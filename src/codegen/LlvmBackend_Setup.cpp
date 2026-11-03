@@ -27213,6 +27213,53 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                 }
             }
         }
+        // fix #7953 (§7.5, §28.9, stdlib §2.5 / §2.6, v0.350): the `?.`
+        // spelling of the SAME value-builtin `ToString()` the `.` arms below
+        // already recognize. `g?.ToString()` on a `Guid?` lowers through
+        // `lowerNullCondValueSemCall` to the SAME `emitValueToString` the `.`
+        // form uses, so the result is the SAME fresh rc := 1 heap string (a
+        // bare null on the null path, which every release tolerates). The `.`
+        // arms (#1982 Guid, #1988 DateTime/TimeSpan/DateOnly/TimeOnly, #1989
+        // Guid.ToString(format), #1637 StringBuilder) read the `.` spelling
+        // ONLY, so the `?.` spelling fell through to the BORROW reading: the
+        // bind retained the string (rc 1 -> 2) and the scope-end release
+        // dropped the borrow (rc 2 -> 1), never dropping the producer's
+        // original +1 ⇒ the 32-byte header + the data buffer leaked per call.
+        // MEASURED on this fix's parent (ASan/LSan): a 200-iteration
+        // `var g: Guid? := Guid.Empty; var s: string? := g?.ToString();` loop
+        // leaked 6400 B in 200 objects (+ 7400 B indirect), while the
+        // byte-identical `.` spelling (`var s: string? := g.ToString();`) was
+        // clean; the `?.` FORMAT spelling leaked the same way (1600 B in 50
+        // objects for `g?.ToString("N")`).
+        //
+        // The gate is the SAME receiver-type test the `.` arms use (the
+        // builtin head name), so the two decisions stay in lockstep: a
+        // receiver this arm admits is exactly a receiver the `.` arm already
+        // calls a +1 producer. The ARITY follows the `.` arms too: no argument
+        // for every head in the family, one argument (the format specifier)
+        // only for the three heads that declare a `ToString(format)` overload
+        // (Guid / DateTime / TimeSpan).
+        if (call->callee) {
+            if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                    call->callee.get())) {
+                if (ncm->member == "ToString" && ncm->target &&
+                    ncm->typeArgs.empty() && !calleeResolvedBySema(*call, ctx_)) {
+                    auto* tt = ctx_.exprType(*ncm->target);
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named) {
+                        std::string_view bn = builtinTypeName(tt);
+                        if (call->args.empty() &&
+                            (bn == "Guid" || bn == "DateTime" ||
+                             bn == "TimeSpan" || bn == "DateOnly" ||
+                             bn == "TimeOnly" || bn == "StringBuilder"))
+                            return true;
+                        if (call->args.size() == 1 &&
+                            (bn == "Guid" || bn == "DateTime" ||
+                             bn == "TimeSpan"))
+                            return true;
+                    }
+                }
+            }
+        }
         // fix #7312 (stdlib §9.1 / §2.18, v0.344): the ONE-ARGUMENT `ToString`
         // OVERLOADS — `ToString(format: string)` and `ToString(radix: int)` —
         // are recognized by the SAME receiver-type test as the no-argument
