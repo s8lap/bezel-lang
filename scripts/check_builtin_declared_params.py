@@ -64,7 +64,9 @@ DECLARE the block it claims.  The `required` column — the DECLARED MINIMUM
 of an overload, the count of its parameters that declare no default — was
 never compared at all, while the checker's output named it; it is now
 compared, and the rows where the table and the document disagree are
-REPORTED, with the document's own declaration as the provenance.
+REPORTED, with the document's own declaration as the provenance.  #8034
+corrected those rows in the TABLE, so the registry of known disagreements is
+gone and a `required` disagreement now FAILS the checker.
 """
 
 import os
@@ -928,76 +930,32 @@ def check_citations(stdlib_text, spec_text, citations=None):
     return errors
 
 
-# The rows whose `required` (DECLARED ARITY) column disagrees with the
-# document, and the checker REPORTS them rather than failing on them.
+# THE `required` (DECLARED ARITY) COLUMN IS NOW COMPARED WITH THE DOCUMENT
+# FOR EVERY COVERED ROW, and a disagreement FAILS the checker.
 #
-# fix #8023: the table's `required` column was never compared with the
-# document at all — and it DISAGREES with the document in the rows below.
-# The table's own contract (`src/common/BuiltinRegistry.cpp`) is that
-# "`required` counts the LEADING parameters that declare no default, so one
-# row answers for every admissible argument count of an overload with §22.5
-# optional parameters", and the `File.ReadAllTextAsync` comment spells it
-# out: "The `required` column is the declared MINIMUM, not the arity."
+# #8023's ratchet made the comparison and found EIGHT rows whose `required`
+# column contradicted the document's own declaration — the table's own
+# contract (`src/common/BuiltinRegistry.cpp`) is that "`required` counts the
+# LEADING parameters that declare no default, so one row answers for every
+# admissible argument count of an overload with §22.5 optional parameters",
+# and the `File.ReadAllTextAsync` comment spells it out: "The `required`
+# column is the declared MINIMUM, not the arity."  Those rows were REPORTED
+# rather than failed on, because the table is the SUBJECT of this ratchet:
+# correcting a row is an edit to `src/common/BuiltinRegistry.cpp`, whose
+# `required` column drives the §22.5 admission window.
 #
-# The table is the SUBJECT of this ratchet, not its property: correcting a
-# row is an edit to `src/common/BuiltinRegistry.cpp` — a file this lane does
-# not own, and one whose `required` column drives the §22.5 admission
-# window — so the disagreement is REPORTED, with the document's own
-# declaration as the provenance, and the corrected value named.  A row whose
-# `required` is neither the document's value nor the value recorded here is
-# a CORRUPTION and FAILS the ratchet.
-#
-#   (head, member, total) -> (the value the table carries, the value the
-#                            document declares, the reason)
-REQUIRED_DEVIATION = _bind({
-    ("FileStream", "", 3):
-        (3, 2,
-         "the table's `required` column says 3, but {sec} declares "
-         "`public constructor(path: string, mode: FileMode, access: "
-         "FileAccess := FileAccess.ReadWrite);` — `access` is DEFAULTED, so "
-         "the declared MINIMUM is 2, not 3; the row's `required` must "
-         "become 2"),
-    ("Math", "DivRem", 3):
-        (2, 3,
-         "the table's `required` column says 2, but {sec} declares "
-         "`public static method DivRem(a: int, b: int, out remainder: "
-         "int): int;` — an `out` SLOT is an ARGUMENT, so the declared "
-         "MINIMUM is 3, not 2"),
-    ("TextWriter", "Write", 1):
-        (0, 1,
-         "the table's `required` column says 0, but {sec} declares "
-         "`public abstract method Write(value: string);` — one parameter "
-         "and no default, so the declared MINIMUM is 1, not 0"),
-    ("TextWriter", "WriteLine", 1):
-        (0, 1,
-         "the table's `required` column says 0, but {sec} declares "
-         "`public method WriteLine(value: string);` — one parameter and no "
-         "default, so the declared MINIMUM is 1, not 0"),
-    ("string", "IndexOf", 2):
-        (2, 1,
-         "the table's `required` column says 2, but {sec} declares "
-         "`public pure method IndexOf(value: char, startIndex: int := 0): "
-         "int;` — `startIndex` is DEFAULTED, so the declared MINIMUM is 1, "
-         "not 2"),
-    ("string", "PadCenter", 2):
-        (2, 1,
-         "the table's `required` column says 2, but {sec} declares "
-         "`public pure method PadCenter(totalWidth: int, paddingChar: char "
-         ":= ' '): string;` — `paddingChar` is DEFAULTED, so the declared "
-         "MINIMUM is 1, not 2"),
-    ("string", "PadLeft", 2):
-        (2, 1,
-         "the table's `required` column says 2, but {sec} declares "
-         "`public pure method PadLeft(totalWidth: int, paddingChar: char "
-         ":= ' '): string;` — `paddingChar` is DEFAULTED, so the declared "
-         "MINIMUM is 1, not 2"),
-    ("string", "PadRight", 2):
-        (2, 1,
-         "the table's `required` column says 2, but {sec} declares "
-         "`public pure method PadRight(totalWidth: int, paddingChar: char "
-         ":= ' '): string;` — `paddingChar` is DEFAULTED, so the declared "
-         "MINIMUM is 1, not 2"),
-})
+# fix #8034 corrected all EIGHT rows in the table — `FileStream`'s
+# constructor (`access` is DEFAULTED → 2), `Math.DivRem` (an `out` SLOT IS
+# AN ARGUMENT, spec §22.3 → 3), `TextWriter.Write` / `TextWriter.WriteLine`
+# (one parameter, no default → 1) and `string.IndexOf` / `PadLeft` /
+# `PadRight` / `PadCenter` (`startIndex` / `paddingChar` are DEFAULTED → 1).
+# The registry of KNOWN disagreements that served them is therefore GONE: a
+# row whose `required` is not the document's declared minimum is now a
+# CORRUPTION and FAILS the checker, exactly as a wrong parameter TYPE or a
+# wrong §7.3 mask does.  Nothing here is weakened by the deletion — the
+# COMPARISON is untouched, and the checker's own mutation leg (see
+# `self_test`) still corrupts a `required` count on every covered block and
+# asserts the corruption is DETECTED.
 
 
 def parse_params(text):
@@ -1397,11 +1355,10 @@ def compare(stdlib, table):
         for _idx, (_kinds, _nn, required) in enumerate(rows):
             if required == want:
                 continue
-            known = REQUIRED_DEVIATION.get((head, member, total))
-            if known is not None and known[0] == required:
-                # the KNOWN disagreement: REPORTED by `known_uncovered`, not
-                # failed on — the table is the subject of this ratchet.
-                continue
+            # fix #8034: the `required` column of EVERY covered row is
+            # compared with the document's declared minimum, and a
+            # disagreement FAILS the checker — the eight rows that used to
+            # disagree are corrected in the table itself.
             errors.append(
                 "stdlib declares `%s%s` at %d argument(s) with %d required "
                 "parameter(s), but the table's `required` column says %d"
@@ -1494,36 +1451,12 @@ def known_uncovered(stdlib, table):
                     % (head, ("." + member) if member else "'s constructor",
                        i, reason)))
 
-    # (h) the rows whose `required` (DECLARED ARITY) column disagrees with
-    #     the document, which the checker reports rather than fails on.
-    for (head, member, total), (table_value, doc_value, reason) in \
-            sorted(REQUIRED_DEVIATION.items()):
-        if head not in covered:
-            continue
-        rows = table.get((head, member, total))
-        if rows is None:
-            continue
-        current = rows[0][2]
-        if current != table_value:
-            # the table was CORRECTED: the row now carries the document's
-            # value, so the deviation is gone — say so, so the entry can be
-            # deleted.
-            out.append(("required",
-                        "`%s%s` at %d argument(s) — the recorded `required` "
-                        "deviation no longer holds: the table now says %d, "
-                        "which is the document's own value, so this entry can "
-                        "be deleted"
-                        % (head, ("." + member) if member else
-                           "'s constructor", total, current)))
-            continue
-        out.append(("required",
-                    "`%s%s` at %d argument(s) — the table's `required` "
-                    "column and the document's DECLARED MINIMUM DISAGREE, and "
-                    "the checker reports it rather than failing on it (the "
-                    "table is the subject of this ratchet, not its property): "
-                    "%s"
-                    % (head, ("." + member) if member else "'s constructor",
-                       total, reason)))
+    # (h) fix #8034: the rows whose `required` (DECLARED ARITY) column
+    #     disagreed with the document are CORRECTED in the table, so there
+    #     is no known `required` gap left to report: a row whose `required`
+    #     is not the document's declared minimum now FAILS the checker
+    #     (`compare`), exactly as a wrong parameter TYPE or a wrong §7.3
+    #     mask does.
 
     return out
 
@@ -1711,11 +1644,8 @@ def self_test():
         key, idx = candidates[0]
         required = table[key][idx][2]
         want = declared_required(stdlib, key[0], key[1], key[2])
-        known = REQUIRED_DEVIATION.get(key)
         bad = required + 1
         if want is not None and bad == want:
-            bad += 1
-        if known is not None and bad == known[0]:
             bad += 1
         mutated = apply_mutation(table, key[0], key[1], key[2], 0,
                                  ("required", bad), index=idx)
@@ -1771,7 +1701,6 @@ def main(argv):
     covered_rows = sum(len(rows) for (h, m, t), rows in table.items()
                         if h in covered_heads())
     forms, rows_read = coverage(stdlib, table)
-    deviations = len([1 for kind, _t in gaps if kind == "required"])
     sys.stdout.write("check_builtin_declared_params: the table agrees with "
                      "the standard library over %d standard-library block(s) "
                      "and %d specification block(s), %d declared form(s) and "
@@ -1780,10 +1709,12 @@ def main(argv):
                      "`required` (DECLARED ARITY) columns are compared, and "
                      "the §-citation of all %d block(s) is verified against "
                      "the document; %d known-uncovered item(s) are listed "
-                     "above, %d of them a `required` deviation\n"
+                     "above, and every covered row's `required` column "
+                     "matches the document's declared MINIMUM (a disagreement "
+                     "FAILS this checker)\n"
                      % (len(BLOCKS), len(SPEC_BLOCKS) + len(SPEC_RECORDS),
                         forms, rows_read, covered_rows, len(BLOCK_CITATIONS),
-                        len(gaps), deviations))
+                        len(gaps)))
     return 0
 
 

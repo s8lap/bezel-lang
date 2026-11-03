@@ -31,8 +31,12 @@ What is asserted here:
     does not exist, or which does not declare the block, is an ERROR;
   * fix #8023: the `required` (DECLARED ARITY) column is COMPARED with the
     document — a corrupted arity fails and names the member and the
-    argument count — and the rows where the table and the document disagree
-    are REPORTED with the document's own declaration as the provenance.
+    argument count;
+  * fix #8034: the EIGHT rows where the table and the document disagreed are
+    CORRECTED in the table itself, so the checker's registry of known
+    deviations is gone: there is NO `required` deviation left to REPORT, and
+    a `required` that is not the document's declared minimum now FAILS the
+    checker.
 
 The list of the #8005 rows is the #8005 COMMIT's own diff (the `-` lines of
 `git show 92bf3654 -- src/common/BuiltinRegistry.cpp`), transcribed here as
@@ -262,7 +266,12 @@ class Citations(unittest.TestCase):
 
 
 class RequiredColumn(unittest.TestCase):
-    """fix #8023: the `required` (DECLARED ARITY) column is compared."""
+    """fix #8023: the `required` (DECLARED ARITY) column is compared.
+
+    fix #8034: the EIGHT rows whose `required` contradicted the document are
+    CORRECTED in the table, so a `required` disagreement is a FAILURE and
+    not a report — this class pins that stronger oracle.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -306,24 +315,39 @@ class RequiredColumn(unittest.TestCase):
         self.assertTrue(any("`string.Contains`" in e for e in errors),
                         'the checker does not NAME the member: %s' % errors)
 
-    def test_the_known_required_deviations_are_reported(self):
+    def test_no_required_deviation_remains_and_a_corrupted_required_fails(self):
+        # fix #8034: the EIGHT rows whose `required` contradicted the
+        # document are CORRECTED in the table itself, so the checker's
+        # registry of known `required` deviations is gone and there is NO
+        # `required` gap left to REPORT.
         gaps = c.known_uncovered(self.stdlib, self.table)
         required = [text for kind, text in gaps if kind == "required"]
-        self.assertTrue(required,
-                        'the checker reports no `required` deviation; the '
-                        'disagreement must be visible')
-        joined = " ".join(required)
-        for head in ("FileStream", "Math", "TextWriter", "string"):
-            self.assertIn(head, joined,
-                          'the `required` deviation of `%s` is not reported'
-                          % head)
-        self.assertIn("DEFAULTED", joined,
-                      'the `required` deviations do not carry the document\'s '
-                      'own declaration as the provenance')
+        self.assertEqual([], required,
+                         'the checker still reports a known `required` '
+                         'deviation: %s' % required)
+        # The oracle is STRONGER, not weaker: a `required` that is not the
+        # document's declared minimum now FAILS the checker instead of being
+        # reported.  stdlib §9.6 declares
+        # `PadLeft(totalWidth: int, paddingChar: char := ' ')` — `paddingChar`
+        # is DEFAULTED, so the declared minimum is 1 and a `required` of 2
+        # disagrees with the document.
+        mutated = c.apply_mutation(self.table, "string", "PadLeft", 2, 0,
+                                   ("required", 2))
+        errors = c.compare(self.stdlib, mutated)
+        self.assertTrue(errors,
+                        'the checker does not FAIL a `required` that is not '
+                        'the document\'s declared minimum')
+        named = [e for e in errors if "`string.PadLeft`" in e]
+        self.assertTrue(named,
+                        'the checker fails a corrupted `required` but does '
+                        'not NAME the member: %s' % errors)
+        self.assertTrue(any("`required` column" in e for e in named),
+                        'the checker fails a corrupted `required` but does '
+                        'not NAME the column: %s' % errors)
 
-    def test_a_known_deviation_cannot_hide_a_corruption(self):
-        # the FileStream row records the table's value (3); a corruption to
-        # any OTHER wrong value must fail.
+    def test_a_corrupted_required_count_fails_on_every_wrong_value(self):
+        # the FileStream row records the document's declared minimum (2);
+        # a corruption to any OTHER wrong value must fail.
         for bad in (0, 1, 4, 5):
             mutated = c.apply_mutation(self.table, "FileStream", "", 3, 0,
                                        ("required", bad))
