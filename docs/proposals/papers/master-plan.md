@@ -685,6 +685,45 @@ TO GATE; KEEP THE POOL AT ITS TARGET AND GATE WHEN THE RUN ENDS.⇒ THE 60–100
 SUPERSEDED BY 100.⇒ A SLOT THAT FREES (A LANE THAT HANDED BACK, OR ONE THAT DIED) IS REFILLED IN
 THAT SAME TURN.**
 
+**R38 session handback (2026-11-03, in progress — the run ends 2026-11-05 02:00 NZDT).**
+*Landed:* 55 commits over `origin/main` on the staging branch `r30-c1` at `48353f2b`; **41 fix
+issues banked, 43 issues GitHub would close on the push** (the keyword rule over subject+body),
+**UNATTRIBUTED 0** — measured 2026-11-03 14:15 NZDT with `scripts/pick_ledger.sh`. *Blocked:* the
+one gate is still pending, and it still has to carry 100+. *Asked:* the campaign gained its
+disclosed gaps as issues rather than as prose — #8031 (the `case` EXPRESSION as a local-decl
+initializer never captures its owned scrutinee), #8032 (the `linq_refcount` row pinned the leak
+#8009 fixed), #8033 (the borrowing family's `owned Stack<Cell>.Pop()` dangles; the free is
+`bz$M.C$Mk`, INSIDE `Mk()`), #8034 (the `required` column's eight rows) and #8035.
+
+**=> THE RUN'S END IS EXTENDED BY 24 HOURS (owner directive 2026-11-03): 2026-11-04 02:00 NZDT
+→ 2026-11-05 02:00 NZDT. THIS IS A DURATION CHANGE, NOT A CADENCE CHANGE.** The gate cadence
+above is UNCHANGED: still **ONE** gate, near the end, carrying **100+** closures; the pool is
+still refilled to 7 every time the agent count goes down; the pool is still NOT drained to gate.
+**⇒ A LONGER RUN MEANS MORE HAUL BEFORE THAT ONE GATE — IT DOES NOT MEAN MORE GATES.**
+**⇒ THE EXTENSION IS THREE STEPS, OR IT IS NOT DURABLE: (a)** delete the heartbeat schedule and
+create the new one back to back (there is no `schedule_update`), same name, same cadence, same
+prompt **verbatim**, `ends.at` = the new end — **the R38 instance became
+`sch_19eff064a001uPPxyMG3Muoa2P`, `ends.at = 2026-11-05T02:00:00.000+13:00`**; **(b)** update the
+committed copy in `docs/ops/heartbeat.md`; **(c)** record the extension in this section and in the
+campaign's coordinator block. **⇒ A SCHEDULE-ONLY EXTENSION IS NOT DURABLE: the next session
+reads the FILES, not the scheduler.** **⇒ MEASURED: A HEARTBEAT SURVIVES A SESSION RESTART** —
+the schedule lives in the orchestrator's server, not in the session (the R38 heartbeat fired 17
+times across a restart and kept its cadence).
+
+**=> THE POOL COUNT IS A CLAIM; THE AGENT COUNT IS A MEASUREMENT (R38, 2026-11-03).** The `pool`
+row of `scripts/run_status.sh` counts the DISTINCT lanes holding a `live` row in the claims
+ledger, and a ledger row is a **promise, not an agent**: a lane was claimed, its worktree was
+created, and **NO AGENT WAS EVER DISPATCHED** — the ledger said "live", the UI said "0 live
+agents", and the two disagreed. **⇒ THE LEDGER WAS WRONG, NOT THE UI.** The resolution is
+measured by the SERVER, not by the file: **a lane is live iff there is a child session with NO
+outcome yet** (`outcome` is null while a session runs, and set when it ends) — `opencode api
+session.list --param directory=<dir>` enumerates them. `scripts/pool_lanes.sh` does the count
+AND reconciles it against the ledger, reporting **PHANTOM** (a `live` claim with no running
+session — the erroneous count) and **UNRECORDED** (a running session with no `live` claim), and
+exits 3 on a mismatch. **⇒ THE LEDGER'S LIVE ROWS NOW CARRY THEIR SESSION ID**
+(`live:<role>:ses_…`), which is what makes the reconciliation exact. **⇒ A LANE IS NOT
+"DISPATCHED" UNTIL ITS AGENT EXISTS.**
+
 ---
 
 ## Appendix A — the mechanical commands

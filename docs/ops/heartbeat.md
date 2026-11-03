@@ -72,15 +72,48 @@ schedule_delete({ id: "<the old schedule id>" })
 schedule_create({
   name: "r38-heartbeat",
   when: { every: "20 minutes", tz: "Pacific/Auckland" },
-  ends: { at: "<the run's end, e.g. 2026-11-04T02:00:00.000+13:00>" },
+  ends: { at: "<the run's end, e.g. 2026-11-05T02:00:00.000+13:00>" },
   prompt: "<the prompt below, VERBATIM>",
 })
 ```
 
-The 2026-11-03 instance was `sch_19d81bf5d001RX3ZhdilKdMqk6`, replacing
-`sch_19be9316a0011lGl6KSAqQku3Q` (the old report-and-stop one). The cadence is coarse on
-purpose — tens of minutes; a tight interval burns budget re-reading state that has not
-moved. The `ends` bound is the run's own deadline, so the schedule cannot fire past it.
+The 2026-11-03 instance was `sch_19eff064a001uPPxyMG3Muoa2P`, replacing
+`sch_19d81bf5d001RX3ZhdilKdMqk6` (which replaced `sch_19be9316a0011lGl6KSAqQku3Q`, the old
+report-and-stop one). The cadence is coarse on purpose — tens of minutes; a tight interval
+burns budget re-reading state that has not moved. The `ends` bound is the run's own deadline,
+so the schedule cannot fire past it.
+
+### Extending the run — the rule, so the next extension is mechanical
+
+**The run's end is the schedule's `ends` bound AND a line in TWO committed files. An
+extension that changes only the schedule is not durable** — the next session reads the
+files, not the scheduler, and would inherit the old deadline.
+
+An owner extension of the run's end is therefore THREE steps, in this order:
+
+1. **Delete the old schedule and create the new one, back to back** (there is no
+   `schedule_update`), with the SAME name, the SAME cadence, the SAME prompt **verbatim**,
+   and `ends.at` = the new end. **⇒ Do the two back to back: a gap with no heartbeat is
+   worse than a stale end.** The new schedule's id is printed by `schedule_create` — record
+   it in this file.
+2. **Update the `ends` example above in this file** (it is the committed copy of the
+   instance) and add the new instance id to the paragraph above.
+3. **Record the extension in `docs/proposals/papers/master-plan.md` §6** (the plan's
+   handback section) and in the campaign's coordinator block
+   (`docs/proposals/papers/campaigns/builtin-call-admission.md`), with the date, the old end,
+   the new end, and the directive that caused it.
+
+**⇒ The extension does NOT change the gate cadence.** The run still ends with **ONE** gate,
+near the end, carrying 100+ issue closures, and the pool is still refilled to 7 every time
+the agent count goes down. A longer run means MORE haul before that one gate — it does not
+mean more gates, and it does not mean a drained pool.
+
+**MEASURED 2026-11-03 (the R38 run's first extension).** The owner extended the R38 run by
+**24 hours**: the end moved from **2026-11-04 02:00 NZDT** to **2026-11-05 02:00 NZDT**.
+The schedule was recreated as `sch_19eff064a001uPPxyMG3Muoa2P` with the identical prompt
+and cadence and `ends.at = 2026-11-05T02:00:00.000+13:00`. **⇒ A heartbeat survives a
+session restart** — the schedule lives in the orchestrator's server, not in the session
+(measured: the R38 heartbeat fired 17 times across a restart and kept its cadence).
 
 ### The prompt, verbatim
 

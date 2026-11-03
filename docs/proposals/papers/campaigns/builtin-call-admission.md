@@ -2541,6 +2541,68 @@ with 234 GB of dead worktrees on it was the other half of the stall.
 
 **THE LEDGER AT THIS POINT.** Staging `r30-c1`, **+39** over `origin/main`, **BANKED 25/100**, `distinct fix issues: 25`, `distinct issues GitHub would close: 27`, `UNATTRIBUTED: 0`. **ONE GATE, NEAR THE END, CARRYING 100+ CLOSURES.**
 
+## Coordinator block — 2026-11-03 ~14:15 (the run is EXTENDED by 24 hours; the pool count becomes a MEASUREMENT)
+
+**THE OWNER'S DIRECTIVE.** *"please extend this run by 24 hours. make this change durable in the
+plan."* **⇒ THE RUN'S END MOVES FROM 2026-11-04 02:00 NZDT TO 2026-11-05 02:00 NZDT.**
+
+**⇒ THIS IS A DURATION CHANGE, NOT A CADENCE CHANGE.** The gate cadence is UNCHANGED: still
+**ONE** gate, near the end, carrying **100+** issue closures; the pool is still refilled to 7
+every time the agent count goes down; the pool is still NOT drained to gate. **⇒ A LONGER RUN
+MEANS MORE HAUL BEFORE THAT ONE GATE — IT DOES NOT MEAN MORE GATES.**
+
+**THE THREE STEPS THAT MAKE THE EXTENSION DURABLE (there is no `schedule_update`, so the
+change is a delete-then-create):**
+
+* **(a) THE SCHEDULE.** `schedule_delete({id: "sch_19d81bf5d001RX3ZhdilKdMqk6"})` then
+  `schedule_create({name: "r38-heartbeat", when: {every: "20 minutes", tz:
+  "Pacific/Auckland"}, ends: {at: "2026-11-05T02:00:00.000+13:00"}, prompt: <VERBATIM>})` —
+  **the two back to back, because a gap with no heartbeat is worse than a stale end.** The new
+  instance is **`sch_19eff064a001uPPxyMG3Muoa2P`** (`active`, `nextDueAt`
+  `2026-11-03T14:41:15.850+13:00`). **⇒ A SCHEDULE-ONLY EXTENSION IS NOT DURABLE: the next
+  session reads the FILES, not the scheduler** — so the end must also live in
+  `docs/ops/heartbeat.md` and in `docs/proposals/papers/master-plan.md` §6.
+* **(b) THE COMMITTED COPY.** `docs/ops/heartbeat.md` now carries the new `ends` example, the
+  new instance id, and a new section — *Extending the run — the rule, so the next extension is
+  mechanical* — that states the three steps.
+* **(c) THE PLAN AND THIS BLOCK.** `master-plan.md` §6 carries the R38 handback (55 commits over
+  `origin/main`, **41 fix issues banked**, 43 closable, `UNATTRIBUTED 0` — measured 14:15 NZDT)
+  and the extension.
+
+**⇒ MEASURED: A HEARTBEAT SURVIVES A SESSION RESTART.** The schedule lives in the
+orchestrator's **server**, not in the session: the R38 heartbeat fired 17 times across a
+restart and kept its cadence. **⇒ THE SESSION IS NOT THE HEARTBEAT'S HOME — THE SCHEDULER IS.**
+
+**⇒ THE POOL COUNT IS A CLAIM; THE AGENT COUNT IS A MEASUREMENT.** The `pool` row of
+`scripts/run_status.sh` counts the DISTINCT lanes holding a `live` row in the claims ledger,
+and a ledger row is a **promise, not an agent**. Measured 2026-11-03: the ledger said **3**
+live lanes, opencode said **1**, and the UI said **0** — because `r38-w69-membergate` had a
+claim and a worktree but **NO AGENT WAS EVER DISPATCHED**. **⇒ THE LEDGER WAS WRONG, NOT THE
+UI.** The resolution is the SERVER: **a lane is live iff there is a child session with NO
+outcome yet** (`outcome` is null while a session runs), enumerated by `opencode api session.list
+--param directory=<dir>`. `scripts/pool_lanes.sh` counts from opencode AND reconciles against
+the ledger — **PHANTOM** (a `live` claim with no running session) and **UNRECORDED** (a running
+session with no `live` claim) — and exits 3 on a mismatch. **⇒ THE LEDGER'S LIVE ROWS NOW CARRY
+THEIR SESSION ID** (`live:<role>:ses_…`). **⇒ A LANE IS NOT "DISPATCHED" UNTIL ITS AGENT
+EXISTS.** At 14:15 the two agreed at **7** — the pool target.
+
+**THE POOL IS REFILLED TO 7 IN ONE TURN (2026-11-03 ~14:10), AND THE REFILLS ARE CLUSTERS.**
+Five producer lanes plus one reviewer were dispatched together, chosen by **ONE ROOT CAUSE per
+lane** over the 242 open campaign issues — the haul lever, because **one commit naming N issues
+credits N closures**:
+
+| lane | the one root cause | issues in flight | files owned |
+|---|---|---|---|
+| `r38-p70-namedargs-reg` | the built-in parameter table carries no parameter names and all-zero `nonNullable` masks | #7500 #7501 #7828 #7659 #7999 | `BuiltinRegistry.cpp/.hpp` |
+| `r38-p71-namedargs-bind` | the binder resolves a NAMED argument by INDEX, not by NAME | #7622 #7602 #7601 #7846 #7419 #7535 #7982 #6810 #7995 #7218 | `ExprTypecheck_Calls.cpp`, `_impl.hpp` |
+| `r38-p72-namedargs-cg` | the lowering reads arguments at parameter order | #7501 #7180 #7292 #8027 | `LlvmBackend_Calls.cpp/Calls2.cpp` |
+| `r38-p73-objname` | the name `Object` is compared WITHOUT its generic arity | #7997 #7994 #7992 #7973 | `ExprTypecheck.cpp`, `TypeResolution*.cpp` |
+| `r38-p74-extdispatch` | the §26.5 extension dispatch is keyed on the member NAME alone | #7970 #7951 #7944 #7448 #7812 | `ExprTypecheck_Exprs.cpp` |
+| `r38-w69-membergate` | review of `45bdd87a` | #8012 #8015 #8020 | (read-only) |
+
+**⇒ THE NAMED-ARGUMENT FAMILY IS ONE DEFECT IN THREE DISJOINT FILES** (the table's names → the
+binder's index → the lowering's order), which is why it was split by FILE rather than by issue.
+
 ## Exit review
 
 *(to be written by the campaign's exit reviewer — not this lane)*
