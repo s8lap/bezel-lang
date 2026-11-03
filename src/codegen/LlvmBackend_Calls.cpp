@@ -18540,7 +18540,18 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
             if (ma2->target) {
                 auto* recvTy = ctx_.exprType(*ma2->target);
-                bool isDT = recvTy && builtinTypeName(recvTy) == "DateTime";
+                // fix #7765 (spec §14.2, stdlib §2.5, v0.350): the receiver
+                // may be a BARE TYPE PARAMETER (`a.CompareTo(b)` in a
+                // `where T: IComparable<T>`-constrained body), and under the
+                // active substitution it names a builtin VALUE TYPE. The
+                // substitution's sema type is read through the SAME
+                // `resolveTypeParamRef` the `Math` arm's DateTime key uses
+                // (`isDateTimeValueRef`), so the receiver's own type -- not
+                // the spelling at the call site -- decides the arm.
+                const sema::TypeRef* recvTyResolved =
+                    resolveTypeParamRef(recvTy);
+                bool isDT = recvTyResolved &&
+                            builtinTypeName(recvTyResolved) == "DateTime";
                 if (isDT) {
                     llvm::Value* ticks = lowerExpr(*ma2->target);
                     if (!ticks) return nullptr;
@@ -18716,7 +18727,12 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
             if (ma2->target) {
                 auto* recvTy = ctx_.exprType(*ma2->target);
-                bool isTS = recvTy && builtinTypeName(recvTy) == "TimeSpan";
+                // fix #7765: the receiver may be a bare type parameter under
+                // the active substitution (see the `DateTime` arm above).
+                const sema::TypeRef* recvTyResolved =
+                    resolveTypeParamRef(recvTy);
+                bool isTS = recvTyResolved &&
+                            builtinTypeName(recvTyResolved) == "TimeSpan";
                 if (isTS) {
                     llvm::Value* ticks = lowerExpr(*ma2->target);
                     if (!ticks) return nullptr;
@@ -18768,7 +18784,12 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
             if (ma2->target) {
                 auto* recvTy = ctx_.exprType(*ma2->target);
-                bool isDO = recvTy && builtinTypeName(recvTy) == "DateOnly";
+                // fix #7765: the receiver may be a bare type parameter under
+                // the active substitution (see the `DateTime` arm above).
+                const sema::TypeRef* recvTyResolved =
+                    resolveTypeParamRef(recvTy);
+                bool isDO = recvTyResolved &&
+                            builtinTypeName(recvTyResolved) == "DateOnly";
                 if (isDO) {
                     llvm::Value* dayNum = lowerExpr(*ma2->target);
                     if (!dayNum) return nullptr;
@@ -18914,7 +18935,12 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
             if (ma2->target) {
                 auto* recvTy = ctx_.exprType(*ma2->target);
-                bool isTO = recvTy && builtinTypeName(recvTy) == "TimeOnly";
+                // fix #7765: the receiver may be a bare type parameter under
+                // the active substitution (see the `DateTime` arm above).
+                const sema::TypeRef* recvTyResolved =
+                    resolveTypeParamRef(recvTy);
+                bool isTO = recvTyResolved &&
+                            builtinTypeName(recvTyResolved) == "TimeOnly";
                 if (isTO) {
                     llvm::Value* ms = lowerExpr(*ma2->target);
                     if (!ms) return nullptr;
