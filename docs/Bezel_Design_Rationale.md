@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.354 — November 2026**
+**Companion to the Bezel Language Specification, v0.355 — November 2026**
 
 The specification says what Bezel *is*; this document says *why*. It covers the places where two reasonable designs were possible and one was picked, where a familiar-looking rule rests on a less obvious one, and where something common elsewhere was deliberately left out. Each decision is recorded with the alternative it declined, what that alternative would have bought, and why it lost, so that decisions are revisited deliberately rather than relitigated from memory. Read it when a rule surprises you; each section stands alone.
 
@@ -243,11 +243,19 @@ For the runtime-managed set — `string`, boxed values, function values, and `Ty
 <a id="sec-why-strings-are-runtime-managed"></a>
 ### 4.1 Why strings are runtime-managed
 
-Marking `string` as owned would mean `using var` on the result of `int.ToString()`, every interpolation, every concatenation. The result would be unreadable.
+`string` is runtime-managed (spec [§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types)): a string carries no disposal obligation, so it is passed, stored, returned and captured with no ownership spelling anywhere.
 
-The alternative — value-type strings with copy-on-write — silently allocates on every concatenation and complicates interop with languages where `string` is a reference type.
+**Strings need no ownership.** A `string` is immutable (spec [§4.6](Bezel_Language_Spec.md#sec-string)) and holds no references, so no string reaches another value and strings cannot form a cycle. Reference counting reclaims such a value when its last reference goes, as any other exact scheme would; spec §28.9 leaves the mechanism open. No tracing collector is needed and nothing runs in the background, so the no-collector commitment of [§1](#sec-the-big-picture) holds for strings as it does for classes. A string holds nothing but memory, so there is nothing for an owner to dispose.
 
-The chosen path is to put `string` (and a small set of other deeply-pervasive types: boxed values, function values, and the interned `Type` tokens) in a runtime-managed region and leave manual ownership clean for the 95% of types where it actually matters. Manual ownership would be unworkable for strings; runtime management is unworkable for resources. Each gets the right tool.
+**Ownership is for resources.** It gives a file, a connection or a native handle a single disposal point that the reader can find. Strings are the most common value in every signature: names, keys, messages, log lines. Putting the ownership rules on them would charge the largest cost to the type that gains least, since every interpolation, concatenation and `ToString()` result would become an owned value to bind, move or dispose.
+
+**The price of the alternative.** Rust puts strings under ownership, and the cost shows: the `String`/`&str` split, `.to_string()` and `.clone()` at call sites, and lifetime parameters on every struct that holds a `&str`. That design is workable, but it is an ergonomic cost that Bezel declines for an immutable, value-like type.
+
+**Copy-on-write is declined because immutability already gives its benefit.** Copy-on-write makes sharing cheap and copies only when a holder writes. An immutable string is shared for free and is never written, so value-type strings with copy-on-write would add a uniqueness check and buy nothing. The mutable form is `StringBuilder` (stdlib [§3.1](Bezel_Standard_Library.md#sec-stringbuilder)), an ordinary owned class whose `ToString()` produces the immutable result.
+
+**Reference-count elision is implementation latitude.** An implementation that counts references can remove most of the count traffic at compile time, as Koka's Perceus, Lean 4's reset/reuse and Swift's optimizer do, and can reuse a uniquely held buffer in place. The ownership and borrow facts the compiler already computes are the input such an analysis needs. This is latitude under spec §28.9, not a language rule, and it is left to a later optimization campaign.
+
+Boxed values and `Type` tokens are runtime-managed on the same footing: a box's payload is fixed at boxing, and a `Type` token is interned for the life of the process (spec §28.9). Function values are [§4.2](#sec-why-function-typed-values-are-runtime-managed)'s subject.
 
 <a id="sec-why-function-typed-values-are-runtime-managed"></a>
 ### 4.2 Why function-typed values are runtime-managed

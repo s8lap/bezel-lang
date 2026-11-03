@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.354 — November 2026**
+**Companion to the Bezel Language Specification, v0.355 — November 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -177,7 +177,7 @@ public static class Math
 end Math;
 ```
 
-**What `Min`, `Max`, and `Clamp` compute.** Ordering throughout is `T`'s `CompareTo` ([§2.8](#sec-icomparablet)). `Min(a, b)` returns `a` when `a.CompareTo(b) <= 0` and `b` otherwise; `Max(a, b)` returns `a` when `a.CompareTo(b) >= 0` and `b` otherwise — so a tie returns **`a`** in both, which is what fixes *which object* the call yields at a class or interface substitution, where the two arguments are distinguishable. `Clamp(value, low, high)` returns `low` when `value` compares less than `low`, `high` when it compares greater than `high`, and `value` otherwise.
+**What `Min`, `Max`, and `Clamp` compute.** Ordering throughout is `T`'s `CompareTo` ([§2.8](#sec-icomparablet)). `Min(a, b)` returns `a` when `a.CompareTo(b) <= 0` and `b` otherwise; `Max(a, b)` returns `a` when `a.CompareTo(b) >= 0` and `b` otherwise — so a tie returns **`a`** in both, which is what fixes *which object* the call yields at a class or interface substitution, where the two arguments are distinguishable. `Clamp(value, low, high)` returns `low` when `value` compares less than `low`, `high` when it compares greater than `high`, and `value` otherwise. Those three results answer the call only where `low` does not compare greater than `high`: where it does (`low.CompareTo(high) > 0`), the call raises `ArgumentException` whatever `value` is, as the declaration's annotation states.
 
 **Ownership at class-typed substitutions.** `Min`, `Max`, and `Clamp` return one of their arguments. Under the bare-type-parameter rule (language spec [§28.3](Bezel_Language_Spec.md#sec-bare-type-parameter-returns)), at a class or interface substitution of `T` the call produces a **borrow** whose sources are the arguments: the caller takes no disposal obligation, and the result is usable only while every argument's source is live. At value and runtime-managed substitutions (the common numeric cases; `string`) no ownership attaches.
 
@@ -277,13 +277,13 @@ public record DateTime: IComparable<DateTime>, IEquatable<DateTime>
   public static method FromTicks(ticks: long, kind: DateTimeKind := DateTimeKind.Unspecified): DateTime;
   public method ToUnixTimeSeconds(): long;
   public static method FromUnixTimeSeconds(seconds: long): DateTime;
-  public readonly property Year: int;
+  public readonly property Year: int;         // 1..9999
   public readonly property Month: int;        // 1..12
   public readonly property Day: int;          // 1..31
   public readonly property Hour: int;         // 0..23
   public readonly property Minute: int;       // 0..59
   public readonly property Second: int;       // 0..59
-  public readonly property Millisecond: int;
+  public readonly property Millisecond: int;  // 0..999
   public readonly property DayOfWeek: DayOfWeek;
   public readonly property DayOfYear: int;
   public readonly property Kind: DateTimeKind;
@@ -339,6 +339,10 @@ end DateTimeKind;
 public record TimeSpan: IComparable<TimeSpan>, IEquatable<TimeSpan>
   // (#1357): CompareTo = tick order. Ordering is CompareTo only — no
   //   <,>,<=,>= overloads are declared (spec §9.2, §25.2).
+  // No constructor, so `new TimeSpan(...)` is rejected (spec §17.7's closed
+  //   constructor surface): a span comes from FromTicks, a From<Unit>
+  //   factory, Zero/MinValue/MaxValue, or a member or operator that
+  //   returns one (DateTime's Subtract and -, TimeSpan's operators).
   public method CompareTo(other: TimeSpan): int;
   public readonly property Ticks: long;
   public static method FromTicks(ticks: long): TimeSpan;
@@ -371,7 +375,11 @@ public record TimeSpan: IComparable<TimeSpan>, IEquatable<TimeSpan>
   public static method operator *(a: TimeSpan, factor: double): TimeSpan;
                                      // computes over Ticks in double; OverflowException on a
                                      //   product outside the tick range or a NaN operand
-                                     //   (pinned)
+                                     //   (pinned). The range check reads the double
+                                     //   product, so MaxValue * 1.0 raises (its Ticks
+                                     //   convert to 2^63); an in-range product is
+                                     //   truncated toward zero to whole ticks, as
+                                     //   From<Unit> is
   public static method operator /(a: TimeSpan, divisor: double): TimeSpan;
                                      // same computation model and OverflowException rule
                                      //   as *; DivideByZeroException on
@@ -401,6 +409,7 @@ end DateOnly;
 
 public record TimeOnly: IComparable<TimeOnly>, IEquatable<TimeOnly>
   public constructor(hour: int, minute: int, second: int := 0, millisecond: int := 0);
+                              // ArgumentOutOfRangeException on invalid components
   public readonly property Hour: int;
   public readonly property Minute: int;
   public readonly property Second: int;
@@ -417,7 +426,11 @@ end TimeOnly;
 
 `DateTime.Date: DateOnly` and `DateTime.TimeOfDay: TimeOnly` accessors decompose a `DateTime`.
 
+**Equality and `Kind`.** A `DateTime`'s `=`, `<>`, `Equals` and `GetHashCode` read its `Ticks` alone, as `CompareTo` does: two values with equal `Ticks` are equal whatever their `Kind`s, so `a = b` exactly where `a.CompareTo(b) = 0` (matching .NET). `Kind` is carried and read through the `Kind` property, never compared. `UtcNow` and `ToUtc()` produce `Kind = Utc`; `Now`, `Today` and `ToLocal()` produce `Kind = Local`; `MinValue`, `MaxValue`, `Parse` and a constructor or `FromTicks` call given no `kind` produce `Unspecified`. The `Add*` family, `Add`, `Subtract(span)` and the `+`/`-` operators with a `TimeSpan` keep the `DateTime` operand's `Kind`; `Subtract(other)` and `a - b` subtract the two `Ticks` with no normalization.
+
 **The tick, and the `From`/`Total` pairs.** A **tick** is 100 nanoseconds — 10,000,000 to the second, 864,000,000,000 to the day. It is the unit of `Ticks` on both types and the resolution of every value either can hold; the `c` format's `.fffffff` tail ([§2.18](#sec-iformattable)) is that unit spelled out. `TimeSpan.From<Unit>(n)` is the span of `n` of that unit — `FromHours(1.5)` is ninety minutes — computed over ticks in `double` and truncated toward zero to a whole number of ticks, raising `OverflowException` when the result falls outside the tick range or the argument is `NaN` (the `*` operator's contract above). `Total<Unit>` is the whole span measured in that unit, fractional part included, so `Total<Unit>` of `From<Unit>(n)` is `n` up to that truncation; the integer components (`Days`, `Hours`, `Minutes`, `Seconds`, `Milliseconds`) are the span's decomposition, each within its stated range and carrying the span's sign. `(TimeSpan.FromDays(1) - TimeSpan.FromHours(1)).TotalHours` is therefore `23.0`, and that span's `Hours` is `23`.
+
+**Component ranges.** The constructors of `DateTime`, `DateOnly` and `TimeOnly` raise `ArgumentOutOfRangeException` when a component falls outside its range: `year` 1..9999, `month` 1..12, `day` 1 to the length of that month in that year of the proleptic Gregorian calendar that ISO 8601 uses (February 29 exists only in a leap year), `hour` 0..23, `minute` 0..59, `second` 0..59 and `millisecond` 0..999. `DateOnly` takes the date ranges and `TimeOnly` the time ranges. `DateTime.MinValue` is `0001-01-01T00:00:00` (`Ticks` 0) and `MaxValue` is the last tick of `9999-12-31` (`Ticks` 3155378975999999999), so every valid set of components names a value between them.
 
 The `ArgumentOutOfRangeException` these constructors raise is declared here, deriving from `ArgumentException` so that an `ArgumentException` catch arm covers the whole argument-validation family (language spec [§31.2.1](Bezel_Language_Spec.md#sec-arm-patterns)); it lives in the auto-imported `System` alongside its producers:
 
@@ -534,7 +547,7 @@ public interface IAsyncDisposable: IDisposable
 end IAsyncDisposable;
 ```
 
-Every class implicitly implements `IDisposable` (language spec [§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)); user code does not implement it directly — a class or record declaring a member named `Dispose`, at any parameter list, is a compile error at that declaration (language spec [§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)). The interface is declared here so that generic constraints (`where T: IDisposable`) and explicit interface variables (`var d: IDisposable := someInstance;`) refer to a named declaration in the standard library rather than a language built-in.
+Every class implicitly implements `IDisposable` (language spec [§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)); user code does not implement it directly — a class, record, enum or choice declaring a member named `Dispose`, at any parameter list, is a compile error at that declaration (language spec [§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)). The interface is declared here so that generic constraints (`where T: IDisposable`) and explicit interface variables (`var d: IDisposable := someInstance;`) refer to a named declaration in the standard library rather than a language built-in.
 
 `IAsyncDisposable` is implemented explicitly by classes that need asynchronous cleanup (language spec [§28.12](Bezel_Language_Spec.md#sec-asynchronous-disposal)). It extends `IDisposable`: the synchronous `Dispose()` every class has (language spec [§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)) is the inherited member's implementation, a value held at `IAsyncDisposable` exposes both, and the constraint paragraph below follows from the extension. Implementations declare a method matching `DisposeAsync(): Task` and add `async` to the implementation; `async` is an implementation-side modifier and never appears on the interface declaration. A class that implements `IAsyncDisposable` should also declare a `destructor` for the synchronous fallback path, at the level that declares `DisposeAsync`: a destructor the class only inherits is the base's cleanup and does not stand in (language spec [§28.12](Bezel_Language_Spec.md#sec-asynchronous-disposal)). A direct `DisposeAsync()` call takes language spec [§28.6](Bezel_Language_Spec.md#sec-who-may-dispose)'s receiver rule, as `Dispose()` does: only the owner calls it, and `base.DisposeAsync()` inside a `DisposeAsync` override is the one admitted `this`-rooted call.
 
@@ -1403,6 +1416,8 @@ end StringBuilder;
 ```
 
 Methods return `this` to allow chaining.
+
+**`Capacity`.** The number of `char`s the builder holds storage for before its storage next grows. It is never less than `Length`, and never less than the `capacity` argument of the `StringBuilder(capacity)` constructor that made the builder (0 for the other two constructors). Beyond those two bounds its value is the implementation's, as are when and by how much the storage grows; `max(Length, capacity)` is a conforming answer.
 
 **Sendability** ([§1](#sec-sendability-statements); language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)). `StringBuilder` is **sendable**, on the sendable form's copy-state ground: it holds text only; every member reads and writes that text by value — `Append(value: Object)` keeps `value.ToString()`'s text, not `value`, and `AppendFormat`'s `args` is a call-bounded borrow — and no member exposes a span or an address of its storage. A moved builder keeps its contents.
 
@@ -5465,6 +5480,8 @@ end String;
 ```
 
 `Replace`, `Trim`, `ToUpper`, etc. return new `string` values; `string` is immutable. A `StringBuilder` ([§3.1](#sec-stringbuilder)) is appropriate for accumulation.
+
+**`ToUpper` and `ToLower`.** Each maps every code point of the receiver by `Char.ToUpper` or `Char.ToLower` ([§9.5](#sec-char)): the simple Unicode case mapping, one code point to one, with no locale tailoring. So `"éa".ToUpper()` is `"ÉA"`, a code point with no mapping (`日`) is kept, and the result's `Length` is the receiver's.
 
 **`IsNullOrWhiteSpace`.** Returns `true` when `value` is `null`, when it is the empty string, and when every one of its code points satisfies `Char.IsWhiteSpace` ([§9.5](#sec-char)); `false` otherwise. The member is total over `string?` — the nullable parameter admits the null and the member answers it, so no narrowing is needed at the call.
 
