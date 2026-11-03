@@ -5028,6 +5028,14 @@ private:
     TypeSymbol* memberTargetType(const ast::Expr* target);
 
     void resolveMemberAccess(const ast::MemberAccessExpr& ma);
+    // fix #7970 (§26.5 rule 1, §22.6, stdlib §2.5-§2.7, v0.350): the
+    // member-access resolution with §26.5 rule 1 COMMITTED for the built-in
+    // value records (a name the receiver's declared type declares as an
+    // instance member blocks extensions by that name, at any arity), plus the
+    // rule-1 "the committed instance lookup then fails" refusal for a declared
+    // ARITY-0 member called with arguments. Defined in
+    // ExprTypecheck_Exprs.cpp, beside the expression visitor that calls it.
+    void resolveMemberAccessWithRule1(const ast::MemberAccessExpr& ma);
     // fix #7661 (stdlib §2.5-§2.7, §3.1, v0.350): the closed member surface
     // of the by-name built-ins (DateTime, TimeSpan, DateOnly, TimeOnly, Guid,
     // Random, StringBuilder), asked for every receiver spelling.

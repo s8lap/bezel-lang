@@ -2590,6 +2590,224 @@ void ExprTC::normalizeAliasQualifiedBuiltinHead(
     const_cast<ast::MemberAccessExpr&>(ma).target = std::move(bare);
 }
 
+namespace {
+
+// fix #7970 (§26.5 rule 1, §22.6, stdlib §2.5-§2.7, v0.350): the
+// INSTANCE members the by-name built-in VALUE RECORDS declare.
+//
+// §26.5 rule 1 (v0.350): "If `x`'s declared type (or any base type)
+// *declares* any instance member named `Foo` — of any arity, applicability,
+// or accessibility — instance resolution is committed and extension blocks
+// are **never consulted** for that name on that receiver."
+//
+// The value records carry no TypeSymbol (stdlib §2.5's `DateTime` is a
+// compiler-known value type, not a user declaration), so the ordinary member
+// walk cannot answer "does the receiver's declared type declare an instance
+// member of that name?" — the same gap `builtinRecordSurfaceReason`
+// (ExprTypecheck_Calls.cpp) closes for the CLOSED-surface check, and the same
+// gap the Task gate (issue #7763) closes for the task family. The rows below
+// are the stdlib §2.5 / §2.6 / §2.7 declaration blocks transcribed
+// mechanically: every non-static `method` / `property` of the block, plus the
+// §8.1 universal instance members (`ToString`, `Equals`, `GetHashCode`,
+// `GetType`) the records generate (§9.2) and `Random`'s §8.7 `Dispose`.
+//
+// STATIC members are NOT listed: a static member is not an instance member,
+// so `extension DateTime { FromTicks(..) }` stays reachable on a `DateTime`
+// receiver (a static name is reached through the TYPE, §22.12). The
+// `properties` row is the arity-0 subset — the members a call with arguments
+// cannot bind (§22.6), which is rule 1's "the committed instance lookup then
+// fails" case.
+struct ValueRecordSurface {
+    std::string_view head;
+    std::vector<std::string_view> members;
+    std::vector<std::string_view> properties;
+};
+
+const std::vector<ValueRecordSurface>& valueRecordSurfaces() {
+    static const std::vector<ValueRecordSurface> kRows = {
+        {"DateTime",
+         {"CompareTo", "Ticks", "ToUnixTimeSeconds", "Year", "Month", "Day",
+          "Hour", "Minute", "Second", "Millisecond", "DayOfWeek", "DayOfYear",
+          "Kind", "Date", "TimeOfDay", "AddYears", "AddMonths", "AddDays",
+          "AddHours", "AddMinutes", "AddSeconds", "AddMilliseconds", "Add",
+          "Subtract", "ToUtc", "ToLocal", "ToString", "Equals",
+          "GetHashCode", "GetType"},
+         {"Ticks", "Year", "Month", "Day", "Hour", "Minute", "Second",
+          "Millisecond", "DayOfWeek", "DayOfYear", "Kind", "Date", "TimeOfDay"}},
+        {"TimeSpan",
+         {"CompareTo", "Ticks", "Days", "Hours", "Minutes", "Seconds",
+          "Milliseconds", "TotalDays", "TotalHours", "TotalMinutes",
+          "TotalSeconds", "TotalMilliseconds", "ToString", "Equals",
+          "GetHashCode", "GetType"},
+         {"Ticks", "Days", "Hours", "Minutes", "Seconds", "Milliseconds",
+          "TotalDays", "TotalHours", "TotalMinutes", "TotalSeconds",
+          "TotalMilliseconds"}},
+        {"DateOnly",
+         {"CompareTo", "Year", "Month", "Day", "ToDateTime", "ToString",
+          "Equals", "GetHashCode", "GetType"},
+         {"Year", "Month", "Day"}},
+        {"TimeOnly",
+         {"CompareTo", "Hour", "Minute", "Second", "Millisecond", "ToString",
+          "Equals", "GetHashCode", "GetType"},
+         {"Hour", "Minute", "Second", "Millisecond"}},
+        {"Guid",
+         {"CompareTo", "ToString", "ToByteArray", "Equals", "GetHashCode",
+          "GetType"},
+         {}},
+        {"Random",
+         {"Next", "NextInt64", "NextDouble", "NextBytes", "NextBoolean",
+          "Dispose", "ToString", "Equals", "GetHashCode", "GetType"},
+         {}},
+    };
+    return kRows;
+}
+
+const ValueRecordSurface* valueRecordSurfaceOf(std::string_view head) {
+    if (head.empty()) return nullptr;
+    for (const ValueRecordSurface& s : valueRecordSurfaces())
+        if (s.head == head) return &s;
+    return nullptr;
+}
+
+bool surfaceDeclares(const ValueRecordSurface& s, std::string_view member) {
+    return std::find(s.members.begin(), s.members.end(), member) !=
+           s.members.end();
+}
+
+bool surfaceDeclaresProperty(const ValueRecordSurface& s,
+                             std::string_view member) {
+    return std::find(s.properties.begin(), s.properties.end(), member) !=
+           s.properties.end();
+}
+
+}  // namespace
+
+// fix #7970 (§26.5 rule 1, §22.6, stdlib §2.5-§2.7, v0.350): the
+// member-access resolution with §26.5 rule 1 committed for the built-in
+// value records, and the rule-1 "the committed instance lookup then fails"
+// refusal for a declared ARITY-0 member called with arguments.
+//
+// Two §26.5 rule-1 questions are asked here, both of which the resolution
+// below could not answer for itself:
+//
+//  1. **The commitment.** A name the receiver's declared type declares as an
+//     INSTANCE member blocks extensions by that name, at any arity. The
+//     built-in value records declare no TypeSymbol, so the resolution found
+//     no instance member and fell through to the extension blocks: an
+//     `extension DateTime { AddDays(d: double): int }` TYPED
+//     `d.AddDays(1.0)` by the extension's `int` (and the built-in's own
+//     `DateTime` lowering was emitted under it), so the program printed
+//     garbage where the record's own member must answer. The commitment is
+//     made by taking the extension blocks out of reach for the ONE
+//     resolution — with no applicable block the record's own member is the
+//     answer, which is the same verdict the receiver's factory shape
+//     (`DateTime.FromTicks(0L)`, the synthetic builtinClassSym stub) already
+//     gives, since an extension head does not match that shape either.
+//
+//  2. **The failure.** A declared ARITY-0 member (a property) called WITH
+//     arguments is rule 1's "the committed instance lookup then fails —
+//     compile error" case (§22.6), never a same-named extension and never a
+//     silently degraded value. `t.Ticks(1)` on a `TimeSpan` dropped the
+//     argument and degraded to a zero-initialized value behind exit 0 (the
+//     #2434 warning) — the program ran and printed a value the record's own
+//     `Ticks` never had.
+//
+// SCOPE. This is the VALUE-RECORD half of the §26.5 rule-1 family: the
+// receiver must be one of stdlib §2.5-§2.7's by-name value records, whose
+// declared instance surface the table above transcribes, and the member
+// access must be the plain `.` form. Two neighbours are OUT of scope and are
+// NOT touched here:
+//
+//   * the CONCRETE collection heads' own rule-1 gap (stdlib §4.17
+//     `SortedDictionary`, §4.18 `SortedSet` — a `Count` property against the
+//     §5 `Count(predicate)` extension) is issue #7812: its remedy changes the
+//     verdict of the §5 LINQ predicate count on those heads, which two
+//     existing value rows pin (#3730's `count_predicate_now_dispatches`,
+//     #3735's `sortedset_int_quantifiers`).
+//
+//   * the `?.` spelling of THIS defect is a separate gate: the null-conditional
+//     resolver (`resolveNullCondMember`) and the synthetic non-null member
+//     access `typeCall` builds for a `?.` call are two distinct sites, both in
+//     ExprTypecheck_Calls.cpp, and the house has filed each `?.` twin of this
+//     family as its own issue (#7446, #7670, #7775, #7789).
+void ExprTC::resolveMemberAccessWithRule1(const ast::MemberAccessExpr& ma) {
+    const std::size_t errorsBefore = ctx_.diagnostics().errorCount();
+    // ---- 1. the commitment -------------------------------------------
+    // A name the receiver's declared type declares as an INSTANCE member
+    // blocks extensions by that name, at any arity (§26.5 rule 1). The
+    // built-in value records declare no TypeSymbol, so the resolution found
+    // no instance member and fell through to the extension blocks: an
+    // `extension DateTime { AddDays(d: double): int }` TYPED `d.AddDays(1.0)`
+    // by the extension's `int` while codegen emitted the built-in's own
+    // lowering under it.
+    //
+    // The commitment is made by taking the extension blocks out of reach for
+    // this ONE resolution: with no applicable block, the record's own member
+    // is the answer — which is the same verdict the receiver's factory shape
+    // (`DateTime.FromTicks(0L)`, the synthetic builtinClassSym stub) already
+    // gives, since an extension head does not match that shape either.
+    std::vector<Symbol*> savedChildren;
+    std::vector<ExtensionSymbol*> savedImported;
+    bool hidExtensions = false;
+    if (ma.target) {
+        if (TypeRef* recvTy = ctx_.exprType(*ma.target)) {
+            if (recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration &&
+                recvTy->genericArgs.empty()) {
+                const ValueRecordSurface* s =
+                    valueRecordSurfaceOf(recvTy->headName());
+                if (s && surfaceDeclares(*s, ma.member)) {
+                    if (ModuleSymbol* mod = ctx_.module()) {
+                        savedChildren = mod->children;
+                        std::vector<Symbol*> kept;
+                        kept.reserve(savedChildren.size());
+                        for (Symbol* c : savedChildren)
+                            if (!dynamic_cast<ExtensionSymbol*>(c)) kept.push_back(c);
+                        mod->children = std::move(kept);
+                        savedImported = std::move(importedExtensions_);
+                        importedExtensions_.clear();
+                        hidExtensions = true;
+                    }
+                }
+            }
+        }
+    }
+    resolveMemberAccess(ma);
+    if (hidExtensions) {
+        if (ModuleSymbol* mod = ctx_.module()) mod->children = savedChildren;
+        importedExtensions_ = std::move(savedImported);
+    }
+    // ---- 2. the failure ----------------------------------------------
+    // A call that supplies arguments to a member the receiver's declared type
+    // declares with arity 0. On the built-in value records this was rule 1's
+    // "the committed instance lookup then fails" case with NO diagnostic: the
+    // call's argument was dropped, the value degraded to zero behind the
+    // #2434 warning, and the program ran. The interface collection heads
+    // (#7597) and the array-backed concrete families (#3342) already refuse
+    // this shape; the value records did not.
+    if (&ma != calleeOfCallCtx_ || currentCallArity_ <= 0 || !ma.target)
+        return;
+    if (ctx_.diagnostics().errorCount() != errorsBefore) return;
+    TypeRef* recvTy = ctx_.exprType(*ma.target);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || recvTy->declaration)
+        return;
+    const std::string_view head = recvTy->headName();
+    const ValueRecordSurface* s = valueRecordSurfaceOf(head);
+    if (!s || !surfaceDeclaresProperty(*s, ma.member)) return;
+    auto loc = ma.span.begin;
+    if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        std::string("`") + std::string(ma.member) + "` on `" +
+            std::string(head) +
+            "` is an instance member of the receiver's declared type; an "
+            "extension of the same name is unreachable (spec §26.5 rule 1: "
+            "instance members block same-named extensions of any arity, "
+            "applicability, or accessibility). The instance member takes no "
+            "arguments, but this call supplies " +
+            std::to_string(currentCallArity_) + ". " +
+            extensionNameBlockedNote(recvTy, ma.member));
+}
+
 void ExprTC::visitExpr(const ast::Expr& e) {
     // fix #6721 (§9.4, v0.340): inside a lambda formed in a record constructor
     // body, an identifier naming the receiver — `this`/`base`, or a bare
@@ -6196,7 +6414,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // resolved member symbol and field/property type.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         const std::size_t errorsBeforeMa = ctx_.diagnostics().errorCount();
-        resolveMemberAccess(*ma);
+        resolveMemberAccessWithRule1(*ma);
         // fix #7661 (stdlib §2.5-§2.7, §3.1, v0.350): a member outside a
         // by-name built-in's closed surface, whatever arm resolved it.
         checkBuiltinClosedRecordMember(*ma, errorsBeforeMa);
