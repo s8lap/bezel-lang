@@ -6213,12 +6213,61 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     }
                 }
             }
+            // fix #7874 (stdlib §2.5 / §5.1, v0.350): the selector's RESULT
+            // type U is not always a numeric PRIMITIVE -- it may be a
+            // BUILT-IN VALUE TYPE that lowers to a SCALAR WORD (`DateTime`,
+            // `TimeSpan`, `DateOnly`, `TimeOnly`). stdlib §5.1 declares
+            //     public method Min<U>(selector: (T) -> U): U
+            //                                     where U: IComparable<U>
+            // and stdlib §2.5 declares `IComparable<Self>` on each of those
+            // four, so the shape is ADMITTED -- but the accumulator was keyed
+            // off `uRef->primitive`, which a Named value type does not carry,
+            // so the accumulator stayed the `int` DEFAULT: the `i32`
+            // placeholder. The `DateTime` word is an i64, so the accumulator
+            // truncated it to 32 bits, and the `Ticks` read on the RESULT
+            // masked that truncated word with the i64 tick mask -- `and i32
+            // %mm.r, i64 4611686018427387903` -- which the IR verifier
+            // REJECTS ("Both operands to a binary operator are not of the
+            // same type!"), so the compiler ABORTED on a legal program.
+            //
+            // The accumulator is therefore keyed off the VALUE TYPE: its own
+            // word width (`i64` for `DateTime`/`TimeSpan`, `i32` for
+            // `DateOnly`/`TimeOnly`), and a `DateTime` compares by TICKS (its
+            // `Kind` rides in the word's top two bits; stdlib §2.5's
+            // "CompareTo = tick order (Kind not normalized)") while the
+            // SELECT keeps the ORIGINAL word, so the winner keeps its own
+            // `Kind` -- the same discipline the `Math.Min`/`Max` arm applies
+            // (fix #7716). `DateOnly`/`TimeOnly` are a day number / a
+            // millisecond count (stdlib §2.5), so their word compares
+            // directly.
+            //
+            // An IMPORTED user type of the same name is NOT matched:
+            // `builtinTypeName` returns {} for it (its `moduleName` is
+            // non-empty), so a user `Lib.DateTime` keeps the path it had.
+            std::string_view uValueHead;
+            if (uRef && !uRef->nullable &&
+                uRef->kind == sema::TypeRef::Kind::Named) {
+                const sema::TypeRef* ur = resolveTypeParamRef(uRef);
+                if (ur && !ur->nullable) uValueHead = builtinTypeName(ur);
+            }
+            const bool uIsDateTime = (uValueHead == "DateTime");
+            const bool uIsTimeValue = uIsDateTime ||
+                uValueHead == "TimeSpan" || uValueHead == "DateOnly" ||
+                uValueHead == "TimeOnly";
             sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(retP);
             const bool accIsFP = (retP == sema::PrimitiveType::Float ||
                                   retP == sema::PrimitiveType::Double);
             const bool accIsUnsigned = isUnsignedPrim(retP);
             llvm::Type* accLLTy = lowerTypeRef(retTyRef);
             if (!accLLTy) accLLTy = i32();
+            // fix #7874: a VALUE-TYPE U carries its own word, and the
+            // selector is lowered against the VALUE type (so the closure
+            // returns the value's word, not an `i32`).
+            if (uIsTimeValue && !call.args.empty()) {
+                retTyRef = uRef;
+                accLLTy = lowerTypeRef(uRef);
+                if (!accLLTy) accLLTy = i64();
+            }
             llvm::Value* closure = call.args.empty() ? nullptr
                 : lowerLinqLambda(call.args[0].value.get(), retTyRef);
             if (!call.args.empty() && !closure) return nullptr;
@@ -6262,14 +6311,26 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 val = builder_.CreateTrunc(val, accLLTy);
             llvm::Value* inited = builder_.CreateLoad(i1(), initSlot);
             llvm::Value* acc = builder_.CreateLoad(accLLTy, accSlot);
+            // fix #7874: a `DateTime`'s word carries its `Kind` in the top two
+            // bits, and stdlib §2.5's "CompareTo = tick order (Kind not
+            // normalized)" compares the TICKS -- the same key the
+            // `Math.Min`/`Max` arm uses (fix #7716). The stored value is the
+            // ORIGINAL word, so the winner keeps its own `Kind`.
+            llvm::Value* cmpVal = val;
+            llvm::Value* cmpAcc = acc;
+            if (uIsDateTime && val->getType()->isIntegerTy(64) &&
+                acc->getType()->isIntegerTy(64)) {
+                cmpVal = dtTicksOf(val);
+                cmpAcc = dtTicksOf(acc);
+            }
             llvm::Value* cmp = accIsFP
-                ? (isMax ? builder_.CreateFCmpOGT(val, acc)
-                         : builder_.CreateFCmpOLT(val, acc))
+                ? (isMax ? builder_.CreateFCmpOGT(cmpVal, cmpAcc)
+                         : builder_.CreateFCmpOLT(cmpVal, cmpAcc))
                 : (isMax
-                       ? (accIsUnsigned ? builder_.CreateICmpUGT(val, acc)
-                                        : builder_.CreateICmpSGT(val, acc))
-                       : (accIsUnsigned ? builder_.CreateICmpULT(val, acc)
-                                        : builder_.CreateICmpSLT(val, acc)));
+                       ? (accIsUnsigned ? builder_.CreateICmpUGT(cmpVal, cmpAcc)
+                                        : builder_.CreateICmpSGT(cmpVal, cmpAcc))
+                       : (accIsUnsigned ? builder_.CreateICmpULT(cmpVal, cmpAcc)
+                                        : builder_.CreateICmpSLT(cmpVal, cmpAcc)));
             builder_.CreateCondBr(builder_.CreateOr(builder_.CreateNot(inited), cmp),
                                   updBB, nextBB);
             builder_.SetInsertPoint(updBB);
