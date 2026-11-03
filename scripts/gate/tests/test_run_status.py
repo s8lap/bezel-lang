@@ -84,15 +84,27 @@ class RunStatusTest(unittest.TestCase):
         self.assertIn("aot-bincache is not a symlink", out)
 
     def test_staging_at_target_is_flagged(self):
+        # THE FIXTURE IS ALSO A REGRESSION TEST FOR THE HOUSE RULE (measured
+        # 2026-11-03, the R38 run). GitHub binds ONE closing keyword to ONE
+        # reference, and the reference FOLLOWS the keyword -- IMMEDIATELY (only
+        # whitespace and an optional `:` may sit between). So the subject
+        # "fix #4201 and #4202" closes #4201 ONLY: #4202 does not follow the
+        # keyword, so nothing closes it. The old fixture used exactly that
+        # shape and measured the SUBJECT-ONLY count, which is why the row
+        # counted issues that no push would ever close.
+        #
+        # => The second commit therefore carries a REAL closing keyword for its
+        # second issue, on its own line, and the row measures the
+        # GitHub-closable set.
         repo = Repo(self.d / "repo", self.env)
         repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
         repo.change("a", "fix #4200\n\n" + WANT)
-        repo.change("b", "fix #4201 and #4202\n\n" + WANT)
+        repo.change("b", "fix #4201\n\n" + WANT + "\nFixes #4202\n")
         out = self.status("--staging", str(repo.root), "--target", "3")
         st = self.row(out, "staging")
         self.assertIn("FLAG", st)
-        self.assertIn("+2 over origin/main | banked 3/3", st)
-        self.assertIn("ACTION: staging: 3 fixes banked", out)
+        self.assertIn("+2 over origin/main | closable 3/3", st)
+        self.assertIn("ACTION: staging: 3 issues GitHub would close", out)
         self.assertIn(" OK ", self.row(self.status("--staging", str(repo.root)), "staging"))
 
 
