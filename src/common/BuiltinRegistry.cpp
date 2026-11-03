@@ -591,7 +591,7 @@ struct BuiltinParamRow {
     std::string_view sig;
 };
 
-constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
+constexpr std::array<BuiltinParamRow, 384> kBuiltinParams = {{
     // fix #7421 (stdlib §9.6, §5.1, §7.3, v0.345): the §9.6 `String` head's
     // DECLARED PARAMETER TYPES, transcribed from the standard library's own
     // listing.
@@ -1198,6 +1198,114 @@ constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
     {"Path", "GetFileNameWithoutExtension", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Path", "GetDirectoryName", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Path", "GetFullPath", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    // fix #7500 (stdlib §4.7, §4.11, §4.17, §4.18, §6.1, §6.2, §6.4, §6.10,
+    // §22.5, v0.350): the §22.5 PARAMETER NAMES of the built-in heads the
+    // table carried NO ROW for at all.  Every one of these heads IS a reserved
+    // built-in name, so the §22.5 binder CLAIMS a call to one of their members
+    // and looks the declared names up in THIS table — and the table carried
+    // none, so the binder had nothing to match a name against and answered
+    // "named arguments are not supported on this built-in member — the compiler
+    // carries no parameter names for it" for a spelling §22.5 declares legal.
+    // MEASURED on the pre-fix tree (build/bezelc -c), one per head:
+    //
+    //   new Atomic<int>(initial := 5)          -> refused (the ctor names)
+    //   a.Exchange(value := 6)                  -> refused
+    //   s.Push(item := 5) / s.Enqueue(item := 5)-> refused
+    //   s.Add(item := 5) / s.ContainsKey(key := 5) / s.Remove(key := 5)
+    //   l.AddLast(item := "a")                  -> refused
+    //   m.TryAcquire(timeout := …)              -> refused
+    //   c.CancelAfter(delay := …)               -> refused
+    //   t.CancelAfter(delay := …)               -> refused
+    //
+    // stdlib §1 makes the parameter names API surface ("parameter names are
+    // API surface (named arguments, spec §22.5)"), so each name below is
+    // QUOTED from the standard library's own declaration:
+    //
+    //   §6.4  `Atomic`/`AtomicInteger`: constructor(initial: T);
+    //         Exchange(value: T); AtomicInteger.Add(delta: T).
+    //   §4.11 `Stack`/`OwningStack`: Push(item: T); Contains(item: T).
+    //         `Queue`/`OwningQueue`: Enqueue(item: T); Contains(item: T).
+    //   §4.18 `SortedSet`: Add(item: T); TryAdd(item: T); Contains(item: T);
+    //         Remove(item: T).
+    //   §4.17 `SortedDictionary`: ContainsKey(key: K); Contains(key: K);
+    //         GetOrNull(key: K); Remove(key: K).
+    //   §4.7  `OwningLinkedList`: AddFirst(item: T); AddLast(item: T);
+    //         Contains(item: T); Find(item: T); Remove(item: T).
+    //   §6.2  `Mutex`: TryAcquire(timeout: TimeSpan).
+    //   §6.1  `CancellationTokenSource`: CancelAfter(delay: TimeSpan).
+    //   §6.10 `TaskScope`: CancelAfter(delay: TimeSpan).
+    //
+    // WHY ONLY THE ONE-PARAMETER FORMS. §22.5 binds a named argument to the
+    // parameter it NAMES, in ANY order; a call whose binding is not the
+    // identity permutation is published to codegen, which must then read each
+    // parameter from the argument the binding names. These rows are the
+    // ONE-parameter forms, so their binding is ALWAYS the identity and the
+    // positional read every built-in arm performs stays correct — the
+    // two-parameter forms (`CompareExchange(expected, replacement)`,
+    // `SortedDictionary.Add(key, value)`, `OwningLinkedList.AddBefore(node,
+    // item)`, …) need the codegen arm to honour the published binding first,
+    // and they are NOT transcribed here for that reason.
+    //
+    // WHY `nonNullable` IS 0x00 AND `kinds` IS 0. Both columns are the
+    // FAIL-SAFE direction the table takes everywhere else: a position with no
+    // opinion costs a rejection that does not fire, never a false one. The
+    // element type of these parameters is a TYPE PARAMETER (`T`, `K`) or a
+    // record the kind vocabulary cannot name (`TimeSpan`), so there is no bit
+    // to transcribe; and the §7.3 nullability of a `T`/`K` position depends on
+    // the substitution, which this table does not carry.
+    //
+    // NOT TRANSCRIBED, and why:
+    //
+    //   * `JsonOptions` (stdlib §2.15) — a positional record with FIVE
+    //     components (`Indented`, `IndentWidth`, `AllowTrailingCommas`,
+    //     `IgnoreUnknownFields`, `MaxDepth`). Its `lowerNew` arm reads
+    //     `ne.args[0..4]` POSITIONALLY, so a REORDERED named construction
+    //     would be lowered into the wrong fields — a silently wrong value.
+    //     The row waits for that arm to honour the published binding.
+    //   * `TaskCompletionSource` / `OwningTaskCompletionSource` (stdlib §6.6)
+    //     — the head is AMBIGUOUS: the generic form declares
+    //     `SetResult(result: T)` and the non-generic form declares
+    //     `SetResult()`, so one (head, member, arity) row cannot say which
+    //     form a call names. A 1-argument row would bind a named argument on
+    //     the non-generic form too, where the member takes none.
+    //   * every member with an `out` SLOT (`TryPop(out item)`, `TryGetValue
+    //     (key, out value)`, …) — §22.5 makes a `ref`/`out`/`scoped` argument
+    //     POSITIONAL-ONLY, so the slot must carry no name; the `required`
+    //     column of such a row is a separate question (the `Math.DivRem`
+    //     deviation the ratchet records).
+    //   * `TimeSpan` (stdlib §2.5 declares NO constructor) and `Guid`
+    //     (stdlib §2.6: "Guid declares no constructor") — there is no
+    //     declared name to carry. The open spec-question #7550 asks whether
+    //     the compiler's `new TimeSpan(...)` should exist at all.
+    {"Atomic", "", 1, 1, 0x00, {"initial", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "constructor(initial: T)"},
+    {"AtomicInteger", "", 1, 1, 0x00, {"initial", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "constructor(initial: T)"},
+    {"Atomic", "Exchange", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Exchange(value: T): T"},
+    {"AtomicInteger", "Exchange", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Exchange(value: T): T"},
+    {"AtomicInteger", "Add", 1, 1, 0x00, {"delta", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Add(delta: T): T"},
+    {"Stack", "Push", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Push(item: T)"},
+    {"Stack", "Contains", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Contains(item: T): bool"},
+    {"OwningStack", "Push", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Push(owned item: T)"},
+    {"OwningStack", "Contains", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Contains(item: T): bool"},
+    {"Queue", "Enqueue", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Enqueue(item: T)"},
+    {"Queue", "Contains", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Contains(item: T): bool"},
+    {"OwningQueue", "Enqueue", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Enqueue(owned item: T)"},
+    {"OwningQueue", "Contains", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Contains(item: T): bool"},
+    {"SortedSet", "Add", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Add(item: T)"},
+    {"SortedSet", "TryAdd", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "TryAdd(item: T): bool"},
+    {"SortedSet", "Contains", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Contains(item: T): bool"},
+    {"SortedSet", "Remove", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Remove(item: T): bool"},
+    {"SortedDictionary", "ContainsKey", 1, 1, 0x00, {"key", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ContainsKey(key: K): bool"},
+    {"SortedDictionary", "Contains", 1, 1, 0x00, {"key", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Contains(key: K): bool"},
+    {"SortedDictionary", "GetOrNull", 1, 1, 0x00, {"key", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "GetOrNull(key: K): V?"},
+    {"SortedDictionary", "Remove", 1, 1, 0x00, {"key", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Remove(key: K): bool"},
+    {"OwningLinkedList", "AddFirst", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "AddFirst(owned item: T): LinkedListNode<T>"},
+    {"OwningLinkedList", "AddLast", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "AddLast(owned item: T): LinkedListNode<T>"},
+    {"OwningLinkedList", "Contains", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Contains(item: T): bool"},
+    {"OwningLinkedList", "Find", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Find(item: T): LinkedListNode<T>?"},
+    {"OwningLinkedList", "Remove", 1, 1, 0x00, {"item", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Remove(item: T): bool"},
+    {"Mutex", "TryAcquire", 1, 1, 0x00, {"timeout", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "TryAcquire(timeout: TimeSpan): owned Lock?"},
+    {"CancellationTokenSource", "CancelAfter", 1, 1, 0x00, {"delay", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "CancelAfter(delay: TimeSpan)"},
+    {"TaskScope", "CancelAfter", 1, 1, 0x00, {"delay", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "CancelAfter(delay: TimeSpan)"},
     {"TextWriter", "Write", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {kBPTString | kBPTChar | kBPTObject | kBPTBool | kBPTInt | kBPTByte | kBPTSByte | kBPTShort | kBPTUShort | kBPTUInt | kBPTLong | kBPTULong | kBPTFloat | kBPTDouble | kBPTDecimal, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"TextWriter", "WriteLine", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {kBPTString | kBPTObject | kBPTBool | kBPTInt | kBPTByte | kBPTSByte | kBPTShort | kBPTUShort | kBPTUInt | kBPTLong | kBPTULong | kBPTFloat | kBPTDouble | kBPTDecimal, 0, 0, 0, 0, 0, 0, 0}, ""},
 }};
