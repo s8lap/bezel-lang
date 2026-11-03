@@ -151,6 +151,30 @@ tier_for() {
 # state_of <pid> — the /proc state letter, or ?.
 state_of() { awk '{print $3}' "/proc/$1/stat" 2>/dev/null || echo '?'; }
 
+# is_agent_process <cmd> — true when the command line is an opencode AGENT
+# process rather than a build.
+#
+# WHY THIS EXISTS (measured 2026-11-03, the R38 run).  A lane agent is
+# launched as `opencode run --session <id> --model ... --agent general "<brief>"`,
+# so THE BRIEF IS THE AGENT'S COMMAND-LINE ARGUMENT.  Every lane brief in this
+# campaign names `scripts/dev_heavy.sh` and `scripts/agent_check.sh`, so the
+# agent's own argv matches HEAVY and the reaper reports the AGENT as a stale
+# dev process.  A blanket `reap_stale.sh --kill` would then destroy a LIVE
+# lane.  The agent is not wedged: it spends most of its wall-clock waiting on
+# the model, so it shows no CPU and no disk I/O, which is exactly the signal
+# the reaper uses to call something stale.
+#
+# ⇒ AN AGENT IS EXEMPT AT ANY AGE.  A lane dies by its SESSION ending, and the
+# session reconciler (scripts/pool_lanes.sh) measures that; age is not a
+# death certificate for an agent.
+#
+# The match is deliberately loose (`opencode run` ... `--session` anywhere in
+# the line): a false EXEMPTION costs a few hundred wasted bytes, while a false
+# REAP costs a lane.  Err toward not killing.
+is_agent_process() {
+  printf '%s' "$1" | grep -qE '(^|/)opencode run .*--session'
+}
+
 # ---------------------------------------------------------------------------
 # Self-test: synthetic input, no live processes touched.
 # ---------------------------------------------------------------------------
@@ -198,6 +222,24 @@ if [ "$SELF_TEST" = 1 ]; then
   assert 'tail -f /var/log/messages'                            miss "$PATTERN" "" ""
   assert 'python3 ~/.claude/hooks/bezel_build_guard.py --root /x' miss "$PATTERN" "" ""
   assert 'git commit -m wip'                                    miss "$PATTERN" "" ""
+
+  echo "self-test: the AGENT exemption (an agent's argv IS its brief)"
+  assert_agent() { # <cmd> <expect: exempt|keep>
+    local got
+    if is_agent_process "$1"; then got=exempt; else got=keep; fi
+    if [ "$got" = "$2" ]; then echo "  ok   [$2] ${1:0:72}"
+    else echo "  FAIL expected=$2 got=$got :: ${1:0:72}"; fails=$((fails+1)); fi
+  }
+  # A lane agent: its BRIEF is its argv, so a brief naming dev_heavy.sh or
+  # agent_check.sh makes the agent's own command line match HEAVY.  It must be
+  # EXEMPT -- reaping it would kill a live lane.
+  assert_agent 'opencode run --session ses_x --model minimax/MiniMax-M3.1-Flash --agent general <brief>' exempt
+  assert_agent '/home/stepan/.opencode/bin/opencode run --session ses_x --model m --agent general <brief: route every build through scripts/dev_heavy.sh>' exempt
+  # Real builds must NOT be exempted.
+  assert_agent 'cmake --build build --target bezel_tests -j16' keep
+  assert_agent 'scripts/dev_heavy.sh build cmake --build build --target bezelc' keep
+  assert_agent 'build/tests/bezel_tests_codegen --gtest_filter=x' keep
+  assert_agent 'agent_check.sh --area codegen foo' keep
 
   echo "self-test: tiering (parent signal sets the LOWER bar)"
   # Ownerless (ppid=1) crosses at ORPHAN_AGE=300, not AGE=1200.
@@ -269,6 +311,10 @@ while read -r pid ppid etimes rss cmd; do
   printf '%s' "$cmd" | grep -qE "$PATTERN" || continue
   # Off-limits regardless of age: an in-flight gate even if the pidfile is absent.
   printf '%s' "$cmd" | grep -q 'gate_and_push' && continue
+  # Off-limits regardless of age: a LANE AGENT (see is_agent_process). Its
+  # argv carries the brief, so a brief naming dev_heavy.sh/agent_check.sh
+  # makes the agent look like a build; reaping it would kill a live lane.
+  is_agent_process "$cmd" && continue
   t=$(tier_for "$ppid" "$etimes")
   [ -n "$t" ] || continue
   C_PID+=("$pid"); C_TIER+=("$t"); C_AGE+=("$etimes"); C_CMD+=("$cmd")
