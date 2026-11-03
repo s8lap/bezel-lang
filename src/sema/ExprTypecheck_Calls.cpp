@@ -31919,6 +31919,68 @@ static bool builtinObjectBaseDeclaresMember(const TypeRef* recvTy,
            member == "GetHashCode" || member == "GetType";
 }
 
+// fix #7824 (§26.5 rule 1, §8.1, v0.350): the USER half of
+// `builtinObjectBaseDeclaresMember` above.
+//
+// `Object` is a base type of every user class and record, and it declares the
+// four universal instance members `ToString`, `Equals`, `GetHashCode` and
+// `GetType` (§8.1). Rule 1 commits instance resolution for those NAMES on
+// such a receiver ("of any arity, applicability, or accessibility"), so the
+// extension blocks are never consulted for them.
+//
+// The commitment is INVISIBLE to the ordinary member walk: `Object`'s members
+// are not symbols on the user type, so the walk finds no `ToString` and the
+// resolution fell through to the extension blocks. MEASURED: an
+// `extension R { ToString(n: int): string }` bound `x.ToString(3)` on a
+// `record R`, and an `extension C { Equals(a: int, b: int): bool }` bound
+// `x.Equals(1, 2)` on a `class C`.
+//
+// The BUILT-IN heads that reach an `extension Object` block are the other
+// half (`builtinObjectBaseDeclaresMember`); a user type needs no such
+// reachability test — its `Object` base is there by §8.1.
+//
+// SCOPE. A class, a record, an interface or an enum: a class INHERITS
+// `Object`'s members (§8.1), an interface REACHES `Object` the same way
+// (§8.1: "with `string`, interfaces, and function types reaching `Object`
+// similarly via their reference-type heap representation"), and a record or an
+// enum DECLARES its own `Equals` / `GetHashCode` / `ToString` (§8.3's
+// per-kind default table, §8.5, §9.2, §12.2). A CHOICE is left out: §35.7
+// generates no default `ToString` / `Equals` / `GetHashCode` for it (its
+// `.ToString()` is a use-site error the author removes by DECLARING the
+// member, §35.2), so no name is committed there and §26.5 rule 2 still
+// admits an extension. A primitive is a different resolution path (the
+// built-in chain, not this one) and carries its own §9.x surface.
+//
+// A BUILT-IN class STUB is not a user type: `SemaContext::builtinClassSym`
+// mints a synthetic `TypeSymbol` (kind `Class`, `decl == nullptr`) for the
+// built-in class family (`DateTime`, `Type`, `Task`, ...), and a value record
+// reached through a call carries that stub as its `TypeRef`'s declaration
+// (#7536). The built-in family's own rule-1 commitment is #7970's
+// (`ExprTC::resolveMemberAccessWithRule1`, whose value-record surface table
+// carries §8.1's universal members), so this predicate must NOT claim those
+// receivers — a second refusal would double-report the same call. A stub is
+// told from a user type by `TypeSymbol::decl`: a LOCAL user type carries its
+// `ast::TypeDecl` there, and an IMPORTED one is in the context's imported
+// set (`TypeSymbol::decl` is never assigned for an import — see
+// `ModuleLoader.cpp`'s import path), while a stub is neither.
+static bool userTypeDeclaresObjectSlotMember(const TypeRef* recvTy,
+                                              std::string_view member,
+                                              const SemaContext& ctx) {
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || !recvTy->declaration)
+        return false;
+    const ast::TypeDeclKind kind = recvTy->declaration->kind;
+    if (kind != ast::TypeDeclKind::Class &&
+        kind != ast::TypeDeclKind::Record &&
+        kind != ast::TypeDeclKind::Interface &&
+        kind != ast::TypeDeclKind::Enum)
+        return false;
+    if (recvTy->declaration->decl == nullptr &&
+        !ctx.isImported(recvTy->declaration))
+        return false;  // a built-in class stub, not a user type
+    return member == "ToString" || member == "Equals" ||
+           member == "GetHashCode" || member == "GetType";
+}
+
 bool builtinHeadReachesObjectExtension(std::string_view head) {
     // The heads whose declared surface is decided by name above
     // (builtinStringBuilderDeclaresMember, concreteCollectionSurfaces) AND
@@ -39502,39 +39564,72 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // receiver path above.
         auto extLoc = ma.span.begin;
         if (extLoc.line == 0 && ma.target) extLoc = ma.target->span.begin;
-        if (Symbol* ext = lookupExtensionMember(
-                recvTy, ma.member, &binding, extLoc,
-                /*reportAmbiguity=*/true, currentCallArity_)) {
-            // fix #4292 (§26.4/§26.5, v0.298): re-verify a #4238 self-call
-            // synthesis result against the ORIGIN extension block's own
-            // where-clause before trusting it — see
-            // `selfCallSiblingWhereSatisfiedByCaller`'s header comment
-            // above for why `lookupExtensionMember`'s ground-only filter
-            // cannot decide this by itself. Unaffected: the external-call
-            // path (`selfCallExtSynth == false`) always takes the `admit`
-            // path unchanged.
-            bool admit = true;
-            if (selfCallExtSynth && currentExtension_) {
-                if (auto* callerDecl = dynamic_cast<const ast::ExtensionDecl*>(
-                        currentExtension_->decl)) {
-                    if (auto* foundDecl = owningExtensionDeclOf(
-                            ctx_, importedExtensions_, ext)) {
-                        admit = selfCallSiblingWhereSatisfiedByCaller(
-                            ctx_, *callerDecl, *foundDecl, binding);
+        // fix #7824 (§26.5 rule 1, §8.1, v0.350): the USER half of the
+        // rule-1 commitment, on the site where the extension blocks are
+        // consulted for a receiver whose declared type is a user class or a
+        // record.
+        //
+        // `Object` is the base type of every user class and record (§8.1) and
+        // it DECLARES the four universal instance members `ToString`,
+        // `Equals`, `GetHashCode` and `GetType`. Rule 1: "If `x`'s declared
+        // type (or any base type) *declares* any instance member named `Foo` —
+        // of any arity, applicability, or accessibility — instance resolution
+        // is committed and extension blocks are **never consulted** for that
+        // name on that receiver."
+        //
+        // The commitment is INVISIBLE to the ordinary member walk above:
+        // `Object`'s members are not symbols on the user type, so the walk
+        // finds no `ToString` and the resolution reached this site, where the
+        // extension block answered. MEASURED: an
+        // `extension R { ToString(n: int): string }` bound `x.ToString(3)` on
+        // a `record R`, and an `extension C { Equals(a: int, b: int): bool }`
+        // bound `x.Equals(1, 2)` on a `class C` — the extension's answer
+        // where the committed instance member is the answer.
+        //
+        // The refusal is the HOUSE one, and it is NOT a new diagnostic: the
+        // committed instance member has no MemberSymbol (§8.1's universal
+        // members are synthesized), so the call reaches typeCall's universal
+        // arity check, which reports "the universal `Object.ToString` member
+        // takes 0 argument(s) but the call supplies 1 (§8.1)" — the same
+        // refusal the built-in receivers get (#7775's `object_base_members_
+        // are_not_shadowed_on_an_array` row). The extension's value is never
+        // produced, and the extension's arity is never what the call is
+        // measured against.
+        if (!userTypeDeclaresObjectSlotMember(recvTy, ma.member, ctx_)) {
+            if (Symbol* ext = lookupExtensionMember(
+                    recvTy, ma.member, &binding, extLoc,
+                    /*reportAmbiguity=*/true, currentCallArity_)) {
+                // fix #4292 (§26.4/§26.5, v0.298): re-verify a #4238 self-call
+                // synthesis result against the ORIGIN extension block's own
+                // where-clause before trusting it — see
+                // `selfCallSiblingWhereSatisfiedByCaller`'s header comment
+                // above for why `lookupExtensionMember`'s ground-only filter
+                // cannot decide this by itself. Unaffected: the external-call
+                // path (`selfCallExtSynth == false`) always takes the `admit`
+                // path unchanged.
+                bool admit = true;
+                if (selfCallExtSynth && currentExtension_) {
+                    if (auto* callerDecl = dynamic_cast<const ast::ExtensionDecl*>(
+                            currentExtension_->decl)) {
+                        if (auto* foundDecl = owningExtensionDeclOf(
+                                ctx_, importedExtensions_, ext)) {
+                            admit = selfCallSiblingWhereSatisfiedByCaller(
+                                ctx_, *callerDecl, *foundDecl, binding);
+                        }
                     }
                 }
+                if (admit) {
+                    if (!binding.empty())
+                        ctx_.setExprExtBinding(&ma, std::move(binding));
+                    resolveExtensionMember(ma, ext);
+                    return;
+                }
+                // else: fall through to the rest of resolveMemberAccess, which
+                // reports "no such member" exactly as if lookupExtensionMember
+                // had found nothing — matching the identical EXTERNAL call's
+                // rejection of the same unsatisfied-constraint instantiation
+                // (#4292's Control A).
             }
-            if (admit) {
-                if (!binding.empty())
-                    ctx_.setExprExtBinding(&ma, std::move(binding));
-                resolveExtensionMember(ma, ext);
-                return;
-            }
-            // else: fall through to the rest of resolveMemberAccess, which
-            // reports "no such member" exactly as if lookupExtensionMember
-            // had found nothing — matching the identical EXTERNAL call's
-            // rejection of the same unsatisfied-constraint instantiation
-            // (#4292's Control A).
         }
     }
     // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.278): for receivers whose
