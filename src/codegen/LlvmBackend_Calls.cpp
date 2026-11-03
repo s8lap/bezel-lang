@@ -15831,13 +15831,30 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         builder_.CreateICmpSLT(kVal, mathCmpKey(lo)), lo, inner,
                         "clamp.dt.result");
                 }
+                // fix #7901 (stdlib §2.2, v0.350): stdlib §2.2's order is
+                // "`Clamp(value, low, high)` returns `low` when `value`
+                // compares less than `low`, `high` when it compares greater
+                // than `high`, and `value` otherwise" -- the SAME order the
+                // `string`, `decimal`, `IComparable` and `DateTime` arms of
+                // this very call already implement (the `DateTime` arm quotes
+                // the sentence verbatim in
+                // tests/codegen/datetime_kind_7716_test.cpp). This arm
+                // computed the CLAMP FIRST and compared the CLAMP with
+                // `high`, so when `low > high` it returned `high` -- the one
+                // value stdlib §2.2's order never returns -- where the order
+                // returns `low`. MEASURED: `Math.Clamp(5, 10, 1)` printed 1
+                // where the order gives 10, and `Math.Clamp(5.0, 10.0, 1.0)`
+                // printed 1 where the order gives 10. For `low <= high` the
+                // two shapes agree EXACTLY (the clamp-then-compare form can
+                // only differ once `low > high`), so this is not a behaviour
+                // flip of the normal case.
                 const bool uns = mathUnsignedCmp(call.args[valSrc].value.get());
-                llvm::Value* clamped = builder_.CreateSelect(
-                    uns ? builder_.CreateICmpULT(val, lo)
-                        : builder_.CreateICmpSLT(val, lo), lo, val);
+                llvm::Value* inner = builder_.CreateSelect(
+                    uns ? builder_.CreateICmpUGT(val, hi)
+                        : builder_.CreateICmpSGT(val, hi), hi, val);
                 return builder_.CreateSelect(
-                    uns ? builder_.CreateICmpUGT(clamped, hi)
-                        : builder_.CreateICmpSGT(clamped, hi), hi, clamped, "clamp.result");
+                    uns ? builder_.CreateICmpULT(val, lo)
+                        : builder_.CreateICmpSLT(val, lo), lo, inner, "clamp.result");
             } else if (sema::MethodSymbol* cmpMs =
                            comparableCompareTo(call.args[valSrc].value.get())) {
                 // #1141: non-numeric IComparable<T> → value.CompareTo(lo) < 0 ?
@@ -15899,10 +15916,16 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 if (!val->getType()->isFloatingPointTy()) val = builder_.CreateSIToFP(val, dbl);
                 if (!lo->getType()->isFloatingPointTy())  lo  = builder_.CreateSIToFP(lo, dbl);
                 if (!hi->getType()->isFloatingPointTy())  hi  = builder_.CreateSIToFP(hi, dbl);
-                llvm::Value* clamped = builder_.CreateSelect(
-                    builder_.CreateFCmpOLT(val, lo), lo, val);
+                // fix #7901: stdlib §2.2's order, the same one the integer
+                // arm above and the `string` / `decimal` / `IComparable` /
+                // `DateTime` arms implement -- "`low` when `value` compares
+                // less than `low`, `high` when it compares greater than
+                // `high`, and `value` otherwise". The clamp-then-compare
+                // shape returned `high` when `low > high`.
+                llvm::Value* inner = builder_.CreateSelect(
+                    builder_.CreateFCmpOGT(val, hi), hi, val);
                 return builder_.CreateSelect(
-                    builder_.CreateFCmpOGT(clamped, hi), hi, clamped, "clamp.f.result");
+                    builder_.CreateFCmpOLT(val, lo), lo, inner, "clamp.f.result");
             }
         }
         // fix #3559 (stdlib §2.2, v0.285): the libc-backed lowerings for
