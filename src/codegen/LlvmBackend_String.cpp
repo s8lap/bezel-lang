@@ -1570,6 +1570,101 @@ bool isBuiltinReaderStringArg(const ast::Expr* callee, size_t i,
 }
 
 
+// fix #7592 (§8.5, §8.1, §12.7 *Function-typed targets*, stdlib §3.1, v0.353):
+// record the `StringBuilder.Append(value: Object)` ARGUMENT as sitting at an
+// `Object` position, so that a FUNCTION VALUE handed to it is converted to its
+// OBJECT VIEW (the `fnAtObject_` mechanism's apply step, `fnValForObjectTarget`).
+//
+// THE DEFECT THIS CLOSES.
+//
+//   stdlib §3.1 (v0.353) declares, verbatim:
+//
+//     "public method Append(value: Object): StringBuilder;"
+//
+//   and its Contracts clause: "`Append(value: Object)` keeps `value.ToString()`'s
+//   text, not `value`". §8.1 (v0.353) makes a function type reach `Object`
+//   "via [its] reference-type heap representation" — so a function value at an
+//   `Object` position is the OBJECT VIEW of its closure cell (the header the
+//   `Object` slot holds), NOT the cell base.
+//
+//   The `Object`-position machinery (`fnAtObject_`, the #5978 change) recorded the
+//   sites where an operand "sits where an `Object` is expected" — but its
+//   table (`kFnObjSites`, LlvmBackend_Layout.cpp) is keyed on the RECEIVER's
+//   TYPE ARGUMENT, so it covers the GENERIC collection heads
+//   (`Array<T>.Add(item: T)` at an `Array<Object>`) and nothing else. A
+//   NON-generic built-in with an `Object` parameter — `StringBuilder`'s
+//   `Append` — was not covered: the function value stayed the raw closure
+//   CELL, whose word 0 is a CODE pointer.
+//
+//   ⇒⇒ The StringBuilder's `Append` lowering then took that cell for a
+//   STRING: `lowerObjectToString` asked `bz_obj_is_string(recv, table)`, whose
+//   rule is "not a listed vtable ⇒ a string", and a closure cell's word 0
+//   (a code pointer) is not a listed vtable ⇒ the cell was answered "a
+//   string". The builder's parts array — an `Array<string>` — therefore held
+//   the closure CELL as a part, and the builder's own disposal released it as
+//   a string: `bz_string_release` read the cell's word 3 as a refcount and
+//   freed a block that is not a string. MEASURED (the issue's own repro):
+//   "AddressSanitizer: SEGV on unknown address … The signal is caused by a
+//   WRITE memory access … #2 bz_string_release … #4 bz_array_free" — and the
+//   builder's content was the cell's bytes read as text, i.e. the append
+//   "appended nothing" (the issue's title).
+//
+//   §8.5 (v0.353) makes a function value render as its FORMED TYPE: "For
+//   **function values** … the stdlib §2.13 `FullName` rendering of the value's
+//   own function type — the type it was **formed** at … — `"(int) -> int"` … a
+//   lambda and a method reference render alike, **through `Object`** and at an
+//   interpolation hole alike." §12.7's *Function-typed targets* paragraph is
+//   where the formed type is fixed ("A function value's own type is the type
+//   it was formed at"). So `sb.Append(g)` must append the same text that
+//   `g.ToString()` prints — "(int) -> int" — and the two routes MUST agree.
+//
+// WHY THE CONVERSION IS THE RIGHT FIX AND NOT A RENDERING SPECIAL CASE. The
+// value `Append` receives IS an `Object` — the parameter's declared type — so
+// the conversion the `Object` slot performs is the one the `Object.ToString()`
+// route assumes (the same reason `bz_obj_is_string` exists at all, and the
+// same reason the `Object.ToString()` route and the `AppendFormat` route
+// agree — the #7244 repair). Making the argument an object view makes the two routes
+// AGREE by construction, and it fixes every `Object`-typed consumer of the
+// same argument, not just this one.
+//
+// THE RECOGNITION is structural, keyed on the same shapes the lowering keys
+// on (stdlib §3.1's `Append(value: Object)` on a `StringBuilder` receiver), so
+// the conversion decision and the lowering stay in lockstep.
+void Emitter::noteFnAtObjectStringBuilderArgs(const ast::Expr& e) {
+    const auto* call = dynamic_cast<const ast::CallExpr*>(&e);
+    if (!call || call->args.empty()) return;
+    const auto* ma =
+        dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target) return;
+    // stdlib §3.1: `Append(value: Object)` is the only `Append` overload with
+    // an `Object` parameter (`Append(value: string)`, `Append(value: char)`
+    // and the primitive overloads are not `Object` positions, and a `string`
+    // or a `char` is never a function value, so the conversion is a no-op for
+    // them either way). `AppendLine` has no `Object` overload at all
+    // (stdlib §3.1: `AppendLine()` / `AppendLine(value: string)`).
+    if (ma->member != "Append") return;
+    // The receiver must be the `StringBuilder` built-in (the same test the
+    // #1185 relaxation uses: a declaration-less Named type whose head is
+    // "StringBuilder").
+    const sema::TypeRef* rt = ctx_.exprType(*ma->target);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return;
+    if (rt->headName() != "StringBuilder") return;
+    const ast::Expr* arg = call->args[0].value.get();
+    if (!arg) return;
+    // The `Object` position type. A function-local static: the map stores the
+    // POINTER, so the referent must outlive the lowering — and it does, for
+    // the process.
+    static const sema::TypeRef objectPosition = [] {
+        sema::TypeRef t;
+        t.kind = sema::TypeRef::Kind::Primitive;
+        t.primitive = sema::PrimitiveType::Object;
+        return t;
+    }();
+    noteFnAtObject(arg, &objectPosition);
+}
+
+
 llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                                    const ast::MemberAccessExpr& ma,
                                    llvm::Value* self) {

@@ -5887,6 +5887,15 @@ private:
     void noteFnAtObjectLiteral(const ast::CollectionLiteralExpr& cl,
                                const sema::TypeRef* collTy);
     void noteFnAtObjectChildren(const ast::Expr& e);
+    // fix #7592 (§8.5, §8.1, §12.7 *Function-typed targets*, stdlib §3.1,
+    // v0.353): the `Object`-position
+    // sites of the NON-GENERIC built-in string surface — `StringBuilder`'s
+    // `Append(value: Object)`. `noteFnAtObjectArgs` (LlvmBackend_Layout.cpp)
+    // covers the GENERIC collection heads, whose `Object` position is the
+    // receiver's own type argument; a NON-generic built-in has no type
+    // argument to read, so its `Object` parameter is recorded here instead.
+    // Defined in LlvmBackend_String.cpp — the string surface's own file.
+    void noteFnAtObjectStringBuilderArgs(const ast::Expr& e);
     void noteFnAtObjectStmt(const ast::Stmt& s);
     // The inverse: an `Object`-typed reference known to hold a function value
     // (or null) -> the cell base every invocation site expects.

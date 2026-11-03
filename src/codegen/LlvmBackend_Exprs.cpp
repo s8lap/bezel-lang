@@ -353,6 +353,16 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     fullExprFn_ = thisFn;
     ++fullExprDepth_;
     noteFnAtObjectChildren(e);   // #5978: see `fnAtObject_`
+    // fix #7592 (§8.5, §8.1, §12.7 *Function-typed targets*, stdlib §3.1,
+    // v0.353): the `Object`-position
+    // sites of the NON-generic built-in string surface — `StringBuilder`'s
+    // `Append(value: Object)`. `noteFnAtObjectChildren` covers the GENERIC
+    // collection heads (whose `Object` position is the receiver's own type
+    // argument); a NON-generic built-in has no type argument to read, so its
+    // `Object` parameter is recorded by this sibling. Both run BEFORE the
+    // expression's own lowering — and therefore before the ARGUMENT's
+    // lowering, which is where the conversion is applied.
+    noteFnAtObjectStringBuilderArgs(e);
     if (checkedDisposal_) noteCdBenignChildren(e);   // #4602
     // fix #7906 / §28.3 *Unbound owned temporaries* / K8.1 (v0.350): the CLAIM
     // for a FRESH `owned` DECLARATION-LESS BUILT-IN CLASS (`Random`, `Mutex`,
