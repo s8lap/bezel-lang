@@ -2879,6 +2879,20 @@ private:
     bool isStaticCtxInstanceMemberOfEnclosingType(
         std::string_view name) const;
 
+    // fix #8041 / #8043 (§8.1 / §26.5 / §22.12, v0.350): the root `Object`'s
+    // CLOSED surface, checked at the CALL: a call whose arity matches no
+    // declared form of one of §8.1's five members is refused (the arity
+    // axis #7973's by-name closure left open), and the one STATIC member
+    // (`ReferenceEquals`) is refused when it is spelled through an INSTANCE.
+    // The canonical site is `typeCall`'s #2446 universal-arity block
+    // (src/sema/ExprTypecheck_Calls.cpp), which is outside this lane's
+    // budget and skips every PRIMITIVE-typed receiver — the root `Object`
+    // is one. The check's own comment (at its definition in
+    // src/sema/ExprTypecheck.cpp) states the rationale; its only entry
+    // point is `recordImportedMethodDefaultObligation`, this lane's one
+    // per-call hook.
+    void checkObjectClosedSurfaceCall(const ast::CallExpr& ce);
+
     // §26.5: extension-member lookup. Consulted ONLY when no instance member
     // matches (instance members win — an extension never shadows a real
     // member). Searches the module's ExtensionSymbols for one whose target

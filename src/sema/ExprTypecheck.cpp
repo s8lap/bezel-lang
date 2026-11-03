@@ -491,6 +491,16 @@ void ExprTC::recordImportedClassDefaultObligation(const TypeSymbol* ts,
 // the method's declared type parameters in declaration order (§14.5);
 // otherwise §14.5's argument-driven inference applies.
 void ExprTC::recordImportedMethodDefaultObligation(const ast::CallExpr& ce) {
+    // fix #8041 / #8043 (§8.1 / §26.5 / §22.12, v0.350): the root `Object`'s
+    // CLOSED surface — its arity axis and its one static member. This
+    // function is this lane's ONE per-call hook (src/sema/ExprTypecheck_Exprs.cpp
+    // calls it for EVERY CallExpr, right after `typeCall`), and the
+    // canonical site for the check — `typeCall`'s #2446 universal-arity
+    // block (src/sema/ExprTypecheck_Calls.cpp) — is outside this lane's
+    // budget AND skips every PRIMITIVE-typed receiver, which the root
+    // `Object` is. The check's own comment (at its definition, above)
+    // states the whole rationale; this call is its only entry point.
+    checkObjectClosedSurfaceCall(ce);
     auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*ce.callee));
     if (!ms) return;
     // The importer's own replay covers the method whose body WAS attached.
@@ -14314,6 +14324,134 @@ static bool isObjectPublicSurfaceMember(std::string_view name) {
            name == "ToString" || name == "ReferenceEquals";
 }
 
+// fix #8041 (§8.1, v0.350): the DECLARED FORMS of the root `Object`'s
+// surface — the arities a call on the closed surface may use. Transcribed
+// from §8.1's declaration block, one form per member:
+//
+//     public method GetType(): Type;                       -> 0
+//     public virtual method Equals(other: Object?): bool;  -> 1
+//     public virtual method GetHashCode(): int;            -> 0
+//     public virtual method ToString(): string;            -> 0
+//     public static method ReferenceEquals(a, b): bool;    -> 2
+//
+// The #7973 refusal closed the surface BY NAME; this is the ARITY axis the
+// closed surface needs (§26.5 rule 1: "If the committed instance lookup
+// then fails (no applicable overload, §22.5/§22.6, or the member is
+// inaccessible), the call is a compile error citing the instance
+// member(s)"). Returns -1 for a name that is not one of the five.
+static int objectPublicSurfaceFormArity(std::string_view name) {
+    if (name == "GetType") return 0;
+    if (name == "Equals") return 1;
+    if (name == "GetHashCode") return 0;
+    if (name == "ToString") return 0;
+    if (name == "ReferenceEquals") return 2;
+    return -1;
+}
+
+// fix #8043 (§8.1 / §22.12, v0.350): `ReferenceEquals` is the ONE STATIC
+// member of §8.1's declaration block — the other four are instance
+// members, so they are reached through a value, while a static member is
+// reached through its TYPE (`Object.ReferenceEquals(a, b)`, §2.7 rule 1's
+// chain-head-is-a-type rule and §22.12's "a static member must be accessed
+// through the type name, not an instance").
+static bool isObjectStaticSurfaceMember(std::string_view name) {
+    return name == "ReferenceEquals";
+}
+
+// fix #8041 / #8043 (§8.1 / §26.5 / §22.12, v0.350): the root `Object`'s
+// CLOSED surface — its ARITY axis, and its one STATIC member.
+//
+// WHERE THIS CHECK LIVES, AND WHY NOT AT THE CANONICAL SITE. The canonical
+// site is `typeCall`'s #2446 universal-arity block
+// (src/sema/ExprTypecheck_Calls.cpp) — the ONE place that checks a
+// wrong-arity call to a universal `Object` member — but (a) that file is
+// outside this lane's budget, and (b) its `receiverHasTypeSpecificOverloads`
+// guard skips every PRIMITIVE-typed receiver, and the root `Object` IS one
+// (`Kind::Primitive`, `primitive == Object`), so the root `Object`'s surface
+// never reaches it. The same discipline #7973's refusal used: the check is
+// drawn at the in-budget site that sees the facts.
+//
+// The site: `recordImportedMethodDefaultObligation` is this lane's ONE
+// per-call hook — src/sema/ExprTypecheck_Exprs.cpp calls it for EVERY
+// CallExpr, right after `typeCall` — so the check runs for every call. That
+// matters: `o.ToString(1)` is typed by the primitive-intrinsic branch of
+// `resolveMemberAccess` (ExprTypecheck_Calls.cpp) and RETURNS there, so it
+// never reaches the extension lookup — the `.` spelling of `ToString` is
+// exactly the shape a lookup-site check cannot see, and the `?.` spelling
+// (`o?.ToString(1)`) reaches it.
+//
+// THE TWO REFUSALS.
+//
+// (1) fix #8043 — the STATIC member through an INSTANCE. §8.1 declares
+//     `public static method ReferenceEquals(a: Object?, b: Object?): bool;`
+//     — a static member, so §22.12 requires it to be accessed through the
+//     type name, not an instance, and §2.7 rule 1's chain-head rule reaches
+//     it through its TYPE (`Object.ReferenceEquals(a, b)`), never through a
+//     value. The instance spelling names nothing, and the call used to
+//     reach codegen and degrade.
+//
+// (2) fix #8041 — the ARITY axis. §26.5 rule 1: "If `x`'s declared type
+//     (or any base type) *declares* any instance member named `Foo` — of
+//     any arity, applicability, or accessibility — instance resolution is
+//     committed and extension blocks are **never consulted** for that name
+//     on that receiver. If the committed instance lookup then fails (no
+//     applicable overload, §22.5 / §22.6, or the member is inaccessible),
+//     the call is a compile error citing the instance member(s)." §8.1
+//     declares ONE form per member (`GetType()` 0, `Equals(other: Object?)`
+//     1, `GetHashCode()` 0, `ToString()` 0), so a call whose arity matches
+//     no declared form binds no form and is a compile error — the way §22.6
+//     refuses a call that binds no overload.
+void ExprTC::checkObjectClosedSurfaceCall(const ast::CallExpr& ce) {
+    std::string_view member;
+    const ast::Expr* target = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+        member = ma->member;
+        target = ma->target.get();
+    } else if (auto* nm =
+                   dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get())) {
+        member = nm->member;
+        target = nm->target.get();
+    } else {
+        return;
+    }
+    if (!target) return;
+    const int declaredArity = objectPublicSurfaceFormArity(member);
+    if (declaredArity < 0) return;  // not one of §8.1's five names
+    // The receiver must be a VALUE of the root `Object` type. The
+    // static-qualifier path (`Object.ReferenceEquals(a, b)`, §22.12) resolves
+    // against the compiler's CANONICAL root-`Object` TypeRef, which
+    // `isRootObjectValueReceiver` excludes — that spelling keeps working,
+    // and it is the admitting twin of the refusal below.
+    if (!isRootObjectValueReceiver(ctx_.exprType(*target), ctx_)) return;
+    if (isObjectStaticSurfaceMember(member)) {
+        // fix #8043 (§8.1 / §22.12, v0.350).
+        ctx_.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            "cannot call the static member `" + std::string(member) +
+                "` through an instance of `Object`: `" +
+                std::string(member) +
+                "` is a static member of the root `Object` (\xC2\xA7""8.1) and "
+                "must be accessed through the type name, not an instance "
+                "(\xC2\xA7""22.12) — write `Object." +
+                std::string(member) + "(a, b)`");
+        return;
+    }
+    const std::size_t supplied = ce.args.size();
+    if (supplied == static_cast<std::size_t>(declaredArity)) return;
+    // fix #8041 (§8.1 / §22.6 / §26.5, v0.350). The wording is the #2446
+    // universal-arity wording, so the two sites that refuse a wrong-arity
+    // universal call say the same thing.
+    ctx_.diagnostics().report(
+        Severity::Error, ce.span.begin,
+        "the universal `Object." + std::string(member) +
+            "` member takes " + std::to_string(declaredArity) +
+            " argument(s) but the call supplies " + std::to_string(supplied) +
+            " (\xC2\xA7""8.1); the root `Object`'s public surface is closed, "
+            "and \xC2\xA7""26.5 rule 1 commits the instance lookup for that "
+            "name, so a call that binds no declared form of it is a compile "
+            "error (\xC2\xA7""22.6)");
+}
+
 Symbol* ExprTC::lookupExtensionMember(
     const TypeRef* receiver,
     std::string_view name,
@@ -14549,6 +14687,32 @@ Symbol* ExprTC::lookupExtensionMember(
     };
     std::vector<ExtCandidate> found;
     std::vector<std::unique_ptr<TypeRef>> ownedAncs;
+    // fix #8041 / #8042 (§8.1 / §26.5, v0.350): the ARITY axis of the closed
+    // surface. The per-call arity filter below (fix #2328) DROPS a same-named
+    // extension member whose parameter list has a different arity, so by the
+    // time this lookup reaches its no-match branch the candidate is gone —
+    // and the refusal can no longer tell "no such member" from "such a
+    // member, but not with this many arguments". This collector keeps the
+    // ARITIES of the name-matched members of the blocks that match the
+    // receiver, so the refusal can name the arity instead of claiming the
+    // member's absence.
+    //
+    // `sameNameArities` — the blocks that match the receiver AND pass their
+    // `where` applicability filter (§26.5.1): these blocks DO provide the
+    // name, and only the call's arity is wrong.
+    //
+    // It is the ONLY collector: a block whose `where` clause EXCLUDES the
+    // receiver is not represented here, because that case cannot arise for
+    // the root `Object` — §26.5.1's applicability filter needs the block's
+    // free type variable BOUND (`extWhereClauseProvablyViolated` skips an
+    // unbound constraint), and an `extension Object` block has NO free type
+    // variable (the root `Object` is a PRIMITIVE head, so the free-var scan
+    // below never runs on it), while `extension Object<T>` is rejected at the
+    // declaration ("`Object` is the root type and takes no generic
+    // arguments", §8.1). MEASURED: `extension Object where T: hashable
+    // public method Extra(x: int)` reaches the arity refusal below, not a
+    // `where` refusal.
+    std::vector<std::size_t> sameNameArities;
     for (ExtensionSymbol* ext : candidates) {
         auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext->decl);
         if (!decl || !decl->targetType) continue;
@@ -14632,6 +14796,17 @@ Symbol* ExprTC::lookupExtensionMember(
         const TypeRef* matchedAnc = extensionFindMatchingAncestor(
             target, receiver, freeVars, ownedAncs);
         if (!matchedAnc) continue;
+        // fix #8041 / #8042 (§8.1 / §26.5, v0.350): collect the ARITIES of this
+        // block's name-matched members BEFORE the per-call arity filter below
+        // drops them. The block MATCHES the receiver here, so its members are
+        // the ones §26.5 rule 2 would offer — the filter below may drop them
+        // for their arity alone, and the refusal must be able to say so.
+        std::vector<std::size_t> blockNameArities;
+        for (Symbol* m : ext->members) {
+            if (!m || m->name != name) continue;
+            if (auto* ms = dynamic_cast<MethodSymbol*>(m))
+                blockNameArities.push_back(ms->params.size());
+        }
         // §26.5 (#714/#773): when the extension has free type variables,
         // compute the binding (T → concrete TypeRef) from the matched
         // ancestor's generic args. This binding lets typeCall substitute
@@ -14662,6 +14837,12 @@ Symbol* ExprTC::lookupExtensionMember(
         if (!freeVars.empty() && decl &&
             extWhereClauseProvablyViolated(*decl, binding))
             continue;
+        // fix #8041 / #8042 (§8.1 / §26.5, v0.350): this block matches the
+        // receiver and its `where` clause admits it — so it DOES provide a
+        // same-named member, and only the call's arity can be wrong.
+        sameNameArities.insert(sameNameArities.end(),
+                               blockNameArities.begin(),
+                               blockNameArities.end());
         // Determine whether the extension target is a builtin (null-decl) type.
         // fix #4233 (§26.4/§26.5, v0.298): a param/return mention of the
         // extension's free var used to be deferred here too, for
@@ -14865,14 +15046,84 @@ Symbol* ExprTC::lookupExtensionMember(
         // reflection gate draws its own message for it.
         if (reportAmbiguity && isRootObjectValueReceiver(receiver, ctx_) &&
             !isObjectPublicSurfaceMember(name) && name != "Dispose") {
-            ctx_.diagnostics().report(
-                Severity::Error, loc,
-                "no member `" + std::string(name) + "` on type `Object`: "
-                "`Object`'s public surface is exactly `GetType`, `Equals`, "
-                "`GetHashCode`, `ToString` and the static `ReferenceEquals` "
-                "(\xC2\xA7""8.1); members resolve against the declared type "
-                "(\xC2\xA7""26.5), and no extension on `Object` provides `" +
-                std::string(name) + "`");
+            // fix #8042 (§26.5 / §26.5.1, v0.350): the ARITY axis of the
+            // closed surface, and a refusal that never asserts the opposite
+            // of the truth.
+            //
+            // §8.1 declares the root `Object`'s surface as EXACTLY five
+            // members, one form each (§26.5 rule 1: "If `x`'s declared type
+            // (or any base type) *declares* any instance member named `Foo`
+            // — of any arity, applicability, or accessibility — instance
+            // resolution is committed and extension blocks are **never
+            // consulted** for that name on that receiver. If the committed
+            // instance lookup then fails (no applicable overload, §22.5 /
+            // §22.6, or the member is inaccessible), the call is a compile
+            // error citing the instance member(s)"). #7973 closed the
+            // surface BY NAME; this is the ARITY axis it left open — the
+            // #2446 universal-arity check (ExprTypecheck_Calls.cpp) skips
+            // every PRIMITIVE-typed receiver (the root `Object` IS one), so
+            // `o.Equals()`, `o.GetHashCode(1)` and `o.ToString(1)` compiled
+            // and degraded to a wrong value.
+            //
+            // The ARITY AXIS of the surface's own members is drawn at the
+            // per-call site (`checkObjectClosedSurfaceCall`, above) — the
+            // member lookup is not reached for every spelling of them
+            // (`o.ToString(1)` is typed by the primitive-intrinsic branch of
+            // `resolveMemberAccess` and returns there), so a check drawn
+            // here alone would miss it.
+            //
+            // WHAT IS DRAWN HERE IS THE OTHER HALF: the extension side. A
+            // member an `extension Object` block provides (§26.5 rule 2) IS
+            // resolved by this lookup before the closed surface is asked, so
+            // it never reaches this branch (`found` is non-empty) — but the
+            // per-call arity filter (fix #2328) DROPS a same-named
+            // extension member whose parameter list has a different arity,
+            // so the candidate is gone by the time this branch runs and the
+            // refusal cannot tell "no such member" from "such a member, but
+            // not with this many arguments".
+            if (!sameNameArities.empty() && arity >= 0) {
+                // fix #8042 (§26.5, v0.350): the extension on `Object` DOES
+                // provide this member — the per-call arity filter dropped it
+                // for its arity alone, so the refusal must name the ARITY and
+                // must NOT claim the member's absence.
+                std::vector<std::size_t> forms = sameNameArities;
+                std::sort(forms.begin(), forms.end());
+                forms.erase(std::unique(forms.begin(), forms.end()),
+                            forms.end());
+                std::string formsText;
+                for (std::size_t i = 0; i < forms.size(); ++i) {
+                    if (i) formsText += i + 1 == forms.size() ? " and " : ", ";
+                    formsText += std::to_string(forms[i]);
+                }
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    forms.size() == 1
+                        ? "the extension method `" + std::string(name) +
+                              "` on type `Object` takes " + formsText +
+                              " argument(s) but the call supplies " +
+                              std::to_string(arity) + " (\xC2\xA7""26.5); the "
+                              "extension on `Object` does provide `" +
+                              std::string(name) +
+                              "`, but the call's arity matches none of its "
+                              "declared forms"
+                        : "no form of the extension method `" +
+                              std::string(name) + "` on type `Object` takes " +
+                              std::to_string(arity) + " argument(s) — its "
+                              "declared forms take " + formsText +
+                              " (\xC2\xA7""26.5); the extension on `Object` "
+                              "does provide `" + std::string(name) +
+                              "`, but the call's arity matches none of its "
+                              "declared forms");
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "no member `" + std::string(name) + "` on type `Object`: "
+                    "`Object`'s public surface is exactly `GetType`, `Equals`, "
+                    "`GetHashCode`, `ToString` and the static `ReferenceEquals` "
+                    "(\xC2\xA7""8.1); members resolve against the declared type "
+                    "(\xC2\xA7""26.5), and no extension on `Object` provides `" +
+                    std::string(name) + "`");
+            }
         }
         return nullptr;
     }
