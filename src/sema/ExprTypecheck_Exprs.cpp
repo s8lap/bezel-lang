@@ -2693,6 +2693,157 @@ bool surfaceDeclaresProperty(const ValueRecordSurface& s,
            s.properties.end();
 }
 
+// fix #8047 (§26.5 rule 1, §22.6, stdlib §2.5-§2.7, v0.350): the head name
+// of a by-name built-in VALUE RECORD receiver.
+//
+// The value records carry no TypeSymbol, so the receiver's declared type is
+// read off the TypeRef's own three builtin shapes: the ANNOTATION's
+// `astNode` (`var z: DateTime := ...`), the `builtinClassSym` DECLARATION
+// (the factory result `DateTime.FromTicks(0L)`), and the IMPORTED
+// `importedName` (a value record that arrives from another module). A USER
+// type that shadows the name carries a non-null `decl` on its declaration and
+// is NOT matched — the builtin and the user type are different surfaces.
+std::string_view valueRecordHeadOf(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return {};
+    std::string_view h;
+    if (!t->declaration) {
+        if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
+            h = t->headName();
+        else if (!t->astNode && !t->importedName.empty())
+            h = t->importedName;
+    } else if (!t->declaration->decl) {
+        h = t->declaration->name;
+    }
+    return h;
+}
+
+// fix #8047 (§26.5 rule 1, §22.6, stdlib §9.6, v0.350): the INSTANCE members
+// the built-in `string` declares.
+//
+// stdlib §9.6's declaration block, transcribed: the three named properties,
+// the Inspection / Substring / Span-view / Modification / Splitting /
+// Comparison-and-equality groups, the Object overrides, the Conversion group,
+// the Iteration group, and §8.1's `Object` base member `GetType`. The
+// `string` head is a PRIMITIVE (TypeRef::Kind::Primitive), so it carries no
+// TypeSymbol either — the same gap the value records have (above) — and
+// §26.5 rule 1 commits its instance members by NAME, of any arity.
+const std::vector<std::string_view>& stringInstanceMembers() {
+    static const std::vector<std::string_view> kRows = {
+        // §9.6's named properties.
+        "Length", "IsEmpty", "IsAscii",
+        // §9.6's Inspection group.
+        "Contains", "StartsWith", "EndsWith", "IndexOf", "LastIndexOf",
+        // §9.6's Substring group.
+        "Substring",
+        // §9.6's Span views group.
+        "AsSpan",
+        // §9.6's Modification group.
+        "Trim", "TrimStart", "TrimEnd", "ToUpper", "ToLower", "Replace",
+        "PadLeft", "PadRight", "PadCenter", "Insert", "Remove",
+        // §9.6's Splitting group.
+        "Split",
+        // §9.6's Comparison and equality group.
+        "CompareTo", "Equals",
+        // §9.6's Object overrides.
+        "GetHashCode", "ToString",
+        // §9.6's Conversion group.
+        "ToCharArray",
+        // §9.6's Iteration group.
+        "GetEnumerator",
+        // §8.1's Object base.
+        "GetType",
+    };
+    return kRows;
+}
+
+// fix #8047 (§26.5 rule 1, §22.6, stdlib §9.6, v0.350): the arity-0 subset of
+// the `string` surface — the named properties, the members a call WITH
+// arguments cannot bind (§22.6), which is rule 1's "the committed instance
+// lookup then fails" case.
+bool stringDeclaresProperty(std::string_view member) {
+    return member == "Length" || member == "IsEmpty" || member == "IsAscii";
+}
+
+// fix #8047 (§26.5 rule 1, §22.6, stdlib §9.6, v0.350): the `?.` CALL
+// spelling of a §9.6 PROPERTY has its OWN rule-1 gate — the #7373 arm of
+// `resolveNullCondMember`, which runs BEFORE the extension lookup and
+// reports the rule-1 NOTE (the #7477 wording: "`Length` is a property of
+// `string`, not a method ... ; note: an extension member named `Length` also
+// matches this receiver but was not considered").
+//
+// That gate reaches the extension blocks to build its NOTE, so the §26.5
+// rule-1 commitment must NOT hide them from it on that spelling. The lookup
+// the gate guards is never reached anyway (the gate returns), so the
+// commitment still holds there: the extension is unreachable, and the note
+// says so.
+bool stringPropertyCallHasOwnGate(const TypeRef* recvTy,
+                                   std::string_view member, bool isCall) {
+    if (!isCall) return false;
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Primitive ||
+        recvTy->primitive != PrimitiveType::String)
+        return false;
+    return stringDeclaresProperty(member);
+}
+
+// fix #8047 (§26.5 rule 1, §22.6, stdlib §2.5-§2.7 / §9.6, v0.350): DOES the
+// receiver's DECLARED type declare an instance member of that name?
+//
+// The one question §26.5 rule 1 asks, asked for the two by-name builtin
+// surfaces whose members the ordinary member walk cannot see (neither carries
+// a user TypeSymbol): the §2.5-§2.7 VALUE RECORDS and the §9.6 `string`.
+// The concrete collection heads, `StringBuilder` and the `Object` base are
+// NOT answered here — `resolveNullCondMember` already consults those gates
+// for itself.
+bool builtinSurfaceDeclaresMember(const TypeRef* recvTy,
+                                  std::string_view member) {
+    if (!recvTy || member.empty()) return false;
+    if (recvTy->kind == TypeRef::Kind::Primitive) {
+        if (recvTy->primitive != PrimitiveType::String) return false;
+        const auto& ms = stringInstanceMembers();
+        return std::find(ms.begin(), ms.end(), member) != ms.end();
+    }
+    if (recvTy->kind != TypeRef::Kind::Named) return false;
+    const ValueRecordSurface* s =
+        valueRecordSurfaceOf(valueRecordHeadOf(recvTy));
+    return s && surfaceDeclares(*s, member);
+}
+
+// fix #7945 (§26.5 rule 1, §22.6, stdlib §3.1, v0.350): the ARITY-0
+// properties the built-in `StringBuilder` declares — `Length: int` and
+// `Capacity: int` (stdlib §3.1).
+//
+// A call that supplies arguments to one of them is §26.5 rule 1's "the
+// committed instance lookup then fails" case: the committed lookup has no
+// candidate, so §22.6 makes the call a compile error citing the instance
+// member — never a silently degraded value (the argument dropped, the slot
+// zero-initialised behind the #2434 warning). The `.` spelling refuses it
+// (the #7775 arm of `resolveMemberAccess`); the `?.` spelling did not.
+bool stringBuilderDeclaresArity0Property(const TypeRef* recvTy,
+                                         std::string_view member) {
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || recvTy->declaration)
+        return false;
+    if (recvTy->headName() != "StringBuilder") return false;
+    return member == "Length" || member == "Capacity";
+}
+
+// fix #8047 (§26.5 rule 1, §22.6, stdlib §2.5-§2.7 / §9.6, v0.350): is the
+// member an ARITY-0 one on that surface? A call that supplies arguments to
+// an arity-0 member is rule 1's "the committed instance lookup then fails" —
+// a compile error (§22.6), never a same-named extension and never a
+// silently degraded value.
+bool builtinSurfaceDeclaresArity0Member(const TypeRef* recvTy,
+                                        std::string_view member) {
+    if (!recvTy || member.empty()) return false;
+    if (recvTy->kind == TypeRef::Kind::Primitive) {
+        if (recvTy->primitive != PrimitiveType::String) return false;
+        return stringDeclaresProperty(member);
+    }
+    if (recvTy->kind != TypeRef::Kind::Named) return false;
+    const ValueRecordSurface* s =
+        valueRecordSurfaceOf(valueRecordHeadOf(recvTy));
+    return s && surfaceDeclaresProperty(*s, member);
+}
+
 }  // namespace
 
 // fix #7970 (§26.5 rule 1, §22.6, stdlib §2.5-§2.7, v0.350): the
@@ -2822,6 +2973,69 @@ void ExprTC::resolveMemberAccessWithRule1(const ast::MemberAccessExpr& ma) {
 }
 
 void ExprTC::visitExpr(const ast::Expr& e) {
+    // fix #8047 (§26.5 rule 1, §22.6, stdlib §2.5-§2.7 / §9.6, v0.350): the
+    // §26.5 rule-1 COMMITMENT for the `?.` spelling.
+    //
+    // §26.5 rule 1 (v0.350): "If `x`'s declared type (or any base type)
+    // *declares* any instance member named `Foo` — of any arity,
+    // applicability, or accessibility — instance resolution is committed and
+    // extension blocks are **never consulted** for that name on that
+    // receiver."
+    //
+    // The `.` spelling makes that commitment in `resolveMemberAccessWithRule1`
+    // (the #7970 fix): the extension blocks are taken out of reach for the
+    // ONE resolution, so the receiver's OWN member is the answer. The `?.`
+    // spelling is a DIFFERENT AST node (`ast::NullCondMemberExpr`) with its
+    // own resolver (`resolveNullCondMember`), and that resolver consults the
+    // extension blocks for a name the receiver's declared type DECLARES:
+    // its rule-1 gate asks the collection-interface surfaces, the concrete
+    // collection heads, `StringBuilder` and the `Object` base — but NOT the
+    // by-name VALUE RECORDS (stdlib §2.5-§2.7) and NOT `string` (stdlib
+    // §9.6), the two surfaces that carry no user TypeSymbol and so are
+    // invisible to the ordinary member walk.
+    //
+    // MEASURED on this tip: `extension DateTime { public method AddDays(d:
+    // double): int => 4242; }` and `z?.AddDays(1.0)` on a `DateTime?` printed
+    // `4242` — the EXTENSION's value, where the record's own `AddDays`
+    // (stdlib §2.5) must answer; the character-identical `z.AddDays(1.0)`
+    // prints the record's own `864000000000`. The same for `string`:
+    // `t?.Substring(1)` printed the extension's `EXT` where the built-in's
+    // `bc` must answer.
+    //
+    // The commitment is made the same way the `.` spelling makes it: the
+    // extension blocks are taken out of reach for the ONE resolution, so the
+    // declared member is the answer. The guard restores them on EVERY exit
+    // path (its destructor), so the commitment never outlives the
+    // resolution it covers.
+    struct Rule1ExtensionHide {
+        ExprTC* tc = nullptr;
+        bool active = false;
+        std::vector<Symbol*> savedChildren;
+        std::vector<ExtensionSymbol*> savedImported;
+        void hide() {
+            if (active || !tc) return;
+            ModuleSymbol* mod = tc->ctx_.module();
+            if (!mod) return;
+            savedChildren = mod->children;
+            std::vector<Symbol*> kept;
+            kept.reserve(savedChildren.size());
+            for (Symbol* c : savedChildren)
+                if (!dynamic_cast<ExtensionSymbol*>(c)) kept.push_back(c);
+            mod->children = std::move(kept);
+            savedImported = std::move(tc->importedExtensions_);
+            tc->importedExtensions_.clear();
+            active = true;
+        }
+        void restore() {
+            if (!active) return;
+            if (ModuleSymbol* mod = tc->ctx_.module())
+                mod->children = std::move(savedChildren);
+            tc->importedExtensions_ = std::move(savedImported);
+            active = false;
+        }
+        ~Rule1ExtensionHide() { restore(); }
+    };
+
     // fix #6721 (§9.4, v0.340): inside a lambda formed in a record constructor
     // body, an identifier naming the receiver — `this`/`base`, or a bare
     // instance member of the record — makes the lambda's capture a copy of
@@ -6522,7 +6736,91 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     }
     // §17.5 null-conditional member access `x?.M`.
     if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        // fix #8047 (§26.5 rule 1, §22.6, stdlib §2.5-§2.7 / §9.6, v0.350):
+        // the rule-1 commitment for the `?.` spelling. A name the receiver's
+        // DECLARED type declares as an instance member commits the lookup, so
+        // the extension blocks are not consulted for it (of any arity).
+        Rule1ExtensionHide rule1Hide{this};
+        const TypeRef* nullCondRecvTy =
+            nm->target ? ctx_.exprType(*nm->target) : nullptr;
+        const bool nullCondIsCall =
+            calleeOfCallCtx_ == static_cast<const ast::Expr*>(nm);
+        const bool nullCondDeclares =
+            builtinSurfaceDeclaresMember(nullCondRecvTy, nm->member);
+        // The §9.6 PROPERTY call spelling keeps the compiler's own rule-1
+        // gate (the #7373 arm), which reports the rule-1 NOTE and needs the
+        // extension blocks to build it.
+        if (nullCondDeclares &&
+            !stringPropertyCallHasOwnGate(nullCondRecvTy, nm->member,
+                                          nullCondIsCall))
+            rule1Hide.hide();
+        const std::size_t errorsBeforeNullCond = ctx_.diagnostics().errorCount();
         resolveNullCondMember(*nm);
+        // The extensions are back in reach BEFORE the refusal below, so the
+        // rule-1 NOTE ("an extension member named `X` also matches this
+        // receiver but was not considered") can see them — the same order the
+        // `.` spelling's commitment uses (its note is built after the
+        // restore).
+        rule1Hide.restore();
+        // fix #8047 (§26.5 rule 1, §22.6, stdlib §2.5): rule 1's "the
+        // committed instance lookup then fails" case on the `?.` spelling — a
+        // DECLARED ARITY-0 member (a property) called WITH arguments. The
+        // committed lookup has no candidate, so §22.6 makes the call a compile
+        // error citing the instance member: never a same-named extension and
+        // never a silently degraded value (the argument dropped, the slot
+        // zero-initialised behind the #2434 warning).
+        //
+        // The `string` surface already has this gate on the `?.` path (the
+        // #7373 arm in `resolveNullCondMember`); the value records did not.
+        if (nullCondDeclares && nullCondIsCall && currentCallArity_ > 0 &&
+            nm->target &&
+            ctx_.diagnostics().errorCount() == errorsBeforeNullCond &&
+            builtinSurfaceDeclaresArity0Member(nullCondRecvTy, nm->member) &&
+            !stringPropertyCallHasOwnGate(nullCondRecvTy, nm->member, true)) {
+            const std::string_view head = valueRecordHeadOf(nullCondRecvTy);
+            auto loc = nm->span.begin;
+            if (loc.line == 0) loc = nm->target->span.begin;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("`") + std::string(nm->member) + "` on `" +
+                    std::string(head) +
+                    "` is an instance member of the receiver's declared type; "
+                    "an extension of the same name is unreachable (spec §26.5 "
+                    "rule 1: instance members block same-named extensions of "
+                    "any arity, applicability, or accessibility). The instance "
+                    "member takes no arguments, but this call supplies " +
+                    std::to_string(currentCallArity_) + ". " +
+                    extensionNameBlockedNote(nullCondRecvTy, nm->member));
+        }
+        // fix #7945 (§26.5 rule 1, §22.6, stdlib §3.1, v0.350): the `?.`
+        // twin of the `.` spelling's StringBuilder refusal (the #7775 arm of
+        // `resolveMemberAccess`). `StringBuilder.Length` and
+        // `StringBuilder.Capacity` are ARITY-0 properties (stdlib §3.1), so a
+        // call that supplies arguments to one of them has no candidate: the
+        // committed instance lookup FAILS and §22.6 makes the call a compile
+        // error citing the instance member.
+        //
+        // The `?.` spelling reaches no such gate: the null-conditional
+        // resolver never builds the `.`-form twin for a StringBuilder
+        // receiver, so the call was accepted, the argument silently DROPPED,
+        // and the slot degraded to zero behind the #2434 warning.
+        if (nullCondIsCall && currentCallArity_ > 0 && nm->target &&
+            ctx_.diagnostics().errorCount() == errorsBeforeNullCond &&
+            stringBuilderDeclaresArity0Property(nullCondRecvTy, nm->member)) {
+            auto loc = nm->span.begin;
+            if (loc.line == 0) loc = nm->target->span.begin;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("`") + std::string(nm->member) +
+                    "` on `StringBuilder` is an instance member of the "
+                    "receiver's declared type; an extension of the same name "
+                    "is unreachable (spec §26.5 rule 1: instance members block "
+                    "same-named extensions of any arity, applicability, or "
+                    "accessibility). The instance member is a property that "
+                    "takes no arguments (stdlib §3.1), but this call supplies " +
+                    std::to_string(currentCallArity_) + ". " +
+                    extensionNameBlockedNote(nullCondRecvTy, nm->member));
+        }
     }
     // Slice 3f: NewExpr is typed as its constructed type. `default`
     // and `typeof` follow the same pattern (default(T) → T,
@@ -7814,6 +8112,29 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // distinct return types. Tightened with the overload-resolution
     // slice.
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // fix #8047 (§26.5 rule 1, §22.6, stdlib §2.5-§2.7 / §9.6, v0.350):
+        // the rule-1 commitment for the `?.` CALL spelling.
+        //
+        // A null-conditional CALL `x?.M(args)` is typed by the synthetic
+        // non-null member access `typeCall` builds for it — and that twin
+        // calls `resolveMemberAccess` DIRECTLY, so the `.` spelling's
+        // commitment (which lives in the expression VISITOR, one level up)
+        // does not reach it. The commitment is therefore made here as well,
+        // around the call's own resolution: the extension blocks are out of
+        // reach for the twin's lookup, so the receiver's DECLARED member is
+        // the answer.
+        Rule1ExtensionHide rule1Hide{this};
+        if (auto* ncm =
+                dynamic_cast<const ast::NullCondMemberExpr*>(ce->callee.get()))
+            if (ncm->target && !ncm->member.empty() &&
+                builtinSurfaceDeclaresMember(ctx_.exprType(*ncm->target),
+                                             ncm->member) &&
+                // The §9.6 PROPERTY call spelling keeps the compiler's own
+                // rule-1 gate (the #7373 arm), which reports the rule-1 NOTE
+                // and needs the extension blocks to build it.
+                !stringPropertyCallHasOwnGate(ctx_.exprType(*ncm->target),
+                                              ncm->member, /*isCall=*/true))
+                rule1Hide.hide();
         typeCall(*ce);
         checkChoiceCaseConstruction(*ce);
         // fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): the §17.11
