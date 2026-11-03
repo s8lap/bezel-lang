@@ -2680,6 +2680,74 @@ lane that wants the gate's phases runs the named PHASES (the ratchet sweep, the 
 self-tests) and says so in its report. **⇒ A CYCLE THAT WAS NOT ORDERED IS NOT A GATE, AND IT
 IS NOT A PUSH.**
 
+## Coordinator block — 2026-11-03 18:20 → 18:50 (the pool MEASURES agents now; the #8027 lineage is settled; the haul is 66/72)
+
+**THE STATUS TABLE (18:42:41).** gate OK (no gate running) · jobserver OK (active, available=0 held=20, builds=12) ·
+builders OK (36 builder processes — **do NOT launch a gate**) · memory OK (22.4 G) · disk OK (/mnt/fast 74 %) ·
+staging OK (`r30-c1` @ `23e82994`, +94 over origin/main, **banked 66/100**) · lanes OK (51 worktrees, 45 lane
+build procs, 44 heavy procs box-wide, 32 stall candidates) · pool OK (**11 live lanes**: 7 producers + 4
+reviewers) · stale INFO (0 stale dev processes).
+
+**⇒ THE POOL COUNT IS NOW A MEASUREMENT OF AGENT PROCESSES (the infra pick `23e82994`).** `scripts/pool_lanes.sh`
+used to read "a lane is live" from the SESSION's fields, and that proxy is wrong in two measured ways: a RESUMED
+session keeps the outcome of its PREVIOUS run (so `outcome is None` alone calls a running lane DEAD), and an
+agent whose PROCESS died leaves a session whose `outcome` is still `None` and whose `time.idle` was never
+refreshed (so `outcome is None` alone calls a DEAD lane LIVE). Measured: eight sessions read live while only six
+agent processes existed. ⇒ **A LANE IS AN `opencode run --session <id>` PROCESS, SO THE PROCESS TABLE IS THE
+MEASURE.** The fallback to the session fields is taken ONLY when `ps` itself fails — an EMPTY process table means
+"no agent right now", not "fall back and over-count". The reconciliation against the ledger (PHANTOM / DEAD /
+UNRECORDED / ??, exit 3 on a mismatch) is unchanged.
+
+**⇒ THE SWEEP AT THE TIP IS 24/25 GREEN, AND THE ONE RED IS AN ARTIFACT, NOT A DEFECT.** `scripts/ratchet_sweep.sh`
+on `r30-c1` @ `23e82994` says: `check_internal_residual FAIL — build/bezelc is STALE (13486 s older than
+src/sema/ExprTypecheck_Calls.cpp)`. The staging worktree's `build/` holds only an old `bezelc`; every other
+ratchet PASSes, including `check_vacuous_tests`, `check_builtin_declared_params` and
+`check_toolchain_skip_surface`. ⇒ **⇒ THE ONE GATE MUST REBUILD `bezelc` (and the test binaries) ON THE TIP
+BEFORE THE SWEEP** — that is the known shape of the final gate, not a surprise.
+
+**⇒ `check_toolchain_skip_surface` IS GREEN AT THE TIP, BUT THE COORDINATOR BRANCH CARRIES THE PRE-#6622
+VERSION OF IT.** Measured: the coordinator branch `r38-c3-record` still has the `abs_m >= abs_b` condition (a
+FLAT `absorbing_sites` blocks a `checked_calls` rise), so it reports RED there, while the staging tip has the
+#6622 fix (a rise in `absorbing_sites` is what blocks a rise). ⇒ **⇒ NEVER PICK A COMMIT FROM `r38-c3-record`
+THAT TOUCHES `scripts/check_toolchain_skip_surface.py` OR ITS BASELINE** — it would revert #6622 and the
+baseline with it. (The header the `--update` writer emits is still hardcoded at "2,046 call sites in 634 files
+at 2026-09-17" while the tip's baseline says 4,008 — a stale label to re-point, not a gate blocker.)
+
+**THE #8027 LINEAGE — SETTLED, AND THE REVIEWER WAS RIGHT.** All three commits share the SAME AUTHOR DATE
+(14:53), so the author date does not say which one a review measured; the review was written at 15:17, i.e.
+AFTER 14:53, so it measured the **amend** `a454fd69`, not the original `3086ff5c`. The coordinator measured the
+amend's file directly: it DID carry the four unobservable negatives
+(`BEZEL_EXPECT_FALSE(hasErrorContaining(r, kDestDiag))` in the four CONTROL rows) — the severity filter the
+amend added to the helper does NOT make a negative over an empty-by-construction diagnostics bag observable.
+⇒ The producer's `095f79a4` (the tip of `r38-c81-8027ff`) **deletes those four lines** and leaves `src/`
+byte-identical to `a454fd69`; `scripts/check_vacuous_tests.py --strict` is CLEAN on the new file, and the four
+REFUSAL rows keep their positive diagnostic assertions. ⇒ **⇒ `a454fd69` IS DEAD — NEVER PICK IT.** `095f79a4`
+is with `r38-w94-rereview8027` for a scoped re-review.
+
+**⇒ A SECOND CLOSING BINDING IS A HOUSE DEFECT, AND TWO COMMITS HAVE IT.** GitHub binds ONE closing keyword to
+ONE reference, and the reference FOLLOWS the keyword — so a keyword inside PROSE creates a binding too. Two of
+the producer's commits quote the credited fix's own subject in prose, and the word *fix*/*closed* sits right
+before an already-closed issue number: `6d9c4a46` prints `#7287 #7329` and `943ca6a7` prints `#7601 #7674`
+(⇒ `scripts/pick_issues.sh --github <sha>` is the check). ⇒ Neither is a FALSE closure — #7329 and #7674 were
+already closed by `275fab52` and `01df7809` — but the per-commit issue list is wrong, and a reviewer will flag
+it. ⇒ **⇒ THE PRODUCER MUST AMEND BOTH BODIES BEFORE THE PICK** (drop the keyword in front of the quoted
+number — e.g. `commit 01df7809 — the sibling issue #7674's fix`), and every later commit of that lane must keep
+the rule: **ONE closing keyword per commit.**
+
+**⇒ §22.5's "POSITIONAL-ONLY" RULE, RECORDED SO NO LANE RE-BREAKS IT.** §22.5 (v0.350) makes a `ref`/`out`/
+`scoped` argument POSITIONAL-ONLY ⇒ **`Math.DivRem`'s `out` slot MUST STAY UNNAMED** — a named `out:` at that
+position is not part of the declared surface.
+
+**THE POOL, AS IT STANDS (7 producers + 4 reviewers; the ledger and opencode AGREE).**
+`r38-p85-residual5` (sweep three) · `r38-p86-cluster` (the extension-admission cluster; has `398ca426` #7811
+in review) · `r38-p87-registry` (the registry names and nullability) · `r38-p88-residual6` (sweep four) ·
+`r38-p89-residual5` (sweep five; has `06cf4bcb` #6024, `6d9c4a46` #7287 #7329 and `943ca6a7` #7601 #7674 in
+review) · `r38-p90-objsurface` (#8041 #8042 #8043 #8044) · **`r38-p91-extarity` (NEW — the §26.5 rule-1
+residual cluster: the `?.` twin of #7970, the ARITY shape, and the annotated-local shapes; the probes are
+already written in `/var/tmp/bezel-scratch/r37-rev-c2-43b/probes/`, and the lane must FILE the shapes it
+confirms)** · reviewers `r38-w91-review2` (#7811 + #6024) · `r38-w92-review3` (#7287) · `r38-w93-review4`
+(#7601) · `r38-w94-rereview8027` (#8027).
+
 ## Exit review
 
 *(to be written by the campaign's exit reviewer — not this lane)*
