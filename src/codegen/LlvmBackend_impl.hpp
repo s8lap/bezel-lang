@@ -294,6 +294,19 @@ inline llvm::Value* radixAdmittedIR(llvm::IRBuilder<>& b, llvm::Value* radix) {
 int consoleWriterLocalStdFdOf(const sema::SemaContext& ctx,
                               const ast::IdentifierExpr& id);
 
+// fix #7741 (stdlib §9.6, v0.353; spec §28.3.4 *Producers*, v0.353): is
+// argument `i` of a call whose callee is `callee` a `string`
+// argument at a PLAIN (borrow) parameter position of a BUILT-IN string member
+// whose lowering READS the argument's code points and never stores it — the
+// STRING twin of the collection-shaped `isBuiltinReaderCollectionArg`
+// (LlvmBackend_Setup.cpp). The STRING half lives in LlvmBackend_String.cpp
+// (the string surface's own file); the collection half lives beside the
+// walker that consumes it.
+bool isBuiltinReaderStringArg(const ast::Expr* callee, size_t i,
+                               std::string_view argName,
+                               const ast::Expr* arg,
+                               const sema::SemaContext& ctx);
+
 inline bool isBuiltinDictionaryTypeRef(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;

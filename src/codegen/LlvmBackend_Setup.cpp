@@ -31908,6 +31908,39 @@ struct StringEscapeWalker {
                 a.name.empty() && isConsoleNonRetainingStringArg(callee, i) &&
                 isTargetIdent(a.value.get()))
                 safeArg = true;
+            // fix #7741 (stdlib §9.6, v0.353; spec §28.3.4 *Producers*,
+            // v0.353): a string local passed at a PLAIN (borrow)
+            // parameter position of a built-in string member whose lowering
+            // READS the argument and keeps none of it — `String.Repeat(unit:
+            // string, count: int)` — is a CALL-BOUNDED borrow, not an escape.
+            // The `unit` parameter carries no `owned` marker, so the caller
+            // keeps the obligation (§28.3.4's "borrowing positions": "a
+            // non-`owned` argument"), and the caller's scope-end release of
+            // its own +1 is therefore safe (the callee copies the code points
+            // and stores nothing). The recognizer is the STRING twin of
+            // `isBuiltinReaderCollectionArg` (the collection-shaped
+            // relaxation below), and it lives in LlvmBackend_String.cpp — the
+            // string surface's own file — so the escape decision and the
+            // string lowering stay in lockstep.
+            //
+            // MEASURED before the fix (the issue's own repro, 200 iterations,
+            // ASan/LSan): 7400 B leaked in 400 allocations — one 32-byte
+            // string header plus its 5-byte data buffer per iteration, the
+            // +1 producer local `w` that was bound to the `unit` argument and
+            // never discharged. WITHOUT this relaxation the walk marked the
+            // local ESCAPED (a built-in callee has no resolved MethodSymbol,
+            // so the #1430 plain-parameter relaxation never fired), the
+            // scope-end release was never armed, and the +1 leaked.
+            //
+            // String-release analysis ONLY (stringReleaseMode), so the shared
+            // dict-materializer / grouping / borrowing-Array walks keep their
+            // conservative ESCAPE (the #1997 narrowing): their release targets
+            // are collection backings, and no test asserts a string-argument
+            // relaxation for them.
+            if (!safeArg && stringReleaseMode && a.modifier.empty() &&
+                isTargetIdent(a.value.get()) &&
+                isBuiltinReaderStringArg(callee, i, a.name, a.value.get(), ctx))
+                safeArg = true;
             // fix #7804 (stdlib §2.1, §8.5, §15.1.2, v0.353): an INLINE ARRAY
             // passed at the CONSOLE's NON-RETAINING argument position
             // (`Console.Write` / `Console.WriteLine`'s `value: Object`) is a

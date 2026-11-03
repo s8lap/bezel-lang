@@ -1476,6 +1476,100 @@ void Emitter::emitGuardThrowReleasingString(llvm::Value* cond, const char* name,
 }
 
 
+// fix #7741 (stdlib §9.6, v0.353; spec §28.3.4 *Producers*, v0.353): is
+// argument `i` of a call whose callee is `callee` a `string`
+// argument at a PLAIN (borrow) parameter position of a BUILT-IN string member
+// whose lowering READS the argument's code points and never stores it?
+//
+// THE DEFECT THIS CLOSES. `String.Repeat(unit: string, count: int)` (stdlib
+// §9.6) copies the `unit`'s code points into a fresh string and keeps NO
+// reference to the `unit` — `bz_str_repeat` (src/runtime/
+// bezel_runtime_strings.cpp) reads the unit's code points and packs a new
+// buffer; the unit is BORROWED for the call. But the conservative escape walk
+// (StringEscapeWalker::walkCallArgs, LlvmBackend_Setup.cpp) had no relaxation
+// for this callee: a BUILT-IN callee has no resolved MethodSymbol, so the
+// walk's #1430 plain-parameter relaxation never fired, and the argument fell
+// through to the walk's conservative ESCAPE. A +1 PRODUCER local bound to the
+// `unit` argument was therefore excluded from the scope-end release set, its
+// own +1 was never discharged, and it leaked — MEASURED (the issue's own
+// repro, 200 iterations): 7400 B in 400 allocations, one 32-byte string header
+// plus its 5-byte data buffer per iteration.
+//
+// WHY THIS IS A BORROW AND NOT A TRANSFER. spec §28.3.4's list of the
+// BORROWING POSITIONS of an owned-local read names "a non-`owned` argument";
+// stdlib §9.6 declares `Repeat(unit: string, count: int): string` with NO
+// `owned` marker on the `unit` parameter, so the position is a borrow SOURCE
+// (§28.3.4's "Parameter `p` (no modifier) | Borrowed (source: caller)") and
+// the CALLER keeps the obligation — the same reading stdlib §3.1 states
+// outright for the StringBuilder family's own `args: Array<Object>` parameter
+// ("`AppendFormat`'s `args` is a call-bounded borrow") and that
+// `isBuiltinReaderCollectionArg`'s own comment applies to `string.Join` /
+// `string.Trim`.
+//
+// THE EXCLUSIONS — WHY THIS IS NOT "EVERY BUILTIN STRING CALLEE". The
+// relaxation is NOT the blanket rule "a builtin callee borrows its argument",
+// because a builtin CAN store its argument: a collection member stores its
+// argument into an element slot (`Array<T>.Add(item: T)`), and the
+// StringBuilder's own `Append` RETAINS its string argument into the builder's
+// owned parts list (the #1185 relaxation above keeps that spelling escaped for
+// the borrow analysis — the builder's own +1 outlives the call, so the local's
+// release is still safe, but the two facts are different). The relaxation is
+// therefore admitted ONLY for the builtins whose lowering provably READS the
+// argument and keeps none of it, and it is keyed on the SAME structural shapes
+// the lowerings key on, so the escape decision and the lowering stay in
+// lockstep (the `isConsoleNonRetainingArg` discipline).
+//
+// RECOGNIZED SHAPES (the stdlib's own parameter positions):
+//   * stdlib §9.6 `String.Repeat(unit: string, count: int)` — `unit` is
+//     parameter 0. The `Repeat(c: char, count: int)` overload is excluded by
+//     the ARGUMENT-TYPE gate below (a `char` argument is not a `string`).
+//
+// The PARAMETER position is resolved from the argument's own name when the
+// call uses the NAMED spelling (§22.5) and from its position otherwise — the
+// same two-way resolution `fnObjSiteSlot` (LlvmBackend_Layout.cpp) uses for
+// the collection-shaped sites, so a reordered named argument binds the
+// parameter it names.
+//
+// The argument must ALSO be a `string`-typed value: that is the case this
+// relaxation exists for, and it keeps the `Repeat(c: char, count: int)`
+// overload out of it.
+bool isBuiltinReaderStringArg(const ast::Expr* callee, size_t i,
+                               std::string_view argName,
+                               const ast::Expr* arg,
+                               const sema::SemaContext& ctx) {
+    if (!arg) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return false;
+
+    // ---- the OWNER: the static type the builtin member is accessed on ----
+    // The static-qualifier spelling (`String.Repeat` / `string.Repeat`): the
+    // qualifier is a TYPE name and the sema layer resolves NO type for it, so
+    // the owner is read off the NAME — the same spelling the lowering keys on
+    // (`pt == P::String && m == "Repeat"`, LlvmBackend_Calls2.cpp).
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!id) return false;
+    if (id->name != "string" && id->name != "String") return false;
+
+    // ---- the READER POSITION (the stdlib's own parameter positions) ----
+    if (ma->member != "Repeat") return false;
+    // `Repeat(unit: string, count: int)` — the `unit` parameter is parameter 0
+    // of stdlib §9.6's SECOND overload. The named spelling names the
+    // parameter directly; the positional spelling puts it first.
+    if (argName.empty()) {
+        if (i != 0) return false;
+    } else if (argName != "unit") {
+        return false;
+    }
+
+    // ---- the ARGUMENT must be a `string` value ----
+    const sema::TypeRef* at = ctx.exprType(*arg);
+    if (!at || at->kind != sema::TypeRef::Kind::Primitive ||
+        at->primitive != sema::PrimitiveType::String)
+        return false;
+    return true;
+}
+
+
 llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                                    const ast::MemberAccessExpr& ma,
                                    llvm::Value* self) {
