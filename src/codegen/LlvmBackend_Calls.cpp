@@ -9333,11 +9333,82 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 auto* fn = declareC("bz_array_clear_disposing",
                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
                 builder_.CreateCall(fn, {recv, elemDisp});
-                return llvm::ConstantInt::get(i32(), 0);
+            } else {
+                auto* fn = declareC("bz_array_clear", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy()});
+                builder_.CreateCall(fn, {recv});
             }
-            auto* fn = declareC("bz_array_clear", llvm::Type::getVoidTy(llvm_),
-                                {ptrTy()});
-            builder_.CreateCall(fn, {recv});
+            // fix #8025 (§28.3 *Unbound owned temporaries* / K8.1, §28.9, stdlib
+            // §4.4, v0.350): reclaim an UNBOUND `owned Array<T>` / `Stack<T>` /
+            // `Queue<T>` RECEIVER here — the `isArr` block's `.Clear()` arm was
+            // the ONE arm of the borrowing collection family that carried no
+            // inline reclaim, so the collection's BACKING was allocated and
+            // never freed.
+            //
+            // MEASURED on this fix's parent (1e074eda), 100 iterations of
+            // `Mk().Clear()` with `Mk(): owned Array<int>` under the
+            // generated-code ASan/LSan leg:
+            //
+            //   "SUMMARY: AddressSanitizer: 14400 byte(s) leaked in 200
+            //    allocation(s)."
+            //
+            // — the `bz_array_t` header (8000 B) and the backing buffer
+            // (6400 B), 100 iterations x 2 allocations. The `Array<string>` twin
+            // read 20800 B / 200 allocations and the `Stack<T>` / `Queue<T>`
+            // twins read 14400 B / 200 each: all three are array-backed, so all
+            // three land on THIS arm. The dictionary / set / sorted-set /
+            // sorted-dictionary twins were already CLEAN (0 allocations) — the
+            // `isDict` block's `.Clear()` arm carries the reclaim since #6419
+            // and the Set-family arms carry it since #6394 — and the property
+            // face (`Mk().Count`) is clean because the `.Length`/`.Count` arm
+            // carries it too.
+            //
+            // PLACEMENT. The reclaim goes AFTER the clear, for the same reason
+            // the `isDict` block's `.Clear()` arm puts it there (stdlib §4.8:
+            // "Clear() … empties it; the dictionary itself stays allocated"):
+            // `bz_array_clear` / `bz_array_clear_disposing` EMPTY the array but
+            // leave the `bz_array_t` header and its backing buffer allocated,
+            // so the backing free has to come after the clear. The arm's own
+            // return IS the §28.3 end-of-full-expression boundary (`.Clear()`
+            // returns `unit`, so its obligation cannot sit at a return site
+            // that hands a value back — #6394's note, and the same shape the
+            // `isDict` arm's reclaim has).
+            //
+            // NO DOUBLE RELEASE OF THE ELEMENTS. The element discharge happens
+            // in the clear itself (`bz_array_clear_disposing` releases each
+            // element's co-owned +1 for a borrowing `Array<string>` and disposes
+            // each class element for the owning family), and that clear ERASES
+            // `count` — so the backing free's own element walk
+            // (`bz_array_free`, `for (i = count - 1; i >= 0; --i)`) visits
+            // nothing. The elements are therefore discharged EXACTLY ONCE,
+            // whichever column they live in.
+            //
+            // WHY IT IS NOT #8009. #8009 owns the OWNING family's release, and
+            // it routes it through the §28.3 K8.1 BOUNDARY
+            // (`buildCollectionTempDisposal`), because an owning collection
+            // owes an element CASCADE and that release is not name-keyed. The
+            // BORROWING family's release is the backing free ALONE (its
+            // elements are the caller's — stdlib §4.4), and the family is
+            // reclaimed INLINE by its own arms. Registering it at the K8
+            // boundary as well would FREE THE BACKING TWICE; and the two
+            // populations are disjoint by construction —
+            // `freeUnboundOwnedBorrowingArrayTemp` declines the `Owning*`
+            // heads (they are not in `common::isPlainBuiltinCollectionHead`),
+            // and #8009's boundary claim admits the borrowing family for
+            // NOTHING (the name-keyed release table has no collection in it).
+            // So this arm-site reclaim covers the borrowing family ONLY, and
+            // the owning family keeps its boundary release.
+            //
+            // THE GATE IS UNCHANGED — it is the same helper, and the same
+            // population, the sibling arms already use: an unbound `owned`-
+            // returning CALL whose result type is a borrowing collection head
+            // (`isUnboundOwnedBorrowingArrayCallExpr`). A bound local, a
+            // `using var`, an alias, a `move`, a `new` and a BORROW (§28.1) are
+            // not that shape, so they keep being discharged by their own owner
+            // — no double free, no use-after-free. The helper's own first line
+            // is the null guard (`if (!recvExpr || !recvVal) return;`), the
+            // same one its siblings rely on.
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
             return llvm::ConstantInt::get(i32(), 0);
         }
         // (§28.11 v0.213, #2081: `.DisposeElements()` was retired with axiom A8
