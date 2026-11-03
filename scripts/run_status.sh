@@ -203,13 +203,25 @@ probe_staging() {
   br="$(git -C "$STAGING" branch --show-current 2>/dev/null)"
   tip="$(git -C "$STAGING" rev-parse --short HEAD 2>/dev/null)"
   ahead="$(git -C "$STAGING" rev-list --count origin/main..HEAD 2>/dev/null || echo n/a)"
+  # THE HAUL IS THE GITHUB-CLOSABLE SET, not the subject-only fix set.
+  # MEASURED 2026-11-03 (the R38 run): a `narrow #NNNN:` subject names an
+  # issue in PROSE, but `narrow` is NOT a GitHub closing keyword, so such a
+  # commit closes NOTHING when the branch is pushed -- while the
+  # subject-only rule counts it. The run's target is "100+ ISSUE CLOSURES",
+  # and a closure is what GitHub's keyword rule binds, so the row that
+  # measures the target must use that rule. The subject-only figure is kept
+  # as a second number (it counts the narrow commits' issues, which is a
+  # different question).
   banked="$(cd "$STAGING" && "$HERE/pick_ledger.sh" origin/main..HEAD 2>/dev/null \
+              | sed -n 's/^github-closable issues: \([0-9]*\).*/\1/p')"
+  fixes_named="$(cd "$STAGING" && "$HERE/pick_ledger.sh" origin/main..HEAD 2>/dev/null \
               | sed -n 's/^distinct fix issues: \([0-9]*\).*/\1/p')"
   [ -n "$banked" ] || banked="n/a"
+  [ -n "$fixes_named" ] || fixes_named="n/a"
   if [ "$banked" != n/a ] && [ "$banked" -ge "$TARGET" ]; then st=FLAG
-    ACTIONS+=("staging: $banked fixes banked (target $TARGET) — run scripts/pregate.sh, then gate")
+    ACTIONS+=("staging: $banked issues GitHub would close (target $TARGET) — run scripts/pregate.sh, then gate")
   fi
-  row staging "$st" "${br:-(detached)} @ $tip | +$ahead over origin/main | banked $banked/$TARGET"
+  row staging "$st" "${br:-(detached)} @ $tip | +$ahead over origin/main | closable $banked/$TARGET | fix-named $fixes_named"
 }
 
 # The LIVE POOL. A claim's CURRENT status is its LAST row (claims.tsv is

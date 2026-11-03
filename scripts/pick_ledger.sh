@@ -155,6 +155,13 @@ set +f
 echo "distinct fix issues: ${#CREDIT[@]} ($inferred_fix_issues from inferred kinds)"
 echo "distinct issues named (all kinds): ${#ALL[@]}"
 echo "distinct issues GitHub would close (keyword rule, subject+body, any kind): ${#GH[@]}"
+# THE HAUL FIGURE, machine-readable. MEASURED 2026-11-03 (the R38 run): a
+# `narrow #NNNN:` subject names an issue in PROSE, but `narrow` is NOT a
+# GitHub closing keyword -- so such a commit closes NOTHING when the branch
+# is pushed, while the subject-only rule counts it. A run whose target is
+# "N+ issue CLOSURES" must therefore be measured with GitHub's OWN rule, and
+# this line is that number. run_status.sh's `staging` row reads it.
+echo "github-closable issues: ${#GH[@]}"
 if [ "$unattr" -gt 0 ]; then
   echo "UNATTRIBUTED: $unattr commit(s): no refs/notes/$REF note found by SHA or patch-id" \
        "($ambiguous ambiguous: a patch-id shared by noted commits, none or several with the same subject)"
