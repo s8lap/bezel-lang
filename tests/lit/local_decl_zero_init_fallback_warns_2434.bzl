@@ -14,22 +14,38 @@
 // this fix it emitted none at all.
 //
 // WHY THIS PROGRAM REACHES THE FALLBACK (verified empirically, not assumed
-// — see this fix's commit message): `o.Anything()` is a member access on an
-// `Object`-typed receiver, whose static type carries no known-complete
-// member set (§3 / #605's permissive "unknown member" acceptance) — sema
-// accepts it BY DESIGN (this is byte-for-byte the source text of
-// tests/lit/sema/sema_unknown_member__object_typed_receiver_permissive.bzl,
-// reused here), but codegen has no concrete member to dispatch to, so
-// `lowerExpr` returns null for the CallExpr and `lowerLocalDecl`'s
-// zero-init fallback is what stores the local's value. This is why the new
+// — see this fix's commit message): the initializer is an INDEXER read
+// `x[0]` on a bare type parameter `T`. §3.6 rule 2 / §14.2: a bare type
+// parameter exposes only the members its constraints establish, so sema
+// admits the read (a `where` clause could establish an indexer) — but the
+// monomorphized clone at `T = int` has no indexer to dispatch to, so
+// `lowerExpr` returns null for the index expression and `lowerLocalDecl`'s
+// zero-init fallback is what stores the local's value.
+//
+// ⚠ THE TRIGGER WAS RE-BASED BY fix #7973 (§8.1, v0.350). This case used to
+// use `o.Anything()` on an `Object`-typed receiver — the §3/#605 permissive
+// "unknown member" acceptance. §8.1 declares the root `Object`'s public
+// surface ("The declaration above defines the public surface"), and §26.5
+// resolves a member against the receiver's declared type, so that shape is
+// now a COMPILE ERROR and never reaches codegen. The subject of this case —
+// #2434's local-declaration zero-init fallback — is unchanged; only the
+// shape that reaches it moved, to the one legal shape that still does. The
 // diagnostic is Severity::Warning, not Error: an unconditional Error would
-// reject this (and the other 5 corpus programs sharing this shape) —
-// turning a currently-legal compile into a hard failure, exactly the
-// false-reject #2434 warned against checking for before choosing Error.
+// reject a legal program.
 //
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
 
-module M; class C public method M(o: Object): int var s := o.Anything(); return 0; end M; end C;
+module M;
+class C
+  public method M<T>(x: T): int
+    var s := x[0];
+    return 0;
+  end M;
+  public static method Main(): int
+    using var c := new C();
+    return c.M(1);
+  end Main;
+end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: lowerLocalDecl's initializer expression failed to lower to a value for this local's slot (degraded to a zero-initialized value) — #2434

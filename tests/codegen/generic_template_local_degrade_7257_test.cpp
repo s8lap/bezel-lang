@@ -172,19 +172,48 @@ const char* kTemplateProgram =
     "  end F; "
     "end Program; ";
 
-// (2) the NEGATIVE CONTROL — byte-for-byte the source of
-// tests/lit/local_decl_zero_init_fallback_warns_2434.bzl. A NON-generic
-// method's local whose initializer is a member call on an `Object`-typed
-// receiver: sema accepts it BY DESIGN (§3/#605 permissive "unknown member"),
-// codegen has no member to dispatch to, so the initializer fails to lower and
-// #2434's warning is the ONLY signal. It must keep firing.
+// (2) the NEGATIVE CONTROL — a NON-template method's local whose initializer
+// fails to lower: the #2434 warning must still fire.
+//
+// ⚠ THE TRIGGER WAS RE-BASED BY fix #7973 (§8.1, v0.350). This control used
+// to be the source of tests/lit/local_decl_zero_init_fallback_warns_2434.bzl:
+// a NON-generic method's local whose initializer is a member call on an
+// `Object`-typed receiver — sema accepted it BY DESIGN (§3/#605 permissive
+// "unknown member"), codegen had no member to dispatch to, so the initializer
+// failed to lower and #2434's warning was the ONLY signal. §8.1 declares the
+// root `Object`'s public surface ("The declaration above defines the public
+// surface"), and §26.5 resolves a member against the receiver's declared type,
+// so that shape is now a COMPILE ERROR and never reaches codegen.
+//
+// The replacement keeps the control's SUBJECT — a method that is not a generic
+// template at all, whose local degrades — and reaches it through the one legal
+// shape that still does: a method of a GENERIC CLASS (so the method body is
+// only ever emitted as the class's clone, never as a template) whose local
+// reads an INDEXER off a value of the class's own type parameter. §3.6 rule 2
+// / §14.2 leave a bare type parameter's member set open, so sema admits the
+// read; the clone at `T = int` has no indexer to dispatch to, so the
+// initializer fails to lower.
+//
+// The #2477 DISPATCH note that used to accompany this program (on the
+// `Object` receiver) is gone with that receiver — §8.1's closed surface IS
+// this fix. The #2477 diagnostic itself is still reachable and still pinned,
+// by the dead abstract template body's `new T()`:
+// tests/lit/generic_new_T_dead_template_body_warns_2477.bzl.
 const char* kNonTemplateProgram =
     "module M7257n; "
-    "public class C "
-    "  public method M(o: Object): int "
-    "    var s := o.Anything(); "
+    "public class Box<T> "
+    "  public V: T; "
+    "  public constructor(v: T) V := v; end constructor; "
+    "  public method M(): int "
+    "    var s := this.V[0]; "
     "    return 0; "
     "  end M; "
+    "end Box; "
+    "public class C "
+    "  public static method Main(): int "
+    "    using var b := new Box<int>(1); "
+    "    return b.M(); "
+    "  end Main; "
     "end C; ";
 
 // (3) the SCOPE CONTROL — the SAME generic method, but instantiated at
@@ -251,13 +280,17 @@ BEZEL_TEST(codegen_generic_template_local_degrade_7257,
     if (c.rejected) dump(c);
     BEZEL_EXPECT_FALSE(c.rejected);
     BEZEL_EXPECT_EQ(count2434(c), 1);
-    // TWO `internal:` diagnostics reach this program, and both must survive:
-    // the #2477 dispatch note ("codegen cannot dispatch member 'Anything' on
-    // receiver of type 'Object'") and the #2434 zero-init backstop that
-    // follows from it. The diagnostic is a Warning, so the program still
-    // compiles — #2434 made it a Warning precisely so the §3/#605 permissive
-    // programs keep building.
-    BEZEL_EXPECT_EQ(countInternal(c), 2);
+    // EXACTLY ONE `internal:` diagnostic reaches this program, and it must
+    // survive: the #2434 zero-init backstop. It used to be TWO — the #2477
+    // dispatch note ("codegen cannot dispatch member 'Anything' on receiver of
+    // type 'Object'") and the #2434 backstop that follows from it — but that
+    // pairing was only reproducible through the `Object` receiver, whose
+    // surface §8.1 closes (fix #7973). The #2477 diagnostic itself is still
+    // reachable and still pinned, by the dead abstract template body's
+    // `new T()`: tests/lit/generic_new_T_dead_template_body_warns_2477.bzl.
+    // The diagnostic is a Warning, so the program still compiles — #2434 made
+    // it a Warning precisely so the legal programs keep building.
+    BEZEL_EXPECT_EQ(countInternal(c), 1);
 }
 
 // ===========================================================================

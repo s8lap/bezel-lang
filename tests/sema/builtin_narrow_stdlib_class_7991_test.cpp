@@ -373,10 +373,21 @@ end P;
 // slot AS the value type. On this fix's first draft (every declaration-less
 // Named admitted) this program SEGFAULTED THE COMPILER; with the shipped
 // population it compiles and prints exactly what it printed before the fix.
+//
+// ⚠ FLIPPED by fix #7973 (§8.1, v0.350). The narrowing is STILL not applied
+// — that is the row's subject, and the diagnostic proves it: the refused
+// member is named against `Object`, NOT against `ReadOnlyStringSpan`. What
+// changed is the CONSEQUENCE of not narrowing: §8.1 declares the root
+// `Object`'s public surface ("The declaration above defines the public
+// surface"), and §26.5 resolves a member against the receiver's DECLARED
+// type, so `o.Length` — a member of `ReadOnlyStringSpan`, not of `Object` —
+// names no member of the carrier and is a COMPILE ERROR. It used to compile
+// and degrade to zero at runtime (the permissive "unknown member"
+// acceptance), which is exactly the wrong value this row's non-narrowing
+// existed to prevent.
 BEZEL_TEST(sema_builtin_narrow_stdlib_class_7991,
            non_boxable_builtin_value_type_is_still_not_narrowed_spec_12_7) {
-    BEZEL_EXPECT_EQ(
-        stdoutOf(R"bzl(module M7991V;
+    auto r = runAot(R"bzl(module M7991V;
 public class P
   public static method Main(): int
     var o: Object := 5;
@@ -387,8 +398,13 @@ public class P
     return 0;
   end Main;
 end P;
-)bzl"),
-        std::string("done\n"));
+)bzl");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    // The refusal names `Object` — NOT `ReadOnlyStringSpan` — so the row's
+    // subject (the carrier is NOT narrowed) is what the diagnostic proves.
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "no member `Length` on type `Object`"));
 }
 
 // §8.1: the five §8.1 members on the ROOT `Object` are still admitted.

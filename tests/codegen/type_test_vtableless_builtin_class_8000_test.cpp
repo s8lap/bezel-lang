@@ -387,9 +387,59 @@ end Program;
 // was fixed by #7991 (landed on staging as `bd1f8788`). This fix is in the
 // same neighbourhood, so the crash must STILL be gone: the compiler must
 // finish, not crash.
+//
+// ⚠ RE-BASED by fix #7973 (§8.1, v0.350). The original program read `o.Length`
+// — a member of `ReadOnlyStringSpan`, NOT of the root `Object` — and §8.1
+// ("The declaration above defines the public surface") + §26.5 ("members
+// resolve against the DECLARED type") now REFUSE that read, so the program no
+// longer reaches codegen at all and the crash guard would be vacuous. The
+// shape keeps the carrier, the boxed value, the `is` test against the
+// vtable-less builtin CLASS and the member read through the `Object` carrier
+// — only the member is now one of §8.1's own (`GetHashCode`), so the program
+// still compiles, still runs the type-test lowering, and still exercises the
+// path the crash lived on. The REFUSED spelling of the original program is
+// pinned by the row below, which also proves (the diagnostic names `Object`,
+// not `ReadOnlyStringSpan`) that the narrowing #7991 closed is still closed.
 BEZEL_TEST(codegen_type_test_8000,
            boxed_value_is_test_does_not_crash_the_compiler) {
     const CompileOutput out = compileCapturingStderr(R"bzl(module M8000B;
+public class Program
+  public static method Main(): int
+    var o: Object := 5;
+    if o is ReadOnlyStringSpan then
+      Console.WriteLine(o.GetHashCode());
+    end;
+    return 0;
+  end Main;
+end Program;
+)bzl");
+    BEZEL_EXPECT_TRUE(out.ran);
+    // A compiler crash exits with a signal (128 + SIGSEGV = 139) or dies
+    // before producing any output; a clean compile exits 0.
+    BEZEL_EXPECT_EQ(out.exitCode, 0);
+    BEZEL_EXPECT_TRUE(out.text.find("Segmentation fault") == std::string::npos);
+}
+
+// ── THE SAME SHAPE, REFUSED BY §8.1 (fix #7973) ────────────────────────────
+// The original crash-guard program, verbatim: the carrier is the root
+// `Object`, the value is a boxed `int`, the test is against the vtable-less
+// builtin CLASS `ReadOnlyStringSpan`, and the member read is `o.Length`.
+// `Length` is a member of `ReadOnlyStringSpan` (stdlib §6.x), not of the root
+// `Object` (§8.1 lists exactly `GetType`, `Equals`, `GetHashCode`, `ToString`
+// and the static `ReferenceEquals`), and §26.5 resolves a member against the
+// receiver's DECLARED type — so the read names no member and is a COMPILE
+// ERROR.
+//
+// ⚠ ORACLE. The row asserts the REFUSAL ITSELF — the exit code (1, not a
+// signal) AND the diagnostic text — and not the mere absence of a crash: the
+// compiler must refuse the program, and it must do so with the §8.1
+// diagnostic. The diagnostic naming `Object` (not `ReadOnlyStringSpan`) is
+// also what proves the narrowing #7991 closed is STILL closed: had the
+// narrowing applied, the member would have resolved against
+// `ReadOnlyStringSpan` and there would be nothing to refuse.
+BEZEL_TEST(codegen_type_test_8000,
+           boxed_value_is_test_member_read_is_refused_spec_8_1_7973) {
+    const CompileOutput out = compileCapturingStderr(R"bzl(module M8000R;
 public class Program
   public static method Main(): int
     var o: Object := 5;
@@ -401,8 +451,9 @@ public class Program
 end Program;
 )bzl");
     BEZEL_EXPECT_TRUE(out.ran);
-    // A compiler crash exits with a signal (128 + SIGSEGV = 139) or dies
-    // before producing any output; a clean compile exits 0.
-    BEZEL_EXPECT_EQ(out.exitCode, 0);
+    // 1 = a clean refusal; a crash would be 128 + SIGSEGV = 139 (or -1).
+    BEZEL_EXPECT_EQ(out.exitCode, 1);
     BEZEL_EXPECT_TRUE(out.text.find("Segmentation fault") == std::string::npos);
+    BEZEL_EXPECT_TRUE(out.text.find("no member `Length` on type `Object`") !=
+                       std::string::npos);
 }

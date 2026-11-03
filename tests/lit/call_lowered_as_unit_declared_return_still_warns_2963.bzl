@@ -21,22 +21,29 @@
 // sibling, arrow_body_nullable_unit_return_still_warns_3434.bzl, pins the
 // `()?` case the new gate must also keep warning on.
 //
-// The degrading body is §3/#605's permissive surface: `o.Anything()` on an
-// `Object` receiver is accepted by sema BY DESIGN and lowers to nothing at all,
-// so the arrow body reaches the #2491 site with no value and no IR emitted —
-// "declined", not "lowered as unit".  `Get` is CALLED, because an uninstantiated
-// class's body is never emitted and the note would then be absent for a reason
-// that has nothing to do with this fix.
+// The degrading body is an INDEXER read `x[0]` on a bare type parameter `T`:
+// §3.6 rule 2 / §14.2 leave a bare type parameter's member set open, so sema
+// ADMITS the read, while the monomorphized clone at `T = int` has no indexer
+// to dispatch to — so the arrow body reaches the #2491 site with no value and
+// no IR emitted — "declined", not "lowered as unit".  `Get` is CALLED, because
+// an uninstantiated class's body is never emitted and the note would then be
+// absent for a reason that has nothing to do with this fix.
+//
+// ⚠ THE TRIGGER WAS RE-BASED BY fix #7973 (§8.1, v0.350). The degrading body
+// used to be `o.Anything()` on an `Object` receiver — the §3/#605 permissive
+// surface. §8.1 declares the root `Object`'s public surface ("The declaration
+// above defines the public surface"), and §26.5 resolves a member against the
+// receiver's declared type, so that shape is now a COMPILE ERROR and never
+// reaches codegen. The subject of this case — #2963's gate — is unchanged.
 //
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
 
 module M;
 class C
-  public method Get(o: Object): int => o.Anything();
+  public method Get<T>(x: T): int => x[0];
   public static method Main(): int
     using var c := new C();
-    using var o := new C();
-    return c.Get(o);
+    return c.Get(1);
   end Main;
 end C;
 

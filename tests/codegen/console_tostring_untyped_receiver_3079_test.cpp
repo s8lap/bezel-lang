@@ -37,9 +37,12 @@
 // a dropped line fail as a wrong string instead of passing as a wrong-but-
 // plausible number.
 
+#include "support/aot_result_asserts.hpp"  // diagnosticMessageContains
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 // Shape (i): a BARE reference to a class-level `const` as the ToString
@@ -128,14 +131,54 @@ BEZEL_TEST(codegen_console_tostring_untyped_receiver_3079,
 
 // THE CLASS-LEVEL PROPERTY, on the value channel: a `Console.Write(Line)` whose
 // argument fails to lower must never again make the statement DISAPPEAR without
-// a word. The §3/#605 permissive shape `o.Anything()` on an `Object` receiver is
-// the one that still legitimately reaches the degrade (sema admits it BY
-// DESIGN), so it is the probe: the compile still succeeds and the surrounding
-// lines still print — the guard added by this fix is a Warning on that path, not
-// a reject. The diagnostic TEXT is pinned by the sibling lit test
+// a word. The probe is an argument sema ADMITS and codegen cannot lower: the
+// compile still succeeds and the surrounding lines still print — the guard
+// added by this fix is a Warning on that path, not a reject. The diagnostic
+// TEXT is pinned by the sibling lit test
 // `console_arg_lowering_silent_drop_3079.bzl`.
+//
+// ⚠ THE PROBE WAS RE-BASED BY fix #7973 (§8.1, v0.350). It used to be
+// `o.Anything()` on an `Object` receiver — the §3/#605 permissive "unknown
+// member" acceptance. §8.1 declares the root `Object`'s public surface ("The
+// declaration above defines the public surface"), and §26.5 resolves a member
+// against the receiver's declared type, so that shape is now a COMPILE ERROR
+// and never reaches codegen. The property this row pins — the surrounding
+// lines still print — is unchanged; only the shape that reaches it moved, to
+// the one legal shape that still does: an indexer read on a BARE TYPE
+// PARAMETER, whose member set §3.6 rule 2 / §14.2 leave open, so sema admits
+// the read while the monomorphized clone at `T = int` has no indexer to
+// dispatch to. The sibling row below pins the rejection of the old shape.
 BEZEL_TEST(codegen_console_tostring_untyped_receiver_3079,
-           permissive_unloweable_console_arg_still_compiles_spec_21_9) {
+           unloweable_console_arg_still_compiles_spec_21_9) {
+    auto r = runAot(
+        "module N3079D; "
+        "class C "
+        "  public static method Main(): int "
+        "    Console.WriteLine(\"<\"); "
+        "    _ := C.Probe(1); "
+        "    Console.WriteLine(\">\"); "
+        "    return 0; "
+        "  end Main; "
+        "  public static method Probe<T>(x: T): int "
+        "    Console.WriteLine(x[0]); "
+        "    return 0; "
+        "  end Probe; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("<\n>\n"));
+}
+
+// ⚠ NEW by fix #7973 (§8.1, v0.350): the shape this file's sibling row used
+// to pin — an undeclared member on an `Object`-typed receiver — is now a
+// COMPILE ERROR. §8.1 declares the root `Object` with exactly `GetType`,
+// `Equals`, `GetHashCode`, `ToString` and the static `ReferenceEquals`, and
+// says of that declaration: "The declaration above defines the public
+// surface." §26.5 resolves a member against the receiver's DECLARED type, so
+// `o.Anything()` names no member of `Object`.
+BEZEL_TEST(codegen_console_tostring_untyped_receiver_3079,
+           unresolvable_member_console_arg_is_rejected_spec_8_1_7973) {
     auto r = runAot(
         "module N3079D; "
         "class C "
@@ -147,8 +190,8 @@ BEZEL_TEST(codegen_console_tostring_untyped_receiver_3079,
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("<\n>\n"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "no member `Anything` on type `Object`"));
 }

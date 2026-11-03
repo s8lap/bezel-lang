@@ -357,6 +357,13 @@ end P;
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("5 -1\n"));
 }
 
+//
+// ⚠ FLIPPED by fix #7973 (§8.1, v0.350): the `Object?` fold this row
+// pins now REFUSES the member read that reaches through it — §8.1
+// declares the root `Object`'s public surface, and §26.5 resolves a
+// member against the receiver's DECLARED type, so `r.V` names no
+// member of `Object`. The fold is unchanged; the read is refused
+// statically instead of degrading to zero at runtime.
 // pending #6112. Two arms that are DIFFERENT instantiations of one generic
 // class (`Bx<B>`, `Bx<A>`) plus a `null` arm: the result keeps the pre-#6086
 // `Object?` fold, because typing it `Bx<B>?` made `r.V.y` read `B.y` out of the
@@ -387,11 +394,27 @@ public class P
 end P;
 )bzl");
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("n=122\n") != std::string::npos);
+    // ⚠ FLIPPED by fix #7973 (§8.1, v0.350). The fold this row pins is the
+    // `Object?` one, and §8.1 declares the root `Object`'s public surface
+    // ("The declaration above defines the public surface"), so reading a
+    // member through that fold is now a COMPILE ERROR rather than a runtime
+    // degradation to zero. The fold itself is UNCHANGED — the diagnostic names
+    // `Object`, not `Bx<…>` — and the memory-cleanliness this row probed is
+    // now guaranteed statically: the program cannot be built at all, so the
+    // read that used to overflow a `Bx<…>` slot cannot happen.
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "no member `V` on type `Object`"));
 }
 
+//
+// ⚠ FLIPPED by fix #7973 (§8.1, v0.350): the `Object?` fold this row
+// pins now REFUSES the member read that reaches through it — §8.1
+// declares the root `Object`'s public surface, and §26.5 resolves a
+// member against the receiver's DECLARED type, so `r.V` names no
+// member of `Object`. The fold is unchanged; the read is refused
+// statically instead of degrading to zero at runtime.
 // pending #6112. `Bx<int>` and `Bx<int?>` are different instantiations
 // too (§7.1: `int?` carries a presence flag, so `V` has another layout), and
 // the comparison that finds the mixed pair must see the nullability of a type
@@ -422,11 +445,27 @@ public class P
 end P;
 )bzl");
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("n=122\n") != std::string::npos);
+    // ⚠ FLIPPED by fix #7973 (§8.1, v0.350). The fold this row pins is the
+    // `Object?` one, and §8.1 declares the root `Object`'s public surface
+    // ("The declaration above defines the public surface"), so reading a
+    // member through that fold is now a COMPILE ERROR rather than a runtime
+    // degradation to zero. The fold itself is UNCHANGED — the diagnostic names
+    // `Object`, not `Bx<…>` — and the memory-cleanliness this row probed is
+    // now guaranteed statically: the program cannot be built at all, so the
+    // read that used to overflow a `Bx<…>` slot cannot happen.
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "no member `V` on type `Object`"));
 }
 
+//
+// ⚠ FLIPPED by fix #7973 (§8.1, v0.350): the `Object?` fold this row
+// pins now REFUSES the member read that reaches through it — §8.1
+// declares the root `Object`'s public surface, and §26.5 resolves a
+// member against the receiver's DECLARED type, so `r.V` names no
+// member of `Object`. The fold is unchanged; the read is refused
+// statically instead of degrading to zero at runtime.
 // pending #6112. `Bx<B>` and `Bx<B?>`: a class argument differing only
 // in nullability. Typed `Bx<B>?`, `r.V.y` dereferenced the `null` a
 // `Bx<B?>` holds — SEGV, MEASURED on the fix before this row.
@@ -453,11 +492,27 @@ public class P
 end P;
 )bzl");
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("n=122\n") != std::string::npos);
+    // ⚠ FLIPPED by fix #7973 (§8.1, v0.350). The fold this row pins is the
+    // `Object?` one, and §8.1 declares the root `Object`'s public surface
+    // ("The declaration above defines the public surface"), so reading a
+    // member through that fold is now a COMPILE ERROR rather than a runtime
+    // degradation to zero. The fold itself is UNCHANGED — the diagnostic names
+    // `Object`, not `Bx<…>` — and the memory-cleanliness this row probed is
+    // now guaranteed statically: the program cannot be built at all, so the
+    // read that used to overflow a `Bx<…>` slot cannot happen.
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "no member `V` on type `Object`"));
 }
 
+//
+// ⚠ FLIPPED by fix #7973 (§8.1, v0.350): the `Object?` fold this row
+// pins now REFUSES the member read that reaches through it — §8.1
+// declares the root `Object`'s public surface, and §26.5 resolves a
+// member against the receiver's DECLARED type, so `r.V` names no
+// member of `Object`. The fold is unchanged; the read is refused
+// statically instead of degrading to zero at runtime.
 // pending #6112. `Bx<string>` and `Bx<string?>` holding `null`: the
 // same SEGV through `r.V.Length`, MEASURED on the fix before this row.
 BEZEL_TEST(sema_case_null_arm_join_6086,
@@ -483,11 +538,27 @@ public class P
 end P;
 )bzl");
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("n=122\n") != std::string::npos);
+    // ⚠ FLIPPED by fix #7973 (§8.1, v0.350). The fold this row pins is the
+    // `Object?` one, and §8.1 declares the root `Object`'s public surface
+    // ("The declaration above defines the public surface"), so reading a
+    // member through that fold is now a COMPILE ERROR rather than a runtime
+    // degradation to zero. The fold itself is UNCHANGED — the diagnostic names
+    // `Object`, not `Bx<…>` — and the memory-cleanliness this row probed is
+    // now guaranteed statically: the program cannot be built at all, so the
+    // read that used to overflow a `Bx<…>` slot cannot happen.
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "no member `V` on type `Object`"));
 }
 
+//
+// ⚠ FLIPPED by fix #7973 (§8.1, v0.350): the `Object?` fold this row
+// pins now REFUSES the member read that reaches through it — §8.1
+// declares the root `Object`'s public surface, and §26.5 resolves a
+// member against the receiver's DECLARED type, so `r.V` names no
+// member of `Object`. The fold is unchanged; the read is refused
+// statically instead of degrading to zero at runtime.
 // pending #6112. The mixed pair inside a nested `case` whose own result
 // meets an outer `null` arm.
 BEZEL_TEST(sema_case_null_arm_join_6086,
@@ -513,7 +584,16 @@ public class P
 end P;
 )bzl");
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("n=122\n") != std::string::npos);
+    // ⚠ FLIPPED by fix #7973 (§8.1, v0.350). The fold this row pins is the
+    // `Object?` one, and §8.1 declares the root `Object`'s public surface
+    // ("The declaration above defines the public surface"), so reading a
+    // member through that fold is now a COMPILE ERROR rather than a runtime
+    // degradation to zero. The fold itself is UNCHANGED — the diagnostic names
+    // `Object`, not `Bx<…>` — and the memory-cleanliness this row probed is
+    // now guaranteed statically: the program cannot be built at all, so the
+    // read that used to overflow a `Bx<…>` slot cannot happen.
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "no member `V` on type `Object`"));
 }

@@ -20,15 +20,27 @@
 // other expression whose result is `()` may appear as a statement on its own
 // line, terminated with `;`" — the argument position is not such a place.
 //
-// ACCEPT-WITH-WARNING, deliberately, on THIS program: the §3/#605 permissive
-// "unknown member" acceptance (`o.Anything()` for `o: Object`) is admitted by
-// sema BY DESIGN and legitimately reaches this degrade, so an Error here would
-// be exactly the false reject #2434's lit-corpus check found for the local-decl
-// twin. The severity is #2434/#2491's, reused: a Warning, printed by
+// ACCEPT-WITH-WARNING, deliberately, on THIS program: the argument is an
+// expression sema ADMITS and codegen cannot lower, so the §3/#3079 degrade is
+// legitimately reached, and an Error here would be exactly the false reject
+// #2434's lit-corpus check found for the local-decl twin. The severity is
+// #2434/#2491's, reused: a Warning, printed by
 // `Driver::compileExecutableObject` like every diagnostic, so the drop is
 // visible on stderr while the build still succeeds. The companion AOT test
 // `console_tostring_untyped_receiver_3079_test.cpp` pins the surrounding lines
 // still printing and the exit code still 0.
+//
+// ⚠ THE TRIGGER WAS RE-BASED BY fix #7973 (§8.1, v0.350). This case used to
+// use `o.Anything()` on an `Object`-typed receiver — the §3/#605 permissive
+// "unknown member" acceptance. §8.1 declares the root `Object`'s public
+// surface ("The declaration above defines the public surface"), and §26.5
+// resolves a member against the receiver's declared type, so that shape is
+// now a COMPILE ERROR and never reaches codegen. The subject of this case —
+// a Console argument that fails to lower, and the whole statement disappearing
+// with it — is unchanged; only the shape that reaches it moved, to the one
+// legal shape that still does: an indexer read on a BARE TYPE PARAMETER, whose
+// member set §3.6 rule 2 / §14.2 leave open, so sema admits the read while
+// the monomorphized clone at `T = int` has no indexer to dispatch to.
 //
 // The BUILT-IN-receiver subpopulation escalates to a hard error instead; that
 // is `console_arg_builtin_unit_call_rejected_3079.bzl`.
@@ -39,13 +51,16 @@
 module N3079Lit;
 class C
   public static method Main(): int
-    var o: Object := "x";
     Console.WriteLine("<");
-    Console.WriteLine(o.Anything());
-    Console.Write(o.Anything());
+    _ := C.Probe(1);
     Console.WriteLine(">");
     return 0;
   end Main;
+  public static method Probe<T>(x: T): int
+    Console.WriteLine(x[0]);
+    Console.Write(x[0]);
+    return 0;
+  end Probe;
 end C;
 
 // CHECK-DAG: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} internal: the argument of this `Console.WriteLine` failed to lower to a value, so the whole statement emits nothing — not even the line terminator (stdlib §2.1 / §21.9) — #3079

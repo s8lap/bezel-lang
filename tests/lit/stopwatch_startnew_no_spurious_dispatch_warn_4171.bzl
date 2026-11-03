@@ -42,10 +42,6 @@ module M;
 
 import System.Diagnostics;
 
-class Widget4171
-  public constructor() end constructor;
-end Widget4171;
-
 class C
   public static method Main(): int
     // The pinned shape (fix #4171): Start/Stop/Reset on a
@@ -68,11 +64,14 @@ class C
     sw2.Stop();
     sw2.Reset();
 
-    // Must-still-warn control 1: a genuinely undispatchable member on an
-    // ordinary Object-typed receiver — the original #2477/#2963 shape,
-    // entirely unrelated to Stopwatch — must be completely unaffected.
-    var w: Object := new Widget4171();
-    w.TotallyBogus4171B();
+    // Must-still-warn control 1: a genuinely undispatchable member on a
+    // CONSTRUCTOR-typed `new Stopwatch()` receiver expression (a call-free
+    // `new`, not a bound local) — the original #2477/#2963 shape — must be
+    // completely unaffected. (fix #7973, §8.1: this control used to use an
+    // `Object`-typed receiver; the root `Object`'s public surface is closed,
+    // so an undeclared member on it is now a COMPILE ERROR and never reaches
+    // codegen.)
+    new Stopwatch().TotallyBogus4171B();
 
     // Must-still-warn control 2: a genuinely undispatchable member reached
     // through the SAME `Stopwatch.StartNew()` receiver TYPE, but via a
@@ -89,5 +88,5 @@ end C;
 // CHECK-NOT: cannot dispatch member 'Start'
 // CHECK-NOT: cannot dispatch member 'Stop'
 // CHECK-NOT: cannot dispatch member 'Reset'
-// CHECK: internal: codegen cannot dispatch member 'TotallyBogus4171B' on receiver of type 'Object'
+// CHECK: internal: codegen cannot dispatch member 'TotallyBogus4171B' on receiver of type 'Stopwatch'
 // CHECK: internal: codegen cannot dispatch member 'TotallyBogus4171C' on receiver of type 'Stopwatch'

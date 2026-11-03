@@ -41,10 +41,13 @@
 // than becoming errors — the descent stops at a root that is not a Named
 // built-in TYPE, exactly as before.
 
+#include "support/aot_result_asserts.hpp"  // diagnosticMessageContains
 #include "support/aot_support.hpp"   // runAot — AOT test harness
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -206,11 +209,21 @@ BEZEL_TEST(builtin_member_chain_2976,
 }
 
 BEZEL_TEST(builtin_member_chain_2976,
-           object_typed_root_stays_permissive_spec_3_605) {
-    // §3/#605's permissive surface, in the CHAINED shape this fix newly walks:
-    // the spine bottoms out at an `Object`-typed receiver, which is a Primitive
-    // TypeRef and not a registry built-in, so the descent must find nothing and
-    // leave the program compiling exactly as before.
+           object_typed_root_is_rejected_spec_8_1_7973) {
+    // ⚠ FLIPPED by fix #7973 (§8.1, v0.350). This row used to be
+    // `object_typed_root_stays_permissive_spec_3_605` and asserted that the
+    // permissive acceptance left the program compiling exactly as before.
+    // §8.1 declares the root `Object` with exactly `GetType`, `Equals`,
+    // `GetHashCode`, `ToString` and the static `ReferenceEquals`, and says of
+    // that declaration: "The declaration above defines the public surface."
+    // §26.5 resolves a member against the receiver's DECLARED type, so the
+    // chained shape below names no member of `Object` and is a compile error.
+    // The "§3/#605 permissive acceptance" the old row pinned is not in the spec
+    // (issue #7024: that citation is stale).
+    //
+    // The spine's own subject is unchanged: a CHAINED access whose ROOT is an
+    // `Object`-typed receiver is refused by the closed surface, exactly like
+    // the unchained one.
     const std::string program =
         "module M; "
         "class C "
@@ -219,8 +232,10 @@ BEZEL_TEST(builtin_member_chain_2976,
         "  public static method Main(): int return 0; end Main; "
         "end C;";
     auto r = runAot(program);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(0, r.exitCode);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "no member `Anything` on type `Object`"));
 }
 
 BEZEL_TEST(builtin_member_chain_2976,

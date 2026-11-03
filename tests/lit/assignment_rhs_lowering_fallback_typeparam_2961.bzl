@@ -11,21 +11,31 @@
 // cannot lose a branch without a lit failure.
 //
 // REACHING THE FALLBACK. The `else` is taken exactly when the RHS is NOT a
-// built-in member call. An unknown member on a §3/#605-permissive Object-typed
-// receiver is the shape that lands there: sema accepts the member access under
-// the permissive surface, lowerExpr has no dispatch to lower it to a value, and
+// built-in member call. An expression sema ADMITS and codegen cannot lower is
+// the shape that lands there: the RHS is an indexer read `o[42]` on a bare
+// type parameter `T` — §3.6 rule 2 / §14.2 leave a bare type parameter's
+// member set open, so sema admits the read, while the monomorphized clone at
+// `T = int` has no indexer to dispatch to, so `lowerExpr` returns null;
 // `builtinReceiverOfMemberCall` — which only recognises a RECEIVER of built-in
 // type — returns empty, so the undecorated text is reported. Verified
-// empirically: this file prints the bare "#2961" sentence below, and the
-// #2477 permissive-acceptance note alongside it names the same shape.
+// empirically: this file prints the bare "#2961" sentence below.
+//
+// ⚠ THE TRIGGER WAS RE-BASED BY fix #7973 (§8.1, v0.350). This case used to
+// use `o.NoSuchMember(42)` on an `Object`-typed receiver — the §3/#605
+// permissive "unknown member" acceptance. §8.1 declares the root `Object`'s
+// public surface ("The declaration above defines the public surface"), and
+// §26.5 resolves a member against the receiver's declared type, so that shape
+// is now a COMPILE ERROR and never reaches codegen. The subject of this case —
+// the UNDECORATED fallback branch — is unchanged; only the shape that reaches
+// it moved, to the one legal shape that still does.
 //
 // BOTH ARMS, as in the sibling: the localSlot arm via `x := …` on a local, and
 // the generic lvalueAddr arm via `this.f := …` on a class field. Two CHECK-DAG
 // lines, one per arm, so dropping either arm's fallback site fails loudly.
 //
 // ACCEPT-WITH-WARNING control (same as the sibling): bezelc -c must still exit
-// zero — the program IS legal under §3/#605 — while printing the internal
-// Warning that names the dropped store.
+// zero — the program IS legal — while printing the internal Warning that names
+// the dropped store.
 //
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
@@ -34,10 +44,10 @@ module M;
 class C
   public f: int;
   public constructor() f := 0; end constructor;
-  public method M(o: Object): int
+  public method M<T>(o: T): int
     var x: int := 7;
-    x := o.NoSuchMember(42);
-    this.f := o.NoSuchMember(43);
+    x := o[42];
+    this.f := o[43];
     return x + this.f;
   end M;
 end C;

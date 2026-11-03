@@ -202,11 +202,28 @@ const char* kObjectAliasReassignedToClass =
 // zero; the entire `o.Length + s.Length` therefore degrades to 0
 // (the degraded-return path), so per iter `r = 0`. Total = ab + c = 122.
 // =====================================================================
+// ⚠ THE READ WAS RE-BASED BY fix #7973 (§8.1, v0.350). This program used to
+// read `o.Length` off the `Object`-typed alias `o`. §8.1 declares the root
+// `Object`'s public surface ("The declaration above defines the public
+// surface") — exactly `GetType`, `Equals`, `GetHashCode`, `ToString` and the
+// static `ReferenceEquals` — and §26.5 resolves a member against the
+// receiver's DECLARED type, so `o.Length` names no member of `Object` and is
+// a COMPILE ERROR now. The read is still made, through the one member of
+// §8.1's surface that yields the string the alias holds: `o.ToString()`.
+//
+// The VALUE CHANGES with it, and that is the point of the row: the old
+// program read a member that could not be dispatched, so `o.Length` degraded
+// to 0 and the whole return expression zeroed (#2491's degraded-return path)
+// — the sum was `ab + c = 122` with the alias's own length MISSING. The
+// re-based program reads the alias for what it is, so the sum is the FULL
+// `ab + ab + c = 193` — the same value the string/string control above
+// computes, which is the point: the `Object`-typed alias now yields the same
+// answer as the string-typed copy.
 const char* kBindParameterStringIntoObject =
     "module M; class C "
     "  private static method Take(s: string): int "
     "    var o: Object := s; "
-    "    return o.Length + s.Length; "
+    "    return o.ToString().Length; "
     "  end Take; "
     "  public static method Main(): int "
     "    var t: int := 0; "
@@ -340,8 +357,15 @@ BEZEL_TEST(codegen_string_to_object_alias_release_2900,
            bind_parameter_string_into_object_plain_path_value_28_1) {
     JitResult r = runAot(kBindParameterStringIntoObject);
     BEZEL_EXPECT_TRUE(r.ran);
-    // Take's `o.Length + s.Length` degrades to 0 (the o.Length branch
-    // can't dispatch and #2491's degraded-return path zeroes the whole
-    // expression), so per iter r=0 and the sum is just ab + c = 122.
-    BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
+    // Take's `o.ToString().Length` reads the string the `Object`-typed alias
+    // holds, so per iter r = len("ab" + i) and the sum is the FULL
+    // ab + ab + c = 193 — the same value the string/string control computes
+    // (`2 * kLenAb20 + (kLenSum20 - kLenAb20)`).
+    //
+    // ⚠ THE VALUE CHANGED (122 → 193) with fix #7973 (§8.1, v0.350): the old
+    // program read `o.Length`, a member outside §8.1's closed surface, which
+    // degraded to 0 and took the whole return expression with it. The alias
+    // still holds the string (the checked row above pins that it is released
+    // exactly once); it is now READ through a member that exists.
+    BEZEL_EXPECT_EQ(r.exitCode, 2 * kLenAb20 + (kLenSum20 - kLenAb20));
 }

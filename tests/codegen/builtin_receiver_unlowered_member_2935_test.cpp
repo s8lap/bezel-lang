@@ -58,6 +58,7 @@
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::diagnosticMessageContains;
 using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
@@ -384,13 +385,20 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
 }
 
 BEZEL_TEST(builtin_receiver_unlowered_member_2935,
-           object_typed_receiver_stays_permissive_spec_3_605) {
-    // §3/#605's permissive acceptance, byte-for-byte the shape of
-    // tests/lit/sema/sema_unknown_member__object_typed_receiver_permissive.bzl
-    // and of #2434's own control: an unknown member on an `Object`-typed
-    // receiver is accepted BY DESIGN and reaches the same zero-degrade. It must
-    // keep compiling — the receiver is a Primitive TypeRef, not a registry
-    // built-in, so the gate cannot see it.
+           object_typed_receiver_is_rejected_spec_8_1_7973) {
+    // ⚠ FLIPPED by fix #7973 (§8.1, v0.350). This row used to be
+    // `object_typed_receiver_stays_permissive_spec_3_605` and asserted that an
+    // unknown member on an `Object`-typed receiver kept compiling (reaching the
+    // zero-degrade). §8.1 declares the root `Object` with exactly `GetType`,
+    // `Equals`, `GetHashCode`, `ToString` and the static `ReferenceEquals`,
+    // and says of that declaration: "The declaration above defines the public
+    // surface." §26.5 resolves a member against the receiver's DECLARED type,
+    // so `o.Anything()` names no member of `Object` and is a compile error.
+    // The "§3/#605 permissive acceptance" the old row pinned is not in the spec
+    // (issue #7024: that citation is stale).
+    //
+    // The subject is unchanged: the receiver is a Primitive TypeRef, and the
+    // registry-built-in gate is not what refuses it — §8.1's closed surface is.
     const std::string program =
         "module M; import System.Diagnostics; "
         "class C "
@@ -399,8 +407,10 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
         "  public static method Main(): int return 0; end Main; "
         "end C;";
     auto r = runAot(program);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(0, r.exitCode);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "no member `Anything` on type `Object`"));
 }
 
 BEZEL_TEST(builtin_receiver_unlowered_member_2935,

@@ -14241,6 +14241,79 @@ bool ExprTC::anyExtensionAppliesToBuiltin(const TypeRef* recv,
     return false;
 }
 
+// fix #7973 (§8.1, §26.5, v0.350): the root `Object`'s PUBLIC SURFACE is
+// CLOSED, and the receiver's kind is what decides it — never the spelling.
+//
+// §8.1 (v0.350) declares the root `Object` and says, of that declaration:
+// "The declaration above defines the public surface." The declaration lists
+// exactly five names:
+//
+//     public class Object
+//       public method GetType(): Type;
+//       public virtual method Equals(other: Object?): bool;
+//       public virtual method GetHashCode(): int;
+//       public virtual method ToString(): string;
+//       public static method ReferenceEquals(a: Object?, b: Object?): bool;
+//     end Object;
+//
+// so `o.Bogus()` on an `Object`-typed receiver names NO member of it. The
+// compiler's old reading — that an `Object` receiver accepts any member name
+// and resolves it dynamically — has no basis in the spec: §26.5 resolves a
+// member against the receiver's DECLARED type, and the "permissive acceptance
+// (spec #3 / issue #605)" wording the codegen degradation carries is a STALE
+// citation (issue #7024: "`spec #3` does not name a section of the current
+// spec, and `#605` is closed and concerns an unrelated codegen issue";
+// `grep -n "resolve dynamically" docs/Bezel_Language_Spec.md` → 0 hits).
+// §8.1 is not ambiguous here: the surface is the five names above and nothing
+// else.
+//
+// THE TWO QUESTIONS, AND HOW EACH IS ANSWERED.
+//
+// (1) IS THIS RECEIVER THE ROOT `Object`? By CATEGORY, never by spelling:
+//     the root `Object` is the `Kind::Primitive` / `primitive == Object`
+//     TypeRef (TypeResolution_Names.cpp's primitive arm), and §2.2 + §8.1 make
+//     every other `Object` a DIFFERENT name — a user's generic `Object<T>` is
+//     a `Kind::Named` TypeRef carrying its own declaration, a type parameter
+//     or a nested type named `Object` shadows the root under §2.7 (#8008) and
+//     is `Kind::Named` too, and a module-level `class Object` is BANNED by
+//     §8.1 outright. So the category test reaches the root and nothing else.
+//
+// (2) IS THIS A VALUE RECEIVER OR THE §3.4 STATIC QUALIFIER? The static path
+//     (`Object.Bogus()` — a type-qualified reference, §3.4 / §27.6) hands this
+//     lookup the compiler's CANONICAL root-`Object` TypeRef, the one
+//     `ctx_.primitiveTypeRef(PrimitiveType::Object)` returns (the cached
+//     primitive reference); §3.4's own diagnostic — "type 'Object' has no
+//     static method or property 'Bogus' (§3.4)" — is the right one there and
+//     must stand alone. Every VALUE of the root `Object` type carries a
+//     different TypeRef (a resolved `ast::Type` node, or a synthesized
+//     nullable copy), so the canonical reference is a precise discriminator.
+//
+// The five names §8.1 lists are admitted, and `Dispose` is admitted too — it is
+// NOT one of `Object`'s members (§8.7: "`Dispose()` is class-only"; §28.2:
+// "`Dispose()` is not on `Object`; it is class-only"), and the caller draws
+// that rule's own precise message for it downstream
+// (`closedValueSurfaceMemberReason`'s `Object` + `Dispose` arm). `GetType` is
+// admitted as well: §8.2's reflection gate draws its own message for it.
+//
+// A member an `extension Object` block provides (§26.5 rule 2) is resolved by
+// this lookup BEFORE the closed surface is asked, so it never reaches here.
+static bool isRootObjectValueReceiver(const TypeRef* receiver,
+                                      SemaContext& ctx) {
+    if (!receiver) return false;
+    if (receiver->kind != TypeRef::Kind::Primitive) return false;
+    if (receiver->primitive != PrimitiveType::Object) return false;
+    // The §3.4 static-qualifier path passes the canonical cached reference.
+    return receiver != ctx.primitiveTypeRef(PrimitiveType::Object);
+}
+
+// fix #7973 (§8.1, v0.350): the names §8.1's `Object` declaration lists —
+// transcribed mechanically from the declaration block above, so the compiler
+// and the spec state the same list.
+static bool isObjectPublicSurfaceMember(std::string_view name) {
+    return name == "GetType" || name == "Equals" || name == "GetHashCode" ||
+           name == "ToString" || name == "ReferenceEquals";
+}
+
 Symbol* ExprTC::lookupExtensionMember(
     const TypeRef* receiver,
     std::string_view name,
@@ -14753,6 +14826,54 @@ Symbol* ExprTC::lookupExtensionMember(
         // diagnostic for the non-permissive (known-complete-type)
         // case is added by the caller, which has the receiver
         // `targetType` and the per-block arities in scope.
+        //
+        // fix #7973 (§8.1, §26.5, v0.350): the paragraph above describes the
+        // OLD reading, and §8.1 OVERTURNS it: the root `Object`'s public
+        // surface is CLOSED — "The declaration above defines the public
+        // surface" — so an `Object`-typed receiver accepts no member beyond
+        // §8.1's five names. The "permissive acceptance (spec #3 / issue
+        // #605)" the codegen degradation carries has no basis in the spec
+        // (issue #7024: that citation is stale), and §26.5 resolves a member
+        // against the receiver's DECLARED type, so `o.Bogus()` names nothing
+        // and codegen degraded the slot to a zero-initialised value
+        // (#2477 / #2547 / #2434).
+        //
+        // WHERE THE REFUSAL IS DRAWN, AND WHY HERE. The canonical site is
+        // `closedValueSurfaceMemberReason` (src/sema/ExprTypecheck_Calls.cpp),
+        // the one closed-surface predicate the `.` and `?.` resolvers both
+        // ask — but that file is outside this lane's budget, so the refusal
+        // is drawn at the ONE point in this file that sees the member name,
+        // the receiver's resolved kind, and the caller's own diagnostic
+        // intent: this lookup's no-match branch.
+        //
+        // IT IS DRAWN ONLY WHERE THE CALLER ASKED FOR A DIAGNOSTIC. The
+        // `reportAmbiguity` flag is this lookup's existing "the caller wants
+        // the lookup to report" signal (the probe call sites — which only ask
+        // "does an extension with this name exist" — pass false and stay
+        // silent, exactly as this branch's own comment describes). A refusal
+        // drawn in the probe sites would double-report against the callers'
+        // own wording.
+        //
+        // A member an `extension Object` block provides (§26.5 rule 2) is
+        // resolved by THIS lookup before the closed surface is asked, so it
+        // never reaches this branch (`found` is non-empty).
+        //
+        // `Dispose` is admitted, because it is not one of `Object`'s members
+        // (§8.7, §28.2) and the CALLER draws that rule's own message for it
+        // (`closedValueSurfaceMemberReason`'s `Object` + `Dispose` arm, which
+        // runs after this lookup). `GetType` is admitted because §8.2's
+        // reflection gate draws its own message for it.
+        if (reportAmbiguity && isRootObjectValueReceiver(receiver, ctx_) &&
+            !isObjectPublicSurfaceMember(name) && name != "Dispose") {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "no member `" + std::string(name) + "` on type `Object`: "
+                "`Object`'s public surface is exactly `GetType`, `Equals`, "
+                "`GetHashCode`, `ToString` and the static `ReferenceEquals` "
+                "(\xC2\xA7""8.1); members resolve against the declared type "
+                "(\xC2\xA7""26.5), and no extension on `Object` provides `" +
+                std::string(name) + "`");
+        }
         return nullptr;
     }
     if (found.size() == 1) {

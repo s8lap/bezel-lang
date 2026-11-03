@@ -44,10 +44,13 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"  // diagnosticMessageContains
 #include "support/aot_support.hpp"  // runAot — AOT test harness
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -284,10 +287,19 @@ BEZEL_TEST(builtin_unlowered_member_all_positions_2966,
 }
 
 BEZEL_TEST(builtin_unlowered_member_all_positions_2966,
-           object_typed_receiver_stays_permissive_spec_3_605) {
-    // §3/#605's permissive acceptance is untouched: the receiver is a Primitive
-    // TypeRef, not a registry built-in, so the gate cannot see it. This is the
-    // shape #2434's own corpus check found six live programs relying on.
+           object_typed_receiver_is_rejected_spec_8_1_7973) {
+    // ⚠ FLIPPED by fix #7973 (§8.1, v0.350). This row used to be
+    // `object_typed_receiver_stays_permissive_spec_3_605` and asserted that
+    // the permissive acceptance was untouched. §8.1 declares the root `Object`
+    // with exactly `GetType`, `Equals`, `GetHashCode`, `ToString` and the
+    // static `ReferenceEquals`, and says of that declaration: "The declaration
+    // above defines the public surface." §26.5 resolves a member against the
+    // receiver's DECLARED type, so `o.Anything()` names no member of `Object`
+    // and is a compile error. The "§3/#605 permissive acceptance" the old row
+    // pinned is not in the spec (issue #7024: that citation is stale).
+    //
+    // The subject is unchanged: the receiver is a Primitive TypeRef, and the
+    // registry-built-in gate is not what refuses it — §8.1's closed surface is.
     const std::string program =
         "module M; "
         "class C "
@@ -296,6 +308,8 @@ BEZEL_TEST(builtin_unlowered_member_all_positions_2966,
         "  public static method Main(): int return 0; end Main; "
         "end C;";
     auto r = runAot(program);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(0, r.exitCode);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "no member `Anything` on type `Object`"));
 }
