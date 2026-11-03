@@ -340,6 +340,28 @@ std::string encodingDestinationSpelling(const sema::TypeRef* t) {
     return "<unresolved>";
 }
 
+// fix #8027 (stdlib §3.2, §4.14, §4.15, §5.1, v0.350): the READ-ONLY span
+// VIEWS.
+//
+// stdlib §4.14 declares `ReadOnlySpan<T>` (over an `OwningBuffer<T>`) and
+// stdlib §4.15 declares `ReadOnlyArraySpan<T>` (over an `Array<T>`): each is
+// a READ-ONLY VIEW of the very memory the WRITABLE `Span<T>` / `ArraySpan<T>`
+// view writes. stdlib §3.2 declares the `GetBytes(s, destination)` DESTINATION
+// as `Span<byte>` — a WRITABLE span — and §5.1's conversion table has NO
+// span-to-span conversion at all, so a read-only view is not admissible there
+// on the spec's own terms.
+//
+// The test is the HEAD NAME, read through `headName()` (the alias-transparent
+// read, #1462), so an alias (`type RS := ReadOnlySpan<byte>`) is caught too.
+// It can only fire on a type the `isSpanLikeTypeName` gate has already
+// admitted — a USER type that merely happens to be named `ReadOnlySpan`
+// carries a `declaration` and is refused by that gate, not by this one.
+static bool isReadOnlySpanTypeName(const sema::TypeRef* t) {
+    if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+    const std::string_view h = t->headName();
+    return h == "ReadOnlySpan" || h == "ReadOnlyArraySpan";
+}
+
 }  // namespace
 
 
@@ -527,6 +549,48 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
                 "`Encoding.GetBytes` expects a `Span<byte>` destination "
                 "(stdlib \xC2\xA7""3.2); got `" +
                     encodingDestinationSpelling(destTy) + "` (#7603)");
+            return nullptr;
+        }
+        // fix #8027 (stdlib §3.2, §4.14, §4.15, §5.1, v0.350): a READ-ONLY
+        // span VIEW is not a WRITABLE destination, and this arm WRITES
+        // THROUGH the destination.
+        //
+        // stdlib §3.2 (v0.350), verbatim:
+        //   public abstract method GetBytes(s: string, destination: Span<byte>): int;
+        //                                                                              // returns bytes written;
+        //                                                                              //   IndexOutOfRangeException if too short
+        // The destination is a `Span<byte>` — the WRITABLE span over an
+        // `OwningBuffer<byte>` (stdlib §4.14) or an `Array<byte>` (§4.15).
+        // stdlib §4.14's `ReadOnlySpan<T>` and §4.15's `ReadOnlyArraySpan<T>`
+        // are READ-ONLY VIEWS of the same memory: they share the
+        // `bz.arrayspan` layout, so the shape check below cannot tell them
+        // from a writable span, and the arm's write lands in the backing
+        // buffer BEHIND a view that promised not to be written.
+        //
+        // §5.1's conversion table has NO span-to-span conversion at all, so a
+        // `ReadOnlySpan<byte>` is not admissible at a `Span<byte>` parameter
+        // on the spec's own terms either — the correct answer is a REFUSAL,
+        // not a write.
+        //
+        // MEASURED on the base (48353f2b): `Encoding.UTF8.GetBytes("ab",
+        // buf.AsReadOnlySpan())` compiled CLEAN and RAN — the encoded bytes
+        // were written into the `OwningBuffer<byte>` behind the read-only
+        // view, and the call returned the byte count (2).
+        //
+        // The refusal is a COMPILE-TIME diagnostic, the same shape (and the
+        // same §3.2 wording) as #7603's refusal of a destination that is not
+        // a span at all: the arm cannot write through a destination it cannot
+        // write through.
+        if (destTypeKnown && isSpanLikeTypeName(destTy) &&
+            isReadOnlySpanTypeName(destTy)) {
+            ctx_.diagnostics().report(
+                Severity::Error, call.args[spanArgIdx].value->span.begin,
+                "`Encoding.GetBytes` expects a `Span<byte>` destination "
+                "(stdlib \xC2\xA7""3.2); got `" +
+                    encodingDestinationSpelling(destTy) +
+                    "` — a read-only span view is not a writable destination "
+                    "(stdlib \xC2\xA7""4.14 / \xC2\xA7""4.15; \xC2\xA7""5.1) "
+                    "(#8027)");
             return nullptr;
         }
         llvm::Value* strPtr  = lowerExpr(*call.args[strArgIdx].value);
