@@ -946,8 +946,23 @@ bool isBuiltinCtorSurfaceClosedByRows(std::string_view head);
 //   * it admits an INSTANCE receiver whose head is not in
 //     `isReservedBuiltinTypeName` (`Encoding` is not a `lowerTypeRef` Named
 //     case and so is absent from that set).
-// per §22.5, fix #3398
+//
+// fix #8045 (§22.5, v0.353): the answer is COMPUTED from the ONE built-in
+// parameter table — a head qualifies exactly when the table carries a row for
+// it whose DECLARED PARAMETER NAMES are non-empty — so the claim set cannot
+// drift from the table. The head is NORMALISED first, so the keyword and the
+// reserved PascalCase alias of one type are one head (§3.4).
+//
+// The VALUE built-ins are excluded: `ExprTC::checkBuiltinCallAdmission` owns
+// their §22.5 surface, and two owners would draw two diagnostics on one call.
+// per §22.5, fix #3398 + fix #8045
 bool isBuiltinNamedArgTableHead(std::string_view head);
+
+// fix #8045 (§22.5, v0.353): the VALUE built-ins — the heads the shared
+// built-in resolver (`ExprTC::checkBuiltinCallAdmission`) owns, and which the
+// §22.5 named-argument binder therefore does not claim. The head is
+// NORMALISED, so the keyword spelling and the PascalCase alias are one head.
+bool isBuiltinValueParamHead(std::string_view head);
 
 // fix #3589 (stdlib §5 / §9.6, v0.286): is `n` one of the member names the
 // STRING-receiver gate exempts from its "not yet supported in codegen"

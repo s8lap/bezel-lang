@@ -1348,27 +1348,58 @@ constexpr std::array<std::string_view, 3> kBuiltinCtorSurfaceClosedByRowsHeads =
     "DateTime", "DateOnly", "TimeOnly",
 };
 
-// The heads `kStringParamNames` / `kEncodingParamNames` /
-// `kStringBuilderParamNames` answer for. See the header for the two roles this
-// predicate plays at the call site.
+// fix #8045 (§22.5, v0.353; stdlib §1 "Conventions" — "parameter names are API
+// surface"): the heads whose §22.5 PARAMETER NAMES the ONE built-in parameter
+// table carries.
 //
-// fix #7982 (stdlib §7.3, §7.4, §22.5, v0.350): `File` and `Directory` join
-// the table. The compiler now HONOURS a parameter NAME written at a call to
-// one of their members (the rows above carry the declared names), and this
-// predicate is where "the compiler honours the name" is recorded — it is what
-// `checkBuiltinNamedArgs` reads to CLAIM the call (so a name the member does
-// not declare is refused rather than silently bound positionally) and what
-// the §7 nullability gate reads to know that a named argument's INDEX is not
-// its POSITION (the bound-position check that replaces the index read is
-// `ExprTC::checkBuiltinNamedArgNullability`).
-constexpr std::array<std::string_view, 9> kBuiltinNamedArgTableHeads = {
-    "string", "String", "Encoding", "StringBuilder", "Math", "Convert",
-    // fix #7732 (§22.5, v0.350; stdlib §7.4 `Path`): `Combine(a, b)` and the
-    // `path` parameter of the other members are DECLARED names.
-    "Path",
-    // fix #7982 (§22.5, v0.350; stdlib §7.3 `File`, §7.4 `Directory`): the
-    // declared parameter names of the synchronous members.
-    "File", "Directory",
+// THE TABLE IS THE SOURCE OF TRUTH. The hand-written list this predicate
+// replaces named NINE heads ("string", "String", "Encoding", "StringBuilder",
+// "Math", "Convert", "Path", "File", "Directory") out of the SIXTY-EIGHT heads
+// the table declares a NAMED parameter for (measured on this tree: the table
+// carries 384 rows over 69 distinct heads, 68 of them with at least one
+// declared parameter name — `TextWriter` is the one head with none). So at
+// the other heads a REORDERED name was SILENTLY IGNORED and the arguments
+// bound POSITIONALLY — `Environment.Set(value := "two", name := "X")` set the
+// environment variable `two` to "X" — and an UNKNOWN name was ignored too.
+//
+// The predicate is therefore COMPUTED from the table rather than written out
+// again: a head is a named-argument table head exactly when the table carries
+// a row for it whose declared parameter names are non-empty. A second
+// hand-written list could drift from the table; this one cannot.
+//
+// The VALUE built-ins are the ONE exception, and it is an OWNERSHIP fact, not
+// a gap: `ExprTC::checkBuiltinCallAdmission` — the shared built-in resolver —
+// owns the §22.5 surface of the value built-ins (it refuses an unknown name
+// there, #7622, and refuses a reordered one, #7419), so the §22.5 binder must
+// not claim them as well or one call would draw two diagnostics. See
+// `kBuiltinValueParamHeads` below.
+constexpr bool builtinHeadCarriesParamNames(std::string_view head) {
+    for (const auto& r : kBuiltinParams) {
+        if (r.head != head) continue;
+        for (std::size_t i = 0; i < r.total; ++i)
+            if (!r.names[i].empty()) return true;
+    }
+    return false;
+}
+
+// fix #8045 (§22.5, v0.353): the heads `ExprTC::checkBuiltinCallAdmission` —
+// the shared built-in resolver — owns, and which the §22.5 named-argument
+// binder therefore does NOT claim.
+//
+// The resolver refuses an unknown name at these heads (#7622) and refuses a
+// reordered one (#7419), so the §22.5 surface is already closed there. The
+// binder must not claim them as well: the shared binder refuses a positional
+// argument after a named one (§22.5), and the standard library's own surface
+// USES that shape at these heads — `int.TryParse(s := "42", out result)` —
+// where the `out` slot is positional-only (§22.5). Two owners would draw two
+// diagnostics on one call.
+constexpr std::array<std::string_view, 19> kBuiltinValueParamHeads = {
+    "SByte", "Byte", "Int16", "UInt16", "Int32", "UInt32", "Int64",
+    "UInt64", "Double", "Float", "Decimal", "Boolean", "Char", "Guid",
+    "DateTime", "DateOnly", "TimeOnly", "TimeSpan",
+    // fix #6780 (stdlib §8.2, v0.345): `Debug` — a PURE-STATIC class whose
+    // whole surface the ONE table carries.
+    "Debug",
 };
 
 // fix #3589 (stdlib §5 / §9.6): see the header — the string-receiver LINQ
@@ -2543,9 +2574,28 @@ bool isBuiltinCtorSurfaceClosedByRows(std::string_view head) {
     return contains(kBuiltinCtorSurfaceClosedByRowsHeads, head);
 }  // per §22.5 / §17.7, stdlib §2.5, fix #7502
 
+// fix #8045 (§22.5, v0.353): the §22.5 NAMED-ARGUMENT BINDER's claim set —
+// the heads whose declared parameter names the ONE table carries, MINUS the
+// value built-ins the shared built-in resolver owns.
+//
+// The head is read in the SPELLING the call site used, and NORMALISED before
+// the table is consulted: the table is keyed by the standard-library head
+// (`string`, `Int32`, `Boolean`, …), while a call site may spell the same
+// type by its keyword or by its reserved PascalCase alias (§3.4) — so
+// `String.Repeat`, `string.Repeat`, `int.Parse` and `Int32.Parse` are one
+// head each.
 bool isBuiltinNamedArgTableHead(std::string_view head) {
-    return contains(kBuiltinNamedArgTableHeads, head);
-}  // per §22.5, fix #3398
+    const std::string_view h = normaliseBuiltinParamHead(head);
+    if (contains(kBuiltinValueParamHeads, h)) return false;
+    return builtinHeadCarriesParamNames(h);
+}  // per §22.5, fix #3398 + fix #8045
+
+// fix #8045 (§22.5, v0.353): the heads the shared built-in resolver
+// (`ExprTC::checkBuiltinCallAdmission`) owns — the value built-ins. See
+// `kBuiltinValueParamHeads`.
+bool isBuiltinValueParamHead(std::string_view head) {
+    return contains(kBuiltinValueParamHeads, normaliseBuiltinParamHead(head));
+}  // per §22.5 / §5.1 / §22.6, fix #6780 + fix #8045
 
 bool isStringLinqOperatorMemberName(std::string_view n) {
     return contains(kStringLinqOperatorMemberNames, n);

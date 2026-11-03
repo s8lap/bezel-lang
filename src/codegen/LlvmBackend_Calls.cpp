@@ -13750,8 +13750,40 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // compiled clean and wrote nothing.
         if (m == "Set" && call.args.size() == 2 && call.args[0].value &&
             call.args[1].value) {
-            llvm::Value* nameStr = lowerExpr(*call.args[0].value);
-            llvm::Value* valStr  = lowerExpr(*call.args[1].value);
+            // fix #8045 (§22.5, v0.353; stdlib §2.4): the §22.5 BINDING of a
+            // NAMED argument at `Environment.Set`.
+            //
+            // §22.5: "Each supplied argument binds exactly one parameter ...
+            // naming an argument changes which parameter it binds to, never
+            // when it runs." Sema binds the names correctly — the registry
+            // carries the DECLARED parameter names (stdlib §2.4 declares
+            // `Set(name: string, value: string?)`) — and PUBLISHES the binding
+            // (`ExprTC::checkBuiltinNamedArgs` ->
+            // `SemaContext::setBuiltinCallBinding`; the vector maps PARAMETER
+            // index -> SOURCE argument index). An arm that reads
+            // `call.args[i]` POSITIONALLY ignores that binding, so a
+            // REORDERED named call handed each parameter the value of a
+            // DIFFERENT parameter: `Environment.Set(value := "two", name :=
+            // "BEZEL_PROBE_VAR")` set the environment variable `two` to
+            // "BEZEL_PROBE_VAR" — the #3398/#3423 wrong-answer class.
+            //
+            // `envParamSrc(p)` is the SOURCE argument index bound to PARAMETER
+            // `p`, or `p` itself when there is no published binding (a
+            // positional call, or a named call already in DECLARATION order —
+            // the identity permutation, which sema does not publish).
+            const auto* envBnd = ctx_.builtinCallBinding(call);
+            auto envParamSrc = [&](std::size_t p) -> std::size_t {
+                if (envBnd && p < envBnd->size()) {
+                    const int ai = (*envBnd)[p];
+                    if (ai >= 0 && static_cast<std::size_t>(ai) < call.args.size())
+                        return static_cast<std::size_t>(ai);
+                }
+                return p;
+            };
+            const std::size_t nameArg = envParamSrc(0);   // parameter 0: `name`
+            const std::size_t valArg  = envParamSrc(1);   // parameter 1: `value`
+            llvm::Value* nameStr = lowerExpr(*call.args[nameArg].value);
+            llvm::Value* valStr  = lowerExpr(*call.args[valArg].value);
             if (!nameStr || !valStr) return nullptr;
             llvm::Value* nameData = loadStringData(nameStr);
             auto* i8Ty3 = llvm::Type::getInt8Ty(llvm_);

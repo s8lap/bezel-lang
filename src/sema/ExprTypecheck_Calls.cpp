@@ -24413,14 +24413,13 @@ std::string_view builtinParamHeadSection(std::string_view head) {
 // `Assert(condition: bool, message: string := "")` — the ONE table now
 // carries, and until these rows existed NO check read it: a `Debug` call was
 // admitted whatever it was given.
+//
+// fix #8045 (§22.5, v0.353): the SET itself now lives in the registry
+// (`common::isBuiltinValueParamHead`), so the §22.5 named-argument binder's
+// claim set and this gate's reach are ONE list and cannot disagree about
+// which heads the shared resolver owns.
 bool isBuiltinValueParamHead(std::string_view head) {
-    return head == "SByte" || head == "Byte" || head == "Int16" ||
-           head == "UInt16" || head == "Int32" || head == "UInt32" ||
-           head == "Int64" || head == "UInt64" || head == "Double" ||
-           head == "Float" || head == "Decimal" || head == "Boolean" ||
-           head == "Char" || head == "Guid" || head == "DateTime" ||
-           head == "DateOnly" || head == "TimeOnly" || head == "TimeSpan" ||
-           head == "Debug";
+    return common::isBuiltinValueParamHead(head);
 }
 
 
