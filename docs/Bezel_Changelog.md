@@ -15745,7 +15745,8 @@ The independent critique accepted the train with fixes. Its substantive findings
   - the owning-choice field joins the trivial-dispose definition;
   - explicit disposal and the overwrite release point form one subsection;
   - the store lint's promotion to an error follows the lint.
-- **§8.1** *Member hiding is forbidden* gets a two-sentence transition and four subsections:
+- **§4.2.4** *Set-erasing positions* is rewritten for clarity, the one subsection whose wording changes. It now opens with the problem and the rule in plain sentences. Its 760-word paragraph is split into the gap it closes, a short example, how the rule is checked, related cases, its costs, and its declines and deferrals as a list. Every rule, reason, decline, link and cited lead-in is kept.
+- **§8.1** is retitled *Member hiding and name shadowing are forbidden*, since it also rules on local names, and gets a two-sentence transition and four subsections:
   - visible members
   - local names
   - `Object`'s virtual members and the own-typed `Equals`
