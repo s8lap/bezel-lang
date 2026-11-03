@@ -677,6 +677,80 @@ Limits worth knowing:
   messages, so a name mentioned in prose can WARN falsely. Read it, don't
   count it.
 
+## OpenCode mechanics (this harness)
+
+*Added 2026-11-03. This area exists because the harness's own agent-dispatch
+surface behaves in a way that is not visible from the tool description, and a
+coordinator that does not know it will spend whole turns waiting for agents that
+are already running. Everything here was MEASURED on this box, not inferred.*
+
+### ⚠ Dispatch a lane agent with `scripts/lane_dispatch.sh` — the harness `subagent` tool BLOCKS the turn
+
+**⇒ THE RULE: EVERY lane dispatch goes through `scripts/lane_dispatch.sh`. NEVER
+the harness `subagent` tool.**
+
+**⇒ WHY — MEASURED 2026-11-03 (R38).**
+- `subagent` with `background: true` returns a session id, but the HARNESS held
+  the coordinator's **turn** open until the agent finished: the coordinator's
+  next tool call did not run until the agent was done. The pool row read 7
+  (it counts CLAIMS) while ONE agent was actually running, and the box was idle.
+- Issuing several `subagent` calls in ONE message did **not** help: the harness
+  ran the FIRST one in the foreground and blocked on it.
+- `opencode api session.create` + a DETACHED `opencode run` returns in
+  **0.57 s**, and the child session is LIVE immediately.
+
+**⇒ THE RECIPE** — `scripts/lane_dispatch.sh --title <t> --log <path> --brief-file <path>`
+(also accepts `-- <brief text>`), which is two steps:
+
+1. `opencode api session.create --data '{"title":"…","parentID":"$OPENCODE_SESSION_ID"}'`
+   — creates a CHILD session of **this** coordinator session.
+   `OPENCODE_SESSION_ID` is exported in the environment.
+   ⇒ **THE CHILD APPEARS IN THE UI UNDER THIS SESSION**, and
+   `scripts/pool_lanes.sh` counts it exactly like a harness-spawned lane
+   (it counts child sessions with no outcome yet).
+2. `setsid nohup opencode run --session <id> --model minimax/MiniMax-M3.1-Flash
+   --agent general "<brief>" >log 2>&1 &` — **DETACHED**, so the coordinator's
+   turn continues immediately.
+
+**⇒ THE MODEL AND THE AGENT MUST BE SET EXPLICITLY.** A session created through
+the API and prompted with a bare body uses the server's DEFAULT agent and model
+— measured `build` / `opencode` / `pulse-alpha-free`, which is **not** the
+campaign's model. ⇒ `--model minimax/MiniMax-M3.1-Flash --agent general` is
+part of the recipe, not an option. ⇒ The API's `session.prompt` **IGNORES** a
+`model` field in the body (measured), so the model must come from the
+`opencode run` command line.
+
+**⇒ IF YOU MUST USE THE API DIRECTLY**, the body shape is `{"text": "…"}` — a
+`parts` array is rejected with `Missing key at ["text"]` — and `session.prompt`
+returns in **0.06 s** without waiting for the agent. ⇒ `session.prompt` alone is
+non-blocking, but it cannot set the model; use it only as a follow-up to a
+session that was already launched with the right model.
+
+**⇒ THE SCRIPT PRINTS THE SESSION ID. RECORD IT IN `claims.tsv` IN THE SAME
+TURN**, as `live:<role>:ses_…`. ⇒ A claim with no session id is a PHANTOM, and
+`scripts/pool_lanes.sh` exits 3 on a ledger/opencode mismatch. ⇒ A lane is not
+"dispatched" until its AGENT exists.
+
+**⇒ NEVER `git stash`, NEVER `git add -A`, NEVER TWO `cmake --build` ON ONE
+BUILD DIR** — and **⇒ NEVER LAUNCH A GATE WHILE A LANE IS BUILDING.**
+
+### ⚠ The withdrawn rule: "put the CALL in the background, and put them ALL in one message"
+
+*Withdrawn 2026-11-03, after it was MEASURED FALSE. It is kept here so a
+coordinator who remembers it can see why it is wrong.*
+
+**⇒ THE OLD TEXT WAS: EVERY lane dispatch is a `subagent` call with
+`background: true`, and all the dispatches for a turn go out together as
+parallel tool calls in a single assistant message.**
+
+**⇒ WHY IT IS WITHDRAWN.** `background: true` marks the *agent* as asynchronous
+but the harness held the *turn* open until the agent finished — so the rule's
+own remedy (one message, several calls) ran the FIRST call in the foreground
+and blocked on it. ⇒ The rule solved the symptom it was written for and left
+the turn serialized, which is worse than useless when the pool must reach 7
+lanes in a single turn. ⇒ **Use `scripts/lane_dispatch.sh`; the harness's
+`subagent` tool is not a lane dispatcher in this harness.**
+
 ## Autonomous run discipline (lanes, gates, tests)
 
 These rules are not style preferences — every one was paid for in a lost gate
@@ -1113,37 +1187,19 @@ refutation spends the strongest model on a hypothesis that was never tested.
 Escalate the model only after two refutations, or when there is no root-cause
 hypothesis to act on at all.
 
-### ⚠ Dispatching a lane agent: put the CALL in the background, and put them ALL in one message
+### ⚠ Dispatching a lane agent — see *OpenCode mechanics* (this section is superseded)
 
-*Added 2026-11-03, after an R38 coordinator spent three turns dispatching ONE lane
-per turn because each `subagent` call blocked until the agent finished. The pool
-reads 7 on the ledger while 1 agent is actually running — the pool row counts
-CLAIMS, not agents, so a serialized dispatch looks full while the box is idle.*
+*This section used to carry the rule "every lane dispatch is `background: true`,
+and all the dispatches for a turn go out together as parallel tool calls in a
+single assistant message". **That rule was MEASURED FALSE and is withdrawn**
+(2026-11-03): the harness's `subagent` tool holds the coordinator's turn open
+even with `background: true`, and several `subagent` calls in one message run
+the FIRST one in the foreground.*
 
-**⇒ THE RULE: EVERY lane dispatch is `background: true`, AND ALL THE DISPATCHES
-FOR A TURN GO IN **ONE** ASSISTANT MESSAGE AS PARALLEL TOOL CALLS.**
-
-**⇒ WHY `background: true` ALONE IS NOT ENOUGH — MEASURED 2026-11-03.** A
-`subagent` call with `background: true` still returned control to the
-coordinator, but the HARNESS held the turn open until the agent finished: the
-coordinator's next tool call did not run until the agent was done. So
-`background: true` marks the *agent* as asynchronous while the *turn* stays
-serialized. **⇒ THE COORDINATOR MUST LAUNCH ITS NEXT LANE WITHOUT WAITING FOR
-THE PREVIOUS ONE.** The only way to do that is to issue the calls **in one
-message**, where the harness starts them concurrently.
-
-**⇒ TWO OR MORE IN ONE MESSAGE IS THE NORMAL CASE, NOT AN EDGE CASE.** The pool
-is 7. A turn that frees 3 slots dispatches 3 lanes **at once**. A turn that
-frees 1 slot dispatches 1 — but it is STILL a `background: true` call in its own
-message, and the coordinator continues immediately afterwards.
-
-**⇒ HOW TO TELL IT WORKED.** The dispatch returns a **session id**, and the
-agent's TITLE is visible to the reconciler. `scripts/pool_lanes.sh` counts live
-sessions from opencode — **⇒ A LANE IS NOT "DISPATCHED" UNTIL ITS AGENT
-EXISTS.** A claim with no session id is a PHANTOM: a promise, not an agent.
-**⇒ RECORD THE SESSION ID IN THE LEDGER** (`live:<role>:ses_…`) so the
-reconciler can compare the ledger against opencode instead of trusting the
-claim count.
+**⇒ THE RULE NOW: dispatch every lane with `scripts/lane_dispatch.sh`, and
+never with the harness `subagent` tool. The full recipe, the measured
+numbers, and the API details are in this runbook's *OpenCode mechanics (this
+harness)* area.**
 
 **⇒ NEVER `git stash`, NEVER `git add -A`, NEVER TWO `cmake --build` ON ONE
 BUILD DIR** — and **⇒ NEVER LAUNCH A GATE WHILE A LANE IS BUILDING.**
