@@ -70,12 +70,25 @@ except Exception as exc:
     sys.exit(70)
 rows = blob.get("data", blob) if isinstance(blob, dict) else blob
 
-# A lane is live iff it is a CHILD session with no outcome yet.
+# A lane is live iff it is a CHILD session with no outcome yet -- OR it has
+# been updated since it last went idle.
+#
+# WHY THE SECOND CLAUSE (measured 2026-11-03, the R38 run).  A RESUMED
+# session -- a lane the coordinator continued with `opencode run --session
+# <id>`, e.g. a scoped re-review -- KEEPS THE OUTCOME OF ITS PREVIOUS RUN
+# until the new run ends.  `outcome is None` alone therefore calls a RUNNING
+# resumed lane DEAD, and a coordinator that believes that reaps a live lane.
+# The server's own timestamps settle it: a live session's `time.updated`
+# advances with every message while `time.idle` stays stale (it is only set
+# when the session really stops), so `updated > idle` is the live signal.
 live = {}
 for r in rows:
     if not r.get("parentID"):
         continue                       # a top-level session is the coordinator
-    if r.get("outcome") is None:
+    t = r.get("time") or {}
+    updated = t.get("updated") or 0
+    idle = t.get("idle") or 0
+    if r.get("outcome") is None or (updated and idle and updated > idle):
         live[r["id"]] = (r.get("title") or "")[:60]
 
 print(f"pool_lanes: {len(live)} live agent session(s) per opencode")
