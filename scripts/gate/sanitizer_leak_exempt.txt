@@ -226,7 +226,7 @@ iter_lambda_captured_iter_format_local_unbox_3603.issue_3539_repro_disposes_capt
 dict_object_bare_value_key_indexer_set_4640.dict_object_bare_int_key_indexer_set_leak_floor_spec_8_6  # status:residue issue:4717 #4640/#4717, spec §8.6, §28.11 v0.135: boxing a bare value key into a `Dictionary<Object,_>` slot mints a §8.6 box the borrowing slot's null disposer never discharges — 24 B per call, measured both sides loop-amplified 300x (pre-fix the program SIGSEGV'd in bz_dict_set_gen instead). The row asserts the residual FROM BELOW; #4717's box-vtable guard must UPDATE it, not delete it. tests/codegen/dict_object_bare_value_key_indexer_set_4640_test.cpp
 set_object_element_4642.tryadd_contains_box_residual_floor_spec_8_6  # status:residue issue:4717 #4642/#4717, spec §8.6, §28.11 v0.135: the Set<Object> member of the same family — one box for the inserted element, one for the query, 24 B each, measured both sides loop-amplified 300x (pre-fix the program computed 0 of 600 correct and minted no box at all). Same floor-not-ceiling caveat as the row above. tests/codegen/set_object_element_4642_test.cpp
 
-# ── pattern (h): the LEAK ORACLE'S OWN KNOWN-POSITIVE — 2 rows ─────────────
+# ── pattern (h): the LEAK ORACLE'S OWN KNOWN-POSITIVE — 3 rows ─────────────
 # The first row here that is not a statement about the COMPILER at all. #4638
 # added `BEZEL_AOT_DETECT_LEAKS` (off | report | strict) and the #4638 row below is
 # the only place in the tree that watches the STRICT oracle FAIL a program — "a
@@ -262,3 +262,38 @@ set_object_element_4642.tryadd_contains_box_residual_floor_spec_8_6  # status:re
 # `*_clean_*` / classifier rows do not leak at all.
 leak_detection_4638.strict_mode_fails_the_known_leak  # status:residue issue:4717 #4638/#4717, spec §8.6, §28.11, v0.307: the leak oracle's own known-positive. 500 `Array<Object>.Contains(int)` queries mint 500 §8.6 boxes that are never discharged (24 B apiece), and the row asserts LeakSanitizer fired with EXACTLY 12000 byte(s) in 500 allocation(s) while `ran == false`. A fix IS owed — this is #4717's Array member, the residual #4619 left behind when it landed — so it is residue, not a permanent trade; but #4717 must RE-POINT the row at another leaking program rather than delete it. tests/support/aot_leak_detection_4638_test.cpp:159
 consume_site_freeze_object_typed.asan_sentinel_reports_a_deliberate_leak_spec_28_2  # status:residue issue:4717 #7103/#4717, spec §8.6, §28.11, v0.344: the #7103 lane's ARMED-SENTINEL row — the ASan/LSan leg's own known-positive. It DELIBERATELY ASSERTS the leak and CANNOT pass without it: the row asserts `ran == false` and that the diagnostic contains "LeakSanitizer", so a green row IS the proof that LSan fired; the leak-free control beside it (`asan_sentinel_control_leak_free_program_stays_quiet_spec_28_2`, `kCleanControl`) asserts the same program with `Array<int>` stays quiet — a positive AND a negative control, so the oracle is falsifiable, not a tautology. Its program `kLeakPositive` is BYTE-FOR-BYTE the same as `leak_detection_4638.strict_mode_fails_the_known_leak`'s `kLeak500` (and its control byte-for-byte `kClean500`), so this entry DECLARES A PRE-EXISTING, ALREADY-PROVEN, ALREADY-DECLARED leak and introduces NO new deliberate leak. It is still a SEPARATE row because the sentinel is PER-AREA: this row lives in tests/ownership/ (bezel_tests_ownership) while its sibling lives in tests/support/ (bezel_tests_support), and the gate's ASan leg must be proved armed in EACH area binary — do NOT deduplicate this row away. The leak is the §8.6 500-box residual (500 `Array<Object>.Contains(int)` queries mint 500 boxes that are never discharged) that #4717 still owes a fix for, so it is residue, not a permanent trade; when #4717 lands it must RE-POINT this row AND leak_detection_4638.strict_mode_fails_the_known_leak (the same program, in the support binary) AND the two sibling #4717 rows dict_object_bare_value_key_indexer_set_4640.dict_object_bare_int_key_indexer_set_leak_floor_spec_8_6 and set_object_element_4642.tryadd_contains_box_residual_floor_spec_8_6 (different programs) at another leaking program — a re-pointed sentinel is still a sentinel — and must NOT delete any of them. tests/ownership/consume_site_freeze_object_typed_7103_test.cpp:473
+#
+# The #7972 lane's ARMED-SENTINEL row — the THIRD member of pattern (h). The
+# section's header count was updated to read "3 rows" when this row was added,
+# so the header and the DATA rows under it agree. It is the leak oracle's own
+# known-positive: the row DELIBERATELY ASSERTS that LeakSanitizer fired on a
+# known-leaking program and CANNOT pass without it — it pins `exp.count == 1`,
+# `exp.lastFailing`, `exp.lastBytes == 12000` and `exp.lastAllocs == 500`
+# while `r.ran == false`. Without this row, the #7972 lane's other rows would
+# be satisfied by an oracle that never looks, so it is the lane's
+# falsifiability control.
+#
+# Its program `kKnownLeak500` is BYTE-FOR-BYTE the same as
+# `leak_detection_4638.strict_mode_fails_the_known_leak`'s `kLeak500` (500
+# `Array<Object>.Contains(int)` membership queries, one §8.6 box minted and
+# never discharged per call, 24 B x 500 = 12000 B), so this entry DECLARES A
+# PRE-EXISTING, ALREADY-PROVEN, ALREADY-DECLARED leak and introduces NO new
+# deliberate leak. It is still a SEPARATE row because the sentinel is
+# PER-AREA: this row lives in tests/codegen/ (bezel_tests_codegen) while its
+# sibling lives in tests/support/ (bezel_tests_support), and the gate's ASan
+# leg must be proved armed in EACH area binary — do NOT deduplicate this row
+# away.
+#
+# #7972's fix closed the CENTRAL case: an explicit Dispose on a Task receiver
+# now releases the task, so `t?.Dispose()` no longer leaks it. The leak THIS
+# row asserts is the §8.6 box-mint residue family, which #4717 still owes a
+# fix for, so it is residue, not a permanent trade.
+#
+# ⚠ WHEN #4717 IS FIXED, RE-POINT THIS ROW'S KNOWN-POSITIVE — DO NOT DELETE
+# IT. `kKnownLeak500` stops leaking the moment the §8.6 box mints are
+# discharged, and the row's `exp.lastBytes == 12000` / `exp.lastAllocs == 500`
+# assertions go red with it. The repair is a different program that still leaks
+# BY DESIGN, because deleting the row would retire the only proof that the
+# leak oracle can fire in the codegen area at all. Same "must UPDATE it, not
+# delete it" caveat as the #4638 row above, and for the same open issue.
+task_dispose_releases_task_7972.the_leak_oracle_fires_on_a_known_leak  # status:residue issue:4717 #7972/#4717, spec §8.6, §28.11, v0.353: the leak oracle's own known-positive. 500 `Array<Object>.Contains(int)` queries mint 500 §8.6 boxes that are never discharged (24 B apiece), and the row asserts LeakSanitizer fired with EXACTLY 12000 byte(s) in 500 allocation(s) while `ran == false`. #7972's fix closed the CENTRAL case — an explicit Dispose on a Task receiver now releases the task, so `t?.Dispose()` no longer leaks it — but the leak THIS row asserts is the §8.6 box-mint residue family, which #4717 still owes a fix for, so it is residue, not a permanent trade. It CANNOT be deduplicated against leak_detection_4638.strict_mode_fails_the_known_leak: its program (`kKnownLeak500`) is BYTE-FOR-BYTE the same as that row's `kLeak500` — 500 `Array<Object>.Contains(int)` queries, 12000 byte(s) in 500 allocation(s) — so the leak is ONE AND THE SAME, yet each row is a DISTINCT assertion in a DISTINCT area binary (this one in tests/codegen/, bezel_tests_codegen; that one in tests/support/, bezel_tests_support) and the gate's ASan leg must be proved armed in EACH; do NOT deduplicate this row away. When #4717 lands it must RE-POINT this row at another leaking program rather than delete it. tests/codegen/task_dispose_releases_task_7972_test.cpp:299
