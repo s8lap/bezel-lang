@@ -977,6 +977,52 @@ Rules:
 - A lane that stops its own build to return slots to siblings further along is doing the
   right thing, not giving up — one lane did exactly this and said so.
 
+### ⚠ THE BUILD GATE — AND THE COLD-BUILD STORM THAT KILLED FOUR LANES AT ONCE
+
+**MEASURED 2026-11-04 00:26 (the R38 run).** Four lanes were dispatched at once; **all four
+cold-built at once**; the shared jobserver went to `available=0 held=20 builds=1 jobs=21`
+with 22–44 builder processes observed box-wide; **and all four lanes DIED.** The signature
+was the familiar one — `gmake … Terminated`, no `error:` lines — so each lane's death read
+as "my build failed" and each had already lost its in-flight work.
+
+⇒ **⇒ ⇒ ⇒ THE CAP ON *LANES* IS NOT THE WHOLE RULE — THE CAP ON *CONCURRENT COLD BUILDS*
+IS. A LANE COUNT OF 5 STILL KILLS THE POOL IF ALL FIVE COLD-BUILD IN THE SAME WINDOW.**
+
+⇒ **⇒ ⇒ ⇒ ⇒ THE BUILD GATE — EVERY LANE BRIEF MUST CARRY IT, VERBATIM:**
+
+```
+python3 scripts/build_jobserver.py status     # prints available=N held=N builds=N
+```
+
+**⇒ WAIT (poll every 60 s) UNTIL `available` IS AT LEAST 6, THEN BUILD. ⇒ BUILD WITH
+`-j 4`, NOT `-j 20`.**
+
+- **Poll the jobserver BEFORE the first build, not after.** A lane that starts a build
+  without a gate does not know the pool is saturated.
+- **`-j 4`, not `-j 20`.** One cold build at `-j 4` holds ~4 of the 20 tokens; at `-j 20`
+  it takes the whole pool and the next lane's build gets nothing.
+- **A lane that WAITS IS ALIVE; a lane that dies delivers NOTHING.** Waiting for the gate
+  is the correct behaviour, not a stall to be worked around.
+- **⇒ DISPATCH IN PAIRS, WITH A STAGGER.** Two lanes now, then the next two a few minutes
+  later — so their cold builds cannot collide. Never dispatch the whole pool in one burst.
+- **⇒ THE GATE BELONGS IN EVERY LANE BRIEF**, including a reviewer's: a reviewer that
+  measures the RED arm needs a build too, and it is the reviewer's build that starves a
+  sibling.
+
+### ⚠ Pick a branch's commits IN THE ORDER THEY WERE AUTHORED — THE ANCESTOR FIRST
+
+**MEASURED 2026-11-04 (the R38 run).** A branch carried three commits that all touch
+`LlvmBackend_Calls.cpp`. The **later** commit's diff was contextualised on the **earlier**
+one: cherry-picking the later commit first produced a diff that no longer applied, and the
+branch had to be re-ordered.
+
+⇒ **⇒ ⇒ ⇒ PICK A BRANCH'S COMMITS IN AUTHORED ORDER — THE ANCESTOR FIRST.** A later
+commit's diff is written against the earlier commit's tree; picking it first asks the
+cherry-pick to apply a patch whose context has not landed yet.
+
+⇒ ⇒ ⇒ ⇒ This is not the same as "pick the whole branch at once" — the picks are individual
+commits, and the *order* of those picks is the ancestor-first order.
+
 ### The orchestrator MUST run a CronCreate heartbeat
 
 **An autonomous run's coordinator schedules a recurring heartbeat (CronCreate) for the

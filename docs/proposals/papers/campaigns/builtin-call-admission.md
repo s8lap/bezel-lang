@@ -3234,6 +3234,173 @@ DISCARD IT BLINDLY.**
    NEVER BISECT.**
 5. **⇒ THEN REFRESH master-plan §6 AND DELETE THE HEARTBEAT SCHEDULE.**
 
+## Coordinator block — 2026-11-04 00:26 → 01:05 (THE HAUL REACHES **117**, THE RATCHET SWEEP PASSES 25/25, AND THE **COLD-BUILD STORM** IS THE ROOT CAUSE OF THE MASS DEATH)
+
+### 1. THE HAUL: 112 → **117**, AND THE FLOOR IS MET WITH ROOM TO SPARE
+
+Five picks landed in this window, each verified with `scripts/pick_issues.sh --github <sha>`
+(EXACTLY the intended issues, no second binding naming a still-OPEN issue), each with a
+non-author review recorded first, and each picked **in authored order — the ancestor first**.
+
+| source → picked | reviewer | verdict | issues |
+|---|---|---|---|
+| `76582733` → `1bb96cae` | `r38-w108-review18` | ACCEPT | **#7874** (the re-land) |
+| `91a85a70` → `bddbe304` | `r38-w109-review19` | ACCEPT-W-NOTES | **#7947** |
+| `ee9d92c3` → `e793fc1f` | `r38-w109-review19` | ACCEPT-W-NOTES | **#7765** |
+| `2b9d116a` → `2053e62a` | `r38-w108-review18` | ACCEPT | **#8014** |
+| `70a512be` → `c05c35bf` | `r38-w108-review18` | ACCEPT | **#7659** |
+
+⇒ **THE STAGING TIP IS `c05c35bf`, +138 over `origin/main`. `scripts/pick_ledger.sh`:
+`distinct issues GitHub would close: 117` / `fix-named: 105` / `UNATTRIBUTED: 0`.**
+⇒ **`origin/main` IS AN ANCESTOR OF THE TIP ⇒ THE PUSH IS STILL FAST-FORWARDABLE. NOTHING IS PUSHED.**
+
+⇒ ⇒ ⇒ **THE GATE'S FLOOR (100+) IS MET AT 117 ⇒ EVERYTHING FROM HERE IS MARGIN AND CLOSED FAMILY DEFECTS.**
+
+### 2. THE RATCHET SWEEP IS **MEASURED AND PASSES** — 25/25, ON THE TIP
+
+`r38-w108-review18` ran `scripts/ratchet_sweep.sh` in **its own worktree**, checked out at
+`4accde7b`, with **its own freshly built `build/bezelc`** (built 00:06:24, 11 s, ccache-warm)
+— so the coordinator's known trap (a **STALE `build/bezelc` in the staging worktree** making
+`check_internal_residual` read RED) does not apply.
+
+```
+check_ambiguous_ran_false                  PASS
+check_builtin_declared_params              PASS
+check_commit_trailers                      PASS
+check_dangling_capture                     PASS
+check_deprecated_jit_oracle                PASS
+check_disposal_family_chain                PASS
+check_enumerable_grid_spellings            PASS
+check_imported_symbol_reads                PASS
+check_internal_residual                    PASS
+…  25/25 PASS, 0 RED
+```
+
+⇒ **⇒ ⇒ ⇒ THIS MUST BE RE-RUN AT THE FINAL TIP.** A sweep measured at `4accde7b` says nothing
+about the tip that carries the last picks.
+
+### 3. THE #7874 ARC — A DEFECT DEFERRED, A RE-LAND, AN ACCEPT, A PICK
+
+⇒ **⇒ ⇒ ⇒ ⇒ A CITATION WRONG *AT THE VERSION IT CITES* IS A BODY DEFECT AND THE PICK IS
+DEFERRED — EVEN WHEN THE REVIEWER SAYS "PICK".** ⇒ ⇒ ⇒ ⇒ ⇒ **⇒ ⇒ ⇒ ⇒ A CITATION WHOSE SECTION
+NUMBER IS RIGHT BUT WHOSE PARENTHETICAL VERSION LABEL IS MERELY STALE IS A NOTE AND THE PICK
+STANDS.** ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ **⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE TEST IS ALWAYS: OPEN THE CITED REVISION AND LOOK.**
+
+* `r38-w108-review18` reported a `stdlib §5.1` premise ("§5.1 shifted since v0.350") at severity NOTE.
+* The coordinator **MEASURED the premise at v0.350** (commit `243b133a`): line 3619
+  `## 5. System.Collections.Linq`, line 3674 `Min<U>(selector:…)`, line 3760
+  `### 5.1 No-selector aggregation overloads` ⇒ **the premise was FALSE at the cited version**
+  ⇒ the pick was **DEFERRED**.
+* The commit was **RE-LANDED** on a new branch `r38-c98-reland7874` as `76582733`, with the
+  citation corrected to `stdlib §5` and the subject **re-titled to the four heads it really
+  fixes** (`DateTime`/`TimeSpan`/`DateOnly`/`TimeOnly`) — because `Array<Guid>.Min/Max(sel)` is
+  **still broken** and naming it would have been a false closure.
+* **⇒ A RE-LAND IS NEVER AN AMEND: a new commit on a new branch off the staging tip, with the
+  reviewer's prescribed rewording, and a fresh verdict on the new SHA. ⇒ ⇒ ⇒ ⇒ THE CODE'S
+  IDENTITY WAS PROVEN MECHANICALLY — the same `git patch-id --stable`
+  (`c74fe88b383e8befeb5f5bd888b6fc77274f5e76`) on both and byte-identical blobs for every
+  touched file.**
+* `r38-w108-review18` then gave the re-land **ACCEPT** (F1–F6, all severity NONE) ⇒ picked.
+
+### 4. ⇒ ⇒ ⇒ ⇒ THE **COLD-BUILD STORM** — THE ROOT CAUSE OF THE 00:26 MASS DEATH
+
+**MEASURED AT 00:26:** `available=0 held=20 tok_held=0 tok_wait=0 builds=1 jobs=21 clang=21`,
+**22 builder processes observed**, 44 lane build processes, 43 heavy processes box-wide, 0 stale.
+**FOUR LANES DISPATCHED AT ONCE ALL COLD-BUILT AT ONCE ⇒ ALL FOUR DIED.**
+
+⇒ **⇒ ⇒ ⇒ ⇒ THE CAP ON *LANES* IS NOT THE WHOLE RULE — THE CAP ON *CONCURRENT COLD BUILDS* IS.**
+⇒ **⇒ ⇒ ⇒ ⇒ ⇒ THE BUILD GATE, NOW IN EVERY LANE BRIEF:**
+`python3 scripts/build_jobserver.py status` → **WAIT until `available` ≥ 6** → **build `-j 4`, NOT `-j 20`.**
+⇒ **⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE COORDINATOR DISPATCHES IN PAIRS, WITH A STAGGER.**
+
+⇒ **⇒ ⇒ ⇒ AND A SECOND RULE, LEARNED THE SAME WAY: PICK A BRANCH'S COMMITS IN THE ORDER THEY
+WERE AUTHORED — THE ANCESTOR FIRST.** A later commit's diff is contextualised on the earlier
+one; picking it first breaks the cherry-pick.
+
+⇒ **⇒ ⇒ BOTH RULES ARE NOW DURABLE** — `docs/ops/coordinator-runbook.md` (*THE BUILD GATE — AND
+THE COLD-BUILD STORM THAT KILLED FOUR LANES AT ONCE*, *Pick a branch's commits IN THE ORDER
+THEY WERE AUTHORED — THE ANCESTOR FIRST*) and `CLAUDE.md`'s Pools bullet.
+
+### 5. THE POOL WAS **0**, NOT 5 — AND THE `pool` ROW ONLY COUNTS THE LEDGER
+
+**At 00:49 the status table read `pool OK 5 live lane(s) of 5` — and every one of those five
+lanes was DEAD.** `scripts/pool_lanes.sh` reconciled the ledger against the process table and
+found **0 live agent sessions**: `r38-p100-strings`, `r38-p95-boxing`, `r38-p96-ownership`,
+`r38-w108-review18`, `r38-w109-review19` — all ended.
+
+⇒ **⇒ ⇒ ⇒ ⇒ THE `pool` ROW COUNTS THE *LEDGER*, NOT THE *PROCESS TABLE*. THE LEDGER AND OPENCODE
+MUST AGREE, AND `scripts/pool_lanes.sh` IS WHAT MAKES THEM AGREE.** ⇒ **⇒ ⇒ ⇒ ⇒ A LANE THAT
+DIED IS A SLOT THAT FREED — AND THE FIRST ACTION AFTER A DEATH IS HARVEST, NOT REPLACE.**
+
+⇒ **⇒ ⇒ ⇒ HARVEST FIRST — AND THE DEAD LANES' DELIVERABLES SURVIVED BOTH DEATHS:**
+* `r38-p95-boxing` → **`89e3a353`** (fix **#7817 #7844**, `LlvmBackend_Layout.cpp`) and
+  **`a65f13e8`** (fix **#4841**, `LlvmBackend_Exprs2.cpp`) — **NEITHER REVIEWED.**
+* `r38-p96-ownership` → **`491da5c7`** (fix **#7453**) — **ALREADY PICKED** as `c05c35bf`.
+* `r38-w108-review18` → seven verdicts + the ratchet sweep + three issue drafts.
+* `r38-w109-review19` → two verdicts.
+
+### 6. THE POOL IS REFILLED TO 5 — DISPATCHED IN PAIRS, WITH A STAGGER
+
+| lane | session | work | files |
+|---|---|---|---|
+| `r38-w110-review20` (NEW) | `ses_e5ebc98e6ffe44BsWfbmIaoZty` | review `89e3a353` (#7817 #7844) + `a65f13e8` (#4841) | measures in `r38-p95-boxing`'s warm tree |
+| `r38-p100-strings` (RESUME) | `ses_e5eee6ef7ffe4fSZ7KdKVMWDNC` | finish the **uncommitted** #7741 #7804 work | `LlvmBackend_{String,Exprs,Setup}.cpp`, `LlvmBackend_impl.hpp` |
+| `r38-p101-async` (NEW) | `ses_e5eb9e55affeoaEoNTxk08975v` | #7981 #7972 #7896 #7870 | `LlvmBackend_Async.cpp` |
+| `r38-p102-namedargs` (NEW) | `ses_e5eb9bd71ffeZhx65R0uITiNeL` | #8045 #7828 #7602 | `BuiltinRegistry.cpp`, `ExprTypecheck_Calls.cpp` |
+| `r38-p96-ownership` (RESUME) | `ses_e5f9a75ddffeAYojHCiY428ILX` | #7856 #8031 #8033 #7852 #7907 | `Ownership*.cpp`, the `src/sema` set |
+
+⇒ **⇒ THE TWO COLD-BUILDERS ARE `p101` (codegen) AND `p102` (sema); THE THREE OTHERS HAVE WARM
+BUILD TREES.** ⇒ **`scripts/pool_lanes.sh` NOW REPORTS `5 live agent session(s) per opencode`
+AND `the ledger and opencode AGREE`.**
+
+⇒ **⇒ ⇒ A MIS-DISPATCH WAS CAUGHT AND CORRECTED IN THE SAME TURN.** The string lane was
+dispatched with the ASYNC brief by mistake. It was corrected **before it edited anything**
+(the tree still carried only its own in-flight work), and the correction brief opens with
+**"IGNORE IT ENTIRELY … the async family is NOT yours"**. ⇒ **⇒ ⇒ ⇒ ⇒ ⇒ ⇒ A BRIEF IS A CONTRACT:
+THE FILES IT NAMES ARE THE FILES THE LANE MAY TOUCH, AND THE ISSUES IT NAMES ARE THE ISSUES
+THE LANE MAY CLOSE.**
+
+### 7. FOUR ISSUES **FILED** BY THE COORDINATOR — REVIEWERS ONLY DRAFT
+
+⇒ **⇒ ⇒ ⇒ ⇒ THE COORDINATOR FILES; REVIEWERS ONLY DRAFT.** Three drafts came out of
+`r38-w108-review18`'s `NEW-ISSUES.md`, and one came out of `r38-w107-review17`'s F3. All four
+are filed with `bug` + `campaign:builtin-call-admission` (the third also carries `spec-question`):
+
+| issue | what it is | where it came from |
+|---|---|---|
+| **#8048** | `[codegen]` LINQ `Array<Guid>.Min(sel)` / `Max(sel)` returns a garbage **128-bit** word — the accumulator cannot hold a value type **wider than ONE word** (the `max` came back with a **stack address** in it) | `r38-w108-review18` draft 1 |
+| **#8049** | `[sema]` the no-selector `Array<DateTime>.Min()` / `Max()` is refused with a diagnostic that **contradicts stdlib §2.5**'s `IComparable<Self>` declarations | `r38-w108-review18` draft 2 |
+| **#8050** | `[spec-question]` stdlib §2.2 `Math.Clamp`: the declaration block's `// low > high: ArgumentException` annotation vs its prose — **the annotation is implemented by NO arm** | `r38-w108-review18` draft 3 |
+| **#8051** | `[codegen]` `x.ToString(3)` on a **PRIMITIVE** receiver is ADMITTED by a user extension and then throws `System.ArgumentException` at run time — **byte-identical before and after #7824's fix** | `r38-w107-review17` F3 |
+
+⇒ **⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE `Array<Guid>.Min/Max(sel)` CASE IS A **128-BIT VALUE ON A ONE-WORD
+ACCUMULATOR** — a value type wider than one word is still broken. ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ **⇒ THAT IS A
+NEW ISSUE, NOT A CLOSURE OF #7874**, and #7874's subject was re-titled to name exactly the four
+ONE-WORD heads it really fixes.
+
+⇒ **⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ #8050 IS A SPEC-QUESTION, NOT A DEFECT ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ **IF THE
+ANNOTATION GOVERNS, THE FIX-FORWARD RAISES `low > high: ArgumentException` IN **ALL SIX** ARMS**
+⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ **⇒ ⇒ ⇒ ⇒ THAT IS THE COORDINATOR'S TO ESCALATE, NOT A LANE'S.**
+
+### 8. ⇒ ⇒ ⇒ THE NEXT MOVE (unchanged, restated for the next heartbeat)
+
+1. **⇒ REFILL THE POOL TO 5 IN THE SAME TURN a slot frees** — append the claims row **BEFORE**
+   dispatching (`issue, lane, branch, worktree, hot_files, start, status`; status **LAST**,
+   carrying `live:<role>:ses_…`), and **⇒ ⇒ ⇒ ⇒ ⇒ THE DISPATCH IS IN PAIRS, WITH A STAGGER, AND
+   EVERY BRIEF CARRIES THE BUILD GATE.**
+2. **⇒ PICK AS VERDICTS LAND**, each verified with `scripts/pick_issues.sh --github`, **in
+   authored order (ancestor first)** within a branch.
+3. **⇒ THE REVIEW THROUGHPUT IS THE BOTTLENECK, NOT THE SUPPLY.** Two commits (three issues:
+   #7817 #7844 #4841) are delivered and unreviewed; `r38-w110-review20` owns them.
+4. **⇒ THE GATE IS ONE, NEAR THE END (2026-11-05 ~00:00–02:00 NZDT)**: on a quiet box rebuild
+   `build/bezelc` **and the test binaries** on the tip, `scripts/ratchet_sweep.sh` **25/25 GREEN
+   at the FINAL TIP** (the 25/25 above was measured at `4accde7b`), `scripts/pregate.sh` prints
+   READY, **FREEZE THE TREE (no more picks)**, then
+   `setsid nohup scripts/gate_and_push.sh > LOG 2>&1 < /dev/null &` and
+   `scripts/wait_pid.sh "$BEZEL_GATE_PIDFILE"`. **⇒ ON FAIL: NARROW FIX-FORWARD ONLY — NEVER
+   REVERT, NEVER BISECT.**
+5. **⇒ THEN REFRESH master-plan §6 AND DELETE THE HEARTBEAT SCHEDULE.**
+
 ## Exit review
 
 *(to be written by the campaign's exit reviewer — not this lane)*
