@@ -84,13 +84,40 @@ using bezel::test::runAotChecked;
 namespace {
 
 // ── The programs ────────────────────────────────────────────────────────────
+//
+// ⚠ WHY EVERY FORMAL BELOW IS SPELLED `System.Object` (§8.1, §2.3, §2.7,
+// §8.6, v0.350). THE §8.6 ARGUMENT BOX is minted for a value-typed argument
+// bound to a formal whose type is the ROOT `Object` (or an interface the
+// value type implements) — §8.6: "When a value type is used where `Object`
+// (or an interface implemented by the value type) is expected, the value is
+// **boxed**: a heap-allocated wrapper holds the value."
+//
+// A BARE `Object` in a formal's type is NOT the root where a TYPE PARAMETER
+// named `Object` shadows it. §8.1's *Definition*: "a nested type or a type
+// parameter named `Object` shadows the root under §2.7 as any declaration
+// shadows an always-available name, and `System.Object` still reaches it";
+// §2.3's "Core types" row says the same ("a nested type or type parameter
+// named `Object` shadows it, and `System.Object` still reaches it"). So in
+// `Tag<Object>(x: Object)` the formal's type is the TYPE PARAMETER, the `int`
+// argument is admitted only as the substituted value type (§5.1), and NO §8.6
+// box is minted at all — the programs would not exercise the defect this
+// file covers, and the two rows that read the box back would be VACUOUS.
+//
+// ⇒ THE FORMALS BELOW NAME THE ROOT EXPLICITLY: `x: System.Object`. §8.1
+// says the qualified spelling "still reaches it", so the formal's type IS the
+// root `Object` even though the enclosing method declares a type parameter
+// named `Object` — §8.6's box is minted, the callee reads the box's payload,
+// and the rows below measure the defect they were written for. (The type
+// parameter is still named `Object` on purpose: the programs then also pin
+// that the qualified spelling reaches the root INSIDE a scope where the bare
+// name is shadowed.)
 
 // (1) THE ISSUE'S OWN REPRO, with the box read back so the row's value is not
 // a constant. `Tag<Object>` declares ONE type parameter, named `Object`; the
-// call supplies `int`. §8.1: the root `Object` is the only thing a type
-// parameter named `Object` can mean at runtime, so the formal is the root and
-// the `int` argument is boxed to it (§8.6). The box is minted in the CALLER
-// (Main) and must be released there, after the call returns.
+// call supplies `int`. The formal is the ROOT `Object` (spelled
+// `System.Object` — see the note above), so the `int` argument is boxed to it
+// (§8.6). The box is minted in the CALLER (Main) and must be released there,
+// after the call returns.
 //
 // On the base the box stayed queued: the ARTIFACT path (`bezelc -c`, §2.4 —
 // the path the issue was reported on) is rejected with "Referring to an
@@ -113,7 +140,7 @@ const char* kIssueRepro =
     "    if t = 100 then return 41; end; "
     "    return 1; "
     "  end Main; "
-    "  public static method Tag<Object>(x: Object): int "
+    "  public static method Tag<Object>(x: System.Object): int "
     "    => (x as int) ?? 0; "
     "end Program;";
 
@@ -135,9 +162,9 @@ const char* kNestedGenericExpression =
     "    Console.WriteLine(Tag<int>(5)); "
     "    return 0; "
     "  end Main; "
-    "  public static method Tag<Object>(x: Object): int "
+    "  public static method Tag<Object>(x: System.Object): int "
     "    => Helper<Object>(5) + ((x as int) ?? 0); "
-    "  public static method Helper<Object>(o: Object): int => 7; "
+    "  public static method Helper<Object>(o: System.Object): int => 7; "
     "end Program;";
 
 // (3) THE F2 SHAPE — the ordinary-nested-call twin of (2). The nested call is
@@ -153,7 +180,7 @@ const char* kNestedOrdinaryExpression =
     "    Console.WriteLine(Tag<int>(5)); "
     "    return 0; "
     "  end Main; "
-    "  public static method Tag<Object>(x: Object): int "
+    "  public static method Tag<Object>(x: System.Object): int "
     "    => Helper() + ((x as int) ?? 0); "
     "  public static method Helper(): int => 7; "
     "end Program;";
@@ -174,7 +201,7 @@ const char* kNestedOrdinaryExpressionLifetime =
     "    Console.WriteLine(Tag<int>(5)); "
     "    return 0; "
     "  end Main; "
-    "  public static method Tag<Object>(x: Object): int "
+    "  public static method Tag<Object>(x: System.Object): int "
     "    => Helper() + ((x as int) ?? 0) "
     "       + (x.GetHashCode() - x.GetHashCode()); "
     "  public static method Helper(): int => 7; "
@@ -188,10 +215,10 @@ const char* kNestedGenericExpressionLifetime =
     "    Console.WriteLine(Tag<int>(5)); "
     "    return 0; "
     "  end Main; "
-    "  public static method Tag<Object>(x: Object): int "
+    "  public static method Tag<Object>(x: System.Object): int "
     "    => Helper<Object>(5) + ((x as int) ?? 0) "
     "       + (x.GetHashCode() - x.GetHashCode()); "
-    "  public static method Helper<Object>(o: Object): int => 7; "
+    "  public static method Helper<Object>(o: System.Object): int => 7; "
     "end Program;";
 
 }  // namespace
