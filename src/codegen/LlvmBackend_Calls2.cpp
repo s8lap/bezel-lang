@@ -9386,6 +9386,31 @@ Emitter::CallArgPins::~CallArgPins() {
     for (const ast::Expr* e : pins) em.exprValueOverride_.erase(e);
 }
 
+// fix #8026 (§8.1 / §8.2 / §7.5 / #487, v0.350): the ONE refusal for the
+// universal `Object.GetType` — the `Type` value §8.2 defines but the runtime
+// cannot yet produce (stdlib §2.13's `Type` needs a type-descriptor table
+// that is not emitted).
+//
+// §7.5 says a null-conditional member access resolves as the plain member
+// access does ("`x?.M` resolves `M` as `x.M` does"), so the `?.` spelling of
+// this call must be refused EXACTLY as the `.` spelling is. Before this fix
+// the `.` spelling was refused here — a real diagnostic — while the `?.`
+// spelling reached no arm at all: the universal member carries no
+// MethodSymbol, so `lowerNullCondCall` found no callee, lowered nothing, and
+// the enclosing store was DEGRADED to a zero value behind an `internal:`
+// note (issue #6859's `t?.GetType()` row,
+// `tests/conformance/rules/cases/s8_1_0004.bzl`, which then printed `False`
+// where §8.2 requires `True`). ONE helper, so the two spellings cannot drift.
+static void reportUniversalGetTypeRefusal(sema::SemaContext& ctx,
+                                           SourceLocation loc) {
+    ctx.diagnostics().report(
+        Severity::Error, loc,
+        "`GetType()` is not yet implemented in codegen: the runtime "
+        "`Type` class (stdlib \xC2\xA7""2.13) requires a type-descriptor "
+        "table that is not yet emitted (\xC2\xA7""8.2, #487). This call "
+        "will be supported in a future milestone.");
+}
+
 llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     // fix #7600 (§22.5, v0.350): the written-order pre-pass runs BEFORE every
@@ -9488,12 +9513,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             if (ma->member == "GetType" &&
                 !dynamic_cast<sema::MethodSymbol*>(
                     ctx_.exprSymbol(*call.callee))) {
-                ctx_.diagnostics().report(
-                    Severity::Error, call.span.begin,
-                    "`GetType()` is not yet implemented in codegen: the runtime "
-                    "`Type` class (stdlib \xC2\xA7""2.13) requires a type-descriptor "
-                    "table that is not yet emitted (\xC2\xA7""8.2, #487). This call "
-                    "will be supported in a future milestone.");
+                reportUniversalGetTypeRefusal(ctx_, call.span.begin);
                 return llvm::PoisonValue::get(ptrTy());
             }
         }
@@ -23458,6 +23478,39 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
 
 llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                                const ast::NullCondMemberExpr& nm) {
+    // fix #8026 (§8.1 / §8.2 / §7.5 / #487, v0.350): the `?.` spelling of the
+    // universal `Object.GetType` — the SAME refusal the `.` spelling gets in
+    // lowerCallDispatch, for the reason §7.5 gives ("`x?.M` resolves `M` as
+    // `x.M` does").
+    //
+    // THE DEFECT. The universal member carries no MethodSymbol (§8.1: it is
+    // present on every type without one), so `ms` below is null for it and
+    // every arm of this function declines the call: `lowerNullCondBuiltinCall`
+    // does not know the name, so the call lowered to NOTHING and the
+    // enclosing store was DEGRADED to a zero value behind an `internal:`
+    // note — the silent wrong-code shape `scripts/check_internal_residual.py`
+    // ratchets. MEASURED (issue #6859, the `t?.GetType()` row of
+    // `tests/conformance/rules/cases/s8_1_0004.bzl`): the program compiled,
+    // printed `False` where §8.2 requires `True`, and exited 0. The `.`
+    // spelling of the same call was already refused with a real diagnostic
+    // (`lowerCallDispatch`), so the two spellings of ONE member disagreed —
+    // §7.5 says they may not.
+    //
+    // The refusal is the SHARED helper the `.` spelling uses
+    // (`reportUniversalGetTypeRefusal`), so the two cannot drift. The
+    // §11.7 / §12.2 (#6763) exemption is preserved: a member DECLARED with
+    // this name (a static class's own static `GetType`) carries a
+    // MethodSymbol and is called, not refused.
+    //
+    // The value returned is the same poison the `.` spelling returns: a
+    // VALUE, so the enclosing statement is not degraded and no `internal:`
+    // note is emitted for it. The compilation still FAILS — the diagnostic
+    // above is an Error, so the driver does not link an artifact.
+    if (nm.member == "GetType" && call.args.empty() &&
+        !dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee))) {
+        reportUniversalGetTypeRefusal(ctx_, call.span.begin);
+        return llvm::PoisonValue::get(ptrTy());
+    }
     // fix #2345 / §22.3 / §22.4: pre-create any inline `out var x` slot
     // BEFORE the receiver-null branch below is emitted, exactly as lowerCall
     // (the `.` form) already does as its own first statement. Without this,
