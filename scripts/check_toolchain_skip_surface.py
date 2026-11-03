@@ -55,6 +55,7 @@ Usage:  scripts/check_toolchain_skip_surface.py [--strict] [--self-test]
                                                  [--update [--force]] [--list]
 """
 import argparse
+import datetime
 import pathlib
 import re
 import sys
@@ -286,12 +287,27 @@ def read_baseline(path=BASELINE):
     return _parse_baseline(path.read_text())
 
 
+def _today() -> str:
+    """The date this baseline was written (ISO). The header names it, so the
+    header cannot drift away from the counts the way a hardcoded string did."""
+    return datetime.date.today().isoformat()
+
+
 def write_baseline(absorbing, checked, support, path=BASELINE):
     path.write_text('\n'.join([
         '# toolchain_skip_surface.baseline - ratchet for issue #3733:',
-        '# the runAotChecked toolchain-SKIP surface (2,046 call sites in 634',
-        '# files at 2026-09-17). Freezes the surface so it cannot grow while',
-        '# the burn-down runs.',
+        '# the runAotChecked toolchain-SKIP surface, frozen at the counts',
+        '# BELOW (they are EXACT, not a ceiling).',
+        '#',
+        '# The header used to name the counts in PROSE -- "2,046 call sites in',
+        '# 634 files at 2026-09-17" -- and that number was WRONG from the',
+        '# moment it was written: the writer emitted a FIXED string, so every',
+        '# --update re-stamped the same stale sentence over fresh counts',
+        '# (measured 2026-11-03: the baseline said 4,008 while the header',
+        '# still said 2,046). The counts are the machine-readable lines',
+        '# below; the header now only says where they are.',
+        '#',
+        '# Last re-baselined: %s.' % _today(),
         '#',
         '# Regenerate with scripts/check_toolchain_skip_surface.py --update',
         '# after a burn-down step. --update REFUSES to raise absorbing_sites',

@@ -1,7 +1,16 @@
 # toolchain_skip_surface.baseline - ratchet for issue #3733:
-# the runAotChecked toolchain-SKIP surface (2,046 call sites in 634
-# files at 2026-09-17). Freezes the surface so it cannot grow while
-# the burn-down runs.
+# the runAotChecked toolchain-SKIP surface, frozen at the counts
+# BELOW (they are EXACT, not a ceiling).
+#
+# The header used to name the counts in PROSE -- "2,046 call sites in
+# 634 files at 2026-09-17" -- and that number was WRONG from the
+# moment it was written: the writer emitted a FIXED string, so every
+# --update re-stamped the same stale sentence over fresh counts
+# (measured 2026-11-03: the baseline said 4,008 while the header
+# still said 2,046). The counts are the machine-readable lines
+# below; the header now only says where they are.
+#
+# Last re-baselined: 2026-11-03.
 #
 # Regenerate with scripts/check_toolchain_skip_surface.py --update
 # after a burn-down step. --update REFUSES to raise absorbing_sites
@@ -28,5 +37,5 @@
 #                   from checked_calls only when a file moves into
 #                   or out of tests/support/.
 absorbing_sites = 0
-checked_calls   = 4008
-support_calls   = 4025
+checked_calls   = 4090
+support_calls   = 4107
