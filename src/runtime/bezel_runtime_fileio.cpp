@@ -18,6 +18,20 @@
 // wrong value). Also hardened: unchecked ftell() (-1 on failure flowed into
 // `malloc((size_t)-1 + 1)` == `malloc(0)`, then `buf[n] = 0` wrote past the
 // 0-byte allocation) and unchecked malloc() (OOM null-deref via buf[n] = 0).
+//
+// fix #8030 (2026-11-04, §31.4, v0.350): EVERY allocation in this file is
+// checked — the header's "every path … must leave *out/*len in a defined
+// state" promise is now true of the ALLOCATION sites too, not only of the
+// `*out/*len` ones. The audit found that the header's claim ("unchecked
+// malloc()") was itself only true of the §7.3 read paths: the `Directory.*`
+// and `Path.*` entry points carried ELEVEN unchecked allocations, and
+// `bz_dir_get_files` / `bz_dir_get_dirs` (the two #8030 names) carried four
+// more — an unchecked `strdup` (a null pointer handed to the generated
+// program's `strlen`) and an unchecked `malloc` (a NULL-pointer write inside
+// the runtime). The convention for an allocation failure in this file is
+// `bz_alloc_fail(...)` — §31.4 makes an allocation failure a TERMINATION and
+// not an exception — except at `bz_file_read_all_bytes`, which has an error
+// code to return and returns `-ENOMEM`.
 int32_t bz_file_read_all_bytes(const char* path, uint8_t** out, int64_t* len) {
     *out = nullptr;
     if (len) *len = 0;
@@ -256,6 +270,11 @@ bool bz_dir_exists(const char* path) {
 int32_t bz_dir_create(const char* path) {
     // Create all intermediate directories (like mkdir -p)
     char* tmp = strdup(path);
+    // fix #8030 (§31.4, v0.350): the `strdup` was unchecked, and the very
+    // next line dereferenced it (`tmp + 1`) — an allocation failure was a
+    // NULL-pointer dereference inside the runtime. See the OOM convention
+    // note at the top of this file.
+    if (!tmp) bz_alloc_fail("Directory.CreateDirectory path");
     char* p = tmp + 1;
     while ((p = strchr(p, '/'))) {
         *p = '\0';
@@ -293,7 +312,46 @@ int32_t bz_dir_delete(const char* path, bool recursive) {
     return rmdir(path) == 0 ? 0 : -errno;
 }
 
+// fix #8030 (§31.4, v0.350): the OOM convention for THIS file.
+//
+// Every allocation in this file is checked, and an allocation failure
+// TERMINATES the process: §31.4 makes an allocation failure a termination
+// and not an exception ("the runtime reports the failure and aborts the
+// process. Allocation failure is not an exception"), and `bz_alloc_fail`
+// (bezel_runtime_internal.hpp) is the one funnel every such site uses.
+//
+// Why not an error code? These entry points have no error channel: a
+// `nullptr` return already means "the directory could not be opened" (count
+// 0), so a `nullptr` that meant "out of memory" would turn an OOM into a
+// silently wrong EMPTY result — the one outcome §31.4's rule exists to
+// prevent (see the same reasoning at `bz_file_read_all_lines`, whose
+// `bz_alloc_fail("File.ReadAllLines line data")` site is the shape used
+// here).
+//
+// The belt-and-braces release shape is the file's own: free what was already
+// allocated, then report (`free(lineData); bz_alloc_fail(...)` at the
+// `File.ReadAllLines` site).
+static void bz_dir_list_alloc_fail(std::vector<char*>& results, const char* what) {
+    for (char* p : results) free(p);
+    bz_alloc_fail(what);
+}
+
 // §7.4: Directory.GetFiles — return char** of regular-file names, exclude dots.
+//
+// fix #8030 (§31.4, v0.350): BOTH allocations here were unchecked. The
+// pre-fix code read:
+//
+//     results.push_back(strdup(fullpath));
+//     ...
+//     char** arr = (char**)malloc(results.size() * sizeof(char*));
+//     for (size_t i = 0; i < results.size(); i++) arr[i] = results[i];
+//
+// so (a) a failed `strdup` pushed a `nullptr` into `results`, which became
+// `arr[i]` and was handed to `strlen` by the generated program (a crash in
+// the PROGRAM), and (b) a failed `malloc` left `arr` null and the copy loop
+// wrote through it — a NULL-pointer write inside the RUNTIME. The file's
+// own header states that every allocation in it is checked; these two sites
+// (and the `bz_dir_get_dirs` pair) were the ones that were not.
 void* bz_dir_get_files(const char* path, int64_t* count_out) {
     DIR* d = opendir(path);
     if (!d) { if (count_out) *count_out = 0; return nullptr; }
@@ -304,17 +362,32 @@ void* bz_dir_get_files(const char* path, int64_t* count_out) {
         if (entry->d_name[0] == '.') continue;
         struct stat st;
         snprintf(fullpath, sizeof(fullpath), "%s/%s", path, entry->d_name);
-        if (stat(fullpath, &st) == 0 && S_ISREG(st.st_mode))
-            results.push_back(strdup(fullpath));
+        if (stat(fullpath, &st) == 0 && S_ISREG(st.st_mode)) {
+            char* copy = strdup(fullpath);
+            if (!copy) bz_dir_list_alloc_fail(results, "Directory.GetFiles entry");
+            results.push_back(copy);
+        }
     }
     closedir(d);
-    char** arr = (char**)malloc(results.size() * sizeof(char*));
-    for (size_t i = 0; i < results.size(); i++) arr[i] = results[i];
-    if (count_out) *count_out = (int64_t)results.size();
+    size_t n = results.size();
+    // At least one element's worth, so an EMPTY directory still yields a
+    // non-null (freeable) buffer: `malloc(0)` may return nullptr, and on
+    // this entry point a `nullptr` already means "the directory could not be
+    // opened".
+    char** arr = (char**)malloc((n ? n : 1) * sizeof(char*));
+    if (!arr) bz_dir_list_alloc_fail(results, "Directory.GetFiles result array");
+    for (size_t i = 0; i < n; i++) arr[i] = results[i];
+    if (count_out) *count_out = (int64_t)n;
     return arr;
 }
 
 // §7.4: Directory.GetDirectories — return char** of subdirectory names, exclude dots.
+//
+// fix #8030 (§31.4, v0.350): the same two unchecked allocations as
+// `bz_dir_get_files` above — see that function's note. A failed `strdup`
+// pushed a `nullptr` into the array (which the generated program then passed
+// to `strlen`), and a failed `malloc` left the copy loop writing through a
+// null pointer.
 void* bz_dir_get_dirs(const char* path, int64_t* count_out) {
     DIR* d = opendir(path);
     if (!d) { if (count_out) *count_out = 0; return nullptr; }
@@ -325,13 +398,19 @@ void* bz_dir_get_dirs(const char* path, int64_t* count_out) {
         if (entry->d_name[0] == '.') continue;
         struct stat st;
         snprintf(fullpath, sizeof(fullpath), "%s/%s", path, entry->d_name);
-        if (stat(fullpath, &st) == 0 && S_ISDIR(st.st_mode))
-            results.push_back(strdup(fullpath));
+        if (stat(fullpath, &st) == 0 && S_ISDIR(st.st_mode)) {
+            char* copy = strdup(fullpath);
+            if (!copy) bz_dir_list_alloc_fail(results, "Directory.GetDirectories entry");
+            results.push_back(copy);
+        }
     }
     closedir(d);
-    char** arr = (char**)malloc(results.size() * sizeof(char*));
-    for (size_t i = 0; i < results.size(); i++) arr[i] = results[i];
-    if (count_out) *count_out = (int64_t)results.size();
+    size_t n = results.size();
+    // One element's worth minimum — see `bz_dir_get_files` above.
+    char** arr = (char**)malloc((n ? n : 1) * sizeof(char*));
+    if (!arr) bz_dir_list_alloc_fail(results, "Directory.GetDirectories result array");
+    for (size_t i = 0; i < n; i++) arr[i] = results[i];
+    if (count_out) *count_out = (int64_t)n;
     return arr;
 }
 
@@ -340,6 +419,10 @@ char* bz_path_combine(const char* a, const char* b) {
     size_t la = strlen(a), lb = strlen(b);
     bool slash = la > 0 && a[la - 1] != '/';
     char* out = (char*)malloc(la + lb + 2);
+    // fix #8030 (§31.4, v0.350): the `malloc` was unchecked and the `memcpy`
+    // below wrote through it — an allocation failure was a NULL-pointer
+    // dereference inside the runtime.
+    if (!out) bz_alloc_fail("Path.Combine result");
     memcpy(out, a, la);
     if (slash) out[la++] = '/';
     memcpy(out + la, b, lb + 1);
@@ -348,7 +431,12 @@ char* bz_path_combine(const char* a, const char* b) {
 
 // §7.4: Path.GetFileName — POSIX basename(3).
 char* bz_path_filename(const char* path) {
-    return strdup(basename((char*)path));  // POSIX basename
+    // fix #8030 (§31.4, v0.350): the `strdup` result was returned unchecked,
+    // so an allocation failure handed the caller a null pointer to free and
+    // to read.
+    char* out = strdup(basename((char*)path));  // POSIX basename
+    if (!out) bz_alloc_fail("Path.GetFileName result");
+    return out;
 }
 
 // §7.4: Path.GetExtension — last '.' and beyond in the basename, or "".
@@ -356,7 +444,11 @@ char* bz_path_extension(const char* path) {
     const char* base = strrchr(path, '/');
     base = base ? base + 1 : path;
     const char* dot = strrchr(base, '.');
-    return dot ? strdup(dot) : strdup("");
+    // fix #8030 (§31.4, v0.350): both `strdup` results were returned
+    // unchecked — see `bz_path_filename` above.
+    char* out = dot ? strdup(dot) : strdup("");
+    if (!out) bz_alloc_fail("Path.GetExtension result");
+    return out;
 }
 
 // §7.4: Path.GetFileNameWithoutExtension — basename minus its last '.' suffix.
@@ -364,18 +456,31 @@ char* bz_path_stem(const char* path) {
     const char* base = strrchr(path, '/');
     base = base ? base + 1 : path;
     const char* dot = strrchr(base, '.');
-    if (!dot) return strdup(base);
+    // fix #8030 (§31.4, v0.350): the `strdup` result was returned unchecked.
+    if (!dot) {
+        char* out = strdup(base);
+        if (!out) bz_alloc_fail("Path.GetFileNameWithoutExtension result");
+        return out;
+    }
     size_t n = (size_t)(dot - base);
     char* out = (char*)malloc(n + 1);
+    // fix #8030 (§31.4, v0.350): the `malloc` was unchecked and the
+    // `memcpy` below wrote through it.
+    if (!out) bz_alloc_fail("Path.GetFileNameWithoutExtension result");
     memcpy(out, base, n); out[n] = '\0';
     return out;
 }
 
 // §7.4: Path.GetDirectoryName — POSIX dirname(3).
 char* bz_path_dirname(const char* path) {
+    // fix #8030 (§31.4, v0.350): BOTH `strdup` results were unchecked — the
+    // first is passed straight to `dirname(3)` (which writes through it), the
+    // second is returned to the caller.
     char* copy = strdup(path);
+    if (!copy) bz_alloc_fail("Path.GetDirectoryName path");
     char* dir = dirname(copy);  // POSIX dirname
     char* result = strdup(dir);
+    if (!result) { free(copy); bz_alloc_fail("Path.GetDirectoryName result"); }
     free(copy);
     return result;
 }
@@ -385,7 +490,10 @@ char* bz_path_dirname(const char* path) {
 // documented behavior of never throwing for a non-resolvable input).
 char* bz_path_absolute(const char* path) {
     char buf[4096];
-    return realpath(path, buf) ? strdup(buf) : strdup(path);
+    // fix #8030 (§31.4, v0.350): the `strdup` result was returned unchecked.
+    char* out = realpath(path, buf) ? strdup(buf) : strdup(path);
+    if (!out) bz_alloc_fail("Path.GetFullPath result");
+    return out;
 }
 
 // ---------------------------------------------------------------------------
