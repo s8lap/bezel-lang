@@ -58,9 +58,29 @@ if [ -z "$SESSIONS" ]; then
 fi
 
 python3 - "$SESSIONS" "$CLAIMS" <<'PY'
-import json, os, sys
+import json, os, subprocess, sys
 
 sess_path, claims_path = sys.argv[1], sys.argv[2]
+
+# The AGENT PROCESSES that are alive right now.  A lane is an `opencode run`
+# process, so the process table is the DIRECT measure of "an agent exists" --
+# the session's own timestamps are only a proxy (see below).
+ps_ok = True
+try:
+    ps_out = subprocess.run(["ps", "-eo", "args="], capture_output=True,
+                            text=True, timeout=30).stdout
+except Exception:
+    ps_out = ""
+    ps_ok = False
+agent_sessions = set()
+for line in ps_out.splitlines():
+    if "opencode run" not in line:
+        continue
+    parts = line.split()
+    if "--session" in parts:
+        i = parts.index("--session")
+        if i + 1 < len(parts):
+            agent_sessions.add(parts[i + 1])
 
 try:
     with open(sess_path, encoding="utf-8") as fh:
@@ -70,26 +90,40 @@ except Exception as exc:
     sys.exit(70)
 rows = blob.get("data", blob) if isinstance(blob, dict) else blob
 
-# A lane is live iff it is a CHILD session with no outcome yet -- OR it has
-# been updated since it last went idle.
+# A lane is live iff ITS AGENT PROCESS IS ALIVE.
 #
-# WHY THE SECOND CLAUSE (measured 2026-11-03, the R38 run).  A RESUMED
-# session -- a lane the coordinator continued with `opencode run --session
-# <id>`, e.g. a scoped re-review -- KEEPS THE OUTCOME OF ITS PREVIOUS RUN
-# until the new run ends.  `outcome is None` alone therefore calls a RUNNING
-# resumed lane DEAD, and a coordinator that believes that reaps a live lane.
-# The server's own timestamps settle it: a live session's `time.updated`
-# advances with every message while `time.idle` stays stale (it is only set
-# when the session really stops), so `updated > idle` is the live signal.
+# WHY THE PROCESS, AND NOT THE SESSION (measured 2026-11-03, the R38 run).
+# A lane IS an `opencode run --session <id>` process, so the process table is
+# the DIRECT measure of "an agent exists".  The session's own fields are only
+# a proxy, and the proxy is wrong in TWO measured ways:
+#   * a RESUMED session keeps the OUTCOME OF ITS PREVIOUS RUN until the new
+#     run ends, so `outcome is None` alone calls a RUNNING lane DEAD; and
+#   * an agent whose PROCESS died leaves a session whose `outcome` is still
+#     None and whose `time.idle` was never refreshed, so `outcome is None`
+#     alone calls a DEAD lane LIVE.  Measured: 8 sessions read live while
+#     only 6 agent processes existed -- two lanes had already finished and
+#     the pool over-counted them.
+# ⇒ SO: the process table decides.  A session with no agent process has no
+# agent.  If the process table cannot be READ AT ALL (`ps` failed), fall back
+# to the session fields -- never report a pool of zero because `ps` failed.
+# ⇒ BUT an EMPTY PROCESS TABLE IS NOT A FAILURE: it means there is no agent
+# right now, and the session fields would then OVER-count (a dead agent
+# leaves a session whose `idle` was never refreshed).  So the fallback is
+# taken only when `ps` FAILED, not when `ps` answered.
 live = {}
-for r in rows:
-    if not r.get("parentID"):
-        continue                       # a top-level session is the coordinator
-    t = r.get("time") or {}
-    updated = t.get("updated") or 0
-    idle = t.get("idle") or 0
-    if r.get("outcome") is None or (updated and idle and updated > idle):
-        live[r["id"]] = (r.get("title") or "")[:60]
+if not ps_ok:
+    for r in rows:
+        if not r.get("parentID"):
+            continue
+        t = r.get("time") or {}
+        if r.get("outcome") is None or ((t.get("updated") or 0) > (t.get("idle") or 0)):
+            live[r["id"]] = (r.get("title") or "")[:60]
+else:
+    for r in rows:
+        if not r.get("parentID"):
+            continue
+        if r["id"] in agent_sessions:
+            live[r["id"]] = (r.get("title") or "")[:60]
 
 print(f"pool_lanes: {len(live)} live agent session(s) per opencode")
 
