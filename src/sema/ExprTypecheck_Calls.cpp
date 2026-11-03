@@ -22598,11 +22598,11 @@ std::string mathConvertTypeList(const std::vector<std::uint32_t>& kinds) {
 // parameter count.
 //
 // The ONE built-in parameter table carries an `out` slot as an EMPTY name
-// slot — an `out` parameter is positional-only (§22.3), so it cannot be
-// named — and it is exactly the parameter that widens a form's arity range
-// beyond the form's required count. So the `out` slot is the LAST parameter
-// of a form whose name slot is empty while the form's `total` exceeds its
-// `required`.
+// slot — an `out` parameter is positional-only (§22.5: "A `ref`/`out`/`scoped`
+// argument is positional-only"), so it cannot be named — and it is exactly
+// the parameter that widens a form's arity range beyond the form's required
+// count. So the `out` slot is the LAST parameter of a form whose name slot is
+// empty while the form's `total` exceeds its `required`.
 //
 // THE RULE IS THE SAME BEFORE AND AFTER the table's `required` column is
 // corrected for `Math.DivRem` (#8034): with `required == 2` the `out` slot
