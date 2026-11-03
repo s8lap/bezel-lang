@@ -2558,7 +2558,7 @@ change is a delete-then-create):**
   `schedule_create({name: "r38-heartbeat", when: {every: "20 minutes", tz:
   "Pacific/Auckland"}, ends: {at: "2026-11-05T02:00:00.000+13:00"}, prompt: <VERBATIM>})` —
   **the two back to back, because a gap with no heartbeat is worse than a stale end.** The new
-  instance is **`sch_19eff064a001uPPxyMG3Muoa2P`** (`active`, `nextDueAt`
+  instance is **`sch_1a0df553a001e742yLwXJrJm7b`** (`active`, `nextDueAt`
   `2026-11-03T14:41:15.850+13:00`). **⇒ A SCHEDULE-ONLY EXTENSION IS NOT DURABLE: the next
   session reads the FILES, not the scheduler** — so the end must also live in
   `docs/ops/heartbeat.md` and in `docs/proposals/papers/master-plan.md` §6.
@@ -2815,6 +2815,258 @@ CLOSURES.** ⇒ ⇒ **THE POOL IS 7 PRODUCERS + 5 REVIEWERS (12 lanes):** produc
 `8e37e2ee` and `r38-p89`'s `943ca6a7` — **⇒ THE COORDINATOR CREDITS #7601 FROM `943ca6a7` (it is in review) AND
 `8e37e2ee` IS NOT PICKED** (a second closure of one issue would be a duplicate, and the ledger's CREDIT set is
 subject-only, so the second commit's `Fixes #7601` would bind an issue that is already closed).
+
+## Coordinator block — 2026-11-03 20:25 → 21:05 (the HAUL RULE IS CORRECTED, the pool is REKINDLED to a CLUSTER pool, and the haul reaches 92)
+
+**⇒ THE HAUL FIGURE WAS MEASURED WITH THE WRONG RULE, AND THE WRONG RULE WAS THIS RUN'S OWN INSTRUMENT.** `scripts/pick_ledger.sh` counted a commit's issues from its SUBJECT line only. That counts `narrow #NNNN` — and `narrow` is **not** a GitHub closing keyword, so every narrow commit was credited as a closure it never made. **⇒ THE HAUL RULE IS NOW THE GITHUB-CLOSING RULE: `scripts/pick_issues.sh --github <sha>` — a closing keyword (`close`/`closed`/`fix`/`fixed`/`fixes`/`resolve`/`resolved`, case-insensitive, as a whole word) closes exactly the ONE reference IMMEDIATELY following it (only whitespace and an optional `:` between), in the SUBJECT OR the BODY.** **⇒ ⇒ ⇒ THE SAME TREE, RE-MEASURED UNDER THE RIGHT RULE, MOVED THE HAUL 68 → 80 → 85 → 86.** `run_status.sh`'s staging row now prints `closable N/100 | fix-named M` so the two numbers are never confused again.
+
+**⇒ ⇒ ⇒ THE RULE CONSEQUENCES, MEASURED:**
+* **A QUOTED COMMIT SUBJECT BINDS.** `fix #A #B` closes only `#A`; `narrow #D` and `issue #G` close nothing; but a body line `Fixes #C` closes `#C`, and a PROSE mention ("a lane closes #F") closes `#F` too — quoting gives no protection.
+* **⇒ A COMMIT THAT NAMES AN ISSUE CLOSES IT EVEN IF THE FIX LANDED ELSEWHERE.** That is the basis of the RESIDUAL-CLOSURE sweep, and it is why a TEST-ONLY commit whose subject says `fix #NNNN` is a real closure.
+* **⇒ NEVER NAME AN ISSUE YOU DID NOT FULLY CLOSE.** #7846 and #7547 are deliberately un-named in the bodies that do not fully close them. A prose mention in a body is usually a "STILL OPEN" reference ("until #7741 is fixed", "carried by #8022") ⇒ naming such an issue would be a FALSE CLOSURE.
+
+**⇒ THE GATE BLOCKER WAS MINE AND IS CLEARED.** `origin/main` was merged into `r30-c1` (`4579f1a6`), so `git merge-base --is-ancestor origin/main HEAD` is TRUE and the push is fast-forwardable. The merged commits are 3 spec rationales (v0.351–v0.353) and 2 README refinements ⇒ **the spec is now v0.353 and section NUMBERS may have SHIFTED ⇒ cite by TITLE as well as by number.** The full gate self-test discovery is GREEN at the tip (Ran 1183 tests, exit=0, OK, skipped=2).
+
+**⇒ THE HAUL IS THE BINDING CONSTRAINT, AND THE ONLY LEVER LEFT IS THE CLUSTER COMMIT.** 86 banked at the start of this block + the issues then in review = 98 ⇒ **one commit naming N issues credits N closures ⇒ CLUSTER lanes and RESIDUAL CLOSURES are the only way to reach 100.** **⇒ THIS BLOCK PUTS EVERY REMAINING LANE ON A CLUSTER OR A RESIDUAL CLOSURE.**
+
+### The picks of this block
+
+| pick | reviewer | issues | haul |
+|---|---|---|---|
+| `acc4a722` → `9f640ebe` | `r38-w101-review11` (ACCEPT-W-NOTES) | #7889 | 85 → 86 |
+| `a2abaed96` → `dcba0ab3` | `r38-w100-review10` (ACCEPT-W-NOTES) | #8047 #7542 #7945 | 86 → 89 |
+| `194fba98` → `834b8837` | `r38-w99-review9` (ACCEPT-W-NOTES) | #8041 #8042 #8043 | 89 → **92** |
+
+**⇒ STAGING TIP `834b8837`, +115 over `origin/main`, `closable 92/100 | fix-named 81`, `UNATTRIBUTED: 0`. NOTHING IS PUSHED.** The two new picks were verified with `scripts/pick_issues.sh --github`: `a2abaed96` binds `#8047 #7542 #7945` through the body's explicit `Fixes` lines and nothing else; `194fba98` binds `#8041 #8042 #8043` the same way.
+
+### The pool, rekindled to CLUSTER work (the dead-lane rule, applied in the same turn)
+
+**⇒ THE POOL COUNT IS A CLAIM; THE AGENT COUNT IS A MEASUREMENT.** `scripts/pool_lanes.sh` reconciles the claims file against the PROCESS TABLE (a lane IS an `opencode run --session` process), and the ledger and opencode MUST agree. **⇒ THREE LANES DIED IN THIS BLOCK — `r38-p85-residual5`, `r38-p93-narrowhunt` and (later) `r38-p86-cluster`, `r38-p87-registry`, `r38-w99-review9`, `r38-w100-review10` — AND EVERY FREED SLOT WAS REFILLED IN THE SAME TURN.**
+
+* **`r38-p85-residual5` RESUMED** (session `ses_e605bc88bffeQxxfmQL26twpx2`) — the Math `Min`/`Max`/`Clamp`-over-a-value-type cluster (#7947 #7874 #7938 #7519 #7901, and #6648/#7660 as REPORT-ONLY if the fix lands in another lane's file). Files: `src/codegen/LlvmBackend_Calls.cpp` `Calls2.cpp` `Calls3.cpp` + `src/sema/SubstArgs.cpp`.
+* **`r38-p95-boxing` NEW** (`ses_e5fab4331ffekZ6tOIQxrCCyTq`) — the built-in VALUE TYPE BOXED to `Object` cluster (#7817 #7844 #7937 #7822 #7855 #7953). Files: `LlvmBackend_Assign.cpp` `Exprs2.cpp` `Disposal.cpp` `Layout.cpp`.
+* **`r38-p96-ownership` NEW** (`ses_e5f9a75ddffeAYojHCiY428ILX`) — "AN OWNED VALUE THAT ESCAPES INTO A NON-OWNED PLACE" (#7856 #8031 #8033 #7852 #7907) plus the §22.15 pure-body cluster (#7453). Files: `src/sema/Sendability.cpp` `SymbolCollection.cpp` `DefiniteAssignment.cpp` `ConstFold.cpp` `PureChecker.cpp` — all five were FREE.
+* **`r38-p86-cluster` RESUMED** (`ses_e605b853fffeZ0WJakVza5uSA0`) — the extension-admission cluster continued (#7831, which its own report routed to itself; #7812; #8046) plus the §6.4 PRIMITIVE-receiver crash it asked the coordinator to file. Files: `src/sema/ExprTypecheck_Calls.cpp` only.
+* **`r38-p87-registry` RESUMED** (`ses_e605022cbffeeGGE3Ytp8E0223`) — the **#7659 FIX-FORWARD**. `d1161864` was ACCEPT-W-NOTES but **the cherry-pick conflicts in BOTH `scripts/` files**, so the fix-forward must RE-APPLY the checker's `STDLIB_RECORDS`/`BLOCK_CITATIONS`/`NO_OPINION`/`NO_NAME_SURFACE` and the span-family `NULLABILITY_DEVIATION` entries onto STAGING'S #8020 SHAPE, carry the `SpanFamilyCoverage` class onto staging's self-test file, and fix staging's `NULLABILITY_DEVIATION`-is-empty invariant in the SAME commit. Plus the #8045 head count and a ROUTED HAND-OFF for the `Environment` codegen half.
+* **`r38-p93-narrowhunt` RESUMED AS A REVIEWER** (`ses_e5fe64d83ffe80uYMjYHnPltDE`) — it is the AUTHOR of #4120/#4126, so it cannot review those; it reviews `r38-p90-objsurface`'s two commits instead.
+
+### The review wave this block opened (the bottleneck, not the supply)
+
+**⇒ THE HAUL IS NOT SHORT OF COMMITS; IT IS SHORT OF REVIEWS.** At the start of this block nine delivered issues sat unreviewed. **⇒ FOUR REVIEWER LANES WERE OPENED, AND EVERY REVIEWER WAS TOLD TO RE-MEASURE THE RED ARM ITSELF — `639e8f69` on staging records a MEASURED history of FABRICATED fail-without claims and a VACUOUS assertion in exactly this area of the tree.**
+
+| reviewer | commits | issues at stake |
+|---|---|---|
+| `r38-w102-review12` | `ef042f57` `a1128197` `e8baea07` `6f64c69c` | #7363 #7164 #7260 #7165 — the #7363 commit is an AMEND of a REJECT, and the review must re-check F1/F2/F3 |
+| `r38-w103-review13` | `32c595b3` `43047777` | #4120 #4126 — **TEST-ONLY RESIDUAL CLOSURES**, and the `2c0ac3e2`/`bb92811e` neighbours are the regression checks |
+| `r38-w104-review14` | `342bd60d` `80d170ef` | #7824 #7990 |
+| `r38-w105-review15` | `90604fe7` `f7abb4e7` `252efed3` `50a8925e` | #6027 #7751 #7846 #7944 — **⇒ #7751 IS CLOSED BY TWO COMMITS AND THE REVIEWER MUST SAY WHICH ONE TO PICK** |
+| `r38-p93-narrowhunt` (reviewer role) | `80c83724` `a53e6d9f` | #7577 #6811 #6823 #8004 — **⇒ `80c83724` ALSO CHANGES `scripts/`, SO `python3 -m unittest discover -s scripts/gate/tests` MUST BE GREEN WITH IT IN THE TREE** |
+| `r38-w91-review2` | `398ca426` `06cf4bcb` | #7811 #6024 |
+
+### The two structural facts this block measured
+
+**⇒ ⇒ ⇒ THE RESIDUAL-CLOSURE POOL'S AUTOMATED MINE IS EXHAUSTED, BUT HUMAN MINING STILL YIELDS.** Every `narrow` commit in every branch was enumerated: **the in-campaign ones whose issue is still OPEN are exactly #8000 and #8005, and both are PARTIAL** (the `is`-test population gap and the 37 still-opinionless positions) ⇒ they are NOT closable. **⇒ ⇒ ⇒ BUT THE MINING YIELDED #4120 AND #4126** — two REAL closures out of `r38-p93-narrowhunt`'s second sweep, both TEST-ONLY, both with a RED arm at `1cd532ea^` / `3a5a82ad^`.
+
+**⇒ ⇒ ⇒ OUT-OF-CAMPAIGN ISSUES ARE NOT WORKED.** The same enumeration found narrow commits for #3483 #5355 #6233 #6295 #7390 #7417 #7422 #7480 #7482 #7487 #7538 #7544 #7565 #7567 #7763 — **every one of them is labelled `campaign:using-heads` / `campaign:choice-payloads` / `campaign:producer-temporaries`, NOT `campaign:builtin-call-admission` ⇒ they are ANOTHER RUN'S ISSUES and were NOT touched.** The only `campaign:builtin-call-admission` ones in that set (#7544, #7763) are already CLOSED on GitHub.
+
+**⇒ ⇒ ⇒ `#7218` IS ALREADY CREDITED ⇒ `r38-p87-registry`'s `c45fab1f` IS ZERO HAUL** and is not a pick. **⇒ ⇒ ⇒ `r38-p91-extarity`'s `8ba2023f` (#7889) DUPLICATES the ALREADY-PICKED `acc4a722` (#7889) ⇒ it is not a pick either.**
+
+### The rules this block adds for the next coordinator
+
+1. **⇒ A PICKED COMMIT'S BODY IS IMMUTABLE ⇒ CORRECT BODY DEFECTS *BEFORE* THE PICK.** A body under review cannot be amended; a fix-forward is a NEW commit on top.
+2. **⇒ NEVER pick a commit whose review says REJECT, nor one with a known body/oracle defect.**
+3. **⇒ THE ROUND IS: one commit per issue family, one review per commit, one pick per ACCEPT.**
+4. **⇒ THE GATE IS THE COORDINATOR'S ACT ALONE**, once, near the end, carrying 100+ closures. **⇒ DO NOT DRAIN THE POOL TO GATE** — bank the haul and gate when the run ends.
+5. **⇒ A DEAD LANE FREES A SLOT; REFILL IT IN THE SAME TURN.** The dispatch method is `scripts/lane_dispatch.sh [--resume <session-id>]`; only resume a session whose agent process has EXITED, and append the claims row BEFORE dispatching.
+
+## Coordinator block — 2026-11-03 23:05 → 23:50 (THE POOL IS **5**, THE HAUL IS **101**, AND ALL FIFTEEN LANES DIED IN ONE WINDOW)
+
+### 1. THE HAUL IS 101/100 — THE GATE'S FLOOR IS MET
+
+`scripts/pick_ledger.sh origin/main..r30-c1` on the staging tip `947b6692`:
+
+```
+  POOL            COMMITS FIX-ISSUES(credited)
+  r37                   4                    5
+  r38                 119                   85
+distinct fix issues: 90 (0 from inferred kinds)
+distinct issues named (all kinds): 90
+distinct issues GitHub would close (keyword rule, subject+body, any kind): 101
+github-closable issues: 101
+UNATTRIBUTED: 0
+```
+
+**⇒ ⇒ ⇒ THE ONE GATE'S FLOOR IS MET (101 ≥ 100), WITH `UNATTRIBUTED: 0` — EVERY CLOSURE IS
+ATTRIBUTED TO A COMMIT.** ⇒ **EVERYTHING LANDS FROM HERE IS MARGIN AND A FAMILY DEFECT CLOSED, NOT
+THE MINIMUM.** ⇒ **THE GATE IS STILL ONE, STILL NEAR THE END (2026-11-05 ~00:00–02:00 NZDT), AND THE
+POOL IS NOT DRAINED TO GATE.**
+
+### 2. THE TWELVE PICKS OF THIS RUN
+
+Every pick below was verified with `scripts/pick_issues.sh --github <sha>`: it printed EXACTLY the
+intended issues and no second binding.
+
+| source sha | picked as | reviewer | verdict | issues closed |
+|---|---|---|---|---|
+| `a2abaed96` | `dcba0ab3` | `r38-w100-review10` | ACCEPT-W-NOTES | #8047 #7542 #7945 |
+| `194fba98` | `834b8837` | `r38-w99-review9` | ACCEPT-W-NOTES | #8041 #8042 #8043 |
+| `ef042f574` | `7a674caa` | `r38-w102-review12` | ACCEPT | #7363 |
+| `a11281973` | `7acd0a72` | `r38-w102-review12` | ACCEPT-W-NOTES | #7164 |
+| `e8baea076` | `6c65ff83` | `r38-w102-review12` | ACCEPT-W-NOTES | #7260 |
+| `32c595b3` | `571eae81` | `r38-w103-review13` | ACCEPT-W-NOTES | #4120 |
+| `43047777` | `c86c879c` | `r38-w103-review13` | ACCEPT-W-NOTES | #4126 |
+| `90604fe7` | `62b43a75` | `r38-w105-review15` | ACCEPT-W-NOTES | #6027 |
+| `d558ca911e` | `243d31d1` | `r38-w105-review15` | ACCEPT-W-NOTES | #7846 |
+| `398ca426` | `9400a8bf` | `r38-w91-review2` | ACCEPT-W-NOTES | #7811 |
+| `06cf4bcb46` | `947b6692` | `r38-w91-review2` | ACCEPT-W-NOTES | #6024 |
+| `acc4a722` | `9f640ebe` | `r38-w101-review11` | ACCEPT-W-NOTES | #7889 |
+
+**⇒ THE HAUL MOVED 92 → 101 ACROSS THIS RUN'S PICKS, AND EVERY ONE OF THEM CROSSED THE GATE'S FLOOR
+ONLY AS A GROUP.**
+
+### 3. THE MASS LANE DEATH — AND ⇒ ⇒ ⇒ THE POOL TARGET IS NOW **5**, NOT 7
+
+**MEASURED 2026-11-03 21:20 → 23:00: ALL FIFTEEN LANES DIED IN ONE WINDOW.** The coordinator had
+over-launched the pool to SIXTEEN and then SEVENTEEN live lanes, each a separate `opencode run`
+process with its OWN build tree. The box ran out of build budget — `available=0 held=20`, 18–69
+builder processes box-wide, disk at 80% — and every lane died together, each leaving a `live` row
+in the ledger behind it.
+
+**⇒ ⇒ ⇒ THE POOL IS A *RESOURCE* BUDGET, NOT A PRODUCTIVITY SCORE: every lane in the pool is a
+compiler and a build tree, and the number that matters is how many can hold a jobserver token at
+once, not how many hold a claim.** **⇒ ⇒ ⇒ AND THE LEDGER IS THE SAFETY NET THAT MADE THE RECOVERY
+POSSIBLE: it is append-only, so a dead lane leaves its `live` row behind and the next heartbeat can
+see exactly which lanes to restart, which deliveries to harvest, and which verdicts to pick — **⇒ A
+DEAD LANE COSTS A SLOT, NOT ITS WORK.****
+
+**⇒ ⇒ ⇒ OWNER DIRECTIVE, 2026-11-03 ~23:05: *"reduce the pool to 5 agents. record this durably.
+now that you've been launching them effectively, we ran out temporarily. now it's good."*** ⇒ **THE
+TARGET IS 5 FOR THE REST OF THE RUN, AND IT IS RECORDED IN `CLAUDE.md`'s *Pools* bullet,
+`docs/ops/heartbeat.md` (the standing rule AND the verbatim prompt), the heartbeat's own scheduled
+prompt, `docs/ops/coordinator-runbook.md` (a new subsection, *THE POOL TARGET IS **5**, NOT 7 — AND
+OVER-LAUNCHING THE POOL IS A REAL FAILURE MODE*), `docs/proposals/papers/master-plan.md` §6, and
+here.**
+
+**⇒ MEASURED 23:09: `scripts/pool_lanes.sh` said `0 live agent session(s) per opencode` while the
+ledger claimed SIXTEEN live lanes — the ledger's claims were PHANTOMS. The coordinator reconciled
+them by appending a `dead:` row for every phantom (25 rows across 16 lanes) and the reconciler then
+said `the ledger and opencode AGREE`.**
+
+### 4. THE BODY-DEFECT RULE: `fc272d10ea` (#7751 + #7944) IS **NOT** PICKABLE AS IT STANDS
+
+`r38-w105-review15` returned **ACCEPT-W-NOTES** on the pair — the closure is honest on every
+measurable axis — but filed **F1, HIGH**: the body's clause *"and BEFORE every change this commit
+credits"* is **FALSE**.
+
+```
+$ git merge-base --is-ancestor a27c4a93 5952668f ; echo $?
+0                                     # a27c4a93 IS an ancestor of 5952668f
+$ git merge-base --is-ancestor 0b154fdc 5952668f ; echo $?
+1                                     # 0b154fdc is NOT (it is the later fix)
+```
+
+⇒ **THE NAMED PRE-FIX TREE IS NOT BEFORE EVERYTHING THE COMMIT CREDITS.** The §26.5 extension half
+(`a27c4a93`, #7970) is ALREADY in `5952668f`; the tree is before the argument-type half
+(`0b154fdc`) only. **⇒ THE REVIEWER GAVE THE EXACT REWORDING**, and the coordinator's standing rule
+is that a picked commit's body must be TRUE — **⇒ ⇒ ⇒ THE BODY IS FIXED *BEFORE* THE PICK, NOT AFTER
+IT.** ⇒ **⇒ ⇒ A COMMIT WHOSE REVIEW SAYS REJECT, OR ONE WITH A KNOWN BODY DEFECT, IS NEVER PICKED.**
+
+**⇒ ROUTED TO THE LANE THAT OWNS THE BODY.** `r38-p88-residual6` is RESUMED on a NEW branch
+`r38-c99-closures` (NEW worktree `/mnt/fast/worktrees/r38-p99-closures`, from the staging tip
+`947b6692`) with the reviewer's rewording quoted VERBATIM, plus the duty to RE-MEASURE both arms
+(the reviewer measured **RED 7 passed / 10 failed** at `5952668f` → **GREEN 17 passed / 0 failed**)
+and to prove the ancestry claim with the two exit codes above. **⇒ ⇒ ⇒ A WARM WORKTREE AT
+`5952668f` ALREADY EXISTS (`/run/media/stepan/3/bezel-scratch/r38-w105-review15/wt/pre-5952668f`,
+`build/bezelc` built at 21:01), so the RED arm costs a test-binary rebuild, not a cold build.**
+
+### 5. THE DO-NOT-PICK LIST (measured, durable)
+
+* **`6e49fc25` (branch `r38-c87-registry`'s tip) MUST NEVER BE PICKED.** Its subject names no issue
+  (`--github` prints nothing ⇒ zero haul) **and it DELETES** `tests/sema/builtin_param_surface_7659_test.cpp`
+  (201 lines) and guts `scripts/check_builtin_declared_params.py` (−705) and
+  `scripts/gate/tests/test_check_builtin_declared_params.py` (−393). ⇒ **THE #7659 FIX-FORWARD IS
+  NOT DELIVERED** — the prior lane died mid-rebase with a dirty `scripts/check_builtin_declared_params.py`
+  and `src/common/BuiltinRegistry.cpp`. ⇒ **⇒ ⇒ THE FIX-FORWARD'S CONDITIONS ARE IN
+  `/var/tmp/bezel-scratch/r38-w97-review7/REVIEW.md`: re-apply the checker's `STDLIB_RECORDS` /
+  `BLOCK_CITATIONS` / `NO_OPINION` / `NO_NAME_SURFACE` and the span family's `NULLABILITY_DEVIATION` /
+  `NULLABILITY_DEVIATION_GATE` ONTO STAGING'S #8020 SHAPE, carry `SpanFamilyCoverage` onto staging's
+  self-test file, fix staging's `NULLABILITY_DEVIATION`-is-empty invariant in the SAME commit, and
+  `python3 -m unittest discover -s scripts/gate/tests` must be GREEN.**
+* **`f7abb4e7` (#7751) adds ZERO haul** — it binds one issue where the pair binds two ⇒ **pick the
+  PAIR, never this one.**
+* **`c45fab1f` (#7218 already credited)**, **`8ba2023f` (#7889, a duplicate of the picked
+  `acc4a722`)**, **`252efed3` / `50a8925e`** (superseded by `d558ca911e` / `fc272d10ea`).
+* **⇒ ⇒ ⇒ AND THE RESIDUAL-CLOSURE MINE FOR IN-CAMPAIGN ISSUES IS EXHAUSTED** — only #8000 and
+  #8005 remain and both are partial. **All other `narrow` commits belong to OTHER campaigns
+  (`using-heads` / `choice-payloads` / `producer-temporaries`) and were NOT touched.**
+
+### 6. THIS TURN'S POOL — FIVE LANES, TWO NEW REVIEWERS AND THREE RESUMED PRODUCERS
+
+**⇒ ⇒ ⇒ THE BOTTLENECK IS THE REVIEW THROUGHPUT, NOT THE SUPPLY OF ISSUES: 9 issues (five commits)
++ 3 issues (three commits) + 2 issues (the deferred pair) = 14 closures were undelivered because NO
+VERDICT EXISTED.** ⇒ **⇒ ⇒ HALF THE POOL IS REVIEWERS.**
+
+| lane | role | what it owes |
+|---|---|---|
+| `r38-w107-review17` (**NEW**) | REVIEWER | FIVE commits from FOUR lanes — `6f64c69c` (#7165), `342bd60d` (#7824), `80d170ef` (#7990), `80c83724` (#7577 #6811 #6823), `a53e6d9f` (#8004) — **nine issues.** Three of them are RESIDUAL CLOSURES whose compiler halves landed in a `narrow` ancestor, so the review question is *does the new test genuinely pin the WHOLE issue*. |
+| `r38-w108-review18` (**NEW**) | REVIEWER | THREE commits — `6924b51f` (#7901), `617a9ef1` (#7874), `c4600284` (#7953) — **plus a POLL for the `r38-c99-closures` re-land.** |
+| `r38-p88-residual6` (**RESUMED**) | PRODUCER | TASK 1: the #7751 + #7944 re-land with the reviewer's exact rewording (§4 above). TASK 2: **#8014** (the temporal CONSTRUCTORS' argument positions carry no type opinion) — the same mechanism as `0b154fdc` — **then #7659 if time allows.** |
+| `r38-p85-residual5` (**RESUMED**) | PRODUCER | The Math Min/Max/Clamp-over-a-value-type family, round two: **#7947 #7938 #7519** (its #7874 and #7901 are DONE and in review). |
+| `r38-p95-boxing` (**RESUMED**) | PRODUCER | A built-in value type boxed to `Object`, and the materializer temps: **#7817 #7844 #7937 #7822 #7855** (its #7953 is DONE and in review). |
+
+**⇒ ⇒ ⇒ THE THREE RESUMED LANES ARE EXPLICITLY FORBIDDEN TO AMEND, REBASE OR REWRITE THE COMMITS
+THAT ARE UNDER REVIEW** — a rebase rewrites every SHA on the branch, including the one the reviewer
+is holding. **⇒ THAT IS NOT HYPOTHETICAL: `r38-w105-review15` caught the prior lane rewriting two
+commits TWICE while it was reviewing them (20:38 → 21:00 → 21:03), which made the reviewed SHAs
+stale.** ⇒ **⇒ ⇒ EVERY RESUMED LANE'S BRIEF SAYS SO IN ITS FIRST SECTION.**
+
+**⇒ ⇒ ⇒ THE HOT FILES ARE DISJOINT, AND THE MEASUREMENT IS ON THE BOX:** `r38-p85-residual5` owns
+`LlvmBackend_Calls{,2,3}.cpp` + `sema/SubstArgs.cpp`; `r38-p95-boxing` owns `LlvmBackend_Assign.cpp` /
+`Exprs2.cpp` / `Disposal.cpp` / `Layout.cpp`; `r38-p88-residual6` owns `common/BuiltinRegistry.cpp` +
+`sema/ExprTypecheck_{Calls,Exprs}.cpp` + `ExprTypecheck_impl.hpp` + the `scripts/` checker; the two
+reviewers own NO source file at all.
+
+### 7. THE MECHANICS MEASURED THIS TURN (all durable, all written down)
+
+* **⇒ ⇒ ⇒ `schedule_create`'s END FIELD IS `ends: { at: "<iso>" }`, NOT `endsAt`.** MEASURED:
+  `endsAt` was SILENTLY IGNORED and the new schedule was born with NO END. ⇒ the run's end had to be
+  re-attached by deleting the schedule and re-creating it — **⇒ AND THERE IS NO `schedule_update`, so
+  THE ONLY WAY TO CHANGE A PROMPT IS DELETE + CREATE.** ⇒ the current instance is
+  **`sch_1a0df553a001e742yLwXJrJm7b`**, `every 20 minutes` Pacific/Auckland, `ends.at =
+  2026-11-05T02:00:00.000+13:00`, prompt carrying `--pool 5`.
+* **⇒ TWO CONCURRENT `agent_check.sh` RUNS SHARE `shard_*.log` FILENAMES AND RACE** ⇒ a fake
+  "CUT SHORT". ⇒ every lane now sets a PRIVATE `BEZEL_AGENT_SCRATCH`.
+* **⇒ ⇒ ⇒ THE SHARED AOT CACHE CAN TURN A RED ROW GREEN** ⇒ every RED arm is re-measured with an
+  isolated `BEZEL_AOT_CACHE_DIR` / `BEZEL_AOT_SCRATCH_DIR` / `BEZEL_AOT_CACHE_SALT`.
+* **⇒ ⇒ ⇒ `639e8f69` ON THE STAGING BRANCH RECORDS FABRICATED FAIL-WITHOUT CLAIMS AND A VACUOUS
+  ASSERTION IN EXACTLY THIS AREA** ⇒ **⇒ ⇒ EVERY REVIEWER MUST RE-MEASURE THE RED ARM ITSELF AND
+  MUST NEVER ACCEPT THE COMMIT'S CLAIM.** ⇒ **⇒ ⇒ AND `check_vacuous_tests` FAILS A ROW THAT ASSERTS A
+  NEGATIVE IT CANNOT OBSERVE ⇒ ASSERT THE POSITIVE; WHERE A BODY CLAIMS A *LOCATED* ERROR, USE
+  `bezel::test::failedAtCompileTimeWithRealLocation` (`tests/support/aot_result_asserts.hpp`).**
+* **⇒ ⇒ ⇒ A CLOSURE THAT BREAKS ANOTHER ISSUE'S ROWS IS A BLOCKING FINDING** — measured: the
+  `narrow #4126` commit broke two #2922 Stopwatch rows; `r38-w103-review13` re-measured 18 passed /
+  0 failed and `stopwatch` 88/88 across five binaries before accepting it.
+* **⇒ ⇒ ⇒ §22.5: A `ref` / `out` / `scoped` ARGUMENT IS POSITIONAL-ONLY ⇒ `Math.DivRem`'s `out` SLOT
+  MUST STAY UNNAMED.**
+* **⇒ ⇒ ⇒ `check_internal_residual` IS RED IN THE RATCHET SWEEP ONLY BECAUSE OF A STALE
+  `build/bezelc` IN THE STAGING WORKTREE ⇒ THE FINAL GATE MUST REBUILD `bezelc` AND THE TEST
+  BINARIES ON THE TIP.**
+
+### 8. WHAT THE COORDINATOR WILL DO NEXT
+
+1. **PICK AS VERDICTS LAND** — `scripts/pick_stage.sh --branch r30-c1 --pool r38 --lane <branch>
+   --reviewer <rev> --verdict ACCEPT|ACCEPT-W-NOTES --kind fix <sha>`, each pick verified with
+   `scripts/pick_issues.sh --github` (EXACTLY the intended issues, and no second binding naming a
+   still-OPEN issue).
+2. **⇒ NEVER PICK A COMMIT WHOSE REVIEW SAYS REJECT, NOR ONE WITH A KNOWN BODY OR ORACLE DEFECT.**
+3. **⇒ REFILL THE POOL IN THE SAME TURN A SLOT FREES.** The pool target is **5**.
+4. **⇒ THE GATE IS ONE, NEAR THE END (2026-11-05 ~00:00–02:00 NZDT)**: on a quiet box rebuild
+   `build/bezelc` and the test binaries on the tip, `scripts/ratchet_sweep.sh` 25/25 GREEN,
+   `scripts/pregate.sh` prints READY, FREEZE THE TREE (no more picks), then
+   `setsid nohup scripts/gate_and_push.sh > LOG 2>&1 < /dev/null &` and
+   `scripts/wait_pid.sh "$BEZEL_GATE_PIDFILE"`. **⇒ ON FAIL: NARROW FIX-FORWARD ONLY — NEVER REVERT,
+   NEVER BISECT.**
+5. **⇒ THEN REFRESH master-plan §6 AND DELETE THE HEARTBEAT SCHEDULE.**
 
 ## Exit review
 

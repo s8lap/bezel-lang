@@ -1005,7 +1005,7 @@ heartbeat must never launch a gate and never push. Keep its interval coarse (ten
 minutes); a tight interval burns budget re-reading state that has not moved.
 
 ⚠ **BUT A HEARTBEAT THAT ONLY OBSERVES A STALLED POOL WATCHES THE STALL.** The heartbeat's
-standing rule was amended on 2026-11-03 (owner directive, *"REKINDLE THE POOL TO 7"*) and
+standing rule was amended on 2026-11-03 (owner directive, *"REKINDLE THE POOL"*) and
 is now: **the heartbeat STATUSES and then REKINDLES — a partial pool is a REFILL, not a
 report-and-stop.** Measured on the R38 run: the pool fell to 1 live lane of 7 and stayed
 there, because the old prompt said *"report it and stop"* — so the heartbeat reported the
@@ -1014,6 +1014,27 @@ sat **completely idle** (0 lane build processes, 0 heavy processes box-wide) wit
 seven slots empty. It also PICKs landed commits whose non-author review has recorded a
 verdict, so the banked count keeps rising between heartbeats. It still never launches a
 gate, never pushes, never edits the staging worktree.
+
+### ⚠ THE POOL TARGET IS **5**, NOT 7 — AND OVER-LAUNCHING THE POOL IS A REAL FAILURE MODE
+
+**Owner directive, 2026-11-03 ~23:05: *"reduce the pool to 5 agents. record this durably.
+now that you've been launching them effectively, we ran out temporarily. now it's good."***
+
+**⇒ MEASURED, THE SAME EVENING: the coordinator over-launched the R38 pool to SIXTEEN and then
+SEVENTEEN live lanes (each a separate `opencode run` process with its OWN build tree on the
+NVMe), the box ran out of build budget — `available=0 held=20`, dozens of builder processes,
+disk at 80% — and then **ALL FIFTEEN LANES DIED AT ONCE**, in the same window, each leaving a
+`live` claim in the ledger behind it.** ⇒ **THE POOL IS A *RESOURCE* BUDGET, NOT A PRODUCTIVITY
+SCORE: every lane in the pool is a compiler and a build tree, and the number that matters is
+how many can hold a token at once, not how many have a claim.**
+
+**⇒ ⇒ ⇒ THE STANDING TARGET FOR THIS RUN IS 5 LANES** (`CLAUDE.md`'s *Pools* bullet,
+`docs/ops/heartbeat.md`, the heartbeat's own prompt, and the campaign's coordinator block all
+carry 5). **⇒ ⇒ ⇒ AND THE LEDGER IS THE SAFETY NET THAT MADE THE RECOVERY POSSIBLE:** the
+claims file is append-only, so a lane that died leaves its `live` row behind and the next
+heartbeat can see exactly which lanes to restart, which deliveries to harvest, and which
+verdicts to pick — **⇒ A DEAD LANE COSTS A SLOT, NOT ITS WORK.**
+
 
 **The heartbeat's contract and the VERBATIM recipe that recreates the schedule (there is no
 `schedule_update` — a change means delete-then-create, back to back) live in

@@ -698,12 +698,17 @@ initializer never captures its owned scrutinee), #8032 (the `linq_refcount` row 
 **=> THE RUN'S END IS EXTENDED BY 24 HOURS (owner directive 2026-11-03): 2026-11-04 02:00 NZDT
 → 2026-11-05 02:00 NZDT. THIS IS A DURATION CHANGE, NOT A CADENCE CHANGE.** The gate cadence
 above is UNCHANGED: still **ONE** gate, near the end, carrying **100+** closures; the pool is
-still refilled to 7 every time the agent count goes down; the pool is still NOT drained to gate.
+still refilled every time the agent count goes down; the pool is still NOT drained to gate.
+**⇒ AND THE POOL TARGET IS NOW 5, NOT 7** (owner directive 2026-11-03 ~23:05: *"reduce the
+pool to 5 agents. record this durably"*) ⇒ **THE POOL WAS OVER-LAUNCHED TO 16–17 LANES, THE BOX
+RAN OUT OF BUILD BUDGET, AND ALL FIFTEEN LANES DIED IN ONE WINDOW ⇒ 5 IS THE STANDING TARGET
+FOR THE REST OF THIS RUN** ⇒ `CLAUDE.md`'s *Pools* bullet, `docs/ops/heartbeat.md`, the
+heartbeat's own prompt and the campaign's coordinator block all carry 5.
 **⇒ A LONGER RUN MEANS MORE HAUL BEFORE THAT ONE GATE — IT DOES NOT MEAN MORE GATES.**
 **⇒ THE EXTENSION IS THREE STEPS, OR IT IS NOT DURABLE: (a)** delete the heartbeat schedule and
 create the new one back to back (there is no `schedule_update`), same name, same cadence, same
 prompt **verbatim**, `ends.at` = the new end — **the R38 instance became
-`sch_19eff064a001uPPxyMG3Muoa2P`, `ends.at = 2026-11-05T02:00:00.000+13:00`**; **(b)** update the
+`sch_1a0df553a001e742yLwXJrJm7b`, `ends.at = 2026-11-05T02:00:00.000+13:00`**; **(b)** update the
 committed copy in `docs/ops/heartbeat.md`; **(c)** record the extension in this section and in the
 campaign's coordinator block. **⇒ A SCHEDULE-ONLY EXTENSION IS NOT DURABLE: the next session
 reads the FILES, not the scheduler.** **⇒ MEASURED: A HEARTBEAT SURVIVES A SESSION RESTART** —
