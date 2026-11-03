@@ -615,8 +615,16 @@ C("math_abs_decimal", 'Console.WriteLine(Math.Abs(-1.5m));', ("value", "1.5\n"))
 # #7061, and this cell pins it.
 C("math_abs_float", 'var f: float := Math.Abs(-1.5f);',
   ("reject", R(F_initializer("Math.Abs", "f"), F_convertible("Math.Abs"))), subject="Math.Abs")
+# #7577 (v0.350): this cell's EXPECTATION was STALE — it expected a REJECT that
+# §7.4's DECLARATION narrowing does not deliver.  §7.4 lists declaration
+# narrowing ("from a declaration whose initializer is such an expr"), and §22.6
+# says "a read of a binding §7.4 has narrowed non-null is of its non-nullable
+# type" — so `dn` (declared `decimal?`, initialized `1.5m`) is a `decimal` at
+# the call, and §5.1 admits it at `Math.Abs(decimal)`.  MEASURED at this tip:
+# the program COMPILES, RUNS and prints `1.5`, so a REJECT expectation made
+# the grid call a CORRECT compiler wrong.  The cell is a VALUE cell.
 C("math_abs_decimal_nullable", 'Console.WriteLine(Math.Abs(dn));',
-  ("reject", R(F_overload("Math.Abs"), F_nullable("Math.Abs"), F_convertible("Math.Abs"))),
+  ("value", "1.5\n"),
   pre="var dn: decimal? := 1.5m;", subject="Math.Abs")
 # RULING R2 (coordinator, 2026-10-28): the SAME ruling says `uint` converts to THREE of
 # the four declared parameter types — `long`, `double` AND `decimal` — and to NONE of them
@@ -629,8 +637,15 @@ C("math_round_decimal", 'Console.WriteLine(Math.Round(1.5m));',
   ("reject", R(F_overload("Math.Round"), F_convertible("Math.Round"))), subject="Math.Round")
 C("math_sqrt_uint", 'Console.WriteLine(Math.Sqrt(4000000000u));', ("value", "63245.553203367585\n"))
 C("math_floor_double", 'Console.WriteLine(Math.Floor(2.5));', ("value", "2\n"))
+# #7577 (v0.350): the `double` twin of `math_abs_decimal_nullable` — the SAME
+# STALE EXPECTATION, for §7.4's DECLARATION narrowing ("from a declaration
+# whose initializer is such an expr").  `dn` (declared `double?`, initialized
+# `2.5`) is a `double` at the call, so `Math.Floor(dn)` computes `2`.  MEASURED
+# at this tip: the program COMPILES, RUNS and prints `2`.  (The `null`-initializer
+# twin `math_floor_nullable_null` is NOT narrowed — §7.4 narrows only a non-null
+# initializer — so it stays a REJECT, and it is correct as it is.)
 C("math_floor_nullable", 'Console.WriteLine(Math.Floor(dn));',
-  ("reject", R(F_overload("Math.Floor"), F_nullable("Math.Floor"), F_convertible("Math.Floor"))),
+  ("value", "2\n"),
   pre="var dn: double? := 2.5;", subject="Math.Floor")
 # A narrowed `double?` is LEGAL (§7.4) and §5.1 widens it to `double`; the call
 # must therefore COMPILE AND RUN.  It cannot: the carrier reaches the Math arm.

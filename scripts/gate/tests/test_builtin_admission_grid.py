@@ -167,8 +167,8 @@ REJECT_CELLS = [
     'int_parse_radix_string', 'int_tostring_radix_null',
     'int_tostring_radix_null_named', 'int_tryparse_double',
     'int_tryparse_int', 'long_parse_intarg', 'long_parse_null',
-    'long_tostring_null', 'long_tryparse_null', 'math_abs_decimal_nullable',
-    'math_abs_float', 'math_abs_uint', 'math_floor_nullable', 'math_floor_nullable_null',
+    'long_tostring_null', 'long_tryparse_null',
+    'math_abs_float', 'math_abs_uint', 'math_floor_nullable_null',
     'math_max_mixed', 'math_max_reference', 'math_minmax_typed_result',
     'math_round_decimal', 'math_sign_bool', 'math_sign_reference', 'math_sign_string',
     'sb_append_null', 'sb_append_null_literal', 'sb_insert_two_strings', 'sb_insert_zero',
@@ -360,7 +360,12 @@ class BuiltinAdmissionGridTest(unittest.TestCase):
         lands on another wording of the same family RED — which is what kept
         the grid from being the campaign's DONE instrument."""
         reject = [c for c in g.CELLS if c[4][0] == 'reject']
-        self.assertEqual(len(reject), 63)
+        # 61 since #7577: `math_abs_decimal_nullable` and `math_floor_nullable`
+        # moved from REJECT to VALUE — §7.4's DECLARATION narrowing admits both
+        # calls, so the grid's expectation was stale (the grid called a CORRECT
+        # compiler wrong).  The COUNT is pinned here as well as the names, so a
+        # cell whose expectation KIND changes turns this suite RED.
+        self.assertEqual(len(reject), 61)
         for name, _e, _p, _b, expect, _i, _camp, subject, _lib, _m in reject:
             needles = _needles(expect)
             self.assertGreaterEqual(len(needles), 2, f'{name}: one guessed wording')
