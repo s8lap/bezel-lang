@@ -8867,6 +8867,45 @@ void Emitter::registerFreshBuiltinNewReceiverTempK8(const ast::Expr* recvExpr,
 // does not determine the runtime backing there — the same exclusion
 // `emitOwnedCaptureCollectionRelease` records (a user class behind
 // `bz_array_free` would be a WILD FREE, not a leak).
+//
+// fix #8028 (v0.350) — `OwningBuffer<T>` JOINS the §28.3 K8.1 chain-root
+// family, and this helper is the ONE home of that head set.
+//
+// WHAT `OwningBuffer<T>` IS (stdlib §4.14). It is NOT one of §28.11's seven
+// element-owning collections — it is the family's "runtime-sized storage
+// primitive", the class the resizable owning collections compose over. §4.14
+// states its shape in its own words: "a class with fixed-at-construction
+// storage of N slots"; for class-typed T "slots hold `T?` (nullable
+// references) and the buffer owns each non-null slot's referent … The
+// buffer's destructor disposes every non-null slot in implementation-defined
+// order"; for value-typed T "slots hold `T` directly … the buffer's
+// destructor releases its backing storage but performs no per-slot disposal";
+// and "In both cases the buffer is `IDisposable`". Its runtime storage is a
+// `bz_array_t*` (allocated by `bz_array_alloc_count_n` — the new-OwningBuffer
+// arm in LlvmBackend_Exprs2.cpp), so the RELEASE it owes is the same array
+// free plus the §28.11 element cascade `buildCollectionTempDisposal` derives
+// from the ELEMENT type — the same helper the six §28.11 heads use, and the
+// same helper the `using var` path already routes an `OwningBuffer<T>` through.
+//
+// ⇒ THE NULLABLE-SLOT QUESTION, ANSWERED. §4.14's class-typed slots are
+// `T?`, so the cascade runs over a nullable slot layout the `OwningArray`
+// cascade was never reasoned about — the #8009 report declined to reuse
+// `buildCollectionTempDisposal` for that reason, and the doubt was fair. It is
+// ANSWERED by the runtime, not by a re-derivation: `bz_array_free`'s element
+// loop is `void* elem_ptr = ((void**)arr->data)[i]; if (elem_ptr)
+// dispose_elem(elem_ptr);` — a NULL slot is SKIPPED, so the cascade disposes
+// exactly the non-null referents §4.14 names, and the value-typed tier (whose
+// element policy is the Value row, a NULL disposer) falls through to the
+// backing-only release §4.14 states.
+//
+// ⇒ AND THE HEAD SET IS HERE, NOT SPELLED TWICE. `LlvmBackend_Exprs.cpp` asks
+// the same question through the PREDICATE (with no recorded result type), so
+// this helper's answer reaches both files without a second spelling.
+//
+// per §28.3 K8.1 / §28.11 / stdlib §4.14, v0.350
+static bool k8OwningChainRootHead(std::string_view head) {
+    return common::isOwningCollectionHead(head) || head == "OwningBuffer";
+}
 bool Emitter::freshOwnedVtablelessBuiltinReceiverEligible(
         const ast::Expr* recvExpr, const sema::TypeRef* resultTy) const {
     if (!recvExpr) return false;
@@ -8883,7 +8922,10 @@ bool Emitter::freshOwnedVtablelessBuiltinReceiverEligible(
     // fix #8009 (v0.350): the OWNING COLLECTION family — admitted by its
     // CONCRETE head, with a release that is the collection's OWN arm (the
     // comment above). Every other name still needs the name-keyed table.
-    const bool owningCollection = common::isOwningCollectionHead(bn);
+    // fix #8028 (v0.350): `OwningBuffer<T>` (stdlib §4.14) joins the family —
+    // see `k8OwningChainRootHead` above for its shape and for the answer to
+    // the nullable-slot question.
+    const bool owningCollection = k8OwningChainRootHead(bn);
     if (!owningCollection) {
         if (!vtablelessBuiltinReleaseIsKnown(bn)) return false;
         // fix #7906 (v0.350): `StringBuilder` is EXCLUDED BY NAME — #7733's path
@@ -8947,6 +8989,34 @@ bool Emitter::freshOwnedVtablelessBuiltinReceiverEligible(
     // built-in the pre-#7906 reading is kept (`!resultTy` ⇒ not eligible),
     // so #7906's population is unchanged by this fix and a missing type
     // keeps the pre-fix leak — the sound direction.
+    //
+    // fix #8028 (v0.350) — THE `!resultTy` READING IS ALSO THE TWO FACTS A
+    // CALLER CAN STATE WITHOUT A NAME-KEYED TABLE, and both are asked for at
+    // this ONE site, so the head set stays in ONE home
+    // (`k8OwningChainRootHead`, above):
+    //
+    //   * "IS THIS RECEIVER AN OWNING-FAMILY CHAIN ROOT?" — the property-read
+    //     face (`Mk().Count`, `Mk().Length`) claims the receiver for the
+    //     OWNING family ONLY, and asks that question HERE rather than by
+    //     spelling the head set a second time in `LlvmBackend_Exprs.cpp`.
+    //     `!resultTy` answers it exactly: `owningCollection` is true for the
+    //     owning family and false for every other built-in (the name-keyed
+    //     vtable-less builtins fall through to the `vtablelessBuiltinRelease-
+    //     IsKnown` gate above and are refused by it, since this reading
+    //     returns `owningCollection`, not `true`).
+    //
+    //   * "DOES THE RESULT ALIAS THE RECEIVER?" — the TRANSFER-member face
+    //     (`Mk().Pop()`, `Mk().Dequeue()`, …) has a result that is a FRESH
+    //     owned value the call REMOVED from the collection (stdlib §4.5 /
+    //     §4.7 / §4.9 / §4.10 / §4.11 declare it `owned T` — "transfers out"),
+    //     so it provably does NOT alias the receiver, and the gate's question
+    //     is answered in the affirmative for the receiver's disposal. That is
+    //     the same fact the "missing result type ⇒ unit" reading states, so
+    //     it is stated the same way.
+    //
+    // ⇒ NEITHER READING WIDENS THE FAMILY: both are `owningCollection`-gated,
+    // so the borrowing collection family, the interface heads, and the
+    // name-keyed vtable-less builtins are all untouched.
     if (!resultTy) return owningCollection;
     return freshReceiverResultIsValueLike(resultTy, /*calleeReturnsOwned=*/false);
 }
@@ -8983,7 +9053,11 @@ void Emitter::registerFreshOwnedVtablelessBuiltinReceiverTempK8(
     // `emitOwnedCaptureCollectionRelease`, and the `case`-scrutinee side
     // `freeUnboundOwnedOwningCollectionTemp` already use) carries the release:
     // the runtime free plus the §28.11 element/value disposer.
-    const bool owningCollection = common::isOwningCollectionHead(bn);
+    // fix #8028 (v0.350): `OwningBuffer<T>` (stdlib §4.14) joins it — the SAME
+    // helper routes it today (its `using var` disposal already goes through
+    // `buildCollectionTempDisposal`), so the release is the one the type
+    // already has; see `k8OwningChainRootHead` above.
+    const bool owningCollection = k8OwningChainRootHead(bn);
     if (!owningCollection) {
         if (!vtablelessBuiltinReleaseIsKnown(bn)) return;
         // The SAME `StringBuilder` separation as the predicate's, repeated at the

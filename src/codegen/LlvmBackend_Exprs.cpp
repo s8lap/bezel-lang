@@ -279,6 +279,54 @@ static sema::TypeRef* genericParamSoundAtI32ForPlaceholder(
     return ctx.primitiveTypeRef(sema::PrimitiveType::Int);
 }
 
+// fix #8028 / §28.3 *Unbound owned temporaries* / K8.1 (v0.350): the
+// TRANSFER members — the owning family's members whose DECLARED RETURN is
+// `owned T` ("transfers out"). Their result is a FRESH owned value that the
+// call REMOVED from the collection, so it does NOT alias the receiver, and the
+// receiver is the CALLER's to dispose at the K8.1 boundary.
+//
+// ⇒ THE SIX NAMES, each with its DECLARED RETURN (stdlib §4.5 / §4.7 / §4.9 /
+// §4.10 / §4.11). The grouping is by the DECLARED RETURN, not by how the
+// member reads:
+//
+//   Pop()        OwningStack<T>                    -> owned T   ("raises if
+//                                                        empty; transfers out")
+//   Dequeue()    OwningQueue<T>                    -> owned T
+//   PopAt(i)     OwningArray<T>                    -> owned T   ("removes and
+//                                                        returns owned")
+//   PopFirst()   OwningArray<T>, OwningLinkedList<T> -> owned T
+//   PopLast()    OwningArray<T>, OwningLinkedList<T> -> owned T
+//   PopValue(k)  OwningDictionary<K, V>            -> owned V
+//   Pop(q)       OwningSet<T>                      -> owned T
+//
+// ⇒ THE BORROWING FORMS OF THE SAME NAMES ARE NOT HERE: `Stack<T>.Pop(): T`,
+// `Queue<T>.Dequeue(): T` and `LinkedList<T>`'s positional egress declare a
+// BORROW of the element the collection still owns, so their receiver must
+// SURVIVE the result. They cannot be reached anyway: the claim is gated on
+// the receiver being an OWNING-family chain root (`k8OwningChainRootHead` in
+// LlvmBackend_Disposal.cpp, read through the predicate), and the borrowing
+// family is not in it.
+//
+// ⇒ AND THE `Try*` TRANSFER FORMS NEED NOTHING: `TryPop(out owned item: T?)`,
+// `TryDequeue`, `TryPopFirst`, `TryPopLast`, `TryPopValue` all declare `bool`,
+// which is already a value-like result, so #8009's result gate admitted their
+// receivers already.
+//
+// ⇒ AND THE LOWERING IS THE PROOF, NOT THE NAME: `Pop`/`Dequeue` lower to
+// `bz_array_get` + `bz_array_remove_at` (LlvmBackend_Calls.cpp), `PopAt` /
+// `PopFirst` / `PopLast` to `bz_array_pop_at` ("copy element at idx into *out,
+// then remove the slot WITHOUT disposal — ownership transfers to the caller"),
+// `OwningSet<T>.Pop` to `bz_array_remove_at`, and `PopValue` to
+// `bz_dict_pop_value_*` ("get-then-remove without disposal"). Every one of
+// them REMOVES the element from the collection BEFORE the result is returned —
+// so disposing the collection afterwards cannot touch the transferred value.
+//
+// per §28.3 K8.1 / stdlib §4.5 / §4.7 / §4.9 / §4.10 / §4.11, v0.350
+static bool k8TransferMemberName(std::string_view member) {
+    return member == "Pop" || member == "Dequeue" || member == "PopAt" ||
+           member == "PopFirst" || member == "PopLast" || member == "PopValue";
+}
+
 // fix #2733 / §28.3 *Unbound owned temporaries* (v0.240): the K8 full-expression
 // boundary hook. `lowerExprInner` (below) is the real lowering; this wrapper
 // tracks nesting depth so that the OUTERMOST lowerExpr call — which is exactly a
@@ -346,9 +394,30 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             // covers a built-in member with no user MethodDecl.
             const bool isExplicitDispose =
                 ma->member == "Dispose" || ma->member == "DisposeAsync";
+            // fix #8028 / §28.3 K8.1 (v0.350): the TRANSFER-member face.
+            //
+            // A member whose DECLARED RETURN is `owned T` (stdlib §4.5 / §4.7 /
+            // §4.9 / §4.10 / §4.11 — "transfers out") hands back a FRESH owned
+            // value that the call REMOVED from the collection, so the result
+            // does NOT alias the receiver: the receiver is the caller's to
+            // dispose at the K8.1 boundary, and disposing it cannot touch the
+            // transferred value. The shared result gate refuses it — a class-
+            // typed result is a BORROW unless the callee is declared `owned`,
+            // and a built-in collection member carries no such declaration —
+            // so the claim is made here, where the member's NAME is known.
+            //
+            // ⇒ THE RECEIVER'S HEAD IS STILL GATED: the predicate is asked
+            // with NO recorded result type, which answers "is this receiver an
+            // OWNING-family chain root?" (and the producer test with it) — so
+            // the borrowing family, whose `Pop`/`Dequeue` return a BORROW, is
+            // not reachable here, and the six names are read only against an
+            // owning-family receiver.
+            const bool transferMember = k8TransferMemberName(ma->member);
             if (recv && !isExplicitDispose &&
-                freshOwnedVtablelessBuiltinReceiverEligible(
-                    recv, ctx_.exprType(*call))) {
+                (freshOwnedVtablelessBuiltinReceiverEligible(
+                     recv, ctx_.exprType(*call)) ||
+                 (transferMember && freshOwnedVtablelessBuiltinReceiverEligible(
+                                       recv, /*resultTy=*/nullptr)))) {
                 freshVtablelessBuiltinRoots_.insert(recv);
                 claimedVtablelessBuiltinRecv = recv;
             }
@@ -375,21 +444,24 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // population is the CALL face, and no builtin of that family has a
         // property whose value cannot alias its receiver.
         //
-        // The head test is `common::isOwningCollectionHead` — the ONE registry
-        // that names the six element-owning collection classes (the same
-        // registry the release predicate consults), so no name list is spelled
-        // a second time.
+        // The head test is READ FROM THE ONE AUTHORITY — the PREDICATE, asked
+        // with NO recorded result type. That reading answers exactly the
+        // question this face asks ("is this receiver an OWNING-family chain
+        // root?" — and the producer test with it): `owningCollection` is true
+        // for the owning family and false for every other built-in. fix #8028
+        // (v0.350) widened that family to include `OwningBuffer<T>`
+        // (stdlib §4.14), and asking the predicate is what keeps the head set
+        // in ONE home (`k8OwningChainRootHead`, LlvmBackend_Disposal.cpp)
+        // instead of spelling it a second time here.
         const ast::Expr* recv = ma->target.get();
         if (recv) {
-            const sema::TypeRef* rt = ctx_.exprType(*recv);
             // A PROPERTY always carries a type, so the result gate below reads
             // a real TypeRef (never the "no type recorded" case the CALL face
             // admits for a unit-returning call) — and a property whose value
             // could alias the receiver is declined by it.
-            if (rt && rt->kind == sema::TypeRef::Kind::Named &&
-                !rt->declaration && !rt->nullable &&
-                common::isOwningCollectionHead(builtinTypeName(rt)) &&
-                ctx_.exprType(*ma) &&
+            if (ctx_.exprType(*ma) &&
+                freshOwnedVtablelessBuiltinReceiverEligible(
+                    recv, /*resultTy=*/nullptr) &&
                 freshOwnedVtablelessBuiltinReceiverEligible(
                     recv, ctx_.exprType(*ma))) {
                 freshVtablelessBuiltinRoots_.insert(recv);
