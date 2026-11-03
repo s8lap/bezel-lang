@@ -1061,6 +1061,32 @@ seven slots empty. It also PICKs landed commits whose non-author review has reco
 verdict, so the banked count keeps rising between heartbeats. It still never launches a
 gate, never pushes, never edits the staging worktree.
 
+### ⚠ "DRAIN THE POOL" MEANS **LET IT FINISH** — NOT KILL IT
+
+**Owner correction, 2026-11-04 01:06.** The phrase was read as "stop the agents", and the
+coordinator **TERMed all five running lane agents** — mid-measurement, mid-build, with
+uncommitted work in flight in four worktrees. The owner: *"drain the pool means let the pool
+finish, and not dispatch more work, not kill them."*
+
+⇒ **⇒ ⇒ ⇒ ⇒ "DRAIN THE POOL" = (a) STOP DISPATCHING NEW WORK, (b) LET THE RUNNING LANES
+FINISH AND DELIVER THEIR COMMITS, (c) HARVEST THEM, and only then (d) go quiet for the gate.**
+
+⇒ **⇒ ⇒ ⇒ ⇒ ⇒ A DRAINED POOL IS STILL A BUSY BOX.** A lane winding down is still compiling,
+still running its test shards, still holding jobserver tokens. **⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE GATE'S ZERO-
+BUILDERS PRECONDITION IS *NOT* SATISFIED BY A DRAINED POOL** — the lanes must finish, and their
+builds must actually stop, before `scripts/no_builders.sh` reads clean.
+
+⇒ **⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE LANE PROCESSES ARE NOT TO BE KILLED TO MAKE THE GATE HAPPEN.** A lane
+killed mid-turn loses its *turn*, not its *work* — the uncommitted changes stay on disk in its
+worktree and the session keeps its history, so `scripts/lane_dispatch.sh --resume <session-id>`
+picks it up exactly where it stopped. **⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE RESUME IS CHEAP AND THE WORK IS NOT
+LOST.** Killing is the LAST resort, and it is never needed to satisfy the gate: the gate wants
+the lanes to STOP, and a finished lane stops by itself.
+
+⇒ **⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE GATE STILL NEEDS QUIET — BUT THE QUIET COMES FROM THE LANES FINISHING, NOT
+FROM THE COORDINATOR KILLING THEM.** ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ **AND THE MEASUREMENT IS THE EVIDENCE:
+`scripts/no_builders.sh` AND `ps -eo args | grep -c "[o]pencode run"`, not an assumption.**
+
 ### ⚠ THE POOL TARGET IS **5**, NOT 7 — AND OVER-LAUNCHING THE POOL IS A REAL FAILURE MODE
 
 **Owner directive, 2026-11-03 ~23:05: *"reduce the pool to 5 agents. record this durably.

@@ -3401,6 +3401,63 @@ ANNOTATION GOVERNS, THE FIX-FORWARD RAISES `low > high: ArgumentException` IN **
    REVERT, NEVER BISECT.**
 5. **⇒ THEN REFRESH master-plan §6 AND DELETE THE HEARTBEAT SCHEDULE.**
 
+### 9. "DRAIN THE POOL" MEANS **LET IT FINISH** - NOT KILL IT
+
+**Owner correction, 2026-11-04 01:06.** The coordinator read "drain the agent pool" as "stop the
+agents" and **TERMed all five running lane agents** - mid-measurement, mid-build, with uncommitted
+work in flight in four worktrees. The owner: *"drain the pool means let the pool finish, and not
+dispatch more work, not kill them. it's ok, something to remember for the future."*
+
+=> **=> => => => "DRAIN THE POOL" = (a) STOP DISPATCHING NEW WORK, (b) LET THE RUNNING LANES FINISH
+AND DELIVER THEIR COMMITS, (c) HARVEST THEM, and only then (d) go quiet for the gate.**
+
+=> **=> => => => => A DRAINED POOL IS STILL A BUSY BOX.** A lane winding down still compiles, still
+runs its test shards, still holds jobserver tokens. **=> => => => => => => THE GATE'S ZERO-BUILDERS
+PRECONDITION IS *NOT* SATISFIED BY A DRAINED POOL** - the lanes must actually finish.
+
+=> **=> => => => => AND THE LANE PROCESSES ARE NOT TO BE KILLED TO MAKE THE GATE HAPPEN.** A lane
+killed mid-turn loses its *turn*, not its *work*: the uncommitted changes stay on disk in its
+worktree and the session keeps its history, so `scripts/lane_dispatch.sh --resume <session-id>`
+picks it up exactly where it stopped. **=> => => => => => => THE RESUME IS CHEAP AND THE WORK IS NOT
+LOST.**
+
+=> **=> => => => => THE RULE IS NOW DURABLE** in `docs/ops/coordinator-runbook.md` (*"DRAIN THE POOL"
+MEANS **LET IT FINISH** - NOT KILL IT*) and in `CLAUDE.md`'s Pools bullet.
+
+### 10. THE `pool` ROW COUNTS THE **LEDGER**, NOT THE **PROCESS TABLE** - AND THE LEDGER LIES IF IT IS NOT CLOSED
+
+=> **=> => => => AT 01:12, WITH **ZERO** AGENTS AND **ZERO** BUILDERS ON THE BOX, THE STATUS TABLE
+STILL READ `pool OK 5 live lane(s) of 5`.** The five lanes had been stopped; the server reported
+`0 live agent session(s) per opencode`; but the **claims ledger still held their `live:` rows**,
+and the `pool` row counts DISTINCT LANES HOLDING A LIVE CLAIM IN THE CLAIMS FILE.
+
+=> **=> => => => => => => A DEAD LANE'S CLAIM MUST BE CLOSED WITH A `done:` ROW** (status LAST,
+carrying the lane's ORIGINAL issue key - one row per distinct (lane, issue-key) pair, because the
+reconciler is LAST-WINS PER (LANE, ISSUE)). => **=> => => => => => => ONLY THEN DOES
+`scripts/pool_lanes.sh` REPORT `the ledger and opencode AGREE`**, and only then does the `pool` row
+read what is true.
+
+=> **=> => => => => => => THE `done:` ROW IS ALSO THE HARVEST RECORD.** Each of the five carries
+exactly where the abandoned work is:
+
+| lane | what the abandoned work is |
+|---|---|
+| `r38-p100-strings` | **UNCOMMITTED** - 318 insertions across `LlvmBackend_{String,Exprs,Setup}.cpp` + `LlvmBackend_impl.hpp`, plus **THREE** new test files (`inline_array_string_element_leak_7804_test.cpp`, `sb_append_function_value_7592_test.cpp`, `string_repeat_unit_borrow_7741_test.cpp`) - on disk in `/mnt/fast/worktrees/r38-p100-strings` |
+| `r38-p96-ownership` | **UNCOMMITTED** - 88 insertions in `Ownership_Checks.cpp` + `Ownership_impl.hpp`, plus `tests/ownership/case_expr_owned_scrutinee_capture_8031_test.cpp` - on disk in `/mnt/fast/worktrees/r38-p96-ownership`; `491da5c7` (#7453) is already PICKED |
+| `r38-w110-review20` | **THE REVIEW IS INCOMPLETE** - no `REVIEW.md`; `89e3a353` (#7817 #7844) and `a65f13e8` (#4841) are still **UNREVIEWED** |
+| `r38-p101-async` | analysis only - nothing on disk, no commits |
+| `r38-p102-namedargs` | analysis only - nothing on disk, no commits |
+
+=> **=> => => => => => => => A KILLED LANE COSTS A SLOT, NOT ITS WORK** - but the work must be
+RESUMED, not merely re-derived, and the ledger row is what tells the next heartbeat where it is.
+
+### 11. THE GATE IS LAUNCHED
+
+The gate's own preconditions were met in order, and **the STALE BUILD WAS THE TRAP THE PROTOCOL
+WARNS ABOUT**: `build/bezelc` was from **2026-11-03 14:38** and the test binaries from **12:01**,
+while `src/` files were from **2026-11-04 00:27** => the staging tree's binaries were a MIXED-HEAD
+tree. `build/bezelc` was rebuilt on the tip (7 s, ccache-warm) and the test binaries with it.
+
 ## Exit review
 
 *(to be written by the campaign's exit reviewer — not this lane)*
