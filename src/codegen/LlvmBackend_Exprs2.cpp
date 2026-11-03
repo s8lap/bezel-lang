@@ -13385,11 +13385,55 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             scrutOwnIsOwningCollection = common::isOwningCollectionHead(
                 scrutTy->headName());
             Disposal d{scrutOwnedSlot, nullptr};
-            d.unwindOnly = true;   // arm-body throw disposes the temp
-            if (!scrutOwnIsOwningCollection)
-                d.dynamicDispose = true;
-            else
-                d.collection = true;
+            // fix #8029 (§28.3 / §28.11 / §8.1): the EXCEPTION-edge disposal of
+            // this temporary is chosen by the VALUE'S KIND, and the two kinds
+            // are NOT interchangeable.
+            //
+            //   * A CLASS INSTANCE has a Bezel vtable, and `unwindOnly` — the
+            //     flag that reaches `emitDisposals`' unwind-only arm — IS that
+            //     vtable dispatch: the right disposal for it (§28.4: "runtime
+            //     dispatch resolves disposal to the underlying class's
+            //     `Dispose()`").
+            //   * A BUILT-IN COLLECTION HAS NO VTABLE, so `unwindOnly` on it is
+            //     a WILD JUMP. `emitDisposals`' unwind-only arm ends at
+            //     `emitDisposeAndReclaim`, which reads word 0 as a vtable and
+            //     calls slot 2 — but `bz_dict_t`'s word 0 is its `buckets`
+            //     pointer and `bz_llist_t`'s is its `head`, so the "vtable" is
+            //     a heap pointer and the call target is whatever `*(ptr + 16)`
+            //     happens to hold. MEASURED on the pre-fix compiler (parent
+            //     6f956384): `case Mk() of _ => throw … end case;` over an
+            //     `owned OwningDictionary<string, Cell>` / `owned
+            //     OwningLinkedList<Cell>` scrutinee →
+            //     "AddressSanitizer: SEGV on unknown address 0x000000000000
+            //     (pc 0x000000000000)" — a jump to the null page.
+            //
+            // ⇒ THE COLLECTION ARM THEREFORE TAKES THE COLLECTION'S OWN
+            // RELEASE — the runtime free (`bz_array_free` / `bz_dict_free` /
+            // `bz_llist_free`) plus the §28.11 element/value disposer — the
+            // SAME shape the `owned` collection PARAMETER path registers
+            // (`registerUnwindOwnedParam`, LlvmBackend_Setup.cpp:25575).
+            // `buildCollectionTempDisposal` is the ONE (slot, TypeRef) →
+            // Disposal classifier, so the kind AND the disposer come from the
+            // TYPE and cannot drift from the normal-edge reclaim
+            // (`freeUnboundOwnedOwningCollectionTemp`, the same TypeRef, the
+            // same free, the same disposer). `releaseOnUnwindOnly` is the flag
+            // the collection / dict / linked-list arms of `emitDisposals`
+            // honour: SKIPPED on the normal edge (the construct's own reclaim)
+            // and FIRED on the exception edge (§28.3's "Exception-path
+            // discharge").
+            //
+            // ⇒ SO A COLLECTION-KIND ENTRY NEVER CARRIES THE VTABLE-DISPATCH
+            // FLAG: the wrong flag is not merely discouraged at this call
+            // site, it is not selectable here at all — `unwindOnly` is set
+            // ONLY on the class-instance arm, and the collection arm's flag
+            // is the type-specific release flag.
+            if (!scrutOwnIsOwningCollection) {
+                d.unwindOnly = true;      // arm-body throw disposes the temp
+                d.dynamicDispose = true;  // class instance via vtable Dispose
+            } else {
+                d = buildCollectionTempDisposal(scrutOwnedSlot, scrutTy);
+                d.releaseOnUnwindOnly = true;
+            }
             if (!disposeStack_.empty())
                 disposeStack_.back().push_back(d);
         }
