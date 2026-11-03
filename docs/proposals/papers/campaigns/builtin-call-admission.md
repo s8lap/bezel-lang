@@ -3458,6 +3458,115 @@ WARNS ABOUT**: `build/bezelc` was from **2026-11-03 14:38** and the test binarie
 while `src/` files were from **2026-11-04 00:27** => the staging tree's binaries were a MIXED-HEAD
 tree. `build/bezelc` was rebuilt on the tip (7 s, ccache-warm) and the test binaries with it.
 
+## Coordinator block — 2026-11-04 02:25 → 04:12 (THE HAUL **LANDS**: 122 CLOSURES IN **ONE** PUSH, AFTER A **FAILED** FIRST GATE AND A **NARROW** FIX-FORWARD CYCLE)
+
+### 1. THE OUTCOME
+
+`origin/main` moved `02b662bd` -> **`93e54502`** — **145 commits**, one push, and
+**122 GitHub-closable issues CLOSED** (the floor was 100). MEASURED, not asserted: the 122
+issue numbers were extracted from the pushed range with `scripts/pick_issues.sh`'s own
+keyword rule and then queried against GitHub in ONE GraphQL call — **122 CLOSED, 0 open,
+0 missing**.
+
+The **second** gate's own tally, on the pushed tip:
+
+```
+plain  : 40377 passed, 0 failed  (96 shards, 168s)
+ASan   : 40377 passed, 0 failed  (48 shards, 517s)
+[gate_full_cycle 04:12:46] cycle COMPLETE: both oracles trustworthy-green + conformance green
+== gate_and_push: GATE PASS -> pushing ==
+   02b662bd..93e54502  93e54502d949f89aae1bc83823354c1a8d9c5011 -> main
+== gate_and_push: PUSHED origin/main now 93e54502 ==
+```
+
+### 2. ⇒ ⇒ ⇒ ⇒ ⇒ THE FIRST GATE **FAILED**, ON **FIVE ROWS** — AND EVERY ONE OF THEM WAS **MEASURED**, NOT GUESSED
+
+The first gate (tip `e3af9597`) exited **rc=1**: **`40372 passed, 5 failed`**. The five rows
+were **not** a broken haul — they were **five self-inflicted wounds**, and each was traced to
+the specific pick that caused it:
+
+| # | the failing row | the ROOT CAUSE, measured |
+|---|---|---|
+| 1,2 | `codegen_arg_box_release_call_keyed_7998` (2 rows) | our pick `#8008` (`e4355ef9`) made a type parameter named `Object` shadow the root (§8.1/§2.7) ⇒ **the §8.6 argument box was never minted** ⇒ `Helper<Object>(5)` was refused by §5.1 and the other **three** rows went **VACUOUS** |
+| 3 | `builtin_required_column_8023` | the row asserted the **PRE-FIX hole**. #8034's own message says *"DISCLOSED GAP, NOT FIXED HERE"* — the refusal came from **`#8036`'s arity gate** in `8aaaebb5`, not from #8034 |
+| 4 | `fixed_tmp_data_path_5230` | six hardcoded `/tmp/` paths in **our** new test files |
+| 5 | `internal_degrade_disposition_snapshot_2924` | our pick `#8000` (`188373a0`) added an `internal:` Warning degrade with **no recorded disposition** |
+
+⇒ **THE FIRST GATE'S FAILURE WAS A MEASUREMENT OF THE HAUL, NOT A REFUTAL OF IT.** A
+**full 96-shard baseline suite on the untouched tip** confirmed the tally independently:
+`40372 passed, 5 failed` — the same five rows, nothing else. And the **fix** is what the
+pushed tree measures: the same 40377 tests, now **40377 passed, 0 failed**.
+
+### 3. ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE FIX-FORWARD CYCLE: **FIVE** ISSUES, **ONE** COMMIT EACH, **FIVE** INDEPENDENT NON-AUTHOR REVIEWS
+
+The runbook's rule on a gate FAIL is explicit — *"On FAIL: **never revert, never bisect** —
+narrow fix-forward only"* — so the cycle pushed the **whole haul in ONE push**, which is what
+the one-gate directive intends. Each fix got its **own issue**, its **own commit**, and its
+**own review**:
+
+| issue | the fix | review |
+|---|---|---|
+| `#8052` | the `#7998` test's programs name the ROOT `Object` (`System.Object`), so the §8.6 box is minted again | ACCEPT-W-NOTES -> **ACCEPT** after the transcript was corrected |
+| `#8053` | the `#8034` row asserts the `#8036` arity gate's refusal, not the absence of an error | **REJECT -> corrected -> ACCEPT-W-NOTES** |
+| `#8054` | six `5230-allow` markers, each with its reason | **ACCEPT** |
+| `#8055` | `#8000`'s degrade gets its recorded disposition — **and** the family ratchet's count moves with it | **REJECT -> corrected -> ACCEPT-W-NOTES** |
+| `#8056` | a §-citation slip in **our own** code (§22.3 -> §22.5) | ACCEPT-W-NOTES -> **ACCEPT** |
+
+⇒ **TWO OF THE FIVE WERE REJECTED FIRST, AND BOTH REJECTIONS WERE RIGHT.**
+
+* **`#8053`**: the commit message claimed the parent's diagnostic said *"at 2 argument(s)"*.
+  **IT DOES NOT.** `builtinFormMinArity` returns the form's `total` when the last name slot is
+  empty (the `out` slot), so the arity reads **3** both before and after `#8034` — the
+  compiler's own comment says so. The claim was **inferred, not measured**, and the reviewer
+  caught it. The corrected record names `#8036` as what closed the gap `#8034` had explicitly
+  **DISCLOSED**, and the fail-without was **re-measured by building the test binary at the
+  base `48353f2b`** — both assertions red there.
+* **`#8055`**: the commit grew the snapshot array to **27** rows but left the **family
+  ratchet's** `kSnapshotTagCount = 26` behind ⇒ the sibling row went RED:
+  *"snapshot test file reports 27 Warning-degrade entries; this ratchet pins 26."* That is a
+  **sixth would-be gate failure** — and **neither the coordinator nor the first reviewer saw
+  it**, because both had run the SINGLE filter instead of the whole area. The reviewer also
+  found that the entry's recorded REASON was imprecise for the `as` spelling of the same bail
+  (it substitutes a null into a **nullable** slot, not a boolean); the disposition
+  `WrongValue` stands, and the reason now says why.
+
+⇒ ⇒ ⇒ ⇒ ⇒ **THE LESSON IS DURAL AND IT IS NOW THE RULE: RUN THE WHOLE *AREA*, NOT THE
+FILTER YOU CHANGED.** A filter is a red-to-green probe; an AREA is a gate. The second gate's
+`support` area is **235 passed, 0 failed** — and it was **236th** that would have been red.
+
+### 4. ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE THREE ISSUES THAT ARE **PARTIAL** ARE **COMMENTED, NOT CLOSED**
+
+`scripts/check_issue_refs.sh` flagged three still-open issues whose subject verb claims a fix.
+**NONE of them is fully closed**, so none was closed by hand:
+
+* **`#2924`** — the per-site DISPOSITION RECORD this issue asked for **LANDED** (and the
+  `#8000` commit IS its mutation proof: inject a site, the ratchet goes red naming it). But the
+  issue's SECONDARY finding is not done: the `#2491` diagnostic is still **four hand-written
+  copies**, and the suggested helper `reportDegradedReturn(span)` **does not exist in `src/`**
+  — MEASURED. The snapshot test's own header tracks it as *"still open under #2924"*.
+* **`#8000`** — part (c) landed (the bail now REPORTS) and `bz_cts_desc` is mapped, but the
+  seven vtable-less built-in classes still have no runtime word-0 descriptor, so their `is`
+  test is still **dropped** — reported now, but the block still does not run.
+* **`#8005`** — one slice landed (94 -> **46** rows, 108 -> **35** positions still without a
+  type opinion), so neither §5.1 nor §7 fires at the rest.
+
+⇒ **CLOSING ONE LOSES THE SURVIVING HALF SILENTLY** — so each carries a comment that states
+what landed, what remains, and the measurement of each.
+
+### 5. THE ISSUES THAT REMAIN OPEN, DELIBERATELY
+
+`#8057` (the loose quotation gloss, filed out of `#8056`'s scope), `#8050` (a **spec-question**,
+not a defect — stdlib §2.2's `low > high` annotation against its prose), `#8051` (a
+primitive-receiver fix with no owner in the registry's parameter table).
+
+### 6. THE NEXT CYCLE (THE HARVEST)
+
+Four reviewed-but-unpicked commits wait: `086de277` (`#8031`) and `4583583b` (`#7856`) in
+`/mnt/fast/worktrees/r38-p96-ownership`; `89e3a353` (`#7817 #7844`) and `a65f13e8` (`#4841`) in
+`/mnt/fast/worktrees/r38-p95-boxing` — and `r38-p95-boxing` does **not** carry the picked
+`27763f7b`, so expect a conflict. `r38-p100-strings` still holds **uncommitted** `#7741` /
+`#7804` / `#7592` work. All of it rides the NEXT gate.
+
 ## Exit review
 
 *(to be written by the campaign's exit reviewer — not this lane)*
