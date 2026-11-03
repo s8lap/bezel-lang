@@ -1113,6 +1113,41 @@ refutation spends the strongest model on a hypothesis that was never tested.
 Escalate the model only after two refutations, or when there is no root-cause
 hypothesis to act on at all.
 
+### ⚠ Dispatching a lane agent: put the CALL in the background, and put them ALL in one message
+
+*Added 2026-11-03, after an R38 coordinator spent three turns dispatching ONE lane
+per turn because each `subagent` call blocked until the agent finished. The pool
+reads 7 on the ledger while 1 agent is actually running — the pool row counts
+CLAIMS, not agents, so a serialized dispatch looks full while the box is idle.*
+
+**⇒ THE RULE: EVERY lane dispatch is `background: true`, AND ALL THE DISPATCHES
+FOR A TURN GO IN **ONE** ASSISTANT MESSAGE AS PARALLEL TOOL CALLS.**
+
+**⇒ WHY `background: true` ALONE IS NOT ENOUGH — MEASURED 2026-11-03.** A
+`subagent` call with `background: true` still returned control to the
+coordinator, but the HARNESS held the turn open until the agent finished: the
+coordinator's next tool call did not run until the agent was done. So
+`background: true` marks the *agent* as asynchronous while the *turn* stays
+serialized. **⇒ THE COORDINATOR MUST LAUNCH ITS NEXT LANE WITHOUT WAITING FOR
+THE PREVIOUS ONE.** The only way to do that is to issue the calls **in one
+message**, where the harness starts them concurrently.
+
+**⇒ TWO OR MORE IN ONE MESSAGE IS THE NORMAL CASE, NOT AN EDGE CASE.** The pool
+is 7. A turn that frees 3 slots dispatches 3 lanes **at once**. A turn that
+frees 1 slot dispatches 1 — but it is STILL a `background: true` call in its own
+message, and the coordinator continues immediately afterwards.
+
+**⇒ HOW TO TELL IT WORKED.** The dispatch returns a **session id**, and the
+agent's TITLE is visible to the reconciler. `scripts/pool_lanes.sh` counts live
+sessions from opencode — **⇒ A LANE IS NOT "DISPATCHED" UNTIL ITS AGENT
+EXISTS.** A claim with no session id is a PHANTOM: a promise, not an agent.
+**⇒ RECORD THE SESSION ID IN THE LEDGER** (`live:<role>:ses_…`) so the
+reconciler can compare the ledger against opencode instead of trusting the
+claim count.
+
+**⇒ NEVER `git stash`, NEVER `git add -A`, NEVER TWO `cmake --build` ON ONE
+BUILD DIR** — and **⇒ NEVER LAUNCH A GATE WHILE A LANE IS BUILDING.**
+
 ### Review and dispatch: where the contract rules came from
 
 *Added 2026-10-04. Until then these rules lived only in coordinators' memory files and in
