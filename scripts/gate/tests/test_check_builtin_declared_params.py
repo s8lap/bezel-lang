@@ -265,6 +265,112 @@ class Citations(unittest.TestCase):
                               'a reason for `%s` names another section' % head)
 
 
+class ParameterNames(unittest.TestCase):
+    """fix #7828: the `names` column — the §22.5 NAME SURFACE — is COMPARED.
+
+    stdlib §1 says the parameter names are API surface ("parameter names are
+    API surface (named arguments, spec §22.5)"), and spec §22.5 binds a
+    named argument to the parameter it NAMES — so a name the document does
+    not declare is a wrong §22.5 binding, and a name the document DOES
+    declare and the table does not is a refused binding.
+
+    The checker compared the parameter TYPE, the §7.3 NULLABILITY and the
+    `required` columns, and NEVER the `names` column: a row could carry
+    `pth` where the document spells `path` — the very defect #7828 reports
+    for the `File` / `Directory` rows — and the checker still printed "the
+    table agrees with the standard library".
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stdlib = c.parse_stdlib(c.read(c.STDLIB), c.read(c.SPEC))
+        cls.table = c.parse_table(c.read(c.REGISTRY))
+
+    def test_the_declared_names_are_read_from_the_document(self):
+        # stdlib §7.3: `File.Exists(path: string)`.
+        self.assertEqual(
+            {("path",)},
+            c.declared_names(self.stdlib, "File", "Exists", 1),
+            'stdlib §7.3\'s `File.Exists` names are not read from the document')
+        # stdlib §7.4: `Directory.Delete(path: string, recursive: bool :=
+        # false)` — the defaulted second parameter's name is declared too.
+        self.assertEqual(
+            {("path", "recursive")},
+            c.declared_names(self.stdlib, "Directory", "Delete", 2),
+            'stdlib §7.4\'s `Directory.Delete` names are not read from the '
+            'document')
+
+    def test_a_positional_only_slot_declares_no_name(self):
+        # stdlib §2.5: `TryParse(s: string, out result: DateTime): bool` — an
+        # `out` slot is positional-only (spec §22.5), so it declares no §22.5
+        # name and the table's empty name there is correct.
+        names = c.declared_names(self.stdlib, "DateTime", "TryParse", 2)
+        self.assertIn(("s", ""), names,
+                      'the `out` slot does not declare a §22.5 name: %s'
+                      % (names,))
+
+    def test_a_corrupted_parameter_name_is_detected(self):
+        # the §22.5 NAME the document does not declare: `pth` where stdlib
+        # §7.3 declares `path`.
+        mutated = c.apply_mutation(self.table, "File", "Exists", 1, 0,
+                                   ("name", "pth"))
+        errors = c.compare(self.stdlib, mutated)
+        self.assertTrue(errors,
+                        'the checker does not detect a corrupted §22.5 NAME')
+        named = [e for e in errors if "`File.Exists`" in e]
+        self.assertTrue(named,
+                        'the checker detects a corrupted §22.5 NAME but does '
+                        'not NAME the member: %s' % errors)
+        self.assertTrue(any("`names` column" in e for e in named),
+                        'the checker detects a corrupted §22.5 NAME but does '
+                        'not NAME the column: %s' % errors)
+
+    def test_a_corrupted_directory_name_is_detected(self):
+        # stdlib §7.4's `Directory.Delete(path: string, recursive: bool :=
+        # false)`: the SECOND name is corrupted here, so the comparison is
+        # not a one-position accident.
+        mutated = c.apply_mutation(self.table, "Directory", "Delete", 2, 1,
+                                   ("name", "recurse"))
+        errors = c.compare(self.stdlib, mutated)
+        self.assertTrue(errors,
+                        'the checker does not detect a corrupted §22.5 NAME '
+                        'on the `Directory.Delete` row')
+        named = [e for e in errors if "`Directory.Delete`" in e]
+        self.assertTrue(named,
+                        'the checker detects a corrupted §22.5 NAME but does '
+                        'not NAME the member: %s' % errors)
+        self.assertTrue(any("`names` column" in e for e in named),
+                        'the checker detects a corrupted §22.5 NAME but does '
+                        'not NAME the column: %s' % errors)
+
+    def test_a_removed_name_surface_is_detected(self):
+        # fix #7828: the defect the issue REPORTS — the rows carry NO
+        # parameter names, so a named argument binds by position.  A checker
+        # that only compared a name it FOUND would miss it, so the removed
+        # name surface must be detected too.
+        mutated = c.apply_mutation(self.table, "File", "Exists", 1, 0,
+                                   ("names",))
+        errors = c.compare(self.stdlib, mutated)
+        self.assertTrue(errors,
+                        'the checker does not detect a REMOVED §22.5 NAME '
+                        'SURFACE')
+        named = [e for e in errors if "`File.Exists`" in e]
+        self.assertTrue(named,
+                        'the checker detects a removed §22.5 name surface but '
+                        'does not NAME the member: %s' % errors)
+        self.assertTrue(any("`names` column" in e for e in named),
+                        'the checker detects a removed §22.5 name surface but '
+                        'does not NAME the column: %s' % errors)
+
+    def test_the_names_of_the_covered_rows_match_the_document(self):
+        # no false positive: the table's covered rows carry the DOCUMENT's
+        # own names, so the comparison is clean on the tree it lives in.
+        errors = c.compare(self.stdlib, self.table)
+        self.assertEqual([], errors,
+                         'the checker reports a disagreement on the tree it '
+                         'lives in: %s' % errors)
+
+
 class RequiredColumn(unittest.TestCase):
     """fix #8023: the `required` (DECLARED ARITY) column is compared.
 

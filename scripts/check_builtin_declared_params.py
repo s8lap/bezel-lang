@@ -220,6 +220,7 @@ BLOCKS = [
      "ArgumentOutOfRangeException"),
 ]
 
+
 # The blocks whose authority is the SPECIFICATION and not the standard
 # library's own listing.  Spec §31.4 declares the exception hierarchy's
 # base types, and `docs/Bezel_Standard_Library.md` has NO block for them —
@@ -676,6 +677,51 @@ NULLABLE_ALLOWED = _bind({
         "`other: string?`",
 })
 
+# The rows the table carries with NO §22.5 NAME SURFACE although the
+# document declares one, and the checker REPORTS them rather than failing on
+# them.  The table is the SUBJECT of this ratchet, not its property.
+#
+# These are the `Math` VALUE overloads and the `TextWriter` NUMERIC ones: the
+# document declares `Abs(x: int)` / `Abs(x: long)` / `Abs(x: double)` / `Abs(x:
+# decimal)` and `Write(value: bool)` / `Write(value: int)` / … , and the
+# table transcribes the §22.5 name on ONE of the member's overloads and not
+# on the others.  A named argument at an overload that carries no name
+# surface is refused by the §22.5 binder — a real gap in the table, and a
+# KNOWN one: the checker reports it (below, as a "name-surface" item) and
+# does not fail on it, because the table's overload rows are the SUBJECT.
+#
+#   (head, member) -> why the row carries no name surface
+NO_NAME_SURFACE = _bind({
+    ("Math", "Abs"):
+        "{sec} declares `Abs(x: int)` / `Abs(x: long)` / `Abs(x: double)` / "
+        "`Abs(x: decimal)` and the table transcribes the §22.5 name `x` on "
+        "the `int` overload only, so the other overloads' rows carry NO "
+        "name surface and a named argument at them is refused",
+    ("Math", "Ceiling"):
+        "{sec} declares `Ceiling(x: double)` / `Ceiling(x: decimal)` and the "
+        "table transcribes the §22.5 name `x` on the `double` overload only",
+    ("Math", "Floor"):
+        "{sec} declares `Floor(x: double)` / `Floor(x: decimal)` and the "
+        "table transcribes the §22.5 name `x` on the `double` overload only",
+    ("Math", "Round"):
+        "{sec} declares `Round(x: double, digits: int := 0)` and the table "
+        "transcribes the §22.5 names on the TWO-argument form only, so the "
+        "one-argument form's row carries NO name surface",
+    ("Math", "Truncate"):
+        "{sec} declares `Truncate(x: double)` / `Truncate(x: decimal)` and "
+        "the table transcribes the §22.5 name `x` on the `double` overload "
+        "only",
+    ("TextWriter", "Write"):
+        "{sec}'s #1355 note declares `Write(value: bool)` / `Write(value: "
+        "int)` / … beside `Write(value: string)`, and the table's row "
+        "carries NO name surface for the note-declared overloads",
+    ("TextWriter", "WriteLine"):
+        "{sec}'s #1355 note declares `WriteLine(value: bool)` / "
+        "`WriteLine(value: int)` / … beside `WriteLine(value: string)`, and "
+        "the table's row carries NO name surface for the note-declared "
+        "overloads",
+})
+
 # The positions where the table's §7.3 NULLABILITY mask and the standard
 # library's spelling DISAGREE, and the checker does NOT fail on them.  The
 # table is the SUBJECT of this ratchet, not its property: a lane that finds
@@ -1117,10 +1163,15 @@ def parse_stdlib(text, spec_text=None):
 # ── the table ──────────────────────────────────────────────────────────────
 
 def parse_table(text):
-    """The table's rows, as {(head, member, total): [(kinds, nn, required)]}.
+    """The table's rows, as {(head, member, total): [(kinds, nn, required, names)]}.
 
     `kinds` is the SET of declared type names at each position; a position
     with no bit is the empty set (no type opinion).
+
+    `names` is the §22.5 NAME at each position — the column the checker
+    used not to compare at all (fix #7499: the column is the §22.5 name
+    SURFACE, and stdlib §1 says so explicitly — "parameter names are API
+    surface (named arguments, spec §22.5)").
     """
     out = {}
     for m in ROW_RE.finditer(text):
@@ -1146,7 +1197,16 @@ def parse_table(text):
             kinds.append(frozenset(names))
         if len(kinds) < total:
             kinds += [frozenset()] * (total - len(kinds))
-        out.setdefault((head, member, total), []).append((kinds, nn, required))
+        pnames = []
+        for raw in m.group("names").split(","):
+            raw = raw.strip()
+            if raw.startswith('"') and raw.endswith('"'):
+                raw = raw[1:-1]
+            pnames.append(raw)
+        if len(pnames) < total:
+            pnames += [""] * (total - len(pnames))
+        out.setdefault((head, member, total), []).append(
+            (kinds, nn, required, pnames[:total]))
     return out
 
 
@@ -1215,6 +1275,51 @@ def declared_forms(stdlib):
             yield (head, member, arity)
 
 
+def declared_names(stdlib, head, member, arity):
+    """The document's declared PARAMETER NAMES at `arity`, as a set of tuples.
+
+    The union over the standard library's overloads of that argument count:
+    a member whose two overloads of the same arity disagree on the names
+    (`string.Replace/2` — `oldChar, newChar` beside `oldValue, newValue`)
+    contributes BOTH, and the table's row may name either — the §22.5 binder
+    accepts a call that binds against ANY ONE of them (the overload-aware
+    lookup the registry's own header describes).
+
+    A `ref`/`out`/`scoped` parameter is POSITIONAL-ONLY (spec §22.5), so it
+    declares no §22.5 name: the position's name is the empty string, which
+    is what the table carries there (`TryParse(s: string, out result: sbyte)`
+    — the `result` slot is written positionally, and the table's row carries
+    `s` and an empty second name).
+    """
+    overloads = stdlib.get((head, member))
+    if not overloads:
+        return set()
+    out = set()
+    for params in overloads:
+        required = sum(1 for p in params if not p[2])
+        if not (required <= arity <= len(params)):
+            continue
+        names = []
+        for p in range(arity):
+            if is_positional_only(params[p]):
+                names.append("")
+            else:
+                names.append(params[p][0].split()[-1])
+        out.add(tuple(names))
+    return out
+
+
+def is_positional_only(param):
+    """Is this parameter a POSITIONAL-ONLY one (spec §22.5)?
+
+    A `ref`/`out`/`scoped` argument is positional-only: it cannot be bound
+    by name, so it declares no §22.5 name and the table's empty name there
+    is correct.
+    """
+    words = param[0].split()
+    return bool(words) and words[0] in ("out", "ref", "scoped")
+
+
 def covering_rows(table, head, member, arity):
     """The table's rows that admit `arity` arguments of `member`.
 
@@ -1230,7 +1335,7 @@ def covering_rows(table, head, member, arity):
         h, m, total = key
         if h != head or m != member:
             continue
-        for idx, (kinds, nn, required) in enumerate(rows):
+        for idx, (kinds, nn, required, _pnames) in enumerate(rows):
             if member:
                 if total != arity:
                     continue
@@ -1379,7 +1484,7 @@ def compare(stdlib, table):
             # comparison above reports that, and there is no document's
             # minimum to compare the column against.
             continue
-        for _idx, (_kinds, _nn, required) in enumerate(rows):
+        for _idx, (_kinds, _nn, required, _pnames) in enumerate(rows):
             if required == want:
                 continue
             # fix #8034: the `required` column of EVERY covered row is
@@ -1391,6 +1496,67 @@ def compare(stdlib, table):
                 "parameter(s), but the table's `required` column says %d"
                 % (head, ("." + member) if member else "'s constructor",
                    total, want, required))
+
+    # 4. The `names` column — the §22.5 NAME SURFACE.  fix #7499: this
+    #    column was NEVER compared, so a row could carry a name the standard
+    #    library does not declare (a capitalised `Buffer` where the document
+    #    spells `buffer`, a misspelled `pth`) and the checker still printed
+    #    "the table agrees with the standard library".  stdlib §1 says the
+    #    names ARE API surface ("parameter names are API surface (named
+    #    arguments, spec §22.5)"), and spec §22.5 binds a named argument to
+    #    the parameter it NAMES — so a wrong name is a wrong §22.5 binding.
+    #
+    #    A row that carries NO name surface at all (every name empty) is a
+    #    MISSING name surface when the document declares one: #7828's own
+    #    defect ("the `File.*` / `Directory.*` rows carry NO parameter names,
+    #    so a named argument binds by position") is exactly that, and the
+    #    oracle has to FAIL on it.  The rows the table deliberately carries
+    #    without a name surface — the `Math` value overloads and the
+    #    `TextWriter` numeric ones, which the document declares but the table
+    #    transcribes on ONE overload only — are listed in
+    #    `NO_NAME_SURFACE` and REPORTED (a known gap), not failed on.
+    #
+    #    A `ref`/`out`/`scoped` parameter is POSITIONAL-ONLY (spec §22.5), so
+    #    the document's `out result: DateTime` declares NO §22.5 name for
+    #    that position and the table's empty name there is correct.
+    for (head, member, total), rows in sorted(table.items()):
+        if head not in covered_heads():
+            continue
+        if (head, member) in NOT_TRANSCRIBED:
+            continue
+        if total == 0:
+            continue  # a form with NO parameter declares NO §22.5 name
+        want = declared_names(stdlib, head, member, total)
+        if not want:
+            continue
+        # the names the document declares, ignoring the POSITIONAL-ONLY slots
+        # (whose §22.5 name is the empty string).
+        want_names = set(n for tup in want for n in tup if n)
+        if not want_names:
+            continue  # the document declares NO §22.5 name at this form
+        for _idx, (_kinds, _nn, _required, pnames) in enumerate(rows):
+            if not any(pnames):
+                # the row carries NO §22.5 name surface.
+                if (head, member) in NO_NAME_SURFACE:
+                    continue
+                errors.append(
+                    "stdlib declares `%s%s` at %d argument(s) with the "
+                    "parameter name(s) %s, but the table's `names` column "
+                    "carries NONE"
+                    % (head, ("." + member) if member else "'s constructor",
+                       total,
+                       " / ".join("`%s`" % ", ".join(n)
+                                  for n in sorted(want))))
+                continue
+            if tuple(pnames) in want:
+                continue
+            errors.append(
+                "stdlib declares `%s%s` at %d argument(s) with the "
+                "parameter name(s) %s, but the table's `names` column says %s"
+                % (head, ("." + member) if member else "'s constructor",
+                   total,
+                   " / ".join("`%s`" % ", ".join(n) for n in sorted(want)),
+                   ", ".join("`%s`" % n for n in pnames)))
 
     return errors
 
@@ -1498,6 +1664,18 @@ def known_uncovered(stdlib, table):
     #     (`compare`), exactly as a wrong parameter TYPE or a wrong §7.3
     #     mask does.
 
+    # (i) fix #7828: the rows the table carries with NO §22.5 NAME SURFACE
+    #     although the document declares one — the checker REPORTS them
+    #     rather than failing on them (the table's overload rows are the
+    #     SUBJECT of this ratchet, not its property).
+    for (head, member), reason in sorted(NO_NAME_SURFACE.items()):
+        if head not in covered:
+            continue
+        out.append(("name-surface",
+                    "`%s.%s` — the table's rows carry NO §22.5 name surface "
+                    "for one of the member's overloads although the document "
+                    "declares one: %s" % (head, member, reason)))
+
     return out
 
 
@@ -1569,6 +1747,15 @@ SELF_TEST_MUTATIONS = [
     ("Exception", "", 2, 0, ("extra", "int")),
     ("ArgumentException", "", 2, 0, ("extra", "int")),
     ("ExceptionInfo", "", 3, 0, ("extra", "int")),
+    # fix #7499: the §22.5 NAME column — the column the checker used not to
+    # compare at all.  A corrupted name must be DETECTED, and the error must
+    # NAME the member and the column.
+    ("File", "Exists", 1, 0, ("name", "pth")),
+    ("Directory", "Exists", 1, 0, ("name", "pth")),
+    # fix #7828: the WHOLE name surface removed — the defect the issue
+    # reports.  It must be DETECTED too, not only a single wrong name.
+    ("File", "Exists", 1, 0, ("names",)),
+    ("Directory", "Delete", 2, 1, ("names",)),
 ]
 
 
@@ -1579,10 +1766,11 @@ def apply_mutation(table, head, member, arity, position, mutation, index=0):
     rows = mutated.get(key)
     if not rows:
         die("the self-test names a row the table does not carry: %r" % (key,))
-    kinds, nn, required = rows[index]
+    kinds, nn, required, pnames = rows[index]
     new_kinds = list(kinds)
     new_nn = nn
     new_required = required
+    new_names = list(pnames)
     kind = mutation[0]
     if kind == "extra":
         new_kinds[position] = frozenset([mutation[1]])
@@ -1595,9 +1783,17 @@ def apply_mutation(table, head, member, arity, position, mutation, index=0):
     elif kind == "required":
         # fix #8023: the DECLARED ARITY column.
         new_required = mutation[1]
+    elif kind == "name":
+        # fix #7499: the §22.5 NAME column.
+        new_names[position] = mutation[1]
+    elif kind == "names":
+        # fix #7828: the WHOLE §22.5 NAME SURFACE removed — the defect the
+        # issue itself reports ("the rows carry NO parameter names, so a
+        # named argument binds by position").
+        new_names = [""] * len(pnames)
     else:
         die("the self-test names an unknown mutation %r" % (mutation,))
-    rows[index] = (new_kinds, new_nn, new_required)
+    rows[index] = (new_kinds, new_nn, new_required, new_names)
     return mutated
 
 
@@ -1611,22 +1807,45 @@ def self_test():
     # (1) a declared type the table does not carry.
     mutated = {k: list(v) for k, v in table.items()}
     rows = mutated[("string", "Contains", 1)]
-    rows[0] = ([frozenset()] + list(rows[0][0][1:]), rows[0][1], rows[0][2])
+    rows[0] = ([frozenset()] + list(rows[0][0][1:]), rows[0][1], rows[0][2],
+               rows[0][3])
     if not compare(stdlib, mutated):
         die("the checker does not detect a MISSING declared type", 1)
     # (2) a declared type the standard library does not name.
     mutated = {k: list(v) for k, v in table.items()}
     rows = mutated[("string", "Contains", 1)]
     rows[0] = ([frozenset(["int"])] + list(rows[0][0][1:]), rows[0][1],
-               rows[0][2])
+               rows[0][2], rows[0][3])
     if not compare(stdlib, mutated):
         die("the checker does not detect a WRONG declared type", 1)
     # (3) a nullability the standard library does not spell.
     mutated = {k: list(v) for k, v in table.items()}
     rows = mutated[("string", "Trim", 1)]
-    rows[0] = (rows[0][0], 0x00, rows[0][2])
+    rows[0] = (rows[0][0], 0x00, rows[0][2], rows[0][3])
     if not compare(stdlib, mutated):
         die("the checker does not detect a WRONG nullability", 1)
+    # (3a) fix #7499: a §22.5 NAME the standard library does not declare.
+    mutated = {k: list(v) for k, v in table.items()}
+    rows = mutated[("File", "Exists", 1)]
+    rows[0] = (rows[0][0], rows[0][1], rows[0][2], ["pth"])
+    if not compare(stdlib, mutated):
+        die("the checker does not detect a WRONG parameter NAME", 1)
+    # (3b) fix #7828: the WHOLE §22.5 NAME SURFACE removed — the defect the
+    #     issue reports.  A checker that only compared a name it found would
+    #     miss it.
+    mutated = {k: list(v) for k, v in table.items()}
+    rows = mutated[("File", "Exists", 1)]
+    rows[0] = (rows[0][0], rows[0][1], rows[0][2], [""])
+    errors = compare(stdlib, mutated)
+    if not errors:
+        die("the checker does not detect a REMOVED §22.5 NAME SURFACE", 1)
+    named = [e for e in errors if "`File.Exists`" in e]
+    if not named:
+        die("the checker detects a removed §22.5 name surface but does not "
+            "NAME the member: %s" % "; ".join(errors), 1)
+    if not any("`names` column" in e for e in named):
+        die("the checker detects a removed §22.5 name surface but does not "
+            "NAME the column: %s" % "; ".join(errors), 1)
     # (4) fix #8013: EVERY covered block must have a mutation the checker
     #     asserts is DETECTED — including the blocks the #8005 commit
     #     transcribed, which the checker could not see at all before.
@@ -1752,8 +1971,9 @@ def main(argv):
                      "the standard library over %d standard-library block(s) "
                      "and %d specification block(s), %d declared form(s) and "
                      "%d row(s) read (%d row(s) sit in the covered blocks) — "
-                     "the parameter TYPE, the §7.3 NULLABILITY and the "
-                     "`required` (DECLARED ARITY) columns are compared, and "
+                     "the parameter NAME (§22.5), the parameter TYPE (§5.1), "
+                     "the §7.3 NULLABILITY and the `required` (DECLARED "
+                     "ARITY) columns are compared, and "
                      "the §-citation of all %d block(s) is verified against "
                      "the document; %d known-uncovered item(s) are listed "
                      "above, and every covered row's `required` column "
