@@ -104,6 +104,8 @@ for lane, status in live_claims.items():
             claim_sessions[lane] = tok
 
 phantom = sorted(l for l in live_claims if l not in claim_sessions)
+dead = sorted(l for l in live_claims
+              if l in claim_sessions and claim_sessions[l] not in live)
 unrecorded = sorted(
     sid for sid in live
     if not any(v == sid for v in claim_sessions.values())
@@ -112,17 +114,26 @@ unrecorded = sorted(
 for lane in sorted(live_claims):
     sid = claim_sessions.get(lane, "-")
     title = live.get(sid, "")
-    mark = "OK " if sid in live else "!! "
+    if sid == "-":
+        mark = "?? "          # a live claim with NO session id: unverifiable
+    elif sid in live:
+        mark = "OK "
+    else:
+        mark = "!! "          # the session ENDED: the lane is DEAD
     print(f"  {mark}{lane:<24} {sid:<28} {title}")
 
 for lane in phantom:
     print(f"  PHANTOM   {lane}: a `live` claim with NO running session "
           f"— the claim is a promise, not an agent")
+for lane in dead:
+    print(f"  DEAD      {lane}: the claim says `live` but its session "
+          f"({claim_sessions[lane]}) has ENDED — the lane died or handed "
+          f"its turn back; re-dispatch it or close the claim")
 for sid in unrecorded:
     print(f"  UNRECORDED {sid}: a running session with NO `live` claim "
           f"— {live.get(sid,'')}")
 
-if phantom or unrecorded:
+if phantom or dead or unrecorded:
     print("pool_lanes: MISMATCH — the ledger and opencode disagree")
     sys.exit(3)
 print("pool_lanes: the ledger and opencode AGREE")

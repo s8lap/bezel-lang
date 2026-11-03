@@ -2600,6 +2600,24 @@ credits N closures**:
 | `r38-p74-extdispatch` | the §26.5 extension dispatch is keyed on the member NAME alone | #7970 #7951 #7944 #7448 #7812 | `ExprTypecheck_Exprs.cpp` |
 | `r38-w69-membergate` | review of `45bdd87a` | #8012 #8015 #8020 | (read-only) |
 
+**⇒ MEASURED, AND IT MATTERS TO EVERY CLOSURE IN THIS RUN: `fix #NNNN:` IN A COMMIT SUBJECT
+**DOES** CLOSE THE ISSUE ON GITHUB.** The lane `r38-p70-namedargs-reg` reported the opposite —
+"GitHub recognises only `Fixes`/`Closes`/`Resolves`, never a `fix #NNNN:` subject" — and that is
+**FALSE**. GitHub's documented closing keywords are `close, closes, closed, **fix**, fixes,
+fixed, resolve, resolves, resolved`, and "You can also use closing keywords in a **commit
+message**". **⇒ THE REAL REASON NOTHING IS CLOSED YET IS THAT THE BRANCH HAS NEVER BEEN PUSHED**
+(measured 2026-11-03 15:10: `r30-c1` is 55 commits ahead of `origin/main` and 0 behind — every
+one of the 44 banked closures is waiting for the one gate's push). **⇒ DO NOT LET A LANE'S
+MISCONCEPTION ABOUT KEYWORDS DETER A REAL CLOSURE, AND DO NOT GO AND "CLOSE AN ISSUE
+MANUALLY" FOR A COMMIT THAT ALREADY NAMES IT.**
+
+**⇒ AND THE INVERSE RULE, WHICH IS THE ONE THAT BITES: A COMMIT THAT NAMES AN ISSUE CLOSES IT
+EVEN IF THE FIX LANDED ELSEWHERE.** That is the whole basis of the residual-closure sweep
+(`r38-p79-residual`): a defect fixed incidentally inside another issue's commit leaves its own
+issue open forever, because nothing named it. **⇒ CLOSING IT HONESTLY MEANS A COMMIT THAT
+NAMES IT *AND* LANDS A REGRESSION TEST THAT FAILS ON THE PRE-FIX TREE** — the test is what
+keeps the closure true, and the commit body must say plainly which earlier commit did the fix.
+
 **⇒ THE NAMED-ARGUMENT FAMILY IS ONE DEFECT IN THREE DISJOINT FILES** (the table's names → the
 binder's index → the lowering's order), which is why it was split by FILE rather than by issue.
 
