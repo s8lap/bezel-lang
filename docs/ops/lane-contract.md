@@ -167,6 +167,15 @@ SPECIFIC to its assignment.*
     4. **⇒ QUOTE ONLY THE LINES YOU NEED** (a spec citation is one line plus its section heading),
        never a block of the section.
     5. **⇒ IF A FILE'S SIZE SURPRISES YOU, `wc -c` IT BEFORE READING IT — ALWAYS.**
+    **⇒ AND THE SAME RULE GOVERNS **YOUR OWN** PROBE ARTIFACTS — MEASURED, THREE LANE DEATHS
+    ON 2026-11-03, ALL PRODUCERS, ALL FROM READING A FILE THEY THEMSELVES MADE:**
+    a probe you compile leaves an **ELF binary** in your scratch, and `head` on an ELF is
+    still garbage — one lane died on a **443 KB** ELF probe binary, another on a **2.2 MB**
+    `.bin` artifact, and a third on the 2.27 MB spec above. **⇒ NEVER READ A PROBE'S OUTPUT
+    OR ARTIFACT WHOLE.** **⇒ `wc -c` IT FIRST; THEN `| head -40`, `| tail -40` OR `grep`.**
+    **⇒ AND DO NOT PUT A PROBE BINARY WHERE A `read` WILL FIND IT** — keep executables under a
+    name you will not open (`probe/*.elf`), and put the program's **stdout** in a separate
+    `.txt` you can cap. **⇒ THE PROBE'S OUTPUT IS THE EVIDENCE, NOT THE EXECUTABLE.**
 25. **Write your report to disk as you go, and keep your final message short.** After each
     substantial step, append what you have found to your report file. If you are interrupted, the
     file holds everything you finished — a lane that dies mid-run with its findings only in its
