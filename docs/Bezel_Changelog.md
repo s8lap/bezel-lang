@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.353 — November 2026**
+**Companion to the Bezel Language Specification, v0.354 — November 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -15696,5 +15696,97 @@ The independent critique accepted the train with fixes. Its substantive findings
 - A non-author critic reviewed every lane. It checked each restated rule against spec v0.352 and scripted a section-by-section comparison of links, issue and proposal numbers, and decline words. It spot-checked fifteen dropped facts against the changelog and restored the one that was recorded nowhere else (§5.19's Java corroboration). It corrected one strengthened claim (§17.6, "showed" → "suggested") and one garbled decline (§5.10, the #3240 `new` ruling). It found the two further stale statements fixed in §12.6 (multi-consumer blocker; bounded channels).
 
 **Migration:** doc-only.
+
+---
+
+### v0.354 changelog (v0.353 → v0.354)
+
+**Editorial: the rationale's longest sections are split into subsections.** On 2026-11-03 the owner wrote: "Reading the rationale, section 4.2 appears to be very long, maybe we can split up the section better? Are there any other very long sections that will benefit from reorganisation?" This revision splits §4.2 and the other sections over about 2,000 words into numbered subsections. It also gives §10 *Generics* sections of its own. Class: **editorial** (spec-change process §2). No rule, verdict, grammar or diagnostic changes.
+
+**The treatment.**
+- Each split section opens with a summary of its decision and its main reasons, or keeps an opening that already gave them. Its body is grouped by topic under `#### N.M.K` headings, and each heading carries its own `sec-` anchor.
+- A paragraph moves only within its own section, and its historical notes come last.
+- Paragraph text is unchanged except for four "above"/"below" pointers that a move made wrong, one pointer to a moved note, and link targets.
+- Every existing anchor, code block and `###` heading is kept. Every bold or italic run-in lead-in is kept, and the lead-ins other documents cite all still resolve.
+- Three lead-ins became their subsection's title word for word: §5.28's *Alternatives considered and declined* and *Historical note*, and §8.1's *Historical note: the two-member model*.
+- New text: the summaries, three short roadmap or transition paragraphs, and the headings. The rationale grows from about 124,300 to 125,700 words.
+
+**The rationale.**
+- **§4.2** *Why function-typed values are runtime-managed* (about 6,600 words) gets a summary of the capture rule and nine subsections:
+  - no disposal through a function value
+  - the capture rule
+  - function-typed holders
+  - set-erasing positions
+  - type parameters inside function types
+  - borrow-erasing positions
+  - `scoped` at `Object` and interface types
+  - captured variables
+  - the historical note
+
+  The box paragraph is now below *An `as` at `Object`*, so that paragraph's "above" pointer to it says "below".
+- **§5.15** *Owned buffers and spans* (about 6,200 words) gets a summary and ten subsections:
+  - `OwningBuffer<T>` and the category split
+  - spans as records, with no `unsafe`
+  - the span surface and its bounds checks
+  - string spans
+  - array spans
+  - copy, move and the span factories
+  - flag-checked reads
+  - no span interface
+  - the standard library's conditionally-admitted members
+  - historical notes
+
+  The emptied-register paragraph now points at the register's note, which moved to the end.
+- **§5.19** *Serialization without reflection* and **§5.22** *Type-driven serialization* stay two sections.
+  - §5.19 gets a summary and seven subsections: architecture, vocabulary, synthesis, customization and policy placement, back-edges, polymorphic dispatch, and the historical note.
+  - §5.22 gets six subsections in its existing order: field types, cycles, identity and disposal, polymorphism and inheritance, hand-written forms, and the historical note.
+  - Each opening now names what it takes from the other. Nine links between the two now point at the subsection they mean.
+- **§5.28** *Silent tracking* gets ten subsections. The four later rulings that followed its historical note now sit with their topics:
+  - the owning-choice field joins the trivial-dispose definition;
+  - explicit disposal and the overwrite release point form one subsection;
+  - the store lint's promotion to an error follows the lint.
+- **§8.1** *Member hiding is forbidden* gets a two-sentence transition and four subsections:
+  - visible members
+  - local names
+  - `Object`'s virtual members and the own-typed `Equals`
+  - the two-member model's historical note
+- **§9.15** *Value receivers* gets an opening summary (it opened with the problem) and six subsections:
+  - copyable kinds
+  - move-only kinds
+  - cost and the kernel
+  - the owning inline array
+  - closure capture of `this`
+  - historical notes
+- **§12.15** *Static members* gets a roadmap paragraph and three subsections: the admitted forms and the retired owning-inline-array static, store semantics, and rule 4's notes with rule 5.
+- **§10 *Generics*** (about 7,000 words, with no sections before) gets a four-sentence summary and seven sections that follow its own roadmap:
+  - §10.1 inference and overload resolution
+  - §10.2 type-parameter names
+  - §10.3 `owned` on a bare `T`
+  - §10.4 requirements and declared constraints, with three subsections: §10.4.1 interior-use requirements, §10.4.2 declared constraints at a type-parameter argument, §10.4.3 what the constraints admit
+  - §10.5 conditionally-admitted members
+  - §10.6 dispatched generic methods
+  - §10.7 move-only and other special substitutions
+
+  The #5512 requirement-delta paragraph moves beside the requirement paragraphs it classifies.
+- **§3.14, §12.10, §12.13.** Each section's mid-section historical note moves to the end, and the pointer across it now says "below" or "above" to match. §12.10 also gets a summary: calls mint for the iterable family as well as the `Task` family, as they have since proposal 0096 (v0.258). Its opening states the `Task` family only.
+- **§11.3.** Its five `####` headings are numbered §11.3.1–§11.3.5, to match. The anchors are unchanged.
+
+**Proposals, spec, stdlib (citations only).**
+- **`DECLINED.md`.** 158 rows that cited a split section now name the subsection they mean (160 citations). Most are matched by the lead-in the row already quotes. Rows that cite by issue or proposal number were matched to the subsection holding that paragraph, including every bare "rationale §10".
+  - Row 472's "rationale §10 (*Generics* — the type-argument inference paragraph)" becomes "rationale §10.1 (the type-argument inference paragraph)".
+  - Citations of a whole section or of §5.28's doctrine are left as they were.
+  - No verdict, class or reason changed.
+- **Spec and stdlib.** Eight spec links and four stdlib links into §5.15, §5.19, §5.22, §5.28 and §12.15 now name and target the subsection they cite. For example, spec §29.12's "no per-site suppression" now goes to §5.28.8, and stdlib §2.14's `CodingKeys` sentence to §5.19.4.
+- The pinned changelog's citations are left as they are.
+
+**Checks.**
+- `scripts/check_docs.sh` (all phases), `check_proposals.sh`, `build_book.py --check` and `check_src_citations.py` are clean on the composed tree. The one CITATION advisory (`[spec] §4.12`) predates this revision.
+- The book builds under mdBook v0.4.52. In it, the new subsections render as in-page headings, and §10's sections as page sections.
+- A non-author critic composed the three lanes and wrote its own check. For each split section, the base's paragraphs equal the new section's paragraphs once the new headings, summaries and transitions are set aside, apart from the listed pointer and link edits. All 178 existing anchors appear exactly once, no code block changed, and every phrase that another document quotes on a line citing these sections is still present.
+- The critic retitled §5.15.9 so that it no longer duplicates §10.5's title. It also removed a summary sentence in §5.19 that repeated the opening, tightened two summary claims (§12.10, §12.15) to what their paragraphs say, and fixed blank-line spacing at four section ends.
+
+**Migration:** doc-only.
+
+---
 
 ---
