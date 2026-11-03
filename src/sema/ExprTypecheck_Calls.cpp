@@ -42911,4 +42911,25 @@ bool concreteCollectionHeadDeclares(std::string_view head,
                                     std::string_view member) {
     return sema::isDocumentedConcreteCollectionMember(head, member);
 }
+// fix #7990 (§26.5 rules 1-2, §22.6, v0.350; stdlib §4.1 / §4.2 / §4.12 /
+// §4.13): the same export for the collection INTERFACE heads. #7946's
+// decline asks the CONCRETE head's declared surface; the borrowing LIST
+// interfaces (`IList<T>` / `IReadOnlyList<T>`) are the one head family the
+// concrete table does not name, and their runtime value is the array-backed
+// `bz_array_t*` the name-keyed built-in arms (Peek, Push, Enqueue, ...) reach
+// — so a user extension of that name was swallowed by the built-in arm
+// instead of answering. `isInterfaceCollectionSurfaceHead` says the head is
+// one of the eight stdlib §4 collection interfaces;
+// `interfaceCollectionHeadDeclares` says its declared surface — counting the
+// INHERITED members, as stdlib §1's "Block-by-name" row states — names
+// `member`.
+bool isInterfaceCollectionSurfaceHead(std::string_view head) {
+    const char* section = nullptr;
+    const char* surface = nullptr;
+    return sema::builtinCollectionInterfaceSurface(head, section, surface);
+}
+bool interfaceCollectionHeadDeclares(std::string_view head,
+                                     std::string_view member) {
+    return sema::isDocumentedBuiltinCollectionMember(head, member);
+}
 }  // namespace bezel::common

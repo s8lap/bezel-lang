@@ -1023,6 +1023,22 @@ bool isConcreteCollectionSurfaceHead(std::string_view head);
 bool concreteCollectionHeadDeclares(std::string_view head,
                                     std::string_view member);
 
+// fix #7990 (§26.5 rules 1-2, §22.6, v0.350; stdlib §4.1 / §4.2 / §4.12 /
+// §4.13): the COLLECTION INTERFACE heads' declared instance surface, owned by
+// sema (`builtinCollectionInterfaceSurface` /
+// `isDocumentedBuiltinCollectionMember`). `isInterfaceCollectionSurfaceHead`
+// says the head is one of the eight stdlib §4 collection interfaces;
+// `interfaceCollectionHeadDeclares` says its declared surface — counting the
+// INHERITED members — names `member`. Codegen asks both so a name-keyed
+// built-in arm (Peek, Push, Enqueue, ...) declines a call that sema bound to
+// a user extension on an interface head that does not declare the name: the
+// borrowing LIST interfaces' runtime value is the array-backed `bz_array_t*`
+// the built-in arms reach, so without the decline the built-in swallowed the
+// extension.
+bool isInterfaceCollectionSurfaceHead(std::string_view head);
+bool interfaceCollectionHeadDeclares(std::string_view head,
+                                     std::string_view member);
+
 // fix #3670 (stdlib §5, v0.286): does `m` take a single lambda argument
 // `(T) -> …` seeded with the LINQ receiver's own source element type T, so an
 // un-annotated lambda parameter (`(p) => p.x`) can be typed as T (§27.4's

@@ -3456,6 +3456,42 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 return nullptr;
         }
     }
+    // fix #7990 (§26.5 rules 1-2, §22.6, v0.350; stdlib §4.1): the same
+    // decline for the COLLECTION INTERFACE heads. #7946's decline asks the
+    // CONCRETE head's declared surface, and the interface heads have no row
+    // there — but the borrowing LIST interfaces (`IList<T>` /
+    // `IReadOnlyList<T>`, stdlib §4.1) are array-backed at runtime: their
+    // value is the same `bz_array_t*` the concrete `Array<T>` carries, which
+    // is why `isBorrowingListIface` above folds them into `isArr` and the
+    // name-keyed arms (Peek, Push, Enqueue, ...) reach them.
+    //
+    // MEASURED: `extension IList<int> { Peek(n: int): int => 7 }` with
+    // `a.Peek(10)` on an `IList<int>` receiver printed 0 — the built-in arm's
+    // out-of-range array read — where the extension's 7 is the answer.
+    // stdlib §4.1 declares `IReadOnlyList<T>` / `IList<T>` with `Count`, the
+    // indexer, `GetEnumerator`, and (for `IList<T>`) `IsReadOnly`, `Add`,
+    // `Clear`, `Contains`, `Remove` and `Insert` — and NO `Peek`, `Push` or
+    // `Enqueue`. So §26.5 rule 1 did not commit, §26.5 rule 2 selected the
+    // extension, and §22.6 bound the call to it; the name-keyed built-in arm
+    // then lowered it as the built-in member instead. The same holds for
+    // `IReadOnlyList<T>`; the `ICollection<T>` / `IEnumerable<T>` heads
+    // already answered by the extension, because they are not list
+    // interfaces and the array bridge does not reach them.
+    //
+    // The decline happens BEFORE any receiver IR is emitted, so the receiver
+    // expression is evaluated exactly once (§26.7) by the extension lowering.
+    // A name the interface DOES declare keeps its built-in arm — §26.5 rule 1
+    // commits those, and sema consults the extensions for them too.
+    {
+        auto* msY =
+            dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+        if (isExtensionMethod(msY) && recvTy && !recvTy->declaration) {
+            const std::string_view headY = builtinTypeName(recvTy);
+            if (common::isInterfaceCollectionSurfaceHead(headY) &&
+                !common::interfaceCollectionHeadDeclares(headY, m))
+                return nullptr;
+        }
+    }
     if (m == "Length" || m == "Count") {
         auto* ms =
             dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
