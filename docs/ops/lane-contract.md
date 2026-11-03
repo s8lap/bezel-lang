@@ -148,6 +148,25 @@ SPECIFIC to its assignment.*
     and then read it in, which is ~400 000 tokens — it died with the enumeration in its context and
     produced no verdict. The same applies to build logs, gtest logs, generated sources and
     enumerations. **You want the `N passed, 0 failed` summary line, not the 22 000 lines above it.**
+    **⇒ AND A BROAD `grep` OVER A HUGE FILE IS STILL A DEATH — THE CAP IS PART OF THE RULE.**
+    The spec corpus is enormous, and a lane that greps it without a cap dies the same way:
+
+    | file | size | lines |
+    |---|---|---|
+    | `docs/Bezel_Language_Spec.md` | **2 265 655 B** | 13 315 |
+    | `docs/Bezel_Standard_Library.md` | **641 334 B** | 5 778 |
+    | `docs/Bezel_For_Code_Generation.md` | **289 586 B** | 2 965 |
+
+    **⇒ THE MECHANICAL PROTOCOL FOR A HUGE FILE — NO EXCEPTIONS:**
+    1. **NEVER `cat`, `read`, or `tail` a file over 50 KB.** Find the range first:
+       `grep -n "^## §28" docs/Bezel_Language_Spec.md | head -20` — **the `head -20` IS THE CAP
+       AND IT IS NOT OPTIONAL.** A bare `grep -n "^§" ` over the spec returns thousands of lines.
+    2. **Then read only that range**: `sed -n '6700,6760p' docs/Bezel_Language_Spec.md`.
+    3. **⇒ EVERY `grep` AND EVERY `sed` OVER A HUGE FILE MUST BE CAPPED** — with `| head -40`, or
+       by choosing a narrow range. **A CAPLESS `grep` IS EQUIVALENT TO READING THE FILE WHOLE.**
+    4. **⇒ QUOTE ONLY THE LINES YOU NEED** (a spec citation is one line plus its section heading),
+       never a block of the section.
+    5. **⇒ IF A FILE'S SIZE SURPRISES YOU, `wc -c` IT BEFORE READING IT — ALWAYS.**
 25. **Write your report to disk as you go, and keep your final message short.** After each
     substantial step, append what you have found to your report file. If you are interrupted, the
     file holds everything you finished — a lane that dies mid-run with its findings only in its
