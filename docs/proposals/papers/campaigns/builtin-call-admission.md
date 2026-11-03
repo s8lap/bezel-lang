@@ -3068,6 +3068,172 @@ reviewers own NO source file at all.
    NEVER BISECT.**
 5. **⇒ THEN REFRESH master-plan §6 AND DELETE THE HEARTBEAT SCHEDULE.**
 
+## Coordinator block — 2026-11-03 23:45 → 2026-11-04 00:01 (FOUR LANES DIED IN ONE WINDOW, THE HAUL REACHES 112, AND A BODY CLAIM IS DEFERRED FOR THE SECOND TIME)
+
+### 1. THE HAUL IS **112/100** — AND EVERY PICK WAS VERIFIED BEFORE IT LANDED
+
+```
+$ scripts/pick_ledger.sh origin/main..r30-c1        # on the staging tip c3c33264
+distinct fix issues: 100 (0 from inferred kinds)
+distinct issues named (all kinds): 100
+distinct issues GitHub would close (keyword rule, subject+body, any kind): 112
+github-closable issues: 112
+UNATTRIBUTED: 0
+```
+
+**⇒ THE EIGHT PICKS OF THIS BLOCK, EACH VERIFIED WITH `scripts/pick_issues.sh --github` (EXACTLY the
+intended issues, no second binding naming a still-OPEN issue):**
+
+| source sha | picked as | reviewer | verdict | issues closed |
+|---|---|---|---|---|
+| `6924b51f` | `dd527c15` | `r38-w108-review18` | ACCEPT-W-NOTES | #7901 |
+| `c4600284` | `27763f7b` | `r38-w108-review18` | ACCEPT | #7953 |
+| `8e1718b7` | `054fc488` | `r38-w108-review18` | ACCEPT | #7751 #7944 |
+| `6f64c69c4` | `e35122e6` | `r38-w107-review17` | ACCEPT-W-NOTES | #7165 |
+| `342bd60d` | `373cc7cf` | `r38-w107-review17` | ACCEPT-W-NOTES | #7824 |
+| `80d170ef` | `72dad910` | `r38-w107-review17` | ACCEPT-W-NOTES | #7990 |
+| `80c83724` | `e5f9ffae` | `r38-w107-review17` | ACCEPT-W-NOTES | #7577 #6811 #6823 |
+| `a53e6d9f` | `c3c33264` | `r38-w107-review17` | ACCEPT-W-NOTES | #8004 |
+
+**⇒ ⇒ ⇒ THE HAUL MOVED 101 → 112 ON EIGHT PICKS, AND **NO** PICK WAS MADE ON A COMMIT WHOSE REVIEW
+SAID REJECT. ⇒ ⇒ ⇒ `80c83724` ALSO CHANGES `scripts/` (the admission grid), SO THE HOUSE RULE APPLIED:
+`python3 -m unittest discover -s scripts/gate/tests` MUST BE GREEN **WITH IT IN THE TREE** — the
+reviewer MEASURED IT: **at the pick-shaped tree (the staging tip + that commit's `scripts/` diff) it
+is `Ran 1189 tests … OK (skipped=2)`**, while at the LANE's own tree it is RED — **and the failure is
+INHERITED from the lane's stale base `0b154fdc` (the repo-identity test `#3413`, fixed on staging in
+`db3c76aa`), NOT CAUSED BY THE COMMIT ⇒ ⇒ ⇒ THE COMMIT WAS PICKED AS A CHERRY-PICK, NOT BY MOVING THE
+BRANCH.** ⇒ ⇒ ⇒ THAT IS THE HOUSE RULE LEARNED THE HARD WAY: **A `scripts/` CHANGE IS NOT DONE UNTIL
+THE SCRIPT SELF-TEST IS GREEN ON THE TREE THE PICK PRODUCES.**
+
+### 2. ⚠ FOUR LANES DIED IN ONE WINDOW — **AND THE BOX WAS QUIET WHEN THEY DIED**
+
+**MEASURED 23:46 → 00:01: `r38-p85-residual5`, `r38-p88-residual6`, `r38-w107-review17` and
+`r38-w108-review18` ALL ENDED, and the pool fell to ONE of five.** ⇒ **⇒ ⇒ AND THE CAUSE WAS *NOT*
+RESOURCE EXHAUSTION: the box was CLEAN at the moment they died — `builders: CLEAN — nothing
+building`, `jobserver: available=20 held=0 builds=0`, MemAvailable 24.7 G, disk 81%, 0 stale
+processes. ⇒ ⇒ ⇒ THE LANES' SESSIONS ENDED; THEY DID NOT OOM AND NOTHING WAS REAPED.**
+
+**⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND HERE IS THE PART THAT MATTERS: ALL FOUR DEAD LANES HAD ALREADY DELIVERED.**
+
+| lane | what it delivered before its session ended |
+|---|---|
+| `r38-p85-residual5` | **TWO COMMITS** — `91a85a70` (#7947) and `ee9d92c3` (#7765) — plus a 15 KB `REPORT.md` naming its residuals |
+| `r38-p88-residual6` | **TWO COMMITS** — `2b9d116a` (#8014) and `70a512be` (#7659, the long-blocked fix-forward) |
+| `r38-w107-review17` | **A 42 KB `REVIEW.md` WITH FIVE VERDICTS** (all ACCEPT-W-NOTES) — and it had MEASURED the grid's cell counts and the `scripts/` self-test |
+| `r38-w108-review18` | **A 44 KB `REVIEW.md` WITH FOUR VERDICTS** — and it had RE-MEASURED the re-land's RED→GREEN arms |
+
+**⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE APPEND-ONLY LEDGER IS WHAT MADE THAT VISIBLE. A DYING LANE COSTS A SLOT, NOT ITS
+WORK — BUT ONLY IF THE COORDINATOR GOES AND LOOKS. ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE LESSON IS SHARP: **THE POOL
+FELL TO 1 OF 5 WHILE THREE REVIEWERS' VERDICTS AND FOUR PRODUCERS' COMMITS WERE SITTING UNPICKED. ⇒ ⇒
+⇒ ⇒ ⇒ ⇒ THE RECOVERY MUST BE IMMEDIATE, AND THE FIRST THING THE COORDINATOR DOES ON A DEAD LANE IS
+HARVEST, NOT REPLACE.**
+
+### 3. ⚠ THE SECOND BODY-DEFECT DEFERRAL — AND THE RULE IT SHARPENED
+
+`r38-w108-review18` returned **ACCEPT-W-NOTES** on `617a9ef1` (#7874) and said **PICK**. ⇒ **THE
+COORDINATOR DID NOT PICK IT. ⇒ ⇒ ⇒ THE REVIEWER'S OWN FINDING F2 SAID: *"the section number does not
+match the section's title at v0.353. (At v0.350 §5.1 was **presumably** the LINQ block; the number has
+shifted.)"* ⇒ ⇒ ⇒ AND THE COORDINATOR MEASURED THE PREMISE AND IT WAS FALSE:**
+
+```
+$ git show 243b133a:docs/Bezel_Standard_Library.md | sed -n '3619p;3674p;3760p'   # 243b133a IS v0.350
+## 5. `System.Collections.Linq` (auto-imported)
+  public method Min<U>(selector: (T) -> U): U where U: IComparable<U>;
+### 5.1 No-selector aggregation overloads
+```
+
+⇒ **AT v0.350 §5.1 WAS ALREADY "No-selector aggregation overloads", THE SELECTOR OVERLOADS WERE
+ALREADY IN §5, AND THE LINE NUMBERS ARE THE SAME AT v0.353. ⇒ ⇒ ⇒ THE NUMBER NEVER SHIFTED — SO THE
+COMMIT'S CLAIM *"stdlib §5.1 (v0.350) declares, on the array/sequence surface, `public method
+Min<U>(selector: (T) -> U): U where U: IComparable<U>;`"* IS FALSE **AT THE VERY VERSION IT CITES**,
+AND IT IS A VERIFIED FALSE CLAUSE, NOT A "NUMBER SHIFTED" NIT.**
+
+**⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE RULE, NOW SHARPENED AND WRITTEN DOWN:**
+> **⇒ A CITATION THAT IS WRONG *AT THE VERSION IT CITES* IS A BODY DEFECT AND THE PICK IS **DEFERRED**
+> — EVEN WHEN THE REVIEWER SAYS "PICK". ⇒ ⇒ ⇒ ⇒ A CITATION WHOSE SECTION NUMBER IS RIGHT BUT WHOSE
+> PARENTHETICAL VERSION LABEL IS MERELY STALE IS A **NOTE** AND THE PICK **STANDS** (that is the
+> difference between `617a9ef1`'s §5.1 and `6924b51f`'s "stdlib §2.2 (v0.350)"). ⇒ ⇒ ⇒ ⇒ ⇒ THE TEST
+> IS ALWAYS THE SAME: **OPEN THE CITED REVISION AND LOOK.****
+
+**⇒ ⇒ ⇒ THE FIX WAS THE REVIEWER'S OWN PRESCRIPTION ("re-label the citation `stdlib §5` (not
+§5.1)") — SO THE COMMIT WAS RE-LANDED, NOT AMENDED.** ⇒ **⇒ ⇒ THE RE-LAND IS `76582733` ON A NEW
+BRANCH `r38-c98-reland7874` (worktree `/mnt/fast/worktrees/r38-c98-reland7874`, base = the staging
+tip), AND ITS CODE IS **PROVABLY** UNCHANGED:**
+
+```
+$ git show 617a9ef1  --format="" | git patch-id --stable
+c74fe88b383e8befeb5f5bd888b6fc77274f5e76  0000000000000000000000000000000000000000
+$ git show 76582733 --format="" | git patch-id --stable
+c74fe88b383e8befeb5f5bd888b6fc77274f5e76  0000000000000000000000000000000000000000
+# and BOTH touched blobs are byte-identical
+```
+
+⇒ ⇒ ⇒ **THE MESSAGE DIFFERS IN EXACTLY TWO PLACES: the SUBJECT (re-titled to the FOUR heads the commit
+actually fixes — `DateTime`/`TimeSpan`/`DateOnly`/`TimeOnly` — because the reviewer's F1 MEASURED that
+`Array<Guid>.Min/Max(sel)` is STILL BROKEN, and the old subject's "over a VALUE-TYPE selector"
+OVERCLAIMED), AND THE ONE BODY LINE `stdlib §5 (v0.350) declares`.** ⇒ ⇒ ⇒ **⇒ A NEW SHA WITH A NEW
+BODY NEEDS A NEW VERDICT ⇒ IT IS AWAITING `r38-w108-review18`'s (RESUMED) VERDICT, AND IT IS NOT
+PICKED.**
+
+**⇒ ⇒ ⇒ AND THE P99 RE-LAND OF `#7751`/`#7944` WAS THE SAME SHAPE, ONE STEP EARLIER: `8e1718b7`
+carries `r38-w105-review15`'s EXACT REWORDING, its RED arm was **MEASURED BY THE LANE ITSELF**
+(`7 passed, 10 failed, 9261 filtered` at `5952668f` — matching the reviewer), the ancestry claim is
+TRUE (`a27c4a93` ancestor of `5952668f` → exit 0; `0b154fdc` → exit 1), and the reviewer's own
+re-measurement confirmed it (`F2 — severity: NONE — the RED→GREEN numbers in the body are TRUE`).**
+
+### 4. THE POOL AFTER THE REFILL — FIVE LANES, TWO REVIEWERS RESUMED/FRESH, TWO PRODUCERS
+
+| lane | role | what it owes | hot files |
+|---|---|---|---|
+| `r38-w108-review18` (**RESUMED**) | REVIEWER | the re-land `76582733` (#7874) + `2b9d116a` (#8014) + `70a512be` (#7659) + **THE RATCHET SWEEP, STILL NOT MEASURED** | none (it edits no source) |
+| `r38-w109-review19` (**NEW**) | REVIEWER | `91a85a70` (#7947) + `ee9d92c3` (#7765) — **and the CRUX: does a REJECTION discharge #7947, whose complaint is an IR-verifier CRASH?** | none |
+| `r38-p100-strings` (**NEW**) | PRODUCER | the STRING / `StringBuilder` surface: #7592 (a function value appended ⇒ **heap corruption**), #7741 (a +1 producer local leaks 200×), #7804 (an inline string array leaks), #7814 (`AppendFormat` renders the wrong text) — **and #7494 is REPORT-ONLY, it belongs to the parameter table** | `src/codegen/LlvmBackend_String.cpp` |
+| `r38-p96-ownership` (**RESUMED**) | PRODUCER | the OWNED/ BORROWING / PURE-BODY family: #7856, #8031 (a `case` initializer never captures its owned scrutinee — 224 B / 3 allocs), #8033 (**a DANGLING borrow — a use-after-free**), #7852, #7907, #7453 | `src/sema/{Sendability,SymbolCollection,DefiniteAssignment,ConstFold,PureChecker}.cpp` |
+| `r38-p95-boxing` (**LIVE**) | PRODUCER | the boxing / materializer-temp family: #7817 #7844 #7937 #7822 #7855 | `src/codegen/LlvmBackend_{Assign,Exprs2,Disposal,Layout}.cpp` |
+
+**⇒ ⇒ ⇒ THE HOT FILES ARE DISJOINT, AND THE REVIEWERS OWN NO SOURCE AT ALL. ⇒ ⇒ ⇒ AND THE THREE
+FREE-FILE CLUSTERS THAT WERE OPENED TONIGHT ARE NOW ALL CLAIMED: `LlvmBackend_String.cpp` (p100), the
+five sema ownership/pure-body files (p96), and the re-land branch `r38-c98-reland7874` (w108's
+review).**
+
+**⇒ ⇒ ⇒ ⚠ `r38-p96-ownership`'s WORKTREE CAME BACK WITH AN UNCOMMITTED CHANGE TO
+`src/sema/PureChecker.cpp` — IT DIED MID-WORK. ⇒ ⇒ ⇒ THE RESUME BRIEF SAYS EXPLICITLY: LOOK AT THE
+DIFF FIRST, FINISH IT OR REDO IT CLEANLY, AND **DO NOT `git stash`** (FORBIDDEN IN THIS RUN) AND DO NOT
+DISCARD IT BLINDLY.**
+
+### 5. THE RESIDUALS THE REVIEWERS MEASURED AND THE COORDINATOR OWNS
+
+**⇒ ⇒ ⇒ `r38-w107-review17` MEASURED AND REPORTED, AND THE COORDINATOR MUST FILE THEM:**
+* **`#7824`'s PRIMITIVE RECEIVER IS A REAL, STILL-OPEN DEFECT** — `extension int { ToString(n: int): string }`
+  with `x.ToString(3)` **COMPILES AND THEN CRASHES AT RUN TIME** ⇒ a NEW ISSUE, not a closure of #7824.
+* **THE `Grid` CELL COUNTS: BEFORE 118 cells / 5 wrong; AFTER 118 cells / 3 wrong** ⇒ the three that
+  remain wrong are `builtin_typearg_arity`, `builtin_typearg_list` and `math_abs_float`.
+* **`r38-w108-review18` MEASURED, AND ITS COORDINATOR ACTIONS ARE OPEN:** the **SPEC-QUESTION** for
+  stdlib §2.2's `low > high: ArgumentException` annotation versus its prose (**⇒ IF THE ANNOTATION
+  GOVERNS, THE FIX-FORWARD RAISES IN **ALL SIX** ARMS, NOT TWO**); the **`Array<Guid>.Min/Max(sel)`**
+  residual (a value type WIDER THAN ONE WORD); and the **no-selector `Array<DateTime>.Min()`** result
+  type (`int`). ⇒ ⇒ ⇒ **THE COORDINATOR HAS ASKED THE REVIEWER TO WRITE ALL THREE AS
+  READY-TO-FILE DRAFTS (`NEW-ISSUES.md`) — THE COORDINATOR FILES THEM, THE REVIEWER DOES NOT.**
+
+### 6. WHAT IS STILL MISSING, AND THE NEXT MOVES
+
+1. **⇒ PICK AS VERDICTS LAND** — `scripts/pick_stage.sh --branch r30-c1 --pool r38 --lane <branch>
+   --reviewer <rev> --verdict ACCEPT|ACCEPT-W-NOTES --kind fix <sha>`, each pick verified with
+   `scripts/pick_issues.sh --github`.
+2. **⇒ ⇒ ⇒ AND THE ONE GATE'S FLOOR IS MET WITH ROOM TO SPARE: 112 ≥ 100. ⇒ ⇒ ⇒ EVERYTHING FROM HERE
+   IS MARGIN — BUT THE MARGIN THAT MATTERS MOST IS THE *REVIEW* THROUGHPUT, because every unpicked
+   commit is a closure that does not happen.**
+3. **⇒ THE RATCHET SWEEP IS STILL NOT MEASURED** (both reviewers marked it NOT MEASURED for load) ⇒
+   **⇒ IT IS NOW AN EXPLICIT TASK OF `r38-w108-review18`, WITH THE BOX QUIET.** ⇒ ⇒ ⇒ AND THE
+   KNOWN TRAP: `check_internal_residual` reads RED in a sweep only because of a **STALE `build/bezelc`
+   IN THE STAGING WORKTREE** ⇒ the final gate must rebuild `bezelc` AND the test binaries ON THE TIP.
+4. **⇒ THE GATE IS ONE, NEAR THE END (2026-11-05 ~00:00–02:00 NZDT)**: rebuild on the tip,
+   `scripts/ratchet_sweep.sh` 25/25 GREEN, `scripts/pregate.sh` prints READY, **FREEZE THE TREE (no more
+   picks)**, then `setsid nohup scripts/gate_and_push.sh > LOG 2>&1 < /dev/null &` and
+   `scripts/wait_pid.sh "$BEZEL_GATE_PIDFILE"`. **⇒ ON FAIL: NARROW FIX-FORWARD ONLY — NEVER REVERT,
+   NEVER BISECT.**
+5. **⇒ THEN REFRESH master-plan §6 AND DELETE THE HEARTBEAT SCHEDULE.**
+
 ## Exit review
 
 *(to be written by the campaign's exit reviewer — not this lane)*
