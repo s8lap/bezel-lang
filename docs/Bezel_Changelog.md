@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.350 — October 2026**
+**Companion to the Bezel Language Specification, v0.353 — November 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -15597,5 +15597,104 @@ The independent critique accepted the train with fixes. Its substantive findings
   - **Coverage gaps not written** (recorded in proposal 0210 §8): 0210's `warn` and `quiet` rows, which need the replacing `move` to parse to be measured; the purely local collection's `quiet` row.
 
 **Checks.** `scripts/check_docs.sh` passes on the composed tree, with this entry, the four version headers and the code-generation reference's three pin lines at v0.350; EXTRACT finds 553 fragments, the same count as v0.349. `scripts/check_proposals.sh` passes (201 ↔ 201; accepted 21, graduated 152). `scripts/check_src_citations.py`, `corpus.py lint --strict` (3,693 cases), `corpus.py check` and `scripts/build_book.py --check` are clean.
+
+---
+
+### v0.351 changelog (v0.350 → v0.351)
+
+**Editorial: the rationale states the current design, a too-wide table is restructured, Guide 1 corrects a trust claim, and bolding is reduced across the spec, the rationale and the guides.** On 2026-11-03 the owner asked for five things. First, that rationale §5.1 describe the current language rather than earlier revisions, leaving version history to the changelog. Second, that §5.4 stop saying the language has no shared ownership. Third, noting that "the rationale reads a lot like a less-formal version of the changelog". Fourth, that §28.3.5's table stop forcing horizontal scrolling in the book. Fifth, that Guide 1 link the trust-admission work, and that bolding be reduced where it no longer helps: "more than half the time bold text actually helps with understanding … Yet sometimes it feels like there is too much bolding, especially in the guides and the rationale." Class: **editorial** (spec-change process §2). No rule, verdict, grammar or diagnostic changes.
+
+**The bolding policy.** Bold stays on the defining occurrence of a term, on run-in lead-ins that act as headings, and on verdict words in tables. It comes off emphasis inside running prose, a term already bolded where it was defined, whole bolded clauses and stacked bold-italic. Where a sentence would misread without emphasis, the bold became italics. No wording changed in the bolding pass, and no code block, heading or anchor was touched by it.
+
+**The spec.**
+- **Spec §28.3.5 — the announcement table is restructured for the rendered book (editorial; no rule change).** The eight-column matrix (rows up to ~2,500 characters) forced horizontal scrolling and hid its last columns. It is now a six-column summary table giving each cell's verdict only (row × callee kind: *Owned*, *Owned frame*, *Borrow*, *rejected*, *cannot arise*, *not applicable*, *as row 2*, *as instance*), followed by one run-in note per row (headed *Row N* and the declared return kind) that carries the old cells' full text: the declared return kind, each callee kind's cell, the callee-side admission and the cite. Row numbers, the anchor `sec-announcement-table`, the column names other sections cite ("the static column", "the function-value column") and the Keying/Inheritance/Not-calls reading rules are unchanged. Row 3 ("identical to row 2" in every cell) now reads as one line. The intro's "the *Cite* column" becomes "each row note's *Cite* line", and a reference elsewhere to "the row's cell" becomes "the row's note". The longest table cell goes from 1,251 to 55 characters, and the longest row from 2,543 to 151.
+- **Spec — bolding pass (editorial).** Bold spans outside code: 3,658 → 2,625 (≈12.3 → 8.8 per 1,000 words by this lane's count). Bold stays on defining occurrences, run-in lead-ins and table verdict words. It comes off emphasis words in prose (`**not**`, `**only**`, `**every**`, …), verdict words in running prose (`is a **compile error**`), whole bolded clauses and sentences, and repeat bolding of a term already bolded earlier. Two broken nested-bold lead-ins are repaired (§11.2's `owned`-on-mint-announcing bullet; §22.8's single-assignment lead-in), and the §28 glossary's stacked bold+italic terms become plain bold. No wording changed, and no code block, heading or anchor was touched.
+
+**The guides.**
+- **Guide 1 §3, *Borrowing*.** The sentence that called a stashed plain-field reference "guaranteed to outlive the holder" now says what the rule is: the store is a recorded trust admission (spec §28.3.1, K4.3), backstopped at run time by checked mode's disposed flag (K4.1), listed by `--report-trust-admissions` (§28.3.12), with a `scoped` class-typed parameter (§28.14) as the static spelling. It also links the ongoing work on the trust surface: research `trust-admissions-by-kind` and `trust-report-review`, and work package #7509. §5's back-reference bullet is corrected the same way ("should outlive … your promise, not the compiler's proof"), and §5's two citations are narrowed to §28.3.1 and §28.3.12. Editorial: no rule changes.
+- **Guides 1–7, bolding.** Removed bold that was only emphasis in running prose, that repeated an already-defined term, or that covered a whole clause or sentence. Kept defining occurrences and run-in lead-ins. 165 spans unbolded, with no wording changed. Bold spans per 1000 words before → after: Guide 01 6.9 → 3.8, 02 7.2 → 4.2, 03 15.0 → 7.5, 04 18.1 → 10.0, 05 12.7 → 4.1, 06 14.1 → 6.3, 07 18.2 → 14.4.
+
+**The rationale.**
+- **Rationale §5.1 (`owned`, not borrows) restated for the current language (editorial).** The section now describes the model as it stands: the ownership kernel (spec §28.3.1, K1–K9) and its axiom register; the runtime backstop (K4.1) under checked disposal, the default build; the freeze (K5) as a two-part criterion (keyword-visible, and a flag that backstops every surviving borrow), with the reason for each placement, including its two recorded failure shapes (§28.14 storage-bounded captures, §30.12 guards) and why spans are not a third; the five rules where analysis the compiler already runs makes the static error free (the join rule, a dominated use per proposal 0205, a use after a dominating field write per proposal 0206, the dispose capability, captured owned bindings); and the recorded trust admissions (K4.3) with the report mode. The revision-by-revision notes (v0.157, v0.180, v0.184, v0.198 and the proposal records) are dissolved into those paragraphs. Every reason and every decline is kept. The dropped history (which revision added what, #1465's narrowing, the span exception added at v0.331 and withdrawn at v0.332) is already in the changelog.
+- **Rationale §5.4 retitled *Single ownership by default; sharing is opt-in* (editorial; anchor `sec-no-shared-ownership` kept).** The section used to say the language has no shared ownership and contradicted itself in a closing note. It now states the current design: single ownership is the only implicit regime; `Shared<T>`/`Weak<T>` (spec §28.13, stdlib §2.16) are opt-in, with every additional holder an explicit `Clone()` (or `TryUpgrade()` from a `Weak<T>`); handle-and-table indirection (`OwningSlotMap<T>`), channels and the runtime-managed region cover most of what looks like sharing; and five alternatives are declined with their reasons (implicit handle duplication, a tracing collector or cycle detection, annotation-driven refcounting of arbitrary classes, escape-analysis-inferred sharing, a third reference kind). §5.21's opening no longer calls the types "the library type §5.4 predicted"; it defers to §5.4 for the posture.
+- **Rationale §5.3 retitled *Collections borrow by default; owning collections are named* (editorial; anchor kept).** The option list and the resolution are stated without the v0.52–v0.97 dates, and the `DisposeElements()` retirement note is folded into the paragraph.
+- **Rationale chapter 5: revision narration removed where it was cheap (editorial).** Version tags are dropped from the headings of §5.24–§5.31. The defect history is cut from §5.2's opening (it is recorded in proposal 0200 and the v0.345 entry). §5.30 and §5.31 are restated in the present tense, and §5.31's entries keep their proposal and issue links but lose their revision tags.
+- **Rationale bolding pass (editorial).** 290 bold spans unbolded, leaving defining occurrences, run-in lead-ins and option labels: 894 spans down to 602, 6.7 down to 4.5 per 1000 words, code excluded. One stacked bold-italic span is reduced to italic. No wording changed in the unbolding.
+
+**Proposals.** DECLINED.md's citation of rationale §5.3 uses the section's new title.
+
+**Checks.**
+- `scripts/check_docs.sh` (all phases), `check_proposals.sh`, `build_book.py --check` and `check_src_citations.py` are clean.
+- The site was rendered with mdBook 0.4.52. At 1280 px, §28.3.5's summary table fits with no horizontal scroll.
+- A non-author critic reviewed every lane. Mechanically, each bolding edit changes markup only. By spot-check, it restored two lost definition labels and eight contrastive emphases, and corrected six statements in the rewritten rationale sections against the spec text.
+
+**Migration:** doc-only.
+
+---
+
+### v0.352 changelog (v0.351 → v0.352)
+
+**Editorial: rationale §5.1's freeze paragraph and the planned trust-admission work.** At the owner's request (2026-11-03). Class: **editorial** (spec-change process §2). No rule changes.
+
+- **The freeze paragraph's lead-in.** It was a bolded sentence about "silent kills" and "announced kills". It is now the short label *The freeze*, followed by the same sentence in plain text, so the word *kills* no longer stands out.
+- **The trust paragraph** now says that shrinking the recorded set is planned work. It summarises the [trust-admissions-by-kind research](research/trust-admissions-by-kind/README.md) and links the work package [#7509](https://github.com/s8lap/bezel-lang/issues/7509):
+  - derived retention for short-lived helpers ([proposal 0132](proposals/0132-derived-retention-study.md)'s mechanism, which the model finds sound);
+  - a weak reference over ordinary owned objects for long-lived observers;
+  - `scoped` for calls whose body the compiler cannot see;
+  - an opt-in strict mode once the trust report is complete.
+
+**Migration:** doc-only.
+
+---
+
+### v0.353 changelog (v0.352 → v0.353)
+
+**Editorial: the rationale states the current design.** On 2026-11-03 the owner asked that the rationale stop reading "a lot like a less-formal version of the changelog": "We should talk about the current state of the language rather than the historic state unless explicitly discussing the historic state … leave that to the changelog … assuming it doesn't take anything meaningful away from the text." v0.351 did this for rationale §5.1, §5.3 and §5.4. This revision does it for the rest of the document ([#8038](https://github.com/s8lap/bezel-lang/issues/8038)), and corrects §5.21 against spec §28.13 ([#8039](https://github.com/s8lap/bezel-lang/issues/8039)). Class: **editorial** (spec-change process §2). No rule, verdict, grammar or diagnostic changes.
+
+**The treatment.** Each section states the rule as it stands at spec v0.352, and its reasons, first and in the present tense. A "vN added / narrowed / ruled" narration becomes the reason it records. Where the changelog or a proposal already carries the fact, the narration is dropped; each dropped fact was checked against the changelog. Where the rationale was the only record of something that matters, the fact stays as an explicit *Historical note*. Every reason and every decline is kept, with its proposal, issue or `DECLINED.md` link. Tombstones and changelog-entry pointers stay ("A2 retired v0.258", "the v0.140 entry"). Code blocks and anchors are untouched. Headline counts for the rationale:
+- `v0.NNN` mentions: 1,094 → 108. What remains is in historical notes, tombstones, pointers and §12.10's reversal record.
+- Headings carrying a revision tag: 46 → 0. Only the tag was removed; no heading was otherwise reworded except §11.3's subsection.
+- Words: about 134,700 → 124,300. *Historical note* paragraphs: 0 → 21.
+- "Declined", "rejected", "considered" and "alternative": 622 occurrences before and after.
+
+**The rationale.**
+- **§2, §3, §6–§10 (lane B).** Version mentions 298 → 22. The revision tags come off the ruling lead-ins, and the issue and proposal numbers stay.
+  - §3.10 now reads: the `move` marker; why `move` and not `owned` (proposal 0090); the redundant-marker decline (0102 §2); `out var x` adoption (0122 L2); and no overload pair differing only by `owned` (0185). It ends with a *Historical note* on the admitted pair (0091).
+  - §3.14 states that named slots have no transfer spelling (0183), with a *Historical note* on the retired marked slot (0092).
+  - §8.1 leads with the current `Object`-slot rules (#5664; proposals 0160, 0155). The two-member model that 0155 and 0158 patched becomes a *Historical note*. The residual-split example is corrected to an `Equals` at another type (spec §12.2), because the own-typed `Equals(Point)` it used is now the slot.
+  - The function-value hash paragraph (0173) moves from §8.1 to §7.3.
+  - §9.10, §9.15 and §10 are regrouped by topic. §10 gains a one-line guide to its seven groups, and its "the v0.3NN paragraph above" cross-references now name the issue.
+  - Smaller corrections: §2.4's deferral pointer now points at §9.10; §2.3 no longer gives a stale name count; §3.9 no longer cites the retired `AppendOwned`.
+- **§4, §5.19, §5.22, §11, §12 (lane C).** §4.2's span-interface records split into a present-tense paragraph on what still holds and a *Historical note* on the retired `IReadOnlySpan<TElement>` rules. §5.19 is restated as the current architecture (about 6,000 → 2,900 words). Its v0.114–v0.124 staging and the v0.120/v0.123 working-outs become one historical note, which keeps the Java corroboration of the two-phase design. §5.19 also no longer says classes are ineligible; a class's shape is §5.22's. §5.22 opens with the type-driven rule. §11.3's *Why the change was deferred* is retitled *Three objections to the arm form* (anchor kept). The "vN addendum" labels in §12 become plain lead-ins. §12.10's fence history and §12.13's *three types held at the default* become historical notes.
+- **§5.2–§5.18, §5.20, §5.21, §5.23–§5.29 (lane A).** Version mentions 362 → 19, and §5.15 alone goes from 126 to 1.
+  - §5.10 opens with the replacing `move` (K9.1, K9.2). The restoration-window narrowings (proposals 0163 and 0170, #3240) are one *Historical note* that keeps all their declines.
+  - §5.15's `IReadOnlySpan<TElement>` design and the conditional-member register (proposal 0116) become historical notes. The 5–10× dispatch-cost figure is kept; it is recorded nowhere else.
+  - Stale statements are corrected to the current rule:
+    - §5.7: a sourceless bare-`T` static return is rejected at the declaration (spec §28.3.6), not owned-with-warning.
+    - §5.12: the yield split is stated over the borrowing and owning enumeration interfaces.
+    - §5.15: the byte read tier is on the two read-only byte spans, and a nullable-slot take leaves `null`.
+    - §5.20: a borrow stored in a user field is a recorded trust clause (K4.3).
+    - §5.23: the deleted field-restoration rule is no longer cited.
+  - §5.28's lints now say where they became an error (proposal 0207) or were retired.
+- **§5.21 — `Shared<T>` across domains ([#8039](https://github.com/s8lap/bezel-lang/issues/8039)).** *Why domain-local* contradicted spec §28.13. It becomes *When a handle may cross domains*. `Shared<T>` is sendable exactly when its payload is in the `Shared`-payload synchronized set, and its handle count is then synchronized. Over any other payload it stays domain-local, because a synchronized count would not make an unsynchronized value safe to reach from two domains. The `MutexHandle`, annotation-refcounting and escape-analysis declines are kept.
+- **§12.6 — channels, sendability and the multi-consumer blocker.**
+  - Two items from §18 now live here: the `where T: sendable` constraint (spec §14.2, proposal 0049 train B), with §12.5's Send/Sync decline standing untouched; and the `ReceiveAll()` drain (spec §30.15).
+  - The multi-consumer deferral used to cite "§28.13's unresolved domain-locality for the synchronized set". It now states the actual blocker: a `Shared<T>` crosses domains only over a synchronized payload, and `Channel<T>` is not one, since its receiving end is single-consumer by ownership. §18's MPMC entry says the same.
+  - The paragraph also called bounded channels deferred, although they have been provided since v0.174 (spec §30.15). They are now stated as provided, with the back-pressure reason kept.
+- **§13–§17, §19, §20 (lane D).** Version mentions 138 → 10. Ten headings lose their tag. §15.x, §15.y and §15.z keep their letters (DECLINED, proposals and the pinned changelog cite them). §13.2 now says lambda-parameter destructuring exists (spec §27.4). §17.6 is marked as a reversed rejection, kept as the register's precedent. §17.8 presents runtime `const` (spec §21.1) as the readonly local. §20's closing sentence is corrected to §5.22's record (#703): the cyclic keyword tier was retired rather than discharged.
+- **§18 — *Things deferred* lists only what is deferred.** Six shipped entries leave the list for the sections that own them: serialization (§5.19, §5.22), asymmetric auto-equality (§7.5), lambda-parameter destructuring (§13.2), runtime `const` (§17.8), and `ReceiveAll` and the `sendable` constraint (§12.6). *Sum types beyond `choice`* and *Static interface member promotions* keep only their remaining deferrals, and #1508 is stated as declined with its reason. The attribute entry no longer counts serialization among the machinery it waits for, because serialization ships through the closed `serialized` clause. The intro says an item leaves the list when it ships. §7.5's pointer to the removed entry is reworded.
+
+**Proposals.**
+- **`DECLINED.md`.**
+  - The `SharedAtomic<T>` / sendable-`Shared` mode row moves from `deferred` to `retired`, because the payload rule delivered it with no second type. The index-size line becomes 136 `deferred` and 50 `retired` (1,096 rows).
+  - 135 rows that cited a rationale paragraph by a revision label that no longer exists ("(v0.329 paragraph)", "*v0.327 addendum*", "(the v0.336 paragraph)", a retitled lead-in) now name the paragraph's current lead-in. No verdict, class or reason changed.
+  - Row 444 (Send/Sync typing) now points at §12.6. Row 672's span note is reconciled to v0.78–v0.96 by the v0.97 entry. The multi-consumer row's remaining reason is restated as §12.6 states it.
+- **`spec-change-process.md`.** The checklist line for §18 now says to move a shipped entry out of the list, into the owning section, in the same revision. The v0.201 rule annotated the entry instead.
+
+**Checks.**
+- `scripts/check_docs.sh` (all phases), `check_proposals.sh`, `build_book.py --check` and `check_src_citations.py` are clean on the composed tree. The one CITATION advisory (`[spec] §4.12`) predates this revision.
+- A non-author critic reviewed every lane. It checked each restated rule against spec v0.352 and scripted a section-by-section comparison of links, issue and proposal numbers, and decline words. It spot-checked fifteen dropped facts against the changelog and restored the one that was recorded nowhere else (§5.19's Java corroboration). It corrected one strengthened claim (§17.6, "showed" → "suggested") and one garbled decline (§5.10, the #3240 `new` ruling). It found the two further stale statements fixed in §12.6 (multi-consumer blocker; bounded channels).
+
+**Migration:** doc-only.
 
 ---

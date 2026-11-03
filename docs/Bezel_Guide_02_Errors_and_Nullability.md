@@ -10,7 +10,7 @@ Most of the syntax here is mainstream: non-nullable by default, `?` for nullable
 - A **boundary fault** — I/O, network, anything logged or retried rather than branched on — is a typed exception (§4).
 - A handful of fatal conditions simply terminate.
 
-So in Bezel application code the common case is a value return; exceptions are the boundary-and-defect tool, not the default. Beyond the emphasis, two ownership rules will change ingrained habits: a caught exception is a *borrow* (§5), and cleanup on the exception path is *automatic* (§6). Each is headed **How Bezel does it**. If you skim everything else, read those and the table in §7.
+So in Bezel application code the common case is a value return; exceptions are the boundary-and-defect tool, not the default. Beyond the emphasis, two ownership rules will change ingrained habits: a caught exception is a *borrow* (§5), and cleanup on the exception path is *automatic* (§6). Each is headed How Bezel does it. If you skim everything else, read those and the table in §7.
 
 **Contents:** §1 nullability basics · §2 expected absence: `T?`, `*OrNull`, `Try` · §3 expected outcomes: `Result<T, E>` and domain choices · §4 exceptions: the familiar shape · §5 a caught exception is a borrow · §6 cleanup without leaks · §7 choosing the right tool.
 
@@ -56,7 +56,7 @@ end;
 
 `n += 1` is admitted exactly where `n := n + 1` is, and `n++` with it (spec §6.6, §17.6). Outside a narrowing both are compile errors, and the diagnostic names the three remedies — narrow first, or write `n := (n ?? 0) + 1;` or `n := n! + 1;` (spec §7.11).
 
-One rule that bites people: **narrowing applies to locals, non-`ref` parameters, and `readonly` fields only, never to mutable fields, properties, or `ref` parameters.** A mutable field can be reassigned between the check and the use by things the compiler cannot see — a method call that writes it, a closure, or another continuation interleaving at an `await` — so the compiler will not narrow it; a `ref` parameter aliases a location the caller can still write the same way. Copy it to a local first:
+One rule that bites people: narrowing applies to locals, non-`ref` parameters, and `readonly` fields only, never to mutable fields, properties, or `ref` parameters. A mutable field can be reassigned between the check and the use by things the compiler cannot see — a method call that writes it, a closure, or another continuation interleaving at an `await` — so the compiler will not narrow it; a `ref` parameter aliases a location the caller can still write the same way. Copy it to a local first:
 
 ```bezel
 var local := _field;               // copy
@@ -73,7 +73,7 @@ Locals can lose their narrowing too. A local that is **mutably captured** — as
 
 ## 2. Expected failure: absence — `T?`, the `*OrNull` tier, and the `Try` pattern
 
-Expected failure is a value, not a throw — exceptions are the boundary-and-defect tool (§4). For failures that are part of normal control flow, return the outcome. The simplest expected failure is **absence** — a cache miss, a lookup with nothing under the key, a parse of input that may legitimately be malformed. Two shapes cover it; §3 adds the third.
+Expected failure is a value, not a throw — exceptions are the boundary-and-defect tool (§4). For failures that are part of normal control flow, return the outcome. The simplest expected failure is absence — a cache miss, a lookup with nothing under the key, a parse of input that may legitimately be malformed. Two shapes cover it; §3 adds the third.
 
 **Nullable return** for "maybe there is a value":
 
@@ -187,7 +187,7 @@ public method WellKnownPort(text: string): Result<int, string>
 end WellKnownPort;
 ```
 
-One trap the `??` of §1 does not prepare you for: **a combinator's argument is an ordinary argument, evaluated at the call site before the call — on the success path exactly as on the failure path** (stdlib §2.20). `??` is conditional, so `a ?? Expensive()` never runs `Expensive()` when `a` is non-null (spec §7.7); `.UnwrapOr($"bad port: {raw}")` builds that string on the `Ok` path as well. There is no lazy `UnwrapOrElse`. Where the fallback must be computed only on failure, compute it in the `Error` arm of a `case`.
+One trap the `??` of §1 does not prepare you for: a combinator's argument is an ordinary argument, evaluated at the call site before the call — on the success path exactly as on the failure path (stdlib §2.20). `??` is conditional, so `a ?? Expensive()` never runs `Expensive()` when `a` is non-null (spec §7.7); `.UnwrapOr($"bad port: {raw}")` builds that string on the `Ok` path as well. There is no lazy `UnwrapOrElse`. Where the fallback must be computed only on failure, compute it in the `Error` arm of a `case`.
 
 Note the `AndThen` lambda's return-type ascription: it makes the lambda's own returns declared-result positions, so the bare `Ok`/`Error` spelling works inside it too. The combinators exist only at **value-like** instantiations — payloads of values and strings, the common case. A `Result` carrying an owned resource (`Result<Connection, string>`) has none of them, deliberately. Extraction there is consumption, and consumption is the owning match's job — for owning results, the exhaustive `case` *is* the pipeline. The three idioms compose: `T?` for plain absence, the Try shape for value extraction with a boring failure, the choice return where the failure is branched on with a value-shaped payload.
 
@@ -213,7 +213,7 @@ end;
 
 The built-in hierarchy is what you would expect — `ArgumentException` (with `ArgumentNullException` under it), `InvalidOperationException`, `FormatException`, `OverflowException`, and so on, available without `import` (the full set is spec §31.4). Library producers declare their own exception types beside their APIs — `IOException` and `FileNotFoundException` with the file APIs, `KeyNotFoundException` with `Dictionary<K, V>`, and others — reached by the producer's `import` (none for an auto-imported module such as `System.Collections.Generic`, `KeyNotFoundException`'s home) and otherwise ordinary. Arm patterns match subclasses: a `catch` arm for `ArithmeticException` also catches `OverflowException` and `DivideByZeroException`. Order arms most-specific first.
 
-Two resource-exhaustion faults are deliberately unrecoverable — no `catch` will ever handle them, and both terminate the process. A **stack overflow** raises a `StackOverflowException`: the type exists in the hierarchy, but it **cannot be caught** — no `catch` arm ever matches it. An out-of-memory **allocation failure** is not an exception at all: there is no `OutOfMemoryException`, nothing unwinds, the process simply aborts. Neither is something a `catch` could meaningfully handle — the "handler" would itself need the stack or heap that just ran out — so Bezel does not pretend otherwise.
+Two resource-exhaustion faults are deliberately unrecoverable — no `catch` will ever handle them, and both terminate the process. A stack overflow raises a `StackOverflowException`: the type exists in the hierarchy, but it cannot be caught — no `catch` arm ever matches it. An out-of-memory allocation failure is not an exception at all: there is no `OutOfMemoryException`, nothing unwinds, the process simply aborts. Neither is something a `catch` could meaningfully handle — the "handler" would itself need the stack or heap that just ran out — so Bezel does not pretend otherwise.
 
 Throwing:
 
@@ -227,7 +227,7 @@ throw new ArgumentException("Amount must be positive.", nameof(amount));
 
 ## 5. How Bezel does it: a caught exception is a *borrow*, not yours to keep
 
-This is the most important rule to internalize. The stash-it habit from garbage-collected languages — assign the caught exception to a field, capture it in a closure, return it — does not transfer. In Bezel a caught exception is a **borrow** whose lifetime is the catch arm body. The runtime owns the exception and disposes it when the arm completes. You may use `ex` and pass it to methods (they borrow it for the call), but you may **not**:
+This is the most important rule to internalize. The stash-it habit from garbage-collected languages — assign the caught exception to a field, capture it in a closure, return it — does not transfer. In Bezel a caught exception is a borrow whose lifetime is the catch arm body. The runtime owns the exception and disposes it when the arm completes. You may use `ex` and pass it to methods (they borrow it for the call), but you may not:
 
 - assign it to an `owned` field,
 - return it as `owned`,
@@ -314,13 +314,13 @@ One diagnostic worth recognizing in this area: disposing a value and then using 
 | Absent *and* the value would be owned | `Try` pattern: `bool` + `out owned T? when true`, caller uses `out using var` (and drops the `!`) |
 | Failure is expected, carries information the caller *branches on* at or near the call, and the error payload is a plain value shape | `choice` return (`Result<T, E>` or a domain choice, spec §35); consume with an exhaustive `case`, or — where both payloads are value-like — pipeline with the combinators (`Map`/`MapError`/`AndThen`/`UnwrapOr`, stdlib §2.20) |
 | Failure is expected but consumed at a *boundary* — logged, retried, converted to a protocol answer, reported — or its payload cannot be a plain value shape (it owns a resource, or carries a borrow; spec §35.4) | a typed exception, producer-local (spec §31.4); read it in the `catch` and copy out what you keep (§5) |
-| Caller violated something a correct caller guarantees (a **bug**, not an outcome) | a `requires(...)` clause (spec §22.16) — always-on, faults `ContractViolationException`; never use `requires` for input whose invalidity is a normal outcome at a trust boundary (that is the `T?`/Try/`choice` territory above) |
+| Caller violated something a correct caller guarantees (a bug, not an outcome) | a `requires(...)` clause (spec §22.16) — always-on, faults `ContractViolationException`; never use `requires` for input whose invalidity is a normal outcome at a trust boundary (that is the `T?`/Try/`choice` territory above) |
 | Invalid input at a boundary with no contract (interop, pre-contract code) | `throw new ArgumentException(...)` — the residual idiom `requires` replaces where a contract is possible |
 | Operation invalid in current state | `throw new InvalidOperationException(...)` (or an `invariant(...)`/`requires(...)` where the condition is a class or caller contract) |
 | Must run cleanup that is not a disposal | `try … finally` |
 | Must dispose an owned resource on failure | nothing — ownership handles it automatically |
 | Preserve failure details past a `catch` | copy `ex.Message` / `ex.StackTrace` into owned values — or `ex.ToString()`, one string carrying the type name, the message, and both chains; never the exception itself |
 
-The table is the teaching mirror of a normative rule: the **failure-signal rule** (stdlib §1) classifies every fault condition a library surface declares — five bands, first match wins, one mechanism per condition. Two of its sentences are worth restating here. First, the line between the `choice` row and a typed exception is *where the failure is consumed* and *whether its payload can be a plain value* — never how much information it carries. A fault whose data is read once at a boundary is a typed exception, however rich the data; a fault the caller branches on near the call site, with a value-shaped payload, is a `choice` return. Second, `catch` is a boundary-and-supervision tool — convert, log, retry, report, re-raise. Branching program logic on caught exception types at an interior call site is the signal to check the rule for a value-shaped tier.
+The table is the teaching mirror of a normative rule: the failure-signal rule (stdlib §1) classifies every fault condition a library surface declares — five bands, first match wins, one mechanism per condition. Two of its sentences are worth restating here. First, the line between the `choice` row and a typed exception is *where the failure is consumed* and *whether its payload can be a plain value* — never how much information it carries. A fault whose data is read once at a boundary is a typed exception, however rich the data; a fault the caller branches on near the call site, with a value-shaped payload, is a `choice` return. Second, `catch` is a boundary-and-supervision tool — convert, log, retry, report, re-raise. Branching program logic on caught exception types at an interior call site is the signal to check the rule for a value-shaped tier.
 
 A few habits carry most of it. Prefer a nullable, `Try`, or `choice` return over an exception whenever the failure is *expected and branched on*. Prefer a `requires(...)` clause over a `throw` whenever the condition is something a correct caller already guarantees. Inside a `catch`, treat the exception as something you read and let go of — copy out the strings you need, never the instance. And in choice-returning code, take the ergonomics the language gives you: bare case names in return positions, and the combinators where a `case` would only fold. The familiar syntax mostly transfers; the ownership rules around exceptions and `out` values are the part to internalize.
