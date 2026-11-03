@@ -2621,6 +2621,37 @@ keeps the closure true, and the commit body must say plainly which earlier commi
 **⇒ THE NAMED-ARGUMENT FAMILY IS ONE DEFECT IN THREE DISJOINT FILES** (the table's names → the
 binder's index → the lowering's order), which is why it was split by FILE rather than by issue.
 
+### The R38 gate status: an UNAIDED full cycle ran at 16:46 — it is NOT the run's gate
+
+*Recorded 2026-11-03 ~17:50, by the coordinator, from the heartbeat's status check.*
+
+**⇒ A COMPLETE GATE CYCLE RAN AT 16:46:28–17:15:30 WITHOUT THE COORDINATOR ORDERING IT.** Its
+logs are `/var/tmp/bezel-scratch/gate-cycle/db3bdf98_cycle.log` and its two oracle logs are
+`db3bdf98_plain.log` (PASS, 600.87 s, `trustworthy: true`) and `db3bdf98_full.log` (the ASan
+oracle, 736.05 s). **⇒ IT DID NOT PUSH: `origin/main` IS STILL AT `d3bcbb7e` AND `r30-c1` IS 85+
+COMMITS AHEAD OF IT, SO THE RUN'S CLOSURES HAVE NOT FIRED.** The run's ONE gate is still owed.
+
+**⇒ IT IS NOT A VERDICT ABOUT THE TIP, AND MUST NOT BE READ AS ONE.** It ran at `db3bdf98`
+("bank: four more corpus rows now pass after the #7728 fix"), which is **99 COMMITS BEHIND** the
+tip it was nominally testing. **⇒ THE STAGING BUILD TREE IS NOT THE TREE'S BUILD**: the staging
+worktree's `build/` holds only `build/bezelc` (mtime 14:38) and NO test binaries and NO test
+objects, while `scripts/gate.sh:648` builds `cmake --build build --target bezel_tests` — so
+`build/bezelc` IS STALE RELATIVE TO THE TIP (five `src/` files are newer than it). **⇒ THE FINAL
+GATE MUST REBUILD `build/bezelc` AND THE TEST BINARIES ON THE TIP, ON A QUIET BOX** — it is a
+FULL BUILD (4 148 TUs), not an incremental one, so the pool must be at zero before it starts.
+
+**⇒ WHAT IT DOES ESTABLISH:** the gate machinery itself is healthy (both oracles ran, the
+vacuous-assertion / imported-symbol / enumerable-grid / internal-residual phases were GREEN, and
+`check_internal_residual` read 92 at `db3bdf98`), and **the unaided cycle cost ~29 MINUTES OF A
+LOADED BOX** — a real cost against the run's remaining time, and the reason the pool's cold-build
+budget was blown while it ran.
+
+**⇒ THE LESSON, RECORDED SO IT IS NOT REPEATED:** A GATE IS THE COORDINATOR'S ACT ALONE. No
+lane launches `scripts/gate.sh`, `scripts/gate_full_cycle.sh` or `scripts/gate_and_push.sh`; a
+lane that wants the gate's phases runs the named PHASES (the ratchet sweep, the gate's own
+self-tests) and says so in its report. **⇒ A CYCLE THAT WAS NOT ORDERED IS NOT A GATE, AND IT
+IS NOT A PUSH.**
+
 ## Exit review
 
 *(to be written by the campaign's exit reviewer — not this lane)*
