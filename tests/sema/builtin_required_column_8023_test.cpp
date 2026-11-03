@@ -370,16 +370,43 @@ BEZEL_TEST(builtin_required_column_8023, math_divrem_with_the_out_slot_is_admitt
 }
 
 BEZEL_TEST(builtin_required_column_8023,
-           math_divrem_with_two_positional_arguments_is_not_newly_refused) {
-    // The POSITIONAL two-argument spelling binds no candidate either, but
-    // the front end has NO arity gate on the `Math` head, so it is NOT
-    // refused there. This row pins that the fix does not make the hole
-    // WORSE (a false-rejection guard) — the hole itself is REPORTED, not
-    // papered over: the codegen arm for `DivRem` needs three arguments, so
-    // the call degrades to a zero value there.
+           math_divrem_with_two_positional_arguments_is_refused) {
+    // The POSITIONAL two-argument spelling binds no declared form:
+    // stdlib §2.2 declares `DivRem` at THREE arguments — the `out
+    // remainder` slot IS an argument, and an `out` slot carries no default
+    // (§22.3, §22.5) — so the `Math`-head ARITY GATE refuses the call: it
+    // supplies 2 argument(s) and no declared form has that count (§22.6).
+    //
+    // THE GATE IS #8036's, NOT #8034's. The #8034 lane DISCLOSED this hole
+    // in its own commit message — "the POSITIONAL two-argument
+    // `Math.DivRem(a, b)` is still admitted by the front end and still
+    // degrades to a zero value at codegen, because there is no arity gate on
+    // the `Math` head ... the regression test pins that this change does not
+    // make the hole worse" — and wrote THIS ROW to pin that. #8036 then
+    // closed the hole (in `8aaaebb5`, "fix #6810"), and the row's "not newly
+    // refused" assertion became RED.
+    //
+    // FAIL-WITHOUT (MEASURED on `48353f2b`, the base the #8036 gate cites),
+    // with this program's source: the call was ADMITTED and DEGRADED to a
+    // zero value at codegen — the compiler's own "internal:
+    // lowerLocalDecl's initializer expression failed to lower to a value for
+    // this local's slot (degraded to a zero-initialized value) — #2434"
+    // warning. There is NO arity message on that base at all: the `Math` head
+    // had no arity gate.
+    //
+    // WHAT THIS ROW PINS: the ARITY GATE. The table's `required` column is
+    // pinned by its own row —
+    // `math_divrem_minimum_is_three_because_an_out_slot_is_an_argument` (the
+    // table's `DivRem` form carries `required == 3`) — and the two-argument
+    // form's binding by
+    // `the_two_argument_math_divrem_call_binds_no_declared_form`. Neither was
+    // touched.
     const auto r = parseAndTypecheckGated(prog("    var q := Math.DivRem(17, 5); "));
-    if (r.diagnostics.hasErrors()) dumpDiagnostics(r);
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    if (!hasError(r, "no matching overload of `Math.DivRem`"))
+        dumpDiagnostics(r);
+    BEZEL_EXPECT_TRUE(hasError(r, "no matching overload of `Math.DivRem`"));
+    BEZEL_EXPECT_TRUE(
+        hasError(r, "stdlib §2.2 declares `DivRem` at 3 argument(s)"));
 }
 
 BEZEL_TEST(builtin_required_column_8023, the_one_argument_string_forms_are_admitted) {
