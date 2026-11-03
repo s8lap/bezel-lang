@@ -2214,6 +2214,93 @@ void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
         }
         return;
     }
+    // fix #8014 (§5.1, §7, §7.3, §22.6, stdlib §2.5, v0.350): the
+    // `new TimeSpan(...)` forms are the COMPILER'S OWN INTRINSIC -- the #7899
+    // fix added `new TimeSpan(hours, minutes, seconds)` beside the
+    // one-argument raw-tick form -- and stdlib §2.5 (v0.350) declares NO
+    // `TimeSpan` constructor at all. The ONE built-in parameter table
+    // therefore carries NO row for it, and the §5.1 admission gate asked no
+    // question at the argument positions.
+    //
+    // MEASURED on the base (the tree before this commit):
+    //   `new TimeSpan(1.0)`          -> "codegen error: IR verification failed"
+    //   `new TimeSpan("x", 2, 3)`    -> "codegen error: IR verification failed"
+    //   `new TimeSpan(1, null, 3)`   -> "codegen error: IR verification failed"
+    //   `new TimeSpan(1, true, 3)`   -> COMPILED AND RAN WRONG: it rendered
+    //                                    `00:59:03` instead of `01:00:03`,
+    //                                    because the `bool` was sign-extended
+    //                                    i1 -> -1. A VERIFIER ABORT IS NOT A
+    //                                    DIAGNOSTIC, and a SILENTLY WRONG VALUE
+    //                                    IS WORSE.
+    //
+    // WHY NOT A ROW IN THE TABLE. The table is the §22.5 NAME surface, and the
+    // table-driven §5.1 gate below only considers a form that carries NAMES
+    // (`!f.names.empty()`). A name-less row is skipped by that gate, and a row
+    // WITH names would admit a NAMED argument (`new TimeSpan(hours := 1)`) at a
+    // constructor the standard library does not declare -- a surface the open
+    // spec-question #7550 has not settled (does stdlib §2.5 declare the
+    // constructor, and with which parameter names?). So the positions are
+    // checked HERE, positionally, exactly as the `JsonOptions` arm above
+    // checks its five components -- and NO name surface is invented, so the
+    // named spelling keeps its loud "named arguments are not supported on this
+    // built-in constructor" refusal (§22.5, §17.7, #3425).
+    //
+    // THE TYPE. The intrinsic's components are INTEGER counts: the compiler
+    // computes the span's tick count with integer arithmetic
+    // (`h*36_000_000_000 + m*600_000_000 + s*10_000_000`, the same tick ratios
+    // stdlib §2.5's `From<Unit>` factories use), and the one-argument form is
+    // the raw tick count stdlib §2.5 gives the `long` (`Ticks: long`,
+    // `FromTicks(ticks: long)`). Every position is therefore checked against
+    // `long`: §5.1 admits `int -> long` (and every other integer type), so
+    // every integer literal and every integer-typed expression is admitted --
+    // `new TimeSpan(5U, 2U, 3U)` keeps working -- and §5.1 refuses a
+    // `double`, a `string` and a `bool` ("between integers and `bool` is
+    // never implicit"). A nullable argument draws §7's own message.
+    //
+    // THE ARITY. Only the two arities the intrinsic implements are checked:
+    // the one-argument raw-tick form and the three-argument component form.
+    // The other arities read `args[0]` as the tick count and ignore the rest
+    // -- that is issue #7682's arity gate, not this one's.
+    if (head == "TimeSpan") {
+        if (ne.args.empty()) return;
+        static constexpr std::string_view kTickCountName = "ticks";
+        static constexpr std::string_view kComponentNames[3] = {
+            "hours", "minutes", "seconds"};
+        std::size_t count = 1;
+        if (ne.args.size() == 3) {
+            count = 3;
+        } else if (ne.args.size() != 1) {
+            return;  // #7682's arity: the other arities are not this one's
+        }
+        for (std::size_t p = 0; p < count; ++p) {
+            const std::string_view pname =
+                count == 1 ? kTickCountName : kComponentNames[p];
+            const auto& arg = ne.args[p];
+            if (!arg.value || arg.isDiscard || !arg.modifier.empty() ||
+                !arg.name.empty())
+                continue;
+            const std::string what = "`" + std::string(pname) +
+                                     "` argument of the `" + head +
+                                     "` constructor";
+            // §7 FIRST (the `JsonOptions` arm's order, load-bearing): a
+            // nullable argument is refused as nullable, whatever its type --
+            // a `null` literal at a component draws §7's message, NOT §5.1's.
+            reportBuiltinArgIfNullable(arg.value.get(), what);
+            publishNarrowedBuiltinArg(arg.value.get());
+            TypeRef* argTy = ctx_.exprType(*arg.value);
+            if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
+            if (argTy->nullable) {
+                // §7.4: a read of a binding §7.4 has narrowed non-null is of
+                // its non-nullable type (§22.6), so it is admitted.
+                if (!isNarrowedNonNullRead(arg.value.get())) continue;
+                argTy = operandStaticTypeAt(arg.value.get(), argTy);
+                if (!argTy) continue;
+            }
+            checkAssignable(argTy, ctx_.primitiveTypeRef(PrimitiveType::Long),
+                            arg.value->span.begin, what, arg.value.get());
+        }
+        return;
+    }
     if (ne.args.empty()) return;
     const std::size_t argc = ne.args.size();
     std::vector<common::BuiltinParamForm> forms;
