@@ -426,13 +426,13 @@ BEZEL_TEST(builtin_required_column_8023, the_two_argument_filestream_constructor
     // stdlib §7.2 declares `access` with a DEFAULT, so the two-argument
     // form is declared. Positional AND named.
     const auto r = parseAndTypecheckGated(progWithIo(
-        "    using var fs := new FileStream(\"/tmp/bz_req_8023.bin\", "
+        "    using var fs := new FileStream(\"/tmp/bz_req_8023.bin\", "  // 5230-allow: compile-level only — the program is type-checked, never run, so the path is never opened
         "                              FileMode.Create); "));
     if (r.diagnostics.hasErrors()) dumpDiagnostics(r);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 
     const auto r2 = parseAndTypecheckGated(progWithIo(
-        "    using var fs := new FileStream(path := \"/tmp/bz_req_8023.bin\", "
+        "    using var fs := new FileStream(path := \"/tmp/bz_req_8023.bin\", "  // 5230-allow: compile-level only — the program is type-checked, never run, so the path is never opened
         "                              mode := FileMode.Create); "));
     if (r2.diagnostics.hasErrors()) dumpDiagnostics(r2);
     BEZEL_EXPECT_FALSE(r2.diagnostics.hasErrors());
@@ -441,7 +441,7 @@ BEZEL_TEST(builtin_required_column_8023, the_two_argument_filestream_constructor
 BEZEL_TEST(builtin_required_column_8023,
            the_three_argument_filestream_constructor_is_admitted) {
     const auto r = parseAndTypecheckGated(progWithIo(
-        "    using var fs := new FileStream(path := \"/tmp/bz_req_8023.bin\", "
+        "    using var fs := new FileStream(path := \"/tmp/bz_req_8023.bin\", "  // 5230-allow: compile-level only — the program is type-checked, never run, so the path is never opened
         "                              mode := FileMode.Create, "
         "                              access := FileAccess.Write); "));
     if (r.diagnostics.hasErrors()) dumpDiagnostics(r);
@@ -455,7 +455,7 @@ BEZEL_TEST(builtin_required_column_8023,
     // two-argument call has TWO declared candidates and the shared §22.5
     // binder names both.
     const auto r = parseAndTypecheckGated(progWithIo(
-        "    using var fs := new FileStream(path := \"/tmp/bz_req_8023.bin\", "
+        "    using var fs := new FileStream(path := \"/tmp/bz_req_8023.bin\", "  // 5230-allow: compile-level only — the program is type-checked, never run, so the path is never opened
         "                              bogus := FileMode.Create); "));
     if (!hasError(r, "the named arguments match none of the declared overloads"))
         dumpDiagnostics(r);

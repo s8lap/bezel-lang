@@ -160,7 +160,7 @@ BEZEL_TEST(builtin_path_named_arg_7995, path_combine_named_valid_is_accepted) {
 BEZEL_TEST(builtin_path_named_arg_7995, path_getfilename_named_valid_is_accepted) {
     // control: the legal NAMED spelling of a one-argument member still
     // compiles and runs.
-    auto r = runAot(prog("", "    Console.WriteLine(Path.GetFileName(path := \"/tmp/dir/file.txt\"));"));
+    auto r = runAot(prog("", "    Console.WriteLine(Path.GetFileName(path := \"/tmp/dir/file.txt\"));"));  // 5230-allow: Path.GetFileName is a PURE string operation — the path is never opened
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "file.txt\n");

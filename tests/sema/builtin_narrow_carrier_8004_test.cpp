@@ -110,7 +110,7 @@ BEZEL_TEST(sema_builtin_narrow_carrier_8004,
 // carrier holds is never opened.
 BEZEL_TEST(sema_builtin_narrow_carrier_8004,
            stream_member_call_is_refused_spec_12_7) {
-    auto r = runAot(program("new FileStream(\"/tmp/bezel8004.bin\", FileMode.Create)",
+    auto r = runAot(program("new FileStream(\"/tmp/bezel8004.bin\", FileMode.Create)",  // 5230-allow: the program is REFUSED at compile time, so the FileStream is never opened
                             "Stream", "Length"));
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
