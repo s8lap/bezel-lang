@@ -10756,6 +10756,46 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
             return (n == "DateTime" || n == "TimeSpan") ? n
                                                          : std::string_view{};
         };
+        // fix #7547 (stdlib §2.5, v0.350): the stdlib's compiler-known value
+        // builtins have a CLOSED member surface and no user TypeDecl, so they
+        // reach sema in TWO shapes for the SAME type:
+        //
+        //   * a value-producing expression stamps the result
+        //     `declaration = builtinClassSym("<name>")`
+        //     (ExprTypecheck_Calls.cpp: `TimeSpan.FromTicks(...)`);
+        //   * Slice S24 (§2.3, TypeResolution_Names.cpp) resolves the NAME in
+        //     an ANNOTATION — `var ts: TimeSpan`, a `ts: TimeSpan` parameter,
+        //     a `TimeSpan` field, `new DateTime(...)` — to a Named TypeRef
+        //     with `declaration == nullptr` and the AST spelling as its name.
+        //
+        // Every rule that keyed on `lt->declaration` therefore saw only the
+        // FIRST shape, and the second one LOST THE OPERAND'S TYPE: the §25
+        // operator reject named it `?` (the placeholder it uses for a type it
+        // cannot name), and the stdlib-declared `TimeSpan` operators were not
+        // found at all. Measured on the parent of this fix:
+        //
+        //   `var ts: TimeSpan := TimeSpan.FromTicks(5L); var r := ts + ts;`
+        //     -> "operator `+` is not defined for type `?` (§25); declare
+        //         `static method operator +(a: ?, b: ?)` inside `?` ..."
+        //
+        // even though stdlib §2.5 (v0.350) declares
+        //   `public static method operator +(a: TimeSpan, b: TimeSpan): TimeSpan;`
+        // and the byte-identical program over the inferred shape
+        // (`TimeSpan.FromTicks(5L) + TimeSpan.FromTicks(5L)`) compiles and
+        // computes. The `?` IS the lost operand type: #7604 is this same hole
+        // for the `*`/`/` overloads, and #7717 for the nullable `ts!` shape.
+        //
+        // So the builtin is identified here by NAME, and a USER type that
+        // happens to carry the same name (one with a real `decl`) is excluded
+        // — it keeps the §25 rule and may declare its own operators.
+        auto stdlibValueBuiltinName = [](const TypeRef* t) -> std::string_view {
+            if (!t || t->kind != TypeRef::Kind::Named) return {};
+            if (t->declaration && t->declaration->decl) return {};
+            std::string_view n = namedTypeName(t);
+            // `DateTime`/`TimeSpan`/`DateOnly`/`TimeOnly` (stdlib §2.5) and
+            // `Guid` (§2.6) — the compiler-known value builtins.
+            return isIntrinsicTemporalOrGuid(n) ? n : std::string_view{};
+        };
         if (op == "+" || op == "-") {
             TypeRef* rtT = be.right ? ctx_.exprType(*be.right) : nullptr;
             std::string_view ln = temporalName(lt);
@@ -10775,20 +10815,54 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 return;
             }
         }
-        if (lt && lt->kind == TypeRef::Kind::Named &&
-            lt->declaration && !lt->declaration->decl &&
-            lt->declaration->name == "TimeSpan" &&
-            (op == "+" || op == "-" ||
-             // stdlib §2.5 (v0.350): `operator *(a: TimeSpan, factor:
-             // double)` and `operator /(a: TimeSpan, divisor: double)` --
-             // a `double` right operand only (TimeSpan * TimeSpan and
-             // every other right type stay on the §25 reject below).
-             ((op == "*" || op == "/") && be.right &&
-              [&] {
-                  TypeRef* rr = ctx_.exprType(*be.right);
-                  return rr && rr->kind == TypeRef::Kind::Primitive &&
-                         rr->primitive == PrimitiveType::Double;
-              }()))) {
+        // fix #7547 (stdlib §2.5, v0.350): the `TimeSpan` operator arm must
+        // recognise BOTH shapes of a TimeSpan operand (see
+        // `stdlibValueBuiltinName` above) — the value-producing shape
+        // (`declaration = builtinClassSym("TimeSpan")`) and the ANNOTATION
+        // shape (`declaration == nullptr`, the AST spelling as the name). The
+        // old test keyed on `lt->declaration` alone, so an annotated
+        // TimeSpan (`var ts: TimeSpan := ...`, a `ts: TimeSpan` parameter, a
+        // `TimeSpan` field) reached the §25 reject below and was reported as
+        // "operator `+` is not defined for type `?`" — even though §2.5
+        // declares `operator +(a: TimeSpan, b: TimeSpan): TimeSpan` and the
+        // identical program over the inferred shape computes.
+        //
+        // The arm now admits EXACTLY the operand pairs §2.5 declares, for
+        // BOTH shapes:
+        //
+        //   operator +(a: TimeSpan, b: TimeSpan): TimeSpan
+        //   operator -(a: TimeSpan, b: TimeSpan): TimeSpan
+        //   operator *(a: TimeSpan, factor: double): TimeSpan
+        //   operator /(a: TimeSpan, divisor: double): TimeSpan
+        //
+        // The old arm checked the RIGHT operand only for `*`/`/` (a `double`
+        // factor), so `TimeSpan + int` — an operator §2.5 does NOT declare,
+        // and for which no implicit conversion to a TimeSpan exists (§5.1) —
+        // was admitted and computed as a bare tick addition (5 ticks + 2 = 7
+        // ticks: a silently wrong span). Admitting the annotation shape
+        // without this check would have widened that over-acceptance to
+        // every annotated TimeSpan, so the pair is checked here for both
+        // shapes. (`2.0 * ts` — the double on the LEFT — is a different
+        // defect: §25.2 forbids commutation, and it is filed as #7606.)
+        //
+        // The operand must be NON-NULLABLE, exactly as `temporalName` above
+        // requires for the `DateTime`/`TimeSpan` combinations: stdlib §2.5
+        // declares no lifted (`TimeSpan?`) operator, so a nullable operand
+        // stays on the §25 reject (and its type is now NAMED there, not `?`).
+        bool tsOperandPair = false;
+        if (be.right) {
+            TypeRef* rr = ctx_.exprType(*be.right);
+            if (op == "+" || op == "-") {
+                tsOperandPair = rr && rr->kind == TypeRef::Kind::Named &&
+                                !rr->nullable &&
+                                stdlibValueBuiltinName(rr) == "TimeSpan";
+            } else if (op == "*" || op == "/") {
+                tsOperandPair = rr && rr->kind == TypeRef::Kind::Primitive &&
+                                rr->primitive == PrimitiveType::Double;
+            }
+        }
+        if (lt && lt->kind == TypeRef::Kind::Named && !lt->nullable &&
+            stdlibValueBuiltinName(lt) == "TimeSpan" && tsOperandPair) {
             auto* tsTy = ctx_.makeTypeRef();
             tsTy->kind = TypeRef::Kind::Named;
             tsTy->declaration = builtinClassSym("TimeSpan");
@@ -10853,8 +10927,28 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 }
                 return;
             }
+            // fix #7547 (stdlib §2.5, v0.350): the operand's type must be
+            // NAMED here. The `?` placeholder is what the reject used for a
+            // type it could not name — and a stdlib value builtin in its
+            // ANNOTATION shape (`var ts: TimeSpan := ...`, a `ts: TimeSpan`
+            // parameter, `new DateTime(...)`) has no `declaration`, so the
+            // diagnostic read "operator `+` is not defined for type `?`" for
+            // an operand whose type is `TimeSpan`/`DateTime` — the type was
+            // LOST, and the message pointed the user at a type parameter
+            // that does not exist. `stdlibValueBuiltinName` (above) names the
+            // stdlib value builtins in both shapes.
+            //
+            // The `?` wording is KEPT for every other declaration-less Named
+            // type: a null-declaration builtin (`Array<T>`, `IntPtr`, …) and
+            // an out-of-scope type parameter (an imported generic's unbound
+            // `T`) name a type this diagnostic cannot spell — #3930's
+            // deliberate split, and the lit/conformance rows that pin it.
             std::string typeName =
                 lt->declaration ? std::string(lt->declaration->name) : "?";
+            if (typeName == "?") {
+                std::string_view bn = stdlibValueBuiltinName(lt);
+                if (!bn.empty()) typeName = std::string(bn);
+            }
             ctx_.diagnostics().report(
                 Severity::Error, be.span.begin,
                 std::string("operator `") + std::string(op) +
