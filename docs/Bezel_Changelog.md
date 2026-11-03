@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.352 — November 2026**
+**Companion to the Bezel Language Specification, v0.353 — November 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -15642,6 +15642,58 @@ The independent critique accepted the train with fixes. Its substantive findings
   - a weak reference over ordinary owned objects for long-lived observers;
   - `scoped` for calls whose body the compiler cannot see;
   - an opt-in strict mode once the trust report is complete.
+
+**Migration:** doc-only.
+
+---
+
+### v0.353 changelog (v0.352 → v0.353)
+
+**Editorial: the rationale states the current design.** On 2026-11-03 the owner asked that the rationale stop reading "a lot like a less-formal version of the changelog": "We should talk about the current state of the language rather than the historic state unless explicitly discussing the historic state … leave that to the changelog … assuming it doesn't take anything meaningful away from the text." v0.351 did this for rationale §5.1, §5.3 and §5.4. This revision does it for the rest of the document ([#8038](https://github.com/s8lap/bezel-lang/issues/8038)), and corrects §5.21 against spec §28.13 ([#8039](https://github.com/s8lap/bezel-lang/issues/8039)). Class: **editorial** (spec-change process §2). No rule, verdict, grammar or diagnostic changes.
+
+**The treatment.** Each section states the rule as it stands at spec v0.352, and its reasons, first and in the present tense. A "vN added / narrowed / ruled" narration becomes the reason it records. Where the changelog or a proposal already carries the fact, the narration is dropped; each dropped fact was checked against the changelog. Where the rationale was the only record of something that matters, the fact stays as an explicit *Historical note*. Every reason and every decline is kept, with its proposal, issue or `DECLINED.md` link. Tombstones and changelog-entry pointers stay ("A2 retired v0.258", "the v0.140 entry"). Code blocks and anchors are untouched. Headline counts for the rationale:
+- `v0.NNN` mentions: 1,094 → 108. What remains is in historical notes, tombstones, pointers and §12.10's reversal record.
+- Headings carrying a revision tag: 46 → 0. Only the tag was removed; no heading was otherwise reworded except §11.3's subsection.
+- Words: about 134,700 → 124,300. *Historical note* paragraphs: 0 → 21.
+- "Declined", "rejected", "considered" and "alternative": 622 occurrences before and after.
+
+**The rationale.**
+- **§2, §3, §6–§10 (lane B).** Version mentions 298 → 22. The revision tags come off the ruling lead-ins, and the issue and proposal numbers stay.
+  - §3.10 now reads: the `move` marker; why `move` and not `owned` (proposal 0090); the redundant-marker decline (0102 §2); `out var x` adoption (0122 L2); and no overload pair differing only by `owned` (0185). It ends with a *Historical note* on the admitted pair (0091).
+  - §3.14 states that named slots have no transfer spelling (0183), with a *Historical note* on the retired marked slot (0092).
+  - §8.1 leads with the current `Object`-slot rules (#5664; proposals 0160, 0155). The two-member model that 0155 and 0158 patched becomes a *Historical note*. The residual-split example is corrected to an `Equals` at another type (spec §12.2), because the own-typed `Equals(Point)` it used is now the slot.
+  - The function-value hash paragraph (0173) moves from §8.1 to §7.3.
+  - §9.10, §9.15 and §10 are regrouped by topic. §10 gains a one-line guide to its seven groups, and its "the v0.3NN paragraph above" cross-references now name the issue.
+  - Smaller corrections: §2.4's deferral pointer now points at §9.10; §2.3 no longer gives a stale name count; §3.9 no longer cites the retired `AppendOwned`.
+- **§4, §5.19, §5.22, §11, §12 (lane C).** §4.2's span-interface records split into a present-tense paragraph on what still holds and a *Historical note* on the retired `IReadOnlySpan<TElement>` rules. §5.19 is restated as the current architecture (about 6,000 → 2,900 words). Its v0.114–v0.124 staging and the v0.120/v0.123 working-outs become one historical note, which keeps the Java corroboration of the two-phase design. §5.19 also no longer says classes are ineligible; a class's shape is §5.22's. §5.22 opens with the type-driven rule. §11.3's *Why the change was deferred* is retitled *Three objections to the arm form* (anchor kept). The "vN addendum" labels in §12 become plain lead-ins. §12.10's fence history and §12.13's *three types held at the default* become historical notes.
+- **§5.2–§5.18, §5.20, §5.21, §5.23–§5.29 (lane A).** Version mentions 362 → 19, and §5.15 alone goes from 126 to 1.
+  - §5.10 opens with the replacing `move` (K9.1, K9.2). The restoration-window narrowings (proposals 0163 and 0170, #3240) are one *Historical note* that keeps all their declines.
+  - §5.15's `IReadOnlySpan<TElement>` design and the conditional-member register (proposal 0116) become historical notes. The 5–10× dispatch-cost figure is kept; it is recorded nowhere else.
+  - Stale statements are corrected to the current rule:
+    - §5.7: a sourceless bare-`T` static return is rejected at the declaration (spec §28.3.6), not owned-with-warning.
+    - §5.12: the yield split is stated over the borrowing and owning enumeration interfaces.
+    - §5.15: the byte read tier is on the two read-only byte spans, and a nullable-slot take leaves `null`.
+    - §5.20: a borrow stored in a user field is a recorded trust clause (K4.3).
+    - §5.23: the deleted field-restoration rule is no longer cited.
+  - §5.28's lints now say where they became an error (proposal 0207) or were retired.
+- **§5.21 — `Shared<T>` across domains ([#8039](https://github.com/s8lap/bezel-lang/issues/8039)).** *Why domain-local* contradicted spec §28.13. It becomes *When a handle may cross domains*. `Shared<T>` is sendable exactly when its payload is in the `Shared`-payload synchronized set, and its handle count is then synchronized. Over any other payload it stays domain-local, because a synchronized count would not make an unsynchronized value safe to reach from two domains. The `MutexHandle`, annotation-refcounting and escape-analysis declines are kept.
+- **§12.6 — channels, sendability and the multi-consumer blocker.**
+  - Two items from §18 now live here: the `where T: sendable` constraint (spec §14.2, proposal 0049 train B), with §12.5's Send/Sync decline standing untouched; and the `ReceiveAll()` drain (spec §30.15).
+  - The multi-consumer deferral used to cite "§28.13's unresolved domain-locality for the synchronized set". It now states the actual blocker: a `Shared<T>` crosses domains only over a synchronized payload, and `Channel<T>` is not one, since its receiving end is single-consumer by ownership. §18's MPMC entry says the same.
+  - The paragraph also called bounded channels deferred, although they have been provided since v0.174 (spec §30.15). They are now stated as provided, with the back-pressure reason kept.
+- **§13–§17, §19, §20 (lane D).** Version mentions 138 → 10. Ten headings lose their tag. §15.x, §15.y and §15.z keep their letters (DECLINED, proposals and the pinned changelog cite them). §13.2 now says lambda-parameter destructuring exists (spec §27.4). §17.6 is marked as a reversed rejection, kept as the register's precedent. §17.8 presents runtime `const` (spec §21.1) as the readonly local. §20's closing sentence is corrected to §5.22's record (#703): the cyclic keyword tier was retired rather than discharged.
+- **§18 — *Things deferred* lists only what is deferred.** Six shipped entries leave the list for the sections that own them: serialization (§5.19, §5.22), asymmetric auto-equality (§7.5), lambda-parameter destructuring (§13.2), runtime `const` (§17.8), and `ReceiveAll` and the `sendable` constraint (§12.6). *Sum types beyond `choice`* and *Static interface member promotions* keep only their remaining deferrals, and #1508 is stated as declined with its reason. The attribute entry no longer counts serialization among the machinery it waits for, because serialization ships through the closed `serialized` clause. The intro says an item leaves the list when it ships. §7.5's pointer to the removed entry is reworded.
+
+**Proposals.**
+- **`DECLINED.md`.**
+  - The `SharedAtomic<T>` / sendable-`Shared` mode row moves from `deferred` to `retired`, because the payload rule delivered it with no second type. The index-size line becomes 136 `deferred` and 50 `retired` (1,096 rows).
+  - 135 rows that cited a rationale paragraph by a revision label that no longer exists ("(v0.329 paragraph)", "*v0.327 addendum*", "(the v0.336 paragraph)", a retitled lead-in) now name the paragraph's current lead-in. No verdict, class or reason changed.
+  - Row 444 (Send/Sync typing) now points at §12.6. Row 672's span note is reconciled to v0.78–v0.96 by the v0.97 entry. The multi-consumer row's remaining reason is restated as §12.6 states it.
+- **`spec-change-process.md`.** The checklist line for §18 now says to move a shipped entry out of the list, into the owning section, in the same revision. The v0.201 rule annotated the entry instead.
+
+**Checks.**
+- `scripts/check_docs.sh` (all phases), `check_proposals.sh`, `build_book.py --check` and `check_src_citations.py` are clean on the composed tree. The one CITATION advisory (`[spec] §4.12`) predates this revision.
+- A non-author critic reviewed every lane. It checked each restated rule against spec v0.352 and scripted a section-by-section comparison of links, issue and proposal numbers, and decline words. It spot-checked fifteen dropped facts against the changelog and restored the one that was recorded nowhere else (§5.19's Java corroboration). It corrected one strengthened claim (§17.6, "showed" → "suggested") and one garbled decline (§5.10, the #3240 `new` ruling). It found the two further stale statements fixed in §12.6 (multi-consumer blocker; bounded channels).
 
 **Migration:** doc-only.
 
