@@ -3518,7 +3518,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     {
         auto* msX =
             dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
-        if (isExtensionMethod(msX) && recvTy && !recvTy->declaration) {
+        // fix #7710 (§26.5 rules 1-2, v0.355): "declaration-less" means
+        // BOTH built-in TypeRef shapes -- the annotation (null declaration)
+        // and the `builtinClassSym` stub a static factory result carries
+        // (`FrozenArray<int>.From(a)`: non-null declaration, no TypeDecl, no
+        // module). Gating on `!recvTy->declaration` alone left a stub-typed
+        // receiver to the name-keyed arms (`f.Peek()` printed the built-in's
+        // 3, not the extension's 7). `isUserDeclaredTypeSym` is the #5272
+        // discriminator; `builtinTypeName` already reads both shapes.
+        if (isExtensionMethod(msX) && recvTy &&
+            (!recvTy->declaration ||
+             !sema::isUserDeclaredTypeSym(recvTy->declaration))) {
             const std::string_view headX = builtinTypeName(recvTy);
             if (common::isConcreteCollectionSurfaceHead(headX) &&
                 !common::concreteCollectionHeadDeclares(headX, m))

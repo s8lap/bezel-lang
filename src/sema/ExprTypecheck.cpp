@@ -11793,8 +11793,26 @@ static bool extensionTargetMatchesReceiver(
             // One or both are null-declaration builtins: compare by name.
             // A null-declaration + non-null-declaration pair is never equal
             // (a builtin cannot match a user type and vice versa).
-            bool targetIsBuiltin = (target->declaration == nullptr);
-            bool recvIsBuiltin   = (recv->declaration   == nullptr);
+            //
+            // fix #7756 #7681 #7710 (§26.5 rule 2, §26.2, v0.355): a built-in
+            // reaches this matcher in TWO TypeRef shapes -- an annotation
+            // resolves to a declaration-LESS Named ref, while a static
+            // factory or built-in call result (`TimeSpan.FromHours(1.0)`,
+            // `Guid.Empty`, `d.AddDays(1)`, `FrozenArray<int>.From(a)`) is
+            // stamped with the synthetic `builtinClassSym` TypeSymbol: a
+            // non-null declaration with no TypeDecl and no module. Reading
+            // only `declaration == nullptr` classified that stub as a USER
+            // type, so an `extension TimeSpan` head never matched a
+            // factory-typed receiver and §26.5's search found no block on
+            // "x's type". `isUserDeclaredTypeSym` (Symbol.hpp, #5272) is
+            // the one discriminator for "user declaration vs built-in";
+            // its complement is the built-in, in either shape. Two built-in
+            // shapes are then compared by simple name (namedTypeSimpleName
+            // reads the stub's `declaration->name`).
+            bool targetIsBuiltin = (target->declaration == nullptr) ||
+                                   !isUserDeclaredTypeSym(target->declaration);
+            bool recvIsBuiltin   = (recv->declaration == nullptr) ||
+                                   !isUserDeclaredTypeSym(recv->declaration);
             if (targetIsBuiltin != recvIsBuiltin)
                 return false;   // builtin vs user-declared → never match
             if (!targetIsBuiltin) {
