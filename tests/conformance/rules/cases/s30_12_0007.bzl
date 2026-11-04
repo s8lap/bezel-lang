@@ -12,7 +12,7 @@
 //! expect: run
 //! output: locked
 //!   done
-//! notes: twin of s30_12_0008, where the same helper would park and raises.
+//! notes: companion of s30_12_0008, where the same helper would park and raises.
 module Conf;
 
 import System.Threading;

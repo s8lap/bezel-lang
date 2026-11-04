@@ -2,7 +2,9 @@
 //! doc: spec
 //! section: 30.13
 //! title: completing an awaited task queues the continuation rather than running it inside the completer
-//! rule: When the awaited task completes, the continuation is queued to its
+//! rule: a continuation, once started, runs without interruption from the
+//!   domain's other work until it suspends at an `await`, completes, or
+//!   propagates an exception (*run-to-completion*). … When the awaited task completes, the continuation is queued to its
 //!   domain. The domain runs queued continuations one at a time, in
 //!   unspecified order.
 //! cites: 30.13, 30.11

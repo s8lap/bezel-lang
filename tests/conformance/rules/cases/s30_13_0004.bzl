@@ -24,7 +24,7 @@ public class Program
     var step := await gate;
     var v := c.N;
     var k := 0;
-    for var i in 1..100000 do
+    for var _ in 1..100000 do
       k := k + step;
     end;
     c.N := v + k;

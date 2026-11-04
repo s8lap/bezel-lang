@@ -9,17 +9,17 @@
 //! expect: reject
 //! diagnostic: blocking
 //! notes: accepting twin s30_12_0006 — the one edit is TryAcquire becoming
-//!   `await … TryAcquireAsync`.
+//!   `await … TryAcquireAsync`. The enclosing method is not async, so only
+//!   the async-lambda row of the rule reaches the call.
 module Conf;
 
 import System.Threading;
 
 public class Program
-  public async method RunAsync(m: Mutex): Task
-    var f := async lambda() => do
+  public static method Make(): (Mutex) -> Task
+    return async lambda(m: Mutex) => do
       using var g := m.TryAcquire(TimeSpan.Zero);
       await Task.Delay(0);
     end;
-    await f();
-  end RunAsync;
+  end Make;
 end Program;

@@ -12,7 +12,7 @@
 //!   done
 //! notes: the continuation already holds the mutex (non-reentrant: a holder
 //!   re-acquiring waits on itself), so the helper's Acquire would park; it
-//!   must raise rather than hang. Twin of s30_12_0007.
+//!   must raise rather than hang. Companion of s30_12_0007.
 module Conf;
 
 import System.Threading;

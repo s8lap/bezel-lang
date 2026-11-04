@@ -13,11 +13,10 @@ module Conf;
 import System.Threading;
 
 public class Program
-  public async method RunAsync(m: Mutex): Task
-    var f := async lambda() => do
+  public static method Make(): (Mutex) -> Task
+    return async lambda(m: Mutex) => do
       using var g := await m.TryAcquireAsync(TimeSpan.Zero);
       await Task.Delay(0);
     end;
-    await f();
-  end RunAsync;
+  end Make;
 end Program;
