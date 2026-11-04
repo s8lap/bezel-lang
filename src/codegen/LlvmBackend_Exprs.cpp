@@ -1554,6 +1554,11 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             ev == static_cast<llvm::Value*>(lastStampedFnCell_);
                         pv = emitValueToString(ev, rt);
                         if (pv && fresh) emitClosureRelease(ev);
+                        // fix #7610 (§18.5, v0.355): the alignment applies to
+                        // the rendered text of EVERY hole, a function value
+                        // (and its `null`) included; the FORMAT part is never
+                        // dispatched on a function value.
+                        if (pv) pv = emitAlignOnly(pv, part.formatSpec);
                     }
                     // fix #2661 (spec §8.5 / §18.5, v0.252): a SPAN or a
                     // `Range<T>` hole. Exactly the #2913 shape one type over:
