@@ -300,3 +300,220 @@ BEZEL_TEST(pure_body_stdlib_member_7453,
         BEZEL_EXPECT_TRUE(d->location.line == 5u);
     }
 }
+
+// =========================================================================
+// fix-forward (#7453 review): the ADMIT rows the first fix over-rejected.
+//
+// The first fix keyed the standard library's purity by a hand-written
+// (spelled head, member) table and rejected every member access that was not
+// a row. §22.15 admits a built-in member access for THREE reasons, not one,
+// and the stdlib declares the primitive types ONCE per family; each row
+// below is a program the spec admits, the reviewer's probe a02/a06/a07/a15/
+// a20/a22/a29/a30 (spec / stdlib v0.355). Each asserts that the program
+// compiles with NO "standard-library member" diagnostic at all.
+// =========================================================================
+
+namespace {
+
+// No diagnostic of the §22.15 standard-library arm, and no error at all.
+void expectStdlibArmAdmits(const bezel::test::SemaResult& r) {
+    BEZEL_EXPECT_TRUE(diagnosticsContaining(r, "standard-library member")
+                          .empty());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+}  // namespace
+
+// a02 — §22.15 rule 1: "static field, `static readonly`, and `const` reads
+// … Reads are not effects." stdlib §2.2 declares `public static const Pi:
+// double` and `public static const Tau: double`.
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           math_const_reads_in_pure_body_accepted_spec_22_15_rule_1) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(): double => Math.Pi + Math.Tau;\n"
+        "end C;\n");
+    expectStdlibArmAdmits(r);
+}
+
+// a06 — stdlib §9.1: "`SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`,
+// `Int64`, `UInt64`. The example below shows `Int32`; the others have
+// analogous shapes", and `Int32` declares `public pure method ToString():
+// string;` and `public static pure method Parse(s: string): int;`.
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           small_integer_to_string_in_pure_body_accepted_spec_22_15_stdlib_9_1) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(b: byte, u: uint, sh: short, ul: ulong, "
+        "s: string): string\n"
+        "    var p := uint.Parse(s);\n"
+        "    return b.ToString() + u.ToString() + sh.ToString() + "
+        "ul.ToString();\n"
+        "  end F;\n"
+        "end C;\n");
+    expectStdlibArmAdmits(r);
+}
+
+// a30 — the same family: `CompareTo` (`public pure method CompareTo(other:
+// int): int;` on `Int32`, "analogous" on `Byte`).
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           small_integer_compare_to_in_pure_body_accepted_spec_22_15_stdlib_9_1) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(s: string, b: byte): int => "
+        "int(byte.Parse(s)) + b.CompareTo(b);\n"
+        "end C;\n");
+    expectStdlibArmAdmits(r);
+}
+
+// a07 — stdlib §9.2 `Float`: `public pure method ToString(): string;`
+// ("`Float` has the analogous shape").
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           float_members_in_pure_body_accepted_spec_22_15_stdlib_9_2) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(f: float, s: string): string\n"
+        "    var n := float.IsNaN(f);\n"
+        "    var g := float.Parse(s);\n"
+        "    return f.ToString();\n"
+        "  end F;\n"
+        "end C;\n");
+    expectStdlibArmAdmits(r);
+}
+
+// a15 — §22.15 *Members classified by rule*: a record's synthesized
+// `Equals` is pure "iff every field's equality dispatch target is pure —
+// primitives, …"; stdlib §9.1: "`Equals(other: int): bool` — auto-generated
+// from `IEquatable<int>` per language spec §9.2 … The same convention
+// applies to every primitive declaration in §9.1–§9.5."
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           primitive_equals_in_pure_body_accepted_spec_22_15_classified) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(x: int, y: int, d: double): bool => "
+        "x.Equals(y) or d.Equals(1.0);\n"
+        "end C;\n");
+    expectStdlibArmAdmits(r);
+}
+
+// a20 — spec §3.4: the keyword ALIASES the type, so `x: Int32` names the
+// same stdlib §9.1 record as `x: int`, whose `ToString` is `pure`.
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           int32_spelling_to_string_in_pure_body_accepted_spec_3_4_22_15) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(x: Int32): string => x.ToString();\n"
+        "end C;\n");
+    expectStdlibArmAdmits(r);
+}
+
+// a22 / a29 — stdlib §4.14 `public record Span<T>(Buffer: OwningBuffer<T>,
+// Start: int, Length: int)` and the same for `ReadOnlySpan<T>`: `Start` and
+// `Length` are positional record components, whose getters §22.15
+// classifies ("an auto-property getter is pure (a backing-field read)").
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           span_component_reads_in_pure_body_accepted_spec_22_15_classified) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(sp: Span<int>): int => sp.Length + "
+        "sp.Start;\n"
+        "  public static pure method G(sp: ReadOnlySpan<int>): int => "
+        "sp.Length + sp.Start;\n"
+        "end C;\n");
+    expectStdlibArmAdmits(r);
+}
+
+// The reviewer's r18: a USER enum's member access is not a standard-library
+// member, so the standard-library arm must not report it (the first fix
+// added a second, mislabelled "the standard library does not declare
+// `Color.…`" error after the lookup failure).
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           user_enum_member_not_reported_as_stdlib_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "enum Color\n"
+        "  Red, Green;\n"
+        "end Color;\n"
+        "class C\n"
+        "  public static pure method F(s: string): Color? => "
+        "Color.FromNameOrNull(s);\n"
+        "end C;\n");
+    BEZEL_EXPECT_TRUE(diagnosticsContaining(r, "standard-library member")
+                          .empty());
+}
+
+// =========================================================================
+// The REJECT rows the review measured, pinned: each member carries no
+// `pure` marker in the standard library, so §22.15 rule 6 rejects it.
+// =========================================================================
+
+// stdlib §2.2: `Min`, `Max`, `Clamp`, `Sign` are declared without `pure`
+// ("Not `pure`: INumber<T>'s operators are not pure-declared").
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           math_min_max_clamp_sign_in_pure_body_rejected_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(a: int, b: int): int\n"
+        "    return Math.Min(a, b) + Math.Max(a, b) + Math.Clamp(a, 0, b) + "
+        "Math.Sign(a);\n"
+        "  end F;\n"
+        "end C;\n");
+    for (const char* m : {"Math.Min", "Math.Max", "Math.Clamp", "Math.Sign"}) {
+        const bezel::Diagnostic* d = theDiagnosticContaining(
+            r, std::string("the standard library does not declare `") + m +
+                   "` pure");
+        BEZEL_EXPECT_TRUE(d != nullptr);
+        if (d) BEZEL_EXPECT_TRUE(d->location.line == 4u);
+    }
+}
+
+// stdlib §2.4 `public static readonly property ProcessorCount: int;` (an
+// environment intercept point, no marker) and stdlib §4.8 `ContainsKey` (no
+// marker).
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           environment_and_dictionary_members_in_pure_body_rejected_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(): int => Environment.ProcessorCount;\n"
+        "  public static pure method G(d: Dictionary<string, int>): bool => "
+        "d.ContainsKey(\"x\");\n"
+        "end C;\n");
+    const bezel::Diagnostic* e = theDiagnosticContaining(
+        r, "the standard library does not declare "
+           "`Environment.ProcessorCount` pure");
+    BEZEL_EXPECT_TRUE(e != nullptr);
+    if (e) BEZEL_EXPECT_TRUE(e->location.line == 3u);
+    const bezel::Diagnostic* k = theDiagnosticContaining(
+        r, "the standard library does not declare `Dictionary.ContainsKey` "
+           "pure");
+    BEZEL_EXPECT_TRUE(k != nullptr);
+    if (k) BEZEL_EXPECT_TRUE(k->location.line == 4u);
+}
+
+// stdlib §8.1 `public static method StartNew(): owned Stopwatch;` — a clock
+// read (an intercept point) with no marker.
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           stopwatch_start_new_in_pure_body_rejected_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "import System.Diagnostics;\n"
+        "class C\n"
+        "  public static pure method F(): int\n"
+        "    var sw := Stopwatch.StartNew();\n"
+        "    return 0;\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(
+        r, "the standard library does not declare `Stopwatch.StartNew` pure");
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 5u);
+}

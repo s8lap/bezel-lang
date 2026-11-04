@@ -30,173 +30,359 @@ namespace {
 // declaration.
 //
 // THE SPEC'S ANSWER. §22.15 "Intrinsic purity (the stdlib contract)": "A
-// standard-library member whose body is runtime-provided MAY carry `pure` …
+// standard-library member whose body is runtime-provided may carry `pure` …
 // The marker is the library's *stated contract*, normative for the
 // implementation … and trusted by the checker rather than verified from
 // source." Rule 6 then admits a call iff the member is "`pure`-declared or
 // pure-classified", and the prohibited list rejects "class construction —
 // `new C(…)`" outright (admitted only at the throw operand).
 //
-// SO THE SOURCE IS THE LIBRARY'S OWN MARKERS, transcribed from
-// `docs/Bezel_Standard_Library.md` (stdlib v0.350 / v0.353). Every row
-// below cites the section that declares it. A standard-library member that
-// is NOT in this table is NOT pure-declared, and §22.15 rule 6 rejects the
-// call — which is exactly the rule's "iff" reading, and the standard
-// library's own convention (§1): "Everything not so designated is pure
-// computation" applies to the INTERCEPT POINTS (the I/O surfaces), not to
-// the purity marker, which the library states per member.
+// WHAT A ROW ADMITS — THREE SOURCES, one per `StdlibPurity` value, because
+// §22.15 admits a built-in member access for three different reasons and
+// rule 6's `pure` marker is only one of them:
+//
+//   * `Const` — §22.15 rule 1: "static field, `static readonly`, and `const`
+//     reads … Reads are not effects". `Math.Pi`, `int.MaxValue`,
+//     `double.NaN` are `static const` declarations (stdlib §2.2, §9.1-§9.5),
+//     not calls, so rule 6 does not reach them at all.
+//   * `Declared` — §22.15 rule 6: the member carries the library's own
+//     `pure` marker, transcribed from `docs/Bezel_Standard_Library.md`
+//     (v0.355). Every row cites the section that declares it.
+//   * `Classified` — §22.15 *Members classified by rule (synthesized
+//     bodies)*: "an auto-property getter is pure (a backing-field read) …
+//     a record's synthesized members — positional constructor,
+//     `Equals`/`GetHashCode` (§9.2), `ToString`, `with`-copy — are pure iff
+//     every constituent operation is pure … (for equality and hash: iff
+//     every field's equality dispatch target is pure — primitives,
+//     `string`, enums, and qualifying records …)". That reaches the
+//     positional components of the standard library's records
+//     (`ReadOnlySpan<T>(Buffer, Start, Length)`, stdlib §4.14) and the
+//     synthesized `Equals`/`GetHashCode` of the primitive records (stdlib
+//     §9.1: "`Equals(other: int): bool` — auto-generated from
+//     `IEquatable<int>` per language spec §9.2 … The same convention
+//     applies to every primitive declaration in §9.1–§9.5").
+//
+// THE KEY. A row is keyed by the type's STANDARD-LIBRARY name (the stdlib's
+// own System-namespace spelling, stdlib §9: "declarations use the
+// System-namespace PascalCase names (`Int32`, `String`, `Double`, …)") — so
+// the keyword spelling and the System spelling of one type (`int` /
+// `Int32`, spec §3.4's keyword aliases) read the SAME row — and the eight
+// integer types and the two floating types key ONE family row each, because
+// the library declares them once: stdlib §9.1 "`SByte`, `Byte`, `Int16`,
+// `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`. The example below shows
+// `Int32`; the others have analogous shapes with their respective
+// `MinValue`/`MaxValue`", and stdlib §9.2 "`Float` has the analogous shape".
+// `purityTableHeadOf` does both normalisations.
+//
+// A standard-library member that is not in this table is neither const,
+// `pure`-declared nor pure-classified, and §22.15 rule 6 rejects the call —
+// the rule's "iff" reading.
 //
 // A note on the ARCHITECTURAL HOME: the compiler's ONE built-in table
-// (`src/common/BuiltinRegistry.cpp`'s `kBuiltinParams`) already transcribes
-// the standard library's declared member surfaces; a `pure` column there
-// would be the one-table home for this fact. That file belongs to another
-// lane, so this transcription lives in the file this change owns; the table
-// is written so that folding it into the built-in table is a MOVE, not a
-// REWRITE (the same (head, member) keys).
+// (`src/common/BuiltinRegistry.cpp`'s `kBuiltinParams`) transcribes only the
+// members that carry a §22.5 parameter surface, so it cannot answer the
+// question for a const or a property; a `pure` column there would still
+// leave those rows here. The (head, member) keys below are the registry's
+// own (System-spelled heads), so folding the table into it is a MOVE.
 // ---------------------------------------------------------------------------
+enum class StdlibPurity : unsigned char {
+    Const,       // §22.15 rule 1 — a `static const` read
+    Declared,    // §22.15 rule 6 — the library states `pure`
+    Classified,  // §22.15 "Members classified by rule"
+};
+
 struct StdlibPureMember {
     std::string_view head;
     std::string_view member;
+    StdlibPurity why;
 };
 
+// The two FAMILY keys: stdlib §9.1 and §9.2 each declare one shape for
+// several types.
+constexpr std::string_view kIntegerFamily = "<stdlib §9.1 integer>";
+constexpr std::string_view kFloatingFamily = "<stdlib §9.2 floating>";
+
+constexpr StdlibPurity kConst = StdlibPurity::Const;
+constexpr StdlibPurity kDecl = StdlibPurity::Declared;
+constexpr StdlibPurity kClsf = StdlibPurity::Classified;
+
 constexpr StdlibPureMember kStdlibPureMembers[] = {
-    // stdlib §2.2 `Math` — the pure arithmetic surface.
-    {"Math", "Abs"},        {"Math", "Sqrt"},     {"Math", "Pow"},
-    {"Math", "Floor"},      {"Math", "Ceiling"},  {"Math", "Round"},
-    {"Math", "Truncate"},   {"Math", "Fmod"},     {"Math", "IEEERemainder"},
+    // stdlib §2.2 `Math` — the two `static const` reads and the pure
+    // arithmetic surface (`Min`/`Max`/`Clamp`/`Sign`/`DivRem` carry no
+    // marker).
+    {"Math", "Pi", kConst},          {"Math", "Tau", kConst},
+    {"Math", "Abs", kDecl},          {"Math", "Sqrt", kDecl},
+    {"Math", "Pow", kDecl},          {"Math", "Floor", kDecl},
+    {"Math", "Ceiling", kDecl},      {"Math", "Round", kDecl},
+    {"Math", "Truncate", kDecl},     {"Math", "Fmod", kDecl},
+    {"Math", "IEEERemainder", kDecl},
     // stdlib §3.1 `StringBuilder` — the stored-extent read.
-    {"StringBuilder", "Capacity"},
-    // stdlib §3.3 `ReadOnlyStringSpan`.
-    {"ReadOnlyStringSpan", "Capacity"},
-    {"ReadOnlyStringSpan", "Length"},
-    {"ReadOnlyStringSpan", "Source"},
-    {"ReadOnlyStringSpan", "Start"},
-    {"ReadOnlyStringSpan", "IsEmpty"},
-    {"ReadOnlyStringSpan", "Slice"},
-    {"ReadOnlyStringSpan", "IndexOf"},
-    {"ReadOnlyStringSpan", "Contains"},
-    {"ReadOnlyStringSpan", "StartsWith"},
-    {"ReadOnlyStringSpan", "EndsWith"},
-    {"ReadOnlyStringSpan", "SequenceEqual"},
-    {"ReadOnlyStringSpan", "ToString"},
+    {"StringBuilder", "Capacity", kDecl},
+    // stdlib §3.3 `ReadOnlyStringSpan(Source, Start, Length)` — the three
+    // positional components (classified), the `pure` members.
+    {"ReadOnlyStringSpan", "Source", kClsf},
+    {"ReadOnlyStringSpan", "Start", kClsf},
+    {"ReadOnlyStringSpan", "Length", kClsf},
+    {"ReadOnlyStringSpan", "Capacity", kDecl},
+    {"ReadOnlyStringSpan", "IsEmpty", kDecl},
+    {"ReadOnlyStringSpan", "Slice", kDecl},
+    {"ReadOnlyStringSpan", "IndexOf", kDecl},
+    {"ReadOnlyStringSpan", "Contains", kDecl},
+    {"ReadOnlyStringSpan", "StartsWith", kDecl},
+    {"ReadOnlyStringSpan", "EndsWith", kDecl},
+    {"ReadOnlyStringSpan", "SequenceEqual", kDecl},
+    {"ReadOnlyStringSpan", "ToString", kDecl},
     // stdlib §4.1 / §4.2 — the collection interfaces' `Count` (the one
     // `pure`-declared member of the borrowing and owning interfaces).
-    {"IReadOnlyCollection", "Count"},
-    {"IReadOnlyList", "Count"},
-    {"ICollection", "Count"},
-    {"IList", "Count"},
-    {"IOwningCollection", "Count"},
-    {"IOwningList", "Count"},
+    {"IReadOnlyCollection", "Count", kDecl},
+    {"IReadOnlyList", "Count", kDecl},
+    {"ICollection", "Count", kDecl},
+    {"IList", "Count", kDecl},
+    {"IOwningCollection", "Count", kDecl},
+    {"IOwningList", "Count", kDecl},
+    // stdlib §4.8 `DictionaryEntry<K, V>(Key, Value)` — positional
+    // components.
+    {"DictionaryEntry", "Key", kClsf}, {"DictionaryEntry", "Value", kClsf},
     // stdlib §4.4 `Array<T>` / §4.5 `OwningArray<T>`.
-    {"Array", "Count"},      {"Array", "Capacity"},
-    {"OwningArray", "Count"}, {"OwningArray", "Capacity"},
+    {"Array", "Count", kDecl},       {"Array", "Capacity", kDecl},
+    {"OwningArray", "Count", kDecl}, {"OwningArray", "Capacity", kDecl},
     // stdlib §4.6 `LinkedList<T>` / §4.7 `OwningLinkedList<T>`.
-    {"LinkedList", "Count"},      {"LinkedList", "FirstNode"},
-    {"LinkedList", "LastNode"},   {"LinkedList", "First"},
-    {"LinkedList", "Last"},
-    {"OwningLinkedList", "Count"}, {"OwningLinkedList", "FirstNode"},
-    {"OwningLinkedList", "LastNode"}, {"OwningLinkedList", "First"},
-    {"OwningLinkedList", "Last"},
+    {"LinkedList", "Count", kDecl},      {"LinkedList", "FirstNode", kDecl},
+    {"LinkedList", "LastNode", kDecl},   {"LinkedList", "First", kDecl},
+    {"LinkedList", "Last", kDecl},
+    {"OwningLinkedList", "Count", kDecl},
+    {"OwningLinkedList", "FirstNode", kDecl},
+    {"OwningLinkedList", "LastNode", kDecl},
+    {"OwningLinkedList", "First", kDecl},
+    {"OwningLinkedList", "Last", kDecl},
     // stdlib §4.8 `Dictionary<K,V>` / §4.9 `OwningDictionary<K,V>`.
-    {"Dictionary", "Count"},      {"OwningDictionary", "Count"},
+    {"Dictionary", "Count", kDecl}, {"OwningDictionary", "Count", kDecl},
     // stdlib §4.10 `Set<T>` / `OwningSet<T>` — the `Count` they inherit from
     // §4.1's `IReadOnlyCollection<T>`.
-    {"Set", "Count"},      {"OwningSet", "Count"},
+    {"Set", "Count", kDecl}, {"OwningSet", "Count", kDecl},
     // stdlib §4.11 — the stack/queue surfaces (`Count` inherited; `Peek`
     // pure-declared on the borrowing and the owning family alike).
-    {"Stack", "Count"},     {"Stack", "Peek"},
-    {"OwningStack", "Count"}, {"OwningStack", "Peek"},
-    {"Queue", "Count"},     {"Queue", "Peek"},
-    {"OwningQueue", "Count"}, {"OwningQueue", "Peek"},
+    {"Stack", "Count", kDecl},       {"Stack", "Peek", kDecl},
+    {"OwningStack", "Count", kDecl}, {"OwningStack", "Peek", kDecl},
+    {"Queue", "Count", kDecl},       {"Queue", "Peek", kDecl},
+    {"OwningQueue", "Count", kDecl}, {"OwningQueue", "Peek", kDecl},
     // stdlib §4.14 `OwningBuffer<T>` — the immutable-once-allocated extent.
-    {"OwningBuffer", "Length"},
+    {"OwningBuffer", "Length", kDecl},
+    // stdlib §4.14 `Span<T>(Buffer, Start, Length)` /
+    // `ReadOnlySpan<T>(Buffer, Start, Length)` — the positional components
+    // (their `IsEmpty`/`Slice`/`IndexOf` carry no marker), plus the two
+    // bit-tier entry points the library marks (`ReadOnlySpan<byte>.
+    // AsBitReader`, `Span<byte>.AsBitWriter`; `Span<byte>.AsBitReader`
+    // delegates through the unmarked `AsReadOnly` and is not `pure`).
+    {"Span", "Buffer", kClsf},  {"Span", "Start", kClsf},
+    {"Span", "Length", kClsf},  {"Span", "AsBitWriter", kDecl},
+    {"ReadOnlySpan", "Buffer", kClsf}, {"ReadOnlySpan", "Start", kClsf},
+    {"ReadOnlySpan", "Length", kClsf},
+    {"ReadOnlySpan", "AsBitReader", kDecl},
+    // stdlib §4.14 bit tier — `BitReader`/`BitWriter(Source, BitStart,
+    // BitLength)`: the components, and the members its *Purity* paragraph
+    // names ("`IsEmpty`, `IsByteAligned`, the three `Slice` overloads, and
+    // `AlignToByte` on every type of this tier").
+    {"BitReader", "Source", kClsf},       {"BitReader", "BitStart", kClsf},
+    {"BitReader", "BitLength", kClsf},    {"BitReader", "IsEmpty", kDecl},
+    {"BitReader", "IsByteAligned", kDecl}, {"BitReader", "Slice", kDecl},
+    {"BitReader", "AlignToByte", kDecl},
+    {"BitWriter", "Source", kClsf},       {"BitWriter", "BitStart", kClsf},
+    {"BitWriter", "BitLength", kClsf},    {"BitWriter", "IsEmpty", kDecl},
+    {"BitWriter", "IsByteAligned", kDecl}, {"BitWriter", "Slice", kDecl},
+    {"BitWriter", "AlignToByte", kDecl},
+    // stdlib §4.15 `ArraySpan<T>` / `ReadOnlyArraySpan<T>(Source, Start,
+    // Length)` and the mirrored bit tier `ArrayBitReader`/`ArrayBitWriter`
+    // ("Every rule of §4.14's bit tier holds here verbatim").
+    {"ArraySpan", "Source", kClsf},  {"ArraySpan", "Start", kClsf},
+    {"ArraySpan", "Length", kClsf},  {"ArraySpan", "AsBitWriter", kDecl},
+    {"ReadOnlyArraySpan", "Source", kClsf},
+    {"ReadOnlyArraySpan", "Start", kClsf},
+    {"ReadOnlyArraySpan", "Length", kClsf},
+    {"ReadOnlyArraySpan", "AsBitReader", kDecl},
+    {"ArrayBitReader", "Source", kClsf},
+    {"ArrayBitReader", "BitStart", kClsf},
+    {"ArrayBitReader", "BitLength", kClsf},
+    {"ArrayBitReader", "IsEmpty", kDecl},
+    {"ArrayBitReader", "IsByteAligned", kDecl},
+    {"ArrayBitReader", "Slice", kDecl},
+    {"ArrayBitReader", "AlignToByte", kDecl},
+    {"ArrayBitWriter", "Source", kClsf},
+    {"ArrayBitWriter", "BitStart", kClsf},
+    {"ArrayBitWriter", "BitLength", kClsf},
+    {"ArrayBitWriter", "IsEmpty", kDecl},
+    {"ArrayBitWriter", "IsByteAligned", kDecl},
+    {"ArrayBitWriter", "Slice", kDecl},
+    {"ArrayBitWriter", "AlignToByte", kDecl},
     // stdlib §4.17 `SortedDictionary<K,V>` / §4.18 `SortedSet<T>`.
-    {"SortedDictionary", "Count"},      {"SortedDictionary", "FirstKey"},
-    {"SortedDictionary", "LastKey"},
-    {"SortedSet", "Count"}, {"SortedSet", "First"}, {"SortedSet", "Last"},
+    {"SortedDictionary", "Count", kDecl},
+    {"SortedDictionary", "FirstKey", kDecl},
+    {"SortedDictionary", "LastKey", kDecl},
+    {"SortedSet", "Count", kDecl}, {"SortedSet", "First", kDecl},
+    {"SortedSet", "Last", kDecl},
     // stdlib §4.19 `FrozenArray<T>` declares no `Count` (it conforms to
     // `IEnumerable<T>` alone), so it carries no row here.
     // stdlib §4.20 `Counter<K>` / §4.21 `OwningSlotMap<T>`.
-    {"Counter", "Count"},      {"Counter", "Total"},
-    {"OwningSlotMap", "Count"},
-    // stdlib §8.2 `Debug` — the parse/format surface (the WRITE surface is
-    // not pure).
-    {"Debug", "Parse"}, {"Debug", "ParseOrNull"}, {"Debug", "ToString"},
-    {"Debug", "CompareTo"},
-    // stdlib §9.1 — the integer types (`int` / `long` heads).
-    {"int", "Parse"}, {"int", "ParseOrNull"}, {"int", "ToString"},
-    {"int", "CompareTo"},
-    {"long", "Parse"}, {"long", "ParseOrNull"}, {"long", "ToString"},
-    {"long", "CompareTo"},
-    // stdlib §9.2 `Double` / `Float`.
-    {"double", "IsNaN"}, {"double", "IsInfinity"},
-    {"double", "IsPositiveInfinity"}, {"double", "IsNegativeInfinity"},
-    {"double", "IsFinite"}, {"double", "Parse"}, {"double", "ParseOrNull"},
-    {"double", "IeeeEquals"}, {"double", "BitwiseEquals"},
-    {"double", "ToString"}, {"double", "CompareTo"},
+    {"Counter", "Count", kDecl}, {"Counter", "Total", kDecl},
+    {"OwningSlotMap", "Count", kDecl},
+    // stdlib §8.2 `Debug` declares only `Assert` and `WriteLine`, neither
+    // `pure`, so it carries no row here.
+    //
+    // stdlib §9.1 — the eight integer types, ONE family ("the others have
+    // analogous shapes"): the `MinValue`/`MaxValue` consts, the `pure`
+    // `Parse`/`ParseOrNull`/`ToString`/`CompareTo` (`TryParse` is not
+    // `pure`: it takes `out`), and the record-synthesized `Equals`/
+    // `GetHashCode` (classified: a machine-integer equality).
+    {kIntegerFamily, "MinValue", kConst},
+    {kIntegerFamily, "MaxValue", kConst},
+    {kIntegerFamily, "Parse", kDecl},
+    {kIntegerFamily, "ParseOrNull", kDecl},
+    {kIntegerFamily, "ToString", kDecl},
+    {kIntegerFamily, "CompareTo", kDecl},
+    {kIntegerFamily, "Equals", kClsf},
+    {kIntegerFamily, "GetHashCode", kClsf},
+    // stdlib §9.2 `Double` and `Float` ("`Float` has the analogous shape").
+    {kFloatingFamily, "MinValue", kConst},
+    {kFloatingFamily, "MaxValue", kConst},
+    {kFloatingFamily, "Epsilon", kConst},
+    {kFloatingFamily, "PositiveInfinity", kConst},
+    {kFloatingFamily, "NegativeInfinity", kConst},
+    {kFloatingFamily, "NaN", kConst},
+    {kFloatingFamily, "IsNaN", kDecl},
+    {kFloatingFamily, "IsInfinity", kDecl},
+    {kFloatingFamily, "IsPositiveInfinity", kDecl},
+    {kFloatingFamily, "IsNegativeInfinity", kDecl},
+    {kFloatingFamily, "IsFinite", kDecl},
+    {kFloatingFamily, "Parse", kDecl},
+    {kFloatingFamily, "ParseOrNull", kDecl},
+    {kFloatingFamily, "IeeeEquals", kDecl},
+    {kFloatingFamily, "BitwiseEquals", kDecl},
+    {kFloatingFamily, "ToString", kDecl},
+    {kFloatingFamily, "CompareTo", kDecl},
+    {kFloatingFamily, "Equals", kClsf},
+    {kFloatingFamily, "GetHashCode", kClsf},
     // stdlib §9.3 `Decimal`.
-    {"decimal", "Parse"}, {"decimal", "ParseOrNull"}, {"decimal", "ToString"},
-    {"decimal", "CompareTo"}, {"decimal", "Round"},
+    {"Decimal", "MinValue", kConst}, {"Decimal", "MaxValue", kConst},
+    {"Decimal", "Zero", kConst},     {"Decimal", "One", kConst},
+    {"Decimal", "Parse", kDecl},     {"Decimal", "ParseOrNull", kDecl},
+    {"Decimal", "ToString", kDecl},  {"Decimal", "CompareTo", kDecl},
+    {"Decimal", "Round", kDecl},
+    {"Decimal", "Equals", kClsf},    {"Decimal", "GetHashCode", kClsf},
     // stdlib §9.4 `Boolean`.
-    {"bool", "Parse"}, {"bool", "ParseOrNull"}, {"bool", "ToString"},
+    {"Boolean", "Parse", kDecl},     {"Boolean", "ParseOrNull", kDecl},
+    {"Boolean", "ToString", kDecl},
+    {"Boolean", "Equals", kClsf},    {"Boolean", "GetHashCode", kClsf},
     // stdlib §9.5 `Char`.
-    {"char", "IsDigit"}, {"char", "IsLetter"}, {"char", "IsLetterOrDigit"},
-    {"char", "IsWhiteSpace"}, {"char", "IsUpper"}, {"char", "IsLower"},
-    {"char", "IsControl"}, {"char", "IsPunctuation"}, {"char", "ToUpper"},
-    {"char", "ToLower"}, {"char", "Parse"}, {"char", "ParseOrNull"},
-    {"char", "ToString"}, {"char", "CompareTo"},
-    // stdlib §9.6 `String`.
-    {"string", "Length"}, {"string", "IsEmpty"}, {"string", "IsAscii"},
-    {"string", "From"}, {"string", "Repeat"}, {"string", "IsNullOrWhiteSpace"},
-    {"string", "Contains"}, {"string", "StartsWith"}, {"string", "EndsWith"},
-    {"string", "IndexOf"}, {"string", "LastIndexOf"}, {"string", "Substring"},
-    {"string", "AsSpan"}, {"string", "Trim"}, {"string", "TrimStart"},
-    {"string", "TrimEnd"}, {"string", "ToUpper"}, {"string", "ToLower"},
-    {"string", "Replace"}, {"string", "PadLeft"}, {"string", "PadRight"},
-    {"string", "PadCenter"}, {"string", "Insert"}, {"string", "Remove"},
-    {"string", "CompareTo"}, {"string", "Equals"}, {"string", "GetHashCode"},
-    {"string", "ToString"},
+    {"Char", "MinValue", kConst},    {"Char", "MaxValue", kConst},
+    {"Char", "IsDigit", kDecl},      {"Char", "IsLetter", kDecl},
+    {"Char", "IsLetterOrDigit", kDecl}, {"Char", "IsWhiteSpace", kDecl},
+    {"Char", "IsUpper", kDecl},      {"Char", "IsLower", kDecl},
+    {"Char", "IsControl", kDecl},    {"Char", "IsPunctuation", kDecl},
+    {"Char", "ToUpper", kDecl},      {"Char", "ToLower", kDecl},
+    {"Char", "Parse", kDecl},        {"Char", "ParseOrNull", kDecl},
+    {"Char", "ToString", kDecl},     {"Char", "CompareTo", kDecl},
+    {"Char", "Equals", kClsf},       {"Char", "GetHashCode", kClsf},
+    // stdlib §9.6 `String` (a class: its `Equals`/`GetHashCode`/`ToString`
+    // are declared `pure`, not synthesized).
+    {"string", "Length", kDecl},     {"string", "IsEmpty", kDecl},
+    {"string", "IsAscii", kDecl},    {"string", "From", kDecl},
+    {"string", "Repeat", kDecl},     {"string", "IsNullOrWhiteSpace", kDecl},
+    {"string", "Contains", kDecl},   {"string", "StartsWith", kDecl},
+    {"string", "EndsWith", kDecl},   {"string", "IndexOf", kDecl},
+    {"string", "LastIndexOf", kDecl}, {"string", "Substring", kDecl},
+    {"string", "AsSpan", kDecl},     {"string", "Trim", kDecl},
+    {"string", "TrimStart", kDecl},  {"string", "TrimEnd", kDecl},
+    {"string", "ToUpper", kDecl},    {"string", "ToLower", kDecl},
+    {"string", "Replace", kDecl},    {"string", "PadLeft", kDecl},
+    {"string", "PadRight", kDecl},   {"string", "PadCenter", kDecl},
+    {"string", "Insert", kDecl},     {"string", "Remove", kDecl},
+    {"string", "CompareTo", kDecl},  {"string", "Equals", kDecl},
+    {"string", "GetHashCode", kDecl}, {"string", "ToString", kDecl},
     // stdlib §9.8 `Range<T>` — the recomputed reads carry the marker; the
-    // stored-slot reads are pure by §22.15's classification rule.
-    {"Range", "IsOpenEnded"}, {"Range", "IsEmpty"}, {"Range", "Contains"},
-    {"Range", "Start"}, {"Range", "End"}, {"Range", "Step"},
-    {"Range", "IsEndInclusive"},
+    // stored-slot reads are pure by §22.15's classification rule ("All six
+    // declared properties are the type's auto-property surface").
+    {"Range", "IsOpenEnded", kDecl}, {"Range", "IsEmpty", kDecl},
+    {"Range", "Contains", kDecl},
+    {"Range", "Start", kClsf},       {"Range", "End", kClsf},
+    {"Range", "Step", kClsf},        {"Range", "IsEndInclusive", kClsf},
 };
 
-// The INDEXER rows are keyed by the head alone: an indexer access carries no
-// member name at the site. (fix #7453: NO indexer row is transcribed here —
-// #3721's own structural note established that a built-in indexer read is
-// not rule 6's accessor-read business, and its T3 control row pins that
-// admit. A built-in indexer is left as #3721 left it.)
+// The table key of a standard-library type head: the stdlib's own
+// System-namespace spelling (`int` → `Int32`, `String` → `string`, the
+// registry's one normalisation), then the §9.1 / §9.2 family.
+std::string_view purityTableHeadOf(std::string_view head) {
+    head = common::builtinParamHeadSpelling(head);
+    if (head == "SByte" || head == "Byte" || head == "Int16" ||
+        head == "UInt16" || head == "Int32" || head == "UInt32" ||
+        head == "Int64" || head == "UInt64")
+        return kIntegerFamily;
+    if (head == "Double" || head == "Float") return kFloatingFamily;
+    return head;
+}
 
-bool stdlibMemberIsPure(std::string_view head, std::string_view member) {
+bool stdlibHeadHasRows(std::string_view head) {
+    const std::string_view key = purityTableHeadOf(head);
     for (const auto& e : kStdlibPureMembers)
-        if (e.head == head && e.member == member) return true;
+        if (e.head == key) return true;
     return false;
 }
 
-// The head of a COMPILER-BUILT-IN receiver, or "" when the receiver is a
-// user-declared (or imported) type — the only case where the declaration-
-// based purity predicates (which carry the `pure` modifier) are the
-// authority.
+bool stdlibMemberIsPure(std::string_view head, std::string_view member) {
+    const std::string_view key = purityTableHeadOf(head);
+    for (const auto& e : kStdlibPureMembers)
+        if (e.head == key && e.member == member) return true;
+    return false;
+}
+
+// Is a declaration-less, single-part Named head a STANDARD-LIBRARY type? A
+// declaration-less Named TypeRef is one of exactly two things — a reserved
+// built-in, or a TYPE PARAMETER (`common::isReservedBuiltinTypeName`'s own
+// contract) — and a type parameter is not the standard library's: §22.15
+// *Checking and dispatch* routes a call on a constraint-typed value to the
+// constraint interface's declared members, which is not this arm's
+// question. So the head must be NAMED as a built-in by one of the
+// registry's tables (or by this file's own rows, for the few stdlib types —
+// `Counter`, `BitReader` — no registry table lists).
+bool isStdlibTypeHead(std::string_view h) {
+    return common::isReservedBuiltinTypeName(h) ||
+           !common::builtinTypeHomeModuleOf(h).empty() ||
+           common::isBuiltinExceptionName(h) ||
+           common::isKeywordAliasBuiltinName(h) || stdlibHeadHasRows(h);
+}
+
+// The head of a STANDARD-LIBRARY receiver, or "" when the receiver is a
+// user-declared or imported type (whose declaration-based predicates carry
+// the `pure` modifier) or a type parameter.
 //
-// TWO SHAPES. An INSTANCE receiver (`sb` of type `StringBuilder`, `a` of
-// type `Array<int>`, `s` of type `string`) resolves to a TypeRef whose
-// `declaration` is null — the built-in has no AST declaration — so the head
-// is the TypeRef's own `headName()` (alias-transparent, so `type Al :=
-// Array<int>` reads the same). A STATIC-CLASS receiver (`Console`, `Math`,
-// `Convert`) has no value type at all: `ctx_.exprType` is null and the
-// identifier carries the CLASS SYMBOL.
+// THREE SHAPES. A PRIMITIVE-typed instance receiver (`b` of type `byte`,
+// `x` of type `Int32`) is named by its `PrimitiveType` — never by the
+// spelling the source used, so `int` and `Int32` read the same row (spec
+// §3.4: the keyword ALIASES the type). Another instance receiver (`sb` of
+// type `StringBuilder`, `a` of type `Array<int>`) resolves to a Named
+// TypeRef whose `declaration` is null; its head is the TypeRef's own
+// `headName()` (alias-transparent, so `type Al := Array<int>` reads the
+// same), provided `isStdlibTypeHead` names it. A STATIC-CLASS receiver
+// (`Console`, `Math`) has no value type at all: `ctx_.exprType` is null and
+// the identifier carries the built-in CLASS SYMBOL — declaration-less and
+// with no declaring module (an IMPORTED user type is declaration-less too,
+// but carries its module; `TypeSymbol::isBuiltinRangeSym`'s test).
 std::string_view builtinReceiverHead(const TypeRef* rt, Symbol* recvSym) {
     if (rt) {
-        if (rt->kind != TypeRef::Kind::Named &&
-            rt->kind != TypeRef::Kind::Primitive)
-            return {};
-        if (rt->kind == TypeRef::Kind::Named && rt->declaration) return {};
-        std::string_view h = rt->headName();
-        return h;
+        if (rt->kind == TypeRef::Kind::Primitive) {
+            if (rt->primitive == PrimitiveType::None) return {};
+            return common::primitiveBuiltinSpelling(
+                static_cast<int>(rt->primitive));
+        }
+        if (rt->kind != TypeRef::Kind::Named || rt->declaration) return {};
+        const std::string_view h = rt->headName();
+        return isStdlibTypeHead(h) ? h : std::string_view{};
     }
-    if (auto* ts = dynamic_cast<TypeSymbol*>(recvSym)) return ts->name;
+    if (auto* ts = dynamic_cast<TypeSymbol*>(recvSym)) {
+        if (ts->decl || !ts->moduleName.empty()) return {};
+        // An enum constant is a §22.15 rule 1 read ("enum constants").
+        if (ts->kind == ast::TypeDeclKind::Enum) return {};
+        return ts->name;
+    }
     return {};
 }
 
