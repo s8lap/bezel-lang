@@ -11107,6 +11107,15 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     ? builder_.CreateUIToFP(args[ai], declTy, "cl.arg.uitofp")
                     : builder_.CreateSIToFP(args[ai], declTy, "cl.arg.sitofp");
             }
+            else if (declTy->isFloatingPointTy() &&
+                     args[ai]->getType()->isFloatingPointTy()) {
+                // fix #8144 (spec §5.1 implicit conversions, v0.355): a `float`
+                // argument at a `double` parameter of a function type widens
+                // (`fpext`) like the direct-call path does, via the same
+                // helper; before this the f32 operand reached an f64
+                // parameter and IR verification aborted.
+                args[ai] = coerceNumericToType(args[ai], declTy);
+            }
             else if (declTy->isIntegerTy() && args[ai]->getType()->isIntegerTy()) {
                 unsigned db = declTy->getIntegerBitWidth();
                 unsigned sb = args[ai]->getType()->getIntegerBitWidth();
