@@ -1273,6 +1273,20 @@ static std::string_view objectOwnSignatureMemberOf(
     return {};
 }
 
+// fix #6029 (§8.1, v0.355): the OWN SIGNATURE of one of `Object`'s three
+// virtual members, spelled as §8.1 declares it — `Equals(other: Object?)`,
+// `GetHashCode()`, `ToString()` — or empty for a name that is not one of the
+// three. This is the signature an `override` must reach to fill the slot
+// (§12.2: the trio "block only a declaration at their own signature — one
+// whose parameter list matches `Object`'s up to the nullability widening
+// above — which `override` reaches and nothing else does").
+static std::string_view objectSlotOwnSignature(std::string_view name) {
+    if (name == "Equals") return "Equals(other: Object?)";
+    if (name == "GetHashCode") return "GetHashCode()";
+    if (name == "ToString") return "ToString()";
+    return {};
+}
+
 // fix #5956 (§8.3, v0.338): an `Equals` whose one parameter is the class's own
 // type, `C` or `C?` (`C<T>` with its own type parameters when generic). Such
 // a member is the `Object` slot's second spelling ([§8.3]), so it is an
@@ -7573,6 +7587,45 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
     }
     // Parameters: count, exact modifier, exact type.
     if (derived->params.size() != base->params.size()) {
+        // fix #6029 (§8.1 / §12.1 / §12.2, v0.355): when the OVERRIDE is one
+        // of `Object`'s three virtual members AT THE SLOT'S OWN SIGNATURE
+        // (`Equals(other: Object?)`, `GetHashCode()`, `ToString()` — §8.1)
+        // and the base member it was matched against is declared at a
+        // DIFFERENT signature, the fault is NOT the parameter count. The base
+        // class's own member of that name OCCUPIES the name in the derived
+        // class (§12.2: "a class's own `Equals(a: K, b: K)` blocks that name
+        // in its subclasses as any member does"), so `Object`'s slot is not
+        // reachable by an `override` there: there is no virtual `X()` to
+        // override, and no parameter-count spelling fixes it — the old
+        // message ("does not match the base member's parameter count") sent
+        // the programmer after the count, whose only repair (matching the
+        // base's own signature) overrides the base's member instead of the
+        // slot. The base member here is always a USER-declared one (the
+        // `Object` trio has no base-side MethodSymbol — it is checked by
+        // checkObjectSlotOverrideSignature, §8.1), so "the base class" is
+        // accurate.
+        const std::string_view slot = objectSlotOwnSignature(derived->name);
+        if (!slot.empty()) {
+            // The slot's parameter count (§8.1): `Equals` takes one, the
+            // other two take none.
+            const std::size_t slotArity = (derived->name == "Equals") ? 1 : 0;
+            const bool derivedAtSlot = derived->params.size() == slotArity;
+            const bool baseAtSlot = base->params.size() == slotArity;
+            if (derivedAtSlot && !baseAtSlot) {
+                const std::string baseCls =
+                    (base->parent && !base->parent->name.empty())
+                        ? std::string(base->parent->name)
+                        : "a base class";
+                ctx_.diagnostics().report(
+                    Severity::Error, derived->declLoc,
+                    std::string("override of `") + std::string(derived->name) +
+                    "` matches no virtual member: the base class `" + baseCls +
+                    "` declares `" + std::string(derived->name) +
+                    "` at a different signature, and there is no virtual `" +
+                    std::string(slot) + "` to override (§12.1, §12.2)");
+                return;
+            }
+        }
         err("parameter count");
         return;
     }

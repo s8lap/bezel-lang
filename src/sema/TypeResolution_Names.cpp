@@ -2152,11 +2152,42 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
             // parameter (move-only value types admitted-redundant). Read the
             // already-cached resolved type — re-resolving would double-report
             // any function-type-slot error the Function case emits.
-            if ((p.modifier == "owned" || p.modifier == "out owned") && p.type)
-                checkOwnedDeclType(ctx_.resolvedType(*p.type), md->span.begin,
-                                   p.modifier == "out owned"
-                                       ? "an `out` parameter"
-                                       : "a parameter");
+            //
+            // fix #6029 (§28.1 / §12.1 / §8.1, v0.355): `Object` is a CLASS
+            // TYPE, and §28.1 admits `owned` on one — "`Object` is such a
+            // class type (§8.1) … the marker transfers whatever value the
+            // position holds, and a runtime-managed value there … carries no
+            // obligation". The old §28.1 check classified `Object` with the
+            // primitives and reported "a primitive value type", which is
+            // false. Where the parameter belongs to an `override` of one of
+            // `Object`'s three virtual members (§8.1), the operative fault is
+            // §12.1's parameter-modifier match — the base member declares no
+            // modifier — and the §12.1 check reports it (the
+            // `checkObjectSlotOverrideSignature` path: "override of
+            // `Equals` does not match `Object.Equals`'s parameter
+            // modifiers"). So the §28.1 type requirement is NOT applied to
+            // that parameter: a second, wrong diagnostic would only bury the
+            // right one. §28.1's requirement stays enforced everywhere else
+            // (a non-override `owned other: Object?` parameter is still
+            // reported there), so this changes no program's verdict.
+            if ((p.modifier == "owned" || p.modifier == "out owned") && p.type) {
+                const TypeRef* pTy = ctx_.resolvedType(*p.type);
+                const bool objectTyped =
+                    pTy && pTy->kind == TypeRef::Kind::Primitive &&
+                    pTy->primitive == PrimitiveType::Object;
+                bool objectSlotOverride = false;
+                if (objectTyped &&
+                    (md->name == "Equals" || md->name == "GetHashCode" ||
+                     md->name == "ToString")) {
+                    for (std::string_view mod : md->modifiers)
+                        if (mod == "override") { objectSlotOverride = true; break; }
+                }
+                if (!objectSlotOverride)
+                    checkOwnedDeclType(pTy, md->span.begin,
+                                       p.modifier == "out owned"
+                                           ? "an `out` parameter"
+                                           : "a parameter");
+            }
             // per §17.11 (#1166): resolve the inner type nodes of a parameter's
             // default-value expression (e.g. the `T` in `:= default(T)`) so the
             // §17.11 defaultIllFormed well-formedness check in ExprTypecheck can
