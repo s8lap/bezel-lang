@@ -28224,6 +28224,64 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // fix #7950 (stdlib §2.4 / §4.6 / §28.3 / §28.9, v0.355): `Environment.
+    // Get(name: string): string?` is a +1 string PRODUCER.
+    //
+    // WHY IT IS A PRODUCER. stdlib §2.4 declares:
+    //
+    //   public static method Get(name: string): string?;    // null when the
+    //                                                      //   variable is
+    //                                                      //   absent
+    //
+    // and the `Environment` arm of `tryLowerBuiltinClassCall`
+    // (LlvmBackend_Calls.cpp) mints that result the way every fresh string
+    // production is minted: a malloc'd COPY of the variable's bytes plus a
+    // malloc'd `bz.string` header whose rc is set to 1 (`initStringRc`) — the
+    // producer's reference, §28.3's "Fresh productions are owned" and §28.9's
+    // "the implementation reclaims the production". The copy is NECESSARY:
+    // the C library owns the buffer `getenv` returns and may invalidate it
+    // on the next `setenv`, so the Bezel string cannot borrow it.
+    //
+    // WITHOUT THIS ARM every consumer treated the result as a BORROW, so
+    // nothing discharged the producer's +1: a bound local was not even a
+    // release candidate (the local's own type is the call's sema type, and
+    // `Environment.Get` has none — the §2.4 `Get` result is UNTYPED in sema,
+    // so the borrow arm of `collectStringReleaseEligible` does not admit it
+    // either), and a call argument was never released at the end of the full
+    // expression. MEASURED (issue #7950; generated-code LeakSanitizer, a
+    // 100-iteration loop of `var g := Environment.Get("BZ7950_X");`):
+    // 200 allocations / 3400 B — 100 headers (32 B) + 100 data buffers.
+    //
+    // A bound local TRANSFERS the single reference (no extra retain) and the
+    // scope-end release drops rc 1->0 exactly once; a call argument is
+    // discharged at the end of the full expression by the general call path.
+    // No double free: an ESCAPING local is excluded from the scope-end
+    // release by the escape walk (its +1 then leaks — the safe direction).
+    //
+    // Matched like the `Path` (#7865) and `File.ReadAllText` (#8016) arms
+    // above (a CallExpr on the `Environment` type keyword, the callee NOT
+    // resolved by sema, the receiver NOT a user-declared type), so a USER
+    // type that merely spells `Environment` — or a user extension of it — is
+    // NOT this builtin.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->callee && !calleeResolvedBySema(*call, ctx_)) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->target &&
+                    !sema::isUserDeclaredTypeSym(ctx_.exprSymbol(*ma->target))) {
+                    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                            ma->target.get())) {
+                        if (tid->name == "Environment") {
+                            // §2.4 `Get(name: string): string?` — the only
+                            // §2.4 member whose result is a `string`.
+                            if (ma->member == "Get" && call->args.size() == 1)
+                                return true;  // malloc + initStringRc → rc=1
+                        }
+                    }
+                }
+            }
+        }
+    }
     // #2199 / stdlib §9.6 / §4.6 / §28.9 (v0.220): the stdlib `string` INSTANCE
     // methods that transform self into a fresh heap `bz.string` at rc := 1. Each
     // lowers (in tryLowerStringMethod, LlvmBackend_String.cpp) to either an inline
