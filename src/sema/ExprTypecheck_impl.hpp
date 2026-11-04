@@ -629,6 +629,24 @@ private:
     // common case, which makes the per-op invalidation a cheap no-op.
     std::unordered_set<std::string_view> mutablyCapturedNames_;
 
+    // fix #8099 (§7.4, v0.355): the CALLS whose CALLEE read was known
+    // non-null at the moment the callee was read.
+    //
+    // §7.4's mutably-captured bullet keeps "straight-line check-then-use of
+    // a captured local" accepted — verbatim: "Straight-line check-then-use
+    // of a captured local (`if x <> null then x.M(); end;` — no call
+    // *between* the test and the use) remains accepted." The MEMBER-ACCESS
+    // path reads the callee's narrowing during the callee's own visit,
+    // which is BEFORE `invalidateCapturedNarrowings` drops the
+    // mutably-captured locals' facts at the enclosing call. The
+    // function-VALUE callee path had no such early read: `typeCall` runs
+    // after the drop, so a guarded invocation through a captured function
+    // value was refused. This set carries the early read to the §7.4 gate
+    // in `typeCall`. Keyed by the call node (each AST node is visited once,
+    // so an entry cannot be stale); cleared with the other flow facts at the
+    // start of each body.
+    std::unordered_set<const ast::CallExpr*> calleeReadNarrowed_;
+
     // §22.5 (issue #1160): while type-checking parameter i's default-value
     // expression, that parameter and every parameter declared AFTER it are out
     // of scope — a default may read only EARLIER parameters. This set holds the

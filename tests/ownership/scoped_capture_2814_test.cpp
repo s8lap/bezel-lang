@@ -51,7 +51,7 @@ std::string prog(const std::string& body) {
         "  public constructor(scoped cb: () -> ()) _cb := cb; end; "
         "  public method Install(scoped cb: () -> ()) _cb := cb; end Install; "
         "  public method Fire() "
-        "    if _cb <> null then _cb(); end; "
+        "    _cb?(); "
         "  end Fire; "
         "  destructor end; "
         "end Runner; "
@@ -318,7 +318,7 @@ BEZEL_TEST(scoped_capture_2814, scoped_field_invoke_overwrite_clear_admitted) {
         "  public method Set(scoped cb: () -> ()) _cb := cb; end Set; "
         "  public method Clear() _cb := null; end Clear; "
         "  public method Fire() "
-        "    if _cb <> null then _cb(); end; "
+        "    _cb?(); "
         "  end Fire; "
         "  destructor end; "
         "end C;");

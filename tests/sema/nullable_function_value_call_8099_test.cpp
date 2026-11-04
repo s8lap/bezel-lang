@@ -23,6 +23,17 @@
 // DECLARED type, while the `?.` node carries that type LIFTED to nullable,
 // so the node cannot answer "is the MEMBER's declared type nullable". See
 // the lane report for the residual.
+//
+// The fix-forward of 2a951f84 (the non-author review found three legal
+// spellings over-rejected) adds ACCEPT rows for:
+//   * a successful `is` test whose target is a FUNCTION type (§12.7
+//     "Function-typed targets") -- the test proves the carrier holds a
+//     function value, hence non-null;
+//   * the straight-line check-then-use of a MUTABLY-CAPTURED function value
+//     (§7.4's mutably-captured bullet's own last sentence);
+//   * a `( )` suffix after a `?.` CALL segment (`d?.Mk()(1)`, §7.5's chain
+//     typing), together with the NARROWNESS row that keeps the same
+//     spelling refused over a NULLABLE declared return type.
 #include <cstdint>
 #include <cstdlib>
 #include <sstream>
@@ -387,4 +398,155 @@ BEZEL_TEST(nullable_function_value_call_8099,
         "  end Main;\n"                                          // 10
         "end C;\n",                                              // 11
         "5\n");
+}
+
+// ---------------------------------------------------------------------------
+// ACCEPT rows added by the fix-forward of 2a951f84 (the non-author review
+// found three legal spellings the first commit over-rejected).
+// ---------------------------------------------------------------------------
+
+// §12.7 "Function-typed targets" + §7.4: a `is` test whose target is a
+// FUNCTION type is a legal runtime test -- "it succeeds exactly when the
+// operand holds a function value whose own function type is identical to the
+// target's" -- so a SUCCESSFUL one proves the carrier holds a function value,
+// and a function value is never null. §7.4 names the establishment form: the
+// knowledge is established by "a successful `is`/typed-pattern test", and
+// §7.4's question is "whether its value is known non-null". The call inside
+// the controlled block is therefore admitted.
+//
+// §7.4 also names the early-exit form: "Narrowing also applies after early
+// return, after `is not null`, inside the controlled block of a successful
+// `is` test" -- so the `is not` spelling with an exiting branch is the same
+// fact on the surviving path.
+BEZEL_TEST(nullable_function_value_call_8099,
+           is_function_type_test_narrows_the_callee_spec_12_7) {
+    expectStdout(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "class C\n"                                              // 3
+        "  public static method Pick(): ((int) -> int)?\n"       // 4
+        "    return lambda(x: int) => x + 1;\n"                  // 5
+        "  end Pick;\n"                                          // 6
+        "  public static method Main(): int\n"                   // 7
+        "    var h := Pick();\n"                                 // 8
+        "    var r := 0;\n"                                      // 9
+        "    if h is (int) -> int then\n"                        // 10
+        "      r := h(1);\n"                                    // 11
+        "    end;\n"                                             // 12
+        "    Console.WriteLine(r.ToString());\n"                 // 13
+        "    return 0;\n"                                        // 14
+        "  end Main;\n"                                          // 15
+        "end C;\n",                                              // 16
+        "2\n");
+}
+
+// The `is not` spelling of the same fact, with an EXITING branch: §7.4's
+// early-exit rule leaves the surviving path narrowed, so the call after the
+// `if` is admitted.
+BEZEL_TEST(nullable_function_value_call_8099,
+           is_not_function_type_test_narrows_after_early_return_spec_12_7) {
+    expectStdout(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "class C\n"                                              // 3
+        "  public static method Pick(): ((int) -> int)?\n"       // 4
+        "    return lambda(x: int) => x + 1;\n"                  // 5
+        "  end Pick;\n"                                          // 6
+        "  public static method Main(): int\n"                   // 7
+        "    var h := Pick();\n"                                 // 8
+        "    if h is not (int) -> int then\n"                    // 9
+        "      return 0;\n"                                      // 10
+        "    end;\n"                                             // 11
+        "    Console.WriteLine(h(1).ToString());\n"              // 12
+        "    return 0;\n"                                        // 13
+        "  end Main;\n"                                          // 14
+        "end C;\n",                                              // 15
+        "2\n");
+}
+
+// §7.4 "How narrowing is invalidated", the mutably-captured bullet: "the
+// variable is mutably captured -- assigned, or passed as `ref`/`out`, anywhere
+// inside any lambda of the enclosing function body -- and the block performs
+// *any* operation that can transfer control to user code". The bullet's own
+// last sentence: "Straight-line check-then-use of a captured local (`if x <>
+// null then x.M(); end;` -- no call *between* the test and the use) remains
+// accepted." The invocation of a captured FUNCTION VALUE is such a use: the
+// callee is READ before the call transfers control, exactly as the member
+// access in the spec's own example is read before its call transfers control.
+//
+// The closure that nulls `h` is invoked AFTER the guarded block, so the fact
+// still holds at the use.
+BEZEL_TEST(nullable_function_value_call_8099,
+           straight_line_use_of_a_mutably_captured_function_value_spec_7_4) {
+    expectStdout(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "class C\n"                                              // 3
+        "  public static method Pick(): ((int) -> int)?\n"       // 4
+        "    return lambda(x: int) => x + 1;\n"                  // 5
+        "  end Pick;\n"                                          // 6
+        "  public static method Main(): int\n"                   // 7
+        "    var h := Pick();\n"                                 // 8
+        "    var k := lambda() => do h := null; end;\n"          // 9
+        "    if h <> null then\n"                                // 10
+        "      Console.WriteLine(h(1).ToString());\n"            // 11
+        "    end;\n"                                             // 12
+        "    k();\n"                                             // 13
+        "    return 0;\n"                                        // 14
+        "  end Main;\n"                                          // 15
+        "end C;\n",                                              // 16
+        "2\n");
+}
+
+// §7.5 "Null-conditional access": "The chain is the whole postfix sequence
+// ... its plain `.`, `[ ]` and `( )` suffixes included, and a suffix to the
+// right of a `?.` is typed at the value it meets on the path where it runs --
+// the preceding segment's own declared type, never the nullable type the `?.`
+// gives the chain's result". The segment `d?.Mk()` meets the `?.` MEMBER's
+// own declared type -- `Mk`'s declared return type `(int) -> int` -- so the
+// `(1)` suffix is a call through a NON-nullable function value and §7.4 does
+// not apply to it.
+BEZEL_TEST(nullable_function_value_call_8099,
+           null_conditional_chain_suffix_is_typed_at_the_declared_type_spec_7_5) {
+    expectStdout(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "class D\n"                                              // 3
+        "  public method Mk(): (int) -> int\n"                   // 4
+        "    return lambda(x: int) => x + 100;\n"                // 5
+        "  end Mk;\n"                                            // 6
+        "end D;\n"                                               // 7
+        "class C\n"                                              // 8
+        "  public static method Main(): int\n"                   // 9
+        "    var d: D? := new D();\n"                            // 10
+        "    var r := d?.Mk()(1);\n"                             // 11
+        "    Console.WriteLine((r ?? -1).ToString());\n"          // 12
+        "    return 0;\n"                                        // 13
+        "  end Main;\n"                                          // 14
+        "end C;\n",                                              // 15
+        "101\n");
+}
+
+// The NARROWNESS of the row above: the same `?.`-chain spelling over a
+// member whose DECLARED return type IS a nullable function type is a §7.4
+// violation, and stays refused. (`Nb(): ((int) -> int)?` -- the `(1)` suffix
+// meets a NULLABLE function value.)
+BEZEL_TEST(nullable_function_value_call_8099,
+           null_conditional_chain_suffix_over_a_nullable_declared_type_is_refused_spec_7_5) {
+    expectRejectedWith(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "class D\n"                                              // 3
+        "  public method Nb(): ((int) -> int)?\n"                // 4
+        "    return null;\n"                                     // 5
+        "  end Nb;\n"                                            // 6
+        "end D;\n"                                               // 7
+        "class C\n"                                              // 8
+        "  public static method Main(): int\n"                   // 9
+        "    var d: D? := new D();\n"                            // 10
+        "    var r := d?.Nb()(1);\n"                             // 11
+        "    return 0;\n"                                        // 12
+        "  end Main;\n"                                          // 13
+        "end C;\n",                                              // 14
+        11, kOtherShapeMessage);
 }

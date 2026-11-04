@@ -17913,6 +17913,10 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
                n == "Guid";
     };
     bool narrowable = false;
+    // fix #8099 (§7.4 / §12.7, v0.355): the FUNCTION-kind arm records a §7.4
+    // "known non-null" FACT rather than a §12.7 type narrowing — see that
+    // arm's comment for why the carrier's published type is left alone.
+    bool nonNullFactOnly = false;
     switch (tt->kind) {
         case TypeRef::Kind::Named:
             // Either a declaration-bearing Named (record / enum / value-builtin
@@ -18056,11 +18060,59 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
             break;
         case TypeRef::Kind::Error:
         case TypeRef::Kind::Unit:
-        case TypeRef::Kind::Function:
             narrowable = false;
+            break;
+        case TypeRef::Kind::Function:
+            // fix #8099 (§7.4 / §12.7, v0.355): a FUNCTION-typed test target
+            // is a legal RUNTIME test — §12.7 "Function-typed targets",
+            // verbatim: "A test whose target is a function type ... is
+            // decided by identity of the function type ... it succeeds
+            // exactly when the operand holds a function value whose own
+            // function type is identical to the target's" — so a SUCCESSFUL
+            // test proves the carrier holds a function VALUE, and a function
+            // value is never null. §7.4 names that establishment form: the
+            // knowledge is established by "a successful `is`/typed-pattern
+            // test" (§12.7, §19.3), and §7.4's question is "whether its
+            // value is known non-null".
+            //
+            // What is recorded is that §7.4 "known non-null" FACT, in
+            // `nullNarrowed_` — NOT a §12.7 type narrowing into
+            // `narrowings_`. A §12.7 narrowing RETYPES the carrier to the
+            // test type, and that retype changes the carrier's PUBLISHED
+            // type from a nullable function type to a non-nullable one.
+            // Codegen keys on the slot's nullability (a closure-typed
+            // slot's retain-and-store discipline is decided by it —
+            // LlvmBackend_Setup.cpp's `isClosureTypedLocalAssign`), so
+            // publishing the retype would change a CLOSURE-typed carrier's
+            // ownership behaviour for no §7.4 gain. The narrowFromNullTest
+            // arm states the same constraint on its own path, verbatim:
+            // "Unlike §12.7 type-narrowing this does NOT rewrite the
+            // variable's exprType".
+            //
+            // Only a carrier that HOLDS a function value qualifies: the
+            // fact must be about the value the call reads. A carrier
+            // declared `Object` is not one — §12.7's narrowing there is a
+            // RE-TYPE to the function type (and §28.3's set-erasing clause
+            // applies to it), not a nullability fact this gate could use.
+            {
+                TypeRef* carrierTy = declaredTypeOf(sym);
+                narrowable = carrierTy &&
+                             carrierTy->kind == TypeRef::Kind::Function;
+            }
+            nonNullFactOnly = narrowable;
             break;
     }
     if (!narrowable) return false;
+    if (nonNullFactOnly) {
+        // §7.4's "known non-null" fact, established by the successful
+        // function-typed `is` test above. `nullNarrowed_` is the store §7.4's
+        // own invalidating forms act on (reassignment, a `ref`/`out`
+        // argument, the mutably-captured bullet), so the fact lives and dies
+        // with every other narrowing fact.
+        nullNarrowed_.insert(sym);
+        confirmNullFact(sym);   // #6114
+        return true;
+    }
     TypeRef* narrowed = tt;
     if (tt->nullable) {
         narrowed = ctx_.makeTypeRef(*tt);
@@ -21856,6 +21908,10 @@ void ExprTC::runMethodBody(
     // this is normally already empty; clearing makes the boundary explicit and
     // robust to symbol reuse across methods.)
     narrowings_.clear();
+    // fix #8099 (§7.4, v0.355): the per-call "the callee was read narrowed"
+    // facts are method-local too (see the declaration in
+    // ExprTypecheck_impl.hpp).
+    calleeReadNarrowed_.clear();
     // §7.4 (issue #418): nullability narrowing is likewise method-local.
     nullNarrowed_.clear();
     // §7.4 (v0.214, #2085/#2116): readonly-field narrowing facts are likewise

@@ -10252,10 +10252,62 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         // (`x?.Cb()` over `Cb: () -> int` is legal, §7.5 / §27.1). The `?.`
         // CALL form (`h?(1)`, §7.6) is a different AST node
         // (`ast::NullCondCallExpr`) and never reaches this function.
+        //
+        // fix #8099 follow-up (§7.5, v0.355): a `( )` suffix that follows a
+        // `?.` CALL segment (`d?.Mk()(1)`) is typed the same way §7.5 types
+        // every suffix to the right of a `?.` — "at the value it meets on the
+        // path where it runs -- the preceding segment's own declared type,
+        // never the nullable type the `?.` gives the chain's result". The
+        // SEGMENT `d?.Mk()` meets the `?.` MEMBER's declared type: for a
+        // METHOD that is the method's declared RETURN type (the value the
+        // inner call produces), so `d?.Mk()(1)` over `Mk(): (int) -> int`
+        // calls a NON-nullable function value and is NOT a §7.4 violation.
+        // Over a NULLABLE declared return (`Nb(): ((int) -> int)?`) the same
+        // spelling IS one, and stays refused.
+        //
+        // The `?.` MEMBER's declared type is read from the member SYMBOL the
+        // `?.` node resolved (`resolveNullCondMember` records it), so the
+        // LIFTED node type is never consulted.
+        auto nullCondChainSegmentType =
+            [this](const ast::NullCondMemberExpr* ncm) -> TypeRef* {
+            Symbol* member = ctx_.exprSymbol(*ncm);
+            if (!member) return nullptr;
+            if (auto* ms = dynamic_cast<MethodSymbol*>(member))
+                return sema::methodReturnResolvedType(*ms, ctx_);
+            const TypeRef* memTy = sema::storageComponentType(member, ctx_);
+            if (!memTy) return nullptr;
+            // A PROPERTY/FIELD of function type: calling it calls the
+            // function VALUE it holds, so the segment's own declared type is
+            // that function type's return type.
+            if (memTy->kind == TypeRef::Kind::Function)
+                return memTy->funcReturn;
+            return const_cast<TypeRef*>(memTy);
+        };
+        bool nullCondChainSegmentIsFunction = false;
+        if (auto* inner =
+                dynamic_cast<const ast::CallExpr*>(ce.callee.get())) {
+            if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                    inner->callee.get())) {
+                TypeRef* segTy = nullCondChainSegmentType(ncm);
+                nullCondChainSegmentIsFunction =
+                    segTy && segTy->kind == TypeRef::Kind::Function &&
+                    !segTy->nullable;
+            }
+        }
+        // fix #8099 follow-up (§7.4, v0.355): the callee's narrowing is read
+        // at the CALLEE READ — before `invalidateCapturedNarrowings` drops
+        // the mutably-captured locals' facts at this call — the way the
+        // member-access path reads the receiver's narrowing. §7.4's
+        // mutably-captured bullet keeps "straight-line check-then-use of a
+        // captured local" accepted, and the invocation of a captured
+        // function value is such a use. `calleeReadNarrowed_` carries that
+        // early read here (the gate runs after the drop).
         if (!isMethodOrCtor && ft && ft->kind == TypeRef::Kind::Function &&
             ft->nullable &&
             !dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get()) &&
-            !isNarrowedNonNullRead(ce.callee.get())) {
+            !nullCondChainSegmentIsFunction &&
+            !isNarrowedNonNullRead(ce.callee.get()) &&
+            !calleeReadNarrowed_.count(&ce)) {
             // §7.4's remedy set, worded as the member-access gate words it
             // (~L33324): a SIMPLE VARIABLE is narrowed by a null test or a
             // force-unwrap; every other shape (a field, a property, a call

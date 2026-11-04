@@ -50,7 +50,7 @@ std::string prog(const std::string& body) {
         "  public constructor(scoped cb: () -> ()) _cb := cb; end; "
         "  public method Install(scoped cb: () -> ()) _cb := cb; end Install; "
         "  public method Fire() "
-        "    if _cb <> null then _cb(); end; "
+        "    _cb?(); "
         "  end Fire; "
         "  destructor end; "
         "end Runner; "

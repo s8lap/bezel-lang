@@ -12866,6 +12866,20 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         if (dynamic_cast<const ast::LambdaExpr*>(ce->callee.get()))
             pendingLambdaArgContext_ = true;
         if (ce->callee) visitExpr(*ce->callee);
+        // fix #8099 (§7.4, v0.355): the CALLEE is READ here — before the
+        // arguments are visited, and long before `invalidateCapturedNarrowings`
+        // drops the mutably-captured locals' facts at the enclosing call. The
+        // MEMBER-ACCESS path reads the receiver's narrowing at the same point
+        // (a member access resolves during its own visit), so the
+        // function-VALUE callee path reads it here too: §7.4's
+        // mutably-captured bullet keeps "straight-line check-then-use of a
+        // captured local" accepted, and the invocation of a captured function
+        // value IS such a use.
+        //
+        // The fact is carried to the §7.4 gate in `typeCall` (which runs after
+        // the drop) through `calleeReadNarrowed_`.
+        if (ce->callee && isNarrowedNonNullRead(ce->callee.get()))
+            calleeReadNarrowed_.insert(ce);
         pendingLambdaArgContext_ = savedArgCtxIifeCallee;
         pendingLambdaParamTypes_ = savedIifeParams;
         currentCallArity_ = savedArity;
