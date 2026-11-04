@@ -7843,6 +7843,35 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             elemLlvmTy = et;
                     llvm::Value* fillVal = lowerExpr(*ne.args[fillArgIdx].value);
                     if (fillVal) {
+                        // fix #8037 (spec §8.6, v0.355): the fill value reaches
+                        // every slot in the ELEMENT type's representation. When
+                        // that type is `Object` (or an interface) and the fill
+                        // value is a VALUE type, §8.6 requires the value to be
+                        // BOXED — "a heap-allocated wrapper holds the value" —
+                        // so the slot holds a wrapper with a vtable at word 0.
+                        // Without the box the raw `i32` was spilled into the
+                        // pointer-sized slot (a 4-byte store into an 8-byte
+                        // alloca), and the first `Object` operation on the
+                        // element read the slot as a pointer: MEASURED, the
+                        // generated program SEGFAULTED (exit 139) inside
+                        // `bz_obj_is_string` with `rdi = 0x7` — the integer
+                        // 7 read as an address — on
+                        // `new Array<Object>(1, 7)` +
+                        // `StringBuilder.AppendFormat("{0}", args)`.
+                        //
+                        // `boxForTarget` is the ONE §8.6 boxing helper the
+                        // compiler already uses at every other element store
+                        // (the `.Add`/`.Push`/`.Enqueue` arm in
+                        // LlvmBackend_Calls.cpp, the dictionary-key stores in
+                        // LlvmBackend_Assign.cpp). It is a no-op for a
+                        // reference source (a class instance, a string) and
+                        // for a value-typed element slot (`Array<int>`'s
+                        // `fill` is stored by copy — §4.4), so only the
+                        // `Object`/interface element case changes.
+                        if (!rt->genericArgs.empty() && rt->genericArgs[0])
+                            fillVal = boxForTarget(
+                                fillVal, rt->genericArgs[0],
+                                ne.args[fillArgIdx].value.get());
                         // Spill fill value into an alloca so bz_array_set
                         // can read it via a pointer (matching OwningBuffer init
                         // loop pattern at §4.14 / #778).

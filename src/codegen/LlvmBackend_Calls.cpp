@@ -9213,6 +9213,25 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                "IndexOutOfRangeException");
             }
             v = ensureNullableElem(v);
+            // fix #8037 (spec §8.6, v0.355): the inserted value reaches the
+            // element slot in the ELEMENT type's representation. When that type
+            // is `Object` (or an interface) and the value is a VALUE type,
+            // §8.6 requires it to be BOXED — "a heap-allocated wrapper holds
+            // the value" — so the slot holds a wrapper with a vtable at word 0.
+            // Without the box the raw `i32` was stored in the pointer-sized
+            // slot and the first `Object` operation on the element read it as
+            // a pointer: MEASURED, `args.Insert(0, 3)` on an `Array<Object>`
+            // SEGFAULTED (exit 139) inside `bz_obj_is_string` with
+            // `rdi = 0x3` — the integer 3 read as an address.
+            //
+            // `boxForTarget` is the ONE §8.6 boxing helper, and the `.Add` /
+            // `.Push` / `.Enqueue` arm below this one already uses it at the
+            // same store. It is a no-op for a reference source and for a
+            // value-typed element slot, so only the `Object`/interface element
+            // case changes.
+            if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+                v = boxForTarget(v, recvTy->genericArgs[0],
+                                 call.args[1].value.get());
             // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: Insert co-owns a +1
             // per string element, exactly like Add — transfer a +1 producer,
             // retain anything else. arrIsStringElem derived from arrElemPol.

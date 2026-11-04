@@ -1704,6 +1704,33 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                 }
             }
         }
+        // fix #8037 (spec §8.6, v0.355): the stored value reaches the element
+        // slot in the ELEMENT type's representation. When that type is
+        // `Object` (or an interface) and the value is a VALUE type, §8.6
+        // requires it to be BOXED — "a heap-allocated wrapper holds the
+        // value" — so the slot holds a wrapper with a vtable at word 0.
+        // Without the box the raw `i32` was stored in the pointer-sized slot
+        // and the first `Object` operation on the element read it as a
+        // pointer: MEASURED, `args[0] := 3` on an `Array<Object>` SEGFAULTED
+        // (exit 139) inside `bz_obj_is_string` with `rdi = 0x3` — the integer
+        // 3 read as an address.
+        //
+        // `boxForTarget` is the ONE §8.6 boxing helper the compiler already
+        // uses at the sibling element stores (the `.Add`/`.Push`/`.Enqueue`
+        // arm in LlvmBackend_Calls.cpp, the dictionary-key stores in this
+        // file). It is a no-op for a reference source (a class instance, a
+        // string) and for a value-typed element slot (`Array<int>`'s element
+        // is stored by copy — §4.4), so only the `Object`/interface element
+        // case changes.
+        //
+        // The source expression is needed to pick the box vtable (the value's
+        // own type decides the wrapper), so the boxing is skipped where the
+        // caller has no expression — the compound-assignment write-back
+        // path, whose value was READ BACK from the slot and is therefore
+        // already an `Object` reference, never a raw value.
+        if (valueExpr && recvTy && !recvTy->genericArgs.empty() &&
+            recvTy->genericArgs[0])
+            val = boxForTarget(val, recvTy->genericArgs[0], valueExpr);
         // #429 / §4.6 / §28.9: a borrowing Array<string> overwrite via the
         // indexer `arr[i] := v` releases the displaced old element and takes a +1
         // on the new one (transfer a +1 producer, retain anything else). The
