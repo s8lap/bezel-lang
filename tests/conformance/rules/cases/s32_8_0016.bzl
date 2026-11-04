@@ -8,7 +8,9 @@
 //! cites: 32.8
 //! expect: reject
 //! diagnostic: env
-//! notes: valid twin drops the env position: `f: (int) -> int`.
+//! notes: valid twin drops the env position: `f: (int) -> int`. Under §32.8
+//!   well-formedness rule 2, `env` outside an extern declaration is an ordinary
+//!   identifier, so the rejection arises as an unknown type `env`.
 module Conf;
 
 public static class Apply

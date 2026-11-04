@@ -9,6 +9,9 @@
 //! stdout: True
 //! notes: qsort_r of two 4-byte elements must compare at least once; a comparator
 //!   that never ran, or ran against a copy of the captured cell, prints False.
+//!   The size_t and void* slots are declared ulong and IntPtr, which assumes an
+//!   LP64 target (x86-64 Linux): §32.7 states the explicit conversions for IntPtr
+//!   only, and a Ptr<byte> base would need Ptr<T>.FromIntPtr over RawBytes.Pointer.
 module Conf;
 
 extern "libc"

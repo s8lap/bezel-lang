@@ -12,7 +12,8 @@
 //! output: main
 //!   closed 2
 //! notes: reverse declaration order disposes Second ("closed 2") before First, whose
-//!   destructor calls Exit; a re-initiated sequence would dispose Second again.
+//!   destructor calls Exit; a re-initiated sequence would dispose Second again, and
+//!   a no-op Exit would let the pass go on to Zero and print "closed 0".
 module Conf;
 
 public class Res
@@ -37,6 +38,7 @@ public class Late
 end Late;
 
 public class App
+  public static owned readonly Zero: Res := new Res(0);
   public static owned readonly First: Late := new Late();
   public static owned readonly Second: Res := new Res(2);
 

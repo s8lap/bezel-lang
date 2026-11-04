@@ -10,6 +10,9 @@
 //! expect: reject
 //! diagnostic: parameter
 //! notes: valid twin is s32_8_0019, whose comparator lambda takes two parameters.
+//!   The size_t and void* slots are declared ulong and IntPtr, which assumes an
+//!   LP64 target (x86-64 Linux): §32.7 states the explicit conversions for IntPtr
+//!   only, and a Ptr<byte> base would need Ptr<T>.FromIntPtr over RawBytes.Pointer.
 module Conf;
 
 extern "libc"

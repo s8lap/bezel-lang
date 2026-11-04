@@ -10,6 +10,9 @@
 //! stdout: True
 //! notes: s32_8_0005 is the accept-only twin; this one observes the field write
 //!   the callback makes through the recovered receiver.
+//!   The size_t and void* slots are declared ulong and IntPtr, which assumes an
+//!   LP64 target (x86-64 Linux): §32.7 states the explicit conversions for IntPtr
+//!   only, and a Ptr<byte> base would need Ptr<T>.FromIntPtr over RawBytes.Pointer.
 module Conf;
 
 extern "libc"

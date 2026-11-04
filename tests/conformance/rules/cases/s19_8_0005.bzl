@@ -5,7 +5,8 @@
 //! rule: The same omission applies within a `case` over a choice scrutinee
 //!   (§35.5): a case name resolves to a case pattern, never a type test. At a
 //!   nested slot of a destructuring pattern, enum and choice alike, the omission is
-//!   read against the slot's declared type, not the scrutinee's
+//!   read against the slot's declared type, not the scrutinee's (§35.5 *Case
+//!   patterns*).
 //! cites: 19.8, 35.5
 //! expect: run
 //! output: inner 5

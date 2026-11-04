@@ -11,6 +11,9 @@
 //!   False
 //! notes: bsearch over one element compares the key with it once; a comparator
 //!   answering 0 finds it (non-null), one answering 1 does not (NULL).
+//!   The size_t and void* slots are declared ulong and IntPtr, which assumes an
+//!   LP64 target (x86-64 Linux): §32.7 states the explicit conversions for IntPtr
+//!   only, and a Ptr<byte> base would need Ptr<T>.FromIntPtr over RawBytes.Pointer.
 module Conf;
 
 extern "libc"
