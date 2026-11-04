@@ -335,7 +335,7 @@ BEZEL_TEST(case_expr_owned_collection_value_8060,
         "      var a := MkA(); "
         "      var u := (case i mod 2 of 0 => a, _ => new OwningArray<Cell>()); "
         "      s := s + u.Count; "));
-    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagnosticText(r).find(
                           "the arms of this if/case expression mix an owned "
                           "value with a borrow") != std::string::npos);
