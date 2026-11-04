@@ -1,6 +1,7 @@
 #include "sema/ExprTypecheck.hpp"
 #include "sema/ExprTypecheck_impl.hpp"
 #include "sema/EnumValues.hpp"  // enumDeclaredValues — §10.2/§17.11 (#3044)
+#include "sema/Formattability.hpp"  // fix #8059: namedTypeName / isIntrinsicTemporalOrGuid — the shared stdlib-value-builtin name reader
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 #include "sema/LinqStdlibOverloads.hpp"  // fix #3726: shared stdlib §5 LINQ overload table (name + arity + where) — exported from this TU so `ExprTypecheck_Calls.cpp`'s arity gate (#3726) can consult the SAME source of truth
 
@@ -26434,6 +26435,132 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         if (hn == "SharedEventSource")
                             assignTargetIsSharedEventSource = true;
                     }
+                }
+            }
+        }
+        // fix #8059 (stdlib §2.5, spec §6.6/§25.2, v0.353): the COMPOUND form
+        // of a stdlib value builtin's operator escaped the §6.6/§25.2 check on an
+        // ANNOTATED target — `a += 2` on a TimeSpan computed a bare tick
+        // addition (silently wrong) and `a *= 2.0` aborted the compile with
+        // malformed IR.
+        //
+        // THE DEFECT. A stdlib value builtin reaches sema in TWO shapes for the
+        // SAME type (Slice S24, §2.3, TypeResolution_Names.cpp):
+        //
+        //   * a value-producing expression stamps the result
+        //     `declaration = builtinClassSym("<name>")` (`TimeSpan.FromTicks`);
+        //   * the NAME in an ANNOTATION — `var a: TimeSpan := ...`, an `a:
+        //     TimeSpan` parameter, a `TimeSpan` field, `new DateTime(...)` — is
+        //     resolved to a Named TypeRef with `declaration == nullptr` and the
+        //     AST spelling as its name.
+        //
+        // Every rule keyed on `lt->declaration` saw only the FIRST shape. The
+        // compound-assignment operator block (the named-target arm below) is
+        // guarded on `tTy->declaration`, so on the SECOND shape the whole
+        // §6.6/§25.2 check was SKIPPED: no operator lookup, no diagnostic.
+        // Codegen then lowered the compound through the built-in numeric tail on
+        // the record's LLVM payload — a `TimeSpan`/`DateTime` is a bare i64 tick
+        // count — so `a += 2` computed 5 ticks + 2 = 7 ticks (a span that grew
+        // by 200 ns) and `a *= 2.0` fed `llvm.smul.with.overflow.i64(i64,
+        // double)`, which the IR verifier rejects.
+        //
+        // MEASURED on the parent of this fix (bezelc at 8f66dea6):
+        //
+        //   `var a: TimeSpan := TimeSpan.FromTicks(5L); a += 2;`
+        //     -> compiles, prints `a=7` (a bare tick addition of an operator
+        //        pair stdlib §2.5 does NOT declare — there is no
+        //        `operator +(TimeSpan, int)` — and §5.1 admits no implicit
+        //        conversion for)
+        //   `var a := TimeSpan.FromTicks(5L); a += 2;`
+        //     -> "compound assignment `+=` has no valid result on class type
+        //        `TimeSpan` ..." — the INFERRED shape refused what the
+        //        ANNOTATED shape accepted: the two shapes of the SAME type
+        //        disagreed
+        //   `var d: DateTime := new DateTime(2024, 1, 1); d += 1;`
+        //     -> compiles, prints `d=638396640000000001` (the tick count + 1)
+        //   `var a: TimeSpan := TimeSpan.FromTicks(5L); a *= 2.0;`
+        //     -> "IR verification failed (malformed IR emitted)"
+        //
+        // THE FIX. §6.6 (v0.353) is explicit about the compound form's
+        // typing: "For every operator above except `??=`, the statement
+        // `x op= e` is equivalent to `x := x op e` with the target evaluated
+        // once", and "Let T be the left-hand side's type and R the type of
+        // `x op e` under the rules of this chapter (§6.2 promotion, §6.5
+        // shifts and bitwise, §25.2 overloads)". So the compound form's
+        // verdict IS the binary form's verdict — and the BINARY path already
+        // answers it correctly for a stdlib value builtin in BOTH shapes,
+        // since #7547 taught it to name the stdlib value builtins by NAME
+        // (`stdlibValueBuiltinName`, ExprTypecheck_Exprs.cpp): it FINDS
+        // stdlib §2.5's declared operators and its §25 reject NAMES the
+        // operand's type instead of printing the placeholder `?`.
+        //
+        // So the compound form of a stdlib value builtin's operator is
+        // rewritten to its §6.6 desugaring `x := x op e` — the same rewrite
+        // #4711 already performs for the narrowed-Object compound form, and
+        // for the same reason: the rewrite is EXACT when the target is a bare
+        // identifier ("the 'evaluated once' clause has nothing to evaluate").
+        // The binary path then decides, and codegen lowers the desugared
+        // binary through the lowering that already implements stdlib §2.5's
+        // operators (`lowerBinary`'s stdlib arms) — so `a *= 2.0` reaches
+        // `operator *(a: TimeSpan, factor: double)` and computes over the
+        // ticks in double, instead of the built-in numeric tail.
+        //
+        // The rewrite is limited to a bare identifier target on purpose: §6.6
+        // requires every constituent of the left-hand side's lvalue chain to
+        // be evaluated exactly once, so a field/property target (`obj.Ts op= e`)
+        // cannot be rewritten syntactically without evaluating the receiver
+        // twice. Those shapes keep the compound path's own lowering; the
+        // §6.6/§25.2 check for them is the named-target arm's business (the
+        // sibling arm below).
+        //
+        // The `?` wording of the §25 reject is KEPT for every other
+        // declaration-less Named type — a null-declaration builtin (`Array<T>`,
+        // `IntPtr`, ...) and an out-of-scope type parameter — because those
+        // name a type this diagnostic cannot spell: #3930's deliberate split,
+        // and the rows that pin it
+        // (tests/sema/arithmetic_typeparam_diagnostic_name_3930_test.cpp) stay
+        // green.
+        if (!eventPayload && as->target && as->value &&
+            (as->op == "+=" || as->op == "-=" || as->op == "*=" ||
+             as->op == "/=")) {
+            // The stdlib's compiler-known value builtins (stdlib §2.5's
+            // `DateTime`/`TimeSpan`/`DateOnly`/`TimeOnly` and §2.6's `Guid`)
+            // have a CLOSED member surface and no user TypeDecl, so they reach
+            // sema in the TWO shapes described above. A USER type of the same
+            // name (one with a real `decl`) is EXCLUDED: it keeps the §25
+            // rule and may declare its own operators (#7547's rule, followed
+            // here).
+            auto stdlibValueBuiltinName = [](const TypeRef* t) -> std::string_view {
+                if (!t || t->kind != TypeRef::Kind::Named) return {};
+                if (t->declaration && t->declaration->decl) return {};
+                std::string_view n = namedTypeName(t);
+                return isIntrinsicTemporalOrGuid(n) ? n : std::string_view{};
+            };
+            TypeRef* tgtTy = ctx_.exprType(*as->target);
+            // A NULLABLE operand stays on the compound path: §7.11 lifts the
+            // binary operator over a nullable operand, and the compound form
+            // takes "the verdict its expansion `x op e` has on a nullable
+            // operand" (§6.6) — the compound path's own §7.11 wording.
+            if (tgtTy && tgtTy->kind == TypeRef::Kind::Named && !tgtTy->nullable &&
+                !stdlibValueBuiltinName(tgtTy).empty()) {
+                auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get());
+                if (tid && tid->name != "this" && tid->name != "base") {
+                    // `op` is a string_view into the source buffer (`+=`); the
+                    // binary operator is its prefix, which outlives the AST.
+                    std::string_view binOp = as->op.substr(0, as->op.size() - 1);
+                    auto* mas = const_cast<ast::AssignmentStmt*>(as);
+                    auto read = std::make_unique<ast::IdentifierExpr>();
+                    read->name = tid->name;
+                    read->span = tid->span;
+                    auto bin = std::make_unique<ast::BinaryExpr>();
+                    bin->op = binOp;
+                    bin->span = SourceSpan{tid->span.begin,
+                                            mas->value->span.end};
+                    bin->left = std::move(read);
+                    bin->right = std::move(mas->value);
+                    mas->value = std::move(bin);
+                    mas->op = ":=";
                 }
             }
         }
