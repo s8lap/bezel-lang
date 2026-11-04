@@ -65,6 +65,17 @@
 #              DONE log` with DONE present) is NOT decided — it should exit by
 #              itself, and if it does not, the parser is the likelier fault —
 #              so it keeps whatever tier its age gives it (A, B or none).
+#              PROVABLE means: no process other than the waiter itself and its
+#              own pgrep/grep poll matches the pattern (not its other
+#              descendants, not its ancestors, not another waiter); any such
+#              match is WAITING (r39-rev-reaper B2).
+#
+#   WAITING    a waiter the helper decides WAITING (its target is still
+#              present) at either end of the settle window is EXEMPT at any
+#              age. And the `while pgrep` / `while kill -0` shapes are tier-W
+#              PROBES ONLY: they are never aged into tier A/B, so a lane's
+#              watcher on a live pid is never on the --kill list
+#              (r39-rev-reaper B1, measured on r39-fix-8094's watcher).
 #
 # SAFE BY DEFAULT: dry-run. It only LISTS. Pass --kill to signal.
 #   - PID-only. Never `pkill` by name (the kill-guard hook refuses it, and a
@@ -103,7 +114,7 @@ while [ $# -gt 0 ]; do
     --self-test)           SELF_TEST=1 ;;
     --protect)             PROTECT_FILE="${2:?--protect needs a file}"; shift ;;
     --include-protected)   INCLUDE_PROTECTED=1 ;;
-    -h|--help)             sed -n '2,80p' "$0"; exit 0 ;;
+    -h|--help)             sed -n '2,/^set -u/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
   shift
@@ -139,8 +150,14 @@ fi
 # worktrees path, so a user's `tail -f /var/log/messages` is never matched.
 # ---------------------------------------------------------------------------
 HEAVY='bezel_tests_[a-z]+|(^|[ /])bezelc |cc1plus|(^|[ /])clang(\+\+)? |ld\.lld|ld\.mold|cmake --build|dev_heavy\.sh|agent_check\.sh|run_parallel\.sh|asan_sweep\.sh|ratchet_sweep\.sh'
-WAITERS='while ! test -f|until .* do sleep|until grep|while (! )?(pgrep|kill -0) |tail -f (/var/tmp/bezel-scratch|/mnt/fast/worktrees|.*bezel-scratch.*)|wait_pid\.sh|chain-half'
+WAITERS='while ! test -f|until .* do sleep|until grep|tail -f (/var/tmp/bezel-scratch|/mnt/fast/worktrees|.*bezel-scratch.*)|wait_pid\.sh|chain-half'
 PATTERN="$HEAVY|$WAITERS"
+# Loop shapes that are TIER-W PROBES ONLY, never age (A/B) candidates: such a
+# loop is reaped only when reap_waiter_target.py PROVES it wedged. As an age
+# candidate it put a live lane's `while kill -0 <live pid>` watcher on the
+# --kill list (r39-rev-reaper B1, measured 2026-11-05).
+WPROBE_ONLY='while (! )?(pgrep|kill -0) '
+WPROBE="$WAITERS|$WPROBE_ONLY"
 
 # Gate guard: never touch anything while a gate is live. A gate legitimately
 # runs bezel_tests for hours, and the pool is zero during one, so age alone
@@ -441,8 +458,11 @@ if [ "$SELF_TEST" = 1 ]; then
   else echo "  FAIL idle parent of a sleep child exempted ($ta_idle)"; fails=$((fails+1)); fi
 
   echo "self-test: tier W (waiter-target-satisfied)"
-  assert 'while pgrep -f x >/dev/null; do sleep 1; done'        hit "$PATTERN" "" ""
-  assert 'while kill -0 1234 2>/dev/null; do sleep 60; done'    hit "$PATTERN" "" ""
+  # probe-only shapes: decided by the helper, never aged into tier A/B (B1)
+  assert 'while pgrep -f x >/dev/null; do sleep 1; done'        hit "$WPROBE" "" ""
+  assert 'while kill -0 1234 2>/dev/null; do sleep 60; done'    hit "$WPROBE" "" ""
+  assert 'while pgrep -f x >/dev/null; do sleep 1; done'        miss "$PATTERN" "" ""
+  assert 'while kill -0 1234 2>/dev/null; do sleep 60; done'    miss "$PATTERN" "" ""
   # A self-matching waiter: the marker is in its own argv, and nothing else
   # runs it, so `while pgrep -f MARKER` can never exit. Decided SATISFIED.
   mk="reap-selftest-marker-$$-$RANDOM"
@@ -454,14 +474,21 @@ if [ "$SELF_TEST" = 1 ]; then
   # Unparseable target ($(...) substitution): UNDECIDABLE, left to the age tiers.
   bash -c "until test -n \"\$(cat /nonexistent/u-$$ 2>/dev/null)\"; do sleep 30; done" >/dev/null 2>&1 &
   w_undec=$!
+  # Watching a LIVE pid (r39-fix-8094's area watcher shape): WAITING, so exempt.
+  sleep 300 >/dev/null 2>&1 &
+  w_tgt=$!
+  bash -c "while kill -0 $w_tgt 2>/dev/null; do sleep 30; done" >/dev/null 2>&1 &
+  w_live=$!
   sleep 1.5
   declare -A WV=()
-  while read -r _p _v; do WV[$_p]="$_v"; done < <(waiter_verdicts "$w_blind" "$w_wait" "$w_undec")
-  for _p in "$w_blind" "$w_wait" "$w_undec"; do pkill -KILL -P "$_p" 2>/dev/null; kill -KILL "$_p" 2>/dev/null; done
-  wait "$w_blind" "$w_wait" "$w_undec" 2>/dev/null
+  while read -r _p _v; do WV[$_p]="$_v"; done < <(waiter_verdicts "$w_blind" "$w_wait" "$w_undec" "$w_live")
+  for _p in "$w_blind" "$w_wait" "$w_undec" "$w_live"; do pkill -KILL -P "$_p" 2>/dev/null; kill -KILL "$_p" 2>/dev/null; done
+  kill -KILL "$w_tgt" 2>/dev/null
+  wait "$w_blind" "$w_wait" "$w_undec" "$w_live" "$w_tgt" 2>/dev/null
   for _c in "$w_blind:SATISFIED:self-matching pgrep waiter, target gone" \
             "$w_wait:WAITING:until test -f <missing file>" \
-            "$w_undec:UNDECIDABLE:command substitution in the condition"; do
+            "$w_undec:UNDECIDABLE:command substitution in the condition" \
+            "$w_live:WAITING:while kill -0 <a live pid>"; do
     _p=${_c%%:*}; _r=${_c#*:}; _want=${_r%%:*}; _d=${_r#*:}
     if [ "${WV[$_p]:-}" = "$_want" ]; then echo "  ok   [$_want] $_d"
     else echo "  FAIL expected=$_want got=${WV[$_p]:-none} :: $_d"; fails=$((fails+1)); fi
@@ -486,16 +513,18 @@ while read -r pid ppid etimes rss cmd; do
   [ "$pid" = "$$" ] && continue
   [ "$pid" = "$PPID" ] && continue
   [ "$etimes" -ge 30 ] 2>/dev/null || continue
-  printf '%s' "$cmd" | grep -qE "$PATTERN" || continue
+  if printf '%s' "$cmd" | grep -qE "$PATTERN"; then aged=1
+  elif printf '%s' "$cmd" | grep -qE "$WPROBE_ONLY"; then aged=0
+  else continue; fi
   # Off-limits regardless of age: an in-flight gate even if the pidfile is absent.
   printf '%s' "$cmd" | grep -q 'gate_and_push' && continue
   # Off-limits regardless of age: a LANE AGENT (see is_agent_process). Its
   # argv carries the brief, so a brief naming dev_heavy.sh/agent_check.sh
   # makes the agent look like a build; reaping it would kill a live lane.
   is_agent_process "$cmd" && continue
-  t=$(tier_for "$ppid" "$etimes")
+  t=""; [ "$aged" = 1 ] && t=$(tier_for "$ppid" "$etimes")
   if [ -z "$t" ]; then
-    printf '%s' "$cmd" | grep -qE "$WAITERS" || continue
+    printf '%s' "$cmd" | grep -qE "$WPROBE" || continue
     t=-   # W-probe only
   fi
   # Off-limits unless --include-protected: cwd inside a PROTECTED worktree.
@@ -503,7 +532,7 @@ while read -r pid ppid etimes rss cmd; do
     [ "$t" != - ] && n_protected=$((n_protected+1))
     # still DECIDED for tier W, so the summary can say which protected waiters
     # are provably wedged (reaped only under --include-protected)
-    printf '%s' "$cmd" | grep -qE "$WAITERS" && PW_PID+=("$pid")
+    printf '%s' "$cmd" | grep -qE "$WPROBE" && PW_PID+=("$pid")
     [ "$LIST_WORKING" = 1 ] && [ "$t" != - ] && printf 'protected pid=%s age=%ss cwd in %s  %s\n' \
       "$pid" "$etimes" "$(protected_root "$pid")" "$(printf '%s' "$cmd" | cut -c1-80)"
     continue
@@ -521,7 +550,7 @@ fi
 # Tier W, first look: which waiters have a SATISFIED target right now.
 declare -A W0=() W1=()
 mapfile -t _wp < <(for i in "${!C_PID[@]}"; do
-  printf '%s' "${C_CMD[$i]}" | grep -qE "$WAITERS" && echo "${C_PID[$i]}"; done
+  printf '%s' "${C_CMD[$i]}" | grep -qE "$WPROBE" && echo "${C_PID[$i]}"; done
   for _p in "${PW_PID[@]}"; do echo "$_p"; done)
 while read -r _p _v; do [ -n "${_p:-}" ] && W0[$_p]="$_v"; done < <(waiter_verdicts "${_wp[@]}")
 snap S0
@@ -539,7 +568,7 @@ snap S1
 index_kids
 while read -r _p _v; do [ -n "${_p:-}" ] && W1[$_p]="$_v"; done < <(waiter_verdicts "${_wp[@]}")
 declare -a K_PID=() K_TIER=() K_AGE=() K_CMD=() K_D=()
-working=0 tree_exempt=0
+working=0 tree_exempt=0 n_waiting=0
 for i in "${!C_PID[@]}"; do
   pid=${C_PID[$i]}
   if ! kill -0 "$pid" 2>/dev/null; then continue; fi   # died on its own: goal met
@@ -581,6 +610,16 @@ for i in "${!C_PID[@]}"; do
       "$pid" "${C_AGE[$i]}" "$ta" "$(printf '%s' "${C_CMD[$i]}" | cut -c1-80)"
     continue
   fi
+  # A waiter the helper decides WAITING (its target is still there) at EITHER
+  # end of the settle window is EXEMPT at any age, like io-blocked: it is
+  # doing its job (r39-rev-reaper B1).
+  if [ "${W0[$pid]:-}" = WAITING ] || [ "${W1[$pid]:-}" = WAITING ]; then
+    [ "${C_TIER[$i]}" = - ] && continue
+    n_waiting=$((n_waiting+1))
+    [ "$LIST_WORKING" = 1 ] && printf 'waiting pid=%s age=%ss (waiter target still present)  %s\n' \
+      "$pid" "${C_AGE[$i]}" "$(printf '%s' "${C_CMD[$i]}" | cut -c1-80)"
+    continue
+  fi
   tier=${C_TIER[$i]}
   # Tier W: decided SATISFIED at BOTH ends of the settle window.
   if [ "${W0[$pid]:-}" = SATISFIED ] && [ "${W1[$pid]:-}" = SATISFIED ]; then
@@ -591,15 +630,15 @@ for i in "${!C_PID[@]}"; do
 done
 
 n_w=0; for t in "${K_TIER[@]}"; do [ "$t" = W ] && n_w=$((n_w+1)); done
-echo "candidates: $n_tiered  |  working (exempt): $working  |  working-tree (exempt): $tree_exempt  |  io-blocked (exempt): ${#K_D[@]}  |  protected (exempt): $n_protected  |  waiter-probed: $n_wprobe  |  stale: ${#K_PID[@]} (tier W: $n_w)"
+echo "candidates: $n_tiered  |  working (exempt): $working  |  working-tree (exempt): $tree_exempt  |  waiting (exempt): $n_waiting  |  io-blocked (exempt): ${#K_D[@]}  |  protected (exempt): $n_protected  |  waiter-probed: $n_wprobe  |  stale: ${#K_PID[@]} (tier W: $n_w)"
 _pw=""; for _p in "${PW_PID[@]}"; do
   [ "${W0[$_p]:-}" = SATISFIED ] && [ "${W1[$_p]:-}" = SATISFIED ] && kill -0 "$_p" 2>/dev/null && _pw="$_pw $_p"
 done
 [ -n "$_pw" ] && echo "  protected waiters decided tier W (provably wedged; reaped only with --include-protected):$_pw"
 [ "${#K_D[@]}" -gt 0 ] && \
   echo "  io-blocked need FILESYSTEM relief (btrfs writeback), not a signal — see feedback-btrfs-d-state-starves-test-harness"
-[ $((working + tree_exempt + n_protected)) -gt 0 ] && [ "$LIST_WORKING" = 0 ] && \
-  echo "  ($working working, $tree_exempt with a working/io-blocked descendant, $n_protected in a protected worktree — use --no-exclude-working to see them)"
+[ $((working + tree_exempt + n_waiting + n_protected)) -gt 0 ] && [ "$LIST_WORKING" = 0 ] && \
+  echo "  ($working working, $tree_exempt with a working/io-blocked descendant, $n_waiting waiting on a live target, $n_protected in a protected worktree — use --no-exclude-working to see them)"
 
 if [ "${#K_PID[@]}" -eq 0 ]; then
   echo "nothing stale: every candidate is still making progress (itself or its tree), protected, or undecided"

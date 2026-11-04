@@ -34,13 +34,18 @@
 #                 diff: a tree diff cannot tell "picked" from "reverted on top".
 #                 A merge commit or an empty commit has no patch-id, so it
 #                 counts as NOT landed. Default: $BEZEL_STAGING_REF if set.
+#                 NB patch-id ignores WHITESPACE: a commit amended only by
+#                 re-indentation (semantic in Python) still matches its pick,
+#                 so "landed" is whitespace-insensitive. The branch is kept,
+#                 so no commit is lost; only the checkout goes.
 #   --idle-builds for an IDLE worktree that must be KEPT (WIP, untracked files,
 #                 unmerged), delete only its build/ (a configured tree with a
-#                 CMakeCache.txt; a symlinked build/ deletes its target). The
+#                 CMakeCache.txt; a SYMLINKED build/ is never followed). The
 #                 branch, the commits and the WIP stay. A rebuild is cheap:
 #                 an in-tree build/ on the fast disk uses relocatable ccache
 #                 keys (lane_setup.sh, #5010). Refused when any file under
-#                 build/ changed within the idle threshold.
+#                 build/ changed within the idle threshold, or when a live
+#                 process has its cwd in build/ or is running a binary from it.
 #   --protect FILE  extra PROTECTED worktrees, one path per line (`#` comments
 #                 and blank lines allowed). The coordinator passes its live
 #                 lanes' worktrees. A missing FILE is an error, not "nothing
@@ -53,10 +58,13 @@
 # KEPT (reported; build/ only with --idle-builds): uncommitted TRACKED changes
 # (WIP), untracked files, unmerged commits, and anything whose git index changed
 # within BEZEL_GC_WT_IDLE_MIN minutes (default 120; 0 disables the check — an
-# active worktree is never touched at all).
-# A detached HEAD that no branch, tag or remote ref contains is backed by a new
-# branch `keep/<basename>-<sha8>` BEFORE its worktree is removed (and the
-# removal is skipped if that branch cannot be made): a reap never loses a commit.
+# active worktree is never touched at all). A failing `git status` (a corrupt
+# index) keeps the tree too: it proves nothing about WIP.
+# A detached HEAD that no branch, tag or remote ref contains, and every commit
+# reachable ONLY from the worktree's own HEAD reflog (per-worktree, so deleted
+# with it), is backed by a new branch `keep/<basename>-<sha8>` (one per
+# independent tip) BEFORE the worktree is removed; the removal is skipped if a
+# branch cannot be made: a reap never loses a commit.
 set -u
 MAIN="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gc: not in a git repo" >&2; exit 2; }
 CUR="$MAIN"   # cwd worktree top; may differ from MAIN when run inside a worktree
@@ -80,7 +88,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --protect) [ $# -ge 2 ] && [ -n "$2" ] || { echo "gc: --protect needs a file" >&2; exit 2; }
              PROTECT_FILE="$2"; shift ;;
   --protect=*) PROTECT_FILE="${1#*=}" ;;
-  -h|--help) sed -n '2,62p' "$0"; exit 0 ;;
+  -h|--help) awk 'NR>1 { if (!/^#/) exit; print }' "$0"; exit 0 ;;
   *) echo "gc: unknown arg '$1'" >&2; exit 2 ;;
 esac; shift; done
 [ $((DO_WT+DO_BUILDS+DO_ROOT)) -eq 0 ] && { DO_WT=1; DO_BUILDS=1; DO_ROOT=1; }
@@ -150,6 +158,9 @@ if [ "$DO_WT" = 1 ]; then
   # One pass over /proc for every live process's cwd. Used below to spot a
   # worktree some process is actually sitting in. Cheap; done once, not per-wt.
   live_cwds="$(readlink /proc/[0-9]*/cwd 2>/dev/null | sort -u)"
+  # ...and every live executable: a test binary run from build/ by a process
+  # whose cwd is elsewhere must still keep that build/ (--idle-builds).
+  live_exes="$(readlink /proc/[0-9]*/exe 2>/dev/null | sed 's/ (deleted)$//' | sort -u)"
   idle_min="${BEZEL_GC_WT_IDLE_MIN:-120}"
 
   # landed_in <wt> — prints `main`, `staging` or nothing (= not landed).
@@ -187,17 +198,13 @@ if [ "$DO_WT" = 1 ]; then
   }
   # build_target <wt> — the build tree --idle-builds may delete, or nothing.
   # Only a CONFIGURED tree (CMakeCache.txt) is recognised; an unrecognised
-  # directory is never deleted, whatever its name. A symlinked build/ resolves
-  # to its target, which must not carry another worktree's backref.
+  # directory is never deleted, whatever its name. A SYMLINKED build/ is never
+  # followed: its target may be shared with another (live) worktree, and a
+  # backref check cannot prove it is not (r39-rev-reaper IB2).
   build_target() {
-    local b="$1/build" t o
-    if [ -L "$b" ]; then
-      t="$(readlink -f -- "$b" 2>/dev/null)" || return 0
-      [ -d "$t" ] && [ -e "$t/CMakeCache.txt" ] || return 0
-      o="$(cat "$t/.lane-worktree" 2>/dev/null || true)"
-      if [ -n "$o" ] && [ "$(canon "$o")" != "$(canon "$1")" ]; then return 0; fi
-      printf '%s\n' "$t"
-    elif [ -d "$b" ] && [ -e "$b/CMakeCache.txt" ]; then
+    local b="$1/build"
+    [ -L "$b" ] && return 0
+    if [ -d "$b" ] && [ -e "$b/CMakeCache.txt" ]; then
       printf '%s\n' "$b"
     fi
   }
@@ -205,34 +212,64 @@ if [ "$DO_WT" = 1 ]; then
   drop_build() {
     local wt="$1" why="$2" t
     t="$(build_target "$wt")"
+    if [ -L "$wt/build" ]; then
+      echo "[gc] KEEP build/ (a symlink — never followed): $wt"; return 0
+    fi
     if [ -z "$t" ]; then N_NOBUILD=$((N_NOBUILD+1)); return 0; fi
+    # In use: some live process is cwd'd in it or is RUNNING a binary from it.
+    if printf '%s\n' "$live_cwds" "$live_exes" |
+         awk -v w="$(canon "$t")" '$0==w || index($0, w"/")==1 {f=1} END{exit !f}'; then
+      echo "[gc] KEEP build/ (a live process runs from or is cwd'd in it): $wt"; return 0
+    fi
     if [ "$idle_min" != 0 ] && [ -n "$(find "$t" -newermt "-${idle_min} minutes" -print -quit 2>/dev/null)" ]; then
       echo "[gc] KEEP build/ (written within ${idle_min}m): $wt"; return 0
     fi
     N_BUILDONLY=$((N_BUILDONLY+1))
     reclaim "$t"
     tag "delete idle build/ of KEPT worktree $wt ($why) -> $t ($RC) [branch + WIP kept]"
-    if [ "$APPLY" = 1 ]; then
-      rm -rf -- "$t"
-      [ -L "$wt/build" ] && rm -f -- "$wt/build"
-    fi
+    [ "$APPLY" = 1 ] && rm -rf -- "$t"
   }
-  # backstop <wt> <br> — a detached HEAD that no ref contains gets a keep/ branch
-  # before its worktree goes. Returns non-zero if it could not make one.
+  # backstop <wt> <br> — before a worktree goes, every commit that would become
+  # unreachable gets a keep/ branch: a detached HEAD that no ref contains, and
+  # every commit reachable ONLY from the worktree's own HEAD reflog (which is
+  # per-worktree and is deleted with it — a detached lane that committed and
+  # then switched away, or an amended-away commit). One branch per independent
+  # tip, keep/<basename>-<sha8>. Returns non-zero (= KEEP the worktree) if a
+  # branch cannot be made or the reachability check itself fails.
   backstop() {
-    local wt="$1" br="$2" h kb
-    [ "$br" = DETACHED ] || return 0
+    local wt="$1" br="$2" h kb t o
+    local -a tips=() refl=() rorph=()
     h="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)" || return 1
-    [ -n "$(git -C "$REPO_ROOT" for-each-ref --contains "$h" --count=1 refs/heads refs/remotes refs/tags 2>/dev/null)" ] && return 0
-    kb="keep/$(basename "$wt")-${h:0:8}"
-    N_KEEPBR=$((N_KEEPBR+1))
-    tag "back detached HEAD ${h:0:12} of $wt with branch $kb"
-    [ "$APPLY" = 1 ] || return 0
-    if git -C "$REPO_ROOT" rev-parse -q --verify "refs/heads/$kb" >/dev/null 2>&1; then
-      [ "$(git -C "$REPO_ROOT" rev-parse "refs/heads/$kb")" = "$h" ] && return 0
-      echo "[gc] KEEP ($kb exists and points elsewhere — refusing to remove an unbacked HEAD): $wt"; return 1
+    if [ "$br" = DETACHED ] &&
+       [ -z "$(git -C "$REPO_ROOT" for-each-ref --contains "$h" --count=1 refs/heads refs/remotes refs/tags 2>/dev/null)" ]; then
+      tips+=("$h")
     fi
-    git -C "$REPO_ROOT" branch "$kb" "$h" || { echo "[gc] KEEP (could not create $kb): $wt"; return 1; }
+    mapfile -t refl < <(git -C "$wt" log -g --format=%H HEAD 2>/dev/null | sort -u)
+    if [ "${#refl[@]}" -gt 0 ]; then
+      # commits in the reflog's history that no ref (nor the HEAD backed above) reaches
+      o="$(git -C "$REPO_ROOT" rev-list --ignore-missing "${refl[@]}" --not --branches --remotes --tags "$h" 2>/dev/null)" || {
+        echo "[gc] KEEP (could not check its HEAD reflog for unreachable commits): $wt"; return 1; }
+      if [ -n "$o" ]; then
+        # the reflog entries among them; their independent set covers every one
+        mapfile -t rorph < <(printf '%s\n' "${refl[@]}" | grep -Fxf <(printf '%s\n' "$o"))
+        o="$(git -C "$REPO_ROOT" merge-base --independent "${rorph[@]}" 2>/dev/null)" || {
+          echo "[gc] KEEP (could not reduce its reflog-only commits): $wt"; return 1; }
+        while read -r t; do [ -n "$t" ] && tips+=("$t"); done <<< "$o"
+      fi
+    fi
+    for t in "${tips[@]}"; do
+      kb="keep/$(basename "$wt")-${t:0:8}"
+      N_KEEPBR=$((N_KEEPBR+1))
+      if [ "$t" = "$h" ]; then tag "back detached HEAD ${t:0:12} of $wt with branch $kb"
+      else tag "back reflog-only commit ${t:0:12} of $wt with branch $kb"; fi
+      [ "$APPLY" = 1 ] || continue
+      if git -C "$REPO_ROOT" rev-parse -q --verify "refs/heads/$kb" >/dev/null 2>&1; then
+        [ "$(git -C "$REPO_ROOT" rev-parse "refs/heads/$kb")" = "$t" ] && continue
+        echo "[gc] KEEP ($kb exists and points elsewhere — refusing to drop an unbacked commit): $wt"; return 1
+      fi
+      git -C "$REPO_ROOT" branch "$kb" "$t" || { echo "[gc] KEEP (could not create $kb): $wt"; return 1; }
+    done
+    return 0
   }
   # keep_wt <wt> <why> — a KEPT worktree; --idle-builds may drop its build/.
   keep_wt() {
@@ -290,12 +327,17 @@ if [ "$DO_WT" = 1 ]; then
     fi
     br="$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null || echo DETACHED)"
     # ── KEPT: WIP, untracked files, unmerged ────────────────────────────────
-    if [ -n "$(git -C "$wt" status --porcelain -uno 2>/dev/null)" ]; then
+    # A FAILING `git status` (a corrupt index, say) proves nothing about WIP,
+    # so it keeps the tree rather than reading as "clean" (r39-rev-reaper G3).
+    if ! _st="$(git -C "$wt" status --porcelain 2>/dev/null)"; then
+      N_WIP=$((N_WIP+1)); echo "[gc] KEEP (git status failed — WIP unknown): $wt"; continue
+    fi
+    if printf '%s\n' "$_st" | grep -q '^[^?]'; then
       N_WIP=$((N_WIP+1)); echo "[gc] KEEP (WIP, uncommitted): $wt"; keep_wt "$wt" WIP; continue
     fi
     # Untracked (not ignored) files are WIP too — a new test a lane has not
     # `git add`ed yet. `worktree remove --force` would delete them.
-    if git -C "$wt" status --porcelain 2>/dev/null | grep -q '^??'; then
+    if printf '%s\n' "$_st" | grep -q '^??'; then
       N_UNTR=$((N_UNTR+1)); echo "[gc] KEEP (untracked files): $wt"; keep_wt "$wt" untracked; continue
     fi
     where="$(landed_in "$wt")"
@@ -308,7 +350,7 @@ if [ "$DO_WT" = 1 ]; then
     fi
     backstop "$wt" "$br" || continue
     if [ "$where" = main ]; then N_REAP_MAIN=$((N_REAP_MAIN+1)); else N_REAP_STG=$((N_REAP_STG+1)); fi
-    if [ "$where" = main ]; then _in="origin/main"; else _in="$STAGING_REF by patch-id"; fi
+    if [ "$where" = main ]; then _in="origin/main"; else _in="$STAGING_REF by patch-id (whitespace-insensitive)"; fi
     reclaim "$wt"
     if [ "$br" = DETACHED ]; then _br="detached HEAD; a ref keeps its commit"; else _br="branch $br kept"; fi
     tag "reap landed worktree $wt  [$_br; landed in $_in] ($RC)"

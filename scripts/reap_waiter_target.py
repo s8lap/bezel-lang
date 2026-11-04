@@ -11,10 +11,19 @@ can never exit: the shell running it has the literal text `ratchet_sweep` in
 its own argv, so its `pgrep -f ratchet_sweep` always finds ITSELF. Age alone
 cannot tell that waiter from a live one waiting for a slow job, and a young one
 is missed entirely. A waiter like that is stale when (a) the loop condition,
-evaluated with the GENUINE target (every process matching the pattern minus the
-waiter, its ancestors and descendants, and other pgrep loops for the same
-pattern), says EXIT, and (b) the condition as the waiter itself sees it says
-CONTINUE. That is a decided case: the waiter is provably blind.
+evaluated with the GENUINE target, says EXIT, and (b) the waiter ITSELF matches
+its own pattern, so the condition as it sees it says CONTINUE forever. That is
+a decided case: the waiter is provably blind.
+
+The GENUINE target is every process matching the pattern EXCEPT the waiter
+itself and its own direct `pgrep`/`grep` children (its poll in flight). Nothing
+else is discounted (r39-rev-reaper B2, 2026-11-05): not its other descendants
+(a backgrounded child may BE the target: `( exec -a X sleep N ) & while pgrep
+-f X`), not its ancestors (a script may poll for itself from a background
+loop), and not other processes whose argv merely mentions `pgrep` and the
+pattern (a live target may). Any such match makes the verdict WAITING, which
+reap_stale.sh treats as EXEMPT. A process that appears between the /proc
+snapshot and the pgrep is re-read live; if it cannot be read it is a match.
 
 What is deliberately NOT decided. A waiter whose target is satisfied and that
 is NOT blind (`until grep -q DONE log` with DONE already in the log) should exit
@@ -346,7 +355,6 @@ class Ctx:
         except OSError:
             raise Undecidable("cannot read the waiter's cwd")
         self.ppid_of = {}
-        self.cmd_of = {}
         for d in os.listdir("/proc"):
             if not d.isdigit():
                 continue
@@ -354,26 +362,21 @@ class Ctx:
                 with open("/proc/%s/stat" % d) as f:
                     st = f.read()
                 self.ppid_of[int(d)] = int(st[st.rindex(")") + 2:].split()[1])
-                with open("/proc/%s/cmdline" % d, "rb") as f:
-                    self.cmd_of[int(d)] = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
             except (OSError, ValueError):
                 continue
 
-    def related(self):
-        """The waiter, its descendants and its ancestors. Descendants are taken
-        from the WAITER only: an ancestor's other children (the session's other
-        shells) may be the very target the waiter polls for."""
-        rel = {self.pid}
-        grew = True
-        while grew:
-            grew = False
-            for c, pp in self.ppid_of.items():
-                if pp in rel and c not in rel:
-                    rel.add(c); grew = True
-        p = self.ppid_of.get(self.pid)
-        while p and p > 1 and p not in rel:
-            rel.add(p); p = self.ppid_of.get(p)
-        return rel
+    def is_own_poll(self, p):
+        """True iff `p` is a DIRECT child of the waiter whose comm is pgrep or
+        grep: the waiter's own poll in flight. Read live, so a child forked
+        after the snapshot is recognised; unreadable means "not its poll"."""
+        try:
+            with open("/proc/%d/stat" % p) as f:
+                st = f.read()
+            comm = st[st.index("(") + 1:st.rindex(")")]
+            ppid = int(st[st.rindex(")") + 2:].split()[1])
+        except (OSError, ValueError):
+            return False
+        return ppid == self.pid and comm in ("pgrep", "grep")
 
     def children_comms(self):
         out = []
@@ -494,14 +497,11 @@ def eval_atom(words, ctx):
         if rc not in (0, 1):
             raise Undecidable("pgrep failed")
         raw = {int(x) for x in out.split() if x.isdigit()} - {os.getpid()}
-        rel = ctx.related()
-        genuine = set()
-        for p in raw - rel:
-            c = ctx.cmd_of.get(p, "")
-            if "pgrep" in c and pattern in c:
-                continue  # another waiter polling for the same pattern
-            genuine.add(p)
-        v = (bool(raw), bool(genuine))
+        # Discount ONLY the waiter and its own in-flight poll (see the module
+        # docstring). Blind = the waiter itself matches, so its pgrep can
+        # never come back empty while it lives.
+        genuine = {p for p in raw if p != ctx.pid and not ctx.is_own_poll(p)}
+        v = (ctx.pid in raw, bool(genuine))
     elif cmd == "kill":
         if len(args) != 2 or args[0] != "-0" or not args[1].isdigit():
             raise Undecidable("unsupported kill")

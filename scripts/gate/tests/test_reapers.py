@@ -222,6 +222,81 @@ class GcScratchTest(_GcBase):
         self.assertIn("KEEP (untracked files)", r.stdout)
         self.assertTrue((wt / "new_test.cpp").exists())
 
+    def _backdate_index(self, wt, hours=5):
+        gitdir = pathlib.Path(self.repo.out("-C", str(wt), "rev-parse", "--absolute-git-dir"))
+        _old(gitdir / "index", hours)
+
+    def _old_build(self, root):
+        (root / "obj").mkdir(parents=True)
+        (root / "CMakeCache.txt").write_text("# cache\n")
+        (root / "obj" / "x.o").write_text("o" * 4096)
+        for q in [root / "obj" / "x.o", root / "obj", root / "CMakeCache.txt", root]:
+            _old(q, 5)
+
+    def test_a_commit_only_in_the_head_reflog_gets_a_keep_branch(self):
+        # r39-rev-reaper G2: a detached lane commits Y, then switches back to
+        # main. HEAD is landed, but Y lives only in the per-worktree HEAD reflog,
+        # which `worktree remove` deletes with the tree.
+        wt = self.add_wt("rev-g2", "main", detach=True)
+        (wt / "g2.txt").write_text("only in the reflog\n")
+        self.repo.git("-C", str(wt), "add", "g2.txt")
+        self.repo.git("-C", str(wt), "commit", "-q", "-m", "g2")
+        y = self.repo.out("-C", str(wt), "rev-parse", "HEAD")
+        self.repo.git("-C", str(wt), "switch", "-q", "--detach", "main")
+        self.assertEqual(self.repo.out("for-each-ref", "--contains", y), "")
+        r = self.gc("--worktrees", "--apply")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.repo.out("rev-parse", "-q", "--verify", "refs/heads/keep/rev-g2-" + y[:8]),
+                         y, r.stdout)
+        self.assertIn("back reflog-only commit", r.stdout)
+
+    def test_idle_builds_spares_a_build_a_live_process_runs_from(self):
+        # r39-rev-reaper IB1: a test binary running out of build/ from another cwd.
+        self.lane("lane-x", "x.txt", "x\n")
+        wt = self.add_wt("lane-x", "lane-x")
+        (wt / "x.txt").write_text("wip\n")
+        self._old_build(wt / "build")
+        exe = wt / "build" / "obj" / "fake_tests"
+        exe.write_bytes(pathlib.Path("/usr/bin/sleep").read_bytes())
+        exe.chmod(0o755)
+        _old(exe, 5); _old(wt / "build" / "obj", 5)
+        self.procs.append(subprocess.Popen([str(exe), "120"], cwd=str(self.tmp)))
+        time.sleep(0.3)
+        self._backdate_index(wt)
+        r = self.gc("--worktrees", "--idle-builds", "--apply", idle_min="120")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((wt / "build" / "CMakeCache.txt").exists(), r.stdout)
+        self.assertIn("a live process runs from or is cwd'd in it", r.stdout)
+
+    def test_idle_builds_never_follows_a_symlinked_build(self):
+        # r39-rev-reaper IB2: a symlinked build/ with no backref may be SHARED.
+        self.lane("lane-y", "y.txt", "y\n")
+        wt = self.add_wt("lane-y", "lane-y")
+        (wt / "y.txt").write_text("wip\n")
+        shared = self.tmp / "shared-build"
+        self._old_build(shared)
+        (wt / "build").symlink_to(shared)
+        self._backdate_index(wt)
+        r = self.gc("--worktrees", "--idle-builds", "--apply", idle_min="120")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((shared / "CMakeCache.txt").exists(), r.stdout)
+        self.assertTrue((wt / "build").is_symlink())
+
+    def test_a_failing_git_status_keeps_the_worktree(self):
+        # r39-rev-reaper G3: a corrupt index makes `git status` fail; that must
+        # not read as "clean".
+        sha = self.lane("lane-z", "z.txt", "z\n")
+        self.pick_onto("main", sha)
+        self.repo.git("update-ref", "refs/remotes/origin/main", "main")
+        wt = self.add_wt("lane-z", "lane-z")
+        (wt / "z.txt").write_text("tracked edit\n")
+        gitdir = pathlib.Path(self.repo.out("-C", str(wt), "rev-parse", "--absolute-git-dir"))
+        (gitdir / "index").write_bytes(b"DIRC garbage, not an index")
+        r = self.gc("--worktrees", "--apply")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((wt / "z.txt").exists(), r.stdout)
+        self.assertEqual((wt / "z.txt").read_text(), "tracked edit\n")
+
     def test_summary_line_counts(self):
         sha = self.lane("lane-s", "s.txt", "s\n")
         self.pick_onto("staging", sha)
@@ -260,7 +335,14 @@ class ReapStaleTest(unittest.TestCase):
                               cwd=str(cls.tmp / "lanewt"))
         # Self-matching waiter: its own `pgrep -f` sees its own argv.
         cls.blind = spawn("while pgrep -f %s-target >/dev/null; do sleep 100; done" % mk)
-        cls.procs = [cls.busy_parent, cls.idle_parent, cls.protected, cls.blind]
+        # r39-rev-reaper B1: waiters whose target is ALIVE. Older than --age 30,
+        # neither may be STALE: `while kill -0` is a probe-only shape, and the
+        # `until test -f` one (an aged shape) is decided WAITING, hence exempt.
+        cls.live_target = spawn("exec sleep 600")
+        cls.kill0 = spawn("while kill -0 %d 2>/dev/null; do sleep 100; done" % cls.live_target.pid)
+        cls.until_missing = spawn("until test -f %s/never-%s; do sleep 100; done" % (cls.tmp, mk))
+        cls.procs = [cls.busy_parent, cls.idle_parent, cls.protected, cls.blind,
+                     cls.live_target, cls.kill0, cls.until_missing]
         time.sleep(32)  # every candidate must be >= 30 s old
         cls.env = dict(os.environ, BEZEL_GATE_PIDFILE=str(cls.tmp / "no-gate.pid"))
 
@@ -298,6 +380,14 @@ class ReapStaleTest(unittest.TestCase):
         self.assertIsNone(self.stale_line(r.stdout, self.protected.pid), r.stdout)
         self.assertIn("protected pid=%d " % self.protected.pid, r.stdout)
 
+    def test_a_waiter_on_a_live_target_is_never_aged_stale(self):
+        r = self.reap("--age", "30", "--orphan-age", "30", "--no-exclude-working")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIsNotNone(self.stale_line(r.stdout, self.idle_parent.pid), r.stdout)  # control
+        self.assertIsNone(self.stale_line(r.stdout, self.kill0.pid), r.stdout)
+        self.assertIsNone(self.stale_line(r.stdout, self.until_missing.pid), r.stdout)
+        self.assertIn("waiting pid=%d " % self.until_missing.pid, r.stdout)
+
     def test_self_matching_waiter_is_tier_w_at_any_age(self):
         r = self.reap("--age", "3600", "--orphan-age", "3600")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -313,6 +403,73 @@ class ReapStaleTest(unittest.TestCase):
                            capture_output=True, text=True, timeout=300)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("self-test: PASS", r.stdout)
+
+
+class WaiterTargetTest(unittest.TestCase):
+    """scripts/reap_waiter_target.py on live synthetic waiters. Tier W must be
+    PROVABLE: any process other than the waiter itself and its own pgrep/grep
+    poll that matches the pattern is a live target, so the verdict is WAITING
+    (r39-rev-reaper B2)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="reap-wt-")
+        cls.tmp = pathlib.Path(cls._tmp.name).resolve()
+        mk = "wtgt%d" % os.getpid()
+
+        def spawn(script):
+            return subprocess.Popen(["bash", "-c", script], cwd=str(cls.tmp), start_new_session=True,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # control: blind, nothing else matches -> SATISFIED
+        cls.blind = spawn("while pgrep -f %s-gone >/dev/null; do sleep 100; done" % mk)
+        # W1: the target is the waiter's OWN background child (and the waiter
+        # itself does not match): it exits once the child dies.
+        cls.w1 = spawn('( exec -a %s-w1 sleep 600 ) & while pgrep -f "^%s-w[1]" >/dev/null; '
+                       'do sleep 100; done' % (mk, mk))
+        # W2: a live target whose argv mentions `pgrep` and the pattern.
+        cls.w2_target = spawn("sleep 600; : pgrep %s-t2" % mk)
+        cls.w2 = spawn("while pgrep -f %s-t2 >/dev/null; do sleep 100; done" % mk)
+        # W4: the target is the waiter's ANCESTOR (a script polling for itself).
+        cls.w4_outer = spawn(": %s-a4; bash -c 'while pgrep -f %s-a4 >/dev/null; do sleep 100; done' & wait"
+                             % (mk, mk))
+        cls.procs = [cls.blind, cls.w1, cls.w2_target, cls.w2, cls.w4_outer]
+        time.sleep(1.5)
+        kids = subprocess.run(["pgrep", "-P", str(cls.w4_outer.pid)], capture_output=True,
+                              text=True).stdout.split()
+        cls.w4 = int(kids[0]) if kids else None
+
+    @classmethod
+    def tearDownClass(cls):
+        for p in cls.procs:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.wait()
+        cls._tmp.cleanup()
+
+    def verdict(self, pid):
+        r = subprocess.run(["python3", str(SCRIPTS / "reap_waiter_target.py"), str(pid)],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.split("\t")[1], r.stdout
+
+    def test_blind_waiter_with_no_target_is_satisfied(self):
+        v, out = self.verdict(self.blind.pid)
+        self.assertEqual(v, "SATISFIED", out)
+
+    def test_target_is_the_waiters_own_background_child(self):
+        v, out = self.verdict(self.w1.pid)
+        self.assertEqual(v, "WAITING", out)
+
+    def test_target_argv_mentions_pgrep_and_the_pattern(self):
+        v, out = self.verdict(self.w2.pid)
+        self.assertEqual(v, "WAITING", out)
+
+    def test_target_is_the_waiters_ancestor(self):
+        self.assertIsNotNone(self.w4)
+        v, out = self.verdict(self.w4)
+        self.assertEqual(v, "WAITING", out)
 
 
 if __name__ == "__main__":
