@@ -404,7 +404,9 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
     if (auto* inner = dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get())) {
         if (auto* clsId =
                 dynamic_cast<const ast::IdentifierExpr*>(inner->target.get())) {
-            if (clsId->name == "Encoding") { literal = true; sg = inner->member; }
+            // fix #8126 (§2.7 rule 1, v0.355): a VALUE named `Encoding` is not the built-in.
+            if (clsId->name == "Encoding" &&
+                receiverMayReachBuiltinStaticArm(*clsId)) { literal = true; sg = inner->member; }
         }
     }
     const auto& m = ma->member;  // "GetBytes", "GetString", "GetByteCount", "Name"

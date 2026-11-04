@@ -156,3 +156,42 @@ BEZEL_TEST(local_shadows_console_8126, control_other_local_name_is_unaffected) {
               "Console.WriteLine(Logger.last);",
               "USER:q\n");
 }
+
+// ---- the `Encoding` arm (same mechanism, second commit of #8126) --------
+
+namespace {
+const char* kEnc =
+    "public class Enc "
+    "  public property UTF8: Enc => this; "
+    "  public property Name: string => \"USERNAME\"; "
+    "  public method GetString(s: string): string "
+    "    return \"USER:\" + s; "
+    "  end GetString; "
+    "end Enc; ";
+}  // namespace
+
+// §2.3 / §2.7 rule 1 (v0.355): a local `Encoding` is a value, so
+// `Encoding.UTF8.GetString("x")` is member access on it.  Base: sema typed
+// `Encoding.UTF8` as the built-in singleton and rejected the string argument.
+BEZEL_TEST(local_shadows_console_8126, encoding_local_calls_the_user_method) {
+    auto r = runAot(std::string("module M; ") + kEnc +
+                    " public class C public static method Main(): int "
+                    "  var Encoding := new Enc(); "
+                    "  Console.WriteLine(Encoding.UTF8.GetString(\"x\")); "
+                    "  Console.WriteLine(Encoding.UTF8.Name); "
+                    "  return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "USER:x\nUSERNAME\n");
+}
+
+BEZEL_TEST(local_shadows_console_8126, control_builtin_encoding_still_works) {
+    auto r = runAot("module M; public class C public static method Main(): int "
+                    "  var b := Encoding.UTF8.GetBytes(\"ab\"); "
+                    "  Console.WriteLine(Encoding.UTF8.GetString(b)); "
+                    "  Console.WriteLine(Encoding.UTF8.Name); "
+                    "  return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "ab\nutf-8\n");
+}

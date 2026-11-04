@@ -6697,7 +6697,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     if (auto* encId =
                             dynamic_cast<const ast::IdentifierExpr*>(
                                 inner2->target.get())) {
-                        if (encId->name == "Encoding") {
+                        if (encId->name == "Encoding" &&
+                            receiverMayReachBuiltinStaticArm(*encId)) {  // #8126
                             const char* nameStr = nullptr;
                             if (inner2->member == "UTF8")  nameStr = "utf-8";
                             if (inner2->member == "UTF16") nameStr = "utf-16le";
@@ -6725,7 +6726,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 static const char* const kEncLabels[] = {"utf-8", "utf-16le", "utf-32le", "us-ascii"};
                 auto* encIdV = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
                 if (encIdV && encIdV->name == "Encoding" &&
-                    !receiverIsUserType(*ma->target)) {
+                    receiverMayReachBuiltinStaticArm(*ma->target)) {  // #8126
                     for (int k = 0; k < 4; ++k) {
                         if (ma->member != kEncMembers[k]) continue;
                         return builder_.getInt32(k);

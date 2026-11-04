@@ -35627,7 +35627,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     }
     if (ma.target) {
         if (auto* eid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
-            if (eid->name == "Encoding") {
+            // fix #8126 (§2.3 / §2.7 rule 1, v0.355): a VALUE named `Encoding`
+            // is member access, not the built-in singleton.
+            if (eid->name == "Encoding" &&
+                receiverMayReachBuiltinStaticArm(ctx_.exprSymbol(*eid))) {
                 const auto& sg = ma.member;
                 if (sg == "UTF8" || sg == "UTF16" || sg == "UTF32" ||
                     sg == "ASCII") {
