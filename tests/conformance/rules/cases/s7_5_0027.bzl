@@ -4,7 +4,7 @@
 //! title: ?. over a non-generic Task? and a Task<int>? bound to a local yields a nullable result
 //! rule: `x?.M` returns null if `x` is null; otherwise it performs the access.
 //!   The result type is always nullable
-//! cites: 30.3
+//! cites: 7.5, 30.3
 //! expect: run
 //! issue: 7896
 //! output: True

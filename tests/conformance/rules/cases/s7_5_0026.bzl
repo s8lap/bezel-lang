@@ -4,7 +4,7 @@
 //! title: ?. over a Task<int>? reads IsCompleted and Result when non-null and short-circuits when null
 //! rule: `x?.M` returns null if `x` is null; otherwise it performs the access.
 //!   The result type is always nullable
-//! cites: 30.3
+//! cites: 7.5, 30.3
 //! expect: run
 //! issue: 7896
 //! output: local-p True|7|False

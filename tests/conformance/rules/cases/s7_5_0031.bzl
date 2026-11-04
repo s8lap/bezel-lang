@@ -3,7 +3,7 @@
 //! section: 7.5
 //! title: ?. over string instance methods yields the member's result for a non-null string and null otherwise
 //! rule: `x?.M` returns null if `x` is null; otherwise it performs the access.
-//! cites: 9.6
+//! cites: 7.5, 9.6
 //! expect: run
 //! issue: 7747
 //! output: nn ABCDE|bc|**abcde|True|2
