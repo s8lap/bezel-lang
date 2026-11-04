@@ -1022,6 +1022,84 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 srcEv->getType()->isPointerTy()) {
                 emitBoxRelease(srcEv);
             }
+            // fix #8143 (§18.5 / §28.3.11 / §28.3 K8.1, v0.355): an OWNED
+            // temporary produced by the hole EXPRESSION itself — `new C(...)`,
+            // or a call declared to return `owned C` — is an UNBOUND OWNED
+            // TEMPORARY (§28.3.11). The hole only BORROWS it: §18.5's
+            // dispatch renders the value (the value's `ToString`, or its
+            // `ToString(format:)`) and the CONCAT copies the rendered bytes,
+            // so nothing that survives the hole points into the object. The
+            // +1 the producer transferred is therefore owned by NOBODY — the
+            // hole's expression ends and the object leaks (16 B per
+            // evaluation; MEASURED on the issue's repro over 100 iterations:
+            // "SUMMARY: AddressSanitizer: 1600 byte(s) leaked in 100
+            // allocation(s)").
+            //
+            // §28.3.11 (v0.355) states the obligation: such a temporary "used
+            // only by *borrowing* operations within the expression" is
+            // "disposed at the **end of the full expression** in which it is
+            // produced, after every use of it within that expression has
+            // completed". THE RECLAIM IS THE ESTABLISHED ONE: the SAME
+            // unbound-owned-temporary queue the CALL-ARGUMENT position uses
+            // (`deferUnboundOwnedTempToK8`) — the value is parked in a slot
+            // and the K8 full-expression boundary (the `lowerExpr` wrapper's
+            // `flushK8RecvTemps`) disposes it, while the queue's unwind-only
+            // registration covers the EXCEPTION edge (§28.3's
+            // *Exception-path discharge*). No new disposal path is
+            // introduced: the queue, the flush and the unwind registration are
+            // the ones the argument position already uses, and this site only
+            // supplies the slot.
+            //
+            // THE GATE IS THE SHARED CLASSIFIER. `isFreshOwnedClassProducer`
+            // (common/OwnershipFacts.cpp — the §28.3.11 producer predicate,
+            // #1039/#1053) is true for a `new` expression and for a call whose
+            // declaration returns `owned`, and only when the result type is a
+            // heap CLASS. A BORROWED operand (a local, a field, a property
+            // read) is not a producer, so it is never queued — that borrow is
+            // the caller's, and disposing it would free a value this scope
+            // does not own (a use-after-free). A non-class result (a record, a
+            // string, an interface-typed value) has no heap block to reclaim.
+            // The predicate's class-kind requirement also keeps this arm
+            // disjoint from the box/string producer arms above: those fire on
+            // calls whose declared return type is `Object` or an interface
+            // (a boxable value type), which is not a heap CLASS.
+            //
+            // WHY IT IS SAFE TO DISPOSE AFTER THE RENDER. The rendered string
+            // is a fresh copy of the object's text and the CONCAT copies
+            // those bytes again, so the object has no live reader left when
+            // the boundary disposes it — which is after the whole full
+            // expression, hence after the concat.
+            //
+            // The `UndefValue` guard (which also covers `PoisonValue` — it is
+            // its base class) skips a DEGRADED hole: a lowering that could
+            // not produce a value leaves `srcEv` undefined, and the boundary's
+            // null test on an undefined pointer is undefined behaviour. The
+            // safe direction there is a leak (there is no object to reclaim).
+            if (srcExpr && srcEv && srcEv->getType()->isPointerTy() &&
+                !llvm::isa<llvm::UndefValue>(srcEv) &&
+                isFreshOwnedClassProducer(srcExpr)) {
+                llvm::AllocaInst* holeSlot = entryAllocaNullPtr();
+                builder_.CreateStore(srcEv, holeSlot);
+                if (!deferUnboundOwnedTempToK8(holeSlot)) {
+                    // No K8 boundary to queue on (a disposer body): fall back
+                    // to an immediate, null-guarded discharge so the value is
+                    // not leaked outright — the same fallback the argument
+                    // position uses.
+                    llvm::Value* obj =
+                        builder_.CreateLoad(ptrTy(), holeSlot, "interp.hole");
+                    llvm::Value* isNull = builder_.CreateICmpEQ(
+                        obj, llvm::ConstantPointerNull::get(ptrTy()));
+                    auto* dispBB = llvm::BasicBlock::Create(
+                        llvm_, "interp.hole.dispose", currentFn_);
+                    auto* contBB = llvm::BasicBlock::Create(
+                        llvm_, "interp.hole.cont", currentFn_);
+                    builder_.CreateCondBr(isNull, contBB, dispBB);
+                    builder_.SetInsertPoint(dispBB);
+                    emitDisposeAndReclaim(obj);
+                    builder_.CreateBr(contBB);
+                    builder_.SetInsertPoint(contBB);
+                }
+            }
         };
         // fix #4934 / #4953 (§14.1 / §18.5 / §8.5, v0.307): a hole whose sema
         // type is a BARE type parameter (`T`, or `T?`) inside a generic body
