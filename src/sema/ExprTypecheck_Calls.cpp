@@ -38924,8 +38924,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // fix #8120 (spec §26.5 rule 2 / §27.6, v0.355): the
                         // Stack/Queue twin of the Array/OwningArray gate
                         // above — the same rule-2 consultation, the same
-                        // house form. stdlib §4.11 declares `Count` on
-                        // `Stack<T>` / `Queue<T>` and their Owning twins and
+                        // house form. stdlib §4.11 declares the heads
+                        // `Stack<T>` / `Queue<T>` and their Owning twins
+                        // (`Count` is a collection-interface member) and
                         // no `Doubled`, so a user's `extension Stack<int>
                         // Doubled()` is a member of that name on that
                         // receiver, and §27.6 resolves the bare reference to
