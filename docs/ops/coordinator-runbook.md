@@ -297,8 +297,9 @@ into `/var/tmp/bezel-scratch/` and never a shared short prefix. Measured
 2026-09-22: two lanes both wrote a probe `.bzl` under a common directory, one
 overwrote the other's file mid-run, and the victim's probe briefly read as
 "the bug fixed itself" — a false refutation, which is the expensive direction
-for this class of mistake. Cleanup is automated, so
-you should rarely sweep by hand: `scripts/gate_and_push.sh` runs
+for this class of mistake. Cleanup is automated **only on a push**; a
+run that has not pushed reaps by hand (see *Reaping stale processes, worktrees and build
+dirs*): `scripts/gate_and_push.sh` runs
 `scripts/gc_scratch.sh` after every successful push, which (a) reaps worktrees
 whose commits are already in `origin/main` (branch refs are kept; WIP, locked,
 and the current worktree are never touched), (b) drops stale
@@ -946,6 +947,63 @@ dispose-count/ASan-clean for a double-free.
   lane worktree (and any worktree holding a reference build); gc honours
   locks — it skips every worktree the porcelain list marks `locked`. Unlock and
   `git worktree remove` explicitly at close-out.
+
+### Reaping stale processes, worktrees and build dirs
+
+The owner's standing permission (2026-11-05): **a coordinator may reap anything it judges
+stale**, processes, worktrees, build dirs and scratch, using these scripts or its own. Only
+**commits** and **live lanes** are protected. The automation runs only after a push, so a
+long run that never pushes reaches the reaper only by hand. Reap **at every heartbeat
+whose disk row reads ≥ 80 %**, and before every pool refill that will cold-build.
+
+**Order: processes first, then worktrees, then scratch.** A worktree with a process in it is
+not free, whatever its claim row says.
+
+1. **Processes.** `scripts/reap_stale.sh` (dry-run), then `--kill`. Tier A covers ownerless
+   processes, tier B aged ones, and tier 0 exempts anything still making CPU or I/O progress.
+   `scripts/reap_orphans.sh` is the older PPID==1-only subset. Never kill, by hand or by
+   script:
+   - **a background waiter of a LIVE agent** (an `oc_wait.sh`, a `while … sleep` loop, a
+     `wait_pid.sh`). The agent is woken by that shell's exit; kill it and the agent never
+     wakes, holding its slot until someone notices. Measured R39: four agents sat
+     "completed, waiting" on runs that had already finished. Map each waiter to a live claim
+     before signalling it;
+   - the coordinator's own waiters (`ListAgents` plus the background-task list);
+   - a running gate (`$BEZEL_GATE_PIDFILE`).
+2. **Which worktree is free.** For each `/mnt/fast/worktrees/*`, check:
+   - **procs**: the processes whose `/proc/PID/cwd` lies under it, which must be 0;
+   - **claim**: the last `claims.tsv` row naming the path, which must not be `live`;
+   - **dirty**: the tracked changes, from `git status --short | grep -v '^??'`.
+
+   A tree with a live claim, or procs > 0, is never touched. Reusing a busy tree for a new
+   lane is the same mistake: check procs before writing the path into a brief.
+3. **Worktrees: reclaim the build or the whole tree.**
+   - **Landed** (every commit is in `origin/main` or the staging ref by patch-id, not just
+     by ancestry): `git worktree remove --force`. The branch ref stays.
+   - **Unpushed commits, clean tree**: the commit is the asset, the checkout is not. Remove
+     the worktree, and keep the branch. A **detached HEAD** has no branch: first
+     `git branch keep/<wt>-<sha8> HEAD`, or the commit becomes unreachable.
+   - **WIP (dirty tracked files)**: keep the tree and delete only `build/`
+     (`rm -rf <wt>/build`; `scripts/lane_setup.sh` recreates it, and ccache makes the
+     rebuild cheap). This reclaims ~3–4 GB per tree and loses nothing.
+   - **A reference-compiler tree** a reviewer or verifier is reading
+     (e.g. `r39-verify-shared`): lock it (`git worktree lock --reason …`) and leave it.
+
+   `scripts/gc_scratch.sh --worktrees` automates the landed case only. It reports
+   clean-but-unmerged trees and never reaps them; the cases above are done by hand, or by
+   the reaper's newer modes once they land.
+4. **Orphan build trees and scratch.** Run `scripts/gc_scratch.sh --builds --root`
+   (`--apply`), which removes `/mnt/fast/lane-builds/*` with no worktree and quarantines old
+   root scratch. Delete per-lane scratch dirs (`/var/tmp/bezel-scratch/<run>/<lane>/`) by
+   **name**, never with a recursive search over the scratch root (369 GB, see *Build
+   toolchain*). Keep the lane's `report.md` and probes until its pick or rejection is
+   recorded, because a harvest lane reads them.
+5. **Record it.** Append `standdown` rows for the claims whose worktrees you removed, and
+   note the before/after `df -h /mnt/fast` in the run cursor.
+
+Measured 2026-11-05 (R39): **105 worktrees removed and 21 build dirs dropped took
+`/mnt/fast` from 89 % to 55 %**, with no commit lost: every detached tip got a `keep/` ref
+first, and every WIP tree kept its sources.
 
 ### ⚠ At most TWO lanes may cold-build `--area codegen` at once
 
