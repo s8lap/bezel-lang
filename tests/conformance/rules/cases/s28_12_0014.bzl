@@ -5,8 +5,10 @@
 //! rule: An instance is **logically disposed** — the state §28.2's
 //!   checked-mode test faults on — once its logical disposal has completed;
 //!   until then the disposal's own accesses (a destructor body's, the
-//!   `DisposeAsync` body's and its chained `base.DisposeAsync()`'s) run on a
-//!   live instance.
+//!   `DisposeAsync` body's and its chained `base.DisposeAsync()`'s, and those
+//!   of the destructors that the owned-field cascade (§28.4) runs for the
+//!   instance's owned fields, a child's read of the instance through a
+//!   back-reference included) run on a live instance.
 //! cites: 28.12, 28.2, 28.4
 //! expect: run
 //! output: closing res
