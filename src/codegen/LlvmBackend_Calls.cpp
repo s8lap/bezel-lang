@@ -5814,6 +5814,33 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     (recvTy && !recvTy->genericArgs.empty())
                         ? recvTy->genericArgs[0] : nullptr;
                 bool isStrElem = isStringTypeRefNonNull(elemTypeRef);
+                // fix #8049 (stdlib §2.5 / §5.1 / §2.8, spec §14.2, v0.353):
+                // a BUILT-IN VALUE RECORD element — `DateTime`, `TimeSpan`,
+                // `DateOnly`, `TimeOnly` — is stored INLINE in the array (ONE
+                // scalar WORD: i64 for DateTime/TimeSpan, i32 for
+                // DateOnly/TimeOnly), so the POINTER arm below cannot serve it
+                // at all: that arm reads each element as a POINTER, and
+                // widening it to admit a value record would compare the
+                // ADDRESSES of two inline words and answer with whichever
+                // element happened to sit lowest in memory.
+                //
+                // The element is recognised by its STATIC type, exactly as the
+                // #7874 selector arm recognises a value-typed `U` (the same
+                // `resolveTypeParamRef` + `builtinTypeName` spelling, so an
+                // IMPORTED user type of the same name — `builtinTypeName`
+                // returns {} for it — is not matched, and a NULLABLE element
+                // is excluded, per spec §14.2: "A type-bound constraint —
+                // naming a class or interface — implies non-null T").
+                std::string_view elemValueHead;
+                if (elemTypeRef && !elemTypeRef->nullable &&
+                    elemTypeRef->kind == sema::TypeRef::Kind::Named) {
+                    const sema::TypeRef* er = resolveTypeParamRef(elemTypeRef);
+                    if (er && !er->nullable) elemValueHead = builtinTypeName(er);
+                }
+                const bool elemIsDateTime = (elemValueHead == "DateTime");
+                const bool elemIsTemporalValue =
+                    elemIsDateTime || elemValueHead == "TimeSpan" ||
+                    elemValueHead == "DateOnly" || elemValueHead == "TimeOnly";
                 sema::MethodSymbol* cmpMs = nullptr;
                 if (!isStrElem && elemTypeRef &&
                     elemTypeRef->kind == sema::TypeRef::Kind::Named &&
@@ -5939,6 +5966,139 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     freeLazyTemp();
                     freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                     return builder_.CreateLoad(ptrTy(), accSlot, "mm.r");
+                }
+                // fix #8049 (stdlib §2.5 / §5.1 / §2.8, spec §14.2, v0.353):
+                // THE INLINE VALUE-RECORD ARM — a BUILT-IN VALUE RECORD
+                // element (`DateTime`, `TimeSpan`, `DateOnly`, `TimeOnly`).
+                //
+                // WHAT THE DOCUMENTS REQUIRE. stdlib §2.5 declares
+                //     public record DateTime: IComparable<DateTime>, IEquatable<DateTime>
+                //     public record TimeSpan: IComparable<TimeSpan>, IEquatable<TimeSpan>
+                //     public record DateOnly: IComparable<DateOnly>, IEquatable<DateOnly>
+                //     public record TimeOnly: IComparable<TimeOnly>, IEquatable<TimeOnly>
+                // stdlib §2.8 declares the constraint's authority
+                //     public interface IComparable<T>
+                //       method CompareTo(other: T): int;
+                //     end IComparable;
+                // and stdlib §5.1 declares the no-selector form as
+                //     public extension IEnumerable<T> where T: IComparable<T>
+                //       public method Min(): T;              // InvalidOperationException if empty
+                //       public method Max(): T;              // InvalidOperationException if empty
+                // so `T = DateTime` SATISFIES §5.1's constraint (spec §14.2:
+                // "`where T: IFoo` … Non-nullable types conforming to `IFoo`:
+                // classes implementing it, **records and enums implementing
+                // it**, …") and `darr.Min()` MUST BE ADMITTED.
+                //
+                // THE DEFECT. These four are BUILT-IN value records: they have
+                // no user TypeDecl, so their TypeRef carries NO
+                // `declaration`. The comparator resolution above therefore
+                // resolved nothing for them —
+                //   * `findMethodByName(elemTypeRef->declaration, "CompareTo")`
+                //     is unreachable (no declaration), and
+                //   * `selfComparableIfaceCompareTo(elemTypeRef)` is the
+                //     INTERFACE substitution of §14.2 rule 3 and needs a
+                //     declaration too (it walks `declaration->baseTypeRefs`),
+                // and the #2770 guard below then REJECTED the call with
+                //     "Min() without a selector requires the element type to
+                //      satisfy `T: IComparable<T>` …; `DateTime` does not".
+                //
+                // ⚠ THIS ARM CANNOT BE THE POINTER ARM. The pointer arm reads
+                // each element as a POINTER (a string object, a class
+                // instance, an interface instance). A value record is stored
+                // INLINE — one scalar word in the array buffer — so admitting
+                // it there would compare the ADDRESSES of two inline words and
+                // answer with whichever element sat lowest in memory. This is
+                // therefore a SEPARATE arm that loads the element's WORD.
+                //
+                // THE ORDERING is the value's own `CompareTo`, which §2.5
+                // spells out per type:
+                //   * DateTime — "CompareTo = tick order (Kind not normalized,
+                //     matching .NET)": the TICKS, i.e. the word with its
+                //     `Kind` bits masked off (`dtTicksOf`) — the same key the
+                //     `Math.Min`/`Max` arm uses (fix #7716) and the same key
+                //     the #7874 selector arm uses.
+                //   * TimeSpan — "CompareTo = tick order": the i64 tick word,
+                //     SIGNED (a span may be negative).
+                //   * DateOnly — "CompareTo … chronological": the i32 day
+                //     number.
+                //   * TimeOnly — "CompareTo": the i32 millisecond-of-day
+                //     count.
+                // The winner's ORIGINAL word is kept, so a `DateTime` keeps
+                // its own `Kind` — the discipline the `Math.Min`/`Max` arm
+                // applies (fix #7716).
+                //
+                // ⚠ THE POINTER ARM ABOVE IS UNCHANGED: a `string` element, a
+                // class instance and an interface instance are REFERENCES and
+                // keep their own (already correct) dispatch. This arm is
+                // mutually exclusive with it — a built-in value record is
+                // neither a string nor a class nor an interface, so `isStrElem`,
+                // `cmpMs` and `ifaceCmpFn` are all null for it.
+                //
+                // ⚠ `Guid` (stdlib §2.6, also `IComparable<Guid>`) is NOT here:
+                // it is a `{i64,i64}` STRUCT whose §2.6 order is "lexicographic
+                // over the 16 canonical big-endian bytes", not a scalar-word
+                // order, so it needs a structural comparison of its own.
+                if (elemIsTemporalValue) {
+                    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                    llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                    // stdlib §5.1: Min()/Max() throw on an empty source.
+                    llvm::Value* isEmpty =
+                        builder_.CreateICmpEQ(len, builder_.getInt64(0));
+                    emitGuardThrow(isEmpty, "InvalidOperationException");
+                    auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                           {ptrTy(), i64(), i64()});
+                    auto* idxSlot  = entryAlloca(i64());
+                    auto* accSlot  = entryAlloca(elemTy);
+                    auto* initSlot = entryAlloca(i1());
+                    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                    builder_.CreateStore(
+                        llvm::ConstantInt::get(elemTy, 0), accSlot);
+                    builder_.CreateStore(builder_.getFalse(), initSlot);
+                    auto* condBB = llvm::BasicBlock::Create(llvm_, "mmv.c", currentFn_);
+                    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "mmv.b", currentFn_);
+                    auto* updBB  = llvm::BasicBlock::Create(llvm_, "mmv.u", currentFn_);
+                    auto* nextBB = llvm::BasicBlock::Create(llvm_, "mmv.n", currentFn_);
+                    auto* endBB  = llvm::BasicBlock::Create(llvm_, "mmv.e", currentFn_);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(condBB);
+                    llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                    builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len),
+                                          bodyBB, endBB);
+                    builder_.SetInsertPoint(bodyBB);
+                    llvm::Value* ep = builder_.CreateCall(
+                        ptrFn, {recv, idx, builder_.getInt64(esz)});
+                    llvm::Value* el  = builder_.CreateLoad(elemTy, ep, "mmv.el");
+                    llvm::Value* acc = builder_.CreateLoad(elemTy, accSlot, "mmv.acc");
+                    // The comparison KEY: a DateTime compares by TICKS (its
+                    // `Kind` rides in the word's top two bits and §2.5's
+                    // "Kind not normalized" excludes it); the other three
+                    // compare by their own word.
+                    llvm::Value* cmpVal = el;
+                    llvm::Value* cmpAcc = acc;
+                    if (elemIsDateTime && elemTy->isIntegerTy(64)) {
+                        cmpVal = dtTicksOf(el);
+                        cmpAcc = dtTicksOf(acc);
+                    }
+                    llvm::Value* inited = builder_.CreateLoad(i1(), initSlot);
+                    // isMax: replace acc when el > acc; isMin: when el < acc.
+                    llvm::Value* ordered = isMax
+                        ? builder_.CreateICmpSGT(cmpVal, cmpAcc)
+                        : builder_.CreateICmpSLT(cmpVal, cmpAcc);
+                    builder_.CreateCondBr(
+                        builder_.CreateOr(builder_.CreateNot(inited), ordered),
+                        updBB, nextBB);
+                    builder_.SetInsertPoint(updBB);
+                    builder_.CreateStore(el, accSlot);
+                    builder_.CreateStore(builder_.getTrue(), initSlot);
+                    builder_.CreateBr(nextBB);
+                    builder_.SetInsertPoint(nextBB);
+                    builder_.CreateStore(
+                        builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(endBB);
+                    freeLazyTemp();
+                    freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
+                    return builder_.CreateLoad(elemTy, accSlot, "mm.r");
                 }
                 // fix #2770: a REFERENCE element (class or interface — both
                 // lower to a pointer) for which no comparator could be
