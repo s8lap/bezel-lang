@@ -23104,6 +23104,35 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
         // the caller slot under its own rule; skip.
         if (!arg.modifier.empty()) continue;
         TypeRef* argTy = ctx_.exprType(*arg.value);
+        // fix #8130 (spec §12.3, §26.1, §5.1, §22.6, v0.355): the STATIC
+        // TYPE of a `this` / `base` ARGUMENT — the spelling the resolver
+        // deliberately leaves UNRESOLVED ("Slice 3b: IdentifierExpr name
+        // lookup. `this` / `base` are implicit-meaning identifiers — leave
+        // them unresolved" — ExprTypecheck_Exprs.cpp), so `ctx_.exprType` of
+        // either is null in every ordinary body.
+        //
+        // WITHOUT THE TYPE THE POSITION HAD NO OPINION, and this gate — the
+        // §5.1 admission gate of the `Math` / `Convert` heads (stdlib §2.2 /
+        // §2.3) — stands down for a position with no opinion. So the call
+        // was never refused: `Math.Abs(this)` reached codegen with the
+        // receiver's own BYTES where an `int` was declared, and the compiler
+        // ABORTED inside the LLVM verifier ("Both operands to ICmp
+        // instruction are not of the same type!"), while
+        // `Convert.ToInt32(this)` compiled clean and threw at run time
+        // (exit 70) — the receiver's own bytes read as a `bz.string`
+        // descriptor.
+        //
+        // THE RECOVERY IS §12.3's OWN READING of the receiver (the
+        // ENCLOSING TYPE; the BASE CLASS; §26.1's extension head), and
+        // §5.1's question is asked of it — the SAME question, at the SAME
+        // position, that the local-instance spelling draws. It is a
+        // RECOVERY, not a re-typing: `ctx_.exprType` is unchanged, and the
+        // recovered type is read HERE ONLY.
+        std::optional<TypeRef> recoveredTy;
+        if (!argTy)
+            if (auto rec = admissibleImplicitReceiverType(arg.value.get()))
+                recoveredTy = *rec;
+        if (!argTy && recoveredTy) argTy = &*recoveredTy;
         if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
         // fix #6647 / #7232 (§7, §7.3, v0.343; §22.5, v0.343): the §7
         // nullability gate (#6782) reads a POSITION by the argument's INDEX,
@@ -24851,6 +24880,27 @@ std::optional<TypeRef> ExprTC::implicitReceiverType(const ast::Expr* e) {
     return std::nullopt;
 }
 
+// fix #8130 (spec §12.3, §22.8, §5.1, §22.6, v0.355): the STATIC TYPE of a
+// `this` / `base` ARGUMENT at a built-in call, RECOVERED — but only where the
+// spelling is LEGAL at this position.
+//
+// §12.3: "`this` is not available in a static method or static constructor —
+// it requires an instance receiver". §22.8: "a field initializer may not
+// reference `this` / `base`". At those two positions the compiler already
+// refuses the SPELLING, with its own diagnostic (ExprTypecheck_Exprs.cpp,
+// "Slice 3b"), and the call is refused with it. Recovering a type there
+// would let a SECOND gate speak about a call that has already been refused
+// — two diagnostics for one mistake — so the recovery stands down and the
+// spelling's own error stands alone.
+//
+// Everywhere else the spelling is legal, and the recovery is the §12.3
+// reading of the receiver that `implicitReceiverType` performs.
+std::optional<TypeRef> ExprTC::admissibleImplicitReceiverType(
+    const ast::Expr* e) {
+    if (inStaticMember_ || inFieldInitializer_) return std::nullopt;
+    return implicitReceiverType(e);
+}
+
 // §22.6: is the argument at `p` admissible at a parameter whose DECLARED
 // type is `kind`? `std::nullopt` means "this position is not the admission
 // question" — an untyped argument, a discard, or a `ref`/`out`/`owned`/
@@ -25523,6 +25573,31 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
             if (p >= f.total || !(f.nonNullable & (1u << p)))
                 nonNullable = false;
         TypeRef* argTy = ctx_.exprType(*arg.value);
+        // fix #8130 (spec §12.3, §26.1, §5.1, §22.6, v0.355): the STATIC
+        // TYPE of a `this` / `base` ARGUMENT — the spelling the resolver
+        // deliberately leaves UNRESOLVED ("Slice 3b: IdentifierExpr name
+        // lookup. `this` / `base` are implicit-meaning identifiers — leave
+        // them unresolved" — ExprTypecheck_Exprs.cpp), so `ctx_.exprType` of
+        // either is null in every ordinary body.
+        //
+        // WITHOUT THE TYPE THE POSITION HAD NO OPINION, and this gate — the
+        // §9.6 string-receiver gate — stands down for a position with no
+        // opinion, so the call was never refused: `"abc".StartsWith(this)`
+        // compiled clean and the receiver's OWN BYTES reached the callee
+        // where stdlib §9.6's `StartsWith(value: string): bool` declares a
+        // `string`.
+        //
+        // THE RECOVERY IS §12.3's OWN READING of the receiver (the
+        // ENCLOSING TYPE; the BASE CLASS; §26.1's extension head), and
+        // §5.1's question is asked of it — the SAME question, at the SAME
+        // position, that the local-instance spelling draws. It is a
+        // RECOVERY, not a re-typing: `ctx_.exprType` is unchanged, and the
+        // recovered type is read HERE ONLY.
+        std::optional<TypeRef> recoveredTy;
+        if (!argTy)
+            if (auto rec = admissibleImplicitReceiverType(arg.value.get()))
+                recoveredTy = *rec;
+        if (!argTy && recoveredTy) argTy = &*recoveredTy;
         if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
         // §7.3: the `null` LITERAL reaches a non-nullable parameter nowhere.
         // A nullable position admits it (stdlib §9.6's
@@ -25584,8 +25659,14 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
         }
         bool admitted = false;
         if (scalarKinds) {
-            auto a = builtinArgAdmittedAt(ce, static_cast<std::size_t>(ai),
-                                          scalarKinds, BuiltinDeclaredType::None);
+            // fix #8130 (spec §12.3, §5.1, §22.6, v0.355): the RECOVERED
+            // static type of a `this` / `base` argument is handed to the
+            // shared §5.1 admission test, which reads the argument's STATIC
+            // TYPE — the type the question is asked of.
+            auto a = builtinArgAdmittedAt(
+                ce, static_cast<std::size_t>(ai), scalarKinds,
+                BuiltinDeclaredType::None,
+                recoveredTy ? &*recoveredTy : nullptr);
             if (!a) continue;  // no opinion (a discard, a modifier, an error)
             admitted = *a;
         }

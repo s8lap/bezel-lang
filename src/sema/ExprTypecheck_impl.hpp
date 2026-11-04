@@ -4974,6 +4974,15 @@ private:
     // `string` parameter (stdlib §9.1-§9.5) reaches no candidate at such an
     // argument (§22.6).
     std::optional<TypeRef> implicitReceiverType(const ast::Expr* e);
+    // fix #8130 (spec §12.3, §22.8, §5.1, §22.6, v0.355): the STATIC TYPE
+    // of a `this` / `base` ARGUMENT at a built-in call, recovered — but only
+    // where the SPELLING is legal at this position. In a static member
+    // (§12.3) and in a field initializer (§22.8) the compiler already
+    // refuses the spelling itself, with its own diagnostic; recovering a
+    // type there would let a second gate speak about a call that has
+    // already been refused.
+    std::optional<TypeRef> admissibleImplicitReceiverType(
+        const ast::Expr* e);
     // Is the argument admissible at a parameter whose DECLARED type is
     // `kind`? §5.1's identity and widening, then §5.1's constant narrowing.
     // `kBPTAny` (no type opinion) and `kBPTOut` (an `out` slot) admit
