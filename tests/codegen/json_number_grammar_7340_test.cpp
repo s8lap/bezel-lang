@@ -386,11 +386,14 @@ BEZEL_TEST(json_number_grammar_7340,
     };
     const int rc = bezel::test::runUnderAsanExitCode(
         readProgram("double", kNoDigit), "json-7340-asan");
-    if (rc == -1) return;  // toolchain unavailable: SKIP the leg
-    // 99 = the sanitizer fired (the pre-fix out-of-bounds read) or the
-    // program crashed.  It must NOT fire.
-    BEZEL_EXPECT_TRUE(rc != 99);
-    BEZEL_EXPECT_EQ(rc, wantExit(kNoDigit));
+    // -1 = toolchain unavailable (SKIP the leg; under BEZEL_AOT_FORCE_SANITIZE
+    // the shared helper fails the test instead of returning -1).
+    if (rc != -1) {
+        // 99 = the sanitizer fired (the pre-fix out-of-bounds read) or the
+        // program crashed.  It must NOT fire.
+        BEZEL_EXPECT_TRUE(rc != 99);
+        BEZEL_EXPECT_EQ(rc, wantExit(kNoDigit));
+    }
 }
 
 // The same reads under the GENERATED-CODE ASan/LSan leg: the malformed
