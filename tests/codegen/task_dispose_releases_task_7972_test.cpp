@@ -307,4 +307,20 @@ BEZEL_TEST(task_dispose_releases_task_7972,
     BEZEL_EXPECT_EQ(exp.lastBytes, 12000ull);
     BEZEL_EXPECT_EQ(exp.lastAllocs, 500ull);
     BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // The SPECIFIC diagnostic, not merely "some error": a compile reject, a
+    // crash and a timeout all set hasErrors() too, and every one of them would
+    // satisfy a weaker assertion while proving nothing about leak detection.
+    //
+    // `runAot`'s `ran` is false for FOUR outcomes (issue #3892): a genuine
+    // compile reject, the compiler itself crashing, the program dying from a
+    // runtime signal, and a timeout or a forced-ASan report. The bare
+    // `BEZEL_EXPECT_FALSE(r.ran)` above therefore cannot tell the leak
+    // oracle's abort from any of the other three — and it passes even when
+    // the compiled program SEGFAULTS. These two pins name the REASON the
+    // program did not run: the leak oracle fired on the known leak.
+    BEZEL_EXPECT_TRUE(
+        bezel::test::diagnosticMessageContains(r, "LeakSanitizer fired"));
+    BEZEL_EXPECT_TRUE(
+        bezel::test::diagnosticMessageContains(r, "byte(s) leaked in"));
 }
