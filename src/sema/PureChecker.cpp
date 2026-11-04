@@ -560,9 +560,11 @@ private:
                              const std::string& operation,
                              const std::string& detail);
 
-    // §22.15 throw carve-out: `new E(args)` admitted iff E's invoked ctor
-    // is pure AND E is trivial-dispose. Returns true iff admitted.
-    bool throwCarveOutAdmits(const ast::NewExpr& ne);
+    // §22.15 throw carve-out: `new E(args)` admitted iff (a) E's INVOKED
+    // constructor is `pure`-declared and (b) E is trivial-dispose. Returns
+    // true iff admitted; *why (when non-null) receives the one-clause
+    // explanation of a refusal, for the diagnostic.
+    bool throwCarveOutAdmits(const ast::NewExpr& ne, std::string* why);
 
     // The ONE walk of a `throw` operand, shared by the `ThrowStmt` and the
     // `ThrowExpr` arms (fix-forward #7453): §22.15's carve-out admits `new
@@ -1221,36 +1223,140 @@ bool PureBodyWalker::forSourceAdmitsEnumerator(
     return !isEnumeratorConstructingSource(rt);
 }
 
-bool PureBodyWalker::throwCarveOutAdmits(const ast::NewExpr& ne) {
-    // §22.15 throw carve-out: (a) E's invoked constructor is pure, and
-    // (b) E is trivial-dispose. Slice 2 enforces both.
+// fix #8134 (§31.4, v0.355): §31.4's constructor-purity rule for a BUILT-IN
+// exception type.
+//
+// §31.4, verbatim: "Every built-in exception type's `()` and `(message)`-
+// form constructors (and `ArgumentException`/`ArgumentOutOfRangeException`'s
+// `(message, paramName)` forms) are **`pure`** (§22.15 — the throw-carve-out
+// enablers; all built-ins are trivial-dispose …). The `(message, cause)`
+// chaining constructor is not pure (its snapshot builds a fresh `Array`)."
+//
+// So the invoked constructor's SHAPE decides:
+//
+//   * `()` — the parameterless form — `pure` for every built-in exception;
+//   * `(message: string)` — the one-argument form — `pure` for every
+//     built-in exception;
+//   * two arguments — the `(message, paramName)` form for the two types
+//     §31.4 NAMES (pure), and the `(message, cause)` chaining form for every
+//     other built-in exception (NOT pure);
+//   * any other arity — no such constructor (§31.4's closed constructor
+//     surface), so no `pure` constructor is invoked.
+//
+// THE `()` FORM. §31.4's closing paragraph notes that `new
+// ArgumentException()` is a compile error under §17.7's
+// closed-constructor-surface rule — a SEPARATE defect from this one, and
+// one this lane does not touch. The `()` and `(message)` forms are pure
+// for EVERY built-in exception type here, so the pure-body rule does not
+// change that program's verdict.
+bool builtinExceptionCtorIsPure(std::string_view head, std::size_t arity) {
+    if (arity == 0 || arity == 1) return true;
+    if (arity == 2)
+        return head == "ArgumentException" ||
+               head == "ArgumentOutOfRangeException";
+    return false;
+}
+
+bool PureBodyWalker::throwCarveOutAdmits(const ast::NewExpr& ne,
+                                         std::string* why) {
+    // §22.15 throw carve-out: (a) E's INVOKED constructor is `pure`-declared,
+    // and (b) E is trivial-dispose.
+    //
+    // fix #8134 (§22.15 / §31.4, v0.355): the check now asks about the
+    // INVOKED constructor. It used to ask "does E have a `pure` constructor
+    // SOMEWHERE", which admitted two shapes §22.15's carve-out excludes:
+    //
+    //   * a USER class with a `pure` one-argument constructor AND an impure
+    //     two-argument one: `throw new E("m", cause)` ran the IMPURE
+    //     constructor and was admitted;
+    //   * a BUILT-IN exception's `(message, cause)` chaining constructor,
+    //     which §31.4 states is not pure ("The `(message, cause)` chaining
+    //     constructor is not pure (its snapshot builds a fresh `Array`).").
+    //
+    // WHAT THE SPEC SAYS. §22.15's carve-out, verbatim: "`new E(args)` is
+    // admitted only as the immediate operand of a `throw` statement or
+    // `throw` expression, and only when **(a)** the invoked constructor of
+    // `E` is `pure`-declared — covering, transitively, its chained
+    // constructors and `E`'s field initializers — and **(b)** `E` is a
+    // trivial-dispose class". The subject is the INVOKED constructor.
     if (!ne.type) return false;
     const TypeRef* rt = ctx_.resolvedType(*ne.type);
-    if (!rt || rt->kind != TypeRef::Kind::Named || !rt->declaration) {
-        // Built-in exception types — admitted (§22.15 "Intrinsic purity":
-        // every built-in exception's ()/(message) constructors are pure).
-        // Conservatively admit unknown new-targets at the throw position so
-        // the diagnostic blames the right line; the rule fires elsewhere.
+    if (!rt || rt->kind != TypeRef::Kind::Named) {
+        // An unresolved target: the typecheck pass owns that diagnostic.
+        // Conservatively admit here so the rule does not double-report.
         return true;
+    }
+    if (!rt->declaration) {
+        // A BUILT-IN class — it carries no AST declaration and no artifact,
+        // so §22.15's "Intrinsic purity (the stdlib contract)" makes the
+        // LIBRARY'S OWN marker the authority (§31.4).
+        const std::string_view head = rt->headName();
+        if (!common::isBuiltinExceptionName(head)) {
+            // Not an exception at all: §31.1's "the thrown value must be an
+            // exception" owns this construction. Admit here so the
+            // diagnostic blames the right line.
+            return true;
+        }
+        if (builtinExceptionCtorIsPure(head, ne.args.size())) return true;
+        if (why) {
+            *why = std::string("the invoked constructor of `") +
+                   std::string(head) +
+                   "` is not `pure`-declared — §31.4 marks only the `()` and "
+                   "`(message)` forms pure (and `ArgumentException`/"
+                   "`ArgumentOutOfRangeException`'s `(message, paramName)` "
+                   "form); ";
+            if (ne.args.size() == 2)
+                *why +=
+                    "the `(message, cause)` chaining constructor is not pure";
+            else
+                *why += "no `pure` constructor of that arity exists";
+        }
+        return false;
     }
     TypeSymbol* targetDecl = rt->declaration;
     if (targetDecl->kind != ast::TypeDeclKind::Class) return false;
     // fix #3647: pass the resolved TypeRef `rt` itself (not just its
     // declaration `targetDecl`), so §3.6 rule 2's per-instantiation
     // substitution can run.
-    if (!isTrivialDisposeClass(rt)) return false;
-    // (a) the invoked constructor must be pure. For a `new E(args)` form
-    // the constructor is resolved by the typecheck pass; we look it up by
-    // walking targetDecl's constructors and matching arity. Slice 2 admits
-    // conservatively when no pure ctor is provable (the diagnostic still
-    // names the rule). A pure ctor present anywhere on the chain admits.
-    for (Symbol* m : targetDecl->members) {
-        auto* cs = dynamic_cast<ConstructorSymbol*>(m);
-        if (!cs) continue;
-        // fix #3174 (§22.15, v0.254): through the one predicate — same three
-        // sources in the same order this loop already spelled inline.
-        if (constructorIsPure(cs)) return true;
+    if (!isTrivialDisposeClass(rt)) {
+        if (why)
+            *why = "`" + std::string(targetDecl->name) +
+                   "` is not a trivial-dispose class — §22.15's throw "
+                   "carve-out requires one (the after-arm disposal must "
+                   "run no user code)";
+        return false;
     }
+    // (a) the INVOKED constructor must be pure.
+    //
+    // The typecheck pass already SELECTS the constructor the call invokes
+    // and publishes it — `SemaContext::resolvedNewCtor`, the #4853 table
+    // keyed on the `NewExpr`'s argument list (`ExprTC::checkNewExprArgs`
+    // publishes the single bound candidate, the §22.6 winner of an
+    // overloaded set, and the imported twin). That is the authoritative
+    // answer, so it is read first; the arity match over E's constructors is
+    // the fallback for a selection the pass did not publish.
+    //
+    // A class with NO resolvable constructor of the call's shape (an
+    // implicit default constructor, a primary constructor, an ambiguous
+    // overload set) has no pure constructor the carve-out can point at, so
+    // the carve-out does not admit it — the same verdict the pre-#8134
+    // "no pure ctor on the class" answer gave.
+    const ConstructorSymbol* invoked = ctx_.resolvedNewCtor(&ne.args);
+    if (!invoked) invoked = findUserCtorByArity(targetDecl, ne.args.size());
+    if (!invoked) {
+        if (why)
+            *why = "the invoked constructor of `" +
+                   std::string(targetDecl->name) +
+                   "` could not be identified, so no `pure` constructor is "
+                   "provable for it";
+        return false;
+    }
+    // fix #3174 (§22.15, v0.254): through the one predicate — the same
+    // both-sources purity predicate the CallExpr arm uses.
+    if (constructorIsPure(invoked)) return true;
+    if (why)
+        *why = "the invoked constructor of `" + std::string(targetDecl->name) +
+               "` is not `pure`-declared";
     return false;
 }
 
@@ -1261,11 +1367,14 @@ void PureBodyWalker::checkThrowOperand(const ast::Expr* operand,
     // pure ctor. Any other throw operand is admitted (bare re-raise, a
     // caught binding read).
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(operand)) {
-        if (!throwCarveOutAdmits(*ne)) {
-            reportPureViolation(
-                throwLoc, "class construction at `throw`",
+        std::string why;
+        if (!throwCarveOutAdmits(*ne, &why)) {
+            std::string detail =
                 "the throw carve-out admits only `new E(...)` with a pure "
-                "constructor of a trivial-dispose class");
+                "constructor of a trivial-dispose class";
+            if (!why.empty()) detail += " — " + why;
+            reportPureViolation(throwLoc, "class construction at `throw`",
+                                detail);
         }
         // The new-expression's args still need to be checked.
         for (const auto& a : ne->args)

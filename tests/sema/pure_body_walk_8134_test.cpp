@@ -111,6 +111,10 @@ constexpr const char* kUserImpureCall =
 // not mark `pure`.
 constexpr const char* kStdlibImpureCall =
     "the standard library does not declare `Console.ReadLine` pure";
+// §22.15's throw carve-out's own diagnostic.
+constexpr const char* kCarveOut =
+    "class construction at `throw` is not admitted in a pure body";
+
 }  // namespace
 
 // =========================================================================
@@ -356,3 +360,163 @@ BEZEL_TEST(pure_body_walk_8134,
         kUserImpureCall));
 }
 
+// =========================================================================
+// ITEM 3 — the throw carve-out checks WHICH constructor runs
+// (§22.15's carve-out / §31.4).
+// =========================================================================
+
+// §31.4: "The `(message, cause)` chaining constructor is not pure (its
+// snapshot builds a fresh `Array`)." §22.15's carve-out admits `new E(...)`
+// "only when **(a)** the invoked constructor of `E` is `pure`-declared", so
+// the built-in `(message, cause)` construction is NOT admitted at the throw
+// operand of a pure body.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_builtin_exception_cause_constructor_rejected_spec_31_4) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(cause: Exception): string\n"
+        "    throw new Exception(\"boom\", cause);\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(r, kCarveOut);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) {
+        BEZEL_EXPECT_TRUE(d->location.line == 4u);
+        // The diagnostic names §31.4's rule — the constructor's own marker.
+        BEZEL_EXPECT_TRUE(d->message.find("\xC2\xA7""31.4") !=
+                           std::string::npos);
+    }
+}
+
+// The USER-CLASS twin: a class with a `pure` one-argument constructor AND
+// an impure two-argument one. The carve-out used to admit the construction
+// because the class had a `pure` constructor SOMEWHERE; the invoked
+// constructor is the impure one, so it is rejected.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_user_exception_impure_constructor_rejected_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "public class MyError: Exception\n"
+        "  public pure constructor(message: string) base(message); end "
+        "constructor;\n"
+        "  public constructor(message: string, cause: Exception) base(message, "
+        "cause); end constructor;\n"
+        "end MyError;\n"
+        "class C\n"
+        "  public static pure method F(cause: Exception): string\n"
+        "    throw new MyError(\"boom\", cause);\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(r, kCarveOut);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) {
+        BEZEL_EXPECT_TRUE(d->location.line == 8u);
+        // The diagnostic names the INVOKED constructor's owner.
+        BEZEL_EXPECT_TRUE(d->message.find("MyError") != std::string::npos);
+    }
+}
+
+// The ADMIT control for the built-in `(message)` form — §31.4 marks it
+// `pure`, so the carve-out admits it.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_builtin_exception_message_constructor_admitted_spec_31_4) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(): string\n"
+        "    throw new Exception(\"boom\");\n"
+        "  end F;\n"
+        "end C;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The ADMIT control for the built-in `()` form — §31.4 marks it `pure` too.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_builtin_exception_empty_constructor_admitted_spec_31_4) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(): string\n"
+        "    throw new Exception();\n"
+        "  end F;\n"
+        "end C;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The ADMIT control for §31.4's OTHER pure two-argument form:
+// `ArgumentException`'s `(message, paramName)`. This is the control that
+// shows the two-argument position is not rejected wholesale — the CONSTRUCTOR
+// decides, not the arity.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_argument_exception_param_name_constructor_admitted_spec_31_4) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(): string\n"
+        "    throw new ArgumentException(\"boom\", \"param\");\n"
+        "  end F;\n"
+        "end C;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The ADMIT control for the USER class: the `pure` one-argument constructor
+// is the one invoked, so the carve-out admits it.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_user_exception_pure_constructor_admitted_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "public class MyError: Exception\n"
+        "  public pure constructor(message: string) base(message); end "
+        "constructor;\n"
+        "  public constructor(message: string, cause: Exception) base(message, "
+        "cause); end constructor;\n"
+        "end MyError;\n"
+        "class C\n"
+        "  public static pure method F(): string\n"
+        "    throw new MyError(\"boom\");\n"
+        "  end F;\n"
+        "end C;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The AOT arm of item 3: the real driver refuses the program.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_builtin_exception_cause_constructor_rejected_by_driver_spec_31_4) {
+    BEZEL_EXPECT_TRUE(aotRejectsWith(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(cause: Exception): string\n"
+        "    throw new Exception(\"boom\", cause);\n"
+        "  end F;\n"
+        "end C;\n"
+        "class Program\n"
+        "  public static method Main(): int\n"
+        "    Console.WriteLine(C.F(new Exception(\"inner\")));\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n",
+        kCarveOut));
+}
+
+// The AOT ADMIT arm of item 3: the carve-out's ADMITTED form compiles,
+// LINKS and RUNS — the throw is caught, and the program exits 0.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_builtin_exception_message_constructor_runs_spec_31_4) {
+    BEZEL_EXPECT_TRUE(aotRunsWithExitZero(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(): string\n"
+        "    throw new Exception(\"boom\");\n"
+        "  end F;\n"
+        "end C;\n"
+        "class Program\n"
+        "  public static method Main(): int\n"
+        "    try\n"
+        "      C.F();\n"
+        "    catch var e: Exception => Console.WriteLine(e.Message);\n"
+        "    end;\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n"));
+}
