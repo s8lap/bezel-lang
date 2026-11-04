@@ -16,16 +16,27 @@ a different way — see *Why the rule changed* below.
 **The heartbeat STATUSES and then REKINDLES. A partial pool is a REFILL, not a
 report-and-stop.**
 
-1. Run `scripts/run_status.sh --staging <staging-wt> --claims <claims.tsv> --pool 5` and
+1. Run `scripts/run_status.sh --staging <staging-wt> --claims <claims.tsv> --pool 7` and
    report the table (gate, jobserver, builders, memory, disk, staging, lanes, pool, stale).
-2. **If the `pool` row reads fewer than 5 live lanes, DISPATCH lanes in the SAME turn to
-   fill every empty slot.** **The pool target is 5** (owner directive 2026-11-02 ~23:55 set
+2. **If the `pool` row reads fewer than 7 live lanes, DISPATCH lanes in the SAME turn to
+   fill every empty slot.** **The pool target is 7** (owner directive 2026-11-02 ~23:55 set
    it at 7; the owner's directive of 2026-11-03 ~23:05 — *"reduce the pool to 5 agents.
    record this durably"* — **LOWERED IT TO 5**, because the coordinator over-launched the
-   pool to 16–17 lanes, the box ran out of build budget, and **every lane died at once**).
-   `CLAUDE.md`'s *Pools* bullet says 5. The `pool` row counts the DISTINCT lanes holding a
-   live claim in the claims file. **A lane that dies counts as a slot that freed** — refill
-   it in that same turn, do not wait for the next heartbeat.
+   pool to 16–17 lanes, the box ran out of build budget, and **every lane died at once**;
+   **⇒ ⇒ ⇒ AND THE OWNER'S DIRECTIVE OF 2026-11-04 ~13:55 — *"Raise the pool to 7,
+   review-weighted"* — RAISED IT BACK TO 7, because the box was then measured at ~20 % CPU
+   with 19–20 of 20 jobserver tokens FREE and 6 GB of 31 GB RAM used: the limit had never
+   been CPU/RAM/DISK, and the real bottleneck was the REVIEW QUEUE**). **⇒ ⇒ ⇒ ⇒ AT 7 LANES
+   THE POOL IS WEIGHTED TOWARD REVIEW — a producer only deepens the queue a reviewer must
+   drain — AND A MARGINAL REVIEWER LANE HAS NOTHING TO REVIEW (every R35/R38 lane branch is
+   already in `origin/main` by patch-id), so a marginal lane's work is ISSUE VERIFICATION:
+   reproduce an OPEN issue on the shipping tree and return a DISPOSITION (still reproduces /
+   already fixed / the repro is wrong / it needs an owner ruling).** **⇒ WHAT DID NOT CHANGE:
+   at most TWO lanes cold-build `--area codegen` at once; every lane brief carries the build
+   gate (`available` ≥ 6, then `-j 4`, never `-j 20`); dispatch in PAIRS WITH A STAGGER, never
+   the whole pool in one burst.** `CLAUDE.md`'s *Pools* bullet says 7. The `pool` row counts
+   the DISTINCT lanes holding a live claim in the claims file. **A lane that dies counts as a
+   slot that freed** — refill it in that same turn, do not wait for the next heartbeat.
 3. **PICK landed commits.** If a lane has delivered a commit and a NON-AUTHOR review has
    recorded a verdict, pick it onto the staging branch with `scripts/pick_stage.sh`. Never
    pick a commit whose review says REJECT. A `narrow` commit is recorded with kind `fix`
@@ -132,7 +143,7 @@ session restart** — the schedule lives in the orchestrator's server, not in th
 HEARTBEAT for the R38 campaign run. STATUS CHECK, THEN REKINDLE THE POOL.
 
 1. Run: scripts/run_status.sh --staging /mnt/fast/worktrees/r28-staging --claims /var/tmp/bezel-scratch/r38-coord/claims.tsv --pool 5
-2. Report the table (gate, jobserver, builders, memory, disk, staging, lanes, pool, stale). The pool target is 5 lanes (owner directive 2026-11-02 ~23:55 set it at 7; the owner's directive of 2026-11-03 ~23:05 LOWERED IT TO 5 — "reduce the pool to 5 agents. record this durably" — because the pool had been over-launched to 16-17 lanes and the box ran out of build budget; the standing rule in CLAUDE.md is 5). The `pool` row counts the DISTINCT lanes holding a live claim in the claims file, FLAGs a PARTIAL pool, and reads INFO for a drained one. The `builders` row carries a 5-second window as well as the instantaneous verdict, so a CLEAN instant next to a busy window means the box is building, not idle.
+2. Report the table (gate, jobserver, builders, memory, disk, staging, lanes, pool, stale). The pool target is 7 lanes (owner directive 2026-11-02 ~23:55 set it at 7; the owner's directive of 2026-11-03 ~23:05 LOWERED IT TO 5 — "reduce the pool to 5 agents. record this durably" — because the pool had been over-launched to 16-17 lanes and the box ran out of build budget; the standing rule in CLAUDE.md is 5). The `pool` row counts the DISTINCT lanes holding a live claim in the claims file, FLAGs a PARTIAL pool, and reads INFO for a drained one. The `builders` row carries a 5-second window as well as the instantaneous verdict, so a CLEAN instant next to a busy window means the box is building, not idle.
 3. REKINDLE THE POOL TO 5 (owner directive 2026-11-03 ~23:05). If the pool row reads fewer than 5 live lanes, DISPATCH lanes IN THE SAME TURN to fill every empty slot. A PARTIAL POOL IS A REFILL, NOT A REPORT-AND-STOP. A lane that dies counts as a slot that freed; refill it in the same turn. Keep lanes file-disjoint (no two on the same hot dispatch function: typeCall, lowerBinary, the tryLower*Call family). At most TWO lanes may cold-build --area codegen at once; the rest queue behind them. Append each new lane to /var/tmp/bezel-scratch/r38-coord/claims.tsv (issue, lane, branch, worktree, hot_files, start, status; status is the LAST field) BEFORE dispatching it.
 4. PICK LANDED COMMITS. If a lane has delivered a commit and a NON-AUTHOR review has recorded a verdict, pick it onto the staging branch: scripts/pick_stage.sh --branch r30-c1 --pool r38 --lane <branch> --reviewer <rev> --verdict ACCEPT|ACCEPT-W-NOTES --kind fix|test<sha>. A `narrow` commit is recorded with kind `fix` but its issue stays OPEN on GitHub. Never pick a commit whose review says REJECT.
 5. DO NOT launch a gate. DO NOT push to origin — the one gate near the end of the run is a separate, deliberate act. DO NOT edit source in the staging worktree.

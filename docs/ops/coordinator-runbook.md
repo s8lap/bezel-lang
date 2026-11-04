@@ -1092,6 +1092,10 @@ FROM THE COORDINATOR KILLING THEM.** ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ **AND T
 **Owner directive, 2026-11-03 ~23:05: *"reduce the pool to 5 agents. record this durably.
 now that you've been launching them effectively, we ran out temporarily. now it's good."***
 
+**⇒ ⚠ ⇒ ⚠ SUPERSEDED IN PART BY THE OWNER DIRECTIVE OF 2026-11-04 ~13:55: *"Raise the pool to
+7, review-weighted."* — SEE *THE POOL TARGET IS 7* BELOW. THE 5-LANE RULE IS NOT DEAD; IT IS
+NARROWED TO THE RULE THAT ACTUALLY MATTERS (TWO CONCURRENT COLD BUILDS, STAGGERED DISPATCH).**
+
 **⇒ MEASURED, THE SAME EVENING: the coordinator over-launched the R38 pool to SIXTEEN and then
 SEVENTEEN live lanes (each a separate `opencode run` process with its OWN build tree on the
 NVMe), the box ran out of build budget — `available=0 held=20`, dozens of builder processes,
@@ -1113,6 +1117,47 @@ verdicts to pick — **⇒ A DEAD LANE COSTS A SLOT, NOT ITS WORK.**
 [`docs/ops/heartbeat.md`](docs/ops/heartbeat.md).** A heartbeat is a session artifact and
 dies with the session, so that file is what makes the next run inherit the new behaviour.
 
+
+### THE POOL TARGET IS **7**, REVIEW-WEIGHTED — (owner directive 2026-11-04 ~13:55)
+
+**Owner directive, 2026-11-04 ~13:55, in answer to a measured report that the box was
+running at ~20 % CPU: *"Raise the pool to 7, review-weighted."***
+
+**⇒ THE 2026-11-03 "reduce the pool to 5" WAS OVER-CORRECTION, NOT A HARD CEILING.** What
+actually failed that evening was the **BUILD BUDGET** — sixteen and seventeen lanes each
+cold-building their own tree — not the lane count as such. The rule that survives is the
+concurrent-cold-build cap, not the pool size.
+
+**⇒ MEASURED, 2026-11-04 13:51, at a 5-lane pool:**
+
+| resource | reading |
+|---|---|
+| CPU | us+sy ≈ **19–20 %** (~4 of 20 cores), idle ~50 %, **wa 32–41 %**, runnable 0–2, blocked 9–12 |
+| load | 25.8 — inflated by D-state, not by runnable work |
+| memory | **6 GB of 31 GB used** |
+| disk | 63 %, 85 GB free |
+| jobserver | **19–20 of 20 tokens FREE**, 0 builds |
+
+**⇒ ⇒ ⇒ THE BOTTLENECK WAS THE REVIEW QUEUE, NOT PRODUCTION.** Eight commits were awaiting a
+verdict against four reviewer lanes, and one verdict costs **1.5–3.5 h** (a cold build, then
+the whole `codegen` area at 22,900 rows, the whole `sema` area at 9,500, and the lit track).
+⇒ **⇒ ⇒ ⇒ AT 7 LANES, WEIGHT TOWARD REVIEW:** a producer only deepens the queue a reviewer
+must drain, so a marginal lane should be READ-ONLY (a reviewer, or an issue-verifier).
+
+**⇒ ⇒ ⇒ ⇒ AND A MARGINAL REVIEWER LANE NEEDS SOMETHING TO REVIEW — WHICH NO LONGER EXISTS.**
+Measured 2026-11-04 13:5x: `git cherry origin/main` over EVERY branch in the repo returns
+**no** `fix #` / `narrow #` commit outside `origin/main` — every R35 and R38 lane branch is
+already pushed, by patch-id. ⇒ A marginal lane's work must therefore be **VERIFICATION**:
+reproduce an OPEN issue on the shipping tree and return a **DISPOSITION** —
+*still reproduces* (a fix candidate, with the file:line of the defect and the smallest
+plausible fix site) / *already fixed* (a hand-close candidate, with the fixing commit found
+by `git log -S`) / *the repro is wrong* (close as stale) / *the rule needs an owner ruling*
+(a spec-question, with the two readings quoted).
+
+**⇒ ⇒ ⇒ ⇒ ⇒ WHAT DID NOT CHANGE:** at most **two** lanes cold-build `--area codegen` at
+once; every lane brief carries the build gate (`available` ≥ 6, then `-j 4`, never `-j 20`);
+the coordinator dispatches in **pairs with a stagger**, never the whole pool in one burst; a
+lane that waits is alive; a lane that dies delivers nothing.
 
 ### Gate protocol
 
