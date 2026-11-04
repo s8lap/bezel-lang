@@ -493,3 +493,39 @@ BEZEL_TEST(record_receiver_store_incr_nested_8100,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("5\n"));
 }
+
+// fix-forward #8100: a `static readonly` RECORD-typed member used as the
+// BARE chain base (`S.X := 5`, `S.X++` in a record method body). §9.4
+// (v0.355): "The receiver's own storage is what an lvalue chain rooted at
+// `this` reaches without leaving the value" — a static is not reached through
+// `this`, so the store lands in the static's storage and is legal. The first
+// cut tested `static` only on intermediate hops and refused both statements
+// with the §9.4 text; the class twin of the same body printed 6 throughout.
+BEZEL_TEST(record_receiver_store_incr_nested_8100,
+           static_readonly_record_base_store_and_incr_accepted_spec_9_4) {
+    auto r = runAot(
+        "module Conf; "
+        "public record Inner "
+        "  public property X: int; "
+        "  public constructor(x: int) "
+        "    X := x; "
+        "  end constructor; "
+        "end Inner; "
+        "public record Outer "
+        "  public static readonly S: Inner := new Inner(0); "
+        "  public property N: int; "
+        "  public constructor(n: int) "
+        "    N := n; "
+        "  end constructor; "
+        "  public method M() S.X := 5; end M; "
+        "  public method P() S.X++; end P; "
+        "end Outer; "
+        "public class Program "
+        "  public static method Main() "
+        "    var o := new Outer(1); o.M(); o.P(); "
+        "    Console.WriteLine(Outer.S.X); "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("6\n"));
+}

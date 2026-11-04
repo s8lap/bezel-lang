@@ -10373,6 +10373,13 @@ static bool receiverChainStaysInsideValue(SemaContext& ctx,
             } else if (!dynamic_cast<FieldSymbol*>(bs)) {
                 return false;
             }
+            // A static member is not reached through `this` (§9.4), so a
+            // chain based on one (`S.X := e` on a `static readonly` record
+            // member) lands in the static's storage, not the receiver's
+            // (fix-forward #8100).
+            if (auto* mem = dynamic_cast<MemberSymbol*>(bs))
+                for (std::string_view mod : mem->modifiers)
+                    if (mod == "static") return false;
             curTy = ctx.exprType(*id);
             if (memberTypeLeavesReceiverValue(curTy)) return false;
         }
@@ -10501,18 +10508,6 @@ bool ExprTC::checkRecordReceiverStore(const ast::Expr& target,
     if (auto* ms = dynamic_cast<MemberSymbol*>(sym))
         for (std::string_view mod : ms->modifiers)
             if (mod == "static") return false;
-
-    // Walk the chain for class/interface-typed hops BEFORE the terminal
-    // member. Such a hop has left the receiver and the store lands in the
-    // borrowed heap object (§9.4: "chains that hop through a class- or
-    // interface-typed member leave the receiver ... legal"). The terminal
-    // member is `sym` above; we walk up its chain collecting intermediates
-    // up to the `this` base. The cases this fix ships with land on direct
-    // record members (no intermediate hop), so the hop-walk is a no-op on
-    // the in-scope corpus; the §9.4 mediating shape (`Span<T>` storing into
-    // its borrowed `OwningBuffer<T>`) is covered by a future extension
-    // that resolves intermediate hops through `ctx_.resolvedType`.
-    (void)target;  // hop-walk intentionally elided for the in-scope cases
 
     // Build a verb that matches the spec language for the offending op.
     std::string verb;
