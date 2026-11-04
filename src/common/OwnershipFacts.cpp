@@ -2043,6 +2043,19 @@ bool payloadFieldTypeIsBorrowCarrying(
                     return payloadFieldTypeIsBorrowCarrying(sub.ty, ctx,
                                                             choiceSeen, sub.env,
                                                             memo);
+                // §35.4 rule 3 (v0.355, #7845): a `DateTime` / `TimeSpan` /
+                // `DateOnly` / `TimeOnly` / `Guid` payload is a value (stdlib
+                // §2.5: records of value fields). Those names keep
+                // `declaration == nullptr` after resolution, so they reached
+                // the bare-parameter conservative `true` below. A type
+                // parameter of that name is resolved by the env above.
+                {
+                    const std::string_view n = ft->headName();
+                    if (ft->genericArgs.empty() &&
+                        (n == "DateTime" || n == "TimeSpan" ||
+                         n == "DateOnly" || n == "TimeOnly" || n == "Guid"))
+                        return false;
+                }
                 return true;  // uninstantiated / still-generic bare param
             }
             if (ft->declaration->isValueBuiltin) return false;
