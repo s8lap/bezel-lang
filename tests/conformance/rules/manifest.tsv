@@ -3474,7 +3474,7 @@ s30_3_0030	spec	30.3	reject	program	Calling Result without a call-through-proper
 s30_3_0031	spec	30.3	run	program	A parenthesised Task result of function type is callable	whose callee is a function-typed value — a parameter, local, field, or property of function type, or any expression of one	27.1, 27.7, 30.3	7	7971			
 s30_3_0032	spec	30.3	run	program	A Task result of function type takes its positional argument	whose callee is a function-typed value — a parameter, local, field, or property of function type, or any expression of one	27.1, 27.7, 30.3	42	7971			
 s30_3_0033	spec	30.3	run	program	A type alias of a function type makes Task result callable	whose callee is a function-typed value — a parameter, local, field, or property of function type, or any expression of one	27.1, 27.8, 30.3	7	7971			
-s30_3_0034	spec	30.3	run	program	An alias of Task of a function type keeps Result callable	whose callee is a function-typed value — a parameter, local, field, or property of function type, or any expression of one	27.8, 30.3	7	7971			
+s30_3_0034	spec	30.3	run	program	An alias of Task of a function type keeps Result callable	whose callee is a function-typed value — a parameter, local, field, or property of function type, or any expression of one	27.1, 27.8, 30.3	7	7971			
 s30_3_0035	spec	30.3	reject	program	An alias of Task of int does not make Result callable	public readonly property Result: T;	27.8, 30.3	is a property of	7971			
 s30_3_0036	spec	30.3	reject	program	Result of a type-parameter-typed Task is not callable	public readonly property Result: T;	30.3, 27.1	is a property of	7971			
 s30_3_0037	spec	30.3	reject	program	Calling Task.IsFaulted as a method is rejected	public readonly property IsFaulted: bool;	30.3, 26.5	is a property of	7971			

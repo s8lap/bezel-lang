@@ -4,7 +4,7 @@
 //! title: An alias of Task of a function type keeps Result callable
 //! rule: whose callee is a function-typed value — a parameter, local, field, or
 //!   property of function type, or any expression of one
-//! cites: 27.8, 30.3
+//! cites: 27.1, 27.8, 30.3
 //! expect: run
 //! stdout: 7
 //! issue: 7971
