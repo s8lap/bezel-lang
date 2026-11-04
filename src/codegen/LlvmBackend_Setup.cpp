@@ -6842,6 +6842,25 @@ llvm::GlobalVariable* Emitter::descriptorForPatternName(
     // function #4050/#4051 introduced — so this site shares its
     // alias-to-TypeSymbol lookup with sema and the sibling codegen sites
     // rather than hand-rolling another copy.
+    // fix #8044 (§2.2 / §8.1 / §14.1, v0.353): a BARE pattern name fixes
+    // arity 0 (a pattern carries no type-argument list — grammar A.7 has no
+    // type arguments in a pattern — and §14.1: "the bare `Box` fixes arity
+    // 0"), and §2.2's arity SELECTION picks the arity-0 candidate among the
+    // types of that name: "a reference resolves to the first, in that rule's
+    // order, whose arity its type-argument list fixes". The root `Object`
+    // (arity 0) and a user's generic `Object<T>` (arity 1) are TWO names —
+    // §8.1: "a generic `Object<T>` is a different name (§2.2)" — so a user's
+    // generic must NOT take the bare `Object` pattern; the root's descriptor
+    // (the one `builtinDesc_` holds) is the candidate the bare `Object`
+    // selects, and the caller's root-`Object` test (#6952) applies.
+    //
+    // The selection spans ALL the candidate sets, in §2.7 rule 1's order
+    // (the local module's declarations, then the imported ones, then the
+    // §2.3 always-available built-ins): an arity>0 candidate is remembered
+    // but NOT returned while an arity-0 candidate is still to be found, and
+    // it is returned only when NO arity-0 candidate exists at all (the
+    // pre-#8044 behavior for a name whose only candidate is generic).
+    llvm::GlobalVariable* genericFallback = nullptr;
     auto considerSym = [&](const sema::Symbol* s) -> llvm::GlobalVariable* {
         if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(s)) {
             if (ts->name != last) return nullptr;
@@ -6849,8 +6868,12 @@ llvm::GlobalVariable* Emitter::descriptorForPatternName(
                 ts->kind != ast::TypeDeclKind::Interface)
                 return nullptr;  // record/enum name — not a reference type test
             auto it = descArray_.find(ts);
-            if (it != descArray_.end()) return it->second;
-            return nullptr;
+            if (it == descArray_.end()) return nullptr;
+            if (!ts->genericParams.empty()) {
+                if (!genericFallback) genericFallback = it->second;
+                return nullptr;  // arity > 0 — not a bare name's candidate
+            }
+            return it->second;
         }
         if (auto* aliasSym = dynamic_cast<const sema::TypeAliasSymbol*>(s)) {
             if (aliasSym->name != last) return nullptr;
@@ -6861,7 +6884,15 @@ llvm::GlobalVariable* Emitter::descriptorForPatternName(
                 aliasedTs->kind != ast::TypeDeclKind::Interface)
                 return nullptr;  // record/enum alias — handled by the loop below
             auto it = descArray_.find(aliasedTs);
-            if (it != descArray_.end()) return it->second;
+            if (it == descArray_.end()) return nullptr;
+            // A GENERIC alias's arity is its own (§14.1 / §27.8), so a bare
+            // pattern name does not select it — the same §2.2 arity rule the
+            // generic-class arm above applies.
+            if (!aliasSym->genericParams.empty()) {
+                if (!genericFallback) genericFallback = it->second;
+                return nullptr;
+            }
+            return it->second;
         }
         return nullptr;
     };
@@ -6886,7 +6917,9 @@ llvm::GlobalVariable* Emitter::descriptorForPatternName(
         auto vit = primBoxDesc_.find(vb);
         if (vit != primBoxDesc_.end()) return vit->second;
     }
-    return nullptr;
+    // No arity-0 candidate anywhere: the generic candidate keeps the pattern
+    // (the pre-#8044 behavior).
+    return genericFallback;
 }
 
 

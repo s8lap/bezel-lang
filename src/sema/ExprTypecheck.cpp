@@ -4383,12 +4383,44 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
     //     built-in type. Mirrors codegen's descriptorForPatternName /
     //     record-enum / built-in-descriptor resolution.  §19.3 "Type patterns
     //     without binding: `string`, `int`, `Dog`".
-    const TypeSymbol* foundTs = nullptr;
+    const TypeSymbol* foundTs = nullptr;    // the arity-0 candidate
+    const TypeSymbol* genericTs = nullptr;  // the first arity>0 candidate
     for (const auto& sym : ctx_.symbols()) {
-        if (auto* ts = dynamic_cast<const TypeSymbol*>(sym.get())) {
-            if (ts->name == last) { foundTs = ts; break; }
-        }
+        auto* ts = dynamic_cast<const TypeSymbol*>(sym.get());
+        if (!ts || ts->name != last) continue;
+        if (ts->genericParams.empty()) { foundTs = ts; break; }
+        if (!genericTs) genericTs = ts;
     }
+    // fix #8044 (§2.2 / §8.1 / §14.1, v0.353): the pattern's name is BARE —
+    // a pattern carries no type-argument list (grammar A.7 has no type
+    // arguments in a pattern), so it fixes arity 0 (§14.1: "the bare `Box`
+    // fixes arity 0"), and §2.2's arity SELECTION picks the arity-0
+    // candidate among the types of that name: "a reference resolves to the
+    // first, in that rule's order, whose arity its type-argument list
+    // fixes". The root `Object` (arity 0) and a user's generic `Object<T>`
+    // (arity 1) are TWO names — §8.1: "a generic `Object<T>` is a different
+    // name (§2.2)" — so the user's generic must NOT take the bare `Object`
+    // pattern; the root does, and the pattern is the root's type test.
+    //
+    // The candidate scan therefore does NOT stop at the first name match: it
+    // keeps looking for an arity-0 candidate (§2.2's selection), and the
+    // arity>0 candidate is kept only as the fallback for a name with no
+    // arity-0 candidate at all (the pre-#8044 behavior — a bare generic
+    // name's own arity diagnostic at the pattern position is NOT part of
+    // this fix).
+    //
+    // The §2.3 always-available names are candidates of this resolution too,
+    // and their arity is what §2.2 compares names by: the root `Object` is
+    // arity 0, so it is the candidate a BARE `Object` selects. The check
+    // below is asked only of the names the built-in branch (the arm after
+    // the alias arm) can resolve — a static class of the always-available
+    // set (`Math`, `Console`, …) is not a type, so a bare pattern of that
+    // name is not the always-available one.
+    const bool alwaysAvailableArityZero =
+        Resolver::alwaysAvailableTypeArity(last) == 0 &&
+        (isBuiltinTypeName(last) || last == "string" || last == "Object" ||
+         common::isBuiltinExceptionName(last));
+    if (!foundTs && !alwaysAvailableArityZero) foundTs = genericTs;
     if (foundTs) {
         // §19.3 (v0.311, #5188): bare-form twin of the typed-binding
         // predicate at the arm-loop site (CaseExpr / CaseStmt). Once
@@ -4443,6 +4475,20 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
     for (const auto& sym : ctx_.symbols()) {
         if (auto* ta = dynamic_cast<const TypeAliasSymbol*>(sym.get())) {
             if (ta->name == last) {
+                // fix #8044 (§2.2 / §14.1 / §27.8, v0.353): a GENERIC alias
+                // (arity > 0 — §14.1: "the same holds for a generic type
+                // alias") is not the candidate a BARE pattern name selects:
+                // §2.2's arity rule picks the arity-0 candidate, and a
+                // generic alias's arity is its own (§27.8's alias
+                // transparency does not change it). When an arity-0
+                // always-available candidate of that name exists (the root
+                // `Object` among them), the alias does not take the
+                // pattern; the alias arm below is skipped and the built-in
+                // arm — the arity-0 candidate — applies. With no such
+                // candidate, the alias keeps the pattern (the pre-#8044
+                // behavior).
+                if (alwaysAvailableArityZero && !ta->genericParams.empty())
+                    continue;
                 // A type-alias pattern (`type Foo := Bar; case c of Foo => …`)
                 // — the alias is transparent at pattern position (§19.3, the
                 // alias desugars to its underlying type for the type test).
