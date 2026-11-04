@@ -196,7 +196,7 @@ const char* kRecordReadWriteVsReadWriteAccepted =
     "public interface IHas "
     "  property Val: int; "
     "end IHas; "
-    "public record R : IHas "
+    "public class R : IHas "
     "  private _v: int := 0; "
     "  public property Val: int "
     "    get => do return _v; end; "

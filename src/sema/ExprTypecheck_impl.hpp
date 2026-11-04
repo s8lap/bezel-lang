@@ -751,6 +751,9 @@ private:
     // IdentifierExpr handling can diagnose `this`/`base` in static
     // member bodies.
     bool inStaticMember_ = false;
+    // fix #8089 (§9.4): the instance PropertyDecl whose accessor body is being
+    // visited, else null.
+    const ast::PropertyDecl* currentAccessorProp_ = nullptr;
     // fix #XXXX (§22.5, v0.334): true while visiting a default-value
     // expression. `lookupName` checks this to reject instance state
     // (instance fields, instance properties) in defaults — a default

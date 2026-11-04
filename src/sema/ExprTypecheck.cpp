@@ -10206,9 +10206,13 @@ bool ExprTC::checkRecordReceiverStore(const ast::Expr& target,
     const bool ctorLambda = inConstructor_ && inLambda_ && !inStaticMember_;
     if (inConstructor_ && !ctorLambda) return false;
     if (!ctorLambda) {
-        if (!currentMethodDecl_) return false;
-        for (auto mod : currentMethodDecl_->modifiers)
-            if (mod == "static") return false;
+        // fix #8089 (§9.4, v0.353): an instance accessor body is a member
+        // body like any other ("a setter body whose store lands in the
+        // receiver's own storage is rejected like any other member body").
+        if (!currentMethodDecl_ && !currentAccessorProp_) return false;
+        if (currentMethodDecl_)
+            for (auto mod : currentMethodDecl_->modifiers)
+                if (mod == "static") return false;
     }
 
     if (!isThisRootedLValueTarget(target)) return false;
@@ -23537,6 +23541,15 @@ void ExprTC::visitMember(const ast::Member& m) {
             // compiled and stored P2's zero default + 1 permanently.
             checkStaticReadonlyForwardRef(pd);
         }
+        // fix #8089 (§9.4, v0.353): an accessor body is a member body; record
+        // it (instance properties only) so checkRecordReceiverStore treats it
+        // as one. A `static` property's accessor is not a receiver position.
+        {
+            bool propStatic = false;
+            for (auto mod : pd->modifiers)
+                if (mod == "static") propStatic = true;
+            currentAccessorProp_ = propStatic ? nullptr : pd;
+        }
         for (const auto& a : pd->accessors) {
             // §22.9: a setter accessor has an implicit `value` parameter
             // (renamable via a SetterParamSpec) of the property's type.
@@ -23597,6 +23610,7 @@ void ExprTC::visitMember(const ast::Member& m) {
             returnCtx_ = savePropRet;
             currentReturnType_ = savePropRetTy;
         }
+        currentAccessorProp_ = nullptr;
     } else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(&m)) {
         if (cd->value) {
             // §22.12 / §A.8 (sweep #7): a const initializer may reference another

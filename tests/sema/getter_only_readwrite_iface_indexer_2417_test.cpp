@@ -284,7 +284,7 @@ const char* kRecordGetterOnlyRejected =
     "  end Main; "
     "end C;";
 
-// ---- ACCEPT control 6 (RECORD, body-form with a mutable property — real
+// ---- ACCEPT control 6 (CLASS (was a record until #8089: §9.4 now rejects a record setter/indexer-setter body storing own storage) — real
 //      read-write indexer, §23.4 "Body-form records with mutable properties
 //      may declare read-write indexers") ------------------------------------
 const char* kRecordBodyFormReadWriteAccepted =
@@ -292,7 +292,7 @@ const char* kRecordBodyFormReadWriteAccepted =
     "public interface IBox "
     "  property [i: int]: int; "
     "end IBox; "
-    "public record Box: IBox "
+    "public class Box: IBox "
     "  private _v: int; "
     "  public constructor(seed: int) _v := seed; end constructor; "
     "  public property [i: int]: int "
