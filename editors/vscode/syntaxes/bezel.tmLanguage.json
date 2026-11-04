@@ -271,6 +271,24 @@
         {
           "match": "\\b(old)(?=\\s*\\()",
           "name": "keyword.other.contextual.bezel"
+        },
+        {
+          "match": "\\b(case)\\b((?:(?!\\bof\\b).)*?)\\b(of)\\b",
+          "captures": {
+            "1": {
+              "name": "keyword.control.bezel"
+            },
+            "2": {
+              "patterns": [
+                {
+                  "include": "$self"
+                }
+              ]
+            },
+            "3": {
+              "name": "keyword.control.contextual.bezel"
+            }
+          }
         }
       ]
     },

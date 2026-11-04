@@ -155,6 +155,12 @@ def tm_grammar(reserved, contextual):
                 {'match': r'^\s*(?:(?:public|private|protected|internal|pure)\s+)*(' + words(CONTEXT_ACCESSORS & contextual) + r')\b(?=\s*(?:;|=>|$))',
                  'captures': {'1': {'name': 'keyword.other.contextual.bezel'}}},
                 {'match': r'\b(old)(?=\s*\()', 'name': 'keyword.other.contextual.bezel'},
+                # `of` is a keyword only as the scrutinee/arm delimiter of a `case` (B.2): colour it
+                # when it closes a `case` head on the same line, and leave any other `of` an identifier.
+                {'match': r'\b(case)\b((?:(?!\bof\b).)*?)\b(of)\b',
+                 'captures': {'1': {'name': 'keyword.control.bezel'},
+                              '2': {'patterns': [{'include': '$self'}]},
+                              '3': {'name': 'keyword.control.contextual.bezel'}}},
             ]},
             'keywords': {'patterns': [p for p in [
                 kw(present(CONSTANTS), 'constant.language.bezel'),
