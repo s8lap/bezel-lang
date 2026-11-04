@@ -31,6 +31,7 @@ Bezel's syntax comes from the Pascal family. Its type system is close to C#. Its
 module Shop;
 
 public record Product(Sku: string, Price: decimal, Stock: int);
+
 public record Order(Sku: string, Qty: int);
 
 public choice Outcome
@@ -42,13 +43,16 @@ end Outcome;
 public class Inventory(products: Array<Product>)
     private owned _bySku: Dictionary<string, Product> :=
         products.ToDictionary(lambda(p) => p.Sku);
+
     public method Place(order: Order): Outcome
         var p := _bySku.GetOrNull(order.Sku);
+
         if p = null then
             return UnknownSku(order.Sku);
         elif p.Stock < order.Qty then
             return OutOfStock(p.Stock);
         end;
+
         _bySku[p.Sku] := p with(Stock := p.Stock - order.Qty);  // an updated copy
         return Charged(p.Price * order.Qty);
     end Place;
@@ -66,8 +70,10 @@ public class Program
             new Product("pad", 3.50m, 6),
             new Product("mug", 8.00m, 3)
         ]);
+
         var orders: Array<Order> :=
             [new Order("pen", 10), new Order("ink", 1), new Order("pad", 7)];
+
         for var order in orders do
             var verdict := (case shop.Place(order) of
                 Charged(var amount) => $"charged {amount:F2}",
@@ -75,6 +81,7 @@ public class Program
                 OutOfStock(var left) => $"refused, only {left} left");
             Console.WriteLine($"{order.Qty} x {order.Sku}: {verdict}");
         end;
+
         Console.WriteLine($"running low: {String.Join(", ", shop.LowStock(10))}");
     end Main;
 end Program;

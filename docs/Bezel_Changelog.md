@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.353 — November 2026**
+**Companion to the Bezel Language Specification, v0.355 — November 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -15696,5 +15696,210 @@ The independent critique accepted the train with fixes. Its substantive findings
 - A non-author critic reviewed every lane. It checked each restated rule against spec v0.352 and scripted a section-by-section comparison of links, issue and proposal numbers, and decline words. It spot-checked fifteen dropped facts against the changelog and restored the one that was recorded nowhere else (§5.19's Java corroboration). It corrected one strengthened claim (§17.6, "showed" → "suggested") and one garbled decline (§5.10, the #3240 `new` ruling). It found the two further stale statements fixed in §12.6 (multi-consumer blocker; bounded channels).
 
 **Migration:** doc-only.
+
+---
+
+### v0.354 changelog (v0.353 → v0.354)
+
+**Editorial: the rationale's longest sections are split into subsections.** On 2026-11-03 the owner wrote: "Reading the rationale, section 4.2 appears to be very long, maybe we can split up the section better? Are there any other very long sections that will benefit from reorganisation?" This revision splits §4.2 and the other sections over about 2,000 words into numbered subsections. It also gives §10 *Generics* sections of its own. Class: **editorial** (spec-change process §2). No rule, verdict, grammar or diagnostic changes.
+
+**The treatment.**
+- Each split section opens with a summary of its decision and its main reasons, or keeps an opening that already gave them. Its body is grouped by topic under `#### N.M.K` headings, and each heading carries its own `sec-` anchor.
+- A paragraph moves only within its own section, and its historical notes come last.
+- Paragraph text is unchanged except for four "above"/"below" pointers that a move made wrong, one pointer to a moved note, and link targets.
+- Every existing anchor, code block and `###` heading is kept. Every bold or italic run-in lead-in is kept, and the lead-ins other documents cite all still resolve.
+- Three lead-ins became their subsection's title word for word: §5.28's *Alternatives considered and declined* and *Historical note*, and §8.1's *Historical note: the two-member model*.
+- New text: the summaries, three short roadmap or transition paragraphs, and the headings. The rationale grows from about 124,300 to 125,700 words.
+
+**The rationale.**
+- **§4.2** *Why function-typed values are runtime-managed* (about 6,600 words) gets a summary of the capture rule and nine subsections:
+  - no disposal through a function value
+  - the capture rule
+  - function-typed holders
+  - set-erasing positions
+  - type parameters inside function types
+  - borrow-erasing positions
+  - `scoped` at `Object` and interface types
+  - captured variables
+  - the historical note
+
+  The box paragraph is now below *An `as` at `Object`*, so that paragraph's "above" pointer to it says "below".
+- **§5.15** *Owned buffers and spans* (about 6,200 words) gets a summary and ten subsections:
+  - `OwningBuffer<T>` and the category split
+  - spans as records, with no `unsafe`
+  - the span surface and its bounds checks
+  - string spans
+  - array spans
+  - copy, move and the span factories
+  - flag-checked reads
+  - no span interface
+  - the standard library's conditionally-admitted members
+  - historical notes
+
+  The emptied-register paragraph now points at the register's note, which moved to the end.
+- **§5.19** *Serialization without reflection* and **§5.22** *Type-driven serialization* stay two sections.
+  - §5.19 gets a summary and seven subsections: architecture, vocabulary, synthesis, customization and policy placement, back-edges, polymorphic dispatch, and the historical note.
+  - §5.22 gets six subsections in its existing order: field types, cycles, identity and disposal, polymorphism and inheritance, hand-written forms, and the historical note.
+  - Each opening now names what it takes from the other. Nine links between the two now point at the subsection they mean.
+- **§5.28** *Silent tracking* gets ten subsections. The four later rulings that followed its historical note now sit with their topics:
+  - the owning-choice field joins the trivial-dispose definition;
+  - explicit disposal and the overwrite release point form one subsection;
+  - the store lint's promotion to an error follows the lint.
+- **§4.2.4** *Set-erasing positions* is rewritten for clarity, the one subsection whose wording changes. It now opens with the problem and the rule in plain sentences. Its 760-word paragraph is split into the gap it closes, a short example, how the rule is checked, related cases, its costs, and its declines and deferrals as a list. Every rule, reason, decline, link and cited lead-in is kept.
+- **§8.1** is retitled *Member hiding and name shadowing are forbidden*, since it also rules on local names, and gets a two-sentence transition and four subsections:
+  - visible members
+  - local names
+  - `Object`'s virtual members and the own-typed `Equals`
+  - the two-member model's historical note
+- **§9.15** *Value receivers* gets an opening summary (it opened with the problem) and six subsections:
+  - copyable kinds
+  - move-only kinds
+  - cost and the kernel
+  - the owning inline array
+  - closure capture of `this`
+  - historical notes
+- **§12.15** *Static members* gets a roadmap paragraph and three subsections: the admitted forms and the retired owning-inline-array static, store semantics, and rule 4's notes with rule 5.
+- **§10 *Generics*** (about 7,000 words, with no sections before) gets a four-sentence summary and seven sections that follow its own roadmap:
+  - §10.1 inference and overload resolution
+  - §10.2 type-parameter names
+  - §10.3 `owned` on a bare `T`
+  - §10.4 requirements and declared constraints, with three subsections: §10.4.1 interior-use requirements, §10.4.2 declared constraints at a type-parameter argument, §10.4.3 what the constraints admit
+  - §10.5 conditionally-admitted members
+  - §10.6 dispatched generic methods
+  - §10.7 move-only and other special substitutions
+
+  The #5512 requirement-delta paragraph moves beside the requirement paragraphs it classifies.
+- **§3.14, §12.10, §12.13.** Each section's mid-section historical note moves to the end, and the pointer across it now says "below" or "above" to match. §12.10 also gets a summary: calls mint for the iterable family as well as the `Task` family, as they have since proposal 0096 (v0.258). Its opening states the `Task` family only.
+- **§11.3.** Its five `####` headings are numbered §11.3.1–§11.3.5, to match. The anchors are unchanged.
+
+**Proposals, spec, stdlib (citations only).**
+- **`DECLINED.md`.** 158 rows that cited a split section now name the subsection they mean (160 citations). Most are matched by the lead-in the row already quotes. Rows that cite by issue or proposal number were matched to the subsection holding that paragraph, including every bare "rationale §10".
+  - Row 472's "rationale §10 (*Generics* — the type-argument inference paragraph)" becomes "rationale §10.1 (the type-argument inference paragraph)".
+  - Citations of a whole section or of §5.28's doctrine are left as they were.
+  - No verdict, class or reason changed.
+- **Spec and stdlib.** Eight spec links and four stdlib links into §5.15, §5.19, §5.22, §5.28 and §12.15 now name and target the subsection they cite. For example, spec §29.12's "no per-site suppression" now goes to §5.28.8, and stdlib §2.14's `CodingKeys` sentence to §5.19.4.
+- The pinned changelog's citations are left as they are.
+
+**Checks.**
+- `scripts/check_docs.sh` (all phases), `check_proposals.sh`, `build_book.py --check` and `check_src_citations.py` are clean on the composed tree. The one CITATION advisory (`[spec] §4.12`) predates this revision.
+- The book builds under mdBook v0.4.52. In it, the new subsections render as in-page headings, and §10's sections as page sections.
+- A non-author critic composed the three lanes and wrote its own check. For each split section, the base's paragraphs equal the new section's paragraphs once the new headings, summaries and transitions are set aside, apart from the listed pointer and link edits. All 178 existing anchors appear exactly once, no code block changed, and every phrase that another document quotes on a line citing these sections is still present.
+- The critic retitled §5.15.9 so that it no longer duplicates §10.5's title. It also removed a summary sentence in §5.19 that repeated the opening, tightened two summary claims (§12.10, §12.15) to what their paragraphs say, and fixed blank-line spacing at four section ends.
+
+**Migration:** doc-only.
+
+---
+
+---
+
+### v0.355 changelog (v0.354 → v0.355)
+
+**Quick rulings on the blocking spec questions, and the clarifications queued from earlier rulings: sixteen questions decided, no proposal.** On 2026-11-03 the owner directed: "Do quick rulings. Do a new spec revision if spec text needs to change." Every decision here is a delegated ruling under the owner's 2026-10-08 direction ("Please resolve and decide all known spec related issues. Do proposals for issues that need them."). The bar was the spec-change process's: a ruling the text decides, or a gap the text leaves, filled by the simplest reading consistent with the rest. A choice that narrowed a stated admission or added a mechanism would have needed a proposal; none was needed.
+
+Each decision was classed:
+- **A ruling the text decides** (with at most a clarifying sentence where a compiler lane or a reader misread it): [#7914](https://github.com/s8lap/bezel-lang/issues/7914), [#7930](https://github.com/s8lap/bezel-lang/issues/7930), [#7921](https://github.com/s8lap/bezel-lang/issues/7921), [#7699](https://github.com/s8lap/bezel-lang/issues/7699), [#8050](https://github.com/s8lap/bezel-lang/issues/8050), [#7550](https://github.com/s8lap/bezel-lang/issues/7550), [#7608](https://github.com/s8lap/bezel-lang/issues/7608) (its range half).
+- **A ruling that needs a sentence** (the text was silent): [#8003](https://github.com/s8lap/bezel-lang/issues/8003) (with [#8006](https://github.com/s8lap/bezel-lang/issues/8006), its citation), [#6070](https://github.com/s8lap/bezel-lang/issues/6070), [#7794](https://github.com/s8lap/bezel-lang/issues/7794), [#7697](https://github.com/s8lap/bezel-lang/issues/7697) (duplicate [#7939](https://github.com/s8lap/bezel-lang/issues/7939)), [#7608](https://github.com/s8lap/bezel-lang/issues/7608) (its rounding half), [#7764](https://github.com/s8lap/bezel-lang/issues/7764), [#7862](https://github.com/s8lap/bezel-lang/issues/7862), [#7473](https://github.com/s8lap/bezel-lang/issues/7473).
+- **Clarification and editorial**: the six rows queued on [#7884](https://github.com/s8lap/bezel-lang/issues/7884) — five sentences from the #7412, #7517, #7554, #7568 and #7506 rulings, and the owner-requested rewrite of rationale §4.1.
+
+Three lanes:
+- `E`: the #7884 queue (15 edits: spec 12, stdlib 1, rationale 1, code-generation reference 1).
+- `R1`: language rulings — #7914, #7930, #7921, #8003, #8006, #6070, #7699, #7794 (8 edits: spec 7, code-generation reference 1).
+- `R2`: standard-library rulings — #8050, #7697/#7939, #7550, #7608, #7764, #7862, #7473 (12 edits: stdlib 10, code-generation reference 2).
+
+The lanes drafted against v0.354's review branch; the edits apply to `main` (v0.354 with the §8.1 retitle and the §4.2.4 rewrite) unchanged, as one sequence in the order `E`, `R1`, `R2`, each `old` unique at the point it applies. `R1`'s #7914 edit to §28.2 and to the code-generation reference follows `E`'s enum-and-choice widening of the same sentences.
+
+The critique's substantive findings:
+- **#8003's sentence contradicted §27.6 at a type name.** The draft said that through a type name "only the type's own members, declared or inherited, are candidates, extensions having no static-invocation form", while §27.6 forms a type-qualified extension method reference (`IEnumerable<int>.Count`) and an instance property reference (`string.Length`) through the type name. It also did not decide #7699, which rested on it: `Array.Sort(a)` names a member the type declares, an instance one. The sentence now reads the chain as §2.7 rule 1 lists it (nested types, enum constants, static members; a type parameter's from its constraints, §11.8), says that an instance method of the name does not supply a call through the type name, there being no receiver, and leaves §27.6's type-qualified references untouched.
+- **#7930's sentence broke an antecedent.** Inserted before §8.7's "An owned value held at such a type is disposed by the language's discharge points alone …", it made "such a type" read as the record, enum and choice kinds, which have no `Dispose()` for the discharge points to dispatch to. It now follows that sentence.
+- **#7699's test list** omitted two reject rows whose §7.4 needle the no-member diagnostic replaces (`collection_receiver_narrowing_refuted_6333`, `reassignment_of_null_refuted_6346`).
+- **#7608's edit rewrote the comment two banked rows quote** (`l2_5_0033`, `l2_5_0035`). The comment's first sentence is now kept verbatim and the range check, the `MaxValue * 1.0` consequence and the truncation follow it.
+- **#7764's `ToUtc()`/`ToLocal()` zone shift is not ruled here** (coordinator decision): the sentence went past the question asked and reads the machine zone. It is filed as [#8062](https://github.com/s8lap/bezel-lang/issues/8062); equality by ticks and each producer's `Kind` stand.
+- **One more passage stated the narrow `Dispose` rule**: the code-generation reference's "Never declare a member named `Dispose` on a class or a record". It now names the four kinds and, for #7914, every member kind.
+- **Smaller corrections.** §28.12's new sentence says a member access through a cascade-disposed field faults, not "a read of it" (§28.2's checked test is on member access). §8.5's owning example renders `[2 owned]Res` as `"[2 owned]M.Res"`, matching the declared element. The `TimeSpan` declaration note no longer reads as an exhaustive list of producers (`DateTime`'s `Subtract` and `-` return one too).
+
+**The language specification (lane `R1`).**
+- **§26.5 rule 2 — the no-member outcome (ruling; [#8003](https://github.com/s8lap/bezel-lang/issues/8003); [#8006](https://github.com/s8lap/bezel-lang/issues/8006)).**
+  - *Decided.* Where neither an instance member (rule 1) nor a visible extension member supplies the name, nothing supplies it: the access names no member and is a compile error at the name, the diagnostic naming the receiver's static type. This holds for a call, a property or field read or write, and a method reference (§27.6), through `?.` or postfix `!` at the underlying type. Through a type name (§2.7 rule 1) the candidates are the type's nested types, enum constants and static members (a type parameter's from its constraints): an instance method of the name does not supply a call `T.M(args)`, and extensions have no static-invocation form (rule 4). §27.6's type-qualified references are unaffected.
+  - *Declined.* Extending §22.6 to the extension-candidate set: §22.6 is about the overloads of one existing name, and §26.5 is the rule that governs the search.
+  - *Why.* Rule 2 stated the search but not its empty outcome; rule 1's outcome covers only a name the type declares; §8.7's covers only `Dispose`. The compiler already rejects these accesses; its diagnostic cited §11.3 and §12.1, neither of which states the rule (#8006).
+- **§28.2 — a member named `Dispose` is a member of any kind (clarification; [#7914](https://github.com/s8lap/bezel-lang/issues/7914)).**
+  - *Decided.* The rejection is keyed on the name, so it reaches a field, a property, a `const`, a nested type, a static method, and an enum constant or a choice case on the kinds #7517 adds — the member kinds §9.2 lists for the names it reserves on a value kind. The code-generation reference says the same.
+  - *Declined.* The methods-only reading sema implemented: the rule's word is "member", and on a class §11.3 already makes a non-overloadable `Dispose` clash with the generated `Dispose()`.
+- **§8.7 — `Dispose` on a value kind names no member (clarification; [#7930](https://github.com/s8lap/bezel-lang/issues/7930)).**
+  - *Decided.* §8.7's no-member outcome is stated for records, enums, choices, primitives and inline arrays, the value kinds its first paragraph lists: `e.Dispose()` and the method reference `e.Dispose` over an enum value are compile errors.
+  - *Declined.* Reading §8.7's listed receivers (`Object`, runtime-managed values, other interfaces) as exhaustive, against "and of nothing else".
+- **§28.1, §17.13 — `owned` at `Object`, and the discard of a `using var` (clarifications; [#7921](https://github.com/s8lap/bezel-lang/issues/7921)).**
+  - *Decided: `owned` at `Object`.* `Object` is a class type for §28.1's type requirement and §28.5's field rule. The marker transfers whatever value the position holds, and a runtime-managed value there carries no obligation (§8.7).
+  - *Declined.* Rejecting `Object` as "a primitive value type": no sentence makes that exclusion, and the spec names `Object` where it carves it out (§28.14).
+  - *Decided: the discard.* `_ := c` over a `using var` that owns its value is admitted: it is §28.6's explicit disposal (K3.9, explicitly-disposed post-state), which disposes in place and moves nothing out of the pin.
+  - *Declined.* Extending #7412's `throw` rejection to the discard. #7412 turned on the obligation leaving the scope, and §28.6 groups the discard with `Dispose()`, which it admits on a `using var`.
+- **§7.5 — a plain suffix after `?.` continues the chain (ruling; [#6070](https://github.com/s8lap/bezel-lang/issues/6070)).**
+  - *Decided.* The chain is the whole postfix sequence (A.7 `PrimaryExpr`), and a suffix to the right of a `?.` is typed at the preceding segment's own declared type: `s?.Length.ToString()` over `s: string?` is a `string?`. A segment whose own type is nullable still needs `?.` or `!` (§7.4), and parentheses end the chain.
+  - *Declined.* Reading B, that a plain `.` leaves the chain. §7.5 already skips "the index expressions of the skipped suffixes", and with no `?[` in the grammar those can only be plain `[ ]` suffixes after a `?.`.
+- **The static `Array.Sort(a)` / `Array.Reverse(a)` spelling is not part of the language ([#7699](https://github.com/s8lap/bezel-lang/issues/7699); decided by §2.7 rule 1 and the §26.5 sentence; no edit of its own).**
+  - *Decided.* No standard-library declaration names a static `Sort`, `Reverse`, `Fill` or `CopyTo` on `Array<T>` or `OwningArray<T>`, and the instance methods do not supply a call through the type name. The compiler's #3345 routing of the static spelling to the instance call is a spec-extra to remove.
+  - *Declined.* Recording the sugar in the standard library: a static spelling that forwards to an instance member is a mechanism found nowhere else in the language, so declaring it would be a design change. No capability is lost (`a.Sort()`, `a.Reverse()`, `a.AsSpan().Fill(v)`).
+- **§8.5 — an inline array renders its `FullName` (ruling; [#7794](https://github.com/s8lap/bezel-lang/issues/7794)).**
+  - *Decided.* The default `ToString` of an inline array is the stdlib §2.13 `FullName` rendering, the element recursing qualified: `"[2]M.Rec"`, `"[2 owned]M.Res"`. Keyword-named elements are unchanged (`"[3]int"`).
+  - *Declined.* The `Name` rendering `"[2]Rec"`, which the compiler prints today. Every other name-only default is the `FullName` rendering, for §8.5's stated reason that such a default "is *only* a name and therefore carries the module path".
+
+**The standard library (lane `R2`).**
+- **Stdlib §2.2 (*What `Min`, `Max`, and `Clamp` compute*); the code-generation reference's `Math` paragraph — `Math.Clamp` raises `ArgumentException` when `low` compares greater than `high` (ruling; [#8050](https://github.com/s8lap/bezel-lang/issues/8050)).**
+  - The declaration's `// low > high: ArgumentException` annotation (v0.195) governs. The prose's three results partition the call only where `low <= high`; when `low > high` a `value` between the bounds meets both of its conditions. The prose now says so.
+  - *Declined:* letting the prose govern, which would delete a fault stated since v0.195 and banked as `l2_2_0002`.
+  - The ruling reverses the compiler behaviour #7901 landed (`dd527c154`), not the text: six rows of `math_clamp_low_high_order_7901` flip to expect the exception.
+- **Stdlib §3.1 — `StringBuilder.Capacity` is a storage figure with two bounds (ruling; [#7697](https://github.com/s8lap/bezel-lang/issues/7697); duplicate [#7939](https://github.com/s8lap/bezel-lang/issues/7939)).**
+  - The number of `char`s the builder holds storage for before its storage next grows: never less than `Length`, never less than the `StringBuilder(capacity)` argument (0 for the other constructors), and otherwise the implementation's, as is the growth policy. `max(Length, capacity)` conforms.
+  - *Declined:* removing the member (a design change with no evidence behind it); pinning a .NET-style growth policy.
+- **Stdlib §2.5 (`TimeSpan`'s declaration); the code-generation reference's temporal-types paragraph — `TimeSpan` has no constructor (ruling; [#7550](https://github.com/s8lap/bezel-lang/issues/7550)).**
+  - Spec §17.7's closed constructor surface rejects `new TimeSpan(...)` at every argument list. The declaration block and the code-generation reference now say so, in the reference's `Guid` form.
+  - *Declined:* adding the tick and `(h, m, s)` constructors the compiler admits; that adds surface the factories already spell.
+- **Stdlib §2.5 (`TimeSpan` `operator *`, and `/` through it) — the double model is literal (ruling; [#7608](https://github.com/s8lap/bezel-lang/issues/7608)).**
+  - The range check reads the double product, so `TimeSpan.MaxValue * 1.0` raises `OverflowException` (its ticks convert to 2^63); an in-range product is truncated toward zero to whole ticks, as `From<Unit>` is.
+  - *Declined:* .NET's round-to-nearest, and its saturation of a product of exactly 2^63 to `MaxValue`.
+- **Stdlib §2.5 (*Equality and `Kind`*, new) — `DateTime` equality is tick equality, and `Kind` is stated per producer (ruling; [#7764](https://github.com/s8lap/bezel-lang/issues/7764)).**
+  - `=`, `<>`, `Equals` and `GetHashCode` read `Ticks` alone, as `CompareTo` ("Kind not normalized, matching .NET") does, so §2.8's "zero if equal" holds both ways.
+  - `UtcNow`/`ToUtc()` give `Utc`, `Now`/`Today`/`ToLocal()` give `Local`, and `MinValue`, `MaxValue`, `Parse`, and a constructor or `FromTicks` given no `kind` give `Unspecified`. The `Add*` family, `Add`, `Subtract(span)` and `±` with a `TimeSpan` keep the `DateTime` operand's `Kind`; `Subtract(other)` and `a - b` subtract raw ticks.
+  - *Declined:* Kind-including equality (`DateTime.Today = new DateTime(y, m, d)` would be false, and `CompareTo = 0` would hold on unequal values).
+  - *Not decided here:* whether `ToUtc()`/`ToLocal()` shift the ticks by the machine zone's offset and how they read `Unspecified` ([#8062](https://github.com/s8lap/bezel-lang/issues/8062)).
+- **Stdlib §2.5 (*Component ranges*, new; the `Year`, `Millisecond` and `TimeOnly`-constructor comments) — the temporal constructors' ranges, and `TimeOnly` raises (ruling; [#7862](https://github.com/s8lap/bezel-lang/issues/7862)).**
+  - `year` 1..9999; `month` 1..12; `day` 1 to the length of that month in that year (the proleptic Gregorian calendar of ISO 8601); `hour` 0..23; `minute` 0..59; `second` 0..59; `millisecond` 0..999. `DateOnly` takes the date ranges and `TimeOnly` the time ranges, with the same `ArgumentOutOfRangeException`. `DateTime.MinValue` is `0001-01-01T00:00:00` (`Ticks` 0) and `MaxValue` the last tick of `9999-12-31`.
+  - *Declined:* normalizing an overflowing component (`TimeOnly(25, 0)` as 01:00); any other calendar.
+- **Stdlib §9.6 (*`ToUpper` and `ToLower`*, new) — the string case mapping is `Char`'s simple mapping per code point (ruling; [#7473](https://github.com/s8lap/bezel-lang/issues/7473)).**
+  - `"éa".ToUpper()` is `"ÉA"`, an unmapped code point is kept, and the result's `Length` is the receiver's.
+  - *Declined:* ASCII-only mapping (declined for `char` at v0.300); full SpecialCasing mapping (`ß` → `SS` changes `Length`); locale tailoring (deferred with `System.Globalization`).
+
+**The #7884 queue (lane `E`; clarification and editorial).**
+- **§28.10, §31.1, §28.2, §26.3, §5.1, §28.12, Appendix C; stdlib §2.10; the code-generation reference — the clarifications queued from the #7412, #7517, #7554, #7568 and #7506 rulings ([#7884](https://github.com/s8lap/bezel-lang/issues/7884)).** Each ruling stood on the text; these sentences make the reading explicit where a compiler lane or a reviewer misread it.
+  - **`throw` of a `using var` ([#7412](https://github.com/s8lap/bezel-lang/issues/7412)).** §28.10 and §31.1 say a `using var` is not a valid `throw` operand: the throw consumes its operand, a pin is only borrowed from (§28.3, axiom A5), and an exception to be thrown is declared with `var`.
+  - **A member named `Dispose` on an enum or a choice ([#7517](https://github.com/s8lap/bezel-lang/issues/7517)).** §28.2's rejection named classes and records only, while §8.7 already gave enums and choices no `Dispose()` member. The rule, its *Interfaces are unaffected* clause, §26.3's extension bullet, Appendix C, stdlib §2.10 and the code-generation reference now name all four kinds. On an owning choice the name would also collide with the disposal the language defines for the kind (§35.4), which no call reaches (§35.8).
+  - **What converts to `IDisposable` ([#7554](https://github.com/s8lap/bezel-lang/issues/7554)).** §5.1: `IDisposable` is reached only from a class, an interface extending it, or a type parameter whose constraints guarantee it; no record, enum or choice can implement it (§9.7, §8.7), and an `Object`-typed value reaches it only through a type test (§12.7). The queued wording ("only through a class or an interface") was not used: it contradicted the type-parameter bullet that follows.
+  - **`Object` in the unmarked-`using var` rejection ([#7568](https://github.com/s8lap/bezel-lang/issues/7568)).** §28.10 and Appendix C say "`Object` included"; §28.10 adds that an `Object` local in unclassified state (K1) is not in owned state, so the rejection does not reach it.
+  - **The cascade's accesses run on a live instance ([#7506](https://github.com/s8lap/bezel-lang/issues/7506)).** §28.12's list of the disposal's own accesses includes the destructors the owned-field cascade (§28.4) runs, a child's read of its owner through a back-reference included. An owned field the cascade has already disposed is itself logically disposed, so a later member access through it faults in checked mode.
+- **Rationale §4.1 (*Why strings are runtime-managed*) restated with its real reasons (editorial; owner-requested; #7884 row 6).** Strings need no ownership: a string is immutable and holds no references, so strings cannot form a cycle, and any exact scheme reclaims them with no tracing collector (§28.9 leaves the mechanism open). Ownership is for resources, and putting it on the most common value in every signature charges the largest cost to the type that gains least. Rust's `String`/`&str` split shows the price of the alternative. Copy-on-write is declined because immutability already gives its benefit; the mutable form is `StringBuilder`. Reference-count elision (Koka's Perceus, Lean 4's reset/reuse, Swift's optimizer) is implementation latitude under §28.9, not a language rule. Two weak claims are dropped: that copy-on-write "silently allocates on every concatenation", true of any immutable design, and the interop point, which FFI's `CString`/`WString` answer. The anchor and the title are unchanged.
+
+**Migration.**
+
+  *Newly rejected (compiler catching up; each ruling issue is its own tracker, relabelled `spec-tracking`):*
+  - a non-method member named `Dispose` on a class, record, enum or choice (#7914);
+  - `e.Dispose()` and `e.Dispose` on a value kind (#7930);
+  - the static `Array.Sort`/`Reverse` spellings and the other #3345 forms (#7699): the accept rows of `array_sort_static_call_3345`, all of `array_static_sugar_stmt_segv_7662`, the accept rows of `collection_static_call_nullable_receiver_6276`, two rows of `collection_type_name_member_6267`, one of `collection_concurrent_mod_1232`, and the needles of one row each in `collection_receiver_narrowing_refuted_6333` and `reassignment_of_null_refuted_6346`;
+  - `new TimeSpan(...)` at any argument list (#7550; tracked by [#7682](https://github.com/s8lap/bezel-lang/issues/7682)): 55 sites in 13 gtest files, 0 in the rule corpus.
+
+  *Newly raising (compiler catching up):* `Math.Clamp` with `low > high` (#8050; six gtest rows flip, `l2_2_0002` turns `pass`); the temporal constructors on an out-of-range year or millisecond, a day past its month, and any out-of-range `TimeOnly` component (#7862; no site expects success).
+
+  *Newly accepted (compiler catching up):* `owned` at `Object`/`Object?` in every §28.1/§28.5 position (#7921); plain suffixes after a `?.` segment, typed on the non-null path (#6070; `null_cond_member_further_plain_access_rejected_7_4_7_5` flips).
+
+  *Newly defined:* the no-member outcome for every member access and for an access through a type name (§26.5); `FullName` rendering for an inline array of a user-declared element type (#7794; three gtest files' stdout flips); `StringBuilder.Capacity`'s bounds (#7697); `TimeSpan` `*`/`/` truncation (#7608); `DateTime` equality and each producer's `Kind` (#7764); `DateTime.MinValue`/`MaxValue`; the Unicode simple case mapping for `string` (#7473; with `char`, tracked by [#4481](https://github.com/s8lap/bezel-lang/issues/4481)).
+
+  *Unchanged in the compiler:* `_ := c` over a `using var` (#7921); `TimeSpan` `*`/`/` (#7562's arm conforms); `DateTime` equality and producer `Kind`s (the #7764 interim decision conforms); the #7884 rows (#7412, #7517, #7554 and #7568 are fixed on main; #7506 stays open as the bug).
+
+  *Diagnostic text:* the unknown-member diagnostic's citation moves from `(§11.3, §12.1)` to §26.5, with §2.7 for an access through a type name, and the `Array` no-static form's `(§3.4)` with it (#8006). Seven lit files, one `EXPECT_FALSE` gtest and the #6267 needles pin the old text.
+
+  *Rule corpus:* no banked row changes verdict. `s26_5_0054`–`s26_5_0060` can now cite §26.5 rule 2's sentence instead of §22.6; `s28_2_0008`, `s28_2_0022` and `s28_12_0014` quote sentences this revision extends. The re-citations, the quote refreshes and the new cases each ruling calls for are [#8063](https://github.com/s8lap/bezel-lang/issues/8063).
+
+  *Closed by this revision:* #8003, #7550, #7608, #7764, #7473, #7884 and #7939 (duplicate). The rest become trackers.
+
+**Checks.** `scripts/check_docs.sh` (all phases), `check_proposals.sh`, `build_book.py --check` and `check_src_citations.py` are clean on the composed tree; `corpus.py lint --strict` (4,528 cases) and `corpus.py check` are clean. The one CITATION advisory (`[spec] §4.12`) predates this revision. A non-author critic reviewed every lane against the v0.354 text and the tests on `main`, and its corrections are listed above.
 
 ---

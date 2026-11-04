@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.353 — November 2026**
+**Companion to the Bezel Language Specification, v0.355 — November 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -177,7 +177,7 @@ public static class Math
 end Math;
 ```
 
-**What `Min`, `Max`, and `Clamp` compute.** Ordering throughout is `T`'s `CompareTo` ([§2.8](#sec-icomparablet)). `Min(a, b)` returns `a` when `a.CompareTo(b) <= 0` and `b` otherwise; `Max(a, b)` returns `a` when `a.CompareTo(b) >= 0` and `b` otherwise — so a tie returns **`a`** in both, which is what fixes *which object* the call yields at a class or interface substitution, where the two arguments are distinguishable. `Clamp(value, low, high)` returns `low` when `value` compares less than `low`, `high` when it compares greater than `high`, and `value` otherwise.
+**What `Min`, `Max`, and `Clamp` compute.** Ordering throughout is `T`'s `CompareTo` ([§2.8](#sec-icomparablet)). `Min(a, b)` returns `a` when `a.CompareTo(b) <= 0` and `b` otherwise; `Max(a, b)` returns `a` when `a.CompareTo(b) >= 0` and `b` otherwise — so a tie returns **`a`** in both, which is what fixes *which object* the call yields at a class or interface substitution, where the two arguments are distinguishable. `Clamp(value, low, high)` returns `low` when `value` compares less than `low`, `high` when it compares greater than `high`, and `value` otherwise. Those three results answer the call only where `low` does not compare greater than `high`: where it does (`low.CompareTo(high) > 0`), the call raises `ArgumentException` whatever `value` is, as the declaration's annotation states.
 
 **Ownership at class-typed substitutions.** `Min`, `Max`, and `Clamp` return one of their arguments. Under the bare-type-parameter rule (language spec [§28.3](Bezel_Language_Spec.md#sec-bare-type-parameter-returns)), at a class or interface substitution of `T` the call produces a **borrow** whose sources are the arguments: the caller takes no disposal obligation, and the result is usable only while every argument's source is live. At value and runtime-managed substitutions (the common numeric cases; `string`) no ownership attaches.
 
@@ -277,13 +277,13 @@ public record DateTime: IComparable<DateTime>, IEquatable<DateTime>
   public static method FromTicks(ticks: long, kind: DateTimeKind := DateTimeKind.Unspecified): DateTime;
   public method ToUnixTimeSeconds(): long;
   public static method FromUnixTimeSeconds(seconds: long): DateTime;
-  public readonly property Year: int;
+  public readonly property Year: int;         // 1..9999
   public readonly property Month: int;        // 1..12
   public readonly property Day: int;          // 1..31
   public readonly property Hour: int;         // 0..23
   public readonly property Minute: int;       // 0..59
   public readonly property Second: int;       // 0..59
-  public readonly property Millisecond: int;
+  public readonly property Millisecond: int;  // 0..999
   public readonly property DayOfWeek: DayOfWeek;
   public readonly property DayOfYear: int;
   public readonly property Kind: DateTimeKind;
@@ -339,6 +339,10 @@ end DateTimeKind;
 public record TimeSpan: IComparable<TimeSpan>, IEquatable<TimeSpan>
   // (#1357): CompareTo = tick order. Ordering is CompareTo only — no
   //   <,>,<=,>= overloads are declared (spec §9.2, §25.2).
+  // No constructor, so `new TimeSpan(...)` is rejected (spec §17.7's closed
+  //   constructor surface): a span comes from FromTicks, a From<Unit>
+  //   factory, Zero/MinValue/MaxValue, or a member or operator that
+  //   returns one (DateTime's Subtract and -, TimeSpan's operators).
   public method CompareTo(other: TimeSpan): int;
   public readonly property Ticks: long;
   public static method FromTicks(ticks: long): TimeSpan;
@@ -371,7 +375,11 @@ public record TimeSpan: IComparable<TimeSpan>, IEquatable<TimeSpan>
   public static method operator *(a: TimeSpan, factor: double): TimeSpan;
                                      // computes over Ticks in double; OverflowException on a
                                      //   product outside the tick range or a NaN operand
-                                     //   (pinned)
+                                     //   (pinned). The range check reads the double
+                                     //   product, so MaxValue * 1.0 raises (its Ticks
+                                     //   convert to 2^63); an in-range product is
+                                     //   truncated toward zero to whole ticks, as
+                                     //   From<Unit> is
   public static method operator /(a: TimeSpan, divisor: double): TimeSpan;
                                      // same computation model and OverflowException rule
                                      //   as *; DivideByZeroException on
@@ -401,6 +409,7 @@ end DateOnly;
 
 public record TimeOnly: IComparable<TimeOnly>, IEquatable<TimeOnly>
   public constructor(hour: int, minute: int, second: int := 0, millisecond: int := 0);
+                              // ArgumentOutOfRangeException on invalid components
   public readonly property Hour: int;
   public readonly property Minute: int;
   public readonly property Second: int;
@@ -417,7 +426,11 @@ end TimeOnly;
 
 `DateTime.Date: DateOnly` and `DateTime.TimeOfDay: TimeOnly` accessors decompose a `DateTime`.
 
+**Equality and `Kind`.** A `DateTime`'s `=`, `<>`, `Equals` and `GetHashCode` read its `Ticks` alone, as `CompareTo` does: two values with equal `Ticks` are equal whatever their `Kind`s, so `a = b` exactly where `a.CompareTo(b) = 0` (matching .NET). `Kind` is carried and read through the `Kind` property, never compared. `UtcNow` and `ToUtc()` produce `Kind = Utc`; `Now`, `Today` and `ToLocal()` produce `Kind = Local`; `MinValue`, `MaxValue`, `Parse` and a constructor or `FromTicks` call given no `kind` produce `Unspecified`. The `Add*` family, `Add`, `Subtract(span)` and the `+`/`-` operators with a `TimeSpan` keep the `DateTime` operand's `Kind`; `Subtract(other)` and `a - b` subtract the two `Ticks` with no normalization.
+
 **The tick, and the `From`/`Total` pairs.** A **tick** is 100 nanoseconds — 10,000,000 to the second, 864,000,000,000 to the day. It is the unit of `Ticks` on both types and the resolution of every value either can hold; the `c` format's `.fffffff` tail ([§2.18](#sec-iformattable)) is that unit spelled out. `TimeSpan.From<Unit>(n)` is the span of `n` of that unit — `FromHours(1.5)` is ninety minutes — computed over ticks in `double` and truncated toward zero to a whole number of ticks, raising `OverflowException` when the result falls outside the tick range or the argument is `NaN` (the `*` operator's contract above). `Total<Unit>` is the whole span measured in that unit, fractional part included, so `Total<Unit>` of `From<Unit>(n)` is `n` up to that truncation; the integer components (`Days`, `Hours`, `Minutes`, `Seconds`, `Milliseconds`) are the span's decomposition, each within its stated range and carrying the span's sign. `(TimeSpan.FromDays(1) - TimeSpan.FromHours(1)).TotalHours` is therefore `23.0`, and that span's `Hours` is `23`.
+
+**Component ranges.** The constructors of `DateTime`, `DateOnly` and `TimeOnly` raise `ArgumentOutOfRangeException` when a component falls outside its range: `year` 1..9999, `month` 1..12, `day` 1 to the length of that month in that year of the proleptic Gregorian calendar that ISO 8601 uses (February 29 exists only in a leap year), `hour` 0..23, `minute` 0..59, `second` 0..59 and `millisecond` 0..999. `DateOnly` takes the date ranges and `TimeOnly` the time ranges. `DateTime.MinValue` is `0001-01-01T00:00:00` (`Ticks` 0) and `MaxValue` is the last tick of `9999-12-31` (`Ticks` 3155378975999999999), so every valid set of components names a value between them.
 
 The `ArgumentOutOfRangeException` these constructors raise is declared here, deriving from `ArgumentException` so that an `ArgumentException` catch arm covers the whole argument-validation family (language spec [§31.2.1](Bezel_Language_Spec.md#sec-arm-patterns)); it lives in the auto-imported `System` alongside its producers:
 
@@ -534,7 +547,7 @@ public interface IAsyncDisposable: IDisposable
 end IAsyncDisposable;
 ```
 
-Every class implicitly implements `IDisposable` (language spec [§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)); user code does not implement it directly — a class or record declaring a member named `Dispose`, at any parameter list, is a compile error at that declaration (language spec [§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)). The interface is declared here so that generic constraints (`where T: IDisposable`) and explicit interface variables (`var d: IDisposable := someInstance;`) refer to a named declaration in the standard library rather than a language built-in.
+Every class implicitly implements `IDisposable` (language spec [§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)); user code does not implement it directly — a class, record, enum or choice declaring a member named `Dispose`, at any parameter list, is a compile error at that declaration (language spec [§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)). The interface is declared here so that generic constraints (`where T: IDisposable`) and explicit interface variables (`var d: IDisposable := someInstance;`) refer to a named declaration in the standard library rather than a language built-in.
 
 `IAsyncDisposable` is implemented explicitly by classes that need asynchronous cleanup (language spec [§28.12](Bezel_Language_Spec.md#sec-asynchronous-disposal)). It extends `IDisposable`: the synchronous `Dispose()` every class has (language spec [§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)) is the inherited member's implementation, a value held at `IAsyncDisposable` exposes both, and the constraint paragraph below follows from the extension. Implementations declare a method matching `DisposeAsync(): Task` and add `async` to the implementation; `async` is an implementation-side modifier and never appears on the interface declaration. A class that implements `IAsyncDisposable` should also declare a `destructor` for the synchronous fallback path, at the level that declares `DisposeAsync`: a destructor the class only inherits is the base's cleanup and does not stand in (language spec [§28.12](Bezel_Language_Spec.md#sec-asynchronous-disposal)). A direct `DisposeAsync()` call takes language spec [§28.6](Bezel_Language_Spec.md#sec-who-may-dispose)'s receiver rule, as `Dispose()` does: only the owner calls it, and `base.DisposeAsync()` inside a `DisposeAsync` override is the one admitted `this`-rooted call.
 
@@ -822,7 +835,7 @@ public record User(
 // InternalToken is excluded; last_seen may be absent on read
 ```
 
-The clause has a closed effect vocabulary — `serialized "<name>"` (rename), `serialized skip` (exclude), `serialized optional` (omit-if-null on write, default-if-missing on read), with rename and tolerate combinable as `serialized "<name>" optional` and `skip` mutually exclusive with both — defined normatively in language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis). It is a compiler-recognized declaration modifier, deliberately *not* an attribute system and deliberately not a separate exhaustive key list (rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection) explains the design and why it improves on the Swift `CodingKeys` model).
+The clause has a closed effect vocabulary — `serialized "<name>"` (rename), `serialized skip` (exclude), `serialized optional` (omit-if-null on write, default-if-missing on read), with rename and tolerate combinable as `serialized "<name>" optional` and `skip` mutually exclusive with both — defined normatively in language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis). It is a compiler-recognized declaration modifier, deliberately *not* an attribute system and deliberately not a separate exhaustive key list (rationale [§5.19.4](Bezel_Design_Rationale.md#sec-serialization-customization-and-policy) explains the design and why it improves on the Swift `CodingKeys` model).
 
 A **class** can also be synthesized: it declares `: ISerializable`/`: IDeserializable` and the compiler reads its serialized shape from its field types — no header clause. A class whose fields are all `owned` (or value-typed) serializes as a tree:
 
@@ -879,7 +892,7 @@ public class Node(label: string): ISerializable, IDeserializable
 end Node;
 ```
 
-A cycle is built by constructing the `Shared<Node>` spine, then wiring each `Weak<Node>?` back-edge with `Downgrade()` once its target exists — ordinary mutation of a nullable field, so definite assignment (language spec [§7.9](Bezel_Language_Spec.md#sec-definite-assignment-for-non-nullable-fields)) is satisfied by the null initializer and no two-phase construction is required. The synthesized `Deserialize` reconstructs the spine and binds each `Weak` `$ref` by `Downgrade()`ing the already-reconstructed `Shared<Node>` its identity tag resolves to. A `Weak<T>` reference whose target is never strongly reached in the graph raises `SerializationException` (the design is rationale [§5.22](Bezel_Design_Rationale.md#sec-type-driven-serialization)).
+A cycle is built by constructing the `Shared<Node>` spine, then wiring each `Weak<Node>?` back-edge with `Downgrade()` once its target exists — ordinary mutation of a nullable field, so definite assignment (language spec [§7.9](Bezel_Language_Spec.md#sec-definite-assignment-for-non-nullable-fields)) is satisfied by the null initializer and no two-phase construction is required. The synthesized `Deserialize` reconstructs the spine and binds each `Weak` `$ref` by `Downgrade()`ing the already-reconstructed `Shared<Node>` its identity tag resolves to. A `Weak<T>` reference whose target is never strongly reached in the graph raises `SerializationException` (the design is rationale [§5.22.3](Bezel_Design_Rationale.md#sec-serialization-identity)).
 
 This is the type-driven serialization model: a class declares `: ISerializable`/`: IDeserializable` and its serialized shape — tree, DAG, or cyclic — follows from its field types (`owned` → owning edge, `Shared<T>` → identity participant, `Weak<T>`/borrow → back-reference), with polymorphic edges resolved through an explicit class-body `polymorphic` registry. The concrete format implementations are in [§2.15](#sec-concrete-serialization-formats); the design record for the type-driven model is rationale [§5.22](Bezel_Design_Rationale.md#sec-type-driven-serialization).
 
@@ -1032,7 +1045,7 @@ public method Reencode(text: string, path: string)
 end Reencode;
 ```
 
-**The write family is ordinary generic code; the read family is compiler-known.** `ISerializable` has a real instance method, so `ToText`/`ToBytes` reach `value.Serialize(s)` through their constraint and are user-writable Bezel. The read family is not: `IDeserializable` is a marker interface with no members ([§2.14](#sec-serialization-vocabulary)), so no generic body can reach the recognized `T.Deserialize(d)` factory through a constraint, and `Parse<T>`/`ParseOwned<T>` (both formats) are **compiler-known generics** — the same mechanism as `Task.FromResult<T>`'s compiler-special-cased class-`T` rejection ([§6.7](#sec-task-static-helpers)). `Parse<T>` requires an `IDeserializable`-conforming **value-type** target — a record, enum, or value-like choice (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) — and rejects a class-typed `T` at compile time with a diagnostic directing to `ParseOwned<T>`; `ParseOwned<T>` requires an `IDeserializable`-conforming class whose recognized factory returns `owned T`. A class whose factory has the third [§2.14](#sec-serialization-vocabulary) shape — `Deserialize(d): owned Shared<C>`, the shared-node entry — has no facade form and is read through the agents; `ParseOwned<C>` over such a class is a compile-time error. Were the recognized factory promoted to a static interface member (the recorded follow-up of rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection), itself gated on the `Self` return type [§2.14](#sec-serialization-vocabulary) separately defers), all four become expressible as ordinary constrained generics with no signature change.
+**The write family is ordinary generic code; the read family is compiler-known.** `ISerializable` has a real instance method, so `ToText`/`ToBytes` reach `value.Serialize(s)` through their constraint and are user-writable Bezel. The read family is not: `IDeserializable` is a marker interface with no members ([§2.14](#sec-serialization-vocabulary)), so no generic body can reach the recognized `T.Deserialize(d)` factory through a constraint, and `Parse<T>`/`ParseOwned<T>` (both formats) are **compiler-known generics** — the same mechanism as `Task.FromResult<T>`'s compiler-special-cased class-`T` rejection ([§6.7](#sec-task-static-helpers)). `Parse<T>` requires an `IDeserializable`-conforming **value-type** target — a record, enum, or value-like choice (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) — and rejects a class-typed `T` at compile time with a diagnostic directing to `ParseOwned<T>`; `ParseOwned<T>` requires an `IDeserializable`-conforming class whose recognized factory returns `owned T`. A class whose factory has the third [§2.14](#sec-serialization-vocabulary) shape — `Deserialize(d): owned Shared<C>`, the shared-node entry — has no facade form and is read through the agents; `ParseOwned<C>` over such a class is a compile-time error. Were the recognized factory promoted to a static interface member (the recorded follow-up of rationale [§5.19.2](Bezel_Design_Rationale.md#sec-serialization-the-vocabulary), itself gated on the `Self` return type [§2.14](#sec-serialization-vocabulary) separately defers), all four become expressible as ordinary constrained generics with no signature change.
 
 **Ownership at the facade.** `value` is an unmarked parameter — a borrow for the duration of the call at class substitutions (language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)), a value at record/enum substitutions; the caller keeps ownership and the disposal obligation. The results are fresh productions under [§1](#sec-conventions)'s conventions: `ToText` returns a runtime-managed `string`, `ToBytes` returns `owned OwningBuffer<byte>` ([§4.14](#sec-owned-buffers-and-spans)), and `ParseOwned<T>` returns `owned T` (language spec [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer)), discharged by `using var` or an owned field. Inside a facade read the deserializer's input-span borrow is bounded by the call itself, so the caller's obligation to keep the backing bytes alive ends when the call returns — unlike the agent path, where the span must outlive the `using var d` scope.
 
@@ -1069,7 +1082,7 @@ end SerializationException;
 
 The three properties are value-typed and copy out of a `catch` arm like any other snapshot state (language spec [§31.1](Bezel_Language_Spec.md#sec-throwing-and-catching)). The deserializer interfaces' `Try*`-shaped members (`TryReadNull`) do not throw; every other read member throws on mismatch rather than returning a sentinel, because a deserialization mismatch is a structural error in the input, not an expected control-flow branch.
 
-**Unknown-field policy.** A field present in the input that matches no declared component of the target type is, by default, a `SerializationException` — the strict default established when synthesis shipped, because silently dropping unrecognized input masks producer/consumer schema drift and field-name typos. This behavior is a property of the deserialization *operation*, not of the target type: the same type may legitimately be read strictly when consuming a trusted internal message and leniently when consuming a third-party producer that adds fields freely, a decision that belongs to the caller performing the read, not to the type's serialization contract (rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection)). It is therefore configured on the deserializer: `JsonOptions.IgnoreUnknownFields` (default `false`) for JSON, the `ignoreUnknownFields` parameter (default `false`) of the `BinaryDeserializer` constructors and of the `Binary.Parse<T>`/`ParseOwned<T>` facade. When set, the deserializer skips an unrecognized field's value (via `IDeserializer.SkipValue`, [§2.14](#sec-serialization-vocabulary), which consumes the value including any nested object/array structure) and continues rather than raising. The synthesized `Deserialize` (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) is identical regardless of policy — it always delegates an unrecognized field to the deserializer; strictness lives entirely in the deserializer's configuration. This policy governs only *unknown* fields; missing required fields, duplicates, and type mismatches remain unconditional errors regardless of the setting, and a *missing* declared field is tolerated only by the per-member `serialized optional` clause (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) — the two leniencies are orthogonal and compose.
+**Unknown-field policy.** A field present in the input that matches no declared component of the target type is, by default, a `SerializationException` — the strict default established when synthesis shipped, because silently dropping unrecognized input masks producer/consumer schema drift and field-name typos. This behavior is a property of the deserialization *operation*, not of the target type: the same type may legitimately be read strictly when consuming a trusted internal message and leniently when consuming a third-party producer that adds fields freely, a decision that belongs to the caller performing the read, not to the type's serialization contract (rationale [§5.19.4](Bezel_Design_Rationale.md#sec-serialization-customization-and-policy)). It is therefore configured on the deserializer: `JsonOptions.IgnoreUnknownFields` (default `false`) for JSON, the `ignoreUnknownFields` parameter (default `false`) of the `BinaryDeserializer` constructors and of the `Binary.Parse<T>`/`ParseOwned<T>` facade. When set, the deserializer skips an unrecognized field's value (via `IDeserializer.SkipValue`, [§2.14](#sec-serialization-vocabulary), which consumes the value including any nested object/array structure) and continues rather than raising. The synthesized `Deserialize` (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) is identical regardless of policy — it always delegates an unrecognized field to the deserializer; strictness lives entirely in the deserializer's configuration. This policy governs only *unknown* fields; missing required fields, duplicates, and type mismatches remain unconditional errors regardless of the setting, and a *missing* declared field is tolerated only by the per-member `serialized optional` clause (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) — the two leniencies are orthogonal and compose.
 
 `JsonSerializer`, `JsonDeserializer`, `BinarySerializer`, `BinaryDeserializer`, `JsonOptions`, and `SerializationException` are declared in `System.Serialization` and require an explicit `import System.Serialization`, and the one-shot facades `Json` and `Binary` are declared beside them under the same import. The vocabulary interfaces the agent classes implement (`ISerializer`/`IDeserializer`/`ISerializable`/`IDeserializable`, [§2.14](#sec-serialization-vocabulary)) remain auto-imported, so a type's `: ISerializable` conformance never requires the import — only the code that picks a concrete format does.
 
@@ -1403,6 +1416,8 @@ end StringBuilder;
 ```
 
 Methods return `this` to allow chaining.
+
+**`Capacity`.** The number of `char`s the builder holds storage for before its storage next grows. It is never less than `Length`, and never less than the `capacity` argument of the `StringBuilder(capacity)` constructor that made the builder (0 for the other two constructors). Beyond those two bounds its value is the implementation's, as are when and by how much the storage grows; `max(Length, capacity)` is a conforming answer.
 
 **Sendability** ([§1](#sec-sendability-statements); language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)). `StringBuilder` is **sendable**, on the sendable form's copy-state ground: it holds text only; every member reads and writes that text by value — `Append(value: Object)` keeps `value.ToString()`'s text, not `value`, and `AppendFormat`'s `args` is a call-bounded borrow — and no member exposes a span or an address of its storage. A moved builder keeps its contents.
 
@@ -5465,6 +5480,8 @@ end String;
 ```
 
 `Replace`, `Trim`, `ToUpper`, etc. return new `string` values; `string` is immutable. A `StringBuilder` ([§3.1](#sec-stringbuilder)) is appropriate for accumulation.
+
+**`ToUpper` and `ToLower`.** Each maps every code point of the receiver by `Char.ToUpper` or `Char.ToLower` ([§9.5](#sec-char)): the simple Unicode case mapping, one code point to one, with no locale tailoring. So `"éa".ToUpper()` is `"ÉA"`, a code point with no mapping (`日`) is kept, and the result's `Length` is the receiver's.
 
 **`IsNullOrWhiteSpace`.** Returns `true` when `value` is `null`, when it is the empty string, and when every one of its code points satisfies `Char.IsWhiteSpace` ([§9.5](#sec-char)); `false` otherwise. The member is total over `string?` — the nullable parameter admits the null and the member answers it, so no narrowing is needed at the call.
 

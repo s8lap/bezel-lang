@@ -7,7 +7,7 @@ This first version is editor support only: highlighting, bracket and comment han
 ## Features
 
 - Highlighting for keywords, types, literals (including interpolated `$"…{x}…"` and verbatim `@"…"` strings), comments and `/// ` documentation comments, declarations and `end Name;` labels.
-- Contextual keywords (`value`, `notnull`, `sendable`, `hashable`, `get`, `set`, `pure`, `scoped`, `old`) are coloured only in the positions where they are keywords, as the spec defines them; elsewhere they are ordinary identifiers.
+- Contextual keywords (spec Appendix B.2) are coloured only in the positions where they are keywords; elsewhere they are ordinary identifiers: `of` closing a `case` head (also on a later line), `step` after a range, `convention`, `env` and `variadic(N)` in an `extern` block, `:= symbol "…"`, `serialized` (with `skip`/`optional`), `equality skip`, the `polymorphic ("tag": Type)` member, `operator` in an operator declaration, `scoped`, `pure`, `get`/`set` accessors, `old(` and `result` in an `ensures` clause, and `value`/`notnull`/`sendable`/`hashable` in a `where T:` list. `value` as a setter's implicit parameter is left plain, because that reading depends on the enclosing declaration.
 - Highlighting inside Markdown: ` ```bezel ` (or ` ```bzl `) code blocks in `.md` files are coloured as Bezel in the editor. The Markdown preview pane uses its own highlighter and is not affected.
 - Snippets: `module`, `class`, `record`, `method`, `if`, `for`, `while`, `try`, `tryfinally`, `usingvar`.
 
@@ -29,8 +29,13 @@ The grammar is generated from the language specification: `scripts/gen_editor_gr
 
 ```sh
 # from editors/vscode
-npm install --no-save vscode-textmate@9 vscode-oniguruma@2
+npm install --no-save vscode-textmate@9 vscode-oniguruma@2 highlight.js@10.1.1
 node test/tokenize.js          # tokenizes every bezel block in docs/ and every .bzl test program
+node test/contextual.js        # contextual keywords: coloured in their positions, plain elsewhere
+                               # (fixtures in test/contextual-fixtures.js, shared with test/hljs.js)
+node test/hljs.js              # the docs site's highlight.js language (docs/book/theme/bezel-highlight.js)
+                               # under highlight.js 10.1.1, the copy mdBook 0.4.52 bundles: every
+                               # bezel block in docs/ highlights cleanly, and the same fixtures pass
 MARKDOWN_GRAMMAR=<path to VS Code's markdown.tmLanguage> node test/markdown.js
                                # checks the injection marks exactly the bezel fences in docs/ as Bezel
 node tools/readme-example.js   # re-renders the repository README's example as docs/images/readme-example-*.svg

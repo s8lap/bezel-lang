@@ -211,7 +211,7 @@
           }
         },
         {
-          "match": "\\b(method|property)\\s+(?:(operator)\\s+(\\S+)|([A-Za-z_][A-Za-z0-9_]*))",
+          "match": "\\b(method|property)\\s+(?:(operator)\\s*(<<|>>|<=|>=|<>|\\bmod\\b|[-+*/&|^<>=~])|([A-Za-z_][A-Za-z0-9_]*))",
           "captures": {
             "1": {
               "name": "keyword.other.declaration.bezel"
@@ -243,7 +243,7 @@
     "contextual": {
       "patterns": [
         {
-          "match": "\\b(where)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(:)\\s*(hashable|sendable|notnull|value)\\b",
+          "match": "\\b(where)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(:)(\\s*(?:new\\s*\\(\\s*\\)|[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?:<[^;:()<>]*(?:<[^;:()<>]*>[^;:()<>]*)*>)?\\??)(?:\\s*,\\s*(?:new\\s*\\(\\s*\\)|[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?:<[^;:()<>]*(?:<[^;:()<>]*>[^;:()<>]*)*>)?\\??))*)",
           "captures": {
             "1": {
               "name": "keyword.other.bezel"
@@ -252,16 +252,199 @@
               "name": "entity.name.type.parameter.bezel"
             },
             "4": {
+              "patterns": [
+                {
+                  "match": "<.*>",
+                  "captures": {
+                    "0": {
+                      "patterns": [
+                        {
+                          "include": "$self"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "match": "(?<!\\.)\\b(?:hashable|sendable|notnull|value)\\b(?![\\w.])",
+                  "name": "keyword.other.contextual.bezel"
+                },
+                {
+                  "include": "$self"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "match": "\\b(pure)(?=\\s+(?:method|get|property|constructor|readonly|abstract|virtual|override|sealed|static|owned|public|private|protected|internal)\\b)",
+          "name": "storage.modifier.contextual.bezel"
+        },
+        {
+          "match": "\\b(scoped)(?=\\s+(?:readonly\\b|[A-Za-z_][A-Za-z0-9_]*\\s*[:,)]))",
+          "name": "storage.modifier.contextual.bezel"
+        },
+        {
+          "match": "^\\s*((?:(?:public|private|protected|internal)\\s+)?)(?:(pure)\\s+)?(get|set)\\b(?=\\s*(?:;|=>|\\(\\s*owned\\s*\\)|$))",
+          "captures": {
+            "1": {
+              "patterns": [
+                {
+                  "include": "#keywords"
+                }
+              ]
+            },
+            "2": {
+              "name": "storage.modifier.contextual.bezel"
+            },
+            "3": {
               "name": "keyword.other.contextual.bezel"
             }
           }
         },
         {
-          "match": "\\b(scoped|pure)(?=\\s+(?:method|get|property|static|owned|public|private|protected|internal|[A-Za-z_][A-Za-z0-9_]*\\s*:))",
-          "name": "storage.modifier.contextual.bezel"
+          "match": "\\b(public|private|protected|internal)\\s+(get|set)\\b(?=\\s*(?:;|:=|=>|\\(\\s*owned\\s*\\)))",
+          "captures": {
+            "1": {
+              "name": "storage.modifier.bezel"
+            },
+            "2": {
+              "name": "keyword.other.contextual.bezel"
+            }
+          }
         },
         {
-          "match": "^\\s*(?:(?:public|private|protected|internal|pure)\\s+)*(get|set)\\b(?=\\s*(?:;|=>|$))",
+          "begin": "\\b(ensures)\\s*(\\()",
+          "end": "\\)",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.other.bezel"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#ensures-body"
+            }
+          ]
+        },
+        {
+          "begin": "\\b(case)\\b",
+          "end": "\\b(of)\\b|(?=;|=>|\\bend\\b)",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.control.bezel"
+            }
+          },
+          "endCaptures": {
+            "1": {
+              "name": "keyword.control.contextual.bezel"
+            }
+          },
+          "patterns": [
+            {
+              "include": "$self"
+            }
+          ]
+        },
+        {
+          "match": "(\\.\\.<?)(\\s*(?!step\\b)[^\\s;,\"{}](?:(?!\\bstep\\b|[;,\"{}]|=>|:=|\\b(?:do|then|of)\\b).)*?)\\s+(step)\\b(?=\\s*[-+(\\w])",
+          "captures": {
+            "1": {
+              "name": "keyword.operator.bezel"
+            },
+            "2": {
+              "patterns": [
+                {
+                  "include": "$self"
+                }
+              ]
+            },
+            "3": {
+              "name": "keyword.other.contextual.bezel"
+            }
+          }
+        },
+        {
+          "begin": "\\b(extern)\\s+(\"(?:[^\"\\\\\\n]|\\\\.)*\")(?:\\s+(convention)\\s+(\"(?:[^\"\\\\\\n]|\\\\.)*\"))?",
+          "end": "\\b(end)\\b(?:\\s+(extern)\\b)?(?=\\s*;)",
+          "beginCaptures": {
+            "1": {
+              "name": "storage.modifier.bezel"
+            },
+            "2": {
+              "name": "string.quoted.double.bezel"
+            },
+            "3": {
+              "name": "keyword.other.contextual.bezel"
+            },
+            "4": {
+              "name": "string.quoted.double.bezel"
+            }
+          },
+          "endCaptures": {
+            "1": {
+              "name": "keyword.control.bezel"
+            },
+            "2": {
+              "name": "storage.modifier.bezel"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#extern-body"
+            }
+          ]
+        },
+        {
+          "match": "(:=)\\s*(symbol)\\s+(\"(?:[^\"\\\\\\n]|\\\\.)*\")(?:\\s*(variadic)(?=\\s*\\())?",
+          "captures": {
+            "1": {
+              "name": "keyword.operator.assignment.bezel"
+            },
+            "2": {
+              "name": "keyword.other.contextual.bezel"
+            },
+            "3": {
+              "name": "string.quoted.double.bezel"
+            },
+            "4": {
+              "name": "keyword.other.contextual.bezel"
+            }
+          }
+        },
+        {
+          "match": "\\b(serialized)\\s+(?:(skip)\\b|(\"(?:[^\"\\\\\\n]|\\\\.)*\")(?:\\s+(optional)\\b)?|(optional)\\b)",
+          "captures": {
+            "1": {
+              "name": "keyword.other.contextual.bezel"
+            },
+            "2": {
+              "name": "keyword.other.contextual.bezel"
+            },
+            "3": {
+              "name": "string.quoted.double.bezel"
+            },
+            "4": {
+              "name": "keyword.other.contextual.bezel"
+            },
+            "5": {
+              "name": "keyword.other.contextual.bezel"
+            }
+          }
+        },
+        {
+          "match": "\\b(equality)\\s+(skip)\\b",
+          "captures": {
+            "1": {
+              "name": "keyword.other.contextual.bezel"
+            },
+            "2": {
+              "name": "keyword.other.contextual.bezel"
+            }
+          }
+        },
+        {
+          "match": "\\b(polymorphic)\\s*(?=\\(\\s*\"(?:[^\"\\\\\\n]|\\\\.)*\"\\s*:)",
           "captures": {
             "1": {
               "name": "keyword.other.contextual.bezel"
@@ -269,8 +452,98 @@
           }
         },
         {
-          "match": "\\b(old)(?=\\s*\\()",
+          "match": "\\b(static)\\s+(operator)\\s*(<<|>>|<=|>=|<>|\\bmod\\b|[-+*/&|^<>=~])",
+          "captures": {
+            "1": {
+              "name": "storage.modifier.bezel"
+            },
+            "2": {
+              "name": "keyword.other.contextual.bezel"
+            },
+            "3": {
+              "name": "entity.name.function.operator.bezel"
+            }
+          }
+        },
+        {
+          "match": "\\b(end)\\s+(operator)\\s*(<<|>>|<=|>=|<>|\\bmod\\b|[-+*/&|^<>=~])\\s*(?=;)",
+          "captures": {
+            "1": {
+              "name": "keyword.control.bezel"
+            },
+            "2": {
+              "name": "keyword.other.contextual.bezel"
+            },
+            "3": {
+              "name": "entity.name.function.operator.bezel"
+            }
+          }
+        }
+      ]
+    },
+    "ensures-body": {
+      "patterns": [
+        {
+          "match": "(?<!\\.)\\b(old)(?=\\s*\\()",
           "name": "keyword.other.contextual.bezel"
+        },
+        {
+          "match": "(?<!\\.)\\b(result)\\b",
+          "name": "keyword.other.contextual.bezel"
+        },
+        {
+          "begin": "\\(",
+          "end": "\\)",
+          "patterns": [
+            {
+              "include": "#ensures-body"
+            }
+          ]
+        },
+        {
+          "begin": "\\b(case)\\b",
+          "end": "\\b(of)\\b|(?=;|=>|\\bend\\b)",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.control.bezel"
+            }
+          },
+          "endCaptures": {
+            "1": {
+              "name": "keyword.control.contextual.bezel"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#ensures-body"
+            }
+          ]
+        },
+        {
+          "include": "$self"
+        }
+      ]
+    },
+    "extern-body": {
+      "patterns": [
+        {
+          "match": "(?:(?<=[(,<])|^)\\s*\\b(env)\\b(?=\\s*[,)])",
+          "captures": {
+            "1": {
+              "name": "keyword.other.contextual.bezel"
+            }
+          }
+        },
+        {
+          "match": "\\b(variadic)\\s*(?=\\(\\s*[0-9])",
+          "captures": {
+            "1": {
+              "name": "keyword.other.contextual.bezel"
+            }
+          }
+        },
+        {
+          "include": "$self"
         }
       ]
     },
