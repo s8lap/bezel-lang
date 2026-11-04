@@ -131,6 +131,15 @@ void expectValue(const JitResult& r, const char* out) {
                       std::string::npos);
 }
 
+// fix #8033 (K8.4, v0.355): the specific diagnostic for binding a borrow
+// result read off an unbound owned temporary receiver.
+void expectTemporaryReceiverBindingRejected(const JitResult& r) {
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "over an unbound owned temporary receiver is a borrow whose "
+           "source is that temporary"));
+}
+
 }  // namespace
 
 // ── THE TRANSFER MEMBERS ───────────────────────────────────────────────────
@@ -549,9 +558,15 @@ end C;
 // so the collection leaks on BOTH arms (the sound direction, and the reason this
 // row's oracle is the program's OUTPUT and not a leak count). The program
 // prints its sum with no sanitizer error.
+//
+// fix #8033 (K8.4, stdlib §4.11, v0.355): this row used to BIND the borrow
+// (`var x: Cell := MkS().Peek();`), which K8.4 rejects ("rejected, never
+// lifetime-extended … among them a binding"). The subject — the collection
+// survives its result's use — is now exercised where K8.4 admits the borrow,
+// within the full expression, and the bound spelling pins the rejection.
 BEZEL_TEST(owned_transfer_chain_receiver_8028,
            peek_borrow_result_keeps_the_collection_alive_spec_28_3) {
-    expectValue(bezel::test::runAotCheckedLenient(R"BZL(
+    expectTemporaryReceiverBindingRejected(bezel::test::runAotChecked(R"BZL(
 module M; import System; import System.Collections.Generic;
 class Cell
   public v: int := 1;
@@ -571,15 +586,41 @@ class C
     Console.WriteLine(t); return 0;
   end Main;
 end C;
+)BZL"));
+    expectValue(bezel::test::runAotCheckedLenient(R"BZL(
+module M; import System; import System.Collections.Generic;
+class Cell
+  public v: int := 1;
+end Cell;
+class C
+  public static method MkS(): owned OwningStack<Cell>
+    var s := new OwningStack<Cell>();
+    s.Push(new Cell());
+    return s;
+  end MkS;
+  public static method Main(): int
+    var t := 0;
+    for var i in 0..<100 do
+      t += MkS().Peek().v;
+    end for;
+    Console.WriteLine(t); return 0;
+  end Main;
+end C;
 )BZL"),
                  "100\n");
 }
 
 // `GetOrNull(key: K): V?` (stdlib §4.9) — a BORROW of the stored value, and
 // the same rule: the collection must survive its result.
+//
+// fix #8033 (K8.4, stdlib §4.11, v0.355): this row used to BIND the borrow
+// (`var x: Cell? := MkD().GetOrNull("k");`), which K8.4 rejects ("rejected, never
+// lifetime-extended … among them a binding"). The subject — the collection
+// survives its result's use — is now exercised where K8.4 admits the borrow,
+// within the full expression, and the bound spelling pins the rejection.
 BEZEL_TEST(owned_transfer_chain_receiver_8028,
            getornull_borrow_result_keeps_the_collection_alive_spec_28_3) {
-    expectValue(bezel::test::runAotCheckedLenient(R"BZL(
+    expectTemporaryReceiverBindingRejected(bezel::test::runAotChecked(R"BZL(
 module M; import System; import System.Collections.Generic;
 class Cell
   public v: int := 4;
@@ -595,6 +636,26 @@ class C
     for var i in 0..<100 do
       var x: Cell? := MkD().GetOrNull("k");
       if x <> null then t += x.v; end if;
+    end for;
+    Console.WriteLine(t); return 0;
+  end Main;
+end C;
+)BZL"));
+    expectValue(bezel::test::runAotCheckedLenient(R"BZL(
+module M; import System; import System.Collections.Generic;
+class Cell
+  public v: int := 4;
+end Cell;
+class C
+  public static method MkD(): owned OwningDictionary<string, Cell>
+    var d := new OwningDictionary<string, Cell>();
+    d.Add("k", new Cell());
+    return d;
+  end MkD;
+  public static method Main(): int
+    var t := 0;
+    for var i in 0..<100 do
+      t += MkD().GetOrNull("k")!.v;
     end for;
     Console.WriteLine(t); return 0;
   end Main;

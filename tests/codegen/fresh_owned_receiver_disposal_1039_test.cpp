@@ -36,6 +36,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/aot_support.hpp"      // runAot — AOT oracle (JIT->AOT migration)
+#include "support/aot_result_asserts.hpp"
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "support/scratch_dir.hpp"
@@ -231,9 +232,17 @@ BEZEL_TEST(fresh_owned_receiver_1039, heap_string_field_result_not_disposed) {
 }
 
 // A class-reference method result borrows a receiver sub-object; the receiver
-// must NOT be disposed (else the returned reference dangles). No UAF / DF.
+// must NOT be disposed before the borrow's use (else the returned reference
+// dangles). No UAF / DF.
+//
+// fix #8033 (K8.4, §28.3 announcement table row 4, v0.355): this row used to
+// BIND the borrow — `var i: Inner := new Cell().GetIn();` — and expect the
+// program to run. K8.4 rejects that binding ("a borrow or frame that would
+// escape it is **rejected, never lifetime-extended** … among them a
+// binding"), so the binding now pins the rejection, and the exclusion under
+// test is exercised where K8.4 admits the borrow: within the full expression.
 BEZEL_TEST(fresh_owned_receiver_1039, class_reference_result_not_disposed) {
-    std::string src =
+    const std::string decls =
         "module M; "
         "class Inner public W: int := 5; end Inner; "
         // `In` is `owned` (§28.5): a fresh `new Inner()` may not initialize a
@@ -244,9 +253,22 @@ BEZEL_TEST(fresh_owned_receiver_1039, class_reference_result_not_disposed) {
         "  public constructor() n := n + 1; end constructor; "
         "  public method GetIn(): Inner return In; end GetIn; "
         "  destructor n := n - 1; end destructor; "
-        "end Cell; "
+        "end Cell; ";
+    {
+        auto bound = runAot(decls +
+            "class P public static method Main(): int "
+            "  do var i: Inner := new Cell().GetIn(); var v: int := i.W; end; "
+            "  return 7; end Main; "
+            "end P;");
+        BEZEL_EXPECT_TRUE(
+            bezel::test::failedAtCompileTimeWithRealLocation(bound));
+        BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+            bound, "over an unbound owned temporary receiver is a borrow "
+                   "whose source is that temporary"));
+    }
+    std::string src = decls +
         "class P public static method Main(): int "
-        "  do var i: Inner := new Cell().GetIn(); var v: int := i.W; end; "
+        "  do var v: int := new Cell().GetIn().W; end; "
         "  return 7; end Main; "
         "end P;";
     BEZEL_EXPECT_EQ(run(src), 7);

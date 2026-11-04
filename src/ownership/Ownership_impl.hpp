@@ -5358,6 +5358,23 @@ private:
     // temporary is disposed at the declaration's statement end.
     const ast::Expr* usingVarTemporaryRootedBorrowRead(const ast::Expr& init);
 
+    // fix #8033 (K8.4, §28.3 *Producers* / announcement table rows 4-5,
+    // v0.355): when `init` — a local declaration's initializer — is an
+    // instance call (or an indexer get) whose result is a BORROW of a
+    // borrow-carrying type, and whose RECEIVER is an unbound owned temporary
+    // (a `new` expression or a call producing an owned value), or a meet with
+    // such an arm, returns that call / index expression; nullptr otherwise.
+    // The announcement table gives a plain class-typed instance return (row 4)
+    // and a bare-type-parameter instance return at a class substitution
+    // (row 5) a borrow whose source set holds the receiver — stdlib §4.11:
+    // `Stack<T>.Pop()`'s borrow has "compile-time source … the collection" —
+    // and the indexer row bounds a borrowing collection's element by the
+    // collection. K8.4 rejects the binding: "a borrow or frame that would
+    // escape it is **rejected, never lifetime-extended** … among them a
+    // binding". `var x := Mk().Pop();` (#8033) and `var t := new
+    // Shelf().Top();` (the K8 example) are the canonical shapes.
+    const ast::Expr* temporaryReceiverBorrowResult(const ast::Expr& init);
+
     // §28.10 *Adopting a named owned binding* (v0.350, derives K3.4): an
     // UNMARKED `using var y := x;` (and the anonymous `using var _ := x;`, and
     // `await using var y := x;`, §28.12) whose right-hand side is a named

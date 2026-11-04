@@ -472,9 +472,15 @@ end C;
 // reports and which fails the row (the program would not run to completion).
 // MEASURED on the fixed compiler: 22400 B / 300 allocations leak BY DESIGN
 // here, and the program prints its sum with no sanitizer error.
+//
+// fix #8033 (K8.4, stdlib §4.11, v0.355): this row used to BIND the borrow
+// (`var x: Cell := MkS().Peek();`), which K8.4 rejects ("rejected, never
+// lifetime-extended … among them a binding"). The bound spelling now pins the
+// rejection, and the subject is exercised within the full expression.
 BEZEL_TEST(owned_owning_collection_chain_receiver_8009,
            peek_result_keeps_the_collection_alive_spec_28_3) {
-    const JitResult r = bezel::test::runAotCheckedLenient(R"BZL(
+    {
+        const JitResult bound = runAotChecked(R"BZL(
 module M; import System; import System.Collections.Generic;
 class Cell
   public v: int := 1;
@@ -490,6 +496,32 @@ class C
     for var i in 0..<100 do
       var x: Cell := MkS().Peek();
       t += x.v;
+    end for;
+    Console.WriteLine(t); return 0;
+  end Main;
+end C;
+)BZL");
+        BEZEL_EXPECT_TRUE(
+            bezel::test::failedAtCompileTimeWithRealLocation(bound));
+        BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+            bound, "over an unbound owned temporary receiver is a borrow "
+                   "whose source is that temporary"));
+    }
+    const JitResult r = bezel::test::runAotCheckedLenient(R"BZL(
+module M; import System; import System.Collections.Generic;
+class Cell
+  public v: int := 1;
+end Cell;
+class C
+  public static method MkS(): owned OwningStack<Cell>
+    var s := new OwningStack<Cell>();
+    s.Push(new Cell());
+    return s;
+  end MkS;
+  public static method Main(): int
+    var t := 0;
+    for var i in 0..<100 do
+      t += MkS().Peek().v;
     end for;
     Console.WriteLine(t); return 0;
   end Main;

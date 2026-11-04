@@ -5805,9 +5805,44 @@ void MethodOwnership::checkBareBorrowTempLaunder(const ast::Expr& e) {
     // result (never reaching those sites) is admitted, the temporary's
     // end-of-statement disposal running after the uses. // per §28.3 v0.194
     auto* ce = dynamic_cast<const ast::CallExpr*>(&e);
-    if (!ce) return;
-    BareBorrowCallInfo info = analyzeBareBorrowCall(*ce);
-    if (!info.unboundOwnedTemp) return;
+    BareBorrowCallInfo info;
+    if (ce) info = analyzeBareBorrowCall(*ce);
+    if (!info.unboundOwnedTemp) {
+        // fix #8033 (K8.4, §28.3 announcement table rows 4-5, v0.355): the
+        // RECEIVER twin of the argument launder above. An instance call or
+        // indexer get over an unbound owned temporary yields a borrow whose
+        // source set holds that receiver (row 4: "instance — source the
+        // receiver"; row 5 at a class substitution; the indexer row's
+        // collection proxy bound; stdlib §4.11 for `Stack<T>.Pop()`), so the
+        // result is bounded to this full expression and K8.4 rejects the
+        // binding, store or return of it: "rejected, never
+        // lifetime-extended". `var x := Mk().Pop();` bound a borrow of a
+        // `Stack` freed at the statement's end. Within the statement
+        // (`Mk().Pop().v`) the use is admitted and never reaches this site.
+        if (const ast::Expr* r = temporaryReceiverBorrowResult(e)) {
+            std::string what = "the call's result";
+            if (const auto* rc = dynamic_cast<const ast::CallExpr*>(r)) {
+                if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        rc->callee.get()))
+                    what = "`." + std::string(ma->member) + "(...)`";
+                else if (const auto* nm =
+                             dynamic_cast<const ast::NullCondMemberExpr*>(
+                                 rc->callee.get()))
+                    what = "`?." + std::string(nm->member) + "(...)`";
+            } else if (dynamic_cast<const ast::IndexExpr*>(r)) {
+                what = "the indexer read";
+            }
+            report(Severity::Error, r->span.begin,
+                   what + " over an unbound owned temporary receiver is a "
+                   "borrow whose source is that temporary, which is disposed "
+                   "at the end of this full expression (§28.3.11), so the "
+                   "borrow may not be bound, stored, or returned (K8.4: "
+                   "rejected, never lifetime-extended); bind the receiver to "
+                   "a name first (`using var h := <producer>;`), then read "
+                   "through `h`");
+        }
+        return;
+    }
     report(Severity::Error, info.unboundOwnedTemp->span.begin,
            "a freshly-produced owned value passed as an argument to a "
            "bare-type-parameter call is an unbound owned temporary — the call's "
@@ -7606,6 +7641,76 @@ const ast::Expr* MethodOwnership::usingVarTemporaryRootedBorrowRead(
     // borrow of some other source, not a temporary, and stays a pin.
     if (isUnboundProducerExpr(*cur) &&
         producerState(*cur) == OwnershipState::Owned)
+        return p;
+    return nullptr;
+}
+
+// fix #8033 (K8.4, §28.3 announcement table rows 4-5, v0.355): see the header.
+const ast::Expr* MethodOwnership::temporaryReceiverBorrowResult(
+        const ast::Expr& init) {
+    const ast::Expr* p = &init;
+    while (const auto* bang = dynamic_cast<const ast::PostfixBangExpr*>(p)) {
+        if (!bang->operand) return nullptr;
+        p = bang->operand.get();
+    }
+    // A meet: any arm that is such a result puts the temporary in the
+    // binding's source union (§28.3 K7.2), the shape #7687's helper reads.
+    if (const auto* ce = dynamic_cast<const ast::ConditionalExpr*>(p)) {
+        if (ce->thenValue)
+            if (auto* r = temporaryReceiverBorrowResult(*ce->thenValue))
+                return r;
+        if (ce->elseValue)
+            if (auto* r = temporaryReceiverBorrowResult(*ce->elseValue))
+                return r;
+        return nullptr;
+    }
+    if (const auto* be = dynamic_cast<const ast::BinaryExpr*>(p)) {
+        if (be->op != "??") return nullptr;
+        if (be->left)
+            if (auto* r = temporaryReceiverBorrowResult(*be->left)) return r;
+        if (be->right)
+            if (auto* r = temporaryReceiverBorrowResult(*be->right)) return r;
+        return nullptr;
+    }
+    if (const auto* cs = dynamic_cast<const ast::CaseExpr*>(p)) {
+        for (const auto& arm : cs->arms)
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression &&
+                arm.exprBody)
+                if (auto* r = temporaryReceiverBorrowResult(*arm.exprBody))
+                    return r;
+        return nullptr;
+    }
+    // The result must carry a borrow — the same gate #7687 applies: a value,
+    // `string` or runtime-managed result is row 7 (no borrow), and an `owned`
+    // or mint-announcing result is a fresh value of its own (rows 1-3), which
+    // the binding adopts.
+    const sema::TypeRef* rt = ctx_.exprType(*p);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration ||
+        !isBorrowableType(rt))
+        return nullptr;
+    const ast::Expr* recv = nullptr;
+    if (const auto* call = dynamic_cast<const ast::CallExpr*>(p)) {
+        if (producerState(*call) == OwnershipState::Owned) return nullptr;
+        if (const auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get()))
+            recv = ma->target.get();
+        else if (const auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                     call->callee.get()))
+            recv = nm->target.get();
+    } else if (const auto* ix = dynamic_cast<const ast::IndexExpr*>(p)) {
+        recv = ix->target.get();
+    }
+    if (!recv) return nullptr;
+    // The receiver: the §28.3.11 unbound owned temporary. A static call's
+    // target is a type name, never a producer, so only instance and
+    // extension receivers reach here. A deferred-activation frame (`s.
+    // Reverse()`, a lazy query, §28.3.11 *Deferred-activation callees*) is
+    // excluded, as the argument scan's `noteTemp` excludes it: an element
+    // read through it carries the frame's carried sources (`s`), not the
+    // frame itself.
+    if (isUnboundProducerExpr(*recv) &&
+        producerState(*recv) == OwnershipState::Owned &&
+        !isDeferredActivationCallResult(*recv))
         return p;
     return nullptr;
 }
