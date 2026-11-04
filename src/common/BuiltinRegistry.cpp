@@ -767,9 +767,52 @@ constexpr std::array<BuiltinParamRow, 385> kBuiltinParams = {{
     {"Math", "Abs", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {kBPTLong, 0, 0, 0, 0, 0, 0, 0}, "Abs(x: long): long"},
     {"Math", "Abs", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "Abs(x: double): double"},
     {"Math", "Abs", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {kBPTDecimal, 0, 0, 0, 0, 0, 0, 0}, "Abs(x: decimal): decimal"},
-    {"Math", "Min", 2, 2, 0x00, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Math", "Max", 2, 2, 0x00, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Math", "Clamp", 3, 3, 0x00, {"value", "low", "high", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    // fix #7660 (stdlib §2.2, §14.2, §7.3, §7.4, v0.355): the `Min` / `Max` /
+    // `Clamp` rows now STATE the §7.3 NULLABILITY of their positions, exactly
+    // as the `Sign` row below already did (0x01, since #7227).
+    //
+    // stdlib §2.2 declares
+    //     public static method Min<T>(a: T, b: T): T where T: IComparable<T>;
+    //     public static method Max<T>(a: T, b: T): T where T: IComparable<T>;
+    //     public static method Clamp<T>(value: T, low: T, high: T): T where T: IComparable<T>;
+    // and §14.2 (v0.355) makes the TYPE PARAMETER of a type-bound constraint
+    // NON-NULLABLE: "A type-bound constraint — naming a class or interface —
+    // implies non-null T. … a `null` value satisfies no interface contract, so
+    // a class or interface bound admits only non-nullable substitutions". So
+    // `T` is a non-nullable type and the parameters `a` / `b` / `value` /
+    // `low` / `high` are NON-NULLABLE parameters — the standard library spells
+    // them without a `?`, which is what this table's `nonNullable` column
+    // transcribes (the same column `Sign`'s row already carried for the same
+    // reason: `where T: INumber<T>`).
+    //
+    // THE DEFECT. These three rows carried `0x00`, so the §7 nullability gate
+    // (`ExprTC::checkBuiltinNullableArgs` → `common::builtinParamIsNonNullable`)
+    // had NO declared position to claim at them, and an un-narrowed nullable
+    // argument passed sema untouched and reached CODEGEN, which reported the
+    // fail-closed guard's own text —
+    //     `Math.Min` could not lower a comparison for this argument type
+    //     (stdlib §2.2 requires `where T: IComparable<T>`) … (#2786)
+    // — a message about the COMPARISON, about a type the argument does not
+    // have, at a call §7.3 refuses for a reason that has nothing to do with
+    // ordering. The refusal was right; its WORDING was the wrong rule's.
+    //
+    // The §7 house wording is the one the sibling `Math.Sign` already draws
+    // for the same shape ("the argument to `Math.Sign` is nullable but the
+    // target type is non-nullable (§7)", #7227): §7.3 (v0.355) "Assigning
+    // `null` to a non-nullable target is a compile error", and §7.1 (v0.355)
+    // "The compiler enforces the distinction at every assignment, parameter
+    // pass, and return." A §7.4 NARROWING still discharges the nullability
+    // (the gate asks `isNarrowedNonNullRead`), so the legal narrowed spellings
+    // keep compiling and running.
+    //
+    // The `kinds` column stays `0`: the declared parameter TYPE is the type
+    // PARAMETER `T`, and the vocabulary names the concrete kinds only — the
+    // §5.1 admission question at these positions is §14.2's CONSTRAINT
+    // question, which the compiler's own `Math.Min` / `Max` / `Clamp` block
+    // already asks.
+    {"Math", "Min", 2, 2, 0x03, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Max", 2, 2, 0x03, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Clamp", 3, 3, 0x07, {"value", "low", "high", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Math", "Sqrt", 1, 1, 0x01, {"x", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "Sqrt(x: double): double"},
     {"Math", "Pow", 2, 2, 0x03, {"x", "y", "", "", "", "", "", ""}, {kBPTDouble, kBPTDouble, 0, 0, 0, 0, 0, 0}, "Pow(x: double, y: double): double"},
     {"Math", "Floor", 1, 1, 0x01, {"x", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "Floor(x: double): double"},
