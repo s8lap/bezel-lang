@@ -40304,8 +40304,23 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
         // borrow), so the single release frees each exactly once.
         // fix #7696 (stdlib §2.6, v0.350): `Guid.ToByteArray()` is a fresh
         // `owned Array<byte>` the local solely owns, like Split.
+        // fix #8124 (stdlib §9.6, v0.355): `ToCharArray()` is the third
+        // stdlib §9.6 `owned Array<T>`-returning member (`public method
+        // ToCharArray(): owned Array<char>;`) and it was MISSING here, so a
+        // plain `var a := s.ToCharArray();` — and its `?.` twin
+        // `var a := s?.ToCharArray();` — never reached the scope-end reclaim:
+        // the fresh backing leaked on every binding. MEASURED (ASan/LSan), a
+        // 100-iteration loop of `var a := s.ToCharArray();` leaks "11200
+        // byte(s) in 200 allocation(s)" (the `bz_array_alloc` backing plus
+        // the `bz_array_grow` data buffer) — the byte-identical program on
+        // the `using var` binding leaks nothing, and so does the `Split`
+        // sibling, which IS in this list. The member is a §9.6 instance
+        // method with no MethodSymbol (the same `calleeResolvedBySema` gate
+        // as its siblings excludes a USER method of the same name), and its
+        // elements are CODE POINTS (a value element type), so the reclaim
+        // uses the value-element disposer — no per-element release.
         return mm == "ToArray" || mm == "Sorted" || mm == "Reversed" ||
-               mm == "Split" || mm == "ToByteArray";
+               mm == "Split" || mm == "ToByteArray" || mm == "ToCharArray";
     }
     // Branch B (#2753): a §28.3 RANGE SLICE on `Array<T>` — `arr[r]` (the
     // compiler-recognized `Slice(r: Range<int>): owned Array<T>` form, stdlib
