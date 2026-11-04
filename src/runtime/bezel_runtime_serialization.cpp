@@ -1366,9 +1366,23 @@ struct bz_jder_token {
 
 // Skip one complete JSON value at current pos (after ws skip).
 // Used by SkipValue (unknown-field policy).
+//
+// fix #8128 / stdlib §2.15 (v0.355) "Errors": the skip path must raise AT
+// MOST ONE exception.  bz_ser_throw stores the exception object in the
+// thread-local bz_exc slot and RETURNS (the generated code checks the slot
+// after the call), so a raise that happens while another one is already in
+// flight OVERWRITES the slot with no regard for what was there: the first
+// exception object — and its own heap-allocated Message string — is orphaned
+// (leaked), and the caller observes the second, less specific diagnostic.
+// The nested-failure paths below therefore PROPAGATE the failure (they return
+// without raising again) instead of carrying on and raising a second time.
+// This mirrors the pending-check idiom used elsewhere in this file (the
+// `if (bz_exc) return ...;` guards in bz_binder_read_poly_discriminator /
+// bz_binder_read_case_discriminator, #2427 / #2432).
 static void bz_jder_skip_value(bz_binder_t* d);
 
 static void bz_jder_skip_value_impl(bz_binder_t* d) {
+    extern thread_local void* bz_exc;
     int c = bz_jder_peek(d);
     if (c < 0) { bz_ser_throw_at_json("Unexpected end in JSON skip (§2.15)", d); return; }
 
@@ -1376,6 +1390,10 @@ static void bz_jder_skip_value_impl(bz_binder_t* d) {
         // String: parse and discard.
         int64_t ncp = 0;
         uint32_t* cps = bz_jder_parse_string_cps(d, &ncp);
+        // fix #8128: a null result means bz_jder_parse_string_cps raised
+        // (malformed string / OOM) — the exception is already in flight, so
+        // return without raising again.
+        if (!cps) return;
         free(cps);
     } else if (c == '{') {
         ++d->pos;  // skip '{'
@@ -1386,9 +1404,14 @@ static void bz_jder_skip_value_impl(bz_binder_t* d) {
             // key
             int64_t ncp = 0;
             uint32_t* cps = bz_jder_parse_string_cps(d, &ncp);
+            // fix #8128: a failed key parse has already raised; do not raise a
+            // second time over it (which would orphan the first exception).
+            if (!cps) return;
             free(cps);
-            if (!bz_jder_expect_char(d, ':')) return;
+            if (!bz_jder_expect_char(d, ':')) return;   // raised inside
             bz_jder_skip_value(d);
+            // fix #8128: a nested failure has already raised; propagate it.
+            if (bz_exc) return;
             bz_jder_skip_ws(d);
             if (d->pos >= d->len) { bz_ser_throw_at_json("Truncated JSON object in skip (§2.15)", d); return; }
             if (d->data[d->pos] == ',') { ++d->pos; continue; }
@@ -1402,6 +1425,9 @@ static void bz_jder_skip_value_impl(bz_binder_t* d) {
         if (d->pos < d->len && d->data[d->pos] == ']') { ++d->pos; return; }
         while (true) {
             bz_jder_skip_value(d);
+            // fix #8128: a nested failure has already raised; propagate it
+            // instead of raising "Expected ',' or ']'" over it.
+            if (bz_exc) return;
             bz_jder_skip_ws(d);
             if (d->pos >= d->len) { bz_ser_throw_at_json("Truncated JSON array in skip (§2.15)", d); return; }
             if (d->data[d->pos] == ',') { ++d->pos; continue; }
