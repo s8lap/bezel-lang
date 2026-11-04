@@ -1249,6 +1249,27 @@ follow-up (deliver it with `scripts/lane_dispatch.sh --resume <session-id>`).
      python3 "$s" --strict >/dev/null 2>&1 && echo PASS || echo FAIL
    done
    ```
+   ⇒ ⇒ ⇒ ⇒ ⇒ **⇒ RUN THE SWEEP *AFTER EVERY PICK*, NOT ONLY BEFORE THE GATE.**
+   **MEASURED 2026-11-04 15:35.** The R38 run picked four commits (#8061,
+   #8059, #8044, #8051) over two heartbeats and **never ran the sweep**. The
+   sweep, run on the tip afterwards, found **2 of 25 RED** — and one of the two
+   was **not** the known stale-`build/bezelc` one: the **#7972** pick had
+   added a test row that trips **`check_ambiguous_ran_false`** (a rejection
+   claim pinned only by `.ran`, which `runAot` reports false for FOUR
+   outcomes, not one). **⇒ ⇒ ⇒ ⇒ ⇒ THAT ROW WAS IN THE TREE FOR ~40 MINUTES
+   AND WAS ONLY CAUGHT BY ACCIDENT.** ⇒ A ratchet trip is a **GATE BLOCKER**:
+   the gate cannot launch while it is RED, so a trip discovered at the
+   endgame costs the whole endgame. **⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE SWEEP IS BUILD-FREE
+   AND COSTS SECONDS — RUN IT AFTER EVERY `pick_stage.sh` AND FIX THE TRIP
+   BEFORE THE NEXT PICK.**
+   ⇒ **⇒ AND THE FIX FOR AN AMBIGUOUS-CLAIM TRIP IS *NEVER* THE GRANDFATHER
+   FILE.** `scripts/ambiguous_ran_false.grandfather` is a ratchet EXEMPTION:
+   adding a row to it silences a check that the row itself provoked. **⇒ IF
+   THE ROW CAN BE MADE SOUND, MAKE IT SOUND** — the repo's own leak-oracle
+   test (`tests/support/aot_leak_detection_4638_test.cpp`) already carries the
+   protection: a `diagnosticMessageContains(r, "LeakSanitizer fired")` pin
+   beside the `!r.ran` claim, which tells a deliberate oracle abort from an
+   unrelated crash.
    ⚠ **The checkers fail CLOSED, so a checker run from the wrong directory cannot
    report a clean pass.** Measured 2026-11-02: every one of the 28
    `scripts/check_*.py`, run from a directory that is not a checkout, either
