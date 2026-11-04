@@ -39,6 +39,33 @@
 #              I/O as well makes the exemption fire far more often, and a build
 #              is essentially never at exactly zero progress on BOTH.
 #
+#   TREE-AWARE (2026-11-05). The exemption is for the whole process TREE: a
+#              candidate is exempt when ANY DESCENDANT is working (CPU or I/O
+#              advanced) or io-blocked (D). Measured 2026-11-05: of 36 "stale",
+#              ~20 were the idle PARENT shells (bash / nohup wrappers) of test
+#              suites that live lanes were still running — the bezel_tests
+#              child was working and exempt, its parent was not, so --kill
+#              would have orphaned live work. A parent waiting on a working
+#              child is not wedged.
+#
+#   PROTECTED  a process whose cwd is inside a PROTECTED worktree is exempt
+#              unless --include-protected: the main checkout, the worktree
+#              this runs in, every LOCKED worktree (the warm pool, staging),
+#              and every path in --protect FILE (one per line; the coordinator
+#              passes its live lanes' worktrees). That is where the
+#              coordinator's own live waiter loops sit.
+#
+#   TIER W — WAITER-TARGET-SATISFIED, at any age. A waiter loop whose target
+#              is satisfied but which provably cannot see it: its own
+#              `pgrep -f X` matches ITSELF (X is in its argv), so
+#              `until … ! pgrep -f X` never exits. Decided by
+#              scripts/reap_waiter_target.py, at both ends of the settle
+#              window, only when the loop parses completely. A loop whose
+#              target is satisfied but which is NOT blind (`until grep -q
+#              DONE log` with DONE present) is NOT decided — it should exit by
+#              itself, and if it does not, the parser is the likelier fault —
+#              so it keeps whatever tier its age gives it (A, B or none).
+#
 # SAFE BY DEFAULT: dry-run. It only LISTS. Pass --kill to signal.
 #   - PID-only. Never `pkill` by name (the kill-guard hook refuses it, and a
 #     name match would hit an in-flight gate's identically-named binary).
@@ -51,8 +78,11 @@
 #   scripts/reap_stale.sh --orphan-age 60 # Tier A bar   (default  300s)
 #   scripts/reap_stale.sh --kill          # SIGTERM, then SIGKILL stragglers
 #   scripts/reap_stale.sh --no-exclude-working   # also list working (Tier 0)
+#   scripts/reap_stale.sh --protect FILE  # exempt processes cwd'd in these worktrees
+#   scripts/reap_stale.sh --include-protected    # do NOT exempt protected worktrees
 #   scripts/reap_stale.sh --self-test     # prove the classifier on synthetic input
 set -u
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 AGE=1200          # Tier B: seconds alive before an attached process is stale
 ORPHAN_AGE=300    # Tier A: seconds alive before an OWNERLESS process is stale
@@ -60,6 +90,8 @@ SETTLE=5          # CPU-progress sampling window, seconds
 KILL=0
 SELF_TEST=0
 LIST_WORKING=0
+PROTECT_FILE=""
+INCLUDE_PROTECTED=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -69,7 +101,9 @@ while [ $# -gt 0 ]; do
     --settle)              SETTLE="${2:?--settle needs a value}"; shift ;;
     --no-exclude-working) LIST_WORKING=1 ;;
     --self-test)           SELF_TEST=1 ;;
-    -h|--help)             sed -n '2,45p' "$0"; exit 0 ;;
+    --protect)             PROTECT_FILE="${2:?--protect needs a file}"; shift ;;
+    --include-protected)   INCLUDE_PROTECTED=1 ;;
+    -h|--help)             sed -n '2,80p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
   shift
@@ -84,6 +118,10 @@ for pair in "AGE:$AGE" "ORPHAN_AGE:$ORPHAN_AGE" "SETTLE:$SETTLE"; do
 done
 [ "$AGE" -ge 30 ]        || { echo "--age must be >= 30s" >&2; exit 2; }
 [ "$ORPHAN_AGE" -ge 30 ] || { echo "--orphan-age must be >= 30s" >&2; exit 2; }
+if [ -n "$PROTECT_FILE" ] && [ ! -r "$PROTECT_FILE" ]; then
+  # A typo must not silently UNPROTECT the coordinator's live lanes.
+  echo "--protect file '$PROTECT_FILE' is not readable" >&2; exit 2
+fi
 
 # ---------------------------------------------------------------------------
 # Classifier. Three families, all observed on this box:
@@ -101,7 +139,7 @@ done
 # worktrees path, so a user's `tail -f /var/log/messages` is never matched.
 # ---------------------------------------------------------------------------
 HEAVY='bezel_tests_[a-z]+|(^|[ /])bezelc |cc1plus|(^|[ /])clang(\+\+)? |ld\.lld|ld\.mold|cmake --build|dev_heavy\.sh|agent_check\.sh|run_parallel\.sh|asan_sweep\.sh|ratchet_sweep\.sh'
-WAITERS='while ! test -f|until .* do sleep|until grep|tail -f (/var/tmp/bezel-scratch|/mnt/fast/worktrees|.*bezel-scratch.*)|wait_pid\.sh|chain-half'
+WAITERS='while ! test -f|until .* do sleep|until grep|while (! )?(pgrep|kill -0) |tail -f (/var/tmp/bezel-scratch|/mnt/fast/worktrees|.*bezel-scratch.*)|wait_pid\.sh|chain-half'
 PATTERN="$HEAVY|$WAITERS"
 
 # Gate guard: never touch anything while a gate is live. A gate legitimately
@@ -173,6 +211,93 @@ state_of() { awk '{print $3}' "/proc/$1/stat" 2>/dev/null || echo '?'; }
 # REAP costs a lane.  Err toward not killing.
 is_agent_process() {
   printf '%s' "$1" | grep -qE '(^|/)opencode run .*--session'
+}
+
+# --- process-tree snapshots (the TREE-AWARE exemption) ----------------------
+# snap <S0|S1> fills <S>_PP[pid]=ppid, <S>_ST[pid]=state letter,
+# <S>_TK[pid]=utime+stime clock ticks, <S>_IO[pid]=read+write bytes (when
+# readable). One pass over /proc, builtins only — no fork per process.
+declare -A S0_PP=() S0_ST=() S0_TK=() S0_IO=() S1_PP=() S1_ST=() S1_TK=() S1_IO=() KIDS=()
+snap() {
+  local -n _pp="$1_PP" _st="$1_ST" _tk="$1_TK" _io="$1_IO"
+  _pp=(); _st=(); _tk=(); _io=()
+  local d p line rest k v r w
+  local -a f
+  for d in /proc/[0-9]*; do
+    p=${d#/proc/}
+    { read -r line < "$d/stat"; } 2>/dev/null || continue
+    rest=${line##*) }
+    read -r -a f <<< "$rest"
+    _st[$p]=${f[0]}; _pp[$p]=${f[1]}; _tk[$p]=$(( ${f[11]:-0} + ${f[12]:-0} ))
+    r=""; w=""
+    { while read -r k v; do
+        case $k in read_bytes:) r=$v ;; write_bytes:) w=$v ;; esac
+      done < "$d/io"; } 2>/dev/null
+    [ -n "$r" ] && [ -n "$w" ] && _io[$p]=$((r + w))
+  done
+}
+# index_kids — KIDS[ppid]="pid pid …" from the S1 snapshot.
+index_kids() {
+  local p
+  KIDS=()
+  for p in "${!S1_PP[@]}"; do KIDS[${S1_PP[$p]}]+=" $p"; done
+}
+# tree_activity <pid> — prints why a DESCENDANT keeps <pid> alive, or nothing:
+#   "working <dpid>"  a descendant present in both snapshots advanced CPU or I/O,
+#                     or one born inside the window already used >1 tick
+#   "blocked <dpid>"  a descendant is in D state (io-blocked: exempt, as for self)
+# Err toward not killing: any sign of work below the candidate exempts it.
+tree_activity() {
+  local -a q=(${KIDS[$1]:-}) seen=()
+  local d
+  while [ "${#q[@]}" -gt 0 ]; do
+    d=${q[0]}; q=("${q[@]:1}")
+    case " ${seen[*]:-} " in *" $d "*) continue ;; esac
+    seen+=("$d")
+    if [ "${S1_ST[$d]:-}" = D ]; then echo "blocked $d"; return 0; fi
+    if [ -n "${S0_TK[$d]:-}" ]; then
+      if [ "${S1_TK[$d]:-0}" -gt "${S0_TK[$d]}" ]; then echo "working $d"; return 0; fi
+      if [ -n "${S0_IO[$d]:-}" ] && [ -n "${S1_IO[$d]:-}" ] && [ "${S1_IO[$d]}" -gt "${S0_IO[$d]}" ]; then
+        echo "working $d"; return 0
+      fi
+    elif [ "${S1_TK[$d]:-0}" -gt 1 ]; then
+      echo "working $d"; return 0
+    fi
+    q+=(${KIDS[$d]:-})
+  done
+}
+
+# --- the PROTECTED worktree set ------------------------------------------
+# canon <path> — realpath without requiring existence; in_tree <path> <root>.
+canon() { realpath -m -- "$1" 2>/dev/null || printf '%s\n' "$1"; }
+in_tree() { [ "$1" = "$2" ] || [ "${1#"$2"/}" != "$1" ]; }
+PROTECTED=()
+load_protected() {
+  local repo top common l
+  repo="$HERE/.."
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" && PROTECTED+=("$(canon "$top")")
+  common="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" &&
+    PROTECTED+=("$(canon "$(dirname "$common")")")
+  while read -r l; do [ -n "$l" ] && PROTECTED+=("$(canon "$l")"); done < <(
+    git -C "$repo" worktree list --porcelain 2>/dev/null |
+      awk '/^worktree /{p=substr($0,10)} /^locked/{print p}')
+  if [ -n "$PROTECT_FILE" ]; then
+    while IFS= read -r l || [ -n "$l" ]; do
+      l="${l%%#*}"; l="$(printf '%s' "$l" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [ -n "$l" ] && PROTECTED+=("$(canon "$l")")
+    done < "$PROTECT_FILE"
+  fi
+}
+# protected_root <pid> — the protected worktree holding <pid>'s cwd, or nothing.
+protected_root() {
+  local c r
+  c="$(readlink "/proc/$1/cwd" 2>/dev/null)" || return 0
+  for r in "${PROTECTED[@]}"; do in_tree "$c" "$r" && { printf '%s\n' "$r"; return 0; }; done
+}
+# waiter_verdicts <pid>… — "pid VERDICT" lines from reap_waiter_target.py.
+waiter_verdicts() {
+  [ "$#" -gt 0 ] || return 0
+  python3 "$HERE/reap_waiter_target.py" "$@" 2>/dev/null | awk -F'\t' '{print $1, $2}'
 }
 
 # ---------------------------------------------------------------------------
@@ -272,7 +397,10 @@ if [ "$SELF_TEST" = 1 ]; then
   # this is the exact property that distinguishes a build from a waiter.
   ( exec 3>&1; while :; do printf 'x' >&3; done ) >/dev/null 2>&1 &
   spin=$!
-  s0=$(cpu_cs "$spin"); sleep 1; s1=$(cpu_cs "$spin")
+  # 3 s, not 1: `ps -o times` counts WHOLE seconds, so on a loaded box (load
+  # ~28, measured 2026-11-05) a 1 s window often read 0 -> 0 (2 of 4 runs of
+  # the unchanged script) — a flaky self-test, not a classifier fault.
+  s0=$(cpu_cs "$spin"); sleep 3; s1=$(cpu_cs "$spin")
   kill -KILL "$spin" 2>/dev/null; wait "$spin" 2>/dev/null
   if [ -n "$s0" ] && [ -n "$s1" ] && [ "$s1" -gt "$s0" ]; then
     echo "  ok   [progress] a CPU-burning process advances cpu_cs ($s0 -> $s1)"
@@ -293,15 +421,65 @@ if [ "$SELF_TEST" = 1 ]; then
     fails=$((fails+1))
   fi
 
+  echo "self-test: TREE-AWARE exemption (an idle parent of a working child)"
+  # Measured 2026-11-05: the idle bash/nohup PARENT of a working bezel_tests was
+  # listed STALE while the child was exempt. The parent here only `wait`s.
+  bash -c 'while :; do :; done & wait' >/dev/null 2>&1 &
+  busy_parent=$!
+  bash -c 'sleep 300 & wait' >/dev/null 2>&1 &
+  idle_parent=$!
+  sleep 0.5
+  snap S0; sleep 1; snap S1; index_kids
+  ta_busy="$(tree_activity "$busy_parent")"; ta_idle="$(tree_activity "$idle_parent")"
+  pkill -KILL -P "$busy_parent" 2>/dev/null; pkill -KILL -P "$idle_parent" 2>/dev/null
+  kill -KILL "$busy_parent" "$idle_parent" 2>/dev/null; wait "$busy_parent" "$idle_parent" 2>/dev/null
+  case "$ta_busy" in
+    working*) echo "  ok   [exempt] idle parent of a CPU-burning child ($ta_busy)" ;;
+    *) echo "  FAIL idle parent of a working child not exempted (got '$ta_busy')"; fails=$((fails+1)) ;;
+  esac
+  if [ -z "$ta_idle" ]; then echo "  ok   [keep]   idle parent of an idle (sleep) child is NOT exempted"
+  else echo "  FAIL idle parent of a sleep child exempted ($ta_idle)"; fails=$((fails+1)); fi
+
+  echo "self-test: tier W (waiter-target-satisfied)"
+  assert 'while pgrep -f x >/dev/null; do sleep 1; done'        hit "$PATTERN" "" ""
+  assert 'while kill -0 1234 2>/dev/null; do sleep 60; done'    hit "$PATTERN" "" ""
+  # A self-matching waiter: the marker is in its own argv, and nothing else
+  # runs it, so `while pgrep -f MARKER` can never exit. Decided SATISFIED.
+  mk="reap-selftest-marker-$$-$RANDOM"
+  bash -c "while pgrep -f $mk >/dev/null; do sleep 30; done" >/dev/null 2>&1 &
+  w_blind=$!
+  # Waiting for a file that does not exist: legitimately WAITING.
+  bash -c "until test -f /nonexistent/w-$$-$RANDOM; do sleep 30; done" >/dev/null 2>&1 &
+  w_wait=$!
+  # Unparseable target ($(...) substitution): UNDECIDABLE, left to the age tiers.
+  bash -c "until test -n \"\$(cat /nonexistent/u-$$ 2>/dev/null)\"; do sleep 30; done" >/dev/null 2>&1 &
+  w_undec=$!
+  sleep 1.5
+  declare -A WV=()
+  while read -r _p _v; do WV[$_p]="$_v"; done < <(waiter_verdicts "$w_blind" "$w_wait" "$w_undec")
+  for _p in "$w_blind" "$w_wait" "$w_undec"; do pkill -KILL -P "$_p" 2>/dev/null; kill -KILL "$_p" 2>/dev/null; done
+  wait "$w_blind" "$w_wait" "$w_undec" 2>/dev/null
+  for _c in "$w_blind:SATISFIED:self-matching pgrep waiter, target gone" \
+            "$w_wait:WAITING:until test -f <missing file>" \
+            "$w_undec:UNDECIDABLE:command substitution in the condition"; do
+    _p=${_c%%:*}; _r=${_c#*:}; _want=${_r%%:*}; _d=${_r#*:}
+    if [ "${WV[$_p]:-}" = "$_want" ]; then echo "  ok   [$_want] $_d"
+    else echo "  FAIL expected=$_want got=${WV[$_p]:-none} :: $_d"; fails=$((fails+1)); fi
+  done
+
   if [ "$fails" -eq 0 ]; then echo "self-test: PASS"; exit 0; fi
   echo "self-test: FAIL ($fails assertion(s))"; exit 1
 fi
 
 # ---------------------------------------------------------------------------
 # Pass 1: collect candidates (pattern + tier), sampling CPU at the same time.
+# A WAITER-pattern process under both age bars is not a tier candidate, but is
+# kept as a W-probe: tier W can decide it at any age.
 # ---------------------------------------------------------------------------
 declare -A CPU0=() IO0=()
-declare -a C_PID=() C_TIER=() C_AGE=() C_CMD=()
+declare -a C_PID=() C_TIER=() C_AGE=() C_CMD=() PW_PID=()
+n_tiered=0 n_wprobe=0 n_protected=0
+load_protected
 
 while read -r pid ppid etimes rss cmd; do
   [ -n "${pid:-}" ] || continue
@@ -316,15 +494,37 @@ while read -r pid ppid etimes rss cmd; do
   # makes the agent look like a build; reaping it would kill a live lane.
   is_agent_process "$cmd" && continue
   t=$(tier_for "$ppid" "$etimes")
-  [ -n "$t" ] || continue
+  if [ -z "$t" ]; then
+    printf '%s' "$cmd" | grep -qE "$WAITERS" || continue
+    t=-   # W-probe only
+  fi
+  # Off-limits unless --include-protected: cwd inside a PROTECTED worktree.
+  if [ "$INCLUDE_PROTECTED" = 0 ] && [ -n "$(protected_root "$pid")" ]; then
+    [ "$t" != - ] && n_protected=$((n_protected+1))
+    # still DECIDED for tier W, so the summary can say which protected waiters
+    # are provably wedged (reaped only under --include-protected)
+    printf '%s' "$cmd" | grep -qE "$WAITERS" && PW_PID+=("$pid")
+    [ "$LIST_WORKING" = 1 ] && [ "$t" != - ] && printf 'protected pid=%s age=%ss cwd in %s  %s\n' \
+      "$pid" "$etimes" "$(protected_root "$pid")" "$(printf '%s' "$cmd" | cut -c1-80)"
+    continue
+  fi
+  if [ "$t" = - ]; then n_wprobe=$((n_wprobe+1)); else n_tiered=$((n_tiered+1)); fi
   C_PID+=("$pid"); C_TIER+=("$t"); C_AGE+=("$etimes"); C_CMD+=("$cmd")
   CPU0["$pid"]=$(cpu_cs "$pid"); IO0["$pid"]=$(io_bytes "$pid")
 done < <(ps -eo pid=,ppid=,etimes=,rss=,args=)
 
-if [ "${#C_PID[@]}" -eq 0 ]; then
-  echo "no stale dev processes (tier A >= ${ORPHAN_AGE}s ownerless, tier B >= ${AGE}s attached)"
+if [ "${#C_PID[@]}" -eq 0 ] && [ "${#PW_PID[@]}" -eq 0 ]; then
+  echo "no stale dev processes (tier A >= ${ORPHAN_AGE}s ownerless, tier B >= ${AGE}s attached, tier W any age; $n_protected protected exempt)"
   exit 0
 fi
+
+# Tier W, first look: which waiters have a SATISFIED target right now.
+declare -A W0=() W1=()
+mapfile -t _wp < <(for i in "${!C_PID[@]}"; do
+  printf '%s' "${C_CMD[$i]}" | grep -qE "$WAITERS" && echo "${C_PID[$i]}"; done
+  for _p in "${PW_PID[@]}"; do echo "$_p"; done)
+while read -r _p _v; do [ -n "${_p:-}" ] && W0[$_p]="$_v"; done < <(waiter_verdicts "${_wp[@]}")
+snap S0
 
 # ---------------------------------------------------------------------------
 # Pass 2: progress exemption (Tier 0). A candidate whose CPU OR disk I/O advanced
@@ -332,10 +532,14 @@ fi
 # age. This is the signal that makes the aggressive bars safe. Requiring BOTH
 # signals to be still before reaping is deliberate: the cost of a missed reap is
 # a few hundred wasted NVMe bytes, the cost of a false reap is a dead lane.
+# The same holds for the candidate's whole TREE (tree_activity above).
 # ---------------------------------------------------------------------------
 sleep "$SETTLE"
+snap S1
+index_kids
+while read -r _p _v; do [ -n "${_p:-}" ] && W1[$_p]="$_v"; done < <(waiter_verdicts "${_wp[@]}")
 declare -a K_PID=() K_TIER=() K_AGE=() K_CMD=() K_D=()
-working=0
+working=0 tree_exempt=0
 for i in "${!C_PID[@]}"; do
   pid=${C_PID[$i]}
   if ! kill -0 "$pid" 2>/dev/null; then continue; fi   # died on its own: goal met
@@ -344,6 +548,7 @@ for i in "${!C_PID[@]}"; do
   i0=${IO0[$pid]:-0};  i1=$(io_bytes "$pid"); [ -n "$i1" ] || i1="$i0"
   dcpu=$((c1 - c0)); dio=$((i1 - i0))
   if [ "$dcpu" -gt 0 ] || [ "$dio" -gt 0 ]; then
+    [ "${C_TIER[$i]}" = - ] && continue
     working=$((working+1))
     [ "$LIST_WORKING" = 1 ] && printf 'working pid=%s age=%ss (+%s cs cpu, +%s B io)  %s\n' \
       "$pid" "${C_AGE[$i]}" "$dcpu" "$dio" "$(printf '%s' "${C_CMD[$i]}" | cut -c1-80)"
@@ -361,30 +566,52 @@ for i in "${!C_PID[@]}"; do
   # working build under heavy btrfs throttle shows dcpu=0 AND dio=0, exactly like
   # a stuck waiter. D state is the only reliable discriminator, so it exempts.
   if [ "$(state_of "$pid")" = "D" ]; then
+    [ "${C_TIER[$i]}" = - ] && continue
     K_D+=("$pid")
     printf 'BLOCKED pid=%s age=%ss state=D wchan=%s — io-throttled, NOT reapable\n' \
       "$pid" "${C_AGE[$i]}" "$(cat "/proc/$pid/wchan" 2>/dev/null || echo '?')"
     continue
   fi
-  K_PID+=("$pid"); K_TIER+=("${C_TIER[$i]}"); K_AGE+=("${C_AGE[$i]}"); K_CMD+=("${C_CMD[$i]}")
+  # TREE-AWARE: an idle parent of a working or io-blocked descendant is exempt.
+  ta="$(tree_activity "$pid")"
+  if [ -n "$ta" ]; then
+    [ "${C_TIER[$i]}" = - ] && continue
+    tree_exempt=$((tree_exempt+1))
+    [ "$LIST_WORKING" = 1 ] && printf 'working-tree pid=%s age=%ss (descendant %s)  %s\n' \
+      "$pid" "${C_AGE[$i]}" "$ta" "$(printf '%s' "${C_CMD[$i]}" | cut -c1-80)"
+    continue
+  fi
+  tier=${C_TIER[$i]}
+  # Tier W: decided SATISFIED at BOTH ends of the settle window.
+  if [ "${W0[$pid]:-}" = SATISFIED ] && [ "${W1[$pid]:-}" = SATISFIED ]; then
+    tier=W
+  fi
+  [ "$tier" = - ] && continue
+  K_PID+=("$pid"); K_TIER+=("$tier"); K_AGE+=("${C_AGE[$i]}"); K_CMD+=("${C_CMD[$i]}")
 done
 
-echo "candidates: ${#C_PID[@]}  |  working (exempt): $working  |  io-blocked (exempt): ${#K_D[@]}  |  stale: ${#K_PID[@]}"
+n_w=0; for t in "${K_TIER[@]}"; do [ "$t" = W ] && n_w=$((n_w+1)); done
+echo "candidates: $n_tiered  |  working (exempt): $working  |  working-tree (exempt): $tree_exempt  |  io-blocked (exempt): ${#K_D[@]}  |  protected (exempt): $n_protected  |  waiter-probed: $n_wprobe  |  stale: ${#K_PID[@]} (tier W: $n_w)"
+_pw=""; for _p in "${PW_PID[@]}"; do
+  [ "${W0[$_p]:-}" = SATISFIED ] && [ "${W1[$_p]:-}" = SATISFIED ] && kill -0 "$_p" 2>/dev/null && _pw="$_pw $_p"
+done
+[ -n "$_pw" ] && echo "  protected waiters decided tier W (provably wedged; reaped only with --include-protected):$_pw"
 [ "${#K_D[@]}" -gt 0 ] && \
   echo "  io-blocked need FILESYSTEM relief (btrfs writeback), not a signal — see feedback-btrfs-d-state-starves-test-harness"
-[ "$working" -gt 0 ] && [ "$LIST_WORKING" = 0 ] && \
-  echo "  ($working skipped as genuinely in progress — use --no-exclude-working to see them)"
+[ $((working + tree_exempt + n_protected)) -gt 0 ] && [ "$LIST_WORKING" = 0 ] && \
+  echo "  ($working working, $tree_exempt with a working/io-blocked descendant, $n_protected in a protected worktree — use --no-exclude-working to see them)"
 
 if [ "${#K_PID[@]}" -eq 0 ]; then
-  echo "nothing stale: every candidate is still making progress"
+  echo "nothing stale: every candidate is still making progress (itself or its tree), protected, or undecided"
   exit 0
 fi
 
 for i in "${!K_PID[@]}"; do
   pid=${K_PID[$i]}; tier=${K_TIER[$i]}; age=${K_AGE[$i]}
   st=$(state_of "$pid")
-  printf 'STALE tier=%s pid=%s age=%ss (%dm) state=%s  %s\n' "$tier" "$pid" "$age" \
-    "$((age/60))" "$st" "$(printf '%s' "${K_CMD[$i]}" | cut -c1-100)"
+  _why=""; [ "$tier" = W ] && _why=" reason=waiter-target-satisfied"
+  printf 'STALE tier=%s pid=%s age=%ss (%dm) state=%s%s  %s\n' "$tier" "$pid" "$age" \
+    "$((age/60))" "$st" "$_why" "$(printf '%s' "${K_CMD[$i]}" | cut -c1-100)"
   if [ "$KILL" = 1 ]; then
     if [ "$st" = "D" ]; then
       echo "  -> $pid is in D state (wchan=$(cat "/proc/$pid/wchan" 2>/dev/null || echo ?))"

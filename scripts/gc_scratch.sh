@@ -1,57 +1,262 @@
 #!/usr/bin/env bash
 # Consolidated garbage collector for worktrees, stale build dirs, and root
 # scratch. SAFE BY DEFAULT: dry-run — it only LISTS what it would do. Pass
-# --apply to act.
+# --apply to act. Every run ends with a `[gc] summary` line: counts, and the
+# bytes reclaimed (du of what goes; with --apply also the df delta per disk).
 #
 # Scopes (default: all): --worktrees --builds --root
-#   --worktrees   reap worktrees whose commits are ALREADY in origin/main
-#                 (branch ref is kept; only the checkout + inside build/ go).
+#   --worktrees   reap LANDED worktrees (the branch ref is kept; only the
+#                 checkout and its in-tree build/ go). LANDED means every
+#                 commit on it is already in origin/main (`git cherry`), or —
+#                 with --staging-ref — in REF by `git patch-id --stable`.
 #   --builds      remove stale /var/tmp/bezel-scratch/build-asan-* (keep the
-#                 canonical one asan_sweep reuses for this repo).
+#                 canonical one asan_sweep reuses for this repo), and orphaned
+#                 /mnt/fast/lane-builds/* trees.
 #   --root        QUARANTINE (move, don't delete) stray root scratch older than
 #                 BEZEL_GC_ROOT_AGE_HOURS (default 48h) into
 #                 /var/tmp/bezel-scratch/root-quarantine/<ts>/ — reversible;
 #                 the quarantine self-purges after 14 days.
 #   --landed-only restrict worktree reaping to landed ones (used by the on-push
 #                 hook in gate_and_push.sh); without it, --worktrees also reports
-#                 (but never auto-reaps) clean-but-unmerged worktrees.
+#                 (but never auto-reaps) clean-but-unmerged worktrees. Under
+#                 --landed-only, LANDED means origin/main only unless
+#                 --staging-ref is passed EXPLICITLY ($BEZEL_STAGING_REF is not
+#                 read), so the gate's on-push GC behaves exactly as before.
 #
-# NEVER touched: the current worktree, locked worktrees, worktrees with
-# uncommitted TRACKED changes (WIP), and anything under the age threshold.
+# Worktree options (they imply --worktrees):
+#   --staging-ref REF  also count a worktree as LANDED when each of its commits
+#                 that is neither reachable from REF nor in origin/main has the
+#                 same `git patch-id --stable` as a commit in REF ^origin/main.
+#                 A run banks onto a staging branch and nothing reaches
+#                 origin/main until the end-of-run gate, so without this a
+#                 mid-run dry-run reaps almost nothing (measured 2026-11-05: 1
+#                 of 160 worktrees, 106 "unmerged"). Patch-id, never a tree
+#                 diff: a tree diff cannot tell "picked" from "reverted on top".
+#                 A merge commit or an empty commit has no patch-id, so it
+#                 counts as NOT landed. Default: $BEZEL_STAGING_REF if set.
+#   --idle-builds for an IDLE worktree that must be KEPT (WIP, untracked files,
+#                 unmerged), delete only its build/ (a configured tree with a
+#                 CMakeCache.txt; a symlinked build/ deletes its target). The
+#                 branch, the commits and the WIP stay. A rebuild is cheap:
+#                 an in-tree build/ on the fast disk uses relocatable ccache
+#                 keys (lane_setup.sh, #5010). Refused when any file under
+#                 build/ changed within the idle threshold.
+#   --protect FILE  extra PROTECTED worktrees, one path per line (`#` comments
+#                 and blank lines allowed). The coordinator passes its live
+#                 lanes' worktrees. A missing FILE is an error, not "nothing
+#                 protected".
+#
+# PROTECTED — never touched, not even build/: the main checkout, the worktree
+# this runs in, locked worktrees, any worktree a live process has its cwd in
+# (at its top or anywhere beneath it), and every --protect path (a protected
+# path also covers worktrees nested beneath it).
+# KEPT (reported; build/ only with --idle-builds): uncommitted TRACKED changes
+# (WIP), untracked files, unmerged commits, and anything whose git index changed
+# within BEZEL_GC_WT_IDLE_MIN minutes (default 120; 0 disables the check — an
+# active worktree is never touched at all).
+# A detached HEAD that no branch, tag or remote ref contains is backed by a new
+# branch `keep/<basename>-<sha8>` BEFORE its worktree is removed (and the
+# removal is skipped if that branch cannot be made): a reap never loses a commit.
 set -u
 MAIN="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gc: not in a git repo" >&2; exit 2; }
 CUR="$MAIN"   # cwd worktree top; may differ from MAIN when run inside a worktree
 MAIN="$(git -C "$MAIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null | xargs dirname 2>/dev/null || echo "$MAIN")"
 
-APPLY=0; DO_WT=0; DO_BUILDS=0; DO_ROOT=0; LANDED_ONLY=0
+APPLY=0; DO_WT=0; DO_BUILDS=0; DO_ROOT=0; LANDED_ONLY=0; IDLE_BUILDS=0
+STAGING_REF=""; STAGING_REF_SET=0; PROTECT_FILE=""
 AGE_H=${BEZEL_GC_ROOT_AGE_HOURS:-48}
 QUAR=/var/tmp/bezel-scratch/root-quarantine
-for a in "$@"; do case "$a" in
+while [ $# -gt 0 ]; do case "$1" in
   --apply) APPLY=1 ;;
   --worktrees) DO_WT=1 ;;
   --builds) DO_BUILDS=1 ;;
   --root) DO_ROOT=1 ;;
   --landed-only) LANDED_ONLY=1; DO_WT=1 ;;
-  *) echo "gc: unknown arg '$a'" >&2; exit 2 ;;
-esac; done
+  --idle-builds) IDLE_BUILDS=1; DO_WT=1 ;;
+  --staging-ref) [ $# -ge 2 ] && [ -n "$2" ] || { echo "gc: --staging-ref needs a ref" >&2; exit 2; }
+                 STAGING_REF="$2"; STAGING_REF_SET=1; DO_WT=1; shift ;;
+  --staging-ref=*) STAGING_REF="${1#*=}"; STAGING_REF_SET=1; DO_WT=1
+                 [ -n "$STAGING_REF" ] || { echo "gc: --staging-ref needs a ref" >&2; exit 2; } ;;
+  --protect) [ $# -ge 2 ] && [ -n "$2" ] || { echo "gc: --protect needs a file" >&2; exit 2; }
+             PROTECT_FILE="$2"; shift ;;
+  --protect=*) PROTECT_FILE="${1#*=}" ;;
+  -h|--help) sed -n '2,62p' "$0"; exit 0 ;;
+  *) echo "gc: unknown arg '$1'" >&2; exit 2 ;;
+esac; shift; done
 [ $((DO_WT+DO_BUILDS+DO_ROOT)) -eq 0 ] && { DO_WT=1; DO_BUILDS=1; DO_ROOT=1; }
+# $BEZEL_STAGING_REF is the default only OUTSIDE --landed-only (see the header).
+if [ "$STAGING_REF_SET" = 0 ] && [ "$LANDED_ONLY" = 0 ]; then STAGING_REF="${BEZEL_STAGING_REF:-}"; fi
+if [ -n "$PROTECT_FILE" ] && [ ! -r "$PROTECT_FILE" ]; then
+  echo "gc: --protect file '$PROTECT_FILE' is not readable — refusing to run with a protected set I cannot read" >&2
+  exit 2
+fi
 tag() { [ "$APPLY" = 1 ] && printf '[gc] %s\n' "$*" || printf '[gc dry-run] would %s\n' "$*"; }
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"   # top of THIS invocation's tree
 
+# ── accounting for the final summary ──────────────────────────────────────
+RECLAIM_K=0        # du of everything removed (or, in a dry-run, to be removed)
+declare -A DF0=()  # mount -> used KiB before (filled for every disk we touch)
+du_k() { du -sk -- "$1" 2>/dev/null | cut -f1; }
+human_k() { awk -v k="${1:-0}" 'BEGIN{ s="KMGTP"; i=1; while (k>=1024 && i<5){k/=1024;i++}
+                                        printf (i==1?"%d%s":"%.1f%s"), k, substr(s,i,1) }'; }
+note_disk() { # remember the df "used" of the filesystem holding $1, once
+  local m; m="$(df -P -- "$1" 2>/dev/null | awk 'NR==2{print $6}')"
+  [ -n "$m" ] && [ -z "${DF0[$m]:-}" ] && DF0[$m]="$(df -Pk -- "$m" | awk 'NR==2{print $3}')"
+}
+# reclaim <path> — add its du to the total and set RC (human size). Called
+# directly, NEVER inside $(...): a subshell would drop both updates.
+RC=""
+reclaim() { local k; k="$(du_k "$1")"; RECLAIM_K=$((RECLAIM_K + ${k:-0})); note_disk "$1"; RC="$(human_k "${k:-0}")"; }
+
+canon() { realpath -m -- "$1" 2>/dev/null || printf '%s\n' "$1"; }
+# in_tree <path> <root> — path is root or beneath it. String prefix, not regex,
+# so a path containing regex metacharacters is safe.
+in_tree() { [ "$1" = "$2" ] || [ "${1#"$2"/}" != "$1" ]; }
+
 # ── worktrees ────────────────────────────────────────────────────────────
+N_SEEN=0 N_REAP_MAIN=0 N_REAP_STG=0 N_BUILDONLY=0 N_KEEPBR=0 N_PRUNABLE=0
+N_PROT=0 N_INUSE=0 N_ACTIVE=0 N_WIP=0 N_UNTR=0 N_UNM=0 N_NOBUILD=0
 if [ "$DO_WT" = 1 ]; then
   git -C "$REPO_ROOT" fetch -q origin main 2>/dev/null || true  # best-effort freshen
-  locked="$(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree /{p=$2} /^locked/{print p}')"
+  HAVE_MAIN=0
+  git -C "$REPO_ROOT" rev-parse -q --verify 'origin/main^{commit}' >/dev/null 2>&1 && HAVE_MAIN=1
+  # Patch-ids of every non-merge commit in REF that origin/main does not have:
+  # computed ONCE, then each worktree's own commits are looked up in it.
+  STAGING_PIDS=""
+  if [ -n "$STAGING_REF" ]; then
+    if ! git -C "$REPO_ROOT" rev-parse -q --verify "$STAGING_REF^{commit}" >/dev/null 2>&1; then
+      echo "gc: --staging-ref '$STAGING_REF' does not name a commit" >&2; exit 2
+    fi
+    _rng=("$STAGING_REF"); [ "$HAVE_MAIN" = 1 ] && _rng+=("^origin/main")
+    STAGING_PIDS="$(git -C "$REPO_ROOT" log -p --no-merges --no-color --no-ext-diff "${_rng[@]}" 2>/dev/null |
+                    git -C "$REPO_ROOT" patch-id --stable | cut -d' ' -f1 | sort -u)"
+    echo "[gc] staging ref $STAGING_REF: $(printf '%s' "$STAGING_PIDS" | grep -c .) patch-id(s) beyond origin/main"
+  fi
+
+  # The PROTECTED set (see the header), canonicalised once.
+  P_MAIN="$(canon "$MAIN")"; P_CUR="$(canon "$CUR")"
+  mapfile -t P_LOCKED < <(git -C "$REPO_ROOT" worktree list --porcelain |
+                          awk '/^worktree /{p=substr($0,10)} /^locked/{print p}' |
+                          while read -r l; do canon "$l"; done)
+  P_FILE=()
+  if [ -n "$PROTECT_FILE" ]; then
+    while IFS= read -r l || [ -n "$l" ]; do
+      l="${l%%#*}"; l="$(printf '%s' "$l" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [ -n "$l" ] && P_FILE+=("$(canon "$l")")
+    done < "$PROTECT_FILE"
+    echo "[gc] --protect $PROTECT_FILE: ${#P_FILE[@]} path(s)"
+  fi
   # One pass over /proc for every live process's cwd. Used below to spot a
   # worktree some process is actually sitting in. Cheap; done once, not per-wt.
   live_cwds="$(readlink /proc/[0-9]*/cwd 2>/dev/null | sort -u)"
-  git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r wt; do
-    [ "$wt" = "$MAIN" ] && continue     # never the canonical main worktree
-    [ "$wt" = "$CUR" ] && continue      # nor the worktree we are running in
-    printf '%s\n' "$locked" | grep -qxF "$wt" && continue
-    if [ -n "$(git -C "$wt" status --porcelain -uno 2>/dev/null)" ]; then
-      echo "[gc] KEEP (WIP, uncommitted): $wt"; continue
+  idle_min="${BEZEL_GC_WT_IDLE_MIN:-120}"
+
+  # landed_in <wt> — prints `main`, `staging` or nothing (= not landed).
+  # main: `git cherry` marks '+' for not-yet-in-main, '-' for already-there.
+  # If cherry itself fails (origin/main unknown), treat as unmerged so we never
+  # reap unverified. NB grep -c exits 1 on zero matches but still prints "0",
+  # so it is captured directly (no `|| echo 1`, which would corrupt the count).
+  landed_in() {
+    local wt="$1" out plus n c pid
+    if out="$(git -C "$wt" cherry origin/main HEAD 2>/dev/null)"; then
+      [ "$(printf '%s' "$out" | grep -c '^+')" = 0 ] && { echo main; return; }
+    fi
+    [ -n "$STAGING_REF" ] || return 0
+    # staging: the commits on this worktree that are in neither REF nor
+    # origin/main by reachability must each match a REF patch-id. A merge has
+    # no patch-id and an empty commit prints none: both count as not landed.
+    local excl=("^$STAGING_REF"); [ "$HAVE_MAIN" = 1 ] && excl+=("^origin/main")
+    [ "$(git -C "$wt" rev-list --merges --count HEAD "${excl[@]}" 2>/dev/null || echo 1)" = 0 ] || return 0
+    local shas; shas="$(git -C "$wt" rev-list --no-merges HEAD "${excl[@]}" 2>/dev/null)" || return 0
+    plus="$(printf '%s\n' "$out" | sed -n 's/^+ //p')"   # empty when cherry failed
+    declare -A PID_OF=()
+    while read -r pid c; do [ -n "$c" ] && PID_OF[$c]="$pid"; done < <(
+      [ -n "$shas" ] && git -C "$wt" log -p --no-merges --no-color --no-ext-diff --no-walk=unsorted $shas 2>/dev/null |
+        git -C "$wt" patch-id --stable)
+    n=0
+    for c in $shas; do
+      # in origin/main by patch-id already (cherry printed it with '-')
+      if [ "$HAVE_MAIN" = 1 ] && [ -n "$out" ] && ! printf '%s\n' "$plus" | grep -qxF "$c"; then continue; fi
+      pid="${PID_OF[$c]:-}"
+      if [ -n "$pid" ] && printf '%s\n' "$STAGING_PIDS" | grep -qxF "$pid"; then continue; fi
+      n=$((n+1))
+    done
+    [ "$n" = 0 ] && echo staging
+    return 0
+  }
+  # build_target <wt> — the build tree --idle-builds may delete, or nothing.
+  # Only a CONFIGURED tree (CMakeCache.txt) is recognised; an unrecognised
+  # directory is never deleted, whatever its name. A symlinked build/ resolves
+  # to its target, which must not carry another worktree's backref.
+  build_target() {
+    local b="$1/build" t o
+    if [ -L "$b" ]; then
+      t="$(readlink -f -- "$b" 2>/dev/null)" || return 0
+      [ -d "$t" ] && [ -e "$t/CMakeCache.txt" ] || return 0
+      o="$(cat "$t/.lane-worktree" 2>/dev/null || true)"
+      if [ -n "$o" ] && [ "$(canon "$o")" != "$(canon "$1")" ]; then return 0; fi
+      printf '%s\n' "$t"
+    elif [ -d "$b" ] && [ -e "$b/CMakeCache.txt" ]; then
+      printf '%s\n' "$b"
+    fi
+  }
+  # drop_build <wt> <why> — --idle-builds: delete only build/, keep everything else.
+  drop_build() {
+    local wt="$1" why="$2" t
+    t="$(build_target "$wt")"
+    if [ -z "$t" ]; then N_NOBUILD=$((N_NOBUILD+1)); return 0; fi
+    if [ "$idle_min" != 0 ] && [ -n "$(find "$t" -newermt "-${idle_min} minutes" -print -quit 2>/dev/null)" ]; then
+      echo "[gc] KEEP build/ (written within ${idle_min}m): $wt"; return 0
+    fi
+    N_BUILDONLY=$((N_BUILDONLY+1))
+    reclaim "$t"
+    tag "delete idle build/ of KEPT worktree $wt ($why) -> $t ($RC) [branch + WIP kept]"
+    if [ "$APPLY" = 1 ]; then
+      rm -rf -- "$t"
+      [ -L "$wt/build" ] && rm -f -- "$wt/build"
+    fi
+  }
+  # backstop <wt> <br> — a detached HEAD that no ref contains gets a keep/ branch
+  # before its worktree goes. Returns non-zero if it could not make one.
+  backstop() {
+    local wt="$1" br="$2" h kb
+    [ "$br" = DETACHED ] || return 0
+    h="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)" || return 1
+    [ -n "$(git -C "$REPO_ROOT" for-each-ref --contains "$h" --count=1 refs/heads refs/remotes refs/tags 2>/dev/null)" ] && return 0
+    kb="keep/$(basename "$wt")-${h:0:8}"
+    N_KEEPBR=$((N_KEEPBR+1))
+    tag "back detached HEAD ${h:0:12} of $wt with branch $kb"
+    [ "$APPLY" = 1 ] || return 0
+    if git -C "$REPO_ROOT" rev-parse -q --verify "refs/heads/$kb" >/dev/null 2>&1; then
+      [ "$(git -C "$REPO_ROOT" rev-parse "refs/heads/$kb")" = "$h" ] && return 0
+      echo "[gc] KEEP ($kb exists and points elsewhere — refusing to remove an unbacked HEAD): $wt"; return 1
+    fi
+    git -C "$REPO_ROOT" branch "$kb" "$h" || { echo "[gc] KEEP (could not create $kb): $wt"; return 1; }
+  }
+  # keep_wt <wt> <why> — a KEPT worktree; --idle-builds may drop its build/.
+  keep_wt() {
+    local wt="$1" why="$2"
+    [ "$IDLE_BUILDS" = 1 ] && drop_build "$wt" "$why"
+    return 0
+  }
+
+  while read -r wt; do
+    [ -n "$wt" ] || continue
+    N_SEEN=$((N_SEEN+1))
+    cw="$(canon "$wt")"
+    # ── PROTECTED (never touched, build/ included) ───────────────────────────
+    if [ "$cw" = "$P_MAIN" ] || [ "$cw" = "$P_CUR" ]; then N_PROT=$((N_PROT+1)); continue; fi
+    _l=0; for p in "${P_LOCKED[@]}"; do [ "$cw" = "$p" ] && { _l=1; break; }; done
+    [ "$_l" = 1 ] && { N_PROT=$((N_PROT+1)); continue; }
+    if [ ! -d "$wt" ]; then
+      N_PRUNABLE=$((N_PRUNABLE+1)); echo "[gc] PRUNABLE (directory gone; \`git worktree prune\` drops it): $wt"; continue
+    fi
+    _p=""; for p in "${P_FILE[@]}"; do
+      if in_tree "$cw" "$p" || in_tree "$p" "$cw"; then _p="$p"; break; fi
+    done
+    if [ -n "$_p" ]; then
+      N_PROT=$((N_PROT+1)); echo "[gc] KEEP (PROTECTED by --protect: $_p): $wt"; continue
     fi
     # ── IN-USE guards ───────────────────────────────────────────────────────
     # A REUSED warm-pool worktree (/mnt/fast/worktrees/<name>) becomes "landed"
@@ -63,44 +268,52 @@ if [ "$DO_WT" = 1 ]; then
     # pool worktree at origin/main has NO commits and NO dirty files, so it
     # passes both existing guards; only these two catch it.
     #
-    # (1) Some live process is cwd'd inside it. Uses cwd rather than cmdline
-    #     matching, which is unreliable — a build under dev_heavy.sh does not
-    #     carry the worktree path in its argv. String prefix, not regex, so
-    #     paths containing regex metacharacters are safe.
+    # (1) Some live process is cwd'd inside it (its top or any directory
+    #     beneath it). Uses cwd rather than cmdline matching, which is
+    #     unreliable — a build under dev_heavy.sh does not carry the worktree
+    #     path in its argv. String prefix, not regex, so paths containing regex
+    #     metacharacters are safe.
     if printf '%s\n' "$live_cwds" |
-         awk -v w="$wt" '$0==w || index($0, w"/")==1 {f=1} END{exit !f}'; then
-      echo "[gc] KEEP (IN USE: a live process is cwd'd inside it): $wt"; continue
+         awk -v w="$cw" -v w2="$wt" '$0==w || index($0, w"/")==1 || $0==w2 || index($0, w2"/")==1 {f=1} END{exit !f}'; then
+      N_INUSE=$((N_INUSE+1)); echo "[gc] KEEP (IN USE: a live process is cwd'd inside it): $wt"; continue
     fi
     # (2) Recently active. (1) alone is not sufficient: a lane sitting between
     #     tool calls has no live process in its tree at that instant. The git
     #     index is touched by checkout/commit/status, so its mtime tracks lane
     #     activity. Conservative by design — a finished worktree is merely
-    #     reaped one cycle later. Override with BEZEL_GC_WT_IDLE_MIN=0.
-    idle_min="${BEZEL_GC_WT_IDLE_MIN:-120}"
+    #     reaped one cycle later. Override with BEZEL_GC_WT_IDLE_MIN=0. An
+    #     ACTIVE worktree is not touched at all — --idle-builds included.
     if [ "$idle_min" != 0 ] &&
        [ -n "$(find "$(git -C "$wt" rev-parse --git-dir 2>/dev/null || echo /nonexistent)/index" \
                     -newermt "-${idle_min} minutes" 2>/dev/null)" ]; then
-      echo "[gc] KEEP (active within ${idle_min}m): $wt"; continue
+      N_ACTIVE=$((N_ACTIVE+1)); echo "[gc] KEEP (active within ${idle_min}m): $wt"; continue
     fi
     br="$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null || echo DETACHED)"
-    # Landed = no commits on this branch lack a cherry-equivalent in origin/main.
-    # `git cherry` marks '+' for not-yet-in-main, '-' for already-there. If cherry
-    # itself fails (origin/main unknown), treat as unmerged so we never reap
-    # unverified. NB grep -c exits 1 on zero matches but still prints "0", so it
-    # is captured directly (no `|| echo 1`, which would corrupt the count).
-    if cherry_out="$(git -C "$wt" cherry origin/main HEAD 2>/dev/null)"; then
-      unmerged="$(printf '%s' "$cherry_out" | grep -c '^+')"
-    else
-      unmerged=1
+    # ── KEPT: WIP, untracked files, unmerged ────────────────────────────────
+    if [ -n "$(git -C "$wt" status --porcelain -uno 2>/dev/null)" ]; then
+      N_WIP=$((N_WIP+1)); echo "[gc] KEEP (WIP, uncommitted): $wt"; keep_wt "$wt" WIP; continue
     fi
-    if [ "${unmerged}" != 0 ]; then
-      [ "$LANDED_ONLY" = 1 ] && continue
-      echo "[gc] KEEP (unmerged: $unmerged commit(s) not in origin/main): $wt ($br)"
-      continue
+    # Untracked (not ignored) files are WIP too — a new test a lane has not
+    # `git add`ed yet. `worktree remove --force` would delete them.
+    if git -C "$wt" status --porcelain 2>/dev/null | grep -q '^??'; then
+      N_UNTR=$((N_UNTR+1)); echo "[gc] KEEP (untracked files): $wt"; keep_wt "$wt" untracked; continue
     fi
-    tag "reap landed worktree $wt  [branch $br kept]"
+    where="$(landed_in "$wt")"
+    if [ -z "$where" ]; then
+      N_UNM=$((N_UNM+1))
+      if [ "$LANDED_ONLY" = 0 ]; then
+        echo "[gc] KEEP (unmerged: commit(s) in neither origin/main${STAGING_REF:+ nor $STAGING_REF}): $wt ($br)"
+      fi
+      keep_wt "$wt" unmerged; continue
+    fi
+    backstop "$wt" "$br" || continue
+    if [ "$where" = main ]; then N_REAP_MAIN=$((N_REAP_MAIN+1)); else N_REAP_STG=$((N_REAP_STG+1)); fi
+    if [ "$where" = main ]; then _in="origin/main"; else _in="$STAGING_REF by patch-id"; fi
+    reclaim "$wt"
+    if [ "$br" = DETACHED ]; then _br="detached HEAD; a ref keeps its commit"; else _br="branch $br kept"; fi
+    tag "reap landed worktree $wt  [$_br; landed in $_in] ($RC)"
     [ "$APPLY" = 1 ] && git -C "$REPO_ROOT" worktree remove --force "$wt"
-  done
+  done < <(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree /{print substr($0,10)}')
   [ "$APPLY" = 1 ] && git -C "$REPO_ROOT" worktree prune
 fi
 
@@ -190,7 +403,8 @@ EOF_WTS
       if [ ! -e "$d/CMakeCache.txt" ]; then
         tag "KEEP (not a configured build tree — refusing to guess): $d"; continue
       fi
-      tag "reap orphaned lane build tree $d ($(du -Lsh "$d" 2>/dev/null | cut -f1))"   # symlink-read-ok
+      reclaim "$d"
+      tag "reap orphaned lane build tree $d ($RC)"
       [ "$APPLY" = 1 ] && rm -rf "$d"
     done
   fi
@@ -199,7 +413,8 @@ EOF_WTS
   for d in /var/tmp/bezel-scratch/build-asan*; do
     [ -d "$d" ] || continue
     [ "$(basename "$d")" = "$canon" ] && continue
-    tag "remove stale ASan build $d ($(du -sh "$d" 2>/dev/null | cut -f1))"
+    reclaim "$d"
+    tag "remove stale ASan build $d ($RC)"
     [ "$APPLY" = 1 ] && rm -rf "$d"
   done
   # AOT test link-cache (tests/support/aot_support.hpp). The harness self-GCs it
@@ -267,4 +482,20 @@ if [ "$DO_ROOT" = 1 ]; then
       [ "$APPLY" = 1 ] && rm -rf "$old"
     done
   fi
+fi
+
+# ── summary ───────────────────────────────────────────────────────────────
+# One line a heartbeat or a log reader can grep. In a dry-run the bytes are
+# what WOULD go (du); with --apply the df delta per touched disk follows, which
+# is the honest number (du double-counts nothing here, but a removal can fail).
+_mode=dry-run; [ "$APPLY" = 1 ] && _mode=apply
+if [ "$DO_WT" = 1 ]; then
+  echo "[gc] summary ($_mode): worktrees seen=$N_SEEN reaped=$((N_REAP_MAIN+N_REAP_STG)) (landed-main=$N_REAP_MAIN landed-staging=$N_REAP_STG) build-only=$N_BUILDONLY keep-branches=$N_KEEPBR kept: protected=$N_PROT in-use=$N_INUSE active=$N_ACTIVE wip=$N_WIP untracked=$N_UNTR unmerged=$N_UNM prunable=$N_PRUNABLE"
+fi
+echo "[gc] summary ($_mode): reclaim $( [ "$APPLY" = 1 ] && echo "" || echo "would be " )$(human_k "$RECLAIM_K") (du of what $( [ "$APPLY" = 1 ] && echo went || echo would go ))"
+if [ "$APPLY" = 1 ]; then
+  for m in "${!DF0[@]}"; do
+    _u1="$(df -Pk -- "$m" | awk 'NR==2{print $3}')"
+    echo "[gc] summary (apply): $m used $(human_k "${DF0[$m]}") -> $(human_k "$_u1") (freed $(human_k $(( ${DF0[$m]} - _u1 > 0 ? ${DF0[$m]} - _u1 : 0 ))))"
+  done
 fi
