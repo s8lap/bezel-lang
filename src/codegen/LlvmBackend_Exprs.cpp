@@ -7815,7 +7815,23 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     // StringBuilder.Length — sum of part lengths (total chars).
     // Dictionary<K,V>.Count — runtime bz_dict_count.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
-        if (ma->target && (ma->member == "Length" || ma->member == "Count")) {
+        // fix #7488 (spec §27.6, v0.355): a member access SEMA bound to a
+        // USER EXTENSION method is not the builtin's property. §27.6 resolves
+        // the receiver-qualified reference to the extension member ("the
+        // member resolved on the value exactly as the call `v.Scaled()` is"),
+        // so the builtin's `.Length`/`.Count` lowering below must not claim
+        // it: it would answer with the builtin's count where the extension's
+        // value is the one §27.6 asks for (and the slot would then hold an
+        // `int` where a function value is expected — the #2434 zero-init
+        // degradation, and a SIGSEGV at the call).
+        //
+        // The predicate is the extension-ness of the BOUND symbol, not the
+        // member's name: a builtin `.Count`/`.Length` read binds no
+        // user-declared method symbol, so it keeps its own lowering.
+        const sema::MethodSymbol* extMs =
+            dynamic_cast<const sema::MethodSymbol*>(ctx_.exprSymbol(e));
+        if (!isExtensionMethod(extMs) && ma->target &&
+            (ma->member == "Length" || ma->member == "Count")) {
             // fix #7086 (§14.2, v0.340): a receiver typed as a BARE TYPE
             // PARAMETER (`x: T` under `where T: IList<int>`) stands for the
             // CONCRETE type the parameter is substituted with, so the count

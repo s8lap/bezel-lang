@@ -36275,23 +36275,38 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // legal and must be admitted.
                 //
                 // The gate is the house's §26.5 form the sibling arms in this
-                // block use: a same-named user extension keeps the CALL
-                // accepted (the CALL spelling is the extension member's
-                // call form), while the BARE reference keeps the rejection
-                // (the bare form is §27.6's method-reference formation, and
-                // the bare spellings of the collection heads have their own
-                // handling — #6997's arm and the `?.` twin below).
+                // block use: a same-named user extension keeps the access
+                // accepted, because the extension member is what the access
+                // resolves to.
+                //
+                // fix #7488 (spec §27.6, v0.355): the gate used to require
+                // `&ma == calleeOfCallCtx_` — the CALL spelling only — so the
+                // BARE reference kept the rejection. §27.6 (v0.355) is
+                // explicit: the receiver-qualified reference "resolve[s] the
+                // member on the value EXACTLY AS THE CALL `v.Scaled()` is
+                // (§26.5)". The call `a.Length()` is admitted (the arm above
+                // admits it), so the bare reference `a.Length` MUST resolve to
+                // the SAME member — a false reject otherwise, and an ASYMMETRY
+                // between two spellings of one program (issue #7488).
+                //
+                // The lookup below is arity-agnostic (no `currentCallArity_`),
+                // so it answers the same question for both spellings: does an
+                // extension member of this name apply to this receiver? When
+                // it does, the access falls through to the §26.5 rule-2
+                // extension lookup further down, which binds the member
+                // (§27.6's method-reference formation) exactly as the call
+                // does.
                 //
                 // The diagnostic also gains its §-section: it read
                 // "(stdlib \S4.4)" — a LITERAL BACKSLASH-S, so the message
                 // carried NO §-character at all.
-                const bool lengthCallWithExtension =
-                    ma.member == "Length" && &ma == calleeOfCallCtx_ &&
+                const bool lengthWithExtension =
+                    ma.member == "Length" &&
                     lookupExtensionMember(tt, ma.member, nullptr,
                                           ma.span.begin,
                                           /*reportAmbiguity=*/false) != nullptr;
                 if (ma.member == "Length" && cn == "Array" &&
-                    !lengthCallWithExtension) {
+                    !lengthWithExtension) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "no member `Length` on `Array<T>`: use `Count` "
@@ -36299,7 +36314,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     return;
                 }
                 if (ma.member == "Length" && cn == "OwningArray" &&
-                    !lengthCallWithExtension) {
+                    !lengthWithExtension) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "no member `Length` on `OwningArray<T>`: use `Count` "
@@ -36311,7 +36326,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // IReadOnlyCollection<T>), not `Length` — the Count-vs-Length
                 // convention (§4.4 p.74) applies to resizable collections.
                 if (ma.member == "Length" && cn == "Stack" &&
-                    !lengthCallWithExtension) {
+                    !lengthWithExtension) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "no member `Length` on `Stack<T>`: use `Count` "
@@ -36319,7 +36334,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     return;
                 }
                 if (ma.member == "Length" && cn == "OwningStack" &&
-                    !lengthCallWithExtension) {
+                    !lengthWithExtension) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "no member `Length` on `OwningStack<T>`: use `Count` "
@@ -36327,7 +36342,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     return;
                 }
                 if (ma.member == "Length" && cn == "Queue" &&
-                    !lengthCallWithExtension) {
+                    !lengthWithExtension) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "no member `Length` on `Queue<T>`: use `Count` "
@@ -36335,7 +36350,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     return;
                 }
                 if (ma.member == "Length" && cn == "OwningQueue" &&
-                    !lengthCallWithExtension) {
+                    !lengthWithExtension) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "no member `Length` on `OwningQueue<T>`: use `Count` "
