@@ -649,7 +649,35 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 const sema::TypeRef* prt =
                     ps->declType ? ctx_.resolvedType(*ps->declType)
                                  : ps->resolvedDeclType;
-                if (isValueSubstitutionErased(prt)) continue;
+                // fix #8118 (§28.1 / §8.1 / §28.5, v0.355): a CONCRETELY
+                // declared `owned x: Object` (or `Object?`) parameter carries
+                // the ORDINARY transfer obligation — §28.1 admits the marker
+                // on `Object` ("`Object` is such a class type (§8.1)"), and
+                // there is no SUBSTITUTION here to erase it.
+                //
+                // `isValueSubstitutionErased` answers the §28.1 clause-3
+                // question at a SUBSTITUTION boundary (a bare-`T` slot
+                // substituted to `Object` — #1857's pinned E1/E2
+                // reconciliation, which the #7921 owner ruling does not
+                // revisit), and its Primitive arm covers `Object` because
+                // `Object` is modelled as `TypeRef::Kind::Primitive`. That
+                // arm must not swallow the CONCRETE declaration: with it,
+                // the parameter was never seeded Owned, so no §28.3 auto-drop
+                // ran and the value the callee was given was never disposed
+                // (MEASURED: an owned `Array<int>` passed through `Object?`
+                // in a 100-iteration loop leaked 14,400 bytes in 200
+                // allocations under `--sanitize=address`).
+                //
+                // The two questions are distinguishable HERE because the
+                // seeding site reads the DECLARED type: a bare-`T` slot
+                // resolves to a Named with no declaration (never the
+                // Primitive arm), so the concrete `Object` declaration is the
+                // only shape this exclusion can match.
+                const bool declaredObjectClass =
+                    prt && prt->kind == sema::TypeRef::Kind::Primitive &&
+                    prt->primitive == sema::PrimitiveType::Object;
+                if (!declaredObjectClass && isValueSubstitutionErased(prt))
+                    continue;
                 LocalOwnership lo;
                 lo.state = OwnershipState::Owned;
                 lo.implicitDischarge = false;
@@ -5370,9 +5398,24 @@ bool isValueSubstitutionErased(const sema::TypeRef* rt) {
         case sema::TypeRef::Kind::Primitive:
             // Every primitive is a value/runtime-managed type with no disposal
             // obligation — `string` is runtime-managed (§28.9) and the rest
-            // (including `Object` — §28.2's "`Dispose()` is not on `Object`")
             // are value types, mirroring `checkOwnedDeclType`'s uniform
             // primitive reject.
+            //
+            // fix #8118 (§28.1 / §8.1, v0.355): `Object` is the ROOT CLASS
+            // (§8.1), so `checkOwnedDeclType` now ADMITS the `owned` marker on
+            // it (the #7921 owner ruling, reading (A)) and the "authoritative
+            // reject set" this predicate mirrors no longer contains it. The
+            // ERASURE at an `Object` substitution is §28.1 clause 3's
+            // PER-INSTANTIATION question, which the owner ruling does not
+            // decide; it stays as #1857's E1/E2 reconciliation left it (a
+            // `Factory<Object>.Make()` return carries no obligation — pinned
+            // by tests/ownership/owned_bare_t_primitive_func_unit_erasure_1857_test.cpp).
+            // The residual (§28.1 clause 3 reads "at a class or interface
+            // substitution the marker has its ordinary transfer meaning", and
+            // `Object` is a class) is recorded in the sema copies of this
+            // predicate (TypeResolution_Checks.cpp / ExprTypecheck_Calls.cpp)
+            // and filed for the owner as a separate question. No program's
+            // verdict changes here.
             return true;
         case sema::TypeRef::Kind::Named:
             if (rt->declaration) {
@@ -6306,6 +6349,53 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                 // reclassification (spec §28.1: a declared `owned T` return
                 // remains outside the bare-type-parameter rule at every
                 // instantiation). // per §28.1 v0.196 #1817
+                //
+                // fix #8118 (§28.1 / §8.1, v0.355): a CONCRETELY declared
+                // `owned Object` return is NOT a substitution — §28.1 admits
+                // the marker on `Object` ("`Object` is such a class type
+                // (§8.1)") and the marker is not erased at a direct
+                // declaration. The result therefore TRANSFERS: the callee's
+                // obligation ends at the return and the caller's binding owns
+                // the value.
+                //
+                // MEASURED without this hunk: the erased classification made
+                // the ownership pass call the result a BORROW, so the
+                // TRANSFER `Take(move o)` was REJECTED — "a borrow cannot be
+                // passed where an `owned` value is required: an `owned` sink
+                // takes responsibility for disposing the value, but a borrow
+                // is owned elsewhere (§28.8)" — and the program did not
+                // compile at all. With the classification the transfer
+                // compiles, the value is disposed exactly once (the
+                // destination's destructor counter reaches 1) and nothing
+                // leaks.
+                //
+                // The AUTO-DROP shape (`var o := Make();` with no explicit
+                // discharge) is NOT affected by this hunk: MEASURED
+                // identically with and without it — the codegen's own
+                // `ownedObjectTransfer` path (keyed on
+                // `sema::methodReturnsOwned`) already arms the scope-end
+                // discharge for the plain `var` binding, so both shapes run
+                // the 100-iteration loop, print 100 and exit 0 with no leak.
+                // This hunk is load-bearing for the TRANSFER, not for the
+                // auto-drop.
+                //
+                // The discriminator is the callee's DECLARED return type: a
+                // bare-type-parameter return (`method Make(): owned T`) is the
+                // SUBSTITUTION question #1857 pinned (erased at `T = Object`)
+                // and is left exactly as it was; a declared `Object` return is
+                // the direct-declaration question and transfers.
+                //
+                // The two shapes are told apart by the DECLARED TypeRef alone:
+                // a bare type parameter resolves to a Named with a NULL
+                // declaration (TypeResolution_Names.cpp's generic branch), so
+                // it never reaches the Primitive arm — the check below can
+                // only match a CONCRETELY declared `Object` / `Object?`.
+                const sema::TypeRef* drt =
+                    md->returnType ? ctx_.resolvedType(*md->returnType)
+                                   : nullptr;
+                if (drt && drt->kind == sema::TypeRef::Kind::Primitive &&
+                    drt->primitive == sema::PrimitiveType::Object)
+                    return OwnershipState::Owned;
                 if (isValueSubstitutionErased(ctx_.exprType(e)))
                     return OwnershipState::Borrowed;
                 return OwnershipState::Owned;

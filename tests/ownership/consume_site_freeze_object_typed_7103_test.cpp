@@ -337,6 +337,11 @@ BEZEL_TEST(consume_site_freeze_object_typed,
 //          (b) `owned Object` is REJECTED ("`owned` is not admissible on a
 //              return type of type a primitive value type"), while §28.1
 //              admits `owned` on a class type and `Object` is a class;
+//              — fix #8118 (§28.1 / §8.1 / §28.5, v0.355) CLOSED this
+//              consequence: `checkOwnedDeclType` now admits the marker on
+//              `Object`, so (b) no longer holds. (a) and (c) still do — they
+//              are the same "is this a class type?" question, asked by other
+//              rules;
 //          (c) a fresh owned value returned through a plain `Object` return
 //              is not rejected (§28.6's fresh-value rule).
 //

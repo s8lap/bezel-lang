@@ -25762,6 +25762,40 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
             return;
         }
     }
+    // fix #8118 (§28.1 / §8.1 / §28.5, v0.355): an `owned` PARAMETER whose
+    // declared type is `Object` (or `Object?`).
+    //
+    // §28.1 admits the marker there — "`Object` is such a class type (§8.1),
+    // here and at an `owned` field (§28.5): the marker transfers whatever value
+    // the position holds" — and the #7921 owner ruling (reading (A)) settles
+    // the admission. Before this arm the parameter fell through EVERY
+    // type-specific branch above and through the `isClassOrInterfaceRef` gate
+    // below (an `Object` TypeRef is `Kind::Primitive`, so the gate rejects
+    // it), so NO disposal entry was registered: the value the callee is given
+    // was never discharged on either the normal or the unwind edge — the leak
+    // the §28.1 marker promises to transfer.
+    //
+    // The discharge is DYNAMIC because the declared type cannot say what the
+    // slot holds (§5.1: `Object` is the universal reference type — a class
+    // instance, a §8.6 box, a `string` or a function value may all sit
+    // there, and only the first carries the obligation). See
+    // `emitObjectSlotDisposal` for the runtime discrimination.
+    if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+        rt->primitive == sema::PrimitiveType::Object) {
+        Disposal d{slot, nullptr};
+        d.objectSlotDispose = true;
+        if (ps->autoDropAtScopeEnd) {
+            // §28.3: a never-discharged owner — dispose it at method end on
+            // BOTH the normal and the unwind edges (the same split the
+            // class/interface arm below takes).
+        } else {
+            // Discharged on the normal path by the body: the unwind edge only.
+            if (unwindIneligible_.count(static_cast<const void*>(psym))) return;
+            d.unwindOnly = true;
+        }
+        disposeStack_.front().push_back(d);
+        return;
+    }
     // fix #6337 / §28.3 *Unbound owned temporaries* + §28.8, §31.4 (v0.338):
     // this is the CALLEE-side mirror of the caller-side gate #6311 widened in
     // `buildOrderedArgs`. `isClassOrInterfaceRef` reads the kind off

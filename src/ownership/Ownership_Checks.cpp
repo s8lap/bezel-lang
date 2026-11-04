@@ -17374,7 +17374,45 @@ void MethodOwnership::markOutOwnedArgsCore(
                     if (auto* ls = dynamic_cast<sema::LocalSymbol*>(rs))
                         recipTy = ls->declType;
                 if (!recipTy) recipTy = ctx_.exprType(*id);
-                if (isValueSubstitutionErased(recipTy)) { ++pos; continue; }
+                // fix #8118 (§28.1 / §8.1, v0.355): the erasure asked BELOW is
+                // §28.1 clause 3's SUBSTITUTION question, and it is asked at
+                // the RECIPIENT's SUBSTITUTED type. A CONCRETELY declared
+                // `out owned x: Object?` formal is NOT a substitution: §28.1
+                // admits the marker on `Object` ("`Object` is such a class
+                // type (§8.1)"), so the transfer carries the ORDINARY
+                // obligation and the recipient must be classified Owned (and
+                // discharged exactly once).
+                //
+                // The discriminator is the FORMAL's DECLARED type — the
+                // SYNTACTIC node, which for a bare-type-parameter formal
+                // resolves to a Named with a NULL declaration (never the
+                // Primitive arm) and for a concrete `Object` / `Object?` formal
+                // resolves to the Primitive arm. So this bypass can only ever
+                // match the CONCRETE declaration: a `T = Object` instantiation
+                // keeps the erasure exactly as it was (#1857's pinned E1/E2
+                // reconciliation — the class/interface substitution question
+                // the #7921 owner ruling does not decide).
+                //
+                // MEASURED without this: `method Fill(out owned x: Object?)`
+                // writing `x := new Res();` leaked the 16-byte instance —
+                // ASan: "Direct leak of 16 byte(s) in 1 object(s) allocated
+                // from ... bz$M.App$Fill" — because the recipient was never
+                // classified Owned, so no scope-end discharge was armed for
+                // it (the compiler did not even emit the §28.3 auto-drop
+                // warning for the recipient). WITH the split the recipient is
+                // Owned: the §28.3 auto-drop warning appears and the
+                // instance is disposed exactly once (no leak under
+                // `--sanitize=address`).
+                const std::size_t fj = boundFormalIndex(args, pos, params);
+                const ast::Type* fdt =
+                    fj < params.size() ? params.declType(fj) : nullptr;
+                const sema::TypeRef* frt =
+                    fdt ? ctx_.resolvedType(*fdt) : nullptr;
+                const bool concreteObjectFormal =
+                    frt && frt->kind == sema::TypeRef::Kind::Primitive &&
+                    frt->primitive == sema::PrimitiveType::Object;
+                if (!concreteObjectFormal &&
+                    isValueSubstitutionErased(recipTy)) { ++pos; continue; }
                 // §22.4 / v0.160 (#1305): `out owned var x` declares a FRESH
                 // local inline.  The LocalSymbol was registered in
                 // currentScope_ by ExprTypecheck_Exprs.cpp, but the ownership

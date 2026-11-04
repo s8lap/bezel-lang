@@ -3437,13 +3437,31 @@ void Resolver::checkOwnedDeclType(const TypeRef* t, SourceLocation loc,
         badDesc = "a function-typed value (a runtime-managed reference type, §28.9)";
         break;
     case TypeRef::Kind::Primitive:
+        // fix #8118 (§28.1 / §8.1 / §28.5, v0.355): `Object` is the ROOT
+        // CLASS (§8.1: `public class Object`), not a primitive value type.
+        // §28.1's "Type requirement" admits `owned` on "a class type other
+        // than `Type`" and names `Object` EXPLICITLY: "`Object` is such a
+        // class type (§8.1), here and at an `owned` field (§28.5): the marker
+        // transfers whatever value the position holds, and a runtime-managed
+        // value there — a boxed value, a `string`, a function value — carries
+        // no obligation, the discharge points disposing nothing for it
+        // (§8.7)". The owner ruling on #7921 (v0.355) takes reading (A):
+        // admit it, "wherever §28.1/§28.5 admit a class type". The old arm
+        // reported "a primitive value type" of `Object` — a statement the
+        // spec makes FALSE of `Object` in as many words, and the diagnostic
+        // the issue quotes.
+        //
+        // This is the SAME classification the owning-collection element check
+        // already makes (`owningElementBadDesc`, fix #5250 — "Object is a
+        // class — admitted"), so the two agree by construction.
+        if (t->primitive == PrimitiveType::Object)
+            break;  // admitted — badDesc stays empty
         // `string` is a runtime-managed reference type (§28.9) and every other
-        // primitive — including `Object`, which §28.2 excludes from the
-        // `IDisposable` contract ("`Dispose()` is not on `Object`") — carries
-        // no disposal obligation to transfer, so all are rejected. This
-        // matches the owning-collection element-type check, whose "value types
-        // have no disposal obligation" reasoning §28.1 explicitly aligns with
-        // ("the same reasoning as §28.5's field restriction").
+        // primitive carries no disposal obligation to transfer, so all are
+        // rejected. This matches the owning-collection element-type check,
+        // whose "value types have no disposal obligation" reasoning §28.1
+        // explicitly aligns with ("the same reasoning as §28.5's field
+        // restriction").
         badDesc = t->primitive == PrimitiveType::String
             ? "`string` (a runtime-managed reference type)"
             : "a primitive value type";

@@ -1476,6 +1476,26 @@ int32_t bz_obj_is_string(void* obj, void** vtable_table);
 // policy) — the split that `bz_obj_is_string == 0` alone made before the tag.
 int32_t bz_obj_is_tagged_builtin(void* obj);
 
+// fix #8118 (§28.1 / §8.1 / §15.2, v0.355): 1 iff `obj` is non-null and its
+// word 0 is one of the ARRAY-BACKED built-in vtables (bz_array_vtable /
+// bz_sb_vtable) — i.e. the value is a `bz_array_t`, the representation of the
+// heap-array CLASSES `Array<T>` / `OwningArray<T>` (§15.2) and of a
+// StringBuilder's parts array.
+//
+// THE NARROWER SIBLING OF `bz_obj_is_tagged_builtin`. That helper also
+// answers 1 for the Mutex / CancellationTokenSource handles, and those must
+// NOT take the class protocol: their vtable Dispose slot
+// (`bz_mutex_obj_dispose` / `bz_cts_obj_dispose`) FREES THE HANDLE ITSELF, so
+// a class-protocol discharge (Dispose + reclaim) would free it twice. The
+// runtime's kind-tag dispatcher (`bz_runtime_dispose`) is no help either —
+// it probes offset 48 and offset 88, and those handles' structs are 32 bytes,
+// so the probe would read off the end of them. The `owned` slot whose declared
+// type is `Object` (§28.1: "`Object` is such a class type (§8.1) … here and at
+// an `owned` field") may hold any of them, so the array test is asked on its
+// own and the other tagged builtins are left to their own release rule (a
+// bounded leak, never a double free).
+int32_t bz_obj_is_array(void* obj);
+
 // fix #6776 (§8.1 / §8.2 / §12.7 / stdlib §2.1 / §3.1, v0.340): the runtime
 // type tag of the vtable-less built-ins that reach `Object` representation-
 // preservingly (§3.1 / §5.1). Every bz_array_t and every Mutex now opens with

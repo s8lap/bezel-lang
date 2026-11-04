@@ -72,6 +72,27 @@ static inline bool bz_word0_is_array(void* p) {
     return word0 == (void*)bz_array_vtable || word0 == (void*)bz_sb_vtable;
 }
 
+// fix #8118 (§28.1 / §8.1 / §15.2, v0.355): the EXPORTED form of the array
+// probe above — 1 iff `obj` is non-null and its word 0 is one of the
+// ARRAY-BACKED built-in vtables (bz_array_vtable / bz_sb_vtable), i.e. the
+// value is a `bz_array_t`: the representation of the heap-array CLASSES
+// `Array<T>` / `OwningArray<T>` (§15.2) and of a StringBuilder's parts array.
+//
+// It is asked by the codegen's discharge of an `owned` slot whose declared
+// type is `Object` (§28.1: "`Object` is such a class type (§8.1) … here and at
+// an `owned` field"), where the value's kind is not statically decidable
+// (§5.1). It is DELIBERATELY narrower than `bz_obj_is_tagged_builtin`: that
+// helper also answers 1 for the Mutex / CancellationTokenSource handles, and
+// those must NOT take the class protocol — their vtable Dispose slot
+// (`bz_mutex_obj_dispose` / `bz_cts_obj_dispose`) frees the handle ITSELF, so
+// a Dispose-then-reclaim discharge would free it twice. The runtime's kind-tag
+// dispatcher (`bz_runtime_dispose`) is no help either: it probes offset 48 and
+// offset 88, and those handles' structs are 32 bytes.
+extern "C" int32_t bz_obj_is_array(void* obj) {
+    if (!obj) return 0;
+    return bz_word0_is_array(obj) ? 1 : 0;
+}
+
 extern "C" void bz_runtime_dispose(void* p, void (*dispose_elem)(void*)) {
     if (!p) return;
     if (bz_word0_is_array(p)) { bz_array_free(p, dispose_elem); return; }

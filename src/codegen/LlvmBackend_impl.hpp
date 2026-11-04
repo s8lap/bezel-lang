@@ -2377,6 +2377,33 @@ private:
         // box in the slot is left to its own rule and only a real `Object`
         // instance is freed.
         bool objectReclaim = false;
+        // fix #8118 (§28.1 / §8.1 / §28.5, v0.355): an `owned` slot whose
+        // DECLARED type is `Object` (or `Object?`) — a METHOD PARAMETER or a
+        // FIELD. §28.1 admits the marker there ("`Object` is such a class type
+        // (§8.1), here and at an `owned` field (§28.5): the marker transfers
+        // whatever value the position holds"), and the #7921 owner ruling
+        // (reading (A)) settles the admission.
+        //
+        // The VALUE the slot holds is not decidable statically: §5.1 makes
+        // `Object` the universal reference type, so the slot may hold a class
+        // instance (which carries the obligation), a §8.6 BOX, a `string`, or
+        // a function value — and §28.1 says of the last three: "a
+        // runtime-managed value there … carries no obligation, the discharge
+        // points disposing nothing for it (§8.7)". So the discharge point
+        // asks at RUN TIME, the same shape `collIfaceRuntimeKind` uses for a
+        // polymorphic collection-interface slot: `bz_obj_is_string` (a
+        // REGISTERED vtable is not a string), `bz_obj_is_tagged_builtin` (the
+        // array-backed builtins), `bz_obj_is_fnval` (a function value), and
+        // the vtable's own Dispose slot (a §8.6 box's is the shared no-op
+        // `bz$exDispose`, a class instance's is its own Dispose).
+        //
+        // NOT `dynamicDispose`: that arm emits `emitDisposeAndReclaim`
+        // UNCONDITIONALLY, and an `Object`-typed slot may hold a `string`
+        // (word 0 is a data pointer, not a vtable — §28.9) or a §8.6 box
+        // (whose own release rule is the refcount, §28.9). The `objectReclaim`
+        // arm's guard (reclaim iff word 0 is the `Object` vtable) is the
+        // narrow `Object`-INSTANCE case; this flag is the general one.
+        bool objectSlotDispose = false;
         // #383 / §31.1: the in-flight exception object caught by a catch arm.
         // Freed (via the object's vtable — destructor + base chain + free) on a
         // NORMAL handled exit of the arm (fall-through, return, break,
@@ -14455,6 +14482,36 @@ private:
     // and CauseChain helpers are called unconditionally).
     void emitReclaimBlock(llvm::Value* obj, bool cdMayFree = false);
 
+    // fix #8118 (§28.1 / §8.1 / §28.5, v0.355): the discharge of an `owned`
+    // slot whose DECLARED type is `Object` (or `Object?`) — a method
+    // parameter or a field. The slot's value is not statically decidable
+    // (§5.1: `Object` is the universal reference type), so the KIND of the
+    // value is read at RUN TIME and the discharge point does exactly what
+    // §28.1 / §8.7 say:
+    //   * a CLASS INSTANCE → its own vtable Dispose (§28.4) and the reclaim
+    //     (the `emitDisposeAndReclaim` shape every class-typed owned slot
+    //     uses);
+    //   * an ARRAY-BACKED BUILT-IN (`Array<T>` / `OwningArray<T>` — §15.2
+    //     heap-array CLASSES) → the typed free (`bz_runtime_dispose`, the
+    //     kind-tag dispatcher the polymorphic collection-interface slot
+    //     uses, #3026);
+    //   * a §8.6 BOX, a `string`, a function value, a `Type` token → NOTHING
+    //     (§28.9: they are runtime-managed and carry no obligation; §28.1:
+    //     "the discharge points disposing nothing for it").
+    // The discriminators are the runtime's own (`bz_obj_is_string` against
+    // this module's vtable table, `bz_obj_is_tagged_builtin`,
+    // `bz_obj_is_fnval`) plus the vtable's Dispose SLOT — a §8.6 box's is
+    // the shared no-op `bz$exDispose`, a class instance's is its own Dispose
+    // — so a box is never mistaken for a class instance (the `objectReclaim`
+    // arm's guard is the narrow `Object`-INSTANCE case and this is the
+    // general one).
+    //
+    // `obj` must be non-null (the caller null-guards). The slot is NOT nulled
+    // here: the CALLER decides — the `owned`-slot arms null it (the #396
+    // slot-null precedent) while the `objectReclaim` arm must NOT (its
+    // scope's own box / string releases read the slot afterwards).
+    void emitObjectSlotDisposal(llvm::Value* obj);
+
     // #4602 (§28.2, v0.338) — checked-disposal bounded retention, layer 1.
     // A checked build quarantines a disposed block so a surviving borrow's
     // member-entry guard can read its disposed flag; a block no surviving
@@ -15289,6 +15346,59 @@ private:
         if (!isCapturedOwnedPrimaryParam(fs) || !fs->posParam->type)
             return nullptr;
         return ctx_.resolvedType(*fs->posParam->type);
+    }
+
+    // fix #8118 (§28.1 / §8.1 / §28.5, v0.355): an `owned` FIELD whose
+    // declared type is `Object` (or `Object?`).
+    //
+    // §28.5: "Only fields whose type is a class type or an interface type take
+    // the `owned` field modifier as a marking of their own", and §28.1 names
+    // `Object` as such a class type ("`Object` is such a class type (§8.1),
+    // here and at an `owned` field (§28.5)"); the #7921 owner ruling
+    // (reading (A)) settles the admission.
+    //
+    // `isOwnedReferenceField` REJECTS this shape (an `Object` TypeRef is
+    // `Kind::Primitive`, and that predicate requires a class/interface
+    // `declaration`), so before this predicate the field was SKIPPED by
+    // `emitOwnedFieldDisposals`' cascade and its value leaked at every
+    // holder — the §28.5 field restriction the marker itself claims.
+    //
+    // The generic case (`private owned _t: T` instantiated at `T = Object`)
+    // is read through `ownedTypeParamConcreteType`, the same substitution
+    // lookup `isOwnedReferenceField`'s own generic arm uses (§28.5's
+    // per-instantiation field rule).
+    bool isOwnedObjectField(const sema::FieldSymbol* fs) {
+        if (fs->posParam) {
+            // §22.10 (v0.180): a captured `owned` primary-ctor parameter. Its
+            // type rides `posParam->type` (fs->decl is the owning TypeDecl,
+            // not a FieldDecl) — the same source `isOwnedReferenceField`'s own
+            // posParam branch reads, and the same helper
+            // (`capturedOwnedPrimaryParamType`) the Shared/Weak / collection
+            // owned-field predicates read.
+            const sema::TypeRef* pt = capturedOwnedPrimaryParamType(fs);
+            return pt && pt->kind == sema::TypeRef::Kind::Primitive &&
+                   pt->primitive == sema::PrimitiveType::Object;
+        }
+        if (!hasOwnedModifier(fs)) return false;
+        const sema::TypeRef* rt = nullptr;
+        if (!fs->decl) {
+            rt = ctx_.importedMemberType(fs);
+        } else {
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->type) return false;
+            rt = ctx_.resolvedType(*fd->type);
+        }
+        if (!rt) return false;
+        if (rt->kind == sema::TypeRef::Kind::Primitive)
+            return rt->primitive == sema::PrimitiveType::Object;
+        // (b) §28.5: a generic type-parameter field — classify by the concrete
+        // substituted type of the current instantiation.
+        if (rt->kind == sema::TypeRef::Kind::Named && !rt->declaration) {
+            const sema::TypeRef* concr = ownedTypeParamConcreteType(fs);
+            return concr && concr->kind == sema::TypeRef::Kind::Primitive &&
+                   concr->primitive == sema::PrimitiveType::Object;
+        }
+        return false;
     }
 
     bool isOwnedReferenceField(const sema::FieldSymbol* fs) {

@@ -175,10 +175,15 @@ end Program;
 }
 
 // The §28.1 "Type requirement" still applies where §12.1 does not decide: an
-// `owned` parameter of a NON-`override` method keeps the §28.1 diagnostic (the
-// lane's brief forbids changing which programs are accepted), so this row
-// pins the unchanged verdict and the unchanged text.
-BEZEL_TEST(object_trio_override_message_6029, owned_object_parameter_outside_an_override_still_rejected_spec_28_1) {
+// `owned` parameter of a NON-`override` method is judged by §28.1 alone.
+//
+// fix #8118 (§28.1 / §8.1 / §28.5, v0.355) FLIPPED this row. It used to pin
+// the REJECTION of a plain `owned other: Object?` parameter with the text
+// "`owned` is not admissible on a parameter of type a primitive value type" —
+// a statement the spec makes FALSE of `Object` in as many words ("`Object` is
+// such a class type (§8.1)"). §28.1 admits the marker there, so the program
+// is now ACCEPTED and the row pins the acceptance and the run instead.
+BEZEL_TEST(object_trio_override_message_6029, owned_object_parameter_outside_an_override_is_admitted_spec_28_1) {
     auto r = runAot(R"(
 module M;
 public class C
@@ -193,9 +198,12 @@ public class Program
   end Main;
 end Program;
 )");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "True\n");
+    // The old, misleading text must be gone: `Object` is a class type and
+    // §28.1 admits `owned` on one.
+    BEZEL_EXPECT_FALSE(hasErrorContaining(
         r, "`owned` is not admissible on a parameter of type a primitive value type"));
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_FALSE(r.ran);
 }

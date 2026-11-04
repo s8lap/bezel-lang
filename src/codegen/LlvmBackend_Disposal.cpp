@@ -1363,6 +1363,13 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // (Owning classification per classifyChoiceType). The disposal is via
         // emitOwningChoiceLocationDisposal, NOT the class-vtable path.
         bool owningChoiceField = false;
+        // fix #8118 (§28.1 / §8.1 / §28.5, v0.355): true for an `owned` field
+        // whose declared type is `Object` (or `Object?`). The value may be a
+        // class instance, a §8.6 box, a `string` or a function value (§5.1:
+        // `Object` is the universal reference type), and only the first
+        // carries the §28.1 obligation — so the discharge is the runtime
+        // discrimination `emitObjectSlotDisposal` performs.
+        bool objectField = false;
         // The resolved TypeRef for the owning choice field, passed to
         // emitOwningChoiceLocationDisposal so it can resolve the choice's
         // case declarations and per-case payload types under any substitution.
@@ -1414,6 +1421,20 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         if (fieldIndex_.find(fs) == fieldIndex_.end()) continue;
         if (isOwnedReferenceField(fs)) {
             owned.push_back({fs, nullptr});
+        } else if (isOwnedObjectField(fs)) {
+            // fix #8118 (§28.1 / §8.1 / §28.5, v0.355): an `owned` field of
+            // type `Object` (or `Object?`). §28.5 admits the marker on a
+            // CLASS-typed field and §28.1 names `Object` as such a class
+            // type; the #7921 owner ruling (reading (A)) settles the
+            // admission. `isOwnedReferenceField` rejects the shape (an
+            // `Object` TypeRef is `Kind::Primitive`), so before this branch
+            // the field was SKIPPED by the cascade and its value leaked.
+            // The discharge is dynamic — the value may be a class instance, a
+            // §8.6 box, a `string` or a function value (§5.1) and only the
+            // first carries the obligation (§28.1).
+            OwnedField of{fs, nullptr};
+            of.objectField = true;
+            owned.push_back(of);
         } else if (isOwnedBuiltinExceptionField(fs)) {
             // #405 / §28.5 / §31.1: an `owned` field of BUILTIN exception type.
             // It has no user TypeSymbol (so isOwnedReferenceField rejects it),
@@ -2125,6 +2146,29 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // tag 0 which is also a no-op arm.
         if (it->owningChoiceField) {
             emitOwningChoiceLocationDisposal(addr, it->owningChoiceRef);
+            continue;
+        }
+        // fix #8118 (§28.1 / §8.1 / §28.5, v0.355): an `owned` field of type
+        // `Object` (or `Object?`). §28.5's "Auto-disposes the field when the
+        // containing object is disposed" — and the value's kind is not
+        // statically decidable (§5.1), so the discharge asks the runtime (see
+        // emitObjectSlotDisposal): a class instance is disposed + reclaimed, an
+        // array backing is freed by the typed free, and a runtime-managed value
+        // (a §8.6 box, a `string`, a function value) disposes nothing (§28.1 /
+        // §28.9). Null-guard + null-after, the #396 slot-null precedent.
+        if (it->objectField) {
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                val, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* objDispBB = llvm::BasicBlock::Create(llvm_, "owned.obj.dispose",
+                                                       currentFn_);
+            auto* objContBB = llvm::BasicBlock::Create(llvm_, "owned.obj.cont",
+                                                       currentFn_);
+            builder_.CreateCondBr(isNull, objContBB, objDispBB);
+            builder_.SetInsertPoint(objDispBB);
+            emitObjectSlotDisposal(val);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(objContBB);
+            builder_.SetInsertPoint(objContBB);
             continue;
         }
         llvm::Value* isNull = builder_.CreateICmpEQ(
@@ -3562,6 +3606,202 @@ void Emitter::emitReclaimBlock(llvm::Value* obj, bool cdMayFree) {
             builder_.SetInsertPoint(cdKeepBB);
         }
     }
+}
+
+
+// fix #8118 (§28.1 / §8.1 / §28.5, v0.355): the discharge of an `owned` slot
+// whose DECLARED type is `Object` (or `Object?`).
+//
+// WHY A RUNTIME DISCRIMINATION. §5.1 makes `Object` the universal reference
+// type ("classes … directly through the inheritance chain, with `string`,
+// interfaces, and function types reaching `Object` similarly via their
+// reference-type heap representation"), so an `Object`-typed slot may hold
+// any of:
+//
+//   * a CLASS INSTANCE — the ordinary case, and the one that carries the
+//     §28.1 obligation ("the marker transfers whatever value the position
+//     holds");
+//   * an ARRAY-BACKED built-in (`Array<T>` / `OwningArray<T>` — §15.2's
+//     heap-array CLASSES);
+//   * a §8.6 BOX (a value type boxed into the slot) — runtime-managed
+//     (§28.9: "Boxed value types — created implicitly when a value type is
+//     used where `Object` … is expected"), so it carries NO obligation;
+//   * a `string` — runtime-managed (§28.9), no obligation;
+//   * a FUNCTION VALUE — runtime-managed (§28.9), no obligation.
+//
+// §28.1 says of the last three: "a runtime-managed value there — a boxed
+// value, a `string`, a function value — carries no obligation, the discharge
+// points disposing nothing for it (§8.7)". §8.7 says the discharge points
+// "dispatch to the runtime type's `Dispose()` … and dispose nothing for a
+// runtime-managed value".
+//
+// The STATIC type cannot tell them apart, and neither can the slot's own
+// word 0: a class instance's word 0 is its vtable, a box's word 0 is the
+// BOX vtable (also a vtable), a string's word 0 is its data pointer, and a
+// function value's is the runtime's fnval vtable. So the discharge asks the
+// runtime, in this order:
+//
+//   1. `bz_obj_is_string(obj, vtableTable)` — 1 iff word 0 is NOT a vtable
+//      this module knows (a `string`) → NOTHING is disposed. This test comes
+//      FIRST because word 0 of a string is not a vtable, so reading word 0's
+//      slot 2 before it would be an out-of-bounds read.
+//   2. `bz_obj_is_fnval(obj)` — 1 iff word 0 is the runtime's function-value
+//      vtable → NOTHING is disposed (§28.9: a function value is
+//      runtime-managed).
+//   3. `bz_obj_is_tagged_builtin(obj)` — 1 iff word 0 is one of the
+//      runtime-owned built-in vtables (#6776's tags): the array-backed ones
+//      (`bz_array_vtable` / `bz_sb_vtable`) or the Mutex /
+//      CancellationTokenSource handles. An array backing is a §15.2 heap-array
+//      CLASS, so it carries the obligation and goes through the CLASS
+//      PROTOCOL below (its vtable slot 2 is the runtime's own array Dispose,
+//      `bz_array_obj_dispose` — the header-consulting element disposer — and
+//      the reclaim frees the header). A Mutex / CTS handle is left to its own
+//      release rule (a bounded leak, never a wild free: their structs are 32
+//      bytes, too small for the kind-tag probe `bz_runtime_dispose` reads).
+//   4. Otherwise word 0 IS a class / box vtable. The vtable's Dispose SLOT
+//      decides: a §8.6 box's slot 2 is the shared no-op `bz$exDispose`
+//      (every box vtable — record / enum / primitive / span / inline-array —
+//      installs it), while a class instance's slot 2 is the class's own
+//      Dispose → the class arm (`emitDisposeAndReclaim`, the shape every
+//      class-typed owned slot uses). The `Object` ROOT class is the one
+//      class whose slot 2 is also the shared no-op (§8.7: "`Dispose()` is not
+//      on `Object`"), so it is separated by the vtable IDENTITY — the
+//      `objectReclaim` arm's rule — and reaches the same class arm (whose
+//      Dispose is that same no-op and whose reclaim frees the block; §28.9:
+//      `Object` is a trivial-dispose class).
+//
+// WHY NOT `dynamicDispose`. That arm emits `emitDisposeAndReclaim`
+// unconditionally: over a `string` it would read the DATA POINTER as a
+// vtable and call through it (a wild jump), and over a box it would reclaim
+// a block the box's own refcounted rule owns.
+void Emitter::emitObjectSlotDisposal(llvm::Value* obj) {
+    if (!obj) return;
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "objslot.cont",
+                                            currentFn_);
+    auto* vtableBB = llvm::BasicBlock::Create(llvm_, "objslot.vtable",
+                                              currentFn_);
+    auto* taggedBB = llvm::BasicBlock::Create(llvm_, "objslot.tagged",
+                                              currentFn_);
+    auto* disposeBB = llvm::BasicBlock::Create(llvm_, "objslot.dispose",
+                                               currentFn_);
+    // (1) a `string` (word 0 is a data pointer, not a vtable).
+    auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+    llvm::Value* isStr = builder_.CreateCall(
+        isStrFn, {obj, vtableTablePtr()}, "objslot.isstr");
+    // (2) a function value (§28.9 runtime-managed).
+    auto* fnvalFn = declareC("bz_obj_is_fnval", i32(), {ptrTy()});
+    llvm::Value* isFnval = builder_.CreateCall(
+        fnvalFn, {obj}, "objslot.fnval");
+    // A string or a function value: the discharge disposes NOTHING (§28.1).
+    llvm::Value* isRuntimeManaged = builder_.CreateOr(
+        builder_.CreateICmpNE(isStr, builder_.getInt32(0)),
+        builder_.CreateICmpNE(isFnval, builder_.getInt32(0)),
+        "objslot.runtimemanaged");
+    builder_.CreateCondBr(isRuntimeManaged, contBB, vtableBB);
+    builder_.SetInsertPoint(vtableBB);
+    // (3) the runtime-owned built-in tags (#6776).
+    auto* taggedFn = declareC("bz_obj_is_tagged_builtin", i32(), {ptrTy()});
+    llvm::Value* isTagged = builder_.CreateCall(
+        taggedFn, {obj}, "objslot.tagged");
+    builder_.CreateCondBr(
+        builder_.CreateICmpNE(isTagged, builder_.getInt32(0)),
+        taggedBB, disposeBB);
+    builder_.SetInsertPoint(taggedBB);
+    // A tagged built-in: the ARRAY-BACKED one (a §15.2 heap-array class)
+    // carries the obligation and takes the class protocol; a Mutex /
+    // CancellationTokenSource handle does NOT — its vtable Dispose slot
+    // (`bz_mutex_obj_dispose` / `bz_cts_obj_dispose`) frees the handle
+    // ITSELF, so a Dispose-then-reclaim discharge would free it twice. It is
+    // left to its own release rule: a bounded leak, never a double free.
+    auto* isArrFn = declareC("bz_obj_is_array", i32(), {ptrTy()});
+    llvm::Value* isArr = builder_.CreateCall(
+        isArrFn, {obj}, "objslot.isarr");
+    builder_.CreateCondBr(
+        builder_.CreateICmpNE(isArr, builder_.getInt32(0)),
+        disposeBB, contBB);
+    builder_.SetInsertPoint(disposeBB);
+    // (4) the CLASS PROTOCOL: the vtable's own Dispose (slot 2 — the
+    // class's idempotent Dispose, §28.4) and then the reclaim. For a §8.6
+    // BOX the slot 2 is the shared no-op, so this arm must NOT be taken: a
+    // box is runtime-managed and its block belongs to its own refcounted
+    // rule (§28.9) — reclaiming it here would free a block another owner
+    // still holds. The `Object` ROOT class's slot 2 is the same no-op, but it
+    // IS a class, so it takes this arm (its Dispose is a no-op and the
+    // reclaim frees the block — §28.9's trivial-dispose rule).
+    {
+        llvm::Value* word0 = builder_.CreateLoad(ptrTy(), obj, "objslot.vt");
+        if (builtinDisposeFn_) {
+            // The shared no-op Dispose ⇒ a §8.6 box OR the `Object` root
+            // class. The `Object` root is separated by its vtable IDENTITY
+            // (the `objectReclaim` arm's rule); a box is not.
+            llvm::Value* disposeSlot = builder_.CreateGEP(
+                ptrTy(), word0, {builder_.getInt32(2)});
+            llvm::Value* disposeFn = builder_.CreateLoad(ptrTy(), disposeSlot,
+                                                         "objslot.disp");
+            llvm::Value* isSharedNoop = builder_.CreateICmpEQ(
+                disposeFn,
+                llvm::ConstantExpr::getPointerCast(builtinDisposeFn_, ptrTy()),
+                "objslot.noop");
+            auto* objBB = llvm::BasicBlock::Create(llvm_, "objslot.obj",
+                                                   currentFn_);
+            auto* rootBB = llvm::BasicBlock::Create(llvm_, "objslot.root",
+                                                    currentFn_);
+            builder_.CreateCondBr(isSharedNoop, rootBB, objBB);
+            builder_.SetInsertPoint(objBB);
+            // A CLASS INSTANCE: its own idempotent Dispose (§28.4) and the
+            // reclaim — the shape every class-typed owned slot uses.
+            emitDisposeAndReclaim(obj);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(rootBB);
+            // The `Object` ROOT class: a trivial-dispose class (§28.9 — no
+            // destructor, no owned fields), whose vtable Dispose slot is the
+            // same shared no-op (§8.7: "`Dispose()` is not on `Object`"). Its
+            // discharge is the RECLAIM alone — no logical-disposal step to
+            // run — which is exactly the `objectReclaim` arm's disposition.
+            // It is separated from a §8.6 box by its vtable IDENTITY: the
+            // `Object` vtable is a module-local constant array (`bvt$Object`,
+            // InternalLinkage), so the address identity IS the type identity.
+            auto objVtable = builtinVtable_.find("Object");
+            if (objVtable != builtinVtable_.end()) {
+                llvm::Value* isObj = builder_.CreateICmpEQ(
+                    word0, llvm::cast<llvm::Constant>(objVtable->second),
+                    "objslot.isobj");
+                auto* reclaimBB = llvm::BasicBlock::Create(llvm_,
+                                                            "objslot.reclaim",
+                                                            currentFn_);
+                auto* skipBB = llvm::BasicBlock::Create(llvm_, "objslot.skipbox",
+                                                        currentFn_);
+                builder_.CreateCondBr(isObj, reclaimBB, skipBB);
+                builder_.SetInsertPoint(reclaimBB);
+                emitReclaimBlock(obj);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(skipBB);
+                // A §8.6 box: runtime-managed — the discharge disposes NOTHING
+                // (§28.1: "the discharge points disposing nothing for it"). Its
+                // block belongs to its own refcounted rule (§28.9).
+                builder_.CreateBr(contBB);
+            } else {
+                // No `Object` vtable in this module means nothing in it ever
+                // allocated one, so the slot cannot hold an `Object` instance;
+                // the only value left on this path is a §8.6 box — dispose
+                // NOTHING (§28.1 / §28.9).
+                builder_.CreateBr(contBB);
+            }
+        } else {
+            emitDisposeAndReclaim(obj);
+            builder_.CreateBr(contBB);
+        }
+    }
+    builder_.SetInsertPoint(contBB);
+    // The slot is NOT nulled here: the CALLER decides. The `objectReclaim`
+    // arm (an `Object`-typed LOCAL) must leave the slot's value in place —
+    // its scope-end release reads the slot AFTER this discharge (the
+    // `boxRelease` / `objectStringRelease` entries of the same scope own
+    // the §8.6 box and the `string` +1 the slot may hold, and a null slot
+    // would make those releases read null and skip — #5437's
+    // `object_box_keeps_its_own_release_rule_8_6` and
+    // `object_slot_reassigned_to_box_keeps_box_8_6` pin that), while the
+    // `owned`-slot arms null it themselves (the #396 slot-null precedent).
 }
 
 
@@ -10005,6 +10245,16 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             } else if (!it->vtablelessBuiltin.empty()) {
                 // fix #7565: a fresh `new StringBuilder(...)` receiver temp.
                 emitVtablelessBuiltinRelease(it->vtablelessBuiltin, obj);
+            } else if (it->objectSlotDispose) {
+                // fix #8118 (§28.1 / §8.1 / §28.5, v0.355): an `owned` slot
+                // whose DECLARED type is `Object` (or `Object?`). The value's
+                // kind is not statically decidable (§5.1), so the discharge
+                // asks the runtime — a class instance is disposed + reclaimed,
+                // an array backing takes the class protocol, and a
+                // runtime-managed value (a §8.6 box, a `string`, a function
+                // value) disposes nothing (§28.1: "the discharge points
+                // disposing nothing for it"). See emitObjectSlotDisposal.
+                emitObjectSlotDisposal(obj);
             } else {
                 emitDisposeAndReclaim(obj);
             }
@@ -11488,6 +11738,40 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.SetInsertPoint(contBB);
             continue;
         }
+        if (it->objectSlotDispose) {
+            // fix #8118 (§28.1 / §8.1 / §28.5, v0.355): an `owned` slot whose
+            // DECLARED type is `Object` (or `Object?`). §28.1 admits the marker
+            // there ("`Object` is such a class type (§8.1) … here and at an
+            // `owned` field (§28.5)"), and the #7921 owner ruling (reading (A))
+            // settles the admission. The VALUE is not statically decidable
+            // (§5.1: `Object` is the universal reference type), so the discharge
+            // asks the runtime which kind of value it holds — a class instance
+            // (disposed + reclaimed), an array backing (the typed free), or a
+            // runtime-managed value (a §8.6 box, a `string`, a function value —
+            // §28.1: "carries no obligation, the discharge points disposing
+            // nothing for it"). See emitObjectSlotDisposal for the full
+            // discrimination and its order.
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                obj, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB = llvm::BasicBlock::Create(llvm_, "objslot.dispose",
+                                                    currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "objslot.cont2",
+                                                    currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            emitObjectSlotDisposal(obj);
+            // The #396 slot-null precedent: the slot is nulled AFTER the
+            // discharge so a second pass over the same scope skips it — the
+            // discharge is exactly once per slot.
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
         if (it->objectReclaim) {
             // fix #5437 (§28.9 / §28.2 / §8.1, v0.315). `Object` is a
             // trivial-dispose CLASS (§8.1 declares no destructor and no fields),
@@ -11498,71 +11782,51 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // no `Dispose()` on `Object`), so the instance never reached
             // `emitReclaimBlock` and its 8 bytes leaked at every holder.
             //
-            // The guard is the crux, and it is a RUNTIME test on purpose. §5.1
-            // makes `Object` the universal reference type ("any type to
-            // `Object` … value types … by boxing (§8.6)"), so an `Object`-typed
-            // slot can hold a §8.6 BOX as well as an `Object` instance —
-            // MEASURED: `var o: Object := 42;` allocates a 24-byte box, and
-            // `o = <box>` stores one into an `Object` slot. Boxes are
-            // runtime-managed (§28.9) and are reclaimed by their OWN rule; a
-            // static type test cannot tell the two apart, and freeing a box here
-            // would be a soundness regression, not a leak fix. So: reclaim iff
-            // word 0 is the `Object` vtable this module built.
+            // fix #8118 (§28.1 / §8.1 / §28.5, v0.355): the DISCHARGE is now
+            // the shared runtime discrimination (`emitObjectSlotDisposal`),
+            // because the slot's VALUE is not statically decidable (§5.1) and
+            // the old arm reclaimed ONLY an `Object` instance:
+            //   * an `Object` instance → the reclaim alone (unchanged — the
+            //     vtable-identity test the old arm used is the same one the
+            //     shared helper uses);
+            //   * a §8.6 BOX → NOTHING (unchanged — the box is runtime-managed
+            //     and is reclaimed by its own rule; the #5437 rows
+            //     `object_box_keeps_its_own_release_rule_8_6` and
+            //     `object_slot_reassigned_to_box_keeps_box_8_6` pin this);
+            //   * a CLASS INSTANCE → its own Dispose (§28.4) + the reclaim.
+            //     This is the case the old arm LEAKED: MEASURED, an
+            //     `owned Object` RETURN (`method Make(): owned Object`
+            //     returning `new Res();`) bound by `var o := Make();` left the
+            //     instance with no owner — 16 bytes per call under
+            //     `--sanitize=address`. §28.9's trivial-dispose free rides on
+            //     the INSTANCE, and a class instance is not trivial-dispose
+            //     unless it is, so its own Dispose must run;
+            //   * a `string` / a function value → NOTHING (§28.9).
             //
-            // The vtable comparison is exact rather than "not a box" for two
-            // reasons. (1) It fails SAFE in the direction that matters: an
-            // unrecognized value is left alone, i.e. a bounded leak, never a
-            // free of memory the runtime still owns. (2) It keeps §8.6 boxes,
-            // and any other vtable-bearing value an `Object` slot can hold, on
-            // their own release rules — this arm changes the `Object`
-            // instance's fate ONLY.
-            //
-            // The disposition itself is `emitReclaimBlock` alone, not
-            // `emitDisposeAndReclaim`: §8.1 gives `Object` no destructor and no
-            // owned fields, so there is no logical-disposal step to run, and
-            // calling the vtable's slot 2 would re-enter the very shared no-op
-            // this fix deliberately does not touch.
+            // The `objectReclaim` FLAG is kept (not renamed) because the async
+            // return path keys on it (LlvmBackend_Stmts.cpp's
+            // `!e.objectReclaim` test) to tell an `Object` local that the
+            // frame owns from one the task takes over.
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
             llvm::Value* isNull = builder_.CreateICmpEQ(
                 obj, llvm::ConstantPointerNull::get(ptrTy()));
-            auto objVtable = builtinVtable_.find("Object");
             auto* dispBB = llvm::BasicBlock::Create(llvm_, "obj.reclaim",
                                                     currentFn_);
             auto* contBB = llvm::BasicBlock::Create(llvm_, "obj.reclaim.cont",
                                                     currentFn_);
             builder_.CreateCondBr(isNull, contBB, dispBB);
             builder_.SetInsertPoint(dispBB);
-            if (objVtable != builtinVtable_.end()) {
-                // Word 0 of the object is its vtable pointer. Compare it against
-                // the `Object` vtable by ADDRESS: the vtable is a module-local
-                // constant array (`bvt$Object`, InternalLinkage), so the address
-                // identity is the type identity, exactly as `emitIsA`'s vtable
-                // dispatch and `bz_exc_reclaim_causechain`'s vtable-table gate
-                // already rely on.
-                llvm::Value* word0 = builder_.CreateLoad(
-                    ptrTy(),
-                    builder_.CreateBitCast(
-                        obj, llvm::PointerType::get(ptrTy(), 0)));
-                llvm::Value* isObj = builder_.CreateICmpEQ(
-                    word0, llvm::cast<llvm::Constant>(objVtable->second));
-                auto* reclaimBB = llvm::BasicBlock::Create(
-                    llvm_, "obj.reclaim.free", currentFn_);
-                auto* skipBB = llvm::BasicBlock::Create(
-                    llvm_, "obj.reclaim.skip", currentFn_);
-                builder_.CreateCondBr(isObj, reclaimBB, skipBB);
-                builder_.SetInsertPoint(reclaimBB);
-                emitReclaimBlock(obj);
-                builder_.CreateBr(contBB);
-                builder_.SetInsertPoint(skipBB);
-                builder_.CreateBr(contBB);
-            } else {
-                // No `Object` vtable in this module means nothing in it ever
-                // allocated one, so the slot cannot hold an instance; skip the
-                // reclaim rather than guess.
-                builder_.CreateBr(contBB);
-            }
+            emitObjectSlotDisposal(obj);
+            // The slot is NOT nulled here — the pre-#8118 arm did not null it
+            // either, and the scope's OTHER releases read the slot AFTER this
+            // discharge: the `boxRelease` entry owns the §8.6 box the slot may
+            // hold and the `objectStringRelease` entry owns the `string` +1,
+            // and a null slot would make those read null and skip (the #5437
+            // rows `object_box_keeps_its_own_release_rule_8_6` and
+            // `object_slot_reassigned_to_box_keeps_box_8_6` pin that).
+            builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;
         }

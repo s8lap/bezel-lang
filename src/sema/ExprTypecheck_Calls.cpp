@@ -31150,9 +31150,22 @@ static bool ownedMarkerErasedAtSubstitutedType(const TypeRef* t) {
     case TypeRef::Kind::Function:
         return true;   // a function value is a runtime-managed reference (§28.9).
     case TypeRef::Kind::Primitive:
-        // Every primitive is a value type, or — for `string`/`Object` — a
-        // runtime-managed reference type (§28.9); none carries a disposal
-        // obligation, mirroring checkOwnedDeclType's uniform primitive reject.
+        // Every primitive is a value type, or — for `string` — a runtime-managed
+        // reference type (§28.9); none carries a disposal obligation.
+        //
+        // fix #8118 (§28.1 / §8.1, v0.355): `Object` is the ROOT CLASS
+        // (§8.1), so the §28.1 type requirement ADMITS the marker on it, and
+        // `checkOwnedDeclType` now admits it (the #7921 owner ruling, reading
+        // (A)). This predicate is §28.1 clause 3's PER-INSTANTIATION rule, a
+        // different question from the declaration-site requirement; the
+        // erasure at an `Object` substitution is unchanged (#1857's E1/E2
+        // reconciliation, pinned by
+        // tests/ownership/owned_bare_t_primitive_func_unit_erasure_1857_test.cpp),
+        // and the divergence from `checkOwnedDeclType`'s now-smaller reject
+        // set is deliberate — the same reading as the layer-local copy in
+        // TypeResolution_Checks.cpp, whose comment records the residual
+        // (§28.1 clause 3's "at a class or interface substitution the marker
+        // has its ordinary transfer meaning") as a separate owner question.
         return true;
     case TypeRef::Kind::InlineArray:
         // §15.3: an owning inline array is a MOVE-ONLY value type — the marker
