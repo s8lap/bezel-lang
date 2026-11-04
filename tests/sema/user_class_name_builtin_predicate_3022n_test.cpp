@@ -36,6 +36,9 @@
 //   sema/ExprTypecheck_Calls.cpp:3872  Range<T> LINQ receiver
 //   sema/ExprTypecheck_Calls.cpp:4193  Encoding.Utf8.GetBytes / .GetString / .Name member typing
 //   sema/ExprTypecheck_Calls.cpp:12228 "Encoding usable only as immediate receiver" gate
+//                                            (REMOVED by fix #7028 — the indirect use
+//                                             through an `Encoding` value is now lowered;
+//                                             the row that pinned it is flipped below)
 //   sema/ExprTypecheck_Calls.cpp:12912 RawBytes-only `Length: int` declaration-only test
 //
 // Sites EXCLUDED from this narrow fix (Result combinator sites, kept
@@ -205,20 +208,39 @@ BEZEL_TEST(user_class_name_builtin_predicate_3022n,
     BEZEL_EXPECT_EQ(7, r.exitCode);
 }
 
-// Real builtin Encoding.UTF8.GetBytes round-trip still works (the §3.2
-// "immediate receiver" rule keeps firing on the real singleton path:
-// `Encoding.UTF8.GetBytes(...)` is the only spelling the codegen lowers;
-// an INDIRECT use `var e := Encoding.UTF8; e.GetBytes(...)` is still
-// rejected, and the gate must not widen into a no-op).
+// Real builtin Encoding.UTF8.GetBytes round-trip still works.
+//
+// fix #7028 (stdlib §3.2, v0.355): the §3.2 "immediate receiver" rule is
+// GONE. It was the pre-#7001/pre-#7028 state: the `Encoding` singleton was
+// reachable ONLY as the immediate receiver of `Encoding.UTF8.GetBytes(...)`,
+// because there was no first-class singleton OBJECT to bind to a variable.
+// Since fix #7001 an `Encoding` value IS the i32 kind tag a builtin
+// class-typed slot lowers to, and since fix #7028 the variable receiver
+// dispatches on that tag to the same per-encoding lowering the literal shape
+// uses. stdlib §3.2 (v0.340) says the static properties "return singleton
+// instances ... callers access them through the `Encoding` base type" — so
+// the INDIRECT use `var e := Encoding.UTF8; e.GetBytes(...)` is the
+// DOCUMENTED way to reach the operation, and it now works.
+//
+// The gate did not widen into a no-op: it is the rule that is gone, and the
+// user-class row above (which pins that a user class named `Encoding` is not
+// the built-in) is untouched.
 BEZEL_TEST(user_class_name_builtin_predicate_3022n,
-           builtin_encoding_indirect_use_still_rejected_spec_3_2) {
+           builtin_encoding_indirect_use_now_supported_spec_3_2) {
     auto r = runAotChecked(
-        "module M; "
+        "module M; import System; import System.Text; "
         "class C public static method Main(): int "
         "  var e := Encoding.UTF8; "
-        "  return e.GetBytes(\"hi\"); "
+        "  using var b := e.GetBytes(\"hi\"); "
+        "  return b.Count; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(diagSaysEncodingOnlyDirect(r));
+    if (diagSaysEncodingOnlyDirect(r)) {
+        std::cout << "    #7028 Encoding: the indirect use is still rejected\n";
+    }
+    BEZEL_EXPECT_FALSE(diagSaysEncodingOnlyDirect(r));
+    BEZEL_EXPECT_FALSE(hasAnyError(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(2, r.exitCode);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

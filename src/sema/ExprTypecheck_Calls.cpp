@@ -12611,10 +12611,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // a user class named `Encoding` reaches stdlib §3.2's
                 // specific member-typing arm and codegen tries to box
                 // `Encoding.Utf8` as a built-in singleton.
-                if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
-                    recvTy->declaration &&
-                    recvTy->declaration->name == "Encoding" &&
-                    recvTy->declaration->moduleName.empty()) {
+                // fix #7028 (stdlib §3.2, v0.355): the receiver may ALSO be an
+                // `Encoding`-typed VALUE — a local, a parameter, a field —
+                // and not only the `Encoding.<X>` singleton. stdlib §3.2
+                // (v0.340) says the static properties "return singleton
+                // instances ... callers access them through the `Encoding`
+                // base type", so `var e: Encoding := Encoding.UTF8;
+                // e.GetBytes(s)` is the documented way to reach the operation.
+                // The gate above read only the DECLARATION, and an
+                // `Encoding`-annotated binding carries a NULL declaration
+                // (the builtin-name admission in TypeResolution), so the
+                // variable receiver never reached this arm and its call was
+                // left UNTYPED (no result type, so the owned `Array<byte>`
+                // carried no type descriptor and `.Count` did not lower).
+                // `isStdlibEncodingType` reads BOTH builtin shapes and still
+                // excludes a user class of that name.
+                if (isStdlibEncodingType(recvTy)) {
                     // fix #6957 (stdlib §3.2, v0.340): GetBytes/GetByteCount
                     // take a `string` (or ReadOnlyStringSpan) source; an int
                     // or array argument has no overload and reached codegen.
@@ -35119,44 +35131,26 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 return;
             }
         }
-        // The `Encoding` singleton is reachable ONLY through the direct
-        // `Encoding.Utf8.GetBytes(...)` / `.GetString(...)` form (the codegen
-        // lowers exactly that two-level shape; there is no first-class singleton
-        // OBJECT yet). Reject an INDIRECT use — a member access whose target is
-        // an `Encoding`-typed value that is NOT the direct `Encoding.<singleton>`
-        // member access (e.g. a local `var e := Encoding.Utf8; e.GetBytes(s)`).
-        // Without this guard such a call has no codegen lowering and would
-        // miscompile (a null receiver → crash). A clear compile error is the
-        // sound outcome until a real singleton object is modeled.
-        if (auto* tt = ctx_.exprType(*ma.target)) {
-            // fix #3022 (§11.3, v0.240): `targetIsEncoding` must NOT match
-            // a USER class named Encoding — gate on moduleName.empty()
-            // (the discriminator the rest of the front-end adopted after
-            // #2995/#2997). Without it a user class named `Encoding`
-            // trips the stdlib §3.2 "Encoding is usable only as the
-            // immediate receiver" diagnostic on a program that contains
-            // no §3.2 built-in.
-            bool targetIsEncoding =
-                tt->kind == TypeRef::Kind::Named && tt->declaration &&
-                tt->declaration->name == "Encoding" &&
-                tt->declaration->moduleName.empty();
-            bool targetIsDirectSingleton = false;
-            if (auto* inner =
-                    dynamic_cast<const ast::MemberAccessExpr*>(ma.target.get())) {
-                if (auto* iid = dynamic_cast<const ast::IdentifierExpr*>(
-                        inner->target.get()))
-                    targetIsDirectSingleton = iid->name == "Encoding";
-            }
-            if (targetIsEncoding && !targetIsDirectSingleton) {
-                ctx_.diagnostics().report(
-                    Severity::Error, ma.span.begin,
-                    "an `Encoding` value is usable only as the immediate "
-                    "receiver of `Encoding.UTF8.GetBytes(...)` / "
-                    "`.GetString(...)` (stdlib §3.2); binding it to a variable "
-                    "or using it indirectly is not yet supported");
-                return;
-            }
-        }
+        // fix #7028 (stdlib §3.2, v0.355): the `Encoding` VALUE is no longer
+        // restricted to the immediate receiver of `Encoding.UTF8.GetBytes(...)`.
+        // Since fix #7001 an `Encoding` is the i32 kind tag a builtin
+        // class-typed slot lowers to, and stdlib §3.2 (v0.340) says the
+        // static properties "return singleton instances ... callers access
+        // them through the `Encoding` base type" — so binding one to a local,
+        // a parameter or a field and calling through it is the DOCUMENTED way
+        // to reach the operation, and the old gate rejected exactly that.
+        //
+        // The gate was also INCONSISTENT: it read the receiver's DECLARATION,
+        // and an `Encoding`-annotated binding carries a NULL declaration (the
+        // builtin-name admission in TypeResolution), so it fired on the
+        // inferred spelling (`var e := Encoding.UTF8;`) and NOT on the
+        // annotated one (`var e: Encoding := Encoding.UTF8;`) — which then
+        // reached codegen with an UNTYPED call and no lowering arm.
+        //
+        // The member surface is lowered now: `.Name` (fix #7001) and
+        // `.GetBytes` / `.GetString` / `.GetByteCount` (fix #7028). A member
+        // with no lowering still fails loudly in codegen (#2457's backstop),
+        // so nothing is admitted silently.
     }
     // narrow #4809 (§5.1 / §4.2, v0.307, follow-up to #4766 / commit 6173e0c6):
     // the unannotated built-in static-property reads on the `DateTime` and

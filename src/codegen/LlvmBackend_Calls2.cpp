@@ -375,38 +375,127 @@ static bool isReadOnlySpanTypeName(const sema::TypeRef* t) {
 // All four singletons are implemented (see bz_encoding_* in bezel_runtime.cpp).
 // For Utf16/Utf32/Ascii: GetString and GetBytes may return null on encoding
 // error; codegen checks for null and emits emitGuardThrow("FormatException").
+//
+// fix #7028 (stdlib §3.2, v0.355): the receiver may ALSO be an `Encoding`-typed
+// VALUE — a local, a parameter, a field — and not only the literal singleton.
+// stdlib §3.2 (v0.340) says the static properties "return singleton instances
+// of implementation-provided concrete subclasses ... callers access them
+// through the `Encoding` base type", so `var e: Encoding := Encoding.UTF8;
+// e.GetBytes(s)` is the DOCUMENTED way to reach the same operation — and it
+// had NO lowering arm at all ("`GetBytes` on built-in type `Encoding` produced
+// no value, and no dispatch arm emitted any code for this call", #2457's
+// backstop).
+//
+// Since fix #7001 an `Encoding` value is the i32 KIND TAG a builtin
+// class-typed slot lowers to (0 UTF8, 1 UTF16, 2 UTF32, 3 ASCII), so the
+// variable shape selects the per-encoding runtime entry at RUN TIME: it calls
+// the tag-dispatching `bz_encoding_get_bytes` / `_get_string` /
+// `_get_byte_count` / `_write_bytes` entries, which switch on the tag and call
+// exactly the per-encoding helper the literal shape calls. The literal shape
+// is untouched — it still names the per-encoding entry directly.
 llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
     if (!ma || !ma->target) return nullptr;
-    auto* inner = dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get());
-    if (!inner || !inner->target) return nullptr;
-    auto* clsId = dynamic_cast<const ast::IdentifierExpr*>(inner->target.get());
-    if (!clsId || clsId->name != "Encoding") return nullptr;
 
-    const auto& sg = inner->member;  // "UTF8", "UTF16", "UTF32", or "ASCII"
-    const auto& m  = ma->member;     // "GetBytes", "GetString", or "Name"
+    // The LITERAL shape: ma->target is the member access `Encoding.<X>`.
+    std::string sg;   // the singleton name: "UTF8", "UTF16", "UTF32", "ASCII"
+    bool literal = false;
+    if (auto* inner = dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get())) {
+        if (auto* clsId =
+                dynamic_cast<const ast::IdentifierExpr*>(inner->target.get())) {
+            if (clsId->name == "Encoding") { literal = true; sg = inner->member; }
+        }
+    }
+    const auto& m = ma->member;  // "GetBytes", "GetString", "GetByteCount", "Name"
 
-    // Determine runtime function names and whether GetBytes/GetString can fail.
+    if (literal) {
+        if (sg != "UTF8" && sg != "UTF16" && sg != "UTF32" && sg != "ASCII")
+            return nullptr;
+    } else {
+        // fix #7028: the VARIABLE shape. The receiver's static type must be
+        // the stdlib §3.2 `Encoding` — the BUILT-IN, and not a user class
+        // named `Encoding`. `isStdlibEncodingType` reads both builtin shapes
+        // (the synthetic `builtinClassSym("Encoding")` and the
+        // declaration-less Named ref an `Encoding`-annotated binding
+        // carries) and excludes a user type (#3022 / #5272's rule).
+        if (!sema::isStdlibEncodingType(ctx_.exprType(*ma->target)))
+            return nullptr;
+        // Only the shapes this arm lowers. Anything else (a misspelled member,
+        // a wrong arity) is left to the generic diagnostic — and NO code is
+        // emitted before the shape is known, because the receiver may have
+        // effects and must be evaluated once, in source order (§22.5).
+        if (!((m == "GetBytes" && call.args.size() == 1) ||
+              (m == "GetBytes" && call.args.size() == 2) ||
+              (m == "GetByteCount" && call.args.size() == 1) ||
+              (m == "GetString" && call.args.size() == 1)))
+            return nullptr;
+    }
+
+    // The runtime entries this call lowers to: `per` is the per-encoding entry
+    // (the literal shape names it directly), `disp` is the tag-dispatching
+    // entry (the variable shape, fix #7028), which takes the kind tag as its
+    // first argument and calls the same per-encoding helper.
+    const std::string enc =
+        literal ? (sg == "UTF8"  ? std::string("utf8")  :
+                   sg == "UTF16" ? std::string("utf16") :
+                   sg == "UTF32" ? std::string("utf32") :
+                                   std::string("ascii"))
+                : std::string();
+    struct EncOp { std::string per, disp; };
+    const EncOp getBytesOp  = {"bz_encoding_" + enc + "_get_bytes",
+                               "bz_encoding_get_bytes"};
+    const EncOp getStringOp = {"bz_encoding_" + enc + "_get_string",
+                               "bz_encoding_get_string"};
+    const EncOp countOp     = {"bz_encoding_" + enc + "_get_byte_count",
+                               "bz_encoding_get_byte_count"};
+    const EncOp writeOp     = {"bz_encoding_" + enc + "_write_bytes",
+                               "bz_encoding_write_bytes"};
+
+    // fix #7028: the kind tag of the variable shape's receiver — the i32 tag a
+    // builtin class-typed slot lowers to (fix #7001).
+    llvm::Value* tag = nullptr;
+    if (!literal) {
+        tag = lowerExpr(*ma->target);
+        if (!tag || !tag->getType()->isIntegerTy(32)) return nullptr;
+    }
+
+    // Calls the entry the shape selects: the per-encoding one (the literal
+    // shape) or the tag-dispatching one with the tag as its first argument
+    // (the variable shape). The argument TYPES are spelled out, exactly as
+    // the per-encoding declarations spelled them: a wrongly-typed argument
+    // must keep failing the IR verifier loudly, not slip through as a
+    // differently-typed call.
+    auto encCall = [&](const EncOp& op, llvm::Type* ret, const char* label,
+                       std::vector<llvm::Type*> tys,
+                       std::vector<llvm::Value*> args) -> llvm::Value* {
+        // A void call may not be NAMED (LLVM: "Instruction has a name, but
+        // provides a void value!").
+        const char* nm = ret->isVoidTy() ? "" : label;
+        if (literal) {
+            auto* fn = declareC(op.per.c_str(), ret, tys);
+            return builder_.CreateCall(fn, args, nm);
+        }
+        tys.insert(tys.begin(), i32());
+        auto* fn = declareC(op.disp.c_str(), ret, tys);
+        args.insert(args.begin(), tag);
+        return builder_.CreateCall(fn, args, nm);
+    };
+
+    // fix #7028: the byte count is -1 when the encoding cannot represent the
+    // string — possible only for ASCII (stdlib §3.2 v0.340). The literal shape
+    // knows its encoding at compile time and checks only ASCII; the variable
+    // shape dispatches on the tag at RUN time, so it checks every encoding
+    // (the other three never answer -1, so the check is dead for them).
+    const bool countFault = literal ? (sg == "ASCII") : true;
+
+    // Determine whether GetBytes/GetString can fail.
     // All four encodings follow the strict error model (stdlib §3.2 v0.136):
     // GetString returns null on ill-formed input (incl. UTF8 — fix #1144), and
     // ASCII GetBytes returns null on unrepresentable code points. The runtimes
     // that never fail (UTF8/UTF16/UTF32 GetBytes) just never produce a null, so
     // the null-check guard is dead for them — harmless and uniform.
     bool canFail = true;
-    std::string getBytesName = "bz_encoding_" +
-        (sg == "UTF8"  ? std::string("utf8")  :
-         sg == "UTF16" ? std::string("utf16") :
-         sg == "UTF32" ? std::string("utf32") :
-                         std::string("ascii")) + "_get_bytes";
-    std::string getStringName = "bz_encoding_" +
-        (sg == "UTF8"  ? std::string("utf8")  :
-         sg == "UTF16" ? std::string("utf16") :
-         sg == "UTF32" ? std::string("utf32") :
-                         std::string("ascii")) + "_get_string";
-
-    if (sg != "UTF8" && sg != "UTF16" && sg != "UTF32" && sg != "ASCII")
-        return nullptr;
 
     // fix #6979 (stdlib §3.2 / §3.3, v0.340): a `ReadOnlyStringSpan` source lowers to
     // the {ptr,i32,i32} %bz.arrayspan VALUE, not a string pointer. The
@@ -446,8 +535,8 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
         llvm::Value* strPtr = lowerExpr(*call.args[0].value);
         if (!strPtr) return nullptr;
         strPtr = asEncString(strPtr);
-        auto* fn = declareC(getBytesName.c_str(), ptrTy(), {ptrTy()});
-        llvm::Value* result = builder_.CreateCall(fn, {strPtr}, "enc.bytes");
+        llvm::Value* result =
+            encCall(getBytesOp, ptrTy(), "enc.bytes", {ptrTy()}, {strPtr});
         releaseSrc();
         if (canFail) {
             // Null return → FormatException (stdlib §3.2 v0.136 error model).
@@ -464,16 +553,11 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
         llvm::Value* strPtr = lowerExpr(*call.args[0].value);
         if (!strPtr) return nullptr;
         strPtr = asEncString(strPtr);
-        std::string cntFnName = "bz_encoding_" +
-            (sg == "UTF8"  ? std::string("utf8")  :
-             sg == "UTF16" ? std::string("utf16") :
-             sg == "UTF32" ? std::string("utf32") :
-                             std::string("ascii")) + "_get_byte_count";
-        auto* cntFn = declareC(cntFnName.c_str(), i64(), {ptrTy()});
-        llvm::Value* cnt = builder_.CreateCall(cntFn, {strPtr}, "enc.cnt");
+        llvm::Value* cnt =
+            encCall(countOp, i64(), "enc.cnt", {ptrTy()}, {strPtr});
         releaseSrc();
         // ASCII: -1 means a code point > U+007F → FormatException (§3.2 v0.136).
-        if (sg == "ASCII") {
+        if (countFault) {
             llvm::Value* isFail =
                 builder_.CreateICmpSLT(cnt, builder_.getInt64(0), "enc.asc.fail");
             emitGuardThrow(isFail, "FormatException");
@@ -609,15 +693,10 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
         }
         strPtr = asEncString(strPtr);
         // Count bytes needed.
-        std::string cntFnName = "bz_encoding_" +
-            (sg == "UTF8"  ? std::string("utf8")  :
-             sg == "UTF16" ? std::string("utf16") :
-             sg == "UTF32" ? std::string("utf32") :
-                             std::string("ascii")) + "_get_byte_count";
-        auto* cntFn = declareC(cntFnName.c_str(), i64(), {ptrTy()});
-        llvm::Value* needed = builder_.CreateCall(cntFn, {strPtr}, "enc.sp.needed");
+        llvm::Value* needed =
+            encCall(countOp, i64(), "enc.sp.needed", {ptrTy()}, {strPtr});
         // ASCII: -1 means non-ASCII code point → FormatException.
-        if (sg == "ASCII") {
+        if (countFault) {
             llvm::Value* isFail =
                 builder_.CreateICmpSLT(needed, builder_.getInt64(0), "enc.sp.afail");
             guardRel(isFail, "FormatException");
@@ -642,14 +721,8 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
         llvm::Value* rawPtr = builder_.CreateCall(
             ptrAtFn, {spanSrc, spanStart64, builder_.getInt64(1)}, "enc.sp.raw");
         // Write bytes into the destination buffer.
-        std::string wrtFnName = "bz_encoding_" +
-            (sg == "UTF8"  ? std::string("utf8")  :
-             sg == "UTF16" ? std::string("utf16") :
-             sg == "UTF32" ? std::string("utf32") :
-                             std::string("ascii")) + "_write_bytes";
-        auto* wrtFn = declareC(wrtFnName.c_str(),
-            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-        builder_.CreateCall(wrtFn, {strPtr, rawPtr});
+        encCall(writeOp, llvm::Type::getVoidTy(llvm_), "enc.sp.write",
+                {ptrTy(), ptrTy()}, {strPtr, rawPtr});
         releaseSrc();
         // Return bytes written as int (truncated from i64).
         return builder_.CreateTrunc(needed, i32(), "enc.sp.written");
@@ -724,10 +797,9 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             count = builder_.CreateCall(lenFn, {arr}, "enc.arrlen");
         }
-        auto* fn = declareC(getStringName.c_str(), ptrTy(),
-                            {ptrTy(), i64(), i64()});
-        llvm::Value* result = builder_.CreateCall(fn, {arr, index, count},
-                                                  "enc.str");
+        llvm::Value* result =
+            encCall(getStringOp, ptrTy(), "enc.str", {ptrTy(), i64(), i64()},
+                    {arr, index, count});
         if (canFail) {
             // Null return → FormatException (stdlib §3.2 v0.136 error model).
             llvm::Value* isNull = builder_.CreateICmpEQ(

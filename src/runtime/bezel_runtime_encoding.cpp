@@ -672,3 +672,66 @@ extern "C" void* bz_encoding_ascii_get_string(void* arrp, int64_t index,
     bz_string_init_rc(str);
     return str;
 }
+
+// ---------------------------------------------------------------------------
+// fix #7028 (stdlib §3.2, v0.355): the KIND-TAG dispatch.
+//
+// An `Encoding` VALUE is the i32 kind tag a builtin class-typed slot lowers
+// to (fix #7001): 0 UTF8, 1 UTF16, 2 UTF32, 3 ASCII. stdlib §3.2 (v0.340)
+// says the static properties "return singleton instances ... callers access
+// them through the `Encoding` base type", so a program may hold the encoding
+// in a local, a parameter or a field and call through it — and that call has
+// to select the per-encoding entry at RUN TIME.
+//
+// The four entries below switch on the tag and call exactly the per-encoding
+// helpers above, so the variable shape lowers to the same per-encoding code
+// the literal `Encoding.UTF8.…` shape calls. The fault model is unchanged:
+// `get_bytes` / `get_string` answer NULL on a §3.2 fault (the caller raises
+// FormatException) and `get_byte_count` answers -1 for a code point the
+// encoding cannot represent (ASCII only).
+//
+// A tag outside 0..3 is not an encoding this compiler produces (the four
+// singletons are the only sources of an `Encoding` value), so it answers
+// "no encoding": NULL / -1, which the caller turns into the §3.2
+// FormatException fault rather than a silent wrong answer.
+extern "C" void* bz_encoding_get_bytes(int kind, const void* strp) {
+    switch (kind) {
+        case 0: return bz_encoding_utf8_get_bytes(strp);
+        case 1: return bz_encoding_utf16_get_bytes(strp);
+        case 2: return bz_encoding_utf32_get_bytes(strp);
+        case 3: return bz_encoding_ascii_get_bytes(strp);
+        default: return nullptr;
+    }
+}
+
+extern "C" void* bz_encoding_get_string(int kind, void* arrp, int64_t index,
+                                         int64_t count) {
+    switch (kind) {
+        case 0: return bz_encoding_utf8_get_string(arrp, index, count);
+        case 1: return bz_encoding_utf16_get_string(arrp, index, count);
+        case 2: return bz_encoding_utf32_get_string(arrp, index, count);
+        case 3: return bz_encoding_ascii_get_string(arrp, index, count);
+        default: return nullptr;
+    }
+}
+
+extern "C" int64_t bz_encoding_get_byte_count(int kind, const void* strp) {
+    switch (kind) {
+        case 0: return bz_encoding_utf8_get_byte_count(strp);
+        case 1: return bz_encoding_utf16_get_byte_count(strp);
+        case 2: return bz_encoding_utf32_get_byte_count(strp);
+        case 3: return bz_encoding_ascii_get_byte_count(strp);
+        default: return -1;
+    }
+}
+
+extern "C" void bz_encoding_write_bytes(int kind, const void* strp,
+                                        void* destp) {
+    switch (kind) {
+        case 0: bz_encoding_utf8_write_bytes(strp, destp); break;
+        case 1: bz_encoding_utf16_write_bytes(strp, destp); break;
+        case 2: bz_encoding_utf32_write_bytes(strp, destp); break;
+        case 3: bz_encoding_ascii_write_bytes(strp, destp); break;
+        default: break;
+    }
+}

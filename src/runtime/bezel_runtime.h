@@ -1904,6 +1904,18 @@ void bz_encoding_utf16_write_bytes(const void* str, void* dest);
 void bz_encoding_utf32_write_bytes(const void* str, void* dest);
 void bz_encoding_ascii_write_bytes(const void* str, void* dest);
 
+// fix #7028 (stdlib §3.2, v0.355): the KIND-TAG dispatch. An `Encoding` value
+// is the i32 kind tag a builtin class-typed slot lowers to (fix #7001): 0 UTF8,
+// 1 UTF16, 2 UTF32, 3 ASCII. A call through an `Encoding`-typed value selects
+// the per-encoding entry at RUN TIME; these four entries switch on the tag and
+// call the same per-encoding helper the literal `Encoding.UTF8.…` shape calls.
+// A tag outside 0..3 is not an encoding this compiler produces: it answers
+// NULL / -1, which the caller turns into the §3.2 FormatException fault.
+void* bz_encoding_get_bytes(int kind, const void* str);
+void* bz_encoding_get_string(int kind, void* bytes, int64_t index, int64_t count);
+int64_t bz_encoding_get_byte_count(int kind, const void* str);
+void bz_encoding_write_bytes(int kind, const void* str, void* dest);
+
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Per-interface itable lookup (CG35-itable, §13 / §12 interface dispatch).

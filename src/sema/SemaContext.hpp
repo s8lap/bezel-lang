@@ -1580,6 +1580,29 @@ inline bool isValueBuiltinByName(std::string_view n) {
     return false;
 }
 
+// fix #7028 (stdlib §3.2, v0.355): is this TypeRef the stdlib §3.2
+// `Encoding` — the BUILT-IN, and not a user class of that name (§11.3
+// reserves no names)?
+//
+// The builtin reaches a program in TWO shapes, and a predicate that reads
+// only one of them misses half the surface:
+//   (a) the synthetic `builtinClassSym("Encoding")` — the type the
+//       `Encoding.UTF8` singleton read carries;
+//   (b) the DECLARATION-LESS Named ref the builtin-name admission in
+//       TypeResolution produces (TypeResolution_Names.cpp's `Encoding` row)
+//       — the type of an `Encoding`-annotated local, parameter or field.
+// A user type is excluded by `isUserDeclaredTypeSym` (#5272's discriminator:
+// a real `ast::TypeDecl` in-module, or a populated `moduleName` when
+// imported), which is #3022's rule for the `Encoding` head.
+inline bool isStdlibEncodingType(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return false;
+    if (t->declaration) {
+        if (isUserDeclaredTypeSym(t->declaration)) return false;  // a user type
+        return t->declaration->name == "Encoding";
+    }
+    return t->headName() == "Encoding";
+}
+
 // fix #4191 / #4196 (v0.298): the predicate that scopes "no disposal
 // obligation when directly held or moved" — a strictly narrower question
 // than `isValueBuiltinByName`, which answers "excluded from owning-
