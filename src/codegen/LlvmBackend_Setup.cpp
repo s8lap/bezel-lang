@@ -40299,6 +40299,23 @@ static bool isNullCondToDictionaryInit(const sema::SemaContext& ctx,
 //       Dictionary/LinkedList are dict-/llist-backed and freed differently);
 //     * a single-element index `arr[i]` (§28.3 indexer row, Borrowed — NOT a
 //       slice; common::isBuiltinArrayRangeSliceIndex rejects this shape).
+// fix #8153 (§28.3.11, v0.355): is `e` the `.`/`?.` call
+// `<src>.GroupBy(...).ToArray()`? Its runtime result OWNS its groupings
+// (`lowerGroupByMaterialize` returns `bz_groupby_to_array`), so the
+// borrowing-array reclaim — whose element policy is the borrowed one — must
+// not take it; Branch A below declines it on the same test, written inline.
+bool Emitter::isFreshGroupByToArrayExpr(const ast::Expr* e) const {
+    auto* call = dynamic_cast<const ast::CallExpr*>(e);
+    if (!call || !call->callee) return false;
+    if (auto* ma =
+            dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get()))
+        return ma->member == "ToArray" && isGroupByCall(ma->target.get());
+    if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+            call->callee.get()))
+        return ncm->member == "ToArray" && isGroupByCall(ncm->target.get());
+    return false;
+}
+
 bool Emitter::isFreshBorrowingArrayMaterializerLocal(
         const LocalDeclInitView& view) const {
     if (view.isUsing || !view.init) return false;
@@ -40385,6 +40402,28 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
         return mm == "ToArray" || mm == "Sorted" || mm == "Reversed" ||
                mm == "Split" || mm == "ToByteArray" || mm == "ToCharArray";
     }
+    // Branch C, fix #8153 (§7.7, §28.3.11, stdlib §9.6, v0.355): a `??` whose
+    // BOTH arms are fresh materializers — `var a := s?.Split(",") ??
+    // t.Split(",");`. Exactly one arm runs to produce the value (the right one
+    // only when the left yielded null, and a null left owns nothing), so the
+    // local is bound to ONE fresh array it solely owns, exactly as Branch A's
+    // local is; the escape walk and the scope-end reclaim are Branch A's. Both
+    // arms are tested with `isFreshOwnerlessArrayMaterializerExpr`, the
+    // unbound-temporary recognizer (`.` or `?.` intrinsic, never a user
+    // method, never a user `owned` producer — the ownership pass governs those
+    // and rejects mixing one with a borrowed arm). An arm that is anything
+    // else (a named array, a literal) declines the whole local: a named arm
+    // would be freed by two owners. Before this the local leaked whichever arm
+    // ran — MEASURED, 100 iterations: 43000 B / 1200 allocations for the
+    // issue's two `??` locals.
+    // `xs.GroupBy(...).ToArray()` is excluded as in Branch A (it OWNS its
+    // groupings, so the borrowing reclaim would leak them).
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(view.init))
+        return be->op == "??" &&
+               isFreshOwnerlessArrayMaterializerExpr(be->left.get()) &&
+               isFreshOwnerlessArrayMaterializerExpr(be->right.get()) &&
+               !isFreshGroupByToArrayExpr(be->left.get()) &&
+               !isFreshGroupByToArrayExpr(be->right.get());
     // Branch B (#2753): a §28.3 RANGE SLICE on `Array<T>` — `arr[r]` (the
     // compiler-recognized `Slice(r: Range<int>): owned Array<T>` form, stdlib
     // §4.4). The slice is a FRESH `Array<T>` the local solely owns, distinct
@@ -40857,9 +40896,28 @@ bool Emitter::isFreshOwnerlessArrayMaterializerExpr(const ast::Expr* e) const {
     // on `b.ToArray().Length`). Only the intrinsics, which carry no
     // symbol at all, may match. See `calleeResolvedBySema` above.
     if (calleeResolvedBySema(*call, ctx_)) return false;
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
-    if (!ma) return false;
-    std::string_view mm = ma->member;
+    // fix #8153 (§7.5, §28.3.11, stdlib §9.6, v0.355): the `?.` spelling —
+    // `s?.Split(",")`, `s?.ToCharArray()`, `xs?.ToArray()` — is the same
+    // fresh producer on its non-null path (`lowerNullCondBuiltinCall` lowers
+    // the `.` twin over the pinned receiver) and a bare null on the other,
+    // and every consumer of this recognizer frees through `bz_array_free`,
+    // which returns at once on a null array. So an UNBOUND `?.` result at a
+    // discard, an expression statement or a non-`owned` argument is
+    // reclaimed exactly as the `.` result is; before this it matched only a
+    // MemberAccessExpr callee and leaked (MEASURED, 100 iterations:
+    // `_ := s?.Split(",");` 18200 B / 400 allocations). The bound
+    // `var a := s?.Split(",");` already takes the same `?.` arm in
+    // `isFreshBorrowingArrayMaterializerLocal` (#6529), so the two
+    // recognizers now agree on the population.
+    std::string_view mm;
+    if (auto* ma =
+            dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get()))
+        mm = ma->member;
+    else if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                 call->callee.get()))
+        mm = ncm->member;
+    else
+        return false;
     // #1027: `s.Split(...)` is a fresh `owned Array<string>` materializer too — a
     // bare `s.Split(...).Length` (the result consumed as a receiver, then dropped)
     // leaked its backing + substrings without this. Reclaimed exactly once via

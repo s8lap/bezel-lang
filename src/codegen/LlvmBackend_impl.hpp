@@ -20562,6 +20562,8 @@ private:
     // (LocalConstDecl) is recognized identically.
     bool isFreshBorrowingArrayMaterializerLocal(
         const LocalDeclInitView& view) const;
+    // fix #8153: `<src>.GroupBy(...).ToArray()` in the `.` or `?.` spelling.
+    bool isFreshGroupByToArrayExpr(const ast::Expr* e) const;
     // fix #4308 sibling: the OWNING-array twin — a plain `var`/`const` local
     // bound to `<recv>.GroupBy(sel).ToArray()`. Static-types as `Array<IGrouping>`
     // (sema sees the method's normal return type) but the runtime is an OWNING

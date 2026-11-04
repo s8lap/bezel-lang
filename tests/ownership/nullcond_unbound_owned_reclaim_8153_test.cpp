@@ -2,8 +2,10 @@
 // `Array<T>` result of a stdlib §9.6 `String` member (`Split`,
 // `ToCharArray`), in the `.` and the `?.` spelling, must be reclaimed at
 // every position §28.3.11 names — a non-`owned` argument, a discard, an
-// expression statement — and a materializer local must reclaim the array a
-// reassignment displaces and the arm a `??` initializer produced.
+// expression statement — and a materializer local must reclaim the arm a
+// `??` initializer produced. A materializer local that is REASSIGNED must
+// NOT free the displaced array while a local alias, an iteration or a
+// returned borrow still reads it (the must-not-UAF rows of part B).
 //
 // SPEC (v0.355).
 //   stdlib §9.6 (docs/Bezel_Standard_Library.md:5446-5472):
@@ -40,6 +42,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::runAotChecked;
+using bezel::test::runAotCheckedLenient;
 
 namespace {
 
@@ -81,6 +84,19 @@ std::string prog(const std::string& body) {
            "    return 0; "
            "  end Main; "
            "end C;";
+}
+
+// `prog` with a class whose instance method returns its plain `Array`
+// parameter, so `h.Id(a)` is a borrow of `a`'s array (the r39-rev-8153 q40
+// shape).
+std::string progH(const std::string& body) {
+    std::string p = prog(body);
+    p.insert(p.find("class C "),
+             "class Holder "
+             "  public constructor() end constructor; "
+             "  public method Id(a: Array<string>): Array<string> return a; end Id; "
+             "end Holder; ");
+    return p;
 }
 
 void expectClean(const bezel::test::JitResult& r, const std::string& out) {
@@ -174,4 +190,166 @@ BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
                     "      k := k + CountC(b); "
                     "      k := k + Sink(t.ToCharArray()); ")),
                 "2800\n");
+}
+
+// ===========================================================================
+// (B) #8153 — the `?.` spelling (§7.5: "`x?.M` returns null if `x` is null;
+//     otherwise it performs the access") and the `??` initializer. A
+//     skipped `?.` yields null, which owns nothing.
+// ===========================================================================
+
+// #8153's argument form, all four §9.6 shapes, non-null and null receivers.
+// MEASURED on 3b393693: `CountOf(s?.Split(","))` alone 18200 byte(s) in
+// 400 allocation(s).
+BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
+           spec_28_3_11_nullcond_result_at_an_argument_is_reclaimed) {
+    expectClean(runAotChecked(prog(
+                    "      k := k + CountOf(s?.Split(\",\")) + CountOf(s?.Split('c')) "
+                    "        + CountC(s?.ToCharArray()) + CountOf(n?.Split(',')) "
+                    "        + CountC(n?.ToCharArray()); ")),
+                "1100\n");
+}
+
+// #8153's discard and expression-statement forms. MEASURED on 3b393693:
+// 36000 byte(s) leaked in 1000 allocation(s).
+BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
+           spec_28_3_11_nullcond_discard_and_statement_are_reclaimed) {
+    expectClean(runAotChecked(prog(
+                    "      _ := s?.Split(\",\"); "
+                    "      s?.ToCharArray(); "
+                    "      _ := n?.Split(\",\"); "
+                    "      n?.ToCharArray(); "
+                    "      k := k + 1; ")),
+                "100\n");
+}
+
+// The `?.` spelling of a LINQ materializer at an argument rides the same
+// recognizer. MEASURED on 3b393693: 14400 byte(s) in 200 allocation(s).
+BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
+           spec_28_3_11_nullcond_to_array_at_an_argument_is_reclaimed) {
+    expectClean(runAotChecked(prog(
+                    "      var xs: Array<string>? := [\"a\", \"b\"]; "
+                    "      k := k + CountOf(xs?.ToArray()); ")),
+                "200\n");
+}
+
+// #8153's `??` form: exactly one arm produces the local's array (§7.7), so
+// the local owns it. MEASURED on 3b393693: 43000 byte(s) in 1200
+// allocation(s).
+BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
+           spec_28_3_11_coalesce_of_two_materializers_is_reclaimed) {
+    expectClean(runAotChecked(prog(
+                    "      var a := s?.Split(\",\") ?? t.Split(\";\"); "
+                    "      var b := n?.Split(\",\") ?? t.Split(\";\"); "
+                    "      var c := n?.ToCharArray() ?? t.ToCharArray(); "
+                    "      k := k + a.Count + b.Count + c.Count; ")),
+                "1100\n");
+}
+
+// CONTROLS — a `?.` result transferred into an `owned` parameter (the callee
+// disposes it, null included) and a bound `?.` result passed twice (its
+// scope-end reclaim frees it once). Clean on the parent; a second free would
+// be an ASan double-free.
+BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
+           spec_28_3_11_nullcond_owned_parameter_and_bound_controls_stay_single_freed) {
+    expectClean(runAotChecked(prog(
+                    "      k := k + SinkS(s?.Split(\",\")) + SinkS(n?.Split(\",\")); "
+                    "      var a := s?.Split(\",\"); "
+                    "      k := k + CountOf(a) + CountOf(a); ")),
+                "800\n");
+}
+
+// ===========================================================================
+// (C) MUST NOT USE-AFTER-FREE — a REASSIGNED materializer local whose
+//     displaced array is still read through a local alias (`var b := a`), an
+//     iteration (`for var x in a`) or a borrow a call returned (`h.Id(a)`).
+//
+//     §28.7: "Assignment to an owned field or owned local disposes the
+//     displaced value"; and *Overwrite while borrowed*: "Reassigning a
+//     plain-`var` owned local while a live local borrow of its current value
+//     exists is rejected by the consume-site freeze (K5.2) — the implicit
+//     disposal would silently invalidate the borrow." The compiler does not
+//     yet apply that freeze to these locals (it admits every program below),
+//     so a reclaim of the displaced array at the overwrite frees memory the
+//     alias then reads. The rejected first #8153 attempt (684aa263) did
+//     exactly that: each row below printed nothing and reported an ASan
+//     `heap-use-after-free` under it (MEASURED, plain ASan). On the parent
+//     the displaced array LEAKS (the reassignment counts as an escape of the
+//     local), which is why these rows run with LeakSanitizer OFF
+//     (`runAotCheckedLenient`). The generated-code AddressSanitizer is still
+//     on, and each row reads the alias through an INSTRUMENTED element load
+//     (`b[i]`, a `for` element), because a stale `b.Count` is read inside the
+//     uninstrumented runtime and plain ASan does not see it. The exact count
+//     is asserted as well.
+//
+//     When the §28.7 freeze is enforced for these locals, these programs
+//     become compile errors and the rows must be re-shaped as rejection rows.
+// ===========================================================================
+
+// The reviewer's p25: a `var b := a` alias of a `.Split` local.
+BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
+           spec_28_7_reassigned_split_local_alias_is_not_freed_under_it) {
+    expectClean(runAotCheckedLenient(prog(
+                    "      var a := t.Split(\",\"); var b := a; a := t.Split(\";\"); "
+                    "      k := k + b.Count + b[0].Length + b[2].Length + a.Count; ")),
+                "700\n");
+}
+
+// The reviewer's q36: a reassignment inside a `for` over the local.
+BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
+           spec_28_7_reassignment_inside_iteration_is_not_freed_under_it) {
+    expectClean(runAotCheckedLenient(prog(
+                    "      var a := t.Split(\",\"); "
+                    "      for var x in a do k := k + x.Length; a := t.Split(\";\"); end for; "
+                    "      k := k + a.Count; ")),
+                "600\n");
+}
+
+// The reviewer's q40: a borrow returned by an instance method over the local.
+BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
+           spec_28_7_reassigned_local_call_borrow_is_not_freed_under_it) {
+    expectClean(runAotCheckedLenient(progH(
+                    "      var h := new Holder(); var a := t.Split(\",\"); var d := h.Id(a); "
+                    "      a := t.Split(\";\"); "
+                    "      k := k + d.Count + d[1].Length + a.Count; ")),
+                "600\n");
+}
+
+// The reviewer's q42: the `?.` spelling (#8153's own).
+BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
+           spec_28_7_reassigned_nullcond_split_local_alias_is_not_freed_under_it) {
+    expectClean(runAotCheckedLenient(prog(
+                    "      var a := s?.Split(\",\"); var b := a; a := s?.Split(\";\"); "
+                    "      k := k + CountOf(b) + b![0].Length + CountOf(a); ")),
+                "500\n");
+}
+
+// The reviewer's q43: the `.ToCharArray()` spelling.
+BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
+           spec_28_7_reassigned_to_char_array_local_alias_is_not_freed_under_it) {
+    expectClean(runAotCheckedLenient(prog(
+                    "      var a := t.ToCharArray(); var b := a; a := t.ToCharArray(); "
+                    "      k := k + b.Count + a.Count; "
+                    "      if b[6] = 'c' then k := k + 1; end if; ")),
+                "1500\n");
+}
+
+// The reviewer's q44: a `??` (Branch C) local.
+BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
+           spec_28_7_reassigned_coalesce_local_alias_is_not_freed_under_it) {
+    expectClean(runAotCheckedLenient(prog(
+                    "      var a := s?.Split(\",\") ?? t.Split(\",\"); var b := a; "
+                    "      a := t.Split(\";\"); "
+                    "      k := k + b.Count + b[1].Length + a.Count; ")),
+                "600\n");
+}
+
+// The reviewer's q45: the LINQ `.ToArray()` materializer.
+BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
+           spec_28_7_reassigned_to_array_local_alias_is_not_freed_under_it) {
+    expectClean(runAotCheckedLenient(prog(
+                    "      var a := t.Split(\",\").ToArray(); var b := a; "
+                    "      a := t.Split(\";\").ToArray(); "
+                    "      k := k + b.Count + b[2].Length + a.Count; ")),
+                "600\n");
 }
