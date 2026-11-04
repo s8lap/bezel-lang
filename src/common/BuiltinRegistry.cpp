@@ -591,7 +591,7 @@ struct BuiltinParamRow {
     std::string_view sig;
 };
 
-constexpr std::array<BuiltinParamRow, 384> kBuiltinParams = {{
+constexpr std::array<BuiltinParamRow, 385> kBuiltinParams = {{
     // fix #7421 (stdlib §9.6, §5.1, §7.3, v0.345): the §9.6 `String` head's
     // DECLARED PARAMETER TYPES, transcribed from the standard library's own
     // listing.
@@ -895,6 +895,7 @@ constexpr std::array<BuiltinParamRow, 384> kBuiltinParams = {{
     {"JsonSerializer", "", 1, 1, 0x01, {"options", "", "", "", "", "", "", ""}, {kBPTJsonOptions, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"JsonDeserializer", "", 1, 1, 0x01, {"input", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"JsonDeserializer", "", 2, 2, 0x03, {"input", "options", "", "", "", "", "", ""}, {0, kBPTJsonOptions, 0, 0, 0, 0, 0, 0}, ""},
+    {"BinarySerializer", "", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"BinaryDeserializer", "", 2, 1, 0x03, {"input", "ignoreUnknownFields", "", "", "", "", "", ""}, {0, kBPTBool, 0, 0, 0, 0, 0, 0}, ""},
     {"SByte", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): sbyte"},
     {"SByte", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): sbyte"},
@@ -1343,9 +1344,12 @@ constexpr std::array<std::string_view, 2> kBuiltinCtorLoweredByNameHeads = {
 };
 
 // fix #7502: the heads whose constructor rows are the complete §2.5
-// constructor surface (DateTime, DateOnly, TimeOnly). See the header.
-constexpr std::array<std::string_view, 3> kBuiltinCtorSurfaceClosedByRowsHeads = {
-    "DateTime", "DateOnly", "TimeOnly",
+// constructor surface (DateTime, DateOnly, TimeOnly). fix #7572: and the
+// §2.15 binary agents, whose rows are verified complete against the stdlib:
+// `BinarySerializer()` and `BinaryDeserializer(input, ignoreUnknownFields :=
+// false)` (both input span types share the one row). See the header.
+constexpr std::array<std::string_view, 5> kBuiltinCtorSurfaceClosedByRowsHeads = {
+    "DateTime", "DateOnly", "TimeOnly", "BinarySerializer", "BinaryDeserializer",
 };
 
 // fix #8045 (§22.5, v0.353; stdlib §1 "Conventions" — "parameter names are API

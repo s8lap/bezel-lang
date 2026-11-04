@@ -1949,7 +1949,8 @@ void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
                 " matches no constructor the standard library declares for `" +
                 n + "`: " + detail + "declared: " + declared +
                 " (\xC2\xA7""17.7 closed constructor surface, \xC2\xA7""22.5, "
-                "stdlib \xC2\xA7""2.5, #7502)");
+                "stdlib \xC2\xA7" +
+                (n.rfind("Binary", 0) == 0 ? "2.15, #7572)" : "2.5, #7502)"));
             return;
         }
     }
