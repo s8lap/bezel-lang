@@ -122,7 +122,7 @@ BEZEL_TEST(builtin_fs_qualified_call_7996, module_qualified_environment_is_admit
     auto r = runAot(prog("import System;\n",
         "    System.Environment.Set(\"BEZEL_7996\", \"42\");\n"
         "    var v := System.Environment.Get(\"BEZEL_7996\");\n"
-        "    Console.WriteLine(v);"));
+        "    Console.WriteLine(v ?? \"\");"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "42\n");
 }
@@ -162,7 +162,7 @@ BEZEL_TEST(builtin_fs_qualified_call_7996, alias_qualified_environment_is_admitt
     auto r = runAot(prog("import System as sys;\n",
         "    sys.Environment.Set(\"BEZEL_7996\", \"42\");\n"
         "    var v := sys.Environment.Get(\"BEZEL_7996\");\n"
-        "    Console.WriteLine(v);"));
+        "    Console.WriteLine(v ?? \"\");"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "42\n");
 }
@@ -388,7 +388,7 @@ import Lib;
 class P
   public static method Main(): int
     System.Environment.Set("BEZEL_7996_F6", "42");
-    Console.WriteLine(System.Environment.Get("BEZEL_7996_F6"));
+    Console.WriteLine(System.Environment.Get("BEZEL_7996_F6") ?? "");
     return 0;
   end Main;
 end P;
@@ -410,7 +410,7 @@ import Lib;
 class P
   public static method Main(): int
     sys.Environment.Set("BEZEL_7996_F6", "42");
-    Console.WriteLine(sys.Environment.Get("BEZEL_7996_F6"));
+    Console.WriteLine(sys.Environment.Get("BEZEL_7996_F6") ?? "");
     return 0;
   end Main;
 end P;

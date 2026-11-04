@@ -187,7 +187,7 @@ BEZEL_TEST(builtin_fs_env_arity_7933, declared_environment_arities_run) {
     // have no accept row here: see the reject rows for their declared counts)
     const std::string body =
         "    Environment.Set(\"BZ7933_N\", \"42\");\n"
-        "    Console.WriteLine(Environment.Get(\"BZ7933_N\"));";
+        "    Console.WriteLine(Environment.Get(\"BZ7933_N\") ?? \"\");";
     auto r = runAot(prog("", body));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);

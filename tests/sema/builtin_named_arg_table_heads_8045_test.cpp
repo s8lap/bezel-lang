@@ -97,7 +97,7 @@ BEZEL_TEST(builtin_named_arg_table_heads_8045,
     expectStdout(
         prog("Environment.Set(name := \"BEZEL_PROBE_VAR\", value := \"one\");\n"
              "    Environment.Set(value := \"two\", name := \"BEZEL_PROBE_VAR\");\n"
-             "    Console.WriteLine(Environment.Get(\"BEZEL_PROBE_VAR\"));"),
+             "    Console.WriteLine(Environment.Get(\"BEZEL_PROBE_VAR\") ?? \"\");"),
         "two\n");
 }
 
@@ -138,7 +138,7 @@ BEZEL_TEST(builtin_named_arg_table_heads_8045,
            environment_set_in_declaration_order_is_unchanged) {
     expectStdout(
         prog("Environment.Set(name := \"BEZEL_8045_ORDER\", value := \"one\");\n"
-             "    Console.WriteLine(Environment.Get(\"BEZEL_8045_ORDER\"));"),
+             "    Console.WriteLine(Environment.Get(\"BEZEL_8045_ORDER\") ?? \"\");"),
         "one\n");
 }
 
@@ -147,7 +147,7 @@ BEZEL_TEST(builtin_named_arg_table_heads_8045,
            environment_set_positionally_is_unchanged) {
     expectStdout(
         prog("Environment.Set(\"BEZEL_8045_POS\", \"one\");\n"
-             "    Console.WriteLine(Environment.Get(\"BEZEL_8045_POS\"));"),
+             "    Console.WriteLine(Environment.Get(\"BEZEL_8045_POS\") ?? \"\");"),
         "one\n");
 }
 

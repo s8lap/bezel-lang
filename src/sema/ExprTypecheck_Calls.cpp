@@ -15772,10 +15772,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // `src/codegen/LlvmBackend_Calls.cpp`) produces the
                         // §7.2 tagged companion struct `{i8 hasValue; T
                         // value}` these two types name.
-                        else if (m == "GetInt" || m == "GetBool") {
+                        // fix #8096 (stdlib §2.4, v0.355): `Get(name):
+                        // string?` — "null when the variable is absent".
+                        // The call was UNTYPED, so §7.1/§7.3's nullable
+                        // distinctness had nothing to fire on and the
+                        // un-narrowed result reached a `string` slot.
+                        else if (m == "GetInt" || m == "GetBool" ||
+                                 m == "Get") {
                             auto* nt = ctx_.makeTypeRef();
                             *nt = *ctx_.primitiveTypeRef(
-                                m == "GetInt" ? P::Int : P::Bool);
+                                m == "GetInt" ? P::Int
+                                : m == "Get"  ? P::String
+                                              : P::Bool);
                             nt->nullable = true;
                             ctx_.setExprType(&ce, nt);
                         }
