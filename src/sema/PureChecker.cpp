@@ -480,6 +480,21 @@ public:
     void checkOneStmt(const ast::Stmt* s);
     void checkExpr(const ast::Expr* e);
 
+    // fix #8134 (§22.15 / §A.7, v0.355): the ONE walk of a `case` arm's
+    // sub-expressions, shared by the two arm-bearing forms — the
+    // expression-position `ast::CaseExpr` and the statement-position
+    // `ast::CaseStmt`. An arm carries three sub-expressions, and §22.15's
+    // list is closed ("A pure body may contain exactly the following"), so
+    // all three are subject to the purity rules:
+    //   * the `when` GUARD (`ast::CaseArm::guard`) — an ordinary expression;
+    //   * the arm's EXPRESSION body (`ast::CaseArm::exprBody`) — the
+    //     expression-position form's arm value;
+    //   * the arm's STATEMENT body (`ast::CaseArm::stmts`) — the
+    //     statement-position form's `do … end` body.
+    // Before this helper the expression-position form walked NONE of them
+    // and the statement-position form walked only the third.
+    void checkCaseArms(const std::vector<ast::CaseArm>& arms);
+
     // §22.15 "Pure constructors" (v0.202, #2052, #2061): a pure constructor's
     // explicit `base(…)`/`this(…)` chain call (§11.1) must target a pure
     // constructor — the chain target's purity propagates upward. The chain
@@ -1371,6 +1386,17 @@ void PureBodyWalker::checkStmts(
     }
 }
 
+void PureBodyWalker::checkCaseArms(const std::vector<ast::CaseArm>& arms) {
+    // fix #8134 (§22.15 / §A.7, v0.355): see the declaration's comment for
+    // the three sub-expressions an arm carries and why all three are
+    // subject to the closed pure-body list.
+    for (const auto& arm : arms) {
+        if (arm.guard) checkExpr(arm.guard.get());
+        if (arm.exprBody) checkExpr(arm.exprBody.get());
+        checkStmts(arm.stmts);
+    }
+}
+
 void PureBodyWalker::checkOneStmt(const ast::Stmt* s) {
     if (!s) return;
     // Recurse through control flow.
@@ -1537,8 +1563,11 @@ void PureBodyWalker::checkOneStmt(const ast::Stmt* s) {
     }
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
         if (cs->scrutinee) checkExpr(cs->scrutinee.get());
-        for (const auto& arm : cs->arms)
-            checkStmts(arm.stmts);
+        // fix #8134 (§22.15 / §A.7, v0.355): the statement-position `case`
+        // walked its arms' STATEMENT bodies but not their `when` GUARDS — the
+        // same missing-sub-expression the expression-position form had. Both
+        // forms now share `checkCaseArms`.
+        checkCaseArms(cs->arms);
         return;
     }
     // Break / Continue / etc. — no effect.
@@ -1715,6 +1744,26 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
         checkExpr(ce2->callee.get());
         for (const auto& a : ce2->args)
             if (a.value) checkExpr(a.value.get());
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        // fix #8134 (§22.15 / §17.8, v0.355): the postfix null-forgiving
+        // operator's OPERAND is a sub-expression of the pure body, and
+        // §22.15's list is closed — "A pure body may contain exactly the
+        // following". The operand was never walked, so `Console.ReadLine()!
+        // .Length` compiled in a `pure` body: the `Console.ReadLine()` call
+        // inside the operand ran unobserved, and §22.15 rule 6 (a call to a
+        // member that is not `pure`-declared) never fired.
+        //
+        // WHAT IS AND IS NOT CHECKED. The `!` ITSELF is not an effect:
+        // §17.8, verbatim — "The operator is purely a type-system assertion
+        // (with a runtime null check); it does not move, copy, or borrow
+        // beyond what reading `x` already does." The runtime null check
+        // raises `NullReferenceException`, a built-in exception that is
+        // trivial-dispose (§31.4) — the runtime-raised built-in §22.15's
+        // carve-out admits. So the arm walks the OPERAND (where the
+        // user-visible call lives) and admits the operator itself.
+        checkExpr(pb->operand.get());
         return;
     }
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
@@ -1924,6 +1973,21 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
         checkExpr(cond->thenValue.get());
         checkExpr(cond->condition.get());
         checkExpr(cond->elseValue.get());
+        return;
+    }
+    if (auto* ce3 = dynamic_cast<const ast::CaseExpr*>(e)) {
+        // fix #8134 (§22.15 / §A.7, v0.355): the arms of a `case` EXPRESSION
+        // are sub-expressions of the pure body and were never walked, so an
+        // impure call inside an arm (`(case x of 0 => Console.ReadLine(),
+        // _ => "")`) compiled in a `pure` body — §22.15 rule 6 never fired.
+        //
+        // The statement-position twin (`ast::CaseStmt`) walked its arms'
+        // STATEMENT bodies but not their `when` GUARDS; the two forms share
+        // the `ast::CaseArm` shape, so both now route through the ONE
+        // `checkCaseArms` helper — a guard is an arm's own sub-expression
+        // wherever the arm is spelled.
+        if (ce3->scrutinee) checkExpr(ce3->scrutinee.get());
+        checkCaseArms(ce3->arms);
         return;
     }
     if (auto* te = dynamic_cast<const ast::ThrowExpr*>(e)) {

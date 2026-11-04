@@ -1,0 +1,358 @@
+// Spec-derived regression tests for issue #8134 — §22.15 *Pure members*
+// ("The pure body"), §17.8 (the null-forgiving operator), §A.7 (the `case`
+// forms), and §31.4 *Standard exception types* (language spec v0.355).
+//
+// THE DEFECT — three numbered items, all in `src/sema/PureChecker.cpp`'s
+// `PureBodyWalker`.
+//
+// 1. The OPERAND of the postfix null-forgiving operator (`x!`, §17.8) was
+//    never walked. §22.15's list is closed — "A pure body may contain
+//    exactly the following; the list is closed, and everything outside it is
+//    rejected with a diagnostic naming the operation and this section" — so
+//    an impure call inside the operand of a `!` was silently admitted:
+//    `Console.ReadLine()!.Length` compiled in a `pure` body, and §22.15
+//    rule 6 ("a call … is permitted iff the member declared on the
+//    receiver's static type … is `pure`-declared or pure-classified") never
+//    fired.
+//
+// 2. The ARMS of a `case` EXPRESSION (§A.7, `CaseExpr`) were never walked
+//    either: neither the arm's `when` GUARD nor its body. The
+//    statement-position twin (`CaseStmt`) walked the arms' statement bodies
+//    but not their guards. `(case x of 0 => Console.ReadLine(), _ => "")`
+//    compiled in a `pure` body.
+//
+// 3. The §22.15 THROW CARVE-OUT did not check WHICH constructor runs. It
+//    admitted `new E(...)` at the throw operand when E had a `pure`
+//    constructor SOMEWHERE — so a class with a `pure` one-argument
+//    constructor and an impure two-argument one admitted `throw new E("m",
+//    cause)`, which runs the impure constructor — and it admitted every
+//    built-in exception construction, including §31.4's `(message, cause)`
+//    chaining constructor, which §31.4 states is NOT pure.
+//
+// THE ORACLE. Two, deliberately.
+//
+//   * The SEMA oracle (`parseAndCheckPureGated`) is the phase under test: it
+//     runs lex + parse + symbols + types + expressions + the §22.15
+//     pure-body checker, gated exactly as the driver gates them. Each REJECT
+//     row asserts the EXACT diagnostic text and the LINE the diagnostic
+//     lands on, so a row cannot pass by observing the absence of something.
+//   * The AOT oracle (`runAot`) is the strict whole-program oracle: the real
+//     `Driver::compileFile`, forked, then clang-link and native exec. Each
+//     shape has one AOT row proving the driver agrees — the REJECT rows that
+//     the program is refused with the same diagnostic, the ADMIT rows that
+//     the program COMPILES, LINKS and RUNS (exit code 0), so "it compiled" is
+//     never the whole assertion.
+//
+// The sources are written with real newlines so each rejected row pins the
+// diagnostic to its own line.
+
+#include "sema/ExprTypecheck.hpp"
+#include "sema/PureChecker.hpp"
+#include "sema/Symbol.hpp"
+#include "sema/TypeResolution.hpp"
+#include "support/aot_support.hpp"
+#include "support/sema_support.hpp"
+#include "test_harness.hpp"
+
+#include <string>
+#include <vector>
+
+namespace {
+
+// The SEMA oracle — the pure-body checker under test.
+bezel::test::SemaResult pureCheck(std::string_view src) {
+    return bezel::test::parseAndCheckPureGated(src);
+}
+
+// The diagnostics whose message contains `needle`.
+std::vector<const bezel::Diagnostic*> diagnosticsContaining(
+    const bezel::test::SemaResult& r, const std::string& needle) {
+    std::vector<const bezel::Diagnostic*> out;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos) out.push_back(&d);
+    return out;
+}
+
+// The ONE diagnostic whose message contains `needle` (asserts there is
+// EXACTLY one, so a row cannot pass on a stray diagnostic that happens to
+// carry the same words).
+const bezel::Diagnostic* theDiagnosticContaining(
+    const bezel::test::SemaResult& r, const std::string& needle) {
+    auto hits = diagnosticsContaining(r, needle);
+    if (hits.size() != 1) return nullptr;
+    return hits.front();
+}
+
+// The AOT oracle — the real driver, forked. On a compile reject the
+// driver's stderr lands in ONE Error diagnostic, so the needle is matched
+// against that text.
+bool aotRejectsWith(std::string_view src, const std::string& needle) {
+    auto r = bezel::test::runAot(src);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find(needle) != std::string::npos)
+            return true;
+    return false;
+}
+
+// The AOT oracle's ADMIT side: the program must compile, LINK and RUN, and
+// exit 0. `r.ran` false would mean the compile or the link failed, so the
+// exit-code assertion alone is not enough.
+bool aotRunsWithExitZero(std::string_view src) {
+    auto r = bezel::test::runAot(src);
+    return r.ran && r.exitCode == 0;
+}
+
+// §22.15 rule 6's diagnostic for a USER member that is not `pure`.
+constexpr const char* kUserImpureCall =
+    "the resolved target `Feed` is not pure-declared";
+// §22.15 rule 6's diagnostic for a STANDARD-LIBRARY member the library does
+// not mark `pure`.
+constexpr const char* kStdlibImpureCall =
+    "the standard library does not declare `Console.ReadLine` pure";
+}  // namespace
+
+// =========================================================================
+// ITEM 1 — the postfix `!` operand (§17.8 / §22.15).
+// =========================================================================
+
+// §22.15's list is closed, so the operand of a `!` is a sub-expression of
+// the pure body and rule 6 governs the call inside it. A USER method that
+// is not `pure` is rejected, and the diagnostic lands on the CALL.
+BEZEL_TEST(pure_body_walk_8134,
+           postfix_bang_operand_user_impure_call_rejected_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class Helper\n"
+        "  public static method Feed(): string\n"
+        "    return \"x\";\n"
+        "  end Feed;\n"
+        "end Helper;\n"
+        "class C\n"
+        "  public static pure method F(): string\n"
+        "    return Helper.Feed()!;\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(r, kUserImpureCall);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 9u);
+    // The `!` itself is NOT the reported operation (§17.8: the operator is
+    // "purely a type-system assertion") — the CALL inside its operand is.
+    BEZEL_EXPECT_TRUE(
+        diagnosticsContaining(r, "null-forgiving").empty());
+}
+
+// The STANDARD-LIBRARY twin: `Console.ReadLine()` is not `pure`-declared in
+// the standard library, so the call inside the `!` operand is rule 6's
+// business.
+BEZEL_TEST(pure_body_walk_8134,
+           postfix_bang_operand_stdlib_impure_call_rejected_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(): int\n"
+        "    return Console.ReadLine()!.Length;\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(r, kStdlibImpureCall);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 4u);
+}
+
+// The ADMIT control: the same position with a `pure`-declared callee. The
+// `!` operator itself is admitted — §17.8: "The operator is purely a
+// type-system assertion (with a runtime null check); it does not move, copy,
+// or borrow beyond what reading `x` already does."
+BEZEL_TEST(pure_body_walk_8134,
+           postfix_bang_operand_pure_call_admitted_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class Helper\n"
+        "  public static pure method Feed(): string?\n"
+        "    return null;\n"
+        "  end Feed;\n"
+        "end Helper;\n"
+        "class C\n"
+        "  public static pure method F(): string\n"
+        "    return Helper.Feed()!;\n"
+        "  end F;\n"
+        "end C;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The AOT arm of item 1: the real driver refuses the program.
+BEZEL_TEST(pure_body_walk_8134,
+           postfix_bang_operand_impure_call_rejected_by_driver_spec_22_15) {
+    BEZEL_EXPECT_TRUE(aotRejectsWith(
+        "module M;\n"
+        "class Helper\n"
+        "  public static method Feed(): string\n"
+        "    return \"x\";\n"
+        "  end Feed;\n"
+        "end Helper;\n"
+        "class C\n"
+        "  public static pure method F(): string\n"
+        "    return Helper.Feed()!;\n"
+        "  end F;\n"
+        "end C;\n"
+        "class Program\n"
+        "  public static method Main(): int\n"
+        "    Console.WriteLine(C.F());\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n",
+        kUserImpureCall));
+}
+
+// =========================================================================
+// ITEM 2 — the arms of a `case` EXPRESSION (§A.7 / §22.15).
+// =========================================================================
+
+// The arm's BODY is a sub-expression of the pure body. A USER method that
+// is not `pure` is rejected there.
+BEZEL_TEST(pure_body_walk_8134,
+           case_expression_arm_user_impure_call_rejected_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class Helper\n"
+        "  public static method Feed(): string\n"
+        "    return \"x\";\n"
+        "  end Feed;\n"
+        "end Helper;\n"
+        "class C\n"
+        "  public static pure method F(x: int): string\n"
+        "    return (case x of 0 => Helper.Feed(), _ => \"\");\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(r, kUserImpureCall);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 9u);
+}
+
+// The STANDARD-LIBRARY twin, in the arm's body.
+BEZEL_TEST(pure_body_walk_8134,
+           case_expression_arm_stdlib_impure_call_rejected_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(x: int): string?\n"
+        "    return (case x of 0 => Console.ReadLine(), _ => null);\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(r, kStdlibImpureCall);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 4u);
+}
+
+// The arm's `when` GUARD is an arm's own sub-expression (§19.4), and it is
+// subject to the same closed list.
+BEZEL_TEST(pure_body_walk_8134,
+           case_expression_guard_stdlib_impure_call_rejected_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(x: int): string\n"
+        "    return (case x of 0 when Console.ReadLine()!.Length > 0 => \"y\", "
+        "_ => \"n\");\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(r, kStdlibImpureCall);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 4u);
+}
+
+// The statement-position twin shares the `ast::CaseArm` shape, so its guard
+// is now walked too.
+BEZEL_TEST(pure_body_walk_8134,
+           case_statement_guard_stdlib_impure_call_rejected_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(x: int): int\n"
+        "    var r := 0;\n"
+        "    case x of\n"
+        "      0 when Console.ReadLine()!.Length > 0 => do r := 1; end,\n"
+        "      _ => do r := 2; end,\n"
+        "    end;\n"
+        "    return r;\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(r, kStdlibImpureCall);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 6u);
+}
+
+// The NESTED shape: a `!` inside a `case` arm. Both skips had to be closed
+// for this one to be caught — the arm is not walked at all without item 2,
+// and the `!` operand is not walked without item 1.
+BEZEL_TEST(pure_body_walk_8134,
+           case_expression_arm_containing_postfix_bang_rejected_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(x: int): int\n"
+        "    return (case x of 0 => Console.ReadLine()!.Length, _ => 0);\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(r, kStdlibImpureCall);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 4u);
+}
+
+// The ADMIT control: the same arm shape with a `pure`-declared callee.
+BEZEL_TEST(pure_body_walk_8134,
+           case_expression_arm_pure_call_admitted_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class Helper\n"
+        "  public static pure method Feed(): string\n"
+        "    return \"x\";\n"
+        "  end Feed;\n"
+        "end Helper;\n"
+        "class C\n"
+        "  public static pure method F(x: int): string\n"
+        "    return (case x of 0 => Helper.Feed(), _ => \"\");\n"
+        "  end F;\n"
+        "end C;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The ADMIT control for the STANDARD-LIBRARY shape: a member the library
+// DOES mark `pure` (stdlib §2.2 `Math.Abs`) is admitted in the arm.
+BEZEL_TEST(pure_body_walk_8134,
+           case_expression_arm_pure_stdlib_call_admitted_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(x: int): int\n"
+        "    return (case x of 0 => Math.Abs(-1), _ => 0);\n"
+        "  end F;\n"
+        "end C;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The AOT arm of item 2: the real driver refuses the program.
+BEZEL_TEST(pure_body_walk_8134,
+           case_expression_arm_impure_call_rejected_by_driver_spec_22_15) {
+    BEZEL_EXPECT_TRUE(aotRejectsWith(
+        "module M;\n"
+        "class Helper\n"
+        "  public static method Feed(): string\n"
+        "    return \"x\";\n"
+        "  end Feed;\n"
+        "end Helper;\n"
+        "class C\n"
+        "  public static pure method F(x: int): string\n"
+        "    return (case x of 0 => Helper.Feed(), _ => \"\");\n"
+        "  end F;\n"
+        "end C;\n"
+        "class Program\n"
+        "  public static method Main(): int\n"
+        "    Console.WriteLine(C.F(0));\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n",
+        kUserImpureCall));
+}
+
