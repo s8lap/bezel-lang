@@ -51226,6 +51226,32 @@ void Emitter::setupBoxDescriptors() {
             std::string("pvt$") + nm);
         allVtables_.push_back(primBoxVtable_[nm]);  // §8.6 #417
     }
+
+    // --- Value-builtins: the REPLACEMENT box vtable (#7817 / #7844) --------
+    //
+    // fix #7817 / #7844 (§8 "The Object Class" / §8.5 / §8.6 / §8.3, stdlib
+    // §2.5 / §2.6, v0.353): the boxed VALUE-BUILTIN's Object surface must speak
+    // about the VALUE, not about the box — `o.ToString()` renders the value
+    // (stdlib §2.5 / §2.6), `o.Equals(o2)` compares by value (§8.3), and
+    // `o.GetHashCode()` hashes the value (§8.3) — instead of the box's
+    // class-default answers (the type's qualified name; §8.3's reference
+    // identity).
+    //
+    // ⚠ MINTED HERE, EAGERLY, FOR EVERY MODULE — NOT lazily in the module that
+    // happens to box. `bz_obj_is_string` decides "is this Object a string?" by
+    // asking whether the value's word 0 is listed in the CALLING module's
+    // `bz$vtable$table`, and that table is built from THAT module's
+    // `allVtables_`. A lazily-minted replacement is listed in the boxing
+    // module's table only, so a box that CROSSES a module boundary was
+    // answered "this is a string": `o is DateTime` answered False and
+    // `o.ToString()` printed garbage bytes — a REGRESSION against the parent,
+    // which answered correctly (§2.8.3 rule 4: program-wide type identity).
+    // The base `pvt$<nm>` above is minted eagerly for every module for the same
+    // reason; the replacement is its twin, and `valueBuiltinBoxVtableFor` repoints
+    // the `primBoxVtable_` map entry — the ONE reader of which is
+    // `boxVtableFor` — at it, so every box of this type gets it.
+    for (const char* nm : kValueBuiltins)
+        valueBuiltinBoxVtableFor(nm);
 }
 
 
@@ -51294,6 +51320,208 @@ llvm::Constant* Emitter::valueBuiltinBoxToStringThunk(const char* name) {
             lowerStringLiteral(std::string("\"") + rendered + "\"", false));
     }
     return thunk;
+}
+
+
+// fix #7817 / #7844 (§8 "The Object Class" / §8.5 / §8.6 / §8.3, stdlib §2.5 /
+// §2.6, v0.353): the REPLACEMENT box vtable `pvtvb$<nm>` for a boxed built-in
+// VALUE type (DateTime / TimeSpan / DateOnly / TimeOnly / Guid).
+//
+// THE DEFECTS (MEASURED on this fix's parent, `c4600284`):
+//   #7817 — `var o: Object := ts; o.ToString()` printed "System.TimeSpan" (and
+//     "System.Guid" / "System.DateTime" for the other two). The value-builtin
+//     box vtable's slot 3 is `valueBuiltinBoxToStringThunk`, which returns the
+//     type's QUALIFIED NAME — §8.5's "the type's qualified name" default, the
+//     answer for a CLASS with no ToString. stdlib §2.5 / §2.6 give these value
+//     types their OWN ToString (the ISO-8601 / canonical / "c" rendering), and
+//     the UNBOXED spelling (`ts.ToString()`) already rendered the value: two
+//     spellings of one value disagreed inside one program. The issue's own
+//     SECOND repro — an `extension Object` body's `this.ToString()` — showed the
+//     same.
+//   #7844 — `var o1: Object := DateTime.FromTicks(0L); var o2: Object :=
+//     DateTime.FromTicks(0L); o1.Equals(o2)` answered FALSE. The value-builtin
+//     box vtable's slot 4 is `boxDefaultEqualsThunk`, the §8.3 REFERENCE-
+//     IDENTITY default, while stdlib §2.5 gives DateTime (and every other
+//     §2.5 / §2.6 value type) VALUE equality. The PRIMITIVE box vtable already
+//     answered by value (`primBoxEqualsThunk`, #961); the value-builtin box was
+//     the outlier.
+//
+// THE FIX. For a built-in value type ONLY, the box's vtable is REPLACED by one
+// whose three Object slots read the box's PAYLOAD:
+//
+//   slot 3 (ToString)    → `emitValueToString(payload, &type)` — the very
+//                           renderer the UNBOXED value's own ToString uses, so
+//                           ONE authority answers and the two spellings cannot
+//                           drift;
+//   slot 4 (Equals)      → `emitValueEquality(selfPayload, otherPayload,
+//                           &type)` — the same helper `=` and a record field's
+//                           equality use, so the boxed answer agrees with the
+//                           unboxed one (and, for DateTime, with the §2.5
+//                           tick-order equality that ignores the Kind bits);
+//   slot 5 (GetHashCode) → `emitValueHashCode(payload, &type)` — so §8.3's
+//                           "a.Equals(b) ⇒ a.GetHashCode() = b.GetHashCode()"
+//                           invariant holds for the boxed surface too.
+//
+// The replacement keeps the base vtable's slot 0 (the type descriptor), slot 1
+// (the itmap) and slot 2 (Dispose) VERBATIM, so the box's TYPE TAG is
+// unchanged: `o is Guid` (§12.7) / `case o of Guid` (§19.3) still walk the same
+// descriptor chain (`emitIsA` reads vtable[0]), the box is still disposed by
+// the same routine, and the box's LAYOUT is untouched (the payload still lives
+// two words in — the offset every payload accessor already reads).
+//
+// WHY A NEW GLOBAL AND NOT A MUTATED ONE. `pvt$<nm>` is LinkOnceODR (§2.8.3
+// rule 4) and its initializer is byte-identical across compilation units;
+// replacing slots 3/4/5 in place would make the two units' initializers differ.
+// The replacement is therefore a SEPARATE global (`pvtvb$<nm>`), also
+// LinkOnceODR, whose slots 0/1/2 are the SAME descriptor / itmap / Dispose
+// constants the base vtable carries (so the two initializers agree on
+// everything except the three thunk addresses, which are themselves LinkOnceODR
+// and merge to one address program-wide — the same derivation the primitive box
+// vtable records). The base vtable stays in the runtime's vtable table: it is
+// dead for boxing, but the runtime's `bz_obj_is_string` must still not mistake
+// it for a string's data pointer.
+//
+// ⚠ WHY THIS IS MINTED EAGERLY, IN EVERY MODULE — AND NOT LAZILY, IN THE
+// MODULE THAT BOXES. `bz_obj_is_string` (src/runtime/
+// bezel_runtime_refcounting.cpp) answers "is this Object a string?" by asking
+// whether the value's word 0 is listed in the CALLING MODULE's
+// `bz$vtable$table` — a per-module `InternalLinkage` array built by
+// `finalizeVtableTable` from THAT module's `allVtables_`. A vtable minted
+// lazily (only where a box is actually built) is absent from every OTHER
+// module's table, so a cross-module box was answered "this is a string": the
+// type test `o is DateTime` answered False and `o.ToString()` printed garbage
+// bytes — a REGRESSION against the parent, which answered correctly (§2.8.3
+// rule 4: program-wide type identity). The base `pvt$<nm>` is already minted
+// eagerly for EVERY module (see setupBoxDescriptors), so the replacement is
+// minted the same way and the `primBoxVtable_` map entry — the ONE reader of
+// which is `boxVtableFor` — is repointed at it.
+//
+// THE EQUALITY THUNK'S TYPE GUARD. The Equals thunk compares the two boxes'
+// VTABLE WORDS before touching a payload (`other` may be a bare `bz_string*`,
+// whose word 0 is the char-data pointer — the same one-load device
+// `primBoxEqualsThunk` uses after #2980), so a box never compares its payload
+// against a non-box.
+llvm::GlobalVariable* Emitter::valueBuiltinBoxVtableFor(const char* name) {
+    auto it = primBoxVtable_.find(name);
+    if (it == primBoxVtable_.end() || !it->second) return nullptr;
+    llvm::GlobalVariable* base = it->second;
+    // Idempotent: the map entry already names the replacement.
+    if (base->getName() == ("pvtvb$" + std::string(name))) return base;
+
+    // The value-builtin's OWN TypeRef — the compiler-intrinsic builtin class
+    // symbol, the very shape a value-builtin expression's type carries
+    // (`builtinClassSym("DateTime")` etc.) — and, from it, the payload's LLVM
+    // type. Both come from the ONE authority the box itself uses, so the
+    // thunk's payload type cannot drift from the box's.
+    sema::TypeRef vbTy;
+    vbTy.kind = sema::TypeRef::Kind::Named;
+    vbTy.declaration = ctx_.builtinClassSym(name);
+    llvm::Type* payloadTy = lowerTypeRef(&vbTy);
+    if (!payloadTy) return nullptr;
+
+    // --- slot 3: ToString — `ptr(ptr this)` ---
+    auto* tostrFn = llvm::Function::Create(
+        llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false),
+        llvm::Function::LinkOnceODRLinkage,
+        std::string("bz$vbstr$") + name, module_.get());
+    {
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", tostrFn);
+        // The thunk body is emitted with NO active Bezel function: the
+        // `ThunkScope` RAII helper (above) saves the caller's function +
+        // insertion point and restores them afterwards (the §8.5/§8.6 thunk
+        // pattern every other thunk in this file uses).
+        ThunkScope scope(currentFn_, builder_, tostrFn, entry);
+        llvm::Value* pay = builder_.CreateGEP(
+            ptrTy(), tostrFn->getArg(0), {builder_.getInt32(2)}, "vb.pay");
+        llvm::Value* val = builder_.CreateLoad(payloadTy, pay, "vb.val");
+        llvm::Value* str = emitValueToString(val, &vbTy);
+        builder_.CreateRet(str);
+    }
+    // --- slot 4: Equals — `i1(ptr this, ptr other)` ---
+    auto* eqFn = llvm::Function::Create(
+        llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, /*isVarArg=*/false),
+        llvm::Function::LinkOnceODRLinkage,
+        std::string("bz$vbeq$") + name, module_.get());
+    {
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", eqFn);
+        ThunkScope scope(currentFn_, builder_, eqFn, entry);
+        llvm::Value* self  = eqFn->getArg(0);
+        llvm::Value* other = eqFn->getArg(1);
+        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+        auto* notNullBB = llvm::BasicBlock::Create(llvm_, "vbeq.nonnull", eqFn);
+        auto* checkBB   = llvm::BasicBlock::Create(llvm_, "vbeq.check", eqFn);
+        auto* endBB     = llvm::BasicBlock::Create(llvm_, "vbeq.end", eqFn);
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(other, nullP), endBB, notNullBB);
+        // ONE load each: compare word 0 of `other` against word 0 of `self`
+        // (the same device `primBoxEqualsThunk` uses after #2980): `other` may
+        // be a bare bz_string* whose word 0 is the char-data pointer, so the
+        // vtable word must never be DEREFERENCED here.
+        builder_.SetInsertPoint(notNullBB);
+        llvm::Value* otherVtbl = builder_.CreateLoad(ptrTy(), other, "vbeq.ovt");
+        llvm::Value* selfVtbl  = builder_.CreateLoad(ptrTy(), self, "vbeq.svt");
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(otherVtbl, selfVtbl), checkBB, endBB);
+        builder_.SetInsertPoint(checkBB);
+        llvm::Value* selfPay = builder_.CreateGEP(
+            ptrTy(), self, {builder_.getInt32(2)}, "vbeq.spay");
+        llvm::Value* otherPay = builder_.CreateGEP(
+            ptrTy(), other, {builder_.getInt32(2)}, "vbeq.opay");
+        llvm::Value* sv = builder_.CreateLoad(payloadTy, selfPay, "vbeq.sv");
+        llvm::Value* ov = builder_.CreateLoad(payloadTy, otherPay, "vbeq.ov");
+        llvm::Value* eq = emitValueEquality(sv, ov, &vbTy);
+        llvm::BasicBlock* checkEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 3, "vbeq.res");
+        phi->addIncoming(builder_.getFalse(), entry);      // other null
+        phi->addIncoming(builder_.getFalse(), notNullBB);  // other type
+        phi->addIncoming(eq, checkEnd);                    // value equality
+        builder_.CreateRet(phi);
+    }
+    // --- slot 5: GetHashCode — `i32(ptr this)` ---
+    auto* hashFn = llvm::Function::Create(
+        llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false),
+        llvm::Function::LinkOnceODRLinkage,
+        std::string("bz$vbhash$") + name, module_.get());
+    {
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", hashFn);
+        ThunkScope scope(currentFn_, builder_, hashFn, entry);
+        llvm::Value* pay = builder_.CreateGEP(
+            ptrTy(), hashFn->getArg(0), {builder_.getInt32(2)}, "vbh.pay");
+        llvm::Value* val = builder_.CreateLoad(payloadTy, pay, "vbh.val");
+        llvm::Value* h = emitValueHashCode(val, &vbTy);
+        if (h->getType() != i32())
+            h = builder_.CreateZExtOrTrunc(h, i32());
+        builder_.CreateRet(h);
+    }
+    // --- the replacement vtable ---
+    auto* vtTy = llvm::cast<llvm::ArrayType>(base->getValueType());
+    std::vector<llvm::Constant*> elems(
+        vtTy->getNumElements(), llvm::ConstantPointerNull::get(ptrTy()));
+    if (auto* baseArr = llvm::dyn_cast<llvm::ConstantArray>(
+            base->getInitializer())) {
+        for (unsigned i = 0;
+             i < elems.size() && i < baseArr->getType()->getNumElements(); ++i)
+            if (llvm::Constant* c = baseArr->getAggregateElement(i))
+                elems[i] = c;
+    }
+    elems[kToStringSlot]    = tostrFn;
+    elems[kEqualsSlot]      = eqFn;
+    elems[kGetHashCodeSlot] = hashFn;
+    auto* vt = new llvm::GlobalVariable(
+        *module_, vtTy, /*isConstant=*/true,
+        llvm::GlobalValue::LinkOnceODRLinkage,
+        llvm::ConstantArray::get(vtTy, elems),
+        "pvtvb$" + std::string(name));
+    // ⚠ THE BASE VTABLE STAYS IN `allVtables_`. It is dead for boxing (the map
+    // entry below now names the replacement) but it is still a vtable the
+    // runtime's `bz_obj_is_string` must NOT mistake for a string's data
+    // pointer, so it stays listed. The replacement is listed too — THAT is what
+    // lets a module that CONSUMES a box recognise it (§2.8.3 rule 4).
+    allVtables_.push_back(vt);   // §8.6 #417 — bz_obj_is_string
+    primBoxVtable_[name] = vt;   // the ONE box vtable for this type
+    return vt;
 }
 
 

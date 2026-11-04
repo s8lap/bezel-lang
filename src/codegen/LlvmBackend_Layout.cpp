@@ -5098,6 +5098,36 @@ llvm::Value* Emitter::boxValue(llvm::Value* value, const sema::TypeRef* srcTy) {
         payloadTy = payload->getType();
     }
 
+    // fix #7817 / #7844 (§8 "The Object Class" / §8.5 / §8.6 / §8.3, stdlib
+    // §2.5 / §2.6, v0.353): the Object surface of a BOXED built-in VALUE type
+    // must speak about the VALUE, not about the box — `o.ToString()` renders the
+    // value, `o.Equals(o2)` compares by value, `o.GetHashCode()` hashes the
+    // value (§8.5 / §8.3), instead of the box's class-default answers (the
+    // type's qualified name; §8.3's reference identity).
+    //
+    // The box's vtable for a built-in value type is therefore the REPLACEMENT
+    // `pvtvb$<nm>` (the base `pvt$<nm>` with slots 3/4/5 replaced by thunks that
+    // read the box's PAYLOAD) — and it is NOT minted HERE, in the module that
+    // happens to box, but EAGERLY, FOR EVERY MODULE, by `setupBoxDescriptors` →
+    // `valueBuiltinBoxVtableFor` (src/codegen/LlvmBackend_Setup.cpp), which also
+    // repoints the `primBoxVtable_` map entry this function's `boxVtableFor`
+    // reads. ⚠ THE REASON IS CROSS-MODULE: `bz_obj_is_string` decides "is this
+    // Object a string?" by asking whether the value's word 0 is listed in the
+    // CALLING module's `bz$vtable$table`, and that table is built from THAT
+    // module's `allVtables_`. A lazily-minted replacement is listed in the
+    // boxing module's table only, so a box that CROSSES a module boundary was
+    // answered "this is a string" — `o is DateTime` answered False and
+    // `o.ToString()` printed garbage bytes, a REGRESSION against the parent
+    // (§2.8.3 rule 4: program-wide type identity). Eager minting puts the
+    // replacement in EVERY module's table.
+    //
+    // ⚠ NOT COVERED HERE: the NULLABLE value-builtin box (`DateTime?` → `Object`).
+    // `valueBuiltinBoxName` excludes a nullable source (a nullable value type has
+    // its own tagged layout and its own vtable path), so that shape keeps the
+    // OLD vtable and the OLD answers. It is broken INDEPENDENTLY of this fix —
+    // this commit does not make it worse and does not make it better.
+
+
     // The box struct { vtable*, i64 rc, payload }. The rc word (#422) sits at a
     // FIXED offset 8 between the vtable word and the payload, so bz_box_release's
     // single runtime offset works for every box regardless of payload size; the

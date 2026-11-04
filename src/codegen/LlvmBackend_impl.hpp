@@ -12552,6 +12552,27 @@ private:
     // of scope (it belongs to the value-type's own methods).
     llvm::Constant* valueBuiltinBoxToStringThunk(const char* name);
 
+    // fix #7817 / #7844 (§8 "The Object Class" / §8.5 / §8.6 / §8.3, stdlib
+    // §2.5 / §2.6, v0.353): the REPLACEMENT box vtable `pvtvb$<nm>` for a boxed
+    // built-in VALUE type — the base `pvt$<nm>` with slots 3/4/5 (ToString /
+    // Equals / GetHashCode) replaced by thunks that read the box's PAYLOAD, so
+    // the Object surface speaks about the VALUE (§8.5 / §8.3) instead of about
+    // the box.
+    //
+    // ⚠ IT IS MINTED EAGERLY, IN EVERY MODULE — that is the whole point. The
+    // module that CONSUMES a box must be able to recognise it: `bz_obj_is_string`
+    // (src/runtime/bezel_runtime_refcounting.cpp) decides "is this Object a
+    // string?" by asking whether the value's word 0 is listed in the CALLING
+    // module's `bz$vtable$table` — a per-module array built from THAT module's
+    // `allVtables_`. A vtable minted lazily (only in the module that boxes)
+    // is absent from every OTHER module's table, so a cross-module box was
+    // answered "this is a string": `o is DateTime` answered False and
+    // `o.ToString()` printed garbage bytes (§2.8.3 rule 4 — program-wide type
+    // identity). The base `pvt$<nm>` is already minted eagerly for every module
+    // (setupBoxDescriptors), so the replacement is minted the same way and the
+    // map entry is repointed at it.
+    llvm::GlobalVariable* valueBuiltinBoxVtableFor(const char* name);
+
     // §9.1 / §9.6 (#961): per-type structural Equals `i1(ptr this, ptr other)`
     // and GetHashCode `i32(ptr this)` thunks for boxed RECORDS and ENUMS.
     // Equals guards `other` is a box of the same type (matching vtable[0]
