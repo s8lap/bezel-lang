@@ -2712,8 +2712,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // and `.Length` dereferenced null. (TrimStart/TrimEnd char-set overloads
         // are analogous but not yet wired; only Trim(set) is handled here.)
         if (method == "Trim" && call.args.size() == 1 && call.args[0].value) {
-            llvm::Value* chars = lowerArg(0);
-            if (!chars) return nullptr;
+            const ast::Expr* charsExpr = call.args[0].value.get();
             // fix #7492 (stdlib §9.6, v0.350): a `string` IS an
             // `IEnumerable<char>`, and sema admits it, but its representation
             // is a `bz_string_struct`, not the `bz_array_t` of code points
@@ -2721,15 +2720,108 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             // as an array count and ran off the end (SIGSEGV). The helper is
             // selected by the argument's STATIC type; the set string is
             // walked in the code-point domain (§4.6).
-            if (isStringExprType(*call.args[0].value)) {
+            if (isStringExprType(*charsExpr)) {
+                llvm::Value* chars = lowerArg(0);
+                if (!chars) return nullptr;
                 auto* fnS = declareC("bz_str_trim_chars_str", ptrTy(),
                                      {ptrTy(), ptrTy()});
                 return builder_.CreateCall(fnS, {self, chars},
                                            "trim.chars.str.result");
             }
+            // fix #7521 (stdlib §9.6, §5.1, v0.355): EVERY `IEnumerable<char>`
+            // source is admitted, and the runtime helper reads its set as an
+            // `Array<char>` — a `bz_array_t` whose slots are i32 code points
+            // (`bz_cp_in_set`). A source that is not an `Array<char>` has a
+            // DIFFERENT representation (`Set<T>`/`SortedSet<T>` are
+            // `bz_dict_t*`-backed, `LinkedList<T>` is `bz_llist_t*`-backed, a
+            // lazy `.Where(…)` pipeline and an interface-typed
+            // `IEnumerable<char>` are enumerator objects), so it is
+            // MATERIALISED into a fresh `Array<char>` snapshot through the ONE
+            // generic IEnumerable path — `lowerToLazyEnumerator` +
+            // `bz_lazy_to_array`, the same mechanism stdlib §9.6's
+            // `string.Join(separator, items: IEnumerable<string>)` uses for
+            // its `items` argument (LlvmBackend_Calls.cpp). No collection is
+            // special-cased here: the ONE path enumerates whatever the
+            // argument is.
+            //
+            // THE SOURCE IS BORROWED (§28.9): the snapshot is this call's own
+            // and is released once the trim has read it; the caller's
+            // collection is never disposed by the call. An UNBOUND owned
+            // temporary (§28.3 K8 — an `owned`-returning producer call or a
+            // fresh materializer call used directly as the argument) is the
+            // one exception: it is owned by nobody, so it is discharged at
+            // the full-expression boundary, which is here. `lowerToLazyEnumerator`
+            // takes that one over itself (`ownSourceTemp`) when it recognises
+            // the shape — an `owned`-returning producer call — and the runtime
+            // then reclaims it when the lazy is disposed, so `outRecvArr` stays
+            // NULL for it and this call site cannot free it a second time.
+            // The `new`-expression face (`new Array<char>(2)`) is NOT one of
+            // the shapes `lowerToLazyEnumerator` takes over, and the ARRAY
+            // path surfaces its source value through `outRecvArr` precisely so
+            // the call site can discharge it here through the same
+            // `freeUnboundOwnedBorrowingArrayTemp` the array path uses. (The
+            // DICT/LINKED-LIST paths do not surface a source value — an
+            // unbound `new Set<char>()` is therefore NOT discharged here; a
+            // §28.3 residual of the same class as `string.Join`'s `items`
+            // argument. Reported, not fixed here.)
+            sema::TypeRef* elemRef = nullptr;
+            llvm::Value* srcArr = nullptr;
+            llvm::Value* lazy = lowerToLazyEnumerator(
+                *charsExpr, elemRef, /*ownFreshGroupings=*/false,
+                /*outRecvArr=*/&srcArr, /*ownSourceTemp=*/true);
+            // fix #7521 (stdlib §9.6, §4.1–§4.3, #853, v0.355): the ONE
+            // materialisation path has no lowering for a POLYMORPHIC collection
+            // interface — `ICollection<T>` / `IReadOnlyCollection<T>` /
+            // `IOwningCollection<T>` / `IOwningList<T>` (stdlib §4.1–§4.3).
+            // Those interfaces are implemented by collections with incompatible
+            // runtime representations (array / linked-list / hash-table) and
+            // the concrete backing is ERASED at the interface, so no single
+            // runtime dispatch is sound. §5.1 still admits the type (it IS an
+            // `IEnumerable<char>`), and so does this gate — but a call that
+            // cannot be lowered must NOT be emitted as a call that emits
+            // NOTHING (the silent drop: the enclosing statement produced no
+            // code at all, so the program ran and printed the wrong thing).
+            // Diagnose it, exactly as the collection-member path does for the
+            // same four heads (#853), and hand back a poison value so the
+            // enclosing expression still emits well-formed IR — the diagnostic
+            // has already failed the compile, so the poison is never read.
+            if (!lazy) {
+                const sema::TypeRef* charsTy = ctx_.exprType(*charsExpr);
+                std::string head = charsTy ? std::string(charsTy->headName())
+                                           : std::string();
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    "the `chars` argument of `string.Trim` has type '" + head +
+                    "', which is an `IEnumerable<char>` (stdlib §5.1) but "
+                    "cannot be materialized into a trim set in codegen "
+                    "(stdlib §9.6, §4.1–§4.3, #853): a polymorphic collection "
+                    "interface erases the concrete backing, so no single "
+                    "runtime dispatch is sound. Pass the concrete collection, "
+                    "an `IEnumerable<char>` value, or a borrowing list "
+                    "interface (`IReadOnlyList<char>` / `IList<char>`) instead.");
+                return llvm::PoisonValue::get(ptrTy());
+            }
+            // The element width: a `char` is a 32-bit code point (§3.5, §4.6),
+            // and the set array's slots are i32 code points (`bz_cp_in_set`).
+            // Sema admitted the argument only because its element type IS
+            // `char`, so the snapshot is an `Array<char>`.
+            auto* toArr = declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
+            llvm::Value* snap = builder_.CreateCall(
+                toArr, {lazy, builder_.getInt64(4)}, "trim.chars.snap");
             auto* fn = declareC("bz_str_trim_chars", ptrTy(), {ptrTy(), ptrTy()});
             llvm::Value* res =
-                builder_.CreateCall(fn, {self, chars}, "trim.chars.result");
+                builder_.CreateCall(fn, {self, snap}, "trim.chars.result");
+            // The snapshot is this call's own: release it once the trim has
+            // read it. NULL element disposer — the set's code points are
+            // values, not borrows, so there is no element to release (and no
+            // double free: the source collection is NOT released here).
+            {
+                auto* freeFn = declareC("bz_array_free",
+                                        llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy()});
+                builder_.CreateCall(
+                    freeFn, {snap, llvm::ConstantPointerNull::get(ptrTy())});
+            }
             // fix #7522 (stdlib §9.6, §28.3 *Unbound owned temporaries*,
             // §28.9, v0.350): an `owned Array<char>` call result passed as
             // `chars` is an unbound +1 temporary that the helper only READS;
@@ -2737,9 +2829,14 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             // Release it after the result is built. The helper is a no-op for
             // any shape that is not a fresh owned temporary (a named local,
             // a field, a parameter), so a borrowed set is never freed.
-            freeUnboundOwnedBorrowingArrayTemp(
-                call.args[0].value.get(), chars,
-                ctx_.exprType(*call.args[0].value));
+            //
+            // fix #7521 (v0.355): `outRecvArr` carries the source value ONLY
+            // when the lazy did NOT take the temporary over itself
+            // (`ownSourceTemp`), so this call and the runtime's own discharge
+            // can never both free one value.
+            if (srcArr)
+                freeUnboundOwnedBorrowingArrayTemp(
+                    charsExpr, srcArr, ctx_.exprType(*charsExpr));
             return res;
         }
         // #7425 (§4.6, v0.345): the trim is done in the CODE-POINT domain, by

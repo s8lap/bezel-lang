@@ -4900,6 +4900,30 @@ private:
     // false rejection.
     bool builtinArgAdmitsKind(const ast::Expr* argExpr, TypeRef* argTy,
                               std::uint32_t kind);
+    // fix #7521 (stdlib §9.6, §5.1, §26.5, v0.355): does the argument's type
+    // reach `IEnumerable<char>` — the DECLARED type of stdlib §9.6's
+    // `Trim(chars: IEnumerable<char>): string`?
+    //
+    // §5.1's reference conversions ("a type to an interface it implements or
+    // conforms to"), asked of the argument's own type and answered from the
+    // ONE §26.5 builtin-conformance table (`collectBuiltinAncestorInstantiationsOf`
+    // — the table `checkAssignable`'s own §12.9 variance check consults), so
+    // this gate and the general §5.1 machinery cannot disagree about a
+    // builtin collection.
+    //
+    // Admitted: a `string`; the LAZY LINQ sentinel (stdlib §5) whose element
+    // type is `char`; and any builtin collection or collection interface
+    // whose `IEnumerable<T>` instantiation has element type `char`
+    // (`Array<T>`/`Set<T>`/`Stack<T>`/`Queue<T>`/`LinkedList<T>`/
+    // `SortedSet<T>` and the owning variants, and the `IEnumerable<T>`/
+    // `ICollection<T>`/`IReadOnlyCollection<T>`/`IReadOnlyList<T>`/`IList<T>`
+    // heads).
+    //
+    // NOT admitted: the SPAN family (spec §29.2's "Why these sources bypass
+    // the protocol" — the span records implement no interface, so an
+    // `ArraySpan<char>` is not an `IEnumerable<char>`), and a USER type
+    // (the §26.5 table is the builtin one).
+    bool builtinArgIsEnumerableCharSource(const TypeRef* argTy);
     // Is the CALL admissible against this declared form?
     bool builtinFormApplicable(const ast::CallExpr& ce,
                                 const common::BuiltinParamForm& form);

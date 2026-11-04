@@ -24790,17 +24790,28 @@ bool builtinArgIsRangeOf(TypeRef* argTy, PrimitiveType elem) {
 // would reach it unlowered. That is a residual of the §9.6 surface, named in
 // the hand-back — it costs a rejection that does not fire, never a false
 // acceptance.
+// Is `el` the `char` element type stdlib §9.6's `IEnumerable<char>` names?
+// A NULLABLE `char?` is not `char` (§7.1): the declared parameter is
+// `IEnumerable<char>`, not `IEnumerable<char?>`.
+static bool builtinArgIsCharElement(const TypeRef* el) {
+    return el && el->kind == TypeRef::Kind::Primitive &&
+           el->primitive == PrimitiveType::Char && !el->nullable;
+}
+
 bool builtinArgAdmitsNamedKind(TypeRef* argTy, std::uint32_t namedKinds) {
     if (!argTy) return false;
     for (std::uint32_t bit = 1; bit; bit <<= 1) {
         if (!(namedKinds & bit)) continue;
         switch (bit) {
             case common::kBPTEnumerableChar:
-                if (argTy->kind == TypeRef::Kind::Primitive &&
-                    argTy->primitive == PrimitiveType::String)
-                    return true;
-                if (builtinArgIsArrayOf(argTy, PrimitiveType::Char))
-                    return true;
+                // fix #7521 (stdlib §9.6, §5.1, v0.355): the
+                // `IEnumerable<char>` bit is answered by
+                // `ExprTC::builtinArgIsEnumerableCharSource` (the §26.5
+                // builtin conformance table), which this free function cannot
+                // reach — it has no `ExprTC` to ask. The call site splits the
+                // bit out before it gets here, so this arm never fires; it
+                // breaks (rather than returning) so a hypothetical second
+                // named bit at the same position is still judged.
                 break;
             case common::kBPTArrayChar:
                 if (builtinArgIsArrayOf(argTy, PrimitiveType::Char))
@@ -24822,6 +24833,87 @@ bool builtinArgAdmitsNamedKind(TypeRef* argTy, std::uint32_t namedKinds) {
 }
 
 }  // namespace
+
+// fix #7521 (stdlib §9.6, §5.1, §26.5, v0.355): does the argument's type
+// reach `IEnumerable<char>` — the DECLARED type of stdlib §9.6's
+//     public pure method Trim(chars: IEnumerable<char>): string;
+// ?
+//
+// THE QUESTION. §5.1's reference conversions: "a type to an interface it
+// implements or conforms to". The answer is asked of the ARGUMENT's own type
+// and is read from the ONE §26.5 builtin-conformance table
+// (`collectBuiltinAncestorInstantiationsOf` — the same table
+// `checkAssignable`'s own §12.9 variance check consults for an ordinary
+// `Array<int>` → `IReadOnlyList<int>` assignability), so this gate and the
+// general §5.1 machinery cannot disagree about a builtin collection.
+//
+// THE DEFECT THIS CLOSES. The §9.6 gate read the conformance off a
+// HAND-WRITTEN list — `string` and `Array<char>` only — so it refused
+// `Set<char>`/`Stack<char>`/`Queue<char>`/`LinkedList<char>` (and a lazy
+// `.Where(…)` pipeline, and even an argument whose own type IS
+// `IEnumerable<char>`) with "no matching overload of `string.Trim` — the
+// `chars` argument must be an `IEnumerable<char>`". MEASURED on the base
+// (v0.355, commit f9e23eba): `var e: IEnumerable<char> := arr; s.Trim(e);`
+// compiles (the general §5.1 machinery admits it) while `s.Trim(e)` is
+// REFUSED by this gate — the same program, two answers, one of them a §5.1
+// identity the language does not deny.
+//
+// THREE ADMITTED SHAPES.
+//   * a `string` — stdlib §9.6's class declaration is `public class String:
+//     IEnumerable<char>, IComparable<string>, IEquatable<string>`;
+//   * the LAZY LINQ sentinel (stdlib §5) — the compiler's own representation
+//     of a lazy `IEnumerable<T>` pipeline, a Named ref with no declaration,
+//     no astNode and no importedName, carrying the element type at
+//     `genericArgs[0]` (the shape `Emitter::isLazyEnumerableType` recognises
+//     on the codegen side);
+//   * any BUILTIN collection or collection INTERFACE whose `IEnumerable<T>`
+//     instantiation has element type `char`: `Array<T>`/`Set<T>`/`Stack<T>`/
+//     `Queue<T>`/`LinkedList<T>`/`SortedSet<T>` and the owning variants
+//     (stdlib §4.4–§4.7, §4.10, §4.18), and the interface heads
+//     `IEnumerable<T>`/`ICollection<T>`/`IReadOnlyCollection<T>`/
+//     `IReadOnlyList<T>`/`IList<T>` (stdlib §4.4–§4.5).
+//
+// NOT ADMITTED. The SPAN family: stdlib §4.15's `ArraySpan<T>`/
+// `ReadOnlyArraySpan<T>` and §4.14's `Span<T>`/`ReadOnlySpan<T>` are
+// borrow-bearing records that implement NO interface — spec §29.2's "Why
+// these sources bypass the protocol" says so in as many words ("The span
+// family — `Span<T>`/`ReadOnlySpan<T>` and `ArraySpan<T>`/
+// `ReadOnlyArraySpan<T>` — and `ReadOnlyStringSpan` do not implement the
+// enumeration protocol"), so an `ArraySpan<char>` is NOT an
+// `IEnumerable<char>` and §5.1 converts it to none. (The general §5.1
+// machinery conservatively ACCEPTS that conversion — the §26.5 table does not
+// model the span heads — but a conservative accept is a documented residual,
+// not a licence: the compiler has no lowering for a span at an enumerable
+// position, so admitting one here would compile a call that cannot be
+// lowered.)
+//
+// A USER type that declares `IEnumerable<char>` is not admitted either: the
+// §26.5 table is the BUILTIN one, so the compiler cannot ask the question for
+// a user type here — the same residual the previous hand-written list had.
+bool ExprTC::builtinArgIsEnumerableCharSource(const TypeRef* argTy) {
+    if (!argTy) return false;
+    // A `string` IS an `IEnumerable<char>` (stdlib §9.6).
+    if (argTy->kind == TypeRef::Kind::Primitive &&
+        argTy->primitive == PrimitiveType::String)
+        return true;
+    // The LAZY LINQ sentinel (stdlib §5) — the compiler's own representation
+    // of a lazy `IEnumerable<T>` pipeline.
+    if (argTy->kind == TypeRef::Kind::Named && !argTy->declaration &&
+        !argTy->astNode && argTy->importedName.empty() &&
+        argTy->genericArgs.size() == 1 && argTy->genericArgs[0])
+        return builtinArgIsCharElement(argTy->genericArgs[0]);
+    // The §26.5 builtin conformance table: `Array<char>`/`Set<char>`/
+    // `Stack<char>`/`Queue<char>`/`LinkedList<char>`/`SortedSet<char>` and the
+    // collection interface heads all reach `IEnumerable<char>`.
+    std::vector<TypeRef*> insts;
+    std::vector<std::unique_ptr<TypeRef>> owned;
+    collectBuiltinAncestorInstantiationsOf(argTy, "IEnumerable", insts, owned);
+    for (const TypeRef* inst : insts)
+        if (inst->genericArgs.size() == 1 && inst->genericArgs[0] &&
+            builtinArgIsCharElement(inst->genericArgs[0]))
+            return true;
+    return false;
+}
 
 // fix #7421 (stdlib §9.6, §5.1, §7.3, §22.6, v0.345): THE DECLARED
 // PARAMETER TYPES of a §9.6 `String` member.
@@ -25125,8 +25217,32 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
             admitted = *a;
         }
         // §5.1's reference conversions, for the NAMED declared types.
-        if (!admitted && namedKinds)
-            admitted = builtinArgAdmitsNamedKind(effTy, namedKinds);
+        //
+        // fix #7521 (stdlib §9.6, §5.1, §26.5, v0.355): the
+        // `IEnumerable<char>` bit is asked of the ONE §26.5 builtin
+        // conformance table (`builtinArgIsEnumerableCharSource`), not of a
+        // hand-written list — the general §5.1 machinery already admits
+        // `Set<char>`/`Stack<char>`/`Queue<char>`/`LinkedList<char>` at an
+        // `IEnumerable<char>` position (`var e: IEnumerable<char> := s;`
+        // compiles today), so a §9.6 gate that refused them contradicted the
+        // language's own conversion rule. The other named bits keep the
+        // shared helper.
+        if (!admitted && namedKinds) {
+            const std::uint32_t enumerableChar =
+                namedKinds & common::kBPTEnumerableChar;
+            const std::uint32_t otherNamed =
+                namedKinds & ~static_cast<std::uint32_t>(common::kBPTEnumerableChar);
+            if (enumerableChar && otherNamed) {
+                // More than one named declared type at this position: every
+                // one of them must admit the argument.
+                admitted = builtinArgIsEnumerableCharSource(effTy) &&
+                           builtinArgAdmitsNamedKind(effTy, otherNamed);
+            } else if (enumerableChar) {
+                admitted = builtinArgIsEnumerableCharSource(effTy);
+            } else {
+                admitted = builtinArgAdmitsNamedKind(effTy, otherNamed);
+            }
+        }
         if (admitted) continue;
         // THE REFUSAL. The diagnostic names the DECLARED FORMS (stdlib §9.6's
         // own words), the PARAMETER (§22.5's declared name), the DECLARED
