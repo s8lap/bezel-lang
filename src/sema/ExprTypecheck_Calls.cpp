@@ -13740,9 +13740,40 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // through the SAME symbol-side accessor the
                             // class/interface arm uses (`declaresBuiltinInterface`
                             // — #3139's imported-side fix is already in it).
-                            const bool userRecordComparable =
+                            // The type argument must be the record ITSELF
+                            // (§14.2: `IComparable<Self>`; stdlib §2.8,
+                            // `IComparable<T>` is `CompareTo(other: T)`), so
+                            // `record A(...): IComparable<B>` is NOT a
+                            // comparable `A` (#8092 F4: it aborted IR
+                            // verification). When the symbol carries no
+                            // parallel `baseTypeRefs` entry the name-only
+                            // answer stands.
+                            bool userRecordComparable =
                                 userRecordElem && declaresBuiltinInterface(
                                     elem->declaration, "IComparable");
+                            if (userRecordComparable) {
+                                const TypeSymbol* rs = elem->declaration;
+                                bool selfArg = false;
+                                for (std::size_t bi = 0;
+                                     bi < rs->baseTypes.size(); ++bi) {
+                                    const TypeSymbol* b = rs->baseTypes[bi];
+                                    if (!b || !b->isSynthesizedBuiltinInterface ||
+                                        b->name != "IComparable") continue;
+                                    if (bi >= rs->baseTypeRefs.size() ||
+                                        !rs->baseTypeRefs[bi] ||
+                                        rs->baseTypeRefs[bi]->genericArgs
+                                            .size() != 1) {
+                                        selfArg = true;  // unknown: keep
+                                        continue;
+                                    }
+                                    const TypeRef* ga =
+                                        rs->baseTypeRefs[bi]->genericArgs[0];
+                                    if (ga && ga->declaration == rs &&
+                                        !ga->nullable)
+                                        selfArg = true;
+                                }
+                                userRecordComparable = selfArg;
+                            }
                             // A RECORD with NO `CompareTo` has NO order, so
                             // §5.1's extension does not apply to it and the
                             // call must be REFUSED — exactly as the
@@ -13760,8 +13791,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // `bezelc` died with a codegen error. A located
                             // diagnostic is strictly better than an abort, and
                             // no program that compiled before is broken by it.
-                            if ((m == "Min" || m == "Max") && userRecordElem &&
-                                !userRecordComparable) {
+                            if ((m == "Min" || m == "Max") && ce.args.empty() &&
+                                userRecordElem && !userRecordComparable) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, ce.span.begin,
                                     std::string(m) +

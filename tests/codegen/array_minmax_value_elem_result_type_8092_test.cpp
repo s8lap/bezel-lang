@@ -306,3 +306,84 @@ BEZEL_TEST(array_minmax_value_elem_result_type_8092,
         "1\n3\n1.5\n3.5\na\nc\n");
 }
 
+
+// ── FIX-FORWARD (review of 371e942c / 14c3a1ed) ───────────────────────────
+// F1: the SELECTOR overload `Min<U>(selector: (T) -> U): U` constrains only
+// `U` (stdlib §5, v0.355); it does NOT require `T: IComparable<T>`. A record
+// element that implements no `IComparable` must therefore still be accepted
+// WITH a selector (the no-selector refusal is for `Min()`/`Max()` only).
+BEZEL_TEST(array_minmax_value_elem_result_type_8092,
+           fixfwd_selector_over_noncomparable_record_is_admitted) {
+    BEZEL_EXPECT_EQ(
+        out("module M; public record Pt(X: int, Y: int); "
+            "public class C "
+            "public static method Main(): int "
+            "var a: Array<Pt> := [new Pt(3, 30), new Pt(1, 10), "
+            "new Pt(2, 20)]; "
+            "Console.WriteLine(a.Min(lambda(p: Pt) => p.X)); "
+            "Console.WriteLine(a.Max(lambda(p: Pt) => p.Y)); "
+            "return 0; end Main; end C;"),
+        "1\n30\n");
+}
+
+BEZEL_TEST(array_minmax_value_elem_result_type_8092,
+           fixfwd_selector_variants_over_noncomparable_record) {
+    BEZEL_EXPECT_EQ(
+        out("module M; public record Pt(X: int, Y: int); "
+            "public class C "
+            "public static method Lo(src: IEnumerable<Pt>): int "
+            "return src.Min(lambda(p: Pt) => p.X); end Lo; "
+            "public static method Main(): int "
+            "var a: Array<Pt> := [new Pt(3, 30), new Pt(1, 10), "
+            "new Pt(2, 20)]; "
+            "Console.WriteLine(a.Where(lambda(p: Pt) => p.X > 1)"
+            ".Min(lambda(p: Pt) => p.X)); "
+            "Console.WriteLine(Lo(a)); "
+            "Console.WriteLine(a.Sum(lambda(p: Pt) => p.Y)); "
+            "return 0; end Main; end C;"),
+        "2\n1\n60\n");
+}
+
+// The no-selector form over the same non-comparable record stays REFUSED
+// (stdlib §5.1 `where T: IComparable<T>`), with a located diagnostic.
+BEZEL_TEST(array_minmax_value_elem_result_type_8092,
+           fixfwd_noselector_over_noncomparable_record_still_refused) {
+    auto r = runAot(
+        "module M; public record Pt(X: int, Y: int); "
+        "public class C "
+        "public static method Main(): int "
+        "var a: Array<Pt> := [new Pt(3, 30), new Pt(1, 10)]; "
+        "Console.WriteLine(a.Min().X); return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool saw = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("Min() without a selector requires the element "
+                           "type to implement IComparable<T>") !=
+            std::string::npos)
+            saw = true;
+    BEZEL_EXPECT_TRUE(saw);
+}
+
+// F4: `record A(...): IComparable<B>` is not an `IComparable<A>` (spec §14.2;
+// stdlib §2.8: CompareTo takes `other: T`). The name-only conformance test
+// admitted it and the compiler ABORTED in IR verification; it is now refused
+// with a real diagnostic.
+BEZEL_TEST(array_minmax_value_elem_result_type_8092,
+           fixfwd_record_icomparable_of_other_type_is_refused_not_crashed) {
+    auto r = runAot(
+        "module M; public record B(y: int); "
+        "record A(x: int): IComparable<B> "
+        "  public method CompareTo(other: B): int => x - other.y; "
+        "end A; "
+        "public class C "
+        "public static method Main(): int "
+        "var a: Array<A> := [new A(3), new A(1)]; "
+        "Console.WriteLine(a.Min().x); return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool saw = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("A does not implement IComparable<T>") !=
+            std::string::npos)
+            saw = true;
+    BEZEL_EXPECT_TRUE(saw);
+}

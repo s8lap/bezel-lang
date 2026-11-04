@@ -6190,7 +6190,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // ICmp instruction are not of the same type!" — so the
                 // compiler ABORTED on a program stdlib §5.1 admits).
                 //
-                // The ordering is the RECORD's own `CompareTo` (stdlib §2.8's
+                // The ordering is the RECORD's own comparison method (stdlib §2.8's
                 //     public interface IComparable<T>
                 //       method CompareTo(other: T): int;
                 //     end IComparable;
