@@ -16375,7 +16375,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     auto* fabsFn = llvm::Intrinsic::getOrInsertDeclaration(
                         module_.get(), llvm::Intrinsic::fabs,
                         {arg->getType()});
-                    return builder_.CreateCall(fabsFn, {arg}, "abs.result");
+                    llvm::Value* r =
+                        builder_.CreateCall(fabsFn, {arg}, "abs.result");
+                    // fix #7061 (stdlib §2.2): a float argument resolves to
+                    // Abs(double), so the result is widened to double.
+                    if (arg->getType()->isFloatTy())
+                        r = builder_.CreateFPExt(r, llvm::Type::getDoubleTy(llvm_),
+                                                 "abs.widen");
+                    return r;
                 }
                 // fix #6297 (stdlib §2.2 `Abs(x: decimal): decimal`): a decimal
                 // is a STRUCT, so the integer MinValue/negate path below emitted

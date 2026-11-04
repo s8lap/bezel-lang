@@ -19245,7 +19245,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 ma->member == "DivRem" ||
                                 ma->member == "Min" || ma->member == "Max" ||
                                 ma->member == "Clamp") {
-                                ctx_.setExprType(&ce, argTy);
+                                // fix #7061 (stdlib §2.2, §14.5, v0.355): Abs
+                                // declares int/long/double/decimal only, so a
+                                // `float` argument resolves to Abs(double)
+                                // by float->double widening and the result is
+                                // `double`, never `float`. Min/Max/Clamp<T>
+                                // are generic and keep T = float.
+                                if (ma->member == "Abs" &&
+                                    argTy->primitive == PrimitiveType::Float)
+                                    ctx_.setExprType(&ce, ctx_.primitiveTypeRef(
+                                        PrimitiveType::Double));
+                                else
+                                    ctx_.setExprType(&ce, argTy);
                             }
                         }
                     }

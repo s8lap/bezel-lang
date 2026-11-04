@@ -137,7 +137,7 @@ BEZEL_TEST(math_narrowed_result_7460,
     BEZEL_EXPECT_EQ(runAotOut(prog(
                         "    var f: float? := -4.5f; "
                         "    var l: long? := -3L; "
-                        "    var a: float := Math.Abs(f); "
+                        "    var a: double := Math.Abs(f); "
                         "    var b: long := Math.Abs(l); "
                         "    Console.WriteLine(a); "
                         "    Console.WriteLine(b);")),
