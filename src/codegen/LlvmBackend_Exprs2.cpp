@@ -1495,6 +1495,51 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             retSemaTy = expectedFunctionType_->funcReturn;
         }
     }
+    // fix #8159 (spec §5.1 "Implicit conversions" / §27.3 "Admission at a
+    // target-typed non-call position", v0.355): a lambda literal at a
+    // target-typed position has its BODY typed at the site — "its inferred
+    // return type must equal the target's return slot or implicitly convert to
+    // it (§5.1)" — so a `float` body at a `double` return slot is WIDENED.
+    //
+    // The `retTy == i32()` sentinel test above recognizes only an `int` body as
+    // "unresolved", so a `float` (or `long`) body kept the body's own type: the
+    // closure was emitted `float (ptr, float)` while the call site called it
+    // through the `(float) -> double` function type as `double (ptr, float)`,
+    // and the f32 bits were RE-INTERPRETED as an f64 — 1.25f printed as
+    // 5.273905555e-315. The lambda's twin of the method-reference path, which
+    // is already correct: `classifyMethodRefSlot`/`applyMethodRefSlotAdapt`
+    // (§27.6) bridge the slot with `coerceNumericToType`.
+    //
+    // The rule is §5.1's TABLE, consulted through sema's one copy of it
+    // (`sema::primitiveImplicitlyWidens`), so every row that widens applies
+    // alike — `int`→`long`, `int`→`double`, `float`→`double`,
+    // `int`→`decimal`, ... — and no row that does not (a narrowing, a
+    // `decimal`↔binary-float pair, a signed/unsigned pair) can reach here.
+    //
+    // A RETURN-TYPE ASCRIPTION is not overridden: §27.3 makes the ascription
+    // "its written return type", which "must agree with the target" (§27.1.1's
+    // return rule) — so the ascription path keeps its authority (#2101), and
+    // the body's own value is widened to the ASCRIBED type below, exactly as
+    // the expression-body emit path does.
+    //
+    // The widening itself is materialized where the body's value is returned
+    // (`coerceExprValueToSlot` → `coerceNumericToType` for the expression
+    // body, `coerceExprValueToSlot` against `currentFn_->getReturnType()` for
+    // the block body) — the same helper the direct-call path uses.
+    if (!lam.retType && expectedFunctionType_ && expectedFunctionType_->funcReturn &&
+        retSemaTy) {
+        const sema::TypeRef* expectedRet = expectedFunctionType_->funcReturn;
+        llvm::Type* expectedTy = lowerTypeRef(expectedRet);
+        if (expectedTy != retTy && !expectedRet->nullable && !retSemaTy->nullable &&
+            retSemaTy->kind == sema::TypeRef::Kind::Primitive &&
+            expectedRet->kind == sema::TypeRef::Kind::Primitive &&
+            retSemaTy->primitive != expectedRet->primitive &&
+            sema::primitiveImplicitlyWidens(retSemaTy->primitive,
+                                            expectedRet->primitive)) {
+            retTy = expectedTy;
+            retSemaTy = expectedRet;
+        }
+    }
     // fix #543 / §7 / §17.14: when expectedFunctionType_ declares a NULLABLE
     // VALUE return type (T?), but the body-inferred retTy is NOT the matching
     // tagged struct (e.g. it is the bare underlying record struct or a reference
