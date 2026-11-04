@@ -264,3 +264,228 @@ BEZEL_TEST(json_skip_and_separator_8128,
             "end Main; end C;"),
         42);
 }
+
+// ===========================================================================
+// #8129 — the JSON member / element SEPARATORS.
+//
+// stdlib §2.15 (v0.355) maps the token stream to JSON — RFC 8259 — whose
+// grammar puts a VALUE in exactly three places: after ':' (a member's value),
+// after ',' (a later element or member) and after '[' (an array's first
+// element).  A value that directly follows another value is malformed input,
+// and §2.15's "Errors" paragraph says malformed input raises
+// SerializationException.
+//
+// The rows below pin that rule for the READ path:
+//
+//   * a member value followed by a stray value (`{"V": 1 2}`) raises;
+//   * an array element followed by a stray value (`[1 2]`) raises;
+//   * a member name that directly follows a member value (`{"V": 1 "W": 2}`)
+//     raises;
+//   * and the well-formed shapes — a member value, a nested object, a nested
+//     array, and the whitespace variants — are still admitted.
+//
+// The exit status is 42 when the read raised SerializationException and 1 when
+// it succeeded (an uncaught exception of any other type aborts the program
+// with its own status, so it can never be read as a "raised" verdict).
+// ===========================================================================
+
+// The record whose single field is a double, the record whose single field is
+// a two-element inline array (the collection component §9.8 admits: "a
+// non-owning inline array [N]T … whose element type is eligible") and the
+// record with TWO fields (so a second member's NAME is well-formed and only
+// the separator between the members is at fault).
+const char* kDoubleRecord = "record RD(V: double): ISerializable, IDeserializable; ";
+const char* kArrayRecord = "record RA(V: [2]double): ISerializable, IDeserializable; ";
+const char* kTwoFieldRecord =
+    "record RD2(V: double, W: double): ISerializable, IDeserializable; ";
+
+// A program that reads `json` into the record `recName` (declared by
+// `decls`), prints `show` (an expression over the read value `v`) and returns
+// 1 when the read succeeded, 42 when it raised SerializationException.
+std::string readProgram(const std::string& decls, const std::string& recName,
+                         const std::string& json, const std::string& show) {
+    return std::string("module M; ") + kImport + decls +
+           "class C public static method Main(): int "
+           "  using var d := new JsonDeserializer(" + lit(json) + "); "
+           "  try "
+           "    var v := " + recName + ".Deserialize(d); "
+           "    Console.WriteLine(" + show + "); "
+           "    return 1; "
+           "  catch SerializationException => return 42; end; "
+           "end Main; end C;";
+}
+
+// The same, but with an explicit JsonOptions so that the
+// AllowTrailingCommas option can be exercised.
+std::string readProgramOpts(const std::string& decls, const std::string& recName,
+                            const std::string& json, const std::string& show,
+                            bool allowTrailingCommas) {
+    return std::string("module M; ") + kImport + decls +
+           "class C public static method Main(): int "
+           "  using var d := new JsonDeserializer(" + lit(json) + ", "
+           "new JsonOptions(false, 2, " +
+           (allowTrailingCommas ? "true" : "false") + ", false, 64)); "
+           "  try "
+           "    var v := " + recName + ".Deserialize(d); "
+           "    Console.WriteLine(" + show + "); "
+           "    return 1; "
+           "  catch SerializationException => return 42; end; "
+           "end Main; end C;";
+}
+
+// A member value followed by a stray value: `{"V": 1 2}` is not a JSON text,
+// so the read must raise.
+BEZEL_TEST(json_skip_and_separator_8128,
+           object_member_separator_is_enforced_spec_2_15) {
+    BEZEL_EXPECT_EQ(
+        run(readProgram(kDoubleRecord, "RD", "{\"V\": 1 2}", "v.V.ToString()")),
+        42);
+}
+
+// A member name that directly follows a member's value: `{"V": 1 "W": 2}` is
+// not a JSON text either — the members are not separated by ','.  (Both
+// members are declared, so the ONLY thing wrong with the input is the missing
+// separator.)
+BEZEL_TEST(json_skip_and_separator_8128,
+           object_member_name_must_follow_a_separator_spec_2_15) {
+    BEZEL_EXPECT_EQ(
+        run(readProgram(kTwoFieldRecord, "RD2", "{\"V\": 1 \"W\": 2}",
+                        "v.W.ToString()")),
+        42);
+}
+
+// An array element followed by a stray value: `[1 2]` is not a JSON text, so
+// the read of an inline-array component must raise.
+BEZEL_TEST(json_skip_and_separator_8128,
+           array_element_separator_is_enforced_spec_2_15) {
+    BEZEL_EXPECT_EQ(
+        run(readProgram(kArrayRecord, "RA", "{\"V\": [1 2]}",
+                        "v.V[0].ToString() + \",\" + v.V[1].ToString()")),
+        42);
+}
+
+// The well-formed shapes are still admitted: a member value, a nested object,
+// a nested array, and the whitespace variants of each.  (The nested-array row
+// is a BEHAVIOUR CHANGE: pre-fix the inline-array READ path did not take the
+// ',' between the elements, so the VALID `{"V": [1, 2]}` was rejected while
+// the INVALID `{"V": [1 2]}` was accepted.)
+BEZEL_TEST(json_skip_and_separator_8128,
+           well_formed_json_structures_are_still_admitted_spec_2_15) {
+    // A member value.
+    BEZEL_EXPECT_EQ(
+        run(readProgram(kDoubleRecord, "RD", "{\"V\": 1}", "v.V.ToString()")),
+        1);
+    // Whitespace variants of the same shape.
+    BEZEL_EXPECT_EQ(
+        run(readProgram(kDoubleRecord, "RD", "{ \"V\" : 1 }", "v.V.ToString()")),
+        1);
+    BEZEL_EXPECT_EQ(
+        run(readProgram(kDoubleRecord, "RD", "{\"V\":1}", "v.V.ToString()")),
+        1);
+    BEZEL_EXPECT_EQ(
+        run(readProgram(kDoubleRecord, "RD", "{\n  \"V\": 1\n}", "v.V.ToString()")),
+        1);
+    // A nested object: `{"P": {"A": 4}, "K": 5}`.
+    BEZEL_EXPECT_EQ(
+        run(readProgram(
+            "record Inner(A: int): ISerializable, IDeserializable; "
+            "record Outer(P: Inner, K: int): ISerializable, IDeserializable; ",
+            "Outer", "{\"P\": {\"A\": 4}, \"K\": 5}", "v.K.ToString()")),
+        1);
+    // A nested array: `{"V": [1, 2]}` — the ',' between the elements is the
+    // array's separator and must be taken by the reader.
+    BEZEL_EXPECT_EQ(
+        run(readProgram(kArrayRecord, "RA", "{\"V\": [1, 2]}",
+                        "v.V[0].ToString() + \",\" + v.V[1].ToString()")),
+        1);
+    // Whitespace variant of the nested array.
+    BEZEL_EXPECT_EQ(
+        run(readProgram(kArrayRecord, "RA", "{\"V\": [ 1 , 2 ]}",
+                        "v.V[0].ToString() + \",\" + v.V[1].ToString()")),
+        1);
+}
+
+// A trailing comma in an object is malformed input and must raise (the
+// default JsonOptions has AllowTrailingCommas = false).
+BEZEL_TEST(json_skip_and_separator_8128,
+           trailing_comma_in_an_object_is_rejected_spec_2_15) {
+    BEZEL_EXPECT_EQ(
+        run(readProgram(kDoubleRecord, "RD", "{\"V\": 1,}", "v.V.ToString()")),
+        42);
+}
+
+// A trailing comma inside an inline array belongs to THE ARRAY, so the
+// AllowTrailingCommas option decides its fate: with the option set it is
+// tolerated (the array consumes it), with the default (false) it is rejected.
+//
+// On the base the whole inline array was rejected before this question could
+// arise ("Expected JSON integer" — the base's reader never took the ','), so
+// the option never applied to an inline array at all.
+BEZEL_TEST(json_skip_and_separator_8128,
+           trailing_comma_in_an_inline_array_follows_the_option_spec_2_15) {
+    // Tolerated: AllowTrailingCommas = true.
+    BEZEL_EXPECT_EQ(
+        run(readProgramOpts(kArrayRecord, "RA", "{\"V\": [1, 2,]}",
+                            "v.V[0].ToString() + \",\" + v.V[1].ToString()",
+                            true)),
+        1);
+    // Rejected: the default (AllowTrailingCommas = false).
+    BEZEL_EXPECT_EQ(
+        run(readProgramOpts(kArrayRecord, "RA", "{\"V\": [1, 2,]}",
+                            "v.V[0].ToString() + \",\" + v.V[1].ToString()",
+                            false)),
+        42);
+}
+
+// A stray value where a member NAME is expected (`{"U": 1,2, "W":1}` with the
+// unknown field admitted) is malformed input and must raise.
+//
+// NOTE (a fact about the BASE, measured before any change): this input is
+// ALREADY rejected on the base — the stray `2` lands where a member name is
+// expected and the name parse raises "Expected '\"' in JSON string (§2.15)".
+// #8129's second bullet claims it "is accepted"; that claim is FALSE on this
+// base (the reviewer's own probe output agrees), so this row is a GUARD (it
+// must keep raising), not a RED row.
+BEZEL_TEST(json_skip_and_separator_8128,
+           stray_value_where_a_member_name_is_expected_is_rejected_spec_2_15) {
+    BEZEL_EXPECT_EQ(
+        run(std::string("module M; ") + kImport + kRecord +
+            "class C public static method Main(): int "
+            "  using var d := new JsonDeserializer(" +
+            lit("{\"U\": 1,2, \"W\":1}") + ", "
+            "new JsonOptions(false, 2, false, true, 64)); "
+            "  try "
+            "    var v := RS.Deserialize(d); "
+            "    return 1; "
+            "  catch SerializationException => return 42; end; "
+            "end Main; end C;"),
+        42);
+}
+
+// ===========================================================================
+// The AGENT PATH's multi-value idiom must keep working.
+//
+// stdlib §2.15 (v0.355) "Errors": "the agent path deliberately leaves
+// remaining input unread and never faults on it — the cursor may rest
+// mid-stream for a subsequent read, which is exactly how a multi-value stream
+// is read".
+//
+// The separator rule therefore applies only INSIDE a container: at the top
+// level of the stream two values may follow one another with nothing but
+// whitespace between them.  This row is a GUARD — it must keep reading both
+// values (it is GREEN on both arms).
+// ===========================================================================
+BEZEL_TEST(json_skip_and_separator_8128,
+           agent_path_multi_value_stream_still_reads_spec_2_15) {
+    BEZEL_EXPECT_EQ(
+        run(std::string("module M; ") + kImport +
+            "class C public static method Main(): int "
+            "  using var d := new JsonDeserializer(\"1 2\"); "
+            "  try "
+            "    var a := int(d.ReadInt()); "
+            "    var b := int(d.ReadInt()); "
+            "    return (if a = 1 and b = 2 then 42 else 1); "
+            "  catch SerializationException => return 3; end; "
+            "end Main; end C;"),
+        42);
+}

@@ -779,6 +779,20 @@ struct bz_binder_t {
     int8_t         allow_trailing_commas;  // tolerate trailing comma in JSON objects/arrays
     int32_t        max_depth;              // nesting guard (0 = unlimited)
 
+    // fix #8129 / stdlib §2.15 (v0.355) "Errors": the JSON container nesting
+    // depth.  A JSON value that appears INSIDE a container must be preceded by
+    // the container's separator — ',' between elements or members, ':' before
+    // a member's value, '[' before an array's first element — so a value that
+    // directly follows another value is malformed input and raises
+    // SerializationException.  A value at the TOP level of the stream may
+    // follow another value with only whitespace between them: that is the
+    // agent path's multi-value idiom ("the cursor may rest mid-stream for a
+    // subsequent read, which is exactly how a multi-value stream is read",
+    // stdlib §2.15 "Errors"), so the rule applies only below depth 1.
+    // Incremented by bz_binder_begin_object / bz_binder_begin_array and
+    // decremented by bz_binder_end_object / bz_binder_end_array.
+    int32_t        json_depth;
+
     // §2.15 v0.139 JSON graph-identity: set to 1 when bz_binder_read_graph_marker
     // has already consumed the opening `{` of an inline object (and the `"$id":n,`
     // pseudo-field).  bz_binder_begin_object checks this flag and, when set,
@@ -1071,6 +1085,107 @@ static void bz_ser_throw_at_binary(const char* msg, int64_t offset) {
     bz_ser_throw_at_json((msg), (d)); \
     return (ret); \
 } while(0)
+
+// ---------------------------------------------------------------------------
+// fix #8129 / stdlib §2.15 (v0.355) "Errors": the JSON STRUCTURE rules.
+//
+//   "**Errors.** Malformed input, type mismatches (a `ReadInt` when the next
+//   token is a string), and depth-limit violations raise
+//   `SerializationException` (declared in `System.Serialization`). Trailing
+//   data is the **whole-document** read forms' condition: the facades' reads
+//   assert document exhaustion and raise it (above), while the agent path
+//   deliberately leaves remaining input unread and never faults on it — the
+//   cursor may rest mid-stream for a subsequent read, which is exactly how a
+//   multi-value stream is read — and deserializer disposal never raises."
+//
+// §2.15 maps the token stream to JSON — RFC 8259 — whose grammar puts a
+// VALUE in exactly three places: after ':' (a member's value), after ',' (a
+// later element or member) and after '[' (an array's first element).  A
+// value that directly follows another value — `{"V": 1 2}`, `[1 2]` — is
+// therefore malformed input and must raise.
+//
+// The two helpers below implement that rule for the READ path (the SKIP path
+// has always enforced it: bz_jder_skip_value_impl's object/array loops
+// require ',' or the closing bracket after each value).
+// ---------------------------------------------------------------------------
+
+// The byte before `pos`, skipping whitespace backwards (the inverse of
+// bz_jder_skip_ws).  Returns -1 when there is none (pos is at the very start
+// of the input).
+static int bz_jder_prev_nonspace(const bz_binder_t* d, int64_t pos) {
+    while (pos > 0) {
+        const uint8_t c = d->data[pos - 1];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { --pos; continue; }
+        return (int)c;
+    }
+    return -1;
+}
+
+// Take the separator that precedes a JSON value at the current position.
+//
+// The separator itself (the ',') is CONSUMED here: the array-element path
+// reads N elements back-to-back with no container-level call in between (the
+// synthesized inline-array reader in LlvmBackend_Serialization.cpp), so the
+// element separator has to be taken by the value reader.
+//
+// The position rules, per RFC 8259 (the JSON text §2.15 maps the token stream
+// to):
+//
+//   * a ',' at the current position is the element/member separator.  It is
+//     legal only where a VALUE has just been read — inside a container.  At
+//     the top level of the stream there is no separator (the agent path's
+//     multi-value idiom separates values with whitespace alone), and a ','
+//     that follows '[' or ':' is a stray comma.
+//   * otherwise the value must directly follow '[' (an array's first element),
+//     ':' (an object member's value) or ',' (a separator already consumed by
+//     the caller — bz_binder_try_read_null consumes the ',' so it can see the
+//     "null" token that may follow it).
+//
+// Returns true when the position is a legal value position.  On a malformed
+// position it raises SerializationException (located at the value) and returns
+// false — and it NEVER raises over an exception that is already in flight
+// (bz_ser_throw overwrites the thread-local bz_exc slot with no regard for
+// what was there, orphaning the first exception object — the #8128 leak).
+static bool bz_jder_take_value_separator(bz_binder_t* d) {
+    extern thread_local void* bz_exc;
+    if (bz_exc) return false;
+    bz_jder_skip_ws(d);
+    const int prev = bz_jder_prev_nonspace(d, d->pos);
+    if (d->pos < d->len && d->data[d->pos] == ',') {
+        // A ',' here separates two values.  It is legal only inside a
+        // container, where a value has just been read — and never directly
+        // after '[' or ':' (a stray comma).
+        if (d->json_depth <= 0 || prev == '[' || prev == ':') {
+            bz_ser_throw_at_json("Unexpected ',' in JSON (§2.15)", d);
+            return false;
+        }
+        ++d->pos;                      // the element / member separator
+        bz_jder_skip_ws(d);
+        return true;
+    }
+    // The top level of the stream: values may follow one another with only
+    // whitespace between them (the agent path's multi-value idiom).
+    if (d->json_depth <= 0) return true;
+    // Inside a container: the value must follow '[' (an array's first element),
+    // ':' (an object member's value) or a ',' (already consumed by the
+    // caller).  Anything else means the value directly follows another value
+    // — malformed input.
+    if (prev == '[' || prev == ':' || prev == ',') return true;
+    bz_ser_throw_at_json("Expected ',' or ':' before a JSON value (§2.15)", d);
+    return false;
+}
+
+// The member NAME position: a name must be preceded by '{' (the object's
+// first member) or by ',' (a later one) — RFC 8259's object grammar.  A name
+// that directly follows a member's VALUE (`{"V": 1 "W": 2}`) is malformed
+// input.
+//
+// The ',' itself is consumed by bz_binder_read_field_name before the name is
+// read, so the backward scan finds it.
+static bool bz_jder_member_name_preceded_ok(const bz_binder_t* d) {
+    const int prev = bz_jder_prev_nonspace(d, d->pos);
+    return prev == '{' || prev == ',';
+}
 
 // Expect a specific character, skip ws first, advance pos.
 // Returns true on success, throws otherwise.
@@ -1466,7 +1581,9 @@ static void bz_jder_skip_value(bz_binder_t* d) {
 // Parse a JSON number as a 64-bit integer.
 // Advances pos past the number. Throws on non-number token.
 static int64_t bz_jder_parse_int(bz_binder_t* d) {
-    bz_jder_skip_ws(d);
+    // fix #8129 / stdlib §2.15: a value may only appear where RFC 8259's
+    // grammar allows one (after ':', after ',' or after '[').
+    if (!bz_jder_take_value_separator(d)) return 0;
     if (d->pos >= d->len) {
         bz_ser_throw_at_json("Expected JSON number, got end of input (§2.15)", d);
         return 0;
@@ -1510,7 +1627,9 @@ static int64_t bz_jder_parse_int(bz_binder_t* d) {
 }
 
 static uint64_t bz_jder_parse_uint(bz_binder_t* d) {
-    bz_jder_skip_ws(d);
+    // fix #8129 / stdlib §2.15: a value may only appear where RFC 8259's
+    // grammar allows one (after ':', after ',' or after '[').
+    if (!bz_jder_take_value_separator(d)) return 0;
     if (d->pos >= d->len) {
         bz_ser_throw_at_json("Expected JSON unsigned integer (§2.15)", d);
         return 0;
@@ -1554,7 +1673,9 @@ static uint64_t bz_jder_parse_uint(bz_binder_t* d) {
 }
 
 static double bz_jder_parse_float(bz_binder_t* d) {
-    bz_jder_skip_ws(d);
+    // fix #8129 / stdlib §2.15: a value may only appear where RFC 8259's
+    // grammar allows one (after ':', after ',' or after '[').
+    if (!bz_jder_take_value_separator(d)) return 0.0;
     if (d->pos >= d->len) {
         bz_ser_throw_at_json("Expected JSON number (float), got end of input (§2.15)", d);
         return 0.0;
@@ -1588,7 +1709,9 @@ static double bz_jder_parse_float(bz_binder_t* d) {
 // Parse a JSON number as a decimal, returns a pointer to a thread-local bz_decimal_t.
 // §2.15: "WriteDecimal produces a JSON number written without precision loss."
 static void* bz_jder_parse_decimal(bz_binder_t* d) {
-    bz_jder_skip_ws(d);
+    // fix #8129 / stdlib §2.15: a value may only appear where RFC 8259's
+    // grammar allows one (after ':', after ',' or after '[').
+    if (!bz_jder_take_value_separator(d)) return nullptr;
     if (d->pos >= d->len) {
         bz_ser_throw_at_json("Expected JSON decimal number, got end of input (§2.15)", d);
         return nullptr;
@@ -1799,7 +1922,9 @@ void* bz_binder_read_decimal(void* derp) {
 int8_t bz_binder_read_bool(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
     if (d->kind >= 1) {
-        bz_jder_skip_ws(d);
+        // fix #8129 / stdlib §2.15: a value may only appear where RFC 8259's
+        // grammar allows one (after ':', after ',' or after '[').
+        if (!bz_jder_take_value_separator(d)) return 0;
         if (d->pos + 4 <= d->len && memcmp(d->data + d->pos, "true", 4) == 0) {
             d->pos += 4; return 1;
         }
@@ -1825,7 +1950,9 @@ int8_t bz_binder_read_bool(void* derp) {
 void* bz_binder_read_string(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
     if (d->kind >= 1) {
-        bz_jder_skip_ws(d);
+        // fix #8129 / stdlib §2.15: a value may only appear where RFC 8259's
+        // grammar allows one (after ':', after ',' or after '[').
+        if (!bz_jder_take_value_separator(d)) return nullptr;
         return bz_jder_parse_string(d);
     }
     return bz_binder_read_bz_string(d);
@@ -1835,7 +1962,9 @@ int32_t bz_binder_read_char(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
     if (d->kind >= 1) {
         // Parse a one-character JSON string.
-        bz_jder_skip_ws(d);
+        // fix #8129 / stdlib §2.15: a value may only appear where RFC 8259's
+        // grammar allows one (after ':', after ',' or after '[').
+        if (!bz_jder_take_value_separator(d)) return 0;
         int64_t ncp = 0;
         uint32_t* cps = bz_jder_parse_string_cps(d, &ncp);
         if (!cps) return 0;
@@ -1863,7 +1992,12 @@ int32_t bz_binder_read_char(void* derp) {
 int8_t bz_binder_try_read_null(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
     if (d->kind >= 1) {
-        bz_jder_skip_ws(d);
+        // fix #8129 / stdlib §2.15: a value may only appear where RFC 8259's
+        // grammar allows one (after ':', after ',' or after '[').  `null` is a
+        // value, so it takes the separator like any other; when the token
+        // turns out not to be "null" the caller reads the real value at the
+        // position the separator left behind.
+        if (!bz_jder_take_value_separator(d)) return 0;
         if (d->pos + 4 <= d->len && memcmp(d->data + d->pos, "null", 4) == 0) {
             d->pos += 4; return 1;
         }
@@ -1949,6 +2083,7 @@ int32_t bz_binder_begin_object(void* derp) {
         // bz_binder_read_poly_discriminator ('{' already consumed).
         if (d->kind >= 1) {
             d->json_obj_preread = 0;  // already cleared (we return n directly)
+            ++d->json_depth;          // fix #8129: the object is open
         }
         return n;
     }
@@ -1965,16 +2100,22 @@ int32_t bz_binder_begin_object(void* derp) {
         if (d->json_obj_preread) {
             d->json_obj_preread = 0;
             d->in_object = true;
+            ++d->json_depth;            // fix #8129: the object is open
             int32_t cnt = bz_jder_count_object_fields(d);
             return cnt;
         }
-        bz_jder_skip_ws(d);
+        // fix #8129 / stdlib §2.15: the object is a VALUE, so it may only
+        // appear where RFC 8259's grammar allows one (after ':', after ','
+        // or after '[') — and the ',' that separates it from a previous
+        // element is taken here.
+        if (!bz_jder_take_value_separator(d)) return -1;
         if (d->pos >= d->len || d->data[d->pos] != '{') {
             bz_ser_throw_at_json("Expected '{' in JSON object (§2.15)", d);
             return -1;
         }
         ++d->pos;  // skip '{'
         d->in_object = true;
+        ++d->json_depth;                // fix #8129: the object is open
         int32_t cnt = bz_jder_count_object_fields(d);
         return cnt;
     }
@@ -2049,6 +2190,17 @@ void* bz_binder_read_field_name(void* derp) {
         if (d->pos >= d->len || d->data[d->pos] == '}') {
             return nullptr;  // null → truncated-input path in synthesized deserializer
         }
+        // fix #8129 / stdlib §2.15: a member name may only appear where RFC
+        // 8259's object grammar allows one — right after '{' (the first
+        // member) or after ',' (a later one).  A name that directly follows a
+        // member's VALUE (`{"V": 1 "W": 2}`) is malformed input and raises
+        // SerializationException.  (A stray VALUE where a name is expected —
+        // `{"V": 1, 2}` — is rejected by the name parse itself, which raises
+        // "Expected '\"' in JSON string (§2.15)".)
+        if (!bz_jder_member_name_preceded_ok(d)) {
+            bz_ser_throw_at_json("Expected ',' or '{' before a JSON object member (§2.15)", d);
+            return nullptr;
+        }
         // Parse the key string.
         void* key = bz_jder_parse_string(d);
         if (!key) return nullptr;
@@ -2085,6 +2237,7 @@ void bz_binder_skip_value(void* derp) {
 void bz_binder_end_object(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
     if (d->kind >= 1) {
+        extern thread_local void* bz_exc;
         // Skip ws and consume '}'.
         bz_jder_skip_ws(d);
         // §2.15 JsonOptions.AllowTrailingCommas: a trailing comma immediately
@@ -2094,13 +2247,33 @@ void bz_binder_end_object(void* derp) {
             if (!d->allow_trailing_commas) {
                 bz_ser_throw_at_json("Trailing comma in JSON object (§2.15)", d);
                 d->in_object = false;
+                if (d->json_depth > 0) --d->json_depth;
                 return;
             }
             ++d->pos;  // skip trailing comma
             bz_jder_skip_ws(d);
         }
-        if (d->pos < d->len && d->data[d->pos] == '}') ++d->pos;
+        if (d->pos < d->len && d->data[d->pos] == '}') {
+            ++d->pos;
+            d->in_object = false;
+            if (d->json_depth > 0) --d->json_depth;
+            return;
+        }
+        // fix #8129 / stdlib §2.15: the object must be closed by '}'.  A member
+        // value that is followed by anything else — a stray value
+        // (`{"V": 1 2}`), a missing '}' — is malformed input and raises
+        // SerializationException ("Malformed input … raise
+        // SerializationException").  The raise is suppressed when an exception
+        // is already in flight (the truncated-input path raises inside
+        // bz_jder_count_object_fields): bz_ser_throw overwrites the
+        // thread-local bz_exc slot with no regard for what was there, so a
+        // second raise would orphan (leak) the first exception object — the
+        // #2427 / #8128 pattern.
+        if (!bz_exc) {
+            bz_ser_throw_at_json("Expected '}' in JSON object (§2.15)", d);
+        }
         d->in_object = false;
+        if (d->json_depth > 0) --d->json_depth;
         return;
     }
     d->in_object = false;
@@ -2110,7 +2283,13 @@ void bz_binder_end_object(void* derp) {
 int32_t bz_binder_begin_array(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
     if (d->kind >= 1) {
+        // fix #8129 / stdlib §2.15: the array is a VALUE, so it may only
+        // appear where RFC 8259's grammar allows one (after ':', after ','
+        // or after '[') — and the ',' that separates it from a previous
+        // element is taken here.
+        if (!bz_jder_take_value_separator(d)) return -1;
         if (!bz_jder_expect_char(d, '[')) return -1;
+        ++d->json_depth;   // fix #8129: the array is open
         return -1;  // count unknown
     }
     uint32_t cnt = 0;
@@ -2134,7 +2313,23 @@ void bz_binder_end_array(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
     if (d->kind >= 1) {
         bz_jder_skip_ws(d);
+        // fix #8129 / stdlib §2.15 JsonOptions.AllowTrailingCommas: a trailing
+        // comma immediately before the ']' belongs to THIS array.  When the
+        // option tolerates it, the array consumes it HERE: leaving it behind
+        // would make the ENCLOSING object report it as its own trailing comma
+        // (and, with the '}' now required, as a missing '}' — a misleading
+        // diagnostic for a JSON text the option says to accept).
+        //
+        // When the option does NOT tolerate it, the comma is left where it is
+        // (the pre-existing behaviour): the enclosing object's trailing-comma
+        // check reports it, and an agent-path EndArray that stops short of
+        // the ']' is not turned into a new rejection here.
+        if (d->pos < d->len && d->data[d->pos] == ',' && d->allow_trailing_commas) {
+            ++d->pos;  // skip the tolerated trailing comma
+            bz_jder_skip_ws(d);
+        }
         if (d->pos < d->len && d->data[d->pos] == ']') ++d->pos;
+        if (d->json_depth > 0) --d->json_depth;   // fix #8129: the array is closed
         return;
     }
     /* no trailer */
