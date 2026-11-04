@@ -13755,31 +13755,90 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // verification). When the symbol carries no
                             // parallel `baseTypeRefs` entry the name-only
                             // answer stands.
+                            // The conformance may come through an interface
+                            // that EXTENDS `IComparable<T>` (spec §11 rule 2,
+                            // v0.355: "lists I (or any interface extending
+                            // I)"), so the closure walk
+                            // `inheritsBuiltinInterface` answers the name
+                            // question and `selfArgReaches` below follows the
+                            // type argument through each extending interface
+                            // (#8139).
                             bool userRecordComparable =
-                                userRecordElem && declaresBuiltinInterface(
+                                userRecordElem && inheritsBuiltinInterface(
                                     elem->declaration, "IComparable");
                             if (userRecordComparable) {
                                 const TypeSymbol* rs = elem->declaration;
-                                bool selfArg = false;
-                                for (std::size_t bi = 0;
-                                     bi < rs->baseTypes.size(); ++bi) {
-                                    const TypeSymbol* b = rs->baseTypes[bi];
-                                    if (!b || !b->isSynthesizedBuiltinInterface ||
-                                        b->name != "IComparable") continue;
-                                    if (bi >= rs->baseTypeRefs.size() ||
-                                        !rs->baseTypeRefs[bi] ||
-                                        rs->baseTypeRefs[bi]->genericArgs
-                                            .size() != 1) {
-                                        selfArg = true;  // unknown: keep
-                                        continue;
+                                std::unordered_set<const TypeSymbol*> onPath;
+                                // `sym`'s IComparable argument, with `sym`'s own
+                                // type parameters replaced by `inst` (the
+                                // arguments `sym` was listed with).
+                                std::function<bool(
+                                    const TypeSymbol*,
+                                    const std::vector<const TypeRef*>&)>
+                                    selfArgReaches =
+                                    [&](const TypeSymbol* sym,
+                                        const std::vector<const TypeRef*>& inst)
+                                    -> bool {
+                                    if (!onPath.insert(sym).second) return false;
+                                    auto subst = [&](const TypeRef* t)
+                                        -> const TypeRef* {
+                                        if (t && t->kind == TypeRef::Kind::Named &&
+                                            !t->declaration &&
+                                            t->genericArgs.empty()) {
+                                            for (std::size_t k = 0;
+                                                 k < sym->genericParams.size() &&
+                                                 k < inst.size(); ++k)
+                                                if (sym->genericParams[k] &&
+                                                    sym->genericParams[k]->name ==
+                                                        t->headName())
+                                                    return inst[k];
+                                        }
+                                        return t;
+                                    };
+                                    bool found = false;
+                                    for (std::size_t bi = 0;
+                                         bi < sym->baseTypes.size() && !found;
+                                         ++bi) {
+                                        const TypeSymbol* b = sym->baseTypes[bi];
+                                        if (!b) continue;
+                                        const bool isIComp =
+                                            b->isSynthesizedBuiltinInterface &&
+                                            b->name == "IComparable";
+                                        const bool isUserIface =
+                                            !b->isSynthesizedBuiltinInterface &&
+                                            b->kind ==
+                                                ast::TypeDeclKind::Interface;
+                                        if (!isIComp && !isUserIface) continue;
+                                        const TypeRef* ref =
+                                            bi < sym->baseTypeRefs.size()
+                                                ? sym->baseTypeRefs[bi]
+                                                : nullptr;
+                                        if (isIComp) {
+                                            if (!ref ||
+                                                ref->genericArgs.size() != 1) {
+                                                found = true;  // unknown: keep
+                                                continue;
+                                            }
+                                            const TypeRef* ga =
+                                                subst(ref->genericArgs[0]);
+                                            if (ga && ga->declaration == rs &&
+                                                !ga->nullable)
+                                                found = true;
+                                        } else {
+                                            if (!ref) continue;
+                                            std::vector<const TypeRef*> next;
+                                            for (const TypeRef* ga :
+                                                 ref->genericArgs)
+                                                next.push_back(subst(ga));
+                                            if (selfArgReaches(b, next))
+                                                found = true;
+                                        }
                                     }
-                                    const TypeRef* ga =
-                                        rs->baseTypeRefs[bi]->genericArgs[0];
-                                    if (ga && ga->declaration == rs &&
-                                        !ga->nullable)
-                                        selfArg = true;
-                                }
-                                userRecordComparable = selfArg;
+                                    onPath.erase(sym);
+                                    return found;
+                                };
+                                userRecordComparable = selfArgReaches(
+                                    rs, std::vector<const TypeRef*>{});
                             }
                             // A RECORD with NO `CompareTo` has NO order, so
                             // §5.1's extension does not apply to it and the
