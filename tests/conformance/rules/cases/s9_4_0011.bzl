@@ -10,6 +10,8 @@
 //! expect: reject
 //! diagnostic: receiver
 //! notes: s9_4_0002 pins the bare `X := e` spelling; this is the explicit one.
+//!   Twin s9_4_0019 (next free id; AUTHORING.md asks for adjacent ids, and renumbering
+//!   the batch would churn every cross-reference).
 module Conf;
 
 public record Tally

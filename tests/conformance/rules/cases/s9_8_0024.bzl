@@ -9,7 +9,7 @@
 //!   same reason, and is never truncated to the type's width (a JSON
 //!   `5000000000` read into an `int` component, or `300` into a `byte`
 //!   component, raises).
-//! cites: 9.8, 2.15
+//! cites: 9.8, stdlib 2.15
 //! expect: run
 //! output: SER
 //!   SER

@@ -12,7 +12,9 @@
 //! diagnostic: receiver
 //! notes: the constructor's own `Hits := hits;` is legal (s9_4_0004); only the
 //!   store inside the lambda is the defect, formed after every field is
-//!   assigned so the capture itself is an admitted read of `this`.
+//!   assigned so the capture itself is an admitted read of `this`. Twin
+//!   s9_4_0022 (next free id; AUTHORING.md asks for adjacent ids, and renumbering
+//!   the batch would churn every cross-reference).
 module Conf;
 
 public record Tally

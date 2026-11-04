@@ -12,7 +12,8 @@
 //! cites: 9.8, 35.4
 //! expect: reject
 //! diagnostic: value-like
-//! notes: twin s9_8_0043 — a value-like choice is accepted.
+//! notes: twin s9_8_0050 (next free id; AUTHORING.md asks for adjacent ids, and renumbering
+//!   the batch would churn every cross-reference).
 module Conf;
 
 public class Cell

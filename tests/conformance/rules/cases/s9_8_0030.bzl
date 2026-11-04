@@ -8,7 +8,8 @@
 //! cites: 9.8, 17.11
 //! expect: reject
 //! diagnostic: defaultable
-//! notes: twin s9_8_0003 — a nullable skipped component is accepted.
+//! notes: twin s9_8_0048 (next free id; AUTHORING.md asks for adjacent ids, and renumbering
+//!   the batch would churn every cross-reference).
 module Conf;
 
 public record Login(Id: int, Token: string serialized skip): ISerializable, IDeserializable;

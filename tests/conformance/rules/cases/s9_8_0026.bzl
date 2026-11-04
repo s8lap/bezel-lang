@@ -1,7 +1,7 @@
 //! case: s9_8_0026
 //! doc: spec
 //! section: 9.8
-//! title: an enum reads back by its serialized name, and an unmatched name raises
+//! title: an enum reads back by serialized name only, and an unmatched name raises
 //! rule: The synthesized form writes the member's serialized name as a string
 //!   (via `WriteString`) — its `serialized "<name>"` rename where one is
 //!   declared, its identifier otherwise … — and reads it back by matching
@@ -12,9 +12,10 @@
 //! output: Low
 //!   High
 //!   SER
-//! notes: deliberately does not read the renamed constant's identifier
-//!   ("Low"): whether it is accepted on read is reported as a spec question
-//!   (step 2's "every declared name maps to its value").
+//!   SER
+//! notes: "Low" is the renamed constant's identifier, not its serialized
+//!   name; the rename bullet ("serialized and deserialized under `<name>`
+//!   instead of its declared identifier") settles that it does not match.
 module Conf;
 
 import System.Serialization;
@@ -27,6 +28,7 @@ public class Program
   public static method Main()
     Show("\"lo\"");
     Show("\"High\"");
+    Show("\"Low\"");
     Show("\"Mid\"");
   end Main;
 

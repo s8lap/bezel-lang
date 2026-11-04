@@ -10,6 +10,8 @@
 //! cites: 27.5
 //! expect: reject
 //! diagnostic: receiver
+//! notes: twin s9_4_0021 (next free id; AUTHORING.md asks for adjacent ids, and renumbering
+//!   the batch would churn every cross-reference).
 module Conf;
 
 public record Tally

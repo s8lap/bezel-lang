@@ -9,8 +9,8 @@
 //! cites: 9.8
 //! expect: reject
 //! diagnostic: constructor
-//! notes: twin s9_8_0001 — `constructor(name: string, value: int)` binds
-//!   `Name`/`Value` case-insensitively and is accepted.
+//! notes: twin s9_8_0049 (next free id; AUTHORING.md asks for adjacent ids, and renumbering
+//!   the batch would churn every cross-reference).
 module Conf;
 
 public record Panel: ISerializable, IDeserializable

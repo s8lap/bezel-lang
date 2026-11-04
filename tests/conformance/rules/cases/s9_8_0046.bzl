@@ -7,7 +7,8 @@
 //! cites: 9.8, 35.1
 //! expect: reject
 //! diagnostic: rename
-//! notes: twin s9_8_0043 — a rename on a case is accepted.
+//! notes: twin s9_8_0051 (next free id; AUTHORING.md asks for adjacent ids, and renumbering
+//!   the batch would churn every cross-reference).
 module Conf;
 
 public choice Mode: ISerializable, IDeserializable

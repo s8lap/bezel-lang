@@ -6,7 +6,7 @@
 //!   component) is the one case governed by *operation* policy rather than the
 //!   synthesized code: it is an error by default and is skipped when the
 //!   deserializer is configured to ignore unknown fields (stdlib §2.15);
-//! cites: 9.8, 2.15
+//! cites: 9.8, stdlib 2.15
 //! expect: run
 //! output: ok 1 2
 //!   SER
