@@ -1212,6 +1212,158 @@ static void* bz_jder_parse_string(bz_binder_t* d) {
     return str;
 }
 
+// ---------------------------------------------------------------------------
+// THE JSON NUMBER GRAMMAR — stdlib §2.15 (v0.355).
+// ---------------------------------------------------------------------------
+//
+// stdlib §2.15, "JSON mapping" (docs/Bezel_Standard_Library.md:953):
+//
+//   "A *JSON number* is JSON's own number token (RFC 8259 §6): an optional
+//   `-`, an integer part that is `0` or a nonzero digit followed by zero or
+//   more digits, an optional fraction — a `.` and one or more digits — and an
+//   optional exponent — `e` or `E`, an optional sign, and one or more digits.
+//   Any other spelling of a number — `.5`, `5.`, `1.e3`, `+5`, `007`, `1_000`,
+//   `0x1p3` — is malformed input (**Errors** below)."
+//
+// and stdlib §2.15, "Errors" (docs/Bezel_Standard_Library.md:1073):
+//
+//   "**Errors.** Malformed input, type mismatches (a `ReadInt` when the next
+//   token is a string), and depth-limit violations raise
+//   `SerializationException` (declared in `System.Serialization`)."
+//
+// EVERY number read — int, uint, float and decimal — goes through the ONE
+// scanner below, so a token that is not a JSON number is malformed input and
+// raises SerializationException AT THE NUMBER, and a token that IS a JSON
+// number but does not fit the reader's type is a type mismatch and raises
+// SerializationException too (also at the number).
+//
+// Before this scanner the four readers each had their own ad-hoc scan, and
+// every one of them was a SUFFIX test or nothing at all: they accepted a bare
+// point (".5"), a leading "+", a leading zero followed by a digit ("007") and
+// any non-numeric junk ("nope") as a number, reading them as 0.  The float
+// reader's suffix test also read ONE BYTE BEFORE ITS BUFFER when the token
+// carried no digits at all (the token length was 0, so `buf[len - 1]` was
+// `buf[-1]`).  #7340.
+
+// What a JSON number scan found.
+struct bz_jder_num {
+    int64_t start;        // the token's first byte offset
+    int64_t len;          // the token's length in bytes
+    int64_t suffix_pos;   // the offset of the token's first byte AFTER its
+                          // integer part (the '.' or the 'e'/'E'); -1 when the
+                          // token is an integer
+    bool    negative;     // the token carried a leading '-'
+    bool    has_fraction; // the token carried a '.'
+    bool    has_exponent; // the token carried an 'e'/'E'
+};
+
+// The outcome of a JSON number scan.
+enum bz_jder_num_kind {
+    BZ_JDER_NUM_OK = 0,       // a JSON number was scanned
+    BZ_JDER_NUM_NOT_A_NUMBER, // the cursor is not on a number at all
+    BZ_JDER_NUM_MALFORMED     // it starts like one but breaks the grammar
+};
+
+// Scan the JSON number token at the cursor.  The cursor is expected to be ON
+// the token's first byte (whitespace already skipped).  On success the
+// token's text range and shape are returned and the cursor is advanced past
+// the token; on failure the cursor is left where it was, so the fault is
+// located AT THE NUMBER.
+static enum bz_jder_num_kind bz_jder_scan_number(bz_binder_t* d,
+                                                 struct bz_jder_num* out) {
+    const int64_t start = d->pos;
+    int64_t p = d->pos;
+    bool negative = false;
+    bool has_fraction = false;
+    bool has_exponent = false;
+
+    if (p >= d->len) return BZ_JDER_NUM_NOT_A_NUMBER;
+    if (d->data[p] == '-') {
+        // An optional '-', then the integer part.
+        negative = true;
+        ++p;
+    } else if (d->data[p] < '0' || d->data[p] > '9') {
+        // Not a number at all: a letter, '"', '}', '+', '.', ...
+        return BZ_JDER_NUM_NOT_A_NUMBER;
+    }
+    // The integer part: `0`, or a nonzero digit followed by zero or more digits.
+    if (p >= d->len || d->data[p] < '0' || d->data[p] > '9')
+        return BZ_JDER_NUM_MALFORMED;  // no integer part ("-", "-x")
+    if (d->data[p] == '0') {
+        ++p;
+        // A leading zero may not be followed by a digit ("007").
+        if (p < d->len && d->data[p] >= '0' && d->data[p] <= '9')
+            return BZ_JDER_NUM_MALFORMED;
+    } else {
+        while (p < d->len && d->data[p] >= '0' && d->data[p] <= '9') ++p;
+    }
+    // The optional fraction: a '.' and one or more digits.
+    const int64_t suffix_pos = p;
+    if (p < d->len && d->data[p] == '.') {
+        has_fraction = true;
+        ++p;
+        const int64_t frac_start = p;
+        while (p < d->len && d->data[p] >= '0' && d->data[p] <= '9') ++p;
+        if (p == frac_start) return BZ_JDER_NUM_MALFORMED;  // no digit after the point
+    }
+    // The optional exponent: 'e'/'E', an optional sign, and one or more digits.
+    if (p < d->len && (d->data[p] == 'e' || d->data[p] == 'E')) {
+        has_exponent = true;
+        ++p;
+        if (p < d->len && (d->data[p] == '+' || d->data[p] == '-')) ++p;
+        const int64_t exp_start = p;
+        while (p < d->len && d->data[p] >= '0' && d->data[p] <= '9') ++p;
+        if (p == exp_start) return BZ_JDER_NUM_MALFORMED;  // no digit in the exponent
+    }
+    // The token must END here.  In a JSON text a number is followed by
+    // whitespace, by a structural character (',', '}', ']') or by nothing; any
+    // other byte is trailing junk ("1_000", "0x1p3", "1abc"), which makes the
+    // whole document malformed — RFC 8259 §6 has no such continuation.
+    if (p < d->len) {
+        const uint8_t c = d->data[p];
+        const bool delimiter = (c == ',' || c == '}' || c == ']' ||
+                                c == ' ' || c == '\t' || c == '\n' || c == '\r');
+        if (!delimiter) return BZ_JDER_NUM_MALFORMED;
+    }
+    out->start = start;
+    out->len = p - start;
+    out->suffix_pos = suffix_pos;
+    out->negative = negative;
+    out->has_fraction = has_fraction;
+    out->has_exponent = has_exponent;
+    d->pos = p;
+    return BZ_JDER_NUM_OK;
+}
+
+// A NUL-terminated copy of a JSON number token.
+// stdlib §2.15 (v0.355): "ReadFloat reads a JSON number of ANY LENGTH" and
+// "ReadDecimal reads only a JSON number with no exponent, of any length", so
+// the copy is NOT length-capped: a token too long for the stack buffer is
+// copied to the heap.
+struct bz_jder_token {
+    bz_jder_token(const uint8_t* data, int64_t start, int64_t len) {
+        if (len < (int64_t)sizeof(stack)) {
+            memcpy(stack, data + start, (size_t)len);
+            stack[len] = '\0';
+            buf = stack;
+            return;
+        }
+        char* h = static_cast<char*>(malloc((size_t)len + 1));
+        if (!h) { stack[0] = '\0'; buf = stack; return; }
+        memcpy(h, data + start, (size_t)len);
+        h[len] = '\0';
+        buf = h;
+        heap = true;
+    }
+    ~bz_jder_token() { if (heap) free(buf); }
+    bz_jder_token(const bz_jder_token&) = delete;
+    bz_jder_token& operator=(const bz_jder_token&) = delete;
+    const char* c_str() const { return buf; }
+    char stack[128];
+    char* buf = stack;
+    bool heap = false;
+};
+
 // Skip one complete JSON value at current pos (after ws skip).
 // Used by SkipValue (unknown-field policy).
 static void bz_jder_skip_value(bz_binder_t* d);
@@ -1265,17 +1417,16 @@ static void bz_jder_skip_value_impl(bz_binder_t* d) {
         else if (c == 'n' && d->pos + 4 <= d->len && memcmp(kw, "null",  4) == 0) d->pos += 4;
         else { bz_ser_throw_at_json("Unknown JSON keyword in skip (§2.15)", d); }
     } else if (c == '-' || (c >= '0' && c <= '9')) {
-        // number: consume digits and optional .digits and optional eXX
-        if (d->data[d->pos] == '-') ++d->pos;
-        while (d->pos < d->len && (d->data[d->pos] >= '0' && d->data[d->pos] <= '9')) ++d->pos;
-        if (d->pos < d->len && d->data[d->pos] == '.') {
-            ++d->pos;
-            while (d->pos < d->len && (d->data[d->pos] >= '0' && d->data[d->pos] <= '9')) ++d->pos;
-        }
-        if (d->pos < d->len && (d->data[d->pos] == 'e' || d->data[d->pos] == 'E')) {
-            ++d->pos;
-            if (d->pos < d->len && (d->data[d->pos] == '+' || d->data[d->pos] == '-')) ++d->pos;
-            while (d->pos < d->len && (d->data[d->pos] >= '0' && d->data[d->pos] <= '9')) ++d->pos;
+        // A number: the SAME grammar the typed readers use (stdlib §2.15's
+        // "JSON mapping" — a JSON number is JSON's own number token, RFC 8259
+        // §6).  The skip path used to consume digits, an optional point and an
+        // optional exponent with no check at all, so an unknown field's value
+        // could be a malformed number ("01", ".5", "1e") and the document was
+        // still read.
+        struct bz_jder_num num;
+        if (bz_jder_scan_number(d, &num) != BZ_JDER_NUM_OK) {
+            bz_ser_throw_at_json("JSON number is malformed (§2.15)", d);
+            return;
         }
     } else {
         bz_ser_throw_at_json("Unexpected JSON token in skip (§2.15)", d);
@@ -1294,24 +1445,32 @@ static int64_t bz_jder_parse_int(bz_binder_t* d) {
         bz_ser_throw_at_json("Expected JSON number, got end of input (§2.15)", d);
         return 0;
     }
-    // Collect the number text.
-    int64_t start = d->pos;
-    if (d->data[d->pos] == '-') ++d->pos;
-    if (d->pos >= d->len || d->data[d->pos] < '0' || d->data[d->pos] > '9') {
+    struct bz_jder_num num;
+    const enum bz_jder_num_kind kind = bz_jder_scan_number(d, &num);
+    if (kind == BZ_JDER_NUM_NOT_A_NUMBER) {
+        // Not a number at all — this reader's own wording, unchanged.
         bz_ser_throw_at_json("Expected JSON integer (§2.15)", d);
         return 0;
     }
-    while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
-    // §2.15 (v0.314, fix #5400): no decimal point or exponent allowed for integer
-    // reads — "5.9" must raise SerializationException, not silently truncate to 5.
-    if (d->pos < d->len && (d->data[d->pos] == '.' || d->data[d->pos] == 'e' || d->data[d->pos] == 'E')) {
+    if (kind == BZ_JDER_NUM_MALFORMED) {
+        // stdlib §2.15 (v0.355), "Errors": malformed input raises
+        // SerializationException, located at the number.
+        bz_ser_throw_at_json("JSON number is malformed (§2.15)", d);
+        return 0;
+    }
+    // §2.15 (v0.355): "ReadInt and ReadUInt read only such a number [a JSON
+    // number with no fraction and no exponent], so one with a fraction or an
+    // exponent (5.0, 1e3, 5.9) is a type mismatch and raises
+    // SerializationException located at the number, whatever its value."
+    if (num.has_fraction || num.has_exponent) {
+        d->pos = num.suffix_pos;  // the fault stays at the '.'/'e', as before
         bz_ser_throw_at_json("JSON integer cannot have fraction or exponent (§2.15)", d);
         return 0;
     }
-    int64_t numlen = d->pos - start;
+    const int64_t numlen = num.len;
     if (numlen > 20) { bz_ser_throw_at_json("JSON integer overflow (§2.15)", d); return 0; }
     char buf[24] = {};
-    memcpy(buf, d->data + start, (size_t)numlen);
+    memcpy(buf, d->data + num.start, (size_t)numlen);
     errno = 0;
     int64_t result = strtoll(buf, nullptr, 10);
     // §2.15 (v0.314, fix #5400): strtoll saturates to LONG_MAX/MIN on overflow
@@ -1326,21 +1485,36 @@ static int64_t bz_jder_parse_int(bz_binder_t* d) {
 
 static uint64_t bz_jder_parse_uint(bz_binder_t* d) {
     bz_jder_skip_ws(d);
-    if (d->pos >= d->len || d->data[d->pos] < '0' || d->data[d->pos] > '9') {
+    if (d->pos >= d->len) {
         bz_ser_throw_at_json("Expected JSON unsigned integer (§2.15)", d);
         return 0;
     }
-    int64_t start = d->pos;
-    while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
-    // §2.15 (v0.314, fix #5400): no decimal point or exponent allowed.
-    if (d->pos < d->len && (d->data[d->pos] == '.' || d->data[d->pos] == 'e' || d->data[d->pos] == 'E')) {
+    struct bz_jder_num num;
+    const enum bz_jder_num_kind kind = bz_jder_scan_number(d, &num);
+    if (kind == BZ_JDER_NUM_NOT_A_NUMBER) {
+        bz_ser_throw_at_json("Expected JSON unsigned integer (§2.15)", d);
+        return 0;
+    }
+    if (kind == BZ_JDER_NUM_MALFORMED) {
+        bz_ser_throw_at_json("JSON number is malformed (§2.15)", d);
+        return 0;
+    }
+    // §2.15 (v0.355): a negative number is outside ulong's range, so it raises
+    // ("a number read by ... ReadUInt [whose value lies] outside ulong's (-1
+    // respectively) raises SerializationException located at the number").
+    if (num.negative) {
+        bz_ser_throw_at_json("Expected JSON unsigned integer (§2.15)", d);
+        return 0;
+    }
+    if (num.has_fraction || num.has_exponent) {
+        d->pos = num.suffix_pos;  // the fault stays at the '.'/'e', as before
         bz_ser_throw_at_json("JSON unsigned integer cannot have fraction or exponent (§2.15)", d);
         return 0;
     }
-    int64_t numlen = d->pos - start;
+    const int64_t numlen = num.len;
     if (numlen > 20) { bz_ser_throw_at_json("JSON uint overflow (§2.15)", d); return 0; }
     char buf[24] = {};
-    memcpy(buf, d->data + start, (size_t)numlen);
+    memcpy(buf, d->data + num.start, (size_t)numlen);
     errno = 0;
     uint64_t result = strtoull(buf, nullptr, 10);
     // §2.15 (v0.314, fix #5400): strtoull saturates to ULONG_MAX on overflow and
@@ -1359,56 +1533,24 @@ static double bz_jder_parse_float(bz_binder_t* d) {
         bz_ser_throw_at_json("Expected JSON number (float), got end of input (§2.15)", d);
         return 0.0;
     }
-    int64_t start = d->pos;
-    if (d->data[d->pos] == '-') ++d->pos;
-    while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
-    // stdlib §2.15 (v0.344, #7341): JSON's number grammar requires AT LEAST
-    // ONE DIGIT after the '.', so a point with no digit after it is invalid
-    // ("1.e3" is not a JSON number).  The check below used to look only at
-    // the LAST character of the token, so the defect was caught only when the
-    // point ended the token ("1.", "1.e") and NOT when an exponent followed
-    // it ("1.e3" was read as 1000).  The digit count is therefore counted
-    // HERE, where the fraction is scanned, and the point is rejected when the
-    // fraction is empty.
-    int64_t fracDigits = 0;
-    bool sawPoint = false;
-    if (d->pos < d->len && d->data[d->pos] == '.') {
-        sawPoint = true;
-        ++d->pos;
-        int64_t fracStart = d->pos;
-        while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
-        fracDigits = d->pos - fracStart;
-    }
-    if (d->pos < d->len && (d->data[d->pos] == 'e' || d->data[d->pos] == 'E')) {
-        ++d->pos;
-        if (d->pos < d->len && (d->data[d->pos] == '+' || d->data[d->pos] == '-')) ++d->pos;
-        while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
-    }
-    // stdlib §2.15 (v0.344, #7341): a point with NO digit after it is not a
-    // JSON number, whatever exponent follows it ("1.e3" is invalid).  The
-    // last-character test below catches the point only when it ENDS the token
-    // ("1.", "1.e"), so the empty fraction is rejected here, where it is
-    // scanned.  The message is the one the last-character test already uses,
-    // so the inputs it already rejected keep their diagnostic.
-    if (sawPoint && fracDigits == 0) {
-        bz_ser_throw_at_json("JSON float has invalid form (§2.15)", d);
+    struct bz_jder_num num;
+    const enum bz_jder_num_kind kind = bz_jder_scan_number(d, &num);
+    if (kind == BZ_JDER_NUM_NOT_A_NUMBER) {
+        // stdlib §2.15 (v0.355): a fragment that is not a JSON number is
+        // malformed input — "Any other spelling of a number — `.5`, `5.`,
+        // `1.e3`, `+5`, `007`, `1_000`, `0x1p3` — is malformed input".
+        bz_ser_throw_at_json("Expected JSON number (§2.15)", d);
         return 0.0;
     }
-    int64_t numlen = d->pos - start;
-    if (numlen > 50) { bz_ser_throw_at_json("JSON float too long (§2.15)", d); return 0.0; }
-    char buf[64] = {};
-    memcpy(buf, d->data + start, (size_t)numlen);
-    // stdlib §2.15 (v0.314, #5200/#5369): JSON requires at least one digit
-    // after '.', and at least one digit after the exponent sign.  Reject
-    // forms like "1." and "1e" before calling strtod.
-    char lastChar = buf[numlen - 1];
-    if (lastChar == '.' || lastChar == 'e' || lastChar == 'E' ||
-        lastChar == '+' || lastChar == '-') {
-        bz_ser_throw_at_json("JSON float has invalid form (§2.15)", d);
+    if (kind == BZ_JDER_NUM_MALFORMED) {
+        bz_ser_throw_at_json("JSON number is malformed (§2.15)", d);
         return 0.0;
     }
-    double v = strtod(buf, nullptr);
-    // stdlib §2.15 (v0.314, #5200/#5369): a JSON number whose rounded value
+    // The grammar has already proved the token IS a JSON number, so the text
+    // handed to strtod is a number and strtod consumes all of it.
+    const bz_jder_token tok(d->data, num.start, num.len);
+    double v = strtod(tok.c_str(), nullptr);
+    // §2.15 (v0.314, fix #5200/#5369): a JSON number whose rounded value
     // is not finite raises SerializationException.
     if (!std::isfinite(v)) {
         bz_ser_throw_at_json("JSON float is not finite (§2.15)", d);
@@ -1425,21 +1567,51 @@ static void* bz_jder_parse_decimal(bz_binder_t* d) {
         bz_ser_throw_at_json("Expected JSON decimal number, got end of input (§2.15)", d);
         return nullptr;
     }
-    int64_t start = d->pos;
-    if (d->data[d->pos] == '-') ++d->pos;
-    while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
-    if (d->pos < d->len && d->data[d->pos] == '.') {
-        ++d->pos;
-        while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
+    struct bz_jder_num num;
+    const enum bz_jder_num_kind kind = bz_jder_scan_number(d, &num);
+    if (kind == BZ_JDER_NUM_NOT_A_NUMBER) {
+        bz_ser_throw_at_json("Expected JSON decimal number (§2.15)", d);
+        return nullptr;
     }
-    int64_t numlen = d->pos - start;
-    if (numlen > 50) { bz_ser_throw_at_json("JSON decimal too long (§2.15)", d); return nullptr; }
-    char buf[64] = {};
-    memcpy(buf, d->data + start, (size_t)numlen);
+    if (kind == BZ_JDER_NUM_MALFORMED) {
+        bz_ser_throw_at_json("JSON number is malformed (§2.15)", d);
+        return nullptr;
+    }
+    // §2.15 (v0.355): "ReadDecimal reads only a JSON number with no exponent,
+    // of any length: one with an exponent (1e3, 1.5E-2, 1e0) is a type
+    // mismatch and raises SerializationException located at the number,
+    // whatever its value, as at ReadInt".  The scan used to stop at the
+    // fraction, so the exponent was never even read — "1e3" read as 1.
+    if (num.has_exponent) {
+        d->pos = num.suffix_pos;  // the fault is at the exponent
+        bz_ser_throw_at_json("JSON decimal cannot have an exponent (§2.15)", d);
+        return nullptr;
+    }
     // Use a thread-local buffer for the result (same pattern as bz_binder_read_decimal).
     static thread_local uint32_t jdec_buf[4];
     memset(jdec_buf, 0, sizeof(jdec_buf));
-    bz_decimal_parse_cstr(buf, reinterpret_cast<bz_decimal_t*>(jdec_buf), nullptr, nullptr);
+    // §2.15 (v0.355): "a number whose value, so rounded, lies outside
+    // decimal's range (79228162514264337593543950335.5) raises
+    // SerializationException located at the number".  The parse runs with
+    // SENTINEL vtables so an out-of-range value is OBSERVABLE: the parser
+    // stores its failure in the pending-exception slot (bz_exc), which the
+    // codegen would otherwise raise as a foreign exception type.  The
+    // sentinel object is discarded and the slot restored before the
+    // SerializationException is raised.
+    const bz_jder_token tok(d->data, num.start, num.len);
+    unsigned char sentinel = 0;
+    extern thread_local void* bz_exc;
+    void* prev_exc = bz_exc;
+    bz_exc = nullptr;
+    bz_decimal_parse_cstr(tok.c_str(), reinterpret_cast<bz_decimal_t*>(jdec_buf),
+                          &sentinel, &sentinel);
+    if (bz_exc) {
+        free(bz_exc);
+        bz_exc = prev_exc;
+        bz_ser_throw_at_json("JSON decimal is out of range (§2.15)", d);
+        return nullptr;
+    }
+    bz_exc = prev_exc;
     return jdec_buf;
 }
 

@@ -5,10 +5,10 @@
 //! rule: **Errors.** Malformed input, type mismatches (a `ReadInt` when the
 //!   next token is a string), and depth-limit violations raise
 //!   `SerializationException` (declared in `System.Serialization`); a JSON
-//!   number has the shape the input grammar of
-//!   [§9.2](#sec-double-and-float) admits, and that grammar admits no bare
-//!   point.
-//! cites: 2.15, 9.2
+//!   number is JSON's own number token (RFC 8259 §6), and any other spelling
+//!   of a number — `.5`, `5.`, `1.e3`, `+5`, `007`, `1_000`, `0x1p3` — is
+//!   malformed input.
+//! cites: 2.15
 //! expect: run
 //! issue: 7340
 //! stdout: SER
