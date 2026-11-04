@@ -4877,6 +4877,87 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     // method `?.` are deferred.
     if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
         if (!nm->target) return nullptr;
+        // fix #7896 / #7981 (§30.3 / §7.5, v0.355): `t?.IsCompleted` /
+        // `t?.IsFaulted` / `t?.IsCancelled` / `t?.Result` on a `Task` /
+        // `Task<T>` / `OwningTask<T>` receiver. §30.3 declares all four as
+        // readonly PROPERTIES; §7.5 makes the `?.` result the nullable of the
+        // member type. The `.` form lowers them through the §30.3 Task arms
+        // below; a `?.` access is a distinct AST node, so that arm never ran
+        // and the access fell through to the storage-field path, whose
+        // `storageMemberOf` is null for a builtin Task — the expression
+        // lowered to NOTHING (#2434). Route the `?.` form through the SAME
+        // `.` lowering over a synthetic `.` node over a pinned placeholder
+        // carrying the lowered receiver, with a null-receiver short-circuit.
+        if (nm->member == "IsCompleted" || nm->member == "IsFaulted" ||
+            nm->member == "IsCancelled" || nm->member == "Result") {
+            const sema::TypeRef* ncTskRecvTy = ctx_.exprType(*nm->target);
+            if (ncTskRecvTy && isTaskTypeName(ncTskRecvTy)) {
+                const sema::TypeRef* ncTskResT = ctx_.exprType(e);
+                llvm::Value* ncTskRecv = lowerExpr(*nm->target);
+                if (!ncTskResT || !ncTskRecv ||
+                    !ncTskRecv->getType()->isPointerTy())
+                    return nullptr;
+                auto* ncTskEntry = builder_.GetInsertBlock();
+                auto* ncTskAcc = llvm::BasicBlock::Create(
+                    llvm_, "nctsk.acc", currentFn_);
+                auto* ncTskEnd = llvm::BasicBlock::Create(
+                    llvm_, "nctsk.end", currentFn_);
+                llvm::Value* ncTskIsNull = builder_.CreateICmpEQ(
+                    ncTskRecv, llvm::ConstantPointerNull::get(ptrTy()));
+                builder_.CreateCondBr(ncTskIsNull, ncTskEnd, ncTskAcc);
+                builder_.SetInsertPoint(ncTskAcc);
+                auto ncTskDotted = std::make_unique<ast::MemberAccessExpr>();
+                ncTskDotted->span = e.span;
+                ncTskDotted->member = nm->member;
+                // The `.` form's Result lowering tells a BOUND task (a local
+                // the caller disposes) from an ANONYMOUS PRODUCER (a call the
+                // read itself reclaims — §28.3 / §30.5) by the node KIND.
+                if (dynamic_cast<const ast::CallExpr*>(nm->target.get())) {
+                    ncTskDotted->target = std::make_unique<ast::CallExpr>();
+                } else {
+                    auto ncTskId = std::make_unique<ast::IdentifierExpr>();
+                    ncTskId->name = "<nullcond-receiver>";  // #6681
+                    ncTskDotted->target = std::move(ncTskId);
+                }
+                ctx_.setExprType(ncTskDotted->target.get(),
+                                 const_cast<sema::TypeRef*>(ncTskRecvTy));
+                exprValueOverride_[ncTskDotted->target.get()] = ncTskRecv;
+                sema::TypeRef* ncTskDotTy = ctx_.makeTypeRef(*ncTskResT);
+                ncTskDotTy->nullable = false;
+                ctx_.setExprType(ncTskDotted.get(), ncTskDotTy);
+                llvm::Value* ncTskInner = lowerExpr(*ncTskDotted);
+                exprValueOverride_.erase(ncTskDotted->target.get());
+                nullCondCountSynth_.push_back(std::move(ncTskDotted));
+                // §7.5: VALUE member → {i8 hasValue; T}; REFERENCE → null-ptr.
+                const bool ncTskRefRes = !isNullableValueTy(ncTskResT);
+                if (!ncTskInner || (ncTskRefRes &&
+                                    !ncTskInner->getType()->isPointerTy())) {
+                    // Unrecognised shape: close the CFG, keep the old result.
+                    builder_.CreateBr(ncTskEnd);
+                    builder_.SetInsertPoint(ncTskEnd);
+                    return nullptr;
+                }
+                llvm::Type* ncTskLlvmTy = nullptr;
+                llvm::Value* ncTskVal = nullptr;
+                llvm::Constant* ncTskNull = nullptr;
+                if (ncTskRefRes) {
+                    ncTskLlvmTy = ptrTy();
+                    ncTskVal = ncTskInner;
+                    ncTskNull = llvm::ConstantPointerNull::get(ptrTy());
+                } else {
+                    ncTskLlvmTy = nullableValueStructTy(ncTskResT);
+                    ncTskVal = wrapNullableValue(ncTskResT, ncTskInner);
+                    ncTskNull = nullableValueNull(ncTskResT);
+                }
+                auto* ncTskAccEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(ncTskEnd);
+                builder_.SetInsertPoint(ncTskEnd);
+                auto* ncTskPhi = builder_.CreatePHI(ncTskLlvmTy, 2);
+                ncTskPhi->addIncoming(ncTskNull, ncTskEntry);
+                ncTskPhi->addIncoming(ncTskVal, ncTskAccEnd);
+                return ncTskPhi;
+            }
+        }
         // fix #7778 (stdlib §2.5, §7.5, v0.350): `a?.Year` / `a?.Ticks` /
         // `t?.TotalDays` / `d?.Month` / `o?.Hour` on a `DateTime?` /
         // `TimeSpan?` / `DateOnly?` / `TimeOnly?` receiver. The `.` form reads

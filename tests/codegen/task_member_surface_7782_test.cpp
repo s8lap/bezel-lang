@@ -15,8 +15,9 @@
 // formation, naming `d.Dispose();`, `_ := d;` and the owned-parameter lambda.
 //
 // NOT covered here (residual codegen work, see the commit body): the
-// method-group read `var f := t.Wait;` (spec §27.6 admits it) and a valid
-// `t?.IsCompleted` / `t?.Result` read still degrade in codegen.
+// method-group read `var f := t.Wait;` (spec §27.6 admits it) still degrades
+// in codegen. A valid `t?.IsCompleted` / `t?.Result` read degraded here too,
+// until #7896 / #7981 lowered it.
 
 #include <string>
 
