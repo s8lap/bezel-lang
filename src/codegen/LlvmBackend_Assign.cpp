@@ -17843,6 +17843,19 @@ namespace {
 struct ParamEscapeWalker {
     const sema::SemaContext& ctx;
     const ast::Type* paramDeclType;
+    // fix-forward of ca822b0b (narrow #4841; §27.5 / §8.6 / §28.9, v0.355):
+    // the codegen's own capture set for a lambda (`Emitter::
+    // collectCapturedSyms`, the SAME walk that decides what the closure env
+    // holds). A lambda whose capture set contains the tracked parameter keeps
+    // the parameter's §8.6 box alive past the call (the closure may be stored
+    // in a field and invoked later), so that is an ESCAPE whatever spelling
+    // the body uses: a receiver call `v.ToString()`, a type test `v is int`,
+    // an interpolation `$"{v}"`, a member read, or any arm this walker does
+    // not model. Keying on the capture set rather than on this walker's own
+    // arms means a body shape the walker ignores cannot hide a capture.
+    std::function<void(const ast::LambdaExpr&,
+                       std::unordered_set<const sema::Symbol*>&)>
+        lambdaCaptures;
     bool escaped = false;
 
     bool isTarget(const ast::Expr* e) {
@@ -17939,10 +17952,14 @@ struct ParamEscapeWalker {
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e || escaped) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
-            if (isTarget(id) && !safeRead) escaped = true;
+            // Inside a lambda body every occurrence is a capture (§27.5), so
+            // no position is a safe read there.
+            if (isTarget(id) && (!safeRead || lambdaDepth != 0))
+                escaped = true;
             return;
         }
-        // `v is T` / `v as T` — read only.
+        // `v is T` / `v as T` — read only (outside a lambda; the identifier
+        // arm above refuses the safe read inside one).
         if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
             expr(t->operand.get(), /*safeRead=*/true);
             return;
@@ -17995,7 +18012,9 @@ struct ParamEscapeWalker {
             if (auto* mem = dynamic_cast<const ast::MemberAccessExpr*>(
                     c->callee.get())) {
                 if (isTarget(mem->target.get())) {
-                    // Receiver is the tracked parameter — safe read.
+                    // Receiver is the tracked parameter — safe read, except
+                    // inside a lambda body, where it is a capture (§27.5).
+                    expr(mem->target.get(), /*safeRead=*/true);
                     for (auto& a : c->args) expr(a.value.get(), false);
                     return;
                 }
@@ -18022,6 +18041,8 @@ struct ParamEscapeWalker {
             if (auto* mem = dynamic_cast<const ast::NullCondMemberExpr*>(
                     c->callee.get())) {
                 if (isTarget(mem->target.get())) {
+                    // Safe receiver read only outside a lambda (§27.5).
+                    expr(mem->target.get(), /*safeRead=*/true);
                     for (auto& a : c->args) expr(a.value.get(), false);
                     return;
                 }
@@ -18037,6 +18058,8 @@ struct ParamEscapeWalker {
             if (auto* mem = dynamic_cast<const ast::MemberAccessExpr*>(
                     c->callee.get())) {
                 if (isTarget(mem->target.get())) {
+                    // Safe receiver read only outside a lambda (§27.5).
+                    expr(mem->target.get(), /*safeRead=*/true);
                     for (auto& a : c->args) expr(a.value.get(), false);
                     return;
                 }
@@ -18059,9 +18082,48 @@ struct ParamEscapeWalker {
             expr(c->elseValue.get(), safeRead);
             return;
         }
+        // narrow #4841 / #8095 (§27.6 / §8.6, v0.355): a member access that is
+        // NOT a call's callee. On the tracked parameter it is either a property
+        // read (the box goes nowhere: a receiver read, refused inside a lambda
+        // by the identifier arm) or a METHOD-REFERENCE formation `v.ToString`,
+        // whose closure env holds the receiver (§27.6) and so outlives the
+        // call exactly like a lambda capture: an escape. MEASURED before this
+        // arm: `f := v.ToString;` in a constructor was walked as nothing at
+        // all, the caller released the box, and `c.f()` read it freed (ASan
+        // heap-use-after-free). Any other target is walked conservatively.
+        auto memberAccess = [&](const ast::Expr* target) {
+            if (isTarget(target)) {
+                const sema::TypeRef* t = ctx.exprType(*e);
+                if (!t || t->kind == sema::TypeRef::Kind::Function)
+                    escaped = true;
+                else
+                    expr(target, /*safeRead=*/true);
+                return;
+            }
+            expr(target, false);
+        };
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            memberAccess(m->target.get());
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            memberAccess(m->target.get());
+            return;
+        }
         // Everything else conservatively escapes: lambda capture, collection
         // literal, with, new, throw, interpolation, unary, range.
         if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            if (lambdaCaptures) {
+                std::unordered_set<const sema::Symbol*> caps;
+                lambdaCaptures(*lam, caps);
+                for (const sema::Symbol* sym : caps) {
+                    auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym);
+                    if (ps && ps->declType == paramDeclType) {
+                        escaped = true;
+                        return;
+                    }
+                }
+            }
             ++lambdaDepth;
             if (lam->exprBody) expr(lam->exprBody.get(), false);
             for (auto& s : lam->stmts) stmt(s.get());
@@ -18087,12 +18149,11 @@ struct ParamEscapeWalker {
             for (auto& ind : ix->indices) expr(ind.value.get(), false);
             return;
         }
-        // Conservative: anything else treats the value as escaping.
-        // (This covers UnaryExpr, ThrowExpr, InterpolatedStringExpr,
-        // RangeExpr, CaseExpr — all of them can carry the value into a
-        // longer-lived location or to a position we can't statically prove
-        // safe.)
-        // Recurse conservatively on a few key shapes.
+        // Recurse conservatively on a few key shapes. NOTE (#8095): an
+        // expression kind with NO arm here (ThrowExpr, RangeExpr,
+        // MarkedTransferExpr, BindExpr, ...) is NOT walked at all, so an
+        // occurrence of the parameter inside it is not seen; inside a lambda
+        // the capture-set check above covers it, outside one it does not.
         if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
             expr(u->operand.get(), isUnboxedRead(u->operand.get()));
             return;
@@ -18252,7 +18313,10 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
     // Object/interface never box anyway and never reach the call-site release
     // check, but walking them is cheap and keeps the cache complete.
     std::unordered_set<size_t> nonEscape;
-    ParamEscapeWalker w{ctx_, nullptr};
+    auto captures = [this](const ast::LambdaExpr& lam,
+                           std::unordered_set<const sema::Symbol*>& out) {
+        collectCapturedSyms(lam, out);
+    };
     auto walkParams = [&](const std::vector<ast::Param>& params,
                           const std::vector<std::unique_ptr<ast::Stmt>>* body,
                           const ast::Expr* exprBody) {
@@ -18260,7 +18324,7 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
             if (!params[i].type) continue;
             const sema::TypeRef* pt = ctx_.resolvedType(*params[i].type);
             if (!pt || !isObjectOrInterfaceTarget(pt)) continue;
-            ParamEscapeWalker w{ctx_, params[i].type.get()};
+            ParamEscapeWalker w{ctx_, params[i].type.get(), captures};
             if (body) {
                 for (auto& s : *body) w.stmt(s.get());
             }
@@ -18269,6 +18333,21 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
         }
     };
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(callee)) {
+        // narrow #4841 / #8095 (§29.3 / §30.1, v0.355): an ITERATOR or ASYNC
+        // method's body runs in a state-machine frame that holds its
+        // parameters past the call's return (an iterator's body does not even
+        // start until the first `MoveNext`), so every parameter escapes the
+        // CALL whatever the body does with it. MEASURED before this guard:
+        // `Gen(v: Object): IEnumerable<string>` whose body is
+        // `yield return v.ToString();`, iterated by the caller, read the
+        // §8.6 box after the caller had released it (ASan heap-use-after-free).
+        bool stateMachine = containsYield(md->stmts);
+        for (auto mod : md->modifiers)
+            if (mod == "async") stateMachine = true;
+        if (stateMachine) {
+            calleeParamNonEscape_[callee] = std::move(nonEscape);
+            return false;
+        }
         if (md->bodyKind == ast::MethodBodyKind::Expression) {
             walkParams(md->params, nullptr, md->exprBody.get());
         } else if (md->bodyKind == ast::MethodBodyKind::Block) {
