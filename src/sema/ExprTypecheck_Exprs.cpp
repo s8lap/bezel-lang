@@ -2388,9 +2388,39 @@ void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
         // discriminator classified every non-`int` integral as the comparer.
         std::uint32_t kind = kinds.front();
         if (kinds.size() > 1) {
+            // fix #8007 (§5.1, §17.7, §22.6, stdlib §4.8/§4.9/§4.10, v0.353):
+            // a `string` argument skips the WHOLE position only where the
+            // POSITION ITSELF admits a `string`. `StringBuilder`'s shared
+            // position does (stdlib §3.1: `capacity: int` beside `initial:
+            // string`), and fix #7820 wrote this skip for it. The hash
+            // collections' shared position carries `{kBPTInt, kBPTComparer}`
+            // and NO `kBPTString` (stdlib §4.10: `Set(capacity: int)` beside
+            // `Set(comparer: IEqualityComparer<T>)`; §4.8 and §4.9 the same
+            // pair on `Dictionary` / `OwningDictionary`), so a `string` there
+            // is neither an `int` nor a comparer: the §5.1 gate must RUN and
+            // refuse it as what it is.
+            //
+            // MEASURED on the base (r38-c2 at 95fe673f): with the skip
+            // unconditional, `new Set<int>("x")` -- and the same at
+            // `Dictionary`, `OwningSet` and `OwningDictionary` -- survived
+            // sema and drew CODEGEN's comparer deferral ("the 'Set'
+            // IEqualityComparer constructor is not yet implemented"), which
+            // tells the reader their `string` "is not a comparer" -- a
+            // statement about a type the argument never had. The §5.1
+            // diagnostic is the one that names the real problem.
+            //
+            // The comparer case is untouched: a REAL `IEqualityComparer<T>`
+            // argument is NOT a primitive, so it takes the comparer kind
+            // below and keeps fix #2722's refusal.
             const bool isString = argTy->kind == TypeRef::Kind::Primitive &&
                                   argTy->primitive == PrimitiveType::String;
-            if (isString) continue;
+            bool admitsString = false;
+            for (std::uint32_t k : kinds) {
+                if (!(k & common::kBPTString)) continue;
+                admitsString = true;
+                break;
+            }
+            if (isString && admitsString) continue;
             bool resolved = false;
             if (argTy->kind != TypeRef::Kind::Primitive) {
                 for (std::uint32_t k : kinds) {
