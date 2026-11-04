@@ -4328,6 +4328,114 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             }
         }
     }
+    // fix #7870 (§12.7 / §30.3 / §30.4, v0.353): `t is Task` over a
+    // `Task<string>` must be TRUE — §30.3 declares `public class Task<T>: Task`
+    // and `public class OwningTask<T>: Task where T: class`, so EVERY
+    // Task-family value IS a `Task`.
+    //
+    // THE DEFECT. A task has no runtime type tag: a `bz_task_t*` is a runtime
+    // struct with no Bezel vtable at word 0, so `boxDescriptorFor` /
+    // `descArray_` / `builtinDesc_` all miss and the test reached the
+    // `!targetDesc` bail at the end of this function, which REPORTED it
+    // ("#8000") and DROPPED it. The drop is not a wrong `false` — the
+    // enclosing statement emitted NOTHING at all:
+    //
+    //     probe: using var t := S();  Console.WriteLine((t is Task).ToString());
+    //     warning: internal: this type test was DROPPED and reads as false …
+    //              — #8000
+    //     warning: internal: the argument of this `Console.WriteLine` failed
+    //              to lower to a value, so the whole statement emits nothing
+    //              — #3079
+    //
+    // MEASURED PRE-FIX (base c05c35bf): the program printed NOTHING (not
+    // even "False") and exited 0 — the silent-wrong-value shape. The same
+    // held for `is Task<string>`, `is Task<int>`, `is Task?` and `is not
+    // Task` over the same `Task<string>`.
+    //
+    // THE DECISION. §12.7: "A test naming the operand's own type is admitted:
+    // statically true", and the operand's static type here is a Task-family
+    // type, so the test is decidable WITHOUT a runtime tag:
+    //   * the target is the BASE class `Task` (no type argument) ⇒ EVERY
+    //     Task-family value matches (§30.3's three declarations all derive
+    //     from `Task`);
+    //   * the target is `Task<X>` / `OwningTask<X>` ⇒ the operand matches
+    //     iff it is the SAME instantiation: `Task<X>` is a `Task<X>` and not a
+    //     `Task<Y>` (Y ≠ X), and an `OwningTask<X>` derives from `Task`, NOT
+    //     from `Task<X>`;
+    //   * a NULL operand answers FALSE — §12.7: the answer is "`false` at
+    //     `null`", "a type test matching no absent value"; §19.5 ("Type-pattern
+    //     matching never matches `null`") states the same rule for the
+    //     type-test family ("as `x is T?` answers as `x is T` does").
+    // A nullable TARGET tests as its underlying type (§12.7: "`x is T?` has
+    // the answer of `x is T`"), so `is Task?` answers as `is Task`.
+    //
+    // NOT DECIDABLE, and deliberately left to the drop below: an operand
+    // whose static type is the NON-generic `Task` tested against `Task<X>` —
+    // its runtime type may be a `Task<X>` (an `as` narrowing keeps the value
+    // and erases the head), so the answer depends on the runtime type and
+    // this arm must not claim it.
+    if (obj && obj->getType()->isPointerTy() &&
+        rt->kind == sema::TypeRef::Kind::Named && isTaskTypeName(rt)) {
+        const sema::TypeRef* operandTy = opTyResolved;
+        if (operandTy && operandTy->kind == sema::TypeRef::Kind::Named &&
+            isTaskTypeName(operandTy)) {
+            const bool targetIsBaseTask =
+                rt->headName() == "Task" && rt->genericArgs.empty();
+            // A DECIDABLE test: either the target is the base class, or both
+            // sides name a single type argument (so the instantiations can be
+            // compared). Anything else (a non-generic operand against a
+            // generic target) is left to the drop below.
+            const bool comparable =
+                targetIsBaseTask ||
+                (rt->genericArgs.size() == 1 &&
+                 operandTy->genericArgs.size() == 1);
+            if (comparable) {
+                bool sameInstantiation = false;
+                if (targetIsBaseTask) {
+                    sameInstantiation = true;
+                } else if (rt->headName() == operandTy->headName()) {
+                    sameInstantiation =
+                        typeRefIdentityKey(rt->genericArgs[0]) ==
+                        typeRefIdentityKey(operandTy->genericArgs[0]);
+                }
+                llvm::Value* nonNull = builder_.CreateICmpNE(
+                    obj, llvm::ConstantPointerNull::get(ptrTy()),
+                    "is.task.nonnull");
+                llvm::Value* holds = sameInstantiation
+                    ? nonNull : builder_.getInt1(false);
+                if (te.op == "is") { releaseFreshBoxTemp(); return holds; }
+                if (te.op == "is not") {
+                    releaseFreshBoxTemp();
+                    return builder_.CreateXor(holds, builder_.getInt1(true));
+                }
+                // `as` is DELIBERATELY NOT decided here. The `as` lowering for
+                // a Task-family target is NOT this commit's business: the
+                // `as` RESULT local is a SECOND owner of the task frame, and
+                // `Emitter::taskLocalInitializerIsBorrowSource` recognises
+                // only an IdentifierExpr / MemberAccessExpr /
+                // NullCondMemberExpr / IndexExpr initializer — NOT the `as`
+                // expression — so an `as` result local registers its OWN
+                // scope-end `bz_task_fire_and_forget` on the SAME
+                // `bz_task_t*` the source local disposes. The second disposal
+                // blocks forever inside `bz_task_is_error` (MEASURED by the
+                // R38 reviewer: the program printed "got a" and then NEVER
+                // exited — `timeout 15` → exit 124). So the `as` arm that
+                // the reviewed commit added here is REMOVED, and the `as`
+                // shape keeps its PRE-EXISTING degradation (the
+                // `!targetDesc` drop below, reported as #8000 / #2434) —
+                // tracked separately by #8000 part (b) (the vtable-less
+                // built-in classes that still have no runtime word-0
+                // descriptor) and #7923 (the double-disposal family).
+                //
+                // So for `as` this arm DECIDES nothing and falls through to the
+                // `!targetDesc` bail exactly as it did before this commit —
+                // the object file this commit emits for an `as` program is
+                // BYTE-IDENTICAL to the parent's (MEASURED), because the
+                // `nonNull` comparison above, unused on this path, is
+                // dropped by instruction selection.
+            }
+        }
+    }
     // fix #6776 (§8.2 / §12.7 / stdlib §3.1, v0.340): a vtable-less built-in
     // at an Object / interface location now carries a runtime type tag (word 0
     // is one of the runtime-owned vtables, see bz_obj_is_string), so a test
