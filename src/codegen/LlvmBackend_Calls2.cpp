@@ -9711,7 +9711,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
             if (ma->target) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
-                    if (id->name == "Console") {
+                    // fix #8126 (§2.7 rule 1, v0.355): a VALUE named `Console`
+                    // is member access, not the built-in reader.
+                    if (id->name == "Console" &&
+                        receiverMayReachBuiltinStaticArm(*id)) {
                         if (ma->member == "ReadLine") return emitConsoleReadLine();
                         if (ma->member == "ReadKey") {
                             // getchar() → char (i32)

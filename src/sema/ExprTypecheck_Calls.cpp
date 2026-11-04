@@ -10439,7 +10439,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 bool onConsole = false;
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         consoleMA->target.get())) {
-                    onConsole = (id->name == "Console");
+                    // fix #8126 (§2.7 rule 1, v0.355): a VALUE named `Console`
+                    // is member access on the user's object; the built-in
+                    // console arity rule is not its business.
+                    onConsole = (id->name == "Console" &&
+                                 receiverMayReachBuiltinStaticArm(
+                                     ctx_.exprSymbol(*id)));
                 }
                 // Console.Error.Write/WriteLine or Console.Out.Write/WriteLine.
                 if (!onConsole) {
@@ -10449,6 +10454,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(
                                     innerMA->target.get())) {
                                 if (id2->name == "Console" &&
+                                    receiverMayReachBuiltinStaticArm(
+                                        ctx_.exprSymbol(*id2)) &&
                                     (innerMA->member == "Error" ||
                                      innerMA->member == "Out"))
                                     onConsole = true;

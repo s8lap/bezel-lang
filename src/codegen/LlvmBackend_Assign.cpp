@@ -18000,10 +18000,9 @@ struct ParamEscapeWalker {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
         if (!id || id->name != "Console") return false;
         auto* sym = ctx.exprSymbol(*id);
-        if (dynamic_cast<sema::LocalSymbol*>(sym) ||
-            dynamic_cast<sema::ParameterSymbol*>(sym))
-            return false;
-        return !sema::isUserDeclaredTypeSym(sym);
+        // fix #8126 (§2.7 rule 1, v0.355): any VALUE (local, parameter, field,
+        // property) or user-declared type named `Console` shadows the built-in.
+        return sema::receiverMayReachBuiltinStaticArm(sym);
     }
 
     void expr(const ast::Expr* e, bool safeRead) {

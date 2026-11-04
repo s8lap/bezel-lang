@@ -30678,7 +30678,10 @@ bool isConsoleNonRetainingArg(const ast::Expr* callee, size_t i,
     if (ma->member != "Write" && ma->member != "WriteLine") return false;
     // Direct `Console.Write`/`Console.WriteLine`.
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
-        if (id->name == "Console") return true;
+        // fix #8126 (§2.7 rule 1, v0.355): a VALUE named `Console` is the
+        // author's own object, whose `WriteLine` may store its argument.
+        if (id->name == "Console")
+            return !ctx || sema::receiverMayReachBuiltinStaticArm(ctx->exprSymbol(*id));
         // fix #7713 (stdlib §7.4, v0.350): `w.WriteLine(x)` over a `TextWriter`
         // local bound to `Console.Out`/`Console.Error` lowers through the same
         // tryLowerConsoleCall arm. A local the arm declines (written again)
@@ -30811,7 +30814,9 @@ static bool isBuiltinReaderCollectionArg(const ast::Expr* callee, size_t i,
         // for `Join` in LlvmBackend_Calls.cpp; the identifier "Console" for
         // the console lowering).
         if (id->name == "string" || id->name == "String") owner = "string";
-        else if (id->name == "Console") owner = "Console";
+        else if (id->name == "Console" &&
+                 sema::receiverMayReachBuiltinStaticArm(ctx.exprSymbol(*id)))
+            owner = "Console";  // fix #8126: a VALUE `Console` is not the built-in
         else return false;
     } else {
         // The instance spelling (`"abc".Trim(cs)`): the receiver is a VALUE.

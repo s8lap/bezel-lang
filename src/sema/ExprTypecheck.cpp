@@ -9522,6 +9522,8 @@ static TypeRef* consoleStreamInferredType(SemaContext& ctx,
         return nullptr;
     auto* cid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
     if (!cid || cid->name != "Console") return nullptr;
+    // fix #8126 (§2.7 rule 1, v0.355): a VALUE named `Console` is not the built-in.
+    if (!receiverMayReachBuiltinStaticArm(ctx.exprSymbol(*cid))) return nullptr;
     TypeRef* ref = ctx.makeTypeRef();
     ref->kind = TypeRef::Kind::Named;
     ref->declaration = nullptr;

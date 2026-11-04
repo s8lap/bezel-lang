@@ -178,6 +178,9 @@ int consoleWriterLocalStdFdOf(const sema::SemaContext& ctx,
     if (!init || !init->target) return 0;
     auto* cid = dynamic_cast<const ast::IdentifierExpr*>(init->target.get());
     if (!cid || cid->name != "Console") return 0;
+    // fix #8126 (§2.7 rule 1, v0.355): a VALUE named `Console` is not the
+    // built-in, so `var w := Console.Out` binds the user's own member.
+    if (!sema::receiverMayReachBuiltinStaticArm(ctx.exprSymbol(*cid))) return 0;
     if (init->member == "Out") return 1;
     if (init->member == "Error") return 2;
     return 0;
@@ -214,6 +217,10 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         if (!innerMA || !innerMA->target) return false;
         auto* innerID = dynamic_cast<const ast::IdentifierExpr*>(innerMA->target.get());
         if (!innerID || innerID->name != "Console") return false;
+        // fix #8126 (§2.3 / §2.7 rule 1, v0.355): a local / parameter / field
+        // named `Console` is a VALUE, so `Console.Out.WriteLine(x)` is member
+        // access on it, not the built-in stream.
+        if (!receiverMayReachBuiltinStaticArm(*innerID)) return false;
         if (innerMA->member == "Error" || innerMA->member == "Out") {
             stdfd = (innerMA->member == "Error") ? 2 : 1;
             id = nullptr;  // mark as Error/Out path
@@ -238,6 +245,11 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         // nothing to flush.
         if (ma->member == "Flush" && call.args.empty()) return true;
     }
+
+    // fix #8126 (§2.3 / §2.7 rule 1, v0.355): a local, parameter, field or
+    // property named `Console` is a VALUE, so `Console.WriteLine(x)` is member
+    // access on it — the user's own member, never the built-in console.
+    if (id && !receiverMayReachBuiltinStaticArm(*id)) return false;
 
     bool isWriteLine = (ma->member == "WriteLine");
     bool isWrite = (ma->member == "Write");
