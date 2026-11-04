@@ -12,6 +12,7 @@
 //! expect: reject
 //! diagnostic: Sort
 //! issue: 7699
+//! notes: #8065 asks whether §27.6's unbound instance-method references `T.M` conflict with this sentence. The verdict follows §26.5 as written.
 module Conf;
 
 public class Program

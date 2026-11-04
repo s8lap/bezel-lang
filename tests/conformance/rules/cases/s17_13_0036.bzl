@@ -7,8 +7,8 @@
 //!   disposes in place, as `x.Dispose()` does, and moves nothing out of the
 //!   pin, axiom A5), or an `owned` parameter — is a marker-free consume: the
 //!   value is disposed at the end of the discard statement, and `x` is
-//!   thereafter treated exactly as explicitly disposed (the scope-end pass
-//!   skips its disposal).
+//!   thereafter treated exactly as explicitly disposed (§28.3 — the scope-end
+//!   pass skips its disposal …).
 //! cites: 17.13, 28.6, 28.10
 //! expect: run
 //! output: disposed
