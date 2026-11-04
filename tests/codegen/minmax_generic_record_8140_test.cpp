@@ -19,7 +19,8 @@
 //     record that lists I (or any interface extending I) in its inheritance
 //     clause and declares matching members" ⇒ a GENERIC record
 //     `W<T>: IComparable<W<T>>` conforms at every instantiation, so
-//     `W<string>` satisfies stdlib §5.1's `where T: IComparable<T>` and
+//     `W<string>` satisfies the no-selector `Min()` constraint of stdlib
+//     §5.1, `where T: IComparable<T>` (the interface is stdlib §2.8), and
 //     `Array<W<string>>.Min()` MUST be admitted.
 //   * spec §14.1 "Generic declarations" *Instantiation and its site*: "An
 //     instantiation of a generic declaration is the constructed type or
