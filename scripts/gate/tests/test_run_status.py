@@ -122,6 +122,34 @@ class RunStatusTest(unittest.TestCase):
         self.assertIn("inactive", js)
         self.assertNotIn("ACTION: jobserver", out)
 
+    def test_jobserver_row_shows_compiles_and_tests_separately(self):
+        # Tests hold pool tokens too (tests/test_main.cpp, 2026-11-04), so the
+        # row splits tok_held into a compiles part and a tests part.
+        import sys
+        import time
+        fake = self.d / "fakebin"
+        fake.mkdir()
+        (fake / "systemctl").write_text("#!/bin/sh\necho active\n")
+        (fake / "systemctl").chmod(0o755)
+        jdir = self.d / "js"
+        daemon = subprocess.Popen([sys.executable, str(SCRIPTS / "build_jobserver.py"),
+                                   "serve", "--dir", str(jdir), "--tokens", "3",
+                                   "--interval", "0.2"])
+        try:
+            end = time.time() + 10
+            while not (jdir / "features").exists() and time.time() < end:
+                time.sleep(0.05)
+            self.env["PATH"] = str(fake) + os.pathsep + self.env["PATH"]
+            self.env["BEZEL_JOBSERVER_DIR"] = str(jdir)
+            self.env["BEZEL_STATUS_SKIP"] = "builders lanes"
+            js = self.row(self.status(), "jobserver")
+        finally:
+            daemon.terminate()
+            daemon.wait(timeout=10)
+        self.assertIn("pool 3/3 free, held 0", js)
+        self.assertIn("compiles: held 0 wait 0 builds 0", js)
+        self.assertRegex(js, r"tests: \d+ running, 0 holding, 0 waiting")
+
     def test_bad_arguments_exit_64_instead_of_looping(self):
         for argv in (["--target"], ["--staging"], ["--target", "abc"], ["--target", "-1"],
                      ["--pool"], ["--claims"], ["--pool", "x"]):

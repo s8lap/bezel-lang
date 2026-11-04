@@ -62,6 +62,11 @@ Everything the daemon reports is now an OBSERVED quantity, never a guess:
              build nests several make levels and each level has its own
              implicit slot; a plain `make` build has one.
   build_jobs the running jobs under the joined builds.
+  tests      (`status` only) live bezel_tests_* processes, box-wide, and
+             tests_holding / tests_wait of them holding / queued for a token.
+             Every test process takes one through scripts/test_token.sh
+             (tests/test_main.cpp); its holder is a `bzl-tok-held` launcher,
+             so it is already in tok_held and the audit needs no change.
 
 The audit re-mints a token only when the deficit is PROVABLE: the pool is
 short by more than the launchers hold AND more than any joined build could be
@@ -249,6 +254,63 @@ def expected_outstanding(fifo: str, self_pid: int) -> tuple[int, int, int]:
     return obs.held, obs.builds, obs.launchers
 
 
+TEST_PREFIX = "bezel_tests"
+
+
+def _ppid(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _is_test_comm(comm: str) -> bool:
+    # comm is truncated at 15 characters: bezel_tests_codegen reads as
+    # `bezel_tests_cod`, so match the prefix.
+    return comm.startswith(TEST_PREFIX)
+
+
+def test_pids() -> set[int]:
+    """The live test processes, box-wide (see `test_census`)."""
+    tests = set()
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if _is_test_comm(_comm(pid)) and not _is_test_comm(_comm(_ppid(pid))):
+            tests.add(pid)
+    return tests
+
+
+def test_census(fifo: str, self_pid: int) -> tuple[int, int, int]:
+    """(live test processes, those holding a pool token, those queued for one).
+
+    CLIENT SIDE ONLY (`status`): the daemon's audit does not need it, because
+    a test's token is held by a `bzl-tok-held` child (scripts/test_token.sh,
+    spawned by tests/test_main.cpp) that the audit already counts in tok_held.
+
+    A test process is a process whose comm starts with `bezel_tests` and whose
+    parent's does not: the fork-isolated `Driver::compileFile` children carry
+    their parent's comm and are part of the same run, not runs of their own.
+    It holds a token when one of its children is a `bzl-tok-held` FIFO holder,
+    and is queued for one when that child reads `bzl-tok-wait`.
+    Measured 2026-11-04 ~19:30, before tests took tokens: the pool read
+    `available=20 held=0` while ~20 bezel_tests_* processes ran."""
+    tests = test_pids()
+    holding, waiting = set(), set()
+    for pid in _fifo_holders(fifo, self_pid):
+        comm = _comm(pid)
+        if comm in (LAUNCHER_HOLDING, LAUNCHER_WAITING):
+            parent = _ppid(pid)
+            if parent in tests:
+                (holding if comm == LAUNCHER_HOLDING else waiting).add(parent)
+    return len(tests), len(holding), len(waiting)
+
+
 def _count_procs(names: tuple[str, ...]) -> int:
     n = 0
     for name in os.listdir("/proc"):
@@ -422,9 +484,9 @@ def status(d: str) -> int:
     obs = observe(p["fifo"], os.getpid())
     n = _read(p["tokens"])
     pid = _read(p["pid"])
-    # The pool's own state comes first and in this order, because
-    # `run_status.sh` shows the first 80 characters of this line and the
-    # operator reads it there:
+    # The pool's own state comes first and in this order (`run_status.sh`
+    # reads these fields by NAME and splits them into a compiles part and a
+    # tests part; an operator reading the raw line reads them in this order):
     #   available  tokens physically in the FIFO (the pool's occupancy)
     #   held       tokens checked OUT of the pool (pool size - occupancy)
     #   tok_held   launchers holding a token each (a job that has a slot)
@@ -442,10 +504,21 @@ def status(d: str) -> int:
     # gap between them (clang far above held + #builds) is the leak signature
     # this field exists to make visible immediately.
     clang = _count_procs(("clang", "clang++", "cc1plus"))
+    # `tests` / `tests_holding` / `tests_wait`: test processes (bezel_tests_*)
+    # alive, how many hold a token and how many are queued for one. They are
+    # part of tok_held / tok_wait, so the compiles' share is tok_held -
+    # tests_holding (and tok_wait - tests_wait). A gap between tests and tests_holding
+    # is a test run that is NOT rationed (BEZEL_JOBSERVER=off, a gate, or a
+    # binary built before test_main took a token) -- which is the measurement
+    # this field exists for: before tests took tokens the pool read
+    # `available=20 held=0` with ~20 test processes running.
+    tests, tests_holding, tests_wait = test_census(p["fifo"], os.getpid())
     print(f"build_jobserver: available={obs.available} held={obs.held} "
           f"tok_held={obs.tok_held} tok_wait={obs.tok_wait} "
           f"builds={obs.builds} jobs={int(n) + obs.builds} "
-          f"clang={clang} tokens={n} pid={pid} fifo={p['fifo']}")
+          f"clang={clang} tests={tests} tests_holding={tests_holding} "
+          f"tests_wait={tests_wait} "
+          f"tokens={n} pid={pid} fifo={p['fifo']}")
     return 0
 
 

@@ -114,7 +114,25 @@ probe_jobserver() {
   have systemctl && act="$(systemctl --user is-active bezel-jobserver 2>/dev/null)"
   [ -n "$act" ] || act="unknown"
   if [ -x "$HERE/jobserver_ctl.sh" ]; then
-    line="$(timeout 5 "$HERE/jobserver_ctl.sh" status 2>/dev/null | head -n 1 | cut -c1-80)"
+    line="$(timeout 5 "$HERE/jobserver_ctl.sh" status 2>/dev/null | head -n 1)"
+  fi
+  # Compiles and tests separately. Both kinds of job hold tokens (tests since
+  # test_main.cpp took one, 2026-11-04), and a single tok_held hid which was
+  # which; `tests` above `tests_holding` is a test run the pool does not ration.
+  # A line without the fields (an older build_jobserver.py) is shown as it was.
+  local f v w
+  declare -A kv=()
+  for f in $line; do
+    case "$f" in *=*) kv["${f%%=*}"]="${f#*=}" ;; esac
+  done
+  if [ -n "${kv[available]:-}" ] && [ -n "${kv[tests]:-}" ]; then
+    v=$(( ${kv[tok_held]:-0} - ${kv[tests_holding]:-0} ))
+    w=$(( ${kv[tok_wait]:-0} - ${kv[tests_wait]:-0} ))
+    line="pool ${kv[available]}/${kv[tokens]:-?} free, held ${kv[held]:-?}"
+    line+=" | compiles: held $v wait $w builds ${kv[builds]:-?} clang ${kv[clang]:-?}"
+    line+=" | tests: ${kv[tests]} running, ${kv[tests_holding]:-0} holding, ${kv[tests_wait]:-0} waiting"
+  else
+    line="$(printf '%s' "$line" | cut -c1-80)"
   fi
   # Opt-in (CLAUDE.md): off is a legitimate state, so INFO without an ACTION.
   [ "$act" = active ] || st=INFO

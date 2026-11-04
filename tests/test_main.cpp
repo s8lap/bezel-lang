@@ -10,6 +10,10 @@
 #include <unistd.h>
 
 #include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+
+#include <cstring>
 
 #include <fstream>
 #include <iostream>
@@ -157,6 +161,115 @@ static void atomicWriteShardSummary(const std::string& path,
     }
 }
 
+// ── Every test process holds ONE machine-wide build token while it runs ──
+// MEASURED 2026-11-04 ~19:30: `build_jobserver.py status` read `available=20
+// held=0` (the box "idle") while ~20 whole-area bezel_tests_* processes ran
+// across 17 lane worktrees (load 13). The pool rationed only compiles and
+// links; tests took no token, so they were neither counted nor capped. Lanes
+// start them through dev_heavy.sh, through agent_check.sh, and by running the
+// binary directly, so a rule that lives in a script is bypassed by the next
+// command line (the lesson build_token.sh's header records for compiles). The
+// one place every test run passes through is this main().
+//
+// The holder is scripts/test_token.sh, which takes the token through
+// scripts/build_token.sh unchanged: a launcher-aware daemon hands out a FIFO
+// token and the holder reads as `bzl-tok-held` (counted by the daemon's
+// audit, so a test-held token is never re-minted as lost), with no daemon one
+// of the flock slots is taken, and BEZEL_JOBSERVER=off (gate.sh) skips it.
+//
+// It is spawned as a CHILD rather than re-exec'ing this binary under the
+// launcher. Under a re-exec the pid a caller holds would be the bash holder,
+// and bash runs a SIGTERM trap only after its foreground child exits, so
+// `kill <pid>` would no longer stop the test (and SIGKILL would orphan it).
+// The child keeps this process's pid, argv[0] and signal behaviour exactly as
+// they were. Its stdin is a pipe whose write end only this process holds
+// (O_CLOEXEC, so no exec'd clang/ld/native program inherits it): when this
+// process exits, however it exits, the holder reads EOF and returns the token.
+//
+// Taken lazily, before the first test that actually RUNS: an enumeration
+// (BEZEL_TEST_ENUMERATE=1) or a filter that selects nothing takes no token.
+// (`--gtest_list_tests` is NOT a listing here: the binaries ignore argv, so it
+// runs the whole suite and must take a token like any other run.)
+// BEZEL_TEST_TOKEN_HELD is set once the token is held, so a test binary this
+// process starts never queues for a second token while this one holds the
+// first (with a drained pool that would deadlock).
+static void holdTestToken() {
+    if (const char* js = std::getenv("BEZEL_JOBSERVER");
+        js && std::string(js) == "off")
+        return;
+    if (const char* held = std::getenv("BEZEL_TEST_TOKEN_HELD"); held && *held)
+        return;
+    const std::string script =
+        std::string(::bezel::test::build_paths::kRepoRootDir) +
+        "/scripts/test_token.sh";
+    if (::access(script.c_str(), R_OK) != 0) return;
+
+    // Move both pipes above the standard descriptors, so the dup2 calls below
+    // never target a descriptor the pipe itself occupies.
+    auto highPipe = [](int out[2]) -> bool {
+        int p[2];
+        if (::pipe2(p, O_CLOEXEC) != 0) return false;
+        for (int i = 0; i < 2; ++i) {
+            out[i] = ::fcntl(p[i], F_DUPFD_CLOEXEC, 10);
+            ::close(p[i]);
+        }
+        if (out[0] >= 0 && out[1] >= 0) return true;
+        if (out[0] >= 0) ::close(out[0]);
+        if (out[1] >= 0) ::close(out[1]);
+        return false;
+    };
+    int life[2], ready[2];
+    if (!highPipe(life)) return;
+    if (!highPipe(ready)) {
+        ::close(life[0]);
+        ::close(life[1]);
+        return;
+    }
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, life[0], 0);
+    posix_spawn_file_actions_adddup2(&fa, ready[1], 3);
+    // The holder writes nothing; keeping the caller's stdout/stderr open in it
+    // would only make a `$(bezel_tests_x)` / `| tee` wait on one more writer.
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    std::string arg1 = script;
+    char bash[] = "bash";
+    char* const args[] = {bash, arg1.data(), nullptr};
+    pid_t pid = -1;
+    const int rc = ::posix_spawnp(&pid, "bash", &fa, nullptr, args, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    ::close(life[0]);
+    ::close(ready[1]);
+    if (rc != 0) {
+        ::close(life[1]);
+        ::close(ready[0]);
+        std::fprintf(stderr, "bezel_tests: cannot start %s (%s); running "
+                     "without a build token\n", script.c_str(), std::strerror(rc));
+        return;
+    }
+    // life[1] stays open for the rest of this process: it IS the token's lease.
+    pollfd pfd{ready[0], POLLIN, 0};
+    int pr;
+    while ((pr = ::poll(&pfd, 1, 2000)) < 0 && errno == EINTR) {}
+    if (pr == 0)
+        std::fprintf(stderr, "bezel_tests: waiting for a build token (the pool "
+                     "is busy: python3 scripts/build_jobserver.py status)\n");
+    char byte = 0;
+    ssize_t n;
+    while ((n = ::read(ready[0], &byte, 1)) < 0 && errno == EINTR) {}
+    ::close(ready[0]);
+    if (n == 1) {
+        ::setenv("BEZEL_TEST_TOKEN_HELD", "1", /*overwrite=*/1);
+    } else {
+        // build_token.sh refused (no usable slot dir) or bash died: say so and
+        // run, rather than failing a test run on a jobserver problem.
+        ::close(life[1]);
+        std::fprintf(stderr, "bezel_tests: the token holder exited without a "
+                     "token; running without one\n");
+    }
+}
+
 int main(int argc, char** argv) {
     // ── Point TMPDIR at the disk-backed scratch base, before any test runs ──
     // 247 test TUs place their temp files with std::filesystem::temp_directory_path(),
@@ -261,6 +374,11 @@ int main(int argc, char** argv) {
             std::cout << test.suite << "." << test.name << "\n";
             continue;
         }
+
+        // One token for this process's lifetime, taken before the first test
+        // that actually runs (see holdTestToken).
+        static const bool tokenTaken = (holdTestToken(), true);
+        (void)tokenTaken;
 
         ::bezel::test::currentTestFailed() = false;
         std::cout << "[ RUN  ] " << test.suite << "." << test.name << "\n";

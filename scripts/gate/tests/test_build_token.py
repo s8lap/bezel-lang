@@ -23,6 +23,16 @@ Pin groups:
   5. Crash safety: a SIGKILLed launcher's token is restored by the audit; a
      job never inherits the FIFO; a waiter whose daemon dies falls back to
      the slots instead of hanging.
+  6. Test runs take a token (scripts/test_token.sh, spawned by
+     tests/test_main.cpp). MEASURED 2026-11-04 ~19:30: the pool read
+     `available=20 held=0` while ~20 bezel_tests_* processes ran. A fake test
+     process speaks the same descriptor protocol test_main.cpp does: one token
+     is held while it runs and comes home when it exits (also on SIGKILL of
+     the test); the daemon never re-mints it; a nested run does not take a
+     second one; BEZEL_JOBSERVER=off bypasses; a SIGKILLed holder's token is
+     restored by the audit; `status` counts the test and its token. When a
+     hooked bezel_tests_support is built, the same is checked on the real
+     binary, plus the enumeration bypass.
 Everything runs in a TemporaryDirectory; nothing touches the production pool.
 """
 
@@ -334,6 +344,307 @@ class CrashSafetyTest(LauncherTestBase):
             for h in holders + ([w] if w and w.poll() is None else []):
                 os.killpg(h.pid, signal.SIGKILL)
                 h.wait(timeout=10)
+
+
+TEST_TOKEN = os.path.abspath(os.path.join(SCRIPTS, "test_token.sh"))
+
+# A stand-in for a bezel_tests_<area> process: the descriptor protocol of
+# tests/test_main.cpp's holdTestToken, verbatim. Prints `held` / `none` to the
+# marker once the holder has answered, then sleeps argv[2] seconds. With
+# argv[3] it starts a NESTED fake test (with this process's environment, as a
+# test binary started by a test would) and waits for it.
+FAKE_TEST = r"""
+import os, sys, time
+marker, secs = sys.argv[1], float(sys.argv[2])
+with open("/proc/self/comm", "w") as f:
+    f.write("bezel_tests_fak")
+def high_pipe():
+    r, w = os.pipe2(os.O_CLOEXEC)
+    out = [fcntl.fcntl(x, fcntl.F_DUPFD_CLOEXEC, 10) for x in (r, w)]
+    os.close(r); os.close(w)
+    return out
+import fcntl
+life_r, life_w = high_pipe()
+ready_r, ready_w = high_pipe()
+if os.environ.get("BEZEL_JOBSERVER") == "off" or os.environ.get("BEZEL_TEST_TOKEN_HELD"):
+    got = b""
+else:
+    os.posix_spawnp("bash", ["bash", os.environ["FAKE_TEST_TOKEN_SCRIPT"]], os.environ,
+                    file_actions=[(os.POSIX_SPAWN_DUP2, life_r, 0),
+                                  (os.POSIX_SPAWN_DUP2, ready_w, 3),
+                                  (os.POSIX_SPAWN_OPEN, 1, "/dev/null", os.O_WRONLY, 0)])
+    os.close(life_r); os.close(ready_w)
+    got = os.read(ready_r, 1)
+    if got:
+        os.environ["BEZEL_TEST_TOKEN_HELD"] = "1"
+with open(marker, "w") as f:
+    f.write("held" if got else "none")
+if len(sys.argv) > 3:
+    import subprocess
+    subprocess.run([sys.executable, __file__, sys.argv[3], str(secs)], check=True)
+else:
+    time.sleep(secs)
+"""
+
+
+class TestRunTakesATokenTest(LauncherTestBase):
+    """Group 6: the test-run token (scripts/test_token.sh)."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = os.path.join(self.dir, "fake_test.py")
+        with open(self.fake, "w") as f:
+            f.write(FAKE_TEST)
+        self.env["FAKE_TEST_TOKEN_SCRIPT"] = TEST_TOKEN
+        self.env.pop("BEZEL_TEST_TOKEN_HELD", None)
+        self.procs = []
+
+    def tearDown(self):
+        for p in self.procs:
+            if p.poll() is None:
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait(timeout=10)
+        super().tearDown()
+
+    def fake_test(self, name, secs, env=None, nested=None):
+        marker = os.path.join(self.dir, name)
+        argv = [sys.executable, self.fake, marker, str(secs)]
+        if nested:
+            argv.append(os.path.join(self.dir, nested))
+        p = subprocess.Popen(argv, env=env or self.env, start_new_session=True)
+        self.procs.append(p)
+        return p, marker
+
+    def children(self, pid):
+        try:
+            with open(f"/proc/{pid}/task/{pid}/children") as f:
+                return [int(c) for c in f.read().split()]
+        except OSError:
+            return []
+
+    def holder_of(self, pid):
+        for c in self.children(pid):
+            if _slurp(f"/proc/{c}/comm").strip().startswith("bzl-tok-"):
+                return c
+        return None
+
+    def script(self, env, stdin, ready):
+        """test_token.sh with `stdin` on fd 0 and `ready` on fd 3, the way
+        test_main.cpp spawns it."""
+        return subprocess.Popen(
+            ["bash", "-c", f'exec bash "$0" 3>&{ready} {ready}>&-', TEST_TOKEN],
+            env=env, stdin=stdin, pass_fds=(ready,), start_new_session=True)
+
+    def census(self, pid):
+        """(is `pid` counted as a test, tests holding a token of THIS pool,
+        tests queued for one). `tests` itself is box-wide, so other lanes'
+        test runs are in it; the holding/waiting counts are per pool."""
+        _, holding, waiting = bj.test_census(os.path.join(self.dir, "fifo"), os.getpid())
+        return pid in bj.test_pids(), holding, waiting
+
+    def test_one_token_held_while_the_test_runs_and_returned_on_exit(self):
+        # Runs across ~15 audits (interval 0.2 s, confirm 2): a daemon that did
+        # not count the test's holder would re-mint its token (avail back to N).
+        p, marker = self.fake_test("t1", 3.0)
+        self.assertTrue(_wait_for(lambda: _slurp(marker) == "held"), "no token taken")
+        seen = []
+        while p.poll() is None:
+            seen.append(self.avail())
+            time.sleep(0.1)
+            if len(seen) == 10:
+                holder = self.holder_of(p.pid)
+                self.assertIsNotNone(holder, "no holder child under the test")
+                self.assertEqual(_slurp(f"/proc/{holder}/comm").strip(), "bzl-tok-held")
+                self.assertEqual(self.census(p.pid), (True, 1, 0))
+        self.assertEqual(p.wait(), 0)
+        self.assertGreaterEqual(len(seen), 15)
+        self.assertEqual(set(seen[:-2]), {self.TOKENS - 1},
+                         "the test's token was re-minted or never taken")
+        self.assertTrue(_wait_for(lambda: self.avail() == self.TOKENS),
+                        "the test's token never came home")
+        repaired = [line.split("\t")[-1].strip()
+                    for line in _slurp(os.path.join(self.dir, "samples.tsv")).splitlines()
+                    if not line.startswith("epoch")]
+        self.assertTrue(repaired and set(repaired) == {"0"},
+                        f"the audit repaired the pool while a test held a token: {repaired}")
+
+    def test_a_sigkilled_test_returns_its_token(self):
+        # The holder's stdin is a pipe only the test writes: SIGKILL of the
+        # test is EOF for the holder, which then hands the token back itself.
+        p, marker = self.fake_test("t2", 60)
+        self.assertTrue(_wait_for(lambda: _slurp(marker) == "held"))
+        holder = self.holder_of(p.pid)
+        self.assertIsNotNone(holder)
+        os.kill(p.pid, signal.SIGKILL)
+        p.wait(timeout=10)
+        self.assertTrue(_wait_for(lambda: self.avail() == self.TOKENS, timeout=5),
+                        "a SIGKILLed test's token never came home")
+        self.assertTrue(_wait_for(lambda: not os.path.exists(f"/proc/{holder}"), timeout=5),
+                        "the holder outlived its test")
+
+    def test_a_nested_test_does_not_take_a_second_token(self):
+        # With a pool of 1, a nested run that queued for a second token while
+        # its parent held the only one would deadlock.
+        drain = os.open(os.path.join(self.dir, "fifo"), os.O_RDWR | os.O_NONBLOCK)
+        try:
+            os.read(drain, self.TOKENS - 1)  # leave exactly one token
+            p, marker = self.fake_test("outer", 0.5, nested="inner")
+            self.assertEqual(p.wait(timeout=30), 0, "the nested run deadlocked")
+            self.assertEqual(_slurp(marker), "held")
+            self.assertEqual(_slurp(os.path.join(self.dir, "inner")), "none")
+        finally:
+            os.write(drain, b"+" * (self.TOKENS - 1))
+            os.close(drain)
+        self.assertTrue(_wait_for(lambda: self.avail() == self.TOKENS))
+
+    def test_script_honours_token_held_by_itself(self):
+        # test_token.sh's own guard (test_main.cpp checks it first, too).
+        r, w = os.pipe()
+        lr, lw = os.pipe()
+        env = dict(self.env, BEZEL_TEST_TOKEN_HELD="1")
+        p = self.script(env, lr, w)
+        os.close(w); os.close(lr)
+        self.assertEqual(os.read(r, 1), b"T")
+        self.assertEqual(p.wait(timeout=10), 0)
+        self.assertEqual(self.avail(), self.TOKENS)
+        os.close(r); os.close(lw)
+
+    def test_jobserver_off_takes_nothing(self):
+        env = dict(self.env, BEZEL_JOBSERVER="off",
+                   BEZEL_BUILD_TOKEN_SLOTS_DIR=os.path.join(self.dir, "unused"))
+        p, marker = self.fake_test("t3", 1.0, env=env)
+        self.assertTrue(_wait_for(lambda: _slurp(marker) == "none"))
+        self.assertEqual(self.avail(), self.TOKENS)
+        self.assertIsNone(self.holder_of(p.pid))
+        self.assertEqual(self.census(p.pid), (True, 0, 0))
+        self.assertEqual(p.wait(timeout=10), 0)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "unused")))
+
+    def test_jobserver_off_through_the_script_itself(self):
+        # build_token.sh case 1: the script runs straight through, no token.
+        r, w = os.pipe()
+        lr, lw = os.pipe()
+        env = dict(self.env, BEZEL_JOBSERVER="off")
+        p = self.script(env, lr, w)
+        os.close(w); os.close(lr)
+        self.assertEqual(os.read(r, 1), b"T")
+        self.assertEqual(self.avail(), self.TOKENS)
+        os.close(lw)  # the "test" exits
+        self.assertEqual(p.wait(timeout=10), 0)
+        os.close(r)
+
+    def test_a_sigkilled_holder_token_is_restored_by_the_audit(self):
+        p, marker = self.fake_test("t4", 60)
+        self.assertTrue(_wait_for(lambda: _slurp(marker) == "held"))
+        holder = self.holder_of(p.pid)
+        self.assertIsNotNone(holder)
+        os.kill(holder, signal.SIGKILL)
+        self.assertTrue(_wait_for(lambda: self.avail() == self.TOKENS, timeout=10),
+                        "a SIGKILLed holder's token was never restored")
+        self.assertEqual(p.poll(), None, "killing the holder killed the test")
+
+    def test_a_test_queues_when_the_pool_is_drained(self):
+        holders = [subprocess.Popen([LAUNCHER, "sleep", "30"], env=self.env,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+                   for _ in range(self.TOKENS)]
+        self.procs.extend(holders)
+        self.assertTrue(_wait_for(lambda: self.avail() == 0))
+        p, marker = self.fake_test("t5", 0.2)
+        self.assertTrue(_wait_for(lambda: self.census(p.pid) == (True, 0, 1)),
+                        "the queued test is not reported as waiting")
+        self.assertEqual(_slurp(marker), "", "the test ran without a token")
+        os.killpg(holders[0].pid, signal.SIGTERM)
+        self.assertTrue(_wait_for(lambda: _slurp(marker) == "held"))
+        self.assertEqual(p.wait(timeout=10), 0)
+
+    def test_status_line_reports_tests_separately(self):
+        p, marker = self.fake_test("t6", 3.0)
+        self.assertTrue(_wait_for(lambda: _slurp(marker) == "held"))
+        out = subprocess.run([sys.executable, DAEMON, "status", "--dir", self.dir],
+                             env=self.env, capture_output=True, text=True, timeout=20).stdout
+        self.assertIn("tok_held=1 ", out)
+        self.assertRegex(out, r" tests=[1-9]\d* tests_holding=1 tests_wait=0 ")
+
+
+def _hooked_test_binary():
+    """build/tests/bezel_tests_support, if it is built with the token hook."""
+    root = os.path.abspath(os.path.join(SCRIPTS, ".."))
+    manifest = os.path.join(root, "build", "tests", "test_binaries.txt")
+    for line in _slurp(manifest).splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0] == "support" and os.path.exists(parts[1]):
+            with open(parts[1], "rb") as f:
+                if b"/scripts/test_token.sh" in f.read():
+                    return parts[1]
+    return None
+
+
+HOOKED = _hooked_test_binary()
+
+
+@unittest.skipUnless(HOOKED, "no bezel_tests_support built with the test-token hook")
+class RealTestBinaryTakesATokenTest(LauncherTestBase):
+    """Group 6 on the real binary (tests/test_main.cpp holdTestToken)."""
+    TOKENS = 1
+    # Fast and always registered: the harness's own shard/registry tests.
+    FILTER = os.environ.get("BEZEL_TOKEN_TEST_FILTER", "")
+
+    def setUp(self):
+        super().setUp()
+        self.env.pop("BEZEL_TEST_TOKEN_HELD", None)
+        self.env["BEZEL_SHARD_COUNT"] = "1"
+        names = subprocess.run([HOOKED], env=dict(self.env, BEZEL_TEST_ENUMERATE="1"),
+                               capture_output=True, text=True, timeout=60).stdout.split()
+        self.assertTrue(names, "the binary enumerated nothing")
+        self.env["BEZEL_TEST_LIST"] = os.path.join(self.dir, "one.txt")
+        with open(self.env["BEZEL_TEST_LIST"], "w") as f:
+            f.write((self.FILTER or names[0]) + "\n")
+        # Drain the pool: a run that takes a token must now wait.
+        self.hog = subprocess.Popen([LAUNCHER, "sleep", "120"], env=self.env,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+        self.assertTrue(_wait_for(lambda: self.avail() == 0))
+
+    def tearDown(self):
+        if self.hog.poll() is None:
+            os.killpg(self.hog.pid, signal.SIGKILL)
+            self.hog.wait(timeout=10)
+        super().tearDown()
+
+    def run_bin(self, env, timeout):
+        return subprocess.run([HOOKED], env=env, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, text=True, timeout=timeout)
+
+    def test_a_run_waits_for_a_token_and_returns_it(self):
+        p = subprocess.Popen([HOOKED], env=self.env, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                p.wait(timeout=3)
+            os.killpg(self.hog.pid, signal.SIGTERM)
+            self.hog.wait(timeout=10)
+            self.assertEqual(p.wait(timeout=120), 0)
+            self.assertIn("waiting for a build token", p.stderr.read())
+        finally:
+            if p.poll() is None:
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+            p.stderr.close()
+        self.assertTrue(_wait_for(lambda: self.avail() == self.TOKENS))
+
+    def test_enumeration_takes_no_token(self):
+        r = self.run_bin(dict(self.env, BEZEL_TEST_ENUMERATE="1"), 60)
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("waiting for a build token", r.stderr)
+
+    def test_jobserver_off_takes_no_token(self):
+        r = self.run_bin(dict(self.env, BEZEL_JOBSERVER="off"), 120)
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("waiting for a build token", r.stderr)
+
+    def test_token_already_held_takes_no_second_one(self):
+        r = self.run_bin(dict(self.env, BEZEL_TEST_TOKEN_HELD="1"), 120)
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("waiting for a build token", r.stderr)
 
 
 class DaemonFeaturesTest(LauncherTestBase):
