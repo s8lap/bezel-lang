@@ -6404,6 +6404,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // An IMPORTED user type of the same name is NOT matched:
             // `builtinTypeName` returns {} for it (its `moduleName` is
             // non-empty), so a user `Lib.DateTime` keeps the path it had.
+            //
+            // fix #8048 (stdlib §2.6 / §5, v0.355): a value-typed U may be
+            // MULTI-WORD — `Guid` is a 128-bit `{i64,i64}` record (stdlib
+            // §2.6) — so the accumulator must hold the WHOLE value, not one
+            // machine word. `Guid` is recognised by the same STATIC-type
+            // spelling the #7874 arm uses (so an IMPORTED user type of the
+            // same name is not matched either), and a NULLABLE U is excluded
+            // (spec §14.2: "A type-bound constraint — naming a class or
+            // interface — implies non-null T").
             std::string_view uValueHead;
             if (uRef && !uRef->nullable &&
                 uRef->kind == sema::TypeRef::Kind::Named) {
@@ -6414,19 +6423,27 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             const bool uIsTimeValue = uIsDateTime ||
                 uValueHead == "TimeSpan" || uValueHead == "DateOnly" ||
                 uValueHead == "TimeOnly";
+            // fix #8048: `Guid` (stdlib §2.6) is a MULTI-WORD value record —
+            // a 128-bit `{i64,i64}` struct — so it needs the same
+            // value-keyed accumulator as the four one-word temporal records,
+            // and a comparison of its OWN (§2.6's 16-byte lexicographic
+            // order) rather than a scalar-word one.
+            const bool uIsGuid = (uValueHead == "Guid");
+            const bool uIsValueRecord = uIsTimeValue || uIsGuid;
             sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(retP);
             const bool accIsFP = (retP == sema::PrimitiveType::Float ||
                                   retP == sema::PrimitiveType::Double);
             const bool accIsUnsigned = isUnsignedPrim(retP);
             llvm::Type* accLLTy = lowerTypeRef(retTyRef);
             if (!accLLTy) accLLTy = i32();
-            // fix #7874: a VALUE-TYPE U carries its own word, and the
-            // selector is lowered against the VALUE type (so the closure
-            // returns the value's word, not an `i32`).
-            if (uIsTimeValue && !call.args.empty()) {
+            // fix #7874 / #8048: a VALUE-TYPE U carries its own
+            // REPRESENTATION, and the selector is lowered against the VALUE
+            // type (so the closure returns the value's word — or, for a
+            // `Guid`, the value's WHOLE `{i64,i64}` — not an `i32`).
+            if (uIsValueRecord && !call.args.empty()) {
                 retTyRef = uRef;
                 accLLTy = lowerTypeRef(uRef);
-                if (!accLLTy) accLLTy = i64();
+                if (!accLLTy) accLLTy = uIsGuid ? guidStructType() : i64();
             }
             llvm::Value* closure = call.args.empty() ? nullptr
                 : lowerLinqLambda(call.args[0].value.get(), retTyRef);
@@ -6441,12 +6458,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* accSlot  = entryAlloca(accLLTy);
             auto* initSlot = entryAlloca(i1());
             builder_.CreateStore(builder_.getInt64(0), idxSlot);
-            builder_.CreateStore(
+            // fix #8048: the accumulator's ZERO depends on its TYPE: a
+            // floating-point accumulator is 0.0, an integer accumulator is 0,
+            // and a STRUCT accumulator (a `Guid`'s `{i64,i64}`) is the
+            // all-zero aggregate.
+            llvm::Value* accInit =
                 accIsFP ? static_cast<llvm::Value*>(
                               llvm::ConstantFP::get(accLLTy, 0.0))
-                        : static_cast<llvm::Value*>(
-                              llvm::ConstantInt::get(accLLTy, 0)),
-                accSlot);
+                        : (accLLTy->isIntegerTy()
+                               ? static_cast<llvm::Value*>(
+                                     llvm::ConstantInt::get(accLLTy, 0))
+                               : static_cast<llvm::Value*>(
+                                     llvm::ConstantAggregateZero::get(accLLTy)));
+            builder_.CreateStore(accInit, accSlot);
             builder_.CreateStore(builder_.getFalse(), initSlot);
             auto* condBB = llvm::BasicBlock::Create(llvm_, "mm.c",  currentFn_);
             auto* bodyBB = llvm::BasicBlock::Create(llvm_, "mm.b",  currentFn_);
@@ -6483,14 +6507,42 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 cmpVal = dtTicksOf(val);
                 cmpAcc = dtTicksOf(acc);
             }
-            llvm::Value* cmp = accIsFP
-                ? (isMax ? builder_.CreateFCmpOGT(cmpVal, cmpAcc)
-                         : builder_.CreateFCmpOLT(cmpVal, cmpAcc))
-                : (isMax
-                       ? (accIsUnsigned ? builder_.CreateICmpUGT(cmpVal, cmpAcc)
-                                        : builder_.CreateICmpSGT(cmpVal, cmpAcc))
-                       : (accIsUnsigned ? builder_.CreateICmpULT(cmpVal, cmpAcc)
-                                        : builder_.CreateICmpSLT(cmpVal, cmpAcc)));
+            llvm::Value* cmp = nullptr;
+            if (uIsGuid) {
+                // fix #8048 (stdlib §2.6, v0.355): a `Guid` has NO scalar
+                // order — §2.6 spells its own out: "CompareTo = lexicographic
+                // over the 16 canonical big-endian bytes". The runtime's
+                // `bz_guid_compare` IS that comparison — it is the very
+                // function the `Guid.CompareTo` member call dispatches to (a
+                // `memcmp` over the 16 raw bytes) — so the accumulator's
+                // order is delegated to it rather than re-implemented here,
+                // and the winner's ORIGINAL value is kept (below), so the
+                // result is the selected `Guid` itself.
+                //
+                // ⚠ THE ORDER IS NOT "compare the two 64-bit halves as
+                // integers": the 16 canonical bytes live in the two halves
+                // LITTLE-ENDIAN, so the canonical order compares the LEAST
+                // significant byte of the low half FIRST. A half-word
+                // comparison would answer the opposite pair.
+                llvm::Value* valSlot = entryAlloca(accLLTy);
+                builder_.CreateStore(val, valSlot);
+                auto* cmpFn =
+                    declareC("bz_guid_compare", i32(), {ptrTy(), ptrTy()});
+                llvm::Value* cmpRes =
+                    builder_.CreateCall(cmpFn, {valSlot, accSlot}, "guid.cmp");
+                llvm::Value* zero = builder_.getInt32(0);
+                cmp = isMax ? builder_.CreateICmpSGT(cmpRes, zero)
+                            : builder_.CreateICmpSLT(cmpRes, zero);
+            } else {
+                cmp = accIsFP
+                    ? (isMax ? builder_.CreateFCmpOGT(cmpVal, cmpAcc)
+                             : builder_.CreateFCmpOLT(cmpVal, cmpAcc))
+                    : (isMax
+                           ? (accIsUnsigned ? builder_.CreateICmpUGT(cmpVal, cmpAcc)
+                                            : builder_.CreateICmpSGT(cmpVal, cmpAcc))
+                           : (accIsUnsigned ? builder_.CreateICmpULT(cmpVal, cmpAcc)
+                                            : builder_.CreateICmpSLT(cmpVal, cmpAcc)));
+            }
             builder_.CreateCondBr(builder_.CreateOr(builder_.CreateNot(inited), cmp),
                                   updBB, nextBB);
             builder_.SetInsertPoint(updBB);
