@@ -47922,22 +47922,49 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
     // lowerExpr(tcs.Task.Result) before lowerLocalDecl registers the disposal), and
     // the dynamic dispose null-guards the load — the `result.fault` path bypasses
     // the inner `do` block entirely and never triggers this disposal.
+    //
+    // fix #8131 (§28.3 / §30.3 / §7.5, v0.355): the SAME read spelled with the
+    // null-conditional `?.` (`using var r := t?.Result`) is a DIFFERENT AST node
+    // (ast::NullCondMemberExpr), so the MemberAccessExpr test below missed it and
+    // the TRANSFERRED result was never discharged at scope end — it leaked
+    // (MEASURED: 16 B per read; 1600 B over a 100x loop under ASan/LSan; the
+    // `?.` read itself was correct after #7896/#7981, so the leak is the whole
+    // defect). §30.3's transfer rule is SPELLING-INDEPENDENT — reading `Result`
+    // on a COMPLETED OwningTask in an owned-consuming position transfers
+    // ownership exactly like `await`, whichever spelling performs the read — and
+    // §7.5 makes the `?.` read yield the NULLABLE of the member type, so the
+    // slot holds a null pointer when the receiver is null. The dynamic-dispose
+    // path NULL-GUARDS its load, so the disposal is skipped exactly on that
+    // path (a null receiver disposes nothing) and fires exactly once otherwise.
+    // The `?.` lowering (LlvmBackend_Exprs.cpp, fix #7896/#7981) routes the read
+    // through the SAME `.` lowering over a synthetic MemberAccessExpr, so the
+    // `bz_task_take_result` drain that keeps the task's own disposal from
+    // double-freeing the transferred value runs on this spelling too.
     if (!ld->type) {
+        // The receiver of the `Result` read, for EITHER spelling.
+        const ast::Expr* resultRecv = nullptr;
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 ld->initializer.get())) {
-            if (ma->member == "Result" && ma->target) {
-                const sema::TypeRef* targetTy = ctx_.exprType(*ma->target);
-                if (targetTy && targetTy->kind == sema::TypeRef::Kind::Named &&
-                    !targetTy->declaration && targetTy->astNode &&
-                    targetTy->astNode->name &&
-                    !targetTy->astNode->name->parts.empty() &&
-                    targetTy->headName() == "OwningTask" &&
-                    !targetTy->genericArgs.empty() && targetTy->genericArgs[0]) {
-                    const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
-                    if (isClassOrInterfaceRef(initTy) ||
-                        isClassOrInterfaceRef(resolveTypeParamRef(initTy)))
-                        return true;
-                }
+            if (ma->member == "Result" && ma->target)
+                resultRecv = ma->target.get();
+        } else if (auto* nm =
+                       dynamic_cast<const ast::NullCondMemberExpr*>(
+                           ld->initializer.get())) {
+            if (nm->member == "Result" && nm->target)
+                resultRecv = nm->target.get();
+        }
+        if (resultRecv) {
+            const sema::TypeRef* targetTy = ctx_.exprType(*resultRecv);
+            if (targetTy && targetTy->kind == sema::TypeRef::Kind::Named &&
+                !targetTy->declaration && targetTy->astNode &&
+                targetTy->astNode->name &&
+                !targetTy->astNode->name->parts.empty() &&
+                targetTy->headName() == "OwningTask" &&
+                !targetTy->genericArgs.empty() && targetTy->genericArgs[0]) {
+                const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+                if (isClassOrInterfaceRef(initTy) ||
+                    isClassOrInterfaceRef(resolveTypeParamRef(initTy)))
+                    return true;
             }
         }
     }
