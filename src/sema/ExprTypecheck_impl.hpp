@@ -288,6 +288,17 @@ std::string otherValueTypePatternMessage(std::string_view patName);
 // out: ExprTypecheck_Calls.cpp.
 bool builtinHeadReachesObjectExtension(std::string_view head);
 
+// fix #7756 (§26.5 rules 1-2, v0.355): is `head` a built-in whose DECLARED
+// instance surface sema can answer BY NAME — a stdlib §2.5-§2.7 value record
+// or a concrete collection head (stdlib §4.4-§4.11, §4.17-§4.19)? Only such a
+// head's `builtinClassSym` stub (the TypeRef a static factory or a built-in
+// call result carries) is matched against an extension head by name in
+// `extensionTargetMatchesReceiver`: rule 2's search may reach a stub-typed
+// receiver only where rule 1's by-name commitment can be made first
+// (`ExprTC::resolveMemberAccessWithRule1`), or a same-named extension would
+// shadow a declared built-in member. Defined in ExprTypecheck_Exprs.cpp.
+bool builtinStubHeadHasDeclaredSurface(std::string_view head);
+
 // fix #8012 (stdlib §2.5, §5.1, v0.350): a DECLARED PARAMETER TYPE the
 // ONE built-in parameter table's `kinds` bit set cannot express — the
 // RECORD types stdlib §2.5's temporal records declare at their member

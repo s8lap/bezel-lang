@@ -2964,6 +2964,14 @@ bool builtinSurfaceDeclaresArity0Member(const TypeRef* recvTy,
 
 }  // namespace
 
+// fix #7756 (§26.5 rules 1-2, v0.355): see ExprTypecheck_impl.hpp. The two
+// tables are the ones `resolveMemberAccessWithRule1` commits a stub-typed
+// receiver by, so the matcher admits exactly the stubs that commitment covers.
+bool builtinStubHeadHasDeclaredSurface(std::string_view head) {
+    return valueRecordSurfaceOf(head) != nullptr ||
+           common::isConcreteCollectionSurfaceHead(head);
+}
+
 // fix #7970 (§26.5 rule 1, §22.6, stdlib §2.5-§2.7, v0.350): the
 // member-access resolution with §26.5 rule 1 committed for the built-in
 // value records, and the rule-1 "the committed instance lookup then fails"
@@ -3028,27 +3036,64 @@ void ExprTC::resolveMemberAccessWithRule1(const ast::MemberAccessExpr& ma) {
     // is the answer — which is the same verdict the receiver's factory shape
     // (`DateTime.FromTicks(0L)`, the synthetic builtinClassSym stub) already
     // gives, since an extension head does not match that shape either.
+    //
+    // fix #7756 (§26.5 rule 1, §8.1, v0.355; stdlib §2.5-§2.7, §4.19): the
+    // SAME commitment for the receiver's OTHER built-in shape, the
+    // `builtinClassSym` stub a static factory or a built-in call result
+    // carries (`DateTime.FromTicks(0L)`, `d.AddDays(1.0)`, `Guid.Empty`,
+    // `FrozenArray<int>.From(a)`). `extensionTargetMatchesReceiver` matches
+    // that stub against an extension head by name (#7756, so §26.5 rule 2
+    // finds a block for a name the built-in does NOT declare), and the
+    // sentence above ("an extension head does not match that shape either")
+    // no longer holds. The stub declares no member symbols, so the ordinary
+    // walk finds nothing and a same-named extension WON: MEASURED, an
+    // `extension DateTime { AddDays(n: double): int }` typed
+    // `d.AddDays(1.0).AddDays(1.0)` by the extension's `int` while codegen
+    // lowered the built-in, printing pointer bits at exit 0. The stubs
+    // committed here are exactly the ones the matcher admits
+    // (`builtinStubHeadHasDeclaredSurface`), and the surfaces are the same
+    // tables the declaration-less shape is committed by: this file's
+    // value-record rows, the concrete-collection rows codegen's #7946
+    // decline reads (`common::concreteCollectionHeadDeclares`, so sema and
+    // codegen answer from ONE table), and §8.1's four universal `Object`
+    // members, which every built-in type declares through its `Object` base.
+    auto builtinStubCommits = [&](const TypeRef* t) -> bool {
+        if (!t->declaration || isUserDeclaredTypeSym(t->declaration))
+            return false;
+        const std::string_view head = t->declaration->name;
+        if (!builtinStubHeadHasDeclaredSurface(head)) return false;
+        if (const ValueRecordSurface* s = valueRecordSurfaceOf(head))
+            if (surfaceDeclares(*s, ma.member)) return true;
+        if (common::concreteCollectionHeadDeclares(head, ma.member))
+            return true;
+        return ma.member == "ToString" || ma.member == "Equals" ||
+               ma.member == "GetHashCode" || ma.member == "GetType";
+    };
     std::vector<Symbol*> savedChildren;
     std::vector<ExtensionSymbol*> savedImported;
     bool hidExtensions = false;
     if (ma.target) {
         if (TypeRef* recvTy = ctx_.exprType(*ma.target)) {
+            bool commits = false;
             if (recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration &&
                 recvTy->genericArgs.empty()) {
                 const ValueRecordSurface* s =
                     valueRecordSurfaceOf(recvTy->headName());
-                if (s && surfaceDeclares(*s, ma.member)) {
-                    if (ModuleSymbol* mod = ctx_.module()) {
-                        savedChildren = mod->children;
-                        std::vector<Symbol*> kept;
-                        kept.reserve(savedChildren.size());
-                        for (Symbol* c : savedChildren)
-                            if (!dynamic_cast<ExtensionSymbol*>(c)) kept.push_back(c);
-                        mod->children = std::move(kept);
-                        savedImported = std::move(importedExtensions_);
-                        importedExtensions_.clear();
-                        hidExtensions = true;
-                    }
+                commits = s && surfaceDeclares(*s, ma.member);
+            } else if (recvTy->kind == TypeRef::Kind::Named) {
+                commits = builtinStubCommits(recvTy);
+            }
+            if (commits) {
+                if (ModuleSymbol* mod = ctx_.module()) {
+                    savedChildren = mod->children;
+                    std::vector<Symbol*> kept;
+                    kept.reserve(savedChildren.size());
+                    for (Symbol* c : savedChildren)
+                        if (!dynamic_cast<ExtensionSymbol*>(c)) kept.push_back(c);
+                    mod->children = std::move(kept);
+                    savedImported = std::move(importedExtensions_);
+                    importedExtensions_.clear();
+                    hidExtensions = true;
                 }
             }
         }

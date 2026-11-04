@@ -279,3 +279,133 @@ BEZEL_TEST(extension_builtin_stub_receiver_7756, user_class_not_matched_by_built
                   "s.Twice()); return 0; end Main; end C;"),
         "6");
 }
+
+// ---- §26.5 rule 1 on the stub shape: a DECLARED built-in member wins -------
+//
+// §26.5 rule 1 (v0.355): "If `x`'s declared type (or any base type)
+// *declares* any instance member named `Foo` -- of any arity, applicability,
+// or accessibility -- instance resolution is committed and extension blocks
+// are **never consulted** for that name on that receiver."  stdlib §2.5 /
+// §4.19 (v0.355) declare `DateTime.AddDays(days: double): DateTime`,
+// `DateTime.AddYears(years: int): DateTime`, `DateTime.Year: int`,
+// `TimeSpan.TotalSeconds: double`, `Guid.ToByteArray(): owned Array<byte>`
+// and `FrozenArray<T>.ToArray(): owned Array<T>`, plus §8.1's `ToString`.
+// Matching the stub-typed receiver against an extension head (the rows
+// above) must not let a same-named extension shadow those: with the
+// matcher widened alone, sema typed the call by the extension's `int` while
+// codegen lowered the built-in, so the program printed pointer bits at exit
+// 0 (q1, q2, q5, p03a) or a valid program was rejected (q6, p03d).  Every
+// expected line is the built-in's answer.
+
+// The receiver is a built-in CALL RESULT local (`e := d.AddDays(1.0)`).
+BEZEL_TEST(extension_builtin_stub_receiver_7756, rule1_dt_adddays_on_call_result_local) {
+    BEZEL_EXPECT_EQ(
+        out(prog("extension DateTime public method AddDays(n: double): int "
+                 "=> 5; end;",
+                 "var d := new DateTime(2024, 3, 16); "
+                 "var e := d.AddDays(1.0); "
+                 "Console.WriteLine(e.AddDays(1.0).ToString());")),
+        "2024-03-18T00:00:00\n");
+}
+
+// The receiver is the static factory result `DateTime.FromTicks(0L)`.
+BEZEL_TEST(extension_builtin_stub_receiver_7756, rule1_dt_adddays_addyears_on_factory) {
+    BEZEL_EXPECT_EQ(
+        out(prog("extension DateTime public method AddDays(n: double): int "
+                 "=> 5; public method AddYears(n: int): int => 6; end;",
+                 "Console.WriteLine(DateTime.FromTicks(0L).AddDays(1.0)"
+                 ".ToString()); "
+                 "Console.WriteLine(DateTime.FromTicks(0L).AddYears(1)"
+                 ".ToString());")),
+        "0001-01-02T00:00:00\n0002-01-01T00:00:00\n");
+}
+
+// The receiver is the static property `Guid.Empty`; `ToString` (§8.1 /
+// stdlib §2.7) and `ToByteArray` are both declared.
+BEZEL_TEST(extension_builtin_stub_receiver_7756, rule1_guid_tostring_tobytearray_on_static_property) {
+    BEZEL_EXPECT_EQ(
+        out(prog("extension Guid public method ToString(): string => "
+                 "\"EXT\"; public method ToByteArray(): int => 3; end;",
+                 "Console.WriteLine(Guid.Empty.ToString()); "
+                 "Console.WriteLine(Guid.Empty.ToByteArray().ToString());")),
+        "00000000-0000-0000-0000-000000000000\n"
+        "System.Collections.Generic.Array<byte>\n");
+}
+
+// The receiver is the factory result `FrozenArray<int>.From(a)`; stdlib
+// §4.19 declares `ToArray(): owned Array<T>`.
+BEZEL_TEST(extension_builtin_stub_receiver_7756, rule1_frozenarray_toarray_on_factory) {
+    BEZEL_EXPECT_EQ(
+        out(prog("extension FrozenArray<int> public method ToArray(): int "
+                 "=> 98; end;",
+                 "var a: Array<int> := [1, 2, 3]; "
+                 "using var f := FrozenArray<int>.From(a); "
+                 "Console.WriteLine(f.ToArray().ToString());")),
+        "System.Collections.Generic.Array<int>\n");
+}
+
+// The same, with the built-in's `owned Array<int>` result bound and used:
+// the extension's `int` would make `b.Count` a reject.
+BEZEL_TEST(extension_builtin_stub_receiver_7756, rule1_frozenarray_toarray_count_on_factory) {
+    BEZEL_EXPECT_EQ(
+        out(prog("extension FrozenArray<int> public method ToArray(): int "
+                 "=> 98; end;",
+                 "var a: Array<int> := [1, 2, 3]; "
+                 "using var f := FrozenArray<int>.From(a); "
+                 "using var b := f.ToArray(); "
+                 "Console.WriteLine(b.Count);")),
+        "3\n");
+}
+
+// A chain of built-in call results and factories: `ToString` and the
+// property `TotalSeconds` on TimeSpan factories, `AddDays` twice and then
+// the built-in `Year` on a DateTime call result.
+BEZEL_TEST(extension_builtin_stub_receiver_7756, rule1_timespan_datetime_chains) {
+    BEZEL_EXPECT_EQ(
+        out(prog("extension TimeSpan public method ToString(): string => "
+                 "\"EXT\"; public property TotalSeconds: double => 1.5; end; "
+                 "extension DateTime public method ToString(): string => "
+                 "\"EXT\"; public method AddDays(n: double): int => 5; end;",
+                 "Console.WriteLine(TimeSpan.FromTicks(5L).ToString()); "
+                 "Console.WriteLine(TimeSpan.FromHours(1.0).TotalSeconds); "
+                 "var d := new DateTime(2024, 3, 16); "
+                 "Console.WriteLine(d.AddDays(1.0).ToString()); "
+                 "Console.WriteLine(d.AddDays(1.0).AddDays(1.0).Year);")),
+        "00:00:00.0000005\n3600\n2024-03-17T00:00:00\n2024\n");
+}
+
+// §8.1's universal `GetHashCode` is declared by every built-in through its
+// `Object` base, so rule 1 commits it on a `FrozenArray<int>.From(a)` stub
+// too, as does stdlib §4.19's `Length`: the extension's `string` would make
+// the `int` local a §5.1 reject.
+BEZEL_TEST(extension_builtin_stub_receiver_7756, rule1_frozenarray_object_member_and_length_on_factory) {
+    BEZEL_EXPECT_EQ(
+        out(prog("extension FrozenArray<int> public method GetHashCode(): "
+                 "string => \"EXT\"; public method Length(): string => "
+                 "\"EXTLEN\"; end;",
+                 "var a: Array<int> := [1, 2, 3]; "
+                 "using var f := FrozenArray<int>.From(a); "
+                 "Console.WriteLine(f.Length); "
+                 "var h: int := f.GetHashCode(); "
+                 "Console.WriteLine(h.ToString().Length > 0);")),
+        "3\nTrue\n");
+}
+
+// A stub of a head whose declared surface sema does not tabulate
+// (stdlib §8.1 `Stopwatch`, from `Stopwatch.StartNew()`) is NOT matched by
+// name, since nothing would commit its declared members first.  stdlib §8.1
+// declares `public readonly property IsRunning: bool`, so whatever the
+// verdict on the CALL spelling `sw.IsRunning()` is, it is never the
+// extension's answer.  MEASURED with the matcher widened to every stub, the
+// program printed the extension's "EXT".  (The oracle is the extension's
+// marker only: how the built-in call spelling itself is lowered is a
+// separate question this row does not pin.)
+BEZEL_TEST(extension_builtin_stub_receiver_7756, rule1_untabulated_stub_head_never_answers_declared_name) {
+    auto r = runAot(
+        "module M; import System.Diagnostics; extension Stopwatch public "
+        "method IsRunning(): string => \"EXT\"; end; class C public static "
+        "method Main(): int using var sw := Stopwatch.StartNew(); "
+        "Console.WriteLine(sw.IsRunning().ToString()); return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("EXT") == std::string::npos);
+}

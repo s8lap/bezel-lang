@@ -11809,10 +11809,26 @@ static bool extensionTargetMatchesReceiver(
             // its complement is the built-in, in either shape. Two built-in
             // shapes are then compared by simple name (namedTypeSimpleName
             // reads the stub's `declaration->name`).
-            bool targetIsBuiltin = (target->declaration == nullptr) ||
-                                   !isUserDeclaredTypeSym(target->declaration);
-            bool recvIsBuiltin   = (recv->declaration == nullptr) ||
-                                   !isUserDeclaredTypeSym(recv->declaration);
+            //
+            // fix #7756 (§26.5 rule 1, v0.355): only a stub whose head's
+            // declared instance surface sema answers by name
+            // (`builtinStubHeadHasDeclaredSurface`: the value records and the
+            // concrete collections) is read as built-in here. The stub has
+            // no member symbols, so rule 1's commitment for it is made by
+            // `resolveMemberAccessWithRule1` from those tables; a stub of
+            // any other head (`Stopwatch.StartNew()`) keeps the old
+            // classification, since nothing would commit its declared
+            // members first (MEASURED: `extension Stopwatch {
+            // IsRunning(): string }` answered `sw.IsRunning()` on a
+            // `Stopwatch.StartNew()` local).
+            auto isBuiltinShape = [](const TypeRef* t) {
+                return t->declaration == nullptr ||
+                       (!isUserDeclaredTypeSym(t->declaration) &&
+                        builtinStubHeadHasDeclaredSurface(
+                            t->declaration->name));
+            };
+            bool targetIsBuiltin = isBuiltinShape(target);
+            bool recvIsBuiltin   = isBuiltinShape(recv);
             if (targetIsBuiltin != recvIsBuiltin)
                 return false;   // builtin vs user-declared → never match
             if (!targetIsBuiltin) {
