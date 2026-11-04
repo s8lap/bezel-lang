@@ -685,6 +685,8 @@ TO GATE; KEEP THE POOL AT ITS TARGET AND GATE WHEN THE RUN ENDS.⇒ THE 60–100
 SUPERSEDED BY 100.⇒ A SLOT THAT FREES (A LANE THAT HANDED BACK, OR ONE THAT DIED) IS REFILLED IN
 THAT SAME TURN.**
 
+**R38-ext (2026-11-04 ~17:25, owner directive): THE RUN NOW ENDS 2026-11-07 02:00 NZDT (SATURDAY).** It supersedes the 2026-11-05 end below. The campaign is still `builtin-call-admission`, and there is still ONE gate near the end carrying 100+ closures. The coordinator is now a Claude Code session dispatching 10 Claude lanes plus 6 OpenCode MiniMax lanes.
+
 **R38 session handback (2026-11-03, in progress — the run ends 2026-11-05 02:00 NZDT).**
 *Landed:* 55 commits over `origin/main` on the staging branch `r30-c1` at `48353f2b`; **41 fix
 issues banked, 43 issues GitHub would close on the push** (the keyword rule over subject+body),

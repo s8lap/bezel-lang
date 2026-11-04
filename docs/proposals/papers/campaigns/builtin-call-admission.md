@@ -3570,3 +3570,17 @@ Four reviewed-but-unpicked commits wait: `086de277` (`#8031`) and `4583583b` (`#
 ## Exit review
 
 *(to be written by the campaign's exit reviewer — not this lane)*
+
+## Coordinator block — 2026-11-04 ~17:25 (R38-ext: the run ends SATURDAY 2026-11-07 02:00 NZDT)
+
+- **Owner directive:** *"We are doing the built-in-call-admission campaign in this run. We aim to
+  finish this run 2 am Saturday? Let's extend the run to end at that time."* The run's end is
+  **2026-11-07 02:00 NZDT**. It supersedes every earlier end date in this document
+  (2026-11-05 and 2026-11-06).
+- **Still one gate**, near the end (~2026-11-07 00:00–02:00 NZDT), carrying 100+ closures. The
+  longer run means more haul before that one gate, not more gates.
+- **Coordinator:** a Claude Code session took over from the OpenCode coordinator on 2026-11-04
+  ~16:45. Handover note: `/var/tmp/bezel-scratch/r38-handover/handover.md`. Pool: 10 Claude
+  subagents + 6 OpenCode MiniMax lanes. Run directory: `/var/tmp/bezel-scratch/r39/`.
+- **Staging** `r30-c1` merged `origin/main` (Spec v0.355) mid-run (`b0325c3c`), so every lane
+  dispatched after it bases on v0.355.

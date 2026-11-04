@@ -165,3 +165,13 @@ never push.
   directive of 2026-11-03: **one** gate, near the run's end, carrying 100+ closures.
 - `docs/proposals/papers/campaigns/builtin-call-admission.md` → the campaign's coordinator
   blocks, where the call is recorded with its date and its measurement.
+
+**MEASURED 2026-11-04 ~17:25 (R38-ext: the coordinator moves to Claude Code; the run ends SATURDAY).**
+The owner moved coordination from the OpenCode session to a Claude Code session. The OpenCode
+coordinator deleted its schedules (`sch_1a0df553a001e742yLwXJrJm7b` and the end-of-run one-shot
+`sch_1a2070f7e0019l8OjIgnYtkfdG`) on handover. The owner then set the run's end to
+**2026-11-07 02:00 NZDT (Saturday)**. The Claude Code coordinator's heartbeat is a CronCreate job
+in its own session (cadence `13,43 * * * *`). It is not an OpenCode schedule, so it does NOT
+survive the end of that session: a successor coordinator recreates it from the standing rule
+above. The rule itself is unchanged: STATUS then REKINDLE, one gate near the end, never gate or
+push from the heartbeat.
