@@ -33127,6 +33127,43 @@ static std::string taskClosedCallMessage(std::string_view tn,
            "IsFaulted, IsCancelled and Result, and the method Wait()";
 }
 
+// fix #7971 (spec §30.3, §26.5 rule 1, §27.1, §27.7, v0.355): the CALL
+// spelling of a §30.3 task PROPERTY (`t.IsCompleted()`, `t.Result()`) has no
+// candidate. §30.3 (v0.355) declares, on `Task` / `Task<T>` / `OwningTask<T>`,
+//
+//   public readonly property IsCompleted: bool;
+//   public readonly property IsFaulted: bool;
+//   public readonly property IsCancelled: bool;
+//   public readonly property Result: T;
+//
+// and exactly ONE method, `public method Wait();`. §26.5 rule 1 (v0.350):
+// instance resolution is COMMITTED by name, so the call binds the declared
+// instance member and no extension block is consulted for that name;
+// §27.1 (v0.350) admits only a FUNCTION-typed value as a callee, and §27.7
+// (v0.350) is the compiler's "only function-typed values are callable" rule —
+// a `bool` / `T` property is not one. This is the same shape as the §9.6
+// string property call (`stringPropertyCallMessage`, #7373), and the same
+// shape the closed CALL surface already reports for an undeclared name
+// (`taskClosedCallMessage`, #7868 / #7869): the difference is that here the
+// name IS declared — as a property, not a method.
+static std::string taskPropertyCallMessage(std::string_view mbr) {
+    if (mbr == "Result")
+        return "`Result` is a property of `Task<T>` / `OwningTask<T>`, not a "
+               "method (\xC2\xA7""30.3: `public readonly property Result: T;`), "
+               "so this call has no candidate: the lookup commits to the "
+               "instance member (\xC2\xA7""26.5 rule 1), and only a "
+               "function-typed property can be called (\xC2\xA7""27.1, "
+               "\xC2\xA7""27.7) \xE2\x80\x94"" read it without parentheses, "
+               "`.Result`";
+    return "`" + std::string(mbr) + "` is a property of `Task`, not a method "
+           "(\xC2\xA7""30.3: `public readonly property " + std::string(mbr) +
+           ": bool;`), so this call has no candidate: the lookup commits to "
+           "the instance member (\xC2\xA7""26.5 rule 1), and only a "
+           "function-typed property can be called (\xC2\xA7""27.1, "
+           "\xC2\xA7""27.7) \xE2\x80\x94"" read it without parentheses, `." +
+           std::string(mbr) + "`";
+}
+
 // fix #7782 (spec §27.6, v0.350): "No method reference to `Dispose` or
 // `DisposeAsync`" -- a bound reference naming `Dispose` (a task is a class,
 // §30.3, whose generated `Dispose` the call `t.Dispose();` reaches) is a
@@ -37022,6 +37059,23 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // `if t.IsCompleted` and similar expressions resolve correctly.
                 if (mbr == "IsCompleted" || mbr == "IsFaulted" ||
                     mbr == "IsCancelled") {
+                    // fix #7971 (spec §30.3, §26.5 rule 1, §27.1, §27.7,
+                    // v0.355): the CALL spelling of a §30.3 property is a
+                    // compile error AT THE MEMBER — §30.3 declares
+                    // `public readonly property IsCompleted: bool;`, so the
+                    // call commits to that instance member (§26.5 rule 1) and
+                    // a `bool` is not a callable value (§27.1, §27.7). Before
+                    // this, the arm below typed the property and RETURNED, so
+                    // the call spelling never reached the closed call surface
+                    // and the call was accepted (codegen then degraded the
+                    // slot, #2434, exit 0). The bare READ is unchanged; the
+                    // expression is still typed as the property so nothing
+                    // cascades.
+                    if (&ma == calleeOfCallCtx_) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            taskPropertyCallMessage(mbr));
+                    }
                     ctx_.setExprType(
                         &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                     return;
@@ -37039,12 +37093,25 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (mbr == "Result") {
                     if ((tn == "Task" || tn == "OwningTask") && tt &&
                         !tt->genericArgs.empty() && tt->genericArgs[0]) {
-                        // §30.3 (v0.162 / #1362): .Result inside an async method or
-                        // lambda is a compile error — blocking waits deadlock inside
-                        // domain continuations. Use `await t` instead. Report the error
-                        // but still type the expression so downstream checks don't
-                        // cascade unrelated diagnostics.
-                        if (inAsyncContext_) {
+                        // fix #7971 (spec §30.3, §26.5 rule 1, §27.1, §27.7,
+                        // v0.355): the CALL spelling of `Result` is a compile
+                        // error AT THE MEMBER, for the same reason as the three
+                        // bool properties above: §30.3 declares
+                        // `public readonly property Result: T;`, so the call
+                        // commits to that instance member (§26.5 rule 1) and a
+                        // `T` is not a callable value (§27.1, §27.7). The
+                        // `await` hint below belongs to the READ spelling, so
+                        // only one of the two is reported.
+                        if (&ma == calleeOfCallCtx_) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ma.span.begin,
+                                taskPropertyCallMessage(mbr));
+                        } else if (inAsyncContext_) {
+                            // §30.3 (v0.162 / #1362): .Result inside an async method or
+                            // lambda is a compile error — blocking waits deadlock inside
+                            // domain continuations. Use `await t` instead. Report the error
+                            // but still type the expression so downstream checks don't
+                            // cascade unrelated diagnostics.
                             ctx_.diagnostics().report(Severity::Error, ma.span.begin,
                                 "use `await t` — blocking waits are not available in "
                                 "async code (§30.3)");
@@ -42074,6 +42141,17 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 };
                 if (mbr == "IsCompleted" || mbr == "IsFaulted" ||
                     mbr == "IsCancelled") {
+                    // fix #7971 (spec §30.3, §26.5 rule 1, §27.1, §27.7,
+                    // v0.355): the `?.` twin of the `.` form's property-call
+                    // rejection. §30.3 declares the three as `readonly
+                    // property ... : bool;`, so the call commits to that
+                    // instance member (§26.5 rule 1) and a `bool` is not a
+                    // callable value (§27.1, §27.7). The bare READ is
+                    // unchanged (§7.5: the read stays nullable).
+                    if (&nm == calleeOfCallCtx_) {
+                        ctx_.diagnostics().report(Severity::Error, loc,
+                                                  taskPropertyCallMessage(mbr));
+                    }
                     ctx_.setExprType(
                         &nm, ctx_.primitiveTypeRef(PrimitiveType::Bool,
                                                   /*nullable=*/true));
@@ -42081,8 +42159,16 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 }
                 if (mbr == "Result" && !recvTy->genericArgs.empty() &&
                     recvTy->genericArgs[0]) {
-                    // §30.3: a blocking wait is rejected lexically in async code.
-                    if (inAsyncContext_) {
+                    // fix #7971 (spec §30.3, §26.5 rule 1, §27.1, §27.7,
+                    // v0.355): the `?.` twin of the `.` form's `Result`
+                    // property-call rejection. The `await` hint below belongs
+                    // to the READ spelling, so only one of the two is
+                    // reported.
+                    if (&nm == calleeOfCallCtx_) {
+                        ctx_.diagnostics().report(Severity::Error, loc,
+                                                  taskPropertyCallMessage(mbr));
+                    } else if (inAsyncContext_) {
+                        // §30.3: a blocking wait is rejected lexically in async code.
                         ctx_.diagnostics().report(
                             Severity::Error, loc,
                             "use `await t` — blocking waits are not "
