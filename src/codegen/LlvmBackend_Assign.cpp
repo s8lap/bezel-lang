@@ -18050,7 +18050,14 @@ struct ParamEscapeWalker {
                 for (auto& a : c->args) expr(a.value.get(), false);
                 return;
             }
-            // Generic call — any arg may escape through the callee.
+            // Generic call — any arg may escape through the callee. The
+            // callee expression itself is walked too (fix-forward of
+            // ca822b0b, §8.6 / §27.5, v0.355): in `s.Getter(v)()` the
+            // callee is the inner call, which hands `v` to `Getter`, whose
+            // body may store it. MEASURED before this walk: the inner call
+            // was never visited, the caller released the box, and the stored
+            // value was read freed (ASan heap-use-after-free).
+            expr(c->callee.get(), false);
             for (auto& a : c->args) expr(a.value.get(), false);
             return;
         }
@@ -18067,6 +18074,7 @@ struct ParamEscapeWalker {
                 for (auto& a : c->args) expr(a.value.get(), false);
                 return;
             }
+            expr(c->callee.get(), false);  // as the plain call's callee walk
             for (auto& a : c->args) expr(a.value.get(), false);
             return;
         }
@@ -18149,11 +18157,8 @@ struct ParamEscapeWalker {
             for (auto& ind : ix->indices) expr(ind.value.get(), false);
             return;
         }
-        // Recurse conservatively on a few key shapes. NOTE (#8095): an
-        // expression kind with NO arm here (ThrowExpr, RangeExpr,
-        // MarkedTransferExpr, BindExpr, ...) is NOT walked at all, so an
-        // occurrence of the parameter inside it is not seen; inside a lambda
-        // the capture-set check above covers it, outside one it does not.
+        // Recurse conservatively on a few key shapes. Every expression kind
+        // has an arm; one this walker does not model ESCAPES (see the end).
         if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
             expr(u->operand.get(), isUnboxedRead(u->operand.get()));
             return;
@@ -18173,6 +18178,52 @@ struct ParamEscapeWalker {
             }
             return;
         }
+        // fix-forward of ca822b0b (§8.6 / §17.15 / §27.5, v0.355): the kinds
+        // the walker used to skip SILENTLY, so a parameter inside one was
+        // never seen and the caller released a box the callee had kept.
+        // MEASURED before these arms: a constructor `_saved := (var t := v;
+        // t);` (a §17.15 binding atom) read the stored box freed (ASan
+        // heap-use-after-free, 100 of 100 runs).
+        //   * The binding atom: its clauses are LocalDecls, walked as the
+        //     body's own statements are; its body supplies the atom's value
+        //     (§17.15), so it takes the atom's position.
+        if (auto* b = dynamic_cast<const ast::BindExpr*>(e)) {
+            for (auto& cl : b->clauses) stmt(cl.get());
+            expr(b->body.get(), safeRead);
+            return;
+        }
+        //   * `throw E` carries its operand out of the call (§31).
+        if (auto* t = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(t->operand.get(), false);
+            return;
+        }
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(r->lo.get(), false);
+            expr(r->hi.get(), false);
+            expr(r->step.get(), false);
+            return;
+        }
+        //   * Leaves that evaluate no parameter: literals, `typeof`/`nameof`/
+        //     `default` (a type or a name, not a value), and `()`.
+        if (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+            dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+            dynamic_cast<const ast::CharLiteralExpr*>(e) ||
+            dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+            dynamic_cast<const ast::VerbatimStringExpr*>(e) ||
+            dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+            dynamic_cast<const ast::NullLiteralExpr*>(e) ||
+            dynamic_cast<const ast::TypeOfExpr*>(e) ||
+            dynamic_cast<const ast::NameOfExpr*>(e) ||
+            dynamic_cast<const ast::DefaultExpr*>(e) ||
+            dynamic_cast<const ast::UnitExpr*>(e))
+            return;
+        //   * Anything else — a MarkedTransferExpr (it names its binding by
+        //     spelling, not by symbol) or a kind added after this walker —
+        //     is an ESCAPE. The sound default for a node the walker does not
+        //     model is "the box may outlive the call" (§8.6: the box is
+        //     runtime-managed, so releasing it early is a use-after-free and
+        //     keeping it is only a leak).
+        escaped = true;
     }
 
     void stmt(const ast::Stmt* s) {
@@ -18289,6 +18340,31 @@ struct ParamEscapeWalker {
             }
             return;
         }
+        // fix-forward of ca822b0b (§17.13 / §8.6, v0.355): a discard
+        // `_ := s.Put(v);` evaluates its value like an expression statement
+        // does. MEASURED before this arm: the statement was skipped, `Put`'s
+        // store of `v` was never seen, and the caller released the box the
+        // field still held (ASan heap-use-after-free, 100 of 100 runs).
+        if (auto* d = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(d->value.get(), false); return;
+        }
+        if (auto* y = dynamic_cast<const ast::YieldStmt*>(s)) {
+            expr(y->value.get(), false); return;
+        }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            expr(inc->target.get(), false); return;
+        }
+        // `break` / `continue` evaluate nothing; a local type declaration
+        // cannot name the enclosing body's parameters at all (§21.10: "The
+        // locals and parameters of the bodies enclosing the declaration ...
+        // are not in scope anywhere inside it").
+        if (dynamic_cast<const ast::BreakStmt*>(s) ||
+            dynamic_cast<const ast::ContinueStmt*>(s) ||
+            dynamic_cast<const ast::LocalTypeDecl*>(s))
+            return;
+        // A statement kind this walker does not model ESCAPES (the sound
+        // default; see the end of `expr`).
+        escaped = true;
     }
 };
 }  // namespace
@@ -18344,7 +18420,22 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
         bool stateMachine = containsYield(md->stmts);
         for (auto mod : md->modifiers)
             if (mod == "async") stateMachine = true;
-        if (stateMachine) {
+        // fix-forward of ca822b0b (§12.1, v0.355): a `virtual` member, or an
+        // `override` that is not `sealed`, is DISPATCHED: the body that runs
+        // is the receiver's runtime override, not this declaration's (§12.1:
+        // "To override a virtual member in a derived class, mark the matching
+        // member `override`"). This body therefore proves nothing about the
+        // body that runs, so every parameter escapes. MEASURED before this
+        // guard: `b.Put(v)` with `b: Base` bound to `Base.Put(v) => 0`
+        // released the box that `Keeper`'s override had stored (ASan
+        // heap-use-after-free). An `abstract` member has no body and already
+        // answers "escapes"; a `sealed override` has no further override.
+        bool dispatched = false, sealedMod = false;
+        for (auto mod : md->modifiers) {
+            if (mod == "virtual" || mod == "override") dispatched = true;
+            if (mod == "sealed") sealedMod = true;
+        }
+        if (stateMachine || (dispatched && !sealedMod)) {
             calleeParamNonEscape_[callee] = std::move(nonEscape);
             return false;
         }
