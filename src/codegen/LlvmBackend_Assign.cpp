@@ -17745,6 +17745,63 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 }
             }
         }
+        // fix #7278 (§28.3.11 *Unbound owned temporaries*, stdlib §9.6,
+        // v0.355): an UNBOUND fresh `owned Array<T>` call result at a
+        // non-`owned` parameter — `CountC(t.ToCharArray())`,
+        // `CountOf(t.Split('c'))`, `CountOf(Mk())` with `Mk(): owned
+        // Array<string>` — is "used only by borrowing operations … as a
+        // non-`owned` argument" and is "disposed at the end of the full
+        // expression in which it is produced". The class-instance arm above
+        // does not reach it (an `Array<T>` is declaration-less), so the
+        // backing leaked: MEASURED, 100 iterations, 11200 B / 200 allocations
+        // for `.ToCharArray()`, 24600 B / 800 for `.Split('c')`, 21200 B / 600
+        // for the user `owned` producer.
+        //
+        // REUSE, NOT A NEW DISPOSAL PATH. The population is the two
+        // recognizers the discard / expression-statement / receiver reclaim
+        // already use (`freeUnboundOwnedBorrowingArrayTemp`'s gate), narrowed
+        // to the `Array` head; the release is `buildCollectionTempDisposal`'s
+        // array arm — the same backing free and element-type-keyed disposer a
+        // bound `var a := <same call>;` gets at scope end; and the boundary is
+        // the §28.3 K8.1 queue, registered exactly as
+        // `registerFreshOwnedVtablelessBuiltinReceiverTempK8` registers an
+        // owning-collection receiver (`releaseOnUnwindOnly` keeps the entry
+        // off the normal edge, where the flush frees it and nulls the slot;
+        // the exception edge's unwind walk frees it if a later argument
+        // throws).
+        //
+        // SOUNDNESS. Only a fresh producer matches: a named local, field,
+        // parameter, `move` or alias argument is not a CallExpr of either
+        // recognizer, so its own owner still discharges it; a user method
+        // WITHOUT the `owned` return is excluded by both recognizers (its
+        // result is a borrow). An `owned` parameter takes the value (the
+        // callee disposes it), so it is skipped. The formal must itself be the
+        // `Array` head, so no IEnumerable view / Object box conversion stands
+        // between `v` and the array this frees.
+        if (av && params[idx].modifier != "owned" && !disposeStack_.empty() &&
+            !emittingDisposerBody_ && currentFn_ && params[idx].type &&
+            v->getType()->isPointerTy() &&
+            !llvm::isa<llvm::ConstantPointerNull>(v)) {
+            const sema::TypeRef* at = ctx_.exprType(*av);
+            const sema::TypeRef* ft = ctx_.resolvedType(*params[idx].type);
+            auto isBuiltinArray = [&](const sema::TypeRef* t) {
+                return t && t->kind == sema::TypeRef::Kind::Named &&
+                       !t->declaration && builtinTypeName(t) == "Array";
+            };
+            if (isBuiltinArray(at) && isBuiltinArray(ft) &&
+                (isFreshOwnerlessArrayMaterializerExpr(av) ||
+                 isUnboundOwnedBorrowingArrayCallExpr(av))) {
+                llvm::AllocaInst* slot = entryAllocaNullPtr();
+                if (smStateStruct_) asyncHandlerSpillSlots_.push_back(slot);
+                builder_.CreateStore(v, slot);
+                Disposal coll = buildCollectionTempDisposal(slot, at);
+                coll.unwindOnly = false;
+                coll.dynamicDispose = false;
+                coll.releaseOnUnwindOnly = true;
+                disposeStack_.back().push_back(coll);
+                k8RecvTemps_.push_back(K8RecvTemp{slot, currentFn_, "Array"});
+            }
+        }
     }
     // fix #3777: the §22.5 omitted-default fill is now `fillOmittedParamDefaults`
     // — the same body, stated once, so that `emitChainCall` fills a chain

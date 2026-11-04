@@ -40743,8 +40743,18 @@ bool Emitter::isFreshOwnerlessArrayMaterializerExpr(const ast::Expr* e) const {
     // leaked its backing + substrings without this. Reclaimed exactly once via
     // bz_array_free with the Array<string> string-release disposer (selected by
     // element type at the call site), mirroring the ToArray/Sorted/Reversed temps.
+    //
+    // fix #7278 (stdlib §9.6, §28.3.11, v0.355): `ToCharArray()` is the
+    // §9.6 sibling of `Split` (`public method ToCharArray(): owned
+    // Array<char>;`) and was missing here, so an UNBOUND result
+    // (`_ := s.ToCharArray();`, `s.ToCharArray();`) reached no reclaim and
+    // leaked its backing — 11200 B / 200 allocations over 100 iterations,
+    // while the bound `var a := s.ToCharArray();` (#8124's
+    // `isFreshBorrowingArrayMaterializerLocal` row) and the `Split` discard
+    // were clean. Its elements are code points, so the element-type-keyed
+    // disposer the reclaim selects is null.
     return mm == "ToArray" || mm == "Sorted" || mm == "Reversed" ||
-           mm == "Split" || mm == "ToByteArray";
+           mm == "Split" || mm == "ToByteArray" || mm == "ToCharArray";
 }
 
 
