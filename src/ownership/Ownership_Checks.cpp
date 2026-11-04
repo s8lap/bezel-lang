@@ -19101,7 +19101,35 @@ void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd,
                            ctx_.resolvedType(*fd.type), ctx_, moveOnlyKind))
             return;
     }
-    if (producerState(*fd.initializer) == OwnershipState::Owned) {
+    if (isFreshlyProducedOwnedValue(*fd.initializer)) {
+        // fix #7856 (§28.6 "Leak prevention", v0.353): THE ONE fresh-store
+        // test -- `isFreshlyProducedOwnedValue` -- the SAME predicate the
+        // ASSIGNMENT-STATEMENT store arm (`handleAssignment`'s
+        // `targetIsNonOwnedField` branch) asks. §28.6's fresh-store bullet
+        // states the rule with NO positional restriction, so the two store
+        // arms are ONE rule and they ask ONE question; before this predicate
+        // they were two separate tests and they had already drifted -- the
+        // assignment-statement arm learned to see a BUILTIN owned-materializer
+        // call and this one did not, so the ISSUE'S OWN TITLE SHAPE --
+        // `public data: Array<byte> := Guid.NewGuid().ToByteArray();` --
+        // compiled clean and LEAKED.
+        //
+        // MEASURED at the pre-change tree (bezelc 0.0.0,
+        // `--sanitize=address`, `ASAN_OPTIONS=detect_leaks=1`): the
+        // field-initializer program leaked
+        // `SUMMARY: AddressSanitizer: 14400 byte(s) leaked in 300
+        // allocation(s)` (150 constructions x 2 allocations). The
+        // `Encoding.UTF8.GetBytes` twin is identical; the LINQ `ToArray` and
+        // the `string.Split` twins read 16800 bytes in 300 allocations and
+        // 36900 bytes in 1200 allocations over the same 150 constructions.
+        // The `public owned data: Array<byte>;` twin is CLEAN, and
+        // `public data: Array<byte> := new Array<byte>();` is already
+        // REJECTED (a `new` IS visible to `producerState`) -- so the
+        // builtin-materializer call was the one hole at this position too.
+        //
+        // The diagnostic wording is the SAME §28.6 fresh-store message the
+        // constructor-body counterpart produces, so the two positions read
+        // identically.
         report(Severity::Error, fd.initializer->span.begin,
                std::string("a freshly-produced owned value cannot be stored "
                            "into the non-`owned` field `") +

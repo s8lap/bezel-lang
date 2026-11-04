@@ -1792,6 +1792,31 @@ private:
 
     void handleAssignment(const ast::AssignmentStmt& as);
 
+    // fix #7856 (§28.3 *Producers* / §28.6, v0.353): is this expression a
+    // BUILTIN owned-materializer call -- a call to a standard-library member
+    // the library declares `owned`-returning? DIAGNOSTIC-ONLY by
+    // construction: `producerState` keeps classifying these calls BORROWED
+    // (codegen reclaims them on its own recognition), so every caller of this
+    // helper asks only "is this an owned production?" for a diagnostic
+    // decision.
+    bool isBuiltinOwnedMaterializerCallExpr(const ast::Expr& e);
+
+    // fix #7856 (§28.6 "Leak prevention", v0.353): THE ONE fresh-store test.
+    // §28.6's fresh-store bullet states the rule with NO positional
+    // restriction, and the rule has TWO store arms -- the
+    // ASSIGNMENT-STATEMENT one (`handleAssignment`'s `targetIsNonOwnedField`
+    // branch) and the FIELD-INITIALIZER one (`checkFieldInitializer`). They
+    // are ONE rule, so they ask ONE question, and this predicate is that
+    // question: "is this expression a freshly-produced owned value?" -- a
+    // `new`, a `move`, an owned operator result, a call whose DECLARED return
+    // is `owned T`, or a BUILTIN owned-materializer call (which
+    // `producerState` cannot see, because a builtin callee resolves NO
+    // symbol). DIAGNOSTIC-ONLY by construction: `producerState` keeps
+    // classifying the builtin materializers BORROWED (codegen reclaims them on
+    // its own recognition), so every caller of this helper asks only "is
+    // this an owned production?" for a diagnostic decision.
+    bool isFreshlyProducedOwnedValue(const ast::Expr& e);
+
     // §28.3 / §28.7 / §28.10 (v0.180, #1965): handle an assignment-position
     // `owned` transfer marker `y := owned x;` (as.valueHasOwnedMarker). The
     // assignment analog of the binding marker (#1962): the source must be a

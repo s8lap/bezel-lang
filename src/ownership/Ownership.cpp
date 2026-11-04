@@ -9059,6 +9059,79 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     return common::classifyDisposal(rt, ctx_).carriesObligation;
 }
 
+// fix #7856 (§28.3 *Producers* / §28.6, v0.353): is this expression a
+// BUILTIN owned-materializer call -- a call to a standard-library member the
+// library declares `owned`-returning (stdlib §2.6 `Guid.ToByteArray`,
+// stdlib §3.2 `Encoding.GetBytes`, stdlib §5 / §4.4 / §9.6's
+// `ToArray` / `ToSet` / `ToDictionary` / `Sorted` / `Reversed` / `Slice` /
+// `Split` / `ToBytes`)?
+//
+// The predicate is `common::isBuiltinOwnedMaterializerCall` -- the SAME
+// authority the ownership pass already uses to classify these calls as owned
+// productions (`isMaterializerCarveOutBorrow`, #4042 / #4057 / #5284). It
+// matches only the compiler-known builtins (a builtin callee resolves NO
+// symbol, and the result's head must be a declaration-less `Array` / `Set` /
+// `Dictionary`), so a user member with the same name is not matched.
+//
+// DIAGNOSTIC-ONLY BY CONSTRUCTION. `producerState` still classifies these
+// calls BORROWED, and must keep doing so: `isBuiltinOwnedMaterializerCall`'s
+// own header requires it ("codegen already reclaims these values on its own
+// recognition … Reclassifying them Owned would register a SECOND free on top
+// of codegen's -- the double-free direction"). Every caller of this helper
+// asks only "is this an owned production?" for a DIAGNOSTIC decision.
+//
+// per §28.3, §28.6, stdlib §2.6/§5/§3.2, v0.353, #7856
+bool MethodOwnership::isBuiltinOwnedMaterializerCallExpr(const ast::Expr& e) {
+    auto* call = dynamic_cast<const ast::CallExpr*>(&e);
+    if (!call) return false;
+    return common::isBuiltinOwnedMaterializerCall(*call, ctx_);
+}
+
+// fix #7856 (§28.6 "Leak prevention", v0.353): THE ONE fresh-store test.
+//
+// §28.6's fresh-store bullet states the rule with NO positional restriction:
+// "A **freshly-produced owned value** -- a `new` expression, a call returning
+// `owned T`, a `move` expression, or an owned operator result -- stored into
+// a non-`owned` (borrow) field is an **error** (derives: K1.7 + K2.3): the
+// field does not own its referent, so the fresh value would be left with no
+// owner and leak."
+//
+// The rule has TWO store arms -- the ASSIGNMENT-STATEMENT one
+// (`handleAssignment`'s `targetIsNonOwnedField` branch) and the
+// FIELD-INITIALIZER one (`checkFieldInitializer`). They are ONE rule, so
+// they ask ONE question, and this predicate is that question. Before this
+// predicate the two arms were separate tests and had already drifted: the
+// assignment-statement arm learned to see a BUILTIN owned-materializer call
+// and the field-initializer arm did not, so the ISSUE'S OWN TITLE SHAPE --
+// `public data: Array<byte> := Guid.NewGuid().ToByteArray();` -- was still
+// accepted and still leaked.
+//
+// The two halves:
+//
+//   * `producerState(e) == OwnershipState::Owned` -- a `new`, a
+//     `move`, an owned operator result, or a call whose DECLARED return is
+//     `owned T` (the user-declared `owned` call). This half was already the
+//     rule's test at BOTH positions.
+//
+//   * `isBuiltinOwnedMaterializerCallExpr(e)` -- a call to a standard-
+//     library member the library declares `owned`-returning, which
+//     `producerState` CANNOT see because a builtin callee resolves NO symbol
+//     (the builtin member-call typing path in sema lives entirely inside
+//     `if (!calleeSym)`, stdlib §5 / §4.4 / §9.6), so the call carries no
+//     `owned`-returning declaration to read.
+//
+// DIAGNOSTIC-ONLY BY CONSTRUCTION. `producerState` still classifies a
+// builtin materializer BORROWED, and must keep doing so (see
+// `isBuiltinOwnedMaterializerCallExpr`'s own header). This predicate only
+// REPORTS; no disposal decision changes, so no double free and no leak can
+// follow from the widened test.
+//
+// per §28.6, §28.3 *Producers*, stdlib §2.6/§3.2/§5/§4.4/§9.6, v0.353, #7856
+bool MethodOwnership::isFreshlyProducedOwnedValue(const ast::Expr& e) {
+    if (producerState(e) == OwnershipState::Owned) return true;
+    return isBuiltinOwnedMaterializerCallExpr(e);
+}
+
 void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // Slice O4: `x := EXPR` where x is a tracked local updates x's
     // state to match the producer of EXPR.
@@ -9522,7 +9595,44 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                                    /*intoOwningArraySlot=*/true);
     } else if (!flagged386 && targetIsNonOwnedField(*as.target) &&
                !targetIsMoveOnlyValueField(*as.target) &&
-               producerState(*as.value) == OwnershipState::Owned) {
+               // fix #7856 (§28.6 "Leak prevention", v0.353): THE ONE
+               // fresh-store test, `isFreshlyProducedOwnedValue` -- the SAME
+               // predicate the FIELD-INITIALIZER store arm
+               // (`checkFieldInitializer`) asks, so the two positions of the
+               // ONE §28.6 rule cannot drift apart again.
+               //
+               // The predicate answers "is this a freshly-produced owned
+               // value?" in two halves: `producerState(...) == Owned` (a
+               // `new`, a `move`, an owned operator result, or a call whose
+               // DECLARED return is `owned T`) and
+               // `isBuiltinOwnedMaterializerCallExpr(...)` (a call to a
+               // standard-library member the library declares `owned`-
+               // returning, which `producerState` CANNOT see because a
+               // builtin callee resolves NO symbol -- the builtin member-call
+               // typing path in sema lives entirely inside `if (!calleeSym)`,
+               // stdlib §5 / §4.4 / §9.6 -- so the call carries no
+               // `owned`-returning declaration to read).
+               //
+               // MEASURED at the pre-change tree (bezelc 0.0.0,
+               // `--sanitize=address`, `ASAN_OPTIONS=detect_leaks=1`):
+               // `public data: Array<byte>;` with ctor
+               // `data := g.ToByteArray();` compiled clean and leaked
+               // `SUMMARY: AddressSanitizer: 14400 byte(s) leaked in 300
+               // allocation(s)` (150 iterations x 2 allocations -- linear in
+               // the iteration count). The `Encoding.UTF8.GetBytes` twin is
+               // identical. The `public owned data: Array<byte>;` twin is
+               // CLEAN, and `data := new Array<byte>();` is already REJECTED
+               // (a `new` IS visible to `producerState`) -- so the
+               // builtin-materializer call was the one hole.
+               //
+               // IT IS DIAGNOSTIC-ONLY BY CONSTRUCTION: `producerState` still
+               // classifies these calls BORROWED, so no disposal decision
+               // changes -- exactly the posture
+               // `isBuiltinOwnedMaterializerCall`'s own header requires
+               // ("do not touch producerState": reclassifying these Owned
+               // would register a SECOND free on top of codegen's -- the
+               // double-free direction).
+               isFreshlyProducedOwnedValue(*as.value)) {
         // #1020 / §28.6 (v0.153): a freshly-produced owned value — a `new`, an
         // owned-returning call, a `move`, or an owned operator result
         // (producerState == Owned) — stored into a non-`owned` (borrow) field
