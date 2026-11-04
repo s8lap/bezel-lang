@@ -251,6 +251,59 @@ static bool isBuiltinTimeValueRecord(const TypeRef* t) {
     return !builtinTimeValueHead(t).empty();
 }
 
+// fix #7966 (stdlib §2.15 / §7.4 / §7.5, v0.355): the five component reads of
+// the built-in `JsonOptions` value record (`Indented`, `IndentWidth`,
+// `AllowTrailingCommas`, `IgnoreUnknownFields`, `MaxDepth`) and their DECLARED
+// types (stdlib §2.15): `Indented: bool`, `IndentWidth: int`,
+// `AllowTrailingCommas: bool`, `IgnoreUnknownFields: bool`, `MaxDepth: int`.
+//
+// `JsonOptions` is a COMPILER-KNOWN value record (src/common/BuiltinRegistry.cpp's
+// `kNonHeapReservedBuiltins`), so it has no user TypeDecl and the ordinary
+// member-lookup path never finds its components: the read was UNTYPED, and
+// §7.5's "the result type is always nullable" had nothing to lift for the `?.`
+// spelling (so `o?.MaxDepth` lowered to nothing — #3079).
+//
+// The head is resolved across the three TypeRef shapes a builtin carries (the
+// annotation `astNode`, the `builtinClassSym` declaration, and the IMPORTED
+// `importedName`), and never matches a user type that shadows the name: a user
+// declaration carries a non-null `decl`, and an IMPORTED user record of the same
+// name carries a non-empty `moduleName` (the #2997 split: `!decl` alone does
+// not mean "built-in").
+static bool isBuiltinJsonOptionsValueRecord(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return false;
+    if (t->declaration) {
+        if (t->declaration->decl) return false;               // a user record
+        if (!t->declaration->moduleName.empty()) return false;  // an imported one
+        return t->declaration->name == "JsonOptions";
+    }
+    if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
+        return t->headName() == "JsonOptions";
+    if (!t->astNode && !t->importedName.empty())
+        return t->importedName == "JsonOptions";
+    return false;
+}
+
+// fix #7966 (stdlib §2.15, v0.355): the DECLARED type of a `JsonOptions`
+// component, read from the HOUSE built-in property table
+// (`common::builtinPropertyDecls`) -- the same table that carries stdlib
+// §2.5's `DateTime.Year: int` and that refuses the CALL spelling of a
+// built-in property ("`MaxDepth` is a property of `JsonOptions`, not a
+// method").  ONE table, so the `.` spelling (resolveMemberAccess), the `?.`
+// spelling (resolveNullCondMember) and the CALL refusal cannot drift apart:
+// §7.5's "the result type is always nullable" lifts THE SAME component type
+// the `.` spelling produces.
+//
+// `PrimitiveType::None` means "not a component of `JsonOptions`" (or a type
+// this mapping does not cover -- the five components are `bool` and `int`).
+static PrimitiveType jsonOptionsComponentPrimitive(std::string_view member) {
+    const common::BuiltinPropertyDecl* d =
+        common::builtinDeclaredProperty("JsonOptions", member);
+    if (!d) return PrimitiveType::None;
+    if (d->type == "bool") return PrimitiveType::Bool;
+    if (d->type == "int") return PrimitiveType::Int;
+    return PrimitiveType::None;
+}
+
 // fix #7900 / #7902 / #7911 (stdlib §2.2, §2.5, spec §14.2, v0.350): `Math.Min`
 // / `Max` / `Clamp<T>` are declared `where T: IComparable<T>`, and stdlib §2.5
 // declares `IComparable<Self>` on `DateTime`, `TimeSpan`, `DateOnly` and
@@ -34286,6 +34339,45 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
         }
     }
+    // fix #7966 (stdlib §2.15 / §7.4 / §7.5, v0.355): the five component
+    // reads of the built-in `JsonOptions` value record (`o.Indented`,
+    // `o.IndentWidth`, `o.AllowTrailingCommas`, `o.IgnoreUnknownFields`,
+    // `o.MaxDepth`).
+    //
+    // `JsonOptions` is a COMPILER-KNOWN value record (src/common/
+    // BuiltinRegistry.cpp's `kNonHeapReservedBuiltins`), so it has no user
+    // TypeDecl and the ordinary member-lookup path never finds its
+    // components: the read was UNTYPED. MEASURED on the base (r30-c1
+    // cac9332e): `var s: string := o.IndentWidth;` compiled clean, and
+    // `o.MaxDepth()` drew #2457's "`MaxDepth` on built-in type `JsonOptions`
+    // produced no value" diagnostic instead of a type error.
+    //
+    // stdlib §2.15 declares each component's type, and §9.1/§9.2 make a
+    // record's components readable as properties of that type:
+    //   `Indented: bool`, `IndentWidth: int`, `AllowTrailingCommas: bool`,
+    //   `IgnoreUnknownFields: bool`, `MaxDepth: int`.
+    //
+    // The types come from ONE table (`jsonOptionsComponentPrimitive`), which
+    // the `?.` spelling (resolveNullCondMember) reads too, so §7.5's "the
+    // result type is always nullable" lifts THE SAME component type the `.`
+    // spelling produces and the two spellings cannot drift apart.
+    //
+    // PLACEMENT: right after §7.4's member-access gate, so the gate's
+    // rejection of an UN-NARROWED read of a nullable receiver still comes
+    // FIRST (spec §7.4: "Member access, method calls, and indexing on a
+    // nullable value are compile errors unless the compiler has narrowed it to
+    // non-null"), and so that no later arm of this function can skip the
+    // typing.
+    if (ma.target) {
+        const TypeRef* joRecvTy = ctx_.exprType(*ma.target);
+        if (isBuiltinJsonOptionsValueRecord(joRecvTy)) {
+            PrimitiveType joPt = jsonOptionsComponentPrimitive(ma.member);
+            if (joPt != PrimitiveType::None) {
+                ctx_.setExprType(&ma, ctx_.primitiveTypeRef(joPt));
+                return;
+            }
+        }
+    }
     // §15.1.2 (#1100, #1342): an inline array `[N]T` exposes `.Length`,
     // `.ToArray()`, `.Contains(v)`, the indexer `arr[i]`, and iteration via
     // `for var x in arr`.  It is a value type that does NOT implement
@@ -43594,6 +43686,32 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 nn->nullable = true;
                 ctx_.setExprType(&nm, nn);
             }
+            return;
+        }
+    }
+    // fix #7966 (stdlib §2.15 / §7.5, v0.355): `o?.MaxDepth` /
+    // `o?.IndentWidth` / `o?.Indented` / `o?.AllowTrailingCommas` /
+    // `o?.IgnoreUnknownFields` on a `JsonOptions?` receiver.
+    //
+    // §7.5: "`x?.M` returns null if `x` is null; otherwise it performs the
+    // access. The result type is always nullable" -- and the result is the
+    // `.` form's result (the component's DECLARED type, stdlib §2.15) lifted
+    // to nullable.
+    //
+    // The `.` form's component read is typed by resolveMemberAccess's
+    // `JsonOptions` arm, from the SAME table (`jsonOptionsComponentPrimitive`)
+    // this arm reads, so the two spellings cannot drift apart. Typed
+    // SPECIFICALLY (rather than through the `.` twin the #7778 arm builds for
+    // the time value records) because the twin's `resolveMemberAccess` call
+    // would run the whole member resolver speculatively over a synthetic
+    // node, while the table IS the `.` form's type by construction.
+    if (!member && &nm != calleeOfCallCtx_ && recvTyForDiag &&
+        recvTyForDiag->nullable && !ctx_.exprType(nm) &&
+        isBuiltinJsonOptionsValueRecord(recvTyForDiag)) {
+        PrimitiveType joPt = jsonOptionsComponentPrimitive(nm.member);
+        if (joPt != PrimitiveType::None) {
+            ctx_.setExprType(
+                &nm, ctx_.primitiveTypeRef(joPt, /*nullable=*/true));
             return;
         }
     }

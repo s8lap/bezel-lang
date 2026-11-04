@@ -5144,6 +5144,83 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 return tvPhi;
             }
         }
+        // fix #7966 (stdlib §2.15 / §7.5, v0.355): `o?.MaxDepth` /
+        // `o?.IndentWidth` / `o?.Indented` on a `JsonOptions?` receiver.
+        //
+        // The `.` form's read is the `bz.json_options` struct's component
+        // `extractvalue` (the #7925 arm, and #7993's nullable-carrier arm);
+        // a NullCondMemberExpr is a DISTINCT AST node, so that arm never ran
+        // and the access lowered to NOTHING (#3079 -- the enclosing
+        // `Console.WriteLine` emitted nothing at all).  MEASURED on the base
+        // (r30-c1 cac9332e): `Console.WriteLine(o?.MaxDepth ?? -1)` printed
+        // nothing, and `var x: int? := o?.MaxDepth;` degraded to a
+        // zero-initialised slot (#2434), so `x ?? -1` answered the DEFAULT
+        // `-1` where §7.5 requires the component's value.
+        //
+        // Lower the receiver ONCE; a null receiver yields null, otherwise run
+        // the `.` form's own lowering over a synthetic `.` node whose target
+        // is a pinned placeholder carrying the UNWRAPPED payload, typed as the
+        // NON-nullable receiver, and lift to the §7.5 result (the component's
+        // type, nullable).  sema (resolveNullCondMember) typed the node `T?`
+        // from the same table the `.` form types the component from.
+        if (const sema::TypeRef* joRcvTy = ctx_.exprType(*nm->target);
+            joRcvTy && joRcvTy->nullable && isNullableValueTy(joRcvTy) &&
+            builtinTypeName(joRcvTy) == "JsonOptions") {
+            const sema::TypeRef* joResTy = ctx_.exprType(e);
+            if (joResTy && joResTy->nullable && isNullableValueTy(joResTy)) {
+                llvm::Value* joRcv = lowerExpr(*nm->target);
+                if (!joRcv || !joRcv->getType()->isStructTy()) return nullptr;
+                auto* joEntryBB = builder_.GetInsertBlock();
+                auto* joAccessBB = llvm::BasicBlock::Create(
+                    llvm_, "ncjo.access", currentFn_);
+                auto* joEndBB = llvm::BasicBlock::Create(
+                    llvm_, "ncjo.end", currentFn_);
+                // The carrier is the tagged {i8 hasValue; bz.json_options}
+                // box (§7.2's optional-value lowering -- #2763's
+                // `isNullableValueStructBuiltinTy` puts `JsonOptions` in the
+                // value-STRUCT-builtin family), so the payload is field 1.
+                llvm::Value* joPayload = nullablePrimValue(joRcv);
+                builder_.CreateCondBr(nullablePrimHasValue(joRcv),
+                                      joAccessBB, joEndBB);
+                builder_.SetInsertPoint(joAccessBB);
+                sema::TypeRef* joInnerRcvTy = ctx_.makeTypeRef(*joRcvTy);
+                joInnerRcvTy->nullable = false;
+                auto joPlaceholder = std::make_unique<ast::IdentifierExpr>();
+                joPlaceholder->name = "<nullcond-receiver>";  // #6681
+                ctx_.setExprType(joPlaceholder.get(), joInnerRcvTy);
+                exprValueOverride_[joPlaceholder.get()] = joPayload;
+                auto joDotted = std::make_unique<ast::MemberAccessExpr>();
+                joDotted->span = e.span;
+                joDotted->member = nm->member;
+                joDotted->target = std::move(joPlaceholder);
+                const ast::Expr* joPlaceholderKey = joDotted->target.get();
+                sema::TypeRef* joInnerResTy = ctx_.makeTypeRef(*joResTy);
+                joInnerResTy->nullable = false;
+                ctx_.setExprType(joDotted.get(), joInnerResTy);
+                llvm::Value* joInner = lowerExpr(*joDotted);
+                exprValueOverride_.erase(joPlaceholderKey);
+                nullCondCountSynth_.push_back(std::move(joDotted));
+                if (!joInner || joInner->getType()->isPointerTy() ||
+                    joInner->getType()->isVoidTy()) {
+                    // Unrecognised shape: close the CFG validly and keep the
+                    // old "lowered to nothing" result (the #3079 backstop
+                    // reports it).
+                    builder_.CreateBr(joEndBB);
+                    builder_.SetInsertPoint(joEndBB);
+                    return nullptr;
+                }
+                llvm::Value* joWrapped = wrapNullableValue(joResTy, joInner);
+                auto* joAccessEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(joEndBB);
+                builder_.SetInsertPoint(joEndBB);
+                auto* joPhi = builder_.CreatePHI(joWrapped->getType(), 2);
+                joPhi->addIncoming(
+                    llvm::ConstantAggregateZero::get(joWrapped->getType()),
+                    joEntryBB);
+                joPhi->addIncoming(joWrapped, joAccessEnd);
+                return joPhi;
+            }
+        }
         // §7.5 / issue #416: `b?.V` on a (NULLABLE) RECORD. The target lowers to
         // either the tagged {i8 hasValue; <record payload>} struct (nullable,
         // #416) or the bare by-value payload (non-nullable, #3210). The

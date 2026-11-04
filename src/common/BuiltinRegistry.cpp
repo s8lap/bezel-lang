@@ -2803,6 +2803,30 @@ const std::vector<BuiltinPropertyDecl>& builtinPropertyDecls() {
         {"TimeOnly", "Second", "int", "2.5", false, true},
         {"TimeOnly", "Millisecond", "int", "2.5", false, true},
         {"Guid", "Empty", "Guid", "2.6", true, true},
+        // fix #7966 (stdlib §2.15, v0.355): the five components of the
+        // compiler-known `JsonOptions` value record.  stdlib §2.15 declares
+        // `public record JsonOptions(Indented: bool, IndentWidth: int,
+        // AllowTrailingCommas: bool, IgnoreUnknownFields: bool, MaxDepth:
+        // int);` -- "All five components are required: a positional record
+        // admits no default values (spec A.3 PositionalField), so `new
+        // JsonOptions(...)` supplies every one."
+        //
+        // The rows make the CALL spelling of a component (`o.MaxDepth()`) the
+        // house "property called as method" error, exactly as `d.Year()` is
+        // for stdlib §2.5's `DateTime` -- before this table carried them, the
+        // call drew #2457's "produced no value" diagnostic on the base and,
+        // once the read was typed, degraded to the internal #3079 warning
+        // with the statement emitting nothing (a silent degradation is worse
+        // than an error).
+        //
+        // The `readModelled` flag is TRUE: the component READ is modelled
+        // (the codegen `JsonOptions` arm lowers it), so refusing the call
+        // spelling leaves the working remedy `.MaxDepth`.
+        {"JsonOptions", "Indented", "bool", "2.15", false, true},
+        {"JsonOptions", "IndentWidth", "int", "2.15", false, true},
+        {"JsonOptions", "AllowTrailingCommas", "bool", "2.15", false, true},
+        {"JsonOptions", "IgnoreUnknownFields", "bool", "2.15", false, true},
+        {"JsonOptions", "MaxDepth", "int", "2.15", false, true},
         {"ScopeGuard", "IsDismissed", "bool", "2.21", false, true},
         {"StringBuilder", "Length", "int", "3.1", false, true},
         {"StringBuilder", "Capacity", "int", "3.1", false, false},
