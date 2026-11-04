@@ -361,13 +361,44 @@ constexpr std::array<std::string_view, 73> kHeapPointerReferenceBuiltins = {
 // that Named case (src/codegen/LlvmBackend_Layout.cpp) and subtracting the
 // heap table; each entry names the branch it comes from.
 //
-// `DictionaryEntry` and `DrainedEntry` are compared there too and are
-// deliberately ABSENT: their arm is reached only by a synthetic TypeRef
-// (no astNode, importedName-keyed, genericArgs.size() >= 2), and neither name
-// resolves as a written type annotation at all (`bezelc` reports "unresolved
-// type name" — measured, not inferred), so no declaration-less single-part
-// Named ref can ever carry them. Adding them would only change the
-// generic-argument inference binding, with nothing to gain.
+// `DictionaryEntry` and `DrainedEntry` are compared in that Named case too and
+// are still deliberately ABSENT from this table.
+//
+// ⚠ THE ORIGINAL REASON WAS STALE, and is corrected here (fix #8136, stdlib
+// §4.8, v0.355). It read: "neither name resolves as a written type annotation
+// at all (`bezelc` reports \"unresolved type name\" — measured, not inferred),
+// so no declaration-less single-part Named ref can ever carry them". That is
+// NO LONGER TRUE: since #2794 both names are in the written-type-arity table
+// (src/sema/TypeResolution_Names.cpp), so they DO resolve as written type
+// annotations. MEASURED on this tree: `var x: DictionaryEntry<string, int> := …`
+// passes type resolution (the diagnostic that follows is about `default(T)`'s
+// nullability, not about the name), and `var x: DrainedEntry<string, int> := …`
+// passes it too (the diagnostic that follows is `DrainedEntry<V>`'s
+// `where V: class` constraint). A declaration-less single-part Named ref
+// therefore CAN carry them.
+//
+// They stay absent for a DIFFERENT reason, and the reason is a deliberate
+// NARROWNESS, not an oversight:
+//
+//   * This table is the #2974 gate's EXEMPTION list — "a reserved built-in
+//     whose representation is not a heap pointer" — and it is SNAPSHOT-PINNED
+//     (tests/support/builtin_registry_snapshot_test.cpp). Adding
+//     `DictionaryEntry` here would exempt the type from that gate entirely,
+//     so the pre-existing located note for a shape the construction does not
+//     admit (`new DictionaryEntry<string, int>()`) would stop firing, AND the
+//     pinned snapshot row would have to change.
+//   * `DictionaryEntry<K, V>`'s value-shapedness — the fact the ownership
+//     pass needs to classify a construction of it as BORROWED (a record is a
+//     value type, §9) — is carried instead by the arm-2 positional-ctor set
+//     `kPositionalCtorOnlyBuiltinRecords` (fix #8136), which the ownership
+//     pass consults directly. That set is the natural home: it already lists
+//     the two other builtin RECORDS with a declared positional primary
+//     constructor (`ExceptionInfo`, §31.4; `ReadOnlyStringSpan`, stdlib §3.3),
+//     and `DictionaryEntry<K, V>` (stdlib §4.8) is the third.
+//
+// `DrainedEntry<K, V>` remains outside BOTH sets: stdlib §4.9 declares it a
+// CLASS (with a `where V: class` constraint), not a record, so it has no
+// positional primary constructor and is not value-shaped.
 constexpr std::array<std::string_view, 18> kNonHeapReservedBuiltins = {
     // §32.5 / §32.7 / stdlib §10: FFI-boundary types (i64 / opaque ptr).
     "IntPtr", "UIntPtr", "CString", "WString", "RawBytes",
@@ -406,13 +437,22 @@ constexpr std::array<std::string_view, 3> kNoConstructorBuiltins = {
     "IntPtr", "UIntPtr",
 };
 
-constexpr std::array<std::string_view, 2> kPositionalCtorOnlyBuiltinRecords = {
+constexpr std::array<std::string_view, 3> kPositionalCtorOnlyBuiltinRecords = {
     // §31.4: `public record ExceptionInfo(TypeName: string, Message: string,
     // StackTrace: string);` — the Exception.CauseChain element type.
     "ExceptionInfo",
     // stdlib §3.3: `public record ReadOnlyStringSpan(Source: string,
     // Start: int, Length: int): IReadOnlySpan<char>`.
     "ReadOnlyStringSpan",
+    // fix #8136 (stdlib §4.8, v0.355): `public record DictionaryEntry<K, V>(Key:
+    // K, Value: V);` — the `Dictionary<K, V>` / `SortedDictionary<K, V>`
+    // entry type. The same shape as the two above: a POSITIONAL record, so
+    // language spec §9.1 gives it a primary constructor whose parameters are
+    // its positional fields in declaration order, and nothing else. §17.7
+    // ("Standard-library builtins have a closed constructor surface") then
+    // makes the parameterless form and any other arity a compile error, which
+    // is what the membership in THIS set buys.
+    "DictionaryEntry",
 };
 
 // fix #3136 (§17.7 "Standard-library builtins have a closed constructor
@@ -436,7 +476,7 @@ struct PositionalCtorOnlyBuiltinRecord {
     std::string_view name;
     std::size_t arity;
 };
-constexpr std::array<PositionalCtorOnlyBuiltinRecord, 2>
+constexpr std::array<PositionalCtorOnlyBuiltinRecord, 3>
 kPositionalCtorOnlyBuiltinRecordArities = {{
     // §31.4: `public record ExceptionInfo(TypeName: string, Message: string,
     // StackTrace: string);` — three declared positional fields.
@@ -445,6 +485,11 @@ kPositionalCtorOnlyBuiltinRecordArities = {{
     // Start: int, Length: int): IReadOnlySpan<char>` — three declared
     // positional fields.
     {"ReadOnlyStringSpan", 3},
+    // fix #8136 (stdlib §4.8, v0.355): `public record DictionaryEntry<K, V>(Key:
+    // K, Value: V);` — TWO declared positional fields (`Key`, `Value`). The
+    // arity is per-record, not a constant, precisely so this one (2) does not
+    // have to agree with the two 3-field records above.
+    {"DictionaryEntry", 2},
 }};
 
 // #2921 / #2923: the reserved built-in INTERFACE heads — the subset of
@@ -591,7 +636,7 @@ struct BuiltinParamRow {
     std::string_view sig;
 };
 
-constexpr std::array<BuiltinParamRow, 385> kBuiltinParams = {{
+constexpr std::array<BuiltinParamRow, 386> kBuiltinParams = {{
     // fix #7421 (stdlib §9.6, §5.1, §7.3, v0.345): the §9.6 `String` head's
     // DECLARED PARAMETER TYPES, transcribed from the standard library's own
     // listing.
@@ -884,6 +929,23 @@ constexpr std::array<BuiltinParamRow, 385> kBuiltinParams = {{
     {"StringBuilder", "", 1, 1, 0x01, {"initial", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"ReadOnlyStringSpan", "", 3, 3, 0x00, {"Source", "Start", "Length", "", "", "", "", ""}, {0, kBPTInt, kBPTInt, 0, 0, 0, 0, 0}, ""},
     {"ExceptionInfo", "", 3, 3, 0x07, {"TypeName", "Message", "StackTrace", "", "", "", "", ""}, {kBPTString, kBPTString, kBPTString, 0, 0, 0, 0, 0}, ""},
+    // fix #8136 (stdlib §4.8, v0.355): `public record DictionaryEntry<K, V>(Key:
+    // K, Value: V);` — the positional primary constructor of the §4.8 entry
+    // record. The NAMES are the record's field names (§9.1: "A record's
+    // positional constructor takes its field names as parameter names"), so the
+    // §22.5 binder can bind `Key :=` / `Value :=` — the row is what makes the
+    // NAMED spelling checkable at all (`checkBuiltinCtorNamedArgs` refuses a
+    // name it cannot match rather than binding it positionally behind the
+    // caller's back).
+    //
+    // The `kinds` column carries NO opinion (0, 0): the two parameter types
+    // are the record's own TYPE PARAMETERS (K and V), which the table's fixed
+    // vocabulary cannot express. The argument types are therefore checked by
+    // the dedicated per-record check in `checkBuiltinCtorArgTypes`, against
+    // the CONCRETE K and V of the construction's own target type — the same
+    // "a missing row costs a rejection that does not fire, never a false one"
+    // discipline the table's own header states.
+    {"DictionaryEntry", "", 2, 2, 0x00, {"Key", "Value", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Span", "", 3, 3, 0x00, {"Buffer", "Start", "Length", "", "", "", "", ""}, {0, kBPTInt, kBPTInt, 0, 0, 0, 0, 0}, ""},
     {"ReadOnlySpan", "", 3, 3, 0x00, {"Buffer", "Start", "Length", "", "", "", "", ""}, {0, kBPTInt, kBPTInt, 0, 0, 0, 0, 0}, ""},
     {"ArraySpan", "", 3, 3, 0x00, {"Source", "Start", "Length", "", "", "", "", ""}, {0, kBPTInt, kBPTInt, 0, 0, 0, 0, 0}, ""},
@@ -1382,8 +1444,13 @@ constexpr std::array<BuiltinParamRow, 385> kBuiltinParams = {{
 // fix #3425: the two record-shaped builtins whose `lowerNew` arm resolves each
 // argument to its FIELD SLOT BY NAME before lowering (#3098,
 // LlvmBackend_Exprs2.cpp). See the header.
-constexpr std::array<std::string_view, 2> kBuiltinCtorLoweredByNameHeads = {
-    "ExceptionInfo", "ReadOnlyStringSpan",
+//
+// fix #8136 (stdlib §4.8, v0.355): `DictionaryEntry<K, V>` joins them — the
+// same `lowerNew` arm shape, the same by-name resolution, the same §22.5
+// named-argument spelling (`new DictionaryEntry<string, int>(Value := 5, Key
+// := "ab")`).
+constexpr std::array<std::string_view, 3> kBuiltinCtorLoweredByNameHeads = {
+    "ExceptionInfo", "ReadOnlyStringSpan", "DictionaryEntry",
 };
 
 // fix #7502: the heads whose constructor rows are the complete §2.5

@@ -6228,12 +6228,35 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                     // / `RawBytes` / `IntPtr` / `UIntPtr` / `OwningBuffer` —
                     // every member of `kNonHeapReservedBuiltins` — uniformly
                     // Borrowed, exactly like the user-record twin.
-                    // (per §17.7, §28.3, §8.7 — fix #3134, v0.252)
+                    //
+                    // fix #8136 (stdlib §4.8, v0.355): `DictionaryEntry<K, V>`
+                    // is the third member of that population that is NOT in the
+                    // reserved-name registry — it is a SYNTHETIC, declaration-
+                    // less Named ref (#2794 made it resolvable as a WRITTEN
+                    // annotation, so it is now a real single-part written head
+                    // and a `new DictionaryEntry<string, int>(…)` reaches this
+                    // arm with `rt->declaration == nullptr`). It is a RECORD
+                    // (language spec §9: "A record is a value type"), so a
+                    // construction of it carries NO disposal obligation (§28.3)
+                    // — the same Borrowed verdict the user-record twin above
+                    // gives. Without this, `var e := new DictionaryEntry<…>(…)`
+                    // was classified Owned and drew the §28.3 must-use /
+                    // auto-drop note on a value with nothing to dispose.
+                    //
+                    // The predicate is the registry's own arm-2 set — the
+                    // builtin RECORDS whose only declared constructor is the
+                    // positional primary one (`ExceptionInfo`,
+                    // `ReadOnlyStringSpan`, `DictionaryEntry`) — so the
+                    // authority stays in one place and cannot drift from the
+                    // arity table the §17.7 rejection reads.
+                    // (per §17.7, §28.3, §8.7, §9 — fix #3134, v0.252;
+                    //  fix #8136, v0.355)
                     if (!rt->declaration && rt->astNode && rt->astNode->name &&
                         rt->astNode->name->parts.size() == 1) {
                         std::string_view n = rt->headName();
-                        if (common::isReservedBuiltinTypeName(n) &&
-                            !common::isHeapPointerReferenceBuiltin(n))
+                        if ((common::isReservedBuiltinTypeName(n) &&
+                             !common::isHeapPointerReferenceBuiltin(n)) ||
+                            common::isPositionalCtorOnlyBuiltinRecord(n))
                             return OwnershipState::Borrowed;
                     }
                 }

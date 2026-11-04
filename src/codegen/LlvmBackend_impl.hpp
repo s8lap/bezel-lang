@@ -20420,6 +20420,33 @@ private:
     // `dictEntryValueRelease` Disposal, which discharges the terminal's mint.
     bool isFreshDictEntryValueReleaseTerminalLocal(
         const LocalDeclInitView& view) const;
+    // fix #8136 (stdlib §4.8, v0.355; §28.9 / §9.7): the CONSTRUCTED-entry
+    // sibling of the two predicates above — a plain `var`/`const e := new
+    // DictionaryEntry<K, V>(…)` whose target's generic slot `slot` (0 = the
+    // `Key`, 1 = the `Value`) is a non-nullable `string`.
+    //
+    // The construction mints a reference of its OWN on a `string` component
+    // (the `lowerNew` arm retains it, or takes the +1 a producer hands over),
+    // and the record's scope end discharges it — §28.9's owner model, "every
+    // owner holds its own reference", the same one the value-like CHOICE
+    // construction states for its borrowed payload arguments (fix #6170) and
+    // the same one the `Dictionary`'s own entry slot has (the dictionary
+    // retains the key it stores and releases it with the entry). Membership in
+    // `dictEntryKeyReleaseEligible_` / `dictEntryValueReleaseEligible_` arms
+    // the `dictEntryKeyRelease` / `dictEntryValueRelease` Disposal, which
+    // discharges that reference.
+    //
+    // (The USER-record twin is deliberately NOT the model — MEASURED: the
+    // twin's field store emits no retain and its scope-end release fires only
+    // for some of its shapes; over the five argument shapes it leaks in two and
+    // segfaults in the set taken together.)
+    //
+    // A NULLABLE `string?` component is excluded (its slot is the
+    // `{i8 hasValue; T}` carrier, not a bare pointer): the mint and the
+    // discharge must be keyed on the SAME spelling, or one of them would fire
+    // alone.
+    bool isFreshDictEntryCtorLocal(const LocalDeclInitView& view,
+                                   std::size_t slot) const;
     // fix #3878 / §29.1 / §28.9 / §28.11 (v0.294): true if the local described
     // by `view` is a plain `const`/`var` bound directly to an explicit
     // `<expr>.TakeCurrent()` call on a builtin (declaration-less)

@@ -2083,6 +2083,96 @@ void ExprTC::checkBuiltinNullableCtorArgs(const ast::NewExpr& ne,
 // does), so the constant narrowing and the widening table are not restated.
 void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
                                       const std::string& head) {
+    // fix #8136 (stdlib §4.8, v0.355; §5.1 / §22.6 / §7): a positional-ctor-only
+    // builtin record whose DECLARED POSITIONAL PARAMETERS ARE ITS OWN TYPE
+    // PARAMETERS — `DictionaryEntry<K, V>` (stdlib §4.8,
+    // `public record DictionaryEntry<K, V>(Key: K, Value: V);`) is the one:
+    // §9.1 gives it a primary constructor whose parameters are its positional
+    // fields, so the parameter types are `K` and `V` — the construction
+    // TARGET's own generic arguments.
+    //
+    // The parameter table's `kinds` column has a fixed vocabulary that cannot
+    // express a type PARAMETER, so the table-driven arm below has NO opinion on
+    // these two positions (kind 0 = "no opinion"). Without this check
+    // `new DictionaryEntry<string, int>(5, "x")` reached codegen, which stores
+    // each argument into its field's LLVM type — an `i32` into the Key's `ptr`
+    // slot: an LLVM IR-verifier abort, and (had the widths matched) a SILENT
+    // field permutation. Compare each argument with the CONCRETE K / V of THIS
+    // construction's target type instead, by `checkAssignable` — §5.1's own
+    // arithmetic, so the constant narrowing and the widening table are not
+    // restated.
+    //
+    // The test that selects this arm is ARITHMETIC, not a name list: the
+    // record's declared positional arity equals the count of the target's
+    // generic arguments. `ExceptionInfo` (arity 3, no generic arguments) and
+    // `ReadOnlyStringSpan` (arity 3, one generic argument) do not satisfy it,
+    // so their table rows (which DO carry kinds) keep answering for them
+    // exactly as before.
+    if (common::isPositionalCtorOnlyBuiltinRecord(head)) {
+        const std::size_t arity =
+            common::positionalCtorArityOfBuiltinRecord(head);
+        const sema::TypeRef* tgt = ne.type ? ctx_.resolvedType(*ne.type)
+                                            : ctx_.exprType(ne);
+        if (tgt && tgt->kind == TypeRef::Kind::Named && !tgt->declaration &&
+            arity >= 1 && tgt->genericArgs.size() == arity) {
+            const std::string what =
+                "argument to `" + head + "` constructor";
+            // The declared parameter names are the record's FIELD names (§9.1:
+            // "A record's positional constructor takes its field names as
+            // parameter names"), so the §22.5 binder binds `Key :=` / `Value :=`
+            // exactly as it binds a positional list.
+            const std::vector<common::BuiltinFormals> cands =
+                common::builtinCtorParamNameCandidates(head, ne.args.size());
+            if (!cands.empty() && cands.front().names.size() == arity) {
+                const std::vector<std::string_view>& names =
+                    cands.front().names;
+                BindResult br =
+                    bindArgsToParams(sema::FormalsView::ofNames(names, arity),
+                                     ne.args, ne.span.begin, what,
+                                     /*emit=*/false);
+                if (!br.ok) return;  // `checkBuiltinCtorNamedArgs` owns it
+                for (std::size_t p = 0; p < arity; ++p) {
+                    const int ai = br.paramToArg[p];
+                    if (ai < 0 || static_cast<std::size_t>(ai) >= ne.args.size())
+                        continue;
+                    const auto& arg = ne.args[static_cast<std::size_t>(ai)];
+                    if (!arg.value || arg.isDiscard || !arg.modifier.empty())
+                        continue;
+                    TypeRef* pty = tgt->genericArgs[p];
+                    if (!pty) continue;
+                    // A BARE TYPE PARAMETER as the parameter type (a
+                    // construction inside an unspecialized generic body,
+                    // `new DictionaryEntry<T, int>(…)`) is read at each
+                    // instantiation (§3.6 rule 2 / §14.1), not here — and the
+                    // check would have nothing concrete to compare against.
+                    // Skip it: a missing check costs a rejection that does not
+                    // fire, never a false one.
+                    if (pty->kind == TypeRef::Kind::Named && !pty->declaration &&
+                        pty->genericArgs.empty())
+                        continue;
+                    TypeRef* argTy = ctx_.exprType(*arg.value);
+                    if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
+                    // §7 / §7.3: a nullable argument at a NON-nullable
+                    // parameter is refused. `checkAssignable` IS that check —
+                    // its Primitive→Primitive arm reports the §7 nullability
+                    // drop ("… is nullable but the target type is
+                    // non-nullable (§7)") and its §7.4 narrowing exception
+                    // admits a narrowed non-null read, exactly as
+                    // `reportBuiltinArgIfNullable` would. The parameter
+                    // table's `nonNullable` mask cannot express a type
+                    // PARAMETER's nullability, so the nullability is read
+                    // from the CONCRETE type here — but the REPORT is left to
+                    // `checkAssignable`, which emits the SAME sentence
+                    // `reportBuiltinArgIfNullable` does. Calling both would
+                    // print that sentence TWICE for one argument (the
+                    // one-diagnostic-per-call discipline).
+                    checkAssignable(argTy, pty, arg.value->span.begin, what,
+                                    arg.value.get());
+                }
+                return;
+            }
+        }
+    }
     // fix #7928 (§5.1, stdlib §2.15, v0.350): `JsonOptions(Indented: bool,
     // IndentWidth: int, AllowTrailingCommas: bool, IgnoreUnknownFields: bool,
     // MaxDepth: int)` has NO row in the parameter table on purpose -- a row
@@ -2577,8 +2667,23 @@ void ExprTC::checkBuiltinCtorNamedArgs(const ast::NewExpr& ne,
     // Claiming only names the registry recognizes keeps a missed built-in
     // costing a rejection that does not fire, never a false one — the same
     // fail-safe direction every other positive table here takes.
+    //
+    // fix #8136 (stdlib §4.8, v0.355): `DictionaryEntry<K, V>` is a
+    // declaration-less stdlib record whose name is NOT in the reserved-name
+    // registry (it is a synthetic Named ref — #2794 made it resolvable as a
+    // WRITTEN annotation, so it is now a real single-part written head), but
+    // its positional primary constructor DOES have declared parameter names —
+    // the record's field names (§9.1) — which the parameter table now carries
+    // (the `{"Key", "Value"}` row). Without this arm the name would be
+    // SILENTLY IGNORED and the argument bound POSITIONALLY: a silent field
+    // permutation (`new DictionaryEntry<string, int>(Value := 5, Key := "ab")`
+    // would build `Key: 5, Value: "ab"`), the defect class this whole check
+    // exists to remove. The two records already in the reserved set
+    // (`ExceptionInfo`, `ReadOnlyStringSpan`) are unaffected by the added
+    // disjunct — their `isReservedBuiltinTypeName` answer is already true.
     if (!common::isReservedBuiltinTypeName(head) &&
-        !common::isBuiltinExceptionName(head))
+        !common::isBuiltinExceptionName(head) &&
+        !common::isPositionalCtorOnlyBuiltinRecord(head))
         return;
 
     const std::string desc = "constructor of built-in `" + head + "`";

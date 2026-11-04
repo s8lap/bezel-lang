@@ -7192,27 +7192,41 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // naming nothing this record declares makes the arm DECLINE
             // (nullptr), which surfaces as the pre-existing located #2434 note
             // rather than as a wrong value.
-            if (colName == "ExceptionInfo" || colName == "ReadOnlyStringSpan") {
+            if (colName == "ExceptionInfo" || colName == "ReadOnlyStringSpan" ||
+                colName == "DictionaryEntry") {
                 const bool isEI = (colName == "ExceptionInfo");
+                // fix #8136 (stdlib §4.8, v0.355; §9.1, §17.7, §22.5): the
+                // THIRD member of this family — `DictionaryEntry<K, V>`, whose
+                // declared positional primary constructor is `(Key, Value)`
+                // (stdlib §4.8: `public record DictionaryEntry<K, V>(Key: K,
+                // Value: V);`). Same construction shape, same by-name argument
+                // resolution, same §22.5 evaluation order; only the ARITY (2
+                // rather than 3) and the LAYOUT differ — see the build step
+                // below.
+                const bool isDE = (colName == "DictionaryEntry");
                 static const char* const kEIFields[3] =
                     {"TypeName", "Message", "StackTrace"};      // §31.4
                 static const char* const kRSFields[3] =
                     {"Source", "Start", "Length"};              // stdlib §3.3
-                const char* const* fields = isEI ? kEIFields : kRSFields;
-                if (ne.args.size() == 3) {
+                static const char* const kDEFields[2] =
+                    {"Key", "Value"};                          // stdlib §4.8
+                const char* const* fields =
+                    isEI ? kEIFields : (isDE ? kDEFields : kRSFields);
+                const std::size_t arity = isDE ? 2 : 3;
+                if (ne.args.size() == arity) {
                     // Pass 1: resolve each WRITTEN argument to its field slot.
                     std::size_t slotOf[3] = {3, 3, 3};
                     bool claimed[3] = {false, false, false};
                     std::size_t pos = 0;
                     bool ok = true;
-                    for (std::size_t ai = 0; ai < 3; ++ai) {
+                    for (std::size_t ai = 0; ai < arity; ++ai) {
                         const auto& a = ne.args[ai];
                         if (!a.value) { ok = false; break; }
                         std::size_t slot = 3;
                         if (a.name.empty()) {
                             slot = pos++;
                         } else {
-                            for (std::size_t j = 0; j < 3; ++j)
+                            for (std::size_t j = 0; j < arity; ++j)
                                 if (a.name == fields[j]) { slot = j; break; }
                         }
                         if (slot >= 3 || claimed[slot]) { ok = false; break; }
@@ -7230,13 +7244,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         // own field slot.
                         llvm::Value* vals[3] = {nullptr, nullptr, nullptr};
                         const ast::Expr* valExprs[3] = {nullptr, nullptr, nullptr};
-                        for (std::size_t ai = 0; ai < 3; ++ai) {
+                        for (std::size_t ai = 0; ai < arity; ++ai) {
                             llvm::Value* av = lowerExpr(*ne.args[ai].value);
                             if (!av) { ok = false; break; }
                             vals[slotOf[ai]] = av;
                             valExprs[slotOf[ai]] = &*ne.args[ai].value;
                         }
-                        if (ok && vals[0] && vals[1] && vals[2]) {
+                        if (ok && vals[0] && vals[1] && (arity == 2 || vals[2])) {
                             if (isEI) {
                                 auto* eiTy = llvm::StructType::get(
                                     llvm_, {ptrTy(), ptrTy(), ptrTy()});
@@ -7244,6 +7258,76 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                                 for (unsigned f = 0; f < 3; ++f)
                                     v = builder_.CreateInsertValue(
                                         v, vals[f], {f}, "excinfo.ctor");
+                                return v;
+                            }
+                            if (isDE) {
+                                // fix #8136 (stdlib §4.8, v0.355; §9.1, §22.5,
+                                // §28.9): the `{K, V}` struct that
+                                // `lowerTypeRef`'s Named case gives the type
+                                // (LlvmBackend_Layout.cpp) and that the
+                                // field-read path (`e.Key` / `e.Value`,
+                                // LlvmBackend_Exprs.cpp) GEPs into. The two
+                                // component types are the CONCRETE generic
+                                // arguments of the construction's own target
+                                // type — so `DictionaryEntry<string, int>` is
+                                // `{ptr, i32}` and `DictionaryEntry<int, int>`
+                                // is `{i32, i32}`.
+                                if (rt->genericArgs.size() < 2 ||
+                                    !rt->genericArgs[0] || !rt->genericArgs[1])
+                                    return nullptr;
+                                llvm::Type* kTy = lowerTypeRef(rt->genericArgs[0]);
+                                llvm::Type* vTy = lowerTypeRef(rt->genericArgs[1]);
+                                if (!kTy || !vTy) return nullptr;
+                                // An `int` argument to a `long` K (or the
+                                // reverse) is a legal §5.1 widening /
+                                // narrowing — the argument's OWN value is an
+                                // i32 while the field slot is an i64 — so the
+                                // value is converted to the FIELD's type, the
+                                // same `ctorIntTo` the span arm above uses.
+                                llvm::Value* k0 = vals[0];
+                                llvm::Value* v0 = vals[1];
+                                if (kTy->isIntegerTy() && k0->getType()->isIntegerTy())
+                                    k0 = ctorIntTo(k0, *valExprs[0], kTy);
+                                if (vTy->isIntegerTy() && v0->getType()->isIntegerTy())
+                                    v0 = ctorIntTo(v0, *valExprs[1], vTy);
+                                if (k0->getType() != kTy || v0->getType() != vTy)
+                                    return nullptr;
+                                // §28.9 / §9.7: the record's OWN reference on a
+                                // `string` component. §28.9's owner model: "every
+                                // owner holds its own reference" — so the
+                                // construction RETAINS a BORROW argument (a
+                                // local, a parameter, a field read) and the
+                                // source keeps its own reference; a +1 PRODUCER
+                                // (a fresh `+` / interpolation / slice) instead
+                                // TRANSFERS its single reference into the
+                                // record, the same rule `lowerStringFieldStore`
+                                // applies to a class field store. The record's
+                                // own reference is given back at the record's
+                                // scope end — the `dictEntryKeyRelease` /
+                                // `dictEntryValueRelease` disposals
+                                // (LlvmBackend_Disposal.cpp).
+                                //
+                                // A NULLABLE `string?` component is NOT
+                                // retained here: its slot is the
+                                // `{i8 hasValue; T}` carrier, not a bare
+                                // pointer, so it is not the reference the
+                                // scope-end release discharges. The predicate
+                                // is the same non-nullable-`string` test the
+                                // disposal registration uses
+                                // (`isStringTypeRefNonNull`), so the mint and
+                                // the discharge are keyed on the same spelling
+                                // and cannot disagree.
+                                if (isStringTypeRefNonNull(rt->genericArgs[0]) &&
+                                    !isPlusOneStringProducer(valExprs[0]))
+                                    emitStringRetain(k0);
+                                if (isStringTypeRefNonNull(rt->genericArgs[1]) &&
+                                    !isPlusOneStringProducer(valExprs[1]))
+                                    emitStringRetain(v0);
+                                llvm::StructType* entryStTy =
+                                    llvm::StructType::get(llvm_, {kTy, vTy});
+                                llvm::Value* v = llvm::UndefValue::get(entryStTy);
+                                v = builder_.CreateInsertValue(v, k0, {0}, "de.ctor");
+                                v = builder_.CreateInsertValue(v, v0, {1}, "de.ctor");
                                 return v;
                             }
                             // {ptr Source, i32 Start, i32 Length}: `int` lowers
@@ -7259,8 +7343,9 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     }
                 }
                 // Any other argument list is not a declared constructor of
-                // either type. §17.7's own rejection of the parameterless form
-                // is sema's (checkBuiltinClosedConstructorSurface, fix #2994);
+                // any of these types. §17.7's own rejection of the
+                // parameterless form is sema's
+                // (checkBuiltinClosedConstructorSurface, fix #2994);
                 // declining here leaves every OTHER shape exactly where it was.
                 return nullptr;
             }

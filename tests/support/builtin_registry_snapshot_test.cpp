@@ -655,11 +655,20 @@ BEZEL_TEST(builtin_registry_snapshot, reserved_builtin_type_name_set) {
                                ""})
         BEZEL_EXPECT_FALSE(isReservedBuiltinTypeName(n));
     // (d) OUT by deliberate exclusion: `DictionaryEntry` / `DrainedEntry` are
-    // compared in the Named case, but only on a SYNTHETIC TypeRef (no astNode,
-    // importedName-keyed, genericArgs.size() >= 2), and neither resolves as a
-    // written type annotation at all ("unresolved type name" — measured). No
-    // declaration-less single-part Named ref can carry them, so listing them
-    // would change only the generic-argument inference binding, to no end.
+    // compared in the Named case, and — fix #8136 (stdlib §4.8, v0.355) — they
+    // DO resolve as written type annotations (#2794 put both in the
+    // written-type-arity table), so a declaration-less single-part Named ref
+    // CAN carry them. They stay OUT of the reserved set all the same, for a
+    // different reason than the one this row used to state: the reserved set
+    // is the #2974 gate's exemption list and is snapshot-pinned here, so
+    // adding `DictionaryEntry` would exempt the type from that gate and flip
+    // this row. `DictionaryEntry`'s value-shapedness is carried instead by the
+    // registry's arm-2 positional-ctor set (the builtin RECORDS whose only
+    // declared constructor is the positional primary one — `ExceptionInfo`,
+    // §31.4; `ReadOnlyStringSpan`, stdlib §3.3; `DictionaryEntry`, stdlib
+    // §4.8), which the ownership pass consults directly. `DrainedEntry<K, V>`
+    // is a CLASS (stdlib §4.9, `where V: class`), not a record, and has no
+    // positional primary constructor.
     for (std::string_view n : {"DictionaryEntry", "DrainedEntry"})
         BEZEL_EXPECT_FALSE(isReservedBuiltinTypeName(n));
     // (e) OUT: built-in EXCEPTION names are not in the registry's reserved set —

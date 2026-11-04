@@ -373,21 +373,30 @@ bool isNoConstructorBuiltin(std::string_view n);
 
 // Arm 2 — the builtin RECORDS whose only declared constructor is the positional
 // primary one: `ExceptionInfo` (spec §31.4, `record ExceptionInfo(TypeName:
-// string, Message: string, StackTrace: string)`) and `ReadOnlyStringSpan`
+// string, Message: string, StackTrace: string)`), `ReadOnlyStringSpan`
 // (stdlib §3.3, `record ReadOnlyStringSpan(Source: string, Start: int, Length:
-// int)`). §17.7 rejects "only the undeclared parameterless form `new T()` …
-// exactly as for an identically-shaped user record" — and an identically-shaped
-// user record does reject it ("required parameter `A` is not supplied", §22.5).
-// per §17.7 / §31.4 / stdlib §3.3
+// int)`) and — fix #8136 (stdlib §4.8, v0.355) — `DictionaryEntry<K, V>`
+// (`record DictionaryEntry<K, V>(Key: K, Value: V)`). §17.7 rejects "only the
+// undeclared parameterless form `new T()` … exactly as for an identically-shaped
+// user record" — and an identically-shaped user record does reject it ("required
+// parameter `A` is not supplied", §22.5).
+//
+// fix #8136: the set is ALSO the authority for "this builtin is a VALUE-shaped
+// record" — the three members are records (language spec §9: "A record is a
+// value type"), so a construction of one carries no disposal obligation
+// (§28.3) and a `new` on one is classified Borrowed by the ownership pass, the
+// same way an identically-shaped USER record is.
+// per §17.7 / §31.4 / stdlib §3.3 / stdlib §4.8
 bool isPositionalCtorOnlyBuiltinRecord(std::string_view n);
 
 // fix #3136 (§17.7 "Standard-library builtins have a closed constructor
 // surface", v0.241; §31.4; stdlib §3.3): the DECLARED POSITIONAL ARITY of each
-// arm-2 record — `ExceptionInfo`'s `(TypeName, Message, StackTrace)` and
-// `ReadOnlyStringSpan`'s `(Source, Start, Length)`. Both are 3, but the table
-// is per-record (rather than a constant) so a future arm-2 record whose
-// declared arity differs (e.g. a two-field or four-field builtin positional
-// record) carries its own arity without growing the call site.
+// arm-2 record — `ExceptionInfo`'s `(TypeName, Message, StackTrace)`,
+// `ReadOnlyStringSpan`'s `(Source, Start, Length)` and — fix #8136 (stdlib
+// §4.8, v0.355) — `DictionaryEntry<K, V>`'s `(Key, Value)`. The table is
+// per-record (rather than a constant) so a future arm-2 record whose declared
+// arity differs (e.g. a two-field or four-field builtin positional record)
+// carries its own arity without growing the call site.
 //
 // §17.7: "the constructor surface is exactly what that document declares —
 // `new T(...)` resolves only against a declared constructor, never against a
@@ -405,7 +414,7 @@ bool isPositionalCtorOnlyBuiltinRecord(std::string_view n);
 // never matches a real argument list, which keeps the call site a single
 // `if (auto a = positionalCtorArityOfBuiltinRecord(n); a && ne.args.size()
 // != a)` shape).
-// per §17.7 / §31.4 / stdlib §3.3
+// per §17.7 / §31.4 / stdlib §3.3 / stdlib §4.8
 std::size_t positionalCtorArityOfBuiltinRecord(std::string_view n);
 
 // #2921 / #2923 / §8.1 / §8.5 / §28.2 / §28.9: is `n` a reserved built-in

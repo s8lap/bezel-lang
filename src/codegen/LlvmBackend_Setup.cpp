@@ -32427,6 +32427,64 @@ struct StringEscapeWalker {
             walkAllEscape();
             return;
         }
+        // fix #8136 (stdlib §4.8, v0.355; §28.9 / §9.7): the
+        // `DictionaryEntry<K, V>` twin of the §31.4 built-in-exception
+        // relaxation above — the DECLARED positional primary constructor of
+        // the §4.8 entry record (`public record DictionaryEntry<K, V>(Key: K,
+        // Value: V);`).
+        //
+        // THE MODEL, and why the position is a BORROW rather than an escape.
+        // §28.9's owner model is "every owner holds its own reference": the
+        // construction RETAINS a borrow argument into the record's own field
+        // slot (the `lowerNew` arm), so the SOURCE keeps its own +1 and its
+        // own scope-end release, and the RECORD's own reference is given back
+        // at the record's scope end (the `dictEntryKeyRelease` /
+        // `dictEntryValueRelease` disposals). That is exactly the §31.4
+        // exception-ctor shape the arm above already admits — "the runtime
+        // ctor retains the borrow local's +1 into the slot and the local's own
+        // scope-end release balances the call-side ownership exactly once" —
+        // so the argument position is a CALL-BOUNDED BORROW, not an escape.
+        //
+        // WITHOUT this the walker conservatively tainted the source local, its
+        // scope-end release was never armed, and the source's +1 was orphaned
+        // — a per-construction leak (MEASURED: 720 B / 40 allocations over 20
+        // iterations of `var k := "a" + "b"; var e := new
+        // DictionaryEntry<string, string>(k, "c" + "d");`).
+        //
+        // NARROW, in the same three ways the §31.4 arm is:
+        //   * only a NON-NULLABLE `string` component is relaxed — that is the
+        //     one the construction retains (a nullable component's slot is the
+        //     `{i8 hasValue; T}` carrier and is NOT retained, so the source
+        //     there is not a borrow of a retained slot);
+        //   * only a plain argument position (no modifier, no discard) — the
+        //     §22.5 named spelling (`Key := …`) is admitted too, since it
+        //     binds the same declared field;
+        //   * gated on stringReleaseMode, like the §31.4 arm, so the shared
+        //     dict-materializer / grouping / borrowing-Array walks keep their
+        //     conservative escape.
+        if (stringReleaseMode && rt && rt->kind == sema::TypeRef::Kind::Named &&
+            !rt->declaration && rt->headName() == "DictionaryEntry" &&
+            rt->genericArgs.size() >= 2) {
+            static const char* const kDEFields[2] = {"Key", "Value"};
+            std::size_t pos = 0;
+            for (auto& a : ne->args) {
+                std::size_t slot = 2;
+                if (a.name.empty()) {
+                    slot = pos++;
+                } else {
+                    for (std::size_t j = 0; j < 2; ++j)
+                        if (a.name == kDEFields[j]) { slot = j; break; }
+                }
+                const sema::TypeRef* ct =
+                    (slot < 2) ? rt->genericArgs[slot] : nullptr;
+                bool safeArg = ct && !ct->nullable &&
+                    ct->kind == sema::TypeRef::Kind::Primitive &&
+                    ct->primitive == sema::PrimitiveType::String &&
+                    a.modifier.empty() && !a.isDiscard;
+                expr(a.value.get(), safeArg);
+            }
+            return;
+        }
         if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration) {
             walkAllEscape();  // builtin/unresolved type — no relaxation
             return;
@@ -40537,6 +40595,65 @@ bool Emitter::isFreshDictEntryValueReleaseTerminalLocal(
     return false;
 }
 
+// fix #8136 (stdlib §4.8, v0.355; §28.9 / §9.7): see the declaration comment in
+// LlvmBackend_impl.hpp. The CONSTRUCTED-entry sibling of the two terminal-local
+// predicates above: a plain `var`/`const e := new DictionaryEntry<K, V>(…)`
+// whose target's generic slot `slot` is a non-nullable `string`.
+//
+// WHY THE CONSTRUCTED ENTRY IS A DISCHARGE CANDIDATE AT ALL. §9.7 says a
+// record's reference-typed field is a BORROW ("the record does not own what
+// they point to"), and §28.9 says a `string`'s lifetime is "managed by the
+// runtime without user involvement" — "how the runtime manages their lifecycle
+// (reference counting, region allocation, or other) is not part of this
+// specification". This runtime chose reference counting, and reference
+// counting has to be SYMMETRIC: the `lowerNew` arm takes a reference of its
+// own on a `string` component (retaining it, or taking the +1 a producer hands
+// over), so the reference has to be given back when the record dies. The
+// codebase's own statement of the model is §28.9's owner model — "every owner
+// holds its own reference" — the same one the value-like CHOICE construction
+// states for its borrowed payload arguments (fix #6170), and the same one the
+// `Dictionary`'s own entry slot uses (stdlib §4.8's `Add` retains the key it
+// stores and releases it with the entry).
+//
+// The USER-record twin is NOT the model here, and the difference is measured,
+// not assumed: the twin's field store emits NO retain (the argument's
+// reference is taken over as-is) and its scope-end release fires only for some
+// of its shapes — over the five argument shapes the twin LEAKS in two and
+// SEGFAULTS in the set taken together. The constructed entry therefore follows
+// the OWNER model above, not the twin's behaviour.
+//
+// The escape analysis behind the eligibility set is the same conservative
+// type-agnostic walk the two siblings use: an ESCAPING local (returned, stored
+// into a field or collection, captured, reassigned, passed elsewhere) is simply
+// not registered, so its reference leaks — the SAFE direction, identical to
+// `groupingFreeEligible_` and to the two siblings above.
+bool Emitter::isFreshDictEntryCtorLocal(const LocalDeclInitView& view,
+                                        std::size_t slot) const {
+    if (view.isUsing || !view.init) return false;
+    // The initializer must be the CONSTRUCTION of a `DictionaryEntry<K, V>`:
+    // a `new` with an explicit target type (the §17.7 `new()` shorthand has
+    // no `ne.type` and is not the shape this issue is about).
+    const auto* ne = dynamic_cast<const ast::NewExpr*>(view.init);
+    if (!ne || !ne->type) return false;
+    const sema::TypeRef* rt = ctx_.resolvedType(*ne->type);
+    if (!rt) rt = ctx_.exprType(*view.init);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (rt->headName() != "DictionaryEntry") return false;
+    if (rt->genericArgs.size() < 2) return false;
+    if (slot >= rt->genericArgs.size() || !rt->genericArgs[slot]) return false;
+    const sema::TypeRef* ct = rt->genericArgs[slot];
+    // The component must be a NON-NULLABLE `string`: its slot is then a bare
+    // `bz_string*`, the very reference the construction retains and the very
+    // one the scope-end release discharges. A nullable `string?` slot is the
+    // `{i8 hasValue; T}` carrier, not a bare pointer, so it is excluded here
+    // for the same reason the two sibling predicates exclude it.
+    if (ct->kind != sema::TypeRef::Kind::Primitive ||
+        ct->primitive != sema::PrimitiveType::String || ct->nullable)
+        return false;
+    return true;
+}
+
 
 // fix #3878 / §29.1 / §28.9 / §28.11 (v0.294): see the declaration comment in
 // LlvmBackend_impl.hpp. §29.1's "`Current` semantics on borrowing and owning
@@ -41478,6 +41595,21 @@ void Emitter::collectBorrowingArrayFreeEligible(
             // both, `Dictionary<int,string>` only this one), in its own
             // candidates vector so it feeds its own eligibility set.
             if (isFreshDictEntryValueReleaseTerminalLocal(v))
+                dictEntryValueCandidates.push_back(node);
+            // fix #8136 (stdlib §4.8, v0.355): the CONSTRUCTED-entry
+            // candidates — `var e := new DictionaryEntry<K, V>(…)` whose Key
+            // (slot 0) / Value (slot 1) is a non-nullable `string`. The
+            // construction takes a reference of its own on that component (the
+            // `lowerNew` arm), so the record's scope end must give it back —
+            // the `dictEntryKeyRelease` / `dictEntryValueRelease` disposals,
+            // registered for a provably non-escaping local by the walk below.
+            // The two candidate vectors are the same ones the terminal-local
+            // shapes feed, so the escape walk and the eligibility sets are
+            // the SAME machinery — one walk, one set, one disposal kind per
+            // column.
+            if (isFreshDictEntryCtorLocal(v, /*slot=*/0))
+                dictEntryKeyCandidates.push_back(node);
+            if (isFreshDictEntryCtorLocal(v, /*slot=*/1))
                 dictEntryValueCandidates.push_back(node);
             if (isFreshBorrowingArrayMaterializerLocal(v))
                 candidates.push_back(node);
