@@ -424,7 +424,7 @@ end Program;
 // The original crash-guard program, verbatim: the carrier is the root
 // `Object`, the value is a boxed `int`, the test is against the vtable-less
 // builtin CLASS `ReadOnlyStringSpan`, and the member read is `o.Length`.
-// `Length` is a member of `ReadOnlyStringSpan` (stdlib §6.x), not of the root
+// `Length` is a member of `ReadOnlyStringSpan` (stdlib §3.3), not of the root
 // `Object` (§8.1 lists exactly `GetType`, `Equals`, `GetHashCode`, `ToString`
 // and the static `ReferenceEquals`), and §26.5 resolves a member against the
 // receiver's DECLARED type — so the read names no member and is a COMPILE

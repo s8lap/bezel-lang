@@ -1,7 +1,7 @@
 // Spec-derived regression tests for fix #747 (R42) — two gaps in the primitive
 // numeric `Parse` codegen handler.
 //
-// Authority: stdlib §5.2 (int.Parse / int.Parse(s, radix)) and §6.4
+// Authority: stdlib §9.1 (int.Parse / int.Parse(s, radix)) and §9.3
 // (decimal.Parse). Both `int` and `decimal` reach the primitive `Parse` handler
 // via their lowercase keyword receiver.
 //

@@ -71,7 +71,7 @@
 //     TypeRef did not exist). The predicate fails open there, which is the
 //     correct polarity: claiming ownership of a value the front end never
 //     typed would be unsound.
-//   * `Environment.Variables(): owned Dictionary<string, string>` (stdlib §3)
+//   * `Environment.Variables(): owned Dictionary<string, string>` (stdlib §2.4)
 //     — the same shape: no `Variables` arm anywhere in `src/`, and the call
 //     degrades to a zero value (the #2434 diagnostic). Pre-fix its local was
 //     rejected the same way; it still is. That is a distinct missing-sema-typing

@@ -107,7 +107,7 @@ BEZEL_TEST(builtin_string_parameter_null_6812,
 }
 
 // ===========================================================================
-// THE `File` ASYNC FAMILY — stdlib §7.2 declares `ReadAllTextAsync(path:
+// THE `File` ASYNC FAMILY — stdlib §7.3 declares `ReadAllTextAsync(path:
 // string)`.
 // ===========================================================================
 BEZEL_TEST(builtin_string_parameter_null_6812,

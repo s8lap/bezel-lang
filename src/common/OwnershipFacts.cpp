@@ -794,7 +794,7 @@ bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
     //   stdlib §5   ToArray / ToSet / ToDictionary  (LINQ terminals)
     //   stdlib §4.4 Sorted / Reversed / Slice       (Array copy-forms)
     //   stdlib §9.6 Split                           (string)
-    //   stdlib §7   GetBytes                        (Encoding; the
+    //   stdlib §3.2 GetBytes                        (Encoding; the
     //               `(s, destination: Span<byte>): int` overload returns a
     //               value type and is excluded by the result-head gate below)
     // `ToList` is NOT here: stdlib §5 states "There is no `ToList()` because

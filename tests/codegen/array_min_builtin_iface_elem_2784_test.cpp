@@ -5,7 +5,7 @@
 // WHAT THE DOCUMENTS REQUIRE.  stdlib §5.1 ("No-selector aggregation
 // overloads", v0.240) declares these forms only inside
 //     public extension IEnumerable<T> where T: IComparable<T>
-// and `IDisposable` (stdlib §2.5) declares no `CompareTo` and names no
+// and `IDisposable` (stdlib §2.10) declares no `CompareTo` and names no
 // `IComparable`, so the constraint is unsatisfied and the call must be
 // REJECTED — exactly as the user-defined analogue already was.
 //

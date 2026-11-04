@@ -19,7 +19,7 @@
 //
 // Fix: `ForEach` is NOT a member of any Array<T>/string receiver in stdlib
 // §5 (the only documented `ForEach` is the unrelated static
-// `Parallel.ForEach`, stdlib §5, in `Parallel` namespace). It is REMOVED
+// `Parallel.ForEach`, stdlib §6.12, in `Parallel` namespace). It is REMOVED
 // from every list/gate above. The post-fix behavior for both receivers is
 // the precise collection-specific diagnostic
 //     "no member `ForEach` on `Array<T>` (§22.5 / §4.x) — ..."
@@ -158,7 +158,7 @@ BEZEL_TEST(instance_foreach_rejected_3636, string_foreach_rejected_no_longer_cra
 }
 
 // ── Regression guard: the unrelated STATIC `Parallel.ForEach<A>(...)`
-//    (stdlib §5, in the `Parallel` namespace) is unaffected. A compile-
+//    (stdlib §6.12, in the `Parallel` namespace) is unaffected. A compile-
 //    time shape that DOES use it should still produce a `Task`-typed
 //    expression (or the right domain error — but NOT the `no member on
 //    Array<T>` wording we test above, which is the diagnostic the fix

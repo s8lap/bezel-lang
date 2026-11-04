@@ -2,7 +2,7 @@
 //
 // §18.5 (Interpolated strings) / §8.5 (`ToString`) / §8.1 (`Object` is the
 // universal root) / §28.9 (Runtime-managed types), v0.240. stdlib §3.1
-// (`StringBuilder`), stdlib §6.2 (`Mutex`), stdlib §3 (`Random`).
+// (`StringBuilder`), stdlib §6.2 (`Mutex`), stdlib §2.7 (`Random`).
 //
 // THE RULE. §18.5, verbatim: "A hole *without* a format spec formats via the
 // value's ordinary `ToString()` ([§8.5])." §8.5, verbatim: "`ToString` is
@@ -113,7 +113,7 @@ BEZEL_TEST(codegen_interp_vtableless_builtin_2923, mutex_two_holes_no_use_after_
         std::string("aSystem.Threading.MutexbSystem.Threading.Mutexc"));   // #3119
 }
 
-// stdlib §3: `Random` is a class; §8.5's class default applies. Under ASan on
+// stdlib §2.7: `Random` is a class; §8.5's class default applies. Under ASan on
 // f069645 this receiver gave a heap-buffer-overflow READ.
 BEZEL_TEST(codegen_interp_vtableless_builtin_2923, random_hole_renders_type_name_8_5) {
     BEZEL_EXPECT_EQ(

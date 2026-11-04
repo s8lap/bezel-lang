@@ -2,13 +2,13 @@
 //
 // §28.2 (`IDisposable` / disposal exactly once) / §28.9 (Runtime-managed types)
 // / §28.3 (auto-drop) / §8.1 (`Object` is the universal root), v0.240.
-// stdlib §1, stdlib §3 (`Random`), stdlib §3.1 (`StringBuilder`),
+// stdlib §1, stdlib §2.7 (`Random`), stdlib §3.1 (`StringBuilder`),
 // stdlib §6.5/§24.3 (`EventSource<T>`), stdlib §6.6 (the
 // `TaskCompletionSource` family).
 //
 // THE RULE. stdlib §1, verbatim: "Every class implicitly implements
 // `IDisposable`", so `x.Dispose()` is legal on every one of these receivers —
-// and stdlib §3 says so of `Random` outright: "`Random` is a class with a no-op
+// and stdlib §2.7 says so of `Random` outright: "`Random` is a class with a no-op
 // `Dispose` (its only state is its internal seed; there is nothing to
 // release)." Even a no-op `Dispose` leaves an instance to reclaim: §28.9's
 // *Trivial-dispose classes* subsection, verbatim, "the compiler frees the

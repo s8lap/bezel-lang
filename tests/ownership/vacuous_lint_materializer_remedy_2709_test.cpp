@@ -180,7 +180,7 @@ const char* kMaterializers[] = {
     "a.Reversed()",                                    // stdlib §4.4
     "a.Slice(0..2)",                                   // stdlib §4.4
     "\"a,b,c\".Split(\",\")",                          // stdlib §9.6
-    "Encoding.UTF8.GetBytes(\"hello\")",               // stdlib §7
+    "Encoding.UTF8.GetBytes(\"hello\")",               // stdlib §3.2
 };
 
 }  // namespace

@@ -216,7 +216,7 @@ BEZEL_TEST(span_field_store_1251, direct_class_borrow_field_still_accepted) {
 }
 
 // §9.7: "Reference-typed fields whose types are runtime-managed (`string`, …)
-// do not make the record borrow-bearing." `ReadOnlyStringSpan` (stdlib §4.13)
+// do not make the record borrow-bearing." `ReadOnlyStringSpan` (stdlib §3.3)
 // views a `string`, so it is NOT a borrow-bearing span and stays storable.
 BEZEL_TEST(span_field_store_1251, string_backed_span_field_accepted) {
     auto r = parseAndCheckOwnership(

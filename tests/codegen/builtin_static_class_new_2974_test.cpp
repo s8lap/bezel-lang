@@ -43,7 +43,7 @@
 // `Path`, `File`, `Directory`, `Debug`, `BitConverter`, `Encoding` and `Linq`
 // (which all silently zero-initialised the local behind #2434's warning — the
 // same null-pointer degrade #2922 measured faulting at address 0x8). Each is
-// pinned below. `Encoding` is `public abstract class` (stdlib §7.6) rather than
+// pinned below. `Encoding` is `public abstract class` (stdlib §3.2) rather than
 // static, and `Linq` is not a stdlib type at all, which is why the diagnostic
 // offers three readings rather than asserting "static".
 //

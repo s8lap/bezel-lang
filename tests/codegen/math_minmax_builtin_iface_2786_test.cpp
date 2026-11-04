@@ -4,7 +4,7 @@
 //
 // WHAT THE DOCUMENTS REQUIRE.  stdlib §2.2 ("`Math`", v0.240) declares
 //     public static method Min<T>(a: T, b: T): T where T: IComparable<T>;
-// `IDisposable` (stdlib §2.5) declares no `CompareTo` and names no
+// `IDisposable` (stdlib §2.10) declares no `CompareTo` and names no
 // `IComparable`, so it does NOT satisfy that constraint and the call must be
 // REJECTED with a diagnostic — exactly as a user-defined non-comparable
 // interface already was.  Instead it ABORTED the compiler:

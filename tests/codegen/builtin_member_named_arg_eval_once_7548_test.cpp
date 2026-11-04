@@ -5,7 +5,7 @@
 // spec §22.5 "Evaluation order" (v0.350): arguments are evaluated exactly once,
 // in written (textual) order, and each binds the parameter it names; "the order
 // is observable through side-effecting arguments and is normative."
-// stdlib §9.7 `Math`, §9.8 `Convert`, §9.6 `string.Join` (v0.350).
+// stdlib §2.2 `Math`, §2.3 `Convert`, §9.6 `string.Join` (v0.350).
 //
 // MEASURED on 0900fb1f (build/bezelc, real AOT compile + native run), each
 // argument a call `T(sb, "<tag>", value)` that appends its tag to a trace:

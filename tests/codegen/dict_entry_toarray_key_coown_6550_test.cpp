@@ -267,7 +267,7 @@ BEZEL_TEST(dict_entry_toarray_key_coown_6550,
 // site; the escape does not depend on which operator assembled the pipeline, only
 // on the snapshot outliving it. `Where` and `Take` are element-preserving;
 // `Select(lambda(e) => e)` is the identity projection that still copies the entry
-// struct (so the Key pointer rides along); `SortedDictionary` is stdlib §4.12's
+// struct (so the Key pointer rides along); `SortedDictionary` is stdlib §4.17's
 // ordered sibling, materialized by the same arm.
 BEZEL_TEST(dict_entry_toarray_key_coown_6550,
            where_toarray_entry_snapshot_key_read_spec_28_11) {
