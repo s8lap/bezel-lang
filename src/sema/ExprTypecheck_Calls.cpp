@@ -33518,7 +33518,25 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ctx_.setExprSymbol(&ma, builtinClassSym(ma.member));
                     return;
                 }
-                // Alias known but member is not a public type — fall through.
+                // fix #8022 (§2.2, §2.7, v0.355): the alias names a module and
+                // the member is neither one of its exported types nor a
+                // built-in static class it homes. The module-qualified arm
+                // below reports "module `M` has no public type `X`" for the
+                // same situation; the alias spelling must not differ in whether
+                // it speaks ("The alias is an additional qualifier, not a
+                // rename", §2.2). Same `System.Threading.<Builtin>` exemption
+                // as that arm: the #5012/#5013 gate owns those heads.
+                const bool exemptThreadingAlias8022 =
+                    modName == "System.Threading" &&
+                    (ma.member == "CancellationToken" || ma.member == "Task");
+                if (!exemptThreadingAlias8022) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        std::string("module `") + modName +
+                        "` has no public type `" + std::string(ma.member) +
+                        "` (\xC2\xA7""2.2 / \xC2\xA7""13.2)");
+                    return;
+                }
             }
             // (b) Single-segment module name: `ModuleName.TypeName`
             if (aliasIt == importAliases_.end()) {
