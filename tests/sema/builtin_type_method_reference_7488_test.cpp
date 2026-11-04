@@ -293,6 +293,6 @@ BEZEL_TEST(sema_builtin_type_method_reference_7488,
            array_count_still_answers) {
     // per stdlib §4.4 (v0.355)
     expectStdout("",
-                 "Console.WriteLine(a.Count());",
+                 "Console.WriteLine(a.Count);",
                  "3\n");
 }
