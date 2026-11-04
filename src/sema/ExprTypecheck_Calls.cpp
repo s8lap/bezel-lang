@@ -25159,9 +25159,16 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
     // THE HEAD of the call: the receiver's type, or the type name of a static
     // call (`int.Parse`, `Guid.Parse`).
     std::string_view head;
+    // fix #8051 (§26.5 rule 1, §8.1, §8.6, v0.353): is the receiver a VALUE
+    // PRIMITIVE (stdlib §9.1-§9.5)? `primitiveKeywordHead` answers "" for
+    // `string` (stdlib §9.6 declares that receiver's own surface) and for
+    // `Object` (the `Object` CLASS's own receiver), so the flag is false for
+    // both.
+    bool primitiveReceiver = false;
     if (TypeRef* recvTy = ctx_.exprType(*tgt)) {
         if (recvTy->kind == TypeRef::Kind::Primitive) {
             head = primitiveKeywordHead(recvTy->primitive);
+            primitiveReceiver = !head.empty();
         } else if (recvTy->kind == TypeRef::Kind::Named) {
             if (recvTy->declaration) {
                 // A USER type: its members carry declarations and the ordinary
@@ -25187,7 +25194,74 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
     // the table declares the member at all.
     const std::vector<common::BuiltinParamForm> allForms =
         common::builtinParamForms(head, member, common::kBuiltinAnyArity);
-    if (allForms.empty()) return;
+    if (allForms.empty()) {
+        // fix #8051 (§26.5 rule 1, §8.1, §8.6, v0.353): the PRIMITIVE
+        // receiver's §8.1 ARITY COMMITMENT — the hole this closes.
+        //
+        // The table declares NO form of this member on this primitive, so the
+        // primitive's OWN declared surface says nothing about it, and the
+        // §8.1 universal surface is the only one left: §8.1's universal root
+        // and §8.6's boxing put `ToString` / `Equals` / `GetHashCode` /
+        // `GetType` on EVERY receiver, and §26.5 rule 1 commits instance
+        // resolution for those NAMES ("extension blocks are never consulted
+        // for that name on that receiver"). The committed lookup then finds no
+        // applicable overload, and rule 1 says what happens next: "the call is
+        // a compile error citing the instance member(s); it does not fall back
+        // to an extension".
+        //
+        // MEASURED at the PARENT (99aea6a2) with `build/bezelc`:
+        //   * `x.Equals(1, 2)` on an `int` COMPILED and the enclosing
+        //     statement emitted NOTHING (the #2434 degradation, with only an
+        //     `internal:` warning) — the call was admitted and produced no
+        //     value;
+        //   * `x.GetHashCode(1)` and `x.GetType(1)` on an `int` likewise
+        //     COMPILED and emitted nothing;
+        //   * with a user extension of the same name, the EXTENSION answered
+        //     the call instead (`x.Equals(1, 2)` printed the extension's
+        //     `True`).
+        //
+        // The diagnostic is the HOUSE one — the same sentence the user-type
+        // receiver gets for the same mistake (the §8.1 universal arity check
+        // in `typeCall`), so one mistake draws one sentence whatever the
+        // receiver's kind.
+        //
+        // WHERE THE PRIMITIVE'S OWN SURFACE OWNS THE ARITY, THIS GATE STANDS
+        // DOWN: `x.ToString(16)` is stdlib §9.1's own `ToString(radix: int)`
+        // and `x.ToString("F2")` is its `ToString(format: string)`, so the
+        // table DOES declare those forms and the §22.6 refusal below owns
+        // them (`x.ToString(16, 32)` is refused there, naming §9.1's
+        // declared set). `Equals`, `GetHashCode` and `GetType` are the
+        // universal names the §9.1-§9.5 blocks do NOT spell out (stdlib
+        // §9.1: "Equals(other: int): bool -- auto-generated from
+        // IEquatable<int> per language spec §9.2; not shown explicitly"), so
+        // for them the §8.1 arity is the only arity there is: `Equals` takes
+        // one argument (§8.1's `Equals(other: Object?)`; §8.3's own-typed
+        // `Equals(other: int)` is still one), and `GetHashCode` and `GetType`
+        // take none. The sentence below is therefore right for all three.
+        //
+        // `ToString` is in the map for completeness: the table declares a
+        // `ToString` form for EVERY value primitive (stdlib §9.1-§9.5), so
+        // that arm is not reached today -- the `allForms.empty()` test above
+        // is false for it. It is kept because a primitive that declared no
+        // `ToString` at all would have the §8.1 arity (0).
+        if (primitiveReceiver) {
+            int expectedArity = -1;
+            if (member == "Equals") expectedArity = 1;
+            else if (member == "ToString" || member == "GetHashCode" ||
+                     member == "GetType") expectedArity = 0;
+            if (expectedArity >= 0 &&
+                static_cast<int>(ce.args.size()) != expectedArity) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    std::string("the universal `Object.") + std::string(member) +
+                        "` member takes " + std::to_string(expectedArity) +
+                        " argument(s) but the call supplies " +
+                        std::to_string(ce.args.size()) + " (§8.1)");
+                return;
+            }
+        }
+        return;
+    }
     std::vector<common::BuiltinParamForm> forms;
     for (const auto& f : allForms)
         if (f.total == ce.args.size()) forms.push_back(f);
@@ -32001,6 +32075,65 @@ static bool userTypeDeclaresObjectSlotMember(const TypeRef* recvTy,
     if (recvTy->declaration->decl == nullptr &&
         !ctx.isImported(recvTy->declaration))
         return false;  // a built-in class stub, not a user type
+    return member == "ToString" || member == "Equals" ||
+           member == "GetHashCode" || member == "GetType";
+}
+
+// fix #8051 (§26.5 rule 1, §8.1, §8.6, v0.353): the PRIMITIVE half of
+// `userTypeDeclaresObjectSlotMember` above.
+//
+// §8.1 declares `Object` as "the universal root. Every type derives from it"
+// and names the PRIMITIVES among the kinds that "derive via boxing (§8.6) when
+// used in `Object`-typed positions", so a PRIMITIVE receiver carries the four
+// universal instance members `ToString`, `Equals`, `GetHashCode` and `GetType`
+// exactly as a user class does. §26.5 rule 1 commits instance resolution for
+// those NAMES on such a receiver ("extension blocks are **never consulted**
+// for that name on that receiver"), so the extension blocks must not be
+// consulted for them.
+//
+// MEASURED (the hole this closes) at the PARENT (99aea6a2), with
+// `build/bezelc`:
+//   * `extension int { GetHashCode(): int => 7; }` ANSWERED `x.GetHashCode()`,
+//     printing the extension's `7` where the universal `Object.GetHashCode()`
+//     is the answer;
+//   * `extension int { GetType(): int => 7; }` ANSWERED `x.GetType()`, printing
+//     `7` where §8.2 refuses the call outright ("reflection is not yet
+//     implemented: 'GetType()'");
+//   * `extension int { Equals(a: int, b: int): bool => true; }` ANSWERED
+//     `x.Equals(1, 2)`, where the committed instance lookup FAILS (§26.5
+//     rule 1: "the call is a compile error citing the instance member(s); it
+//     does not fall back to an extension").
+//
+// The task-family twin of this rule is `lookupExtensionMember`'s OWN guard
+// (ExprTypecheck.cpp, #7763) — a task type has no TypeSymbol, so the lookup
+// itself has to refuse the name. A primitive receiver resolves through the
+// BUILT-IN chain and reaches that lookup from the call sites below, so the
+// refusal is made HERE, where the receiver's own kind is known.
+//
+// SCOPE: the VALUE primitives -- the ones `primitiveKeywordHead` names, and
+// so the SAME set `checkBuiltinCallAdmission`'s arity gate above uses (the two
+// halves of this rule must never disagree about what a primitive receiver is).
+// The two heads that are NOT claimed, and why:
+//   * `Object` (`PrimitiveType::Object`) is the root CLASS's own receiver
+//     (§3.4: "`Object` has no lowercase keyword alias ... `Object` is a
+//     class"), and it carries a DIFFERENT, already-complete rule-1
+//     commitment: `ExprTypecheck.cpp`'s #8041 gate refuses a wrong-arity
+//     universal call on it by name ("the root `Object`'s public surface is
+//     closed"). Claiming it here would double-report the same call.
+//   * `string` (`PrimitiveType::String`) is a reference type, not a value type
+//     (stdlib §9.6: "it is a reference type that is not a class"), and stdlib
+//     §9.6 declares its OWN `ToString(): string` / `Equals(other: string)` /
+//     `GetHashCode(): int` surface -- which the §9.6 arity gate already owns
+//     (MEASURED: `s.ToString(3)` is refused with "the call to `ToString` on
+//     `string` supplies 1 argument(s) but stdlib §9.6 declares `ToString():
+//     string` -- exactly 0 argument(s) (§22.5; §9.6)"). The string's member
+//     resolution is a separate path (stdlib §9.6's own gates), and MEASURED
+//     at the parent the extension blocks are not consulted there for the
+//     names §9.6 declares. So the string head was never this hole.
+static bool primitiveReceiverCommitsObjectSlotMember(const TypeRef* recvTy,
+                                                     std::string_view member) {
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Primitive) return false;
+    if (primitiveKeywordHead(recvTy->primitive).empty()) return false;
     return member == "ToString" || member == "Equals" ||
            member == "GetHashCode" || member == "GetType";
 }
@@ -38940,6 +39073,24 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             extensionNameBlockedNote(recvTy, ma.member));
                         return;
                     }
+                } else if (primitiveReceiverCommitsObjectSlotMember(
+                               recvTy, ma.member)) {
+                    // fix #8051 (§26.5 rule 1, §8.1, §8.6, v0.353): the
+                    // PRIMITIVE receiver's rule-1 commitment. §8.1's universal
+                    // root and §8.6's boxing put `ToString` / `Equals` /
+                    // `GetHashCode` / `GetType` on a VALUE primitive receiver,
+                    // so rule 1 commits those NAMES there and the extension
+                    // blocks are NEVER consulted for them. See
+                    // `primitiveReceiverCommitsObjectSlotMember`'s header for
+                    // the measured shapes this closes.
+                    //
+                    // The committed surface's own answer is what remains: the
+                    // universal member's value where the arity fits
+                    // (`x.GetHashCode()`), the §8.2 reflection refusal where
+                    // it does not (`x.GetType()`), and — through the primitive
+                    // receiver's admission path — the §8.1 arity refusal
+                    // where the committed lookup finds no applicable overload
+                    // (`x.Equals(1, 2)`).
                 } else {
                 // §26.5 (#714): pass outBinding to capture the free-var
                 // binding when a generic extension matched via ancestor lookup.
@@ -41676,10 +41827,16 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             // a same-named user extension.
             // fix #7775 (§26.5 rule 1, §8.1, v0.350; stdlib §3.1): and the
             // `?.` twin of the `.` form's `StringBuilder` / `Object`-base gate.
+            // fix #8051 (§26.5 rule 1, §8.1, §8.6, v0.353): and the `?.` twin
+            // of the `.` form's PRIMITIVE gate — §8.1's universal root and
+            // §8.6's boxing commit the four universal member names on a
+            // VALUE primitive receiver, so the extension blocks are never
+            // consulted for them there either.
             if (!builtinCollectionSurfaceDeclaresMember(recvTy, nm.member) &&
                 !builtinConcreteCollectionDeclaresMember(recvTy, nm.member) &&
                 !builtinStringBuilderDeclaresMember(recvTy, nm.member) &&
-                !builtinObjectBaseDeclaresMember(recvTy, nm.member)) {
+                !builtinObjectBaseDeclaresMember(recvTy, nm.member) &&
+                !primitiveReceiverCommitsObjectSlotMember(recvTy, nm.member)) {
                 member = lookupExtensionMember(
                     recvTy, nm.member, nullptr, nm.span.begin,
                     /*reportAmbiguity=*/true, currentCallArity_);
