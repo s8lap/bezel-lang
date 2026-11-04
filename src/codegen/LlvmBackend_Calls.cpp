@@ -5814,11 +5814,23 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
 
             // fix #686 / stdlib §5.1: Min/Max with decimal selector
             // (e.g. Array<decimal?>.Min((x) => x ?? sentinel)).
-            // loadTy is the element LLVM type: {i8,decimal} for decimal?, decimal for decimal.
+            // fix #8108 (stdlib §5.1, v0.355): the closure's SECOND parameter
+            // is the ELEMENT (T) — the selector is `lambda(x: T) => x.<field>`
+            // — and NOT the selector's RESULT type (U). This arm loaded the
+            // element AS the result type (a 16-byte `decimal`) and called the
+            // closure with that type, so for any element that is not a
+            // `decimal` the callee received a TRUNCATED element where it
+            // expected the whole one (a record's `decimal` field read out of
+            // the element's first 16 bytes: "107374182400", or a wild pointer
+            // for a class element) and the projected value was garbage.
+            // The ELEMENT's own LLVM type is what both the load and the call
+            // need — the same discipline the generic selector arm uses
+            // (`callClosure`, which derives the call's parameter type from the
+            // loaded element). For the two element types this arm was written
+            // for, `elemTy` IS the old `loadTy`: `decimal` -> `%bz.decimal`,
+            // `decimal?` -> `{i8,%bz.decimal}`.
             if (decSelectorMM || (isNullableDecElemMM && call.args.size() == 1)) {
-                llvm::Type* loadTyMM = isNullableDecElemMM
-                    ? static_cast<llvm::Type*>(nullDecTyMM)
-                    : static_cast<llvm::Type*>(decTy);
+                llvm::Type* loadTyMM = elemTy;
                 sema::TypeRef* decRetRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Decimal);
                 llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), decRetRef);
                 if (!closure) return nullptr;
@@ -5846,9 +5858,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.SetInsertPoint(bodyBB);
                 auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
                 llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
-                // fix #686: load at correct width per element type.
+                // fix #686 / #8108: load the ELEMENT at its own width (the
+                // element's LLVM type, not the selector's result type).
                 llvm::Value* el = builder_.CreateLoad(loadTyMM, ep);
-                // Call selector: (env, elem) -> decimal.
+                // Call selector: (env, elem) -> decimal. The parameter is the
+                // ELEMENT (fix #8108), so the call's type matches the closure
+                // the lambda was lowered with.
                 llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "cl.fn");
                 llvm::Value* envSlotP = builder_.CreateGEP(ptrTy(), closure, {builder_.getInt32(1)});
                 llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlotP, "cl.env");
