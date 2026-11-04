@@ -7381,6 +7381,79 @@ void ExprTC::checkAssignable(
             "sequence, which converts to no primitive type");
         return;
     }
+    // fix #8098 (§5.1, stdlib §5 / §4.1 / §4.12, v0.355): the SAME lazy
+    // `IEnumerable<U>` sentinel into a NON-primitive target. #7625's arm above
+    // covers the PRIMITIVE target; the sentinel has no head name, so every
+    // name-keyed arm below misses it and the catch-all accepted a lazy result
+    // into ANY collection target — `var q: Array<int> := a.Where(…)` compiled
+    // with rc=0, bound the SEQUENCE POINTER into the `Array<int>` slot and
+    // then SEGV'd at run time (MEASURED on 74ee5c00: printed an address, exit
+    // 139; the issue's repro).
+    //
+    // §5.1's reference conversions are a CLOSED list — identity, class to base
+    // class up to `Object`, "any type to `Object`", "a type to an interface
+    // it implements", interface to extended interface, a type parameter to
+    // what its constraints guarantee, and §12.9's variance-induced ones — and
+    // a sequence is none of those rows' sources: it is an `IEnumerable<T>`
+    // value (stdlib §5's `Where(predicate: (T) -> bool): IEnumerable<T>`),
+    // not a class, and not a type that implements a collection interface.
+    // stdlib §4.12 declares `public interface IEnumerable<out T>` with ONLY
+    // `GetEnumerator` — it extends NOTHING — so the lazy sequence conforms to
+    // neither `IList<T>` nor `IReadOnlyList<T>` (stdlib §4.1) nor
+    // `ICollection<T>` nor `IReadOnlyCollection<T>`; and the concrete
+    // collection classes (`Array<T>` §4.4, `Set<T>` §4.10,
+    // `Dictionary<K, V>` §4.8, `FrozenArray<T>` §4.19, …) are CLASSES, so
+    // the conversion is a class-to-class one with no nominal relation.
+    //
+    // So the ONLY collection targets a lazy result may reach are the ones it
+    // IS: `IEnumerable<T>` (stdlib §4.12) and `IOrderedEnumerable<T>`
+    // (stdlib §5's `OrderBy`/`ThenBy` result, which extends `IEnumerable<T>`).
+    // `Object` stays admitted by the root-type early-return above (§5.1's
+    // "any type to `Object`"), and a bare type parameter keeps the prior
+    // conservative accept (the #4810/#7997 arm below rejects only a concrete
+    // class or record there; a parameter's own constraint set decides at
+    // instantiation — §14.2).
+    if (from->kind == TypeRef::Kind::Named && !from->declaration &&
+        !from->astNode && !from->genericArgs.empty() &&
+        from->importedName.empty() && to->kind == TypeRef::Kind::Named) {
+        // `namedTypeSimpleName` (not `headName`): it reads the UNDERLYING
+        // head through an alias (§27.8 — `aliasResolvedHead`, fix #4570) and
+        // the LAST component of a qualified spelling, so
+        // `System.Collections.Generic.IEnumerable<T>` and an alias of it are
+        // both recognised.
+        const std::string_view toHead = namedTypeSimpleName(to);
+        if (toHead == "IEnumerable" || toHead == "IOrderedEnumerable") {
+            // the sequence's own type — accepted (identity, §5.1).
+        } else {
+            // A bare type-parameter target: §5.1 lists no conversion into it
+            // either, but the compiler's standing stance for that target is
+            // the #4810/#7997 arm below (a CONCRETE class or record is
+            // rejected; a sequence is neither), and the parameter's own
+            // constraints decide the question at instantiation (§14.2). Left
+            // on the prior path, as it was before this arm.
+            const std::string_view toTpHead =
+                (!to->declaration && to->genericArgs.empty() &&
+                 !to->isAliasQualifiedBuiltin())
+                    ? to->headName() : std::string_view();
+            const bool toIsTypeParamTarget =
+                !toTpHead.empty() &&
+                ((freeTypeParamNames && freeTypeParamNames->count(toTpHead)) ||
+                 currentScopeGenericParamNames().count(toTpHead));
+            if (!toIsTypeParamTarget) {
+                std::string target = toHead.empty()
+                    ? std::string("the target type")
+                    : ("`" + std::string(toHead) + "`");
+                reportNotConvertible(
+                    "a deferred stdlib §5 operator yields a lazy "
+                    "`IEnumerable<T>` sequence, and §5.1 lists no implicit "
+                    "conversion from a sequence to " + target +
+                    " — bind it as `IEnumerable<T>`, or materialize it first "
+                    "with `.ToArray()` / `.ToSet()` / `.ToDictionary(…)` "
+                    "(stdlib §5)");
+                return;
+            }
+        }
+    }
     // §5.4 / §10 (#924): an enum is NOT implicitly convertible to or from its
     // underlying integer type — both directions require an explicit cast
     // (`int(e)` / `E(n)`). The mixed Named(enum)↔Primitive case falls through
