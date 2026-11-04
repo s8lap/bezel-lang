@@ -11721,15 +11721,7 @@ private:
             return true;
         }
         if (!hasOwnedModifier(fs)) return false;
-        const sema::TypeRef* rt = nullptr;
-        // #662 foundation B: imported field — type from importedMemberType.
-        if (!fs->decl) {
-            rt = ctx_.importedMemberType(fs);
-        } else {
-            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-            if (!fd || !fd->type) return false;
-            rt = ctx_.resolvedType(*fd->type);
-        }
+        const sema::TypeRef* rt = declaredFieldTypeRef(fs);
         if (!isFfiBufferTypeRef(rt)) return false;
         if (isRawBytes) *isRawBytes = (builtinTypeName(rt) == "RawBytes");
         return true;
@@ -15380,14 +15372,7 @@ private:
                    pt->primitive == sema::PrimitiveType::Object;
         }
         if (!hasOwnedModifier(fs)) return false;
-        const sema::TypeRef* rt = nullptr;
-        if (!fs->decl) {
-            rt = ctx_.importedMemberType(fs);
-        } else {
-            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-            if (!fd || !fd->type) return false;
-            rt = ctx_.resolvedType(*fd->type);
-        }
+        const sema::TypeRef* rt = declaredFieldTypeRef(fs);
         if (!rt) return false;
         if (rt->kind == sema::TypeRef::Kind::Primitive)
             return rt->primitive == sema::PrimitiveType::Object;
@@ -15399,6 +15384,18 @@ private:
                    concr->primitive == sema::PrimitiveType::Object;
         }
         return false;
+    }
+
+    // The declared type of a field, local or imported (#662 foundation B,
+    // §28.5): an imported field has no `decl`, so its type rides
+    // `ctx_.importedMemberType`. Null when neither source has one.
+    const sema::TypeRef* declaredFieldTypeRef(const sema::FieldSymbol* fs) const {
+        if (!fs->decl) return ctx_.importedMemberType(fs);
+        // SEAM-ACCESSOR: the both-sources accessor; the `!fs->decl` arm above
+        // answers the imported case, so this FieldDecl read is local-only.
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (!fd || !fd->type) return nullptr;
+        return ctx_.resolvedType(*fd->type);
     }
 
     bool isOwnedReferenceField(const sema::FieldSymbol* fs) {
@@ -15418,15 +15415,7 @@ private:
                    pk == ast::TypeDeclKind::Interface;
         }
         if (!hasOwnedModifier(fs)) return false;
-        const sema::TypeRef* rt = nullptr;
-        // #662 foundation B: imported field — type from importedMemberType.
-        if (!fs->decl) {
-            rt = ctx_.importedMemberType(fs);
-        } else {
-            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-            if (!fd || !fd->type) return false;
-            rt = ctx_.resolvedType(*fd->type);
-        }
+        const sema::TypeRef* rt = declaredFieldTypeRef(fs);
         if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
         // (b) §28.5: a generic type-parameter field — classify by the concrete
         // substituted type of the current instantiation.
@@ -15484,15 +15473,7 @@ private:
             return false;
         }
         if (!hasOwnedModifier(fs)) return false;
-        const sema::TypeRef* rt = nullptr;
-        // #662 foundation B: imported field — type from importedMemberType.
-        if (!fs->decl) {
-            rt = ctx_.importedMemberType(fs);
-        } else {
-            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-            if (!fd || !fd->type) return false;
-            rt = ctx_.resolvedType(*fd->type);
-        }
+        const sema::TypeRef* rt = declaredFieldTypeRef(fs);
         if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
         if (rt->declaration) return false;  // user TypeDecl — not a builtin
         // Local (non-imported) field: name via astNode.
@@ -15521,14 +15502,7 @@ private:
         // (#1543).
         if (fs->posParam) return isSubscriptionType(capturedOwnedPrimaryParamType(fs));
         if (!hasOwnedModifier(fs)) return false;
-        const sema::TypeRef* rt = nullptr;
-        if (!fs->decl) {
-            rt = ctx_.importedMemberType(fs);
-        } else {
-            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-            if (!fd || !fd->type) return false;
-            rt = ctx_.resolvedType(*fd->type);
-        }
+        const sema::TypeRef* rt = declaredFieldTypeRef(fs);
         return isSubscriptionType(rt);
     }
 
@@ -15550,14 +15524,7 @@ private:
             return isEventSourceTypeName(pt);
         }
         if (!hasOwnedModifier(fs)) return false;
-        const sema::TypeRef* rt = nullptr;
-        if (!fs->decl) {
-            rt = ctx_.importedMemberType(fs);
-        } else {
-            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-            if (!fd || !fd->type) return false;
-            rt = ctx_.resolvedType(*fd->type);
-        }
+        const sema::TypeRef* rt = declaredFieldTypeRef(fs);
         if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
             return false;
         if (isEventSourceTypeName(rt)) return true;
