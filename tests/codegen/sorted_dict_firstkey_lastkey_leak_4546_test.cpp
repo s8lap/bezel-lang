@@ -59,10 +59,12 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 using bezel::test::runAotOut;
 
@@ -115,27 +117,25 @@ BEZEL_TEST(sorted_dict_firstkey_lastkey_leak_4546,
 }
 
 // ---------------------------------------------------------------------------
-// Leak-fixed rows — loop-amplified (150x), CALL syntax (`d.FirstKey()`,
-// LlvmBackend_Calls.cpp's tryLowerCollectionInstanceCall). The issue names
-// this as a SEPARATE mint site from the property-syntax one above; this row
-// proves it independently rather than assuming the two share a fate.
+// The CALL syntax (`d.FirstKey()`, LlvmBackend_Calls.cpp's
+// tryLowerCollectionInstanceCall) is REFUSED, so this mint site is closed
+// (fix #7543, §26.5 rule 1, §27.1, §27.7, v0.355): stdlib §4.17
+// declares `FirstKey` / `LastKey` as `public pure readonly property`, so the
+// lookup commits to that instance member and a property's value is not
+// callable. The PROPERTY row above is the spelling §4.17 declares, and it
+// still mints the same key copy — through LlvmBackend_Exprs.cpp's
+// `isSortedDictMember` arm, which is the site this fix (and #4546) discharge.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(sorted_dict_firstkey_lastkey_leak_4546,
-           call_syntax_loop_no_leak_stdlib_4_17) {
-    JitResult r = runAotChecked(wrap(
+           call_syntax_is_refused_property_call_7543) {
+    auto r = runAot(wrap(
         "  using var d := new SortedDictionary<string,int>(); "
         "  d[\"a\"] := 1; d[\"z\"] := 2; "
-        "  var n := 0; "
-        "  var i := 0; "
-        "  while i < 150 do "
-        "    var f := d.FirstKey(); var l := d.LastKey(); "
-        "    n := n + f.Length + l.Length; "
-        "    i := i + 1; "
-        "  end; "
-        "  Console.WriteLine($\"n={n}\"); "
+        "  var f := d.FirstKey(); "
         "  return 0; "));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, "n=300\n");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "`FirstKey` is a property of `SortedDictionary`, not a method"));
 }
 
 // ---------------------------------------------------------------------------
@@ -158,15 +158,16 @@ BEZEL_TEST(sorted_dict_firstkey_lastkey_leak_4546,
 }
 
 BEZEL_TEST(sorted_dict_firstkey_lastkey_leak_4546,
-           call_syntax_value_correct_stdlib_4_17) {
-    BEZEL_EXPECT_EQ(
-        runAotOut(wrap(
-            "  using var d := new SortedDictionary<string,int>(); "
-            "  d[\"banana\"] := 2; d[\"apple\"] := 1; d[\"cherry\"] := 3; "
-            "  var f := d.FirstKey(); var l := d.LastKey(); "
-            "  Console.WriteLine($\"f={f} l={l}\"); "
-            "  return 0; ")),
-        "f=apple l=cherry");
+           call_syntax_value_correct_is_refused_property_call_7543) {
+    auto r = runAot(wrap(
+        "  using var d := new SortedDictionary<string,int>(); "
+        "  d[\"banana\"] := 2; d[\"apple\"] := 1; d[\"cherry\"] := 3; "
+        "  var f := d.FirstKey(); var l := d.LastKey(); "
+        "  Console.WriteLine($\"f={f} l={l}\"); "
+        "  return 0; "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "`FirstKey` is a property of `SortedDictionary`, not a method"));
 }
 
 // Re-reading each property TWICE per iteration (loop-amplified, 100x): each

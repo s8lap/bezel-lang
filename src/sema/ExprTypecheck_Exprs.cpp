@@ -3111,28 +3111,140 @@ void ExprTC::resolveMemberAccessWithRule1(const ast::MemberAccessExpr& ma) {
     // #2434 warning, and the program ran. The interface collection heads
     // (#7597) and the array-backed concrete families (#3342) already refuse
     // this shape; the value records did not.
-    if (&ma != calleeOfCallCtx_ || currentCallArity_ <= 0 || !ma.target)
-        return;
+    if (&ma == calleeOfCallCtx_ && currentCallArity_ > 0 && ma.target &&
+        ctx_.diagnostics().errorCount() == errorsBefore) {
+        TypeRef* recvTy = ctx_.exprType(*ma.target);
+        if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
+            !recvTy->declaration) {
+            const std::string_view head = recvTy->headName();
+            const ValueRecordSurface* s = valueRecordSurfaceOf(head);
+            if (s && surfaceDeclaresProperty(*s, ma.member)) {
+                auto loc = ma.span.begin;
+                if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("`") + std::string(ma.member) + "` on `" +
+                        std::string(head) +
+                        "` is an instance member of the receiver's declared "
+                        "type; an extension of the same name is unreachable "
+                        "(spec §26.5 rule 1: instance members block "
+                        "same-named extensions of any arity, applicability, "
+                        "or accessibility). The instance member takes no "
+                        "arguments, but this call supplies " +
+                        std::to_string(currentCallArity_) + ". " +
+                        extensionNameBlockedNote(recvTy, ma.member));
+                return;
+            }
+        }
+    }
+    // ---- 3. the GENERAL rule: a PROPERTY called as a METHOD ----------
+    //
+    // fix #7543 / #7984 (spec §26.5 rule 1, §27.1, §27.7, v0.355).
+    //
+    // §26.5 rule 1 commits the lookup to the member the receiver's declared
+    // type declares, of ANY arity; §27.1 admits only a FUNCTION-typed value
+    // as a callee ("a parameter, local, field, or property of function
+    // type"); §27.7 is the compiler's "only function-typed values are
+    // callable" rule. So a PROPERTY of a NON-function type is not callable,
+    // and `x.P(...)` — a call through the property's VALUE — has no
+    // candidate: the lookup committed to the property, and the property's
+    // value is not a callable.
+    //
+    // This is the GENERAL form of what #7597 (the collection interfaces),
+    // #7775 (the built-in `StringBuilder`), #7373 (the §9.6 `string`
+    // properties) and #7971 (the §30.3 `Task` properties) each refuse for
+    // ONE surface: the arity-0 call `x.P()` — the spelling that matches the
+    // property's own arity — reached none of them, so it was ACCEPTED, and
+    // codegen then degraded it (the #2434 zero-initializer, or the #3079
+    // "failed to lower" warning) behind exit 0. MEASURED on the base tip:
+    // `o.N()` (a user `int` property), `sb.Length()`, `arr.Count()`,
+    // `b.Length()`, `Environment.NewLine(1)` and `DateTime.UtcNow()` all
+    // compiled.
+    //
+    // THE ORDER. The check runs LAST, after the arms above, and only when
+    // NO diagnostic was reported for this access (`errorCount` is unchanged
+    // since the arm started) — so a surface that already refuses the call
+    // (#7373's `string`, #7971's `Task`, #7597's / #7775's arity>0 arms)
+    // keeps ITS OWN message and no second one is added here.
+    //
+    // WHAT IS LEGAL, and stays legal:
+    //   * a property OF FUNCTION TYPE called (`o.F()` where `F` is a
+    //     lambda-typed property) — §27.1 names "a property of function type"
+    //     among the callable values;
+    //   * a METHOD that shares its name with a property elsewhere — the
+    //     receiver's own declared surface decides, per §26.5 rule 1;
+    //   * an EXTENSION method — §26.5 rule 2, consulted only when the
+    //     receiver's declared type declares no member of that name, which is
+    //     exactly the case this check leaves alone (the member is not in the
+    //     receiver's declared surface);
+    //   * `Count()` where the stdlib declares a METHOD — §5's
+    //     `IEnumerable<T>` operator (`e.Count()`), which no receiver head
+    //     in the table declares as a property.
+    if (&ma != calleeOfCallCtx_ || !ma.target) return;
     if (ctx_.diagnostics().errorCount() != errorsBefore) return;
-    TypeRef* recvTy = ctx_.exprType(*ma.target);
-    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || recvTy->declaration)
-        return;
-    const std::string_view head = recvTy->headName();
-    const ValueRecordSurface* s = valueRecordSurfaceOf(head);
-    if (!s || !surfaceDeclaresProperty(*s, ma.member)) return;
-    auto loc = ma.span.begin;
-    if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
-    ctx_.diagnostics().report(
-        Severity::Error, loc,
-        std::string("`") + std::string(ma.member) + "` on `" +
-            std::string(head) +
-            "` is an instance member of the receiver's declared type; an "
-            "extension of the same name is unreachable (spec §26.5 rule 1: "
-            "instance members block same-named extensions of any arity, "
-            "applicability, or accessibility). The instance member takes no "
-            "arguments, but this call supplies " +
-            std::to_string(currentCallArity_) + ". " +
-            extensionNameBlockedNote(recvTy, ma.member));
+    {
+        // (a) a USER-declared property. The member access resolved to the
+        // PropertySymbol, so the receiver's declared type declares it (§26.5
+        // rule 1 commits) and its declared type is the expression's type.
+        if (auto* ps = dynamic_cast<PropertySymbol*>(
+                ctx_.exprSymbol(ma))) {
+            TypeRef* pt = ctx_.exprType(ma);
+            // A property of FUNCTION type is callable (§27.1). An UNTYPED
+            // property read is not this check's business: the type is
+            // missing, not non-function, and a separate arm reports it.
+            if (!pt || pt->kind == TypeRef::Kind::Function) return;
+            auto loc = ma.span.begin;
+            if (loc.line == 0) loc = ma.target->span.begin;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                common::propertyCalledAsMethodMessage(
+                    ma.member,
+                    ps->parent ? ps->parent->name : std::string_view("this "
+                                                                      "type"),
+                    "\xC2\xA7""23"));
+            return;
+        }
+        // (b) a BUILT-IN property. The receiver is a built-in head — either
+        // the declaration-LESS shape (`Array`, `Set`, `IList<T>`, ...: a
+        // Named ref whose head rides the astNode / importedName) or a
+        // built-in CLASS STUB (`Stack`, `Queue`, `FrozenArray`: a Named ref
+        // whose declaration is the synthetic `builtinClassSym` stub, whose
+        // `decl` is null and whose `moduleName` is empty — #7970's
+        // `isUserDeclaredTypeSym` test tells the two apart). Either way the
+        // declared surface is the stdlib's own declaration block — the table
+        // that carries it. A USER class of the same name is excluded: its own
+        // declared surface answers.
+        //
+        // It is gated on the ARITY-0 call — the shape this lane fixes. A call
+        // that SUPPLIES an argument to an arity-0 property is a DIFFERENT
+        // error, and the house already has its own message for every one of
+        // them: #7597's collections ("the instance member takes no arguments,
+        // but this call supplies N"), #7775's `StringBuilder` (#7945's `?.`
+        // twin), #7670's `?.` twin of the collections, #7970's value records,
+        // and #7778's temporal value records. This check must not pre-empt
+        // them: the arity-0 call is the HOLE (it MATCHES the property's own
+        // arity, so every "takes no arguments" arm skipped it), and the
+        // arity>0 call was never the hole.
+        TypeRef* recvTy = currentCallArity_ == 0 ? ctx_.exprType(*ma.target)
+                                                  : nullptr;
+        const std::string_view recvHead = builtinPropertyReceiverHead(recvTy);
+        if (!recvHead.empty()) {
+            const common::BuiltinPropertyDecl* d =
+                common::builtinDeclaredProperty(recvHead, ma.member);
+            if (d && d->readModelled) {
+                auto loc = ma.span.begin;
+                if (loc.line == 0) loc = ma.target->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    common::propertyCalledAsMethodMessage(
+                        ma.member, recvHead,
+                        std::string("stdlib \xC2\xA7") + std::string(d->section) +
+                            ": `" + std::string(d->member) + ": " +
+                            std::string(d->type) + "`"));
+                return;
+            }
+        }
+    }
 }
 
 void ExprTC::visitExpr(const ast::Expr& e) {

@@ -208,10 +208,14 @@ std::string sinkOf(const std::string& ty, const std::string& probe) {
 
 BEZEL_TEST(codegen_dict_backed_set_drop_on_overwrite_6776,
            owned_param_sortedset_int_auto_dispose_frees_table_28_8_4_18) {
+    // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §4.18 declares
+    // `SortedSet<T>.First` as a `pure readonly property`, so the CALL spelling
+    // `v.First()` is refused; the PROPERTY READ is the spelling §4.18 declares
+    // (and the neighbouring `v.Count` in the same probe is already the read).
     BEZEL_EXPECT_EQ(
         checkedOut(prog("var x := new SortedSet<int>(); x.Add(7); x.Add(5); x.Add(6);"
                         " H.Sink(move x);",
-                        sinkOf("SortedSet<int>", "{v.Contains(6)} {v.First()}"))),
+                        sinkOf("SortedSet<int>", "{v.Contains(6)} {v.First}"))),
         rep("3 True 5\n", 100));
 }
 

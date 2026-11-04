@@ -163,7 +163,11 @@ BEZEL_TEST(channel_inline_array_element_5305ff2,
                 "    i := i + 1; "
                 "  end; "
                 "  Console.WriteLine(acc); Console.WriteLine(n); "
-                "  Console.WriteLine(cr.Count()); "
+                // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §6.9
+                // declares `Channel<T>.Count` as a `public readonly property`, so
+                // the CALL spelling is refused; the PROPERTY READ is the spelling
+                // §6.9 declares.
+                "  Console.WriteLine(cr.Count); "
                 "  return 0; end Main; end C;",
                 "200\n200\n0\n");
 }
@@ -319,7 +323,11 @@ BEZEL_TEST(channel_inline_array_element_5305ff2,
                 "    cr.TryReceive(out _); "
                 "    i := i + 1; "
                 "  end; "
-                "  Console.WriteLine(cr.Count()); "
+                // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §6.9
+                // declares `Channel<T>.Count` as a `public readonly property`, so
+                // the CALL spelling is refused; the PROPERTY READ is the spelling
+                // §6.9 declares.
+                "  Console.WriteLine(cr.Count); "
                 "  return 0; end Main; end C;",
                 "0\n");
 }
@@ -339,7 +347,11 @@ BEZEL_TEST(channel_inline_array_element_5305ff2,
                 "    var a: [3]int := [i, i, i]; "
                 "    tr.Send(a); i := i + 1; "
                 "  end; "
-                "  Console.WriteLine(cr.Count()); "
+                // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §6.9
+                // declares `Channel<T>.Count` as a `public readonly property`, so
+                // the CALL spelling is refused; the PROPERTY READ is the spelling
+                // §6.9 declares.
+                "  Console.WriteLine(cr.Count); "
                 "  return 0; end Main; end C;",
                 "100\n");
 }

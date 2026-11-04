@@ -482,8 +482,11 @@ BEZEL_TEST(sorted_set_no_compareto_3865, sortedset_cmp_element_full_functional) 
         "  s.Add(new Cmp(30)); s.Add(new Cmp(10)); s.Add(new Cmp(20)); "
         "  s.Add(new Cmp(10)); "               // duplicate: CompareTo-equal, no-op
         "  var hasTen := (if s.Contains(new Cmp(10)) then 1 else 0); "
-        "  var f := s.First().Item; "
-        "  var l := s.Last().Item; "
+        // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §4.18 declares
+        // `SortedSet<T>.First` / `.Last` as PROPERTIES, so the CALL spelling is
+        // refused and the PROPERTY READ is the spelling §4.18 declares.
+        "  var f := s.First.Item; "
+        "  var l := s.Last.Item; "
         "  var removed := (if s.Remove(new Cmp(20)) then 1 else 0); "
         "  Console.WriteLine(s.Count); "        // 2 (30, 10 remain)
         "  Console.WriteLine(hasTen); "         // 1

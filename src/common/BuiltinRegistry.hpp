@@ -1216,4 +1216,80 @@ bool isBuiltinIntLengthPropertyHead(std::string_view head);
 // per §5.1 / §4.17 / §4.18 / §6.9, fix #4766 + #4833
 bool isBuiltinIntCountPropertyHead(std::string_view head);
 
+// fix #7543 / #7984 (spec §26.5 rule 1, §27.1, §27.7, v0.355): the PROPERTY
+// members the BUILT-IN heads declare, with their declared types.
+//
+// THE RULE. Spec §26.5 rule 1 (v0.350): "If `x`'s declared type (or any base
+// type) *declares* any instance member named `Foo` — of any arity,
+// applicability, or accessibility — instance resolution is committed and
+// extension blocks are **never consulted** for that name on that receiver. If
+// the committed instance lookup then fails (no applicable overload,
+// §22.5/§22.6, or the member is inaccessible, §13.1), the call is a compile
+// error citing the instance member(s)". Spec §27.1 (v0.350) admits only a
+// FUNCTION-typed value as a callee — "a parameter, local, field, or property
+// of function type" — and §27.7 (v0.350) is the compiler's "only
+// function-typed values are callable" rule. A PROPERTY of a NON-function type
+// is therefore not callable, and `x.P(...)` — a call through the property's
+// value — has no candidate.
+//
+// The rows are the stdlib's own declaration blocks, transcribed member by
+// member, so the table and the document cannot drift: each row names the
+// head, the property, its DECLARED type and the stdlib section that declares
+// it. Where a head's block ELIDES an interface-required member, the row
+// carries it anyway — stdlib §1's "Elided interface-required members"
+// convention makes those members "part of the class's public contract
+// whether the declaration shows them or elides it" (`Set<T>` / `Stack<T>` /
+// `Queue<T>` and the owning forms elide `Count` and `IsReadOnly`, which
+// `ICollection<T>` / `IReadOnlyCollection<T>` require). A head whose name a
+// USER type reuses is not this table's business — the caller excludes a
+// user-declared receiver (the same exclusion every other built-in surface in
+// this file carries, #7217 / #3022).
+//
+// The `string` row (§9.6) and the `Task` rows (§30.3) are NOT here: #7373 and
+// #7971 already refuse the call spelling of those properties, with their own
+// diagnostics, and a second report on the same access would be a cascade.
+struct BuiltinPropertyDecl {
+    std::string_view head;    // the built-in head the property is declared on
+    std::string_view member;  // the property's name
+    std::string_view type;    // its declared type, as the stdlib spells it
+    std::string_view section; // the stdlib section that declares it
+    bool isStatic = false;   // the stdlib declares it `static readonly`
+    // The property READ is a MODELLED spelling on this receiver, so refusing
+    // the CALL spelling leaves a working remedy (`.Count` instead of
+    // `.Count()`). False for two cases:
+    //
+    //  * the six collection INTERFACE heads of stdlib §4.1 / §4.2
+    //    (`IReadOnlyCollection`, `IReadOnlyList`, `ICollection`, `IList`,
+    //    `IOwningCollection`, `IOwningList`) — the compiler does not model a
+    //    property read on a declaration-less interface head in the
+    //    local-initialiser position (MEASURED, `var n := c.Count;` on an
+    //    `IList<int>` compiles with the internal #3079 "failed to lower"
+    //    warning and prints NOTHING), and the zero-arg property call on such a
+    //    receiver is pinned ACCEPTED by #7446's and #7597's own tests ("on an
+    //    `IList<int>` receiver the built-in must answer"). The read is
+    //    #7090's family (a property reference over a builtin collection
+    //    interface head), which this lane does not own. The CONCRETE heads
+    //    that implement the same interfaces are NOT in this exemption: their
+    //    property read is modelled, so refusing their call spelling leaves
+    //    the remedy `.Count`.
+    //  * `StringBuilder.Capacity` (stdlib §3.1) — the READ is already refused
+    //    as a declared-but-unimplemented member (#7661's open question), so
+    //    refusing the call would only take away the one spelling the
+    //    compiler still admits.
+    bool readModelled = true;
+};
+
+// The declared PROPERTY `member` of the built-in head `head`, or nullptr when
+// the head declares no property of that name.
+const BuiltinPropertyDecl* builtinDeclaredProperty(std::string_view head,
+                                                   std::string_view member);
+
+// fix #7543 / #7984 (§26.5 rule 1, §27.1, §27.7): the ONE diagnostic for
+// "a property was called as a method". `declNote` names the declaration —
+// "stdlib §4.4: `Count: int`" for a built-in, "§23" for a user-declared
+// property — and `owner` names the type that declares it.
+std::string propertyCalledAsMethodMessage(std::string_view member,
+                                          std::string_view owner,
+                                          const std::string& declNote);
+
 }  // namespace bezel::common

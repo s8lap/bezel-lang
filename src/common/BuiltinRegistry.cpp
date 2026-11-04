@@ -2679,6 +2679,215 @@ bool isBuiltinIntCountPropertyHead(std::string_view head) {
     return contains(kBuiltinIntCountPropertyHeads, head);
 }  // per §5.1 / §4.17 / §4.18 / §6.9, fix #4766 + #4833
 
+// fix #7543 / #7984 (spec §26.5 rule 1, §27.1, §27.7, v0.355): the
+// PROPERTY members the built-in heads declare. The rows are the stdlib's own
+// declaration blocks, transcribed member by member (the header carries the
+// rationale and the citations).
+namespace {
+const std::vector<BuiltinPropertyDecl>& builtinPropertyDecls() {
+    static const std::vector<BuiltinPropertyDecl> kRows = {
+        // §2.1 Console — three static readonly properties.
+        {"Console", "In", "TextReader", "2.1", true, true},
+        {"Console", "Out", "TextWriter", "2.1", true, true},
+        {"Console", "Error", "TextWriter", "2.1", true, true},
+        {"Environment", "NewLine", "string", "2.4", true, true},
+        {"Environment", "MachineName", "string", "2.4", true, true},
+        {"Environment", "UserName", "string", "2.4", true, true},
+        {"Environment", "OSVersion", "string", "2.4", true, true},
+        {"Environment", "ProcessorCount", "int", "2.4", true, true},
+        {"Environment", "CommandLineArgs", "IReadOnlyList<string>", "2.4", true, true},
+        {"DateTime", "Ticks", "long", "2.5", false, true},
+        {"DateTime", "Year", "int", "2.5", false, true},
+        {"DateTime", "Month", "int", "2.5", false, true},
+        {"DateTime", "Day", "int", "2.5", false, true},
+        {"DateTime", "Hour", "int", "2.5", false, true},
+        {"DateTime", "Minute", "int", "2.5", false, true},
+        {"DateTime", "Second", "int", "2.5", false, true},
+        {"DateTime", "Millisecond", "int", "2.5", false, true},
+        {"DateTime", "DayOfWeek", "DayOfWeek", "2.5", false, true},
+        {"DateTime", "DayOfYear", "int", "2.5", false, true},
+        {"DateTime", "Kind", "DateTimeKind", "2.5", false, true},
+        {"DateTime", "Date", "DateOnly", "2.5", false, true},
+        {"DateTime", "TimeOfDay", "TimeOnly", "2.5", false, true},
+        {"DateTime", "Now", "DateTime", "2.5", true, true},
+        {"DateTime", "UtcNow", "DateTime", "2.5", true, true},
+        {"DateTime", "Today", "DateTime", "2.5", true, true},
+        {"DateTime", "MinValue", "DateTime", "2.5", true, true},
+        {"DateTime", "MaxValue", "DateTime", "2.5", true, true},
+        {"TimeSpan", "Ticks", "long", "2.5", false, true},
+        {"TimeSpan", "Days", "int", "2.5", false, true},
+        {"TimeSpan", "Hours", "int", "2.5", false, true},
+        {"TimeSpan", "Minutes", "int", "2.5", false, true},
+        {"TimeSpan", "Seconds", "int", "2.5", false, true},
+        {"TimeSpan", "Milliseconds", "int", "2.5", false, true},
+        {"TimeSpan", "TotalDays", "double", "2.5", false, true},
+        {"TimeSpan", "TotalHours", "double", "2.5", false, true},
+        {"TimeSpan", "TotalMinutes", "double", "2.5", false, true},
+        {"TimeSpan", "TotalSeconds", "double", "2.5", false, true},
+        {"TimeSpan", "TotalMilliseconds", "double", "2.5", false, true},
+        {"TimeSpan", "Zero", "TimeSpan", "2.5", true, true},
+        {"TimeSpan", "MinValue", "TimeSpan", "2.5", true, true},
+        {"TimeSpan", "MaxValue", "TimeSpan", "2.5", true, true},
+        {"DateOnly", "Year", "int", "2.5", false, true},
+        {"DateOnly", "Month", "int", "2.5", false, true},
+        {"DateOnly", "Day", "int", "2.5", false, true},
+        {"TimeOnly", "Hour", "int", "2.5", false, true},
+        {"TimeOnly", "Minute", "int", "2.5", false, true},
+        {"TimeOnly", "Second", "int", "2.5", false, true},
+        {"TimeOnly", "Millisecond", "int", "2.5", false, true},
+        {"Guid", "Empty", "Guid", "2.6", true, true},
+        {"ScopeGuard", "IsDismissed", "bool", "2.21", false, true},
+        {"StringBuilder", "Length", "int", "3.1", false, true},
+        {"StringBuilder", "Capacity", "int", "3.1", false, false},
+        {"Encoding", "Name", "string", "3.2", false, true},
+        {"Encoding", "UTF8", "Encoding", "3.2", true, true},
+        {"Encoding", "UTF16", "Encoding", "3.2", true, true},
+        {"Encoding", "UTF32", "Encoding", "3.2", true, true},
+        {"Encoding", "ASCII", "Encoding", "3.2", true, true},
+        {"IReadOnlyCollection", "Count", "int", "4.1", false, false},
+        {"IReadOnlyList", "Count", "int", "4.1", false, false},
+        {"ICollection", "Count", "int", "4.1", false, false},
+        {"ICollection", "IsReadOnly", "bool", "4.1", false, false},
+        {"IList", "Count", "int", "4.1", false, false},
+        {"IList", "IsReadOnly", "bool", "4.1", false, false},
+        {"IOwningCollection", "Count", "int", "4.2", false, false},
+        {"IOwningCollection", "IsReadOnly", "bool", "4.2", false, false},
+        {"IOwningList", "Count", "int", "4.2", false, false},
+        {"IOwningList", "IsReadOnly", "bool", "4.2", false, false},
+        {"Array", "Count", "int", "4.4", false, true},
+        {"Array", "Capacity", "int", "4.4", false, true},
+        {"OwningArray", "Count", "int", "4.5", false, true},
+        {"OwningArray", "Capacity", "int", "4.5", false, true},
+        {"LinkedList", "Count", "int", "4.6", false, true},
+        {"LinkedList", "First", "T?", "4.6", false, true},
+        {"LinkedList", "Last", "T?", "4.6", false, true},
+        {"LinkedList", "FirstNode", "LinkedListNode<T>?", "4.6", false, true},
+        {"LinkedList", "LastNode", "LinkedListNode<T>?", "4.6", false, true},
+        {"LinkedListNode", "Value", "T", "4.6", false, true},
+        {"LinkedListNode", "Next", "LinkedListNode<T>?", "4.6", false, true},
+        {"LinkedListNode", "Previous", "LinkedListNode<T>?", "4.6", false, true},
+        {"OwningLinkedList", "Count", "int", "4.7", false, true},
+        {"OwningLinkedList", "First", "T?", "4.7", false, true},
+        {"OwningLinkedList", "Last", "T?", "4.7", false, true},
+        {"OwningLinkedList", "FirstNode", "LinkedListNode<T>?", "4.7", false, true},
+        {"OwningLinkedList", "LastNode", "LinkedListNode<T>?", "4.7", false, true},
+        {"Dictionary", "Count", "int", "4.8", false, true},
+        {"Dictionary", "Keys", "IReadOnlyCollection<K>", "4.8", false, true},
+        {"Dictionary", "Values", "IReadOnlyCollection<V>", "4.8", false, true},
+        {"OwningDictionary", "Count", "int", "4.9", false, true},
+        {"OwningDictionary", "Keys", "IReadOnlyCollection<K>", "4.9", false, true},
+        {"OwningDictionary", "Values", "IReadOnlyCollection<V>", "4.9", false, true},
+        {"Set", "Count", "int", "4.10", false, true},
+        {"Set", "IsReadOnly", "bool", "4.10", false, true},
+        {"OwningSet", "Count", "int", "4.10", false, true},
+        {"OwningSet", "IsReadOnly", "bool", "4.10", false, true},
+        // §4.11 — `Count` is ELIDED from these four blocks: it is the
+        // interface-required member of `IReadOnlyCollection<T>` (stdlib §4.1),
+        // which stdlib §1's "Elided interface-required members" convention
+        // makes part of the class's own public contract ("the members an
+        // implemented interface requires are part of the class's public
+        // contract whether the declaration shows them or elides it"). The
+        // property READ is modelled on all four (MEASURED: `s.Count` on a
+        // `Stack<int>` prints the element count), so refusing the CALL leaves
+        // the working remedy `.Count`.
+        {"Stack", "Count", "int", "4.11", false, true},
+        {"OwningStack", "Count", "int", "4.11", false, true},
+        {"Queue", "Count", "int", "4.11", false, true},
+        {"OwningQueue", "Count", "int", "4.11", false, true},
+        {"OwningBuffer", "Length", "int", "4.14", false, true},
+        {"SortedDictionary", "Count", "int", "4.17", false, true},
+        {"SortedDictionary", "FirstKey", "K", "4.17", false, true},
+        {"SortedDictionary", "LastKey", "K", "4.17", false, true},
+        {"SortedSet", "Count", "int", "4.18", false, true},
+        {"SortedSet", "First", "T", "4.18", false, true},
+        {"SortedSet", "Last", "T", "4.18", false, true},
+        {"FrozenArray", "Length", "int", "4.19", false, true},
+        // §5 — `IGrouping<TKey, T>` declares `readonly property Key: TKey;`.
+        // The property READ is modelled (MEASURED: `g.Key` on a grouping over
+        // `[1,2]` prints the key), and the CALL spelling printed a wrong value
+        // (0) — the same shape as the issue's.
+        {"IGrouping", "Key", "TKey", "5", false, true},
+        {"Counter", "Count", "int", "4.20", false, true},
+        {"Counter", "Total", "int", "4.20", false, true},
+        {"OwningSlotMap", "Count", "int", "4.21", false, true},
+        {"SlotHandle", "Index", "int", "4.21", false, true},
+        {"SlotHandle", "Generation", "int", "4.21", false, true},
+        {"CancellationToken", "None", "CancellationToken", "6.1", true, true},
+        {"CancellationToken", "IsCancellationRequested", "bool", "6.1", false, true},
+        {"CancellationTokenSource", "Token", "CancellationToken", "6.1", false, true},
+        {"CancellationTokenSource", "IsCancellationRequested", "bool", "6.1", false, true},
+        {"TaskCompletionSource", "Task", "Task<T>", "6.6", false, true},
+        {"OwningTaskCompletionSource", "Task", "OwningTask<T>", "6.6", false, true},
+        {"Channel", "Count", "int", "6.9", false, true},
+        {"Channel", "IsClosed", "bool", "6.9", false, true},
+        {"TaskScope", "Token", "CancellationToken", "6.10", false, true},
+        {"LockGuard", "Value", "T", "6.11", false, true},
+        {"ReadGuard", "Value", "T", "6.11", false, true},
+        {"WriteGuard", "Value", "T", "6.11", false, true},
+        {"Parallel", "DefaultDegree", "int", "6.12", true, true},
+        {"Stream", "CanRead", "bool", "7.1", false, true},
+        {"Stream", "CanWrite", "bool", "7.1", false, true},
+        {"Stream", "CanSeek", "bool", "7.1", false, true},
+        {"Stream", "Length", "long", "7.1", false, true},
+        {"Stream", "Position", "long", "7.1", false, true},
+        // `FileStream: Stream` (stdlib §7.2) INHERITS §7.1's five properties,
+        // so the same call spelling is a property call on a `FileStream`
+        // receiver too. MEASURED: `st.Position` / `st.Length` / `st.CanRead`
+        // all read on a `FileStream` receiver.
+        {"FileStream", "CanRead", "bool", "7.1", false, true},
+        {"FileStream", "CanWrite", "bool", "7.1", false, true},
+        {"FileStream", "CanSeek", "bool", "7.1", false, true},
+        {"FileStream", "Length", "long", "7.1", false, true},
+        {"FileStream", "Position", "long", "7.1", false, true},
+        {"FileStream", "Path", "string", "7.2", false, true},
+        {"Stopwatch", "IsRunning", "bool", "8.1", false, true},
+        {"Stopwatch", "Elapsed", "TimeSpan", "8.1", false, true},
+        {"Stopwatch", "ElapsedMilliseconds", "long", "8.1", false, true},
+        // stdlib §9.8 `Range<T>`: `Start` / `End` are the two properties whose
+        // READ is modelled — MEASURED: `r.Start` prints 1 and `r.End` prints 5
+        // on a `1..5` range, and the CALL spellings `r.Start()` / `r.End()`
+        // degrade to nothing (#605 / #3079). The range's other four properties
+        // (`Step`, `IsEmpty`, `IsEndInclusive`, `IsOpenEnded`) have a READ
+        // that is already refused ("`Step` on built-in type `Range` produced
+        // no value"), so they are NOT rows here — their read is not a modelled
+        // spelling, and their call spelling is refused with it.
+        {"Range", "Start", "T?", "9.8", false, true},
+        {"Range", "End", "T?", "9.8", false, true},
+        {"IntPtr", "Zero", "IntPtr", "10.0", true, true},
+        {"UIntPtr", "Zero", "UIntPtr", "10.0", true, true},
+        {"CString", "Length", "int", "10.1", false, true},
+        {"CString", "Pointer", "IntPtr", "10.1", false, true},
+        {"WString", "Length", "int", "10.2", false, true},
+        {"WString", "Pointer", "IntPtr", "10.2", false, true},
+        {"RawBytes", "Length", "int", "10.3", false, true},
+        {"RawBytes", "Pointer", "IntPtr", "10.3", false, true},
+        {"Ptr", "Zero", "Ptr<T>", "10.5", true, true},
+    };
+    return kRows;
+}
+}  // namespace
+
+const BuiltinPropertyDecl* builtinDeclaredProperty(std::string_view head,
+                                                   std::string_view member) {
+    for (const auto& r : builtinPropertyDecls()) {
+        if (r.head != head || r.member != member) continue;
+        return &r;
+    }
+    return nullptr;
+}  // per §26.5 rule 1 / §27.1 / §27.7, fix #7543 + #7984
+
+std::string propertyCalledAsMethodMessage(std::string_view member,
+                                          std::string_view owner,
+                                          const std::string& declNote) {
+    return "`" + std::string(member) + "` is a property of `" +
+           std::string(owner) + "`, not a method (" + declNote +
+           "), so this call has no candidate: the lookup commits to the "
+           "instance member (\xC2\xA7""26.5 rule 1), and only a "
+           "function-typed property can be called (\xC2\xA7""27.1, "
+           "\xC2\xA7""27.7) \xE2\x80\x94"" read it without parentheses, `." +
+           std::string(member) + "`";
+}  // per §26.5 rule 1 / §27.1 / §27.7, fix #7543 + #7984
+
 // fix #5044 (§2.3 Row 10, stdlib §4, v0.307): the §2.3 always-available
 // bare-name Row 10 collection/iterator heads. The single authority for
 // `isAlwaysAvailableBareName`'s Row 10 chain, replacing the hand-spelled

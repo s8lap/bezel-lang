@@ -54,6 +54,29 @@ bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable);
 // Defined in ExprTypecheck_Calls.cpp.
 std::string_view taskFamilyHeadName(const TypeRef* rt);
 
+// fix #7543 / #7984 (spec §26.5 rule 1, §27.1, §27.7, v0.355): the BUILT-IN
+// head a receiver's DECLARED type names — empty when the receiver is a
+// USER-declared type (whose own declared surface answers) or a non-builtin.
+//
+// Two shapes name a built-in head:
+//
+//   * the DECLARATION-LESS shape (`Array<int>`, `IList<int>`, `StringBuilder`,
+//     `OwningBuffer<int>`, ... — a Named TypeRef with no `declaration`, whose
+//     head rides the annotation's `astNode` or the `importedName`); and
+//   * the built-in CLASS STUB (`Stack`, `Queue`, `FrozenArray` — a Named
+//     TypeRef whose `declaration` is the synthetic `builtinClassSym` stub,
+//     whose `decl` is null and whose `moduleName` is empty).
+//
+// #7970's `isUserDeclaredTypeSym` tells the two apart: a USER type that
+// reuses a built-in's name carries a non-null `decl` (or a module name) and is
+// NOT matched — its own declared surface answers there.
+inline std::string_view builtinPropertyReceiverHead(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return {};
+    if (!t->declaration) return t->headName();
+    if (!isUserDeclaredTypeSym(t->declaration)) return t->declaration->name;
+    return {};
+}
+
 // fix #5194 (§4.3/§5.2, v0.312): parse a `float` literal text to its correctly-
 // rounded IEEE-754 value.  A `float` literal must be rounded once, to nearest
 // with ties to even (not double-rounded through a `double` intermediate).

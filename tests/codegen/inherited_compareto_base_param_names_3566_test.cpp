@@ -67,6 +67,13 @@
 // layout coincides with the real one (measured `first=1 last=3 count=3` on the
 // revert). So is the non-inherited `CompareTo` #3530 already fixed.
 
+// fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): the rows below read
+// `d.FirstKey` / `d.LastKey` as the PROPERTY READ stdlib §4.17 declares
+// (`public pure readonly property FirstKey: K;` / `LastKey: K;`). The CALL
+// spelling `d.FirstKey()` is refused — the lookup commits to that instance
+// member (§26.5 rule 1) and a property's value is not callable (§27.1,
+// §27.7).
+
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -137,8 +144,8 @@ BEZEL_TEST(inherited_compareto_3566, renamed_param_base_compareto_spec_4_17) {
         "    using var c := new Derived<long>(30L, 2); "
         "    var d := new SortedDictionary<Derived<long>, int>(); "
         "    d.Add(a, 30); d.Add(b, 10); d.Add(c, 20); "
-        "    Console.WriteLine($\"first={d.FirstKey().Key} "
-        "last={d.LastKey().Key} count={d.Count}\"); "
+        "    Console.WriteLine($\"first={d.FirstKey.Key} "
+        "last={d.LastKey.Key} count={d.Count}\"); "
         "    return 0; "
         "  end Main; "
         "end Program;");
@@ -162,8 +169,8 @@ BEZEL_TEST(inherited_compareto_3566, renamed_param_payload_round_trip_spec_2_8_3
         "    using var c := new Derived<long>(5000000030L, 2); "
         "    var d := new SortedDictionary<Derived<long>, int>(); "
         "    d.Add(a, 30); d.Add(b, 10); d.Add(c, 20); "
-        "    Console.WriteLine($\"k={d.FirstKey().Key} "
-        "p={d.FirstKey().Payload}\"); "
+        "    Console.WriteLine($\"k={d.FirstKey.Key} "
+        "p={d.FirstKey.Payload}\"); "
         "    return 0; "
         "  end Main; "
         "end Program;");
@@ -199,8 +206,8 @@ BEZEL_TEST(inherited_compareto_3566, two_level_rename_chain_spec_14_1) {
         "    using var c := new GLeaf<long>(30L, 2); "
         "    var d := new SortedDictionary<GLeaf<long>, int>(); "
         "    d.Add(a, 30); d.Add(b, 10); d.Add(c, 20); "
-        "    Console.WriteLine($\"first={d.FirstKey().Key} "
-        "last={d.LastKey().Key} count={d.Count} pay={d.FirstKey().Payload}\"); "
+        "    Console.WriteLine($\"first={d.FirstKey.Key} "
+        "last={d.LastKey.Key} count={d.Count} pay={d.FirstKey.Payload}\"); "
         "    return 0; "
         "  end Main; "
         "end Program;");
@@ -228,8 +235,8 @@ BEZEL_TEST(inherited_compareto_3566, matching_param_name_also_declined_spec_4_17
         "    using var c := new Derived<long>(30L, 2); "
         "    var d := new SortedDictionary<Derived<long>, int>(); "
         "    d.Add(a, 30); d.Add(b, 10); d.Add(c, 20); "
-        "    Console.WriteLine($\"first={d.FirstKey().Key} "
-        "last={d.LastKey().Key} count={d.Count}\"); "
+        "    Console.WriteLine($\"first={d.FirstKey.Key} "
+        "last={d.LastKey.Key} count={d.Count}\"); "
         "    return 0; "
         "  end Main; "
         "end Program;");
@@ -259,8 +266,8 @@ BEZEL_TEST(inherited_compareto_3566, non_generic_derived_over_generic_base_spec_
         "    using var c := new DPlain(30L, 2); "
         "    var d := new SortedDictionary<DPlain, int>(); "
         "    d.Add(a, 30); d.Add(b, 10); d.Add(c, 20); "
-        "    Console.WriteLine($\"first={d.FirstKey().Key} "
-        "last={d.LastKey().Key} count={d.Count} pay={d.FirstKey().Payload}\"); "
+        "    Console.WriteLine($\"first={d.FirstKey.Key} "
+        "last={d.LastKey.Key} count={d.Count} pay={d.FirstKey.Payload}\"); "
         "    return 0; "
         "  end Main; "
         "end Program;");
@@ -288,8 +295,8 @@ BEZEL_TEST(inherited_compareto_3566, control_int_argument_placeholder_coincides)
         "    using var c := new Derived<int>(30, 2); "
         "    var d := new SortedDictionary<Derived<int>, int>(); "
         "    d.Add(a, 30); d.Add(b, 10); d.Add(c, 20); "
-        "    Console.WriteLine($\"first={d.FirstKey().Key} "
-        "last={d.LastKey().Key} count={d.Count}\"); "
+        "    Console.WriteLine($\"first={d.FirstKey.Key} "
+        "last={d.LastKey.Key} count={d.Count}\"); "
         "    return 0; "
         "  end Main; "
         "end Program;");
@@ -317,8 +324,8 @@ BEZEL_TEST(inherited_compareto_3566, control_self_declared_compareto_3530) {
         "    using var c := new GSelf<long>(30L, 2); "
         "    var d := new SortedDictionary<GSelf<long>, int>(); "
         "    d.Add(a, 30); d.Add(b, 10); d.Add(c, 20); "
-        "    Console.WriteLine($\"first={d.FirstKey().Key} "
-        "last={d.LastKey().Key} count={d.Count}\"); "
+        "    Console.WriteLine($\"first={d.FirstKey.Key} "
+        "last={d.LastKey.Key} count={d.Count}\"); "
         "    return 0; "
         "  end Main; "
         "end Program;");

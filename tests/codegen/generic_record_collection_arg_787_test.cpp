@@ -29,13 +29,17 @@ int runFull(const std::string& program) {
 }  // namespace
 
 // §14.1: the #787 repro — a method on the Array<int> field. Was SIGSEGV; now 2.
+//
+// fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §4.4 declares
+// `Array<T>.Count` as a `pure readonly property`, so the CALL spelling is
+// refused; the property READ is the spelling §4.4 declares.
 BEZEL_TEST(generic_record_collection_arg_787, array_field_method) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; record Box<T>(V: T); "
         "class C public static method Main(): int "
         "  using var a: Array<int> := new Array<int>(2); a.Add(1); a.Add(2); "
         "  var b := new Box<Array<int>>(a); "
-        "  return b.V.Count(); "  // 2
+        "  return b.V.Count; "  // 2
         "end Main; end C;"), 2);
 }
 

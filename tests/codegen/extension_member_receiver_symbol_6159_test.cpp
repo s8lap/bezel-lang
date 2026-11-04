@@ -146,11 +146,17 @@ BEZEL_TEST(extension_receiver_symbol_6159, ilist_length_ienumerable_extension_wi
 // per §26.5 rule 1 (v0.345) + stdlib §3.1: `StringBuilder` DECLARES
 // `Length`, so instance resolution is committed and the extension blocks are
 // never consulted — the built-in answers with the content length (3).
+//
+// fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): the CALL spelling
+// `sb.Length()` is now refused — stdlib §3.1 declares `Length` as a
+// `readonly property` of type `int`, and only a FUNCTION-typed value is
+// callable. The PROPERTY READ `sb.Length` is the spelling §3.1 declares, and
+// it still answers with the built-in's content length.
 BEZEL_TEST(extension_receiver_symbol_6159, sb_length_declared_member_wins) {
     // per §26.5 rule 1 (v0.345); stdlib §3.1
     BEZEL_EXPECT_EQ(runAotOut(sbProgram(
         "extension StringBuilder public method Length(): int => 77; end;",
-        "var i: int := sb.Length(); Console.WriteLine(i);")),
+        "var i: int := sb.Length; Console.WriteLine(i);")),
         "3");
 }
 
@@ -168,6 +174,10 @@ BEZEL_TEST(extension_receiver_symbol_6159, ilist_count_inherited_member_wins) {
 
 // per §26.5 rule 1 (v0.345) + stdlib §4.4: `Array<T>` DECLARES `Count`, so
 // the extension block is never consulted — the built-in answers.
+//
+// fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): the CALL spelling
+// `a.Count()` is now refused (stdlib §4.4 declares `Count` as a `pure readonly
+// property` of type `int`); the PROPERTY READ is the spelling §4.4 declares.
 BEZEL_TEST(extension_receiver_symbol_6159, array_count_declared_member_wins) {
     // per §26.5 rule 1 (v0.345); stdlib §4.4
     BEZEL_EXPECT_EQ(runAotOut(
@@ -175,7 +185,7 @@ BEZEL_TEST(extension_receiver_symbol_6159, array_count_declared_member_wins) {
         "extension Array<int> public method Count(): int => 77; end; "
         "class Program public static method Main(): int "
         "  var a: Array<int> := [1,2,3]; "
-        "  var i: int := a.Count(); Console.WriteLine(i); "
+        "  var i: int := a.Count; Console.WriteLine(i); "
         "  return 0; "
         "end Main; end Program;"),
         "3");
@@ -185,6 +195,13 @@ BEZEL_TEST(extension_receiver_symbol_6159, array_count_declared_member_wins) {
 
 // With NO user extension the built-in answers every one of these — the fix
 // must not change a program that has no extension in it.
+//
+// fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): the two PROPERTY reads
+// (`a.Count`, `sb.Length`) are the spellings stdlib §4.4 / §3.1 declare; the
+// CALL spelling of each is now refused. The `IList<T>` receiver's zero-arg
+// `c.Count()` is the collection-INTERFACE shape, which stays admitted (#7446's
+// ruling — the built-in answers it, and the property READ on a declaration-less
+// interface head is not modelled in the local-initialiser position).
 BEZEL_TEST(extension_receiver_symbol_6159, no_extension_builtin_still_answers) {
     // per stdlib §3.1 / §4.1 / §4.4
     BEZEL_EXPECT_EQ(runAotOut(
@@ -193,9 +210,9 @@ BEZEL_TEST(extension_receiver_symbol_6159, no_extension_builtin_still_answers) {
         "  var a: Array<int> := [1,2,3]; "
         "  var c: IList<int> := a; "
         "  var sb := new StringBuilder(); sb.Append(\"abc\"); "
-        "  Console.WriteLine(a.Count()); "
+        "  Console.WriteLine(a.Count); "
         "  Console.WriteLine(c.Count()); "
-        "  Console.WriteLine(sb.Length()); "
+        "  Console.WriteLine(sb.Length); "
         "  return 0; "
         "end Main; end Program;"),
         "3\n3\n3");

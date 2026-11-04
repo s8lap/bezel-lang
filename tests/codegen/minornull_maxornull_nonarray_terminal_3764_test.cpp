@@ -334,7 +334,11 @@ BEZEL_TEST(minornull_maxornull_nonarray_terminal_3764,
             "    using var s := new Set<int>();\n"
             "    s.Add(30); s.Add(10); s.Add(20);\n"
             "    var rgSum := (1..5).Sum();\n"
-            "    Console.WriteLine($\"{lzSum},{ll.Count},{s.Count()},"
+            // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §4.10
+            // declares `Set<T>.Count` as a `pure readonly property`, so the CALL
+            // spelling is refused and the PROPERTY READ is used. `ll.Count`
+            // (a `LinkedList<T>`, §4.6) was already the property read.
+            "    Console.WriteLine($\"{lzSum},{ll.Count},{s.Count},"
             "{s.Contains(10)},{rgSum}\");")),
         "60,3,3,True,15");
 }

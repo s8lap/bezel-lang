@@ -97,6 +97,7 @@
 // Expected values: `Make()` builds [1, 2, 3]; `acc` counts one pass, so 101
 // iterations give 101, whose `mod 100` residue is 1.
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -269,14 +270,34 @@ BEZEL_TEST(lazy_terminal_unbound_owned_source_reclaim_6380,
 }
 
 // ===========================================================================
-// ELEMENT-RETURNING AND STRING-ELEMENT FACES. `First()` on a `LinkedList`
+// ELEMENT-RETURNING AND STRING-ELEMENT FACES. `First` on a `LinkedList`
 // returns an element read out of the materialized snapshot, so the reclaim must
 // run AFTER that read and must not reach into the snapshot; the two `Array<string>`
 // rows pin the null-element-disposer decision above.
+//
+// fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §4.6 declares
+// `LinkedList<T>.First` as a `public pure readonly property First: T;`, so the
+// CALL spelling `f.Make().First()` is REFUSED — the lookup commits to that
+// instance member and a property's value is not callable.
+//
+// The CALL face this row pinned (the reclaim sat in the call lowering's
+// fall-through arm, LlvmBackend_Calls3.cpp) is therefore closed. The PROPERTY
+// face — `f.Make().First` — is the spelling §4.6 declares, but the
+// element-read arm of the codegen (LlvmBackend_Exprs.cpp) does NOT call
+// `freeUnboundOwnedBorrowingArrayTemp`, so that spelling still leaks the
+// unbound temp. MEASURED on this tip: 592 B in 16 allocations over 4
+// iterations (`bz_llist_alloc` / `bz_llist_add_last`), against 0 B for the
+// `.Count` property face of the identical loop (the arm that DOES call the
+// helper). That gap is PRE-EXISTING (the property-read path is untouched by
+// this fix) and is reported as a residual for the codegen owner; this row
+// pins the CLOSED face, which is what this lane changed.
 // ===========================================================================
 BEZEL_TEST(lazy_terminal_unbound_owned_source_reclaim_6380,
-           linkedlist_element_terminal_of_an_unbound_owned_temp_is_reclaimed_spec_28_3) {
-    expectClean(driver(makeLlist(), "M6380R", "f.Make().First();"));
+           linkedlist_element_terminal_call_spelling_is_refused_property_call_7543) {
+    auto r = runAot(driver(makeLlist(), "M6380R", "f.Make().First();"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "`First` is a property of `LinkedList`, not a method"));
 }
 
 BEZEL_TEST(lazy_terminal_unbound_owned_source_reclaim_6380,

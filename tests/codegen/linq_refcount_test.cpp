@@ -1031,8 +1031,16 @@ BEZEL_TEST(linq_refcount, owned_fold_temp_length_property_leak_free_1006b) {
     expectValueAndLeakFree(kOwnedFoldLength, 3);
 }
 
-// `P.Fold(s).Count()` — the LINQ `.Count()` method form (an array terminal) is
-// also a borrow position; the owned Fold temp is freed after the count. Returns 3.
+// `P.Fold(s).Count` — the PROPERTY form (stdlib §4.4 declares `Array<T>.Count`
+// as a `pure readonly property`) is also a borrow position; the owned Fold temp
+// is freed after the count. Returns 3.
+//
+// fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): the CALL spelling
+// `P.Fold(s).Count()` is refused — the receiver's declared type (`Array<int>`)
+// declares `Count` as a property, so the lookup commits to that instance
+// member and a property's value is not callable. The PROPERTY READ is the
+// spelling §4.4 declares, and it reaches the SAME reclaim (the property arm
+// of the array-backed `.Count`/`.Length` path).
 const char* kOwnedFoldCountMethod =
     "module M; class P "
     "  public static method Fold(src: Array<int>): owned Array<int> "
@@ -1040,12 +1048,12 @@ const char* kOwnedFoldCountMethod =
     "  public static method Main(): int "
     "    using var s := new Array<int>(); "
     "    s.Add(3); s.Add(1); s.Add(2); "
-    "    var n := P.Fold(s).Count(); "
+    "    var n := P.Fold(s).Count; "
     "    return n; "
     "  end Main; "
     "end P;";
 
-BEZEL_TEST(linq_refcount, owned_fold_temp_count_method_leak_free_1006b) {
+BEZEL_TEST(linq_refcount, owned_fold_temp_count_property_leak_free_1006b) {
     expectValueAndLeakFree(kOwnedFoldCountMethod, 3);
 }
 
@@ -1216,7 +1224,10 @@ const char* kToDictUnboundCount =
     "    var n: int := 0; "
     "    do "
     "      using var a := new Array<int>(); a.Add(1); a.Add(2); "
-    "      n := a.ToDictionary(lambda(x) => x).Count(); "  // unbound dict temp reclaimed
+    // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §4.8 declares
+    // `Dictionary<K,V>.Count` as a `pure readonly property`, so the CALL
+    // spelling is refused and the PROPERTY READ is the spelling §4.8 declares.
+    "      n := a.ToDictionary(lambda(x) => x).Count; "  // unbound dict temp reclaimed
     "    end; "
     "    return n; "                                   // 2 — count correct, no leak
     "  end Main; "
@@ -1237,7 +1248,7 @@ const char* kToDictBoundCount =
     "    do "
     "      using var a := new Array<int>(); a.Add(1); a.Add(2); "
     "      using var d := a.ToDictionary(lambda(x) => x); "
-    "      n := d.Count(); "                           // bound — sole free is d's
+    "      n := d.Count; "                             // bound — sole free is d's
     "    end; "
     "    return n; "                                   // 2
     "  end Main; "

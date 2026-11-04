@@ -40,6 +40,7 @@
 // store (#6341(b), §28.9) is a separate DISPOSAL-layer defect, filed and
 // tracked separately; nothing here touches a field slot.
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan
 #include "test_harness.hpp"
 
@@ -141,11 +142,21 @@ BEZEL_TEST(llist_unbound_owned_temp_reclaim_6341,
         "    acc += f.Make().Count; ")), 0);
 }
 
-// Face 2 — `.Count()` no-arg CALL.  The arm with no `freeFreshInputTemp()`.
+// Face 2 — the `.Count()` no-arg CALL spelling is REFUSED (fix #7543), so
+// this face is CLOSED: stdlib §4.6 declares `LinkedList<T>.Count` as a
+// `public pure readonly property Count: int;`, so the lookup commits to that
+// instance member (§26.5 rule 1) and a property's value is not callable
+// (§27.1, §27.7).  The reclaim this face pinned (the no-arg call arm of
+// LlvmBackend_Calls3.cpp, which had no `freeFreshInputTemp()`) is therefore
+// unreachable — the PROPERTY face (Face 1) is the spelling §4.6 declares.
 BEZEL_TEST(llist_unbound_owned_temp_reclaim_6341,
-           llist_unbound_count_method_no_leak_spec_28_3) {
-    BEZEL_EXPECT_EQ(runChecked(prog(kFactoryInt,
-        "    acc += f.Make().Count(); ")), 0);
+           llist_unbound_count_call_spelling_is_refused_property_call_7543) {
+    auto r = runAot(prog(kFactoryInt,
+        "    acc += f.Make().Count(); "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r,
+            "`Count` is a property of `LinkedList`, not a method"));
 }
 
 // Face 3 — `for-in` over an unbound owned list.  `lowerLinkedListFor` reached
@@ -164,11 +175,15 @@ BEZEL_TEST(llist_unbound_owned_temp_reclaim_6341,
 BEZEL_TEST(llist_unbound_owned_temp_reclaim_6341,
            llist_all_three_faces_mixed_with_using_var_no_leak_spec_28_3) {
     BEZEL_EXPECT_EQ(runChecked(prog(kFactoryInt,
+        // fix #7543: the `.Count()` CALL face is refused (stdlib §4.6's
+        // `LinkedList<T>.Count` is a property), so this program exercises the
+        // PROPERTY face twice and the `for-in` face — the two faces that
+        // remain.
         "    acc += f.Make().Count; "
-        "    acc += f.Make().Count(); "
+        "    acc += f.Make().Count; "
         "    for var s in f.Make() do acc += s; end; "
         "    using var l := f.Make(); "
-        "    acc += l.Count + l.Count(); "
+        "    acc += l.Count + l.Count; "
         "    for var t in l do acc += t; end; ")), 0);
 }
 
@@ -186,9 +201,11 @@ BEZEL_TEST(llist_unbound_owned_temp_reclaim_6341,
 BEZEL_TEST(llist_unbound_owned_temp_reclaim_6341,
            llist_bound_using_var_still_disposed_exactly_once_spec_28_3) {
     BEZEL_EXPECT_EQ(runChecked(prog(kFactoryInt,
+        // fix #7543: the `.Count()` CALL spelling is refused (stdlib §4.6),
+        // so the read is the property face.
         "    using var l := f.Make(); "
         "    acc += l.Count; "
-        "    acc += l.Count(); "
+        "    acc += l.Count; "
         "    for var s in l do acc += s; end; ")), 0);
 }
 
@@ -198,7 +215,7 @@ BEZEL_TEST(llist_unbound_owned_temp_reclaim_6341,
     BEZEL_EXPECT_EQ(runChecked(prog(kFactoryInt,
         "    var l := f.Make(); "
         "    acc += l.Count; "
-        "    acc += l.Count(); "
+        "    acc += l.Count; "
         "    for var s in l do acc += s; end; ")), 0);
 }
 
@@ -209,7 +226,7 @@ BEZEL_TEST(llist_unbound_owned_temp_reclaim_6341,
     BEZEL_EXPECT_EQ(runChecked(prog(kFactoryInt,
         "    var l := f.Make(); "
         "    acc += l.Count; "
-        "    acc += l.Count(); "
+        "    acc += l.Count; "
         "    for var s in l do acc += s; end; "
         "    l.Dispose(); ")), 0);
 }
@@ -222,7 +239,7 @@ BEZEL_TEST(llist_unbound_owned_temp_reclaim_6341,
         "    var l := f.Make(); "
         "    var m := move l; "
         "    acc += m.Count; "
-        "    acc += m.Count(); "
+        "    acc += m.Count; "
         "    for var s in m do acc += s; end; ")), 0);
 }
 
@@ -247,7 +264,7 @@ BEZEL_TEST(llist_unbound_owned_temp_reclaim_6341,
         "  var acc := 0; var i := 0; "
         "  while i < 200 do "
         "    acc += f.Make().Count; "
-        "    acc += f.Make().Count(); "
+        "    acc += f.Make().Count; "
         "    for var s in f.Make() do acc += s; end; "
         "    i += 1; "
         "  end; "
@@ -279,7 +296,7 @@ BEZEL_TEST(llist_unbound_owned_temp_reclaim_6341,
         "class C  public static method Main(): int "
         "  var f := new Factory(); "
         "  if f.Make().Count <> 3 then return 1; end; "
-        "  if f.Make().Count() <> 3 then return 2; end; "
+        "  if f.Make().Count <> 3 then return 2; end; "
         "  var t := 0; "
         "  for var s in f.Make() do t += s; end; "
         "  if t <> 24 then return 3; end; "
@@ -296,7 +313,7 @@ BEZEL_TEST(llist_unbound_owned_temp_reclaim_6341,
            array_twin_unbound_faces_unchanged_no_leak_spec_28_3) {
     BEZEL_EXPECT_EQ(runChecked(prog(kFactoryArray,
         "    acc += f.Make().Count; "
-        "    acc += f.Make().Count(); "
+        "    acc += f.Make().Count; "
         "    for var s in f.Make() do acc += s; end; ")), 0);
 }
 
@@ -312,5 +329,5 @@ BEZEL_TEST(llist_unbound_owned_temp_reclaim_6341,
     // materializer-temp reclaim of the #1013 family, a different site.
     BEZEL_EXPECT_EQ(runChecked(prog(kFactoryDict,
         "    acc += f.Make().Count; "
-        "    acc += f.Make().Count(); ")), 0);
+        "    acc += f.Make().Count; ")), 0);
 }

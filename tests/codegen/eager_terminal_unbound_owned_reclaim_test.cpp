@@ -476,10 +476,21 @@ BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
 //
 // `Count` and `Sum` at operator-position 0 on an eager family: the two terminals
 // #6366 fixed, whose cleanliness is what made the sibling omission visible.
+//
+// fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): the CALL spelling of a
+// property is now refused — stdlib §4.4 declares `Array<T>.Count` as a `pure
+// readonly property`, and on a `Stack<T>` receiver `Count` is the elided
+// interface-required member of `IReadOnlyCollection<T>` (stdlib §1's
+// "Elided interface-required members" convention). The two rows below are
+// re-spelled as the PROPERTY READ, which is the spelling the stdlib declares
+// and which reaches the SAME reclaim: the `.Length`/`.Count` property arm
+// (LlvmBackend_Exprs.cpp) calls `freeUnboundOwnedBorrowingArrayTemp` too —
+// #1006(b) added it to the property face for exactly this reason, and #6341
+// calls the property arm "the no-arg call twin" of the call arm.
 // ===========================================================================
 BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
            array_count_terminal_of_an_unbound_owned_temp_is_still_reclaimed_spec_28_3) {
-    expectReclaimed(makeArray(), "MEGC1", "acc := acc + f.Make().Count();", 4);
+    expectReclaimed(makeArray(), "MEGC1", "acc := acc + f.Make().Count;", 4);
 }
 
 BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
@@ -489,7 +500,7 @@ BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
 
 BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
            stack_count_terminal_of_an_unbound_owned_temp_is_still_reclaimed_spec_28_3) {
-    expectReclaimed(makeStack(), "MEGC3", "acc := acc + f.Make().Count();", 4);
+    expectReclaimed(makeStack(), "MEGC3", "acc := acc + f.Make().Count;", 4);
 }
 
 // A LAZY OPERATOR before the terminal: the #6380 path. `lazyTerminal` holds, the
@@ -815,6 +826,9 @@ BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
 
 BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
            split_count_scalar_terminal_of_a_string_element_receiver_is_reclaimed_spec_28_3) {
+    // fix #7543: the CALL spelling of the property is refused (stdlib §4.4's
+    // `Array<T>.Count` is a property), so the row reads the property — the
+    // same spelling the array-backed `.Count` property arm reclaims through.
     expectReclaimedStandalone("MEGSF18",
-                    "acc := acc + \"alpha,beta,gamma\".Split(\",\").Count();", 4);
+                    "acc := acc + \"alpha,beta,gamma\".Split(\",\").Count;", 4);
 }

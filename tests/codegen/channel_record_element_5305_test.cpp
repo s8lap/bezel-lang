@@ -154,7 +154,11 @@ BEZEL_TEST(channel_record_element_5305, out_discard_releases_cell) {
                 "    cr.TryReceive(out _); "
                 "    i := i + 1; "
                 "  end; "
-                "  Console.WriteLine(cr.Count()); "
+                // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §6.9
+                // declares `Channel<T>.Count` as a `public readonly property`, so
+                // the CALL spelling is refused; the PROPERTY READ is the spelling
+                // §6.9 declares.
+                "  Console.WriteLine(cr.Count); "
                 "  return 0; end Main; end C;",
                 "0\n");
 }
@@ -275,7 +279,11 @@ BEZEL_TEST(channel_record_element_5305, undrained_cells_released_at_disposal) {
                 "  using var tr := cr.NewSender(); "
                 "  var i := 0; "
                 "  while i < 50 do tr.Send(new P(i, i)); i := i + 1; end; "
-                "  Console.WriteLine(cr.Count()); "
+                // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §6.9
+                // declares `Channel<T>.Count` as a `public readonly property`, so
+                // the CALL spelling is refused; the PROPERTY READ is the spelling
+                // §6.9 declares.
+                "  Console.WriteLine(cr.Count); "
                 "  return 0; end Main; end C;",
                 "50\n");
 }

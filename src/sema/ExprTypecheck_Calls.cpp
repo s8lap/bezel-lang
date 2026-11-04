@@ -43345,9 +43345,64 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     auto* accessedMem = dynamic_cast<MemberSymbol*>(member);
     TypeRef* memberTy =
         const_cast<TypeRef*>(storageComponentType(member, ctx_));
-    if (!memberTy) return;
-    memberTy = substituteMemberType(memberTy, nm.target.get(),
-                                    accessedMem ? accessedMem->parent : nullptr);
+    if (memberTy)
+        memberTy = substituteMemberType(memberTy, nm.target.get(),
+                                        accessedMem ? accessedMem->parent
+                                                    : nullptr);
+    // fix #7543 (spec §26.5 rule 1, §27.1, §27.7, v0.355): the `?.` twin of
+    // the `.` form's property-call refusal, for a USER-declared property.
+    //
+    // §26.5 rule 1 commits the lookup to the member the receiver's declared
+    // type declares; §27.1 admits only a FUNCTION-typed value as a callee;
+    // §27.7 is the compiler's "only function-typed values are callable" rule.
+    // A property of a NON-function type is not callable, so `o?.N()` — the
+    // null-conditional twin of `o.N()` — has no candidate either. #7971
+    // refused the `?.` twin of the §30.3 task property call for the same
+    // reason; this is its general form for a user-declared property.
+    //
+    // It runs HERE, before the access is typed, and AFTER #7373's `string`
+    // arm and #7971's `Task` arm (both of which return early with their own
+    // message), so a surface that already refuses the call keeps its message
+    // and no second one is added.
+    //
+    // A property OF FUNCTION TYPE stays callable (§27.1 names "a property of
+    // function type" among the callable values): `o?.F(4)` is legal.
+    //
+    // A BUILT-IN property is NOT refused here, and the `.` form's refusal
+    // does not reach it either (the `?.` form is a different AST node with
+    // its own resolver, and `typeCall`'s #6529 arm types the `?.` call
+    // SPECULATIVELY — a twin that reports an error leaves the call untyped
+    // exactly as before). The reason is a PIN: the conformance corpus, the
+    // spec's own executable rules, requires the `?.` CALL spelling of a
+    // built-in property to RUN. §7.5's rule cases `s7_5_0009`, `s7_5_0010`,
+    // `s7_5_0012` and `s7_5_0013` are `expect: run` cases over
+    // `a?.Count()` on an `Array<int>?` ("With a non-null receiver the access
+    // is the call `Count()`, which yields the element count, 2"), and #6529
+    // (CLOSED) is the issue that made the spelling work. So `a?.Count()` is
+    // LEGAL here, while the `.` form `a.Count()` is the shape this lane
+    // refuses (§26.5 rule 1 commits the lookup to `Array<T>`'s `Count`
+    // PROPERTY, and §27.1 admits only a function-typed value as a callee).
+    if (&nm == calleeOfCallCtx_) {
+        if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
+            // (a) a USER-declared property: the member walk DID resolve it,
+            // so the receiver's declared type declares it.
+            //
+            // An UNTYPED property read is not this check's business: the type
+            // is missing, not non-function, and a separate arm reports it.
+            if (memberTy && memberTy->kind != TypeRef::Kind::Function) {
+                SourceLocation loc = nm.span.begin;
+                if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    common::propertyCalledAsMethodMessage(
+                        nm.member,
+                        ps->parent ? ps->parent->name : std::string_view("this "
+                                                                          "type"),
+                        "\xC2\xA7""23"));
+                return;
+            }
+        }
+    }
     if (!memberTy) return;
     if (memberTy->nullable) {
         ctx_.setExprType(&nm, memberTy);  // already nullable

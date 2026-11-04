@@ -60,6 +60,24 @@ bool hasInstanceBlocksExtensionError(const bezel::test::SemaResult& r,
     return false;
 }
 
+// fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): the PROPERTY-CALL refusal
+// — "`Count` is a property of `Array`, not a method (stdlib §4.4: `Count:
+// int`), so this call has no candidate ...".
+bool hasPropertyCalledAsMethodError(const bezel::test::SemaResult& r,
+                                    std::string_view memberName,
+                                    std::string_view owner) {
+    const std::string head = "`" + std::string(memberName) +
+                             "` is a property of `" + std::string(owner) +
+                             "`, not a method";
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find(head) == std::string::npos) continue;
+        if (d.message.find("26.5") == std::string::npos) continue;
+        if (d.message.find("27.1") == std::string::npos) continue;
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 // ============================================================================
@@ -97,22 +115,43 @@ BEZEL_TEST(sema_builtin_collection_blocks_extension_3342,
 }
 
 // ============================================================================
-// Control axis (must still work): `arr.Count()` (0 args) on Array<T> matches
-// the instance member's arity (0), so it is NOT rejected — the §5 LINQ
-// `Count()` extension happens to share the property's name and is therefore
-// unreachable, but the call's arity matches the instance member and the
-// resolution succeeds. The stdlib §4.4 wording allows this: the COMPOSED
-// spelling `coll.Where(pred).Count()` is the documented route to the §5
-// operator pipeline when the receiver declares `Count`.
+// The zero-arg control axis, FLIPPED by fix #7543 (§26.5 rule 1, §27.1, §27.7,
+// v0.355). `arr.Count()` on `Array<T>` used to be ACCEPTED: the §5 LINQ
+// `Count()` extension shares the property's name and is unreachable (§26.5
+// rule 1 — the stdlib §1 "Block-by-name" row), and the call's arity matches
+// the instance member's (0), so the resolution succeeded and the call
+// degraded to the property's VALUE.
+//
+// It is now a compile error: §4.4 declares `public pure readonly property
+// Count: int;`, so the lookup commits to that instance member (§26.5 rule 1)
+// and only a FUNCTION-typed value is callable (§27.1, §27.7). The property
+// READ `arr.Count` is the spelling §4.4 declares. The COMPOSED spelling
+// `coll.Where(pred).Count()` remains the documented route to the §5 operator
+// pipeline (the row below).
 // ============================================================================
 BEZEL_TEST(sema_builtin_collection_blocks_extension_3342,
-           array_count_zero_args_accepted) {
+           array_count_zero_args_rejected_property_call_7543) {
     auto r = parseSemaAll(
         "module M; "
         "class C public static method Main(): int "
         "  using var xs := new Array<int>(); "
         "  xs.Add(1); xs.Add(2); xs.Add(3); "
         "  return xs.Count(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasPropertyCalledAsMethodError(r, "Count", "Array"));
+}
+
+// The property READ is the spelling stdlib §4.4 declares — and it still
+// answers with the element count.
+BEZEL_TEST(sema_builtin_collection_blocks_extension_3342,
+           array_count_property_read_accepted) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C public static method Main(): int "
+        "  using var xs := new Array<int>(); "
+        "  xs.Add(1); xs.Add(2); xs.Add(3); "
+        "  return xs.Count; "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

@@ -243,7 +243,11 @@ BEZEL_TEST(set_family_eager_terminals_3735,
 BEZEL_TEST(set_family_eager_terminals_3735, set_int_count_and_contains) {
     BEZEL_EXPECT_EQ(
         runAotOut(prog(std::string(SET_INT) +
-                       "    Console.WriteLine($\"{s.Count()},{s.Contains(10)},"
+                       // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355):
+                       // stdlib §4.10 declares `Set<T>.Count` as a `pure readonly
+                       // property`, so the CALL spelling is refused and the
+                       // PROPERTY READ is the spelling §4.10 declares.
+                       "    Console.WriteLine($\"{s.Count},{s.Contains(10)},"
                        "{s.Contains(99)}\");")),
         "3,True,False");
 }
@@ -302,7 +306,11 @@ BEZEL_TEST(set_family_eager_terminals_3735,
     // 10, 20 for the identical expression.
     BEZEL_EXPECT_EQ(
         runAotOut(prog(std::string(SORTED_INT) +
-                       "    Console.WriteLine($\"{s.First()},{s.Last()},"
+                       // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355):
+                       // stdlib §4.18 declares `SortedSet<T>.First` / `.Last` as
+                       // PROPERTIES, so the CALL spelling is refused and the
+                       // PROPERTY READ is the spelling §4.18 declares.
+                       "    Console.WriteLine($\"{s.First},{s.Last},"
                        "{s.ElementAt(0)},{s.ElementAt(1)},"
                        "{s.ElementAt(2)}\");")),
         "10,30,10,20,30");
@@ -344,8 +352,11 @@ BEZEL_TEST(set_family_eager_terminals_3735,
            sortedset_dict_arm_and_snapshot_agree) {
     BEZEL_EXPECT_EQ(
         runAotOut(prog(std::string(SORTED_INT) +
-                       "    Console.WriteLine($\"{s.First() = s.ElementAt(0)},"
-                       "{s.Last() = s.ElementAt(2)}\");")),
+                       // fix #7543: `First` / `Last` are PROPERTIES on
+                       // `SortedSet<T>` (stdlib §4.18), so the CALL spelling is
+                       // refused and the PROPERTY READ is used.
+                       "    Console.WriteLine($\"{s.First = s.ElementAt(0)},"
+                       "{s.Last = s.ElementAt(2)}\");")),
         "True,True");
 }
 
@@ -385,7 +396,10 @@ BEZEL_TEST(set_family_eager_terminals_3735,
             "    using var s := new OwningSet<Box>();\n"
             "    s.Add(new Box(30)); s.Add(new Box(10)); s.Add(new Box(20));\n"
             "    Console.WriteLine($\"{s.Sum(lambda(b: Box) => b.Value)},"
-            "{s.Count()},{s.First().Value},"
+            // fix #7543: `OwningSet<T>.Count` is a PROPERTY (stdlib §4.11), so
+            // the CALL spelling is refused. `First` on this head is the §5
+            // operator (a method), so it stays a call.
+            "{s.Count},{s.First().Value},"
             "{s.Any(lambda(b: Box) => b.Value > 25)},"
             "{s.All(lambda(b: Box) => b.Value > 5)}\");")),
         "60,3,30,True,True");
@@ -401,7 +415,10 @@ BEZEL_TEST(set_family_eager_terminals_3735,
             "    using var b3 := new Box(20);\n"
             "    s.Add(b1); s.Add(b2); s.Add(b3);\n"
             "    Console.WriteLine($\"{s.Sum(lambda(b: Box) => b.Value)},"
-            "{s.Count()},{s.First().Value}\");")),
+            // fix #7543: `Set<T>.Count` is a PROPERTY (stdlib §4.10), so the
+            // CALL spelling is refused. `First` on this head is the §5
+            // operator (a method), so it stays a call.
+            "{s.Count},{s.First().Value}\");")),
         "60,3,30");
 }
 

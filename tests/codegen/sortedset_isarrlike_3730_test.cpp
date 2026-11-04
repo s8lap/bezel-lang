@@ -111,7 +111,10 @@ BEZEL_TEST(sortedset_isarrlike_3730, where_select_count_first_last) {
             "    var selAcc := \"\";\n"
             "    for var x in sel do selAcc := selAcc + $\"{x},\"; end;\n"
             "    Console.WriteLine($\"where={wAcc} select={selAcc} "
-            "count={s.Count()} first={s.First()} last={s.Last()}\");")),
+            // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §4.18 declares
+            // `SortedSet<T>.Count` / `.First` / `.Last` as PROPERTIES, so the CALL
+            // spellings are refused and the PROPERTY READS are used.
+            "count={s.Count} first={s.First} last={s.Last}\");")),
         "where=20,30,40, select=20,40,60,80, count=4 first=10 last=40");
 }
 

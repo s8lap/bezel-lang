@@ -92,7 +92,10 @@ BEZEL_TEST(codegen_inline_array_hash_6271,
         "  var k2: [2]int := [3, 4]; "
         "  var a: Array<[2]int> := [k1, k2]; "
         "  using var s: Set<[2]int> := a.ToSet(); "
-        "  Console.WriteLine($\"{s.Count()} {s.Contains(k1)} {s.Contains(k2)}\"); "
+        // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §4.10 declares
+        // `Set<T>.Count` as a `pure readonly property`, so the CALL spelling is
+        // refused and the PROPERTY READ is the spelling §4.10 declares.
+        "  Console.WriteLine($\"{s.Count} {s.Contains(k1)} {s.Contains(k2)}\"); "
         "  return 0; "
         "end Main; end C;"), "2 True True\n");
 }
@@ -177,7 +180,10 @@ BEZEL_TEST(codegen_inline_array_hash_6271,
         "  var d: Dictionary<[3]int, string> := new Dictionary<[3]int, string>(); "
         "  d.Add(k1, \"a\"); "
         "  d.Add(k3, \"b\"); "
-        "  Console.WriteLine($\"{d.Count()} {d.ContainsKey(k1)} {d.ContainsKey(k2)}\"); "
+        // fix #7543: stdlib §4.8 declares `Dictionary<K,V>.Count` as a `pure readonly
+        // property`, so the CALL spelling is refused and the PROPERTY READ is
+        // the spelling §4.8 declares.
+        "  Console.WriteLine($\"{d.Count} {d.ContainsKey(k1)} {d.ContainsKey(k2)}\"); "
         "  return 0; "
         "end Main; end C;"), "2 True True\n");
 }

@@ -17,7 +17,9 @@
 //   R5  ICollection<int>?.Length()       R6  IReadOnlyCollection<int>?.Length()
 //   R7  StringBuilder.Count()            R8  StringBuilder?.Count()
 //   R9  OwningBuffer<byte>.Count()       R10 OwningBuffer<byte>?.Count()
-//   C1  Array<int>.Count() runs (§5 LINQ over IEnumerable; §4.4)
+//   C1  IEnumerable<int>.Count() runs (§5 LINQ over IEnumerable)
+//   C1' Array<int>.Count() is REFUSED (stdlib §4.4 declares `Count` as a
+//       property — fix #7543)
 //   C2  OwningBuffer<Foo>.Count() / ?.Count() accepted (class T: IEnumerable)
 //   C3  user class with its own Count()/Length() methods runs
 //   C4  user class with function-typed fields named Length/Count is accepted
@@ -82,20 +84,45 @@ BEZEL_CALL_REJECT(owningbuffer_value_nullcond_count_call_rejected_stdlib_4_14,
                   "b?.Count()",
                   "no member `Count` on `OwningBuffer<T>`: use `Length`")
 
-// ── C1 — LINQ `Count()` on an IEnumerable receiver stays accepted (§5, §4.4).
+// ── C1 — the §5 LINQ `Count()` operator is reachable only where the
+// receiver's declared surface declares no `Count` of its own (§26.5 rule 1 +
+// the stdlib §1 "Block-by-name" row). An `IEnumerable<int>` receiver declares
+// none — the operator is an EXTENSION — so the call still runs there.
 BEZEL_TEST(sema_member_set_call_spellings_6128,
-           array_count_call_runs_stdlib_5) {
+           enumerable_count_call_runs_stdlib_5) {
     auto r = runAot(
         "module M6128k; "
+        "class Program public static method Main(): int "
+        "  var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var e: IEnumerable<int> := a; "
+        "  Console.WriteLine(e.Count()); "
+        "  return 0; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("3\n"));
+}
+
+// ── C1' — FLIPPED by fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355). An
+// `Array<T>` receiver DECLARES `Count` (stdlib §4.4: `public pure readonly
+// property Count: int;`), so the lookup commits to that instance member and
+// the call through its value has no candidate: only a FUNCTION-typed property
+// is callable. The property READ `a.Count` is the spelling §4.4 declares.
+BEZEL_TEST(sema_member_set_call_spellings_6128,
+           array_count_call_is_refused_stdlib_4_4) {
+    auto r = runAot(
+        "module M6128k2; "
         "class Program public static method Main(): int "
         "  var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
         "  Console.WriteLine(a.Count()); "
         "  return 0; "
         "end Main; end Program;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("3\n"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "`Count` is a property of `Array`, not a method"));
 }
 
 // ── C2 — class-typed OwningBuffer is IEnumerable<T?> (§4.14): `Count()` is

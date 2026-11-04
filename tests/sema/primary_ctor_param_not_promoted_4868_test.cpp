@@ -239,7 +239,7 @@ BEZEL_TEST(primary_ctor_param_not_promoted_4868,
         "end Counter; "
         "class Program public static method Main() "
         "  using var c := new Counter(5); "
-        "  Console.WriteLine(c.Value()); "
+        "  Console.WriteLine(c.Value); "
         "end Main; end Program;");
     // Must compile and run successfully.
     BEZEL_EXPECT_TRUE(r.ran);

@@ -125,7 +125,10 @@ BEZEL_TEST(imported_builtin_scope_end_disposal_6776,
            imported_sortedset_owned_parameter_auto_dispose_checked_spec_28_8_4_18) {
     auto r = runChecked6776b(
         "public static method Sink(owned v: SortedSet<int>)"
-        " Console.WriteLine($\"{v.Count} {v.Contains(6)} {v.First()}\"); end Sink;",
+        // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §4.18 declares
+        // `SortedSet<T>.First` as a PROPERTY, so the CALL spelling is refused
+        // and the PROPERTY READ is the spelling §4.18 declares.
+        " Console.WriteLine($\"{v.Count} {v.Contains(6)} {v.First}\"); end Sink;",
         "var x := M6776b.SS(); H6776b.Sink(move x);");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);

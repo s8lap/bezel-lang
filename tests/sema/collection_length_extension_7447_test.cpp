@@ -139,23 +139,30 @@ BEZEL_TEST(sema_collection_length_extension_7447,
 // The sibling member the receiver DOES declare still answers: `Array<T>`
 // declares `Count` (stdlib §4.4), and the Count-vs-Length convention is
 // why the diagnostic points at it.
+//
+// fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): the CALL spelling
+// `a.Count()` is now refused (a non-function property is not callable) — the
+// PROPERTY READ `a.Count` is the spelling stdlib §4.4 declares.
 BEZEL_TEST(sema_collection_length_extension_7447,
            array_count_still_answers) {
     // per stdlib §4.4
     expectStdout("",
-                 "Console.WriteLine(a.Count());",
+                 "Console.WriteLine(a.Count);",
                  "3\n");
 }
 
 // And with a same-named extension in the program, the DECLARED member still
 // answers — `Array<T>` declares `Count`, so §26.5 rule 1 commits instance
 // resolution for that name and the extension is unreachable.
+//
+// fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): the CALL spelling is
+// refused; the property READ still answers with the built-in's count.
 BEZEL_TEST(sema_collection_length_extension_7447,
            array_count_declared_member_wins_over_a_same_named_extension) {
     // per §26.5 rule 1 (v0.345) + stdlib §4.4
     expectStdout("extension Array<int>\n"
                  "  public method Count(): int => 77;\n"
                  "end;\n",
-                 "Console.WriteLine(a.Count());",
+                 "Console.WriteLine(a.Count);",
                  "3\n");
 }

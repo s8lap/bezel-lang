@@ -260,6 +260,21 @@ BEZEL_TEST(sortedset_isarrlike_3730, all_now_dispatches) {
         "True,False");
 }
 
+// NOT FLIPPED by fix #7543 — and deliberately so.
+//
+// The PREDICATE spelling `s.Count(pred)` is a call with an ARGUMENT, and
+// #7812 (OPEN) owns that surface: "SortedSet declares Count (§4.18), so per
+// §26.5 rule 1 (v0.350) a call with a predicate must be the arity error.
+// After #7670 the `?.` spelling rejects it but the plain `.` spelling does
+// not." The arity error is the HOUSE's wording ("the instance member takes
+// no arguments, but this call supplies 1"), not this lane's property-call
+// message, so fix #7543 leaves the predicate spelling exactly as it found
+// it — the arity-0 CALL spelling is the hole this lane closes (the row
+// below), and the arity>0 spelling is #7812's.
+//
+// (fix #7543 gates its built-in arm on the arity-0 call for the same
+// reason: an arity>0 call to an arity-0 property is a DIFFERENT error — the
+// house already owns that message for every surface that has one.)
 BEZEL_TEST(sortedset_isarrlike_3730, count_predicate_now_dispatches) {
     // The no-predicate `Count()` keeps its own O(1) `bz_dict_count` arm (the
     // row just below); only the predicate overload takes the new snapshot
@@ -270,7 +285,11 @@ BEZEL_TEST(sortedset_isarrlike_3730, count_predicate_now_dispatches) {
 }
 
 BEZEL_TEST(sortedset_isarrlike_3730, count_noarg_still_types_and_runs) {
-    BEZEL_EXPECT_EQ(runAotOut(prog("    Console.WriteLine(s.Count().ToString());")),
+    // FLIPPED by fix #7543: the CALL spelling `s.Count()` is refused (stdlib
+    // §4.18 declares `Count` as a property); the property READ `s.Count` is
+    // the spelling the stdlib declares, and it still answers with the live
+    // slot count (4).
+    BEZEL_EXPECT_EQ(runAotOut(prog("    Console.WriteLine(s.Count.ToString());")),
                     "4");
 }
 
@@ -326,13 +345,18 @@ BEZEL_TEST(sortedset_isarrlike_3730, elementat_now_dispatches_ascending) {
 
 BEZEL_TEST(sortedset_isarrlike_3730,
            first_last_dict_arm_agrees_with_snapshot_elementat) {
-    // `First()`/`Last()` keep the dedicated `bz_dict_min_key_gen` /
+    // `First`/`Last` keep the dedicated `bz_dict_min_key_gen` /
     // `bz_dict_max_key_gen` arm (fix #3735 excludes them from the snapshot
     // route deliberately). The two surfaces must agree — the property
     // #2471/#2472 established.
+    //
+    // FLIPPED by fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355; stdlib
+    // §4.18): `SortedSet<T>` declares `First` / `Last` as PROPERTIES, so the
+    // CALL spelling is refused and the property READ is the spelling the
+    // stdlib declares.
     BEZEL_EXPECT_EQ(
-        runAotOut(prog("    Console.WriteLine($\"{s.First() = s.ElementAt(0)},"
-                        "{s.Last() = s.ElementAt(3)}\");")),
+        runAotOut(prog("    Console.WriteLine($\"{s.First = s.ElementAt(0)},"
+                        "{s.Last = s.ElementAt(3)}\");")),
         "True,True");
 }
 
@@ -374,9 +398,13 @@ BEZEL_TEST(sortedset_isarrlike_3730, where_select_still_type_and_run) {
 }
 
 BEZEL_TEST(sortedset_isarrlike_3730, first_last_still_type_and_run) {
+    // FLIPPED by fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355; stdlib
+    // §4.18): `First` / `Last` are PROPERTIES on `SortedSet<T>`, so the CALL
+    // spelling is refused and the property READ answers with the least /
+    // greatest element.
     BEZEL_EXPECT_EQ(
         runAotOut(prog(
-            "    Console.WriteLine($\"{s.First()},{s.Last()}\");")),
+            "    Console.WriteLine($\"{s.First},{s.Last}\");")),
         "10,40");
 }
 

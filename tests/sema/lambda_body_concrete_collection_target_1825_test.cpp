@@ -52,7 +52,7 @@ BEZEL_TEST(lambda_body_concrete_collection_target_1825,
         "class C public static method Main(): int "
         "  var f: (int) -> Array<int> := lambda(x) => [x, x + 10]; "
         "  var r := f(5); "
-        "  return r.Count(); "                        // 2 = [5, 15]
+        "  return r.Count; "                         // 2 = [5, 15]
         "end Main; end C;"), 2);
 }
 
@@ -103,7 +103,7 @@ BEZEL_TEST(lambda_body_concrete_collection_target_1825,
         "  var f: (int) -> OwningArray<Cell> := lambda(x) => "
         "    [new Cell(x), new Cell(x + 10)]; "
         "  var r := f(5); "
-        "  return r.Count(); "                        // 2
+        "  return r.Count; "                         // 2
         "end Main; end C;"), 2);
 }
 

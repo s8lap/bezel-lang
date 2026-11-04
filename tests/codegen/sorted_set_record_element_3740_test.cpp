@@ -141,7 +141,10 @@ BEZEL_TEST(sorted_set_record_element_3740, finding_b_contains_over_borrowed_rece
     BEZEL_EXPECT_EQ(run(std::string(PRELUDE) +
         "class C "
         "  public static method CheckSorted(s: SortedSet<Bad>): bool "
-        "    return s.Contains(s.First()); "
+        // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): stdlib §4.18 declares
+        // `SortedSet<T>.First` as a PROPERTY, so the CALL spelling is refused
+        // and the PROPERTY READ is the spelling §4.18 declares.
+        "    return s.Contains(s.First); "
         "  end CheckSorted; "
         "  public static method Main(): int "
         "    using var s := new SortedSet<Bad>(); "
