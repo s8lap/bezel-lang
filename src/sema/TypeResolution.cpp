@@ -422,7 +422,7 @@ void Resolver::run(const ast::SourceFile& src) {
                 // resolution path (TypeResolution_Names.cpp around line 2687)
                 // remains the only `first` candidate; record the bare name as
                 // ambiguous and the importing module for the diagnostic.
-                // HOLD: `Counter` (§2.3 Row 10 / stdlib §4.14) is excluded here
+                // HOLD: `Counter` (§2.3 Row 10 / stdlib §4.20) is excluded here
                 // pending the companion spec question on (identifier, generic
                 // arity) keying — see issue #5140.
                 //

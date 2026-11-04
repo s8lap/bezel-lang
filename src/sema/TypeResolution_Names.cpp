@@ -273,7 +273,7 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // §9.8 / issue #550: thrown by synthesised Serialize/Deserialize on
         // malformed binary input.
         n == "SerializationException" ||
-        // issue #976 / stdlib §7.4 / §7.5: System.Threading TimeoutException and
+        // issue #976 / stdlib §6.1 / §7.5: System.Threading TimeoutException and
         // the System.IO exception family. Per the spec these live in
         // System.Threading / System.IO and require `import`, but the compiler
         // does not yet enforce import-gating for those namespaces (File/Directory/
@@ -5312,7 +5312,7 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             // table (e.g. `BitReader` is in `isAlwaysAvailableBareName`
             // but not in `builtinTypeArity` — the spec's §2.3 Row 10
             // whole-stdlib§4 promise).
-            // `Counter` (§2.3 Row 10 / stdlib §4.14) is held pending
+            // `Counter` (§2.3 Row 10 / stdlib §4.20) is held pending
             // the (identifier, generic arity) keying spec question, so
             // `isAlwaysAvailableBareName` is paired with the TypeRes-
             // olution.cpp gate that excluded `Counter` at population —

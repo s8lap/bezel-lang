@@ -408,7 +408,7 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
     if (sg != "UTF8" && sg != "UTF16" && sg != "UTF32" && sg != "ASCII")
         return nullptr;
 
-    // fix #6979 (stdlib §3.2, v0.340): a `ReadOnlyStringSpan` source lowers to
+    // fix #6979 (stdlib §3.2 / §3.3, v0.340): a `ReadOnlyStringSpan` source lowers to
     // the {ptr,i32,i32} %bz.arrayspan VALUE, not a string pointer. The
     // bz_encoding_*_{get_bytes,get_byte_count,write_bytes} entries take a
     // string, so a span source is materialized to a fresh +1 string
@@ -8503,7 +8503,7 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
     } else if (common::isVtableLessBuiltinClassName(
                    builtinTypeName(recvTy))) {
         // fix #2921 (spec §28.2 / §28.9 / §8.1, stdlib §1 /
-        // stdlib §3, v0.240): every arm above this `else`
+        // stdlib §2.7, v0.240): every arm above this `else`
         // chain names ONE built-in, and the `else` below ends in
         // the generic vtable dispatch (emitDisposeAndReclaim →
         // slot 2). That dispatch's precondition is that the
@@ -8519,7 +8519,7 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
         // `AsyncEventSource<T>`, `TaskCompletionSource<T>`,
         // `OwningTaskCompletionSource<T>`. Both calls are legal:
         // stdlib §1 says "Every class implicitly
-        // implements `IDisposable`", and stdlib §3 documents
+        // implements `IDisposable`", and stdlib §2.7 documents
         // `Random`'s Dispose as a no-op outright.
         //
         // Gate on the PROPERTY ("does this receiver carry a

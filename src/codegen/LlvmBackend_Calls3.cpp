@@ -3384,7 +3384,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
             valTramp = buildLinqTrampoline(2, elemTy2, valTy);
         }
 
-        // #1692 / stdlib §5: a Dictionary<string,V>'s OWN ContainsKey/indexer/
+        // #1692 / stdlib §4.8: a Dictionary<string,V>'s OWN ContainsKey/indexer/
         // Remove codegen unconditionally dispatches to the dedicated string
         // fast path (bz_dict_contains_str / bz_dict_try_get_str / ...), which
         // requires the underlying bz_dict_t to be in STRING-KEY mode — never

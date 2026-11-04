@@ -10544,8 +10544,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // names whose arity DIFFERS from the §8.1 universal surface —
             // e.g. `string.Equals(other: string?, ignoreCase: bool): bool`
             // (2 args, stdlib §9.6), `DateTime.ToString(format: string):
-            // string` (1 arg, stdlib §2.8), `decimal.ToString(radix: int)` (
-            // 1 arg, stdlib §2.18). The arity check below assumes the §8.1
+            // string` (1 arg, stdlib §2.5), `decimal.ToString(format: string):
+            // string` (1 arg, stdlib §9.3; the format-specifier vocabulary is
+            // stdlib §2.18). The arity check below assumes the §8.1
             // universal surface, so it would false-reject these legitimate
             // type-specific overloads. Skip when the receiver's resolved
             // type is a Primitive or a Named value-builtin. User-defined

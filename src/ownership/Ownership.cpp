@@ -6603,7 +6603,7 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         // (Shared<T>), `var sender := ch.NewSender()` (ChannelSender<T>),
         // `var cts := CancellationTokenSource.New()`, etc. // per §28.13, §30.14
         //
-        // fix #5351 (§28.3, stdlib §7.3, v0.313): builtin static factory calls
+        // fix #5351 (§28.3, stdlib §7.3 / stdlib §7.4 / stdlib §4.19 / stdlib §8.1 / stdlib §6.1, v0.313): builtin static factory calls
         // (File.ReadAllLines / File.ReadAllBytes / Directory.GetFiles /
         // GetDirectories / FrozenArray<T>.From / Stopwatch.StartNew /
         // CancellationTokenSource factories) produce owned values per their
@@ -6617,7 +6617,7 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         // registers scope-end disposal. Safe: codegen registers NO reclaim for
         // these locals (only `using var` reaches the disposal arms), so the
         // transfer path has exactly one disposer and admitting transfer cannot
-        // double-free. // per §28.3, §21.1, stdlib §7.3, #5284, #5351
+        // double-free. // per §28.3, §21.1, stdlib §7.3 / stdlib §7.4 / stdlib §4.19 / stdlib §8.1 / stdlib §6.1, #5284, #5351
         if (!calleeMs && common::isBuiltinOwnedStaticFactoryCall(*ce, ctx_))
             return OwnershipState::Owned;
         // Stdlib §4.5 / §4.13 (v0.307): `Drain()` on an owning collection

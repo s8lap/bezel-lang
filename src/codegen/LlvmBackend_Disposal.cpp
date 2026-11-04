@@ -4038,7 +4038,7 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
                               llvm::ConstantPointerNull::get(ptrTy()))});
         return true;
     }
-    // stdlib §3 (v0.240): `Random`'s Dispose is a documented no-op — "`Random`
+    // stdlib §2.7 (v0.240): `Random`'s Dispose is a documented no-op — "`Random`
     // is a class with a no-op `Dispose` (its only state is its internal seed;
     // there is nothing to release)" — but the INSTANCE is still reclaimed:
     // §28.9's trivial-dispose subsection says "the compiler frees the

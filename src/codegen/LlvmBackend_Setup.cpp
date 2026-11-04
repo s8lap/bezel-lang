@@ -6443,7 +6443,7 @@ Emitter::builtinExceptionHierarchy() {
         // §9.8 / issue #550: thrown by synthesised Serialize/Deserialize when
         // the binary stream is malformed (unknown fields, truncated data, etc.).
         {"SerializationException", "Exception"},
-        // issue #976 / stdlib §7.4: System.Threading TimeoutException.
+        // issue #976 / stdlib §6.1: System.Threading TimeoutException.
         {"TimeoutException", "Exception"},
         // issue #976 / stdlib §7.5: the System.IO exception family. All derive
         // from IOException, which derives from Exception. Registered so
@@ -23129,8 +23129,8 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
-    // fix #2921 (spec §28.9 / §28.3, stdlib §3 / stdlib §1, v0.240): a
-    // `using var` bound to a `Random`. stdlib §3 documents its Dispose as a
+    // fix #2921 (spec §28.9 / §28.3, stdlib §2.7 / stdlib §1, v0.240): a
+    // `using var` bound to a `Random`. stdlib §2.7 documents its Dispose as a
     // no-op — "its only state is its internal seed; there is nothing to
     // release" — but the INSTANCE is still reclaimed: §28.9's trivial-dispose
     // subsection says "the compiler frees the undischarged value at its owner's
