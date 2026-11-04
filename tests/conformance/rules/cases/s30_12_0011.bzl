@@ -1,0 +1,32 @@
+//! case: s30_12_0011
+//! doc: spec
+//! section: 30.12
+//! title: explicitly disposing a lock binding while a guard acquired from it is live is rejected
+//! rule: For the same body-local analysis, a live guard counts as a live local
+//!   borrow of the lock binding it was acquired from: consuming, discarding,
+//!   or explicitly disposing a lock binding while a guard obtained from it is
+//!   live is rejected the same way.
+//! cites: 30.12, 28.3
+//! expect: reject
+//! diagnostic: live
+//! issue: 1721
+//! notes: accepting twin s30_12_0012 — the one edit swaps the two Dispose()
+//!   statements so the guard is released before the lock dies.
+module Conf;
+
+import System.Threading;
+
+public sealed class Counter
+  public N: int;
+  public constructor(n: int) N := n; end constructor;
+end Counter;
+
+public class Program
+  public static method Main()
+    var lk := new Locked<Counter>(new Counter(0));
+    var g := lk.Lock();
+    g.Value.N := 1;
+    lk.Dispose();
+    g.Dispose();
+  end Main;
+end Program;
