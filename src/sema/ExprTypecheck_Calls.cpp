@@ -25007,11 +25007,41 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
     // `String` type name. A user type named `String` has a declaration and
     // is checked by the ordinary user-method machinery.
     bool isStringHead = false;
-    if (TypeRef* recvTy = ctx_.exprType(*tgt)) {
-        if (recvTy->kind == TypeRef::Kind::Primitive &&
-            recvTy->primitive == PrimitiveType::String)
-            isStringHead = true;
-    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt)) {
+    // fix #7494 (§3.4, v0.355; §5.1, v0.355): THE STATIC HEAD IS READ BY
+    // NAME, exactly as the REST of the compiler reads it.
+    //
+    // §3.4 (v0.355, line 504): "Static members of the standard library type
+    // are accessible through either form"; §1.4 (v0.355, line 78): the
+    // keyword `string` and the standard-library type name `String` "name the
+    // same type — they are interchangeable in source". So `String.M(...)` is
+    // ONE call shape, and this gate must ask the §5.1 question of it
+    // exactly as it asks it of `string.M(...)`.
+    //
+    // The compiler ALREADY reads this head by NAME everywhere else:
+    // `primitiveFromName` maps `String` to the primitive (TypeResolution.cpp,
+    // §3.4's alias table), the primitive-static member resolver dispatches
+    // on it (`ExprTypecheck_Calls.cpp`, `pt = primitiveFromName(id2->name)`),
+    // and the §9.6 ARITY gate keys on `tid->name == "string" ||
+    // tid->name == "String"`. This gate was the ONE place that read the
+    // TARGET'S EXPRESSION TYPE first and reached the name-based branches
+    // only in the `else if` — so a local named `String` (a name §2.3 row 1
+    // says may not be shadowed, but which the compiler accepts) carrying a
+    // VALUE type made the whole §9.6 declared-parameter gate STAND DOWN,
+    // while the arity gate, the member resolver and codegen still read the
+    // head as the §9.6 static:
+    //
+    //   var String := 5;
+    //   String.IsNullOrWhiteSpace(5)  -> the COMPILER ABORTED (an LLVM
+    //                                    "ICmp operand type mismatch")
+    //   string.IsNullOrWhiteSpace(5)  -> REFUSED (§5.1)
+    //   var String := 5;
+    //   String.Repeat(5, 2)            -> compiled CLEAN (silently admitted)
+    //   string.Repeat(5, 2)            -> REFUSED (§5.1)
+    //
+    // The NAME is read FIRST here, and the receiver's own type is consulted
+    // only for the INSTANCE spelling (a receiver whose type is the `string`
+    // primitive) — which is what this gate's own header describes.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt)) {
         // The STATIC spelling. `string` is the primitive keyword, so it names
         // the §9.6 class and nothing else; `String` is its alias, and it
         // names the §9.6 class only when it carries no user declaration.
@@ -25043,8 +25073,27 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
             // (`SymbolCollection.cpp`'s reserved-alias check), and the
             // exclusion below keeps the gate away from a user type that
             // somehow carries one.
+            //
+            // fix #7494 (§3.4, v0.355): the same exclusion, read at the
+            // SHAPE THAT IS LEFT — a bare identifier that carries a VALUE
+            // type because a local shadows the name. §3.4's reserved-name
+            // rule makes `String` the primitive alias in EVERY source
+            // position (the rule is about the NAME), and the compiler's own
+            // name-based readers (the arity gate, the primitive-static
+            // resolver) read it that way; so a local named `String` is
+            // still the alias here, and the gate claims the head.
             auto* ts = dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*tgt));
             if (!ts || ts->decl == nullptr) isStringHead = true;
+        }
+    }
+    if (!isStringHead) {
+        // The INSTANCE spelling: a receiver whose OWN type is the `string`
+        // primitive. This is the shape the §9.6 instance members are read at
+        // (`"ab".Trim(...)`, `s.Trim(...)` where `s: string`).
+        if (TypeRef* recvTy = ctx_.exprType(*tgt)) {
+            if (recvTy->kind == TypeRef::Kind::Primitive &&
+                recvTy->primitive == PrimitiveType::String)
+                isStringHead = true;
         }
     }
     if (!isStringHead) return;
