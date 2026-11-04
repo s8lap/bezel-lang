@@ -13900,6 +13900,304 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             phi->addIncoming(strObj, okEnd);
             return phi;
         }
+        // fix #7949 (stdlib §2.4, v0.355): `GetInt(name: string): int?` and
+        // `GetBool(name: string): bool?` — the two §2.4 METHODS that reached
+        // NO codegen arm at all, so both degraded: a local initializer
+        // degraded to the #2434 zero-init (measured: `var n :=
+        // Environment.GetInt("X"); Console.WriteLine(n ?? -1);` printed `0`
+        // for an ABSENT variable, and `0` — not `42` — for a variable just
+        // set to "42"), and a call in an ARGUMENT position degraded to the
+        // #3079 "the whole statement emits nothing" (not even the line
+        // terminator).
+        //
+        // §2.4 (v0.355) declares, verbatim:
+        //
+        //   public static method GetInt(name: string): int?;    // convenience
+        //   public static method GetBool(name: string): bool?;  //   tier: null
+        //                                                        //   when the
+        //                                                        //   variable
+        //                                                        //   is absent
+        //                                                        //   OR
+        //                                                        //   malformed
+        //                                                        //   — delib-
+        //                                                        //   erately
+        //                                                        //   conflated
+        //                                                        //   (recorded)
+        //
+        // so BOTH the absent case and the malformed case lower to the SAME
+        // null result — that conflation is §2.4's own recorded decision, not
+        // a shortcut.
+        //
+        // The RESULT is a NULLABLE primitive, so its lowering is §7.2's
+        // tagged companion struct `{i8 hasValue; T value}`
+        // (`nullableValueStructTy`), which is what the sema type `int?` /
+        // `bool?` (added by the same commit) tells the consumers to expect.
+        if ((m == "GetInt" || m == "GetBool") && call.args.size() == 1 &&
+            call.args[0].value) {
+            const bool isInt = (m == "GetInt");
+            llvm::Value* nameStr = lowerExpr(*call.args[0].value);
+            if (!nameStr) return nullptr;
+            llvm::Value* nameData = loadStringData(nameStr);
+            auto* getenvFn = module_->getFunction("getenv");
+            if (!getenvFn) {
+                auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+                getenvFn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "getenv", module_.get());
+            }
+            llvm::Value* rawPtr = builder_.CreateCall(getenvFn, {nameData},
+                                                       "env.get.raw");
+            // The ABSENT case: the variable is not in the environment at all.
+            auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
+            llvm::Value* isNull = builder_.CreateICmpEQ(rawPtr, nullPtr,
+                                                        "env.get.absent");
+            auto* entBB  = builder_.GetInsertBlock();
+            auto* nullBB = llvm::BasicBlock::Create(llvm_, "env.get.null",
+                                                     currentFn_);
+            auto* okBB   = llvm::BasicBlock::Create(llvm_, "env.get.ok",
+                                                     currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "env.get.end",
+                                                     currentFn_);
+            builder_.CreateCondBr(isNull, nullBB, okBB);
+            builder_.SetInsertPoint(nullBB);
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(okBB);
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            // The PRESENT case: parse the variable's text. §2.4's "absent OR
+            // malformed" conflation means a parse failure is the SAME null
+            // result as an absent variable.
+            llvm::Value* parsed = nullptr;   // i1: the text is well-formed
+            llvm::Value* payload = nullptr;  // the parsed value
+            if (isInt) {
+                // §9.1's integer grammar, which §2.4's convenience tier is
+                // built on: "an optional leading `+` or `-`, then one or more
+                // digits of that radix, and nothing else; no whitespace, no
+                // `0x`/`0b` prefix, no digit separators", and a value outside
+                // the type's range is an overflow. Spelled exactly as
+                // `Convert.TryToInt32`'s arm spells it (stdlib §2.3 / #1238):
+                // strtoll + an end-pointer check + a whitespace reject + a
+                // range check to [INT32_MIN, INT32_MAX].
+                auto* strtollFn = declareC("strtoll", i64(),
+                                           {ptrTy(), ptrTy(), i32()});
+                auto* endSlotT = entryAlloca(ptrTy());
+                llvm::Value* val64 = builder_.CreateCall(
+                    strtollFn, {rawPtr, endSlotT, builder_.getInt32(10)},
+                    "env.getint.v64");
+                llvm::Value* endPtr = builder_.CreateLoad(ptrTy(), endSlotT,
+                                                          "env.getint.ep");
+                llvm::Value* fc = builder_.CreateLoad(i8Ty, rawPtr,
+                                                      "env.getint.fc");
+                llvm::Value* fcWs = builder_.CreateICmpULE(
+                    fc, llvm::ConstantInt::get(i8Ty, ' '), "env.getint.fws");
+                llvm::Value* advanced = builder_.CreateICmpNE(
+                    endPtr, rawPtr, "env.getint.adv");
+                llvm::Value* endCh = builder_.CreateLoad(i8Ty, endPtr,
+                                                         "env.getint.end");
+                llvm::Value* atNul = builder_.CreateICmpEQ(
+                    endCh, llvm::ConstantInt::get(i8Ty, 0), "env.getint.nul");
+                parsed = builder_.CreateAnd(
+                    builder_.CreateNot(fcWs),
+                    builder_.CreateAnd(advanced, atNul), "env.getint.ok1");
+                llvm::Value* inRange = builder_.CreateAnd(
+                    builder_.CreateICmpSGE(
+                        val64,
+                        llvm::ConstantInt::getSigned(i64(), INT32_MIN),
+                        "env.getint.lo"),
+                    builder_.CreateICmpSLE(
+                        val64,
+                        llvm::ConstantInt::getSigned(i64(), INT32_MAX),
+                        "env.getint.hi"),
+                    "env.getint.inr");
+                parsed = builder_.CreateAnd(parsed, inRange, "env.getint.ok2");
+                payload = builder_.CreateTrunc(val64, i32(), "env.getint.v");
+            } else {
+                // §2.4: "GetBool accepts exactly Boolean.Parse's forms
+                // ("true"/"false", case-insensitive); "1"/"yes" are null."
+                // stdlib §9.4's `Boolean.TryParse` arm spells exactly this
+                // test, and §2.4's convenience tier is built on it.
+                auto* strcasecmpFn = declareC("strcasecmp", i32(),
+                                              {ptrTy(), ptrTy()});
+                llvm::Constant* trueStr =
+                    llvm::ConstantDataArray::getString(llvm_, "true", true);
+                unsigned tid = stringLiteralIdx_++;
+                auto* trueGV = new llvm::GlobalVariable(
+                    *module_, trueStr->getType(), true,
+                    llvm::GlobalValue::PrivateLinkage, trueStr,
+                    ".bz.env.true." + std::to_string(tid));
+                llvm::Constant* falseStr =
+                    llvm::ConstantDataArray::getString(llvm_, "false", true);
+                auto* falseGV = new llvm::GlobalVariable(
+                    *module_, falseStr->getType(), true,
+                    llvm::GlobalValue::PrivateLinkage, falseStr,
+                    ".bz.env.false." + std::to_string(tid));
+                llvm::Value* cmpTrue = builder_.CreateICmpEQ(
+                    builder_.CreateCall(strcasecmpFn, {rawPtr, trueGV}),
+                    builder_.getInt32(0), "env.getbool.isTrue");
+                llvm::Value* cmpFalse = builder_.CreateICmpEQ(
+                    builder_.CreateCall(strcasecmpFn, {rawPtr, falseGV}),
+                    builder_.getInt32(0), "env.getbool.isFalse");
+                parsed = builder_.CreateOr(cmpTrue, cmpFalse,
+                                           "env.getbool.ok");
+                // The VALUE of a well-formed "false" is false; a malformed
+                // text is null (the conflation), so the payload only matters
+                // on the parsed path. The payload's LLVM type is `i1` — the
+                // `bool` primitive's own lowering, which is what the
+                // nullable `bool?` carrier's second slot holds.
+                payload = cmpTrue;
+            }
+            // The carrier's hasValue tag: 1 when the variable was present AND
+            // well-formed, 0 otherwise (absent OR malformed — §2.4's
+            // deliberate conflation). The SELECT is built HERE, in the block
+            // that defines it, so it dominates the PHI edge it feeds.
+            llvm::Value* hvSel = builder_.CreateSelect(
+                parsed,
+                llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                llvm::ConstantInt::get(nullablePrimHasValTy(), 0),
+                "env.get.hv.sel");
+            auto* okEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            // The carrier: {i8 hasValue; T value}.
+            sema::TypeRef primTy = *ctx_.primitiveTypeRef(
+                isInt ? sema::PrimitiveType::Int : sema::PrimitiveType::Bool);
+            primTy.nullable = true;
+            llvm::StructType* carrierTy = nullableValueStructTy(&primTy);
+            auto* hvPhi = builder_.CreatePHI(nullablePrimHasValTy(), 2,
+                                             "env.get.hv");
+            hvPhi->addIncoming(
+                llvm::ConstantInt::get(nullablePrimHasValTy(), 0), nullBB);
+            hvPhi->addIncoming(hvSel, okEnd);
+            auto* valPhi = builder_.CreatePHI(payload->getType(), 2,
+                                              "env.get.val");
+            valPhi->addIncoming(llvm::Constant::getNullValue(payload->getType()),
+                                nullBB);
+            valPhi->addIncoming(payload, okEnd);
+            llvm::Value* res = builder_.CreateInsertValue(
+                llvm::UndefValue::get(carrierTy), hvPhi, {0u});
+            res = builder_.CreateInsertValue(res, valPhi, {1u});
+            return res;
+        }
+        // fix #7949 (stdlib §2.4, v0.355): `Variables(): owned Dictionary<
+        // string, string>` — the LAST §2.4 member, which reached no codegen
+        // arm at all: `var v := Environment.Variables();` degraded to the
+        // #2434 zero-init (measured: `Console.WriteLine(v.Count > 0)`
+        // printed `False` for a process whose environment holds dozens of
+        // variables).
+        //
+        // §2.4 (v0.355) declares:
+        //
+        //   public static method Variables(): owned Dictionary<string, string>;
+        //
+        // and states the result's nature: "`Variables()` returns a
+        // freshly-allocated `owned Dictionary<string, string>` (per the §1
+        // convention for fresh-instance returns)". So the table is NEW (not a
+        // view of a live table) and the CALLER owns it — the `owned` marker
+        // is what discharges it at scope end.
+        if (m == "Variables" && call.args.empty()) {
+            // The backing table: §4.9's string-key dictionary
+            // (`bz_dict_alloc` + `bz_dict_set_str` — the same pair the
+            // `new Dictionary<string, V>` path uses, so the result is
+            // consumable by the ordinary `Dictionary<string,V>` surface).
+            auto* dictAllocFn = declareC("bz_dict_alloc", ptrTy(), {});
+            llvm::Value* dict = builder_.CreateCall(dictAllocFn, {},
+                                                     "env.vars.dict");
+            // The process environment: the C library's `environ` vector
+            // (`char **environ`) — the same source the `Get`/`Set` arms
+            // above read and write through `getenv`/`setenv`. Each entry
+            // is "NAME=VALUE"; an entry with no '=' is malformed and is
+            // skipped.
+            auto* environGV = module_->getOrInsertGlobal("environ", ptrTy());
+            llvm::Value* envVec = builder_.CreateLoad(ptrTy(), environGV,
+                                                      "env.vars.env");
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* loopBB = llvm::BasicBlock::Create(llvm_, "env.vars.loop",
+                                                     currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "env.vars.body",
+                                                     currentFn_);
+            auto* insBB  = llvm::BasicBlock::Create(llvm_, "env.vars.ins",
+                                                     currentFn_);
+            auto* nextBB = llvm::BasicBlock::Create(llvm_, "env.vars.next",
+                                                     currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "env.vars.end",
+                                                     currentFn_);
+            builder_.CreateBr(loopBB);
+            builder_.SetInsertPoint(loopBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot,
+                                                   "env.vars.idx");
+            llvm::Value* slot = builder_.CreateGEP(ptrTy(), envVec, idx,
+                                                   "env.vars.ptr");
+            llvm::Value* entry = builder_.CreateLoad(ptrTy(), slot,
+                                                     "env.vars.entry");
+            llvm::Value* atEnd = builder_.CreateICmpEQ(
+                entry, llvm::ConstantPointerNull::get(ptrTy()),
+                "env.vars.atEnd");
+            builder_.CreateCondBr(atEnd, endBB, bodyBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* strchrFn = declareC("strchr", ptrTy(), {ptrTy(), i32()});
+            llvm::Value* eqPos = builder_.CreateCall(
+                strchrFn, {entry, builder_.getInt32('=')}, "env.vars.eq");
+            llvm::Value* hasEq = builder_.CreateICmpNE(
+                eqPos, llvm::ConstantPointerNull::get(ptrTy()),
+                "env.vars.hasEq");
+            builder_.CreateCondBr(hasEq, insBB, nextBB);
+            builder_.SetInsertPoint(insBB);
+            // The KEY: the bytes before the '='. The runtime copies the key
+            // bytes itself (`bz_dict_set_str` -> `bz_key_dup`), so the
+            // entry's own buffer is not owned by the table.
+            llvm::Value* keyLen = builder_.CreatePtrToInt(eqPos, i64(),
+                                                          "env.vars.eqInt");
+            llvm::Value* entryInt = builder_.CreatePtrToInt(entry, i64(),
+                                                            "env.vars.entryInt");
+            keyLen = builder_.CreateSub(keyLen, entryInt, "env.vars.keyLen");
+            // The VALUE: the bytes after the '='.
+            llvm::Value* vptr = builder_.CreateGEP(i8Ty, eqPos,
+                                                    builder_.getInt64(1),
+                                                    "env.vars.vptr");
+            auto* strlenFn = declareC("strlen", i64(), {ptrTy()});
+            llvm::Value* vlen = builder_.CreateCall(strlenFn, {vptr},
+                                                     "env.vars.vlen");
+            // The value's own `bz_string`, minted with rc := 1 — the
+            // dictionary CO-OWNS that one reference (§4.8: a borrowing
+            // `Dictionary<K, string>` co-owns a +1 per stored value) and
+            // releases it when the table is disposed.
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn = declareC("memcpy", ptrTy(),
+                                      {ptrTy(), ptrTy(), i64()});
+            llvm::Value* vdata = builder_.CreateCall(
+                mallocFn,
+                {builder_.CreateAdd(vlen, builder_.getInt64(1))},
+                "env.vars.vdata");
+            builder_.CreateCall(memcpyFn, {vdata, vptr, vlen});
+            llvm::Value* vend = builder_.CreateGEP(i8Ty, vdata, vlen);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), vend);
+            uint64_t strBytes =
+                module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* vstr = builder_.CreateCall(mallocFn,
+                                                     {builder_.getInt64(strBytes)},
+                                                     "env.vars.vstr");
+            builder_.CreateStore(vdata,
+                                 builder_.CreateStructGEP(stringType(), vstr, 0));
+            builder_.CreateStore(vlen,
+                                 builder_.CreateStructGEP(stringType(), vstr, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+                                 builder_.CreateStructGEP(stringType(), vstr, 2));
+            initStringRc(vstr);  // #422: producer's reference, rc := 1
+            auto* setStrFn = declareC(
+                "bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+            builder_.CreateCall(setStrFn,
+                                {dict, entry, keyLen,
+                                 llvm::ConstantInt::get(i8Ty, 1), vstr});
+            builder_.CreateBr(nextBB);
+            builder_.SetInsertPoint(nextBB);
+            llvm::Value* nextIdx = builder_.CreateAdd(
+                builder_.CreateLoad(i64(), idxSlot), builder_.getInt64(1));
+            builder_.CreateStore(nextIdx, idxSlot);
+            builder_.CreateBr(loopBB);
+            builder_.SetInsertPoint(endBB);
+            return dict;
+        }
         // fix #2348 (stdlib §2.4, v0.307): `Set(name: string, value: string?)`
         // — "value = null removes the variable; an empty name, or one
         // containing \"=\", raises ArgumentException". Never implemented under

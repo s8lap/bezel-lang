@@ -976,16 +976,21 @@ bool isBuiltinOwnedStaticFactoryCall(const ast::CallExpr& call,
     // `isTaskFamilyHead` arm), `CString.From`/`FromBytes`, `WString.From`,
     // `RawBytes.From` (producerState's FFI-buffer arm), and
     // `JsonSerializer.ParseOwned` / `BinarySerializer.Deserialize` (the
-    // serializer arms). `Environment.Variables(): owned Dictionary<string,
-    // string>` (stdlib §3) is a TENTH `owned` static whose local is ALSO
-    // rejected pre-fix, but is DELIBERATELY excluded here: MEASURED, sema
-    // types no result for that call at all (the call is not in sema's
-    // `colName` surface table, and `src/` contains no `Variables` arm), so
-    // there is no TypeRef for the (c) cross-check to read and no codegen
-    // lowering — the callee degrades to a zero value (#2434). Admitting a
-    // shape whose value the compiler cannot produce would classify a
-    // notional `owned` and dispose a zero. That API gap is a separate defect,
-    // filed alongside this fix.
+    // serializer arms).
+    //
+    // fix #7949 (stdlib §2.4, v0.355): `Environment.Variables(): owned
+    // Dictionary<string, string>` is a TENTH `owned` static and IS now
+    // listed. The note that used to exclude it here ("sema types no result
+    // for that call at all ... and `src/` contains no `Variables` arm") is
+    // STALE: sema's `colName == "Environment"` block types `Variables()` as
+    // `Dictionary<string, string>` (`makeDictResult`), and the same commit
+    // adds the codegen lowering (the `Environment` block of
+    // `src/codegen/LlvmBackend_Calls.cpp`), so the (c) cross-check has a
+    // TypeRef to read and the callee has a value to dispose. Admitting it
+    // BEFORE those two existed would have classified a notional `owned` and
+    // disposed a zero — the wrong polarity to fail in; admitting it now is
+    // what makes the freshly-allocated table the CALLER's to release
+    // (§2.4: "returns a freshly-allocated `owned Dictionary<string, string>`").
     struct OwnedStaticFactory {
         std::string_view colName;
         std::string_view member;
@@ -1001,6 +1006,12 @@ bool isBuiltinOwnedStaticFactoryCall(const ast::CallExpr& call,
         {"Directory", "GetFiles", "Array"},
         {"Directory", "GetDirectories", "Array"},
         {"FrozenArray", "From", "FrozenArray"},
+        // fix #7949 (stdlib §2.4, v0.355): `Environment.Variables(): owned
+        // Dictionary<string, string>` — §2.4's "freshly-allocated `owned
+        // Dictionary<string, string>`". The result head is the syntactic
+        // `Dictionary` head sema's `makeDictResult` stamps, which is what
+        // the (c) cross-check below reads.
+        {"Environment", "Variables", "Dictionary"},
     };
     const OwnedStaticFactory* hit = nullptr;
     for (const OwnedStaticFactory& f : kOwnedStaticFactories)

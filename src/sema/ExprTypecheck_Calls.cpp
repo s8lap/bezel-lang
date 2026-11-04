@@ -15743,6 +15743,42 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 &ce, makeDictResult(
                                     ctx_.primitiveTypeRef(P::String),
                                     ctx_.primitiveTypeRef(P::String)));
+                        // fix #7949 (stdlib §2.4, v0.355): `GetInt(name):
+                        // int?` and `GetBool(name): bool?` — the two §2.4
+                        // METHODS whose RESULT TYPE the compiler never
+                        // recorded, so the call was UNTYPED.
+                        //
+                        // The consequence was not cosmetic. An UNTYPED call
+                        // leaves an INFERRED local untypeable
+                        // (`src/sema/ExprTypecheck.cpp`: `lsym->declType =
+                        // ctx_.exprType(*ld->initializer)`), and the `??`
+                        // lowering's nullable-value arm is gated on the
+                        // LEFT operand's sema type
+                        // (`src/codegen/LlvmBackend_Exprs2.cpp`'s
+                        // `lowerCoalesce`: `if (auto* lt =
+                        // ctx_.exprType(*bin.left))`), so `var n :=
+                        // Environment.GetInt("X"); Console.WriteLine(n ??
+                        // -1);` could not lower the coalesce AT ALL. MEASURED
+                        // on the pre-fix tree: `var n: bool :=
+                        // Environment.GetInt("X");` was ADMITTED (a typed
+                        // `int` initializer would be rejected against a
+                        // `bool` slot), which is the tell that the call
+                        // carried no type.
+                        //
+                        // The RESULT is NULLABLE because §2.4 declares it so:
+                        // "null when the variable is absent OR malformed —
+                        // deliberately conflated (recorded)". The lowering
+                        // (the `Environment` block of
+                        // `src/codegen/LlvmBackend_Calls.cpp`) produces the
+                        // §7.2 tagged companion struct `{i8 hasValue; T
+                        // value}` these two types name.
+                        else if (m == "GetInt" || m == "GetBool") {
+                            auto* nt = ctx_.makeTypeRef();
+                            *nt = *ctx_.primitiveTypeRef(
+                                m == "GetInt" ? P::Int : P::Bool);
+                            nt->nullable = true;
+                            ctx_.setExprType(&ce, nt);
+                        }
                     }
                     // §2.5: DateTime/TimeSpan static properties/methods. Scalar
                     // i64 value types; builtinClassSym carries the name so later
