@@ -37154,6 +37154,47 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // fix #8135 (stdlib §3.3, v0.355): the `Source` COMPONENT of
+        // `ReadOnlyStringSpan(Source: string, Start: int, Length: int)`.
+        //
+        // The record has no user TypeSymbol, so the ordinary member-lookup
+        // path never typed the component and `s.Source` came out of sema with
+        // NO type at all: every use of it was unchecked, and an ARITHMETIC use
+        // of it reached codegen as a POINTER operand and produced MALFORMED IR
+        // ("add ptr %sp.source, i32 1" → "IR verification failed"), a
+        // compiler crash where a diagnostic belongs.
+        //
+        // §3.3 declares the component `Source: string`, so the read is an
+        // ordinary string value: §4.6's string rules apply to it (`s.Source +
+        // "x"` concatenates; `s.Source + 1` is rejected as a mixed
+        // string/non-string `+`), and it carries NO disposal obligation —
+        // §9.7 classifies a record whose only reference-typed field is a
+        // runtime-managed `string` as NOT borrow-bearing, and `owned string`
+        // is inadmissible (§28.1), so reading the source out cannot transfer
+        // a disposal obligation.
+        //
+        // The ARRAY-backed pair's `Source` (§4.15's `ArraySpan<T>` /
+        // `ReadOnlyArraySpan<T>`, `Source: Array<T>`) is deliberately NOT
+        // typed here: §4.15's prose says that field "carries a borrow of the
+        // array", a borrow §9.7's declared-field-type rule does not derive
+        // (an `Array<T>` field is not borrow-bearing), and `Array<T>` is a
+        // class WITH a disposal obligation — MEASURED, reading it out under an
+        // `owned Array<int>` return frees the array at the callee's scope end
+        // and the caller then reads it (heap-use-after-free). Typing it needs
+        // the borrow-carrying component modelled first; that is deferred.
+        if (ma.target && ma.member == "Source") {
+            if (auto* tt = ctx_.exprType(*ma.target)) {
+                bool isStrSpan = tt->kind == TypeRef::Kind::Named &&
+                    !tt->declaration && tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty() &&
+                    tt->headName() == "ReadOnlyStringSpan";
+                if (isStrSpan) {
+                    ctx_.setExprType(
+                        &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                    return;
+                }
+            }
+        }
         // per §4.6/§4.7: LinkedList<T>/OwningLinkedList<T> node-returning properties
         // (FirstNode, LastNode, First, Last) and LinkedListNode<T> accessor
         // properties (Value, Next, Previous). None have user TypeSymbols, so the

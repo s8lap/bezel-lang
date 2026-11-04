@@ -744,6 +744,48 @@ static std::string listMemberSignatureSpelling(const sema::TypeRef* fnTy) {
     return s;
 }
 
+// fix #8135 (stdlib §3.3, v0.355): the `Source` component of
+// `ReadOnlyStringSpan(Source: string, Start: int, Length: int)` — the
+// string-backed span view of stdlib §3.3.
+//
+// The span lowers to the shared `{ptr source, i32 start, i32 length}` struct
+// (`arraySpanStructType()`), so `Source` is field 0 — the source string
+// pointer, the same field the span's own `Slice` carries forward
+// (`new ReadOnlyStringSpan(Source, this.Start + start, length)`, §3.3).
+//
+// WHY ONLY THIS ONE RECORD. The stdlib declares a `Source` component on three
+// span-shaped records: `ReadOnlyStringSpan` (§3.3, `Source: string`),
+// `ArraySpan<T>` and `ReadOnlyArraySpan<T>` (§4.15, `Source: Array<T>`). The
+// ARRAY-BACKED pair is deliberately NOT lowered here:
+//
+//   * §9.7 classifies a record whose only reference-typed field is a
+//     runtime-managed `string` as NOT borrow-bearing, so §3.3's `Source` is an
+//     ordinary string value with no disposal obligation (`owned string` is
+//     inadmissible, §28.1) and reading it out is sound.
+//   * §4.15's `ArraySpan<T>.Source` is an `Array<T>` — a CLASS with a disposal
+//     obligation — and §4.15's prose says the field "carries a borrow of the
+//     array", a borrow §9.7's declared-field-type rule does not derive (an
+//     `Array<T>` field is not borrow-bearing, so §9.7 would classify the record
+//     as NOT borrow-bearing; the compiler hard-codes the span views as
+//     borrow-bearing instead). MEASURED: lowering that component without a
+//     borrow model opens a heap-use-after-free — `return sp.Source;` under an
+//     `owned Array<int>` return frees the array at the callee's scope end and
+//     the caller reads it (the component has no sema type, so the §28.3
+//     ownership check never runs). The array-backed pair's components are
+//     deferred with that measurement; the string-backed one is fixed here.
+//
+// `rt->declaration` is non-null for a USER record, so a user's own
+// `record ReadOnlyStringSpan` (stdlib §3.3's own record and a user's are
+// different records — ExprTypecheck_Calls.cpp) keeps the generic record-field
+// path; only the builtin (declaration-less) shape is admitted here.
+static bool isReadOnlyStringSpanTypeRef(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    // `headName()` reads the astNode's first name part, else the imported
+    // name — the same alias-blind read `isSpanLikeTypeName` uses.
+    return rt->headName() == "ReadOnlyStringSpan";
+}
+
 llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     diverged_ = false;  // CG40: cleared per expression; a `throw` sets it
     // §27.6 (v0.184, #1758): inside a primitive-intrinsic thunk body, a synthetic
@@ -7191,10 +7233,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     // §4.15 (#549): ArraySpan<T>/ReadOnlyArraySpan<T> readonly property reads.
     // Both types are value structs { ptr source, i32 start, i32 length }.
     // Length extracts field 2; IsEmpty compares field 2 to 0.
+    //
+    // fix #8135 (stdlib §3.3, v0.355): `Source` — the FIRST declared component
+    // of `ReadOnlyStringSpan(Source: string, Start: int, Length: int)` — is
+    // field 0 of the same { ptr source, i32 start, i32 length } struct. It had
+    // NO handler here, so the read fell through every member-access path,
+    // lowered to no value, and the enclosing statement emitted NOTHING at all
+    // (the #3079 internal warning: "the argument of this Console.WriteLine
+    // failed to lower to a value, so the whole statement emits nothing — not
+    // even the line terminator"). That is a silent wrong output, not a
+    // rejection.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target &&
             (ma->member == "Length" || ma->member == "IsEmpty" ||
-             ma->member == "Start")) {
+             ma->member == "Start" ||
+             (ma->member == "Source" &&
+              isReadOnlyStringSpanTypeRef(ctx_.exprType(*ma->target))))) {
             auto* tt = ctx_.exprType(*ma->target);
             // §3.3 (#883): ReadOnlyStringSpan shares the {ptr,i32,i32} layout, so
             // Length/IsEmpty are the same field-2 read as the array-backed spans.
@@ -7205,6 +7259,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (isSpanLikeTypeName(tt) || isStrSpan) {
                 llvm::Value* sv = lowerExpr(*ma->target);
                 if (!sv) return nullptr;
+                // fix #8135: `Source` is field 0 — the source string pointer.
+                // The same field the span's own `Slice` carries forward, so a
+                // sub-view's `Source` is the ORIGINAL source, as §3.3's
+                // `Slice` body spells it (`new ReadOnlyStringSpan(Source,
+                // this.Start + start, length)`).
+                if (ma->member == "Source")
+                    return builder_.CreateExtractValue(sv, {0u}, "sp.source");
                 // §4.14 (#1277): `Start` is field 1 of the { ptr source, i32
                 // start, i32 length } span struct. It had no handler, so `sp.Start`
                 // fell through to the generic member-access path and read 0 (also
