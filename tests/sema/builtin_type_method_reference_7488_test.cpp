@@ -75,6 +75,11 @@ const char kArrayLength[] =
 const char kStackLength[] =
     "no member `Length` on `Stack<T>`: use `Count` (stdlib \xC2\xA7""4.11)";
 
+// The type-qualified refusal: the head declares no static member of that
+// name, and an extension has no static-invocation form (§26.5 rule 2).
+const char kNoStaticLength[] =
+    "'Array' has no static method or property 'Length'";
+
 // A module carrying the extension block, and a `Main` that runs `body` over
 // a three-element `Array<int>`.
 std::string prog(const std::string& ext, const std::string& body) {
@@ -171,6 +176,72 @@ BEZEL_TEST(sema_builtin_type_method_reference_7488,
 
 // ── #7489: the TYPE-QUALIFIED reference ────────────────────────────────────
 
+// §27.6 (v0.355): the type-qualified reference "uses the extended type's
+// name as qualifier … it captures no receiver, and the resulting function has
+// the receiver as its first parameter" — so the formed type is
+// `(Array<int>) -> int` and calling it with the receiver runs the extension.
+BEZEL_TEST(sema_builtin_type_method_reference_7488,
+           type_qualified_length_reference_calls_the_extension) {
+    // per §27.6 (v0.355) + §26.4 (v0.355)
+    expectStdout(kArrayExt,
+                 "var f: (Array<int>) -> int := Array<int>.Length;\n"
+                 "    Console.WriteLine(f(a));",
+                 "42\n");
+}
+
+// The TYPE-QUALIFIED form of a member the head DOES declare: `Array<T>`
+// declares `Count` (stdlib §4.4), and §27.6 forms a type-qualified
+// reference over an instance property — the getter, `(Array<int>) -> int`.
+// NOT PINNED HERE: the built-in heads dispatch their own members
+// STRUCTURALLY (there is no member symbol to reference), so the compiler
+// refuses the spelling rather than forming the reference — a NAMED RESIDUAL
+// of this lane, not a regression. The row that IS pinned is the extension
+// form above, whose member is a real symbol.
+
+// The type-qualified reference over a USER class whose extension is IMPORTED.
+// §27.6 (v0.355) forms the reference over "the extended type's name as
+// qualifier" for ANY extended type, and §2.8.2 clause 2 (v0.355) makes an
+// external instantiation behave identically to a same-module one.
+//
+// This row pins WHICH TYPE the formation is matched against. The receiver of a
+// type-qualified formation is the QUALIFIER'S OWN TYPE (§27.6), and an
+// IMPORTED user type has no AST declaration in this module — so the built-in
+// head shape must NOT be used for it: a built-in head and the imported
+// block's user-declared head are never equal
+// (`extensionTargetMatchesReceiver`), the reference finds no extension, and
+// the program is rejected "no member `Inc` on type `K` (§11.3, §12.1)" where
+// it compiled before.
+BEZEL_TEST(sema_builtin_type_method_reference_7488,
+           type_qualified_reference_over_an_imported_class_still_forms) {
+    // per §27.6 (v0.355) + §2.8.2 clause 2 (v0.355)
+    const char* kLib =
+        "module N2;\n"
+        "public class K\n"
+        "  public constructor() end constructor;\n"
+        "end K;\n"
+        "public extension K\n"
+        "  public method Inc(a: int): int\n"
+        "    return a + 1;\n"
+        "  end Inc;\n"
+        "end;\n";
+    std::string app =
+        "module M;\n"
+        "import System;\n"
+        "import N2;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    var k := new K();\n"
+        "    var g: (K, int) -> int := K.Inc;\n"
+        "    Console.WriteLine(g(k, 5));\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n";
+    auto r = bezel::test::runAotModulesChecked(
+        {{"N2", kLib}, {"M", app}}, "M");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "6\n");
+}
+
 // ── CONTROLS ────────────────────────────────────────────────────────────────
 
 // With NO extension the receiver-qualified reference is STILL refused: the
@@ -201,6 +272,18 @@ BEZEL_TEST(sema_builtin_type_method_reference_7488,
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(hasError(r, kStackLength));
     BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+}
+
+// With NO extension the TYPE-QUALIFIED reference is refused too: the head
+// declares no static member of that name (§26.5 rule 2 — an extension has no
+// static-invocation form, and there is no extension here at all).
+BEZEL_TEST(sema_builtin_type_method_reference_7488,
+           type_qualified_length_without_an_extension_is_still_refused) {
+    // per §26.5 rule 2 (v0.355)
+    expectRejected("",
+                   "var f: (Array<int>) -> int := Array<int>.Length;\n"
+                   "    Console.WriteLine(f(a));",
+                   kNoStaticLength);
 }
 
 // The sibling member the receiver DOES declare still answers: `Array<T>`

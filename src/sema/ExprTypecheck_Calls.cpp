@@ -32286,6 +32286,58 @@ static bool builtinConcreteCollectionDeclaresMember(const TypeRef* recvTy,
     return isDocumentedConcreteCollectionMember(recvTy->headName(), member);
 }
 
+// fix #7489 (spec §27.6, v0.355): the receiver TypeRef for a TYPE-QUALIFIED
+// member access whose qualifier names a BUILT-IN head (`Array<int>.Length`).
+//
+// §27.6 (v0.355): the type-qualified reference "uses the extended type's
+// name as qualifier, at the type arguments that bind a generic block's
+// parameters (§26.4)" — so the qualifier's own type IS the receiver an
+// extension block's head is matched against.
+//
+// The qualifier names a TYPE, so there is no receiver VALUE and no exprType
+// for it: the receiver is synthesized from the qualifier, and it must carry
+// the SHAPE a built-in head has (DECLARATION-LESS, the head name in
+// `importedName` — the same shape the compiler's own synthesized builtin
+// ancestors use, e.g. the `Task` base in `extensionFindMatchingAncestor`)
+// and the qualifier's TYPE ARGUMENTS. `extensionTargetMatchesReceiver`
+// compares the two heads by NAME (a built-in against a built-in) and
+// requires their generic-argument COUNTS to agree, so a receiver missing
+// either can never match an extension block declared over that head.
+//
+// Returns null for a qualifier that does not name a built-in head (a user
+// class, a record, a primitive keyword), where the ordinary synthesis
+// applies.
+//
+// The discriminator is `isUserDeclaredTypeSym` (sema/Symbol.hpp:502), NOT
+// `targetType->decl != nullptr`: a USER type that is IMPORTED has no AST
+// declaration in this module, so the declaration test alone classifies an
+// imported class as a built-in head. The built-in SHAPE then replaced the
+// imported class's own declaration, `extensionTargetMatchesReceiver` compared
+// a built-in head against the imported block's user-declared head ("never
+// equal"), and the type-qualified reference over an IMPORTED class found no
+// extension — `K.Inc` over `public extension K` imported from another module
+// was rejected "no member `Inc` on type `K` (§11.3, §12.1)" where it had
+// compiled before (issue #6898's row
+// `xmod_extension_method_ref_6898.unbound_reference_to_class_extension_spec_27_6`).
+// `isUserDeclaredTypeSym` is the house discriminator for exactly this
+// question — "the user declared this type, so it is not the built-in of the
+// same name" — and it covers both halves: an AST declaration (`decl !=
+// nullptr`) OR a module of origin (`moduleName` non-empty, the imported case).
+static TypeRef* builtinTypeQualifierReceiver(SemaContext& ctx,
+                                              TypeSymbol* targetType,
+                                              const ast::Expr* target) {
+    if (!targetType || isUserDeclaredTypeSym(targetType)) return nullptr;
+    auto* tr = ctx.makeTypeRef();
+    tr->kind = TypeRef::Kind::Named;
+    tr->declaration = nullptr;
+    tr->importedName = targetType->name;
+    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(target)) {
+        for (const auto& ta : tid->typeArgs)
+            tr->genericArgs.push_back(ta ? ctx.resolvedType(*ta) : nullptr);
+    }
+    return tr;
+}
+
 // fix #7775 (§26.5 rule 1, §8.1, v0.350; stdlib §3.1): the INSTANCE members
 // the built-in `StringBuilder` declares, counting its `Object` base.
 //
@@ -40149,6 +40201,67 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         if (!recvTy) {
             synth.kind = TypeRef::Kind::Named;
             synth.declaration = targetType;
+            // fix #7489 (spec §27.6, v0.355): a TYPE-QUALIFIED reference
+            // whose qualifier names a BUILT-IN head (`Array<int>.Length`) has
+            // no receiver VALUE — the qualifier names a TYPE — so the
+            // receiver is synthesized from the qualifier. The synthesized
+            // receiver carried neither the built-in SHAPE nor the qualifier's
+            // TYPE ARGUMENTS, and both are what an extension block declared
+            // over that head is matched against:
+            //
+            //  (a) the SHAPE — a built-in head's TypeRef is DECLARATION-LESS
+            //      (the head name in `importedName`), and
+            //      `extensionTargetMatchesReceiver` treats a built-in head
+            //      and a user-declared one as "never equal"; a receiver
+            //      carrying the built-in TypeSymbol could therefore never
+            //      match an extension block declared over that head.
+            //  (b) the TYPE ARGUMENTS — `extensionTargetMatchesReceiver`
+            //      requires the two heads' generic-argument COUNTS to agree,
+            //      and the synthesized receiver carried none, so a block over
+            //      `Array<int>` (or `Array<T>`) never matched the qualifier
+            //      `Array<int>`.
+            //
+            // With both missing the type-qualified formation found NO
+            // extension, the access fell through untyped, and codegen
+            // degraded the slot to a zero-initialised value (the #2434
+            // warning) — the silent degradation of issue #7489.
+            //
+            // §27.6 (v0.355): the type-qualified reference "uses the extended
+            // type's name as qualifier, at the type arguments that bind a
+            // generic block's parameters (§26.4)" — the qualifier's own type
+            // IS the receiver the block's head is matched against.
+            //
+            // §26.5 rule 1 (v0.355) still commits the names the head
+            // DECLARES ("If `x`'s declared type … *declares* any instance
+            // member named `Foo` … instance resolution is committed and
+            // extension blocks are **never consulted** for that name on that
+            // receiver"), so a head that declares the name keeps the old
+            // synthesis and the extension stays unreachable — the same rule
+            // the receiver-qualified form obeys.
+            //
+            // The BARE form only. §27.6's type-qualified spelling is a
+            // METHOD-REFERENCE FORMATION, and §26.5 rule 2 (v0.355) gives an
+            // extension no static-invocation form at all ("a call or read
+            // `T.M` that none of them supplies names no member … an extension
+            // does not, extensions having no static-invocation form"). So the
+            // CALL spelling over a type qualifier (`Array<int>.Length()`) is
+            // NOT a formation and keeps its own refusal; only the bare
+            // reference is one.
+            if (&ma != calleeOfCallCtx_) {
+                if (TypeRef* builtinRecv = builtinTypeQualifierReceiver(
+                        ctx_, targetType, ma.target.get())) {
+                    if (!builtinConcreteCollectionDeclaresMember(
+                            builtinRecv, ma.member) &&
+                        !builtinCollectionSurfaceDeclaresMember(builtinRecv,
+                                                                ma.member) &&
+                        !builtinStringBuilderDeclaresMember(builtinRecv,
+                                                            ma.member) &&
+                        !builtinObjectBaseDeclaresMember(builtinRecv,
+                                                         ma.member)) {
+                        synth = *builtinRecv;
+                    }
+                }
+            }
             recvTy = &synth;
         }
         // §26.5 (#714): pass outBinding to capture the free-var binding.
@@ -41063,18 +41176,37 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // reference to it (the primitive form `int.Doubled`, #1633).
                 // Such a name is not a "no static member" case, so it is left
                 // to the extension path rather than rejected here.
-                const auto extensionDeclares = [&](const ExtensionSymbol* x) {
-                    for (const Symbol* mem : x->members)
-                        if (mem && mem->name == m) return true;
-                    return false;
-                };
+                //
+                // fix #7489 (spec §27.6, v0.355): the test used to be "ANY
+                // extension block in scope declares a member of that name" —
+                // head-AGNOSTIC, so an extension over a DIFFERENT head
+                // suppressed the reject too. The access then fell through
+                // untyped and codegen degraded the slot to a zero-initialised
+                // value (the #2434 warning) — the silent degradation of issue
+                // #7489, for every qualifier the extension does not cover.
+                //
+                // The head-aware test is the authority: the §26.5 rule-2
+                // lookup over THIS head, with the receiver the qualifier's
+                // own type (the built-in shape — see
+                // `builtinTypeQualifierReceiver`). The rule-1 commitment
+                // (the head DECLARES the name → the extension blocks are
+                // never consulted for it) is applied first, exactly as the
+                // receiver-qualified form applies it.
                 bool extensionNamed = false;
-                if (ctx_.module())
-                    for (const Symbol* c : ctx_.module()->children)
-                        if (const auto* x = dynamic_cast<const ExtensionSymbol*>(c))
-                            extensionNamed = extensionNamed || extensionDeclares(x);
-                for (const ExtensionSymbol* x : importedExtensions_)
-                    extensionNamed = extensionNamed || extensionDeclares(x);
+                if (TypeRef* headRecv = builtinTypeQualifierReceiver(
+                        ctx_, targetType, ma.target.get())) {
+                    const bool headDeclares =
+                        builtinConcreteCollectionDeclaresMember(headRecv, m) ||
+                        builtinCollectionSurfaceDeclaresMember(headRecv, m) ||
+                        builtinStringBuilderDeclaresMember(headRecv, m) ||
+                        builtinObjectBaseDeclaresMember(headRecv, m);
+                    if (!headDeclares)
+                        extensionNamed =
+                            lookupExtensionMember(headRecv, m, nullptr,
+                                                   ma.span.begin,
+                                                   /*reportAmbiguity=*/false) !=
+                            nullptr;
+                }
                 if (collectionName && !declaredStatic && !extensionNamed) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
