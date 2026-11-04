@@ -29,6 +29,16 @@
 //    built-in exception construction, including §31.4's `(message, cause)`
 //    chaining constructor, which §31.4 states is NOT pure.
 //
+// FIX-FORWARD (the review of item 3): the item-3 rows below introduced an
+// OVER-REJECTION — a `pure` constructor with a DEFAULTED parameter, invoked
+// with the default omitted, was refused ("the invoked constructor of
+// `MyError` could not be identified"), because the typecheck pass publishes
+// its constructor selection only in its OVERLOAD arms, and the carve-out's
+// fallback then matched an EXACT parameter count that a call leaving a
+// default out cannot satisfy. The rows at the END of this file pin the fix:
+// the single-constructor case (local and IMPORTED) is admitted again, and
+// the overloaded case still answers about the constructor the call INVOKES.
+//
 // THE ORACLE. Two, deliberately.
 //
 //   * The SEMA oracle (`parseAndCheckPureGated`) is the phase under test: it
@@ -519,4 +529,255 @@ BEZEL_TEST(pure_body_walk_8134,
         "    return 0;\n"
         "  end Main;\n"
         "end Program;\n"));
+}
+
+// =========================================================================
+// FIX-FORWARD #8134 — the INVOKED constructor is identified even when the
+// typecheck pass published no selection (§22.15 / §22.5 / §31.4).
+// =========================================================================
+//
+// THE DEFECT THIS CLOSES. §22.15's carve-out admits `new E(...)` "only when
+// (a) the INVOKED constructor of `E` is `pure`-declared". Identifying that
+// constructor needs the SELECTION the typecheck pass makes — and the pass
+// publishes it (`SemaContext::resolvedNewCtor`) in its OVERLOAD arms only.
+// Its SINGLE-constructor arms (the local `ctors.size() == 1` tail and the
+// imported twin) bind the arguments and check them, but publish nothing.
+//
+// The carve-out's fallback was therefore an EXACT parameter-count match, and
+// §22.5 makes a shorter call legal against a longer parameter list:
+//
+//   public pure constructor(message: string, code: int := 0) base(message);
+//
+// invoked as `throw new MyError("neg")` — ONE argument, TWO formals, the
+// second filled from its declared default. The parameter count does not
+// match, so the fallback found no constructor at all and the carve-out
+// refused a program whose invoked constructor IS `pure`-declared — a
+// rejection the base did not make.
+//
+// THE FIX. ONE non-static constructor is the invoked one (a class with a
+// single constructor has no other candidate, and the typecheck pass has
+// already rejected a call that does not bind to it); otherwise the call's
+// arguments are BOUND to each candidate's formals (§22.5), so a defaulted
+// formal left unbound — and a named argument — are honoured.
+
+// The STATEMENT form: `throw new MyError("neg")` at the throw operand of a
+// pure body, against a `pure` constructor whose second formal declares a
+// default the call omits. §22.5 fills that formal from its default, so the
+// constructor that runs is the `pure` one and §22.15 (a) admits it.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_user_exception_pure_constructor_with_default_admitted_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "public class MyError: Exception\n"
+        "  public pure constructor(message: string, code: int := 0) base(message); end "
+        "constructor;\n"
+        "end MyError;\n"
+        "class C\n"
+        "  public static pure method F(): string\n"
+        "    throw new MyError(\"neg\");\n"
+        "  end F;\n"
+        "end C;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The AOT arm of that row: the program COMPILES, LINKS and RUNS — the throw
+// is caught and the program exits 0.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_user_exception_pure_constructor_with_default_runs_spec_22_15) {
+    BEZEL_EXPECT_TRUE(aotRunsWithExitZero(
+        "module M;\n"
+        "public class MyError: Exception\n"
+        "  public pure constructor(message: string, code: int := 0) base(message); end "
+        "constructor;\n"
+        "end MyError;\n"
+        "class Program\n"
+        "  public static pure method Run(x: int): int\n"
+        "    if x < 0 then\n"
+        "      throw new MyError(\"neg\");\n"
+        "    end;\n"
+        "    return x;\n"
+        "  end Run;\n"
+        "  public static method Main(): int\n"
+        "    try\n"
+        "      Console.WriteLine(Run(-1));\n"
+        "    catch var e: Exception => Console.WriteLine(\"caught \" + e.Message);\n"
+        "    end;\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n"));
+}
+
+// The THROW-EXPRESSION form: §22.15's carve-out admits `new E(...)` "only
+// as the immediate operand of a `throw` statement or `throw` expression", so
+// the expression spelling reaches the same carve-out — and the same
+// identification.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_user_exception_pure_constructor_with_default_throw_expression_admitted_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "public class MyError: Exception\n"
+        "  public pure constructor(message: string, code: int := 0) base(message); end "
+        "constructor;\n"
+        "end MyError;\n"
+        "class C\n"
+        "  public static pure method F(s: string?): string\n"
+        "    return s ?? throw new MyError(\"none\");\n"
+        "  end F;\n"
+        "end C;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The AOT arm of the throw-expression form.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_user_exception_pure_constructor_with_default_throw_expression_runs_spec_22_15) {
+    BEZEL_EXPECT_TRUE(aotRunsWithExitZero(
+        "module M;\n"
+        "public class MyError: Exception\n"
+        "  public pure constructor(message: string, code: int := 0) base(message); end "
+        "constructor;\n"
+        "end MyError;\n"
+        "class Program\n"
+        "  public static pure method Run(s: string?): string\n"
+        "    return s ?? throw new MyError(\"none\");\n"
+        "  end Run;\n"
+        "  public static method Main(): int\n"
+        "    try\n"
+        "      Console.WriteLine(Run(\"a\"));\n"
+        "    catch var e: Exception => Console.WriteLine(\"caught \" + e.Message);\n"
+        "    end;\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n"));
+}
+
+// The DEFAULT-PARAMETER OVERLOAD row (ADMIT): a `pure` constructor with a
+// defaulted formal beside an IMPURE sibling the call does not bind (the
+// sibling's `cause` is a required formal the call supplies no value for).
+// §22.6 leaves exactly one applicable candidate — the `pure` one — so it is
+// the constructor that runs, and §22.15 (a) admits the construction.
+//
+// This is the row that keeps the fix honest in the OVERLOADED case: the
+// carve-out may not answer "does E have a `pure` constructor SOMEWHERE" (the
+// pre-#8134 question), and it may not answer "the only `pure` constructor E
+// has" either — it answers about the constructor the call invokes.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_user_exception_default_parameter_overload_admitted_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "public class MyError: Exception\n"
+        "  public pure constructor(message: string, code: int := 0) base(message); end "
+        "constructor;\n"
+        "  public constructor(message: string, cause: Exception) base(message, cause); end "
+        "constructor;\n"
+        "end MyError;\n"
+        "class C\n"
+        "  public static pure method F(): string\n"
+        "    throw new MyError(\"neg\");\n"
+        "  end F;\n"
+        "end C;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The DEFAULT-PARAMETER OVERLOAD row (REJECT): the same `pure` constructor
+// with a defaulted formal, beside an IMPURE sibling of the SAME REQUIRED
+// ARITY. §22.6's defaulted-arity tie-break prefers the candidate that fills
+// NO default ("adding an optional-parameter overload never re-routes
+// existing calls"), so the IMPURE sibling is the constructor the call
+// invokes — and §22.15 (a) does not admit it.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_user_exception_default_parameter_overload_impure_sibling_rejected_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "public class MyError: Exception\n"
+        "  public pure constructor(message: string, code: int := 0) base(message); end "
+        "constructor;\n"
+        "  public constructor(message: string) base(message); end constructor;\n"
+        "end MyError;\n"
+        "class C\n"
+        "  public static pure method F(): string\n"
+        "    throw new MyError(\"neg\");\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(r, kCarveOut);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) {
+        BEZEL_EXPECT_TRUE(d->location.line == 8u);
+        // The diagnostic names the INVOKED constructor's owner — and, this
+        // time, the invoked constructor IS identified (the IMPURE sibling),
+        // so the refusal is about its purity, not about its being unknown.
+        BEZEL_EXPECT_TRUE(d->message.find("MyError") != std::string::npos);
+        BEZEL_EXPECT_TRUE(d->message.find("not `pure`-declared") !=
+                           std::string::npos);
+    }
+}
+
+// The SINGLE-IMPURE-CONSTRUCTOR control: one non-static constructor, not
+// `pure`-declared, with the same defaulted formal. The carve-out identifies
+// it (there is no other candidate) and refuses it for its impurity — the
+// identification is not a blanket admission.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_user_exception_impure_constructor_with_default_rejected_spec_22_15) {
+    auto r = pureCheck(
+        "module M;\n"
+        "public class MyError: Exception\n"
+        "  public constructor(message: string, code: int := 0) base(message); end "
+        "constructor;\n"
+        "end MyError;\n"
+        "class C\n"
+        "  public static pure method F(): string\n"
+        "    throw new MyError(\"neg\");\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(r, kCarveOut);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) {
+        BEZEL_EXPECT_TRUE(d->location.line == 7u);
+        BEZEL_EXPECT_TRUE(d->message.find("not `pure`-declared") !=
+                           std::string::npos);
+    }
+}
+
+// The IMPORTED twin: the library module exports the class, the importing
+// module throws it in a pure body. The imported single-constructor path
+// (`ExprTC::checkImportedNewExprArgs`) publishes no selection either, so the
+// carve-out has to identify the invoked constructor ACROSS the module
+// boundary — where the constructor's purity is the artifact's own marker
+// (`MemberSymbol::isPure`, the both-sources arm of `constructorIsPure`).
+//
+// The oracle is `runAotModules` — the strict multi-module AOT oracle (the
+// real driver, a library artifact built with `compileObject`, clang-link,
+// native exec). The program must COMPILE, LINK and RUN: the throw is caught
+// in the importer and the program exits 0.
+BEZEL_TEST(pure_body_walk_8134,
+           throw_imported_exception_pure_constructor_with_default_runs_spec_22_15) {
+    const std::string lib =
+        "module Lib;\n"
+        "public class MyError: Exception\n"
+        "  public pure constructor(message: string, code: int := 0) base(message); end "
+        "constructor;\n"
+        "end MyError;\n";
+    const std::string app =
+        "module App;\n"
+        "import Lib;\n"
+        "class Program\n"
+        "  public static pure method Run(x: int): int\n"
+        "    if x < 0 then\n"
+        "      throw new MyError(\"neg\");\n"
+        "    end;\n"
+        "    return x;\n"
+        "  end Run;\n"
+        "  public static method Main(): int\n"
+        "    try\n"
+        "      Console.WriteLine(Run(-1));\n"
+        "    catch var e: Exception => Console.WriteLine(\"caught \" + e.Message);\n"
+        "    end;\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n";
+    auto r = bezel::test::runAotModules(
+        {bezel::test::ModuleSource{"Lib", lib},
+         bezel::test::ModuleSource{"App", app}},
+        "App");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(0, r.exitCode);
 }

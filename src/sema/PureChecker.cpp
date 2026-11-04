@@ -885,6 +885,131 @@ static const ConstructorSymbol* findUserCtorByArity(
     return symMatching == 1 ? symMatch : nullptr;
 }
 
+// fix-forward #8134 (§22.15 / §31.4, v0.355): the INVOKED constructor of a
+// `new E(args)` the typecheck pass did not publish.
+//
+// WHY THE PASS SOMETIMES PUBLISHES NOTHING. `ExprTC::checkNewExprArgs` (the
+// LOCAL path) and `ExprTC::checkImportedNewExprArgs` (the IMPORTED twin)
+// publish the constructor they selected on `SemaContext::resolvedNewCtor` in
+// their OVERLOAD arms only — the §22.6 winner, the §22.6-filtered single
+// candidate, and the imported twin's winner. Their SINGLE-constructor arms
+// (the LOCAL `ctors.size() == 1` tail, and the imported tail) bind the
+// arguments and check them, but publish nothing. So for every class with
+// exactly ONE constructor the selection is not on the table, and §22.15's
+// carve-out has to identify the invoked constructor itself.
+//
+// WHY THE OLD ARITY MATCH WAS NOT ENOUGH. It matched
+// `cs->params.size() == args.size()` — an EXACT parameter count — and §22.5
+// makes a shorter call legal against a longer parameter list when the
+// trailing formals declare defaults:
+//
+//   public pure constructor(message: string, code: int := 0) base(message);
+//
+// invoked as `throw new MyError("neg")` — ONE argument, TWO formals, the
+// second filled from its default. The arity match does not see that
+// constructor at all, so the carve-out refused a program whose invoked
+// constructor IS `pure`-declared (§22.15 (a)) — a rejection the base did not
+// make, and one this fix-forward removes.
+//
+// THE TWO RULES, in order.
+//
+//   (a) ONE non-static constructor: that constructor IS the invoked one. A
+//       class with a single constructor has no other candidate to select,
+//       and the typecheck pass has already rejected the program if the
+//       arguments do not bind to it (§22.5) or do not convert (§5.1) — so
+//       naming it here cannot mis-identify a legal call.
+//
+//   (b) SEVERAL constructors: bind the call's arguments to each candidate's
+//       formals (§22.5) and take the unique candidate that binds. Binding
+//       is what honours a DEFAULTED formal left unbound and a NAMED
+//       argument — the two shapes the arity match could not see. Two
+//       candidates that bind leave the choice to §22.6's ranking, which the
+//       typecheck pass runs; if it published no winner, the invoked
+//       constructor is not identifiable here, and the carve-out does not
+//       admit it (the same verdict the pre-#8134 "no pure ctor on the class"
+//       answer gave).
+//
+// A STATIC constructor is never invoked by a `new` expression, so it is not a
+// candidate here — the same exclusion `findUserCtorByArity` makes.
+
+// §22.5 argument-to-parameter binding, SILENT (no diagnostics): the
+// APPLICABILITY half of `ExprTC::bindArgsToParams` — the same rule it
+// applies, reduced to the three facts `sema::FormalsView` carries (how many
+// formals, each formal's NAME, and whether it may be left unbound).
+//
+// WHY A SECOND COPY. `bindArgsToParams` is an `ExprTC` private member, and
+// `PureChecker.cpp` is a separate translation unit with no `ExprTC`; the
+// binder's DIAGNOSTIC half needs the typechecker's context, but its
+// APPLICABILITY half needs nothing but the formal list and the argument
+// list — both of which the caller already holds. The rule applied here is
+// the rule the binder applies:
+//
+//   * positional arguments fill the formals in order;
+//   * a named argument binds to the formal of that name;
+//   * a positional argument may not follow a named one;
+//   * no formal may be bound twice;
+//   * every formal left unbound must declare a default.
+//
+// The binder also checks the arguments' TYPES against the formals' (§5.1);
+// that half is not repeated here — a candidate this predicate admits may
+// still be inapplicable by type, and §22.6's ranking (the typecheck pass)
+// decides between such candidates.
+static bool ctorBindsArgs(const sema::FormalsView& formals,
+                           const std::vector<ast::CallArgument>& args) {
+    const std::size_t n = formals.size();
+    std::vector<bool> bound(n, false);
+    bool sawNamed = false;
+    std::size_t pos = 0;  // the next positional formal
+    for (const ast::CallArgument& a : args) {
+        if (a.name.empty()) {
+            // per §22.5: positional arguments precede named arguments.
+            if (sawNamed) return false;
+            if (pos >= n) return false;  // more arguments than formals
+            bound[pos] = true;
+            ++pos;
+            continue;
+        }
+        sawNamed = true;
+        std::size_t idx = n;
+        for (std::size_t j = 0; j < n; ++j)
+            if (formals.name(j) == a.name) {
+                idx = j;
+                break;
+            }
+        if (idx >= n) return false;     // no formal of that name
+        if (bound[idx]) return false;   // bound twice
+        bound[idx] = true;
+    }
+    // per §22.5: every formal left unbound takes its declared default.
+    for (std::size_t j = 0; j < n; ++j)
+        if (!bound[j] && !formals.hasDefault(j)) return false;
+    return true;
+}
+
+// fix-forward #8134: the invoked constructor of `new E(args)`, for a class
+// whose selection the typecheck pass did not publish. See the note above for
+// the two rules and why the old arity match was not enough.
+static const ConstructorSymbol* findInvokedUserCtor(
+    const TypeSymbol* cls, const std::vector<ast::CallArgument>& args) {
+    std::vector<const ConstructorSymbol*> ctors;
+    for (Symbol* m : cls->members) {
+        auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+        if (!cs || cs->isStatic) continue;
+        ctors.push_back(cs);
+    }
+    if (ctors.empty()) return nullptr;
+    // (a) ONE non-static constructor: it is the invoked one.
+    if (ctors.size() == 1) return ctors[0];
+    // (b) SEVERAL: the unique candidate whose formals the call binds.
+    const ConstructorSymbol* bound = nullptr;
+    for (const ConstructorSymbol* cs : ctors) {
+        if (!ctorBindsArgs(sema::FormalsView::of(*cs), args)) continue;
+        if (bound) return nullptr;  // two candidates bind: §22.6 decides
+        bound = cs;
+    }
+    return bound;
+}
+
 // §22.15 "Members classified by rule" (#2061, item 2): record construction
 // `new R(args)` is admitted in a pure body iff the invoked constructor is
 // compiler-synthesized-pure (positional record — class-identity check) OR
@@ -1330,19 +1455,28 @@ bool PureBodyWalker::throwCarveOutAdmits(const ast::NewExpr& ne,
     //
     // The typecheck pass already SELECTS the constructor the call invokes
     // and publishes it — `SemaContext::resolvedNewCtor`, the #4853 table
-    // keyed on the `NewExpr`'s argument list (`ExprTC::checkNewExprArgs`
-    // publishes the single bound candidate, the §22.6 winner of an
-    // overloaded set, and the imported twin). That is the authoritative
-    // answer, so it is read first; the arity match over E's constructors is
-    // the fallback for a selection the pass did not publish.
+    // keyed on the `NewExpr`'s argument list. That is the authoritative
+    // answer, so it is read first. The publication happens in the pass's
+    // OVERLOAD arms only: the §22.6 winner of an overloaded set and the
+    // imported twin's winner (`ExprTC::checkNewExprArgs` and
+    // `ExprTC::checkImportedNewExprArgs`). The pass's SINGLE-constructor
+    // arms — the LOCAL `ctors.size() == 1` tail and the imported twin —
+    // bind the arguments and check them but publish nothing, so for every
+    // class with exactly one constructor the selection is NOT on the table
+    // and the carve-out has to identify the invoked constructor itself.
     //
-    // A class with NO resolvable constructor of the call's shape (an
-    // implicit default constructor, a primary constructor, an ambiguous
-    // overload set) has no pure constructor the carve-out can point at, so
-    // the carve-out does not admit it — the same verdict the pre-#8134
-    // "no pure ctor on the class" answer gave.
+    // The fallback is `findInvokedUserCtor` (below): ONE non-static
+    // constructor is the invoked one, and otherwise the arguments are BOUND
+    // to each candidate's formals (§22.5) so a defaulted formal left
+    // unbound — and a named argument — are honoured.
+    //
+    // A class with NO identifiable constructor (an implicit default
+    // constructor, a primary constructor, an ambiguous overload set) has no
+    // pure constructor the carve-out can point at, so the carve-out does
+    // not admit it — the same verdict the pre-#8134 "no pure ctor on the
+    // class" answer gave.
     const ConstructorSymbol* invoked = ctx_.resolvedNewCtor(&ne.args);
-    if (!invoked) invoked = findUserCtorByArity(targetDecl, ne.args.size());
+    if (!invoked) invoked = findInvokedUserCtor(targetDecl, ne.args);
     if (!invoked) {
         if (why)
             *why = "the invoked constructor of `" +
