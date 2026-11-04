@@ -11078,9 +11078,36 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     }
                 }
             }
+            // fix #8158 (spec §5.1 "Implicit conversions", v0.355): the implicit
+            // NUMERIC WIDENING at a function-value argument is ONE path — the
+            // shared `coerceNumericToType` — for every row of §5.1's table that
+            // can occur at this position: `int`/`long`/`short`/`byte` → `float`,
+            // → `double`, `float` → `double`, and `int`/`long`/`short`/`byte` →
+            // `decimal`. Before this the integer→decimal row was MISSING, so an
+            // `int` argument at a `decimal` parameter of a function type reached
+            // the call with its raw i32 bits and the module failed IR
+            // verification ("Call parameter type does not match function
+            // signature!"); each further row of §5.1's table would have needed
+            // its own branch here, and the helper already implements them all.
+            //
+            // The two directions this path does NOT take are the ones §5.1 does
+            // not admit:
+            //   * float → integer — a NARROWING, which §5.2's explicit
+            //     conversion governs; kept here only for an UNANNOTATED lambda
+            //     parameter, whose type is inferred from the call.
+            //   * integer → integer — #7279 (a SEPARATE, OPEN issue) sign-
+            //     extends an unsigned source at a function-value argument, while
+            //     `coerceNumericToType` zero-extends it; that arm is left
+            //     EXACTLY as it is until #7279 is fixed.
             if (declTy->isIntegerTy() && args[ai]->getType()->isFloatingPointTy())
                 args[ai] = builder_.CreateFPToSI(args[ai], declTy);
-            else if (declTy->isFloatingPointTy() && args[ai]->getType()->isIntegerTy()) {
+            else if (declTy->isIntegerTy() && args[ai]->getType()->isIntegerTy()) {
+                unsigned db = declTy->getIntegerBitWidth();
+                unsigned sb = args[ai]->getType()->getIntegerBitWidth();
+                if (db > sb) args[ai] = builder_.CreateSExt(args[ai], declTy);
+                else args[ai] = builder_.CreateTrunc(args[ai], declTy);
+            }
+            else {
                 // fix #7251 (spec §5.1, v0.344): an INTEGER argument at a
                 // `double` PARAMETER converts by VALUE, so an UNSIGNED source
                 // must use `uitofp` — the instruction that preserves the value
@@ -11104,28 +11131,30 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // the `sitofp` it always had, so a negative signed argument
                 // keeps its sign and every signed result is bit-for-bit what
                 // it was.
-                const ast::Expr* fpSrcE =
-                    (ai >= 1 && ai - 1 < call.args.size())
-                        ? call.args[ai - 1].value.get()
-                        : nullptr;
-                args[ai] = (fpSrcE && isUnsignedTargetExpr(*fpSrcE))
-                    ? builder_.CreateUIToFP(args[ai], declTy, "cl.arg.uitofp")
-                    : builder_.CreateSIToFP(args[ai], declTy, "cl.arg.sitofp");
-            }
-            else if (declTy->isFloatingPointTy() &&
-                     args[ai]->getType()->isFloatingPointTy()) {
+                //
                 // fix #8144 (spec §5.1 implicit conversions, v0.355): a `float`
                 // argument at a `double` parameter of a function type widens
                 // (`fpext`) like the direct-call path does, via the same
                 // helper; before this the f32 operand reached an f64
                 // parameter and IR verification aborted.
-                args[ai] = coerceNumericToType(args[ai], declTy);
-            }
-            else if (declTy->isIntegerTy() && args[ai]->getType()->isIntegerTy()) {
-                unsigned db = declTy->getIntegerBitWidth();
-                unsigned sb = args[ai]->getType()->getIntegerBitWidth();
-                if (db > sb) args[ai] = builder_.CreateSExt(args[ai], declTy);
-                else args[ai] = builder_.CreateTrunc(args[ai], declTy);
+                const ast::Expr* fpSrcE =
+                    (ai >= 1 && ai - 1 < call.args.size())
+                        ? call.args[ai - 1].value.get()
+                        : nullptr;
+                const bool srcUns = fpSrcE && isUnsignedTargetExpr(*fpSrcE);
+                llvm::Value* widened =
+                    coerceNumericToType(args[ai], declTy, srcUns);
+                if (widened->getType() == declTy) {
+                    args[ai] = widened;
+                } else if (declTy->isFloatingPointTy() &&
+                           args[ai]->getType()->isIntegerTy(1)) {
+                    // A `bool` source: §5.1's table does NOT relate `bool` to a
+                    // binary float ("Between integers and `bool`" is never
+                    // implicit), so `coerceNumericToType` declines it. The
+                    // pre-existing behaviour converted it anyway; keep that.
+                    args[ai] = builder_.CreateSIToFP(args[ai], declTy,
+                                                     "cl.arg.sitofp");
+                }
             }
         }
         // Similarly fix up the return type if it's an unresolved generic.
