@@ -38610,28 +38610,65 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                     std::string(mbr) + "(...)`)");
                             return;
                         }
-                        if (!isUniversalObjectMember && !isLengthAlias &&
-                                !isDeclaredMethod && !isLinqOperator &&
-                                !isCallForm) {
+                        // fix #8120 (spec §26.5 rule 2 / §27.6, v0.355): the
+                        // built-in collection heads' DOCUMENTED surface is
+                        // not the whole of §26.5's resolution. Rule 2: "If
+                        // the receiver's type declares no instance member of
+                        // that name, the compiler searches the current module
+                        // and all imported modules ... for extension blocks on
+                        // `x`'s type, base types, or implemented interfaces"
+                        // — and "The outcome is the same for every member
+                        // access on a value, not only a call ... a method
+                        // reference, which resolves its member exactly as
+                        // the call does (§27.6)".
+                        //
+                        // The name is NOT in the head's documented surface
+                        // (that is what this reject says), so rule 2 sends
+                        // the lookup to the extension blocks — and a user's
+                        // `extension Array<int> Doubled()` IS a member of
+                        // that name on that receiver. The CALL `a.Doubled()`
+                        // is admitted (it resolves through the same rule-2
+                        // lookup further down), so the BARE REFERENCE
+                        // `a.Doubled` must resolve to the SAME member:
+                        // refusing it here is a FALSE REJECT and an asymmetry
+                        // between two spellings of one program (#7488's
+                        // shape, for every name but `Length`).
+                        //
+                        // The gate is the house §26.5 form the sibling arms
+                        // in this function use (the built-in collection
+                        // member rejects a few hundred lines below ask the
+                        // same lookup before refusing): an arity-agnostic
+                        // lookup that answers "does an extension member of
+                        // this name apply to this receiver?" — for BOTH
+                        // spellings, since the bare reference has no arity of
+                        // its own.
+                        {
                             auto loc = ma.span.begin;
                             if (loc.line == 0 && ma.target)
                                 loc = ma.target->span.begin;
-                            ctx_.diagnostics().report(
-                                Severity::Error, loc,
-                                std::string("no member `") +
-                                    std::string(mbr) + "` on `" +
-                                    std::string(cn) +
-                                    "<T>` (stdlib \xC2\xA7""4.4/\xC2\xA7"
-                                    "4.5) -- it is not part of this "
-                                    "collection's documented property "
-                                    "surface (Count, Capacity, and the "
-                                    "`.Length` alias), a declared method/"
-                                    "LINQ operator (call or bare reference, "
-                                    "language spec \xC2\xA7""27.6), or a "
-                                    "universal `ToString`/`Equals`/"
-                                    "`GetHashCode`/`GetType` member "
-                                    "(language spec \xC2\xA7""8.1)");
-                            return;
+                            if (!isUniversalObjectMember && !isLengthAlias &&
+                                    !isDeclaredMethod && !isLinqOperator &&
+                                    !isCallForm &&
+                                    !lookupExtensionMember(
+                                        tt, mbr, nullptr, loc,
+                                        /*reportAmbiguity=*/false)) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, loc,
+                                    std::string("no member `") +
+                                        std::string(mbr) + "` on `" +
+                                        std::string(cn) +
+                                        "<T>` (stdlib \xC2\xA7""4.4/\xC2\xA7"
+                                        "4.5) -- it is not part of this "
+                                        "collection's documented property "
+                                        "surface (Count, Capacity, and the "
+                                        "`.Length` alias), a declared method/"
+                                        "LINQ operator (call or bare reference, "
+                                        "language spec \xC2\xA7""27.6), or a "
+                                        "universal `ToString`/`Equals`/"
+                                        "`GetHashCode`/`GetType` member "
+                                        "(language spec \xC2\xA7""8.1)");
+                                return;
+                            }
                         }
                     }
                 }
@@ -38884,29 +38921,43 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                     "(...)`)");
                             return;
                         }
-                        if (!isUniversalObjectMember &&
-                                !isUndocumentedWorkingAlias &&
-                                !isUndocumentedCallableAlias &&
-                                !isDeclaredMethod && !isLinqOperator &&
-                                !isCallForm) {
+                        // fix #8120 (spec §26.5 rule 2 / §27.6, v0.355): the
+                        // Stack/Queue twin of the Array/OwningArray gate
+                        // above — the same rule-2 consultation, the same
+                        // house form. stdlib §4.11 declares `Count` on
+                        // `Stack<T>` / `Queue<T>` and their Owning twins and
+                        // no `Doubled`, so a user's `extension Stack<int>
+                        // Doubled()` is a member of that name on that
+                        // receiver, and §27.6 resolves the bare reference to
+                        // it exactly as the call `s.Doubled()` does.
+                        {
                             auto loc = ma.span.begin;
                             if (loc.line == 0 && ma.target)
                                 loc = ma.target->span.begin;
-                            ctx_.diagnostics().report(
-                                Severity::Error, loc,
-                                std::string("no member `") +
-                                    std::string(mbr) + "` on `" +
-                                    std::string(cn) +
-                                    "<T>` (stdlib \xC2\xA7""4.11) -- it is "
-                                    "not part of this collection's "
-                                    "documented property surface (Count and "
-                                    "the `.Length` alias), a declared "
-                                    "method/LINQ operator (call or bare "
-                                    "reference, language spec \xC2\xA7"
-                                    "27.6), or a universal `ToString`/"
-                                    "`Equals`/`GetHashCode`/`GetType` "
-                                    "member (language spec \xC2\xA7""8.1)");
-                            return;
+                            if (!isUniversalObjectMember &&
+                                    !isUndocumentedWorkingAlias &&
+                                    !isUndocumentedCallableAlias &&
+                                    !isDeclaredMethod && !isLinqOperator &&
+                                    !isCallForm &&
+                                    !lookupExtensionMember(
+                                        tt, mbr, nullptr, loc,
+                                        /*reportAmbiguity=*/false)) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, loc,
+                                    std::string("no member `") +
+                                        std::string(mbr) + "` on `" +
+                                        std::string(cn) +
+                                        "<T>` (stdlib \xC2\xA7""4.11) -- it is "
+                                        "not part of this collection's "
+                                        "documented property surface (Count and "
+                                        "the `.Length` alias), a declared "
+                                        "method/LINQ operator (call or bare "
+                                        "reference, language spec \xC2\xA7"
+                                        "27.6), or a universal `ToString`/"
+                                        "`Equals`/`GetHashCode`/`GetType` "
+                                        "member (language spec \xC2\xA7""8.1)");
+                                return;
+                            }
                         }
                     }
                 }
