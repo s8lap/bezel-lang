@@ -1159,6 +1159,47 @@ once; every lane brief carries the build gate (`available` ≥ 6, then `-j 4`, n
 the coordinator dispatches in **pairs with a stagger**, never the whole pool in one burst; a
 lane that waits is alive; a lane that dies delivers nothing.
 
+### ⚠ `rg` IS NOT INSTALLED IN THIS ENVIRONMENT — AND A LANE WILL REACH FOR IT
+
+**MEASURED 2026-11-04 14:46–14:52.** The #8061 fix-forward's reviewer lane
+(`r38-c2-review-8061ff`) ran `rg -n --no-heading -g '*.cpp' -g '*.hpp'
+'stdlib §[0-9.]+' src tests`, got **`rg: command not found`** three times, fell
+back to `grep -rn` over the whole tree, and **timed out at 120 s** — twice —
+losing the better part of its turn to a tool that does not exist. The other
+six lanes had not hit it yet; any of them could.
+
+**⇒ ⇒ ⇒ A `rg` SHIM NOW EXISTS AT `/home/stepan/.local/bin/rg`** — a shell
+script over `git grep` (index-backed, so the same sweep runs in **0.15 s**)
+with a `grep -r` fallback outside a work tree. It supports the subset lanes
+use: `-n`, `--no-heading`, `--no-line-number`, `-i`, `-F`, `-l`, `-c`,
+`--count-matches`, `--hidden`, `-e/--regexp`, `-g/--glob`, a pattern on
+stdin, and **searching stdin** when no path is given (so
+`rg … | rg …` pipelines behave). It is **not** ripgrep: no `-P`/PCRE, no
+`--json`, no multiline.
+
+**⇒ `/home/stepan/.local/bin` IS ON EVERY LANE'S `PATH`** (it is the third
+entry), so the shim applies to lanes **already running** and to every lane
+dispatched after it.
+
+**⇒ ⇒ ⇒ ⇒ TWO RULES FOR LANE BRIEFS, THEN:**
+1. **A lane brief may say `rg` — the shim makes it work.** But a brief that
+   tells a lane to sweep the whole tree should ALSO name the fast form:
+   **`git grep -n --no-heading -E 'PATTERN' -- '*.cpp' '*.hpp' src tests`**,
+   and should say **raise the timeout on a big sweep** (`timeout: 600000`).
+2. **⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND A BRIEF MUST NOT ASK A LANE TO RE-DERIVE A SWEEP THAT THE
+   COMMIT UNDER REVIEW ALREADY MEASURED.** The #8061 brief asked for a
+   spot-check; the lane's own report listed the 115 candidate sites and the
+   reason for each of the 97 left alone. **⇒ THE REVIEWER'S JOB WAS MINUTES OF
+   SPOT-CHECKING, AND IT SPENT ITS TURN REBUILDING THE SWEEP.** ⇒ Point a
+   reviewer at the lane's report and at the commit's own `--numstat`/`--stat`,
+   not at the tree.
+
+**⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND IF A LANE IS SILENT FOR A WHILE, LOOK FOR A TOOL WALL
+BEFORE YOU CALL IT STUCK.** A lane with no output for minutes is usually
+mid-reasoning or mid-sweep — but a lane whose log shows `command not found`
+or repeated `timeout` messages is blocked, not thinking, and it needs a
+follow-up (deliver it with `scripts/lane_dispatch.sh --resume <session-id>`).
+
 ### Gate protocol
 
 1. **Never launch a gate you expect to fail.** Run every targeted filter for
