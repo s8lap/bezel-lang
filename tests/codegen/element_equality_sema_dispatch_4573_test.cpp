@@ -661,10 +661,18 @@ BEZEL_TEST(element_equality_sema_dispatch_4573, control_array_nullable_int_spec_
 }
 
 // stdlib §2.5: `DateTime` is a scalar i64 value builtin — already correct.
+//
+// FLIPPED by fix #7984 (§26.5 rule 1, §27.1, §27.7, v0.355; stdlib §2.5):
+// `DateTime.UtcNow` is declared `public static readonly property UtcNow:
+// DateTime;`, so the CALL spelling `DateTime.UtcNow()` is a call through the
+// property's VALUE — a `DateTime`, not a function — and it has no candidate.
+// The PROPERTY READ is the spelling §2.5 declares, and it still yields the
+// current UTC instant, so the row's subject (the `Array<DateTime>` element
+// dispatch) is unchanged.
 BEZEL_TEST(element_equality_sema_dispatch_4573, control_array_datetime_spec_2_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var d: DateTime := DateTime.UtcNow(); "
+        "  var d: DateTime := DateTime.UtcNow; "
         "  var a: Array<DateTime> := [d]; "
         "  if a.Contains(d) then return 1; end; "
         "  return 0; "

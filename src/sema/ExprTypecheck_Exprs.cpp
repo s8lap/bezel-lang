@@ -3244,6 +3244,45 @@ void ExprTC::resolveMemberAccessWithRule1(const ast::MemberAccessExpr& ma) {
                 return;
             }
         }
+        // (c) a STATIC built-in property (`Environment.NewLine(...)`). The
+        // receiver is a TYPE PATH, not a value: it carries no expression
+        // type, and the head it names is the class that declares the
+        // property. A USER class of the same name is excluded — its own
+        // declared surface answers.
+        //
+        // Only a STATIC property is refused here: the stdlib declares
+        // `NewLine`, `UtcNow`, `Zero`, ... as `public static readonly
+        // property`, and those are the ones a TYPE PATH can reach. A type
+        // path naming an INSTANCE property (`Array<int>.Count`) is a
+        // different shape — the type-qualified reference #7489 owns — and is
+        // left alone here.
+        if (!ctx_.exprType(*ma.target) &&
+            !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target))) {
+            std::string_view head;
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(ma.target.get()))
+                head = id->name;
+            else if (auto* q = dynamic_cast<const ast::MemberAccessExpr*>(
+                         ma.target.get()))
+                head = q->member;
+            if (!head.empty()) {
+                const common::BuiltinPropertyDecl* d =
+                    common::builtinDeclaredProperty(head, ma.member);
+                if (d && d->isStatic) {
+                    auto loc = ma.span.begin;
+                    if (loc.line == 0) loc = ma.target->span.begin;
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        common::propertyCalledAsMethodMessage(
+                            ma.member, head,
+                            std::string("stdlib \xC2\xA7") +
+                                std::string(d->section) + ": `" +
+                                std::string(d->member) + ": " +
+                                std::string(d->type) + "`"));
+                    return;
+                }
+            }
+        }
     }
 }
 
