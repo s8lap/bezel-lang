@@ -28,7 +28,7 @@
 //     end Main;
 //   end Program;
 //
-// Prints "<109>\n" pre-fix; expected "<m>\n" per stdlib §8.5 (char.ToString()
+// Prints "<109>\n" pre-fix; expected "<m>\n" per stdlib §9.5 (char.ToString()
 // is the character itself) — identical to #5024's own `boxcls` repro, just
 // through an INHERITED (not directly-declared) `Apply`.
 //
@@ -69,7 +69,7 @@
 
 using bezel::test::runAot;
 
-// #5094 (§14.1, §14.5 phase 2, §12.7, §18.5, stdlib §8.5, v0.307): the
+// #5094 (§14.1, §14.5 phase 2, §12.7, §18.5, stdlib §9.5, v0.307): the
 // issue's own repro — a generic subclass (`SubBox<T>: Box<T>`) that simply
 // passes its own type parameter through to the base, called from inside an
 // enclosing generic method (`Go<U>`) so the concrete type (`char`) is only
@@ -138,7 +138,7 @@ BEZEL_TEST(subclass_inherited_generic_method_char_enum_interpolation_5094,
     BEZEL_EXPECT_EQ(r.stdoutText, "<99>\n");
 }
 
-// #5094 (§14.1, §12.7, §18.5, stdlib §8.5, v0.307): a FIXED base argument —
+// #5094 (§14.1, §12.7, §18.5, stdlib §9.5, v0.307): a FIXED base argument —
 // a non-generic subclass that instantiates the generic base at a concrete
 // `char` written directly in its own base clause (`CharBox: Box<char>`,
 // mirroring the issue body's own `IntBox: Box<char>` example). No enclosing
@@ -170,7 +170,7 @@ BEZEL_TEST(subclass_inherited_generic_method_char_enum_interpolation_5094,
     BEZEL_EXPECT_EQ(r.stdoutText, "<z>\n");
 }
 
-// #5094 (§14.1, §12.7, §18.5, stdlib §8.5, v0.307): a REORDERED base-clause
+// #5094 (§14.1, §12.7, §18.5, stdlib §9.5, v0.307): a REORDERED base-clause
 // parameter — the derived class declares its OWN two type parameters (`A`,
 // `B`) and instantiates the base with the SECOND one (`Wrap<A,B>: Box<B>`),
 // mirroring the issue body's own `Pair2<A,B>: Base<B>` example. A walk that
@@ -211,7 +211,7 @@ BEZEL_TEST(subclass_inherited_generic_method_char_enum_interpolation_5094,
     BEZEL_EXPECT_EQ(r.stdoutText, "<q>\n");
 }
 
-// #5094 (§14.1, §12.7, §12.9, §18.5, stdlib §8.5, v0.307): a TWO-LEVEL
+// #5094 (§14.1, §12.7, §12.9, §18.5, stdlib §9.5, v0.307): a TWO-LEVEL
 // inheritance chain (`DeepBox<T>: MidBox<T>: Box<T>`) — `ms->parent` (`Box`)
 // is neither `DeepBox` (the receiver's static type) nor its immediate base
 // (`MidBox`), so the fix's base-chain walk must cross two `baseTypeRefs`

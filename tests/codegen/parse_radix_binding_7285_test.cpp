@@ -383,7 +383,7 @@ BEZEL_TEST(parse_radix_binding_7285, named_uint_literal_radix_still_parses_hex) 
     BEZEL_EXPECT_EQ(parseOut("", "radix := 16u"), std::string("255\n"));
 }
 
-// A CLASS-LEVEL `const` (stdlib §22.12) is a §17.14 constant too — its
+// A CLASS-LEVEL `const` (spec §22.12) is a §17.14 constant too — its
 // value reaches the radix through `ConstMemberSymbol::intValue`.
 BEZEL_TEST(parse_radix_binding_7285, class_const_radix_still_parses_hex) {
     std::string prog =
@@ -705,7 +705,7 @@ namespace {
 
 namespace fs7285 = std::filesystem;
 
-// The library module: a class-level `const` (stdlib §22.12) of a `uint`
+// The library module: a class-level `const` (spec §22.12) of a `uint`
 // type — a type that reaches an `int` parameter only by §5.1's constant
 // narrowing, so the fold must carry its VALUE across the module boundary.
 const char* kImportedConstLib7285 =

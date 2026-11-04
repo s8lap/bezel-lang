@@ -1,5 +1,5 @@
 // Direct unit tests for bz_args_array's argv -> Array<string> construction
-// (stdlib §33.4, language spec §33.2 / §33.6).
+// (spec §33.4, language spec §33.2 / §33.6).
 //
 // Root cause (2026-07-12 hardening wave, follow-up to #1762 finding R1 — see
 // also tests/runtime/fileio_read_all_error_paths_test.cpp):

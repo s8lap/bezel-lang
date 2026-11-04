@@ -1,8 +1,8 @@
-// fix #4728 (spec §29.1, stdlib §5 + §11.1 Average widening, v0.305):
+// fix #4728 (spec §29.1, stdlib §5 / spec §5.1 Average widening, v0.305):
 // `IEnumerable<byte>.Average()` must NOT sign-extend its unsigned element
 // through the sum-then-divide accumulator before widening to `double`.
 // §5 declares `Average(): double` for every numeric primitive element;
-// stdlib §11.1's narrowing/widening table promotes a `byte` element to
+// spec §5.1's narrowing/widening table promotes a `byte` element to
 // `double` BEFORE the sum, not through a SIGNED `int` intermediate — the
 // accumulator's job is to preserve the element's numeric value, not to
 // fold it through `i32` first.

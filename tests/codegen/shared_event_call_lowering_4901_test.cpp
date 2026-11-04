@@ -875,7 +875,7 @@ BEZEL_TEST(codegen_shared_event_call_lowering_4901,
 // the `(int) -> ()` target and picks `On(int)` — the codegen gate now
 // (fix #4978 / §27.6, v0.313) honours the selector-chosen overload,
 // so `+=` admits an overload group the same way `.Subscribe`/`.Add` do.
-// String-first ordering (stdlib §27.6: "declared first" binding).
+// String-first ordering (spec §27.6: "declared first" binding).
 BEZEL_TEST(codegen_shared_event_call_lowering_4901,
            plus_eq_overloaded_static_group_accepted_and_runs) {
     BEZEL_EXPECT_EQ(runAotOut(

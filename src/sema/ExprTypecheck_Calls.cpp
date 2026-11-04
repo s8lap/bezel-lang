@@ -1292,7 +1292,7 @@ bool reportHashKeyInlineArrayLiteral(DiagnosticEngine& diags,
 //     — NOT `SortedDictionary`, fix #3831, §15.4's target list is closed)
 //     — matched by name in codegen's materializeHeapCollectionLiteral /
 //     materializeHeapDictLiteral;
-//   * a user type that declared `FromCollectionLiteral` (stdlib §15.4 — the
+//   * a user type that declared `FromCollectionLiteral` (spec §15.4 — the
 //     user hook for materialising a literal into their own type).
 // A collection INTERFACE is deliberately NOT admissible (see
 // isCollectionLiteralInterfaceTarget). Declared in ExprTypecheck_impl.hpp —
@@ -9182,7 +9182,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // class async-lambda body infers `OwningTask<C>` against
                     // a declared `(A) -> Task<R>` slot, and `OwningTask<C>`
                     // reaches no instantiation of `Task<T>` (siblings under
-                    // `Task`, stdlib §30.3), so R is never bound. Before this
+                    // `Task`, spec §30.3), so R is never bound. Before this
                     // check the call proceeded anyway: `collectBoundParamNames`
                     // (consulted only by `inferReturnTargetTypeArgs`, far
                     // below in this file) treats ANY syntactic mention inside
@@ -26750,7 +26750,7 @@ void ExprTC::checkBuiltinNamedArgs(const ast::CallExpr& ce, Symbol* calleeSym) {
 // the lowering ignores surplus arguments (`q.Peek(1)`, `st.Peek(1)`) —
 // compiled and DROPPED the argument.
 //
-// stdlib §26.5 rule 1 (block-by-name) makes the instance member the only
+// spec §26.5 rule 1 (block-by-name) makes the instance member the only
 // candidate "by name — any arity, applicability, or accessibility", so a call
 // whose argument count no declared overload takes has no candidate and is a
 // compile error (§22.6).
@@ -35205,7 +35205,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
                         return;
                     }
-                    // int.TryParse(s, out result): bool — §3.4/stdlib §5.2
+                    // int.TryParse(s, out result): bool — §3.4/stdlib §9.1
                     if (mbr == "TryParse") {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                         return;

@@ -119,7 +119,7 @@ using ParseRadixResolver =
 // it so (`LocalSymbol::isCompileTimeConst`): a RUNTIME `const` — a
 // single-assignment binding with a non-constant initializer — is not one, and
 // §5.1's constant narrowing does not reach it. A class-level `const`
-// (stdlib §22.12) always is; sema recorded its typed integer value
+// (spec §22.12) always is; sema recorded its typed integer value
 // (`ConstMemberSymbol::intValue`), and ModuleLoader carried it for an
 // IMPORTED const (whose AST decl does not exist).
 std::optional<long long> parseRadixConstSymbolValue(

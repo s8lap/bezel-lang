@@ -369,7 +369,7 @@ BEZEL_TEST(minornull_maxornull_nonarray_terminal_3764,
 
 BEZEL_TEST(minornull_maxornull_nonarray_terminal_3764,
            sortedset_class_element_leak_free_200x) {
-    // Elements are BORROWED by the SortedSet (stdlib §28.11's borrow-slot
+    // Elements are BORROWED by the SortedSet (spec §28.11's borrow-slot
     // row); each `Box` is disposed exactly once by its own `using var`, never
     // by the set and never by the terminal's snapshot — mirrors
     // `sortedset_class_elements_terminals_leak_free_200x` in the #3735 file.

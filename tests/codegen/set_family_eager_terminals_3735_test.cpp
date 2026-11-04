@@ -488,7 +488,7 @@ BEZEL_TEST(set_family_eager_terminals_3735,
 
 BEZEL_TEST(set_family_eager_terminals_3735,
            sortedset_class_elements_terminals_leak_free_200x) {
-    // Elements are BORROWED by the SortedSet (stdlib §28.11's borrow-slot
+    // Elements are BORROWED by the SortedSet (spec §28.11's borrow-slot
     // row); each `Box` is disposed exactly once by its own `using var`, never
     // by the set and never by the terminal's snapshot.
     auto r = runAotChecked(prog(

@@ -319,7 +319,7 @@ BEZEL_TEST(range_dict_key_6207,
                         "    return 0;\n"));
 }
 
-// The same §8.3 pair across the BOXED spelling (stdlib §8.6): `a.GetHashCode()`
+// The same §8.3 pair across the BOXED spelling (spec §8.6): `a.GetHashCode()`
 // on the unboxed value must equal `GetHashCode()` on a `Range` boxed into a
 // class field, which is what makes the trampoline's arm agree with the box
 // vtable thunk #4126 built. Pre-fix the dictionary half was a SEGV, so this row

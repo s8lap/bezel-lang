@@ -5,7 +5,7 @@
 // (see `char_repeat_is_rejected.bzl` for why the extractor's automatic
 // resolution is unsafe for this file's `checkBody` name specifically).
 //
-// §3.4 / stdlib §5.2: int.Parse(s: string): int — recognized.
+// §3.4 / stdlib §9.1: int.Parse(s: string): int — recognized.
 //
 // Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
 //

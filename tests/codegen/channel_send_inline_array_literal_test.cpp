@@ -3,7 +3,7 @@
 //
 // WHAT THE DOCUMENTS REQUIRE.
 //
-//   Stdlib §6.9: `ChannelSender<T>.Send(owned item: T)` — stdlib §15.4
+//   Stdlib §6.9: `ChannelSender<T>.Send(owned item: T)` — spec §15.4
 //   (collection literals) admits a collection literal "via the parameter type of
 //   a method call", so `tr.Send([1, 2, 3])` on a `ChannelSender<[3]int>` is
 //   normative syntax.

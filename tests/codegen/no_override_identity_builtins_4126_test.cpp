@@ -225,7 +225,7 @@ BEZEL_TEST(no_override_identity_4126,
 }
 
 // ═══════════ Guid.GetHashCode() — a genuine missing dedicated handler ═════
-// stdlib §8.3: two Guids that compare Equal (bz_guid_equals: bytewise) MUST
+// spec §8.3: two Guids that compare Equal (bz_guid_equals: bytewise) MUST
 // hash identically. Guid.Empty.GetHashCode() is a KNOWN, hand-computable
 // value under the new `bz_guid_hash`'s FNV-style fold (h=17; h=h*31+word,
 // four times, all words zero): 17 * 31^4 = 17 * 923521 = 15699857. Asserting

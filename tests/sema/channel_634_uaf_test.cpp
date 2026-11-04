@@ -324,7 +324,7 @@ BEZEL_TEST(channel_634_uaf, l3_interleaved_dispose_no_crash_30_15) {
 }
 
 // ---------------------------------------------------------------------------
-// #4318 — stdlib §30.15 v0.315: Channel<T> and ChannelSender<T> are
+// #4318 — spec §30.15 v0.315: Channel<T> and ChannelSender<T> are
 // null-declaration builtins that skip their own where T: sendable constraint.
 // Before fix: no constraint check fired. Fix adds kNullDeclSendableConstraints
 // to TypeResolution_Names.cpp so the sendable constraint is checked.

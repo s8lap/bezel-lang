@@ -7,7 +7,7 @@
 // (see `char_repeat_is_rejected.bzl` for why the extractor's automatic
 // resolution is unsafe for this file's `checkBody` name specifically).
 //
-// §3.4 / stdlib §5.2: long has no static method `Quux`.
+// §3.4 / stdlib §9.1: long has no static method `Quux`.
 
 module M; class C public static method Main(): int var x := long.Quux(1); return 0; end Main; end C;
 

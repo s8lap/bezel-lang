@@ -135,7 +135,7 @@ struct Failed {
 // name is either tested here or explicitly noted as out of scope.
 const std::vector<BuiltinCase>& registryCases() {
     static const std::vector<BuiltinCase> kCases = {
-        // ── Exception types (stdlib §31.4) — all `new T("msg")` ─────────
+        // ── Exception types (spec §31.4) — all `new T("msg")` ─────────
         {"Exception",                       "import System.Threading; ", "var e := new Exception(\"x\");", "e"},
         {"ArgumentException",               "import System.Threading; ", "var e := new ArgumentException(\"x\", \"p\");", "e"},
         {"ArgumentNullException",           "import System.Threading; ", "var e := new ArgumentNullException(\"p\");", "e"},

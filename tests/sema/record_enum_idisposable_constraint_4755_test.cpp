@@ -1,6 +1,6 @@
 // Regression tests for issue #4755 — §9.7 (v0.307): records and enums can
 // never implement `IDisposable`/`IAsyncDisposable` (only classes implement them,
-// implicitly per stdlib §28.2). The builtin interfaces resolve to a Named
+// implicitly per spec §28.2). The builtin interfaces resolve to a Named
 // TypeRef WITHOUT a synthesized declaration, so without the fix the call-site
 // constraint checker fell through the type-parameter-bound branch (which defers
 // on builtin interfaces) to the decl-null defer below, silently accepting the
@@ -23,7 +23,7 @@
 // DIAGNOSTIC FORMAT (per ExprTypecheck_Calls.cpp:4664-4679):
 //   "type argument `XXX` does not satisfy the constraint `where T: YYY` (§14.2)"
 //
-// Authority: spec §9.7 (v0.307), stdlib §28.2.
+// Authority: spec §9.7 (v0.307), spec §28.2.
 //
 // SCOPE. Covers both halves of the fix:
 //   * record type argument rejected (call site AND type instantiation)
@@ -175,7 +175,7 @@ BEZEL_TEST(record_idisposable_constraint_4755,
 
 // ══════════════ ACCEPT controls (fix must not break these) ════════════════════════
 
-// §9.7 / stdlib §28.2: a CLASS is the only valid substitution for
+// §9.7 / spec §28.2: a CLASS is the only valid substitution for
 // `where T: IDisposable`. Every class implicitly implements IDisposable
 // (§28.2), so a plain class is accepted. Uses runAot to exercise the
 // full end-to-end path. Negative guard: no constraint-not-satisfied

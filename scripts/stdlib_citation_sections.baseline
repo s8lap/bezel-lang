@@ -16,10 +16,9 @@
 # -- and NO line number, because a line-numbered key would fail the
 # gate on every unrelated commit that moved a comment.
 #
-count: 473
+count: 441
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	IOwningEnumerable	4.5
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	Range	4.4
-site:	src/codegen/LlvmBackend_Calls.cpp	no-such-section	11.1	11.1
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	2.7
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	4.5
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	5
@@ -34,7 +33,6 @@ site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Math	2.5
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Range	2.1
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	ReadOnlyStringSpan	3.1
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Value	4.8
-site:	src/codegen/LlvmBackend_Calls2.cpp	no-such-section	22.12	22.12
 site:	src/codegen/LlvmBackend_Calls2.cpp	wrong-section	CString	10.4
 site:	src/codegen/LlvmBackend_Calls2.cpp	wrong-section	IComparable	9.6
 site:	src/codegen/LlvmBackend_Calls2.cpp	wrong-section	IDisposable	2.7
@@ -50,15 +48,14 @@ site:	src/codegen/LlvmBackend_Calls3.cpp	wrong-section	Set	5
 site:	src/codegen/LlvmBackend_Calls3.cpp	wrong-section	Split	5
 site:	src/codegen/LlvmBackend_Disposal.cpp	wrong-section	IOwningList	4.5
 site:	src/codegen/LlvmBackend_Disposal.cpp	wrong-section	OwningLinkedList	4.2
-site:	src/codegen/LlvmBackend_Exprs.cpp	no-such-section	22.12	22.12
 site:	src/codegen/LlvmBackend_Exprs2.cpp	wrong-section	OwningBuffer	1
 site:	src/codegen/LlvmBackend_Exprs2.cpp	wrong-section	Set	1
 site:	src/codegen/LlvmBackend_Layout.cpp	wrong-section	IEnumerable	2.8
 site:	src/codegen/LlvmBackend_Layout.cpp	wrong-section	IEnumerable	9.6
-site:	src/codegen/LlvmBackend_Setup.cpp	no-such-section	28.14	28.14
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	Array	10
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	Array	4.1
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	Array	5
+site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	Array	9.6
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	CString	9.6
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	Equals	2.5
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	IEnumerable	2.1
@@ -108,11 +105,7 @@ site:	src/sema/ExprTypecheck.cpp	wrong-section	Array	5
 site:	src/sema/ExprTypecheck.cpp	wrong-section	IDisposable	4.12
 site:	src/sema/ExprTypecheck.cpp	wrong-section	JsonOptions	3.3
 site:	src/sema/ExprTypecheck.cpp	wrong-section	MaxValue	1
-site:	src/sema/ExprTypecheck_Calls.cpp	no-such-section	15.4	15.4
 site:	src/sema/ExprTypecheck_Calls.cpp	no-such-section	22.5	22.5
-site:	src/sema/ExprTypecheck_Calls.cpp	no-such-section	26.5	26.5
-site:	src/sema/ExprTypecheck_Calls.cpp	no-such-section	30.3	30.3
-site:	src/sema/ExprTypecheck_Calls.cpp	no-such-section	5.2	5.2
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	Array	3.1
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	Array	5
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	Channel	6.5
@@ -162,6 +155,7 @@ site:	tests/codegen/array_lastindexof_7671_test.cpp	wrong-section	Equals	4.4
 site:	tests/codegen/array_local_bound_to_interface_and_object_no_leak_spec_28_2_4913_test.cpp	wrong-section	Array	4.1
 site:	tests/codegen/array_minmax_iface_elem_2770_test.cpp	wrong-section	CompareTo	2.8
 site:	tests/codegen/array_minmax_iface_elem_2770_test.cpp	wrong-section	IComparable	5.1
+site:	tests/codegen/array_minmax_value_elem_result_type_8092_test.cpp	wrong-section	IComparable	5.1
 site:	tests/codegen/array_minornull_maxornull_inferred_var_3784_test.cpp	wrong-section	Where	5.1
 site:	tests/codegen/array_reverse_chain_466_test.cpp	wrong-section	IEnumerable	3
 site:	tests/codegen/array_reversed_sorted_472_test.cpp	wrong-section	Array	3
@@ -174,7 +168,6 @@ site:	tests/codegen/array_span_549_test.cpp	wrong-section	OwningArray	4.2
 site:	tests/codegen/async_451_test.cpp	wrong-section	OwningArray	6.7
 site:	tests/codegen/async_task_intrinsic_collection_result_2279_test.cpp	wrong-section	Set	4.18
 site:	tests/codegen/async_using_var_await_dispose_910_test.cpp	wrong-section	OwningArray	3.1
-site:	tests/codegen/average_unsigned_element_no_sign_extension_4728_test.cpp	no-such-section	11.1	11.1
 site:	tests/codegen/await_using_builtin_head_disposal_3449_test.cpp	wrong-section	IAsyncDisposable	6.10
 site:	tests/codegen/base_tostring_1106_test.cpp	wrong-section	ToString	2.13
 site:	tests/codegen/borrowing_collection_clear_receiver_leak_8025_test.cpp	wrong-section	Queue	4.6
@@ -185,13 +178,9 @@ site:	tests/codegen/builtin_explicit_dispose_vtableless_2921_test.cpp	wrong-sect
 site:	tests/codegen/builtin_fs_env_arity_7933_test.cpp	wrong-section	Dictionary	2.4
 site:	tests/codegen/builtin_interface_value_1115_test.cpp	wrong-section	IEqualityComparer	5
 site:	tests/codegen/builtin_interpolation_iface_head_2969_test.cpp	wrong-section	IEnumerable	4.3
-site:	tests/codegen/builtin_member_population_2998_test.cpp	no-such-section	31.4	31.4
-site:	tests/codegen/capture_cell_scoped_call_2334_test.cpp	no-such-section	28.14	28.14
-site:	tests/codegen/captured_var_and_generic_class_method_char_enum_interpolation_5024_test.cpp	no-such-section	8.5	8.5
 site:	tests/codegen/chain_split_todict_2151_test.cpp	wrong-section	Array	5
 site:	tests/codegen/channel_receive_abandonment_1524_test.cpp	wrong-section	Task	6.9
 site:	tests/codegen/channel_recv_all_1724_test.cpp	wrong-section	IOwningAsyncEnumerable	6.9
-site:	tests/codegen/channel_send_inline_array_literal_test.cpp	no-such-section	15.4	15.4
 site:	tests/codegen/checked_cast_reinterpret_753_test.cpp	wrong-section	MaxValue	2.12
 site:	tests/codegen/checked_cast_reinterpret_753_test.cpp	wrong-section	MinValue	2.12
 site:	tests/codegen/choice_unknown_member_reject_2496_test.cpp	wrong-section	Error	2.20
@@ -203,7 +192,6 @@ site:	tests/codegen/collection_method_group_signature_7098_test.cpp	wrong-sectio
 site:	tests/codegen/collection_task_add_appends_2999_test.cpp	wrong-section	Task	4.4
 site:	tests/codegen/concrete_is_as_decision_4858_test.cpp	wrong-section	IEquatable	9.6
 site:	tests/codegen/console_append_builtin_render_6753_test.cpp	wrong-section	StringBuilder	2.1
-site:	tests/codegen/console_write_class_record_interface_to_string_2878_test.cpp	no-such-section	28.9	28.9
 site:	tests/codegen/cstring_tobytes_1000_test.cpp	wrong-section	Count	10.1
 site:	tests/codegen/ctor_type_class_defaulted_sibling_4790_test.cpp	wrong-section	IEquatable	9.4
 site:	tests/codegen/datetime_render_everywhere_6806_test.cpp	wrong-section	DateTime	3.1
@@ -239,7 +227,6 @@ site:	tests/codegen/frozen_array_from_borrowed_lvalue_4850_test.cpp	wrong-sectio
 site:	tests/codegen/generic_bare_typeparam_compareto_reject_2480_test.cpp	wrong-section	IComparable	5
 site:	tests/codegen/generic_value_method_515_516_test.cpp	wrong-section	ToString	5
 site:	tests/codegen/guid_tostring_format_1989_stdlib_2_6_test.cpp	wrong-section	Guid	2.18
-site:	tests/codegen/inferred_lambda_param_char_enum_interpolation_4896_test.cpp	no-such-section	8.5	8.5
 site:	tests/codegen/inferred_lambda_param_char_enum_interpolation_4896_test.cpp	wrong-section	ToString	2.13
 site:	tests/codegen/interface_head_dispose_2970_test.cpp	wrong-section	IDisposable	4.1
 site:	tests/codegen/interface_head_dispose_2970_test.cpp	wrong-section	IDisposable	4.2
@@ -269,12 +256,10 @@ site:	tests/codegen/math_narrowed_result_7460_test.cpp	wrong-section	IComparable
 site:	tests/codegen/math_sign_unsigned_6925_test.cpp	wrong-section	INumber	2.2
 site:	tests/codegen/math_timespan_ordered_7900_test.cpp	wrong-section	IComparable	2.2
 site:	tests/codegen/membership_query_boxing_4619_test.cpp	wrong-section	ArraySpan	4.14
-site:	tests/codegen/minornull_maxornull_nonarray_terminal_3764_test.cpp	no-such-section	28.11	28.11
 site:	tests/codegen/multitype_catch_ncb_593_test.cpp	wrong-section	TimeoutException	7.4
 site:	tests/codegen/named_arg_single_evaluation_7292_test.cpp	wrong-section	IComparable	2.2
 site:	tests/codegen/narrow_element_aggregation_4695_test.cpp	wrong-section	Array	5.1
 site:	tests/codegen/narrow_element_aggregation_4695_test.cpp	wrong-section	MaxValue	5.1
-site:	tests/codegen/no_override_identity_builtins_4126_test.cpp	no-such-section	8.3	8.3
 site:	tests/codegen/nullable_receiver_tostring_format_7319_test.cpp	wrong-section	DateTime	2.18
 site:	tests/codegen/nullcond_dispose_vtableless_4209_test.cpp	wrong-section	IDisposable	1
 site:	tests/codegen/owned_collection_disposal_test.cpp	wrong-section	Array	4.5
@@ -286,18 +271,14 @@ site:	tests/codegen/owned_iter_field_disposal_1643_test.cpp	wrong-section	IDispo
 site:	tests/codegen/ownedbuffer_span_636_test.cpp	wrong-section	OwningBuffer	2.15
 site:	tests/codegen/owning_collection_member_access_5466_test.cpp	wrong-section	OwningSet	4.2
 site:	tests/codegen/parse_first_arg_7294_test.cpp	wrong-section	ReadOnlyStringSpan	9.1
-site:	tests/codegen/parse_radix_binding_7285_test.cpp	no-such-section	22.12	22.12
 site:	tests/codegen/parse_tryparse_class_instance_first_arg_7290_test.cpp	wrong-section	ReadOnlyStringSpan	9.1
 site:	tests/codegen/parse_tryparse_float_first_arg_7293_test.cpp	wrong-section	ReadOnlyStringSpan	9.2
 site:	tests/codegen/primitive_compareto_586_test.cpp	wrong-section	IEquatable	9.1
 site:	tests/codegen/primitive_equals_constraint_863_test.cpp	wrong-section	IEquatable	9.1
-site:	tests/codegen/range_dict_key_6207_test.cpp	no-such-section	8.6	8.6
 site:	tests/codegen/range_dict_key_6207_test.cpp	wrong-section	Range	4.17
 site:	tests/codegen/sb_append_function_value_7592_test.cpp	wrong-section	Array	3.1
 site:	tests/codegen/selectmany_range_selector_775_test.cpp	wrong-section	Range	5
-site:	tests/codegen/set_family_eager_terminals_3735_test.cpp	no-such-section	28.11	28.11
 site:	tests/codegen/set_family_eager_terminals_3735_test.cpp	wrong-section	Set	5
-site:	tests/codegen/shared_event_call_lowering_4901_test.cpp	no-such-section	27.6	27.6
 site:	tests/codegen/shared_sync_689_contention_test.cpp	wrong-section	Task	6.8
 site:	tests/codegen/sorted_1426_test.cpp	wrong-section	GetEnumerator	4.18
 site:	tests/codegen/sorted_dict_1406_test.cpp	wrong-section	DictionaryEntry	4.17
@@ -325,20 +306,18 @@ site:	tests/codegen/string_asspan_byte_start_7106_test.cpp	wrong-section	ReadOnl
 site:	tests/codegen/string_builtin_iface_dispatch_2752_test.cpp	wrong-section	IComparable	2.2
 site:	tests/codegen/string_from_ffi_buffer_2734_test.cpp	wrong-section	IntPtr	9.6
 site:	tests/codegen/string_join_items_gate_7167_test.cpp	wrong-section	IEnumerable	9.6
+site:	tests/codegen/string_nullsafe_owned_result_8124_test.cpp	wrong-section	Array	9.6
 site:	tests/codegen/string_pad_center_7133_test.cpp	wrong-section	ArgumentOutOfRangeException	9.6
 site:	tests/codegen/string_repeat_pad_range_7120_test.cpp	wrong-section	ArgumentOutOfRangeException	9.6
 site:	tests/codegen/string_trim_chars_string_arg_7492_test.cpp	wrong-section	IEnumerable	9.6
 site:	tests/codegen/string_trim_chars_temp_array_leak_7522_test.cpp	wrong-section	IEnumerable	9.6
-site:	tests/codegen/string_trim_ienumerable_chars_7521_test.cpp	no-such-section	21.9	21.9
 site:	tests/codegen/string_trim_ienumerable_chars_7521_test.cpp	wrong-section	Array	5
 site:	tests/codegen/string_trim_ienumerable_chars_7521_test.cpp	wrong-section	Array	9.6
 site:	tests/codegen/string_trim_ienumerable_chars_7521_test.cpp	wrong-section	IEnumerable	4.5
 site:	tests/codegen/stringbuilder_negative_capacity_leak_4884_test.cpp	wrong-section	StringBuilder	1
-site:	tests/codegen/subclass_inherited_generic_method_char_enum_interpolation_5094_test.cpp	no-such-section	8.5	8.5
 site:	tests/codegen/sum_constraint_rejects_non_inumber_4730_test.cpp	wrong-section	Array	5
 site:	tests/codegen/sum_constraint_rejects_non_inumber_4730_test.cpp	wrong-section	INumber	5
 site:	tests/codegen/timespan_tostring_c_form_6720_stdlib_2_18_test.cpp	wrong-section	TimeSpan	2.18
-site:	tests/codegen/uint_radix_rejected_7271_test.cpp	no-such-section	22.12	22.12
 site:	tests/module/imported_builtin_property_typing_2374_test.cpp	wrong-section	Array	4.1
 site:	tests/module/math_imported_time_name_7900_test.cpp	wrong-section	IComparable	2.2
 site:	tests/module/xmod_class_comparator_collision_3512_test.cpp	wrong-section	CompareTo	4.17
@@ -359,7 +338,6 @@ site:	tests/ownership/span_field_store_1251_test.cpp	wrong-section	Array	4.15
 site:	tests/ownership/static_interface_constraint_disposal_1425_test.cpp	wrong-section	Zero	2.19
 site:	tests/ownership/vacuous_lint_cstring_to_bytes_2826_test.cpp	wrong-section	Array	10.1
 site:	tests/ownership/vacuous_lint_materializer_remedy_2709_test.cpp	wrong-section	Array	5
-site:	tests/runtime/args_array_oom_hardening_2234_test.cpp	no-such-section	33.4	33.4
 site:	tests/sema/builtin_call_admission_7372_test.cpp	wrong-section	ReadOnlyStringSpan	9.1
 site:	tests/sema/builtin_collection_to_primitive_4760_test.cpp	wrong-section	IOwningEnumerable	4.5
 site:	tests/sema/builtin_ctor_named_arg_binding_3425_test.cpp	wrong-section	Array	4.2
@@ -373,8 +351,6 @@ site:	tests/sema/builtin_named_kind_entity_8015_test.cpp	wrong-section	Range	9.6
 site:	tests/sema/builtin_named_kind_entity_8015_test.cpp	wrong-section	ReadOnlyStringSpan	9.1
 site:	tests/sema/builtin_out_var_untyped_recipient_5332_test.cpp	wrong-section	OwningSet	4.2
 site:	tests/sema/builtin_span_slice_nullable_arg_2601_test.cpp	wrong-section	Insert	3.3
-site:	tests/sema/channel_634_uaf_test.cpp	no-such-section	30.15	30.15
-site:	tests/sema/collection_element_move_only_3775_test.cpp	no-such-section	14.4	14.4
 site:	tests/sema/collection_element_move_only_3775_test.cpp	wrong-section	SortedSet	4.12
 site:	tests/sema/compiler_known_base_closed_5636_test.cpp	wrong-section	Stream	1
 site:	tests/sema/constraint_collection_member_7086_test.cpp	wrong-section	Add	4.1
@@ -404,7 +380,6 @@ site:	tests/sema/primitive_builtin_iface_generic_arg_1867_test.cpp	wrong-section
 site:	tests/sema/primitive_builtin_iface_generic_arg_1867_test.cpp	wrong-section	IComparable	9.6
 site:	tests/sema/primitive_builtin_iface_generic_arg_1867_test.cpp	wrong-section	IEquatable	9.1
 site:	tests/sema/primitive_builtin_iface_generic_arg_1867_test.cpp	wrong-section	IEquatable	9.4
-site:	tests/sema/record_enum_idisposable_constraint_4755_test.cpp	no-such-section	28.2	28.2
 site:	tests/sema/reverse_set_3763_test.cpp	wrong-section	Array	5
 site:	tests/sema/sorted_dictionary_literal_target_removed_3831_test.cpp	wrong-section	ContainsKey	1
 site:	tests/sema/stack_queue_remove_no_member_6163_test.cpp	wrong-section	Remove	4.1

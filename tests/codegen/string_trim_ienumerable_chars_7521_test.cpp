@@ -237,7 +237,7 @@ BEZEL_TEST(string_trim_ienumerable_chars_7521,
 //
 // THE ORACLE IS "THE COMPILE FAILS", never "the program runs": with the
 // materialisation arm returning nothing, the enclosing statement emitted no
-// code at all, the program ran, and it printed NOTHING (stdlib §21.9) --
+// code at all, the program ran, and it printed NOTHING (spec §21.9) --
 // a silent drop, the worst outcome. A diagnostic is the only acceptable
 // answer for a source the compiler cannot honour.
 BEZEL_TEST(string_trim_ienumerable_chars_7521,

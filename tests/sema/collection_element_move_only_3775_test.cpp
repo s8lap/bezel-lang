@@ -76,7 +76,7 @@
 // that file's diff) and its own tests are unaffected.
 //
 // SCOPE DECLINED, FILED SEPARATELY (CLAUDE.md "decline-with-reasons"):
-//   - `OwningBuffer<T>`/`Span<T>`/`ReadOnlySpan<T>`: stdlib §14.4 states they
+//   - `OwningBuffer<T>`/`Span<T>`/`ReadOnlySpan<T>`: spec §14.4 states they
 //     "still reject ... move-only value types", but MEASURED on this fix,
 //     `OwningBuffer<Wrap>` for an owning-classified `Wrap` still compiles
 //     with zero diagnostics — a pre-existing, separate gap this lane does

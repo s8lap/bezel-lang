@@ -97,7 +97,7 @@ BEZEL_TEST(uint_radix_rejected_7271, ulong_literal_radix_renders_the_radix_form)
                     std::string("ff\n"));
 }
 
-// A class-level `const` of the narrowable type (stdlib §22.12) is a §17.14
+// A class-level `const` of the narrowable type (spec §22.12) is a §17.14
 // constant too.
 BEZEL_TEST(uint_radix_rejected_7271, uint_const_member_radix_renders_the_radix_form) {
     std::string prog =

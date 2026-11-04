@@ -5687,13 +5687,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 : lowerLinqLambda(call.args[0].value.get(), selRetRef);
             if (!call.args.empty() && !closure) return nullptr;
             llvm::Type* dblTy = llvm::Type::getDoubleTy(llvm_);
-            // fix #4728 (spec §29.1, stdlib §5 + §11.1 Average widening, v0.305):
+            // fix #4728 (spec §29.1, stdlib §5 / spec §5.1 Average widening, v0.305):
             // the no-selector Average() widening must honor the element's
             // signedness — UIToFP for `byte`/`ushort`/`uint`/`ulong`/`char`, SIToFP
             // for the signed family. Before this fix the `toDouble` lambda used
             // `CreateSIToFP` unconditionally, so a `byte` 250 was reinterpreted
             // as i8 -6 → double -6.0, and the accumulator's double sum no longer
-            // matched the element's numeric value. stdlib §11.1's
+            // matched the element's numeric value. spec §5.1's
             // narrowing/widening table promotes an unsigned element to `double`
             // BEFORE the sum; that is the contract this widens-to. The selector
             // form mirrors the no-selector form via `selRetRef`'s primitive

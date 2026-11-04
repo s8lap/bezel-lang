@@ -20,7 +20,7 @@
 //
 // File name: capture_cell_scoped_call_2334 — extends the #2334 fix's coverage
 // of "a local captured by a lambda passed to a `scoped` callback parameter"
-// to the full stdlib §28.14 register family called out in the brief.
+// to the full spec §28.14 register family called out in the brief.
 //
 // As with taskscope_asan_2334_test.cpp: this is an ASan leg test (the
 // existing taskscope_behavior_610_test.cpp's value-only runAot harness

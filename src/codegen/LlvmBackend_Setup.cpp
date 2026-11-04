@@ -45793,7 +45793,7 @@ void Emitter::collectCellFreeEligible(
                                 }
                                 if (boundingLd) {
                                     // Bounding type must be one of the
-                                    // stdlib §28.14 storage-bounded
+                                    // spec §28.14 storage-bounded
                                     // positions. For form 2 the bounding
                                     // object's TYPE is the call's RETURN
                                     // type (the owned Subscription /

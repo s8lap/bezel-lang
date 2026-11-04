@@ -69,7 +69,7 @@
 //   interface             -> lowerObjectToString (vt/string fresh +1, null
 //                            "null" literal sentinel)
 // Set `releaseRender = true` for the WHOLE result: a release on a sentinel is
-// a no-op (stdlib §28.9), and every fresh +1 in the list needs discharge.
+// a no-op (spec §28.9), and every fresh +1 in the list needs discharge.
 // One branch, one renderer, one discharge flag — the structural mismatch the
 // original ad-hoc member walk let in cannot recur here.
 //

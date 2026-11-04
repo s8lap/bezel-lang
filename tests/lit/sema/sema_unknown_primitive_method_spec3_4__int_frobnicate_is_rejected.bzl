@@ -7,7 +7,7 @@
 // (see `char_repeat_is_rejected.bzl` for why the extractor's automatic
 // resolution is unsafe for this file's `checkBody` name specifically).
 //
-// §3.4 / stdlib §5.2: int has no static method `Frobnicate`.
+// §3.4 / stdlib §9.1: int has no static method `Frobnicate`.
 
 module M; class C public static method Main(): int var x := int.Frobnicate(42); return 0; end Main; end C;
 

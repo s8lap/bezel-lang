@@ -71,8 +71,8 @@
 //   Cap_color  -> "1/7\n"       (want "Conf.Color/7\n")
 //   boxcls     -> "<k>\n<109>\n<65><1>\n"
 //                 (want         "<k>\n<m>\n<65><Conf.Color>\n")
-// per stdlib §8.5 (char.ToString() is the character itself) and stdlib
-// §2.13 + §8.5 (enum ToString() renders the qualified TYPE name — #4927's
+// per stdlib §9.5 (char.ToString() is the character itself) and stdlib
+// §2.13 + spec §8.5 (enum ToString() renders the qualified TYPE name — #4927's
 // correction).
 //
 // ROOT CAUSE — two distinct siblings of #4896's i32/char/enum ambiguity,
@@ -147,7 +147,7 @@
 using bezel::test::runAot;
 using bezel::test::runAotOut;
 
-// #5024 part (a) / §14.1, §14.5 phase 2, §18.5, stdlib §8.5 (v0.307): a
+// #5024 part (a) / §14.1, §14.5 phase 2, §18.5, stdlib §9.5 (v0.307): a
 // captured `T`-typed variable, specialized at `char`, interpolated from
 // inside a lambda that itself has an ordinary (non-generic) declared
 // parameter. Pre-fix stdout: "120/7\n". Post-fix: "x/7\n".

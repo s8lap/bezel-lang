@@ -90,7 +90,7 @@
 using bezel::test::runAot;
 using bezel::test::runAotOut;
 
-// #4896 / §14.5 phase 2, §18.5, stdlib §8.5 (v0.307): a generic method's
+// #4896 / §14.5 phase 2, §18.5, stdlib §9.5 (v0.307): a generic method's
 // inferred lambda parameter specialized at `char`, alone in its own
 // compile (avoids the separate cross-specialization leak documented
 // above). Pre-fix stdout: `<120>\n`. Post-fix: `<x>\n`.
