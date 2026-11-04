@@ -219,11 +219,14 @@ BEZEL_TEST(codegen_async_owned_builtin_collection_param_6368,
 // borrowed `Cell`: an ASan double free / use-after-free, which is strictly
 // worse than the leak this issue is about.
 //
-// The three `Cell`s are minted inside `Make` and each dies at its own K8
-// full-expression boundary (§28.3 — that is precisely why the compiler's
-// fresh-store lint fires on this shape), so the ARRAY is the sole surviving
-// holder of the backing; if the release wrongly cascaded into the elements it
-// would free them a second time.
+// The three slots borrow ONE `Cell` owned by `Main`'s `using var c` (a
+// parameter-sourced borrow stored into the local array, §28.11's residual), so
+// the ARRAY is the sole surviving holder of the backing and NOT of the
+// element; if the release wrongly cascaded into the elements it would free
+// `c` (three times) before its owner does. (Before v0.346 the fixture minted
+// three fresh `Cell`s straight into `a.Add(new Cell(…))`; that is now §15.4's
+// fresh-store compile error — proposal 0207, #3047 lint A — so the borrowed
+// elements are re-cut to a live owner, which keeps the row's subject.)
 //
 // This is the row that ANSWERS the design question "is `bz_array_free` the
 // correct release for `Array<T>`?": yes, but with the §28.11 element-slot
@@ -245,11 +248,11 @@ BEZEL_TEST(codegen_async_owned_builtin_collection_param_6368,
         "  public method N(): int return _n; end N; "
         "end Cell; "
         "class Q "
-        "  public static method Make(): owned Array<Cell> "
+        "  public static method Make(c: Cell): owned Array<Cell> "
         "    var a: Array<Cell> := new Array<Cell>(); "
-        "    a.Add(new Cell(9)); "
-        "    a.Add(new Cell(8)); "
-        "    a.Add(new Cell(7)); "
+        "    a.Add(c); "
+        "    a.Add(c); "
+        "    a.Add(c); "
         "    return a; "
         "  end Make; "
         "  public static async method Take(owned a: Array<Cell>): Task<int> "
@@ -259,8 +262,9 @@ BEZEL_TEST(codegen_async_owned_builtin_collection_param_6368,
         "end Q; "
         "class P public static async method Main(): Task<int> "
         "  var t := 0; "
+        "  using var c := new Cell(9); "
         "  for var i in 0..<500 do "
-        "    var v := await Q.Take(Q.Make()); "
+        "    var v := await Q.Take(Q.Make(c)); "
         "    t := t + v; "
         "  end for; "
         "  return t mod 251; "

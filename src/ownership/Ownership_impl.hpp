@@ -3198,7 +3198,7 @@ private:
     // and are excluded. Called from handleAssignment; returns true when it
     // reported a diagnostic.
     //
-    // It is also the indexer half of §15.4's fresh-store warning, for BOTH of
+    // It is also the indexer half of §15.4's fresh-store error (v0.346), for BOTH of
     // that section's store positions — "the indexer-set, key and value positions
     // alike" (#3395): the value always, and the index when the head is a
     // dictionary, whose `:=` upsert retains an absent key.
@@ -3210,7 +3210,7 @@ private:
     bool checkIndexerSetBorrowStoreEscape(const ast::AssignmentStmt& as,
                                           bool fromLambdaBody = false);
 
-    // §15.4 fresh-store warning (v0.243, the taken #1813 follow-on) — THE one
+    // §15.4 fresh-store error (v0.346; the v0.243 warning, the taken #1813 follow-on) — THE one
     // authority for it, and the reason it is a function rather than two inline
     // arms: §15.4 states the rule once for "`Add`/`Insert` and the indexer-set,
     // key and value positions alike", so the two store sinks the compiler has
@@ -3220,14 +3220,14 @@ private:
     // predicate derived for one arm of a classification that already had an
     // authority.
     //
-    // §15.4: "Because the retention is statically certain to outlive the value,
-    // the compiler **must warn** when a store-position argument on a
-    // borrowing-family collection … is a **fresh unbound owned temporary of
-    // class type** (§28.3): a `new` expression, a collection literal, an
-    // `owned`-returning call result, a `move` result, or a `Task`-family call
-    // result … The warning does not narrow the admission: the program remains
-    // accepted, no `using var` is demanded, and the recorded literal-only-
-    // rejection asymmetry above stands unchanged."
+    // §15.4 (v0.346, proposal 0207 promoted the v0.243 lint to an error): "a
+    // fresh unbound owned temporary of class type (§28.3.11) — a `new`
+    // expression, a collection literal, an `owned`-returning call result, a
+    // `move` result, or a **`Task`-family call result** … — in a single-element
+    // store position of a borrowing-family collection is a compile error at the
+    // store site." §28.11's store-site check clause 4 and K8.4's last sentence
+    // state the same rejection; a plain parameter of a USER-declared member
+    // keeps the unbound-temporary admission (neither sink below reaches one).
     //
     // FRESHNESS IS `producerState`, NOT A NEW SHAPE LIST. producerState is the
     // §28.3 producers-table authority already used for exactly this question at
@@ -3246,9 +3246,22 @@ private:
     // reader to a remedy that does not work (the asymmetry
     // checkBorrowingFamilyLiteralElements already prints for a rejected literal
     // key). // per §15.4, §28.11, §28.3
-    void warnSec154FreshStore(const ast::Expr& arg, std::string_view storeSpelling,
-                              std::string_view recvName, std::string_view collHead,
-                              bool isDictionaryKeyPosition);
+    // §15.4 (v0.355) / §28.11 clause 4: the storing-method-CALL half of the
+    // fresh-store rule, for one call. Reached from the statement walk
+    // (`checkCollectionBorrowStoreEscape`) AND from `checkRead`'s CallExpr arm,
+    // because §15.4's positions are the members the call resolves to,
+    // wherever the call sits — `var b := s.TryAdd(new Item())` and
+    // `var v := d.GetOrAdd(new K(), f)` are value-returning stores whose call
+    // is a local-decl initializer, which only the read walk visits. Each call
+    // node reports at most once (`sec154FreshStoreCallsSeen_`); a call seen
+    // while diagnostics are suppressed is not marked, so the reporting walk
+    // still reports it. // per §15.4, §28.11
+    void checkSec154FreshStoreCall(const ast::CallExpr& call);
+    std::unordered_set<const ast::CallExpr*> sec154FreshStoreCallsSeen_;
+
+    void rejectSec154FreshStore(const ast::Expr& arg, std::string_view storeSpelling,
+                                std::string_view recvName, std::string_view collHead,
+                                bool isDictionaryKeyPosition);
 
     // §28.3 / §28.5 / §28.8 (issue #402): true when `target` resolves to an
     // `owned` field — an owned storage location. Reuses the owned-field

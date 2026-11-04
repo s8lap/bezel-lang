@@ -73,6 +73,7 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -361,16 +362,25 @@ BEZEL_TEST(sema_borrowing_family_literal_fresh_producer_2673,
 
 // §15.4 resolution 5, VERBATIM: "**`Add` after construction is not a literal
 // position** (the store paragraph below). Aggregate membership never grows."
-// The asymmetry is the recorded design, so a fix that widened to ingress would
-// contradict the very paragraph it implements. `Length` = 1.
-// per §15.4 resolution 5, §28.11 (#2673)
+// The literal-site rule must not widen to ingress. Before v0.346 this row
+// pinned the store as ACCEPTED (`Length` = 1, under the store paragraph's
+// warning); since v0.346 (proposal 0207, #3047 lint A) the store paragraph
+// itself rejects it — §15.4 (v0.355): "a fresh unbound owned temporary of
+// class type … in a single-element store position of a borrowing-family
+// collection is a compile error at the store site". So the row now pins that
+// `xs.Add(new Conn(4))` is rejected by the STORE rule (the §15.4 fresh-store
+// error) and still NOT by the literal-site rule (it is not a literal
+// position). // per §15.4 resolution 5, §15.4 store paragraph, §28.11 (#2673)
 BEZEL_TEST(sema_borrowing_family_literal_fresh_producer_2673,
            add_after_construction_is_not_a_literal_position_spec_15_4) {
-    expectAccepted(
+    JitResult r = runAot(prog(
         "    var xs: Array<Conn> := []; "
         "    xs.Add(new Conn(4)); "
-        "    return xs.Count; ",
-        1);
+        "    return xs.Count; "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "§15.4 fresh-store error"));
+    BEZEL_EXPECT_FALSE(rejectedBorrowingFamilyFreshProducer(r));
 }
 
 // §15.4's empty-literal carve-out: "the empty literal `[]` is admitted for

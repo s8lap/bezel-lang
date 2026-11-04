@@ -3,6 +3,15 @@
 // (A) Task.WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>
 //     stdlib §6.7 / spec §30.10.
 // (B) Task.Delay(ms, token: CancellationToken): Task  — token cancellation.
+//
+// v0.346 (proposal 0207, #3047 lint A): a borrowing `Array<Task…>` seeded with
+// `tasks.Add(<task-minting call>)` is §15.4's fresh-store COMPILE ERROR (§15.4
+// v0.355: "a Task-family call" is a fresh form; §28.14 rule 2 v0.355: the
+// collection "holds the tasks through named bindings"). Each such fixture
+// below is re-cut to named `using var ptN := <call>;` bindings declared BEFORE
+// the collection (so the collection never outlives them) and `tasks.Add(ptN)`;
+// the combinator under test, the inputs and the expected results are
+// unchanged. `OwningArray` fixtures are untouched (they take ownership).
 //     stdlib §6.7 / spec §30.8.
 // (C) await inside a catch GUARD (catch E when await ...) — confirmed clean
 //     diagnostic (not a crash).
@@ -143,10 +152,13 @@ BEZEL_TEST(whenall_generic_results_451, int_results_sum) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C "
         "  public static async method Main(): Task<int> "
+        "    using var pt1 := Task.FromResult(10); "
+        "    using var pt2 := Task.FromResult(20); "
+        "    using var pt3 := Task.FromResult(30); "
         "    using var tasks := new Array<Task<int>>(); "
-        "    tasks.Add(Task.FromResult(10)); "
-        "    tasks.Add(Task.FromResult(20)); "
-        "    tasks.Add(Task.FromResult(30)); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
+        "    tasks.Add(pt3); "
         "    using var wa := Task.WhenAll(tasks); "
         "    var arr := await wa; "
         "    return arr[0] + arr[1] + arr[2]; "
@@ -176,10 +188,13 @@ BEZEL_TEST(whenall_generic_results_451, bool_results_collected) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C "
         "  public static async method Main(): Task<int> "
+        "    using var pt1 := Task.FromResult(true); "
+        "    using var pt2 := Task.FromResult(true); "
+        "    using var pt3 := Task.FromResult(true); "
         "    using var tasks := new Array<Task<bool>>(); "
-        "    tasks.Add(Task.FromResult(true)); "
-        "    tasks.Add(Task.FromResult(true)); "
-        "    tasks.Add(Task.FromResult(true)); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
+        "    tasks.Add(pt3); "
         "    using var wa := Task.WhenAll(tasks); "
         "    var arr := await wa; "
         "    var n := 0; "
@@ -202,10 +217,13 @@ BEZEL_TEST(whenall_generic_results_451, async_producers_cross_thread) {
         "    return n; "
         "  end Produce; "
         "  public static async method Main(): Task<int> "
+        "    using var pt1 := Produce(7); "
+        "    using var pt2 := Produce(8); "
+        "    using var pt3 := Produce(9); "
         "    using var tasks := new Array<Task<int>>(); "
-        "    tasks.Add(Produce(7)); "
-        "    tasks.Add(Produce(8)); "
-        "    tasks.Add(Produce(9)); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
+        "    tasks.Add(pt3); "
         "    using var wa := Task.WhenAll(tasks); "
         "    var arr := await wa; "
         "    return arr[0] + arr[1] + arr[2]; "
@@ -224,9 +242,11 @@ BEZEL_TEST(whenall_generic_results_451, one_faulted_propagates) {
         "    throw new InvalidOperationException(); "
         "  end Boom; "
         "  public static async method Main(): Task<int> "
+        "    using var pt1 := Task.FromResult(1); "
+        "    using var pt2 := Boom(); "
         "    using var tasks := new Array<Task<int>>(); "
-        "    tasks.Add(Task.FromResult(1)); "
-        "    tasks.Add(Boom()); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
         "    using var wa := Task.WhenAll(tasks); "
         "    var arr := await wa; "
         "    return arr[0]; "
@@ -244,9 +264,11 @@ BEZEL_TEST(whenall_generic_results_451, faulted_caught) {
         "  end Boom; "
         "  public static async method Main(): Task<int> "
         "    var x := 0; "
+        "    using var pt1 := Task.FromResult(1); "
+        "    using var pt2 := Boom(); "
         "    using var tasks := new Array<Task<int>>(); "
-        "    tasks.Add(Task.FromResult(1)); "
-        "    tasks.Add(Boom()); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
         "    using var wa := Task.WhenAll(tasks); "
         "    try "
         "      var arr := await wa; "
@@ -592,12 +614,17 @@ BEZEL_TEST(task_delay_1378, starvation_regression_concurrent_delays) {
         "    return 1; "
         "  end D; "
         "  public static async method Main(): Task<int> "
+        "    using var pt1 := D(); "
+        "    using var pt2 := D(); "
+        "    using var pt3 := D(); "
+        "    using var pt4 := D(); "
+        "    using var pt5 := D(); "
         "    using var tasks := new Array<Task<int>>(); "
-        "    tasks.Add(D()); "
-        "    tasks.Add(D()); "
-        "    tasks.Add(D()); "
-        "    tasks.Add(D()); "
-        "    tasks.Add(D()); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
+        "    tasks.Add(pt3); "
+        "    tasks.Add(pt4); "
+        "    tasks.Add(pt5); "
         "    using var wa := Task.WhenAll(tasks); "
         "    var arr := await wa; "
         "    return arr[0] + arr[1] + arr[2] + arr[3] + arr[4]; "

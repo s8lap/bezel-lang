@@ -1,15 +1,15 @@
 //! case: s15_4_0016
 //! doc: spec
 //! section: 15.4
-//! title: a fresh unbound owned temporary at a borrowing collection's Add draws the fresh-store warning
-//! rule: Because the retention is statically certain to outlive the value, the
-//!   compiler **must warn** when a store-position argument in a **borrowing
-//!   position** — `Add`/`Insert` and the indexer-set on a borrowing-family
-//!   collection, key and value positions alike, ... — is a **fresh unbound owned
-//!   temporary of class type** (§15.4, v0.343).
+//! title: a fresh unbound owned temporary at a borrowing collection's Add is a compile error
+//! rule: A fresh unbound owned temporary of class type ... — a `new` expression,
+//!   a collection literal, an `owned`-returning call result, a `move` result, or
+//!   a **`Task`-family call result** ... — in a single-element store position of
+//!   a borrowing-family collection is a compile error at the store site
+//!   (§15.4, v0.355).
 //! cites: 15.4, 28.11
-//! expect: warn
-//! diagnostic: fresh unbound owned temporary
+//! expect: reject
+//! diagnostic: §15.4 fresh-store error
 module Conf;
 
 public class Item

@@ -4,6 +4,15 @@
 // and `using var` Task disposal. These derive from Bezel_Standard_Library_0_130.md
 // §6.7 and language spec §30.5 / §30.10.
 //
+// v0.346 (proposal 0207, #3047 lint A): a borrowing `Array<Task…>` seeded with
+// `tasks.Add(<task-minting call>)` is §15.4's fresh-store COMPILE ERROR (§15.4
+// v0.355: "a Task-family call" is a fresh form; §28.14 rule 2 v0.355: the
+// collection "holds the tasks through named bindings"). Each such fixture
+// below is re-cut to named `using var ptN := <call>;` bindings declared BEFORE
+// the collection (so the collection never outlives them) and `tasks.Add(ptN)`;
+// the combinator under test, the inputs and the expected results are
+// unchanged. `OwningArray` fixtures are untouched (they take ownership).
+//
 // Like async_test.cpp, the async emitter accumulates LLVM module state across
 // runs, so these tests compile to native executables and check exit codes.
 // ASan/LSan is used to verify no leaks or double-frees.
@@ -235,10 +244,13 @@ BEZEL_TEST(task_combinators_6_7, when_all_already_complete) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C "
         "  public static async method Main(): Task<int> "
+        "    using var pt1 := Task.FromResult(1); "
+        "    using var pt2 := Task.FromResult(2); "
+        "    using var pt3 := Task.FromResult(3); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(Task.FromResult(1)); "
-        "    tasks.Add(Task.FromResult(2)); "
-        "    tasks.Add(Task.FromResult(3)); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
+        "    tasks.Add(pt3); "
         "    using var wa := Task.WhenAll(tasks); "
         "    await wa; "
         "    return 5; "
@@ -360,9 +372,11 @@ BEZEL_TEST(task_combinators_6_7, when_all_with_delays_cross_thread) {
         "  end Signal2; "
         "  public static async method Main(): Task<int> "
         "    using var ch := new Channel<int>(); "
+        "    using var pt1 := ch.Receive(); "
+        "    using var pt2 := ch.Receive(); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(ch.Receive()); "
-        "    tasks.Add(ch.Receive()); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
         "    using var prod := Domain.Spawn(C.Signal2, ch.NewSender()); "
         "    using var wa := Task.WhenAll(tasks); "
         "    await wa; "
@@ -388,9 +402,11 @@ BEZEL_TEST(task_combinators_6_7, when_any_already_complete) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C "
         "  public static async method Main(): Task<int> "
+        "    using var pt1 := Task.FromResult(10); "
+        "    using var pt2 := Task.FromResult(20); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(Task.FromResult(10)); "
-        "    tasks.Add(Task.FromResult(20)); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
         "    using var wa := Task.WhenAny(tasks); "
         "    await wa; "
         "    return 8; "
@@ -406,9 +422,11 @@ BEZEL_TEST(task_combinators_6_7, when_any_yields_winner_index) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C "
         "  public static async method Main(): Task<int> "
+        "    using var pt1 := Task.FromResult(10); "
+        "    using var pt2 := Task.FromResult(20); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(Task.FromResult(10)); "
-        "    tasks.Add(Task.FromResult(20)); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
         "    using var wa := Task.WhenAny(tasks); "
         "    var idx := await wa; "
         "    return idx; "          // 0 — first task completed first (already-done)
@@ -436,9 +454,11 @@ BEZEL_TEST(task_combinators_6_7, when_any_with_delay_cross_thread) {
         "  public static async method Main(): Task<int> "
         "    using var ch1 := new Channel<int>(); "
         "    using var ch2 := new Channel<int>(); "
+        "    using var pt1 := ch1.Receive(); "
+        "    using var pt2 := ch2.Receive(); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(ch1.Receive()); "
-        "    tasks.Add(ch2.Receive()); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
         "    using var prod := Domain.Spawn(C.Signal2, ch1.NewSender(), ch2.NewSender()); "
         "    using var wa := Task.WhenAny(tasks); "
         "    await wa; "
@@ -470,9 +490,11 @@ BEZEL_TEST(task_combinators_6_7, when_any_delay_race_winner_index) {
         "  public static async method Main(): Task<int> "
         "    using var ch0 := new Channel<int>(); "
         "    using var ch1 := new Channel<int>(); "
+        "    using var pt1 := ch0.Receive(); "
+        "    using var pt2 := ch1.Receive(); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(ch0.Receive()); "
-        "    tasks.Add(ch1.Receive()); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
         "    using var prod := Domain.Spawn(C.Signal1, ch0.NewSender()); "
         "    using var wa := Task.WhenAny(tasks); "
         "    var idx := await wa; "
@@ -759,8 +781,9 @@ BEZEL_TEST(task_combinators_30_5, using_var_when_all_not_awaited_no_leak) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C "
         "  public static async method Main(): Task<int> "
+        "    using var pt1 := Task.FromResult(1); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(Task.FromResult(1)); "
+        "    tasks.Add(pt1); "
         "    using var wa := Task.WhenAll(tasks); "
         "    return 12; "
         "  end Main; end C;"),
@@ -818,9 +841,11 @@ BEZEL_TEST(task_combinators_443, when_all_one_faulted_raises) {
         "    throw new InvalidOperationException(); "
         "  end Boom; "
         "  public static async method Main(): Task<int> "
+        "    using var pt1 := Task.FromResult(1); "
+        "    using var pt2 := Boom(); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(Task.FromResult(1)); "
-        "    tasks.Add(Boom()); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
         "    using var wa := Task.WhenAll(tasks); "
         "    await wa; "
         "    return 5; "
@@ -838,9 +863,11 @@ BEZEL_TEST(task_combinators_443, when_all_one_faulted_caught) {
         "  end Boom; "
         "  public static async method Main(): Task<int> "
         "    var x := 0; "
+        "    using var pt1 := Task.FromResult(1); "
+        "    using var pt2 := Boom(); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(Task.FromResult(1)); "
-        "    tasks.Add(Boom()); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
         "    using var wa := Task.WhenAll(tasks); "
         "    try await wa; catch Exception => x := 9; end; "
         "    return x; "
@@ -855,9 +882,11 @@ BEZEL_TEST(task_combinators_443, when_all_all_success_unaffected) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C "
         "  public static async method Main(): Task<int> "
+        "    using var pt1 := Task.FromResult(1); "
+        "    using var pt2 := Task.FromResult(2); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(Task.FromResult(1)); "
-        "    tasks.Add(Task.FromResult(2)); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
         "    using var wa := Task.WhenAll(tasks); "
         "    await wa; "
         "    return 5; "
@@ -889,9 +918,11 @@ BEZEL_TEST(task_combinators_443, when_all_delay_then_fault_cross_thread) {
         "  end CloseChan; "
         "  public static async method Main(): Task<int> "
         "    using var ch := new Channel<int>(); "
+        "    using var pt1 := Task.FromResult(1); "
+        "    using var pt2 := ch.Receive(); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(Task.FromResult(1)); "
-        "    tasks.Add(ch.Receive()); "
+        "    tasks.Add(pt1); "
+        "    tasks.Add(pt2); "
         "    using var prod := Domain.Spawn(C.CloseChan, ch.NewSender()); "
         "    using var wa := Task.WhenAll(tasks); "
         "    await wa; "

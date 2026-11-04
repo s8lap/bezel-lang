@@ -1,5 +1,14 @@
-// Spec-derived regression for issue #3395 — §15.4's fresh-store warning at the
+// Spec-derived regression for issue #3395 — §15.4's fresh-store rule at the
 // INDEXER-SET KEY position.
+//
+// SEVERITY UPDATE (v0.346, proposal 0207, #3047 lint A): the rule this file
+// pins is a compile ERROR since v0.346 — §15.4 (v0.355): "a fresh unbound
+// owned temporary of class type … in a single-element store position of a
+// borrowing-family collection is a compile error at the store site", "and the
+// **key** position of `OwningDictionary<K, V>`". The positions, the count per
+// store and the message variants below are unchanged; the reject rows now
+// assert an error, and the two end-to-end rows a rejection. The v0.283 text
+// quoted next is the warning's, kept for the history.
 //
 // §15.4 *Collection literals* (v0.283) states the must-warn once, for both
 // store sinks and BOTH positions, verbatim:
@@ -44,13 +53,14 @@
 // (stdlib §4.9), so a fresh class-typed key is a borrowing position exactly
 // like `Dictionary`'s, per §28.11's amended text ("the same check reaches the
 // key slot of `OwningDictionary<K, V>`, a borrowing position"). See the
-// `owning_dictionary_fresh_class_key_warns_*` tests below.
+// `owning_dictionary_fresh_class_key_rejects_*` tests below.
 //
 // // per §15.4 (fresh-store warning, v0.243; store-position list quoted above),
 //    §28.11 *Borrowing collections*, §28.3 *Unbound owned temporaries*
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
@@ -91,8 +101,8 @@ OwnershipResult check(const std::string& body) {
 int freshStoreWarnings(const OwnershipResult& r) {
     int n = 0;
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
-        if (d.message.find("§15.4 fresh-store warning") == std::string::npos)
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("§15.4 fresh-store error") == std::string::npos)
             continue;
         ++n;
     }
@@ -108,7 +118,6 @@ int freshStoreWarnings(const OwnershipResult& r) {
 int anyFreshTempWarnings(const OwnershipResult& r) {
     int n = 0;
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
         if (d.message.find("fresh unbound owned temporary") == std::string::npos)
             continue;
         ++n;
@@ -116,11 +125,11 @@ int anyFreshTempWarnings(const OwnershipResult& r) {
     return n;
 }
 
-// The text of the first §15.4 fresh-store warning mentioning `needle`, or "".
+// The text of the first §15.4 fresh-store error mentioning `needle`, or "".
 std::string freshStoreTextWith(const OwnershipResult& r, const char* needle) {
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
-        if (d.message.find("§15.4 fresh-store warning") == std::string::npos)
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("§15.4 fresh-store error") == std::string::npos)
             continue;
         if (d.message.find(needle) == std::string::npos) continue;
         return d.message;
@@ -137,7 +146,7 @@ bool contains(const std::string& hay, const char* needle) {
 // ── The #3395 gap itself ─────────────────────────────────────────────────────
 
 // §15.4: "the indexer-set, KEY and value positions alike". Pre-fix: 0.
-BEZEL_TEST(fresh_store_indexer_key_3395, fresh_class_key_warns) {
+BEZEL_TEST(fresh_store_indexer_key_3395, fresh_class_key_rejects) {
     OwnershipResult r = check(
         "class C public static method M(): int "
         "  using var d := new Dictionary<Key, int>(); "
@@ -146,8 +155,8 @@ BEZEL_TEST(fresh_store_indexer_key_3395, fresh_class_key_warns) {
         "end M; end C;");
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 1);
     BEZEL_EXPECT_EQ(anyFreshTempWarnings(r), 1);
-    // "The warning does not narrow the admission" — it stays a Warning.
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // v0.346 (proposal 0207): an ERROR at the store site.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     const std::string w = freshStoreTextWith(r, "key store");
     BEZEL_EXPECT_FALSE(w.empty());
     BEZEL_EXPECT_TRUE(contains(w, "K8 full-expression boundary"));
@@ -183,7 +192,7 @@ BEZEL_TEST(fresh_store_indexer_key_3395, add_and_indexer_key_sinks_agree) {
 
 // "key and value positions alike" — one statement, two store positions, two
 // warnings, and the key's is the one that omits the owning-family remedy.
-BEZEL_TEST(fresh_store_indexer_key_3395, fresh_key_and_fresh_value_both_warn) {
+BEZEL_TEST(fresh_store_indexer_key_3395, fresh_key_and_fresh_value_both_reject) {
     OwnershipResult r = check(
         "class C public static method M(): int "
         "  using var d := new Dictionary<Key, Item>(); "
@@ -202,7 +211,7 @@ BEZEL_TEST(fresh_store_indexer_key_3395, fresh_key_and_fresh_value_both_warn) {
 // indexer (stdlib §4.17 "Value semantics match `Dictionary<K, V>`"), and it is
 // in this sink's head list — so its key position answers identically. Its
 // warning names NO owning remedy at all (there is no `OwningSortedDictionary`).
-BEZEL_TEST(fresh_store_indexer_key_3395, sorted_dictionary_fresh_key_warns) {
+BEZEL_TEST(fresh_store_indexer_key_3395, sorted_dictionary_fresh_key_rejects) {
     OwnershipResult r = check(
         "class C public static method M(): int "
         "  using var sd := new SortedDictionary<Ord, int>(); "
@@ -219,7 +228,7 @@ BEZEL_TEST(fresh_store_indexer_key_3395, sorted_dictionary_fresh_key_warns) {
 // §15.4's fresh set is `producerState`'s §28.3 producers table, not a shape list
 // local to this sink: "an `owned`-returning call result" and "a `move` result"
 // are members of it and reach the key position through the same one predicate.
-BEZEL_TEST(fresh_store_indexer_key_3395, owned_call_and_move_keys_warn) {
+BEZEL_TEST(fresh_store_indexer_key_3395, owned_call_and_move_keys_reject) {
     OwnershipResult call = check(
         "class C "
         "  public static method MakeKey(): owned Key return new Key(3); "
@@ -246,7 +255,7 @@ BEZEL_TEST(fresh_store_indexer_key_3395, owned_call_and_move_keys_warn) {
 
 // The documented remedy: a named holder is not an unbound temporary — in the
 // key position exactly as in the value position.
-BEZEL_TEST(fresh_store_indexer_key_3395, named_holder_key_does_not_warn) {
+BEZEL_TEST(fresh_store_indexer_key_3395, named_holder_key_is_not_rejected) {
     OwnershipResult r = check(
         "class C public static method M(k: Key, it: Item): int "
         "  using var d := new Dictionary<Key, Item>(); "
@@ -265,7 +274,7 @@ BEZEL_TEST(fresh_store_indexer_key_3395, named_holder_key_does_not_warn) {
 // element table puts the others in columns whose store cannot dangle — a value
 // type "copies the value in", a runtime-managed reference "stores the
 // reference". `int`, `string` and `record` keys are all silent.
-BEZEL_TEST(fresh_store_indexer_key_3395, value_string_and_record_keys_do_not_warn) {
+BEZEL_TEST(fresh_store_indexer_key_3395, value_string_and_record_keys_are_not_rejected) {
     OwnershipResult r = check(
         "class C public static method M(s: string, it: Item): int "
         "  using var di := new Dictionary<int, Item>(); "
@@ -293,7 +302,7 @@ BEZEL_TEST(fresh_store_indexer_key_3395, array_index_is_not_a_store_position) {
         "  return a.Count; "
         "end M; end C;");
     // Exactly one — the value's. Unchanged from the #3364 baseline.
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 1);
     BEZEL_EXPECT_EQ(anyFreshTempWarnings(r), 1);
     BEZEL_EXPECT_FALSE(freshStoreTextWith(r, "coll[i]").empty());
@@ -305,9 +314,9 @@ BEZEL_TEST(fresh_store_indexer_key_3395, array_index_is_not_a_store_position) {
 // storing-call sink's value leg declines it too — even after fix #3839 widens
 // the KEY leg below. The key here is a plain `string` (not class-typed), so
 // it draws nothing either: this test pins the value-only case; the
-// `owning_dictionary_fresh_class_key_warns_*` tests below pin the (now warned)
+// `owning_dictionary_fresh_class_key_rejects_*` tests below pin the (now warned)
 // class-typed-key case.
-BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_indexer_set_does_not_warn) {
+BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_indexer_set_is_not_rejected) {
     OwnershipResult r = check(
         "class C public static method M(): int "
         "  using var od := new OwningDictionary<string, Item>(); "
@@ -326,14 +335,14 @@ BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_indexer_set_does_not_
 // dangles at its K8 boundary exactly as a `Dictionary` key does. Pre-fix: 0
 // (neither sink reached it at all, since `OwningDictionary` is absent from
 // the ordinary `borrowingFamily` whitelist both sinks share).
-BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_fresh_class_key_warns_indexer) {
+BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_fresh_class_key_rejects_indexer) {
     OwnershipResult r = check(
         "class C public static method M(): int "
         "  using var od := new OwningDictionary<Key, Item>(); "
         "  od[new Key(1)] := new Item(2); "
         "  return od.Count; "
         "end M; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     // Exactly one — the key's. The value is an owned transfer (stdlib §4.9's
     // `set(owned)`) and must stay silent even though it is equally fresh.
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 1);
@@ -352,14 +361,14 @@ BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_fresh_class_key_warns
 // The storing-CALL sink's `Add` must agree with the indexer-set sink above —
 // the same symmetry #3395 established for `Dictionary`. Pre-fix: 0 (excluded
 // by the `borrowingFamily` whitelist entirely).
-BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_fresh_class_key_warns_add) {
+BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_fresh_class_key_rejects_add) {
     OwnershipResult r = check(
         "class C public static method M(): int "
         "  using var od := new OwningDictionary<Key, Item>(); "
         "  od.Add(new Key(1), new Item(2)); "
         "  return od.Count; "
         "end M; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 1);
     BEZEL_EXPECT_EQ(anyFreshTempWarnings(r), 1);
     // Unlike the indexer-set sink, the storing-CALL sink's `storeSpelling` is
@@ -375,13 +384,13 @@ BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_fresh_class_key_warns
 // "Required" list; the sink's `storing` set already recognizes it (`m ==
 // "TryAdd"`, shared with `Dictionary`/`Set`), so only the head classification
 // needed widening.
-BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_fresh_class_key_warns_tryadd) {
+BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_fresh_class_key_rejects_tryadd) {
     OwnershipResult r = check(
         "class C public static method M(): bool "
         "  using var od := new OwningDictionary<Key, Item>(); "
         "  return od.TryAdd(new Key(1), new Item(2)); "
         "end M; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 1);
     BEZEL_EXPECT_EQ(anyFreshTempWarnings(r), 1);
 }
@@ -390,7 +399,7 @@ BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_fresh_class_key_warns
 // not a fresh temporary) and the value does not warn either (it is an owned
 // transfer) — confirms the value stays silent even when the key draws no
 // warning of its own to hide behind.
-BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_named_key_fresh_value_no_warn) {
+BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_named_key_fresh_value_not_rejected) {
     OwnershipResult r = check(
         "class C public static method M(): int "
         "  using var od := new OwningDictionary<Key, Item>(); "
@@ -405,10 +414,10 @@ BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_named_key_fresh_value
     BEZEL_EXPECT_EQ(anyFreshTempWarnings(r), 0);
 }
 
-// Admission is unchanged (§15.4: "the program remains accepted") — end to end
-// through the real driver, with a class-typed key so both fix #3839 branches
-// fire on the compile path that actually runs the program.
-BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_warned_program_still_compiles_and_runs) {
+// End to end through the real driver, with a class-typed key so both fix
+// #3839 branches fire on the compile path: rejected at the store site
+// (§15.4, v0.346; before that the program compiled with the warning).
+BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_fresh_key_program_is_rejected) {
     auto r = runAot(
         std::string(kPreamble) +
         "class C public static method Main(): int "
@@ -418,16 +427,16 @@ BEZEL_TEST(fresh_store_indexer_key_3395, owning_dictionary_warned_program_still_
         "  Console.WriteLine(\"count=\" + od.Count.ToString()); "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("count=2") != std::string::npos);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "§15.4 fresh-store error"));
 }
 
 // A user type's own indexer carries its own §28.14 obligations, not this
 // collection-specific rule: the sink requires a builtin head (a Named TypeRef
 // with a null declaration), so a user indexer taking a class-typed index is
 // untouched.
-BEZEL_TEST(fresh_store_indexer_key_3395, user_declared_indexer_does_not_warn) {
+BEZEL_TEST(fresh_store_indexer_key_3395, user_declared_indexer_is_not_rejected) {
     OwnershipResult r = check(
         "class Table "
         "  private _n: int := 0; "
@@ -445,13 +454,11 @@ BEZEL_TEST(fresh_store_indexer_key_3395, user_declared_indexer_does_not_warn) {
     BEZEL_EXPECT_EQ(anyFreshTempWarnings(r), 0);
 }
 
-// ── Admission is unchanged (§15.4: "the program remains accepted") ───────────
+// ── The shape is rejected end to end (§15.4, v0.346) ─────────────────────────
 
-// End-to-end through the real driver: the warned program still compiles, links
-// and runs, and both entries are present. `runAot` discards compiler stderr on a
-// successful compile, so this asserts the ADMISSION half only — the warning
-// counts above are the ownership-pass half.
-BEZEL_TEST(fresh_store_indexer_key_3395, warned_program_still_compiles_and_runs) {
+// Through the real driver: the fresh-key indexer-set program, which compiled
+// with the warning before v0.346, is rejected at the store site.
+BEZEL_TEST(fresh_store_indexer_key_3395, fresh_key_program_is_rejected) {
     auto r = runAot(
         std::string(kPreamble) +
         "class C public static method Main(): int "
@@ -461,7 +468,7 @@ BEZEL_TEST(fresh_store_indexer_key_3395, warned_program_still_compiles_and_runs)
         "  Console.WriteLine(\"count=\" + d.Count.ToString()); "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("count=2") != std::string::npos);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "§15.4 fresh-store error"));
 }

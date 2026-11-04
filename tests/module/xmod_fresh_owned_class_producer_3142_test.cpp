@@ -35,6 +35,9 @@
 //   T1c the SAME program, `Res` declared LOCALLY  clean, exit 0
 //   T2  (new Res(i)).v      x200, `Res` IMPORTED  3184 bytes / 199 allocations
 //
+// (v0.346: the T1/T1c measurements above are history — the Add spelling is now
+// §15.4's fresh-store compile error; T1/T1c are re-cut to a user plain-parameter
+// sink and T1r pins the rejection. Proposal 0207, #3047.)
 // T1c is the point of the whole file: the two programs are otherwise identical,
 // so what leaks is not the shape but the MODULE BOUNDARY. It is also the
 // differential control — it passed before the fix and must keep passing after,
@@ -113,6 +116,36 @@ int compileImportAndRunAsan3142(const std::string& libSrc,
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
 }
 
+// The importer's front-end verdict only: compile `appSrc` against `libSrc`'s
+// artifact and return the importer's error count (-2 = the dependency
+// toolchain is unavailable). For the §15.4 reject row below.
+long compileImportErrorCount3142(const std::string& libSrc,
+                                 const std::string& appSrc) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path();
+    std::string stem = unique_stem("bz3142e_");
+    TempFile3142 aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile3142 aObj((dir / (stem + "_a.o")).string());
+    writeSource3142(aSrc.path, libSrc);
+    {
+        bezel::Driver driver;
+        if (!driver.compileObject(aSrc.path, aObj.path).success) return -2;
+    }
+    if (!std::ifstream(aObj.path).good()) return -2;
+    TempFile3142 bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile3142 bExe((dir / stem).string());
+    writeSource3142(bSrc.path, appSrc);
+    bezel::Driver driver;
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    auto res = bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps);
+    if (res.success) return 0;
+    return static_cast<long>(res.errorCount);
+}
+
 // The single-module build of one source, same ASan settings — for the control.
 int compileAndRunAsan3142(const std::string& src) {
     namespace fs = std::filesystem;
@@ -141,29 +174,60 @@ const char* kDep =
 }  // namespace
 
 // ===========================================================================
-// T1 — a fresh `new` of an IMPORTED class as the argument of a BORROWING
-// `Array<T>.Add`. §28.3: the collection borrows, so the caller keeps the
-// obligation and the full-expression boundary is the call's own end (#1881).
-// Pre-fix: 3072 bytes leaked in 192 allocations. // per §28.3 / §2.8.3 rule 4
+// T1 — a fresh `new` of an IMPORTED class as a BORROWING argument. Before
+// v0.346 the sink was `arr.Add(new Res3142(i))` on a borrowing `Array<T>`
+// (#1881's path: the collection borrows, the caller keeps the obligation, the
+// call's own end is the boundary). Since v0.346 (proposal 0207, #3047 lint A)
+// that store is §15.4's fresh-store COMPILE ERROR, so the disposal half is
+// re-cut to the sink the error's own remedy names as admitted — a plain
+// parameter of a user-declared member (§15.4 v0.355: "A plain parameter of a
+// user-declared member stays admitted"): the same fresh imported temporary,
+// borrowed for one call, disposed at the call's end (§28.3 K8). The rejection
+// of the old spelling across the module boundary is pinned by T1r below.
+// Pre-fix (#3142): 3072 bytes leaked in 192 allocations on the Add spelling.
+// // per §28.3 / §2.8.3 rule 4 / §15.4
 // ===========================================================================
 BEZEL_TEST(xmod_fresh_owned_class_producer_3142,
-           imported_class_temp_in_borrowing_add_is_disposed) {
+           imported_class_temp_in_borrowing_param_is_disposed) {
     int r = compileImportAndRunAsan3142(
         kDep,
         "module AppF5_3142a; import DepF5_3142; "
         "public class C "
+        "  public static method Keep(r: Res3142): int return r.v; end Keep; "
         "  public static method Main(): int "
-        "    var arr: Array<Res3142> := new Array<Res3142>(); "
+        "    var t: int := 0; "
         "    var i: int := 0; "
         "    while i < 200 do "
         "      i := i + 1; "
-        "      arr.Add(new Res3142(i)); "
+        "      t := t + C.Keep(new Res3142(i)); "
         "    end while; "
+        "    if t <> 20100 then return 3; end if; "
         "    return 0; "
         "  end Main; "
         "end C;");
     if (r == -2) return;  // dependency toolchain unavailable — skip
     BEZEL_EXPECT_EQ(r, 0);
+}
+
+// T1r — the pre-v0.346 spelling, `arr.Add(new Res3142(i))` with `Res3142`
+// IMPORTED, is §15.4's fresh-store error across the module boundary too: the
+// rule is "of class type", and an imported class is one (§2.8.3 rule 4 — the
+// classification an import carries is the declaring module's). Exactly one
+// error: the store site. // per §15.4 (v0.355), §28.11 clause 4, §2.8.3 rule 4
+BEZEL_TEST(xmod_fresh_owned_class_producer_3142,
+           imported_class_temp_in_borrowing_add_is_fresh_store_error) {
+    long n = compileImportErrorCount3142(
+        kDep,
+        "module AppF5_3142r; import DepF5_3142; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var arr: Array<Res3142> := new Array<Res3142>(); "
+        "    arr.Add(new Res3142(1)); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    if (n == -2) return;  // dependency toolchain unavailable — skip
+    BEZEL_EXPECT_EQ(n, 1);
 }
 
 // ===========================================================================
@@ -198,13 +262,13 @@ BEZEL_TEST(xmod_fresh_owned_class_producer_3142,
 
 // ===========================================================================
 // ★ THE DIFFERENTIAL CONTROL. T1's program with `Res3142` declared in the SAME
-// module. It was already clean before the fix — the AST cast succeeds for a
+// module (re-cut with T1 to the plain-parameter sink, v0.346). It was already clean before the fix — the AST cast succeeds for a
 // local symbol — so it pins that the module boundary was the whole difference,
 // and that reading `TypeSymbol::kind` did not change the local answer.
 // // per §28.3
 // ===========================================================================
 BEZEL_TEST(xmod_fresh_owned_class_producer_3142,
-           local_class_temp_in_borrowing_add_still_disposed_control) {
+           local_class_temp_in_borrowing_param_still_disposed_control) {
     int r = compileAndRunAsan3142(
         "module LocalF5_3142; "
         "public class Res3142L "
@@ -212,13 +276,15 @@ BEZEL_TEST(xmod_fresh_owned_class_producer_3142,
         "  public constructor(x: int) v := x; end constructor; "
         "end Res3142L; "
         "public class C "
+        "  public static method Keep(r: Res3142L): int return r.v; end Keep; "
         "  public static method Main(): int "
-        "    var arr: Array<Res3142L> := new Array<Res3142L>(); "
+        "    var t: int := 0; "
         "    var i: int := 0; "
         "    while i < 200 do "
         "      i := i + 1; "
-        "      arr.Add(new Res3142L(i)); "
+        "      t := t + C.Keep(new Res3142L(i)); "
         "    end while; "
+        "    if t <> 20100 then return 3; end if; "
         "    return 0; "
         "  end Main; "
         "end C;");

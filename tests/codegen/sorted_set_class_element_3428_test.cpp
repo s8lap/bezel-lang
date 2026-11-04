@@ -59,7 +59,7 @@
 //
 // The ordering/dedup CORRECTNESS surface for the newly-admitted class and
 // interface elements (for-in, GetEnumerator, First/Last, Add/TryAdd/Remove
-// dedup, the §15.4 fresh-store warning) is pinned in
+// dedup, the §15.4 fresh-store error, v0.346) is pinned in
 // tests/codegen/sorted_set_class_element_2773_test.cpp, not here — this file
 // stays scoped to `lowerNew`'s admission/rejection boundary, matching its
 // original #3428 scope.
@@ -381,19 +381,24 @@ BEZEL_TEST(sorted_set_class_element_3428, stale_2974_constructor_claim_gone) {
 // per stdlib §4.18 (v0.286), fix #2773 (B1): the §15.4 fresh-store shape
 // #3428's "knock-on" section flagged is NO LONGER dormant for a
 // CompareTo-bearing class element — construction now succeeds, so the fresh
-// store must draw the mandatory §15.4 warning (Ownership_Checks.cpp's two
-// whitelists were widened in the same commit; the warning ITSELF is pinned in
-// sorted_set_class_element_2773_test.cpp, which uses the ownership-check
-// harness this codegen-oriented file does not link). This row only confirms
-// the program still COMPILES (no error) now that it is a real, non-dormant
-// program — dormancy is gone, per #3428's own note that this row "goes red
-// the moment construction is implemented".
+// store reaches §15.4. Before v0.346 that was a warning on a compiling program
+// and this row confirmed the program still COMPILED (Count 1). Since v0.346
+// (proposal 0207, #3047 lint A) §15.4 (v0.355) makes it "a compile error at
+// the store site" (`SortedSet` is in the borrowing family), so the row now
+// pins that the reachable shape is REJECTED by that rule — still the point of
+// #3428's note (the shape is live, not dormant: a dormant shape would fail
+// construction with a different diagnostic). // per §15.4, stdlib §4.18
 BEZEL_TEST(sorted_set_class_element_3428, fresh_store_shape_now_reachable) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_TRUE(rejectsWith(prog(
         "  using var b := new SortedSet<Ord>(); "
         "  b.Add(new Ord(1)); "
-        "  return b.Count; ")),
-        1);
+        "  return b.Count; "),
+        "§15.4 fresh-store error"));
+    BEZEL_EXPECT_TRUE(lacks(prog(
+        "  using var b := new SortedSet<Ord>(); "
+        "  b.Add(new Ord(1)); "
+        "  return b.Count; "),
+        "matches no documented constructor"));
 }
 
 // ── FALSE-REJECT GUARD: every supported element category still works ─────────

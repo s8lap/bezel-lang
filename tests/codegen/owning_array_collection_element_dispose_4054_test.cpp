@@ -172,7 +172,7 @@ BEZEL_TEST(owning_array_collection_element_dispose_4054, dictionary_int_int) {
 //
 //    Note the `using var r := new R()` binding — `items.Add(new R())` would
 //    be a §28.3 fresh unbound owned temporary stored into a borrowing-family
-//    collection (§15.4 fresh-store warning), the slot holds a borrow of a
+//    collection (§15.4 fresh-store error since v0.346), the slot holds a borrow of a
 //    value that dies at the statement's end. The named binding fixes it.
 BEZEL_TEST(owning_array_collection_element_dispose_4054, no_double_free_borrowed_elems) {
     constexpr const char* kSrc =

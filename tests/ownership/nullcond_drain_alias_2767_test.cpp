@@ -204,8 +204,12 @@ BEZEL_TEST(nullcond_drain_alias_2767,
         "class P "
         "  public static method Main(): int "
         "    do "
+        // The elements are bound to named holders first: `arr.Add(new R())`
+        // is §15.4's fresh-store error since v0.346 (proposal 0207, #3047
+        // lint A), and this row's subject is the frame adoption below.
+        "      using var r1 := new R(); using var r2 := new R(); "
         "      using var arr := new Array<R>(); "
-        "      arr.Add(new R()); arr.Add(new R()); "
+        "      arr.Add(r1); arr.Add(r2); "
         "      using var f := new Factory(arr); "
         "      var fbn: Factory? := f; "
         "      for var x in fbn?.Drain() do "

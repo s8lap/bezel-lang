@@ -414,10 +414,15 @@ BEZEL_TEST(sorted_set_no_compareto_3865,
 // ── FALSE-REJECT: `Dictionary<K,V>` shares the SAME `hasObjectHeaderEquality`/
 // ── `recordTypeOfRef` key eligibility — confirm actual computed VALUES. ────
 
+// The keys are named `using var` bindings: a fresh `new ClassNoCmp(…)` key is
+// §15.4's fresh-store error since v0.346 (proposal 0207, #3047 lint A) — the
+// key position of a borrowing `Dictionary` is a store position — and this row
+// is about the key-ELIGIBILITY check, not the store. // per §15.4, §4.8
 BEZEL_TEST(sorted_set_no_compareto_3865, dictionary_class_key_no_compareto_unaffected) {
     BEZEL_EXPECT_EQ(run(prog(
+        "  using var k3 := new ClassNoCmp(3); using var k1 := new ClassNoCmp(1); "
         "  var d := new Dictionary<ClassNoCmp, int>(); "
-        "  d.Add(new ClassNoCmp(3), 30); d.Add(new ClassNoCmp(1), 10); "
+        "  d.Add(k3, 30); d.Add(k1, 10); "
         "  return d.Count; ")),
         2);
 }

@@ -32,8 +32,9 @@ implementation is worse than no case, because it teaches the wrong rule.
 
 `warn` is for the handful of rules whose consequence is a diagnostic that does
 not stop the compile: the must-use warning on an undischarged plain-`var` owned
-local, the fresh-store warning on a borrowing collection, the use-after-dispose
-warning, the terminal-accessor provenance warning. Those are normative and an
+local, the use-after-dispose warning, the terminal-accessor provenance warning.
+(The §15.4 fresh-store diagnostic was a `warn` rule until v0.346; it is an
+error now, and its cases are `reject`.) Those are normative and an
 `accept` case cannot tell them from silence. A `warn` case passes when the
 compile succeeds *and* says something; which wording is reported, not gated.
 

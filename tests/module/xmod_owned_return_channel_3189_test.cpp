@@ -422,35 +422,62 @@ BEZEL_TEST(xmod_owned_return_channel_3189, t3_imported_owned_operator_chain_25) 
 
 // ===========================================================================
 // T4 — §28.3 (#1881): a fresh imported `owned` producer passed to a BORROWING
-// `Array<T>.Add`. The collection borrows, so the caller keeps the obligation
-// and the boundary is the call's own end. This is the second, independent
-// codegen consumer of `isFreshOwnedClassProducer` (LlvmBackend_Calls.cpp), so a
-// fix that repaired only the receiver path would leave this row red.
-// Pre-fix: 672 bytes leaked in 42 allocations under LSan.
-//
-// The array is never READ after the loop — per §28.3 the element the collection
-// borrowed dies at the end of the adding expression, so reading it would be the
-// language's own dangling-borrow case, not this fix's subject.
+// position. The callee borrows, so the caller keeps the obligation and the
+// boundary is the call's own end. Before v0.346 the borrowing position was
+// `arr.Add(Cell.MakeIt(i))` on an `Array<T>` (LlvmBackend_Calls.cpp's
+// borrowing-collection `Add` argument, the second independent codegen
+// consumer of `isFreshOwnedClassProducer`). Since v0.346 (proposal 0207,
+// #3047 lint A) that store is §15.4's fresh-store COMPILE ERROR — pinned by
+// T4r below — so the disposal half is re-cut to the sink §15.4 (v0.355) keeps
+// admitted: "A plain parameter of a user-declared member stays admitted".
+// Pre-fix (#3189, Add spelling): 672 bytes leaked in 42 allocations under LSan.
 // ===========================================================================
-BEZEL_TEST(xmod_owned_return_channel_3189, t4_imported_producer_into_borrowing_add_28_3) {
+BEZEL_TEST(xmod_owned_return_channel_3189, t4_imported_producer_into_borrowing_param_28_3) {
     const std::string prog =
         "public class Program "
+        "  public static method Keep(c: Cell): int => c.V; "
         "  public static method Main(): int "
+        "    var t: int := 0; "
         "    do "
-        "      var arr: Array<Cell> := []; "
         "      var i: int := 0; "
         "      while i < 7 do "
-        "        arr.Add(Cell.MakeIt(i)); "
+        "        t := t + Program.Keep(Cell.MakeIt(i)); "
         "        i := i + 1; "
         "      end while; "
         "    end; "
+        "    if t <> 21 then return 100; end if; "
         "    return Cell.GetN(); "
         "  end Main; "
         "end Program;";
     int imported = run3189(importedApp3189(prog), true, "t4i");
     if (imported == -2) return;  // no toolchain — SKIP
-    BEZEL_EXPECT_EQ(imported, 0);  // pre-fix: 7
+    BEZEL_EXPECT_EQ(imported, 0);
     BEZEL_EXPECT_EQ(run3189(localApp3189(prog), false, "t4l"), 0);
+}
+
+// T4r — the pre-v0.346 T4 spelling, `arr.Add(Cell.MakeIt(i))`: an
+// `owned`-returning call result stored into a borrowing `Array<T>` is §15.4's
+// fresh-store error (v0.355: "an `owned`-returning call result … in a
+// single-element store position of a borrowing-family collection is a compile
+// error at the store site"), and identically so across the module boundary —
+// the imported factory's `owned` return is carried in its metadata (#3189).
+// // per §15.4, §28.11 clause 4, §2.8.3 rule 4
+BEZEL_TEST(xmod_owned_return_channel_3189, t4r_imported_producer_into_borrowing_add_is_fresh_store_error) {
+    const std::string prog =
+        "public class Program "
+        "  public static method Main(): int "
+        "    var arr: Array<Cell> := []; "
+        "    arr.Add(Cell.MakeIt(1)); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    std::string errI, errL;
+    int imported = run3189(importedApp3189(prog), true, "t4ri", &errI);
+    if (imported == -2) return;  // no toolchain — SKIP
+    BEZEL_EXPECT_EQ(imported, -1);
+    BEZEL_EXPECT_TRUE(errI.find("§15.4 fresh-store error") != std::string::npos);
+    BEZEL_EXPECT_EQ(run3189(localApp3189(prog), false, "t4rl", &errL), -1);
+    BEZEL_EXPECT_TRUE(errL.find("§15.4 fresh-store error") != std::string::npos);
 }
 
 // ===========================================================================

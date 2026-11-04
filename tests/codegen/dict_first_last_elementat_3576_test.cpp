@@ -186,7 +186,10 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_first_last_elementat_4_8) 
 }
 
 // stdlib §4.8: a class-typed V — the decode's pointer/borrow arm, not the
-// scalar ptrtoint arm. `fe.Value.Tag` reads the borrow directly.
+// scalar ptrtoint arm. `fe.Value.Tag` reads the borrow directly. The value
+// is a named `using var` that outlives the read: the earlier `d.Add(1, new
+// R(7))` read a dead element (proposal 0207 §2's silent wrong read) and is
+// §15.4's fresh-store error since v0.346 (#3047 lint A). // per §15.4
 BEZEL_TEST(dict_first_last_elementat_3576, dictionary_class_value_first_4_8) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
@@ -194,8 +197,9 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_class_value_first_4_8) {
         "  public constructor(t: int) Tag := t; end constructor; "
         "end R; "
         "class C public static method Main(): int "
+        "  using var r := new R(7); "
         "  var d := new Dictionary<int, R>(); "
-        "  d.Add(1, new R(7)); "
+        "  d.Add(1, r); "
         "  var fe := d.First(); "
         "  return fe.Key * 10 + fe.Value.Tag; "
         "end Main; end C;"), 17);

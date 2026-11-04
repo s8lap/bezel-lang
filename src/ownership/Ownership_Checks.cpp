@@ -3562,6 +3562,11 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         return;
     }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // §15.4 / §28.11 clause 4 (v0.355): a single-element store in a READ
+        // position — `var b := s.TryAdd(new Item(1));`, a `GetOrAdd` result —
+        // is a store position too; the statement walk reaches only a call
+        // that is a statement. Once per call node. // per §15.4
+        checkSec154FreshStoreCall(*call);
         // Treat the callee as a member-access-target for discharge
         // tolerance (so `x.M(x)` doesn't flag x).
         if (call->callee) checkRead(*call->callee, true);
@@ -13018,7 +13023,7 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
     // of `OwningDictionary<K, V>`, a borrowing position" — it owns its
     // values and not its keys (stdlib §4.9), so a fresh class-typed key
     // dangles at its K8 boundary exactly as a `Dictionary` key does. Only
-    // `Add`/`TryAdd`'s key (args[0]) draws the warning; the value stays
+    // `Add`/`TryAdd`'s key (args[0]) draws the error; the value stays
     // silent. No "use the owning family" remedy clause is emitted here —
     // not because of `isDictionaryKeyPosition`, but because
     // `sec154HeadHasOwningTwin` never whitelisted `OwningDictionary`
@@ -13032,17 +13037,8 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
     // the general escape-rejection walk below, which is for the ordinary
     // borrowing family only.
     if (!borrowingFamily) {
-        if (storing && cn == "OwningDictionary" && !call.args.empty() &&
-            call.args[0].value) {
-            const ast::IdentifierExpr* odRoot = identifierRoot(*ma->target);
-            const std::string recvNameForWarn =
-                odRoot ? std::string(odRoot->name) : std::string("it");
-            const std::string storeSpelling =
-                std::string("`.") + std::string(m) + "(...)` store";
-            warnSec154FreshStore(*call.args[0].value, storeSpelling,
-                                 recvNameForWarn, cn,
-                                 /*isDictionaryKeyPosition=*/true);
-        }
+        if (storing && cn == "OwningDictionary")
+            checkSec154FreshStoreCall(call);
         return;
     }
 
@@ -13085,30 +13081,12 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         kind = RecvKind::Escapes;
     }
 
-    // §15.4 fresh-store warning (v0.243) — the storing-method-CALL half of the
-    // shared sink; `checkIndexerSetBorrowStoreEscape` is the other. Emitted
-    // BEFORE the `RecvKind::Unknown` bail below on purpose: §15.4's must-warn is
-    // not conditioned on the receiver's scope ("Because the retention is
-    // statically certain to outlive the value…"), since a borrowing collection
-    // outlives the K8 boundary of the statement storing into it in EVERY
-    // receiver shape — including the roots the escape rule below declines to
-    // classify. The BULK `AddRange` is excluded: its argument is a COLLECTION
-    // whose elements are copied out, and §15.4 names the element store positions
-    // ("`Add`/`Insert` and the indexer-set"), so a fresh source collection's own
-    // death leaves no dangling element slot behind. // per §15.4, §28.11
-    if (storing) {
-        const std::string recvNameForWarn =
-            recvRoot ? std::string(recvRoot->name) : std::string("it");
-        const std::string storeSpelling =
-            std::string("`.") + std::string(m) + "(...)` store";
-        const bool dictHead = (cn == "Dictionary" || cn == "SortedDictionary");
-        for (std::size_t i = 0; i < call.args.size(); ++i) {
-            if (!call.args[i].value) continue;
-            warnSec154FreshStore(*call.args[i].value, storeSpelling,
-                                 recvNameForWarn, cn,
-                                 /*isDictionaryKeyPosition=*/dictHead && i == 0);
-        }
-    }
+    // §15.4 fresh-store error (v0.346; the v0.243 warning promoted) — the
+    // storing-method-CALL half of the shared sink, for the ordinary borrowing
+    // family (the `OwningDictionary` key returned above, through the same
+    // helper). Run BEFORE the `RecvKind::Unknown` bail below on purpose: the
+    // rule is not conditioned on the receiver's scope. // per §15.4, §28.11
+    if (storing) checkSec154FreshStoreCall(call);
 
     if (kind == RecvKind::Unknown) {
         // §28.3 *Diagnostics* "The trust-admission report" (v0.307, #4605):
@@ -13380,7 +13358,7 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         // Restricted to the ELEMENT store: the bulk `AddRange` arm above has
         // its own resolution path (its argument is a COLLECTION whose elements
         // are copied out — §28.11 *Value-copy members*), and the §15.4
-        // fresh-store warning below already covers a fresh literal argument.
+        // fresh-store error below already covers a fresh literal argument.
         //
         // The recognizer also matches a §21.1 `const` local, but the
         // depth comparison below cannot decide a `const` source:
@@ -13736,7 +13714,7 @@ void MethodOwnership::checkRefOutLocationOutlivesCall(
 }
 
 // per §15.4 (v0.243) / §28.11 *The element slot policy*: is `t` the CLASS-typed
-// population §15.4's fresh-store warning names ("a fresh unbound owned temporary
+// population §15.4's fresh-store error names ("a fresh unbound owned temporary
 // of **class type**")? §28.11's element-category table puts the other categories
 // in columns whose store cannot dangle: a value type "copies the value in", and
 // a runtime-managed reference (`string`, function types — §28.9) "stores the
@@ -13758,7 +13736,7 @@ static bool sec154StoreArgIsClassTyped(const sema::TypeRef* t) {
 }
 
 // per §15.4 (v0.243): the borrowing-family heads that HAVE an owning twin, so
-// the warning's second remedy ("use the owning family, whose store positions
+// the diagnostic's second remedy ("use the owning family, whose store positions
 // take ownership") can be named concretely. `SortedDictionary` / `SortedSet`
 // have no owning form in the stdlib (§4), so the remedy is omitted for them
 // rather than inventing `OwningSortedDictionary` — a diagnostic that names a
@@ -13769,7 +13747,54 @@ static bool sec154HeadHasOwningTwin(std::string_view head) {
            head == "Stack" || head == "Queue" || head == "Dictionary";
 }
 
-void MethodOwnership::warnSec154FreshStore(const ast::Expr& arg,
+// per §15.4 (v0.355) / §28.11 clause 4: see the declaration comment. The
+// store-member set is `checkCollectionBorrowStoreEscape`'s single-element
+// `storing` set (§28.11 value-copy shape (ii)); the bulk `AddRange` is not a
+// single-element store and is outside the rule.
+void MethodOwnership::checkSec154FreshStoreCall(const ast::CallExpr& call) {
+    if (!call.callee) return;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return;
+    const std::string_view m = ma->member;
+    const bool storing = m == "Add" || m == "Insert" || m == "TryAdd" ||
+                         m == "AddFirst" || m == "AddLast" ||
+                         m == "AddBefore" || m == "AddAfter" || m == "Push" ||
+                         m == "Enqueue" || m == "GetOrAdd";
+    if (!storing) return;
+    const sema::TypeRef* tt = ctx_.exprType(*ma->target);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
+        return;
+    const std::string_view cn = tt->headName();
+    const bool borrowingFamily =
+        cn == "Array" || cn == "Dictionary" || cn == "SortedDictionary" ||
+        cn == "Set" || cn == "SortedSet" || cn == "Stack" || cn == "Queue" ||
+        cn == "LinkedList";
+    const bool owningDictKey = cn == "OwningDictionary";
+    if (!borrowingFamily && !owningDictKey) return;
+    if (!suppressDiag_ && !sec154FreshStoreCallsSeen_.insert(&call).second)
+        return;
+    const ast::IdentifierExpr* recvRoot = identifierRoot(*ma->target);
+    const std::string recvName =
+        recvRoot ? std::string(recvRoot->name) : std::string("it");
+    const std::string storeSpelling =
+        std::string("`.") + std::string(m) + "(...)` store";
+    // `OwningDictionary<K, V>` owns its values and not its keys (stdlib
+    // §4.9): only the key (args[0]) is a borrowing position.
+    if (owningDictKey) {
+        if (!call.args.empty() && call.args[0].value)
+            rejectSec154FreshStore(*call.args[0].value, storeSpelling, recvName,
+                                   cn, /*isDictionaryKeyPosition=*/true);
+        return;
+    }
+    const bool dictHead = (cn == "Dictionary" || cn == "SortedDictionary");
+    for (std::size_t i = 0; i < call.args.size(); ++i) {
+        if (!call.args[i].value) continue;
+        rejectSec154FreshStore(*call.args[i].value, storeSpelling, recvName, cn,
+                               /*isDictionaryKeyPosition=*/dictHead && i == 0);
+    }
+}
+
+void MethodOwnership::rejectSec154FreshStore(const ast::Expr& arg,
                                            std::string_view storeSpelling,
                                            std::string_view recvName,
                                            std::string_view collHead,
@@ -13818,7 +13843,7 @@ void MethodOwnership::warnSec154FreshStore(const ast::Expr& arg,
     // for a class with a non-static `owned` field whose OWN declared type
     // is itself trivial-dispose (or a generic instantiation, e.g.
     // `OwningBox<Random>`, that only classifies trivial-dispose once
-    // substituted): the surrounding `warnSec154FreshStore` warning still
+    // substituted): the surrounding `rejectSec154FreshStore` warning still
     // fires either way, so this is not an accept/reject change — but it
     // ends the site's disagreement with the class's own compile-time
     // verdict everywhere else in the compiler (the five sites above).
@@ -13841,8 +13866,10 @@ void MethodOwnership::warnSec154FreshStore(const ast::Expr& arg,
                   "`), whose store positions take ownership"
             : std::string();
 
+    // §15.4 / §28.11 clause 4 (v0.346, proposal 0207): an ERROR at the store
+    // site — the v0.243 lint's predicate and content, promoted (#3047 lint A).
     report(
-        Severity::Warning, arg.span.begin,
+        Severity::Error, arg.span.begin,
         std::string("this ") + std::string(storeSpelling) + " on `" +
         std::string(recvName) +
         "` stores a fresh unbound owned temporary into a borrowing-family "
@@ -13854,7 +13881,7 @@ void MethodOwnership::warnSec154FreshStore(const ast::Expr& arg,
         "; bind the source to a named holder first — `using var t := …;`, "
         "then store `t`, whose own lifetime the §28.11 store rule then "
         "checks" + owningRemedy +
-        " (§15.4 fresh-store warning, v0.243; §28.11)");
+        " (§15.4 fresh-store error, v0.346; §28.11)");
 }
 
 // §28.11 "Storing a borrow" (v0.180; hole closed #1884). §28.11 lists the store
@@ -13916,7 +13943,7 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
             odRoot ? std::string(odRoot->name) : std::string("it");
         for (const ast::CallArgument& idx : ix->indices) {
             if (!idx.value) continue;
-            warnSec154FreshStore(*idx.value, "`coll[key] := …` key store",
+            rejectSec154FreshStore(*idx.value, "`coll[key] := …` key store",
                                  recvNameForWarn, cn,
                                  /*isDictionaryKeyPosition=*/true);
         }
@@ -13942,11 +13969,11 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
         cn == "LinkedList";
     if (!borrowingFamily) return false;
 
-    // §15.4 fresh-store warning (v0.243) — the indexer-set half of the shared
+    // §15.4 fresh-store error (v0.346; the v0.243 warning promoted) — the indexer-set half of the shared
     // sink (§15.4 names "`Add`/`Insert` and the indexer-set, key and value
     // positions alike" in one breath, so both sinks route through the one
     // authority). Emitted before the scope-comparison rejection below, which it
-    // neither gates nor is gated by: the warning fires on the argument's
+    // neither gates nor is gated by: the error fires on the argument's
     // FRESHNESS, the rejection on a named source's SCOPE, and no expression is
     // both.
     //
@@ -13958,7 +13985,7 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
     // `as.value`, so the two sinks disagreed about the same store: `d.Add(new
     // Key(), v)` warned while `d[new Key()] := v` said nothing. Wiring, not new
     // machinery — the freshness question is answered by the one
-    // `warnSec154FreshStore` authority (producerState, the §28.3 producers
+    // `rejectSec154FreshStore` authority (producerState, the §28.3 producers
     // table) for both positions.
     //
     // The index is examined ONLY for a DICTIONARY head, because only there is it
@@ -13969,7 +13996,7 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
     // not retained in any slot, so it is not a store position and draws nothing.
     // `OwningDictionary` never reaches this block — the fix #3839 branch above
     // (before the owned-setter bail) already answered its key, and its VALUE
-    // stays excluded: §15.4 scopes the must-warn to "a store-position argument
+    // stays excluded: §15.4 scopes the rejection to "a store-position argument
     // on a **borrowing-family** collection" for the value position, and the
     // storing-call sink excludes it identically — the two sinks stay
     // symmetric there. // per §15.4, §28.11
@@ -13981,12 +14008,12 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
         if (cn == "Dictionary" || cn == "SortedDictionary") {
             for (const ast::CallArgument& idx : ix->indices) {
                 if (!idx.value) continue;
-                warnSec154FreshStore(*idx.value, "`coll[key] := …` key store",
+                rejectSec154FreshStore(*idx.value, "`coll[key] := …` key store",
                                      recvNameForWarn, cn,
                                      /*isDictionaryKeyPosition=*/true);
             }
         }
-        warnSec154FreshStore(*as.value, "`coll[i] := …` store", recvNameForWarn,
+        rejectSec154FreshStore(*as.value, "`coll[i] := …` store", recvNameForWarn,
                              cn, /*isDictionaryKeyPosition=*/false);
     }
 
@@ -27419,7 +27446,7 @@ bool MethodOwnership::builtinCollectionStoreCallee(const ast::Expr* callee) {
     // narrow #3696 (spec §28.14 / stdlib §4.18, v0.286): `SortedSet` was the
     // third built-in collection family absent from this disjunction — distinct
     // from the two whitelists #3428 named (both fixed by #2773 (B1)) which
-    // gate §15.4 fresh-store warnings on a borrow-store collection receiver.
+    // gate §15.4 fresh-store errors on a borrow-store collection receiver.
     // This site is the §28.14 call-boundedness walk's sink (used by
     // `callBoundedWalkExpr` / `processFanoutAdd`), not the §15.4 warning — so
     // `SortedSet` here was deliberately NOT in scope for #3428, filed here

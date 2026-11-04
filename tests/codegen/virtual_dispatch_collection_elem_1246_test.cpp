@@ -175,7 +175,10 @@ BEZEL_TEST(virtual_dispatch_collection_elem_1246,
 // ── (e) LinkedList<T> variant ────────────────────────────────────────────────
 
 // §14.2 / §12 (#1246): same unification fix for LinkedList<T>. D.V()=4 twice
-// → 8. Before the fix: 0.
+// → 8. Before the fix: 0. The elements are named `using var` bindings: the
+// earlier `ll.AddLast(new D())` read dead elements' `V()` (each fresh `D`
+// died at its K8 boundary) and is §15.4's fresh-store error since v0.346
+// (proposal 0207, #3047 lint A). // per §15.4
 BEZEL_TEST(virtual_dispatch_collection_elem_1246,
            forin_linked_list_class_constraint_spec_12_14_2) {
     BEZEL_EXPECT_EQ(run(
@@ -193,8 +196,9 @@ BEZEL_TEST(virtual_dispatch_collection_elem_1246,
         "  end Run; "
         "end G; "
         "class C public static method Main(): int "
+        "  using var d1 := new D(); using var d2 := new D(); "
         "  using var ll := new LinkedList<B>(); "
-        "  ll.AddLast(new D()); ll.AddLast(new D()); "
+        "  ll.AddLast(d1); ll.AddLast(d2); "
         "  return G.Run(ll); "   // D.V()=4 twice → 8
         "end Main; end C;"), 8);
 }

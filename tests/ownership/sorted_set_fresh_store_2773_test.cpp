@@ -1,5 +1,7 @@
 // Spec-derived regression test for fix #2773 (B1) — `SortedSet<T>` joins the
-// §15.4 fresh-store warning's borrowing-family whitelist.
+// §15.4 fresh-store rule's borrowing-family whitelist. (The rule was a
+// warning when this was written; since v0.346 (proposal 0207, #3047 lint A)
+// it is a compile error, and the rows count the error.)
 //
 // BACKGROUND. Issue #3428 (v0.283) flagged, as a "knock-on" of its own
 // rejection: `SortedSet` was absent from BOTH borrowing-family whitelists in
@@ -53,8 +55,8 @@ OwnershipResult check(const std::string& body) {
 int freshStoreWarnings(const OwnershipResult& r) {
     int n = 0;
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
-        if (d.message.find("§15.4 fresh-store warning") == std::string::npos)
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("§15.4 fresh-store error") == std::string::npos)
             continue;
         ++n;
     }
@@ -64,9 +66,9 @@ int freshStoreWarnings(const OwnershipResult& r) {
 }  // namespace
 
 // per §15.4 / stdlib §4.18 (v0.286), fix #2773 (B1): `SortedSet<Ord>.Add` of a
-// fresh `new Ord(...)` temporary must draw the mandatory warning — the exact
+// fresh `new Ord(...)` temporary must draw the §15.4 fresh-store error — the exact
 // shape #3428's "knock-on" section named and its own test pinned DORMANT.
-BEZEL_TEST(sorted_set_fresh_store_2773, sortedset_add_fresh_temp_warns) {
+BEZEL_TEST(sorted_set_fresh_store_2773, sortedset_add_fresh_temp_rejects) {
     OwnershipResult r = check(
         "class C public static method M(): int "
         "  using var s := new SortedSet<Ord>(); "
@@ -74,14 +76,14 @@ BEZEL_TEST(sorted_set_fresh_store_2773, sortedset_add_fresh_temp_warns) {
         "  return s.Count; "
         "end M; end C;");
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 1);
-    // "The warning does not narrow the admission" (§15.4) — the program is
-    // still accepted, no error.
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // §15.4 (v0.346, proposal 0207; #3047 lint A): the store is a compile
+    // ERROR at the store site (a warning before v0.346).
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // per §15.4 (v0.286): a NAMED holder draws no warning — the remedy §15.4
 // itself names ("bind the source to a named holder first").
-BEZEL_TEST(sorted_set_fresh_store_2773, sortedset_add_named_holder_no_warning) {
+BEZEL_TEST(sorted_set_fresh_store_2773, sortedset_add_named_holder_not_rejected) {
     OwnershipResult r = check(
         "class C public static method M(): int "
         "  using var s := new SortedSet<Ord>(); "
@@ -104,7 +106,7 @@ BEZEL_TEST(sorted_set_fresh_store_2773, sortedset_has_no_indexer_store_position)
         "  s.Add(new Ord(3)); "
         "  return s.Count; "
         "end M; end C;");
-    // Exactly the ONE `.Add` warning — nothing from an indexer sink, because
+    // Exactly the ONE `.Add` error — nothing from an indexer sink, because
     // `SortedSet<T>` (stdlib §4.18) declares no `[i: int]`/`[key: K]`
     // property for `checkIndexerSetBorrowStoreEscape` to ever match.
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 1);

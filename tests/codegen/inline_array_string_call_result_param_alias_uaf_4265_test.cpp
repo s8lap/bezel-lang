@@ -137,7 +137,9 @@ int runChecked(const std::string& program) {
 // jitter on an identical binary/program). Used here only for the
 // TYPE-KIND-BOUNDARY control (a heap `Array<string>` factory), never for a
 // FAIL-WITHOUT/PASS-WITH UAF row.
-bool leaksAtLeast(const std::string& program, long minBytes) {
+// No caller since v0.346 (its one row became a §15.4 rejection); kept for the
+// next TYPE-KIND-BOUNDARY row rather than churning the oracle surface.
+[[maybe_unused]] bool leaksAtLeast(const std::string& program, long minBytes) {
     auto r = runAotChecked(program);
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (r.ran) return false;  // no sanitizer finding at all — wrongly clean
@@ -311,12 +313,18 @@ BEZEL_TEST(inline_array_string_call_result_param_alias_uaf_4265,
         r, "returns class/interface type `Array` without `owned`"));
 }
 
-// Legal leak control (measured: 799 allocations / 44085 bytes leaked at 200
-// iterations under LSan). An `owned Array<string>` factory result handed to a
-// BORROWING collection's Add is §15.4's documented hazard: the borrowing
-// collection never frees the fresh temporary, so it leaks (and is never a UAF).
+// Formerly the legal leak control (measured: 799 allocations / 44085 bytes
+// leaked at 200 iterations under LSan): an `owned Array<string>` factory result
+// handed to a BORROWING collection's Add was §15.4's documented hazard (a
+// warning) and leaked. Since v0.346 (proposal 0207, #3047 lint A) the program
+// is invalid — §15.4 (v0.355): "an `owned`-returning call result … in a
+// single-element store position of a borrowing-family collection is a compile
+// error at the store site" (`Array<string>` is a class type) — so, like the row
+// above, this is a spec-driven program-invalid flip, not an oracle weakening:
+// the program no longer runs, so it can neither leak nor UAF, and the row now
+// pins the rejection. // per §15.4, §28.11 clause 4
 BEZEL_TEST(inline_array_string_call_result_param_alias_uaf_4265,
-           heap_array_string_owned_factory_into_borrowing_add_still_leaks_not_uaf) {
+           heap_array_string_owned_factory_into_borrowing_add_is_fresh_store_error) {
     const char* prog =
         "module M; "
         "class Helper "
@@ -335,7 +343,12 @@ BEZEL_TEST(inline_array_string_call_result_param_alias_uaf_4265,
         "    return 0; "
         "  end Main; "
         "end C;";
-    BEZEL_EXPECT_TRUE(leaksAtLeast(prog, 2000));
+    auto r = bezel::test::runAot(prog);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "§15.4 fresh-store error"));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "`.Add(...)` store"));
 }
 
 // ===========================================================================

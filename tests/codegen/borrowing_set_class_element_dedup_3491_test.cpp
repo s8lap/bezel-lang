@@ -40,6 +40,7 @@
 // fix's directive; not closed or referenced by this commit.
 
 #include "support/codegen_support.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -183,54 +184,45 @@ BEZEL_TEST(borrowing_set_class_element_dedup_3491, add_duplicate_not_disposed_by
         "  return Box._n; end Main; end C;"), 2);
 }
 
-// Adversarial-review row: pin the fresh-owned-producer disposal this fix
-// ADDS (mirroring #1881's rule for the generic borrowing Add path) — a
-// borrowing Set<T> never owns `item`, so `new Box(...)` passed directly to
-// `.Add` must be disposed exactly once at the end of that call's full
-// expression, whether or not the dedup scan accepts it. This row is the
-// ACCEPTED case: the set is empty, so `new Box(1)` is not a duplicate of
-// anything (no comparand exists yet to scan, so no dangling-borrow read is
-// possible here) — it is appended (a now-dangling borrow left in `s`,
-// per §28.3's accepted residual) AND disposed once. Uses runAotChecked (not
-// runAot): this is the row a hand-run probe cannot stand in for — only the
-// checked/ASan+LSan harness actually verifies dispose-exactly-once rather
-// than just the destructor-count side channel.
-BEZEL_TEST(borrowing_set_class_element_dedup_3491, add_fresh_producer_disposed_once_when_accepted) {
-    BEZEL_EXPECT_EQ(runChecked(std::string(kBox) +
+// Adversarial-review rows (pre-v0.346): these pinned the #1881 disposal of a
+// fresh `new Box(1)` passed straight to a borrowing `Set<Box>.Add` — once on
+// the ACCEPTED path (empty set) and once on the dedup-REJECTED path (a live
+// content-equal comparand `a`). Since v0.346 (proposal 0207, #3047 lint A)
+// that argument is §15.4's fresh-store COMPILE ERROR (v0.355: "a fresh unbound
+// owned temporary of class type … in a single-element store position of a
+// borrowing-family collection is a compile error at the store site"; `Set` is
+// in the family), whichever path the dedup scan would take — so both rows now
+// pin the rejection. The K8.1 boundary disposal they observed is re-pinned at
+// a user-declared plain-parameter sink in
+// borrowing_collection_add_temp_disposal_1881_test.cpp (`plain_param_sink_*`).
+// // per §15.4, §28.11 clause 4
+static void expectFreshStoreError3491(const std::string& prog) {
+    auto r = runAotChecked(prog);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(
+        bezel::test::diagnosticMessageContains(r, "§15.4 fresh-store error"));
+    BEZEL_EXPECT_TRUE(
+        bezel::test::diagnosticMessageContains(r, "`.Add(...)` store"));
+}
+
+BEZEL_TEST(borrowing_set_class_element_dedup_3491, add_fresh_producer_when_accepted_is_fresh_store_error) {
+    expectFreshStoreError3491(std::string(kBox) +
         "public static method Main(): int "
         "  do var s := new Set<Box>(); "
         "    s.Add(new Box(1)); "
         "    return Box._n; end; "
-        "  return 0; end Main; end C;"), 1);
+        "  return 0; end Main; end C;");
 }
 
-// Adversarial-review row, the REJECTED case: `a` is kept alive as a `using
-// var` (not disposed until this block's end, i.e. AFTER the return
-// statement's value is captured) so the dup-scan inside the second `.Add`
-// compares the fresh `new Box(1)` against a LIVE comparand — deliberately
-// NOT the shape of two back-to-back fresh-producer Adds, which would make
-// the second call's scan dereference the FIRST call's already-disposed
-// (dangling) element; that hazard is real but pre-existing (Contains faults
-// identically on the same program) and out of scope for this fix, per
-// adversarial review. `s.Add(a)` does not trigger #1881 disposal (`a` is a
-// named-binding read, not a fresh producer — isFreshOwnedClassProducer is
-// false); `a` stays owned by the caller throughout. The second `.Add(new
-// Box(1))` is content-equal to `a` (§8.3, user Equals override) so the
-// borrowing dedup scan REJECTS it (dupDisposer is null — a borrowing Set<T>
-// never disposes a rejected duplicate, §28.11 v0.135) — but the #1881 rule
-// still disposes the rejected fresh-producer argument itself, once, because
-// the set never took ownership of it either way. `Box._n` is read (and `a`
-// is still alive) before `a`'s own using-var disposal fires at block end, so
-// this row isolates exactly the rejected-path disposal count: 1.
-BEZEL_TEST(borrowing_set_class_element_dedup_3491, add_fresh_producer_disposed_once_when_rejected) {
-    BEZEL_EXPECT_EQ(runChecked(std::string(kBox) +
+BEZEL_TEST(borrowing_set_class_element_dedup_3491, add_fresh_producer_when_rejected_is_fresh_store_error) {
+    expectFreshStoreError3491(std::string(kBox) +
         "public static method Main(): int "
         "  do using var a := new Box(1); "
         "    var s := new Set<Box>(); "
         "    s.Add(a); "
         "    s.Add(new Box(1)); "
         "    return Box._n; end; "
-        "  return 0; end Main; end C;"), 1);
+        "  return 0; end Main; end C;");
 }
 
 // Control row (task requirement): a VALUE-typed element Set<int> is

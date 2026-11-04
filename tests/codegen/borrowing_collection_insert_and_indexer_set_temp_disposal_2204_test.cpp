@@ -1,3 +1,14 @@
+// ── v0.346 (proposal 0207, #3047 lint A) ──────────────────────────────────
+// The literal-only carve-out quoted below is GONE. §15.4 (v0.355): "a fresh
+// unbound owned temporary of class type … in a single-element store position
+// of a borrowing-family collection is a compile error at the store site", the
+// positions including `Insert` and "the indexer-set, key and value alike". The
+// fresh-temporary `Insert` / indexer-set rows below therefore pin the
+// REJECTION now; the K8.1 boundary disposal they observed is re-pinned at a
+// user-declared plain-parameter sink in
+// borrowing_collection_add_temp_disposal_1881_test.cpp (`plain_param_sink_*`).
+// The named-borrow and owning-family controls are unchanged.
+// ──────────────────────────────────────────────────────────────────────────
 // fix #2204 — §28.3 (unbound owned temporaries) + §28.11 (borrowing
 // collections / the store-a-borrow rule), spec v0.226. Codegen-observable,
 // LeakSanitizer-checked coverage for: an owned TEMPORARY (`new R(1)`)
@@ -64,6 +75,7 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
 #include "test_harness.hpp"
 
@@ -85,6 +97,16 @@ const char* kR =
     "  destructor _n := _n + 1; end destructor; "
     "end R; ";
 
+// §15.4 (v0.355): the program is rejected at compile time, by the fresh-store
+// rule, naming the store spelling.
+void expectFreshStoreError(const std::string& src, const char* store) {
+    auto r = runAotChecked(src);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(
+        bezel::test::diagnosticMessageContains(r, "§15.4 fresh-store error"));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, store));
+}
+
 std::string prog(const std::string& classesAfterR, const std::string& mainBody) {
     return std::string("module M; ") + kR + classesAfterR +
            "class C public static method Main(): int " + mainBody +
@@ -96,30 +118,29 @@ std::string prog(const std::string& classesAfterR, const std::string& mainBody) 
 // ===========================================================================
 // THE BUG (issue's own repro shape) — `arr.Insert(0, new R(1))` on a
 // borrowing `Array<R>`: the temporary is disposed at the end of the
-// statement (its destructor observably runs), with no leak.
-// FAIL-WITHOUT: R._n == 0 (+ leak).
+// statement (pre-v0.346: R._n == 1, no leak). Since v0.346: the §15.4 error.
 // ===========================================================================
 BEZEL_TEST(borrowing_collection_insert_temp_2204,
-           array_insert_fresh_temp_disposed_28_3) {
+           array_insert_fresh_temp_is_fresh_store_error_15_4) {
     const std::string src = prog(
         "",
         "  using var arr := new Array<R>(); "
         "  arr.Insert(0, new R(1)); "
         "  return R._n; ");  // disposed at end of the Insert statement -> 1
-    BEZEL_EXPECT_EQ(run(src), 1);
+    expectFreshStoreError(src, "`.Insert(...)` store");
 }
 
 // Two fresh temps inserted in separate statements — each disposed exactly
 // once, in production order.
 BEZEL_TEST(borrowing_collection_insert_temp_2204,
-           array_insert_two_fresh_temps_disposed_28_3) {
+           array_insert_two_fresh_temps_is_fresh_store_error_15_4) {
     const std::string src = prog(
         "",
         "  using var arr := new Array<R>(); "
         "  arr.Insert(0, new R(1)); "
         "  arr.Insert(1, new R(2)); "
         "  return R._n; ");  // 2
-    BEZEL_EXPECT_EQ(run(src), 2);
+    expectFreshStoreError(src, "`.Insert(...)` store");
 }
 
 // An `owned`-returning FACTORY call (not a bare `new`) used as the Insert
@@ -127,7 +148,7 @@ BEZEL_TEST(borrowing_collection_insert_temp_2204,
 // isFreshOwnedClassProducer's `owned`-return discriminant, not a `new`-only
 // whitelist.
 BEZEL_TEST(borrowing_collection_insert_temp_2204,
-           array_insert_owned_returning_call_temp_disposed_28_3) {
+           array_insert_owned_returning_call_temp_is_fresh_store_error_15_4) {
     const std::string src = prog(
         "class Mk "
         "  public static method Make(x: int): owned R return new R(x); end Make; "
@@ -135,7 +156,7 @@ BEZEL_TEST(borrowing_collection_insert_temp_2204,
         "  using var arr := new Array<R>(); "
         "  arr.Insert(0, Mk.Make(3)); "
         "  return R._n; ");  // 1
-    BEZEL_EXPECT_EQ(run(src), 1);
+    expectFreshStoreError(src, "`.Insert(...)` store");
 }
 
 // ===========================================================================
@@ -148,20 +169,20 @@ BEZEL_TEST(borrowing_collection_insert_temp_2204,
 // expression) and is disposed AFTER the return.
 // ===========================================================================
 BEZEL_TEST(borrowing_collection_indexer_set_temp_2204,
-           array_indexer_set_fresh_temp_disposed_28_3) {
+           array_indexer_set_fresh_temp_is_fresh_store_error_15_4) {
     const std::string src = prog(
         "",
         "  var first := new R(0); "
         "  using var arr := new Array<R>(1, first); "
         "  arr[0] := new R(1); "
         "  return R._n; ");  // set RHS disposed at end of indexer-set stmt -> 1
-    BEZEL_EXPECT_EQ(run(src), 1);
+    expectFreshStoreError(src, "`coll[i] := …` store");
 }
 
 // Same shape but with a successor indexer-set statement — both RHS temps
 // disposed exactly once, in production order.
 BEZEL_TEST(borrowing_collection_indexer_set_temp_2204,
-           array_indexer_set_two_fresh_temps_disposed_28_3) {
+           array_indexer_set_two_fresh_temps_is_fresh_store_error_15_4) {
     const std::string src = prog(
         "",
         "  var first := new R(0); "
@@ -169,7 +190,7 @@ BEZEL_TEST(borrowing_collection_indexer_set_temp_2204,
         "  arr[0] := new R(1); "
         "  arr[1] := new R(2); "
         "  return R._n; ");  // 2 set RHSs disposed at end of their stmts -> 2
-    BEZEL_EXPECT_EQ(run(src), 2);
+    expectFreshStoreError(src, "`coll[i] := …` store");
 }
 
 // An `owned`-returning FACTORY call (not a bare `new`) used as the indexer-
@@ -177,7 +198,7 @@ BEZEL_TEST(borrowing_collection_indexer_set_temp_2204,
 // isFreshOwnedClassProducer's `owned`-return discriminant, not a `new`-only
 // whitelist.
 BEZEL_TEST(borrowing_collection_indexer_set_temp_2204,
-           array_indexer_set_owned_returning_call_temp_disposed_28_3) {
+           array_indexer_set_owned_returning_call_temp_is_fresh_store_error_15_4) {
     const std::string src = prog(
         "class Mk "
         "  public static method Make(x: int): owned R return new R(x); end Make; "
@@ -186,7 +207,7 @@ BEZEL_TEST(borrowing_collection_indexer_set_temp_2204,
         "  using var arr := new Array<R>(1, first); "
         "  arr[0] := Mk.Make(3); "
         "  return R._n; ");  // 1 (set RHS disposed at end of indexer-set stmt)
-    BEZEL_EXPECT_EQ(run(src), 1);
+    expectFreshStoreError(src, "`coll[i] := …` store");
 }
 
 // ===========================================================================
@@ -199,13 +220,13 @@ BEZEL_TEST(borrowing_collection_indexer_set_temp_2204,
 // and the indexer-set is the insert-or-replace path).
 // ===========================================================================
 BEZEL_TEST(borrowing_collection_indexer_set_temp_2204,
-           dict_indexer_set_fresh_temp_disposed_28_3) {
+           dict_indexer_set_fresh_temp_is_fresh_store_error_15_4) {
     const std::string src = prog(
         "",
         "  using var d := new Dictionary<string, R>(); "
         "  d[\"k\"] := new R(1); "
         "  return R._n; ");  // disposed at end of the indexer-set stmt -> 1
-    BEZEL_EXPECT_EQ(run(src), 1);
+    expectFreshStoreError(src, "`coll[i] := …` store");
 }
 
 // Borrowing Dictionary<INT-GENERIC-KEY, R> indexer-set — the gen-key path
@@ -213,13 +234,13 @@ BEZEL_TEST(borrowing_collection_indexer_set_temp_2204,
 // fix. Confirms the fix is hardware-shared between string- and gen-key
 // borrowing dicts.
 BEZEL_TEST(borrowing_collection_indexer_set_temp_2204,
-           dict_indexer_set_int_key_fresh_temp_disposed_28_3) {
+           dict_indexer_set_int_key_fresh_temp_is_fresh_store_error_15_4) {
     const std::string src = prog(
         "",
         "  using var d := new Dictionary<int, R>(); "
         "  d[0] := new R(1); "
         "  return R._n; ");  // 1
-    BEZEL_EXPECT_EQ(run(src), 1);
+    expectFreshStoreError(src, "`coll[i] := …` store");
 }
 
 // ===========================================================================
@@ -308,7 +329,7 @@ BEZEL_TEST(borrowing_collection_insert_temp_2204,
 // nothing left to double-free. Encoding: caught*10 + R._n.
 // ===========================================================================
 BEZEL_TEST(borrowing_collection_insert_temp_2204,
-           no_double_free_when_throw_follows_insert_28_2) {
+           throw_follows_insert_program_is_fresh_store_error_15_4) {
     const std::string src = prog(
         "class W "
         "  public static method Step(x: int) "
@@ -330,5 +351,5 @@ BEZEL_TEST(borrowing_collection_insert_temp_2204,
         "    caught := 1; "
         "  end; "
         "  return caught * 10 + R._n; ");  // 1*10 + 1 = 11, disposed exactly once
-    BEZEL_EXPECT_EQ(run(src), 11);
+    expectFreshStoreError(src, "`.Insert(...)` store");
 }

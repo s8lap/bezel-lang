@@ -1,4 +1,11 @@
-// Spec-derived regression for issue #3364 — the §15.4 FRESH-STORE WARNING.
+// Spec-derived regression for issue #3364 — the §15.4 FRESH-STORE rule,
+// a WARNING from v0.243 and a compile ERROR since v0.346 (proposal 0207,
+// #3047 lint A). The rows below were written against the warning and are
+// re-pinned against the error: the population, the per-store count, the
+// hazard split and the remedies are unchanged; only the severity flipped.
+// §15.4 (v0.355): "a fresh unbound owned temporary of class type … in a
+// single-element store position of a borrowing-family collection is a
+// compile error at the store site."
 //
 // WHAT #3364 CLAIMED, AND WHY IT IS REFUTED. #3364 was filed as a #3356
 // follow-up asserting that `for var x in h[0] do … end` over a `Set<Item>`
@@ -49,6 +56,7 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
@@ -79,23 +87,23 @@ OwnershipResult check(const std::string& body) {
     return parseAndCheckOwnership(std::string(kPreamble) + body);
 }
 
-// Counts the §15.4 fresh-store WARNINGs. Keyed on a stable rule identifier —
+// Counts the §15.4 fresh-store ERRORs (v0.346; a warning before). Keyed on a stable rule identifier —
 // the §-reference plus the rule's own name — never on the whole sentence, so a
 // wording tweak does not silently break the test (the tests/README convention
 // hasErrorMessage documents for the error side).
 int freshStoreWarnings(const OwnershipResult& r) {
     int n = 0;
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
-        if (d.message.find("§15.4 fresh-store warning") == std::string::npos)
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("§15.4 fresh-store error") == std::string::npos)
             continue;
         ++n;
     }
     return n;
 }
 
-// Counts EVERY warning that claims a fresh unbound owned temporary, whatever
-// its wording. This is the DOUBLE-FIRE GUARD, and it is load-bearing: a sibling
+// Counts EVERY diagnostic (any severity) that claims a fresh unbound owned
+// temporary, whatever its wording. This is the DOUBLE-FIRE GUARD, and it is load-bearing: a sibling
 // lane's `fix #3383` (a31d37d, on `cycle-1-integration` when this landed)
 // implements a narrower version of this same §15.4 mandate as a second,
 // independent loop at the tail of `checkCollectionBorrowStoreEscape`. The two
@@ -106,7 +114,6 @@ int freshStoreWarnings(const OwnershipResult& r) {
 int anyFreshTempWarnings(const OwnershipResult& r) {
     int n = 0;
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
         if (d.message.find("fresh unbound owned temporary") == std::string::npos)
             continue;
         ++n;
@@ -114,11 +121,11 @@ int anyFreshTempWarnings(const OwnershipResult& r) {
     return n;
 }
 
-// The text of the first §15.4 fresh-store warning, or "" if none fired.
+// The text of the first §15.4 fresh-store error, or "" if none fired.
 std::string freshStoreText(const OwnershipResult& r) {
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
-        if (d.message.find("§15.4 fresh-store warning") != std::string::npos)
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("§15.4 fresh-store error") != std::string::npos)
             return d.message;
     }
     return std::string();
@@ -132,7 +139,7 @@ bool contains(const std::string& hay, const char* needle) {
 
 // ── The #3364 repro itself: an `owned Set<Item>` field filled with temporaries ──
 
-BEZEL_TEST(fresh_store_warning_3364, set_field_add_temp_warns_once_per_store) {
+BEZEL_TEST(fresh_store_warning_3364, set_field_add_temp_rejected_once_per_store) {
     OwnershipResult r = check(
         "class Holder "
         "  private owned _s: Set<Item>; "
@@ -143,19 +150,18 @@ BEZEL_TEST(fresh_store_warning_3364, set_field_add_temp_warns_once_per_store) {
         "    _s.Add(new Item(20)); "
         "  end constructor; "
         "end Holder;");
-    // §15.4's must-warn is per store-position argument: three stores, three
-    // warnings. Pre-fix this was 0.
+    // §15.4's rule is per store-position argument: three stores, three
+    // errors. Pre-#3364 this was 0.
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 3);
     // …and exactly three in total, from any wording (see anyFreshTempWarnings).
     BEZEL_EXPECT_EQ(anyFreshTempWarnings(r), 3);
-    // "The warning does not narrow the admission" — it is a WARNING, and the
-    // ownership pass reports no error for the shape.
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // v0.346 (proposal 0207): the shape is a compile ERROR at the store site.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// §15.4: "The warning names the K8 boundary at which the argument dies and the
+// §15.4: "the diagnostic names the boundary at which the argument dies and the
 // remedies". Both remedies are named: the named holder, and the owning family.
-BEZEL_TEST(fresh_store_warning_3364, warning_names_k8_boundary_and_both_remedies) {
+BEZEL_TEST(fresh_store_warning_3364, error_names_k8_boundary_and_both_remedies) {
     OwnershipResult r = check(
         "class C public static method M(): int "
         "  using var a := new Array<Item>(); "
@@ -224,9 +230,9 @@ BEZEL_TEST(fresh_store_warning_3364,
 
 // §15.4 names the indexer-set alongside `Add`/`Insert`, so the two store sinks
 // answer with the one predicate. `t` is a borrowed parameter, so the `.Add(t)`
-// that seeds the slot is itself admitted and unwarned — the single warning
-// below is the indexer-set's.
-BEZEL_TEST(fresh_store_warning_3364, indexer_set_of_a_fresh_temp_warns) {
+// that seeds the slot is itself admitted — the single error below is the
+// indexer-set's.
+BEZEL_TEST(fresh_store_warning_3364, indexer_set_of_a_fresh_temp_rejects) {
     OwnershipResult r = check(
         "class C public static method M(t: Item): int "
         "  using var a := new Array<Item>(); "
@@ -239,7 +245,7 @@ BEZEL_TEST(fresh_store_warning_3364, indexer_set_of_a_fresh_temp_warns) {
 }
 
 // §15.4's fresh set includes "an `owned`-returning call result".
-BEZEL_TEST(fresh_store_warning_3364, owned_returning_call_result_warns) {
+BEZEL_TEST(fresh_store_warning_3364, owned_returning_call_result_rejects) {
     OwnershipResult r = check(
         "class C "
         "  public static method Make(): owned Res return new Res(7); end Make; "
@@ -254,7 +260,7 @@ BEZEL_TEST(fresh_store_warning_3364, owned_returning_call_result_warns) {
 
 // The per-collection store spellings are presentations of §28.11's one store
 // row, so `Push` is the same rule as `Add`.
-BEZEL_TEST(fresh_store_warning_3364, stack_push_of_a_fresh_temp_warns) {
+BEZEL_TEST(fresh_store_warning_3364, stack_push_of_a_fresh_temp_rejects) {
     OwnershipResult r = check(
         "class C public static method M(): int "
         "  using var s := new Stack<Item>(); "
@@ -264,12 +270,12 @@ BEZEL_TEST(fresh_store_warning_3364, stack_push_of_a_fresh_temp_warns) {
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 1);
 }
 
-// ── Negative controls: the warning must not widen past §15.4's population ──
+// ── Negative controls: the error must not widen past §15.4's population ──
 
 // The owning family's store positions TAKE ownership (§28.11 owned column) —
-// this is one of the two remedies the warning names, so warning on it would
+// this is one of the two remedies the error names, so rejecting it would
 // send the reader in a circle.
-BEZEL_TEST(fresh_store_warning_3364, owning_family_store_does_not_warn) {
+BEZEL_TEST(fresh_store_warning_3364, owning_family_store_is_not_rejected) {
     OwnershipResult r = check(
         "class C public static method M(): int "
         "  using var o := new OwningArray<Item>(); "
@@ -280,7 +286,7 @@ BEZEL_TEST(fresh_store_warning_3364, owning_family_store_does_not_warn) {
 }
 
 // The documented remedy itself: a named holder is not an unbound temporary.
-BEZEL_TEST(fresh_store_warning_3364, named_holder_store_does_not_warn) {
+BEZEL_TEST(fresh_store_warning_3364, named_holder_store_is_not_rejected) {
     OwnershipResult r = check(
         "class C public static method M(): int "
         "  using var t := new Item(1); "
@@ -291,10 +297,10 @@ BEZEL_TEST(fresh_store_warning_3364, named_holder_store_does_not_warn) {
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 0);
 }
 
-// §15.4 scopes the warning to a fresh temporary of CLASS type; §28.11's element
+// §15.4 scopes the rule to a fresh temporary of CLASS type; §28.11's element
 // table puts the other categories in columns that cannot dangle — a value type
 // "copies the value in", a runtime-managed reference "stores the reference".
-BEZEL_TEST(fresh_store_warning_3364, value_and_runtime_managed_elements_do_not_warn) {
+BEZEL_TEST(fresh_store_warning_3364, value_and_runtime_managed_elements_are_not_rejected) {
     OwnershipResult ints = check(
         "class C public static method M(): int "
         "  using var a := new Array<int>(); "
@@ -323,7 +329,7 @@ BEZEL_TEST(fresh_store_warning_3364, value_and_runtime_managed_elements_do_not_w
 // `AddRange` is the BULK store: its argument is a COLLECTION whose elements are
 // copied out, so the source collection's own death leaves no dangling element
 // slot. §15.4 names the element store positions only.
-BEZEL_TEST(fresh_store_warning_3364, bulk_add_range_does_not_warn) {
+BEZEL_TEST(fresh_store_warning_3364, bulk_add_range_is_not_rejected) {
     OwnershipResult r = check(
         "class C public static method M(src: Array<int>): int "
         "  using var a := new Array<int>(); "
@@ -333,12 +339,12 @@ BEZEL_TEST(fresh_store_warning_3364, bulk_add_range_does_not_warn) {
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 0);
 }
 
-// The scope that makes the rule implementable at all (§15.4: "rejection cannot
-// be scoped by signature — `coll.Add(new X())` and `sink.Consume(new X())` are
-// indistinguishable plain-parameter calls"): the warning keys on the RECEIVER
-// being a borrowing-family collection, so an ordinary callee taking a fresh
-// temporary is untouched.
-BEZEL_TEST(fresh_store_warning_3364, plain_callee_taking_a_fresh_temp_does_not_warn) {
+// §15.4 (v0.355): "The rule reaches no other callee … a plain parameter of a
+// **user-declared** member — `sink.Consume(new X())` … — keeps §28.3.11's
+// unbound-temporary admission". The rule keys on the RECEIVER being a
+// borrowing-family collection, so an ordinary callee taking a fresh temporary
+// is untouched.
+BEZEL_TEST(fresh_store_warning_3364, plain_callee_taking_a_fresh_temp_is_not_rejected) {
     OwnershipResult r = check(
         "class C "
         "  public static method Consume(r: Item): int return r.V; end Consume; "
@@ -347,11 +353,12 @@ BEZEL_TEST(fresh_store_warning_3364, plain_callee_taking_a_fresh_temp_does_not_w
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 0);
 }
 
-// ── Admission is unchanged (§15.4: "the program remains accepted") ──
+// ── The shape is rejected end to end (§15.4, v0.346) ──
 
-// The #3364 repro end-to-end through the real driver: it still compiles, links,
-// and runs. The warning is a signal, not a rejection.
-BEZEL_TEST(fresh_store_warning_3364, warned_program_still_compiles_and_runs) {
+// The #3364 repro through the real driver: before v0.346 it compiled with the
+// warning (and its slot dangled); it is now rejected at the store site with
+// the §15.4 fresh-store error.
+BEZEL_TEST(fresh_store_warning_3364, repro_program_is_rejected_at_compile_time) {
     auto r = runAot(
         std::string(kPreamble) +
         "class Holder "
@@ -367,7 +374,7 @@ BEZEL_TEST(fresh_store_warning_3364, warned_program_still_compiles_and_runs) {
         "  Console.WriteLine(\"count=\" + h.Count.ToString()); "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("count=1") != std::string::npos);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "§15.4 fresh-store error"));
 }

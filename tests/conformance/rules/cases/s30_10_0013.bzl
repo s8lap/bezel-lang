@@ -21,10 +21,10 @@ end Work;
 
 public class Program
   public static async method Main(): Task
-    var ts := new Array<Task<int>>();
-    ts.Add(Work.MakeAsync(3));
-    ts.Add(Work.MakeAsync(1));
-    ts.Add(Work.MakeAsync(2));
+    var a := Work.MakeAsync(3);
+    var b := Work.MakeAsync(1);
+    var c := Work.MakeAsync(2);
+    var ts: Array<Task<int>> := [a, b, c];
     using var all := Task.WhenAll(ts);
     var results := await all;
     for var r in results do

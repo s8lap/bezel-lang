@@ -82,7 +82,9 @@ const char* kToArrayIndexerAdd =
 // CONTROL: a borrowing Array<Widget>.Add(w) for a plain class element was
 // already correct on HEAD (#4308 is interface-typed and goes through a
 // different element-policy arm); this stays GREEN through the fix to prove
-// the gated IGrouping branch did not regress the plain-class path.
+// the gated IGrouping branch did not regress the plain-class path. The element
+// is a named `using var`: `arr.Add(new Widget())` is §15.4's fresh-store error
+// since v0.346 (proposal 0207, #3047 lint A). // per §15.4
 const char* kPlainClassControl =
     "module M; import System.Collections.Generic; "
     "class Widget public v: int; "
@@ -90,8 +92,9 @@ const char* kPlainClassControl =
     "  public method Tag(): int => 1; "
     "end Widget; "
     "class C public static method Main(): int "
+    "  using var w := new Widget(); "
     "  using var arr := new Array<Widget>(); "
-    "  arr.Add(new Widget()); "
+    "  arr.Add(w); "
     "  return arr.Count; "
     "end Main; end C;";
 

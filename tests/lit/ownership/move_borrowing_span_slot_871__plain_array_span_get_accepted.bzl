@@ -6,20 +6,20 @@
 //
 // Clean-compile ACCEPT control: bezelc -c must exit zero.
 //
-// fix #3364 (§15.4 fresh-store warning, v0.243): the setup line `arr.Add(move
-// c1);` is itself a §15.4 fresh store — a `move` result is one of the five
-// fresh forms that section names, and `Array<Cell>` is a borrowing-family
-// collection whose slot takes no ownership — so it now draws the MANDATORY
-// warning. The property this test pins is unaffected: the store is still
-// ADMITTED (§15.4: "The warning does not narrow the admission"), `bezelc -c`
-// still exits zero, and the span get is still accepted. The blanket
-// "no diagnostics at all" guard is therefore narrowed to its real subject:
-// no ERROR, and the one expected §15.4 warning.
+// The setup store was `arr.Add(move c1);` — a `move` result is one of §15.4's
+// fresh forms, so that store drew the §15.4 fresh-store warning (fix #3364,
+// v0.243) and, since v0.346 (proposal 0207, #3047 lint A), is a compile
+// ERROR: "a fresh unbound owned temporary of class type … in a single-element
+// store position of a borrowing-family collection is a compile error at the
+// store site" (§15.4, v0.355). The setup is re-cut to §15.4's own remedy —
+// bind the value to a named holder first and store the holder (`using var c1
+// := new Cell(); arr.Add(c1);`, a same-scope local the §28.11 store rule
+// admits) — so the program stays a clean-compile ACCEPT control for the
+// property this test pins: the plain span get.
 //
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class Cell public V: int := 0; end Cell; class C public static method Main(): int const arr: Array<Cell> := []; var c1 := new Cell(); arr.Add(move c1); var sp := arr.AsSpan(); var v := sp[0].V; return v; end Main; end C;
+module M; class Cell public V: int := 0; end Cell; class C public static method Main(): int const arr: Array<Cell> := []; using var c1 := new Cell(); arr.Add(c1); var sp := arr.AsSpan(); var v := sp[0].V; return v; end Main; end C;
 
-// NODIAG-NOT: error
-// NODIAG: §15.4 fresh-store warning
+// NODIAG-NOT: {{error|warning}}

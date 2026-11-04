@@ -3,7 +3,7 @@
 // call-boundedness) collection-name list.
 //
 // THIRD whitelist gap in the file. The two #3428 named (both fixed by
-// #2773 (B1)) are the §15.4 fresh-store warning gates
+// #2773 (B1)) are the §15.4 fresh-store diagnostic gates (an error since v0.346)
 // (`checkCollectionBorrowStoreEscape` / `checkIndexerSetBorrowStoreEscape`)
 // and admit `SortedSet<T>` because stdlib §4.18 gives it the same
 // borrowing-family value semantics as §4.17 / `SortedDictionary` (already
@@ -134,7 +134,7 @@ BEZEL_TEST(builtin_collection_store_callee_3696,
 
 // Row 5 — same negative control for the field receiver. No call-bounded
 // source — no §28.14 obligation — no diagnostic. `owned` field avoids the
-// §28.5 fresh-store warning that would otherwise shadow the §28.14 walk's
+// §15.4 fresh-store error (v0.346) that would otherwise shadow the §28.14 walk's
 // classification (and is unrelated to this fix).
 BEZEL_TEST(builtin_collection_store_callee_3696,
            sorted_set_field_receiver_value_typed_add_admitted) {

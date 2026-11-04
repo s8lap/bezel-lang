@@ -149,8 +149,18 @@ BEZEL_TEST(call_bounded_task_abandonment_1527, async_inline_await_clean) {
 
 // Fan-out: accumulate into a purely-local collection, discharge every
 // element with `await Task.WhenAll(pending)` (§28.14 v0.179's own named
-// idiom).
-BEZEL_TEST(call_bounded_task_abandonment_1527, async_fanout_whenall_clean) {
+// idiom). This row pinned `pending.Add(cb())` as ADMITTED; since v0.346
+// (proposal 0207, #3047 lint A) that spelling is §15.4's fresh-store error —
+// §28.14 rule 2 (v0.355): "The collection holds the tasks through named
+// bindings (`var t1 := cb(); var t2 := cb(); var pending: Array<Task> := [t1,
+// t2];`): a minted task stored straight into a borrowing slot,
+// `pending.Add(cb())`, dies at its K8 boundary and is §15.4's fresh-store
+// error, not an accumulation." The named-binding spelling is NOT pinned here:
+// the §28.14 call-bounded walk does not yet credit `Task.WhenAll` over a
+// literal of named tasks as their settlement (it reports both `t1` and `t2`
+// "not awaited to settlement" — a separate compiler gap, recorded in the
+// #3047 lane report).
+BEZEL_TEST(call_bounded_task_abandonment_1527, async_fanout_add_is_fresh_store_error) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
         "  public static async method Ok(cb: () -> Task): Task "
@@ -160,15 +170,18 @@ BEZEL_TEST(call_bounded_task_abandonment_1527, async_fanout_whenall_clean) {
         "    await Task.WhenAll(pending); "
         "  end Ok; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagContains(r, "§15.4 fresh-store error"));
 }
 
-// Fan-out built incrementally across loop iterations — the realistic shape
-// of "spawn one per element, then join" — is admitted: an `.Add` inside a
-// (possibly zero-trip) loop body either ran (a real, still-owed member) or
-// didn't (nothing to owe), unlike a direct discharge, which the loop's
-// uncertain trip count CANNOT certify.
-BEZEL_TEST(call_bounded_task_abandonment_1527, async_loop_fanout_whenall_clean) {
+// The pre-v0.346 spelling of the fan-out, `pending.Add(cb())`: §28.14 rule 2
+// (v0.355): "a minted task stored straight into a borrowing slot,
+// `pending.Add(cb())`, dies at its K8 boundary and is §15.4's fresh-store
+// error, not an accumulation." Rejected, in a loop body as in straight-line
+// code (the dynamically-sized call-bounded fan-out has no borrowing-slot
+// spelling; proposal 0207 §5 records the gap). This row pinned the loop
+// spelling as ADMITTED before v0.346.
+BEZEL_TEST(call_bounded_task_abandonment_1527, async_loop_fanout_add_is_fresh_store_error) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
         "  public static async method Ok(cb: () -> Task, xs: Array<int>): Task "
@@ -179,7 +192,8 @@ BEZEL_TEST(call_bounded_task_abandonment_1527, async_loop_fanout_whenall_clean) 
         "    await Task.WhenAll(pending); "
         "  end Ok; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagContains(r, "§15.4 fresh-store error"));
 }
 
 // if/else BOTH branches await the same bound task on every live path — the
