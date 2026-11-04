@@ -6234,10 +6234,38 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // by SEMA (§5.1's `where T: IComparable<T>`) before codegen
                 // is reached, so this arm is entered only for a record that
                 // HAS a dispatchable `CompareTo`.
+                //
+                // fix #8140 (stdlib §5.1 / §2.8, spec §14.1 / §14.2, v0.355):
+                // the GENERIC record's decline was the defect — a
+                // `record W<T>: IComparable<W<T>>` element is admitted by
+                // SEMA (spec §14.2 *Interface conformance* rule 2: a record
+                // listing the interface with the matching member conforms at
+                // EVERY instantiation), so `Array<W<string>>.Min()` reached
+                // this arm, found no thunk, and fell through to the NUMERIC
+                // path below — which compares the element (a struct) against
+                // an `i32` accumulator:
+                //     Both operands to ICmp instruction are not of the same type!
+                //       %25 = icmp slt %"record.W$spec0" %22, i32 %24
+                // and the compiler ABORTED ("IR verification failed (malformed
+                // IR emitted)") on a legal program.
+                //
+                // `buildGenericRecordCompareToThunk` is the fix's
+                // counterpart of `buildRecordCompareToThunk`: it monomorphizes
+                // the record's `CompareTo` at the element's OWN instantiation
+                // (spec §14.1's substitution) through the ONE generic-method
+                // instantiation path, so the element is read at that
+                // instantiation's layout and ordered by that instantiation's
+                // `CompareTo`. It is tried ONLY after the ordinary thunk
+                // declined (which is the case for every generic record), so
+                // every shape that works today is bit-identical.
                 llvm::Function* recCmpThunk = nullptr;
                 if (!isStrElem && elemTypeRef && !elemTypeRef->nullable &&
                     elemTypeRef->kind == sema::TypeRef::Kind::Named)
                     recCmpThunk = buildRecordCompareToThunk(elemTypeRef);
+                if (!recCmpThunk && !isStrElem && elemTypeRef &&
+                    !elemTypeRef->nullable &&
+                    elemTypeRef->kind == sema::TypeRef::Kind::Named)
+                    recCmpThunk = buildGenericRecordCompareToThunk(elemTypeRef);
                 if (recCmpThunk) {
                     auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
                     llvm::Value* len = builder_.CreateCall(lenFn, {recv});

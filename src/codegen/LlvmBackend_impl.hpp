@@ -25209,6 +25209,42 @@ private:
     // Null for a non-record, or a record with no single-parameter `CompareTo`.
     llvm::Function* buildRecordCompareToThunk(const sema::TypeRef* ty);
 
+    // fix #8140 (stdlib §5.1 / §2.8, spec §14.1 / §14.2, v0.355): the
+    // record analogue of `specializedClassCompareToFn` — the comparator thunk
+    // `int cmp(const void* a, const void* b)` for a GENERIC RECORD element,
+    // calling the record's `CompareTo` MONOMORPHIZED at the element's own
+    // instantiation (`W<string>` ⇒ the `CompareTo` specialized at `W<string>`,
+    // reading the element at `W<string>`'s layout).
+    //
+    // `buildRecordCompareToThunk` above DECLINES a generic record (its
+    // `CompareTo` would need monomorphization), so the no-selector
+    // `Min()`/`Max()` lowering fell through to the numeric path and compared
+    // the record aggregate against an `i32` (`icmp slt %"record.W$spec0", i32`)
+    // — the IR verifier ABORTED on a program stdlib §5.1 admits.
+    //
+    // The monomorphization itself is NOT a new mechanism: it asks
+    // `buildSpecializedMethodFn` — the ONE generic-method instantiation path
+    // (§14.1's monomorphization) — for the `CompareTo` body under the
+    // substitution, exactly as `specializedClassCompareToFn` does for a
+    // generic CLASS.
+    //
+    // ⚠ SCOPE: this builder serves the Min/Max no-selector arm ONLY.
+    // `buildRecordCompareToThunk` and `recordHasDispatchableCompareTo` are
+    // UNCHANGED, so the sorted-collection family's eligibility agreement
+    // (#3740) keeps its measured behaviour for a generic record.
+    // Null for a non-record, a non-generic record (that is
+    // `buildRecordCompareToThunk`'s shape), a record with no
+    // single-parameter `CompareTo`, or a shape the specialization declines.
+    llvm::Function* buildGenericRecordCompareToThunk(const sema::TypeRef* ty);
+
+    // fix #8140 (stdlib §5.1, v0.355): the per-instantiation cache of
+    // `buildGenericRecordCompareToThunk`, keyed on the STRUCTURAL identity
+    // (`descIdentityKey(declaration, instArgs)`) — the same key
+    // `buildObjectCompareToThunk` uses — so two instantiations whose readable
+    // mangles coincide still get DISTINCT thunks, while one instantiation
+    // reached from two call sites shares one thunk.
+    std::map<std::string, llvm::Function*> genericRecCmpThunks_;
+
     // fix #3530 (§14.1 / §2.8.3 rule 4, v0.283): buildObjectCompareToThunk's
     // per-instantiation cache, keyed on `descIdentityKey(declaration, instArgs)`
     // — the STRUCTURAL identity — rather than on the emitted symbol name,

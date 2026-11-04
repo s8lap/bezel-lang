@@ -1415,6 +1415,163 @@ llvm::Function* Emitter::buildRecordCompareToThunk(const sema::TypeRef* ty) {
     return fn;
 }
 
+// fix #8140 (stdlib §5.1 / §2.8, spec §14.1 / §14.2, v0.355): the
+// comparator thunk for a GENERIC RECORD element — the record analogue of
+// `specializedClassCompareToFn` (the generic CLASS's monomorphized
+// `CompareTo`).
+//
+// WHAT THE DOCUMENTS REQUIRE.
+//
+//   * stdlib §5.1 (v0.355) declares the no-selector form as
+//         public extension IEnumerable<T> where T: IComparable<T>
+//           public method Min(): T;              // InvalidOperationException if empty
+//           public method Max(): T;              // InvalidOperationException if empty
+//     so the no-selector `Min()`/`Max()` orders by the ELEMENT's own
+//     `IComparable<T>.CompareTo` (stdlib §2.8: `method CompareTo(other: T):
+//     int;`).
+//   * spec §14.2 *Interface conformance* rule 2 (v0.355) admits a RECORD that
+//     lists the interface in its inheritance clause and declares the matching
+//     members — so a GENERIC record `W<T>: IComparable<W<T>>` conforms at
+//     EVERY instantiation, and `Array<W<string>>.Min()` is a legal call.
+//   * spec §14.1 *Instantiation and its site* (v0.355): "An instantiation of a
+//     generic declaration is the constructed type or constructed member
+//     obtained by substituting type arguments for its type parameters" — so
+//     the `CompareTo` that orders `W<string>` is the one MONOMORPHIZED at
+//     `W<string>`, reading the element at `W<string>`'s own layout.
+//
+// THE DEFECT. `buildRecordCompareToThunk` above DECLINES a generic record —
+// its gate `recordHasDispatchableCompareTo` excludes one ("Monomorphizing a
+// generic record's `CompareTo` … is a self-contained follow-up, not attempted
+// here") — so the no-selector `Min()`/`Max()` arm fell through to the NUMERIC
+// path, which compares the element (a struct) against an `i32` accumulator:
+//     Both operands to ICmp instruction are not of the same type!
+//       %25 = icmp slt %"record.W$spec0" %22, i32 %24
+// and the compiler ABORTED ("IR verification failed (malformed IR emitted)")
+// on a program stdlib §5.1 admits.
+//
+// THE FIX. Monomorphize the record's `CompareTo` at the element's own
+// instantiation and order through it. The monomorphization is NOT a new
+// mechanism: this asks `buildSpecializedMethodFn` — the ONE generic-method
+// instantiation path — for the body under the substitution, exactly as
+// `specializedClassCompareToFn` does for a generic CLASS (which is why the
+// class analogue exists at all: #3530's `methodFns_[cmpMs]` is the ERASED
+// TEMPLATE, whose `T`-typed fields sit at the placeholder offsets).
+//
+// ⚠ SCOPE. This builder serves the no-selector `Min()`/`Max()` arm ONLY.
+// `buildRecordCompareToThunk` and `recordHasDispatchableCompareTo` are
+// UNCHANGED, so the sorted-collection family keeps its measured behaviour for
+// a generic record (#3740's eligibility agreement) and this fix cannot move
+// it.
+//
+// A LOCAL IRBuilder, not `builder_` — the same discipline
+// `buildRecordCompareToThunk` above uses: this thunk is built mid-lowering
+// of another function, and touching `builder_`/`currentFn_` here would drag
+// `propagateBB_`/`unwindTarget_` with it.
+llvm::Function* Emitter::buildGenericRecordCompareToThunk(
+        const sema::TypeRef* ty) {
+    if (!ty || ty->kind != sema::TypeRef::Kind::Named || ty->nullable)
+        return nullptr;
+    const sema::TypeSymbol* rec = ty->declaration;
+    if (!rec || rec->kind != ast::TypeDeclKind::Record) return nullptr;
+    // A GENERIC record only: a non-generic one is `buildRecordCompareToThunk`'s
+    // shape (and that builder's thunk is already correct), so this one
+    // declines it rather than minting a second thunk for the same type.
+    const std::vector<std::string_view> gpNames =
+        sema::genericParamNames(rec);
+    if (gpNames.empty() || gpNames.size() != ty->genericArgs.size())
+        return nullptr;
+    sema::MethodSymbol* cmpMs = findMethodByName(rec, "CompareTo");
+    if (!cmpMs || cmpMs->params.size() != 1) return nullptr;
+    if (isStaticMethod(cmpMs)) return nullptr;  // `this` is the thunk's first arg
+    // The §2.8 `IComparable<T>` shape: the single parameter must BE the record
+    // (`CompareTo(other: W<T>)`), because the thunk's second operand is the
+    // record's own bytes, passed BY VALUE (§9.4/CG29). A `CompareTo` whose
+    // parameter is some OTHER type does not match the interface's member
+    // (spec §14.2 rule 2: the record must "declare matching members"), and
+    // lowering it through this ABI would type the callee's parameter wrongly
+    // — so it is declined here, exactly as a record with no `CompareTo` at
+    // all is.
+    const auto* ps =
+        dynamic_cast<const sema::ParameterSymbol*>(cmpMs->params[0]);
+    if (!ps) return nullptr;
+    const sema::TypeRef* formal = ps->declType
+                                      ? ctx_.resolvedType(*ps->declType)
+                                      : ps->resolvedDeclType;
+    if (!formal || formal->nullable ||
+        formal->kind != sema::TypeRef::Kind::Named ||
+        formal->declaration != rec)
+        return nullptr;
+    CallableInfo ci;
+    if (!callableInfo(cmpMs, ci)) return nullptr;  // abstract / no AST body
+
+    // The type arguments, composed through the ACTIVE OUTER substitution
+    // FIRST — the same `substituteTypeRefLocal` the sibling class thunk uses
+    // (#2192/#3020): inside a specialization of an OUTER generic, `W<T>`'s
+    // argument is still the bare parameter `T`, whose structural key is
+    // identical for EVERY binding.
+    std::vector<const sema::TypeRef*> instArgs;
+    instArgs.reserve(ty->genericArgs.size());
+    for (const sema::TypeRef* a : ty->genericArgs)
+        instArgs.push_back(substituteTypeRefLocal(a, genericSubstSemaTy_));
+
+    // The cache key is the STRUCTURAL identity (`descIdentityKey`), not the
+    // emitted name: `descReadableMangle` is cosmetic, so two distinct
+    // instantiations can mangle alike and a name-keyed lookup would hand the
+    // second the first's thunk.
+    const std::string thunkKey = descIdentityKey(rec, instArgs);
+    auto kit = genericRecCmpThunks_.find(thunkKey);
+    if (kit != genericRecCmpThunks_.end()) return kit->second;
+
+    // Install the substitution and ask the ONE generic-method instantiation
+    // path for the `CompareTo` body at this instantiation. The LLVM and sema
+    // maps are filled in lockstep (the sibling site's discipline), so they
+    // cannot desync.
+    auto savedSubst = genericSubst_;
+    auto savedSema = genericSubstSemaTy_;
+    std::unordered_map<std::string_view, llvm::Type*> newSubst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+    for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+        newSubst[gpNames[gi]] = lowerTypeRef(instArgs[gi]);
+        newSema[gpNames[gi]] = instArgs[gi];
+    }
+    genericSubst_ = std::move(newSubst);
+    genericSubstSemaTy_ = std::move(newSema);
+    // The element's OWN struct at this instantiation (§14.1) — the same one
+    // the Min/Max arm loads the element at (`lowerTypeRef` of the element
+    // TypeRef installs the same substitution and asks `recordStruct` for the
+    // same per-field-type-vector cached struct).
+    llvm::StructType* elemSt = recordStruct(rec);
+    // `this` by pointer (§9.4/CG29) and the second operand BY VALUE — the
+    // record method's own ABI, the one `buildRecordCompareToThunk` above
+    // calls.
+    llvm::Function* specFn =
+        buildSpecializedMethodFn(cmpMs, ci, {ptrTy(), elemSt});
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSema);
+    if (!specFn) return nullptr;
+
+    // The thunk: `int cmp(const void* a, const void* b)` — the SAME ABI as
+    // `buildRecordCompareToThunk` above (a record's stored bytes ARE its own
+    // inline struct value, so `a`/`b` are DIRECT pointers to the record: no
+    // vtable dispatch applies — records are not polymorphic (CG29)).
+    std::string thunkName = std::string("bz$reccmp$") + mangledTypeName(rec);
+    for (const sema::TypeRef* a : instArgs)
+        thunkName += "$" + descReadableMangle(a);
+    auto* fty = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      thunkName, module_.get());
+    genericRecCmpThunks_[thunkKey] = fn;
+    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    llvm::IRBuilder<> thunkB(bb);
+    llvm::Value* thisPtr = &*fn->arg_begin();
+    llvm::Value* bVal =
+        thunkB.CreateLoad(elemSt, &*std::next(fn->arg_begin()), "cmp.b");
+    llvm::Value* result =
+        thunkB.CreateCall(specFn, {thisPtr, bVal}, "cmp.result");
+    thunkB.CreateRet(result);
+    return fn;
+}
+
 // fix #3488 / stdlib §4.17 (v0.283): the stored-identity pair for a REFERENCE
 // key of a `SortedDictionary<K, V>`.
 //
