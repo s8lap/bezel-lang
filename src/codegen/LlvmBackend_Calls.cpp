@@ -6179,6 +6179,101 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                     return builder_.CreateLoad(elemTy, accSlot, "mm.r");
                 }
+                // fix #8092 (stdlib §5.1 / §2.8, spec §14.2, v0.355): a USER
+                // RECORD element that implements `IComparable<T>` — e.g.
+                //     record Meters(cents: int): IComparable<Meters>
+                // is a VALUE type: it is stored INLINE in the array (one
+                // struct per slot), so the POINTER arm above cannot serve it
+                // (it would compare the slot ADDRESSES) — and the NUMERIC path
+                // below cannot either (it builds `icmp slt %record.Meters,
+                // i32`, which the IR verifier REJECTS — "Both operands to
+                // ICmp instruction are not of the same type!" — so the
+                // compiler ABORTED on a program stdlib §5.1 admits).
+                //
+                // The ordering is the RECORD's own `CompareTo` (stdlib §2.8's
+                //     public interface IComparable<T>
+                //       method CompareTo(other: T): int;
+                //     end IComparable;
+                // — spec §14.2's conformance rule admits "records and enums
+                // implementing it"), dispatched through
+                // `buildRecordCompareToThunk` — the ONE thunk builder that
+                // already serves a record's `CompareTo` for the sorted
+                // collections (#3740), with the same ABI: `this` by pointer,
+                // the second operand by value, both read from a slot.
+                //
+                // ⚠ A GENERIC record is DECLINED by the thunk builder (its
+                // `CompareTo` would need monomorphization) and keeps the
+                // pre-existing path; a record with NO `CompareTo` is refused
+                // by SEMA (§5.1's `where T: IComparable<T>`) before codegen
+                // is reached, so this arm is entered only for a record that
+                // HAS a dispatchable `CompareTo`.
+                llvm::Function* recCmpThunk = nullptr;
+                if (!isStrElem && elemTypeRef && !elemTypeRef->nullable &&
+                    elemTypeRef->kind == sema::TypeRef::Kind::Named)
+                    recCmpThunk = buildRecordCompareToThunk(elemTypeRef);
+                if (recCmpThunk) {
+                    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                    llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                    // stdlib §5.1: Min()/Max() throw on an empty source.
+                    llvm::Value* isEmpty =
+                        builder_.CreateICmpEQ(len, builder_.getInt64(0));
+                    emitGuardThrow(isEmpty, "InvalidOperationException");
+                    auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                           {ptrTy(), i64(), i64()});
+                    auto* idxSlot  = entryAlloca(i64());
+                    auto* accSlot  = entryAlloca(elemTy);
+                    auto* initSlot = entryAlloca(i1());
+                    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                    builder_.CreateStore(
+                        llvm::Constant::getNullValue(elemTy), accSlot);
+                    builder_.CreateStore(builder_.getFalse(), initSlot);
+                    auto* condBB = llvm::BasicBlock::Create(llvm_, "mmr.c", currentFn_);
+                    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "mmr.b", currentFn_);
+                    auto* updBB  = llvm::BasicBlock::Create(llvm_, "mmr.u", currentFn_);
+                    auto* nextBB = llvm::BasicBlock::Create(llvm_, "mmr.n", currentFn_);
+                    auto* endBB  = llvm::BasicBlock::Create(llvm_, "mmr.e", currentFn_);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(condBB);
+                    llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                    builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len),
+                                          bodyBB, endBB);
+                    builder_.SetInsertPoint(bodyBB);
+                    llvm::Value* ep = builder_.CreateCall(
+                        ptrFn, {recv, idx, builder_.getInt64(esz)});
+                    llvm::Value* el  = builder_.CreateLoad(elemTy, ep, "mmr.el");
+                    // The thunk reads BOTH operands through POINTERS (its ABI
+                    // is `int cmp(const void* a, const void* b)`), so the
+                    // element value is spilled to its own slot; the
+                    // accumulator already lives in `accSlot`.
+                    auto* elSlot = entryAlloca(elemTy);
+                    builder_.CreateStore(el, elSlot);
+                    llvm::Value* cmp = builder_.CreateCall(
+                        recCmpThunk,
+                        {builder_.CreateBitCast(elSlot, ptrTy()),
+                         builder_.CreateBitCast(accSlot, ptrTy())},
+                        "mmr.cmp");
+                    llvm::Value* inited = builder_.CreateLoad(i1(), initSlot);
+                    // The record's own `CompareTo`: negative when `el` orders
+                    // before `acc`, positive when after (stdlib §2.8).
+                    llvm::Value* ordered = isMax
+                        ? builder_.CreateICmpSGT(cmp, builder_.getInt32(0))
+                        : builder_.CreateICmpSLT(cmp, builder_.getInt32(0));
+                    builder_.CreateCondBr(
+                        builder_.CreateOr(builder_.CreateNot(inited), ordered),
+                        updBB, nextBB);
+                    builder_.SetInsertPoint(updBB);
+                    builder_.CreateStore(el, accSlot);
+                    builder_.CreateStore(builder_.getTrue(), initSlot);
+                    builder_.CreateBr(nextBB);
+                    builder_.SetInsertPoint(nextBB);
+                    builder_.CreateStore(
+                        builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(endBB);
+                    freeLazyTemp();
+                    freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
+                    return builder_.CreateLoad(elemTy, accSlot, "mmr.r");
+                }
                 // fix #2770: a REFERENCE element (class or interface — both
                 // lower to a pointer) for which no comparator could be
                 // resolved must not fall through to the numeric path below.

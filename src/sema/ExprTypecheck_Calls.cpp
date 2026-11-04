@@ -13672,8 +13672,114 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  (elem->kind == TypeRef::Kind::Primitive &&
                                   elem->primitive == P::String &&
                                   !elem->nullable));
+                            // fix #8092 (stdlib §5.1 / §2.5 / §2.8, spec §14.2,
+                            // v0.355): the RESULT TYPE of the no-selector
+                            // `Min()`/`Max()` is `T` for EVERY T that satisfies
+                            // §5.1's constraint — stdlib §5.1 declares
+                            //     public extension IEnumerable<T> where T: IComparable<T>
+                            //       public method Min(): T;
+                            //       public method Max(): T;
+                            // so the result is the ELEMENT type, whatever that
+                            // element is. TWO families were left on the `int`
+                            // DEFAULT below, and both are value types:
+                            //   * a BUILT-IN VALUE RECORD — `DateTime`,
+                            //     `TimeSpan`, `DateOnly`, `TimeOnly` (stdlib
+                            //     §2.5 declares `IComparable<Self>` on each).
+                            //     They carry no user TypeDecl, so their TypeRef
+                            //     has NO `declaration` and the class/interface
+                            //     probe above never saw them: `var x: DateTime
+                            //     := darr.Min();` was REFUSED with a §5.1
+                            //     conversion diagnostic naming "a concrete
+                            //     primitive", and the INFERRED form silently
+                            //     printed the TRUNCATED tick word.
+                            //   * a USER RECORD implementing `IComparable<T>`
+                            //     — spec §14.2 admits "records and enums
+                            //     implementing it", and a record is a VALUE
+                            //     type (stored INLINE, one struct per array
+                            //     slot), so it is NOT the pointer-shaped
+                            //     element the probe above was written for.
+                            // A NULLABLE element is excluded: §14.2 says "a
+                            // type-bound constraint — naming a class or
+                            // interface — implies non-null T", so `T = DateTime?`
+                            // does not satisfy the constraint.
+                            //
+                            // ⚠ `Guid` (stdlib §2.6) also declares
+                            // `IComparable<Guid>`, but it is a 128-bit STRUCT
+                            // whose §2.6 order is "lexicographic over the 16
+                            // canonical big-endian bytes" — not a scalar-word
+                            // order — so it keeps its pre-existing refusal (the
+                            // same split `mathOrderedTimeValueHead` draws for
+                            // the `Math` arm, and the same split #8049 drew for
+                            // the collection `Min()`/`Max()` arm).
+                            //
+                            // ⚠ AN ENUM ELEMENT IS NOT TOUCHED HERE. §14.2's
+                            // conformance rule admits "records and ENUMS
+                            // implementing it", so an enum that lists
+                            // `IComparable<Self>` in its inheritance clause is
+                            // comparable too — but an enum is stored as its
+                            // UNDERLYING INTEGER, so the ordering must be the
+                            // enum's own `CompareTo` (not its ordinal), and
+                            // that dispatch is a separate change. An enum
+                            // element therefore keeps the pre-existing result
+                            // type and behaviour (the `int` default below);
+                            // `Array<Color>.Min()` COMPILES and computes the
+                            // minimum today, and this change must not newly
+                            // refuse a program that works.
+                            const bool builtinValueRecordElem =
+                                elem && !elem->nullable &&
+                                !mathOrderedTimeValueHead(elem).empty();
+                            const bool userRecordElem =
+                                elem && !elem->nullable &&
+                                elem->kind == TypeRef::Kind::Named &&
+                                elem->declaration &&
+                                elem->declaration->kind ==
+                                    ast::TypeDeclKind::Record;
+                            // A USER RECORD's comparability is its own
+                            // declaration's: spec §14.2's conformance rule
+                            // ("records and enums implementing it"), read
+                            // through the SAME symbol-side accessor the
+                            // class/interface arm uses (`declaresBuiltinInterface`
+                            // — #3139's imported-side fix is already in it).
+                            const bool userRecordComparable =
+                                userRecordElem && declaresBuiltinInterface(
+                                    elem->declaration, "IComparable");
+                            // A RECORD with NO `CompareTo` has NO order, so
+                            // §5.1's extension does not apply to it and the
+                            // call must be REFUSED — exactly as the
+                            // class/interface arm below refuses a class that
+                            // names no `IComparable`, and exactly as
+                            // stdlib §4.4's `Sort()`/`Sorted()` gate refuses a
+                            // non-comparable element.
+                            //
+                            // ⚠ AT THE BASE THIS SHAPE ABORTED THE COMPILER:
+                            // the result was typed `int` (so the call was
+                            // ADMITTED), and codegen's numeric path built
+                            // `icmp slt %record.Pt, i32` — which the LLVM
+                            // verifier REJECTS ("Both operands to ICmp
+                            // instruction are not of the same type!"), so
+                            // `bezelc` died with a codegen error. A located
+                            // diagnostic is strictly better than an abort, and
+                            // no program that compiled before is broken by it.
+                            if ((m == "Min" || m == "Max") && userRecordElem &&
+                                !userRecordComparable) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string(m) +
+                                    "() without a selector requires the "
+                                    "element type to implement "
+                                    "IComparable<T> (stdlib §5.1 / §14.2 "
+                                    "/ #1198); " +
+                                    std::string(elem->declaration->name) +
+                                    " does not implement IComparable<T>. "
+                                    "Use " + std::string(m) +
+                                    "(selector: (T) -> U) instead.");
+                                return;
+                            }
+                            const bool comparableElem =
+                                ptrComparableElem || builtinValueRecordElem ||
+                                userRecordComparable;
                             if ((m == "Min" || m == "Max") && ce.args.empty() &&
-                                ptrComparableElem) {
+                                comparableElem) {
                                 // per §5.1 / §14.2 (#1198): enforce the
                                 // IComparable<T> constraint on class/interface
                                 // elements. String always satisfies it (stdlib
@@ -13701,8 +13807,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 bool implIComp = true; // string: always true
                                 // Kept DIRECT, exactly as the base-list scan it
                                 // replaces: only the module boundary changes.
+                                //
+                                // fix #8092 (stdlib §2.5 / §2.8, spec §14.2,
+                                // v0.355): a BUILT-IN VALUE RECORD element is
+                                // comparable by the STDLIB's own declaration
+                                // (`public record DateTime: IComparable<DateTime>,
+                                // IEquatable<DateTime>` — stdlib §2.5), which
+                                // the SYMBOL cannot answer for: these four
+                                // carry no user TypeDecl, so their TypeRef has
+                                // no `declaration` at all. The stdlib
+                                // declaration is the authority for them, so
+                                // the symbol probe is SKIPPED for that family
+                                // (and only for it). A USER RECORD's
+                                // comparability was already decided above (the
+                                // same accessor), so the probe does not run
+                                // for it either.
                                 if (elem->kind == TypeRef::Kind::Named &&
-                                    elem->declaration)
+                                    elem->declaration &&
+                                    !builtinValueRecordElem &&
+                                    !userRecordComparable)
                                     implIComp = declaresBuiltinInterface(
                                         elem->declaration, "IComparable");
                                 if (!implIComp) {

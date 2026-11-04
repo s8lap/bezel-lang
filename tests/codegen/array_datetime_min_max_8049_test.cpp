@@ -52,28 +52,24 @@
 // tick word, a `DateOnly` by its i32 day number, a `TimeOnly` by its i32
 // millisecond-of-day count.
 //
-// ⚠ COUPLING WITH A SEPARATELY-FILED RESIDUAL — READ THIS BEFORE RE-SPELLING
-// THESE ROWS. The RESULT TYPE of the no-selector `Min()`/`Max()` is ALSO
-// wrong, and it is NOT fixed by the commit that fixes the refusal: sema types
-// the result as a primitive `int` (`ExprTC::typeCall`,
-// src/sema/ExprTypecheck_Calls.cpp — the `ptrComparableElem` arm keys on a
-// Class/Interface/string element, so a built-in value-record element falls
-// through to the `int` default). That is the SECOND facet of #8049 and the
-// coordinator has filed it separately, against a live lane's sema file.
+// ⚠ COUPLING WITH THE RESULT-TYPE FIX (#8092) — READ THIS BEFORE RE-SPELLING
+// THESE ROWS. The RESULT TYPE of the no-selector `Min()`/`Max()` is `T` (the
+// ELEMENT type), per stdlib §5.1 (`public method Min(): T`), and it is now
+// FIXED (#8092, on `r30-c1` after this commit): sema used to type the result
+// a PRIMITIVE `int` (the `ptrComparableElem` arm keyed on a Class/Interface/
+// `string` element only, and a built-in value record carries no user
+// TypeDecl), so `var x: DateTime := darr.Min();` was refused with a §5.1
+// conversion diagnostic.
 //
-//     ⇒ `var x: DateTime := darr.Min();` is STILL REFUSED today, with a
-//       §5.1 conversion diagnostic ("no implicit conversion from a concrete
-//       primitive to the value type `DateTime`"). That binding shape is
-//       therefore NOT asserted here.
-//     ⇒ These rows observe the computed value through a `long`-typed binding,
-//       which is the shape that is legal while sema types the result `int`
-//       (spec §5.1's numeric widening int → long). It prints the winner's
-//       word EXACTLY — the full 64-bit tick count, not a truncation.
-//     ⇒ WHEN THE RESIDUAL RESULT-TYPE FIX LANDS, these rows MUST BE
-//       RE-SPELLED against the `DateTime`-typed result (the binding becomes
-//       `var x: DateTime := darr.Min();` and the observable becomes the
-//       element's own rendering). Until then they pin the value the codegen
-//       arm computes, which is the subject of THIS commit.
+// ⇒ The rows below therefore read their values through an ELEMENT-TYPED
+//   binding (`var lo: DateTime := arr.Min();`) and the element's own
+//   observable (`Ticks` / `ToString()` / `Kind`). The `var lo: long :=
+//   arr.Min();` spelling they used before is no longer legal — a `DateTime`
+//   does not convert to `long` (§5.1's table is closed).
+// ⇒ The VALUES are unchanged: the same winners, read exactly (the full
+//   64-bit tick count, not a truncation).
+// ⇒ A USER RECORD implementing `IComparable<T>` is now covered too — see
+//   tests/codegen/array_minmax_value_elem_result_type_8092_test.cpp.
 //
 // EVERY ROW IS POSITIVE: each asserts that the program COMPILES, RUNS, and
 // PRINTS the expected value. A program that is rejected (as it was before the
@@ -138,16 +134,18 @@ std::string prog(const std::string& body) {
 // the span is 731 days). A tick is 100 ns, so 737,059 days is
 // 737059 * 864000000000 = 636818976000000000 ticks.
 //
-// The values are read through a `long` binding because sema types the
-// no-selector result as `int` today (see the RESIDUAL note in the header);
-// the binding is what keeps the full 64-bit count intact.
+// The values are read through a `DateTime`-typed binding and its `Ticks`
+// property (fix #8092, stdlib §5.1: the no-selector result is `T`, the
+// ELEMENT type). The binding used to be `var lo: long := arr.Min();`, which
+// was only legal while sema typed the result a PRIMITIVE `int`; the tick
+// count is still read exactly (the full 64-bit count, not a truncation).
 BEZEL_TEST(array_datetime_min_max_8049, datetime_element_min_max_admitted_and_ordered) {
     BEZEL_EXPECT_EQ(
         out(prog(
             "var arr: Array<DateTime> := [new DateTime(2019, 1, 1), "
             "new DateTime(2021, 1, 1), new DateTime(2020, 1, 2)]; "
-            "var lo: long := arr.Min(); Console.WriteLine(lo); "
-            "var hi: long := arr.Max(); Console.WriteLine(hi); ")),
+            "var lo: DateTime := arr.Min(); Console.WriteLine(lo.Ticks); "
+            "var hi: DateTime := arr.Max(); Console.WriteLine(hi.Ticks); ")),
         "636818976000000000\n637450560000000000\n");
 }
 
@@ -160,8 +158,8 @@ BEZEL_TEST(array_datetime_min_max_8049, datetime_element_min_max_under_asan) {
         outChecked(prog(
             "var arr: Array<DateTime> := [DateTime.FromTicks(300), "
             "DateTime.FromTicks(100), DateTime.FromTicks(200)]; "
-            "var lo: long := arr.Min(); Console.WriteLine(lo); "
-            "var hi: long := arr.Max(); Console.WriteLine(hi); ")),
+            "var lo: DateTime := arr.Min(); Console.WriteLine(lo.Ticks); "
+            "var hi: DateTime := arr.Max(); Console.WriteLine(hi.Ticks); ")),
         "100\n300\n");
 }
 
@@ -174,8 +172,8 @@ BEZEL_TEST(array_datetime_min_max_8049, timespan_element_min_max_admitted_and_or
         out(prog(
             "var arr: Array<TimeSpan> := [TimeSpan.FromTicks(300), "
             "TimeSpan.FromTicks(100), TimeSpan.FromTicks(-50)]; "
-            "var lo: long := arr.Min(); Console.WriteLine(lo); "
-            "var hi: long := arr.Max(); Console.WriteLine(hi); ")),
+            "var lo: TimeSpan := arr.Min(); Console.WriteLine(lo.Ticks); "
+            "var hi: TimeSpan := arr.Max(); Console.WriteLine(hi.Ticks); ")),
         "-50\n300\n");
 }
 
@@ -184,27 +182,41 @@ BEZEL_TEST(array_datetime_min_max_8049, timespan_element_min_max_admitted_and_or
 // so the winners are 737,059 (2019-01-01) and 737,790 (2021-01-01). The
 // element word is 32 bits wide, so this row's value is exact with no width
 // question at all.
+//
+// The printed values are the winners' rendered dates ("yyyy-MM-dd", stdlib
+// §2.5's `DateOnly.ToString()`), read through a `DateOnly`-typed binding
+// (fix #8092: the no-selector result is `T`, the ELEMENT type). The binding
+// used to be `var lo: long := arr.Min();`, which was only legal while sema
+// typed the result a PRIMITIVE `int`; the row's DAY NUMBERS were the
+// representation behind the same two dates.
 BEZEL_TEST(array_datetime_min_max_8049, dateonly_element_min_max_admitted_and_ordered) {
     BEZEL_EXPECT_EQ(
         out(prog(
             "var arr: Array<DateOnly> := [new DateOnly(2019, 1, 1), "
             "new DateOnly(2021, 1, 1), new DateOnly(2020, 1, 2)]; "
-            "var lo: long := arr.Min(); Console.WriteLine(lo); "
-            "var hi: long := arr.Max(); Console.WriteLine(hi); ")),
-        "737059\n737790\n");
+            "var lo: DateOnly := arr.Min(); Console.WriteLine(lo.ToString()); "
+            "var hi: DateOnly := arr.Max(); Console.WriteLine(hi.ToString()); ")),
+        "2019-01-01\n2021-01-01\n");
 }
 
 // #8049 / stdlib §2.5: `Array<TimeOnly>.Min()` / `.Max()` are ADMITTED and
 // order by the millisecond-of-day count. A `TimeOnly` is an i32 millisecond
 // count, so 01:00:00 is 3,600,000 and 03:00:00 is 10,800,000.
+//
+// The printed values are the winners' rendered times ("HH:mm:ss", stdlib
+// §2.5's `TimeOnly.ToString()`), read through a `TimeOnly`-typed binding
+// (fix #8092: the no-selector result is `T`, the ELEMENT type). The binding
+// used to be `var lo: long := arr.Min();`, which was only legal while sema
+// typed the result a PRIMITIVE `int`; the row's MILLISECOND COUNTS were the
+// representation behind the same two times.
 BEZEL_TEST(array_datetime_min_max_8049, timeonly_element_min_max_admitted_and_ordered) {
     BEZEL_EXPECT_EQ(
         out(prog(
             "var arr: Array<TimeOnly> := [new TimeOnly(3, 0, 0), "
             "new TimeOnly(1, 0, 0), new TimeOnly(2, 0, 0)]; "
-            "var lo: long := arr.Min(); Console.WriteLine(lo); "
-            "var hi: long := arr.Max(); Console.WriteLine(hi); ")),
-        "3600000\n10800000\n");
+            "var lo: TimeOnly := arr.Min(); Console.WriteLine(lo.ToString()); "
+            "var hi: TimeOnly := arr.Max(); Console.WriteLine(hi.ToString()); ")),
+        "01:00:00\n03:00:00\n");
 }
 
 // #8049 / stdlib §2.5 ("CompareTo = tick order (Kind not normalized,
@@ -225,15 +237,28 @@ BEZEL_TEST(array_datetime_min_max_8049, timeonly_element_min_max_admitted_and_or
 // So this row distinguishes tick-order from word-order, AND pins that the
 // winner keeps its OWN `Kind` (the minimum's printed word still carries the
 // Utc bits) — the same discipline the `Math.Min`/`Max` arm applies.
+//
+// The observable is read through a `DateTime`-typed binding (fix #8092: the
+// no-selector result is `T`, the ELEMENT type): `Ticks` is the tick count
+// (the `Kind` bits masked off, exactly the key the ordering uses) and
+// `Kind` is the winner's own. The binding used to be
+// `var lo: long := arr.Min();`, which was only legal while sema typed the
+// result a PRIMITIVE `int` — that spelling printed the winner's RAW word
+// (4611686018427388004 = 100 + 2^62), which the `Ticks` property now
+// reports as the 100 ticks the ordering actually compared.
 BEZEL_TEST(array_datetime_min_max_8049, datetime_element_kind_not_normalized_in_ordering) {
     BEZEL_EXPECT_EQ(
         out(prog(
             "var arr: Array<DateTime> := [DateTime.FromTicks(300), "
             "DateTime.FromTicks(100, DateTimeKind.Utc), "
             "DateTime.FromTicks(200)]; "
-            "var lo: long := arr.Min(); Console.WriteLine(lo); "
-            "var hi: long := arr.Max(); Console.WriteLine(hi); ")),
-        "4611686018427388004\n300\n");
+            "var lo: DateTime := arr.Min(); Console.WriteLine(lo.Ticks); "
+            "if lo.Kind = DateTimeKind.Utc then Console.WriteLine(\"utc\"); "
+            "else Console.WriteLine(\"notutc\"); end if; "
+            "var hi: DateTime := arr.Max(); Console.WriteLine(hi.Ticks); "
+            "if hi.Kind = DateTimeKind.Utc then Console.WriteLine(\"utc\"); "
+            "else Console.WriteLine(\"notutc\"); end if; ")),
+        "100\nutc\n300\nnotutc\n");
 }
 
 // #8049 / stdlib §5.1 ("InvalidOperationException if empty"): the new arm

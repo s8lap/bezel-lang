@@ -7,7 +7,6 @@
 //! expect: run
 //! output: 2019
 //!   2021
-//! issue: 8092
 module Conf;
 
 public class Program

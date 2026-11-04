@@ -6,7 +6,6 @@
 //! cites: 5.1, 2.5
 //! expect: run
 //! stdout: 2 12
-//! issue: 8092
 module Conf;
 
 public class Program
