@@ -3599,6 +3599,14 @@ private:
     // fact was recorded.
     bool narrowFromFieldNullTest(const ast::Expr* cond, bool forTrueBranch);
 
+    // fix-forward #8099 (§7.4 / §12.7, v0.355): the `is <function type>` /
+    // `is not <function type>` twin of narrowFromFieldNullTest for a
+    // readonly nullable FUNCTION-typed field path. Records §7.4's null fact
+    // in `fieldNarrowed_` (never a §12.7 retype — that is #5550); declined
+    // in the construction window and at a `ref`-parameter root (#5522).
+    // Returns true iff a field-narrowing fact was recorded.
+    bool narrowFromFieldTypeTest(const ast::Expr* cond, bool forTrueBranch);
+
     // §7.4 (v0.214, #2085/#2116): the FIELD-ONLY establishment walk used to
     // (re)seed `fieldNarrowed_` for a branch context without touching
     // `nullNarrowed_`/`narrowings_` — the same condition shapes

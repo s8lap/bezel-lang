@@ -550,3 +550,242 @@ BEZEL_TEST(nullable_function_value_call_8099,
         "end C;\n",                                              // 14
         11, kOtherShapeMessage);
 }
+
+// ---------------------------------------------------------------------------
+// Rows added by the second fix-forward (r39-rev-8099b's B5 and N2).
+// ---------------------------------------------------------------------------
+
+// §7.4 (v0.355) "Narrowing applies to locals -- and `readonly` fields --
+// only": the narrowing carriers include "a `readonly` field ... in the
+// tracked shape" -- "`this._f`, `TypeName._s`, or `v._f`" -- and the
+// establishment forms include "a successful `is`/typed-pattern test". So the
+// Function-typed `is` test that narrows a LOCAL (the rows above) narrows a
+// readonly field path the same way, and the call inside the controlled block
+// is admitted. (The pre-gate compiler ran this program; the first fix-forward
+// refused it.)
+BEZEL_TEST(nullable_function_value_call_8099,
+           is_function_type_test_on_a_readonly_field_narrows_the_callee_spec_7_4) {
+    expectStdout(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "class H\n"                                              // 3
+        "  private readonly _f: ((int) -> int)?;\n"              // 4
+        "  public constructor() _f := lambda(x: int) => x + 1; end;\n"  // 5
+        "  public method Fire()\n"                               // 6
+        "    if this._f is (int) -> int then\n"                  // 7
+        "      Console.WriteLine(this._f(1).ToString());\n"      // 8
+        "    end;\n"                                             // 9
+        "  end Fire;\n"                                          // 10
+        "end H;\n"                                               // 11
+        "class C\n"                                              // 12
+        "  public static method Main(): int\n"                   // 13
+        "    var h := new H();\n"                                // 14
+        "    h.Fire();\n"                                        // 15
+        "    return 0;\n"                                        // 16
+        "  end Main;\n"                                          // 17
+        "end C;\n",                                              // 18
+        "2\n");
+}
+
+// The bare-identifier spelling of the same field (`_f`, implicit `this`).
+BEZEL_TEST(nullable_function_value_call_8099,
+           is_function_type_test_on_a_bare_readonly_field_narrows_the_callee_spec_7_4) {
+    expectStdout(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "class H\n"                                              // 3
+        "  private readonly _f: ((int) -> int)?;\n"              // 4
+        "  public constructor() _f := lambda(x: int) => x + 1; end;\n"  // 5
+        "  public method Fire()\n"                               // 6
+        "    if _f is (int) -> int then\n"                       // 7
+        "      Console.WriteLine(_f(1).ToString());\n"           // 8
+        "    end;\n"                                             // 9
+        "  end Fire;\n"                                          // 10
+        "end H;\n"                                               // 11
+        "class C\n"                                              // 12
+        "  public static method Main(): int\n"                   // 13
+        "    var h := new H();\n"                                // 14
+        "    h.Fire();\n"                                        // 15
+        "    return 0;\n"                                        // 16
+        "  end Main;\n"                                          // 17
+        "end C;\n",                                              // 18
+        "2\n");
+}
+
+// The `is not` spelling with an EXITING branch: §7.4's early-exit rule
+// leaves the surviving path narrowed for a readonly field path too.
+BEZEL_TEST(nullable_function_value_call_8099,
+           is_not_function_type_test_on_a_readonly_field_narrows_after_early_return_spec_7_4) {
+    expectStdout(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "class H\n"                                              // 3
+        "  private readonly _f: ((int) -> int)?;\n"              // 4
+        "  public constructor() _f := lambda(x: int) => x + 1; end;\n"  // 5
+        "  public method Fire()\n"                               // 6
+        "    if this._f is not (int) -> int then return; end;\n" // 7
+        "    Console.WriteLine(this._f(1).ToString());\n"        // 8
+        "  end Fire;\n"                                          // 9
+        "end H;\n"                                               // 10
+        "class C\n"                                              // 11
+        "  public static method Main(): int\n"                   // 12
+        "    var h := new H();\n"                                // 13
+        "    h.Fire();\n"                                        // 14
+        "    return 0;\n"                                        // 15
+        "  end Main;\n"                                          // 16
+        "end C;\n",                                              // 17
+        "2\n");
+}
+
+// The static spelling of the tracked shape, `TypeName._s`.
+BEZEL_TEST(nullable_function_value_call_8099,
+           is_function_type_test_on_a_static_readonly_field_narrows_the_callee_spec_7_4) {
+    expectStdout(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "class H\n"                                              // 3
+        "  private static readonly _s: ((int) -> int)? := lambda(x: int) => x + 1;\n"  // 4
+        "  public static method Fire()\n"                        // 5
+        "    if H._s is (int) -> int then\n"                     // 6
+        "      Console.WriteLine(H._s(1).ToString());\n"         // 7
+        "    end;\n"                                             // 8
+        "  end Fire;\n"                                          // 9
+        "end H;\n"                                               // 10
+        "class C\n"                                              // 11
+        "  public static method Main(): int\n"                   // 12
+        "    H.Fire();\n"                                        // 13
+        "    return 0;\n"                                        // 14
+        "  end Main;\n"                                          // 15
+        "end C;\n",                                              // 16
+        "2\n");
+}
+
+// The local-rooted spelling of the tracked shape, `v._f` ("where `v` is a
+// local variable or non-`ref` parameter that is itself narrowing-tracked").
+BEZEL_TEST(nullable_function_value_call_8099,
+           is_function_type_test_on_a_local_rooted_readonly_field_narrows_the_callee_spec_7_4) {
+    expectStdout(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "class H\n"                                              // 3
+        "  public readonly F: ((int) -> int)?;\n"                // 4
+        "  public constructor() F := lambda(x: int) => x + 1; end;\n"  // 5
+        "end H;\n"                                               // 6
+        "class C\n"                                              // 7
+        "  public static method Main(): int\n"                   // 8
+        "    var v := new H();\n"                                // 9
+        "    if v.F is (int) -> int then\n"                      // 10
+        "      Console.WriteLine(v.F(1).ToString());\n"          // 11
+        "    end;\n"                                             // 12
+        "    return 0;\n"                                        // 13
+        "  end Main;\n"                                          // 14
+        "end C;\n",                                              // 15
+        "2\n");
+}
+
+// The admitting twin's NARROWNESS: the same `is` test on a MUTABLE field
+// establishes nothing -- §7.4 "It never narrows mutable fields, properties,
+// or `ref` parameters" -- so the call stays refused.
+BEZEL_TEST(nullable_function_value_call_8099,
+           is_function_type_test_on_a_mutable_field_does_not_narrow_spec_7_4) {
+    expectRejectedWith(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "class H\n"                                              // 3
+        "  private _f: ((int) -> int)?;\n"                       // 4
+        "  public method Set() _f := lambda(x: int) => x + 1; end Set;\n"  // 5
+        "  public method Fire()\n"                               // 6
+        "    if this._f is (int) -> int then\n"                  // 7
+        "      Console.WriteLine(this._f(1).ToString());\n"      // 8
+        "    end;\n"                                             // 9
+        "  end Fire;\n"                                          // 10
+        "end H;\n"                                               // 11
+        "class C\n"                                              // 12
+        "  public static method Main(): int\n"                   // 13
+        "    var h := new H();\n"                                // 14
+        "    h.Set();\n"                                         // 15
+        "    h.Fire();\n"                                        // 16
+        "    return 0;\n"                                        // 17
+        "  end Main;\n"                                          // 18
+        "end C;\n",                                              // 19
+        8, kOtherShapeMessage);
+}
+
+// §7.4 "The rule does not apply inside the declaring type's constructors,
+// field initializers, static constructor, or static field initializers (the
+// assignment window)": the same test INSIDE the constructor narrows nothing.
+BEZEL_TEST(nullable_function_value_call_8099,
+           is_function_type_test_on_a_readonly_field_in_its_constructor_does_not_narrow_spec_7_4) {
+    expectRejectedWith(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "class H\n"                                              // 3
+        "  private readonly _f: ((int) -> int)?;\n"              // 4
+        "  public constructor()\n"                               // 5
+        "    _f := lambda(x: int) => x + 1;\n"                   // 6
+        "    if this._f is (int) -> int then\n"                  // 7
+        "      Console.WriteLine(this._f(1).ToString());\n"      // 8
+        "    end;\n"                                             // 9
+        "  end;\n"                                               // 10
+        "end H;\n"                                               // 11
+        "class C\n"                                              // 12
+        "  public static method Main(): int\n"                   // 13
+        "    var h := new H();\n"                                // 14
+        "    return 0;\n"                                        // 15
+        "  end Main;\n"                                          // 16
+        "end C;\n",                                              // 17
+        8, kOtherShapeMessage);
+}
+
+// §7.4 "`ref` parameters do not narrow": "A null test, type test (§12.7),
+// ... on it narrows nothing", so the Function-typed `is` test that narrows a
+// plain parameter establishes nothing about a `ref` one, and the call stays
+// refused. (The first fix-forward narrowed it.)
+BEZEL_TEST(nullable_function_value_call_8099,
+           is_function_type_test_on_a_ref_parameter_does_not_narrow_spec_7_4) {
+    expectRejectedWith(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "class C\n"                                              // 3
+        "  public static method Run(ref p: ((int) -> int)?)\n"   // 4
+        "    if p is (int) -> int then\n"                        // 5
+        "      Console.WriteLine(p(1).ToString());\n"            // 6
+        "    end;\n"                                             // 7
+        "  end Run;\n"                                           // 8
+        "  public static method Main(): int\n"                   // 9
+        "    var h: ((int) -> int)? := lambda(x: int) => x + 1;\n"  // 10
+        "    Run(ref h);\n"                                      // 11
+        "    return 0;\n"                                        // 12
+        "  end Main;\n"                                          // 13
+        "end C;\n",                                              // 14
+        6, simpleVarMessage("p"));
+}
+
+// §7.4 "`ref` parameters do not narrow", the readonly-path clause: "a
+// `readonly`-field path rooted at it (`a._f`) is not trackable, since its
+// root is not". The `v._f` form over a `ref v` establishes nothing. (A
+// record root: an OWNED class local may not be passed by `ref` at all,
+// §22.3, which would add a second, unrelated error.)
+BEZEL_TEST(nullable_function_value_call_8099,
+           is_function_type_test_on_a_ref_rooted_readonly_field_does_not_narrow_spec_7_4) {
+    expectRejectedWith(
+        "module M;\n"                                            // 1
+        "import System;\n"                                       // 2
+        "record H\n"                                             // 3
+        "  public readonly F: ((int) -> int)?;\n"                // 4
+        "  public constructor() F := lambda(x: int) => x + 1; end;\n"  // 5
+        "end H;\n"                                               // 6
+        "class C\n"                                              // 7
+        "  public static method Run(ref v: H)\n"                 // 8
+        "    if v.F is (int) -> int then\n"                      // 9
+        "      Console.WriteLine(v.F(1).ToString());\n"          // 10
+        "    end;\n"                                             // 11
+        "  end Run;\n"                                           // 12
+        "  public static method Main(): int\n"                   // 13
+        "    var v := new H();\n"                                // 14
+        "    Run(ref v);\n"                                      // 15
+        "    return 0;\n"                                        // 16
+        "  end Main;\n"                                          // 17
+        "end C;\n",                                              // 18
+        10, kOtherShapeMessage);
+}

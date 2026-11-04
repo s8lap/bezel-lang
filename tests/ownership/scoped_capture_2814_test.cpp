@@ -309,7 +309,8 @@ BEZEL_TEST(scoped_capture_2814, scoped_field_read_out_rejected) {
     BEZEL_EXPECT_TRUE(diagContains(r, "never read out"));
 }
 
-// §28.14 controls: a scoped field may be INVOKED (behind a null test),
+// §28.14 controls: a scoped field may be INVOKED (through the §7.6
+// null-conditional call `_cb?()`; a mutable field never narrows, §7.4),
 // OVERWRITTEN from a scoped parameter, and CLEARED to null.
 BEZEL_TEST(scoped_capture_2814, scoped_field_invoke_overwrite_clear_admitted) {
     auto r = parseAndCheckOwnership(

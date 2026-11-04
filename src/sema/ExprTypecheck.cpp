@@ -18098,6 +18098,19 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
                 TypeRef* carrierTy = declaredTypeOf(sym);
                 narrowable = carrierTy &&
                              carrierTy->kind == TypeRef::Kind::Function;
+                // fix-forward #8099 / narrow #5522 (§7.4, v0.355): "`ref`
+                // parameters do not narrow" — verbatim, "A null test, type
+                // test (§12.7), assignment, `??=`, early exit, or
+                // `out`-recipient postcondition (§22.4) on it narrows
+                // nothing". A `ref` parameter aliases a caller-chosen
+                // location whose other names stay live for the whole call,
+                // so the fact this arm would record could be falsified by a
+                // write the invalidating forms never see. The Named arm's
+                // own `ref` admission is the rest of #5522 and is not touched
+                // here; this arm is NEW with #8099, so it is born correct.
+                if (auto* ps = dynamic_cast<ParameterSymbol*>(sym);
+                    ps && ps->modifier == "ref")
+                    narrowable = false;
             }
             nonNullFactOnly = narrowable;
             break;
@@ -19793,6 +19806,77 @@ bool ExprTC::narrowFromFieldNullTest(const ast::Expr* cond, bool forTrueBranch) 
     return true;
 }
 
+// fix-forward #8099 (§7.4 / §12.7, v0.355): the readonly-FIELD twin of
+// narrowFromTypeTest's Function arm. `<readonly path> is <function type>`
+// narrows the true branch and `is not` the else branch, by recording §7.4's
+// "known non-null" FACT about a nullable readonly FUNCTION-typed field path
+// in `fieldNarrowed_` — the store the §7.4 gates consult for a field path
+// through `isNarrowedNonNullRead` — exactly as `<readonly path> <> null`
+// does in narrowFromFieldNullTest above. §7.4 (v0.355) lists a `readonly`
+// field among the narrowing carriers (the tracked shape "`this._f`,
+// `TypeName._s`, or `v._f`") and "a successful `is`/typed-pattern test"
+// among the establishment forms, and §12.7's function-typed test "succeeds
+// exactly when the operand holds a function value", which is never null.
+// Without this twin the #8099 call gate refused `if this._f is (int) -> int
+// then this._f(1) end;` over `readonly _f: ((int) -> int)?` — a legal
+// program the pre-gate compiler ran — while admitting the `<> null`
+// spelling of the same fact.
+//
+// The shape is the Function arm's, no wider: the field's DECLARED type and
+// the test type are both function types, and what is recorded is the NULL
+// fact only — the member read keeps its declared nullable type, the same
+// constraint the Function arm states ("NOT a §12.7 type narrowing"). Type-
+// narrowing a readonly path by `is T` for a Named `T` is #5550 and is not
+// done here. Declined where the null-test twin declines — inside the
+// declaring type's construction window (§7.4 / §22.8) — and at a
+// `ref`-parameter root: §7.4 "`ref` parameters do not narrow", verbatim, "a
+// `readonly`-field path rooted at it (`a._f`) is not trackable, since its
+// root is not" (#5522; readonlyFieldPathOf's own root admission is the rest
+// of that issue and is left as it is).
+bool ExprTC::narrowFromFieldTypeTest(const ast::Expr* cond, bool forTrueBranch) {
+    auto* te = dynamic_cast<const ast::TypeTestExpr*>(cond);
+    if (!te) return false;
+    bool narrowsThis;
+    if (te->op == "is") narrowsThis = forTrueBranch;       // true branch
+    else if (te->op == "is not") narrowsThis = !forTrueBranch;  // else branch
+    else return false;                                     // `as` etc.
+    if (!narrowsThis) return false;
+    if (!te->testType) return false;
+    TypeRef* tt = ctx_.resolvedType(*te->testType);
+    if (!tt || tt->kind != TypeRef::Kind::Function) return false;
+    const ast::Expr* operand = te->operand.get();
+    // Peek the field symbol FIRST (without assigning ids) so the declines
+    // below happen before any id is minted — establishment must be a no-op
+    // there, not a tracked-then-suppressed path (as in the null-test twin).
+    auto* probeMa = dynamic_cast<const ast::MemberAccessExpr*>(operand);
+    auto* probeId = dynamic_cast<const ast::IdentifierExpr*>(operand);
+    const FieldSymbol* fsProbe = nullptr;
+    if (probeMa) fsProbe = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(*probeMa));
+    else if (probeId) fsProbe =
+        dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(*probeId));
+    if (!fsProbe) return false;
+    // Only a carrier that HOLDS a function value qualifies: the fact must be
+    // about the value a call reads. An `Object`-declared field is not one —
+    // §12.7's narrowing there is a RE-TYPE (#5550), not a nullability fact.
+    TypeRef* ft = fieldTypeOf(fsProbe);
+    if (!ft || ft->kind != TypeRef::Kind::Function) return false;
+    if ((inConstructor_ || inFieldInitializer_) &&
+        fsProbe->parent == currentType_)
+        return false;
+    if (probeMa) {
+        if (auto* tid =
+                dynamic_cast<const ast::IdentifierExpr*>(probeMa->target.get()))
+            if (auto* ps = dynamic_cast<ParameterSymbol*>(ctx_.exprSymbol(*tid));
+                ps && ps->modifier == "ref")
+                return false;
+    }
+    auto key = readonlyFieldPathOf(operand, /*assignIds=*/true);
+    if (!key) return false;
+    fieldNarrowed_.insert(*key);
+    confirmFieldFact(*key);   // #6835
+    return true;
+}
+
 // §7.4 (v0.214, #2085/#2116): the field-only establishment walk. Mirrors
 // collectNarrowings' condition coverage (single test; `and` contributes both
 // conjuncts to the true branch) but touches ONLY `fieldNarrowed_` — used to
@@ -19801,6 +19885,7 @@ bool ExprTC::narrowFromFieldNullTest(const ast::Expr* cond, bool forTrueBranch) 
 void ExprTC::collectFieldNarrowings(const ast::Expr* cond, bool forTrueBranch) {
     if (!cond) return;
     if (narrowFromFieldNullTest(cond, forTrueBranch)) return;
+    if (narrowFromFieldTypeTest(cond, forTrueBranch)) return;   // #8099
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(cond)) {
         if (be->op == "and" && forTrueBranch) {
             collectFieldNarrowings(be->left.get(), /*forTrueBranch=*/true);
@@ -20007,6 +20092,9 @@ void ExprTC::collectNarrowings(const ast::Expr* cond, bool forTrueBranch) {
     // §7.4 (v0.214, #2085/#2116): a `<readonly-field path> <> null` / `= null`
     // test narrows the field path (`this._f`, `TypeName._s`, `local._f`).
     if (narrowFromFieldNullTest(cond, forTrueBranch)) return;
+    // fix-forward #8099 (§7.4 / §12.7, v0.355): `<readonly-field path> is
+    // <function type>` records the same null fact (narrowFromFieldTypeTest).
+    if (narrowFromFieldTypeTest(cond, forTrueBranch)) return;
     // §22.4 (v0.183, #1585): a `Try`-style call with an out-nullability
     // postcondition narrows its out recipient on the branch matching the
     // stated constant.
