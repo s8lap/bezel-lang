@@ -188,7 +188,7 @@ BEZEL_TEST(encoding_variable_receiver_7028, parameter_3_2) {
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("3\n4\n8\n3\n"));
 }
 
-// The two-argument `GetBytes(s, destination: Span<byte>)` form (stdlib §3.2),
+// The two-argument `GetBytes(s, destination: Span<byte>)` form (stdlib §3.2 / §4.14),
 // through the variable shape.
 BEZEL_TEST(encoding_variable_receiver_7028, destination_span_3_2) {
     auto r = runAotChecked(

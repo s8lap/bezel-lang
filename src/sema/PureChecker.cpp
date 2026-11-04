@@ -43,7 +43,7 @@ namespace {
 //
 //   * `Const` — §22.15 rule 1: "static field, `static readonly`, and `const`
 //     reads … Reads are not effects". `Math.Pi`, `int.MaxValue`,
-//     `double.NaN` are `static const` declarations (stdlib §2.2, §9.1-§9.5),
+//     `double.NaN` are `static const` declarations (stdlib §9.1-§9.5; Math.Pi: §2.2),
 //     not calls, so rule 6 does not reach them at all.
 //   * `Declared` — §22.15 rule 6: the member carries the library's own
 //     `pure` marker, transcribed from `docs/Bezel_Standard_Library.md`
@@ -132,7 +132,7 @@ constexpr StdlibPureMember kStdlibPureMembers[] = {
     {"ReadOnlyStringSpan", "EndsWith", kDecl},
     {"ReadOnlyStringSpan", "SequenceEqual", kDecl},
     {"ReadOnlyStringSpan", "ToString", kDecl},
-    // stdlib §4.1 / §4.2 — the collection interfaces' `Count` (the one
+    // stdlib §4.1 / §4.2 — the collection interfaces' Count (the one
     // `pure`-declared member of the borrowing and owning interfaces).
     {"IReadOnlyCollection", "Count", kDecl},
     {"IReadOnlyList", "Count", kDecl},

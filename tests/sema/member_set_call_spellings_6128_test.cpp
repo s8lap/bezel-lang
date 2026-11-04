@@ -86,7 +86,7 @@ BEZEL_CALL_REJECT(owningbuffer_value_nullcond_count_call_rejected_stdlib_4_14,
 
 // ── C1 — the §5 LINQ `Count()` operator is reachable only where the
 // receiver's declared surface declares no `Count` of its own (§26.5 rule 1 +
-// the stdlib §1 "Block-by-name" row). An `IEnumerable<int>` receiver declares
+// the stdlib §1 "Block-by-name" row). An `IEnumerable<int>` (§4.12) receiver declares
 // none — the operator is an EXTENSION — so the call still runs there.
 BEZEL_TEST(sema_member_set_call_spellings_6128,
            enumerable_count_call_runs_stdlib_5) {

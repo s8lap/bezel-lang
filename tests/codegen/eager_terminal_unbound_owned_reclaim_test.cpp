@@ -480,7 +480,7 @@ BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
 // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): the CALL spelling of a
 // property is now refused — stdlib §4.4 declares `Array<T>.Count` as a `pure
 // readonly property`, and on a `Stack<T>` receiver `Count` is the elided
-// interface-required member of `IReadOnlyCollection<T>` (stdlib §1's
+// interface-required member of `IReadOnlyCollection<T>` (stdlib §4.1; stdlib §1's
 // "Elided interface-required members" convention). The two rows below are
 // re-spelled as the PROPERTY READ, which is the spelling the stdlib declares
 // and which reaches the SAME reclaim: the `.Length`/`.Count` property arm

@@ -5,11 +5,11 @@
 // -- WHAT THE DOCUMENTS REQUIRE ----------------------------------------------
 // The stdlib declares the collection factories with an `owned` return:
 //
-//   stdlib §7.4  public static method GetFiles(path: string): owned Array<string>;
-//   stdlib §7.4  public static method GetDirectories(path: string): owned Array<string>;
-//   stdlib §7.3  public static method ReadAllLines(path: string): owned Array<string>;
-//   stdlib §7.3  public static method ReadAllBytes(path: string): owned Array<byte>;
-//   stdlib §2.4  public static method Variables(): owned Dictionary<string, string>;
+//   stdlib §7.4 / §4.4  public static method GetFiles(path: string): owned Array<string>;
+//   stdlib §7.4 / §4.4  public static method GetDirectories(path: string): owned Array<string>;
+//   stdlib §7.3 / §4.4  public static method ReadAllLines(path: string): owned Array<string>;
+//   stdlib §7.3 / §4.4  public static method ReadAllBytes(path: string): owned Array<byte>;
+//   stdlib §2.4 / §4.8  public static method Variables(): owned Dictionary<string, string>;
 //
 // (§7.4 is `Directory`, §7.3 is `File`, §2.4 is `Environment`.)
 //
@@ -275,7 +275,7 @@ var i := 0; while i < 100 do _ := Directory.GetDirectories("@DATA@/bzt8094_d5");
 
 // ===========================================================================
 // THE `owned Dictionary<string, string>` FACTORY: `Environment.Variables`
-// (stdlib §2.4, "returns a freshly-allocated `owned Dictionary<string,
+// (stdlib §2.4 / §4.8, "returns a freshly-allocated `owned Dictionary<string,
 // string>`"). The dict's VALUE column carries a +1 per stored value
 // (§28.11), so the free must aim the string-release disposer at THAT column.
 //

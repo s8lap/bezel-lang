@@ -260,7 +260,7 @@ BEZEL_TEST(pure_body_stdlib_member_7453,
 
 // The §22.15 throw carve-out: `new E(...)` is admitted as the immediate
 // operand of a `throw` when E's constructor is `pure` and E is
-// trivial-dispose (stdlib §31.4 declares every built-in exception's
+// trivial-dispose (language spec §31.4 declares every built-in exception's
 // constructors `pure`). The carve-out is untouched by this change.
 BEZEL_TEST(pure_body_stdlib_member_7453,
            throw_carve_out_still_admitted_spec_22_15) {

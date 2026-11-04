@@ -40853,7 +40853,7 @@ bool Emitter::isUnboundOwnedBorrowingArrayCallExpr(const ast::Expr* e) const {
     // `Directory.GetDirectories(path)` (stdlib §7.4, "owned Array<string>"),
     // `File.ReadAllLines(path)` and `File.ReadAllBytes(path)` (stdlib §7.3,
     // "owned Array<string>" / "owned Array<byte>"), and `Environment.Variables()`
-    // (stdlib §2.4, "owned Dictionary<string, string>").
+    // (stdlib §2.4 / §4.8, "owned Dictionary<string, string>").
     //
     // WHY `calleeReturnsOwned` CANNOT SEE THEM. It reads the `owned` marker off
     // a resolved USER MethodDecl/MethodSymbol. A stdlib factory has NEITHER:
