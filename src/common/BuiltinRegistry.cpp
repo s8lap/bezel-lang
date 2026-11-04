@@ -1535,9 +1535,16 @@ constexpr std::array<std::string_view, 11> kLinqLazyPassthroughOperatorNames = {
 // to the in-place `bz_array_*` mutator via the `isCollectionTypeName` structural
 // path; #3825 admitted them and updated the two pins that accepted the in-place
 // behaviour (`stack_reverse_is_lazy_not_in_place`, `queue_reverse_is_lazy_not_in_place`).
-constexpr std::array<std::string_view, 9> kLazyReverseDirectReceiverHeads = {
+//
+// fix #7625 (stdlib §5 / §4.1, v0.355): the borrowing list interfaces
+// `IList<T>` / `IReadOnlyList<T>` declare no instance `Reverse()` either
+// (stdlib §4.1: only the indexer, `Count`, and the ICollection members), so
+// on them too the lazy operator is the only meaning. Codegen admits them as
+// the array-backed lazy source `Array<T>` uses (`tryLowerLazyLinqCall`).
+constexpr std::array<std::string_view, 11> kLazyReverseDirectReceiverHeads = {
     "Set", "OwningSet", "SortedSet", "LinkedList", "OwningLinkedList",
     "Stack", "OwningStack", "Queue", "OwningQueue",
+    "IList", "IReadOnlyList",
 };
 
 // fix #4766 / #4833 (§5.1, v0.307): the builtin heap-type heads that declare

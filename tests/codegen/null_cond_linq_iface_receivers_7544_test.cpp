@@ -202,31 +202,46 @@ BEZEL_TEST(null_cond_linq_iface_7544, wrong_arity_to_array_on_ilist_spec_stdlib_
 }
 
 // Finding A: a deferred operator bound to a declared non-lazy type.
+// #7625 FLIP: the operator is now typed and lowered on a list interface, so
+// the line no longer fails as "produced no value"; it is rejected by spec
+// §5.1 instead (a lazy sequence converts to no primitive type). Still a loud
+// compile-time reject; only the needle changed.
 BEZEL_TEST(null_cond_linq_iface_7544, where_into_int_local_stays_rejected_on_ireadonlylist) {
     BEZEL_EXPECT_TRUE(rejectedWith(
-        listProg("var q: int := r.Where(lambda(x: int) => x > 1); "), kNoValue));
+        listProg("var q: int := r.Where(lambda(x: int) => x > 1); "),
+        "a deferred stdlib §5 operator yields a lazy `IEnumerable<T>` "
+        "sequence, which converts to no primitive type"));
 }
 
-// Finding B: deferred operators on a list interface are NOT lowered; they were
-// a loud "produced no value" on base and must stay one (the review measured a
-// runtime InvalidOperationException on the widened typing).
-BEZEL_TEST(null_cond_linq_iface_7544, where_then_count_stays_rejected_on_ireadonlylist) {
-    BEZEL_EXPECT_TRUE(rejectedWith(
-        listProg("var w := r.Where(lambda(x: int) => x > 1); "
-                 "Console.WriteLine(w.Count()); "),
-        kNoValue));
+// Finding B, #7625 FLIP: the deferred operators on a list interface are now
+// LOWERED (stdlib §5 / §4.1), so these rows pin the values instead of the old
+// "produced no value" reject. runAotChecked (generated-code ASan + LSan).
+namespace {
+void expectListStdout(const std::string& body, const char* expected) {
+    JitResult r = runAotChecked(listProg(body));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string(expected));
+}
+}  // namespace
+
+// [5,3,8,1].Where(x > 1) = 5,3,8.
+BEZEL_TEST(null_cond_linq_iface_7544, where_then_count_lowered_on_ireadonlylist_7625) {
+    expectListStdout("var w := r.Where(lambda(x: int) => x > 1); "
+                     "Console.WriteLine(w.Count()); ",
+                     "3\n");
 }
 
-BEZEL_TEST(null_cond_linq_iface_7544, select_then_first_stays_rejected_on_ilist) {
-    BEZEL_EXPECT_TRUE(rejectedWith(
-        listProg("var w := l.Select(lambda(x: int) => x * 2); "
-                 "Console.WriteLine(w.First()); "),
-        kNoValue));
+BEZEL_TEST(null_cond_linq_iface_7544, select_then_first_lowered_on_ilist_7625) {
+    expectListStdout("var w := l.Select(lambda(x: int) => x * 2); "
+                     "Console.WriteLine(w.First()); ",
+                     "10\n");
 }
 
-// `ToSet` has no list-interface lowering either (the widened typing degraded
-// it to a #3079 warning and `Count` 0).
-BEZEL_TEST(null_cond_linq_iface_7544, to_set_stays_rejected_on_ilist) {
-    BEZEL_EXPECT_TRUE(rejectedWith(
-        listProg("var s := l.ToSet(); Console.WriteLine(s.Count); "), kNoValue));
+// `using var`: a plain `var s := <coll>.ToSet()` leaks the set on EVERY
+// receiver, `Array<T>` included (pre-existing, outside #7625).
+BEZEL_TEST(null_cond_linq_iface_7544, to_set_lowered_on_ilist_7625) {
+    expectListStdout("using var s := l.ToSet(); Console.WriteLine(s.Count); ",
+                     "4\n");
 }

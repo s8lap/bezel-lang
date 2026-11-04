@@ -7360,6 +7360,27 @@ void ExprTC::checkAssignable(
         }
         ctx_.diagnostics().report(Severity::Error, loc, msg);
     };
+    // fix #7625 (§5.1, stdlib §5, v0.355): a DEFERRED §5 operator's result —
+    // the lazy `IEnumerable<U>` sentinel (Named, no declaration, no astNode,
+    // the element type at genericArgs[0], no importedName) — is a reference
+    // sequence, and §5.1 lists no conversion from a sequence to a PRIMITIVE
+    // (`string` included; `Object` is the root type and stays admitted by the
+    // boxing path). The sentinel carries no head name, so every name-keyed
+    // arm below misses it and the catch-all accepted `var q: int :=
+    // a.Where(…)` on every receiver, binding the sequence POINTER into the
+    // `int` slot (MEASURED: it printed the address and leaked). #7625 lowers
+    // the deferred operators on IList / IReadOnlyList, which would have
+    // turned their (accidental) loud rejection of the same line into that
+    // silent acceptance; rejecting it here covers every receiver at once.
+    if (from->kind == TypeRef::Kind::Named && !from->declaration &&
+        !from->astNode && !from->genericArgs.empty() &&
+        from->importedName.empty() && to->kind == TypeRef::Kind::Primitive &&
+        to->primitive != PrimitiveType::Object) {
+        reportNotConvertible(
+            "a deferred stdlib §5 operator yields a lazy `IEnumerable<T>` "
+            "sequence, which converts to no primitive type");
+        return;
+    }
     // §5.4 / §10 (#924): an enum is NOT implicitly convertible to or from its
     // underlying integer type — both directions require an explicit cast
     // (`int(e)` / `E(n)`). The mixed Named(enum)↔Primitive case falls through

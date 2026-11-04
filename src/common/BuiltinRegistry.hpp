@@ -1151,6 +1151,11 @@ bool isLinqLazyPassthroughOperatorName(std::string_view m);
 // note therefore says the lazy operator applies — admitted here in #3825,
 // replacing the earlier exclusion.
 //
+// fix #7625 (stdlib §5 / §4.1, v0.355): the borrowing list interfaces
+// `IList<T>` / `IReadOnlyList<T>` declare no instance `Reverse()` (stdlib
+// §4.1), so they are admitted too; their runtime value is the same
+// bz_array_t* as `Array<T>`, wrapped as a borrowing lazy array source.
+//
 // ⚠ EXCLUDES `OwningBuffer` (§4.14) and `FrozenArray` (§4.19): both are
 // `bz_array_t*`-backed and reach the same in-place mutator
 // (`OwningBuffer<int>.Reverse()` measured mutating in place), and their lazy

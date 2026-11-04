@@ -12362,8 +12362,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // lowers only a CLOSED set of §5 operators on a borrowing
                 // `IList<T>` / `IReadOnlyList<T>` receiver (the array-backed
                 // list-interface bridge in `tryLowerCollectionInstanceCall`
-                // plus `tryLowerLazyLinqCall`'s ToArray arm). Admitting the
-                // whole §5 surface here turned the deferred operators
+                // plus `tryLowerLazyLinqCall`, which since #7625 lowers the
+                // deferred operators and ToArray/ToSet/ToDictionary/GroupBy).
+                // Admitting the whole §5 surface here turned the deferred operators
                 // (Where/Select/Take/Distinct/OrderBy/Concat/…), `ToSet`, and
                 // wrong-arity calls — LOUD base rejections — into a degraded
                 // #3079 warning or a runtime InvalidOperationException. So on a
@@ -12374,10 +12375,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     ienumRecv && recvTy->headName() != "IEnumerable";
                 bool listIfaceSkip = false;
                 if (listIfaceRecv) {
+                    // fix #7625 (stdlib §5 / §4.1, v0.355): the DEFERRED
+                    // operators and the `ToSet` materializer are lowered too:
+                    // codegen's `tryLowerLazyLinqCall` wraps the borrowing,
+                    // array-backed list interface as the same lazy ARRAY
+                    // source as `Array<T>` (lowerToLazyEnumerator), so every
+                    // name below reaches the one existing lazy pipeline.
                     static const char* const kLoweredOnListIface[] = {
                         "ToArray", "Any",  "All", "Count",  "First",
                         "Last",    "Single", "ElementAt", "Min", "Max",
-                        "Sum",     "Average", "Contains"};
+                        "Sum",     "Average", "Contains",
+                        "Where", "Select", "SelectMany", "Take", "Skip",
+                        "TakeWhile", "SkipWhile", "Distinct", "OrderBy",
+                        "OrderByDescending", "Concat", "Zip", "Union",
+                        "Intersect", "Except", "Reverse", "ToSet",
+                        "GroupBy", "ToDictionary"};
                     bool lowered = false;
                     for (const char* n : kLoweredOnListIface)
                         if (m == n) lowered = true;
@@ -12417,6 +12429,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         else
                             ctx_.setExprType(&ce, makeConcreteCollectionResult(
                                 m == "ToSet" ? "Set" : "Array", srcElem2));
+                    }
+                    // fix #7625 (stdlib §5 `ToDictionary`, v0.355): on a
+                    // list interface, typed exactly as the lazy-receiver arm
+                    // types it (same TKey hashable gate) — codegen's
+                    // tryLowerLazyLinqCall now lowers it on this receiver,
+                    // and an untyped result silently dropped its first use.
+                    else if (listIfaceRecv && m == "ToDictionary" &&
+                             !ce.args.empty()) {
+                        TypeRef* keyTy = nullptr;
+                        if (ce.args[0].value)
+                            if (auto* lamTy = ctx_.exprType(*ce.args[0].value))
+                                if (lamTy->kind == TypeRef::Kind::Function &&
+                                    lamTy->funcReturn)
+                                    keyTy = lamTy->funcReturn;
+                        if (!linqKeyHashableCheck(m, keyTy, ce.span.begin, ctx_))
+                            return;
+                        ctx_.setExprType(
+                            &ce,
+                            makeDictResult(keyTy, toDictValueType(ce, srcElem2)));
                     }
                     else if ((m == "Any" || m == "All") && ce.args.size() <= 1)
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));

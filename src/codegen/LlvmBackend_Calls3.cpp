@@ -2974,12 +2974,16 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
 
     bool collRecv = isCollectionTypeName(recvTy);
     // fix #7544 (stdlib §5 `ToArray(): owned Array<T>`, §4.1, v0.350): the
-    // borrowing list interfaces are array-backed IEnumerable<T> sources, but
-    // only the materializer is admitted here — `ToArray` on `IList<T>` /
-    // `IReadOnlyList<T>` produced no value (#2457) in both the `.` and `?.`
-    // spellings, while their other §5 operators lower through
-    // tryLowerCollectionInstanceCall's list-interface bridge and stay there.
-    if (!collRecv && m == "ToArray") {
+    // borrowing list interfaces are array-backed IEnumerable<T> sources —
+    // `ToArray` on `IList<T>` / `IReadOnlyList<T>` produced no value (#2457).
+    // fix #7625 (stdlib §5 / §4.1, v0.355): so are the DEFERRED operators
+    // (Where/Select/Take/Skip/Distinct/OrderBy/Concat/Reverse/…) and the
+    // ToSet / ToDictionary materializers, which reach only the arms below;
+    // every TERMINAL (Count/Sum/First/…) still returns nullptr from this
+    // function and keeps lowering through tryLowerCollectionInstanceCall's
+    // list-interface bridge. The receiver is a BORROW: lowerToLazyEnumerator
+    // wraps it with the borrowing `bz_lazy_from_array`, never owning it.
+    if (!collRecv) {
         bool listIfaceOwning = false;
         collRecv = isListInterfaceName(recvTy, &listIfaceOwning) &&
                    !listIfaceOwning;
