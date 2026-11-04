@@ -517,3 +517,257 @@ BEZEL_TEST(pure_body_stdlib_member_7453,
     BEZEL_EXPECT_TRUE(d != nullptr);
     if (d) BEZEL_EXPECT_TRUE(d->location.line == 5u);
 }
+
+// =========================================================================
+// Fix-forward #7453 (third attempt): the throw EXPRESSION carve-out, and the
+// positional components of the built-in positional records.
+// =========================================================================
+
+// §22.15 *The throw carve-out*: "Inside a pure body, `new E(args)` is
+// admitted only as the immediate operand of a `throw` statement or `throw`
+// expression, and only when (a) the invoked constructor of `E` is
+// `pure`-declared … and (b) `E` is a trivial-dispose class", and "Every
+// built-in exception type's `()` and `(message)`-form constructors … are
+// `pure`". The expression spelling (review probe n33): the `ThrowExpr` arm
+// walked its operand as an ordinary expression, so the `NewExpr` arm's
+// standard-library class-construction rejection fired on the carve-out's
+// own validation idiom.
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           throw_expression_carve_out_admits_stdlib_exception_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(s: string?): string => s ?? throw new "
+        "ArgumentException(\"null s\");\n"
+        "end C;\n");
+    BEZEL_EXPECT_TRUE(
+        diagnosticsContaining(r, "standard-library class construction")
+            .empty());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The same carve-out in a block body (review probe n36): the throw
+// expression is the right operand of `??` in a local's initializer.
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           throw_expression_carve_out_in_block_body_admitted_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(s: string?): string\n"
+        "    var t := s ?? throw new InvalidOperationException(\"missing\");\n"
+        "    return t;\n"
+        "  end F;\n"
+        "end C;\n");
+    BEZEL_EXPECT_TRUE(
+        diagnosticsContaining(r, "standard-library class construction")
+            .empty());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The carve-out reaches a USER exception class in the expression spelling
+// too (review probe n35, rejected on every earlier arm): `MyError` derives
+// from `Exception` (trivial-dispose, condition (b)) and declares a `pure`
+// constructor (condition (a)), so `s ?? throw new MyError(…)` is admitted
+// exactly as the statement form `throw new MyError(…);` already was.
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           throw_expression_carve_out_admits_user_pure_ctor_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "public class MyError: Exception\n"
+        "  public pure constructor(message: string)\n"
+        "    base(message);\n"
+        "  end constructor;\n"
+        "end MyError;\n"
+        "class C\n"
+        "  public static pure method F(s: string?): string => s ?? throw new "
+        "MyError(\"null s\");\n"
+        "end C;\n");
+    BEZEL_EXPECT_TRUE(
+        diagnosticsContaining(r, "class construction").empty());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The REJECT control for the expression spelling: a user exception whose
+// constructor is NOT `pure` fails condition (a), and the diagnostic is the
+// carve-out's own ("class construction at `throw`"), on the throw's line —
+// the same diagnostic the statement spelling reports.
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           throw_expression_carve_out_rejects_user_impure_ctor_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "public class MyError: Exception\n"
+        "  public constructor(message: string)\n"
+        "    base(message);\n"
+        "  end constructor;\n"
+        "end MyError;\n"
+        "class C\n"
+        "  public static pure method F(s: string?): string\n"
+        "    return s ?? throw new MyError(\"null s\");\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(
+        r, "class construction at `throw` is not admitted in a pure body");
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 9u);
+    // The carve-out's report is the ONLY construction report: the plain
+    // `NewExpr` arm is not reached for a throw operand.
+    BEZEL_EXPECT_TRUE(diagnosticsContaining(r, "class construction is not")
+                          .empty());
+}
+
+// The carve-out admits the CONSTRUCTION, not the arguments: an impure call
+// inside the throw operand's argument list is still rule 6's business.
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           throw_expression_operand_args_still_checked_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(s: string?): string\n"
+        "    return s ?? throw new ArgumentException(Console.ReadLine() ?? "
+        "\"x\");\n"
+        "  end F;\n"
+        "end C;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(
+        r, "the standard library does not declare `Console.ReadLine` pure");
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 4u);
+    BEZEL_EXPECT_TRUE(
+        diagnosticsContaining(r, "standard-library class construction")
+            .empty());
+}
+
+// §22.16: "`throw` is rejected (a clause states a proposition …)". The
+// clause's throw is its ONE violation; its `new ArgumentException(…)`
+// operand is still the carve-out's (admitted) business, not a second
+// report. Pins the diagnostic count of conformance case s22_16_0006, which
+// the earlier arm had raised to two.
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           clause_throw_reports_the_throw_once_spec_22_16) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class Ops\n"
+        "  public static method Check(x: int): bool\n"
+        "    requires(throw new ArgumentException(\"boom\"))\n"
+        "    return true;\n"
+        "  end Check;\n"
+        "end Ops;\n");
+    const bezel::Diagnostic* d = theDiagnosticContaining(
+        r, "`throw` is not admitted in a pure body");
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 4u);
+    BEZEL_EXPECT_TRUE(
+        diagnosticsContaining(r, "class construction").empty());
+    BEZEL_EXPECT_TRUE(r.diagnostics.diagnostics().size() == 1u);
+}
+
+// Review probe n01 — stdlib §2.15 `record JsonOptions(Indented: bool,
+// IndentWidth: int, AllowTrailingCommas: bool, IgnoreUnknownFields: bool,
+// MaxDepth: int)`. Spec §9.1: a positional record generates "Public
+// read-only properties, one per positional field … auto-properties in
+// §23.1's sense"; §22.15 *Members classified by rule*: "an auto-property
+// getter is pure (a backing-field read)". All five component reads are
+// admitted.
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           json_options_component_reads_in_pure_body_accepted_spec_9_1_22_15) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "import System.Serialization;\n"
+        "class C\n"
+        "  public static pure method F(o: JsonOptions): int => o.MaxDepth + "
+        "o.IndentWidth;\n"
+        "  public static pure method G(o: JsonOptions): bool => o.Indented or "
+        "o.AllowTrailingCommas or o.IgnoreUnknownFields;\n"
+        "end C;\n");
+    expectStdlibArmAdmits(r);
+}
+
+// The classification is by RECORD, so every built-in positional record's
+// components are admitted: spec §31.4 `record ExceptionInfo(TypeName:
+// string, Message: string, StackTrace: string)` (over-rejected by the
+// earlier arm, which had transcribed only the stdlib's spans), stdlib §3.3
+// `ReadOnlyStringSpan(Source, Start, Length)`, §4.8 `DictionaryEntry<K,
+// V>(Key, Value)` and §4.15 `ArraySpan<T>` / `ReadOnlyArraySpan<T>(Source,
+// Start, Length)`.
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           positional_record_component_reads_accepted_spec_9_1_22_15_31_4) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method E(e: ExceptionInfo): string => e.TypeName "
+        "+ e.Message + e.StackTrace;\n"
+        "  public static pure method S(s: ReadOnlyStringSpan): int => s.Start "
+        "+ s.Length;\n"
+        "  public static pure method D(d: DictionaryEntry<string, int>): int "
+        "=> d.Value + d.Key.Length;\n"
+        "  public static pure method A(a: ArraySpan<int>): int => a.Start + "
+        "a.Length;\n"
+        "  public static pure method R(a: ReadOnlyArraySpan<int>): int => "
+        "a.Start + a.Length;\n"
+        "end C;\n");
+    expectStdlibArmAdmits(r);
+}
+
+// The classification admits the COMPONENTS, not every member of a
+// positional record: `JsonOptions` declares no `pure` member, so a call
+// to one its header does not name is still rule 6's rejection.
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           positional_record_non_component_member_still_rejected_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  public static pure method F(s: ReadOnlyStringSpan): bool => "
+        "s.IsEmpty;\n"
+        "  public static pure method G(sp: ReadOnlySpan<int>): bool => "
+        "sp.IsEmpty;\n"
+        "end C;\n");
+    // `ReadOnlyStringSpan.IsEmpty` is `pure`-declared (stdlib §3.3);
+    // `ReadOnlySpan<T>.IsEmpty` carries no marker (stdlib §4.14).
+    const bezel::Diagnostic* d = theDiagnosticContaining(
+        r, "the standard library does not declare `ReadOnlySpan.IsEmpty` "
+           "pure");
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 4u);
+    BEZEL_EXPECT_TRUE(diagnosticsContaining(r, "ReadOnlyStringSpan.IsEmpty")
+                          .empty());
+}
+
+// =========================================================================
+// Behaviour flips the §22.15 stdlib arm brings to CONTRACT CLAUSES. §22.16:
+// a clause "is admitted under the pure-body rules of §22.15, applied
+// expression-wise", so a standard-library member the library does not
+// mark `pure` is rejected in a clause exactly as in a pure body. These
+// three shapes compiled before #7453 (review probes n29, n22, n21).
+// =========================================================================
+BEZEL_TEST(pure_body_stdlib_member_7453,
+           clause_unmarked_stdlib_members_rejected_spec_22_16) {
+    auto r = parseSemaAll(
+        "module M;\n"
+        "class C\n"
+        "  private _sb: StringBuilder := new StringBuilder();\n"
+        "  invariant(_sb.Length >= 0)\n"
+        "  public method F(a: Array<int>, x: int): bool\n"
+        "    requires(a.Contains(x))\n"
+        "    return true;\n"
+        "  end F;\n"
+        "  public method G(): bool\n"
+        "    requires(Console.ReadLine() <> null)\n"
+        "    return true;\n"
+        "  end G;\n"
+        "end C;\n");
+    // stdlib §3.1 declares `Length` with no marker (`Capacity` carries one).
+    const bezel::Diagnostic* l = theDiagnosticContaining(
+        r, "the standard library does not declare `StringBuilder.Length` "
+           "pure");
+    BEZEL_EXPECT_TRUE(l != nullptr);
+    if (l) BEZEL_EXPECT_TRUE(l->location.line == 4u);
+    // stdlib §4.4 declares `Contains` with no marker.
+    const bezel::Diagnostic* c = theDiagnosticContaining(
+        r, "the standard library does not declare `Array.Contains` pure");
+    BEZEL_EXPECT_TRUE(c != nullptr);
+    if (c) BEZEL_EXPECT_TRUE(c->location.line == 6u);
+    // stdlib §2.1 declares `ReadLine` with no marker (an I/O intercept).
+    const bezel::Diagnostic* rl = theDiagnosticContaining(
+        r, "the standard library does not declare `Console.ReadLine` pure");
+    BEZEL_EXPECT_TRUE(rl != nullptr);
+    if (rl) BEZEL_EXPECT_TRUE(rl->location.line == 10u);
+}

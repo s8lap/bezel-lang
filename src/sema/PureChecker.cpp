@@ -55,12 +55,15 @@ namespace {
 //     every constituent operation is pure … (for equality and hash: iff
 //     every field's equality dispatch target is pure — primitives,
 //     `string`, enums, and qualifying records …)". That reaches the
-//     positional components of the standard library's records
-//     (`ReadOnlySpan<T>(Buffer, Start, Length)`, stdlib §4.14) and the
-//     synthesized `Equals`/`GetHashCode` of the primitive records (stdlib
-//     §9.1: "`Equals(other: int): bool` — auto-generated from
-//     `IEquatable<int>` per language spec §9.2 … The same convention
-//     applies to every primitive declaration in §9.1–§9.5").
+//     stored-slot getters of the stdlib's body records (`Range<T>`, stdlib
+//     §9.8) and the synthesized `Equals`/`GetHashCode` of the primitive
+//     records (stdlib §9.1: "`Equals(other: int): bool` — auto-generated
+//     from `IEquatable<int>` per language spec §9.2 … The same convention
+//     applies to every primitive declaration in §9.1–§9.5"). The
+//     positional components of the built-in POSITIONAL records
+//     (`ReadOnlySpan<T>(Buffer, Start, Length)`, stdlib §4.14;
+//     `JsonOptions(…)`, §2.15; …) are classified too, but keyed by the
+//     RECORD, not the member: `kStdlibPositionalRecords` below.
 //
 // THE KEY. A row is keyed by the type's STANDARD-LIBRARY name (the stdlib's
 // own System-namespace spelling, stdlib §9: "declarations use the
@@ -118,12 +121,9 @@ constexpr StdlibPureMember kStdlibPureMembers[] = {
     {"Math", "IEEERemainder", kDecl},
     // stdlib §3.1 `StringBuilder` — the stored-extent read.
     {"StringBuilder", "Capacity", kDecl},
-    // stdlib §3.3 `ReadOnlyStringSpan(Source, Start, Length)` — the three
-    // positional components (classified), the `pure` members.
-    {"ReadOnlyStringSpan", "Source", kClsf},
-    {"ReadOnlyStringSpan", "Start", kClsf},
-    {"ReadOnlyStringSpan", "Length", kClsf},
-    {"ReadOnlyStringSpan", "Capacity", kDecl},
+    // stdlib §3.3 `ReadOnlyStringSpan(Source, Start, Length)` — the `pure`
+    // members (the three positional components are classified by
+    // `kStdlibPositionalRecords` below; stdlib §3.3 declares no `Capacity`).
     {"ReadOnlyStringSpan", "IsEmpty", kDecl},
     {"ReadOnlyStringSpan", "Slice", kDecl},
     {"ReadOnlyStringSpan", "IndexOf", kDecl},
@@ -140,9 +140,8 @@ constexpr StdlibPureMember kStdlibPureMembers[] = {
     {"IList", "Count", kDecl},
     {"IOwningCollection", "Count", kDecl},
     {"IOwningList", "Count", kDecl},
-    // stdlib §4.8 `DictionaryEntry<K, V>(Key, Value)` — positional
-    // components.
-    {"DictionaryEntry", "Key", kClsf}, {"DictionaryEntry", "Value", kClsf},
+    // stdlib §4.8 `DictionaryEntry<K, V>(Key, Value)` — its two positional
+    // components are classified by `kStdlibPositionalRecords` below.
     // stdlib §4.4 `Array<T>` / §4.5 `OwningArray<T>`.
     {"Array", "Count", kDecl},       {"Array", "Capacity", kDecl},
     {"OwningArray", "Count", kDecl}, {"OwningArray", "Capacity", kDecl},
@@ -170,46 +169,33 @@ constexpr StdlibPureMember kStdlibPureMembers[] = {
     {"OwningBuffer", "Length", kDecl},
     // stdlib §4.14 `Span<T>(Buffer, Start, Length)` /
     // `ReadOnlySpan<T>(Buffer, Start, Length)` — the positional components
-    // (their `IsEmpty`/`Slice`/`IndexOf` carry no marker), plus the two
-    // bit-tier entry points the library marks (`ReadOnlySpan<byte>.
-    // AsBitReader`, `Span<byte>.AsBitWriter`; `Span<byte>.AsBitReader`
-    // delegates through the unmarked `AsReadOnly` and is not `pure`).
-    {"Span", "Buffer", kClsf},  {"Span", "Start", kClsf},
-    {"Span", "Length", kClsf},  {"Span", "AsBitWriter", kDecl},
-    {"ReadOnlySpan", "Buffer", kClsf}, {"ReadOnlySpan", "Start", kClsf},
-    {"ReadOnlySpan", "Length", kClsf},
+    // are classified by `kStdlibPositionalRecords` below (their `IsEmpty`/
+    // `Slice`/`IndexOf` carry no marker); these are the two bit-tier entry
+    // points the library marks (`ReadOnlySpan<byte>.AsBitReader`,
+    // `Span<byte>.AsBitWriter`; `Span<byte>.AsBitReader` delegates through
+    // the unmarked `AsReadOnly` and is not `pure`).
+    {"Span", "AsBitWriter", kDecl},
     {"ReadOnlySpan", "AsBitReader", kDecl},
     // stdlib §4.14 bit tier — `BitReader`/`BitWriter(Source, BitStart,
-    // BitLength)`: the components, and the members its *Purity* paragraph
-    // names ("`IsEmpty`, `IsByteAligned`, the three `Slice` overloads, and
-    // `AlignToByte` on every type of this tier").
-    {"BitReader", "Source", kClsf},       {"BitReader", "BitStart", kClsf},
-    {"BitReader", "BitLength", kClsf},    {"BitReader", "IsEmpty", kDecl},
+    // BitLength)`: the members its *Purity* paragraph names ("`IsEmpty`,
+    // `IsByteAligned`, the three `Slice` overloads, and `AlignToByte` on
+    // every type of this tier"); the components are classified below.
+    {"BitReader", "IsEmpty", kDecl},
     {"BitReader", "IsByteAligned", kDecl}, {"BitReader", "Slice", kDecl},
     {"BitReader", "AlignToByte", kDecl},
-    {"BitWriter", "Source", kClsf},       {"BitWriter", "BitStart", kClsf},
-    {"BitWriter", "BitLength", kClsf},    {"BitWriter", "IsEmpty", kDecl},
+    {"BitWriter", "IsEmpty", kDecl},
     {"BitWriter", "IsByteAligned", kDecl}, {"BitWriter", "Slice", kDecl},
     {"BitWriter", "AlignToByte", kDecl},
     // stdlib §4.15 `ArraySpan<T>` / `ReadOnlyArraySpan<T>(Source, Start,
     // Length)` and the mirrored bit tier `ArrayBitReader`/`ArrayBitWriter`
-    // ("Every rule of §4.14's bit tier holds here verbatim").
-    {"ArraySpan", "Source", kClsf},  {"ArraySpan", "Start", kClsf},
-    {"ArraySpan", "Length", kClsf},  {"ArraySpan", "AsBitWriter", kDecl},
-    {"ReadOnlyArraySpan", "Source", kClsf},
-    {"ReadOnlyArraySpan", "Start", kClsf},
-    {"ReadOnlyArraySpan", "Length", kClsf},
+    // ("Every rule of §4.14's bit tier holds here verbatim"); the
+    // components are classified below.
+    {"ArraySpan", "AsBitWriter", kDecl},
     {"ReadOnlyArraySpan", "AsBitReader", kDecl},
-    {"ArrayBitReader", "Source", kClsf},
-    {"ArrayBitReader", "BitStart", kClsf},
-    {"ArrayBitReader", "BitLength", kClsf},
     {"ArrayBitReader", "IsEmpty", kDecl},
     {"ArrayBitReader", "IsByteAligned", kDecl},
     {"ArrayBitReader", "Slice", kDecl},
     {"ArrayBitReader", "AlignToByte", kDecl},
-    {"ArrayBitWriter", "Source", kClsf},
-    {"ArrayBitWriter", "BitStart", kClsf},
-    {"ArrayBitWriter", "BitLength", kClsf},
     {"ArrayBitWriter", "IsEmpty", kDecl},
     {"ArrayBitWriter", "IsByteAligned", kDecl},
     {"ArrayBitWriter", "Slice", kDecl},
@@ -307,6 +293,90 @@ constexpr StdlibPureMember kStdlibPureMembers[] = {
     {"Range", "Step", kClsf},        {"Range", "IsEndInclusive", kClsf},
 };
 
+// ---------------------------------------------------------------------------
+// §22.15 "Members classified by rule" — the built-in POSITIONAL RECORDS
+// (fix-forward #7453, the third attempt).
+//
+// A positional record's components are read through its generated
+// read-only properties — spec §9.1: "Public read-only properties, one per
+// positional field, with the same names — auto-properties in §23.1's
+// sense" — and §22.15 classifies that getter: "an **auto-property getter**
+// is pure (a backing-field read)". So EVERY component read of EVERY
+// built-in positional record is admitted by classification, and the
+// admission is a property of the record's DECLARATION HEADER, not of a
+// per-member marker. Transcribing the components as per-member rows above
+// (the previous attempt) had the wrong shape twice over: the earlier
+// review found `Span<T>`'s components missing, and the second found
+// `JsonOptions`'s — each a declaration the row table had not reached. This
+// table is keyed by the record instead, ONE entry per `record X(…)` header
+// the documents declare, so a record is either here whole or not at all.
+//
+// THE POPULATION is every `public record X(…)` declaration of a BUILT-IN
+// (compiler-known, declaration-less) type in the standard library (v0.355:
+// `grep -n -E '^ *public (readonly )?record [A-Za-z]+(<[^>]*>)?\('
+// docs/Bezel_Standard_Library.md`, minus the user-record examples `Point`,
+// `User`, `ConfigError`, `ClickedEvent`, `PriceTick`, `JobResult`) plus the
+// one the language spec itself declares, §31.4's `ExceptionInfo`. The
+// stdlib's body records (`Range<T>`, stdlib §9.8, whose declared stored
+// slots are classified by rows above; the §2.5 temporal and identity
+// values) are not positional and are not here.
+// ---------------------------------------------------------------------------
+struct StdlibPositionalRecord {
+    std::string_view head;
+    std::string_view components[5];  // "" past the declared arity
+};
+
+constexpr StdlibPositionalRecord kStdlibPositionalRecords[] = {
+    // stdlib §2.15 `record JsonOptions(Indented: bool, IndentWidth: int,
+    // AllowTrailingCommas: bool, IgnoreUnknownFields: bool, MaxDepth: int)`.
+    {"JsonOptions", {"Indented", "IndentWidth", "AllowTrailingCommas",
+                     "IgnoreUnknownFields", "MaxDepth"}},
+    // stdlib §3.3 `record ReadOnlyStringSpan(Source: string, Start: int,
+    // Length: int)`.
+    {"ReadOnlyStringSpan", {"Source", "Start", "Length"}},
+    // stdlib §4.8 `record DictionaryEntry<K, V>(Key: K, Value: V)`.
+    {"DictionaryEntry", {"Key", "Value"}},
+    // stdlib §4.14 `record Span<T>(Buffer: OwningBuffer<T>, Start: int,
+    // Length: int)` / `record ReadOnlySpan<T>(Buffer, Start, Length)`.
+    {"Span", {"Buffer", "Start", "Length"}},
+    {"ReadOnlySpan", {"Buffer", "Start", "Length"}},
+    // stdlib §4.14 `record BitReader(Source: ReadOnlySpan<byte>, BitStart:
+    // int, BitLength: int)` / `record BitWriter(Source: Span<byte>, …)`.
+    {"BitReader", {"Source", "BitStart", "BitLength"}},
+    {"BitWriter", {"Source", "BitStart", "BitLength"}},
+    // stdlib §4.15 `record ArraySpan<T>(Source: Array<T>, Start: int,
+    // Length: int)` / `record ReadOnlyArraySpan<T>(Source, Start, Length)`,
+    // and the mirrored bit tier `record ArrayBitReader(Source:
+    // ReadOnlyArraySpan<byte>, BitStart: int, BitLength: int)` /
+    // `record ArrayBitWriter(Source: ArraySpan<byte>, …)`.
+    {"ArraySpan", {"Source", "Start", "Length"}},
+    {"ReadOnlyArraySpan", {"Source", "Start", "Length"}},
+    {"ArrayBitReader", {"Source", "BitStart", "BitLength"}},
+    {"ArrayBitWriter", {"Source", "BitStart", "BitLength"}},
+    // spec §31.4 `record ExceptionInfo(TypeName: string, Message: string,
+    // StackTrace: string)`.
+    {"ExceptionInfo", {"TypeName", "Message", "StackTrace"}},
+};
+
+const StdlibPositionalRecord* stdlibPositionalRecordOf(
+    std::string_view head) {
+    for (const auto& r : kStdlibPositionalRecords)
+        if (r.head == head) return &r;
+    return nullptr;
+}
+
+// Is `member` a positional component of the built-in record `head`? True
+// iff the record's declaration header names it: the read is then the
+// generated auto-property's getter, pure by classification (§22.15).
+bool stdlibPositionalComponentOf(std::string_view head,
+                                 std::string_view member) {
+    const StdlibPositionalRecord* r = stdlibPositionalRecordOf(head);
+    if (!r) return false;
+    for (std::string_view c : r->components)
+        if (!c.empty() && c == member) return true;
+    return false;
+}
+
 // The table key of a standard-library type head: the stdlib's own
 // System-namespace spelling (`int` → `Int32`, `String` → `string`, the
 // registry's one normalisation), then the §9.1 / §9.2 family.
@@ -324,14 +394,18 @@ bool stdlibHeadHasRows(std::string_view head) {
     const std::string_view key = purityTableHeadOf(head);
     for (const auto& e : kStdlibPureMembers)
         if (e.head == key) return true;
-    return false;
+    return stdlibPositionalRecordOf(key) != nullptr;
 }
 
+// Is the standard-library member `head.member` admitted in a pure body —
+// a const read (rule 1), a `pure`-declared member (rule 6), or a member
+// classified by rule: a row of `kStdlibPureMembers`, or a positional
+// component of a `kStdlibPositionalRecords` record?
 bool stdlibMemberIsPure(std::string_view head, std::string_view member) {
     const std::string_view key = purityTableHeadOf(head);
     for (const auto& e : kStdlibPureMembers)
         if (e.head == key && e.member == member) return true;
-    return false;
+    return stdlibPositionalComponentOf(key, member);
 }
 
 // Is a declaration-less, single-part Named head a STANDARD-LIBRARY type? A
@@ -474,6 +548,15 @@ private:
     // §22.15 throw carve-out: `new E(args)` admitted iff E's invoked ctor
     // is pure AND E is trivial-dispose. Returns true iff admitted.
     bool throwCarveOutAdmits(const ast::NewExpr& ne);
+
+    // The ONE walk of a `throw` operand, shared by the `ThrowStmt` and the
+    // `ThrowExpr` arms (fix-forward #7453): §22.15's carve-out admits `new
+    // E(args)` "only as the immediate operand of a `throw` statement or
+    // `throw` expression", so both spellings take a `NewExpr` operand
+    // through `throwCarveOutAdmits` (reporting at `throwLoc` when it does
+    // not admit) and check only its arguments; any other operand (a bare
+    // re-raise, a caught binding read) is walked as an ordinary expression.
+    void checkThrowOperand(const ast::Expr* operand, SourceLocation throwLoc);
 
     // §22.15 trivial-dispose — the exact inverse of
     // `common::isNonTrivialDisposeClass`, which is what it now calls (#3588).
@@ -1156,6 +1239,27 @@ bool PureBodyWalker::throwCarveOutAdmits(const ast::NewExpr& ne) {
     return false;
 }
 
+void PureBodyWalker::checkThrowOperand(const ast::Expr* operand,
+                                       SourceLocation throwLoc) {
+    if (!operand) return;
+    // §22.15 throw carve-out: `new E(args)` admitted iff trivial-dispose +
+    // pure ctor. Any other throw operand is admitted (bare re-raise, a
+    // caught binding read).
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(operand)) {
+        if (!throwCarveOutAdmits(*ne)) {
+            reportPureViolation(
+                throwLoc, "class construction at `throw`",
+                "the throw carve-out admits only `new E(...)` with a pure "
+                "constructor of a trivial-dispose class");
+        }
+        // The new-expression's args still need to be checked.
+        for (const auto& a : ne->args)
+            if (a.value) checkExpr(a.value.get());
+        return;
+    }
+    checkExpr(operand);
+}
+
 void PureBodyWalker::reportPureViolation(SourceLocation loc,
                                          const std::string& operation,
                                          const std::string& detail) {
@@ -1333,29 +1437,13 @@ void PureBodyWalker::checkOneStmt(const ast::Stmt* s) {
                 "a contract clause states a proposition — the mechanism, "
                 "message, and blame of a violation belong to §22.16's "
                 "machinery, not to the clause's own throw (§22.16)");
-            if (ts->value) checkExpr(ts->value.get());
-            return;
         }
-        // §22.15 throw carve-out: `new E(args)` admitted iff trivial-
-        // dispose + pure ctor. Any other throw operand is admitted
-        // (bare re-raise, a caught binding read).
-        if (ts->value) {
-            if (auto* ne = dynamic_cast<ast::NewExpr*>(ts->value.get())) {
-                if (!throwCarveOutAdmits(*ne)) {
-                    reportPureViolation(
-                        ts->span.begin,
-                        "class construction at `throw`",
-                        "the throw carve-out admits only `new E(...)` "
-                        "with a pure constructor of a trivial-dispose "
-                        "class");
-                }
-                // The new-expression's args still need to be checked.
-                for (const auto& a : ne->args)
-                    if (a.value) checkExpr(a.value.get());
-                return;
-            }
-            checkExpr(ts->value.get());
-        }
+        // The operand is walked the same way in both modes: the `throw` is
+        // the clause's ONE violation, and its `new E(...)` operand is
+        // still the carve-out's business (§22.15: admitted "as the
+        // immediate operand of a `throw` statement or `throw` expression"),
+        // not a second report (fix-forward #7453).
+        checkThrowOperand(ts->value.get(), ts->span.begin);
         return;
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
@@ -1847,12 +1935,16 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
                 "a contract clause states a proposition — the mechanism, "
                 "message, and blame of a violation belong to §22.16's "
                 "machinery, not to the clause's own throw (§22.16)");
-            if (te->operand) checkExpr(te->operand.get());
-            return;
         }
         // §22.15 throw carve-out: a throw expression follows the same rule
-        // as the throw statement.
-        if (te->operand) checkExpr(te->operand.get());
+        // as the throw statement — "admitted only as the immediate operand
+        // of a `throw` statement or `throw` expression". Walking the
+        // operand as an ordinary expression (the previous spelling) sent
+        // `s ?? throw new ArgumentException(…)` through the `NewExpr`
+        // arm's class-construction rejections, which the carve-out exists
+        // to admit (fix-forward #7453; §21.8 makes the statement "the
+        // expression form followed by `;`").
+        checkThrowOperand(te->operand.get(), te->span.begin);
         return;
     }
     if (auto* le = dynamic_cast<const ast::LambdaExpr*>(e)) {
