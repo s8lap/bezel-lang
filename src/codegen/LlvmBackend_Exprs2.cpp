@@ -6718,6 +6718,43 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // bottom of lowerNew, before each `return obj`, exactly mirroring
     // lowerCall's loop. // per §22.4, §28.3, §17.13, #1833 (b), #1467
     const std::size_t newDiscardOwnedBase = discardOwnedOutSlots_.size();
+    // fix #4841 (§8.6 / §28.3 / §28.9, v0.307): THIS `new`'s §8.6
+    // ARGUMENT-BOX record — the handle `dischargeArgBoxCall` releases it
+    // through once the constructor has returned.
+    //
+    // THE DEFECT. A value (or record) argument bound to an `Object` /
+    // interface CONSTRUCTOR parameter is §8.6-boxed at the call site
+    // (`boxForTarget` inside `buildOrderedArgs`). The box is a CALLER-side +1
+    // producer whose lifetime ends when the constructor returns — §28.3
+    // "Unbound owned temporaries" / §28.9 "Runtime-managed types". #2952
+    // discharges exactly that shape after an ordinary METHOD call, and the
+    // `new` path did not: `buildOrderedArgs` queues the box for release only
+    // when `currentCallee_` is set (the escape analysis needs the callee's
+    // body), and the METHOD call path installs it (LlvmBackend_Calls2.cpp)
+    // while the CONSTRUCTOR path never did. So the box was minted and never
+    // queued — MEASURED (ASan/LSan): `new C(5)` with
+    // `constructor(v: Object)` leaks 24 B per construction (300 iterations =
+    // 7200 B in 300 allocations).
+    //
+    // THE FIX, in the two halves the METHOD path already has:
+    //   * the CALLEE is installed on `currentCallee_` around the argument
+    //     build, so `isCalleeParamNonEscaping` can walk the constructor's body
+    //     and decide whether the parameter escapes. `currentCallee_` is
+    //     documented (LlvmBackend_impl.hpp) as "the callee Decl
+    //     (MethodDecl or ConstructorDecl) for the call currently being
+    //     lowered" — the constructor case was always intended; only the
+    //     `new` path failed to supply it. `isCalleeParamNonEscaping`
+    //     (LlvmBackend_Assign.cpp) already has the `ConstructorDecl` arm.
+    //   * the CALL opens its own §8.6 argument-box record
+    //     (`beginArgBoxCall`) and discharges it after the constructor has
+    //     returned (`dischargeArgBoxCall`), so the box's last use — the
+    //     constructor's read of the parameter — is over before the release.
+    //
+    // THE RECORD IS PER `new`, NOT PER FUNCTION (#7998's rule): the record is
+    // opened before this `new`'s arguments are built and discharged at this
+    // `new`'s own post-constructor point, so a NESTED `new`'s discharge can
+    // never release an OUTER `new`'s still-live box.
+    std::size_t ctorArgBoxIdx = kNoArgBoxCall;
     // fix #2874 (§2.8.2 "No restrictions beyond visibility", v0.240): #2860's
     // "constructing imported generic ... cannot run the initializer of its
     // field" diagnostic is located from `importedFieldInitDiagLoc_`, but that
@@ -9540,10 +9577,20 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     // method-call path; the helpers themselves are unchanged.
                     std::vector<AccessorRefArg> accessorRefArgs;
                     const std::size_t bareTBase = bareTParamNarrowUnwraps_.size();
+                    // fix #4841 (§8.6 / §28.3 / §28.9): open THIS `new`'s §8.6
+                    // argument-box record and install the constructor on
+                    // `currentCallee_` so `buildOrderedArgs`'s escape analysis
+                    // can decide whether the boxed argument outlives the
+                    // constructor. See the `ctorArgBoxIdx` declaration above.
+                    if (ctorArgBoxIdx == kNoArgBoxCall)
+                        ctorArgBoxIdx = beginArgBoxCall();
+                    const ast::Member* savedCtorCallee = currentCallee_;
+                    currentCallee_ = earlyCd;
                     bool ok = buildOrderedArgs(earlyCd->params, ne.args, eArgs,
                                               &eArgExprs,
                                               /*nullTransferredOwned=*/true,
                                               &accessorRefArgs);
+                    currentCallee_ = savedCtorCallee;
                     // fix #4945 (§14.1 / §7.10, v0.307): restore bare-`T`
                     // nullable carriers under the constructed type's subst.
                     restoreCtorBareTParamCarriers(earlyCd->params, bareTBase,
@@ -10619,6 +10666,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // `out owned` formal disposes the produced value at the end of the
         // full statement.
         disposeNewDiscardOwnedOutSlots(newDiscardOwnedBase);
+        // fix #4841 (§8.6 / §28.3 / §28.9): discharge THIS `new`'s §8.6
+        // argument-box record. The imported-ctor path builds its arguments
+        // without `buildOrderedArgs`, so it mints no box of its own; the
+        // record is open only if the pre-pass above ran and its box was
+        // never handed to a constructor — in which case the box is garbage
+        // and releasing it is exactly right.
+        if (!diverged_)
+            dischargeArgBoxCall(ctorArgBoxIdx);
         return obj;
     }
 
@@ -10695,10 +10750,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // emits the §22.3 copy-IN bracket for an indexer-slot / property
             // `ref`/`out` argument. Flushed below.
             const std::size_t bareTBase = bareTParamNarrowUnwraps_.size();
+            // fix #4841 (§8.6 / §28.3 / §28.9): the REBUILD branch (the
+            // pre-pass above did not produce the arguments this constructor
+            // uses) needs the same §8.6 argument-box record and the same
+            // `currentCallee_` installation as the pre-pass. The record is
+            // opened only if it is not open yet — the pre-pass's record (when
+            // it ran) is still the live one, and the rebuild's box joins it.
+            if (ctorArgBoxIdx == kNoArgBoxCall)
+                ctorArgBoxIdx = beginArgBoxCall();
+            const ast::Member* savedCtorCallee = currentCallee_;
+            currentCallee_ = cd;
             builtArgs = buildOrderedArgs(cd->params, ne.args, args,
                                               &ctorArgExprs,
                                               /*nullTransferredOwned=*/true,
                                               &accessorRefArgs);
+            currentCallee_ = savedCtorCallee;
             // fix #4945 (§14.1 / §7.10, v0.307): see restoreCtorBareTParamCarriers.
             restoreCtorBareTParamCarriers(cd->params, bareTBase, args,
                                           ctorArgSemaTy);
@@ -11220,6 +11286,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // calls — closes the §22.4 / §28.3 top-level ctor-discard leak in
     // `var q := new R(out _);`.
     disposeNewDiscardOwnedOutSlots(newDiscardOwnedBase);
+    // fix #4841 (§8.6 / §28.3 / §28.9): the §8.6 ARGUMENT-BOX discharge for
+    // THIS `new` — the box minted for a value (or record) argument bound to
+    // an `Object` / interface CONSTRUCTOR parameter is a caller-side +1
+    // producer whose lifetime ends when the constructor returns (§28.3
+    // "Unbound owned temporaries" / §28.9). The constructor has run by now,
+    // so the box's last use is over and `bz_box_release` is owed. Emitted
+    // here — after the constructor, before the object is handed back — so a
+    // NESTED `new`'s own discharge can never release this box early
+    // (#7998's per-call rule).
+    //
+    // The `!diverged_` guard keeps the release out of a diverged (already
+    // branched-to-unwind) block; on that edge the box leaks, which is the
+    // pre-existing safe direction.
+    if (!diverged_)
+        dischargeArgBoxCall(ctorArgBoxIdx);
     return obj;
 }
 
