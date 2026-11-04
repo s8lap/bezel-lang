@@ -6827,6 +6827,18 @@ private:
     // is never delegated as a call argument — the provable subset).
     bool exprTypeIsTaskScope(const ast::Expr& e) const;
     bool typeRefIsTaskScope(const sema::TypeRef* rt) const;
+    // fix-forward #8118 (stdlib §6.10, v0.355; #5657): report `e` when it is
+    // an expression of static type `TaskScope` placed into an OWNING position
+    // — an `owned` return slot, an `owned` parameter / payload / owned-sink
+    // argument, an `owned` field, an owning inline-array slot. The position's
+    // own static type does not matter: §6.10 names "an owning position of a
+    // wider static type reached by a language spec §5.1 reference conversion
+    // (an `owned Object` return, an `owned IAsyncDisposable` parameter, ...)"
+    // as a compile error exactly like a `TaskScope`-typed one. Borrows are
+    // never reported (callers invoke this only for owning positions).
+    // `position` names the position in the diagnostic.
+    void reportTaskScopeInOwningPosition(const ast::Expr& e,
+                                         std::string_view position);
     void checkTaskScopeConsumption(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // Scan helpers: does `await <name>.Join()` / a bare-`name` argument occur?

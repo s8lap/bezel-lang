@@ -1412,6 +1412,12 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                 ctorParams.modifier(boundPos) == "owned";
             const bool ownedSink =
                 ctorOwnedSink || (isSharedNew && pos == 0);
+            // fix-forward #8118 (stdlib §6.10, v0.355; #5657): the ctor twin of
+            // recordMovesInArgs' owned-sink TaskScope rejection (a `Shared<T>`
+            // payload included — §6.10 names it).
+            if (ownedSink)
+                reportTaskScopeInOwningPosition(*a.value,
+                                                "an `owned` parameter");
             // §22.3 (v0.169, #1348): the `owned` marker is only valid on an
             // argument to an `owned` parameter. On any other ctor position it
             // is spurious.
@@ -1816,6 +1822,13 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
                 userOwned = false;
         }
         const bool ownedSink = userOwned || builtinOwnedSinkArg(callee, pos);
+        // fix-forward #8118 (stdlib §6.10, v0.355; #5657): a TaskScope
+        // argument to an owned sink — an `owned Object` / `owned
+        // IAsyncDisposable` parameter, an `owned` choice payload — is an
+        // owning position §6.10 rejects. Diagnose only; the classification
+        // below still runs.
+        if (ownedSink)
+            reportTaskScopeInOwningPosition(*a.value, "an `owned` parameter");
 
         // §22.3 (v0.169, #1348): the `owned` call-site marker is valid ONLY on
         // an argument to an `owned` parameter. On any other position it is
@@ -2443,6 +2456,12 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             const bool ownedSink =
                 isImplicitOwned(call->args, pos, call->callee.get()) ||
                 builtinOwnedSinkArg(call->callee.get(), pos);
+            // fix-forward #8118 (stdlib §6.10, v0.355; #5657): the bare-
+            // statement-call twin of recordMovesInArgs' owned-sink TaskScope
+            // rejection (`Take(new TaskScope());` with `owned d: Object`).
+            if (ownedSink)
+                reportTaskScopeInOwningPosition(*a.value,
+                                                "an `owned` parameter");
             if (a.modifier == "owned" && !ownedSink) {
                 // Spurious marker on a non-owned parameter position: reject, and
                 // do NOT consume (this position does not take ownership).
@@ -19038,6 +19057,17 @@ void MethodOwnership::checkGetterFreshOwnedReturn(const ast::Expr& e) {
 void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd,
                                             const ast::TypeDecl* enclosingType) {
     if (!fd.initializer) return;
+    // fix-forward #8118 (stdlib §6.10, v0.355; #5657): an `owned` field's
+    // initializer is an owning position at whatever static type the field is
+    // declared (`owned _o: Object? := new TaskScope()`). Static or instance
+    // alike — §6.10's list names "a field" without restriction — so this runs
+    // ahead of the instance-only §28.6 scope below.
+    for (std::string_view m : fd.modifiers)
+        if (m == "owned") {
+            reportTaskScopeInOwningPosition(*fd.initializer,
+                                            "an `owned` field");
+            break;
+        }
     // Scope: INSTANCE fields only. A STATIC field follows the §22.13 static-init
     // model (its initializer runs at first-use, its value lives for the program
     // and is not part of any instance's disposal), NOT the instance-field §28.6
@@ -28871,6 +28901,36 @@ void MethodOwnership::taskScopeUsageScanStmt(const ast::Stmt& s,
     }
 }
 
+// fix-forward #8118 (stdlib §6.10, v0.355; #5657). §6.10: "Every other owning
+// position is a compile error naming this rule, at the declaration that spells
+// the position or at the expression that would place a `TaskScope` in one ...
+// and an owning position of a wider static type reached by a language spec
+// §5.1 reference conversion (an `owned Object` return, an `owned
+// IAsyncDisposable` parameter, an `await using var` declared at `Object` or at
+// an interface)." This is the EXPRESSION half: the callers are the owning
+// positions themselves (handleReturn / the expression-body return check under
+// an `owned` return, the owned-sink argument arms of recordMovesInArgs and of
+// recordMovesIn's constructor arm, the owned-field / owning-slot store of
+// handleAssignment, an `owned` field's initializer). The `await using var`
+// wider-declared-type form is checkTaskScopeConsumption's. Until #8118 the
+// `owned Object` return was rejected only by ACCIDENT (Object was misread as a
+// primitive by checkOwnedDeclType); the rule itself was never enforced there.
+void MethodOwnership::reportTaskScopeInOwningPosition(
+    const ast::Expr& e, std::string_view position) {
+    const ast::Expr* v = lookThroughForceUnwrap(&e);
+    if (!v) v = &e;
+    if (!exprTypeIsTaskScope(e) && !exprTypeIsTaskScope(*v)) return;
+    report(Severity::Error, e.span.begin,
+           std::string("a TaskScope may not be placed in ") +
+               std::string(position) +
+               " — a TaskScope may only be consumed by an `await using var` "
+               "binding whose static type is `TaskScope` (stdlib §6.10, "
+               "v0.355): every other owning position, including one of a "
+               "wider static type reached by a §5.1 reference conversion, "
+               "discharges on §28.12's implicit synchronous path, which "
+               "cannot await the drain of its children");
+}
+
 void MethodOwnership::checkTaskScopeConsumption(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     // Collect every await-using TaskScope local, then check §6.10's
@@ -28891,6 +28951,24 @@ void MethodOwnership::checkTaskScopeConsumption(
                            "synchronous `using var` cannot await the drain "
                            "of its children; write `await using var " +
                            std::string(ld->name) + " := …`");
+            } else if (isTS && ld->isAwaitUsing && ld->type &&
+                       !typeRefIsTaskScope(ctx_.resolvedType(*ld->type))) {
+                // fix-forward #8118 (stdlib §6.10, v0.355; #5657): the one
+                // admitted production is an `await using var` "whose static
+                // type is `TaskScope`"; one declared at `Object` or at an
+                // interface over a TaskScope initializer is the wider-static-
+                // type owning position §6.10 names. Reported INSTEAD of the
+                // missing-Join check below (a scope declared at `Object` has
+                // no `Join` to call without a narrowing test first).
+                report(Severity::Error, ld->span.begin,
+                       std::string("`") + std::string(ld->name) +
+                           "` is an `await using var` declared at a wider "
+                           "static type than `TaskScope` over a TaskScope — "
+                           "a TaskScope may only be consumed by an `await "
+                           "using var` binding whose static type is "
+                           "`TaskScope` (stdlib §6.10, v0.355); declare it `"
+                           "await using var " + std::string(ld->name) +
+                           ": TaskScope := …`");
             } else if (isTS && ld->isAwaitUsing) {
                 bool sawAwaitJoin = false, sawDelegation = false;
                 for (const auto& bs : body)

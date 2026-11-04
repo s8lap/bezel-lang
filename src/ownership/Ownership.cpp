@@ -1855,6 +1855,10 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
         bool isStatic, const GenericReturnContext* genericCtx) {
     returnType_ = returnType;
     returnOwned_ = returnOwned;
+    // fix-forward #8118 (stdlib §6.10, v0.355; #5657): the `=> E` twin of
+    // handleReturn's TaskScope owning-return rejection.
+    if (returnOwned_)
+        reportTaskScopeInOwningPosition(exprBody, "an `owned` return slot");
     // SB01-B (§28.3, v0.190, #1786): set `isAsync_` so
     // `checkBorrowReturnedThroughOwningType` exempts an `async` expression body
     // (its `=> E` body is the awaited value, not a task). The block-body path
@@ -9773,8 +9777,15 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // parameter). Runs after checkBorrowStoreEscape so #386's owned-local-borrow
     // and §31.1 catch-borrow diagnoses are not duplicated. // per §28.3, §28.5
     if (targetIsOwnedField(*as.target)) {
+        // fix-forward #8118 (stdlib §6.10, v0.355; #5657): a TaskScope stored
+        // into an `owned` field, at any declared field type.
+        if (as.value)
+            reportTaskScopeInOwningPosition(*as.value, "an `owned` field");
         handleOwnedFieldAssignment(as, flagged386);
     } else if (targetIsOwningInlineArraySlot(*as.target)) {
+        if (as.value)
+            reportTaskScopeInOwningPosition(*as.value,
+                                            "an owning inline-array slot");
         // §28.11 (#780): an owning inline-array slot `a[i]` (a `[N owned]T?` /
         // `[N owned]T` slot) is an owned sink with the SAME discipline as an
         // `owned` field — its indexer-set "takes owned" (§28.11 slot policy).
@@ -11013,6 +11024,11 @@ void MethodOwnership::moveOnlyArrayLeakScan(
 }
 
 void MethodOwnership::handleReturn(const ast::Expr& e) {
+    // fix-forward #8118 (stdlib §6.10, v0.355; #5657): a TaskScope returned
+    // through an `owned` return slot — `owned Object`, `owned
+    // IAsyncDisposable`, at any declared type — is an owning position.
+    if (returnOwned_)
+        reportTaskScopeInOwningPosition(e, "an `owned` return slot");
     // fix #4962 (§17.15 / §28.3, v0.307): pre-populate
     // `states_[clause].source` for every binding-atom clause reachable
     // from the return expression so the §28.3 / §9.7 indirect-escape
