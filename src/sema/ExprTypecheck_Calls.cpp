@@ -37102,7 +37102,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // `T` is not a callable value (§27.1, §27.7). The
                         // `await` hint below belongs to the READ spelling, so
                         // only one of the two is reported.
-                        if (&ma == calleeOfCallCtx_) {
+                        // Fix-forward: when T is itself a FUNCTION type the
+                        // call is legal: §27.1 (v0.355) admits "a parameter,
+                        // local, field, or property of function type" as a
+                        // callee, so `t.Result()` over `Task<() -> int>`
+                        // reads Result and calls it, exactly as a user
+                        // class's function-typed property does. Only a
+                        // non-function T is refused here.
+                        if (&ma == calleeOfCallCtx_ &&
+                            tt->genericArgs[0]->kind !=
+                                TypeRef::Kind::Function) {
                             ctx_.diagnostics().report(
                                 Severity::Error, ma.span.begin,
                                 taskPropertyCallMessage(mbr));
@@ -42163,8 +42172,12 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                     // v0.355): the `?.` twin of the `.` form's `Result`
                     // property-call rejection. The `await` hint below belongs
                     // to the READ spelling, so only one of the two is
-                    // reported.
-                    if (&nm == calleeOfCallCtx_) {
+                    // reported. As in the `.` form, a FUNCTION-typed T is a
+                    // legal callee (§27.1, v0.355: "a property of function
+                    // type"), so only a non-function T is refused.
+                    if (&nm == calleeOfCallCtx_ &&
+                        recvTy->genericArgs[0]->kind !=
+                            TypeRef::Kind::Function) {
                         ctx_.diagnostics().report(Severity::Error, loc,
                                                   taskPropertyCallMessage(mbr));
                     } else if (inAsyncContext_) {

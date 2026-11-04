@@ -406,3 +406,120 @@ BEZEL_TEST(task_property_call_7971,
                           "Console.WriteLine(foo.Result.ToString());"),
         "7\n");
 }
+
+// ===========================================================================
+// FIX-FORWARD: a FUNCTION-typed `Result` IS a legal callee.
+//
+// spec §27.1 (v0.355) admits as a callee "a function-typed value -- a
+// parameter, local, field, or property of function type, or any expression of
+// one", and §30.3 (v0.355) declares `public readonly property Result: T;`. At
+// `T` a function type, `t.Result()` reads the property and calls the function
+// it holds -- exactly as a user class's function-typed property `h.Cb()` is
+// called. The first cut of #7971 (e5ad8c2f) refused every `t.Result()`; these
+// rows compiled and ran correctly on its base (2fd1ed56) and were refused at
+// e5ad8c2f.
+// ===========================================================================
+
+// `Task<() -> int>`: read `Result`, call it.
+BEZEL_TEST(task_property_call_7971,
+           function_typed_result_call_runs_spec_27_1_spec_30_3) {
+    expectStdout(prog("using var t := Task.FromResult<() -> int>(lambda() => 7); "
+                      "var v := t.Result(); "
+                      "Console.WriteLine(v.ToString());"),
+                 "7\n");
+}
+
+// The explicitly parenthesised "read, then call" spelling.
+BEZEL_TEST(task_property_call_7971,
+           parenthesised_function_typed_result_call_runs_spec_27_1_spec_30_3) {
+    expectStdout(prog("using var t := Task.FromResult<() -> int>(lambda() => 7); "
+                      "var v := (t.Result)(); "
+                      "Console.WriteLine(v.ToString());"),
+                 "7\n");
+}
+
+// A function type WITH a parameter: the argument is the function's, not the
+// property's.
+BEZEL_TEST(task_property_call_7971,
+           function_typed_result_call_with_an_argument_runs_spec_27_1_spec_30_3) {
+    expectStdout(
+        prog("using var t := Task.FromResult<(int) -> int>("
+             "lambda(x: int) => x + 1); "
+             "Console.WriteLine(t.Result(41).ToString());"),
+        "42\n");
+}
+
+// An `async` method's `Task<() -> int>`, awaited in one async body and called
+// through `Result` in the synchronous `Main`.
+BEZEL_TEST(task_property_call_7971,
+           async_function_typed_result_call_in_sync_main_runs_spec_27_1_spec_30_3) {
+    expectStdout(
+        "module M; import System; import System.Threading.Tasks;\n"
+        "class C\n"
+        "  public static async method Mk(): Task<() -> int> "
+        "return lambda() => 8; end Mk;\n"
+        "  public static async method Run(): Task<int>\n"
+        "    using var t := Mk();\n"
+        "    var f := await t;\n"
+        "    return f();\n"
+        "  end Run;\n"
+        "  public static method Main(): int\n"
+        "    using var t := Run();\n"
+        "    Console.WriteLine(t.Result.ToString());\n"
+        "    using var u := Mk();\n"
+        "    Console.WriteLine(u.Result().ToString());\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "8\n8\n");
+}
+
+// The `?.` twin: §7.5 (v0.355) types a suffix to the right of `?.` at the
+// value type, so over `Task<() -> int>?` the `( )` suffix calls the function
+// `Result` holds -- a legal call, whose result is nullable. A USER class's
+// function-typed property `h?.Cb()` is accepted on the same terms. Only the
+// ACCEPTANCE is the subject of this row: the printed value is a pre-existing,
+// shared codegen gap (#2434 degrades the `?.`-call initializer for the user
+// class's twin too), not this fix's.
+BEZEL_TEST(task_property_call_7971,
+           null_conditional_function_typed_result_call_is_accepted_spec_7_5_spec_27_1) {
+    expectRuns(prog("using var t0 := Task.FromResult<() -> int>(lambda() => 7); "
+                    "var t: Task<() -> int>? := t0; "
+                    "var v := t?.Result(); "
+                    "Console.WriteLine((v ?? 0).ToString());"));
+}
+
+// A NULLABLE function-typed `Result` is invoked with the null-conditional call
+// `?(...)` (§7.6, v0.355), and runs.
+BEZEL_TEST(task_property_call_7971,
+           nullable_function_typed_result_null_conditional_call_runs_spec_7_6) {
+    expectStdout(
+        prog("using var t := Task.FromResult<(() -> int)?>(lambda() => 5); "
+             "var v := t.Result?(); "
+             "Console.WriteLine((v ?? 0).ToString());"),
+        "5\n");
+}
+
+// The `.Result` blocking wait in ASYNC code is still refused for a
+// function-typed T (§30.3: "use `await t`"): admitting the call spelling must
+// not drop the async rule, and the property-call diagnostic must not fire in
+// its place.
+BEZEL_TEST(task_property_call_7971,
+           async_function_typed_result_call_keeps_the_await_diagnostic_spec_30_3) {
+    expectRejectedWith(
+        "module M; import System; import System.Threading.Tasks;\n"
+        "class C\n"
+        "  public static async method A(): Task<int>\n"
+        "    using var t := Task.FromResult<() -> int>(lambda() => 7);\n"
+        "    return t.Result();\n"
+        "  end A;\n"
+        "  public static method Main(): int\n"
+        "    using var u := A();\n"
+        "    Console.WriteLine(u.Result.ToString());\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        5,
+        "use `await t` — blocking waits are not available in async code "
+        "(§30.3)");
+}
