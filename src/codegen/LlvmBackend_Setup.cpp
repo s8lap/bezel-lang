@@ -40802,16 +40802,74 @@ bool Emitter::isUnboundOwnedBorrowingArrayCallExpr(const ast::Expr* e) const {
         return false;
     if (!common::isPlainBuiltinCollectionHead(builtinTypeName(rt)))
         return false;
-    // The expression must be a CALL whose resolved callee is a user MethodSymbol
-    // declared with an `owned` return (the authority that the call owns its
-    // result). The callee symbol is keyed on the CallExpr's `callee` node.
+    // The expression must be a CALL whose callee OWNS its result. There are two
+    // authorities for that, and the callee symbol is keyed on the CallExpr's
+    // `callee` node.
     auto* call = dynamic_cast<const ast::CallExpr*>(e);
     if (!call || !call->callee) return false;
+    // (1) A USER MethodSymbol declared with an `owned` return.
+    //
     // fix #3189 (family M2 of umbrella #3152): the both-sources marker read.
     // An imported `method M(): owned Array<T>` answered `false` here, so the
     // unbound borrowing-array temporary's `bz_array_free` was never emitted
     // and the backing leaked once per call.
-    return common::calleeReturnsOwned(*call, ctx_);
+    if (common::calleeReturnsOwned(*call, ctx_)) return true;
+    // (2) fix #8094 (§17.13, §28.3, stdlib §2.4 / §7.3 / §7.4, v0.355): the
+    // BUILTIN `owned` static-factory face — `Directory.GetFiles(path)` and
+    // `Directory.GetDirectories(path)` (stdlib §7.4, "owned Array<string>"),
+    // `File.ReadAllLines(path)` and `File.ReadAllBytes(path)` (stdlib §7.3,
+    // "owned Array<string>" / "owned Array<byte>"), and `Environment.Variables()`
+    // (stdlib §2.4, "owned Dictionary<string, string>").
+    //
+    // WHY `calleeReturnsOwned` CANNOT SEE THEM. It reads the `owned` marker off
+    // a resolved USER MethodDecl/MethodSymbol. A stdlib factory has NEITHER:
+    // there is no `ast::MethodDecl` for `Directory.GetFiles` and no
+    // `MethodSymbol` on the callee — sema types those calls in its
+    // `colName`-keyed static arms, with nothing attached to the callee. So
+    // `calleeReturnsOwned` answered `false` for every stdlib factory, and the
+    // whole `owned`-returning stdlib surface was INVISIBLE to this predicate.
+    // MEASURED on this fix's parent (c18b2552), generated-code LeakSanitizer,
+    // 100 iterations: `_ := Directory.GetFiles("/tmp");` leaked 8 840 500 B in
+    // 285 600 allocations and `Directory.GetFiles("/tmp").Count` leaked the
+    // same — while the byte-identical `new Dictionary<string,string>();`
+    // discard was CLEAN (the `new`-expression face,
+    // `isUnboundOwnedBuiltinCollectionNewExpr`, #6357). That contrast is the
+    // defect: the `new` face of an unbound owned temporary is discharged and
+    // the CALL face of one is not.
+    //
+    // WHY THIS PREDICATE, AND NOT A SECOND NAME LIST.
+    // `common::isBuiltinOwnedStaticFactoryCall` (OwnershipFacts.cpp, #5284) IS
+    // the stdlib's own `owned`-factory table, transcribed from the
+    // `owned`-returning declarations beside each class's section, and the
+    // ownership pass ALREADY consults it to classify exactly these calls
+    // `Owned` (`producerState`, Ownership.cpp:6656). Codegen and the ownership
+    // pass therefore answer ONE question the same way — the no-drift property
+    // this file's other free sites are built on — and no second copy of the
+    // factory table is spelled here. Its four gates keep it narrow: the STATIC
+    // `Col.Member(...)` shape; a BUILTIN receiver (§2.3's `isUserDeclaredTypeSym`
+    // discriminator rejects a user class that took the name — such a class is
+    // classified Owned through its own `MethodDecl` and reaches arm (1) above);
+    // NO `MethodSymbol` on the callee (a user/imported static method carries
+    // one and is never claimed here); and the result head the stdlib declares.
+    //
+    // The RESULT-TYPE gate above is what keeps the OTHER rows of that table out
+    // of this predicate: `Stopwatch.StartNew` (§8.1),
+    // `CancellationTokenSource.WithCancelAfter` / `CreateLinked` /
+    // `CreateLinkedAll` (§6.1) and `FrozenArray<T>.From` (§4.19) have heads
+    // outside `isPlainBuiltinCollectionHead`, so they never reach a backing
+    // free here — they carry their own disposal paths (a vtable-less builtin
+    // release), and freeing a `Stopwatch` with `bz_array_free` would be a
+    // wrong-free.
+    //
+    // WHAT IT IS NOT. This is NOT a widening of the disposal machinery: the
+    // free itself is `freeUnboundOwnedBorrowingArrayTemp`'s existing
+    // three-way `isLL / isDict / else` dispatch, unchanged. For the
+    // `Array<string>` rows the per-element disposer is the string-release
+    // thunk (`genericArgs[0]` is `string`), which is exactly the co-owned +1
+    // per element the `makeFilesList` / `bz_file_read_all_lines` lowerings
+    // mint (`initStringRc`, rc := 1) — so the elements are released exactly
+    // once, with the backing.
+    return common::isBuiltinOwnedStaticFactoryCall(*call, ctx_);
 }
 
 
