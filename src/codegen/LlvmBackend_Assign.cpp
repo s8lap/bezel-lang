@@ -17988,6 +17988,27 @@ struct ParamEscapeWalker {
         return false;
     }
 
+    // fix #8011 (§8.6 / §28.3 / §28.9, v0.353): the tracked parameter passed
+    // on, bare, as argument `i` of call `c`. A call argument is a borrow for
+    // the duration of that call (§28.3), so it is an escape only when the
+    // CALLEE lets its own parameter escape. `argNonEscaping` (installed by
+    // `isCalleeParamNonEscaping`) answers that for a callee whose body this
+    // module compiles and whose dispatch is static; every other callee keeps
+    // the conservative escape verdict. Not inside a lambda body: there the
+    // reference is a capture that may outlive the call (the `isUnboxedRead`
+    // guard). Only a plain positional argument qualifies: a modifier (`ref`,
+    // `out`, `move`, `scoped`) or a named argument falls back to escaping.
+    std::function<bool(const ast::CallExpr&, size_t)> argNonEscaping;
+    bool isNonEscapingCallArg(const ast::CallExpr& c, size_t i) {
+        if (lambdaDepth != 0 || !argNonEscaping || i >= c.args.size())
+            return false;
+        const ast::CallArgument& a = c.args[i];
+        if (a.isDiscard || !a.modifier.empty() || !a.name.empty() ||
+            !isTarget(a.value.get()))
+            return false;
+        return argNonEscaping(c, i);
+    }
+
     // The bare type name `Console` — the auto-imported `System.Console`, and
     // NOT a local, a parameter, or a USER type that shadows it (§2.3's
     // always-available names are shadowable except §3.4's reserved row;
@@ -18091,7 +18112,9 @@ struct ParamEscapeWalker {
                                (mem->member == "Write" ||
                                 mem->member == "WriteLine") &&
                                c->args.size() == 1 && lambdaDepth == 0);
-                for (auto& a : c->args) expr(a.value.get(), eqRead);
+                for (size_t i = 0; i < c->args.size(); ++i)
+                    expr(c->args[i].value.get(),
+                         eqRead || isNonEscapingCallArg(*c, i));
                 return;
             }
             if (auto* mem = dynamic_cast<const ast::NullCondMemberExpr*>(
@@ -18106,7 +18129,8 @@ struct ParamEscapeWalker {
                 for (auto& a : c->args) expr(a.value.get(), false);
                 return;
             }
-            // Generic call — any arg may escape through the callee. The
+            // Generic call — any arg may escape through the callee, unless
+            // the callee's own parameter provably does not (#8011). The
             // callee expression itself is walked too (fix-forward of
             // ca822b0b, §8.6 / §27.5, v0.355): in `s.Getter(v)()` the
             // callee is the inner call, which hands `v` to `Getter`, whose
@@ -18114,7 +18138,8 @@ struct ParamEscapeWalker {
             // was never visited, the caller released the box, and the stored
             // value was read freed (ASan heap-use-after-free).
             expr(c->callee.get(), false);
-            for (auto& a : c->args) expr(a.value.get(), false);
+            for (size_t i = 0; i < c->args.size(); ++i)
+                expr(c->args[i].value.get(), isNonEscapingCallArg(*c, i));
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
@@ -18449,6 +18474,42 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
                            std::unordered_set<const sema::Symbol*>& out) {
         collectCapturedSyms(lam, out);
     };
+    // fix #8011 (§8.6 / §28.3 / §28.9, v0.355): a tracked parameter passed on
+    // as a plain call argument escapes only if the callee's parameter at that
+    // position escapes. Every question about the CALLEE is answered from its
+    // sema symbol (an imported member has no AST in this module): it must not
+    // be imported, an operator, an extension or an interface member, and its
+    // parameter at that position must carry no modifier. The one AST read is
+    // the body walk itself, through `isCalleeParamNonEscaping`, whose null
+    // answer for a member with no declaration here is "escapes" (the imported
+    // answer, the same handoff the method-reference thunk makes); that walk
+    // also refuses a dispatched (`virtual`, non-`sealed` `override`) body
+    // (§12.1), an abstract one, and a state machine (`async`, or an iterator
+    // with `yield`: the parameter is copied into a frame that outlives the
+    // call, §29.3 / §30.1). Everything else stays an escape (the leak
+    // direction #2952 records). Recursion: the cache entry for `callee` is
+    // seeded with the empty set ("every parameter escapes") before the walk,
+    // so a cycle back to a callee still being analysed answers "escapes" —
+    // conservative, and a callee cached under that answer is cached in the
+    // leak direction.
+    auto argNonEscaping = [this](const ast::CallExpr& c, size_t i) -> bool {
+        if (!c.callee) return false;
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(
+            ctx_.exprSymbol(*c.callee));
+        if (!ms || ms->isOperator || ms->extensionDecl ||
+            ctx_.isImported(ms))
+            return false;
+        if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Interface)
+            return false;
+        for (const ast::CallArgument& a : c.args)
+            if (!a.name.empty() || a.isDiscard) return false;
+        if (i >= ms->params.size()) return false;
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
+        if (!ps || !ps->modifier.empty()) return false;
+        return isCalleeParamNonEscaping(
+            dynamic_cast<const ast::Member*>(ms->decl), i);
+    };
+    calleeParamNonEscape_[callee];  // seed: every parameter escapes (#8011)
     auto walkParams = [&](const std::vector<ast::Param>& params,
                           const std::vector<std::unique_ptr<ast::Stmt>>* body,
                           const ast::Expr* exprBody) {
@@ -18457,6 +18518,7 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
             const sema::TypeRef* pt = ctx_.resolvedType(*params[i].type);
             if (!pt || !isObjectOrInterfaceTarget(pt)) continue;
             ParamEscapeWalker w{ctx_, params[i].type.get(), captures};
+            w.argNonEscaping = argNonEscaping;
             if (body) {
                 for (auto& s : *body) w.stmt(s.get());
             }
@@ -18484,11 +18546,13 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
         // body that runs, so every parameter escapes. MEASURED before this
         // guard: `b.Put(v)` with `b: Base` bound to `Base.Put(v) => 0`
         // released the box that `Keeper`'s override had stored (ASan
-        // heap-use-after-free). An `abstract` member has no body and already
-        // answers "escapes"; a `sealed override` has no further override.
+        // heap-use-after-free). An `abstract` member has no body of its own
+        // (§12.1), so it is dispatched too; a `sealed override` has no
+        // further override, so its body is the one that runs.
         bool dispatched = false, sealedMod = false;
         for (auto mod : md->modifiers) {
-            if (mod == "virtual" || mod == "override") dispatched = true;
+            if (mod == "virtual" || mod == "override" || mod == "abstract")
+                dispatched = true;
             if (mod == "sealed") sealedMod = true;
         }
         if (stateMachine || (dispatched && !sealedMod)) {

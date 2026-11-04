@@ -105,9 +105,11 @@ const char* kCaseWhenGuardArm =
     "  end Main; "
     "end P;";
 
-// OVER-RELEASE GUARD 1: the operand read AND a pass to another call. The
-// call is an escape, so the box is not released (it leaks, the safe
-// direction #2952 records). 20 calls x (5 + 5).
+// OVER-RELEASE GUARD 1: the operand read AND a pass to another call. Since
+// #8011 the pass-on is an escape only if `Inner`'s own parameter escapes;
+// `Inner` only type-tests it, so the box IS released after each call, and
+// the row checks that the release is not premature (no use-after-free) and,
+// on the checked leg, that it happens (no leak). 20 calls x (5 + 5).
 const char* kReadAndPassOn =
     "module M6142E; "
     "public class P "
@@ -205,14 +207,20 @@ BEZEL_TEST(codegen_narrowed_operand_box_release_6142,
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("600\n"));
 }
 
-// per §28.3, v0.338 — the parameter also passes to another call, an escape:
-// the box is kept (no use-after-free; leak detection off).
+// per §28.3, v0.338 — the parameter also passes to another call. Since #8011
+// (§8.6, v0.355) that callee's parameter is non-escaping, so the box is
+// released after the call: no use-after-free on the lenient leg, no leak on
+// the checked leg.
 BEZEL_TEST(codegen_narrowed_operand_box_release_6142,
            operand_read_plus_pass_on_keeps_box_spec_28_3) {
     JitResult r = runAotCheckedLenient(kReadAndPassOn);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("200\n"));
+    JitResult c = runAotChecked(kReadAndPassOn);
+    BEZEL_EXPECT_TRUE(c.ran);
+    BEZEL_EXPECT_EQ(c.exitCode, 0);
+    BEZEL_EXPECT_EQ(c.stdoutText, std::string("200\n"));
 }
 
 // per §28.3, v0.338 — the parameter is also stored in a field read after
