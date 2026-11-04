@@ -6856,6 +6856,46 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                 elemTypeRef->declaration, ifm);
                 }
             }
+            // fix #8092 (stdlib §2.5 / §5.1 / §2.8, spec §14.2, v0.355): a
+            // VALUE-typed element that is not a pointer — a BUILT-IN VALUE
+            // RECORD (`DateTime`, `TimeSpan`, `DateOnly`, `TimeOnly`) or a
+            // USER RECORD implementing `IComparable<T>` — is stored INLINE in
+            // the array, and its ORDER is the value's own `CompareTo`, NOT a
+            // comparison of its raw word.
+            //
+            // ⚠ THE `DateTime` CASE IS A SILENT WRONG VALUE. stdlib §2.5 says
+            // "CompareTo = tick order (Kind not normalized, matching .NET)",
+            // and a `DateTime`'s `Kind` rides in the TOP TWO BITS of its word.
+            // The integer path below compares the RAW WORD, so a Utc/Local
+            // value ranks above (or below) every Unspecified one.
+            // MEASURED before this fix, over {Utc 300, Unspecified 100,
+            // Unspecified 200}: `MaxOrNull()` returned the UTC element while
+            // the plain `Max()` — the same §5.1 extension, the arm #8049 gave
+            // the `dtTicksOf` key — returned the Unspecified 300 one. The two
+            // arms of ONE extension disagreed about a value-record element,
+            // and the `*OrNull` one was silently wrong.
+            //
+            // A USER RECORD's order is its own `CompareTo`, dispatched through
+            // `buildRecordCompareToThunk` — the SAME thunk the plain
+            // `Min()`/`Max()` arm uses (#8092) and the sorted collections
+            // (#3740). Before this fix a record element fell through to the
+            // "not yet implemented for this element type" refusal below, so
+            // `Array<Record>.MinOrNull()` was REFUSED while `Array<Record>.
+            // Min()` computed the right answer.
+            std::string_view elemValueHead;
+            if (elemTypeRef && !elemTypeRef->nullable &&
+                elemTypeRef->kind == sema::TypeRef::Kind::Named) {
+                const sema::TypeRef* er = resolveTypeParamRef(elemTypeRef);
+                if (er && !er->nullable) elemValueHead = builtinTypeName(er);
+            }
+            const bool elemIsDateTime = (elemValueHead == "DateTime");
+            const bool elemIsTemporalValue =
+                elemIsDateTime || elemValueHead == "TimeSpan" ||
+                elemValueHead == "DateOnly" || elemValueHead == "TimeOnly";
+            llvm::Function* recCmpThunk = nullptr;
+            if (!isStrElem && elemTypeRef && !elemTypeRef->nullable &&
+                elemTypeRef->kind == sema::TypeRef::Kind::Named)
+                recCmpThunk = buildRecordCompareToThunk(elemTypeRef);
             if (isStrElem || cmpMs || ifaceCmpFn) {
                 // Pointer-typed element: §9.6 ordinal string relation,
                 // itable CompareTo (interface, #2770), or direct
@@ -6885,6 +6925,43 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 shouldUpdate = isMaxOrNull
                     ? builder_.CreateICmpSGT(cmp, zero)
                     : builder_.CreateICmpSLT(cmp, zero);
+            } else if (elemIsTemporalValue) {
+                // fix #8092 (stdlib §2.5 / §5.1, spec §14.2, v0.355): a
+                // BUILT-IN VALUE RECORD element compares by its OWN
+                // `CompareTo`, not by its raw word. A `DateTime` compares by
+                // TICKS (its `Kind` rides in the word's top two bits and
+                // stdlib §2.5's "CompareTo = tick order (Kind not
+                // normalized)" excludes it) — the same key the plain
+                // `Min()`/`Max()` arm uses (#8049) and the `Math.Min`/`Max`
+                // arm uses (#7716). `TimeSpan` is a plain SIGNED tick count,
+                // `DateOnly` a day number and `TimeOnly` a millisecond-of-day
+                // count, so their words compare directly.
+                llvm::Value* cmpVal = el;
+                llvm::Value* cmpAcc = acc;
+                if (elemIsDateTime && elemLLTy->isIntegerTy(64)) {
+                    cmpVal = dtTicksOf(el);
+                    cmpAcc = dtTicksOf(acc);
+                }
+                shouldUpdate = isMaxOrNull
+                    ? builder_.CreateICmpSGT(cmpVal, cmpAcc)
+                    : builder_.CreateICmpSLT(cmpVal, cmpAcc);
+            } else if (recCmpThunk) {
+                // fix #8092 (stdlib §2.5 / §5.1 / §2.8, spec §14.2, v0.355):
+                // a USER RECORD element implementing `IComparable<T>` orders by
+                // its OWN `CompareTo` — the same thunk the plain `Min()`/`Max()`
+                // arm uses. Before this arm the shape fell through to the
+                // refusal below, so `Array<Record>.MinOrNull()` was REFUSED
+                // while `Array<Record>.Min()` computed the right answer.
+                auto* elSlot = entryAlloca(elemLLTy);
+                builder_.CreateStore(el, elSlot);
+                llvm::Value* cmp = builder_.CreateCall(
+                    recCmpThunk,
+                    {builder_.CreateBitCast(elSlot, ptrTy()),
+                     builder_.CreateBitCast(accSlot, ptrTy())},
+                    "mon.cmp");
+                shouldUpdate = isMaxOrNull
+                    ? builder_.CreateICmpSGT(cmp, builder_.getInt32(0))
+                    : builder_.CreateICmpSLT(cmp, builder_.getInt32(0));
             } else if (elemLLTy->isIntegerTy()) {
                 shouldUpdate = isMaxOrNull
                     ? (elemIsUnsigned ? builder_.CreateICmpUGT(el, acc)
