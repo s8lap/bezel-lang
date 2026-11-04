@@ -238,7 +238,7 @@ BEZEL_TEST(user_class_name_builtin_predicate_3022n,
         std::cout << "    #7028 Encoding: the indirect use is still rejected\n";
     }
     BEZEL_EXPECT_FALSE(diagSaysEncodingOnlyDirect(r));
-    BEZEL_EXPECT_FALSE(hasAnyError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(2, r.exitCode);
 }
