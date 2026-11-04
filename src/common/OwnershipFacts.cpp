@@ -569,6 +569,51 @@ bool isBareMoveArmValue(const ast::Expr& e) {
 
 namespace {
 
+// fix #8060 (§28.3 producers table, the if/case arm-meet row; K7.1, v0.355):
+// an arm that is a FRESH OWNED BUILTIN-COLLECTION producer -- a `new` of a
+// builtin collection (`new OwningArray<Cell>()`, `new Array<int>()`, `new
+// Dictionary<string, int>()`) or an `owned`-returning call whose result is
+// one (`MkA(): owned OwningArray<Cell>`). The arm-meet row is "the meet of the
+// arms' ownership states", and the `new` / `owned`-return rows of the same
+// table make each of these an OWNED arm, so owned ⊓ owned = owned (K7.1).
+//
+// `isFreshOwnedClassProducer` cannot answer for these: it ends in
+// `rt->declaration->kind == TypeDeclKind::Class`, and every builtin collection
+// is declaration-less. So an if/case over two `new OwningArray<Cell>()` arms
+// met to BORROWED here: the ownership pass's `producerState` called the
+// construct a borrow, the binding carried no obligation, and the collection
+// LEAKED (`var u := (case 1 of _ => new OwningArray<Cell>());` -- the header
+// and its backing buffer, 208 bytes in 2 allocations per evaluation). The
+// same classification made a NESTED owned-collection meet a borrow arm, so
+// `(case i of 1 => (case i of _ => new OwningArray<Cell>()), _ => new
+// OwningArray<Cell>())` was wrongly REJECTED as a mixed owned/borrowed meet.
+//
+// Narrow by construction: the result must be a declaration-less head in one
+// of the two collection registries (the owning family and the plain borrowing
+// family), so a user class (`isFreshOwnedClassProducer`'s population), a
+// value-shaped builtin (no obligation) and the other heap builtins (Task,
+// Shared, ... -- each with its own disposal regime) are untouched. The
+// class-typed codegen consumers of the arm-meet predicate
+// (`unwindOwnedLocalClass`, `usingVarOwnsClassObjectDynamically`) gate on a
+// class/interface result type and so do not change; a collection-typed
+// owned binding is disposed by its TYPE-keyed scope-end disposal.
+bool isFreshOwnedBuiltinCollectionArm(const ast::Expr* e,
+                                      const sema::SemaContext& ctx) {
+    if (!e) return false;
+    bool producer = false;
+    if (dynamic_cast<const ast::NewExpr*>(e)) {
+        producer = true;
+    } else if (auto* call = dynamic_cast<const ast::CallExpr*>(e)) {
+        producer = calleeReturnsOwned(*call, ctx);
+    }
+    if (!producer) return false;
+    const sema::TypeRef* rt = ctx.exprType(*e);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    const std::string_view head = rt->headName();
+    return isOwningCollectionHead(head) || isPlainBuiltinCollectionHead(head);
+}
+
 // One arm of an if/case expression is an OWNED arm iff it is a fresh owned
 // producer or a nested owned-meet if/case. // §28.3 arm-meet (v0.184, #1661)
 bool armIsOwnedProducer(const ast::Expr* arm, const sema::SemaContext& ctx,
@@ -585,7 +630,9 @@ bool armIsOwnedProducer(const ast::Expr* arm, const sema::SemaContext& ctx,
     if (dynamic_cast<const ast::ConditionalExpr*>(arm) ||
         dynamic_cast<const ast::CaseExpr*>(arm))
         return conditionalCaseArmMeetIsOwned(*arm, ctx, resolveParam);
-    return isFreshOwnedClassProducer(arm, ctx, resolveParam);
+    if (isFreshOwnedClassProducer(arm, ctx, resolveParam)) return true;
+    // fix #8060: the builtin-collection producers (see above).
+    return isFreshOwnedBuiltinCollectionArm(arm, ctx);
 }
 
 // The shared arm-meet decision (see the header). Every non-absorbing arm must
