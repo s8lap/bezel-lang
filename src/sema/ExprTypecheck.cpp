@@ -10266,6 +10266,157 @@ bool ExprTC::isReadonlyStoreWindowOpen(const ast::Expr& target,
            isThisRootedLValueTarget(target);
 }
 
+// §9.4's hop key: a member whose type is a class or an interface LEAVES the
+// receiver's value. The classification is the one
+// isNonNullableReferenceType uses (TypeRef.hpp), read WITHOUT its
+// nullability test — a nullable class-typed member leaves the value just as a
+// non-nullable one does — and WITHOUT its `string` case (a string member is
+// immutable, so no store reaches through it).
+static bool memberTypeLeavesReceiverValue(const TypeRef* t) {
+    if (!t) return false;
+    switch (t->kind) {
+        case TypeRef::Kind::Primitive:
+            return t->primitive == PrimitiveType::Object;
+        case TypeRef::Kind::Function:
+            return true;
+        case TypeRef::Kind::Named:
+            // A Named TypeRef with no declaration is an imported/builtin
+            // reference type (a collection wrapper, `Task`, …) or a bare
+            // generic parameter — both follow the reference-type rule
+            // (§7.10), so the hop leaves the value.
+            if (!t->declaration) return true;
+            // fix #3462 (v0.315): builtinClassSym mints VALUE types (Range,
+            // Ptr) with kind=Class; they are told apart by their empty
+            // moduleName (they have no real module).
+            if (t->declaration->moduleName.empty()) return false;
+            return t->declaration->kind == ast::TypeDeclKind::Class ||
+                   t->declaration->kind == ast::TypeDeclKind::Interface;
+        default:
+            return false;
+    }
+}
+
+// §9.4 (v0.355), "Value receivers are borrows": "The receiver's own storage
+// is what an lvalue chain rooted at `this` reaches WITHOUT LEAVING THE VALUE
+// — an explicit `this.X := e`, a bare `X := e` resolving to the receiver's
+// storage or settable property, or an inline-array-field chain
+// `this._arr[i] := e`". The chain's ROOT is not what decides the rule ("The
+// rule keys on where the store would land — never on the chain's root or the
+// statement's form"), so a chain that walks INTO a nested record's storage
+// without leaving the value is receiver storage too: a record component is
+// stored INLINE in the holder (§9.2/§9.7), so `this.I.X := e` on a
+// record-typed member `I` lands in the receiver's own storage.
+//
+// The walk below answers that question for one lvalue chain: starting at the
+// chain's base (the receiver) and following its `.member` / `[index]` hops
+// outward, does every hop stay inside the receiver's VALUE? A hop LEAVES it
+// when
+//   - the member hopped through is class- or interface-typed (§9.4's key —
+//     the same key §28.3's narrowed-local rule reads: "no hop through a
+//     class- or interface-typed member"): a record's reference-typed fields
+//     are borrows (§9.7), so a store beyond such a hop lands in the borrowed
+//     heap object, not in the receiver, and is LEGAL;
+//   - the member hopped through is a COMPUTED (block-form) property: the
+//     chain reads a computed value there, not the receiver's own storage, and
+//     a store through it lands where that value's own member puts it (a
+//     record-typed computed property yields a COPY, so the store lands in a
+//     temporary, not in the receiver);
+//   - the hop is an INDEXER — a call. An inline array's element is storage
+//     INSIDE the array value (§15.1.1) and stays.
+//
+// A STATIC member is not reached through `this` at all (§9.4 keys on "what an
+// lvalue chain rooted at `this` reaches"), so it leaves too.
+//
+// Returns true iff the chain stays inside the receiver's value.
+static bool receiverChainStaysInsideValue(SemaContext& ctx,
+                                           const ast::Expr& target) {
+    // Collect the chain's hops (outermost first), then reverse so the walk
+    // runs from the base outward — the same chain shape
+    // isThisRootedLValueTarget peels. A postfix `!` is type-neutral and is
+    // peeled, not counted as a hop.
+    std::vector<const ast::Expr*> hops;
+    const ast::Expr* base = &target;
+    for (;;) {
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(base)) {
+            base = pb->operand.get();
+            if (!base) return true;
+            continue;
+        }
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(base)) {
+            hops.push_back(base);
+            base = ma->target.get();
+        } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(base)) {
+            hops.push_back(base);
+            base = ix->target.get();
+        } else {
+            break;
+        }
+        if (!base) return true;  // a malformed chain: leave the walk alone
+    }
+    std::reverse(hops.begin(), hops.end());
+    // The bare-member spelling (`Raw := e`) has no hop: the base IS the
+    // terminal, and the terminal check below decides it.
+    if (hops.empty()) return true;
+    // The BASE of the chain: either the explicit `this` (no member, no type)
+    // or the bare implicit-this spelling, which names a MEMBER of the current
+    // type. A bare base is an INTERMEDIATE member whenever the chain has a
+    // hop after it, so it is judged like any other: it must be the receiver's
+    // own storage, and it must not be class- or interface-typed (such a
+    // member leaves the receiver's value — the chain reads the class object
+    // it names, and everything beyond it lands there).
+    const TypeRef* curTy = nullptr;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(base)) {
+        if (id->name != "this" && id->name != "base") {
+            Symbol* bs = ctx.exprSymbol(*id);
+            if (auto* ps = dynamic_cast<PropertySymbol*>(bs)) {
+                if (!ps->isAutoProperty) return false;
+            } else if (!dynamic_cast<FieldSymbol*>(bs)) {
+                return false;
+            }
+            curTy = ctx.exprType(*id);
+            if (memberTypeLeavesReceiverValue(curTy)) return false;
+        }
+    }
+    // The type of the expression the walk stands on. A member hop updates it
+    // with the member's type; an index hop reads it. The explicit `this` base
+    // has no member type (the receiver's own type is not a member's), so the
+    // walk starts with none — a member hop sets it before any index hop.
+    for (std::size_t i = 0; i < hops.size(); ++i) {
+        const ast::Expr* h = hops[i];
+        if (dynamic_cast<const ast::IndexExpr*>(h)) {
+            // An index hop. An inline array's element is storage INSIDE the
+            // array value (§15.1.1) and stays; any other indexer is a CALL,
+            // and a store through it lands where the indexer puts it.
+            if (!curTy || curTy->kind != TypeRef::Kind::InlineArray)
+                return false;
+            curTy = ctx.exprType(*h);
+            continue;
+        }
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(h);
+        if (!ma) return true;
+        const bool last = (i + 1 == hops.size());
+        Symbol* ms = ctx.exprSymbol(*h);
+        const TypeRef* mt = ctx.exprType(*h);
+        if (!last) {
+            // An INTERMEDIATE hop: the chain must stay inside the value.
+            if (memberTypeLeavesReceiverValue(mt)) return false;
+            // The member hopped through must be the receiver's own storage:
+            // a computed (block-form) property is not storage.
+            if (auto* ps = dynamic_cast<PropertySymbol*>(ms)) {
+                if (!ps->isAutoProperty) return false;
+            } else if (!dynamic_cast<FieldSymbol*>(ms)) {
+                return false;
+            }
+            // A static member is not reached through `this` (§9.4).
+            if (auto* mem = dynamic_cast<MemberSymbol*>(ms))
+                for (std::string_view mod : mem->modifiers)
+                    if (mod == "static") return false;
+        }
+        curTy = mt;
+    }
+    return true;
+}
+
 // §9.4 (v0.236, #2309; follow-up §9.4 "Value receivers are borrows", v0.307):
 // in an instance member body of a RECORD (the section's focus), `this` binds a
 // borrow of the receiver value, so a store that would land in the receiver's
@@ -10311,20 +10462,38 @@ bool ExprTC::checkRecordReceiverStore(const ast::Expr& target,
 
     if (!isThisRootedLValueTarget(target)) return false;
 
-    // The terminal symbol of the chain must be a field or auto-property of
-    // the enclosing record (its own storage). A computed property (block /
-    // expression-bodied), an indexer that lands through a method call, or a
-    // non-record member all fall through to "not own storage" — these are
-    // either computed and legal or covered by other checks.
+    // §9.4 (v0.355): the store lands in the receiver's own storage only if
+    // the chain stays inside the receiver's VALUE. A hop through a class- or
+    // interface-typed member LEAVES it, and the store beyond that hop is
+    // legal (§9.4: "a store beyond such a hop lands in the borrowed heap
+    // object, not in the receiver"). A chain that walks into a nested
+    // RECORD's storage without leaving the value (`this.I.X := e`) stays
+    // inside — a record component is stored inline in its holder (§9.2), so
+    // that storage IS the receiver's own storage.
+    if (!receiverChainStaysInsideValue(ctx_, target)) return false;
+
+    // The terminal symbol of the chain must be a field or auto-property of a
+    // RECORD — the receiver's own storage, or a record's storage nested
+    // inside it. A computed property (block / expression-bodied), an indexer
+    // that lands through a method call, or a non-record member all fall
+    // through to "not own storage" — these are either computed and legal or
+    // covered by other checks.
     Symbol* sym = ctx_.exprSymbol(target);
     if (!sym) return false;
+    const TypeSymbol* owner = nullptr;
     if (auto* fs = dynamic_cast<FieldSymbol*>(sym)) {
-        if (fs->parent != currentType_) return false;
+        owner = fs->parent;
     } else if (auto* ps = dynamic_cast<PropertySymbol*>(sym)) {
-        if (ps->parent != currentType_ || !ps->isAutoProperty) return false;
+        if (!ps->isAutoProperty) return false;
+        owner = ps->parent;
     } else {
         return false;
     }
+    // The declaring type of the stored member is a RECORD: the receiver's own
+    // type, or a record reached through value-typed hops (the walk above has
+    // already left the chain at any class- or interface-typed hop, so a
+    // member declared by a class is never reached here).
+    if (!owner || owner->kind != ast::TypeDeclKind::Record) return false;
     // A static member is not the receiver's storage (§9.4: the rejection is
     // about "what an lvalue chain rooted at `this` reaches"; a static is not
     // reached through `this`). Applies to every member body, not only the
@@ -29651,6 +29820,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // consumes the same A.6 `LValue` production as AssignmentStmt — a
         // method-call result cannot serve as the chain's base here either.
         if (is->target) checkLValueChainNotCallBased(*is->target);
+        // §9.4 (v0.355), "Value receivers are borrows": the increment form is
+        // "the same store by other syntax" — §17.6's desugaring makes `Raw++`
+        // a store to `Raw`, so it is the §9.4 receiver-store rule's own case.
+        // The AssignmentStmt arm reaches the check through
+        // checkReadonlyAssignment and the ref/out arm through
+        // checkRefOutOperandCategory; this arm was the ONE that did not, so
+        // `Raw++` in a record method body compiled and mutated the borrowed
+        // receiver in place (fix #8100). Runs before the box-write check
+        // below, in the same order as the AssignmentStmt arm.
+        if (is->target)
+            checkRecordReceiverStore(*is->target, is->op, is->span.begin);
         // fix s12_7_0002 (§12.7, v0.307): position (i) of the box-write
         // rule, `++`/`--` spelling — `o.X++`, `o[0]--`. IncrementStmt
         // sibling of the AssignmentStmt call in checkReadonlyAssignment.
