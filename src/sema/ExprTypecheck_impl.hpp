@@ -718,6 +718,34 @@ private:
     // call. Saved/restored around each callee visit (a nested call sets
     // the OUTER arity while the inner call's own arity is in flight).
     std::ptrdiff_t currentCallArity_ = -1;
+    // fix #7967 (§26.5.1, v0.355): the CALL EXPRESSION the currently-being-
+    // visited MemberAccessExpr belongs to (its enclosing CallExpr, when there
+    // is one). The §26.5.1 APPLICABILITY filter the stdlib §5 block's
+    // candidate is subject to reads the call's ARGUMENT types — "extension
+    // members of the called name that match the call's arity and argument
+    // types" — and the arguments are visited AFTER the callee's member access
+    // is resolved, so the ranking site has no other handle on them. Null
+    // means "no call context" (a bare reference / a property read), which
+    // leaves the argument-type filter un-applied — the sound direction: a
+    // candidate that MIGHT apply is never dropped.
+    // Saved/restored around each callee visit, exactly as `currentCallArity_`.
+    const ast::CallExpr* currentCallExpr_ = nullptr;
+    // fix #7967 (§26.5.1, v0.355): is the stdlib §5 LINQ overload `name` at
+    // `arity` APPLICABLE for the call in flight? The two filters §26.5.1
+    // names: the block-level `where` clause satisfied by the receiver's
+    // inferred element type, and the call's argument types matching the
+    // overload's parameter shape. `elemTy` is the receiver-substituted
+    // `IEnumerable<T>` element type (null = unknown → the candidate is
+    // KEPT); `whereClause` is the §5 overload row's `where` string.
+    bool stdlibLinqCandidateApplicable(std::string_view name,
+                                       std::ptrdiff_t arity,
+                                       const TypeRef* elemTy,
+                                       const std::string& whereClause);
+    // fix #7967 (§26.5.1, v0.355): is the argument a FUNCTION value? The
+    // three-valued answer the §5 overload's `(T) -> …` parameter needs; see
+    // `stdlibLinqCandidateApplicable`'s header in ExprTypecheck.cpp.
+    enum class LinqArgFunctionShape { IsFunction, NotFunction, Unknown };
+    LinqArgFunctionShape linqArgFunctionShape(const ast::Expr* arg);
     // fix #6529: keep-alive for the synthetic `.`-form calls typeCall builds to
     // type a built-in / LINQ `?.` call (their exprType entries are keyed on the
     // node addresses, which must outlive the pass).

@@ -29,7 +29,34 @@
 #include <cstddef>
 #include <string_view>
 
+#include "sema/TypeRef.hpp"  // PrimitiveType — fix #7967's §5.1 INumber conformer set
+
 namespace bezel::sema {
+
+// fix #7967 (§26.5.1, v0.355): the ELEVEN §2.19 `INumber<T>` conformer
+// primitives — the set stdlib §2.19 names exactly ("byte, sbyte, short,
+// ushort, int, uint, long, ulong, float, double, decimal conform to all
+// three"). `char` and `bool` are NOT conformers (`+` is not defined on
+// either), and a nullable `T?` does not satisfy `T: INumber<T>`.
+//
+// This is the ONE definition of the set: `ExprTypecheck_Calls.cpp`'s
+// `isNoSelectorAggregationElem` (the §5.1 `Sum()`/`Average()` result-type
+// keying, #1836/#4695/#4730) forwards to it, and this file's §26.5.1
+// applicability filter reads it — so the filter and the §5.1 gate can never
+// disagree about which element types satisfy `T: INumber<T>`.
+inline bool linqInumberConformerPrimitive(PrimitiveType p) {
+    switch (p) {
+        case PrimitiveType::Byte:  case PrimitiveType::SByte:
+        case PrimitiveType::Short: case PrimitiveType::UShort:
+        case PrimitiveType::Int:   case PrimitiveType::UInt:
+        case PrimitiveType::Long:  case PrimitiveType::ULong:
+        case PrimitiveType::Float: case PrimitiveType::Double:
+        case PrimitiveType::Decimal:
+            return true;
+        default:
+            return false;
+    }
+}
 
 struct StdlibLinqOverload {
     const char* name;

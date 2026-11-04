@@ -14484,6 +14484,156 @@ bool ExprTC::extWhereClauseProvablyViolated(
 // Adding a row to `kStdlibLinqOverloads` is now a one-place edit shared by
 // both readers.
 
+// fix #7967 (§26.5.1, v0.355): the stdlib §5 block's APPLICABILITY filter.
+//
+// §26.5.1: "specificity ranks the APPLICABLE candidates: extension members of
+// the called name that match the call's arity and ARGUMENT TYPES, from blocks
+// whose head matches R, with block-level `where` clauses SATISFIED by the
+// arguments inferred from the receiver. A `where` clause is an applicability
+// filter, never a ranking signal."
+//
+// The §5 block was admitted to the ranking by (name, arity) alone (#3343), so
+// a §5 overload that CANNOT APPLY still entered it — and, its
+// `IEnumerable<T>` head being a subtype of `Object`, it BEAT an applicable
+// user `extension Object` member (§26.5 rule 3's "most specific type wins" is
+// a rule over the APPLICABLE candidates). MEASURED by the issue: an
+// `Array<string>.Sum()` was REFUSED with the §5.1 `T: INumber<T>` diagnostic
+// although the user's `extension Object { Sum() }` was applicable, and an
+// `a.Where("x")` ran the §5 operator (printing garbage and leaking
+// `bz_lazy_where`) although the user's `extension Object { Where(s: string) }`
+// was the only applicable candidate.
+//
+// BOTH filters are PROVABLE-VIOLATION tests — the §26.4 discipline of
+// `extWhereClauseProvablyViolated` (a candidate that MIGHT apply is KEPT), and
+// each one uses the SAME computation the §5 typing path uses for the same
+// constraint, so the filter and the §5 typing path can never disagree about
+// whether a §5 overload applies.
+//
+// (1) THE BLOCK-LEVEL `where` CLAUSE, read off the §5 overload row and
+//     evaluated against the receiver's INFERRED element type T (the §26.5
+//     step-2 substitution — the `IEnumerable<T>` ancestor's type argument).
+//     Only the two constraints this compiler can decide PROVABLY are applied:
+//       * `where T: INumber<T>` — the ELEVEN §2.19 conformer primitives (the
+//         same set the §5.1 `Sum()`/`Average()` gate uses). A primitive
+//         outside that set (`string`, `bool`, `char`) and a nullable
+//         primitive PROVABLY violate it. A class / interface / unresolved
+//         element DEFERS (§14.2: the constraint is checked at the
+//         instantiation), so the candidate is KEPT.
+//       * `where T: hashable` — `isEqualityBearing`, the ONE §3.6 property
+//         computation the `where T: hashable` gate uses. A type it rejects
+//         PROVABLY violates it; an unresolved type-parameter placeholder
+//         DEFERS, so the candidate is KEPT.
+//     `where T: IComparable<T>` is NOT applied here: the §5.1 `Min()`/`Max()`
+//     gate owns that verdict (its class/interface/enum/built-in-value-record
+//     cases are a per-kind computation this filter does not second-guess), so
+//     the candidate is KEPT and the §5 typing path reports it as before.
+//
+// (2) THE CALL'S ARGUMENT TYPES, for the §5 overloads whose parameter is a
+//     FUNCTION value (the `(T) -> …` predicate / selector / key forms — the
+//     arity-1 rows of `common::isLinqElementLambdaOperatorName`, the table
+//     `linqLambdaElementType` seeds a lambda's parameter from, so the two
+//     cannot drift). An argument that PROVABLY is not a function value makes
+//     the §5 overload inapplicable.
+//
+//     The ranking site runs BEFORE the call's arguments are visited (the
+//     callee's member access is resolved first), so an argument's type is
+//     usually not yet computed here. The peek answers from what IS known —
+//     the sema context's type when the argument has already been visited, the
+//     argument's AST shape, and a binding's declared type — and reports
+//     UNKNOWN when it cannot decide. UNKNOWN KEEPS the candidate (the sound
+//     direction).
+// fix #7967 (§26.5.1, v0.355): is the argument a function value? THREE-valued —
+// the answer the §5 overload's `(T) -> …` parameter needs. See the header
+// above for why UNKNOWN is possible and why it keeps the §5 candidate.
+ExprTC::LinqArgFunctionShape ExprTC::linqArgFunctionShape(
+    const ast::Expr* arg) {
+    if (!arg) return LinqArgFunctionShape::Unknown;
+    // The argument has already been visited (the sema context knows its type).
+    if (const TypeRef* t = ctx_.exprType(*arg)) {
+        return t->kind == TypeRef::Kind::Function
+                   ? LinqArgFunctionShape::IsFunction
+                   : LinqArgFunctionShape::NotFunction;
+    }
+    // A lambda literal IS a function value (§27.3).
+    if (dynamic_cast<const ast::LambdaExpr*>(arg))
+        return LinqArgFunctionShape::IsFunction;
+    // A literal is a value of its primitive type — never a function value.
+    if (dynamic_cast<const ast::StringLiteralExpr*>(arg) ||
+        dynamic_cast<const ast::IntLiteralExpr*>(arg) ||
+        dynamic_cast<const ast::BoolLiteralExpr*>(arg) ||
+        dynamic_cast<const ast::FloatLiteralExpr*>(arg) ||
+        dynamic_cast<const ast::CharLiteralExpr*>(arg))
+        return LinqArgFunctionShape::NotFunction;
+    // A BINDING: the scope's symbol carries the DECLARED type. The binding is
+    // not visited yet (the arguments are visited after the callee), so the
+    // sema context has no type for it — the scope is the one place its
+    // declared type is already known.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(arg)) {
+        for (Scope* s = currentScope_; s; s = s->parent) {
+            auto it = s->names.find(id->name);
+            if (it == s->names.end()) continue;
+            const TypeRef* t = nullptr;
+            if (auto* ls = dynamic_cast<LocalSymbol*>(it->second))
+                t = ls->declType;
+            else if (auto* ps = dynamic_cast<ParameterSymbol*>(it->second))
+                t = ps->resolvedDeclType;
+            if (!t) return LinqArgFunctionShape::Unknown;
+            return t->kind == TypeRef::Kind::Function
+                       ? LinqArgFunctionShape::IsFunction
+                       : LinqArgFunctionShape::NotFunction;
+        }
+    }
+    return LinqArgFunctionShape::Unknown;
+}
+
+// fix #7967 (§26.5.1, v0.355): is the stdlib §5 LINQ overload `name` at
+// `arity` APPLICABLE for the call in flight? See the header above.
+bool ExprTC::stdlibLinqCandidateApplicable(std::string_view name,
+                                            std::ptrdiff_t arity,
+                                            const TypeRef* elemTy,
+                                            const std::string& whereClause) {
+    // (1) THE BLOCK-LEVEL `where` CLAUSE — an applicability filter (§26.5.1),
+    // never a ranking signal.
+    if (!whereClause.empty() && elemTy) {
+        if (whereClause == "where T: INumber<T>") {
+            // The ELEVEN §2.19 `INumber<T>` conformer primitives — the same
+            // set the §5.1 `Sum()`/`Average()` gate uses (#4730). A class /
+            // interface element DEFERS (§14.2), so it is not decided here.
+            const bool primitiveElem =
+                elemTy->kind == TypeRef::Kind::Primitive;
+            if (primitiveElem) {
+                const bool conformer =
+                    !elemTy->nullable && linqInumberConformerPrimitive(
+                                             elemTy->primitive);
+                if (!conformer) return false;
+            }
+        } else if (whereClause == "where T: hashable") {
+            // The ONE §3.6 property computation the `where T: hashable` gate
+            // uses. An unresolved type-parameter placeholder DEFERS (§14.2),
+            // so the candidate is KEPT.
+            const bool defers =
+                elemTy->kind == TypeRef::Kind::Error ||
+                (elemTy->kind == TypeRef::Kind::Named &&
+                 !elemTy->declaration && !elemTy->astNode);
+            if (!defers && !isEqualityBearing(elemTy, ctx_)) return false;
+        }
+        // `where T: IComparable<T>` is NOT decided here — see the header.
+    }
+    // (2) THE CALL'S ARGUMENT TYPES — for the §5 overloads whose parameter is
+    // a FUNCTION value.
+    if (arity == 1 && common::isLinqElementLambdaOperatorName(name)) {
+        const ast::Expr* arg = nullptr;
+        if (currentCallExpr_ && currentCallExpr_->args.size() == 1 &&
+            currentCallExpr_->args[0].value)
+            arg = currentCallExpr_->args[0].value.get();
+        if (arg) {
+            const LinqArgFunctionShape shape = linqArgFunctionShape(arg);
+            if (shape == LinqArgFunctionShape::NotFunction) return false;
+        }
+    }
+    return true;
+}
+
 // fix #3343 (§26.5 / §5, v0.278): does `receiver` implement `IEnumerable<T>`
 // for SOME T? Returns the receiver-substituted `IEnumerable<...>` ancestor
 // (a TypeRef in the receiver's interface chain — builtin or user-declared)
@@ -15315,22 +15465,53 @@ Symbol* ExprTC::lookupExtensionMember(
             // type system independently (std::hashable / IComparable<T> are
             // compiler-known conformers for the primitive value types).
             const StdlibLinqOverload* e = stdlibLinqLookup(name, arity);
-            ExtCandidate c;
-            c.isStandardLibraryLinq = true;
-            c.substHead = enumAnc;
-            c.stdHead = "IEnumerable<T>";
-            c.stdWhere = e ? e->where : "";
-            c.member = found[0].member;  // error-recovery fallback mirror
-                                         // the user-extension candidates: if
-                                         // §5 wins the tie at the lookup-
-                                         // return site (it cannot — a §5
-                                         // candidate always ties its user-
-                                         // peers on identical substituted
-                                         // heads — but stay defensive),
-                                         // pick a real symbol to keep
-                                         // downstream typing best-effort.
-            c.binding = found[0].binding;
-            found.push_back(std::move(c));
+            // fix #7967 (§26.5.1, v0.355): the §5 block's APPLICABILITY
+            // FILTER. §26.5.1 ranks "the APPLICABLE candidates" — extension
+            // members "that match the call's arity and argument types, from
+            // blocks whose head matches R, with block-level `where` clauses
+            // satisfied by the arguments inferred from the receiver". The §5
+            // block was admitted here by (name, arity) ALONE, so a §5 overload
+            // that cannot apply still entered the ranking — and, its
+            // `IEnumerable<T>` head being a subtype of `Object`, it BEAT an
+            // applicable user `extension Object` member (§26.5 rule 3's "most
+            // specific type wins" is a rule over the APPLICABLE candidates).
+            //
+            // The filter is applied HERE, at the candidate's admission, so the
+            // §26.5.1 ranking below sees only APPLICABLE candidates — and the
+            // rule-4 ambiguity diagnostic, which reads the same candidate set,
+            // cannot report an ambiguity with a candidate that does not apply.
+            // `elemTy` is the receiver's inferred element type T (the
+            // `IEnumerable<T>` ancestor's type argument — the §26.5 step-2
+            // substitution the `where` clause is evaluated against).
+            const TypeRef* elemTy =
+                (!enumAnc->genericArgs.empty() && enumAnc->genericArgs[0])
+                    ? enumAnc->genericArgs[0]
+                    : nullptr;
+            if (!stdlibLinqCandidateApplicable(name, arity, elemTy,
+                                               e ? e->where : std::string())) {
+                // §5 does NOT apply at this call — the §5 candidate is NOT
+                // admitted, and the ranking below runs over the USER
+                // candidates alone, so the applicable user extension wins
+                // (§26.5 rule 3 / §26.5.1). The lookup stays silent on the
+                // no-candidate case (the caller's own wording owns it).
+            } else {
+                ExtCandidate c;
+                c.isStandardLibraryLinq = true;
+                c.substHead = enumAnc;
+                c.stdHead = "IEnumerable<T>";
+                c.stdWhere = e ? e->where : "";
+                c.member = found[0].member;  // error-recovery fallback mirror
+                                             // the user-extension candidates: if
+                                             // §5 wins the tie at the lookup-
+                                             // return site (it cannot — a §5
+                                             // candidate always ties its user-
+                                             // peers on identical substituted
+                                             // heads — but stay defensive),
+                                             // pick a real symbol to keep
+                                             // downstream typing best-effort.
+                c.binding = found[0].binding;
+                found.push_back(std::move(c));
+            }
         }
     }
     if (found.empty()) {

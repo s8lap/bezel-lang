@@ -105,15 +105,12 @@ const char* primitiveSpellingForDiag(PrimitiveType p) {
 // `ISteppable`/`IParsable` only and `bool` to none, so `Sum()` over them is not
 // well-typed at all (tracked separately — this predicate does not admit them).
 bool isNoSelectorAggregationElem(PrimitiveType p) {
-    using P = PrimitiveType;
-    switch (p) {
-        case P::Byte:  case P::SByte: case P::Short: case P::UShort:
-        case P::Int:   case P::UInt:  case P::Long:  case P::ULong:
-        case P::Float: case P::Double: case P::Decimal:
-            return true;
-        default:
-            return false;
-    }
+    // fix #7967 (§26.5.1, v0.355): the SET now lives in the shared §5 table
+    // header (`linqInumberConformerPrimitive`), so the §5.1 `Sum()`/`Average()`
+    // gate here and the §26.5.1 applicability filter that decides whether the
+    // §5 block's `where T: INumber<T>` candidate applies at all read ONE
+    // definition and cannot disagree.
+    return bezel::sema::linqInumberConformerPrimitive(p);
 }
 
 std::string typeNameForDiag(const TypeRef* t) {
@@ -20309,12 +20306,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     {
                         const ast::Expr* savedCallee = calleeOfCallCtx_;
                         const std::ptrdiff_t savedArity = currentCallArity_;
+                        // fix #7967 (§26.5.1, v0.355): the §5 block's
+                        // applicability filter reads the call's arguments; the
+                        // twin carries them, so it is stashed for the twin's
+                        // member-access resolution exactly as the outer call's
+                        // is stashed for its own.
+                        const ast::CallExpr* savedCallExpr = currentCallExpr_;
                         calleeOfCallCtx_ = dottedPtr;
                         currentCallArity_ =
                             static_cast<std::ptrdiff_t>(synth->args.size());
+                        currentCallExpr_ = synth.get();
                         resolveMemberAccess(*dottedPtr);
                         calleeOfCallCtx_ = savedCallee;
                         currentCallArity_ = savedArity;
+                        currentCallExpr_ = savedCallExpr;
                     }
                     typeCall(*synth);
                     TypeRef* twinTy = ctx_.exprType(*synth);

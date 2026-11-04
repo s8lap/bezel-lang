@@ -12916,6 +12916,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         std::ptrdiff_t savedArity = currentCallArity_;
         currentCallArity_ =
             static_cast<std::ptrdiff_t>(ce->args.size());
+        // fix #7967 (§26.5.1, v0.355): the CALL EXPRESSION itself, for the
+        // §5 block's applicability filter. §26.5.1 ranks the candidates that
+        // "match the call's arity and ARGUMENT TYPES", and the arguments are
+        // visited AFTER the callee's member access is resolved — so the
+        // ranking site has no other handle on the arguments. Stashed here
+        // (and restored with the arity below) for the same window the arity
+        // is stashed for.
+        const ast::CallExpr* savedCallExpr = currentCallExpr_;
+        currentCallExpr_ = ce;
         // fix #3797 (§27.3 / §27.4, v0.286): for an immediately-invoked
         // lambda (`(lambda(params) => body)(args)`), the call's argument
         // types ARE the target-type context §27.4 names ("when the lambda's
@@ -12988,6 +12997,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         pendingLambdaArgContext_ = savedArgCtxIifeCallee;
         pendingLambdaParamTypes_ = savedIifeParams;
         currentCallArity_ = savedArity;
+        currentCallExpr_ = savedCallExpr;
         calleeOfCallCtx_ = savedCallee;
         // per §24: an event-handler argument (`<event>.Subscribe(h)` / .Add /
         // .Remove) — push the event payload type so an untyped handler lambda's
