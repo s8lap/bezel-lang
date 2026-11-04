@@ -14,6 +14,192 @@ namespace bezel::sema {
 
 namespace {
 
+// ---------------------------------------------------------------------------
+// §22.15 rule 6 — the STANDARD LIBRARY's `pure` markers (the ONE source).
+//
+// WHY THIS TABLE EXISTS. The compiler knows a USER member's purity from its
+// declaration (the `pure` modifier) and an IMPORTED member's from the
+// artifact interface (`MetaMember::isPure` → `MemberSymbol::isPure`). A
+// STANDARD-LIBRARY member has neither: the compiler-built-in classes carry
+// NO AST declaration (`TypeRef::declaration` is null) and no artifact, so the
+// callee resolves to NO symbol at all and `callTargetIsPure`'s final arm
+// (`return true;` — "Intrinsic / builtin calls (no AST decl) are admitted")
+// admitted EVERY standard-library call. The same gap admitted every
+// standard-library CONSTRUCTION: the `NewExpr` arm rejected a class only
+// when `rt->declaration->kind == Class`, and a built-in class has no
+// declaration.
+//
+// THE SPEC'S ANSWER. §22.15 "Intrinsic purity (the stdlib contract)": "A
+// standard-library member whose body is runtime-provided MAY carry `pure` …
+// The marker is the library's *stated contract*, normative for the
+// implementation … and trusted by the checker rather than verified from
+// source." Rule 6 then admits a call iff the member is "`pure`-declared or
+// pure-classified", and the prohibited list rejects "class construction —
+// `new C(…)`" outright (admitted only at the throw operand).
+//
+// SO THE SOURCE IS THE LIBRARY'S OWN MARKERS, transcribed from
+// `docs/Bezel_Standard_Library.md` (stdlib v0.350 / v0.353). Every row
+// below cites the section that declares it. A standard-library member that
+// is NOT in this table is NOT pure-declared, and §22.15 rule 6 rejects the
+// call — which is exactly the rule's "iff" reading, and the standard
+// library's own convention (§1): "Everything not so designated is pure
+// computation" applies to the INTERCEPT POINTS (the I/O surfaces), not to
+// the purity marker, which the library states per member.
+//
+// A note on the ARCHITECTURAL HOME: the compiler's ONE built-in table
+// (`src/common/BuiltinRegistry.cpp`'s `kBuiltinParams`) already transcribes
+// the standard library's declared member surfaces; a `pure` column there
+// would be the one-table home for this fact. That file belongs to another
+// lane, so this transcription lives in the file this change owns; the table
+// is written so that folding it into the built-in table is a MOVE, not a
+// REWRITE (the same (head, member) keys).
+// ---------------------------------------------------------------------------
+struct StdlibPureMember {
+    std::string_view head;
+    std::string_view member;
+};
+
+constexpr StdlibPureMember kStdlibPureMembers[] = {
+    // stdlib §2.2 `Math` — the pure arithmetic surface.
+    {"Math", "Abs"},        {"Math", "Sqrt"},     {"Math", "Pow"},
+    {"Math", "Floor"},      {"Math", "Ceiling"},  {"Math", "Round"},
+    {"Math", "Truncate"},   {"Math", "Fmod"},     {"Math", "IEEERemainder"},
+    // stdlib §3.1 `StringBuilder` — the stored-extent read.
+    {"StringBuilder", "Capacity"},
+    // stdlib §3.3 `ReadOnlyStringSpan`.
+    {"ReadOnlyStringSpan", "Capacity"},
+    {"ReadOnlyStringSpan", "Length"},
+    {"ReadOnlyStringSpan", "Source"},
+    {"ReadOnlyStringSpan", "Start"},
+    {"ReadOnlyStringSpan", "IsEmpty"},
+    {"ReadOnlyStringSpan", "Slice"},
+    {"ReadOnlyStringSpan", "IndexOf"},
+    {"ReadOnlyStringSpan", "Contains"},
+    {"ReadOnlyStringSpan", "StartsWith"},
+    {"ReadOnlyStringSpan", "EndsWith"},
+    {"ReadOnlyStringSpan", "SequenceEqual"},
+    {"ReadOnlyStringSpan", "ToString"},
+    // stdlib §4.1 / §4.2 — the collection interfaces' `Count` (the one
+    // `pure`-declared member of the borrowing and owning interfaces).
+    {"IReadOnlyCollection", "Count"},
+    {"IReadOnlyList", "Count"},
+    {"ICollection", "Count"},
+    {"IList", "Count"},
+    {"IOwningCollection", "Count"},
+    {"IOwningList", "Count"},
+    // stdlib §4.4 `Array<T>` / §4.5 `OwningArray<T>`.
+    {"Array", "Count"},      {"Array", "Capacity"},
+    {"OwningArray", "Count"}, {"OwningArray", "Capacity"},
+    // stdlib §4.6 `LinkedList<T>` / §4.7 `OwningLinkedList<T>`.
+    {"LinkedList", "Count"},      {"LinkedList", "FirstNode"},
+    {"LinkedList", "LastNode"},   {"LinkedList", "First"},
+    {"LinkedList", "Last"},
+    {"OwningLinkedList", "Count"}, {"OwningLinkedList", "FirstNode"},
+    {"OwningLinkedList", "LastNode"}, {"OwningLinkedList", "First"},
+    {"OwningLinkedList", "Last"},
+    // stdlib §4.8 `Dictionary<K,V>` / §4.9 `OwningDictionary<K,V>`.
+    {"Dictionary", "Count"},      {"OwningDictionary", "Count"},
+    // stdlib §4.10 `Set<T>` / `OwningSet<T>` — the `Count` they inherit from
+    // §4.1's `IReadOnlyCollection<T>`.
+    {"Set", "Count"},      {"OwningSet", "Count"},
+    // stdlib §4.11 — the stack/queue surfaces (`Count` inherited; `Peek`
+    // pure-declared on the borrowing and the owning family alike).
+    {"Stack", "Count"},     {"Stack", "Peek"},
+    {"OwningStack", "Count"}, {"OwningStack", "Peek"},
+    {"Queue", "Count"},     {"Queue", "Peek"},
+    {"OwningQueue", "Count"}, {"OwningQueue", "Peek"},
+    // stdlib §4.14 `OwningBuffer<T>` — the immutable-once-allocated extent.
+    {"OwningBuffer", "Length"},
+    // stdlib §4.17 `SortedDictionary<K,V>` / §4.18 `SortedSet<T>`.
+    {"SortedDictionary", "Count"},      {"SortedDictionary", "FirstKey"},
+    {"SortedDictionary", "LastKey"},
+    {"SortedSet", "Count"}, {"SortedSet", "First"}, {"SortedSet", "Last"},
+    // stdlib §4.19 `FrozenArray<T>` declares no `Count` (it conforms to
+    // `IEnumerable<T>` alone), so it carries no row here.
+    // stdlib §4.20 `Counter<K>` / §4.21 `OwningSlotMap<T>`.
+    {"Counter", "Count"},      {"Counter", "Total"},
+    {"OwningSlotMap", "Count"},
+    // stdlib §8.2 `Debug` — the parse/format surface (the WRITE surface is
+    // not pure).
+    {"Debug", "Parse"}, {"Debug", "ParseOrNull"}, {"Debug", "ToString"},
+    {"Debug", "CompareTo"},
+    // stdlib §9.1 — the integer types (`int` / `long` heads).
+    {"int", "Parse"}, {"int", "ParseOrNull"}, {"int", "ToString"},
+    {"int", "CompareTo"},
+    {"long", "Parse"}, {"long", "ParseOrNull"}, {"long", "ToString"},
+    {"long", "CompareTo"},
+    // stdlib §9.2 `Double` / `Float`.
+    {"double", "IsNaN"}, {"double", "IsInfinity"},
+    {"double", "IsPositiveInfinity"}, {"double", "IsNegativeInfinity"},
+    {"double", "IsFinite"}, {"double", "Parse"}, {"double", "ParseOrNull"},
+    {"double", "IeeeEquals"}, {"double", "BitwiseEquals"},
+    {"double", "ToString"}, {"double", "CompareTo"},
+    // stdlib §9.3 `Decimal`.
+    {"decimal", "Parse"}, {"decimal", "ParseOrNull"}, {"decimal", "ToString"},
+    {"decimal", "CompareTo"}, {"decimal", "Round"},
+    // stdlib §9.4 `Boolean`.
+    {"bool", "Parse"}, {"bool", "ParseOrNull"}, {"bool", "ToString"},
+    // stdlib §9.5 `Char`.
+    {"char", "IsDigit"}, {"char", "IsLetter"}, {"char", "IsLetterOrDigit"},
+    {"char", "IsWhiteSpace"}, {"char", "IsUpper"}, {"char", "IsLower"},
+    {"char", "IsControl"}, {"char", "IsPunctuation"}, {"char", "ToUpper"},
+    {"char", "ToLower"}, {"char", "Parse"}, {"char", "ParseOrNull"},
+    {"char", "ToString"}, {"char", "CompareTo"},
+    // stdlib §9.6 `String`.
+    {"string", "Length"}, {"string", "IsEmpty"}, {"string", "IsAscii"},
+    {"string", "From"}, {"string", "Repeat"}, {"string", "IsNullOrWhiteSpace"},
+    {"string", "Contains"}, {"string", "StartsWith"}, {"string", "EndsWith"},
+    {"string", "IndexOf"}, {"string", "LastIndexOf"}, {"string", "Substring"},
+    {"string", "AsSpan"}, {"string", "Trim"}, {"string", "TrimStart"},
+    {"string", "TrimEnd"}, {"string", "ToUpper"}, {"string", "ToLower"},
+    {"string", "Replace"}, {"string", "PadLeft"}, {"string", "PadRight"},
+    {"string", "PadCenter"}, {"string", "Insert"}, {"string", "Remove"},
+    {"string", "CompareTo"}, {"string", "Equals"}, {"string", "GetHashCode"},
+    {"string", "ToString"},
+    // stdlib §9.8 `Range<T>` — the recomputed reads carry the marker; the
+    // stored-slot reads are pure by §22.15's classification rule.
+    {"Range", "IsOpenEnded"}, {"Range", "IsEmpty"}, {"Range", "Contains"},
+    {"Range", "Start"}, {"Range", "End"}, {"Range", "Step"},
+    {"Range", "IsEndInclusive"},
+};
+
+// The INDEXER rows are keyed by the head alone: an indexer access carries no
+// member name at the site. (fix #7453: NO indexer row is transcribed here —
+// #3721's own structural note established that a built-in indexer read is
+// not rule 6's accessor-read business, and its T3 control row pins that
+// admit. A built-in indexer is left as #3721 left it.)
+
+bool stdlibMemberIsPure(std::string_view head, std::string_view member) {
+    for (const auto& e : kStdlibPureMembers)
+        if (e.head == head && e.member == member) return true;
+    return false;
+}
+
+// The head of a COMPILER-BUILT-IN receiver, or "" when the receiver is a
+// user-declared (or imported) type — the only case where the declaration-
+// based purity predicates (which carry the `pure` modifier) are the
+// authority.
+//
+// TWO SHAPES. An INSTANCE receiver (`sb` of type `StringBuilder`, `a` of
+// type `Array<int>`, `s` of type `string`) resolves to a TypeRef whose
+// `declaration` is null — the built-in has no AST declaration — so the head
+// is the TypeRef's own `headName()` (alias-transparent, so `type Al :=
+// Array<int>` reads the same). A STATIC-CLASS receiver (`Console`, `Math`,
+// `Convert`) has no value type at all: `ctx_.exprType` is null and the
+// identifier carries the CLASS SYMBOL.
+std::string_view builtinReceiverHead(const TypeRef* rt, Symbol* recvSym) {
+    if (rt) {
+        if (rt->kind != TypeRef::Kind::Named &&
+            rt->kind != TypeRef::Kind::Primitive)
+            return {};
+        if (rt->kind == TypeRef::Kind::Named && rt->declaration) return {};
+        std::string_view h = rt->headName();
+        return h;
+    }
+    if (auto* ts = dynamic_cast<TypeSymbol*>(recvSym)) return ts->name;
+    return {};
+}
+
 // §22.15 (v0.202, #2052) — the closed-body checker. A `PureBodyWalker` is
 // constructed per pure member and walks its statements/expressions.
 //
@@ -75,6 +261,14 @@ private:
     // NOT apply to clauses), and the violation's `operation` prefix is
     // "a contract clause's expression" rather than "a pure body".
     bool clauseMode_ = false;
+
+    // fix #7453 (§22.15 rule 6): true while the walker is inside a CALL's
+    // CALLEE expression, so a member access reached that way is reported as
+    // a "call to a standard-library member" rather than as an accessor
+    // read — the same access, named by the position it was reached from.
+    // Saved and restored around the callee recursion, so an argument's own
+    // member access is not read as a callee.
+    bool inCallee_ = false;
 
     // §22.15 "the closed list's contrapositive": any store whose target
     // root leaves the frame is rejected (instance/static field, indexer
@@ -1142,7 +1336,12 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
         }
         // Recurse into callee + args. The callee itself may be a member
         // access (which involves reads — fine).
-        checkExpr(ce->callee.get());
+        {
+            const bool savedCallee = inCallee_;
+            inCallee_ = true;
+            checkExpr(ce->callee.get());
+            inCallee_ = savedCallee;
+        }
         for (const auto& a : ce->args)
             if (a.value) checkExpr(a.value.get());
         // §22.15 contrapositive: an `owned` argument is owned-consuming.
@@ -1202,6 +1401,36 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
                         "disqualifying class-typed field so the record is "
                         "auto-hashable)");
                 }
+            } else if (rt && rt->kind == TypeRef::Kind::Named &&
+                       !rt->declaration &&
+                       !common::builtinClassModulePathOf(rt->headName())
+                            .empty()) {
+                // fix #7453 (§22.15, the prohibited list): "class
+                // construction — `new C(…)`" is rejected in a pure body,
+                // "admitted only at the throw operand". The arm above
+                // reaches only a USER class (a built-in class carries no
+                // AST declaration, so `rt->declaration` is null), which
+                // left every standard-library construction — `new
+                // StringBuilder()`, `new Array<int>()` — admitted. §22.15's
+                // prohibition is on CLASS construction as such, not on
+                // user-written constructors: a standard-library class's
+                // constructor is runtime code just as a user class's is,
+                // and its instance drags in the same discharge machinery.
+                //
+                // The test is the compiler's own built-in CLASS table
+                // (`common::builtinClassModulePathOf`, the 88-row §8.5
+                // table), so a built-in RECORD (`Range<T>`,
+                // `ReadOnlyStringSpan`) and the primitive records are NOT
+                // caught here — rule 3 admits record construction, and the
+                // record's own classification decides it.
+                reportPureViolation(
+                    ne->span.begin, "standard-library class construction",
+                    std::string("`new ") + std::string(rt->headName()) +
+                        "(...)` constructs a standard-library class — "
+                        "§22.15's prohibited list rejects class "
+                        "construction in a pure body (admitted only at the "
+                        "throw operand, whose carve-out requires a pure "
+                        "ctor + a trivial-dispose class)");
             }
         }
         for (const auto& a : ne->args)
@@ -1240,6 +1469,40 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
                     std::string("the resolved target `") +
                         std::string(ps->name) +
                         "` is not pure-declared (§22.15 rule 6 / #3630)");
+            }
+        } else if (!ctx_.exprSymbol(*e)) {
+            // §22.15 rule 6, the STANDARD-LIBRARY arm (fix #7453). A
+            // member access on a COMPILER-BUILT-IN receiver resolves to NO
+            // symbol — the built-in carries no AST declaration — so the
+            // declaration-based predicates above cannot answer rule 6's
+            // question, and the member was admitted unconditionally. The
+            // standard library's OWN `pure` marker is the authority
+            // (§22.15 "Intrinsic purity (the stdlib contract)"), so the
+            // member is admitted only where that marker is stated.
+            //
+            // The `else` keeps the two arms disjoint: a member access that
+            // DOES resolve to a symbol is a user-declared or imported
+            // member, whose purity the `PropertySymbol` arm above (and the
+            // CallExpr arm's `callTargetIsPure`) reads from the declaration
+            // or the artifact interface.
+            const std::string_view head = builtinReceiverHead(
+                ctx_.exprType(*ma->target), ctx_.exprSymbol(*ma->target));
+            if (!head.empty() &&
+                !stdlibMemberIsPure(head, ma->member)) {
+                reportPureViolation(
+                    e->span.begin,
+                    inCallee_ ? "call to a standard-library member"
+                               : "accessor read of a standard-library member",
+                    std::string("the standard library does not declare `") +
+                        std::string(head) + "." + std::string(ma->member) +
+                        "` pure — §22.15 rule 6 admits a call only when the "
+                        "resolved member is pure-declared (a standard-library "
+                        "member carries the marker the library states for it; "
+                        "§22.15 \"Intrinsic purity (the stdlib contract)\")");
+                // The access chain is rejected; do not descend into the
+                // target (a second report on the same chain would blame
+                // the wrong link).
+                return;
             }
         }
         checkExpr(ma->target.get());
@@ -1299,6 +1562,15 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
                     "pure-declared (§22.15 rule 6 / #3721)");
             }
         }
+        // NOTE (fix #7453): a BUILTIN indexer read (`a[0]` over an
+        // `Array<T>`, a span, a string) is deliberately NOT checked here.
+        // #3721's own structural note established that a builtin index
+        // resolves no user `PropertySymbol`, so rule 6's accessor-read arm
+        // is a no-op for every builtin shape, and its T3 control row
+        // (`builtin_array_index_admitted_in_pure_body_3721_control`) pins
+        // that admit. Extending rule 6 to the built-in indexers is a
+        // SEPARATE question from #7453's (a standard-library CALL and a
+        // standard-library CONSTRUCTION); it is not taken here.
         checkExpr(ix->target.get());
         for (const auto& i : ix->indices)
             if (i.value) checkExpr(i.value.get());
