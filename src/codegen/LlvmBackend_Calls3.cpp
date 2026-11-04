@@ -3228,6 +3228,42 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         !dictRecv && !igrpRecv && !orderedEnumRecv)
         return nullptr;
 
+    // fix #7969 (§26.5 rules 1-2 / §26.5.1, v0.355): every arm of this
+    // function is reached by NAME, and each of them MATERIALISES the receiver
+    // into a lazy enumerator (`bz_lazy_from_array` / `bz_lazy_from_llist` /
+    // …) — a heap allocation the §5 pipeline owns. A USER EXTENSION named
+    // like a §5 operator (a §26.5 rule 2 candidate that rule 3 / §26.5.1
+    // selected over the §5 block) reached this function, the receiver was
+    // materialised into a lazy source, and the arm then found no §5 shape to
+    // lower (the extension's arity is 0; §5's `Select` takes 1) and returned
+    // nullptr — so the extension's own lowering ran and the materialised lazy
+    // source was LEAKED. MEASURED on the issue's own probes: 27 876 bytes in
+    // 202 allocations for a 100-iteration `a.Select()` loop
+    // (`extension Array<T>`) and 276 bytes in 2 allocations for a single call
+    // (`extension Object`).
+    //
+    // THE DISCRIMINATOR IS SEMA'S CHOSEN CALLEE, NOT THE NAME. §26.5 rule 2
+    // admits the extension blocks and rule 3 / §26.5.1 select among the
+    // APPLICABLE candidates; when sema bound the call to an extension member,
+    // that member IS the answer, and this function must decline so the
+    // extension's own lowering runs. The decline happens BEFORE any receiver
+    // IR is emitted (§22.5: an operand is evaluated once; §26.7: the receiver
+    // is evaluated once), so the leak goes away rather than merely shrinking.
+    //
+    // §26.5 rule 1's commitment is respected: a name the receiver's own
+    // DECLARED SURFACE declares is the instance member's (stdlib §4.4's
+    // `Array<T>.Reverse()` / `ToArray()`), and the extension blocks are never
+    // consulted for it — so the §5 arm keeps answering there.
+    {
+        auto* msL =
+            dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+        if (isExtensionMethod(msL)) {
+            const std::string_view headX = builtinTypeName(recvTy);
+            if (!common::concreteCollectionHeadDeclares(headX, m))
+                return nullptr;
+        }
+    }
+
     // Element LLVM type for the receiver's element TypeRef.
     auto elemLlvmOf = [&](sema::TypeRef* er) -> llvm::Type* {
         if (er) if (auto* t = lowerTypeRef(er)) return t;
