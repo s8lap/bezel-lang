@@ -31,11 +31,15 @@
     PARENS.contains = ['self'].concat(PLAIN);
     var METHOD_TITLE = { className: 'title', begin: /\bmethod\s+/, end: /[A-Za-z_][A-Za-z0-9_]*/, excludeBegin: true };
 
-    // old( inside an `ensures (...)` clause
-    var OLD = CTX(/\bold\b(?=\s*\()/);
+    // old( inside an `ensures (...)` clause,
+    // and `result`, which reads as the keyword throughout the clause; `x.result` is a member
+    var MEMBER = { begin: /\.[A-Za-z_][A-Za-z0-9_]*/ };
+    var IN_ENSURES = [MEMBER, CTX(/\bold\b(?=\s*\()/), CTX(/\bresult\b/)];
     var ENSURES_PARENS = { begin: /\(/, end: /\)/, keywords: KEYWORDS };
-    ENSURES_PARENS.contains = ['self', OLD].concat(PLAIN);
-    var ENSURES = { begin: /\bensures\s*\(/, end: /\)/, keywords: KEYWORDS, contains: [ENSURES_PARENS, OLD].concat(PLAIN) };
+    var ENSURES_CASE = { begin: /\bcase\b/, end: /\bof\b|(?=;|=>|\bend\b)/, keywords: KW('of') };
+    ENSURES_PARENS.contains = ['self', ENSURES_CASE].concat(IN_ENSURES, PLAIN);
+    ENSURES_CASE.contains = [ENSURES_PARENS].concat(IN_ENSURES, PLAIN);
+    var ENSURES = { begin: /\bensures\s*\(/, end: /\)/, keywords: KEYWORDS, contains: [ENSURES_PARENS, ENSURES_CASE].concat(IN_ENSURES, PLAIN) };
     // `of` closing a `case` head, on any line; the head gives up at `;`, `=>` or `end`
     var CASE = { begin: /\bcase\b/, end: /\bof\b|(?=;|=>|\bend\b)/, keywords: KW('of'), contains: [PARENS].concat(PLAIN) };
     // `step` after a range a..b / a..<b
@@ -85,7 +89,7 @@
       begin: /\bwhere(?=\s+[A-Za-z_][A-Za-z0-9_]*\s*:)/,
       end: /(?=[;{\n=]|\b(?:constructor|destructor|extension|interface|invariant|protected|abstract|continue|internal|override|property|readonly|requires|decimal|default|ensures|finally|private|virtual|choice|closed|double|extern|import|lambda|method|module|nameof|public|record|return|sealed|static|string|typeof|ushort|async|await|break|catch|const|false|float|owned|sbyte|short|throw|ulong|using|where|while|yield|base|bool|byte|case|char|elif|else|enum|long|move|null|then|this|true|type|uint|when|with|and|end|for|int|mod|not|out|ref|try|var|as|do|if|in|is|or)\b)/,
       keywords: KEYWORDS,
-      contains: COMMENTS.concat([GENERIC_ARGS, CTX(/\b(?:hashable|sendable|notnull|value)\b(?![\w.<]|\s*:)/), TYPE])
+      contains: COMMENTS.concat([GENERIC_ARGS, MEMBER, CTX(/\b(?:hashable|sendable|notnull|value)\b(?![\w.<]|\s*:)/), TYPE])
     };
     return {
       name: 'Bezel',

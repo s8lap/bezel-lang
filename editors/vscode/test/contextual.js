@@ -1,6 +1,6 @@
 // Checks that the generated TextMate grammar colours Bezel's contextual keywords (spec Appendix
 // B.2) only in their positions: every «word» in test/contextual-fixtures.js must get a keyword or
-// storage scope and every ‹word› must not. Usage (from editors/vscode):
+// storage scope, every ‹word› must not, and no ⟪code⟫ may be inside a string or comment. Usage (from editors/vscode):
 //   npm install --no-save vscode-textmate@9 vscode-oniguruma@2
 //   node test/contextual.js
 const fs = require('fs');
@@ -29,13 +29,16 @@ const isKeyword = (scope) => /^(keyword|storage)\./.test(scope) && !scope.starts
   for (const fixture of require('./contextual-fixtures')) {
     const { code, marks } = parse(fixture);
     // innermost scope of every character offset
-    const scopeAt = [];
+    const scopeAt = [], stackAt = [];
     let state = vsctm.INITIAL;
     let base = 0;
     for (const line of code.split('\n')) {
       const r = grammar.tokenizeLine(line, state);
       for (const t of r.tokens) {
-        for (let i = t.startIndex; i < t.endIndex; i++) scopeAt[base + i] = t.scopes[t.scopes.length - 1];
+        for (let i = t.startIndex; i < t.endIndex; i++) {
+          scopeAt[base + i] = t.scopes[t.scopes.length - 1];
+          stackAt[base + i] = t.scopes;
+        }
       }
       state = r.ruleStack;
       base += line.length + 1;
@@ -43,6 +46,11 @@ const isKeyword = (scope) => /^(keyword|storage)\./.test(scope) && !scope.starts
     for (const m of marks) {
       checked++;
       const scope = scopeAt[m.start] || 'source.bezel';
+      if (m.kind === 'code') {
+        const inside = (stackAt[m.start] || []).find((s) => /^(string|comment)\./.test(s));
+        if (inside) bad.push(`${JSON.stringify(fixture)}: \`${m.word}\` at ${m.start} is inside ${inside}`);
+        continue;
+      }
       const same = scopeAt.slice(m.start, m.end).every((s) => s === scopeAt[m.start]);
       if (m.keyword !== isKeyword(scope) || !same) {
         bad.push(`${JSON.stringify(fixture)}: \`${m.word}\` at ${m.start} has ${scope}, expected ` +

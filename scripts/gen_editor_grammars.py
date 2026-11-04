@@ -56,16 +56,18 @@ CATEGORIES = [TYPES, CONSTANTS, VARIABLES, MODIFIERS, DECLARATIONS, WORD_OPERATO
 # Contextual keywords (B.2) are identifiers outside their positions, so the
 # grammars colour them only where the position is recognisable lexically, and
 # prefer leaving a keyword plain to colouring an identifier. Every B.2 keyword
-# is covered except two whose position depends on an enclosing declaration
+# is covered except one whose position depends on an enclosing declaration
 # rather than on the tokens around it: `value` as the implicit setter parameter
-# (it is an ordinary parameter name there, B.2's note) and `result` inside an
-# `ensures` clause. Both stay plain everywhere. The contexts, all from B.2 and
-# the Appendix A production named:
+# (an ordinary parameter name there, B.2's note), which stays plain; `value` is
+# coloured only as a constraint. The contexts, all from B.2 and the Appendix A
+# production named:
 #   value notnull sendable hashable  a `where T:` constraint list (Constraint)
 #   pure      the member-modifier slot and `pure get` (MethodDecl, Accessor, ...)
 #   scoped    a field/parameter modifier and the call-site marker `f(scoped x)`
 #   get set   accessor heads and the `private set` auto-property shorthand
 #   old       `old(` inside an `ensures (...)` clause
+#   result    anywhere inside an `ensures (...)` clause (its keyword reading always
+#             wins there, B.2); not after a `.`
 #   of        closing a `case` head, on the same or a later line (CaseStmt/CaseExpr)
 #   step      after a range `a..b` / `a..<b` (Range)
 #   convention, env, variadic   inside an `extern "lib"` block (ExternBlock)
@@ -75,9 +77,9 @@ CATEGORIES = [TYPES, CONSTANTS, VARIABLES, MODIFIERS, DECLARATIONS, WORD_OPERATO
 #   operator  after `static method`, after `static` (IfaceStaticOperator) and
 #             in `end operator +;` (OperatorBody), each followed by an OpToken
 CONTEXT_CONSTRAINTS = {'value', 'notnull', 'sendable', 'hashable'}
-CONTEXT_POSITIONAL = {'pure', 'scoped', 'get', 'set', 'old', 'of', 'step', 'convention', 'env',
-                      'variadic', 'symbol', 'serialized', 'equality', 'polymorphic', 'operator'}
-CONTEXT_LEFT_PLAIN = {'result'}   # `value` is also the setter parameter; see above
+CONTEXT_POSITIONAL = {'pure', 'scoped', 'get', 'set', 'old', 'result', 'of', 'step', 'convention',
+                      'env', 'variadic', 'symbol', 'serialized', 'equality', 'polymorphic',
+                      'operator'}
 VISIBILITY = ['public', 'private', 'protected', 'internal']
 OP_TOKEN = r'<<|>>|<=|>=|<>|\bmod\b|[-+*/&|^<>=~]'   # A.4 OpToken
 STR = r'"(?:[^"\\\n]|\\.)*"'                       # a plain string literal
@@ -116,7 +118,7 @@ def tm_contextual(reserved, contextual):
          'captures': {'1': {'name': 'keyword.other.bezel'}, '2': {'name': 'entity.name.type.parameter.bezel'},
                       '4': {'patterns': [
                           {'match': r'<.*>', 'captures': {'0': {'patterns': [{'include': '$self'}]}}},
-                          {'match': r'\b(?:' + words(CONTEXT_CONSTRAINTS & contextual) + r')\b(?![\w.])',
+                          {'match': r'(?<!\.)\b(?:' + words(CONTEXT_CONSTRAINTS & contextual) + r')\b(?![\w.])',
                            'name': ctx},
                           {'include': '$self'}]}}},
         # `pure` in the member-modifier slot (A.4 MethodDecl, PropertyDecl, IndexerDecl,
@@ -130,19 +132,14 @@ def tm_contextual(reserved, contextual):
          'captures': {'1': {'patterns': [{'include': '#keywords'}]}, '2': {'name': mod}, '3': {'name': ctx}}},
         {'match': r'\b(' + vis + r')\s+(get|set)\b(?=\s*(?:;|:=|=>|\(\s*owned\s*\)))',
          'captures': {'1': {'name': 'storage.modifier.bezel'}, '2': {'name': ctx}}},
-        # `old(` only inside an `ensures (...)` clause (A.4 ContractClause, §22.16)
+        # `old(` and `result` only inside an `ensures (...)` clause (A.4 ContractClause, §22.16)
         {'begin': r'\b(ensures)\s*(\()', 'end': r'\)',
          'beginCaptures': {'1': {'name': 'keyword.other.bezel'}},
          'patterns': [{'include': '#ensures-body'}]},
-        # `of` closes a `case` head (A.6 CaseStmt, A.7 CaseExpr): on the same line, or — when
-        # the line holds no `of` — on a later one. The multi-line head gives up at `;`, `=>` or
-        # `end`, so a head missing its `of` colours nothing after it.
-        {'match': r'\b(case)\b((?:(?!\bof\b|//|/\*).)*?)\b(of)\b',
-         'captures': {'1': {'name': 'keyword.control.bezel'},
-                      '2': {'patterns': [{'include': '$self'}]},
-                      '3': {'name': 'keyword.control.contextual.bezel'}}},
-        {'begin': r'\b(case)\b(?=(?:(?!\bof\b|//|/\*).)*(?://.*)?$)',
-         'end': r'\b(of)\b|(?=;|=>|\bend\b)',
+        # `of` closes a `case` head (A.6 CaseStmt, A.7 CaseExpr), on the same line or a later
+        # one. The head is a begin/end scope so strings and comments in it nest; it gives up at
+        # `;`, `=>` or `end`, so a head missing its `of` colours nothing after it.
+        {'begin': r'\b(case)\b', 'end': r'\b(of)\b|(?=;|=>|\bend\b)',
          'beginCaptures': {'1': {'name': 'keyword.control.bezel'}},
          'endCaptures': {'1': {'name': 'keyword.control.contextual.bezel'}},
          'patterns': [{'include': '$self'}]},
@@ -251,13 +248,19 @@ def tm_grammar(reserved, contextual):
                                        '2': {'name': 'entity.name.label.bezel'}}},
             'contextual': {'patterns': tm_contextual(reserved, contextual)},
             'ensures-body': {'patterns': [
-                {'match': r'\b(old)(?=\s*\()', 'name': 'keyword.other.contextual.bezel'},
+                {'match': r'(?<!\.)\b(old)(?=\s*\()', 'name': 'keyword.other.contextual.bezel'},
+                # `result` reads as the keyword throughout the clause (B.2); `x.result` is a member
+                {'match': r'(?<!\.)\b(result)\b', 'name': 'keyword.other.contextual.bezel'},
                 {'begin': r'\(', 'end': r'\)', 'patterns': [{'include': '#ensures-body'}]},
+                {'begin': r'\b(case)\b', 'end': r'\b(of)\b|(?=;|=>|\bend\b)',
+                 'beginCaptures': {'1': {'name': 'keyword.control.bezel'}},
+                 'endCaptures': {'1': {'name': 'keyword.control.contextual.bezel'}},
+                 'patterns': [{'include': '#ensures-body'}]},
                 {'include': '$self'}]},
             'extern-body': {'patterns': [
                 # the user-data marker: a bare `env` list element; `env:` is a parameter named env
                 # and `: env` a type, both identifiers (B.2, A.3 ExternParam)
-                {'match': r'(?:(?<=[(,])|^)\s*\b(env)\b(?=\s*[,)])',
+                {'match': r'(?:(?<=[(,<])|^)\s*\b(env)\b(?=\s*[,)])',
                  'captures': {'1': {'name': 'keyword.other.contextual.bezel'}}},
                 {'match': r'\b(variadic)\s*(?=\(\s*[0-9])', 'captures': {'1': {'name': 'keyword.other.contextual.bezel'}}},
                 {'include': '$self'}]},
@@ -326,11 +329,15 @@ def hljs_language(reserved, contextual):
     PARENS.contains = ['self'].concat(PLAIN);
     var METHOD_TITLE = { className: 'title', begin: /\bmethod\s+/, end: /[A-Za-z_][A-Za-z0-9_]*/, excludeBegin: true };
 
-    // old( inside an `ensures (...)` clause
-    var OLD = CTX(/\bold\b(?=\s*\()/);
+    // old( inside an `ensures (...)` clause,
+    // and `result`, which reads as the keyword throughout the clause; `x.result` is a member
+    var MEMBER = { begin: /\.[A-Za-z_][A-Za-z0-9_]*/ };
+    var IN_ENSURES = [MEMBER, CTX(/\bold\b(?=\s*\()/), CTX(/\bresult\b/)];
     var ENSURES_PARENS = { begin: /\(/, end: /\)/, keywords: KEYWORDS };
-    ENSURES_PARENS.contains = ['self', OLD].concat(PLAIN);
-    var ENSURES = { begin: /\bensures\s*\(/, end: /\)/, keywords: KEYWORDS, contains: [ENSURES_PARENS, OLD].concat(PLAIN) };
+    var ENSURES_CASE = { begin: /\bcase\b/, end: /\bof\b|(?=;|=>|\bend\b)/, keywords: KW('of') };
+    ENSURES_PARENS.contains = ['self', ENSURES_CASE].concat(IN_ENSURES, PLAIN);
+    ENSURES_CASE.contains = [ENSURES_PARENS].concat(IN_ENSURES, PLAIN);
+    var ENSURES = { begin: /\bensures\s*\(/, end: /\)/, keywords: KEYWORDS, contains: [ENSURES_PARENS, ENSURES_CASE].concat(IN_ENSURES, PLAIN) };
     // `of` closing a `case` head, on any line; the head gives up at `;`, `=>` or `end`
     var CASE = { begin: /\bcase\b/, end: /\bof\b|(?=;|=>|\bend\b)/, keywords: KW('of'), contains: [PARENS].concat(PLAIN) };
     // `step` after a range a..b / a..<b
@@ -380,7 +387,7 @@ def hljs_language(reserved, contextual):
       begin: /\bwhere(?=\s+[A-Za-z_][A-Za-z0-9_]*\s*:)/,
       end: /(?=[;{\n=]|\b(?:@WHERE_END@)\b)/,
       keywords: KEYWORDS,
-      contains: COMMENTS.concat([GENERIC_ARGS, CTX(/\b(?:@CONSTRAINTS@)\b(?![\w.<]|\s*:)/), TYPE])
+      contains: COMMENTS.concat([GENERIC_ARGS, MEMBER, CTX(/\b(?:@CONSTRAINTS@)\b(?![\w.<]|\s*:)/), TYPE])
     };
     return {
       name: 'Bezel',
@@ -426,7 +433,7 @@ def main():
         problems.append(f'Appendix B.1 reserves `{w}`, which has no colour category in this script')
     for w in sorted(known - reserved):
         problems.append(f'category table lists `{w}`, which Appendix B.1 no longer reserves')
-    ctx_known = CONTEXT_CONSTRAINTS | CONTEXT_POSITIONAL | CONTEXT_LEFT_PLAIN
+    ctx_known = CONTEXT_CONSTRAINTS | CONTEXT_POSITIONAL
     for w in sorted(ctx_known - contextual):
         problems.append(f'contextual table lists `{w}`, which Appendix B.1 does not name as contextual')
     for w in sorted(contextual - ctx_known):

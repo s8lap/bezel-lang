@@ -266,7 +266,7 @@
                   }
                 },
                 {
-                  "match": "\\b(?:hashable|sendable|notnull|value)\\b(?![\\w.])",
+                  "match": "(?<!\\.)\\b(?:hashable|sendable|notnull|value)\\b(?![\\w.])",
                   "name": "keyword.other.contextual.bezel"
                 },
                 {
@@ -328,25 +328,7 @@
           ]
         },
         {
-          "match": "\\b(case)\\b((?:(?!\\bof\\b|//|/\\*).)*?)\\b(of)\\b",
-          "captures": {
-            "1": {
-              "name": "keyword.control.bezel"
-            },
-            "2": {
-              "patterns": [
-                {
-                  "include": "$self"
-                }
-              ]
-            },
-            "3": {
-              "name": "keyword.control.contextual.bezel"
-            }
-          }
-        },
-        {
-          "begin": "\\b(case)\\b(?=(?:(?!\\bof\\b|//|/\\*).)*(?://.*)?$)",
+          "begin": "\\b(case)\\b",
           "end": "\\b(of)\\b|(?=;|=>|\\bend\\b)",
           "beginCaptures": {
             "1": {
@@ -502,12 +484,35 @@
     "ensures-body": {
       "patterns": [
         {
-          "match": "\\b(old)(?=\\s*\\()",
+          "match": "(?<!\\.)\\b(old)(?=\\s*\\()",
+          "name": "keyword.other.contextual.bezel"
+        },
+        {
+          "match": "(?<!\\.)\\b(result)\\b",
           "name": "keyword.other.contextual.bezel"
         },
         {
           "begin": "\\(",
           "end": "\\)",
+          "patterns": [
+            {
+              "include": "#ensures-body"
+            }
+          ]
+        },
+        {
+          "begin": "\\b(case)\\b",
+          "end": "\\b(of)\\b|(?=;|=>|\\bend\\b)",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.control.bezel"
+            }
+          },
+          "endCaptures": {
+            "1": {
+              "name": "keyword.control.contextual.bezel"
+            }
+          },
           "patterns": [
             {
               "include": "#ensures-body"
@@ -522,7 +527,7 @@
     "extern-body": {
       "patterns": [
         {
-          "match": "(?:(?<=[(,])|^)\\s*\\b(env)\\b(?=\\s*[,)])",
+          "match": "(?:(?<=[(,<])|^)\\s*\\b(env)\\b(?=\\s*[,)])",
           "captures": {
             "1": {
               "name": "keyword.other.contextual.bezel"

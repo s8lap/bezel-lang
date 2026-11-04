@@ -1,7 +1,8 @@
 // Shared fixtures for the contextual-keyword tests (test/contextual.js for the TextMate grammar,
 // test/hljs.js for the docs site's highlight.js language). Each case is a Bezel snippet in which
 // «word» marks a contextual keyword that must be coloured as a keyword in that position, and
-// ‹word› marks the same spelling used as an identifier, which must stay plain. The positions are
+// ‹word› marks the same spelling used as an identifier, which must stay plain; ⟪text⟫ marks code
+// that must not be inside a string or comment (a rule that leaks a string). The positions are
 // spec Appendix B.2's, with the Appendix A production each comes from.
 module.exports = [
   // of: the scrutinee/arm delimiter of a `case` (A.6 CaseStmt, A.7 CaseExpr)
@@ -13,6 +14,12 @@ module.exports = [
   'if ‹of› is Foo then return 4; end;',
   'case n\n  1 => Console.WriteLine(‹of›);,\nend case;',
   'Print(‹of›); // case x of',
+  // a `case` head's strings and comments nest: an `of` inside them is not the delimiter
+  'case Lookup("x of y") «of»\n  1 => 2\nend case;\n⟪var⟫ s := "next";',
+  'case $"{a} of" «of»\n  _ => 0\nend case;\n⟪var⟫ s := "next";',
+  'case x; var ‹of› := 1;',
+  'case x /* note */ «of»',
+  'case x // of\n«of» _ => 0\nend case;',
   // step: after a range (A.7 Range)
   'for var i in 1..10 «step» 2 do',
   'var fives := 0..<50 «step» 5;',
@@ -35,6 +42,7 @@ module.exports = [
   'extern "libc"\n  public method qsort_r(b: Ptr<byte>, n: UIntPtr,\n      compar: (IntPtr, IntPtr, «env») -> int, «env»): ();\nend;',
   'extern "sqlite3"\n  public method exec(db: IntPtr,\n      cb: («env», int) -> int,\n      «env»,\n      errmsg: Ptr<IntPtr>): int;\nend;',
   'extern "libc"\n  public method g(‹env›: IntPtr): int;\nend;',
+  'extern "c"\n public method f(cb: Func<«env», int>): int;\nend;',
   'Native.Call(cb, ‹env›);',
   // serialized (+ skip, optional): the member clause (A.3 SerializedClause)
   'record Doc(Title: string, Rank: Level «serialized» «skip»);',
@@ -79,8 +87,13 @@ module.exports = [
   'public class Box<T> where T: «value»',
   'method Spawn<A, R>(f: (A) -> R) where A: «sendable», «notnull» where R: «sendable», class',
   'record Key<K> where K: «hashable»;',
+  'class C<T> where T: Foo.‹value›',
   'var ‹value› := 1; var ‹notnull› := true; var ‹sendable› := 0; var ‹hashable› := 0;',
   'public property X: int\n  set => _x := ‹value›;\nend X;',
-  // result: deliberately left plain (its reading depends on the enclosing `ensures`)
-  '  ensures (‹result› > 0)',
+  // result: its keyword reading wins throughout an `ensures` clause (A.4 ContractClause)
+  '  ensures («result» > 0)',
+  '  ensures (Max(«result», 1) = (case «result» «of» 0 => 1, _ => «result»))',
+  '  ensures (x.‹result› = «old»(x.‹result›))',
+  'var ‹result› := Compute(); return ‹result›;',
+  '  requires (‹result› > 0)',
 ];

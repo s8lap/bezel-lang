@@ -3,7 +3,8 @@
 // bundles. It (1) highlights every ```bezel block in docs/*.md and fails on a thrown error, an
 // `illegal` result or a block that ends inside a mode (an unclosed string, comment or context),
 // and (2) checks the contextual-keyword fixtures of test/contextual-fixtures.js: every «word» must
-// be inside a `hljs-keyword` span and every ‹word› outside any keyword span.
+// be inside a `hljs-keyword` span, every ‹word› outside any keyword span, and every ⟪code⟫
+// outside any string or comment span.
 // Usage (from editors/vscode):
 //   npm install --no-save highlight.js@10.1.1
 //   node test/hljs.js
@@ -32,8 +33,8 @@ const highlight = (code) => {
   if (r.errorRaised) throw r.errorRaised;
   return r;
 };
-// The text offsets [start, end) of every span with class hljs-keyword in highlight.js HTML.
-function keywordRanges(html) {
+// The text offsets [start, end) of every span with one of the classes in highlight.js HTML.
+function spanRanges(html, classes) {
   const ranges = [], stack = [];
   let pos = 0;
   const re = /<span class="([^"]*)">|<\/span>|&(amp|lt|gt|quot|#x27|#39);|[^<&]+/g;
@@ -42,7 +43,7 @@ function keywordRanges(html) {
     if (m[1] !== undefined) stack.push({ cls: m[1], start: pos });
     else if (m[0] === '</span>') {
       const s = stack.pop();
-      if (s.cls.split(' ').includes('hljs-keyword')) ranges.push([s.start, pos]);
+      if (s.cls.split(' ').some((c) => classes.includes(c))) ranges.push([s.start, pos]);
     } else if (m[2] !== undefined) pos += 1;
     else pos += m[0].length;
   }
@@ -72,17 +73,24 @@ for (const f of fs.readdirSync(path.join(root, 'docs')).filter((n) => n.endsWith
 let checked = 0;
 for (const fixture of require('./contextual-fixtures')) {
   const { code, marks } = parse(fixture);
-  let ranges;
+  let ranges, quoted;
   try {
     const r = highlight(code);
     if (r.illegal) { bad.push(`${JSON.stringify(fixture)}: illegal`); continue; }
-    ranges = keywordRanges(r.value);
+    ranges = spanRanges(r.value, ['hljs-keyword']);
+    quoted = spanRanges(r.value, ['hljs-string', 'hljs-comment']);
   } catch (e) {
     bad.push(`${JSON.stringify(fixture)}: ${e.message}`);
     continue;
   }
   for (const mk of marks) {
     checked++;
+    if (mk.kind === 'code') {
+      if (quoted.some(([s, e]) => s < mk.end && mk.start < e)) {
+        bad.push(`${JSON.stringify(fixture)}: \`${mk.word}\` at ${mk.start} is inside a string or comment`);
+      }
+      continue;
+    }
     const inKw = ranges.some(([s, e]) => s <= mk.start && mk.end <= e);
     const touchesKw = ranges.some(([s, e]) => s < mk.end && mk.start < e);
     if (mk.keyword ? !inKw : touchesKw) {
