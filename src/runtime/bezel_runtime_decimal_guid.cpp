@@ -1222,50 +1222,38 @@ extern "C" void* bz_decimal_to_string(const bz_decimal_t* a) {
     return hdr;
 }
 
-// Round(digits) — rounds to `digits` decimal places using banker's rounding
-// (round-half-to-even), per stdlib §9.3 ("matching Math.Round (§2.2)").
+// Half-to-even (banker's) rounding of a decimal MANTISSA — the ONE rounding
+// operation the decimal runtime uses (stdlib §9.3 "matching Math.Round
+// (§2.2)"; §2.18's decimal midpoint rule, v0.230: `Decimal.Round` and the
+// F/P/E format specifiers are two spellings of one rounding operation and
+// never disagree at a midpoint).
 //
-// Per stdlib §9.3 (v0.195, #2339): digits outside 0..28 must raise
-// ArgumentOutOfRangeException. The contract is enforced by the codegen
-// caller (LlvmBackend_Calls.cpp "Decimal.Round" branch emits an
-// emitGuardThrow for `digits < 0 || digits > 28` BEFORE invoking this
-// runtime helper), so the runtime can assume the precondition holds and
-// simply compute the rounding. Defensive: if a non-codegen caller does
-// invoke this helper with out-of-range digits, abort — silently clamping
-// or returning the operand was the #2339 defect (Round(-1) returned -2m
-// instead of raising).
-extern "C" void bz_decimal_round(const bz_decimal_t* a, int32_t digits,
-                                  bz_decimal_t* out) {
-    if (digits < 0 || digits > 28) {
-        // Precondition violation: caller should have rejected this. Write
-        // default(decimal) so the out slot is left in a defined state
-        // even when the abort is caught by a test harness; then bail.
-        out->lo32 = 0; out->mid32 = 0; out->hi32 = 0; out->flags = 0;
-        abort();  // precondition violated — codegen guards this
-    }
-    uint32_t s = dec_scale(a);
-    if ((uint32_t)digits >= s) { *out = *a; return; }
-    __uint128_t m = dec_mantissa(a);
-    uint32_t remove = s - (uint32_t)digits;
-    // Drop the lowest `remove` decimal places one at a time. The rounding
-    // decision is made on the FIRST dropped digit (the digit at position
-    // `digits`, immediately after the kept range), not on the LOWEST dropped
-    // digit — that is the i == 0 iteration in this loop, which is the units
-    // digit, several positions below the relevant one whenever remove > 1.
-    // For example, 0.9651m.Round(2) drops two places; the relevant digit is
-    // the 3rd decimal place ("5"), not the 4th ("1").  Per §9.3 banker's
-    // rounding:
-    //   • first-dropped < 5       → round down (no change to mantissa)
-    //   • first-dropped > 5       → round up   (mantissa += 1)
-    //   • first-dropped == 5 AND any later-dropped non-zero (strictly greater
-    //     than the midpoint, e.g. 0.9651) → round up
-    //   • first-dropped == 5 AND all later-dropped zero (exact midpoint, e.g.
-    //     0.9650) → round to even: round up if the kept digit is odd, no
-    //     change if it is even. 0.9650m.Round(2) keeps 96 (even) → 0.96m;
-    //     0.9750m.Round(2) keeps 97 (odd)  → 0.98m.
-    // Carry propagation (e.g. 0.9999m.Round(1) → 1m, 0.9950m.Round(2) → 1m
-    // when the kept digit is odd) is handled by dec_store (trailing-zero
-    // strip + max-96-bit reduction).
+// `m` is the unsigned mantissa; `remove` is how many decimal places are
+// dropped from its low end. The rounding decision is made on the FIRST
+// dropped digit (the digit immediately after the kept range), not on the
+// LOWEST dropped digit — that is the i == 0 iteration in this loop, which is
+// the units digit, several positions below the relevant one whenever
+// remove > 1. For example, 0.9651m.Round(2) drops two places; the relevant
+// digit is the 3rd decimal place ("5"), not the 4th ("1").  Per §9.3
+// banker's rounding:
+//   • first-dropped < 5       → round down (no change to mantissa)
+//   • first-dropped > 5       → round up   (mantissa += 1)
+//   • first-dropped == 5 AND any later-dropped non-zero (strictly greater
+//     than the midpoint, e.g. 0.9651) → round up
+//   • first-dropped == 5 AND all later-dropped zero (exact midpoint, e.g.
+//     0.9650) → round to even: round up if the kept digit is odd, no
+//     change if it is even. 0.9650m.Round(2) keeps 96 (even) → 0.96m;
+//     0.9750m.Round(2) keeps 97 (odd)  → 0.98m.
+//
+// `remove` MAY exceed the mantissa's own digit count: the places above it
+// are the implied leading zeros of the value (a decimal whose scale exceeds
+// its digit count — e.g. 0.00015m has mantissa 15 and scale 5), and they are
+// dropped as zeros, exactly as the scale says.
+//
+// Returns the rounded mantissa (unsigned — the caller restores the sign and
+// the scale). Shared by bz_decimal_round (§9.3) and by the F/P/E format
+// specifiers' digit-string rounding (§2.18).
+__uint128_t dec_round_mantissa_half_even(__uint128_t m, uint32_t remove) {
     bool dropNonZero = false;  // any later-dropped (lower-place) digit > 0
     for (uint32_t i = 0; i < remove; ++i) {
         __uint128_t rem = m % 10;
@@ -1291,6 +1279,40 @@ extern "C" void bz_decimal_round(const bz_decimal_t* a, int32_t digits,
             if (rem != 0) dropNonZero = true;
         }
     }
+    return m;
+}
+
+// Round(digits) — rounds to `digits` decimal places using banker's rounding
+// (round-half-to-even), per stdlib §9.3 ("matching Math.Round (§2.2)").
+//
+// Per stdlib §9.3 (v0.195, #2339): digits outside 0..28 must raise
+// ArgumentOutOfRangeException. The contract is enforced by the codegen
+// caller (LlvmBackend_Calls.cpp "Decimal.Round" branch emits an
+// emitGuardThrow for `digits < 0 || digits > 28` BEFORE invoking this
+// runtime helper), so the runtime can assume the precondition holds and
+// simply compute the rounding. Defensive: if a non-codegen caller does
+// invoke this helper with out-of-range digits, abort — silently clamping
+// or returning the operand was the #2339 defect (Round(-1) returned -2m
+// instead of raising).
+extern "C" void bz_decimal_round(const bz_decimal_t* a, int32_t digits,
+                                  bz_decimal_t* out) {
+    if (digits < 0 || digits > 28) {
+        // Precondition violation: caller should have rejected this. Write
+        // default(decimal) so the out slot is left in a defined state
+        // even when the abort is caught by a test harness; then bail.
+        out->lo32 = 0; out->mid32 = 0; out->hi32 = 0; out->flags = 0;
+        abort();  // precondition violated — codegen guards this
+    }
+    uint32_t s = dec_scale(a);
+    if ((uint32_t)digits >= s) { *out = *a; return; }
+    __uint128_t m = dec_mantissa(a);
+    uint32_t remove = s - (uint32_t)digits;
+    // Drop the lowest `remove` decimal places one at a time (the half-even
+    // rule — see dec_round_mantissa_half_even above).
+    // Carry propagation (e.g. 0.9999m.Round(1) → 1m, 0.9950m.Round(2) → 1m
+    // when the kept digit is odd) is handled by dec_store (trailing-zero
+    // strip + max-96-bit reduction).
+    m = dec_round_mantissa_half_even(m, remove);
     // Rounding only reduces mantissa magnitude; result always fits in 96 bits.
     dec_store(out, m, (uint32_t)digits, dec_sign(a), nullptr);
 }

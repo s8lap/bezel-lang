@@ -655,6 +655,12 @@ extern thread_local bz_domain_t* g_current_domain;
 
 // ---- promoted file-local helpers (defs stay in their home TU) ----
 void  bz_set_exc(void* vtable);                               // decimal_guid
+// Half-to-even (banker's) rounding of a decimal mantissa — the ONE rounding
+// operation the decimal runtime uses: stdlib §9.3 (`Decimal.Round`) and §2.18's
+// decimal midpoint rule (the F/P/E format specifiers round midpoints the same
+// way). Defined in bezel_runtime_decimal_guid.cpp; used by bz_decimal_round
+// there and by the P/E branches of bz_decimal_to_string_fmt in the time TU.
+__uint128_t dec_round_mantissa_half_even(__uint128_t m, uint32_t remove);
 void* bz_make_string(const char* buf, int64_t len);          // time
 void  domain_ref(bz_domain_t* dom);                          // concurrency
 bz_domain_t* bz_main_domain_get();                           // concurrency

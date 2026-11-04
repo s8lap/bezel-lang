@@ -388,6 +388,18 @@ extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
     return sh;
 }
 
+// Write the decimal digits of the unsigned mantissa `m` into `buf`, most
+// significant first, and return the digit count (a zero mantissa writes the
+// single digit "0"). `buf` must hold at least 30 bytes — a 96-bit mantissa
+// has at most 29 digits.
+static int dec_digits_write(char* buf, __uint128_t m) {
+    if (m == 0) { buf[0] = '0'; return 1; }
+    char tmp[32]; int n = 0;
+    while (m > 0) { tmp[n++] = (char)('0' + (int)(m % 10)); m /= 10; }
+    for (int i = 0; i < n; ++i) buf[i] = tmp[n - 1 - i];
+    return n;
+}
+
 // §2.18 / #1412 (v0.172+): Decimal.ToString(format) — handles the full §2.18
 // decimal specifier vocabulary: F/Fn, E/En, G, P/Pn.  Returns nullptr for any
 // unrecognized or malformed specifier; callers check for nullptr and raise
@@ -489,14 +501,7 @@ extern "C" void* bz_decimal_to_string_fmt(const bz_decimal_t* a,
 
     // Capacity 44: up to 29 mantissa digits + 2 appended zeros (P) + guard.
     char raw[44]; int nd = 0;
-    if (isZero) { raw[0] = '0'; nd = 1; }
-    else {
-        __uint128_t t = m0;
-        while (t > 0) { raw[nd++] = (char)('0' + (int)(t % 10)); t /= 10; }
-        for (int i = 0; i < nd / 2; ++i) {
-            char c = raw[i]; raw[i] = raw[nd-1-i]; raw[nd-1-i] = c;
-        }
-    }
+    nd = dec_digits_write(raw, m0);
 
     // ── P/Pn: percent (×100, F-format, "%" suffix) — per §2.18 #1412 ─────────
     if (upper == 'P') {
@@ -515,6 +520,25 @@ extern "C" void* bz_decimal_to_string_fmt(const bz_decimal_t* a,
             zbuf[zpos] = '\0';
             return bz_make_string(zbuf, zpos);
         }
+        // Round to `prec` fractional digits, HALF-TO-EVEN — per stdlib §2.18's
+        // decimal midpoint rule ("digit reduction under F/Fn, P/Pn, and E/En
+        // rounds a midpoint half-to-even (banker's rounding), agreeing with
+        // Decimal.Round ... P/E apply the same rule to their scaled digit
+        // strings"), so P agrees with F at every midpoint.
+        //
+        // The ×100-scaled value V = a × 100 carries a's OWN digit string: the
+        // ×100 moves the decimal point two places and adds digits only when
+        // a's scale is below 2 (then V is an integer, which needs no rounding
+        // at all). Rounding V at `prec` decimals therefore drops
+        // (s0 - prec - 2) trailing digits of a's mantissa — the very digit
+        // drop the F branch performs through bz_decimal_round — so both
+        // specifiers run the SAME rounding operation
+        // (dec_round_mantissa_half_even, the core bz_decimal_round uses).
+        int drop = (int)s0 - prec - 2;
+        if (drop > 0) {
+            __uint128_t rm = dec_round_mantissa_half_even(m0, (uint32_t)drop);
+            nd = dec_digits_write(raw, rm);
+        }
         // ×100 in digit-string domain: shift decimal point right by 2.
         // raw[0..nd-1] with s0 fractional digits; after ×100: new_s = s0 - 2.
         // If s0 < 2: append (2 - s0) trailing '0' chars and set new_s = 0.
@@ -526,29 +550,9 @@ extern "C" void* bz_decimal_to_string_fmt(const bz_decimal_t* a,
             for (int i = 0; i < pad && nd < 42; ++i) raw[nd++] = '0';
             new_s = 0;
         }
-        // Round to prec fractional digits in digit-string domain (half-up).
-        // keep_unc = total retained digits (int part + prec fractional).
-        // If keep_unc < 0: all significant digits are past the prec-th fractional
-        // position; the first dropped digit is a leading '0' → no carry → result is 0.
-        if (new_s > prec) {
-            int keep_unc = nd - new_s + prec;  // may be negative
-            if (keep_unc < 0) {
-                nd = 0;  // all digits past cutoff; first dropped = leading '0' → no carry
-            } else if (keep_unc < nd) {
-                int carry = (raw[keep_unc] - '0') >= 5 ? 1 : 0;
-                nd = keep_unc;
-                for (int i = nd - 1; i >= 0 && carry; --i) {
-                    int dv = (raw[i] - '0') + carry;
-                    raw[i] = (char)('0' + dv % 10);
-                    carry = dv / 10;
-                }
-                if (carry) {
-                    for (int i = nd; i > 0; --i) raw[i] = raw[i-1];
-                    raw[0] = '1'; nd++;
-                }
-            }
-            new_s = prec;
-        }
+        // A rounded value carries exactly `prec` decimals: the retained
+        // digits are the scaled value multiplied by 10^prec.
+        if (drop > 0) new_s = prec;
         char buf[100]; int pos = 0;
         int int_d = nd - new_s;
         if (neg && !isZero) buf[pos++] = '-';
@@ -579,22 +583,23 @@ extern "C" void* bz_decimal_to_string_fmt(const bz_decimal_t* a,
         int prec = hasCount ? count : 6;
         // Exponent = (integer part digit count) - 1 = (nd - s0) - 1.
         int exp = isZero ? 0 : nd - (int)s0 - 1;
-        // Round significand to prec+1 significant digits (half-up).
-        if (!isZero && nd > prec + 1) {
-            int keep = prec + 1;
-            int carry = (raw[keep] - '0') >= 5 ? 1 : 0;
-            nd = keep;
-            for (int i = nd - 1; i >= 0 && carry; --i) {
-                int dv = (raw[i] - '0') + carry;
-                raw[i] = (char)('0' + dv % 10);
-                carry = dv / 10;
-            }
-            if (carry) {
-                // Carry propagated past all digits: prepend '1', bump exponent.
-                for (int i = nd; i > 0; --i) raw[i] = raw[i-1];
-                raw[0] = '1'; nd++;
+        // Round the significand to prec+1 significant digits, HALF-TO-EVEN —
+        // per stdlib §2.18's decimal midpoint rule (the same rule the F branch
+        // and Decimal.Round apply), so E agrees with F at every midpoint.
+        // The significand is the mantissa's digit string, so this is the same
+        // digit drop bz_decimal_round performs, run through the same rounding
+        // operation (dec_round_mantissa_half_even).
+        int keep = prec + 1;
+        int drop = nd - keep;
+        if (drop > 0) {
+            __uint128_t rm = dec_round_mantissa_half_even(m0, (uint32_t)drop);
+            nd = dec_digits_write(raw, rm);
+            if (nd > keep) {
+                // The rounding carried past the most significant digit
+                // (9.99 → 10.0): the significand gains a digit and the
+                // exponent moves up by one.
                 exp++;
-                nd = prec + 1;  // re-truncate: the carry digit is now in raw[0]
+                nd = keep;  // re-truncate: the carried digit is now raw[0]
             }
         }
         // Format: [-]d[0]['.'d[1]...d[prec]]E[+/-]EEE
