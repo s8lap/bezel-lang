@@ -212,7 +212,7 @@ BEZEL_TEST(codegen_narrowed_operand_box_release_6142,
 // released after the call: no use-after-free on the lenient leg, no leak on
 // the checked leg.
 BEZEL_TEST(codegen_narrowed_operand_box_release_6142,
-           operand_read_plus_pass_on_keeps_box_spec_28_3) {
+           operand_read_plus_pass_on_releases_box_spec_28_3) {
     JitResult r = runAotCheckedLenient(kReadAndPassOn);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);

@@ -17998,6 +17998,80 @@ struct ParamEscapeWalker {
     // reference is a capture that may outlive the call (the `isUnboxedRead`
     // guard). Only a plain positional argument qualifies: a modifier (`ref`,
     // `out`, `move`, `scoped`) or a named argument falls back to escaping.
+    // fix-forward of 6da9a1b2 / fix #8011 (§17.4 / §8.6 / §28.9, v0.355):
+    // is `v as T` an UNBOXING `as`? §17.4: "When the target type is a value
+    // type, `x as T` produces `T?`: the boxed `Object`-or-interface input is
+    // unboxed to the value type" — the payload is read OUT of the box and the
+    // box goes nowhere, a read. For a REFERENCE target (`v as IFoo`,
+    // `v as Object`, `v as string`) §17.4 says instead "the result is
+    // additionally a *borrow* of `x` (more precisely, a borrow with the same
+    // source as `x`)": the result IS the parameter's box, and storing it
+    // (`s._f := v as IFoo`) keeps the box past the call. `unboxes` is the
+    // Emitter's own boxable-value predicate (`isBoxableValueType` /
+    // `isNullableValueTy`, the pair `boxForTarget` boxes by); an unresolved
+    // target answers "not an unboxing", the escape direction. MEASURED before
+    // this split: every `as` was a safe read, so `s._saved := o as IFoo` in a
+    // callee let the caller release the argument box post-call — the stored
+    // reference then read back a freed box (a silent wrong value in a direct
+    // callee; through a forwarder, an ASan SEGV inside free).
+    std::function<bool(const sema::TypeRef*)> unboxes;
+    bool isUnboxingAs(const ast::TypeTestExpr& t) {
+        if (!t.testType || !unboxes) return false;
+        return unboxes(ctx.resolvedType(*t.testType));
+    }
+
+    // fix-forward of 6da9a1b2 / fix #8011 (§26.7 / §8.6 / §28.9, v0.355):
+    // does member access `callee` (the tracked parameter as receiver) reach
+    // an EXTENSION member? An extension member's `this` IS the receiver
+    // reference — for a tracked `Object`/interface parameter, the box itself
+    // (§26.7: "The receiver is always a borrow"). §26.7 also says
+    // "extensions cannot store `this`", but the compiler does not yet reject
+    // that store (#7823, #7968 track the sema gap), so an extension body
+    // reached through the receiver may keep the box exactly as a callee's
+    // parameter store would; and even a §26.7-conforming body may pass
+    // `this` on to a callee that stores it. The receiver arm's "safe read"
+    // therefore does not cover an extension member: it is an escape, the
+    // conservative (leak) direction, until the walk can follow `this` into
+    // the extension body. A declared member's receiver stays a read: a
+    // record's `this` is a re-boxed copy, and a class instance is never a
+    // call-site-minted box. MEASURED before this guard: `o.KeepIn(s)` (an
+    // `extension Object` method storing `this`) was a read, the caller
+    // released the box, and the stored reference was read freed (ASan
+    // heap-use-after-free, direct and through a forwarder). An extension
+    // method carries `extensionDecl` (ModuleLoader synthesises one for an
+    // imported extension too); an extension PROPERTY (expression-bodied,
+    // §26.3) is left with a null `parent` by SymbolCollection, which is the
+    // only mark it carries.
+    // The receiver position sees through the two borrow-preserving views
+    // `v!` (§17.8: keeps `v`'s classification) and a reference-target
+    // `v as T` (§17.4: a borrow with the same source), so that
+    // `(v as IFoo)!.Get()` is the receiver read `v.Get()` is — the member
+    // reached is still checked by `isExtensionMemberAccess`.
+    const ast::Expr* receiverCore(const ast::Expr* e) {
+        for (;;) {
+            if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+                e = p->operand.get();
+                continue;
+            }
+            if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+                if (t->op == "as" && !isUnboxingAs(*t)) {
+                    e = t->operand.get();
+                    continue;
+                }
+            }
+            return e;
+        }
+    }
+    bool isExtensionMemberAccess(const ast::Expr* callee) {
+        if (!callee) return false;
+        sema::Symbol* sym = ctx.exprSymbol(*callee);
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
+            return ms->extensionDecl != nullptr;
+        if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym))
+            return ps->parent == nullptr;
+        return false;
+    }
+
     std::function<bool(const ast::CallExpr&, size_t)> argNonEscaping;
     bool isNonEscapingCallArg(const ast::CallExpr& c, size_t i) {
         if (lambdaDepth != 0 || !argNonEscaping || i >= c.args.size())
@@ -18035,10 +18109,15 @@ struct ParamEscapeWalker {
                 escaped = true;
             return;
         }
-        // `v is T` / `v as T` — read only (outside a lambda; the identifier
-        // arm above refuses the safe read inside one).
+        // `v is T` / `v is not T` — read only (outside a lambda; the
+        // identifier arm above refuses the safe read inside one). `v as T`
+        // is a read only when it UNBOXES (a value-type target, §17.4); an
+        // `as` to a reference type yields a borrow of the same box and so
+        // inherits the parent position, like `v!` below (fix-forward of
+        // 6da9a1b2, `isUnboxingAs`).
         if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
-            expr(t->operand.get(), /*safeRead=*/true);
+            bool read = t->op != "as" || isUnboxingAs(*t);
+            expr(t->operand.get(), /*safeRead=*/read || safeRead);
             return;
         }
         // `v = null` / `v <> null` (literal null): read only.
@@ -18088,9 +18167,15 @@ struct ParamEscapeWalker {
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
             if (auto* mem = dynamic_cast<const ast::MemberAccessExpr*>(
                     c->callee.get())) {
-                if (isTarget(mem->target.get())) {
+                if (isTarget(receiverCore(mem->target.get()))) {
                     // Receiver is the tracked parameter — safe read, except
-                    // inside a lambda body, where it is a capture (§27.5).
+                    // inside a lambda body, where it is a capture (§27.5),
+                    // and except for an extension member, whose `this` is
+                    // the box itself (§26.7, `isExtensionMemberAccess`).
+                    if (isExtensionMemberAccess(c->callee.get())) {
+                        escaped = true;
+                        return;
+                    }
                     expr(mem->target.get(), /*safeRead=*/true);
                     for (auto& a : c->args) expr(a.value.get(), false);
                     return;
@@ -18119,8 +18204,14 @@ struct ParamEscapeWalker {
             }
             if (auto* mem = dynamic_cast<const ast::NullCondMemberExpr*>(
                     c->callee.get())) {
-                if (isTarget(mem->target.get())) {
-                    // Safe receiver read only outside a lambda (§27.5).
+                if (isTarget(receiverCore(mem->target.get()))) {
+                    // Safe receiver read only outside a lambda (§27.5) and
+                    // only for a declared member (§26.7, see the plain
+                    // receiver arm).
+                    if (isExtensionMemberAccess(c->callee.get())) {
+                        escaped = true;
+                        return;
+                    }
                     expr(mem->target.get(), /*safeRead=*/true);
                     for (auto& a : c->args) expr(a.value.get(), false);
                     return;
@@ -18145,8 +18236,14 @@ struct ParamEscapeWalker {
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
             if (auto* mem = dynamic_cast<const ast::MemberAccessExpr*>(
                     c->callee.get())) {
-                if (isTarget(mem->target.get())) {
-                    // Safe receiver read only outside a lambda (§27.5).
+                if (isTarget(receiverCore(mem->target.get()))) {
+                    // Safe receiver read only outside a lambda (§27.5) and
+                    // only for a declared member (§26.7, see the plain
+                    // receiver arm).
+                    if (isExtensionMemberAccess(c->callee.get())) {
+                        escaped = true;
+                        return;
+                    }
                     expr(mem->target.get(), /*safeRead=*/true);
                     for (auto& a : c->args) expr(a.value.get(), false);
                     return;
@@ -18180,10 +18277,14 @@ struct ParamEscapeWalker {
         // arm: `f := v.ToString;` in a constructor was walked as nothing at
         // all, the caller released the box, and `c.f()` read it freed (ASan
         // heap-use-after-free). Any other target is walked conservatively.
+        // An extension PROPERTY's getter (§26.3) runs with `this` = the box,
+        // the same way an extension method does (§26.7), so its read on the
+        // tracked parameter is an escape too (`isExtensionMemberAccess`).
         auto memberAccess = [&](const ast::Expr* target) {
             if (isTarget(target)) {
                 const sema::TypeRef* t = ctx.exprType(*e);
-                if (!t || t->kind == sema::TypeRef::Kind::Function)
+                if (!t || t->kind == sema::TypeRef::Kind::Function ||
+                    isExtensionMemberAccess(e))
                     escaped = true;
                 else
                     expr(target, /*safeRead=*/true);
@@ -18509,6 +18610,11 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
         return isCalleeParamNonEscaping(
             dynamic_cast<const ast::Member*>(ms->decl), i);
     };
+    // fix-forward of 6da9a1b2 (§17.4, v0.355): the walker's unboxing-`as`
+    // test, answered by the same predicate pair `boxForTarget` boxes by.
+    auto unboxes = [this](const sema::TypeRef* t) -> bool {
+        return t && (isBoxableValueType(t) || isNullableValueTy(t));
+    };
     calleeParamNonEscape_[callee];  // seed: every parameter escapes (#8011)
     auto walkParams = [&](const std::vector<ast::Param>& params,
                           const std::vector<std::unique_ptr<ast::Stmt>>* body,
@@ -18519,6 +18625,7 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
             if (!pt || !isObjectOrInterfaceTarget(pt)) continue;
             ParamEscapeWalker w{ctx_, params[i].type.get(), captures};
             w.argNonEscaping = argNonEscaping;
+            w.unboxes = unboxes;
             if (body) {
                 for (auto& s : *body) w.stmt(s.get());
             }

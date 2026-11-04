@@ -435,6 +435,346 @@ const char* kPassOnSealedRead =
     "  end Main; "
     "end Program;";
 
+
+// ---------------------------------------------------------------------------
+// fix-forward of 6da9a1b2 (§17.4 / §26.7 / §8.6 / §28.9, v0.355): two of the
+// walker's "safe read" arms answered READ for a shape that KEEPS the box, and
+// the pass-on deferral then carried that verdict up through every forwarder.
+//
+// §17.4 (v0.355): "When the target type is a value type, `x as T` produces
+//   `T?`: the boxed `Object`-or-interface input is unboxed to the value type"
+//   — and otherwise "the result is additionally a *borrow* of `x` (more
+//   precisely, a borrow with the same source as `x`)". So `o as IFoo` /
+//   `o as Object` IS the parameter's box, and a store of it keeps the box.
+// §26.7 (v0.355): "The receiver is always a borrow; extensions cannot store
+//   `this`" — an extension member's `this` is the receiver reference itself,
+//   and the compiler does not yet reject the store (#7823 / #7968), so a
+//   receiver call that reaches an extension member must count as an escape.
+//
+// The `keeps_box` rows below read the stored box AFTER the outer call
+// returned, 100x, under ASan with leak detection off: a premature release is
+// a heap-use-after-free / SEGV or a wrong count. MEASURED on 6da9a1b2: the
+// forwarded rows printed 0 (`as IFoo`, `extension IFoo` storing `this`) or
+// died in ASan (`extension Object` storing `this`; the `ToString` witness).
+
+// B1, forwarded: `Keep` stores `o as IFoo` (a reference-target `as`).
+const char* kAsIfaceStoreFwd =
+    "module M8011P; "
+    "public class Sink "
+    "  public _saved: Object?; "
+    "  public constructor() _saved := null; end constructor; "
+    "end Sink; "
+    "public interface IFoo "
+    "  method Get(): int; "
+    "end IFoo; "
+    "public record R(x: int): IFoo "
+    "  public method Get(): int => x; "
+    "end R; "
+    "public class Program "
+    "  public static method Keep(s: Sink, o: Object): int "
+    "    s._saved := o as IFoo; return 1; "
+    "  end Keep; "
+    "  public static method Tag(s: Sink, o: Object): int => Keep(s, o); "
+    "  public static method Main(): int "
+    "    using var s := new Sink(); "
+    "    var n := 0; "
+    "    for var i in 0..<100 do "
+    "      var a := Tag(s, new R(i + 1000)); "
+    "      var g := s._saved as IFoo; "
+    "      if g <> null and g!.Get() = i + 1000 then n := n + a; end if; "
+    "    end for; "
+    "    Console.WriteLine(n); "
+    "    return 0; "
+    "  end Main; "
+    "end Program;";
+
+// B1, direct: the storing method is the one Main calls.
+const char* kAsIfaceStoreDirect =
+    "module M8011Q; "
+    "public class Sink "
+    "  public _saved: Object?; "
+    "  public constructor() _saved := null; end constructor; "
+    "end Sink; "
+    "public interface IFoo "
+    "  method Get(): int; "
+    "end IFoo; "
+    "public record R(x: int): IFoo "
+    "  public method Get(): int => x; "
+    "end R; "
+    "public class Program "
+    "  public static method Tag(s: Sink, o: Object): int "
+    "    s._saved := o as IFoo; return 1; "
+    "  end Tag; "
+    "  public static method Main(): int "
+    "    using var s := new Sink(); "
+    "    var n := 0; "
+    "    for var i in 0..<100 do "
+    "      var a := Tag(s, new R(i + 1000)); "
+    "      var g := s._saved as IFoo; "
+    "      if g <> null and g!.Get() = i + 1000 then n := n + a; end if; "
+    "    end for; "
+    "    Console.WriteLine(n); "
+    "    return 0; "
+    "  end Main; "
+    "end Program;";
+
+// B1, forwarded, the ASan witness: the stored box is read through
+// `ToString()` and through a second `as IFoo` after the outer call.
+const char* kAsIfaceStoreFwdWitness =
+    "module M8011R; "
+    "public class Sink "
+    "  public _saved: Object?; "
+    "  public constructor() _saved := null; end constructor; "
+    "end Sink; "
+    "public interface IFoo "
+    "  method Get(): int; "
+    "end IFoo; "
+    "public record R(x: int): IFoo "
+    "  public method Get(): int => x; "
+    "end R; "
+    "public class Program "
+    "  public static method Keep(s: Sink, o: Object): int "
+    "    s._saved := o as IFoo; return 1; "
+    "  end Keep; "
+    "  public static method Tag(s: Sink, o: Object): int => Keep(s, o); "
+    "  public static method Main(): int "
+    "    using var s := new Sink(); "
+    "    var n := 0; "
+    "    for var i in 0..<100 do "
+    "      var a := Tag(s, new R(1005)); "
+    "      var t := s._saved!.ToString(); "
+    "      var f: IFoo := (s._saved as IFoo)!; "
+    "      if f.Get() = 1005 and t.Length > 0 then n := n + a; end if; "
+    "    end for; "
+    "    Console.WriteLine(n); "
+    "    return 0; "
+    "  end Main; "
+    "end Program;";
+
+// B2, forwarded: the receiver call reaches an `extension Object` member that
+// stores `this`.
+const char* kExtensionRecvStoreFwd =
+    "module M8011S; "
+    "public class Sink "
+    "  public _saved: Object?; "
+    "  public constructor() _saved := null; end constructor; "
+    "end Sink; "
+    "public extension Object "
+    "  public method KeepIn(s: Sink): int "
+    "    s._saved := this; return 1; "
+    "  end KeepIn; "
+    "end extension; "
+    "public class Program "
+    "  public static method Inner(s: Sink, o: Object): int => o.KeepIn(s); "
+    "  public static method Tag(s: Sink, o: Object): int => Inner(s, o); "
+    "  public static method Main(): int "
+    "    using var s := new Sink(); "
+    "    var n := 0; "
+    "    for var i in 0..<100 do "
+    "      var a := Tag(s, i + 1000); "
+    "      if s._saved!.ToString() = (i + 1000).ToString() then "
+    "        n := n + a; "
+    "      end if; "
+    "    end for; "
+    "    Console.WriteLine(n); "
+    "    return 0; "
+    "  end Main; "
+    "end Program;";
+
+// B2, direct.
+const char* kExtensionRecvStoreDirect =
+    "module M8011T; "
+    "public class Sink "
+    "  public _saved: Object?; "
+    "  public constructor() _saved := null; end constructor; "
+    "end Sink; "
+    "public extension Object "
+    "  public method KeepIn(s: Sink): int "
+    "    s._saved := this; return 1; "
+    "  end KeepIn; "
+    "end extension; "
+    "public class Program "
+    "  public static method Tag(s: Sink, o: Object): int => o.KeepIn(s); "
+    "  public static method Main(): int "
+    "    using var s := new Sink(); "
+    "    var n := 0; "
+    "    for var i in 0..<100 do "
+    "      var a := Tag(s, i + 1000); "
+    "      if s._saved!.ToString() = (i + 1000).ToString() then "
+    "        n := n + a; "
+    "      end if; "
+    "    end for; "
+    "    Console.WriteLine(n); "
+    "    return 0; "
+    "  end Main; "
+    "end Program;";
+
+// B2, forwarded, interface-typed parameter: `extension IFoo` stores `this`.
+const char* kIfaceExtensionStoreThisFwd =
+    "module M8011U; "
+    "public class Sink "
+    "  public _saved: Object?; "
+    "  public constructor() _saved := null; end constructor; "
+    "end Sink; "
+    "public interface IFoo "
+    "  method Get(): int; "
+    "end IFoo; "
+    "public record R(x: int): IFoo "
+    "  public method Get(): int => x; "
+    "end R; "
+    "public extension IFoo "
+    "  public method KeepIn(s: Sink): int "
+    "    s._saved := this; return 1; "
+    "  end KeepIn; "
+    "end extension; "
+    "public class Program "
+    "  public static method Inner(s: Sink, f: IFoo): int => f.KeepIn(s); "
+    "  public static method Tag(s: Sink, f: IFoo): int => Inner(s, f); "
+    "  public static method Main(): int "
+    "    using var s := new Sink(); "
+    "    var n := 0; "
+    "    for var i in 0..<100 do "
+    "      var a := Tag(s, new R(i + 1000)); "
+    "      var g := s._saved as IFoo; "
+    "      if g <> null and g!.Get() = i + 1000 then n := n + a; end if; "
+    "    end for; "
+    "    Console.WriteLine(n); "
+    "    return 0; "
+    "  end Main; "
+    "end Program;";
+
+// Admitting twin: a reference-target `as` that is only compared against
+// `null` keeps nothing, so the pass-on still releases the box.
+const char* kAsIfaceNullTestFwd =
+    "module M8011V; "
+    "public interface IFoo "
+    "  method Get(): int; "
+    "end IFoo; "
+    "public record R(x: int): IFoo "
+    "  public method Get(): int => x; "
+    "end R; "
+    "public class Program "
+    "  public static method Peek(o: Object): int "
+    "    if (o as IFoo) <> null then return 1; end if; "
+    "    return 0; "
+    "  end Peek; "
+    "  public static method Tag(o: Object): int => Peek(o); "
+    "  public static method Main(): int "
+    "    var n := 0; "
+    "    for var i in 0..<100 do n := n + Tag(new R(i + 1000)); end for; "
+    "    Console.WriteLine(n); "
+    "    return 0; "
+    "  end Main; "
+    "end Program;";
+
+// Admitting twin: an `extension Object` member that only unboxes `this`
+// is reached through the receiver; the walker does not follow `this` into
+// the extension body, so the pass-on keeps the box (the leak direction —
+// the lenient leg only pins that nothing is freed early).
+const char* kExtensionRecvReadFwd =
+    "module M8011W; "
+    "public extension Object "
+    "  public method Peek(): int => (this as int) ?? 0; "
+    "end extension; "
+    "public class Program "
+    "  public static method Inner(o: Object): int => o.Peek(); "
+    "  public static method Tag(o: Object): int => Inner(o); "
+    "  public static method Main(): int "
+    "    var n := 0; "
+    "    for var i in 0..<100 do n := n + Tag(i + 1); end for; "
+    "    Console.WriteLine(n); "
+    "    return 0; "
+    "  end Main; "
+    "end Program;";
+
+
+// B2 via an extension PROPERTY (§26.3, expression-bodied): `o.Self` IS the
+// box, stored by the forwarded callee.
+const char* kExtensionPropertyThisStoreFwd =
+    "module M8011X; "
+    "public class Sink "
+    "  public _saved: Object?; "
+    "  public constructor() _saved := null; end constructor; "
+    "end Sink; "
+    "public extension Object "
+    "  public property Self: Object => this; "
+    "end extension; "
+    "public class Program "
+    "  public static method Keep(s: Sink, o: Object): int "
+    "    s._saved := o.Self; return 1; "
+    "  end Keep; "
+    "  public static method Tag(s: Sink, o: Object): int => Keep(s, o); "
+    "  public static method Main(): int "
+    "    using var s := new Sink(); "
+    "    var n := 0; "
+    "    for var i in 0..<100 do "
+    "      var a := Tag(s, i + 1000); "
+    "      if s._saved!.ToString() = (i + 1000).ToString() then "
+    "        n := n + a; "
+    "      end if; "
+    "    end for; "
+    "    Console.WriteLine(n); "
+    "    return 0; "
+    "  end Main; "
+    "end Program;";
+
+// B1 + B2: the receiver is `(o as IFoo)!` and the member reached is an
+// `extension IFoo` member storing `this`.
+const char* kAsIfaceBangExtensionRecvStoreFwd =
+    "module M8011Y; "
+    "public class Sink "
+    "  public _saved: Object?; "
+    "  public constructor() _saved := null; end constructor; "
+    "end Sink; "
+    "public interface IFoo "
+    "  method Get(): int; "
+    "end IFoo; "
+    "public record R(x: int): IFoo "
+    "  public method Get(): int => x; "
+    "end R; "
+    "public extension IFoo "
+    "  public method KeepIn(s: Sink): int "
+    "    s._saved := this; return 1; "
+    "  end KeepIn; "
+    "end extension; "
+    "public class Program "
+    "  public static method Keep(s: Sink, o: Object): int => "
+    "    (o as IFoo)!.KeepIn(s); "
+    "  public static method Tag(s: Sink, o: Object): int => Keep(s, o); "
+    "  public static method Main(): int "
+    "    using var s := new Sink(); "
+    "    var n := 0; "
+    "    for var i in 0..<100 do "
+    "      var a := Tag(s, new R(i + 1000)); "
+    "      var g := s._saved as IFoo; "
+    "      if g <> null and g!.Get() = i + 1000 then n := n + a; end if; "
+    "    end for; "
+    "    Console.WriteLine(n); "
+    "    return 0; "
+    "  end Main; "
+    "end Program;";
+
+// Admitting twin: the receiver `(o as IFoo)!` reaches a DECLARED interface
+// member, which is the receiver read `o.Get()` is: released.
+const char* kAsIfaceBangRecvReadFwd =
+    "module M8011Z; "
+    "public interface IFoo "
+    "  method Get(): int; "
+    "end IFoo; "
+    "public record R(x: int): IFoo "
+    "  public method Get(): int => x; "
+    "end R; "
+    "public class Program "
+    "  public static method Peek(o: Object): int => (o as IFoo)!.Get(); "
+    "  public static method Tag(o: Object): int => Peek(o); "
+    "  public static method Main(): int "
+    "    var n := 0; "
+    "    for var i in 0..<100 do n := n + Tag(new R(i + 1)) - i; end for; "
+    "    Console.WriteLine(n); "
+    "    return 0; "
+    "  end Main; "
+    "end Program;";
+
 }  // namespace
 
 // per §8.6 / §28.3, v0.353 — the corrected repro: the argument box of
@@ -606,6 +946,124 @@ BEZEL_TEST(codegen_param_escape_arg_box_8011,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.stdoutText, std::string("100\n"));
     JitResult r = runAotChecked(kPassOnSealedRead);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
+
+// per §17.4 / §8.6, v0.355 — the forwarded callee stores `o as IFoo`: the
+// result is a borrow of the same box, so the box is kept (no use-after-free;
+// every read-back correct; leak detection off).
+BEZEL_TEST(codegen_param_escape_arg_box_8011,
+           as_iface_store_fwd_keeps_box_spec_17_4) {
+    JitResult r = runAotCheckedLenient(kAsIfaceStoreFwd);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
+
+// per §17.4 / §8.6, v0.355 — the same store in the directly called method.
+BEZEL_TEST(codegen_param_escape_arg_box_8011,
+           as_iface_store_direct_keeps_box_spec_17_4) {
+    JitResult r = runAotCheckedLenient(kAsIfaceStoreDirect);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
+
+// per §17.4 / §28.9, v0.355 — the ASan witness: the stored box survives a
+// `ToString()` and a second `as` after the outer call.
+BEZEL_TEST(codegen_param_escape_arg_box_8011,
+           as_iface_store_fwd_tostring_witness_keeps_box_spec_17_4) {
+    JitResult r = runAotCheckedLenient(kAsIfaceStoreFwdWitness);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
+
+// per §26.7 / §8.6, v0.355 — the forwarded receiver call reaches an
+// `extension Object` member whose `this` (the box) is stored: kept.
+BEZEL_TEST(codegen_param_escape_arg_box_8011,
+           extension_recv_store_fwd_keeps_box_spec_26_7) {
+    JitResult r = runAotCheckedLenient(kExtensionRecvStoreFwd);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
+
+// per §26.7 / §8.6, v0.355 — the same extension call in the directly
+// called method.
+BEZEL_TEST(codegen_param_escape_arg_box_8011,
+           extension_recv_store_direct_keeps_box_spec_26_7) {
+    JitResult r = runAotCheckedLenient(kExtensionRecvStoreDirect);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
+
+// per §26.7 / §8.6, v0.355 — an interface-typed parameter whose
+// `extension IFoo` member stores `this`, through a forwarder: kept.
+BEZEL_TEST(codegen_param_escape_arg_box_8011,
+           iface_extension_store_this_fwd_keeps_box_spec_26_7) {
+    JitResult r = runAotCheckedLenient(kIfaceExtensionStoreThisFwd);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
+
+// per §17.4 / §8.6, v0.355 — admitting twin: `(o as IFoo) <> null` in the
+// forwarded callee keeps nothing, so the box is still released (no leak).
+BEZEL_TEST(codegen_param_escape_arg_box_8011,
+           as_iface_null_test_fwd_releases_box_spec_17_4) {
+    JitResult plain = runAot(kAsIfaceNullTestFwd);
+    BEZEL_EXPECT_TRUE(plain.ran);
+    BEZEL_EXPECT_EQ(plain.stdoutText, std::string("100\n"));
+    JitResult r = runAotChecked(kAsIfaceNullTestFwd);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
+
+// per §26.7 / §8.6, v0.355 — admitting twin: a read-only extension member
+// reached through the receiver computes the right value and frees nothing
+// early (the box is kept, the conservative direction; leak detection off).
+BEZEL_TEST(codegen_param_escape_arg_box_8011,
+           extension_recv_read_fwd_no_early_release_spec_26_7) {
+    JitResult r = runAotCheckedLenient(kExtensionRecvReadFwd);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("5050\n"));
+}
+
+// per §26.3 / §26.7 / §8.6, v0.355 — an extension PROPERTY whose body is
+// `this`, read on the forwarded parameter and stored: the box is kept.
+BEZEL_TEST(codegen_param_escape_arg_box_8011,
+           extension_property_this_store_fwd_keeps_box_spec_26_7) {
+    JitResult r = runAotCheckedLenient(kExtensionPropertyThisStoreFwd);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
+
+// per §17.4 / §26.7 / §8.6, v0.355 — the receiver `(o as IFoo)!` reaches
+// an `extension IFoo` member storing `this`: kept.
+BEZEL_TEST(codegen_param_escape_arg_box_8011,
+           as_iface_bang_extension_recv_store_fwd_keeps_box_spec_26_7) {
+    JitResult r = runAotCheckedLenient(kAsIfaceBangExtensionRecvStoreFwd);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
+
+// per §17.4 / §17.8 / §8.6, v0.355 — admitting twin: `(o as IFoo)!.Get()`
+// in the forwarded callee is a receiver read of a declared member, so the
+// box is still released (no leak).
+BEZEL_TEST(codegen_param_escape_arg_box_8011,
+           as_iface_bang_recv_read_fwd_releases_box_spec_17_4) {
+    JitResult plain = runAot(kAsIfaceBangRecvReadFwd);
+    BEZEL_EXPECT_TRUE(plain.ran);
+    BEZEL_EXPECT_EQ(plain.stdoutText, std::string("100\n"));
+    JitResult r = runAotChecked(kAsIfaceBangRecvReadFwd);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
