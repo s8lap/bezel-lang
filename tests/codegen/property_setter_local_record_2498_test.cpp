@@ -52,6 +52,16 @@
 // per the lane protocol) and chosen so no two operands could coincidentally
 // produce the same sum, ruling out a "looks right" false pass.
 
+// FIXTURE NOTE (#8089 fix-forward, §9.4 v0.353): the RECORD fixtures below
+// whose accessor stored the record's own field are now in the §9.4 MEDIATING
+// shape — the backing value lives in a class the record borrows, and the
+// accessor stores beyond that class-typed hop ("a store beyond such a hop
+// lands in the borrowed heap object, not in the receiver, and is legal").
+// §9.4 rejects the former shape: "a *setter body* whose store lands in the
+// receiver's own storage is rejected like any other member body". The record
+// receiver still lowers through the same accessor path and every expected
+// value is unchanged; the stored value is now observed through the class.
+
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -71,16 +81,19 @@ int run(const std::string& program) {
 BEZEL_TEST(property_setter_local_record_2498, public_backing_direct_set_then_read) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "public record RecSetLocal2498T1(x: int) "
-        "  public _n: int := 1; "
+        "public class RecSetLocal2498T1Cell "
+        "  public V: int := 1; "
+        "end RecSetLocal2498T1Cell; "
+        "public record RecSetLocal2498T1(x: int, cell: RecSetLocal2498T1Cell) "
         "  public property Name: int "
-        "    get => _n; "
-        "    set => _n := value; "
+        "    get => cell.V; "
+        "    set => cell.V := value; "
         "  end Name; "
         "end RecSetLocal2498T1; "
         "public class C2498T1 "
         "  public static method Main(): int "
-        "    var r := new RecSetLocal2498T1(9); "
+        "    using var c := new RecSetLocal2498T1Cell(); "
+        "    var r := new RecSetLocal2498T1(9, c); "
         "    r.Name := 55; "
         "    return r.x + r.Name; "
         "  end Main; "
@@ -92,16 +105,24 @@ BEZEL_TEST(property_setter_local_record_2498, public_backing_direct_set_then_rea
 BEZEL_TEST(property_setter_local_record_2498, private_backing_direct_set_then_read) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
+        "public class RecSetLocal2498T2Cell "
+        "  public V: int := 1; "
+        "end RecSetLocal2498T2Cell; "
         "public record RecSetLocal2498T2(x: int) "
-        "  private _n: int := 1; "
+        "  private _c: RecSetLocal2498T2Cell; "
+        "  public constructor(x: int, c: RecSetLocal2498T2Cell) "
+        "    this.x := x; "
+        "    _c := c; "
+        "  end constructor; "
         "  public property Name: int "
-        "    get => _n; "
-        "    set => _n := value; "
+        "    get => _c.V; "
+        "    set => _c.V := value; "
         "  end Name; "
         "end RecSetLocal2498T2; "
         "public class C2498T2 "
         "  public static method Main(): int "
-        "    var r := new RecSetLocal2498T2(9); "
+        "    using var c := new RecSetLocal2498T2Cell(); "
+        "    var r := new RecSetLocal2498T2(9, c); "
         "    r.Name := 47; "
         "    return r.x + r.Name; "
         "  end Main; "
@@ -232,16 +253,19 @@ BEZEL_TEST(property_setter_local_record_2498, enum_block_form_property_rejected_
 BEZEL_TEST(property_setter_local_record_2498, compound_assign_delegates_to_fixed_setter) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "public record RecCompoundProp2498T6(seed: int) "
-        "  public _n: int := 10; "
+        "public class RecCompoundProp2498T6Cell "
+        "  public V: int := 10; "
+        "end RecCompoundProp2498T6Cell; "
+        "public record RecCompoundProp2498T6(seed: int, cell: RecCompoundProp2498T6Cell) "
         "  public property Name: int "
-        "    get => _n; "
-        "    set => _n := value; "
+        "    get => cell.V; "
+        "    set => cell.V := value; "
         "  end Name; "
         "end RecCompoundProp2498T6; "
         "public class C2498T6 "
         "  public static method Main(): int "
-        "    var r := new RecCompoundProp2498T6(1); "
+        "    using var c := new RecCompoundProp2498T6Cell(); "
+        "    var r := new RecCompoundProp2498T6(1, c); "
         "    r.Name += 3; "
         "    return r.Name; "
         "  end Main; "

@@ -53,23 +53,10 @@
 //        reference, named local set then read back. LSan ON.
 //   T3 — SAME-MODULE CLASS-backed interface-typed reference (the
 //        cross-module twin of T1). LSan ON.
-//   T4 — CRITICAL — RECORD-implementor named local: a RECORD (not a
-//        class) behind the interface, whose indexer SETTER stores the
-//        value into a reference-typed field. WITHOUT the paired
-//        call-site retain added in this commit (the walker widening alone
-//        would arm the local's scope-end release on the record-implementor
-//        path), the post-scope field read would UAF — the release would
-//        drop the field's only reference. This cell is the CATCH for the
-//        paired-retain requirement: with the walker widening alone (W7-A
-//        49f8a1b, reverted by the reviewer), T4 would SEGV on read. With
-//        the walker widening AND the paired call-site retain (this fix),
-//        the call-site retain mints the extra +1 on the record-backed
-//        path, so the scope-end release drops soundly and the field stays
-//        alive. LSan ON for class-implementor control, OFF for record-
-//        implementor (records have no disposer, accepted #2505/T4-style
-//        family leak characteristic, not a defect this test should
-//        catch — same shape #2535-T4 documents; the test catches
-//        correct-and-no-UAF on the field read, exit == recorded length).
+//   T4 — implementor named local, post-scope read through the interface
+//        (exit == recorded length, no UAF). Was a RECORD implementor
+//        reaching the itable's record-path paired retain; §9.4 (v0.353)
+//        bars that program (#8089 fix-forward), so it is now a class.
 //   T5 — CONTROL — CLASS (non-interface) indexer: the leak #2505's gate
 //        excluded — the same shape as T1 with the interface removed.
 //        Sound under the walker widening (no interface dispatch ⇒ no
@@ -307,52 +294,29 @@ BEZEL_TEST(xmod_interface_indexer_named_local_setter_arc_2540,
 }
 
 // ===========================================================================
-// T4 — CRITICAL — RECORD-implementor named local (§9/§9.7/§11/§23.4/§28.9,
-// v0.236): the CATCH cell for the paired-call-site-retain requirement. A
-// RECORD is held through an INTERFACE-typed reference; the NAMED LOCAL is
-// passed to the interface-dispatched indexer SETTER (`iref[0] := s;`),
-// the user-written setter body assigns `value` into the record's string
-// field `_v` (record's plain store, §9/§9.7 — a record's reference fields
-// are borrows with no independent +1 and no disposer; even an explicit
-// `do _v := value; end;` setter is a plain store because the record has
-// no disposer to balance a retain). The field then ALIASES the local's
-// only reference; if the local's scope-end release (armed by the walker
-// widening) fires, the field's only ref is dropped and the post-scope
-// field read SEGVs.
+// T4 — implementor named local read back after the local's scope
+// (§11/§23.4/§28.9). The named local `s` is passed to the interface-dispatched
+// indexer SETTER (`iref[0] := s;`), whose body stores `value` into the
+// implementor's string field; the post-scope read `iref[0].Length` must see
+// the stored string (no UAF once the local's scope-end release fires).
 //
-// This is the exact UAF scenario the W7-A reviewer's WALKER-WIDENING-ONLY
-// rejection flagged. The paired call-site retain added in this commit —
-// the `ifaceIdxNamedLocalEligible` branch in lowerIndexerSet's itable
-// dispatch (the `recordBB` block, mirroring #2535's lowerVirtualPropertySet
-// shape) — mints the extra +1 on the RECORD-backed runtime path ONLY,
-// pre-balancing the local's scope-end release. With walker + paired
-// retain (this fix), the field stays alive past the local's scope and the
-// post-scope field read returns the length.
-//
-// The itable's owner-kind flag is NULL for a record-backed dispatch (set
-// up by #2506's append), so the flag read in this commit's itable dispatch
-// selects the `recordBB` path and the call-site retain fires. With the
-// walker widening ALONE (W7-A 49f8a1b, reverted), T4 would SEGV at the
-// `iref[0].Length` field read — the scope-end release drops the field's
-// only reference. This cell PASSES with the fix and FAILS (SEGV) without
-// it; demonstrably discriminated.
-//
-// LeakSanitizer OFF: a record's string field carries no independent +1 in
-// any code path (records have no disposer to balance a retain against) —
-// the pre-existing, accepted record-field-leak characteristic (same shape
-// #2505-T4 / #2506-T5 / #2500-T4 document). Not a defect this test should
-// fail on. The test catches the SAFETY half: no UAF/crash, value-round-
-// trips (the field stores "hello" via the user setter and reads back "hello"
-// through the getter).
+// Until #8089's fix-forward the implementor was a RECORD, which reached the
+// itable's `recordBB` paired-retain path. §9.4 (v0.353) now rejects that
+// program twice over — "a *setter body* whose store lands in the receiver's
+// own storage is rejected like any other member body", and "a value kind
+// cannot conform to an interface that declares a settable property or indexer
+// member at all" — so no legal program reaches the record path here, and the
+// implementor is a class (was `iface_record_indexer_named_local_no_uaf_9_7_23_4`).
+// LeakSanitizer OFF, as before.
 // ===========================================================================
 BEZEL_TEST(xmod_interface_indexer_named_local_setter_arc_2540,
-           iface_record_indexer_named_local_no_uaf_9_7_23_4) {
+           iface_class_indexer_named_local_post_scope_read_no_uaf_23_4) {
     const std::string src =
         "module LocalIface2540T4; "
         "public interface IIdx2540T4 "
         "  property [i: int]: string get; set; end; "
         "end IIdx2540T4; "
-        "public record RHolder2540T4: IIdx2540T4 "
+        "public class RHolder2540T4: IIdx2540T4 "
         "  public _v: string := \"init\"; "
         "  public property [i: int]: string "
         "    get => _v; "
@@ -361,7 +325,7 @@ BEZEL_TEST(xmod_interface_indexer_named_local_setter_arc_2540,
         "end RHolder2540T4; "
         "public class Program2540T4 "
         "  public static method Main(): int "
-        "    var r := new RHolder2540T4(); "
+        "    using var r := new RHolder2540T4(); "
         "    var iref: IIdx2540T4 := r; "
         "    do "
         "      var s := \"hel\" + \"lo\"; "

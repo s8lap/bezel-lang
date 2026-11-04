@@ -100,17 +100,13 @@
 //        The named-local `s` keeps its own +1 — releasing here would drop
 //        the local's only ref. LSan-clean post-fix.
 //
-//   T5 — RECORD-backed implementor behind the interface. §9 / §9.7: a
-//        record's setter PLAIN-STORES, so the field aliases newVal's heap
-//        after the setter call. Releasing newVal would UAF; the fix
-//        deliberately emits no release on the record path. This test pins:
-//        (a) no UAF / double-free on the record path, (b) the VALUE is
-//        correct (the boxed field is observable through the interface),
-//        (c) the existing record-path leak (bounded, the issue's recorded
-//        scope) is not WORSENED by the fix. This test uses `runAot`, not
-//        `runAotChecked`, because the record path's leak is the
-//        documented scope — `r.ran` would flip false for the bounded leak
-//        even with the fix.
+//   T5 — a second CLASS implementor, read back THROUGH the interface:
+//        no UAF / double-free, and the value stored by the compound is
+//        observable via `q[0]`. Until #8089's fix-forward this row used a
+//        RECORD implementor to reach the record (plain-store) path; §9.4
+//        (v0.353) bars that shape (a setter storing the receiver's own
+//        storage, and a value kind conforming to an interface with a
+//        settable member), so no legal program reaches the record path here.
 //
 //   T6 — VALUE-only probe with the issue's VERBATIM getter (`_s + "g"`),
 //        pinning the correct output value `bgxs` over 5 iterations. This
@@ -155,12 +151,16 @@ constexpr const char* kIface =
     "  end; "
     "end D; ";
 
-// Shared pair: RECORD-backed implementor behind an interface. Same
-// getter / setter shape as kIface, but the implementor is a record.
-constexpr const char* kRecordIface =
+// Second implementor behind the same interface, read back THROUGH the
+// interface. It was RECORD-backed until #8089's fix-forward; §9.4 (v0.353)
+// now bars that shape twice over — "a *setter body* whose store lands in the
+// receiver's own storage is rejected like any other member body", and "a value
+// kind cannot conform to an interface that declares a settable property or
+// indexer member at all" — so the implementor is a class (T5 below).
+constexpr const char* kSecondIface =
     "module M; "
     "public interface IBox property [i: int]: string; end IBox; "
-    "public record R: IBox "
+    "public class R: IBox "
     "  public _s: string := \"r\"; "
     "  public property [i: int]: string "
     "    get => _s; "
@@ -330,33 +330,28 @@ BEZEL_TEST(codegen_compound_assign_interface_indexer_owner_release_2847,
 }
 
 // ---------------------------------------------------------------------------
-// T5 — RECORD-backed implementor behind the interface. §9 / §9.7: a
-// record's setter PLAIN-STORES, so the field aliases newVal's heap
-// after the setter call. Releasing newVal would UAF; the fix deliberately
-// emits no release on the record path. This test pins:
+// T5 — a second implementor behind the interface, read back THROUGH the
+// interface. Was `iface_record_impl_record_path_no_uaf_9_9_7`, a RECORD
+// implementor reaching the record (plain-store) path; §9.4 (v0.353) now
+// rejects that program ("a *setter body* whose store lands in the receiver's
+// own storage is rejected like any other member body"; "a value kind cannot
+// conform to an interface that declares a settable property or indexer member
+// at all"), so the implementor is a class (#8089 fix-forward). This test pins:
 //
-//   * The program EXITS cleanly (no UAF / double-free) on the record path.
-//   * The VALUE is correct (the boxed field is observable through the
-//     interface — `q[0]` reads the latest value the box stored).
+//   * The program EXITS cleanly (no UAF / double-free).
+//   * The VALUE is correct (`q[0]` reads the latest value stored through
+//     the interface).
 //   * The program reaches the end of `Main` and returns 0.
-//
-// This test uses `runAot`, NOT `runAotChecked` — the record path's leak
-// is the issue's documented scope (`r.ran` would flip false even with the
-// fix). Pinning the record path's SAFETY, not its LSan-cleanliness.
-//
-//   Pre-fix and post-fix: `r.ran = true`, value observable.
-//   What this test pins: the fix did NOT regress the record path into a
-//   UAF by releasing newVal on the record block.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_compound_assign_interface_indexer_owner_release_2847,
-           iface_record_impl_record_path_no_uaf_9_9_7) {
+           iface_second_class_impl_read_through_iface_no_uaf_23_4) {
     auto r = runAot(
-        std::string(kRecordIface) +
+        std::string(kSecondIface) +
         "class C "
         "  public static method Main(): int "
         "    var k := 0; "
         "    while k < 5 do "
-        "      var r := new R(); "
+        "      using var r := new R(); "
         "      var q: IBox := r; "
         "      q[0] += \"x\"; "
         "      Console.WriteLine(q[0]); "         // boxed: read through iface
@@ -365,11 +360,10 @@ BEZEL_TEST(codegen_compound_assign_interface_indexer_owner_release_2847,
         "    return 0; "
         "  end Main; "
         "end C;");
-    // §9 value semantics: the record's `_s` lives in the BOX; reading
-    // back through the interface sees the stored value. After each
-    // iteration: get "r" -> + "x" = "rx" -> set "rxs"; the next read
-    // gets the box's latest. 5 lines, each containing "rxs".
-    BEZEL_EXPECT_TRUE(r.ran);                    // no UAF (record path is sound)
+    // Reading back through the interface sees the stored value. Each
+    // iteration: get "r" -> + "x" = "rx" -> set "rxs". 5 lines, each
+    // containing "rxs".
+    BEZEL_EXPECT_TRUE(r.ran);                    // no UAF
     BEZEL_EXPECT_TRUE(r.stdoutText.find("rxs") != std::string::npos);
 }
 

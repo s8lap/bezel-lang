@@ -284,10 +284,13 @@ const char* kRecordGetterOnlyRejected =
     "  end Main; "
     "end C;";
 
-// ---- ACCEPT control 6 (CLASS (was a record until #8089: §9.4 now rejects a record setter/indexer-setter body storing own storage) — real
-//      read-write indexer, §23.4 "Body-form records with mutable properties
-//      may declare read-write indexers") ------------------------------------
-const char* kRecordBodyFormReadWriteAccepted =
+// ---- ACCEPT control 6 (CLASS, body-form read-write indexer storing its own
+//      field). Was a RECORD until #8089's fix-forward: §9.4 (v0.353) now
+//      rejects a record setter body storing the receiver's own storage, and
+//      "a value kind cannot conform to an interface that declares a settable
+//      property or indexer member at all", so the record shape of this
+//      control is unrepresentable (was `record_bodyform_readwrite_...`) ------
+const char* kClassBodyFormReadWriteAccepted =
     "module M; "
     "public interface IBox "
     "  property [i: int]: int; "
@@ -370,6 +373,6 @@ BEZEL_TEST(getter_only_readwrite_iface_indexer_2417,
 }
 
 BEZEL_TEST(getter_only_readwrite_iface_indexer_2417,
-           record_bodyform_readwrite_accepted_runs_correct_value) {
-    BEZEL_EXPECT_TRUE(runs(37, kRecordBodyFormReadWriteAccepted));
+           class_bodyform_readwrite_accepted_runs_correct_value) {
+    BEZEL_EXPECT_TRUE(runs(37, kClassBodyFormReadWriteAccepted));
 }

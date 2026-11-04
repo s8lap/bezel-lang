@@ -88,6 +88,17 @@
 // status is WEXITSTATUS-masked to 8 bits, per the lane protocol and
 // #2401's own test file's documented mistake).
 
+// FIXTURE NOTE (#8089 fix-forward, §9.4 v0.353): T4 (GET only) drops its
+// unused record setter. The other RECORD fixtures below
+// whose accessor stored the record's own field are now in the §9.4 MEDIATING
+// shape — the backing value lives in a class the record borrows, and the
+// accessor stores beyond that class-typed hop ("a store beyond such a hop
+// lands in the borrowed heap object, not in the receiver, and is legal").
+// §9.4 rejects the former shape: "a *setter body* whose store lands in the
+// receiver's own storage is rejected like any other member body". The record
+// receiver still lowers through the same accessor path and every expected
+// value is unchanged; the stored value is now observed through the class.
+
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -173,11 +184,13 @@ BEZEL_TEST(xmod_record_property_setter_indexer_import_2489,
            setter_public_backing_positional_and_body_direct_set_then_read) {
     const char* lib =
         "module RecSetLib2489T1; "
-        "public record RecSet2489T1(x: int) "
-        "  public _n: int := 1; "
+        "public class RecSet2489T1Cell "
+        "  public V: int := 1; "
+        "end RecSet2489T1Cell; "
+        "public record RecSet2489T1(x: int, cell: RecSet2489T1Cell) "
         "  public property Name: int "
-        "    get => _n; "
-        "    set => _n := value; "
+        "    get => cell.V; "
+        "    set => cell.V := value; "
         "  end Name; "
         "end RecSet2489T1;";
     int r = compileImportAndRun2489(
@@ -185,7 +198,8 @@ BEZEL_TEST(xmod_record_property_setter_indexer_import_2489,
         "module App2489T1; import RecSetLib2489T1; "
         "public class C2489T1 "
         "  public static method Main(): int "
-        "    var r := new RecSet2489T1(9); "
+        "    using var c := new RecSet2489T1Cell(); "
+        "    var r := new RecSet2489T1(9, c); "
         "    r.Name := 55; "
         "    return r.x + r.Name; "
         "  end Main; "
@@ -205,11 +219,18 @@ BEZEL_TEST(xmod_record_property_setter_indexer_import_2489,
            setter_private_backing_direct_set_then_read) {
     const char* lib =
         "module RecSetLib2489T2; "
+        "public class RecSet2489T2Cell "
+        "  public V: int := 1; "
+        "end RecSet2489T2Cell; "
         "public record RecSet2489T2(x: int) "
-        "  private _n: int := 1; "
+        "  private _c: RecSet2489T2Cell; "
+        "  public constructor(x: int, c: RecSet2489T2Cell) "
+        "    this.x := x; "
+        "    _c := c; "
+        "  end constructor; "
         "  public property Name: int "
-        "    get => _n; "
-        "    set => _n := value; "
+        "    get => _c.V; "
+        "    set => _c.V := value; "
         "  end Name; "
         "end RecSet2489T2;";
     int r = compileImportAndRun2489(
@@ -217,7 +238,8 @@ BEZEL_TEST(xmod_record_property_setter_indexer_import_2489,
         "module App2489T2; import RecSetLib2489T2; "
         "public class C2489T2 "
         "  public static method Main(): int "
-        "    var r := new RecSet2489T2(9); "
+        "    using var c := new RecSet2489T2Cell(); "
+        "    var r := new RecSet2489T2(9, c); "
         "    r.Name := 47; "
         "    return r.x + r.Name; "
         "  end Main; "
@@ -271,7 +293,6 @@ BEZEL_TEST(xmod_record_property_setter_indexer_import_2489,
         "  public _v: int := 0; "
         "  public property [i: int]: int "
         "    get => _v + i; "
-        "    set => _v := value - i; "
         "  end; "
         "end IdxRec2489T4;";
     int r = compileImportAndRun2489(
@@ -300,11 +321,18 @@ BEZEL_TEST(xmod_record_property_setter_indexer_import_2489,
            indexer_set_then_get_private_backing) {
     const char* lib =
         "module RecIdxLib2489T5; "
+        "public class IdxRec2489T5Cell "
+        "  public V: int := 0; "
+        "end IdxRec2489T5Cell; "
         "public record IdxRec2489T5(seed: int) "
-        "  private _v: int := 0; "
+        "  private _c: IdxRec2489T5Cell; "
+        "  public constructor(seed: int, c: IdxRec2489T5Cell) "
+        "    this.seed := seed; "
+        "    _c := c; "
+        "  end constructor; "
         "  public property [i: int]: int "
-        "    get => _v + i; "
-        "    set => _v := value - i; "
+        "    get => _c.V + i; "
+        "    set => _c.V := value - i; "
         "  end; "
         "end IdxRec2489T5;";
     int r = compileImportAndRun2489(
@@ -312,7 +340,8 @@ BEZEL_TEST(xmod_record_property_setter_indexer_import_2489,
         "module App2489T5; import RecIdxLib2489T5; "
         "public class C2489T5 "
         "  public static method Main(): int "
-        "    var r := new IdxRec2489T5(9); "
+        "    using var c := new IdxRec2489T5Cell(); "
+        "    var r := new IdxRec2489T5(9, c); "
         "    r[5] := 9; "
         "    return r[2]; "
         "  end Main; "

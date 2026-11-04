@@ -43,6 +43,16 @@
 // multiply) so a stale read could never coincidentally match a correct
 // write's result.
 
+// FIXTURE NOTE (#8089 fix-forward, §9.4 v0.353): the RECORD fixtures below
+// whose accessor stored the record's own field are now in the §9.4 MEDIATING
+// shape — the backing value lives in a class the record borrows, and the
+// accessor stores beyond that class-typed hop ("a store beyond such a hop
+// lands in the borrowed heap object, not in the receiver, and is legal").
+// §9.4 rejects the former shape: "a *setter body* whose store lands in the
+// receiver's own storage is rejected like any other member body". The record
+// receiver still lowers through the same accessor path and every expected
+// value is unchanged; the stored value is now observed through the class.
+
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -62,16 +72,19 @@ int run(const std::string& program) {
 BEZEL_TEST(indexer_setter_local_record_2502, public_backing_set_then_get) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "public record IdxRecLocal2502T1(seed: int) "
-        "  public _v: int := 0; "
+        "public class IdxRecLocal2502T1Cell "
+        "  public V: int := 0; "
+        "end IdxRecLocal2502T1Cell; "
+        "public record IdxRecLocal2502T1(seed: int, cell: IdxRecLocal2502T1Cell) "
         "  public property [i: int]: int "
-        "    get => _v + i; "
-        "    set => _v := value - i; "
+        "    get => cell.V + i; "
+        "    set => cell.V := value - i; "
         "  end; "
         "end IdxRecLocal2502T1; "
         "public class C2502T1 "
         "  public static method Main(): int "
-        "    var r := new IdxRecLocal2502T1(9); "
+        "    using var c := new IdxRecLocal2502T1Cell(); "
+        "    var r := new IdxRecLocal2502T1(9, c); "
         "    r[5] := 9; "
         "    return r[2]; "
         "  end Main; "
@@ -84,16 +97,24 @@ BEZEL_TEST(indexer_setter_local_record_2502, public_backing_set_then_get) {
 BEZEL_TEST(indexer_setter_local_record_2502, private_backing_set_then_get) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
+        "public class IdxRecLocal2502T2Cell "
+        "  public V: int := 0; "
+        "end IdxRecLocal2502T2Cell; "
         "public record IdxRecLocal2502T2(seed: int) "
-        "  private _v: int := 0; "
+        "  private _c: IdxRecLocal2502T2Cell; "
+        "  public constructor(seed: int, c: IdxRecLocal2502T2Cell) "
+        "    this.seed := seed; "
+        "    _c := c; "
+        "  end constructor; "
         "  public property [i: int]: int "
-        "    get => _v + i; "
-        "    set => _v := value - i; "
+        "    get => _c.V + i; "
+        "    set => _c.V := value - i; "
         "  end; "
         "end IdxRecLocal2502T2; "
         "public class C2502T2 "
         "  public static method Main(): int "
-        "    var r := new IdxRecLocal2502T2(9); "
+        "    using var c := new IdxRecLocal2502T2Cell(); "
+        "    var r := new IdxRecLocal2502T2(9, c); "
         "    r[3] := 20; "
         "    return r[4]; "
         "  end Main; "
@@ -133,16 +154,19 @@ BEZEL_TEST(indexer_setter_local_record_2502, class_control_unaffected) {
 BEZEL_TEST(indexer_setter_local_record_2502, inline_array_element_receiver) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "public record IdxRecLocal2502T4(seed: int) "
-        "  public _v: int := 0; "
+        "public class IdxRecLocal2502T4Cell "
+        "  public V: int := 0; "
+        "end IdxRecLocal2502T4Cell; "
+        "public record IdxRecLocal2502T4(seed: int, cell: IdxRecLocal2502T4Cell) "
         "  public property [i: int]: int "
-        "    get => _v + i; "
-        "    set => _v := value - i; "
+        "    get => cell.V + i; "
+        "    set => cell.V := value - i; "
         "  end; "
         "end IdxRecLocal2502T4; "
         "public class C2502T4 "
         "  public static method Main(): int "
-        "    var arr: [1]IdxRecLocal2502T4 := [new IdxRecLocal2502T4(9)]; "
+        "    using var c := new IdxRecLocal2502T4Cell(); "
+        "    var arr: [1]IdxRecLocal2502T4 := [new IdxRecLocal2502T4(9, c)]; "
         "    arr[0][5] := 9; "
         "    return arr[0][2]; "
         "  end Main; "

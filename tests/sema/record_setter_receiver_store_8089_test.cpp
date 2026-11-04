@@ -150,3 +150,84 @@ BEZEL_TEST(record_setter_receiver_store_8089,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("5\n"));
 }
+
+// §9.4 (v0.353), "Value receivers are borrows": "In every instance member body
+// of a value kind ... — a record method or accessor body here; ... — `this`
+// binds a borrow of the receiver value. Consequently a store that would land
+// in the receiver's own storage is a compile error at the member body". A
+// GETTER is an accessor body too, so its store is rejected (base accepted it
+// and wrote through to the caller's value, printing 3).
+BEZEL_TEST(record_setter_receiver_store_8089,
+           getter_store_into_own_storage_rejected_spec_9_4) {
+    auto r = runAot(
+        std::string("module Conf; "
+        "public record Gauge "
+        "  public property Raw: int; "
+        "  public constructor(raw: int) "
+        "    Raw := raw; "
+        "  end constructor; "
+        "  public property Bump: int "
+        "    get => do Raw := Raw + 1; return Raw; end; "
+        "  end Bump; "
+        "end Gauge; ") + kMain);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, kStore));
+}
+
+// §9.4 (v0.353): "The receiver's own storage is what an lvalue chain rooted at
+// `this` reaches without leaving the value". A `static` field is not reached
+// through `this`, so an instance SETTER storing one is legal. (Accepted before
+// #8089, rejected by its first commit, accepted again by the fix-forward.)
+BEZEL_TEST(record_setter_receiver_store_8089,
+           setter_store_to_static_field_accepted_spec_9_4) {
+    auto r = runAot(
+        "module Conf; "
+        "public record Gauge "
+        "  public static Count: int := 0; "
+        "  public readonly property Raw: int; "
+        "  public constructor(raw: int) "
+        "    Raw := raw; "
+        "  end constructor; "
+        "  public property D: int "
+        "    get => Raw; "
+        "    set => do Count := Count + value; end; "
+        "  end D; "
+        "end Gauge; "
+        "public class Program "
+        "  public static method Main() "
+        "    var g := new Gauge(2); "
+        "    g.D := 4; "
+        "    Console.WriteLine(Gauge.Count); "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("4\n"));
+}
+
+// The METHOD twin of the row above: the `static` test on the stored symbol
+// used to run only on the constructor-lambda path, so an instance record
+// method storing a static field was rejected as a receiver store.
+BEZEL_TEST(record_setter_receiver_store_8089,
+           method_store_to_static_field_accepted_spec_9_4) {
+    auto r = runAot(
+        "module Conf; "
+        "public record Gauge "
+        "  public static Count: int := 0; "
+        "  public readonly property Raw: int; "
+        "  public constructor(raw: int) "
+        "    Raw := raw; "
+        "  end constructor; "
+        "  public method M() "
+        "    Count := Count + 100; "
+        "  end M; "
+        "end Gauge; "
+        "public class Program "
+        "  public static method Main() "
+        "    var g := new Gauge(2); "
+        "    g.M(); "
+        "    Console.WriteLine(Gauge.Count); "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}

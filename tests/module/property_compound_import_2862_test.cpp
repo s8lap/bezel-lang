@@ -47,6 +47,16 @@
 // Values are kept < 256 where the observable is the exit status
 // (WEXITSTATUS-masked to 8 bits).
 
+// FIXTURE NOTE (#8089 fix-forward, §9.4 v0.353): the RECORD fixtures below
+// whose accessor stored the record's own field are now in the §9.4 MEDIATING
+// shape — the backing value lives in a class the record borrows, and the
+// accessor stores beyond that class-typed hop ("a store beyond such a hop
+// lands in the borrowed heap object, not in the receiver, and is legal").
+// §9.4 rejects the former shape: "a *setter body* whose store lands in the
+// receiver's own storage is rejected like any other member body". The record
+// receiver still lowers through the same accessor path and every expected
+// value is unchanged; the stored value is now observed through the class.
+
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -214,11 +224,13 @@ BEZEL_TEST(property_compound_import_2862, imported_plain_set_unchanged_2400) {
 BEZEL_TEST(property_compound_import_2862, imported_record_property_9_2) {
     const char* lib =
         "module PropLib2862T4; "
-        "public record R2862T4(Tag: int) "
+        "public class Cell2862T4 "
         "  public _s: int := 0; "
+        "end Cell2862T4; "
+        "public record R2862T4(Tag: int, Cell: Cell2862T4) "
         "  public property P: int "
-        "    get => _s + 100; "
-        "    set => do _s := value + 1; end; "
+        "    get => Cell._s + 100; "
+        "    set => do Cell._s := value + 1; end; "
         "  end; "
         "end R2862T4;";
     int r = compileImportAndRun2862(
@@ -226,9 +238,10 @@ BEZEL_TEST(property_compound_import_2862, imported_record_property_9_2) {
         "module App2862T4; import PropLib2862T4; "
         "public class C2862T4 "
         "  public static method Main(): int "
-        "    var r := new R2862T4(3); "
+        "    using var c := new Cell2862T4(); "
+        "    var r := new R2862T4(3, c); "
         "    r.P++; "
-        "    return r._s; "
+        "    return c._s; "
         "  end Main; "
         "end C2862T4;");
     if (r == -2) return;

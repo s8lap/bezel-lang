@@ -45,6 +45,16 @@
 // dropped write (the pristine getter value) could never coincidentally
 // match a correct write's result.
 
+// FIXTURE NOTE (#8089 fix-forward, §9.4 v0.353): the RECORD fixtures below
+// whose accessor stored the record's own field are now in the §9.4 MEDIATING
+// shape — the backing value lives in a class the record borrows, and the
+// accessor stores beyond that class-typed hop ("a store beyond such a hop
+// lands in the borrowed heap object, not in the receiver, and is legal").
+// §9.4 rejects the former shape: "a *setter body* whose store lands in the
+// receiver's own storage is rejected like any other member body". The record
+// receiver still lowers through the same accessor path and every expected
+// value is unchanged; the stored value is now observed through the class.
+
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -116,11 +126,13 @@ BEZEL_TEST(indexer_compound_increment_import_2509,
            record_compound_add_public_backing) {
     const char* lib =
         "module RecIdxLib2509T1; "
-        "public record IdxRec2509T1(seed: int) "
-        "  public _v: int := 0; "
+        "public class IdxRec2509T1Cell "
+        "  public V: int := 0; "
+        "end IdxRec2509T1Cell; "
+        "public record IdxRec2509T1(seed: int, cell: IdxRec2509T1Cell) "
         "  public property [i: int]: int "
-        "    get => _v + i; "
-        "    set => _v := value - i; "
+        "    get => cell.V + i; "
+        "    set => cell.V := value - i; "
         "  end; "
         "end IdxRec2509T1;";
     int r = compileImportAndRun2509(
@@ -128,7 +140,8 @@ BEZEL_TEST(indexer_compound_increment_import_2509,
         "module App2509T1; import RecIdxLib2509T1; "
         "public class C2509T1 "
         "  public static method Main(): int "
-        "    var r := new IdxRec2509T1(9); "
+        "    using var c := new IdxRec2509T1Cell(); "
+        "    var r := new IdxRec2509T1(9, c); "
         "    r[5] += 3; "
         "    return r[2]; "
         "  end Main; "
@@ -145,11 +158,13 @@ BEZEL_TEST(indexer_compound_increment_import_2509,
 BEZEL_TEST(indexer_compound_increment_import_2509, record_increment) {
     const char* lib =
         "module RecIdxLib2509T2; "
-        "public record IdxRec2509T2(seed: int) "
-        "  public _v: int := 0; "
+        "public class IdxRec2509T2Cell "
+        "  public V: int := 0; "
+        "end IdxRec2509T2Cell; "
+        "public record IdxRec2509T2(seed: int, cell: IdxRec2509T2Cell) "
         "  public property [i: int]: int "
-        "    get => _v + i; "
-        "    set => _v := value - i; "
+        "    get => cell.V + i; "
+        "    set => cell.V := value - i; "
         "  end; "
         "end IdxRec2509T2;";
     int r = compileImportAndRun2509(
@@ -157,7 +172,8 @@ BEZEL_TEST(indexer_compound_increment_import_2509, record_increment) {
         "module App2509T2; import RecIdxLib2509T2; "
         "public class C2509T2 "
         "  public static method Main(): int "
-        "    var r := new IdxRec2509T2(9); "
+        "    using var c := new IdxRec2509T2Cell(); "
+        "    var r := new IdxRec2509T2(9, c); "
         "    r[5]++; "
         "    return r[2]; "
         "  end Main; "
@@ -175,11 +191,13 @@ BEZEL_TEST(indexer_compound_increment_import_2509, record_increment) {
 BEZEL_TEST(indexer_compound_increment_import_2509, record_compound_sub) {
     const char* lib =
         "module RecIdxLib2509T3; "
-        "public record IdxRec2509T3(seed: int) "
-        "  public _v: int := 0; "
+        "public class IdxRec2509T3Cell "
+        "  public V: int := 0; "
+        "end IdxRec2509T3Cell; "
+        "public record IdxRec2509T3(seed: int, cell: IdxRec2509T3Cell) "
         "  public property [i: int]: int "
-        "    get => _v + i; "
-        "    set => _v := value - i; "
+        "    get => cell.V + i; "
+        "    set => cell.V := value - i; "
         "  end; "
         "end IdxRec2509T3;";
     int r = compileImportAndRun2509(
@@ -187,7 +205,8 @@ BEZEL_TEST(indexer_compound_increment_import_2509, record_compound_sub) {
         "module App2509T3; import RecIdxLib2509T3; "
         "public class C2509T3 "
         "  public static method Main(): int "
-        "    var r := new IdxRec2509T3(9); "
+        "    using var c := new IdxRec2509T3Cell(); "
+        "    var r := new IdxRec2509T3(9, c); "
         "    r[4] -= 1; "
         "    return r[7]; "
         "  end Main; "
@@ -204,11 +223,13 @@ BEZEL_TEST(indexer_compound_increment_import_2509, record_compound_sub) {
 BEZEL_TEST(indexer_compound_increment_import_2509, record_decrement) {
     const char* lib =
         "module RecIdxLib2509T4; "
-        "public record IdxRec2509T4(seed: int) "
-        "  public _v: int := 0; "
+        "public class IdxRec2509T4Cell "
+        "  public V: int := 0; "
+        "end IdxRec2509T4Cell; "
+        "public record IdxRec2509T4(seed: int, cell: IdxRec2509T4Cell) "
         "  public property [i: int]: int "
-        "    get => _v + i; "
-        "    set => _v := value - i; "
+        "    get => cell.V + i; "
+        "    set => cell.V := value - i; "
         "  end; "
         "end IdxRec2509T4;";
     int r = compileImportAndRun2509(
@@ -216,7 +237,8 @@ BEZEL_TEST(indexer_compound_increment_import_2509, record_decrement) {
         "module App2509T4; import RecIdxLib2509T4; "
         "public class C2509T4 "
         "  public static method Main(): int "
-        "    var r := new IdxRec2509T4(9); "
+        "    using var c := new IdxRec2509T4Cell(); "
+        "    var r := new IdxRec2509T4(9, c); "
         "    r[3]--; "
         "    return r[8]; "
         "  end Main; "
@@ -297,11 +319,13 @@ BEZEL_TEST(indexer_compound_increment_import_2509,
            record_multi_dim_compound_sub) {
     const char* lib =
         "module MultiIdxLib2509T7; "
-        "public record MultiIdxRec2509T7(seed: int) "
-        "  public _v: int := 0; "
+        "public class MultiIdxRec2509T7Cell "
+        "  public V: int := 0; "
+        "end MultiIdxRec2509T7Cell; "
+        "public record MultiIdxRec2509T7(seed: int, cell: MultiIdxRec2509T7Cell) "
         "  public property [i: int, j: int]: int "
-        "    get => _v + i * 10 + j; "
-        "    set => _v := value - i * 10 - j; "
+        "    get => cell.V + i * 10 + j; "
+        "    set => cell.V := value - i * 10 - j; "
         "  end; "
         "end MultiIdxRec2509T7;";
     int r = compileImportAndRun2509(
@@ -309,7 +333,8 @@ BEZEL_TEST(indexer_compound_increment_import_2509,
         "module App2509T7; import MultiIdxLib2509T7; "
         "public class C2509T7 "
         "  public static method Main(): int "
-        "    var r := new MultiIdxRec2509T7(9); "
+        "    using var c := new MultiIdxRec2509T7Cell(); "
+        "    var r := new MultiIdxRec2509T7(9, c); "
         "    r[2, 3] -= 5; "
         "    return r[1, 1]; "
         "  end Main; "
@@ -331,11 +356,18 @@ BEZEL_TEST(indexer_compound_increment_import_2509,
            record_private_backing_decrement) {
     const char* lib =
         "module PrivIdxLib2509T8; "
+        "public class PrivIdxRec2509T8Cell "
+        "  public V: int := 0; "
+        "end PrivIdxRec2509T8Cell; "
         "public record PrivIdxRec2509T8(seed: int) "
-        "  private _w: int := 0; "
+        "  private _c: PrivIdxRec2509T8Cell; "
+        "  public constructor(seed: int, c: PrivIdxRec2509T8Cell) "
+        "    this.seed := seed; "
+        "    _c := c; "
+        "  end constructor; "
         "  public property [k: int]: int "
-        "    get => _w + k; "
-        "    set => _w := value - k; "
+        "    get => _c.V + k; "
+        "    set => _c.V := value - k; "
         "  end; "
         "end PrivIdxRec2509T8;";
     int r = compileImportAndRun2509(
@@ -343,7 +375,8 @@ BEZEL_TEST(indexer_compound_increment_import_2509,
         "module App2509T8; import PrivIdxLib2509T8; "
         "public class C2509T8 "
         "  public static method Main(): int "
-        "    var r := new PrivIdxRec2509T8(9); "
+        "    using var c := new PrivIdxRec2509T8Cell(); "
+        "    var r := new PrivIdxRec2509T8(9, c); "
         "    r[4]--; "
         "    return r[3]; "
         "  end Main; "

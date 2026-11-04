@@ -17,7 +17,8 @@
 //  (b) Block-form getter on a CLASS via interface → returns 7 (classes went
 //      through Pass D which was already correct; this is a regression guard).
 //  (c) Block-form getter with multiple statements on a record via interface.
-//  (d) Block-form setter on a record via interface (read-write property).
+//  (d) Block-form setter via interface (read-write property) — a CLASS
+//      implementor since #8089's fix-forward (§9.4 bars the record shape).
 //  (e) Control: expression-form property via interface — record + class.
 //  (f) Control: block-form property called directly (not via interface).
 //  (g) Interface with ONLY properties (no methods) — used to be skipped entirely
@@ -122,17 +123,19 @@ BEZEL_TEST(codegen_blockform_property_itable, record_blockgetter_multi_stmt_via_
         "end C;"), 8);
 }
 
-// (d) Block-form SETTER on a record via interface.  §23 / §13: read-write
-// property with both a block-form getter and a block-form setter. The record
-// is a body record (not positional) so the field initializer does not
-// reference another instance member (§22.8 forbids that). The setter mutates
-// the boxed copy of the record (the interface variable holds the box).
-// Set to 42, read back via interface → 42.
-BEZEL_TEST(codegen_blockform_property_itable, record_block_setter_via_interface) {
+// (d) Block-form SETTER via interface.  §23 / §13: read-write property with
+// both a block-form getter and a block-form setter, dispatched through the
+// itable. The implementor is a CLASS: §9.4 (v0.353) makes the former record
+// shape unrepresentable twice over — "a *setter body* whose store lands in
+// the receiver's own storage is rejected like any other member body", and "a
+// value kind cannot conform to an interface that declares a settable property
+// or indexer member at all" (#8089 fix-forward; was
+// `record_block_setter_via_interface`). Set to 42, read back via interface → 42.
+BEZEL_TEST(codegen_blockform_property_itable, class_block_setter_via_interface) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "interface IRW  property Count: int; end IRW; "
-        "record Counter : IRW "
+        "class Counter : IRW "
         "  protected _n: int := 0; "
         "  public property Count: int "
         "    get => do return _n; end; "
@@ -141,7 +144,7 @@ BEZEL_TEST(codegen_blockform_property_itable, record_block_setter_via_interface)
         "end Counter; "
         "class C "
         "  public static method Main(): int "
-        "    var c := new Counter(); "
+        "    using var c := new Counter(); "
         "    var r: IRW := c; "
         "    r.Count := 42; "
         "    return r.Count; "

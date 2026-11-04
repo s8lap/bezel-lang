@@ -51,6 +51,16 @@
 // path. Reproduced for `int?` (property), `long?` (indexer) and `double?`
 // (interface property) while probing this fix; filed as #2888.
 
+// FIXTURE NOTE (#8089 fix-forward, §9.4 v0.353): the RECORD fixtures below
+// whose accessor stored the record's own field are now in the §9.4 MEDIATING
+// shape — the backing value lives in a class the record borrows, and the
+// accessor stores beyond that class-typed hop ("a store beyond such a hop
+// lands in the borrowed heap object, not in the receiver, and is legal").
+// §9.4 rejects the former shape: "a *setter body* whose store lands in the
+// receiver's own storage is rejected like any other member body". The record
+// receiver still lowers through the same accessor path and every expected
+// value is unchanged; the stored value is now observed through the class.
+
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -277,19 +287,22 @@ BEZEL_TEST(codegen_decimal_property_compound_2883, non_decimal_properties_unchan
 BEZEL_TEST(codegen_decimal_property_compound_2883, record_backed_property_9_2) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M2883c; "
-        "public record Rec2883 "
+        "public class Cell2883 "
         "  public _v: decimal := 0m; "
-        "  public property P: decimal get => _v; set => do _v := value; end; end; "
+        "end Cell2883; "
+        "public record Rec2883(Cell: Cell2883) "
+        "  public property P: decimal get => Cell._v; set => do Cell._v := value; end; end; "
         "end Rec2883; "
         "public class Main2883c "
         "  public static method Main(): int "
-        "    var r: Rec2883 := new Rec2883(); "
-        "    r._v := 4m; "
+        "    using var c := new Cell2883(); "
+        "    var r: Rec2883 := new Rec2883(c); "
+        "    c._v := 4m; "
         "    r.P += 1.5m; "
-        "    Console.Write(r._v.ToString()); "
+        "    Console.Write(c._v.ToString()); "
         "    Console.Write(\"|\"); "
         "    r.P++; "
-        "    Console.WriteLine(r._v.ToString()); "
+        "    Console.WriteLine(c._v.ToString()); "
         "    return 0; "
         "  end Main; "
         "end Main2883c;"), "5.5|6.5");

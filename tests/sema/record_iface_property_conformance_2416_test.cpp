@@ -189,9 +189,13 @@ const char* kPositionalFieldVsReadonlyAccepted =
     "  end Main; "
     "end C;";
 
-// ---- ACCEPT control 3 (read-write record property vs read-write interface
-//      property — the itable setter slot is genuinely filled) -------------
-const char* kRecordReadWriteVsReadWriteAccepted =
+// ---- ACCEPT control 3 (read-write CLASS property vs read-write interface
+//      property — the itable setter slot is genuinely filled). Was a RECORD
+//      until #8089's fix-forward: §9.4 (v0.353) rejects a record setter body
+//      storing the receiver's own storage, and "a value kind cannot conform to
+//      an interface that declares a settable property or indexer member at
+//      all", so this control is a class (was `record_readwrite_vs_...`) ----
+const char* kClassReadWriteVsReadWriteAccepted =
     "module M; "
     "public interface IHas "
     "  property Val: int; "
@@ -271,6 +275,6 @@ BEZEL_TEST(record_iface_property_conformance_2416,
 }
 
 BEZEL_TEST(record_iface_property_conformance_2416,
-           record_readwrite_vs_readwrite_accepted_runs_correct_value) {
-    BEZEL_EXPECT_TRUE(runs(42, kRecordReadWriteVsReadWriteAccepted));
+           class_readwrite_vs_readwrite_accepted_runs_correct_value) {
+    BEZEL_EXPECT_TRUE(runs(42, kClassReadWriteVsReadWriteAccepted));
 }

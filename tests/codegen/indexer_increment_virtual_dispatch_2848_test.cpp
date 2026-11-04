@@ -69,6 +69,20 @@
 // indexer: silently discarded when this file was written, now REJECTED in sema
 // — T16 was updated accordingly and asserts the rejection).
 
+// FIXTURE NOTE (#8089 fix-forward, §9.4 v0.353): the RECORD fixtures below
+// whose accessor stored the record's own field are now in the §9.4 MEDIATING
+// shape — the backing value lives in a class the record borrows, and the
+// accessor stores beyond that class-typed hop ("a store beyond such a hop
+// lands in the borrowed heap object, not in the receiver, and is legal").
+// §9.4 rejects the former shape: "a *setter body* whose store lands in the
+// receiver's own storage is rejected like any other member body". The record
+// receiver still lowers through the same accessor path and every expected
+// value is unchanged; the stored value is now observed through the class.
+// The exception is T19, the record-backed INTERFACE receiver: a value kind
+// cannot conform to an interface with a settable member (§9.4), so that row
+// now pins the rejection.
+
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -592,15 +606,17 @@ BEZEL_TEST(codegen_indexer_increment_virtual_2848,
            record_receiver_unchanged_9_23_4) {
     BEZEL_EXPECT_EQ(run(runAot(
         "module M; "
-        "record R "
+        "class Cell "
         "  public V: int := 0; "
+        "end Cell; "
+        "record R(Box: Cell) "
         "  public property [i: int]: int "
-        "    get => V + 100; "
-        "    set => do V := value + 1; end; "
+        "    get => Box.V + 100; "
+        "    set => do Box.V := value + 1; end; "
         "  end; "
         "end R; "
         "class C public static method Main(): int "
-        "  var r := new R(); r[3]++; return r.V; "
+        "  using var c := new Cell(); var r := new R(c); r[3]++; return c.V; "
         "end Main; end C;")), 102);
 }
 
@@ -750,14 +766,19 @@ BEZEL_TEST(codegen_indexer_increment_virtual_2848,
         decls + "  b[0]++; return d._s; end Main; end C;")), 203);
 }
 
-// T19 — a RECORD reached through an INTERFACE-typed variable: the itable branch
-// can land on a record-backed implementor. §9 value semantics mean the write
-// lands in the BOX, not in `r`, so both halves are asserted — reading back
-// through the interface sees the stored value while the original record is
-// untouched. (This mirrors #2836's T22 for the `++` spelling.)
+// T19 — a RECORD reached through an INTERFACE-typed variable, the itable
+// branch landing on a record-backed implementor. This row used to assert the
+// §9 box semantics of that dispatch (read back through the interface 403, the
+// original record untouched at 0). §9.4 (v0.353) now rejects the program: "a
+// *setter body* whose store lands in the receiver's own storage is rejected
+// like any other member body" (and "a value kind cannot conform to an
+// interface that declares a settable property or indexer member at all"), so
+// the record-backed shape is unrepresentable and the row pins the rejection
+// (#8089 fix-forward; was `record_backed_interface_receiver_9_23_4`).
+// (This mirrors #2836's T22 for the `++` spelling.)
 BEZEL_TEST(codegen_indexer_increment_virtual_2848,
-           record_backed_interface_receiver_9_23_4) {
-    const std::string prog =
+           record_backed_interface_receiver_setter_rejected_9_4) {
+    auto r = runAot(
         "module M; "
         "interface IBox property [i: int]: int; end IBox; "
         "record R: IBox "
@@ -768,9 +789,13 @@ BEZEL_TEST(codegen_indexer_increment_virtual_2848,
         "  end; "
         "end R; "
         "class C public static method Main(): int "
-        "  var r := new R(); var q: IBox := r; q[0]++; ";
-    // > 255, so the observable moves to stdout.
-    BEZEL_EXPECT_TRUE(runAotOut(
-        prog + "Console.WriteLine(q[0]); return 0; end Main; end C;") == "403");
-    BEZEL_EXPECT_EQ(run(runAot(prog + "return r.V; end Main; end C;")), 0);
+        "  var r := new R(); var q: IBox := r; q[0]++; "
+        "  Console.WriteLine(q[0]); return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    bool sawStore = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+                d.message.find("to the receiver's own storage") != std::string::npos)
+            sawStore = true;
+    BEZEL_EXPECT_TRUE(sawStore);
 }

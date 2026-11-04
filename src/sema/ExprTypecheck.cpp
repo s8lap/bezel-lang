@@ -10231,12 +10231,13 @@ bool ExprTC::checkRecordReceiverStore(const ast::Expr& target,
     } else {
         return false;
     }
-    if (ctorLambda) {
-        // A static member is not the receiver's storage.
-        if (auto* ms = dynamic_cast<MemberSymbol*>(sym))
-            for (std::string_view mod : ms->modifiers)
-                if (mod == "static") return false;
-    }
+    // A static member is not the receiver's storage (§9.4: the rejection is
+    // about "what an lvalue chain rooted at `this` reaches"; a static is not
+    // reached through `this`). Applies to every member body, not only the
+    // constructor-lambda path (fix-forward #8089).
+    if (auto* ms = dynamic_cast<MemberSymbol*>(sym))
+        for (std::string_view mod : ms->modifiers)
+            if (mod == "static") return false;
 
     // Walk the chain for class/interface-typed hops BEFORE the terminal
     // member. Such a hop has left the receiver and the store lands in the

@@ -100,6 +100,16 @@
 // no IR-emitting flag and the lit track is a diagnostics track; adding compiler
 // CLI surface for a test is out of scope for a fix lane.)
 
+// FIXTURE NOTE (#8089 fix-forward, §9.4 v0.353): the RECORD fixtures below
+// whose accessor stored the record's own field are now in the §9.4 MEDIATING
+// shape — the backing value lives in a class the record borrows, and the
+// accessor stores beyond that class-typed hop ("a store beyond such a hop
+// lands in the borrowed heap object, not in the receiver, and is legal").
+// §9.4 rejects the former shape: "a *setter body* whose store lands in the
+// receiver's own storage is rejected like any other member body". The record
+// receiver still lowers through the same accessor path and every expected
+// value is unchanged; the stored value is now observed through the class.
+
 #include <cstdio>
 #include <string>
 
@@ -516,18 +526,24 @@ const char* kOutArgIntoIndexerSlotWithProducerIndex =
 // (N)-(P) CHARACTERIZATION guards for the three deliberate exclusions.
 // =====================================================================
 const char* kRecordReceiverResidual =
-    "module M; record Row "
+    "module M; class Sink "
     "  public N: int; "
+    "end Sink; "
+    "record Row "
+    "  public N: int; "
+    "  public S: Sink; "
+    "  public constructor(n: int, s: Sink) N := n; S := s; end constructor; "
     "  public property [k: string]: int "
     "    get => N + k.Length; "
     "    set => do "
-    "      N := value; "
+    "      S.N := value; "
     "    end; "
     "  end; "
     "end Row; "
     "class C "
     "  public static method Main(): int "
-    "    var r := new Row(0); "
+    "    using var s := new Sink(); "
+    "    var r := new Row(0, s); "
     "    var n := 0; "
     "    for var i in 1..20 do "
     "      r[$\"z-{i}\"] := i; "
