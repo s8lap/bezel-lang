@@ -17201,8 +17201,9 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
 }
 
 
-// fix #5272 (the static-CALL chokepoint) and #5272-ff (the static-PROPERTY
-// chokepoint) — §2.3 / §2.7 / §3.4, v0.313.
+// fix #5272 (the static-CALL chokepoint), #5272-ff (the static-PROPERTY
+// chokepoint) and #8019 (the LOCAL half) — §2.3 / §2.7 rule 1 / §3.4, v0.313,
+// v0.355.
 //
 // Codegen's builtin dispatch is keyed on the receiver identifier's SPELLING
 // (`id->name`, or the `cls` string derived from it), not on what sema resolved
@@ -17221,23 +17222,27 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
 //     TimeSpan.Zero, IntPtr.Zero/UIntPtr.Zero, Guid.Empty,
 //     CancellationToken.None), which fix #5272 did NOT reach.
 //
-// MEASURED PRE-FIX (staging @ 23d1c7ad, `agent_check --probe --asan`, one user
-// class per probe, the USER's declared value in the right column):
+// #5272 and #5272-ff closed the USER-TYPE half.  #8019 closes the LOCAL
+// half: the same ladders also matched a receiver sema resolved to a VALUE —
+// a local, a parameter, a field, a property, a `for` variable, a pattern
+// binding, a captured closure local.  §2.7 rule 1 (v0.355) decides that
+// case: "If it resolves to a *value* (a local, field, or property), the
+// chain is member access."  MEASURED pre-fix on the #8019 base (`f7f2cab6`),
+// with the USER's own member on the right:
 //
-//     user class            member        user's value   printed (the builtin)
-//     Math                  Pi            3.25            3.141592653589793
-//     Math                  Tau           6.5             6.283185307179586
-//     Environment           ProcessorCount 555             20
-//     DateTime              Now           111             639265989418842169
-//     DateTime              MaxValue      222             3155378975999999999
-//     TimeSpan              Zero          333             00:00:00
-//     IntPtr                Zero          444             0
-//     Guid                  Empty         777             00000000-0000-...
-//     CancellationToken     None          888             System.Threading...
+//     local `Path`   .Combine("x","y")   USER:x+y      x/y   (the builtin)
+//     local `Math`   .Sqrt(2.0)          USER:7        malformed IR
+//     local `Math`   .Pi                 USER:3.25     3.141592653589793
+//     local `Random` .Next(5)            USER:r        malformed IR
+//     local `Debug`  .Assert(true)       USER:dbg      malformed IR
+//     local `Guid`   .Empty              USER:777      the builtin's Guid
+//     local `DateTime` .Now              USER:111      the builtin's clock
+//     local `IntPtr` .Zero               USER:444      0
 //
-// Not one of these crashes and not one warns: every row is a SILENT wrong
-// answer, which is why the guard has to sit at the chokepoint and why the
-// regression rows assert the USER's bytes rather than "did not crash".
+// Not one crashed and not one warns: every row is a SILENT wrong answer, or
+// — for the arms whose own argument types meet the user's call — a MALFORMED
+// IR codegen error.  That is why the guard has to sit at the chokepoint and
+// why the regression rows assert the USER's bytes rather than "did not crash".
 //
 // The discriminator is the EXISTING #2997 one `builtinTypeName` documents — a
 // `builtinClassSym` is shaped `decl == nullptr && moduleName.empty()`, so a
@@ -17250,15 +17255,32 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
 // Sema stamps the receiver `IdentifierExpr`'s `exprSymbol` uniformly for a
 // dotted head and a value position (ExprTypecheck_Exprs.cpp), so ONE predicate
 // serves the call form and the property form.  When sema stamps nothing the
-// symbol is null, this returns false, and the receiver keeps the pre-existing
-// behaviour — no arm that used to be reached is lost.
+// symbol is null, this returns TRUE, and the receiver keeps the pre-existing
+// behaviour — no arm that used to be reached is lost.  (A primitive keyword
+// alias and `IntPtr`/`UIntPtr` carry no value symbol; §3.4 reserves the
+// primitive row, so they cannot be shadowed anyway.)
 //
-// The rule itself lives in `sema::isUserDeclaredTypeSym` (sema/Symbol.hpp) so
-// SEMA's own text-keyed static-member TYPING gates on the identical predicate:
-// a receiver sema types as a built-in must be the same receiver codegen lowers
+// The rule itself lives in `sema::receiverMayReachBuiltinStaticArm`
+// (sema/Symbol.hpp) so SEMA's own text-keyed static-member TYPING gates on the
+// identical predicate: a receiver sema types as a built-in must be the same
+// receiver codegen lowers
 // as a built-in, or the two layers disagree about what a user class shadowing
 // a built-in means — sema would type the user's property as the builtin's and
 // codegen would lower the user's, and one of the two is wrong by construction.
+bool Emitter::receiverMayReachBuiltinStaticArm(const ast::Expr& recv) {
+    return sema::receiverMayReachBuiltinStaticArm(ctx_.exprSymbol(recv));
+}
+
+// fix #5272 + #5272-ff (§2.3 / §2.7 / §3.4, v0.313): THE #5272-ERA
+// predicate — "is this receiver a USER-DECLARED type?".  fix #8019
+// (§2.3 / §2.7 rule 1, v0.355) supersedes it for every SINGLE-LEVEL static
+// arm, because it cannot tell a user-declared TYPE from a VALUE (a local, a
+// parameter, a field, a property) — and #8019 is exactly that hole.  It is
+// kept for the ONE site whose ladder cannot move without a sibling it does
+// not own: the `Encoding` singleton arm in LlvmBackend_Exprs.cpp's
+// `lowerExpr`, whose chain is TWO-LEVEL (`Encoding.UTF8.GetBytes(…)`) and is
+// matched by `tryLowerEncodingCall` (LlvmBackend_Calls2.cpp) — another lane's
+// file.  See the declaration in LlvmBackend_impl.hpp.
 bool Emitter::receiverIsUserType(const ast::Expr& recv) {
     return sema::isUserDeclaredTypeSym(ctx_.exprSymbol(recv));
 }

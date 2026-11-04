@@ -14064,14 +14064,39 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // the whole text-keyed family is wrong, not just Convert.
     //
     // #5272-ff promoted the discriminator into the shared
-    // `receiverIsUserType` helper (defined in LlvmBackend_Exprs2.cpp, with the
-    // full rule and the measured evidence) because the same text-keyed defect
-    // had a SECOND chokepoint — the static-PROPERTY-read arms in
+    // `receiverMayReachBuiltinStaticArm` helper (defined in LlvmBackend_Exprs2.cpp,
+    // with the full rule and the measured evidence) because the same text-keyed
+    // defect had a SECOND chokepoint — the static-PROPERTY-read arms in
     // LlvmBackend_Exprs.cpp's `lowerExpr`, which this guard never reached and
     // which silently answered a user `DateTime.Now` with the builtin's clock.
     // One helper, both ladders: a future text-keyed arm that forgets the guard
     // is one call away from the shared rule instead of re-deriving it.
-    if (!cls.empty() && receiverIsUserType(*ma->target)) cls = {};
+    //
+    // fix #8019 (§2.3 / §2.7 rule 1 / §3.4, v0.355): the LOCAL half.  The
+    // guard above refuses a receiver that names a USER-DECLARED type; it did
+    // NOT refuse a receiver that names a VALUE — a local, a parameter, a
+    // field, a property, a `for` variable, a pattern binding, a captured
+    // closure local — because `isUserDeclaredTypeSym` answers false for
+    // those too.  So `var Path := new Combiner(); Path.Combine("x", "y")`
+    // still reached the built-in `Path.Combine` arm and printed `x/y`
+    // instead of the user's `USER:x+y`: a SILENT wrong answer, and for the
+    // arms whose own argument types meet the user's call (`Math.Sqrt`,
+    // `Random.Next`, `Debug.Assert`) a MALFORMED-IR codegen error.
+    //
+    // §2.7 rule 1 (v0.355) decides it: "If it resolves to a *value* (a local,
+    // field, or property), the chain is member access."  §2.3 (v0.355) makes
+    // the shadowing legal — "every other always-available name may be
+    // shadowed by local declarations under the normal name-resolution rules"
+    // (only §3.4's reserved row cannot be).  So the LOCAL wins, and the
+    // chain is member access on it — never the built-in's static arm.
+    //
+    // The helper is the ONE place the rule lives, and it now answers for
+    // both halves: FALSE for a user-declared type (#5272) and FALSE for a
+    // value (#8019); TRUE for the synthetic `builtinClassSym` and TRUE for a
+    // receiver sema stamped nothing on (a primitive keyword alias and
+    // `IntPtr`/`UIntPtr` carry no value symbol, and §3.4 reserves the
+    // primitive row), so no built-in arm that used to be reached is lost.
+    if (!cls.empty() && !receiverMayReachBuiltinStaticArm(*ma->target)) cls = {};
     const auto& m = ma->member;
 
     // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: CString / WString / RawBytes

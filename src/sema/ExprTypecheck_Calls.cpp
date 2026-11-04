@@ -35297,7 +35297,17 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // clobbering the adjacent pending-task field → SIGSEGV on resume. Typing it
     // as CancellationToken (a ptr-lowered builtin record) gives the frame slot
     // the correct ptr width so the local round-trips. Mirrors Encoding.Utf8.
-    if (ma.target && !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target))) {
+    // fix #8019 (§2.3 / §2.7 rule 1 / §3.4, v0.355): the receiver of a
+    // text-keyed built-in static-property typing must NAME THE BUILT-IN
+    // CLASS.  `isUserDeclaredTypeSym` cannot tell a user-declared TYPE from
+    // a VALUE (a local, a parameter, a field, a property, a `for` variable, a
+    // pattern binding, a captured closure local) — it answers false for
+    // both — so a LOCAL named `CancellationToken` / `IntPtr` / `DateTime` /
+    // `TimeSpan` / `Guid` reached this block and was typed as the BUILT-IN's
+    // static property, and the user's own property was discarded.  §2.7
+    // rule 1 decides it: "If it resolves to a *value* (a local, field, or
+    // property), the chain is member access."
+    if (ma.target && receiverMayReachBuiltinStaticArm(ctx_.exprSymbol(*ma.target))) {
         if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
             if (cid->name == "CancellationToken" && ma.member == "None") {
                 auto* ctTy = ctx_.makeTypeRef();
@@ -35594,7 +35604,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // it lowers to a pointer-sized integer (i64) and a downstream
     // `handle = IntPtr.Zero` types as `bool` (both operands Named IntPtr, no
     // declaration → no record-equality error). Codegen emits the i64 0.
-    if (ma.target && !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target))) {
+    // fix #8019 (§2.3 / §2.7 rule 1 / §3.4, v0.355): the receiver must NAME
+    // THE BUILT-IN CLASS — a LOCAL named `IntPtr` is a VALUE (§2.7 rule 1:
+    // "If it resolves to a *value* (a local, field, or property), the chain
+    // is member access"), so `IntPtr.Zero` on it is the user's own member,
+    // not the built-in's null pointer.
+    if (ma.target && receiverMayReachBuiltinStaticArm(ctx_.exprSymbol(*ma.target))) {
         if (auto* pid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
             if ((pid->name == "IntPtr" || pid->name == "UIntPtr") &&
                 ma.member == "Zero") {
@@ -35688,7 +35703,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // same shape §2.5 already declares on `DateTime.UtcNow: DateTime` /
     // `TimeSpan.Zero: TimeSpan`, so codegen's `DateTime` / `TimeSpan`
     // builders receive a typeref they already accept.
-    if (ma.target && !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target))) {
+    // fix #8019 (§2.3 / §2.7 rule 1 / §3.4, v0.355): the receiver must NAME
+    // THE BUILT-IN CLASS — a LOCAL named `DateTime` / `TimeSpan` is a VALUE
+    // (§2.7 rule 1: "If it resolves to a *value* (a local, field, or
+    // property), the chain is member access"), so `DateTime.Now` on it is the
+    // user's own member, not the built-in's clock.
+    if (ma.target && receiverMayReachBuiltinStaticArm(ctx_.exprSymbol(*ma.target))) {
         if (auto* did = dynamic_cast<const ast::IdentifierExpr*>(
                 ma.target.get())) {
             if (did->name == "DateTime") {
@@ -37524,9 +37544,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
             // §2.5: DateTime static properties accessed as DateTime.Now, etc.
             // These appear as MemberAccess on the "DateTime" identifier.
+            // fix #8019 (§2.3 / §2.7 rule 1, v0.355): the receiver must NAME
+            // THE BUILT-IN CLASS — a LOCAL named `DateTime` / `TimeSpan` is a
+            // VALUE (§2.7 rule 1: "If it resolves to a *value* (a local, field,
+            // or property), the chain is member access"), so the access is the
+            // user's own member.
             if (auto* idtmp = dynamic_cast<const ast::IdentifierExpr*>(
                     ma.target.get());
-                idtmp && !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target))) {
+                idtmp && receiverMayReachBuiltinStaticArm(ctx_.exprSymbol(*ma.target))) {
                 const auto* did = idtmp;
                 if (did->name == "DateTime") {
                     auto* dt = ctx_.makeTypeRef();
@@ -37621,9 +37646,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
             // stdlib §2.6: Guid.Empty — static readonly property on the Guid type name.
+            // fix #8019 (§2.3 / §2.7 rule 1, v0.355): the receiver must NAME
+            // THE BUILT-IN CLASS — a LOCAL named `Guid` is a VALUE (§2.7
+            // rule 1: "If it resolves to a *value* (a local, field, or
+            // property), the chain is member access"), so `Guid.Empty` on it
+            // is the user's own property, not the built-in's all-zero Guid.
             if (auto* idtmp = dynamic_cast<const ast::IdentifierExpr*>(
                     ma.target.get());
-                idtmp && !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target))) {
+                idtmp && receiverMayReachBuiltinStaticArm(ctx_.exprSymbol(*ma.target))) {
                 const auto* tid = idtmp;
                 if (tid->name == "Guid" && ma.member == "Empty") {
                     auto* gTy = ctx_.makeTypeRef();
@@ -37691,9 +37721,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // CancellationToken builtin type name used as an identifier expression.
             // The target's exprType is null (an identifier-as-type-name, not a
             // value expression), so we look at the exprSymbol instead.
+            // fix #8019 (§2.3 / §2.7 rule 1, v0.355): the receiver must NAME
+            // THE BUILT-IN CLASS — a LOCAL named `CancellationToken` is a VALUE
+            // (§2.7 rule 1: "If it resolves to a *value* (a local, field, or
+            // property), the chain is member access"), so `CancellationToken.None`
+            // on it is the user's own property, not the built-in's token.
             if (auto* idtmp = dynamic_cast<const ast::IdentifierExpr*>(
                     ma.target.get());
-                idtmp && !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target))) {
+                idtmp && receiverMayReachBuiltinStaticArm(ctx_.exprSymbol(*ma.target))) {
                 const auto* tid = idtmp;
                 if (tid->name == "CancellationToken" && ma.member == "None") {
                     auto* ctTy = ctx_.makeTypeRef();

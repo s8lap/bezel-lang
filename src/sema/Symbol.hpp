@@ -505,6 +505,53 @@ inline bool isUserDeclaredTypeSym(const Symbol* s) {
     return ts->decl != nullptr || !ts->moduleName.empty();
 }
 
+// fix #8019 (§2.3 / §2.7 rule 1 / §3.4, v0.355): MAY THIS RECEIVER REACH A
+// TEXT-KEYED BUILT-IN STATIC ARM?
+//
+// `isUserDeclaredTypeSym` above answers ONE question — "is this a
+// USER-DECLARED type?" — and the text-keyed ladders read its negation as
+// "so it must be the built-in".  That inference is wrong for a VALUE: a
+// LOCAL, a PARAMETER, a FIELD or a PROPERTY is not a user-declared type
+// either, yet it is not the built-in class.  #8019 is exactly that hole —
+// a local named `Path` / `Math` / `DateTime` reached the built-in's static
+// arm and the user's own member never ran (a silent wrong answer, and for
+// `Math.Sqrt` / `Random.Next` / `Debug.Assert` a MALFORMED-IR codegen
+// error, because the built-in arm's own argument types met the user's
+// call).
+//
+// §2.7 rule 1 (v0.355) decides it, verbatim:
+//
+//   "Resolve the leftmost segment `A` as a bare name: local scope, then the
+//    enclosing type's accessible members … If `A` resolves to a *type*, the
+//    rest of the chain resolves against that type's members … If it resolves
+//    to a *value* (a local, field, or property), the chain is member access."
+//
+// and §2.3 (v0.355) says the always-available names are shadowable —
+// "Only the first row's names cannot be shadowed (§3.4); every other
+// always-available name may be shadowed by local declarations under the
+// normal name-resolution rules" — so the LOCAL wins and the chain is
+// member access on it.
+//
+// So the head of a text-keyed built-in static arm may be reached only when
+// it names the BUILT-IN class:
+//
+//   * a `TypeSymbol` shaped `decl == nullptr && moduleName.empty()` — the
+//     synthetic `builtinClassSym` — is the built-in;
+//   * a `TypeSymbol` that is NOT that shape is a USER-DECLARED type and
+//     wins (§2.3 / #5272);
+//   * any other symbol is a VALUE, and the chain is member access;
+//   * a receiver sema stamped NOTHING on is NOT decided here.  A primitive
+//     keyword alias (`string`, `int`, `Decimal`, `Boolean`, …) and
+//     `IntPtr`/`UIntPtr` carry no value symbol, and §3.4 reserves the
+//     primitive row, so the PRE-EXISTING behaviour stands for them and no
+//     built-in arm that used to be reached is lost.
+inline bool receiverMayReachBuiltinStaticArm(const Symbol* s) {
+    if (!s) return true;
+    if (const auto* ts = dynamic_cast<const TypeSymbol*>(s))
+        return ts->decl == nullptr && ts->moduleName.empty();
+    return false;
+}
+
 // §11.7 / §12.5 / §19.6 (v0.242, #3052): the class-shape modifier predicates,
 // stated once so the whole `abstract`-keyed rule family reaches `closed`.
 //

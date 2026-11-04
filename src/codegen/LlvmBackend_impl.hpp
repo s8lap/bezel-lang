@@ -24291,26 +24291,32 @@ private:
     // Returns an empty string_view if the TypeRef is not a builtin named type.
     static std::string_view builtinTypeName(const sema::TypeRef* rt);
 
-    // fix #5272 + #5272-ff (§2.3 / §2.7 / §3.4, v0.313): THE chokepoint guard
-    // for every builtin dispatch keyed on a receiver's identifier TEXT.  True
-    // when `recv` is a dotted-access receiver that sema resolved to a
-    // USER-declared type — a `TypeSymbol` carrying a real `ast::TypeDecl`
-    // in-module, or a populated `moduleName` when imported — i.e. NOT the
-    // synthetic `builtinClassSym`, which is shaped `decl == nullptr &&
-    // moduleName.empty()` (the #2997 discriminator `builtinTypeName` above
-    // documents).  False when sema stamped nothing on the receiver, so a
-    // receiver that previously reached a builtin arm never loses it.
+    // fix #5272 + #5272-ff + #8019 (§2.3 / §2.7 rule 1 / §3.4, v0.313, v0.355):
+    // THE chokepoint guard for every builtin dispatch keyed on a receiver's
+    // identifier TEXT.  True when `recv` MAY reach a text-keyed built-in
+    // static arm — i.e. sema resolved it to the synthetic `builtinClassSym`
+    // (shaped `decl == nullptr && moduleName.empty()`, the #2997 discriminator
+    // `builtinTypeName` above documents), or stamped NOTHING on it (a
+    // primitive keyword alias and `IntPtr`/`UIntPtr` carry no value symbol,
+    // and §3.4 reserves the primitive row), so a receiver that previously
+    // reached a builtin arm never loses it.
     //
-    // §2.3 (v0.313): of the always-available names, only §3.4's reserved row —
-    // the PascalCase aliases of the primitive value types, plus `String` —
-    // cannot be shadowed; "every other always-available name may be shadowed
-    // by local declarations under the normal name-resolution rules", which
-    // §2.7 supplies: the current-module declaration wins the bare name and the
-    // auto-imported one stays reachable by its qualified name
-    // (`System.Convert.ToInt32`).  `Math`, `Environment`, `DateTime`,
-    // `TimeSpan`, `IntPtr`, `UIntPtr`, `Guid` and `CancellationToken` are in
-    // neither reserved set, so a user class may take those spellings and MUST
-    // win — including for a static PROPERTY read, not only a static call.
+    // False for the two cases that must NOT reach a built-in arm:
+    //   * a USER-declared type — a `TypeSymbol` carrying a real
+    //     `ast::TypeDecl` in-module, or a populated `moduleName` when
+    //     imported.  §2.3 (v0.313): of the always-available names, only
+    //     §3.4's reserved row — the PascalCase aliases of the primitive value
+    //     types, plus `String` — cannot be shadowed; "every other
+    //     always-available name may be shadowed by local declarations under
+    //     the normal name-resolution rules".  `Math`, `Environment`,
+    //     `DateTime`, `TimeSpan`, `IntPtr`, `UIntPtr`, `Guid` and
+    //     `CancellationToken` are in neither reserved set, so a user class may
+    //     take those spellings and MUST win — for a static PROPERTY read, not
+    //     only a static call.  (#5272 / #5272-ff.)
+    //   * a VALUE — a local, a parameter, a field, a property, a pattern
+    //     binding, a `for` variable, a captured closure local.  §2.7 rule 1
+    //     (v0.355): "If it resolves to a *value* (a local, field, or
+    //     property), the chain is member access."  (#8019.)
     //
     // Every site that matches `id->name == "<Builtin>"` (or `cls == "<Builtin>"`)
     // must be gated on `!` of this.  Two chokepoints existed and both are
@@ -24318,6 +24324,32 @@ private:
     // `tryLowerBuiltinClassCall`, and the static-PROPERTY-read ladder in
     // LlvmBackend_Exprs.cpp's `lowerExpr`.  See the definition in
     // LlvmBackend_Exprs2.cpp for the measured pre-fix evidence.
+    bool receiverMayReachBuiltinStaticArm(const ast::Expr& recv);
+
+    // fix #5272 + #5272-ff (§2.3 / §2.7 / §3.4, v0.313): THE #5272-era
+    // predicate — true when `recv` is a dotted-access receiver that sema
+    // resolved to a USER-declared type (a `TypeSymbol` carrying a real
+    // `ast::TypeDecl` in-module, or a populated `moduleName` when imported),
+    // i.e. NOT the synthetic `builtinClassSym`, which is shaped `decl ==
+    // nullptr && moduleName.empty()` (the #2997 discriminator `builtinTypeName`
+    // above documents).  False when sema stamped nothing on the receiver, so a
+    // receiver that previously reached a builtin arm never loses it.
+    //
+    // fix #8019 (§2.3 / §2.7 rule 1, v0.355): SUPERSEDED by
+    // `receiverMayReachBuiltinStaticArm` above for every SINGLE-LEVEL static
+    // arm — this predicate cannot tell a user-declared TYPE from a VALUE (a
+    // local, a parameter, a field, a property), and #8019 is exactly that
+    // hole.  It is kept for the ONE site whose ladder cannot move without a
+    // sibling it does not own: the `Encoding` singleton arm in
+    // LlvmBackend_Exprs.cpp's `lowerExpr`.  That arm's chain is TWO-LEVEL
+    // (`Encoding.UTF8.GetBytes(…)`), and `tryLowerEncodingCall`
+    // (LlvmBackend_Calls2.cpp) — whose owner is another lane — keys on the
+    // same TEXT; gating the singleton arm without that arm would make SEMA
+    // (the `Encoding` typing block in ExprTypecheck_Calls.cpp) and CODEGEN
+    // disagree about what a local named `Encoding` means, and the two-level
+    // call would then lower the built-in encoding for a receiver sema typed
+    // as the user's own type — a MALFORMED IR where today there is a wrong
+    // value.  The three sites must move together.
     bool receiverIsUserType(const ast::Expr& recv);
 
     // fix #2991 (spec §11.3 / §28.3 / §28.9, v0.240): the head SPELLING a `new`
