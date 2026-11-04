@@ -10220,6 +10220,77 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 ft = par->declType ? ctx_.resolvedType(*par->declType)
                                    : par->resolvedDeclType;
         }
+        // fix #8099 (§7.4 / §7.6, v0.355): a call THROUGH a NULLABLE function
+        // value is a compile error unless the compiler has narrowed it to
+        // non-null. §7.4, verbatim: "Member access, method calls, and indexing
+        // on a nullable value are compile errors unless the compiler has
+        // narrowed it to non-null" — and an invocation of a function value is
+        // a "method call on a nullable value". §7.6 gives the ONE spelling a
+        // nullable function value is invoked with: `?(...)`.
+        //
+        // Before this check an un-narrowed `h(1)` over `h: ((int) -> int)?`
+        // compiled clean and the program died with SIGSEGV (exit 139) on the
+        // null call (#8099) — the same false-accept the §7.4 member-access
+        // gate (#418 / #862) already refuses for `h.M`.
+        //
+        // The narrowing test is `isNarrowedNonNullRead` — §7.4's ONE "is this
+        // read non-null here?" predicate (a local / parameter via
+        // `nullNarrowed_` / `narrowings_` / `initNarrowed_`, and a `readonly`
+        // field path via `fieldNarrowed_`). It is the same helper the other
+        // §7.4 gates use (#6265's `Array.Sort(n)` sugar gate, the
+        // member-access gate at ~L33302), so a narrowed local / parameter /
+        // `readonly` field is admitted here exactly as it is there — and the
+        // `!` force-unwrap (§7.8) and the `??` fallback (§7.7) need no
+        // special case: both yield a NON-nullable callee type.
+        //
+        // The `?.`-MEMBER callee (`x?.Cb()`) is EXCLUDED: §7.5 types a suffix
+        // to the right of `?.` at the member's own DECLARED type, but the `?.`
+        // node carries that declared type LIFTED to nullable (the §7.5 "the
+        // result type is always nullable" rule), so the node's type cannot
+        // answer "is the MEMBER's declared type nullable" — the `?.` form
+        // would be refused over a member whose declared type is not nullable
+        // (`x?.Cb()` over `Cb: () -> int` is legal, §7.5 / §27.1). The `?.`
+        // CALL form (`h?(1)`, §7.6) is a different AST node
+        // (`ast::NullCondCallExpr`) and never reaches this function.
+        if (!isMethodOrCtor && ft && ft->kind == TypeRef::Kind::Function &&
+            ft->nullable &&
+            !dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get()) &&
+            !isNarrowedNonNullRead(ce.callee.get())) {
+            // §7.4's remedy set, worded as the member-access gate words it
+            // (~L33324): a SIMPLE VARIABLE is narrowed by a null test or a
+            // force-unwrap; every other shape (a field, a property, a call
+            // result, an index result) is not a narrowing carrier at all
+            // (§7.4 "Narrowing applies to locals — and `readonly` fields —
+            // only"), so the copy-to-a-local remedy is the one that applies.
+            const ast::IdentifierExpr* cid =
+                dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get());
+            const bool simpleVar =
+                cid && (dynamic_cast<LocalSymbol*>(calleeSym) ||
+                        dynamic_cast<ParameterSymbol*>(calleeSym));
+            if (simpleVar) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    std::string("call through a nullable function value `") +
+                    std::string(cid->name) +
+                    "` requires narrowing it to non-null first (§7.4): guard "
+                    "with `if " + std::string(cid->name) +
+                    " <> null`, force-unwrap with `" + std::string(cid->name) +
+                    "!`, or use the null-conditional call `" +
+                    std::string(cid->name) + "?(...)`");
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    "call through a nullable function value requires narrowing "
+                    "it to non-null first (§7.4): copy the nullable value to a "
+                    "local variable and guard with `<> null`, force-unwrap with "
+                    "`!`, or use the null-conditional call `?(...)`");
+            }
+            // Type the call as the function's own return type so the
+            // enclosing expression types and no cascade follows the rejection.
+            if (ft->funcReturn)
+                ctx_.setExprType(&ce, ft->funcReturn);
+            return;
+        }
         if (!isMethodOrCtor && ft && ft->kind == TypeRef::Kind::Function) {
             // fix #4085 / §27.1 (v0.294): calls THROUGH a function-typed
             // callee are positional — §27.1, verbatim, "Function types may
