@@ -4926,10 +4926,28 @@ private:
     // types stdlib declares at that position, for the positions the table's
     // `kinds` bit set cannot spell. `DeclaredType::None` means the table
     // carries the opinion (its `kinds` bit set) and this gate asks about it.
+    // `recoveredTy` is the argument's STATIC TYPE when sema recorded none
+    // (fix #7304 — the `this` / `base` spelling, which the resolver leaves
+    // untyped). Null means "no recovery", and the position keeps its
+    // "no opinion" answer.
     std::optional<bool> builtinArgAdmittedAt(const ast::CallExpr& ce,
                                              std::size_t p,
                                              std::uint32_t kind,
-                                             BuiltinDeclaredType declared);
+                                             BuiltinDeclaredType declared,
+                                             const TypeRef* recoveredTy = nullptr);
+    // fix #7304 (spec §12.3, §26.1, §5.1, §22.6, v0.355): the STATIC TYPE of
+    // a `this` / `base` spelling, which the resolver deliberately leaves
+    // UNRESOLVED ("Slice 3b ... leave them unresolved" —
+    // ExprTypecheck_Exprs.cpp). `std::nullopt` means the spelling has no
+    // recoverable type at this position (a `this` outside a member body, a
+    // `base` in a class with no base class).
+    //
+    // `this` names the ENCLOSING TYPE (§12.3, §9.4 for a value kind,
+    // §26.1 for an extension block's receiver); `base` names the BASE CLASS
+    // (§12.3). Neither is a `string`, so a built-in member that declares a
+    // `string` parameter (stdlib §9.1-§9.5) reaches no candidate at such an
+    // argument (§22.6).
+    std::optional<TypeRef> implicitReceiverType(const ast::Expr* e);
     // Is the argument admissible at a parameter whose DECLARED type is
     // `kind`? §5.1's identity and widening, then §5.1's constant narrowing.
     // `kBPTAny` (no type opinion) and `kBPTOut` (an `out` slot) admit

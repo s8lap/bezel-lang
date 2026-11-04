@@ -24656,6 +24656,78 @@ bool ExprTC::builtinArgAdmitsKind(const ast::Expr* argExpr, TypeRef* argTy,
     return false;
 }
 
+// fix #7304 (spec §12.3, §26.1, §5.1, §22.6, v0.355): the STATIC TYPE of
+// the `this` / `base` spelling — the two IMPLICIT-MEANING identifiers the
+// resolver deliberately leaves UNRESOLVED ("Slice 3b: IdentifierExpr name
+// lookup. `this` / `base` are implicit-meaning identifiers — leave them
+// unresolved" — ExprTypecheck_Exprs.cpp), so `ctx_.exprType` of either is
+// null in every ordinary body.
+//
+// WHY THE TYPE IS RECOVERED HERE, and only here.
+//
+//   * §12.3 gives `this` the ENCLOSING CLASS and `base` the BASE CLASS;
+//     §9.4 gives a value kind's member body the same reading ("`this` binds a
+//     borrow of the receiver value"), and §26.1 gives an extension block's
+//     `this` the EXTENDED TYPE. None of them is a `string`, and §5.1's
+//     conversion table admits no class-to-`string` conversion.
+//   * The built-in call admission gate (§22.6) asks the §5.1 question of
+//     every argument, and it reads the argument's STATIC TYPE. With the type
+//     missing, the position had NO opinion: `builtinArgAdmittedAt` returned
+//     "not the admission question", every candidate was applicable, and
+//     `int.TryParse(this, out v)` reached the lowering with the receiver's
+//     own bytes read as text.
+//   * This is a RECOVERY, not a re-typing: the resolver's "leave them
+//     unresolved" deferral stands, and no other gate reads this answer. The
+//     answer is what §12.3 already says the receiver's type is.
+//
+// `std::nullopt` means the spelling has no recoverable type AT THIS
+// POSITION: a `this` outside a member body, a `base` in a class with no base
+// class, or an extension block whose head the resolver does not name.
+std::optional<TypeRef> ExprTC::implicitReceiverType(const ast::Expr* e) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+    if (!id) return std::nullopt;
+    TypeRef out;
+    if (id->name == "base") {
+        // §12.3: `base` names the BASE CLASS — the same recovery
+        // `memberTargetType` performs, so the two spellings agree.
+        if (!currentType_) return std::nullopt;
+        TypeSymbol* base = nullptr;
+        for (TypeSymbol* b : currentType_->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) { base = b; break; }
+        // §12.3: "`base` is legal only inside instance members of a derived
+        // class" — so in a class with NO base class (or with only an
+        // interface base) the spelling is itself illegal, and the compiler
+        // says so for the MEMBER-ACCESS form ("`C` has no class base") but
+        // not for the bare spelling. The gate still needs an answer here,
+        // and the only class-typed answer available is the ENCLOSING type:
+        // a `base` receiver is not a `string`, whatever it names.
+        if (!base) base = currentType_;
+        out.kind = TypeRef::Kind::Named;
+        out.declaration = base;
+        return out;
+    }
+    if (id->name != "this") return std::nullopt;
+    if (currentType_) {
+        // §12.3 / §9.4: `this` is the ENCLOSING TYPE — a class, a record or
+        // any other type kind whose member body is being checked.
+        out.kind = TypeRef::Kind::Named;
+        out.declaration = currentType_;
+        return out;
+    }
+    // §26.1: an extension block over a PRIMITIVE head (`extension string`)
+    // has no user TypeSymbol, so `currentType_` is null — the receiver's
+    // type is the head's own type. Read it from the extension's own
+    // declaration.
+    if (currentExtension_) {
+        if (auto* ext =
+                dynamic_cast<const ast::ExtensionDecl*>(currentExtension_->decl))
+            if (ext->targetType)
+                if (const TypeRef* rt = ctx_.resolvedType(*ext->targetType))
+                    if (rt->kind != TypeRef::Kind::Error) return *rt;
+    }
+    return std::nullopt;
+}
+
 // §22.6: is the argument at `p` admissible at a parameter whose DECLARED
 // type is `kind`? `std::nullopt` means "this position is not the admission
 // question" — an untyped argument, a discard, or a `ref`/`out`/`owned`/
@@ -24663,7 +24735,8 @@ bool ExprTC::builtinArgAdmitsKind(const ast::Expr* argExpr, TypeRef* argTy,
 std::optional<bool> ExprTC::builtinArgAdmittedAt(const ast::CallExpr& ce,
                                                   std::size_t p,
                                                   std::uint32_t kind,
-                                                  BuiltinDeclaredType declared) {
+                                                  BuiltinDeclaredType declared,
+                                                  const TypeRef* recoveredTy) {
     const auto& a = ce.args[p];
     if (!a.value) return std::nullopt;
     // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
@@ -24672,6 +24745,15 @@ std::optional<bool> ExprTC::builtinArgAdmittedAt(const ast::CallExpr& ce,
     if (!a.modifier.empty()) return std::nullopt;
     if (a.isDiscard) return std::nullopt;
     TypeRef* argTy = ctx_.exprType(*a.value);
+    // fix #7304 (spec §12.3, §5.1, §22.6, v0.355): the argument's STATIC
+    // TYPE when sema recorded none. The resolver leaves the `this` / `base`
+    // spellings UNRESOLVED ("Slice 3b ... leave them unresolved"), so the
+    // position had NO type and NO opinion — and every candidate was
+    // applicable, so a `this` argument reached a built-in member that
+    // declares a `string` parameter (stdlib §9.1) with no candidate to
+    // reach. The receiver's type is recovered here (§12.3: the enclosing
+    // type; §12.3: the base class), and §5.1 asks the question of it.
+    if (!argTy && recoveredTy) argTy = const_cast<TypeRef*>(recoveredTy);
     if (!argTy || argTy->kind == TypeRef::Kind::Error) return std::nullopt;
     // §7.3: the `null` literal reaches no non-nullable parameter.
     if (dynamic_cast<const ast::NullLiteralExpr*>(a.value.get())) return false;
@@ -25752,6 +25834,30 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
                 "candidates cited (§22.6)");
         return;
     }
+    // fix #7304 (spec §12.3, §5.1, §22.6, v0.355): the STATIC TYPE of a
+    // `this` / `base` ARGUMENT, which the resolver leaves untyped ("Slice 3b
+    // ... leave them unresolved"). The applicability loop below asks the
+    // §5.1 question of every argument, and it reads the argument's type —
+    // so with the type missing the position had NO opinion, every candidate
+    // was applicable, and a `this` argument reached a built-in member that
+    // declares a `string` parameter (stdlib §9.1-§9.5) with NO candidate to
+    // reach. The recovery is §12.3's own reading of the receiver (§9.4 for a
+    // value kind, §26.1 for an extension block's head).
+    //
+    // Computed ONCE per call — the same argument sits at the same position in
+    // every candidate form — and LAZILY: the vector is empty unless some
+    // argument is UNTYPED, which (the resolver leaving only the `this` /
+    // `base` spellings untyped) is rare, and this gate is on the hot path of
+    // every built-in call.
+    std::vector<std::optional<TypeRef>> recoveredArgTypes;
+    for (std::size_t p = 0; p < ce.args.size(); ++p) {
+        const ast::Expr* a = ce.args[p].value.get();
+        if (!a || ctx_.exprType(*a)) continue;
+        auto rec = implicitReceiverType(a);
+        if (!rec) continue;
+        if (recoveredArgTypes.empty()) recoveredArgTypes.resize(ce.args.size());
+        recoveredArgTypes[p] = *rec;
+    }
     // APPLICABILITY: a candidate is applicable when every bound argument
     // reaches its parameter. The diagnostic names the position the BEST
     // candidate misses.
@@ -25782,7 +25888,10 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
             // spell it — the standard library's own RECORD types.
             auto admitted = builtinArgAdmittedAt(
                 ce, p, f.kinds[p],
-                builtinMemberDeclaredTypeAt(head, member, p));
+                builtinMemberDeclaredTypeAt(head, member, p),
+                (p < recoveredArgTypes.size() && recoveredArgTypes[p])
+                    ? &*recoveredArgTypes[p]
+                    : nullptr);
             if (!admitted) continue;
             if (*admitted) { ++admits; continue; }
             if (!fails) { fail = p; fails = true; }
@@ -25790,6 +25899,9 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
         int distance = 0;
         if (fails) {
             TypeRef* argTy = ctx_.exprType(*ce.args[fail].value);
+            if (!argTy && fail < recoveredArgTypes.size() &&
+                recoveredArgTypes[fail])
+                argTy = const_cast<TypeRef*>(&*recoveredArgTypes[fail]);
             distance = builtinCandidateDistance(f.kinds[fail], argTy);
         }
         if (!best || admits > bestAdmits ||
@@ -25829,6 +25941,13 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
     std::string why;
     if (bestFail < ce.args.size() && ce.args[bestFail].value) {
         TypeRef* argTy = ctx_.exprType(*ce.args[bestFail].value);
+        // fix #7304 (spec §12.3, §5.1, v0.355): the recovered STATIC TYPE of
+        // a `this` / `base` argument — the type the §5.1 question is asked of.
+        // Without it the reason named no §-rule at all, because the argument
+        // had no type to reason about.
+        if (!argTy && bestFail < recoveredArgTypes.size() &&
+            recoveredArgTypes[bestFail])
+            argTy = const_cast<TypeRef*>(&*recoveredArgTypes[bestFail]);
         if (argTy && argTy->kind != TypeRef::Kind::Error) {
             TypeRef* effTy = argTy;
             if (argTy->nullable)
