@@ -954,7 +954,7 @@ The owner's standing permission (2026-11-05): **a coordinator may reap anything 
 stale**, processes, worktrees, build dirs and scratch, using these scripts or its own. Only
 **commits** and **live lanes** are protected. The automation runs only after a push, so a
 long run that never pushes reaches the reaper only by hand. Reap **at every heartbeat
-whose disk row reads ≥ 80 %**, and before every pool refill that will cold-build.
+whose `df -h /mnt/fast` reads ≥ 80 %** (`run_status.sh` raises its disk ACTION only at 90 %, which is too late for a cold-build fan-out), and before every pool refill that will cold-build.
 
 **Order: processes first, then worktrees, then scratch.** A worktree with a process in it is
 not free, whatever its claim row says.
@@ -963,7 +963,7 @@ not free, whatever its claim row says.
    processes, tier B aged ones, and tier 0 exempts anything still making CPU or I/O progress.
    `scripts/reap_orphans.sh` is the older PPID==1-only subset. Never kill, by hand or by
    script:
-   - **a background waiter of a LIVE agent** (an `oc_wait.sh`, a `while … sleep` loop, a
+   - **a background waiter of a LIVE agent** (a scratch `oc_wait.sh`-style poll loop, a `while … sleep` loop, a
      `wait_pid.sh`). The agent is woken by that shell's exit; kill it and the agent never
      wakes, holding its slot until someone notices. Measured R39: four agents sat
      "completed, waiting" on runs that had already finished. Map each waiter to a live claim
@@ -993,8 +993,10 @@ not free, whatever its claim row says.
    clean-but-unmerged trees and never reaps them; the cases above are done by hand, or by
    the reaper's newer modes once they land.
 4. **Orphan build trees and scratch.** Run `scripts/gc_scratch.sh --builds --root`
-   (`--apply`), which removes `/mnt/fast/lane-builds/*` with no worktree and quarantines old
-   root scratch. Delete per-lane scratch dirs (`/var/tmp/bezel-scratch/<run>/<lane>/`) by
+   (`--apply`), which removes `/mnt/fast/lane-builds/*` with no worktree once it has been idle
+   24 h, and quarantines old root scratch. A fresher orphan tree is removed by hand.
+   **A waiter whose own `pgrep -f` matches itself** (target gone, loop eternal) is wedged,
+   not live: killing it RELEASES the agent waiting on it. Confirm the target finished first. Delete per-lane scratch dirs (`/var/tmp/bezel-scratch/<run>/<lane>/`) by
    **name**, never with a recursive search over the scratch root (369 GB, see *Build
    toolchain*). Keep the lane's `report.md` and probes until its pick or rejection is
    recorded, because a harvest lane reads them.

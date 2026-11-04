@@ -52,7 +52,8 @@ you mid-run and was not reachable from here, add a line.
 
 ## Before a gate (the gate owner only)
 - `scripts/pregate.sh` must say READY; zero agents and zero builders; the tree is frozen.
-  One gate per run, near its end, carrying 100+ closures. Runbook *Gates*.
+  One gate per run, near its end, carrying 100+ closures. CLAUDE.md *Gates*;
+  runbook *Gate protocol*.
 
 ## When a rule had to be repeated to you
 - Add it to the contract it belongs in, with its reason in the runbook, and a trigger line
