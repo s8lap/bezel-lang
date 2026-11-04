@@ -5909,15 +5909,35 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // Determine the accessed member's LLVM type without yet emitting the
         // access: a storage field's element type, or i32 for `string.Length`.
         auto* targetTy = ctx_.exprType(*nm->target);
-        bool stringLength = nm->member == "Length" && targetTy &&
+        const bool stringReceiver = targetTy &&
             targetTy->kind == sema::TypeRef::Kind::Primitive &&
             targetTy->primitive == sema::PrimitiveType::String;
+        bool stringLength = nm->member == "Length" && stringReceiver;
+        // fix #8123 (§7.5, stdlib §9.6, v0.355): the two BOOL properties of
+        // §9.6's `String` listing — `IsEmpty: bool` and `IsAscii: bool` — on
+        // the `?.` spelling. §7.5 admits `x?.M` for ANY member access and
+        // stdlib §9.6 declares both on the closed `string` surface, so the
+        // refusal was an implementation gap, not a rule of the language.
+        //
+        // The VALUES are the ones the `.` spelling computes (stdlib §9.6:
+        // "IsEmpty: bool — Length = 0"; "IsAscii: bool — true iff every code
+        // point < 128"): `IsEmpty` reads the string's code-point count and
+        // compares it with zero, `IsAscii` calls the runtime's
+        // `bz_string_is_ascii` — the SAME helper the `.` spelling's `IsAscii`
+        // arm calls (LlvmBackend_Exprs.cpp's CG27a block), so the two
+        // spellings cannot disagree about the answer. The `.` spelling's
+        // `IsEmpty` is #2348's open item and is NOT changed here; this arm is
+        // the `?.` spelling only.
+        bool stringIsEmpty = nm->member == "IsEmpty" && stringReceiver;
+        bool stringIsAscii = nm->member == "IsAscii" && stringReceiver;
         auto* ms = storageMemberOf(ctx_.exprSymbol(e));
         llvm::StructType* st = nullptr;
         llvm::Type* memTy = nullptr;
         unsigned memIdx = 0;
         if (stringLength) {
             memTy = i32();  // stdlib §9.6: Length: int
+        } else if (stringIsEmpty || stringIsAscii) {
+            memTy = i1();  // stdlib §9.6: IsEmpty: bool, IsAscii: bool
         } else {
             if (!ms || !ms->parent) return nullptr;
             auto idxIt = fieldIndex_.find(ms);
@@ -5984,6 +6004,31 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // `(if c then f() else s)?.Length`, `k.W?.Length`) has no named
             // owner and no scope-end release, so discharge it here, after the
             // length read. Only the non-null edge holds a reference.
+            if (isPlusOneStringProducer(nm->target.get()))
+                emitStringRelease(obj);
+        } else if (stringIsEmpty) {
+            // stdlib §9.6: `IsEmpty: bool` — "Length = 0". The code-point
+            // count is the string header's field 1 (`loadStringLen`), the very
+            // read the `.Length` arm above performs, so `IsEmpty` and
+            // `Length == 0` cannot disagree.
+            llvm::Value* len64 = loadStringLen(obj);
+            val = builder_.CreateICmpEQ(len64, builder_.getInt64(0),
+                                        "str.isempty");
+            // The same +1 producer discharge the `Length` arm does above
+            // (fix #5290): a producer receiver has no named owner, so it is
+            // released here, on the non-null edge only.
+            if (isPlusOneStringProducer(nm->target.get()))
+                emitStringRelease(obj);
+        } else if (stringIsAscii) {
+            // stdlib §9.6: `IsAscii: bool` — "true iff every code point < 128".
+            // The SAME runtime helper the `.` spelling's CG27a `IsAscii` arm
+            // calls, so the two spellings answer identically.
+            auto* fn = declareC("bz_string_is_ascii", i32(), {ptrTy()});
+            llvm::Value* r = builder_.CreateCall(fn, {obj}, "str.ascii");
+            val = builder_.CreateICmpNE(r, builder_.getInt32(0),
+                                        "str.isascii");
+            // The same +1 producer discharge the `Length` arm does above
+            // (fix #5290).
             if (isPlusOneStringProducer(nm->target.get()))
                 emitStringRelease(obj);
         } else {

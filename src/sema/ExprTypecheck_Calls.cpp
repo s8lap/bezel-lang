@@ -42654,12 +42654,32 @@ TypeRef* ExprTC::builtinValueMemberType(const TypeRef* recvTy,
     if (!recvTy || recvTy->kind != TypeRef::Kind::Primitive) return nullptr;
     if (recvTy->primitive == PrimitiveType::String) {
         // stdlib §9.6: Length: int. (ToString and the rest are methods —
-        // reached as `?(`, not a bare `?.` member access. `IsAscii` is also a
-        // bare-access bool member and types correctly here, but its value path
-        // needs a runtime scan helper that is the same gap regardless of `?.`;
-        // it is left to a dedicated follow-up rather than half-enabled.)
+        // reached as `?(`, not a bare `?.` member access.)
         if (member == "Length")
             return ctx_.primitiveTypeRef(PrimitiveType::Int);
+        // fix #8123 (§7.5, stdlib §9.6, v0.355): the two BOOL properties of
+        // §9.6's `String` listing — `public pure readonly property IsEmpty:
+        // bool;` and `public pure readonly property IsAscii: bool;`. §7.5
+        // defines `x?.M` for ANY member access ("`x?.M` returns null if `x`
+        // is null; otherwise it performs the access. The result type is
+        // always nullable"), with no restriction on `M`'s declaring type, and
+        // stdlib §9.6 declares these two on the closed `string` surface. The
+        // `?.` spelling of both was REFUSED ("string member `?.IsEmpty` is
+        // not yet supported in codegen") — an implementation gap reported as
+        // a compile error, not a rule of the language.
+        //
+        // The CALLER lifts the result to nullable per §7.5, so the type
+        // returned here is the NON-nullable declared one (`bool`), and the
+        // `?.` result is `bool?`.
+        //
+        // The `.` spelling of `IsAscii` types at resolveMemberAccess's own
+        // inlined intrinsic block (and lowers there, via `bz_string_is_ascii`);
+        // `IsEmpty`'s `.` spelling is #2348's open "String.IsEmpty" item, and
+        // this arm does NOT change it — the `.` spelling's admission is a
+        // SEPARATE question, owned by #2348. What this arm adds is the `?.`
+        // spelling only.
+        if (member == "IsEmpty" || member == "IsAscii")
+            return ctx_.primitiveTypeRef(PrimitiveType::Bool);
     }
     return nullptr;
 }
