@@ -3214,10 +3214,29 @@ void checkRecordNoCtorFieldCompletion(const ast::TypeDecl& rec,
             if (!cd->isStatic) { hasInstanceCtor = true; break; }
         }
     }
-    // A record WITH an explicit instance constructor is fully covered by
+    // fix #8097 / §9.3 / §7.9 (v0.355): a POSITIONAL record always carries the
+    // §9.1 auto-generated primary, and §7.9's obligation is PER CONSTRUCTOR.
+    // §9.3 (v0.355) states it: "The auto-generated primary assigns the
+    // positional storage only, and §7.9's obligation is per constructor, so a
+    // non-defaultable body field or auto-property is satisfied only by a field
+    // initializer (§22.8); a body constructor, of any parameter list, does not
+    // assign it for the primary." So for a POSITIONAL record the screen runs
+    // even when the body declares constructors: a body constructor does not
+    // discharge the PRIMARY's obligation, and only a field initializer
+    // (§22.8) does. Before this fix the screen returned early for ANY record
+    // with a body constructor, so `new R(9)` — the auto-generated primary —
+    // left the body field at its zero-filled slot with no diagnostic at all.
+    //
+    // A BODY record (no positional list) has NO auto-generated primary: its
+    // declared constructor carries the whole obligation, and
+    // runRecordConstructor's own per-constructor fall-off check (every
+    // declared constructor is visited via checkMember) covers it. That shape
+    // is deliberately left UNCHANGED.
+    const bool positional = rec.hasPositionalFields;
+    // A BODY record WITH an explicit instance constructor is fully covered by
     // runRecordConstructor's own per-constructor fall-off check (every
     // declared constructor is visited via checkMember); nothing to add here.
-    if (hasInstanceCtor) return;
+    if (hasInstanceCtor && !positional) return;
     for (const auto& m : rec.members) {
         std::string_view name;
         SourceLocation loc;
@@ -3230,6 +3249,19 @@ void checkRecordNoCtorFieldCompletion(const ast::TypeDecl& rec,
             name = p->name;
             loc = p->span.begin;
         } else {
+            continue;
+        }
+        if (positional && hasInstanceCtor) {
+            // The primary is present alongside the body constructor, and the
+            // body constructor does not assign this storage FOR THE PRIMARY
+            // (§9.3, v0.355). Only a field initializer (§22.8) does.
+            ctx.diagnostics().report(
+                Severity::Error, loc,
+                std::string("non-nullable field `") + std::string(name) +
+                    "` needs an initializer: this record's auto-generated "
+                    "primary constructor assigns the positional storage only, "
+                    "so a body constructor does not assign it for the primary "
+                    "(§9.3, §7.9)");
             continue;
         }
         ctx.diagnostics().report(
