@@ -530,8 +530,77 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     // an unrecorded expression, and the structural disjunct above did not
     // require it non-null. The `argTy &&` conjunct is what makes the
     // dereference safe again, as it was before that cut.
-    if (argTy && (isNullableValueTy(argTy) || isBareTypeParamRef(argTy)) &&
-        arg->getType()->isStructTy()) {
+    //
+    // fix #7965 (§7.4 / §22.6 / stdlib §7.4, v0.355): THE ARGUMENT IS NOT
+    // ALWAYS THE `{i8 hasValue; T}` CARRIER the arm below reads. A §7.4-
+    // NARROWED READ that sema PUBLISHED (#7621) is lowered to its bare
+    // PAYLOAD `T` — #6674's unwrap extracts it inside `lowerExpr` — so the
+    // carrier arm must not read a has-value tag out of a value that carries
+    // none.
+    //
+    // WHY THE PUBLISH IS ASYMMETRIC (THE DEFECT, MEASURED on b0325c3c).
+    // `Console.WriteLine(p)` and `Console.Out.WriteLine(p)` reach the §7
+    // nullability gate's CONSOLE arm, which REPORTS a still-nullable
+    // argument but does NOT publish the narrowed read — the carrier therefore
+    // reaches this function and the arm below renders it correctly (the
+    // #5240 rows). The `TextWriter` facet of stdlib §7.4 (`var t: TextWriter :=
+    // Console.Out; t.WriteLine(p)`, the #7713 once-bound-local resolver)
+    // reaches the gate's `checkBuiltinNullableArgs` instead, which DOES
+    // publish the narrowed read (#7621) — so the PAYLOAD reaches this
+    // function, and the carrier arm read the record's FIRST FIELD as the
+    // has-value tag:
+    //   %has.val81 = extractvalue %record.P %nv.val, 0   ; i32 (the X field!)
+    //   %has.val2  = icmp ne i32 %has.val81, i8 0        ; WIDTH MISMATCH
+    // ⇒ "Both operands to ICmp instruction are not of the same type!" and
+    // "bezelc: codegen error: IR verification failed" — a LEGAL program
+    // refused to compile (#7965). The same shape over a nullable CHOICE did
+    // not even reach the verifier: `emitChoiceToString` read the payload's
+    // case slot out of the payload and the compiler died with SIGSEGV.
+    //
+    // WHICH SHAPE IS THE ARGUMENT. The carrier is `{i8 hasValue; T}` — the
+    // exact type `nullableValueStructTy(argTy)` builds for the recorded
+    // nullable type — and the payload is that carrier's element 1. The
+    // discriminator is EXACT (the type the compiler itself builds), not a
+    // structural guess (the #5240 cut's structural guess mis-read an ordinary
+    // `record(byte, int)` as a carrier). #6674's unwrap fires only for a
+    // PUBLISHED (§7.4-narrowed) read whose value IS the carrier — so a
+    // published read whose value has the carrier's PAYLOAD type is a payload,
+    // and anything else keeps the carrier arm (the conservative default: a
+    // monomorphized record's specialized/unspecialized layout mismatch, #569,
+    // answers "carrier" here, as it did before).
+    //
+    // A BARE TYPE PARAMETER (a generic body, §3.6 rule 2) has no concrete
+    // carrier type to compare against, and there the carrier is what reaches
+    // the console (#6674's unwrap needs a CONCRETE nullable type), so the
+    // carrier arm stays the one that applies.
+    //
+    // The PAYLOAD arm renders the value with its NON-NULLABLE type — the
+    // §7.4 / §22.6 type of a narrowed read — through the ONE renderer
+    // (`emitValueToString`), exactly as the carrier arm's has-value arm
+    // does, so both spellings of the same write print the same text.
+    const bool nullableValueArg =
+        argTy && (isNullableValueTy(argTy) || isBareTypeParamRef(argTy));
+    bool argIsNullableCarrier = true;
+    if (nullableValueArg && !isBareTypeParamRef(argTy)) {
+        llvm::StructType* carrier = nullableValueStructTy(argTy);
+        const bool isCarrierValue = arg->getType() == carrier;
+        const bool isPayloadValue =
+            call.args[0].value &&
+            ctx_.isNarrowedValueRead(*call.args[0].value) &&
+            arg->getType() == carrier->getElementType(1);
+        argIsNullableCarrier = isCarrierValue || !isPayloadValue;
+    }
+    if (nullableValueArg && !argIsNullableCarrier) {
+        // The bare PAYLOAD `T` of a §7.4-narrowed read: render it directly.
+        // There is no has-value tag left to test (the #6674 unwrap already
+        // extracted the payload) and none to test: §7.4's narrowing is the
+        // proof that the read has a value.
+        sema::TypeRef innerTy = *argTy;
+        innerTy.nullable = false;
+        strPtr = emitValueToString(arg, &innerTy);
+        if (!strPtr) return false;
+        releaseRender = true;
+    } else if (nullableValueArg && arg->getType()->isStructTy()) {
         llvm::Value* hasVal = nullablePrimHasValue(arg);             // i1
         llvm::Value* innerVal = nullablePrimValue(arg);              // T
         auto* valBB  = llvm::BasicBlock::Create(llvm_, "wln.nv.val",  currentFn_);
