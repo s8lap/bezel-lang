@@ -18709,6 +18709,33 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                             builder_.CreateICmpSLT(ta, tb), i32(), "dt.cmp.lt");
                         return builder_.CreateSub(gt, lt, "dt.cmp");
                     }
+                    // fix #8064 (stdlib §2.5 "Equality and `Kind`", v0.355; spec
+                    // §8.3): "A `DateTime`'s `=`, `<>`, `Equals` and
+                    // `GetHashCode` read its `Ticks` alone ... two values with
+                    // equal `Ticks` are equal whatever their `Kind`s". There
+                    // was no unboxed arm, so both degraded to zero (#2434).
+                    // The comparison and the hash are emitValueEquality's and
+                    // emitValueHashCode's own DateTime arms (tick-only), the
+                    // ones the box thunks and `=` already use, so the unboxed
+                    // and boxed answers cannot disagree.
+                    if (mname == "GetHashCode" && call.args.empty())
+                        return emitValueHashCode(ticks, recvTyResolved);
+                    if (mname == "Equals" && call.args.size() == 1 &&
+                        call.args[0].value) {
+                        // Classify the argument BEFORE lowering it (§22.5: a
+                        // reroute must not lower it twice). A non-DateTime
+                        // static type (Object, interface, nullable) takes §8.1's
+                        // universal route, as the decimal arm does.
+                        const sema::TypeRef* at = resolveTypeParamRef(
+                            ctx_.exprType(*call.args[0].value));
+                        if (!(at && !at->nullable && isDateTimeValueRef(at)))
+                            return lowerValueSemUniversalEquals(
+                                recvTyResolved, ticks, call);
+                        llvm::Value* other = lowerExpr(*call.args[0].value);
+                        if (!other || !other->getType()->isIntegerTy(64))
+                            return nullptr;
+                        return emitValueEquality(ticks, other, recvTyResolved);
+                    }
                     // per stdlib §2.5 / #1357: ToUnixTimeSeconds(): long.
                     if (mname == "ToUnixTimeSeconds" && call.args.empty()) {
                         auto* fn = declareC("bz_datetime_to_unix_seconds", i64(), {i64()});
