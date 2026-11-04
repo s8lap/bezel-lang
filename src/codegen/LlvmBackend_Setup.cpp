@@ -40310,7 +40310,7 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
         // fix #7696 (stdlib §2.6, v0.350): `Guid.ToByteArray()` is a fresh
         // `owned Array<byte>` the local solely owns, like Split.
         // fix #8124 (stdlib §9.6, v0.355): `ToCharArray()` is the third
-        // stdlib §9.6 `owned Array<T>`-returning member (`public method
+        // stdlib §9.6 `owned Array<T>` (stdlib §4.4)-returning member (`public method
         // ToCharArray(): owned Array<char>;`) and it was MISSING here, so a
         // plain `var a := s.ToCharArray();` — and its `?.` twin
         // `var a := s?.ToCharArray();` — never reached the scope-end reclaim:

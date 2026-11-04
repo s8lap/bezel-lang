@@ -345,7 +345,8 @@ BEZEL_TEST(array_minmax_value_elem_result_type_8092,
 }
 
 // The no-selector form over the same non-comparable record stays REFUSED
-// (stdlib §5.1 `where T: IComparable<T>`), with a located diagnostic.
+// (stdlib §5.1 `where T: IComparable<T>`; stdlib §2.8 `IComparable<T>`),
+// with a located diagnostic.
 BEZEL_TEST(array_minmax_value_elem_result_type_8092,
            fixfwd_noselector_over_noncomparable_record_still_refused) {
     auto r = runAot(

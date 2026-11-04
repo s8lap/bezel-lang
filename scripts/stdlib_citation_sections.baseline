@@ -16,7 +16,7 @@
 # -- and NO line number, because a line-numbered key would fail the
 # gate on every unrelated commit that moved a comment.
 #
-count: 441
+count: 438
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	IOwningEnumerable	4.5
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	Range	4.4
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	2.7
@@ -55,7 +55,6 @@ site:	src/codegen/LlvmBackend_Layout.cpp	wrong-section	IEnumerable	9.6
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	Array	10
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	Array	4.1
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	Array	5
-site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	Array	9.6
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	CString	9.6
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	Equals	2.5
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	IEnumerable	2.1
@@ -155,7 +154,6 @@ site:	tests/codegen/array_lastindexof_7671_test.cpp	wrong-section	Equals	4.4
 site:	tests/codegen/array_local_bound_to_interface_and_object_no_leak_spec_28_2_4913_test.cpp	wrong-section	Array	4.1
 site:	tests/codegen/array_minmax_iface_elem_2770_test.cpp	wrong-section	CompareTo	2.8
 site:	tests/codegen/array_minmax_iface_elem_2770_test.cpp	wrong-section	IComparable	5.1
-site:	tests/codegen/array_minmax_value_elem_result_type_8092_test.cpp	wrong-section	IComparable	5.1
 site:	tests/codegen/array_minornull_maxornull_inferred_var_3784_test.cpp	wrong-section	Where	5.1
 site:	tests/codegen/array_reverse_chain_466_test.cpp	wrong-section	IEnumerable	3
 site:	tests/codegen/array_reversed_sorted_472_test.cpp	wrong-section	Array	3
@@ -306,7 +304,6 @@ site:	tests/codegen/string_asspan_byte_start_7106_test.cpp	wrong-section	ReadOnl
 site:	tests/codegen/string_builtin_iface_dispatch_2752_test.cpp	wrong-section	IComparable	2.2
 site:	tests/codegen/string_from_ffi_buffer_2734_test.cpp	wrong-section	IntPtr	9.6
 site:	tests/codegen/string_join_items_gate_7167_test.cpp	wrong-section	IEnumerable	9.6
-site:	tests/codegen/string_nullsafe_owned_result_8124_test.cpp	wrong-section	Array	9.6
 site:	tests/codegen/string_pad_center_7133_test.cpp	wrong-section	ArgumentOutOfRangeException	9.6
 site:	tests/codegen/string_repeat_pad_range_7120_test.cpp	wrong-section	ArgumentOutOfRangeException	9.6
 site:	tests/codegen/string_trim_chars_string_arg_7492_test.cpp	wrong-section	IEnumerable	9.6

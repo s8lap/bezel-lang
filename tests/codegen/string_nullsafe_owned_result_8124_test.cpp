@@ -94,9 +94,10 @@ bool hasError(const JitResult& r, const std::string& needle) {
 // ===========================================================================
 
 // The ISSUE's repro: `var a := s?.Split('c')` on a NON-NULL receiver must give
-// the Array, not a zero-initialised slot. stdlib §9.6's `Split(separator:
-// char)` splits "abcdc" at each 'c' → ["ab", "d", ""] — three parts (the
-// trailing empty part is kept, exactly as the `.` spelling does).
+// the Array (stdlib §4.4), not a zero-initialised slot. stdlib §9.6's
+// `Split(separator: char)` splits "abcdc" at each 'c' → ["ab", "d", ""] —
+// three parts (the trailing empty part is kept, exactly as the `.` spelling
+// does).
 BEZEL_TEST(codegen_string_nullsafe_owned_result_8124,
            spec_7_5_split_char_separator_non_null_receiver) {
     auto r = runAot(prog(
