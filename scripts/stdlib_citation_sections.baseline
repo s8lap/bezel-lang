@@ -16,7 +16,7 @@
 # -- and NO line number, because a line-numbered key would fail the
 # gate on every unrelated commit that moved a comment.
 #
-count: 471
+count: 473
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	IOwningEnumerable	4.5
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	Range	4.4
 site:	src/codegen/LlvmBackend_Calls.cpp	no-such-section	11.1	11.1
@@ -389,6 +389,8 @@ site:	tests/sema/extension_where_clause_filter_3336_test.cpp	wrong-section	IComp
 site:	tests/sema/hash_ctor_string_shared_position_8007_test.cpp	wrong-section	IEqualityComparer	4.10
 site:	tests/sema/imported_public_collides_with_always_available_5140_test.cpp	wrong-section	Counter	4.14
 site:	tests/sema/indexer_nullable_index_arg_2619_test.cpp	wrong-section	Range	4.6
+site:	tests/sema/lazy_result_to_concrete_collection_8098_test.cpp	wrong-section	Array	5
+site:	tests/sema/lazy_result_to_concrete_collection_8098_test.cpp	wrong-section	IEnumerable	4.4
 site:	tests/sema/list_interface_range_slice_6513_test.cpp	wrong-section	Range	4.4
 site:	tests/sema/lone_candidate_unrelated_argument_6334_test.cpp	wrong-section	IEnumerable	4.1
 site:	tests/sema/math_minmax_nullable_7660_test.cpp	wrong-section	IComparable	2.2

@@ -321,7 +321,7 @@ BEZEL_TEST(extension_builtin_stub_receiver_7756, rule1_dt_adddays_addyears_on_fa
 }
 
 // The receiver is the static property `Guid.Empty`; `ToString` (§8.1 /
-// stdlib §2.7) and `ToByteArray` are both declared.
+// stdlib §2.6) and `ToByteArray` are both declared.
 BEZEL_TEST(extension_builtin_stub_receiver_7756, rule1_guid_tostring_tobytearray_on_static_property) {
     BEZEL_EXPECT_EQ(
         out(prog("extension Guid public method ToString(): string => "
