@@ -2038,6 +2038,105 @@ bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args
     return true;
 }
 
+// fix #8031 (§28.3 K8, v0.353): the `case`-expression K8 full-expression-
+// boundary mark. The mark tells codegen's `lowerCaseExpr` that the
+// construct's SCRUTINEE is an unbound OWNED temporary that must be captured
+// into an entry alloca, registered on the dispose stack, and released at the
+// construct's completion. §28.3's unbound-owned-temporary rule is what makes
+// the temporary the construct's to release.
+//
+// THE MARK IS A PROPERTY OF THE NODE, NOT OF THE POSITION. The predicate is
+// the same one the case-STATEMENT twin uses (`src/ownership/Ownership.cpp`,
+// the `CaseStmt` arm of the CFG block walk): the scrutinee's producer
+// classification is Owned (a `new`, an owned-returning call, a `move`, …)
+// AND the scrutinee's static type is a heap class / interface value or an
+// owning-collection value. Both facts come from the AST and from sema's
+// recorded static type — `producerState` consults no ownership dataflow
+// (it classifies an EXPRESSION "purely from its AST shape and static type",
+// Ownership.cpp) — so the answer is the SAME wherever the construct is
+// reached from.
+//
+// BEFORE THIS CHANGE only the DISCHARGE walk set the mark, so a `case`
+// expression reached through the READ walk — a local-decl initializer, an
+// assignment RHS, a `return` operand, a call argument — never captured its
+// owned scrutinee temporary and the temporary LEAKED (measured: 224 bytes in
+// 3 allocations, the `bz_array_t` header, its backing buffer and the owned
+// element). The statement-position twin (`case Mk() of … end case;`) was
+// always fine: its mark comes from the CFG block walk, which does not depend
+// on the expression context.
+//
+// The mark is idempotent (a bool), so setting it from several walkers is
+// safe; the first one to see the node decides, and every later one agrees.
+void MethodOwnership::markCaseExprOwnedScrutinee(const ast::CaseExpr& ce) {
+    if (ce.disposeOwnedScrutinee) return;
+    if (!ce.scrutinee) return;
+    if (producerState(*ce.scrutinee) != OwnershipState::Owned) return;
+    const sema::TypeRef* rt = ctx_.exprType(*ce.scrutinee);
+    bool isHeapClass = rt && rt->kind == sema::TypeRef::Kind::Named &&
+        rt->declaration &&
+        (rt->declaration->kind == ast::TypeDeclKind::Class ||
+         rt->declaration->kind == ast::TypeDeclKind::Interface) &&
+        !rt->declaration->isValueBuiltin &&
+        (rt->declaration->decl != nullptr ||
+         !rt->declaration->moduleName.empty());
+    bool isOwningCollection = rt && rt->kind == sema::TypeRef::Kind::Named &&
+        isOwningCollectionNameHead(rt->headName());
+    if (isHeapClass || isOwningCollection)
+        const_cast<ast::CaseExpr*>(&ce)->disposeOwnedScrutinee = true;
+}
+
+// fix #8031 (§28.3 K8, v0.353): the DECLARATION-SITE expression positions.
+//
+// THE GAP THIS CLOSES. The three walkers that reach a `case` EXPRESSION —
+// the discharge walk, the read walk, and the §35.5 arm-borrow-source
+// collector — all walk a METHOD BODY. A `case` expression that lives in a
+// DECLARATION-SITE expression is not part of any method body, so none of
+// them reached it, and the construct's owned scrutinee temporary was never
+// captured and never released (MEASURED: 224 bytes in 3 allocations at
+// every one of those positions). The positions are:
+//
+//   * an INSTANCE field initializer        (`f: int := (case Mk() of _ => 1);`)
+//   * a STATIC field initializer           (`static f: int := (case …);`)
+//   * an AUTO-PROPERTY initializer         (`property P: int := (case …);`)
+//   * a PARAMETER's DEFAULT value         (`m(x: int := (case …))`)
+//
+// THE MARK-ONLY MODE. The walk REUSES the §35.5 collector's expression
+// grammar — the ONE place the grammar is spelled — in a mode that sets the
+// K8 mark and does NOTHING else: the collector's §35.5 arm-registration and
+// its K8.4 escape check are skipped, so this entry point changes NO
+// diagnostic behaviour. It only sets the mark.
+//
+// WHY THE MARK IS THE WHOLE FIX. The mark is what codegen's `lowerCaseExpr`
+// reads: with it set, the scrutinee is captured into an entry alloca, a
+// dispose-stack entry is registered for it, and the construct's normal-edge
+// reclaim releases it at the construct's completion. The mark is a property
+// of the NODE (the scrutinee's producer classification and static type),
+// not of the position — so the same predicate answers the same way here as
+// it does in the method-body walkers.
+//
+// The default-parameter position is lowered at the CALL SITE (codegen's
+// omitted-argument path lowers `p.defaultValue` in the CALLER), so the same
+// AST node is lowered once per call site — the mark is per node, so every
+// call site captures and releases its own copy.
+void MethodOwnership::markCaseExprOwnedScrutineeInExpr(const ast::Expr& e) {
+    const bool saved = markOnlyCaseWalk_;
+    markOnlyCaseWalk_ = true;
+    collectCaseArmBorrowSourcesExpr(e);
+    markOnlyCaseWalk_ = saved;
+}
+
+// fix #8031 (§28.3 K8, v0.353): the statement-list sibling — see
+// `markCaseExprOwnedScrutineeInExpr`. A property accessor's BLOCK body
+// (`get => do … end`) is a declaration-site statement list, not part of any
+// method body, so the three method-body walkers never reached a `case`
+// EXPRESSION written in it either.
+void MethodOwnership::markCaseExprOwnedScrutineeInStmt(const ast::Stmt& s) {
+    const bool saved = markOnlyCaseWalk_;
+    markOnlyCaseWalk_ = true;
+    collectCaseArmBorrowSourcesStmt(s);
+    markOnlyCaseWalk_ = saved;
+}
+
 void MethodOwnership::handleDischarge(const ast::Expr& e) {
     // §31.1 / §28.8 / §17.12 (issue #406): a `throw` in EXPRESSION position
     // (`x ?? throw new Wrap(b)`, `case ... => throw new Wrap(b)`) is a
@@ -2137,21 +2236,16 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         // emit the entry-alloca + endBB-dispose pair. The shared `isHeapClass
         // || isOwningCollection` gate keeps both forms of the §28.3 unbound-
         // owned-temporary reclaim keyed on the same producer classifier.
-        if (!suppressDiag_ && ce->scrutinee &&
-            producerState(*ce->scrutinee) == OwnershipState::Owned) {
-            const sema::TypeRef* rt = ctx_.exprType(*ce->scrutinee);
-            bool isHeapClass = rt && rt->kind == sema::TypeRef::Kind::Named &&
-                rt->declaration &&
-                (rt->declaration->kind == ast::TypeDeclKind::Class ||
-                 rt->declaration->kind == ast::TypeDeclKind::Interface) &&
-                !rt->declaration->isValueBuiltin &&
-                (rt->declaration->decl != nullptr ||
-                 !rt->declaration->moduleName.empty());
-            bool isOwningCollection = rt && rt->kind == sema::TypeRef::Kind::Named &&
-                isOwningCollectionNameHead(rt->headName());
-            if (isHeapClass || isOwningCollection)
-                const_cast<ast::CaseExpr*>(ce)->disposeOwnedScrutinee = true;
-        }
+        //
+        // fix #8031 (§28.3 K8, v0.353): the mark is a property of the NODE
+        // and of the scrutinee's producer classification, NOT of the position
+        // the construct is reached from — so it is set here (the discharge
+        // walk), in the read walk, and in the syntactic pre-pass alike.
+        // Before this change only THIS site set it, so a `case` expression
+        // reached through `checkRead` (a local-decl initializer, an
+        // assignment RHS, a `return`/argument operand) never captured its
+        // owned scrutinee temporary and the temporary LEAKED.
+        markCaseExprOwnedScrutinee(*ce);
         BlockState saved = states_;
         for (const auto& arm : ce->arms) {
             states_ = saved;
@@ -3165,6 +3259,14 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
             return;
         }
         auto* ce = static_cast<const ast::CaseExpr*>(&e);
+        // fix #8031 (§28.3 K8, v0.353): the read walk is the path a `case`
+        // expression takes in every position the discharge walk does not
+        // reach directly — a local-decl initializer, an assignment RHS, a
+        // `return` operand, a call argument. Set the K8 mark here too, so
+        // the construct's owned scrutinee temporary is captured and released
+        // in those positions as well (the discharge walk sets it for the
+        // expression-statement position).
+        markCaseExprOwnedScrutinee(*ce);
         if (ce->scrutinee) checkRead(*ce->scrutinee, false);
         for (const auto& arm : ce->arms) {
             if (arm.guard) checkRead(*arm.guard, false);
@@ -10336,8 +10438,34 @@ void MethodOwnership::collectCaseArmBorrowSourcesExpr(const ast::Expr& e) {
     if (const auto* mv = dynamic_cast<const ast::UnaryExpr*>(&e))
         if (mv->op == "move") reportIfBorrowOnlyArmBindingMove(*mv);
     if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
-        registerCaseArmBorrowSources(cx->arms, cx->scrutinee.get());
-        registerBorrowOnlyArmBindings(cx->arms, cx->scrutinee.get());
+        // fix #8031 (§28.3 K8, v0.353): the MARK-ONLY walk mode (the
+        // declaration-site positions — a field initializer, a static field
+        // initializer, an auto-property initializer, a parameter's default
+        // value) skips the §35.5 arm-registration and escape-check work: this
+        // walk's ONLY job there is to set the K8 boundary mark, so it changes
+        // no diagnostic behaviour at all.
+        if (!markOnlyCaseWalk_) {
+            registerCaseArmBorrowSources(cx->arms, cx->scrutinee.get());
+            registerBorrowOnlyArmBindings(cx->arms, cx->scrutinee.get());
+        }
+        // fix #8031 (§28.3 K8, v0.353): this walker is the ownership pass's
+        // ONE syntactic walk over a METHOD BODY, and it reaches every `case`
+        // expression in every METHOD-BODY expression position (initializer,
+        // assignment RHS, return / throw / yield operand, condition, argument)
+        // — so the K8 mark is set here as well, and the construct's owned
+        // scrutinee temporary is captured and released in EVERY position, not
+        // only in the ones the discharge walk happens to reach. The predicate
+        // is position-independent (the scrutinee's producer classification and
+        // static type), so all the call sites agree.
+        //
+        // The DECLARATION-SITE positions (a field initializer, a static field
+        // initializer, an auto-property initializer, a parameter's default
+        // value, a property's expression body, a property accessor's body, a
+        // `requires` / `ensures` clause, a class `invariant`) are NOT part of
+        // any method body, so this walk never reached them either — they are
+        // marked through `markCaseExprOwnedScrutineeInExpr`, which drives
+        // THIS walker in its MARK-ONLY mode.
+        markCaseExprOwnedScrutinee(*cx);
         // fix #4635 (§28.3 K8.4, v0.307): the K8.4 escape check rides this
         // walker — the ownership pass's ONE syntactic walk that reaches every
         // CaseExpr in every expression position (initializer, assignment RHS,
@@ -10345,7 +10473,8 @@ void MethodOwnership::collectCaseArmBorrowSourcesExpr(const ast::Expr& e) {
         // an escape check of the construct's VALUE needs. It runs once, in the
         // pre-pass, so the diagnostic fires exactly once and never inside the
         // O3b fixpoint. // per §28.3 K8.4, §35.5, v0.307
-        checkOwningMatchArmEscape(*cx);
+        if (!markOnlyCaseWalk_)
+            checkOwningMatchArmEscape(*cx);
         if (cx->scrutinee) collectCaseArmBorrowSourcesExpr(*cx->scrutinee);
         for (const auto& arm : cx->arms) {
             if (arm.guard) collectCaseArmBorrowSourcesExpr(*arm.guard);
@@ -10409,6 +10538,39 @@ void MethodOwnership::collectCaseArmBorrowSourcesExpr(const ast::Expr& e) {
             }
     } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
         if (th->operand) collectCaseArmBorrowSourcesExpr(*th->operand);
+    } else if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        // fix #8031 (§28.3 K8, v0.353): a `case` EXPRESSION can be nested in a
+        // record `with(...)` OVERRIDE VALUE (`new R() with (v := (case Mk() of
+        // _ => 1))`). §9.5's `with` form reads the source and every override
+        // value -- the SAME shape `checkRead`'s own `WithExpr` arm walks
+        // (`readOperand(we->source.get())` and then each override value) --
+        // so this walker's grammar must descend into both, or a `case`
+        // nested in either is INVISIBLE to it.
+        //
+        // WHY IT MATTERED. This walker is the ownership pass's ONE syntactic
+        // walk over a method body, and it is ALSO the grammar the
+        // DECLARATION-SITE reach drives (in its MARK-ONLY mode). Without this
+        // arm the declaration-site positions inherited the hole: a `case`
+        // nested in a `with(...)` never got the K8 boundary mark, so the
+        // construct's owned scrutinee temporary was never captured and never
+        // released (MEASURED at the pre-fix tree: 22400 bytes in 300
+        // allocations for an instance field initializer evaluated 100 times;
+        // 224 bytes in 3 allocations for a static field initializer).
+        if (we->source) collectCaseArmBorrowSourcesExpr(*we->source);
+        for (const auto& ia : we->assigns)
+            if (ia.value) collectCaseArmBorrowSourcesExpr(*ia.value);
+    } else if (auto* rg = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        // fix #8031 (§28.3 K8, v0.353): a `case` EXPRESSION can be nested in a
+        // range's ENDPOINT (`1..(case Mk() of _ => 2)`). §16.1's range
+        // CONSTRUCTION reads the written endpoints (and §16.4's STRIDE adds
+        // the step) -- the SAME shape `checkRead`'s own `RangeExpr` arm walks
+        // (`readOperand(re->lo/hi/step)`) -- so this walker's grammar must
+        // descend into all three, or a `case` nested in any of them is
+        // INVISIBLE to it. (The same MEASURED leak as the `WithExpr` arm
+        // above.)
+        if (rg->lo) collectCaseArmBorrowSourcesExpr(*rg->lo);
+        if (rg->hi) collectCaseArmBorrowSourcesExpr(*rg->hi);
+        if (rg->step) collectCaseArmBorrowSourcesExpr(*rg->step);
     } else if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
         for (const auto& cl : bx->clauses)
             if (cl && cl->initializer)
@@ -10455,18 +10617,23 @@ void MethodOwnership::collectCaseArmBorrowSourcesStmt(const ast::Stmt& s) {
     // scan leaf statement expressions, scan control-flow form expressions.
     forEachNestedStmt(s, [&](const ast::Stmt& cur) {
         if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&cur)) {
-            registerCaseArmBorrowSources(cs->arms, cs->scrutinee.get());
-            // fix #4664: register BEFORE the walker descends into this
-            // statement's arm bodies (`forEachNestedStmt` calls this action on
-            // the parent first), so a `move` inside an arm sees its own
-            // binding's ban. // per §35.5, §28.3 K3.1, v0.307
-            registerBorrowOnlyArmBindings(cs->arms, cs->scrutinee.get());
-            // fix #4663 (§28.3 K8.4, v0.307): the STATEMENT-position twin of
-            // #4635's `checkOwningMatchArmEscape` call below in the CaseExpr
-            // branch — same reasoning, applied to a STORE written out of a
-            // block-form arm's body instead of the construct's own value.
-            // // per §28.3 K8.4, §35.5, v0.307
-            checkOwningMatchArmStmtEscape(*cs);
+            // fix #8031 (§28.3 K8, v0.353): the MARK-ONLY walk mode skips the
+            // §35.5 arm-registration and escape-check work — see the CaseExpr
+            // arm of `collectCaseArmBorrowSourcesExpr`.
+            if (!markOnlyCaseWalk_) {
+                registerCaseArmBorrowSources(cs->arms, cs->scrutinee.get());
+                // fix #4664: register BEFORE the walker descends into this
+                // statement's arm bodies (`forEachNestedStmt` calls this action
+                // on the parent first), so a `move` inside an arm sees its own
+                // binding's ban. // per §35.5, §28.3 K3.1, v0.307
+                registerBorrowOnlyArmBindings(cs->arms, cs->scrutinee.get());
+                // fix #4663 (§28.3 K8.4, v0.307): the STATEMENT-position twin of
+                // #4635's `checkOwningMatchArmEscape` call below in the CaseExpr
+                // branch — same reasoning, applied to a STORE written out of a
+                // block-form arm's body instead of the construct's own value.
+                // // per §28.3 K8.4, §35.5, v0.307
+                checkOwningMatchArmStmtEscape(*cs);
+            }
             if (cs->scrutinee) collectCaseArmBorrowSourcesExpr(*cs->scrutinee);
             for (const auto& arm : cs->arms) {
                 if (arm.guard) collectCaseArmBorrowSourcesExpr(*arm.guard);

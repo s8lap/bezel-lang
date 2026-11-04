@@ -17887,6 +17887,19 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
             // fix #3546 (§31.1, v0.283): same reachability gap, same position.
             mo.checkLambdaBodyEscapesExpr(
                 *fd->initializer);
+            // fix #8031 (§28.3 K8, v0.353): the field initializer is a
+            // DECLARATION-SITE expression — it is not part of any method body,
+            // so the three method-body walkers (the discharge walk, the read
+            // walk, the §35.5 collector) never reached a `case` EXPRESSION
+            // written here, and the construct's owned scrutinee temporary
+            // LEAKED (MEASURED: 224 bytes in 3 allocations — the `bz_array_t`
+            // header, its backing buffer and the owned element). Mark the K8
+            // boundary for every `case` expression reachable from the
+            // initializer, so the construct captures and releases its owned
+            // scrutinee temporary here too. Applies to a STATIC field as well:
+            // the K8 boundary is the CONSTRUCT's, and the static initializer is
+            // the construct's own scope. // per §28.3 K8
+            mo.markCaseExprOwnedScrutineeInExpr(*fd->initializer);
         }
     } else if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
         if (nt->decl) {
@@ -17904,6 +17917,21 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
             for (const auto& innerM : nt->decl->members) {
                 if (innerM) checkMember(*innerM, ctx, nt->decl.get());
             }
+            // fix #8031 (§28.3 K8, v0.353): the nested type's PRIMARY-
+            // CONSTRUCTOR parameter list is a declaration-site position, exactly
+            // as at the top level — mark the K8 boundary for every `case`
+            // expression in a primary-constructor parameter's default value.
+            // // per §28.3 K8
+            {
+                MethodOwnership mo(ctx);
+                for (const ast::Param& p : nt->decl->positionalFields)
+                    if (p.defaultValue)
+                        mo.markCaseExprOwnedScrutineeInExpr(*p.defaultValue);
+                for (const ast::ChoiceCase& cc : nt->decl->choiceCases)
+                    for (const ast::Param& p : cc.payload)
+                        if (p.defaultValue)
+                            mo.markCaseExprOwnedScrutineeInExpr(*p.defaultValue);
+            }
         }
     } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
         // #2168 / §23.1 / §28.6 (v0.226): an auto-property initializer writes
@@ -17913,6 +17941,14 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
         if (pd->autoInitializer) {
             MethodOwnership mo(ctx);
             mo.checkAutoPropertyInitializer(*pd);
+            // fix #8031 (§28.3 K8, v0.353): the auto-property initializer is a
+            // DECLARATION-SITE expression — not part of any method body — so
+            // the three method-body walkers never reached a `case` EXPRESSION
+            // written here and the construct's owned scrutinee temporary
+            // LEAKED (MEASURED: 224 bytes in 3 allocations). Mark the K8
+            // boundary for it, exactly as the field-initializer arm does. // per
+            // §28.3 K8
+            mo.markCaseExprOwnedScrutineeInExpr(*pd->autoInitializer);
         }
         // #926 / §28.6 (v0.153): a property/indexer GETTER may not return a
         // freshly-produced owned value (a getter is a borrow-producing position).
@@ -17947,6 +17983,13 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
             // `this` and instance fields are in scope - a closure capturing
             // them carries a non-empty source set.
             mo.checkGetterReturnFieldCaptures(*pd->exprBody);
+            // fix #8031 (§28.3 K8, v0.353): the property's EXPRESSION BODY is
+            // a DECLARATION-SITE expression — not part of any method body — so
+            // the three method-body walkers never reached a `case` EXPRESSION
+            // written here and the construct's owned scrutinee temporary
+            // LEAKED (MEASURED: 224 bytes in 3 allocations). Mark the K8
+            // boundary for it. // per §28.3 K8
+            mo.markCaseExprOwnedScrutineeInExpr(*pd->exprBody);
         } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
             for (const auto& acc : pd->accessors) {
                 MethodOwnership mo(ctx);
@@ -17985,6 +18028,20 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
                         *acc.exprBody);
                 else if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block)
                     mo.checkLambdaBodyEscapes(acc.stmts);
+                // fix #8031 (§28.3 K8, v0.353): an accessor body is a
+                // DECLARATION-SITE expression (or statement list) — not part
+                // of any method body — so the three method-body walkers never
+                // reached a `case` EXPRESSION written in it and the construct's
+                // owned scrutinee temporary LEAKED (MEASURED: 224 bytes in 3
+                // allocations). Mark the K8 boundary for it, in both accessor
+                // body shapes. // per §28.3 K8
+                if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression &&
+                    acc.exprBody)
+                    mo.markCaseExprOwnedScrutineeInExpr(*acc.exprBody);
+                else if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block)
+                    for (const auto& accStmt : acc.stmts)
+                        if (accStmt)
+                            mo.markCaseExprOwnedScrutineeInStmt(*accStmt);
                 // fix #5252 (§23.3 / §28.3, v0.313): a `set(owned)` accessor
                 // body runs the FULL ownership pass with its implicit `value`
                 // as an `owned` parameter. §23.3: the setter "takes owned T";
@@ -18047,6 +18104,48 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
     checkMemberFlow(m, ctx, enclosingType, enclosingExtension);
     MethodOwnership mo(ctx);
     mo.scanMemberForFieldReadArgs(m);
+    // fix #8031 (§28.3 K8, v0.353): a PARAMETER's DEFAULT VALUE is a
+    // DECLARATION-SITE expression — it is not part of any method body, so the
+    // three method-body walkers (the discharge walk, the read walk, the §35.5
+    // collector) never reached a `case` EXPRESSION written there and the
+    // construct's owned scrutinee temporary LEAKED (MEASURED: 224 bytes in 3
+    // allocations). Codegen lowers the default at the CALL SITE (the
+    // omitted-argument path lowers `p.defaultValue` in the CALLER), so the
+    // same AST node is lowered once per call site; the K8 mark is per node, so
+    // every call site captures and releases its own copy. Mark the K8 boundary
+    // for every `case` expression reachable from every parameter default of
+    // this member — a method's, a constructor's, an operator's, an indexer's.
+    // // per §28.3 K8
+    {
+        const std::vector<ast::Param>* params = nullptr;
+        const std::vector<ast::ContractClause>* contracts = nullptr;
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
+            params = &md->params;
+            contracts = &md->contractClauses;
+        } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
+            params = &cd->params;
+            contracts = &cd->contractClauses;
+        } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m))
+            params = &od->params;
+        else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m))
+            params = &pd->indexerParams;
+        if (params)
+            for (const ast::Param& p : *params)
+                if (p.defaultValue)
+                    mo.markCaseExprOwnedScrutineeInExpr(*p.defaultValue);
+        // A `requires` / `ensures` clause is a DECLARATION-SITE expression too
+        // — it is evaluated by the callee (or by the contract machinery) and is
+        // not part of any method body.
+        if (contracts)
+            for (const ast::ContractClause& cc : *contracts)
+                if (cc.expr)
+                    mo.markCaseExprOwnedScrutineeInExpr(*cc.expr);
+        // A class `invariant` expression is likewise a declaration-site
+        // expression (evaluated at construction exit).
+        if (auto* id = dynamic_cast<const ast::InvariantDecl*>(&m))
+            if (id->expr)
+                mo.markCaseExprOwnedScrutineeInExpr(*id->expr);
+    }
 }
 
 // ---------- Slice O9: owned-field definite-assignment (§7.9) --------
@@ -18313,6 +18412,25 @@ void checkTopDecl(const ast::TopDecl& d, sema::SemaContext& ctx) {
         // type-parameter recognition (a `class Box<T> ... method Get(): T`).
         for (const auto& m : td->members) {
             if (m) checkMember(*m, ctx, td);
+        }
+        // fix #8031 (§28.3 K8, v0.353): the type's PRIMARY-CONSTRUCTOR
+        // parameter list is a DECLARATION-SITE position — the parameters and
+        // their default values belong to the TYPE, not to any method body — so
+        // the three method-body walkers never reached a `case` EXPRESSION
+        // written in a primary-constructor parameter's default value, and the
+        // construct's owned scrutinee temporary LEAKED (MEASURED: 224 bytes in
+        // 3 allocations). Mark the K8 boundary for it. // per §28.3 K8
+        {
+            MethodOwnership mo(ctx);
+            for (const ast::Param& p : td->positionalFields)
+                if (p.defaultValue)
+                    mo.markCaseExprOwnedScrutineeInExpr(*p.defaultValue);
+            // A CHOICE CASE's payload field is a declaration-site parameter
+            // position too (§35.1) — same hook, same reason.
+            for (const ast::ChoiceCase& cc : td->choiceCases)
+                for (const ast::Param& p : cc.payload)
+                    if (p.defaultValue)
+                        mo.markCaseExprOwnedScrutineeInExpr(*p.defaultValue);
         }
     } else if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&d)) {
         // §28.3 v0.235 (#1666, #2381): an ExtensionDecl carries no `genericParams`

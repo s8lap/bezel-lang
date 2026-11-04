@@ -502,6 +502,29 @@ public:
                                const ast::TypeDecl* enclosingType = nullptr);
     void checkAutoPropertyInitializer(const ast::PropertyDecl& pd);
 
+    // fix #8031 (§28.3 K8, v0.353): the DECLARATION-SITE expression positions.
+    // The three walkers that reach a `case` EXPRESSION inside a method body
+    // (the discharge walk, the read walk, and the §35.5 arm-borrow-source
+    // collector) never see a `case` expression that lives in a
+    // DECLARATION-SITE expression — a field initializer, a static field
+    // initializer, an auto-property initializer, or a parameter's default
+    // value — because those expressions are not part of any method body.
+    // This entry point marks the K8 boundary for EVERY `case` expression
+    // reachable from such a declaration-site expression.
+    //
+    // It REUSES the §35.5 collector's expression grammar (the ONE place the
+    // grammar is spelled) in a MARK-ONLY mode: the walk descends exactly as
+    // the collector does, but the collector's §35.5 arm-registration and
+    // escape-check work is skipped, so this changes NO diagnostic behaviour
+    // — it only sets the K8 mark.
+    void markCaseExprOwnedScrutineeInExpr(const ast::Expr& e);
+
+    // fix #8031 (§28.3 K8, v0.353): the statement-list sibling of
+    // `markCaseExprOwnedScrutineeInExpr` — for a declaration-site STATEMENT
+    // list (a property accessor's block body). Same MARK-ONLY mode, same
+    // reuse of the §35.5 collector's statement grammar.
+    void markCaseExprOwnedScrutineeInStmt(const ast::Stmt& s);
+
     // issue #7693 (see #6233, #7541; §15.3 *Parameter passing* / *Whole-value
     // reassignment*, v0.350): the argument-position field-read checks
     // (`rejectMoveOnlyFieldReadArg` and the owned-sink field-read leg of
@@ -1739,6 +1762,26 @@ private:
                          std::size_t pos, const ast::Expr* callee);
 
     void handleDischarge(const ast::Expr& e);
+
+    // fix #8031 (§28.3 K8, v0.353): set the `case`-expression K8
+    // full-expression-boundary mark (`ast::CaseExpr::disposeOwnedScrutinee`)
+    // when the construct's SCRUTINEE is an unbound OWNED producer (a heap
+    // class / interface value, or an owning-collection value). Codegen's
+    // `lowerCaseExpr` reads the mark to capture the scrutinee into an entry
+    // alloca, register a dispose-stack entry for it, and release it at the
+    // construct's completion. The mark is a property of the NODE and of the
+    // scrutinee's producer classification — both independent of the position
+    // the construct is reached from — so it is set from EVERY expression
+    // position: the discharge walk, the read walk, the syntactic pre-pass
+    // over a METHOD BODY, and the DECLARATION-SITE entry point
+    // (`markCaseExprOwnedScrutineeInExpr`).
+    void markCaseExprOwnedScrutinee(const ast::CaseExpr& ce);
+
+    // fix #8031 (§28.3 K8, v0.353): the MARK-ONLY walk mode (see
+    // `markCaseExprOwnedScrutineeInExpr`). True while the §35.5 collector
+    // runs as a pure marker — the collector then skips its arm-registration
+    // and escape-check work and only sets the K8 mark.
+    bool markOnlyCaseWalk_ = false;
 
     // Recursively descend an expression and, at each IdentifierExpr that
     // names a tracked local, verify the local's ownership state is
