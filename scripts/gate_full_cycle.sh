@@ -1559,6 +1559,46 @@ if ! python3 scripts/check_src_citations.py >> "$_sc_log" 2>&1; then
 fi
 say "src-citation phase: GREEN (every §-citation in src/ resolves)"
 
+# ── STDLIB-CITATION-SECTION PHASE (#8067) ───────────────────────────────────
+# The phase above asks that a §-citation RESOLVES to SOME section, in a
+# namespace pooled across the spec, the stdlib, the rationale and the guides.
+# It cannot ask WHICH section the comment meant: `stdlib §7` resolves (to the
+# stdlib's System.IO, and to the spec's §7), so it can never be WRONG, only
+# ambiguous. #8061 is exactly that -- src/common/OwnershipFacts.cpp cited
+# `stdlib §7` for `Encoding.GetBytes`, and `Encoding` is stdlib §3.2.
+#
+# This phase is the second half of the citation check, over src/ AND tests/
+# (the phase above reads src/ only, and BOTH of #8061's blocking findings
+# were in tests/). It is a RATCHET, not a gate: the precise rule -- the member
+# is DECLARED in the cited section -- flags 471 sites today, ~77 % of them
+# structurally (a section that DISCUSSES a member without DECLARING it), so
+# the sites are banked in scripts/stdlib_citation_sections.baseline and the
+# check fires only on a NEW one.
+#
+# --self-test runs first and is not optional, for the reason recorded in every
+# sibling phase above: the detector's self-test plants the #8061 and #8093
+# shapes verbatim and the look-alike shapes that must NOT count.
+say "stdlib-citation-section phase: scripts/check_stdlib_citation_sections.py"
+_scs_log="$LOGDIR/${TAG}_stdlib_citation_sections.log"
+if ! python3 scripts/check_stdlib_citation_sections.py --self-test \
+      > "$_scs_log" 2>&1; then
+  say "CYCLE FAILURE: check_stdlib_citation_sections SELF-TEST failed — the"
+  say "  checker cannot be trusted to report on the tree. See $_scs_log"
+  tail -20 "$_scs_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_stdlib_citation_sections.py --strict \
+      >> "$_scs_log" 2>&1; then
+  say "CYCLE FAILURE: a stdlib §-citation names a section that does NOT"
+  say "  declare the member it names (or a number the stdlib does not have"
+  say "  at all) — a citation is how a reader finds the authority, and a"
+  say "  reader who follows a wrong one lands in the wrong section (#8061,"
+  say "  #8066, #8093). See $_scs_log"
+  tail -40 "$_scs_log" 2>/dev/null | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "stdlib-citation-section phase: GREEN ($(tail -1 "$_scs_log"))"
+
 # Rule-corpus harness phase (tests/conformance/rules). Build-free and fast, so
 # it sits beside the gate self-tests rather than in the conformance phase, which
 # needs a bezelc. Three checks, all fail-closed:
