@@ -27071,6 +27071,59 @@ void Emitter::collectCdFreeEligible(
 static bool calleeResolvedBySema(const ast::CallExpr& call,
                                  const sema::SemaContext& ctx);
 
+// fix #7747 (§7.5, stdlib §9.6, §28.9, v0.355): the §9.6 string INSTANCE
+// methods that transform `self` into a FRESH heap `bz.string` at rc := 1 —
+// the ONE list the producer recognizer reads.
+//
+// The list was written out inline for the `.` spelling alone (the #2199 arm
+// below). fix #7747 admits the `?.` spelling of the same members (§7.5), and
+// the `?.` lowering mints the SAME fresh rc := 1 string on its non-null path
+// (it runs the `.` twin's own lowering). So the recognizer must answer the
+// SAME question for both spellings — hence ONE list, read twice, instead of a
+// second copy that could drift.
+//
+// The member set and the arities are the §9.6 declarations, transcribed: the
+// §9.6 "Modification" group (Trim / TrimStart / TrimEnd / ToUpper / ToLower /
+// Replace / PadLeft / PadRight / PadCenter / Insert / Remove) and the
+// "Substring" group. The bool/int members (Contains, StartsWith, EndsWith,
+// Equals, CompareTo, IndexOf, LastIndexOf, GetHashCode) do NOT mint a string
+// and are not here; `Split` / `ToCharArray` mint an owned ARRAY, not a string;
+// `AsSpan` mints a view.
+//
+// fix #7133 / §9.6 / §28.9 (v0.343): `PadCenter` is the THIRD member of the
+// same Pad family and mints through the SAME helper (bz_str_pad, whose
+// `align` byte selects the centered layout) — the runtime ends it in
+// `bz_string_init_rc`, so it hands the consumer a fresh +1 producer exactly
+// like its two siblings. Without this arm a consumer (a bound local, a
+// WriteLine argument, a `+` operand, …) would classify the result as a
+// BORROW, RETAIN it on top of the producer's +1, and the producer's
+// reference would never be dropped — the same leak #7119 measured for
+// Repeat/GetField.
+static bool stringInstanceMethodMintsFreshString(std::string_view m,
+                                                  std::size_t argc) {
+    // §9.6 ToUpper/ToLower: no args. Inline malloc + initStringRc.
+    if ((m == "ToUpper" || m == "ToLower") && argc == 0) return true;
+    // §9.6 Trim: 0 args (ASCII whitespace) or 1 arg
+    // (chars: IEnumerable<char> → bz_str_trim_chars).
+    if (m == "Trim" && (argc == 0 || argc == 1)) return true;
+    // §9.6 TrimStart/TrimEnd: no args.
+    if ((m == "TrimStart" || m == "TrimEnd") && argc == 0) return true;
+    // §9.6 Substring(start[, length]) → bz_str_substring.
+    if (m == "Substring" && (argc == 1 || argc == 2)) return true;
+    // §9.6 Replace(oldChar, newChar) and Replace(oldValue, newValue): both
+    // 2-arg forms, both rc=1.
+    if (m == "Replace" && argc == 2) return true;
+    // §9.6 PadLeft/PadRight/PadCenter(totalWidth[, paddingChar]) → bz_str_pad.
+    if ((m == "PadLeft" || m == "PadRight" || m == "PadCenter") &&
+        (argc == 1 || argc == 2))
+        return true;
+    // §9.6 Insert(startIndex, value) → inline mint.
+    if (m == "Insert" && argc == 2) return true;
+    // §9.6 Remove(startIndex[, count]) → inline mint.
+    if (m == "Remove" && (argc == 1 || argc == 2)) return true;
+    return false;
+}
+
 // #422 / §4.6 / §28.9: is `init` a codegen-internal +1 string producer?
 // A string `+` BinaryExpr or an InterpolatedStringExpr — both lower to a fresh
 // malloc'd rc=1 header that codegen owns end-to-end. Binding such a result to a
@@ -28372,50 +28425,13 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     // The `?.` spelling is a DIFFERENT AST node
                     // (ast::NullCondMemberExpr) and never reaches this arm —
                     // it keeps its own classification, and its own codegen gap
-                    // is tracked separately (#7130).
+                    // is tracked separately (#7130). The `?.` arm below is its
+                    // own answer.
                     if (tt && tt->kind == sema::TypeRef::Kind::Primitive &&
                         tt->primitive == sema::PrimitiveType::String) {
                         std::string_view m = ma->member;
                         std::size_t argc = call->args.size();
-                        // §9.6 ToUpper/ToLower: no args. Inline malloc + initStringRc.
-                        if ((m == "ToUpper" || m == "ToLower") && argc == 0)
-                            return true;
-                        // §9.6 Trim: 0 args (ASCII whitespace) or 1 arg
-                        // (chars: IEnumerable<char> → bz_str_trim_chars).
-                        if (m == "Trim" && (argc == 0 || argc == 1))
-                            return true;
-                        // §9.6 TrimStart/TrimEnd: no args.
-                        if ((m == "TrimStart" || m == "TrimEnd") && argc == 0)
-                            return true;
-                        // §9.6 Substring(start[, length]) → bz_str_substring.
-                        if (m == "Substring" && (argc == 1 || argc == 2))
-                            return true;
-                        // §9.6 Replace(oldChar, newChar) and Replace(oldValue,
-                        // newValue): both 2-arg forms, both rc=1.
-                        if (m == "Replace" && argc == 2)
-                            return true;
-                        // §9.6 PadLeft/PadRight(totalWidth[, paddingChar]) →
-                        // bz_str_pad.
-                        // fix #7133 / §9.6 / §28.9 (v0.343): `PadCenter` is the
-                        // THIRD member of the same Pad family and mints through
-                        // the SAME helper (bz_str_pad, whose `align` byte
-                        // selects the centered layout) — the runtime ends it in
-                        // `bz_string_init_rc`, so it hands the consumer a fresh
-                        // +1 producer exactly like its two siblings. Without
-                        // this arm a consumer (a bound local, a WriteLine
-                        // argument, a `+` operand, …) would classify the result
-                        // as a BORROW, RETAIN it on top of the producer's +1,
-                        // and the producer's reference would never be dropped —
-                        // the same leak #7119 measured for Repeat/GetField.
-                        if ((m == "PadLeft" || m == "PadRight" ||
-                             m == "PadCenter") &&
-                            (argc == 1 || argc == 2))
-                            return true;
-                        // §9.6 Insert(startIndex, value) → inline mint.
-                        if (m == "Insert" && argc == 2)
-                            return true;
-                        // §9.6 Remove(startIndex[, count]) → inline mint.
-                        if (m == "Remove" && (argc == 1 || argc == 2))
+                        if (stringInstanceMethodMintsFreshString(m, argc))
                             return true;
                         // fix #7706 (stdlib §9.6, v0.350): no INSTANCE
                         // `Repeat(count)` arm. It is not a §9.6 member; a call
@@ -28437,6 +28453,41 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                         !tt->astNode->name->parts.empty() &&
                         tt->headName() == "ReadOnlyStringSpan" &&
                         ma->member == "ToString" && call->args.empty())
+                        return true;
+                }
+            }
+            // fix #7747 (§7.5, stdlib §9.6, §28.9, v0.355): the `?.` spelling
+            // of the §9.6 string instance methods is now ADMITTED (the `?.`
+            // string gate in sema no longer refuses it — §7.5 defines `x?.M`
+            // for any member access), and its lowering mints the SAME fresh
+            // rc := 1 string on the non-null path: `lowerNullCondBuiltinCall`
+            // runs the `.` twin's own `tryLowerStringMethod` over the already
+            // lowered receiver and merges the result with a null pointer.
+            //
+            // So the `?.` spelling needs the SAME producer recognition, or a
+            // consumer (a bound local, a WriteLine argument, a `+` operand, …)
+            // treats the result as a BORROW, RETAINS it on top of the
+            // producer's +1, and the producer's reference is never dropped —
+            // the #2199 / #7139 leak shape. MEASURED on this fix's parent
+            // (ASan/LSan): a 100-iteration loop of `var s: string? := "abcde";
+            // var t := s?.ToUpper();` leaked 3200 byte(s) in 100 objects
+            // (+ 600 byte(s) indirect) — the `bz_str_case` result of the
+            // `ToUpper` — while the byte-identical `.` spelling was clean.
+            //
+            // The recognizer reads the SAME member list as the `.` spelling
+            // (`stringInstanceMethodMintsFreshString`), so the two spellings
+            // cannot drift apart. The result is NULLABLE (a bare null on the
+            // null path), and every release tolerates a null — the same
+            // argument the `?.` ToString arms (#6680 / #7953) already make.
+            if (auto* ncm =
+                    dynamic_cast<const ast::NullCondMemberExpr*>(
+                        call->callee.get())) {
+                if (ncm->target) {
+                    auto* ntt = ctx_.exprType(*ncm->target);
+                    if (ntt && ntt->kind == sema::TypeRef::Kind::Primitive &&
+                        ntt->primitive == sema::PrimitiveType::String &&
+                        stringInstanceMethodMintsFreshString(
+                            ncm->member, call->args.size()))
                         return true;
                 }
             }

@@ -23587,6 +23587,61 @@ static const BuiltinStringArityRow* findBuiltinStringArity(
     return nullptr;
 }
 
+// fix #7747 (§7.5, stdlib §9.6, v0.355): the §9.6 string INSTANCE members
+// whose `?.` CALL spelling the compiler admits and lowers.
+//
+// §7.5 defines `x?.M` for ANY member access — "`x?.M` returns null if `x` is
+// null; otherwise it performs the access. The result type is always
+// nullable" — with no restriction on `M`'s declaring type, and stdlib §9.6
+// declares the string's instance methods on a closed surface. The `?.`
+// spelling of those methods was REFUSED ("string member `?.M` is not yet
+// supported in codegen") — an implementation gap reported as a compile error,
+// not a rule of the language.
+//
+// Both predicates below are DERIVED from the SAME table the `.` form's arity
+// gate reads (`builtinStringInstanceArities`) — the per-method §9.6 table is
+// NOT duplicated here (the `.` and `?.` spellings cannot drift apart). They
+// answer TWO DIFFERENT questions, and conflating them is a defect:
+//
+//   * `nullCondStringMemberLowered` — does the `?.` string path LOWER this
+//     member at all? The arity gate (§22.5) asks this: a wrong-arity call is
+//     the ONLY mistake on a member the `?.` path lowers, so the gate must
+//     report it exactly as the `.` spelling does. On a member the `?.` path
+//     does NOT lower, the `?.` string gate is what reports the mistake, and
+//     the arity gate must stay quiet (one mistake, one diagnostic).
+//   * `nullCondStringInstanceMemberAdmitted` — is this member the fix #7747
+//     ARM's to admit (i.e. NOT already handled by the pre-existing §21.1
+//     materializer arm)? The `?.` string gate asks this.
+//
+// The members §9.6 declares as instance members that the `?.` path does NOT
+// lower:
+//
+//   * `AsSpan` returns a `ReadOnlyStringSpan` — a VALUE (a view), so its
+//     `?.` result would be a nullable VALUE (the tagged {i8, T} struct)
+//     rather than the nullable pointer every other admitted member
+//     returns. The `?.` string arm already documented this exclusion
+//     ("AsSpan is excluded: it returns ReadOnlyStringSpan (a struct) …
+//     and requires separate nullable-handling").
+//
+// `Split` / `ToCharArray` DO lower (the §21.1 materializer arm types them
+// and codegen inlines their dispatch) — they were admitted BEFORE this fix,
+// and the `.`-form arity gate already gated them, so they must keep being
+// gated. They are only EXCLUDED from the fix #7747 arm, because that arm
+// leaves the node untyped and the materializer arm is what types them.
+static bool nullCondStringMemberLowered(std::string_view member) {
+    // `AsSpan` is a view, not a lowerable `?.` member (see above).
+    if (member == "AsSpan") return false;
+    return findBuiltinStringArity(builtinStringInstanceArities(), member) !=
+           nullptr;
+}
+
+static bool nullCondStringInstanceMemberAdmitted(std::string_view member) {
+    // The §21.1 materializer arm owns these two (it types them); the fix
+    // #7747 arm must not also claim them.
+    if (member == "Split" || member == "ToCharArray") return false;
+    return nullCondStringMemberLowered(member);
+}
+
 // "exactly 2 argument(s)" / "0 or 1 argument(s)" / "1 or 3 argument(s)" — how
 // the declared arity is spelled in the diagnostic.
 static std::string builtinStringArityExpectation(const BuiltinStringArityRow& r) {
@@ -23649,10 +23704,23 @@ static void checkBuiltinStringCallArity(SemaContext& ctx,
         // The null-conditional spelling `s?.M(..)`: the `?.` mirror of the
         // string-member gate REJECTS every built-in `string` member it cannot
         // lower ("string member `?.M` is not yet supported in codegen"), so
-        // gating one of those here would report the SAME mistake twice. Only
-        // the two §9.6 members the `?.` path DOES admit are gated.
-        if (nullCond && member != "Split" && member != "ToCharArray")
-            return;
+        // gating one of those here would report the SAME mistake twice.
+        //
+        // fix #7747 (§7.5, stdlib §9.6, v0.355): the `?.` spelling of the
+        // §9.6 INSTANCE members the lowering now admits is no longer
+        // refused, so those members are gated by arity here exactly as the
+        // `.` spelling is — one mistake, one diagnostic. The members the
+        // `?.` gate still refuses (the `AsSpan` view, and every name §9.6
+        // does not declare as an instance member) keep the skip: the `?.`
+        // string gate is what reports them, and reporting the arity mistake
+        // too would report ONE mistake twice.
+        //
+        // `Split` / `ToCharArray` were ALREADY lowered by the `?.` path
+        // before this fix, so they were already gated here — the skip must
+        // not extend to them (that would drop the §22.5 arity diagnostic for
+        // a wrong-arity `?.Split(",", "x")`, which the `.` spelling reports
+        // and which the `?.` spelling reported before this fix).
+        if (nullCond && !nullCondStringMemberLowered(member)) return;
     }
     const unsigned argc = static_cast<unsigned>(ce.args.size());
     bool admitted = false;
@@ -42919,6 +42987,39 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 bool isStringLinqOp =
                     common::isStringLinqOperatorMemberName(mbr);
                 if (!isStringLinqOp) {
+                    // fix #7747 (§7.5, stdlib §9.6, v0.355): the `?.` CALL
+                    // spelling of a §9.6 INSTANCE method is ADMITTED — §7.5
+                    // defines `x?.M` for any member access ("`x?.M` returns
+                    // null if `x` is null; otherwise it performs the access.
+                    // The result type is always nullable"), with no
+                    // restriction on `M`'s declaring type, and the refusal
+                    // below states its own nature ("not yet supported in
+                    // codegen" — an implementation gap reported as a compile
+                    // error, not a rule of the language).
+                    //
+                    // The member set is the ONE §9.6 instance-member table
+                    // (`nullCondStringInstanceMemberAdmitted` reads
+                    // `builtinStringInstanceArities`) — the per-method table
+                    // is not duplicated here, so the `.` and `?.` spellings
+                    // cannot drift apart.
+                    //
+                    // The CALL form only: a `?.` BARE member read
+                    // (`s?.M` with no parentheses) is a member ACCESS, not a
+                    // call, and its own surface (the §9.6 properties) is
+                    // typed by `builtinValueMemberType` above.
+                    //
+                    // Leaving the node UNTYPEPED is the whole job here:
+                    // `typeCall`'s `.`-twin path (the #6529 arm) types the
+                    // `?.` call by typing the `.` twin and lifting the
+                    // result to nullable per §7.5, and codegen's
+                    // `lowerNullCondBuiltinCall` lowers that twin over the
+                    // receiver's null check — so the short-circuit and the
+                    // §7.5 evaluation rule (the arguments of a skipped
+                    // suffix are not evaluated) come from the lowering, not
+                    // from a re-implementation of it here.
+                    if (&nm == calleeOfCallCtx_ &&
+                        nullCondStringInstanceMemberAdmitted(mbr))
+                        return;
                     ctx_.diagnostics().report(
                         Severity::Error, nmLoc,
                         std::string("string member `?.") +

@@ -23498,10 +23498,42 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
 
     auto& mutNm = const_cast<ast::NullCondMemberExpr&>(nm);
     const ast::Expr* placeholderKey = nullptr;
+    // fix #7747 (§7.5, §4.6, §28.9, v0.355): a PRODUCER receiver — a
+    // concatenation, an interpolation, a `??`/`if` result — hands the `?.`
+    // lowering a +1 reference with no named owner. The `.` form discharges it:
+    // its call site pre-lowers the producer receiver, passes it to
+    // `tryLowerStringMethod` as the CALLER-OWNED receiver, and releases it
+    // after the call — and `tryLowerStringMethod`'s raise funnel
+    // (`emitGuardThrowReleasingString`) releases it on the raise edge too.
+    //
+    // The `?.` form cannot do that with a PLACEHOLDER receiver: the
+    // placeholder is a synthetic identifier, so the `.` form's producer
+    // recognizer (`isPlusOneStringProducer(ma->target)`) sees no producer,
+    // `tryLowerStringMethod` gets a null `callerOwnedSelf`, and nobody
+    // releases the producer's reference ⇒ a leak on EVERY `?.` string call
+    // with a producer receiver. MEASURED (ASan/LSan) before this fix: a
+    // 100-iteration loop of `var u := ("a" + "b")?.ToUpper();` leaked 3200
+    // byte(s) in 100 objects (+ 300 byte(s) indirect) — the concat's inline
+    // malloc — while the byte-identical `.` spelling was clean.
+    //
+    // So for a producer receiver the twin's target IS the original receiver
+    // node, with the already-lowered value PINNED in `exprValueOverride_` so
+    // the receiver is still evaluated exactly ONCE (§7.5: "the receiver is
+    // evaluated first; if it is null the access does not occur") while the
+    // twin's own recognizer sees the original producer shape and discharges
+    // it exactly as the `.` form does. The node is moved back after the
+    // lowering, the same way the groupBy receiver is (#6664's pattern).
+    const bool rcvIsStringProducer =
+        !groupByRcv && nm.target && isPlusOneStringProducer(nm.target.get());
+    const ast::Expr* rcvNodeKey = nullptr;
     auto dotted = std::make_unique<ast::MemberAccessExpr>();
     dotted->span = nm.span;
     dotted->member = nm.member;
     if (groupByRcv) {
+        dotted->target = std::move(mutNm.target);
+    } else if (rcvIsStringProducer) {
+        rcvNodeKey = mutNm.target.get();
+        exprValueOverride_[rcvNodeKey] = rcv;
         dotted->target = std::move(mutNm.target);
     } else {
         auto placeholder = std::make_unique<ast::IdentifierExpr>();
@@ -23548,6 +23580,10 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
     llvm::Value* inner = lowerExpr(*synth);
     mutCall.args = std::move(synth->args);
     if (groupByRcv) mutNm.target = std::move(dottedRaw->target);
+    else if (rcvIsStringProducer) {
+        mutNm.target = std::move(dottedRaw->target);
+        exprValueOverride_.erase(rcvNodeKey);
+    }
     else exprValueOverride_.erase(placeholderKey);
     nullCondGroupingCallSynth_.push_back(std::move(synth));
 

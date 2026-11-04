@@ -282,15 +282,20 @@ BEZEL_TEST(sema_string_member_arity_padcenter_tostring_7153,
 }
 
 // ===========================================================================
-// (H) CONTROL — the STATIC and `?.` spellings are NOT gated by this fix.
+// (H) CONTROL — the STATIC spelling is NOT gated by this fix, and the `?.`
+//     spelling is now ADMITTED.
 //
 //   * `string.PadCenter(5)` — §9.6 declares no STATIC `PadCenter`, so the
 //     static spelling keeps its §3.4 rejection ("type 'string' has no static
 //     method or property 'PadCenter'"). The static surface is a SEPARATE
 //     table; this fix adds a row to the INSTANCE table only.
-//   * `s?.PadCenter(5)` — the null-conditional spelling is excluded from the
-//     arity gate (the `?.` lowering gate already rejects it), so ONE mistake
-//     is never reported TWICE.
+//   * `s?.PadCenter(5)` — fix #7747 (§7.5, stdlib §9.6, v0.355): the `?.`
+//     spelling of a §9.6 INSTANCE method is no longer refused ("string
+//     member `?.PadCenter` is not yet supported in codegen"), and it is now
+//     gated by arity exactly as the `.` spelling is — one mistake, one
+//     diagnostic. So the `?.` spelling at the DECLARED arity is ANSWERED
+//     with the §9.6 value ("ab".PadCenter(5) = " ab  "), and at a WRONG
+//     arity it draws the §22.5 arity diagnostic.
 // ===========================================================================
 BEZEL_TEST(sema_string_member_arity_padcenter_tostring_7153,
            accept_static_and_null_conditional_spellings_keep_their_own_diagnostics) {
@@ -303,17 +308,39 @@ BEZEL_TEST(sema_string_member_arity_padcenter_tostring_7153,
     BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
         r, "has no static method or property 'PadCenter'"));
 
+    // fix #7747 (§7.5, stdlib §9.6, v0.355): the `?.` spelling is ADMITTED
+    // and answers with the §9.6 value — "ab".PadCenter(5) = " ab  " (the
+    // extra padding character goes to the RIGHT, stdlib §9.6's Pad contract).
     JitResult r2 = runAot(
         "module M;\n"
         "class C\n"
         "  public static method Main(): int\n"
         "    var s: string? := \"ab\";\n"
         "    var t := s?.PadCenter(5);\n"
+        "    Console.WriteLine(\"[\" + (t ?? \"NULL\") + \"]\");\n"
         "    return 0;\n"
         "  end Main;\n"
         "end C;\n");
-    BEZEL_EXPECT_FALSE(r2.ran);
-    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r2));
+    BEZEL_EXPECT_TRUE(r2.ran);
+    BEZEL_EXPECT_EQ(r2.exitCode, 0);
+    BEZEL_EXPECT_EQ(r2.stdoutText, "[ ab  ]\n");
+
+    // And at a WRONG arity the `?.` spelling draws the SAME §22.5 diagnostic
+    // as the `.` spelling — one mistake, one diagnostic.
+    JitResult r3 = runAot(
+        "module M;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    var s: string? := \"ab\";\n"
+        "    var t := s?.PadCenter(5, 'x', 'y');\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n");
+    BEZEL_EXPECT_FALSE(r3.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r3));
     BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
-        r2, "string member `?.PadCenter` is not yet supported in codegen"));
+        r3,
+        "the call to `PadCenter` on `string` supplies 3 argument(s) but stdlib "
+        "§9.6 declares `PadCenter(totalWidth: int, paddingChar: char := ' '): "
+        "string` — 1 or 2 argument(s) (§22.5; §9.6)"));
 }

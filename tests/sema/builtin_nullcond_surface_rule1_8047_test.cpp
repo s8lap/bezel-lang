@@ -165,33 +165,42 @@ BEZEL_TEST(sema_builtin_nullcond_surface_rule1_8047,
 
 // `string` declares `Substring(startIndex: int): string` (stdlib §9.6), so
 // the extension of the same name is unreachable on a `string` receiver —
-// rule 1 commits by NAME, of any arity. The `?.` spelling of a built-in
-// string member is not lowerable today (the compiler's own `?.` string gate),
-// so the call is REFUSED rather than answered by the extension. (Pre-fix it
-// printed the extension's `EXT`.)
+// rule 1 commits by NAME, of any arity.
+//
+// fix #7747 (§7.5, stdlib §9.6, v0.355): the `?.` spelling of a §9.6
+// instance method is no longer refused ("string member `?.Substring` is not
+// yet supported in codegen"), so the call is ANSWERED — by the BUILT-IN's
+// member, not by the extension. The extension's "EXT" never appears: the
+// row now pins the §9.6 answer ("abc".Substring(1) = "bc"), which is
+// strictly stronger than the old "it is rejected" expectation — a lowering
+// that answered with the extension's value would fail this row.
 BEZEL_TEST(sema_builtin_nullcond_surface_rule1_8047,
            string_nullcond_substring_extension_does_not_type_the_call) {
-    // per §26.5 rule 1 (v0.350) + stdlib §9.6
-    expectRejected("extension string\n"
-                   "  public method Substring(i: int): string => \"EXT\";\n"
-                   "end;\n",
-                   "Console.WriteLine(s?.Substring(1) ?? \"NONE\");",
-                   "string member `?.Substring` is not yet supported in "
-                   "codegen");
+    // per §26.5 rule 1 (v0.350) + stdlib §9.6 + §7.5
+    expectStdout("extension string\n"
+                 "  public method Substring(i: int): string => \"EXT\";\n"
+                 "end;\n",
+                 "Console.WriteLine(s?.Substring(1) ?? \"NONE\");",
+                 "bc\n");
 }
 
 // `ToUpper(): string` is declared (stdlib §9.6), so the extension of the
 // same name — whose `int` return type the pre-fix compiler typed the call
 // with — is unreachable.
+//
+// fix #7747 (§7.5, stdlib §9.6, v0.355): the `?.` spelling is no longer
+// refused, and the call is answered by the BUILT-IN's member — the §9.6
+// answer ("abc".ToUpper() = "ABC"), never the extension's 7. The row pins
+// that value, which is strictly stronger than the old "it is rejected"
+// expectation.
 BEZEL_TEST(sema_builtin_nullcond_surface_rule1_8047,
            string_nullcond_toupper_extension_does_not_type_the_call) {
-    // per §26.5 rule 1 (v0.350) + stdlib §9.6
-    expectRejected("extension string\n"
-                   "  public method ToUpper(): int => 7;\n"
-                   "end;\n",
-                   "Console.WriteLine(s?.ToUpper() ?? -1);",
-                   "string member `?.ToUpper` is not yet supported in "
-                   "codegen");
+    // per §26.5 rule 1 (v0.350) + stdlib §9.6 + §7.5
+    expectStdout("extension string\n"
+                 "  public method ToUpper(): int => 7;\n"
+                 "end;\n",
+                 "Console.WriteLine(s?.ToUpper() ?? \"NONE\");",
+                 "ABC\n");
 }
 
 // ── #7945: the `?.` twin of the `.` spelling's StringBuilder refusal ──────
