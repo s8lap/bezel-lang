@@ -1518,8 +1518,12 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     // a rendering rather than a delegation would make it a third
                     // place the §8.5 answer lives.
                     if (!pv && rt &&
-                        rt->kind == sema::TypeRef::Kind::InlineArray)
+                        rt->kind == sema::TypeRef::Kind::InlineArray) {
                         pv = emitValueToString(ev, rt);
+                        // fix #3473 (§18.5, v0.355): the alignment applies to
+                        // the rendered type name like any other hole.
+                        if (pv) pv = emitAlignOnly(pv, part.formatSpec);
+                    }
                     // fix #3442 (§8.5 unit row / §4.7 / §18.5, v0.283): the
                     // UNIT hole, exactly the #2913 shape one type over. §8.5
                     // puts unit in the SAME sentence as the inline arrays
