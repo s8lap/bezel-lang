@@ -19,6 +19,9 @@
 #   preflight   clean tree, HEAD contains BASE, no live gate, no builders,
 #               fast-disk symlinks, /mnt/fast headroom
 #   bezelc      build/bezelc is newer than every src/ file (corpus needs it)
+#   binaries    build/bezelc and every build/tests/test_binaries.txt entry are at
+#               least as new as the newest build-input MTIME (src/, cmake/, tests/
+#               C++ and CMakeLists.txt; stat only, scripts/gate/binary_freshness.py)
 #   ratchets    scripts/ratchet_sweep.sh (every check_*.py the gate runs)
 #   selftests   gate self-tests + smart-push self-tests (markers redirected,
 #               #3415: never touch a live gate's pidfile/donefile)
@@ -42,7 +45,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --base) BASE="$2"; shift 2 ;;
     --filters) FILTERS="$2"; shift 2 ;;
-    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
     *) echo "pregate: unknown argument '$1' (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -104,6 +107,16 @@ else
   record bezelc PASS "$BEZELC newer than every src/ file"
 fi
 
+# --- binary freshness (stat only, no build) ----------------------------------
+# R39 gate 1: a stale bezel_tests_support made 4 gate self-tests skip. Every
+# binary the gate runs must be at least as new as the newest build-input mtime
+# (not commit time: a corpus-only commit must not turn this red).
+if _bf="$(python3 scripts/gate/binary_freshness.py 2>&1)"; then
+  record binaries PASS "$_bf"
+else
+  record binaries FAIL "$(printf '%s' "$_bf" | tr '\n' ';' | cut -c1-400)"
+fi
+
 # --- build-free phases, in parallel -----------------------------------------
 run_bg() {  # name, command...
   local name="$1"; shift
@@ -146,6 +159,9 @@ phase_result() {  # name, pass-note
 }
 phase_result ratchets "$(tail -1 "$OUT/ratchets.log")"
 phase_result selftests "$(grep -E '^Ran ' "$OUT/selftests.log" | head -1)"
+if [ "${RESULT[selftests]}" = FAIL ]; then
+  NOTE[selftests]="rc=$(cat "$OUT/selftests.rc" 2>/dev/null) — see $OUT/selftests.log (gate tests) and $OUT/selftests_smart_push.log (smart-push)"
+fi
 if [ "${RESULT[selftests]}" = PASS ]; then
   # unittest exits 0 for "OK (skipped=N)": enforce the gate's cap. Pregate runs
   # with no gate live; on a clean tree the 2 gate-only lock tests do not skip,
