@@ -385,3 +385,60 @@ BEZEL_TEST(sema_method_ref_overload_residual_8205,
                                     "    Console.WriteLine(f());"),
                         "42\n");
 }
+
+// ── F3: every other position with no target FUNCTION type ──────────────────
+//
+// SPEC §27.6 (v0.355): "When no target type is available (e.g., `var f :=
+// Math.Abs;` with no annotation), the reference is ambiguous and the compiler
+// reports an error pointing to the candidate overloads." A position declared
+// `Object`, and an interpolation hole, supply no function type to select by.
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           overloaded_reference_to_an_object_local_is_ambiguous) {
+    // per §27.6 (v0.355): review probe p01
+    expectRejected(classMain("var o: Object := v.Len;\n"
+                             "    Console.WriteLine(o);"),
+                   kNoTarget);
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           overloaded_static_reference_to_a_user_object_parameter_is_ambiguous) {
+    // per §27.6 (v0.355): review probe p22
+    expectRejected(
+        "module M;\n"
+        "class V\n"
+        "  public static method Len(): int => 42;\n"
+        "  public static method Len(x: int): int => x + 100;\n"
+        "end V;\n"
+        "class U\n"
+        "  public static method Show(o: Object): () => Console.WriteLine(o);\n"
+        "end U;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    U.Show(V.Len);\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        kNoTarget);
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           overloaded_reference_in_an_interpolation_hole_is_ambiguous) {
+    // per §27.6 / §18.5 (v0.355): review probe p08
+    expectRejected(classMain("Console.WriteLine($\"{v.Len}\");"), kNoTarget);
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           non_overloaded_reference_in_an_interpolation_hole_still_formats) {
+    // control: one candidate, nothing to select (§27.6, §18.5)
+    expectCheckedStdout(genericMain("Console.WriteLine($\"{v.Len}\");"),
+                        "() -> int\n");
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           overloaded_reference_with_a_function_target_still_selects) {
+    // control: a target function type selects (§27.6)
+    expectCheckedStdout(classMain("var f: () -> int := v.Len;\n"
+                                  "    Console.WriteLine(f());"),
+                        "42\n");
+}

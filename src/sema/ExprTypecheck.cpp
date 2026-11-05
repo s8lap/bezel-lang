@@ -7246,6 +7246,19 @@ void ExprTC::checkAssignable(
         }
     }
     if (!from || !to) return;
+    // fix #8205 (§27.6, v0.355): "When the named method (or property) is
+    // overloaded, the reference is resolved using the target function type at
+    // the use site" — and a position declared `Object` supplies no FUNCTION
+    // type to resolve by, so "When no target type is available ... the
+    // reference is ambiguous and the compiler reports an error pointing to the
+    // candidate overloads". This is the one §5.1 site every `Object`-declared
+    // position reaches (`var o: Object := v.Len;`, a user `Object`
+    // parameter); before, the first-declared overload was boxed silently.
+    if (to->kind == TypeRef::Kind::Primitive &&
+        to->primitive == PrimitiveType::Object &&
+        from->kind == TypeRef::Kind::Function && fromExpr &&
+        reportUncalledOverloadedMethodRef(fromExpr, loc))
+        return;
     // §27.6 "Method references to overloaded methods" (v0.338, #5814): the
     // built-in `Math.Abs` group is selected by the target function type.
     if (to->kind == TypeRef::Kind::Function && isMathAbsReference(fromExpr)) {

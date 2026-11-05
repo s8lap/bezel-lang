@@ -4915,6 +4915,16 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         // their identifiers resolve and their types are set for codegen.
         for (const auto& part : is->parts)
             if (part.expr) visitExpr(*part.expr);
+        // fix #8205 (§27.6, §18.5, v0.355): a hole supplies no target type —
+        // its operand is formatted, never converted to a function type — so
+        // an overloaded method group in a hole is the no-target ambiguity
+        // ("When no target type is available ... the reference is
+        // ambiguous"), as it is at any other target-less position. Before:
+        // the first-declared overload's type was formatted.
+        for (const auto& part : is->parts)
+            if (part.expr)
+                reportUncalledOverloadedMethodRef(part.expr.get(),
+                                                  part.expr->span.begin);
         // §18.5 dispatch rule (v0.172, #812/#1339): a hole WITH a real format
         // spec (not a bare `,`alignment) requires an operand that is either
         // intrinsically formattable (a numeric/temporal/Guid) or implements the
