@@ -2618,7 +2618,7 @@ private:
     // to RETURN the set so `variantGenericAssignable`'s recursion can test
     // membership at arbitrary nesting depth.
     std::unordered_set<std::string_view> currentScopeGenericParamNames() const;
-    // fix #6530 (§3.6 rule 2 / §14.1, v0.355): is `name` — a bare,
+    // fix #6530 (§3.6 rule 2 / §14.1, v0.355): is `t` — a bare,
     // declaration-less, single-part Named type — a TYPE PARAMETER in the
     // enclosing scope?
     //
@@ -2631,12 +2631,21 @@ private:
     // declaration the enclosing type's and the enclosing method's own (plus an
     // enclosing extension block's, §26.4). So the POSITIVE test for "a type
     // parameter" is `isInScopeTypeParam`, and the name-keyed test is the wrong
-    // SHAPE for it — measurably so: a type parameter named `Range`, `Guid` or
-    // `Guid` (both reserved builtin names) was read as the builtin, and every
-    // guard keyed on that read rejected valid generic code.
+    // SHAPE for it — measurably so: a type parameter named `Range` or `Guid`
+    // (both reserved builtin names) was read as the builtin, and every guard
+    // keyed on that read rejected valid generic code.
     //
-    // The registry test survives as the FALLBACK for a name the scope does not
-    // declare: a name the registry does not know is not a builtin, so it is a
+    // BUT THE SCOPE ALONE IS ALSO A NAME TEST. §14.1 has two types spelled
+    // alike in one body: a built-in `Guid` read off a NON-generic class's field
+    // or return type reaches the body of `class Box<Guid>` / `F<Guid>` with the
+    // same spelling as the parameter, and treating it as the parameter makes
+    // every guard below fail OPEN on a real `Dictionary<Guid, int>` (`d[0]`
+    // compiled and threw KeyNotFoundException). So the positive answer
+    // additionally requires `TypeRef::isResolvedTypeParam` — the resolver's
+    // own record that THIS spelling bound to a type-parameter marker.
+    //
+    // The registry test survives as the FALLBACK for an unstamped TypeRef:
+    // a name the registry does not know is not a builtin, so it is a
     // type parameter (or an unresolved name, which fails open too). That keeps
     // #6500's own rule — a MISSED built-in name costs a rejection that does
     // not fire rather than one that fires falsely — so the ONLY behaviour this
@@ -2647,12 +2656,12 @@ private:
     // (#6527/#6535, same file) and the index-argument check's
     // unsubstituted-parameter walk (#7064/#6319, same file) all asked the
     // name-keyed question, and all three over-rejected identically.
-    bool isBareTypeParamName(std::string_view name) const;
+    bool isInScopeTypeParamRef(const TypeRef* t) const;
     // fix #6530 (§3.6 rule 2 / §14.1, v0.355): the #7064/#6319 walk — does
     // `t` still carry an UNSUBSTITUTED type parameter anywhere (a bare one,
     // `property [i: T]` in a generic class, or one EMBEDDED in a constructed
     // type)? Was a file-static in ExprTypecheck_Exprs.cpp; promoted to a
-    // member so its leaf test can ask the SCOPE (`isBareTypeParamName`)
+    // member so its leaf test can ask the SCOPE (`isInScopeTypeParamRef`)
     // instead of the name.
     bool containsUnsubstitutedTypeParam(const TypeRef* t) const;
     // Sibling of `isExtensionTargetTypeParam` (which tests one name) that

@@ -1022,8 +1022,10 @@ static bool sameIndexParamType(const TypeRef* p, const TypeRef* a) {
 // parameter" — so a type parameter named after a reserved builtin (`Range`,
 // `Guid`) was read as a CONCRETE type and the check fired on valid
 // generic code. It is a MEMBER now so the leaf test can ask the SCOPE
-// (`isBareTypeParamName`): a bare name that IS a declared type parameter of
-// the enclosing scope is a type parameter whatever it is spelled. MEASURED on
+// (`isInScopeTypeParamRef`): a TypeRef whose spelling RESOLVED to a declared
+// type parameter of the enclosing scope is a type parameter whatever it is
+// spelled — and a built-in `Guid` read off another declaration is not, even
+// inside `class Box<Guid>`. MEASURED on
 // the pre-fix base: `method F<Range>(d: Dictionary<Range, int>): int
 // return d[0];` is rejected with "a value of primitive type `int` does not
 // implicitly convert to the type parameter `Range`", while the same program
@@ -1053,7 +1055,7 @@ static bool sameIndexParamType(const TypeRef* p, const TypeRef* a) {
 bool ExprTC::containsUnsubstitutedTypeParam(const TypeRef* t) const {
     if (!t) return false;
     if (t->kind == TypeRef::Kind::Named && !t->declaration &&
-        t->genericArgs.empty() && isBareTypeParamName(t->headName()))
+        t->genericArgs.empty() && isInScopeTypeParamRef(t))
         return true;
     for (const TypeRef* ga : t->genericArgs)
         if (containsUnsubstitutedTypeParam(ga)) return true;
@@ -6118,7 +6120,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             // fix #6530 (§3.6 rule 2 / §14.1, v0.355): the
                             // test for "this name is a TYPE PARAMETER" is the
                             // ENCLOSING SCOPE's declared parameter names
-                            // (`isBareTypeParamName`, §14.1) — NOT a name-keyed
+                            // (`isInScopeTypeParamRef`, §14.1) — NOT a name-keyed
                             // registry test. A declaration-less single-part
                             // Named TypeRef is ambiguous between "a reserved
                             // builtin" and "a type parameter"
@@ -6133,7 +6135,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             // same body under `F<T>` compiles.
                             //
                             // The registry test survives inside
-                            // `isBareTypeParamName` as the FALLBACK for a name
+                            // `isInScopeTypeParamRef` as the FALLBACK for a name
                             // the scope does NOT declare: a name the registry
                             // does not know is not a builtin, so it is a type
                             // parameter (or an unresolved name, which fails
@@ -6145,7 +6147,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             if (keyT && keyT->kind == TypeRef::Kind::Named &&
                                 !keyT->declaration && keyT->genericArgs.empty())
                                 keyIsBareParam =
-                                    isBareTypeParamName(keyT->headName());
+                                    isInScopeTypeParamRef(keyT);
                             if (rangeIdx && !keyIsRange && !keyIsBareParam)
                                 ctx_.diagnostics().report(
                                     Severity::Error, e.span.begin,
@@ -10909,7 +10911,7 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
         // indexer guard does, so `Helper.F<Range<int>>()` still resolves.
         //
         // fix #6530 (§3.6 rule 2 / §14.1, v0.355): the bare-parameter test
-        // is the SCOPE's (`isBareTypeParamName`), not the name-keyed registry
+        // is the SCOPE's (`isInScopeTypeParamRef`), not the name-keyed registry
         // test. MEASURED on the pre-fix base: with the type parameter named
         // `Range`, `(0 .. 1) in d` over a `Dictionary<Range, int>` is rejected
         // with "the left operand of `in` over `Dictionary` has a type that is
@@ -10943,7 +10945,7 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 if (keyT && keyT->kind == TypeRef::Kind::Named &&
                     !keyT->declaration && keyT->genericArgs.empty())
                     keyIsBareParam =
-                        isBareTypeParamName(keyT->headName());
+                        isInScopeTypeParamRef(keyT);
                 if (!keyIsBareParam) {
                     // A `RangeExpr` node reaches sema with a default-
                     // constructed span (the parser's `stampSpan` runs on the

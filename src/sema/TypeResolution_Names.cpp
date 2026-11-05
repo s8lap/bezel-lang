@@ -5348,6 +5348,10 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     return;
                 }
             }
+            // fix #6530 (§14.1, v0.355): record that THIS spelling bound to
+            // a type parameter, so a later reader can tell it from a built-in
+            // of the same name that reached the same body from elsewhere.
+            const_cast<ast::Type&>(t).resolvedAsTypeParam = true;
             return;
         }
         // fix #5172 (§2.2, v0.310): arity selects among rule 1's types.

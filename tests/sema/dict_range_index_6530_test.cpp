@@ -36,13 +36,22 @@
 // "is this name a TYPE PARAMETER?" is a question about the SCOPE, not about
 // the spelling.
 //
-// THE FIX. The bare-type-parameter test is now ONE helper that asks the
-// SCOPE (`ExprTC::isBareTypeParamName`, §14.1) whether the name is a declared
-// type parameter of the enclosing method, type or extension block, with the
-// name-keyed registry test surviving only as the fallback for a name the
-// scope does NOT declare — where it still keeps #6500's own rule that a
-// MISSED built-in name costs a rejection that does not fire rather than one
-// that fires falsely.
+// THE FIX. The bare-type-parameter test is now ONE helper
+// (`ExprTC::isInScopeTypeParamRef`, §14.1) that asks whether the TypeRef's
+// own spelling RESOLVED to a type parameter (the resolver stamps the AST node)
+// AND that parameter is declared by the enclosing method, type or extension
+// block, with the name-keyed registry test surviving only as the fallback for
+// an unstamped TypeRef — where it still keeps #6500's own rule that a MISSED
+// built-in name costs a rejection that does not fire rather than one that
+// fires falsely.
+//
+// Asking the scope BY NAME is not enough (review of the first attempt, rows
+// at the end of this file): §14.1 itself anticipates "two types spelled alike
+// in one body", and a built-in `Guid` read off a NON-generic class's field or
+// return type reaches the body of `class Box<Guid>` / `F<Guid>` spelled like
+// the parameter. A scope-by-name test failed OPEN there, and `d[0] := 5;
+// return d[0];` on a real `Dictionary<Guid, int>` compiled and threw
+// KeyNotFoundException.
 //
 // The same name-keyed test stood at two MORE guards in the same file, and
 // both over-rejected the same shape (rows below): the `in` operator's §5.1
@@ -351,4 +360,186 @@ BEZEL_TEST(dict_range_index_6530,
                          "    return s.Length;\n"));
     BEZEL_EXPECT_TRUE(rejectedWith(
         r, "range index `[a..b]` is not admitted on `Dictionary<K, V>`"));
+}
+
+// ── A REAL built-in key reaching a body whose type parameter is spelled
+//    like it ───────────────────────────────────────────────────────────────
+//
+// §14.1 (v0.355), *Type-parameter names*: the members a body reaches stay in
+// reach under a same-spelled type parameter — "two types spelled alike in one
+// body". `Holder` is NOT generic, so the `Guid` in its field / return type is
+// the stdlib §2.6 built-in, whatever the body that reads it calls its own
+// parameter. §5.1 has no implicit `int` -> `Guid` conversion, and stdlib §4.8 /
+// §23.4 admit no range index on a `Dictionary<Guid, V>`, so every row below
+// must stay REJECTED. The base (pre-#6530) compiler rejects all six; a
+// scope-by-NAME fix accepted all six, and x2 / x4 then threw
+// KeyNotFoundException at run time on a key the program had just stored.
+// (Rows from the r39-rev-6530 review, probes x1–x7.)
+
+namespace {
+
+const char* kHolderMake =
+    "module P;\n"
+    "public class Holder\n"
+    "  public static method Make(): owned Dictionary<Guid, int>\n"
+    "    var d: Dictionary<Guid, int> := new Dictionary<Guid, int>();\n"
+    "    return d;\n"
+    "  end Make;\n"
+    "end Holder;\n";
+
+const char* kHolderField =
+    "module P;\n"
+    "public class Holder\n"
+    "  public property D: Dictionary<Guid, int>;\n"
+    "  public constructor()\n"
+    "    D := new Dictionary<Guid, int>();\n"
+    "  end constructor;\n"
+    "end Holder;\n";
+
+const char* kIndexArgMsg =
+    "the index argument to `Dictionary[key]` has a type that is not "
+    "implicitly convertible to the target type";
+const char* kInMsg =
+    "the left operand of `in` over `Dictionary` has a type that is not "
+    "implicitly convertible to the target type";
+const char* kRangeMsg =
+    "range index `[a..b]` is not admitted on `Dictionary<K, V>`";
+
+}  // namespace
+
+// x1: the #6500 range-index guard, the receiver a non-generic method's
+// `owned Dictionary<Guid, int>` return, inside `F<Guid>`.
+BEZEL_TEST(dict_range_index_6530,
+           builtin_guid_return_in_F_Guid_range_index_still_rejected_spec_23_4) {
+    auto r = runAot(std::string(kHolderMake) +
+                    "public class U\n"
+                    "  public static method F<Guid>(k: Guid): int\n"
+                    "    using var d := Holder.Make();\n"
+                    "    d[1 .. 5] := 9;\n"
+                    "    return d.Count;\n"
+                    "  end F;\n"
+                    "end U;\n"
+                    "public class Program\n"
+                    "  public static method Main()\n"
+                    "    Console.WriteLine(U.F<int>(3));\n"
+                    "  end Main;\n"
+                    "end Program;\n");
+    BEZEL_EXPECT_TRUE(rejectedWith(r, kRangeMsg));
+}
+
+// x2: the index-argument walk, same receiver — `int` is not a `Guid` (§5.1).
+BEZEL_TEST(dict_range_index_6530,
+           builtin_guid_return_in_F_Guid_int_index_still_rejected_spec_5_1) {
+    auto r = runAot(std::string(kHolderMake) +
+                    "public class U\n"
+                    "  public static method F<Guid>(k: Guid): int\n"
+                    "    using var d := Holder.Make();\n"
+                    "    d[0] := 5;\n"
+                    "    return d[0];\n"
+                    "  end F;\n"
+                    "end U;\n"
+                    "public class Program\n"
+                    "  public static method Main()\n"
+                    "    Console.WriteLine(U.F<int>(3));\n"
+                    "  end Main;\n"
+                    "end Program;\n");
+    BEZEL_EXPECT_TRUE(rejectedWith(r, kIndexArgMsg));
+}
+
+// x3: the `in` operator's §5.1 key slot, same receiver.
+BEZEL_TEST(dict_range_index_6530,
+           builtin_guid_return_in_F_Guid_in_operator_still_rejected_spec_5_1) {
+    auto r = runAot(std::string(kHolderMake) +
+                    "public class U\n"
+                    "  public static method F<Guid>(k: Guid): bool\n"
+                    "    using var d := Holder.Make();\n"
+                    "    return 0 in d;\n"
+                    "  end F;\n"
+                    "end U;\n"
+                    "public class Program\n"
+                    "  public static method Main()\n"
+                    "    Console.WriteLine(U.F<int>(3));\n"
+                    "  end Main;\n"
+                    "end Program;\n");
+    BEZEL_EXPECT_TRUE(rejectedWith(r, kInMsg));
+}
+
+// x4: a non-generic class's FIELD, read inside a generic CLASS `Box<Guid>`.
+BEZEL_TEST(dict_range_index_6530,
+           builtin_guid_field_in_Box_Guid_int_index_still_rejected_spec_5_1) {
+    auto r = runAot(std::string(kHolderField) +
+                    "public class Box<Guid>\n"
+                    "  public method Go(h: Holder): int\n"
+                    "    h.D[0] := 5;\n"
+                    "    return h.D[0];\n"
+                    "  end Go;\n"
+                    "end Box;\n"
+                    "public class Program\n"
+                    "  public static method Main()\n"
+                    "    var h := new Holder();\n"
+                    "    var b := new Box<int>();\n"
+                    "    Console.WriteLine(b.Go(h));\n"
+                    "  end Main;\n"
+                    "end Program;\n");
+    BEZEL_EXPECT_TRUE(rejectedWith(r, kIndexArgMsg));
+}
+
+// x5: the range-index guard on the same field inside `Box<Guid>`.
+BEZEL_TEST(dict_range_index_6530,
+           builtin_guid_field_in_Box_Guid_range_index_still_rejected_spec_23_4) {
+    auto r = runAot(std::string(kHolderField) +
+                    "public class Box<Guid>\n"
+                    "  public method Go(h: Holder): int\n"
+                    "    h.D[1 .. 5] := 9;\n"
+                    "    return h.D.Count;\n"
+                    "  end Go;\n"
+                    "end Box;\n"
+                    "public class Program\n"
+                    "  public static method Main()\n"
+                    "    var h := new Holder();\n"
+                    "    var b := new Box<int>();\n"
+                    "    Console.WriteLine(b.Go(h));\n"
+                    "  end Main;\n"
+                    "end Program;\n");
+    BEZEL_EXPECT_TRUE(rejectedWith(r, kRangeMsg));
+}
+
+// x6: the `in` key slot on the field, inside a generic METHOD `F<Guid>`.
+BEZEL_TEST(dict_range_index_6530,
+           builtin_guid_field_in_F_Guid_in_operator_still_rejected_spec_5_1) {
+    auto r = runAot(std::string(kHolderField) +
+                    "public class U\n"
+                    "  public static method F<Guid>(h: Holder, k: Guid): bool\n"
+                    "    return 0 in h.D;\n"
+                    "  end F;\n"
+                    "end U;\n"
+                    "public class Program\n"
+                    "  public static method Main()\n"
+                    "    var h := new Holder();\n"
+                    "    Console.WriteLine(U.F<int>(h, 1));\n"
+                    "  end Main;\n"
+                    "end Program;\n");
+    BEZEL_EXPECT_TRUE(rejectedWith(r, kInMsg));
+}
+
+// x7, the spelling control: x4 with the class's parameter named `T`. Rejected
+// on every compiler; together with x4 it shows that only the parameter's
+// SPELLING separates the two, so x4 must be rejected too.
+BEZEL_TEST(dict_range_index_6530,
+           control_builtin_guid_field_in_Box_T_int_index_rejected_spec_5_1) {
+    auto r = runAot(std::string(kHolderField) +
+                    "public class Box<T>\n"
+                    "  public method Go(h: Holder): int\n"
+                    "    h.D[0] := 5;\n"
+                    "    return h.D[0];\n"
+                    "  end Go;\n"
+                    "end Box;\n"
+                    "public class Program\n"
+                    "  public static method Main()\n"
+                    "    var h := new Holder();\n"
+                    "    var b := new Box<int>();\n"
+                    "    Console.WriteLine(b.Go(h));\n"
+                    "  end Main;\n"
+                    "end Program;\n");
+    BEZEL_EXPECT_TRUE(rejectedWith(r, kIndexArgMsg));
 }

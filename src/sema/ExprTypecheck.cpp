@@ -5969,9 +5969,17 @@ std::unordered_set<std::string_view> ExprTC::currentScopeGenericParamNames()
 //
 // The same three programs with the type parameter named `T` are ACCEPTED on
 // that base — the asymmetry IS the defect. The registry test survives as the
-// fallback for a name the scope does not declare (see the header).
-bool ExprTC::isBareTypeParamName(std::string_view name) const {
-    if (isInScopeTypeParam(name)) return true;
+// fallback for a TypeRef the resolver did not stamp (see the header).
+//
+// The positive test is the TypeRef's ORIGIN, not its spelling: a field or
+// return type declared in a NON-generic class that names the built-in `Guid`
+// reaches the body of `class Box<Guid>` / `F<Guid>` spelled exactly like the
+// in-scope parameter, and a name test (scope or registry) cannot tell them
+// apart. `isResolvedTypeParam` reads what the resolver chose AT THAT SPELLING.
+bool ExprTC::isInScopeTypeParamRef(const TypeRef* t) const {
+    if (!t) return false;
+    std::string_view name = t->headName();
+    if (t->isResolvedTypeParam() && isInScopeTypeParam(name)) return true;
     return !common::isReservedBuiltinTypeName(name) &&
            !common::isBuiltinExceptionName(name);
 }

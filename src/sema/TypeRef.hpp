@@ -107,6 +107,16 @@ struct TypeRef {
         return astNode && astNode->aliasQualifiedBuiltin;
     }
 
+    // fix #6530 (§14.1, v0.355): true when the spelling this TypeRef was
+    // resolved from bound to a TYPE PARAMETER in its own declaration's scope
+    // (stamped by `Resolver::resolveNamed`). It is a fact about where the
+    // TypeRef CAME FROM, not about its name: a built-in `Guid` declared in a
+    // non-generic class's field stays unstamped when it reaches the body of
+    // a `class Box<Guid>`.
+    bool isResolvedTypeParam() const {
+        return astNode && astNode->resolvedAsTypeParam;
+    }
+
     // InlineArray:
     const ast::Expr* arraySize = nullptr;   // ConstIntExpr; sema later evaluates
     // #734: the folded compile-time size (>= 0) when arraySize is a literal or a
