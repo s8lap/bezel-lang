@@ -30497,10 +30497,62 @@ bool ExprTC::isEventSubscribeDrop(const ast::Expr* e) {
 // type so its body resolves member access (`p.x`) — exactly as the
 // event-handler payload mechanism (§24) types `(e) => …` handler params.
 // Null when the call is not such a LINQ operator (no seeding applied).
+// fix #8166 (stdlib §5 / §7.5 / §27.4, v0.355): the `?.` SPELLING of a member
+// call is a DISTINCT AST node (`ast::NullCondMemberExpr` — §7.5), so a helper
+// that reads a call's callee must read BOTH nodes to answer ONE question
+// about the receiver: which member is named, and what is the receiver.
+//
+// §7.5 (v0.355, docs/Bezel_Language_Spec.md:1043): "`x?.M` returns null if `x`
+// is null; otherwise it performs the access" — the `?.` spelling names the
+// SAME member over the SAME receiver as the `.` spelling, so the two must
+// reach ONE answer wherever the question is about the receiver rather than
+// about the null check.
+//
+// THE DEFECT this helper's `?.` blindness caused (issue #8166). The LINQ
+// seeding below answers "what is the source element type T?" — the type of
+// the operator's lambda PARAMETER. Reading only the `.` node, the `?.`
+// spelling found NO receiver, so the `?.` form of a LINQ operator's lambda
+// argument was typed with NO parameter type at all: `x` stayed untyped, the
+// lambda's body (`x.Length`) resolved to nothing, and the lambda's inferred
+// function type carried NO result type.
+//
+// The consequence was a wrong ELEMENT type for the whole `?.` chain, because
+// stdlib §5's `Select<U>(selector: (T) -> U): IEnumerable<U>` types its
+// result element U from the selector's RESULT type — and with no result
+// type, sema fell back to the SOURCE element T (the `srcElem` fallback in
+// `typeLinqOperator`). So `s?.Split(",")?.Select(lambda(x) => x.Length)`
+// typed as `IEnumerable<string>` instead of `IEnumerable<int>`, and the
+// `?.ToArray()` on it as `Array<string>` instead of `Array<int>`. Codegen
+// lowers what sema says: it sized the lazy element slot as 8 bytes (a
+// string) instead of 4 (an int) and emitted a bulk string retain over the
+// int elements — MEASURED on issue #8166: an AddressSanitizer SEGV in
+// `bz_string_retain` (via `bz_array_retain_strings`) on the int element
+// bits. The `.` spelling of the same chain (`s!.Split(",").Select(...)`) was
+// correct, because its callee IS the `.` node.
+namespace {
+
+// The member a call names and the receiver it names it over — read from
+// EITHER callee node (`ast::MemberAccessExpr` for `.`, the distinct
+// `ast::NullCondMemberExpr` for `?.`). Empty for any other callee shape.
+struct LinqCallee {
+    const ast::Expr* target = nullptr;
+    std::string_view member;
+};
+
+LinqCallee linqCalleeOf(const ast::Expr* callee) {
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+        return {ma->target.get(), ma->member};
+    if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(callee))
+        return {ncm->target.get(), ncm->member};
+    return {};
+}
+
+}  // namespace
+
 TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
-    if (!ma || !ma->target) return nullptr;
-    const auto& m = ma->member;
+    const LinqCallee lc = linqCalleeOf(callee);
+    if (!lc.target) return nullptr;
+    const std::string_view m = lc.member;
     // LINQ operators/aggregates whose (single) lambda is `(T) -> …` over the
     // source element T (stdlib §5). Select's selector and OrderBy's key fn are
     // also `(T) -> …`; Distinct/Take/Skip take no lambda (excluded).
@@ -30516,7 +30568,7 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
     // no name added or removed.
     bool elemLambda = common::isLinqElementLambdaOperatorName(m);
     if (!elemLambda) return nullptr;
-    return linqSourceElementType(ctx_.exprType(*ma->target));
+    return linqSourceElementType(ctx_.exprType(*lc.target));
 }
 
 // stdlib §2.20 / spec §35.2 (v0.307): the parameter type
@@ -30546,13 +30598,18 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
 // in `visitCallExpr`: this only supplies the parameter type a lambda needs to
 // be typed at all — a non-value-like receiver is rejected exactly as before.
 TypeRef* ExprTC::resultCombinatorLambdaParamType(const ast::Expr* callee) {
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
-    if (!ma || !ma->target) return nullptr;
-    const auto& m = ma->member;
+    // fix #8166 (§7.5, v0.355): the `?.` callee node reads here too — see
+    // `linqCalleeOf`'s header. The combinator's parameter type is the SAME
+    // question the `.` spelling answers, so the `?.` spelling must answer it
+    // too (§7.5: "a suffix to the right of a `?.` is typed at the value it
+    // meets on the path where it runs").
+    const LinqCallee lc = linqCalleeOf(callee);
+    if (!lc.target) return nullptr;
+    const std::string_view m = lc.member;
     const bool takesT = (m == "Map" || m == "AndThen");
     const bool takesE = (m == "MapError");
     if (!takesT && !takesE) return nullptr;
-    TypeRef* recvTy = ctx_.exprType(*ma->target);
+    TypeRef* recvTy = ctx_.exprType(*lc.target);
     // The same receiver shape the combinator arm in `visitCallExpr` keys on
     // (§35.2): the stdlib's own `Result` choice, instantiated at two args.
     if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||
@@ -30634,12 +30691,16 @@ TypeRef* ExprTC::linqSourceElementType(TypeRef* recvTy) {
 // `linqLambdaElementType` does not apply: the fold lambda has two parameters whose
 // types come from different sources — the seed and the element.) Empty otherwise.
 std::vector<TypeRef*> ExprTC::aggregateFoldLambdaParamTypes(const ast::CallExpr& ce) {
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
-    if (!ma || !ma->target || ma->member != "Aggregate" || ce.args.size() < 2)
+    // fix #8166 (§7.5 / stdlib §5, v0.355): the `?.` callee node reads here
+    // too — see `linqCalleeOf`'s header. The fold lambda's two parameter types
+    // (the seed's TAccum and the source element T) are the SAME question the
+    // `.` spelling answers, so the `?.` spelling must answer it too.
+    const LinqCallee lc = linqCalleeOf(ce.callee.get());
+    if (!lc.target || lc.member != "Aggregate" || ce.args.size() < 2)
         return {};
     if (!ce.args[0].value) return {};
     TypeRef* seedTy = ctx_.exprType(*ce.args[0].value);   // TAccum
-    auto* recvTy = ctx_.exprType(*ma->target);
+    auto* recvTy = ctx_.exprType(*lc.target);
     if (!seedTy || !recvTy || recvTy->kind != TypeRef::Kind::Named ||
         recvTy->genericArgs.empty() || !recvTy->genericArgs[0])
         return {};
@@ -30666,11 +30727,15 @@ std::vector<TypeRef*> ExprTC::aggregateFoldLambdaParamTypes(const ast::CallExpr&
 // Aggregate fold seeding above; the single-param linqLambdaElementType does
 // not apply because the two params come from different sources.) Empty otherwise.
 std::vector<TypeRef*> ExprTC::zipCombineLambdaParamTypes(const ast::CallExpr& ce) {
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
-    if (!ma || !ma->target || ma->member != "Zip" || ce.args.size() < 2)
+    // fix #8166 (§7.5 / stdlib §5, v0.355): the `?.` callee node reads here
+    // too — see `linqCalleeOf`'s header. The combiner's two parameter types
+    // (the receiver's element T and the `other` argument's element U) are the
+    // SAME question the `.` spelling answers.
+    const LinqCallee lc = linqCalleeOf(ce.callee.get());
+    if (!lc.target || lc.member != "Zip" || ce.args.size() < 2)
         return {};
     if (!ce.args[0].value) return {};
-    TypeRef* elemT = linqSourceElementType(ctx_.exprType(*ma->target));      // T
+    TypeRef* elemT = linqSourceElementType(ctx_.exprType(*lc.target));      // T
     TypeRef* elemU = linqSourceElementType(ctx_.exprType(*ce.args[0].value)); // U
     if (!elemT || !elemU) return {};
     return { elemT, elemU };                              // {T, U}
