@@ -508,6 +508,26 @@ public:
     void checkPureCtorChainPurity(const ast::ConstructorDecl& cd,
                                   const ConstructorSymbol& cs);
 
+    // fix #8163 (§22.15, v0.355): the CONSTRUCTION CONTENT of a class's
+    // PRIMARY constructor — the inheritance clause's base-call arguments and
+    // the primary's parameter DEFAULT expressions — walked under the
+    // pure-body rules when a pure constructor chains to that primary.
+    //
+    // §12.8: a `this(...)` chain in a primary-ctor class ends at the primary.
+    // §22.8 step 0-2 / §22.10: the primary's construction runs the base call
+    // and then the class's field initializers, and a parameter default
+    // evaluates when the argument is omitted (§22.5) — i.e. all of it runs as
+    // part of the construction a pure constructor chains to. §22.15's rule
+    // ("A pure constructor's `base(…)`/`this(…)` chain target must itself be
+    // pure") therefore reaches this content.
+    //
+    // The class's FIELD INITIALIZERS are deliberately NOT walked here: the
+    // class-level birth-store walk (`checkOneType`) already enforces them for
+    // every class with a pure constructor ("a class with a pure constructor
+    // must have field initializers satisfying the pure-body rules"), and
+    // walking them twice would report the same impurity twice.
+    void checkPrimaryCtorConstructionContent(const ast::TypeDecl& td);
+
     // §22.16 (v0.203, #2053): walk each contract clause's expression under
     // the §22.15 pure-body rules APPLIED EXPRESSION-WISE, with the clause-
     // specific amendments: `throw` is rejected (the carve-out's reverse —
@@ -1133,16 +1153,58 @@ void PureBodyWalker::checkPureCtorChainPurity(
             declTarget = cd2;
     }
     if (!symTarget) {
-        // No matching ctor — primary-ctor class chain (no
-        // ConstructorSymbol: the parser synthesizes the chain's body),
-        // or an arity mismatch already caught by sema. Admit silently:
-        // the chain target's purity is provable by the primary-ctor
-        // birth-store rule, and an arity mismatch is not a §22.15 defect.
+        // No matching ctor — a primary-ctor class chain (no
+        // ConstructorSymbol: the parser synthesizes the chain's body), or
+        // an arity mismatch already caught by sema.
+        //
+        // fix #8163 (§22.15, v0.355): the PRIMARY-ctor case is NOT a
+        // free pass. §22.15 "Pure constructors" — "A pure constructor's
+        // `base(…)`/`this(…)` chain target must itself be pure" — reaches
+        // a class primary, because §12.8's chain in a primary-ctor class
+        // ENDS at the primary (the primary is that class's only
+        // constructor that does not chain with `this(...)`), and the
+        // primary's CONSTRUCTION runs as part of every construction of the
+        // class: §22.10's inheritance-clause base call (§22.8 step 0), then
+        // the class's field initializers (§22.8 step 2).
+        //
+        // ⚠ THE OLD COMMENT HERE WAS FALSE. It claimed "the chain target's
+        // purity is provable by the primary-ctor birth-store rule". The
+        // birth-store rule (§22.15 "Pure constructors") covers the class's
+        // field INITIALIZERS — and the class-level walk in `checkOneType`
+        // enforces them ("a class with a pure constructor must have field
+        // initializers satisfying the pure-body rules"). It says NOTHING
+        // about the primary's BASE-CALL ARGUMENTS or its PARAMETER DEFAULTS,
+        // which are ordinary user expressions evaluated during that very
+        // construction. So `class MyError(message: string): Exception(
+        // Helper.Msg(message))` + `pure constructor() this("default")`
+        // chained to a primary that runs an impure call, and the §22.15
+        // rule never fired.
+        //
+        // The field initializers are NOT walked again here: the class-level
+        // birth-store walk already reports them, at the initializer, and a
+        // second walk would double-report the same impurity.
+        //
+        // An arity mismatch is still admitted silently — sema owns that
+        // diagnostic (§22.5 / §22.6), not this rule.
         //
         // ⚠ This branch's own comment used to justify an outcome it did not
         // describe: before #3174 it also ran for every imported base class,
         // which is neither a primary-ctor chain nor an arity mismatch. It now
         // means what it says.
+        if (isThisChain) {
+            // `this(...)` in a class with a primary constructor chains to
+            // THAT primary (§12.8: the chain must end; §22.10: a body
+            // constructor of a primary-ctor class chains with `this(...)`).
+            // An IMPORTED class carries no `ast::TypeDecl` here, so its
+            // primary's content is not re-checkable in this compilation —
+            // the same admission the pre-#8163 code made.
+            const auto* td =
+                dynamic_cast<const ast::TypeDecl*>(targetClass->decl);
+            if (td && td->kind == ast::TypeDeclKind::Class &&
+                td->hasPositionalFields) {
+                checkPrimaryCtorConstructionContent(*td);
+            }
+        }
         return;
     }
     if (declTarget) {
@@ -1155,6 +1217,52 @@ void PureBodyWalker::checkPureCtorChainPurity(
         std::string(isThisChain ? "this(" : "base(") + "...) target is "
         "not pure — a pure constructor's chain target must itself be "
         "declared `pure`");
+}
+
+// fix #8163 (§22.15, v0.355): the construction content of a class PRIMARY
+// constructor, walked under the pure-body rules.
+//
+// THE TWO EXPRESSION GROUPS.
+//
+//   * The inheritance clause's BASE-CALL ARGUMENTS (§22.10 / §22.8 step 0):
+//     `class D(v: int): Base(v)` — the arguments are evaluated as part of
+//     the construction, before the field initializers run.
+//
+//   * The primary's PARAMETER DEFAULT expressions (§22.5): a default-value
+//     expression evaluates when the argument is omitted, i.e. inside the
+//     construction this chain reaches.
+//
+// Both are ordinary user expressions, and §22.15's pure-body rules apply to
+// them exactly as they apply to a pure member's body — the same rules the
+// class-level birth-store walk applies to this class's field initializers.
+//
+// THE DIAGNOSTIC. The walker's own §22.15 diagnostics fire here, verbatim —
+// "call is not admitted in a pure body — the resolved target `X` is not
+// pure-declared (§22.15)" and the rest of the closed list's contrapositive.
+// No new wording is introduced: the same impurity, in the same class, is
+// already reported in exactly this text when it sits in a field initializer
+// of a class with a pure constructor (the class-level birth-store walk), and
+// a class primary's construction content is the same kind of material.
+//
+// THE SCOPE. §22.15's rule is about the CHAIN TARGET. For a `this(...)`
+// chain in a primary-ctor class the target IS the primary (§12.8: the chain
+// must end, and the primary is the only constructor of such a class that
+// does not chain with `this(...)`), and the primary's construction runs for
+// EVERY instance of the class — so this content is part of what a pure
+// constructor in that class promises. The BASE class's own construction
+// content (its field initializers, and the purity of the base constructor
+// the primary invokes) is a further step up the hierarchy and is NOT walked
+// here; that is recorded as a residual in the fix's report.
+void PureBodyWalker::checkPrimaryCtorConstructionContent(
+    const ast::TypeDecl& td) {
+    for (const ast::CallArgument& a : td.primaryBaseCtorArgs) {
+        if (!a.value) continue;
+        checkExpr(a.value.get());
+    }
+    for (const ast::Param& p : td.positionalFields) {
+        if (!p.defaultValue) continue;
+        checkExpr(p.defaultValue.get());
+    }
 }
 
 bool PureBodyWalker::isEnumeratorConstructingSource(
