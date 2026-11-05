@@ -2662,7 +2662,13 @@ bool bz_llist_drain_next(void* listp, void** val_out) {
 // Random
 // ---------------------------------------------------------------------------
 
-struct bz_rng_t { uint64_t state[2]; }; // xorshift128+
+// fix #8000 (§12.7 / §8.2, v0.355): the handle opens with its runtime type
+// tag (bz_random_vtable) so `o is Random` at an `Object` carrier is answered;
+// codegen never reads the state.
+struct bz_rng_t {
+    void* vtable;        // bz_random_vtable
+    uint64_t state[2];   // xorshift128+
+};
 
 static uint64_t xorshift128_next(uint64_t* s) {
     uint64_t t = s[0];
@@ -2685,6 +2691,7 @@ static uint64_t xorshift128_next(uint64_t* s) {
 void* bz_random_alloc(int64_t seed) {
     auto* r = (bz_rng_t*)malloc(sizeof(bz_rng_t));
     if (!r) bz_alloc_fail("Random state");
+    r->vtable = (void*)bz_random_vtable;  // fix #8000 (§8.2): identity at allocation
     r->state[0] = (uint64_t)seed ^ 0xdeadbeef12345678ULL;
     r->state[1] = (uint64_t)seed * 6364136223846793005ULL + 1442695040888963407ULL;
     if (r->state[0] == 0) r->state[0] = 1;

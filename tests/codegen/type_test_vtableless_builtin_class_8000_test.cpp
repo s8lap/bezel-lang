@@ -55,16 +55,23 @@
 // already there. (c) makes the `!targetDesc` bail REPORT the drop for a
 // declaration-less builtin CLASS target, so the answer is never silent.
 //
-// WHAT THE FIX DOES NOT ACHIEVE. The vtable-less builtin CLASSES that have
-// NO runtime tag at all (`Stopwatch`, `TaskScope`, `FileStream`, `Random`,
-// `Lock`, `Semaphore`, `SemaphoreToken`) still cannot be ANSWERED behind an
-// `Object`/interface erasure: their runtime values are plain C structs whose
-// word 0 is DATA (a `timespec`, a `FILE*`, a `std::mutex`, a `sem_t`, a
-// `uint64_t` state, a core pointer), not a vtable, so there is no descriptor
-// chain for `emitIsA` to walk. Giving them one is a runtime layout change in
-// five runtime TUs — see the handback. For those classes this fix makes the
-// drop LOUD (a diagnostic) instead of silent; it does not make the test
-// answerable.
+// PART (b) — narrow #8000 (§12.7 / §19.3 / §8.2, v0.355). The seven
+// vtable-less builtin CLASSES that had NO runtime tag (`Stopwatch`,
+// `TaskScope`, `FileStream`, `Random`, `Lock`, `Semaphore`,
+// `SemaphoreToken`) now carry one: each runtime handle opens with a word-0
+// vtable in the class slot layout (the #6776 Mutex / #7554 CTS shape —
+// bezel_runtime_refcounting.cpp's BZ_BUILTIN_TAG rows), stamped at
+// allocation, and `runtimeBuiltinDescriptorFor` maps each name to its
+// descriptor. So `o is Stopwatch` at an `Object` carrier is ANSWERED by the
+// ordinary `emitIsA` address walk, the controlled block runs, `as` yields the
+// value or null, and `o.ToString()` / an owned-`IDisposable` `Dispose()`
+// dispatch through real slots (both faulted on a word-0 DATA pointer before).
+//
+// WHAT IS STILL LEFT (why this is `narrow`). The remaining declaration-less
+// builtin classes with no tag (`Task`, `Subscription`, `CancellationToken`,
+// the serializer/deserializer classes) still take the (c) bail: the drop is
+// LOUD (the `internal:` Warning), not answered. The `residual_*` row below
+// pins that the Warning still fires for one of them.
 //
 // ORACLE. Every accept row RUNS the program and asserts EXACT stdout; the
 // diagnostic row compiles the program with the real `bezelc` binary as a
@@ -87,6 +94,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -95,6 +103,14 @@ namespace {
 // can never be mistaken for a passing one.
 std::string stdoutOf(const std::string& program) {
     auto r = runAot(program);
+    if (!r.ran) return std::string("<did not run>");
+    return r.stdoutText;
+}
+
+// The same, under the strict ASan/LSan oracle (runAotChecked returns
+// ran=false on any sanitizer report, leaks included).
+std::string checkedStdoutOf(const std::string& program) {
+    auto r = runAotChecked(program);
     if (!r.ran) return std::string("<did not run>");
     return r.stdoutText;
 }
@@ -208,36 +224,32 @@ end Program;
 
 }  // namespace
 
-// ── (c) THE DROPPED TEST IS NOW DIAGNOSED ──────────────────────────────────
-// §12.7 (v0.350): "`is T` tests whether a value is an instance of `T` and
-// produces `bool`." The `Stopwatch` has no runtime type tag, so behind an
-// `Object` erasure the runtime cannot answer — but the compiler must SAY SO
-// (#2775: "every producer that can return null for a condition expression
-// must report its own diagnostic before doing so"). On the base this program
-// compiled clean and printed NOTHING, with no diagnostic at all.
+// ── (b) THE TEST ON A NEWLY TAGGED CLASS IS ANSWERED ───────────────────────
+// §12.7 (v0.355): "`is T` tests whether a value is an instance of `T` and
+// produces `bool`." `Stopwatch` now carries a runtime type tag, so the test
+// is ANSWERED and is no longer a dropped one: the (c) Warning must NOT fire.
+// ⚠ FLIPPED by narrow #8000 part (b): this row asserted the Warning PRESENT
+// (the drop was diagnosed, not answered). The subprocess compile is the
+// non-vacuous oracle for an absence (the #3138 trap); the companion
+// `residual_class_drop_is_still_diagnosed` row proves the same needle is
+// still produced where a drop remains, so this absence cannot be vacuous.
 BEZEL_TEST(codegen_type_test_8000,
            is_test_on_vtableless_builtin_is_answered) {
     const CompileOutput out = compileCapturingStderr(kStopwatchIsProgram);
     BEZEL_EXPECT_TRUE(out.ran);
     BEZEL_EXPECT_EQ(out.exitCode, 0);
-    // The diagnostic is reported, and it names the class and the issue.
-    BEZEL_EXPECT_TRUE(out.text.find(kDroppedClassNeedle) != std::string::npos);
-    BEZEL_EXPECT_TRUE(out.text.find("`Stopwatch`") != std::string::npos);
-    BEZEL_EXPECT_TRUE(out.text.find("#8000") != std::string::npos);
-    // …and it is reported AT the type test, not at some unrelated position.
-    // The diagnostic must carry a real source location (the #2737 shape — a
-    // `file:0:0` — would make the report useless).
-    BEZEL_EXPECT_TRUE(out.text.find(":0:0") == std::string::npos);
+    BEZEL_EXPECT_TRUE(out.text.find(kDroppedClassNeedle) == std::string::npos);
+    BEZEL_EXPECT_TRUE(out.text.find("#8000") == std::string::npos);
 }
 
-// The SAME program, run: the drop still reads as `false`, so the controlled
-// block still does not run — but the compiler now says so, so the outcome is
-// no longer a SILENT wrong answer. This row pins that (c) does not change the
-// runtime outcome of a class that has no runtime tag (that is part (b), which
-// needs a runtime layout change — see the file header).
+// The issue's repro, RUN under the ASan/LSan oracle: the controlled block
+// runs, `o.Stop()` stops the watch, and `IsRunning` is `False`.
+// ⚠ FLIPPED by narrow #8000 part (b): this row pinned `""` (the dropped test
+// read as false and the block never ran).
 BEZEL_TEST(codegen_type_test_8000,
            is_test_on_vtableless_builtin_is_not_silently_dropped) {
-    BEZEL_EXPECT_EQ(stdoutOf(kStopwatchIsProgram), std::string(""));
+    BEZEL_EXPECT_EQ(checkedStdoutOf(kStopwatchIsProgram),
+                    std::string("False\n"));
 }
 
 // ── THE `is not` SPELLING — THE CONTROL ─────────────────────────────────────
@@ -456,4 +468,211 @@ end Program;
     BEZEL_EXPECT_TRUE(out.text.find("Segmentation fault") == std::string::npos);
     BEZEL_EXPECT_TRUE(out.text.find("no member `Length` on type `Object`") !=
                        std::string::npos);
+}
+
+// ── PART (b): THE NEWLY TAGGED CLASSES ─────────────────────────────────────
+// narrow #8000 (§12.7 / §19.3 / §8.2, v0.355). Every row below RUNS under
+// runAotChecked and FAILED on the base (`6f1e1a15`): the tests read as false
+// (or the dispatch through word 0 faulted).
+
+// §12.7: `is not` on a tagged class answers from the same tag. `o` holds a
+// Stopwatch, so `o is not Stopwatch` is false and `t is not Stopwatch` (a
+// string carrier) is true; `o is Stopwatch` prints True as a value.
+BEZEL_TEST(codegen_type_test_8000, b_is_and_is_not_produce_bools_on_stopwatch) {
+    BEZEL_EXPECT_EQ(checkedStdoutOf(R"bzl(module M8000BB;
+import System.Diagnostics;
+public class Program
+  public static method Main(): int
+    using var w := new Stopwatch();
+    var o: Object := w;
+    var t: Object := "text";
+    Console.WriteLine(o is Stopwatch);
+    Console.WriteLine(o is not Stopwatch);
+    Console.WriteLine(t is Stopwatch);
+    Console.WriteLine(t is not Stopwatch);
+    return 0;
+  end Main;
+end Program;
+)bzl"),
+                    std::string("True\nFalse\nFalse\nTrue\n"));
+}
+
+// §12.7: `as T` yields the value when it is a `T` and null otherwise — a
+// string carrier and a Semaphore carrier are both mismatches.
+BEZEL_TEST(codegen_type_test_8000, b_as_yields_value_or_null) {
+    BEZEL_EXPECT_EQ(checkedStdoutOf(R"bzl(module M8000BA;
+import System.Diagnostics;
+import System.Threading;
+public class Program
+  public static method Probe(o: Object): string
+    var sw := o as Stopwatch;
+    if sw = null then
+      return "null";
+    end;
+    return "sw";
+  end Probe;
+  public static method Main(): int
+    using var w := new Stopwatch();
+    Console.WriteLine(Probe(w));
+    Console.WriteLine(Probe("text"));
+    using var s := new Semaphore(1, 1);
+    Console.WriteLine(Probe(s));
+    return 0;
+  end Main;
+end Program;
+)bzl"),
+                    std::string("sw\nnull\nnull\n"));
+}
+
+// §12.7 / §8.2: each of the seven tagged classes is identified as itself and
+// as none of the others (a first-match chain), a string carrier matches none
+// of them, and a Mutex (tagged before this fix) matches none of them either.
+// `o.ToString()` (§8.1) dispatches through the new slot 3 and renders the
+// qualified name — on the base it read word 0 as a vtable and faulted.
+BEZEL_TEST(codegen_type_test_8000, b_all_seven_tagged_classes_are_distinguished) {
+    BEZEL_EXPECT_EQ(checkedStdoutOf(R"bzl(module M8000BK;
+import System.Diagnostics;
+import System.Threading;
+import System.IO;
+public class Program
+  public static method Kind(o: Object): string
+    if o is Stopwatch then return "Stopwatch"; end;
+    if o is Random then return "Random"; end;
+    if o is FileStream then return "FileStream"; end;
+    if o is Lock then return "Lock"; end;
+    if o is Semaphore then return "Semaphore"; end;
+    if o is SemaphoreToken then return "SemaphoreToken"; end;
+    if o is TaskScope then return "TaskScope"; end;
+    if o is string then return "string"; end;
+    return "other";
+  end Kind;
+  public static method Show(o: Object)
+    Console.WriteLine(Kind(o) + " " + o.ToString());
+  end Show;
+  public static async method Main(): Task<int>
+    using var sw := new Stopwatch();
+    Show(sw);
+    using var r := new Random(3);
+    Show(r);
+    using var fs := new FileStream("/var/tmp/bezel-scratch/bezel_8000_kinds.txt", FileMode.Create);
+    Show(fs);
+    using var m := new Mutex();
+    using var l := await m.AcquireAsync();
+    Show(l);
+    using var s := new Semaphore(1, 1);
+    Show(s);
+    using var t := await s.AcquireAsync();
+    Show(t);
+    await using var scope := new TaskScope();
+    Show(scope);
+    await scope.Join();
+    Show("hi");
+    Show(m);
+    return 0;
+  end Main;
+end Program;
+)bzl"),
+                    std::string("Stopwatch System.Diagnostics.Stopwatch\n"
+                                "Random System.Random\n"
+                                "FileStream System.IO.FileStream\n"
+                                "Lock System.Threading.Lock\n"
+                                "Semaphore System.Threading.Semaphore\n"
+                                "SemaphoreToken System.Threading.SemaphoreToken\n"
+                                "TaskScope System.Threading.TaskScope\n"
+                                "string hi\n"
+                                "other System.Threading.Mutex\n"));
+}
+
+// §28.4 / §12.6: an owned value at an `IDisposable` slot is discharged by the
+// class protocol (slot-2 Dispose, then reclaim). On the base slot 2 was read
+// through a word-0 DATA pointer — a wild jump (SIGSEGV) for every one of
+// these. Each is now disposed exactly once and reclaimed (LSan-clean); the
+// Semaphore token and the Mutex lock release their permit / lock, so the
+// owner's own Dispose after them is clean.
+BEZEL_TEST(codegen_type_test_8000, b_owned_idisposable_slot_disposes_tagged_classes) {
+    BEZEL_EXPECT_EQ(checkedStdoutOf(R"bzl(module M8000BD;
+import System.Diagnostics;
+import System.Threading;
+import System.IO;
+public class Program
+  public static method Take(owned d: IDisposable)
+    d.Dispose();
+  end Take;
+  public static method Main(): int
+    Take(Stopwatch.StartNew());
+    Take(new Random(3));
+    Take(new Semaphore(1, 1));
+    var s := new Semaphore(1, 1);
+    Take(s.Acquire());
+    Take(s.Acquire());
+    s.Dispose();
+    var m := new Mutex();
+    Take(m.Acquire());
+    Take(m.Acquire());
+    m.Dispose();
+    Take(new FileStream("/var/tmp/bezel-scratch/bezel_8000_take.txt", FileMode.Create));
+    Console.WriteLine("ok");
+    return 0;
+  end Main;
+end Program;
+)bzl"),
+                    std::string("ok\n"));
+}
+
+// A 100x loop (the one-shot-leak trap): each iteration allocates a tagged
+// Stopwatch and Random, tests them through an `Object` carrier, and disposes
+// them; runAotChecked's LSan leg fails the row on any leaked cell.
+BEZEL_TEST(codegen_type_test_8000, b_loop_100x_is_leak_free) {
+    BEZEL_EXPECT_EQ(checkedStdoutOf(R"bzl(module M8000BL;
+import System.Diagnostics;
+public class Program
+  public static method Main(): int
+    var hits := 0;
+    var i := 0;
+    while i < 100 do
+      using var x := Stopwatch.StartNew();
+      var o: Object := x;
+      if o is Stopwatch then
+        o.Stop();
+        hits := hits + 1;
+      end;
+      using var r := new Random(i);
+      var q: Object := r;
+      if q is Random then hits := hits + 1; end;
+      i := i + 1;
+    end;
+    Console.WriteLine(hits);
+    return 0;
+  end Main;
+end Program;
+)bzl"),
+                    std::string("200\n"));
+}
+
+// ── THE RESIDUAL: A CLASS STILL WITHOUT A TAG IS STILL DIAGNOSED ───────────
+// `CancellationToken` (stdlib §6.1) has no runtime tag yet, so `o is
+// CancellationToken` at an `Object` carrier still takes the (c) bail, and the
+// drop must stay LOUD. This row is also what keeps the absence asserted by
+// `is_test_on_vtableless_builtin_is_answered` non-vacuous: the same needle is
+// still produced by the same compile path.
+BEZEL_TEST(codegen_type_test_8000, residual_class_drop_is_still_diagnosed) {
+    const CompileOutput out = compileCapturingStderr(R"bzl(module M8000RC;
+import System.Threading;
+public class Program
+  public static method Main(): int
+    using var cts := new CancellationTokenSource();
+    var o: Object := cts.Token;
+    if o is CancellationToken then
+      Console.WriteLine("tok");
+    end;
+    return 0;
+  end Main;
+end Program;
+)bzl");
+    BEZEL_EXPECT_TRUE(out.ran);
+    BEZEL_EXPECT_EQ(out.exitCode, 0);
+    BEZEL_EXPECT_TRUE(out.text.find(kDroppedClassNeedle) != std::string::npos);
+    BEZEL_EXPECT_TRUE(out.text.find("`CancellationToken`") != std::string::npos);
+    BEZEL_EXPECT_TRUE(out.text.find("#8000") != std::string::npos);
+    BEZEL_EXPECT_TRUE(out.text.find(":0:0") == std::string::npos);
 }

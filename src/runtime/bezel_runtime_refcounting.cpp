@@ -279,9 +279,64 @@ extern "C" void* bz_cts_vtable[6] = {
     (void*)bz_builtin_obj_equals, (void*)bz_builtin_obj_hash,
 };
 
+// fix #8000 (§12.7 / §19.3 / §8.2 / §8.5, v0.355): the remaining
+// declaration-less built-in CLASSES that reach `Object` — Stopwatch (stdlib
+// §8.1), Random (stdlib §2.7), FileStream (stdlib §7.2), Lock / Semaphore /
+// SemaphoreToken (stdlib §6.2 / §6.3) and TaskScope (stdlib §6.10) — get the
+// same runtime-owned tag, in the same slot layout, so `o is Stopwatch` at an
+// `Object` carrier is answered by the ordinary descriptor walk (§8.2: the
+// runtime type identity is fixed at allocation) instead of being dropped.
+// Each handle now opens with its vtable word; codegen never reads their
+// fields, so the word is runtime-internal. Slot 2 is the CLASS-protocol
+// Dispose of each (releases the contents, leaves the handle for the caller's
+// reclaim step — the Mutex / CTS contract above); slot 3 is §8.5's class
+// default, the type's qualified name (none of the seven declares a
+// `ToString` of its own in the stdlib).
+#define BZ_BUILTIN_TYPENAME_TOSTRING(fn, qname)                              \
+    static void* fn(void*) {                                                 \
+        static const char name[] = qname;                                    \
+        return bz_make_string(name, (int64_t)(sizeof(name) - 1));            \
+    }
+BZ_BUILTIN_TYPENAME_TOSTRING(bz_stopwatch_obj_tostring, "System.Diagnostics.Stopwatch")
+BZ_BUILTIN_TYPENAME_TOSTRING(bz_random_obj_tostring, "System.Random")
+BZ_BUILTIN_TYPENAME_TOSTRING(bz_filestream_obj_tostring, "System.IO.FileStream")
+BZ_BUILTIN_TYPENAME_TOSTRING(bz_lock_obj_tostring, "System.Threading.Lock")
+BZ_BUILTIN_TYPENAME_TOSTRING(bz_semaphore_obj_tostring, "System.Threading.Semaphore")
+BZ_BUILTIN_TYPENAME_TOSTRING(bz_semtoken_obj_tostring, "System.Threading.SemaphoreToken")
+BZ_BUILTIN_TYPENAME_TOSTRING(bz_task_scope_obj_tostring, "System.Threading.TaskScope")
+#undef BZ_BUILTIN_TYPENAME_TOSTRING
+
+// Stopwatch and Random hold no resource: their class-protocol Dispose has
+// nothing to release (the reclaim step frees the calloc'd/malloc'd cell).
+static void bz_plain_obj_dispose(void*) {}
+
+#define BZ_BUILTIN_TAG(prefix, disposeFn, toStringFn)                        \
+    extern "C" void* prefix##_desc[2] = { (void*)prefix##_desc, nullptr };   \
+    extern "C" void* prefix##_vtable[6] = {                                  \
+        (void*)prefix##_desc, (void*)bz_builtin_itmap,                       \
+        (void*)disposeFn, (void*)toStringFn,                                 \
+        (void*)bz_builtin_obj_equals, (void*)bz_builtin_obj_hash,            \
+    };
+BZ_BUILTIN_TAG(bz_stopwatch, bz_plain_obj_dispose, bz_stopwatch_obj_tostring)
+BZ_BUILTIN_TAG(bz_random, bz_plain_obj_dispose, bz_random_obj_tostring)
+BZ_BUILTIN_TAG(bz_filestream, bz_filestream_obj_dispose, bz_filestream_obj_tostring)
+BZ_BUILTIN_TAG(bz_lock, bz_lock_obj_dispose, bz_lock_obj_tostring)
+BZ_BUILTIN_TAG(bz_semaphore, bz_semaphore_obj_dispose, bz_semaphore_obj_tostring)
+BZ_BUILTIN_TAG(bz_semtoken, bz_semtoken_obj_dispose, bz_semtoken_obj_tostring)
+BZ_BUILTIN_TAG(bz_task_scope, bz_task_scope_obj_dispose, bz_task_scope_obj_tostring)
+#undef BZ_BUILTIN_TAG
+
 static inline bool bz_word0_is_builtin_vtable(void* word0) {
     return word0 == (void*)bz_array_vtable || word0 == (void*)bz_sb_vtable ||
-           word0 == (void*)bz_mutex_vtable || word0 == (void*)bz_cts_vtable;
+           word0 == (void*)bz_mutex_vtable || word0 == (void*)bz_cts_vtable ||
+           // fix #8000: the seven tags above.
+           word0 == (void*)bz_stopwatch_vtable ||
+           word0 == (void*)bz_random_vtable ||
+           word0 == (void*)bz_filestream_vtable ||
+           word0 == (void*)bz_lock_vtable ||
+           word0 == (void*)bz_semaphore_vtable ||
+           word0 == (void*)bz_semtoken_vtable ||
+           word0 == (void*)bz_task_scope_vtable;
 }
 
 // fix #6776: codegen's hooks onto the tags above. `bz_sb_tag` retags the

@@ -5065,12 +5065,29 @@ llvm::Value* Emitter::emitIsA(llvm::Value* obj, llvm::GlobalVariable* targetDesc
 // the chain `emitIsA` walks (obj[0] -> vtable[0] -> desc[0..]), so the
 // ordinary walk answers it by address — the same shape `bz_sb_desc` /
 // `bz_mutex_desc` already answer.
+//
+// fix #8000 part (b) (§12.7 / §19.3 / §8.2, v0.355): the seven declaration-
+// less built-in CLASSES that had NO runtime tag — `Stopwatch` (stdlib §8.1),
+// `Random` (§2.7), `FileStream` (§7.2), `Lock` / `Semaphore` /
+// `SemaphoreToken` (§6.2 / §6.3) and `TaskScope` (§6.10) — now carry one: the
+// runtime gives each handle the same word-0 vtable in the class slot layout
+// (bezel_runtime_refcounting.cpp's BZ_BUILTIN_TAG rows), stamped at
+// allocation, with `bz_<name>_desc[0]` the descriptor itself. So they join
+// this map, and `o is Stopwatch` is answered by the same address walk
+// instead of falling to the dropped-test bail.
 llvm::GlobalVariable* Emitter::runtimeBuiltinDescriptorFor(
         std::string_view head) {
     const char* sym = nullptr;
     if (head == "StringBuilder") sym = "bz_sb_desc";
     else if (head == "Mutex") sym = "bz_mutex_desc";
     else if (head == "CancellationTokenSource") sym = "bz_cts_desc";  // #8000
+    else if (head == "Stopwatch") sym = "bz_stopwatch_desc";          // #8000 (b)
+    else if (head == "Random") sym = "bz_random_desc";
+    else if (head == "FileStream") sym = "bz_filestream_desc";
+    else if (head == "Lock") sym = "bz_lock_desc";
+    else if (head == "Semaphore") sym = "bz_semaphore_desc";
+    else if (head == "SemaphoreToken") sym = "bz_semtoken_desc";
+    else if (head == "TaskScope") sym = "bz_task_scope_desc";
     else return nullptr;
     auto* ty = llvm::ArrayType::get(ptrTy(), 2);
     return llvm::cast<llvm::GlobalVariable>(module_->getOrInsertGlobal(sym, ty));

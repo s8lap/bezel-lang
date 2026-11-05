@@ -517,7 +517,14 @@ char* bz_path_absolute(const char* path) {
 // §7.1/§7.2 declarations.
 // ---------------------------------------------------------------------------
 
+// fix #8000 (§12.7 / §8.2, v0.355): the handle opens with its runtime type
+// tag (bz_filestream_vtable, bezel_runtime_refcounting.cpp) so `o is
+// FileStream` at an `Object` carrier is answered. Codegen never reads the
+// fields. The cell is calloc'd, freed by free(): by bz_filestream_dispose on
+// the typed path, or by codegen's reclaim step after the class-protocol
+// Dispose (bz_filestream_obj_dispose, which closes but keeps the cell).
 struct bz_filestream_t {
+    void*   vtable;     // bz_filestream_vtable
     FILE*   fp;
     char*   path;       // NUL-terminated copy of the constructor's path
     int64_t path_len;   // byte length of `path` (excluding the NUL)
@@ -602,6 +609,7 @@ void* bz_filestream_open(const char* path_data, int64_t path_len,
 
     auto* fs = (bz_filestream_t*)calloc(1, sizeof(bz_filestream_t));
     if (!fs) { fclose(fp); free(path); bz_alloc_fail("FileStream handle"); }
+    fs->vtable    = (void*)bz_filestream_vtable;  // fix #8000 (§8.2)
     fs->fp        = fp;
     fs->path      = path;
     fs->path_len  = path_len;
@@ -621,10 +629,10 @@ void* bz_filestream_open(const char* path_data, int64_t path_len,
 // Without the guard, line 510 reads `fs->closed` from freed memory after
 // `free(fs)` at line 518 below, and `free(fs->path)` / `free(fs)` are a
 // double-free. Null-tolerant per the prior contract.
-void bz_filestream_dispose(void* h) {
-    auto* fs = (bz_filestream_t*)h;
-    if (!fs) return;
-    if (fs->closed.exchange(1)) return;   // already disposed → no-op (fix #4357 sibling, §28.2)
+// fix #8000: the flush + close + path release shared by both release
+// protocols. Returns false when an earlier dispose already ran it.
+static bool bz_filestream_close_contents(bz_filestream_t* fs) {
+    if (fs->closed.exchange(1)) return false;   // already disposed (fix #4357 sibling, §28.2)
     if (fs->fp) {
         fflush(fs->fp);
         fclose(fs->fp);
@@ -632,7 +640,25 @@ void bz_filestream_dispose(void* h) {
     fs->fp = nullptr;
     free(fs->path);
     fs->path = nullptr;
+    return true;
+}
+
+void bz_filestream_dispose(void* h) {
+    auto* fs = (bz_filestream_t*)h;
+    if (!fs) return;
+    if (!bz_filestream_close_contents(fs)) return;   // already disposed → no-op
     free(fs);
+}
+
+// fix #8000 (§28.4 / §8.7, v0.355): bz_filestream_vtable slot 2 — the
+// class-protocol Dispose of a FileStream held at an `owned … : IDisposable`
+// slot. It flushes and closes like bz_filestream_dispose but leaves the
+// handle for the caller's reclaim step (emitDisposeAndReclaim frees it), and
+// is idempotent because that protocol dispatches it again before the reclaim.
+void bz_filestream_obj_dispose(void* h) {
+    auto* fs = (bz_filestream_t*)h;
+    if (!fs) return;
+    (void)bz_filestream_close_contents(fs);
 }
 
 // per stdlib §7.1: Flush() — push buffered writes to the OS.

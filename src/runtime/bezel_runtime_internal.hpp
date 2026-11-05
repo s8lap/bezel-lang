@@ -264,6 +264,30 @@ extern "C" void bz_mutex_obj_dispose(void* mutex);
 extern "C" void* bz_cts_desc[2];
 extern "C" void* bz_cts_vtable[6];
 extern "C" void bz_cts_obj_dispose(void* cts);
+// fix #8000 (§12.7 / §8.2, v0.355): the tags of the seven remaining
+// declaration-less built-in classes (bezel_runtime_refcounting.cpp), each
+// handle's word 0 at allocation, and the class-protocol Dispose slots of the
+// five that hold a resource — each the twin of the typed release that leaves
+// the handle for the caller's reclaim step instead of freeing it itself.
+extern "C" void* bz_stopwatch_desc[2];
+extern "C" void* bz_stopwatch_vtable[6];
+extern "C" void* bz_random_desc[2];
+extern "C" void* bz_random_vtable[6];
+extern "C" void* bz_filestream_desc[2];
+extern "C" void* bz_filestream_vtable[6];
+extern "C" void* bz_lock_desc[2];
+extern "C" void* bz_lock_vtable[6];
+extern "C" void* bz_semaphore_desc[2];
+extern "C" void* bz_semaphore_vtable[6];
+extern "C" void* bz_semtoken_desc[2];
+extern "C" void* bz_semtoken_vtable[6];
+extern "C" void* bz_task_scope_desc[2];
+extern "C" void* bz_task_scope_vtable[6];
+extern "C" void bz_filestream_obj_dispose(void* fs);
+extern "C" void bz_lock_obj_dispose(void* lock);
+extern "C" void bz_semaphore_obj_dispose(void* sem);
+extern "C" void bz_semtoken_obj_dispose(void* token);
+extern "C" void bz_task_scope_obj_dispose(void* scope);
 // Either view of a function value -> the cell base. A cell base's word 0 is a
 // code pointer and can never equal the vtable's address.
 static inline void* bz_closure_base(void* c) {

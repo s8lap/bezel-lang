@@ -81,10 +81,24 @@ struct bz_mutex_t {
     int32_t           disposed;
 };
 
+// fix #8000 (§12.7 / §8.2, v0.355): the Lock opens with its runtime type tag
+// (bz_lock_vtable, bezel_runtime_refcounting.cpp) so `o is Lock` at an
+// `Object` carrier is answered. It is calloc'd plain data (bz_lock_make), so
+// either release protocol may free it: bz_lock_release on the typed path, or
+// codegen's reclaim step after bz_lock_obj_dispose on the class path.
 struct bz_lock_t {
+    void*            vtable;   // bz_lock_vtable
     bz_mutex_core_t* core;     // borrowed (+ core_refs held)
     bool             released; // idempotent flag (§28.2)
 };
+
+static bz_lock_t* bz_lock_make(bz_mutex_core_t* core) {
+    auto* lk = (bz_lock_t*)calloc(1, sizeof(bz_lock_t));
+    if (!lk) bz_alloc_fail("Lock");
+    lk->vtable = (void*)bz_lock_vtable;  // fix #8000 (§8.2): identity at allocation
+    lk->core = core;
+    return lk;
+}
 
 static void mutex_core_ref(bz_mutex_core_t* c) {
     c->core_refs.fetch_add(1, std::memory_order_relaxed);
@@ -129,7 +143,7 @@ void* bz_mutex_acquire(void* mp) {
     auto* m = ((bz_mutex_t*)mp)->core;
     pthread_mutex_lock(&m->mtx);  // blocking; non-recursive → always enters if not held
     mutex_core_ref(m);             // Lock holds a ref on the core
-    auto* lk = new bz_lock_t{m, false};
+    auto* lk = bz_lock_make(m);
     return lk;
 }
 
@@ -161,7 +175,7 @@ void* bz_mutex_try_acquire(void* mp, int64_t timeout_ms) {
     }
     if (rc != 0) return nullptr;   // timeout or contention → null (owned Lock?)
     mutex_core_ref(m);
-    auto* lk = new bz_lock_t{m, false};
+    auto* lk = bz_lock_make(m);
     return lk;
 }
 
@@ -184,8 +198,23 @@ void bz_lock_release(void* lkp) {
     // Release the core ref the Lock holds; may destroy the mutex if the Mutex
     // object was already disposed (Lock-outlives-Mutex scenario).
     bz_mutex_core_t* c = lk->core;
-    delete lk;          // free the bz_lock_t struct
+    free(lk);           // free the bz_lock_t struct (calloc'd, fix #8000)
     mutex_core_release(c);
+}
+
+// fix #8000 (§28.4 / §8.7, v0.355): bz_lock_vtable slot 2 — the class-protocol
+// Dispose of a Lock held at an `owned … : IDisposable` slot. It releases the
+// held mutex and the Lock's core reference like bz_lock_release, but leaves
+// the handle for the caller's reclaim step (which frees it); idempotent on
+// the same `released` flag, because that protocol dispatches it again before
+// the reclaim.
+void bz_lock_obj_dispose(void* lkp) {
+    if (!lkp) return;
+    auto* lk = (bz_lock_t*)lkp;
+    if (lk->released) return;
+    lk->released = true;
+    pthread_mutex_unlock(&lk->core->mtx);
+    mutex_core_release(lk->core);
 }
 
 // §6.2: Mutex.Dispose — dispose the Mutex object.  Marks disposed (for
@@ -308,7 +337,7 @@ void* bz_mutex_acquire_async(void* mp, void* token, void* oce_vtable) {
     if (rc == 0) {
         // Acquired immediately.
         mutex_core_ref(m);
-        auto* lk = new bz_lock_t{m, false};
+        auto* lk = bz_lock_make(m);
         return mutex_make_done_task(lk);
     }
 
@@ -344,7 +373,7 @@ void* bz_mutex_acquire_async(void* mp, void* token, void* oce_vtable) {
         bz_cancel_state_release(s);  // release the worker's token ref
         // Acquire succeeded and not cancelled: build a lock and complete.
         // The core ref the worker held is transferred to the new bz_lock_t.
-        auto* lk = new bz_lock_t{m, false};
+        auto* lk = bz_lock_make(m);
         // (core ref already held — do NOT call mutex_core_ref again here)
         void* lkPtr = lk;
         bz_task_complete(task, &lkPtr, (int64_t)sizeof(void*));
@@ -380,7 +409,7 @@ void* bz_mutex_try_acquire_async(void* mp, int64_t timeout_ms,
     if (rc == 0) {
         // Acquired immediately → non-null result.
         mutex_core_ref(m);
-        auto* lk = new bz_lock_t{m, false};
+        auto* lk = bz_lock_make(m);
         return mutex_make_done_task(lk);
     }
 
@@ -446,7 +475,7 @@ void* bz_mutex_try_acquire_async(void* mp, int64_t timeout_ms,
         }
         bz_cancel_state_release(s);  // release the worker's token ref
         // Build the lock; core ref transferred to bz_lock_t.
-        auto* lk = new bz_lock_t{m, false};
+        auto* lk = bz_lock_make(m);
         void* lkPtr = lk;
         bz_task_complete(task, &lkPtr, (int64_t)sizeof(void*));
     });
@@ -491,12 +520,28 @@ void* bz_mutex_try_acquire_async(void* mp, int64_t timeout_ms,
 //     the task with OCE.
 // ---------------------------------------------------------------------------
 
-struct bz_semaphore_t {
+struct bz_semaphore_t;
+
+// fix #8000 (§12.7 / §8.2, v0.355): the #6776 Mutex split. The refcounted
+// core (below) keeps every field the semaphore had; the Semaphore OBJECT is
+// now a separate calloc'd handle that opens with its runtime type tag
+// (bz_semaphore_vtable, bezel_runtime_refcounting.cpp), so `o is Semaphore`
+// at an `Object` carrier is answered. Tokens and pool workers hold the CORE,
+// never the handle, so either release protocol may free the handle:
+//   - the TYPED path (bz_semaphore_dispose): the core owns the handle
+//     (`core->handle`) and frees it with its last reference — the handle
+//     stays readable while any token holds the core (#706's guarantee);
+//   - the CLASS protocol (an owned `IDisposable` slot): codegen dispatches
+//     slot 2, bz_semaphore_obj_dispose, which detaches the handle from the
+//     core before dropping the Semaphore's reference, and then reclaims the
+//     handle itself.
+struct bz_semaphore_core_t {
     sem_t                sem;
     std::atomic<int>    core_refs{1};
-    // fix #706: atomic so concurrent Dispose from two domains cannot both
-    // reach semaphore_core_release (exchange(true) ensures exactly one caller).
-    std::atomic<bool>   disposed{false};
+    // fix #8000: the handle this core was created for, freed with the core's
+    // last reference on the typed path; null once the class protocol's
+    // reclaim step owns the handle instead.
+    bz_semaphore_t*     handle = nullptr;
     // fix #4445 (stdlib §6.3, v0.302): maxCount is the permit ceiling
     // documented at construction. It is recorded for diagnostics and is NOT
     // enforced at release time, because no release path can exceed it: a
@@ -510,18 +555,44 @@ struct bz_semaphore_t {
     int                 maxCount;
 };
 
-struct bz_semaphore_token_t {
-    bz_semaphore_t* sem;     // borrowed (+ core_refs held)
-    bool            released; // idempotent flag (§28.2)
+// The Semaphore object (fix #8000): calloc'd, plain data, freed by free() —
+// either by the core's last release or by codegen's reclaim step.
+struct bz_semaphore_t {
+    void*                vtable;    // bz_semaphore_vtable
+    bz_semaphore_core_t* core;
+    // fix #706: set atomically by bz_semaphore_dispose so concurrent Dispose
+    // calls from two domains cannot both reach semaphore_core_release (the
+    // exchange ensures exactly one caller proceeds).
+    int32_t              disposed;
 };
 
-static void semaphore_core_ref(bz_semaphore_t* s) {
+// fix #8000: the SemaphoreToken opens with its runtime type tag
+// (bz_semtoken_vtable) and is calloc'd (semaphore_token_make), so either
+// release protocol may free it — bz_semaphore_token_release on the typed
+// path, codegen's reclaim step after bz_semtoken_obj_dispose on the class
+// path.
+struct bz_semaphore_token_t {
+    void*                vtable;   // bz_semtoken_vtable
+    bz_semaphore_core_t* sem;      // borrowed (+ core_refs held)
+    bool                 released; // idempotent flag (§28.2)
+};
+
+static bz_semaphore_token_t* semaphore_token_make(bz_semaphore_core_t* s) {
+    auto* tok = (bz_semaphore_token_t*)calloc(1, sizeof(bz_semaphore_token_t));
+    if (!tok) bz_alloc_fail("SemaphoreToken");
+    tok->vtable = (void*)bz_semtoken_vtable;  // fix #8000 (§8.2)
+    tok->sem = s;
+    return tok;
+}
+
+static void semaphore_core_ref(bz_semaphore_core_t* s) {
     s->core_refs.fetch_add(1, std::memory_order_relaxed);
 }
 
-static void semaphore_core_release(bz_semaphore_t* s) {
+static void semaphore_core_release(bz_semaphore_core_t* s) {
     if (s->core_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         sem_destroy(&s->sem);
+        free(s->handle);   // null once the class protocol reclaimed it (#8000)
         delete s;
     }
 }
@@ -559,7 +630,7 @@ extern "C" {
 
 // §6.3: Semaphore — allocate a new counting semaphore.  core_refs = 1.
 // initialCount: the initial permit count (must be >= 0).
-// maxCount: the permit ceiling (diagnostics-only here; see bz_semaphore_t
+// maxCount: the permit ceiling (diagnostics-only here; see bz_semaphore_core_t
 // comment for why no release-time check is needed).
 //
 // fix #4445 (stdlib §6.3, v0.302): the ArgumentException contract on the
@@ -572,11 +643,16 @@ extern "C" {
 void* bz_semaphore_new(int initial_count, int max_count) {
     if (initial_count < 0) initial_count = 0;
     if (max_count < initial_count) max_count = initial_count;
-    auto* s = new bz_semaphore_t();
+    auto* s = new bz_semaphore_core_t();
     s->maxCount = max_count;
     // core_refs = 1 via the in-struct initializer.
     sem_init(&s->sem, /*pshared=*/0, (unsigned int)initial_count);
-    return s;
+    auto* h = (bz_semaphore_t*)calloc(1, sizeof(bz_semaphore_t));
+    if (!h) bz_alloc_fail("Semaphore");
+    h->vtable = (void*)bz_semaphore_vtable;  // fix #8000 (§8.2): identity at allocation
+    h->core = s;
+    s->handle = h;
+    return h;
 }
 
 // bz_semaphore_acquire — block until a permit is available; return an owned
@@ -584,12 +660,12 @@ void* bz_semaphore_new(int initial_count, int max_count) {
 // core stays alive even if the Semaphore object is disposed before the token
 // is released.
 void* bz_semaphore_acquire(void* sp) {
-    auto* s = (bz_semaphore_t*)sp;
+    auto* s = ((bz_semaphore_t*)sp)->core;
     // sem_wait restarts on EINTR.
     int rc;
     do { rc = sem_wait(&s->sem); } while (rc == -1 && errno == EINTR);
     semaphore_core_ref(s);
-    auto* tok = new bz_semaphore_token_t{s, false};
+    auto* tok = semaphore_token_make(s);
     return tok;
 }
 
@@ -597,7 +673,7 @@ void* bz_semaphore_acquire(void* sp) {
 // Returns an owned bz_semaphore_token_t* on success, or null on timeout.
 // Uses sem_timedwait with CLOCK_REALTIME (per POSIX).
 void* bz_semaphore_try_acquire(void* sp, int64_t timeout_ms) {
-    auto* s = (bz_semaphore_t*)sp;
+    auto* s = ((bz_semaphore_t*)sp)->core;
     int rc;
     if (timeout_ms <= 0) {
         // Zero / negative timeout: try without waiting.
@@ -617,7 +693,7 @@ void* bz_semaphore_try_acquire(void* sp, int64_t timeout_ms) {
     }
     if (rc != 0) return nullptr;  // timeout or unavailable → null (owned SemaphoreToken?)
     semaphore_core_ref(s);
-    auto* tok = new bz_semaphore_token_t{s, false};
+    auto* tok = semaphore_token_make(s);
     return tok;
 }
 
@@ -633,9 +709,24 @@ void bz_semaphore_token_release(void* tokp) {
     }
     // Release the core ref the Token holds; may destroy the semaphore core if
     // the Semaphore object was already disposed (Token-outlives-Semaphore).
-    bz_semaphore_t* s = tok->sem;
-    delete tok;                 // free the bz_semaphore_token_t struct
+    bz_semaphore_core_t* s = tok->sem;
+    free(tok);                  // free the bz_semaphore_token_t struct (calloc'd, fix #8000)
     semaphore_core_release(s);
+}
+
+// fix #8000 (§28.4 / §8.7, v0.355): bz_semtoken_vtable slot 2 — the
+// class-protocol Dispose of a SemaphoreToken held at an `owned … :
+// IDisposable` slot: post the permit and drop the token's core reference like
+// bz_semaphore_token_release, but leave the handle for the caller's reclaim
+// step. Idempotent on `released`, because that protocol dispatches it again
+// before the reclaim.
+void bz_semtoken_obj_dispose(void* tokp) {
+    if (!tokp) return;
+    auto* tok = (bz_semaphore_token_t*)tokp;
+    if (tok->released) return;
+    tok->released = true;
+    sem_post(&tok->sem->sem);
+    semaphore_core_release(tok->sem);
 }
 
 // §6.3: Semaphore.Dispose — dispose the Semaphore object.  Marks disposed
@@ -646,9 +737,22 @@ void bz_semaphore_token_release(void* tokp) {
 // cannot both proceed to semaphore_core_release.
 void bz_semaphore_dispose(void* sp) {
     if (!sp) return;
-    auto* s = (bz_semaphore_t*)sp;
-    if (s->disposed.exchange(true)) return;  // already disposed → no-op (fix #706)
-    semaphore_core_release(s);  // drop the Semaphore object's own ref
+    auto* h = (bz_semaphore_t*)sp;
+    if (__atomic_exchange_n(&h->disposed, 1, __ATOMIC_ACQ_REL))
+        return;  // already disposed → no-op (fix #706)
+    semaphore_core_release(h->core);  // drop the Semaphore object's own ref; frees the handle last
+}
+
+// fix #8000 (§28.4 / §8.7, v0.355): bz_semaphore_vtable slot 2 — the
+// class-protocol Dispose (see the struct comment). The caller's reclaim step
+// frees the handle, so detach it from the core before dropping the
+// Semaphore's reference. Idempotent like bz_semaphore_dispose.
+void bz_semaphore_obj_dispose(void* sp) {
+    if (!sp) return;
+    auto* h = (bz_semaphore_t*)sp;
+    if (__atomic_exchange_n(&h->disposed, 1, __ATOMIC_ACQ_REL)) return;
+    h->core->handle = nullptr;
+    semaphore_core_release(h->core);
 }
 
 // ---------------------------------------------------------------------------
@@ -666,7 +770,7 @@ void bz_semaphore_dispose(void* sp) {
 // bz_semaphore_acquire_async — per §6.3 / #647.
 // Returns a bz_task_t* (OwningTask<SemaphoreToken>).
 void* bz_semaphore_acquire_async(void* sp, void* token, void* oce_vtable) {
-    auto* s = (bz_semaphore_t*)sp;
+    auto* s = ((bz_semaphore_t*)sp)->core;
     auto* cs = (bz_cancel_state_t*)token;
 
     // Pre-cancel check.
@@ -679,7 +783,7 @@ void* bz_semaphore_acquire_async(void* sp, void* token, void* oce_vtable) {
     int rc = sem_trywait(&s->sem);
     if (rc == 0) {
         semaphore_core_ref(s);
-        auto* tok = new bz_semaphore_token_t{s, false};
+        auto* tok = semaphore_token_make(s);
         return semaphore_make_done_task(tok);
     }
 
@@ -714,7 +818,7 @@ void* bz_semaphore_acquire_async(void* sp, void* token, void* oce_vtable) {
         bz_cancel_state_release(cs);
         // Acquire succeeded and not cancelled: build a token.
         // The core ref the worker held is transferred to the new bz_semaphore_token_t.
-        auto* tok = new bz_semaphore_token_t{s, false};
+        auto* tok = semaphore_token_make(s);
         void* tokPtr = tok;
         bz_task_complete(task, &tokPtr, (int64_t)sizeof(void*));
     });
@@ -726,7 +830,7 @@ void* bz_semaphore_acquire_async(void* sp, void* token, void* oce_vtable) {
 // Result is a bz_semaphore_token_t* on success, or null on timeout.
 void* bz_semaphore_try_acquire_async(void* sp, int64_t timeout_ms,
                                       void* token, void* oce_vtable) {
-    auto* s = (bz_semaphore_t*)sp;
+    auto* s = ((bz_semaphore_t*)sp)->core;
     auto* cs = (bz_cancel_state_t*)token;
 
     // Pre-cancel check (takes priority over timeout).
@@ -739,7 +843,7 @@ void* bz_semaphore_try_acquire_async(void* sp, int64_t timeout_ms,
     int rc = sem_trywait(&s->sem);
     if (rc == 0) {
         semaphore_core_ref(s);
-        auto* tok = new bz_semaphore_token_t{s, false};
+        auto* tok = semaphore_token_make(s);
         return semaphore_make_done_task(tok);
     }
 
@@ -802,7 +906,7 @@ void* bz_semaphore_try_acquire_async(void* sp, int64_t timeout_ms,
             return;
         }
         bz_cancel_state_release(cs);
-        auto* tok = new bz_semaphore_token_t{s, false};
+        auto* tok = semaphore_token_make(s);
         void* tokPtr = tok;
         bz_task_complete(task, &tokPtr, (int64_t)sizeof(void*));
     });

@@ -3981,7 +3981,15 @@ void bz_tcs_dispose_owned_result(void* t) {
 // runs after it completes.
 // ---------------------------------------------------------------------------
 
+// fix #8000 (§12.7 / §8.2, v0.355): the scope opens with its runtime type tag
+// (bz_task_scope_vtable, bezel_runtime_refcounting.cpp), stamped by the
+// member initializer at allocation, so `o is TaskScope` at an `Object`
+// carrier — a plain borrowed `Object` parameter is the one Object position
+// stdlib §6.10 admits — is answered. Codegen never reads the fields. The
+// scope is still new/delete'd and released only by its own lifecycle below;
+// see bz_task_scope_obj_dispose for why the class protocol never reaches it.
 struct bz_task_scope_t {
+    void* vtable = (void*)bz_task_scope_vtable;
     std::mutex mtx;
     bz_cancel_state_t* state;      // internal CTS state cell (scope holds rc 1)
     int64_t pending = 0;           // children not yet completed
@@ -4149,6 +4157,15 @@ void bz_scope_perform(BzScopeFinalActions& act) {
 }  // namespace
 
 extern "C" {
+
+// fix #8000 (§28.4, v0.355): bz_task_scope_vtable slot 2. Stdlib §6.10
+// confines a TaskScope to its own `await using var` binding — never an owned
+// field, parameter, return slot, element, type argument or owned
+// `Object`/interface conversion — so no class-protocol discharge (Dispose
+// then reclaim) can be emitted for one; its disposal is the binding's
+// DisposeAsync / unwind path. The slot is therefore a deliberate no-op: were
+// it ever reached it must not tear the scope down behind its own lifecycle.
+void bz_task_scope_obj_dispose(void*) {}
 
 // stdlib §6.10: new TaskScope() — fresh internal CancellationTokenSource.
 void* bz_task_scope_new(void) {

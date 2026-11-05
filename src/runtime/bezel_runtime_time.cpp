@@ -971,7 +971,14 @@ int32_t bz_timeonly_try_parse(const void* str_p, int32_t* out_ms) {
 // All functions are extern "C" with the bz_sw_* prefix.
 // ---------------------------------------------------------------------------
 
+// fix #8000 (§12.7 / §8.2, v0.355): the handle opens with its runtime type
+// tag (bz_stopwatch_vtable, bezel_runtime_refcounting.cpp) so `o is
+// Stopwatch` at an `Object` carrier is answered. Codegen never reads the
+// fields; the cell is calloc'd plain data, freed by free() — by
+// bz_stopwatch_free on the typed path, or by codegen's reclaim step after the
+// (empty) class-protocol Dispose.
 struct bz_stopwatch_t {
+    void* vtable;              // bz_stopwatch_vtable
     struct timespec start_ts;  // CLOCK_MONOTONIC timestamp of last Start()
     int64_t elapsed_ns;        // accumulated nanoseconds from completed Start/Stop cycles
     int32_t running;           // 1 = running, 0 = stopped
@@ -991,6 +998,8 @@ extern "C" {
 // per stdlib §8.1: Stopwatch() — allocate and zero-initialise.
 void* bz_stopwatch_alloc(void) {
     auto* sw = (bz_stopwatch_t*)calloc(1, sizeof(bz_stopwatch_t));
+    if (!sw) bz_alloc_fail("Stopwatch");
+    sw->vtable = (void*)bz_stopwatch_vtable;  // fix #8000 (§8.2): identity at allocation
     return sw;
 }
 
