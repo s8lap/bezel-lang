@@ -16137,6 +16137,34 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             lam->exprBody->span.begin, "returned value",
                             lam->exprBody.get());
         }
+        // fix #8168 (§27.3 *Admission at a target-typed non-call position*,
+        // §5.1, v0.355): an UNASCRIBED lambda at a function-typed target —
+        // "the body is typed, and its inferred return type must equal the
+        // target's return slot or implicitly convert to it (§5.1); otherwise
+        // the lambda is a compile error at the position". The branch above
+        // leaves `returnCtx_ = None` for an unascribed lambda, so neither the
+        // expression body nor a block body's `return e;` ever reached the
+        // §5.1 check, and `(long) -> int := lambda(x: long) => x` (or
+        // `(double) -> float`, `(decimal) -> double`, ...) was admitted and
+        // miscompiled. Apply the SAME predicate the `return` statement uses
+        // (checkAssignable, which also carries §5.1 constant narrowing) to
+        // every value-return path. Scoped to a primitive return slot
+        // (numeric, `bool`, `char`, `string`, `Object`, nullable or not): a
+        // class / record / type-parameter slot may still be an unsubstituted
+        // callee type parameter here, and a unit slot admits §27.3's
+        // discarded-result expression body. An overload-set target
+        // (`lamTargetAmbiguous`) is the candidate resolution picks, not
+        // this one, and an async lambda's slot is its task-family wrapper.
+        if (!hasAscription && !lam->isAsync && lamTargetRet &&
+            !lamTargetAmbiguous &&
+            lamTargetRet->kind == TypeRef::Kind::Primitive) {
+            forEachLambdaReturnValue(*lam, [&](const ast::Expr* retVal) {
+                if (!retVal || !ctx_.exprType(*retVal)) return;
+                checkAssignable(ctx_.exprType(*retVal), lamTargetRet,
+                                retVal->span.begin,
+                                "lambda body's returned value", retVal);
+            });
+        }
         // §27.3/§21.7 (v0.217): a value-ascribed BLOCK body must return a
         // value on every path — the same totality rule as a method with a
         // declared return type (and as §27.3's own "return is required on
