@@ -21353,6 +21353,40 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // the call (§7.4, §22.6); an un-narrowed one is
                         // refused (§14.2). An explicit list `Math.Max<T>` binds
                         // T and types the call T.
+                        // fix #8287 (stdlib §2.2, §9.4, §10.0, spec §14.2,
+                        // v0.355): `Boolean` declares `IEquatable<bool>` only
+                        // and `IntPtr` / `UIntPtr` no base list, so none
+                        // satisfies `where T: IComparable<T>`; this builtin
+                        // special case bypasses the ordinary constraint check,
+                        // so the gate is applied here. An explicit type list
+                        // binds T; otherwise every operand is judged.
+                        if (mathNarrowedOk) {
+                            std::string_view bad;
+                            const TypeRef* badAt = nullptr;
+                            if (ma->typeArgs.size() == 1 && ma->typeArgs[0]) {
+                                badAt = ctx_.resolvedType(*ma->typeArgs[0]);
+                                bad = stdlibNonComparableValueHead(badAt);
+                            } else {
+                                for (const auto& arg : ce.args) {
+                                    if (!arg.value) continue;
+                                    badAt = mathArgType(*arg.value);
+                                    bad = stdlibNonComparableValueHead(badAt);
+                                    if (!bad.empty()) break;
+                                }
+                            }
+                            if (!bad.empty()) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "type argument `" + std::string(bad) +
+                                    "` does not satisfy the constraint `where "
+                                    "T: IComparable<T>` — `Math." +
+                                    std::string(ma->member) +
+                                    "` requires an argument type that "
+                                    "implements `IComparable<T>` (§14.2, "
+                                    "stdlib §2.2)");
+                                return;
+                            }
+                        }
                         TypeRef* timeProbe = nullptr;
                         if (mathNarrowedOk) {
                             const TypeRef* explicitT = nullptr;

@@ -75,4 +75,32 @@ inline bool isStdlibGuidType(const TypeRef* t) {
     return false;
 }
 
+// fix #8287 (stdlib §2.2, §9.4, §10.0, spec §14.2, v0.355): the built-in value
+// types that declare NO `IComparable<T>`: `Boolean` lists `IEquatable<bool>`
+// only (stdlib §9.4) and `IntPtr` / `UIntPtr` list no base at all (stdlib
+// §10.0), so none satisfies `Math.Min` / `Max` / `Clamp`'s `where T:
+// IComparable<T>`. Returns the spelling to name in the diagnostic, or an
+// empty view when `t` is not one of them. A user type of the same name, and
+// any nullable (§7's question), is not one.
+inline std::string_view stdlibNonComparableValueHead(const TypeRef* t) {
+    if (!t || t->nullable) return {};
+    if (t->kind == TypeRef::Kind::Primitive)
+        return t->primitive == PrimitiveType::Bool ? "bool"
+                                                   : std::string_view{};
+    if (t->kind != TypeRef::Kind::Named) return {};
+    std::string_view name;
+    if (t->declaration) {
+        if (isUserDeclaredTypeSym(t->declaration)) return {};
+        name = t->declaration->name;
+    } else if (t->astNode && t->astNode->name &&
+               !t->astNode->name->parts.empty()) {
+        name = t->astNode->name->parts.back();
+    } else if (!t->astNode && !t->importedName.empty()) {
+        name = t->importedName;
+    }
+    if (name == "Boolean") return "bool";
+    if (name == "IntPtr" || name == "UIntPtr") return name;
+    return {};
+}
+
 }  // namespace bezel::sema
