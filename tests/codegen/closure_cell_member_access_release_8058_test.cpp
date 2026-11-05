@@ -1322,3 +1322,61 @@ end P;
 )BZL"),
                         "100\n");
 }
+
+// ===========================================================================
+// 28/9 — a local bound from an EXPRESSION-BODIED GETTER's +1, then rendered.
+//
+//   class Holder … public method Get(): (int)->int => this.Fn;
+//   var g: (int)->int := h.Get();  var s := g.ToString();
+//
+// The third review's blocker (rev-8058d BLOCKING 1): this program was a
+// heap-use-after-free on the unit's first base, because an arrow getter
+// handed its caller a +0 borrow that the caller then released (#8141), and
+// this unit's relaxation of the `g.ToString()` receiver made the member-call
+// spellings reach that over-release. #8141 now mints the +1 in the arrow
+// getter's return (§22.2, §28.9, v0.355), exactly as the block twin
+// `return this.Fn;` does, so the getter's result is the caller's own
+// reference, and this unit's scope-end `bz_closure_release` of `g` is the
+// drop of THAT reference, never of the field's.
+//
+// MEASURED, 100x, `agent_check.sh --probe --asan`:
+//   r30-c1 alone (#8141 in, unit out): "2000", NO ASan error, 72-byte /
+//     2-allocation LEAK (the cell and its env block) — the local keeps the
+//     +1 it was handed, because the `g.ToString()` receiver is still an
+//     escape (the cell's count never returns to the field's one, so
+//     `using var h` cannot free it);
+//   r30-c1 + this unit: "2000", NO leak, NO ASan error.
+// So the row is RED without the unit (the leak) and RED on the unit as first
+// reviewed, 65defd9d without #8141 (the use-after-free), and GREEN only on
+// the combined tree: it pins
+// both that the cell is reclaimed AND that reclaiming it is not a double
+// free of the field's reference (§28.9 v0.355: "Runtime management governs
+// the *function value itself*").
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           a_local_bound_from_an_arrow_getter_then_rendered_reclaims_only_its_own_reference) {
+    expectNoLeak(runAotChecked(R"BZL(
+module M;
+class Holder
+  public Fn: (int)->int;
+  public constructor() this.Fn := lambda(x: int) => x + 7; end constructor;
+  public method Get(): (int)->int => this.Fn;
+end Holder;
+class P
+  public static method Run(h: Holder): int
+    var g: (int)->int := h.Get();
+    var s := g.ToString();
+    return s.Length;
+  end Run;
+  public static method Main(): int
+    using var h := new Holder();
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do total := total + P.Run(h) + h.Fn(1); i := i + 1; end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                 "2000\n");
+}
