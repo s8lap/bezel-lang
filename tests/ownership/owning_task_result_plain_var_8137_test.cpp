@@ -399,7 +399,8 @@ BEZEL_TEST(owning_task_result_plain_var_8137,
         "      using var t := Mk(); "
         "      const c := t.Result; "));
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_FALSE(r.ran);  // rejected before it could run
+    // rejected at compile time, with a real source location
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
     const std::string text = diagnosticText(r);
     BEZEL_EXPECT_TRUE(text.find(
         "a `const` local (`c`) must not take an owned production") !=
