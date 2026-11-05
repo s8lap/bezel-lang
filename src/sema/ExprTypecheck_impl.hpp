@@ -4769,8 +4769,13 @@ private:
     // BLOCK that declares it — an extension method has no `parent` TypeSymbol
     // (§26.1), so the hierarchy walk finds nothing and the selection silently
     // degraded to "the first-declared member", which is the #8121 gap.
+    //
+    // fix #8205 (§27.6 / §26.5, v0.355): for a RECEIVER-QUALIFIED reference
+    // (`refExpr` = the `v.Name` member access) the extension set is the union
+    // of the applicable members of EVERY block the call `v.Name(…)` would
+    // consult, not the one block the bare lookup stopped at.
     std::vector<MethodSymbol*> methodRefOverloadCandidates(
-        const MethodSymbol* ms);
+        const MethodSymbol* ms, const ast::Expr* refExpr = nullptr);
 
     // §27.6 (v0.355): the function type a method reference over an EXTENSION
     // member forms. The type-qualified (unbound) spelling carries the

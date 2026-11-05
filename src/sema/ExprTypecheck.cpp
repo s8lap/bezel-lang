@@ -6344,7 +6344,7 @@ TypeRef* ExprTC::buildMethodRefType(const MethodSymbol* ms) {
 // for the #4292 self-call check. No applicability decision is re-derived here,
 // so the set cannot drift from what the lookup actually selected.
 std::vector<MethodSymbol*> ExprTC::methodRefOverloadCandidates(
-    const MethodSymbol* ms) {
+    const MethodSymbol* ms, const ast::Expr* refExpr) {
     std::vector<MethodSymbol*> out;
     if (!ms) return out;
     if (ms->parent) {
@@ -6367,6 +6367,47 @@ std::vector<MethodSymbol*> ExprTC::methodRefOverloadCandidates(
     for (Symbol* cand : owner->members) {
         if (!cand || cand->name != ms->name) continue;
         if (auto* mm = dynamic_cast<MethodSymbol*>(cand)) out.push_back(mm);
+    }
+    // fix #8205 (§27.6 / §26.5, v0.355): "the reference considers the same
+    // candidate set as the call". A receiver-qualified reference `v.Name`
+    // resolves the member on the value exactly as the call `v.Name(…)` does,
+    // and a call consults EVERY applicable extension block (§26.5 rule 2/4),
+    // so overloads split across two blocks (`extension Array<int>` declaring
+    // `Len()`, `extension IEnumerable<int>` declaring `Len(x: int)`) are one
+    // overload set. The applicability and specificity decisions are
+    // `lookupExtensionMember`'s own, asked once per arity the other blocks
+    // declare under the name — nothing is re-derived here.
+    const auto* rma =
+        refExpr ? dynamic_cast<const ast::MemberAccessExpr*>(refExpr) : nullptr;
+    if (rma && rma->target && !extensionRefIsUnbound(*rma)) {
+        const TypeRef* recv = ctx_.exprType(*rma->target);
+        std::vector<std::size_t> arities;
+        auto gather = [&](ExtensionSymbol* e) {
+            if (e == owner) return;
+            for (Symbol* cand : e->members) {
+                auto* mm = dynamic_cast<MethodSymbol*>(cand);
+                if (!mm || mm->name != ms->name) continue;
+                if (std::find(arities.begin(), arities.end(),
+                              mm->params.size()) == arities.end())
+                    arities.push_back(mm->params.size());
+            }
+        };
+        if (recv) {
+            if (ctx_.module()) {
+                for (Symbol* child : ctx_.module()->children)
+                    if (auto* e = dynamic_cast<ExtensionSymbol*>(child))
+                        gather(e);
+            }
+            for (ExtensionSymbol* e : importedExtensions_) gather(e);
+        }
+        for (std::size_t n : arities) {
+            Symbol* found = lookupExtensionMember(
+                recv, ms->name, nullptr, SourceLocation{}, false,
+                static_cast<std::ptrdiff_t>(n));
+            auto* mm = dynamic_cast<MethodSymbol*>(found);
+            if (mm && std::find(out.begin(), out.end(), mm) == out.end())
+                out.push_back(mm);
+        }
     }
     return out;
 }
@@ -6593,7 +6634,7 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
     // existing helper (mirrors `resolveMethodOverload` for plain calls). For an
     // EXTENSION member the set is the block's same-name members instead.
     std::vector<MethodSymbol*> overloads =
-        methodRefOverloadCandidates(ms);
+        methodRefOverloadCandidates(ms, fromExpr);
     if (overloads.size() < 2)
         return MethodRefOverloadResult::SingleOverload;
 
@@ -6788,7 +6829,7 @@ bool ExprTC::reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
     // candidate set is the block's same-name members.
     if (!ms->parent && !ms->extensionDecl) return false;
 
-    std::vector<MethodSymbol*> overloads = methodRefOverloadCandidates(ms);
+    std::vector<MethodSymbol*> overloads = methodRefOverloadCandidates(ms, initExpr);
     if (overloads.size() < 2) return false;
 
     // Build the candidates' signatures for the diagnostic.
@@ -8906,7 +8947,7 @@ void ExprTC::checkAssignable(
                     // overloads' signatures.
                     std::string sigs;
                     std::vector<MethodSymbol*> overloads =
-                        methodRefOverloadCandidates(ms0);
+                        methodRefOverloadCandidates(ms0, fromExpr);
                     for (MethodSymbol* ov : overloads) {
                         // The candidate's signature as the reference would
                         // form it: an EXTENSION member's is the §27.6

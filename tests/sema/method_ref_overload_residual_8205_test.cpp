@@ -66,6 +66,25 @@ std::string classMain(const std::string& body) {
            "end C;\n";
 }
 
+const char kSplitBlocks[] =
+    "extension Array<int>\n"
+    "  public method Len(): int => 1;\n"
+    "end;\n"
+    "extension IEnumerable<int>\n"
+    "  public method Len(x: int): int => x + 200;\n"
+    "end;\n";
+
+std::string splitMain(const std::string& body) {
+    return std::string("module M;\n") + kSplitBlocks +
+           "class C\n"
+           "  public static method Main(): int\n"
+           "    var a: Array<int> := [1,2,3];\n"
+           "    " + body + "\n"
+           "    return 0;\n"
+           "  end Main;\n"
+           "end C;\n";
+}
+
 void expectRejected(const std::string& src, const std::string& needle) {
     auto r = runAot(src);
     BEZEL_EXPECT_FALSE(r.ran);
@@ -139,3 +158,47 @@ BEZEL_TEST(sema_method_ref_overload_residual_8205,
                         "105\n");
 }
 
+// ── B ───────────────────────────────────────────────────────────────────────
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           overloads_split_across_two_extension_blocks_resolve_by_target) {
+    // per §27.6 + §26.5 (v0.355): the issue's literal repro
+    expectCheckedStdout(splitMain("Console.WriteLine(a.Len(5));\n"
+                                  "    var g: (int) -> int := a.Len;\n"
+                                  "    Console.WriteLine(g(5));"),
+                        "205\n205\n");
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           split_blocks_reference_selects_the_other_block_by_target) {
+    // the zero-arity member (the more specific block) is still selectable
+    expectCheckedStdout(splitMain("var f: () -> int := a.Len;\n"
+                                  "    Console.WriteLine(f());"),
+                        "1\n");
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           split_blocks_reference_without_a_target_is_ambiguous) {
+    // per §27.6: the union is overloaded, so no target means ambiguous
+    expectRejected(splitMain("var f := a.Len;"), kNoTarget);
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           single_block_overload_set_still_resolves_by_target) {
+    // control: one block, as #8121 pinned
+    expectCheckedStdout(
+        "module M;\n"
+        "extension Array<int>\n"
+        "  public method Len(): int => 1;\n"
+        "  public method Len(x: int): int => x + 200;\n"
+        "end;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    var a: Array<int> := [1,2,3];\n"
+        "    var g: (int) -> int := a.Len;\n"
+        "    Console.WriteLine(g(5));\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "205\n");
+}
