@@ -6956,6 +6956,29 @@ llvm::Value* Emitter::applyMethodRefSlotAdapt(MrSlotAdapt k, llvm::Value* v,
     return v;
 }
 
+// fix #8121 (§27.6 / §26.4, v0.355): the free-type-variable binding a
+// reference over a member of a GENERIC EXTENSION BLOCK recorded at its
+// formation, or null when the member is not such a member (or declares type
+// parameters of its own, which keep their own path). §27.6: "A reference over
+// a member of a generic extension block binds the block's parameters by its
+// qualifier ...; the qualifier's arguments instantiate the block member the
+// same way (§26.4)". Sema records the binding on the reference's
+// MemberAccessExpr exactly as on a call's callee (`setExprExtBinding`, #714).
+static const std::vector<std::pair<std::string, sema::TypeRef*>>*
+genericExtBlockBinding(const sema::SemaContext& ctx,
+                       const sema::MethodSymbol* ms, const ast::Expr* refExpr) {
+    if (!ms || ms->parent || !ms->extensionDecl || !refExpr ||
+        !ms->genericParams.empty())
+        return nullptr;
+    const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(refExpr);
+    if (!ma || !ma->typeArgs.empty()) return nullptr;
+    const auto* bnd = ctx.exprExtBinding(*ma);
+    if (!bnd || bnd->empty()) return nullptr;
+    for (const auto& [nm, ty] : *bnd)
+        if (nm.empty() || !ty) return nullptr;
+    return bnd;
+}
+
 llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
                                              llvm::Value* receiverVal,
                                              const ast::Expr* refExpr) {
@@ -6965,6 +6988,22 @@ llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(refExpr))
         typeArgs = &ma->typeArgs;
     const sema::TypeRef* fnTy = refExpr ? ctx_.exprType(*refExpr) : nullptr;
+    // fix #8121 (§27.6 / §26.4, v0.355): a reference over a member of a
+    // GENERIC EXTENSION BLOCK (`b.Head` / `Array<long>.Head` over `extension
+    // Array<T>`'s `Head(): T`). The block member's compiled function is the
+    // erased template, lowered with the i32 placeholder for `T` (§14.1), so a
+    // thunk over it advertised and returned a 32-bit `T`: measured, `() ->
+    // long` over `[5000000000L]` answered 705032704, `() -> double` answered 0,
+    // and a heap-string / class `T` was a truncated pointer (ASan SEGV). The
+    // reference instantiates the member "the same way" a call does (§27.6), so
+    // the thunk inlines the body under the block's binding, exactly the path
+    // the call `b.Head()` takes (lowerCall's #714 / #4293 substitution).
+    const auto* extBnd = genericExtBlockBinding(ctx_, ms, refExpr);
+    const bool extBlock = extBnd != nullptr;
+    // The UNBOUND (type-qualified) spelling captures no receiver: the
+    // receiver is the formed function's FIRST parameter (§27.6). The caller
+    // (CG60) lowers no value for a type-name qualifier.
+    const bool extUnbound = extBlock && !receiverVal;
     auto unsupported = [&](const char* why) -> llvm::Value* {
         ctx_.diagnostics().report(
             Severity::Error, refExpr ? refExpr->span.begin : SourceLocation{},
@@ -6974,10 +7013,11 @@ llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
                 "that calls the method)");
         return nullptr;
     };
-    if (!typeArgs || typeArgs->size() != ms->genericParams.size() || !fnTy ||
-        fnTy->kind != sema::TypeRef::Kind::Function)
+    if (!extBlock &&
+        (!typeArgs || typeArgs->size() != ms->genericParams.size() || !fnTy ||
+         fnTy->kind != sema::TypeRef::Kind::Function))
         return unsupported("it names no type-argument list");
-    if (isExtensionMethod(ms) || ms->extensionDecl)
+    if (!extBlock && (isExtensionMethod(ms) || ms->extensionDecl))
         return unsupported("a generic extension member reference has no "
                            "generic thunk yet");
     if (ms->parent && !ms->parent->genericParams.empty())
@@ -6991,57 +7031,158 @@ llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
         (ci.bodyKind != ast::MethodBodyKind::Expression &&
          ci.bodyKind != ast::MethodBodyKind::Block))
         return unsupported("its body is not available to specialize");
-    if (ms->genericParams.size() != typeArgs->size())
+    if (!extBlock && ms->genericParams.size() != typeArgs->size())
         return unsupported("its declaration is not available to specialize");
 
     // The substitution the reference names, resolved in the caller's scope.
     std::unordered_map<std::string_view, llvm::Type*> newSubst;
     std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
     std::vector<std::string> idKeys;
-    for (std::size_t i = 0; i < typeArgs->size(); ++i) {
-        sema::TypeRef* arg = (*typeArgs)[i] ? ctx_.resolvedType(*(*typeArgs)[i])
-                                            : nullptr;
-        if (!arg) return unsupported("a type argument did not resolve");
-        const sema::TypeRef* inCaller =
-            substituteTypeRefLocal(arg, genericSubstSemaTy_);
-        const std::string_view gpName = ms->genericParams[i]->name;
-        newSubst[gpName] = lowerTypeRef(arg);
-        newSema[gpName] = inCaller;
-        idKeys.push_back(typeRefIdentityKey(inCaller));
+    if (extBlock) {
+        // fix #8121: the block's binding (§26.4), as lowerCall installs it for
+        // the call `b.Head()` (#714).
+        for (const auto& [nm, ty] : *extBnd) {
+            const sema::TypeRef* inCaller =
+                substituteTypeRefLocal(ty, genericSubstSemaTy_);
+            newSubst[nm] = lowerTypeRef(ty);
+            newSema[nm] = inCaller;
+            idKeys.push_back(nm + "=" + typeRefIdentityKey(inCaller));
+        }
+        // ... plus the receiver CLASS's own free variables, which the body
+        // reads through `this` (lowerCall's #4293 composition): names the
+        // block binding already set keep the block's value.
+        const sema::TypeRef* recvTy = nullptr;
+        if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(refExpr)) {
+            if (!extUnbound && ma->target)
+                recvTy = ctx_.exprType(*ma->target);
+        }
+        if (extUnbound && ms->extensionDecl->targetType)
+            if (const sema::TypeRef* tt =
+                    ctx_.resolvedType(*ms->extensionDecl->targetType))
+                recvTy = substituteTypeRefLocal(tt, newSema);
+        if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+            recvTy->declaration && !recvTy->genericArgs.empty()) {
+            const std::vector<std::string_view> clsParams =
+                sema::genericParamNames(recvTy->declaration);
+            if (clsParams.size() == recvTy->genericArgs.size())
+                for (std::size_t gi = 0; gi < clsParams.size(); ++gi) {
+                    const std::string_view pn = clsParams[gi];
+                    const sema::TypeRef* arg = recvTy->genericArgs[gi];
+                    if (pn.empty() || !arg || newSubst.count(pn)) continue;
+                    newSubst[pn] = lowerTypeRef(arg);
+                    newSema[pn] = substituteTypeRefLocal(arg, genericSubstSemaTy_);
+                }
+        }
+        // The bound and the unbound spelling form different signatures.
+        idKeys.push_back(extUnbound ? "#unbound" : "#bound");
+    } else {
+        for (std::size_t i = 0; i < typeArgs->size(); ++i) {
+            sema::TypeRef* arg = (*typeArgs)[i]
+                                     ? ctx_.resolvedType(*(*typeArgs)[i])
+                                     : nullptr;
+            if (!arg) return unsupported("a type argument did not resolve");
+            const sema::TypeRef* inCaller =
+                substituteTypeRefLocal(arg, genericSubstSemaTy_);
+            const std::string_view gpName = ms->genericParams[i]->name;
+            newSubst[gpName] = lowerTypeRef(arg);
+            newSema[gpName] = inCaller;
+            idKeys.push_back(typeRefIdentityKey(inCaller));
+        }
     }
 
-    const bool instMethod = !isStaticMethod(ms);
+    const bool instMethod = !isStaticMethod(ms) && !extUnbound;
     // per §27.6 (v0.338): the instance is captured by reference for a class
     // receiver and BY COPY for a value-shaped one. A record receiver's env
     // holds the struct bytes (as makeMethodThunk's #5237 path); an enum,
     // choice or other value-shaped receiver has no generic thunk yet.
-    const bool recordRecv = instMethod && ms->parent &&
-        ms->parent->kind == ast::TypeDeclKind::Record;
-    if (instMethod && ms->parent &&
+    //
+    // fix #8121: an extension block's receiver is the extension's target (its
+    // `this`, §26.1). A class, interface or built-in collection receiver is a
+    // pointer; a RECORD receiver is passed to the body as a pointer to a
+    // spilled copy (§26.1 / #433), so the env holds its struct bytes.
+    const sema::TypeSymbol* recordDecl = nullptr;
+    llvm::Type* recordSt = nullptr;
+    if (extBlock) {
+        const sema::TypeRef* tt =
+            ms->extensionDecl->targetType
+                ? ctx_.resolvedType(*ms->extensionDecl->targetType)
+                : nullptr;
+        const sema::TypeRef* recvSema = tt ? substituteTypeRefLocal(tt, newSema)
+                                           : nullptr;
+        if (recvSema && recvSema->kind == sema::TypeRef::Kind::Named &&
+            recvSema->declaration &&
+            recvSema->declaration->kind == ast::TypeDeclKind::Record)
+            recordDecl = recvSema->declaration;
+        llvm::Type* recvLl = recvSema ? lowerTypeRef(recvSema) : nullptr;
+        if (!recvLl || (!recordDecl && !recvLl->isPointerTy()))
+            return unsupported("a value-shaped receiver other than a record has "
+                               "no generic thunk yet");
+        // The INSTANTIATED record's layout (a generic record's fields are
+        // laid out at the block's binding), not the declaration's template.
+        if (recordDecl) recordSt = recvLl;
+    } else if (instMethod && ms->parent &&
+               ms->parent->kind == ast::TypeDeclKind::Record) {
+        recordDecl = ms->parent;
+        recordSt = recordStruct(ms->parent);
+    }
+    const bool recordRecv = instMethod && recordDecl != nullptr;
+    if (!extBlock && instMethod && ms->parent &&
         ms->parent->kind != ast::TypeDeclKind::Class &&
         ms->parent->kind != ast::TypeDeclKind::Record)
         return unsupported("a value-shaped receiver other than a record has "
                            "no generic thunk yet");
     if (recordRecv && receiverVal && receiverVal->getType()->isPointerTy())
-        receiverVal = builder_.CreateLoad(recordStruct(ms->parent), receiverVal);
-    // The formed function type's slots, lowered in the caller's scope.
-    std::vector<llvm::Type*> thunkParamTys{ptrTy()};  // env
-    for (const auto& fp : fnTy->funcParams) {
-        if (!fp.modifier.empty()) thunkParamTys.push_back(ptrTy());
-        else thunkParamTys.push_back(lowerTypeRef(fp.type));
+        receiverVal = builder_.CreateLoad(recordSt, receiverVal);
+    // The formed function type's slots, lowered in the caller's scope. An
+    // extension block member's slots are its OWN declared parameters (and, in
+    // the unbound spelling, the receiver first) under the block's binding:
+    // the reference's recorded type may be another overload's (the §27.6
+    // selection picked `ms`).
+    struct Slot {
+        std::string_view modifier;
+        const sema::TypeRef* type = nullptr;
+    };
+    std::vector<Slot> slots;
+    const sema::TypeRef* retSema = nullptr;
+    if (extBlock) {
+        if (extUnbound) {
+            const sema::TypeRef* tt =
+                ctx_.resolvedType(*ms->extensionDecl->targetType);
+            slots.push_back({{}, substituteTypeRefLocal(tt, newSema)});
+        }
+        for (auto* psym : ms->params) {
+            auto* par = dynamic_cast<sema::ParameterSymbol*>(psym);
+            if (!par) continue;
+            const sema::TypeRef* pt =
+                par->declType ? ctx_.resolvedType(*par->declType) : nullptr;
+            if (!pt) pt = par->resolvedDeclType;
+            if (!pt) return unsupported("a parameter type did not resolve");
+            slots.push_back({par->modifier, substituteTypeRefLocal(pt, newSema)});
+        }
+        if (const sema::TypeRef* rt = sema::methodReturnResolvedType(*ms, ctx_))
+            retSema = substituteTypeRefLocal(rt, newSema);
+    } else {
+        for (const auto& fp : fnTy->funcParams)
+            slots.push_back({fp.modifier, fp.type});
+        retSema = fnTy->funcReturn;
     }
-    llvm::Type* retTy = (!fnTy->funcReturn ||
-                         fnTy->funcReturn->kind == sema::TypeRef::Kind::Unit)
+    std::vector<llvm::Type*> thunkParamTys{ptrTy()};  // env
+    for (const Slot& sl : slots) {
+        if (!sl.modifier.empty()) thunkParamTys.push_back(ptrTy());
+        else thunkParamTys.push_back(lowerTypeRef(sl.type));
+    }
+    llvm::Type* retTy = (!retSema ||
+                         retSema->kind == sema::TypeRef::Kind::Unit)
                             ? llvm::Type::getVoidTy(llvm_)
-                            : lowerTypeRef(fnTy->funcReturn);
+                            : lowerTypeRef(retSema);
     // A formation that converts representation at the target has no adapter on
     // this path (#5208's adapters are keyed on the callee's own ABI).
     if (const auto* mf = ctx_.methodRefFormation(*refExpr)) {
         const sema::TypeRef* tgt = mf->target;
         if (tgt && tgt->kind == sema::TypeRef::Kind::Function &&
-            tgt->funcParams.size() == fnTy->funcParams.size()) {
-            for (std::size_t i = 0; i < fnTy->funcParams.size(); ++i)
-                if (fnTy->funcParams[i].modifier.empty() &&
+            tgt->funcParams.size() == slots.size()) {
+            for (std::size_t i = 0; i < slots.size(); ++i)
+                if (slots[i].modifier.empty() &&
                     lowerTypeRef(tgt->funcParams[i].type) !=
                         thunkParamTys[i + 1])
                     return unsupported("the target function type changes a "
@@ -7052,7 +7193,7 @@ llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
                                    "return representation");
         }
     }
-    const FnValKind kind = closureKindForMethod(ms, false);
+    const FnValKind kind = closureKindForMethod(ms, extUnbound);
 
     auto cit = genericMethodThunks_.find({ms, idKeys});
     if (cit != genericMethodThunks_.end())
@@ -7095,12 +7236,24 @@ llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
     llvm::Value* envPtrArg = &*argIt++;
     std::vector<llvm::Value*> callArgs;
     if (recordRecv) {
-        llvm::Type* st = recordStruct(ms->parent);
+        llvm::Type* st = recordSt;
         llvm::AllocaInst* tmp = entryAlloca(st);
         builder_.CreateStore(builder_.CreateLoad(st, envPtrArg), tmp);
         callArgs.push_back(tmp);
     } else if (instMethod) {
         callArgs.push_back(builder_.CreateLoad(ptrTy(), envPtrArg));
+    } else if (extUnbound && argIt != thunk->args().end()) {
+        // fix #8121: the unbound spelling's receiver is the thunk's first
+        // user parameter; a record receiver reaches the body as a pointer to
+        // a spilled copy (§26.1 / #433), as makeMethodThunk's #1306 path does.
+        llvm::Value* recvArg = &*argIt++;
+        if (recordDecl && !recvArg->getType()->isPointerTy()) {
+            llvm::AllocaInst* tmp = entryAlloca(recvArg->getType());
+            builder_.CreateStore(recvArg, tmp);
+            callArgs.push_back(tmp);
+        } else {
+            callArgs.push_back(recvArg);
+        }
     }
     for (; argIt != thunk->args().end(); ++argIt) callArgs.push_back(&*argIt);
 
@@ -7109,6 +7262,46 @@ llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
     genericSubstSemaTy_ = std::move(newSema);
     bool emitted = false;
     llvm::Value* result = emitInlineGenericMethod(ms, callArgs, &emitted);
+    // fix #8121 (§27.6 / §28.9, v0.355): a closure CALL returns +1 for a
+    // non-nullable `string` (and a function-typed) result — the contract a
+    // lambda body keeps (LlvmBackend_Exprs2.cpp, #429/#2688) and that the
+    // non-generic method thunk inherits from the callee's own #429 return
+    // mint. The inlined generic member does not mint: an EXPRESSION body
+    // yields its raw value, and a BLOCK body's `return` keys its mint on the
+    // declared return type node, which for `T` does not resolve to `string`.
+    // So the thunk mints here, under the reference's substitution, with the
+    // lambda body's transfer exclusions; a block body whose declared return
+    // IS `string` already minted in its own `return`.
+    if (extBlock && result && retSema && result->getType()->isPointerTy() &&
+        emitted && !diverged_) {
+        CallableInfo rci;
+        const bool haveCi = callableInfo(ms, rci);
+        const ast::Expr* body =
+            haveCi && rci.bodyKind == ast::MethodBodyKind::Expression
+                ? rci.exprBody : nullptr;
+        bool declMints = false;
+        if (haveCi && rci.bodyKind == ast::MethodBodyKind::Block &&
+            rci.returnType) {
+            const sema::TypeRef* d = ctx_.resolvedType(*rci.returnType);
+            declMints = d && ((d->kind == sema::TypeRef::Kind::Primitive &&
+                               d->primitive == sema::PrimitiveType::String) ||
+                              d->kind == sema::TypeRef::Kind::Function);
+        }
+        if (haveCi && !declMints) {
+            if (!retSema->nullable &&
+                retSema->kind == sema::TypeRef::Kind::Primitive &&
+                retSema->primitive == sema::PrimitiveType::String &&
+                !(body && (isPlusOneStringProducer(body) ||
+                           returnedStringLocalOwnsPlusOne(body))))
+                emitStringRetain(result);
+            else if (retSema->kind == sema::TypeRef::Kind::Function &&
+                     !(body && (isPlusOneClosureProducer(body) ||
+                                isUserMethodClosureReturnCall(body) ||
+                                isLambdaClosureReturnCall(body) ||
+                                returnedClosureLocalOwnsPlusOne(body))))
+                emitClosureRetain(result);
+        }
+    }
     genericSubst_ = std::move(savedSubst);
     genericSubstSemaTy_ = std::move(savedSema);
 
@@ -7163,6 +7356,21 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // method at the type arguments it names, never the erased template.
     if (!ms->genericParams.empty() && refExpr)
         return makeGenericMethodThunk(ms, receiverVal, refExpr);
+    // fix #8121 (§27.6 / §26.4, v0.355): a reference over a member of a
+    // GENERIC EXTENSION BLOCK instantiates the member at the block's binding
+    // too ("the qualifier's arguments instantiate the block member the same
+    // way"), so it takes the same inline-under-substitution thunk. The
+    // block's compiled member is the i32-placeholder template (§14.1), which
+    // a thunk over `origFn` below would call at the wrong width. A member
+    // whose body is not available (an import without a re-parsed body) keeps
+    // the template thunk, as before.
+    if (genericExtBlockBinding(ctx_, ms, refExpr)) {
+        CallableInfo ci;
+        if (callableInfo(ms, ci) &&
+            (ci.bodyKind == ast::MethodBodyKind::Expression ||
+             ci.bodyKind == ast::MethodBodyKind::Block))
+            return makeGenericMethodThunk(ms, receiverVal, refExpr);
+    }
     llvm::Function* origFn = nullptr;
     auto it = methodFns_.find(ms);
     if (it != methodFns_.end()) origFn = it->second;

@@ -8561,6 +8561,16 @@ void ExprTC::checkAssignable(
                                                                   true)
                                           : buildMethodRefType(ov);
                         if (!ft) continue;
+                        // Only a candidate of the TARGET's arity is a
+                        // candidate (§27.6: the reference is resolved by the
+                        // target function type); the per-slot loops below
+                        // index `ft->funcParams` by the target's arity. Read
+                        // off the built type, so the §27.6 extension shape
+                        // (the receiver counted in the type-qualified
+                        // spelling) is measured the same way as an ordinary
+                        // method's formal count.
+                        if (ft->funcParams.size() != to->funcParams.size())
+                            continue;
                         bool modMatch = true;
                         for (std::size_t i = 0;
                              i < to->funcParams.size(); ++i) {

@@ -85,6 +85,7 @@
 
 using bezel::test::JitResult;
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -477,4 +478,298 @@ BEZEL_TEST(sema_extension_method_ref_residual_8121,
     expectStdout(arrayProgram("Console.WriteLine(a.Len2());\n"
                               "    Console.WriteLine(a.Len2(5));"),
                  "3\n5003\n");
+}
+
+// ── fix-forward (review r39-rev-8121): the AMBIGUITY diagnostic's candidates ─
+//
+// §27.6 (v0.355), *Selection among several unifying candidates*: "candidates
+// that unify only through conversion are co-equal ..., so absent an exact
+// candidate the reference is ambiguous and the compiler reports the
+// candidates." A candidate is an overload of the TARGET's arity: with
+// `M()`, `M(x: long)` and `M(x: double)` against `(int) -> int`, the two
+// one-parameter overloads both unify through a widening conversion and
+// neither is exact, so the reference is ambiguous between exactly those two.
+//
+// Measured on 2bf3d627 (the fix this row repairs): the compiler itself
+// crashed (SIGSEGV in `checkAssignable`) — the candidate loop of the
+// ambiguity diagnostic had lost its arity filter and indexed the
+// zero-parameter `M()`'s parameter list by the target's arity. With an
+// extra `M(x: long, y: int)` it listed that two-parameter overload as a
+// candidate. Both on a user class and on an extension block.
+
+namespace {
+
+const char kAmbiguousTwoCandidates[] =
+    "the method reference `M` is ambiguous against the target type "
+    "(\xC2\xA7""27.6 v0.307) \xE2\x80\x94 multiple overloads unify through "
+    "implicit conversion and none matches exactly (candidates: "
+    "`(long) -> int`, `(double) -> int`)";
+
+// `decls` declares the overloads: in the class body (`inClass`) or in an
+// extension block over the class.
+std::string ambiguityProgram(const std::string& decls, bool inClass) {
+    std::string src = "module M;\nclass V\n  public constructor() end constructor;\n";
+    if (inClass) src += decls;
+    src += "end V;\n";
+    if (!inClass) src += "extension V\n" + decls + "end;\n";
+    src += "class C\n"
+           "  public static method Main(): int\n"
+           "    var v := new V();\n"
+           "    var f: (int) -> int := v.M;\n"
+           "    Console.WriteLine(f(1));\n"
+           "    return 0;\n"
+           "  end Main;\n"
+           "end C;\n";
+    return src;
+}
+
+const char kFewerParamOverloads[] =
+    "  public method M(): int => 1;\n"
+    "  public method M(x: long): int => 2;\n"
+    "  public method M(x: double): int => 3;\n";
+
+const char kMoreParamOverloads[] =
+    "  public method M(x: long): int => 2;\n"
+    "  public method M(x: double): int => 3;\n"
+    "  public method M(x: long, y: int): int => 4;\n";
+
+}  // namespace
+
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           class_ambiguity_with_a_fewer_parameter_overload_reports_the_two_candidates) {
+    // per §27.6 (v0.355)
+    expectRejected(ambiguityProgram(kFewerParamOverloads, true),
+                   kAmbiguousTwoCandidates);
+}
+
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           extension_ambiguity_with_a_fewer_parameter_overload_reports_the_two_candidates) {
+    // per §27.6 (v0.355) + §26.5 (v0.355)
+    expectRejected(ambiguityProgram(kFewerParamOverloads, false),
+                   kAmbiguousTwoCandidates);
+}
+
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           class_ambiguity_does_not_list_a_wrong_arity_overload) {
+    // per §27.6 (v0.355)
+    expectRejected(ambiguityProgram(kMoreParamOverloads, true),
+                   kAmbiguousTwoCandidates);
+}
+
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           extension_ambiguity_does_not_list_a_wrong_arity_overload) {
+    // per §27.6 (v0.355) + §26.5 (v0.355)
+    expectRejected(ambiguityProgram(kMoreParamOverloads, false),
+                   kAmbiguousTwoCandidates);
+}
+
+// ── fix-forward (review r39-rev-8121): a GENERIC-BLOCK reference RUNS the ───
+// ── instantiated member ────────────────────────────────────────────────────
+//
+// §27.6 (v0.355): "A reference over a member of a generic extension block
+// binds the block's parameters by its qualifier ...; the qualifier's
+// arguments instantiate the block member the same way (§26.4)." So the
+// function value formed by `b.Head` (bound) or `Array<long>.Head` (type-
+// qualified) over `extension Array<T>`'s `Head(): T` returns what the call
+// `b.Head()` returns.
+//
+// Measured on 2bf3d627: sema formed `() -> long`, but the thunk called the
+// block's i32-placeholder template — `5000000000` came back as 705032704, a
+// `double` 2.5 as 0, and a heap string / class element as a truncated pointer
+// (a SEGV under ASan). The int and string-LITERAL rows above could not see it.
+// These rows run under the checked (ASan) oracle, in both spellings, and read
+// the data the thunk handles (a value above 2^32, a heap-allocated string).
+
+namespace {
+
+// The BOUND reference is formed and called in `Main`, over a local; the
+// TYPE-QUALIFIED reference is formed and called in `Show`, over the same
+// value passed as a parameter. (Kept apart on purpose: a type-qualified
+// reference called with a LOCAL collection as its receiver argument leaks
+// that collection on some compiles — measured on the #8120 base 824ad6b5
+// with a NON-generic `extension Array<int>` too, so it is not this fix's —
+// and a checked row must not depend on it.)
+std::string genericBlockProgram(const std::string& block,
+                                const std::string& recvType,
+                                const std::string& init,
+                                const std::string& bound,
+                                const std::string& qualified) {
+    return std::string("module M;\n"
+                       "class Item\n"
+                       "  public n: int;\n"
+                       "  public constructor(n: int)\n"
+                       "    this.n := n;\n"
+                       "  end constructor;\n"
+                       "end Item;\n") +
+           block +
+           "class C\n"
+           "  public static method Show(b: " + recvType + "): int\n" +
+           qualified +
+           "    return 0;\n"
+           "  end Show;\n"
+           "  public static method Main(): int\n" + init + bound +
+           "    return C.Show(b);\n"
+           "  end Main;\n"
+           "end C;\n";
+}
+
+void expectCheckedStdout(const std::string& src, const std::string& out) {
+    JitResult r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, out);
+}
+
+}  // namespace
+
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           generic_block_reference_over_a_long_array_returns_the_full_value) {
+    // per §27.6 (v0.355) + §26.4 (v0.355)
+    expectCheckedStdout(
+        genericBlockProgram(kGenericBlock, "Array<long>",
+                            "    var b: Array<long> := [5000000000L, 2L];\n",
+                            "    Console.WriteLine(b.Head());\n"
+                            "    var g: () -> long := b.Head;\n"
+                            "    Console.WriteLine(g());\n",
+                            "    var h: (Array<long>) -> long := Array<long>.Head;\n"
+                            "    Console.WriteLine(h(b));\n"),
+        "5000000000\n5000000000\n5000000000\n");
+}
+
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           generic_block_reference_over_a_double_array_returns_the_value) {
+    // per §27.6 (v0.355) + §26.4 (v0.355)
+    expectCheckedStdout(
+        genericBlockProgram(kGenericBlock, "Array<double>",
+                            "    var b: Array<double> := [2.5, 1.0];\n",
+                            "    var k: () -> double := b.Head;\n"
+                            "    Console.WriteLine(k());\n",
+                            "    var m: (Array<double>) -> double := Array<double>.Head;\n"
+                            "    Console.WriteLine(m(b));\n"),
+        "2.5\n2.5\n");
+}
+
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           generic_block_reference_over_a_heap_string_array_returns_the_string) {
+    // per §27.6 (v0.355) + §26.4 (v0.355)
+    expectCheckedStdout(
+        genericBlockProgram(kGenericBlock, "Array<string>",
+                            // The element is built in place: a heap string
+                            // bound to a local first and then copied into the
+                            // literal leaks 32 bytes with NO reference at all
+                            // (pre-existing on 824a and 2bf3d627).
+                            "    var n := 41;\n"
+                            "    var b: Array<string> := [\"v\" + n.ToString(), \"there\"];\n",
+                            // Each spelling is called TWICE: a +0 result the
+                            // closure caller releases frees the element on the
+                            // first call, so the second reads freed memory.
+                            "    var f: () -> string := b.Head;\n"
+                            "    Console.WriteLine(f());\n"
+                            "    Console.WriteLine(f());\n",
+                            "    var g: (Array<string>) -> string := Array<string>.Head;\n"
+                            "    Console.WriteLine(g(b));\n"
+                            "    Console.WriteLine(g(b));\n"),
+        "v41\nv41\nv41\nv41\n");
+}
+
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           generic_block_reference_over_an_owning_array_returns_the_element) {
+    // per §27.6 (v0.355) + §26.4 (v0.355)
+    expectCheckedStdout(
+        genericBlockProgram("extension OwningArray<T> where T: class\n"
+                            "  public method Head(): T => this[0];\n"
+                            "end;\n",
+                            "OwningArray<Item>",
+                            "    using var b: OwningArray<Item> := new OwningArray<Item>();\n"
+                            "    b.Add(new Item(5));\n",
+                            "    var f: () -> Item := b.Head;\n"
+                            "    Console.WriteLine(f().n);\n",
+                            "    var g: (OwningArray<Item>) -> Item := OwningArray<Item>.Head;\n"
+                            "    Console.WriteLine(g(b).n);\n"),
+        "5\n5\n");
+}
+
+// A block member whose PARAMETER is the block's variable: the thunk's
+// parameter is the instantiated `long` too, so the argument is not truncated.
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           generic_block_reference_with_a_type_variable_parameter_passes_the_full_value) {
+    // per §27.6 (v0.355) + §26.4 (v0.355)
+    expectCheckedStdout(
+        genericBlockProgram("extension Array<T>\n"
+                            "  public method Same(x: T): T => x;\n"
+                            "end;\n",
+                            "Array<long>",
+                            "    var b: Array<long> := [1L];\n",
+                            "    var f: (long) -> long := b.Same;\n"
+                            "    Console.WriteLine(f(6000000000L));\n",
+                            "    var g: (Array<long>, long) -> long := Array<long>.Same;\n"
+                            "    Console.WriteLine(g(b, 7000000000L));\n"),
+        "6000000000\n7000000000\n");
+}
+
+// The function value's call hands back an OWNED `string` (§28.9): a closure
+// call result is released by its caller, as a lambda body's is (#429/#2688).
+// The inlined generic member's `this[0]` is a BORROW of the element, so the
+// thunk mints the +1; a BLOCK body's `return this[0];` against a declared `T`
+// does not mint either. Measured before the mint: `bezel: fatal: refcount
+// over-release (string)` on the second call, both spellings, both bodies.
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           generic_block_reference_over_a_heap_string_array_block_body_returns_the_string) {
+    // per §27.6 (v0.355) + §26.4 (v0.355) + §28.9 (v0.355)
+    expectCheckedStdout(
+        genericBlockProgram("extension Array<T>\n"
+                            "  public method Head(): T\n"
+                            "    return this[0];\n"
+                            "  end Head;\n"
+                            "end;\n",
+                            "Array<string>",
+                            "    var n := 41;\n"
+                            "    var b: Array<string> := [\"v\" + n.ToString(), \"there\"];\n",
+                            "    var f: () -> string := b.Head;\n"
+                            "    Console.WriteLine(f());\n"
+                            "    Console.WriteLine(f());\n",
+                            "    var g: (Array<string>) -> string := Array<string>.Head;\n"
+                            "    Console.WriteLine(g(b));\n"
+                            "    Console.WriteLine(g(b));\n"),
+        "v41\nv41\nv41\nv41\n");
+}
+
+// The mint's TRANSFER side: a member that already returns +1 (a `+`
+// producer, in either body form) or a literal sentinel is not retained again
+// — a surplus +1 would leak one string per call, so the calls are looped.
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           generic_block_reference_to_a_string_producer_member_does_not_leak) {
+    // per §27.6 (v0.355) + §26.4 (v0.355) + §28.9 (v0.355)
+    expectCheckedStdout(
+        genericBlockProgram("extension Array<T>\n"
+                            "  public method Desc(): string => \"n=\" + this.Count.ToString();\n"
+                            "  public method Lit(): string => \"lit\";\n"
+                            "  public method DescB(): string\n"
+                            "    return \"m=\" + this.Count.ToString();\n"
+                            "  end DescB;\n"
+                            "end;\n",
+                            "Array<string>",
+                            "    var n := 41;\n"
+                            "    var b: Array<string> := [\"v\" + n.ToString(), \"there\"];\n"
+                            "    var i := 0;\n",
+                            "    while i < 50 do\n"
+                            "      var h: () -> string := b.Lit;\n"
+                            "      var k: () -> string := b.DescB;\n"
+                            "      var t := k();\n"
+                            "      if i = 49 then\n"
+                            "        Console.WriteLine(h());\n"
+                            "        Console.WriteLine(t);\n"
+                            "      end;\n"
+                            "      i := i + 1;\n"
+                            "    end;\n",
+                            "    var j := 0;\n"
+                            "    while j < 50 do\n"
+                            "      var g: (Array<string>) -> string := Array<string>.Desc;\n"
+                            "      var s := g(b);\n"
+                            "      if j = 49 then\n"
+                            "        Console.WriteLine(s);\n"
+                            "      end;\n"
+                            "      j := j + 1;\n"
+                            "    end;\n"),
+        "lit\nm=2\nn=2\n");
 }
