@@ -70,8 +70,17 @@
 // store, laundered through a binding, so the receiver's aliases are tracked
 // (a fixpoint over the body's local declarations) and treated as the receiver
 // itself.
+//
+// fix #8217 (§26.7 / §28.3, v0.355) adds the BUILTIN CLASS head: a builtin
+// class (`StringBuilder`, `FileStream`, a collection, a task, a sync
+// primitive) resolves with `declaration == nullptr` — the compiler has no
+// parsed AST body for it — so the receiver classification read it as a VALUE
+// receiver and the §26.7 store check never fired for one. A builtin class is
+// a heap-pointer reference, so §26.7's rule applies to it exactly as to a
+// user class.
 
 #include "ast/Node.hpp"
+#include "common/BuiltinRegistry.hpp"
 #include "ownership/Ownership.hpp"
 #include "ownership/StmtWalker.hpp"
 #include "sema/SemaContext.hpp"
@@ -397,6 +406,42 @@ void collectAliases(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
 // Is the extension's receiver a REFERENCE receiver? §26.7's store rule is
 // about a borrow; a value-kind receiver (§9.4) is COPIED by a store, so §9.4's
 // own-storage rule — not this one — governs it.
+//
+// fix #8217 (§26.7 / §28.3, v0.355): a BUILTIN CLASS head is a reference
+// receiver too. The `Named` arm used to read `if (!t->declaration) return
+// false;` — but a builtin class (`StringBuilder`, `FileStream`, a collection,
+// a task, a sync primitive) has NO parsed AST body, so its resolved TypeRef
+// carries `declaration == nullptr` (src/sema/TypeResolution_Names.cpp's
+// "nullary stdlib classes" row; the same shape §7.9's strict-storage check
+// classifies through `isBuiltinClassTypeRef`, mirrored in
+// src/sema/DefiniteAssignment.cpp and src/ownership/Ownership.cpp). The
+// early-out therefore read every builtin-class extension's receiver as a VALUE
+// receiver and the §26.7 store check never fired for one: MEASURED on the
+// base, `public extension StringBuilder { public method Into(h: Holder)
+// h.o := this; end Into; }` compiled clean (issue #8217). A builtin class IS
+// a heap-pointer reference, so §26.7's rule applies to it exactly as to a
+// user class.
+//
+// The classification reads the BuiltinRegistry snapshot — the authority the
+// rest of the compiler reads for these heads — and not a second hand-list.
+// The VALUE-shaped builtins (DateTime/TimeSpan/Guid/Range/Span/… and
+// `CancellationToken`, a `public record` per stdlib §6.1) are excluded: a
+// value-kind receiver is COPIED by a store, so §9.4's own-storage rule
+// governs it, not §26.7's.
+bool isBuiltinClassReceiver(const sema::TypeRef* t) {
+    if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+    if (t->declaration) return false;
+    std::string_view n = t->headName();
+    if (n.empty()) return false;
+    // A value-or-record builtin: §9.4's value-receiver rule governs it.
+    if (sema::isValueBuiltinByName(n)) return false;
+    // §31's builtin exception hierarchy — heap-allocated class types with no
+    // parsed AST body, so they are outside the two BuiltinRegistry tables.
+    if (common::isBuiltinExceptionName(n)) return true;
+    return common::isReservedBuiltinTypeName(n) &&
+           common::isHeapPointerReferenceBuiltin(n);
+}
+
 bool receiverIsReference(const ast::ExtensionDecl& ext, sema::SemaContext& ctx) {
     if (!ext.targetType) return false;
     const sema::TypeRef* t = ctx.resolvedType(*ext.targetType);
@@ -406,7 +451,7 @@ bool receiverIsReference(const ast::ExtensionDecl& ext, sema::SemaContext& ctx) 
             // §4: `Object` is the root reference type.
             return t->primitive == sema::PrimitiveType::Object;
         case sema::TypeRef::Kind::Named: {
-            if (!t->declaration) return false;
+            if (!t->declaration) return isBuiltinClassReceiver(t);
             if (t->declaration->isValueBuiltin) return false;
             return t->declaration->kind == ast::TypeDeclKind::Class ||
                    t->declaration->kind == ast::TypeDeclKind::Interface;
