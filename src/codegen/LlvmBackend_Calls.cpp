@@ -10694,15 +10694,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // Convenience predicate: is this a borrowing Dictionary<K, string>?
         //   RuntimeManaged + non-nullable string primitive + NOT owning.
         // Mirrors isStringValueDict (same exclusions: OwningDictionary excluded,
-        // nullable string? excluded, function types share RuntimeManaged but
-        // use a different release path — same string-vs-function distinction).
+        // function types share RuntimeManaged but use a different release path
+        // — same string-vs-function distinction). fix #8207 (§28.9, v0.355):
+        // `string?` is the same runtime-managed row as `string` (null is the
+        // null-safe retain/release no-op), so it is NOT excluded.
         bool dictIsStringValue =
             !dictValIsOwning &&
             dictValPol.cat == ElementPolicy::Category::RuntimeManaged &&
             valTy &&
             valTy->kind == sema::TypeRef::Kind::Primitive &&
-            valTy->primitive == sema::PrimitiveType::String &&
-            !valTy->nullable;
+            valTy->primitive == sema::PrimitiveType::String;
         // dictValClassDisposer: non-null for OwningDictionary<K, class-or-interface V>.
         // Derived from dictValPol (elementPolicyFor) which now handles both Class
         // and Interface correctly per §28.11 v0.135 fix #619.

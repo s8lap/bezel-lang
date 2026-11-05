@@ -2065,7 +2065,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     if (!valDisp) valDisp = dictValueBoxFreer(recvTy);
     // isStrVal: borrowing Dictionary<K, string> — detect via elementPolicyFor.
     bool isStrVal =
-        !dictIsOwning2 && dictValTy2 && !dictValTy2->nullable &&
+        !dictIsOwning2 && dictValTy2 &&
         dictValTy2->kind == sema::TypeRef::Kind::Primitive &&
         dictValTy2->primitive == sema::PrimitiveType::String &&
         elementPolicyFor(dictValTy2, /*owning=*/false).cat ==
@@ -5416,7 +5416,7 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
             !recvTy->astNode->name->parts.empty() &&
             recvTy->headName() == "OwningDictionary";
         bool isStrValDict =
-            !dictIsOwningC && valTy && !valTy->nullable &&
+            !dictIsOwningC && valTy &&
             valTy->kind == sema::TypeRef::Kind::Primitive &&
             valTy->primitive == sema::PrimitiveType::String &&
             elementPolicyFor(valTy, /*owning=*/false).cat ==
@@ -10971,11 +10971,9 @@ void Emitter::dictSnapshotValueDisposers(const sema::TypeRef* dictTy,
     // `bz_string*`. Releasing at the source free can drop the last reference
     // while the snapshot still points at it; letting the snapshot INHERIT the
     // table's +1 and release it at slot-1 Dispose keeps the accounting exact
-    // and the bytes alive for the whole iteration. The `!nullable` guard
-    // mirrors the scope-end and freeLinkedListSourceNow spellings — a nullable
-    // string value is never retained at construction, so there is no +1 to
-    // discharge.
-    if (!owning && !valTy->nullable &&
+    // and the bytes alive for the whole iteration. fix #8207 (§28.9, v0.355):
+    // a `string?` value is the same runtime-managed row (null is a no-op).
+    if (!owning &&
         valTy->kind == sema::TypeRef::Kind::Primitive &&
         valTy->primitive == sema::PrimitiveType::String &&
         elementPolicyFor(valTy, /*owning=*/false).cat ==

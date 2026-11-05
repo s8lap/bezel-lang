@@ -22750,7 +22750,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                         const sema::TypeRef* dictVal =
                             (dt->genericArgs.size() > 1) ? dt->genericArgs[1]
                                                         : nullptr;
-                        if (dictVal && !dictVal->nullable) {
+                        if (dictVal) {
                             ElementPolicy dvp = elementPolicyFor(dictVal, false);
                             if (dvp.cat == ElementPolicy::Category::RuntimeManaged &&
                                 dictVal->kind == sema::TypeRef::Kind::Primitive &&
@@ -24061,7 +24061,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 const sema::TypeRef* dictVal =
                     (dictTy->genericArgs.size() > 1) ? dictTy->genericArgs[1]
                                                      : nullptr;
-                if (dictVal && !dictVal->nullable) {
+                if (dictVal) {
                     ElementPolicy dvp = elementPolicyFor(dictVal, false);
                     if (dvp.cat == ElementPolicy::Category::RuntimeManaged &&
                             dictVal->kind == sema::TypeRef::Kind::Primitive &&
@@ -50791,7 +50791,7 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
         !dictTy->astNode->name->parts.empty() &&
         common::isOwningPrefixedName(dictTy->headName());
     bool dictIsStringValue =
-        !dictValIsOwning && valTy && !valTy->nullable &&
+        !dictValIsOwning && valTy &&
         valTy->kind == sema::TypeRef::Kind::Primitive &&
         valTy->primitive == sema::PrimitiveType::String &&
         elementPolicyFor(valTy, /*owning=*/false).cat ==
