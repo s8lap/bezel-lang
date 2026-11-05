@@ -1175,6 +1175,15 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 if (sit != genericSubst_.end())
                     return sit->second;
             }
+            // narrow #7792 (stdlib §2.1 / §7.4, v0.355): the built-in
+            // `TextWriter` is the i32 descriptor of its standard stream
+            // (`Console.Out` = 1, `Console.Error` = 2). Its nullable form is
+            // the `{i8, i32}` carrier, taken by the isNullableValueTy arm at
+            // the top. Until this arm the non-nullable form reached the i32
+            // only through the bare-type-parameter fallback at the end of this
+            // switch; now that isBuiltinTypeRefName names it (so it is never a
+            // type parameter), it is lowered here on purpose.
+            if (!rt->nullable && isBuiltinTextWriterTypeRef(rt)) return i32();
             // §32.5 / §32.7 / stdlib §10: FFI-boundary types. IntPtr and
             // UIntPtr are pointer-sized integers — on the host target that is
             // 64-bit, so they lower to i64. CString/WString/RawBytes are

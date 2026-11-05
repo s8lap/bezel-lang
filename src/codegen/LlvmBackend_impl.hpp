@@ -24916,6 +24916,25 @@ private:
         // header for why the test must be negative and why completeness is
         // load-bearing).
         if (common::isReservedBuiltinTypeName(name)) return true;
+        // narrow #7792 (stdlib §2.1 / §7.4, v0.355): the built-in `TextWriter`
+        // is a value — the i32 standard-stream descriptor — with its own
+        // lowerTypeRef / nullableValueStructTy arms (isBuiltinTextWriterTypeRef
+        // is the family predicate). It is in NEITHER registry table: the
+        // non-heap table carries sema meaning this unit has not ruled on
+        // (§17.7's closed-constructor arms, the Ownership `Borrowed` state of
+        // a value-builtin construction, the value-builtin → primitive
+        // conversion diagnostic), and the heap table would make it a `ptr`.
+        // Without this row the declaration-less single-part name read as a
+        // BARE TYPE PARAMETER to every consumer of this predicate:
+        // isUnboundTemplateArg said `new Box<TextWriter?>(...)` was an
+        // all-unbound template instantiation, so lowerNew installed no
+        // substitution and allocated / constructed the ERASED `{ptr, i8, i32}`
+        // while every read of `b.v` GEP'd the specialized
+        // `{ptr, i8, {i8, i32}}` (an 8-byte read at offset 12 — ASan
+        // heap-buffer-overflow, the stream written through descriptor 0).
+        // The same name-keyed row the §7.9 field-default rule already carries
+        // (DefiniteAssignment.cpp / Ownership.cpp, `n == "TextWriter"`).
+        if (name == "TextWriter") return true;
         // §31.4: a built-in exception type (Exception / a subtype). Kept local
         // because `builtinVtable_` is a live per-module map, not a duplicated
         // name list — it cannot drift from a table it does not copy.

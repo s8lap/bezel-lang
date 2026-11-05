@@ -164,11 +164,24 @@ Fd0TrapOutcome runWithFd0Trap(const std::string& source) {
     }
     Fd0TrapOutcome o;
     bezel::Driver driver;
-    bezel::CompileResult r = driver.compileFile(src, exe);
+    // narrow #7792, fourth fix-forward: a hand-rolled `driver.compileFile`
+    // runner does not honour `BEZEL_AOT_FORCE_SANITIZE` by itself
+    // (docs/ops/lane-contract.md item 8), so under the ASan sweep this runner
+    // was blind to the heap-buffer-overflow the generic-construction rows
+    // below pin. Mirror `runAot`: the sweep's one bit becomes
+    // `opts.sanitizeAddress`, and the child runs with the same
+    // `detect_leaks=0:abort_on_error=0` options `runAot` uses, so a fired
+    // report is a non-zero exit (97) that `expectStreams` refuses.
+    bezel::codegen::CodegenOptions opts;
+    opts.sanitizeAddress = bezel::test::forceSanitizeAddress();
+    bezel::CompileResult r = driver.compileFile(src, exe, /*deps=*/{}, opts);
     o.compiled = r.success;
     if (r.success) {
         pid_t pid = ::fork();
         if (pid == 0) {
+            if (opts.sanitizeAddress)
+                ::setenv("ASAN_OPTIONS",
+                         "detect_leaks=0:abort_on_error=0:exitcode=97", 1);
             int fd0 = ::open(fd0f.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
             int fd1 = ::open(outf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
             int fd2 = ::open(errf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -1027,4 +1040,180 @@ BEZEL_TEST(textwriter_value_7792, nullable_controls_under_fd0_trap_7_4) {
         "var p: TextWriter? := Console.Out; p ??= Console.Error; p!.WriteLine(\"co\"); "
         "Console.WriteLine(n = null); Console.WriteLine(m <> null);"));
     expectStreams(o, "co\nFalse\nTrue\nend\n", "ce\nce2\nce3\nce4\nce5\n");
+}
+
+// ---------------------------------------------------------------------------
+// narrow #7792, fourth fix-forward (stdlib §2.1 / §7.4; spec §14.1, §9.1,
+// v0.355): a GENERIC class or record instantiated at `TextWriter?` /
+// `TextWriter` where EVERY type argument is TextWriter-shaped. The built-in
+// `TextWriter` was not a name codegen's `isBuiltinTypeRefName` knew, so to
+// `isUnboundTemplateArg` the type-argument list `<TextWriter?>` read as a
+// list of BARE TYPE PARAMETERS: `lowerNew` installed no substitution and
+// allocated / constructed the ERASED `%class.Box = {ptr, i8, i32}` while every
+// read of `b.v` GEP'd the specialized `{ptr, i8, {i8, i32}}`. MEASURED on
+// 5907d0b2 with the fd-0 trap: `new Box<TextWriter?>(Console.Error)` then
+// `b.v!.WriteLine("b01")` wrote 4 bytes through DESCRIPTOR 0 and stderr stayed
+// empty (ASan: heap-buffer-overflow, an 8-byte read at offset 12); the generic
+// record `G<T>(V: T)` lost the write; `Pair<TextWriter?, TextWriter>` sent one
+// write to stdout and the other to fd 0. A mixed list (`Pair<int,
+// TextWriter?>`) was correct because the `int` forced the substitution. Each
+// row asserts the stdout AND stderr text and that fd 0 received nothing.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const char* kGenDecls =
+    "class Box<T> public v: T; public constructor(x: T) v := x; end constructor; "
+    "public method Get(): T return v; end Get; "
+    "public static method Of(x: T): owned Box<T> return new Box<T>(x); end Of; "
+    "end Box; "
+    "class Two<T> public a: T; public b: T; "
+    "public constructor(x: T, y: T) a := x; b := y; end constructor; end Two; "
+    "class Lab<T> public n: int; public v: T; "
+    "public constructor(k: int, x: T) n := k; v := x; end constructor; end Lab; "
+    "class Pair<A, B> public a: A; public b: B; "
+    "public constructor(x: A, y: B) a := x; b := y; end constructor; end Pair; "
+    "class Opt<T> public v: T?; public constructor(x: T?) v := x; end constructor; "
+    "end Opt; "
+    "public record G<T>(V: T); public record P2<A, B>(X: A, Y: B); ";
+
+}  // namespace
+
+// b01 / r14: the review's repro -- `new Box<TextWriter?>(Console.Error)`,
+// read through `!`, through `??`, and after a `null` store.
+BEZEL_TEST(textwriter_value_7792, generic_class_ctor_at_textwriter_nullable_14_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var b := new Box<TextWriter?>(Console.Error); b.v!.WriteLine(\"b01\"); "
+        "(b.v ?? Console.Out).WriteLine(\"r14\"); b.v := null; "
+        "(b.v ?? Console.Out).WriteLine(\"r14b\"); Console.WriteLine(b.v = null);",
+        kGenDecls));
+    expectStreams(o, "r14b\nTrue\nend\n", "b01\nr14\n");
+}
+
+// b02 / b03 / b06 / b09 / b14: the constructed value held in a typed, a
+// nullable-typed and an inferred local, `Console.Out` as the argument, and a
+// read through the generic `Get(): T` method.
+BEZEL_TEST(textwriter_value_7792, generic_class_ctor_locals_and_get_14_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var t: Box<TextWriter?> := new Box<TextWriter?>(Console.Error); "
+        "t.v!.WriteLine(\"b02\"); "
+        "var n: Box<TextWriter?>? := new Box<TextWriter?>(Console.Error); "
+        "n!.v!.WriteLine(\"b03\"); "
+        "var u := new Box<TextWriter?>(Console.Out); (u.v ?? Console.Error).WriteLine(\"b09\"); "
+        "var g := new Box<TextWriter?>(Console.Error); "
+        "(g.Get() ?? Console.Out).WriteLine(\"b14\");",
+        kGenDecls));
+    expectStreams(o, "b09\nend\n", "b02\nb03\nb14\n");
+}
+
+// b10: the generic RECORD `G<T>(V: T)` (§9.1) at `TextWriter?`, with a
+// stream and with `null`.
+BEZEL_TEST(textwriter_value_7792, generic_record_ctor_at_textwriter_nullable_9_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var g := new G<TextWriter?>(Console.Error); (g.V ?? Console.Out).WriteLine(\"b10\"); "
+        "var h := new G<TextWriter?>(null); (h.V ?? Console.Out).WriteLine(\"b10b\"); "
+        "Console.WriteLine(h.V = null);",
+        kGenDecls));
+    expectStreams(o, "b10b\nTrue\nend\n", "b10\n");
+}
+
+// b18 / b19: two `T` fields with one `null`, and an `int` field DECLARED
+// before the `T` field.
+BEZEL_TEST(textwriter_value_7792, generic_class_two_t_fields_and_int_first_14_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var t := new Two<TextWriter?>(Console.Error, null); "
+        "(t.a ?? Console.Out).WriteLine(\"b18\"); (t.b ?? Console.Out).WriteLine(\"b18b\"); "
+        "var l := new Lab<TextWriter?>(1, Console.Error); "
+        "(l.v ?? Console.Out).WriteLine(\"b19\"); Console.WriteLine(l.n);",
+        kGenDecls));
+    expectStreams(o, "b18b\n1\nend\n", "b18\nb19\n");
+}
+
+// b24: two type parameters, BOTH TextWriter-shaped -- `<TextWriter?,
+// TextWriter>` and `<TextWriter?, TextWriter?>` -- as a class and as a record.
+BEZEL_TEST(textwriter_value_7792, generic_pair_both_args_textwriter_shaped_14_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var p := new Pair<TextWriter?, TextWriter>(Console.Error, Console.Out); "
+        "(p.a ?? Console.Out).WriteLine(\"b24\"); p.b.WriteLine(\"b24b\"); "
+        "var q := new Pair<TextWriter?, TextWriter?>(Console.Error, null); "
+        "(q.a ?? Console.Out).WriteLine(\"s10\"); (q.b ?? Console.Out).WriteLine(\"s10b\"); "
+        "var r := new P2<TextWriter?, TextWriter>(Console.Error, Console.Out); "
+        "(r.X ?? Console.Out).WriteLine(\"s06\"); r.Y.WriteLine(\"s06b\"); "
+        "var s := new P2<TextWriter, TextWriter>(Console.Error, Console.Out); "
+        "s.X.WriteLine(\"s06c\"); s.Y.WriteLine(\"s06d\");",
+        kGenDecls));
+    expectStreams(o, "b24b\ns10b\ns06b\ns06d\nend\n", "b24\ns10\ns06\ns06c\n");
+}
+
+// The siblings of the `new` site that ask the same "is this type-argument
+// list resolved?" question: a static method of the generic class, a generic
+// static method instantiated at `TextWriter?`, an explicit `Id<TextWriter?>`,
+// `default(TextWriter?)`, and a `T?` field at `T = TextWriter`.
+BEZEL_TEST(textwriter_value_7792, generic_siblings_static_id_default_14_1) {
+    auto o = runWithFd0Trap(
+        std::string("module M; ") + kGenDecls +
+        "class P static method Id<T>(x: T): T return x; end Id; "
+        "static method Mk<T>(x: T): owned Box<T> return new Box<T>(x); end Mk; "
+        "public static method Main() "
+        "using var a := Box<TextWriter?>.Of(Console.Error); (a.v ?? Console.Out).WriteLine(\"s01\"); "
+        "using var m := Mk<TextWriter?>(Console.Error); (m.v ?? Console.Out).WriteLine(\"s01b\"); "
+        "var n: TextWriter? := Console.Error; (Id<TextWriter?>(n) ?? Console.Out).WriteLine(\"s02\"); "
+        "Id<TextWriter>(Console.Out).WriteLine(\"s02b\"); "
+        "var d: TextWriter? := default(TextWriter?); (d ?? Console.Error).WriteLine(\"s03\"); "
+        "var o := new Opt<TextWriter>(Console.Error); (o.v ?? Console.Out).WriteLine(\"s14\"); "
+        "var z := new Opt<TextWriter>(null); (z.v ?? Console.Error).WriteLine(\"s14b\"); "
+        "Console.WriteLine(\"end\"); end Main; end P;");
+    expectStreams(o, "s02b\nend\n", "s01\ns01b\ns02\ns03\ns14\ns14b\n");
+}
+
+// Array-of-generic: an `Array<Box<TextWriter?>>` holding a local's box, and an
+// `Array<G<TextWriter?>>` of generic records.
+BEZEL_TEST(textwriter_value_7792, generic_array_of_box_and_record_14_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var b0 := new Box<TextWriter?>(Console.Error); "
+        "var arr := new Array<Box<TextWriter?>>(); arr.Add(b0); "
+        "(arr[0].v ?? Console.Out).WriteLine(\"s04a\"); "
+        "var ga := new Array<G<TextWriter?>>(); ga.Add(new G<TextWriter?>(Console.Error)); "
+        "ga.Add(new G<TextWriter?>(null)); "
+        "(ga[0].V ?? Console.Out).WriteLine(\"s04c\"); (ga[1].V ?? Console.Out).WriteLine(\"s04d\");",
+        kGenDecls));
+    expectStreams(o, "s04d\nend\n", "s04a\ns04c\n");
+}
+
+// 200 constructions of the class and the record in a loop (the ASan leg: an
+// erased allocation read through the specialized layout is a
+// heap-buffer-overflow on every iteration), then the controls `Box<int>`,
+// `Box<string>` and `Box<int?>`, whose layouts must not change.
+BEZEL_TEST(textwriter_value_7792, generic_ctor_loop_200_and_value_controls_14_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var k := 0; for var i in 0..<200 do "
+        "var b := new Box<TextWriter?>(Console.Error); "
+        "var g := new G<TextWriter?>(Console.Error); "
+        "if b.v <> null then k := k + 1; end; if g.V <> null then k := k + 1; end; "
+        "end for; Console.WriteLine(k); "
+        "var bi := new Box<int>(5); Console.WriteLine(bi.v); "
+        "var bs := new Box<string>(\"str\"); Console.WriteLine(bs.v); "
+        "var bn := new Box<int?>(7); Console.WriteLine(bn.v ?? 0); "
+        "var gi := new G<int?>(9); Console.WriteLine(gi.V ?? 0);",
+        kGenDecls));
+    expectStreams(o, "400\n5\nstr\n7\n9\nend\n", "");
+}
+
+// Nested: a `Box<Box<TextWriter?>>` and a `Box<G<TextWriter?>>` whose inner
+// box / record is read through a local. MEASURED on 5907d0b2: the inner
+// `Box<TextWriter?>` was constructed at the erased layout, so the inner read
+// wrote 3 bytes through descriptor 0 (`v1`) and the record's write was lost
+// (`v7`). The CHAINED read `bb.v.v` of a nullable value built-in through two
+// generic instantiations is a separate, pre-existing defect (base-identical
+// for `Box<Box<Guid?>>`), tracked as #8269; it is not pinned here.
+BEZEL_TEST(textwriter_value_7792, generic_nested_box_read_through_local_14_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var bb := new Box<Box<TextWriter?>>(new Box<TextWriter?>(Console.Error)); "
+        "var inner := bb.v; (inner.v ?? Console.Out).WriteLine(\"v1\"); "
+        "var bg := new Box<G<TextWriter?>>(new G<TextWriter?>(Console.Error)); "
+        "var ig := bg.v; (ig.V ?? Console.Out).WriteLine(\"v7\"); "
+        "var bn := new Box<Box<TextWriter>>(new Box<TextWriter>(Console.Out)); "
+        "var inn := bn.v; inn.v.WriteLine(\"v8\");",
+        kGenDecls));
+    expectStreams(o, "v8\nend\n", "v1\nv7\n");
 }
