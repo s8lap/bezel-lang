@@ -1155,8 +1155,61 @@ bool ExprTC::linqIComparableProvablyViolated(const TypeRef* elem) const {
             return elem->nullable || elem->primitive == PrimitiveType::Bool;
         case TypeRef::Kind::Named: {
             // fix #8181: an UNCONSTRAINED type parameter in scope (rule 6).
-            if (!elem->declaration)
-                return linqElemIsUnconstrainedTypeParam(elem);
+            if (!elem->declaration) {
+                if (linqElemIsUnconstrainedTypeParam(elem)) return true;
+                // fix #8199 (spec §14.2 *Interface conformance* rule 1, §26.5.1
+                // *Applicability*, stdlib §5.1, v0.355): a DECLARATION-LESS
+                // BUILTIN CLASS element (`Array<int>`, `Dictionary<K,V>`,
+                // `Set<T>`, … — the shape every builtin generic class carries)
+                // was not decided here, so the §5 `Min()`/`Max()` candidate
+                // stayed APPLICABLE at it and BEAT a user's applicable
+                // `extension Object { Min() }` (§26.5 rule 3's "most specific
+                // type wins" is a rule over the APPLICABLE candidates), and
+                // CODEGEN's #2770 guard then refused the call:
+                //
+                //   Min() without a selector requires the element type to
+                //   satisfy `T: IComparable<T>` (stdlib §5.1 / spec §14.2 /
+                //   #2770); `Array` does not — its `CompareTo` could not be
+                //   resolved for dispatch.
+                //
+                // THE DECIDING SENTENCE — spec §14.2 rule 1: "T is a class
+                // that lists I (or any interface extending I) in its
+                // inheritance clause, that inherits from a class which conforms
+                // to I". A builtin class lists NO interface at all, so it does
+                // not conform to `IComparable<Self>` and the §5.1 constraint
+                // is PROVABLY unsatisfied: the §5 candidate is DROPPED and the
+                // user's extension answers (issue #8199).
+                //
+                // The three answers, in the order the shapes are told apart:
+                //   * an UNCONSTRAINED type parameter in scope (rule 6) —
+                //     already decided by #8181, above;
+                //   * a CONSTRAINED type parameter — NOT decided here (the
+                //     sound direction): the §5 candidate is KEPT and the §5.1
+                //     gate decides at the instantiation;
+                //   * anything else that carries no `declaration` is a BUILTIN,
+                //     and a builtin is comparable only where the standard
+                //     library declares `IComparable<Self>` on it — stdlib
+                //     §2.5 does so for `DateTime`, `TimeSpan`, `DateOnly` and
+                //     `TimeOnly`, and for nothing else.
+                //
+                // The builtin-vs-type-parameter test is `isInScopeTypeParamRef`
+                // — the resolver's own POSITIVE test for "this spelling bound
+                // to a type-parameter marker", with the reserved-builtin
+                // registry as its fallback — so a builtin the registry does
+                // not know is KEPT rather than dropped: this filter's sound
+                // direction is to keep every element whose conformance is not
+                // PROVABLY absent.
+                //
+                // The one comparable builtin family is read with
+                // `mathOrderedTimeValueHead` — the SAME helper the §5.1 gate
+                // uses for its built-in value-record arm (#8092/#8049) — so the
+                // filter and the gate cannot disagree: both accept
+                // `DateTime`/`TimeSpan`/`DateOnly`/`TimeOnly`, and both
+                // decline `Guid` (a 128-bit struct the gate has always
+                // refused).
+                if (isInScopeTypeParamRef(elem)) return false;
+                return mathOrderedTimeValueHead(elem).empty();
+            }
             // A nullable element is not decided here.
             if (elem->nullable) return false;
             const auto k = elem->declaration->kind;
