@@ -8,7 +8,7 @@
 //!   from the target
 //! cites: 27.6, 14.5
 //! expect: reject
-//! diagnostic: type parameters
+//! diagnostic: type parameter
 //! notes: Exactly 1 error on the staging tip, all the quoted one; the
 //!   accepting twin (the reference replaced by a call, or the
 //!   ambiguity removed) compiles.

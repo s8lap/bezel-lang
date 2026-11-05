@@ -6,7 +6,7 @@
 //! rule: When no target type is available (e.g., `var f := Math.Abs;` with
 //!   no annotation), the reference is ambiguous and the compiler
 //!   reports an error pointing to the candidate overloads.
-//! cites: 18.5, 17.9
+//! cites: 18.5, 7.5
 //! expect: reject
 //! diagnostic: no target type
 //! issue: 8205
