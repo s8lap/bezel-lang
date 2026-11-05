@@ -4148,6 +4148,51 @@ private:
     // borrow (store-to-field, out/ref param, multi-hop alias, closure
     // capture). // per §28.3, §31.1
     bool isEscapeBoundLocal(sema::Symbol* sym) const;
+
+    // fix #8165 (§28.3 *Producers*, §28.3.8, §28.3.9, stdlib §9.6, v0.355): is
+    // `e` a FRESH OWNED builtin `Array<T>` PRODUCTION — the stdlib's
+    // `owned`-returning materializer (`t.Split(",")`, `s.ToCharArray()`,
+    // `xs.ToArray()`, `xs.Sorted()`, `xs.Reversed()`), in the `.` and `?.`
+    // spellings, or the `??` form whose BOTH arms are such calls (so exactly
+    // one arm runs and the binding owns ONE fresh array)?
+    //
+    // The call form is `common::isFreshOwnedArrayMaterializerCall` — the ONE
+    // authority, shared with codegen's scope-end reclaim
+    // (`isFreshBorrowingArrayMaterializerLocal` /
+    // `isFreshOwnerlessArrayMaterializerExpr`), so "this production is a
+    // fresh `Array<T>` the binding solely owns" and "codegen frees it at the
+    // end of the binding's scope" cannot drift apart.
+    bool isFreshOwnedArrayMaterializerExpr(const ast::Expr& e) const;
+
+    // fix #8165 (§28.3 *Producers*, §28.3.8, §28.3.9, stdlib §9.6, v0.355): is
+    // `sym` a LOCAL whose DECLARED production is such a fresh owned `Array<T>`?
+    //
+    // WHY THIS EXISTS. The ownership pass classifies such a local **Borrowed**,
+    // because `producerState` reads a builtin callee's `owned` marker from an
+    // `ast::MethodDecl` and a builtin member resolves none — the gap
+    // `common::isBuiltinOwnedMaterializerCall`'s header records. But the
+    // production IS owned (stdlib §9.6 declares `Split` / `ToCharArray` as
+    // `owned Array<T>`; §5 declares `ToArray`), the binding SOLELY owns the
+    // array, and codegen reclaims it at the END OF THE BINDING'S SCOPE. So for
+    // §28.3's BORROW-LIFETIME rules the binding is an OWNED local: its value
+    // dies at the end of its scope, so a borrow of it may not outlive it
+    // (§28.3.8's closure bullet and the "borrow assigned to a local whose
+    // scope strictly encloses the source's" bullet) and the owner may not be
+    // overwritten while a borrow of it is live (§28.3.9's consume-site
+    // freeze). The class-instance twin (`var a := new Item(1);`) is rejected
+    // on both channels; this predicate makes the Array-materializer twin
+    // agree.
+    //
+    // IT IS NOT A DISPOSAL CHANGE. `producerState` still classifies the
+    // production Borrowed, and no state changes: reclassifying it Owned would
+    // arm §28.3's auto-drop and register a SECOND free on top of codegen's
+    // scope-end reclaim — the double-free direction
+    // `common::isBuiltinOwnedMaterializerCall`'s header declines. This
+    // predicate is consulted ONLY by the two borrow-lifetime channels.
+    //
+    // The DECLARED production is what it reads (the binding's initializer),
+    // because the production is what the scope-end reclaim frees.
+    bool isFreshOwnedArrayMaterializerLocal(sema::Symbol* sym) const;
     // fix #6296 (§28.3 *Provenance* clause 1, v0.338): is `sym` a binding of
     // FUNCTION type — a closure value, the one binding kind that carries a
     // capture-source set ("a captured function value its own set,

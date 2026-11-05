@@ -7285,6 +7285,44 @@ bool MethodOwnership::isEscapeBoundLocal(sema::Symbol* sym) const {
     return isOwnedTrackedLocal(sym) || isCatchBorrow(sym);
 }
 
+// fix #8165 (§28.3 *Producers*, §28.3.8, §28.3.9, stdlib §9.6, v0.355): see
+// the declaration in Ownership_impl.hpp for the full rationale.
+bool MethodOwnership::isFreshOwnedArrayMaterializerExpr(
+        const ast::Expr& e) const {
+    // The `??` form (fix #8153, stdlib §9.6): BOTH arms are fresh materializers,
+    // so exactly one arm runs and the binding owns ONE fresh array — the same
+    // shape codegen's `isFreshBorrowingArrayMaterializerLocal` Branch C
+    // reclaims at scope end. An arm that is anything else (a named array, a
+    // literal) declines the whole production: a named arm would be freed by
+    // two owners.
+    if (const auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->op != "??") return false;
+        if (!be->left || !be->right) return false;
+        return isFreshOwnedArrayMaterializerExpr(*be->left.get()) &&
+               isFreshOwnedArrayMaterializerExpr(*be->right.get());
+    }
+    const auto* call = dynamic_cast<const ast::CallExpr*>(&e);
+    if (!call) return false;
+    return common::isFreshOwnedArrayMaterializerCall(*call, ctx_);
+}
+
+// fix #8165 (§28.3 *Producers*, §28.3.8, §28.3.9, stdlib §9.6, v0.355): see
+// the declaration in Ownership_impl.hpp for the full rationale.
+bool MethodOwnership::isFreshOwnedArrayMaterializerLocal(
+        sema::Symbol* sym) const {
+    if (!sym) return false;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls || !ls->decl) return false;
+    // The binding's DECLARATION: a plain `var` or a `using var` (both are
+    // `ast::LocalDecl`; a `const` is a `LocalConstDecl` and is excluded, as
+    // it is by §21.1's rejection of a `const` over an owned production). A
+    // for-loop induction variable's `decl` is the `ForStmt` itself, so the
+    // cast declines it.
+    const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    if (!ld || !ld->initializer) return false;
+    return isFreshOwnedArrayMaterializerExpr(*ld->initializer);
+}
+
 bool MethodOwnership::isRefOutParam(sema::Symbol* sym) const {
     // §27.5 / §28.6 (#1217): a plain ref/out parameter (not "out owned" —
     // that is an ownership-transfer parameter handled separately). A ref/out
@@ -7976,8 +8014,19 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
                 dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
             // A value-typed result is a copy, never a borrow (§28.3
             // "value-typed returns"), so the same type gate as Shape 1.
+            //
+            // fix #8165 (§28.3.9, §28.7, v0.355): Shape 1's widened gate
+            // too — `isBorrowableType` answers false for a declaration-less
+            // builtin class head, so `var d := a.Id();` over an
+            // `Array<string>` (an extension returning `this`) was never a
+            // borrow of `a` and the consume-site freeze could not see `d`,
+            // while the class twin (`var d := a.Me();` over a user class)
+            // is caught. // per §28.3, §28.7
+            const bool mayBorrow =
+                returnedExprMayBorrow(rhs) ||
+                isBorrowableOwnedSinkType(ctx_.exprType(rhs));
             if (!isAsync && !md->returnOwned && ma && ma->target &&
-                returnedExprMayBorrow(rhs) &&
+                mayBorrow &&
                 methodReturnsOnlyReceiverSourcedBorrows(*md))
                 return borrowSourceForExpr(*ma->target);
             // fix #5254 (§28.3, v0.313): an interface-dispatched call whose
@@ -7991,7 +8040,7 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             // receiver's source, exactly as the concrete-method arm above does.
             if (!isAsync && !md->returnOwned && ma && ma->target &&
                 md->bodyKind == ast::MethodBodyKind::Abstract &&
-                returnedExprMayBorrow(rhs))
+                mayBorrow)
                 return borrowSourceForExpr(*ma->target);
         }
     }
@@ -8035,12 +8084,46 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
         // decides: per §28.3 K1.5, "an unmarked read of an owned binding is
         // a borrow of the binding" whatever the reader's type is.
         // See objectTypedOwnedRootBorrowSource's own comment.
-        if (returnedExprMayBorrow(rhs) ||
-            objectTypedOwnedRootBorrowSource(rhs) != nullptr) {
+        // fix #8165 (§28.3 *Producers* / §28.3.8 / §28.3.9, v0.355): the
+        // borrow-vs-copy gate reads `isBorrowableType`, which answers FALSE
+        // for a DECLARATION-LESS builtin CLASS head (`Array<T>` has no user
+        // `TypeDecl`; the null-declaration branch recognizes only the
+        // builtin-exception hierarchy positively). So `var b := a;` over a
+        // fresh materializer local `var a := t.Split(",");` was never a
+        // borrow of `a`, and the consume-site freeze could not see `b` —
+        // while the class-instance twin (a user class, which
+        // `isBorrowableType` recognizes) was caught. `arrayGate` reads the
+        // OWNED-SINK twin `isBorrowableOwnedSinkType` (fix #8170, which
+        // recognizes the borrow-bearing builtin class heads through
+        // `common::isBorrowBearingBuiltinClassHead`), and it is honoured ONLY
+        // for a root that is such a fresh materializer local (directly, or
+        // as the recorded source of a multi-hop holder): every other
+        // `Array`-typed read keeps its old classification, so the
+        // dedicated channels that already judge those (the #3706 / #7209
+        // collection-literal stores, the owned-sink transfers) keep their
+        // own diagnostics. The gate still asks about the READ's own type, so
+        // a value-typed element read (`a[0]` of an `Array<string>`) stays a
+        // copy. // per §28.3, §28.3.9
+        const bool baseGate = returnedExprMayBorrow(rhs) ||
+                              objectTypedOwnedRootBorrowSource(rhs) != nullptr;
+        const bool arrayGate =
+            !baseGate && isBorrowableOwnedSinkType(ctx_.exprType(rhs));
+        if (baseGate || arrayGate) {
             if (const ast::IdentifierExpr* root =
                     identifierRootThroughCastBang(rhs)) {
                 sema::Symbol* sym = ctx_.exprSymbol(*root);
-                if (isOwnedTrackedLocal(sym)) return sym;
+                // fix #8165 (§28.3 *Producers*, §28.3.8, v0.355): a local over
+                // a FRESH OWNED builtin `Array<T>` production is an OWNED
+                // local for the borrow-lifetime rules — its value is disposed
+                // at the end of its scope (codegen's scope-end reclaim), so a
+                // borrow of it may not outlive it. The ownership pass
+                // classifies it Borrowed (a builtin callee resolves no
+                // `MethodDecl` to read `owned` from), so the state check
+                // alone misses it; the class-instance twin is caught by the
+                // state. // per §28.3, §28.3.8, §28.3.9, stdlib §9.6
+                if ((baseGate && isOwnedTrackedLocal(sym)) ||
+                    isFreshOwnedArrayMaterializerLocal(sym))
+                    return sym;
                 // Multi-hop alias chain (#386 case 3): the re-borrow's root is
                 // not itself owned but is a tracked local that already carries
                 // a borrow source — it was bound from a re-borrow of an owned
@@ -8054,7 +8137,15 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
                 if (sym) {
                     auto it = states_.find(sym);
                     if (it != states_.end() && it->second.source &&
-                        isEscapeBoundLocal(it->second.source->sym))
+                        // fix #8165 (§28.3.8, v0.355): the chain must be able
+                        // to END at a fresh-owned-`Array` materializer local —
+                        // that local is an owned local for the borrow-lifetime
+                        // rules, so the chain through it is a chain to an owned
+                        // source, exactly as through a state-Owned one.
+                        ((baseGate &&
+                          isEscapeBoundLocal(it->second.source->sym)) ||
+                         isFreshOwnedArrayMaterializerLocal(
+                             it->second.source->sym)))
                         return it->second.source->sym;
                 }
             }
@@ -8169,7 +8260,22 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
         collectLambdaIdentifiers(*lam, ids);
         for (const ast::IdentifierExpr* id : ids) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
-            if (isEscapeBoundLocal(sym)) return sym;
+            // fix #8165 (§28.3 *Producers*, §28.3.8, §28.9, stdlib §9.6,
+            // v0.355): a local over a FRESH OWNED builtin `Array<T>`
+            // production (`var a := t.Split(",")`) is an OWNED local for the
+            // borrow-lifetime rules — its value is disposed at the end of its
+            // scope (codegen's scope-end reclaim), so a closure capturing it
+            // may not outlive that scope. The ownership pass classifies the
+            // local Borrowed (a builtin callee resolves no `MethodDecl` to
+            // read `owned` from), so `isEscapeBoundLocal` — which reads the
+            // state — misses it, while the class-instance twin
+            // (`var a := new Item(1);`) is caught. §28.3's producers table
+            // makes the Array-materializer production Owned (stdlib §9.6
+            // declares `Split` / `ToCharArray` `owned Array<T>`), so the two
+            // spellings must agree. // per §28.3, §28.3.8, §28.9
+            if (isEscapeBoundLocal(sym) ||
+                isFreshOwnedArrayMaterializerLocal(sym))
+                return sym;
             // fix #6296 (§28.3 *Provenance* clause 1, v0.338): a captured
             // FUNCTION value "carries its own set, transitively" — resolve the
             // fixpoint's answer for it. This is the leg the issue's repro was
@@ -12327,6 +12433,16 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
             // fix #5252: resolve by symbol, not by name (shadowing).
             if (const LocalOwnership* rst = lookupStateFor(*rid))
                 if (rst->state == OwnershipState::Owned) return false;
+            // fix #8165 (§28.3 consume table K3.1, §28.8, v0.355): a fresh
+            // materializer local (`var items := seq.Reversed();`) is an owned
+            // local for the borrow-lifetime rules, so `borrowSourceForExpr`
+            // now resolves it — but its bare store into an OWNED field is the
+            // same move-on-read transfer as the state-Owned skip just above
+            // (#4042 / #4057 record that transfer and suppress the scope-end
+            // reclaim), not a borrow store. Same method-scope gate.
+            // // per §28.3, §28.8
+            if (isFreshOwnedArrayMaterializerLocal(ctx_.exprSymbol(*rid)))
+                return false;
         }
         // fix #4989 (§28.3 consume table K3.1 / §28.5 / §28.8.1 / §17.8,
         // v0.307): #4948 taught `ownedLocalBorrowSource` to root THROUGH

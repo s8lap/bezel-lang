@@ -41,6 +41,8 @@
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::diagnosticMessageContains;
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 using bezel::test::runAotCheckedLenient;
 
@@ -99,6 +101,15 @@ std::string progH(const std::string& body) {
              "  public method Id(): Array<string> => this; "
              "end extension; ");
     return p;
+}
+
+// fix #8165: the §28.3.9 / §28.7 consume-site freeze rejects the overwrite
+// of a materializer local while a local borrow of its current value is live.
+void expectFrozen(const bezel::test::JitResult& r, const char* holder) {
+    BEZEL_EXPECT_FALSE(r.ran);
+    const std::string needle =
+        std::string("the borrow held by `") + holder + "` is still live";
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, needle.c_str()));
 }
 
 void expectClean(const bezel::test::JitResult& r, const std::string& out) {
@@ -284,17 +295,23 @@ BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
 //     uninstrumented runtime and plain ASan does not see it. The exact count
 //     is asserted as well.
 //
-//     When the §28.7 freeze is enforced for these locals, these programs
-//     become compile errors and the rows must be re-shaped as rejection rows.
+//     fix #8165 (§28.3.9, §28.7, v0.355) enforces that freeze for these
+//     locals: the alias, `?.`, `.ToCharArray()`, `??`, `.ToArray()` and
+//     returned-borrow rows are now COMPILE ERRORS naming the live holder —
+//     the diagnostic the class-instance twin draws. The iteration row (q36)
+//     is still admitted: its class-instance twin (an `OwningArray<Item>`
+//     reassigned inside a `for` over it) is admitted too, so it is a
+//     class-agnostic gap in the `for`-source freeze, outside #8165; it keeps
+//     its must-not-UAF oracle.
 // ===========================================================================
 
 // The reviewer's p25: a `var b := a` alias of a `.Split` local.
 BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
-           spec_28_7_reassigned_split_local_alias_is_not_freed_under_it) {
-    expectClean(runAotCheckedLenient(prog(
+           spec_28_7_reassigned_split_local_alias_is_rejected_by_the_freeze) {
+    expectFrozen(runAot(prog(
                     "      var a := t.Split(\",\"); var b := a; a := t.Split(\";\"); "
                     "      k := k + b.Count + b[0].Length + b[2].Length + a.Count; ")),
-                "700\n");
+                 "b");
 }
 
 // The reviewer's q36: a reassignment inside a `for` over the local.
@@ -309,49 +326,49 @@ BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
 
 // The reviewer's q40: a borrow returned by an instance method over the local.
 BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
-           spec_28_7_reassigned_local_call_borrow_is_not_freed_under_it) {
-    expectClean(runAotCheckedLenient(progH(
+           spec_28_7_reassigned_local_call_borrow_is_rejected_by_the_freeze) {
+    expectFrozen(runAot(progH(
                     "      var a := t.Split(\",\"); var d := a.Id(); "
                     "      a := t.Split(\";\"); "
                     "      k := k + d.Count + d[1].Length + a.Count; ")),
-                "600\n");
+                 "d");
 }
 
 // The reviewer's q42: the `?.` spelling (#8153's own).
 BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
-           spec_28_7_reassigned_nullcond_split_local_alias_is_not_freed_under_it) {
-    expectClean(runAotCheckedLenient(prog(
+           spec_28_7_reassigned_nullcond_split_local_alias_is_rejected_by_the_freeze) {
+    expectFrozen(runAot(prog(
                     "      var a := s?.Split(\",\"); var b := a; a := s?.Split(\";\"); "
                     "      k := k + CountOf(b) + b![0].Length + CountOf(a); ")),
-                "500\n");
+                 "b");
 }
 
 // The reviewer's q43: the `.ToCharArray()` spelling.
 BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
-           spec_28_7_reassigned_to_char_array_local_alias_is_not_freed_under_it) {
-    expectClean(runAotCheckedLenient(prog(
+           spec_28_7_reassigned_to_char_array_local_alias_is_rejected_by_the_freeze) {
+    expectFrozen(runAot(prog(
                     "      var a := t.ToCharArray(); var b := a; a := t.ToCharArray(); "
                     "      k := k + b.Count + a.Count; "
                     "      if b[6] = 'c' then k := k + 1; end if; ")),
-                "1500\n");
+                 "b");
 }
 
 // The reviewer's q44: a `??` (Branch C) local.
 BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
-           spec_28_7_reassigned_coalesce_local_alias_is_not_freed_under_it) {
-    expectClean(runAotCheckedLenient(prog(
+           spec_28_7_reassigned_coalesce_local_alias_is_rejected_by_the_freeze) {
+    expectFrozen(runAot(prog(
                     "      var a := s?.Split(\",\") ?? t.Split(\",\"); var b := a; "
                     "      a := t.Split(\";\"); "
                     "      k := k + b.Count + b[1].Length + a.Count; ")),
-                "600\n");
+                 "b");
 }
 
 // The reviewer's q45: the LINQ `.ToArray()` materializer.
 BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
-           spec_28_7_reassigned_to_array_local_alias_is_not_freed_under_it) {
-    expectClean(runAotCheckedLenient(prog(
+           spec_28_7_reassigned_to_array_local_alias_is_rejected_by_the_freeze) {
+    expectFrozen(runAot(prog(
                     "      var a := t.Split(\",\").ToArray(); var b := a; "
                     "      a := t.Split(\";\").ToArray(); "
                     "      k := k + b.Count + b[2].Length + a.Count; ")),
-                "600\n");
+                 "b");
 }

@@ -10105,7 +10105,19 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // state is overwritten, and only when the displaced value is live-
             // owned (a borrowed-state local has no disposal, so nothing is
             // silently killed).
-            if (st.state == OwnershipState::Owned)
+            //
+            // fix #8165 (§28.3.9, stdlib §9.6, v0.355): a local over a FRESH
+            // OWNED builtin `Array<T>` production (`var a := t.Split(",")`) is
+            // an owned local for the freeze even though the ownership pass
+            // classifies it Borrowed — a builtin callee resolves no
+            // `MethodDecl` to read `owned` from, so `producerState` cannot see
+            // the stdlib's `owned Array<T>` declaration. Its value IS disposed
+            // at the end of its scope (codegen's scope-end reclaim), so a
+            // live borrow of it dangles across the overwrite exactly as it
+            // does for a state-Owned local, and the class-instance twin is
+            // rejected on this channel. // per §28.3.9, §28.7, stdlib §9.6
+            if (st.state == OwnershipState::Owned ||
+                isFreshOwnedArrayMaterializerLocal(ctx_.exprSymbol(*id)))
                 checkConsumeFreeze(id->name, as.target->span.begin, ctx_.exprSymbol(*id));
             // fix #6609 (§28.3 bullet 1, v0.339): a SELF-ASSIGNMENT into an
             // OWNED-STATE local. v0.339 added, verbatim: "A self-assignment is

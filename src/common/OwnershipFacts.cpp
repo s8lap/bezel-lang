@@ -943,6 +943,99 @@ bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
     return head == "Array" || head == "Set" || head == "Dictionary";
 }
 
+// fix #8165 (§28.3 *Producers*, §28.3.8, §28.3.9, stdlib §9.6 / §5 / §4.4 /
+// §2.6, v0.355): the stdlib members whose result is a FRESH OWNED borrowing
+// `Array<T>` the binding solely owns — the member list of the ONE authority
+// codegen's scope-end reclaim uses.
+//
+// WHY A SECOND LIST (and why this one, not `isBuiltinOwnedMaterializerCall`'s).
+// `isBuiltinOwnedMaterializerCall` answers a DIFFERENT question — "does the
+// STDLIB DECLARATION mark this return `owned`?" — and its own header says so
+// ("Deliberately NOT unified with codegen's same-named recognizers … Sharing
+// one list would fuse two questions with different answers"). This list
+// answers the codegen question — "is this a fresh `Array<T>` whose disposal is
+// the end of the binding's scope?" — and therefore matches codegen's
+// `isFreshBorrowingArrayMaterializerLocal` / `isFreshOwnerlessArrayMaterializerExpr`
+// (src/codegen/LlvmBackend_Setup.cpp) member for member. The differences are
+// load-bearing in BOTH directions:
+//
+//   * `ToSet` / `ToDictionary` are in the stdlib-`owned` list but NOT here:
+//     they are dict-backed, reclaimed on a different path, so a binding over
+//     one is not scope-end-disposed by the borrowing-array reclaim;
+//   * `GetBytes` / `ToBytes` likewise (their reclaim is the byte-buffer path);
+//   * `ToCharArray` is NOT in the stdlib-`owned` list (that predicate's own
+//     comment records it as one of the #2749 items it left out) but IS here,
+//     because codegen's reclaim covers it (fix #8124) and stdlib §9.6
+//     declares it `owned Array<char>`.
+//
+// The stdlib declarations behind the list (each an `owned`-returning member
+// whose result is a fresh `Array<T>`):
+//   stdlib §5   ToArray
+//   stdlib §4.4 Sorted, Reversed
+//   stdlib §9.6 Split, ToCharArray
+//   stdlib §2.6 ToByteArray
+bool isFreshOwnedArrayMaterializerMember(std::string_view member) {
+    return member == "ToArray" || member == "Sorted" ||
+           member == "Reversed" || member == "Split" ||
+           member == "ToByteArray" || member == "ToCharArray";
+}
+
+// fix #8165 (§28.3 *Producers*, §28.3.8, §28.3.9, stdlib §9.6, v0.355): is
+// `call` a FRESH OWNED builtin `Array<T>` materializer call — the call form of
+// the production whose value a binding solely owns and whose disposal is the
+// end of that binding's scope?
+//
+// THE GATES, each with its reason:
+//
+//   (a) the callee names a member of `isFreshOwnedArrayMaterializerMember` —
+//       the stdlib's `owned`-returning borrowing-`Array` materializers, in the
+//       `.` and `?.` spellings (sibling `Expr` kinds with identical
+//       `target`/`member` fields, so both are read; the `?(` invocation form
+//       is NOT a member call and is not covered);
+//
+//   (b) the callee carries NO symbol — sema's builtin member-call typing path
+//       lives entirely inside `if (!calleeSym)`
+//       (sema/ExprTypecheck_Calls.cpp), so a user method of the same name (or
+//       a function-typed FIELD named `Split`, which attaches a FieldSymbol)
+//       is excluded. This is the same gate `isBuiltinOwnedMaterializerCall`
+//       and codegen's `calleeResolvedBySema` use, for the same reason;
+//
+//   (c) the RESULT is a declaration-less builtin `Array<T>` — the borrowing
+//       family whose scope-end reclaim frees the backing (and, for
+//       `Array<string>`, each substring). The owning families
+//       (`OwningArray<T>`) and the dict-/llist-backed ones are excluded by
+//       the head test.
+bool isFreshOwnedArrayMaterializerCall(const ast::CallExpr& call,
+                                        const sema::SemaContext& ctx) {
+    if (!call.callee) return false;
+    std::string_view mm;
+    if (const auto* ma =
+            dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+        mm = ma->member;
+    } else if (const auto* ncm =
+                   dynamic_cast<const ast::NullCondMemberExpr*>(
+                       call.callee.get())) {
+        mm = ncm->member;
+    } else {
+        return false;
+    }
+    if (!isFreshOwnedArrayMaterializerMember(mm)) return false;
+    // (b) the BUILTIN only: sema resolved nothing on the callee.
+    if (ctx.exprSymbol(*call.callee) != nullptr) return false;
+    // (c) the result must be a declaration-less builtin `Array<T>`.
+    const sema::TypeRef* rt = ctx.exprType(call);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    std::string_view head;
+    if (!rt->aliasResolvedHead.empty())
+        head = rt->aliasResolvedHead;
+    else if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
+        head = rt->headName();
+    else if (!rt->importedName.empty())
+        head = rt->importedName;
+    return head == "Array";
+}
+
 // §28.8 / §28.3 *Producers* / stdlib §6.1, §7.3, §7.4, §8.1, §4.19 (fix #5284).
 // See the header for the full recognition argument. // per §28.8, §28.3, §2.3,
 // §2.7, stdlib §4.19/§6.1/§7.3/§7.4/§8.1

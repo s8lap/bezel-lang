@@ -614,6 +614,33 @@ bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
 bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
                                     const sema::SemaContext& ctx);
 
+// fix #8165 (§28.3 *Producers*, §28.3.8, §28.3.9, stdlib §9.6 / §5 / §4.4 /
+// §2.6, v0.355): the stdlib members whose result is a FRESH OWNED borrowing
+// `Array<T>` the binding solely owns — the member list codegen's scope-end
+// reclaim (`isFreshBorrowingArrayMaterializerLocal` /
+// `isFreshOwnerlessArrayMaterializerExpr`, src/codegen/LlvmBackend_Setup.cpp)
+// uses. It is NOT `isBuiltinOwnedMaterializerCall`'s list: that predicate
+// answers "does the stdlib DECLARATION mark this return `owned`?" (so it
+// admits `ToSet` / `ToDictionary` / `GetBytes` / `ToBytes`, whose reclaims are
+// not the borrowing-array scope-end one, and it omits `ToCharArray`), while
+// this one answers "is this a fresh `Array<T>` whose disposal is the end of
+// the binding's scope?" — the question the ownership pass needs when it
+// decides whether a binding over such a production is an OWNED local for
+// §28.3's borrow-lifetime rules. The two lists differ in BOTH directions and
+// the difference is load-bearing; see the definition's comment.
+// per §28.3, §28.3.8, §28.3.9, stdlib §9.6, v0.355
+bool isFreshOwnedArrayMaterializerMember(std::string_view member);
+
+// fix #8165 (§28.3 *Producers*, §28.3.8, §28.3.9, stdlib §9.6, v0.355): is
+// `call` a FRESH OWNED builtin `Array<T>` materializer call — the call form of
+// the production whose value a binding solely owns and whose disposal is the
+// end of that binding's scope? The gates (the member list above; the callee
+// carrying NO sema symbol, so a user method of the same name is excluded; and
+// the result being a declaration-less builtin `Array<T>`) are stated in full
+// at the definition. // per §28.3, stdlib §9.6, v0.355
+bool isFreshOwnedArrayMaterializerCall(const ast::CallExpr& call,
+                                        const sema::SemaContext& ctx);
+
 // §28.3 producers table, "Range slice" row (v0.240) / §15.6 (fix #2749 item 2):
 // the RANGE-SLICE INDEXER form `arr[r]` on a builtin `Array<T>`. The spec row is
 // verbatim:

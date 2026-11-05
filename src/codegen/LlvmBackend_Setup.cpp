@@ -41121,8 +41121,14 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
         // as its siblings excludes a USER method of the same name), and its
         // elements are CODE POINTS (a value element type), so the reclaim
         // uses the value-element disposer — no per-element release.
-        return mm == "ToArray" || mm == "Sorted" || mm == "Reversed" ||
-               mm == "Split" || mm == "ToByteArray" || mm == "ToCharArray";
+        // fix #8165: the member list is the SHARED one
+        // (`common::isFreshOwnedArrayMaterializerMember`, src/common/
+        // OwnershipFacts.cpp) — the ownership pass's §28.3 borrow-lifetime
+        // check asks the same question ("is this a fresh `Array<T>` whose
+        // disposal is the end of the binding's scope?") and must not answer
+        // it from a second transcription of the stdlib's `owned`-returning
+        // members. // per §28.3, stdlib §9.6, v0.355
+        return common::isFreshOwnedArrayMaterializerMember(mm);
     }
     // Branch C, fix #8153 (§7.7, §28.3.11, stdlib §9.6, v0.355): a `??` whose
     // BOTH arms are fresh materializers — `var a := s?.Split(",") ??
@@ -41655,8 +41661,12 @@ bool Emitter::isFreshOwnerlessArrayMaterializerExpr(const ast::Expr* e) const {
     // `isFreshBorrowingArrayMaterializerLocal` row) and the `Split` discard
     // were clean. Its elements are code points, so the element-type-keyed
     // disposer the reclaim selects is null.
-    return mm == "ToArray" || mm == "Sorted" || mm == "Reversed" ||
-           mm == "Split" || mm == "ToByteArray" || mm == "ToCharArray";
+    // fix #8165: the member list is the SHARED one
+    // (`common::isFreshOwnedArrayMaterializerMember`, src/common/
+    // OwnershipFacts.cpp) — the ownership pass's §28.3 borrow-lifetime check
+    // asks the same question and must not answer it from a second
+    // transcription. // per §28.3, stdlib §9.6, v0.355
+    return common::isFreshOwnedArrayMaterializerMember(mm);
 }
 
 
