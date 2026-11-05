@@ -175,22 +175,24 @@ void expectSection5MinNotTheExtension(const JitResult& r,
 
 // The INTERFACE row only: once the sema gate reads the closure (#8185), the
 // element reaches codegen, whose #2770 guard (`selfComparableIface`, direct
-// bases only) still refuses it -- tracked as #8186. Pinned to exactly that
-// located refusal or the §5 output; the sema gate's own text and the
-// extension's 4242 are no longer accepted.
-void expectSection5MinOrCodegenRefusal8186(const JitResult& r,
+// bases only) still refused it -- tracked as #8186.
+//
+// fix #8186 (spec §14.2 *Interface conformance* rule 3, v0.355): the shared
+// predicate now walks the interface's EXTENSION CHAIN, so the element's
+// `IComparable<Self>` is FOUND and the §5 `Min()` dispatches through the
+// element's own `CompareTo`. The pinned outcome FLIPS: the #2770 refusal is
+// no longer reachable for this shape, and only the §5 output is accepted.
+// The sema gate's own text and the extension's 4242 remain unaccepted.
+void expectSection5MinNotTheExtension8186(const JitResult& r,
                                            const std::string& expectedStdout) {
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "IR verification failed"));
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(
         r, "does not implement IComparable<T>"));
-    if (r.ran) {
-        BEZEL_EXPECT_EQ(r.exitCode, 0);
-        BEZEL_EXPECT_EQ(r.stdoutText, expectedStdout);
-        return;
-    }
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(
         r, "its `CompareTo` could not be resolved for dispatch"));
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, expectedStdout);
 }
 
 }  // namespace
@@ -267,7 +269,7 @@ BEZEL_TEST(codegen_linq_icomparable_applicability_8180,
         "      var s1 := new Sq(1);\n"
         "      a.Add(s1);\n"
         "      t := t + a.Min().Area();\n"));
-    expectSection5MinOrCodegenRefusal8186(r, "100\n");
+    expectSection5MinNotTheExtension8186(r, "100\n");
 }
 
 // fix #8185 controls (spec §14.2 *Interface conformance*, v0.355): the gate now

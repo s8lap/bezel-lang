@@ -44,7 +44,11 @@ namespace bezel::sema {
 // this header's include graph unchanged. #2787: the §14.2 rule-3 self-recurrence
 // test now lives there as the single shared definition.
 bool typeRefEqual(const TypeRef* a, const TypeRef* b);
-bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable);
+// fix #8186 (spec §14.2 rule 3, v0.355): the shared predicate walks the
+// interface's EXTENSION CHAIN, so it takes the SemaContext (the §14.1
+// substitution allocates its result there).
+bool selfComparableIface(SemaContext& ctx, const TypeRef* t,
+                          const TypeSymbol* icomparable);
 
 // fix #7731 / #7782 (spec §30.3, v0.350): the head name ("Task" or
 // "OwningTask") of a `Task` / `Task<T>` / `OwningTask<T>` receiver type, empty
@@ -2506,9 +2510,13 @@ private:
     // IComparable<T>`? Delegates to sema::selfComparableIface — THE one
     // definition of this predicate (TypeResolution.hpp). This was one of three
     // hand-rolled copies until #2787 collapsed them; do not re-inline it.
-    static bool selfComparableIfaceArg(const TypeRef* argTy,
+    //
+    // fix #8186 (spec §14.2 rule 3, v0.355): the shared predicate now walks
+    // the interface's EXTENSION CHAIN (§14.1's substitution at each level),
+    // so `ctx` is threaded through for the substitution's allocations.
+    static bool selfComparableIfaceArg(SemaContext& ctx, const TypeRef* argTy,
                                        const TypeSymbol* icomparable) {
-        return selfComparableIface(argTy, icomparable);
+        return selfComparableIface(ctx, argTy, icomparable);
     }
 
     // §8.6 / §5.1 (#1311): does a primitive value type box into a builtin

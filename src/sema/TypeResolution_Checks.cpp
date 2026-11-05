@@ -17,8 +17,11 @@
 #include <cctype>
 #include <functional>
 #include <set>
+#include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace bezel::sema {
 
@@ -197,16 +200,90 @@ bool Resolver::recordValueContainsSelf(TypeSymbol* start, TypeSymbol* cur,
 // truth: delegates to Resolver::typeRefEqual.
 // #2787: the single definition of the §14.2-rule-3 self-recurrence test. See
 // TypeResolution.hpp for why this is exact rather than a proxy.
-bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable) {
+//
+// fix #8186 (spec §14.2 *Interface conformance* rule 3, §14.1 *Instantiation
+// and its site*, stdlib §2.8 / §4.4 / §5.1, v0.355): the EXTENSION CHAIN,
+// not the DIRECT base list.
+//
+// QUOTED (v0.355), spec §14.2 *Interface conformance* rule 3: "**T is an
+// interface** that has I in its extension chain — either I is named directly
+// in T's inheritance clause, or T extends an interface that itself conforms
+// to I." The second clause is the one the pre-fix predicate could not read:
+// it scanned `t->declaration->baseTypeRefs` only, so
+//
+//     interface IOrd<T>: IComparable<T> end IOrd;
+//     interface IShape: IOrd<IShape> … end IShape;
+//
+// answered FALSE for `IShape` — `IComparable<IShape>` is not in IShape's own
+// base list; it is in IOrd's, one level down, with IOrd's type parameter `T`
+// instantiated to `IShape` by §14.1's substitution. MEASURED on r30-c1: the
+// §5.1 gate (which reads the CLOSURE, `classOrIfaceComparableAtInstance`,
+// §8209) admitted the element, and CODEGEN then refused it with the #2770
+// guard ("`IShape` does not — its `CompareTo` could not be resolved for
+// dispatch") — the shape was document-admissible and rejected.
+//
+// WHY THE CHAIN WALK CARRIES A SUBSTITUTION. Each level's declared base is
+// re-expressed in THAT level's type arguments before the next level is read
+// (§14.1: "the instance's arguments into the declaration"), so the
+// `IComparable<T>` spelled in IOrd's body becomes `IComparable<IShape>` when
+// IOrd is read at `IOrd<IShape>`. The re-expression is §14.1's OWN
+// substitution — `sema::substituteGenericArgs` (SubstArgs.hpp, the single
+// authority) — so the chain walk and the §12.9 instantiation walk
+// (`collectAncestorInstantiationsOf`, the one #8209's gate uses) cannot
+// disagree about what `IOrd<IShape>` means.
+//
+// The walk is bounded and cycle-guarded (an interface cycle can survive error
+// recovery into this walk): at most `kMaxChainWalk` levels, and a level is
+// visited once per (declaration, arguments) identity.
+bool selfComparableIface(SemaContext& ctx, const TypeRef* t,
+                          const TypeSymbol* icomparable) {
     if (!t || t->nullable || !icomparable ||
         t->kind != TypeRef::Kind::Named || !t->declaration ||
         t->declaration->kind != ast::TypeDeclKind::Interface)
         return false;
-    for (const TypeRef* bt : t->declaration->baseTypeRefs) {
-        if (!bt || bt->nullable || bt->kind != TypeRef::Kind::Named ||
-            bt->declaration != icomparable || bt->genericArgs.size() != 1)
+    const std::size_t kMaxChainWalk = 64;  // defensive; chains are shallow
+    std::size_t walked = 0;
+    std::vector<const TypeRef*> work{t};
+    std::vector<const TypeRef*> seen;
+    while (!work.empty()) {
+        if (++walked > kMaxChainWalk) break;
+        const TypeRef* cur = work.back();
+        work.pop_back();
+        if (!cur || cur->kind != TypeRef::Kind::Named || !cur->declaration)
             continue;
-        if (typeRefEqual(bt->genericArgs[0], t)) return true;
+        bool dup = false;
+        for (const TypeRef* s : seen)
+            if (typeRefEqual(s, cur)) { dup = true; break; }
+        if (dup) continue;
+        seen.push_back(cur);
+        const TypeSymbol* d = cur->declaration;
+        // §14.1: this level's type arguments instantiate this level's
+        // declaration's type parameters.
+        std::unordered_map<std::string_view, TypeRef*> subst;
+        const auto& params = d->genericParams;
+        if (params.size() == cur->genericArgs.size())
+            for (std::size_t i = 0; i < params.size(); ++i)
+                if (params[i]) subst[params[i]->name] = cur->genericArgs[i];
+        for (const TypeRef* bt : d->baseTypeRefs) {
+            if (!bt || bt->nullable || bt->kind != TypeRef::Kind::Named)
+                continue;
+            // Re-express the declared base in THIS level's arguments.
+            const TypeRef* base = bt;
+            if (!subst.empty())
+                base = substituteGenericArgs(const_cast<TypeRef*>(bt),
+                                             SubstArgs{ctx, subst});
+            if (!base) continue;
+            // The self-recurrence: the base must name `IComparable<X>` with X
+            // the element type ITSELF (§14.2's exact, component-wise,
+            // INVARIANT identity — `IG<T>: IComparable<IG<int>>` does NOT
+            // satisfy it at `IG<string>`, §12.9).
+            if (base->declaration == icomparable &&
+                base->genericArgs.size() == 1) {
+                const TypeRef* arg = base->genericArgs[0];
+                if (arg && typeRefEqual(arg, t)) return true;
+            }
+            if (base->declaration) work.push_back(base);
+        }
     }
     return false;
 }

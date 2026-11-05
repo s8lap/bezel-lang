@@ -186,7 +186,24 @@ bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
 //     class or interface — implies non-null T".
 // `icomparable` is the caller's `ctx_.builtinInterfaceSym("IComparable")`;
 // passing null yields false.
-bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable);
+//
+// fix #8186 (spec §14.2 rule 3, §14.1, v0.355): the EXTENSION CHAIN, not the
+// direct base list. QUOTED rule 3: "**T is an interface** that has I in its
+// extension chain — either I is named directly in T's inheritance clause, or
+// T extends an interface that itself conforms to I." The second clause was
+// unreadable before: the predicate scanned `t->declaration->baseTypeRefs`
+// only, so `interface IShape: IOrd<IShape>` with `interface IOrd<T>:
+// IComparable<T>` answered FALSE — the `IComparable<IShape>` instantiation
+// lives in IOrd's base list, one level down.
+//
+// The chain walk re-expresses each level's declared base in THAT level's type
+// arguments (§14.1) with `sema::substituteGenericArgs` — the single
+// substitution authority — so the chain and §12.9's instantiation walk
+// (`collectAncestorInstantiationsOf`, the one #8209's §5.1 gate uses) cannot
+// disagree. `ctx` is the SemaContext that owns the type arguments (the
+// substitution allocates its result there).
+bool selfComparableIface(SemaContext& ctx, const TypeRef* t,
+                          const TypeSymbol* icomparable);
 
 // Does a derived (override) parameter type MATCH a base parameter type —
 // exactly, or via the one nullability widening §12.1 admits (base `T`,

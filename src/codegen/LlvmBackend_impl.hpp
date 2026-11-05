@@ -10982,26 +10982,35 @@ private:
     // element satisfies the bound, find the `CompareTo` MethodSymbol on the
     // matched `IComparable` base to dispatch through. That is the part sema does
     // not need, and the only reason this wrapper exists.
+    //
+    // fix #8186 (spec §14.2 *Interface conformance* rule 3, v0.355): the
+    // `CompareTo` member is declared on `IComparable` ITSELF, so once the
+    // shared predicate has established that the element's EXTENSION CHAIN
+    // reaches `IComparable<Self>` (the predicate walks the chain now), the
+    // member is found on the builtin interface symbol — the pre-fix code
+    // re-scanned the element's OWN `baseTypeRefs` for the `IComparable` base
+    // and therefore found NOTHING when the base was one level down (in
+    // `IOrd`), and the element was refused by the #2770 guard even though
+    // the shape is document-admissible.
+    //
+    // The lookup is unchanged in what it selects: the non-static
+    // one-parameter `CompareTo` of the synthesized `IComparable` — the same
+    // MethodSymbol the direct-base case selected, and the one
+    // `ensureIfaceCmpThunk` keys its itable slot on
+    // (`ifaceMethodIndex_[cmpMs]` is IComparable's own slot index).
     sema::MethodSymbol* selfComparableIfaceCompareTo(
             const sema::TypeRef* elemTR) {
         const sema::TypeSymbol* icmpSym =
             ctx_.builtinInterfaceSym("IComparable");
-        if (!sema::selfComparableIface(elemTR, icmpSym)) return nullptr;
-        // The predicate guarantees a matching base exists; re-find it to reach
-        // its members.
-        for (const sema::TypeRef* bt : elemTR->declaration->baseTypeRefs) {
-            if (!bt || bt->kind != sema::TypeRef::Kind::Named || bt->nullable)
-                continue;
-            if (bt->declaration != icmpSym || bt->genericArgs.size() != 1)
-                continue;
-            if (!sema::typeRefEqual(bt->genericArgs[0], elemTR)) continue;
-            const sema::TypeSymbol* bd = bt->declaration;
-            for (sema::Symbol* m : bd->members) {
-                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
-                if (ms && !isStaticMethod(ms) && ms->name == "CompareTo" &&
-                    ms->params.size() == 1)
-                    return ms;
-            }
+        if (!sema::selfComparableIface(ctx_, elemTR, icmpSym)) return nullptr;
+        // The `CompareTo` member is declared on `IComparable` — reached
+        // through the chain or directly, it is the SAME member and the SAME
+        // itable slot.
+        for (sema::Symbol* m : icmpSym->members) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+            if (ms && !isStaticMethod(ms) && ms->name == "CompareTo" &&
+                ms->params.size() == 1)
+                return ms;
         }
         return nullptr;
     }

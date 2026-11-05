@@ -15972,8 +15972,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // typeRefEqual on the argument, same nullable
                             // exclusion. Do not re-inline it: #2776's pending
                             // cross-module fix must reach every caller.
+                            //
+                            // fix #8186 (spec §14.2 rule 3, v0.355): the
+                            // shared predicate now walks the EXTENSION CHAIN,
+                            // so an interface whose chain reaches
+                            // `IComparable<Self>` is comparable here too.
                             if (!isComparableElem &&
                                 selfComparableIface(
+                                    ctx_,
                                     elemTy472,
                                     ctx_.builtinInterfaceSym("IComparable")))
                                 isComparableElem = true;
@@ -21608,7 +21614,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 } else if (
                                     argTy->declaration->kind ==
                                         ast::TypeDeclKind::Interface &&
-                                    !selfComparableIfaceArg(argTy,
+                                    !selfComparableIfaceArg(ctx_, argTy,
                                                             icomparable)) {
                                     // fix #2782: for an INTERFACE argument the
                                     // loose `isSubtype(decl, IComparable)`
@@ -43555,7 +43561,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                 isSubtype(ta->declaration, icmp) &&
                                 (ta->declaration->kind !=
                                      ast::TypeDeclKind::Interface ||
-                                 selfComparableIfaceArg(ta, icmp));
+                                 selfComparableIfaceArg(ctx_, ta, icmp));
                         } else if (ta && ta->kind != TypeRef::Kind::Primitive) {
                             admitted = false;
                         }
