@@ -613,3 +613,72 @@ BEZEL_TEST(sema_method_ref_overload_residual_8205,
            object_position_reference_in_a_non_linq_argument_is_ambiguous) {
     expectRejectedOnce(withoutPeek(kPeekNestedObjectParam), kNoTarget);
 }
+
+// ── E: the list rule is independent of declaration order ────────────────────
+//
+// SPEC §27.6 (v0.355), *References to generic methods*: "with a list, only
+// candidates declaring that many type parameters of their own take part ...;
+// without one, only candidates declaring none take part". So `v.Len` over
+// `Len<T>(x: T)` and `Len()` is the reference to `Len()` whichever is
+// declared first. Before: with the GENERIC member declared first the
+// reference was typed by that member's signature, so `var f := v.Len;
+// f()` was refused (§5.1, "expects 1") — rev-8205 probe q01, rev-8205b r26.
+
+namespace {
+
+// rev-8205 q01_generic_first_var.bzl, verbatim except for the call `body`
+std::string genericFirstMain(const std::string& body) {
+    return std::string("module M;\n"
+                       "class V\n"
+                       "  public constructor() end constructor;\n"
+                       "  public method Len<T>(x: T): int => 7;\n"
+                       "  public method Len(): int => 42;\n"
+                       "end V;\n"
+                       "class C\n"
+                       "  public static method Main(): int\n"
+                       "    var v := new V();\n"
+                       "    ") +
+           body + "\n"
+                  "    return 0;\n"
+                  "  end Main;\n"
+                  "end C;\n";
+}
+
+}  // namespace
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           generic_overload_declared_first_does_not_take_part_var) {
+    // per §27.6 / §14.5 (v0.355): rev-8205 q01
+    expectCheckedStdout(genericFirstMain("var f := v.Len;\n"
+                                         "    Console.WriteLine(f());"),
+                        "42\n");
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           generic_overload_declared_first_does_not_take_part_writeline) {
+    // per §27.6 / §14.5 (v0.355): rev-8205b r26b — the mirror of p04
+    expectCheckedStdout(genericFirstMain("Console.WriteLine(v.Len);"),
+                        "() -> int\n");
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           generic_overload_declared_first_reference_has_the_non_generic_arity) {
+    // per §27.6 / §14.5 (v0.355): rev-8205b r26 — `f` is `() -> int`, so
+    // calling it with an argument is the §5.1 count error, not a call of
+    // the generic member (which would print 7)
+    auto r = runAot(genericFirstMain("var f := v.Len;\n"
+                                     "    Console.WriteLine(f(5));"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasError(
+        r, "call supplies 1 argument(s) but the function value expects 0"));
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           generic_overload_declared_first_list_still_selects_the_generic) {
+    // control (§27.6 / §14.5): with a one-type-argument list the generic
+    // member is the only candidate
+    expectCheckedStdout(genericFirstMain("var f := v.Len<int>;\n"
+                                         "    Console.WriteLine(f(5));"),
+                        "7\n");
+}

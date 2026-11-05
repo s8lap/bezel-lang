@@ -34286,10 +34286,28 @@ TypeRef* ExprTC::applyMethodRefTypeArgs(const ast::MemberAccessExpr& ma,
         const MethodSymbol& ms = ms0;
         if (ms.genericParams.empty()) return ft;
         if (ms.parent) {
+            // fix #8205 (§27.6 / §14.5, v0.355): "without [a list], only
+            // candidates declaring none take part", whatever their
+            // declaration order — so where the first-declared member is
+            // generic, a UNIQUE non-generic candidate is the reference's
+            // method, exactly as the list branch below takes a unique fit.
+            // Several are left to target-typed selection
+            // (selectMethodRefOverload) or the no-target ambiguity.
+            // Before: the generic member's signature was returned, so `var f
+            // := v.Len;` over `Len<T>(x: T)` declared before `Len()` typed
+            // `f` as `(T) -> int` and `f()` was refused (§5.1).
             std::vector<MethodSymbol*> group;
             collectHierarchyOverloads(ms.parent, ms.name, group);
+            std::vector<MethodSymbol*> fits;
             for (MethodSymbol* ov : group)
-                if (ov->genericParams.empty()) return ft;
+                if (ov->genericParams.empty()) fits.push_back(ov);
+            if (fits.size() == 1) {
+                if (TypeRef* oft = buildMethodRefType(fits[0])) {
+                    ctx_.setMethodRefSelectedOverload(&ma, fits[0]);
+                    return oft;
+                }
+            }
+            if (!fits.empty()) return ft;
         }
         std::string names;
         for (auto* g : ms.genericParams) {
