@@ -14,6 +14,7 @@
                                    // vocabulary predicate (fix #7333)
 #include "sema/LinqStdlibOverloads.hpp"  // fix #3726: shared stdlib §5 overload table (name + arity + where)
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation (shared with Resolver)
+#include "sema/SpanFamily.hpp"    // isSpanFamilyTypeRef — §3.3 / §4.14 / §4.15 span views (fix #8211)
 #include "sema/TypeResolution.hpp"  // typeRefEqual, overrideParamTypeMatches
 #include "sema/SubstArgs.hpp"       // sema::substituteGenericArgs — generic class IComparable check
 #include "sema/GenericParams.hpp"   // sema::hasVariantGenericParam — §12.9 variance read from BOTH
@@ -34989,12 +34990,39 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // still loads (SemaContext::markNarrowedValueRead); otherwise
                 // the carrier reached bz_datetime_to_string_fmt & co. and
                 // failed IR verification.
+                //
+                // fix #8211 (stdlib §3.3 / §4.14 / §4.15, v0.355): the SPAN
+                // VIEWS join them here, for the same reason and with the same
+                // mechanism. A nullable span is a nullable VALUE type: it
+                // lowers to the tagged `{i8 hasValue; {ptr,i32,i32}}` carrier,
+                // while every span consumer wants the {ptr,i32,i32} PAYLOAD
+                // (the carrier's field 2 is the length, so an extract at
+                // index 2 of the two-element carrier is out of range). The
+                // carrier reached the span member lowerings and bezelc CRASHED
+                // (issue #8211: SIGSEGV in llvm::Value::setName, exit 139);
+                // the instance-method receiver was spilled into a {ptr,i32,i32}
+                // slot as the carrier — a store of the wrong width, which the
+                // IR verifier does not catch, so the program ran on a smashed
+                // slot (an IndexOutOfRangeException, and a SIGSEGV for
+                // `s.ToString()`); and the indexer read the carrier's tag byte
+                // as the source pointer. Publishing the narrowed read hands
+                // the payload to every consumer at once — codegen's ONE central
+                // unwrap (fix #6674) extracts it, instead of each lowering site
+                // repeating the unwrap.
+                //
+                // The un-narrowed form is REJECTED by the gate above (that is
+                // what makes the payload unwrap sound: §22.6 — "a read of a
+                // binding §7.4 has narrowed non-null is of its non-nullable
+                // type" — applies to a narrowed read only), and the indexer
+                // gate (ExprTypecheck_Exprs.cpp) publishes the same read for
+                // the same family.
                 if (isSimpleVar && declaredNullable &&
                     dt->kind == TypeRef::Kind::Named &&
                     (dt->headName() == "DateTime" ||
                      dt->headName() == "TimeSpan" ||
                      dt->headName() == "DateOnly" ||
-                     dt->headName() == "TimeOnly"))
+                     dt->headName() == "TimeOnly" ||
+                     isSpanFamilyTypeRef(dt)))
                     ctx_.markNarrowedValueRead(tid);
                 // per §7.4 (#862): a bare identifier resolving to a FIELD or
                 // PROPERTY is never narrowable — fields can be reassigned by

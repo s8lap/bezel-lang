@@ -6,6 +6,7 @@
 #include "sema/Formattability.hpp"  // §2.18/§18.5: the shared format-spec
                                    // vocabulary predicate (fix #7333)
 #include "sema/GenericParams.hpp"  // genericParamCount / genericParamNameAt — #3143
+#include "sema/SpanFamily.hpp"      // isSpanFamilyTypeRef — §3.3 / §4.14 / §4.15 span views (fix #8211)
 #include "sema/TypeResolution.hpp"  // fix #2320: typeRefEqual for ctor overload re-resolution
 
 #include <cmath>
@@ -5593,6 +5594,26 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             if (tsym && (dynamic_cast<LocalSymbol*>(tsym) ||
                                           dynamic_cast<ParameterSymbol*>(tsym)))
                                 receiverNarrowed = isKnownNonNull(tsym);
+                        }
+                    }
+                    // fix #8211 (stdlib §3.3 / §4.14 / §4.15, v0.355): a
+                    // NARROWED nullable SPAN receiver is published for the
+                    // same reason the member-access gate publishes it
+                    // (ExprTypecheck_Calls.cpp): the read is of the
+                    // non-nullable type (§22.6), so codegen must hand the
+                    // span's PAYLOAD to the indexer, not the
+                    // `{i8 hasValue; {ptr,i32,i32}}` carrier the local still
+                    // holds. Without it the indexer read the carrier's tag
+                    // byte as the source pointer and the program raised
+                    // IndexOutOfRangeException on a valid index.
+                    //
+                    // The un-narrowed form is the reject below, so the
+                    // unwrap is sound (a narrowed read only).
+                    if (receiverNarrowed) {
+                        if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                                ix->target.get())) {
+                            if (isSpanFamilyTypeRef(tt))
+                                ctx_.markNarrowedValueRead(tid);
                         }
                     }
                     if (!receiverNarrowed) {
