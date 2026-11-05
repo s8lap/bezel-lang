@@ -956,12 +956,41 @@ bool Resolver::paramCarriesConstraint(std::string_view name,
     if (currentMethodConstraints_ && scan(*currentMethodConstraints_))
         return true;
     if (currentOuterType_) {
-        // SEAM-ACCESSOR: `currentOuterType_` is the type this resolver is
-        // resolving in THIS compilation, so it is always a local type with
-        // an AST (never an import).
-        if (auto* td = dynamic_cast<const ast::TypeDecl*>(
-                currentOuterType_->decl))
-            if (scan(td->genericConstraints)) return true;
+        // fix #5998 / the imported-symbol ratchet (§14.2, v0.355): the
+        // ENCLOSING TYPE's own `where` clause is read off the TypeSymbol's
+        // generic-parameter SYMBOLS — the channel #3146 (family F13 of
+        // umbrella #3152) put the §14.2 constraints on — and NOT through
+        // `Symbol::decl` into the declaring `ast::TypeDecl`.
+        //
+        // The AST-gated read is exactly the class-1 seam the imported-symbol
+        // ratchet counts (`scripts/check_imported_symbol_reads.py`): `Symbol::
+        // decl` is null for an IMPORTED symbol, so the `dynamic_cast` into
+        // `ast::TypeDecl` answered "this type carries no `sendable`
+        // constraint" — silently, and wrongly: §14.2 case 1 decides the
+        // constraint at the site by the PARAMETER's own constraints, and the
+        // parameter's constraints are carried on the symbol on BOTH sides of
+        // a module boundary.
+        //
+        // The two sources agree for a LOCAL type: `SymbolCollection::
+        // collectGenericParams` re-keys the declaring node's `where` clauses
+        // onto the parameter symbols, so `GenericParamSymbol::constraints`
+        // holds exactly the items the AST scan saw — the historical
+        // `where T is owned` modifier form carries no items and is dropped by
+        // both. So this is a NARROWING of where the fact is read, not a
+        // change of what it answers.
+        //
+        // The `// SEAM-ACCESSOR:` marker that used to sit on this read (the
+        // `dynamic_cast<const ast::TypeDecl*>(currentOuterType_->decl)` that
+        // b420357f marked) is GONE with the read: the marker exempts a read
+        // from the ratchet's count, and there is no read left to exempt. The
+        // fact now comes off the SYMBOL, which carries it on both sides of a
+        // module boundary.
+        for (const Symbol* gp : currentOuterType_->genericParams) {
+            const auto* gps = dynamic_cast<const GenericParamSymbol*>(gp);
+            if (!gps || gps->name != name) continue;
+            for (const auto& c : gps->constraints)
+                if (c.kind == kind) return true;
+        }
     }
     return false;
 }
