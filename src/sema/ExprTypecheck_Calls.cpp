@@ -41902,6 +41902,80 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     resolveExtensionMember(ma, ext);
                     return;
                 }
+                // fix #8179 (§26.5.1, §26.5 rule 2, §2, stdlib §5, v0.355):
+                // the stdlib §5 LAZY-SEQUENCE SENTINEL — a Named TypeRef with no
+                // declaration, no astNode and no importedName, carrying the
+                // element type at genericArgs[0] (`makeLazyEnumerable`, this
+                // file) — carries NO NAME, so the §26.5 rule-2 search related
+                // it to no extension block at all: not to the `IEnumerable<T>`
+                // of stdlib §5's own block, and not to the implicit `Object`
+                // base ("every type derives from Object", §2 / §12). A user's
+                // `extension Object` member was therefore never a CANDIDATE on
+                // a lazy receiver, and a §5-named call whose arity matches no
+                // §5 overload was rejected with the §5 arity diagnostic
+                // ("wrong number of arguments for stdlib §5 LINQ operator
+                // `Select` ... got 0, expected 1 (#3726)") instead of the
+                // user's member.
+                //
+                // MEASURED — the arity gate is NOT the site. The extension
+                // lookup above runs while the CALLEE is resolved, which is
+                // BEFORE `typeCall`'s §5 arms (the #3726 gate) run: the gate
+                // fires only BECAUSE this lookup found nothing. So the fix is
+                // here — give the sentinel the base its type has — and the
+                // #3726 gate then never fires, because the callee resolves to
+                // the user's member and `typeCall`'s ordinary method path
+                // types the call.
+                //
+                // §26.5.1 (v0.355): "specificity ranks the applicable
+                // candidates: extension members of the called name that match
+                // the call's arity and argument types, from blocks whose head
+                // matches R". A zero-argument `Select` matches no §5 `Select`
+                // arity, so the §5 overload is NOT a candidate and the user's
+                // `extension Object` member is the only applicable one.
+                // §26.5 rule 1 does not block it: neither `IEnumerable<T>`
+                // nor a lazy sequence declares an instance member `Select`.
+                //
+                // SCOPE — the `Object` base is consulted ONLY for a §5-named
+                // member whose arity matches NO §5 overload, and ONLY on the
+                // lazy sentinel:
+                //   * a §5 name with a §5 arity keeps §5's operator (the §5
+                //     block's `IEnumerable<T>` head is more specific than
+                //     `Object`, §26.5.1's specificity), so the same-arity
+                //     call is unchanged;
+                //   * the four universal `Object` members (§8.1) are not §5
+                //     names, so rule 1's commitment for them is untouched;
+                //   * the lazy sentinel's runtime value is a `bz_lazy_t*` —
+                //     NEVER a dictionary / set / linked-list — so the #7822
+                //     exclusion (`builtinHeadReachesObjectExtension`) does
+                //     not apply to it: MEASURED, `var o: Object :=
+                //     a.Where(f); o.ToString()` prints garbage (the lazy
+                //     value's word 0 is the lazy vtable, not the class
+                //     vtable) but ASan reports NO error, while the SAME
+                //     spelling on a `Dictionary` SEGFAULTS (#7822) and on a
+                //     NAMED `IEnumerable<int>` aborts under ASan with
+                //     "allocation-size-too-big" — the two heads #7822
+                //     excludes. The dictionary half of #8179 is therefore
+                //     NOT fixed here (reported instead).
+                if (recvTy->kind == TypeRef::Kind::Named &&
+                    !recvTy->declaration && !recvTy->astNode &&
+                    recvTy->importedName.empty() &&
+                    !recvTy->genericArgs.empty() &&
+                    common::isBuiltinCollectionLinqOperatorName(ma.member) &&
+                    currentCallArity_ >= 0 &&
+                    !bezel::sema::stdlibLinqMemberMatches(
+                        ma.member, currentCallArity_)) {
+                    // the sentinel's implicit `Object` base (§2 / §12): the
+                    // §26.5 rule-2 search over the blocks on the base types.
+                    if (Symbol* ext = lookupExtensionMember(
+                            ctx_.primitiveTypeRef(PrimitiveType::Object),
+                            ma.member, &binding, extLoc,
+                            /*reportAmbiguity=*/true, currentCallArity_)) {
+                        if (!binding.empty())
+                            ctx_.setExprExtBinding(&ma, std::move(binding));
+                        resolveExtensionMember(ma, ext);
+                        return;
+                    }
+                }
                 }
             }
         }
