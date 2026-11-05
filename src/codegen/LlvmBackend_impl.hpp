@@ -7944,6 +7944,39 @@ private:
     // the class base (§12.3). Use indexAccessReceiverDecl below.
     const sema::TypeSymbol* indexReceiverDecl(const ast::Expr* target);
 
+    // fix #8127 (§8.5 / §18.5, v0.355): the STATIC type of a `this` / `base`
+    // receiver EXPRESSION — the type of the member body the expression is
+    // written in.
+    //
+    // `this` / `base` carry NO sema exprType (ExprTypecheck_Exprs.cpp's
+    // "Slice 3b: IdentifierExpr name lookup. `this` / `base` are
+    // implicit-meaning identifiers — leave them unresolved"), so every
+    // consumer that needs the receiver's TYPE has to recover it from the
+    // emitter's own receiver state. §8.5's "ToString is invoked implicitly
+    // inside string interpolation via virtual dispatch" needs the type to
+    // pick the rendering; without it the §18.5 hole fell through to the
+    // "pointer ⇒ it is a bz_string" fallback and read the receiver's own
+    // bytes as a string descriptor (#8127: SIGSEGV or an empty line).
+    //
+    // The recovery is the SAME "which type's body am I in" one
+    // `indexReceiverDecl` performs (the methodFns_ reverse lookup, the
+    // specialized-body symbol, the extension target type), extended to the
+    // other receiver kinds codegen emits a body for: a constructor
+    // (ctorFns_), a property accessor (propAccessorFns_), an indexer
+    // accessor (indexerGetterFns_ / indexerSetterFns_), a record or choice
+    // receiver (currentReceiverRecordType), an enum receiver
+    // (currentEnumMethod_) and a lambda body (lambdaFnEnclosingType_).
+    //
+    // `base` answers the ENCLOSING type, not the base class: §8.5's
+    // interpolation dispatch is VIRTUAL, so `base` renders as the runtime
+    // type's ToString — the same answer the `base.ToString()` sibling
+    // already gives (LlvmBackend_Calls2.cpp's #1106 block), and the same
+    // answer `$"{this}"` gives for the very same object.
+    //
+    // Null when the expression is not a `this` / `base` spelling, or when
+    // the enclosing type cannot be recovered.
+    const sema::TypeRef* thisReceiverTypeRef(const ast::Expr* e);
+
     // fix #2832 / #2833 (§12.3 / §23.4, v0.240): the receiver TypeSymbol an
     // INDEXER ACCESS `ix` resolves its indexer against.
     //   * `this[i]` / an ordinary typed receiver → indexReceiverDecl.

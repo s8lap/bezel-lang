@@ -786,6 +786,113 @@ static bool isReadOnlyStringSpanTypeRef(const sema::TypeRef* rt) {
     return rt->headName() == "ReadOnlyStringSpan";
 }
 
+// fix #8127 (§8.5 / §18.5, v0.355): the STATIC type of a `this` / `base`
+// receiver expression. See the declaration (LlvmBackend_impl.hpp) for the
+// contract and the spec reading.
+//
+// `this` / `base` carry no sema exprType, so the type is recovered from the
+// emitter's own receiver state — the same "which type's body am I in" lookup
+// `indexReceiverDecl` performs, extended to the other receiver kinds codegen
+// emits a body for.
+const sema::TypeRef* Emitter::thisReceiverTypeRef(const ast::Expr* e) {
+    if (!e) return nullptr;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+    if (!id || (id->name != "this" && id->name != "base")) return nullptr;
+    // A ready-made TypeRef, for the one receiver kind whose type is not a
+    // user TypeSymbol: an EXTENSION block's target type (`extension int`).
+    const sema::TypeRef* direct = nullptr;
+    const sema::TypeSymbol* ts = nullptr;
+    if (currentFn_) {
+        // 1. an ordinary method body (and an extension method body: the
+        //    extension has no parent TypeSymbol, so its TARGET type is the
+        //    receiver's type — #1237's rule, mirrored from indexReceiverDecl).
+        for (const auto& [ms, fn] : methodFns_) {
+            if (fn != currentFn_) continue;
+            if (ms->parent) { ts = ms->parent; break; }
+            if (isExtensionMethod(ms) && ms->extensionDecl &&
+                ms->extensionDecl->targetType) {
+                const sema::TypeRef* t =
+                    ctx_.resolvedType(*ms->extensionDecl->targetType);
+                if (t) { direct = t; break; }
+            }
+        }
+        // 2. a CONSTRUCTOR body (ctors have no MethodSymbol and are never
+        //    registered in methodFns_ — #4056's recorded reason).
+        if (!ts && !direct) {
+            for (const auto& [cs, fn] : ctorFns_)
+                if (fn == currentFn_ && cs->parent) { ts = cs->parent; break; }
+        }
+        // 3. a PROPERTY accessor body (an accessor function is not in
+        //    methodFns_ — it has its own memo, propAccessorFns_).
+        if (!ts && !direct) {
+            for (const auto& [key, fn] : propAccessorFns_)
+                if (fn == currentFn_ && std::get<0>(key) &&
+                    std::get<0>(key)->parent) {
+                    ts = std::get<0>(key)->parent;
+                    break;
+                }
+        }
+        // 4. an INDEXER accessor body (the same shape as the property
+        //    accessor, with its own memo).
+        if (!ts && !direct) {
+            for (const auto& [key, fn] : indexerGetterFns_)
+                if (fn == currentFn_ && key.first && key.first->parent) {
+                    ts = key.first->parent;
+                    break;
+                }
+            if (!ts)
+                for (const auto& [key, fn] : indexerSetterFns_)
+                    if (fn == currentFn_ && key.first && key.first->parent) {
+                        ts = key.first->parent;
+                        break;
+                    }
+        }
+        // 5. a LAMBDA body: the lambda's own llvm::Function is not in
+        //    methodFns_; its LEXICAL enclosing type was recorded by sema and
+        //    registered by lowerLambda (#5226).
+        if (!ts && !direct) {
+            auto lit = lambdaFnEnclosingType_.find(currentFn_);
+            if (lit != lambdaFnEnclosingType_.end()) ts = lit->second;
+        }
+    }
+    // 6. a SPECIALIZED method body (the monomorphized instance of a generic
+    //    method — #747 R42's rule).
+    if (!ts && !direct && currentSpecMethodSymbol_ &&
+        currentSpecMethodSymbol_->parent)
+        ts = currentSpecMethodSymbol_->parent;
+    // 7. an ENUM receiver (`currentEnumMethod_` is the enum's TypeSymbol).
+    if (!ts && !direct && currentEnumMethod_) ts = currentEnumMethod_;
+    // 8. a RECORD or CHOICE receiver (currentReceiverRecordType's recovery,
+    //    which also covers a record constructor body).
+    if (!ts && !direct) ts = currentReceiverRecordType();
+    // 9. the method whose body emission is IN PROGRESS. `emitAsyncMethod` /
+    //    `emitIteratorMethod` are called FROM `emitFunctionBody`, so the
+    //    CurrentMethodGuard is still active while their RESUME function's body
+    //    is emitted — and that resume function is in none of the maps above.
+    //    LAST, because `currentMethod_` is a SCOPED member: a body emitted
+    //    lazily from inside another member's body would see the outer
+    //    method's symbol, and every `currentFn_`-keyed lookup above (1-5) is
+    //    the precise one for such a nested emission.
+    if (!ts && !direct && currentMethod_ && currentMethod_->parent)
+        ts = currentMethod_->parent;
+    if (direct) return direct;
+    if (!ts) return nullptr;
+    auto ref = std::make_unique<sema::TypeRef>();
+    ref->kind = sema::TypeRef::Kind::Named;
+    ref->declaration = const_cast<sema::TypeSymbol*>(ts);
+    // The receiver's own generic arguments, from the ACTIVE substitution (the
+    // same binding `thisCaptureCopyType` installs) — so a generic class's
+    // `this` renders as its instantiation.
+    const std::vector<std::string_view> gp = sema::genericParamNames(ts);
+    for (std::string_view n : gp) {
+        auto it = genericSubstSemaTy_.find(n);
+        if (it == genericSubstSemaTy_.end() || !it->second) break;
+        ref->genericArgs.push_back(const_cast<sema::TypeRef*>(it->second));
+    }
+    descArena_.push_back(std::move(ref));
+    return descArena_.back().get();
+}
+
 llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     diverged_ = false;  // CG40: cleared per expression; a `throw` sets it
     // §27.6 (v0.184, #1758): inside a primitive-intrinsic thunk body, a synthetic
@@ -1378,9 +1485,30 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     ev = llvm::Constant::getNullValue(
                         lowerTypeRef(ctx_.exprType(*part.expr)));
                 }
+                // fix #8127 (§8.5 / §18.5, v0.355): a hole whose operand is a
+                // `this` / `base` RECEIVER has no sema exprType, so the
+                // rendering dispatch below saw no type at all and fell through
+                // to the "pointer ⇒ it is a bz_string" fallback — reading the
+                // receiver's own bytes as a string descriptor (a SIGSEGV when
+                // the first word is not a pointer, an empty line when it
+                // happens to be). §8.5 renders such a hole through the
+                // receiver's ToString (the user's override if declared, else
+                // the type's qualified name) — the SAME rendering the
+                // non-`this` local of the very same class already gets, so the
+                // receiver's STATIC type is recovered and the existing
+                // dispatch renders it (the class/interface arm and the record
+                // arm below).
+                //
+                // SEMA's own answer wins when it has one (a primitive
+                // extension block types its `this` at the extension's target
+                // type — the same type this recovery finds, but sema's is the
+                // authority); the recovery is the FALLBACK for the ordinary
+                // body, where `this` / `base` are deliberately left untyped.
+                const sema::TypeRef* holeTy = ctx_.exprType(*part.expr);
+                if (!holeTy) holeTy = thisReceiverTypeRef(part.expr.get());
                 // §18.5: format spec → translate to snprintf format.
                 if (!part.formatSpec.empty()) {
-                    const sema::TypeRef* frt = ctx_.exprType(*part.expr);
+                    const sema::TypeRef* frt = holeTy;
                     frt = resolveBareTParamConcreteHoleTy(frt, ev);  // #5024
                     sema::TypeRef frtNvBuf4934;
                     frt = resolveBareTParamNullableHoleTy(frt, ev, frtNvBuf4934);
@@ -1479,7 +1607,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     }
                     // emitWithFormatSpec returned null: fall through.
                 }
-                const sema::TypeRef* rt = ctx_.exprType(*part.expr);
+                const sema::TypeRef* rt = holeTy;
                 rt = resolveBareTParamConcreteHoleTy(rt, ev);  // #5024
                 sema::TypeRef rtNvBuf4934;
                 rt = resolveBareTParamNullableHoleTy(rt, ev, rtNvBuf4934);

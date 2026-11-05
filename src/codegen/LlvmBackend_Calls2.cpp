@@ -12012,6 +12012,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             }
             const sema::TypeRef* cg_recvTy =
                 ctx_.exprType(*cg_ma->target);
+            // fix #8127 (§8.5 / §18.5, v0.355): `this.ToString()` — a `this` /
+            // `base` receiver carries no sema exprType, so the class dispatch
+            // below (the vtable slot 3 / classToStringThunk route, which
+            // answers the user's override else the §8.5 qualified-name
+            // default) never ran and the call degraded with the #3079
+            // "failed to lower to a value" warning, printing NOTHING. Recover
+            // the receiver's STATIC type — the enclosing type of the member
+            // body — so the very same dispatch the non-`this` spelling
+            // (`c.ToString()`) uses answers here.
+            if (!cg_recvTy)
+                cg_recvTy = thisReceiverTypeRef(cg_ma->target.get());
             if (cg_recvTy) {
                 using CG_K = sema::TypeRef::Kind;
                 // fix #3907 (stdlib §4.19): `FrozenArray<T>.From(...)`'s
