@@ -11511,6 +11511,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // are untouched.
                     if (nargs == 1 && ce.args[0].value &&
                         !ce.args[0].isDiscard && ce.args[0].modifier.empty()) {
+                        // fix #8205 (§27.6, v0.355): the parameter is `Object`
+                        // (stdlib §2.1), a position that supplies no target
+                        // FUNCTION type, so an overloaded method group named
+                        // here has nothing to select by — "When no target
+                        // type is available … the reference is ambiguous".
+                        // Before: the first-declared overload's type printed.
+                        reportUncalledOverloadedMethodRef(
+                            ce.args[0].value.get(),
+                            ce.args[0].value->span.begin);
                         checkBorrowErasingPosition(
                             ctx_.exprType(*ce.args[0].value),
                             ctx_.primitiveTypeRef(PrimitiveType::Object),
