@@ -399,3 +399,160 @@ BEZEL_TEST(minmax_constraint_8161,
              "if m <> null then Console.WriteLine($\"{m!}\"); end if; "),
         "is not yet implemented for this element type"));
 }
+
+// =====================================================================
+// ROW 14 — `.Where(…).Min()` WITH NO SELECTOR IS TYPED AS THE ELEMENT.
+//
+// stdlib §5.1 (v0.355) declares the no-selector form as
+//     public extension IEnumerable<T> where T: IComparable<T>
+//       public method Min(): T;
+// so the result of a LAZY `Where(…).Min()` over a record element is the
+// RECORD — `f.v` on the result must resolve.
+//
+// Pre-fix: the result was typed `int`, so `f.v` was rejected with "no
+// member `v` on primitive type `int`".
+//
+// The REVERSED `CompareTo` makes the ordering visible: `Min()` is the
+// LARGEST `v` (3) and `Max()` the SMALLEST (1).
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           where_then_min_over_a_record_element_is_typed_as_the_element) {
+    BEZEL_EXPECT_EQ(
+        out(prog("record R(v: int): IComparable<R> "
+                 "  public method CompareTo(other: R): int => "
+                 "    (if v > other.v then -1 else "
+                 "     (if v < other.v then 1 else 0)); "
+                 "end R; ",
+                 "var a: Array<R> := [new R(3), new R(1), new R(2)]; "
+                 "var f := a.Where(lambda(x: R) => x.v <> 2).Min(); "
+                 "Console.WriteLine($\"{f.v}\"); "
+                 "var g := a.Where(lambda(x: R) => x.v <> 2).Max(); "
+                 "Console.WriteLine($\"{g.v}\"); ")),
+        "3\n"
+        "1\n");
+}
+
+// =====================================================================
+// ROW 15 — THE SAME OVER A GENERIC RECORD ELEMENT: the lazy receiver's
+// element type is the record's own INSTANTIATION, so the result is
+// `W<string>` — and the element must be read at `W<string>`'s layout.
+//
+// Pre-fix: "no member `v` on primitive type `int`".
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           where_then_min_over_a_generic_record_element) {
+    BEZEL_EXPECT_EQ(
+        out(prog(wSelfDecl(),
+                 "var a: Array<W<string>> := "
+                 "[new W<string>(3), new W<string>(1), new W<string>(2)]; "
+                 "var f := a.Where(lambda(x: W<string>) => x.v <> 2).Min(); "
+                 "Console.WriteLine($\"{f.v}\"); "
+                 "var g := a.Where(lambda(x: W<string>) => x.v <> 2).Max(); "
+                 "Console.WriteLine($\"{g.v}\"); ")),
+        "3\n"
+        "1\n");
+}
+
+// =====================================================================
+// ROW 16 — THE LAZY RECEIVER'S §5.1 CONSTRAINT: a record with NO
+// `CompareTo` has NO order, so stdlib §5.1's `where T: IComparable<T>`
+// does not hold and the call must be REFUSED.
+//
+// Pre-fix: the call was ADMITTED (the result was typed `int`), and the
+// compile then ABORTED in codegen — "Both operands to ICmp instruction
+// are not of the same type!" → "IR verification failed (malformed IR
+// emitted)". The row is RED on the base because the base never emits the
+// constraint diagnostic.
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           where_then_min_over_a_record_without_compareto_is_refused) {
+    BEZEL_EXPECT_TRUE(rejectsWith(
+        prog("record Plain(v: int) end Plain; ",
+             "var a: Array<Plain> := [new Plain(3), new Plain(1)]; "
+             "var f := a.Where(lambda(x: Plain) => x.v <> 1).Min(); "
+             "Console.WriteLine($\"{f.v}\"); "),
+        "Plain does not implement IComparable<T>"));
+}
+
+// =====================================================================
+// ROW 17 — THE LAZY RECEIVER'S §5.1 CONSTRAINT, AT THE WRONG
+// INSTANTIATION: `record W<T>(v: int): IComparable<W<int>>` does not
+// implement `IComparable<W<string>>`, so the lazy `MinOrNull()` over
+// `Array<W<string>>` is not admissible either.
+//
+// Pre-fix: the call was ADMITTED and compiled (the `CompareTo` was
+// monomorphized at the wrong layout). The row is RED on the base because
+// the base never emits the constraint diagnostic.
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           where_then_min_or_null_over_a_generic_record_at_the_wrong_instantiation_is_refused) {
+    BEZEL_EXPECT_TRUE(rejectsWith(
+        prog(wFixedDecl(),
+             "var a: Array<W<string>> := "
+             "[new W<string>(3), new W<string>(1)]; "
+             "var m := a.Where(lambda(x: W<string>) => x.v <> 1).MinOrNull(); "
+             "if m <> null then Console.WriteLine($\"{m!.v}\"); end if; "),
+        "W does not implement IComparable<T>"));
+}
+
+// =====================================================================
+// ROW 18 — CONTROL: the lazy `MinOrNull()` over a COMPARABLE record still
+// works — the new constraint check must not refuse it.
+//
+// Base and fixed: "3".
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           control_where_then_min_or_null_over_a_comparable_record) {
+    BEZEL_EXPECT_EQ(
+        out(prog("record R(v: int): IComparable<R> "
+                 "  public method CompareTo(other: R): int => "
+                 "    (if v > other.v then -1 else "
+                 "     (if v < other.v then 1 else 0)); "
+                 "end R; ",
+                 "var a: Array<R> := [new R(3), new R(1)]; "
+                 "var m := a.Where(lambda(x: R) => x.v <> 1).MinOrNull(); "
+                 "if m <> null then Console.WriteLine($\"{m!.v}\"); end if; ")),
+        "3\n");
+}
+
+// =====================================================================
+// ROW 19 — CONTROL: the lazy receiver's `int` element is unchanged (the
+// numeric no-selector path; the order is NUMERIC, so `Min()` is 1 and
+// `Max()` is 3).
+//
+// Base and fixed: "1" / "3".
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           control_where_then_min_over_an_int_element_is_unchanged) {
+    BEZEL_EXPECT_EQ(
+        out(prog("",
+                 "var a: Array<int> := [3, 1, 2]; "
+                 "var f := a.Where(lambda(x: int) => x <> 2).Min(); "
+                 "Console.WriteLine($\"{f}\"); "
+                 "var g := a.Where(lambda(x: int) => x <> 2).Max(); "
+                 "Console.WriteLine($\"{g}\"); ")),
+        "1\n"
+        "3\n");
+}
+
+// =====================================================================
+// ROW 20 — THE CONCRETE `MinOrNull()` APPLIES THE SAME §5.1 CONSTRAINT:
+// `record W<T>(v: int): IComparable<W<int>>` does not implement
+// `IComparable<W<string>>`, so the no-selector `MinOrNull()` over
+// `Array<W<string>>` is not admissible either — exactly as the sibling
+// `Min()` over the same array (row 1) is not.
+//
+// Pre-fix: `bezelc` SEGFAULTED (the `!` unwrap read past the end of the
+// refusal's bare element). The row is RED on the base because the base
+// never emits the constraint diagnostic.
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           min_or_null_over_a_generic_record_at_the_wrong_instantiation_is_refused) {
+    BEZEL_EXPECT_TRUE(rejectsWith(
+        prog(wFixedDecl(),
+             "var a: Array<W<string>> := "
+             "[new W<string>(3), new W<string>(1)]; "
+             "var m := a.MinOrNull(); "
+             "if m <> null then Console.WriteLine($\"{m!.v}\"); end if; "),
+        "W does not implement IComparable<T>"));
+}

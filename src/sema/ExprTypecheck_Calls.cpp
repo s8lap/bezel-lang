@@ -12767,6 +12767,51 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 noSelectorKeyed = true;
                             }
                         }
+                        // fix #8161 (stdlib §5.1 / §2.8 / §14.2, v0.355): the
+                        // no-selector `Min()`/`Max()` returns the ELEMENT type
+                        // `T` for EVERY `T` that satisfies §5.1's
+                        // `where T: IComparable<T>` — not only for the
+                        // numeric primitives the arm above keys off. A USER
+                        // RECORD element was left on the `int` default, so
+                        // `arr.Where(…).Min().v` did not resolve ("no member
+                        // `v` on primitive type `int`") on a program stdlib
+                        // §5.1 admits. The CONCRETE-collection path has always
+                        // typed the element here (#8092); this is the LAZY
+                        // receiver's twin.
+                        //
+                        // The §5.1 CONSTRAINT is applied with the SAME helper
+                        // the concrete path uses
+                        // (`userRecordComparableAtInstance`, §12.9's
+                        // `collectAncestorInstantiationsOf` walk), so a record
+                        // that does not implement `IComparable<T>` AT THIS
+                        // INSTANTIATION is REFUSED with the same diagnostic
+                        // instead of being admitted and then aborting the
+                        // compile in codegen (the pre-fix shape: "Both
+                        // operands to ICmp instruction are not of the same
+                        // type!" → "IR verification failed").
+                        if (!noSelectorKeyed && (m == "Min" || m == "Max") &&
+                            ce.args.empty() && srcElem && !srcElem->nullable &&
+                            srcElem->kind == TypeRef::Kind::Named &&
+                            srcElem->declaration &&
+                            srcElem->declaration->kind ==
+                                ast::TypeDeclKind::Record) {
+                            if (!userRecordComparableAtInstance(srcElem)) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string(m) +
+                                    "() without a selector requires the "
+                                    "element type to implement "
+                                    "IComparable<T> (stdlib §5.1 / §14.2 "
+                                    "/ #1198); " +
+                                    std::string(srcElem->declaration->name) +
+                                    " does not implement IComparable<T>. "
+                                    "Use " + std::string(m) +
+                                    "(selector: (T) -> U) instead.");
+                                return;
+                            }
+                            ctx_.setExprType(&ce, srcElem);
+                            noSelectorKeyed = true;
+                        }
                         if (!noSelectorKeyed)
                             ctx_.setExprType(&ce,
                                 elemIsDecimal
@@ -12846,6 +12891,28 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  ast::TypeDeclKind::Interface))
                             implIComp = declaresBuiltinInterface(
                                 srcElem->declaration, "IComparable");
+                        // fix #8161 (stdlib §5.1 / §2.8 / §14.2, v0.355): a
+                        // RECORD element was NOT gated at all on this path —
+                        // the check above covers only a class/interface
+                        // element. §5.1's constraint binds the RECORD family
+                        // too ("records and enums implementing it", spec
+                        // §14.2's conformance rule), and it binds it AT THE
+                        // INSTANTIATION: `record W<T>(v: int):
+                        // IComparable<W<int>>` does not implement
+                        // `IComparable<W<string>>`, so the no-selector
+                        // `MinOrNull()` over `Array<W<string>>` is not
+                        // admissible. The same helper the concrete-collection
+                        // path and the lazy `Min()`/`Max()` path use
+                        // (`userRecordComparableAtInstance`, §12.9's
+                        // `collectAncestorInstantiationsOf` walk) decides it,
+                        // so the three cannot disagree.
+                        if (implIComp && !srcElem->nullable &&
+                            srcElem->kind == TypeRef::Kind::Named &&
+                            srcElem->declaration &&
+                            srcElem->declaration->kind ==
+                                ast::TypeDeclKind::Record)
+                            implIComp =
+                                userRecordComparableAtInstance(srcElem);
                         if (!implIComp) {
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
@@ -15168,6 +15235,32 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                      ast::TypeDeclKind::Interface))
                                 implIComp = declaresBuiltinInterface(
                                     elem->declaration, "IComparable");
+                            // fix #8161 (stdlib §5.1 / §2.8, spec §14.2 /
+                            // §14.1, v0.355): a RECORD element is gated by the
+                            // SAME instantiation-aware predicate the
+                            // no-selector `Min()`/`Max()` arm above uses
+                            // (`userRecordComparableAtInstance`, §12.9's
+                            // `collectAncestorInstantiationsOf` walk). §5.1's
+                            // constraint binds the record family too (spec
+                            // §14.2 *Interface conformance* rule 2: "records
+                            // and enums implementing it"), and it binds it AT
+                            // THE INSTANTIATION: `record W<T>(v: int):
+                            // IComparable<W<int>>` does not implement
+                            // `IComparable<W<string>>`, so the no-selector
+                            // `MinOrNull()` over `Array<W<string>>` is not
+                            // admissible — and the sibling `Min()` over the
+                            // same array is refused. Without this gate the
+                            // shape reached codegen's generic-record
+                            // comparator and ordered the element by a
+                            // `CompareTo` monomorphized at the WRONG
+                            // instantiation.
+                            if (implIComp && !elem->nullable &&
+                                elem->kind == TypeRef::Kind::Named &&
+                                elem->declaration &&
+                                elem->declaration->kind ==
+                                    ast::TypeDeclKind::Record)
+                                implIComp =
+                                    userRecordComparableAtInstance(elem);
                             if (!implIComp) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, ce.span.begin,
