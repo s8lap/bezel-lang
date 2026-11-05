@@ -11515,6 +11515,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.exprType(*ce.args[0].value),
                             ctx_.primitiveTypeRef(PrimitiveType::Object),
                             ce.args[0].value->span.begin);
+                        // narrow #7792 fix-forward (stdlib §2.1, v0.355): the
+                        // `Object` overload renders the object a local
+                        // holding a user subclass of `TextWriter` holds.
+                        admitTextWriterSubclassLocalRead(ce.args[0].value.get());
                         // fix #7694 (§35.8, §8.6, §15.3, v0.350): the `Object`
                         // overload is a boxing position, and an owning
                         // choice / owning inline array "cannot be boxed".
@@ -11593,6 +11597,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.exprType(*ce.args[0].value),
                             ctx_.primitiveTypeRef(PrimitiveType::Object),
                             ce.args[0].value->span.begin);
+                        // narrow #7792 fix-forward: as the `Console` arm.
+                        admitTextWriterSubclassLocalRead(ce.args[0].value.get());
                         const char* moveOnlyKind7713 = nullptr;
                         TypeRef* argTy7713 = ctx_.exprType(*ce.args[0].value);
                         if (argTy7713 &&

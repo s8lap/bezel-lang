@@ -12872,6 +12872,15 @@ bool typeHasNoDefaultWalk(const TypeRef* t, const common::RecordSubstEnv* incomi
                         return true;  // interface: non-nullable reference
                                       // type (§17.11), unconditionally
                     }
+                    // narrow #7792 (stdlib §7.4, spec §7.9 / §17.11, v0.355):
+                    // `TextWriter` is an abstract class, a non-nullable
+                    // reference type with no zero value. Before this a
+                    // `var w: TextWriter;` read and a `default(TextWriter)`
+                    // were the zero descriptor, and a write through them went
+                    // silently to descriptor 0 (standard input).
+                    if (head == "TextWriter") {
+                        return true;  // abstract class: non-nullable reference
+                    }
                     // fix #4309 (§17.11, v0.298; send-back on #4294): the
                     // 25-name closed set of every OTHER null-declaration
                     // builtin interface — see

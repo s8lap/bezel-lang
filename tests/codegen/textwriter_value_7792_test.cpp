@@ -25,10 +25,14 @@
 // `Console.Error` asserts that the text did NOT reach stdout.
 //
 // NOT COVERED (narrow #7792): a user subclass of `TextWriter` (stdlib §1
-// *Extensibility* opens it) cannot be held in a `TextWriter` location by this
-// compiler. The conversion is now a located compile error instead of an 8-byte
-// pointer stored into the 4-byte slot (a heap overrun) or an IR verifier
-// abort; the last rows pin that.
+// *Extensibility* opens it) cannot be held in a `TextWriter` field, parameter,
+// return, element or generic argument by this compiler. That conversion is a
+// located compile error instead of an 8-byte pointer stored into the 4-byte
+// slot (a heap overrun) or an IR verifier abort. A LOCAL declared `TextWriter`
+// holds the object itself, so its object uses (`is` / `as` a user type,
+// `Object`, `=`, printing) run, and every use as a built-in `TextWriter` is
+// rejected. A `TextWriter` never given a stream is a §7.9 / §17.11 compile
+// error, as for a user class. The last rows pin all of that.
 
 #include <memory>
 #include <string>
@@ -341,4 +345,139 @@ BEZEL_TEST(textwriter_value_7792, user_subclass_declaration_still_admitted_1) {
         "return 0; end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("[a]<c>\n"));
+}
+
+// narrow #7792 fix-forward: a LOCAL declared `TextWriter` and initialized with
+// a user subclass holds the object itself, so every use that reads it AS that
+// object runs (the review's f01 f02 f03 f07 c06 c08, which the first narrow
+// fix rejected): `as` / `is` a user type, `Console.WriteLine` (the `Object`
+// overload, stdlib §2.1), `=` against the subclass value and against `null`,
+// an `Object` parameter, a `TextWriter?` local, an interpolation hole.
+BEZEL_TEST(textwriter_value_7792, user_subclass_local_object_uses_run_7_4) {
+    const std::string pre = std::string("module M; ") + kSub;
+    struct Row { const char* body; const char* out; };
+    const Row rows[] = {
+        // f01: downcast back and type test.
+        {"class P public static method Main() var w := new W(); var t: TextWriter := w; "
+         "var back := t as W; if back <> null then back.Write(\"dc\"); end if; "
+         "Console.WriteLine(t is W); end Main; end P;",
+         "[dc]True\n"},
+        // f02: printed through the `Object` overload, and compared.
+        {"class P public static method Main() var w := new W(); var t: TextWriter := w; "
+         "Console.WriteLine(t); Console.WriteLine(t = w); end Main; end P;",
+         "M.W\nTrue\n"},
+        // f03: passed to an `Object` parameter.
+        {"class P static method Q(o: Object) Console.WriteLine(\"q\"); end Q; "
+         "public static method Main() var w := new W(); var t: TextWriter := w; Q(t); "
+         "end Main; end P;",
+         "q\n"},
+        // f07: the round trip keeps the object.
+        {"class P public static method Main() var w := new W(); var t: TextWriter := w; "
+         "var b := t as W; if b <> null then b.Write(\"rt\"); else Console.WriteLine(\"lost\"); "
+         "end if; Console.WriteLine(); end Main; end P;",
+         "[rt]\n"},
+        // c06: compared with `null`.
+        {"class P public static method Main() var w := new W(); var t: TextWriter := w; "
+         "Console.WriteLine(t = null); Console.WriteLine(\"ok\"); end Main; end P;",
+         "False\nok\n"},
+        // c08: a `TextWriter?` local.
+        {"class P public static method Main() var w := new W(); var t: TextWriter? := w; "
+         "Console.WriteLine(t = null); end Main; end P;",
+         "False\n"},
+        // An interpolation hole renders the object (§18.5).
+        {"class P public static method Main() var w := new W(); var t: TextWriter := w; "
+         "Console.WriteLine($\"<{t}>\"); end Main; end P;",
+         "<M.W>\n"},
+    };
+    for (const Row& row : rows) {
+        auto r = runAotChecked(pre + row.body);
+        BEZEL_EXPECT_TRUE(r.ran);
+        BEZEL_EXPECT_EQ(r.exitCode, 0);
+        BEZEL_EXPECT_EQ(r.stdoutText, std::string(row.out));
+    }
+}
+
+// narrow #7792 fix-forward: such a local repeated in a loop does not leak
+// (the object is owned by `w`; `t` only names it).
+BEZEL_TEST(textwriter_value_7792, user_subclass_local_in_loop_no_leak_7_4) {
+    auto r = runAotChecked(std::string("module M; ") + kSub +
+        "class P public static method Main() var i := 0; "
+        "while i < 200 do using var w := new W(); var t: TextWriter := w; "
+        "if t is W then i := i + 1; end if; end while; "
+        "Console.WriteLine(i); end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("200\n"));
+}
+
+// narrow #7792 fix-forward: every OTHER use of such a local would read it as
+// a built-in `TextWriter` (a descriptor), so it stays a located compile error:
+// a `TextWriter` receiver, a `TextWriter` parameter, a copy to another local,
+// a reassignment, `??`, `as TextWriter`, comparison with `Console.Out`.
+BEZEL_TEST(textwriter_value_7792, user_subclass_local_textwriter_uses_rejected_7_4) {
+    const std::string pre = std::string("module M; ") + kSub;
+    const char* bodies[] = {
+        "class P public static method Main() var w := new W(); var t: TextWriter := w; "
+        "t.Write(\"x\"); end Main; end P;",
+        "class P static method E(u: TextWriter) u.WriteLine(\"x\"); end E; "
+        "public static method Main() var w := new W(); var t: TextWriter := w; E(t); "
+        "end Main; end P;",
+        "class P public static method Main() var w := new W(); var t: TextWriter := w; "
+        "var u: TextWriter := t; u.WriteLine(\"x\"); end Main; end P;",
+        "class P public static method Main() var w := new W(); var t: TextWriter := w; "
+        "t := Console.Out; t.WriteLine(\"x\"); end Main; end P;",
+        "class P public static method Main() var w := new W(); var t: TextWriter? := w; "
+        "var u := t ?? Console.Out; u.WriteLine(\"x\"); end Main; end P;",
+        "class P public static method Main() var w := new W(); var t: TextWriter := w; "
+        "var u := t as TextWriter; Console.WriteLine(u = null); end Main; end P;",
+        "class P public static method Main() var w := new W(); var t: TextWriter := w; "
+        "Console.WriteLine(t = Console.Out); end Main; end P;",
+    };
+    for (const char* b : bodies) {
+        auto r = runAot(pre + b);
+        BEZEL_EXPECT_FALSE(r.ran);
+        BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+        BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, kSubNeedle));
+    }
+}
+
+// narrow #7792 fix-forward: a `TextWriter` that was never given a stream is a
+// compile error, as for a user class (spec §7.9; §17.11 `default(T)`), not a
+// write to descriptor 0 (the review's a17, a16, a09).
+BEZEL_TEST(textwriter_value_7792, unassigned_textwriter_rejected_7_9) {
+    struct Row { const char* src; const char* needle; };
+    const Row rows[] = {
+        {"module M; class P public static method Main() var w: TextWriter; "
+         "Console.WriteLine(\"a\"); w.WriteLine(\"unassigned\"); Console.WriteLine(\"b\"); "
+         "end Main; end P;",
+         "read of unassigned local `w`"},
+        {"module M; class H private w: TextWriter; public constructor() end constructor; "
+         "public method Go() w.WriteLine(\"field-default\"); end Go; end H; "
+         "class P public static method Main() var h := new H(); h.Go(); end Main; end P;",
+         "constructor does not initialize non-nullable field `w`"},
+        {"module M; class P public static method Main() "
+         "var w: TextWriter := default(TextWriter); w.WriteLine(\"default-writer\"); "
+         "end Main; end P;",
+         "`default(T)` is a compile error for a non-nullable reference type"},
+    };
+    for (const Row& row : rows) {
+        auto r = runAot(row.src);
+        BEZEL_EXPECT_FALSE(r.ran);
+        BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+        BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, row.needle));
+    }
+}
+
+// Control: an assigned `TextWriter` local / field still compiles and writes.
+BEZEL_TEST(textwriter_value_7792, assigned_textwriter_local_and_field_run_7_9) {
+    auto r = runAotChecked(
+        "module M; class H private w: TextWriter; "
+        "public constructor() w := Console.Out; end constructor; "
+        "public method Go() w.WriteLine(\"field\"); end Go; end H; "
+        "class P public static method Main() var w: TextWriter; "
+        "var b := true; if b then w := Console.Out; else w := Console.Error; end if; "
+        "w.WriteLine(\"local\"); var h := new H(); h.Go(); end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("local\nfield\n"));
 }

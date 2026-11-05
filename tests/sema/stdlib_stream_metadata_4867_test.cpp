@@ -35,7 +35,10 @@ namespace {
 // Whole program that imports System.IO and uses Stream/TextReader/TextWriter
 // as parameter types.  Uses default(Stream) to avoid definite-assignment
 // issues with uninitialized locals; the observable is printed to stdout so
-// the exit code remains available for the harness to assert.
+// the exit code remains available for the harness to assert.  The
+// `TextWriter` argument is `Console.Out` (stdlib §2.1, v0.355):
+// `default(TextWriter)` is a compile error for a non-nullable reference type
+// (spec §17.11, v0.355), enforced since narrow #7792.
 std::string prog() {
     return "module M; "
            "import System.IO; "
@@ -50,7 +53,7 @@ std::string prog() {
            "    return 3; "
            "  end TakeTextWriter; "
            "  public static method Main(): int "
-           "    Console.WriteLine(TakeStream(default(Stream)) + TakeTextReader(default(TextReader)) + TakeTextWriter(default(TextWriter))); "
+           "    Console.WriteLine(TakeStream(default(Stream)) + TakeTextReader(default(TextReader)) + TakeTextWriter(Console.Out)); "
            "    return 0; "
            "  end Main; "
            "end C;";

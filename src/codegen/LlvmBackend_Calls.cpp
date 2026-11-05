@@ -832,7 +832,14 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             if (freshFnArg) emitClosureRelease(arg);
             releaseRender = true;
         } else if (argTy->kind == sema::TypeRef::Kind::Named &&
-                   (argTy->declaration || isVtablelessBuiltinRef(argTy))) {
+                   (argTy->declaration || isVtablelessBuiltinRef(argTy) ||
+                    // narrow #7792 fix-forward (stdlib §2.1 / §7.4, v0.355):
+                    // a `TextWriter` local initialized with a user subclass
+                    // instance holds the object pointer (sema admits only
+                    // the object-reading uses), so it renders as that object
+                    // (its `ToString`), not as the bytes of a string.
+                    (isBuiltinTextWriterTypeRef(argTy) &&
+                     arg->getType()->isPointerTy()))) {
             // fix #6753 (stdlib §2.1 / §3.1, v0.340): admits the declaration-less
             // vtable-less classes too. `emitValueToString` renders them (a `T?`
             // through its nullable-ref arm, a `StringBuilder` by its content, the

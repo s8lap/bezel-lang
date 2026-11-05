@@ -416,6 +416,9 @@ void ExprTC::run(const ast::SourceFile& src) {
     // of the join above — `v as ReferenceTarget` where `v`'s declared type is
     // the bare type parameter.
     checkDeferredAsOperandInstantiations();
+    // narrow #7792 fix-forward: after every body is typed, so every read of
+    // such a local, and every admitted position, has been seen.
+    checkTextWriterSubclassLocalReads();
 }
 
 
@@ -6918,6 +6921,132 @@ void ExprTC::checkBorrowErasingPosition(TypeRef* from, TypeRef* to,
             "or store its backing buffer instead)");
 }
 
+// narrow #7792 (stdlib §1 *Extensibility*, §7.4, v0.355): does the user type
+// `root` derive, directly or through other user types, from the built-in
+// `TextWriter`?
+static bool typeReachesBuiltinTextWriter(const TypeSymbol* root) {
+    std::vector<const TypeSymbol*> work{root};
+    std::unordered_set<const TypeSymbol*> seen;
+    while (!work.empty() && seen.size() < 256) {
+        const TypeSymbol* ts = work.back();
+        work.pop_back();
+        if (!ts || !seen.insert(ts).second) continue;
+        for (const TypeRef* br : nonSymbolBaseRefsOf(ts))
+            if (br && br->kind == TypeRef::Kind::Named && !br->declaration &&
+                br->headName() == "TextWriter")
+                return true;
+        for (const TypeSymbol* b : ts->baseTypes) work.push_back(b);
+    }
+    return false;
+}
+
+// narrow #7792 fix-forward: see `textWriterSubclassLocalInit_`.
+const std::string* ExprTC::textWriterSubclassLocalRead(const ast::Expr* e) const {
+    if (!e || textWriterSubclassLocals_.empty()) return nullptr;
+    if (!dynamic_cast<const ast::IdentifierExpr*>(e)) return nullptr;
+    auto* ls = dynamic_cast<const LocalSymbol*>(ctx_.exprSymbol(*e));
+    if (!ls) return nullptr;
+    auto it = textWriterSubclassLocals_.find(ls);
+    return it == textWriterSubclassLocals_.end() ? nullptr : &it->second;
+}
+
+// narrow #7792 fix-forward: the operand positions that read the local as the
+// object it holds. `a = b` / `a <> b` compares the two pointers, so it is
+// admitted when the other operand is another such local or a typed value that
+// is not a built-in `TextWriter` (an i32 descriptor, a different
+// representation). `is` / `as` read the object's runtime type, so they are
+// admitted unless the target is `TextWriter` itself (whose result would be a
+// `TextWriter` value holding the pointer). An interpolation hole renders the
+// object (its `ToString`, §18.5).
+void ExprTC::admitTextWriterSubclassOperandReads(const ast::Expr& e) {
+    if (textWriterSubclassLocals_.empty()) return;
+    auto isBuiltinTw = [](const TypeRef* t) {
+        return t && t->kind == TypeRef::Kind::Named && !t->declaration &&
+               t->genericArgs.empty() && t->headName() == "TextWriter";
+    };
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if ((be->op != "=" && be->op != "<>") || !be->left || !be->right)
+            return;
+        const ast::Expr* l = be->left.get();
+        const ast::Expr* r = be->right.get();
+        const bool lt = textWriterSubclassLocalRead(l) != nullptr;
+        const bool rt = textWriterSubclassLocalRead(r) != nullptr;
+        // An UNTYPED operand is not admitted against: `Console.Out` /
+        // `Console.Error` are left untyped by design (see
+        // consoleStreamInferredType) and are descriptors.
+        auto objectOperand = [&](const ast::Expr* o) {
+            if (dynamic_cast<const ast::NullLiteralExpr*>(o)) return true;
+            const TypeRef* ot = ctx_.exprType(*o);
+            return ot && !isBuiltinTw(ot);
+        };
+        if (lt && (rt || objectOperand(r)))
+            textWriterSubclassReadOk_.insert(l);
+        if (rt && (lt || objectOperand(l)))
+            textWriterSubclassReadOk_.insert(r);
+        return;
+    }
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (!te->operand || !te->testType) return;
+        const TypeRef* target = ctx_.resolvedType(*te->testType);
+        if (!target || isBuiltinTw(target)) return;
+        admitTextWriterSubclassLocalRead(te->operand.get());
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : is->parts)
+            if (part.expr) admitTextWriterSubclassLocalRead(part.expr.get());
+        return;
+    }
+}
+
+// narrow #7792 fix-forward: every read of a local that holds a user subclass
+// of `TextWriter`, outside the admitted positions, is a located compile error.
+// Such a read used as a `TextWriter` (a receiver of `Write` / `WriteLine` /
+// `Flush`, a `TextWriter` argument, field, return value or local, the operand
+// of `??` or `!`, a `ref` / `out` argument, an assignment target) would treat
+// the object pointer as a stream descriptor. MEASURED before this check: a
+// copy into another `TextWriter` local or a `??` printed nothing, a `ref`
+// argument the callee reassigned left the slot holding the object, and a
+// field store or a `TextWriter` argument aborted the IR verifier.
+void ExprTC::checkTextWriterSubclassLocalReads() {
+    if (textWriterSubclassLocals_.empty()) return;
+    struct Bad {
+        SourceLocation loc;
+        std::string name;
+        std::string sub;
+    };
+    std::vector<Bad> bad;
+    for (const auto& [e, sym] : ctx_.allExprSymbols()) {
+        const std::string* sub = textWriterSubclassLocalRead(e);
+        if (!sub) continue;
+        if (textWriterSubclassReadOk_.count(e) &&
+            !textWriterSubclassReadDenied_.count(e))
+            continue;
+        auto* id = static_cast<const ast::IdentifierExpr*>(e);
+        bad.push_back({e->span.begin, std::string(id->name), *sub});
+    }
+    // The map is unordered: report in source order, once per location.
+    std::sort(bad.begin(), bad.end(), [](const Bad& a, const Bad& b) {
+        if (a.loc.line != b.loc.line) return a.loc.line < b.loc.line;
+        return a.loc.column < b.loc.column;
+    });
+    for (std::size_t i = 0; i < bad.size(); ++i) {
+        if (i > 0 && bad[i].loc.line == bad[i - 1].loc.line &&
+            bad[i].loc.column == bad[i - 1].loc.column)
+            continue;
+        ctx_.diagnostics().report(
+            Severity::Error, bad[i].loc,
+            "the local `" + bad[i].name + "` holds a `" + bad[i].sub +
+            "`, a user subclass of `TextWriter`; converting it to the "
+            "built-in `TextWriter` type is not implemented by this compiler, "
+            "so this use of it is rejected. Such a local may be compared "
+            "(`=`, `<>`), tested or cast to a user type (`is`, `as`), "
+            "converted to `Object`, interpolated, or written with "
+            "`Console.Write` / `WriteLine`; it may not be assigned again "
+            "(stdlib \xC2\xA7""7.4, #7792)");
+    }
+}
+
 void ExprTC::checkAssignable(
     TypeRef* from, TypeRef* to, SourceLocation loc, const std::string& what,
     const ast::Expr* fromExpr,
@@ -6965,19 +7094,13 @@ void ExprTC::checkAssignable(
     if (to->kind == TypeRef::Kind::Named && !to->declaration &&
         to->genericArgs.empty() && to->headName() == "TextWriter" &&
         from->kind == TypeRef::Kind::Named && from->declaration) {
-        bool reaches = false;
-        std::vector<const TypeSymbol*> work{from->declaration};
-        std::unordered_set<const TypeSymbol*> seen;
-        while (!work.empty() && !reaches && seen.size() < 256) {
-            const TypeSymbol* ts = work.back();
-            work.pop_back();
-            if (!ts || !seen.insert(ts).second) continue;
-            for (const TypeRef* br : nonSymbolBaseRefsOf(ts))
-                if (br && br->kind == TypeRef::Kind::Named &&
-                    !br->declaration && br->headName() == "TextWriter")
-                    reaches = true;
-            for (const TypeSymbol* b : ts->baseTypes) work.push_back(b);
-        }
+        bool reaches = typeReachesBuiltinTextWriter(from->declaration);
+        // narrow #7792 fix-forward: the initializer of a local declared
+        // `TextWriter` / `TextWriter?` is admitted (see
+        // `textWriterSubclassLocalInit_`); the LocalDecl arm records the local
+        // and `checkTextWriterSubclassLocalReads` gates its uses.
+        if (reaches && fromExpr && fromExpr == textWriterSubclassLocalInit_)
+            reaches = false;
         if (reaches) {
             ctx_.diagnostics().report(
                 Severity::Error, loc,
@@ -6990,6 +7113,18 @@ void ExprTC::checkAssignable(
                 "(stdlib \xC2\xA7""7.4, #7792)");
             return;
         }
+    }
+    // narrow #7792 fix-forward: a read of a local that holds a user subclass
+    // of `TextWriter` (see `textWriterSubclassLocalInit_`). Converted to
+    // `Object` it is the object it holds, so the read is admitted; converted
+    // to anything else (`TextWriter`, `TextWriter?`, a type parameter) the
+    // pointer would be read as a stream descriptor, so the read is denied.
+    if (fromExpr && textWriterSubclassLocalRead(fromExpr)) {
+        if (to->kind == TypeRef::Kind::Primitive &&
+            to->primitive == PrimitiveType::Object)
+            textWriterSubclassReadOk_.insert(fromExpr);
+        else
+            textWriterSubclassReadDenied_.insert(fromExpr);
     }
     // fix #2912 (§8.6 *Boxing of inline arrays*, v0.240) — the whole rule:
     //
@@ -26028,12 +26163,29 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // — the same rule now applies at every §5.1 conversion site, so
                 // this arm no longer carries its own copy.
                 if (ld->initializer) {
+                    // narrow #7792 fix-forward (stdlib §7.4, v0.355): a local
+                    // declared `TextWriter` / `TextWriter?` may be initialized
+                    // with a user subclass instance (the one admitted position,
+                    // see `textWriterSubclassLocalInit_`).
+                    const ast::Expr* const savedTwInit =
+                        textWriterSubclassLocalInit_;
+                    textWriterSubclassLocalInit_ = ld->initializer.get();
                     checkAssignableRangeSite(
                         ctx_.exprType(*ld->initializer),
                         lsym->declType, ld->initializer->span.begin,
                         std::string("initializer for `") +
                         std::string(ld->name) + "`",
                         ld->initializer.get());  // §27.6 #756 property-ref
+                    textWriterSubclassLocalInit_ = savedTwInit;
+                    const TypeRef* dt = lsym->declType;
+                    const TypeRef* it = ctx_.exprType(*ld->initializer);
+                    if (dt && dt->kind == TypeRef::Kind::Named &&
+                        !dt->declaration && dt->genericArgs.empty() &&
+                        dt->headName() == "TextWriter" && it &&
+                        it->kind == TypeRef::Kind::Named && it->declaration &&
+                        typeReachesBuiltinTextWriter(it->declaration))
+                        textWriterSubclassLocals_[lsym] =
+                            std::string(namedTypeSimpleName(it));
                 }
             } else if (ld->initializer) {
                 // per §15.4: a collection literal has no standalone type; a

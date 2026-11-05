@@ -4530,6 +4530,39 @@ private:
     // position rejects the conversion, naming #7029. Set only through
     // `RangeIEnumSite`, which restores the previous value.
     const ast::Expr* rangeIEnumSiteExpr_ = nullptr;
+    // narrow #7792 fix-forward (stdlib §1 *Extensibility*, §7.4, v0.355): a
+    // user subclass of the built-in `TextWriter` has no representation in a
+    // `TextWriter` location (one is the i32 descriptor of a standard stream,
+    // the other an object pointer), so `checkAssignable` rejects the
+    // conversion. ONE position is admitted: the initializer of a local
+    // declared `TextWriter` / `TextWriter?` (`var t: TextWriter := w;`). That
+    // local's slot takes the initializer's own lowering (the object pointer),
+    // so the uses that read it as an object (`is` / `as`, `=` / `<>`, a
+    // conversion to `Object`, an interpolation hole, `Console.Write(Line)`)
+    // are correct. Every other use of the local would treat the pointer as a
+    // descriptor, and is rejected by `checkTextWriterSubclassLocalReads` at the
+    // end of `run`.
+    //
+    // `textWriterSubclassLocalInit_`: the initializer being checked (keyed on
+    // the expression, so a conditional's leaves never inherit it).
+    // `textWriterSubclassLocals_`: each such local and its subclass's name.
+    // `textWriterSubclassReadOk_`: the reads of one found in an admitted
+    // position. `textWriterSubclassReadDenied_`: the reads converted to a
+    // non-`Object` type, rejected even when another visit admitted them.
+    const ast::Expr* textWriterSubclassLocalInit_ = nullptr;
+    std::unordered_map<const LocalSymbol*, std::string> textWriterSubclassLocals_;
+    std::unordered_set<const ast::Expr*> textWriterSubclassReadOk_;
+    std::unordered_set<const ast::Expr*> textWriterSubclassReadDenied_;
+    // The subclass name when `e` is a bare read of such a local, else null.
+    const std::string* textWriterSubclassLocalRead(const ast::Expr* e) const;
+    // Admits `e` when it is such a read (a no-op otherwise).
+    void admitTextWriterSubclassLocalRead(const ast::Expr* e) {
+        if (textWriterSubclassLocalRead(e)) textWriterSubclassReadOk_.insert(e);
+    }
+    // The admitted positions of `e`'s operands (`=` / `<>`, `is` / `as`, an
+    // interpolation hole). Called from visitExpr once `e` is typed.
+    void admitTextWriterSubclassOperandReads(const ast::Expr& e);
+    void checkTextWriterSubclassLocalReads();
     struct RangeIEnumSite {
         const ast::Expr*& slot;
         const ast::Expr* saved;

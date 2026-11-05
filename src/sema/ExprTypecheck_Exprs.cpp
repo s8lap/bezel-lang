@@ -4890,6 +4890,9 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                           formatVocabularyRejectMessage(t));
             }
         }
+        // narrow #7792 fix-forward: a hole renders its operand (§18.5), so it
+        // may read a local holding a user subclass of `TextWriter`.
+        admitTextWriterSubclassOperandReads(e);
         ctx_.setExprType(
             &e, ctx_.primitiveTypeRef(PrimitiveType::String));
         return;
@@ -5021,6 +5024,9 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     if (auto* cnd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
         typeConditional(*cnd, e);
     }
+    // narrow #7792 fix-forward (stdlib §7.4, v0.355): the operand positions
+    // that may read a local holding a user subclass of `TextWriter`.
+    admitTextWriterSubclassOperandReads(e);
     // §17.4: `is` / `is not` yield bool; `as` yields the nullable form
     // of the target type (a failed cast is null). Recording it lets
     // `(x as T)` — and member access on its result — resolve.

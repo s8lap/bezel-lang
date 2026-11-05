@@ -60,6 +60,11 @@ bool isBuiltinClassTypeRef(const sema::TypeRef* rt) {
     std::string_view n = rt->headName();
     if (n.empty()) return false;
     if (common::isBuiltinExceptionName(n)) return true;
+    // narrow #7792 (stdlib §7.4, spec §7.9, v0.355): `TextWriter` is an
+    // abstract class, so a non-nullable `TextWriter` field has no default.
+    // Its slot is the i32 descriptor of a standard stream (not in the heap-
+    // pointer table), and a zero slot wrote silently to descriptor 0.
+    if (n == "TextWriter") return true;
     return common::isReservedBuiltinTypeName(n) &&
            common::isHeapPointerReferenceBuiltin(n);
 }
