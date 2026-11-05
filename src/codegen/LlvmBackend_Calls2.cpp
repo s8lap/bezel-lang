@@ -19148,6 +19148,23 @@ static bool isBareTypeParamRef(const sema::TypeRef* arg) {
             (!arg->astNode && !arg->importedName.empty()));
 }
 
+// fix #6530 (§14.1 / §2.7, v0.355): is `arg` — a bare-parameter-SHAPED ref
+// (the test above, plus no generic args of its own) — one of the parameters
+// `levelParams` DECLARES? The scope's own parameter list is the only sound
+// answer to "is this spelling a type parameter here": a reserved-builtin
+// NAME test (`Emitter::isBareTypeParamRef`) reads a parameter spelled
+// `Guid` / `Range` as the built-in. Used by `computeAncestorGenericSubst`,
+// where every bare spelling in a base clause was resolved in the declaring
+// level's scope, so the level's declared list IS that scope's answer.
+static bool isLevelParamRef(const sema::TypeRef* arg,
+                            const std::vector<std::string_view>& levelParams) {
+    if (!isBareTypeParamRef(arg) || !arg->genericArgs.empty()) return false;
+    const std::string_view head = arg->headName();
+    for (std::string_view p : levelParams)
+        if (p == head) return true;
+    return false;
+}
+
 // §12 / §14 (issue #585): see the header comment in LlvmBackend_impl.hpp. Walk
 // the base-class chain from `recvTy`'s declaration up to `ancestor`, resolving
 // each level's base type-arguments through the level below, then fill the
@@ -19281,6 +19298,10 @@ bool Emitter::computeAncestorGenericSubst(
                 sema::genericParamNames(base);
             if (!baseRef || baseParams.size() != baseRef->genericArgs.size())
                 return false;
+            // fix #6530: the parameters THIS level declares — the scope the
+            // base clause's bare spellings were resolved in (§14.1).
+            const std::vector<std::string_view> levelParams =
+                sema::genericParamNames(cur);
             for (std::size_t gi = 0; gi < baseParams.size(); ++gi) {
                 const sema::TypeRef* arg = baseRef->genericArgs[gi];
                 // A bare generic-parameter reference: locally that is a
@@ -19293,9 +19314,31 @@ bool Emitter::computeAncestorGenericSubst(
                 // bound T to the bare-param ref and lowerTypeRef produced the
                 // i32 placeholder — a specialized-looking `Container$specN`
                 // with the WRONG (template) field layout.
-                if (isBareTypeParamRef(arg)) {
+                //
+                // fix #6530 (§14.1, v0.355): "is this base-clause argument a
+                // parameter of `cur`?" is answered by `cur`'s DECLARED
+                // parameter list, not by the name-keyed member
+                // `Emitter::isBareTypeParamRef` this unqualified call used to
+                // reach (class scope shadows the file-static of the same
+                // name above). That member reads "not a reserved builtin
+                // name, therefore a parameter", so `class Derived<Guid>:
+                // Base<Guid>` at `Derived<int>` bound Base's `K` to the bare
+                // `Guid` ref itself, lowerTypeRef read it as the 16-byte
+                // built-in, and `D[0] := 11; return D[0]` on the inherited
+                // `Dictionary<K, int>` threw KeyNotFoundException (review
+                // r39-rev-6530b, probe a9), while the `T` twin printed 11.
+                // §2.7 / §14.1: inside `Derived<Guid>`'s declaration the bare
+                // spelling `Guid` IS the parameter; a built-in reaches this
+                // walk only from a level that does not declare the name
+                // (`class D: Base<Guid>`), where it stays the built-in.
+                if (isLevelParamRef(arg, levelParams)) {
                     auto it = curArgs.find(arg->headName());
-                    if (it != curArgs.end()) arg = it->second;
+                    // A parameter this level never pinned: the chain cannot
+                    // be resolved (the #2909 refusal, now taken at the level
+                    // that asked, so a builtin-named parameter cannot pass
+                    // the end check below as "concrete").
+                    if (it == curArgs.end() || !it->second) return false;
+                    arg = it->second;
                 }
                 nextArgs[baseParams[gi]] = arg;
             }
@@ -19319,7 +19362,17 @@ bool Emitter::computeAncestorGenericSubst(
         // substituted with placeholder" bug. Concreteness means: not a
         // bare generic-parameter reference (Named with no declaration +
         // single-part name / importedName).
-        if (isBareTypeParamRef(it->second)) return false;
+        //
+        // fix #6530 (§14.1, v0.355): the name-keyed member test cannot see a
+        // parameter spelled like a built-in (`Guid`, `Range`), so a seed that
+        // bound such a parameter to its own bare ref passed here as
+        // "concrete" and lowered to the built-in's layout. The resolver's own
+        // per-TypeRef record (`TypeRef::typeParam`: this spelling bound to a
+        // type-parameter marker in its scope) is the second, name-free test;
+        // a ref the resolver did not produce (imported, no AST node) keeps
+        // the name test, so this only ADDS refusals, in #2909's direction.
+        if (isBareTypeParamRef(it->second) || it->second->isResolvedTypeParam())
+            return false;
         outSubst[gp->name] = lowerTypeRef(it->second);
         outSema[gp->name] = it->second;
     }

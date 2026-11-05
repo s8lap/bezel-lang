@@ -5348,10 +5348,14 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     return;
                 }
             }
-            // fix #6530 (§14.1, v0.355): record that THIS spelling bound to
-            // a type parameter, so a later reader can tell it from a built-in
-            // of the same name that reached the same body from elsewhere.
-            const_cast<ast::Type&>(t).resolvedAsTypeParam = true;
+            // fix #6530 (§14.1, v0.355): record ON THIS TypeRef that the
+            // spelling bound to a type parameter of the scope it was resolved
+            // in, so a later reader can tell it from a built-in of the same
+            // name that reached the same body from another declaration. The
+            // record is per-resolution (per TypeRef), not on `t`: the same
+            // AST node can be resolved again in another scope (an alias body
+            // at each of its use sites), where the answer may differ.
+            ref.typeParam = true;
             return;
         }
         // fix #5172 (§2.2, v0.310): arity selects among rule 1's types.

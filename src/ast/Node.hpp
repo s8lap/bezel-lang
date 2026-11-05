@@ -1019,12 +1019,6 @@ struct Type : Node {
     // dropped from `name`. The type then always names the BUILT-IN: scope
     // lookup (type parameter, module type, imported type) must not capture it.
     bool aliasQualifiedBuiltin = false;
-    // fix #6530 (§14.1, v0.355): set by sema when this bare name resolved to
-    // a TYPE-PARAMETER marker of an enclosing declaration's scope. A
-    // declaration-less single-part Named TypeRef has the same shape for a
-    // built-in and for a type parameter (see `TypeRef::isAliasQualifiedBuiltin`),
-    // so this records which one the resolver actually chose at the spelling.
-    bool resolvedAsTypeParam = false;
     // InlineArray (`[N]T` / `[N owned]T`):
     std::unique_ptr<Expr> arraySize;
     bool arrayOwned = false;

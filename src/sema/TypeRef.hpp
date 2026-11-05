@@ -107,15 +107,31 @@ struct TypeRef {
         return astNode && astNode->aliasQualifiedBuiltin;
     }
 
-    // fix #6530 (§14.1, v0.355): true when the spelling this TypeRef was
-    // resolved from bound to a TYPE PARAMETER in its own declaration's scope
-    // (stamped by `Resolver::resolveNamed`). It is a fact about where the
-    // TypeRef CAME FROM, not about its name: a built-in `Guid` declared in a
-    // non-generic class's field stays unstamped when it reaches the body of
-    // a `class Box<Guid>`.
-    bool isResolvedTypeParam() const {
-        return astNode && astNode->resolvedAsTypeParam;
-    }
+    // fix #6530 (§14.1, v0.355): set by `Resolver::resolveNamed` when the
+    // spelling THIS TypeRef was resolved from bound to a TYPE-PARAMETER
+    // marker of the scope it was resolved IN. A declaration-less single-part
+    // Named TypeRef has the same shape for a built-in and for a type
+    // parameter (see `isAliasQualifiedBuiltin` above), and the NAME cannot
+    // tell them apart (`class Box<Guid>` makes the names equal), so this
+    // records which one the resolver chose.
+    //
+    // The record lives on the TypeRef, i.e. on the (spelling, scope) PAIR,
+    // never on the shared `ast::Type` node: `resolveType` makes a fresh
+    // TypeRef per resolution, while one AST node can be resolved in several
+    // scopes — a non-generic alias body (`type GMap := Dictionary<Guid,
+    // int>`) is re-resolved at every use site in THAT site's scope, so a
+    // stamp on the node written by `F<Guid>(d: GMap)` would leak into
+    // `Holder.D: GMap`, whose key is the built-in (review r39-rev-6530b,
+    // probe r8). A copy of a TypeRef (`SubstArgs`, the alias arm's copy of
+    // the underlying type) carries the record with it, which is right: the
+    // copy stands for the same resolution.
+    //
+    // Readers: `ExprTC::isInScopeTypeParamRef`. A TypeRef built without the
+    // resolver (module metadata, sema-synthesised refs) stays false, and the
+    // reader falls back to the name test, so such a ref is never read as a
+    // type parameter it is not — the fail-closed direction.
+    bool typeParam = false;
+    bool isResolvedTypeParam() const { return typeParam; }
 
     // InlineArray:
     const ast::Expr* arraySize = nullptr;   // ConstIntExpr; sema later evaluates

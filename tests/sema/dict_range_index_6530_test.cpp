@@ -38,10 +38,13 @@
 //
 // THE FIX. The bare-type-parameter test is now ONE helper
 // (`ExprTC::isInScopeTypeParamRef`, §14.1) that asks whether the TypeRef's
-// own spelling RESOLVED to a type parameter (the resolver stamps the AST node)
-// AND that parameter is declared by the enclosing method, type or extension
-// block, with the name-keyed registry test surviving only as the fallback for
-// an unstamped TypeRef — where it still keeps #6500's own rule that a MISSED
+// own spelling RESOLVED to a type parameter (the resolver records it ON THE
+// TYPEREF it produces for that resolution — never on the shared AST node,
+// which an alias body re-resolves at every use site, in that site's scope:
+// rows r8/r8b/r8c at the end of this file) AND that parameter is declared by
+// the enclosing method, type or extension block, with the name-keyed registry
+// test surviving only as the fallback for a TypeRef the resolver did not
+// produce — where it still keeps #6500's own rule that a MISSED
 // built-in name costs a rejection that does not fire rather than one that
 // fires falsely.
 //
@@ -542,4 +545,120 @@ BEZEL_TEST(dict_range_index_6530,
                     "  end Main;\n"
                     "end Program;\n");
     BEZEL_EXPECT_TRUE(rejectedWith(r, kIndexArgMsg));
+}
+
+// ── The SAME built-in key, reached through a type ALIAS ──────────────────
+//
+// §27.8 (v0.355): a type alias is a "pure synonym" of the underlying type;
+// `type GMap := Dictionary<Guid, int>` names the §2.6 built-in key once, at
+// its (non-generic) declaration. The resolver re-resolves an alias body at
+// EVERY use site, in that site's scope (`aliasScope.parent = scope`, #4105),
+// so the alias's ONE `ast::Type` node for `Guid` is resolved both inside
+// `F<Guid>(d: GMap)` — where it is the parameter — and at `Holder.D: GMap` —
+// where it is the built-in. The second attempt at #6530 recorded "resolved as
+// a type parameter" ON THAT SHARED NODE, and the record written by the
+// unrelated `F<Guid>` leaked into `Holder.D`: r8 was ACCEPTED and threw
+// KeyNotFoundException on a key it had just stored, r8c accepted a range index
+// and an `int in Dictionary<Guid, int>`, while r8b — r8 with the unrelated
+// `F<Guid>` deleted — stayed rejected. An unrelated declaration must not flip
+// a verdict (§14.1: the answer belongs to the spelling IN ITS SCOPE), so the
+// record lives on the TypeRef each resolution produces. §5.1 admits no `int`
+// -> `Guid`, and stdlib §4.8 / §23.4 admit no range index on a
+// `Dictionary<Guid, V>`. (Rows from the r39-rev-6530b review, probes r8/r8b/r8c.)
+
+namespace {
+
+const char* kHolderAliasField =
+    "module P;\n"
+    "type GMap := Dictionary<Guid, int>;\n"
+    "public class Holder\n"
+    "  public property D: GMap;\n"
+    "  public constructor()\n"
+    "    D := new Dictionary<Guid, int>();\n"
+    "  end constructor;\n"
+    "end Holder;\n";
+
+// The unrelated generic method whose parameter is spelled like the built-in
+// and whose parameter type is the alias: on the shared-node design its
+// resolution of `GMap`'s body was the stamp that leaked.
+const char* kUnrelatedFGuidOverAlias =
+    "public class Stamp\n"
+    "  public static method F<Guid>(d: GMap): int\n"
+    "    return d.Count;\n"
+    "  end F;\n"
+    "end Stamp;\n";
+
+const char* kBoxGuidIntIndex =
+    "public class Box<Guid>\n"
+    "  public method Go(h: Holder): int\n"
+    "    h.D[0] := 5;\n"
+    "    return h.D[0];\n"
+    "  end Go;\n"
+    "end Box;\n"
+    "public class Program\n"
+    "  public static method Main()\n"
+    "    var h := new Holder();\n"
+    "    var b := new Box<int>();\n"
+    "    Console.WriteLine(b.Go(h));\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+}  // namespace
+
+// r8: `Box<Guid>` indexes the alias-typed built-in field with an `int`, with
+// the unrelated `F<Guid>(d: GMap)` present. Pre-fix (f91d48e1): accepted,
+// KeyNotFoundException at run time.
+BEZEL_TEST(dict_range_index_6530,
+           alias_builtin_guid_field_in_Box_Guid_int_index_rejected_despite_unrelated_F_Guid_spec_27_8) {
+    auto r = runAot(std::string(kHolderAliasField) + kUnrelatedFGuidOverAlias +
+                    kBoxGuidIntIndex);
+    BEZEL_EXPECT_TRUE(rejectedWith(r, kIndexArgMsg));
+}
+
+// r8b, the control: r8 with the unrelated `F<Guid>` deleted. Rejected on every
+// compiler; with r8 it shows that only an UNRELATED declaration separated the
+// two verdicts on the shared-node design.
+BEZEL_TEST(dict_range_index_6530,
+           control_alias_builtin_guid_field_in_Box_Guid_int_index_rejected_spec_5_1) {
+    auto r = runAot(std::string(kHolderAliasField) + kBoxGuidIntIndex);
+    BEZEL_EXPECT_TRUE(rejectedWith(r, kIndexArgMsg));
+}
+
+// r8c: the other two guards on the same leak — the #6500 range index and the
+// `in` key slot. Pre-fix: accepted, printed 1.
+BEZEL_TEST(dict_range_index_6530,
+           alias_builtin_guid_field_in_Box_Guid_range_index_rejected_despite_unrelated_F_Guid_spec_23_4) {
+    auto r = runAot(std::string(kHolderAliasField) + kUnrelatedFGuidOverAlias +
+                    "public class Box<Guid>\n"
+                    "  public method Go(h: Holder): int\n"
+                    "    h.D[1 .. 5] := 5;\n"
+                    "    return h.D.Count;\n"
+                    "  end Go;\n"
+                    "end Box;\n"
+                    "public class Program\n"
+                    "  public static method Main()\n"
+                    "    var h := new Holder();\n"
+                    "    var b := new Box<int>();\n"
+                    "    Console.WriteLine(b.Go(h));\n"
+                    "  end Main;\n"
+                    "end Program;\n");
+    BEZEL_EXPECT_TRUE(rejectedWith(r, kRangeMsg));
+}
+
+BEZEL_TEST(dict_range_index_6530,
+           alias_builtin_guid_field_in_Box_Guid_in_operator_rejected_despite_unrelated_F_Guid_spec_5_1) {
+    auto r = runAot(std::string(kHolderAliasField) + kUnrelatedFGuidOverAlias +
+                    "public class Box<Guid>\n"
+                    "  public method Go(h: Holder): bool\n"
+                    "    return 0 in h.D;\n"
+                    "  end Go;\n"
+                    "end Box;\n"
+                    "public class Program\n"
+                    "  public static method Main()\n"
+                    "    var h := new Holder();\n"
+                    "    var b := new Box<int>();\n"
+                    "    Console.WriteLine(b.Go(h));\n"
+                    "  end Main;\n"
+                    "end Program;\n");
+    BEZEL_EXPECT_TRUE(rejectedWith(r, kInMsg));
 }
