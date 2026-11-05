@@ -910,3 +910,408 @@ BEZEL_TEST(interp_this_class_tostring_8127, choice_getter_explicit_tostring_from
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Fix-forward #3 (review r39-rev-8127c): `this` must be typed and LOADED from
+// ONE recovery. 6f894e53 typed a generic record / choice accessor's `this` from
+// the frame but loaded it from the caller's state (so the hole read a pointer
+// as the struct), and pushed no frame at all for an expression-bodied GENERIC
+// method inlined by `emitInlineGenericMethod` or a record explicit constructor
+// inlined by `buildRecordValue` (so `this` was typed as the CALLER). §8.5
+// (v0.355): "For positional records: a representation of fields, e.g.
+// \"Point(X: 10, Y: 20)\"" (head unqualified); "For choices that are value-like
+// and auto-hashable (§35.7): … \"TypeName.CaseName(field1: value1, …)\"";
+// "For body records that do not satisfy auto-equality conditions … the type's
+// qualified name". The programs are the review's own probes, verbatim.
+
+// generic `record P<T>` getter `$"p {this}"` read from a NON-generic record's method (review
+// r39-rev-8127c q08): 6f894e53 typed the hole as P but left `this` an unloaded pointer -> SIGSEGV.
+BEZEL_TEST(interp_this_class_tostring_8127, generic_record_getter_read_from_record_method_renders_fields) {
+    auto r = runAot(
+        "module M;\n"
+        "public record P<T>(X: T, Y: T)\n"
+        "  public property Show: string => $\"p {this}\";\n"
+        "end P;\n"
+        "public record R(K: int)\n"
+        "  public method Go(): string\n"
+        "    var p := new P<int>(1, 2);\n"
+        "    return p.Show;\n"
+        "  end Go;\n"
+        "end R;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public method Go(): int\n"
+        "    var r := new R(5);\n"
+        "    Console.WriteLine(r.Go());\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "p P(X: 1, Y: 2)\n");
+}
+
+// the same getter read from a GENERIC record `W<U>`'s method (review v05): 6f894e53 SIGSEGV.
+BEZEL_TEST(interp_this_class_tostring_8127, generic_record_getter_read_from_generic_record_method_renders_fields) {
+    auto r = runAot(
+        "module M;\n"
+        "public record P<T>(X: T, Y: T)\n"
+        "  public property Show: string => $\"p {this}\";\n"
+        "end P;\n"
+        "public record W<U>(Z: U)\n"
+        "  public method Go(): string\n"
+        "    var p := new P<int>(1, 2);\n"
+        "    return p.Show;\n"
+        "  end Go;\n"
+        "end W;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public method Go(): int\n"
+        "    var w := new W<int>(5);\n"
+        "    Console.WriteLine(w.Go());\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "p P(X: 1, Y: 2)\n");
+}
+
+// generic `choice O<T>` getter read from a record method (review v07): 6f894e53 SIGSEGV. §8.5: a
+// value-like auto-hashable choice renders `"TypeName.CaseName(field1: value1, …)"`, head unqualified.
+BEZEL_TEST(interp_this_class_tostring_8127, generic_choice_getter_read_from_record_method_renders_the_case) {
+    auto r = runAot(
+        "module M;\n"
+        "public choice O<T>\n"
+        "  Some(v: T),\n"
+        "  None;\n"
+        "  public property D: string => $\"d {this}\";\n"
+        "end O;\n"
+        "public record R(K: int)\n"
+        "  public method Go(): string\n"
+        "    var o := O<int>.Some(K);\n"
+        "    return o.D;\n"
+        "  end Go;\n"
+        "end R;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public method Go(): int\n"
+        "    var r := new R(3);\n"
+        "    Console.WriteLine(r.Go());\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "d O.Some(v: 3)\n");
+}
+
+// an EXPRESSION-bodied generic record method (`emitInlineGenericMethod` inlines it into the caller)
+// called from a class that overrides ToString (review w01): c5aae377 and 6f894e53 typed `this` as
+// the caller A and dispatched A's override on P's bytes -> SIGSEGV.
+BEZEL_TEST(interp_this_class_tostring_8127, generic_record_expr_method_from_overriding_class_renders_fields) {
+    auto r = runAot(
+        "module M;\n"
+        "public record P<T>(X: T, Y: T)\n"
+        "  public method Self(): string => $\"s {this}\";\n"
+        "end P;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var p := new P<int>(1, 2);\n"
+        "    Console.WriteLine(p.Self());\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "s P(X: 1, Y: 2)\n");
+}
+
+// an expression-bodied generic CHOICE method called from a class (review w03): 6f894e53 REJECTED the
+// program at compile time (the choice classified at a bare `O` with no type arguments).
+BEZEL_TEST(interp_this_class_tostring_8127, generic_choice_expr_method_from_class_renders_the_case) {
+    auto r = runAot(
+        "module M;\n"
+        "public choice O<T>\n"
+        "  Some(v: T),\n"
+        "  None;\n"
+        "  public method D(): string => $\"d {this}\";\n"
+        "end O;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var o := O<int>.Some(3);\n"
+        "    Console.WriteLine(o.D());\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "d O.Some(v: 3)\n");
+}
+
+// the generic record method called from another RECORD's method (review w04): 6f894e53 rendered P's
+// bytes as the caller `R(K: 1)`, exit 0.
+BEZEL_TEST(interp_this_class_tostring_8127, generic_record_expr_method_from_record_method_renders_fields) {
+    auto r = runAot(
+        "module M;\n"
+        "public record P<T>(X: T, Y: T)\n"
+        "  public method Self(): string => $\"s {this}\";\n"
+        "end P;\n"
+        "public record R(K: int)\n"
+        "  public method Go(): string\n"
+        "    var p := new P<int>(1, 2);\n"
+        "    return p.Self();\n"
+        "  end Go;\n"
+        "end R;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public method Go(): int\n"
+        "    var r := new R(5);\n"
+        "    Console.WriteLine(r.Go());\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "s P(X: 1, Y: 2)\n");
+}
+
+// the caller's ToString calls its own virtual `Boom()` (review w05): a caller-typed `this` would
+// dispatch A's vtable slot on P<string>'s bytes. 6f894e53: SIGSEGV. A string component renders bare
+// (as the existing `record_receiver_renders_field_listing` row pins: `R(X: 1, Y: a)`).
+BEZEL_TEST(interp_this_class_tostring_8127, generic_record_expr_method_is_not_dispatched_through_callers_virtual) {
+    auto r = runAot(
+        "module M;\n"
+        "public record P<T>(X: T, Y: T)\n"
+        "  public method Self(): string => $\"s {this}\";\n"
+        "end P;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public virtual method Boom(): string => \"BOOM\";\n"
+        "  public override method ToString(): string => this.Boom();\n"
+        "  public method Go(): int\n"
+        "    var p := new P<string>(\"x\", \"y\");\n"
+        "    Console.WriteLine(p.Self());\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "s P(X: x, Y: y)\n");
+}
+
+// called from static `Program.Main` (review w06): 6f894e53 rendered `s M.Program`.
+BEZEL_TEST(interp_this_class_tostring_8127, generic_record_expr_method_from_static_main_renders_fields) {
+    auto r = runAot(
+        "module M;\n"
+        "public record P<T>(X: T, Y: T)\n"
+        "  public method Self(): string => $\"s {this}\";\n"
+        "end P;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public method Go(): int => 0;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    var p := new P<int>(1, 2);\n"
+        "    Console.WriteLine(p.Self());\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "s P(X: 1, Y: 2)\n");
+}
+
+// called from a class with no override (review v03): 6f894e53 rendered `s M.A`.
+BEZEL_TEST(interp_this_class_tostring_8127, generic_record_expr_method_from_class_renders_fields) {
+    auto r = runAot(
+        "module M;\n"
+        "public record P<T>(X: T, Y: T)\n"
+        "  public method Self(): string => $\"s {this}\";\n"
+        "end P;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public method Go(): int\n"
+        "    var p := new P<int>(1, 2);\n"
+        "    Console.WriteLine(p.Self());\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "s P(X: 1, Y: 2)\n");
+}
+
+// `$"ctor {this}"` in a body record's explicit constructor, inlined by `buildRecordValue` at
+// `new R(…)` from a class that overrides ToString and then from a record method (review y01):
+// 6f894e53 SIGSEGV. `R` declares explicit FIELDS, so it does not satisfy the auto-equality
+// conditions (§9.2: "an explicit field declaration among them suppresses the auto-generated
+// equality members"), and §8.5 renders such a body record as the type's QUALIFIED name.
+BEZEL_TEST(interp_this_class_tostring_8127, record_ctor_this_from_overriding_class_and_record_renders_qualified_name) {
+    auto r = runAot(
+        "module M;\n"
+        "public record R\n"
+        "  public X: int;\n"
+        "  public Y: string;\n"
+        "  public constructor(x: int)\n"
+        "    X := x;\n"
+        "    Y := \"a\";\n"
+        "    Console.WriteLine($\"ctor {this}\");\n"
+        "  end constructor;\n"
+        "end R;\n"
+        "public record Q(K: int)\n"
+        "  public method Go(): int\n"
+        "    var r := new R(K);\n"
+        "    return r.X;\n"
+        "  end Go;\n"
+        "end Q;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var r := new R(1);\n"
+        "    var q := new Q(2);\n"
+        "    Console.WriteLine(q.Go());\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "ctor M.R\nctor M.R\n2\n");
+}
+
+// the same constructor reached from a class with no override (review y02): 6f894e53 `ctor M.A`.
+BEZEL_TEST(interp_this_class_tostring_8127, record_ctor_this_from_class_renders_qualified_name) {
+    auto r = runAot(
+        "module M;\n"
+        "public record R\n"
+        "  public X: int;\n"
+        "  public Y: string;\n"
+        "  public constructor(x: int)\n"
+        "    X := x;\n"
+        "    Y := \"a\";\n"
+        "    Console.WriteLine($\"ctor {this}\");\n"
+        "  end constructor;\n"
+        "end R;\n"
+        "public record Q(K: int)\n"
+        "  public method Go(): int\n"
+        "    var r := new R(K);\n"
+        "    return r.X;\n"
+        "  end Go;\n"
+        "end Q;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public method Go(): int\n"
+        "    var r := new R(1);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "ctor M.R\n");
+}
+
+// the same constructor reached from a RECORD's method (review y03): 6f894e53 rendered the caller
+// `ctor Q(K: 2)`.
+BEZEL_TEST(interp_this_class_tostring_8127, record_ctor_this_from_record_method_renders_qualified_name) {
+    auto r = runAot(
+        "module M;\n"
+        "public record R\n"
+        "  public X: int;\n"
+        "  public Y: string;\n"
+        "  public constructor(x: int)\n"
+        "    X := x;\n"
+        "    Y := \"a\";\n"
+        "    Console.WriteLine($\"ctor {this}\");\n"
+        "  end constructor;\n"
+        "end R;\n"
+        "public record Q(K: int)\n"
+        "  public method Go(): int\n"
+        "    var r := new R(K);\n"
+        "    return r.X;\n"
+        "  end Go;\n"
+        "end Q;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public method Go(): int\n"
+        "\n"
+        "    var q := new Q(2);\n"
+        "    Console.WriteLine(q.Go());\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "ctor M.R\n2\n");
+}

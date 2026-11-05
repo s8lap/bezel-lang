@@ -23301,6 +23301,19 @@ llvm::Value* Emitter::emitInlineGenericMethod(
     // Bind this and params.
     currentThis_ = (!args.empty() && !isStaticMethod(ms))
                     ? args[0] : nullptr;
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): the body is lowered into the
+    // CALLER's function, so record the method's owner as `this`'s type for
+    // its duration (an extension method's owner is its target type) — the
+    // `currentFn_`-keyed lookups all name the caller here, and
+    // `currentSpecMethodSymbol_` alone was consulted only after them (review
+    // r39-rev-8127c BLOCKING 2: `record P<T> … Self(): string => $"{this}"`
+    // called from class A rendered `this` as A). Closed where `currentThis_`
+    // is restored below.
+    const sema::TypeRef* inlineExtTarget = nullptr;
+    if (!ms->parent && isExtensionMethod(ms) && ms->extensionDecl &&
+        ms->extensionDecl->targetType)
+        inlineExtTarget = ctx_.resolvedType(*ms->extensionDecl->targetType);
+    ThisReceiverScope thisRecvScope(*this, ms->parent, inlineExtTarget);
     locals_.clear();
     paramSlots_.clear();
     propagateBB_ = nullptr;
@@ -23514,6 +23527,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(
     }
 
     // Restore state.
+    thisRecvScope.close();  // fix-forward #8127
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);

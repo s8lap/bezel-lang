@@ -7977,40 +7977,49 @@ private:
     // the enclosing type cannot be recovered.
     const sema::TypeRef* thisReceiverTypeRef(const ast::Expr* e);
 
-    // fix-forward #8127 (§8.5 / §18.5, v0.355): the receiver TYPE of an
-    // ACCESSOR (or inlined constructor) body, recorded at the moment that
-    // body is opened, keyed by the function it is lowered INTO.
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): the receiver TYPE of a body
+    // lowered OUT OF ITS OWN TYPE'S CONTEXT, recorded at the moment that body
+    // is opened, keyed by the function it is lowered INTO.
     //
-    // WHY. An accessor body is lowered out of its own type's context: an
-    // expression-bodied getter, an inlined setter / indexer accessor and an
-    // inlined constructor are lowered INTO THE CALLER'S FUNCTION with
-    // `currentThis_` swapped to the receiver object, and a block getter is a
-    // memoised function emitted LAZILY from inside the first caller's body.
-    // In both cases every other piece of receiver state (`methodFns_` keyed
-    // by `currentFn_`, `currentMethod_`, `currentEnumMethod_`,
-    // `currentReceiverRecordType()`) still describes the CALLER, so
-    // `thisReceiverTypeRef` answered with the caller's type — class `B`'s
-    // `property Name => $"{this}"` read from class `A` rendered `B`'s object
-    // with `A`'s ToString (a type-confused virtual call) or crashed.
+    // WHY. Such a body is lowered while every other piece of receiver state
+    // describes the CALLER: an expression-bodied getter, an inlined setter /
+    // indexer accessor, an inlined constructor (class or record) and an
+    // expression-bodied GENERIC method (`emitInlineGenericMethod`) are
+    // lowered INTO THE CALLER'S FUNCTION with `currentThis_` swapped to the
+    // receiver object; a field initializer runs at the `new` site; a block
+    // getter is a memoised function emitted LAZILY from inside the first
+    // caller's body. `methodFns_` keyed by `currentFn_`, `currentMethod_`,
+    // `currentEnumMethod_` and the rest all still name the caller, so the
+    // recovery answered with the caller's type — class `B`'s `property Name
+    // => $"{this}"` read from class `A` rendered `B`'s object with `A`'s
+    // ToString (a type-confused virtual call) or crashed, and a generic
+    // record's `Self(): string => $"{this}"` did the same from the method
+    // inline (review r39-rev-8127c, probes w01–w06, y01–y03).
     //
     // A frame applies only while `currentFn_` is the function it was pushed
     // in, and only when it is the INNERMOST frame: a nested body (a lambda,
     // a block getter) emitted from inside the accessor is a different
-    // function, so it never sees the frame. A null `type` (the owner is not
-    // known — an extension property has no parent TypeSymbol) makes
-    // `thisReceiverTypeRef` answer null, i.e. the pre-recovery behaviour,
-    // rather than fall through to the caller's state.
+    // function, so it never sees the frame. A frame with neither `type` nor
+    // `direct` (the owner is not known — an extension property has no parent
+    // TypeSymbol) makes the recovery answer UNKNOWN, i.e. the pre-recovery
+    // behaviour, rather than fall through to the caller's state. `direct` is
+    // the extension-target TypeRef of an inlined generic EXTENSION method,
+    // whose receiver type is not a user TypeSymbol.
+    //
+    // Read ONLY through `thisReceiverOwner()` — see that declaration.
     struct ThisReceiverFrame {
         const llvm::Function* fn;
         const sema::TypeSymbol* type;
+        const sema::TypeRef* direct;
     };
     std::vector<ThisReceiverFrame> thisReceiverFrames_;
     // RAII push for `thisReceiverFrames_`. `close()` pops early (at the point
     // the caller's `currentThis_` is restored); the destructor pops otherwise.
     struct ThisReceiverScope {
-        ThisReceiverScope(Emitter& e, const sema::TypeSymbol* ts)
+        ThisReceiverScope(Emitter& e, const sema::TypeSymbol* ts,
+                          const sema::TypeRef* direct = nullptr)
             : e_(e), depth_(e.thisReceiverFrames_.size()) {
-            e_.thisReceiverFrames_.push_back({e_.currentFn_, ts});
+            e_.thisReceiverFrames_.push_back({e_.currentFn_, ts, direct});
         }
         void close() {
             if (closed_) return;
@@ -8888,9 +8897,29 @@ private:
     // in methodFns_, then fall back to currentSpecMethodSymbol_ for a
     // specialized generic body that is not registered there.
     const sema::TypeSymbol* currentReceiverRecordType();
-    // fix-forward #8127: the receiver-STATE half of currentReceiverRecordType
-    // (everything but the accessor-body frame), shared by both answers.
-    const sema::TypeSymbol* currentReceiverRecordTypeFromState();
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): THE one recovery of "whose
+    // body is `this` in". Both consumers of the receiver's identity — its
+    // static TYPE (`thisReceiverTypeRef`: the §18.5 hole, `this.ToString()`)
+    // and its value LOAD (`currentReceiverRecordType`: CG29's record / choice
+    // `this`) — are filters over this answer, so they cannot disagree about
+    // one receiver. `type` is the owning TypeSymbol; `direct` is the
+    // receiver TypeRef of an extension body (no TypeSymbol); both null means
+    // the owner is unknown. `genericLayoutLive` is true when the owner's
+    // specialized struct layout can be computed in the current context (a
+    // non-generic owner, the owner's own emission context, or a body lowered
+    // elsewhere while the owner's substitution is live —
+    // `receiverSubstIsLive`); the LOAD requires it, the TYPE of a record /
+    // choice owner follows the load. Definition: LlvmBackend_Layout.cpp.
+    struct ThisReceiverOwner {
+        const sema::TypeSymbol* type = nullptr;
+        const sema::TypeRef* direct = nullptr;
+        bool genericLayoutLive = false;
+    };
+    ThisReceiverOwner thisReceiverOwner();
+    // True when every generic parameter `ts` declares is bound in the active
+    // substitution (`genericSubstSemaTy_`); vacuously true for a non-generic
+    // type.
+    bool receiverSubstIsLive(const sema::TypeSymbol* ts) const;
     // fix #6721 (§9.4, v0.340): the receiver type a lambda's `this` capture
     // COPIES — a record, or a choice that is not owning-classified (§35.4),
     // read per instantiation under the active substitution (§3.6 rule 2).

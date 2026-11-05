@@ -13296,6 +13296,14 @@ llvm::Value* Emitter::buildRecordValue(
         const sema::TypeSymbol* savedCtorParentRecord = currentCtorParentRecord_;
         currentCtorParentRecord_ = t;
         currentThis_ = slot;
+        // fix-forward #8127 (§8.5 / §18.5, v0.355): the record constructor
+        // body is inlined into the CALLER's function; record the record as
+        // `this`'s type for the body (review r39-rev-8127c, probes y01–y03:
+        // `$"ctor {this}"` in R's constructor rendered the CALLER's type).
+        // The `currentCtorParentRecord_` fallback above is consulted only
+        // after the `currentFn_`-keyed lookups, which all name the caller
+        // here. Closed where `currentThis_` is restored below.
+        ThisReceiverScope thisRecvScope(*this, t);
         locals_.clear();
         paramSlots_.clear();
         // fix #2283 / §22.3: a `ref`/`out` param's arg is the caller's storage
@@ -13376,6 +13384,7 @@ llvm::Value* Emitter::buildRecordValue(
             }
         }
         lowerScopedBlock(cd->body, bodyStartIdx);
+        thisRecvScope.close();  // fix-forward #8127
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);
         paramSlots_ = std::move(savedParams);

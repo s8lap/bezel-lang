@@ -791,107 +791,46 @@ static bool isReadOnlyStringSpanTypeRef(const sema::TypeRef* rt) {
 // contract and the spec reading.
 //
 // `this` / `base` carry no sema exprType, so the type is recovered from the
-// emitter's own receiver state — the same "which type's body am I in" lookup
-// `indexReceiverDecl` performs, extended to the other receiver kinds codegen
-// emits a body for.
+// emitter's own receiver state — `thisReceiverOwner`, the ONE recovery of
+// "which type's body am I in" (fix-forward #8127). For a record or choice
+// owner the answer is `currentReceiverRecordType`'s, verbatim: that is the
+// filter that decides whether a `this` READ loads the receiver's struct value
+// (`loadThisValueIfRecv`), and a hole typed as a record while its operand is
+// still the receiver POINTER reads that pointer as the struct — the crash the
+// previous fix-forward measured (a generic record's getter read from another
+// record's method). Typing from the same verdict as the load makes the two
+// agree by construction: either both answer the owner, or neither does and
+// the hole keeps its pre-recovery lowering.
 const sema::TypeRef* Emitter::thisReceiverTypeRef(const ast::Expr* e) {
     if (!e) return nullptr;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
     if (!id || (id->name != "this" && id->name != "base")) return nullptr;
+    const ThisReceiverOwner o = thisReceiverOwner();
     // A ready-made TypeRef, for the one receiver kind whose type is not a
     // user TypeSymbol: an EXTENSION block's target type (`extension int`).
-    const sema::TypeRef* direct = nullptr;
-    const sema::TypeSymbol* ts = nullptr;
-    // 0. an ACCESSOR (or inlined constructor) body — fix-forward #8127. Such
-    //    a body is lowered into the CALLER's function (an inlined getter,
-    //    setter or constructor) or emitted lazily from inside the caller's
-    //    body (a block getter), so every lookup below would answer with the
-    //    CALLER's type. The frame recorded when the body was opened is the
-    //    certain answer; when its owner is unknown, answer null rather than
-    //    guess (the hole then keeps its pre-recovery lowering).
-    bool fromFrame = false;
-    if (!thisReceiverFrames_.empty() &&
-        thisReceiverFrames_.back().fn == currentFn_) {
-        ts = thisReceiverFrames_.back().type;
-        if (!ts) return nullptr;
-        fromFrame = true;
-    }
-    if (currentFn_ && !fromFrame) {
-        // 1. an ordinary method body (and an extension method body: the
-        //    extension has no parent TypeSymbol, so its TARGET type is the
-        //    receiver's type — #1237's rule, mirrored from indexReceiverDecl).
-        for (const auto& [ms, fn] : methodFns_) {
-            if (fn != currentFn_) continue;
-            if (ms->parent) { ts = ms->parent; break; }
-            if (isExtensionMethod(ms) && ms->extensionDecl &&
-                ms->extensionDecl->targetType) {
-                const sema::TypeRef* t =
-                    ctx_.resolvedType(*ms->extensionDecl->targetType);
-                if (t) { direct = t; break; }
-            }
-        }
-        // 2. a CONSTRUCTOR body (ctors have no MethodSymbol and are never
-        //    registered in methodFns_ — #4056's recorded reason).
-        if (!ts && !direct) {
-            for (const auto& [cs, fn] : ctorFns_)
-                if (fn == currentFn_ && cs->parent) { ts = cs->parent; break; }
-        }
-        // 3. a PROPERTY accessor body (an accessor function is not in
-        //    methodFns_ — it has its own memo, propAccessorFns_).
-        if (!ts && !direct) {
-            for (const auto& [key, fn] : propAccessorFns_)
-                if (fn == currentFn_ && std::get<0>(key) &&
-                    std::get<0>(key)->parent) {
-                    ts = std::get<0>(key)->parent;
-                    break;
-                }
-        }
-        // 4. an INDEXER accessor body (the same shape as the property
-        //    accessor, with its own memo).
-        if (!ts && !direct) {
-            for (const auto& [key, fn] : indexerGetterFns_)
-                if (fn == currentFn_ && key.first && key.first->parent) {
-                    ts = key.first->parent;
-                    break;
-                }
-            if (!ts)
-                for (const auto& [key, fn] : indexerSetterFns_)
-                    if (fn == currentFn_ && key.first && key.first->parent) {
-                        ts = key.first->parent;
-                        break;
-                    }
-        }
-        // 5. a LAMBDA body: the lambda's own llvm::Function is not in
-        //    methodFns_; its LEXICAL enclosing type was recorded by sema and
-        //    registered by lowerLambda (#5226).
-        if (!ts && !direct) {
-            auto lit = lambdaFnEnclosingType_.find(currentFn_);
-            if (lit != lambdaFnEnclosingType_.end()) ts = lit->second;
-        }
-    }
-    // 6. a SPECIALIZED method body (the monomorphized instance of a generic
-    //    method — #747 R42's rule).
-    if (!ts && !direct && currentSpecMethodSymbol_ &&
-        currentSpecMethodSymbol_->parent)
-        ts = currentSpecMethodSymbol_->parent;
-    // 7. an ENUM receiver (`currentEnumMethod_` is the enum's TypeSymbol).
-    if (!ts && !direct && currentEnumMethod_) ts = currentEnumMethod_;
-    // 8. a RECORD or CHOICE receiver (currentReceiverRecordType's recovery,
-    //    which also covers a record constructor body).
-    if (!ts && !direct) ts = currentReceiverRecordType();
-    // 9. the method whose body emission is IN PROGRESS. `emitAsyncMethod` /
-    //    `emitIteratorMethod` are called FROM `emitFunctionBody`, so the
-    //    CurrentMethodGuard is still active while their RESUME function's body
-    //    is emitted — and that resume function is in none of the maps above.
-    //    LAST, because `currentMethod_` is a SCOPED member: a body emitted
-    //    lazily from inside another member's body would see the outer
-    //    method's symbol, and every `currentFn_`-keyed lookup above (1-5) is
-    //    the precise one for such a nested emission. (Accessor bodies, the
-    //    measured case of exactly that hazard, are answered by step 0.)
-    if (!ts && !direct && currentMethod_ && currentMethod_->parent)
-        ts = currentMethod_->parent;
-    if (direct) return direct;
+    if (o.direct) return o.direct;
+    const sema::TypeSymbol* ts = o.type;
     if (!ts) return nullptr;
+    if (ts->kind == ast::TypeDeclKind::Record ||
+        ts->kind == ast::TypeDeclKind::Choice) {
+        ts = currentReceiverRecordType();
+        if (!ts) return nullptr;
+        // A record / choice is RENDERED at its instantiation (§8.5: the
+        // positional / auto-equality listing is each component's own
+        // ToString, and §35.7's auto-hashable classification reads the
+        // payload types), so a bare head is not a usable static type. The
+        // ERASED template body of a generic record / choice method (lowered
+        // once with no substitution, besides each specialization) has no
+        // instantiation to render at: answer null there, which keeps the
+        // hole's pre-recovery lowering in that body. MEASURED: with the bare
+        // `O` returned instead, the hole's choice arm classified `O<T>` with
+        // `T` unbound as not auto-hashable and reported the hard §35.7 error
+        // for the template — rejecting `choice O<T> … D(): string => $"{this}"`
+        // outright (review w03), while the specialization was fine. The LOAD
+        // keeps answering in the template (its own placeholder layout is the
+        // one `this` points at, as before this fix).
+        if (!receiverSubstIsLive(ts)) return nullptr;
+    }
     auto ref = std::make_unique<sema::TypeRef>();
     ref->kind = sema::TypeRef::Kind::Named;
     ref->declaration = const_cast<sema::TypeSymbol*>(ts);
@@ -907,7 +846,6 @@ const sema::TypeRef* Emitter::thisReceiverTypeRef(const ast::Expr* e) {
     descArena_.push_back(std::move(ref));
     return descArena_.back().get();
 }
-
 llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     diverged_ = false;  // CG40: cleared per expression; a `throw` sets it
     // §27.6 (v0.184, #1758): inside a primitive-intrinsic thunk body, a synthetic

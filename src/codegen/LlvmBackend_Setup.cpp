@@ -13759,6 +13759,14 @@ void Emitter::emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
 // classStruct(t) and `obj` points at the instance (base subobject at offset 0).
 void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                                llvm::StructType* st) {
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): a field initializer is lowered
+    // with `currentThis_` = the new object, in whatever function the
+    // construction site is in (`lowerNew`, `emitChainCall`,
+    // `emitClassDeserialize`, a constructor body); record `t` as `this`'s type
+    // for the initializers' duration, in this one place every construction
+    // path reaches, so a `this` in an initializer is never typed from the
+    // caller's state.
+    ThisReceiverScope thisRecvScope(*this, t);
     // Own (non-inherited) instance storage only: `t`'s own non-static fields,
     // auto-properties, and instance event backing fields (sync + async per
     // §24 / #1176) — in declaration order (the same per-member shape

@@ -2882,85 +2882,185 @@ llvm::StructType* Emitter::choiceStruct(const sema::TypeSymbol* t) {
 }
 
 
+// fix-forward #8127 (§8.5 / §18.5, v0.355): is `ts`'s OWN generic
+// substitution the live one? True when every type parameter `ts` declares is
+// bound in `genericSubstSemaTy_` — the binding every inline site installs for
+// the receiver's instantiation before it lowers the owner's body (the
+// member-access getter inline, `setupReceiverGenericSubst`, the record
+// constructor inline's own `recSubst`, `lowerNew`'s instantiation
+// substitution, the generic-method call arm ahead of
+// `emitInlineGenericMethod`). A non-generic type needs no substitution, so it
+// is always live.
+bool Emitter::receiverSubstIsLive(const sema::TypeSymbol* ts) const {
+    if (!ts) return false;
+    for (std::string_view n : sema::genericParamNames(ts)) {
+        auto it = genericSubstSemaTy_.find(n);
+        if (it == genericSubstSemaTy_.end() || !it->second) return false;
+    }
+    return true;
+}
+
+
+// fix-forward #8127 (§8.5 / §18.5, v0.355) — see the declaration. THE one
+// recovery of "whose body is `this` in". `thisReceiverTypeRef` (the receiver's
+// static type: the §18.5 hole, `this.ToString()`) and
+// `currentReceiverRecordType` (the CG29 value load of a record / choice
+// receiver) are both thin filters over this answer, so the two can never
+// disagree about one receiver — the defect class the first two fixes of
+// #8127 kept re-creating (a hole typed as the owner while the value stayed an
+// unloaded pointer, or typed as the caller while the load was the owner's).
+//
+// Step 0 is the frame a body opened OUT of its own type's emission context
+// pushes (`thisReceiverFrames_`): an inlined getter / setter / constructor /
+// expression-bodied generic method, a lazily emitted block accessor, a field
+// initializer. Every lookup below describes the CALLER there. Steps 1–9 are
+// the owner's own emission context, in the order the typing has used since
+// c5aae377, and they answer only when there is no frame for `currentFn_`.
+//
+// `genericLayoutLive` answers "can the owner's specialized struct be computed
+// here" — the question the record / choice LOAD must ask, because
+// `recordStruct` / `choiceStruct` read the active substitution. A frame and a
+// lambda are bodies lowered outside the owner's own context, so a generic
+// owner's substitution has to be CHECKED (`receiverSubstIsLive`); every other
+// step IS the owner's own context (its erased template or its specialization
+// — whichever one, the layout in force is the one its `this` points at), so
+// the answer is unconditionally live, as the pre-frame recovery always
+// assumed. The lambda rule generalises #6320's "non-generic only": a generic
+// enclosing type now answers when its substitution is in fact live (a lambda
+// emitted inline inside a specialization), and declines otherwise.
+Emitter::ThisReceiverOwner Emitter::thisReceiverOwner() {
+    ThisReceiverOwner o;
+    // 0. a frame pushed for a body lowered into / out of another context.
+    //    A frame whose owner is unknown (`type` and `direct` both null — an
+    //    extension property has no parent TypeSymbol) answers UNKNOWN rather
+    //    than falling through to the caller's state.
+    if (!thisReceiverFrames_.empty() &&
+        thisReceiverFrames_.back().fn == currentFn_) {
+        const ThisReceiverFrame& f = thisReceiverFrames_.back();
+        o.type = f.type;
+        o.direct = f.direct;
+        o.genericLayoutLive = f.type && receiverSubstIsLive(f.type);
+        return o;
+    }
+    if (currentFn_) {
+        // 1. an ordinary method body (and an extension method body: the
+        //    extension has no parent TypeSymbol, so its TARGET type is the
+        //    receiver's type — #1237's rule, mirrored from indexReceiverDecl).
+        for (const auto& [ms, fn] : methodFns_) {
+            if (fn != currentFn_) continue;
+            if (ms->parent) { o.type = ms->parent; break; }
+            if (isExtensionMethod(ms) && ms->extensionDecl &&
+                ms->extensionDecl->targetType) {
+                const sema::TypeRef* t =
+                    ctx_.resolvedType(*ms->extensionDecl->targetType);
+                if (t) { o.direct = t; break; }
+            }
+        }
+        // 2. a CONSTRUCTOR body (ctors have no MethodSymbol and are never
+        //    registered in methodFns_ — #4056's recorded reason).
+        if (!o.type && !o.direct) {
+            for (const auto& [cs, fn] : ctorFns_)
+                if (fn == currentFn_ && cs->parent) { o.type = cs->parent; break; }
+        }
+        // 3. a PROPERTY accessor body (an accessor function is not in
+        //    methodFns_ — it has its own memo, propAccessorFns_).
+        if (!o.type && !o.direct) {
+            for (const auto& [key, fn] : propAccessorFns_)
+                if (fn == currentFn_ && std::get<0>(key) &&
+                    std::get<0>(key)->parent) {
+                    o.type = std::get<0>(key)->parent;
+                    break;
+                }
+        }
+        // 4. an INDEXER accessor body (the same shape as the property
+        //    accessor, with its own memo).
+        if (!o.type && !o.direct) {
+            for (const auto& [key, fn] : indexerGetterFns_)
+                if (fn == currentFn_ && key.first && key.first->parent) {
+                    o.type = key.first->parent;
+                    break;
+                }
+            if (!o.type)
+                for (const auto& [key, fn] : indexerSetterFns_)
+                    if (fn == currentFn_ && key.first && key.first->parent) {
+                        o.type = key.first->parent;
+                        break;
+                    }
+        }
+        // 5. a LAMBDA body: the lambda's own llvm::Function is not in
+        //    methodFns_; its LEXICAL enclosing type was recorded by sema and
+        //    registered by lowerLambda (#5226). The enclosing body's
+        //    substitution is not the lambda's own (#6320), so it is checked.
+        if (!o.type && !o.direct) {
+            auto lit = lambdaFnEnclosingType_.find(currentFn_);
+            if (lit != lambdaFnEnclosingType_.end() && lit->second) {
+                o.type = lit->second;
+                o.genericLayoutLive = receiverSubstIsLive(o.type);
+                return o;
+            }
+        }
+    }
+    // 6. a SPECIALIZED method body (the monomorphized instance of a generic
+    //    method — #747 R42's rule; buildSpecializedMethodFn never registers
+    //    its function in methodFns_, #628).
+    if (!o.type && !o.direct && currentSpecMethodSymbol_ &&
+        currentSpecMethodSymbol_->parent)
+        o.type = currentSpecMethodSymbol_->parent;
+    // 7. an ENUM receiver (`currentEnumMethod_` is the enum's TypeSymbol).
+    if (!o.type && !o.direct && currentEnumMethod_) o.type = currentEnumMethod_;
+    // 8. a record CONSTRUCTOR body emitted standalone (fix #4056: the ctor's
+    //    function is in neither map above when the body is `emitConstructorBody`'s).
+    if (!o.type && !o.direct && currentCtorParentRecord_)
+        o.type = currentCtorParentRecord_;
+    // 9. the method whose body emission is IN PROGRESS. `emitAsyncMethod` /
+    //    `emitIteratorMethod` are called FROM `emitFunctionBody`, so the
+    //    CurrentMethodGuard is still active while their RESUME function's body
+    //    is emitted — and that resume function is in none of the maps above.
+    //    LAST, because `currentMethod_` is a SCOPED member: a body emitted
+    //    lazily from inside another member's body would see the outer
+    //    method's symbol, and every `currentFn_`-keyed lookup above (1-5) is
+    //    the precise one for such a nested emission. (Bodies lowered out of
+    //    their own context — the measured case of exactly that hazard — are
+    //    answered by step 0.)
+    if (!o.type && !o.direct && currentMethod_ && currentMethod_->parent)
+        o.type = currentMethod_->parent;
+    o.genericLayoutLive = o.type != nullptr;
+    return o;
+}
+
+
 // §9 / §9.1 (#1759): recover the record TypeSymbol of the instance method
-// currently being emitted, or null when the receiver is not a record (class /
-// enum / extension), the method is static, or none is in flight. Mirrors the
-// owner recovery lowerWith uses for `this with … end` (#575 / #628): the
-// reverse-lookup of currentFn_ in methodFns_ handles ordinary bodies, and the
-// currentSpecMethodSymbol_ fallback handles a specialized generic body that
-// buildSpecializedMethodFn never registered in methodFns_. The
-// currentCtorParentRecord_ fallback (fix #4056) handles record CONSTRUCTOR
-// bodies, where currentFn_ is the ctor's function (which is never registered
-// in methodFns_ — and has no MethodSymbol) and currentSpecMethodSymbol_ is
-// null, but `this` is still a pointer to a record (CG29) that needs to be
-// loaded into the record struct when it reaches a callee expecting the
-// struct by value (§9.4, §22.3).
+// currently being emitted, or null when the receiver is not a record / choice
+// (class / enum / extension), the method is static, or none is in flight.
+// Originally the owner recovery lowerWith uses for `this with … end` (#575 /
+// #628): the reverse-lookup of currentFn_ in methodFns_ for ordinary bodies,
+// the currentSpecMethodSymbol_ fallback for a specialized generic body that
+// buildSpecializedMethodFn never registered in methodFns_, and the
+// currentCtorParentRecord_ fallback (fix #4056) for record CONSTRUCTOR bodies
+// — where `this` is still a pointer to a record (CG29) that needs to be loaded
+// into the record struct when it reaches a callee expecting the struct by
+// value (§9.4, §22.3). fix #357 (§35.7, v0.334): a CHOICE receiver is a
+// value-type sum for the same reason a record is (§35.8: a value-like choice
+// boxes only on demand, and the choice's own storage IS its cases' payloads),
+// so inside a choice body `this` is a POINTER to the by-value receiver exactly
+// as CG29 makes it for a record; without the choice arm a by-value parameter
+// taking the choice received the raw pointer (an IR verification failure,
+// "Call parameter type does not match function signature"). See
+// coerceThisRecordValue below.
+//
+// fix-forward #8127 (§8.5 / §18.5, v0.355): now a FILTER over
+// `thisReceiverOwner` — the same answer the receiver's static type is read
+// from — restricted to the record / choice kinds and to an owner whose
+// specialized layout can be computed here (`genericLayoutLive`).
 const sema::TypeSymbol* Emitter::currentReceiverRecordType() {
     if (!currentThis_) return nullptr;
-    // fix-forward #8127 (§8.5 / §18.5, v0.355): inside an ACCESSOR body
-    // lowered out of its own type's context (an inlined getter / setter, a
-    // lazily-emitted block getter — see `thisReceiverFrames_`), every lookup
-    // below describes the CALLER, so a class's getter read from a record
-    // method loaded the class pointer as the caller's record struct, and a
-    // choice's getter read from a class method left the choice `this` an
-    // unloaded pointer. The frame recorded when the body was opened answers
-    // instead. A frame whose owner is unknown keeps the pre-frame answer; a
-    // GENERIC owner is trusted only when the receiver state agrees with it,
-    // because its layout needs the owner's substitution to be the live one.
-    if (!thisReceiverFrames_.empty() &&
-        thisReceiverFrames_.back().fn == currentFn_ &&
-        thisReceiverFrames_.back().type) {
-        const sema::TypeSymbol* ft = thisReceiverFrames_.back().type;
-        if (ft->kind != ast::TypeDeclKind::Record &&
-            ft->kind != ast::TypeDeclKind::Choice)
-            return nullptr;
-        if (ft->genericParams.empty()) return ft;
-        return currentReceiverRecordTypeFromState() == ft ? ft : nullptr;
-    }
-    return currentReceiverRecordTypeFromState();
+    const ThisReceiverOwner o = thisReceiverOwner();
+    if (!o.type || !o.genericLayoutLive) return nullptr;
+    if (o.type->kind != ast::TypeDeclKind::Record &&
+        o.type->kind != ast::TypeDeclKind::Choice)
+        return nullptr;
+    return o.type;
 }
-
-const sema::TypeSymbol* Emitter::currentReceiverRecordTypeFromState() {
-    if (currentFn_) {
-        for (const auto& [ms, fn] : methodFns_)
-            if (fn == currentFn_ && ms->parent &&
-                (ms->parent->kind == ast::TypeDeclKind::Record ||
-                 // fix #357 (§35.7, v0.334): a CHOICE receiver is a
-                 // value-type sum for the same reason a record is (§35.8: a
-                 // value-like choice boxes only on demand, and the choice's own
-                 // storage IS its cases' payloads), so inside a choice method
-                 // `this` is a POINTER to the by-value receiver exactly as
-                 // CG29 makes it for a record. Without this arm a choice's
-                 // `this` never loads, and a by-value parameter taking the
-                 // choice receives the raw pointer — an IR verification
-                 // failure ("Call parameter type does not match function
-                 // signature", `ptr` where `%choice.C` is wanted). See
-                 // coerceThisRecordValue below.
-                 ms->parent->kind == ast::TypeDeclKind::Choice))
-                return ms->parent;
-    }
-    if (currentSpecMethodSymbol_ && currentSpecMethodSymbol_->parent &&
-        currentSpecMethodSymbol_->parent->kind == ast::TypeDeclKind::Record)
-        return currentSpecMethodSymbol_->parent;
-    if (currentCtorParentRecord_ &&
-        currentCtorParentRecord_->kind == ast::TypeDeclKind::Record)
-        return currentCtorParentRecord_;
-    // fix #6320 (§9.4 / §35.1, v0.338): inside a LAMBDA body `currentFn_` is
-    // the lambda's own function, and a captured `this` is restored from the
-    // env as the receiver pointer. Recover its lexical enclosing type (#5226).
-    // Non-generic only: the receiver's substitution is not active in the
-    // lambda body, so a generic layout could not be recomputed here.
-    if (currentFn_) {
-        auto lit = lambdaFnEnclosingType_.find(currentFn_);
-        if (lit != lambdaFnEnclosingType_.end() && lit->second &&
-            lit->second->genericParams.empty() &&
-            (lit->second->kind == ast::TypeDeclKind::Record ||
-             lit->second->kind == ast::TypeDeclKind::Choice))
-            return lit->second;
-    }
-    return nullptr;
-}
-
 
 // fix #6721 (§9.4, v0.340) — see the declaration.
 const sema::TypeRef* Emitter::thisCaptureCopyType() {
