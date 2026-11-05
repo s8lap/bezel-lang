@@ -13033,6 +13033,50 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         bool savedArgCtxIifeCallee = pendingLambdaArgContext_;
         if (dynamic_cast<const ast::LambdaExpr*>(ce->callee.get()))
             pendingLambdaArgContext_ = true;
+        // fix #8203 (§26.5.1, v0.355): the stdlib §5 block's APPLICABILITY
+        // filter reads the call's ARGUMENT TYPES — §26.5.1 ranks "extension
+        // members of the called name that match the call's arity and argument
+        // types" — but the arguments are visited AFTER the callee's member
+        // access is resolved, so at the ranking site the argument's type is
+        // not yet known. The #7967 filter could therefore only classify a
+        // literal or a typed binding, and reported UNKNOWN for a CALL RESULT
+        // or a CONCATENATION: the §5 `Where` was then admitted by name and,
+        // its `IEnumerable<T>` head being a subtype of `Object`, it BEAT the
+        // user's applicable `extension Object { Where(s: string) }` — the
+        // program compiled and printed garbage.
+        //
+        // So the ONE argument of a §5 element-lambda operator is TYPED here,
+        // BEFORE the callee, so the filter can read its type — exactly as the
+        // immediately-invoked-lambda case above peeks its arguments for
+        // §27.4's target-type context. A LAMBDA argument is NOT peeked: its
+        // parameter type is seeded from the receiver's element type (§5 D7,
+        // `linqLambdaElementType` below), which the callee's visit produces —
+        // and the filter already reads a lambda as a function value.
+        //
+        // The peek's own diagnostics are rolled back: the argument is visited
+        // again, in the normal order, and reports them there. A peek that
+        // reported an ERROR leaves no type behind (the §26.5.1 filter reads
+        // UNKNOWN then, and the §5 candidate is KEPT — the sound direction).
+        if (ce->args.size() == 1 && ce->args[0].value &&
+            !ctx_.exprType(*ce->args[0].value)) {
+            const ast::Expr* peekArg = ce->args[0].value.get();
+            const ast::MemberAccessExpr* peekMa =
+                dynamic_cast<const ast::MemberAccessExpr*>(
+                    ce->callee.get());
+            if (peekMa &&
+                common::isLinqElementLambdaOperatorName(peekMa->member) &&
+                !dynamic_cast<const ast::LambdaExpr*>(peekArg)) {
+                const std::size_t mark =
+                    ctx_.diagnostics().diagnostics().size();
+                const std::size_t errsBefore =
+                    ctx_.diagnostics().errorCount();
+                visitExpr(*peekArg);
+                const bool clean =
+                    ctx_.diagnostics().errorCount() == errsBefore;
+                ctx_.diagnostics().rollbackTo(mark);
+                if (!clean) ctx_.setExprType(peekArg, nullptr);
+            }
+        }
         if (ce->callee) visitExpr(*ce->callee);
         // fix #8099 (§7.4, v0.355): the CALLEE is READ here — before the
         // arguments are visited, and long before `invalidateCapturedNarrowings`
