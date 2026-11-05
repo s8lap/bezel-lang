@@ -9663,6 +9663,14 @@ private:
     static bool isExtensionMethod(const sema::MethodSymbol* ms) {
         return ms && ms->extensionDecl != nullptr;
     }
+    // fix #7841 (§26.7, §28.9, §30.1, v0.355): is `ms` a member of an
+    // `extension string` block, so that its `this` is a borrowed reference to
+    // a runtime-managed `string`? Such a receiver is the twin of a borrowed
+    // `string` PARAMETER, and every place that keeps a borrowed `string`
+    // parameter alive past the call (a lambda capture, #2689; an async
+    // frame, #5262-ff) must keep `this` alive the same way. Defined in
+    // LlvmBackend_Setup.cpp beside extensionThisType.
+    bool isStringExtensionMethod(const sema::MethodSymbol* ms) const;
     // #720: the declaring type of a field/property/method symbol (its `parent`),
     // or null. Used to find the type whose static state to lazily initialize.
     static const sema::TypeSymbol* memberOwner(const sema::Symbol* sym) {
@@ -13087,6 +13095,29 @@ private:
     // does not mutate between the analysis and the call sites).
     std::unordered_map<const ast::Member*,
                        std::unordered_set<size_t>> calleeParamNonEscape_;
+    // fix #7841 (§26.7, §28.9, §30.1, v0.355): may the `this` of an
+    // `extension string` member outlive a call to it UNRETAINED? The
+    // receiver-side twin of `isCalleeParamNonEscaping`: a conservative
+    // classification of every `this` occurrence in the member's body (the
+    // walker and the rules: ThisStringEscapeWalker, LlvmBackend_Calls2.cpp).
+    // False means the caller may release its +1 receiver temporary right
+    // after the call; true keeps the pre-#7841 leak. Cached per declaration
+    // (`thisStringEscape_`, keyed on the MethodDecl / PropertyDecl);
+    // `inProgress` guards the recursion through `this.Other()`.
+    bool thisStringMayEscape(const sema::MethodSymbol* ms,
+                             std::unordered_set<const ast::Node*>& inProgress,
+                             bool* hitCycle);
+    bool thisStringMayEscapeProperty(
+        const sema::PropertySymbol* ps,
+        std::unordered_set<const ast::Node*>& inProgress, bool* hitCycle);
+    std::unordered_map<const ast::Node*, bool> thisStringEscape_;
+    // fix #7841: the K8 deferral of an extension receiver's release
+    // (deferExtStringReceiverReleaseToK8) is sound only for the provably
+    // fresh record factory (`Wrap(): Named => new Named(this, 1)`), whose
+    // result is the ONLY holder of the receiver and is itself consumed at
+    // the K8 boundary; a member that also stores `this` elsewhere must keep
+    // the leak. `isProvablyFreshRecordFactoryMethod` with `this` admitted.
+    bool extStringRecvK8Eligible(const sema::MethodSymbol* ms) const;
 
     // fix #2952: pending releases for argument-position fresh boxes, appended
     // by buildOrderedArgs and consumed (bz_box_release emitted) by the CALL's

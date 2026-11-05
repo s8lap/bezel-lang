@@ -1718,6 +1718,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // and for a move-only receiver (§9.4: a borrow of in-place storage
         // bounded by the call; the escape is rejected in ownership).
         const sema::TypeRef*   thisCopyTy = nullptr;
+        // fix #7841 (§28.9, §26.7, v0.355): true when this is the `this`
+        // capture of an `extension string` member. The receiver is a borrowed
+        // runtime-managed `string`, the twin of a borrowed `string` PARAMETER
+        // (#2689): the capture takes its own +1 and the envdtor drops it, so
+        // the closure keeps the string alive however long it lives.
+        bool                   thisStringRetained = false;
     };
     std::vector<CaptureEntry> captures;
 
@@ -3189,6 +3195,22 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 savedBB = builder_.GetInsertBlock();
             }
         }
+        // fix #7841 (§28.9, §26.7, v0.355): an `extension string` receiver is
+        // a borrowed `string`, captured by value like any other `this`. §28.9
+        // makes `string` runtime-managed, and relaxes the borrow-escape rule
+        // only for "a captured borrowed class reference", so the closure may
+        // outlive the call; it must then hold its own reference, exactly as a
+        // captured borrowed `string` parameter does (#2689 above: one retain
+        // per capture-site execution, one release per envdtor run). Before
+        // this the env held the caller's pointer raw: a closure stored or
+        // returned by the extension (`Fn(): () -> int => lambda(): int =>
+        // this.Length`) read a freed string once the caller released its
+        // receiver temporary.
+        if (!ce.thisCopyTy && currentThis_->getType()->isPointerTy() &&
+            isStringExtensionMethod(currentMethod_)) {
+            emitStringRetain(currentThis_);
+            ce.thisStringRetained = true;
+        }
         captures.push_back(ce);
     }
 
@@ -4427,9 +4449,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     {
         bool hasNonThisCapture = false;
         for (const auto& ce : captures)
-            if (!ce.isThis || ce.thisCopyTy) {  // fix #6721: the copy cell
-                hasNonThisCapture = true;          // is freed by the envdtor
-                break;
+            if (!ce.isThis || ce.thisCopyTy ||  // fix #6721: the copy cell
+                ce.thisStringRetained) {        // is freed by the envdtor;
+                hasNonThisCapture = true;       // fix #7841: the string `this`
+                break;                          // is released by it
             }
 
         if (!hasNonThisCapture || envFieldTys.empty()) {
@@ -4512,6 +4535,15 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                                 cell, ce.thisCopyTy);
                     }
                     builder_.CreateCall(freeFn(), {cell});
+                    continue;
+                }
+                if (ce.isThis && ce.thisStringRetained) {
+                    // fix #7841: the +1 the `extension string` receiver
+                    // capture took (see the capture site).
+                    llvm::Value* fld = builder_.CreateStructGEP(
+                        envTyD, envArg, static_cast<unsigned>(i));
+                    emitStringRelease(
+                        builder_.CreateLoad(ptrTy(), fld, "this.str"));
                     continue;
                 }
                 if (ce.isThis) continue;

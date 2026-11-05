@@ -1563,6 +1563,32 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 break;
             }
         }
+        // fix #7841 (§30.1, §26.7, §28.9, v0.355): the same hold for the
+        // `this` of an `extension string` member. §30.1 names "its `this`
+        // receiver" beside the plain parameters as a borrow "held ... until
+        // the task SETTLES", and such a receiver is a borrowed `string`
+        // exactly like the formals pinned above — but the loop above walks
+        // `ms->params` only, so the frame held the caller's pointer raw and
+        // a resumed body (`await Task.Delay(1); return this.Length;`) read a
+        // string the caller had already released. The `this` capture is the
+        // frame capture whose symbol is null (emitFrameCaptureStores).
+        // The retain reads the value back from that frame field, so it is
+        // the very pointer the teardown release will load.
+        if (isStringExtensionMethod(ms)) {
+            for (std::size_t ci = 0; ci < frame.captures.size(); ++ci) {
+                if (frame.captures[ci].first != nullptr) continue;
+                const unsigned fi = frame.captureStart + (unsigned)ci;
+                if (fi >= frame.structTy->getNumElements() ||
+                    !frame.structTy->getElementType(fi)->isPointerTy())
+                    break;
+                emitStringRetain(builder_.CreateLoad(
+                    ptrTy(), builder_.CreateStructGEP(frame.structTy, st, fi),
+                    "async.pinthis"));
+                asyncStringPinFields_.push_back(
+                    frame.captureStart + (unsigned)ci);
+                break;
+            }
+        }
         // Publish the frame for the teardown release. Cleared at the end of
         // this function alongside asyncOwnedParamFrame_, so a nested emission
         // that completes its own frame cannot reach this one.

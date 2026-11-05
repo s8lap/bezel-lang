@@ -9593,6 +9593,452 @@ static void reportUniversalGetTypeRefusal(sema::SemaContext& ctx,
         "will be supported in a future milestone.");
 }
 
+// fix #7841 (§26.7, §28.9, §30.1, v0.355): may the `this` of the
+// `extension string` member whose body is walked here outlive the call
+// UNRETAINED? Decides whether the caller may release its +1 receiver
+// temporary right after the call (see the receiver block in
+// lowerCallDispatch).
+//
+// §26.7: "The receiver is always a borrow; extensions cannot store `this`,
+// return it as `owned`, or dispose it." §28.9 makes `string` a
+// runtime-managed value and says runtime management "relaxes nothing about
+// the values the closure captures: a captured borrowed class reference is
+// subject to §28.3's borrow-escape rules" — a `string` is not a class
+// reference, so a closure or an async / iterator frame that captures a
+// string `this` and outlives the call is LEGAL, and each such capture takes
+// its own reference (a lambda env: LlvmBackend_Exprs2.cpp; an async frame:
+// LlvmBackend_Async.cpp; an iterator frame: isIteratorFrameStringPinCapture)
+// exactly as it does for a captured borrowed `string` PARAMETER.
+//
+// What the compiler does NOT retain is a `this` that FLOWS INTO A VALUE: a
+// record / choice positional (`new Named(this, 1)`, the #4322 flow-through
+// model), an `Object` box, a collection literal element, a user call's
+// argument, a `with` / `case` / index operand, a local's initializer. The
+// alias fact the argument loop honours (calleeReturnMayAliasStringArgUnretained)
+// is a list of RETURN types that embed a string, and a list cannot be
+// complete: measured on the receiver, a generic choice, an `Object` box and
+// a record nested in a record all embed `this` and are not on it, and a
+// VOID member that embeds `this` into a record it hands to a parameter
+// (`Put(l: Array<Named>) l.Add(new Named(this, 1))`) has no return type to
+// gate on at all. So the decision is made on the callee's BODY: every
+// occurrence of `this` is classified, and anything not known to be a read
+// the call's own extent covers is an escape — including every expression
+// and statement kind the walk does not list. Conservative in one direction
+// only: an escape means the caller keeps the pre-#7841 leak (leak over UAF,
+// the #4322 posture), never a release.
+//
+// Reads (a release after the call is sound — each measured under ASan+LSan
+// in the #7841 review probes, 100× loops):
+//   * `this.M(...)` / `this.P` bound to a BUILT-IN `string` member (its
+//     result is a fresh value, §28.9) — unless the access is itself
+//     Function-typed (a method reference captures `this` in a closure cell);
+//   * `this.E(...)` / `this.P` bound to a user `extension string` member
+//     whose own body walk finds no escape (recursive; a cycle is a read: the
+//     receiver is alive for the whole outer call, so a result that depended
+//     on an in-progress walk is not cached);
+//   * an operand of a built-in binary operator (concat / compare produce
+//     fresh values) or of an interpolation hole; `this!`; `is` / `as`;
+//   * a bare `this` returned by a member DECLARED to return `string` or
+//     `string?` (the return retains; pinned by
+//     string_extension_receiver_once_7841 rows 5 and d08) — only at lambda
+//     depth 0, a lambda's own return is not classified;
+//   * a bare `this` assigned to a class field / property (`h.V := this`, the
+//     store retains), to an `out` parameter (`o := this`, likewise), or
+//     initializing a `string`-typed local (`var x := this`, a retained copy
+//     the local's scope end releases);
+//   * a `Console.Write` / `Console.WriteLine` argument;
+//   * an `if` / `elif` / `while` / conditional-expression condition.
+// A lambda body is walked with the same rules: its captured `this` IS
+// retained, but a value it embeds `this` into (`lambda(): Named => new
+// Named(this, 1)`) outlives the env's release. An async or iterator body is
+// walked the same way (the frame pins `this`); a `yield return this` is an
+// escape (the yielded value is not classified).
+namespace {
+struct ThisStringEscapeWalker {
+    const sema::SemaContext& ctx;
+    // The recursion into a user extension member's own walk (the Emitter's
+    // cached thisStringMayEscape / thisStringMayEscapeProperty).
+    std::function<bool(const sema::MethodSymbol*, bool*)> methodEscapes;
+    std::function<bool(const sema::PropertySymbol*, bool*)> propertyEscapes;
+    bool returnIsRead = false;   // declared return type is string / string?
+    bool escaped = false;
+    bool hitCycle = false;
+    int lambdaDepth = 0;
+
+    static bool isThis(const ast::Expr* e) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        return id && id->name == "this";
+    }
+    static bool isConsole(const ast::Expr* e) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        return id && id->name == "Console";
+    }
+    bool isFunctionTyped(const ast::Expr& e) const {
+        const sema::TypeRef* t = ctx.exprType(e);
+        return t && t->kind == sema::TypeRef::Kind::Function;
+    }
+    // `this.member` (called or not): a read iff the bound member is a
+    // built-in of `string` or a user extension member whose own body is
+    // read-only. `access` is the member-access node (or the call node when
+    // called) whose sema type tells a method reference apart.
+    bool memberReadOnThis(const ast::Expr& access, const sema::Symbol* sym) {
+        if (isFunctionTyped(access)) return false;
+        if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(sym)) {
+            if (!ms->extensionDecl) return true;
+            return !methodEscapes(ms, &hitCycle);
+        }
+        if (auto* ps = dynamic_cast<const sema::PropertySymbol*>(sym))
+            return !propertyEscapes(ps, &hitCycle);
+        return true;
+    }
+    void expr(const ast::Expr* e, bool safeRead) {
+        if (!e || escaped) return;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            if (id->name == "this" && !safeRead) escaped = true;
+            return;
+        }
+        if (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+            dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+            dynamic_cast<const ast::CharLiteralExpr*>(e) ||
+            dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+            dynamic_cast<const ast::VerbatimStringExpr*>(e) ||
+            dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+            dynamic_cast<const ast::NullLiteralExpr*>(e) ||
+            dynamic_cast<const ast::TypeOfExpr*>(e) ||
+            dynamic_cast<const ast::NameOfExpr*>(e) ||
+            dynamic_cast<const ast::DefaultExpr*>(e) ||
+            dynamic_cast<const ast::UnitExpr*>(e))
+            return;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            if (isThis(ma->target.get())) {
+                if (!memberReadOnThis(*ma, ctx.exprSymbol(*ma)))
+                    escaped = true;
+                return;
+            }
+            expr(ma->target.get(), false);
+            return;
+        }
+        if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(nm->target.get(), false);
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    c->callee.get())) {
+                if (isThis(ma->target.get())) {
+                    if (!memberReadOnThis(*c, ctx.exprSymbol(*c->callee)))
+                        escaped = true;
+                    for (auto& a : c->args) expr(a.value.get(), false);
+                    return;
+                }
+                const bool consoleWrite =
+                    isConsole(ma->target.get()) &&
+                    (ma->member == "Write" || ma->member == "WriteLine") &&
+                    c->args.size() == 1;
+                expr(ma->target.get(), false);
+                for (auto& a : c->args) expr(a.value.get(), consoleWrite);
+                return;
+            }
+            expr(c->callee.get(), false);
+            for (auto& a : c->args) expr(a.value.get(), false);
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    c->callee.get()))
+                expr(ma->target.get(), false);
+            else
+                expr(c->callee.get(), false);
+            for (auto& a : c->args) expr(a.value.get(), false);
+            return;
+        }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            bool userOp = false;
+            if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(
+                    ctx.exprSymbol(*b)))
+                userOp = ms->isOperator;
+            expr(b->left.get(), !userOp);
+            expr(b->right.get(), !userOp);
+            return;
+        }
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(u->operand.get(), false);
+            return;
+        }
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(t->operand.get(), true);
+            return;
+        }
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(p->operand.get(), true);
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(c->condition.get(), true);
+            expr(c->thenValue.get(), false);
+            expr(c->elseValue.get(), false);
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : is->parts) expr(part.expr.get(), true);
+            return;
+        }
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            ++lambdaDepth;
+            if (lam->exprBody) expr(lam->exprBody.get(), false);
+            for (auto& s : lam->stmts) stmt(s.get());
+            --lambdaDepth;
+            return;
+        }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (auto& a : n->args) expr(a.value.get(), false);
+            return;
+        }
+        if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(w->source.get(), false);
+            for (auto& a : w->assigns) expr(a.value.get(), false);
+            return;
+        }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& el : cl->elements) expr(el.get(), false);
+            for (auto& k : cl->keys) expr(k.get(), false);
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get(), false);
+            for (auto& ind : ix->indices) expr(ind.value.get(), false);
+            return;
+        }
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+            expr(ce->scrutinee.get(), false);
+            for (auto& arm : ce->arms) {
+                expr(arm.guard.get(), false);
+                expr(arm.exprBody.get(), false);
+                for (auto& s : arm.stmts) stmt(s.get());
+            }
+            return;
+        }
+        if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(th->operand.get(), false);
+            return;
+        }
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(r->lo.get(), false);
+            expr(r->hi.get(), false);
+            expr(r->step.get(), false);
+            return;
+        }
+        // Every other expression kind (a marked transfer, a `bind`, ...):
+        // not classified, so an escape.
+        escaped = true;
+    }
+    void stmt(const ast::Stmt* s) {
+        if (!s || escaped) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            // `var x := this` at `string` (no annotation, or `string` /
+            // `string?`) copies with its own retain and releases at the
+            // local's scope end — a read. An `Object`-typed local boxes.
+            bool localCopy = false;
+            if (isThis(ld->initializer.get()) && !ld->isUsing) {
+                localCopy = !ld->type;
+                if (ld->type)
+                    if (const sema::TypeRef* lt = ctx.resolvedType(*ld->type))
+                        localCopy =
+                            lt->kind == sema::TypeRef::Kind::Primitive &&
+                            lt->primitive == sema::PrimitiveType::String;
+            }
+            expr(ld->initializer.get(), localCopy);
+            return;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get(), false);
+            return;
+        }
+        if (dynamic_cast<const ast::LocalTypeDecl*>(s) ||
+            dynamic_cast<const ast::BreakStmt*>(s) ||
+            dynamic_cast<const ast::ContinueStmt*>(s))
+            return;
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            expr(r->value.get(),
+                 returnIsRead && lambdaDepth == 0 && isThis(r->value.get()));
+            return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            expr(es->expr.get(), false);
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(ts->value.get(), false);
+            return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // `h.V := this` (a class field / property store retains) and
+            // `o := this` (an `out` parameter store retains) are reads;
+            // every other assignment of a bare `this` is an escape.
+            bool storeRetains = false;
+            if (as->op == ":=" && isThis(as->value.get())) {
+                if (auto* tma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        as->target.get())) {
+                    const sema::TypeRef* ot =
+                        tma->target ? ctx.exprType(*tma->target) : nullptr;
+                    storeRetains = ot && ot->kind == sema::TypeRef::Kind::Named &&
+                                   ot->declaration &&
+                                   ot->declaration->kind ==
+                                       ast::TypeDeclKind::Class;
+                } else if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                               as->target.get())) {
+                    auto* ps = dynamic_cast<const sema::ParameterSymbol*>(
+                        ctx.exprSymbol(*tid));
+                    storeRetains = ps && ps->modifier == "out";
+                }
+            }
+            if (auto* tma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    as->target.get()))
+                expr(tma->target.get(), false);
+            else if (!dynamic_cast<const ast::IdentifierExpr*>(
+                         as->target.get()))
+                expr(as->target.get(), false);
+            expr(as->value.get(), storeRetains);
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get(), true);
+            for (auto& b : is->ifBranch.body) stmt(b.get());
+            for (auto& br : is->elifBranches) {
+                expr(br.condition.get(), true);
+                for (auto& b : br.body) stmt(b.get());
+            }
+            for (auto& b : is->elseBody) stmt(b.get());
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get(), true);
+            for (auto& b : ws->body) stmt(b.get());
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            expr(fs->iterable.get(), false);
+            expr(fs->withExpr.get(), false);
+            for (auto& b : fs->body) stmt(b.get());
+            return;
+        }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) stmt(b.get());
+            return;
+        }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            expr(inc->target.get(), false);
+            return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(ds->value.get(), false);
+            return;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            expr(ys->value.get(), false);
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) stmt(b.get());
+            for (auto& c : ts->catches) {
+                expr(c.guard.get(), true);
+                stmt(c.body.get());
+            }
+            for (auto& b : ts->finallyBody) stmt(b.get());
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            expr(cs->scrutinee.get(), false);
+            for (auto& arm : cs->arms) {
+                expr(arm.guard.get(), false);
+                expr(arm.exprBody.get(), false);
+                for (auto& st : arm.stmts) stmt(st.get());
+            }
+            return;
+        }
+        // Every statement kind not classified above: an escape.
+        escaped = true;
+    }
+};
+}  // namespace
+
+// fix #7841 — see ThisStringEscapeWalker. `*hitCycle` is set when the walk
+// consulted a member whose own walk is still in progress.
+bool Emitter::thisStringMayEscape(
+        const sema::MethodSymbol* ms,
+        std::unordered_set<const ast::Node*>& inProgress, bool* hitCycle) {
+    if (!ms || !ms->decl || ctx_.isImported(ms)) return true;
+    const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md) return true;
+    auto it = thisStringEscape_.find(md);
+    if (it != thisStringEscape_.end()) return it->second;
+    if (inProgress.count(md)) {
+        if (hitCycle) *hitCycle = true;
+        return false;
+    }
+    ThisStringEscapeWalker w{
+        ctx_,
+        [&](const sema::MethodSymbol* m, bool* hc) {
+            return thisStringMayEscape(m, inProgress, hc);
+        },
+        [&](const sema::PropertySymbol* p, bool* hc) {
+            return thisStringMayEscapeProperty(p, inProgress, hc);
+        }};
+    if (md->returnType)
+        if (const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType))
+            w.returnIsRead = rt->kind == sema::TypeRef::Kind::Primitive &&
+                             rt->primitive == sema::PrimitiveType::String;
+    inProgress.insert(md);
+    if (md->bodyKind == ast::MethodBodyKind::Expression && md->exprBody)
+        w.expr(md->exprBody.get(),
+               w.returnIsRead && ThisStringEscapeWalker::isThis(
+                                     md->exprBody.get()));
+    else if (md->bodyKind == ast::MethodBodyKind::Block)
+        for (auto& s : md->stmts) w.stmt(s.get());
+    else
+        w.escaped = true;
+    inProgress.erase(md);
+    if (w.hitCycle && hitCycle) *hitCycle = true;
+    // A result that leaned on an in-progress walk is only final for the
+    // outermost member; an inner member's own callers get a fresh walk.
+    if (!w.hitCycle || inProgress.empty()) thisStringEscape_[md] = w.escaped;
+    return w.escaped;
+}
+
+// fix #7841 — the extension PROPERTY twin (`property Len2: int =>
+// this.Length`; §26.3 admits the expression body only). Its own `this`
+// return is not classified (a getter's string result is not known to
+// retain), so `property Self: string => this` is an escape.
+bool Emitter::thisStringMayEscapeProperty(
+        const sema::PropertySymbol* ps,
+        std::unordered_set<const ast::Node*>& inProgress, bool* hitCycle) {
+    if (!ps || !ps->decl || ctx_.isImported(ps)) return true;
+    const auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    if (!pd || pd->bodyKind != ast::PropertyBodyKind::Expression ||
+        !pd->exprBody)
+        return true;
+    auto it = thisStringEscape_.find(pd);
+    if (it != thisStringEscape_.end()) return it->second;
+    if (inProgress.count(pd)) {
+        if (hitCycle) *hitCycle = true;
+        return false;
+    }
+    ThisStringEscapeWalker w{
+        ctx_,
+        [&](const sema::MethodSymbol* m, bool* hc) {
+            return thisStringMayEscape(m, inProgress, hc);
+        },
+        [&](const sema::PropertySymbol* p, bool* hc) {
+            return thisStringMayEscapeProperty(p, inProgress, hc);
+        }};
+    inProgress.insert(pd);
+    w.expr(pd->exprBody.get(), false);
+    inProgress.erase(pd);
+    if (w.hitCycle && hitCycle) *hitCycle = true;
+    if (!w.hitCycle || inProgress.empty()) thisStringEscape_[pd] = w.escaped;
+    return w.escaped;
+}
+
 llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     // fix #7600 (§22.5, v0.350): the written-order pre-pass runs BEFORE every
@@ -18219,16 +18665,28 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
                 rt->primitive == sema::PrimitiveType::String &&
                 isPlusOneStringProducer(maR->target.get())) {
+                // fix #7841 (third pass): the decision is the callee BODY's
+                // (ThisStringEscapeWalker above), not its return type — a
+                // void member can embed `this` too. The claim / K8 paths
+                // stay for the one embedding shape they were built for
+                // (the provably fresh `new R(.., this, ..)` factory, where
+                // the record's own scope-end field release, or the K8
+                // boundary, reclaims the receiver); every other escape
+                // keeps the pre-#7841 leak.
+                std::unordered_set<const ast::Node*> inProgress;
+                const bool recvEscapes =
+                    thisStringMayEscape(ms, inProgress, nullptr);
                 const bool recvMayAlias =
                     calleeReturnMayAliasStringArgUnretained(ctx_, ms);
                 const bool recvClaimedByLocal =
                     recvMayAlias &&
                     (wasRecordCallResultInitOutermost ||
                      recordCallResultInitOutermostClassWithRecordField_);
-                if (!recvMayAlias)
+                if (!recvEscapes)
                     emitStringRelease(args[0]);
-                else if (!recvClaimedByLocal &&
-                         k8ExtStringRecvCalls_.count(&call))
+                else if (recvMayAlias && !recvClaimedByLocal &&
+                         k8ExtStringRecvCalls_.count(&call) &&
+                         extStringRecvK8Eligible(ms))
                     deferExtStringReceiverReleaseToK8(args[0]);
             }
         }

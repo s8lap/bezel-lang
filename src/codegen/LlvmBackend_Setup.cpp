@@ -231,6 +231,29 @@ llvm::Type* Emitter::extensionThisType(const sema::MethodSymbol* ms,
 }
 
 
+// fix #7841 — see the declaration.
+bool Emitter::extStringRecvK8Eligible(const sema::MethodSymbol* ms) const {
+    if (!ms) return false;
+    const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md || !md->returnType) return false;
+    const sema::TypeRef* tr = ctx_.resolvedType(*md->returnType);
+    if (!tr || tr->kind != sema::TypeRef::Kind::Named || !tr->declaration)
+        return false;
+    return isProvablyFreshRecordFactoryMethod(ms, tr->declaration,
+                                              /*admitThisPassthrough=*/true);
+}
+
+// fix #7841 — see the declaration.
+bool Emitter::isStringExtensionMethod(const sema::MethodSymbol* ms) const {
+    if (!ms || !ms->extensionDecl || !ms->extensionDecl->targetType)
+        return false;
+    const sema::TypeRef* rt =
+        ctx_.resolvedType(*ms->extensionDecl->targetType);
+    return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+           rt->primitive == sema::PrimitiveType::String && !rt->nullable;
+}
+
+
 void Emitter::declareExterns() {
     for (const auto& sym : ctx_.symbols()) {
         auto* xb = dynamic_cast<const sema::ExternBlockSymbol*>(sym.get());
@@ -39348,6 +39371,48 @@ void Emitter::collectRecordCallResultReleaseEligible(
                                         !rrt->nullable &&
                                         isPlusOneStringProducer(
                                             rma->target.get());
+                        // fix #7841 (third pass; §28.9, v0.355): admit `this`
+                        // only when every OTHER argument is a value scalar or
+                        // an unbound `string` +1 producer. The claim releases
+                        // EVERY string field of the record at the local's
+                        // scope end, and #4295's parameter passthrough
+                        // admits `new P2(this, x)` whatever `x` is: with a
+                        // NAMED `x` (`Make.Str(i).WrapWith(keep)`) that
+                        // release freed `keep`'s string once per iteration
+                        // (measured: a double free; base leaked the receiver
+                        // instead). Not admitted, the receiver keeps base's
+                        // leak.
+                        if (admitThis)
+                            for (const auto& ca : call->args) {
+                                const sema::TypeRef* at =
+                                    ca.value ? ctx_.exprType(*ca.value)
+                                             : nullptr;
+                                const bool scalar =
+                                    at &&
+                                    ((at->kind ==
+                                          sema::TypeRef::Kind::Primitive &&
+                                      at->primitive !=
+                                          sema::PrimitiveType::String &&
+                                      at->primitive !=
+                                          sema::PrimitiveType::Object) ||
+                                     (at->kind ==
+                                          sema::TypeRef::Kind::Named &&
+                                      at->declaration &&
+                                      at->declaration->kind ==
+                                          ast::TypeDeclKind::Enum));
+                                const bool freshStr =
+                                    at &&
+                                    at->kind ==
+                                        sema::TypeRef::Kind::Primitive &&
+                                    at->primitive ==
+                                        sema::PrimitiveType::String &&
+                                    !at->nullable &&
+                                    isPlusOneStringProducer(ca.value.get());
+                                if (!scalar && !freshStr) {
+                                    admitThis = false;
+                                    break;
+                                }
+                            }
                         if ((ms &&
                              (isProvablyFreshRecordFactoryMethod(
                                   ms, tr->declaration, admitThis) ||
