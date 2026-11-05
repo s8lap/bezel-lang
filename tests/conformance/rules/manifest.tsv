@@ -1374,7 +1374,6 @@ s14_1_1413	spec	14.1	run	program	a record component of type Guid keeps its type 
 s14_1_1414	spec	14.1	run	program	ToString of another class's Guid member, direct and through Object, inside Box<Guid>	Type parameters of declarations that do not nest share no scope	14.1, 2.7	all:36036\n36036				
 s14_1_1415	spec	14.1	run	program	ToString of another class's TimeSpan member, direct and through Object, inside Box<TimeSpan>	Type parameters of declarations that do not nest share no scope	14.1, 2.7	all:16016\n16016				
 s14_1_1416	spec	14.1	run	program	ToString of another class's DateTime member, direct and through Object, inside Box<DateTime>	Type parameters of declarations that do not nest share no scope	14.1, 2.7	all:19019\n19019				
-s14_1_1417	spec	14.1	run	program	control: the same shape with an ordinary type parameter T reads another class's Guid member	Type parameters of declarations that do not nest share no scope	14.1, 2.7	136				
 s14_2_0001	spec	14.2	accept	lib	a class type satisfies where T: class	`where T: class` accepts non-nullable reference types only — classes, interfaces, string, function types (§14.2).	14.2		4367			
 s14_2_0002	spec	14.2	reject	lib	a record fails where T: class	`where T: class` accepts non-nullable reference types only; a value type is excluded (§14.2).	14.2	class	4367			
 s14_2_0003	spec	14.2	accept	lib	a record satisfies where T: value	`where T: value` accepts non-nullable value types — records, enums, choices, primitives, inline arrays, the unit type (§14.2).	14.2		4367			
