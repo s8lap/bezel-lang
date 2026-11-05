@@ -8029,6 +8029,28 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
             // reclaims elsewhere, so reclaiming here would double-free.
             if (loc->isUsing) return lvalueAddr(receiver, slotTy);
             if (unwindOwnedLocalClass(ld)) return lvalueAddr(receiver, slotTy);
+            // fix-forward #8137 (§30.3 / §28.3 / §17.13, v0.355): a plain
+            // local initialised by an `OwningTask<T>.Result` read is owned by
+            // structure too — §30.3 transfers the task's result to the reader
+            // exactly as `await` does — but `unwindOwnedLocalClass` classifies
+            // by initializer FORM and has no `Result` arm, so `var c :=
+            // t.Result; _ := c;` found NO slot here and the discard's named-
+            // binding branch (LlvmBackend_Stmts.cpp, `discardOutOwnedVar`)
+            // emitted NOTHING: measured 1600 B leaked in 100 allocations on a
+            // 100x loop (every iteration), where the `new`-initialised twin
+            // was clean. The explicit `c.Dispose()` spelling was unaffected
+            // only because the #4246 stamp arm below happens to cover it.
+            // Same CLASSIFICATION form the ownership pass and the unwind
+            // registration (`registerUnwindOwnedLocal`) read, so the three
+            // sites agree on which locals this scope reclaims; the fact gates
+            // on a USER class/interface result, so a vtable-less builtin never
+            // reaches the class dispatch through this arm. Reclaim + null is
+            // exactly-once: the unwind entry reloads the nulled slot and skips.
+            // // per §30.3, §28.3, §17.13, v0.355, #8137
+            if (ld->initializer &&
+                common::owningTaskResultReadClassifiesOwned(ld->initializer.get(),
+                                                            ctx_))
+                return lvalueAddr(receiver, slotTy);
             // fix #4246 (§28.3 / §28.6, v0.298): `unwindOwnedLocalClass`
             // classifies purely from ld's DECLARATION initializer form and
             // returns null for a borrow-initialized local (`var y := x;`),

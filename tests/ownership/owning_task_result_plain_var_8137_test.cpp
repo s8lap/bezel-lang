@@ -649,3 +649,78 @@ BEZEL_TEST(owning_task_result_plain_var_8137,
         "Mk()"));
     expectNoLeak(r, "5250\nlive 0 0\n");
 }
+
+// ---------------------------------------------------------------------------
+// THE DISCARD ROWS (third fix-forward, §17.13 / §28.3 / §30.3, v0.355).
+//
+// `_ := c;` on a plain local the §30.3 classification made OWNED is the
+// announced consume of §17.13: the ownership pass stamps the discard
+// (`discardOutOwnedVar`) and codegen's named-binding branch asks
+// `explicitDisposeOwnedReceiverSlot` for the slot to reclaim + null. That
+// resolver recognised a plain local only through `unwindOwnedLocalClass`
+// (initializer FORM), so the Result-initialised local found no slot and the
+// discard emitted nothing. Measured on 80e11e74 (the unwind fix-forward):
+// 800 B in 50 allocations -- every NON-throwing iteration leaked, while the
+// throwing half was rescued by the unwind entry. On its parent 480b4e18 the
+// same program leaked all 100. The `new`-initialised twin was clean on both.
+// Sums: 50 non-throwing iterations return 1, 50 throwing ones add 100.
+// ---------------------------------------------------------------------------
+
+// §17.13 / §28.3 -- DISCARD then throw (probe m04_r): the discard disposes
+// the transferred Cell and nulls the slot; the throw edge then reloads null
+// and skips, so the fix cannot double-dispose.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_dot_result_discard_then_throw_disposes_exactly_once_spec_17_13) {
+    JitResult r = runAotChecked(unwindProg(
+        "t: OwningTask<Cell>",
+        "var c := t.Result; "
+        "_ := c; "
+        "if k then var z := Boom(); end if; "
+        "return 1;",
+        "Mk()"));
+    expectNoLeak(r, "5050\nlive 0 0\n");
+}
+
+// §17.13 / §28.3 -- throw then DISCARD (probe m08_r): the throwing half is
+// disposed by the unwind entry, the non-throwing half by the discard.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_dot_result_throw_then_discard_disposes_exactly_once_spec_17_13) {
+    JitResult r = runAotChecked(unwindProg(
+        "t: OwningTask<Cell>",
+        "var c := t.Result; "
+        "if k then var z := Boom(); end if; "
+        "_ := c; "
+        "return 1;",
+        "Mk()"));
+    expectNoLeak(r, "5050\nlive 0 0\n");
+}
+
+// §17.13 / §28.3 -- the CONTROL (probe m04_n): the same discard on a
+// `new`-initialised local, clean before and after.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_new_local_discard_then_throw_control_spec_17_13) {
+    JitResult r = runAotChecked(unwindProg(
+        "t: OwningTask<Cell>",
+        "var c := new Cell(5); "
+        "_ := c; "
+        "if k then var z := Boom(); end if; "
+        "return 1;",
+        "Mk()"));
+    expectNoLeak(r, "5050\nlive 0 0\n");
+}
+
+// §28.9 / §28.3 -- explicit DISPOSE then throw (probe m03_r): the SAME
+// resolver serves `c.Dispose()`, which the #4246 stamp arm already covered;
+// the new structural arm answers first and must reclaim + null the same
+// slot -- exactly once, with the unwind entry skipping the nulled slot.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_dot_result_explicit_dispose_then_throw_disposes_exactly_once_spec_28_9) {
+    JitResult r = runAotChecked(unwindProg(
+        "t: OwningTask<Cell>",
+        "var c := t.Result; "
+        "c.Dispose(); "
+        "if k then var z := Boom(); end if; "
+        "return 1;",
+        "Mk()"));
+    expectNoLeak(r, "5050\nlive 0 0\n");
+}
