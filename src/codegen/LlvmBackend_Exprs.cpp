@@ -1151,29 +1151,46 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // not produce a value leaves `srcEv` undefined, and the boundary's
             // null test on an undefined pointer is undefined behaviour. The
             // safe direction there is a leak (there is no object to reclaim).
-            if (srcExpr && srcEv && srcEv->getType()->isPointerTy() &&
-                !llvm::isa<llvm::UndefValue>(srcEv) &&
-                isFreshOwnedClassProducer(srcExpr)) {
-                llvm::AllocaInst* holeSlot = entryAllocaNullPtr();
-                builder_.CreateStore(srcEv, holeSlot);
-                if (!deferUnboundOwnedTempToK8(holeSlot)) {
-                    // No K8 boundary to queue on (a disposer body): fall back
-                    // to an immediate, null-guarded discharge so the value is
-                    // not leaked outright — the same fallback the argument
-                    // position uses.
-                    llvm::Value* obj =
-                        builder_.CreateLoad(ptrTy(), holeSlot, "interp.hole");
-                    llvm::Value* isNull = builder_.CreateICmpEQ(
-                        obj, llvm::ConstantPointerNull::get(ptrTy()));
-                    auto* dispBB = llvm::BasicBlock::Create(
-                        llvm_, "interp.hole.dispose", currentFn_);
-                    auto* contBB = llvm::BasicBlock::Create(
-                        llvm_, "interp.hole.cont", currentFn_);
-                    builder_.CreateCondBr(isNull, contBB, dispBB);
-                    builder_.SetInsertPoint(dispBB);
-                    emitDisposeAndReclaim(obj);
-                    builder_.CreateBr(contBB);
-                    builder_.SetInsertPoint(contBB);
+            //
+            // fix #8171 (§18.5 / §28.3.11 / §28.3 K7.1 / §28.9, v0.355): the
+            // CLASSIFIER is widened. #8143's arm recognised ONE producer
+            // shape — `isFreshOwnedClassProducer(srcExpr)`, which is `new
+            // C(...)` / an `owned C`-returning call whose RESULT TYPE is a heap
+            // CLASS. Two populations it cannot see still leaked their
+            // temporary at the hole:
+            //
+            //   * an OWNED MEET (§28.3 K7.1 — "owned ⊓ owned = owned"): `a ?? b`,
+            //     an if-expression and a case-expression whose arms are all
+            //     owned producers. The meet's RESULT is a fresh owned value
+            //     the hole borrows (§18.5), so nobody owns it. MEASURED on the
+            //     issue's p12/p13 repro over 100 iterations: 1600 B in 100
+            //     allocations each (one 16-byte class instance per
+            //     evaluation) — the meet's result, orphaned.
+            //   * a DECLARATION-LESS built-in producer: `new StringBuilder(...)`
+            //     (stdlib §3.1) and the `owned Array<T>` materializers
+            //     `s.Split(...)` / `s.ToCharArray()` (stdlib §9.6). Every
+            //     built-in is declaration-less, so `rt->declaration` is null
+            //     and the class test can never fire for them. MEASURED: p14
+            //     59200 B / 200 allocations, p15 35800 B / 1000.
+            //
+            // The RELEASE is kind-specific (`classifyHoleOwnedTemp` /
+            // `registerHoleOwnedTemp` own that split): a heap class through
+            // its vtable Dispose, a builtin COLLECTION through the runtime
+            // free plus the §28.11 element disposer, a vtable-less built-in
+            // through its own free. A vtable dispatch on a `bz_array_t*` or a
+            // `StringBuilder` would be a WILD JUMP — neither has a Bezel
+            // vtable at word 0.
+            if (srcExpr && srcEv) {
+                const HoleOwnedTempKind holeKind =
+                    classifyHoleOwnedTemp(srcExpr);
+                if (holeKind != HoleOwnedTempKind::None) {
+                    if (!registerHoleOwnedTemp(srcExpr, srcEv, holeKind)) {
+                        // No K8 boundary to queue on (a disposer body): fall
+                        // back to an immediate, null-guarded discharge so the
+                        // value is not leaked outright — the same fallback the
+                        // argument position uses.
+                        emitHoleOwnedTempFallback(srcExpr, srcEv, holeKind);
+                    }
                 }
             }
         };

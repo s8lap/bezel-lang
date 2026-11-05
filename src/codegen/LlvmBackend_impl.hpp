@@ -22904,6 +22904,66 @@ private:
     // (a LATER operand that throws). Returns false when the queue cannot be
     // used (no function / disposer body); the caller keeps its old path.
     bool deferUnboundOwnedTempToK8(llvm::AllocaInst* slot);
+    // fix #8171 / #8172 (§28.3.11 / §18.5 / §28.3, v0.355): the hole's OWN
+    // unbound owned temporary.
+    //
+    // §18.5: an interpolation hole BORROWS its operand; §28.3.11: a value that
+    // is "used only by *borrowing* operations within the expression" is an
+    // unbound owned temporary, "disposed at the end of the full expression in
+    // which it is produced". The hole's operand is such a borrowing use, so
+    // when the operand is a FRESH OWNED PRODUCER the +1 it carries is owned by
+    // NOBODY and the hole owes a disposal.
+    //
+    // #8143 installed that discharge for ONE producer shape — a `new C(...)` /
+    // an `owned C`-returning call of a heap CLASS (`isFreshOwnedClassProducer`).
+    // The two populations it cannot see are the ones this enum names:
+    //   * an owned MEET (§28.3 K7.1) — `a ?? b`, an if-expression, a
+    //     case-expression — whose RESULT is a fresh owned value;
+    //   * a DECLARATION-LESS built-in producer — `new StringBuilder(...)`
+    //     (stdlib §3.1) and the `owned Array<T>` materializers (stdlib §9.6).
+    //     Every built-in is declaration-less, so the class test in
+    //     `isFreshOwnedClassProducer` can never fire for them, and their
+    //     release is NOT the vtable Dispose.
+    enum class HoleOwnedTempKind {
+        None = 0,
+        // A heap class/interface instance — the vtable Dispose
+        // (`emitDisposeAndReclaim`), the `deferUnboundOwnedTempToK8` channel.
+        Class,
+        // A builtin COLLECTION backing (`Array` / `Dictionary` / ...) — the
+        // runtime free plus the §28.11 element disposer
+        // (`buildCollectionTempDisposal`), never a vtable dispatch.
+        Collection,
+        // A declaration-less VTABLE-LESS built-in (`StringBuilder` and the
+        // other `emitVtablelessBuiltinRelease` arms) — the built-in's OWN
+        // free, never a vtable dispatch.
+        VtablelessBuiltin,
+    };
+    // Classify the hole's operand: is it a fresh owned producer the hole
+    // must discharge? Returns `None` for every borrow (a local, a field, a
+    // property read, a plain call) — disposing one of those would free a
+    // value this scope does not own.
+    HoleOwnedTempKind classifyHoleOwnedTemp(const ast::Expr* srcExpr) const;
+    // The `??` / if-expression / case-expression ARM MEET: the meet's RESULT
+    // is a fresh owned value when every arm is an owned producer (§28.3 K7.1,
+    // "owned ⊓ owned = owned"). A MIXED meet is rejected by the ownership
+    // pass (`checkCoalesceMeetMixed` / `checkArmMeetMixed`), so requiring
+    // owned arms here cannot classify a borrow as owned.
+    bool holeOperandIsOwnedMeet(const ast::Expr* srcExpr) const;
+    // Register the hole's operand as an unbound owned temporary: an
+    // `unwindOnly` disposeStack_ entry (the EXCEPTION edge, §28.3's
+    // *Exception-path discharge*) plus a K8-boundary queue entry (the NORMAL
+    // edge, §28.3.11's "end of the full expression"). Returns false when the
+    // queue cannot be used (no function / disposer body) — the caller then
+    // keeps its own fallback path.
+    bool registerHoleOwnedTemp(const ast::Expr* srcExpr, llvm::Value* srcEv,
+                               HoleOwnedTempKind kind);
+    // The NO-K8-BOUNDARY fallback for the above (a disposer body has no
+    // full-expression boundary to queue on): an immediate, null-guarded
+    // discharge of the hole's operand, using the RELEASE its kind names —
+    // the vtable Dispose for a class, the collection free for a builtin
+    // collection, the built-in's own free for a vtable-less built-in.
+    void emitHoleOwnedTempFallback(const ast::Expr* srcExpr, llvm::Value* srcEv,
+                                   HoleOwnedTempKind kind);
     // Record an awaited Pattern A task temporary at the await's success edge:
     // registers the null-guarded bz_task_free on disposeStack_ (covering the
     // exception edge and acting as the conservative backstop) and queues it for

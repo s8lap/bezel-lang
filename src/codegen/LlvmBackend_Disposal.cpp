@@ -9504,6 +9504,280 @@ bool Emitter::deferUnboundOwnedTempToK8(llvm::AllocaInst* slot) {
 }
 
 
+// fix #8171 / #8172 (§28.3.11 / §18.5 / §28.3 K7.1, v0.355): the hole's OWN
+// unbound owned temporary — the classifier and the registration.
+//
+// §18.5: an interpolation hole BORROWS its operand (§7.4: the hole's implicit
+// `ToString` dispatch is not a member access, so the operand is not consumed).
+// §28.3.11: a value "used only by *borrowing* operations within the expression"
+// is an UNBOUND OWNED TEMPORARY, "disposed at the end of the full expression in
+// which it is produced, after every use of it within that expression has
+// completed". So when the hole's operand is a FRESH OWNED PRODUCER, the +1 it
+// carries is owned by NOBODY and the hole owes a disposal.
+//
+// #8143 installed that discharge for ONE producer shape. `isFreshOwnedClassProducer`
+// (common/OwnershipFacts.cpp) recognises `new C(...)` and an `owned C`-returning
+// call, and it requires the RESULT TYPE to be a heap CLASS
+// (`rt->declaration->kind == Class`). Two populations therefore fall through it:
+//
+//   * an OWNED MEET (§28.3 K7.1 — "owned ⊓ owned = owned"): `a ?? b`, an
+//     if-expression and a case-expression whose arms are all owned producers
+//     yield a fresh owned VALUE. The ownership pass already classifies exactly
+//     that shape as `Owned` (`Ownership.cpp::producerState` — the `??` arm and
+//     `common::conditionalCaseArmMeetIsOwned` for if/case); only codegen's hole
+//     arm lacked the classification, so the meet's result leaked at the hole.
+//   * a DECLARATION-LESS built-in producer: `new StringBuilder(...)` (stdlib
+//     §3.1) and the `owned Array<T>` materializers `s.Split(...)` /
+//     `s.ToCharArray()` (stdlib §9.6). Every built-in is declaration-less, so
+//     `rt->declaration` is null and the class test can never fire.
+//
+// The RELEASE differs per kind, and that is why this is a kind and not a
+// boolean: a heap class is released through its vtable Dispose
+// (`emitDisposeAndReclaim`), a builtin COLLECTION through the runtime free plus
+// the §28.11 element disposer (`buildCollectionTempDisposal` — `bz_array_free`
+// / `bz_dict_free` / `bz_llist_free`), and a vtable-less built-in through its
+// OWN free (`emitVtablelessBuiltinRelease`). A vtable dispatch on a
+// `bz_array_t*` or on a `StringBuilder` would be a WILD JUMP (neither has a
+// Bezel vtable at word 0), so the kind is load-bearing, not cosmetic.
+Emitter::HoleOwnedTempKind
+Emitter::classifyHoleOwnedTemp(const ast::Expr* srcExpr) const {
+    if (!srcExpr) return HoleOwnedTempKind::None;
+    const sema::TypeRef* rt = ctx_.exprType(*srcExpr);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named)
+        return HoleOwnedTempKind::None;
+    // (1) A heap CLASS / INTERFACE result: the #8143 shape and the owned
+    // MEET's result.
+    if (rt->declaration) {
+        if (rt->declaration->kind != ast::TypeDeclKind::Class &&
+            rt->declaration->kind != ast::TypeDeclKind::Interface)
+            return HoleOwnedTempKind::None;
+        if (isFreshOwnedClassProducer(srcExpr)) return HoleOwnedTempKind::Class;
+        if (holeOperandIsOwnedMeet(srcExpr)) return HoleOwnedTempKind::Class;
+        return HoleOwnedTempKind::None;
+    }
+    // (2) A DECLARATION-LESS built-in. A user class that shadows a built-in
+    // name keeps its `declaration` and was answered above.
+    const std::string_view bn = builtinTypeName(rt);
+    if (bn.empty()) return HoleOwnedTempKind::None;
+    // (2a) A vtable-less built-in CLASS with a KNOWN release route
+    // (`StringBuilder`, `Random`, `Atomic`, ...). A built-in with no release
+    // arm would be a WILD JUMP, so it keeps its leak — the sound direction,
+    // exactly as `freshOwnedVtablelessBuiltinReceiverEligible` decides.
+    // The producer test is the same one #7733 uses for the StringBuilder root:
+    // a `new` of the built-in, or a call DECLARED to return `owned` (§28.1: an
+    // `owned` return transfers the +1). A call WITHOUT the marker returns a
+    // BORROW, and disposing that would free a value owned elsewhere.
+    if (!rt->nullable && vtablelessBuiltinReleaseIsKnown(bn)) {
+        bool producer = false;
+        if (dynamic_cast<const ast::NewExpr*>(srcExpr)) {
+            producer = true;
+        } else if (auto* call = dynamic_cast<const ast::CallExpr*>(srcExpr)) {
+            producer = common::calleeReturnsOwned(*call, ctx_);
+        }
+        if (producer) return HoleOwnedTempKind::VtablelessBuiltin;
+    }
+    // (2b) A fresh builtin COLLECTION temporary: the `owned Array<T>`
+    // materializers (`s.Split(...)`, `s.ToCharArray()`, `s.ToArray()`,
+    // `s.Sorted()`, `s.Reversed()`, `s.ToByteArray()` — stdlib §9.6) and the
+    // `new`-of-a-collection face. `isFreshOwnerlessArrayMaterializerExpr` is
+    // the codegen recognizer those call sites already use (#7278 / #8153), so
+    // the hole and the discard position cannot drift on the population.
+    if (!rt->nullable && (isFreshOwnerlessArrayMaterializerExpr(srcExpr) ||
+                           isUnboundOwnedBuiltinCollectionNewExpr(srcExpr)))
+        return HoleOwnedTempKind::Collection;
+    return HoleOwnedTempKind::None;
+}
+
+
+// fix #8171 (§28.3 K7.1 / §28.3 producers table, v0.355): the hole's operand
+// is an OWNED MEET — `a ?? b`, an if-expression or a case-expression whose arms
+// meet to OWNED. The meet's RESULT is a fresh owned value (§28.3 K7.1: "owned ⊓
+// owned = owned (exactly one of the two owned values is produced at runtime and
+// is discharged once)"), so the hole — which borrows it (§18.5) — owes its
+// disposal.
+//
+// THE GATE. Every arm must be an owned producer. A MIXED meet is REJECTED by
+// the ownership pass (`checkCoalesceMeetMixed` for `??`, `checkArmMeetMixed`
+// for if/case), so an arm set that mixes an owned value with a borrow never
+// reaches codegen; requiring owned arms here therefore cannot classify a
+// borrow as owned, and a hole over a BORROW meet keeps its pre-fix behaviour
+// (no disposal — the borrow belongs to whoever owns it).
+//
+// THE `??` ARM. The ownership pass's own rule (Ownership.cpp's `producerState`)
+// is "the built-in `??` with an Owned-producing RHS, over a reference-type
+// result". The RHS must therefore be an owned producer; and the LHS must be
+// one too, or an ABSORBING arm (`null` / `throw`, §28.3 K7.5) — a borrow LHS
+// is the mixed meet the ownership pass rejects. A user-defined `operator ??`
+// is an ordinary call, not a meet (the ownership pass skips it), so it is
+// skipped here too.
+bool Emitter::holeOperandIsOwnedMeet(const ast::Expr* srcExpr) const {
+    if (!srcExpr) return false;
+    // The if-expression / case-expression arm meet — the SHARED predicate the
+    // ownership pass itself consults (`producerState`), so the two cannot
+    // disagree about which meets are owned.
+    if (common::conditionalCaseArmMeetIsOwned(
+            *srcExpr, ctx_,
+            [this](const sema::TypeRef* t) { return resolveTypeParamRef(t); }))
+        return true;
+    const auto* be = dynamic_cast<const ast::BinaryExpr*>(srcExpr);
+    if (!be || be->op != "??" || !be->left || !be->right) return false;
+    // A user-defined `operator ??` is an ordinary call, not a meet.
+    if (auto* sym = ctx_.exprSymbol(*be))
+        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
+            if (ms->isOperator) return false;
+    if (!isFreshOwnedClassProducer(be->right.get())) return false;
+    const ast::Expr* lhs = be->left.get();
+    if (isFreshOwnedClassProducer(lhs)) return true;
+    // An absorbing arm imposes no ownership state (§28.3 K7.5): `null` and
+    // `throw` arms absorb to the other arm's state.
+    if (dynamic_cast<const ast::NullLiteralExpr*>(lhs)) return true;
+    if (dynamic_cast<const ast::ThrowExpr*>(lhs)) return true;
+    return false;
+}
+
+
+// fix #8171 / #8172 (§28.3.11 / §28.3, v0.355): register the hole's operand as
+// an unbound owned temporary — the EXCEPTION edge and the NORMAL edge.
+//
+// THE TWO CHANNELS are the ones the codebase already uses for this obligation
+// (§28.3 K8.1's "the full expression's end"):
+//   * the EXCEPTION edge — an `unwindOnly` disposeStack_ entry, so a throw out
+//     of the rest of the expression disposes the temporary while unwinding
+//     (§28.3's *Exception-path discharge*);
+//   * the NORMAL edge — a `k8RecvTemps_` queue entry, discharged by
+//     `flushK8RecvTemps` at the K8 full-expression boundary (the `lowerExpr`
+//     wrapper), which is §28.3.11's "end of the full expression in which it is
+//     produced, after every use of it within that expression has completed".
+//
+// The three kinds differ only in the RELEASE the two channels carry:
+//   * `Class` — the vtable Dispose (`emitDisposeAndReclaim`), exactly the
+//     `deferUnboundOwnedTempToK8` channel #8143 established;
+//   * `Collection` — the runtime free plus the §28.11 element disposer
+//     (`buildCollectionTempDisposal`), the same `Disposal` shape
+//     `registerFreshOwnedVtablelessBuiltinReceiverTempK8` registers for an
+//     owning collection: `releaseOnUnwindOnly` so the entry fires on the
+//     EXCEPTION edge and is skipped on the normal one (the flush emits it
+//     there, and nulls the slot, so the registered entry reads null);
+//   * `VtablelessBuiltin` — the built-in's OWN free
+//     (`emitVtablelessBuiltinRelease`), the same shape
+//     `registerFreshBuiltinNewReceiverTempK8` registers for a StringBuilder.
+//
+// NEITHER A COLLECTION NOR A VTABLE-LESS BUILTIN MAY GO THROUGH THE VTABLE
+// DISPATCH: a `bz_array_t*` and a `StringBuilder` have no Bezel vtable at word
+// 0, so the slot-2 dispatch would be a wild jump.
+bool Emitter::registerHoleOwnedTemp(const ast::Expr* srcExpr,
+                                     llvm::Value* srcEv,
+                                     HoleOwnedTempKind kind) {
+    if (kind == HoleOwnedTempKind::None) return false;
+    if (!srcExpr || !srcEv) return false;
+    if (!srcEv->getType()->isPointerTy()) return false;
+    // A DEGRADED hole: a lowering that could not produce a value leaves an
+    // undefined pointer, and the boundary's null test on it would be undefined
+    // behaviour. The safe direction there is a leak (there is no object to
+    // reclaim) — the same guard #8143's arm carries.
+    if (llvm::isa<llvm::UndefValue>(srcEv)) return false;
+    if (!currentFn_ || emittingDisposerBody_) return false;
+    const sema::TypeRef* rt = ctx_.exprType(*srcExpr);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    llvm::AllocaInst* slot = entryAllocaNullPtr();
+    // A state-machine body may flush after a suspension: keep the slot in the
+    // frame, as `deferUnboundOwnedTempToK8` does (#5286).
+    if (smStateStruct_) asyncHandlerSpillSlots_.push_back(slot);
+    builder_.CreateStore(srcEv, slot);
+    switch (kind) {
+    case HoleOwnedTempKind::Class:
+        // The #8143 channel, unchanged: an `unwindOnly` `dynamicDispose` entry
+        // (the exception edge) plus the K8 queue entry (the normal edge).
+        return deferUnboundOwnedTempToK8(slot);
+    case HoleOwnedTempKind::Collection: {
+        Disposal coll = buildCollectionTempDisposal(slot, rt);
+        coll.unwindOnly = false;
+        coll.dynamicDispose = false;
+        // `releaseOnUnwindOnly` (NOT `unwindOnly`): the entry is SKIPPED on the
+        // NORMAL edge (the K8 flush emits the release there, and nulls the
+        // slot) and FIRES on the EXCEPTION edge — the two-edge discipline of
+        // the K8 boundary.
+        coll.releaseOnUnwindOnly = true;
+        if (!disposeStack_.empty()) disposeStack_.back().push_back(coll);
+        k8RecvTemps_.push_back(K8RecvTemp{slot, currentFn_});
+        return true;
+    }
+    case HoleOwnedTempKind::VtablelessBuiltin: {
+        const std::string_view bn = builtinTypeName(rt);
+        if (bn.empty()) return false;
+        Disposal d{slot, nullptr};
+        d.unwindOnly = true;      // the normal edge is the K8 flush
+        d.dynamicDispose = false;
+        d.vtablelessBuiltin = std::string(bn);
+        if (!disposeStack_.empty()) disposeStack_.back().push_back(d);
+        k8RecvTemps_.push_back(K8RecvTemp{slot, currentFn_, std::string(bn)});
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+
+// fix #8171 (§28.3.11 / §28.9, v0.355): the no-K8-boundary fallback for the
+// hole's own unbound owned temporary — the shape #8143's arm already had for
+// the class case, extended to the kinds `classifyHoleOwnedTemp` admits.
+//
+// A disposer body has no full-expression boundary to queue on
+// (`deferUnboundOwnedTempToK8` refuses there), so the discharge is emitted
+// INLINE, right after the hole's render — the render is the hole's last use of
+// the operand (§18.5: the hole borrows it; §7.4: the hole's implicit
+// `ToString` dispatch is not a member access), and the rendered text is a
+// FRESH COPY of the value, so nothing that survives the hole points into the
+// object.
+//
+// The RELEASE is the kind's own — the vtable Dispose for a class, the
+// collection free (with the §28.11 element disposer) for a builtin collection,
+// the built-in's own free for a vtable-less built-in. A vtable dispatch on a
+// `bz_array_t*` or on a `StringBuilder` would be a WILD JUMP.
+void Emitter::emitHoleOwnedTempFallback(const ast::Expr* srcExpr,
+                                        llvm::Value* srcEv,
+                                        HoleOwnedTempKind kind) {
+    if (!srcExpr || !srcEv) return;
+    if (!srcEv->getType()->isPointerTy()) return;
+    if (llvm::isa<llvm::UndefValue>(srcEv)) return;
+    if (!currentFn_) return;
+    llvm::AllocaInst* slot = entryAllocaNullPtr();
+    builder_.CreateStore(srcEv, slot);
+    llvm::Value* obj = builder_.CreateLoad(ptrTy(), slot, "interp.hole");
+    llvm::Value* isNull = builder_.CreateICmpEQ(
+        obj, llvm::ConstantPointerNull::get(ptrTy()));
+    auto* dispBB = llvm::BasicBlock::Create(
+        llvm_, "interp.hole.dispose", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(
+        llvm_, "interp.hole.cont", currentFn_);
+    builder_.CreateCondBr(isNull, contBB, dispBB);
+    builder_.SetInsertPoint(dispBB);
+    switch (kind) {
+    case HoleOwnedTempKind::Class:
+        emitDisposeAndReclaim(obj);
+        break;
+    case HoleOwnedTempKind::Collection:
+        // The SAME helper the discard position uses for a fresh unbound
+        // borrowing-array temporary (#1015 / #6357): the runtime free plus the
+        // per-element disposer the element type selects.
+        freeUnboundOwnedBorrowingArrayTemp(srcExpr, obj,
+                                            ctx_.exprType(*srcExpr));
+        break;
+    case HoleOwnedTempKind::VtablelessBuiltin: {
+        const sema::TypeRef* rt = ctx_.exprType(*srcExpr);
+        const std::string_view bn = rt ? builtinTypeName(rt) : std::string_view();
+        if (!bn.empty()) emitVtablelessBuiltinRelease(bn, obj);
+        break;
+    }
+    default:
+        break;
+    }
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+}
+
+
 void Emitter::flushK8RecvTemps() {
     // Mirrors flushFfiExprTemps / flushAwaitedTaskTemps exactly, including the
     // two retains those document: an entry belonging to ANOTHER function is
