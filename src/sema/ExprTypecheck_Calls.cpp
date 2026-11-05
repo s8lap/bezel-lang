@@ -12618,10 +12618,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // written for the mutable families (whose surfaces §4.19 does
                 // not declare), whereas this guard can only ever turn a
                 // currently-UNTYPED expression into a typed one.
+                //
+                // fix #8104 (stdlib §4.19, §26.5 rule 1, v0.355): the OTHER
+                // built-in shape is the ANNOTATION (`using var f:
+                // FrozenArray<int> := ...`), a declaration-less Named whose
+                // head is `FrozenArray`. The arm read only the stub, so
+                // `f.ToArray()` stayed untyped there -- with or without a
+                // same-named extension -- and codegen dropped the statement.
                 if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
-                    recvTy->declaration && !recvTy->declaration->decl &&
-                    recvTy->declaration->moduleName.empty() &&
-                    recvTy->declaration->name == "FrozenArray" &&
+                    ((recvTy->declaration && !recvTy->declaration->decl &&
+                      recvTy->declaration->moduleName.empty() &&
+                      recvTy->declaration->name == "FrozenArray") ||
+                     (!recvTy->declaration &&
+                      recvTy->headName() == "FrozenArray")) &&
                     m == "ToArray" && ce.args.empty() &&
                     !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                     ctx_.setExprType(&ce, makeConcreteCollectionResult(
