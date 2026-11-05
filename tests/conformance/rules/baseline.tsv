@@ -256,6 +256,18 @@ s5_1_0171	pass
 s5_1_0801	pass	
 s5_1_0802	pass	
 s5_1_0803	pass	
+s5_1_0901	pass	
+s5_1_0902	pass	
+s5_1_0903	pass	
+s5_1_0904	pass	
+s5_1_0905	pass	
+s5_1_0906	pass	
+s5_1_0907	pass	
+s5_1_0908	pass	
+s5_1_0909	pass	
+s5_1_0910	pass	
+s5_1_0911	pass	
+s5_1_0912	pass	
 s5_2_0001	pass	
 s5_2_0002	pass	
 s5_2_0003	pass	
@@ -325,6 +337,7 @@ s6_6_0018	fail	#6717
 s6_6_0019	pass	
 s7_1_0001	pass	
 s7_1_0002	pass	
+s7_1_0901	pass	
 s7_2_0001	pass	
 s7_3_0001	pass	
 s7_3_0002	pass	
@@ -448,6 +461,7 @@ s7_4_0181	pass
 s7_4_0182	pass	
 s7_4_0183	pass	
 s7_4_0184	pass	
+s7_4_0901	pass	
 s7_5_0001	pass	
 s7_5_0002	pass	
 s7_5_0003	pass	
@@ -470,6 +484,12 @@ s7_5_0020	pass
 s7_5_0021	pass	
 s7_5_0023	pass	
 s7_5_0201	pass	
+s7_5_0901	pass	
+s7_5_0902	pass	
+s7_5_0903	pass	
+s7_5_0904	pass	
+s7_5_0905	pass	
+s7_5_0906	pass	
 s7_6_0001	pass	
 s7_6_0002	pass	
 s7_7_0001	pass	
@@ -490,6 +510,12 @@ s7_7_0015	pass
 s7_7_0016	pass	
 s7_7_0017	pass	
 s7_7_0018	pass	
+s7_7_0901	pass	
+s7_7_0902	pass	
+s7_7_0903	pass	
+s7_7_0904	pass	
+s7_7_0905	pass	
+s7_7_0906	pass	
 s7_8_0001	pass	
 s7_8_0002	pass	
 s7_9_0001	pass	
@@ -990,6 +1016,7 @@ s12_7_0042	pass
 s12_7_0043	pass	
 s12_7_0047	pass	
 s12_7_0048	pass	
+s12_7_0901	pass	
 s12_8_0001	pass	
 s12_8_0002	pass	
 s12_8_0003	pass	
@@ -1246,6 +1273,14 @@ s17_4_0004	pass
 s17_4_0005	pass	
 s17_4_0006	pass	
 s17_4_0007	pass	
+s17_4_0901	pass	
+s17_4_0902	pass	
+s17_4_0903	pass	
+s17_4_0904	pass	
+s17_4_0905	pass	
+s17_4_0906	pass	
+s17_4_0908	pass	
+s17_4_0909	pass	
 s17_5_0001	pass	
 s17_5_0003	pass	
 s17_5_0004	pass	
@@ -1301,6 +1336,10 @@ s17_7_0008	pass
 s17_7_0010	pass	
 s17_7_0011	pass	
 s17_7_0012	pass	
+s17_7_0901	pass	
+s17_7_0902	pass	
+s17_7_0903	pass	
+s17_7_0904	pass	
 s17_8_0001	pass	
 s17_8_0002	pass	
 s17_8_0003	pass	
@@ -2097,6 +2136,9 @@ s27_3_0060	pass
 s27_3_0061	pass	
 s27_3_0062	fail	#6258
 s27_3_0063	fail	#6258
+s27_3_0901	pass	
+s27_3_0902	pass	
+s27_3_0903	pass	
 s27_4_0001	pass	
 s27_4_0002	pass	
 s27_4_0003	pass	
@@ -3302,6 +3344,12 @@ l2_18_0024	pass
 l2_18_0025	pass	
 l2_18_0026	pass	
 l2_18_0027	pass	#7303
+l2_18_0901	pass	
+l2_18_0902	pass	
+l2_18_0903	pass	
+l2_18_0904	pass	
+l2_18_0905	pass	
+l2_18_0906	pass	
 l2_19_0001	pass	
 l2_19_0002	pass	
 l2_19_0003	pass	
@@ -3437,6 +3485,8 @@ l4_8_0007	pass
 l4_8_0008	pass	
 l4_8_0009	pass	
 l4_8_0010	pass	
+l4_8_0901	pass	
+l4_8_0902	pass	
 l4_9_0001	pass	
 l4_9_0002	pass	
 l4_9_0003	pass	
