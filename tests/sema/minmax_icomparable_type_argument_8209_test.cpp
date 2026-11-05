@@ -106,7 +106,7 @@ std::string prog(const std::string& decls, const std::string& body) {
 
 // =====================================================================
 // ROW 1 — THE DIRECT SPELLING. `class K: IComparable<int>` does NOT
-// implement `IComparable<K>`, so stdlib §5.1's `where T: IComparable<T>` is
+// implement `IComparable<K>`, so the `where T: IComparable<T>` of stdlib §2.8 (the §5.1 gate) is
 // not satisfied at an element of type `K` and the call must be REJECTED at
 // compile time.
 //

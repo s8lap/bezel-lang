@@ -13310,7 +13310,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         std::string(m) +
                                         "() without a selector requires the "
                                         "element type to implement "
-                                        "IComparable<T> (stdlib §5.1 / §14.2 "
+                                        "IComparable<T> (stdlib §2.8 / §5.1 / §14.2 "
                                         "/ #1198); " +
                                         std::string(
                                             srcElem->declaration->name) +

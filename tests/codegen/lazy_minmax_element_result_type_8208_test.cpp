@@ -11,7 +11,7 @@
 //           public method Max(): T;              // InvalidOperationException if empty
 //     so the no-selector form returns the ELEMENT type `T` — for EVERY `T`
 //     that satisfies the constraint, not only for the numeric primitives.
-//   * stdlib §9.6 declares `string`'s own `IComparable<string>`, and stdlib
+//   * stdlib §2.8 states `string`'s own `IComparable<string>`, and stdlib
 //     §2.5 declares `IComparable<Self>` on `DateTime`, `TimeSpan`, `DateOnly`
 //     and `TimeOnly`; spec §14.2 *Interface conformance* rule 2 (v0.355)
 //     admits "records and enums implementing it" and rule 1 admits a class
