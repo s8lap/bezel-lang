@@ -390,6 +390,78 @@ class Program
 end Program;
 )BZL";
 
+// ── fix-forward (review r39-rev-8141, B1): the CHAIN-call site ─────────────
+// `h.Get()(1)` re-derives "did the callee's return mint?" from the callee's
+// AST (`innerMints`, src/codegen/LlvmBackend_Calls2.cpp, fix #3704/#4239) and
+// releases twice when it thinks so. It must list the same transfer exclusions
+// as the return-site mint gate, `isCoalescedClosureTransfer` included, or a
+// `??` transfer is released twice: "refcount over-release (closure)".
+// MEASURED on 09d18434: c01 / c02 / c03 abort rc=134; on 301f24f2 c01 printed
+// 200 (c02 / c03 were already rc=134 there). 100 x (2 * 1) = 200.
+const char* kChainCoalesceBlock = R"BZL(module M;
+class Holder
+  public static method Pick(some: bool): ((int)->int)?
+    if some then return lambda(x: int) => x * 2; end;
+    return null;
+  end Pick;
+  public method Get(): (int)->int
+    return Holder.Pick(true) ?? throw new InvalidOperationException("x");
+  end Get;
+end Holder;
+class P
+  public static method Main(): int
+    using var h := new Holder();
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do total := total + h.Get()(1); i := i + 1; end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL";
+
+const char* kChainCoalesceArrow = R"BZL(module M;
+class Holder
+  public static method Pick(some: bool): ((int)->int)?
+    if some then return lambda(x: int) => x * 2; end;
+    return null;
+  end Pick;
+  public method Get(): (int)->int => Holder.Pick(true) ?? throw new InvalidOperationException("x");
+end Holder;
+class P
+  public static method Main(): int
+    using var h := new Holder();
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do total := total + h.Get()(1); i := i + 1; end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL";
+
+// The arrow `?? lambda` twin: both arms are +1 producers, so the `??` is a
+// transfer and the chain site must release once.
+const char* kChainCoalesceLambdaArrow = R"BZL(module M;
+class Holder
+  public static method Pick(some: bool): ((int)->int)?
+    if some then return lambda(x: int) => x * 2; end;
+    return null;
+  end Pick;
+  public method Get(): (int)->int => Holder.Pick(true) ?? lambda(x: int) => x * 3;
+end Holder;
+class P
+  public static method Main(): int
+    using var h := new Holder();
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do total := total + h.Get()(1); i := i + 1; end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL";
+
 }  // namespace
 
 // ===========================================================================
@@ -484,4 +556,29 @@ BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
 BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
            spec_28_9_coalesced_producer_return_transfers_in_both_body_forms) {
     expectCleanRun(kCoalesceTransfer, "600\n");
+}
+
+// ===========================================================================
+// ROW 12 — c01, block `return Pick() ?? throw` called as `h.Get()(1)`.
+// GREEN on 301f24f2, RED on 09d18434 (chain-site double release).
+// ===========================================================================
+BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
+           spec_28_9_chain_call_of_block_coalesced_transfer_releases_once) {
+    expectCleanRun(kChainCoalesceBlock, "200\n");
+}
+
+// ===========================================================================
+// ROW 13 — c02, the arrow twin `=> Pick() ?? throw`, chain-called.
+// ===========================================================================
+BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
+           spec_22_2_chain_call_of_arrow_coalesced_transfer_releases_once) {
+    expectCleanRun(kChainCoalesceArrow, "200\n");
+}
+
+// ===========================================================================
+// ROW 14 — arrow `=> Pick() ?? lambda`, chain-called.
+// ===========================================================================
+BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
+           spec_22_2_chain_call_of_arrow_coalesced_lambda_releases_once) {
+    expectCleanRun(kChainCoalesceLambdaArrow, "200\n");
 }

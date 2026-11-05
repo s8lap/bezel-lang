@@ -11892,8 +11892,14 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                         localOwnsPlusOne = true;
                                 }
                             }
+                            // fix-forward #8141 (§28.9, v0.355): mirror the
+                            // return-site mint gate's `??` transfer exclusion
+                            // (isCoalescedClosureTransfer). `return Pick() ??
+                            // throw …` no longer mints, so releasing twice here
+                            // over-released the caller's single +1.
                             innerMints = !isPlusOneClosureProducer(retVal) &&
                                          !isUserMethodClosureReturnCall(retVal) &&
+                                         !isCoalescedClosureTransfer(retVal) &&
                                          !localOwnsPlusOne;
                         }
                     }
