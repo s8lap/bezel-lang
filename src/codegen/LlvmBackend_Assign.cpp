@@ -16660,6 +16660,46 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
     // (`new Ctor(owned p)`). // per §28.3, §29.8, §30.1
     std::vector<std::pair<llvm::AllocaInst*, const ast::Expr*>>
         transferredOwnedArgSlots;
+    // fix #8018 (§8.6 / §28.9 / §28.3, v0.355): the callee of the CALL BEING
+    // BUILT, captured ONCE — before any argument expression is lowered.
+    //
+    // `currentCallee_` is EMITTER state, not a per-call value: the call site
+    // installs the callee on it before this function runs, but a NESTED CALL
+    // inside an argument expression CLOBBERS it. The nested call installs its
+    // OWN callee and clears `currentCallee_` at its own end (`emitMethodCall`
+    // / `lowerCallDispatch`), so by the time the OUTER call's §8.6 argument-box
+    // mint check runs, `currentCallee_` is null — the check saw "no callee",
+    // the freshly minted box was NEVER queued for release, and it leaked
+    // (24 bytes per call, unbounded in a loop). A nested GENERIC call is the
+    // other way round: its arm returns from `lowerCallDispatch` WITHOUT
+    // clearing `currentCallee_`, so the check saw the NESTED callee — a box
+    // could be released although THIS call's callee keeps the parameter (a
+    // use-after-free). Consulting the captured callee answers the right
+    // question in both cases: "does the callee of THIS call keep its
+    // parameter?" (§28.9 / §28.3's unbound-owned-temporary discharge).
+    //
+    // The capture is trusted only when it provably IS this call's callee:
+    // `params` IS the callee's own formal list (every call site passes
+    // `md->params` / `cd->params` — see the call sites in LlvmBackend_Calls2.cpp
+    // and LlvmBackend_Exprs2.cpp), so the captured Decl must own that exact
+    // vector. A call site that installs no callee of its own (the
+    // record-constructor path and the imported-generic-constructor path)
+    // leaves a STALE `currentCallee_` behind; the identity check rejects it,
+    // so the mint check is skipped there and those paths keep exactly their
+    // pre-#8018 behaviour (the box is minted and not queued — the
+    // conservative leak).
+    const ast::Member* argBoxCallee = currentCallee_;
+    if (argBoxCallee) {
+        const std::vector<ast::Param>* calleeParams = nullptr;
+        if (const auto* cmd =
+                dynamic_cast<const ast::MethodDecl*>(argBoxCallee))
+            calleeParams = &cmd->params;
+        else if (const auto* ccd =
+                     dynamic_cast<const ast::ConstructorDecl*>(argBoxCallee))
+            calleeParams = &ccd->params;
+        if (!calleeParams || calleeParams->data() != params.data())
+            argBoxCallee = nullptr;
+    }
     for (const auto& a : args) {
         std::size_t idx = params.size();
         if (a.name.empty()) {
@@ -17476,7 +17516,11 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // isolates this argument from any later boxForTarget on a sibling
             // argument (or the per-boxable-type rescue on the SAME argument's
             // own tail — see #2915). The callee Decl flows through
-            // currentCallee_ (set by the call site BEFORE buildOrderedArgs).
+            // currentCallee_ (set by the call site BEFORE buildOrderedArgs) and
+            // is captured as `argBoxCallee` at the top of this function — see
+            // fix #8018 below: the emitter's currentCallee_ is CLOBBERED by a
+            // nested call inside the argument expression, so the check must
+            // consult the capture, not the live emitter state.
             llvm::Value* savedBoxMint = lastBoxMint_;
             lastBoxMint_ = nullptr;
             v = boxForTarget(v, formalTy, a.value.get());
@@ -17486,9 +17530,18 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // queue it for release at the post-call site. A null `v` after
             // boxForTarget means no box was minted (reference source or null
             // unit-source rescue), so nothing to release.
+            //
+            // fix #8018 (§8.6 / §28.9 / §28.3, v0.355): the callee consulted
+            // here is `argBoxCallee` — the callee of the CALL BEING BUILT,
+            // captured at the top of this function — NOT the emitter's
+            // `currentCallee_`, which a NESTED CALL inside the argument
+            // expression clobbers (clears it, or leaves the nested generic
+            // callee on it). Consulting the clobbered value made this check
+            // ask about the wrong callee: usually about none at all, so the
+            // minted box was never queued and leaked 24 bytes per call.
             if (v && lastBoxMint_ && v == lastBoxMint_ &&
-                currentCallee_ != nullptr) {
-                if (isCalleeParamNonEscaping(currentCallee_, idx)) {
+                argBoxCallee != nullptr) {
+                if (isCalleeParamNonEscaping(argBoxCallee, idx)) {
                     // fix #7998 (§8.6 / §28.9 / §28.3, v0.350): the box is
                     // queued in the record of the CALL that is building THIS
                     // argument, not in a function-wide list. The record is the
