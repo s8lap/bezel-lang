@@ -9646,12 +9646,13 @@ static void reportUniversalGetTypeRefusal(sema::SemaContext& ctx,
 //     `string?` (the return retains; pinned by
 //     string_extension_receiver_once_7841 rows 5 and d08) — only at lambda
 //     depth 0, a lambda's own return is not classified;
-//   * a bare `this` assigned to a plain `string` / `string?` FIELD of a class
-//     (`h.V := this`, the store retains; not an `Object` field, which boxes,
-//     nor a property, whose user setter may embed `value`), to an `out o:
-//     string` parameter (`o := this`, likewise), or initializing a
-//     `string`-typed local (`var x := this`, a retained copy the local's
-//     scope end releases);
+//   * NOT a copy of `this` into a new name — `var x := this`, `o := this`
+//     into an `out` parameter, `h.V := this` into a field. Each copy retains,
+//     but the walk tracks the receiver by the spelling `this` only, and the
+//     copy's reference ends (scope end, caller's iteration end, overwrite)
+//     while a value the copy was boxed or embedded into lives on (`x as
+//     Object`, `o as Object`, `x.W0()`: the third review's a1 / c1 / c3 /
+//     c4). Every copy is an escape;
 //   * a `Console.Write` / `Console.WriteLine` argument;
 //   * an `if` / `elif` / `while` / conditional-expression condition.
 // A lambda body is walked with the same rules: its captured `this` IS
@@ -9681,10 +9682,6 @@ struct ThisStringEscapeWalker {
     bool isFunctionTyped(const ast::Expr& e) const {
         const sema::TypeRef* t = ctx.exprType(e);
         return t && t->kind == sema::TypeRef::Kind::Function;
-    }
-    static bool isStringType(const sema::TypeRef* t) {
-        return t && t->kind == sema::TypeRef::Kind::Primitive &&
-               t->primitive == sema::PrimitiveType::String;
     }
     // The built-in `string` members whose `string` result is a FRESH +1
     // value, each measured under ASan+LSan with the result embedded in a
@@ -9739,21 +9736,6 @@ struct ThisStringEscapeWalker {
         }
         if (sym) return false;
         return builtinMemberRead(access, member, called);
-    }
-    // `h.F := this`: a read only when `F` is a PLAIN field (no user setter
-    // to hand `value` on, FieldSymbol) of a CLASS, declared `string` /
-    // `string?` (the store retains, measured d03). An `Object`-typed field
-    // boxes `this` unretained (the review's r07) and a property's user setter
-    // may embed it (r08).
-    bool isPlainStringField(const sema::Symbol* sym) const {
-        auto* fs = dynamic_cast<const sema::FieldSymbol*>(sym);
-        if (!fs) return false;
-        const ast::Type* ty = nullptr;
-        if (fs->posParam)
-            ty = fs->posParam->type.get();
-        else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
-            ty = fd->type.get();
-        return ty && isStringType(ctx.resolvedType(*ty));
     }
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e || escaped) return;
@@ -9910,19 +9892,13 @@ struct ThisStringEscapeWalker {
     void stmt(const ast::Stmt* s) {
         if (!s || escaped) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            // `var x := this` at `string` (no annotation, or `string` /
-            // `string?`) copies with its own retain and releases at the
-            // local's scope end — a read. An `Object`-typed local boxes.
-            bool localCopy = false;
-            if (isThis(ld->initializer.get()) && !ld->isUsing) {
-                localCopy = !ld->type;
-                if (ld->type)
-                    if (const sema::TypeRef* lt = ctx.resolvedType(*ld->type))
-                        localCopy =
-                            lt->kind == sema::TypeRef::Kind::Primitive &&
-                            lt->primitive == sema::PrimitiveType::String;
-            }
-            expr(ld->initializer.get(), localCopy);
+            // `var x := this`: the copy takes its own reference, but it is a
+            // NEW NAME the walk does not follow, and its reference ends at
+            // the local's scope end — `x as Object`, `x.ToString()` embedded
+            // in a record, or `x.W0()` into an escaping member then outlives
+            // the call unretained (the third review's a1 / a6 / c3 / c4). A
+            // bare `this` initializer is an escape.
+            expr(ld->initializer.get(), false);
             return;
         }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
@@ -9947,40 +9923,21 @@ struct ThisStringEscapeWalker {
             return;
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
-            // `h.V := this` (a plain `string` field of a class: the store
-            // retains, d03) and `o := this` (an `out o: string` parameter:
-            // likewise, d04) are reads; a store to any other target — an
-            // `Object`-typed field or out parameter boxes `this` unretained
-            // (the review's r07 / r09), a property's user setter may embed
-            // it (r08) — and every other assignment of a bare `this` is an
-            // escape.
-            bool storeRetains = false;
-            if (as->op == ":=" && isThis(as->value.get())) {
-                if (auto* tma = dynamic_cast<const ast::MemberAccessExpr*>(
-                        as->target.get())) {
-                    const sema::TypeRef* ot =
-                        tma->target ? ctx.exprType(*tma->target) : nullptr;
-                    storeRetains = ot && ot->kind == sema::TypeRef::Kind::Named &&
-                                   ot->declaration &&
-                                   ot->declaration->kind ==
-                                       ast::TypeDeclKind::Class &&
-                                   isPlainStringField(ctx.exprSymbol(*tma));
-                } else if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
-                               as->target.get())) {
-                    auto* ps = dynamic_cast<const sema::ParameterSymbol*>(
-                        ctx.exprSymbol(*tid));
-                    storeRetains = ps && ps->modifier == "out" &&
-                                   ps->declType &&
-                                   isStringType(ctx.resolvedType(*ps->declType));
-                }
-            }
+            // Every assignment of a bare `this` is an escape. A store into a
+            // plain `string` field (`h.V := this`) or an `out o: string`
+            // parameter (`o := this`) does retain, but the stored copy is a
+            // name the walk does not follow: `o as Object` or `k.O := h.V as
+            // Object` lets the value outlive the call unretained once the
+            // copy's own reference is dropped (the third review's c1 / c2).
+            // An `Object`-typed target boxes `this` unretained (r07 / r09)
+            // and a property's user setter may embed it (r08).
             if (auto* tma = dynamic_cast<const ast::MemberAccessExpr*>(
                     as->target.get()))
                 expr(tma->target.get(), false);
             else if (!dynamic_cast<const ast::IdentifierExpr*>(
                          as->target.get()))
                 expr(as->target.get(), false);
-            expr(as->value.get(), storeRetains);
+            expr(as->value.get(), false);
             return;
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {

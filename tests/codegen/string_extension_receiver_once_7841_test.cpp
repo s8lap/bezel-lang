@@ -501,3 +501,79 @@ BEZEL_TEST(string_extension_receiver_once_7841,
             "    for var n in l do t := t + n.Tag.Length; end;\n")),
         "690\n");
 }
+
+// ---------------------------------------------------------------------------
+// Fix-forward-2 rows (the third review): a COPY of `this` into a new name
+// (`var x := this`, `o := this` into `out o: string`, `h.V := this` into a
+// string field) retains, but the walk follows the receiver by the spelling
+// `this` only, so the copy's later box or embed went unseen; the copy's own
+// reference ends at its scope end while the boxed value lives on. Base leaks
+// each; 5846f47a (and d584a839) freed the receiver in `main` right after the
+// call. Every copy is an escape again. Forced-ASan `runAot` UAF guards.
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           local_copy_boxed_as_object_no_uaf_spec_26_7) {
+    // a1: `var x := this; return x as Object;`
+    expectRan(
+        runAot(extProgram(
+            "",
+            "  public method AsO(): Object\n"
+            "    var x := this;\n"
+            "    return x as Object;\n"
+            "  end AsO;\n",
+            "    using var l := new Array<Object>();\n"
+            "    for var i in 0..199 do l.Add(Make.Str(i).AsO()); end;\n"
+            "    for var o in l do t := t + o.ToString().Length; end;\n")),
+        "690\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           out_string_copy_boxed_as_object_no_uaf_spec_26_7) {
+    // c1: `o := this` into `out o: string`, then `o as Object` returned.
+    expectRan(
+        runAot(extProgram(
+            "",
+            "  public method OutBox(out o: string): Object\n"
+            "    o := this;\n"
+            "    return o as Object;\n"
+            "  end OutBox;\n",
+            "    using var l := new Array<Object>();\n"
+            "    for var i in 0..199 do l.Add(Make.Str(i).OutBox(out var o)); end;\n"
+            "    for var x in l do t := t + x.ToString().Length; end;\n")),
+        "690\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           local_copy_into_embedding_extension_no_uaf_spec_26_7) {
+    // c3: the copy is the receiver of a user extension that embeds its own
+    // `this` into a record handed out through a parameter.
+    expectRan(
+        runAot(extProgram(
+            "public record Named(Tag: string, N: int);\n",
+            "  public method W0(l: Array<Named>) l.Add(new Named(this, 1)); end W0;\n"
+            "  public method Put(l: Array<Named>)\n"
+            "    var x := this;\n"
+            "    x.W0(l);\n"
+            "  end Put;\n",
+            "    using var l := new Array<Named>();\n"
+            "    for var i in 0..199 do Make.Str(i).Put(l); end;\n"
+            "    for var n in l do t := t + n.Tag.Length; end;\n")),
+        "690\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           one_shot_local_copy_boxed_no_invalid_free_spec_26_7) {
+    // c4: ONE call; on 5846f47a the plain (non-sanitized) build aborted with
+    // `free(): invalid pointer` (rc 134) and the ASan build SEGV'd.
+    expectRan(
+        runAot(extProgram(
+            "",
+            "  public method AsO(): Object\n"
+            "    var x := this;\n"
+            "    return x as Object;\n"
+            "  end AsO;\n",
+            "    var o := (\"a\" + 1.ToString()).AsO();\n"
+            "    Console.WriteLine(o.ToString());\n")),
+        "a1\n0\n");
+}
