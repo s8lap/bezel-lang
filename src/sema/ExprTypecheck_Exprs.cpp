@@ -11042,6 +11042,35 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 inHead == "IList" || inHead == "IReadOnlyList" ||
                 inHead == "ICollection" || inHead == "IReadOnlyCollection" ||
                 inHead == "IOwningList" || inHead == "IOwningCollection";
+            // fix #8260 (§17.5, §7.4, v0.355): `x in c` IS the call
+            // `c.Contains(x)`, so a NULLABLE interface receiver gets the
+            // written call's refusal: member access on a nullable value
+            // requires narrowing first. A simple local/parameter narrowed
+            // non-null (`if c <> null`) stays admitted, as for the call.
+            if (inInterfaceFamily && inRt->nullable && be.right) {
+                bool narrowed = false;
+                std::string recvName;
+                if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                        be.right.get())) {
+                    recvName = std::string(rid->name);
+                    Symbol* rsym = lookupName(rid->name);
+                    if (rsym && (dynamic_cast<LocalSymbol*>(rsym) ||
+                                 dynamic_cast<ParameterSymbol*>(rsym)))
+                        narrowed = isKnownNonNull(rsym);
+                }
+                if (!narrowed) {
+                    std::string nm = recvName.empty() ? "c" : recvName;
+                    ctx_.diagnostics().report(
+                        Severity::Error, be.span.begin,
+                        std::string("member access `.Contains` on a nullable "
+                                    "value requires narrowing it to non-null "
+                                    "first (§""7.4): guard with `if ") + nm +
+                            " <> null`, force-unwrap with `" + nm +
+                            "!, or use the null-conditional `" + nm +
+                            "?.Contains` (`x in c` is `c.Contains(x)`, "
+                            "§17.5)");
+                }
+            }
             if (inHead == "Dictionary" || inHead == "OwningDictionary" ||
                 inHead == "SortedDictionary" || inElementFamily ||
                 inInterfaceFamily) {
@@ -11087,22 +11116,6 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                         checkInOperatorContainsAdmission(inHead, keyT, inLoc);
                 }
             }
-        }
-        // fix #8260 (§17.5, §5.1): the `in` operator at a USER-typed receiver
-        // — a class that declares its own `Contains` (§17.5's structural
-        // lookup: "any accessible method named `Contains` taking one parameter
-        // of compatible type and returning `bool` qualifies"). The left
-        // operand is admitted exactly when `c.Contains(x)`'s ARGUMENT is:
-        // the method's own first-parameter type. The check DEFERS when the
-        // receiver declares no `Contains` (nothing for `x in c` to mean) or
-        // when the parameter's type is undecidable here (§14.2 rule 2).
-        if (be.left && be.right && inLt && inRt &&
-            inRt->kind == TypeRef::Kind::Named && inRt->declaration) {
-            SourceLocation inLoc =
-                be.left->span.begin.line != 0 ? be.left->span.begin
-                                              : be.span.begin;
-            checkInOperatorUserContainsAdmission(be.right.get(), inRt,
-                                                 be.left.get(), inLt, inLoc);
         }
         // fix #6542 (§17.5, v0.338; §5.1, v0.338; stdlib §9.6): the same
         // enumeration for the STRING receiver. `String` declares TWO

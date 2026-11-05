@@ -13431,19 +13431,16 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         // was left — and what #8260 is about — is the receiver whose
         // `Contains` is the ORDINARY CALL: a COLLECTION INTERFACE
         // (`IList<T>` / `IReadOnlyList<T>` / `ICollection<T>` /
-        // `IReadOnlyCollection<T>`, stdlib §4.1) and a USER class that
-        // declares its own `Contains` (§17.5: "The `Contains` lookup is
-        // structural rather than interface-based: any accessible method named
-        // `Contains` taking one parameter of compatible type and returning
-        // `bool` qualifies").
+        // `IReadOnlyCollection<T>`, stdlib §4.1). A USER class receiver is
+        // deliberately NOT handled here: §17.5 requires an ACCESSIBLE
+        // `Contains` (§13.1) and a non-null receiver (§7.4), and neither is
+        // checked on that path.
         //
         // The lowering below is the ordinary CALL lowering of `c.Contains(x)`
         // — the SAME arms the written call reaches
-        // (`tryLowerCollectionInstanceCall` for the built-in heads, the
-        // instance-method dispatch for a user class) — so the two spellings
+        // (`tryLowerCollectionInstanceCall`) — so the two spellings
         // CANNOT DRIFT: the #853 diagnostic a polymorphic collection
-        // interface receives is the one `c.Contains(x)` receives, and a user
-        // class's own `Contains` is the one that runs. Nothing about the
+        // interface receives is the one `c.Contains(x)` receives. Nothing about the
         // search itself is re-implemented here.
         if (bin.right) {
             const sema::TypeRef* rTy = ctx_.exprType(*bin.right);
@@ -13454,22 +13451,7 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 const bool isListIface =
                     isListInterfaceName(rTy, &listIfaceOwning);
                 const bool isCollIface = isCollectionInterfaceName(rTy);
-                sema::MethodSymbol* userContains = nullptr;
-                if (!isListIface && !isCollIface && rTy->declaration) {
-                    if (sema::MethodSymbol* ms =
-                            findMethodByName(rTy->declaration, "Contains")) {
-                        // §17.5: "taking one parameter of compatible type and
-                        // returning `bool`" — the two halves of the
-                        // structural lookup. A `Contains` that is neither is
-                        // not the member `x in c` means.
-                        if (ms->params.size() == 1) {
-                            if (llvm::FunctionType* ft = methodFnType(ms))
-                                if (ft->getReturnType() == i1())
-                                    userContains = ms;
-                        }
-                    }
-                }
-                if (isListIface || isCollIface || userContains) {
+                if (isListIface || isCollIface) {
                     // The receiver and the element are evaluated ONCE, in the
                     // call's own order (§22.5: the receiver, then the
                     // argument), and their VALUES are pinned into the
@@ -13484,35 +13466,6 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     llvm::Value* recvVal = lowerExpr(*bin.right);
                     llvm::Value* elemVal = lowerExpr(*bin.left);
                     if (!recvVal || !elemVal) return nullptr;
-                    // A user type's `Contains` takes a DECLARED parameter
-                    // type; the argument must fit it. Sema has already
-                    // checked the conversion (§5.1) for every receiver whose
-                    // parameter type it can resolve; the guard below is the
-                    // backstop for the shapes sema DEFERS (a parameter type
-                    // that still mentions a type parameter at this
-                    // instantiation), where a mismatch would otherwise reach
-                    // the IR as an ill-typed call argument.
-                    if (userContains) {
-                        llvm::Type* paramTy = nullptr;
-                        if (llvm::FunctionType* ft = methodFnType(userContains))
-                            if (ft->getNumParams() >= 2)
-                                paramTy = ft->getParamType(1);
-                        if (paramTy && elemVal->getType() != paramTy &&
-                            !(paramTy->isIntegerTy() &&
-                              elemVal->getType()->isIntegerTy()) &&
-                            !(paramTy->isFloatingPointTy() &&
-                              elemVal->getType()->isFloatingPointTy())) {
-                            ctx_.diagnostics().report(
-                                Severity::Error, bin.span.begin,
-                                "the left operand of `in` over `" +
-                                    std::string(rTy->headName()) +
-                                    "` has a type that is not implicitly "
-                                    "convertible to the parameter type of "
-                                    "`" + std::string(rTy->headName()) +
-                                    ".Contains` (§5.1, §17.5)");
-                            return nullptr;
-                        }
-                    }
                     auto& mutBin = const_cast<ast::BinaryExpr&>(bin);
                     const ast::Expr* rcvKey = mutBin.right.get();
                     const ast::Expr* elemKey = mutBin.left.get();
@@ -13529,12 +13482,6 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                         ctx_.setExprType(
                             callee.get(),
                             ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
-                        // The user type's own `Contains` — §26.5 rule 1
-                        // commits to the instance member, and the ordinary
-                        // instance-method dispatch needs the resolved symbol
-                        // to pick the (possibly virtual) implementation.
-                        if (userContains)
-                            ctx_.setExprSymbol(callee.get(), userContains);
                         synth->callee = std::move(callee);
                     }
                     {

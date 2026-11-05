@@ -5468,24 +5468,6 @@ private:
                                           const TypeRef* elemTy,
                                           SourceLocation loc);
 
-    // fix #8260 (§17.5): the `in` operator's ADMISSION at a USER-typed
-    // receiver. §17.5's lookup is STRUCTURAL — "any accessible method named
-    // `Contains` taking one parameter of compatible type and returning `bool`
-    // qualifies" — so a user class that declares its own `Contains` is a
-    // receiver `x in c` means, and the left operand is admitted exactly when
-    // `c.Contains(x)`'s ARGUMENT is: the method's own first-parameter type.
-    //
-    // The check DEFERS (admits without checking) when the receiver declares
-    // no `Contains` at all (nothing to be equivalent to) or when the
-    // parameter's type cannot be resolved here (a type parameter that this
-    // instantiation does not decide, §14.1 / §14.2 rule 2) — the same
-    // fail-open the collection families' bare-type-parameter carve-out uses.
-    void checkInOperatorUserContainsAdmission(const ast::Expr* recvExpr,
-                                              const TypeRef* recvTy,
-                                              const ast::Expr* argExpr,
-                                              TypeRef* argTy,
-                                              SourceLocation loc);
-
     // §7 / stdlib §3.3 (#2581): the ReadOnlyStringSpan twin of #2315. A builtin
     // ReadOnlyStringSpan instance method (IndexOf/Contains/StartsWith/EndsWith/
     // SequenceEqual, stdlib §3.3) declares NON-nullable `string`/`char` operands

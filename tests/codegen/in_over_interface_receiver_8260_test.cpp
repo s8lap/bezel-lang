@@ -46,9 +46,11 @@
 //  (C) The polymorphic COLLECTION interfaces keep the #853 refusal — the
 //      diagnostic is BYTE-IDENTICAL to the one `c.Contains(x)` gets, which is
 //      the point: `x in c` IS `c.Contains(x)`.
-//  (D) A USER class that declares its own `Contains` answers with ITS OWN
-//      method (the §17.5 structural lookup), and the left operand is
-//      type-checked against that method's parameter type.
+//  (D) A USER class receiver is NOT admitted by this fix (review of a77442ad:
+//      the user-class arm accepted a `private` Contains from another class,
+//      §13.1, and a nullable receiver, §7.4, which crashed at run time). Those
+//      programs keep the base's refusal; the rows pin it.
+//  (G) A NULLABLE interface receiver gets the written call's §7.4 refusal.
 //  (E) The function-typed element follows the `Contains` call EXACTLY (#5520 /
 //      #7598): ADMITTED at an `IList` receiver (`IList<T>.Contains` is stdlib
 //      §4's equality search, and a function value HAS a §9.2 first-kind
@@ -239,48 +241,12 @@ const char* kIReadOnlyCollectionRefused =
     "end C;";
 
 // ---------------------------------------------------------------------------
-// (D) A USER class that declares its own `Contains` — §17.5's structural
-// lookup. The `in` operator runs the USER's method.
-//
-// The class implements `IList<int>` (stdlib §4.1) and declares the members
-// `IList<T>` requires — the elision marker is NOT implemented by this
-// compiler, so the members are declared here.
+// (D) USER-class receivers stay refused (base behaviour). The review of
+// a77442ad measured the user-class arm accepting a `private` Contains from
+// another class (§13.1; §17.5 says "any accessible method") and a nullable
+// receiver (§7.4) that segfaulted at run time.
 // ---------------------------------------------------------------------------
-const char* kUserClassContains =
-    "module M; "
-    "public class Bag: IList<int> "
-    "  private owned _items: Array<int>; "
-    "  public constructor() _items := new Array<int>(); end constructor; "
-    "  public method Add(item: int): () _items.Add(item); end Add; "
-    "  public method Clear(): () _items.Clear(); end Clear; "
-    "  public method Contains(item: int): bool "
-    "    return _items.Contains(item); "
-    "  end Contains; "
-    "  public method Remove(item: int): bool "
-    "    return _items.Remove(item); "
-    "  end Remove; "
-    "  public method Insert(index: int, item: int): () "
-    "    _items.Insert(index, item); "
-    "  end Insert; "
-    "  public property Count: int => _items.Count; "
-    "  public property IsReadOnly: bool => false; "
-    "  public method Get(index: int): int return _items[index]; end Get; "
-    "  public method Set(index: int, value: int): () "
-    "    _items[index] := value; "
-    "  end Set; "
-    "end Bag; "
-    "class C "
-    "  public static method Main(): int "
-    "    var b := new Bag(); "
-    "    b.Add(3); "
-    "    Console.WriteLine(3 in b); "
-    "    Console.WriteLine(4 in b); "
-    "    return 0; "
-    "  end Main; "
-    "end C;";
-
-// The left operand is checked against the USER's `Contains` parameter type.
-const char* kUserClassLeftOperandType =
+const char* kUserClassPublicContainsRefused =
     "module M; "
     "public class Bag "
     "  private owned _items: Array<int>; "
@@ -292,7 +258,111 @@ const char* kUserClassLeftOperandType =
     "class C "
     "  public static method Main(): int "
     "    var b := new Bag(); "
-    "    var r := 1.5 in b; "
+    "    var r := 1 in b; "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+// p06: a PRIVATE Contains called from another class.
+const char* kUserClassPrivateContains =
+    "module P; "
+    "public class Bag "
+    "  private method Contains(item: int): bool return true; end Contains; "
+    "end Bag; "
+    "class C "
+    "  public static method Main(): int "
+    "    var b := new Bag(); "
+    "    Console.WriteLine(3 in b); "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+// p34: a NULLABLE user-class receiver whose Contains reads a field (the
+// accepted program segfaulted on Q(null)).
+const char* kUserClassNullableReceiverCrash =
+    "module P; "
+    "public class Bag "
+    "  private owned _items: Array<int>; "
+    "  public constructor() _items := new Array<int>(); end constructor; "
+    "  public method Contains(item: int): bool "
+    "    return _items.Contains(item); end Contains; "
+    "end Bag; "
+    "class C "
+    "  public static method Q(b: Bag?): bool "
+    "    return 7 in b; "
+    "  end Q; "
+    "  public static method Main(): int "
+    "    Console.WriteLine(\"before\"); "
+    "    Console.WriteLine(Q(null)); "
+    "    Console.WriteLine(\"after\"); "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+// p31: the same with a body that does not read `this` (printed True for null).
+const char* kUserClassNullableReceiverNoThis =
+    "module P; "
+    "public class Bag "
+    "  public constructor() end constructor; "
+    "  public method Contains(item: int): bool return item = 7; end Contains; "
+    "end Bag; "
+    "class C "
+    "  public static method Q(b: Bag?): bool "
+    "    return 7 in b; "
+    "  end Q; "
+    "  public static method Main(): int "
+    "    var b := new Bag(); "
+    "    Console.WriteLine(Q(b)); "
+    "    Console.WriteLine(Q(null)); "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+// ---------------------------------------------------------------------------
+// (G) A NULLABLE interface receiver: `b.Contains(7)` is refused under §7.4,
+// and `7 in b` IS `b.Contains(7)` (§17.5).
+// ---------------------------------------------------------------------------
+// p32
+const char* kNullableIListReceiver =
+    "module P; "
+    "class C "
+    "  public static method Q(b: IList<int>?): bool "
+    "    return 7 in b; "
+    "  end Q; "
+    "  public static method Main(): int "
+    "    var a := new Array<int>(); "
+    "    a.Add(7); "
+    "    Console.WriteLine(Q(a)); "
+    "    Console.WriteLine(Q(null)); "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+const char* kNullableIReadOnlyListReceiver =
+    "module P; "
+    "class C "
+    "  public static method Q(b: IReadOnlyList<int>?): bool "
+    "    return 7 in b; "
+    "  end Q; "
+    "  public static method Main(): int "
+    "    Console.WriteLine(Q(null)); "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+// The narrowed form stays admitted, as the written call is (§7.4).
+const char* kNarrowedIListReceiver =
+    "module P; "
+    "class C "
+    "  public static method Q(b: IList<int>?): bool "
+    "    if b <> null then return 7 in b; end if; "
+    "    return false; "
+    "  end Q; "
+    "  public static method Main(): int "
+    "    var a := new Array<int>(); "
+    "    a.Add(7); "
+    "    Console.WriteLine(Q(a)); "
+    "    Console.WriteLine(Q(null)); "
     "    return 0; "
     "  end Main; "
     "end C;";
@@ -460,25 +530,53 @@ BEZEL_TEST(codegen_in_over_interface_receiver_8260,
 }
 
 // ---------------------------------------------------------------------------
-// (D) a user class's own `Contains` is the one that runs, and the left
-// operand is checked against its parameter type.
+// (D) user-class receivers stay refused; the base's diagnostic.
+// ---------------------------------------------------------------------------
+#define BEZEL_8260_REFUSED_USER(NAME, SRC)                                   \
+    BEZEL_TEST(codegen_in_over_interface_receiver_8260, NAME) {              \
+        JitResult r = runAotChecked(SRC);                                    \
+        BEZEL_EXPECT_FALSE(r.ran);                                           \
+        BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());                        \
+        BEZEL_EXPECT_TRUE(hasError(                                          \
+            r, "not yet implemented: codegen for this `in` expression form")); \
+    }
+
+BEZEL_8260_REFUSED_USER(user_class_receiver_stays_refused,
+                        kUserClassPublicContainsRefused)
+BEZEL_8260_REFUSED_USER(user_class_private_contains_is_not_accessible_p06,
+                        kUserClassPrivateContains)
+BEZEL_8260_REFUSED_USER(user_class_nullable_receiver_is_refused_p34,
+                        kUserClassNullableReceiverCrash)
+BEZEL_8260_REFUSED_USER(user_class_nullable_receiver_no_this_is_refused_p31,
+                        kUserClassNullableReceiverNoThis)
+
+// ---------------------------------------------------------------------------
+// (G) a nullable interface receiver gets the written call's §7.4 refusal.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_in_over_interface_receiver_8260,
-           user_class_contains_is_the_member_that_runs) {
-    JitResult r = runAotChecked(kUserClassContains);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "True\nFalse\n");
+           nullable_ilist_receiver_is_refused_p32) {
+    JitResult r = runAotChecked(kNullableIListReceiver);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasError(
+        r, "member access `.Contains` on a nullable value requires "
+           "narrowing it to non-null first (§7.4)"));
 }
 
 BEZEL_TEST(codegen_in_over_interface_receiver_8260,
-           user_class_left_operand_is_checked_against_the_parameter_type) {
-    JitResult r = runAotChecked(kUserClassLeftOperandType);
+           nullable_ireadonlylist_receiver_is_refused) {
+    JitResult r = runAotChecked(kNullableIReadOnlyListReceiver);
     BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasError(
-        r, "the left operand of `in` over `Bag` has a type that is not "
-           "implicitly convertible to the target type (§5.1)"));
+        r, "member access `.Contains` on a nullable value requires "
+           "narrowing it to non-null first (§7.4)"));
+}
+
+BEZEL_TEST(codegen_in_over_interface_receiver_8260,
+           narrowed_ilist_receiver_is_admitted) {
+    JitResult r = runAotChecked(kNarrowedIListReceiver);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "True\nFalse\n");
 }
 
 // ---------------------------------------------------------------------------
