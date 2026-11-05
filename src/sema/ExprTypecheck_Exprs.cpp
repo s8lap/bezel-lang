@@ -11089,7 +11089,12 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 return t && t->kind == TypeRef::Kind::Primitive &&
                        t->primitive == PrimitiveType::String;
             };
-            if (isStr(lt) != isStr(rt0)) {  // exactly one operand is string
+            // fix #7750 (§4.6, v0.355): an operand with NO type is POISONED
+            // (an unresolved type or an unknown member already reported its
+            // error), so "exactly one operand is string" is unknowable; the
+            // cascade `+` error is suppressed.
+            if (lt && rt0 &&
+                isStr(lt) != isStr(rt0)) {  // exactly one operand is string
                 ctx_.diagnostics().report(
                     Severity::Error, be.span.begin,
                     "`+` requires both operands to be `string` — the compiler "
