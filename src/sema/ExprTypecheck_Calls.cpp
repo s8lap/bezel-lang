@@ -13026,7 +13026,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             srcElem->kind == TypeRef::Kind::Primitive &&
                             !srcElem->nullable) {
                             P ep = srcElem->primitive;
-                            if (isNoSelectorAggregationElem(ep)) {
+                            // fix #8208 (stdlib §5.1 / §2.8, spec §14.2,
+                            // v0.355): `char` is NOT an §2.19 `INumber<T>`
+                            // conformer, so `isNoSelectorAggregationElem` does
+                            // not list it — but stdlib §9.5's `Char` record
+                            // declares `IComparable<char>`, so the no-selector
+                            // form's result is the ELEMENT (`char`), exactly as
+                            // the CONCRETE-collection path keys it (#4731:
+                            // "the §5.1 `IComparable<T>` gate §5.1 imposes is
+                            // satisfied by EVERY §3.4 primitive"). Without
+                            // `Char` here the LAZY receiver's result fell to
+                            // the `int` default and `Console.WriteLine`
+                            // printed the code point (97) instead of the
+                            // character ('a').
+                            if (isNoSelectorAggregationElem(ep) ||
+                                ((m == "Min" || m == "Max") && ep == P::Char)) {
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(ep));
                                 noSelectorKeyed = true;
                             }
@@ -13075,6 +13089,97 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                             ctx_.setExprType(&ce, srcElem);
                             noSelectorKeyed = true;
+                        }
+                        // fix #8208 (stdlib §5.1 / §2.8 / §9.6, spec §14.2,
+                        // v0.355): the no-selector `Min()`/`Max()` returns the
+                        // ELEMENT type `T` for EVERY `T` that satisfies §5.1's
+                        // `where T: IComparable<T>` — and the LAZY receiver's
+                        // arm still keyed the result off the numeric
+                        // primitives and the USER RECORD only. THREE more
+                        // families were left on the `int` default, and each
+                        // was wrong in a way the EAGER twin shows:
+                        //   * a `string` element — stdlib §9.6 declares
+                        //     `IComparable<string>`, so the result is the
+                        //     string. MEASURED before this fix:
+                        //     `arr.Where(…).Min()` over `Array<string>`
+                        //     PRINTED GARBAGE (2393792 — the string pointer
+                        //     truncated to an int) where the eager
+                        //     `arr.Min()` printed "a";
+                        //   * a CLASS / INTERFACE element — the result is the
+                        //     class. MEASURED before this fix:
+                        //     `arr.Where(…).Min().X` was REFUSED ("no member
+                        //     `X` on primitive type `int`"), and the bare
+                        //     `arr.Where(…).Min()` printed the element's
+                        //     ADDRESS as an int (469591088);
+                        //   * a BUILT-IN VALUE RECORD (`DateTime`, `TimeSpan`,
+                        //     `DateOnly`, `TimeOnly` — stdlib §2.5 declares
+                        //     `IComparable<Self>` on each) — the result is the
+                        //     record. MEASURED before this fix:
+                        //     `arr.Where(…).Min().Year` was REFUSED ("no member
+                        //     `Year` on primitive type `int`"), where the
+                        //     eager `arr.Min().Year` printed 2023.
+                        //
+                        // The CONCRETE-collection path has always typed the
+                        // element here (#8092 / #8049 / #4731); this is the
+                        // LAZY receiver's twin, and the SAME element-typing
+                        // decisions are reused verbatim so the two arms
+                        // cannot disagree.
+                        //
+                        // The §5.1 CONSTRAINT on the CLASS / INTERFACE family
+                        // is applied with the SAME helper the concrete path
+                        // uses (`classOrIfaceComparableAtInstance`, #8209's
+                        // instantiation-aware check), so a class that does not
+                        // implement `IComparable<T>` AT THIS INSTANTIATION is
+                        // REFUSED with the same diagnostic instead of being
+                        // admitted and then failing in codegen.
+                        if (!noSelectorKeyed && (m == "Min" || m == "Max") &&
+                            ce.args.empty() && srcElem && !srcElem->nullable) {
+                            bool keyed = false;
+                            // A CLASS or INTERFACE element: the §5.1
+                            // constraint decides, exactly as on the concrete
+                            // path.
+                            if (srcElem->kind == TypeRef::Kind::Named &&
+                                srcElem->declaration &&
+                                (srcElem->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 srcElem->declaration->kind ==
+                                     ast::TypeDeclKind::Interface)) {
+                                if (!classOrIfaceComparableAtInstance(srcElem)) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        std::string(m) +
+                                        "() without a selector requires the "
+                                        "element type to implement "
+                                        "IComparable<T> (stdlib §5.1 / §14.2 "
+                                        "/ #1198); " +
+                                        std::string(
+                                            srcElem->declaration->name) +
+                                        " does not implement IComparable<T>. "
+                                        "Use " + std::string(m) +
+                                        "(selector: (T) -> U) instead.");
+                                    return;
+                                }
+                                keyed = true;
+                            }
+                            // A `string` element: stdlib §9.6 declares
+                            // `IComparable<string>`, so the constraint holds
+                            // (the concrete path's `ptrComparableElem` arm).
+                            else if (srcElem->kind == TypeRef::Kind::Primitive &&
+                                     srcElem->primitive == P::String)
+                                keyed = true;
+                            // A BUILT-IN VALUE RECORD: stdlib §2.5 declares
+                            // `IComparable<Self>` on each of the four, and the
+                            // stdlib declaration is the authority for them
+                            // (they carry no user TypeDecl, so the symbol
+                            // probe cannot answer for them).
+                            else if (srcElem->kind == TypeRef::Kind::Named &&
+                                     !srcElem->declaration &&
+                                     !mathOrderedTimeValueHead(srcElem).empty())
+                                keyed = true;
+                            if (keyed) {
+                                ctx_.setExprType(&ce, srcElem);
+                                noSelectorKeyed = true;
+                            }
                         }
                         if (!noSelectorKeyed)
                             ctx_.setExprType(&ce,
