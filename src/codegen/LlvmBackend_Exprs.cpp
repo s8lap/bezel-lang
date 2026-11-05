@@ -871,6 +871,40 @@ const sema::TypeRef* Emitter::thisReceiverTypeRef(const ast::Expr* e) {
     descArena_.push_back(std::move(ref));
     return descArena_.back().get();
 }
+
+// fix #7518 (§27.6 / §28.9, v0.355): the env disposer of a bound method
+// reference over a `string` receiver.
+//
+// The closure cell's env block holds ONE word — the captured receiver
+// (`buildMethodClosureCell` stores `receiverVal` verbatim) — and
+// `bz_closure_release` calls the cell's env disposer as `envdtor(env)` at the
+// cell's last drop (the #672 typed env-disposer ABI). This disposer releases
+// the captured `string`: §27.6 captures a `string` receiver BY COPY, so the
+// copy is the closure's own reference to the string data, and it must be
+// dropped when the closure dies.
+//
+// The function is created ONCE PER MODULE and shared by every cell that
+// captures a `string` receiver: the env's layout is the same for all of them
+// (one word), so one disposer serves all. The module lookup keeps it
+// per-module without a new Emitter member (the widely-included
+// `LlvmBackend_impl.hpp` is deliberately not touched — CLAUDE.md rule 20).
+static llvm::Function* makeStringReceiverEnvdtor(llvm::Module& mod,
+                                                  llvm::LLVMContext& ctx,
+                                                  llvm::Type* voidTy,
+                                                  llvm::Type* ptrTy,
+                                                  llvm::Function* strRelease) {
+    const char* name = "bz$mref$strrecv$envdtor";
+    if (llvm::Function* existing = mod.getFunction(name)) return existing;
+    auto* fnTy = llvm::FunctionType::get(voidTy, {ptrTy}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      name, &mod);
+    llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+    llvm::Value* s = b.CreateLoad(ptrTy, fn->getArg(0), "str.recv");
+    b.CreateCall(strRelease, {s});
+    b.CreateRetVoid();
+    return fn;
+}
+
 llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     diverged_ = false;  // CG40: cleared per expression; a `throw` sets it
     // §27.6 (v0.184, #1758): inside a primitive-intrinsic thunk body, a synthetic
@@ -6764,7 +6798,38 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // deliberately NOT lowered on that path here — CG33b lowers
                 // it itself, and lowering it twice would double any receiver
                 // side effect / +1 string-producer refcount.
-                if (ma->member != "Length" && ma->member != "IsAscii") {
+                //
+                // fix #7518 (§27.6, v0.355): a §27.6 METHOD REFERENCE over a
+                // `string` receiver — the bare form of a BOUND reference to a
+                // user extension member (`a.Twice`) — is NOT the builtin's
+                // member, and this arm must not claim it. §27.6 resolves the
+                // receiver-qualified reference "exactly as the call
+                // `v.Scaled()` is", so the member the reference forms is the
+                // EXTENSION's member, and the builtin's surface is not it.
+                //
+                // The defect this fixes (MEASURED on this fix's parent,
+                // r30-c1): the arm below returned a bare `nullptr` for every
+                // non-`Length`/`IsAscii` name whose symbol is not a property
+                // getter — and a METHOD reference's symbol is a MethodSymbol,
+                // never a getter — so the closure was never built. The local
+                // then degraded to a zero-initialised value (the #2434
+                // warning) and the call SEGV'd (rc 139 on the issue's own
+                // repro).
+                //
+                // The predicate is the KIND of the bound symbol: a PROPERTY
+                // reference (a computed/block getter) keeps its own path
+                // (CG33b below), and the builtin's `Length`/`IsAscii` reads
+                // bind no user-declared method symbol at all (§26.5 rule 1
+                // commits the name to the built-in — #7477), so they are
+                // unaffected.
+                const bool isStringMethodRef =
+                    dynamic_cast<const sema::MethodSymbol*>(
+                        ctx_.exprSymbol(e)) != nullptr;
+                if (isStringMethodRef) {
+                    // A §27.6 method reference over a `string` receiver: fall
+                    // through to the method-reference lowering (CG60), which
+                    // builds the closure cell that captures the receiver.
+                } else if (ma->member != "Length" && ma->member != "IsAscii") {
                     if (!computedGetterOf(ctx_.exprSymbol(e)) &&
                         !blockGetterOf(ctx_.exprSymbol(e)))
                         return nullptr;
@@ -11300,6 +11365,50 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     builder_.CreateStore(
                         boxReceiverEnvdtor(),
                         builder_.CreateStructGEP(closureCellType(), cell, 3));
+            }
+            // fix #7518 (§27.6 / §28.9, v0.355): a bound reference over a
+            // `string` receiver captures the receiver BY COPY — §27.6: "by
+            // reference for a class- or interface-typed receiver, by copy for
+            // a value-shaped one — a record, an enum, a copyable choice, a
+            // non-owning inline array, a primitive, the unit value, a
+            // `string` or a function value". A `string` is a runtime-managed
+            // REFERENCE (§28.9), so its copy is a new reference to the same
+            // immutable data: the capture takes its own +1 and the env
+            // disposer drops it, so the closure keeps the string alive
+            // however long it lives. Without the retain the env held the
+            // producer's raw pointer, and a closure that outlived the
+            // producer's release read a freed string (the twin of #7841's
+            // `extension string` `this` capture and of #2689's captured
+            // `string` parameter, which both take the +1).
+            //
+            // The disposer is the closure cell's env slot (offset 3), the
+            // same slot the #6057 box-receiver path uses: `bz_closure_release`
+            // calls it as `envdtor(env)` at the cell's last drop, and the env
+            // block's one word IS the captured receiver
+            // (`buildMethodClosureCell` stores `receiverVal` verbatim).
+            //
+            // The RECEIVER PRODUCER's own +1 is discharged here too — the
+            // reference form's twin of the CALL form's receiver release
+            // (fix #7841's `k8ExtStringRecvCalls_` path in
+            // LlvmBackend_Calls2.cpp, which releases it once the call has
+            // returned). The closure's construction is the use that consumed
+            // the producer, so the producer's reference is released right
+            // after it; the env's own copy (the retain above) is what keeps
+            // the string alive for the closure. Without this the producer's
+            // +1 was orphaned: MEASURED, 50 leaked strings (1790 B) over a
+            // 50-iteration loop of `Make.Str(i).Twice`.
+            if (cell && recv && recv->getType()->isPointerTy() && recvTy &&
+                recvTy->kind == sema::TypeRef::Kind::Primitive &&
+                recvTy->primitive == sema::PrimitiveType::String) {
+                emitStringRetain(recv);
+                if (isPlusOneStringProducer(ma->target.get()))
+                    emitStringRelease(recv);
+                builder_.CreateStore(
+                    makeStringReceiverEnvdtor(
+                        *module_, llvm_, llvm::Type::getVoidTy(llvm_), ptrTy(),
+                        declareC("bz_string_release",
+                                 llvm::Type::getVoidTy(llvm_), {ptrTy()})),
+                    builder_.CreateStructGEP(closureCellType(), cell, 3));
             }
             return cell;
         }
