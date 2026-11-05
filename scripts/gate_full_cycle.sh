@@ -1391,6 +1391,24 @@ say "dangling-capture phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_danglingcap.log"))
 # with exit 65 by design). Inside a gate BOTH conditions hold, so 2 skips here
 # is the expected steady state — and the cap means a third muted test fails the
 # phase instead of quietly joining them.
+# R39 gate 1: build/tests/bezel_tests_support was OLDER than the test-token
+# hook, so the four test_build_token.RealTestBinaryTakesATokenTest cases
+# self-skipped ("no bezel_tests_support built with the test-token hook"); with
+# the two in-gate lock skips that was 6 > the cap and the cycle failed 8
+# minutes in. These self-tests inspect the real test binaries, and this phase
+# runs BEFORE gate.sh's own build (gate.sh[2/5], ~line 648), so build them
+# first. Chosen over moving gate.sh's build: gate.sh also runs standalone, and
+# is invoked twice per cycle (plain, ASan), so its build must stay. Cost is one
+# incremental no-op `cmake --build` inside gate.sh afterwards (the objects are
+# already up to date). Goes through dev_heavy.sh so it joins the jobserver/cgroup.
+say "gate-selftest prebuild: bezel_tests + bezelc (the self-tests read the real binaries)"
+if ! scripts/dev_heavy.sh build cmake --build build --target bezel_tests bezelc -j16 \
+     > "$LOGDIR/${TAG}_gate_selftest_prebuild.log" 2>&1; then
+  say "CYCLE FAILURE: the pre-self-test build failed — see $LOGDIR/${TAG}_gate_selftest_prebuild.log"
+  grep -iE 'error:|FAILED:' "$LOGDIR/${TAG}_gate_selftest_prebuild.log" 2>/dev/null | head -20 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
 say "gate-selftest phase: scripts/gate/tests (#3415)"
 _gs_log="$LOGDIR/${TAG}_gate_selftest.log"
 # Bumped 560 -> 824 (r21-jobserver, non-author review follow-up): the floor
