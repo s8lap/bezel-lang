@@ -209,7 +209,7 @@ BEZEL_TEST(builtin_ext_method_ref_7518,
         "42\n");
 }
 
-// A GENERIC extension block (stdlib §26.4): the block's parameters are bound
+// A GENERIC extension block (§26.4): the block's parameters are bound
 // by the receiver at the formation (§27.6 / §26.4).
 BEZEL_TEST(builtin_ext_method_ref_7518,
            generic_extension_block_reference_calls_the_extension_spec_26_4) {

@@ -222,6 +222,8 @@ bool callReturnsReceiver(const ast::CallExpr* ce, const AliasDecls& aliases,
     if (!ms) return false;
     if (isStaticMethod(*ms)) return false;  // a static method has no receiver
     if (ctx.isImported(ms)) return false;    // no AST body to read
+    // SEAM-ACCESSOR: the method BODY is read, which no symbol carries; an imported
+    // method was refused on the line above, so this is a local declaration.
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md) return false;
     return methodReturnsReceiver(*md, ctx, depth + 1);
