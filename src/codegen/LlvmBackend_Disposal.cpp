@@ -9676,7 +9676,16 @@ bool Emitter::registerHoleOwnedTemp(const ast::Expr* srcExpr,
     // behaviour. The safe direction there is a leak (there is no object to
     // reclaim) — the same guard #8143's arm carries.
     if (llvm::isa<llvm::UndefValue>(srcEv)) return false;
-    if (!currentFn_ || emittingDisposerBody_) return false;
+    if (!currentFn_ || emittingDisposerBody_) {
+        // No K8 boundary to queue on (a disposer body): the discharge is
+        // emitted INLINE, after the hole's render — the hole's last use of
+        // the operand (§18.5). The pending fallback is CARRIED to that site
+        // (fix #8172), so the registration can sit AHEAD of the render.
+        holeOwnedTempFallbackExpr_ = srcExpr;
+        holeOwnedTempFallbackValue_ = srcEv;
+        holeOwnedTempFallbackKind_ = kind;
+        return false;
+    }
     const sema::TypeRef* rt = ctx_.exprType(*srcExpr);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
     llvm::AllocaInst* slot = entryAllocaNullPtr();
@@ -9731,14 +9740,23 @@ bool Emitter::registerHoleOwnedTemp(const ast::Expr* srcExpr,
 // FRESH COPY of the value, so nothing that survives the hole points into the
 // object.
 //
+// fix #8172: the pending fallback is CARRIED (in the `holeOwnedTempFallback*`
+// members) from the registration site to this release site, because the
+// registration now sits AHEAD of the render (so a throwing render still
+// discharges the temporary) while the release must sit BEHIND it.
+//
 // The RELEASE is the kind's own — the vtable Dispose for a class, the
 // collection free (with the §28.11 element disposer) for a builtin collection,
 // the built-in's own free for a vtable-less built-in. A vtable dispatch on a
 // `bz_array_t*` or on a `StringBuilder` would be a WILD JUMP.
-void Emitter::emitHoleOwnedTempFallback(const ast::Expr* srcExpr,
-                                        llvm::Value* srcEv,
-                                        HoleOwnedTempKind kind) {
-    if (!srcExpr || !srcEv) return;
+void Emitter::emitHoleOwnedTempFallback() {
+    const ast::Expr* srcExpr = holeOwnedTempFallbackExpr_;
+    llvm::Value* srcEv = holeOwnedTempFallbackValue_;
+    const HoleOwnedTempKind kind = holeOwnedTempFallbackKind_;
+    if (!srcExpr || !srcEv || kind == HoleOwnedTempKind::None) return;
+    holeOwnedTempFallbackExpr_ = nullptr;
+    holeOwnedTempFallbackValue_ = nullptr;
+    holeOwnedTempFallbackKind_ = HoleOwnedTempKind::None;
     if (!srcEv->getType()->isPointerTy()) return;
     if (llvm::isa<llvm::UndefValue>(srcEv)) return;
     if (!currentFn_) return;

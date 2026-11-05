@@ -22962,8 +22962,16 @@ private:
     // discharge of the hole's operand, using the RELEASE its kind names —
     // the vtable Dispose for a class, the collection free for a builtin
     // collection, the built-in's own free for a vtable-less built-in.
-    void emitHoleOwnedTempFallback(const ast::Expr* srcExpr, llvm::Value* srcEv,
-                                   HoleOwnedTempKind kind);
+    //
+    // fix #8172 (§18.3 / §28.3, v0.355): the discharge must happen AFTER the
+    // hole's RENDER (the render is the hole's last use of the operand), so the
+    // pending fallback is CARRIED from the registration site to the release
+    // site — the two are in different places once the registration moves ahead
+    // of the render.
+    void emitHoleOwnedTempFallback();
+    const ast::Expr* holeOwnedTempFallbackExpr_ = nullptr;
+    llvm::Value* holeOwnedTempFallbackValue_ = nullptr;
+    HoleOwnedTempKind holeOwnedTempFallbackKind_ = HoleOwnedTempKind::None;
     // Record an awaited Pattern A task temporary at the await's success edge:
     // registers the null-guarded bz_task_free on disposeStack_ (covering the
     // exception edge and acting as the conservative backstop) and queues it for

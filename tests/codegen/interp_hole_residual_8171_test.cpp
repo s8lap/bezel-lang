@@ -74,6 +74,32 @@ public class C
 end C;
 )";
 
+// `T` — a class whose `ToString` THROWS (the #8172 shape). Its destructor
+// marker ("DT") counts the disposals of the `T` temporary, and the fact that
+// the marker appears at all is the assertion that the temporary was
+// discharged on the EXCEPTION edge (§28.3's *Exception-path discharge*).
+const char* kThrowPrelude = R"(
+module M;
+public class C
+  public Id: int;
+  public constructor(id: int) Id := id; end constructor;
+  destructor Console.WriteLine("D" + Id.ToString()); end destructor;
+  public static method Make(): owned C
+    return new C(1);
+  end Make;
+end C;
+public class T
+  public constructor() end constructor;
+  destructor Console.WriteLine("DT"); end destructor;
+  public override method ToString(): string
+    throw new InvalidOperationException("render");
+  end ToString;
+  public static method Make(): owned T
+    return new T();
+  end Make;
+end T;
+)";
+
 } // namespace
 
 // §28.3.11 / §28.3 K7.1 (v0.355) — the `??` MEET row:
@@ -242,5 +268,62 @@ end Program;
     std::string expected;
     for (int k = 0; k < 100; ++k)
         expected += "System.Collections.Generic.Array<char>\n";
+    BEZEL_EXPECT_EQ(r.stdoutText, expected);
+}
+
+// §28.3 / §28.3.11 (v0.355) — the EXCEPTION-PATH row (issue #8172):
+// `$"{C.Make()}{T.Make()}"` where `T.ToString()` THROWS.
+//
+// The hole's own `ToString` dispatch (§7.4: the hole's implicit dispatch is
+// not a member access) is USER CODE, and it may throw. §28.3's
+// *Exception-path discharge* requires every already-produced, not-yet-consumed
+// unbound owned temporary to be disposed while unwinding — including the
+// throwing hole's OWN temporary.
+//
+// The registration must therefore happen BEFORE the render: #8143's arm ran
+// inside `appendPart`, i.e. AFTER the render, so a throwing render skipped
+// the registration entirely and the temporary was owned by nobody. MEASURED
+// before the fix (100 iterations): the `T` temporary leaked, 1600 B in 100
+// allocations; the earlier hole's `C` temporary WAS discharged (100 "D1"
+// markers) because that hole's arm had already run.
+//
+// The accumulator is covered by the same clause: the interpolation's running
+// string is an owned temporary of the expression too, and a throw out of the
+// render abandoned it (MEASURED before the fix: 3200 B in 100 direct + 400 B
+// in 100 indirect allocations per 100 iterations — the accumulator's header
+// and its char data; the exception object itself is NOT leaked).
+//
+// The stdout is asserted EXACTLY: one "DT" (the `T` temporary discharged on
+// the unwind) and one "D1" (the `C` temporary discharged on the unwind) per
+// iteration, then the catch counter.
+BEZEL_TEST(interp_hole_residual_8171,
+           render_throws_8172_discharges_the_holes_owned_temporary) {
+    auto r = runAotChecked(std::string(kThrowPrelude) + R"(
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var caught := 0;
+    while i < 100 do
+      try
+        Console.WriteLine($"{C.Make()}{T.Make()}");
+      catch
+        InvalidOperationException => do caught := caught + 1; end,
+      end try;
+      i := i + 1;
+    end while;
+    Console.WriteLine("caught=" + caught.ToString());
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    std::string expected;
+    for (int k = 0; k < 100; ++k) {
+        expected += "DT\n";
+        expected += "D1\n";
+    }
+    expected += "caught=100\n";
     BEZEL_EXPECT_EQ(r.stdoutText, expected);
 }

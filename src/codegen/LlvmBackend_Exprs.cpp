@@ -1152,47 +1152,28 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // null test on an undefined pointer is undefined behaviour. The
             // safe direction there is a leak (there is no object to reclaim).
             //
-            // fix #8171 (§18.5 / §28.3.11 / §28.3 K7.1 / §28.9, v0.355): the
-            // CLASSIFIER is widened. #8143's arm recognised ONE producer
-            // shape — `isFreshOwnedClassProducer(srcExpr)`, which is `new
-            // C(...)` / an `owned C`-returning call whose RESULT TYPE is a heap
-            // CLASS. Two populations it cannot see still leaked their
-            // temporary at the hole:
+            // fix #8171 / #8172 (§18.5 / §28.3.11 / §28.3 K7.1 / §28.9,
+            // v0.355): the hole's OWN unbound owned temporary is registered
+            // AHEAD of this render, in the part's lowering (see the
+            // `classifyHoleOwnedTemp` / `registerHoleOwnedTemp` call below the
+            // `!ev` handling) — NOT here.
             //
-            //   * an OWNED MEET (§28.3 K7.1 — "owned ⊓ owned = owned"): `a ?? b`,
-            //     an if-expression and a case-expression whose arms are all
-            //     owned producers. The meet's RESULT is a fresh owned value
-            //     the hole borrows (§18.5), so nobody owns it. MEASURED on the
-            //     issue's p12/p13 repro over 100 iterations: 1600 B in 100
-            //     allocations each (one 16-byte class instance per
-            //     evaluation) — the meet's result, orphaned.
-            //   * a DECLARATION-LESS built-in producer: `new StringBuilder(...)`
-            //     (stdlib §3.1) and the `owned Array<T>` materializers
-            //     `s.Split(...)` / `s.ToCharArray()` (stdlib §9.6). Every
-            //     built-in is declaration-less, so `rt->declaration` is null
-            //     and the class test can never fire for them. MEASURED: p14
-            //     59200 B / 200 allocations, p15 35800 B / 1000.
+            // #8143's arm ran HERE, inside `appendPart`, which is AFTER the
+            // hole's `ToString` dispatch. That placement is what #8172 is
+            // about: a hole whose own `ToString()` THREW skipped the
+            // registration entirely, so neither the K8 queue entry nor the
+            // exception-edge disposal existed and the temporary was owned by
+            // nobody (MEASURED: `$"{C.Make()}{T.Make()}"` over 100 iterations
+            // leaked the `T` temporary — 1600 B in 100 allocations).
             //
-            // The RELEASE is kind-specific (`classifyHoleOwnedTemp` /
-            // `registerHoleOwnedTemp` own that split): a heap class through
-            // its vtable Dispose, a builtin COLLECTION through the runtime
-            // free plus the §28.11 element disposer, a vtable-less built-in
-            // through its own free. A vtable dispatch on a `bz_array_t*` or a
-            // `StringBuilder` would be a WILD JUMP — neither has a Bezel
-            // vtable at word 0.
-            if (srcExpr && srcEv) {
-                const HoleOwnedTempKind holeKind =
-                    classifyHoleOwnedTemp(srcExpr);
-                if (holeKind != HoleOwnedTempKind::None) {
-                    if (!registerHoleOwnedTemp(srcExpr, srcEv, holeKind)) {
-                        // No K8 boundary to queue on (a disposer body): fall
-                        // back to an immediate, null-guarded discharge so the
-                        // value is not leaked outright — the same fallback the
-                        // argument position uses.
-                        emitHoleOwnedTempFallback(srcExpr, srcEv, holeKind);
-                    }
-                }
-            }
+            // The classifier is #8171's: a `new C(...)` / an `owned C`-returning
+            // call, an OWNED MEET (`??` / if / case), and the DECLARATION-LESS
+            // built-in producers (`new StringBuilder(...)`, the `owned Array<T>`
+            // materializers) — with a per-kind RELEASE (a heap class through
+            // its vtable Dispose, a builtin collection through the runtime free
+            // plus the §28.11 element disposer, a vtable-less built-in through
+            // its own free; a vtable dispatch on a `bz_array_t*` or a
+            // `StringBuilder` would be a WILD JUMP).
         };
         // fix #4934 / #4953 (§14.1 / §18.5 / §8.5, v0.307): a hole whose sema
         // type is a BARE type parameter (`T`, or `T?`) inside a generic body
@@ -1260,6 +1241,51 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (lowerTypeRef(cand) != v->getType()) return ty;
             return cand;
         };
+        // fix #8172 (§18.5 / §28.3 / §28.3.11, v0.355): the disposal scope a
+        // hole's EXPRESSION part opens stays OPEN across that part's RENDER,
+        // so a throw out of the render discharges what the render was using —
+        // the accumulator (`acc`) and the hole's OWN owned temporary — on the
+        // EXCEPTION edge (§28.3's *Exception-path discharge*).
+        //
+        // Before this the scope was popped right after `lowerExpr`, so the
+        // render ran with NO scope covering it: a throwing `ToString` (the
+        // hole's own implicit dispatch, §7.4) abandoned `acc` — MEASURED on
+        // `$"{C.Make()}{T.Make()}"` over 100 iterations: 3200 B in 100 direct
+        // allocations plus 400 B in 100 indirect (the accumulator's header and
+        // its char data; the exception object itself is NOT leaked — the same
+        // throw in a plain method leaks 0) — and skipped the hole's own
+        // temporary's registration entirely (#8143's arm ran inside
+        // `appendPart`, i.e. AFTER the render).
+        //
+        // `closePartScope` is the scope's exit: it lifts the scope's OTHER
+        // entries to the parent (#3519's rule — the entries a lowering pushed
+        // TRANSITIVELY must survive the pop) and pops the scope. The
+        // accumulator's own entry is NOT lifted: `acc` is released by
+        // `appendPart` (it is concat'd into the new string), so that entry
+        // must die with the scope.
+        llvm::AllocaInst* partAccSlot = nullptr;
+        bool partScopeOpen = false;
+        auto closePartScope = [&]() {
+            if (!partScopeOpen) return;
+            partScopeOpen = false;
+            // fix #8172: the pending no-K8-boundary fallback (a disposer body)
+            // is released HERE — after the render, which is the hole's last
+            // use of its operand (§18.5).
+            emitHoleOwnedTempFallback();
+            if (!disposeStack_.empty() && disposeStack_.size() >= 2) {
+                auto& top = disposeStack_.back();
+                auto& parent = *(disposeStack_.end() - 2);
+                for (auto it = top.begin(); it != top.end(); ) {
+                    if (it->slot != partAccSlot) {
+                        parent.push_back(std::move(*it));
+                        it = top.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            disposeStack_.pop_back();
+        };
         for (const auto& part : is->parts) {
             llvm::Value* pv = nullptr;
             llvm::Value* ev = nullptr;  // #1030: lowered part expr (borrow check)
@@ -1320,7 +1346,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // that and skip `appendPart` on the normal path too.
                 bool savedDiverged = diverged_;
                 disposeStack_.push_back({});
-                llvm::AllocaInst* accSlot = entryAllocaNullPtr();
+                partAccSlot = entryAllocaNullPtr();
+                partScopeOpen = true;
+                llvm::AllocaInst* accSlot = partAccSlot;
                 builder_.CreateStore(acc, accSlot);
                 Disposal d{accSlot, nullptr};
                 d.unwindOnly = true;
@@ -1334,41 +1362,19 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 if (diverged_) {
                     // Exception was thrown: `emitUnwindDisposals()` already
                     // fired at the throw site and disposed `accSlot`.
+                    partScopeOpen = false;
                     disposeStack_.pop_back();
                     return llvm::PoisonValue::get(ptrTy());
                 }
-                // Normal path: null the slot so the scope's string disposal is
-                // a no-op (the prior `acc` was concat'd into the new string and
-                // will be released by `appendPart` below), then pop the scope.
-                builder_.CreateStore(
-                    llvm::ConstantPointerNull::get(ptrTy()), accSlot);
-                // fix #3519 (narrow, §18.5 / §28.3 / §29.2 / §28.9, v0.298): the
-                // wrap #3513 added is `unwindOnly` + `stringRelease` (the sole
-                // intentional push); any OTHER Disposal entry landed here
-                // transitively, e.g. the `iterEnumDispose` an argument-coercion
-                // call inside `{Sum(d)}` registered via
-                // `wrapAsIEnumerableForTarget` at LlvmBackend_Assign.cpp:13880.
-                // The pop_back below silently drops those — without the lift,
-                // the snapshot's entries array (the wrap owns) leaks (152 B / 3
-                // allocs under LSan for the Dictionary-int,int wrap reproduced
-                // by `dictionary_passed_as_an_ienumerable_argument_is_wrapped_29_2`,
-                // gate x5 across cycle-7). Lift them to the parent so they
-                // survive; `accSlot` is the only entry left to pop. Skip the
-                // diverge path (line 393 above): `emitUnwindDisposals()` already
-                // fired this scope at the throw site, so the wrap disposed there.
-                if (!disposeStack_.empty() && disposeStack_.size() >= 2) {
-                    auto& top = disposeStack_.back();
-                    auto& parent = *(disposeStack_.end() - 2);
-                    for (auto it = top.begin(); it != top.end(); ) {
-                        if (it->slot != accSlot) {
-                            parent.push_back(std::move(*it));
-                            it = top.erase(it);
-                        } else {
-                            ++it;
-                        }
-                    }
-                }
-                disposeStack_.pop_back();
+                // fix #8172: the scope is NOT popped here — it stays open
+                // across the render (see `closePartScope` above), and the
+                // accumulator's slot is NOT nulled here: the render may throw,
+                // and the unwind path must find the accumulator in the slot
+                // to release it (§28.3's *Exception-path discharge*). The
+                // accumulator is released by `appendPart` on the normal path
+                // (it is concat'd into the new string), and the scope's own
+                // accumulator entry dies with the scope (`closePartScope`
+                // does not lift it) — so no slot nulling is needed.
                 // fix #3442 (§4.7 / §8.5 / §18.5, v0.283): a UNIT-typed hole is
                 // the one expression kind that legitimately lowers to NO value
                 // — `()` is LLVM `void`, so `lowerExpr` returns nullptr for it
@@ -1449,6 +1455,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             "should yield a value, it is unimplemented, "
                             "#2457)" +
                             builtinMemberChainNote(member, appliedMember));
+                        closePartScope();
                         continue;
                     }
                     const std::string builtinNew =
@@ -1459,6 +1466,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             Severity::Error, part.expr->span.begin,
                             unconstructedBuiltinNewNote(builtinNew,
                                                         "be interpolated"));
+                        closePartScope();
                         continue;
                     }
                     if (!ctx_.diagnostics().hasErrors()) {
@@ -1492,6 +1500,36 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // body, where `this` / `base` are deliberately left untyped.
                 const sema::TypeRef* holeTy = ctx_.exprType(*part.expr);
                 if (!holeTy) holeTy = thisReceiverTypeRef(part.expr.get());
+                // fix #8171 / #8172 (§18.5 / §28.3.11 / §28.3 K7.1 / §28.9,
+                // v0.355): the hole's OWN unbound owned temporary, registered
+                // HERE — BEFORE the render.
+                //
+                // §18.5: the hole BORROWS its operand (the hole dispatches the
+                // value's `ToString` and the CONCAT copies the rendered bytes),
+                // so a FRESH OWNED PRODUCER in that position hands its +1 to
+                // nobody: §28.3.11 disposes it "at the end of the full
+                // expression in which it is produced". The population is
+                // #8171's: a `new C(...)` / an `owned C`-returning call, an
+                // OWNED MEET (`??` / if / case), and the DECLARATION-LESS
+                // built-in producers (`new StringBuilder(...)`, the `owned
+                // Array<T>` materializers).
+                //
+                // fix #8172: the registration is AHEAD of the render on
+                // purpose. #8143's arm ran inside `appendPart`, i.e. AFTER the
+                // render, so a hole whose own `ToString()` THREW skipped the
+                // registration entirely — neither the K8 queue entry nor the
+                // exception-edge disposal was created, and the temporary was
+                // owned by nobody (MEASURED: `$"{C.Make()}{T.Make()}"` over 100
+                // iterations leaked the `T` temporary, 1600 B in 100
+                // allocations). Registered here, the disposal sits in the part's
+                // scope, which the render runs INSIDE (see `closePartScope`),
+                // so §28.3's *Exception-path discharge* covers the throw.
+                {
+                    const HoleOwnedTempKind holeKind =
+                        classifyHoleOwnedTemp(part.expr.get());
+                    if (holeKind != HoleOwnedTempKind::None)
+                        registerHoleOwnedTemp(part.expr.get(), ev, holeKind);
+                }
                 // §18.5: format spec → translate to snprintf format.
                 if (!part.formatSpec.empty()) {
                     const sema::TypeRef* frt = holeTy;
@@ -1542,6 +1580,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         phi->addIncoming(vStr, valEnd);
                         phi->addIncoming(nStr, nullEnd);
                         appendPart(phi, ev, part.expr.get());
+                        closePartScope();
                         continue;
                     }
                     // §18.5 / §7 (v0.184, #1691): a nullable REFERENCE part
@@ -1584,11 +1623,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         phi2->addIncoming(liveStr, liveEnd);
                         phi2->addIncoming(nStr2, nullEnd2);
                         appendPart(phi2, ev, part.expr.get());
+                        closePartScope();
                         continue;
                     }
                     pv = emitWithFormatSpec(ev, part.formatSpec, frt);
                     if (pv) {
                         appendPart(pv, ev, part.expr.get());
+                        closePartScope();
                         continue;
                     }
                     // emitWithFormatSpec returned null: fall through.
@@ -2081,6 +2122,11 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 }
             }
             if (pv) appendPart(pv, ev, part.expr.get());
+            // fix #8172: the part's disposal scope closes HERE — after the
+            // render and after `appendPart` (which releases the previous
+            // accumulator). A LITERAL part opens no scope, so this is a no-op
+            // for it.
+            closePartScope();
         }
         return acc;
     }
