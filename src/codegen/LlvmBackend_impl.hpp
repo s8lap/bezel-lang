@@ -21172,6 +21172,14 @@ private:
     // (closureReleaseEligible_). Such a returned local TRANSFERS its single +1
     // to the caller (no second retain). Parallel to returnedStringLocalOwnsPlusOne.
     bool returnedClosureLocalOwnsPlusOne(const ast::Expr* e) const;
+    // fix #8141 (§17.1 L12 / §28.9, v0.355): true when a returned closure
+    // `a ?? b` already carries exactly one +1 on every path that yields a
+    // value — `a` is a +1 closure transfer (producer / user-method call /
+    // lambda call, or a nested such `??`) and `b` is a `throw`, `null` or a
+    // +1 transfer too. lowerCoalesce does not normalize a closure `??` (only
+    // `string`), so its result is the selected arm's own reference: the
+    // return-site mint must treat it as a TRANSFER, like the bare producer.
+    bool isCoalescedClosureTransfer(const ast::Expr* e) const;
     // #429 (closure RETURN + FIELD-STORE) / §28.9: is `target` a closure-typed
     // CLASS instance field / auto-property lvalue (NOT a local / param /
     // ref-param / array element / static field / record field)? Only such a

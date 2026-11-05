@@ -21957,6 +21957,27 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
                     /*outWrapMade=*/nullptr,
                     /*srcOwnedByCallee=*/
                     returnSourceIsCalleeOwnedCollection(ci.exprBody));
+            // fix #8141 (§22.2 / §28.9 / §21.7, v0.355): the closure +1 mint
+            // of the ReturnStmt arm's "#429 (closure RETURN category)"
+            // (LlvmBackend_Stmts.cpp), which this face — the monomorphized
+            // twin of emitMethodBody's arrow arm — never had. A specialized
+            // `GetG<T>(…): (int)->int => this.Fn` handed back +0 while its
+            // block twin `return this.Fn;` (lowered through that ReturnStmt
+            // arm with `currentReturnTypeNode_ = ci.returnType`, set above)
+            // minted +1, and the caller's `isUserMethodClosureReturnCall`
+            // release then freed the field's only reference. See
+            // emitMethodBody's arm for the full argument; same predicate.
+            if (rv && currentReturnTypeNode_ && rv->getType()->isPointerTy()) {
+                const sema::TypeRef* declRet =
+                    ctx_.resolvedType(*currentReturnTypeNode_);
+                if (declRet && declRet->kind == sema::TypeRef::Kind::Function &&
+                    !isPlusOneClosureProducer(ci.exprBody) &&
+                    !isUserMethodClosureReturnCall(ci.exprBody) &&
+                    !isLambdaClosureReturnCall(ci.exprBody) &&
+                    !returnedClosureLocalOwnsPlusOne(ci.exprBody) &&
+                    !isCoalescedClosureTransfer(ci.exprBody))
+                    emitClosureRetain(rv);
+            }
             // #2491 (twin of #2434): expression-body return failed to lower —
             // emitReturn's `v ? v : null` fallback would silently substitute a
             // zero/null return. See the ReturnStmt site in
@@ -23511,6 +23532,25 @@ llvm::Value* Emitter::emitInlineGenericMethod(
                 /*outWrapMade=*/nullptr,
                 /*srcOwnedByCallee=*/
                 returnSourceIsCalleeOwnedCollection(ci.exprBody));
+            // fix #8141 (§22.2 / §28.9 / §21.7, v0.355): the closure +1 mint
+            // of the ReturnStmt arm's "#429 (closure RETURN category)"
+            // (LlvmBackend_Stmts.cpp). An expression-bodied GENERIC method is
+            // inlined HERE, never through a `return` statement, so
+            // `GetG<T>(t: T): (int)->int => this.Fn` yielded the field's +0
+            // borrow while its block twin (compiled by
+            // buildSpecializedMethodFn, whose `return this.Fn;` takes that
+            // ReturnStmt arm) minted +1 — and the caller, which classifies the
+            // call through `isUserMethodClosureReturnCall` exactly as it does
+            // for the block twin, released the field's only reference. Same
+            // predicate and transfer exclusions as emitMethodBody's arrow arm.
+            if (declRet && declRet->kind == sema::TypeRef::Kind::Function &&
+                result->getType()->isPointerTy() &&
+                !isPlusOneClosureProducer(ci.exprBody) &&
+                !isUserMethodClosureReturnCall(ci.exprBody) &&
+                !isLambdaClosureReturnCall(ci.exprBody) &&
+                !returnedClosureLocalOwnsPlusOne(ci.exprBody) &&
+                !isCoalescedClosureTransfer(ci.exprBody))
+                emitClosureRetain(result);
         }
     } else if (ci.bodyKind == ast::MethodBodyKind::Block) {
         // Block body: compile a specialized function and call it.

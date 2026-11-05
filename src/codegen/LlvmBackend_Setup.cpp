@@ -11996,6 +11996,35 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                     !returnedStringLocalOwnsPlusOne(ci.exprBody))
                     emitStringRetain(v);
             }
+            // fix #8141 (§22.2 / §28.9 / §21.7, v0.355): the CLOSURE twin of
+            // the string mint just above, which this face never had. §22.2:
+            // "`=> expression` replaces the block" — the arrow body IS the
+            // method's `return` operand, so it must mint exactly what the
+            // ReturnStmt arm's "#429 (closure RETURN category)" mint
+            // (LlvmBackend_Stmts.cpp) mints for `return <same expr>;`. The
+            // caller cannot tell the two spellings apart:
+            // `isUserMethodClosureReturnCall` classifies EVERY call to a user
+            // method with a function return type as a +1 producer, so
+            // `var g := h.Get();` arms a scope-end `bz_closure_release`, and
+            // the chain-call site (`h.Get()(1)`, LlvmBackend_Calls2.cpp)
+            // releases twice for a borrowed body. Without this mint
+            // `=> this.Fn` / `=> this.Items[0]` / `=> param` handed back +0,
+            // so the caller's release dropped the field's ONLY reference: the
+            // §28.9 runtime-managed closure was freed while its holder still
+            // stored it (heap-use-after-free on the next read). Same predicate,
+            // same transfer exclusions, same `currentReturnTypeNode_` key
+            // (so an accessor read face, axiom A4, still mints nothing).
+            if (v && currentReturnTypeNode_ && v->getType()->isPointerTy()) {
+                const sema::TypeRef* declRet =
+                    ctx_.resolvedType(*currentReturnTypeNode_);
+                if (declRet && declRet->kind == sema::TypeRef::Kind::Function &&
+                    !isPlusOneClosureProducer(ci.exprBody) &&
+                    !isUserMethodClosureReturnCall(ci.exprBody) &&
+                    !isLambdaClosureReturnCall(ci.exprBody) &&
+                    !returnedClosureLocalOwnsPlusOne(ci.exprBody) &&
+                    !isCoalescedClosureTransfer(ci.exprBody))
+                    emitClosureRetain(v);
+            }
             // #843 / §7.1: an arrow body returning a nullable VALUE type must
             // wrap (and widen) the bare value into the `{i8, T}` struct, exactly
             // as the ReturnStmt path does. Without this `=> 42` for a `long?`
@@ -34652,6 +34681,32 @@ bool Emitter::returnedClosureLocalOwnsPlusOne(const ast::Expr* e) const {
     // cell). Mirrors the producer arm directly above.
     if (closureBorrowRetainEligible_.count(declNode)) return true;
     return false;
+}
+
+// fix #8141 (§17.1 L12 / §28.9, v0.355): `Pick() ?? throw …` returned from a
+// method whose declared return type is a function type. lowerCoalesce
+// (LlvmBackend_Exprs2.cpp) normalizes only a `string` `??`; for a closure it
+// yields the selected arm's own reference. When every value-yielding arm is a
+// +1 transfer (a `throw` or `null` arm yields no reference), the result is
+// already the caller's +1 and the return-site mint must not add a second one
+// (MEASURED: `function_value_at_object_spec_12_7_5978`'s `Rx` — 64 B per call
+// leaked once the arrow face minted). A closure-owning LOCAL operand is
+// deliberately NOT a transfer here: only a returned bare identifier hands its
+// slot's +1 over (returnedClosureLocalOwnsPlusOne); inside `??` the local
+// keeps its scope-end release, so its value is a borrow the mint must cover.
+bool Emitter::isCoalescedClosureTransfer(const ast::Expr* e) const {
+    auto* bin = dynamic_cast<const ast::BinaryExpr*>(e);
+    if (!bin || bin->op != "??" || !bin->left || !bin->right) return false;
+    auto transfers = [&](const ast::Expr* x) {
+        return isPlusOneClosureProducer(x) ||
+               isUserMethodClosureReturnCall(x) ||
+               isLambdaClosureReturnCall(x) || isCoalescedClosureTransfer(x);
+    };
+    if (!transfers(bin->left.get())) return false;
+    const ast::Expr* r = bin->right.get();
+    return dynamic_cast<const ast::ThrowExpr*>(r) != nullptr ||
+           dynamic_cast<const ast::NullLiteralExpr*>(r) != nullptr ||
+           transfers(r);
 }
 
 

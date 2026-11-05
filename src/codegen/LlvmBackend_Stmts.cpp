@@ -4120,11 +4120,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // of the closure header, its env, and its captures, not merely
             // the 26000 B / 1500-allocation figure LSan reports at 500
             // iterations of issue #3804's own probes.
+            // fix #8141 (§22.2 / §28.9, v0.355): `!isCoalescedClosureTransfer`
+            // — `return Pick() ?? throw …` hands the caller the producer arm's
+            // own +1 (a closure `??` is not normalized), so it is a transfer.
+            // The expression-bodied faces (emitMethodBody, the generic faces in
+            // LlvmBackend_Calls2.cpp) use this same exclusion list.
             if (declRet && declRet->kind == sema::TypeRef::Kind::Function &&
                 !isPlusOneClosureProducer(rs->value.get()) &&
                 !isUserMethodClosureReturnCall(rs->value.get()) &&
                 !isLambdaClosureReturnCall(rs->value.get()) &&
-                !returnedClosureLocalOwnsPlusOne(rs->value.get()))
+                !returnedClosureLocalOwnsPlusOne(rs->value.get()) &&
+                !isCoalescedClosureTransfer(rs->value.get()))
                 emitClosureRetain(v);
         }
         // fix #1747 / §28.9 / §9.7 / §28.3: a method whose declared return
