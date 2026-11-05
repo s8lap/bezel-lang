@@ -6666,10 +6666,13 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
             return;
         const auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(fromExpr);
         if (!rma || !rma->target) return;
-        if (!methodRefAmbiguityReported_.insert(fromExpr).second) return;
+        if (methodRefAmbiguityAlreadyReported(fromExpr)) return;
+        const std::size_t idx = ctx_.diagnostics().diagnostics().size();
         lookupExtensionMember(ctx_.exprType(*rma->target), ms->name, nullptr,
                               fromExpr->span.begin, true,
                               static_cast<std::ptrdiff_t>(n));
+        if (ctx_.diagnostics().diagnostics().size() > idx)
+            recordMethodRefAmbiguity(fromExpr, idx);
     };
 
     const std::size_t arity = target->funcParams.size();
@@ -6893,7 +6896,7 @@ bool ExprTC::reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
     // fix #8205 (§27.6, v0.355): one report per reference — a reference can
     // reach this rule from two checks (a call's special-cased `Object`
     // argument and the ordinary §5.1 one).
-    if (!methodRefAmbiguityReported_.insert(initExpr).second) return true;
+    if (methodRefAmbiguityAlreadyReported(initExpr)) return true;
 
     // Build the candidates' signatures for the diagnostic.
     std::string sigs;
@@ -6939,6 +6942,7 @@ bool ExprTC::reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
         sigs += ") -> " + sigOne(ft->funcReturn) + "`";
     }
 
+    const std::size_t reportIdx = ctx_.diagnostics().diagnostics().size();
     ctx_.diagnostics().report(
         Severity::Error, loc,
         std::string("the method reference `") + std::string(ms->name) +
@@ -6946,9 +6950,35 @@ bool ExprTC::reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
             "(\xC2\xA7""27.6 v0.307) — add an explicit type annotation "
             "(e.g. `var f: (int) -> () := " + std::string(ms->name) +
             ";`) to disambiguate (candidates: " + sigs + ")");
+    recordMethodRefAmbiguity(initExpr, reportIdx);
     return true;
 }
 
+// fix #8205 (§27.6, v0.355): see `methodRefAmbiguityReported_`. A record
+// counts only while the diagnostic it names is still in the engine, so a
+// rolled-back report (index now out of range, or the slot since refilled by
+// another diagnostic) does not count as reported and the re-visit reports
+// again.
+bool ExprTC::methodRefAmbiguityAlreadyReported(const ast::Expr* ref) const {
+    auto it = methodRefAmbiguityReported_.find(ref);
+    if (it == methodRefAmbiguityReported_.end()) return false;
+    const auto& diags = ctx_.diagnostics().diagnostics();
+    const MethodRefAmbiguityRecord& rec = it->second;
+    if (rec.index >= diags.size()) return false;
+    const Diagnostic& d = diags[rec.index];
+    return d.severity == Severity::Error &&
+           d.location.offset == rec.location.offset &&
+           d.location.line == rec.location.line &&
+           d.location.column == rec.location.column &&
+           d.message == rec.message;
+}
+
+void ExprTC::recordMethodRefAmbiguity(const ast::Expr* ref, std::size_t idx) {
+    const auto& diags = ctx_.diagnostics().diagnostics();
+    if (idx >= diags.size()) return;
+    methodRefAmbiguityReported_[ref] =
+        MethodRefAmbiguityRecord{idx, diags[idx].location, diags[idx].message};
+}
 
 // fix #5659 (§9.7 *borrow-erasing position* / §8.6, v0.330). The ONE
 // definition of the rule, for every route a value that holds borrows can take

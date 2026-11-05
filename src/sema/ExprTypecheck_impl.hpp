@@ -4789,11 +4789,35 @@ private:
     std::vector<MethodSymbol*> methodRefOverloadCandidates(
         const MethodSymbol* ms, const ast::Expr* refExpr = nullptr,
         std::vector<std::size_t>* ambiguousArities = nullptr);
-    // fix #8205 (§27.6, v0.355): references the no-target / rule-4 method-
-    // reference diagnostics already reported, so a reference reached by two
-    // checks (a call's special-cased argument check and the ordinary §5.1
-    // one) is diagnosed once.
-    std::unordered_set<const ast::Expr*> methodRefAmbiguityReported_;
+    // fix #8205 (§27.6, v0.355): the no-target / rule-4 method-reference
+    // diagnostics already reported, so a reference reached by two checks (a
+    // call's special-cased argument check and the ordinary §5.1 one) is
+    // diagnosed once. Keyed by the reference node; the record names the
+    // diagnostic itself (its index in `ctx_.diagnostics().diagnostics()`, its
+    // location and its text), and is honoured only while THAT diagnostic is
+    // still in the engine. A speculative visit (the #8203 LINQ-operator
+    // argument peek, the #6529 / #7778 `?.` twins) discards its diagnostics
+    // with `rollbackTo`, and the re-visit that follows must report again —
+    // so no rollback site has to remember this record. Before: a persistent
+    // set remembered the peek's report, and the real visit reported nothing:
+    // `o.Where((lambda() => do var f := V.Len; return 1; end)())` over an
+    // overloaded `Len` compiled (MEASURED, rev-8205b r23/r25). Consult it
+    // only through `methodRefAmbiguityAlreadyReported` /
+    // `recordMethodRefAmbiguity`.
+    struct MethodRefAmbiguityRecord {
+        std::size_t index = 0;
+        SourceLocation location;
+        std::string message;
+    };
+    std::unordered_map<const ast::Expr*, MethodRefAmbiguityRecord>
+        methodRefAmbiguityReported_;
+    // True iff `ref`'s recorded diagnostic is still in the engine (not rolled
+    // back): the recorded index is in range and the error there is the one
+    // recorded (same location, same text).
+    bool methodRefAmbiguityAlreadyReported(const ast::Expr* ref) const;
+    // Records that the diagnostic at index `idx` — already reported — is
+    // `ref`'s. No-op when nothing was reported at `idx`.
+    void recordMethodRefAmbiguity(const ast::Expr* ref, std::size_t idx);
 
     // §27.6 (v0.355): the function type a method reference over an EXTENSION
     // member forms. The type-qualified (unbound) spelling carries the

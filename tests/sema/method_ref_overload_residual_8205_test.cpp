@@ -442,3 +442,174 @@ BEZEL_TEST(sema_method_ref_overload_residual_8205,
                                   "    Console.WriteLine(f());"),
                         "42\n");
 }
+
+// ── D: the dedup record survives a speculative visit's rollback ─────────────
+//
+// The #8203 LINQ-operator argument peek (`o.Where(arg)` over a user
+// `extension Object { Where(…) }`) visits `arg` once speculatively, rolls its
+// diagnostics back, and visits it again in the normal order. The one-report-
+// per-reference record (fix #8205) outlived the rollback, so the real visit
+// reported nothing: a program the §27.6 no-target rule (or §26.5 rule 4)
+// rejects compiled and ran (MEASURED, rev-8205b probes r21/r23/r24/r25 —
+// verbatim below). Each control is the same program with `Where` renamed
+// `Wherx` (no §5 operator name, so no peek). Every row also pins the
+// record's purpose: the reference is diagnosed exactly ONCE.
+
+namespace {
+
+// rev-8205b r23_linq_peek_iife_var_infer.bzl
+const char kPeekIifeVarInfer[] =
+    "module M;\n"
+    "class V\n"
+    "  public static method Len(): int => 42;\n"
+    "  public static method Len(x: int): int => x + 100;\n"
+    "end V;\n"
+    "extension Object\n"
+    "  public method Where(n: int): int => n;\n"
+    "end;\n"
+    "class C\n"
+    "  public static method Main(): int\n"
+    "    var o: Object := new Object();\n"
+    "    Console.WriteLine(o.Where((lambda() => do var f := V.Len; return 1; end)()));\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end C;\n";
+
+// rev-8205b r25_linq_peek_iife_tie.bzl
+const char kPeekIifeTie[] =
+    "module M;\n"
+    "extension Array<int>\n"
+    "  public method Len(): int => 1;\n"
+    "end;\n"
+    "extension IEnumerable<int>\n"
+    "  public method Len(x: int): int => x + 200;\n"
+    "end;\n"
+    "extension IEnumerable<T>\n"
+    "  public method Len(x: int): int => x + 300;\n"
+    "end;\n"
+    "extension Object\n"
+    "  public method Where(n: int): int => n;\n"
+    "end;\n"
+    "class C\n"
+    "  public static method Main(): int\n"
+    "    var a: Array<int> := [1,2,3];\n"
+    "    var o: Object := new Object();\n"
+    "    Console.WriteLine(o.Where((lambda() => do var g: (int) -> int := a.Len; return g(5); end)()));\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end C;\n";
+
+// rev-8205b r21_linq_peek_interp_hole.bzl
+const char kPeekInterpHole[] =
+    "module M;\n"
+    "class V\n"
+    "  public static method Len(): int => 42;\n"
+    "  public static method Len(x: int): int => x + 100;\n"
+    "end V;\n"
+    "extension Object\n"
+    "  public method Where(s: string): string => s;\n"
+    "end;\n"
+    "class C\n"
+    "  public static method Main(): int\n"
+    "    var o: Object := new Object();\n"
+    "    Console.WriteLine(o.Where($\"{V.Len}\"));\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end C;\n";
+
+// rev-8205b r24_linq_peek_nested_object_param.bzl
+const char kPeekNestedObjectParam[] =
+    "module M;\n"
+    "class V\n"
+    "  public static method Len(): int => 42;\n"
+    "  public static method Len(x: int): int => x + 100;\n"
+    "end V;\n"
+    "class U\n"
+    "  public static method Show(x: Object): int => 3;\n"
+    "end U;\n"
+    "extension Object\n"
+    "  public method Where(n: int): int => n;\n"
+    "end;\n"
+    "class C\n"
+    "  public static method Main(): int\n"
+    "    var o: Object := new Object();\n"
+    "    Console.WriteLine(o.Where(U.Show(V.Len)));\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end C;\n";
+
+// The control: every `Where` renamed `Wherx`.
+std::string withoutPeek(std::string src) {
+    for (std::size_t at = src.find("Where"); at != std::string::npos;
+         at = src.find("Where", at + 5))
+        src.replace(at, 5, "Wherx");
+    return src;
+}
+
+std::size_t errorCount(const JitResult& r, const std::string& needle) {
+    std::size_t n = 0;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        for (std::size_t at = d.message.find(needle); at != std::string::npos;
+             at = d.message.find(needle, at + needle.size()))
+            ++n;
+    }
+    return n;
+}
+
+void expectRejectedOnce(const std::string& src, const std::string& needle) {
+    auto r = runAot(src);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_EQ(errorCount(r, needle), static_cast<std::size_t>(1));
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+}
+
+}  // namespace
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           no_target_reference_inside_a_peeked_linq_argument_is_ambiguous) {
+    // per §27.6 (v0.355): `var f := V.Len;` inside an immediately-invoked
+    // lambda that the `Where` peek visits speculatively (r23; tip printed 1)
+    expectRejectedOnce(kPeekIifeVarInfer, kNoTarget);
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           no_target_reference_inside_a_non_linq_argument_is_ambiguous) {
+    expectRejectedOnce(withoutPeek(kPeekIifeVarInfer), kNoTarget);
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           rule_4_tie_inside_a_peeked_linq_argument_is_ambiguous) {
+    // per §27.6 / §26.5 rule 4 (v0.355): the split-set tie at arity 1,
+    // selected inside the peeked IIFE (r25; tip printed 205)
+    expectRejectedOnce(kPeekIifeTie, kTieAmbiguity);
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           rule_4_tie_inside_a_non_linq_argument_is_ambiguous) {
+    expectRejectedOnce(withoutPeek(kPeekIifeTie), kTieAmbiguity);
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           interpolation_hole_reference_in_a_peeked_linq_argument_is_ambiguous) {
+    // per §27.6 / §18.5 (v0.355): `$"{V.Len}"` as the peeked argument (r21;
+    // tip printed `() -> int`)
+    expectRejectedOnce(kPeekInterpHole, kNoTarget);
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           interpolation_hole_reference_in_a_non_linq_argument_is_ambiguous) {
+    expectRejectedOnce(withoutPeek(kPeekInterpHole), kNoTarget);
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           object_position_reference_in_a_peeked_linq_argument_is_ambiguous) {
+    // per §27.6 (v0.355): `U.Show(V.Len)` at an `Object` parameter, nested in
+    // the peeked argument (r24; tip printed 3)
+    expectRejectedOnce(kPeekNestedObjectParam, kNoTarget);
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           object_position_reference_in_a_non_linq_argument_is_ambiguous) {
+    expectRejectedOnce(withoutPeek(kPeekNestedObjectParam), kNoTarget);
+}
