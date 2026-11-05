@@ -754,6 +754,12 @@ private:
     // parameter guarantees no conformance and no derived property, so a §5
     // block's `where T: …` clause is PROVABLY unsatisfied at it.
     bool linqElemIsUnconstrainedTypeParam(const TypeRef* elem) const;
+    // fix #8266 (stdlib §5.1, spec §3.6 rule 2 / §14.2, v0.355): is `elem` a
+    // bare, non-nullable type parameter IN SCOPE (the receiver's element in a
+    // generic body)? The no-selector `Sum(): owned T` / `Min(): T` /
+    // `Max(): T` over such an element returns that parameter, not `int`.
+    // Defined beside `linqElemIsUnconstrainedTypeParam`.
+    bool linqElemIsInScopeTypeParam(const TypeRef* elem) const;
     // fix #8198 (spec §14.2 *A type parameter as the type argument* /
     // *Interface conformance* rule 6, §26.5.1, v0.355): is the §5 block's
     // `where` clause PROVABLY unsatisfied at the element type `elem` — a type

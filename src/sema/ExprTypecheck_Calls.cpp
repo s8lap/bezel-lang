@@ -998,6 +998,28 @@ bool ExprTC::linqElemIsUnconstrainedTypeParam(const TypeRef* elem) const {
     return !currentMethodTypeParamMayInherit(n);
 }
 
+// fix #8266 (stdlib §5.1, spec §3.6 rule 2 / §14.2, v0.355): see the
+// declaration in ExprTypecheck_impl.hpp. stdlib §5.1 declares the no-selector
+// aggregations on the element type itself --
+//     public extension IEnumerable<T> where T: INumber<T>
+//       public method Sum(): owned T;
+//     public extension IEnumerable<T> where T: IComparable<T>
+//       public method Min(): T;  public method Max(): T;
+// -- so inside a generic body whose receiver element is the body's own type
+// parameter the call's type is that parameter, and spec §3.6 rule 2 ("A
+// generic body type-checks under the weakest assumption its constraints
+// establish") then confines it to `Object` and its bounds (§5.1, §14.2). The
+// shape is #8181's (a Named TypeRef with no declaration and no arguments);
+// the SCOPE test (`isInScopeTypeParam`) plus #6530's stamp/builtin test
+// (`isInScopeTypeParamRef`) keeps a same-spelled builtin (`Guid`, `Range`) out.
+bool ExprTC::linqElemIsInScopeTypeParam(const TypeRef* elem) const {
+    if (!elem || elem->kind != TypeRef::Kind::Named || elem->declaration ||
+        !elem->genericArgs.empty() || elem->nullable)
+        return false;
+    const std::string_view n = elem->headName();
+    return !n.empty() && isInScopeTypeParam(n) && isInScopeTypeParamRef(elem);
+}
+
 // fix-forward #8181: may the CURRENT method's type parameter `n` carry a
 // constraint it inherits rather than writes (spec §14.2, quoted above)? `true`
 // means "it may" and the caller KEEPS the §5 candidate (the sound direction);
@@ -13366,6 +13388,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 noSelectorKeyed = true;
                             }
                         }
+                        // fix #8266 (stdlib §5.1, spec §3.6 rule 2 / §14.2,
+                        // v0.355): the LAZY twin -- a type-parameter element
+                        // in a generic body types as that parameter, not the
+                        // `int` default (see the concrete-collection arm).
+                        if (!noSelectorKeyed && ce.args.empty() &&
+                            linqElemIsInScopeTypeParam(srcElem)) {
+                            ctx_.setExprType(&ce, srcElem);
+                            noSelectorKeyed = true;
+                        }
                         // fix #8161 (stdlib §5.1 / §2.8 / §14.2, v0.355): the
                         // no-selector `Min()`/`Max()` returns the ELEMENT type
                         // `T` for EVERY `T` that satisfies §5.1's
@@ -14015,6 +14046,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             !srcElem2->nullable &&
                             isNoSelectorAggregationElem(srcElem2->primitive))
                             noSelTy = ctx_.primitiveTypeRef(srcElem2->primitive);
+                        // fix #8266 (stdlib §5.1, spec §3.6 rule 2 / §14.2,
+                        // v0.355): a type-parameter element in a generic body
+                        // returns that parameter (`Min(): T` / `Max(): T`).
+                        else if (ce.args.empty() &&
+                                 linqElemIsInScopeTypeParam(srcElem2))
+                            noSelTy = srcElem2;
                         ctx_.setExprType(
                             &ce, uTy ? uTy
                                      : (noSelTy ? noSelTy
@@ -14035,6 +14072,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             !srcElem2->nullable &&
                             isNoSelectorAggregationElem(srcElem2->primitive))
                             sumTy = ctx_.primitiveTypeRef(srcElem2->primitive);
+                        // fix #8266 (stdlib §5.1, spec §3.6 rule 2 / §14.2,
+                        // v0.355): `Sum(): owned T` at a type-parameter
+                        // element in a generic body is `T`, not `int`.
+                        else if (ce.args.empty() &&
+                                 linqElemIsInScopeTypeParam(srcElem2))
+                            sumTy = srcElem2;
                         ctx_.setExprType(
                             &ce, sumTy ? sumTy : ctx_.primitiveTypeRef(P::Int));
                     }
@@ -15605,6 +15648,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                             ctx_.primitiveTypeRef(ep));
                                         noSelectorKeyed = true;
                                     }
+                                }
+                                // fix #8266 (stdlib §5.1, spec §3.6 rule 2 /
+                                // §5.1 / §14.2, v0.355): a TYPE-PARAMETER
+                                // element (`G<T>(a: Array<T>) where T:
+                                // INumber<T> => a.Sum()`) was admitted by the
+                                // placeholder arm above and then fell to the
+                                // `int` default below, so `: int => a.Sum()`
+                                // was ACCEPTED and at a user record conformer
+                                // printed garbage. `Sum(): owned T` /
+                                // `Min(): T` / `Max(): T` -- the result is `T`.
+                                if (!noSelectorKeyed && ce.args.empty() &&
+                                    linqElemIsInScopeTypeParam(elem)) {
+                                    ctx_.setExprType(&ce, elem);
+                                    noSelectorKeyed = true;
                                 }
                             }
                             if (!noSelectorKeyed) {

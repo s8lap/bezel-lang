@@ -118,21 +118,28 @@ BEZEL_TEST(codegen_linq_generic_body_where_applicability_8181,
 // 100 x (11 + 11 + 11 + 11) = 4400.
 // PARENT (737e6d0a / bbdd4bb8): 4400. dece4010: 100 x 4 x 4242 = 1696800
 // (the omitted clause was read as "unconstrained" — review r39-rev-8180 o1).
+// fix #8266 (stdlib §5.1 `Sum(): owned T`, spec §3.6 rule 2, v0.355): the
+// bodies return `T`, not `int` — the §5 `Sum()` at a type-parameter element is
+// `T`, and `: int => a.Sum()` is a refused §5.1 conversion. Same intent: the
+// inherited `INumber<T>` keeps the §5 `Sum()`, observed at the T = int call.
+// MEASURED on the #8266 parent (r30-c1 @ b2e70429): this `: T` spelling was
+// REFUSED in the omitted-`where` bodies ("a value of primitive type `int`
+// does not implicitly convert to the type parameter `T`"); likewise below.
 BEZEL_TEST(codegen_linq_generic_body_where_applicability_8181,
            override_with_omitted_where_keeps_the_inherited_inumber_sum_without_leaking) {
     JitResult r = runAotChecked(looped(
         "class B\n"
-        "  public virtual method S<T>(a: Array<T>): int where T: INumber<T> =>"
+        "  public virtual method S<T>(a: Array<T>): T where T: INumber<T> =>"
         " a.Sum();\n"
         "end B;\n"
         "class O: B\n"
-        "  public override method S<T>(a: Array<T>): int => a.Sum();\n"
+        "  public override method S<T>(a: Array<T>): T => a.Sum();\n"
         "end O;\n"
         "class Mid: B\n"
-        "  public override method S<T>(a: Array<T>): int => a.Sum();\n"
+        "  public override method S<T>(a: Array<T>): T => a.Sum();\n"
         "end Mid;\n"
         "class Leaf: Mid\n"
-        "  public override method S<T>(a: Array<T>): int => a.Sum();\n"
+        "  public override method S<T>(a: Array<T>): T => a.Sum();\n"
         "end Leaf;\n",
         "      var a := new Array<int>();\n"
         "      a.Add(5);\n"
@@ -155,28 +162,28 @@ BEZEL_TEST(codegen_linq_generic_body_where_applicability_8181,
 // read under the implemented interface's ... substitution"), each called
 // directly and through the interface. 100 x 6 x 11 = 6600.
 // PARENT (737e6d0a / bbdd4bb8): 6600. dece4010: 100 x 6 x 4242 = 2545200
-// (review r39-rev-8180 o2).
+// (review r39-rev-8180 o2). fix #8266: the bodies return `T` (see above).
 BEZEL_TEST(codegen_linq_generic_body_where_applicability_8181,
            interface_implementation_with_omitted_where_keeps_the_inherited_inumber_sum_without_leaking) {
     JitResult r = runAotChecked(looped(
         "interface IA\n"
-        "  method S<T>(a: Array<T>): int where T: INumber<T>;\n"
+        "  method S<T>(a: Array<T>): T where T: INumber<T>;\n"
         "end IA;\n"
         "interface IB: IA\n"
         "  method Q(): int;\n"
         "end IB;\n"
         "interface IG<U>\n"
-        "  method S<T>(a: Array<T>, u: U): int where T: INumber<T>;\n"
+        "  method S<T>(a: Array<T>, u: U): T where T: INumber<T>;\n"
         "end IG;\n"
         "class X: IA\n"
-        "  public method S<T>(a: Array<T>): int => a.Sum();\n"
+        "  public method S<T>(a: Array<T>): T => a.Sum();\n"
         "end X;\n"
         "class Y: IB\n"
-        "  public method S<T>(a: Array<T>): int => a.Sum();\n"
+        "  public method S<T>(a: Array<T>): T => a.Sum();\n"
         "  public method Q(): int => 0;\n"
         "end Y;\n"
         "class Z: IG<string>\n"
-        "  public method S<T>(a: Array<T>, u: string): int => a.Sum();\n"
+        "  public method S<T>(a: Array<T>, u: string): T => a.Sum();\n"
         "end Z;\n",
         "      var a := new Array<int>();\n"
         "      a.Add(5);\n"

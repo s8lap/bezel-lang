@@ -101,6 +101,10 @@ std::string notnullConstrainedSum() {
 // `IEnumerable<int>` head being a subtype of `Object` (§26.5.1), it is the
 // more specific candidate. The value printed is the §5 `Sum()`'s (5 + 6 = 11),
 // NOT the extension's 4040.
+// fix #8266 (stdlib §5.1 `Sum(): owned T`, spec §3.6 rule 2, v0.355): the
+// body returns `T` -- the §5 `Sum()` at a type-parameter element is `T`, and
+// `: int => a.Sum()` is a refused §5.1 conversion. The same holds of
+// `looped()`'s `C.I` below.
 std::string inumberConstrainedSum() {
     return
         "module M;\n"
@@ -109,7 +113,7 @@ std::string inumberConstrainedSum() {
         "  public method Sum(): int => 4040;\n"
         "end;\n"
         "class C\n"
-        "  static method G<T>(a: Array<T>): int where T: INumber<T> =>"
+        "  static method G<T>(a: Array<T>): T where T: INumber<T> =>"
         " a.Sum();\n"
         "  public static method Main(): int\n"
         "    var a := new Array<int>();\n"
@@ -172,7 +176,7 @@ std::string looped() {
         "class C\n"
         "  static method G<T>(a: Array<T>): int where T: class => a.Sum();\n"
         "  static method N<T>(a: Array<T>): int where T: notnull => a.Sum();\n"
-        "  static method I<T>(a: Array<T>): int where T: INumber<T> =>"
+        "  static method I<T>(a: Array<T>): T where T: INumber<T> =>"
         " a.Sum();\n"
         "end C;\n"
         "class D\n"

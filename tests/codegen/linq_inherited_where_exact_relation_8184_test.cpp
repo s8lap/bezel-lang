@@ -63,11 +63,14 @@ std::string looped(const std::string& decls, const std::string& loopBody) {
 // The issue's w1: a PRIVATE base `S<T> where T: INumber<T>` and a derived,
 // distinct, non-override `S<T>` of the same shape (§12.2: no override
 // relationship). 100 x 4040 = 404000. PARENT: 1100 (11 per call).
+// fix #8266: the private base body returns `T` (its `: int => a.Sum()` is a
+// refused §5.1 conversion, see the override row below); `D.S` is unconstrained
+// and its `int` comes from the extension.
 BEZEL_TEST(codegen_linq_inherited_where_exact_relation_8184,
            w1_private_base_same_shape_distinct_member_answers_the_extension) {
     JitResult r = runAotChecked(looped(
         "class B\n"
-        "  private method S<T>(a: Array<T>): int where T: INumber<T> =>"
+        "  private method S<T>(a: Array<T>): T where T: INumber<T> =>"
         " a.Sum();\n"
         "  public method K(): int => 0;\n"
         "end B;\n"
@@ -153,21 +156,24 @@ BEZEL_TEST(codegen_linq_inherited_where_exact_relation_8184,
 // overload that implements the UNconstrained one. It inherits
 // `where T: INumber<T>`, so the §5 `Sum()` applies — directly and through
 // each interface. 100 x 3 x 11 = 3300. PARENT: 3300.
+// fix #8266: the constrained bodies return `T` (see the override row below).
+// On the #8266 parent the omitted-`where` `: T` bodies were REFUSED (`int`
+// does not convert to `T`), so this row and the override row are RED there.
 BEZEL_TEST(codegen_linq_inherited_where_exact_relation_8184,
            control_implementation_of_the_constrained_interface_keeps_the_builtin) {
     JitResult r = runAotChecked(looped(
         "interface IA\n"
-        "  method S<T>(a: Array<T>): int where T: INumber<T>;\n"
+        "  method S<T>(a: Array<T>): T where T: INumber<T>;\n"
         "end IA;\n"
         "interface IB\n"
         "  method S<T>(s: string): int;\n"
         "end IB;\n"
         "class D: IA, IB\n"
         "  public method S<T>(s: string): int => 1;\n"
-        "  public method S<T>(a: Array<T>): int => a.Sum();\n"
+        "  public method S<T>(a: Array<T>): T => a.Sum();\n"
         "end D;\n"
         "class E: IA\n"
-        "  public method S<T>(a: Array<T>): int => a.Sum();\n"
+        "  public method S<T>(a: Array<T>): T => a.Sum();\n"
         "end E;\n",
         "      var d := new D();\n"
         "      var ia: IA := d;\n"
@@ -182,8 +188,13 @@ BEZEL_TEST(codegen_linq_inherited_where_exact_relation_8184,
 // inherits `where T: INumber<T>` — one level, and through an intermediate
 // class that omits it too — and an override inheriting only position 1 keeps
 // the §5 `Sum()` at that position alone (§14.2: "correspond by position").
-// Per iteration: 11 + 11 + 11 = 33; the last assignment adds
-// 4040 * 100000 + 11 once. 100 x 33 + 404000011 = 404003311. PARENT: the same.
+// Per iteration: 11 + 11 + 11 = 33, so 100 x 33 = 3300; then `P` prints
+// position 0 (the extension, 4040) and position 1 (the §5 `Sum()`, 11).
+// fix #8266 (stdlib §5.1 `Sum(): owned T`, spec §3.6 rule 2, v0.355): the
+// bodies return `T` (and `P` a `string` through interpolation) -- the §5
+// `Sum()` at a type-parameter element is `T`, and `: int => a.Sum()` is a
+// refused §5.1 conversion. Before #8266 this row summed `P` into `t` as an
+// `int` (404003311); the observation is the same pair of answers.
 BEZEL_TEST(codegen_linq_inherited_where_exact_relation_8184,
            control_genuine_override_keeps_the_inherited_builtin) {
     JitResult r = runAotChecked(
@@ -192,18 +203,18 @@ BEZEL_TEST(codegen_linq_inherited_where_exact_relation_8184,
         "  public method Sum(): int => 4040;\n"
         "end;\n"
         "class B\n"
-        "  public virtual method S<T>(a: Array<T>): int where T: INumber<T> =>"
+        "  public virtual method S<T>(a: Array<T>): T where T: INumber<T> =>"
         " a.Sum();\n"
-        "  public virtual method P<A, Z>(a: Array<A>, b: Array<Z>): int"
-        " where Z: INumber<Z> => b.Sum();\n"
+        "  public virtual method P<A, Z>(a: Array<A>, b: Array<Z>): string"
+        " where Z: INumber<Z> => $\"{b.Sum()}\";\n"
         "end B;\n"
         "class Mid: B\n"
-        "  public override method S<T>(a: Array<T>): int => a.Sum();\n"
+        "  public override method S<T>(a: Array<T>): T => a.Sum();\n"
         "end Mid;\n"
         "class Leaf: Mid\n"
-        "  public override method S<T>(a: Array<T>): int => a.Sum();\n"
-        "  public override method P<X, Y>(a: Array<X>, b: Array<Y>): int =>"
-        " a.Sum() * 100000 + b.Sum();\n"
+        "  public override method S<T>(a: Array<T>): T => a.Sum();\n"
+        "  public override method P<X, Y>(a: Array<X>, b: Array<Y>): string =>"
+        " $\"{a.Sum()}|{b.Sum()}\";\n"
         "end Leaf;\n"
         "class Prog\n"
         "  public static method Main(): int\n"
@@ -222,12 +233,12 @@ BEZEL_TEST(codegen_linq_inherited_where_exact_relation_8184,
         "    var c := new Array<int>();\n"
         "    c.Add(5);\n"
         "    c.Add(6);\n"
-        "    t := t + lb.P(c, c);\n"
         "    Console.WriteLine(t);\n"
+        "    Console.WriteLine(lb.P(c, c));\n"
         "    return 0;\n"
         "  end Main;\n"
         "end Prog;\n");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "404003311\n");
+    BEZEL_EXPECT_EQ(r.stdoutText, "3300\n4040|11\n");
 }
