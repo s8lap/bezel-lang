@@ -478,7 +478,7 @@ s7_5_0013	pass
 s7_5_0014	pass	
 s7_5_0016	pass	
 s7_5_0017	pass	
-s7_5_0018	fail	#7130: the `?.` spelling of a string instance method is rejected in codegen, though §7.5 defines it
+s7_5_0018	pass	
 s7_5_0019	pass	
 s7_5_0020	pass	
 s7_5_0021	pass	
