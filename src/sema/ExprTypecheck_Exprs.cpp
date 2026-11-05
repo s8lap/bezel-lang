@@ -11089,11 +11089,24 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 return t && t->kind == TypeRef::Kind::Primitive &&
                        t->primitive == PrimitiveType::String;
             };
-            // fix #7750 (§4.6, v0.355): an operand with NO type is POISONED
-            // (an unresolved type or an unknown member already reported its
-            // error), so "exactly one operand is string" is unknowable; the
-            // cascade `+` error is suppressed.
-            if (lt && rt0 &&
+            // fix #7750 (§4.6, v0.355): after an unresolved type name or an
+            // unknown member the operand is left UNTYPED (or Error-typed) and
+            // its error is already reported, so the `+` error would only be a
+            // cascade (once with no location). But an operand is ALSO left
+            // untyped with NO error at all (a static method group, a namespace
+            // used as a value, a builtin void call), and there this `+` error
+            // is the program's ONLY rejection. So the cascade is suppressed
+            // only when an error has already been reported in this
+            // compilation: every suppression happens in a program that is
+            // already rejected, and an untyped operand with no prior error is
+            // still refused here.
+            auto untyped = [](const TypeRef* t) {
+                return !t || t->kind == TypeRef::Kind::Error;
+            };
+            const bool poisonedOperand =
+                (untyped(lt) || untyped(rt0)) &&
+                ctx_.diagnostics().hasErrors();
+            if (!poisonedOperand &&
                 isStr(lt) != isStr(rt0)) {  // exactly one operand is string
                 ctx_.diagnostics().report(
                     Severity::Error, be.span.begin,
