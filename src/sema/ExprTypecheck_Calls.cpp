@@ -13398,19 +13398,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // and the clause is the lazy block's own — the same one
                     // the `FirstOrNull` arm above reports.
                     //
-                    // SCOPE: the gate decides ADMISSION (§14.2 rule 2 — "decided
-                    // after substitution, at the use"), which is what §15.1
-                    // requires of a conditionally-admitted member. It does NOT
-                    // type the member: `ElementAtOrNull` is documented by
-                    // stdlib §5 but implemented by this compiler on NO receiver
-                    // (MEASURED at the base commit:
-                    // `IEnumerable<int>.ElementAtOrNull(0)` is refused by
-                    // CODEGEN with #2457's "documented but not implemented by
-                    // this compiler"), so the lazy receiver's spelling of it
-                    // keeps its pre-existing (untyped, degraded) behavior over
-                    // an ORDINARY element type — that is the §5
-                    // implementation gap, not a §15.1 question, and this fix
-                    // does not change it.
+                    // fix #8229 (stdlib §5, v0.355): the same arm now TYPES the
+                    // call. MEASURED before: with only the gate, the call stayed
+                    // untyped, so an inferred local (`var v :=
+                    // xs.Where(p).ElementAtOrNull(1)`) took the #2434 default
+                    // slot and `v ?? -1` read garbage even once codegen lowered
+                    // the call. The gate runs first and unconditionally (as
+                    // #8210 had it); the type is formed only when the gate
+                    // admits and the element type is known.
                     else if (m == "ElementAtOrNull" && ce.args.size() == 1) {
                         if (reportOrNullInlineArrayDiag(
                                 ctx_,
@@ -13420,6 +13415,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "type",
                                 ce.span.begin))
                             return;
+                        if (srcElem) {
+                            auto* nullTy = ctx_.makeTypeRef();
+                            *nullTy = *srcElem;
+                            nullTy->nullable = true;
+                            ctx_.setExprType(&ce, nullTy);
+                        }
                     }
                     // fix #3784 (stdlib §5.1, v0.286): MinOrNull()/MaxOrNull()
                     // on a LAZY IEnumerable<T> receiver (e.g. `arr.Where(...)

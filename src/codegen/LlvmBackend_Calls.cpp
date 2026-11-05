@@ -3690,6 +3690,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         m == "Contains" || m == "IndexOf" ||
         // stdlib §5 *OrNull variants (lazy source → materialize, then check):
         m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull" ||
+        // fix #8229 / stdlib §5 (v0.355): ElementAtOrNull(i) is the `T?`
+        // sibling of ElementAt(i) on the same IEnumerable<T> extension block;
+        // a lazy/LinkedList/Range/vtable/Set/string receiver had no arm and
+        // reached the #605/#2434 zero-init degrade (printed 0).
+        m == "ElementAtOrNull" ||
         // fix #3764 / stdlib §5.1 (v0.286): MinOrNull()/MaxOrNull() are the
         // `T?`-returning siblings of Min()/Max() on the SAME
         // `extension IEnumerable<T> where T: IComparable<T>` block — they
@@ -7409,13 +7414,26 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // These are materializing terminals (lazy sources were pre-materialized
         // above into `recv`). The result is T? — for int/record/enum: the tagged
         // {i8 hasValue; T value} struct; for string/class: a nullable pointer.
-        if ((m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull") &&
-            call.args.empty()) {
+        if (((m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull") &&
+             call.args.empty()) ||
+            // fix #8229 / stdlib §5 (v0.355): ElementAtOrNull(i) — the element at
+            // index i as T?, null when i is negative or >= length (where
+            // ElementAt(i) throws IndexOutOfRangeException).
+            (m == "ElementAtOrNull" && call.args.size() == 1 &&
+             call.args[0].value)) {
             llvm::Type* retTy = getElemTy();
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            llvm::Value* eaIdx = nullptr;
             llvm::Value* condV;
-            if (m == "SingleOrNull")
+            if (m == "ElementAtOrNull") {
+                eaIdx = lowerExpr(*call.args[0].value);
+                if (!eaIdx) return nullptr;
+                eaIdx = builder_.CreateSExt(eaIdx, i64());
+                // unsigned compare: negative i becomes huge, so one test covers
+                // both `i < 0` and `i >= len`.
+                condV = builder_.CreateICmpULT(eaIdx, len);
+            } else if (m == "SingleOrNull")
                 condV = builder_.CreateICmpEQ(len, builder_.getInt64(1));
             else
                 condV = builder_.CreateICmpSGT(len, builder_.getInt64(0));
@@ -7429,7 +7447,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
                                    {ptrTy(), i64(), ptrTy(), i64()});
             llvm::Value* idx64;
-            if (m == "LastOrNull") {
+            if (m == "ElementAtOrNull") {
+                idx64 = eaIdx;
+            } else if (m == "LastOrNull") {
                 idx64 = builder_.CreateSub(len, builder_.getInt64(1));
             } else {
                 idx64 = builder_.getInt64(0);
