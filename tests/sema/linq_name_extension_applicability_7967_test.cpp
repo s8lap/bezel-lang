@@ -184,9 +184,9 @@ std::string differentlyNamedExtensionStillWorks() {
 // block-level `where T: INumber<T>` is unsatisfied at T = string), so §26.5.1
 // ranks the user's member as the only APPLICABLE candidate and it answers.
 //
-// BASE (r30-c1 @ ff2855bf): a COMPILE ERROR — "Sum() requires the element
-// type to satisfy `T: INumber<T>` (stdlib §5.1 / spec §2.19 / #4730);
-// `string` does not conform to `INumber<string>`".
+// BASE (r30-c1 @ ff2855bf): a COMPILE ERROR — Sum() rejected the call because
+// `string` does not conform to `INumber<string>` (the interface is declared
+// in stdlib §2.19; #4730).
 // ---------------------------------------------------------------------------
 BEZEL_TEST(sema_linq_name_extension_applicability_7967,
            sum_over_string_elements_answers_the_applicable_extension) {
