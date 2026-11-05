@@ -13425,7 +13425,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // never arity-gated on the terminal arms. Reject both, as the
                 // direct-collection and named-`IEnumerable` receivers already
                 // do; a user extension that applies (§26.5) still resolves.
-                if ((isLazyRecv || isOrderedEnumerableLinqRecv) &&
+                // The gate keys on the TRUE sentinel shape (no importedName,
+                // as `builtinArgIsEnumerableCharSource` spells it):
+                // `isLazyRecv` also matches an IMPORTED builtin collection
+                // (`Set<T>`, `Dictionary<K, V>`, `Channel<T>`, ... rebuilt by
+                // the module loader with its head only in `importedName`),
+                // whose own members (`Add`, `Send`, ...) an imported
+                // declaration keeps in the importer (§2.5).
+                const bool isTrueLazySentinel =
+                    isLazyRecv && recvTy->importedName.empty();
+                if ((isTrueLazySentinel || isOrderedEnumerableLinqRecv) &&
                     !lookupExtensionMember(recvTy, m, nullptr, ce.span.begin,
                                            /*reportAmbiguity=*/false,
                                            static_cast<int>(ce.args.size()))) {
