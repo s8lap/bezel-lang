@@ -124,8 +124,8 @@ BEZEL_TEST(codegen_linq_sum_user_inumber_8223, class_level_generic) {
     BEZEL_EXPECT_EQ(r.stdoutText, "11\n");
 }
 
-// Empty source: the result is the seed, `T.Zero()` (stdlib §5 empty-source
-// rule, §5.1).
+// Empty source: the result is the seed (the stdlib §5 empty-source rule,
+// §5.1), i.e. the zero `INumber<T>` produces (stdlib §2.19).
 BEZEL_TEST(codegen_linq_sum_user_inumber_8223, empty_array_yields_zero_seed) {
     JitResult r = runAotChecked(program(
         "INumber",

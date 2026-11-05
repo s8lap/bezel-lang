@@ -15,7 +15,8 @@
 // #8104.  Spec §26.5 rule 1 (v0.355): "If `x`'s declared type ... declares
 // any instance member named `Foo` ... instance resolution is committed and
 // extension blocks are never consulted for that name on that receiver."
-// stdlib §4.19 declares `ToArray(): owned Array<T>`.  #7756 committed rule 1
+// stdlib §4.19 declares `ToArray()`, which returns an owned
+// `Array<T>` (stdlib §4.4).  #7756 committed rule 1
 // for the factory STUB shape; the ANNOTATED shape
 // (`using var f: FrozenArray<int> := ...`, a declaration-less generic Named)
 // was never committed, so the same-named extension `ToArray(): int` still

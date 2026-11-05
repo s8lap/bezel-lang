@@ -8,7 +8,8 @@
 // generic interface method ... inherits the overridden or implemented
 // declaration's constraints". A method that overrides and implements NOTHING
 // inherits nothing, so its `T` is unconstrained (§14.2 *A type parameter as the
-// type argument*) and the stdlib §5 `Sum()` (`where T: INumber<T>`) is not an
+// type argument*) and the stdlib §5 `Sum()` (whose `T` is bound by
+// `INumber<T>`, stdlib §2.19) is not an
 // applicable candidate on its `Array<T>` receiver: the user's
 // `extension Object { Sum() }` answers (§26.5.1). §12.2: "a `private` base
 // member never blocks ... the derived declaration creates a **distinct
