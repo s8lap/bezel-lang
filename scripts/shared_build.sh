@@ -35,13 +35,20 @@
 # KEY. The MANIFEST records `treekey` = sha1 over `git rev-parse <sha>:<p>` for
 # p in src tests CMakeLists.txt cmake (a missing path counts as "-"). Two
 # commits with the same key build the same binaries (bezelc --version differs:
-# it embeds `git describe`).
+# it embeds `git describe`), so `path --tree` may serve either.
 # The key does not cover the system toolchain (clang/LLVM); the MANIFEST
 # records `toolchain` so a mismatch can be seen.
 #
 # Usage:
 #   shared_build.sh publish [--ref REF] [--keep N]  build+publish REF (default
 #                                 $BEZEL_STAGING_REF, else r30-c1), then prune
+#   shared_build.sh ensure REF    publish REF unless already published (flocked:
+#                                 a concurrent ensure of the same sha WAITS)
+#   shared_build.sh path REF      print the published dir for REF's exact sha;
+#                                 exit 1 if none (never builds)
+#   shared_build.sh path --tree REF   same, but any published sha whose treekey
+#                                 equals REF's qualifies (exact sha preferred)
+#   shared_build.sh treekey REF   print REF's treekey
 #   shared_build.sh list          published builds, newest first
 #   shared_build.sh prune [--keep N]   keep the newest N (default 4); never
 #                                 removes a build a reader holds or one being built
@@ -105,6 +112,15 @@ published_shas() {  # newest first (nanosecond publish time), complete only
     printf '%s %s\n' "${e:-0}" "$s"
   done | sort -k1,1nr | cut -d' ' -f2
 }
+find_by_key() {  # $1 sha (preferred) $2 key -> sha of a published build, or rc 1
+  complete_dir "$1" && { printf '%s\n' "$1"; return 0; }
+  local s
+  for s in $(published_shas); do
+    [ "$(mf_get "$SHARED_ROOT/$s/MANIFEST" treekey)" = "$2" ] && { printf '%s\n' "$s"; return 0; }
+  done
+  return 1
+}
+
 # --- removal (prune / an abandoned partial build) -----------------------------
 remove_build_dir() {  # $1 dir
   local d="$1"
@@ -275,6 +291,29 @@ cmd_publish() {
   printf '%s\n' "$d"
 }
 
+cmd_ensure() {
+  [ $# -eq 1 ] || die "usage: shared_build.sh ensure REF"
+  local sha d; sha="$(need_sha "$1")"
+  if complete_dir "$sha"; then printf '%s\n' "$SHARED_ROOT/$sha"; return 0; fi
+  d="$(publish "$sha")" || exit 1
+  cmd_prune
+  printf '%s\n' "$d"
+}
+
+cmd_path() {
+  local by_tree=0 sha s
+  [ "${1:-}" = "--tree" ] && { by_tree=1; shift; }
+  [ $# -eq 1 ] || die "usage: shared_build.sh path [--tree] REF"
+  sha="$(need_sha "$1")"
+  if [ "$by_tree" = 1 ]; then
+    s="$(find_by_key "$sha" "$(tree_key "$sha")")" || { say "no published build with ${1}'s tree key"; exit 1; }
+  else
+    complete_dir "$sha" || { say "no published build for $1 (${sha:0:12}); publish: scripts/shared_build.sh ensure $1"; exit 1; }
+    s="$sha"
+  fi
+  printf '%s\n' "$SHARED_ROOT/$s"
+}
+
 cmd_list() {
   local s m
   for s in $(published_shas); do
@@ -287,8 +326,11 @@ cmd_list() {
 sub="${1:-}"; shift || true
 case "$sub" in
   publish)     cmd_publish "$@" ;;
+  ensure)      cmd_ensure "$@" ;;
+  path)        cmd_path "$@" ;;
+  treekey)     [ $# -eq 1 ] || die "usage: shared_build.sh treekey REF"; tree_key "$(need_sha "$1")" ;;
   list)        cmd_list ;;
   prune)       cmd_prune "$@" ;;
   ""|-h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-  *) die "unknown subcommand '$sub' (publish|list|prune)" ;;
+  *) die "unknown subcommand '$sub' (publish|ensure|path|treekey|list|prune)" ;;
 esac
