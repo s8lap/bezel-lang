@@ -12685,6 +12685,11 @@ static std::vector<const TypeRef*> builtinInterfaceAncestors(
         ancestors.push_back(makeBuiltin("IList", {T}));
     else if (name == "OwningArray")
         ancestors.push_back(makeBuiltin("IOwningList", {T}));
+    else if (name == "FrozenArray")
+        // fix #8103 (§26.5 rule 2, stdlib §4.19, v0.355): `FrozenArray<T>`
+        // is declared `public class FrozenArray<T>: IEnumerable<T>`, so
+        // `IEnumerable<T>` is its (only) implemented interface.
+        ancestors.push_back(makeBuiltin("IEnumerable", {T}));
     else if (name == "Set" || name == "LinkedList")
         // #1851: Set<T> and LinkedList<T> implement ICollection<T> (mutating
         // borrowing collections, stdlib §4.6/§4.9), not merely
@@ -12754,7 +12759,11 @@ static std::vector<const TypeRef*> builtinInterfaceAncestors(
 static std::vector<const TypeRef*> builtinInterfaceAncestorsOf(
     const TypeRef* recv,
     std::vector<std::unique_ptr<TypeRef>>& owned) {
-    if (!recv || recv->kind != TypeRef::Kind::Named || recv->declaration)
+    if (!recv || recv->kind != TypeRef::Kind::Named) return {};
+    // fix #8103 (§26.5 rule 2, v0.355): the `builtinClassSym` stub a static
+    // factory or built-in call result carries (`FrozenArray<int>.From(a)`)
+    // is the same built-in type as the declaration-less annotation shape.
+    if (recv->declaration && isUserDeclaredTypeSym(recv->declaration))
         return {};
     std::string_view name = namedTypeSimpleName(recv);
     if (name.empty()) return {};
@@ -14517,7 +14526,8 @@ static const TypeRef* extensionFindMatchingAncestor(
         }
     }
     // Walk builtin (null-declaration) receiver's conceptual interface chain.
-    if (recv->kind == TypeRef::Kind::Named && !recv->declaration) {
+    if (recv->kind == TypeRef::Kind::Named &&
+        (!recv->declaration || !isUserDeclaredTypeSym(recv->declaration))) {
         auto builtinAncs = builtinInterfaceAncestorsOf(recv, owned);
         for (const TypeRef* anc : builtinAncs)
             if (extensionTargetMatchesReceiver(target, anc, freeVars))
