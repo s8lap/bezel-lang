@@ -6344,7 +6344,8 @@ TypeRef* ExprTC::buildMethodRefType(const MethodSymbol* ms) {
 // for the #4292 self-call check. No applicability decision is re-derived here,
 // so the set cannot drift from what the lookup actually selected.
 std::vector<MethodSymbol*> ExprTC::methodRefOverloadCandidates(
-    const MethodSymbol* ms, const ast::Expr* refExpr) {
+    const MethodSymbol* ms, const ast::Expr* refExpr,
+    std::vector<std::size_t>* ambiguousArities) {
     std::vector<MethodSymbol*> out;
     if (!ms) return out;
     if (ms->parent) {
@@ -6401,9 +6402,17 @@ std::vector<MethodSymbol*> ExprTC::methodRefOverloadCandidates(
             for (ExtensionSymbol* e : importedExtensions_) gather(e);
         }
         for (std::size_t n : arities) {
+            // fix #8205 (§26.5 rule 4, v0.355): a TIE at this arity is not a
+            // winner. The silent lookup still hands back its error-recovery
+            // fallback (the first of the tied blocks), so the tie is recorded
+            // for the caller: a reference that SELECTS this arity resolves as
+            // the call of this arity does — ambiguously — instead of binding
+            // whichever tied block was declared first.
+            bool tie = false;
             Symbol* found = lookupExtensionMember(
                 recv, ms->name, nullptr, SourceLocation{}, false,
-                static_cast<std::ptrdiff_t>(n));
+                static_cast<std::ptrdiff_t>(n), &tie);
+            if (tie && ambiguousArities) ambiguousArities->push_back(n);
             auto* mm = dynamic_cast<MethodSymbol*>(found);
             if (mm && std::find(out.begin(), out.end(), mm) == out.end())
                 out.push_back(mm);
@@ -6633,10 +6642,35 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
     // first-wins arity selection still honours §22.6 closer-wins. Re-use the
     // existing helper (mirrors `resolveMethodOverload` for plain calls). For an
     // EXTENSION member the set is the block's same-name members instead.
+    std::vector<std::size_t> tiedArities;
     std::vector<MethodSymbol*> overloads =
-        methodRefOverloadCandidates(ms, fromExpr);
+        methodRefOverloadCandidates(ms, fromExpr, &tiedArities);
     if (overloads.size() < 2)
         return MethodRefOverloadResult::SingleOverload;
+
+    // fix #8205 (§27.6 / §26.5 rule 4, v0.355): the receiver-qualified
+    // reference is "the member resolved on the value exactly as the call
+    // `v.Scaled()` is (§26.5)". Where the target selects an arity at which
+    // the extension lookup is a rule-4 tie, the call of that arity is the
+    // "ambiguous extension member" error, so the reference is too — reported
+    // by the lookup itself, at the reference, in the call's own wording.
+    // Before: the tie's fallback bound silently, so two equally specific
+    // blocks were chosen by declaration order (swapping them swapped the
+    // program's output). The winner is still returned (error recovery), so
+    // the §5.1 check adds no second diagnostic.
+    auto reportTieIfSelected = [&](const MethodSymbol* winner) {
+        if (!winner || !winner->extensionDecl) return;
+        const std::size_t n = winner->params.size();
+        if (std::find(tiedArities.begin(), tiedArities.end(), n) ==
+            tiedArities.end())
+            return;
+        const auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(fromExpr);
+        if (!rma || !rma->target) return;
+        if (!methodRefAmbiguityReported_.insert(fromExpr).second) return;
+        lookupExtensionMember(ctx_.exprType(*rma->target), ms->name, nullptr,
+                              fromExpr->span.begin, true,
+                              static_cast<std::ptrdiff_t>(n));
+    };
 
     const std::size_t arity = target->funcParams.size();
 
@@ -6753,6 +6787,7 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
         // declared overload from `lookupMember`). See
         // `setMethodRefSelectedOverload`.
         ctx_.setMethodRefSelectedOverload(fromExpr, exactWinnerMs);
+        reportTieIfSelected(exactWinnerMs);
         return MethodRefOverloadResult::Unique;
     }
     if (convertingWinners.size() == 1) {
@@ -6762,6 +6797,7 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
         // MethodSymbol — every `Unique` return is a §27.6 selection
         // that codegen must honor.
         ctx_.setMethodRefSelectedOverload(fromExpr, convertingWinnerMs[0]);
+        reportTieIfSelected(convertingWinnerMs[0]);
         return MethodRefOverloadResult::Unique;
     }
     if (convertingWinners.size() > 1) {
@@ -15765,7 +15801,9 @@ Symbol* ExprTC::lookupExtensionMember(
     std::vector<std::pair<std::string, TypeRef*>>* outBinding,
     SourceLocation loc,
     bool reportAmbiguity,
-    std::ptrdiff_t arity) {
+    std::ptrdiff_t arity,
+    bool* outAmbiguous) {
+    if (outAmbiguous) *outAmbiguous = false;
     if (!receiver) return nullptr;
     // fix #7763 (§26.5 rule 1, §30.3, §8.1, v0.350): instance members win BY
     // NAME. A task type has no TypeSymbol, so the ordinary member walk cannot
@@ -16626,6 +16664,7 @@ Symbol* ExprTC::lookupExtensionMember(
         }
         ctx_.diagnostics().report(Severity::Error, loc, msg);
     }
+    if (outAmbiguous) *outAmbiguous = true;
     // Error-recovery (mirrors resolveOverload's OverloadOutcome::Ambiguous
     // handling, ExprTypecheck_Calls.cpp): return a deterministic candidate so
     // downstream typing stays best-effort even though compilation fails.

@@ -3194,7 +3194,14 @@ private:
         std::vector<std::pair<std::string, TypeRef*>>* outBinding = nullptr,
         SourceLocation loc = SourceLocation{},
         bool reportAmbiguity = true,
-        std::ptrdiff_t arity = -1);
+        std::ptrdiff_t arity = -1,
+        bool* outAmbiguous = nullptr);
+    // fix #8205 (§26.5 rule 4, §27.6, v0.355): `outAmbiguous`, when given, is
+    // set to whether the lookup reached the rule-4 tie (two or more equally
+    // specific blocks) — the silent `reportAmbiguity=false` probe otherwise
+    // returns the tie's error-recovery fallback indistinguishably from a
+    // unique winner, which is how a method reference over a split overload
+    // set bound by DECLARATION ORDER.
 
     // §26.5 step 1 (v0.183): when an instance member of `name` name-blocks
     // extension lookup for `receiver` and the committed instance call then
@@ -4774,8 +4781,19 @@ private:
     // (`refExpr` = the `v.Name` member access) the extension set is the union
     // of the applicable members of EVERY block the call `v.Name(…)` would
     // consult, not the one block the bare lookup stopped at.
+    //
+    // `ambiguousArities`, when given, receives each parameter count at which
+    // that union's per-arity lookup is a §26.5 rule-4 tie: the member the set
+    // carries at such an arity is the tie's fallback, and selecting it is the
+    // same ambiguity the call `v.Name(…)` of that arity reports.
     std::vector<MethodSymbol*> methodRefOverloadCandidates(
-        const MethodSymbol* ms, const ast::Expr* refExpr = nullptr);
+        const MethodSymbol* ms, const ast::Expr* refExpr = nullptr,
+        std::vector<std::size_t>* ambiguousArities = nullptr);
+    // fix #8205 (§27.6, v0.355): references the no-target / rule-4 method-
+    // reference diagnostics already reported, so a reference reached by two
+    // checks (a call's special-cased argument check and the ordinary §5.1
+    // one) is diagnosed once.
+    std::unordered_set<const ast::Expr*> methodRefAmbiguityReported_;
 
     // §27.6 (v0.355): the function type a method reference over an EXTENSION
     // member forms. The type-qualified (unbound) spelling carries the
