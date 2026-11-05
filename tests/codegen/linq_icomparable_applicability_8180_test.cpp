@@ -31,6 +31,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -157,29 +158,38 @@ BEZEL_TEST(codegen_linq_icomparable_applicability_8180,
 // that inherits from a class which conforms to I"; rule 3: "T is an interface
 // that has I in its extension chain".
 //
-// The spec answer is the §5 `Min()` (the expected stdout below). This tree's
-// §5.1 no-selector gate (#1198 / #3139) still reads the DIRECT base list
-// (`declaresBuiltinInterface`), so it REFUSES these three elements with its
-// own located diagnostic — the pre-existing over-reject (the class/interface
-// twin of #8139, which fixed records), reported by lane r39-fix-8180b. Both
-// arms are therefore pinned exactly: refused by THAT gate diagnostic, or run
-// with the §5 answer. What is never admitted is the extension's 4242.
-// PARENT (737e6d0a): refused by the gate. bbdd4bb8 / dece4010: the extension's
-// `int` answered (review r39-rev-8180 r1b / r1c / r1d: 4242), so `.X` /
-// `.Area()` on it is refused as a member of `int` — neither pinned arm.
+// The spec answer is the §5 `Min()` (the expected stdout below). #8185
+// closed the §5.1 no-selector gate's over-reject (it read the DIRECT base
+// list), so the rows now pin the §5 output ONLY: the gate's refusal is no
+// longer an accepted arm. What is never admitted is the extension's 4242.
 namespace {
 
 void expectSection5MinNotTheExtension(const JitResult& r,
-                                      const std::string& elemName,
+                                      const std::string& /*elemName*/,
                                       const std::string& expectedStdout) {
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "IR verification failed"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, expectedStdout);
+}
+
+// The INTERFACE row only: once the sema gate reads the closure (#8185), the
+// element reaches codegen, whose #2770 guard (`selfComparableIface`, direct
+// bases only) still refuses it -- tracked as #8186. Pinned to exactly that
+// located refusal or the §5 output; the sema gate's own text and the
+// extension's 4242 are no longer accepted.
+void expectSection5MinOrCodegenRefusal8186(const JitResult& r,
+                                           const std::string& expectedStdout) {
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "IR verification failed"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(
+        r, "does not implement IComparable<T>"));
     if (r.ran) {
         BEZEL_EXPECT_EQ(r.exitCode, 0);
         BEZEL_EXPECT_EQ(r.stdoutText, expectedStdout);
         return;
     }
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(
-        r, (elemName + " does not implement IComparable<T>").c_str()));
+        r, "its `CompareTo` could not be resolved for dispatch"));
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
 
@@ -257,5 +267,53 @@ BEZEL_TEST(codegen_linq_icomparable_applicability_8180,
         "      var s1 := new Sq(1);\n"
         "      a.Add(s1);\n"
         "      t := t + a.Min().Area();\n"));
-    expectSection5MinNotTheExtension(r, "IShape", "100\n");
+    expectSection5MinOrCodegenRefusal8186(r, "100\n");
+}
+
+// fix #8185 controls (spec §14.2 *Interface conformance*, v0.355): the gate now
+// reads the base closure, but an element that does NOT reach `IComparable` at
+// all stays refused with the gate's own diagnostic, and so does one that
+// implements only `IEquatable` (a different interface, not an extending one).
+namespace {
+void expectGateRefusal(const std::string& decls, const std::string& elem) {
+    JitResult r = runAot(
+        "module M;\n" + decls +
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    var a := new Array<" + elem + ">();\n"
+        "    var m := a.Min();\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, (elem + " does not implement IComparable<T>").c_str()));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+}
+}  // namespace
+
+BEZEL_TEST(codegen_linq_icomparable_applicability_8180,
+           class_reaching_no_icomparable_stays_refused_by_the_gate_8185) {
+    expectGateRefusal(
+        "public interface IOrd2 end IOrd2;\n"
+        "class K: IOrd2\n"
+        "  public X: int;\n"
+        "  public constructor(x: int)\n"
+        "    X := x;\n"
+        "  end;\n"
+        "end K;\n",
+        "K");
+}
+
+BEZEL_TEST(codegen_linq_icomparable_applicability_8180,
+           class_implementing_only_iequatable_stays_refused_by_the_gate_8185) {
+    expectGateRefusal(
+        "class K: IEquatable<K>\n"
+        "  public X: int;\n"
+        "  public constructor(x: int)\n"
+        "    X := x;\n"
+        "  end;\n"
+        "  public method Equals(other: K): bool => X = other.X;\n"
+        "end K;\n",
+        "K");
 }

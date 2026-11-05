@@ -1079,9 +1079,8 @@ bool ExprTC::currentMethodTypeParamMayInherit(std::string_view n) const {
 //     `Boolean` wrapper deliberately declares no `IComparable`" (spec §3.5);
 //   * a class / interface element with NO `IComparable` anywhere in its
 //     base closure (`inheritsBuiltinInterface`, §14.2 rules 1 and 3 —
-//     fix-forward #8180; the #1198 / #3139 gate below still reads the
-//     direct-only `declaresBuiltinInterface`, a stricter test, so every
-//     element this calls violated the gate also refuses);
+//     fix-forward #8180; the #1198 / #3139 gate reads the same closure
+//     since #8185);
 //   * a USER RECORD that is not `IComparable<Self>` — the SAME
 //     `userRecordSelfComparable` the #8092 gate uses;
 //   * an UNCONSTRAINED type parameter in scope (rule 6, #8181).
@@ -12889,7 +12888,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  ast::TypeDeclKind::Class ||
                              srcElem->declaration->kind ==
                                  ast::TypeDeclKind::Interface))
-                            implIComp = declaresBuiltinInterface(
+                            implIComp = inheritsBuiltinInterface(
                                 srcElem->declaration, "IComparable");
                         // fix #8161 (stdlib §5.1 / §2.8 / §14.2, v0.355): a
                         // RECORD element was NOT gated at all on this path —
@@ -14444,8 +14443,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // whose codegen consequence is the IR-verifier
                                 // failure this check exists to prevent.
                                 bool implIComp = true; // string: always true
-                                // Kept DIRECT, exactly as the base-list scan it
-                                // replaces: only the module boundary changes.
+                                // fix #8185 (spec §14.2 *Interface conformance*
+                                // rules 1 and 3, v0.355): the gate reads the
+                                // base CLOSURE (`inheritsBuiltinInterface`,
+                                // the walk #8180's filter uses), not the direct
+                                // list: a class through an extending interface
+                                // or a generic base, and an interface through
+                                // its chain, conform. Like the filter, a closure
+                                // hit does not follow the type argument.
                                 //
                                 // fix #8092 (stdlib §2.5 / §2.8, spec §14.2,
                                 // v0.355): a BUILT-IN VALUE RECORD element is
@@ -14465,7 +14470,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     elem->declaration &&
                                     !builtinValueRecordElem &&
                                     !userRecordComparable)
-                                    implIComp = declaresBuiltinInterface(
+                                    implIComp = inheritsBuiltinInterface(
                                         elem->declaration, "IComparable");
                                 if (!implIComp) {
                                     ctx_.diagnostics().report(
@@ -15233,7 +15238,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                      ast::TypeDeclKind::Class ||
                                  elem->declaration->kind ==
                                      ast::TypeDeclKind::Interface))
-                                implIComp = declaresBuiltinInterface(
+                                implIComp = inheritsBuiltinInterface(
                                     elem->declaration, "IComparable");
                             // fix #8161 (stdlib §5.1 / §2.8, spec §14.2 /
                             // §14.1, v0.355): a RECORD element is gated by the
