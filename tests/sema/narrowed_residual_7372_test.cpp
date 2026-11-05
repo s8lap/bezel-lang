@@ -187,7 +187,7 @@ BEZEL_TEST(narrowed_residual_7372, long_parse_with_a_null_first_argument_is_refu
         "`Parse(s: ReadOnlyStringSpan): long`, so the `s` argument must be a "
         "`string` — a `Object?` is never implicitly convertible to a `string` "
         "(§5.1's nullable lifting converts a `T` to a `T?`, never the other "
-        "way) (§5.1) — the call is a compile error with no candidates cited (§22.6)");
+        "way) — the call is a compile error with no candidates cited (§22.6)");
 }
 
 // A CLASS INSTANCE reaches no §9.1 parameter either — and before the anchor

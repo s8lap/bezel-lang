@@ -27319,7 +27319,16 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
             // for this family, because every refusal of it says §22.6. The
             // clause is APPENDED (the pinned rows match a prefix or a middle
             // substring of this message, never its whole text).
-            (why.empty() ? "" : " — " + why + " (\xC2\xA7""5.1)") +
+            //
+            // fix #7505: a reason that already NAMES §5.1 (the nullable-lifting
+            // leg) carries the citation itself; the suffix is then dropped, so
+            // ONE §5.1 survives.
+            (why.empty()
+                 ? ""
+                 : " — " + why +
+                       (why.find("§5.1") != std::string::npos
+                            ? ""
+                            : " (\xC2\xA7""5.1)")) +
             " — the call is a compile error with no candidates cited "
             "(§22.6)");
 }
