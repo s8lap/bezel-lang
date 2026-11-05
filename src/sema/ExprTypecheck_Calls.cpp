@@ -13247,11 +13247,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                     }
                     // fix #8210 (§15.1 / §14.2, v0.355): `ElementAtOrNull`
-                    // is the FOURTH member of the `*OrNull` tier over
-                    // `IEnumerable<T>` — stdlib §1's *Conditional members* row
-                    // names all four (`FirstOrNull`, `LastOrNull`,
-                    // `SingleOrNull`, `ElementAtOrNull`), and stdlib §5
-                    // declares it on `IEnumerable<T>` as
+                    // is the FOURTH member of the `*OrNull` tier — stdlib
+                    // §1's *Conditional members* row names all four
+                    // (`FirstOrNull`, `LastOrNull`, `SingleOrNull`,
+                    // `ElementAtOrNull`), and stdlib §5 declares it on
+                    // `IEnumerable<T>` as
                     // `ElementAtOrNull(index: int): T?`. It forms its `T?` at
                     // the ELEMENT type, so on a lazy receiver whose element
                     // type is an inline array it is a conditionally-admitted
