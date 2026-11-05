@@ -63,6 +63,13 @@
 #   scripts/agent_check.sh --probe --asan FILE.bzl    compile+RUN one .bzl under
 #                                                     ASan/LSan with a hang timeout
 #                                                     (for memory/disposal fixes)
+#   scripts/agent_check.sh --use-shared REF ...       any of the above, but with NO
+#                                                     build: run the binaries that
+#                                                     scripts/shared_build.sh
+#                                                     published for REF (read-only
+#                                                     lanes). Refused when this
+#                                                     tree's src/ tests/ differ
+#                                                     from REF. Not with --lit.
 #
 # It NEVER runs the full suite. For whole-suite validation, that is the gate:
 # scripts/gate.sh (coordinator only).
@@ -97,6 +104,56 @@ echo "agent_check: scratch dir: $SCRATCH" >&2
 
 die() { echo "agent_check: $*" >&2; exit 2; }
 [ -x "$DH" ] || die "scripts/dev_heavy.sh not found/executable at $DH"
+
+# --- --use-shared <ref>: run against a PUBLISHED build, with NO build -----------
+# For read-only lanes (reviewers, issue-verifiers): scripts/shared_build.sh
+# publishes bezelc + the test binaries for a commit once, read-only, under
+# /mnt/fast/shared-builds/<sha>/. This flag points BUILD_DIR there and turns
+# every build step into a verify-only step. It REFUSES (exit 3) when this
+# worktree's src/ tests/ CMakeLists.txt cmake differ from <ref> (tracked edits
+# or untracked files): the shared binaries were built from <ref>'s sources, and
+# running them here would test code that is not this tree's.
+# Stripped from ANYWHERE in the args (like --no-lit), before --probe dispatches,
+# so `--probe FILE --use-shared REF` uses the shared bezelc. Without the flag
+# nothing below changes.
+SHARED_MODE=0
+SHARED_REF=""
+_us_args=()
+_next_us=0
+for _a in "$@"; do
+  if [ "$_next_us" = 1 ]; then
+    case "$_a" in -*) die "--use-shared needs a ref before '$_a' (a commit or branch)" ;; esac
+    SHARED_REF="$_a"; _next_us=0; continue
+  fi
+  case "$_a" in
+    --use-shared) _next_us=1 ;;
+    --use-shared=*) SHARED_REF="${_a#--use-shared=}"; [ -n "$SHARED_REF" ] || die "--use-shared= needs a ref" ;;
+    *) _us_args+=("$_a") ;;
+  esac
+done
+[ "$_next_us" = 0 ] || die "--use-shared needs a ref (a commit or branch)"
+set -- "${_us_args[@]}"
+SB="$ROOT/scripts/shared_build.sh"
+if [ -n "$SHARED_REF" ]; then
+  [ -x "$SB" ] || die "--use-shared: $SB not found/executable"
+  _sb_out="$(cd "$ROOT" && "$SB" resolve --worktree "$ROOT" "$SHARED_REF")"; _sb_rc=$?
+  if [ "$_sb_rc" -ne 0 ]; then
+    echo "agent_check: --use-shared $SHARED_REF: no usable shared build (exit $_sb_rc; reason above). Nothing was run." >&2
+    exit "$_sb_rc"
+  fi
+  _sb_get() { printf '%s\n' "$_sb_out" | sed -n "s/^$1=//p" | head -1; }
+  SHARED_DIR="$(_sb_get dir)"
+  # Held (shared) for the whole run: scripts/shared_build.sh prune never
+  # removes a build a reader holds. Re-verify after taking it, since a prune
+  # may have removed the dir between the lookup and the lock.
+  exec {SHARED_LOCK_FD}>"$(_sb_get lock)" && flock -s "$SHARED_LOCK_FD" \
+    || die "--use-shared: cannot take the reader lock $(_sb_get lock)"
+  [ -r "$SHARED_DIR/MANIFEST" ] || die "--use-shared: $SHARED_DIR was pruned before it could be locked; re-run"
+  BUILD_DIR="$(_sb_get build)"
+  [ -d "$BUILD_DIR" ] || die "--use-shared: published build dir $BUILD_DIR is missing"
+  SHARED_MODE=1
+  echo "agent_check: --use-shared $SHARED_REF -> $SHARED_DIR (sha $(_sb_get sha | cut -c1-12), $(_sb_get match) match) — NO build; running the published binaries" >&2
+fi
 
 # --- the per-area test binaries (CMake-generated manifest) --------------------
 # tests/CMakeLists.txt emits build/tests/test_binaries.txt as
@@ -152,6 +209,11 @@ reconfigure() {
 # still-stale or missing binary is a hard failure.
 build_target() {  # $1 = cmake target ; $2 = binary to verify after the build
   local target="$1" bin="$2" core_a="$BUILD_DIR/libbezel_core.a"
+  if [ "$SHARED_MODE" = 1 ]; then   # --use-shared: verify, never build
+    [ -z "$bin" ] || [ -x "$bin" ] || die "--use-shared: published $bin is missing"
+    echo "== agent_check: --use-shared: NOT building $target (published) =="
+    return 0
+  fi
   echo "== agent_check: build $target (dev_heavy, foreground) =="
   reconfigure
   "$DH" build cmake --build "$BUILD_DIR" -j"$JOBS" --target "$target" \
@@ -173,6 +235,22 @@ build_target() {  # $1 = cmake target ; $2 = binary to verify after the build
 build_tests() {
   local target=bezel_tests b n=0
   [ -n "$AREA" ] && target="bezel_tests_$AREA"
+  if [ "$SHARED_MODE" = 1 ]; then   # --use-shared: verify the published binaries, never build
+    # The lit track builds check-lit and writes lit's Output/ into the build
+    # tree, which a published build keeps read-only.
+    [ "${RUN_LIT:-0}" = 1 ] && [ "${NO_LIT:-0}" != 1 ] \
+      && die "--lit cannot run with --use-shared (lit writes into the build tree, which a published build keeps read-only); run --lit in a lane build"
+    [ -r "$MANIFEST" ] || die "--use-shared: published manifest $MANIFEST is missing"
+    [ -z "$AREA" ] || [ -n "$(test_binaries)" ] || die "unknown --area '$AREA'; known areas: $(test_groups)"
+    while IFS= read -r b; do
+      [ -n "$b" ] || continue
+      [ -x "$b" ] || die "--use-shared: published $b is missing"
+      n=$(( n + 1 ))
+    done < <(test_binaries)
+    [ "$n" -gt 0 ] || die "--use-shared: the published manifest is empty ($MANIFEST)"
+    echo "== agent_check: --use-shared: NOT building $target ($n published binar$([ "$n" -eq 1 ] && echo y || echo ies)) =="
+    return 0
+  fi
   if [ -r "$MANIFEST" ]; then
     if [ -n "$AREA" ] && [ -z "$(test_binaries)" ]; then
       die "unknown --area '$AREA'; known areas: $(test_groups)"
@@ -473,7 +551,7 @@ for f in "$@"; do
     # instead of silently running it as a filter substring (which
     # previously could explode scope to nearly a whole area with no
     # indication anything was wrong — see the issue's measured repro).
-    -*) die "'$f' looks like a mistyped or misplaced flag, not a filter — refusing to treat it as one (a gtest suite-or-name substring can never start with '-'). Recognized flags: --area <group>, --lit, --no-lit, --probe, --build-only, --select (see the usage comment at the top of this script). If you meant --area, it must be followed by its group name." ;;
+    -*) die "'$f' looks like a mistyped or misplaced flag, not a filter — refusing to treat it as one (a gtest suite-or-name substring can never start with '-'). Recognized flags: --area <group>, --lit, --no-lit, --probe, --build-only, --select, --use-shared <ref> (see the usage comment at the top of this script). If you meant --area, it must be followed by its group name." ;;
   esac
 done
 

@@ -49,6 +49,14 @@
 #   shared_build.sh path --tree REF   same, but any published sha whose treekey
 #                                 equals REF's qualifies (exact sha preferred)
 #   shared_build.sh treekey REF   print REF's treekey
+#   shared_build.sh check-clean [--worktree DIR] REF
+#                                 exit 3 (with the reason) if DIR's src/ tests/
+#                                 CMakeLists.txt cmake differ from REF's,
+#                                 including untracked files there
+#   shared_build.sh resolve [--worktree DIR] REF
+#                                 check-clean + lookup, for agent_check.sh:
+#                                 prints dir= build= lock= sha= match= lines.
+#                                 exit 1 none, 3 dirty.
 #   shared_build.sh list          published builds, newest first
 #   shared_build.sh prune [--keep N]   keep the newest N (default 4); never
 #                                 removes a build a reader holds or one being built
@@ -119,6 +127,21 @@ find_by_key() {  # $1 sha (preferred) $2 key -> sha of a published build, or rc 
     [ "$(mf_get "$SHARED_ROOT/$s/MANIFEST" treekey)" = "$2" ] && { printf '%s\n' "$s"; return 0; }
   done
   return 1
+}
+
+# --- check-clean: the published binaries were built from <ref>'s sources ------
+check_clean() {  # $1 worktree $2 sha $3 label -> rc 0 clean, 3 dirty (reason on stderr)
+  local wt="$1" sha="$2" label="$3" changed untracked
+  changed="$(git -C "$wt" diff --name-only "$sha" -- "${KEY_PATHS[@]}" 2>/dev/null)"
+  untracked="$(git -C "$wt" ls-files --others --exclude-standard -- "${KEY_PATHS[@]}" 2>/dev/null)"
+  if [ -z "$changed" ] && [ -z "$untracked" ]; then return 0; fi
+  say "REFUSED: $wt differs from $label (${sha:0:12}) in ${KEY_PATHS[*]}."
+  say "  The shared binaries were built from $label's sources, so running them here"
+  say "  would test code that is not the code in this worktree (stale binaries)."
+  [ -z "$changed" ] || { say "  changed vs ${sha:0:12}:"; printf '%s\n' "$changed" | head -10 | sed 's/^/    /' >&2; }
+  [ -z "$untracked" ] || { say "  untracked:"; printf '%s\n' "$untracked" | head -10 | sed 's/^/    /' >&2; }
+  say "  Build normally (drop --use-shared), or commit/clean and use a ref whose tree matches."
+  return 3
 }
 
 # --- removal (prune / an abandoned partial build) -----------------------------
@@ -314,6 +337,41 @@ cmd_path() {
   printf '%s\n' "$SHARED_ROOT/$s"
 }
 
+parse_wt() {  # sets WT and REST from [--worktree DIR] args...
+  WT="$ROOT"; REST=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --worktree) WT="${2:-}"; shift 2 ;;
+      *) REST+=("$1"); shift ;;
+    esac
+  done
+  [ -n "$WT" ] && git -C "$WT" rev-parse --show-toplevel >/dev/null 2>&1 || die "--worktree '$WT' is not a git worktree"
+}
+
+cmd_check_clean() {
+  parse_wt "$@"; [ "${#REST[@]}" -eq 1 ] || die "usage: shared_build.sh check-clean [--worktree DIR] REF"
+  local sha; sha="$(need_sha "${REST[0]}" "$WT")"
+  check_clean "$WT" "$sha" "${REST[0]}"
+}
+
+cmd_resolve() {
+  parse_wt "$@"; [ "${#REST[@]}" -eq 1 ] || die "usage: shared_build.sh resolve [--worktree DIR] REF"
+  local ref="${REST[0]}" label sha s match
+  label="$ref"
+  sha="$(need_sha "$ref" "$WT")"
+  check_clean "$WT" "$sha" "$label" || exit 3
+  s="$(find_by_key "$sha" "$(tree_key "$sha")")" || {
+    say "no published build for $label (${sha:0:12}) or any commit with the same src/tests tree."
+    say "  Publish it first: scripts/shared_build.sh ensure $ref   (or build normally)"
+    exit 1; }
+  if [ "$s" = "$sha" ]; then match=exact; else match=tree; fi
+  echo "dir=$SHARED_ROOT/$s"
+  echo "build=$(mf_get "$SHARED_ROOT/$s/MANIFEST" build_dir)"
+  echo "lock=$LOCKS/$s.use"
+  echo "sha=$s"
+  echo "match=$match"
+}
+
 cmd_list() {
   local s m
   for s in $(published_shas); do
@@ -329,8 +387,10 @@ case "$sub" in
   ensure)      cmd_ensure "$@" ;;
   path)        cmd_path "$@" ;;
   treekey)     [ $# -eq 1 ] || die "usage: shared_build.sh treekey REF"; tree_key "$(need_sha "$1")" ;;
+  check-clean) cmd_check_clean "$@" ;;
+  resolve)     cmd_resolve "$@" ;;
   list)        cmd_list ;;
   prune)       cmd_prune "$@" ;;
   ""|-h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-  *) die "unknown subcommand '$sub' (publish|ensure|path|treekey|list|prune)" ;;
+  *) die "unknown subcommand '$sub' (publish|ensure|path|treekey|check-clean|resolve|list|prune)" ;;
 esac
