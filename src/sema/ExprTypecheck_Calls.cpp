@@ -13414,6 +13414,46 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     !recvTy->declaration &&
                     recvTy->headName() == "IOrderedEnumerable" &&
                     !recvTy->genericArgs.empty() && recvTy->genericArgs[0];
+                // fix #8310 (stdlib §5 / §4.12, §26.5 rule 1, v0.355): the
+                // lazy sentinel and a named `IOrderedEnumerable<T>` declare
+                // exactly stdlib §5's operators plus `GetEnumerator` and the
+                // §8.1 Object members. A call outside that surface was left
+                // UNTYPED (`q.FirstOrDefault()` printed `[0]`, `q.Aggregate(
+                // fold)` an empty line, behind an #2434 / #3079 `internal:`
+                // warning), and a §5 operator called at an arity §5 does not
+                // declare (the seedless `Aggregate(fold)`, `Count(1, 2)`) was
+                // never arity-gated on the terminal arms. Reject both, as the
+                // direct-collection and named-`IEnumerable` receivers already
+                // do; a user extension that applies (§26.5) still resolves.
+                if ((isLazyRecv || isOrderedEnumerableLinqRecv) &&
+                    !lookupExtensionMember(recvTy, m, nullptr, ce.span.begin,
+                                           /*reportAmbiguity=*/false,
+                                           static_cast<int>(ce.args.size()))) {
+                    const bool documented =
+                        bezel::sema::stdlibLinqLookup(m, /*arity=*/-1) !=
+                        nullptr;
+                    if (documented) {
+                        if (!bezel::sema::stdlibLinqMemberMatches(
+                                m, ce.args.size())) {
+                            reportLinqArityMismatch();
+                            return;
+                        }
+                    } else if (m != "OfType" /* #3559's removal arm */ &&
+                               m != "GetEnumerator" && m != "ToString" &&
+                               m != "Equals" && m != "GetHashCode" &&
+                               m != "GetType" && m != "Dispose") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "no member `" + std::string(m) +
+                                "` on `IEnumerable` (stdlib §4.12) -- it is "
+                                "not part of this interface's documented "
+                                "surface (GetEnumerator), a universal "
+                                "`ToString`/`Equals`/`GetHashCode`/`GetType` "
+                                "member (language spec §8.1), or a stdlib §5 "
+                                "LINQ extension operator");
+                        return;
+                    }
+                }
                 if (isLazyRecv || isRangeLinqRecv || isGroupingLinqRecv ||
                     isOrderedEnumerableLinqRecv) {
                     TypeRef* srcElem = isGroupingLinqRecv ? recvTy->genericArgs[1]
