@@ -1,5 +1,6 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "sema/Sendability.hpp"  // #5305: isAggregateChannelElement — §30.14 aggregate channel element
+#include "sema/BuiltinValueTypes.hpp"  // isStdlibGuidType — §2.6's built-in Guid
 #include "common/OwnershipFacts.hpp"  // §30.11: isFreshOwnedClassProducer — the false-path operand gate
 
 namespace bezel::codegen {
@@ -1683,13 +1684,78 @@ bool Emitter::buildSortedObjectKeyIdentity(const sema::TypeRef* keyTy,
 // Signature: int cmp(const void* a, const void* b)
 //   a, b = direct pointers to key bytes (NOT void** of void*).
 // Returns null for unsupported key types (record, decimal, unresolved param).
-// Supported: integer types (i32, i64, i8, i16, i1), float/double.
+// Supported: integer types (i32, i64, i8, i16, i1), float/double, and (fix
+// #8263) the built-in `Guid`, whose §2.6 order is the runtime's
+// `bz_guid_compare` over the 16 canonical bytes.
 // String-key SortedDictionary uses a dedicated bz_sort_kv_str/bz_dict_min_key_str
 // path and does NOT use this comparator.
 llvm::Function* Emitter::buildSortedKeyComparator(const sema::TypeRef* keyTy) {
     if (!keyTy) return nullptr;
     llvm::Type* kllvm = lowerTypeRef(keyTy);
     if (!kllvm) return nullptr;
+
+    // fix #8263 (stdlib §2.6 / §4.17 / §4.18, v0.355): a `Guid` key/element
+    // is stored INLINE as a 16-byte `{i64,i64}` struct (§2.6), so it fits NONE
+    // of the scalar arms below (its LLVM type is a struct, not an integer and
+    // not a float) — and before this arm it fell through to the
+    // `else return nullptr` arm. EVERY consumer of this comparator then
+    // silently degraded:
+    //   * `SortedSet<Guid>` / `SortedDictionary<Guid, V>` iteration fell back
+    //     to the UNSORTED insertion-order snapshot, violating §4.18's
+    //     "iteration in ascending order" and §4.17's "iteration visits
+    //     entries in ascending key order";
+    //   * `.First` / `.Last` / `.FirstKey` / `.LastKey` were REFUSED with a
+    //     diagnostic claiming `Guid` does not implement `IComparable<Guid>`
+    //     — which §2.6 declares it DOES
+    //     (`public record Guid: IComparable<Guid>, IEquatable<Guid>`).
+    //
+    // §2.6's order is "lexicographic over the 16 canonical big-endian bytes",
+    // and the runtime's `bz_guid_compare` IS that comparison: a `memcmp` over
+    // the 16 raw bytes, and those raw bytes ARE the canonical bytes (the
+    // parse path memcpy's the 16 canonical bytes into the struct in order —
+    // `guid_parse_str` in src/runtime/bezel_runtime_decimal_guid.cpp). It is
+    // the SAME function the `Guid.CompareTo` member dispatches to (fix
+    // #8048's own comment records that), so the collection's order and the
+    // member's order cannot drift apart.
+    //
+    // The ABI matches exactly: `bz_sort_kv_gen` / `bz_sort_keys_gen` call
+    // `cmp(a, b)` with `a` / `b` = DIRECT pointers to the key bytes — the
+    // same 16 bytes the hash/equality trampolines read, because the generic
+    // key table stores a `Guid` key as its 16 raw bytes — which is precisely
+    // `bz_guid_compare(const bz_guid_t*, const bz_guid_t*)`'s ABI.
+    //
+    // The internal name is `bz$guidcmp` — THE SAME function the
+    // `Array<Guid>.Sort()` / `Sorted()` path (fix #8237) builds — so a module
+    // that both sorts an `Array<Guid>` and iterates a `SortedSet<Guid>`
+    // emits ONE Guid comparator.
+    //
+    // A NULLABLE `Guid?` is NOT matched (`isStdlibGuidType` excludes it, per
+    // spec §14.2's non-null rule) and is deliberately NOT ordered here: a
+    // `Guid?` element is stored as the nullable CARRIER (`{i8 hasValue;
+    // Guid}`), whose bytes are NOT the Guid's 16 canonical bytes, so
+    // `bz_guid_compare` would compare the flag and the padding. The
+    // `SortedSet<Guid?>` shape is a separate defect (it is admitted although
+    // `Array<Guid?>.Sort()` is refused for the very same bound, and its
+    // membership is broken independently of the order).
+    if (sema::isStdlibGuidType(resolveTypeParamRef(keyTy))) {
+        if (llvm::Function* existing = module_->getFunction("bz$guidcmp"))
+            return existing;
+        auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                          "bz$guidcmp", module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+        // A LOCAL IRBuilder, not `builder_`: this thunk is emitted in the
+        // middle of another function's lowering, and touching `builder_` /
+        // `currentFn_` here would drag `propagateBB_` / `unwindTarget_` with
+        // it (the same hazard `buildObjectCompareToThunk`'s own comment
+        // records).
+        llvm::IRBuilder<> guidB(bb);
+        auto* runtimeCmp =
+            declareC("bz_guid_compare", i32(), {ptrTy(), ptrTy()});
+        guidB.CreateRet(guidB.CreateCall(runtimeCmp,
+                                          {fn->getArg(0), fn->getArg(1)}));
+        return fn;
+    }
 
     // Build a unique name per key LLVM type to cache it per module.
     std::string name = "bz$sdcmp$";
