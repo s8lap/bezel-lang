@@ -1,4 +1,7 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "sema/BuiltinValueTypes.hpp"  // isStdlibGuidType — §2.6's built-in Guid
+                                       // value record (fix #8237; the SAME
+                                       // predicate sema's §4.4 gate consults)
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 #include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #7299/#7300 shared parse guard)
 
@@ -7914,7 +7917,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // TimeSpan by signed ticks, DateOnly by day number, TimeOnly by
             // millisecond-of-day) via the shared value comparator the
             // SortedDictionary key path uses (`buildSortedKeyComparator`).
-            // `Guid` is NOT here (a 128-bit struct; sema keeps refusing it).
+            // `Guid` is NOT here (a 128-bit struct — it gets its own
+            // comparator, the #8237 arm below).
             llvm::Function* temporalCmpFn = nullptr;
             if (elemTR && elemTR->kind == sema::TypeRef::Kind::Named &&
                 !elemTR->nullable) {
@@ -7926,6 +7930,54 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     h7766 == "DateOnly" || h7766 == "TimeOnly")
                     temporalCmpFn = buildSortedKeyComparator(elemTR);
             }
+            // fix #8237 (stdlib §2.6 / §4.4 / §2.8, spec §14.2, v0.355): a
+            // `Guid` element is stored INLINE as a 16-byte `{i64,i64}` STRUCT
+            // (§2.6), so the `bz$intcmp` fallback below (an i32 LOAD out of
+            // that slot) would order it by the LOW HALF of its first word — a
+            // wrong order, not merely a wrong sign. §2.6's order is
+            // "lexicographic over the 16 canonical big-endian bytes", which
+            // is EXACTLY what the runtime's `bz_guid_compare` computes: it
+            // `memcmp`s the 16 raw bytes, and those bytes ARE the canonical
+            // bytes (the parse path memcpy's the 16 canonical bytes into the
+            // struct in order, and `memcmp` compares bytes as UNSIGNED). It is
+            // the SAME comparison `Guid.CompareTo` dispatches to, so the
+            // sort's order and the member's order cannot drift apart.
+            //
+            // The element test is `sema::isStdlibGuidType` — THE SAME
+            // predicate sema's §4.4 admissibility gate consults
+            // (sema/BuiltinValueTypes.hpp). Sema ADMITS the element; codegen
+            // must then ORDER it by §2.6's rule. A codegen that failed to
+            // recognise an admitted `Guid` would fall through to `bz$intcmp`
+            // and answer a WRONG order silently — a worse defect than the
+            // refusal this fixes.
+            //
+            // `bz$guidcmp` is built ONCE per module: the internal name is
+            // the cache key, exactly as `bz$strcmp` is cached in the arms
+            // below.
+            llvm::Function* guidCmpFn = nullptr;
+            if (sema::isStdlibGuidType(resolveTypeParamRef(elemTR))) {
+                auto* guidCmpName = "bz$guidcmp";
+                guidCmpFn = module_->getFunction(guidCmpName);
+                if (!guidCmpFn) {
+                    auto* guidCmpTy = llvm::FunctionType::get(
+                        i32(), {ptrTy(), ptrTy()}, false);
+                    guidCmpFn = llvm::Function::Create(
+                        guidCmpTy, llvm::Function::InternalLinkage,
+                        guidCmpName, module_.get());
+                    auto* guidCmpBB = llvm::BasicBlock::Create(
+                        llvm_, "entry", guidCmpFn);
+                    llvm::IRBuilder<> guidCmpB(guidCmpBB);
+                    // Each argument is a pointer to the ELEMENT SLOT (the 16
+                    // bytes of the `Guid`) — the pointer the qsort comparator
+                    // receives, and the layout `bz_guid_compare` reads.
+                    llvm::Value* guidA = &*guidCmpFn->arg_begin();
+                    llvm::Value* guidB = &*std::next(guidCmpFn->arg_begin());
+                    auto* runtimeCmp = declareC("bz_guid_compare", i32(),
+                                                {ptrTy(), ptrTy()});
+                    guidCmpB.CreateRet(
+                        guidCmpB.CreateCall(runtimeCmp, {guidA, guidB}));
+                }
+            }
             bool isStringElem =
                 !classCompareMs && !ifaceCmpFn && (elemTy2 == ptrTy());
             llvm::Function* cmpFn = nullptr;
@@ -7933,6 +7985,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 cmpFn = ifaceCmpFn;
             } else if (temporalCmpFn) {
                 cmpFn = temporalCmpFn;
+            } else if (guidCmpFn) {
+                cmpFn = guidCmpFn;
             } else if (classCompareMs) {
                 // Class IComparable<T> comparator thunk: dispatches a.CompareTo(b)
                 // via vtable (virtual/override) or direct compiled call otherwise.
@@ -8226,7 +8280,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // TimeSpan by signed ticks, DateOnly by day number, TimeOnly by
             // millisecond-of-day) via the shared value comparator the
             // SortedDictionary key path uses (`buildSortedKeyComparator`).
-            // `Guid` is NOT here (a 128-bit struct; sema keeps refusing it).
+            // `Guid` is NOT here (a 128-bit struct — it gets its own
+            // comparator, the #8237 arm below).
             llvm::Function* temporalCmpFn2 = nullptr;
             if (elemTR2 && elemTR2->kind == sema::TypeRef::Kind::Named &&
                 !elemTR2->nullable) {
@@ -8238,6 +8293,35 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     h7766 == "DateOnly" || h7766 == "TimeOnly")
                     temporalCmpFn2 = buildSortedKeyComparator(elemTR2);
             }
+            // fix #8237 (stdlib §2.6 / §4.4 / §2.8, spec §14.2, v0.355): the
+            // `Sorted()` twin of the `Sort()` arm's #8237 block above — the
+            // SAME comparator, built the SAME way, and the same shared
+            // element predicate (`sema::isStdlibGuidType`). The two arms
+            // differ only in what they do with the comparator (Sort() sorts
+            // the receiver in place, Sorted() sorts a copy), so the ORDER
+            // they impose must not differ — see the `bz$strcmp` pair for the
+            // same house pattern (one body per module, cached by name).
+            llvm::Function* guidCmpFn2 = nullptr;
+            if (sema::isStdlibGuidType(resolveTypeParamRef(elemTR2))) {
+                auto* guidCmpName = "bz$guidcmp";
+                guidCmpFn2 = module_->getFunction(guidCmpName);
+                if (!guidCmpFn2) {
+                    auto* guidCmpTy = llvm::FunctionType::get(
+                        i32(), {ptrTy(), ptrTy()}, false);
+                    guidCmpFn2 = llvm::Function::Create(
+                        guidCmpTy, llvm::Function::InternalLinkage,
+                        guidCmpName, module_.get());
+                    auto* guidCmpBB = llvm::BasicBlock::Create(
+                        llvm_, "entry", guidCmpFn2);
+                    llvm::IRBuilder<> guidCmpB(guidCmpBB);
+                    llvm::Value* guidA = &*guidCmpFn2->arg_begin();
+                    llvm::Value* guidB = &*std::next(guidCmpFn2->arg_begin());
+                    auto* runtimeCmp = declareC("bz_guid_compare", i32(),
+                                                {ptrTy(), ptrTy()});
+                    guidCmpB.CreateRet(
+                        guidCmpB.CreateCall(runtimeCmp, {guidA, guidB}));
+                }
+            }
             bool isStringElem2 =
                 !classCompareMs2 && !ifaceCmpFn2 && (elemTy2 == ptrTy());
             llvm::Function* cmpFn2 = nullptr;
@@ -8245,6 +8329,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 cmpFn2 = ifaceCmpFn2;
             } else if (temporalCmpFn2) {
                 cmpFn2 = temporalCmpFn2;
+            } else if (guidCmpFn2) {
+                cmpFn2 = guidCmpFn2;
             } else if (classCompareMs2) {
                 // Class IComparable<T> comparator thunk. per §14.2 / #1195.
                 //

@@ -9,6 +9,9 @@
 
 #include "common/BuiltinRegistry.hpp"  // isArrayBackedCollectionName/isDictionaryName/isLinkedListName (#2465)
 #include "common/OwnershipFacts.hpp"  // isBorrowBearingRecordOrSpan (§30.1, #1595)
+#include "sema/BuiltinValueTypes.hpp"  // isStdlibGuidType — §2.6's built-in Guid
+                                        // value record (fix #8237; shared with
+                                        // codegen's comparator choice)
 #include "sema/EnumValues.hpp"  // enumDeclaresValue — §5.4's checked enum cast (#3044)
 #include "sema/Formattability.hpp"  // §2.18/§18.5: the shared format-spec
                                    // vocabulary predicate (fix #7333)
@@ -15894,11 +15897,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // the arms above saw the conformance. A user type
                             // of the same name (a real `decl`) keeps the
                             // arms above, and a NULLABLE element never
-                            // satisfies a type bound (§14.2). `Guid` (also
-                            // `IComparable<Guid>`, §2.6) is a 128-bit struct
-                            // whose lowering is not a scalar word, so it keeps
-                            // its pre-existing refusal, as #8049 did for
-                            // `Min()`/`Max()`.
+                            // satisfies a type bound (§14.2).
+                            //
+                            // `Guid` (also `IComparable<Guid>`, §2.6) is NOT
+                            // in this arm — it is a 128-bit struct whose
+                            // lowering is not a scalar word, so it needs its
+                            // own arm (the #8237 arm below) and its own
+                            // codegen comparator.
                             if (!isComparableElem && elemTy472 &&
                                 elemTy472->kind == TypeRef::Kind::Named &&
                                 !elemTy472->nullable &&
@@ -15912,6 +15917,36 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     bn7766 == "TimeOnly")
                                     isComparableElem = true;
                             }
+                            // fix #8237 (stdlib §2.6 / §4.4 / §2.8, spec
+                            // §14.2, v0.355): (e) the BUILT-IN `Guid`.
+                            // stdlib §2.6 declares
+                            //     public record Guid: IComparable<Guid>, IEquatable<Guid>
+                            // with "CompareTo = lexicographic over the 16
+                            // canonical big-endian bytes", so `T = Guid`
+                            // satisfies §4.4's `where T: IComparable<T>` and
+                            // §14.2 admits it ("records ... implementing it").
+                            // `Guid` is a BUILT-IN value record: it carries no
+                            // user TypeDecl, so it has no `baseTypeRefs` and
+                            // the class/record/interface arms above could not
+                            // see its conformance — the same shape #7766
+                            // fixed for §2.5's temporal records. It was
+                            // REFUSED with "Guid does not implement
+                            // IComparable<Guid>" (issue #8237).
+                            //
+                            // ⚠ The predicate is SHARED with codegen
+                            // (`sema::isStdlibGuidType`, sema/
+                            // BuiltinValueTypes.hpp): sema ADMITS the element
+                            // here, and codegen then has to ORDER it by
+                            // §2.6's rule. A codegen that failed to
+                            // recognise an admitted `Guid` would fall through
+                            // to the `bz$intcmp` fallback (an i32 LOAD out of
+                            // a 16-byte value) and sort the array by the low
+                            // half of the Guid's first word — a silent WRONG
+                            // ORDER, worse than the refusal. One definition,
+                            // two sides.
+                            if (!isComparableElem &&
+                                sema::isStdlibGuidType(elemTy472))
+                                isComparableElem = true;
                             if (!isComparableElem) {
                                 // fix #2790: name the form the user actually
                                 // wrote, and point at that form's comparer
