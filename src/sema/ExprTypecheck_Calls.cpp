@@ -2852,15 +2852,26 @@ bool hashableCheckDefers(const TypeRef* t) {
 // block. The PREDICATE is unchanged — `isEqualityBearing`, the one §3.6
 // computation — so a member of the §4 family and the §5 block's member of
 // the same name can never disagree about the element type.
+// fix #7598 (stdlib §4 *Equality search*, spec §14.2 / §9.2, v0.355): the
+// `requirement` parameter names the REQUIREMENT the call is admitted under,
+// in the same way `stdlibCite` names the section that states it — so the §4
+// family can say "requires an element type with a §9.2 first-kind `Equals`"
+// (the condition stdlib §4's *Equality search* actually states) instead of
+// the §5 block's "requires `T: hashable`". The §5 wording names a STRICTER
+// property than §4 imposes, and at a §4 member it is self-contradictory: a
+// function value is NOT hashable (§3.6 clause (e)) yet IS admitted at a §4
+// equality search (§27.7.1: a lambda equals only itself). The default is
+// unchanged, so the §5 block's six operators keep their exact message.
 bool linqHashableCheck(std::string_view m, const TypeRef* srcElem,
                        SourceLocation loc, SemaContext& ctx,
                        const char* stdlibCite = "stdlib \xC2\xA7""5, "
-                                                "proposal 0116 D9") {
+                                                "proposal 0116 D9",
+                       const char* requirement = "requires `T: hashable`") {
     if (hashableCheckDefers(srcElem)) return true;
     if (isEqualityBearing(srcElem, ctx)) return true;
     std::string msg =
-        std::string("operator `") + std::string(m) +
-        "` requires `T: hashable` (\xC2\xA7""14.2; " + std::string(stdlibCite) + ")";
+        std::string("operator `") + std::string(m) + "` " + requirement +
+        " (\xC2\xA7""14.2; " + std::string(stdlibCite) + ")";
     const std::string detail = hashableFailureComponentPath(srcElem, ctx);
     if (!detail.empty()) msg += detail;
     ctx.diagnostics().report(Severity::Error, loc, msg);
@@ -3047,6 +3058,40 @@ std::string igroupingBareMemberReject(std::string_view name) {
 // do not declare `IndexOf` at all (stdlib §4.6/§4.7/§4.10/§4.11) — so the
 // exemption stays confined to `Array`, the head that declares the two
 // members.
+// fix #7598 (stdlib §4 *Equality search*, spec §14.2 / §9.2, v0.355): the
+// two receiver HEADS whose `Contains` IS the stdlib §4 equality-search member
+// — and NOT §5's hashable-block extension operator.
+//
+// stdlib §4.1 declares `method Contains(item: T): bool;` on `ICollection<T>`,
+// and `IList<T>` inherits it (`IList<T>: IReadOnlyList<T>, ICollection<T>`).
+// stdlib §4 names the member: "The members that compare an argument with
+// stored elements by `Equals` are the equality search: `Contains` and
+// `Remove(item)` of `ICollection<T>` and of its implementations here at an
+// unconstrained element type (`Array<T>`, `LinkedList<T>`) …". Per §26.5 rule 1
+// an instance member is resolved BEFORE the §5 extension block is consulted,
+// so at these two heads §5's `where T: hashable` block is not the governing
+// condition; §4's is ("a call is admitted only where the element type,
+// nullability stripped, has a member for the comparison language spec §9.2
+// calls the first kind, `Equals` with an argument of that type").
+//
+// NOT `IReadOnlyList<T>`: it declares NO `Contains` (stdlib §4.1), so its
+// `Contains` IS §5's extension operator and §5's hashable block governs it —
+// a function element type is refused there, and must stay refused.
+//
+// `ICollection<T>` is named here because it is the DECLARING head of the
+// member (stdlib §4.1) and `IList<T>` inherits it — the helper states a
+// fact about the STDLIB, not about the compiler's current receiver set.
+// MEASURED: no verdict changes at the `ICollection` head today, because that
+// head is not a §5 receiver either (it is excluded from the §5 typing path
+// along with `IReadOnlyCollection<T>`) and its `Contains` is fenced at
+// CODEGEN (#853: "`Contains` through a polymorphic collection interface … is
+// not yet supported in codegen") — so the arm is documentary/defensive: if
+// the head is ever admitted to the §5 path, the §4 wording is the right one.
+bool linqEqualitySearchHead(std::string_view colName, std::string_view m) {
+    return m == "Contains" &&
+           (colName == "ICollection" || colName == "IList");
+}
+
 bool linqHashableGateApplies(std::string_view colName, std::string_view m,
                              const TypeRef* srcElem = nullptr) {
     if (colName == "SortedSet" && m == "Contains") return false;
@@ -3058,7 +3103,58 @@ bool linqHashableGateApplies(std::string_view colName, std::string_view m,
         (colName == "Array" || colName == "Stack" || colName == "Queue" ||
          colName == "LinkedList"))
         return false;
+    // fix #7598 (stdlib §4 *Equality search*, spec §14.2 / §9.2, v0.355):
+    // at the two §4 equality-search heads the §5 block's `where T: hashable`
+    // condition does not apply; §4's FIRST-KIND-`Equals` condition does —
+    // and a function value HAS a first-kind `Equals` (§27.7.1: "A lambda
+    // (closure) value equals only itself — reference equality on the closure
+    // instance"), so the search is ADMITTED there exactly as it is at
+    // `Array<T>`.
+    //
+    // Before this the exemption covered only `Array`/`Stack`/`Queue`/
+    // `LinkedList`, so `IList<(int) -> int>.Contains(f)` was refused with §5's
+    // *hashable* message while `ICollection<(int) -> int>.Contains(f)` and
+    // `Array<(int) -> int>.Contains(f)` were admitted — the same §4 member,
+    // three verdicts. The heads are exempt for `Contains` ONLY: neither
+    // `ICollection<T>` nor `IList<T>` declares `IndexOf`/`LastIndexOf`
+    // (stdlib §4.1), so those names are not §4 members.
+    if (linqEqualitySearchHead(colName, m) && searched &&
+        searched->kind == TypeRef::Kind::Function)
+        return false;
     return true;
+}
+
+// fix #7598 (stdlib §4 *Equality search*, spec §14.2 / §9.2, v0.355): the
+// §4-shaped sibling of `linqHashableCheck`. The PREDICATE is the SAME §3.6
+// computation (`isEqualityBearing` — "the constraint adds no second definition
+// of the property"), so a §4 member and a §5 block member of the same name
+// can never disagree about the element type; only the WORDING differs, and it
+// must differ: §5's condition is hashability, while §4's is the §9.2
+// FIRST-KIND `Equals`. A function type is NOT hashable (§3.6 clause (e)) yet
+// IS admitted at a §4 equality search (a lambda equals only itself —
+// §27.7.1), so a "requires `T: hashable`" diagnostic at a §4 member would
+// name a condition the ADMITTED programs fail.
+bool linqEqualitySearchCheck(std::string_view m, const TypeRef* srcElem,
+                             SourceLocation loc, SemaContext& ctx) {
+    // The SAME message producer `linqHashableCheck` is — reached with the
+    // stdlib §4 citation and the stdlib §4 REQUIREMENT named, so the two
+    // families share one predicate AND one message builder and can never
+    // drift apart in either.
+    return linqHashableCheck(m, srcElem, loc, ctx,
+                              "stdlib \xC2\xA7""4 (*Equality search*)",
+                              "requires an element type with a \xC2\xA7""9.2 "
+                              "first-kind `Equals`");
+}
+
+// fix #7598: the §4 family and the §5 block share the PREDICATE but not the
+// WORDING. This is the ONE place that picks between them, so the two can
+// never drift.
+bool linqOperatorCheck(std::string_view colName, std::string_view m,
+                       const TypeRef* srcElem, SourceLocation loc,
+                       SemaContext& ctx) {
+    if (linqEqualitySearchHead(colName, m))
+        return linqEqualitySearchCheck(m, srcElem, loc, ctx);
+    return linqHashableCheck(m, srcElem, loc, ctx);
 }
 
 // #1937 / §14.1 / §2.5: does `rt` structurally reference any of the
@@ -12734,7 +12830,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // unaffected).
                     if (isLinqHashableOperator(m) &&
                         linqHashableGateApplies(colName, m, srcElem) &&
-                        !linqHashableCheck(m, srcElem, ce.span.begin, ctx_))
+                        !linqOperatorCheck(colName, m, srcElem, ce.span.begin,
+                                           ctx_))
                         return false;  // diagnostic reported; do not type
                     // fix #3726 (stdlib §5 `System.Collections.Linq`, v0.286):
                     // arity-gate the lazy LINQ typing arms below. The §5 name
