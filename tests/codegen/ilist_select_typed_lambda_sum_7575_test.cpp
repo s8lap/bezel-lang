@@ -1,7 +1,8 @@
-// Pin test for issue #7575 -- `l.Select(lambda(x: int) => x + 1).Sum()` on an
-// `IList<int>` receiver. stdlib §5 (System.Collections.Linq, v0.355): the
-// lazy `Select` and the eager `Sum` are declared over `IEnumerable<T>`, which
-// `IList<int>` extends (stdlib §4.x), so [1,2,3] -> [2,3,4] -> 9.
+// Pin test for issue #7575 -- `l.Select(lambda(x: int) => x + 1).Sum()` on a
+// receiver typed as the borrowing list interface (stdlib §4.1, v0.355). The lazy
+// `Select` and the eager `Sum` are the Linq operators of stdlib §5
+// (System.Collections.Linq, v0.355), declared over the sequence interface that
+// the list interface extends, so [1,2,3] -> [2,3,4] -> 9.
 //
 // ALREADY FIXED on staging b52409a7 (verified by lane r39-verify-vA); this
 // file only PINS the issue's literal repro (typed lambda parameter). The
