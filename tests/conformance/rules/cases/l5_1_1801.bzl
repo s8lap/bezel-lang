@@ -4,7 +4,7 @@
 //! title: Sum over a skipped sequence folds a user INumber record from its Zero and operator plus
 //! rule: an accumulator over `U.Zero()` and `+`, exactly spec §11.8's own `Sum<T>`
 //!   example
-//! cites: 11.8, 14.2
+//! cites: 5, 11.8, 14.2
 //! expect: run
 //! output: 1300
 //!   zbc

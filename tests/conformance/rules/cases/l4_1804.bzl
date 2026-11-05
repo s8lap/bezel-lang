@@ -7,7 +7,7 @@
 //!   choice that is neither auto-hashable nor declares an `Equals` of its own
 //! cites: 4.1, 9.2
 //! expect: reject
-//! diagnostic: first kind
+//! diagnostic: first-kind
 //! issue: 7598
 module Conf;
 

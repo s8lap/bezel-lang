@@ -4,7 +4,7 @@
 //! title: Sum through nested generic bodies folds a record and leaves the int aggregates unchanged
 //! rule: an accumulator over `U.Zero()` and `+`, exactly spec §11.8's own `Sum<T>`
 //!   example
-//! cites: 11.8, 14.2
+//! cites: 5, 11.8, 14.2
 //! expect: run
 //! output: 11
 //!   6
