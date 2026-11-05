@@ -52,6 +52,28 @@
 // (the declared type names the class, so the static class-disposal path
 // reaches the binding), and the VALUE-typed `Task<int>?` receiver (no
 // disposal obligation at all -- §28.9).
+//
+// THE FIX-FORWARD ROWS (added by the fix-forward of #8137). #8137 made the
+// plain binding OWN the transferred result and taught codegen the SCOPE-END
+// disposal for it, but §28.7's OTHER half -- the drop-on-overwrite -- was
+// still missing: codegen's `disposeDisplacedOwnedClassLocal` gates on
+// `unwindOwnedLocalClass`, which classifies a local by its INITIALIZER FORM
+// (`new C()` / an `owned`-returning call / ...) and did not know the §30.3
+// owned `Result`-read form. So REASSIGNING such a local
+//
+//   var c := t.Result;      // owns the transferred Cell
+//   c := new Cell(7);       // §28.7: the DISPLACED Cell must be disposed
+//
+// leaked the displaced value: MEASURED on 555708b9 (build/bezelc
+// --sanitize=address, 100 iterations), 1600 bytes in 100 allocations, and the
+// class's live counter standing at 100. The fix-forward teaches the
+// drop-on-overwrite gate the SAME shared fact the ownership pass reads
+// (`common::owningTaskResultReadOwnsClassResult`), so the classification and
+// the emitted disposal cannot drift.
+//
+// §28.7 (v0.355): "Assignment to an owned field or owned local disposes the
+// displaced value ... if the previous value is live ... it is disposed; then
+// the new value is stored."
 
 #include <iostream>
 #include <string>
@@ -247,4 +269,142 @@ BEZEL_TEST(owning_task_result_plain_var_8137,
         "      using var t := Mk(); "
         "      _ := t.Result; "));
     expectNoLeak(r, "0\nlive 0\n");
+}
+
+// =====================================================================
+// THE FIX-FORWARD ROWS -- §28.7's DROP-ON-OVERWRITE for a plain `var`
+// bound to an `OwningTask`'s `Result`.
+//
+// Each row REASSIGNS the local that owns the transferred result. §28.7:
+// "Assignment to an owned field or owned local disposes the displaced value
+// ... if the previous value is live ... it is disposed; then the new value is
+// stored." The displaced value is the transferred Cell; the new value is
+// disposed at scope end by the §28.3 auto-drop. So BOTH are disposed exactly
+// once -- the live counter returns to 0 and LeakSanitizer reports nothing.
+//
+// PRE-FIX (555708b9): 1600 bytes leaked in 100 allocations, live counter 100.
+// The rows below FAIL on that arm (the leak assertion and the live counter
+// both go red) and PASS with the fix-forward.
+// =====================================================================
+
+// §28.7 -- the `.` spelling: `var c := t.Result; c := new Cell(7);`.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_dot_result_reassign_disposes_displaced_value_spec_28_7) {
+    JitResult r = runAotChecked(prog(
+        "      using var t := Mk(); "
+        "      var c := t.Result; "
+        "      s := s + c.v; "
+        "      c := new Cell(7); "
+        "      s := s + c.v; "));
+    expectNoLeak(r, "1200\nlive 0\n");
+}
+
+// §28.7 -- the ANNOTATED `.` spelling: `var c: Cell := t.Result;`. The
+// declared type names the class; the disposal obligation and the displaced
+// value are the same as in the unannotated spelling.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_annotated_dot_result_reassign_displaces_spec_28_7) {
+    JitResult r = runAotChecked(prog(
+        "      using var t := Mk(); "
+        "      var c: Cell := t.Result; "
+        "      s := s + c.v; "
+        "      c := new Cell(7); "
+        "      s := s + c.v; "));
+    expectNoLeak(r, "1200\nlive 0\n");
+}
+
+// §7.5 / §28.7 -- the `?.` spelling: `var c := o?.Result; c := new Cell(7);`.
+// The `?.` read yields the NULLABLE of the member type, so the slot may hold
+// null -- over a PRESENT receiver it holds the transferred Cell, and that is
+// the displaced value §28.7 disposes.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_nullcond_result_reassign_displaces_spec_28_7) {
+    JitResult r = runAotChecked(prog(
+        "      using var t := Mk(); "
+        "      var o: OwningTask<Cell>? := t; "
+        "      var c := o?.Result; "
+        "      s := s + (c?.v ?? 0); "
+        "      c := new Cell(7); "
+        "      s := s + (c?.v ?? 0); "));
+    expectNoLeak(r, "1200\nlive 0\n");
+}
+
+// §28.7 / §28.3 -- REASSIGN-THEN-SCOPE-END: the reassignment is the last
+// statement of the binding's scope, so the new value is dead at scope end and
+// the §28.3 auto-drop disposes it there. The displaced (transferred) value
+// was already disposed at the overwrite -- exactly once each.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_dot_result_reassign_then_scope_end_spec_28_7) {
+    JitResult r = runAotChecked(prog(
+        "      using var t := Mk(); "
+        "      var c := t.Result; "
+        "      s := s + c.v; "
+        "      c := new Cell(7); "));
+    expectNoLeak(r, "500\nlive 0\n");
+}
+
+// §28.7 / §30.3 -- the displaced value is ANOTHER TRANSFER: `c := t2.Result;`.
+// The first read's transferred Cell is the displaced value (disposed at the
+// overwrite); the second read's transferred Cell is the new value (disposed at
+// scope end). Two DIFFERENT tasks, so the second read is not the §30.3
+// "second read" that raises InvalidOperationException.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_dot_result_reassign_from_another_result_spec_28_7) {
+    JitResult r = runAotChecked(prog(
+        "      using var t := Mk(); "
+        "      using var t2 := Mk(); "
+        "      var c := t.Result; "
+        "      s := s + c.v; "
+        "      c := t2.Result; "
+        "      s := s + c.v; "));
+    expectNoLeak(r, "1000\nlive 0\n");
+}
+
+// §28.7 -- the CONTROL: the SAME reassignment shape on a NORMAL owned local
+// (`var c := new Cell(5); c := new Cell(7);`). It was already clean (the
+// drop-on-overwrite gate admits the `new`-initializer form), so the fix
+// must leave it exactly as it was: the displaced Cell disposed at the
+// overwrite, the new one at scope end, live counter 0, no leak.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_reassign_of_a_normal_owned_local_control_spec_28_7) {
+    JitResult r = runAotChecked(prog(
+        "      var c := new Cell(5); "
+        "      s := s + c.v; "
+        "      c := new Cell(7); "
+        "      s := s + c.v; "));
+    expectNoLeak(r, "1200\nlive 0\n");
+}
+
+// §21.1 -- the `const` spelling of the same read is a COMPILE ERROR, and this
+// row pins that diagnostic.
+//
+// A runtime `const` local "must not take an owned production" (§21.1, v0.355)
+// -- the binding never takes a disposal obligation, so an owned production
+// bound to it would leak. The `Result` read of an `OwningTask` IS an owned
+// production (§30.3's transfer), so `const c := t.Result;` is rejected.
+//
+// This is the flip #8137 made and did not name: before #8137 the read was a
+// BORROW and the `const` was accepted (and leaked). The diagnostic is the
+// generic §21.1 wording, which names the `using var` remedy. The row is
+// GREEN on 555708b9 (it pins the #8137 behaviour) and stays green with the
+// fix-forward -- the fix-forward does not touch the `const` path.
+//
+// The assertion is on the SPECIFIC message (the §21.1 rule, the local's
+// name, and the `using var` remedy), not merely on "some error", and the
+// program must have been REJECTED (it never ran) -- `runAot` fills the
+// diagnostics only on a reject, so this is the live oracle for the row.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           const_bind_of_owned_task_result_is_rejected_spec_21_1) {
+    JitResult r = runAotChecked(prog(
+        "      using var t := Mk(); "
+        "      const c := t.Result; "));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_FALSE(r.ran);  // rejected before it could run
+    const std::string text = diagnosticText(r);
+    BEZEL_EXPECT_TRUE(text.find(
+        "a `const` local (`c`) must not take an owned production") !=
+        std::string::npos);
+    BEZEL_EXPECT_TRUE(text.find("bind owned values with `using var`") !=
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(text.find("§21.1 / §28.3") != std::string::npos);
 }

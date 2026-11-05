@@ -7937,13 +7937,51 @@ void Emitter::disposeDisplacedOwnedClassLocal(const ast::Expr* target,
     // is never disposed here (no double-free). The scope-end / explicit-dispose
     // path re-loads the slot and disposes the NEW value; here we dispose the OLD
     // one — exactly once each.
+    //
+    // fix-forward #8137 (§28.7 / §30.3, v0.355): the SECOND owned-local form
+    // the gate must admit — the §30.3 OWNED `Result` READ of an `OwningTask`.
+    // §30.3: "reading it on a completed task in an owned-consuming position
+    // transfers ownership of the result to the reader exactly as `await` does
+    // — the result buffer is consumed". A local binding IS an owned-consuming
+    // position, so `var c := t.Result` (and `var c: Cell := t.Result`, and
+    // `var c := o?.Result`) OWNS the transferred class object. The ownership
+    // pass agrees — it classifies the read through the SHARED fact
+    // `common::owningTaskResultReadOwnsClassResult` (src/ownership/
+    // Ownership.cpp's `producerState`), which is why the ownership side
+    // already treats a REASSIGNMENT of such a local as a covered drop-on-
+    // overwrite (`localDropOnOverwriteCovered`) and does NOT raise the §28.3
+    // discharge error.
+    //
+    // But this gate keyed on `unwindOwnedLocalClass`, which classifies a local
+    // by its INITIALIZER FORM (`new C()` / an `owned`-returning call / …) and
+    // does not know the `Result`-read form — so the displaced value was never
+    // disposed here and leaked: MEASURED on 555708b9 (build/bezelc
+    // --sanitize=address, 100 iterations), 1600 bytes in 100 allocations, and
+    // the class's live counter standing at 100. The gate now reads the SAME
+    // shared fact the ownership pass reads, so the classification and the
+    // emitted disposal cannot drift (the #1414 "one fact, one home" rule).
+    //
+    // The gate stays as narrow as it was: a plain LOCAL variable (never a
+    // parameter — a ParameterSymbol is not a LocalDecl — and never a field /
+    // index / static target), whose initializer IS the owned `Result` read.
+    // The `?.` spelling yields the NULLABLE of the member type (§7.5), so the
+    // slot may hold null — the null-guard below skips the disposal on that
+    // path, exactly like the `.` spelling's moved-from slot.
     if (!addr) return;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(target);
     if (!id) return;  // field / index / static target — not a plain local
     auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
     if (!loc) return;  // a parameter (borrow or owned) — excluded
     auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
-    if (!ld || !unwindOwnedLocalClass(ld)) return;  // not an owned plain class local
+    if (!ld) return;  // not a plain `var` local
+    // fix-forward #8137 (§28.7 / §30.3, v0.355) — the owned-`Result`-read
+    // form, beside the initializer-form classifier.
+    bool ownsTransferredResult =
+        ld->initializer && common::owningTaskResultReadOwnsClassResult(
+            ld->initializer.get(), ctx_,
+            [this](const sema::TypeRef* t) { return resolveTypeParamRef(t); });
+    if (!unwindOwnedLocalClass(ld) && !ownsTransferredResult)
+        return;  // not an owned plain class local
     llvm::Value* old = builder_.CreateLoad(elemTy, addr, "reassign.old");
     if (!old->getType()->isPointerTy()) return;
     // Null-guard (a moved-out slot holds null) AND identity-guard (a self-
