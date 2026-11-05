@@ -141,10 +141,31 @@ int32_t bz_datetime_day_of_year(int64_t ticks) {
 
 // Per §2.5: AddYears/AddMonths perform calendar-aware arithmetic.
 // We decompose to components, adjust, then recompose.
+//
+// fix #7777 (stdlib §2.5, v0.355): the DateTime tick domain is
+// [0, 3155378975999999999] -- "`DateTime.MinValue` is `0001-01-01T00:00:00`
+// (`Ticks` 0) and `MaxValue` is the last tick of `9999-12-31` (`Ticks`
+// 3155378975999999999)" -- and "The `Add*` family, `Add`,
+// `Subtract(span: TimeSpan)`, and `DateTime.FromTicks` raise
+// `OverflowException` when the result falls outside `MinValue..MaxValue`".
+// AddYears/AddMonths are CALENDAR arithmetic: a result year outside 1..9999
+// has NO DateTime representation (there is no year 0 and no year 10000), so
+// the helper returns a tick count ONE PAST MaxValue and the caller raises
+// OverflowException on it. The sentinel is the tick part only, so it never
+// collides with the Kind bits (bits 62..63) and never with a representable
+// tick count (the largest representable one is MaxValue - 9999, since the
+// runtime's resolution is a millisecond).
+static const int64_t DT_MAX_TICKS = 3155378975999999999LL;
+
 int64_t bz_datetime_add_years(int64_t ticks, int32_t years) {
     int32_t y, mo, d, h, mi, s, ms;
     bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
-    y += years;
+    // int64 arithmetic: `years` is an int32 and `y + years` overflows an
+    // int32 for a large offset (AddYears(2147483647)).
+    int64_t ny = (int64_t)y + (int64_t)years;
+    if (ny < 1 || ny > 9999)
+        return dtKindBits(ticks) | (DT_MAX_TICKS + 1);
+    y = (int32_t)ny;
     // Clamp Feb 29 in a non-leap year to Feb 28.
     if (mo == 2 && d == 29) {
         bool leap = (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0);
@@ -156,11 +177,17 @@ int64_t bz_datetime_add_years(int64_t ticks, int32_t years) {
 int64_t bz_datetime_add_months(int64_t ticks, int32_t months) {
     int32_t y, mo, d, h, mi, s, ms;
     bz_datetime_ticks_to_parts(ticks, &y, &mo, &d, &h, &mi, &s, &ms);
-    // Convert month to 0-based for arithmetic, then back.
-    int32_t total_months = (y * 12 + (mo - 1)) + months;
-    y  = total_months / 12;
-    mo = total_months % 12 + 1;
-    if (mo <= 0) { mo += 12; y--; }
+    // Convert month to 0-based for arithmetic, then back. int64 arithmetic:
+    // the month index overflows an int32 for a large offset
+    // (AddMonths(2147483647)).
+    int64_t total_months = (int64_t)y * 12 + (int64_t)(mo - 1) + (int64_t)months;
+    int64_t ny = total_months / 12;
+    int64_t nmo = total_months % 12 + 1;
+    if (nmo <= 0) { nmo += 12; ny--; }
+    if (ny < 1 || ny > 9999)
+        return dtKindBits(ticks) | (DT_MAX_TICKS + 1);
+    y = (int32_t)ny;
+    mo = (int32_t)nmo;
     // Clamp day to the last day of the resulting month.
     static const int32_t days_in_month[] =
         {0, 31,28,31,30,31,30,31,31,30,31,30,31};

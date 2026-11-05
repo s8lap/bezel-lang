@@ -8,6 +8,16 @@ extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
 
 namespace bezel::codegen {
 
+// fix #7777 (stdlib §2.5, v0.355): `DateTime.MaxValue`'s tick count -- "the
+// last tick of `9999-12-31` (`Ticks` 3155378975999999999)". The DateTime
+// tick DOMAIN is [0, MaxValue] ("`DateTime.MinValue` is
+// `0001-01-01T00:00:00` (`Ticks` 0)"), and "The `Add*` family, `Add`,
+// `Subtract(span: TimeSpan)`, and `DateTime.FromTicks` raise
+// `OverflowException` when the result falls outside `MinValue..MaxValue`".
+// The same constant is spelled in LlvmBackend_Exprs.cpp, where the `+`/`-`
+// operators are lowered (the two files are the two arms of one rule).
+static constexpr std::int64_t kDateTimeMaxTicks = 3155378975999999999LL;
+
 // fix #7299 / #7300: THE ONE first-argument guard for the `Parse` / `TryParse`
 // arms — defined in LlvmBackend_Calls2.cpp beside the arms it guards there,
 // and shared with THIS file's second copy of those arms (the `Decimal` and
@@ -19800,28 +19810,101 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                             v = builder_.CreateFPExt(v, dbl);
                         return v;
                     };
+                    // fix #7777 (stdlib §2.5, v0.355): the DateTime tick
+                    // DOMAIN. "`DateTime.MinValue` is `0001-01-01T00:00:00`
+                    // (`Ticks` 0) and `MaxValue` is the last tick of
+                    // `9999-12-31` (`Ticks` 3155378975999999999), so every
+                    // valid set of components names a value between them",
+                    // and "The `Add*` family, `Add`, `Subtract(span:
+                    // TimeSpan)`, and `DateTime.FromTicks` raise
+                    // `OverflowException` when the result falls outside
+                    // `MinValue..MaxValue`".
+                    //
+                    // The tick count is carried in bits 0..61 (dtTicksOf), so
+                    // it is never negative and the domain test is an
+                    // UNSIGNED compare against MaxValue.
+                    //
+                    // Helper: `base + delta` in ticks, guarded so the sum
+                    // lands in [0, MaxValue]. The bounds are computed in i64
+                    // -- EXACT, where a double bound would round at these
+                    // magnitudes -- so the admitted sum can never wrap.
+                    auto dtAddChecked = [&](llvm::Value* base,
+                                            llvm::Value* delta) -> llvm::Value* {
+                        llvm::Value* lo = builder_.CreateNeg(base, "dt.add.lo");
+                        llvm::Value* hi = builder_.CreateSub(
+                            builder_.getInt64(kDateTimeMaxTicks), base,
+                            "dt.add.hi");
+                        llvm::Value* inRange = builder_.CreateAnd(
+                            builder_.CreateICmpSGE(delta, lo),
+                            builder_.CreateICmpSLE(delta, hi));
+                        emitGuardThrow(builder_.CreateNot(inRange),
+                                       "OverflowException");
+                        return builder_.CreateAdd(base, delta, "dt.add");
+                    };
+                    // Helper: `base - delta` in ticks, guarded so the
+                    // difference lands in [0, MaxValue]. The span's tick
+                    // count may be ANY i64, so the bounds are stated on the
+                    // DELTA: `base - delta` is in the domain exactly when
+                    // `delta` is in [base - MaxValue, base].
+                    auto dtSubChecked = [&](llvm::Value* base,
+                                            llvm::Value* delta) -> llvm::Value* {
+                        llvm::Value* lo = builder_.CreateSub(
+                            base, builder_.getInt64(kDateTimeMaxTicks),
+                            "dt.sub.lo");
+                        llvm::Value* inRange = builder_.CreateAnd(
+                            builder_.CreateICmpSGE(delta, lo),
+                            builder_.CreateICmpSLE(delta, base));
+                        emitGuardThrow(builder_.CreateNot(inRange),
+                                       "OverflowException");
+                        return builder_.CreateSub(base, delta, "dt.sub");
+                    };
+                    // Helper: is this DateTime's tick count outside the
+                    // domain [0, MaxValue]? Used for the CALENDAR arithmetic
+                    // (AddYears/AddMonths), whose result the runtime cannot
+                    // represent when the year leaves 1..9999: it returns a
+                    // tick count one past MaxValue, which this test rejects.
+                    auto dtTicksOutOfRange = [&](llvm::Value* v) -> llvm::Value* {
+                        return builder_.CreateICmpUGT(
+                            dtTicksOf(v), builder_.getInt64(kDateTimeMaxTicks),
+                            "dt.range");
+                    };
+
                     // Helper: add a double quantity (in ticks) to ticks.
                     auto addDoubleTicks = [&](double ratio) -> llvm::Value* {
                         llvm::Value* qty = arg0dbl();
                         if (!qty) return nullptr;
                         auto* dbl = llvm::Type::getDoubleTy(llvm_);
                         llvm::Value* r = llvm::ConstantFP::get(dbl, ratio);
+                        llvm::Value* prod = builder_.CreateFMul(qty, r, "dt.prod");
+                        // fix #7777 (stdlib §2.5, v0.355): the offset in
+                        // ticks is computed over `double`, and a product that
+                        // is not representable as an i64 tick count (or is
+                        // NaN or infinite) can only produce an out-of-domain
+                        // result -- so it raises OverflowException, and the
+                        // guard keeps the `fptosi` below from converting a
+                        // POISON value.
+                        llvm::Value* lo = llvm::ConstantFP::get(
+                            dbl, -9223372036854775808.0);
+                        llvm::Value* hi = llvm::ConstantFP::get(
+                            dbl, 9223372036854775808.0);
+                        llvm::Value* ok = builder_.CreateAnd(
+                            builder_.CreateFCmpOGE(prod, lo),
+                            builder_.CreateFCmpOLT(prod, hi));
+                        emitGuardThrow(builder_.CreateNot(ok), "OverflowException");
                         llvm::Value* delta = builder_.CreateFPToSI(
-                            builder_.CreateFMul(qty, r), i64(), "dt.delta");
+                            prod, i64(), "dt.delta");
                         // per stdlib §2.5 (#7716): the result keeps the
                         // receiver's Kind.
-                        return dtCompose(
-                            builder_.CreateAdd(dtTicksOf(ticks), delta, "dt.add"),
-                            dtKindBitsOf(ticks));
+                        return dtCompose(dtAddChecked(dtTicksOf(ticks), delta),
+                                         dtKindBitsOf(ticks));
                     };
 
                     // §2.5: DateTime.Add(span: TimeSpan): DateTime
                     if (mname == "Add" && call.args.size() == 1 && call.args[0].value) {
                         llvm::Value* span = arg0i64();
                         if (!span) return nullptr;
-                        return dtCompose(
-                            builder_.CreateAdd(dtTicksOf(ticks), span, "dt.addspan"),
-                            dtKindBitsOf(ticks));
+                        return dtCompose(dtAddChecked(dtTicksOf(ticks), span),
+                                         dtKindBitsOf(ticks));
                     }
                     // §2.5: AddDays/Hours/Minutes/Seconds/Milliseconds(double): DateTime
                     if (mname == "AddDays")         return addDoubleTicks(864000000000.0);
@@ -19836,7 +19919,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         if (!y) return nullptr;
                         if (!y->getType()->isIntegerTy(32)) y = builder_.CreateTrunc(y, i32());
                         auto* fn = declareC("bz_datetime_add_years", i64(), {i64(), i32()});
-                        return builder_.CreateCall(fn, {ticks, y}, "dt.addyears");
+                        llvm::Value* res = builder_.CreateCall(fn, {ticks, y}, "dt.addyears");
+                        // fix #7777 (stdlib §2.5, v0.355): the Add* family
+                        // raises OverflowException when the result falls
+                        // outside MinValue..MaxValue. A result year outside
+                        // 1..9999 has no DateTime representation, so the
+                        // runtime returns a tick count one past MaxValue and
+                        // this range test rejects it.
+                        emitGuardThrow(dtTicksOutOfRange(res), "OverflowException");
+                        return res;
                     }
                     // §2.5: AddMonths(months: int): DateTime — calendar-aware.
                     if (mname == "AddMonths" && !call.args.empty() && call.args[0].value) {
@@ -19844,7 +19935,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         if (!mo) return nullptr;
                         if (!mo->getType()->isIntegerTy(32)) mo = builder_.CreateTrunc(mo, i32());
                         auto* fn = declareC("bz_datetime_add_months", i64(), {i64(), i32()});
-                        return builder_.CreateCall(fn, {ticks, mo}, "dt.addmonths");
+                        llvm::Value* res = builder_.CreateCall(fn, {ticks, mo}, "dt.addmonths");
+                        // fix #7777 (stdlib §2.5, v0.355): as AddYears above.
+                        emitGuardThrow(dtTicksOutOfRange(res), "OverflowException");
+                        return res;
                     }
                     // §2.5: Subtract(other: DateTime): TimeSpan
                     if (mname == "Subtract" && call.args.size() == 1 && call.args[0].value) {
@@ -19854,9 +19948,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         if (!arg) return nullptr;
                         // Subtract(span: TimeSpan): DateTime
                         if (otherIsSpan)
-                            return dtCompose(
-                                builder_.CreateSub(dtTicksOf(ticks), arg, "dt.subspan"),
-                                dtKindBitsOf(ticks));
+                            return dtCompose(dtSubChecked(dtTicksOf(ticks), arg),
+                                             dtKindBitsOf(ticks));
                         // Subtract(other: DateTime): TimeSpan -- tick
                         // difference, neither Kind taking part (#7716).
                         return builder_.CreateSub(dtTicksOf(ticks), dtTicksOf(arg),

@@ -17,6 +17,15 @@ extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
 
 namespace bezel::codegen {
 
+// fix #7777 (stdlib §2.5, v0.355): `DateTime.MaxValue`'s tick count -- "the
+// last tick of `9999-12-31` (`Ticks` 3155378975999999999)". The DateTime tick
+// DOMAIN is [0, MaxValue], and the `Add*` family, `Add`,
+// `Subtract(span: TimeSpan)`, the `+`/`-` operators with a TimeSpan and
+// `DateTime.FromTicks` raise `OverflowException` when the result falls
+// outside it. The same constant is spelled in LlvmBackend_Calls.cpp, where the
+// MEMBER arms are lowered (the two files are the two arms of one rule).
+static constexpr std::int64_t kDateTimeMaxTicks = 3155378975999999999LL;
+
 namespace {
 
 // The §17.14 constant-expression folder resolves an identifier by NAME; this
@@ -12447,14 +12456,68 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 return nullptr;
             if (dtMinusDt)
                 return builder_.CreateSub(dtTicksOf(lv), dtTicksOf(rv), "dt.diff");
+            // fix #7777 (stdlib §2.5, v0.355): the DateTime tick DOMAIN is
+            // [0, MaxValue] -- "`DateTime.MinValue` is `0001-01-01T00:00:00`
+            // (`Ticks` 0) and `MaxValue` is the last tick of `9999-12-31`
+            // (`Ticks` 3155378975999999999)" -- and "The `Add*` family,
+            // `Add`, `Subtract(span: TimeSpan)`, and `DateTime.FromTicks`
+            // raise `OverflowException` when the result falls outside
+            // `MinValue..MaxValue`".
+            //
+            // The `+`/`-` operators with a TimeSpan are the OPERATOR SPELLING
+            // of `Add` / `Subtract(span: TimeSpan)` -- stdlib §2.5's
+            // "Equality and `Kind`" paragraph groups them ("The `Add*`
+            // family, `Add`, `Subtract(span)` and the `+`/`-` operators with
+            // a `TimeSpan` keep the `DateTime` operand's `Kind`") -- so they
+            // raise on the same condition. (Recorded as an interpretation:
+            // the "Parse and range contracts" sentence names the members, not
+            // the operators; issue #7777 names the operators too.)
+            //
+            // The bounds are computed in i64 -- EXACT, where a double bound
+            // would round at these magnitudes -- so an admitted result can
+            // never wrap: `base + delta` is in the domain exactly when
+            // `delta` is in [-base, MaxValue - base], and `base - delta` is
+            // in the domain exactly when `delta` is in
+            // [base - MaxValue, base].
             if (dtOpSpan) {
-                llvm::Value* t = bin.op == "+"
-                    ? builder_.CreateAdd(dtTicksOf(lv), rv, "dt.plus")
-                    : builder_.CreateSub(dtTicksOf(lv), rv, "dt.minus");
+                llvm::Value* base = dtTicksOf(lv);
+                llvm::Value* t = nullptr;
+                if (bin.op == "+") {
+                    llvm::Value* lo = builder_.CreateNeg(base, "dt.plus.lo");
+                    llvm::Value* hi = builder_.CreateSub(
+                        builder_.getInt64(kDateTimeMaxTicks), base, "dt.plus.hi");
+                    llvm::Value* inRange = builder_.CreateAnd(
+                        builder_.CreateICmpSGE(rv, lo),
+                        builder_.CreateICmpSLE(rv, hi));
+                    emitGuardThrow(builder_.CreateNot(inRange),
+                                   "OverflowException");
+                    t = builder_.CreateAdd(base, rv, "dt.plus");
+                } else {
+                    llvm::Value* lo = builder_.CreateSub(
+                        base, builder_.getInt64(kDateTimeMaxTicks), "dt.minus.lo");
+                    llvm::Value* inRange = builder_.CreateAnd(
+                        builder_.CreateICmpSGE(rv, lo),
+                        builder_.CreateICmpSLE(rv, base));
+                    emitGuardThrow(builder_.CreateNot(inRange),
+                                   "OverflowException");
+                    t = builder_.CreateSub(base, rv, "dt.minus");
+                }
                 return dtCompose(t, dtKindBitsOf(lv));
             }
-            return dtCompose(builder_.CreateAdd(lv, dtTicksOf(rv), "dt.plus"),
-                             dtKindBitsOf(rv));
+            // TimeSpan + DateTime -- the same rule, with the DateTime
+            // operand's tick count as the base.
+            {
+                llvm::Value* base = dtTicksOf(rv);
+                llvm::Value* lo = builder_.CreateNeg(base, "dt.plus.lo");
+                llvm::Value* hi = builder_.CreateSub(
+                    builder_.getInt64(kDateTimeMaxTicks), base, "dt.plus.hi");
+                llvm::Value* inRange = builder_.CreateAnd(
+                    builder_.CreateICmpSGE(lv, lo),
+                    builder_.CreateICmpSLE(lv, hi));
+                emitGuardThrow(builder_.CreateNot(inRange), "OverflowException");
+                return dtCompose(builder_.CreateAdd(base, lv, "dt.plus"),
+                                 dtKindBitsOf(rv));
+            }
         }
     }
     // §11.8 (v0.176, #807): constraint-operator dispatch — sema resolved this
