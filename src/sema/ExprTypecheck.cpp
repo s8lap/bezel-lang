@@ -6866,7 +6866,34 @@ bool ExprTC::reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
     if (!ms->parent && !ms->extensionDecl) return false;
 
     std::vector<MethodSymbol*> overloads = methodRefOverloadCandidates(ms, initExpr);
+    // fix #8205 (§27.6 / §14.5, v0.355): the list rule decides which
+    // candidates take part BEFORE ambiguity is judged — "with a list, only
+    // candidates declaring that many type parameters of their own take part
+    // ...; without one, only candidates declaring none take part" (the same
+    // filter `selectMethodRefOverload` applies). So `v.Len` over `Len(): int`
+    // and `Len<T>(x: T): int` has ONE candidate and is not ambiguous. Before:
+    // the generic overload was counted, and `var f := v.Len;` /
+    // `Console.WriteLine(v.Len)` were refused as having no target to select
+    // by. Where every candidate is generic the set is empty and the
+    // generic-reference-without-a-list error reports instead.
+    {
+        std::size_t listSize = 0;
+        if (auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(initExpr))
+            listSize = rma->typeArgs.size();
+        else if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(initExpr))
+            listSize = rid->typeArgs.size();
+        overloads.erase(
+            std::remove_if(overloads.begin(), overloads.end(),
+                           [&](const MethodSymbol* ov) {
+                               return ov->genericParams.size() != listSize;
+                           }),
+            overloads.end());
+    }
     if (overloads.size() < 2) return false;
+    // fix #8205 (§27.6, v0.355): one report per reference — a reference can
+    // reach this rule from two checks (a call's special-cased `Object`
+    // argument and the ordinary §5.1 one).
+    if (!methodRefAmbiguityReported_.insert(initExpr).second) return true;
 
     // Build the candidates' signatures for the diagnostic.
     std::string sigs;

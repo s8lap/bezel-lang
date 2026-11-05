@@ -341,3 +341,47 @@ BEZEL_TEST(sema_method_ref_overload_residual_8205,
         "end C;\n",
         "205\n1\n");
 }
+
+// ── F2 (review of 7584c270): the §14.5 list rule decides the candidates ─────
+//
+// SPEC §27.6 (v0.355), *References to generic methods*: "Overload selection
+// follows §14.5's list rule: with a list, only candidates declaring that many
+// type parameters of their own take part ...; without one, only candidates
+// declaring none take part". `v.Len` over `Len(): int` and `Len<T>(x: T): int`
+// therefore has ONE candidate and no ambiguity.
+
+namespace {
+
+std::string genericMain(const std::string& body) {
+    return std::string("module M;\n"
+                       "class V\n"
+                       "  public constructor() end constructor;\n"
+                       "  public method Len(): int => 42;\n"
+                       "  public method Len<T>(x: T): int => 7;\n"
+                       "end V;\n"
+                       "class C\n"
+                       "  public static method Main(): int\n"
+                       "    var v := new V();\n"
+                       "    ") +
+           body + "\n"
+                  "    return 0;\n"
+                  "  end Main;\n"
+                  "end C;\n";
+}
+
+}  // namespace
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           generic_overload_does_not_take_part_without_a_list_writeline) {
+    // per §27.6 / §14.5 (v0.355): review probe p04
+    expectCheckedStdout(genericMain("Console.WriteLine(v.Len);"),
+                        "() -> int\n");
+}
+
+BEZEL_TEST(sema_method_ref_overload_residual_8205,
+           generic_overload_does_not_take_part_without_a_list_var) {
+    // per §27.6 / §14.5 (v0.355): review probe p23
+    expectCheckedStdout(genericMain("var f := v.Len;\n"
+                                    "    Console.WriteLine(f());"),
+                        "42\n");
+}
