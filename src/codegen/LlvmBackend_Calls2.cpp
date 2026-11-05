@@ -4258,6 +4258,7 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
         locals_[id] = slot;
         if (loc && loc->decl) locals_[loc->decl] = slot;
         registerOutVarStringRelease(*id, loc, ms, pos, slot);
+        if (!ms) registerBuiltinOutVarStringRelease(call, *id, pos, slot);
         // fix #3842 (§22.4, v0.289 L2; §28.3, §28.11): `out owned var x` is
         // RETIRED, and `out var x` is now the sole inline owned form — it
         // ADOPTS the classification the callee's declaration announces, so at
@@ -4416,6 +4417,25 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
 // this slot is READ BACK after the release: the recipient's alloca is entry-
 // block hoisted, so the next iteration of an enclosing loop has the callee load
 // it to release what it displaces. See that flag's comment.
+// fix #8268: see the declaration in LlvmBackend_impl.hpp.
+void Emitter::registerBuiltinOutVarStringRelease(const ast::CallExpr& call,
+                                                 const ast::IdentifierExpr& id,
+                                                 std::size_t pos,
+                                                 llvm::AllocaInst* slot) {
+    if (!slot || disposeStack_.empty()) return;                    // gate 5
+    if (currentFn_ != stringReleaseEligibleFn_) return;            // gate 3
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || (ma->member != "TryPop" && ma->member != "TryDequeue")) return;
+    if (!isBuiltinTryOutStringSlot(call.callee.get(), pos, ctx_)) return;
+    outVarOwnedStringRecipients_.insert(static_cast<const void*>(&id));
+    if (!outVarStringReleaseEligible(&id)) return;                 // gate 4
+    mapSuspendLocalSlot(&id, slot);
+    Disposal d{slot, nullptr};
+    d.stringRelease = true;
+    d.nullSlotAfterRelease = true;
+    disposeStack_.back().push_back(d);
+}
+
 void Emitter::registerOutVarStringRelease(const ast::IdentifierExpr& id,
                                           const sema::LocalSymbol* loc,
                                           const sema::MethodSymbol* ms,

@@ -16352,6 +16352,66 @@ llvm::Value* Emitter::resolveBuiltinOutArg(
     return resolveOutAddrWithBracket(*a.value, outTy, sink);
 }
 
+// fix #8268 (stdlib §4.8 / §4.11; spec §22.3, §28.9, v0.355): see the
+// declaration in LlvmBackend_impl.hpp.
+//
+// THE DEFECT. `Dictionary<K, string>.TryGetValue(k, out v)` (and the
+// SortedDictionary twin, and `Stack<string>` / `Queue<string>` `TryPeek`) wrote
+// the table's stored pointer into `v`'s slot with a PLAIN store: no retain of
+// the new value, no release of the displaced one. Stdlib §4.8 makes that out a
+// read of the stored value — the table keeps its own reference — and §22.3
+// makes the write a copy-out to the recipient. For a pre-declared `var v:
+// string?` local that slot OWNS a reference (armStringLocalRefcount's bind-time
+// retain, released at scope end), so the scope-end release dropped the
+// table's reference and the table's own release then aborted with "refcount
+// over-release (string)". The inline `out var v` spelling was balanced only
+// because its slot owns nothing (registerOutVarStringRelease's gate 1 declines
+// a builtin callee) and gets no scope-end release. The transferring siblings
+// (`TryPop`, `TryDequeue`) were balanced for the new value, which carries the
+// collection's moved reference, but leaked the displaced one.
+//
+// THE PREDICATE mirrors the assignment statement's string-store dispatch
+// (LlvmBackend_Stmts.cpp: lowerStringFieldStore, then lowerStringLocalReassign
+// gated on the analyzed function, then lowerStringRefParamStore), so an out
+// write into a recipient is balanced exactly when `v := <read>` into it is.
+bool Emitter::tryOutTargetOwnsStringRef(const ast::Expr& target) {
+    if (!isStringExprType(target)) return false;
+    // lowerStringFieldStore: a CLASS string field / auto-property storage.
+    if (isStringFieldLvalue(target)) return true;
+    // lowerStringLocalReassign: a string local / by-value parameter slot.
+    if (localSlot(target)) {
+        if (currentFn_ != stringReleaseEligibleFn_) return false;
+        return !isNullableStringExprType(target) ||
+               stringLocalSlotOwnsRef(target);
+    }
+    // lowerStringRefParamStore: an enclosing `ref`/`out` string parameter,
+    // whose caller-side slot owns the reference.
+    if (!dynamic_cast<const ast::IdentifierExpr*>(&target)) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    return sym && refParams_.find(sym) != refParams_.end();
+}
+
+llvm::Value* Emitter::beginTryOutStringWrite(
+    const ast::CallArgument& a, llvm::Value* outAddr, llvm::Type* outTy,
+    const std::vector<AccessorRefArg>& sink) {
+    if (a.isDiscard || !a.value || a.modifier != "out") return nullptr;
+    if (!outAddr || !outTy || !outTy->isPointerTy() || !sink.empty())
+        return nullptr;
+    if (!tryOutTargetOwnsStringRef(*a.value)) return nullptr;
+    return builder_.CreateLoad(ptrTy(), outAddr, "tryout.str.old");
+}
+
+void Emitter::finishTryOutStringWrite(llvm::Value* outAddr,
+                                      llvm::Value* oldVal, bool borrowed) {
+    if (!outAddr || !oldVal) return;
+    // Retain-before-release, as every string slot store does, so a recipient
+    // that already held the very value read keeps it alive across the pair.
+    if (borrowed)
+        emitStringRetain(
+            builder_.CreateLoad(ptrTy(), outAddr, "tryout.str.new"));
+    emitStringRelease(oldVal);
+}
+
 llvm::Type* Emitter::tryOutNullableSlotTy(const sema::TypeRef* elem) {
     if (!elem) return ptrTy();
     sema::TypeRef nn = *elem;

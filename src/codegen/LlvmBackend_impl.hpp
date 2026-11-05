@@ -317,6 +317,41 @@ inline bool isBuiltinDictionaryTypeRef(const sema::TypeRef* rt) {
     return common::isDictionaryName(rt->headName());
 }
 
+// fix #8268 (stdlib §4.8 / §4.11; spec §22.3, §28.9, v0.355): is argument
+// `i` of the call whose callee is `callee` the `out` slot of a builtin
+// collection `Try*` whose out-write Emitter::beginTryOutStringWrite /
+// finishTryOutStringWrite balance at a `string` element — `TryGetValue`'s
+// value slot (index 1) on a builtin Dictionary / OwningDictionary /
+// SortedDictionary at a `string` / `string?` V, or `TryPeek` / `TryPop` /
+// `TryDequeue`'s item slot (index 0) on a builtin `Stack` / `Queue` at a
+// `string` / `string?` T? Those are exactly the receivers the Calls.cpp
+// TryGetValue (`isDict` block) and Stack/Queue `Try*` arms lower. Shared by
+// the StringEscapeWalker, which may then treat a pre-declared string local
+// named there as written-and-balanced rather than escaped.
+inline bool isBuiltinTryOutStringSlot(const ast::Expr* callee, std::size_t i,
+                                      const sema::SemaContext& ctx) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return false;
+    const sema::TypeRef* rt = ctx.exprType(*ma->target);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    auto isStringArg = [&](std::size_t g) {
+        const sema::TypeRef* a =
+            g < rt->genericArgs.size() ? rt->genericArgs[g] : nullptr;
+        return a && a->kind == sema::TypeRef::Kind::Primitive &&
+               a->primitive == sema::PrimitiveType::String;
+    };
+    const std::string_view head = rt->headName();
+    if (common::isDictionaryName(head))
+        return ma->member == "TryGetValue" && i == 1 && isStringArg(1);
+    if (head == "Stack" || head == "Queue")
+        return i == 0 && isStringArg(0) &&
+               (ma->member == "TryPeek" ||
+                (head == "Stack" ? ma->member == "TryPop"
+                                 : ma->member == "TryDequeue"));
+    return false;
+}
+
 // fix #4322 (§9.7 "Records and disposal" / §28.3 / §28.9, v0.298): does
 // METHOD `ms`'s declared return type provably embed a plain string ARGUMENT
 // unretained — a Named Record/Choice return (the #4254 channel), or an
@@ -24741,6 +24776,29 @@ private:
     // `{i8,T}` struct for a value instantiation, a nullable pointer for a
     // class one) — what ensureOutVarSlots gives an `out var` recipient (#1336).
     llvm::Type* tryOutNullableSlotTy(const sema::TypeRef* elem);
+    // fix #8268 (stdlib §4.8 / §4.11; spec §22.3, §28.9, v0.355): the
+    // string refcount balance of a builtin collection `Try*` out-write into a
+    // PRE-DECLARED recipient. Such a write is §22.3's copy-out, an ordinary
+    // assignment to the recipient, so a recipient slot that owns an
+    // independent reference for its value (the slots the assignment
+    // statement's lowerStringFieldStore / lowerStringLocalReassign /
+    // lowerStringRefParamStore balance) must keep owning exactly one.
+    // `beginTryOutStringWrite` is called BEFORE the builtin's first store into
+    // `outAddr`: it returns the displaced value when the target is such a slot
+    // (and the write is not an accessor bracket — `sink` non-empty — whose
+    // setter does its own balance), else null. `finishTryOutStringWrite`, at
+    // the merge block after the last store, releases that displaced value
+    // and, for a BORROWING out (`TryGetValue`, `TryPeek`), retains the value
+    // now in the slot; a TRANSFERRING out (`TryPop`, `TryDequeue`) already
+    // moved the collection's reference into the slot. No-op on a null
+    // `oldVal`. Inline `out var` recipients and discards are never admitted.
+    llvm::Value* beginTryOutStringWrite(const ast::CallArgument& a,
+                                        llvm::Value* outAddr,
+                                        llvm::Type* outTy,
+                                        const std::vector<AccessorRefArg>& sink);
+    void finishTryOutStringWrite(llvm::Value* outAddr, llvm::Value* oldVal,
+                                 bool borrowed);
+    bool tryOutTargetOwnsStringRef(const ast::Expr& target);
     // fix #5289 (§22.6 "out _", §28.3 "Unbound owned temporaries"): against an
     // `out owned T` formal the discarded value is an unbound owned temporary
     // disposed at the end of the full statement. A builtin `Try*` that wrote an
@@ -26261,6 +26319,20 @@ private:
                                      const sema::LocalSymbol* loc,
                                      const sema::MethodSymbol* ms,
                                      std::size_t pos, llvm::AllocaInst* slot);
+
+    // fix #8268 (stdlib §4.11; spec §22.4, §28.9, v0.355): the BUILTIN twin
+    // of `registerOutVarStringRelease`. `s.TryPop(out var v)` /
+    // `q.TryDequeue(out var v)` on a `Stack<string>` / `Queue<string>` MOVES
+    // the removed element's reference into the inline recipient, which then
+    // owns it — the same shape a user method's `out` string formal leaves —
+    // but gate 1 (no MethodSymbol) registered no scope-end release, so the
+    // moved reference leaked while the pre-declared spelling of the same call
+    // released it. Same gates 3/4/5 as the user-method form; TryPeek's and
+    // TryGetValue's out is a BORROW and registers nothing.
+    void registerBuiltinOutVarStringRelease(const ast::CallExpr& call,
+                                            const ast::IdentifierExpr& id,
+                                            std::size_t pos,
+                                            llvm::AllocaInst* slot);
 
     // fix #3305 / §22.4 / §22.3 / §28.9 (v0.268): constructor analogue of
     // `registerOutVarStringRelease` (above) — same five gates, same Disposal

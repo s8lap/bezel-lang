@@ -32489,6 +32489,25 @@ struct StringEscapeWalker {
                         safeArg = true;
                 }
             }
+            // fix #8268 (stdlib §4.8 / §4.11; spec §22.3, §28.9, v0.355): the
+            // BUILTIN twin of the #3304 arm above. A pre-declared `string` /
+            // `string?` recipient named as the `out` slot of a builtin
+            // Dictionary `TryGetValue` or Stack/Queue `TryPeek` / `TryPop` /
+            // `TryDequeue` is a WRITE into the recipient's slot, not an
+            // escape: Emitter::beginTryOutStringWrite / finishTryOutStringWrite
+            // balance that write (retain a borrowed read, move a removed
+            // element, release the displaced value), so the slot ends the call
+            // holding exactly one reference no other party owns — the shape
+            // the scope-end release discharges. Without this arm the walk
+            // tainted the local ESCAPED, its scope-end release never armed,
+            // and the balanced write's reference leaked (and an escaping
+            // producer local's `v ?? x` read was taken as a transfer of the
+            // slot's +1, so the next write's release-old over-released).
+            if (!safeArg && stringReleaseMode && !a.isDiscard &&
+                a.modifier == "out" && a.name.empty() &&
+                isTargetIdent(a.value.get()) &&
+                isBuiltinTryOutStringSlot(callee, i, ctx))
+                safeArg = true;
             // fix #5275 (§22.3 / §28.9, v0.313): the `ref` sibling of the #3304
             // arm above, and the answer to the objection that arm records
             // against `ref` ("a `ref` callee reads the caller's slot via a

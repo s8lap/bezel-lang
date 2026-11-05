@@ -10050,6 +10050,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // instantiation a nullable pointer. On the FALSE (empty) path the
             // slot is assigned null; on the TRUE path the extracted value.
             const bool isValTy = tryOutIsNullableValue(recvTy, 0);
+            // fix #8268 (stdlib §4.11, §22.3, §28.9, v0.355): a pre-declared
+            // string recipient that owns its value releases the displaced one;
+            // TryPeek's out is a borrow (retained below), TryPop/TryDequeue
+            // move the collection's reference into the slot.
+            llvm::Value* tpStrOld =
+                beginTryOutStringWrite(call.args[0], outAddr, outTy, outArgs);
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv}, "trypop.len");
             // False-path null: store null now (the found path overwrites it).
@@ -10105,6 +10111,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phi = builder_.CreatePHI(i1(), 2, "trypop.r");
             phi->addIncoming(builder_.getTrue(), foundBB);
             phi->addIncoming(builder_.getFalse(), preBB);
+            finishTryOutStringWrite(outAddr, tpStrOld,
+                                    /*borrowed=*/m == "TryPeek");
             // fix #5289 (§22.6 "out _", §28.3): the discarded `out owned` value is an
             // unbound owned temporary — dispose it (null-guarded) after the call.
             if (call.args[0].isDiscard)
@@ -12447,6 +12455,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     return nullptr;
                 }
             }
+            // fix #8268 (stdlib §4.8, §22.3, §28.9, v0.355): the out is a READ
+            // of the stored value; a pre-declared recipient slot that owns its
+            // string keeps owning one (retain the read, release the displaced).
+            llvm::Value* tgStrOld =
+                beginTryOutStringWrite(call.args[1], outAddr, outTy, outArgs);
             // bz_dict_try_get_* writes the stored void* into *tmpSlot.
             // For pointer values: the void* IS the string/object pointer.
             // For integer/float values: the void* encodes the value via
@@ -12514,6 +12527,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(coerceToNullableSlot(outTy, dv), outAddr);
             builder_.CreateBr(tgEndBB);
             builder_.SetInsertPoint(tgEndBB);
+            finishTryOutStringWrite(outAddr, tgStrOld, /*borrowed=*/true);
             // fix #2938 / §22.3: flush any bracket on the normal-return edge.
             // The TryGetValue path never throws, so emit is always true.
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
