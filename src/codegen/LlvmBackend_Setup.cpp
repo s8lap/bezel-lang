@@ -1482,8 +1482,7 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
                     return arg;
                 if (arg->astNode && arg->astNode->name &&
                     arg->astNode->name->parts.size() == 1) {
-                    auto it = genericSubstSemaTy_.find(
-                        arg->headName());
+                    auto it = substSemaFind(arg);
                     if (it != genericSubstSemaTy_.end() && it->second)
                         return it->second;
                 }
@@ -27786,7 +27785,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     if (tt && tt->kind == sema::TypeRef::Kind::Named &&
                         !tt->declaration && tt->astNode && tt->astNode->name &&
                         tt->astNode->name->parts.size() == 1) {
-                        auto sit = genericSubstSemaTy_.find(tt->headName());
+                        auto sit = substSemaFind(tt);
                         if (sit != genericSubstSemaTy_.end() && sit->second) {
                             const sema::TypeRef* concrete = sit->second;
                             using K = sema::TypeRef::Kind;
@@ -28904,7 +28903,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                             !recvTy->declaration && recvTy->astNode &&
                             recvTy->astNode->name &&
                             recvTy->astNode->name->parts.size() == 1) {
-                            auto sit = genericSubstSemaTy_.find(recvTy->headName());
+                            auto sit = substSemaFind(recvTy);
                             if (sit != genericSubstSemaTy_.end() && sit->second)
                                 concrete = sit->second;
                         }
@@ -49217,7 +49216,7 @@ bool Emitter::usingVarIsMovedClassObject(const ast::LocalDecl* ld) {
         rt->declaration == nullptr && !genericSubstSemaTy_.empty() &&
         rt->astNode && rt->astNode->name &&
         rt->astNode->name->parts.size() == 1) {
-        auto it = genericSubstSemaTy_.find(rt->headName());
+        auto it = substSemaFind(rt);
         if (it != genericSubstSemaTy_.end())
             return isClassOrInterfaceRef(it->second);
     }
@@ -51292,8 +51291,7 @@ const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
                     if (!genericSubstSemaTy_.empty() && rt->astNode &&
                         rt->astNode->name &&
                         rt->astNode->name->parts.size() == 1) {
-                        auto it = genericSubstSemaTy_.find(
-                            rt->headName());
+                        auto it = substSemaFind(rt);
                         if (it != genericSubstSemaTy_.end() && it->second &&
                             it->second->kind == sema::TypeRef::Kind::Named)
                             return it->second->declaration;

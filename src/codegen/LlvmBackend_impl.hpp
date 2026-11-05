@@ -15302,6 +15302,7 @@ private:
         if (!rt->astNode || !rt->astNode->name ||
             rt->astNode->name->parts.size() != 1)
             return nullptr;
+        if (!mayNameBoundTypeParam(rt)) return nullptr;  // fix #8174 (§14.1)
         auto it = genericSubstSemaTy_.find(rt->astNode->name->parts[0]);
         return it != genericSubstSemaTy_.end() ? it->second : nullptr;
     }
@@ -25225,7 +25226,7 @@ private:
         if (!ty || ty->kind != sema::TypeRef::Kind::Named || ty->declaration ||
             genericSubstSemaTy_.empty() || ty->headName().empty())
             return ty;
-        auto it = genericSubstSemaTy_.find(ty->headName());
+        auto it = substSemaFind(ty);  // fix #8174 (§14.1)
         if (it != genericSubstSemaTy_.end() && it->second) return it->second;
         return ty;
     }
@@ -25375,6 +25376,42 @@ private:
     // `isBuiltinTypeRefName` now derives entirely from
     // common::isReservedBuiltinTypeName. Any new Named-case branch must extend
     // the registry table (and its snapshot row) in the same commit.
+    // fix #8174 (§14.1, v0.355): may this declaration-less spelling be looked
+    // up in the active substitution BY NAME? A name that is not a built-in's
+    // can only be a type parameter. A name that IS one (`class Box<Guid>`)
+    // is the parameter only when the resolver bound THIS TypeRef to it
+    // (`TypeRef::isResolvedTypeParam`, recorded per (spelling, scope) by
+    // #6530); otherwise it is the built-in, written in a declaration where
+    // no such parameter is in scope (`Holder.G: Guid` read inside `Box`),
+    // and Box's binding `Guid -> int` must not retype it.
+    //
+    // A TypeRef with no `astNode` (module metadata, `importedName`) carries no
+    // resolver record, so the name stays the only evidence and the lookup is
+    // allowed — the behaviour before this fix.
+    bool mayNameBoundTypeParam(const sema::TypeRef* t) const {
+        return t && (!t->astNode || !isBuiltinTypeRefName(t->headName()) ||
+                     t->isResolvedTypeParam());
+    }
+    // The by-name substitution lookups for a TypeRef's spelling, guarded by
+    // `mayNameBoundTypeParam` (fix #8174, §14.1): `end()` for a built-in
+    // that merely shares a type parameter's name.
+    std::unordered_map<std::string_view, const sema::TypeRef*>::const_iterator
+    substSemaFind(const sema::TypeRef* t) const {
+        return mayNameBoundTypeParam(t)
+                   ? genericSubstSemaTy_.find(t->headName())
+                   : genericSubstSemaTy_.end();
+    }
+    std::unordered_map<std::string_view, llvm::Type*>::const_iterator
+    substLlFind(const sema::TypeRef* t) const {
+        return mayNameBoundTypeParam(t) ? genericSubst_.find(t->headName())
+                                        : genericSubst_.end();
+    }
+    std::size_t substSemaCount(const sema::TypeRef* t) const {
+        return mayNameBoundTypeParam(t)
+                   ? genericSubstSemaTy_.count(t->headName())
+                   : 0;
+    }
+
     bool isBareTypeParamRef(const sema::TypeRef* t) const {
         if (!t || t->kind != sema::TypeRef::Kind::Named || t->declaration)
             return false;

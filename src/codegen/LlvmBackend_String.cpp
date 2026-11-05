@@ -4041,7 +4041,7 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
         fieldTy->astNode && fieldTy->astNode->name &&
         fieldTy->astNode->name->parts.size() == 1 &&
         !genericSubstSemaTy_.empty()) {
-        auto sit = genericSubstSemaTy_.find(fieldTy->headName());
+        auto sit = substSemaFind(fieldTy);
         if (sit != genericSubstSemaTy_.end() && sit->second &&
             sit->second != fieldTy)
             return emitValueToString(val, sit->second);

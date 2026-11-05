@@ -2027,7 +2027,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         structRt->astNode->name &&
                         structRt->astNode->name->parts.size() == 1 &&
                         !genericSubstSemaTy_.empty()) {
-                        auto sit = genericSubstSemaTy_.find(structRt->headName());
+                        auto sit = substSemaFind(structRt);
                         if (sit != genericSubstSemaTy_.end() && sit->second &&
                             sit->second->declaration)
                             structRt = sit->second;
@@ -2462,8 +2462,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         !tt->declaration && !genericSubstSemaTy_.empty() &&
                         tt->astNode && tt->astNode->name &&
                         tt->astNode->name->parts.size() == 1) {
-                        auto it = genericSubstSemaTy_.find(
-                            tt->headName());
+                        auto it = substSemaFind(tt);
                         if (it != genericSubstSemaTy_.end() && it->second &&
                             it->second->kind == sema::TypeRef::Kind::Primitive)
                             tt = const_cast<sema::TypeRef*>(it->second);
@@ -3005,8 +3004,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                     !genericSubstSemaTy_.empty() &&
                                     argTy->astNode && argTy->astNode->name &&
                                     argTy->astNode->name->parts.size() == 1) {
-                                    auto ait = genericSubstSemaTy_.find(
-                                        argTy->headName());
+                                    auto ait = substSemaFind(argTy);
                                     if (ait != genericSubstSemaTy_.end() &&
                                         ait->second &&
                                         ait->second->kind ==
@@ -11763,8 +11761,7 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
             !recvTy->declaration && recvTy->astNode &&
             recvTy->astNode->name &&
             recvTy->astNode->name->parts.size() == 1) {
-            auto sit = genericSubstSemaTy_.find(
-                recvTy->headName());
+            auto sit = substSemaFind(recvTy);
             if (sit != genericSubstSemaTy_.end() && sit->second)
                 concrete = sit->second;
         }
@@ -13803,8 +13800,7 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             // Unresolved generic param — check if any substitution is String.
             if (rt->astNode && rt->astNode->name &&
                 rt->astNode->name->parts.size() == 1) {
-                auto sit = genericSubstSemaTy_.find(
-                    rt->headName());
+                auto sit = substSemaFind(rt);
                 if (sit != genericSubstSemaTy_.end() && sit->second) {
                     auto* srt = sit->second;
                     return srt->kind == sema::TypeRef::Kind::Primitive &&

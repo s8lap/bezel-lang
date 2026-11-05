@@ -1148,11 +1148,17 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // end of this switch, so that behavior is unchanged.
             // per §2.2 (v0.313), fix #5241: an alias-qualified built-in
             // (`D.Stopwatch`) is never the same-named type parameter.
+            // fix #8174 (§14.1, v0.355): and a spelling that is ALSO a
+            // built-in's name is the type parameter only when the resolver
+            // bound it to one (`mayNameBoundTypeParam`) — a built-in `Guid`
+            // reached from another declaration (`Holder.G: Guid` read inside
+            // `class Box<Guid>`) is not captured by Box's substitution.
             if (!rt->declaration && !genericSubst_.empty() &&
                 rt->astNode && rt->astNode->name &&
                 rt->astNode->name->parts.size() == 1 &&
-                !rt->astNode->aliasQualifiedBuiltin) {
-                auto sit = genericSubst_.find(rt->headName());
+                !rt->astNode->aliasQualifiedBuiltin &&
+                mayNameBoundTypeParam(rt)) {
+                auto sit = substLlFind(rt);
                 if (sit != genericSubst_.end())
                     return sit->second;
             }
@@ -3315,7 +3321,7 @@ const sema::TypeRef* Emitter::recordMemberTypeResolved(const sema::Symbol* m) {
     if (declared->astNode && declared->astNode->name &&
         declared->astNode->name->parts.size() == 1 &&
         !declared->astNode->aliasQualifiedBuiltin) {
-        auto it = genericSubstSemaTy_.find(declared->headName());
+        auto it = substSemaFind(declared);
         if (it != genericSubstSemaTy_.end() && it->second)
             return withNullability(it->second);
     }
@@ -10186,7 +10192,7 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
             if (tt->kind == sema::TypeRef::Kind::Named && !tt->declaration &&
                 tt->astNode && tt->astNode->name &&
                 tt->astNode->name->parts.size() == 1) {
-                auto cit = genericSubstSemaTy_.find(tt->headName());
+                auto cit = substSemaFind(tt);
                 if (cit != genericSubstSemaTy_.end() && cit->second &&
                     cit->second->kind == sema::TypeRef::Kind::Named &&
                     cit->second->declaration) {

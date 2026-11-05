@@ -5187,7 +5187,7 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
             if (recvTy->declaration) {
                 recRecv = recvTy->declaration;
             } else if (!genericSubstSemaTy_.empty()) {
-                auto sit = genericSubstSemaTy_.find(recvTy->headName());
+                auto sit = substSemaFind(recvTy);
                 if (sit != genericSubstSemaTy_.end() && sit->second &&
                     sit->second->kind == sema::TypeRef::Kind::Named)
                     recRecv = sit->second->declaration;
@@ -5211,7 +5211,7 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
         recvTy->kind == sema::TypeRef::Kind::Named && !recvTy->declaration &&
         !genericSubstSemaTy_.empty() && recvTy->astNode &&
         recvTy->astNode->name && recvTy->astNode->name->parts.size() == 1) {
-        auto sit = genericSubstSemaTy_.find(recvTy->headName());
+        auto sit = substSemaFind(recvTy);
         if (sit != genericSubstSemaTy_.end() && sit->second) {
             const sema::TypeRef* concrete = sit->second;
             using K = sema::TypeRef::Kind;
@@ -5350,7 +5350,7 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
         recvTy->kind == sema::TypeRef::Kind::Named && !recvTy->declaration &&
         !genericSubstSemaTy_.empty() && recvTy->astNode &&
         recvTy->astNode->name && recvTy->astNode->name->parts.size() == 1) {
-        auto sit = genericSubstSemaTy_.find(recvTy->headName());
+        auto sit = substSemaFind(recvTy);
         if (sit != genericSubstSemaTy_.end() && sit->second) {
             const sema::TypeRef* concrete = sit->second;
             using K = sema::TypeRef::Kind;
@@ -12798,8 +12798,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     !recvTy->declaration && recvTy->astNode &&
                     recvTy->astNode->name &&
                     recvTy->astNode->name->parts.size() == 1) {
-                    auto sit = genericSubstSemaTy_.find(
-                        recvTy->headName());
+                    auto sit = substSemaFind(recvTy);
                     if (sit != genericSubstSemaTy_.end() && sit->second &&
                         sit->second->declaration &&
                         (sit->second->declaration->kind ==
@@ -15427,7 +15426,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             isDeclLessNamedBuiltinRecv && recvTy->astNode &&
                             recvTy->astNode->name &&
                             recvTy->astNode->name->parts.size() == 1 &&
-                            genericSubstSemaTy_.count(recvTy->headName()) != 0;
+                            substSemaCount(recvTy) != 0;
                         if (isObjectContractMember &&
                                 isDeclLessNamedBuiltinRecv) {
                             // #2874's rule: locate the diagnostic on EVERY
@@ -16008,8 +16007,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         !recvTy->declaration && recvTy->astNode &&
                         recvTy->astNode->name &&
                         recvTy->astNode->name->parts.size() == 1) {
-                        auto sit = genericSubstSemaTy_.find(
-                            recvTy->headName());
+                        auto sit = substSemaFind(recvTy);
                         if (sit != genericSubstSemaTy_.end() && sit->second)
                             concrete = sit->second;
                     }
@@ -18192,7 +18190,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // the real substituted type.
             if (rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
                 !genericSubstSemaTy_.empty()) {
-                if (auto it = genericSubstSemaTy_.find(rt->headName());
+                if (auto it = substSemaFind(rt);
                     it != genericSubstSemaTy_.end() && it->second)
                     rt = it->second;
             }
@@ -24700,7 +24698,7 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             // #730 (§14.1/§14.2): a bare `T` parameter receiver bound by the
             // active monomorphization to an auto-bearing record.
             if (!recRecv && !genericSubstSemaTy_.empty()) {
-                auto sit = genericSubstSemaTy_.find(recvTy0->headName());
+                auto sit = substSemaFind(recvTy0);
                 if (sit != genericSubstSemaTy_.end() && sit->second &&
                     sit->second->kind == sema::TypeRef::Kind::Named)
                     recRecv = sit->second->declaration;

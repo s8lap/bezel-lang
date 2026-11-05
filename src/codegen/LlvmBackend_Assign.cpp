@@ -2224,7 +2224,7 @@ const sema::TypeSymbol* Emitter::indexReceiverDecl(const ast::Expr* target) {
         if (tt->kind == sema::TypeRef::Kind::Named && !tt->declaration &&
             tt->astNode && tt->astNode->name &&
             tt->astNode->name->parts.size() == 1) {
-            auto sit = genericSubstSemaTy_.find(tt->headName());
+            auto sit = substSemaFind(tt);
             if (sit != genericSubstSemaTy_.end() && sit->second &&
                 sit->second->kind == sema::TypeRef::Kind::Named &&
                 sit->second->declaration)
