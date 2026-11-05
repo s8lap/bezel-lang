@@ -1123,7 +1123,7 @@ BEZEL_TEST(builtin_registry_snapshot, keyword_alias_builtin_set) {
 //
 // fix #8232 (stdlib §5, v0.355) ADDED `ElementAtOrNull`: the `T?` sibling
 // of `ElementAt` on the SAME `public extension IEnumerable<T>` block, and a
-// `string` is an `IEnumerable<char>` (stdlib §9.6). The "no lowering on ANY
+// `string` is an `IEnumerable<char>` (stdlib §4.12; `String` is stdlib §9.6). The "no lowering on ANY
 // receiver" gap #3444 flagged was CLOSED by fix #8229 (the name reached
 // `LlvmBackend_Calls.cpp`'s `isArrTerminal` and its `T?` arm, which the
 // string receiver's materialize path runs), so the name's absence from THIS

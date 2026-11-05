@@ -11,7 +11,7 @@
 //!   `x in l` return by the field-copy idiom `var u := l; if u <> null then
 //!   return x in u; end if;` compiles. Not red on base by verdict: the saved
 //!   pre-fix compiler also rejected it, with the 'not yet implemented' text, so
-//!   only the diagnostic needle (reported, never gated) differs.4 diagnostic.
+//!   only the diagnostic needle (reported, never gated) differs.
 module P;
 
 public class H

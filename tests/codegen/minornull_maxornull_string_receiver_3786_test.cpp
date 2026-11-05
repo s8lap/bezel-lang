@@ -233,7 +233,7 @@ BEZEL_TEST(minornull_maxornull_string_receiver_3786,
            element_at_or_null_is_now_admitted) {
     // fix #8232 (stdlib §5, v0.355): `ElementAtOrNull` is the `T?` sibling of
     // `ElementAt` on the SAME `public extension IEnumerable<T>` block, and a
-    // `string` is an `IEnumerable<char>` (stdlib §9.6 / #1220). #3444 flagged
+    // `string` is an `IEnumerable<char>` (stdlib §4.12; `String` is stdlib §9.6 / #1220). #3444 flagged
     // the name as "no lowering on ANY receiver"; fix #8229 CLOSED that gap
     // (the name reached `LlvmBackend_Calls.cpp`'s `isArrTerminal` and its
     // `T?` arm, which this receiver's materialize path runs), so the last

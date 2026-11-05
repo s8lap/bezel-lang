@@ -218,7 +218,7 @@ bool Resolver::recordValueContainsSelf(TypeSymbol* start, TypeSymbol* cur,
 // base list; it is in IOrd's, one level down, with IOrd's type parameter `T`
 // instantiated to `IShape` by §14.1's substitution. MEASURED on r30-c1: the
 // §5.1 gate (which reads the CLOSURE, `classOrIfaceComparableAtInstance`,
-// §8209) admitted the element, and CODEGEN then refused it with the #2770
+// #8209) admitted the element, and CODEGEN then refused it with the #2770
 // guard ("`IShape` does not — its `CompareTo` could not be resolved for
 // dispatch") — the shape was document-admissible and rejected.
 //

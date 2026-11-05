@@ -532,23 +532,41 @@ BEZEL_TEST(codegen_in_over_interface_receiver_8260,
 // ---------------------------------------------------------------------------
 // (D) user-class receivers stay refused; the base's diagnostic.
 // ---------------------------------------------------------------------------
-#define BEZEL_8260_REFUSED_USER(NAME, SRC)                                   \
-    BEZEL_TEST(codegen_in_over_interface_receiver_8260, NAME) {              \
-        JitResult r = runAotChecked(SRC);                                    \
-        BEZEL_EXPECT_FALSE(r.ran);                                           \
-        BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());                        \
-        BEZEL_EXPECT_TRUE(hasError(                                          \
-            r, "not yet implemented: codegen for this `in` expression form")); \
-    }
+BEZEL_TEST(codegen_in_over_interface_receiver_8260,
+           user_class_receiver_stays_refused) {
+    JitResult r = runAotChecked(kUserClassPublicContainsRefused);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasError(
+        r, "not yet implemented: codegen for this `in` expression form"));
+}
 
-BEZEL_8260_REFUSED_USER(user_class_receiver_stays_refused,
-                        kUserClassPublicContainsRefused)
-BEZEL_8260_REFUSED_USER(user_class_private_contains_is_not_accessible_p06,
-                        kUserClassPrivateContains)
-BEZEL_8260_REFUSED_USER(user_class_nullable_receiver_is_refused_p34,
-                        kUserClassNullableReceiverCrash)
-BEZEL_8260_REFUSED_USER(user_class_nullable_receiver_no_this_is_refused_p31,
-                        kUserClassNullableReceiverNoThis)
+BEZEL_TEST(codegen_in_over_interface_receiver_8260,
+           user_class_private_contains_is_not_accessible_p06) {
+    JitResult r = runAotChecked(kUserClassPrivateContains);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasError(
+        r, "not yet implemented: codegen for this `in` expression form"));
+}
+
+BEZEL_TEST(codegen_in_over_interface_receiver_8260,
+           user_class_nullable_receiver_is_refused_p34) {
+    JitResult r = runAotChecked(kUserClassNullableReceiverCrash);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasError(
+        r, "not yet implemented: codegen for this `in` expression form"));
+}
+
+BEZEL_TEST(codegen_in_over_interface_receiver_8260,
+           user_class_nullable_receiver_no_this_is_refused_p31) {
+    JitResult r = runAotChecked(kUserClassNullableReceiverNoThis);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasError(
+        r, "not yet implemented: codegen for this `in` expression form"));
+}
 
 // ---------------------------------------------------------------------------
 // (G) a nullable interface receiver gets the written call's §7.4 refusal.

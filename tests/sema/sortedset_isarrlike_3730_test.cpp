@@ -280,7 +280,7 @@ BEZEL_TEST(sortedset_isarrlike_3730, all_now_dispatches) {
 // FLIPPED by fix #7812 (§26.5 rule 1, v0.355; stdlib §4.18 declares `Count`
 // as a property): the plain `.` predicate spelling is now the arity error
 // the `?.` twin (#7670) already gave. The §5 predicate count is reached
-// through the composed spelling `s.Where(pred).Count()` (stdlib §1
+// through the composed spelling `s.Where(pred).Count()` (stdlib §5
 // "Block-by-name"), which keeps the value this row used to pin: 20, 30 and
 // 40 are > 15.
 BEZEL_TEST(sortedset_isarrlike_3730, count_predicate_refused_7812) {

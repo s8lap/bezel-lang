@@ -121,7 +121,7 @@ const char* kSub =
 const char* kSubNeedle = "a user subclass of `TextWriter`; converting it to the "
                          "built-in `TextWriter` type is not implemented";
 
-// narrow #7792 (stdlib §2.1, v0.355) -- the fd-0 trap. A `TextWriter` value
+// narrow #7792 (stdlib §7.4, v0.355) -- the fd-0 trap. A `TextWriter` value
 // is a standard-stream descriptor, so a TextWriter produced WITHOUT the
 // representation's constructor (a null `TextWriter?` on the left of `??`,
 // before this fix) holds descriptor 0 and `w.WriteLine(..)` writes to

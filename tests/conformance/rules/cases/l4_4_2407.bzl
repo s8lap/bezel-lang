@@ -15,8 +15,7 @@
 //!   IComparable<T>; IShape does not implement IComparable<IShape>'. Ascending
 //!   by CompareTo is Area order 3, 4, 5, 7, 9. It passes on the staging tip. No
 //!   open issue describes the Sort() call site (#8186 covers the no-selector
-//!   Min()/Max() guard only). No open issue describes the Sort() call site
-//!   (#8186 covers the no-selector Min()/Max() guard only).
+//!   Min()/Max() guard only).
 module Conf;
 
 public interface IOrd<T>: IComparable<T>

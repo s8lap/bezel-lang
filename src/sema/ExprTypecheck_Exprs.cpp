@@ -3174,10 +3174,9 @@ bool builtinStubHeadHasDeclaredSurface(std::string_view head) {
 //
 //   * the CONCRETE collection heads' own rule-1 gap (stdlib §4.17
 //     `SortedDictionary`, §4.18 `SortedSet` — a `Count` property against the
-//     §5 `Count(predicate)` extension) is issue #7812: its remedy changes the
-//     verdict of the §5 LINQ predicate count on those heads, which two
-//     existing value rows pin (#3730's `count_predicate_now_dispatches`,
-//     #3735's `sortedset_int_quantifiers`).
+//     §5 `Count(predicate)` extension) was issue #7812, fixed at its own
+//     site (`s.Count(pred)` on those heads is now the rule-1 arity error,
+//     and the composed `s.Where(pred).Count()` is the remedy).
 //
 //   * the `?.` spelling of THIS defect is a separate gate: the null-conditional
 //     resolver (`resolveNullCondMember`) and the synthetic non-null member

@@ -16,7 +16,7 @@
 # -- and NO line number, because a line-numbered key would fail the
 # gate on every unrelated commit that moved a comment.
 #
-count: 439
+count: 451
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	IOwningEnumerable	4.5
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	Range	4.4
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	2.7
@@ -25,6 +25,7 @@ site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	5
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	5.1
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	7.1
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Dictionary	2.4
+site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Guid	2.2
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	IComparable	2.2
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	IComparable	2.5
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	IComparable	5.1
@@ -48,6 +49,7 @@ site:	src/codegen/LlvmBackend_Calls3.cpp	wrong-section	Set	5
 site:	src/codegen/LlvmBackend_Calls3.cpp	wrong-section	Split	5
 site:	src/codegen/LlvmBackend_Disposal.cpp	wrong-section	IOwningList	4.5
 site:	src/codegen/LlvmBackend_Disposal.cpp	wrong-section	OwningLinkedList	4.2
+site:	src/codegen/LlvmBackend_Exprs.cpp	wrong-section	Contains	4.1
 site:	src/codegen/LlvmBackend_Exprs2.cpp	wrong-section	OwningBuffer	1
 site:	src/codegen/LlvmBackend_Exprs2.cpp	wrong-section	Set	1
 site:	src/codegen/LlvmBackend_Layout.cpp	wrong-section	IEnumerable	2.8
@@ -116,6 +118,8 @@ site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	Dictionary	5
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	DomainFaultedException	2.15
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	Empty	9.6
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	GetEnumerator	4.12
+site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	GetEnumerator	5
+site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	IComparable	2.2
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	IComparable	5
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	IComparable	5.1
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	IEnumerable	9.6
@@ -238,12 +242,17 @@ site:	tests/codegen/linked_list_test.cpp	wrong-section	LinkedList	4.4
 site:	tests/codegen/linkedlist_source_ctor_2693_test.cpp	wrong-section	IEnumerable	4.6
 site:	tests/codegen/linkedlist_source_fresh_mint_retain_2727_test.cpp	wrong-section	Array	4.6
 site:	tests/codegen/linq_class_elem_eq_hash_2773_test.cpp	wrong-section	Set	5
+site:	tests/codegen/linq_icomparable_applicability_builtin_class_8199_test.cpp	wrong-section	IComparable	2.5
+site:	tests/codegen/linq_iface_chain_icomparable_8186_test.cpp	wrong-section	CompareTo	2.8
+site:	tests/codegen/linq_iface_chain_icomparable_8186_test.cpp	wrong-section	IComparable	5.1
 site:	tests/codegen/linq_last_single_predicate_789_test.cpp	wrong-section	Range	5
 site:	tests/codegen/linq_minmax_selector_wide_value_8048_test.cpp	wrong-section	Guid	9.6
 site:	tests/codegen/linq_test.cpp	wrong-section	IEnumerable	9.6
 site:	tests/codegen/linq_throw_469_test.cpp	wrong-section	IComparable	5
 site:	tests/codegen/math_convert_test.cpp	wrong-section	IComparable	2.2
 site:	tests/codegen/math_datetime_narrowed_7902_test.cpp	wrong-section	IComparable	2.5
+site:	tests/codegen/math_guid_min_max_clamp_7935_test.cpp	wrong-section	CompareTo	2.8
+site:	tests/codegen/math_guid_min_max_clamp_7935_test.cpp	wrong-section	IComparable	2.2
 site:	tests/codegen/math_method_ref_datetime_7911_test.cpp	wrong-section	IComparable	2.2
 site:	tests/codegen/math_minmax_clamp_mixed_value_type_7947_test.cpp	wrong-section	DateTime	2.2
 site:	tests/codegen/math_minmax_generic_unsigned_6908_test.cpp	wrong-section	IComparable	2.2

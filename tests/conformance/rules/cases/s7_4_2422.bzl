@@ -13,7 +13,7 @@
 //!   declaration with a non-null initializer). Removing the `in` expression
 //!   leaves a compiling file. Not red on base by verdict: the saved pre-fix
 //!   compiler also rejected it, with the 'not yet implemented' text, so only
-//!   the diagnostic needle (reported, never gated) differs.4 diagnostic.
+//!   the diagnostic needle (reported, never gated) differs.
 module P;
 
 class C

@@ -12,7 +12,7 @@
 // Stdlib §4.18 (v0.355) declares `public pure readonly property Count: int`
 // on `SortedSet<T>`; §4.17 does the same on `SortedDictionary<K, V>`. So
 // `s.Count(lambda(x: int) => x > 1)` is the arity error, and the composed
-// spelling `s.Where(pred).Count()` (stdlib §1 "Block-by-name") is the remedy.
+// spelling `s.Where(pred).Count()` (stdlib §5) is the remedy.
 //
 // The ORACLE is the specific diagnostic (the house's arity wording). The
 // CONTROLS — the property read, the composed spelling, and the §5 predicate

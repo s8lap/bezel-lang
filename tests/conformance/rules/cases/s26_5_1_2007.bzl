@@ -19,6 +19,6 @@ public class Program
   public static method Main()
     var a := new Array<int>();
     a.Add(1);
-    Console.WriteLine(a.Where(lambda(x) => x > 0).Take(1, 2));
+    Console.WriteLine(a.Where(lambda(x) => x > 0).Take(1, "s"));
   end Main;
 end Program;
