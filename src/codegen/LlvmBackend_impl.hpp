@@ -16505,9 +16505,21 @@ private:
     // Unretained suppression (walkCallArgs), which is call-wide, not
     // context-specific, so admitting it anywhere else would arm a release
     // with no matching suppression.
+    //
+    // fix #7841 (§26.7, §28.9, v0.355): `admitThisPassthrough` admits the
+    // extension-receiver twin of that shape — a bare `this` of a user
+    // `extension string` `enclosingFactory`, used exactly once
+    // (`Wrap(): Named => new Named(this, 1)`). It is set ONLY by the
+    // `var n := <+1 string producer>.Wrap();` LocalDecl arm of
+    // collectRecordCallResultReleaseEligible, where the CALL SITE's receiver
+    // is an unbound `string` +1 producer: the receiver is then exactly the
+    // "first argument" whose release lowerCallDispatch suppresses for a
+    // claimed init, so the record local's scope-end field release is its
+    // one release.
     bool isFreshRecordConstructionOfExactType(
         const ast::Expr* expr, const sema::TypeSymbol* recTs,
-        const sema::MethodSymbol* enclosingFactory = nullptr) const;
+        const sema::MethodSymbol* enclosingFactory = nullptr,
+        bool admitThisPassthrough = false) const;
 
     // fix #2448 / §9.7 / §28.9 (v0.235): is MethodSymbol `ms` provably a
     // "fresh record factory" for record `recTs`? Consulted by
@@ -16515,8 +16527,11 @@ private:
     // free (a caller-side gate blind to the callee's own body). See the
     // definition (LlvmBackend_Setup.cpp) for the full rationale and its
     // deliberately narrow scope.
+    // fix #7841: `admitThisPassthrough` — see
+    // isFreshRecordConstructionOfExactType.
     bool isProvablyFreshRecordFactoryMethod(
-        const sema::MethodSymbol* ms, const sema::TypeSymbol* recTs) const;
+        const sema::MethodSymbol* ms, const sema::TypeSymbol* recTs,
+        bool admitThisPassthrough = false) const;
 
     // fix #2428 / §9.8 / §28.9 / §35.4, generalized by fix #2448 / §9.7: is
     // `call` a call to SOME type's own SYNTHESIZED `Deserialize` factory?
@@ -22675,8 +22690,46 @@ private:
         // (`OwnedField::vtablelessBuiltin` has been a `std::string` since
         // #4290, so this is the same idiom, not a new one.)
         std::string vtablelessBuiltin = {};
+        // fix #7841 (§26.7, §28.9, v0.355): the slot holds a `string` +1
+        // producer that was the receiver of a user `extension string` call;
+        // its K8-boundary release is `bz_string_release`, not a Dispose.
+        // See `deferExtStringReceiverReleaseToK8`.
+        bool stringRelease = false;
     };
     std::vector<K8RecvTemp> k8RecvTemps_;
+
+    // fix #7841 (§26.7, §28.3 K8.1, §28.9, v0.355): the receiver of a user
+    // `extension string` call whose receiver expression is a `string` +1
+    // producer (`Make.Str(i).Wrap()`) is evaluated once, by the extension
+    // lowering, and nothing else owns it. When the extension's declared
+    // return MAY EMBED that string unretained
+    // (`calleeReturnMayAliasStringArgUnretained` — `Wrap(): Named =>
+    // new Named(this, 1)`), releasing it right after the call frees what
+    // the result still points at (heap-use-after-free). The receiver is then
+    // released only where a later owner is KNOWN:
+    //   * the call initializes a claiming record/class local
+    //     (`suppressForCallResultClaim`, #4322/#4342/#4300): that local's
+    //     scope-end string-field release owns it, so nothing is emitted here;
+    //   * the call is read through a chain of field/property READS ending
+    //     in a non-nullable VALUE primitive (`Make.Str(i).Wrap().Tag.Length`):
+    //     the result is consumed within the full expression, so the release
+    //     moves to the K8 boundary, after every use of it (§28.3 K8.1).
+    // Every other may-alias shape keeps the pre-#7841 leak (leak over UAF).
+    // The CLAIM is made in `lowerExpr` on the member-access node, before its
+    // target call is lowered, and erased right after — the same adjacent
+    // claim/consume discipline as `freshVtablelessBuiltinRoots_`.
+    std::set<const ast::Expr*> k8ExtStringRecvCalls_;
+    // The claim predicate above: if `ma` is a field/property read typed a
+    // non-nullable VALUE primitive (not `string` / `Object`) reached through
+    // field/property reads from a call sema bound to a user extension
+    // method, that call; otherwise null.
+    const ast::Expr* extStringRecvReadClaimTarget(
+        const ast::MemberAccessExpr& ma);
+    // Park `recvStr` in a fresh slot released at the next K8 boundary (normal
+    // edge) and, via a `stringRelease` disposeStack_ entry, on the exception
+    // edge. Returns false (the caller then emits nothing: a leak) when no
+    // scope or function is available.
+    bool deferExtStringReceiverReleaseToK8(llvm::Value* recvStr);
 
     // The eligibility predicate for the queue above. NON-NULLABLE `string`
     // only: a non-nullable `string` method return is minted `+1` BY THE CALLEE

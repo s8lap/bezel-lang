@@ -9352,6 +9352,64 @@ void Emitter::registerFreshOwnedVtablelessBuiltinReceiverTempK8(
 }
 
 
+// fix #7841 (§26.7, §28.3 K8.1, §28.9, v0.355) — see the declaration of
+// `k8ExtStringRecvCalls_` in LlvmBackend_impl.hpp.
+const ast::Expr* Emitter::extStringRecvReadClaimTarget(
+        const ast::MemberAccessExpr& ma) {
+    // The OUTERMOST read's value must be a non-nullable VALUE primitive
+    // (`Length`, an `int` field): nothing it yields can carry the receiver
+    // string past the full expression. A `string` read is NOT claimed: a
+    // binding of it (`var s := Make.Str(i).Wrap().Tag;`) does not take its
+    // own reference, so a K8 release would dangle `s` (measured:
+    // heap-use-after-free). A record / choice / class / `Object` read could
+    // re-embed it unretained.
+    const sema::TypeRef* rt = ctx_.exprType(ma);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Primitive || rt->nullable ||
+        rt->primitive == sema::PrimitiveType::String ||
+        rt->primitive == sema::PrimitiveType::Object ||
+        rt->primitive == sema::PrimitiveType::None)
+        return nullptr;
+    // Descend through field/property READS (never a method reference) to
+    // the call whose result they read: `Make.Str(i).Wrap().Tag.Length`.
+    const ast::MemberAccessExpr* cur = &ma;
+    for (;;) {
+        if (dynamic_cast<const sema::MethodSymbol*>(ctx_.exprSymbol(*cur)))
+            return nullptr;
+        const ast::Expr* tgt = cur->target.get();
+        if (auto* inner = dynamic_cast<const ast::CallExpr*>(tgt)) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                ctx_.exprSymbol(*inner->callee));
+            return isExtensionMethod(ms) ? inner : nullptr;
+        }
+        cur = dynamic_cast<const ast::MemberAccessExpr*>(tgt);
+        if (!cur) return nullptr;
+    }
+}
+
+bool Emitter::deferExtStringReceiverReleaseToK8(llvm::Value* recvStr) {
+    if (!recvStr || !recvStr->getType()->isPointerTy()) return false;
+    if (disposeStack_.empty() || emittingDisposerBody_ || !currentFn_)
+        return false;
+    llvm::AllocaInst* slot = entryAllocaNullPtr();
+    // A state-machine body may flush after a suspension: keep the slot in the
+    // frame, as registerFreshOwnedVtablelessBuiltinReceiverTempK8 does.
+    if (smStateStruct_) asyncHandlerSpillSlots_.push_back(slot);
+    builder_.CreateStore(recvStr, slot);
+    // The exception edge (a LATER operand of the same full expression throws):
+    // the scope's walk releases the slot. On the normal edge the K8 flush
+    // releases it first and nulls the slot, so this entry is then a no-op
+    // (`bz_string_release` is null-safe).
+    Disposal d{slot, nullptr};
+    d.stringRelease = true;
+    d.nullSlotAfterRelease = true;
+    disposeStack_.back().push_back(d);
+    K8RecvTemp t{slot, currentFn_};
+    t.stringRelease = true;
+    k8RecvTemps_.push_back(t);
+    return true;
+}
+
+
 bool Emitter::deferUnboundOwnedTempToK8(llvm::AllocaInst* slot) {
     if (!slot || !currentFn_ || emittingDisposerBody_) return false;
     if (slot->getAllocatedType() != ptrTy()) return false;
@@ -9399,6 +9457,16 @@ void Emitter::flushK8RecvTemps() {
     for (const auto& t : k8RecvTemps_) {
         if (t.fn != currentFn_) { keep.push_back(t); continue; }
         if (!live) continue;
+        // fix #7841 (§26.7, §28.9, v0.355): a `string` receiver temporary of a
+        // user extension call (`deferExtStringReceiverReleaseToK8`). Released
+        // and nulled; the registered `stringRelease` entry then reads null.
+        if (t.stringRelease) {
+            emitStringRelease(
+                builder_.CreateLoad(ptrTy(), t.slot, "k8recv.str"));
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 t.slot);
+            continue;
+        }
         // fix #8009 (§28.3 K8.1 / §28.11, v0.350): a COLLECTION temporary's
         // release is the COLLECTION'S OWN arm — the runtime free
         // (`bz_array_free` / `bz_dict_free` / `bz_llist_free`) plus the §28.11

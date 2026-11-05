@@ -121,3 +121,71 @@ BEZEL_TEST(string_extension_receiver_once_7841,
             "end Program;\n"),
         "290\n");
 }
+
+// The fix-forward rows (review of a850ccae, probes p07 / p02 / p06): an
+// extension whose result EMBEDS `this` unretained (a record holding the
+// receiver string). §26.7 (v0.355): "The receiver is always a borrow". The
+// receiver temporary must outlive every read through the result -- an
+// immediate post-call release was a heap-use-after-free -- and must still be
+// released exactly once (ASan: no UAF, no leak).
+namespace {
+
+const char* kWrapPrelude =
+    "module M;\n"
+    "public record Named(Tag: string, N: int);\n"
+    "public extension string\n"
+    "  public method Wrap(): Named => new Named(this, 1);\n"
+    "end;\n"
+    "public class Make\n"
+    "  public static method Str(n: int): string => \"s\" + n.ToString();\n"
+    "end Make;\n"
+    "public class Program\n"
+    "  public static method Main(): int\n";
+
+std::string wrapProgram(const std::string& body) {
+    return std::string(kWrapPrelude) + body +
+           "    return 0;\n"
+           "  end Main;\n"
+           "end Program;\n";
+}
+
+}  // namespace
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           wrap_result_embeds_receiver_one_shot_no_uaf_spec_26_7) {
+    // p07: base printed "a1"; a850ccae crashed in bz_string_to_utf8z.
+    expectClean(
+        runAotChecked(wrapProgram(
+            "    var n := (\"a\" + 1.ToString()).Wrap();\n"
+            "    Console.WriteLine(n.Tag);\n")),
+        "a1\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           wrap_result_bound_to_local_loop_no_uaf_no_leak_spec_26_7) {
+    // p02: the record local's own scope-end string-field release owns the
+    // receiver (§28.9), exactly as for the static twin `Make.Wrap(Make.Str(i))`.
+    expectClean(
+        runAotChecked(wrapProgram(
+            "    var t := 0;\n"
+            "    for var i in 0..199 do\n"
+            "      var n := Make.Str(i).Wrap();\n"
+            "      t := t + n.Tag.Length;\n"
+            "    end;\n"
+            "    Console.WriteLine(t);\n")),
+        "690\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           wrap_result_field_read_inline_loop_no_uaf_no_leak_spec_26_7) {
+    // p06: the result is read within the full expression; the receiver is
+    // released at its end, after the read (§28.3 K8.1).
+    expectClean(
+        runAotChecked(wrapProgram(
+            "    var t := 0;\n"
+            "    for var i in 0..199 do\n"
+            "      t := t + Make.Str(i).Wrap().Tag.Length;\n"
+            "    end;\n"
+            "    Console.WriteLine(t);\n")),
+        "690\n");
+}

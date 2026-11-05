@@ -18196,6 +18196,20 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // once the call has returned, exactly as the §9.6 member path does.  A
     // result that returns the receiver (`this`) carries its own +1 (§28.9),
     // so the release here is the receiver temporary's own reference.
+    //
+    // fix #7841 follow-up (§26.7, §28.3 K8.1, §28.9, v0.355): the receiver is
+    // treated EXACTLY as a first argument by the #4322/#4342 alias fact the
+    // argument release above honours. An extension whose declared return may
+    // embed `this` unretained (`Wrap(): Named => new Named(this, 1)`) hands
+    // back a result that still points at the receiver, so an immediate release
+    // is a heap-use-after-free on the first read of `n.Tag`. For that callee:
+    //   * a claiming record/class local (`suppressForCallResultClaim`) owns
+    //     the string through its scope-end field release: emit nothing;
+    //   * a field/property read of the result claimed in `lowerExpr`
+    //     (`Make.Str(i).Wrap().Tag.Length`) consumes it within the full
+    //     expression: release at the K8 boundary, after every use;
+    //   * any other shape keeps the pre-#7841 leak (leak over UAF, #4322).
+    // See `k8ExtStringRecvCalls_` (LlvmBackend_impl.hpp).
     if (!diverged_ && isExtensionMethod(ms) && !args.empty() &&
         args[0]->getType()->isPointerTy()) {
         if (auto* maR = dynamic_cast<const ast::MemberAccessExpr*>(
@@ -18204,8 +18218,19 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 maR->target ? ctx_.exprType(*maR->target) : nullptr;
             if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
                 rt->primitive == sema::PrimitiveType::String &&
-                isPlusOneStringProducer(maR->target.get()))
-                emitStringRelease(args[0]);
+                isPlusOneStringProducer(maR->target.get())) {
+                const bool recvMayAlias =
+                    calleeReturnMayAliasStringArgUnretained(ctx_, ms);
+                const bool recvClaimedByLocal =
+                    recvMayAlias &&
+                    (wasRecordCallResultInitOutermost ||
+                     recordCallResultInitOutermostClassWithRecordField_);
+                if (!recvMayAlias)
+                    emitStringRelease(args[0]);
+                else if (!recvClaimedByLocal &&
+                         k8ExtStringRecvCalls_.count(&call))
+                    deferExtStringReceiverReleaseToK8(args[0]);
+            }
         }
     }
 

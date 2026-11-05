@@ -479,7 +479,23 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
+    // fix #7841 (§26.7, §28.3 K8.1, v0.355): a chain of field/property READS
+    // of a user extension call's result ending in a value primitive
+    // (`Make.Str(i).Wrap().Tag.Length`) consumes that result within this full
+    // expression, so a `string` +1 receiver whose extension may embed it
+    // unretained is released at the K8 boundary rather than leaked. Claimed
+    // here, before the call is lowered; consumed in `lowerCallDispatch`;
+    // erased right after. See `k8ExtStringRecvCalls_`.
+    const ast::Expr* claimedExtStringRecvCall = nullptr;
+    if (auto* maX = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (const ast::Expr* c = extStringRecvReadClaimTarget(*maX)) {
+            if (k8ExtStringRecvCalls_.insert(c).second)
+                claimedExtStringRecvCall = c;
+        }
+    }
     llvm::Value* v = lowerExprInner(e);
+    if (claimedExtStringRecvCall)
+        k8ExtStringRecvCalls_.erase(claimedExtStringRecvCall);
     // fix #7906: the receiver's OWN lowering consumed the claim above and
     // registered the temporary for the K8 boundary; this is the consumption
     // point (a no-op for every expression that was never claimed).

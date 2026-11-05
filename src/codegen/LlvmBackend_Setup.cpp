@@ -39323,8 +39323,34 @@ void Emitter::collectRecordCallResultReleaseEligible(
                         // body and a follow-up issue tracks the closure.
                         const auto* ms = dynamic_cast<const sema::MethodSymbol*>(
                             ctx_.exprSymbol(*call->callee));
+                        // fix #7841 (§26.7, §28.9, v0.355): a user
+                        // `extension string` factory whose receiver at THIS
+                        // call is an unbound `string` +1 producer
+                        // (`var n := Make.Str(i).Wrap();`) — the receiver is
+                        // the call's first argument for the claim, exactly as
+                        // `Make.Wrap(Make.Str(i))`'s argument is. A named /
+                        // borrowed receiver is not admitted (its release is
+                        // owned elsewhere), so it keeps the leak.
+                        bool admitThis = false;
+                        if (ms && isExtensionMethod(ms))
+                            if (auto* rma = dynamic_cast<
+                                    const ast::MemberAccessExpr*>(
+                                    call->callee.get()))
+                                if (const sema::TypeRef* rrt =
+                                        rma->target
+                                            ? ctx_.exprType(*rma->target)
+                                            : nullptr)
+                                    admitThis =
+                                        rrt->kind ==
+                                            sema::TypeRef::Kind::Primitive &&
+                                        rrt->primitive ==
+                                            sema::PrimitiveType::String &&
+                                        !rrt->nullable &&
+                                        isPlusOneStringProducer(
+                                            rma->target.get());
                         if ((ms &&
-                             (isProvablyFreshRecordFactoryMethod(ms, tr->declaration) ||
+                             (isProvablyFreshRecordFactoryMethod(
+                                  ms, tr->declaration, admitThis) ||
                               isProvablyFreshImportedRecordFactoryMethod_(
                                   ms, tr->declaration, ctx_))) ||
                             isSynthesizedRecordDeserializeCall(call, tr->declaration))
@@ -40078,7 +40104,8 @@ void Emitter::collectRecordCallResultReleaseEligible(
 // across a whole callee body.
 bool Emitter::isFreshRecordConstructionOfExactType(
         const ast::Expr* expr, const sema::TypeSymbol* recTs,
-        const sema::MethodSymbol* enclosingFactory) const {
+        const sema::MethodSymbol* enclosingFactory,
+        bool admitThisPassthrough) const {
     if (!expr || !recTs || recTs->kind != ast::TypeDeclKind::Record)
         return false;
     auto* ne = dynamic_cast<const ast::NewExpr*>(expr);
@@ -40230,6 +40257,19 @@ bool Emitter::isFreshRecordConstructionOfExactType(
                             factoryParamArgCounts[ps] == 1) {
                             passthrough = true;
                         }
+                        // fix #7841 (§26.7, §28.9, v0.355): the extension
+                        // receiver `this`, read once — see the declaration.
+                        if (!passthrough && admitThisPassthrough &&
+                            id->name == "this" &&
+                            isExtensionMethod(enclosingFactory)) {
+                            int thisArgs = 0;
+                            for (const auto& oa : ne->args)
+                                if (auto* oid = dynamic_cast<
+                                        const ast::IdentifierExpr*>(
+                                        oa.value.get()))
+                                    if (oid->name == "this") ++thisArgs;
+                            passthrough = (thisArgs == 1);
+                        }
                     }
                 }
                 if (!passthrough) return false;
@@ -40265,7 +40305,8 @@ bool Emitter::isFreshRecordConstructionOfExactType(
 // check does not reason about. (A fuller whole-body escape analysis
 // remains a follow-up, out of this fix's scope — see the commit message.)
 bool Emitter::isProvablyFreshRecordFactoryMethod(
-        const sema::MethodSymbol* ms, const sema::TypeSymbol* recTs) const {
+        const sema::MethodSymbol* ms, const sema::TypeSymbol* recTs,
+        bool admitThisPassthrough) const {
     if (!ms || !recTs) return false;
     // fix #3645 (§9.7 / §28.9 / §2.8.3 rule 4, v0.286): `ms->decl` is no
     // longer null for an imported method that returns a record class — the
@@ -40292,7 +40333,7 @@ bool Emitter::isProvablyFreshRecordFactoryMethod(
         // recursion inside it, the #2866/#4253 direct-NewExpr admissions,
         // boxValueNeedsStringRetain) omits it and is unaffected.
         return isFreshRecordConstructionOfExactType(md->exprBody.get(), recTs,
-                                                      ms);
+                                                      ms, admitThisPassthrough);
     }
     if (md->bodyKind == ast::MethodBodyKind::Block) {
         // fix #3745 / §9.7 / §28.9 (v0.286): also admit the two-statement
@@ -40315,7 +40356,8 @@ bool Emitter::isProvablyFreshRecordFactoryMethod(
             // fix #4295: `ms` threaded through — see the expression-bodied
             // arm above.
             return isFreshRecordConstructionOfExactType(rs->value.get(),
-                                                          recTs, ms);
+                                                          recTs, ms,
+                                                          admitThisPassthrough);
         }
         if (md->stmts.size() == 2) {
             // fix #3591 (LOCALDECL-ONLY WALKER RATCHET): the prior shape
@@ -40345,7 +40387,8 @@ bool Emitter::isProvablyFreshRecordFactoryMethod(
             // Initializer must be a provably-fresh construction of recTs.
             // fix #4295: `ms` threaded through — see the expression-bodied
             // arm above.
-            if (!isFreshRecordConstructionOfExactType(view.init, recTs, ms))
+            if (!isFreshRecordConstructionOfExactType(view.init, recTs, ms,
+                                                      admitThisPassthrough))
                 return false;
             // Return value must be a bare-identifier read of THAT local —
             // not a field access, member call, indexer, or any other
