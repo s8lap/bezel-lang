@@ -50,6 +50,7 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -260,7 +261,8 @@ BEZEL_TEST(sortedset_isarrlike_3730, all_now_dispatches) {
         "True,False");
 }
 
-// NOT FLIPPED by fix #7543 — and deliberately so.
+// NOT FLIPPED by fix #7543 — and deliberately so (the predicate row below
+// was flipped by #7812; see count_predicate_refused_7812).
 //
 // The PREDICATE spelling `s.Count(pred)` is a call with an ARGUMENT, and
 // #7812 (OPEN) owns that surface: "SortedSet declares Count (§4.18), so per
@@ -275,12 +277,24 @@ BEZEL_TEST(sortedset_isarrlike_3730, all_now_dispatches) {
 // (fix #7543 gates its built-in arm on the arity-0 call for the same
 // reason: an arity>0 call to an arity-0 property is a DIFFERENT error — the
 // house already owns that message for every surface that has one.)
-BEZEL_TEST(sortedset_isarrlike_3730, count_predicate_now_dispatches) {
-    // The no-predicate `Count()` keeps its own O(1) `bz_dict_count` arm (the
-    // row just below); only the predicate overload takes the new snapshot
-    // route. 20, 30 and 40 are > 15.
+// FLIPPED by fix #7812 (§26.5 rule 1, v0.355; stdlib §4.18 declares `Count`
+// as a property): the plain `.` predicate spelling is now the arity error
+// the `?.` twin (#7670) already gave. The §5 predicate count is reached
+// through the composed spelling `s.Where(pred).Count()` (stdlib §1
+// "Block-by-name"), which keeps the value this row used to pin: 20, 30 and
+// 40 are > 15.
+BEZEL_TEST(sortedset_isarrlike_3730, count_predicate_refused_7812) {
+    auto r = reject("    Console.WriteLine($\"{s.Count(lambda(y) => y > 15)}\");");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_EQ(bezel::test::diagnosticMessageCount(
+                        r, "The instance member takes no arguments, but this "
+                           "call supplies 1"),
+                    1);
+}
+
+BEZEL_TEST(sortedset_isarrlike_3730, count_predicate_composed_where_still_counts) {
     BEZEL_EXPECT_EQ(
-        runAotOut(prog("    Console.WriteLine($\"{s.Count(lambda(y) => y > 15)}\");")),
+        runAotOut(prog("    Console.WriteLine($\"{s.Where(lambda(y) => y > 15).Count()}\");")),
         "3");
 }
 

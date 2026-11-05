@@ -330,7 +330,7 @@ BEZEL_TEST(set_family_eager_terminals_3735, sortedset_int_quantifiers) {
                        "    Console.WriteLine($\"{s.Any()},"
                        "{s.Any(lambda(x: int) => x > 25)},"
                        "{s.All(lambda(x: int) => x > 5)},"
-                       "{s.Count(lambda(x: int) => x > 15)}\");")),
+                       "{s.Where(lambda(x: int) => x > 15).Count()}\");")),
         "True,True,True,2");
 }
 

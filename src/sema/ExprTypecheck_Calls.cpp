@@ -42056,6 +42056,36 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // built-in's own signature (stdlib §4.x), so a program
                     // that stores the declared `bool` of `a.Contains(2)` in
                     // the extension's `string` is rejected.
+                    //
+                    // fix #7812 (§26.5 rule 1, v0.355; stdlib §4.18): the
+                    // plain `.` twin of #7670's `?.` refusal. `Count` is the
+                    // arity-0 property of these heads, so the committed
+                    // lookup of `s.Count(pred)` fails with arguments — the
+                    // §5 predicate count is unreachable by name. The #3342
+                    // arm above covers only `Array`/`Stack`/`Queue`/`Set`/
+                    // `Dictionary`/... and not the sorted forms, so a
+                    // `SortedSet<T>` (and `SortedDictionary<K, V>`) reached
+                    // the LINQ predicate count here.
+                    if (ma.member == "Count" && &ma == calleeOfCallCtx_ &&
+                        currentCallArity_ > 0) {
+                        auto loc = ma.span.begin;
+                        if (loc.line == 0 && ma.target)
+                            loc = ma.target->span.begin;
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            std::string("`") + std::string(ma.member) +
+                            "` on `" + std::string(recvTy->headName()) +
+                            "` is an instance member of the receiver's "
+                            "declared type; an extension of the same name "
+                            "is unreachable (spec §26.5 rule 1: instance "
+                            "members block same-named extensions of any "
+                            "arity, applicability, or accessibility). The "
+                            "instance member takes no arguments, but this "
+                            "call supplies " +
+                            std::to_string(currentCallArity_) + ". " +
+                            extensionNameBlockedNote(recvTy, ma.member));
+                        return;
+                    }
                 } else if (builtinStringBuilderDeclaresMember(recvTy,
                                                               ma.member) ||
                            builtinObjectBaseDeclaresMember(recvTy,
