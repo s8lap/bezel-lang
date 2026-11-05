@@ -9720,6 +9720,9 @@ void Resolver::checkAbstractImplementations() {
                 // the unspecialized template's MethodSymbol; its bare type-
                 // parameter types read correctly only under that subst).
                 TypeSymbol* implClass = nullptr;
+                // fix #8184: `impl` was chosen by the full-signature match
+                // (not the first-same-arity / name-only fallbacks below).
+                bool implMatchesExactly = false;
                 // fix #5097 (§11.2, v0.307, related #4836): a class may
                 // legitimately declare TWO same-name, same-arity overloads
                 // to witness TWO obligations from the same generic interface
@@ -9829,6 +9832,7 @@ void Resolver::checkAbstractImplementations() {
                             if (paramsMatchObligation(ms, c)) {
                                 impl = ms;
                                 implClass = c;
+                                implMatchesExactly = true;
                                 break;
                             }
                             continue;
@@ -9887,6 +9891,14 @@ void Resolver::checkAbstractImplementations() {
                         " (§11.2, v0.314)");
                     break;
                 }
+                // fix #8184 (spec §14.2, v0.355): record the witness so the
+                // body checker's inherited-`where` lookup
+                // (`ExprTC::currentMethodTypeParamMayInherit`) follows the
+                // implementation relation, not a same-name, same-arity method.
+                // Only a full-signature witness is recorded: a fallback pick
+                // is followed by a §11.2 diagnostic, and an unrecorded
+                // obligation leaves the reader on its shape-based answer.
+                if (implMatchesExactly) ctx_.recordInterfaceWitness(t, im, impl);
                 std::unordered_map<std::string_view, const TypeRef*> implSubst;
                 auto csIt = classSubst.find(implClass);
                 if (csIt != classSubst.end()) implSubst = csIt->second;

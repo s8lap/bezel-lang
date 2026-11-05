@@ -1009,13 +1009,19 @@ bool ExprTC::linqElemIsUnconstrainedTypeParam(const TypeRef* elem) const {
 //      the enclosing type's BASE CLOSURE (classes AND interfaces — the
 //      interface-implementation case is not materialized onto the symbol by
 //      #5039, which runs for `override` only), constrained at position `gi`
-//      by its own written clause or its own materialized set;
+//      by its own written clause or its own materialized set. Since #8184 the
+//      walk follows the relation, not the spelling: a CLASS member counts
+//      only for an `override` (a non-override overrides nothing, §12.1/§12.2),
+//      and an INTERFACE member counts only when the current method is the
+//      §11.2 witness `checkAbstractImplementations` recorded for it
+//      (`SemaContext::interfaceWitnesses`), or when no witness was recorded;
 //   3. an IMPORTED such method (no `ast::MethodDecl`) is constrained unless
 //      the module side table says its parameter at `gi` carries nothing.
-// Matching by shape over-approximates (an unrelated overload of the same
-// shape KEEPS the candidate) — never under-approximates, which is what a
-// PROVABLE-violation test needs. A type parameter that is not the current
-// METHOD's (a class's or an extension block's) inherits nothing.
+// Where the relation is not known (no witness recorded, or an override whose
+// base chain the shape walk over-approximates) the candidate is KEPT — the
+// lookup never under-approximates, which is what a PROVABLE-violation test
+// needs. A type parameter that is not the current METHOD's (a class's or an
+// extension block's) inherits nothing.
 bool ExprTC::currentMethodTypeParamMayInherit(std::string_view n) const {
     const ast::MethodDecl* md = currentMethodDecl_;
     if (!md || !currentType_) return false;
@@ -1029,9 +1035,22 @@ bool ExprTC::currentMethodTypeParamMayInherit(std::string_view n) const {
         return gp && !gp->constraints.empty();
     };
     // 1. The current method's own symbol (materialized inherited set).
+    const MethodSymbol* self = nullptr;
     for (const Symbol* mem : currentType_->members)
         if (auto* ms = dynamic_cast<const MethodSymbol*>(mem))
-            if (ms->decl == md && symConstrained(ms)) return true;
+            if (ms->decl == md) {
+                if (symConstrained(ms)) return true;
+                self = ms;
+            }
+    // fix #8184 (spec §14.2, §12.1, §12.2, v0.355): only an `override` can
+    // inherit from a CLASS base — §12.1: "To override a virtual member in a
+    // derived class, mark the matching member `override`" — and a same-shape
+    // base member the current method does not override is §12.2's "distinct
+    // member: no override relationship" (a `private` base member), which
+    // contributes nothing. Unknown symbol: keep the shape-based answer.
+    const bool mayOverride =
+        !self || std::find(self->modifiers.begin(), self->modifiers.end(),
+                           "override") != self->modifiers.end();
     // 2./3. The base closure, cycle-guarded like `inheritsBuiltinInterface`.
     std::vector<const TypeSymbol*> queue;
     std::unordered_set<const TypeSymbol*> seen{currentType_};
@@ -1039,12 +1058,26 @@ bool ExprTC::currentMethodTypeParamMayInherit(std::string_view n) const {
         if (b && seen.insert(b).second) queue.push_back(b);
     for (std::size_t qi = 0; qi < queue.size(); ++qi) {
         const TypeSymbol* cur = queue[qi];
+        const bool curIsIface = cur->kind == ast::TypeDeclKind::Interface;
         for (const Symbol* mem : cur->members) {
             auto* ms = dynamic_cast<const MethodSymbol*>(mem);
             if (!ms || ms->isOperator || ms->name != md->name ||
                 ms->params.size() != md->params.size() ||
                 ms->genericParams.size() != md->genericParams.size())
                 continue;
+            if (!curIsIface && !mayOverride) continue;
+            // fix #8184: an interface method inherits its set only to the
+            // method that IMPLEMENTS it (§14.2) — the §11.2 witness
+            // `checkAbstractImplementations` chose by full signature for
+            // this type. A sibling overload, or the implementation of
+            // ANOTHER interface's same-shape method, inherits nothing. No
+            // recorded witness: keep the shape-based answer.
+            if (curIsIface && self) {
+                const auto* wit = ctx_.interfaceWitnesses(currentType_, ms);
+                if (wit && std::find(wit->begin(), wit->end(), self) ==
+                               wit->end())
+                    continue;
+            }
             if (auto* bd = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
                 if (gi < bd->genericParams.size())
                     for (const auto& gc : bd->genericConstraints)

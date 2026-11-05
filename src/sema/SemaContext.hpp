@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -1040,6 +1041,28 @@ public:
         return it == importedGenericConstraints_.end() ? nullptr : &it->second;
     }
 
+    // fix #8184 (spec §14.2 *Constraints on overrides and interface
+    // implementations*, v0.355): the §11.2 instance-conformance WITNESS the
+    // Resolver's `checkAbstractImplementations` chose for each interface
+    // obligation `im` of the local type `t` (the method whose full signature
+    // matches `im` under the obligation's substitution). Several witnesses may
+    // be recorded for one (t, im): a generic interface listed at two
+    // instantiations has one obligation per instantiation. Read by
+    // `ExprTC::currentMethodTypeParamMayInherit`, which asks whether a method
+    // IMPLEMENTS `im` (and so inherits its `where` set) rather than merely
+    // shares its name and arity. `nullptr` means no witness was recorded for
+    // (t, im) — the conformance check did not run or did not reach it — and
+    // the reader keeps its shape-based answer.
+    void recordInterfaceWitness(const Symbol* t, const Symbol* im,
+                                const Symbol* impl) {
+        interfaceWitnesses_[{t, im}].push_back(impl);
+    }
+    const std::vector<const Symbol*>* interfaceWitnesses(
+        const Symbol* t, const Symbol* im) const {
+        auto it = interfaceWitnesses_.find({t, im});
+        return it == interfaceWitnesses_.end() ? nullptr : &it->second;
+    }
+
     // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): whether an imported Property (or
     // Indexer) member declares a setter — MetaMember::hasSetter (see its field
     // comment in ModuleMetadata.hpp for why this cannot be recovered from
@@ -1439,6 +1462,11 @@ private:
     // per-parameter constraint payload, from MetaMember::genericParams.
     std::unordered_map<const Symbol*, std::vector<ImportedGenericConstraint>>
         importedGenericConstraints_;
+    // fix #8184: (local type, interface obligation) -> its §11.2 witness(es).
+    // Looked up only, never iterated, so the pointer ordering is harmless.
+    std::map<std::pair<const Symbol*, const Symbol*>,
+             std::vector<const Symbol*>>
+        interfaceWitnesses_;
     // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): imported property/indexer setter
     // presence, from MetaMember::hasSetter.
     std::unordered_map<const Symbol*, bool> importedPropertyHasSetter_;
