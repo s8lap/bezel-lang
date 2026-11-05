@@ -2107,6 +2107,13 @@ private:
     // for the whole codegen run; see nullCondCountSynth_ above.
     // fix #6529 reuses it for the general built-in `?.` call.
     std::vector<std::unique_ptr<ast::CallExpr>> nullCondGroupingCallSynth_;
+    // fix #8260 (§17.5): holder for the synthetic `c.Contains(x)` CallExpr
+    // that the `in` operator's interface/user-receiver arm builds (the
+    // receiver and the element are MOVED into it and moved back afterwards,
+    // with their lowered values pinned in `exprValueOverride_`). Kept alive
+    // for the whole codegen run so the exprType entries set on its nodes
+    // never outlive their key — the nullCondGroupingCallSynth_ discipline.
+    std::vector<std::unique_ptr<ast::CallExpr>> inOperatorSynthCalls_;
     // §27.7.1 (v0.180, #1544): cached property-getter-reference thunk per
     // property symbol — the SAME #1170 stability reasoning as methodThunks_
     // above, applied to a property used as a function value (§27.6, `var f:

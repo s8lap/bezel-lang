@@ -5445,6 +5445,47 @@ private:
     // MemberAccessExpr) and are not reached — filed separately.
     void checkBuiltinCollectionCallArgs(const ast::CallExpr& ce);
 
+    // fix #8260 (§17.5, stdlib §4 *Equality search*, §14.2): the `in`
+    // operator's ADMISSION at a COLLECTION-INTERFACE receiver is the
+    // `Contains` CALL's admission there — `x in c` IS `c.Contains(x)`, and
+    // stdlib §4 states the rule for the operator too ("There the call is a
+    // compile error, `x in xs` (language spec §17.5) and a method reference
+    // formed over the member (language spec §27.6) included").
+    //
+    // The gate is the SAME pair the `Contains` call consults —
+    // `linqHashableGateApplies` (WHICH condition governs: §4's first-kind
+    // `Equals` at the §4 equality-search heads `ICollection` / `IList`, §5's
+    // `T: hashable` at the others) and `linqOperatorCheck` (the check itself,
+    // with the matching wording) — so the two spellings can never drift: a
+    // function element is ADMITTED at an `IList` receiver (as
+    // `lst.Contains(f)` is, #7598) and REFUSED at an `IReadOnlyList` one
+    // (as `rol.Contains(f)` is).
+    //
+    // `colName` is the receiver's head name; `elemTy` its element type.
+    // Returns true when the operand is admitted (and reports the diagnostic
+    // when it is not).
+    bool checkInOperatorContainsAdmission(std::string_view colName,
+                                          const TypeRef* elemTy,
+                                          SourceLocation loc);
+
+    // fix #8260 (§17.5): the `in` operator's ADMISSION at a USER-typed
+    // receiver. §17.5's lookup is STRUCTURAL — "any accessible method named
+    // `Contains` taking one parameter of compatible type and returning `bool`
+    // qualifies" — so a user class that declares its own `Contains` is a
+    // receiver `x in c` means, and the left operand is admitted exactly when
+    // `c.Contains(x)`'s ARGUMENT is: the method's own first-parameter type.
+    //
+    // The check DEFERS (admits without checking) when the receiver declares
+    // no `Contains` at all (nothing to be equivalent to) or when the
+    // parameter's type cannot be resolved here (a type parameter that this
+    // instantiation does not decide, §14.1 / §14.2 rule 2) — the same
+    // fail-open the collection families' bare-type-parameter carve-out uses.
+    void checkInOperatorUserContainsAdmission(const ast::Expr* recvExpr,
+                                              const TypeRef* recvTy,
+                                              const ast::Expr* argExpr,
+                                              TypeRef* argTy,
+                                              SourceLocation loc);
+
     // §7 / stdlib §3.3 (#2581): the ReadOnlyStringSpan twin of #2315. A builtin
     // ReadOnlyStringSpan instance method (IndexOf/Contains/StartsWith/EndsWith/
     // SequenceEqual, stdlib §3.3) declares NON-nullable `string`/`char` operands

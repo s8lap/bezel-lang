@@ -3479,6 +3479,101 @@ bool containsMethodTypeParam(
 
 }  // namespace
 
+// fix #8260 (§17.5, stdlib §4 *Equality search*, §14.2): the `in` operator's
+// admission at a COLLECTION-INTERFACE receiver is the `Contains` CALL's
+// admission there — `x in c` IS `c.Contains(x)`, and stdlib §4 states the rule
+// for the operator too: "There the call is a compile error, `x in xs` (language
+// spec §17.5) and a method reference formed over the member (language spec
+// §27.6) included".
+//
+// The gate is the SAME pair the `Contains` call consults —
+// `linqHashableGateApplies` (WHICH condition governs: §4's first-kind
+// `Equals` at the §4 equality-search heads `ICollection` / `IList`, §5's
+// `T: hashable` at the others) and `linqOperatorCheck` (the check itself,
+// with the matching wording) — so the two spellings can never drift. MEASURED
+// on the pre-fix base: `IList<(int) -> int>.Contains(f)` is ADMITTED (#7598 —
+// a function value HAS a §9.2 first-kind `Equals`, §27.7.1) while
+// `IReadOnlyList<(int) -> int>.Contains(f)` is REFUSED with "operator
+// `Contains` requires `T: hashable`" (that head declares no `Contains`, so
+// §5's extension operator governs it). The `in` operator must answer the same
+// way at each head.
+bool ExprTC::checkInOperatorContainsAdmission(std::string_view colName,
+                                              const TypeRef* elemTy,
+                                              SourceLocation loc) {
+    if (!linqHashableGateApplies(colName, "Contains", elemTy)) return true;
+    return linqOperatorCheck(colName, "Contains", elemTy, loc, ctx_);
+}
+
+// fix #8260 (§17.5): the `in` operator's admission at a USER-typed receiver.
+// §17.5's lookup is STRUCTURAL — "The `Contains` lookup is structural rather
+// than interface-based: any accessible method named `Contains` taking one
+// parameter of compatible type and returning `bool` qualifies" — so a user
+// class that declares its own `Contains` is a receiver `x in c` means, and the
+// left operand is admitted exactly when `c.Contains(x)`'s ARGUMENT is: the
+// method's own first-parameter type.
+//
+// The check DEFERS (admits without checking) when the receiver declares no
+// `Contains` at all (there is no call to be equivalent to) or when the
+// parameter's type still mentions a type parameter this site does not decide
+// (§14.1 / §14.2 rule 2) — the same fail-open the collection families'
+// bare-type-parameter carve-out uses.
+void ExprTC::checkInOperatorUserContainsAdmission(const ast::Expr* recvExpr,
+                                                  const TypeRef* recvTy,
+                                                  const ast::Expr* argExpr,
+                                                  TypeRef* argTy,
+                                                  SourceLocation loc) {
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || !recvTy->declaration)
+        return;
+    // The `Contains` member, over the type and its bases (§11.2's member
+    // lookup: the declared members plus the inherited ones).
+    const sema::MethodSymbol* ms = nullptr;
+    std::vector<const sema::TypeSymbol*> work{recvTy->declaration};
+    for (std::size_t i = 0; i < work.size() && !ms; ++i) {
+        const sema::TypeSymbol* t = work[i];
+        if (!t) continue;
+        for (sema::Symbol* m : t->members) {
+            auto* cand = dynamic_cast<sema::MethodSymbol*>(m);
+            if (!cand || cand->name != "Contains") continue;
+            // §17.5: "taking one parameter ... and returning `bool`". A
+            // STATIC `Contains` is not the instance member the operator means.
+            bool isStatic = false;
+            for (auto mod : cand->modifiers)
+                if (mod == "static") isStatic = true;
+            if (isStatic || cand->params.size() != 1) continue;
+            ms = cand;
+            break;
+        }
+        for (const sema::TypeSymbol* bt : t->baseTypes)
+            if (bt) work.push_back(bt);
+    }
+    if (!ms) return;  // no `Contains` — nothing for `x in c` to mean
+    const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md || md->params.empty() || !md->params[0].type) return;
+    TypeRef* paramTy = ctx_.resolvedType(*md->params[0].type);
+    if (!paramTy) return;
+    // The receiver's own class substitution (§14.1): `Bag<int>.Contains(item:
+    // T)`'s parameter is `int` here, not the bare `T`.
+    if (ms->parent)
+        paramTy = substituteMemberType(paramTy, recvExpr, ms->parent);
+    // A parameter type that still mentions a type parameter is UNDECIDABLE at
+    // this site (§14.2 rule 2 reads the use at the instantiations) — defer,
+    // the same fail-open the collection families' carve-out uses.
+    {
+        std::unordered_set<std::string_view> names;
+        if (ms->parent)
+            for (auto* gp : ms->parent->genericParams)
+                if (gp) names.insert(gp->name);
+        for (const auto& gp : md->genericParams)
+            names.insert(gp.name);
+        if (typeRefMentionsAnyParamName(paramTy, names)) return;
+    }
+    if (!argTy) return;
+    checkAssignable(argTy, paramTy, loc,
+                    std::string("left operand of `in` over `") +
+                        std::string(recvTy->headName()) + "`",
+                    argExpr);  // §7.4 / §27.6 — narrowing-aware
+}
+
 // §14.1 (#785, #850): structurally unify a value parameter's declared type
 // (`pt`, AST) against the call argument's resolved type (`argTy`), binding each
 // method type parameter named in `paramNames` to the matching component of the

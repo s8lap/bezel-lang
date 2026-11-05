@@ -11025,8 +11025,26 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 inHead == "OwningStack" || inHead == "Queue" ||
                 inHead == "OwningQueue" || inHead == "LinkedList" ||
                 inHead == "OwningLinkedList";
+            // fix #8260 (§17.5, stdlib §4.1, v0.355): the COLLECTION
+            // INTERFACES are element families too. `ICollection<T>` declares
+            // `method Contains(item: T): bool;` (stdlib §4.1) and
+            // `IList<T>` inherits it; `IReadOnlyList<T>` /
+            // `IReadOnlyCollection<T>` reach the §5 LINQ `Contains(value: T)`
+            // extension. `checkBuiltinCollectionCallArgs` checks that call's
+            // `item: T` slot with this same `checkAssignable` (its
+            // `isEnumerableIface` row), so `in` must draw the line `Contains`
+            // draws: without this the left operand of `x in c` at an
+            // interface receiver was never checked at all, and `1.5 in lst`
+            // over an `IList<int>` reached codegen (where it is refused with
+            // the "not yet implemented" diagnostic — the wrong layer for a
+            // §5.1 conversion error).
+            bool inInterfaceFamily =
+                inHead == "IList" || inHead == "IReadOnlyList" ||
+                inHead == "ICollection" || inHead == "IReadOnlyCollection" ||
+                inHead == "IOwningList" || inHead == "IOwningCollection";
             if (inHead == "Dictionary" || inHead == "OwningDictionary" ||
-                inHead == "SortedDictionary" || inElementFamily) {
+                inHead == "SortedDictionary" || inElementFamily ||
+                inInterfaceFamily) {
                 TypeRef* keyT = inRt->genericArgs[0];
                 bool keyIsBareParam = false;
                 if (keyT && keyT->kind == TypeRef::Kind::Named &&
@@ -11052,8 +11070,39 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                         std::string("left operand of `in` over `") +
                             std::string(inHead) + "`",
                         be.left.get());  // §7.4 / §27.6 — narrowing-aware
+                    // fix #8260 (§17.5, stdlib §4 *Equality search*, §14.2):
+                    // the `Contains` ADMISSION gate, at the heads where the
+                    // `Contains` call applies one. stdlib §4 states it for the
+                    // operator too: "There the call is a compile error, `x in
+                    // xs` (language spec §17.5) and a method reference formed
+                    // over the member (language spec §27.6) included". The gate
+                    // is the SAME pair the call consults — §4's first-kind
+                    // `Equals` at the §4 equality-search heads (`ICollection`
+                    // / `IList`), §5's `T: hashable` at the others — so a
+                    // function element is ADMITTED at an `IList` receiver
+                    // (as `lst.Contains(f)` is, #7598) and REFUSED at an
+                    // `IReadOnlyList` one (as `rol.Contains(f)` is), and the
+                    // two spellings cannot drift.
+                    if (inInterfaceFamily)
+                        checkInOperatorContainsAdmission(inHead, keyT, inLoc);
                 }
             }
+        }
+        // fix #8260 (§17.5, §5.1): the `in` operator at a USER-typed receiver
+        // — a class that declares its own `Contains` (§17.5's structural
+        // lookup: "any accessible method named `Contains` taking one parameter
+        // of compatible type and returning `bool` qualifies"). The left
+        // operand is admitted exactly when `c.Contains(x)`'s ARGUMENT is:
+        // the method's own first-parameter type. The check DEFERS when the
+        // receiver declares no `Contains` (nothing for `x in c` to mean) or
+        // when the parameter's type is undecidable here (§14.2 rule 2).
+        if (be.left && be.right && inLt && inRt &&
+            inRt->kind == TypeRef::Kind::Named && inRt->declaration) {
+            SourceLocation inLoc =
+                be.left->span.begin.line != 0 ? be.left->span.begin
+                                              : be.span.begin;
+            checkInOperatorUserContainsAdmission(be.right.get(), inRt,
+                                                 be.left.get(), inLt, inLoc);
         }
         // fix #6542 (§17.5, v0.338; §5.1, v0.338; stdlib §9.6): the same
         // enumeration for the STRING receiver. `String` declares TWO

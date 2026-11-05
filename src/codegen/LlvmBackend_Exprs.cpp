@@ -13421,6 +13421,147 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 return phi;
             }
         }
+        // fix #8260 (§17.5, stdlib §4.1): `x in c` IS `c.Contains(x)` — for
+        // EVERY receiver whose static type exposes a `Contains`.
+        //
+        // The arms above cover the receivers whose `Contains` has a BESPOKE
+        // lowering: a Range (§9.8's `Contains`), a `string` (§9.6), a
+        // dict-backed `Set` (§4.10), a `Dictionary` (§4.8's `ContainsKey`), an
+        // array-backed collection (§4.4) and an inline array (§15.1.2). What
+        // was left — and what #8260 is about — is the receiver whose
+        // `Contains` is the ORDINARY CALL: a COLLECTION INTERFACE
+        // (`IList<T>` / `IReadOnlyList<T>` / `ICollection<T>` /
+        // `IReadOnlyCollection<T>`, stdlib §4.1) and a USER class that
+        // declares its own `Contains` (§17.5: "The `Contains` lookup is
+        // structural rather than interface-based: any accessible method named
+        // `Contains` taking one parameter of compatible type and returning
+        // `bool` qualifies").
+        //
+        // The lowering below is the ordinary CALL lowering of `c.Contains(x)`
+        // — the SAME arms the written call reaches
+        // (`tryLowerCollectionInstanceCall` for the built-in heads, the
+        // instance-method dispatch for a user class) — so the two spellings
+        // CANNOT DRIFT: the #853 diagnostic a polymorphic collection
+        // interface receives is the one `c.Contains(x)` receives, and a user
+        // class's own `Contains` is the one that runs. Nothing about the
+        // search itself is re-implemented here.
+        if (bin.right) {
+            const sema::TypeRef* rTy = ctx_.exprType(*bin.right);
+            if (rTy && rTy->kind == sema::TypeRef::Kind::Named) {
+                // The `Contains` PROVIDER: a built-in collection interface
+                // (stdlib §4.1–§4.2) or a user type that declares one.
+                bool listIfaceOwning = false;
+                const bool isListIface =
+                    isListInterfaceName(rTy, &listIfaceOwning);
+                const bool isCollIface = isCollectionInterfaceName(rTy);
+                sema::MethodSymbol* userContains = nullptr;
+                if (!isListIface && !isCollIface && rTy->declaration) {
+                    if (sema::MethodSymbol* ms =
+                            findMethodByName(rTy->declaration, "Contains")) {
+                        // §17.5: "taking one parameter of compatible type and
+                        // returning `bool`" — the two halves of the
+                        // structural lookup. A `Contains` that is neither is
+                        // not the member `x in c` means.
+                        if (ms->params.size() == 1) {
+                            if (llvm::FunctionType* ft = methodFnType(ms))
+                                if (ft->getReturnType() == i1())
+                                    userContains = ms;
+                        }
+                    }
+                }
+                if (isListIface || isCollIface || userContains) {
+                    // The receiver and the element are evaluated ONCE, in the
+                    // call's own order (§22.5: the receiver, then the
+                    // argument), and their VALUES are pinned into the
+                    // synthetic call's nodes — the null-conditional twin's
+                    // discipline (lowerNullCondBuiltinCall): the real
+                    // expression NODES are moved into the synthetic call and
+                    // moved back afterwards, so every classifier that reads
+                    // the receiver's or the argument's SHAPE (the
+                    // unbound-owned-temp reclaim, the §8.6 boxing decision, the
+                    // §5.1 widening) sees the same expression the written
+                    // call would.
+                    llvm::Value* recvVal = lowerExpr(*bin.right);
+                    llvm::Value* elemVal = lowerExpr(*bin.left);
+                    if (!recvVal || !elemVal) return nullptr;
+                    // A user type's `Contains` takes a DECLARED parameter
+                    // type; the argument must fit it. Sema has already
+                    // checked the conversion (§5.1) for every receiver whose
+                    // parameter type it can resolve; the guard below is the
+                    // backstop for the shapes sema DEFERS (a parameter type
+                    // that still mentions a type parameter at this
+                    // instantiation), where a mismatch would otherwise reach
+                    // the IR as an ill-typed call argument.
+                    if (userContains) {
+                        llvm::Type* paramTy = nullptr;
+                        if (llvm::FunctionType* ft = methodFnType(userContains))
+                            if (ft->getNumParams() >= 2)
+                                paramTy = ft->getParamType(1);
+                        if (paramTy && elemVal->getType() != paramTy &&
+                            !(paramTy->isIntegerTy() &&
+                              elemVal->getType()->isIntegerTy()) &&
+                            !(paramTy->isFloatingPointTy() &&
+                              elemVal->getType()->isFloatingPointTy())) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, bin.span.begin,
+                                "the left operand of `in` over `" +
+                                    std::string(rTy->headName()) +
+                                    "` has a type that is not implicitly "
+                                    "convertible to the parameter type of "
+                                    "`" + std::string(rTy->headName()) +
+                                    ".Contains` (§5.1, §17.5)");
+                            return nullptr;
+                        }
+                    }
+                    auto& mutBin = const_cast<ast::BinaryExpr&>(bin);
+                    const ast::Expr* rcvKey = mutBin.right.get();
+                    const ast::Expr* elemKey = mutBin.left.get();
+                    exprValueOverride_[rcvKey] = recvVal;
+                    exprValueOverride_[elemKey] = elemVal;
+
+                    auto synth = std::make_unique<ast::CallExpr>();
+                    synth->span = bin.span;
+                    {
+                        auto callee = std::make_unique<ast::MemberAccessExpr>();
+                        callee->span = bin.span;
+                        callee->member = "Contains";
+                        callee->target = std::move(mutBin.right);
+                        ctx_.setExprType(
+                            callee.get(),
+                            ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+                        // The user type's own `Contains` — §26.5 rule 1
+                        // commits to the instance member, and the ordinary
+                        // instance-method dispatch needs the resolved symbol
+                        // to pick the (possibly virtual) implementation.
+                        if (userContains)
+                            ctx_.setExprSymbol(callee.get(), userContains);
+                        synth->callee = std::move(callee);
+                    }
+                    {
+                        ast::CallArgument arg;
+                        arg.value = std::move(mutBin.left);
+                        synth->args.push_back(std::move(arg));
+                    }
+                    ctx_.setExprType(
+                        synth.get(),
+                        ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+                    llvm::Value* result = lowerExpr(*synth);
+                    // Put the moved nodes back and drop the pins, whether or
+                    // not the call lowered.
+                    mutBin.right = std::move(
+                        static_cast<ast::MemberAccessExpr*>(synth->callee.get())
+                            ->target);
+                    mutBin.left = std::move(synth->args[0].value);
+                    exprValueOverride_.erase(rcvKey);
+                    exprValueOverride_.erase(elemKey);
+                    if (!result) return nullptr;
+                    // Keep the synthetic tree (and the exprType keys it
+                    // carries) alive — the null-conditional twin's discipline.
+                    inOperatorSynthCalls_.push_back(std::move(synth));
+                    return result;
+                }
+            }
+        }
         // #628 (part 1): unhandled `in` form — emit a hard error so the
         // caller sees a failed compile rather than silent garbage IR.
         ctx_.diagnostics().report(
