@@ -16288,7 +16288,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // this one, and an async lambda's slot is its task-family wrapper.
         if (!hasAscription && !lam->isAsync && lamTargetRet &&
             !lamTargetAmbiguous &&
-            lamTargetRet->kind == TypeRef::Kind::Primitive) {
+            (lamTargetRet->kind == TypeRef::Kind::Primitive ||
+             (lamTargetRet->kind == TypeRef::Kind::Named &&
+              lamTargetRet->declaration))) {
             forEachLambdaReturnValue(*lam, [&](const ast::Expr* retVal) {
                 if (!retVal || !ctx_.exprType(*retVal)) return;
                 checkAssignable(ctx_.exprType(*retVal), lamTargetRet,

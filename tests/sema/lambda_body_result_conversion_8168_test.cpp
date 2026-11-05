@@ -132,3 +132,67 @@ BEZEL_TEST(lambda_body_result_conversion_8168,
         "    var c: (int) -> string := lambda(x: int) => x;\n"
         "    Console.WriteLine(c(3));\n");
 }
+
+// narrow #8168 (second slice): the return slot is a declared NON-primitive
+// type (class, record, enum). §27.3 applies the same sentence ("its inferred
+// return type must equal the target's return slot or implicitly convert to
+// it (§5.1)"); pre-fix `(int) -> Item := lambda(x: int) => x` failed IR
+// verification and `() -> Point := lambda() => new Item()` printed garbage.
+namespace {
+const char* kDecls8168 =
+    "class Item\n"
+    "  public method V(): int => 7;\n"
+    "end Item;\n"
+    "record Point(X: int, Y: int);\n"
+    "enum Pri\n"
+    "  Low, High;\n"
+    "end Pri;\n";
+
+void expectRejectedDecl8168(const std::string& body) {
+    auto r = runAot(std::string("module M;\n") + kDecls8168 +
+                    "class C\n"
+                    "  public static method Main(): int\n" +
+                    body +
+                    "    return 0;\n"
+                    "  end Main;\n"
+                    "end C;\n");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kNeedle8168));
+}
+}  // namespace
+
+BEZEL_TEST(lambda_body_result_conversion_8168,
+           int_body_at_class_slot_rejected_spec_27_3) {
+    expectRejectedDecl8168(
+        "    var f: (int) -> Item := lambda(x: int) => x;\n"
+        "    Console.WriteLine(f(1).V());\n");
+}
+
+BEZEL_TEST(lambda_body_result_conversion_8168,
+           string_body_at_class_slot_rejected_spec_27_3) {
+    expectRejectedDecl8168(
+        "    var f: (int) -> Item := lambda(x) => \"s\";\n"
+        "    Console.WriteLine(f(1).V());\n");
+}
+
+BEZEL_TEST(lambda_body_result_conversion_8168,
+           class_body_at_record_slot_rejected_spec_27_3) {
+    expectRejectedDecl8168(
+        "    var f: () -> Point := lambda() => new Item();\n"
+        "    Console.WriteLine(f().X);\n");
+}
+
+BEZEL_TEST(lambda_body_result_conversion_8168,
+           int_body_at_enum_slot_rejected_spec_27_3) {
+    expectRejectedDecl8168(
+        "    var f: () -> Pri := lambda() => 1;\n"
+        "    Console.WriteLine(f() = Pri.High);\n");
+}
+
+BEZEL_TEST(lambda_body_result_conversion_8168,
+           block_body_int_return_at_class_slot_rejected_spec_27_3) {
+    expectRejectedDecl8168(
+        "    var f: (int) -> Item := lambda(x: int) => do return x; end;\n"
+        "    Console.WriteLine(f(1).V());\n");
+}
