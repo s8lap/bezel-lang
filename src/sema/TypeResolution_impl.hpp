@@ -1510,6 +1510,27 @@ private:
     // the outer instantiation.
     bool isGenericParamRef(const ast::Type& t, Scope* scope);
 
+    // fix #5998 item 4 (§14.2 "A type parameter as the type argument", case
+    // 1, v0.355): does the type parameter `name` in the current declaration
+    // context CARRY the constraint `kind`?
+    //
+    // §14.2 case 1: "The argument is a type parameter `P` ... the constraint
+    // is decided at that site, by `P`'s own constraints. ... A derived-property
+    // constraint is guaranteed only by `P`'s carrying the same constraint,
+    // since nothing is inferred." The parameter's own constraints are its
+    // declaration's `where` clause — the extension block's for a block
+    // parameter (§26.4: the block's parameters are constrained by its `where`
+    // clause and nothing else), the enclosing type's for a type parameter,
+    // the method's for a method parameter.
+    //
+    // The three clause sets are consulted in UNION — the same shape
+    // `checkOwnedDeclType`'s `hasValueConstraint` uses: a name is bound by
+    // whichever declaration declares it, and a shadowing name is a separate
+    // binding the union cannot tell apart (the NARROW, under-rejecting
+    // direction this codebase prefers for such a consultation).
+    bool paramCarriesConstraint(std::string_view name,
+                                std::string_view kind) const;
+
     // fix #5549 (§26.4, §14.2 v0.338): check a generic extension head's bare
     // block-parameter arguments against the extended type's declared
     // constraints, under the block's own `where` clause alone.
@@ -1762,6 +1783,19 @@ private:
     // declaration whose body resolveTypeDecl is walking (null in a local
     // type's own walk, which declares none).
     const std::vector<ast::GenericParam>* currentTypeDeclGenericParams_ = nullptr;
+    // fix #5998 item 4 (§14.2 "A type parameter as the type argument", case
+    // 1 / §26.4, v0.355): the `where` clause of the EXTENSION BLOCK whose
+    // head or members are currently being resolved (set in resolveTopDecl's
+    // extension branch, saved/restored exactly like currentMethodConstraints_
+    // beside it). It is the block's OWN parameters' constraint set — §26.4:
+    // "the block-level type parameter ... the block's `where` clause and
+    // nothing else" — and `paramCarriesConstraint` reads it wherever a
+    // block parameter is the type argument of a constrained type (the
+    // §14.2 case-1 decision AT THAT SITE: `extension Channel<T> where T:
+    // sendable` names `Channel<T>`, whose §30.15 element requirement the
+    // block's clause states). Null outside an extension block.
+    const std::vector<ast::GenericConstraint>* currentExtensionConstraints_ =
+        nullptr;
 
     // §21.10 (v0.334): true while resolving the members of a LOCAL type
     // declaration (`record`/`enum` in statement position). §21.10 forbids such

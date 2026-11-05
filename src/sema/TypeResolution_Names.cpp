@@ -923,6 +923,46 @@ enum class Tri { Yes, No, Unknown };
 
 } // namespace
 
+// fix #5998 item 4 (§14.2 "A type parameter as the type argument", case 1,
+// v0.355): does the type parameter `name` in the current declaration context
+// CARRY the constraint `kind`?
+//
+// §14.2 case 1: "The argument is a type parameter `P` ... the constraint is
+// decided at that site, by `P`'s own constraints. ... A derived-property
+// constraint is guaranteed only by `P`'s carrying the same constraint, since
+// nothing is inferred." The parameter's own constraints are its declaration's
+// `where` clause — the extension block's for a block parameter (§26.4: the
+// block's parameters are constrained by its `where` clause and nothing else),
+// the enclosing type's for a type parameter, the method's for a method
+// parameter.
+//
+// The three clause sets are consulted in UNION — the same shape
+// `checkOwnedDeclType`'s `hasValueConstraint` uses: a name is bound by
+// whichever declaration declares it, and a shadowing name is a separate
+// binding the union cannot tell apart (the NARROW, under-rejecting direction
+// this codebase prefers for such a consultation).
+bool Resolver::paramCarriesConstraint(std::string_view name,
+                                       std::string_view kind) const {
+    auto scan = [&](const std::vector<ast::GenericConstraint>& gcs) -> bool {
+        for (const auto& gc : gcs) {
+            if (gc.typeParam != name) continue;
+            for (const auto& item : gc.items)
+                if (item.kind == kind) return true;
+        }
+        return false;
+    };
+    if (currentExtensionConstraints_ && scan(*currentExtensionConstraints_))
+        return true;
+    if (currentMethodConstraints_ && scan(*currentMethodConstraints_))
+        return true;
+    if (currentOuterType_) {
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                currentOuterType_->decl))
+            if (scan(td->genericConstraints)) return true;
+    }
+    return false;
+}
+
 void Resolver::checkExtensionHeadConstraints(const ast::ExtensionDecl& ext,
                                              Scope* scope) {
     if (!ext.targetType) return;
@@ -1003,19 +1043,56 @@ void Resolver::checkExtensionHeadConstraints(const ast::ExtensionDecl& ext,
 
     // A builtin owning collection carries no GenericParamSymbol constraints;
     // its stated `class` requirement on the owning slot is the table below
-    // (stdlib owning collections). The hash-keyed builtins (Dictionary, Set)
-    // are NOT in this table: their key rule is the type-level §3.6 rule 2 at
-    // the instantiation site, not a declared `where` head constraint (#5998
-    // item 2 withdrawn). A builtin not listed here is not checked (residual).
+    // (stdlib owning collections). A builtin not listed there is not checked
+    // (residual).
     struct BuiltinRequirement {
         std::string_view name;
         std::size_t slot;
         std::string_view constraint;
     };
+    // Every BUILTIN head that DECLARES a `where` clause in the standard
+    // library, with the SLOT that clause constrains and the constraint it
+    // states. §26.4: "the extended type's declared constraints are decided
+    // there as at an instantiation site (§14.2 *A type parameter as the type
+    // argument*), by the parameters' constraints, which are the block's
+    // `where` clause and nothing else" — so a head over one of these builtins
+    // must restate the clause, exactly as the owning family already had to.
+    //
+    // The slots are the stdlib's own parameter positions, read from the
+    // declarations themselves:
+    //   stdlib §2.16  `Shared<T>` / `Weak<T>`              → `where T: class`
+    //   stdlib §4.2   `IOwningCollection<T>` /
+    //                `IOwningList<T>`                      → `where T: class`
+    //   stdlib §4.5   `OwningArray<T>`                      → `where T: class`
+    //   stdlib §4.7   `OwningLinkedList<T>`                 → `where T: class`
+    //   stdlib §4.9   `OwningDictionary<K, V>` /
+    //                `DrainedEntry<K, V>`                  → `where V: class`
+    //   stdlib §4.10  `OwningSet<T>`                        → `where T: class`
+    //   stdlib §4.11  `OwningStack<T>` / `OwningQueue<T>`   → `where T: class`
+    //   stdlib §4.13  `IOwningEnumerable<T>` /
+    //                `IOwningEnumerator<T>` /
+    //                `IOwningAsyncEnumerable<T>` /
+    //                `IOwningAsyncEnumerator<T>`           → `where T: class`
+    //   stdlib §6.6   `OwningTaskCompletionSource<T>`       → `where T: class`
+    //
+    // The hash-keyed builtins (`Dictionary<K, V>`, `Set<T>`) are NOT in this
+    // table, and neither are `SortedDictionary<K, V>` / `SortedSet<T>`: those
+    // declarations state NO `where` clause (stdlib §4.8, §4.10, §4.17,
+    // §4.18), so §26.4 has no declared constraint to restate there — the
+    // hashable key rule is the type-level §3.6 rule 2 check at the
+    // instantiation site, carried to the naming declaration's instantiations
+    // (stdlib §4.20's recorded ruling), not a head constraint.
     static constexpr BuiltinRequirement kBuiltinHeadRequirements[] = {
         {"OwningArray", 0, "class"},      {"OwningSet", 0, "class"},
         {"OwningStack", 0, "class"},      {"OwningQueue", 0, "class"},
         {"OwningLinkedList", 0, "class"}, {"OwningDictionary", 1, "class"},
+        {"Shared", 0, "class"},           {"Weak", 0, "class"},
+        {"IOwningCollection", 0, "class"}, {"IOwningList", 0, "class"},
+        {"IOwningEnumerable", 0, "class"}, {"IOwningEnumerator", 0, "class"},
+        {"IOwningAsyncEnumerable", 0, "class"},
+        {"IOwningAsyncEnumerator", 0, "class"},
+        {"DrainedEntry", 1, "class"},
+        {"OwningTaskCompletionSource", 0, "class"},
     };
 
     if (!head->declaration || head->declaration->genericParams.empty()) {
@@ -1042,7 +1119,8 @@ void Resolver::checkExtensionHeadConstraints(const ast::ExtensionDecl& ext,
                 std::string(param) + ": " + std::string(req.constraint) +
                 "` (\xC2\xA7""14.2): the builtin `" + std::string(headName) +
                 "` requires its parameter to be " +
-                "a class" +
+                (req.constraint == "class" ? "a class"
+                                           : std::string(req.constraint)) +
                 ", and an extension block's `where` clause must state it, "
                 "since a block parameter inherits no constraint from the "
                 "extended type (\xC2\xA7""26.4)");
@@ -1214,6 +1292,18 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
             bindExtensionTargetTypeParams(*ext->targetType, extScope, parent,
                                           functionSlotDiagReported);
         }
+        // fix #5998 item 4 (§14.2 "A type parameter as the type argument",
+        // case 1 / §26.4, v0.355): the block's `where` clause IS the
+        // constraint set of the block's own parameters (§26.4), so it is
+        // what decides a §14.2 constraint whose type argument is a block
+        // parameter — `extension Channel<T> where T: sendable` names
+        // `Channel<T>`, whose §30.15 element requirement the clause
+        // states. Set for the head AND the members (a member's type may
+        // name the block's parameter too), saved/restored like
+        // currentMethodConstraints_.
+        const std::vector<ast::GenericConstraint>* savedExtConstraints =
+            currentExtensionConstraints_;
+        currentExtensionConstraints_ = &ext->genericConstraints;
         if (ext->targetType) resolveType(*ext->targetType, &extScope);
         // fix #5549 (§26.4, v0.338): the head's block parameters are checked
         // against the extended type's constraints under the block's clause.
@@ -1230,6 +1320,7 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
         for (const auto& m : ext->members) {
             if (m) resolveMember(*m, &extScope);
         }
+        currentExtensionConstraints_ = savedExtConstraints;
     } else if (auto* xb =
                    dynamic_cast<const ast::ExternBlock*>(&decl)) {
         for (const auto& d : xb->methods) {
@@ -5803,6 +5894,10 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                         }
                         if (c.slot < ref.genericArgs.size()) {
                             TypeRef* arg = ref.genericArgs[c.slot];
+                            const ast::Type* argAst =
+                                c.slot < t.genericArgs.size()
+                                    ? t.genericArgs[c.slot].get()
+                                    : nullptr;
                             // argName is only used in diagnostics; the late pass
                             // checkSendableConstraintsLate produces the specific
                             // message. argSpelling (TypeResolution_Checks.cpp) also
@@ -5811,6 +5906,38 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             std::string argName = "<type>";
                             if (arg && arg->kind == TypeRef::Kind::Named) {
                                 argName = std::string(arg->headName());
+                            }
+                            // fix #5998 item 4 (§14.2 "A type parameter as
+                            // the type argument", case 1, v0.355): the
+                            // argument is a TYPE PARAMETER, so the constraint
+                            // is decided AT THIS SITE by the parameter's own
+                            // constraints — a derived property is guaranteed
+                            // only by the parameter carrying the same
+                            // constraint. The pending replay below would
+                            // instead ask the §30.14 computation about the
+                            // parameter ITSELF, which is not a type at all:
+                            // it rejects the extension head `extension
+                            // Channel<T> where T: sendable` (whose block
+                            // parameter IS constrained — §26.4) and the class
+                            // body `class Box<T> where T: sendable { … c:
+                            // Channel<T> … }` — both FALSE rejections.
+                            //
+                            // The message is the pending replay's own, so the
+                            // diagnostic a reader sees is unchanged: same
+                            // text, same site.
+                            if (argAst && isGenericParamRef(*argAst, scope)) {
+                                if (!paramCarriesConstraint(
+                                        argAst->name->parts.front(),
+                                        "sendable")) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, t.span.begin,
+                                        std::string("type argument `") +
+                                        argName +
+                                        "` does not satisfy the constraint "
+                                        "`where " + std::string(c.paramName) +
+                                        ": sendable` (§14.2)");
+                                }
+                                break;
                             }
                             ctx_.addPendingSendableConstraint(
                                 SemaContext::PendingSendableConstraint{
