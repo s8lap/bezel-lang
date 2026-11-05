@@ -31339,6 +31339,91 @@ struct StringEscapeWalker {
                static_cast<const void*>(loc->decl) == target;
     }
 
+    // fix-forward #8162 (stdlib §3.3, v0.355): the DERIVED-SPAN mode. Set ONLY
+    // by collectCtorSpanBorrowEligible — the pass that decides whether a
+    // constructor-built `ReadOnlyStringSpan` may be admitted as a CALL-BOUNDED
+    // BORROW of its source string.
+    //
+    // WHY THE MODE EXISTS. stdlib §3.3 (v0.355) defines the span's own factory
+    // in terms of the constructor — "`Slice` is `new ReadOnlyStringSpan(Source,
+    // this.Start + start, length)`" — so a member call on a span that RETURNS A
+    // SPAN mints a NEW span that BORROWS THE SAME SOURCE STRING (the compiler
+    // lowers `Slice` to a fresh {ptr,i32,i32} value carrying the SAME source
+    // pointer, with NO retain of its own). The derived span therefore ALIASES
+    // the tracked span's source and can OUTLIVE the tracked span — and with it
+    // the source string's scope end, which is where the source's own
+    // `bz_string_release` fires.
+    //
+    // The escape walk treats a method RECEIVER as a plain read, so a derived
+    // span was invisible to it: `sp.Slice(1, 3)` read `sp` safely, the tracked
+    // span was judged non-escaping, and the source was released at its scope
+    // end while the derived span still pointed at the freed string — the
+    // use-after-free the review of #8162 measured (`p09`: leak -> ASan SEGV in
+    // `bz_str_slice_cp`; `p20`: clean -> ASan SEGV).
+    //
+    // THE RULE. In this mode, a member call on the TRACKED span whose RESULT is
+    // a span is an ESCAPE of the tracked span — with ONE exception, the
+    // `LocalDecl`-binding shape below. Every other member of the span's
+    // surface returns a VALUE (Length, IsEmpty, the indexer, the search and
+    // comparison family) or a FRESH OWNED STRING (`ToString`, which
+    // materializes a new string — §3.3's "Materialization" clause), so none of
+    // them carries the source out of the tracked span's lifetime.
+    bool spanDeriveMode = false;
+
+    // fix-forward #8162 (stdlib §3.3, v0.355): is `e` a MEMBER CALL on the
+    // TRACKED span whose RESULT is a `ReadOnlyStringSpan`? Only such a call
+    // can carry the tracked span's source string past the tracked span's own
+    // lifetime (see the spanDeriveMode comment).
+    //
+    // The result type is read from the SEMANTIC type table (`ctx.exprType`),
+    // not from the member's name, so the rule does not depend on which member
+    // happens to be spelled `Slice` today: any member whose result is a span
+    // is a derivation. The `ReadOnlyStringSpan` head is read with `headName()`,
+    // the ONE alias-transparent accessor the codebase uses for a builtin's
+    // identity (the same spelling the §3.3 indexer lowering uses).
+    //
+    // The null-conditional spellings (`sp?.Slice(..)`) are covered by the same
+    // test — their result type is the same span type (nullable), and their
+    // receiver is read the same way.
+    //
+    // `callee`/`args`, when non-null, receive the call's callee and argument
+    // list so a caller that admits the derived span can walk the arguments
+    // without re-deriving the call's shape.
+    bool derivedSpanCallParts(const ast::Expr* e,
+                               const ast::Expr** callee,
+                               const std::vector<ast::CallArgument>** args) {
+        if (!spanDeriveMode) return false;
+        const ast::Expr* cal = nullptr;
+        const std::vector<ast::CallArgument>* as = nullptr;
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            cal = c->callee.get();
+            as = &c->args;
+        } else if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            cal = c->callee.get();
+            as = &c->args;
+        } else {
+            return false;
+        }
+        const ast::Expr* recv = nullptr;
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(cal))
+            recv = m->target.get();
+        else if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(cal))
+            recv = m->target.get();
+        else
+            return false;
+        if (!isTargetIdent(recv)) return false;
+        const sema::TypeRef* rt = ctx.exprType(*e);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+        if (rt->headName() != "ReadOnlyStringSpan") return false;
+        if (callee) *callee = cal;
+        if (args) *args = as;
+        return true;
+    }
+
+    bool isDerivedSpanCall(const ast::Expr* e) {
+        return derivedSpanCallParts(e, nullptr, nullptr);
+    }
+
     // #1951 / §19.2 / §20 / §28.3 / §28.9: does `e` (an expression-position
     // `case`/`when` or if-expression) have a `string` (nullable or non-
     // nullable) result? Only then does lowerCaseExpr/lowerConditional RETAIN
@@ -32935,11 +33020,42 @@ struct StringEscapeWalker {
         }
         // Call: the receiver (callee) is a read; every ARGUMENT escapes.
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            // fix-forward #8162 (stdlib §3.3, v0.355): a member call on the
+            // TRACKED span whose RESULT IS A SPAN derives a new span that
+            // borrows the SAME source string (stdlib §3.3: "`Slice` is `new
+            // ReadOnlyStringSpan(Source, this.Start + start, length)`"), so
+            // the derived span can OUTLIVE the tracked span — and with it the
+            // source string's scope end, where the source's own release
+            // fires. Read as a plain receiver read, the derived span was
+            // invisible to this walk (the review of #8162 measured the
+            // use-after-free: `return sp.Slice(1, 3);` and `keep :=
+            // sp.Slice(0, 2);` both SEGV'd once the source was released at
+            // its scope end).
+            //
+            // The ONE non-escaping position is the `LocalDecl`-binding shape,
+            // which the `LocalDecl` arm above intercepts BEFORE it walks the
+            // initializer — a binding's scope can never outlive the source
+            // string, and the binding is re-walked there for its own escapes.
+            // Every other position (a return value, a call argument, a field
+            // store, a collection element, an assignment to an already-declared
+            // local, a discarded expression) is an ESCAPE here.
+            if (isDerivedSpanCall(c)) {
+                escaped = true;
+                return;
+            }
             expr(c->callee.get(), /*safeRead=*/true);
             walkCallArgs(c->callee.get(), c->args);
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            // fix-forward #8162 (stdlib §3.3, v0.355): the null-conditional
+            // twin of the derived-span escape above — a `sp?.Slice(..)` mints
+            // the same kind of span, so it escapes the tracked span the same
+            // way.
+            if (isDerivedSpanCall(c)) {
+                escaped = true;
+                return;
+            }
             expr(c->callee.get(), /*safeRead=*/true);
             walkCallArgs(c->callee.get(), c->args);
             return;
@@ -33287,6 +33403,69 @@ struct StringEscapeWalker {
     void stmt(const ast::Stmt* s) {
         if (!s || escaped) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            // fix-forward #8162 (stdlib §3.3, v0.355): the DERIVED-SPAN
+            // BINDING shape — `var d := sp.Slice(1, 3);`, a local declaration
+            // whose initializer DERIVES a new span from the TRACKED span.
+            //
+            // WHY THIS SHAPE IS NOT AN ESCAPE (and why every other position
+            // is). stdlib §3.3 (v0.355) defines `Slice` as `new
+            // ReadOnlyStringSpan(Source, this.Start + start, length)` — the
+            // derived span BORROWS THE SAME SOURCE STRING as the tracked span.
+            // A derived span bound to a LOCAL DECLARATION is safe, because
+            // that binding can never outlive the source string: the tracked
+            // span must be VISIBLE at the binding, so the binding's scope is
+            // the tracked span's scope or a NESTED one, and the source
+            // string's scope encloses the tracked span's scope — so the
+            // derived span dies NO LATER than the source's scope end, which
+            // is exactly where the source's own `bz_string_release` fires.
+            //
+            // It is safe ONLY if the derived span's own binding never escapes
+            // (`var d := sp.Slice(1, 3); return d;` hands the alias to the
+            // caller, which outlives the source). So the SAME conservative
+            // walk is re-run with the NEW local as its target, over the WHOLE
+            // body (the alias may be copied onward anywhere later in the
+            // body, exactly like #3729's record-copy-alias relaxation), and
+            // the tracked span escapes unless that walk is clean.
+            //
+            // Every OTHER position for a derived span — a return value, a
+            // call argument, a field store, a collection element, an
+            // assignment to an already-declared local — is an ESCAPE: the
+            // alias lands where the source's scope end cannot discipline it.
+            if (spanDeriveMode && !ld->isUsing && ld->initializer) {
+                const ast::Expr* dCallee = nullptr;
+                const std::vector<ast::CallArgument>* dArgs = nullptr;
+                if (derivedSpanCallParts(ld->initializer.get(), &dCallee,
+                                         &dArgs)) {
+                    if (wholeBody) {
+                        StringEscapeWalker w2{ctx,
+                                              static_cast<const void*>(ld)};
+                        w2.spanDeriveMode = true;
+                        w2.wholeBody = wholeBody;
+                        for (auto& s2 : *wholeBody) {
+                            w2.stmt(s2.get());
+                            if (w2.escaped) break;
+                        }
+                        if (w2.escaped) {
+                            // The derived span's binding escapes — so the
+                            // derived span can outlive the source.
+                            // Conservative escape.
+                            escaped = true;
+                            return;
+                        }
+                        // The derived span dies with THIS local: the receiver
+                        // read is a plain read and the call's arguments are
+                        // walked as usual; the RESULT is not walked as an
+                        // escape (that is the whole point of this arm).
+                        expr(dCallee, /*safeRead=*/true);
+                        walkCallArgs(dCallee, *dArgs);
+                        return;
+                    }
+                    // No whole body to re-walk against: decline the
+                    // relaxation (conservative escape).
+                    escaped = true;
+                    return;
+                }
+            }
             // #1871 / §28.9 / §28.11: binding the target array directly into a
             // pure-`IEnumerable<T>` VIEW local that was independently proven never
             // to escape (safeViewAliases) is a BORROW: the view wrapper borrows the
@@ -38818,6 +38997,30 @@ static bool isClassWithRecordOrChoiceField(const sema::TypeSymbol* ts,
 // source's scope encloses or equals the span's, and the span's own scope end
 // is at or before the source's. Releasing the source at the source's scope
 // end therefore cannot free a string an alive span still points at.
+//
+// fix-forward #8162 (stdlib §3.3, v0.355): THE ADMITTED SHAPE IS NOT SOUND
+// ON ITS OWN — a span DERIVED from the admitted span breaks it. stdlib §3.3
+// defines the span's own factory in terms of this constructor ("`Slice` is
+// `new ReadOnlyStringSpan(Source, this.Start + start, length)`"), so
+// `sp.Slice(1, 3)` mints a NEW span that BORROWS THE SAME SOURCE STRING (the
+// compiler lowers it to a fresh {ptr,i32,i32} value carrying the same source
+// pointer, with no retain of its own). The derived span can OUTLIVE the
+// admitted span — and with it the source's scope end — so the walk must not
+// treat a derivation as a plain receiver read.
+//
+// The walk therefore runs in the DERIVED-SPAN mode (`spanDeriveMode`), in
+// which a member call on the tracked span whose RESULT IS A SPAN is an
+// ESCAPE, with ONE exception: a derivation bound to a LOCAL DECLARATION. A
+// local binding of a derivation can never outlive the source string — the
+// tracked span must be visible at the binding, so the binding's scope is the
+// tracked span's scope or a nested one, and the source's scope encloses the
+// tracked span's — so that shape is admitted after the new local is re-walked
+// for its own escapes (the walker's `LocalDecl` arm).
+//
+// MEASURED, the review of #8162: with the derived span NOT accounted for, the
+// admission turned a leak into a USE-AFTER-FREE — `return sp.Slice(1, 3);`
+// went leak -> ASan SEGV in `bz_str_slice_cp`, and `keep := sp.Slice(0, 2);`
+// went clean -> ASan SEGV.
 void Emitter::collectCtorSpanBorrowEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     ctorSpanBorrowDecl_.clear();
@@ -38826,10 +39029,13 @@ void Emitter::collectCtorSpanBorrowEligible(
     std::vector<std::pair<const ast::Node*, const ast::NewExpr*>> candidates;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
+        // The candidate scan below reads only `var` bindings: a §21.1 runtime
+        // `const` (ast::LocalConstDecl) is a sibling node that takes no
+        // scope-end release of its own, so a `const` span binding keeps the
+        // conservative escape (its source is NOT released — a leak, the safe
+        // direction) and no candidate is needed for it.
+        // LOCALDECL-ONLY: a §21.1 `const` local is structurally unreachable here.
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            // LOCALDECL-ONLY: a §21.1 runtime `const` (ast::LocalConstDecl)
-            // is a sibling node with no `initializer`, so it never matches
-            // here — and it takes no disposal obligation anyway.
             LocalDeclInitView v = localDeclInitView(ld);
             if (v.init && !v.isUsing) {
                 if (auto* ne = dynamic_cast<const ast::NewExpr*>(v.init)) {
@@ -38870,6 +39076,30 @@ void Emitter::collectCtorSpanBorrowEligible(
         // DEFAULT (conservative) mode: `stringReleaseMode` stays FALSE, so
         // every use of the span beyond a plain field / index read is an
         // escape, and the span's own declaration is never mistaken for one.
+        //
+        // fix-forward #8162 (stdlib §3.3, v0.355): the DERIVED-SPAN mode.
+        // stdlib §3.3 defines the span's own factory in terms of the
+        // constructor — "`Slice` is `new ReadOnlyStringSpan(Source, this.Start
+        // + start, length)`" — so a member call on the span whose RESULT IS A
+        // SPAN derives a new span that borrows the SAME source string, and
+        // that derived span can outlive the tracked span (and with it the
+        // source's scope end, where the source's own release fires). The
+        // review of #8162 measured the use-after-free this leaves open: a
+        // `return sp.Slice(1, 3);` and a `keep := sp.Slice(0, 2);` both SEGV'd
+        // once the source was released at its scope end.
+        //
+        // In this mode the walk treats such a derivation as an ESCAPE of the
+        // tracked span, with ONE exception — a derivation bound to a LOCAL
+        // DECLARATION, whose scope can never outlive the source string (the
+        // tracked span must be visible at the binding, so the binding's scope
+        // is the tracked span's scope or a nested one, and the source's scope
+        // encloses the tracked span's). The `LocalDecl` arm of the walker
+        // admits that shape after re-walking the new local for its own
+        // escapes.
+        w.spanDeriveMode = true;
+        // The WHOLE body is what the derived-span re-walk needs: a derived
+        // span's binding may be copied onward anywhere later in the body.
+        w.wholeBody = &body;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             ctorSpanBorrowDecl_.insert(

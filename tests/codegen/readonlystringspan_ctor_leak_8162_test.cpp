@@ -68,6 +68,39 @@
 // conservative direction), so row 4 uses the crash-freedom oracle: it pins
 // that the shape does not CRASH (a use-after-free IS caught by ASan without
 // LSan).
+//
+// fix-forward #8162 (stdlib §3.3, v0.355): THE DERIVED SPAN. stdlib §3.3
+// defines the span's own factory in terms of THIS constructor — "`Slice` is
+// `new ReadOnlyStringSpan(Source, this.Start + start, length)`" — so a member
+// call on a span whose RESULT IS A SPAN mints a NEW span that BORROWS THE
+// SAME SOURCE STRING (the compiler lowers it to a fresh {ptr,i32,i32} value
+// carrying the same source pointer, with no retain of its own). The derived
+// span can OUTLIVE the span it was derived from — and with it the SOURCE
+// STRING's scope end, where the source's own `bz_string_release` fires.
+//
+// The first #8162 fix proved only that the SPAN does not escape, and a
+// derived span was invisible to that proof: the escape walk reads a method
+// RECEIVER as a plain read, so `sp.Slice(1, 3)` looked like a harmless use of
+// `sp`. The review of #8162 measured the consequence — the fix turned a LEAK
+// into a HEAP-USE-AFTER-FREE (`return sp.Slice(1, 3);` SEGV'd in
+// `bz_str_slice_cp`; `keep := sp.Slice(0, 2);` SEGV'd too).
+//
+// The fix-forward admits a derived span in ONE shape: bound to a LOCAL
+// DECLARATION. A local binding of a derived span can never outlive the source
+// string — the tracked span must be VISIBLE at the binding, so the binding's
+// scope is the tracked span's scope or a nested one, and the source's scope
+// encloses the tracked span's — so that shape is sound, and it is admitted
+// after the new local is re-walked for its own escapes. EVERY other position
+// (a return value, an assignment to an outer local, a call argument, a field
+// store, a collection element) is an ESCAPE: the alias lands where the
+// source's scope end cannot discipline it, so the source keeps the
+// conservative escape and is NOT released (a deliberate leak — the safe
+// direction — and the span stays valid, as §3.3 requires).
+//
+// Rows 6 and 7 pin that direction (the crash-freedom oracle, because the
+// residual leak is deliberate and by design) and row 8 pins that the
+// in-scope shape is still LEAK-FREE (the full ASan+LSan oracle), so the
+// fix-forward did not over-reach into "every derived span is an escape".
 
 #include <string>
 
@@ -243,4 +276,155 @@ BEZEL_TEST(readonlystringspan_ctor_leak_8162,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("303\n"));
+}
+
+// ===========================================================================
+// ROW 6 — THE DERIVED SPAN THAT IS RETURNED (stdlib §3.3, v0.355).
+//
+// stdlib §3.3 (v0.355) defines the span's own factory in terms of THIS
+// constructor — "`Slice` is `new ReadOnlyStringSpan(Source, this.Start +
+// start, length)`" — so `sp.Slice(1, 3)` mints a NEW span that BORROWS THE
+// SAME SOURCE STRING (the compiler lowers it to a fresh {ptr,i32,i32} value
+// carrying the same source pointer, with no retain of its own). The derived
+// span can therefore OUTLIVE the span it was derived from — and with it the
+// SOURCE STRING's scope end, which is where the source's own
+// `bz_string_release` fires.
+//
+// The row's program returns the derived span out of the callee, so the
+// caller reads the source's storage after the callee's scope ended. Before
+// the fix-forward, the source was released at the callee's scope end and
+// this read was a HEAP-USE-AFTER-FREE (the review of #8162 measured it as
+// an ASan SEGV in `bz_str_slice_cp` — a leak turned into a crash).
+//
+// THE ORACLE. The fix-forward's answer to a derived span that outlives the
+// source is the CONSERVATIVE direction: the source keeps its escape, so it
+// is NOT released — a deliberate, documented leak (the same direction row 4
+// already pins, and the same sentence in §3.3's neighbour: the span "may
+// sit in fields, cross `await`, and outlive any scope"). The residual leak
+// is therefore EXPECTED here, and the crash-freedom oracle (ASan WITHOUT
+// LeakSanitizer — `runAotCheckedLenient`) is the one that can fail on the
+// pre-fix-forward compiler. The plain oracle then pins the EXACT stdout.
+//
+// The loop is 100 iterations (`0 .. 99` is INCLUSIVE, §16.3) so the shape
+// is exercised 100 times, not once.
+// ===========================================================================
+BEZEL_TEST(readonlystringspan_ctor_leak_8162,
+           derived_span_returned_no_uaf_spec_3_3) {
+    const char* prog =
+        "module Conf; "
+        "public class Program "
+        "  static method Mk(i: int): ReadOnlyStringSpan "
+        "    var w := \"hello\" + i.ToString(); "
+        "    var sp := new ReadOnlyStringSpan(w, 0, 5); "
+        "    return sp.Slice(1, 3); "
+        "  end Mk; "
+        "  public static method Main(): int "
+        "    var t := 0; "
+        "    for var i in 0 .. 99 do "
+        "      var sp := Mk(i); "
+        "      t := t + sp.Length; "
+        "      if i = 5 then Console.WriteLine(sp.ToString()); end if; "
+        "    end for; "
+        "    Console.WriteLine(t); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    // Crash-freedom (ASan without LSan): red on the pre-fix-forward
+    // compiler (a heap-use-after-free in the materialization).
+    BEZEL_EXPECT_TRUE(didNotCrash(prog));
+    // The value oracle: the exact stdout, unchanged by the fix-forward.
+    auto r = runAot(prog);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // "ell" — "hello5".Slice(1, 3) — and then the accumulated lengths:
+    // 100 iterations x a 3-code-point span = 300.
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ell\n300\n"));
+}
+
+// ===========================================================================
+// ROW 7 — THE DERIVED SPAN ASSIGNED TO AN OUTER LOCAL (stdlib §3.3,
+// v0.355). The twin of row 6: the derived span is not returned but stored
+// into a local declared OUTSIDE the source's scope, so it outlives the
+// source's scope end exactly the same way.
+//
+// Before the fix-forward this shape was CLEAN on the pre-fix compiler (the
+// source was never released at all — that was the leak #8162 is about) and
+// a HEAP-USE-AFTER-FREE on the #8162 fix (the review measured it as an
+// ASan SEGV). The fix-forward restores the clean-by-leak direction.
+//
+// The oracle and the expected stdout are as in row 6.
+// ===========================================================================
+BEZEL_TEST(readonlystringspan_ctor_leak_8162,
+           derived_span_assigned_outer_no_uaf_spec_3_3) {
+    const char* prog =
+        "module Conf; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var keep := new ReadOnlyStringSpan(\"\", 0, 0); "
+        "    for var i in 0 .. 99 do "
+        "      do "
+        "        var w := \"hello\" + \"world\"; "
+        "        var sp := new ReadOnlyStringSpan(w, 1, 3); "
+        "        keep := sp.Slice(0, 2); "
+        "      end; "
+        "    end for; "
+        "    Console.WriteLine(keep.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    // Crash-freedom (ASan without LSan): red on the pre-fix-forward
+    // compiler (a heap-use-after-free in the materialization).
+    BEZEL_EXPECT_TRUE(didNotCrash(prog));
+    // The value oracle: the exact stdout, unchanged by the fix-forward.
+    auto r = runAot(prog);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // "el" — "helloworld".Slice(1, 3).Slice(0, 2).
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("el\n"));
+}
+
+// ===========================================================================
+// ROW 8 — THE DERIVED SPAN USED IN SCOPE IS STILL LEAK-FREE (the control
+// for rows 6 and 7, stdlib §3.3, v0.355).
+//
+// The derived span here is bound to a LOCAL DECLARATION in the source's own
+// scope, so it dies no later than the source: a local binding of a derived
+// span can never outlive the source string (the tracked span must be
+// VISIBLE at the binding, so the binding's scope is the tracked span's
+// scope or a nested one, and the source's scope encloses the tracked
+// span's). So the source's scope-end release still fires — and this row
+// pins that with the FULL oracle (ASan AND LeakSanitizer).
+//
+// This row is the control that a fix-forward which treats EVERY derived
+// span as an escape (rather than only the ones that can outlive the source)
+// did not over-reach: such a fix would leak here, and this row would report
+// it.
+//
+// It is green on the pre-fix-forward compiler too (the #8162 fix already
+// released the source in this shape), so it is a CONTROL, not a
+// fail-without row.
+// ===========================================================================
+BEZEL_TEST(readonlystringspan_ctor_leak_8162,
+           derived_span_in_scope_still_clean_spec_3_3) {
+    const char* prog =
+        "module Conf; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var t := 0; "
+        "    for var i in 0 .. 99 do "
+        "      var w := \"hello\" + i.ToString(); "
+        "      var sp := new ReadOnlyStringSpan(w, 0, 5); "
+        "      var sp3 := sp.Slice(1, 3); "
+        "      t := t + sp3.Length + sp3.ToString().Length; "
+        "    end for; "
+        "    Console.WriteLine(t); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    auto r = runAotChecked(prog);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // 100 iterations x (a 3-code-point span + its 3-code-point
+    // materialization) = 600.
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("600\n"));
 }
