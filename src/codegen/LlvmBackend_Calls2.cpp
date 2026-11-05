@@ -11724,31 +11724,56 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // a function-typed value whose lifetime ends with the full
     // expression.
     //
-    // Release-count selection. The cell's rc on arrival at the chain-
-    // call site equals the producer's +1 (the lambda literal in the
-    // inner call's body, set by `initClosureRc` to 1) PLUS any
-    // `bz_closure_retain` the inner method's return-statement fired
-    // (Stmts.cpp:2626-2634 mints +1 for a closure-typed return whose
-    // value is NOT a +1 producer / NOT a user-method-closure-return /
-    // NOT a returned-closure-local — i.e., a borrowed value crossing a
-    // method boundary). Two patterns exist:
+    // Release count. fix-forward #8141 (§28.9 / §22.2, v0.355), replacing
+    // the #3704 "mirror the callee's return-site mint gate" scheme: the
+    // chain-call result is released EXACTLY ONCE, for every callee.
     //
-    //   1. Inner method returns a +1 producer (lambda literal, method
-    //      ref, primitive-intrinsic ref, Object-member ref): the return
-    //      does NOT mint. Closure arrives with rc=1. ONE release.
+    // The contract the caller relies on is the one `isUserMethodClosureReturnCall`
+    // states (LlvmBackend_impl.hpp): a call to a user method whose declared
+    // return type is a function type "mints exactly +1 for the returned
+    // closure cell — so the caller owns that single reference". The
+    // return-site gate (the ReturnStmt arm in LlvmBackend_Stmts.cpp and the
+    // three expression-body faces, fix #8141) establishes it on every path:
+    // a borrowed value (a field read, a parameter) is RETAINED to +1, a
+    // value that already owns a +1 (a lambda, a method reference, a user-
+    // method or lambda call, a +1-owning local, a `??` transfer) is passed
+    // through. The bound use `var g := h.Get(); … g(1)` releases that one
+    // reference at scope end; the chain use `h.Get()(1)` releases it here,
+    // after the call. One contract, one release, whichever body ran.
     //
-    //   2. Inner method returns a borrowed value (a CallExpr to a
-    //      lambda-typed local, a field read, etc.): the return mints.
-    //      Closure arrives with rc=2. TWO releases.
+    // The previous scheme re-derived "did the callee's return mint?" from
+    // `ms->decl` — the STATICALLY resolved method's AST — and released a
+    // second time when it thought so. That per-body inference at a call
+    // site cannot be sound:
+    //   * it cannot see which body RUNS: for a `virtual` base returning
+    //     `this.Fn` and an `override` returning `Pick(true) ?? throw …`,
+    //     `h.Get()(1)` on a `Sub` released the override's single +1 twice
+    //     — "refcount over-release (closure)" (review r39-rev-8141c, B2);
+    //     the interface-dispatched face of the SAME program (an interface
+    //     method has no body to read) already released once and was clean;
+    //   * it mis-reads the body it CAN see: a borrowed field body
+    //     `return this.Fn;` yields +1 (the field keeps its own reference;
+    //     the mint is what gives the result ITS reference, not a second
+    //     one), so the "borrowed body ⇒ two releases" rule freed the
+    //     holder's cell (heap-use-after-free on the next `h.Fn(1)`), and a
+    //     body with several `return`s was judged by its last one alone;
+    //   * it drifts: fix #3804 added `isLambdaClosureReturnCall` to the
+    //     return-site gate and this mirror never followed, so its own
+    //     founding shape (`return outer();`, `outer` a lambda local) has
+    //     yielded +1 and been released twice since.
+    // §28.9 (v0.355): a function value's "lifetime is managed by the runtime
+    // without user involvement" — a legal chain call must neither free a
+    // cell its holder still references nor abort. §22.2: `=> expression`
+    // "replaces the block", so the arrow and block faces share the contract.
     //
-    // The chain-call site cannot see the inner method's body directly,
-    // so walk to the LAST `ReturnStmt` of the method (`exprBody` for
-    // expression-bodied methods, last statement in `stmts` for block-
-    // bodied methods) and apply the SAME predicate Stmts.cpp:2626 uses
-    // to gate its mint. If the predicate would fire retain, emit two
-    // releases here; otherwise one. This mirrors the IIFE site at
-    // line 5520 in either case (which already does this for inline-
-    // created closures).
+    // Known residual, NOT compensated here (issue #8175): a body the return-
+    // site gate cannot classify as a transfer — an all-lambda `case`
+    // expression, a mixed-arm `Z ?? lambda` / `Pick() ?? this.Fn`, a
+    // conditional of two `??` transfers — yields +2, and now leaks at the
+    // chain use exactly as it already leaks at every bound use. The fix for
+    // that belongs at the return site (per-arm minting), where it fixes
+    // every use at once; a call-site compensation would reintroduce the
+    // per-body inference above.
     //
     // Callee-kind gate. This arm covers BOTH the chain-call `f()()`
     // shape (callee IS a CallExpr — producer closure, balanced by the
@@ -11823,91 +11848,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 if (!disposeStack_.empty())
                     disposeStack_.back().push_back(d);
             }
-            // #422 / §28.9: release the transient closure after the call.
-            // fix #3704 (narrowed) / §27.5 / §28.9 / §30.5 (v0.287):
-            // mirror the Stmts.cpp:2626 mint gate at the chain-call
-            // site. When the inner method's return-statement mints (a
-            // borrowed value crossing the function boundary), two
-            // releases balance producer + mint; otherwise one release
-            // balances the producer alone. Probe-verified across all
-            // five chains in scope here (Rows 1-5 below):
-            //   * Rows 1-3 — `return outer();` — outer() is a CallExpr
-            //     to a lambda-typed local; Stmts.cpp:2626 fires retain;
-            //     chain call needs TWO.
-            //   * Row 4 — `return lambda() => lambda() => x;` — outer
-            //     lambda is a producer; no retain; ONE release.
-            //   * Row 5 — `return lambda() => x;` — producer; ONE.
+            // #422 / §28.9: release the transient closure after the call —
+            // ONCE (fix-forward #8141, see the release-count note above).
             //
-            // Callee-kind gate (narrow #3704, this fix): the chain-call
-            // shape has `call.callee` = CallExpr (a producer); the
-            // IndexExpr-borrow shape `xs[0]()` has `call.callee` =
-            // IndexExpr (a borrow — the read produces no +1 to
-            // balance). Skip BOTH releases for the IndexExpr shape.
-            if (auto* calleeCall =
-                    dynamic_cast<const ast::CallExpr*>(call.callee.get())) {
-                bool innerMints = false;
-                if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
-                        ctx_.exprSymbol(*calleeCall->callee))) {
-                    // SEAM-DEBT: #3704 — class-3 read on ms->decl for the chain-call mint gate;
-                    // safe because the inner method is reached only via local CallExpr callee
-                    // (the outer `f()` in `f()()`); an imported callee would not produce a
-                    // CallExpr here at all (the chain-call shape is local-only).
-                    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-                        const ast::Expr* retVal = nullptr;
-                        if (md->bodyKind == ast::MethodBodyKind::Expression &&
-                            md->exprBody) {
-                            retVal = md->exprBody.get();
-                        } else {
-                            const ast::ReturnStmt* ret = nullptr;
-                            for (const auto& s : md->stmts) {
-                                if (auto* r =
-                                        dynamic_cast<const ast::ReturnStmt*>(s.get()))
-                                    ret = r;
-                            }
-                            if (ret) retVal = ret->value.get();
-                        }
-                        if (retVal) {
-                            // fix #4239 (§28.3 / §30.5, v0.298): the
-                            // returnedClosureLocalOwnsPlusOne() predicate
-                            // returns false when called from the chain-call
-                            // site (currentFn_ = C.Main, not MakeClosure),
-                            // so this test was always false for the named-
-                            // local return case. Directly check whether retVal
-                            // is a local-identifier whose initializer is a +1
-                            // closure producer (lambda literal or method ref).
-                            // For `return f;` where `f := lambda() => …`:
-                            //   - f's initializer IS a +1 producer → local
-                            //     owns the +1 → innerMints = false → ONE
-                            //     release (correct, no double-free).
-                            // For `return g();` where g is a closure local:
-                            //   - g's initializer is a lambda (a +1 producer)
-                            //     but the call CONSUMES g (rc(g) goes to 0),
-                            //     and the return mints a new +1 → innerMints
-                            //     = true → TWO releases (correct).
-                            bool localOwnsPlusOne = false;
-                            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(retVal)) {
-                                if (auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id))) {
-                                    LocalDeclInitView dv = localDeclInitView(loc->decl);
-                                    if (dv.init && isPlusOneClosureProducer(dv.init))
-                                        localOwnsPlusOne = true;
-                                }
-                            }
-                            // fix-forward #8141 (§28.9, v0.355): mirror the
-                            // return-site mint gate's `??` transfer exclusion
-                            // (isCoalescedClosureTransfer). `return Pick() ??
-                            // throw …` no longer mints, so releasing twice here
-                            // over-released the caller's single +1.
-                            innerMints = !isPlusOneClosureProducer(retVal) &&
-                                         !isUserMethodClosureReturnCall(retVal) &&
-                                         !isCoalescedClosureTransfer(retVal) &&
-                                         !localOwnsPlusOne;
-                        }
-                    }
-                }
+            // Callee-kind gate (narrow #3704): the chain-call shape has
+            // `call.callee` = CallExpr (a +1 producer by the contract above);
+            // the IndexExpr-borrow shape `xs[0]()` has `call.callee` =
+            // IndexExpr (a borrow — the read produces no +1 to balance), and
+            // skips the release.
+            if (dynamic_cast<const ast::CallExpr*>(call.callee.get()))
                 emitClosureRelease(closurePtr);
-                if (innerMints)
-                    emitClosureRelease(closurePtr);
-            }
             return ccRes;
         }
     }

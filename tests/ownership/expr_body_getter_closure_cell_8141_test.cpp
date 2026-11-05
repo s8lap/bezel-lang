@@ -462,6 +462,249 @@ class P
 end P;
 )BZL";
 
+// ── fix-forward 2 (review r39-rev-8141c, B2): ONE release, whatever body ran ─
+// The chain-call site used to re-derive "did the callee's return mint?" from
+// `ms->decl` — the STATICALLY resolved method's AST — and release twice when
+// it thought so. §12.1 (v0.355): an override's "return type … must match the
+// base member exactly"; the caller sees ONE signature and cannot know which
+// body runs. §28.9: a function value's "lifetime is managed by the runtime
+// without user involvement". The contract every body satisfies (the
+// return-site mint, fix #8141) is "exactly +1 to the caller", so the chain
+// site releases exactly once, for every callee. MEASURED on 736cdf5c
+// (`bezelc --sanitize=address`, 100x): every program below except the
+// interface twin aborted ("refcount over-release (closure)") or freed the
+// holder's cell (heap-use-after-free).
+
+// B2 — a `virtual` BLOCK getter returning the field, an `override` returning
+// a `??` transfer; chain-called on both receivers. 100 x (8 + 2 + 8 + 8) = 2600.
+const char* kChainVirtualOverrideBlock = R"BZL(module M;
+class Holder
+  public Fn: (int)->int;
+  public constructor() this.Fn := lambda(x: int) => x + 7; end constructor;
+  public static method Pick(some: bool): ((int)->int)?
+    if some then return lambda(x: int) => x * 2; end;
+    return null;
+  end Pick;
+  public virtual method Get(): (int)->int
+    return this.Fn;
+  end Get;
+end Holder;
+class Sub: Holder
+  public constructor() base(); end constructor;
+  public override method Get(): (int)->int
+    return Holder.Pick(true) ?? throw new InvalidOperationException("x");
+  end Get;
+end Sub;
+class P
+  public static method Main(): int
+    using var h: Holder := new Holder();
+    using var s: Holder := new Sub();
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do total := total + h.Get()(1) + s.Get()(1) + h.Fn(1) + s.Fn(1); i := i + 1; end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL";
+
+// B2, the ARROW twin. 2600.
+const char* kChainVirtualOverrideArrow = R"BZL(module M;
+class Holder
+  public Fn: (int)->int;
+  public constructor() this.Fn := lambda(x: int) => x + 7; end constructor;
+  public static method Pick(some: bool): ((int)->int)?
+    if some then return lambda(x: int) => x * 2; end;
+    return null;
+  end Pick;
+  public virtual method Get(): (int)->int => this.Fn;
+end Holder;
+class Sub: Holder
+  public constructor() base(); end constructor;
+  public override method Get(): (int)->int => Holder.Pick(true) ?? throw new InvalidOperationException("x");
+end Sub;
+class P
+  public static method Main(): int
+    using var h: Holder := new Holder();
+    using var s: Holder := new Sub();
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do total := total + h.Get()(1) + s.Get()(1) + h.Fn(1) + s.Fn(1); i := i + 1; end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL";
+
+// B2 — a `virtual` GENERIC block getter, the override returning
+// `Pick(c) ?? lambda` (both arms +1 producers: a transfer). The override
+// yields 2 when `c` (50 calls) and 4 otherwise (50 calls).
+// 100 x (8 + 8 + 8) + 50 x 2 + 50 x 4 = 2700.
+const char* kChainVirtualGenericOverrideBlock = R"BZL(module M;
+class Holder
+  public Fn: (int)->int;
+  public constructor() this.Fn := lambda(x: int) => x + 7; end constructor;
+  public static method Pick(some: bool): ((int)->int)?
+    if some then return lambda(x: int) => x * 2; end;
+    return null;
+  end Pick;
+  public virtual method GetG<T>(t: T, c: bool): (int)->int
+    return this.Fn;
+  end GetG;
+end Holder;
+class Sub: Holder
+  public constructor() base(); end constructor;
+  public override method GetG<T>(t: T, c: bool): (int)->int
+    return Holder.Pick(c) ?? lambda(x: int) => x + 3;
+  end GetG;
+end Sub;
+class P
+  public static method Main(): int
+    using var h: Holder := new Holder();
+    using var s: Holder := new Sub();
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do total := total + h.GetG<string>("a", i mod 2 = 0)(1) + s.GetG<string>("a", i mod 2 = 0)(1) + h.Fn(1) + s.Fn(1); i := i + 1; end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL";
+
+// B2, the generic-virtual ARROW twin. 2700.
+const char* kChainVirtualGenericOverrideArrow = R"BZL(module M;
+class Holder
+  public Fn: (int)->int;
+  public constructor() this.Fn := lambda(x: int) => x + 7; end constructor;
+  public static method Pick(some: bool): ((int)->int)?
+    if some then return lambda(x: int) => x * 2; end;
+    return null;
+  end Pick;
+  public virtual method GetG<T>(t: T, c: bool): (int)->int => this.Fn;
+end Holder;
+class Sub: Holder
+  public constructor() base(); end constructor;
+  public override method GetG<T>(t: T, c: bool): (int)->int => Holder.Pick(c) ?? lambda(x: int) => x + 3;
+end Sub;
+class P
+  public static method Main(): int
+    using var h: Holder := new Holder();
+    using var s: Holder := new Sub();
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do total := total + h.GetG<string>("a", i mod 2 = 0)(1) + s.GetG<string>("a", i mod 2 = 0)(1) + h.Fn(1) + s.Fn(1); i := i + 1; end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL";
+
+// The INTERFACE-dispatched twin: two implementers with the two bodies, both
+// called through `IG`. An interface method has no body to read, so this face
+// already released once on 736cdf5c (an admitting twin: green on both arms);
+// it pins that the dispatched faces agree. 100 x (8 + 2 + 8) = 1800.
+const char* kChainInterfaceTwin = R"BZL(module M;
+interface IG
+  method Get(): (int)->int;
+end IG;
+class Holder: IG
+  public Fn: (int)->int;
+  public constructor() this.Fn := lambda(x: int) => x + 7; end constructor;
+  public static method Pick(some: bool): ((int)->int)?
+    if some then return lambda(x: int) => x * 2; end;
+    return null;
+  end Pick;
+  public method Get(): (int)->int
+    return this.Fn;
+  end Get;
+end Holder;
+class Other: IG
+  public constructor() end constructor;
+  public method Get(): (int)->int => Holder.Pick(true) ?? throw new InvalidOperationException("x");
+end Other;
+class P
+  public static method Main(): int
+    using var h := new Holder();
+    using var o := new Other();
+    var a: IG := h;
+    var b: IG := o;
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do total := total + a.Get()(1) + b.Get()(1) + h.Fn(1); i := i + 1; end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL";
+
+// The simplest body of all, chain-called: a non-virtual BLOCK `return
+// this.Fn;`. The field keeps its reference; the mint gives the result its
+// one; the old "borrowed body ⇒ two releases" rule freed the holder's cell
+// (heap-use-after-free on `h.Fn(1)`, MEASURED on 301f24f2 and 736cdf5c).
+// 100 x (8 + 8) = 1600.
+const char* kChainFieldBlock = R"BZL(module M;
+class Holder
+  public Fn: (int)->int;
+  public constructor() this.Fn := lambda(x: int) => x + 7; end constructor;
+  public method Get(): (int)->int
+    return this.Fn;
+  end Get;
+end Holder;
+class P
+  public static method Main(): int
+    using var h := new Holder();
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do total := total + h.Get()(1) + h.Fn(1); i := i + 1; end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL";
+
+// Its ARROW twin (`=> this.Fn`, the issue's own getter, chain-called). 1600.
+const char* kChainFieldArrow = R"BZL(module M;
+class Holder
+  public Fn: (int)->int;
+  public constructor() this.Fn := lambda(x: int) => x + 7; end constructor;
+  public method Get(): (int)->int => this.Fn;
+end Holder;
+class P
+  public static method Main(): int
+    using var h := new Holder();
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do total := total + h.Get()(1) + h.Fn(1); i := i + 1; end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL";
+
+// The #3704 founding shape, chain-called: `return outer();` where `outer`
+// is a lambda-typed local. Fix #3804 made the return site treat that call
+// as a transfer (`isLambdaClosureReturnCall`), so the result has been +1
+// since; the mirror never followed and released twice ("refcount
+// over-release (closure)", MEASURED on 301f24f2 and 736cdf5c). 100 x 3 = 300.
+const char* kChainOuterLambdaCall = R"BZL(module M;
+class C
+  public static method Make(): () -> int
+    var x := 3;
+    var outer := lambda() => do
+      return lambda() => x;
+    end;
+    return outer();
+  end Make;
+  public static method Main(): int
+    var total := 0;
+    var i := 0;
+    while i < 100 do total := total + C.Make()(); i := i + 1; end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end C;
+)BZL";
+
 }  // namespace
 
 // ===========================================================================
@@ -581,4 +824,71 @@ BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
 BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
            spec_22_2_chain_call_of_arrow_coalesced_lambda_releases_once) {
     expectCleanRun(kChainCoalesceLambdaArrow, "200\n");
+}
+
+// ===========================================================================
+// ROW 15 — B2: `virtual` block getter + `??`-transfer override, chain-called
+// on a Holder AND a Sub. RED on 736cdf5c (refcount over-release on the Sub).
+// ===========================================================================
+BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
+           spec_12_1_chain_call_releases_once_whichever_virtual_block_body_runs) {
+    expectCleanRun(kChainVirtualOverrideBlock, "2600\n");
+}
+
+// ===========================================================================
+// ROW 16 — B2, the arrow twin. RED on 736cdf5c.
+// ===========================================================================
+BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
+           spec_12_1_chain_call_releases_once_whichever_virtual_arrow_body_runs) {
+    expectCleanRun(kChainVirtualOverrideArrow, "2600\n");
+}
+
+// ===========================================================================
+// ROW 17 — B2, generic-virtual block. RED on 736cdf5c.
+// ===========================================================================
+BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
+           spec_12_1_chain_call_releases_once_whichever_generic_virtual_block_body_runs) {
+    expectCleanRun(kChainVirtualGenericOverrideBlock, "2700\n");
+}
+
+// ===========================================================================
+// ROW 18 — B2, generic-virtual arrow. RED on 736cdf5c.
+// ===========================================================================
+BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
+           spec_12_1_chain_call_releases_once_whichever_generic_virtual_arrow_body_runs) {
+    expectCleanRun(kChainVirtualGenericOverrideArrow, "2700\n");
+}
+
+// ===========================================================================
+// ROW 19 — the interface-dispatched twin (admitting twin: green on 736cdf5c).
+// ===========================================================================
+BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
+           spec_28_9_chain_call_through_interface_releases_once_for_either_implementer) {
+    expectCleanRun(kChainInterfaceTwin, "1800\n");
+}
+
+// ===========================================================================
+// ROW 20 — the simplest body, block `return this.Fn;`, chain-called.
+// RED on 301f24f2 and 736cdf5c (heap-use-after-free of the holder's cell).
+// ===========================================================================
+BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
+           spec_28_9_chain_call_of_block_field_getter_does_not_free_the_field) {
+    expectCleanRun(kChainFieldBlock, "1600\n");
+}
+
+// ===========================================================================
+// ROW 21 — its arrow twin `=> this.Fn`, chain-called. RED on both.
+// ===========================================================================
+BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
+           spec_22_2_chain_call_of_arrow_field_getter_does_not_free_the_field) {
+    expectCleanRun(kChainFieldArrow, "1600\n");
+}
+
+// ===========================================================================
+// ROW 22 — the #3704 founding shape `return outer();`, chain-called.
+// RED on 301f24f2 and 736cdf5c (refcount over-release).
+// ===========================================================================
+BEZEL_TEST(ownership_expr_body_getter_closure_cell_8141,
+           spec_28_9_chain_call_of_returned_lambda_call_releases_once) {
+    expectCleanRun(kChainOuterLambdaCall, "300\n");
 }

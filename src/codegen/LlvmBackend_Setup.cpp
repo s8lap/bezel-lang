@@ -12007,9 +12007,11 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             // method with a function return type as a +1 producer, so
             // `var g := h.Get();` arms a scope-end `bz_closure_release`, and
             // the chain-call site (`h.Get()(1)`, LlvmBackend_Calls2.cpp)
-            // releases twice for a borrowed body. Without this mint
-            // `=> this.Fn` / `=> this.Items[0]` / `=> param` handed back +0,
-            // so the caller's release dropped the field's ONLY reference: the
+            // releases once after the call (fix-forward #8141: it no longer
+            // infers a count from the callee's body). Without this mint
+            // `=> this.Fn` / `=> this.Items[0]` handed back +0 (a bare
+            // `=> param` is rejected by §28.14 before codegen), so the
+            // caller's release dropped the field's ONLY reference: the
             // §28.9 runtime-managed closure was freed while its holder still
             // stored it (heap-use-after-free on the next read). Same predicate,
             // same transfer exclusions, same `currentReturnTypeNode_` key
