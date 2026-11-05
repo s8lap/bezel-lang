@@ -113,6 +113,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -440,6 +441,42 @@ BEZEL_TEST(case_expr_owned_scrutinee_capture_8031,
 // compiler reads 300 allocations / 22400 bytes and the row fails on a NUMBER,
 // not on a yes/no. (The one-shot static-field row is the exception: a static
 // initializer runs once per program, so it cannot be amplified that way.)
+//
+// THE THREE CONTRACT-CLAUSE POSITIONS ARE ALSO PURE BODIES, AND THAT CHANGES
+// WHAT THEY CAN ASSERT. A `requires` / `ensures` clause and a class
+// `invariant` member are PURE BODIES: §22.16 (spec line 5614, v0.355) -- "Each
+// clause's expression is of type `bool`, is admitted under the pure-body
+// discipline of §22.15 with the amendments of this section, and can neither
+// write state, consume or dispose a value, nor suspend." §22.15's list is
+// CLOSED, and its prohibited list rejects, inside a pure body: class
+// construction (`new C(...)`), a call to a member that is not `pure`-declared,
+// a call returning an `owned` class instance, `move`, and an `owned` argument.
+//
+// ⇒ AN UNBOUND OWNED TEMPORARY CANNOT ARISE IN A CLAUSE. §28.3.4's producers
+// table classifies as Owned exactly the shapes §22.15 forbids in a pure body
+// -- `new T(...)`, an owned-returning call, `move x`, an `owned` argument, a
+// class collection literal, an owning-choice construction -- and the only
+// allocations a pure body may perform are RECORDS (which carry no disposal
+// obligation, §9.7) and runtime-managed values (§28.9). So §28.3.11's "`case`
+// scrutinees extend the boundary" rule -- the rule #8031 implements -- has
+// NOTHING to bind to at a clause position: the construct's owned scrutinee
+// temporary cannot be produced there, so it cannot be captured, and it cannot
+// be leaked either.
+//
+// The rows that USED to sit here called an IMPURE `Mk()` inside the clause
+// (`requires ((case Mk() of _ => 1) = 1)`). THOSE PROGRAMS ARE SPEC-INVALID:
+// §22.15 rule 6 rejects the call ("the resolved target `Mk` is not
+// pure-declared"), and §22.16 states the same rule as "callees must be pure"
+// (spec line 5644). Since #8134's narrow made the pure-body checker WALK a
+// `case` arm's scrutinee expression, the compiler rejects them, and these
+// three rows failed with `r.ran == false`.
+//
+// So the three positions are pinned TWO ways now: a POSITIVE row per position
+// (the clause's `case` expression over a BORROWED class-typed scrutinee -- the
+// only scrutinee shape §22.15 admits at a clause position -- asserting the
+// clause is admitted, is evaluated, and does NOT reclaim a scrutinee it does
+// not own), and a NEGATIVE row per position (the OLD impure-`Mk` program is
+// REJECTED with §22.15's exact diagnostic).
 // =========================================================================
 
 // An INSTANCE FIELD INITIALIZER -- `public r: int := (case Mk() of _ => 1);`.
@@ -640,11 +677,128 @@ BEZEL_TEST(case_expr_owned_scrutinee_capture_8031,
     expectNoLeak(r, "100\n");
 }
 
-// A `requires` CLAUSE (§22.16) -- the clause's expression is evaluated at
-// every call, so 100 calls amplify the leak 100-fold.
+// =========================================================================
+// The CONTRACT-CLAUSE positions -- the three declaration-site positions that
+// are ALSO PURE BODIES (§22.16 + §22.15; the header above states the
+// consequence). An owned scrutinee temporary cannot arise here, so these rows
+// pin the POSITIVE observable the position admits -- the clause is admitted,
+// it is EVALUATED, and the construct does NOT reclaim a scrutinee it does not
+// own -- and the NEGATIVE one: the old impure-`Mk` program is rejected.
+//
+// The borrow-only guarantee (§22.16, spec line 5644) is what makes the
+// positive shape possible at all: "a read of a named owned binding in a
+// clause is always §28.3's unmarked borrow read".
+// =========================================================================
+
+// A `requires` CLAUSE (§22.16) whose `case` scrutinee is the member's own
+// CLASS-TYPED PARAMETER -- §28.3.4's producers table: "Parameter `p` (no
+// modifier) | Borrowed (source: caller)" -- and §22.15 rule 1 admits a
+// parameter read in a pure body. The clause is evaluated on every
+// invocation, so 100 calls evaluate it 100 times.
+//
+// The row asserts the clause is ADMITTED and EVALUATED (the program runs and
+// prints), that NOTHING LEAKS, and that the caller's array is STILL THERE
+// afterwards: the construct must not reclaim a scrutinee it does not own, and
+// a construct that wrongly reclaimed it would take the caller's array out
+// from under the caller (a double free / use-after-free, which the ASan leg
+// catches).
 BEZEL_TEST(case_expr_owned_scrutinee_capture_8031,
-           requires_clause_captures_owned_scrutinee_spec_28_3_11) {
+           requires_clause_borrowed_scrutinee_is_not_reclaimed_spec_22_16) {
     JitResult r = runAotChecked(declProg(
+        "  public static method F(arr: OwningArray<Cell>): int "
+        "    requires ((case arr of _ => 1) = 1) "
+        "    return arr.Count; "
+        "  end F; ",
+        "    using var arr := Mk(); "
+        "    var total := 0; "
+        "    var i := 0; "
+        "    while i < 100 do "
+        "      total := total + F(arr); "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(total); "
+        "    Console.WriteLine(arr.Count); "
+        "    return 0; "));
+    expectNoLeak(r, "100\n1\n");
+}
+
+// An `ensures` CLAUSE (§22.16) -- the same position as the `requires` clause,
+// evaluated at the callee's normal-completion path. (The AOT-checked leg runs
+// with §22.16's checked-contracts mode on, so the clause IS emitted.)
+BEZEL_TEST(case_expr_owned_scrutinee_capture_8031,
+           ensures_clause_borrowed_scrutinee_is_not_reclaimed_spec_22_16) {
+    JitResult r = runAotChecked(declProg(
+        "  public static method F(arr: OwningArray<Cell>): int "
+        "    ensures ((case arr of _ => 1) = 1) "
+        "    return arr.Count; "
+        "  end F; ",
+        "    using var arr := Mk(); "
+        "    var total := 0; "
+        "    var i := 0; "
+        "    while i < 100 do "
+        "      total := total + F(arr); "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(total); "
+        "    Console.WriteLine(arr.Count); "
+        "    return 0; "));
+    expectNoLeak(r, "100\n1\n");
+}
+
+// A CLASS `invariant` (§22.16, "Class invariants") -- the invariant's
+// expression is checked in the declaring class's context (its private fields
+// readable), and the scrutinee is the instance's OWN `owned` field, which
+// §28.3.4 classifies as a BORROW ("Field access `obj.f` where `f` is `owned`
+// | Borrowed (source: `obj`)"). The instance owns the array; the clause must
+// not reclaim it. The invariant is evaluated at the construction exit, so 100
+// constructions evaluate it 100 times.
+BEZEL_TEST(case_expr_owned_scrutinee_capture_8031,
+           class_invariant_borrowed_scrutinee_is_not_reclaimed_spec_22_16) {
+    JitResult r = runAotChecked(declProg(
+        "  private owned _cells: OwningArray<Cell>; "
+        "  public constructor() "
+        "    _cells := new OwningArray<Cell>(); "
+        "    _cells.Add(new Cell()); "
+        "  end constructor; "
+        "  invariant ((case this._cells of _ => 1) = 1); ",
+        "    var total := 0; "
+        "    var i := 0; "
+        "    while i < 100 do "
+        "      using var h := new H(); "
+        "      total := total + 1; "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(total); "
+        "    return 0; "));
+    expectNoLeak(r, "100\n");
+}
+
+// =========================================================================
+// The REJECTION rows -- the OLD impure-`Mk` programs, pinned as REJECTED.
+//
+// The programs are the ones these three rows used to run. They are SPEC-INVALID
+// (§22.16 + §22.15: a clause is a pure body, and a pure body may not call a
+// member that is not `pure`-declared), and the compiler's rejection is
+// CORRECT -- so the row pins the rejection rather than the old leak.
+//
+// The oracle is the EXACT diagnostic text (so the row cannot pass by
+// observing the absence of something) plus a REAL compile-time location (so
+// a crash, a timeout, or an ASan report cannot pass as a rejection -- see
+// tests/support/aot_result_asserts.hpp's `failedAtCompileTimeWithRealLocation`).
+// =========================================================================
+
+// §22.15 rule 6's diagnostic for a call to a USER member that is not
+// `pure`-declared, byte for byte: the em dash is U+2014 and the section
+// mark is U+00A7.
+constexpr const char* kImpureCallInPureBody =
+    "call is not admitted in a pure body \xE2\x80\x94 the resolved target "
+    "`Mk` is not pure-declared (\xC2\xA7" "22.15)";
+
+// A `requires` CLAUSE whose `case` scrutinee is the IMPURE `Mk()` --
+// REJECTED by §22.15 rule 6.
+BEZEL_TEST(case_expr_owned_scrutinee_capture_8031,
+           requires_clause_impure_scrutinee_rejected_spec_22_15) {
+    JitResult r = runAot(declProg(
         "  public static method F(x: int): int "
         "    requires ((case Mk() of _ => 1) = 1) "
         "    return x; "
@@ -657,15 +811,18 @@ BEZEL_TEST(case_expr_owned_scrutinee_capture_8031,
         "    end while; "
         "    Console.WriteLine(total); "
         "    return 0; "));
-    expectNoLeak(r, "100\n");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, kImpureCallInPureBody));
 }
 
-// An `ensures` CLAUSE (§22.16) -- the same position as the `requires` clause,
-// evaluated at the callee's normal-completion path. (The AOT-checked leg runs
-// with §22.16's checked-contracts mode on, so the clause IS emitted.)
+// An `ensures` CLAUSE whose `case` scrutinee is the IMPURE `Mk()` -- the
+// same rejection, at the other clause position.
 BEZEL_TEST(case_expr_owned_scrutinee_capture_8031,
-           ensures_clause_captures_owned_scrutinee_spec_28_3_11) {
-    JitResult r = runAotChecked(declProg(
+           ensures_clause_impure_scrutinee_rejected_spec_22_15) {
+    JitResult r = runAot(declProg(
         "  public static method F(x: int): int "
         "    ensures ((case Mk() of _ => 1) = 1) "
         "    return x; "
@@ -678,14 +835,19 @@ BEZEL_TEST(case_expr_owned_scrutinee_capture_8031,
         "    end while; "
         "    Console.WriteLine(total); "
         "    return 0; "));
-    expectNoLeak(r, "100\n");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, kImpureCallInPureBody));
 }
 
-// A CLASS `invariant` (§22.16) -- the invariant's expression is evaluated at
-// every construction exit, so 100 constructions amplify the leak 100-fold.
+// A CLASS `invariant` whose `case` scrutinee is the IMPURE `Mk()` -- the
+// same rejection, at the invariant position (§22.16's clause rules govern
+// the invariant member too: "checked under this section's clause rules").
 BEZEL_TEST(case_expr_owned_scrutinee_capture_8031,
-           class_invariant_captures_owned_scrutinee_spec_28_3_11) {
-    JitResult r = runAotChecked(declProg(
+           class_invariant_impure_scrutinee_rejected_spec_22_15) {
+    JitResult r = runAot(declProg(
         "  invariant ((case Mk() of _ => 1) = 1); ",
         "    var total := 0; "
         "    var i := 0; "
@@ -696,7 +858,11 @@ BEZEL_TEST(case_expr_owned_scrutinee_capture_8031,
         "    end while; "
         "    Console.WriteLine(total); "
         "    return 0; "));
-    expectNoLeak(r, "100\n");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, kImpureCallInPureBody));
 }
 
 // =========================================================================
