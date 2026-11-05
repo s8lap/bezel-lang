@@ -7,6 +7,7 @@
 #include "common/OwnershipFacts.hpp"  // fix #3588: the ONE §28.9 trivial-dispose walk
 #include "sema/NestedTypeWalk.hpp"  // fix #3597: the shared §11.6 nested-type walk
 #include "sema/Symbol.hpp"
+#include "sema/TypeResolution.hpp"  // typeRefEqual (§22.6 exact match)
 #include "sema/TypeRef.hpp"
 #include "support/Diagnostic.hpp"
 
@@ -1255,10 +1256,10 @@ void PureBodyWalker::checkPureCtorChainPurity(
 // must end, and the primary is the only constructor of such a class that
 // does not chain with `this(...)`), and the primary's construction runs for
 // EVERY instance of the class — so this content is part of what a pure
-// constructor in that class promises. The BASE class's own construction
-// content (its field initializers, and the purity of the base constructor
-// the primary invokes) is a further step up the hierarchy and is NOT walked
-// here; that is recorded as a residual in the fix's report.
+// constructor in that class promises. The purity of the base constructor
+// the primary's clause invokes is checked below (#8163); the BASE class's
+// own field initializers are a further step up the hierarchy and are NOT
+// walked here.
 void PureBodyWalker::checkPrimaryCtorConstructionContent(
     const ast::TypeDecl& td, const TypeSymbol* cls, int depth) {
     for (const ast::CallArgument& a : td.primaryBaseCtorArgs) {
@@ -1286,18 +1287,121 @@ void PureBodyWalker::checkPrimaryCtorConstructionContent(
                                   ? td.primaryBaseCtorArgs.front().value->span.begin
                                   : td.span.begin;
     // The invoked base constructor, read off the SYMBOLS (an imported base
-    // carries no AST): the unique non-static constructor whose formals the
-    // clause's arguments bind. A base with NO constructor symbol is a
-    // primary-ctor class: climb to ITS base, binding against ITS clause
-    // arguments through the both-sources accessor (never the AST), so the
-    // chain primary -> base primary -> impure base is followed too. The
-    // climbed primaries' own argument expressions are not walked (that
-    // would need their AST; SEAM-DEBT #8182).
+    // carries no AST). fix-forward #8163 (§22.10 / §11.1 / §22.5 / §22.6,
+    // v0.355): a primary-ctor base's PRIMARY is a member of its constructor
+    // overload set (§11.1: body constructors are declared "in addition" to
+    // it) yet has no ConstructorSymbol, so the candidate set is the base's
+    // non-static body constructors PLUS its primary formal list, and a
+    // candidate is the invoked one only when the clause's arguments BIND it
+    // (§22.5) — never merely because it is the only body constructor (the
+    // §22.10 idiom `class MyError(message: string): Exception(message)` with
+    // a convenience `constructor() this("default")` is invoked through its
+    // PRIMARY by `MyError(message)`). Several binding candidates are
+    // narrowed by an exact argument-type match (§22.6's identity rank).
+    //
+    // Outcomes: a BODY constructor -> its purity decides (a pure one's own
+    // chain is checked where it is declared, §22.15); the PRIMARY, or an
+    // implicit default constructor (no constructor at all) -> climb to that
+    // class's base through the both-sources clause accessor; UNDECIDED (no
+    // unique candidate) -> stop silently unless every candidate is an impure
+    // body constructor. The climbed primaries' own argument expressions are
+    // not walked (that would need their AST; SEAM-DEBT #8182).
+    //
+    // An IMPORTED primary-ctor class whose clause arguments did not replay
+    // (`primaryBaseCtorArgsOf` null; MEASURED for a non-generic imported
+    // middle primary) leaves the next step's arguments UNKNOWN, not empty:
+    // there every non-static constructor (and the primary) is a candidate,
+    // and only a UNIQUE one decides.
+    auto argMatchesType = [&](const ast::CallArgument& a,
+                              const TypeRef* formal) {
+        if (!a.value || !formal) return true;  // unknown: cannot exclude
+        const TypeRef* at = ctx_.exprType(*a.value);
+        if (!at) return true;
+        return typeRefEqual(at, formal);
+    };
     const std::vector<ast::CallArgument>* args = &td.primaryBaseCtorArgs;
+    static const std::vector<ast::CallArgument> kNoArgs;
+    bool argsKnown = true;
     for (; base && depth <= 16; ++depth) {
-        if (const ConstructorSymbol* invoked =
-                findInvokedUserCtor(base, *args)) {
-            if (!constructorIsPure(invoked))
+        std::vector<const ConstructorSymbol*> bodyCands;
+        std::size_t nonStatic = 0;
+        for (Symbol* m : base->members) {
+            auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+            if (!cs || cs->isStatic) continue;
+            ++nonStatic;
+            if (!argsKnown ||
+                ctorBindsArgs(sema::FormalsView::of(*cs), *args))
+                bodyCands.push_back(cs);
+        }
+        const std::vector<const Symbol*> primaryFields =
+            base->hasPositionalFields ? recordPositionalFieldSymbols(base)
+                                      : std::vector<const Symbol*>{};
+        bool primaryCand =
+            base->hasPositionalFields &&
+            (!argsKnown ||
+             ctorBindsArgs(sema::FormalsView::of(primaryFields), *args));
+        const bool implicitDefault =
+            nonStatic == 0 && !base->hasPositionalFields;
+        if (argsKnown && !implicitDefault &&
+            bodyCands.size() + (primaryCand ? 1u : 0u) > 1) {
+            // §22.6: narrow by exact type, all-positional clauses of a
+            // NON-generic base only (a formal spelled with a type parameter
+            // is not compared against the substituted argument type).
+            bool narrow = base->genericParams.empty();
+            for (const ast::CallArgument& a : *args)
+                if (!a.name.empty()) narrow = false;
+            if (narrow) {
+                std::vector<const ConstructorSymbol*> exact;
+                for (const ConstructorSymbol* cs : bodyCands) {
+                    bool ok = true;
+                    for (std::size_t i = 0; ok && i < args->size(); ++i) {
+                        const TypeRef* ft = formalParamResolvedType(*cs, i);
+                        if (!ft)
+                            if (const ast::Type* dt =
+                                    formalParamDeclType(*cs, i))
+                                ft = ctx_.resolvedType(*dt);
+                        ok = argMatchesType((*args)[i], ft);
+                    }
+                    if (ok) exact.push_back(cs);
+                }
+                bool primaryExact = false;
+                if (primaryCand) {
+                    primaryExact = true;
+                    for (std::size_t i = 0;
+                         primaryExact && i < args->size() &&
+                         i < primaryFields.size();
+                         ++i) {
+                        auto* fs =
+                            dynamic_cast<const FieldSymbol*>(primaryFields[i]);
+                        const TypeRef* ft =
+                            fs && fs->posParam && fs->posParam->type
+                                ? ctx_.resolvedType(*fs->posParam->type)
+                                : nullptr;
+                        primaryExact = argMatchesType((*args)[i], ft);
+                    }
+                }
+                if (exact.size() + (primaryExact ? 1u : 0u) == 1) {
+                    bodyCands = exact;
+                    primaryCand = primaryExact;
+                }
+            }
+        }
+        const std::size_t nCands = bodyCands.size() + (primaryCand ? 1u : 0u);
+        if (!implicitDefault && nCands != 1) {
+            // UNDECIDED: report only what every reading agrees on — every
+            // candidate an impure body constructor.
+            if (primaryCand || bodyCands.empty()) return;
+            for (const ConstructorSymbol* cs : bodyCands)
+                if (constructorIsPure(cs)) return;
+            reportPureViolation(
+                at, "constructor chain call",
+                "base(...) target is not pure \xE2\x80\x94 a pure "
+                "constructor's chain target must itself be declared "
+                "`pure`");
+            return;
+        }
+        if (!implicitDefault && !primaryCand) {
+            if (!constructorIsPure(bodyCands.front()))
                 reportPureViolation(
                     at, "constructor chain call",
                     "base(...) target is not pure \xE2\x80\x94 a pure "
@@ -1305,7 +1409,7 @@ void PureBodyWalker::checkPrimaryCtorConstructionContent(
                     "`pure`");
             return;
         }
-        static const std::vector<ast::CallArgument> kNoArgs;
+        // The PRIMARY (or an implicit default constructor): climb.
         const auto* baseArgs = primaryBaseCtorArgsOf(base);
         const TypeSymbol* next = nullptr;
         for (const TypeSymbol* b : base->baseTypes)
@@ -1313,6 +1417,9 @@ void PureBodyWalker::checkPrimaryCtorConstructionContent(
                 next = b;
                 break;
             }
+        // No clause arguments: KNOWN empty for a local class or an implicit
+        // default constructor; UNKNOWN for an imported primary (see above).
+        argsKnown = baseArgs || base->decl || implicitDefault;
         args = baseArgs ? baseArgs : &kNoArgs;
         base = next;
     }

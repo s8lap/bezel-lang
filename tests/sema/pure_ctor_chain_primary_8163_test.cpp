@@ -528,3 +528,206 @@ BEZEL_TEST(pure_ctor_chain_primary_8163,
         "  end Main;\n"
         "end Program;\n"));
 }
+
+// =========================================================================
+// fix-forward #8163 (round 4) — the invoked base constructor of a
+// PRIMARY-CTOR base. §11.1 / §22.10 (v0.355): a primary-ctor class's body
+// constructors are declared "in addition" to its primary, so the primary is a
+// member of the base's constructor overload set even though it has no
+// ConstructorSymbol; §22.5 decides which member the clause's arguments bind.
+// Round 3 took "the base has ONE body constructor" to mean "that is the
+// invoked one" and so rejected the §22.10 idiom below, whose clause
+// `MyError(message)` binds MyError's PRIMARY, not its 0-arity convenience
+// constructor. Reviewer probes p24 / p01 / p20 / p22 (accept), p05 (reject),
+// p03 (reject: an overload set discriminated by type only).
+// =========================================================================
+
+namespace {
+// The full diagnostic line, so a reject row asserts the text, not a needle.
+constexpr const char* kBaseChainLine =
+    "constructor chain call is not admitted in a pure body \xE2\x80\x94 "
+    "base(...) target is not pure \xE2\x80\x94 a pure constructor's chain "
+    "target must itself be declared `pure`";
+
+// The ONE Error diagnostic, and its message begins with `line`.
+const bezel::Diagnostic* theErrorStartingWith(
+    const bezel::test::SemaResult& r, const std::string& line) {
+    const bezel::Diagnostic* hit = nullptr;
+    std::size_t errors = 0;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        ++errors;
+        if (d.message.rfind(line, 0) == 0) hit = &d;
+    }
+    return errors == 1 ? hit : nullptr;
+}
+
+constexpr const char* kThrowProgram =
+    "class Program\n"
+    "  public static pure method Run(x: int): int\n"
+    "    if x < 0 then throw new E(); end;\n"
+    "    return x;\n"
+    "  end Run;\n"
+    "  public static method Main(): int\n"
+    "    try Console.WriteLine(Run(-1));\n"
+    "    catch var e: Exception => Console.WriteLine(\"caught \" + e.Message);\n"
+    "    end;\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// p01: PB's clause target is its PRIMARY (arity 1); its impure 0-arity body
+// constructor is not invoked by `PB(m)`.
+constexpr const char* kPrimaryBaseImpureBodyCtor =
+    "module M;\n"
+    "class PB(m: string): Exception(m)\n"
+    "  public constructor() this(\"x\");\n"
+    "    Console.WriteLine(\"impure body ctor of PB\");\n"
+    "  end constructor;\n"
+    "end PB;\n"
+    "class E(m: string): PB(m)\n"
+    "  public pure constructor() this(\"d\"); end constructor;\n"
+    "end E;\n";
+}  // namespace
+
+// p24: the §22.10 idiom (primary + non-pure convenience constructor),
+// subclassed by a primary class with a pure convenience constructor.
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           spec_22_10_myerror_idiom_subclass_pure_ctor_admitted_8163) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class MyError(message: string): Exception(message)\n"
+        "  public constructor() this(\"default\"); end constructor;\n"
+        "end MyError;\n"
+        "class SubError(message: string): MyError(message)\n"
+        "  public pure constructor() this(\"sub\"); end constructor;\n"
+        "end SubError;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// p01
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           primary_base_with_impure_body_ctor_not_invoked_admitted_8163) {
+    auto r = pureCheck(kPrimaryBaseImpureBodyCtor);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// p20: PB's single body constructor takes an `int`; `PB(m)` with
+// `m: string` binds only the primary.
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           primary_base_impure_body_ctor_other_type_admitted_8163) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class PB(m: string): Exception(m)\n"
+        "  public constructor(n: int) this(\"x\");\n"
+        "    Console.WriteLine(\"impure body ctor of PB\");\n"
+        "  end constructor;\n"
+        "end PB;\n"
+        "class E(m: string): PB(m)\n"
+        "  public pure constructor() this(\"d\"); end constructor;\n"
+        "end E;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// p22: p01 executed — the pure method's throw constructs E through PB's
+// primary, never PB's impure body constructor, so the side effect does not
+// print and the message is the pure constructor's "d".
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           primary_base_with_impure_body_ctor_runs_and_prints_8163) {
+    auto r = bezel::test::runAot(std::string(kPrimaryBaseImpureBodyCtor) +
+                                 kThrowProgram);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(r.exitCode == 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "caught d\n");
+}
+
+// p05: E -> C primary -> B primary -> A's impure constructor; the diagnostic
+// lands on E's clause argument (line 12).
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           chain_of_three_primaries_to_impure_ctor_rejected_8163) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class A : Exception\n"
+        "  public constructor(m: string) base(m);\n"
+        "    Console.WriteLine(\"impure A\");\n"
+        "  end constructor;\n"
+        "end A;\n"
+        "class B(m: string): A(m)\n"
+        "end B;\n"
+        "class C(m: string): B(m)\n"
+        "end C;\n"
+        "class E(m: string): C(m)\n"
+        "  public pure constructor() this(\"d\"); end constructor;\n"
+        "end E;\n");
+    const auto* d = theErrorStartingWith(r, kBaseChainLine);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 11u);
+}
+
+// p03: B's two constructors differ only by parameter TYPE, so both bind
+// `B(m)` by §22.5 arity; §22.6 selects the exact `(m: string)` match, which
+// is impure.
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           overload_by_type_invoked_impure_ctor_rejected_8163) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class B : Exception\n"
+        "  public constructor(m: string) base(m);\n"
+        "    Console.WriteLine(\"impure\");\n"
+        "  end constructor;\n"
+        "  public pure constructor(n: int) base(\"n\"); end constructor;\n"
+        "end B;\n"
+        "class E(m: string): B(m)\n"
+        "  public pure constructor() this(\"d\"); end constructor;\n"
+        "end E;\n");
+    const auto* d = theErrorStartingWith(r, kBaseChainLine);
+    BEZEL_EXPECT_TRUE(d != nullptr);
+    if (d) BEZEL_EXPECT_TRUE(d->location.line == 8u);
+}
+
+// p04: the mirror — the exact `(m: string)` match is the pure one.
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           overload_by_type_invoked_pure_ctor_admitted_8163) {
+    auto r = pureCheck(
+        "module M;\n"
+        "class B : Exception\n"
+        "  public pure constructor(m: string) base(m); end constructor;\n"
+        "  public constructor(n: int) base(\"n\");\n"
+        "    Console.WriteLine(\"impure\");\n"
+        "  end constructor;\n"
+        "end B;\n"
+        "class E(m: string): B(m)\n"
+        "  public pure constructor() this(\"d\"); end constructor;\n"
+        "end E;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The §22.10 idiom ACROSS A MODULE BOUNDARY: the imported `MyError` carries
+// no AST, so its primary is identified off the symbols (§2.5) — its clause
+// target `MyError(message)` is its PRIMARY, and its impure 0-arity
+// convenience constructor never runs. Compiles, links and prints the pure
+// constructor's message.
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           imported_myerror_idiom_subclass_pure_ctor_runs_8163) {
+    const std::string lib =
+        "module XLibIdiom8163;\n"
+        "public class MyError(message: string): Exception(message)\n"
+        "  public constructor() this(\"default\");\n"
+        "    Console.WriteLine(\"impure convenience\");\n"
+        "  end constructor;\n"
+        "end MyError;\n";
+    const std::string app =
+        "module XApp8163;\n"
+        "import XLibIdiom8163;\n"
+        "class E(message: string): MyError(message)\n"
+        "  public pure constructor() this(\"sub\"); end constructor;\n"
+        "end E;\n" +
+        std::string(kThrowProgram);
+    auto r = bezel::test::runAotModules(
+        {bezel::test::ModuleSource{"XLibIdiom8163", lib},
+         bezel::test::ModuleSource{"XApp8163", app}},
+        "XApp8163");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(r.exitCode == 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "caught sub\n");
+}
