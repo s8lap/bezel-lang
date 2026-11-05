@@ -1652,6 +1652,29 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 else if (isTypeParamStringFieldLvalue(*as->target) &&
                          rhs->getType()->isPointerTy())
                     emitStringRetain(rhs);
+                // narrow #8214 (§28.9 / §6.6 / §8.6, v0.355): the `??=` twin
+                // of lowerObjectStringFieldStore — a string-typed source
+                // stored into a class Object/interface field takes its own +1
+                // (a +1 producer, or `x as Object` of one, transfers). The
+                // string-escape walk's #8214 arm reads this store's RHS as a
+                // safe read for any assignment operator, so without the retain
+                // the source's scope-end release would free the string under
+                // the field. Nothing releases the field's +1 (see
+                // collectObjectStringStorageFields). The slot is null here.
+                else if (rhs->getType()->isPointerTy() &&
+                         isObjectStringFieldLvalue(*as->target,
+                                                   as->value.get())) {
+                    bool producer = isPlusOneStringProducer(as->value.get());
+                    if (!producer) {
+                        if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(
+                                as->value.get())) {
+                            if (tt->op == "as" && tt->operand)
+                                producer =
+                                    isPlusOneStringProducer(tt->operand.get());
+                        }
+                    }
+                    if (!producer) emitStringRetain(rhs);
+                }
                 // fix #5245 (§4.6 / §28.9 / §6.6, v0.313): a `string?` LOCAL
                 // that owns a +1 for its value (a classified producer/borrow
                 // local, see stringLocalSlotOwnsRef) takes an independent +1
@@ -1978,26 +2001,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     handled = lowerBoxFieldStore(*as->target, addr, rhs,
                                                  as->value.get());
                 // fix #8214 / §28.9 / §4.6 / §8.6 (v0.355): the OBJECT-STRING
-                // STORAGE FIELD-STORE category — the string twin of the box
-                // family just above. A store into a CLASS Object/interface
-                // field whose EVERY store (per the
-                // collectObjectStringStorageFields pre-pass) is a string-typed
-                // source takes an independent +1 (retain-new or
-                // transfer-producer / release-old), released on the owner's
-                // disposal. Without it the field ALIASED the source's only
-                // reference and the source's scope-end release freed the
-                // string under the field — issue #8214's use-after-free
-                // (`h.O := x as Object;` ⇒ `free(): invalid pointer`, rc 134).
+                // STORAGE FIELD-STORE category. A store of a string-typed
+                // source (a `string`, or `x as Object` of one) into a CLASS
+                // Object/interface field takes an independent +1
+                // (retain-new or transfer-producer). Without it the field
+                // ALIASED the source's only reference and the source's
+                // scope-end release freed the string under the field —
+                // issue #8214's use-after-free (`h.O := x as Object;` ⇒
+                // `free(): invalid pointer`, rc 134). Nothing releases that +1
+                // (narrow #8214: the slot may also hold a class instance, so
+                // no release is sound): a leak, never a use-after-free.
                 //
-                // Gated on isObjectStringFieldLvalue, which checks BOTH the
-                // target (a class field the pre-pass classified as
-                // string-only) and the source (a string-typed value, or
-                // `x as Object` whose operand is a string) — so a store of a
-                // class instance / a box / an `Object`-typed value never
-                // reaches here, and the release half can never fire on a
-                // non-string. Mutually exclusive with the box arm above (a
-                // string source is not a boxable value type), so the order
-                // between them does not matter.
+                // Gated on isObjectStringFieldLvalue, which checks the source
+                // is a string, so a store of a class instance / a box / an
+                // `Object`-typed value never reaches here. Mutually exclusive
+                // with the box arm above (a string source is not a boxable
+                // value type), so the order between them does not matter.
                 if (!handled)
                     handled = lowerObjectStringFieldStore(*as->target, addr,
                                                           rhs, as->value.get());

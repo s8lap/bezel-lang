@@ -23,26 +23,34 @@
 // the string survived — but it LEAKED its reference (39 bytes / 2 allocations
 // under LSan, `bz$M.Make$Str`). One shape, two symptoms.
 //
-// THE FIX. A class field whose DECLARED type is `Object`/interface and whose
-// EVERY store carries a string-typed source is an "object string storage
-// field" (the string twin of the box storage family): the store RETAINS the
-// value into the field (the field takes its own independent +1) and releases
-// the displaced value, and the owner's disposal releases the field's +1. The
+// THE FIX (narrow). A `:=` store of a STRING-typed source (a `string`, or
+// `x as Object` of one) into a class field whose DECLARED type is
+// `Object`/interface RETAINS the string, so the field holds its own +1 and the
+// source's scope-end release no longer frees the string under it. The
 // string-escape walk reads such a store's right-hand side as a SAFE READ (a
 // borrow, not an escape), so the SOURCE keeps its own +1 and still releases it
-// at its scope end — the two halves balance.
+// at its scope end.
 //
-// WHY A PRE-PASS AND NOT A RUNTIME TAG. An `Object`-typed slot may hold a
-// class instance, a box, a function value or a string, and the static type
-// cannot tell them apart. The retain half is decidable per STORE (the
-// source's static type IS a string); the release half needs "is the slot's
-// CURRENT value a string?", which is a RUNTIME question — issue #8215 / #5059
-// ("no runtime tag distinguishes string from other objects behind `Object?`"),
-// and the runtime's `bz_obj_is_string` is only sound in the SKIP direction (a
-// cross-module class instance answers "string"), so it cannot gate a release.
-// The per-field pre-pass answers it STATICALLY: a field whose every store is a
-// string can only ever hold a string. A MIXED field is EXCLUDED, so it keeps
-// the pre-fix plain-store behaviour.
+// NOTHING RELEASES THE FIELD'S +1 — IT LEAKS. The first version of this fix
+// also released the field on overwrite and on disposal, keyed on a pre-pass
+// that admitted a field only when every store it could see was a string. The
+// non-author review (rev-8214) MEASURED that classification unsound: it did
+// not see a store inside a block-lambda body (`this.O := f`), a `??=` store,
+// or a store made by ANOTHER MODULE into a public field, and a read
+// `o := h.O` into an `Object` local that outlives `h` keeps an un-retained
+// alias. Each turned the release into a string release of a class instance
+// (heap corruption) or a use-after-free, on programs the base ran cleanly.
+// An `Object` slot may hold a class instance, a box, a function value or a
+// string (§5.1, §8.1), and no static or runtime discriminator says which
+// (issue #8215 / #5059), so no release keyed on the slot is sound. A leak is
+// the pre-#8214 behaviour for every such slot; a use-after-free is not.
+//
+// So the rows that store a HEAP string run through `runAotCheckedLenient`:
+// the generated-code AddressSanitizer (use-after-free, double free,
+// over-release) is armed, LeakSanitizer is not, because the field's +1 is the
+// documented residual leak. The rows that store no heap string (the literal,
+// the int box, the class instance, the `Array<string>` neighbour) stay on
+// `runAotChecked` and are leak-checked.
 //
 // SCOPE — WHAT THESE ROWS DO NOT CLAIM. Two neighbouring shapes are still
 // open and are NOT pinned as fixed here:
@@ -59,33 +67,33 @@
 //     `Object`: the callee's own scope-end release frees the value the
 //     caller receives. MEASURED pre-fix: rc 139.
 //
-// Both are the SAME defect at slots where the per-field static
-// classification is unavailable; closing them is the discriminator work this
-// fix deliberately does not attempt (it would trade a use-after-free for an
-// unbounded leak). The rows below cover the CLASS-FIELD shape, which is the
-// one issue #8214 is filed against, plus the controls that must not move.
+// Both are the SAME defect at other `Object`-typed slots; they are not
+// touched here, so the subject is `narrow #8214`. The rows below cover the
+// CLASS-FIELD shape, which is the one issue #8214 is filed against, the
+// review's regressions, and the controls that must not move.
 //
-// EVERY ROW GOES THROUGH `runAotChecked` — the helper that compiles the
-// program NATIVELY with the generated-code AddressSanitizer AND arms
-// LeakSanitizer BY CONSTRUCTION (`detectLeaks=true` is a hardcoded argument
-// in aot_support.hpp). The leak rows therefore rest on that argument and NOT
-// on an environment variable: `runAotCheckedLenient` passes `false` and runs
-// `detect_leaks=0`, so a leak assertion written against THAT helper would be
-// VACUOUS. `BEZEL_AOT_DETECT_LEAKS` is read only by `runAot`, never by the
-// `runAotChecked` family, so it is not what arms these rows.
+// `runAotChecked` arms LeakSanitizer BY CONSTRUCTION (`detectLeaks=true` is a
+// hardcoded argument in aot_support.hpp); `runAotCheckedLenient` passes
+// `false` and runs `detect_leaks=0`, so NO row on the lenient helper makes a
+// leak claim. `BEZEL_AOT_DETECT_LEAKS` is read only by `runAot`, never by the
+// `runAotChecked` family.
 //
 // Every row asserts `!checkedToolchainSkipped(r)` BEFORE any guard that could
 // absorb the skip: a box without clang fails the row loudly rather than
 // passing vacuously.
 
 #include <string>
+#include <vector>
 
 #include "support/aot_support.hpp"
 #include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::ModuleSource;
 using bezel::test::runAotChecked;
+using bezel::test::runAotCheckedLenient;
+using bezel::test::runAotModules;
 
 namespace {
 
@@ -135,12 +143,24 @@ void expectCleanRun(const std::string& body, const std::string& expected) {
     BEZEL_EXPECT_EQ(r.stdoutText, expected);
 }
 
+// Run `body` with the generated-code AddressSanitizer armed and LeakSanitizer
+// OFF, and require: the program RAN, exited 0, printed exactly `expected`. A
+// use-after-free, a double free, an over-release or a crash fails the row; the
+// field's documented +1 leak does not (see the file header).
+void expectNoUseAfterFree(const std::string& body, const std::string& expected) {
+    JitResult r = runAotCheckedLenient(body);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (!r.ran) return;
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, expected);
+}
+
 // The class-field shape, parameterised by the store statement.
 //
 // The holder is created ONCE and the store runs kIterations times inside a
-// `for` loop, so the field is OVERWRITTEN kIterations times: each overwrite
-// releases the displaced value, which is what makes a missing/extra release
-// show up as a leak (or an over-release) rather than hiding.
+// `for` loop, so the field is OVERWRITTEN kIterations times and each read of
+// it happens after the source's scope ended.
 std::string fieldProgram(const std::string& storeStatement) {
     return std::string("module M; ") + kHolderDecl + kMakerDecl +
            "public class Program "
@@ -168,12 +188,12 @@ std::string fieldProgram(const std::string& storeStatement) {
 // the field still pointed at, and `Console.WriteLine(h.O.ToString())` read it
 // back AFTER the block ended.
 //
-// Post-fix: the program prints `s12345` / `6` per iteration and is clean
-// under ASan AND LSan (the field's reference is released by the owner's
-// disposal; the source's by its own scope end).
+// Post-fix: the program prints `s12345` / `6` per iteration and ASan reports
+// no use-after-free. The field's +1 leaks (the file header says why), so the
+// row runs with LeakSanitizer off.
 // ===========================================================================
 BEZEL_TEST(object_string_store_retain_8214,
-           issue_repro_y_boxhole_oneshot_looped_100x_is_clean) {
+           issue_repro_y_boxhole_oneshot_looped_100x_does_not_use_after_free) {
     const std::string program =
         "module M; "
         "public record Named(Tag: string, N: int); "
@@ -205,7 +225,7 @@ BEZEL_TEST(object_string_store_retain_8214,
         "    return 0; "
         "  end Main; "
         "end Program; ";
-    expectCleanRun(program, repeatLine("s12345\n6\n", kIterations));
+    expectNoUseAfterFree(program, repeatLine("s12345\n6\n", kIterations));
 }
 
 // ===========================================================================
@@ -214,14 +234,12 @@ BEZEL_TEST(object_string_store_retain_8214,
 // scope-end release freed the string the field pointed at — `free(): invalid
 // pointer` (rc 134) plain, a heap-use-after-free under ASan.
 //
-// The row is RED pre-fix and GREEN post-fix, and it is leak-free post-fix
-// (the field's +1 is released by the owner's disposal; the source's +1 by its
-// own scope end) — so it pins the WHOLE balance, not just the absence of the
-// crash.
+// The row is RED pre-fix and GREEN post-fix (no use-after-free; the field's
+// +1 is the documented leak).
 // ===========================================================================
 BEZEL_TEST(object_string_store_retain_8214,
            object_field_explicit_as_object_store_retains_the_string) {
-    expectCleanRun(fieldProgram("h.O := x as Object;"),
+    expectNoUseAfterFree(fieldProgram("h.O := x as Object;"),
                    repeatLine("s12345\n", kIterations));
 }
 
@@ -231,26 +249,22 @@ BEZEL_TEST(object_string_store_retain_8214,
 // escape walk read the implicit store as an escape and suppressed `x`'s
 // scope-end release — but it LEAKED the reference (39 bytes / 2 allocations).
 // The row pins that the implicit conversion behaves EXACTLY like the explicit
-// one: same value printed, and no leak either.
+// one: same value printed, and no use-after-free.
 //
 // The two rows together are what make "the implicit conversion must behave
 // the same as the explicit one" a MEASURED claim rather than an assertion.
 // ===========================================================================
 BEZEL_TEST(object_string_store_retain_8214,
            object_field_implicit_conversion_twin_retains_the_string) {
-    expectCleanRun(fieldProgram("h.O := x;"),
+    expectNoUseAfterFree(fieldProgram("h.O := x;"),
                    repeatLine("s12345\n", kIterations));
 }
 
 // ===========================================================================
 // THE STRING LITERAL — "must not be over-released". A literal is a SENTINEL
 // reference (the runtime's literal rc value): bz_string_retain /
-// bz_string_release are no-ops on it, so the store's retain/release pair must
-// not free it and the program must not abort with an over-release.
-//
-// The literal is stored kIterations times into the same field, so an
-// over-release would fire on the SECOND store (the first one released the
-// field's initial literal) and an under-release would leak.
+// bz_string_release are no-ops on it, so the store's retain must not change
+// it, and the row stays leak-checked: a literal store allocates nothing.
 // ===========================================================================
 BEZEL_TEST(object_string_store_retain_8214,
            object_field_string_literal_store_is_not_over_released) {
@@ -289,7 +303,7 @@ BEZEL_TEST(object_string_store_retain_8214,
         "    return 0; "
         "  end Main; "
         "end Program; ";
-    expectCleanRun(program, repeatLine("s12345\n", kIterations));
+    expectNoUseAfterFree(program, repeatLine("s12345\n", kIterations));
 }
 
 // ===========================================================================
@@ -300,8 +314,7 @@ BEZEL_TEST(object_string_store_retain_8214,
 //
 // The holder here is a SEPARATE class whose `Object` field's initializer is
 // an INT (a box), not a string: a field that receives BOTH a box and a string
-// is a MIXED field, which the pre-pass excludes from both families (a mixed
-// field keeps the pre-fix plain-store behaviour) — so the control uses a
+// is a MIXED field, which the box pre-pass excludes — so the control uses a
 // box-only field, which is the shape the box family actually owns.
 // ===========================================================================
 BEZEL_TEST(object_string_store_retain_8214,
@@ -426,4 +439,611 @@ BEZEL_TEST(object_string_store_retain_8214,
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find("22.12") != std::string::npos) mentions = true;
     BEZEL_EXPECT_TRUE(mentions);
+}
+
+// ===========================================================================
+// THE REVIEW'S REGRESSIONS (rev-8214). Each program ran cleanly on the base
+// and crashed on the first version of this fix, whose field release was keyed
+// on an unsound "every store is a string" classification. Each is looped 100x
+// and must print its exact value with no sanitizer report.
+// ===========================================================================
+
+// A block-lambda body stores a CLASS INSTANCE into the field the visible
+// stores fill with strings. The first version's pre-pass never descended into
+// `LambdaExpr` bodies, so it released the `Foo` as a string (`free(): invalid
+// size`).
+BEZEL_TEST(object_string_store_retain_8214,
+           review_p02_lambda_body_class_store_is_not_string_released) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Foo
+  public V: int := 7;
+end Foo;
+public class Holder
+  public O: Object := "";
+  public method SetS(s: string)
+    this.O := s;
+  end SetS;
+  public method Fill(f: Foo)
+    var g := lambda() => do this.O := f; end;
+    g();
+  end Fill;
+end Holder;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var keep := new Foo();
+    while i < 100 do
+      var h := new Holder();
+      h.SetS("a" + i.ToString());
+      h.Fill(keep);
+      i := i + 1;
+    end;
+    Console.WriteLine(keep.V);
+    return 0;
+  end Main;
+end Program;
+)BZ", "7\n");
+}
+
+// A `??=` store of a class instance. The first version's pre-pass checked only
+// `:=` (`refcount over-release (string)` under ASan).
+BEZEL_TEST(object_string_store_retain_8214,
+           review_p03_null_coalescing_assign_class_store_is_not_string_released) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Foo
+  public V: int := 7;
+end Foo;
+public class Holder
+  public O: Object? := null;
+  public method SetS(s: string)
+    this.O := s;
+  end SetS;
+  public method Fill(f: Foo)
+    this.O ??= f;
+  end Fill;
+end Holder;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var keep := new Foo();
+    while i < 100 do
+      var h := new Holder();
+      h.Fill(keep);
+      i := i + 1;
+    end;
+    var h2 := new Holder();
+    h2.SetS("x" + i.ToString());
+    Console.WriteLine(keep.V);
+    return 0;
+  end Main;
+end Program;
+)BZ", "7\n");
+}
+
+// The field is read into an `Object` local that OUTLIVES the holder. The read
+// takes no reference, so the first version's disposal release freed the
+// string under `o` (`free(): invalid pointer`).
+BEZEL_TEST(object_string_store_retain_8214,
+           review_p07_field_read_into_outliving_object_local_stays_alive) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Holder
+  public O: Object := "";
+end Holder;
+public class Make
+  public static method Str(n: int): string => "s" + n.ToString();
+end Make;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var total := 0;
+    while i < 100 do
+      var o: Object := "";
+      do
+        var h := new Holder();
+        h.O := Make.Str(i);
+        o := h.O;
+      end;
+      var junk := Make.Str(77777);
+      total := total + o.ToString().Length + junk.Length - junk.Length;
+      i := i + 1;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)BZ", "290\n");
+}
+
+// ANOTHER MODULE stores a class instance into the library's public field. The
+// library's own compile cannot see that store, so the first version released
+// the `Foo` as a string. runAotModules has no lenient-checked twin (see
+// aot_support.hpp), so the row runs on the plain AOT oracle and its sanitizer
+// leg is the BEZEL_AOT_FORCE_SANITIZE=address sweep.
+BEZEL_TEST(object_string_store_retain_8214,
+           review_p17_cross_module_class_store_is_not_string_released) {
+    std::vector<ModuleSource> mods;
+    mods.push_back({"Lib", R"BZ(
+module Lib;
+public class Holder
+  public O: Object := "";
+  public method SetS(s: string)
+    this.O := s;
+  end SetS;
+end Holder;
+)BZ"});
+    mods.push_back({"App", R"BZ(
+module App;
+import Lib;
+public class Foo
+  public V: int := 7;
+end Foo;
+public class Putter
+  public static method Put(h: Holder, f: Foo)
+    h.O := f;
+  end Put;
+end Putter;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var keep := new Foo();
+    while i < 100 do
+      var h := new Holder();
+      h.SetS("a" + i.ToString());
+      Putter.Put(h, keep);
+      i := i + 1;
+    end;
+    Console.WriteLine(keep.V);
+    return 0;
+  end Main;
+end Program;
+)BZ"});
+    JitResult r = runAotModules(mods, "App");
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (!r.ran) return;
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "7\n");
+}
+
+// ===========================================================================
+// CONTROLS (rev-8214's "now clean" set). Each crashed or leaked on the base
+// and must keep printing its exact value with no use-after-free.
+// ===========================================================================
+
+// p01: the issue's shape in a `while` loop, the holder created per iteration.
+BEZEL_TEST(object_string_store_retain_8214, control_p01_issue_loop) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Holder
+  public O: Object := "";
+end Holder;
+public class Make
+  public static method Str(n: int): string => "s" + n.ToString();
+end Make;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var total := 0;
+    while i < 100 do
+      var h := new Holder();
+      do
+        var x := Make.Str(i);
+        h.O := x as Object;
+      end;
+      var junk := Make.Str(99999);
+      total := total + h.O.ToString().Length + junk.Length - junk.Length;
+      i := i + 1;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)BZ", "290\n");
+}
+
+// p05: a GENERIC class's Object field, stored from a method and directly.
+BEZEL_TEST(object_string_store_retain_8214, control_p05_generic_class_field) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Make
+  public static method Str(n: int): string => "s" + n.ToString();
+end Make;
+public class Cell<T>
+  public O: Object := "";
+  public Tag: T;
+  public constructor(t: T)
+    this.Tag := t;
+  end constructor;
+  public method Put(s: string)
+    this.O := s;
+  end Put;
+end Cell;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var total := 0;
+    while i < 100 do
+      var c := new Cell<int>(i);
+      do
+        var x := Make.Str(i);
+        c.Put(x);
+        c.O := x as Object;
+      end;
+      total := total + c.O.ToString().Length;
+      i := i + 1;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)BZ", "290\n");
+}
+
+// p06: +1 producers, literals and a self-derived value overwrite the field.
+BEZEL_TEST(object_string_store_retain_8214, control_p06_producer_overwrites) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Holder
+  public O: Object := "";
+end Holder;
+public class Make
+  public static method Str(n: int): string => "s" + n.ToString();
+end Make;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var total := 0;
+    while i < 100 do
+      var h := new Holder();
+      h.O := Make.Str(i);
+      total := total + h.O.ToString().Length;
+      h.O := Make.Str(i + 1) as Object;
+      total := total + h.O.ToString().Length;
+      h.O := "lit" + i.ToString();
+      h.O := "plain";
+      h.O := h.O.ToString() + "!";
+      total := total + h.O.ToString().Length;
+      i := i + 1;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)BZ", "1182\n");
+}
+
+// p08: the field read back through `as string` and `is string`.
+BEZEL_TEST(object_string_store_retain_8214, control_p08_as_string_readback) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Holder
+  public O: Object := "";
+end Holder;
+public class Make
+  public static method Str(n: int): string => "s" + n.ToString();
+end Make;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var total := 0;
+    while i < 100 do
+      var h := new Holder();
+      do
+        var x := Make.Str(i);
+        h.O := x;
+      end;
+      var t := h.O as string;
+      if t is not null then
+        total := total + t.Length;
+      end;
+      if h.O is string then
+        total := total + 1;
+      end;
+      i := i + 1;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)BZ", "390\n");
+}
+
+// p10: a conditional expression over two string locals.
+BEZEL_TEST(object_string_store_retain_8214, control_p10_conditional_of_strings) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Holder
+  public O: Object := "";
+end Holder;
+public class Make
+  public static method Str(n: int): string => "s" + n.ToString();
+end Make;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var total := 0;
+    while i < 100 do
+      var h := new Holder();
+      do
+        var s := Make.Str(i);
+        var t := Make.Str(i + 1);
+        h.O := (if i mod 2 = 0 then s else t);
+      end;
+      var junk := Make.Str(5);
+      total := total + h.O.ToString().Length + junk.Length - junk.Length;
+      i := i + 1;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)BZ", "292\n");
+}
+
+// p11: a `string?` source into an `Object?` field, null every third time.
+BEZEL_TEST(object_string_store_retain_8214, control_p11_nullable_string_source) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Holder
+  public O: Object? := null;
+end Holder;
+public class Make
+  public static method Maybe(n: int): string? => (if n mod 3 = 0 then null else "m" + n.ToString());
+end Make;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var total := 0;
+    while i < 100 do
+      var h := new Holder();
+      do
+        var m := Make.Maybe(i);
+        h.O := m;
+      end;
+      if h.O is not null then
+        total := total + h.O!.ToString().Length;
+      end;
+      i := i + 1;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)BZ", "192\n");
+}
+
+// p14: the field stored from a constructor parameter and from a method.
+BEZEL_TEST(object_string_store_retain_8214, control_p14_constructor_store) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Holder
+  public O: Object;
+  public constructor(s: string)
+    this.O := s;
+  end constructor;
+  public method Reset(n: int)
+    this.O := "r" + n.ToString();
+  end Reset;
+end Holder;
+public class Make
+  public static method Str(n: int): string => "s" + n.ToString();
+end Make;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var total := 0;
+    while i < 100 do
+      var h: Holder? := null;
+      do
+        var x := Make.Str(i);
+        h := new Holder(x);
+      end;
+      var junk := Make.Str(5);
+      if h is not null then
+        total := total + h.O.ToString().Length + junk.Length - junk.Length;
+        h.Reset(i);
+        total := total + h.O.ToString().Length;
+      end;
+      i := i + 1;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)BZ", "580\n");
+}
+
+// p15: a block-lambda body stores a captured string into the field.
+BEZEL_TEST(object_string_store_retain_8214, control_p15_lambda_string_store) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Holder
+  public O: Object := "";
+end Holder;
+public class Make
+  public static method Str(n: int): string => "s" + n.ToString();
+end Make;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var total := 0;
+    while i < 100 do
+      var h := new Holder();
+      h.O := Make.Str(i);
+      do
+        var x := Make.Str(i + 1);
+        var f := lambda() => do h.O := x; end;
+        f();
+      end;
+      var junk := Make.Str(5);
+      total := total + h.O.ToString().Length + junk.Length - junk.Length;
+      i := i + 1;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)BZ", "292\n");
+}
+
+// p16: an `Object`-typed AUTO-PROPERTY.
+BEZEL_TEST(object_string_store_retain_8214, control_p16_auto_property) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Foo
+  public V: int := 7;
+end Foo;
+public class Holder
+  public property A: Object := "";
+end Holder;
+public class Make
+  public static method Str(n: int): string => "s" + n.ToString();
+end Make;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var total := 0;
+    while i < 100 do
+      var h := new Holder();
+      do
+        var x := Make.Str(i);
+        h.A := x as Object;
+      end;
+      var junk := Make.Str(5);
+      total := total + h.A.ToString().Length + junk.Length - junk.Length;
+      i := i + 1;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)BZ", "290\n");
+}
+
+// ===========================================================================
+// SHAPES THE FIRST VERSION LEFT OPEN, closed by retaining without a
+// classification. Both crash on r30-c1 and on c9f52c5a.
+// ===========================================================================
+
+// A MIXED field: a method stores a class instance, then `x as Object` stores
+// a string from a `do` block. The first version's pre-pass excluded the field
+// (a class store), so the string store kept aliasing `x` and the block's
+// scope-end release freed it (heap-use-after-free).
+BEZEL_TEST(object_string_store_retain_8214,
+           mixed_field_explicit_as_object_store_retains_the_string) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Foo
+  public V: int := 7;
+end Foo;
+public class Holder
+  public O: Object := "";
+  public method SetF(f: Foo)
+    this.O := f;
+  end SetF;
+end Holder;
+public class Make
+  public static method Str(n: int): string => "s" + n.ToString();
+end Make;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var total := 0;
+    var keep := new Foo();
+    while i < 100 do
+      var h := new Holder();
+      h.SetF(keep);
+      do
+        var x := Make.Str(i);
+        h.O := x as Object;
+      end;
+      var junk := Make.Str(99999);
+      total := total + h.O.ToString().Length + junk.Length - junk.Length;
+      i := i + 1;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)BZ", "290\n");
+}
+
+// `this.O ??= s` with a `string` parameter (§6.6). The `??=` arm stored the
+// caller's borrow with no retain, and the caller's scope-end release freed it
+// under the field (rev-8214's p18).
+BEZEL_TEST(object_string_store_retain_8214,
+           null_coalescing_assign_string_store_retains_the_string) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Holder
+  public O: Object? := null;
+  public method SetS(s: string)
+    this.O := s;
+  end SetS;
+  public method Fill(s: string)
+    this.O ??= s;
+  end Fill;
+end Holder;
+public class Make
+  public static method Str(n: int): string => "s" + n.ToString();
+end Make;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var total := 0;
+    while i < 100 do
+      var h := new Holder();
+      do
+        var x := Make.Str(i);
+        h.Fill(x);
+      end;
+      var junk := Make.Str(5);
+      total := total + h.O!.ToString().Length + junk.Length - junk.Length;
+      h.SetS(junk);
+      i := i + 1;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)BZ", "290\n");
+}
+
+// `h.O ??= x` and `h.O ??= x as Object` from a `do`-block local. The
+// string-escape walk's #8214 arm reads the RHS of ANY assignment operator into
+// such a field as a safe read, so `x`'s scope-end release stays armed; the
+// first version's `??=` arm did not retain, so that release freed the string
+// under the field (heap-use-after-free on c9f52c5a; r30-c1 leaked instead).
+BEZEL_TEST(object_string_store_retain_8214,
+           null_coalescing_assign_from_block_local_retains_the_string) {
+    expectNoUseAfterFree(R"BZ(
+module M;
+public class Holder
+  public O: Object? := null;
+end Holder;
+public class Make
+  public static method Str(n: int): string => "s" + n.ToString();
+end Make;
+public class Program
+  public static method Main(): int
+    var i := 0;
+    var total := 0;
+    while i < 100 do
+      var h := new Holder();
+      do
+        var x := Make.Str(i);
+        h.O ??= x;
+        h.O ??= x as Object;
+      end;
+      var junk := Make.Str(5);
+      total := total + h.O!.ToString().Length + junk.Length - junk.Length;
+      i := i + 1;
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)BZ", "290\n");
 }

@@ -2413,50 +2413,6 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         }
     }
 
-    // fix #8214 (§28.9 / §4.6 / §8.6, v0.355): release every OBJECT-STRING
-    // STORAGE field / auto-property of THIS class (own members only; an
-    // inherited slot is released by the base CORE disposer via
-    // emitBaseDisposeChain — visiting only ts->members avoids a
-    // double-release). An Object/interface field whose EVERY store is a
-    // string (per the collectObjectStringStorageFields pre-pass) holds an
-    // INDEPENDENT +1 on that string (taken at the store via
-    // lowerObjectStringFieldStore); on disposal that +1 is released EXACTLY
-    // ONCE via bz_string_release, freeing the string at rc 0. This is the
-    // exact string-field twin of the box walk above, and the release point
-    // issue #8214's field needed: without it the field's +1 (or, in the
-    // pre-fix build, the source's +1 the field aliased) leaked.
-    //
-    // Safety: isObjectStringStorageMember gates on objectStringStorageFields_,
-    // which is populated ONLY for fields whose every store carries a
-    // string-typed source — so bz_string_release is NEVER called on a class
-    // instance, a box or a function value (the cardinal discriminator the box
-    // walk above names for its own family). A MIXED field (one that also
-    // receives a class reference / a box) is NOT in the set → NOT released
-    // here → it keeps the pre-#8214 behaviour (a leak, never a
-    // use-after-free) — issue #8215 / #8216's mixed-field territory, which
-    // needs a runtime discriminator this fix deliberately does not introduce.
-    // bz_string_release is null-safe (a calloc-zeroed null field is a no-op)
-    // and a no-op on the literal sentinel. After releasing, NULL the slot so a
-    // re-entrant / double dispose finds null and is a no-op (the #396
-    // slot-null precedent, parallel to the string-field and closure-field
-    // nulling above).
-    {
-        llvm::StructType* ost = classStruct(ts);
-        for (const sema::Symbol* m : ts->members) {
-            bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
-            if (!isField && !sema::isAutoPropertyStorageSymbol(m, ctx_))
-                continue;  // fix #3152 — see the string walk above
-            if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
-            if (!isObjectStringStorageMember(m)) continue;
-            unsigned idx = fieldIndex_[m];
-            llvm::Value* addr = builder_.CreateStructGEP(ost, currentThis_, idx,
-                                                         "ostr.addr");
-            llvm::Value* val = builder_.CreateLoad(ptrTy(), addr, "ostr.val");
-            emitStringRelease(val);
-            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
-        }
-    }
-
     // fix #4253 (§9.7 / §28.9, v0.298): release every RECORD-typed field /
     // auto-property of THIS class whose declared type owns at least one
     // `string` field (isRecordWithStringFieldsTypeRef — recurses through
