@@ -12922,6 +12922,35 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         return true;
                     }
+                    // fix-forward #8229 (stdlib §5 `ElementAtOrNull(index:
+                    // int): T?`, spec §15.1, v0.355): the fourth `*OrNull`
+                    // accessor, typed `T?` here too. This lambda is the
+                    // fallback of the vtable-backed `IEnumerable<T>` chain (a
+                    // yield-method result, an `IEnumerable<T>` parameter) and
+                    // of the string chain; the lazy-sentinel chain types the
+                    // call in its own arm before reaching this one. MEASURED
+                    // at 1b215627: with no arm here the call stayed UNTYPED on
+                    // a vtable receiver, codegen (which now lowers it) built a
+                    // `T?` value the untyped consumer misread, and
+                    // `Gen().ElementAtOrNull(1) ?? -1` printed 1, not 5. Same
+                    // §15.1 inline-array gate as the FirstOrNull arm above.
+                    if (m == "ElementAtOrNull" && ce.args.size() == 1) {
+                        if (srcElem) {
+                            if (!reportOrNullInlineArrayDiag(
+                                    ctx_,
+                                    nullableOrNullFormedTypeArg(recvTy, m),
+                                    m,
+                                    "a lazy sequence of an inline array element "
+                                    "type",
+                                    ce.span.begin)) {
+                                auto* nullTy = ctx_.makeTypeRef();
+                                *nullTy = *srcElem;
+                                nullTy->nullable = true;
+                                ctx_.setExprType(&ce, nullTy);
+                            }
+                        }
+                        return true;
+                    }
                     // stdlib §5 (#651): OfType<U>() on lazy receiver → lazy IEnum<U>.
                     // fix #3710: no `ce.args.empty()` guard — a WITHDRAWN
                     // member is a removal diagnostic at ANY arity, not only

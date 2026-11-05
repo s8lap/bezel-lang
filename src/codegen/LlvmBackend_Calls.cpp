@@ -3895,7 +3895,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             (call.args.empty() &&
              (m == "First" || m == "Single" || m == "Last" ||
               m == "FirstOrNull" || m == "LastOrNull" || m == "SingleOrNull")) ||
-            (m == "ElementAt" && call.args.size() == 1);
+            (m == "ElementAt" && call.args.size() == 1) ||
+            // fix-forward #8229 (stdlib §5, v0.355): `ElementAtOrNull(i)`
+            // returns the grouping at `i` (or null) through the same T? arm
+            // as FirstOrNull, which hands its pointer PHI to freeLazyTemp.
+            // MEASURED at 1b215627 without this term: the borrowing-snapshot
+            // path ran, and `xs.GroupBy(k).ElementAtOrNull(1)` looped 50x
+            // leaked 300 allocations from bz_groupby_to_array.
+            (m == "ElementAtOrNull" && call.args.size() == 1);
         keepGroupByGrouping = resultIsGrouping && handledElemTerm;
     }
     if (ownGroupByGroups || keepGroupByGrouping) {
@@ -7427,9 +7434,37 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* eaIdx = nullptr;
             llvm::Value* condV;
             if (m == "ElementAtOrNull") {
+                // fix-forward #8229 (stdlib §5 `ElementAtOrNull(index: int):
+                // T?`, v0.355): this arm builds a `T?` value, so it is sound
+                // only where sema typed the call `T?`. MEASURED at 1b215627: a
+                // vtable `IEnumerable<T>` receiver reached here UNTYPED, and
+                // the untyped consumer misread the value (`Gen()
+                // .ElementAtOrNull(1) ?? -1` printed 1, not 5). Refuse loudly
+                // instead, so no untyped path can be silent again; likewise
+                // for an index that did not lower to an integer.
+                const sema::TypeRef* eaTy = ctx_.exprType(call);
+                if (!eaTy || !eaTy->nullable) {
+                    if (!ctx_.diagnostics().hasErrors())
+                        ctx_.diagnostics().report(
+                            Severity::Error, call.span.begin,
+                            "internal: `ElementAtOrNull` (stdlib \xC2\xA7""5, "
+                            "returns `T?`) was not typed `T?` on this receiver, "
+                            "so its result cannot be lowered soundly; the call "
+                            "is refused rather than miscompiled (#8229)");
+                    return nullptr;
+                }
                 eaIdx = lowerExpr(*call.args[0].value);
                 if (!eaIdx) return nullptr;
-                eaIdx = builder_.CreateSExt(eaIdx, i64());
+                if (!eaIdx->getType()->isIntegerTy()) {
+                    if (!ctx_.diagnostics().hasErrors())
+                        ctx_.diagnostics().report(
+                            Severity::Error, call.args[0].value->span.begin,
+                            "the index argument of `ElementAtOrNull` must be "
+                            "`int` (stdlib \xC2\xA7""5 `ElementAtOrNull(index: "
+                            "int): T?`)");
+                    return nullptr;
+                }
+                eaIdx = builder_.CreateSExtOrTrunc(eaIdx, i64());
                 // unsigned compare: negative i becomes huge, so one test covers
                 // both `i < 0` and `i >= len`.
                 condV = builder_.CreateICmpULT(eaIdx, len);
