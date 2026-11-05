@@ -25340,7 +25340,51 @@ void Emitter::registerUnwindOwnedLocal(const ast::LocalDecl* ld) {
     if (currentFn_ != unwindIneligibleFn_) return;
     if (unwindIneligible_.count(static_cast<const void*>(ld))) return;
     const sema::TypeSymbol* cls = unwindOwnedLocalClass(ld);
-    if (!cls) return;
+    // fix-forward #8137 (§30.3 / §28.3, v0.355): the SECOND owned-local form
+    // this registration must admit — the §30.3 owned `Result` READ of an
+    // `OwningTask` ("reading it on a completed task in an owned-consuming
+    // position transfers ownership of the result to the reader exactly as
+    // `await` does"). The ownership pass classifies `var c := t.Result` OWNED
+    // through the shared fact's CLASSIFICATION form
+    // (`common::owningTaskResultReadClassifiesOwned`, `producerState`), so it
+    // ACCEPTS a later `TakeO(move c)` — and a local discharged on SOME path is
+    // not `autoDropAtScopeEnd`, so this unwind-only registration is its ONLY
+    // exception-edge disposal. But `unwindOwnedLocalClass` classifies by the
+    // INITIALIZER FORM (`new C()` / an `owned`-returning call / `move` / a
+    // bind atom / an arm-meet / `??`) and has no arm for the `Result` read,
+    // so nothing was registered and the transferred object LEAKED on every
+    // throw between the read and the move: MEASURED on the unit's tip
+    // (`--sanitize=address`, 100 iterations, every other one throwing) 50
+    // allocations / 800 bytes, the class's live counter at 50, while the
+    // `new`-initialised twin is clean. Programs the base REJECTED ("a borrow
+    // cannot be passed where an `owned` value is required") had become
+    // leaking accepts — an inversion of §28.3's "every owned value is
+    // disposed exactly once on every path".
+    //
+    // Read the SAME classification form the ownership pass and the §28.7
+    // drop-on-overwrite gate (`disposeDisplacedOwnedClassLocal`) read, so the
+    // three cannot drift (the #1414 "one fact, one home" rule); the form has
+    // no resolver, so a GENERIC body's bare-`T` read stays a borrow on every
+    // side (the gap recorded on #8137). The `Disposal` below carries no
+    // class, so dispatch is DYNAMIC exactly as for the interface / bare-T
+    // arms of `unwindOwnedLocalClass`; the reload is null-guarded, and every
+    // discharge the walker leaves ELIGIBLE nulls the slot (`TakeO(move c)`
+    // through `transferredOwnedArgSlots`, `c.Dispose()` through the
+    // ownership-stamped `disposeReclaimsReassignedBorrow` reclaim), so a
+    // value moved out or disposed before the throw is skipped — the
+    // `eligible => nulled` invariant the walker is licensed by.
+    //
+    // The arm lives HERE and not in `unwindOwnedLocalClass`: that
+    // classifier's other callers (the iterator / async frame-keyed disposals
+    // in LlvmBackend_Iterators.cpp and LlvmBackend_Async.cpp, the explicit-
+    // dispose slot reclaim in LlvmBackend_Calls2.cpp) were not measured with
+    // the `Result` form, and this registration is the one site the leak was
+    // measured at. // per §30.3, §28.3, §28.7, v0.355, #8137
+    const bool ownsTransferredResult =
+        !cls && ld->initializer &&
+        common::owningTaskResultReadClassifiesOwned(ld->initializer.get(),
+                                                    ctx_);
+    if (!cls && !ownsTransferredResult) return;
     auto it = locals_.find(ld);
     if (it == locals_.end()) return;
     Disposal d{it->second, nullptr};

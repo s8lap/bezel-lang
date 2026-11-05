@@ -489,3 +489,163 @@ BEZEL_TEST(owning_task_result_plain_var_8137,
     BEZEL_EXPECT_TRUE(text.find("program terminated by signal") ==
                       std::string::npos);
 }
+
+// =====================================================================
+// THE UNWIND ROWS -- §28.3's EXCEPTION EDGE for a plain `var` bound to an
+// `OwningTask`'s `Result` (the third fix-forward of #8137).
+//
+// `R` binds the transferred result to a plain `var`, THROWS on every other
+// call (so an exception leaves the binding's scope on half the iterations),
+// and otherwise MOVES the binding into an `owned` parameter. Because the
+// binding is discharged on SOME path it is not auto-dropped at scope end
+// (§28.3's affine auto-drop covers a never-discharged owner only), so the
+// unwind-only disposal codegen registers for a plain owned local is its
+// ONLY exception-edge disposal.
+//
+// §28.3 (v0.355): "every owned value is disposed exactly once on every
+// path" -- the exception edge is a path. §30.3 (v0.355): the `Result` read
+// "transfers ownership of the result to the reader exactly as `await`
+// does", so the binding owns the value the unwind must dispose.
+//
+// PRE-FIX (the unit's tip, 45bac30d): the unit's §30.3 classification made
+// the binding OWNED, so the ownership pass ACCEPTED the `move` -- the base
+// (255cbe57) had REJECTED these programs with "a borrow cannot be passed
+// where an `owned` value is required" -- but codegen's
+// `registerUnwindOwnedLocal` keyed on `unwindOwnedLocalClass`, which
+// classifies a local by its INITIALIZER FORM and has no arm for the `Result`
+// read, so nothing was registered: MEASURED under ASan, 50 allocations /
+// 800 bytes leaked and the class's live counter at 50 (the 50 throwing
+// iterations), while the `new`-initialised twin was clean. The fix-forward
+// reads the SAME shared classification fact the ownership pass reads at the
+// registration, so the rows below go to `live 0` with no leak.
+//
+// The expected sum: 50 throwing iterations add 100 each (the catch arm) and
+// 50 moving iterations add the moved object's value.
+// =====================================================================
+
+namespace {
+
+// The program for the unwind rows. `rSig` is `R`'s first parameter (the
+// task), `rBody` its body (which reads `k`, the throw switch), and `mk` the
+// producer the caller binds with `using var t := ...`. `Sq` is a class
+// behind the `IShape` interface for the interface-typed task.
+std::string unwindProg(const std::string& rSig, const std::string& rBody,
+                       const std::string& mk) {
+    return
+        "module M; import System; "
+        "class Cell "
+        "  public static n: int := 0; "
+        "  public v: int; "
+        "  public constructor(x: int) v := x; Cell.n := Cell.n + 1; end constructor; "
+        "  destructor Cell.n := Cell.n - 1; end destructor; "
+        "end Cell; "
+        "interface IShape "
+        "  method V(): int; "
+        "end IShape; "
+        "class Sq: IShape "
+        "  public static n: int := 0; "
+        "  public constructor() Sq.n := Sq.n + 1; end constructor; "
+        "  destructor Sq.n := Sq.n - 1; end destructor; "
+        "  public method V(): int return 3; end V; "
+        "end Sq; "
+        "class C "
+        "  public static async method Mk(): OwningTask<Cell> return new Cell(5); end Mk; "
+        "  public static async method MkI(): OwningTask<IShape> return new Sq(); end MkI; "
+        "  static method Boom(): int throw new InvalidOperationException(\"boom\"); end Boom; "
+        "  static method TakeO(owned c: Cell): int return c.v; end TakeO; "
+        "  static method TakeI(owned c: IShape): int return c.V(); end TakeI; "
+        "  static method R(" + rSig + ", k: bool): int " + rBody + " end R; "
+        "  static method A() "
+        "    var i := 0; var s := 0; "
+        "    while i < 100 do "
+        "      using var t := " + mk + "; "
+        "      try s := s + R(t, i mod 2 = 0); "
+        "      catch var e: InvalidOperationException => s := s + 100; end try; "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(s); "
+        "  end A; "
+        "  public static method Main(): int "
+        "    A(); "
+        "    Console.WriteLine($\"live {Cell.n} {Sq.n}\"); "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+}
+
+}  // namespace
+
+// §28.3 / §30.3 -- THE REVIEW'S REPRO (probe n16): `var c := t.Result;` then
+// a throw on half the calls, else `TakeO(move c)`. Pre-fix: 50 allocations /
+// 800 bytes leaked, live counter 50.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_dot_result_is_disposed_on_the_unwind_edge_spec_28_3) {
+    JitResult r = runAotChecked(unwindProg(
+        "t: OwningTask<Cell>",
+        "var c := t.Result; "
+        "if k then var z := Boom(); end if; "
+        "return TakeO(move c);",
+        "Mk()"));
+    expectNoLeak(r, "5250\nlive 0 0\n");
+}
+
+// §28.3 / §30.3 -- the ANNOTATED spelling (probe n16b): `var c: Cell :=
+// t.Result;`. The declared type names the class; the obligation is the same.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_annotated_dot_result_is_disposed_on_the_unwind_edge_spec_28_3) {
+    JitResult r = runAotChecked(unwindProg(
+        "t: OwningTask<Cell>",
+        "var c: Cell := t.Result; "
+        "if k then var z := Boom(); end if; "
+        "return TakeO(move c);",
+        "Mk()"));
+    expectNoLeak(r, "5250\nlive 0 0\n");
+}
+
+// §28.3 / §30.3 -- the INTERFACE-typed result (probe n16i): `OwningTask<
+// IShape>`, whose `Result` is an interface reference. The unwind disposal is
+// dynamic (the object's own vtable), so the concrete `Sq` behind the
+// interface is disposed; 50 moving iterations add `Sq.V()` = 3 each.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_interface_result_is_disposed_on_the_unwind_edge_spec_28_3) {
+    JitResult r = runAotChecked(unwindProg(
+        "t: OwningTask<IShape>",
+        "var c := t.Result; "
+        "if k then var z := Boom(); end if; "
+        "return TakeI(move c);",
+        "MkI()"));
+    expectNoLeak(r, "5150\nlive 0 0\n");
+}
+
+// §28.7 / §28.3 -- REASSIGN then throw (probe n16r): `c := new Cell(7);`
+// disposes the transferred Cell by drop-on-overwrite (the second
+// fix-forward), and the unwind edge must then dispose the NEW value -- the
+// registration is on the SLOT, not on the transferred object. Pre-fix the
+// new value leaked on the throw edge (50 allocations); 50 moving iterations
+// add 7 each.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_dot_result_reassigned_value_is_disposed_on_the_unwind_edge_spec_28_7) {
+    JitResult r = runAotChecked(unwindProg(
+        "t: OwningTask<Cell>",
+        "var c := t.Result; "
+        "c := new Cell(7); "
+        "if k then var z := Boom(); end if; "
+        "return TakeO(move c);",
+        "Mk()"));
+    expectNoLeak(r, "5350\nlive 0 0\n");
+}
+
+// §28.3 -- the CONTROL (probe n16c): the SAME shape on a `new`-initialised
+// local, which `unwindOwnedLocalClass` has always recognised. It was clean
+// before the fix and must stay clean -- the fix must not double-dispose it.
+// (`R` ignores its task parameter.)
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_new_local_unwind_control_spec_28_3) {
+    JitResult r = runAotChecked(unwindProg(
+        "t: OwningTask<Cell>",
+        "var c := new Cell(5); "
+        "if k then var z := Boom(); end if; "
+        "return TakeO(move c);",
+        "Mk()"));
+    expectNoLeak(r, "5250\nlive 0 0\n");
+}
