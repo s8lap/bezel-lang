@@ -386,3 +386,118 @@ BEZEL_TEST(string_extension_receiver_once_7841,
             "    for var n in l do t := t + n.Tag.Length; end;\n")),
         "690\n");
 }
+
+// ---------------------------------------------------------------------------
+// Fix-forward rows (the non-author review of d584a839): six programs whose
+// `this` reaches a value that outlives the call by a route the first walk
+// classified as a READ. Base leaks each; d584a839 released the receiver in
+// `main` right after the call and the later read was a heap-use-after-free.
+// §26.7 v0.355: "The receiver is always a borrow; extensions cannot store
+// `this`, return it as `owned`, or dispose it." The compiler accepts every
+// one of these programs, so until a ruling says which of them §26.7 forbids
+// the backend keeps base's leak (leak over UAF, the #4322 posture). Each
+// row is a `runAot` UAF guard: green on base, red on d584a839 under
+// BEZEL_AOT_FORCE_SANITIZE=address.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const char* kHolder =
+    "public record Named(Tag: string, N: int);\n"
+    "public class Holder\n"
+    "  public O: Object := \"\";\n"
+    "  public R: Named := new Named(\"\", 0);\n"
+    "  private _p: string := \"\";\n"
+    "  public property P: string\n"
+    "    get => _p;\n"
+    "    set => do this.R := new Named(value, 1); end;\n"
+    "  end P;\n"
+    "end Holder;\n";
+
+}  // namespace
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           bang_operand_embeds_receiver_no_uaf_spec_26_7) {
+    // r04: `this!` has the value `this`; the first walk read it as a safe
+    // operand whatever the context.
+    expectRan(
+        runAot(extProgram(
+            "public record Named(Tag: string, N: int);\n",
+            "  public method W(): Named => new Named(this!, 1);\n",
+            "    using var l := new Array<Named>();\n"
+            "    for var i in 0..199 do l.Add(Make.Str(i).W()); end;\n"
+            "    for var n in l do t := t + n.Tag.Length; end;\n")),
+        "690\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           as_object_result_boxes_receiver_no_uaf_spec_26_7) {
+    // r05: `this as Object` boxes `this` unretained; the first walk treated
+    // every type-test operand (`is`, `is not` AND `as`) as a read.
+    expectRan(
+        runAot(extProgram(
+            "",
+            "  public method AsO(): Object => this as Object;\n",
+            "    using var l := new Array<Object>();\n"
+            "    for var i in 0..199 do l.Add(Make.Str(i).AsO()); end;\n"
+            "    for var o in l do t := t + o.ToString().Length; end;\n")),
+        "690\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           object_field_store_boxes_receiver_no_uaf_spec_26_7) {
+    // r07: a store to an `Object`-typed class field boxes `this`; only a
+    // plain `string` field's store retains.
+    expectRan(
+        runAot(extProgram(
+            kHolder,
+            "  public method PutO(h: Holder) h.O := this; end PutO;\n",
+            "    using var h := new Holder();\n"
+            "    for var i in 0..199 do\n"
+            "      Make.Str(i).PutO(h); t := t + h.O.ToString().Length;\n"
+            "    end;\n")),
+        "690\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           property_setter_embeds_receiver_no_uaf_spec_26_7) {
+    // r08: the property's user setter embeds `value` in a record (#4322's
+    // flow-through); a property store is not a field store.
+    expectRan(
+        runAot(extProgram(
+            kHolder,
+            "  public method SetP(h: Holder) h.P := this; end SetP;\n",
+            "    using var h := new Holder();\n"
+            "    for var i in 0..199 do\n"
+            "      Make.Str(i).SetP(h); t := t + h.R.Tag.Length;\n"
+            "    end;\n")),
+        "690\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           out_object_parameter_boxes_receiver_no_uaf_spec_26_7) {
+    // r09: `out o: Object` boxes `this` unretained; only `out o: string`
+    // retains.
+    expectRan(
+        runAot(extProgram(
+            "",
+            "  public method OutO(out o: Object) o := this; end OutO;\n",
+            "    for var i in 0..199 do\n"
+            "      Make.Str(i).OutO(out var o); t := t + o.ToString().Length;\n"
+            "    end;\n")),
+        "690\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           builtin_tostring_returns_receiver_unretained_no_uaf_spec_26_7) {
+    // r18_3: `string.ToString()` returns `this` itself, unretained -- not
+    // every built-in `string` member's result is a fresh value.
+    expectRan(
+        runAot(extProgram(
+            "public record Named(Tag: string, N: int);\n",
+            "  public method W(): Named => new Named(this.ToString(), 1);\n",
+            "    using var l := new Array<Named>();\n"
+            "    for var i in 0..199 do l.Add(Make.Str(i).W()); end;\n"
+            "    for var n in l do t := t + n.Tag.Length; end;\n")),
+        "690\n");
+}

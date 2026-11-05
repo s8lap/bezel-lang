@@ -13103,13 +13103,13 @@ private:
     // False means the caller may release its +1 receiver temporary right
     // after the call; true keeps the pre-#7841 leak. Cached per declaration
     // (`thisStringEscape_`, keyed on the MethodDecl / PropertyDecl);
-    // `inProgress` guards the recursion through `this.Other()`.
+    // `inProgress` guards the recursion through `this.Other()` — a member
+    // reached while its own walk is in progress is an escape.
     bool thisStringMayEscape(const sema::MethodSymbol* ms,
-                             std::unordered_set<const ast::Node*>& inProgress,
-                             bool* hitCycle);
+                             std::unordered_set<const ast::Node*>& inProgress);
     bool thisStringMayEscapeProperty(
         const sema::PropertySymbol* ps,
-        std::unordered_set<const ast::Node*>& inProgress, bool* hitCycle);
+        std::unordered_set<const ast::Node*>& inProgress);
     std::unordered_map<const ast::Node*, bool> thisStringEscape_;
     // fix #7841: the K8 deferral of an extension receiver's release
     // (deferExtStringReceiverReleaseToK8) is sound only for the provably
