@@ -34,17 +34,18 @@
 //     must keep that diagnostic. ROW 4 is the discriminator pair.
 //   * `t := move t` is the §28.3 / §22.3 explicit-transfer spelling and is
 //     accepted. ROW 8.
-//   * two DISTINCT owned locals — `t := u` — is an ordinary §28.7
-//     drop-on-overwrite. ROW 9.
+//   * two DISTINCT owned locals — `t := u` — is not a self-assignment; it is
+//     rejected by the state-match arm for another binding's unmarked read
+//     (the fourth fix-forward of #8137), never by this one. ROW 9.
 //   * §21.1's `const` local self-assignment keeps ITS OWN diagnostic; the two
 //     rules are distinct and each must fire as itself. ROW 10.
 //
-// NOT COVERED, REPORTED: §28.3's state-match bullet is general, and
+// NOT COVERED BY THIS ARM: §28.3's state-match bullet is general, and
 // `var t := new Res(); t := r;` with `r` a `Res` PARAMETER is the same
-// violation through a different spelling — MEASURED accepted rc=0 on the
-// parent, and it stays accepted here. The fix is scoped to the case v0.339
-// names. Widening it to every borrow RHS would reject every
-// `t := someBorrowingCall()` shape and needs its own census.
+// violation through a different spelling. The unmarked read of ANOTHER
+// binding (a parameter or a local) is rejected by its own arm since the
+// fourth fix-forward of #8137; a call / member / indexer RHS that yields a
+// borrow (`t := someBorrowingCall()`) is #4846 and needs its own census.
 //
 // per §28.3, §15.3, §28.7, §22.3, §21.1, v0.339, #6609
 
@@ -294,22 +295,25 @@ end Program;
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, kSelfAssign));
 }
 
-// ── ROW 9 — two DISTINCT owned locals: ordinary drop-on-overwrite ─────────
+// ── ROW 9 — two DISTINCT owned locals: NOT a self-assignment ─────────────
 // `t := u;` is not a self-assignment; an arm that compared SPELLINGS rather
-// than SYMBOLS would wrongly reject it.
+// than SYMBOLS would wrongly reject it AS ONE.
 //
-// This row is a COMPILE-TIME acceptance check (`parseAndCheckOwnership`)
-// rather than a `runAot`/`runAotChecked` run, and the reason is §28.6, not
-// convenience: an unmarked store of a named owned binding into another local
-// is a BORROW store, so `t.Dispose()` afterwards is itself rejected — "cannot
-// call `Dispose()` on `t`: it is a borrow (an alias) of `u`" — and the pair
-// cannot be tidied without `move`, which would stop being the shape this row
-// is about. Both oracles run the program, so both would see the resulting
-// leak and turn a clean ACCEPT into a red for an unrelated reason. The claim
-// under test is purely "this is NOT a self-assignment", which is a question
-// about diagnostics, so it is asked of the diagnostics directly.
+// It is still a §28.3 state-match violation, through the OTHER-binding
+// spelling: "an owned-state LHS requires an owned RHS — a fresh producer, or
+// a named owned binding under the explicit transfer marker (`x := move y;`)"
+// (§28.3 *State match on reassignment*, item 1, v0.355), and the unmarked read
+// `u` is a borrow. The fourth fix-forward of #8137 enforces that half, so the
+// row's expectation flipped from "no error at all" to "rejected by the
+// state-match diagnostic, NOT by the self-assignment one". (The program, run,
+// was a double disposal of `u`'s Cell: MEASURED on r30-c1 @ c48c1c1c under
+// ASan, the same shape is a heap-use-after-free.)
+//
+// This row is a COMPILE-TIME check (`parseAndCheckOwnership`): the claim
+// under test is a question about diagnostics, so it is asked of the
+// diagnostics directly.
 BEZEL_TEST(self_assignment_owned_local_6609,
-           distinct_owned_locals_accepted_spec_28_7) {
+           distinct_owned_locals_not_a_self_assignment_spec_28_3) {
     std::string src = std::string(kCell) + R"(
 class Program
   public static method Main(): int
@@ -321,9 +325,11 @@ class Program
 end Program;
 )";
     auto r = parseAndCheckOwnership(src);
-    // No ERROR at all — the store is accepted. (The pre-existing §28.3
-    // auto-drop WARNING is expected and is a Warning, not an Error.)
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "cannot assign `u` to `t`: `t` is in the OWNED state and the "
+           "right-hand side is an unmarked read of `u`, which is a BORROW"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "Spell the transfer with `move`"));
     BEZEL_EXPECT_FALSE(hasErrorMessage(r, kSelfAssign));
 }
 

@@ -10157,7 +10157,8 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             //   (2) the RHS IS the unmarked read of that SAME binding. Symbol
             //       identity, not spelling: `ctx_.exprSymbol` on both sides, so
             //       two locals sharing a name across bodies cannot alias, and
-            //       `t := u` (two distinct owned locals) is untouched.
+            //       `t := u` (two distinct owned locals) is not this arm's: it
+            //       is the other-binding arm's, just below.
             //   (3) NOT a marked transfer. `t := move t` is the §28.3 /
             //       §22.3 explicit-transfer spelling and is the sanctioned way
             //       to express the same intent; `recordMovesIn` has already
@@ -10201,11 +10202,10 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // one. MEASURED on the parent, `var t := new Res(); t := r;` with
             // `r` a `Res` PARAMETER is also accepted rc=0: the same violation
             // through a different spelling. This arm is deliberately scoped to
-            // the named case; widening it to every borrow RHS is an
-            // expression-shape widening with its own blast radius (it would
-            // reject every `t := someBorrowingCall()` shape), which is exactly
-            // the scope creep CLAUDE.md forbids and which needs its own census.
-            // Filed as a follow-up.
+            // the named case. The unmarked read of ANOTHER binding (`t := r;`)
+            // is the other-binding arm below (the fourth fix-forward of
+            // #8137); widening to every borrow RHS (`t := someBorrowingCall()`)
+            // is #4846 and needs its own census.
             if (st.state == OwnershipState::Owned && !as.valueHasOwnedMarker) {
                 // (2) the RHS is the unmarked read of THIS binding. Peel a
                 // force-unwrap (`t := t!` reads the same slot) exactly as
@@ -10241,6 +10241,83 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                                "it is not a §28.7 drop-and-replace discharge. "
                                "Delete the statement, or spell the transfer "
                                "explicitly with `move`");
+                // fix-forward #8137 (§28.3 *State match on reassignment*,
+                // §28.7, §30.3, v0.355): the state match for an unmarked read
+                // of ANOTHER binding. §28.3: "Assigning a borrow to an
+                // owned-state LHS, or an owned value to a borrowed-state LHS,
+                // is rejected — the mismatch would silently drop or
+                // double-hold a disposal obligation", and item 1: "an
+                // owned-state LHS requires an owned RHS — a fresh producer, or
+                // a named owned binding under the explicit transfer marker
+                // (`x := move y;`)". The Adoption clause classifies "an
+                // unmarked binding read" as a borrow. So `c := b;` into an
+                // owned-state `c` is a compile error whether `b` is a plain
+                // parameter, a borrowed-state local, or an owned local read
+                // without `move`.
+                //
+                // WHY NOW. #8137 made `var c := t.Result;` (an OwningTask's
+                // transferred result, §30.3) an OWNED local, which brought the
+                // un-enforced half of this rule (#8164) onto that spelling:
+                // `c := b1;` over a plain parameter `b1` was accepted, the
+                // drop-on-overwrite of the NEXT store (§28.7) and the scope-end
+                // auto-drop then disposed the caller's `b1` / `b2`, and the
+                // caller's read was a heap-use-after-free. Rejecting the store
+                // is the spec's answer, and it is what makes the
+                // drop-on-overwrite of every ACCEPTED store into an owned-state
+                // local dispose only a value that local owns.
+                //
+                // SCOPE. The RHS is a bare identifier (a `!` peeled) naming a
+                // LOCAL or a PARAMETER — a binding read — and its value is of
+                // a borrowable class/interface type
+                // (`isBorrowableOwnedSinkType`), so a runtime-managed RHS (a
+                // `string`, a box, a function value), which §28.3 puts outside
+                // the match, is never reached. The borrow classification is
+                // `ownedArgSourceIsBorrow`'s (a non-`owned` parameter, a
+                // Borrowed-state local, a catch binding — and NOT the fresh
+                // owned-`Array` materializer carve-out the pass tracks as
+                // Borrowed); an Owned-state local read unmarked is the other
+                // half of item 1 (it must be `move`d). A call / member /
+                // indexer RHS that yields a borrow is the same rule through a
+                // different spelling (#4846) and is not widened here.
+                if (!selfRead && !moveOnlyTarget && rid &&
+                    isBorrowableOwnedSinkType(ctx_.exprType(*rid))) {
+                    sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                    const bool isBinding =
+                        dynamic_cast<sema::LocalSymbol*>(rsym) ||
+                        dynamic_cast<sema::ParameterSymbol*>(rsym);
+                    bool rhsOwnedUnmarked = false;
+                    if (dynamic_cast<sema::LocalSymbol*>(rsym)) {
+                        if (LocalOwnership* rst = lookupStateFor(*rid))
+                            rhsOwnedUnmarked =
+                                rst->state == OwnershipState::Owned;
+                    }
+                    const bool rhsBorrow =
+                        isBinding && !rhsOwnedUnmarked &&
+                        ownedArgSourceIsBorrow(*rid);
+                    if (isBinding && (rhsBorrow || rhsOwnedUnmarked))
+                        report(Severity::Error, rid->span.begin,
+                               std::string("cannot assign `") +
+                                   std::string(rid->name) + "` to `" +
+                                   std::string(id->name) + "`: `" +
+                                   std::string(id->name) +
+                                   "` is in the OWNED state and the "
+                                   "right-hand side is an unmarked read of `" +
+                                   std::string(rid->name) +
+                                   "`, which is a BORROW — §28.3's state match "
+                                   "on reassignment requires an owned-state LHS "
+                                   "to receive an owned value (a fresh "
+                                   "producer, or a named owned binding under "
+                                   "the explicit transfer marker `x := move "
+                                   "y`); storing the borrow would make `" +
+                                   std::string(id->name) +
+                                   "` dispose a value it does not own. " +
+                                   (rhsOwnedUnmarked
+                                        ? std::string(
+                                              "Spell the transfer with `move`")
+                                        : std::string(
+                                              "Bind the borrow to a separate "
+                                              "local instead")));
+                }
             }
             // fix #4329 (§28.3 / §28.7 / O4 silent-poison design, v0.298): at a
             // non-loop `if … then` / no-else merge, `joinInto`'s catch-all sets

@@ -491,6 +491,114 @@ BEZEL_TEST(owning_task_result_plain_var_8137,
                       std::string::npos);
 }
 
+// §28.3 *State match on reassignment* -- the NON-GENERIC twin of the row
+// above, the fourth fix-forward of #8137 (the R39 gate's ASan leg).
+//
+// In a non-generic body the ownership pass DOES see `var c := t.Result;` as
+// §30.3's owned transfer, so `c` is an OWNED-state local, and `c := b1;`
+// stores a BORROWED parameter into it. §28.3 (v0.355): "Assigning a borrow to
+// an owned-state LHS, or an owned value to a borrowed-state LHS, is rejected
+// -- the mismatch would silently drop or double-hold a disposal obligation",
+// and item 1: "an owned-state LHS requires an owned RHS -- a fresh producer,
+// or a named owned binding under the explicit transfer marker (`x := move
+// y;`)". The program is therefore a COMPILE ERROR at the first store.
+//
+// MEASURED on r30-c1 @ c48c1c1c (ASan): the program compiled, the stores'
+// drop-on-overwrite and `c`'s scope-end auto-drop disposed the CALLER's `b1`
+// / `b2`, and the caller's `b1.v` read was a heap-use-after-free. (On
+// origin/main d201a5c5, before #8137, `c` was a borrow: the program printed
+// 400 and leaked the transferred Result.)
+//
+// The oracle: rejected at compile time with a real location (the program
+// never ran), with the specific state-match diagnostic naming the borrow
+// `b1` and the owned-state LHS `c`.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           nongeneric_reassign_from_borrowed_param_is_rejected_spec_28_3) {
+    JitResult r = runAotChecked(
+        "module M; import System; "
+        "class Cell "
+        "  public static n: int := 0; "
+        "  public v: int; "
+        "  public constructor(x: int) v := x; Cell.n := Cell.n + 1; end constructor; "
+        "  destructor Cell.n := Cell.n - 1; end destructor; "
+        "end Cell; "
+        "class C "
+        "  public static async method Mk(): OwningTask<Cell> return new Cell(5); end Mk; "
+        "  static method G(t: OwningTask<Cell>, b1: Cell, b2: Cell): int "
+        "    var c := t.Result; "
+        "    c := b1; "
+        "    c := b2; "
+        "    return 1; "
+        "  end G; "
+        "  static method A() "
+        "    var i := 0; var s := 0; "
+        "    while i < 100 do "
+        "      using var t := Mk(); "
+        "      var b1 := new Cell(1); var b2 := new Cell(2); "
+        "      s := s + G(t, b1, b2) + b1.v + b2.v; "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(s); "
+        "  end A; "
+        "  public static method Main(): int "
+        "    A(); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    const std::string text = diagnosticText(r);
+    BEZEL_EXPECT_TRUE(text.find(
+        "cannot assign `b1` to `c`: `c` is in the OWNED state and the "
+        "right-hand side is an unmarked read of `b1`, which is a BORROW") !=
+        std::string::npos);
+    BEZEL_EXPECT_TRUE(text.find("§28.3's state match on reassignment") !=
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(text.find("heap-use-after-free") == std::string::npos);
+}
+
+// §28.3 *State match on reassignment*, item 1 -- an OWNED local read WITHOUT
+// the transfer marker is the same violation: "a named owned binding under the
+// explicit transfer marker (`x := move y;`)". `c := d;` over an owned `d`
+// stores a borrow of `d`'s value into the owned-state `c`; MEASURED on
+// r30-c1 @ c48c1c1c it compiled and both `c` and `d` disposed the same Cell.
+// The diagnostic names the `move` remedy.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_result_reassign_from_unmarked_owned_local_is_rejected_spec_28_3) {
+    JitResult r = runAotChecked(prog(
+        "      using var t := Mk(); "
+        "      var c := t.Result; "
+        "      var d := new Cell(8); "
+        "      c := d; "
+        "      s := s + c.v; "));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    const std::string text = diagnosticText(r);
+    BEZEL_EXPECT_TRUE(text.find(
+        "cannot assign `d` to `c`: `c` is in the OWNED state and the "
+        "right-hand side is an unmarked read of `d`, which is a BORROW") !=
+        std::string::npos);
+    BEZEL_EXPECT_TRUE(text.find("Spell the transfer with `move`") !=
+                      std::string::npos);
+}
+
+// §28.3 / §28.7 -- the CONTROL for the row above: the marked transfer
+// `c := move d;` is admitted (item 1's "named owned binding under the
+// explicit transfer marker"), the DISPLACED transferred Result is disposed at
+// the store (§28.7, b3940405's intent), and the moved Cell is disposed once at
+// scope end through `c`: live counter 0, no leak.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           plain_var_result_reassign_from_moved_owned_local_displaces_spec_28_7) {
+    JitResult r = runAotChecked(prog(
+        "      using var t := Mk(); "
+        "      var c := t.Result; "
+        "      s := s + c.v; "
+        "      var d := new Cell(8); "
+        "      c := move d; "
+        "      s := s + c.v; "));
+    expectNoLeak(r, "1300\nlive 0\n");
+}
+
 // =====================================================================
 // THE UNWIND ROWS -- §28.3's EXCEPTION EDGE for a plain `var` bound to an
 // `OwningTask`'s `Result` (the third fix-forward of #8137).
