@@ -18787,6 +18787,41 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 v = builder_.CreateFPExt(v, llvm::Type::getDoubleTy(llvm_));
             llvm::Value* r = llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_), ratio);
             llvm::Value* prod = builder_.CreateFMul(v, r, "ts.product");
+            // fix #7576 (stdlib §2.5, v0.355): `TimeSpan.From<Unit>(n)` is
+            // "computed over ticks in `double` and truncated toward zero to a
+            // whole number of ticks, raising `OverflowException` when the
+            // result falls outside the tick range or the argument is `NaN`
+            // (the `*` operator's contract above)". The `*` operator's
+            // contract: "computes over Ticks in double; OverflowException on
+            // a product outside the tick range or a NaN operand (pinned). The
+            // range check reads the double product, so MaxValue * 1.0 raises
+            // (its Ticks convert to 2^63); an in-range product is truncated
+            // toward zero to whole ticks, as From<Unit> is".
+            //
+            // The arm had NO guard: `CreateFPToSI` of an out-of-range or NaN
+            // product is POISON in LLVM, and on x86 the `cvttsd2si` returns the
+            // "integer indefinite" value, so `TimeSpan.FromDays(1e300)`
+            // produced an arbitrary tick count and
+            // `TimeSpan.FromSeconds(0.0/0.0)` produced long.MinValue — no
+            // exception at all (MEASURED on r30-c1: `1e300` -> ticks
+            // 140341758457675, `0.0/0.0` -> ticks -9223372036854775808).
+            //
+            // The guard is the `*` operator's, verbatim: a NaN ARGUMENT
+            // raises, and the double PRODUCT must lie in [-2^63, 2^63) — the
+            // half-open range the operator's own check uses, so
+            // `From<Unit>` and `*` agree on the boundary (MaxValue's Ticks
+            // convert to 2^63, which is OUTSIDE the range and raises). The
+            // in-range product is truncated toward zero by `fptosi`, which is
+            // the stdlib's stated truncation.
+            emitGuardThrow(builder_.CreateFCmpUNO(v, v, "ts.from.nan"),
+                           "OverflowException");
+            llvm::Value* lo = llvm::ConstantFP::get(
+                llvm::Type::getDoubleTy(llvm_), -9223372036854775808.0);
+            llvm::Value* hi = llvm::ConstantFP::get(
+                llvm::Type::getDoubleTy(llvm_), 9223372036854775808.0);
+            llvm::Value* inRange = builder_.CreateAnd(
+                builder_.CreateFCmpOGE(prod, lo), builder_.CreateFCmpOLT(prod, hi));
+            emitGuardThrow(builder_.CreateNot(inRange), "OverflowException");
             return builder_.CreateFPToSI(prod, i64(), "ts.ticks");
         };
         if (m == "FromDays")         return fromDouble(864000000000.0);
