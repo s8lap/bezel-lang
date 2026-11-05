@@ -228,3 +228,98 @@ BEZEL_TEST(inherited_generic_key_6530,
             "  end Main;\n"
             "end Program;\n"));
 }
+
+// ---------------------------------------------------------------------------
+// fix-forward #6530 (review r39-rev-6530c, probes c6_T / c6_..._X): the chain
+// walk must NOT refuse a level whose base clause names a parameter the
+// receiver never pinned when the ANCESTOR does not need that parameter.
+//
+//     class A<X>      property bv: X
+//     class B<Y>: A<string>
+//     class C<T>: B<T>   method Go(): int  return bv.Length;
+//
+// at `C<int>`: `bv.Length` is read in C's SHARED TEMPLATE body, where the
+// active substitution is empty (#2909's LOOSENED SEED leaves `T` unbound on
+// purpose). C's base clause `B<T>` binds B's `Y` to the still-bare `T`; B's
+// base clause `A<string>` never consults `Y`, so A's `X` is `string` and the
+// walk succeeds — the END check refuses only a binding the ancestor actually
+// needs. The third #6530 commit returned `false` from the walk as soon as a
+// level's parameter was unbound, so `classStruct(A)` fell back to the T→i32
+// erased placeholder, `bv` lowered as i32, and `.Length` GEP'd a `%bz.string`
+// off an i32: "codegen error: IR verification failed" where every earlier
+// compiler printed 5. §12 / §14.1 (v0.355): the field's type is decided by
+// substitution along the base chain, level by level; §3.6 rule 2: evaluated
+// per instantiation after substituting the type arguments. The #2909 pin
+// `multi_level_concrete_leaf_spec_12_14_1` DESCRIBES this D → M → B shape but
+// its program never gives M a base, so it could not see the regression.
+// ---------------------------------------------------------------------------
+
+// A generic leaf over a generic middle level whose base clause pins the
+// ancestor's argument concretely (`A<string>`), parameter spelled `T`.
+BEZEL_TEST(inherited_generic_key_6530,
+           unbound_intermediate_param_T_over_concrete_ancestor_arg_reads_inherited_string_spec_12_14_1) {
+    BEZEL_EXPECT_EQ(
+        std::string("5\n"),
+        out("module P;\n"
+            "public class A<X>\n"
+            "  public property bv: X;\n"
+            "  public constructor(v: X)\n"
+            "    bv := v;\n"
+            "  end constructor;\n"
+            "end A;\n"
+            "public class B<Y>: A<string>\n"
+            "  public constructor()\n"
+            "    base(\"hello\");\n"
+            "  end constructor;\n"
+            "end B;\n"
+            "public class C<T>: B<T>\n"
+            "  public constructor()\n"
+            "    base();\n"
+            "  end constructor;\n"
+            "  public method Go(): int\n"
+            "    return bv.Length;\n"
+            "  end Go;\n"
+            "end C;\n"
+            "public class Program\n"
+            "  public static method Main()\n"
+            "    using var x := new C<int>();\n"
+            "    Console.WriteLine(x.Go());\n"
+            "  end Main;\n"
+            "end Program;\n"));
+}
+
+// The same chain with the leaf's parameter spelled `Guid`: the unbound bare
+// `Guid` that C's base clause hands to B's `Y` is the resolver-flagged
+// parameter, and it must flow through the walk unconsulted exactly as `T`
+// does — neither refused at B's level nor read as the 16-byte built-in.
+BEZEL_TEST(inherited_generic_key_6530,
+           unbound_intermediate_param_named_guid_over_concrete_ancestor_arg_reads_inherited_string) {
+    BEZEL_EXPECT_EQ(
+        std::string("5\n"),
+        out("module P;\n"
+            "public class A<X>\n"
+            "  public property bv: X;\n"
+            "  public constructor(v: X)\n"
+            "    bv := v;\n"
+            "  end constructor;\n"
+            "end A;\n"
+            "public class B<Y>: A<string>\n"
+            "  public constructor()\n"
+            "    base(\"hello\");\n"
+            "  end constructor;\n"
+            "end B;\n"
+            "public class C<Guid>: B<Guid>\n"
+            "  public constructor()\n"
+            "    base();\n"
+            "  end constructor;\n"
+            "  public method Go(): int\n"
+            "    return bv.Length;\n"
+            "  end Go;\n"
+            "end C;\n"
+            "public class Program\n"
+            "  public static method Main()\n"
+            "    using var x := new C<int>();\n"
+            "    Console.WriteLine(x.Go());\n"
+            "  end Main;\n"
+            "end Program;\n"));
+}

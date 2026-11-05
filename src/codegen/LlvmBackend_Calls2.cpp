@@ -19333,12 +19333,26 @@ bool Emitter::computeAncestorGenericSubst(
                 // (`class D: Base<Guid>`), where it stays the built-in.
                 if (isLevelParamRef(arg, levelParams)) {
                     auto it = curArgs.find(arg->headName());
-                    // A parameter this level never pinned: the chain cannot
-                    // be resolved (the #2909 refusal, now taken at the level
-                    // that asked, so a builtin-named parameter cannot pass
-                    // the end check below as "concrete").
-                    if (it == curArgs.end() || !it->second) return false;
-                    arg = it->second;
+                    // fix-forward #6530 (§12 / §14.1, v0.355): a parameter
+                    // this level never pinned stays the BARE ref and flows
+                    // on — it is NOT a refusal here. #2909's LOOSENED SEED
+                    // leaves an unreferenced parameter unbound on purpose,
+                    // and whether that matters is decided by the END check
+                    // alone, which refuses only a binding the ANCESTOR
+                    // consults: `class C<T>: B<T>`, `class B<Y>: A<string>`
+                    // reading A's `bv: X` in C's template body hands B's `Y`
+                    // the bare `T`, B's own base clause `A<string>` never
+                    // reads `Y`, and `X` is `string` — the walk must
+                    // succeed (the base printed 5). An early `return false`
+                    // at this level refused that walk, `classStruct(A)` fell
+                    // back to the T→i32 erased placeholder, and `.Length`
+                    // GEP'd a `%bz.string` off an i32: "IR verification
+                    // failed" (review r39-rev-6530c, probes c6_T and c6_X).
+                    // The builtin-named case the early return was written
+                    // for (`Derived<Guid>: Base<Guid>` in Derived's template
+                    // body) is already caught at the end check by the
+                    // resolver's `isResolvedTypeParam()` term below.
+                    if (it != curArgs.end()) arg = it->second;
                 }
                 nextArgs[baseParams[gi]] = arg;
             }
