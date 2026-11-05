@@ -11255,6 +11255,39 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
             ctx_.setExprType(&be, tsTy);
             return;
         }
+        // fix #7606 (spec §25.2, v0.355; stdlib §2.5, v0.355): a stdlib value
+        // builtin on the RIGHT of a primitive left operand has no declared
+        // operator. §2.5 declares `operator *(a: TimeSpan, factor: double)`
+        // and `operator /(a: TimeSpan, divisor: double)` only, with the
+        // TimeSpan FIRST; §25.2: operands are matched to the parameters in
+        // order, with no automatic commutation. So `2.0 * ts` (and `2 * ts`,
+        // `1.0 + ts`, ...) has no applicable overload. The Named-left reject
+        // below never sees it (its left operand is a primitive), so before this
+        // the pair was silently computed as a bare tick product.
+        if (lt && lt->kind == TypeRef::Kind::Primitive &&
+            lt->primitive != PrimitiveType::String &&
+            (op == "+" || op == "-" || op == "*" || op == "/" ||
+             op == "mod") &&
+            be.right) {
+            TypeRef* rr = ctx_.exprType(*be.right);
+            std::string_view rn =
+                (rr && rr->kind == TypeRef::Kind::Named)
+                    ? stdlibValueBuiltinName(rr)
+                    : std::string_view{};
+            if (!rn.empty()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    "operator `" + std::string(op) + "` is not defined with "
+                    "a primitive left operand and a `" + std::string(rn) +
+                    "` right operand (\xC2\xA7""25.2): stdlib \xC2\xA7""2.5 declares "
+                    "its `" + std::string(rn) + "` operators with the `" +
+                    std::string(rn) + "` as the FIRST parameter and operands "
+                    "match parameters in order, with no automatic "
+                    "commutation; write the `" + std::string(rn) +
+                    "` operand on the left (e.g. `ts * 2.0`)");
+                return;
+            }
+        }
         // §25: arithmetic operators (+, -, *, /, mod) are NOT defined on
         // user class/record types unless the type declares a matching
         // `static method operator <op>` in its own body. `findBinaryOperator`
