@@ -30806,18 +30806,25 @@ bool isConsoleNonRetainingArg(const ast::Expr* callee, size_t i,
         // local bound to `Console.Out`/`Console.Error` lowers through the same
         // tryLowerConsoleCall arm. A local the arm declines (written again)
         // is a compile error there, so claiming it here cannot strand a value.
-        return ctx && consoleWriterLocalStdFdOf(*ctx, *id) != 0;
+        // fix #7792 (stdlib §7.4, v0.355): so does any other receiver whose
+        // static type is the built-in `TextWriter` (a parameter, a reassigned
+        // local): the arm writes to the descriptor the value holds.
+        return ctx && (consoleWriterLocalStdFdOf(*ctx, *id) != 0 ||
+                       isBuiltinTextWriterTypeRef(ctx->exprType(*id)));
     }
     // `Console.Out.<m>` / `Console.Error.<m>` — the stdout/stderr TextWriter
     // facets that lower through the same tryLowerConsoleCall stdfd path.
     if (auto* inner =
             dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get())) {
-        if (inner->member != "Out" && inner->member != "Error") return false;
         if (auto* iid =
                 dynamic_cast<const ast::IdentifierExpr*>(inner->target.get()))
-            return iid->name == "Console";
+            if (iid->name == "Console" &&
+                (inner->member == "Out" || inner->member == "Error"))
+                return true;
     }
-    return false;
+    // fix #7792 (stdlib §7.4, v0.355): any other `TextWriter`-typed receiver
+    // expression (`h.W`, `Pick()`) lowers through the same arm.
+    return ctx && isBuiltinTextWriterTypeRef(ctx->exprType(*ma->target));
 }
 
 // fix #7127 / #6889 (§22.3 / §28.3 / §28.9, v0.343): is argument `i` of a call

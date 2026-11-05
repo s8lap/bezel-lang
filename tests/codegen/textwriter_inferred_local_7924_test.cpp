@@ -62,19 +62,24 @@ BEZEL_TEST(textwriter_inferred_local_7924, var_const_out_error_matrix) {
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("5\ns7\ncls\nx\n"));
 }
 
-// An inferred local that is reassigned is not provably Console.Out, so it keeps
-// the #2457 reject exactly as the annotated one does.
-BEZEL_TEST(textwriter_inferred_local_7924, reassigned_inferred_local_still_rejected) {
-    auto ann = runAot(std::string(kPre) +
+// An inferred local that is reassigned writes to the stream it holds at the
+// write, exactly as the annotated one does. fix #7792 (stdlib §2.1 / §7.4,
+// v0.355) flipped this row: it pinned the #2457 reject of a reassigned local,
+// which only existed because a `TextWriter` value had no representation. The
+// stream follows the value now, so `w := Console.Error; w.WriteLine(1)` writes
+// to stderr (the harness captures stdout only) and the later write to
+// `Console.Out` reaches stdout.
+BEZEL_TEST(textwriter_inferred_local_7924, reassigned_inferred_local_follows_the_value) {
+    auto ann = runAotChecked(std::string(kPre) +
         "var w: TextWriter := Console.Out; w := Console.Error; w.WriteLine(1); "
-        "end Main; end P;");
-    auto inf = runAot(std::string(kPre) +
+        "w := Console.Out; w.WriteLine(2); end Main; end P;");
+    auto inf = runAotChecked(std::string(kPre) +
         "var w := Console.Out; w := Console.Error; w.WriteLine(1); "
-        "end Main; end P;");
-    BEZEL_EXPECT_FALSE(ann.ran);
-    BEZEL_EXPECT_FALSE(inf.ran);
-    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(ann, "#2457"));
-    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(inf, "#2457"));
+        "w := Console.Out; w.WriteLine(2); end Main; end P;");
+    BEZEL_EXPECT_TRUE(ann.ran);
+    BEZEL_EXPECT_TRUE(inf.ran);
+    BEZEL_EXPECT_EQ(ann.stdoutText, std::string("2\n"));
+    BEZEL_EXPECT_EQ(inf.stdoutText, std::string("2\n"));
 }
 
 // The direct, unbound spellings are untouched by the inferred-local typing:

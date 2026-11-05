@@ -293,6 +293,10 @@ inline llvm::Value* radixAdmittedIR(llvm::IRBuilder<>& b, llvm::Value* radix) {
 // that the slot is never written again. Defined in LlvmBackend_Calls.cpp.
 int consoleWriterLocalStdFdOf(const sema::SemaContext& ctx,
                               const ast::IdentifierExpr& id);
+// fix #7792 (stdlib §7.4, v0.355): `ty` is the built-in `TextWriter` (nullable
+// or not), whose value is the i32 descriptor of its standard stream. Defined in
+// LlvmBackend_Calls.cpp.
+bool isBuiltinTextWriterTypeRef(const sema::TypeRef* ty);
 
 // fix #7741 (stdlib §9.6, v0.353; spec §28.3.4 *Producers*, v0.353): is
 // argument `i` of a call whose callee is `callee` a `string`
@@ -7648,6 +7652,30 @@ private:
         return isNullableValueTy(&nn);
     }
 
+    // fix #7792 (stdlib §7.4, v0.355): a `TextWriter` value (the i32 stream
+    // descriptor) or a `null` literal at a `TextWriter?` FORMAL. That formal
+    // lowers to the tagged `{i8 hasValue; i32}` carrier, but `TextWriter` is
+    // not in the `isNullableValueTy` family the argument wrap keys on, so the
+    // bare i32 reached the call (an IR verifier abort). Keyed on the formal's
+    // own lowering; returns `v` unchanged for any other shape.
+    llvm::Value* wrapTextWriterArgForNullableFormal(const sema::TypeRef* formalTy,
+                                                    llvm::Value* v) {
+        if (!v || !formalTy || !formalTy->nullable ||
+            !isBuiltinTextWriterTypeRef(formalTy))
+            return v;
+        auto* st = llvm::dyn_cast<llvm::StructType>(lowerTypeRef(formalTy));
+        if (!st || st->getNumElements() != 2 ||
+            st->getElementType(0) != nullablePrimHasValTy() ||
+            st->getElementType(1) != i32() || v->getType() == st)
+            return v;
+        if (v->getType()->isPointerTy() && llvm::isa<llvm::ConstantPointerNull>(v))
+            return llvm::ConstantAggregateZero::get(st);
+        if (!v->getType()->isIntegerTy(32)) return v;
+        llvm::Value* res = builder_.CreateInsertValue(
+            llvm::UndefValue::get(st),
+            llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+        return builder_.CreateInsertValue(res, v, {1u});
+    }
     llvm::Value* wrapNullableValue(const sema::TypeRef* rt, llvm::Value* val) {
         auto* st = nullableValueStructTy(rt);
         // fix #569 / §14.1 / #460: inside a monomorphized body the value slot may
@@ -24657,6 +24685,10 @@ private:
     // primitive, the caller converts via emitPrimitiveToString first.
     llvm::Value* emitConsoleWrite(llvm::Value* strPtr, bool newline,
                                    int fd = 1);
+    // fix #7792 (stdlib §7.4, v0.355): the same write to a descriptor known
+    // only at run time (a `TextWriter` value, LlvmBackend_Calls.cpp).
+    llvm::Value* emitConsoleWrite(llvm::Value* strPtr, bool newline,
+                                   llvm::Value* fd);
 
     // CG-console: Console.ReadLine() → string? (null at EOF).
     // Uses fgets(buf, 4096, stdin), strips trailing newline, copies to heap.

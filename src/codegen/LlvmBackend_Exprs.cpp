@@ -7178,6 +7178,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         return builder_.getInt32(k);
                     }
                 }
+                // fix #7792 (stdlib §2.1 / §7.4, v0.355): `Console.Out` and
+                // `Console.Error` as VALUES. stdlib §2.1 declares them as
+                // `static readonly property Out: TextWriter` / `Error`, and a
+                // `TextWriter`-typed slot is the i32 a builtin class type
+                // lowers to (as `Encoding`'s kind tag above), so the value is
+                // the standard stream's file descriptor: 1 for `Out`, 2 for
+                // `Error`. `tryLowerConsoleCall` writes to the descriptor a
+                // `TextWriter` receiver evaluates to, so the stream follows
+                // the value through a parameter, a reassigned local, a field
+                // or a return value. Before this the value failed to lower
+                // (null; the #2434 / #2491 / #1386 degrades).
+                auto* conIdV = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+                if (conIdV && conIdV->name == "Console" &&
+                    (ma->member == "Out" || ma->member == "Error") &&
+                    receiverMayReachBuiltinStaticArm(*ma->target))  // #8126
+                    return builder_.getInt32(ma->member == "Out" ? 1 : 2);
                 if (cn == "Encoding" && ma->member == "Name") {
                     llvm::Value* encV = lowerExpr(*ma->target);
                     if (!encV) return nullptr;

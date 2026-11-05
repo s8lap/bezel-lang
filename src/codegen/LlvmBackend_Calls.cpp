@@ -34,6 +34,13 @@ bool sharedParseOperandAdmissible(
 
 llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
                                int fd) {
+    return emitConsoleWrite(strPtr, newline, builder_.getInt32(fd));
+}
+
+// fix #7792 (stdlib §7.4, v0.355): the descriptor as an i32 VALUE, so a
+// `TextWriter` value receiver writes to the stream it holds at run time.
+llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
+                               llvm::Value* fd) {
     // fix #592 / per §4.6: Bezel strings use a per-string storage width of 1,
     // 2, or 4 bytes per code point (Python PEP 393 model). The raw data
     // pointer is NOT UTF-8 for non-ASCII content: a width-1 string stores
@@ -63,7 +70,7 @@ llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
     // size_t byteLen = strlen(utf8buf);
     llvm::Function* strlenFn = declareC("strlen", i64(), {ptrTy()});
     llvm::Value* byteLen = builder_.CreateCall(strlenFn, {utf8buf}, "utf8.len");
-    builder_.CreateCall(writeFn, {builder_.getInt32(fd), utf8buf, byteLen});
+    builder_.CreateCall(writeFn, {fd, utf8buf, byteLen});
     if (newline) {
         // Write a newline byte.
         llvm::Constant* nlData = llvm::ConstantDataArray::getString(
@@ -72,7 +79,7 @@ llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
             *module_, nlData->getType(), true,
             llvm::GlobalValue::PrivateLinkage, nlData, ".bz.nl");
         builder_.CreateCall(writeFn,
-                            {builder_.getInt32(fd), nlGV,
+                            {fd, nlGV,
                              builder_.getInt64(1)});
     }
     // free(utf8buf) — bz_string_to_utf8z always malloc-allocates.
@@ -165,6 +172,14 @@ llvm::Value* Emitter::emitConsoleReadLine() {
 }
 
 
+// fix #7792 (stdlib §7.4, v0.355): is `ty` the built-in `TextWriter` (no user
+// declaration), nullable or not? A value of that type is the i32 descriptor of
+// the standard stream it denotes (`Console.Out` 1, `Console.Error` 2).
+bool isBuiltinTextWriterTypeRef(const sema::TypeRef* ty) {
+    return ty && ty->kind == sema::TypeRef::Kind::Named && !ty->declaration &&
+           ty->headName() == "TextWriter";
+}
+
 // fix #7713 (stdlib §7.4, v0.350): the standard stream (1 = stdout, 2 = stderr)
 // a `TextWriter`-typed local denotes, or 0 when that is not statically proven.
 // Proven only for a local declared with an initializer that is exactly
@@ -223,41 +238,80 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
 
     // Detect Console.Error.Write/WriteLine — stderr output (fd=2).
     int stdfd = 1;  // default: stdout
+    // fix #7792 (stdlib §2.1 / §7.4, v0.355): the descriptor a `TextWriter`
+    // VALUE receiver evaluates to at run time, when the stream is not known
+    // statically. Null on the static paths (which use `stdfd`).
+    llvm::Value* fdV = nullptr;
+    // fix #7792: a receiver whose static type is the built-in `TextWriter`
+    // (a parameter, a field, a reassigned local, a call result) is a value
+    // holding the stream's descriptor (`Console.Out` lowers to 1 and
+    // `Console.Error` to 2, LlvmBackend_Exprs.cpp), so `w.WriteLine(x)` is
+    // `Console.Out.WriteLine(x)` or `Console.Error.WriteLine(x)` according
+    // to the value (stdlib §7.4: "[§2.1]'s rule, of which `Console.Out` and
+    // `Console.Error` are instances"). The member and the argument count are
+    // checked BEFORE the receiver is lowered, so a declined call has emitted
+    // no code. Returns false to decline.
+    auto lowerTextWriterValueReceiver = [&]() -> bool {
+        if (!isBuiltinTextWriterTypeRef(ctx_.exprType(*ma->target))) return false;
+        const bool shapeOk =
+            (ma->member == "WriteLine" && call.args.size() <= 1) ||
+            (ma->member == "Write" && call.args.size() == 1) ||
+            (ma->member == "Flush" && call.args.empty());
+        if (!shapeOk) return false;
+        llvm::Value* v = lowerExpr(*ma->target);
+        // A §7.4-narrowed `TextWriter?` read may arrive as its `{i8, i32}`
+        // carrier; sema's §7.4 member-access gate rejects the un-narrowed
+        // form, which is the precondition `unwrapNarrowedNullable` states.
+        v = unwrapNarrowedNullable(v, i32());
+        if (!v || !v->getType()->isIntegerTy(32)) return false;
+        fdV = v;
+        return true;
+    };
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
     if (!id) {
         // Try Console.Error.Write/WriteLine: target is MemberAccess "Console.Error"
         auto* innerMA = dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get());
-        if (!innerMA || !innerMA->target) return false;
-        auto* innerID = dynamic_cast<const ast::IdentifierExpr*>(innerMA->target.get());
-        if (!innerID || innerID->name != "Console") return false;
+        auto* innerID = innerMA && innerMA->target
+            ? dynamic_cast<const ast::IdentifierExpr*>(innerMA->target.get())
+            : nullptr;
         // fix #8126 (§2.3 / §2.7 rule 1, v0.355): a local / parameter / field
         // named `Console` is a VALUE, so `Console.Out.WriteLine(x)` is member
         // access on it, not the built-in stream.
-        if (!receiverMayReachBuiltinStaticArm(*innerID)) return false;
-        if (innerMA->member == "Error" || innerMA->member == "Out") {
+        if (innerID && innerID->name == "Console" &&
+            receiverMayReachBuiltinStaticArm(*innerID) &&
+            (innerMA->member == "Error" || innerMA->member == "Out")) {
             stdfd = (innerMA->member == "Error") ? 2 : 1;
             id = nullptr;  // mark as Error/Out path
-        } else return false;
-    } else if (id->name != "Console") {
+        } else {
+            // fix #7792: any other receiver expression (`h.W`, `Pick()`).
+            if (!lowerTextWriterValueReceiver()) return false;
+            if (ma->member == "Flush") return true;  // see the Flush note below
+        }
+    } else if (id->name != "Console" || !receiverMayReachBuiltinStaticArm(*id)) {
         // fix #7713 (stdlib §7.4 / §2.1, v0.350): a `TextWriter`-typed LOCAL
         // that is bound to `Console.Out` / `Console.Error` and never written
         // again IS that stream, so `w.WriteLine(x)` is `Console.Out.WriteLine(x)`
         // (stdlib §7.4: "[§2.1]'s rule, of which `Console.Out` and
-        // `Console.Error` are instances"). The value of `Console.Out` itself
-        // has no runtime representation (it lowers to null), so the stream is
-        // read off the initializer, with the positive unwritten proof
-        // `tryOpaqueSlotBuiltinRender` uses. Any other receiver (a parameter,
-        // a field, a reassigned local, a user subclass) declines and keeps
-        // the #2457 reject.
+        // `Console.Error` are instances"). The stream is read off the
+        // initializer, with the positive unwritten proof
+        // `tryOpaqueSlotBuiltinRender` uses. fix #7792: any other
+        // `TextWriter`-typed identifier (a parameter, a reassigned local, a
+        // field read through an implicit `this`, or a value that is itself
+        // named `Console`) is read as a value, and the stream is chosen at
+        // run time.
         const int fd = textWriterLocalStdFd(*id);
-        if (fd == 0) return false;
-        stdfd = fd;
+        if (fd != 0) {
+            stdfd = fd;
+        } else if (!lowerTextWriterValueReceiver()) {
+            return false;
+        }
         id = nullptr;
         // `Flush()` (stdlib §7.4's abstract member): the console lowering
         // writes through write(2) with no user-space buffer, so a flush has
         // nothing to flush.
         if (ma->member == "Flush" && call.args.empty()) return true;
     }
+    llvm::Value* const fdArg = fdV ? fdV : builder_.getInt32(stdfd);
 
     // fix #8126 (§2.3 / §2.7 rule 1, v0.355): a local, parameter, field or
     // property named `Console` is a VALUE, so `Console.WriteLine(x)` is member
@@ -283,7 +337,7 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             *module_, nlData->getType(), true,
             llvm::GlobalValue::PrivateLinkage, nlData,
             ".bz.console.nl." + std::to_string(id2));
-        builder_.CreateCall(writeFn, {builder_.getInt32(stdfd), nlGV, builder_.getInt64(1)});
+        builder_.CreateCall(writeFn, {fdArg, nlGV, builder_.getInt64(1)});
         return true;
     }
     if (call.args.size() != 1 || !call.args[0].value) return false;
@@ -909,7 +963,7 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         releaseRender = (strPtr != arg);
     }
     if (!strPtr) return false;
-    emitConsoleWrite(strPtr, isWriteLine, stdfd);
+    emitConsoleWrite(strPtr, isWriteLine, fdArg);
     // issue #421 / fix #2875: discharge the write-only render. Done AFTER the
     // write, which only reads the string. `bz_string_release` frees the data
     // buffer and then the header at rc == 0 — the exact pair the raw free()

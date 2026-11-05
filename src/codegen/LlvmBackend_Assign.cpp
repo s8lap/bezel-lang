@@ -16555,6 +16555,11 @@ bool Emitter::fillOmittedParamDefaults(
                                     /*sourceIsNullableRef=*/false, dv);
                             }
                         }
+                    } else {
+                        // fix #7792 (stdlib §7.4, v0.355): the omitted-default
+                        // twin of the explicit-argument `TextWriter?` wrap.
+                        ordered[j] = wrapTextWriterArgForNullableFormal(
+                            formalTy, ordered[j]);
                     }
                 }
             }
@@ -17439,6 +17444,10 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                             /*sourceIsNullableRef=*/false, a.value.get());
                     }
                 }
+            } else if (formalTy && formalTy->nullable &&
+                       isBuiltinTextWriterTypeRef(formalTy)) {
+                // fix #7792 (stdlib §7.4, v0.355): see the helper.
+                v = wrapTextWriterArgForNullableFormal(formalTy, v);
             } else if (formalTy) {
                 // per §7.4 / §12.7 (#1191): a value-type nullable local that sema
                 // proved non-null by null-flow narrowing is accepted as a

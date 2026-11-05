@@ -13,7 +13,8 @@
 // `Console.Error` are instances". So a `TextWriter` bound to `Console.Out` /
 // `Console.Error` writes what `Console.Out.<m>` / `Console.Error.<m>` write.
 // Scope of the fix: a LOCAL whose initializer is `Console.Out` / `Console.Error`
-// and which is never written again; any other receiver keeps the #2457 reject.
+// and which is never written again (any other receiver: a parameter, a field,
+// a reassigned local, a call result, is a value since #7792).
 // The `Object` overload is a boxing position, so an owning choice / owning
 // inline array there is rejected (spec §35.8 / §8.6 / §15.3, #7694) and a
 // borrow-bearing value too (spec §9.7).

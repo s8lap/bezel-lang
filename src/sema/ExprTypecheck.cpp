@@ -6952,6 +6952,45 @@ void ExprTC::checkAssignable(
     // §5.1 "Constant narrowing" (#2925): applied HERE, once, for every §5.1
     // conversion site — see narrowIntConstantToTarget above.
     from = narrowIntConstantToTarget(fromExpr, from, to);
+    // narrow #7792 (stdlib §1 *Extensibility*, §7.4, v0.355): a user class
+    // derived from the built-in `TextWriter` converted to `TextWriter`. The
+    // stdlib opens `TextWriter` to user subclasses, but this compiler
+    // represents a `TextWriter` value as the descriptor of the standard
+    // stream it denotes (`Console.Out`, `Console.Error`), so a subclass
+    // instance has no representation in a `TextWriter` location. MEASURED
+    // before this arm: a field store wrote the 8-byte object pointer into the
+    // 4-byte slot (a heap overrun) and a later `WriteLine` through it printed
+    // nothing; a parameter pass aborted the IR verifier. Reject it, loudly
+    // and located, until a `TextWriter` value can carry a subclass instance.
+    if (to->kind == TypeRef::Kind::Named && !to->declaration &&
+        to->genericArgs.empty() && to->headName() == "TextWriter" &&
+        from->kind == TypeRef::Kind::Named && from->declaration) {
+        bool reaches = false;
+        std::vector<const TypeSymbol*> work{from->declaration};
+        std::unordered_set<const TypeSymbol*> seen;
+        while (!work.empty() && !reaches && seen.size() < 256) {
+            const TypeSymbol* ts = work.back();
+            work.pop_back();
+            if (!ts || !seen.insert(ts).second) continue;
+            for (const TypeRef* br : nonSymbolBaseRefsOf(ts))
+                if (br && br->kind == TypeRef::Kind::Named &&
+                    !br->declaration && br->headName() == "TextWriter")
+                    reaches = true;
+            for (const TypeSymbol* b : ts->baseTypes) work.push_back(b);
+        }
+        if (reaches) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "the " + what + " has type `" +
+                std::string(namedTypeSimpleName(from)) +
+                "`, a user subclass of `TextWriter`; converting it to the "
+                "built-in `TextWriter` type is not implemented by this "
+                "compiler, which represents a `TextWriter` value only as one "
+                "of the standard streams `Console.Out` and `Console.Error` "
+                "(stdlib \xC2\xA7""7.4, #7792)");
+            return;
+        }
+    }
     // fix #2912 (§8.6 *Boxing of inline arrays*, v0.240) — the whole rule:
     //
     //   "Move-only value types — owning inline arrays (`[N owned]T` and
