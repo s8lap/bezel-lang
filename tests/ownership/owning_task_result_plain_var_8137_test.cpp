@@ -408,3 +408,84 @@ BEZEL_TEST(owning_task_result_plain_var_8137,
                       std::string::npos);
     BEZEL_EXPECT_TRUE(text.find("§21.1 / §28.3") != std::string::npos);
 }
+
+// §28.7 / §28.3 -- the GENERIC body, the second fix-forward's row: codegen's
+// drop-on-overwrite gate must never classify a local OWNED that the
+// ownership pass classifies as a BORROW.
+//
+// `G<T>(t: OwningTask<T>, b1: T, b2: T) where T: class` reads
+// `var c := t.Result;` and then stores two BORROWED parameters into `c`.
+// The ownership pass runs on the generic template body, where the read's
+// type is the bare parameter `T` (no class declaration), so it classifies
+// `c` as a BORROW and admits both stores as borrow-to-borrow (§28.3 *State
+// match on reassignment*, item 1: "a borrowed-state LHS requires a borrow (or
+// `null`) RHS", v0.355). §28.7's drop-on-overwrite ("Assignment to an owned
+// field or owned local disposes the displaced value") therefore does not
+// apply to `c`: a borrowed-state store disposes nothing.
+//
+// The first fix-forward (9a8e479a) handed the shared fact codegen's
+// monomorphization-aware resolver at the overwrite gate while the ownership
+// pass handed it none, so at the `G<Cell>` specialization the gate resolved
+// `T` to `Cell`, called `c` OWNED, and disposed the displaced value at EVERY
+// store: the second store freed the caller's `b1`, and the caller's `b1.v`
+// read was a heap-use-after-free (MEASURED on 9a8e479a under ASan). The gate
+// now reads the fact in the ownership pass's own CLASSIFICATION form (no
+// resolver), so the two sides cannot be handed different arguments.
+//
+// The oracle is must-not-UAF: there is no `heap-use-after-free` (nor any
+// other AddressSanitizer ERROR headline, nor a signal) in the report, and
+// the caller's reads of `b1.v` and `b2.v` after the call produced the exact
+// sum (1 + 1 + 2 per iteration, 100 iterations). The row deliberately does
+// NOT assert `r.ran`, the exit code or the live counter: the transferred
+// `Result` of a GENERIC read is a borrow on both sides today and LEAKS (the
+// base behaviour, a separate known gap; the ownership pass does not yet see
+// the generic shape), and `runAotChecked` turns ANY sanitizer report — a
+// leak-only one included — into `ran == false` / `exitCode == -1` with the
+// report in the diagnostics, so pinning that leak is not this row's
+// question. The vacuous-oracle controls are the exact stdout (a program
+// ASan aborts at the first `b1.v` read prints no sum — MEASURED on
+// 9a8e479a: empty stdout, `heap-use-after-free` in the report) and the
+// toolchain-skip check.
+BEZEL_TEST(owning_task_result_plain_var_8137,
+           generic_body_reassign_from_borrowed_params_is_not_a_uaf_spec_28_7) {
+    JitResult r = runAotChecked(
+        "module M; import System; "
+        "class Cell "
+        "  public static n: int := 0; "
+        "  public v: int; "
+        "  public constructor(x: int) v := x; Cell.n := Cell.n + 1; end constructor; "
+        "  destructor Cell.n := Cell.n - 1; end destructor; "
+        "end Cell; "
+        "class C "
+        "  public static async method Mk(): OwningTask<Cell> return new Cell(5); end Mk; "
+        "  static method G<T>(t: OwningTask<T>, b1: T, b2: T): int where T: class "
+        "    var c := t.Result; "
+        "    c := b1; "
+        "    c := b2; "
+        "    return 1; "
+        "  end G; "
+        "  static method A() "
+        "    var i := 0; var s := 0; "
+        "    while i < 100 do "
+        "      using var t := Mk(); "
+        "      var b1 := new Cell(1); var b2 := new Cell(2); "
+        "      s := s + G<Cell>(t, b1, b2) + b1.v + b2.v; "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(s); "
+        "  end A; "
+        "  public static method Main(): int "
+        "    A(); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_EQ(r.stdoutText, "400\n");
+    const std::string text = diagnosticText(r);
+    BEZEL_EXPECT_TRUE(text.find("heap-use-after-free") == std::string::npos);
+    BEZEL_EXPECT_TRUE(text.find("ERROR: AddressSanitizer") == std::string::npos);
+    BEZEL_EXPECT_TRUE(text.find("SUMMARY: AddressSanitizer: heap-use-after-free") ==
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(text.find("program terminated by signal") ==
+                      std::string::npos);
+}

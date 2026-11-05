@@ -7945,9 +7945,9 @@ void Emitter::disposeDisplacedOwnedClassLocal(const ast::Expr* target,
     // — the result buffer is consumed". A local binding IS an owned-consuming
     // position, so `var c := t.Result` (and `var c: Cell := t.Result`, and
     // `var c := o?.Result`) OWNS the transferred class object. The ownership
-    // pass agrees — it classifies the read through the SHARED fact
-    // `common::owningTaskResultReadOwnsClassResult` (src/ownership/
-    // Ownership.cpp's `producerState`), which is why the ownership side
+    // pass agrees — it classifies the read through the SHARED fact's
+    // CLASSIFICATION form `common::owningTaskResultReadClassifiesOwned`
+    // (src/ownership/Ownership.cpp's `producerState`), which is why the ownership side
     // already treats a REASSIGNMENT of such a local as a covered drop-on-
     // overwrite (`localDropOnOverwriteCovered`) and does NOT raise the §28.3
     // discharge error.
@@ -7967,6 +7967,28 @@ void Emitter::disposeDisplacedOwnedClassLocal(const ast::Expr* target,
     // The `?.` spelling yields the NULLABLE of the member type (§7.5), so the
     // slot may hold null — the null-guard below skips the disposal on that
     // path, exactly like the `.` spelling's moved-from slot.
+    //
+    // fix-forward #8137, second round (§28.7 / §28.3, v0.355): the fact is
+    // read in its CLASSIFICATION form (`owningTaskResultReadClassifiesOwned`,
+    // NO resolver), which is the form the ownership pass reads. The first
+    // round passed codegen's monomorphization-aware `resolveTypeParamRef`
+    // here while the ownership pass (which runs on the generic TEMPLATE body)
+    // passed none — so in `G<T>(t: OwningTask<T>, b1: T, b2: T) where T:
+    // class` with `var c := t.Result; c := b1; c := b2;` the ownership pass
+    // saw a BORROW local (`T` is no class declaration) and admitted the two
+    // stores as borrow-to-borrow (§28.3 *State match on reassignment*, item
+    // 1: "a borrowed-state LHS requires a borrow (or `null`) RHS"), while
+    // this gate at the `G<Cell>` specialization resolved `T` to `Cell`,
+    // called the local OWNED and disposed the displaced value at EVERY store:
+    // the second store freed the caller's `b1` (MEASURED on 9a8e479a under
+    // ASan: heap-use-after-free at the caller's `b1.v`). §28.7's disposal
+    // belongs to an OWNED local, and the ownership pass is the one authority
+    // on that state; this gate must never classify past it. The
+    // classification form has no resolver parameter, so the two sides cannot
+    // be handed different arguments again. A generic `Result` read is
+    // therefore a BORROW on both sides today — it leaks (the same gap the
+    // base had), never double-frees — until the ownership pass learns the
+    // generic shape, at which point both sides move together.
     if (!addr) return;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(target);
     if (!id) return;  // field / index / static target — not a plain local
@@ -7975,11 +7997,11 @@ void Emitter::disposeDisplacedOwnedClassLocal(const ast::Expr* target,
     auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
     if (!ld) return;  // not a plain `var` local
     // fix-forward #8137 (§28.7 / §30.3, v0.355) — the owned-`Result`-read
-    // form, beside the initializer-form classifier.
+    // form, beside the initializer-form classifier, in the CLASSIFICATION
+    // form the ownership pass reads (see above).
     bool ownsTransferredResult =
-        ld->initializer && common::owningTaskResultReadOwnsClassResult(
-            ld->initializer.get(), ctx_,
-            [this](const sema::TypeRef* t) { return resolveTypeParamRef(t); });
+        ld->initializer && common::owningTaskResultReadClassifiesOwned(
+                               ld->initializer.get(), ctx_);
     if (!unwindOwnedLocalClass(ld) && !ownsTransferredResult)
         return;  // not an owned plain class local
     llvm::Value* old = builder_.CreateLoad(elemTy, addr, "reassign.old");

@@ -48939,9 +48939,12 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
     // double-freeing the transferred value runs on this spelling too.
     //
     // fix #8137 (§30.3 / §28.3, v0.355): the READ ITSELF is now the SHARED
-    // fact (`common::owningTaskResultReadOwnsClassResult`), the same one the
-    // ownership pass's `producerState` consults to classify the read as an
-    // OWNED transfer. Before this, codegen and the ownership pass each
+    // fact (`common::owningTaskResultReadOwnsClassResult`, the resolver form
+    // of the fact whose CLASSIFICATION form the ownership pass's
+    // `producerState` consults to classify the read as an OWNED transfer;
+    // this arm runs only for a local that pass already stamped, so the
+    // resolver decides HOW to dispose, never WHETHER — fix-forward #8137,
+    // second round). Before this, codegen and the ownership pass each
     // carried their OWN copy of "is this a `Result` read of an OwningTask whose
     // result is a class?" — and the copies had DIVERGED in EFFECT: the
     // ownership pass classified the read as a BORROW, so a plain

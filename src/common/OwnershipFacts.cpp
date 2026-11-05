@@ -3706,4 +3706,14 @@ bool owningTaskResultReadOwnsClassResult(
            resTy->declaration->kind == ast::TypeDeclKind::Interface;
 }
 
+// fix-forward #8137 (§28.7 / §28.3 / §30.3, v0.355) — the CLASSIFICATION form,
+// see the header. No resolver: this is the ownership pass's view of the read,
+// and every codegen gate that classifies on its own calls THIS form, so the
+// classification and the disposal emitted for it cannot drift.
+// // per §28.3, §28.7, v0.355, #8137
+bool owningTaskResultReadClassifiesOwned(const ast::Expr* e,
+                                         const sema::SemaContext& ctx) {
+    return owningTaskResultReadOwnsClassResult(e, ctx, TypeParamResolver{});
+}
+
 }  // namespace bezel::common

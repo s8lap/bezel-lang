@@ -6316,11 +6316,14 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     // case (b0d) registers the scope-end disposal for it), which is why the
     // defect was spelling-dependent.
     //
-    // The gate is the SHARED fact (`common::owningTaskResultReadOwnsClassResult`),
-    // the same one codegen's case (b0d) consults to register the disposal, so
-    // the classification and the emitted disposal cannot drift.
+    // The gate is the SHARED fact in its CLASSIFICATION form
+    // (`common::owningTaskResultReadClassifiesOwned`, no resolver — this pass
+    // runs on the generic template body, before monomorphization). Codegen's
+    // §28.7 drop-on-overwrite gate reads the SAME form, and codegen's case
+    // (b0d) registers the scope-end disposal only for a local this pass
+    // stamped, so the classification and the emitted disposal cannot drift.
     // // per §30.3, §28.3, v0.355, #8137
-    if (common::owningTaskResultReadOwnsClassResult(&e, ctx_))
+    if (common::owningTaskResultReadClassifiesOwned(&e, ctx_))
         return OwnershipState::Owned;
     // §28.6 / §28.11 (#1107 finding D): a `move X` whose value is an OWNING
     // COLLECTION (OwningArray/OwningStack/OwningQueue/OwningSet/OwningDictionary/

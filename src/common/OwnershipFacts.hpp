@@ -1224,14 +1224,43 @@ bool stateMachineOwnedParamIsFrameNullable(
 // (language spec §30.3, v0.355). The reader therefore OWNS the transferred
 // heap object, and §28.3's ordinary discharge rules apply to the binding.
 //
-// This predicate is the ONE home for that question. Two consumers consult it:
-//   * the OWNERSHIP pass (`MethodOwnership::producerState`,
+// This predicate is the ONE home for that question, in TWO forms that answer
+// TWO different questions:
+//
+//   * `owningTaskResultReadClassifiesOwned(e, ctx)` — the CLASSIFICATION.
+//     It takes NO resolver, so it answers exactly what the ownership pass
+//     (which runs before monomorphization, on the generic TEMPLATE body) can
+//     see: in a generic body the read's type is the bare parameter `T`, which
+//     is not a class declaration, and the read classifies as a BORROW there
+//     (a known gap, tracked separately: §30.3 makes no generic exception).
+//     Its callers are the ownership pass (`MethodOwnership::producerState`,
 //     src/ownership/Ownership.cpp) — the classification that makes a plain
 //     `var c := t.Result` an OWNED binding (so §28.3 auto-drops it at scope
-//     end), and
-//   * CODEGEN (`Emitter::usingVarOwnsClassObjectDynamically`, case (b0d),
-//     src/codegen/LlvmBackend_Setup.cpp) — the scope-end disposal registration
-// so the CLASSIFICATION and the emitted DISPOSAL cannot drift (the #1414
+//     end) — and EVERY codegen site that must AGREE with that classification
+//     on its own, without an ownership-pass stamp to lean on: today the §28.7
+//     drop-on-overwrite gate (`Emitter::disposeDisplacedOwnedClassLocal`,
+//     src/codegen/LlvmBackend_Disposal.cpp). Because this form has no
+//     resolver parameter, the two sides have no knob to disagree on: codegen
+//     cannot dispose a displaced value the ownership pass treats as a borrow
+//     (fix-forward #8137, second round — the first fix-forward passed
+//     codegen's resolver here, so a `G<T>(t: OwningTask<T>, b1: T, b2: T)
+//     where T: class` body with `var c := t.Result; c := b1; c := b2;`
+//     disposed the caller's `b1` at the second store — a heap-use-after-free
+//     on a program the ownership pass accepts as a borrow-to-borrow store,
+//     §28.3 *State match on reassignment* item 1).
+//
+//   * `owningTaskResultReadOwnsClassResult(e, ctx, resolveParam)` — the
+//     DISPOSAL-MECHANISM question, resolver REQUIRED (no default, so a caller
+//     must choose a form on purpose). CODEGEN passes its monomorphization-
+//     aware `resolveTypeParamRef` so a generic body's bare `T` resolves to the
+//     concrete class at the instantiation. Its one caller is the scope-end
+//     registration (`Emitter::usingVarOwnsClassObjectDynamically`, case
+//     (b0d), src/codegen/LlvmBackend_Setup.cpp), which runs only for a local
+//     the ownership pass ALREADY classified owned — a `using var`, or a plain
+//     `var` it stamped `autoDropAtScopeEnd` — so it decides HOW to dispose,
+//     never WHETHER.
+//
+// So the CLASSIFICATION and the emitted DISPOSAL cannot drift (the #1414
 // "one fact, one home" rule).
 //
 // The class/interface gate is on the READ'S OWN result type — the value the
@@ -1243,13 +1272,10 @@ bool stateMachineOwnedParamIsFrameNullable(
 // §28.11 collection disposal path, and codegen's per-T result disposer (the
 // `bz_task_take_result` drain that makes the transfer observable) is attached
 // for the class/interface family only.
-//
-// `resolveParam` is the documented shared resolver hook: CODEGEN passes its
-// monomorphization-aware `resolveTypeParamRef` (so a generic body's bare `T`
-// resolves to the concrete class at the instantiation); SEMA — which runs
-// before monomorphization — passes the identity (or nothing).
 bool owningTaskResultReadOwnsClassResult(
     const ast::Expr* e, const sema::SemaContext& ctx,
-    const TypeParamResolver& resolveParam = {});
+    const TypeParamResolver& resolveParam);
+bool owningTaskResultReadClassifiesOwned(const ast::Expr* e,
+                                         const sema::SemaContext& ctx);
 
 }  // namespace bezel::common
