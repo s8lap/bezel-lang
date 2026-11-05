@@ -6,7 +6,8 @@
 // implements; §26.5 step 3 "Most specific type wins".
 //
 // ALREADY FIXED on staging b52409a7 (verified by lane r39-verify-vB); this
-// file only PINS it (no fail-without is available). The conformance corpus
+// file only PINS it. Fail-without: the review (r39-rev-pinvA) measured both
+// rows FAIL on a pre-fix tree (Oct 29). The conformance corpus
 // (s26_5_1_0038/0039) covers only Take, Skip, Where, Select on Array; this
 // covers all sixteen names of the issue on BOTH receivers.
 //
@@ -14,16 +15,13 @@
 // int (101..116) and prints each call, so a name that still reached the
 // library would print a different value (or fail to compile).
 //
-// Oracle: the Stack row is runAotChecked (leak-strict); the Array row is
-// runAotCheckedLenient because the verify lane's 144 B leak hypothesis
-// REPRODUCES (see the comment at that row).
+// Oracle: runAotChecked (leak-strict) on both rows.
 #include <string>
 
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAotChecked;
-using bezel::test::runAotCheckedLenient;
 
 namespace {
 
@@ -52,32 +50,35 @@ const Op kOps[] = {
     {"ToDictionary", "k: (int) -> int", "lambda(x) => x"},
 };
 
-std::string subst(std::string s, const std::string& T) {
+std::string subst(std::string s, const std::string& T,
+                  const std::string& argVar) {
     for (std::string::size_type p; (p = s.find("%T")) != std::string::npos;)
         s.replace(p, 2, T);
     for (std::string::size_type p; (p = s.find("%A")) != std::string::npos;)
-        s.replace(p, 2, "a");
+        s.replace(p, 2, argVar);
     return s;
 }
 
 // Returns {program, expected stdout}.
 std::pair<std::string, std::string> build(const std::string& recv,
-                                          const std::string& init) {
+                                          const std::string& init,
+                                          const std::string& argDecl,
+                                          const std::string& argVar) {
     const std::string T = recv + "<int>";
     std::string src = "module R;\nextension " + T + "\n";
     std::string body, expect;
     int v = 101;
     for (const Op& op : kOps) {
         src += std::string("  public method ") + op.name + "(" +
-               subst(op.param, T) + "): int => " + std::to_string(v) + ";\n";
+               subst(op.param, T, argVar) + "): int => " + std::to_string(v) + ";\n";
         body += std::string("  Console.WriteLine(a.") + op.name + "(" +
-                subst(op.arg, T) + "));\n";
+                subst(op.arg, T, argVar) + "));\n";
         expect += std::to_string(v) + "\n";
         ++v;
     }
     src += "end;\n"
            "class Program public static method Main(): int\n"
-           "  var a: " + T + " := " + init + ";\n" + body +
+           "  var a: " + T + " := " + init + ";\n" + argDecl + body +
            "  return 0;\n"
            "end Main; end Program;\n";
     return {src, expect};
@@ -87,12 +88,13 @@ std::pair<std::string, std::string> build(const std::string& recv,
 
 BEZEL_TEST(extension_linq_named_user_wins_7663,
            array_receiver_all_sixteen_names_spec_26_5_1_v0_355) {
-    auto [src, expect] = build("Array", "[1,2,3]");
-    // Lenient: the 144 B leak of the Array literal (80 B header + 64 B
-    // payload, LSan "bz_array_alloc") REPRODUCES under runAotChecked on this
-    // program (measured at b52409a7): a SEPARATE defect from #7663, not
-    // pinned here. The generated-code ASan stays on; only LSan is off.
-    auto r = runAotCheckedLenient(src);
+    auto [src, expect] = build(
+        "Array", "[1,2,3]", "  var b := new Array<int>(); b.Add(4);\n", "b");
+    // The receiver stays the issue's literal `[1,2,3]`; the ARGUMENT array is
+    // a `new Array<int>()` local, not a literal: a literal-initialised local
+    // passed as an extension-method ARGUMENT leaks 144 B (a separate defect,
+    // tracked apart from #7663), so the argument must not be one.
+    auto r = runAotChecked(src);
 
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -101,7 +103,7 @@ BEZEL_TEST(extension_linq_named_user_wins_7663,
 
 BEZEL_TEST(extension_linq_named_user_wins_7663,
            stack_receiver_all_sixteen_names_spec_26_5_1_v0_355) {
-    auto [src, expect] = build("Stack", "new Stack<int>()");
+    auto [src, expect] = build("Stack", "new Stack<int>()", "", "a");
     auto r = runAotChecked(src);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
