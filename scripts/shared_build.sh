@@ -89,6 +89,19 @@ KEY_PATHS=(src tests CMakeLists.txt cmake)
 die() { echo "shared_build: $*" >&2; exit 2; }
 say() { echo "shared_build: $*" >&2; }
 
+# The root holds builds and nothing else we may delete: an empty value or "/"
+# is refused outright (prune/publish rm -rf below it), and every removal below
+# touches only names that are exactly a full lowercase git sha.
+case "${BEZEL_SHARED_BUILD_ROOT-x}" in
+  "") die "BEZEL_SHARED_BUILD_ROOT is set but empty — refusing" ;;
+esac
+case "${SHARED_ROOT%/}" in
+  ""|/) die "BEZEL_SHARED_BUILD_ROOT must not be / — refusing" ;;
+esac
+SHARED_ROOT="${SHARED_ROOT%/}"
+LOCKS="$SHARED_ROOT/.locks"
+is_sha() { [[ "${1:-}" =~ ^[0-9a-f]{40}$ ]]; }
+
 resolve_sha() {  # $1 ref [$2 repo dir] -> full sha, or rc 1
   git -C "${2:-$ROOT}" rev-parse --verify --quiet "$1^{commit}" 2>/dev/null
 }
@@ -119,7 +132,7 @@ published_shas() {  # newest first (nanosecond publish time), complete only
   for m in "$SHARED_ROOT"/*/MANIFEST; do
     [ -r "$m" ] || continue
     s="$(mf_get "$m" sha)"; e="$(mf_get "$m" built_at_ns)"
-    [ -n "$s" ] && [ "$(basename "$(dirname "$m")")" = "$s" ] || continue
+    is_sha "$s" && [ "$(basename "$(dirname "$m")")" = "$s" ] || continue
     printf '%s %s\n' "${e:-0}" "$s"
   done | sort -k1,1nr | cut -d' ' -f2
 }
@@ -132,11 +145,22 @@ find_by_key() {  # $1 sha (preferred) $2 key -> sha of a published build, or rc 
   return 1
 }
 
+warn_toolchain() {  # $1 sha: loud stderr line if the build's toolchain differs
+  local built now
+  built="$(mf_get "$SHARED_ROOT/$1/MANIFEST" toolchain)"
+  now="$(clang++ --version 2>/dev/null | head -1)"
+  [ -n "$built" ] && [ -n "$now" ] && [ "$built" != "$now" ] || return 0
+  say "WARNING: toolchain mismatch for shared build ${1:0:12}: built with '$built', current is '$now'."
+  say "  The treekey does not cover the toolchain; results may differ from a local build."
+}
+
 # --- check-clean: the published binaries were built from <ref>'s sources ------
 check_clean() {  # $1 worktree $2 sha $3 label -> rc 0 clean, 3 dirty (reason on stderr)
   local wt="$1" sha="$2" label="$3" changed untracked
-  changed="$(git -C "$wt" diff --name-only "$sha" -- "${KEY_PATHS[@]}" 2>/dev/null)"
-  untracked="$(git -C "$wt" ls-files --others --exclude-standard -- "${KEY_PATHS[@]}" 2>/dev/null)"
+  changed="$(git -C "$wt" diff --name-only "$sha" -- "${KEY_PATHS[@]}" 2>/dev/null)" || {
+    say "REFUSED: 'git diff' failed in $wt — cannot prove it matches $label (${sha:0:12})."; return 3; }
+  untracked="$(git -C "$wt" ls-files --others --exclude-standard -- "${KEY_PATHS[@]}" 2>/dev/null)" || {
+    say "REFUSED: 'git ls-files' failed in $wt — cannot prove it matches $label (${sha:0:12})."; return 3; }
   if [ -z "$changed" ] && [ -z "$untracked" ]; then return 0; fi
   say "REFUSED: $wt differs from $label (${sha:0:12}) in ${KEY_PATHS[*]}."
   say "  The shared binaries were built from $label's sources, so running them here"
@@ -165,6 +189,7 @@ cmd_prune() {
     case "$1" in --keep) keep="${2:-}"; shift 2 ;; *) die "prune: unknown arg '$1'" ;; esac
   done
   case "$keep" in ''|*[!0-9]*) die "--keep must be a non-negative integer" ;; esac
+  [ -d "$SHARED_ROOT" ] || die "prune: shared root '$SHARED_ROOT' does not exist — refusing"
   mkdir -p "$LOCKS" || die "cannot create $LOCKS"
   local pfd ufd bfd s d n=0
   exec {pfd}>"$LOCKS/prune"; flock "$pfd"
@@ -176,14 +201,15 @@ cmd_prune() {
     if flock -n "$bfd"; then
       say "prune: removing ${s:0:12}"
       remove_build_dir "$SHARED_ROOT/$s"
-      rm -f "$LOCKS/$s.use" "$LOCKS/$s.build"
+      # Lock files are never unlinked: a waiter blocked on the old inode and a
+      # later locker on a new one would both hold "the" lock.
     fi
     exec {bfd}>&- {ufd}>&-
   done
   # A dir with no MANIFEST whose build lock is free is an abandoned build.
   for d in "$SHARED_ROOT"/*/; do
     d="${d%/}"; s="$(basename "$d")"
-    [ -d "$d" ] && ! complete_dir "$s" || continue
+    is_sha "$s" && [ -d "$d" ] && ! complete_dir "$s" || continue
     exec {bfd}>"$LOCKS/$s.build"
     if flock -n "$bfd"; then say "prune: removing abandoned partial build ${s:0:12}"; remove_build_dir "$d"; fi
     exec {bfd}>&-
@@ -264,6 +290,9 @@ write_manifest() {  # $1 dir $2 sha $3 seconds
 
 publish() {  # $1 sha -> prints the dir; rc
   local sha="$1" d="$SHARED_ROOT/$1" bfd t0 log rc
+  is_sha "$sha" || die "publish: '$sha' is not a full lowercase 40-hex sha"
+  [ -d "$SHARED_ROOT" ] || [ -d "$(dirname -- "$SHARED_ROOT")" ] \
+    || die "publish: parent of shared root '$SHARED_ROOT' does not exist — refusing"
   mkdir -p "$LOCKS" || die "cannot create $LOCKS"
   exec {bfd}>"$LOCKS/$sha.build"
   if ! flock -n "$bfd"; then
@@ -337,6 +366,7 @@ cmd_path() {
     complete_dir "$sha" || { say "no published build for $1 (${sha:0:12}); publish: scripts/shared_build.sh ensure $1"; exit 1; }
     s="$sha"
   fi
+  warn_toolchain "$s"
   printf '%s\n' "$SHARED_ROOT/$s"
 }
 
@@ -367,6 +397,7 @@ cmd_resolve() {
     say "no published build for $label (${sha:0:12}) or any commit with the same src/tests tree."
     say "  Publish it first: scripts/shared_build.sh ensure $ref   (or build normally)"
     exit 1; }
+  warn_toolchain "$s"
   if [ "$s" = "$sha" ]; then match=exact; else match=tree; fi
   echo "dir=$SHARED_ROOT/$s"
   echo "build=$(mf_get "$SHARED_ROOT/$s/MANIFEST" build_dir)"

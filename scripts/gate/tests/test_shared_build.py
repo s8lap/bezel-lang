@@ -272,6 +272,79 @@ class SharedBuildPathEnsureTest(SharedBuildTestBase):
         self.assertNotIn(str(self.root / shas[1]), self.git("worktree", "list"))
 
 
+class SharedBuildHardeningTest(SharedBuildTestBase):
+    """Review notes of r39-rev-sharedbuild (probes P-foreign, P10, check_clean)."""
+
+    def test_prune_and_publish_leave_non_sha_dirs_alone(self):
+        self.publish_head()
+        foreign = self.root / "not-a-build"
+        foreign.mkdir()
+        (foreign / "keep.txt").write_text("precious\n")
+        short = self.root / "abc123"      # hex but not 40 chars
+        short.mkdir()
+        upper = self.root / ("A" * 40)    # 40 chars but not lowercase hex
+        upper.mkdir()
+        r = self.sb("prune", "--keep", "0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for d in (foreign, short, upper):
+            self.assertTrue(d.exists(), "prune removed non-build dir %s" % d)
+        self.assertTrue((foreign / "keep.txt").exists())
+        # publishing another commit must not touch them either
+        self.commit_file("src/a.cpp", "int z;\n", "z")
+        self.publish_head()
+        self.assertTrue((foreign / "keep.txt").exists())
+
+    def test_prune_still_reaps_an_abandoned_partial_sha_dir(self):
+        sha = self.git("rev-parse", "HEAD")
+        r = self.sb("ensure", "HEAD", env=dict(self.env, FAKE_BUILD_FAIL="1"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue((self.root / sha).exists())
+        self.assertEqual(self.sb("prune").returncode, 0)
+        self.assertFalse((self.root / sha).exists())
+
+    def test_root_slash_empty_or_missing_is_refused(self):
+        for val in ("/", ""):
+            r = self.sb("prune", env=dict(self.env, BEZEL_SHARED_BUILD_ROOT=val))
+            self.assertEqual(r.returncode, 2, (val, r.stderr))
+        r = self.sb("prune", env=dict(self.env, BEZEL_SHARED_BUILD_ROOT=str(self.base / "nope")))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertFalse((self.base / "nope").exists())
+
+    def test_prune_never_unlinks_lock_files(self):
+        shas = [self.git("rev-parse", "HEAD")]
+        self.publish_head()
+        shas.append(self.commit_file("src/a.cpp", "int q;\n", "q"))
+        self.publish_head()
+        locks = [self.root / ".locks" / ("%s.%s" % (shas[0], k)) for k in ("build", "use")]
+        inodes = {l: os.stat(l).st_ino for l in locks if l.exists()}
+        self.assertTrue(inodes)
+        r = self.sb("prune", "--keep", "1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse((self.root / shas[0]).exists())
+        for l, ino in inodes.items():
+            self.assertTrue(l.exists(), "prune unlinked lock %s" % l)
+            self.assertEqual(os.stat(l).st_ino, ino)
+
+    def test_check_clean_refuses_when_git_diff_fails(self):
+        self.publish_head()
+        # corrupt the index so `git diff` exits non-zero
+        (self.repo / ".git" / "index").write_bytes(b"garbage")
+        r = self.sb("check-clean", "HEAD")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("REFUSED", r.stderr)
+
+    def test_toolchain_mismatch_warns_but_serves(self):
+        d = self.publish_head()
+        m = d / "MANIFEST"
+        txt = m.read_text().replace("toolchain=", "toolchain=OLD-CLANG ", 1)
+        m.chmod(0o644)
+        m.write_text(txt)
+        r = self.sb("path", "HEAD")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, str(d)), r.stderr)
+        if shutil.which("clang++"):
+            self.assertIn("toolchain mismatch", r.stderr)
+
+
 class SharedBuildRefusalTest(SharedBuildTestBase):
 
     def test_resolve_refuses_a_tracked_src_edit(self):
