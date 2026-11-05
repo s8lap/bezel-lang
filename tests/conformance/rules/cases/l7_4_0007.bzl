@@ -9,6 +9,7 @@
 //! issue: 7965
 //! notes: twin of l7_4_0008 (pairs the accepted with its rejecting form).
 module Conf;
+import System.IO;
 
 public class Program
   public static method Show(p: decimal?)

@@ -9,6 +9,7 @@
 //! issue: 7965
 //! notes: twin of l7_4_0003 (pairs the rejected with its accepting form).
 module Conf;
+import System.IO;
 
 public record P(X: int, Y: int);
 
