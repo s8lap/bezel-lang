@@ -13043,6 +13043,56 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                         }
                     }
+                    // fix #8210 (§15.1 / §14.2, v0.355): `ElementAtOrNull`
+                    // is the FOURTH member of the `*OrNull` tier over
+                    // `IEnumerable<T>` — stdlib §1's *Conditional members* row
+                    // names all four (`FirstOrNull`, `LastOrNull`,
+                    // `SingleOrNull`, `ElementAtOrNull`), and stdlib §5
+                    // declares it on `IEnumerable<T>` as
+                    // `ElementAtOrNull(index: int): T?`. It forms its `T?` at
+                    // the ELEMENT type, so on a lazy receiver whose element
+                    // type is an inline array it is a conditionally-admitted
+                    // member (spec §15.1) and the use is a compile error.
+                    //
+                    // MEASURED at the base commit (r30-c1): this arm did not
+                    // exist, so `arr.Where(...).ElementAtOrNull(0)` over an
+                    // `Array<[3]int>` compiled clean (rc=0) with only
+                    // codegen's #2477/#2434 degraded-lowering warnings — the
+                    // malformed nullable inline array was never formed and
+                    // never rejected. The explicitly-spelled `IEnumerable<T>`
+                    // twin of the SAME call IS gated (the #5911 R13 row), so
+                    // the two spellings of one member disagreed.
+                    //
+                    // The gate reads its position through the §15.1 position
+                    // table (`nullableOrNullFormedTypeArg`), so the element
+                    // type of an `IGrouping<TKey, T>` (the one receiver whose
+                    // element is NOT genericArgs[0]) is read correctly too,
+                    // and the clause is the lazy block's own — the same one
+                    // the `FirstOrNull` arm above reports.
+                    //
+                    // SCOPE: the gate decides ADMISSION (§14.2 rule 2 — "decided
+                    // after substitution, at the use"), which is what §15.1
+                    // requires of a conditionally-admitted member. It does NOT
+                    // type the member: `ElementAtOrNull` is documented by
+                    // stdlib §5 but implemented by this compiler on NO receiver
+                    // (MEASURED at the base commit:
+                    // `IEnumerable<int>.ElementAtOrNull(0)` is refused by
+                    // CODEGEN with #2457's "documented but not implemented by
+                    // this compiler"), so the lazy receiver's spelling of it
+                    // keeps its pre-existing (untyped, degraded) behavior over
+                    // an ORDINARY element type — that is the §5
+                    // implementation gap, not a §15.1 question, and this fix
+                    // does not change it.
+                    else if (m == "ElementAtOrNull" && ce.args.size() == 1) {
+                        if (reportOrNullInlineArrayDiag(
+                                ctx_,
+                                nullableOrNullFormedTypeArg(recvTy, m),
+                                m,
+                                "a lazy sequence of an inline array element "
+                                "type",
+                                ce.span.begin))
+                            return;
+                    }
                     // fix #3784 (stdlib §5.1, v0.286): MinOrNull()/MaxOrNull()
                     // on a LAZY IEnumerable<T> receiver (e.g. `arr.Where(...)
                     // .MinOrNull()`) return nullable T — the same shape as the
