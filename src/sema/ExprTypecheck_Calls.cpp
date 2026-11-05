@@ -1408,16 +1408,22 @@ bool ExprTC::linqElemTypeParamClauseUnsatisfied(const TypeRef* elem,
         }
     };
     if (currentMethodDecl_) collect(currentMethodDecl_->genericConstraints);
-    if (currentType_ && currentType_->decl)
-        if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl))
-            collect(td->genericConstraints);
+    // The enclosing type's clauses are read off its sema GenericParamSymbol
+    // (`constraints`, §14.2 #3146), populated for local AND imported types,
+    // not off the AST `decl` (null for an imported type).
+    bool typeStates = false;
+    if (currentType_)
+        for (const Symbol* gs : currentType_->genericParams)
+            if (gs && gs->name == p)
+                if (auto* gp = dynamic_cast<const GenericParamSymbol*>(gs))
+                    if (!gp->constraints.empty()) typeStates = true;
     if (currentExtension_ && currentExtension_->decl)
         if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
                 currentExtension_->decl))
             collect(ed->genericConstraints);
     // No clause at all → unconstrained → `linqElemIsUnconstrainedTypeParam`
     // already decides it.
-    if (items.empty()) return false;
+    if (items.empty() && !typeStates) return false;
 
     if (clause == "where T: INumber<T>") {
         // §14.2 *Interface conformance* rule 6: "a type-bound constraint
@@ -6945,7 +6951,7 @@ bool ExprTC::userRecordComparableAtInstance(const TypeRef* elem) {
 // fix #8209 (spec §14.2 *Interface conformance* rules 1 and 3 / §14.1
 // *Instantiation and its site*, stdlib §5.1 / §2.8, v0.355): the CLASS and
 // INTERFACE counterpart of `userRecordComparableAtInstance` above — does the
-// element type `elem` satisfy stdlib §5.1's `where T: IComparable<T>`
+// element type `elem` satisfy the `where T: IComparable<T>` (stdlib §2.8, gating §5.1)
 // constraint AT THIS INSTANTIATION?
 //
 // THE DEFECT THIS CLOSES. The §5.1 gate read the interface NAME through the
