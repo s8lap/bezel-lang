@@ -17,8 +17,8 @@
 //
 // and stdlib §4.1's `ICollection<T>` (the interface `Dictionary<K, V>`
 // conforms to) declares `Add(item: T)` / `Contains(item: T)` /
-// `Remove(item: T)` — with `T` = `DictionaryEntry<K, V>` here. stdlib §1's
-// elision rule makes those interface-required members part of the concrete
+// `Remove(item: T)` — with `T` = `DictionaryEntry<K, V>` here.
+// The elision rule of stdlib §1 makes those interface-required members part of the concrete
 // class's own public contract, so the entry-shaped forms are reachable on a
 // `Dictionary<K, V>` receiver.
 //
@@ -66,7 +66,8 @@
 // class `Equals`/reference identity, §4.6 string content, §9.2 value
 // equality).
 //
-// SCOPE. Only `Dictionary<K, V>` carries the entry forms. stdlib §4.9:
+// SCOPE. Only `Dictionary<K, V>` carries the entry forms.
+// stdlib §4.9:
 // "`OwningDictionary<K, V>` … The interface conformance is `IDisposable` only
 // — not `IOwningCollection<DictionaryEntry<K, V>>`", and stdlib §4.17:
 // `SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>>` — a

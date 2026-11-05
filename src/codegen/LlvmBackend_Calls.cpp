@@ -10673,8 +10673,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return builder_.CreateIntToPtr(asI64, ptrTy());
         };
 
-        // fix #8169 (stdlib §4.8, v0.355): the ENTRY-SHAPED `ICollection`
-        // forms of `Dictionary<K, V>`.
+        // fix #8169 (stdlib §4.8, v0.355): the ENTRY-SHAPED forms of
+        // `Dictionary<K, V>` (its collection-interface members).
         //
         // §4.8 declares `Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>`,
         // so the interface's `Add(item)` / `Contains(item)` / `Remove(item)`
