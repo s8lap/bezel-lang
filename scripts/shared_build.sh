@@ -35,7 +35,8 @@
 # KEY. The MANIFEST records `treekey` = sha1 over `git rev-parse <sha>:<p>` for
 # p in src tests CMakeLists.txt cmake (a missing path counts as "-"). Two
 # commits with the same key build the same binaries (bezelc --version differs:
-# it embeds `git describe`), so `path --tree` may serve either.
+# it embeds `git describe`), so a lane whose CLEAN tree has a published key
+# can reuse that build (`resolve auto`, `agent_check.sh --use-shared auto`).
 # The key does not cover the system toolchain (clang/LLVM); the MANIFEST
 # records `toolchain` so a mismatch can be seen.
 #
@@ -53,10 +54,12 @@
 #                                 exit 3 (with the reason) if DIR's src/ tests/
 #                                 CMakeLists.txt cmake differ from REF's,
 #                                 including untracked files there
-#   shared_build.sh resolve [--worktree DIR] REF
+#   shared_build.sh resolve [--worktree DIR] REF|auto
 #                                 check-clean + lookup, for agent_check.sh:
 #                                 prints dir= build= lock= sha= match= lines.
-#                                 exit 1 none, 3 dirty.
+#                                 auto = DIR's HEAD. exit 1 none, 3 dirty.
+#   shared_build.sh offer [--worktree DIR]   one stderr NOTE if DIR is clean
+#                                 and its HEAD's treekey is published; always 0
 #   shared_build.sh list          published builds, newest first
 #   shared_build.sh prune [--keep N]   keep the newest N (default 4); never
 #                                 removes a build a reader holds or one being built
@@ -355,9 +358,9 @@ cmd_check_clean() {
 }
 
 cmd_resolve() {
-  parse_wt "$@"; [ "${#REST[@]}" -eq 1 ] || die "usage: shared_build.sh resolve [--worktree DIR] REF"
+  parse_wt "$@"; [ "${#REST[@]}" -eq 1 ] || die "usage: shared_build.sh resolve [--worktree DIR] REF|auto"
   local ref="${REST[0]}" label sha s match
-  label="$ref"
+  if [ "$ref" = auto ]; then ref=HEAD; label="HEAD (auto)"; else label="$ref"; fi
   sha="$(need_sha "$ref" "$WT")"
   check_clean "$WT" "$sha" "$label" || exit 3
   s="$(find_by_key "$sha" "$(tree_key "$sha")")" || {
@@ -370,6 +373,18 @@ cmd_resolve() {
   echo "lock=$LOCKS/$s.use"
   echo "sha=$s"
   echo "match=$match"
+}
+
+cmd_offer() {
+  parse_wt "$@"
+  [ -d "$SHARED_ROOT" ] || return 0
+  local sha s
+  sha="$(resolve_sha HEAD "$WT")" || return 0
+  check_clean "$WT" "$sha" HEAD 2>/dev/null || return 0
+  s="$(find_by_key "$sha" "$(tree_key "$sha")")" || return 0
+  say "NOTE: a published build matches this clean tree: $SHARED_ROOT/$s"
+  say "  A read-only run can skip this build: scripts/agent_check.sh --use-shared auto <filters>"
+  return 0
 }
 
 cmd_list() {
@@ -389,8 +404,9 @@ case "$sub" in
   treekey)     [ $# -eq 1 ] || die "usage: shared_build.sh treekey REF"; tree_key "$(need_sha "$1")" ;;
   check-clean) cmd_check_clean "$@" ;;
   resolve)     cmd_resolve "$@" ;;
+  offer)       cmd_offer "$@" ;;
   list)        cmd_list ;;
   prune)       cmd_prune "$@" ;;
   ""|-h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-  *) die "unknown subcommand '$sub' (publish|ensure|path|treekey|check-clean|resolve|list|prune)" ;;
+  *) die "unknown subcommand '$sub' (publish|ensure|path|treekey|check-clean|resolve|offer|list|prune)" ;;
 esac

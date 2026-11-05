@@ -63,7 +63,7 @@
 #   scripts/agent_check.sh --probe --asan FILE.bzl    compile+RUN one .bzl under
 #                                                     ASan/LSan with a hang timeout
 #                                                     (for memory/disposal fixes)
-#   scripts/agent_check.sh --use-shared REF ...       any of the above, but with NO
+#   scripts/agent_check.sh --use-shared REF|auto ...  any of the above, but with NO
 #                                                     build: run the binaries that
 #                                                     scripts/shared_build.sh
 #                                                     published for REF (read-only
@@ -105,14 +105,15 @@ echo "agent_check: scratch dir: $SCRATCH" >&2
 die() { echo "agent_check: $*" >&2; exit 2; }
 [ -x "$DH" ] || die "scripts/dev_heavy.sh not found/executable at $DH"
 
-# --- --use-shared <ref>: run against a PUBLISHED build, with NO build -----------
+# --- --use-shared <ref|auto>: run against a PUBLISHED build, with NO build ------
 # For read-only lanes (reviewers, issue-verifiers): scripts/shared_build.sh
 # publishes bezelc + the test binaries for a commit once, read-only, under
 # /mnt/fast/shared-builds/<sha>/. This flag points BUILD_DIR there and turns
 # every build step into a verify-only step. It REFUSES (exit 3) when this
 # worktree's src/ tests/ CMakeLists.txt cmake differ from <ref> (tracked edits
 # or untracked files): the shared binaries were built from <ref>'s sources, and
-# running them here would test code that is not this tree's.
+# running them here would test code that is not this tree's. `auto` = this
+# worktree's HEAD, and accepts any published commit with the same tree key.
 # Stripped from ANYWHERE in the args (like --no-lit), before --probe dispatches,
 # so `--probe FILE --use-shared REF` uses the shared bezelc. Without the flag
 # nothing below changes.
@@ -122,7 +123,7 @@ _us_args=()
 _next_us=0
 for _a in "$@"; do
   if [ "$_next_us" = 1 ]; then
-    case "$_a" in -*) die "--use-shared needs a ref before '$_a' (a commit or branch)" ;; esac
+    case "$_a" in -*) die "--use-shared needs a ref before '$_a' (a commit or branch, or 'auto')" ;; esac
     SHARED_REF="$_a"; _next_us=0; continue
   fi
   case "$_a" in
@@ -131,9 +132,11 @@ for _a in "$@"; do
     *) _us_args+=("$_a") ;;
   esac
 done
-[ "$_next_us" = 0 ] || die "--use-shared needs a ref (a commit or branch)"
+[ "$_next_us" = 0 ] || die "--use-shared needs a ref (a commit or branch, or 'auto')"
 set -- "${_us_args[@]}"
-SB="$ROOT/scripts/shared_build.sh"
+# Beside THIS script, not "$ROOT/scripts": a lane may run a newer agent_check
+# from another worktree against a tree that predates shared_build.sh.
+SB="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/shared_build.sh"
 if [ -n "$SHARED_REF" ]; then
   [ -x "$SB" ] || die "--use-shared: $SB not found/executable"
   _sb_out="$(cd "$ROOT" && "$SB" resolve --worktree "$ROOT" "$SHARED_REF")"; _sb_rc=$?
@@ -154,6 +157,12 @@ if [ -n "$SHARED_REF" ]; then
   SHARED_MODE=1
   echo "agent_check: --use-shared $SHARED_REF -> $SHARED_DIR (sha $(_sb_get sha | cut -c1-12), $(_sb_get match) match) — NO build; running the published binaries" >&2
 fi
+# Without --use-shared: if a published build matches this CLEAN tree, say so
+# (stderr only — it is never used unless the flag asks for it).
+offer_shared() {
+  [ "$SHARED_MODE" = 0 ] && [ "${BEZEL_SHARED_BUILD_OFFER:-1}" = 1 ] && [ -x "$SB" ] || return 0
+  (cd "$ROOT" && "$SB" offer --worktree "$ROOT") || true
+}
 
 # --- the per-area test binaries (CMake-generated manifest) --------------------
 # tests/CMakeLists.txt emits build/tests/test_binaries.txt as
@@ -251,6 +260,7 @@ build_tests() {
     echo "== agent_check: --use-shared: NOT building $target ($n published binar$([ "$n" -eq 1 ] && echo y || echo ies)) =="
     return 0
   fi
+  offer_shared
   if [ -r "$MANIFEST" ]; then
     if [ -n "$AREA" ] && [ -z "$(test_binaries)" ]; then
       die "unknown --area '$AREA'; known areas: $(test_groups)"
@@ -392,6 +402,7 @@ if [ "${1:-}" = "--probe" ]; then
   [ -n "$file" ] && [ -f "$file" ] || die "--probe needs a .bzl file: agent_check.sh --probe [--asan] FILE.bzl"
   base="$(basename "${file%.bzl}")"
   BEZELC="$BUILD_DIR/bezelc"
+  offer_shared
   build_target bezelc "$BEZELC"
   if [ "$asan" = 1 ]; then
     out="$SCRATCH/${base}.asan.out"
@@ -551,7 +562,7 @@ for f in "$@"; do
     # instead of silently running it as a filter substring (which
     # previously could explode scope to nearly a whole area with no
     # indication anything was wrong — see the issue's measured repro).
-    -*) die "'$f' looks like a mistyped or misplaced flag, not a filter — refusing to treat it as one (a gtest suite-or-name substring can never start with '-'). Recognized flags: --area <group>, --lit, --no-lit, --probe, --build-only, --select, --use-shared <ref> (see the usage comment at the top of this script). If you meant --area, it must be followed by its group name." ;;
+    -*) die "'$f' looks like a mistyped or misplaced flag, not a filter — refusing to treat it as one (a gtest suite-or-name substring can never start with '-'). Recognized flags: --area <group>, --lit, --no-lit, --probe, --build-only, --select, --use-shared <ref|auto> (see the usage comment at the top of this script). If you meant --area, it must be followed by its group name." ;;
   esac
 done
 

@@ -438,6 +438,47 @@ is `--single-oracle MODE`, which says loudly that it is not a full acceptance.
 Running `scripts/gate.sh` directly gates ONE oracle and now prints that its
 `GATE PASS` is not an acceptance verdict — use it for diagnosis, not to land.
 
+### Shared read-only builds (reviewers and verifiers do not build)
+
+ccache shares compiles across worktrees, but every lane still links and stores
+its own `bezelc` plus six test binaries (~3.6 GB a build dir), and a reviewer
+builds two arms. `scripts/shared_build.sh` builds a commit ONCE and publishes it
+read-only under `/mnt/fast/shared-builds/<full-sha>/` (a locked, detached
+worktree at that sha with its `build/`, plus a `MANIFEST` written last: sha,
+tree key, toolchain, build time, md5s). The newest 4 are kept; `prune` never
+removes one a reader holds.
+
+- **Coordinator: publish after each pick batch**, and before dispatching the
+  reviewers and verifiers that will run against it:
+  `scripts/shared_build.sh publish` (default ref: `$BEZEL_STAGING_REF`, else
+  `r30-c1`; `--ref R` for another, e.g. a review's BASE arm). It builds through
+  `dev_heavy.sh`, waits for 6 free jobserver tokens, and uses `-j 4`.
+  `scripts/shared_build.sh ensure R` is the same but returns at once when R is
+  already published; two lanes ensuring one sha build it once (the second
+  waits on an flock). `path R` / `list` only look.
+- **Reviewers / verifiers** (read-only lanes, clean tree):
+  `scripts/agent_check.sh --use-shared <ref> [--area A] <filters>` and
+  `scripts/agent_check.sh --probe [--asan] FILE.bzl --use-shared <ref>` run the
+  published binaries with NO build — seconds instead of a link. A review's tip
+  arm, built from the lane branch, is still a normal build; only arms that
+  match a published commit are shared. `--use-shared auto` takes this tree's
+  HEAD and accepts any published commit with the same tree key (sha1 over
+  `git rev-parse <sha>:src`, `:tests`, `:CMakeLists.txt`, `:cmake`), so a
+  commit that changed only docs or scripts reuses its parent's build.
+- **It refuses** (exit 3, with the changed paths) when the worktree's `src/`,
+  `tests/`, `CMakeLists.txt` or `cmake/` differ from the ref, tracked or
+  untracked: the published binaries were built from the ref's sources, and the
+  run would otherwise report on code the lane is not looking at. `--lit` is
+  refused too (lit writes into the build tree). Without the flag nothing
+  changes; a plain run on a clean tree with a published match only prints a
+  NOTE naming the build.
+- **Why the build is not copied.** The test binaries bake five absolute paths
+  (`tests/CMakeLists.txt`, the generated `build_paths.cpp`: the runtime and
+  core archives, `bezelc`, `src/runtime`, the repo root) and `Driver.cpp`
+  bakes the runtime archive's path, none with a run-time override. A copied
+  binary keeps using the tree that built it, so each sha is built in its own
+  worktree at its final path, and the MANIFEST-last rename is the atomic step.
+
 ## Dual-coordinator runs (two sessions, one repo)
 
 A run may be driven by **two coordinator sessions** sharing one repo, one machine
