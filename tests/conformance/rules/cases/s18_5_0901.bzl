@@ -1,8 +1,7 @@
 //! case: s18_5_0901
 //! doc: spec
 //! section: 18.5
-//! title: a ToString that throws inside an interpolation hole in a finally block propagates to the
-//!   enclosing
+//! title: a ToString that throws in an interpolation hole in a finally block reaches the enclosing catch
 //! rule: A hole *without* a format spec formats via the value's ordinary `ToString()`
 //! cites: 18.5, 8.5
 //! expect: run

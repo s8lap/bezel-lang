@@ -1,7 +1,7 @@
 //! case: s7_4_0906
 //! doc: spec
 //! section: 7.4
-//! title: ArraySpan<int>? and ReadOnlyArraySpan<int>? locals narrowed by a <> null test admit indexing
+//! title: ArraySpan<int>? and ReadOnlyArraySpan<int>? locals narrowed by a null test admit members
 //! rule: a null test in either spelling — `x <> null` or `x is not null` (narrowing the true branch)
 //! cites: 7.4
 //! expect: run

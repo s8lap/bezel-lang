@@ -1,8 +1,7 @@
 //! case: s7_4_0905
 //! doc: spec
 //! section: 7.4
-//! title: a lambda that tests a captured ReadOnlyStringSpan? itself may read its members under its own
-//!   null
+//! title: a lambda testing a captured ReadOnlyStringSpan? may read members under its own test
 //! rule: a null test in either spelling — `x <> null` or `x is not null` (narrowing the true branch)
 //! cites: 7.4
 //! expect: run

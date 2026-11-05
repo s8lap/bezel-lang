@@ -1,7 +1,7 @@
 //! case: s7_4_0902
 //! doc: spec
 //! section: 7.4
-//! title: a ReadOnlyStringSpan? parameter narrowed by a <> null test admits Length, Slice, indexing and
+//! title: a ReadOnlyStringSpan? parameter narrowed by a <> null test admits its members
 //! rule: a null test in either spelling — `x <> null` or `x is not null` (narrowing the true branch)
 //! cites: 7.4
 //! expect: run

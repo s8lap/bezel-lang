@@ -1,7 +1,7 @@
 //! case: s26_7_0905
 //! doc: spec
 //! section: 26.7
-//! title: an extension body may not store the receiver through a const alias with an explicit type into a
+//! title: an extension body may not store the receiver via a typed const alias into a parameter's field
 //! rule: The receiver is always a borrow; extensions cannot store `this`, return it as `owned`, or
 //!   dispose it.
 //! cites: 26.7

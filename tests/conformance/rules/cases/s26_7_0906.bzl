@@ -1,7 +1,7 @@
 //! case: s26_7_0906
 //! doc: spec
 //! section: 26.7
-//! title: an extension body may read an int field of the receiver through a const and store the int in a
+//! title: an extension body may read an int field of the receiver and store the int in a parameter's field
 //! rule: The receiver is always a borrow; extensions cannot store `this`, return it as `owned`, or
 //!   dispose it.
 //! cites: 26.7

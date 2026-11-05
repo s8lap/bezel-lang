@@ -1,8 +1,7 @@
 //! case: s18_5_0907
 //! doc: spec
 //! section: 18.5
-//! title: interpolation holes over a borrowed parameter render in a finally block, a destructor and a
-//!   catch
+//! title: interpolation holes over a borrowed parameter render in finally, a destructor and a catch arm
 //! rule: A hole *without* a format spec formats via the value's ordinary `ToString()`
 //! cites: 18.5, 8.5
 //! expect: run

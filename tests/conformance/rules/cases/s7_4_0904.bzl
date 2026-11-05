@@ -1,14 +1,18 @@
 //! case: s7_4_0904
 //! doc: spec
 //! section: 7.4
-//! title: a ReadOnlyStringSpan? local reassigned from a non-nullable Slice call stays narrowed across the
+//! title: a ReadOnlyStringSpan? local reassigned from a Slice call stays narrowed in the loop
 //! rule: assignment: after `x := expr;` where `expr`'s static type is non-nullable
 //! cites: 7.4
 //! expect: run
 //! output: abcdefgh
+//!   6
 //!   bcdefg
+//!   4
 //!   cdef
+//!   2
 //!   de
+//!   0
 module Conf;
 
 public class Program
@@ -23,6 +27,7 @@ public class Program
           s := null;
         else
           s := s.Slice(1, s.Length - 2);
+          Console.WriteLine(s.Length);
         end if;
       end if;
       i := i + 1;

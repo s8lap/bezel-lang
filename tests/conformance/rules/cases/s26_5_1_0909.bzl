@@ -1,8 +1,7 @@
 //! case: s26_5_1_0909
 //! doc: spec
 //! section: 26.5.1
-//! title: extensions on Array<int> beat the same-named LINQ operators on IEnumerable<int> for an
-//!   Array<int>
+//! title: extensions on Array<int> beat same-named LINQ operators on IEnumerable<int>
 //! rule: An extension on E1 is **more specific** than one on E2 when E1 is a subtype of E2 and E2 is not
 //!   a subtype of E1.
 //! cites: 26.5.1

@@ -2,7 +2,7 @@
 //! doc: spec
 //! section: 28.3.9
 //! title: reassigning an owned Array local while a closure over it is called afterwards is rejected
-//! rule: is rejected, as it is under a live closure over `xs`
+//! rule: or through a closure value that is itself still live.
 //! cites: 28.3.9
 //! expect: reject
 //! diagnostic: live

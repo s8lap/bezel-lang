@@ -1,7 +1,7 @@
 //! case: s18_5_0903
 //! doc: spec
 //! section: 18.5
-//! title: a ToString that throws inside an interpolation hole in a lambda body propagates to the caller's
+//! title: a ToString that throws in an interpolation hole in a lambda body reaches the caller's catch
 //! rule: A hole *without* a format spec formats via the value's ordinary `ToString()`
 //! cites: 18.5, 8.5
 //! expect: run

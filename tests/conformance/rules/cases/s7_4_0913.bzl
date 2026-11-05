@@ -7,7 +7,7 @@
 //!   lambda of the enclosing function body
 //! cites: 7.4
 //! expect: reject
-//! diagnostic: nullable
+//! diagnostic: mutably
 module Conf;
 
 public class Program

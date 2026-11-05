@@ -1,7 +1,7 @@
 //! case: s7_4_0907
 //! doc: spec
 //! section: 7.4
-//! title: Span<int>? and ReadOnlySpan<int>? locals over an OwningBuffer narrowed by a <> null test admit
+//! title: Span<int>? and ReadOnlySpan<int>? over an OwningBuffer narrowed by a null test admit members
 //! rule: a null test in either spelling — `x <> null` or `x is not null` (narrowing the true branch)
 //! cites: 7.4
 //! expect: run

@@ -1,8 +1,7 @@
 //! case: s26_5_1_0905
 //! doc: spec
 //! section: 26.5.1
-//! title: user extensions whose parameter types differ from the LINQ operator's are chosen exactly when
-//!   the
+//! title: user extensions with differing parameter types are chosen exactly when the argument matches
 //! rule: extension members of the called name that match the call's arity and argument types
 //! cites: 26.5.1
 //! expect: run

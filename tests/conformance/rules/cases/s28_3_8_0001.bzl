@@ -1,7 +1,8 @@
 //! case: s28_3_8_0001
 //! doc: spec
 //! section: 28.3.8
-//! title: a closure over an inner-block nullable Array local assigned to an outer function variable and
+//! title: a closure over an inner-block nullable Array local, stored outward and called after the block,
+//!   is
 //! rule: whose scope does not strictly enclose any source's scope
 //! cites: 28.3.8
 //! expect: reject

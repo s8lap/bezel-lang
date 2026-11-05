@@ -1,8 +1,7 @@
 //! case: s7_4_0910
 //! doc: spec
 //! section: 7.4
-//! title: a ReadOnlyStringSpan? local declared with a non-nullable initializer is narrowed at its
-//!   declaration
+//! title: a ReadOnlyStringSpan? local with a non-nullable initializer is narrowed at declaration
 //! rule: from a declaration whose initializer is such an `expr` — `var x: T? := expr;` or `const x: T? :=
 //!   expr;`
 //! cites: 7.4

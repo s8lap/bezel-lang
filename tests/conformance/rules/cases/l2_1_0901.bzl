@@ -1,8 +1,7 @@
 //! case: l2_1_0901
 //! doc: stdlib
 //! section: 2.1
-//! title: Console.WriteLine of a class and of an Object-typed binding invokes the overriding ToString,
-//!   whose
+//! title: Console.WriteLine of a class and of an Object binding invokes the overriding ToString
 //! rule: The `Object` overloads invoke `ToString()`.
 //! cites: 2.1
 //! expect: run

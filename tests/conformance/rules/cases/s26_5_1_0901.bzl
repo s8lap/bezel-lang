@@ -1,7 +1,7 @@
 //! case: s26_5_1_0901
 //! doc: spec
 //! section: 26.5.1
-//! title: an interpolated string argument selects the Object-headed Where(string) over the LINQ
+//! title: an interpolated string argument selects Object-headed Where(string) over LINQ Where
 //! rule: extension members of the called name that match the call's arity and argument types
 //! cites: 26.5.1
 //! expect: run

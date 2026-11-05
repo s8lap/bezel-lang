@@ -1,8 +1,7 @@
 //! case: s7_4_0903
 //! doc: spec
 //! section: 7.4
-//! title: a ReadOnlyStringSpan? parameter narrowed by an early return admits member access on the
-//!   surviving
+//! title: a ReadOnlyStringSpan? parameter narrowed by an early return admits members afterwards
 //! rule: an early exit: after `if x = null then return; end;` or `if x is null then return; end;`
 //! cites: 7.4
 //! expect: run

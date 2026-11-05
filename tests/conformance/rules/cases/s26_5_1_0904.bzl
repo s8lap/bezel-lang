@@ -1,7 +1,7 @@
 //! case: s26_5_1_0904
 //! doc: spec
 //! section: 26.5.1
-//! title: a conditional whose arms are a string call and a string concatenation selects the Object-headed
+//! title: a conditional of a string call and a concatenation selects Object-headed Where(string)
 //! rule: extension members of the called name that match the call's arity and argument types
 //! cites: 26.5.1
 //! expect: run

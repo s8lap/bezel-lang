@@ -1,7 +1,7 @@
 //! case: s26_5_1_0902
 //! doc: spec
 //! section: 26.5.1
-//! title: a parenthesised conditional of string literals selects the Object-headed Where(string) over the
+//! title: a parenthesised conditional of literals selects Object-headed Where(string) over LINQ Where
 //! rule: extension members of the called name that match the call's arity and argument types
 //! cites: 26.5.1
 //! expect: run

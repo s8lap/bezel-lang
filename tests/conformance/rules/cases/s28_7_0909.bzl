@@ -1,8 +1,8 @@
 //! case: s28_7_0909
 //! doc: spec
 //! section: 28.7
-//! title: reassigning an owned Array local while an alias made by an extension method returning this is
-//!   read
+//! title: reassigning an owned Array local while an alias from a returning-this extension is read is
+//!   rejected
 //! rule: Reassigning a plain-`var` owned **local** while a live local borrow of its current value exists
 //!   is rejected by the consume-site freeze
 //! cites: 28.7, 28.3.9

@@ -1,8 +1,7 @@
 //! case: s18_5_0904
 //! doc: spec
 //! section: 18.5
-//! title: a ToString that throws inside an interpolation hole after an await in an async method is
-//!   rethrown
+//! title: a ToString that throws in an interpolation hole after an await is rethrown at the await
 //! rule: A hole *without* a format spec formats via the value's ordinary `ToString()`
 //! cites: 18.5, 8.5
 //! expect: run
