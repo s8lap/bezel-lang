@@ -1092,6 +1092,16 @@ public:
         // consulted only at emission time below).
         collectObjectStringReturnMethods();
         collectBoxStorageFields();
+        // fix #8214 (§28.9 / §4.6 / §8.6, v0.355): the OBJECT-STRING STORAGE
+        // twin of collectBoxStorageFields above. Must run BEFORE the
+        // method-body emission loop (the store site consults the set) and
+        // BEFORE collectStringReleaseEligible (the string-escape walk consults
+        // it to keep the source's scope-end release armed). It depends only on
+        // ctx_ (sema, resolved before codegen), fieldIndex_ (declareStructs
+        // above) and methodFns_/ctorFns_ (declareFunctions above) — none on
+        // vtables or late codegen state — so placing it here is sound, exactly
+        // as for its box sibling.
+        collectObjectStringStorageFields();
         declareVtables();  // CG17: after functions exist (needs fn ptrs)
         // fix #2864 (§8.6 "Boxing" / §23.2 / §2.5, v0.240): MOVED UP from just
         // below `emitExportedIndexer*` to here. §8.6's box vtables/descriptors
@@ -22523,6 +22533,52 @@ private:
         return boxStorageFields_.count(static_cast<const void*>(m)) != 0;
     }
 
+    // fix #8214 (§28.9 / §4.6 / §8.6, v0.355): the OBJECT-STRING STORAGE
+    // fields — Object/interface-typed CLASS fields (FieldSymbol / auto-property
+    // PropertySymbol) into which EVERY store (across all locally compiled
+    // methods + constructors + accessors + destructors of the module) supplies
+    // a STRING-typed source (a `string` value, or `x as Object` / `x as I`
+    // whose operand `x` is a `string`). Such a field provably always holds a
+    // `string` (never a class instance, never a box, never a function value),
+    // so the store site can RETAIN the value into the field (giving the field
+    // its OWN independent +1) and the disposer can release that +1 with
+    // bz_string_release — the exact string-field twin of the box family
+    // above. Populated by collectObjectStringStorageFields (the pre-pass);
+    // a field that receives ANY non-string store is NEVER added, so the
+    // release can never fire on a non-string (the sound direction: a mixed
+    // field keeps the pre-#8214 plain-store behaviour — a leak, never a
+    // use-after-free).
+    //
+    // WHY A PRE-PASS AND NOT A RUNTIME TAG. An `Object`-typed slot may hold a
+    // class instance, a box, a function value or a string, and the STATIC
+    // type cannot tell them apart — the same problem the box family solves
+    // with collectBoxStorageFields. Deciding per-store (the source's static
+    // type IS a string) is sound for the RETAIN half; deciding per-field (is
+    // the slot's CURRENT value a string?) is what the release half needs, and
+    // that is a runtime question this fix deliberately does not answer (issue
+    // #8215 / #5059 — no runtime tag distinguishes a string from the other
+    // objects behind an `Object` slot). The per-field pre-pass answers it
+    // STATICALLY: a field whose every store is a string can only ever hold a
+    // string. A MIXED field is excluded, so its UAF (and the array /
+    // dictionary element cases, whose slot type is `Object` with no per-field
+    // classification available) stay open under #8215 / #8216.
+    std::unordered_set<const void*> objectStringStorageFields_;
+
+    // fix #8214: the one-shot latch for collectObjectStringStorageFields (the
+    // pre-pass runs once per module; the set is module-wide).
+    bool objectStringStorageFieldsScanDone_ = false;
+
+    // fix #8214 (§28.9 / §4.6 / §8.6, v0.355): is `m` in
+    // objectStringStorageFields_? True iff this field was determined (via
+    // the collectObjectStringStorageFields pre-pass) to hold ONLY strings —
+    // every store was a string-typed source. Used by emitDisposerCore to
+    // gate bz_string_release at disposal, and by the string-escape walk to
+    // keep the source's scope-end release armed. Parallel to
+    // isBoxStorageMember.
+    bool isObjectStringStorageMember(const sema::Symbol* m) {
+        return objectStringStorageFields_.count(static_cast<const void*>(m)) != 0;
+    }
+
     // #429 (box RETURN category) / §8.6 / §28.9: the set of user-defined,
     // locally-compiled MethodSymbols whose declared return type is Object or
     // an interface AND whose body provably always returns boxable value source
@@ -22605,6 +22661,50 @@ private:
     // we know can never hold a class instance. Called once from run() before
     // the method-body emission loop.
     void collectBoxStorageFields();
+
+    // fix #8214 (§28.9 / §4.6 / §8.6, v0.355): the OBJECT-STRING STORAGE
+    // twin of collectBoxStorageFields above. Scan all method / constructor /
+    // accessor / destructor bodies AND field initializers for stores to
+    // Object/interface-typed CLASS instance fields. A field is added to
+    // objectStringStorageFields_ ONLY if EVERY store to it carries a
+    // STRING-typed source (objectStringSourceIsString). A field that
+    // receives ANY other store — a class reference, a box, an `Object`-typed
+    // value — is never added, so the disposer can never call
+    // bz_string_release on a non-string. Called once from run() before the
+    // method-body emission loop (and before collectStringReleaseEligible,
+    // whose escape walk consults the set).
+    void collectObjectStringStorageFields();
+
+    // fix #8214 (§28.9 / §4.6 / §8.6, v0.355): is `valueExpr` a source whose
+    // RUNTIME VALUE is a `string`? True for a `string`-typed expression (the
+    // primitive, nullable or not) and for `x as Object` / `x as I` whose
+    // OPERAND `x` is a `string` (§17.4: the `as` result is a BORROW of `x`,
+    // and the value it carries IS `x`'s string). False for everything else —
+    // in particular for a source whose static type is `Object` (the value may
+    // be a class instance, so retaining it as a string would be unsound).
+    bool objectStringSourceIsString(const ast::Expr* valueExpr);
+
+    // fix #8214 (§28.9 / §4.6 / §8.6, v0.355): is `target` an
+    // OBJECT-STRING STORAGE FIELD lvalue — an Object/interface-typed CLASS
+    // instance field / auto-property that the collectObjectStringStorageFields
+    // pre-pass classified as holding ONLY strings? Such a location outlives
+    // the function and is released on the owner's disposal, so it takes an
+    // independent +1 on store (the string-field twin of isBoxFieldLvalue).
+    bool isObjectStringFieldLvalue(const ast::Expr& target,
+                                    const ast::Expr* valueExpr);
+
+    // fix #8214 (§28.9 / §4.6 / §8.6, v0.355): store `newVal` (a string) into
+    // the class Object/interface field at `fieldAddr` with retain-new /
+    // release-old, giving the field an INDEPENDENT +1 — the exact shape
+    // lowerStringFieldStore gives a `string`-typed field. A +1 producer is
+    // TRANSFERRED (no retain); anything else is RETAINED. The displaced old
+    // value is released: the pre-pass proved the field holds only strings, so
+    // the value it held IS a string (a literal / a null slot releases as a
+    // no-op). Returns true when handled.
+    bool lowerObjectStringFieldStore(const ast::Expr& target,
+                                      llvm::Value* fieldAddr,
+                                      llvm::Value* newVal,
+                                      const ast::Expr* valueExpr);
 
     // fix #4277 (§9.7 "Records and disposal" / §28.9 "Runtime-managed types" /
     // §13.2 "Top-level types" / §23.1 "Auto-properties", v0.306): the ONE

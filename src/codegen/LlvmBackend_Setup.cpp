@@ -31376,6 +31376,21 @@ struct StringEscapeWalker {
     // `stringReleaseMode`; when null every into-local binding stays a
     // conservative escape, matching the pre-#2900 behavior.
     const std::unordered_set<const void*>* objectStringBorrowAliases = nullptr;
+    // fix #8214 / §28.9 / §4.6 / §8.6 (v0.355): the OBJECT-STRING STORAGE
+    // FIELDS — Object/interface-typed CLASS fields whose EVERY store (per the
+    // collectObjectStringStorageFields pre-pass) supplies a STRING-typed
+    // source. A store into such a field RETAINS the value into the field
+    // (lowerObjectStringFieldStore), minting the field its OWN independent
+    // +1 and leaving the source's own +1 UNTOUCHED — so the source still
+    // owns exactly one reference it MUST release at scope end. The
+    // AssignmentStmt arm below therefore walks the RHS of such a store as a
+    // SAFE READ (a borrow, not an escape), keeping the source
+    // scope-end-release eligible; without this the conservative escape
+    // suppressed that release and the source's +1 leaked (the same shape
+    // #2505 / #2535 closed for a class PROPERTY SET). Non-null only in
+    // `stringReleaseMode`; when null every such store stays a conservative
+    // escape, matching the pre-#8214 behaviour.
+    const std::unordered_set<const void*>* objectStringStorageFields = nullptr;
     // fix #2641 / §22.4: the `out var x` ARGUMENT occurrence that INTRODUCES the
     // tracked recipient. For an inline out-var the "decl node" IS an
     // `ast::IdentifierExpr` in an argument list (ExprTypecheck_Exprs.cpp sets
@@ -34285,6 +34300,48 @@ struct StringEscapeWalker {
                             expr(as->value.get(), /*safeRead=*/true);
                             return;
                         }
+                    }
+                }
+                // fix #8214 / §28.9 / §4.6 / §8.6 (v0.355): the
+                // OBJECT-STRING STORAGE FIELD twin of the property-set
+                // relaxation above. `h.O := s;` where `h.O` is an
+                // Object/interface-typed class field whose EVERY store is a
+                // string (the collectObjectStringStorageFields pre-pass) is a
+                // CALL-BOUNDED BORROW of `s`, not an ESCAPE:
+                // lowerObjectStringFieldStore RETAINS the value into the
+                // field, minting the field its OWN independent +1 and
+                // leaving `s`'s own +1 UNTOUCHED — so `s` still owns exactly
+                // one reference it MUST release at scope end. Walking the RHS
+                // as a safe read keeps `s` scope-end-release eligible; without
+                // this the conservative escape below suppressed that release
+                // and `s`'s +1 leaked (39 bytes per store, MEASURED on the
+                // pre-fix build: `h.O := x;` inside a `do ... end` leaked
+                // `bz$M.Make$Str`'s 32-byte header + 7-byte payload).
+                //
+                // SOUNDNESS — the discriminant is the PRE-PASS, exactly as
+                // for the box family: the field is in
+                // `objectStringStorageFields_` only when EVERY store into it
+                // carries a string-typed source, so the store site always
+                // retains and the field can only ever hold a string. A field
+                // the pre-pass excluded (some store carries a class
+                // reference, a box, or an `Object`-typed value) does NOT
+                // reach this arm: its store does NOT retain, so the field
+                // ALIASES the source's only reference and the conservative
+                // escape below must stay.
+                //
+                // Gated on `stringReleaseMode` (the string-release walk
+                // family only) and on `!inLambda` — a capture read inside a
+                // lambda body outlives the scope (the env holds the value),
+                // so it stays a conservative escape, the same `inLambda`
+                // clause the #1997 / #2764 relaxations use.
+                if (objectStringStorageFields && stringReleaseMode &&
+                    !inLambda) {
+                    sema::Symbol* tsym = ctx.exprSymbol(*as->target);
+                    if (tsym && objectStringStorageFields->count(
+                                    static_cast<const void*>(tsym))) {
+                        expr(as->target.get(), /*safeRead=*/false);
+                        expr(as->value.get(), /*safeRead=*/true);
+                        return;
                     }
                 }
             }
@@ -38995,6 +39052,12 @@ void Emitter::collectStringReleaseEligible(
         // and the source's release stays armed. Must run AFTER
         // collectObjectStringReleaseEligible (which populates the set).
         w.objectStringBorrowAliases = &objectStringBorrowAll_;
+        // fix #8214 / §28.9 / §4.6 / §8.6 (v0.355): the OBJECT-STRING
+        // STORAGE FIELDS — a store into such a field retains the value
+        // into the field (the field takes its OWN +1), so the source's
+        // own +1 stays and its scope-end release must fire: the walker's
+        // AssignmentStmt arm reads such a store's RHS as a SAFE READ.
+        w.objectStringStorageFields = &objectStringStorageFields_;
         w.retainedCtorArgs = &retainedCtorArgs;  // fix #6170
         // fix #8162 (stdlib §3.3, v0.355): consult the CONSTRUCTOR-BORROW
         // MAP — a `new ReadOnlyStringSpan(source, start, length)` in the map
@@ -39033,6 +39096,12 @@ void Emitter::collectStringReleaseEligible(
         // the producer loop above (a copy of an `Object` alias of a
         // string is a borrow too).
         w.objectStringBorrowAliases = &objectStringBorrowAll_;
+        // fix #8214 / §28.9 / §4.6 / §8.6 (v0.355): the OBJECT-STRING
+        // STORAGE FIELDS — a store into such a field retains the value
+        // into the field (the field takes its OWN +1), so the source's
+        // own +1 stays and its scope-end release must fire: the walker's
+        // AssignmentStmt arm reads such a store's RHS as a SAFE READ.
+        w.objectStringStorageFields = &objectStringStorageFields_;
         w.retainedCtorArgs = &retainedCtorArgs;  // fix #6170
         // fix #8162 (stdlib §3.3, v0.355): consult the CONSTRUCTOR-BORROW
         // MAP — a `new ReadOnlyStringSpan(source, start, length)` in the map
@@ -47905,6 +47974,314 @@ void Emitter::collectBoxStorageFields() {
             if (isOk) boxStorageFields_.insert(voidPtr);
         }
     }
+}
+
+
+// fix #8214 (§28.9 / §4.6 / §8.6, v0.355): is `valueExpr` a source whose
+// RUNTIME VALUE is a `string`?
+//
+// TRUE for
+//   * a `string`-typed expression — the primitive, nullable or not (§28.9:
+//     `string` is runtime-managed, so its heap value is a `bz_string*`);
+//   * `x as Object` / `x as I` whose OPERAND `x` is a `string` — §17.4: the
+//     `as` result is a BORROW of `x` ("a borrow with the same source as
+//     `x`"), so the value the conversion carries IS `x`'s string. This is
+//     the shape issue #8214 is filed against.
+//
+// FALSE for everything else — in particular for a source whose static type is
+// `Object` (the value may be a class instance, a box or a function value, so
+// retaining it as a string would be UNSOUND: `bz_string_retain` on a class
+// instance corrupts it), and for a `null` literal (no value at all — the
+// null-safe release handles the slot).
+//
+// The `as` arm reads the OPERAND's static type, not the conversion's result
+// type: `x as Object` has result type `Object` (§17.4), which alone says
+// nothing about the value.
+bool Emitter::objectStringSourceIsString(const ast::Expr* valueExpr) {
+    if (!valueExpr) return false;
+    const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
+    if (!srcTy) return false;
+    if (srcTy->kind == sema::TypeRef::Kind::Primitive &&
+        srcTy->primitive == sema::PrimitiveType::String)
+        return true;
+    // `x as Object` / `x as I` — the operand decides.
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(valueExpr)) {
+        if (tt->op != "as") return false;
+        if (!tt->operand) return false;
+        const sema::TypeRef* opTy = ctx_.exprType(*tt->operand);
+        if (!opTy) return false;
+        return opTy->kind == sema::TypeRef::Kind::Primitive &&
+               opTy->primitive == sema::PrimitiveType::String;
+    }
+    return false;
+}
+
+
+// fix #8214 (§28.9 / §4.6 / §8.6, v0.355): the OBJECT-STRING STORAGE twin of
+// collectBoxStorageFields above.
+//
+// For every class TypeSymbol, find all Object/interface-typed instance fields
+// and auto-properties. Then scan EVERY method and constructor body of that
+// class for AssignmentStmt stores (:=) to those fields. Additionally, check
+// each field's own AST initializer (FieldDecl / PropertyDecl autoInitializer).
+// A field is added to objectStringStorageFields_ ONLY if:
+//   (a) every such store has a STRING-typed source (objectStringSourceIsString
+//       — a `string` value, or `x as Object` / `x as I` whose operand `x` is a
+//       `string`); OR
+//   (b) the store is a `null` literal — it puts no value in the slot, and
+//       bz_string_release is null-safe, so it is NEUTRAL (the same treatment
+//       the box pre-pass gives a `:= null` store, #7968).
+// A field that receives ANY other store — a class reference, a box, a
+// function value, an `Object`-typed parameter — is EXCLUDED. That exclusion is
+// what makes the disposal release sound: bz_string_release is then never
+// called on anything but a string.
+//
+// The scan mirrors collectBoxStorageFields exactly (same accessor bodies, same
+// every-method / every-constructor / every-accessor / destructor sweep, same
+// "the pre-pass is the authority" contract), so the two families cannot drift
+// about WHICH fields they classify.
+void Emitter::collectObjectStringStorageFields() {
+    if (objectStringStorageFieldsScanDone_) return;
+    objectStringStorageFieldsScanDone_ = true;
+
+    // fix-forward #7968 (§23.3 / §28.9, v0.355): the PROPERTY / INDEXER
+    // accessor bodies, collected once — a block or arrow setter stores into a
+    // field exactly as a method does, but accessors are not in `methodFns_`.
+    std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*> accessorBodies;
+    for (auto& asym : ctx_.symbols()) {
+        if (ctx_.isImported(asym.get())) continue;
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(asym->decl);
+        if (!pd) continue;
+        for (auto& acc : pd->accessors)
+            if (!acc.stmts.empty()) accessorBodies.push_back(&acc.stmts);
+    }
+
+    for (auto& sym : ctx_.symbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+
+        // Candidate fields: Object/interface typed instance fields. The
+        // AST-only predicates are correct HERE for the same reason they are in
+        // collectBoxStorageFields: `ctx_.symbols()` holds only the module
+        // being compiled, so every member of `ts` has a decl.
+        std::vector<const sema::Symbol*> candidates;
+        for (const sema::Symbol* m : ts->members) {
+            bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
+            if (!isField && !sema::hasAstAutoPropertyDecl(m)) continue;
+            if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
+            const sema::TypeRef* ft = recordMemberType(m);
+            if (!ft || !isObjectOrInterfaceTarget(ft)) continue;
+            candidates.push_back(m);
+        }
+        if (candidates.empty()) continue;
+
+        // Track which candidates are still "string only" (start as true).
+        std::unordered_map<const void*, bool> ok;
+        for (const sema::Symbol* m : candidates)
+            ok[static_cast<const void*>(m)] = true;
+
+        // A store into an Object/interface field whose source is NOT a string
+        // excludes the field.
+        auto checkStore = [&](const ast::Expr* target, const ast::Expr* val) {
+            if (!target || !val) return;
+            sema::Symbol* fsym = ctx_.exprSymbol(*target);
+            if (!fsym) return;
+            auto it = ok.find(static_cast<const void*>(fsym));
+            if (it == ok.end()) return;   // not a candidate field
+            if (!it->second) return;      // already excluded
+            // A `null` literal puts no value in the slot; bz_string_release is
+            // null-safe, so it is NEUTRAL (the #7968 treatment).
+            if (dynamic_cast<const ast::NullLiteralExpr*>(val)) return;
+            if (!objectStringSourceIsString(val)) it->second = false;
+        };
+
+        // Recursive statement scanner for stores.
+        std::function<void(const ast::Stmt*)> scanStmt;
+        scanStmt = [&](const ast::Stmt* s) {
+            if (!s) return;
+            if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+                if (as->op == ":=" && as->target && as->value)
+                    checkStore(as->target.get(), as->value.get());
+            }
+            if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+                for (auto& b : is->ifBranch.body) scanStmt(b.get());
+                for (auto& br : is->elifBranches)
+                    for (auto& b : br.body) scanStmt(b.get());
+                for (auto& b : is->elseBody) scanStmt(b.get());
+            } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                for (auto& b : ws->body) scanStmt(b.get());
+            } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                for (auto& b : fs->body) scanStmt(b.get());
+            } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                for (auto& b : d->body) scanStmt(b.get());
+            } else if (auto* ts2 = dynamic_cast<const ast::TryStmt*>(s)) {
+                for (auto& b : ts2->body) scanStmt(b.get());
+                for (auto& c : ts2->catches)
+                    if (c.body) scanStmt(c.body.get());
+                for (auto& b : ts2->finallyBody) scanStmt(b.get());
+            } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                for (auto& arm : cs->arms)
+                    for (auto& a : arm.stmts) scanStmt(a.get());
+            }
+        };
+
+        // Check field initializers (AST FieldDecl / PropertyDecl initializer).
+        //
+        // fix #8214: the initializer's value lands in the slot through
+        // emitInstanceInit, which retains only a `string`-TYPED field's
+        // initializer — an `Object`-typed field's initializer is stored RAW.
+        // So the initializer must itself carry a reference the slot can own:
+        // a string LITERAL does (a literal is a sentinel — retain/release are
+        // no-ops on it, §28.9), a `null` does (the zeroed slot), and a
+        // `string`-typed EXPRESSION does NOT (its +1 belongs to the
+        // expression, and emitInstanceInit would not retain it — the slot
+        // would hold an un-retained alias). A field whose initializer is a
+        // non-literal string expression is therefore EXCLUDED here, so the
+        // slot never owns a reference it cannot account for.
+        for (const sema::Symbol* m : candidates) {
+            const ast::Expr* init = nullptr;
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+                init = fd->initializer.get();
+            else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+                init = pd->autoInitializer.get();
+            if (!init) continue;  // no initializer → calloc-zeroed null → OK
+            if (dynamic_cast<const ast::NullLiteralExpr*>(init)) continue;
+            auto it = ok.find(static_cast<const void*>(m));
+            if (!it->second) continue;
+            // A string LITERAL initializer: the sentinel needs no reference
+            // (bz_string_retain / bz_string_release are no-ops on it).
+            if (dynamic_cast<const ast::StringLiteralExpr*>(init)) continue;
+            // Anything else that is not a string is a non-string value.
+            if (!objectStringSourceIsString(init)) {
+                it->second = false;
+                continue;
+            }
+            // A string-typed EXPRESSION initializer: the slot would hold an
+            // un-retained alias of it (emitInstanceInit does not retain an
+            // Object-typed field's initializer), so the field is excluded.
+            it->second = false;
+        }
+
+        // Check all method bodies for stores to these fields.
+        for (auto& [msym, fn] : methodFns_) {
+            if (ctx_.isImported(msym)) continue;
+            auto* md = dynamic_cast<const ast::MethodDecl*>(msym->decl);
+            if (!md) continue;
+            for (auto& s : md->stmts) scanStmt(s.get());
+        }
+
+        // Check all constructor bodies (of any class) for stores to these
+        // fields.
+        for (auto& [csym, fn] : ctorFns_) {
+            if (ctx_.isImported(csym)) continue;
+            auto* cd = dynamic_cast<const ast::ConstructorDecl*>(csym->decl);
+            if (!cd) continue;
+            for (auto& s : cd->body) scanStmt(s.get());
+        }
+
+        // Every local property / indexer accessor body.
+        for (auto* body : accessorBodies)
+            for (auto& s : *body) scanStmt(s.get());
+
+        // The class's destructor, if any.
+        for (const sema::Symbol* m : ts->members) {
+            auto* ds = dynamic_cast<const sema::MethodSymbol*>(m);
+            if (!ds) continue;
+            auto* dd = dynamic_cast<const ast::DestructorDecl*>(ds->decl);
+            if (!dd) continue;
+            for (auto& s : dd->body) scanStmt(s.get());
+        }
+
+        // Add the fields that survived as string-only.
+        for (auto& [voidPtr, isOk] : ok) {
+            if (isOk) objectStringStorageFields_.insert(voidPtr);
+        }
+    }
+}
+
+
+// fix #8214 (§28.9 / §4.6 / §8.6, v0.355): is `target` an OBJECT-STRING
+// STORAGE FIELD lvalue? An Object/interface-typed CLASS instance field /
+// auto-property that the collectObjectStringStorageFields pre-pass classified
+// as holding ONLY strings, storing a string-typed source.
+//
+// The storage classification mirrors isStringFieldLvalue's
+// isClassFieldStorageLvalue (NOT a local / parameter, NOT a ref-out alias, NOT
+// a static field, a class field or class auto-property — a RECORD field is
+// excluded: a record's reference fields are BORROWS (§9) and a record has no
+// disposer (§9.7), so there is no release point to pair the retain with).
+bool Emitter::isObjectStringFieldLvalue(const ast::Expr& target,
+                                         const ast::Expr* valueExpr) {
+    if (!valueExpr) return false;
+    // The SOURCE must be a string: a retain of a non-string would corrupt it.
+    // A `null` literal is admitted as well — it puts NO value in the slot, so
+    // the only thing the store owes is the release of the DISPLACED value
+    // (which the pre-pass proved was a string); bz_string_retain / release are
+    // null-safe, so the pair is a no-op on the null itself.
+    if (!objectStringSourceIsString(valueExpr) &&
+        !dynamic_cast<const ast::NullLiteralExpr*>(valueExpr))
+        return false;
+    if (localSlot(target)) return false;
+    {
+        llvm::Type* dummy = nullptr;
+        if (refParamAddr(target, dummy)) return false;
+    }
+    if (staticFieldGlobal(target)) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    if (!sym) return false;
+    // The PRE-PASS is the authority: only a field it classified as
+    // string-only may take the retain / release pair.
+    if (!isObjectStringStorageMember(sym)) return false;
+    if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym))
+        return fs->parent && fs->parent->kind == ast::TypeDeclKind::Class;
+    if (sema::isAutoPropertyStorageSymbol(sym, ctx_)) {
+        auto* ms = dynamic_cast<sema::MemberSymbol*>(sym);
+        return ms && ms->parent && ms->parent->kind == ast::TypeDeclKind::Class;
+    }
+    return false;
+}
+
+
+// fix #8214 (§28.9 / §4.6 / §8.6, v0.355): store `newVal` (a string) into the
+// class Object/interface field at `fieldAddr` with retain-new / release-old,
+// giving the field an INDEPENDENT +1. The exact shape lowerStringFieldStore
+// gives a `string`-typed field — order: load-old → retain-or-transfer-new →
+// store-new → release-old. Retaining the new value BEFORE releasing the old
+// makes a self-assignment safe (rc dips +1 then back, never transiently 0).
+// A +1 producer is TRANSFERRED (no retain — its single reference becomes the
+// field's); anything else is RETAINED via bz_string_retain (the field's count
+// is independent of the source's, so the source's own scope-end release still
+// balances — the string-escape walk's #8214 relaxation keeps that release
+// armed).
+//
+// The displaced old value is RELEASED: the pre-pass proved the field holds
+// only strings, so the value it held IS a string (a literal / a null slot
+// releases as a no-op — bz_string_release is null-safe and a no-op on the
+// literal sentinel).
+bool Emitter::lowerObjectStringFieldStore(const ast::Expr& target,
+                                           llvm::Value* fieldAddr,
+                                           llvm::Value* newVal,
+                                           const ast::Expr* valueExpr) {
+    if (!isObjectStringFieldLvalue(target, valueExpr)) return false;
+    if (!fieldAddr || !newVal) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), fieldAddr, "ostr.old");
+    // A +1 producer is TRANSFERRED (no retain — its single reference becomes
+    // the field's); anything else is RETAINED. `x as Object` carries the
+    // OPERAND's value (§17.4: the result is a borrow of `x`), so a +1
+    // producer OPERAND transfers its reference through the conversion — the
+    // conversion's own result type (`Object`) says nothing about the value.
+    bool producer = isPlusOneStringProducer(valueExpr);
+    if (!producer) {
+        if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(valueExpr)) {
+            if (tt->op == "as" && tt->operand)
+                producer = isPlusOneStringProducer(tt->operand.get());
+        }
+    }
+    if (!producer) emitStringRetain(newVal);
+    builder_.CreateStore(newVal, fieldAddr);
+    emitStringRelease(oldVal);
+    return true;
 }
 
 

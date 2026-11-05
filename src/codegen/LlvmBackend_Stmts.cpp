@@ -1977,6 +1977,30 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled)
                     handled = lowerBoxFieldStore(*as->target, addr, rhs,
                                                  as->value.get());
+                // fix #8214 / §28.9 / §4.6 / §8.6 (v0.355): the OBJECT-STRING
+                // STORAGE FIELD-STORE category — the string twin of the box
+                // family just above. A store into a CLASS Object/interface
+                // field whose EVERY store (per the
+                // collectObjectStringStorageFields pre-pass) is a string-typed
+                // source takes an independent +1 (retain-new or
+                // transfer-producer / release-old), released on the owner's
+                // disposal. Without it the field ALIASED the source's only
+                // reference and the source's scope-end release freed the
+                // string under the field — issue #8214's use-after-free
+                // (`h.O := x as Object;` ⇒ `free(): invalid pointer`, rc 134).
+                //
+                // Gated on isObjectStringFieldLvalue, which checks BOTH the
+                // target (a class field the pre-pass classified as
+                // string-only) and the source (a string-typed value, or
+                // `x as Object` whose operand is a string) — so a store of a
+                // class instance / a box / an `Object`-typed value never
+                // reaches here, and the release half can never fire on a
+                // non-string. Mutually exclusive with the box arm above (a
+                // string source is not a boxable value type), so the order
+                // between them does not matter.
+                if (!handled)
+                    handled = lowerObjectStringFieldStore(*as->target, addr,
+                                                          rhs, as->value.get());
                 // #824 / §28.5 / §28.9: a store into a CLASS `owned` collection
                 // field (OwningArray<T>/OwningStack<T>/OwningQueue<T>/OwningSet<T>/
                 // OwningLinkedList<T>/OwningBuffer<T>/OwningDictionary<T> etc.)
