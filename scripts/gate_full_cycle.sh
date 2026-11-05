@@ -1407,9 +1407,15 @@ _gs_log="$LOGDIR/${TAG}_gate_selftest.log"
 # for the recorded/inferred --kind tests, then 905 -> 927 for the review
 # round-4 tests (rebase/bisect hooks, patch-id note recovery, --continue,
 # empty picks, trailing-flag hangs, handback read-only), then 927 -> 934 for
-# the duplicate-patch-id / pruned-target / quoted-recipe tests.
-_gs_floor=934
-_gs_skip_cap=4
+# the duplicate-patch-id / pruned-target / quoted-recipe tests. Then 934 -> 938 for the
+# shared self-test skip-cap tests (pregate enforces the cycle's cap).
+_gs_floor=938
+# The skip cap is shared with scripts/pregate.sh (scripts/gate/selftest_limits.sh)
+# so the two cannot drift: R39 gate 1 failed here on 6 skips that pregate had
+# accepted as "OK (skipped=6)".
+# shellcheck source=gate/selftest_limits.sh
+. "$REPO/scripts/gate/selftest_limits.sh"
+_gs_skip_cap="$(gate_selftest_skip_cap_for 1)"
 # fix #3463: THE PHASE MUST NOT BE ABLE TO REACH THIS GATE'S OWN MARKERS.
 #
 # Four modules in that directory drive the real scripts/gate_and_push.sh, which

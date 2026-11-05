@@ -112,12 +112,16 @@ run_bg() {  # name, command...
 
 run_bg ratchets scripts/ratchet_sweep.sh
 
+# The skip cap is the GATE's (scripts/gate/selftest_limits.sh, sourced by both).
+# -v so the skipped test names and reasons are in the log.
+# shellcheck source=gate/selftest_limits.sh
+. scripts/gate/selftest_limits.sh
 selftests() {
   mkdir -p "$OUT/markers"
   BEZEL_GATE_PIDFILE="$OUT/markers/gate.pid" BEZEL_GATE_DONEFILE="$OUT/markers/gate.done" \
-    python3 -m unittest discover -s scripts/gate/tests || return 1
+    python3 -m unittest discover -s scripts/gate/tests -v || return 1
   BEZEL_GATE_PIDFILE="$OUT/markers/gate.pid" BEZEL_GATE_DONEFILE="$OUT/markers/gate.done" \
-    python3 -m unittest scripts.gate.tests.test_gate_and_push_smart_push || return 1
+    python3 -m unittest scripts.gate.tests.test_gate_and_push_smart_push >> "$OUT/selftests_smart_push.log" 2>&1 || return 1
 }
 run_bg selftests selftests
 
@@ -142,6 +146,22 @@ phase_result() {  # name, pass-note
 }
 phase_result ratchets "$(tail -1 "$OUT/ratchets.log")"
 phase_result selftests "$(grep -E '^Ran ' "$OUT/selftests.log" | head -1)"
+if [ "${RESULT[selftests]}" = PASS ]; then
+  # unittest exits 0 for "OK (skipped=N)": enforce the gate's cap. Pregate runs
+  # with no gate live; on a clean tree the 2 gate-only lock tests do not skip,
+  # so the cap is lower than in-gate (gate_selftest_skip_cap_for).
+  _inside=1
+  [ -z "$(git status --porcelain --untracked-files=no)" ] && _inside=0
+  _cap="$(gate_selftest_skip_cap_for "$_inside")"
+  _sk="$(gate_selftest_skip_count "$OUT/selftests.log")"
+  if [ "$_sk" -gt "$_cap" ]; then
+    _names="$(grep -E ' \.\.\. skipped ' "$OUT/selftests.log" | sed 's/ \.\.\. skipped / => /' | cut -c1-160 | tr '\n' ';')"
+    RESULT[selftests]=FAIL
+    NOTE[selftests]="skipped=$_sk > cap $_cap (the gate would fail) — ${_names} rebuild: scripts/dev_heavy.sh build cmake --build build --target bezel_tests bezelc"
+  else
+    NOTE[selftests]="${NOTE[selftests]}, skipped=$_sk (cap $_cap)"
+  fi
+fi
 if [ "${RESULT[bezelc]}" = PASS ]; then
   phase_result corpus "$(grep -E '^gate_rule_corpus_baseline: OK' "$OUT/corpus.log" | tail -1 | cut -c1-90)"
 else
