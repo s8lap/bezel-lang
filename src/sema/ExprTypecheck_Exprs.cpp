@@ -2860,6 +2860,36 @@ namespace {
 // §8.1 universal instance members (`ToString`, `Equals`, `GetHashCode`,
 // `GetType`) the records generate (§9.2) and `Random`'s §8.7 `Dispose`.
 //
+// fix #8251 (stdlib §6.1/§8.1, §26.5 rule 1-2, v0.355): stdlib §6.1's
+// `CancellationToken` is a compiler-known `public record` with no TypeSymbol
+// either, and it joins the table for the same reason the §2.5-§2.7 records
+// are here — it is the authority for TWO questions the ordinary member walk
+// cannot answer, and both of them are §26.5 questions:
+//
+//   1. RULE 1 (the commitment). stdlib §6.1 declares
+//      `public readonly property IsCancellationRequested: bool`,
+//      `public method ThrowIfCancellationRequested()` and
+//      `public method Register(scoped callback: () -> ()): owned Subscription`
+//      on `CancellationToken`, plus the §8.1 universal members every type
+//      inherits. A user `extension CancellationToken { IsCancellationRequested
+//      (): bool => ... }` must therefore be UNREACHABLE on a `CancellationToken`
+//      receiver — rule 1 commits the instance lookup for that name.
+//   2. RULE 2 (the MATCH). `builtinStubHeadHasDeclaredSurface` below reads
+//      this table to decide whether a `builtinClassSym` STUB is a BUILT-IN
+//      shape or a USER shape, and `extensionTargetMatchesReceiver`
+//      (ExprTypecheck.cpp) refuses to equate a built-in with a user type.
+//      Before this row a `CancellationToken` STUB — the shape
+//      `CancellationToken.None` and `CancellationTokenSource.Token` carry
+//      (`builtinClassSym("CancellationToken")`, a non-null declaration with no
+//      TypeDecl) — was read as a USER type, so an `extension CancellationToken`
+//      head never matched it and the extension was INVISIBLE: `t.Twice()` on
+//      `var t := CancellationToken.None;` reached codegen with no callee at
+//      all ("`Twice` on built-in type `CancellationToken` produced no value,
+//      and no dispatch arm emitted any code for this call", issue #8251).
+//      The ANNOTATION shape (`var t: CancellationToken := ...`) was never
+//      affected — it is declaration-LESS, so it was already a built-in shape —
+//      which is why the same extension worked there and not here.
+//
 // STATIC members are NOT listed: a static member is not an instance member,
 // so `extension DateTime { FromTicks(..) }` stays reachable on a `DateTime`
 // receiver (a static name is reached through the TYPE, §22.12). The
@@ -2907,6 +2937,22 @@ const std::vector<ValueRecordSurface>& valueRecordSurfaces() {
          {"Next", "NextInt64", "NextDouble", "NextBytes", "NextBoolean",
           "Dispose", "ToString", "Equals", "GetHashCode", "GetType"},
          {}},
+        // fix #8251 (stdlib §6.1/§8.1, v0.355): stdlib §6.1's
+        // `CancellationToken` record, transcribed from its declaration block:
+        //   public record CancellationToken
+        //     public static readonly property None: CancellationToken;   <- STATIC: not listed
+        //     public readonly property IsCancellationRequested: bool;
+        //     public method ThrowIfCancellationRequested();
+        //     public method Register(scoped callback: () -> ()): owned Subscription;
+        //   end CancellationToken;
+        // plus the §8.1 universal instance members every type inherits
+        // (`ToString`, `Equals`, `GetHashCode`, `GetType`). `None` is STATIC,
+        // so it is not listed (a static member is not an instance member,
+        // §22.12) — exactly as `DateTime.FromTicks` is not listed above.
+        {"CancellationToken",
+         {"IsCancellationRequested", "ThrowIfCancellationRequested",
+          "Register", "ToString", "Equals", "GetHashCode", "GetType"},
+         {"IsCancellationRequested"}},
     };
     return kRows;
 }
