@@ -31377,12 +31377,14 @@ struct StringEscapeWalker {
     // conservative escape, matching the pre-#2900 behavior.
     const std::unordered_set<const void*>* objectStringBorrowAliases = nullptr;
     // fix #8214 / §28.9 / §4.6 / §8.6 (v0.355): the OBJECT-STRING STORAGE
-    // FIELDS — Object/interface-typed CLASS fields whose EVERY store (per the
-    // collectObjectStringStorageFields pre-pass) supplies a STRING-typed
-    // source. A store into such a field RETAINS the value into the field
-    // (lowerObjectStringFieldStore), minting the field its OWN independent
-    // +1 and leaving the source's own +1 UNTOUCHED — so the source still
-    // owns exactly one reference it MUST release at scope end. The
+    // FIELDS — every Object/interface-typed CLASS field of a class compiled in
+    // this module (the collectObjectStringStorageFields pre-pass). The pre-pass
+    // does NOT classify stores: membership says nothing about what the field
+    // holds, and nothing releases on it. A store whose SOURCE is STRING-typed
+    // into such a field RETAINS the value (lowerObjectStringFieldStore), minting
+    // the field its OWN independent +1 and leaving the source's own +1
+    // UNTOUCHED — so the source still owns exactly one reference it MUST
+    // release at scope end. The
     // AssignmentStmt arm below therefore walks the RHS of such a store as a
     // SAFE READ (a borrow, not an escape), keeping the source
     // scope-end-release eligible; without this the conservative escape
@@ -34305,9 +34307,9 @@ struct StringEscapeWalker {
                 // fix #8214 / §28.9 / §4.6 / §8.6 (v0.355): the
                 // OBJECT-STRING STORAGE FIELD twin of the property-set
                 // relaxation above. `h.O := s;` where `h.O` is an
-                // Object/interface-typed class field (the
-                // collectObjectStringStorageFields set) of a string is a
-                // CALL-BOUNDED BORROW of `s`, not an ESCAPE:
+                // Object/interface-typed class field (a member of the
+                // collectObjectStringStorageFields set) and `s` is STRING-typed
+                // is a CALL-BOUNDED BORROW of `s`, not an ESCAPE:
                 // lowerObjectStringFieldStore RETAINS the value into the
                 // field, minting the field its OWN independent +1 and
                 // leaving `s`'s own +1 UNTOUCHED — so `s` still owns exactly
@@ -34320,11 +34322,15 @@ struct StringEscapeWalker {
                 //
                 // SOUNDNESS: the field is in `objectStringStorageFields_` when
                 // it is an Object/interface-typed class field, and the store
-                // site (isObjectStringFieldLvalue) retains EVERY string-typed
+                // site (isObjectStringFieldLvalue) retains a STRING-typed
                 // source stored into such a field with `:=` or `??=` (this arm
-                // fires for any assignment operator). A source that is
-                // not a string carries no string reference for this walk to
-                // release, so reading it as safe changes nothing for it.
+                // fires for any assignment operator). The store site does not
+                // classify the field, so a source whose static type is
+                // `Object` is NOT retained here even when it holds a string:
+                // that alias is the open residual (#8215), not covered by this
+                // arm. A source that is not a string carries no string
+                // reference for this walk to release, so reading it as safe
+                // changes nothing for it.
                 //
                 // Gated on `stringReleaseMode` (the string-release walk
                 // family only) and on `!inLambda` — a capture read inside a

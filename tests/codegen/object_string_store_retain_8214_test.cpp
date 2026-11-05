@@ -244,18 +244,19 @@ BEZEL_TEST(object_string_store_retain_8214,
 }
 
 // ===========================================================================
-// THE IMPLICIT TWIN. The same store WITHOUT the `as`: `h.O := x;` (§5.1's
-// implicit string → Object conversion). Pre-fix this shape did not crash — the
-// escape walk read the implicit store as an escape and suppressed `x`'s
-// scope-end release — but it LEAKED the reference (39 bytes / 2 allocations).
-// The row pins that the implicit conversion behaves EXACTLY like the explicit
-// one: same value printed, and no use-after-free.
-//
-// The two rows together are what make "the implicit conversion must behave
-// the same as the explicit one" a MEASURED claim rather than an assertion.
+// CONTROL — THE IMPLICIT TWIN. The same store WITHOUT the `as`: `h.O := x;`
+// (§5.1's implicit string → Object conversion). This row does NOT discriminate:
+// pre-fix this shape did not crash, because the escape walk read the implicit
+// store as an escape and suppressed `x`'s scope-end release, so the string
+// survived and was LEAKED (39 bytes / 2 allocations). Under the lenient oracle
+// (no LeakSanitizer) the pre-fix and post-fix builds both pass it. It claims
+// only what it checks: the implicit store prints the stored value, and no
+// use-after-free fires on the read after the `do` block ends. It does NOT claim
+// that the implicit store retains the string; the explicit row above is the one
+// that is RED pre-fix.
 // ===========================================================================
 BEZEL_TEST(object_string_store_retain_8214,
-           object_field_implicit_conversion_twin_retains_the_string) {
+           control_implicit_conversion_twin_store_is_clean) {
     expectNoUseAfterFree(fieldProgram("h.O := x;"),
                    repeatLine("s12345\n", kIterations));
 }
@@ -281,6 +282,11 @@ BEZEL_TEST(object_string_store_retain_8214,
 // The `Object`-typed parameter shape is NOT here on purpose: its static type
 // does not say the value is a string (it may be a class instance), so
 // retaining it would be unsound — that is the mixed-slot case #8215 owns.
+//
+// The caller's `s` is scoped in a `do ... end;` block and the field is read
+// AFTER the block ends, with a second allocation of the same size in between
+// (reusing the freed block). Without the field's retain the block's release
+// frees the string under the field: a heap-use-after-free or a wrong value.
 // ===========================================================================
 BEZEL_TEST(object_string_store_retain_8214,
            object_field_string_parameter_store_retains_the_string) {
@@ -296,14 +302,20 @@ BEZEL_TEST(object_string_store_retain_8214,
         "  public static method Main(): int "
         "    var h := new Holder(); "
         "    for var i in 0..<" + std::to_string(kIterations) + " do "
-        "      var s := Make.Str(12345); "
-        "      Make.Put(h, s); "
+        "      var t := 0; "
+        "      do "
+        "        var s := Make.Str(12345); "
+        "        Make.Put(h, s); "
+        "      end; "
+        "      var junk := Make.Str(99999); "
         "      Console.WriteLine(h.O.ToString()); "
+        "      t := junk.Length; "
+        "      Console.WriteLine(t); "
         "    end for; "
         "    return 0; "
         "  end Main; "
         "end Program; ";
-    expectNoUseAfterFree(program, repeatLine("s12345\n", kIterations));
+    expectNoUseAfterFree(program, repeatLine("s12345\n6\n", kIterations));
 }
 
 // ===========================================================================
