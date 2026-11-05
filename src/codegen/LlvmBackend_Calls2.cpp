@@ -3764,7 +3764,11 @@ bool Emitter::isOutOwnedArgPosition(const ast::CallExpr& call, std::size_t pos) 
     if (cn == "OwningSet" && m == "TryPop") return pos == 1;
     // OwningDictionary<K,V>.TryPopValue(key, out owned value: V) — arg 1.
     if (cn == "OwningDictionary" && m == "TryPopValue") return pos == 1;
-    if (cn == "Weak" && m == "TryUpgrade") return pos == 0;
+    // fix #7508 (spec §28.13, stdlib §2.16, v0.355): `Weak<T>.TryUpgrade` has
+    // NO out parameter any more — it is the Try shape-(b) NULLABLE RETURN
+    // `TryUpgrade(): owned Shared<T>?`, so the handle is produced by the
+    // call's RESULT and the caller's binding owns it. There is no
+    // out-owned argument to model here.
     // Channel<T>.TryReceive(out owned item: T?) — arg 0, only when T is a
     // class/interface (value-typed/string T drops the ownership modifiers,
     // stdlib §6.9).
@@ -3813,12 +3817,17 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
 
     std::size_t pos = 0;
     for (const auto& a : call.args) {
-        // §28.13 / stdlib §2.16 (#603): Weak<T>.TryUpgrade(out using var h).
+        // §28.13 / stdlib §2.16 (#603): an `out using var` recipient.
         // The modifier is "out using var" — pre-create a null-initialized ptr
-        // slot so lvalueAddr finds it. Register a sharedHandle disposal so the
-        // handle is released at scope end: if TryUpgrade succeeded the slot
-        // holds a valid Shared<T> handle; if it failed the slot is null and
-        // emitDisposals' null-guard skips the release (no-op).
+        // slot so lvalueAddr finds it.
+        // fix #7508 (spec §28.13, stdlib §2.16, v0.355): the `Weak<T>
+        // .TryUpgrade(out using var h)` spelling is GONE — `TryUpgrade` is
+        // the Try shape-(b) NULLABLE RETURN `TryUpgrade(): owned
+        // Shared<T>?` (stdlib §2.16), so the handle is produced by the
+        // call's RESULT and the caller's binding owns it. Every remaining
+        // `out using var` recipient is an owning-collection / channel Try*'s
+        // moved-out OWNED CLASS ELEMENT → dispatch its destructor + reclaim
+        // the block via the object's own vtable (dynamicDispose).
         if (a.modifier == "out using var" && a.value) {
             auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
             if (id2) {
@@ -3827,30 +3836,10 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                 bool alreadyMapped = (loc2 && loc2->decl &&
                                       locals_.count(loc2->decl)) ||
                                      locals_.count(id2);
-                // §28.13 vs §28.11 / #889: the scope-end disposal kind depends on
-                // what the out value IS. Weak<T>.TryUpgrade(out using var h) binds
-                // a Shared<T> control-block HANDLE → bz_shared_release. Every other
-                // owned-OUT `out using var` (an owning-collection / channel Try*:
-                // TryPop/TryDequeue/TryPopFirst/TryPopLast/TryReceive) binds a moved-
-                // out OWNED CLASS ELEMENT → dispatch its destructor + reclaim the
-                // block via the object's own vtable (dynamicDispose). Using the
-                // sharedHandle path for a class element calls bz_shared_release on a
-                // raw object pointer, corrupting the heap and leaking the element.
-                // Discriminate by the RECEIVER builtin type name.
-                bool isUpgrade = false;
-                if (auto* maC = dynamic_cast<const ast::MemberAccessExpr*>(
-                        call.callee.get())) {
-                    if (maC->target) {
-                        if (const sema::TypeRef* rt =
-                                ctx_.exprType(*maC->target)) {
-                            isUpgrade = (builtinTypeName(rt) == "Weak");
-                        }
-                    }
-                }
                 if (!alreadyMapped) {
                     llvm::AllocaInst* outSlot = entryAlloca(ptrTy());
-                    // Zero-initialize: null → the Try* false path (no upgrade / no
-                    // element). emitDisposals' null-guard then skips the release.
+                    // Zero-initialize: null → the Try* false path (no element).
+                    // emitDisposals' null-guard then skips the release.
                     builder_.CreateStore(
                         llvm::ConstantPointerNull::get(ptrTy()), outSlot);
                     locals_[id2] = outSlot;
@@ -3858,8 +3847,8 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                     // fix #3981 (§22.3/§22.4/§28.9/§28.11/§28.13, v0.294): the
                     // `out using var` sibling of registerOutVarStringRelease's
                     // wiring — see that function's comment for the mechanism.
-                    // This arm's disposal (sharedHandle / dynamicDispose below)
-                    // can be deferred past a suspend the same way the string
+                    // This arm's disposal (dynamicDispose below) can be
+                    // deferred past a suspend the same way the string
                     // release can; without a frame field, `outSlot`'s
                     // per-activation alloca is reset before the deferred
                     // disposal reads it. Unconditionally safe: `outSlot` is
@@ -3876,17 +3865,12 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                     // the erased value as an object segfaults (bz_obj_is_string on
                     // a non-pointer). Register the class-element dispose only when
                     // the recipient's SUBSTITUTED type is a genuine class/
-                    // interface. The Weak.TryUpgrade Shared<T> handle path is
-                    // unaffected (Weak<T> is always a reference substitution).
+                    // interface.
                     const sema::TypeRef* recipTy =
                         (loc2 && loc2->declType) ? loc2->declType
                                                  : ctx_.exprType(*id2);
                     if (!disposeStack_.empty()) {
-                        if (isUpgrade) {
-                            Disposal disp{outSlot, nullptr};
-                            disp.sharedHandle = true;  // §28.13: Shared<T> handle
-                            disposeStack_.back().push_back(disp);
-                        } else if (outOwnedRecipientDisposes(recipTy)) {
+                        if (outOwnedRecipientDisposes(recipTy)) {
                             Disposal disp{outSlot, nullptr};
                             disp.dynamicDispose = true;  // §28.11: owned class elem
                             disposeStack_.back().push_back(disp);
@@ -4855,12 +4839,11 @@ void Emitter::ensureCtorOutVarSlots(const ast::NewExpr& ne,
         }
         // §22.4 (v0.235, #2430): `out using var x` at a CONSTRUCTOR call
         // site — the ctor analogue of ensureOutVarSlots' `out using var`
-        // CallExpr block above, restricted to its non-`isUpgrade` path: a
-        // constructor is never `Weak<T>.TryUpgrade` (that path exists only
-        // for a MEMBER-ACCESS callee on the builtin `Weak<T>` receiver,
-        // which a `new T(...)` call is not), so this block always takes the
-        // `dynamicDispose` (owned class-element) branch, never
-        // `sharedHandle`. Sema now registers the recipient (mirrors
+        // CallExpr block above. Since fix #7508 (spec §28.13, stdlib §2.16,
+        // v0.355) `Weak<T>.TryUpgrade` has no `out using var` parameter at
+        // all (it is the Try shape-(b) nullable RETURN), so this block
+        // always takes the `dynamicDispose` (owned class-element) branch.
+        // Sema now registers the recipient (mirrors
         // #2409's `out owned var` NewExpr fix, ExprTypecheck_Exprs.cpp) but,
         // exactly as the #2411 ICE for `out owned var`, codegen's
         // `buildOrderedArgs` needs a pre-created `locals_` slot for the

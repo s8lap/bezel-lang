@@ -16,6 +16,13 @@
 // `move`. The borrowing Try* (`out item`, no `owned`) is unchanged — it neither
 // reclaims nor double-frees.
 //
+// fix #7508 (spec §28.13, stdlib §2.16, v0.355): `Weak<T>.TryUpgrade` no
+// longer HAS an `out` parameter — it is the Try shape-(b) nullable RETURN
+// `TryUpgrade(): owned Shared<T>?` — so the `out using var` scope-end
+// disposal is no longer a Shared-handle case: the handle comes from the
+// call's RESULT and the `using var` bound to it is discharged by the
+// ordinary sharedHandle path.
+//
 // Value tests — runJit returns the raw int (kept in 0..255). Each program
 // reports a destructor counter (`Cell._n` / a `_log` digit fold) so a leak
 // (counter too high) and a double-free (counter negative / a wrong fold) are
@@ -162,17 +169,20 @@ BEZEL_TEST(out_owned_writeback_889, borrow_stack_class_trypop_no_disposal) {
         "end Main; end C;"), 7);
 }
 
-// Regression — Weak<T>.TryUpgrade(out using var h) still binds a Shared<T>
-// HANDLE released via bz_shared_release (the sharedHandle path is preserved for
-// a Weak receiver). The upgraded handle reads the underlying value (42) and the
-// last handle's disposal disposes the Cell exactly once.
+// Regression — the handle `Weak<T>.TryUpgrade()` produces is a Shared<T>
+// HANDLE released via bz_shared_release (the sharedHandle path). The upgraded
+// handle reads the underlying value (42) and the last handle's disposal
+// disposes the Cell exactly once.
+// fix #7508 (spec §28.13, stdlib §2.16, v0.355): the handle now comes from
+// the call's RESULT (`TryUpgrade(): owned Shared<T>?`, Try shape (b)) rather
+// than from an `out using var` parameter.
 BEZEL_TEST(out_owned_writeback_889, weak_tryupgrade_out_using_var_preserved) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
         "  do using var sh := new Shared<Cell>(new Cell()); "
         "    using var w := sh.Downgrade(); "
-        "    var ok := false; "
-        "    if w.TryUpgrade(out using var h) then ok := true; end; "
+        "    using var h := w.TryUpgrade(); "
+        "    var ok := h <> null; "
         "    if not ok then return 100; end; "
         "  end; return Cell._n; end Main; end C;"), 0);
 }

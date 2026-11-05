@@ -271,9 +271,19 @@ BEZEL_TEST(builtin_out_discard_5289, channel_tryreceive_discard) {
 }
 
 BEZEL_TEST(builtin_out_discard_5289, weak_tryupgrade_discard_releases_handle) {
-    // `out _` against `out using var s: Shared<T>`: the upgraded handle is an
-    // unbound owned temporary (§22.6, §28.3) and must be RELEASED, else the
-    // Cell outlives its last owner (count stays 1) or leaks under ASan.
+    // fix #7508 (spec §28.13, stdlib §2.16, v0.355): `Weak<T>.TryUpgrade` is
+    // the Try shape-(b) NULLABLE RETURN `TryUpgrade(): owned Shared<T>?` — it
+    // has NO `out` parameter any more, so the `out _` spelling this row used
+    // to pin is retired (stdlib §2.16 declares exactly one member beside
+    // `Dispose()`; the changelog's v0.222 ruling made the conversion a
+    // breaking change).
+    //
+    // The upgraded handle is still an OWNED value that must be RELEASED, else
+    // the Cell outlives its last owner (count stays 1) or leaks under ASan.
+    // The shape-(b) discharge spelling is §28.10's anonymous owning binding —
+    // `using var _ := w.TryUpgrade();` — §17.13's "the one `_` form that owns
+    // storage": the handle is released at SCOPE END (MEASURED: the Cell's
+    // count returns to 0).
     auto r = runAot(
         "module M; import System; "
         "class Cell public static _n: int := 0; "
@@ -282,14 +292,15 @@ BEZEL_TEST(builtin_out_discard_5289, weak_tryupgrade_discard_releases_handle) {
         "class C public static method Main(): int "
         "  do using var sh := new Shared<Cell>(new Cell()); "
         "    using var w := sh.Downgrade(); "
-        "    if w.TryUpgrade(out _) then Console.WriteLine(\"ok\"); "
+        "    using var up := w.TryUpgrade(); "
+        "    if up <> null then Console.WriteLine(\"ok\"); "
         "    else Console.WriteLine(\"no\"); end; "
-        "    var b := w.TryUpgrade(out _); Console.WriteLine(b); "
+        "    using var _ := w.TryUpgrade(); "
         "  end; "
         "  Console.WriteLine(Cell._n); return 0; end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "ok\nTrue\n0\n");
+    BEZEL_EXPECT_EQ(r.stdoutText, "ok\n0\n");
 }
 
 // ---- lambda body and async body -------------------------------------------

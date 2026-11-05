@@ -7,4 +7,4 @@
 
 module M; class Foo end Foo; class C public static method Test(owned w: Weak<Foo>) w.Bogus(); end Test; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: no member `Bogus` on `Weak<T>`; documented surface: TryUpgrade(out owned s: Shared<T>?), Dispose() (stdlib §2.16)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: no member `Bogus` on `Weak<T>`; documented surface: TryUpgrade(): owned Shared<T>?, Dispose() (stdlib §2.16)

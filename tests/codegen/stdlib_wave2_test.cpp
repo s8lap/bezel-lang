@@ -11,14 +11,17 @@
 //         neither had codegen or sema handlers.
 //         Spec ref: stdlib §5 "Grouping" / "Filtering", v0.134.
 //
-// #653 — Weak<T>.TryUpgrade(out owned s: Shared<T>?): bool wrote back the
-//         new strong handle when the call-site used "out using var" (inline
-//         form), but Shared<T>? methods (Clone/Get/Downgrade) silently returned
-//         nullptr when the receiver was any non-identifier expression (e.g. a
-//         PostfixBangExpr such as `nullable!`).  Root cause: IdentifierExpr
-//         guard in tryLowerBuiltinClassCall returned null before reaching the
-//         Shared/Weak dispatch.  Additionally, "out pre_declared_var" is
-//         ill-formed per spec §22.4 for out-owned parameters; sema must reject.
+// #653 — Weak<T>.TryUpgrade(): owned Shared<T>? wrote back the
+//         new strong handle (the Try shape-(b) nullable return stdlib §2.16
+//         declares; fix #7508 re-typed it from the shape-(a) `out owned`
+//         parameter), but Shared<T>? methods (Clone/Get/Downgrade) silently
+//         returned nullptr when the receiver was any non-identifier expression
+//         (e.g. a PostfixBangExpr such as `nullable!`).  Root cause:
+//         IdentifierExpr guard in tryLowerBuiltinClassCall returned null before
+//         reaching the Shared/Weak dispatch.  Additionally, a call with an
+//         argument is ill-formed: `TryUpgrade` takes no parameters (the
+//         `out` spelling is not a member of `Weak<T>` any more — fix #7508);
+//         sema must reject.
 //         Spec refs: spec §22.4, §28.13, stdlib §2.16, v0.134.
 //
 // All tests use the JIT harness (runJit/runJitChecked) and return int exit codes.
@@ -381,7 +384,8 @@ BEZEL_TEST(codegen_shared_weak_653, shared_downgrade_via_nullable_bang_receiver)
         "    var obj := new Obj(); obj.Val := 7; "
         "    using var h: Shared<Obj>? := new Shared<Obj>(move obj); "
         "    using var w := h!.Downgrade(); "
-        "    if w.TryUpgrade(out using var h2) then "
+        "    using var h2 := w.TryUpgrade(); "
+        "    if h2 <> null then "
         "      if h2.Get().Val = 7 then return 0; end; "
         "      return 1; "
         "    end; "
@@ -390,9 +394,12 @@ BEZEL_TEST(codegen_shared_weak_653, shared_downgrade_via_nullable_bang_receiver)
         "end C;"), 0);
 }
 
-// §28.13 / spec §22.4: TryUpgrade with "out using var" (inline form) works —
-// the new strong handle is written, GetVal reads through it correctly.
-BEZEL_TEST(codegen_shared_weak_653, tryupgrade_inline_out_using_var_works) {
+// §28.13 / stdlib §2.16: TryUpgrade's nullable RESULT works — the new strong
+// handle is the call's value, GetVal reads through it correctly.
+// fix #7508 (spec §28.13, stdlib §2.16, v0.355): the member is the Try
+// shape-(b) NULLABLE RETURN `TryUpgrade(): owned Shared<T>?`; the `out using
+// var` spelling is no longer a member of `Weak<T>`.
+BEZEL_TEST(codegen_shared_weak_653, tryupgrade_nullable_return_works) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "class Obj public Val: int := 0; end Obj; "
@@ -401,7 +408,8 @@ BEZEL_TEST(codegen_shared_weak_653, tryupgrade_inline_out_using_var_works) {
         "    var obj := new Obj(); obj.Val := 55; "
         "    using var h := new Shared<Obj>(move obj); "
         "    using var w := h.Downgrade(); "
-        "    if w.TryUpgrade(out using var h2) then "
+        "    using var h2 := w.TryUpgrade(); "
+        "    if h2 <> null then "
         "      if h2.Get().Val = 55 then return 0; end; "
         "      return 1; "
         "    end; "
@@ -410,14 +418,11 @@ BEZEL_TEST(codegen_shared_weak_653, tryupgrade_inline_out_using_var_works) {
         "end C;"), 0);
 }
 
-// spec §22.4 / §28.13: "out pre_declared_var" is ill-formed at call site for
-// an "out owned" parameter — sema must reject it with a diagnostic error.
-// TryUpgrade(out owned s: Shared<T>?): bool — calling with "out upgraded" where
-// "upgraded" is a pre-declared variable is not a valid call-site form.
-BEZEL_TEST(codegen_shared_weak_653, tryupgrade_out_predeclared_var_sema_error) {
-    // Using "out upgraded" (pre-declared variable) must be a sema error
-    // per spec §22.4: accepted forms are "out using var x" and "out owned var x"
-    // only. Plain "out var x" would also be invalid for out-owned parameters.
+// spec §28.13 / stdlib §2.16 (fix #7508): `TryUpgrade` takes NO parameters —
+// it is the Try shape-(b) nullable RETURN `TryUpgrade(): owned Shared<T>?` —
+// so a call with an argument (the retired `out` spelling) is ill-formed and
+// sema must reject it.
+BEZEL_TEST(codegen_shared_weak_653, tryupgrade_with_argument_sema_error) {
     BEZEL_EXPECT_TRUE(hasSemaError(
         "module M; "
         "class Obj public Val: int := 0; end Obj; "

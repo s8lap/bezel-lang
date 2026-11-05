@@ -26,10 +26,15 @@
 // have re-landed a red row. The §28.10 marked-adoption remedy is pinned too,
 // which the old spelling did not cover.
 //
+// fix #7508 (spec §28.13, stdlib §2.16, v0.355): `TryUpgrade` is the Try
+// shape-(b) NULLABLE RETURN `TryUpgrade(): owned Shared<T>?` — the stdlib's own
+// idiom ("using var s := w.TryUpgrade(); if s <> null then …"). The retired
+// `out using var` spelling is no longer a member of `Weak<T>`.
+//
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
 
-module M; class Foo end Foo; class C public static method Test(owned w: Weak<Foo>) var ok := w.TryUpgrade(out using var s); end Test; end C;
+module M; class Foo end Foo; class C public static method Test(owned w: Weak<Foo>) using var s := w.TryUpgrade(); end Test; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} owned parameter `w` is implicitly disposed at the end of the method
 // CHECK-SAME: (§28.3 must-use / auto-drop)

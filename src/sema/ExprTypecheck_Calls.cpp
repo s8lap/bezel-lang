@@ -19229,36 +19229,72 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // §28.13 / stdlib §2.16 (#603): Weak<T> instance methods.
                     if (rcn == "Weak") {
                         if (m == "TryUpgrade") {
-                            // TryUpgrade(out owned s: Shared<T>?): bool.
-                            // spec §22.4 / #653 + fix #3842 (§A.4, v0.289 L2):
-                            // the parameter is "out owned" — the only accepted
-                            // inline call-site forms are "out var x" (adopting,
-                            // v0.289 L2) and "out using var x". `out owned var x`
-                            // is RETIRED and now rejected at the parser.
-                            // Plain "out x" (pre-declared variable) is ill-formed
-                            // because it doesn't communicate an owned-discharge
-                            // obligation to the compiler. Emit a clear diagnostic.
+                            // TryUpgrade(): owned Shared<T>? — Try shape (b).
+                            //
+                            // fix #7508 (spec §28.13, stdlib §2.16, v0.355):
+                            // the declared member is the NULLABLE-RETURN
+                            // shape, not the `out`-parameter shape: stdlib
+                            // §2.16 declares "public method TryUpgrade():
+                            // owned Shared<T>?;" and spec §28.13 says the same
+                            // in its own words — "`TryUpgrade(): owned
+                            // Shared<T>?` atomically produces a new strong
+                            // handle if the value is still alive, and `null`
+                            // otherwise ... (Try shape (b), stdlib §1 — the
+                            // handle is a proper class type at every
+                            // instantiation, so null alone carries the signal;
+                            // `using var` + null test at the call site, the
+                            // `Mutex.TryAcquire` idiom)". The compiler
+                            // implemented shape (a) — an `out owned` parameter
+                            // plus a `bool` result — so the stdlib's own
+                            // idiom ("using var s := w.TryUpgrade(); if s <>
+                            // null then ... end;") did not type at all: the
+                            // call was `bool`, the `using var` was vacuous
+                            // (§28.9) and `s.Get()` did not resolve. The
+                            // stdlib's §1 table names `Weak<T>.TryUpgrade` in
+                            // the shape-(b) row explicitly ("a bool would
+                            // carry no information").
+                            //
+                            // The `out`-parameter spelling is therefore NOT a
+                            // member of `Weak<T>` any more: stdlib §2.16
+                            // declares exactly one member beside `Dispose()`,
+                            // and the `out` form is no surface at all.
                             if (!ce.args.empty()) {
-                                const auto& arg0 = ce.args[0];
-                                bool isOutUsingVar =
-                                    arg0.modifier == "out using var";
-                                bool isOutVar = arg0.modifier == "out var";
-                                bool isDiscard = arg0.isDiscard;
-                                if (!arg0.modifier.empty() &&
-                                    !isOutUsingVar && !isOutVar &&
-                                    !isDiscard) {
-                                    ctx_.diagnostics().report(
-                                        Severity::Error, ce.span.begin,
-                                        "TryUpgrade parameter is 'out owned': "
-                                        "accepted call-site forms are "
-                                        "'out var x' or 'out using var x' "
-                                        "(spec §22.4, v0.289 L2). "
-                                        "Plain 'out x' is not valid for an "
-                                        "'out owned' parameter — use "
-                                        "'out var x' instead.");
-                                }
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "`Weak<T>.TryUpgrade` takes no arguments — "
+                                    "its RESULT is the nullable handle "
+                                    "`owned Shared<T>?` (spec §28.13, stdlib "
+                                    "§2.16, v0.355); write "
+                                    "`using var s := w.TryUpgrade();` and test "
+                                    "`s <> null`");
                             }
-                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                            // The result type: `Shared<T>?` — the receiver's
+                            // element type argument under a "Shared" head,
+                            // NULLABLE (null is the shape-(b) failure signal).
+                            // The head is a synthetic astNode (the builtin
+                            // `Shared<T>` has no user TypeSymbol — the same
+                            // shape the `Downgrade` arm above builds for
+                            // `Weak<T>`).
+                            auto* sharedTy = ctx_.makeTypeRef();
+                            sharedTy->kind = TypeRef::Kind::Named;
+                            sharedTy->declaration = nullptr;
+                            sharedTy->nullable = true;
+                            static const ast::Type* kSharedNode =
+                                []() -> ast::Type* {
+                                    auto* qn = new ast::QualifiedName;
+                                    qn->parts.push_back("Shared");
+                                    auto* t  = new ast::Type;
+                                    t->kind  = ast::TypeKind::Named;
+                                    t->name.reset(qn);
+                                    return t;
+                                }();
+                            sharedTy->astNode = kSharedNode;
+                            if (recvTy && !recvTy->genericArgs.empty() &&
+                                recvTy->genericArgs[0])
+                                sharedTy->genericArgs.push_back(
+                                    const_cast<TypeRef*>(
+                                        recvTy->genericArgs[0]));
+                            ctx_.setExprType(&ce, sharedTy);
                         } else if (m != "Dispose") {
                             // §2.16 / #674: Weak<T> exposes only TryUpgrade()
                             // and Dispose().  Any other member is an error.
@@ -19267,7 +19303,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 Severity::Error, ce.span.begin,
                                 std::string("no member `") + std::string(m) +
                                 "` on `Weak<T>`; documented surface: "
-                                "TryUpgrade(out owned s: Shared<T>?), Dispose() "
+                                "TryUpgrade(): owned Shared<T>?, Dispose() "
                                 "(stdlib \xC2\xA7""2.16)");
                         }
                         // Dispose(): unit; no return type set.

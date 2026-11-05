@@ -4,7 +4,8 @@
 // Shared<T> wraps an owned class instance with an atomic reference count.
 // Clone() creates an additional strong handle (+1 strong).  Get() borrows the
 // inner value.  Downgrade() creates a weak handle (+1 weak, strong unchanged).
-// TryUpgrade() promotes a weak handle to a strong one (returns bool).
+// TryUpgrade() promotes a weak handle to a strong one (returns
+// `owned Shared<T>?` — null when the value is gone, stdlib §2.16 Try shape (b)).
 // The owned value is disposed exactly once when the last strong handle is
 // released.  The control block is freed when the last weak handle is released.
 //
@@ -248,6 +249,9 @@ BEZEL_TEST(codegen_shared_weak_603, spec_28_13_get_returns_readable_inner) {
 
 // §28.13: Downgrade() + TryUpgrade() succeeds while h is alive.
 // The new strong handle from TryUpgrade is valid and Get() works on it.
+// fix #7508 (spec §28.13, stdlib §2.16, v0.355): TryUpgrade is the Try
+// shape-(b) NULLABLE RETURN `TryUpgrade(): owned Shared<T>?` — the stdlib's
+// own idiom ("using var s := w.TryUpgrade(); if s <> null then …").
 BEZEL_TEST(codegen_shared_weak_603, spec_28_13_tryupgrade_succeeds_while_strong_alive) {
     std::string src = std::string(kCounterClass) +
         "class C "
@@ -256,7 +260,8 @@ BEZEL_TEST(codegen_shared_weak_603, spec_28_13_tryupgrade_succeeds_while_strong_
         "    obj.V := 7; "
         "    using var h := new Shared<Inner>(move obj); "
         "    using var w := h.Downgrade(); "
-        "    if w.TryUpgrade(out using var h2) then "
+        "    using var h2 := w.TryUpgrade(); "
+        "    if h2 <> null then "
         "      if h2.Get().V = 7 then return 0; end; "
         "      return 1; "
         "    end; "

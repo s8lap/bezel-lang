@@ -23572,11 +23572,13 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // No user TypeSymbol; recognised by type name "Weak". At scope end,
     // bz_weak_release decrements the weak count and frees the control block
     // when both strong and weak counts are 0.
-    // The `out using var` slot created by TryUpgrade also ends up here (its
-    // declared type is Weak<T> if the upgrade failed, but actually the SUCCESS
-    // path binds a Shared<T> handle — handled by sharedHandle above because
-    // TryUpgrade stores a Shared<T> into the out-slot and that slot's type is
-    // Shared<T> not Weak<T>).
+    // fix #7508 (spec §28.13, stdlib §2.16, v0.355): the `out using var`
+    // slot TryUpgrade used to create is GONE — `TryUpgrade` is the Try
+    // shape-(b) NULLABLE RETURN `TryUpgrade(): owned Shared<T>?`, so the
+    // handle is produced by the call's RESULT. A `using var` bound to that
+    // result is recognised by the sharedHandle arm ABOVE (the result's type
+    // head is "Shared", nullable or not), and its scope-end release is
+    // null-guarded — a null binding's disposal is a no-op (stdlib §2.16).
     {
         bool isWeak = false;
         auto isWeakTypeName = [](const sema::TypeRef* rt) {

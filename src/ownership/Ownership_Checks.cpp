@@ -17457,10 +17457,13 @@ bool MethodOwnership::builtinOutOwnedArg(const ast::Expr* callee,
     // and causes a spurious §28.3 auto-drop warning on pre-declared out recipients.
     // OwningDictionary<K,V>.TryPopValue(key, out owned value: V) — arg 1.
     if (cn == "OwningDictionary" && m == "TryPopValue") return argPos == 1;
-    // Weak<T>.TryUpgrade(out owned s: Shared<T>?) — arg 0 (stdlib §2.16). The
-    // accepted call-site form is `out using var s`, which declares a fresh
-    // local the dataflow does not track; recognised here for completeness.
-    if (cn == "Weak"        && m == "TryUpgrade")  return argPos == 0;
+    // Weak<T>.TryUpgrade has NO out parameter any more: fix #7508 (spec
+    // §28.13, stdlib §2.16, v0.355) re-typed it as the Try shape-(b)
+    // NULLABLE RETURN, `TryUpgrade(): owned Shared<T>?`, so the handle is
+    // produced by the call's RESULT and the caller's binding owns it. The
+    // old `out owned s: Shared<T>?` parameter (shape (a)) is not a member of
+    // `Weak<T>` any more and sema rejects it, so there is nothing to model
+    // here.
     // Channel<T>.TryReceive(out owned item: T?) — arg 0, but only when T is a
     // class/interface: for value-typed T and string the ownership modifiers
     // drop out (stdlib §6.9), so there is no owned-out transfer to model.

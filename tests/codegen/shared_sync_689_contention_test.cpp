@@ -356,7 +356,10 @@ BEZEL_TEST(shared_sync_689_contention,
 // ──────────────────────────────────────────────────────────────────────────────
 
 // §28.13 / #689: TryUpgrade fails after the last strong handle is released.
-// CAS loop must observe strong==0 and return false (not a partial increment).
+// CAS loop must observe strong==0 and return null (not a partial increment).
+// fix #7508 (spec §28.13, stdlib §2.16, v0.355): TryUpgrade is the Try
+// shape-(b) NULLABLE RETURN `TryUpgrade(): owned Shared<T>?` — "null" is the
+// failure signal.
 BEZEL_TEST(shared_sync_689_contention,
            tryupgrade_fails_after_last_strong_released_28_13_v0140) {
     std::string src =
@@ -376,7 +379,8 @@ BEZEL_TEST(shared_sync_689_contention,
         "      end do); "
         // At this point the strong handle (h) has gone out of scope;
         // strong == 0 → TryUpgrade must fail.
-        "    if w.TryUpgrade(out using var h2) then "
+        "    using var h2 := w.TryUpgrade(); "
+        "    if h2 <> null then "
         "      return 1; "   // must NOT reach: upgrade should fail
         "    end; "
         "    return Inner.disposed; "   // must be 1 (disposed on strong→0)
@@ -405,7 +409,8 @@ BEZEL_TEST(shared_sync_689_contention,
         "  public static method Main(): int "
         "    using var w := Factory.MakeWeak(); "
         // MakeWeak returned: h is gone, strong==0.
-        "    if w.TryUpgrade(out using var h2) then "
+        "    using var h2 := w.TryUpgrade(); "
+        "    if h2 <> null then "
         "      return 42; "  // must NOT reach: upgrade should fail
         "    end; "
         "    return Inner.disposed; "  // expect 1
@@ -433,7 +438,8 @@ BEZEL_TEST(shared_sync_689_contention,
         "    obj.V := 42; "
         "    using var h := new Shared<Inner>(move obj); "
         "    using var w := h.Downgrade(); "
-        "    if w.TryUpgrade(out using var h2) then "
+        "    using var h2 := w.TryUpgrade(); "
+        "    if h2 <> null then "
         "      return h2.Get().V; "  // expect 42
         "    end; "
         "    return -1; "

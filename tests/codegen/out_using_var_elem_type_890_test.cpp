@@ -10,7 +10,11 @@
 //   OwningLinkedList<T>.TryPopFirst → T  (arg 0)
 //   OwningLinkedList<T>.TryPopLast  → T  (arg 0)
 //   OwningDictionary<K,V>.TryPopValue → V (arg 1)
-//   Weak<T>.TryUpgrade            → Shared<T>  (unchanged — regression check)
+//   Weak<T>.TryUpgrade            → (no out parameter any more — fix #7508:
+//                                     the Try shape-(b) nullable RETURN
+//                                     `TryUpgrade(): owned Shared<T>?`,
+//                                     stdlib §2.16; the recipient is an
+//                                     ordinary local bound to the RESULT)
 //
 // Value tests — runJit returns the raw int (kept in 0..255).
 // Each test verifies a member read or method call on the `item` local.
@@ -169,12 +173,16 @@ BEZEL_TEST(out_using_var_elem_type_890, owned_dict_trypopvalue_field_read) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Regression: Weak<T>.TryUpgrade still derives Shared<T>.
-// §28.13, #603: s is Shared<Cell>; s.Get()._v == 66.
+// Regression: Weak<T>.TryUpgrade still yields a Shared<T> handle.
+// §28.13, #603: s is Shared<Cell>?; s.Get()._v == 66.
+// fix #7508 (spec §28.13, stdlib §2.16, v0.355): the handle now comes from
+// the RESULT (`TryUpgrade(): owned Shared<T>?`, Try shape (b)), not from an
+// `out using var` parameter — the `out` form is not a member of `Weak<T>`.
 // ──────────────────────────────────────────────────────────────────────────────
 
-// §28.13, #603 (regression): Weak<Cell>.TryUpgrade — out using var s is Shared<Cell>.
-// s.Get() returns a borrow of Cell; field read on the borrow works.
+// §28.13, #603 (regression): Weak<Cell>.TryUpgrade — the result is
+// `Shared<Cell>?`; s.Get() returns a borrow of Cell; field read on the borrow
+// works.
 BEZEL_TEST(out_using_var_elem_type_890, weak_tryupgrade_shared_regression) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
@@ -182,7 +190,8 @@ BEZEL_TEST(out_using_var_elem_type_890, weak_tryupgrade_shared_regression) {
         "  using var sh := new Shared<Cell>(move obj); "
         "  using var w := sh.Downgrade(); "
         "  var got := -1; "
-        "  if w.TryUpgrade(out using var s) then "
+        "  using var s := w.TryUpgrade(); "
+        "  if s <> null then "
         "    if s.Get()._v = 66 then got := 66; end; "
         "  end; "
         "  return got; "

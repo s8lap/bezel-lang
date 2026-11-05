@@ -24611,9 +24611,11 @@ private:
     // the normal-return edge. No-op for any other element type.
     void disposeDiscardedOwnedOut(llvm::Value* scratch,
                                   const sema::TypeRef* elem);
-    // Same for `Weak<T>.TryUpgrade(out using var s)` discarded: the upgraded
-    // Shared<T> handle written into the scratch slot is released (null-guarded).
-    void releaseDiscardedSharedOut(llvm::Value* scratch);
+    // fix #5289's `Weak<T>.TryUpgrade(out _)` form is GONE (fix #7508,
+    // spec §28.13, stdlib §2.16, v0.355): `TryUpgrade` is the Try shape-(b)
+    // NULLABLE RETURN `TryUpgrade(): owned Shared<T>?`, so there is no
+    // out-slot and no discarded handle to release. The helper that released
+    // it was removed with it.
 
     // #1955 / §28.3: null the caller's slot for a call ARGUMENT that transferred
     // a bare owned LOCAL / owned PARAMETER's ownership to an owned recipient at a
@@ -26152,7 +26154,7 @@ private:
     // `pos` is declared `out owned`, or one of the builtin owned-OUT collection
     // Try* methods (OwningStack.TryPop, OwningQueue.TryDequeue, OwningArray/
     // OwningLinkedList.TryPopFirst/TryPopLast, OwningSet.TryTake,
-    // OwningDictionary.TryPopValue, Weak.TryUpgrade, Channel<T>.TryReceive for
+    // OwningDictionary.TryPopValue, Channel<T>.TryReceive for
     // class/interface T)? Mirrors MethodOwnership::builtinOutOwnedArg /
     // markOutOwnedArgs (src/ownership/Ownership_Checks.cpp) so codegen recognizes
     // the SAME positions the ownership pass marks Owned. Consulted so a PRE-

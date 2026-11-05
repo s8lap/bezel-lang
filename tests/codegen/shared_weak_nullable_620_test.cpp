@@ -276,6 +276,9 @@ BEZEL_TEST(codegen_shared_weak_nullable_620, spec_28_13_weak_nullable_local_null
 }
 
 // §28.13 (#620): Weak<T>? neq-null check.
+// fix #7508 (spec §28.13, stdlib §2.16, v0.355): TryUpgrade is the Try
+// shape-(b) NULLABLE RETURN `TryUpgrade(): owned Shared<T>?` — the stdlib's
+// own idiom ("using var s := w.TryUpgrade(); if s <> null then …").
 BEZEL_TEST(codegen_shared_weak_nullable_620, spec_28_13_weak_nullable_local_nonnull) {
     std::string src = std::string(kInner) +
         "class C "
@@ -284,7 +287,8 @@ BEZEL_TEST(codegen_shared_weak_nullable_620, spec_28_13_weak_nullable_local_nonn
         "    obj.V := 7; "
         "    using var h := new Shared<Inner>(move obj); "
         "    using var w := h.Downgrade(); "
-        "    if w.TryUpgrade(out using var h2) then "
+        "    using var h2 := w.TryUpgrade(); "
+        "    if h2 <> null then "
         "      return h2.Get().V; "
         "    end; "
         "    return -1; "

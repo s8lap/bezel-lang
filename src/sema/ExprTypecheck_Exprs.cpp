@@ -14040,7 +14040,10 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // the receiver's generic element argument.
             //
             // Handled cases (all are builtins with no MethodDecl):
-            //   Weak<T>.TryUpgrade                           → Shared<T> (arg 0)
+            //   Weak<T>.TryUpgrade                           → (no out parameter any
+//                                                    more; fix #7508 — the
+//                                                    Try shape-(b) nullable
+//                                                    RETURN, stdlib §2.16)
             //   OwningStack<T>.TryPop                         → T         (arg 0)
             //   OwningQueue<T>.TryDequeue                     → T         (arg 0)
             //   OwningArray<T>.TryPopFirst/TryPopLast         → T         (arg 0)
@@ -14138,33 +14141,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                     const std::string_view mn =
                                         maCallee->member;
 
-                                    if (cn == "Weak" &&
-                                        mn == "TryUpgrade" &&
-                                        pos2 == 0 &&
-                                        !rt->genericArgs.empty() &&
-                                        rt->genericArgs[0]) {
-                                        // Weak<T>.TryUpgrade → Shared<T>
-                                        // Build a synthetic Shared<T> astNode
-                                        // (same lambda pattern as kWeakNode in
-                                        // ExprTypecheck_Calls.cpp ~L1762).
-                                        static const ast::Type* kSharedNode =
-                                            []() -> ast::Type* {
-                                                auto* qn = new ast::QualifiedName;
-                                                qn->parts.push_back("Shared");
-                                                auto* t  = new ast::Type;
-                                                t->kind  = ast::TypeKind::Named;
-                                                t->name.reset(qn);
-                                                return t;
-                                            }();
-                                        TypeRef* sharedTy = ctx_.makeTypeRef();
-                                        sharedTy->kind = TypeRef::Kind::Named;
-                                        sharedTy->declaration = nullptr;
-                                        sharedTy->astNode = kSharedNode;
-                                        sharedTy->genericArgs.push_back(
-                                            const_cast<TypeRef*>(rt->genericArgs[0]));
-                                        lsym->declType = sharedTy;
-
-                                    } else if (
+                                    // fix #7508 (spec §28.13, stdlib §2.16, v0.355):
+                                    // `Weak<T>.TryUpgrade` has NO `out using
+                                    // var` parameter any more — it is the Try
+                                    // shape-(b) NULLABLE RETURN
+                                    // `TryUpgrade(): owned Shared<T>?`, so the
+                                    // handle is produced by the call's RESULT
+                                    // (whose type the call's own typing
+                                    // supplies) and the recipient is an ordinary
+                                    // local bound to it. There is no out-recipient
+                                    // element type to derive here.
+                                    if (
                                         // per §28.11, #890: owning-collection
                                         // Try* methods — element type from
                                         // receiver's generic argument.

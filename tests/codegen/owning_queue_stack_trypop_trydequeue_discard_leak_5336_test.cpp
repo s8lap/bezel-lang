@@ -9,7 +9,11 @@
 //
 // THE FIX. After writing the element into the out slot, if `call.args[0].isDiscard`
 // is true, call `disposeDiscardedOwnedOut` exactly as TryPopFirst/TryPopLast
-// (§22.6 fix #5289) and TryPopValue/TryReceive/TryUpgrade do.
+// (§22.6 fix #5289) and TryPopValue/TryReceive do.
+// fix #7508 (spec §28.13, stdlib §2.16, v0.355): `Weak<T>.TryUpgrade` is not
+// in that list any more — it has no `out` parameter at all (it is the Try
+// shape-(b) nullable RETURN `TryUpgrade(): owned Shared<T>?`), so it has no
+// out slot to discard.
 //
 // Each test case uses a class R with a static-counting destructor so the
 // LeakSanitizer leg verifies exactly-one disposal. runAotChecked also guards

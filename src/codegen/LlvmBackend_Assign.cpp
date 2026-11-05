@@ -16349,22 +16349,6 @@ llvm::Type* Emitter::tryOutNullableSlotTy(const sema::TypeRef* elem) {
     return t ? t : ptrTy();
 }
 
-void Emitter::releaseDiscardedSharedOut(llvm::Value* scratch) {
-    llvm::Value* h = builder_.CreateLoad(ptrTy(), scratch, "outdisc.sh");
-    llvm::Value* isNull = builder_.CreateICmpEQ(
-        h, llvm::ConstantPointerNull::get(ptrTy()));
-    auto* relBB = llvm::BasicBlock::Create(llvm_, "outdisc.shrel", currentFn_);
-    auto* contBB = llvm::BasicBlock::Create(llvm_, "outdisc.shcont", currentFn_);
-    builder_.CreateCondBr(isNull, contBB, relBB);
-    builder_.SetInsertPoint(relBB);
-    builder_.CreateCall(declareC("bz_shared_release",
-                                 llvm::Type::getVoidTy(llvm_), {ptrTy()}),
-                        {h});
-    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), scratch);
-    builder_.CreateBr(contBB);
-    builder_.SetInsertPoint(contBB);
-}
-
 void Emitter::disposeDiscardedOwnedOut(llvm::Value* scratch,
                                        const sema::TypeRef* elem) {
     if (!scratch || !elem || elem->kind != sema::TypeRef::Kind::Named ||

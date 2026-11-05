@@ -14093,28 +14093,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 // Dispose() is handled in the explicit-Dispose block; fall through.
             }
             if (btn653 == "Weak") {
-                if (mname == "TryUpgrade" && call.args.size() == 1 &&
-                    (call.args[0].value || call.args[0].isDiscard)) {
-                    // fix #2938 / §22.3: see TryGetValue above.
-                    // fix #5289 (§22.6): `out _` gets a scratch handle slot.
-                    llvm::Type* slotTy = nullptr;
-                    std::vector<AccessorRefArg> outArgs;
-                    llvm::Value* outAddr = resolveBuiltinOutArg(
-                        call.args[0], ptrTy(), slotTy, outArgs);
-                    if (!outAddr) {
-                        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
-                        return builder_.getFalse();
-                    }
+                // fix #7508 (spec §28.13, stdlib §2.16, v0.355):
+                // `TryUpgrade(): owned Shared<T>?` — Try shape (b), the
+                // NULLABLE-RETURN shape stdlib §2.16 declares. The runtime's
+                // `bz_weak_try_upgrade(weak, &out)` already writes the NEW
+                // STRONG HANDLE into `*out` (null when the value is gone) and
+                // returns 1/0; the slot's null IS the shape-(b) null signal, so
+                // the lowering stores into a scratch slot and LOADS it back
+                // as the call's nullable result. The old `out`-parameter shape
+                // (a) is no longer a member of `Weak<T>` and sema rejects it.
+                if (mname == "TryUpgrade" && call.args.empty()) {
+                    llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), slot);
                     auto* fn = declareC("bz_weak_try_upgrade", i32(),
                                         {ptrTy(), ptrTy()});
-                    llvm::Value* r = builder_.CreateCall(fn, {handle, outAddr},
-                                                         "weak.tryupgrade");
-                    // fix #2938 / §22.3: flush any bracket on the normal-return edge.
-                    emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
-                    if (call.args[0].isDiscard)  // fix #5289 (§28.3)
-                        releaseDiscardedSharedOut(outAddr);
-                    return builder_.CreateICmpNE(r, builder_.getInt32(0),
-                                                 "weak.upgraded");
+                    builder_.CreateCall(fn, {handle, slot}, "weak.tryupgrade");
+                    return builder_.CreateLoad(ptrTy(), slot, "weak.upgraded");
                 }
                 // Dispose() is handled in the explicit-Dispose block; fall through.
             }
@@ -20449,7 +20444,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // Receiver is identified by builtinTypeName "Shared" or "Weak".
     // Shared<T> methods: Clone() → bz_shared_clone; Get() → bz_shared_get;
     //   Downgrade() → bz_shared_downgrade; Dispose() → bz_shared_release.
-    // Weak<T> methods: TryUpgrade(out using var h) → bz_weak_try_upgrade;
+    // Weak<T> methods: TryUpgrade() → bz_weak_try_upgrade;
     //   Dispose() → bz_weak_release.
     // NOTE: explicit Dispose() on these types is intercepted in lowerCall's
     // Dispose() block (around the CTS Dispose arm) — see below.
@@ -20503,37 +20498,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     llvm::Value* handle = lowerExpr(*ma2->target);
                     if (!handle) return nullptr;
                     const auto& mname = ma2->member;
-                    // TryUpgrade(out using var s: Shared<T>): bool
-                    // bz_weak_try_upgrade(weak_handle, &out_slot) → int (1=success).
-                    // The out-slot was pre-created in ensureOutVarSlots.
-                    if (mname == "TryUpgrade" && call.args.size() == 1 &&
-                        (call.args[0].value || call.args[0].isDiscard)) {
-                        // fix #2938 / §22.3: a property or indexer slot target
-                        // is admitted by §22.3 and resolves through the §22.3
-                        // copy-in/copy-out bracket; `lvalueAddr` alone declines,
-                        // so the builtin call bailed (#2434) and the write-back
-                        // silently dropped. `outArgs` carries the bracket record
-                        // for the normal-return write-back flush below.
-                        llvm::Type* slotTy = nullptr;
-                        std::vector<AccessorRefArg> outArgs;
-                        llvm::Value* outAddr = resolveBuiltinOutArg(
-                            call.args[0], ptrTy(), slotTy, outArgs);
-                        if (!outAddr) {
-                            emitAccessorRefArgWriteBacks(outArgs,
-                                                         /*emit=*/false);
-                            return builder_.getFalse();
-                        }
+                    // TryUpgrade(): owned Shared<T>? — Try shape (b).
+                    // bz_weak_try_upgrade(weak_handle, &out_slot) → int (1=success);
+                    // the slot receives the NEW STRONG HANDLE, or null when the
+                    // value is gone — the slot's null IS the shape-(b) null
+                    // signal, so the lowering LOADS it back as the result.
+                    // fix #7508 (spec §28.13, stdlib §2.16, v0.355): the
+                    // `out`-parameter shape (a) is no longer a member of
+                    // `Weak<T>`; sema rejects it.
+                    if (mname == "TryUpgrade" && call.args.empty()) {
+                        llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                        builder_.CreateStore(
+                            llvm::ConstantPointerNull::get(ptrTy()), slot);
                         auto* fn = declareC("bz_weak_try_upgrade", i32(),
                                             {ptrTy(), ptrTy()});
-                        llvm::Value* r = builder_.CreateCall(fn, {handle, outAddr},
-                                                             "weak.tryupgrade");
-                        // fix #2938 / §22.3: flush any bracket on the
-                        // normal-return edge.
-                        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
-                        if (call.args[0].isDiscard)  // fix #5289 (§28.3)
-                            releaseDiscardedSharedOut(outAddr);
-                        return builder_.CreateICmpNE(r, builder_.getInt32(0),
-                                                     "weak.upgraded");
+                        builder_.CreateCall(fn, {handle, slot},
+                                            "weak.tryupgrade");
+                        return builder_.CreateLoad(ptrTy(), slot, "weak.upgraded");
                     }
                     // Dispose() is handled in the explicit-Dispose block; fall through.
                 }
