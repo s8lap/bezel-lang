@@ -17392,6 +17392,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // one.
                         else if (m == "GetEnumerator") { /* handled by the
                             #2546 gate at line 5117; do not overwrite */ }
+                        // fix #8305 (stdlib §4.17, v0.355): `Add(key: K, value:
+                        // V)` and `Clear()` declare NO result. Without this arm
+                        // they fell into the V-return catch-all below, so
+                        // `sd.Add(k, v);` was typed as `V` and drew the §21.9
+                        // unused-result warning the `Dictionary` twin (which
+                        // leaves both untyped) never draws. Leave the call
+                        // untyped, as the Dictionary block does.
+                        else if (m == "Add" || m == "Clear") { /* unit: no type */ }
                         // fix #3511 / stdlib §4.17 / §5 (v0.285): a §5 operator
                         // the shared Dictionary/SortedDictionary entry block above
                         // already typed (`sd.Take(1)` → lazy
