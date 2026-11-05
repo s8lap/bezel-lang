@@ -186,7 +186,7 @@ BEZEL_TEST(sema_math_ref_constrained_typeparam_6295,
 }
 
 // The OTHER TWO selectors: `Min` and `Clamp` declare the same
-// `where T: IComparable<T>` bound (stdlib §2.2) and are formed by the same check.
+// `where T: IComparable<T>` bound (the interface is stdlib §2.8) and are formed by the same check.
 BEZEL_TEST(sema_math_ref_constrained_typeparam_6295,
            constrained_min_and_clamp_references_run_27_6) {
     auto r = runAotChecked(
