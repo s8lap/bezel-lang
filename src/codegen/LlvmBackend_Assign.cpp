@@ -3156,6 +3156,9 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         obj = tmp;
     }
     currentThis_ = obj;
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): the inlined expression-bodied INDEXER getter is lowered into
+    // the CALLER's function; record its owner as `this`'s type for the body.
+    ThisReceiverScope thisRecvScope(*this, ps ? ps->parent : nullptr);
     locals_.clear();
     paramSlots_.clear();
     // Bind each indexer parameter to its pre-lowered argument value.
@@ -3253,6 +3256,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // the method-call path (LlvmBackend_Calls2.cpp ~11000) and in the
     // function-value call path (#4078's own other half).
     if (!diverged_) releaseIndexArgClosureProducers(ix, ps, argVals);
+    thisRecvScope.close();  // fix-forward #8127
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
@@ -4053,6 +4057,9 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     // resolution now (spilling here, post-resolution, would have re-copied
     // an already-correct address and defeated the fix).
     currentThis_ = obj;
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): the inlined INDEXER setter is lowered into
+    // the CALLER's function; record its owner as `this`'s type for the body.
+    ThisReceiverScope thisRecvScope(*this, ps ? ps->parent : nullptr);
     locals_.clear();
     paramSlots_.clear();
     // Indexer params (pre-lowered above).
@@ -4148,6 +4155,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     // in the function-value call path (#4078's own other half), and in the
     // GETTER twin's expression-bodied and block-form paths above.
     if (!diverged_) releaseIndexArgClosureProducers(ix, ps, argVals);
+    thisRecvScope.close();  // fix-forward #8127
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
@@ -5069,6 +5077,9 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
         auto savedParams = paramSlots_;
         auto savedSubstPair = setupReceiverGenericSubst(ix->target.get(), ps->parent);
         currentThis_ = obj;
+        // fix-forward #8127 (§8.5 / §18.5, v0.355): the inlined expression-bodied INDEXER getter (compound assignment) is lowered into
+        // the CALLER's function; record its owner as `this`'s type for the body.
+        ThisReceiverScope thisRecvScope(*this, ps ? ps->parent : nullptr);
         locals_.clear();
         paramSlots_.clear();
         for (std::size_t k = 0; k < ps->indexerParams.size() &&
@@ -5077,6 +5088,7 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
             paramSlots_[ps->indexerParams[k]] = idxSlots[k];
         }
         cur = lowerExpr(*getterExpr);
+        thisRecvScope.close();  // fix-forward #8127
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);
         paramSlots_ = std::move(savedParams);
@@ -5110,6 +5122,9 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
     auto savedParams = paramSlots_;
     SavedReceiverSubst savedSubstPair;
     currentThis_ = obj;
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): the inlined INDEXER setter (compound assignment) is lowered into
+    // the CALLER's function; record its owner as `this`'s type for the body.
+    ThisReceiverScope thisRecvScope(*this, ps ? ps->parent : nullptr);
     locals_.clear();
     paramSlots_.clear();
     // fix #5341 (§14.1 / §23.4, v0.315): install the receiver's generic
@@ -5201,6 +5216,7 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
     // producer +1 is discharged once, after the setter — the last consumer.
     releaseIndexArgStringProducers(*ix, ps, recvDecl, idxArgVals,
                                    /*accessorResultEscapes=*/false);
+    thisRecvScope.close();  // fix-forward #8127
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
@@ -6559,6 +6575,11 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
     currentFn_          = fn;
     builder_.SetInsertPoint(entryBB);
     currentThis_        = &*fn->args().begin();
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): this getter is emitted LAZILY
+    // from inside its first caller's body, so the caller's receiver state is
+    // still live; record the property's OWNER as `this`'s type for the body.
+    const sema::PropertySymbol* recvPs = ps ? ps : psKey;
+    ThisReceiverScope thisRecvScope(*this, recvPs ? recvPs->parent : nullptr);
     locals_.clear();
     paramSlots_.clear();
     refParams_.clear();
@@ -6637,6 +6658,7 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
         emitImplicitReturn(fn);
 
     // --- Restore state ---
+    thisRecvScope.close();  // fix-forward #8127
     currentFn_          = savedFn;
     currentThis_        = savedThis;
     locals_             = std::move(savedLocals);
@@ -7582,6 +7604,10 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     auto argIt = fn->args().begin();
     currentThis_ = &*argIt;
     ++argIt;
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): emitted LAZILY from inside the
+    // first caller's body — record the indexer's OWNER as `this`'s type (see
+    // ensurePropertyBlockGetter).
+    ThisReceiverScope thisRecvScope(*this, ps ? ps->parent : nullptr);
     for (std::size_t k = 0; k < ps->indexerParams.size() &&
          argIt != fn->args().end(); ++k, ++argIt) {
         llvm::Argument& a = *argIt;
@@ -7604,6 +7630,7 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
         emitImplicitReturn(fn);
 
     // --- Restore state ---
+    thisRecvScope.close();  // fix-forward #8127
     currentFn_          = savedFn;
     currentThis_        = savedThis;
     locals_             = std::move(savedLocals);
@@ -8828,6 +8855,9 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     retainAssignedStringParams(setter->stmts, ps->indexerParams, pd);
     llvm::Value* savedThis = currentThis_;
     currentThis_ = recv;
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): the inlined PROPERTY setter is lowered into
+    // the CALLER's function; record its owner as `this`'s type for the body.
+    ThisReceiverScope thisRecvScope(*this, ps ? ps->parent : nullptr);
     // §21.7 (#739): accessor-end target — a `return;` ends the setter, not the
     // enclosing method (the setter body is inlined here).
     llvm::BasicBlock* savedAccEnd = inlinedAccessorEnd_;
@@ -8857,6 +8887,7 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     inlinedAccessorEnd_ = savedAccEnd;
     if (!term) builder_.CreateBr(accEndBB);
     builder_.SetInsertPoint(accEndBB);
+    thisRecvScope.close();  // fix-forward #8127
     currentThis_ = savedThis;
     // fix #4614(b) (§22.16, v0.306): the setter NORMAL-EXIT boundary.
     // `accEndBB` is the join every non-throwing path through the inlined
@@ -14971,6 +15002,10 @@ llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
     unwindTarget_      = nullptr; propagateBB_ = nullptr;
     currentCaughtExc_  = nullptr; unwindScopeDepth_ = 0;
     diverged_          = false;
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): record the property's OWNER as
+    // `this`'s type for the thunk body (it is emitted lazily, from inside a
+    // caller whose receiver state is still live).
+    ThisReceiverScope thisRecvScope(*this, ps ? ps->parent : nullptr);
 
     llvm::Value* val = lowerExpr(*getterExpr);
     // fix #2761 (§8.6 "Boxing" / §23.2, v0.240): the THUNK face of an
@@ -14987,6 +15022,7 @@ llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
     builder_.CreateRet(val);
 
     // Restore state.
+    thisRecvScope.close();  // fix-forward #8127
     currentFn_         = savedFn;
     if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
     currentThis_       = savedThis;

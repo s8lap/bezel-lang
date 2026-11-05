@@ -802,7 +802,21 @@ const sema::TypeRef* Emitter::thisReceiverTypeRef(const ast::Expr* e) {
     // user TypeSymbol: an EXTENSION block's target type (`extension int`).
     const sema::TypeRef* direct = nullptr;
     const sema::TypeSymbol* ts = nullptr;
-    if (currentFn_) {
+    // 0. an ACCESSOR (or inlined constructor) body — fix-forward #8127. Such
+    //    a body is lowered into the CALLER's function (an inlined getter,
+    //    setter or constructor) or emitted lazily from inside the caller's
+    //    body (a block getter), so every lookup below would answer with the
+    //    CALLER's type. The frame recorded when the body was opened is the
+    //    certain answer; when its owner is unknown, answer null rather than
+    //    guess (the hole then keeps its pre-recovery lowering).
+    bool fromFrame = false;
+    if (!thisReceiverFrames_.empty() &&
+        thisReceiverFrames_.back().fn == currentFn_) {
+        ts = thisReceiverFrames_.back().type;
+        if (!ts) return nullptr;
+        fromFrame = true;
+    }
+    if (currentFn_ && !fromFrame) {
         // 1. an ordinary method body (and an extension method body: the
         //    extension has no parent TypeSymbol, so its TARGET type is the
         //    receiver's type — #1237's rule, mirrored from indexReceiverDecl).
@@ -872,7 +886,8 @@ const sema::TypeRef* Emitter::thisReceiverTypeRef(const ast::Expr* e) {
     //    LAST, because `currentMethod_` is a SCOPED member: a body emitted
     //    lazily from inside another member's body would see the outer
     //    method's symbol, and every `currentFn_`-keyed lookup above (1-5) is
-    //    the precise one for such a nested emission.
+    //    the precise one for such a nested emission. (Accessor bodies, the
+    //    measured case of exactly that hazard, are answered by step 0.)
     if (!ts && !direct && currentMethod_ && currentMethod_->parent)
         ts = currentMethod_->parent;
     if (direct) return direct;

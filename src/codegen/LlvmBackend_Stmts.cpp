@@ -11758,6 +11758,10 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                 // Save/restore currentThis_.
                 llvm::Value* savedThis = currentThis_;
                 currentThis_ = enumObj2;
+                // fix-forward #8127 (§8.5 / §18.5, v0.355): the expression
+                // getter below is inlined into THIS function; record its
+                // owner as `this`'s type for the body.
+                ThisReceiverScope thisRecvScope(*this, currentPropSym->parent);
                 // Try expression getter (get => expr).
                 if (const ast::Expr* getterExpr = computedGetterOf(currentPropSym)) {
                     curVal = lowerExpr(*getterExpr);
@@ -11789,6 +11793,7 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                         emitPendingCheck();
                     }
                 }
+                thisRecvScope.close();  // fix-forward #8127
                 currentThis_ = savedThis;
             } else {
                 // Imported enumerator class — call the cross-module

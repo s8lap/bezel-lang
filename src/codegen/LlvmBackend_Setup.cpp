@@ -16080,6 +16080,10 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
         }
     } restoreBareTFlag{this, savedInlinedSetterBareTFieldReleaseSafeForCtor};
     currentThis_ = obj;
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): the constructor body is
+    // inlined into the CALLER's function; record the constructor's owner as
+    // `this`'s type for the body (popped when this function returns).
+    ThisReceiverScope thisRecvScope(*this, cs ? cs->parent : nullptr);
     // fix #4056 / §9.4 / CG29 / §22.3 (v0.294): a record ctor body's `this` is
     // the receiver POINTER (CG29), but callees expecting the record STRUCT
     // need it loaded. `currentReceiverRecordType`'s methodFns_ lookup misses

@@ -368,3 +368,545 @@ BEZEL_TEST(interp_this_class_tostring_8127, loop_100_rendered_string_does_not_le
     for (int i = 0; i < 100; ++i) expected += "C!\n";
     BEZEL_EXPECT_EQ(r.stdoutText, expected);
 }
+
+// ── fix-forward: `this` inside an ACCESSOR body lowered from ANOTHER type ──
+//
+// Review r39-rev-8127 (REJECT of c5aae377): an expression-bodied getter is
+// INLINED into its caller's function, a block getter is emitted LAZILY from
+// inside its first caller's body, and a setter / indexer accessor is inlined
+// the same way -- so the receiver-type recovery answered with the CALLER's
+// type: wrong text at exit 0, a type-confused virtual call, and SIGSEGVs in
+// programs the pre-#8127 base ran. The owner is now recorded when the
+// accessor body is opened. §8.5 (v0.355): the hole renders the RECEIVER's
+// ToString -- here B's §8.5 class default, its qualified name.
+
+// s12: class B's expression getter `=> $"prop {this}"` read from class A's method. The getter is INLINED
+// into A.Go, so the c5aae377 recovery answered with A's type (`prop M.A`); `this` is B's object.
+BEZEL_TEST(interp_this_class_tostring_8127, class_getter_read_from_another_class_renders_owner) {
+    auto r = runAot(
+        "module M;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public method Go(): int\n"
+        "    var b := new B();\n"
+        "    Console.WriteLine(b.Name);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public P: string := \"pp\";\n"
+        "  public property Name: string\n"
+        "    get => $\"prop {this}\";\n"
+        "  end Name;\n"
+        "end B;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "prop M.B\n");
+}
+
+// s01: the s12 shape where the CALLER (A) overrides ToString. Base and c5aae377 both SIGSEGV.
+BEZEL_TEST(interp_this_class_tostring_8127, class_getter_read_from_overriding_class_renders_owner) {
+    auto r = runAot(
+        "module M;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var b := new B();\n"
+        "    Console.WriteLine(b.Name);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public P: string := \"pp\";\n"
+        "  public property Name: string\n"
+        "    get => $\"prop {this}\";\n"
+        "  end Name;\n"
+        "end B;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "prop M.B\n");
+}
+
+// s13: an expression-bodied INDEXER getter of B read from A (c5aae377: `idx M.A`).
+BEZEL_TEST(interp_this_class_tostring_8127, indexer_getter_read_from_another_class_renders_owner) {
+    auto r = runAot(
+        "module M;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public method Go(): int\n"
+        "    var b := new B();\n"
+        "    Console.WriteLine(b[0]);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public P: string := \"pp\";\n"
+        "  public property [i: int]: string\n"
+        "    get => $\"idx {this}\";\n"
+        "  end;\n"
+        "end B;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "idx M.B\n");
+}
+
+// s15: B's getter read from the static `Program.Main` (c5aae377: `prop M.Program`).
+BEZEL_TEST(interp_this_class_tostring_8127, class_getter_read_from_static_main_renders_owner) {
+    auto r = runAot(
+        "module M;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public property Name: string\n"
+        "    get => $\"prop {this}\";\n"
+        "  end Name;\n"
+        "end B;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    var b := new B();\n"
+        "    Console.WriteLine(b.Name);\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "prop M.B\n");
+}
+
+// s23: B declares an unrelated `virtual Boom()`; A overrides ToString. c5aae377 dispatched A's ToString slot
+// on B's object and printed `prop BOOM` -- a type-confused virtual call. B has no override, so §8.5's
+// class default (B's qualified name) is the rendering.
+BEZEL_TEST(interp_this_class_tostring_8127, getter_this_is_not_dispatched_through_the_callers_tostring) {
+    auto r = runAot(
+        "module M;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public virtual method Boom(): string => \"BOOM\";\n"
+        "  public property Name: string => $\"prop {this}\";\n"
+        "end B;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var b := new B();\n"
+        "    Console.WriteLine(b.Name);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "prop M.B\n");
+}
+
+// s20: a CHOICE property `=> $"d {this}"` read from a class method whose class overrides ToString.
+// Base ran (`d `); c5aae377 SIGSEGVed (the class arm on a choice value). §8.5: a value-like auto-hashable
+// choice renders case-shaped, head unqualified.
+BEZEL_TEST(interp_this_class_tostring_8127, choice_getter_read_from_overriding_class_renders_the_case) {
+    auto r = runAot(
+        "module M;\n"
+        "public choice S\n"
+        "  K(v: int),\n"
+        "  Z;\n"
+        "  public property Desc: string => $\"d {this}\";\n"
+        "end S;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var s := S.K(3);\n"
+        "    Console.WriteLine(s.Desc);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "d S.K(v: 3)\n");
+}
+
+// s24: the s20 shape without the caller's override (c5aae377: `d M.A`).
+BEZEL_TEST(interp_this_class_tostring_8127, choice_getter_read_from_class_renders_the_case) {
+    auto r = runAot(
+        "module M;\n"
+        "public choice S\n"
+        "  K(v: int),\n"
+        "  Z;\n"
+        "  public property Desc: string => $\"d {this}\";\n"
+        "end S;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public method Go(): int\n"
+        "    var s := S.K(3);\n"
+        "    Console.WriteLine(s.Desc);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "d S.K(v: 3)\n");
+}
+
+// s26: B's getter read from a RECORD method. Base ran (`prop `); c5aae377 SIGSEGVed (the record arm on a
+// class pointer).
+BEZEL_TEST(interp_this_class_tostring_8127, class_getter_read_from_record_method_renders_owner) {
+    auto r = runAot(
+        "module M;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public property Name: string => $\"prop {this}\";\n"
+        "end B;\n"
+        "public record R(X: int, Y: string)\n"
+        "  public method Go(): int\n"
+        "    var b := new B();\n"
+        "    Console.WriteLine(b.Name);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end R;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    var r := new R(1, \"a\");\n"
+        "    return r.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "prop M.B\n");
+}
+
+// s27: B's getter read from an ENUM method (c5aae377: `prop M.E`).
+BEZEL_TEST(interp_this_class_tostring_8127, class_getter_read_from_enum_method_renders_owner) {
+    auto r = runAot(
+        "module M;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public property Name: string => $\"prop {this}\";\n"
+        "end B;\n"
+        "public enum E\n"
+        "  X;\n"
+        "  public method Go(): int\n"
+        "    var b := new B();\n"
+        "    Console.WriteLine(b.Name);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end E;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    return E.X.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "prop M.B\n");
+}
+
+// the BLOCK-bodied getter twin: a memoised function emitted lazily from inside A.Go.
+BEZEL_TEST(interp_this_class_tostring_8127, block_getter_read_from_another_class_renders_owner) {
+    auto r = runAot(
+        "module M;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var b := new B();\n"
+        "    Console.WriteLine(b.Name);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public property Name: string\n"
+        "    get => do\n"
+        "      return $\"blk {this}\";\n"
+        "    end;\n"
+        "  end Name;\n"
+        "end B;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "blk M.B\n");
+}
+
+// the SETTER twin: B's block setter is inlined into A.Go with `this` = B's object.
+BEZEL_TEST(interp_this_class_tostring_8127, inlined_setter_from_another_class_renders_owner) {
+    auto r = runAot(
+        "module M;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var b := new B();\n"
+        "    b.Val := 7;\n"
+        "    Console.WriteLine(b.N);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public property Val: int\n"
+        "    get => N;\n"
+        "    set => do\n"
+        "      Console.WriteLine($\"set {this}\");\n"
+        "      N := value;\n"
+        "    end;\n"
+        "  end Val;\n"
+        "end B;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "set M.B\n7\n");
+}
+
+// nested inlines: B's getter reads C's getter; each `this` is its own owner, and A's own `this`
+// after the inlines is A again (A overrides ToString).
+BEZEL_TEST(interp_this_class_tostring_8127, nested_inlined_getters_each_render_their_own_owner) {
+    auto r = runAot(
+        "module M;\n"
+        "public class C\n"
+        "  public K: int := 9;\n"
+        "  public property Tag: string => $\"c {this}\";\n"
+        "end C;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public owned Kid: C := new C();\n"
+        "  public property Name: string => $\"b {this} / {Kid.Tag} / {this}\";\n"
+        "end B;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var b := new B();\n"
+        "    Console.WriteLine(b.Name);\n"
+        "    Console.WriteLine($\"a {this}\");\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "b M.B / c M.C / M.B\na A!\n");
+}
+
+// enum getter read from a class method: §8.5 (v0.355) renders an enum by its qualified name; the
+// caller's frame previously stood in for `this` (base and c5aae377 printed `d 0`).
+BEZEL_TEST(interp_this_class_tostring_8127, enum_getter_read_from_class_renders_qualified_name) {
+    auto r = runAot(
+        "module M;\n"
+        "public enum E\n"
+        "  X, Y;\n"
+        "  public property Desc: string => $\"d {this}\";\n"
+        "end E;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    Console.WriteLine(E.X.Desc);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "d M.E\n");
+}
+
+// positional record getter read from a class method: §8.5 (v0.355) field listing; c5aae377 SIGSEGV'd.
+BEZEL_TEST(interp_this_class_tostring_8127, record_getter_read_from_class_renders_fields) {
+    auto r = runAot(
+        "module M;\n"
+        "public record R(X: int, Y: string)\n"
+        "  public property Desc: string => $\"d {this}\";\n"
+        "end R;\n"
+        "public class A\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var r := new R(1, \"a\");\n"
+        "    Console.WriteLine(r.Desc);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "d R(X: 1, Y: a)\n");
+}
+
+// a getter taken as a function value (property thunk) and called from another class.
+BEZEL_TEST(interp_this_class_tostring_8127, getter_bound_as_function_value_renders_owner) {
+    auto r = runAot(
+        "module M;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var b := new B();\n"
+        "    var f: () -> string := b.Name;\n"
+        "    Console.WriteLine(f());\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public property Name: string => $\"fv {this}\";\n"
+        "end B;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "fv M.B\n");
+}
+
+// a block-bodied indexer getter read from another class's method.
+BEZEL_TEST(interp_this_class_tostring_8127, block_indexer_getter_from_another_class_renders_owner) {
+    auto r = runAot(
+        "module M;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var b := new B();\n"
+        "    Console.WriteLine(b[3]);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public property [i: int]: string\n"
+        "    get => do\n"
+        "      return $\"bix {i} {this}\";\n"
+        "    end;\n"
+        "  end;\n"
+        "end B;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "bix 3 M.B\n");
+}
+
+// `=> this.ToString()` read from another class: dispatches on B, not on the caller A.
+BEZEL_TEST(interp_this_class_tostring_8127, getter_explicit_tostring_call_from_another_class_renders_owner) {
+    auto r = runAot(
+        "module M;\n"
+        "public class A\n"
+        "  public Q: int := 1;\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var b := new B();\n"
+        "    Console.WriteLine(b.Name);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public property Name: string => this.ToString();\n"
+        "end B;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "M.B\n");
+}
+
+// choice getter `=> this.ToString()` read from a class: c5aae377 SIGSEGV'd. The rendered text is a
+// PRE-EXISTING gap (base prints nothing too; see review r14), so this row pins only that the
+// program runs to completion; it does not pin the text.
+BEZEL_TEST(interp_this_class_tostring_8127, choice_getter_explicit_tostring_from_class_does_not_crash) {
+    auto r = runAot(
+        "module M;\n"
+        "public choice S\n"
+        "  K(v: int),\n"
+        "  Z;\n"
+        "  public property Desc: string => this.ToString();\n"
+        "end S;\n"
+        "public class A\n"
+        "  public override method ToString(): string => \"A!\";\n"
+        "  public method Go(): int\n"
+        "    var s := S.K(3);\n"
+        "    Console.WriteLine(s.Desc);\n"
+        "    return 0;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    return a.Go();\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}

@@ -2897,6 +2897,30 @@ llvm::StructType* Emitter::choiceStruct(const sema::TypeSymbol* t) {
 // struct by value (§9.4, §22.3).
 const sema::TypeSymbol* Emitter::currentReceiverRecordType() {
     if (!currentThis_) return nullptr;
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): inside an ACCESSOR body
+    // lowered out of its own type's context (an inlined getter / setter, a
+    // lazily-emitted block getter — see `thisReceiverFrames_`), every lookup
+    // below describes the CALLER, so a class's getter read from a record
+    // method loaded the class pointer as the caller's record struct, and a
+    // choice's getter read from a class method left the choice `this` an
+    // unloaded pointer. The frame recorded when the body was opened answers
+    // instead. A frame whose owner is unknown keeps the pre-frame answer; a
+    // GENERIC owner is trusted only when the receiver state agrees with it,
+    // because its layout needs the owner's substitution to be the live one.
+    if (!thisReceiverFrames_.empty() &&
+        thisReceiverFrames_.back().fn == currentFn_ &&
+        thisReceiverFrames_.back().type) {
+        const sema::TypeSymbol* ft = thisReceiverFrames_.back().type;
+        if (ft->kind != ast::TypeDeclKind::Record &&
+            ft->kind != ast::TypeDeclKind::Choice)
+            return nullptr;
+        if (ft->genericParams.empty()) return ft;
+        return currentReceiverRecordTypeFromState() == ft ? ft : nullptr;
+    }
+    return currentReceiverRecordTypeFromState();
+}
+
+const sema::TypeSymbol* Emitter::currentReceiverRecordTypeFromState() {
     if (currentFn_) {
         for (const auto& [ms, fn] : methodFns_)
             if (fn == currentFn_ && ms->parent &&
@@ -8703,7 +8727,12 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
                 (ps->parent && ps->parent->kind == ast::TypeDeclKind::Choice)
                     ? ps->parent
                     : nullptr;
+            // fix-forward #8127 (§8.5 / §18.5, v0.355): the thunk is emitted
+            // from inside its first caller's body; record the property's
+            // OWNER as `this`'s type while its getter expression is lowered.
+            ThisReceiverScope thisRecvScope(*this, ps->parent);
             result = lowerExpr(*getter);
+            thisRecvScope.close();
             // fix #2761 (§8.6 "Boxing" / §27.6, v0.240): the PROPERTY-AS-
             // FUNCTION-VALUE face of the same expression getter. Its `ret` is
             // typed from `pd->type` a few lines above, so a value-typed body

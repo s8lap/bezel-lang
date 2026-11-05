@@ -7977,6 +7977,55 @@ private:
     // the enclosing type cannot be recovered.
     const sema::TypeRef* thisReceiverTypeRef(const ast::Expr* e);
 
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): the receiver TYPE of an
+    // ACCESSOR (or inlined constructor) body, recorded at the moment that
+    // body is opened, keyed by the function it is lowered INTO.
+    //
+    // WHY. An accessor body is lowered out of its own type's context: an
+    // expression-bodied getter, an inlined setter / indexer accessor and an
+    // inlined constructor are lowered INTO THE CALLER'S FUNCTION with
+    // `currentThis_` swapped to the receiver object, and a block getter is a
+    // memoised function emitted LAZILY from inside the first caller's body.
+    // In both cases every other piece of receiver state (`methodFns_` keyed
+    // by `currentFn_`, `currentMethod_`, `currentEnumMethod_`,
+    // `currentReceiverRecordType()`) still describes the CALLER, so
+    // `thisReceiverTypeRef` answered with the caller's type — class `B`'s
+    // `property Name => $"{this}"` read from class `A` rendered `B`'s object
+    // with `A`'s ToString (a type-confused virtual call) or crashed.
+    //
+    // A frame applies only while `currentFn_` is the function it was pushed
+    // in, and only when it is the INNERMOST frame: a nested body (a lambda,
+    // a block getter) emitted from inside the accessor is a different
+    // function, so it never sees the frame. A null `type` (the owner is not
+    // known — an extension property has no parent TypeSymbol) makes
+    // `thisReceiverTypeRef` answer null, i.e. the pre-recovery behaviour,
+    // rather than fall through to the caller's state.
+    struct ThisReceiverFrame {
+        const llvm::Function* fn;
+        const sema::TypeSymbol* type;
+    };
+    std::vector<ThisReceiverFrame> thisReceiverFrames_;
+    // RAII push for `thisReceiverFrames_`. `close()` pops early (at the point
+    // the caller's `currentThis_` is restored); the destructor pops otherwise.
+    struct ThisReceiverScope {
+        ThisReceiverScope(Emitter& e, const sema::TypeSymbol* ts)
+            : e_(e), depth_(e.thisReceiverFrames_.size()) {
+            e_.thisReceiverFrames_.push_back({e_.currentFn_, ts});
+        }
+        void close() {
+            if (closed_) return;
+            closed_ = true;
+            if (e_.thisReceiverFrames_.size() > depth_)
+                e_.thisReceiverFrames_.resize(depth_);
+        }
+        ~ThisReceiverScope() { close(); }
+        ThisReceiverScope(const ThisReceiverScope&) = delete;
+        ThisReceiverScope& operator=(const ThisReceiverScope&) = delete;
+        Emitter& e_;
+        std::size_t depth_;
+        bool closed_ = false;
+    };
+
     // fix #2832 / #2833 (§12.3 / §23.4, v0.240): the receiver TypeSymbol an
     // INDEXER ACCESS `ix` resolves its indexer against.
     //   * `this[i]` / an ordinary typed receiver → indexReceiverDecl.
@@ -8293,14 +8342,22 @@ private:
     // an early `return nullptr` — pops the chain. Deliberately NOT a
     // NestedBodyScope: the inline stays in the CALLER's function (no
     // function boundary is crossed), and this guard owns only the chain.
+    //
+    // fix-forward #8127 (§8.5 / §18.5, v0.355): it ALSO records the getter's
+    // owner as the receiver type of the inlined body (`thisReceiverFrames_`),
+    // because the inline runs in the CALLER's function, where every other
+    // receiver lookup answers with the caller's type.
     struct ComputedGetterInlineScope {
         ComputedGetterInlineScope(Emitter& e, sema::PropertySymbol* ps)
-            : e_(e) { e_.computedGetterInlining_.push_back(ps); }
+            : e_(e), recv_(e, ps ? ps->parent : nullptr) {
+            e_.computedGetterInlining_.push_back(ps);
+        }
         ~ComputedGetterInlineScope() { e_.computedGetterInlining_.pop_back(); }
         ComputedGetterInlineScope(const ComputedGetterInlineScope&) = delete;
         ComputedGetterInlineScope& operator=(const ComputedGetterInlineScope&) =
             delete;
         Emitter& e_;
+        ThisReceiverScope recv_;
     };
 
     // fix #5319: lower a self/mutual read of an expression-bodied property as
@@ -8831,6 +8888,9 @@ private:
     // in methodFns_, then fall back to currentSpecMethodSymbol_ for a
     // specialized generic body that is not registered there.
     const sema::TypeSymbol* currentReceiverRecordType();
+    // fix-forward #8127: the receiver-STATE half of currentReceiverRecordType
+    // (everything but the accessor-body frame), shared by both answers.
+    const sema::TypeSymbol* currentReceiverRecordTypeFromState();
     // fix #6721 (§9.4, v0.340): the receiver type a lambda's `this` capture
     // COPIES — a record, or a choice that is not owning-classified (§35.4),
     // read per instantiation under the active substitution (§3.6 rule 2).
