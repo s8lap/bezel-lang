@@ -3801,6 +3801,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             isRangeToIEnumerableCoercion(ctx_.exprType(*rs->value),
                                          currentLambdaReturnSemaTy_))
             v = boxForTarget(v, currentLambdaReturnSemaTy_, rs->value.get());
+        // fix #8289 (§27.3, §5.1, §29.2, v0.355): the block-lambda twin of
+        // the expression-body wrap in lowerLambda: `return arr;` at an
+        // `IEnumerable<T>` return slot yields the enumerator, not the raw
+        // array. Non-pointer values and declines pass through.
+        if (!returnReprTypeNode() && rs->value && v &&
+            v->getType()->isPointerTy() && currentLambdaReturnSemaTy_ &&
+            !isRangeToIEnumerableCoercion(ctx_.exprType(*rs->value),
+                                          currentLambdaReturnSemaTy_))
+            v = wrapAsIEnumerableForTarget(
+                v, currentLambdaReturnSemaTy_, rs->value.get(),
+                /*ownLazyPipeline=*/true,
+                /*outWrapMade=*/nullptr,
+                /*srcOwnedByCallee=*/
+                returnSourceIsCalleeOwnedCollection(rs->value.get()));
         // §29.2 / §4.3 (#1310): a value returned as `IEnumerable<T>` must be a
         // vtable-backed enumerator, not a raw bz_array_t* / class instance — the
         // caller's for-in and its scope-end iterEnumDispose both dispatch through
@@ -4252,11 +4266,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // #2688 introduced for the same reason — so the two forms now agree,
         // which is the invariant #2688 established.
         //
-        // ⚠ This is the ONLY arm of the four that gets the lambda fallback.
-        // Neither lambda body form ever calls `boxForTarget` or
-        // `wrapAsIEnumerableForTarget` (zero occurrences on the expression
-        // path), so adding those here would BREAK the agreement rather than
-        // restore it. And the two +1-mint arms are untouched: they key on
+        // ⚠ This is the ONLY arm of the four that gets the nullable-value
+        // lambda fallback. (Since #6998 / #8289 both lambda body forms DO call
+        // `boxForTarget` / `wrapAsIEnumerableForTarget` for an IEnumerable<T>
+        // return slot, in lowerLambda and in the lambda arms above, so the
+        // two body forms still agree.) And the two +1-mint arms are untouched: they key on
         // `currentReturnTypeNode_`, and the lambda mints already have their own
         // arms above keyed on `!currentReturnTypeNode_ && lamRet`.
         //

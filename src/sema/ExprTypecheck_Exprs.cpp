@@ -16354,8 +16354,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // miscompiled. Apply the SAME predicate the `return` statement uses
         // (checkAssignable, which also carries §5.1 constant narrowing) to
         // every value-return path. Scoped to a primitive return slot
-        // (numeric, `bool`, `char`, `string`, `Object`, nullable or not): a
-        // class / record / type-parameter slot may still be an unsubstituted
+        // (numeric, `bool`, `char`, `string`, `Object`, nullable or not) or a
+        // Named slot with a resolved declaration (class / record / enum /
+        // interface, fix #8168 narrow, cbe49e4f; an `IEnumerable<T>` slot is
+        // one — its Array<T> body converts per §5.1 and codegen wraps it,
+        // #8289): a bare type-parameter slot may still be an unsubstituted
         // callee type parameter here, and a unit slot admits §27.3's
         // discarded-result expression body. An overload-set target
         // (`lamTargetAmbiguous`) is the candidate resolution picks, not

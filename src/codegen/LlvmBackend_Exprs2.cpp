@@ -1616,6 +1616,22 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         retSemaTy = expectedRetSema;
         retTy = lowerTypeRef(retSemaTy);
     }
+    // fix #8289 (§27.3, §5.1, §29.2, v0.355): the same for an UNASCRIBED lambda
+    // whose body is an `Array<T>` / `Set<T>` / `Stack<T>` / `Queue<T>` / lazy
+    // pipeline at an `IEnumerable<T>`-family return slot. The body-derived
+    // type is a different head over the same `ptr`, so the wrap below (which
+    // keys on the TARGET head) would decline and hand the raw collection to a
+    // for-in. The target's slot is authoritative; the body is converted to it.
+    if (!lam.retType && retSemaTy && expectedRetSema &&
+        retSemaTy->kind == sema::TypeRef::Kind::Named &&
+        expectedRetSema->kind == sema::TypeRef::Kind::Named &&
+        !expectedRetSema->declaration && !expectedRetSema->nullable &&
+        !retSemaTy->nullable && retTy->isPointerTy() &&
+        common::isSyncIterFormatEnumerableHead(expectedRetSema->headName()) &&
+        retSemaTy->headName() != expectedRetSema->headName() &&
+        lowerTypeRef(expectedRetSema)->isPointerTy()) {
+        retSemaTy = expectedRetSema;
+    }
     // Also try to resolve via genericSubst_ when the sema return type is
     // an unresolved named generic param (e.g. C in Curried<A,B,C>).
     if (retTy == i32() && lam.exprBody) {
@@ -4190,6 +4206,22 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 if (retSemaTy && isRangeToIEnumerableCoercion(
                                      ctx_.exprType(*lam.exprBody), retSemaTy))
                     v = boxForTarget(v, retSemaTy, lam.exprBody.get());
+                // fix #8289 (§27.3, §5.1, §29.2, v0.355): an Array<T> /
+                // Set / Stack / Queue / lazy-pipeline / user-class body at an
+                // `IEnumerable<T>` return slot becomes the vtable-backed
+                // enumerator, exactly as a method's arrow body does
+                // (emitMethodBody). Raw, the caller's for-in read the array
+                // header as a vtable (SIGSEGV). A decline returns `v` as is.
+                if (retSemaTy && v->getType()->isPointerTy() &&
+                    !isRangeToIEnumerableCoercion(
+                        ctx_.exprType(*lam.exprBody), retSemaTy))
+                    v = wrapAsIEnumerableForTarget(
+                        v, retSemaTy, lam.exprBody.get(),
+                        /*ownLazyPipeline=*/true,
+                        /*outWrapMade=*/nullptr,
+                        /*srcOwnedByCallee=*/
+                        returnSourceIsCalleeOwnedCollection(
+                            lam.exprBody.get()));
                 if (v->getType() != retTy)
                     v = coerceExprValueToSlot(
                         v, retTy, lam.exprBody.get(),
