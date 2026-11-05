@@ -37244,16 +37244,27 @@ struct ClosureEscapeWalker {
     // all (MEASURED, review of eb91cd7a: heap-use-after-free on each, freed
     // by the scope-end `bz_closure_release` the name-keyed relaxation armed).
     // The walker therefore asks what the call RESOLVED TO: sema's
-    // `resolveExtensionMember` stamps the bound extension `MethodSymbol` on
-    // the callee member-access node (`ctx.exprSymbol`), and such a symbol is
-    // an extension member exactly when its `extensionDecl` is set (§26 /
-    // #433, the same test codegen's `isExtensionMethod` makes when it lowers
-    // the call). `Object`'s own universal members bind NO `MethodSymbol`
-    // (their bodies are runtime intrinsics, #2781). So the receiver is
-    // relaxed only when BOTH hold: the member is one §8.1 declares on
-    // `Object`, AND sema did not bind the access to an extension member. The
-    // name alone is NOT the decider; it only names the §8.1 surface the
-    // runtime-provided bodies implement.
+    // `resolveExtensionMember` stamps the bound extension member's symbol on
+    // the callee member-access node (`ctx.exprSymbol`), whereas `Object`'s
+    // own universal members bind NO symbol at all (their bodies are runtime
+    // intrinsics, #2781). So the receiver is relaxed only when BOTH hold:
+    // the member is one §8.1 declares on `Object`, AND the callee node
+    // carries no resolved symbol. The name alone is NOT the decider; it only
+    // names the §8.1 surface the runtime-provided bodies implement.
+    //
+    // WHY "NO SYMBOL AT ALL", NOT "NOT AN EXTENSION METHOD". The previous
+    // fix-forward tested for a `MethodSymbol` whose `extensionDecl` is set.
+    // That misses an extension PROPERTY: §26.3 (v0.355) admits "computed
+    // read-only properties" in an extension block, and a function-typed one
+    // that reuses an `Object` member's name — `extension Object public
+    // property ToString: (Array<Object>) -> int => lambda(xs) => Keep.Take(xs,
+    // this);`, called as `g.ToString(xs)` — is stamped as a `PropertySymbol`,
+    // which that test did not recognise, so the receiver was relaxed and the
+    // lambda's alias of `this` outlived the cell (MEASURED, review of
+    // 6f5448ff: heap-use-after-free, freed by `bz_closure_release`; a
+    // `GetHashCode`-named property was a partial early free). ANY resolved
+    // member symbol — method or property, local or imported — means user
+    // code is reached, so any symbol keeps the conservative escape.
     //
     // BEFORE this, the walker's `MemberAccessExpr` arm forced `safeRead=false`
     // on every receiver, on the stated premise that "Member access / indexing
@@ -37280,26 +37291,27 @@ struct ClosureEscapeWalker {
                name == "GetHashCode" || name == "GetType";
     }
 
-    // Did sema bind this callee member access to an EXTENSION member (§26.5
-    // rule 2)? True exactly when the node's resolved symbol is a
-    // `MethodSymbol` declared in an `extension` block (`extensionDecl` set,
-    // §26 / #433). `Object`'s own universal members leave the node
-    // symbol-less, so they answer false.
-    bool calleeBindsExtensionMember(const ast::Expr& calleeNode) const {
-        auto* ms = dynamic_cast<const sema::MethodSymbol*>(
-            ctx.exprSymbol(calleeNode));
-        return ms != nullptr && ms->extensionDecl != nullptr;
+    // Did sema bind this callee member access to a DECLARED member — an
+    // extension method or an extension property (§26.5 rule 2), local or
+    // imported? True exactly when the node carries a resolved symbol.
+    // `Object`'s own universal members leave the node symbol-less (#2781),
+    // so they answer false. Deliberately NOT narrowed to a `MethodSymbol`
+    // with `extensionDecl`: an extension PROPERTY is a `PropertySymbol`
+    // (see the comment block above), and on a function-typed receiver no
+    // symbol of any kind can be `Object`'s own.
+    bool calleeBindsDeclaredMember(const ast::Expr& calleeNode) const {
+        return ctx.exprSymbol(calleeNode) != nullptr;
     }
 
     // The receiver of `calleeNode` (a callee-position member access naming
     // `member`) is a BORROW for the call's duration iff the call reaches
-    // `Object`'s OWN member: a §8.1 name that sema did NOT bind to an
-    // extension member. See the comment block above for why the name alone
-    // does not decide (#8051).
+    // `Object`'s OWN member: a §8.1 name that sema bound to NO declared
+    // member. See the comment block above for why the name alone does not
+    // decide (#8051), and why any symbol at all keeps the escape.
     bool calleeReachesObjectOwnMember(const ast::Expr& calleeNode,
                                       std::string_view member) const {
         return isObjectDeclaredInstanceMember(member) &&
-               !calleeBindsExtensionMember(calleeNode);
+               !calleeBindsDeclaredMember(calleeNode);
     }
 
     void exprCallee(const ast::Expr* callee) {

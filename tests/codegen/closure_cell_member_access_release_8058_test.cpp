@@ -221,6 +221,33 @@ void expectRejectedOrNoClosureUseAfterFree(const JitResult& r) {
     BEZEL_EXPECT_FALSE(bezel::test::diagnosticMessageContains(r, "attempting free on address"));
 }
 
+// fix-forward of #8058 (§26.5 rule 1 / §8.1, v0.355): the oracle for a
+// program that §26.5 rule 1 REJECTS — an `extension Object` member that
+// reuses an `Object` member's name ("extension blocks are **never consulted**
+// for that name on that receiver") — but that the compiler still ACCEPTS on
+// a function-typed receiver today (the #8051 family), and that then RUNS
+// CLEANLY on the base tree. Two outcomes are admitted: a genuine
+// compile-time rejection citing rule 1 (§26.5, or §8.1's arity diagnostic
+// the user-type receivers already get) or the store ban (§26.7) / the
+// set-erasing receiver (§28.3); OR, while the program is still accepted,
+// the full control oracle — it ran, printed `out`, and NO AddressSanitizer
+// report (the use-after-free the name-keyed and method-only relaxations
+// introduced). Stronger than `expectRejectedOrNoClosureUseAfterFree` above
+// on purpose: these programs do not hit the #7247 crash, so a crash here
+// would be THIS fix's, and the row must not absorb it.
+void expectRule1RejectionOrNoMemoryError(const JitResult& r,
+                                         const std::string& out) {
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    if (bezel::test::failedAtCompileTimeWithRealLocation(r)) {
+        BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, "§26.5") ||
+                          bezel::test::diagnosticMessageContains(r, "§8.1") ||
+                          bezel::test::diagnosticMessageContains(r, "§26.7") ||
+                          bezel::test::diagnosticMessageContains(r, "§28.3"));
+        return;
+    }
+    expectNoMemoryError(r, out);
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -992,6 +1019,13 @@ end P;
 // heap-use-after-free`, freed by `bz_closure_release`. On the base tree
 // 8845ad4e and on this fix: "100", no AddressSanitizer report.
 //
+// THESE PROGRAMS ARE ILLEGAL under §26.5 rule 1 (and the first two under
+// §26.7's "extensions cannot store `this`"); the compiler does not enforce
+// either on a function-typed receiver yet. The oracle is therefore
+// `expectRule1RejectionOrNoMemoryError`: a rule-1 rejection is accepted, and
+// until one exists the row pins exact output "100" and no AddressSanitizer
+// report — never an admission.
+//
 // Lenient harness (LeakSanitizer OFF): the escaped cells have no releaser —
 // the conservative escape's PRE-EXISTING leak (MEASURED on base: 97–99 × 64
 // B), a separate defect from the use-after-free these rows pin. The final
@@ -1001,7 +1035,7 @@ end P;
 // ===========================================================================
 BEZEL_TEST(closure_cell_member_access_release_8058,
            a_same_named_extension_to_string_storing_this_keeps_the_closure_cell_alive) {
-    expectNoMemoryError(runAotCheckedLenient(R"BZL(
+    expectRule1RejectionOrNoMemoryError(runAotCheckedLenient(R"BZL(
 module M;
 extension Object
   public method ToString(xs: Array<Object>): string
@@ -1035,7 +1069,7 @@ end P;
 
 BEZEL_TEST(closure_cell_member_access_release_8058,
            a_same_named_extension_equals_storing_this_keeps_the_closure_cell_alive) {
-    expectNoMemoryError(runAotCheckedLenient(R"BZL(
+    expectRule1RejectionOrNoMemoryError(runAotCheckedLenient(R"BZL(
 module M;
 extension Object
   public method Equals(xs: Array<Object>, k: int): bool
@@ -1069,7 +1103,7 @@ end P;
 
 BEZEL_TEST(closure_cell_member_access_release_8058,
            a_same_named_extension_get_hash_code_returning_this_keeps_the_closure_cell_alive) {
-    expectNoMemoryError(runAotCheckedLenient(R"BZL(
+    expectRule1RejectionOrNoMemoryError(runAotCheckedLenient(R"BZL(
 module M;
 extension Object
   public method GetHashCode(tag: string): Object => this;
@@ -1086,6 +1120,200 @@ class P
       var o := P.Make();
       if o.GetHashCode() = o.GetHashCode() then n := n + 1; end;
       i := i + 1;
+    end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                        "100\n");
+}
+
+// ===========================================================================
+// SAME-NAMED EXTENSION PROPERTY — the third spelling. §26.3 (v0.355) admits
+// "computed read-only properties" in an extension block, so an `extension
+// Object` PROPERTY of function type that reuses an `Object` member's name
+// (`public property ToString: (Array<Object>) -> int => lambda(xs) =>
+// Keep.Take(xs, this);`) is a member too, and `g.ToString(xs)` on a
+// function-typed receiver binds it (§26.5 rule 1 is not enforced there, as
+// above). Sema stamps a PropertySymbol, not a MethodSymbol with
+// `extensionDecl`, so the previous fix-forward (6f5448ff) — which asked only
+// "is this an extension METHOD?" — still relaxed the receiver, and the
+// lambda's alias of `this` (stored by `Keep.Take`) outlived the cell.
+//
+// MEASURED at 6f5448ff (`scripts/agent_check.sh --probe --asan`, 100x):
+// ToString / GetType: `ERROR: AddressSanitizer: heap-use-after-free`, freed
+// by `bz_closure_release`; GetHashCode: 92 cells fewer leaked than base,
+// i.e. freed under a live alias. On base 8845ad4e and on this fix: "100",
+// no AddressSanitizer report. The walker now relaxes only a callee node
+// that carries NO resolved symbol at all.
+//
+// Same oracle as the method rows (`expectRule1RejectionOrNoMemoryError`):
+// a rule-1 rejection is accepted; until one exists, exact output and no
+// ASan report. Lenient harness: the escaped cells and the per-call lambda
+// cells leak on every arm (MEASURED on base: 292 allocations), the
+// conservative escape's pre-existing leak.
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           a_same_named_extension_property_to_string_storing_this_keeps_the_closure_cell_alive) {
+    expectRule1RejectionOrNoMemoryError(runAotCheckedLenient(R"BZL(
+module M;
+class Keep
+  public static method Take(xs: Array<Object>, o: Object): int
+    xs.Add(o);
+    return 0;
+  end Take;
+end Keep;
+extension Object
+  public property ToString: (Array<Object>) -> int => lambda(xs: Array<Object>) => Keep.Take(xs, this);
+end;
+class P
+  public static method Run(xs: Array<Object>): int
+    var g: (int)->int := lambda(x: int) => x + 1;
+    return g.ToString(xs);
+  end Run;
+  public static method Main(): int
+    var xs := new Array<Object>();
+    var i: int := 0;
+    while i < 100 do
+      _ := P.Run(xs);
+      i := i + 1;
+    end;
+    var n: int := 0;
+    for var o in xs do
+      if o.GetHashCode() = o.GetHashCode() then n := n + 1; end;
+    end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                                        "100\n");
+}
+
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           a_same_named_extension_property_get_type_storing_this_keeps_the_closure_cell_alive) {
+    expectRule1RejectionOrNoMemoryError(runAotCheckedLenient(R"BZL(
+module M;
+class Keep
+  public static method Take(xs: Array<Object>, o: Object): int
+    xs.Add(o);
+    return 0;
+  end Take;
+end Keep;
+extension Object
+  public property GetType: (Array<Object>) -> int => lambda(xs: Array<Object>) => Keep.Take(xs, this);
+end;
+class P
+  public static method Run(xs: Array<Object>): int
+    var g: (int)->int := lambda(x: int) => x + 1;
+    return g.GetType(xs);
+  end Run;
+  public static method Main(): int
+    var xs := new Array<Object>();
+    var i: int := 0;
+    while i < 100 do
+      _ := P.Run(xs);
+      i := i + 1;
+    end;
+    var n: int := 0;
+    for var o in xs do
+      if o.GetHashCode() = o.GetHashCode() then n := n + 1; end;
+    end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                                        "100\n");
+}
+
+// The `GetHashCode`-named property hides `Object.GetHashCode()` on EVERY
+// `Object`-typed receiver in the module (rule 1 is unenforced for a property
+// even there — a pre-existing sema gap the review recorded), so the final
+// read cannot be a direct `o.GetHashCode()`. MEASURED on this fix for the
+// other candidates: `o.Equals(o)` is a pointer comparison that reads nothing
+// (the review's x13 printed 100 on 6f5448ff although 92 cells were freed
+// under the alias); `o.ToString()` on this view is the pre-existing
+// #7247-family crash; `o.GetType()` is unimplemented (#487); the §12.7
+// type test `o is (int) -> int` reads nothing freed either (and is `false`
+// for the view an `extension Object` body's `this` stores — a separate
+// observation, reported with this fix). The read is therefore
+// `Object.GetHashCode()` reached through a GENERIC body, `Keep.H<Object>(o)`
+// with `method H<T>(x: T): int => x.GetHashCode()`, where the hiding
+// property is not in the lookup: on 6f5448ff that read is `ERROR:
+// AddressSanitizer: heap-use-after-free` (freed by `bz_closure_release`,
+// MEASURED via `--probe --asan`); on this fix "100", no ASan report.
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           a_same_named_extension_property_get_hash_code_storing_this_keeps_the_closure_cell_alive) {
+    expectRule1RejectionOrNoMemoryError(runAotCheckedLenient(R"BZL(
+module M;
+class Keep
+  public static method Take(xs: Array<Object>, o: Object): int
+    xs.Add(o);
+    return 0;
+  end Take;
+  public static method H<T>(x: T): int => x.GetHashCode();
+end Keep;
+extension Object
+  public property GetHashCode: (Array<Object>) -> int => lambda(xs: Array<Object>) => Keep.Take(xs, this);
+end;
+class P
+  public static method Run(xs: Array<Object>): int
+    var g: (int)->int := lambda(x: int) => x + 1;
+    return g.GetHashCode(xs);
+  end Run;
+  public static method Main(): int
+    var xs := new Array<Object>();
+    var i: int := 0;
+    while i < 100 do
+      _ := P.Run(xs);
+      i := i + 1;
+    end;
+    var n: int := 0;
+    for var o in xs do
+      if Keep.H<Object>(o) = Keep.H<Object>(o) then n := n + 1; end;
+    end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                                        "100\n");
+}
+
+// CONTROL — the same property under a name `Object` does not declare
+// (`Hook`). Never relaxed on any arm (not a §8.1 name), so it is identical
+// on base, on every fix, and here: "100", no ASan report. It shows the
+// property rows above fail only through the relaxation.
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           an_extension_property_under_another_name_is_a_control) {
+    expectNoMemoryError(runAotCheckedLenient(R"BZL(
+module M;
+class Keep
+  public static method Take(xs: Array<Object>, o: Object): int
+    xs.Add(o);
+    return 0;
+  end Take;
+end Keep;
+extension Object
+  public property Hook: (Array<Object>) -> int => lambda(xs: Array<Object>) => Keep.Take(xs, this);
+end;
+class P
+  public static method Run(xs: Array<Object>): int
+    var g: (int)->int := lambda(x: int) => x + 1;
+    return g.Hook(xs);
+  end Run;
+  public static method Main(): int
+    var xs := new Array<Object>();
+    var i: int := 0;
+    while i < 100 do
+      _ := P.Run(xs);
+      i := i + 1;
+    end;
+    var n: int := 0;
+    for var o in xs do
+      if o.GetHashCode() = o.GetHashCode() then n := n + 1; end;
     end;
     Console.WriteLine(n.ToString());
     return 0;
