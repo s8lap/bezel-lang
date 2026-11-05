@@ -9627,39 +9627,48 @@ static void reportUniversalGetTypeRefusal(sema::SemaContext& ctx,
 // only: an escape means the caller keeps the pre-#7841 leak (leak over UAF,
 // the #4322 posture), never a release.
 //
-// Reads (a release after the call is sound — each measured under ASan+LSan
-// in the #7841 review probes, 100× loops):
+// The SAFE SET (fourth pass, review r39-rev-7841e). Four reviews each found
+// a new spelling of "a copy of `this` escapes": `new Named(this, 1)`, a
+// `var x := this` / `o := this` / `h.V := this` copy, a member whose RESULT
+// is `this` (`Id(): string => this`, then `this.Id()` boxed by the caller),
+// and a record factory whose OTHER argument stores `this` elsewhere. So the
+// walk no longer enumerates escapes: it admits a `this` occurrence only in
+// one of the few positions below, each of which hands `this` to something
+// that provably cannot keep it past the call, and everything else — every
+// copy, every call argument, every user member whose result could BE
+// `this`, every expression or statement kind not listed — is an escape.
 //   * `this.M(...)` / `this.P` bound to a BUILT-IN `string` member whose
-//     RESULT cannot carry `this`: a value primitive, or a `string` from a
-//     called member on the measured fresh list (builtinMemberRead;
-//     `ToString()` returns `this` unretained and is NOT on it) — unless the
-//     access is itself Function-typed (a method reference captures `this`
-//     in a closure cell);
+//     RESULT cannot carry `this`: a non-nullable value primitive
+//     (`Length`, `IndexOf`, `StartsWith`, ...), or a `string` from a called
+//     member on the measured fresh list (builtinMemberRead; `ToString()`
+//     returns `this` itself unretained and is NOT on it). The call's
+//     arguments are walked as ordinary expressions;
 //   * `this.E(...)` / `this.P` bound to a user `extension string` member
-//     whose own body walk finds no escape (recursive; a cycle is an escape,
-//     and every result is cached — see thisStringMayEscape);
-//   * an operand of a built-in binary operator other than `??` (concat /
-//     compare produce fresh values) or of an interpolation hole; an `is` /
-//     `is not` operand. `this!`, `this as T` and `this ?? x` have the VALUE
-//     `this`, so they are read or escape as their own context is;
-//   * a bare `this` returned by a member DECLARED to return `string` or
-//     `string?` (the return retains; pinned by
-//     string_extension_receiver_once_7841 rows 5 and d08) — only at lambda
-//     depth 0, a lambda's own return is not classified;
-//   * NOT a copy of `this` into a new name — `var x := this`, `o := this`
-//     into an `out` parameter, `h.V := this` into a field. Each copy retains,
-//     but the walk tracks the receiver by the spelling `this` only, and the
-//     copy's reference ends (scope end, caller's iteration end, overwrite)
-//     while a value the copy was boxed or embedded into lives on (`x as
-//     Object`, `o as Object`, `x.W0()`: the third review's a1 / c1 / c3 /
-//     c4). Every copy is an escape;
-//   * a `Console.Write` / `Console.WriteLine` argument;
-//   * an `if` / `elif` / `while` / conditional-expression condition.
-// A lambda body is walked with the same rules: its captured `this` IS
-// retained, but a value it embeds `this` into (`lambda(): Named => new
-// Named(this, 1)`) outlives the env's release. An async or iterator body is
-// walked the same way (the frame pins `this`); a `yield return this` is an
-// escape (the yielded value is not classified).
+//     whose own body walk finds no escape AND whose declared result cannot
+//     carry `this`: void, or a non-nullable value primitive
+//     (resultCannotCarryThis). A member returning `string`, `Object`, a
+//     nullable, a record, a collection or a frame hands its caller a value
+//     that may BE `this` (the fourth review's k08c..k08m: `Id(): string =>
+//     this` is read-only in itself, but `Keep.Put(l, this.Id())` boxes the
+//     receiver), so its call is an escape in the caller's walk; recursion
+//     through a cycle is an escape, every result is cached;
+//   * a BARE `this` as a direct operand of a built-in binary operator
+//     other than `??` (concat / compare produce fresh values), as an
+//     interpolation hole, or as the single argument of `Console.Write` /
+//     `Console.WriteLine`;
+//   * a BARE `this` returned by a member DECLARED to return `string` /
+//     `string?` (the return retains; pinned by rows 5 and d08) — at lambda
+//     depth 0 only. (That member's own CALL from another extension is an
+//     escape there, by the result rule above.)
+// Not reads, by construction: `this!`, `this as T`, `this ?? x` (their
+// value is `this`), any copy into a new name, any argument of a user or
+// static call, a `new` argument (the provably fresh record factory is the
+// claim / K8 paths' business, with `this` admitted exactly once and no
+// other argument mentioning it: isFreshRecordConstructionOfExactType), a
+// `yield`, a condition, an index, a `case` / `with` operand. A lambda body
+// is walked with the same rules (its captured `this` IS retained, but a
+// value it embeds `this` into outlives the env's release); an async or
+// iterator body likewise (the frame pins `this`).
 namespace {
 struct ThisStringEscapeWalker {
     const sema::SemaContext& ctx;
@@ -9670,6 +9679,10 @@ struct ThisStringEscapeWalker {
     bool returnIsRead = false;   // declared return type is string / string?
     bool escaped = false;
     int lambdaDepth = 0;
+    // "Does this expression MENTION `this` at all?" mode
+    // (Emitter::exprMentionsThis): every occurrence, read or not, sets
+    // `escaped`, and so does every expression kind the walk does not list.
+    bool strict = false;
 
     static bool isThis(const ast::Expr* e) {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -9716,22 +9729,51 @@ struct ThisStringEscapeWalker {
                 return true;
         }
     }
+    // A user member's DECLARED result that cannot be or carry `this`: no
+    // result at all (a void member), or a non-nullable value primitive. A
+    // `string` result may BE `this` (`Id(): string => this`: the fourth
+    // review's k08c..k08m), an `Object` / nullable / Named / collection /
+    // frame result may carry it, and an unresolvable type is not known.
+    bool resultCannotCarryThis(const ast::Type* declared) const {
+        if (!declared) return true;
+        const sema::TypeRef* t = ctx.resolvedType(*declared);
+        if (!t || t->nullable || t->kind != sema::TypeRef::Kind::Primitive)
+            return false;
+        switch (t->primitive) {
+            case sema::PrimitiveType::String:
+            case sema::PrimitiveType::Object:
+            case sema::PrimitiveType::None:
+                return false;
+            default:
+                return true;
+        }
+    }
     // `this.member` (called or not): a read iff the bound member is a user
-    // extension member whose own body is read-only, or a built-in `string`
-    // member whose result cannot carry `this` (builtinMemberRead). `access`
-    // is the member-access node (or the call node when called) whose sema
-    // type tells a method reference apart. A symbol kind the walk does not
-    // classify is an escape; a member sema bound to NO symbol (the built-in
-    // `string` members resolve by name) is classified by its type alone.
+    // extension member whose own body is read-only AND whose declared
+    // result cannot carry `this` (resultCannotCarryThis), or a built-in
+    // `string` member whose result cannot carry `this` (builtinMemberRead).
+    // `access` is the member-access node (or the call node when called)
+    // whose sema type tells a method reference apart. A symbol kind the
+    // walk does not classify is an escape; a member sema bound to NO symbol
+    // (the built-in `string` members resolve by name) is classified by its
+    // type alone.
     bool memberReadOnThis(const ast::Expr& access, std::string_view member,
                           bool called, const sema::Symbol* sym) {
         if (isFunctionTyped(access)) return false;
         if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(sym)) {
-            if (ms->extensionDecl) return !methodEscapes(ms);
+            if (ms->extensionDecl) {
+                auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+                return md && resultCannotCarryThis(md->returnType.get()) &&
+                       !methodEscapes(ms);
+            }
             return builtinMemberRead(access, member, called);
         }
         if (auto* ps = dynamic_cast<const sema::PropertySymbol*>(sym)) {
-            if (ps->decl || ctx.isImported(ps)) return !propertyEscapes(ps);
+            if (ps->decl || ctx.isImported(ps)) {
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                return pd && resultCannotCarryThis(pd->type.get()) &&
+                       !propertyEscapes(ps);
+            }
             return builtinMemberRead(access, member, called);
         }
         if (sym) return false;
@@ -9740,7 +9782,7 @@ struct ThisStringEscapeWalker {
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e || escaped) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
-            if (id->name == "this" && !safeRead) escaped = true;
+            if (id->name == "this" && (strict || !safeRead)) escaped = true;
             return;
         }
         if (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
@@ -9757,8 +9799,9 @@ struct ThisStringEscapeWalker {
             return;
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
             if (isThis(ma->target.get())) {
-                if (!memberReadOnThis(*ma, ma->member, /*called=*/false,
-                                      ctx.exprSymbol(*ma)))
+                if (strict || !memberReadOnThis(*ma, ma->member,
+                                                /*called=*/false,
+                                                ctx.exprSymbol(*ma)))
                     escaped = true;
                 return;
             }
@@ -9773,18 +9816,23 @@ struct ThisStringEscapeWalker {
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                     c->callee.get())) {
                 if (isThis(ma->target.get())) {
-                    if (!memberReadOnThis(*c, ma->member, /*called=*/true,
-                                          ctx.exprSymbol(*c->callee)))
+                    if (strict || !memberReadOnThis(*c, ma->member,
+                                                    /*called=*/true,
+                                                    ctx.exprSymbol(*c->callee)))
                         escaped = true;
                     for (auto& a : c->args) expr(a.value.get(), false);
                     return;
                 }
+                // A BARE `this` as the one argument of `Console.Write` /
+                // `Console.WriteLine` is printed within the call's extent.
                 const bool consoleWrite =
                     isConsole(ma->target.get()) &&
                     (ma->member == "Write" || ma->member == "WriteLine") &&
                     c->args.size() == 1;
                 expr(ma->target.get(), false);
-                for (auto& a : c->args) expr(a.value.get(), consoleWrite);
+                for (auto& a : c->args)
+                    expr(a.value.get(),
+                         consoleWrite && isThis(a.value.get()));
                 return;
             }
             expr(c->callee.get(), false);
@@ -9801,16 +9849,16 @@ struct ThisStringEscapeWalker {
             return;
         }
         if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
-            // `??` has the VALUE of an operand (it passes `this` through
-            // unretained), so its operands inherit the context; every other
-            // built-in operator (concat / compare) produces a fresh value.
+            // A BARE `this` operand of a built-in operator other than `??`
+            // (concat / compare produce a fresh value) is a read; `??` has
+            // the VALUE of an operand, and a user operator is a call.
             bool userOp = false;
             if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(
                     ctx.exprSymbol(*b)))
                 userOp = ms->isOperator;
-            const bool operandRead = b->op == "??" ? safeRead : !userOp;
-            expr(b->left.get(), operandRead);
-            expr(b->right.get(), operandRead);
+            const bool operandRead = b->op != "??" && !userOp;
+            expr(b->left.get(), operandRead && isThis(b->left.get()));
+            expr(b->right.get(), operandRead && isThis(b->right.get()));
             return;
         }
         if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
@@ -9818,26 +9866,27 @@ struct ThisStringEscapeWalker {
             return;
         }
         if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
-            // `is` / `is not` test and yield a bool; `as` has the VALUE of
-            // its operand (`this as Object` boxes `this` unretained — the
-            // review's r05), so it inherits the context.
-            expr(t->operand.get(), t->op == "as" ? safeRead : true);
+            // `this is T` yields a bool but `this as Object` boxes `this`
+            // unretained (the review's r05): a bare `this` under either is
+            // an escape, the operand is walked as an ordinary expression.
+            expr(t->operand.get(), false);
             return;
         }
         if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
-            // `this!` has the value `this` (the review's r04: `new
-            // Named(this!, 1)` embeds it); it inherits the context.
-            expr(p->operand.get(), safeRead);
+            // `this!` has the value `this` (the review's r04): an escape.
+            expr(p->operand.get(), false);
             return;
         }
         if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
-            expr(c->condition.get(), true);
+            expr(c->condition.get(), false);
             expr(c->thenValue.get(), false);
             expr(c->elseValue.get(), false);
             return;
         }
         if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
-            for (auto& part : is->parts) expr(part.expr.get(), true);
+            // A BARE `this` hole is formatted into a fresh string.
+            for (auto& part : is->parts)
+                expr(part.expr.get(), isThis(part.expr.get()));
             return;
         }
         if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
@@ -9941,17 +9990,17 @@ struct ThisStringEscapeWalker {
             return;
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
-            expr(is->ifBranch.condition.get(), true);
+            expr(is->ifBranch.condition.get(), false);
             for (auto& b : is->ifBranch.body) stmt(b.get());
             for (auto& br : is->elifBranches) {
-                expr(br.condition.get(), true);
+                expr(br.condition.get(), false);
                 for (auto& b : br.body) stmt(b.get());
             }
             for (auto& b : is->elseBody) stmt(b.get());
             return;
         }
         if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
-            expr(ws->condition.get(), true);
+            expr(ws->condition.get(), false);
             for (auto& b : ws->body) stmt(b.get());
             return;
         }
@@ -9980,7 +10029,7 @@ struct ThisStringEscapeWalker {
         if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
             for (auto& b : ts->body) stmt(b.get());
             for (auto& c : ts->catches) {
-                expr(c.guard.get(), true);
+                expr(c.guard.get(), false);
                 stmt(c.body.get());
             }
             for (auto& b : ts->finallyBody) stmt(b.get());
@@ -10000,6 +10049,24 @@ struct ThisStringEscapeWalker {
     }
 };
 }  // namespace
+
+// fix #7841 (fourth pass, §26.7, §28.9, v0.355) — does `e` mention `this`
+// ANYWHERE (read or not, under a lambda, a member access, a call argument,
+// ...)? Conservative: an expression kind the walker does not list counts
+// as a mention. Consulted by isFreshRecordConstructionOfExactType with
+// `this` admitted: a record factory is K8 / claim eligible only when the
+// bare `this` is its one `string` positional argument and NO other
+// argument mentions it (the fourth review's q01 / q02: `new Named(this,
+// Keep.Put(l, this))` stored `this` elsewhere before the K8 release).
+bool Emitter::exprMentionsThis(const ast::Expr* e) const {
+    if (!e) return false;
+    ThisStringEscapeWalker w{
+        ctx_, [](const sema::MethodSymbol*) { return true; },
+        [](const sema::PropertySymbol*) { return true; }};
+    w.strict = true;
+    w.expr(e, false);
+    return w.escaped;
+}
 
 // fix #7841 — see ThisStringEscapeWalker. A member whose walk is still in
 // progress (a recursive or mutually recursive clique) is an ESCAPE, and

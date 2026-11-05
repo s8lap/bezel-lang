@@ -13111,6 +13111,10 @@ private:
         const sema::PropertySymbol* ps,
         std::unordered_set<const ast::Node*>& inProgress);
     std::unordered_map<const ast::Node*, bool> thisStringEscape_;
+    // fix #7841 (fourth pass): does `e` mention `this` anywhere? The
+    // walker in strict mode (LlvmBackend_Calls2.cpp); an unlisted
+    // expression kind counts as a mention.
+    bool exprMentionsThis(const ast::Expr* e) const;
     // fix #7841: the K8 deferral of an extension receiver's release
     // (deferExtStringReceiverReleaseToK8) is sound only for the provably
     // fresh record factory (`Wrap(): Named => new Named(this, 1)`), whose

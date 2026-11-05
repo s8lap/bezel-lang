@@ -577,3 +577,99 @@ BEZEL_TEST(string_extension_receiver_once_7841,
             "    Console.WriteLine(o.ToString());\n")),
         "a1\n0\n");
 }
+
+// ---------------------------------------------------------------------------
+// Fix-forward-3 rows (the fourth review): the walker now admits `this` only
+// in a small safe set. (1) A record factory whose OTHER argument stores
+// `this` elsewhere (`new Named(this, Keep.Put(l, this))`) is no longer K8
+// eligible. (2) A user member whose RESULT may be `this` (`Id(): string =>
+// this`) is an escape in the walk of a member that calls it, however the
+// result is then used: boxed directly, through a local, through a property,
+// or yielded. Base leaks each; 44d02684 freed the receiver under the box.
+// Forced-ASan `runAot` UAF guards, 100x loops.
+// ---------------------------------------------------------------------------
+
+const char* kKeep =
+    "public class Keep\n"
+    "  public static method Put(l: Array<Object>, s: string): int\n"
+    "    l.Add(s as Object);\n"
+    "    return 1;\n"
+    "  end Put;\n"
+    "end Keep;\n";
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           factory_other_argument_stores_receiver_no_uaf_spec_26_7) {
+    // q02: K8 claim on `.W(l).Tag.Length`; the int argument boxes `this`.
+    expectRan(
+        runAot(extProgram(
+            std::string("public record Named(Tag: string, N: int);\n") + kKeep,
+            "  public method W(l: Array<Object>): Named => new Named(this, Keep.Put(l, this));\n",
+            "    using var l := new Array<Object>();\n"
+            "    for var i in 0..99 do t := t + Make.Str(i).W(l).Tag.Length; end;\n"
+            "    for var o in l do t := t + o.ToString().Length; end;\n")),
+        "580\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           member_result_is_receiver_boxed_by_caller_no_uaf_spec_26_7) {
+    // k08c: `Id(): string => this` is read-only in itself; its CALL hands
+    // the caller `this`.
+    expectRan(
+        runAot(extProgram(
+            kKeep,
+            "  public method Id(): string => this;\n"
+            "  public method P(l: Array<Object>) Keep.Put(l, this.Id()); end P;\n",
+            "    using var l := new Array<Object>();\n"
+            "    for var i in 0..99 do Make.Str(i).P(l); end;\n"
+            "    for var o in l do t := t + o.ToString().Length; end;\n")),
+        "290\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           member_result_is_receiver_via_local_boxed_no_uaf_spec_26_7) {
+    // k08g: the result through a local, boxed as the return value.
+    expectRan(
+        runAot(extProgram(
+            "",
+            "  public method Id(): string => this;\n"
+            "  public method AsO(): Object\n"
+            "    var x := this.Id();\n"
+            "    return x as Object;\n"
+            "  end AsO;\n",
+            "    using var l := new Array<Object>();\n"
+            "    for var i in 0..99 do l.Add(Make.Str(i).AsO()); end;\n"
+            "    for var o in l do t := t + o.ToString().Length; end;\n")),
+        "290\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           member_result_is_receiver_via_property_no_uaf_spec_26_7) {
+    // k08l: an extension property whose getter returns `this.Id()`.
+    expectRan(
+        runAot(extProgram(
+            kKeep,
+            "  public method Id(): string => this;\n"
+            "  public property P: string => this.Id();\n"
+            "  public method Q(l: Array<Object>) Keep.Put(l, this.P); end Q;\n",
+            "    using var l := new Array<Object>();\n"
+            "    for var i in 0..99 do Make.Str(i).Q(l); end;\n"
+            "    for var o in l do t := t + o.ToString().Length; end;\n")),
+        "290\n");
+}
+
+BEZEL_TEST(string_extension_receiver_once_7841,
+           member_result_is_receiver_yielded_no_uaf_spec_26_7) {
+    // k08m: `yield return this.Id()` from an iterator member; the caller
+    // boxes each element.
+    expectRan(
+        runAot(extProgram(
+            "",
+            "  public method Id(): string => this;\n"
+            "  public method Ys(): IEnumerable<string>\n"
+            "    yield return this.Id();\n"
+            "  end Ys;\n",
+            "    using var l := new Array<Object>();\n"
+            "    for var i in 0..99 do for var s in Make.Str(i).Ys() do l.Add(s as Object); end; end;\n"
+            "    for var o in l do t := t + o.ToString().Length; end;\n")),
+        "290\n");
+}

@@ -40228,6 +40228,28 @@ bool Emitter::isFreshRecordConstructionOfExactType(
         const sema::TypeRef* fty =
             sema::storageComponentType(posFields[i], ctx_);
         if (!fty) return false;
+        // fix #7841 (fourth pass, §26.7, §28.9, v0.355): with `this`
+        // admitted, the receiver may appear ONLY as the bare `this` of a
+        // non-nullable `string` positional (the STRING arm below counts it
+        // and requires exactly one). Any OTHER argument that mentions `this`
+        // — `Keep.Put(l, this)`, `this.Stash(h)`, a lambda over it — may
+        // store the receiver elsewhere before the K8 / claim release, which
+        // the review's q01 / q02 measured as a use-after-free; and a bare
+        // `this` in a non-string positional (an `Object` box) is not the
+        // retained-field shape the release reasons about. Both decline.
+        if (admitThisPassthrough) {
+            auto* thisId =
+                dynamic_cast<const ast::IdentifierExpr*>(arg.value.get());
+            const bool bareThis = thisId && thisId->name == "this";
+            if (bareThis) {
+                if (fty->nullable ||
+                    fty->kind != sema::TypeRef::Kind::Primitive ||
+                    fty->primitive != sema::PrimitiveType::String)
+                    return false;
+            } else if (exprMentionsThis(arg.value.get())) {
+                return false;
+            }
+        }
         // fix #3964 (§9.7 / §28.9 / §14.1, v0.294): `storageComponentType`
         // returns the DECLARED type, so a BARE TYPE-PARAMETER component
         // (`record Box<T>(X: T, ...)`) is Named/no-declaration whatever `T`
