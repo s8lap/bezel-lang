@@ -29232,19 +29232,15 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     //     ✓          –         –/✓        over-release, exit 134
     //     ✓          ✓         –/✓        over-release, exit 134
     //
-    // A `string?`-returning lambda does NOT mint +1 on return — both body forms
-    // gate that mint on `!retSemaTy->nullable` (see LlvmBackend_Exprs2.cpp and
-    // LlvmBackend_Stmts.cpp's ReturnStmt arm, whose comment states the rule and
-    // its reason: "the method-side `string?` mint (#2196) is a method-contract
-    // rule the lambda call-site ABI does not share"). So on a nullable
-    // accumulator the fold hands back its input unchanged, the loop owns no
-    // reference, and the ONLY reference in play is the seed's own — which this
-    // arm's adoption discharges. Hence `!nullable` belongs on the two RELEASING
-    // slots in LlvmBackend_Calls.cpp and must NOT be added here: adding it
-    // would restore the 3737 B / 202-allocation leak. "bz_string_release is a
-    // no-op on null" is NOT the argument for admitting the nullable shape here;
-    // the failing accumulator is non-null, and the argument is that the loop
-    // owns nothing to release.
+    // Since fix #8167 (§28.3 / §28.9, v0.355) a `string?`-returning lambda
+    // mints +1 on return exactly as a `string`-returning one does (both body
+    // forms: LlvmBackend_Exprs2.cpp and LlvmBackend_Stmts.cpp's ReturnStmt
+    // arm), so the fold hands back a fresh reference on every step and the
+    // loop (LlvmBackend_Calls.cpp) releases each superseded one. Before that
+    // fix the nullable fold returned its input unchanged, the loop owned
+    // nothing, and the loop abstained from the per-step and seed releases;
+    // the recognition below was then the only thing closing the nullable
+    // residue. Both halves now follow the same mint, for both nullabilities.
     if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
         if (call->callee && call->args.size() == 2 && call->args[0].value) {
             if (auto* ma =

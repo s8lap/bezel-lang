@@ -5335,40 +5335,27 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // loop's to release. `bz_string_release` is null- and
             // sentinel-safe, so the null first iteration needs no branch.
             //
-            // ⚠ THE PREMISE IS THE FOLD'S RETURN MINT, AND IT IS GATED ON
-            // `!nullable` — `aggAccIsManagedRef` below carries that conjunct and
-            // must not lose it. A `string?`-returning lambda deliberately does NOT
-            // mint +1 on return: both body forms gate the mint on
-            // `!retSemaTy->nullable` (LlvmBackend_Exprs2.cpp, the expression
-            // body; LlvmBackend_Stmts.cpp's ReturnStmt arm, which says so in
-            // terms — "a `string?` lambda return does not mint there, so it must
-            // not mint here either… the method-side `string?` mint (#2196) is a
-            // method-contract rule the lambda call-site ABI does not share").
-            // So on a nullable accumulator `next` is `acc` unchanged: the loop
-            // OWNS NOTHING, and every release this arm performs is an
-            // over-release. MEASURED (`bezelc --sanitize=address`, 101
-            // iterations, a 6-element `Array<string>` source, seed `"n"+"ull"`,
-            // identity fold `lambda(x: string?, y: string): string? => x`),
-            // toggling these three sub-changes independently:
+            // THE PREMISE IS THE FOLD'S RETURN MINT. A `string` fold (either
+            // nullability) mints its return: both lambda body forms retain a
+            // borrow and transfer a +1 producer (LlvmBackend_Exprs2.cpp, the
+            // expression body; LlvmBackend_Stmts.cpp's ReturnStmt arm). So
+            // every `next` carries a fresh +1 and each superseded one is
+            // this loop's to release.
             //
-            //   prevSlot  seedSlot  isPlusOneStringProducer   result
-            //     –          –                –                3700 B / 200 allocs
-            //     –          –                ✓                CLEAN
-            //     –          ✓                –/✓              heap-use-after-free
-            //     ✓          –                –/✓              over-release, exit 134
-            //     ✓          ✓                –/✓              over-release, exit 134
-            //
-            // EITHER releasing slot over-releases on its own; for the identity
-            // fold the residue is closed by the `isPlusOneStringProducer` arm
-            // alone, which is why that arm keeps its nullable coverage (see
-            // LlvmBackend_Setup.cpp). For a concatenating fold the recognizer
-            // alone still leaves 25,452 B / 1,212 allocations.
-            //
-            // ON THE RESIDUE: the all-gates-off measurement is byte-identical
-            // to the pre-#6395 parent (3700 B / 200 allocations). The
-            // per-evaluation residue is element-count-invariant (2 allocations
-            // over 101 iterations, shared with the parent), which is what
-            // distinguishes the returned value from a dropped intermediate.
+            // fix #8167 (§28.3, §28.9, §27.3, v0.355): until this fix the mint
+            // was gated on `!nullable`, so a `string?` fold's `next` was its
+            // accumulator unchanged, the loop owned nothing, and every
+            // release here was an over-release (#6395 measured exit 134 and a
+            // heap-use-after-free on the identity fold
+            // `lambda(x: string?, y: string): string? => x`). The lambda now
+            // mints for `string?` too -- the caller of a function value
+            // releases a `string?` result as it does a `string` one -- so the
+            // premise holds for BOTH nullabilities and the gate below is the
+            // accumulator's `string` type alone. The identity-fold rows of
+            // tests/codegen/aggregate_string_accumulator_discharge_6395_test.cpp
+            // pin both the over-release and the use-after-free modes; they
+            // stay green, now by the lambda minting rather than by the loop
+            // abstaining.
             //
             // The LAST value is deliberately NOT discharged here: it is the
             // result this arm returns, and its reference is the caller's (whose
@@ -5408,90 +5395,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 (foldTyRef && foldTyRef->kind == sema::TypeRef::Kind::Function)
                     ? foldTyRef->funcReturn
                     : foldTyRef;
-            // …and the mint is a TRANSFER-or-RETAIN, so the premise this arm
-            // discharges is true whenever EITHER half fires. Verbatim from the
-            // mint site (LlvmBackend_Exprs2.cpp, expression body — the ReturnStmt
-            // sibling in LlvmBackend_Stmts.cpp reads the same three):
-            //
-            //   emitStringRetain(v)  iff  retSemaTy->kind == Primitive
-            //                             && primitive == String
-            //                             && !retSemaTy->nullable
-            //                             && !isPlusOneStringProducer(body)
-            //                             && !returnedStringLocalOwnsPlusOne(body)
-            //
-            // Negated, a step's `next` carries a fresh +1 when the fold's return
-            // is a non-nullable `string` (the RETAIN fires) OR its body is
-            // itself a +1 producer (the transfer fires). Both halves are needed
-            // and each is measured:
-            //
-            //   `=> x`     over `string?`  neither half → no mint → the loop owns
-            //                                  nothing and every release it makes
-            //                                  is an over-release (exit 134).
-            //   `=> x! + y` over `string?`  the transfer fires → a fresh +1 per
-            //                                  step, and the per-step release is
-            //                                  correct and load-bearing: dropping
-            //                                  it costs 25,452 B / 1,212 allocs over
-            //                                  101 iterations, where the rejected
-            //                                  8a8c3246 measured that same shape
-            //                                  CLEAN. A blanket `!nullable` here is
-            //                                  therefore NOT the fix — it is the
-            //                                  band-aid the reviewer warned about,
-            //                                  and it was measured before being
-            //                                  rejected.
-            //
-            // A BLOCK-bodied fold takes the same transfer half, read off the
-            // ReturnStmt instead of `exprBody` — which is what the ReturnStmt
-            // mint site reads too. Restricted to a body that is EXACTLY ONE
-            // `return <expr>`: that is the only shape where the arm's decision
-            // is decidable from here. Two returns, or a return nested in a
-            // conditional, are left undecided and fall to the non-nullable half
-            // alone, which is the conservative direction — it under-releases a
-            // case that is already unreleased rather than over-releases one
-            // that is not. MEASURED: a single-return nullable block fold over a
-            // 6-element source leaked 25,452 B / 1,212 allocs with the gate
-            // reading only `exprBody`, and is clean once this reads the
-            // ReturnStmt; the base measures 30,352 B / 1,412 on the same
-            // program, so the residual was under-discharge on both sides, never
-            // unsoundness. The fold-body short-circuit in the `aggFoldBodyMints`
-            // initializer below keeps the call from reaching `isPlusOneStringProducer`
-            // when the fold body is absent; that function returns false on a null
-            // argument in any case. Cited by SYMBOL and not by line (#6450): the
-            // line 02b7025a gave was already off by one against its own tree, and
-            // a line is a position that a neighbouring hunk moves.
-            const auto* foldLam =
-                dynamic_cast<const ast::LambdaExpr*>(call.args[1].value.get());
-            const ast::Expr* aggFoldBody = nullptr;
-            if (foldLam) {
-                if (foldLam->exprBody)
-                    aggFoldBody = foldLam->exprBody.get();
-                else if (foldLam->stmts.size() == 1) {
-                    if (const auto* ret = dynamic_cast<const ast::ReturnStmt*>(
-                            foldLam->stmts[0].get()))
-                        aggFoldBody = ret->value.get();
-                }
-            }
-            const bool aggFoldBodyMints =
-                aggFoldBody && isPlusOneStringProducer(aggFoldBody);
+            // The accumulator's type is the FOLD's return type (see above), and
+            // the fold's return mint holds for a `string` of either nullability
+            // (fix #8167). An `int` / `decimal` / struct accumulator takes
+            // neither slot nor release.
             const bool aggAccIsManagedRef =
                 aggAccRef && aggAccRef->kind == sema::TypeRef::Kind::Primitive &&
-                aggAccRef->primitive == sema::PrimitiveType::String &&
-                (!aggAccRef->nullable || aggFoldBodyMints);
-            // The gate is `mint ⇔ ¬nullable ∧ ¬producer ∧ ¬returnedLocalOwnsOne`
-            // (per §28.3, a transfer-or-retain), so "the loop owns this step" is
-            // the disjunction of its three negated conjuncts. This arm implements
-            // only the first two: a nullable `string` accumulator does NOT carry
-            // a +1 (a `string?` lambda return deliberately omits the mint per
-            // #2688), so `returnedLocalOwnsOne` never fires for a lambda
-            // accumulator parameter. A returned local's own +1 is escaped — it
-            // flows to the caller — so the loop does not own it either. The
-            // identity-fold rows empirically confirm this: `returnedStringOwns
-            // PlusOne` does not fire, and the nullable identity fold aborts
-            // without it.
+                aggAccRef->primitive == sema::PrimitiveType::String;
             // Allocated only on that population, so the null seed below is only
             // ever asked for a pointer type (a `string` accumulator lowers to
             // `ptr`); an `int`/`decimal`/struct accumulator takes neither the
-            // slot nor the release, and neither does a NULLABLE `string` (⚠
-            // above).
+            // slot nor the release.
             auto* prevSlot = aggAccIsManagedRef ? entryAlloca(ptrTy()) : nullptr;
             if (prevSlot)
                 builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
@@ -5525,11 +5439,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // local's own scope-end discharge.
             //
             // `seedSlot` rides on `aggAccIsManagedRef` and therefore on the same
-            // `!nullable` mint predicate as `prevSlot`, for the same reason and
-            // with the same measurement: a nullable accumulator's fold does not
-            // re-mint the seed, so on an identity fold the seed IS the returned
-            // value and releasing it is a use-after-free on the arm's own result
-            // — that is the `seedSlot`-only cell of the matrix above.
+            // mint predicate as `prevSlot`: the fold re-mints the seed (an
+            // identity fold retains it), so the seed's own reference is the
+            // loop's to drop after the one read of it. Since fix #8167 that
+            // holds for a `string?` accumulator too.
             auto* seedSlot =
                 (aggAccIsManagedRef && isPlusOneStringProducer(call.args[0].value.get()))
                     ? entryAlloca(ptrTy()) : nullptr;

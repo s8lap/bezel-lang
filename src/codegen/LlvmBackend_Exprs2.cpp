@@ -4187,8 +4187,23 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // String: retain unless the body is a +1 producer (concat/interp/
                 //   range-slice/numeric-ToString/user-method-call) or is an
                 //   identifier naming a non-nullable local that owns +1.
+                //
+                // fix #8167 (§28.3, §28.9, §27.3, v0.355): a `string?` result
+                // mints too. The CALLER of a function value releases a
+                // `string?` result exactly as it releases a `string` one
+                // (isPlusOneStringProducer's closure-call arm, #2196: "nullable
+                // OR non-nullable"), so a `() -> string?` lambda that returned
+                // a +0 borrow handed the caller a reference it then dropped: a
+                // heap-use-after-free on the second call. The shapes: a
+                // generic-block extension member at T = string
+                // (`lambda() => c.HeadN()` over `HeadN(): T?` — the inlined
+                // generic member mints nothing, see makeGenericMethodThunk,
+                // #8121) and a captured `string?` local (`lambda() => ns`).
+                // bz_string_retain is a no-op on null, so a null result stays a
+                // null carry. The block-body twin (emitReturn's lambda arm,
+                // LlvmBackend_Stmts.cpp) is kept in lockstep.
                 if (v && v->getType()->isPointerTy() &&
-                    retSemaTy && !retSemaTy->nullable &&
+                    retSemaTy &&
                     retSemaTy->kind == sema::TypeRef::Kind::Primitive &&
                     retSemaTy->primitive == sema::PrimitiveType::String &&
                     !isPlusOneStringProducer(lam.exprBody.get()) &&

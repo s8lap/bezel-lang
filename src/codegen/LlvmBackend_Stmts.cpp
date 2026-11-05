@@ -3993,14 +3993,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // `lambda(k) => do return k; end` returned a +0 borrow, so every caller
         // that releases the result (a `var` bind, `Dictionary.GetOrAdd`'s
         // store) double-freed the block-body form and only that form. Mirror
-        // the expr-body predicate EXACTLY, including its `!nullable` gate: a
-        // `string?` lambda return does not mint there, so it must not mint here
-        // either — agreement between the two forms is the invariant, and the
-        // method-side `string?` mint (#2196) is a method-contract rule the
-        // lambda call-site ABI does not share.
+        // the expr-body predicate EXACTLY — agreement between the two forms is
+        // the invariant.
+        // fix #8167 (§28.3, §28.9, §27.3, v0.355): that predicate no longer
+        // has a `!nullable` gate. The caller of a function value releases a
+        // `string?` result as it releases a `string` one (isPlusOneStringProducer's
+        // closure-call arm, #2196), so a `() -> string?` lambda must mint the
+        // same +1; this arm and the expression-body arm
+        // (LlvmBackend_Exprs2.cpp) move together.
         const sema::TypeRef* lamRet = currentLambdaReturnSemaTy_;
         if (v && rs->value && !currentReturnTypeNode_ && lamRet &&
-            v->getType()->isPointerTy() && !lamRet->nullable &&
+            v->getType()->isPointerTy() &&
             lamRet->kind == sema::TypeRef::Kind::Primitive &&
             lamRet->primitive == sema::PrimitiveType::String &&
             !isPlusOneStringProducer(rs->value.get()) &&
