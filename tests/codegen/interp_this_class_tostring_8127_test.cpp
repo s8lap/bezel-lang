@@ -46,6 +46,7 @@
 using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
+using bezel::test::runAotCheckedLenient;
 
 namespace {
 
@@ -1314,4 +1315,334 @@ BEZEL_TEST(interp_this_class_tostring_8127, record_ctor_this_from_record_method_
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "ctor M.R\n2\n");
+}
+
+// ── fix-forward (B1): `this` captured by an ASYNC LAMBDA whose owner body is ──
+// ── lowered from ANOTHER type's member ───────────────────────────────────────
+//
+// Review r39-rev-8127d (REJECT of cfd83413): an async lambda's statements are
+// lowered in its RESUME function, and only the lambda's ENTRY function was
+// registered in `lambdaFnEnclosingType_` (lowerLambda, #5226). Inside the resume
+// body every `currentFn_`-keyed owner recovery missed, and `thisReceiverOwner`
+// fell through to step 9 — the method whose emission is in progress. When the
+// lambda's owner body is a class `B`'s block getter lowered lazily from a RECORD
+// `R.Go`, that is `R.Go`, so the captured class `this` was loaded as the
+// CALLER's record struct: `call @"bz$M.B$Pick"(%record.R %10)` — an IR
+// verification failure of a VALID program that 8d5b8dd3 ran correctly. The
+// resume function is now keyed to the lambda's lexical enclosing type exactly as
+// the entry is (emitAsyncLambda).
+//
+// §8.5 / §18.5 (v0.355): `this` is the receiver, of the OWNER's type. §27.5: a
+// lambda captures the enclosing member's `this`; an `async` lambda is a lambda.
+//
+// Oracles. The rows whose getter holds a LAMBDA-VALUED LOCAL use
+// `runAotCheckedLenient`: a lambda-valued local in a lazily emitted accessor
+// body leaks its closure on 8d5b8dd3 too (#6766's family, measured 72 B in 2
+// allocations with a control lambda that captures NOTHING — the leak is not
+// this fix's and does not depend on `this`), and the lenient oracle keeps the
+// generated-code ASan (a wrong-typed load still faults) while turning LSan off.
+// The rows without such a local use the full checked oracle.
+
+// The review's e29: a class block getter forms a local async lambda capturing
+// `this`, read from a RECORD's sync method. cfd83413: IR verification failure.
+BEZEL_TEST(interp_this_class_tostring_8127,
+           getter_local_async_lambda_this_from_record_sync) {
+    auto r = runAotCheckedLenient(
+        "module M;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public static method Pick(b: B): int => b.N + 1;\n"
+        "  public property P: int\n"
+        "    get => do\n"
+        "      var f := async lambda(): Task<int> => B.Pick(this) + this.N;\n"
+        "      using var t := f();\n"
+        "      return t.Result;\n"
+        "    end;\n"
+        "  end P;\n"
+        "end B;\n"
+        "public record R(K: int, Q: string)\n"
+        "  public method Go(): int\n"
+        "    using var b := new B();\n"
+        "    Console.WriteLine(b.P);\n"
+        "    return K;\n"
+        "  end Go;\n"
+        "end R;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    var r := new R(7, \"rq\");\n"
+        "    Console.WriteLine(r.Go());\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "8485\n7\n");
+}
+
+// The review's e26: the same getter read from the record's sync method, its
+// ASYNC method and its ITERATOR method — three emission contexts whose
+// `currentMethod_` is the record's, each the wrong answer for the lambda.
+BEZEL_TEST(interp_this_class_tostring_8127,
+           getter_local_async_lambda_this_from_record_sync_async_and_iterator) {
+    auto r = runAotCheckedLenient(
+        "module M;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public static method Pick(b: B): int => b.N + 1;\n"
+        "  public property P: int\n"
+        "    get => do\n"
+        "      var f := async lambda(): Task<int> => B.Pick(this) + this.N;\n"
+        "      using var t := f();\n"
+        "      return t.Result;\n"
+        "    end;\n"
+        "  end P;\n"
+        "end B;\n"
+        "public record R(K: int, Q: string)\n"
+        "  public method Go(): int\n"
+        "    using var b := new B();\n"
+        "    Console.WriteLine(b.P);\n"
+        "    return K;\n"
+        "  end Go;\n"
+        "  public async method GoA(): Task<int>\n"
+        "    using var b := new B();\n"
+        "    Console.WriteLine(b.P);\n"
+        "    return K;\n"
+        "  end GoA;\n"
+        "  public method Each(): IEnumerable<int>\n"
+        "    using var b := new B();\n"
+        "    yield return b.P;\n"
+        "    yield return K;\n"
+        "  end Each;\n"
+        "end R;\n"
+        "public class Program\n"
+        "  public static async method Main(): Task\n"
+        "    var r := new R(7, \"rq\");\n"
+        "    Console.WriteLine(r.Go());\n"
+        "    using var t := r.GoA();\n"
+        "    var n := await t;\n"
+        "    Console.WriteLine(n);\n"
+        "    for var x in r.Each() do\n"
+        "      Console.WriteLine(x);\n"
+        "    end for;\n"
+        "    return;\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "8485\n7\n8485\n7\n8485\n7\n");
+}
+
+// The iterator twin alone: the record ITERATOR's resume body is the context
+// the getter is lowered from.
+BEZEL_TEST(interp_this_class_tostring_8127,
+           getter_local_async_lambda_this_from_record_iterator) {
+    auto r = runAotCheckedLenient(
+        "module M;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public static method Pick(b: B): int => b.N + 1;\n"
+        "  public property P: int\n"
+        "    get => do\n"
+        "      var f := async lambda(): Task<int> => B.Pick(this) + this.N;\n"
+        "      using var t := f();\n"
+        "      return t.Result;\n"
+        "    end;\n"
+        "  end P;\n"
+        "end B;\n"
+        "public record R(K: int, Q: string)\n"
+        "  public method Each(): IEnumerable<int>\n"
+        "    using var b := new B();\n"
+        "    yield return b.P;\n"
+        "    yield return K;\n"
+        "  end Each;\n"
+        "end R;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    var r := new R(7, \"rq\");\n"
+        "    for var x in r.Each() do\n"
+        "      Console.WriteLine(x);\n"
+        "    end for;\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "8485\n7\n");
+}
+
+// An EXPRESSION-BODIED getter INLINED into the record's method, passing the
+// async lambda as an argument (no lambda-valued local, so the full checked
+// oracle applies). cfd83413: IR verification failure; 8d5b8dd3: SIGSEGV.
+BEZEL_TEST(interp_this_class_tostring_8127,
+           expr_getter_async_lambda_arg_this_from_record_sync_checked) {
+    auto r = runAotChecked(
+        "module M;\n"
+        "public class B\n"
+        "  public N: int := 4242;\n"
+        "  public static method Pick(b: B): int => b.N + 1;\n"
+        "  public static async method Run(f: () -> Task<int>): Task<int>\n"
+        "    using var t := f();\n"
+        "    var v := await t;\n"
+        "    return v;\n"
+        "  end Run;\n"
+        "  public property P: int => B.RunSync(async lambda(): Task<int> => B.Pick(this) + this.N);\n"
+        "  public static method RunSync(g: () -> Task<int>): int\n"
+        "    using var t := B.Run(g);\n"
+        "    return t.Result;\n"
+        "  end RunSync;\n"
+        "end B;\n"
+        "public record R(K: int, Q: string)\n"
+        "  public method Go(): int\n"
+        "    using var b := new B();\n"
+        "    Console.WriteLine(b.P);\n"
+        "    return K;\n"
+        "  end Go;\n"
+        "end R;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    var r := new R(7, \"rq\");\n"
+        "    Console.WriteLine(r.Go());\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "8485\n7\n");
+}
+
+// The MIRROR: the lambda's owner is a RECORD (a CHOICE below), whose `this` is
+// a pointer the by-value call must LOAD (CG29). Step 5 now answers for the
+// resume function, with the owner's substitution checked, exactly as it does
+// for a sync lambda. A record method's own async lambda: an IR verification
+// failure on 8d5b8dd3 and 6f894e53 (no recovery at all), correct on cfd83413
+// (step 9 happened to name the right method) — a positive control for the
+// fix-forward, not a fail-without row.
+BEZEL_TEST(interp_this_class_tostring_8127,
+           record_method_local_async_lambda_this_by_value) {
+    auto r = runAotChecked(
+        "module M;\n"
+        "public record R(K: int, Q: string)\n"
+        "  public static method Pick(r: R): int => r.K + 1;\n"
+        "  public method Go(): int\n"
+        "    var f := async lambda(): Task<int> => R.Pick(this) + this.K;\n"
+        "    using var t := f();\n"
+        "    return t.Result;\n"
+        "  end Go;\n"
+        "end R;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    var r := new R(7, \"rq\");\n"
+        "    Console.WriteLine(r.Go());\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "15\n");
+}
+
+// A CHOICE method's own async lambda passing `this` by value and matching on
+// it: an IR verification failure on every earlier arm, cfd83413 included
+// (`currentReceiverRecordType`'s choice arm never saw the resume function).
+BEZEL_TEST(interp_this_class_tostring_8127,
+           choice_method_local_async_lambda_this_by_value) {
+    auto r = runAotChecked(
+        "module M;\n"
+        "public choice O\n"
+        "  Some(v: int),\n"
+        "  None;\n"
+        "  public static method Pick(o: O): int => (case o of Some(v) => v + 1, _ => 0);\n"
+        "  public method Go(): int\n"
+        "    var f := async lambda(): Task<int> => O.Pick(this) + (case this of Some(v) => v, _ => 0);\n"
+        "    using var t := f();\n"
+        "    return t.Result;\n"
+        "  end Go;\n"
+        "end O;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    var o := O.Some(3);\n"
+        "    Console.WriteLine(o.Go());\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "7\n");
+}
+
+// A RECORD's block getter with a local async lambda, read from a CLASS: the
+// caller's `currentMethod_` is the class's, so cfd83413 failed IR verification
+// (no record load at all; 8d5b8dd3 and 6f894e53 too). Lenient: the getter's
+// lambda-valued local (#6766's family).
+BEZEL_TEST(interp_this_class_tostring_8127,
+           record_getter_local_async_lambda_this_by_value_from_class) {
+    auto r = runAotCheckedLenient(
+        "module M;\n"
+        "public record R(K: int, Q: string)\n"
+        "  public static method Pick(r: R): int => r.K + 1;\n"
+        "  public property P: int\n"
+        "    get => do\n"
+        "      var f := async lambda(): Task<int> => R.Pick(this) + this.K;\n"
+        "      using var t := f();\n"
+        "      return t.Result;\n"
+        "    end;\n"
+        "  end P;\n"
+        "end R;\n"
+        "public class A\n"
+        "  public N: int := 1;\n"
+        "  public method Go(): int\n"
+        "    var r := new R(7, \"rq\");\n"
+        "    Console.WriteLine(r.P);\n"
+        "    return N;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    Console.WriteLine(a.Go());\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "15\n1\n");
+}
+
+// The GENERIC record's block getter, read from a class inside `R<string>`'s
+// instantiation: on 8d5b8dd3, 6f894e53 AND cfd83413 this COMPILED and printed
+// garbage (a different number each build — `this` reached `Pick` unloaded).
+// The resume function's owner is now `R<T>` with its substitution live, so
+// the CG29 load happens. Lenient: the getter's lambda-valued local (#6766).
+BEZEL_TEST(interp_this_class_tostring_8127,
+           generic_record_getter_local_async_lambda_this_by_value_from_class) {
+    auto r = runAotCheckedLenient(
+        "module M;\n"
+        "public record R<T>(K: int, V: T)\n"
+        "  public static method Pick(r: R<T>): int => r.K + 1;\n"
+        "  public property P: int\n"
+        "    get => do\n"
+        "      var f := async lambda(): Task<int> => R<T>.Pick(this) + this.K;\n"
+        "      using var t := f();\n"
+        "      return t.Result;\n"
+        "    end;\n"
+        "  end P;\n"
+        "end R;\n"
+        "public class A\n"
+        "  public N: int := 1;\n"
+        "  public method Go(): int\n"
+        "    var r := new R<string>(7, \"rq\");\n"
+        "    Console.WriteLine(r.P);\n"
+        "    return N;\n"
+        "  end Go;\n"
+        "end A;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    using var a := new A();\n"
+        "    Console.WriteLine(a.Go());\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "15\n1\n");
 }

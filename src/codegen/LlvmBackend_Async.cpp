@@ -2498,6 +2498,23 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         // carries over (the resume runs on a fresh — possibly cross-thread —
         // activation, reading only the heap frame).
         currentFn_ = resumeFn;
+        // fix-forward #8127 (§8.5 / §18.5, v0.355): the resume function is a
+        // LAMBDA body too — the lambda's statements are lowered HERE, not in
+        // the entry `fn` that lowerLambda registered in
+        // `lambdaFnEnclosingType_` (#5226). Every `currentFn_`-keyed owner
+        // recovery (`thisReceiverOwner` step 5, `choiceTypeOf`'s #6318 choice
+        // arm, the §22.12 base-class recoveries) therefore MISSED the
+        // resume function, and `thisReceiverOwner` fell through to step 9:
+        // the method whose emission is IN PROGRESS. When the lambda's owner
+        // body is lowered lazily from inside ANOTHER type's member (a block
+        // getter of class `B` read from record `R.Go`), that is `R.Go`, so
+        // the captured class `this` was loaded as the CALLER's record struct
+        // (an IR verification failure, review r39-rev-8127d B1). Key the
+        // resume function to the lambda's lexical enclosing type exactly as
+        // lowerLambda keys the entry, so both halves of one lambda answer with
+        // one owner.
+        if (const sema::TypeSymbol* lt = ctx_.lambdaEnclosingType(&lam))
+            lambdaFnEnclosingType_[resumeFn] = lt;
         currentThis_ = nullptr;
         locals_.clear(); paramSlots_.clear(); refParams_.clear();
         cellVars_.clear();
