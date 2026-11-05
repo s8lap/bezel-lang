@@ -7855,6 +7855,58 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 llvm::Value* task = lowerExpr(*ma->target);
                 if (task && task->getType()->isPointerTy()) {
                     llvm::Type* resTy = lowerTypeRef(tt->genericArgs[0]);
+                    // fix #8138 (§30.3 / §30.4, v0.355): the `OwningTask<T>`
+                    // SINGLE-CONSUMER guard. §30.3: "reading it on a completed
+                    // task in an owned-consuming position transfers ownership of
+                    // the result to the reader exactly as `await` does — the
+                    // result buffer is consumed, and **a second read or `await`
+                    // raises `InvalidOperationException`**."
+                    //
+                    // The first read CONSUMES the result buffer (the
+                    // `bz_task_take_result` drain below), so a second read
+                    // loaded through the now-NULL buffer pointer and
+                    // SEGFAULTED (MEASURED: exit 139, both the `.` and the `?.`
+                    // spelling). The `await` sibling of this rule already had
+                    // its guard — `bz_task_is_spent` / `bz_task_mark_spent` at
+                    // the await site (LlvmBackend_Async.cpp, #1352) — so the
+                    // two spellings are brought into LOCKSTEP here: the read
+                    // checks the spent flag before touching the buffer and
+                    // marks the task spent after it has consumed the result.
+                    //
+                    // Only a BOUND task is tracked: an ANONYMOUS producer
+                    // (`Mk().Result`) is reclaimed by this very read (the
+                    // `bz_task_free` below), so marking it spent afterwards
+                    // would be a use-after-free — exactly the reason the await
+                    // site gates its own `markSpentAfter` on `!freeTaskAfter`.
+                    // A plain `Task`/`Task<T>` is NOT single-consumer
+                    // (§30.4 "A `Task` or `Task<T>` may be awaited from
+                    // multiple places") and is not marked.
+                    const bool isOwningTaskReceiver = [&]() {
+                        if (!tt || tt->kind != sema::TypeRef::Kind::Named)
+                            return false;
+                        if (!tt->declaration)
+                            return tt->astNode && tt->astNode->name &&
+                                   !tt->astNode->name->parts.empty() &&
+                                   tt->headName() == "OwningTask";
+                        return !tt->declaration->decl &&
+                               tt->declaration->name == "OwningTask";
+                    }();
+                    // §30.4 / §30.9 (#1196): a BOUND task (`t.Result` where
+                    // `t` is a local variable, not an anonymous CallExpr
+                    // producer) — hoisted here so the single-consumer guard
+                    // above reads the SAME verdict the fault-borrow mark below
+                    // does (one decision, one place).
+                    const bool isBoundTask =
+                        dynamic_cast<const ast::CallExpr*>(ma->target.get()) ==
+                        nullptr;
+                    const bool trackSpent = isOwningTaskReceiver && isBoundTask;
+                    if (trackSpent) {
+                        auto* isSpentFn = declareC("bz_task_is_spent", i1(),
+                                                   {ptrTy()});
+                        llvm::Value* spent = builder_.CreateCall(
+                            isSpentFn, {task}, "result.spent");
+                        emitGuardThrow(spent, "InvalidOperationException");
+                    }
                     // §30.3 (v0.162 / #1362): catchable at-call-site guard —
                     // reading Result on an INCOMPLETE task inside a domain
                     // continuation raises InvalidOperationException (mirrors
@@ -7921,9 +7973,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     // exception at its own, independent scope end, so mark it
                     // borrowed here too (bz_task_fault_borrowed is false for
                     // every ordinarily-faulted task, so this is a no-op there).
-                    bool isBoundTask =
-                        dynamic_cast<const ast::CallExpr*>(ma->target.get()) ==
-                        nullptr;
+                    // `isBoundTask` is hoisted above (the single-consumer guard
+                    // reads the same verdict).
                     llvm::Value* shouldMarkBorrowed;
                     if (isBoundTask) {
                         shouldMarkBorrowed = builder_.getTrue();
@@ -7961,6 +8012,23 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             declareC("bz_task_free", llvm::Type::getVoidTy(llvm_),
                                      {ptrTy()});
                         builder_.CreateCall(freeTaskFn, {task});
+                    }
+                    // fix #8138 (§30.4 / §30.3, v0.355): the first read SPENDS
+                    // the task regardless of outcome — §30.4: "the first await
+                    // spends the task regardless of outcome (success, fault, or
+                    // cancellation), and a second await raises
+                    // `InvalidOperationException`". The `.Result` read is the
+                    // synchronous sibling of that await, so it spends the task
+                    // on the FAULT edge too: a second read after a failed first
+                    // read raises `InvalidOperationException` rather than
+                    // re-raising the original fault. Marked BEFORE the re-raise
+                    // so a catch arm that re-reads sees the spent task (the
+                    // same order the await site's fault edge uses).
+                    if (trackSpent) {
+                        auto* markSpentFn = declareC(
+                            "bz_task_mark_spent", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy()});
+                        builder_.CreateCall(markSpentFn, {task});
                     }
                     // Re-raise the original exception object through the
                     // synchronous-throw path (stores bz$exc, runs unwind
@@ -8098,6 +8166,19 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 llvm::Type::getInt8Ty(llvm_), 1);
                             builder_.CreateCall(takeResultFn, {task, drainArg});
                         }
+                    }
+                    // fix #8138 (§30.3 / §30.4, v0.355): the SUCCESS edge
+                    // spends the task too — the read has consumed the result
+                    // buffer, so a second read (or a second `await`) must raise
+                    // `InvalidOperationException`. This is the `.Result`
+                    // twin of the await site's `markSpentAfter` call
+                    // (LlvmBackend_Async.cpp, #1352): the two spellings of the
+                    // single-consumer rule now agree on WHEN the task is spent.
+                    if (trackSpent) {
+                        auto* markSpentFn = declareC(
+                            "bz_task_mark_spent", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy()});
+                        builder_.CreateCall(markSpentFn, {task});
                     }
                     return resultVal;
                 }
