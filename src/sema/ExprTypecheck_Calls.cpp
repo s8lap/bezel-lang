@@ -4823,6 +4823,100 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // restored type, and the winner's re-type is published after it.
     for (const auto& [e, t] : pristineArgType)
         if (t) ctx_.setExprType(e, t);
+
+    // fix #6254 (§14.5 phase 1 / §22.6 "Interaction with overloading",
+    // v0.355): a LONE generic candidate whose type parameter NO argument
+    // binds is INAPPLICABLE — §14.5: "a candidate whose inference fails is
+    // inapplicable and drops out (the call then resolves among the
+    // remaining candidates as usual)". With one candidate none remains, so
+    // §22.6 stage 3 makes the call an error. Before this check the lone
+    // candidate was returned with nothing substituted and nothing judged:
+    // `S.M(null)` against `M<T>(x: T?)` reached codegen with `T` still
+    // unbound and produced MALFORMED IR ("Call parameter type does not
+    // match function signature!", rc=1), and the `Array<T>?` twin compiled
+    // and RAN with `T` never bound.
+    //
+    // The EVIDENCE for "inference failed" must be CERTAIN, because an empty
+    // substitution map is NOT by itself evidence of a failed match: the
+    // #6334 check below measures that `unifyArgSubst` binds only on a
+    // structural head match and never through a §12 subtype step, so a VALID
+    // call (a `string` argument against `S<V>(x: IEnumerable<V>)`) also
+    // leaves the map empty. The certain evidence here is §14.5's own
+    // sentence: "a bare `null` literal argument is not self-determined and
+    // contributes no binding" — so the check fires only when EVERY argument
+    // at a position whose declared type mentions the type parameter is a bare
+    // `null` literal. Any other argument at such a position might bind the
+    // parameter (through the unifier, through a §12 subtype step, or through
+    // §14.5's phase-2 lambda inference), so the verdict is not certain and
+    // the call is left alone.
+    //
+    // A TARGET context cannot supply the parameter either: §14.5 phase 3
+    // binds an unbound parameter "by unifying the method's declared return
+    // type — current bindings applied — against the target", so only a
+    // parameter the RETURN type mentions can be completed by a target. When
+    // the return type DOES mention it, `typeCall`'s own §14.5 check owns
+    // that shape (it reports "cannot infer the type argument `T` of `M`'s
+    // call"), and this one must not double-report.
+    auto checkLoneGenericUnboundTypeParam = [&]() {
+        if (cands.size() != 1) return;
+        // An explicit type-argument list binds every parameter and runs no
+        // inference (§14.5 "Explicit lists are all-or-nothing").
+        if (callTypeArgs && !callTypeArgs->empty()) return;
+        if (cands[0]->genericParams.empty()) return;
+        // A DISAGREEMENT (§14.5 "Agreement") is already reported by
+        // `typeCall`'s §14.1 diagnostic; do not add a second message.
+        if (phase1Conflicted[0]) return;
+        // The DECLARED return type — the only channel a target context can
+        // complete an unbound parameter through (§14.5 phase 3).
+        TypeRef* retTy = nullptr;
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(cands[0]->decl))
+            retTy = md->returnType ? ctx_.resolvedType(*md->returnType) : nullptr;
+        else
+            retTy = ctx_.importedReturnType(cands[0]);
+        for (Symbol* g : cands[0]->genericParams) {
+            if (!g || g->name.empty()) continue;
+            const std::string_view tname = g->name;
+            // Bound by an argument already? Then nothing is unbound here.
+            if (phase1Subst[0].count(tname)) continue;
+            std::unordered_set<std::string_view> single{tname};
+            // A target context can complete it only through the return type.
+            if (retTy && refOutParamTypeMentionsTypeParam(retTy, single))
+                continue;
+            // The parameter positions whose declared type still mentions it —
+            // the positions only a `null` argument could have bound.
+            bool anyPosition = false;
+            bool allNull = true;
+            for (std::size_t i = 0; i < paramTypes[0].size(); ++i) {
+                const TypeRef* pt = paramTypes[0][i];
+                if (!pt || !containsMethodTypeParam(pt, single)) continue;
+                anyPosition = true;
+                const int ai = i < argIdxRows[0].size() ? argIdxRows[0][i] : -1;
+                const ast::Expr* av =
+                    ai >= 0 && static_cast<std::size_t>(ai) < ce.args.size()
+                        ? ce.args[static_cast<std::size_t>(ai)].value.get()
+                        : nullptr;
+                // A bare `null` literal is the only argument that contributes
+                // no binding here (§14.5 phase 1). Anything else — a lambda
+                // literal included, whose §14.5 phase-2 inference may bind the
+                // parameter — leaves the verdict undecided.
+                if (!av || !dynamic_cast<const ast::NullLiteralExpr*>(av))
+                    allNull = false;
+            }
+            if (!anyPosition || !allNull) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                "cannot infer the type argument `" + std::string(tname) +
+                    "` of `" + std::string(cands[0]->name) +
+                    "`'s call — a bare `null` literal argument is not "
+                    "self-determined and contributes no binding (§14.5), so "
+                    "no argument binds `" + std::string(tname) +
+                    "`; the method's declared return type does not mention "
+                    "it, so no target type can supply it either — supply an "
+                    "explicit type argument (§14.5, §22.6)");
+            return;
+        }
+    };
+
     // fix #6001 (§22.6 / §14.1, v0.338), recorded interpretation pending
     // #6220(c): when a candidate spelled with the type's parameter
     // (`Q(x: T)` on `G<T>`) substitutes to EXACTLY the signature of a
@@ -4874,6 +4968,9 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             candNames.resize(k);
             fillsDefault.resize(k);
             spelledWithTypeParam.resize(k);
+            // fix #6254: the lone-candidate check below must see the
+            // survivor this compaction leaves, so it runs here too.
+            checkLoneGenericUnboundTypeParam();
             if (cands.size() == 1) return soleSurvivor(cands[0]);
         }
     }
@@ -5180,6 +5277,10 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                             "§14.5, §22.6)");
         }
     }
+    // fix #6254: the lone generic candidate whose type parameter no
+    // argument binds is inapplicable (§14.5) — check it here, next
+    // to the #6334 lone-candidate check above.
+    checkLoneGenericUnboundTypeParam();
     if (cands.size() == 1) return soleSurvivor(cands[0]);
 
     // A discard argument (`out _`) is outside the value-conversion ranking of
