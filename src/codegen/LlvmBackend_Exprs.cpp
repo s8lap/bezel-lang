@@ -5365,6 +5365,100 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 return tvPhi;
             }
         }
+        // fix #8232 (§7.5 / §7.2, stdlib §4.8 / §5, v0.355): `e?.Key` /
+        // `e?.Value` on a `DictionaryEntry<K, V>?` receiver -- the type §5's
+        // `ElementAtOrNull(index: int): T?` yields on a dictionary, and the
+        // type of a written `DictionaryEntry<K, V>?` parameter.
+        //
+        // The `.` form reads the two fields through the MemberAccessExpr
+        // DictionaryEntry arm (the entry has no TypeSymbol, so the storage
+        // field path cannot locate them); a NullCondMemberExpr is a DISTINCT
+        // node, so that arm never ran and the access lowered to NOTHING
+        // (measured on 71569383: `Console.WriteLine(d.ElementAtOrNull(0)?.Key
+        // ?? "none")` printed nothing under #3079's warning, and a loop
+        // summing `(d.ElementAtOrNull(i mod 3)?.Key ?? "xyz").Length` printed
+        // 0 under #2961's).
+        //
+        // The receiver is the tagged `{i8 hasValue; {K, V}}` carrier (spec
+        // §7.2). Lower it ONCE (§7.5: "The receiver is evaluated first");
+        // a null receiver yields null, otherwise the field is
+        // extracted from the PAYLOAD and lifted to the §7.5 result -- the
+        // nullable of the member type: `{i8 hasValue; T}` for a value member
+        // (`int?`), a possibly-null pointer for a reference one (`string?`).
+        // A member whose LLVM type is ALREADY the result's carrier (an
+        // `int?` Value read as an `int?` result) is passed through as is
+        // rather than wrapped a second time.
+        if (nm->member == "Key" || nm->member == "Value") {
+            const sema::TypeRef* deRcvTy = ctx_.exprType(*nm->target);
+            const sema::TypeRef* deResTy = ctx_.exprType(e);
+            if (deRcvTy && deResTy &&
+                deRcvTy->kind == sema::TypeRef::Kind::Named &&
+                !deRcvTy->declaration &&
+                deRcvTy->headName() == "DictionaryEntry" &&
+                deRcvTy->genericArgs.size() >= 2 &&
+                deRcvTy->genericArgs[0] && deRcvTy->genericArgs[1]) {
+                llvm::Type* deKTy = lowerTypeRef(deRcvTy->genericArgs[0]);
+                llvm::Type* deVTy = lowerTypeRef(deRcvTy->genericArgs[1]);
+                if (!deKTy || !deVTy) return nullptr;
+                llvm::StructType* deEntryTy =
+                    llvm::StructType::get(llvm_, {deKTy, deVTy});
+                llvm::StructType* deCarrierTy = llvm::StructType::get(
+                    llvm_, {nullablePrimHasValTy(), deEntryTy});
+                const unsigned deFi = nm->member == "Key" ? 0u : 1u;
+                llvm::Type* deFieldTy = deEntryTy->getElementType(deFi);
+                // The §7.5 result's representation, decided BEFORE any block
+                // is opened so an unrecognised shape returns with the CFG
+                // untouched (the #3079 backstop then reports it loudly).
+                const bool deResIsValue = isNullableValueTy(deResTy);
+                llvm::Type* deResLlvm = nullptr;
+                llvm::Constant* deResNull = nullptr;
+                if (deResIsValue) {
+                    deResLlvm = nullableValueStructTy(deResTy);
+                    deResNull = nullableValueNull(deResTy);
+                    auto* deResSt = llvm::cast<llvm::StructType>(deResLlvm);
+                    if (deFieldTy != deResLlvm &&
+                        deFieldTy != deResSt->getElementType(1))
+                        return nullptr;
+                } else {
+                    if (!deFieldTy->isPointerTy()) return nullptr;
+                    deResLlvm = ptrTy();
+                    deResNull = llvm::ConstantPointerNull::get(ptrTy());
+                }
+                auto deLift = [&](llvm::Value* fld) -> llvm::Value* {
+                    if (!deResIsValue || fld->getType() == deResLlvm)
+                        return fld;
+                    return wrapNullableValue(deResTy, fld);
+                };
+                llvm::Value* deRcv = lowerExpr(*nm->target);
+                if (!deRcv) return nullptr;
+                if (deRcv->getType() == deEntryTy) {
+                    // A receiver the flow already proved non-null (§7.4):
+                    // `?.` reads the field like `.`.
+                    return deLift(builder_.CreateExtractValue(
+                        deRcv, {deFi}, "ncde.fld"));
+                }
+                if (deRcv->getType() != deCarrierTy) return nullptr;
+                auto* deEntryBB = builder_.GetInsertBlock();
+                auto* deAccessBB = llvm::BasicBlock::Create(
+                    llvm_, "ncde.access", currentFn_);
+                auto* deEndBB = llvm::BasicBlock::Create(
+                    llvm_, "ncde.end", currentFn_);
+                builder_.CreateCondBr(nullablePrimHasValue(deRcv),
+                                      deAccessBB, deEndBB);
+                builder_.SetInsertPoint(deAccessBB);
+                llvm::Value* dePayload =
+                    builder_.CreateExtractValue(deRcv, {1u}, "ncde.payload");
+                llvm::Value* deVal = deLift(builder_.CreateExtractValue(
+                    dePayload, {deFi}, "ncde.fld"));
+                auto* deAccessEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(deEndBB);
+                builder_.SetInsertPoint(deEndBB);
+                auto* dePhi = builder_.CreatePHI(deResLlvm, 2, "ncde.res");
+                dePhi->addIncoming(deResNull, deEntryBB);
+                dePhi->addIncoming(deVal, deAccessEnd);
+                return dePhi;
+            }
+        }
         // fix #7966 (stdlib §2.15 / §7.5, v0.355): `o?.MaxDepth` /
         // `o?.IndentWidth` / `o?.Indented` on a `JsonOptions?` receiver.
         //
@@ -10699,6 +10793,24 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     llvm::StructType* entryStTy =
                         llvm::StructType::get(llvm_, {kTy, vTy});
                     unsigned fi = ma->member == "Key" ? 0 : 1;
+                    // fix #8232 (§7.4 / §7.2, stdlib §4.8 / §5, v0.355): a
+                    // NULLABLE entry -- `var e := d.ElementAtOrNull(i);`, or
+                    // a `DictionaryEntry<K, V>?` parameter -- read after
+                    // `if e <> null then e.Key`. §7.4 narrowing retypes the
+                    // READ and converts no value, so the slot still holds the
+                    // tagged `{i8 hasValue; {K, V}}` carrier (spec §7.2) and
+                    // the field lives one level down, in the PAYLOAD. GEP'ing
+                    // the `{K, V}` struct over the carrier read the tag byte
+                    // as the Key (measured on 71569383: `e.Key + e.Value` on
+                    // a `Dictionary<int, int>` printed 73732 for 3 + 5, and a
+                    // `string` Key segfaulted). The discriminator is the sema
+                    // type OR the STORAGE -- the same pair fieldAddr's
+                    // nullable-record arm reads (#416 / #7088): the carrier
+                    // is a LITERAL `{i8, {K, V}}`, which a bare `{K, V}` can
+                    // never be pointer-equal to (that would need V == {K, V}).
+                    llvm::StructType* entryCarrierTy = llvm::StructType::get(
+                        llvm_, {nullablePrimHasValTy(), entryStTy});
+                    const bool entryTypedNullable = isNullableDictEntryTy(tt);
                     // Prefer an existing local alloca (the loop-variable case)
                     // — its storage already holds the {K,V} struct. Otherwise
                     // lower the target expression to its value and spill it to
@@ -10729,11 +10841,23 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         // non-captured behaviour is unaffected.
                         llvm::Type* baseElemTy = nullptr;
                         llvm::Value* base = boxedStorage(slot, baseElemTy);
+                        if (!baseElemTy) baseElemTy = slot->getAllocatedType();
+                        // fix #8232: step into the carrier's payload.
+                        if (baseElemTy == entryCarrierTy ||
+                            (entryTypedNullable && baseElemTy != entryStTy))
+                            base = builder_.CreateStructGEP(
+                                entryCarrierTy, base, 1, "de.payload");
                         llvm::Value* fieldPtr = builder_.CreateStructGEP(
                             entryStTy, base, fi, "de.fld");
                         return builder_.CreateLoad(
                             entryStTy->getElementType(fi), fieldPtr, "de.load");
                     } else if (llvm::Value* v = lowerExpr(*ma->target)) {
+                        // fix #8232: a nullable-carrier VALUE (a parameter
+                        // spilled by value, a call result) -- take its
+                        // payload before spilling the `{K, V}` struct.
+                        if (v->getType() == entryCarrierTy)
+                            v = builder_.CreateExtractValue(v, {1u},
+                                                            "de.payload");
                         if (v->getType()->isStructTy()) {
                             llvm::AllocaInst* tmp = entryAlloca(entryStTy);
                             builder_.CreateStore(v, tmp);

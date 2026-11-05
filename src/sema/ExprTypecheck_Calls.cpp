@@ -44986,6 +44986,37 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 break;
         }
     }
+    // fix #8232 (§7.5, stdlib §4.8 / §5, v0.355): `e?.Key` / `e?.Value` on a
+    // `DictionaryEntry<K, V>?` receiver -- the type §5's
+    // `ElementAtOrNull(index: int): T?` yields on a dictionary, or a written
+    // `DictionaryEntry<K, V>?` annotation. The `.` form types the two fields
+    // in `resolveMemberAccess`'s #548 / #3563 arm (the entry has no
+    // TypeSymbol, so the ordinary member lookup never finds them, and
+    // `headName()` reads both the synthetic and the written spelling); this
+    // resolver had no twin, so the `?.` node was left UNTYPED -- no
+    // diagnostic, and codegen lowered the access to nothing behind the #3079
+    // / #2961 warnings. §7.5: "The result type is always nullable", so the
+    // result is the nullable of the field's type. A call spelling
+    // (`e?.Key()`) is left to the paths below.
+    if (!member && (nm.member == "Key" || nm.member == "Value") &&
+        &nm != calleeOfCallCtx_) {
+        if (const TypeRef* tt = ctx_.exprType(*nm.target);
+            tt && tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+            tt->headName() == "DictionaryEntry" &&
+            tt->genericArgs.size() >= 2) {
+            const TypeRef* ft = tt->genericArgs[nm.member == "Key" ? 0 : 1];
+            if (ft) {
+                if (ft->nullable) {
+                    ctx_.setExprType(&nm, const_cast<TypeRef*>(ft));
+                } else {
+                    TypeRef* nn = ctx_.makeTypeRef(*ft);
+                    nn->nullable = true;
+                    ctx_.setExprType(&nm, nn);
+                }
+                return;
+            }
+        }
+    }
     // §7.5 / §26.5 / #458: for a NULLABLE VALUE type receiver (e.g. `int?`,
     // `bool?`, `enum?`, `record?`) memberTargetType returns null (because the
     // type is Primitive or Named-record, not a class TypeSymbol). Also fall

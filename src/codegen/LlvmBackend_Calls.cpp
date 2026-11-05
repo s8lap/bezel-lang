@@ -11261,7 +11261,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::StructType* dtNullableTy = nullptr;
             if (m == "ElementAtOrNull") {
                 const sema::TypeRef* dtEaTy = ctx_.exprType(call);
-                if (!dtEaTy || !isNullableSyntheticDictEntryTy(dtEaTy)) {
+                if (!dtEaTy || !isNullableDictEntryTy(dtEaTy)) {
                     // Refuse LOUDLY rather than miscompile: this arm builds a
                     // `T?` value, so it is sound only where sema typed the
                     // call `DictionaryEntry<K, V>?`. (The array family's arm
@@ -11598,7 +11598,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // the entry as `DictionaryEntry<K, V>?` -- the tagged
             // `{i8 hasValue; {K, V}}` struct (the SAME shape a nullable
             // record gets, spec §7.2; the synthetic entry's nullable form is
-            // recognised by `isNullableSyntheticDictEntryTy`). The present
+            // recognised by `isNullableDictEntryTy`). The present
             // arm wraps the decoded entry with the tag set; the null arm
             // produced the all-zero struct; the merge PHI picks between them.
             if (m == "ElementAtOrNull") {

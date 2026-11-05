@@ -7069,30 +7069,27 @@ private:
     // unified by isNullableValueTy below. Defined in LlvmBackend_Layout.cpp
     // (needs the record-declaration kind check, like isNullableEnumTy).
     bool isNullableRecordTy(const sema::TypeRef* rt);
-    // fix #8232 (stdlib §4.8 / §5, v0.355): is rt a NULLABLE SYNTHETIC
-    // `DictionaryEntry<K, V>` -- the declaration-less Named TypeRef sema
-    // builds for a dictionary's §5 element type (`importedName ==
-    // "DictionaryEntry"`, `genericArgs == [K, V]`)?
+    // fix #8232 (stdlib §4.8 / §5, v0.355): is rt a NULLABLE
+    // `DictionaryEntry<K, V>` -- a declaration-less Named TypeRef whose
+    // `headName()` is "DictionaryEntry" with `genericArgs == [K, V]`?
     //
     // stdlib §5's `public method ElementAtOrNull(index: int): T?;` forms its
     // `T?` at the ELEMENT type, and a `Dictionary<K, V>`'s element type is
-    // the synthetic `DictionaryEntry<K, V>` (stdlib §4.8: `public class
-    // Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>`). The synthetic
-    // type has NO TypeSymbol, so `isNullableRecordTy` (which requires
-    // `rt->declaration` to be a record) does not recognise it -- and before
-    // this fix a NULLABLE synthetic entry had NO null representation at all:
-    // `lowerTypeRef` returned the BARE `{K, V}` struct for it, so "null" and
-    // "the entry" were the same bits. The predicate gives the family the
-    // SAME tagged `{i8 hasValue; {K, V}}` struct a nullable record gets
-    // (spec §7.2), so the out-of-range answer is distinguishable from the
-    // entry.
-    //
-    // It is deliberately NARROW: it requires the declaration-less synthetic
-    // shape AND the "DictionaryEntry" imported name AND two type arguments.
-    // A WRITTEN `DictionaryEntry<K, V>` (stdlib §4.8 declares it as a real
-    // record, so a user can name it) carries a declaration and is
-    // `isNullableRecordTy`'s business, not this predicate's.
-    bool isNullableSyntheticDictEntryTy(const sema::TypeRef* rt);
+    // `DictionaryEntry<K, V>` (stdlib §4.8: `public class Dictionary<K, V>:
+    // ICollection<DictionaryEntry<K, V>>`). Neither of its TypeRef spellings
+    // -- the SYNTHETIC element type sema builds (`importedName`) nor a WRITTEN
+    // annotation (`builtinTypeArity` admits the name with no TypeSymbol) --
+    // carries a declaration, so `isNullableRecordTy` (which requires
+    // `rt->declaration` to be a record) recognises neither, and before this
+    // fix a nullable entry had NO null representation at all: the synthetic
+    // form lowered to the BARE `{K, V}` struct (so "null" and "the entry"
+    // were the same bits) and the written form to the `{i8, i32}` fallback
+    // (so a `DictionaryEntry<string, int>?` parameter failed IR verification
+    // against any argument). The predicate gives BOTH spellings the SAME
+    // tagged `{i8 hasValue; {K, V}}` struct a nullable record gets (spec
+    // §7.2), so the out-of-range answer is distinguishable from the entry and
+    // the two spellings agree on one layout.
+    bool isNullableDictEntryTy(const sema::TypeRef* rt);
     // fix #2447 / §35.9 / §7.2: is rt a NULLABLE CHOICE (a nullable Named
     // TypeRef whose declaration is a choice)? "`C?` is the ordinary
     // nullable value type (§7.2)" (§35.9, "Nullable `C?`") — a choice's
@@ -7289,12 +7286,12 @@ private:
                isNullableRecordTy(rt) || isNullableChoiceTy(rt) ||
                isNullableValueBuiltinTy(rt) ||
                isNullableValueStructBuiltinTy(rt) || isNullableUnitTy(rt) ||
-               // fix #8232 (stdlib §4.8 / §5, v0.355): the NULLABLE synthetic
-               // `DictionaryEntry<K, V>` -- §5's `ElementAtOrNull` forms its
-               // `T?` at a dictionary's element type, and that type is the
-               // synthetic (declaration-less) entry. See the predicate's own
-               // declaration for why it needs its own term.
-               isNullableSyntheticDictEntryTy(rt) ||
+               // fix #8232 (stdlib §4.8 / §5, v0.355): the NULLABLE
+               // `DictionaryEntry<K, V>` (synthetic or written) -- §5's
+               // `ElementAtOrNull` forms its `T?` at a dictionary's element
+               // type, and that type has no declaration. See the predicate's
+               // own declaration for why it needs its own term.
+               isNullableDictEntryTy(rt) ||
                isNullableTextWriterTy(rt);
     }
     // narrow #7792 (stdlib §2.1 / §7.4, v0.355): `TextWriter?` — the nullable

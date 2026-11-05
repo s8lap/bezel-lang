@@ -54,6 +54,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -568,4 +569,253 @@ end C;
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
         r, "does not expose `ElementAtOrNull`"));
+}
+
+// ---------------------------------------------------------------------------
+// CONSUMERS of the nullable entry (fix-forward of the first review, which
+// REJECTED 71569383). `d.ElementAtOrNull(i)` on a `Dictionary<K, V>` is a
+// `DictionaryEntry<K, V>?`, laid out as the tagged `{i8 hasValue; {K, V}}`
+// carrier (spec section 7.2). At 71569383 only `!`, `= null` and `??` read it
+// correctly; every row below was MEASURED wrong there:
+//
+//   - a section 7.4 NARROWED read (`if e <> null then e.Key`) GEP'd the bare
+//     `{K, V}` struct over the carrier and read the tag byte as the Key:
+//     `e.Key + e.Value` printed 73732 for 3 + 5, a `string` Key segfaulted;
+//   - section 7.5 `?.Key` / `?.Value` lowered to NOTHING (the #3079 / #2961
+//     warnings: the `Console.WriteLine` printed nothing, the loop sum was 0);
+//   - a WRITTEN `DictionaryEntry<K, V>?` parameter lowered to the `{i8, i32}`
+//     fallback, so passing the entry failed IR verification.
+// ---------------------------------------------------------------------------
+
+// The review's r30: the section 7.4 narrowing idiom over an int/int entry.
+BEZEL_TEST(collection_elementatornull_8232, dict_entry_narrowed_read_int_spec_7_4) {
+    expectOut(runAotChecked(R"BZL(
+module M; import System; import System.Collections.Generic;
+class C
+  public static method Main(): int
+    using var d := new Dictionary<int, int>();
+    d.Add(3, 5);
+    var e := d.ElementAtOrNull(0);
+    if e <> null then Console.WriteLine(e.Key + e.Value); end if;
+    var f := d.ElementAtOrNull(1);
+    if f <> null then Console.WriteLine(f.Key); else Console.WriteLine("none"); end if;
+    return 0;
+  end Main;
+end C;
+)BZL"),
+              "8\nnone\n");
+}
+
+// The review's r29: the same idiom over a `string` Key (segfaulted).
+BEZEL_TEST(collection_elementatornull_8232, dict_entry_narrowed_read_string_key_spec_7_4) {
+    expectOut(runAotChecked(R"BZL(
+module M; import System; import System.Collections.Generic;
+class C
+  public static method Main(): int
+    using var d := new Dictionary<string, int>();
+    d.Add("ka", 5);
+    var e := d.ElementAtOrNull(0);
+    if e <> null then Console.WriteLine(e.Key); Console.WriteLine(e.Value); end if;
+    return 0;
+  end Main;
+end C;
+)BZL"),
+              "ka\n5\n");
+}
+
+// The review's r20: section 7.5 `?.Key` / `?.Value` on the UNBOUND call
+// result, present and absent, string/string. `runAot`, not `runAotChecked`:
+// an UNBOUND string-keyed entry temporary leaks its rebuilt Key and minted
+// Value on every dictionary terminal. That is the pre-existing `ElementAt` twin
+// (7000 B / 400 allocs for 200 `d.ElementAt(i).Key` reads at the base),
+// tracked as #8267. The leak-free BOUND shapes are pinned under ASan below.
+BEZEL_TEST(collection_elementatornull_8232, dict_entry_null_conditional_unbound_spec_7_5) {
+    expectOut(runAot(R"BZL(
+module M; import System; import System.Collections.Generic;
+class C
+  public static method Main(): int
+    using var d := new Dictionary<string, string>();
+    d.Add("ka", "va");
+    Console.WriteLine(d.ElementAtOrNull(0)?.Key ?? "none");
+    Console.WriteLine(d.ElementAtOrNull(1)?.Key ?? "none");
+    var k := d.ElementAtOrNull(0)?.Value;
+    Console.WriteLine(k ?? "none");
+    return 0;
+  end Main;
+end C;
+)BZL"),
+              "ka\nnone\nva\n");
+}
+
+// The review's r23: a VALUE-typed member, so the section 7.5 result is an
+// `int?` carrier, present and absent.
+BEZEL_TEST(collection_elementatornull_8232, dict_entry_null_conditional_int_value_spec_7_5) {
+    expectOut(runAotChecked(R"BZL(
+module M; import System; import System.Collections.Generic;
+class C
+  public static method Main(): int
+    using var d := new Dictionary<int, int>();
+    d.Add(1, 100);
+    Console.WriteLine(d.ElementAtOrNull(0)?.Value ?? -1);
+    Console.WriteLine(d.ElementAtOrNull(3)?.Value ?? -1);
+    Console.WriteLine(d.ElementAtOrNull(0)?.Key ?? -1);
+    return 0;
+  end Main;
+end C;
+)BZL"),
+              "100\n-1\n1\n");
+}
+
+// The review's r15: `?.Key` inside an expression, looped (keys "ka", "kb";
+// index `i mod 3` is out of range one time in three). 200 iterations:
+// 67 x 2 + 67 x 2 + 66 x 3 = 466. `runAot` for the #8267 reason above.
+BEZEL_TEST(collection_elementatornull_8232, dict_entry_null_conditional_in_loop_spec_7_5) {
+    expectOut(runAot(R"BZL(
+module M; import System; import System.Collections.Generic;
+class C
+  public static method Main(): int
+    using var d := new Dictionary<string, string>();
+    d.Add("ka", "va"); d.Add("kb", "vb");
+    var t := 0;
+    for var i in 0..<200 do
+      t := t + (d.ElementAtOrNull(i mod 3)?.Key ?? "xyz").Length;
+    end for;
+    Console.WriteLine(t);
+    return 0;
+  end Main;
+end C;
+)BZL"),
+              "466\n");
+}
+
+// The review's r26: `?.` and the narrowed read on BOUND locals.
+BEZEL_TEST(collection_elementatornull_8232, dict_entry_null_conditional_bound_spec_7_5) {
+    expectOut(runAotChecked(R"BZL(
+module M; import System; import System.Collections.Generic;
+class C
+  public static method Main(): int
+    using var d := new Dictionary<string, int>();
+    d.Add("ka", 5);
+    var e := d.ElementAtOrNull(0);
+    var f := d.ElementAtOrNull(4);
+    Console.WriteLine(e?.Value ?? -1);
+    Console.WriteLine(f?.Value ?? -1);
+    Console.WriteLine(e?.Key ?? "none");
+    Console.WriteLine(f?.Key ?? "none");
+    if e <> null then Console.WriteLine(e.Key); end if;
+    return 0;
+  end Main;
+end C;
+)BZL"),
+              "5\n-1\nka\nnone\nka\n");
+}
+
+// The review's r27: the entry passed to a WRITTEN `DictionaryEntry<K, V>?`
+// parameter (stdlib section 4.8 declares the record, so a user can name it),
+// plus the section 5.1 widening of a non-nullable entry and a `null` literal.
+// `runAot`: a string-keyed entry temporary passed BY VALUE is never released
+// (#6153 / #8267). The non-nullable `Show(d.ElementAt(0))` twin leaks the
+// same 35 B / 2 allocs at the base. The int/int row below pins the parameter
+// path under ASan.
+BEZEL_TEST(collection_elementatornull_8232, dict_entry_to_written_nullable_parameter) {
+    expectOut(runAot(R"BZL(
+module M; import System; import System.Collections.Generic;
+class C
+  static method Show(e: DictionaryEntry<string, int>?): string
+    if e = null then return "null"; end if;
+    return e!.Key + ":" + e!.Value.ToString();
+  end Show;
+  static method ShowNarrowed(e: DictionaryEntry<string, int>?): string
+    if e <> null then return e.Key + "=" + e.Value.ToString(); end if;
+    return "nil";
+  end ShowNarrowed;
+  public static method Main(): int
+    using var d := new Dictionary<string, int>();
+    d.Add("ka", 5);
+    Console.WriteLine(Show(d.ElementAtOrNull(0)));
+    Console.WriteLine(Show(d.ElementAtOrNull(1)));
+    Console.WriteLine(ShowNarrowed(d.ElementAtOrNull(0)));
+    Console.WriteLine(ShowNarrowed(d.ElementAtOrNull(1)));
+    Console.WriteLine(Show(d.ElementAt(0)));
+    Console.WriteLine(Show(null));
+    return 0;
+  end Main;
+end C;
+)BZL"),
+              "ka:5\nnull\nka=5\nnil\nka:5\nnull\n");
+}
+
+// Every consumer above, looped 100x over a STRING key AND a STRING value
+// (the rebuilt Key and the minted Value are the entry's two ownership
+// halves): under runAotChecked's generated-code ASan nothing may leak.
+BEZEL_TEST(collection_elementatornull_8232, dict_entry_consumers_loop_100_no_leak) {
+    expectNoLeak(runAotChecked(R"BZL(
+module M; import System; import System.Collections.Generic;
+class C
+  public static method Main(): int
+    using var d := new Dictionary<string, string>();
+    d.Add("a", "aa"); d.Add("bb", "bbb");
+    var t := 0;
+    for var i in 0..<100 do
+      var e := d.ElementAtOrNull(i mod 3);
+      if e <> null then t := t + e.Key.Length + e.Value.Length; end if;
+      t := t + (e?.Key ?? "xyzw").Length;
+      t := t + (e?.Value ?? "").Length;
+    end for;
+    Console.WriteLine(t);
+    return 0;
+  end Main;
+end C;
+)BZL"),
+                 "666\n");
+}
+
+// The written-parameter and `?.` consumers on UNBOUND int/int entries,
+// looped 100x under ASan (no heap field, so no #8267 leak to inherit).
+// i mod 3 == 0 (34x): 2 * 10 + 10; == 1 (33x): 3 * 100 + 100;
+// == 2 (33x, out of range): -1 + 1000 -> 1020 + 13200 + 32967 = 47187.
+BEZEL_TEST(collection_elementatornull_8232, dict_entry_int_param_and_null_conditional_loop_100_no_leak) {
+    expectNoLeak(runAotChecked(R"BZL(
+module M; import System; import System.Collections.Generic;
+class C
+  static method Score(e: DictionaryEntry<int, int>?): int
+    if e <> null then return e.Key * e.Value; end if;
+    return -1;
+  end Score;
+  public static method Main(): int
+    using var d := new Dictionary<int, int>();
+    d.Add(2, 10); d.Add(3, 100);
+    var t := 0;
+    for var i in 0..<100 do
+      t := t + Score(d.ElementAtOrNull(i mod 3));
+      t := t + (d.ElementAtOrNull(i mod 3)?.Value ?? 1000);
+    end for;
+    Console.WriteLine(t);
+    return 0;
+  end Main;
+end C;
+)BZL"),
+                 "47187\n");
+}
+
+// A member type that is ITSELF nullable (`Dictionary<int, int?>`): the
+// section 7.5 result of `?.Value` is that same `int?`, null both when the
+// entry is absent and when the stored value is null.
+BEZEL_TEST(collection_elementatornull_8232, dict_entry_null_conditional_nullable_value_spec_7_5) {
+    expectOut(runAotChecked(R"BZL(
+module M; import System; import System.Collections.Generic;
+class C
+  public static method Main(): int
+    using var d := new Dictionary<int, int?>();
+    d.Add(3, 5); d.Add(4, null);
+    Console.WriteLine(d.ElementAtOrNull(0)?.Value ?? -1);
+    Console.WriteLine(d.ElementAtOrNull(1)?.Value ?? -2);
+    Console.WriteLine(d.ElementAtOrNull(2)?.Value ?? -3);
+    var e := d.ElementAtOrNull(0);
+    if e <> null then Console.WriteLine(e.Value ?? -4); end if;
+    return 0;
+  end Main;
+end C;
+)BZL"),
+              "5\n-2\n-3\n5\n");
 }

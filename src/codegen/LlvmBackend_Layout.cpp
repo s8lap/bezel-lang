@@ -1045,22 +1045,26 @@ bool Emitter::isNullableRecordTy(const sema::TypeRef* rt) {
 }
 
 
-// fix #8232 (stdlib §4.8 / §5, v0.355): the NULLABLE SYNTHETIC
-// `DictionaryEntry<K, V>` -- see the declaration comment in
-// LlvmBackend_impl.hpp.
+// fix #8232 (stdlib §4.8 / §5, v0.355): the NULLABLE `DictionaryEntry<K, V>`
+// -- see the declaration comment in LlvmBackend_impl.hpp.
 //
-// The shape is the declaration-less Named TypeRef sema builds for a
-// dictionary's §5 element type (`ExprTypecheck_Calls.cpp`'s `entryTy` block
-// and `ExprTypecheck.cpp`'s §4.8 for-in case): `declaration == nullptr`,
-// `astNode == nullptr`, `importedName == "DictionaryEntry"`, and two type
-// arguments. The `importedName` is load-bearing: a WRITTEN
-// `DictionaryEntry<K, V>` (stdlib §4.8 declares the record, so a user can
-// name it) carries a declaration and belongs to `isNullableRecordTy`.
-bool Emitter::isNullableSyntheticDictEntryTy(const sema::TypeRef* rt) {
+// Two TypeRef shapes spell the type, and both are declaration-less: the
+// SYNTHETIC one sema builds for a dictionary's §5 element type
+// (`ExprTypecheck_Calls.cpp`'s `entryTy` block and `ExprTypecheck.cpp`'s
+// §4.8 for-in case: `importedName == "DictionaryEntry"`, no astNode), and the
+// WRITTEN one a user annotation resolves to (`TypeResolution_Names.cpp`'s
+// `builtinTypeArity` admits `DictionaryEntry` at arity 2 with NO TypeSymbol:
+// it carries an astNode, and its `declaration` stays null). `headName()`
+// reads either spelling (the astNode's head for the written form, the
+// importedName for the synthetic one) -- the same test `lowerTypeRef`'s
+// `{K, V}` arm uses, so the nullable form's PAYLOAD is that same struct for
+// both, and a synthetic `d.ElementAtOrNull(0)` passed to a written
+// `DictionaryEntry<K, V>?` parameter is the SAME LLVM type on both sides.
+bool Emitter::isNullableDictEntryTy(const sema::TypeRef* rt) {
     if (!rt || !rt->nullable) return false;
     if (rt->kind != sema::TypeRef::Kind::Named) return false;
-    if (rt->declaration || rt->astNode) return false;
-    if (rt->importedName != "DictionaryEntry") return false;
+    if (rt->declaration) return false;
+    if (rt->headName() != "DictionaryEntry") return false;
     if (rt->genericArgs.size() < 2) return false;
     return rt->genericArgs[0] != nullptr && rt->genericArgs[1] != nullptr;
 }
@@ -3536,16 +3540,16 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
         return llvm::StructType::get(
             llvm_, {nullablePrimHasValTy(), recordStruct(rt->declaration)});
     }
-    // fix #8232 (stdlib §4.8 / §5, v0.355): the NULLABLE SYNTHETIC
+    // fix #8232 (stdlib §4.8 / §5, v0.355): the NULLABLE
     // `DictionaryEntry<K, V>` -- §5's `ElementAtOrNull(index: int): T?` forms
-    // its `T?` at a dictionary's ELEMENT type, and that type is the
-    // synthetic (declaration-less) entry, which `isNullableRecordTy` does not
-    // recognise. The payload is the SAME bare `{K, V}` struct the
-    // non-nullable synthetic entry lowers to (the `DictionaryEntry`/
+    // its `T?` at a dictionary's ELEMENT type, and that type (synthetic or
+    // written) has no declaration, so `isNullableRecordTy` does not
+    // recognise it. The payload is the SAME bare `{K, V}` struct the
+    // non-nullable entry lowers to (the `DictionaryEntry`/
     // `DrainedEntry` branch of `lowerTypeRef` below), with the leading
     // hasValue tag distinguishing null from any entry -- exactly the shape a
     // nullable record gets.
-    if (isNullableSyntheticDictEntryTy(rt)) {
+    if (isNullableDictEntryTy(rt)) {
         sema::TypeRef nn = *rt;
         nn.nullable = false;
         llvm::Type* payload = lowerTypeRef(&nn);
