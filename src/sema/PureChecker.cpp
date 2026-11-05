@@ -1199,6 +1199,7 @@ void PureBodyWalker::checkPureCtorChainPurity(
             // primary's content is not re-checkable in this compilation —
             // the same admission the pre-#8163 code made.
             const auto* td =
+                // SEAM-DEBT: #8182 an imported primary's content is admitted unchecked
                 dynamic_cast<const ast::TypeDecl*>(targetClass->decl);
             if (td && td->kind == ast::TypeDeclKind::Class &&
                 td->hasPositionalFields) {
