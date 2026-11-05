@@ -10228,6 +10228,25 @@ static TypeRef* consoleStreamInferredType(SemaContext& ctx,
     return ref;
 }
 
+// narrow #7792 (stdlib §2.1 / §7.4, spec §7.7, §20, §19.2, v0.355): a bare
+// `Console.Out` / `Console.Error` as an OPERAND of a value-merging form — the
+// right operand of `??`, a branch of an `if` expression, an arm of a `case`
+// expression — takes the `TextWriter` type consoleStreamInferredType mints
+// for a `var` initializer, recorded on the node. In every other position the
+// property read stays untyped (#7924: a typed RECEIVER re-routes the
+// syntactic `Console.Out.Write` paths). Before this the merge saw one untyped
+// arm: `n ?? Console.Error` was typed off the left operand alone and codegen,
+// seeing no right-operand type, fell to its "non-nullable left" arm and
+// returned the RAW `{i8, i32}` carrier (descriptor 0 for a null `n`), and an
+// `if` / `case` expression whose arms were all stream reads had no type.
+TypeRef* ExprTC::typeConsoleStreamOperand(const ast::Expr* e) {
+    if (!e) return nullptr;
+    if (TypeRef* t = ctx_.exprType(*e)) return t;
+    TypeRef* minted = consoleStreamInferredType(ctx_, *e);
+    if (minted) ctx_.setExprType(e, minted);
+    return minted;
+}
+
 // #1621 / §31.2.1: a headless Named TypeRef standing for a built-in
 // exception ancestor name reached only through the built-in exception
 // hierarchy table (no AST node names it directly — e.g. `Exception` reached
@@ -10538,8 +10557,9 @@ void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
             }
         }
     }
-    TypeRef* tt = cnd.thenValue ? ctx_.exprType(*cnd.thenValue) : nullptr;
-    TypeRef* et = cnd.elseValue ? ctx_.exprType(*cnd.elseValue) : nullptr;
+    // narrow #7792: a `Console.Out` / `Console.Error` branch is a `TextWriter`.
+    TypeRef* tt = typeConsoleStreamOperand(cnd.thenValue.get());
+    TypeRef* et = typeConsoleStreamOperand(cnd.elseValue.get());
     // §20 / §7.4 (#1089): a bare `null` branch does not impose a type — it makes
     // the RESULT nullable around the OTHER branch's type. `T if c else null`
     // (and its mirror) is `T?`. A `null` literal carries no type of its own, so
@@ -10662,7 +10682,8 @@ void ExprTC::typeCase(const ast::CaseExpr& cse, const ast::Expr& e) {
             dynamic_cast<const ast::NullLiteralExpr*>(arm.exprBody.get()) !=
             nullptr;
         if (isNullLit) sawNullArm = true;
-        TypeRef* at = ctx_.exprType(*arm.exprBody);
+        // narrow #7792: a `Console.Out` / `Console.Error` arm is a `TextWriter`.
+        TypeRef* at = typeConsoleStreamOperand(arm.exprBody.get());
         if (!at) continue;  // diverging (bottom) arm — no constraint
         if (!isNullLit) {
             // fix #6086 (§20, §19.1, v0.338): the running common type of the

@@ -3414,6 +3414,13 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
         return llvm::StructType::get(
             llvm_, {nullablePrimHasValTy(), lowerTypeRef(&nn)});
     }
+    // narrow #7792 (stdlib §2.1 / §7.4, v0.355): `TextWriter?` — the payload is
+    // the i32 standard-stream descriptor a TextWriter value is (see
+    // isNullableTextWriterTy). The same `{i8, i32}` shape the bare-type-param
+    // placeholder arm of lowerTypeRef produced by accident, now reached on
+    // purpose through the family predicate.
+    if (isNullableTextWriterTy(rt))
+        return llvm::StructType::get(llvm_, {nullablePrimHasValTy(), i32()});
     return nullablePrimStructTy(rt->primitive);
 }
 

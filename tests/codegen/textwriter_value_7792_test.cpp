@@ -35,13 +35,33 @@
 // admitted. A type test or cast into `TextWriter` (`as`, `is`, a typed `case`
 // binding), and one of a `TextWriter` value, is a located compile error. A
 // `TextWriter` never given a stream is a §7.9 / §17.11 compile error, as for
-// a user class. The last rows pin all of that.
+// a user class. The rows after the first block pin all of that.
+//
+// narrow #7792, third fix-forward: `TextWriter?` is a member of codegen's
+// nullable-VALUE family and a bare `Console.Out` / `Console.Error` operand of
+// `??` / an `if` expression / a `case` expression is typed `TextWriter`, so
+// every spelling that PRODUCES a TextWriter from a nullable one (`??`, the
+// `if` / `case` arms, `?.`, `default`, record / class fields, array and
+// Dictionary elements, a generic field, a lambda / async / iterator result)
+// lowers to the right stream. The last block of rows runs each spelling with
+// fd 0 opened read-write on an empty file (`runWithFd0Trap`) and asserts the
+// stdout AND stderr text and that fd 0 received nothing -- the oracle under
+// which the review measured a null `TextWriter?` writing through descriptor 0.
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "codegen/LlvmBackend.hpp"
+#include "driver/Driver.hpp"
 #include "lexer/Lexer.hpp"
 #include "parser/Parser.hpp"
 #include "sema/ExprTypecheck.hpp"
@@ -51,6 +71,8 @@
 #include "support/Diagnostic.hpp"
 #include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
+#include "support/scratch_dir.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 #include "llvm/IR/LLVMContext.h"
@@ -98,6 +120,86 @@ const char* kSub =
 
 const char* kSubNeedle = "a user subclass of `TextWriter`; converting it to the "
                          "built-in `TextWriter` type is not implemented";
+
+// narrow #7792 (stdlib §2.1, v0.355) -- the fd-0 trap. A `TextWriter` value
+// is a standard-stream descriptor, so a TextWriter produced WITHOUT the
+// representation's constructor (a null `TextWriter?` on the left of `??`,
+// before this fix) holds descriptor 0 and `w.WriteLine(..)` writes to
+// STANDARD INPUT. `runAot` opens fd 0 on /dev/null read-only, where such a
+// write fails silently and the row sees only "nothing reached stdout" -- a
+// vacuous oracle. This helper compiles through the real Driver (the AOT path)
+// and runs the executable with fd 0 opened READ-WRITE on an empty scratch file,
+// capturing stdout and stderr; a row asserts the stderr text (stdlib §2.1:
+// `Console.Error` writes to standard error) AND that the fd-0 file stayed
+// empty. The reviewer measured the defect exactly this way.
+struct Fd0TrapOutcome {
+    bool compiled = false;
+    int exitCode = -1;
+    std::string stdoutText;
+    std::string stderrText;
+    long fd0Bytes = -1;  // bytes written through descriptor 0; must stay 0
+};
+
+static const std::filesystem::path& wtDirTw7792() {
+    return wtScratchDir("wt-tw7792");
+}
+
+static std::string slurp(const std::string& path) {
+    std::ifstream in(path);
+    return std::string(std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>());
+}
+
+Fd0TrapOutcome runWithFd0Trap(const std::string& source) {
+    auto dir = wtDirTw7792();
+    std::string stem = unique_stem("bezel_tw7792");
+    std::string src = (dir / (stem + ".bzl")).string();
+    std::string exe = (dir / stem).string();
+    std::string outf = (dir / (stem + ".stdout")).string();
+    std::string errf = (dir / (stem + ".stderr")).string();
+    std::string fd0f = (dir / (stem + ".fd0")).string();
+    {
+        std::ofstream out(src);
+        out << source;
+    }
+    Fd0TrapOutcome o;
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(src, exe);
+    o.compiled = r.success;
+    if (r.success) {
+        pid_t pid = ::fork();
+        if (pid == 0) {
+            int fd0 = ::open(fd0f.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+            int fd1 = ::open(outf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            int fd2 = ::open(errf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (fd0 < 0 || fd1 < 0 || fd2 < 0) ::_exit(126);
+            ::dup2(fd0, 0);
+            ::dup2(fd1, 1);
+            ::dup2(fd2, 2);
+            ::close(fd0);
+            ::close(fd1);
+            ::close(fd2);
+            ::execl(exe.c_str(), exe.c_str(), (char*)nullptr);
+            ::_exit(127);
+        }
+        if (pid > 0) {
+            int status = 0;
+            ::waitpid(pid, &status, 0);
+            if (WIFEXITED(status)) o.exitCode = WEXITSTATUS(status);
+            else if (WIFSIGNALED(status)) o.exitCode = 128 + WTERMSIG(status);
+            o.stdoutText = slurp(outf);
+            o.stderrText = slurp(errf);
+            struct stat st {};
+            if (::stat(fd0f.c_str(), &st) == 0) o.fd0Bytes = (long)st.st_size;
+        }
+    }
+    std::remove(src.c_str());
+    std::remove(exe.c_str());
+    std::remove(outf.c_str());
+    std::remove(errf.c_str());
+    std::remove(fd0f.c_str());
+    return o;
+}
 
 }  // namespace
 
@@ -636,4 +738,293 @@ BEZEL_TEST(textwriter_value_7792, nullable_subclass_local_null_test_runs_7_4) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
+
+// ---------------------------------------------------------------------------
+// narrow #7792 (stdlib §2.1 / §7.4, spec §7.7, §20, §19.2, v0.355): every
+// spelling that PRODUCES a `TextWriter` / `TextWriter?` value from a nullable
+// one. Before this fix `TextWriter?` was not a member of codegen's
+// nullable-VALUE family (it reached the `{i8, i32}` carrier only by accident)
+// and a bare `Console.Out` / `Console.Error` operand carried no type, so
+// `n ?? Console.Error` returned the RAW carrier: a null `n` wrote through
+// DESCRIPTOR 0. MEASURED on 1021a84f with the fd-0 trap: `ce\n` landed in the
+// file opened on fd 0, stderr stayed empty. Each row below asserts the stderr
+// / stdout text and that fd 0 received nothing.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string twMain(const std::string& body, const std::string& decls = "") {
+    return "module M; " + decls + "class P public static method Main() " + body +
+           " Console.WriteLine(\"end\"); end Main; end P;";
+}
+
+// The common oracle: the program compiled, exited 0, wrote `err` to standard
+// error and `out` to standard output, and NOTHING through descriptor 0.
+void expectStreams(const Fd0TrapOutcome& o, const std::string& out,
+                   const std::string& err) {
+    BEZEL_EXPECT_TRUE(o.compiled);
+    BEZEL_EXPECT_EQ(o.exitCode, 0);
+    BEZEL_EXPECT_EQ(o.stdoutText, out);
+    BEZEL_EXPECT_EQ(o.stderrText, err);
+    BEZEL_EXPECT_EQ(o.fd0Bytes, 0L);
+}
+
+}  // namespace
+
+// z01: the review's repro -- a null `TextWriter?` local on the left of `??`,
+// the result inferred into a `var`.
+BEZEL_TEST(textwriter_value_7792, coalesce_null_left_var_local_2_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var n: TextWriter? := null; var w := n ?? Console.Error; "
+        "w.WriteLine(\"ce\");"));
+    expectStreams(o, "end\n", "ce\n");
+}
+
+// z02: the `??` result used directly as the receiver.
+BEZEL_TEST(textwriter_value_7792, coalesce_null_left_direct_receiver_2_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var n: TextWriter? := null; (n ?? Console.Error).WriteLine(\"ce\");"));
+    expectStreams(o, "end\n", "ce\n");
+}
+
+// z03: the result stored into a local DECLARED `TextWriter`.
+BEZEL_TEST(textwriter_value_7792, coalesce_null_left_typed_local_2_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var n: TextWriter? := null; var w: TextWriter := n ?? Console.Error; "
+        "w.WriteLine(\"ce\");"));
+    expectStreams(o, "end\n", "ce\n");
+}
+
+// z05: a nullable PARAMETER on the left, called with `null` and with a stream.
+BEZEL_TEST(textwriter_value_7792, coalesce_null_left_parameter_2_1) {
+    auto o = runWithFd0Trap(
+        "module M; class P static method H(n: TextWriter?) "
+        "var w := n ?? Console.Error; w.WriteLine(\"ce\"); end H; "
+        "public static method Main() H(null); H(Console.Out); "
+        "Console.WriteLine(\"end\"); end Main; end P;");
+    expectStreams(o, "ce\nend\n", "ce\n");
+}
+
+// z07: `?? Console.Out` -- the right operand is standard OUTPUT.
+BEZEL_TEST(textwriter_value_7792, coalesce_null_left_out_right_2_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var n: TextWriter? := null; var w := n ?? Console.Out; "
+        "w.WriteLine(\"co\");"));
+    expectStreams(o, "co\nend\n", "");
+}
+
+// z09: a nullable FIELD on the left.
+BEZEL_TEST(textwriter_value_7792, coalesce_null_left_field_2_1) {
+    auto o = runWithFd0Trap(
+        "module M; class H public n: TextWriter?; "
+        "public constructor() n := null; end constructor; end H; "
+        "class P public static method Main() var h := new H(); "
+        "(h.n ?? Console.Error).WriteLine(\"ce\"); "
+        "Console.WriteLine(\"end\"); end Main; end P;");
+    expectStreams(o, "end\n", "ce\n");
+}
+
+// The `??` inside a loop: three `Write("x")` through the coalesced stream,
+// then a newline through `Console.Error` directly.
+BEZEL_TEST(textwriter_value_7792, coalesce_null_left_in_loop_2_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var n: TextWriter? := null; for var i in 0..<3 do "
+        "var w := n ?? Console.Error; w.Write(\"x\"); end for; "
+        "Console.Error.WriteLine(\"\");"));
+    expectStreams(o, "end\n", "xxx\n");
+}
+
+// The right operand's other shapes: a `null` (result stays `TextWriter?`), a
+// nullable local, a `TextWriter` parameter. These were correct before; pinned
+// against regression by the family change.
+BEZEL_TEST(textwriter_value_7792, coalesce_right_operand_shapes_7_7) {
+    auto o = runWithFd0Trap(
+        "module M; class P static method G(n: TextWriter?, d: TextWriter) "
+        "var w := n ?? d; w.WriteLine(\"ce\"); end G; "
+        "public static method Main() var n: TextWriter? := null; "
+        "var m := n ?? null; Console.WriteLine(m = null); "
+        "var o: TextWriter? := Console.Error; var m2 := n ?? o; "
+        "m2!.WriteLine(\"ce2\"); G(null, Console.Error); "
+        "var n2: TextWriter? := null; var o2: TextWriter? := null; "
+        "var w3 := n2 ?? o2 ?? Console.Error; w3.WriteLine(\"ce3\"); "
+        "Console.WriteLine(\"end\"); end Main; end P;");
+    expectStreams(o, "True\nend\n", "ce2\nce\nce3\n");
+}
+
+// An `if` EXPRESSION with a nullable arm and a stream arm (spec §20: the result
+// is `TextWriter?`). Was an IR-verifier abort (the arms had no common lowering).
+BEZEL_TEST(textwriter_value_7792, if_expression_nullable_and_stream_arms_20) {
+    auto o = runWithFd0Trap(twMain(
+        "var n: TextWriter? := null; var flag := true; "
+        "var w2 := (if flag then n else Console.Error); Console.WriteLine(w2 = null); "
+        "var w3 := (if not flag then n else Console.Error); w3!.WriteLine(\"ce\");"));
+    expectStreams(o, "True\nend\n", "ce\n");
+}
+
+// An `if` EXPRESSION whose arms are BOTH bare stream reads (§20): the result is
+// a `TextWriter`. Was a silent drop (no type on either arm, nothing lowered).
+BEZEL_TEST(textwriter_value_7792, if_expression_two_stream_arms_20) {
+    auto o = runWithFd0Trap(twMain(
+        "var flag := true; var w := (if flag then Console.Error else Console.Out); "
+        "w.WriteLine(\"ce\"); var v := (if not flag then Console.Error else Console.Out); "
+        "v.WriteLine(\"co\");"));
+    expectStreams(o, "co\nend\n", "ce\n");
+}
+
+// A `case` EXPRESSION with a nullable arm and a stream arm (§19.2 / §20). Was
+// an IR-verifier abort.
+BEZEL_TEST(textwriter_value_7792, case_expression_arms_19_2) {
+    auto o = runWithFd0Trap(twMain(
+        "var n: TextWriter? := null; var k := 1; "
+        "var w := (case k of 0 => n, _ => Console.Error); w!.WriteLine(\"ce\"); "
+        "var o: TextWriter? := Console.Error; "
+        "var w2 := (case k of 1 => o, _ => Console.Out); w2!.WriteLine(\"ce2\");"));
+    expectStreams(o, "end\n", "ce\nce2\n");
+}
+
+// `default(TextWriter?)` is null (§7.1) and coalesces to the right operand.
+BEZEL_TEST(textwriter_value_7792, default_nullable_coalesces_7_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var d := default(TextWriter?); Console.WriteLine(d = null); "
+        "var w := d ?? Console.Error; w.WriteLine(\"ce\");"));
+    expectStreams(o, "True\nend\n", "ce\n");
+}
+
+// A `TextWriter?` RECORD field (positional), null and present.
+BEZEL_TEST(textwriter_value_7792, record_field_nullable_9_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var r := new R(null); var w := r.W ?? Console.Error; w.WriteLine(\"ce\"); "
+        "var r2 := new R(Console.Error); r2.W!.WriteLine(\"ce2\");",
+        "record R(W: TextWriter?); "));
+    expectStreams(o, "end\n", "ce\nce2\n");
+}
+
+// A `TextWriter?` CLASS field set from a constructor parameter.
+BEZEL_TEST(textwriter_value_7792, class_field_from_ctor_parameter_7_4) {
+    auto o = runWithFd0Trap(
+        "module M; class H public n: TextWriter?; "
+        "public constructor(w: TextWriter?) n := w; end constructor; end H; "
+        "class P public static method Main() var h := new H(null); "
+        "(h.n ?? Console.Error).WriteLine(\"ce\"); "
+        "var h2 := new H(Console.Error); h2.n!.WriteLine(\"ce2\"); "
+        "Console.WriteLine(\"end\"); end Main; end P;");
+    expectStreams(o, "end\n", "ce\nce2\n");
+}
+
+// An `Array<TextWriter?>` element, null and assigned.
+BEZEL_TEST(textwriter_value_7792, array_element_nullable_15_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var a := new Array<TextWriter?>(2, null); "
+        "var w := a[0] ?? Console.Error; w.WriteLine(\"ce\"); "
+        "a[1] := Console.Error; a[1]!.WriteLine(\"ce2\");"));
+    expectStreams(o, "end\n", "ce\nce2\n");
+}
+
+// A `Dictionary<string, TextWriter?>` value, null and assigned. Was a SEGFAULT
+// of the compiled program.
+BEZEL_TEST(textwriter_value_7792, dictionary_value_nullable_15_3) {
+    auto o = runWithFd0Trap(twMain(
+        "var d := new Dictionary<string, TextWriter?>(); d[\"a\"] := null; "
+        "var w := d[\"a\"] ?? Console.Error; w.WriteLine(\"ce\"); "
+        "d[\"b\"] := Console.Error; d[\"b\"]!.WriteLine(\"ce2\");"));
+    expectStreams(o, "end\n", "ce\nce2\n");
+}
+
+// A generic class instantiated at `T = TextWriter?` and `T = TextWriter`.
+BEZEL_TEST(textwriter_value_7792, generic_field_at_textwriter_14_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var b := new Box<TextWriter?>(null); var w := b.v ?? Console.Error; "
+        "w.WriteLine(\"ce\"); var b2 := new Box<TextWriter>(Console.Error); "
+        "b2.v.WriteLine(\"ce2\");",
+        "class Box<T> public v: T; public constructor(x: T) v := x; "
+        "end constructor; end Box; "));
+    expectStreams(o, "end\n", "ce\nce2\n");
+}
+
+// A lambda whose body is the `??` (declared `() -> TextWriter`). Was an
+// IR-verifier abort.
+BEZEL_TEST(textwriter_value_7792, lambda_returns_coalesce_27_1) {
+    auto o = runWithFd0Trap(twMain(
+        "var n: TextWriter? := null; "
+        "var f: () -> TextWriter := lambda() => n ?? Console.Error; "
+        "f().WriteLine(\"ce\");"));
+    expectStreams(o, "end\n", "ce\n");
+}
+
+// An async method returning `Task<TextWriter>` from the `??`, awaited. Was a
+// silent drop (the awaited value never reached the write).
+BEZEL_TEST(textwriter_value_7792, async_returns_coalesce_30_1) {
+    auto o = runWithFd0Trap(
+        "module M; class P static async method A(n: TextWriter?): Task<TextWriter> "
+        "return n ?? Console.Error; end A; "
+        "public static async method Main(): Task<int> var w := await A(null); "
+        "w.WriteLine(\"ce\"); Console.WriteLine(\"end\"); return 0; end Main; end P;");
+    expectStreams(o, "end\n", "ce\n");
+}
+
+// An iterator yielding the `??` and then `Console.Out`.
+BEZEL_TEST(textwriter_value_7792, iterator_yields_coalesce_16_1) {
+    auto o = runWithFd0Trap(
+        "module M; class P static method It(n: TextWriter?): IEnumerable<TextWriter> "
+        "yield return n ?? Console.Error; yield return Console.Out; end It; "
+        "public static method Main() for var w in It(null) do w.WriteLine(\"ce\"); "
+        "end for; Console.WriteLine(\"end\"); end Main; end P;");
+    expectStreams(o, "ce\nend\n", "ce\n");
+}
+
+// The `??` result at a RETURN, an ARGUMENT, a FIELD store, and a call result
+// on the left.
+BEZEL_TEST(textwriter_value_7792, coalesce_at_return_argument_field_store_7_7) {
+    auto o = runWithFd0Trap(
+        "module M; class H public w: TextWriter; "
+        "public constructor(n: TextWriter?) w := n ?? Console.Error; end constructor; "
+        "end H; class P "
+        "static method R(n: TextWriter?): TextWriter return n ?? Console.Error; end R; "
+        "static method Use(w: TextWriter) w.WriteLine(\"ce2\"); end Use; "
+        "static method Pick(k: int): TextWriter? "
+        "return (if k = 0 then null else Console.Error); end Pick; "
+        "public static method Main() R(null).WriteLine(\"ce\"); "
+        "var n: TextWriter? := null; Use(n ?? Console.Error); "
+        "var h := new H(null); h.w.WriteLine(\"ce3\"); "
+        "var w := Pick(0) ?? Console.Error; w.WriteLine(\"ce4\"); "
+        "Pick(1)!.WriteLine(\"ce5\"); "
+        "Console.WriteLine(\"end\"); end Main; end P;");
+    expectStreams(o, "end\n", "ce\nce2\nce3\nce4\nce5\n");
+}
+
+// A `TextWriter?`-returning method with `return null` on one path.
+BEZEL_TEST(textwriter_value_7792, nullable_return_null_path_coalesces_7_7) {
+    auto o = runWithFd0Trap(
+        "module M; class P static method Pick(z: bool): TextWriter? "
+        "if z then return null; end; return Console.Out; end Pick; "
+        "public static method Main() var w := Pick(true) ?? Console.Error; "
+        "w.WriteLine(\"ce\"); Pick(false)!.WriteLine(\"co\"); "
+        "Console.WriteLine(\"end\"); end Main; end P;");
+    expectStreams(o, "co\nend\n", "ce\n");
+}
+
+// `?.` on a `TextWriter?` receiver (§7.5): skipped when null, writes when
+// present.
+BEZEL_TEST(textwriter_value_7792, null_conditional_write_7_5) {
+    auto o = runWithFd0Trap(twMain(
+        "var n: TextWriter? := null; n?.WriteLine(\"x\"); "
+        "var o: TextWriter? := Console.Error; o?.WriteLine(\"ce\");"));
+    expectStreams(o, "end\n", "ce\n");
+}
+
+// The controls the review found correct (z04, z06, z08, the narrowed read and
+// `??=`), re-pinned under the fd-0 trap so the family change cannot regress
+// them.
+BEZEL_TEST(textwriter_value_7792, nullable_controls_under_fd0_trap_7_4) {
+    auto o = runWithFd0Trap(twMain(
+        "var n: TextWriter? := Console.Error; var w := n ?? Console.Out; "
+        "w.WriteLine(\"ce\"); n!.WriteLine(\"ce2\"); "
+        "var m: TextWriter? := null; "
+        "var w2 := (if m = null then Console.Error else m!); w2.WriteLine(\"ce3\"); "
+        "if n <> null then n.WriteLine(\"ce4\"); end; "
+        "m ??= Console.Error; m!.WriteLine(\"ce5\"); "
+        "var p: TextWriter? := Console.Out; p ??= Console.Error; p!.WriteLine(\"co\"); "
+        "Console.WriteLine(n = null); Console.WriteLine(m <> null);"));
+    expectStreams(o, "co\nFalse\nTrue\nend\n", "ce\nce2\nce3\nce4\nce5\n");
 }

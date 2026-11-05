@@ -2892,6 +2892,13 @@ private:
     // the name so `namedRefSimpleName` still reports it correctly.
     TypeRef* builtinAncestorTypeRef(std::string_view name);
 
+    // narrow #7792 (stdlib §2.1 / §7.4, v0.355): the type of a bare
+    // `Console.Out` / `Console.Error` in an OPERAND position of `??`, an `if`
+    // expression or a `case` expression — `TextWriter`, recorded on the node
+    // (the read is otherwise left untyped, #7924). Returns the node's existing
+    // type when it has one; null when `e` is null or not a stream read.
+    TypeRef* typeConsoleStreamOperand(const ast::Expr* e);
+
     // §31.4 (v0.240, #2971): the type of `Exception.CauseChain` — a synthetic
     // `Array<ExceptionInfo>` over program-lifetime static astNodes (the pattern
     // `makeConcreteCollectionResult` uses): `Array` so `.Count` and indexing

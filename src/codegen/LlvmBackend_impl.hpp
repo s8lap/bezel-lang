@@ -7208,7 +7208,25 @@ private:
         return isNullablePrimTy(rt) || isNullableEnumTy(rt) ||
                isNullableRecordTy(rt) || isNullableChoiceTy(rt) ||
                isNullableValueBuiltinTy(rt) ||
-               isNullableValueStructBuiltinTy(rt) || isNullableUnitTy(rt);
+               isNullableValueStructBuiltinTy(rt) || isNullableUnitTy(rt) ||
+               isNullableTextWriterTy(rt);
+    }
+    // narrow #7792 (stdlib §2.1 / §7.4, v0.355): `TextWriter?` — the nullable
+    // form of the built-in `TextWriter`, whose value is the i32 descriptor of
+    // a standard stream (isBuiltinTextWriterTypeRef). It lowers to the same
+    // tagged `{i8 hasValue; i32}` carrier as `int?`, and it is a MEMBER of the
+    // isNullableValueTy family so that every nullable-merge lowering keyed on
+    // that predicate (`??`, an `if` / `case` expression arm, `?.`, `!`,
+    // `= null`, the argument / return / field / element wraps, `default`)
+    // treats it as the value it is. Before this it reached the carrier only
+    // through lowerTypeRef's bare-type-parameter placeholder arm (the name is
+    // not a reserved built-in), and `n ?? Console.Error` fell to the "#1045
+    // non-nullable LHS" arm, returning the RAW carrier: a null `TextWriter?`
+    // then wrote through descriptor 0 (standard input) instead of the right
+    // operand. MEASURED on 1021a84f: `var n: TextWriter? := null;
+    // (n ?? Console.Error).WriteLine("ce");` wrote `ce` to fd 0.
+    bool isNullableTextWriterTy(const sema::TypeRef* rt) {
+        return rt && rt->nullable && isBuiltinTextWriterTypeRef(rt);
     }
     // The tagged struct for a nullable value type (prim, enum, or record). For
     // an enum the value slot is the underlying integer (i32 — CG44); for a record

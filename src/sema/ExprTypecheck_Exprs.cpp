@@ -11731,7 +11731,10 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
     // (rather than the RHS) keeps the whole `??` typed even when the RHS
     // is a call or postfix-`!` expression whose own type is not recorded.
     if (op == "??") {
-        TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
+        // narrow #7792 (stdlib §2.1 / §7.4, v0.355): a bare `Console.Out` /
+        // `Console.Error` operand is a `TextWriter` (see the helper).
+        typeConsoleStreamOperand(be.right.get());
+        TypeRef* lt = typeConsoleStreamOperand(be.left.get());
         // When the LHS is a null literal (typed as nullable Object) or is
         // untyped, prefer the RHS type — `null ?? x` has x's type.
         bool lhsIsNullLiteral =

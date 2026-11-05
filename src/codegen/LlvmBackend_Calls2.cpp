@@ -24483,6 +24483,81 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         reportUniversalGetTypeRefusal(ctx_, call.span.begin);
         return llvm::PoisonValue::get(ptrTy());
     }
+    // narrow #7792 (stdlib §2.1 / §7.4, spec §7.5, v0.355): `w?.WriteLine(x)`,
+    // `w?.Write(x)` and `w?.Flush()` on a `TextWriter?` receiver. The receiver
+    // is the `{i8 hasValue; i32 descriptor}` carrier (isNullableTextWriterTy),
+    // and the members carry no MethodSymbol (built-ins), so no arm below could
+    // lower the call: it lowered to NOTHING and the write was silently
+    // dropped (MEASURED on 1021a84f: `var o: TextWriter? := Console.Error;
+    // o?.WriteLine("ce");` printed nothing anywhere, exit 0). §7.5: the
+    // receiver is evaluated once; if null the access does not occur; otherwise
+    // the member is resolved as `w.M` is. So: test the tag, and on the present
+    // edge run the `.` spelling's own console lowering (tryLowerConsoleCall)
+    // over a synthetic `.` call whose receiver is a placeholder pinned to the
+    // unwrapped descriptor (lowerNullCondBuiltinCall's pattern). The call is a
+    // unit result, returned as the `.` spelling returns it (nullptr).
+    if (const sema::TypeRef* twRcv =
+            nm.target ? ctx_.exprType(*nm.target) : nullptr;
+        twRcv && isNullableTextWriterTy(twRcv) &&
+        (nm.member == "WriteLine" || nm.member == "Write" ||
+         nm.member == "Flush") &&
+        !dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee))) {
+        llvm::Value* rcv = lowerExpr(*nm.target);
+        llvm::Value* hasVal = nullptr;
+        llvm::Value* payload = nullptr;
+        if (rcv && rcv->getType() == nullableValueStructTy(twRcv)) {
+            hasVal = nullablePrimHasValue(rcv);
+            payload = nullablePrimValue(rcv);
+        } else if (rcv && rcv->getType()->isIntegerTy(32)) {
+            // A §7.4-narrowed read already arrives as the bare descriptor.
+            hasVal = builder_.getInt1(true);
+            payload = rcv;
+        } else {
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "`?." + std::string(nm.member) + "` on this `TextWriter?` "
+                "receiver: the receiver did not lower to a stream descriptor, "
+                "so the call cannot be emitted (narrow #7792, stdlib §2.1 / "
+                "§7.4)");
+            return nullptr;
+        }
+        auto* accessBB =
+            llvm::BasicBlock::Create(llvm_, "nctw.access", currentFn_);
+        auto* endBB = llvm::BasicBlock::Create(llvm_, "nctw.end", currentFn_);
+        builder_.CreateCondBr(hasVal, accessBB, endBB);
+        builder_.SetInsertPoint(accessBB);
+        auto placeholder = std::make_unique<ast::IdentifierExpr>();
+        placeholder->name = "<nullcond-receiver>";  // unspellable (#6681)
+        placeholder->span = nm.target->span;
+        sema::TypeRef* placeholderTy = ctx_.makeTypeRef(*twRcv);
+        placeholderTy->nullable = false;
+        ctx_.setExprType(placeholder.get(), placeholderTy);
+        const ast::Expr* placeholderKey = placeholder.get();
+        exprValueOverride_[placeholderKey] = payload;
+        auto dotted = std::make_unique<ast::MemberAccessExpr>();
+        dotted->span = nm.span;
+        dotted->member = nm.member;
+        dotted->target = std::move(placeholder);
+        auto synth = std::make_unique<ast::CallExpr>();
+        synth->span = call.span;
+        synth->callee = std::move(dotted);
+        auto& mutCall = const_cast<ast::CallExpr&>(call);
+        synth->args = std::move(mutCall.args);
+        const bool emitted = tryLowerConsoleCall(*synth);
+        mutCall.args = std::move(synth->args);
+        exprValueOverride_.erase(placeholderKey);
+        nullCondGroupingCallSynth_.push_back(std::move(synth));
+        if (!emitted)
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "`?." + std::string(nm.member) + "` on a `TextWriter?` "
+                "receiver: this argument shape is not one stdlib §7.4 "
+                "declares (`Write(value)`, `WriteLine()`, `WriteLine(value)`, "
+                "`Flush()`), so the call cannot be emitted (narrow #7792)");
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        return nullptr;  // unit result, as the `.` spelling
+    }
     // fix #2345 / §22.3 / §22.4: pre-create any inline `out var x` slot
     // BEFORE the receiver-null branch below is emitted, exactly as lowerCall
     // (the `.` form) already does as its own first statement. Without this,
