@@ -748,6 +748,12 @@ private:
     // "conforms OR cannot be decided here" (the candidate is KEPT).
     // Defined in ExprTypecheck_Calls.cpp beside the gate.
     bool linqIComparableProvablyViolated(const TypeRef* elem) const;
+    // fix #8181 (spec §14.2 *A type parameter as the type argument* /
+    // *Interface conformance* rule 6, §26.5.1, v0.355): is `elem` a type
+    // parameter IN SCOPE that carries NO `where` constraint at all? Such a
+    // parameter guarantees no conformance and no derived property, so a §5
+    // block's `where T: …` clause is PROVABLY unsatisfied at it.
+    bool linqElemIsUnconstrainedTypeParam(const TypeRef* elem) const;
     // fix #7967 (§26.5.1, v0.355): is the argument a FUNCTION value? The
     // three-valued answer the §5 overload's `(T) -> …` parameter needs; see
     // `stdlibLinqCandidateApplicable`'s header in ExprTypecheck.cpp.

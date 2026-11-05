@@ -14529,6 +14529,9 @@ bool ExprTC::extWhereClauseProvablyViolated(
 //         helper does not decide (numeric primitives, `char`, `string`, the
 //         built-in value records, enums, an unresolved element) is KEPT, and
 //         the §5 typing path reports it as before.
+//     And, for EVERY clause (fix #8181): an UNCONSTRAINED type parameter in
+//     scope PROVABLY violates it (§14.2 *A type parameter as the type
+//     argument*); a constrained one is KEPT.
 //
 // (2) THE CALL'S ARGUMENT TYPES, for the §5 overloads whose parameter is a
 //     FUNCTION value (the `(T) -> …` predicate / selector / key forms — the
@@ -14597,6 +14600,19 @@ bool ExprTC::stdlibLinqCandidateApplicable(std::string_view name,
     // (1) THE BLOCK-LEVEL `where` CLAUSE — an applicability filter (§26.5.1),
     // never a ranking signal.
     if (!whereClause.empty() && elemTy) {
+        // fix #8181 (spec §14.2 *A type parameter as the type argument*,
+        // §26.5.1, v0.355): in a GENERIC BODY the receiver's element type is
+        // the body's own type parameter, and §14.2 decides a constraint that
+        // "turns on a type parameter in scope ... by the constraints of the
+        // parameters it turns on". An UNCONSTRAINED parameter guarantees no
+        // conformance (§14.2 *Interface conformance* rule 6) and no derived
+        // property, so EVERY constrained §5 block is PROVABLY inapplicable at
+        // it. The placeholder DEFERRED below, so the §5 candidate was admitted
+        // by name, beat the user's applicable `extension Object` member, and
+        // was lowered per instantiation — MEASURED: at `T = string` a §5
+        // `Sum()` emitted `add i32 %15, ptr %14` and `bezelc` aborted with
+        // malformed IR. A CONSTRAINED parameter is not decided here (KEPT).
+        if (linqElemIsUnconstrainedTypeParam(elemTy)) return false;
         if (whereClause == "where T: INumber<T>") {
             // The ELEVEN §2.19 `INumber<T>` conformer primitives — the same
             // set the §5.1 `Sum()`/`Average()` gate uses (#4730). A class /

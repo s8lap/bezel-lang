@@ -965,6 +965,26 @@ bool truncatedDoubleFits(double t, PrimitiveType pt) {
 
 }  // namespace
 
+// fix #8181 (spec §14.2, v0.355): see the declaration in ExprTypecheck_impl.hpp.
+// §14.2 *A type parameter as the type argument*: "Where a constraint's
+// satisfaction turns on a type parameter in scope, it is decided ... by the
+// constraints of the parameters it turns on". An UNCONSTRAINED parameter
+// ("*(none)* | Any type, nullable or not") guarantees nothing, so every
+// type-bound and derived-property clause is unsatisfied at it. A CONSTRAINED
+// parameter is not decided here (the candidate is KEPT — the sound direction).
+//
+// The shape test (a Named TypeRef with no declaration and no type arguments) is
+// necessary but NOT sufficient — ~50 null-declaration stdlib builtins share it
+// (#4199) — so the name must also be a type parameter declared in scope.
+bool ExprTC::linqElemIsUnconstrainedTypeParam(const TypeRef* elem) const {
+    if (!elem || elem->kind != TypeRef::Kind::Named || elem->declaration ||
+        !elem->genericArgs.empty())
+        return false;
+    const std::string_view n = elem->headName();
+    if (n.empty() || !isInScopeTypeParam(n)) return false;
+    return !isCurrentScopeTypeParamConstrained(n);
+}
+
 // fix #8180 (stdlib §5.1, spec §14.2 *Interface conformance*, v0.355): see the
 // declaration in ExprTypecheck_impl.hpp. stdlib §5.1 declares
 //     public extension IEnumerable<T> where T: IComparable<T>
@@ -981,7 +1001,8 @@ bool truncatedDoubleFits(double t, PrimitiveType pt) {
 //     `IComparable` — the SAME accessor (`declaresBuiltinInterface`) the
 //     #1198 / #3139 gate below uses;
 //   * a USER RECORD that is not `IComparable<Self>` — the SAME
-//     `userRecordSelfComparable` the #8092 gate uses.
+//     `userRecordSelfComparable` the #8092 gate uses;
+//   * an UNCONSTRAINED type parameter in scope (rule 6, #8181).
 // Every other element (numeric primitives, `char`, `string`, the built-in value
 // records, enums, `Guid`, an unresolved / constrained element) is NOT decided
 // here; the §5.1 gate keeps its own per-kind verdict for those.
@@ -993,8 +1014,11 @@ bool ExprTC::linqIComparableProvablyViolated(const TypeRef* elem) const {
         case TypeRef::Kind::Primitive:
             return elem->nullable || elem->primitive == PrimitiveType::Bool;
         case TypeRef::Kind::Named: {
-            // An unresolved or nullable element is not decided here.
-            if (!elem->declaration || elem->nullable) return false;
+            // fix #8181: an UNCONSTRAINED type parameter in scope (rule 6).
+            if (!elem->declaration)
+                return linqElemIsUnconstrainedTypeParam(elem);
+            // A nullable element is not decided here.
+            if (elem->nullable) return false;
             const auto k = elem->declaration->kind;
             if (k == ast::TypeDeclKind::Class ||
                 k == ast::TypeDeclKind::Interface)
