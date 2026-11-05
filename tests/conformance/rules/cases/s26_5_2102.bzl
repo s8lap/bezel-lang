@@ -13,6 +13,7 @@
 //!   method called on a CancellationToken receiver with 'produced no value,
 //!   and no dispatch arm emitted any code'. It passes on the staging tip.
 module M;
+import System.Threading;
 
 public extension CancellationToken
   public method Twice(): int => 2;

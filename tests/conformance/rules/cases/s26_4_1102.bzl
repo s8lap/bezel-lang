@@ -7,6 +7,7 @@
 //! expect: accept
 //! issue: 5998
 module Conf;
+import System.Threading;
 
 extension ChannelSender<T> where T: sendable, notnull
   public method P(): int

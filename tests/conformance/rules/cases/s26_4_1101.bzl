@@ -9,6 +9,7 @@
 //! expect: accept
 //! issue: 5998
 module Conf;
+import System.Threading;
 
 extension Channel<T> where T: sendable
   public method P(): int

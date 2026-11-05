@@ -8,6 +8,7 @@
 //! diagnostic: sendable
 //! issue: 5998
 module Conf;
+import System.Threading;
 
 public class Box<T> where T: sendable
   public method F<U>(c: Channel<U>): int

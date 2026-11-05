@@ -10,6 +10,7 @@
 //! diagnostic: sendable
 //! issue: 5998
 module Conf;
+import System.Threading;
 
 extension Channel<T>
   public method P(): int
