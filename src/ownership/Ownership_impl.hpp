@@ -3273,6 +3273,27 @@ private:
     // of a consumed owned parameter). // per §28.3, §28.5, §28.8
     bool targetIsOwnedField(const ast::Expr& target) const;
 
+    // fix #8160 (stdlib §6.10, v0.355; #5657): is the argument at `pos` an
+    // `owned` CHOICE PAYLOAD slot — the position §6.10 names ("a choice
+    // payload")? The slot's DECLARED marker is what the rule reads; the §28.1
+    // per-instantiation erasure (which vacates the marker's obligation at a
+    // value-like / runtime-managed instantiation) answers a different question
+    // and must not switch the §6.10 rule off. One reader for both call paths
+    // (recordMovesInArgs and handleDischarge).
+    // // per stdlib §6.10, spec §28.1, v0.355
+    bool argIsOwnedChoicePayload(const std::vector<ast::CallArgument>& args,
+                                 std::size_t pos,
+                                 const ast::Expr* callee) const;
+
+    // fix #8160 (stdlib §6.10, v0.355; #5657): true when `target` is an
+    // `out owned` PARAMETER — the owned-OUT direction (§22.4 / §28.8), where
+    // the callee produces the value and the caller becomes responsible for
+    // discharging it. §6.10 names "a parameter (`out` and lambda parameters
+    // included)" among the positions it rejects a TaskScope in. Used by
+    // handleAssignment to report a TaskScope stored into such a slot.
+    // // per stdlib §6.10, spec §22.4, §28.8, v0.355
+    bool targetIsOutOwnedParameter(const ast::Expr& target) const;
+
     // §28.11 (issue #780): true when `target` is an owning inline-array slot
     // `a[i]` — an index into a `[N owned]T?` / `[N owned]T` value. Such a slot
     // is an owned storage location with the SAME discipline as an `owned` field:
@@ -6827,6 +6848,16 @@ private:
     // is never delegated as a call argument — the provable subset).
     bool exprTypeIsTaskScope(const ast::Expr& e) const;
     bool typeRefIsTaskScope(const sema::TypeRef* rt) const;
+    // fix #8160 (stdlib §6.10, v0.355; #5657): the DECLARED return type of
+    // the body under analysis is `OwningTask<T>` (the owning task — its
+    // RESULT slot is an owning position, §30.3 / §30.10) or `Object` (the
+    // builtin root class — the one class-typed `static` return the §28.3.6
+    // declaration-site rule does not reach, MEASURED). Used by handleReturn /
+    // runExprBodyOwningReturnCheck to place the §6.10 owning-position
+    // rejection on those two slots.
+    // // per stdlib §6.10, spec §28.3.6, §30.3, §30.10, §8.1, v0.355
+    bool declaredReturnIsOwningTask() const;
+    bool declaredReturnIsObject() const;
     // fix-forward #8118 (stdlib §6.10, v0.355; #5657): report `e` when it is
     // an expression of static type `TaskScope` placed into an OWNING position
     // — an `owned` return slot, an `owned` parameter / payload / owned-sink

@@ -58,6 +58,18 @@ const ast::Expr* lookThroughForceUnwrap(const ast::Expr* e) {
     return e;
 }
 
+// fix #8160 (stdlib §6.10, v0.355; #5657): the OPERAND of an `as` cast — the
+// one spelling of a language spec §5.1 reference conversion that WIDENS the
+// expression's own static type on the page (`new TaskScope() as Object` has
+// the static type `Object`, the value is the TaskScope). `is` / `is not` are
+// type TESTS, not conversions, and keep the operand's type — they are not
+// looked through here.
+const ast::Expr* lookThroughAsCast(const ast::Expr* e) {
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e))
+        if (tt->op == "as" && tt->operand) return tt->operand.get();
+    return nullptr;
+}
+
 namespace {
 
 // §22.10 (#1627): resolve the parameter list that a `new T(args)` call binds to,
@@ -1824,10 +1836,25 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
         const bool ownedSink = userOwned || builtinOwnedSinkArg(callee, pos);
         // fix-forward #8118 (stdlib §6.10, v0.355; #5657): a TaskScope
         // argument to an owned sink — an `owned Object` / `owned
-        // IAsyncDisposable` parameter, an `owned` choice payload — is an
-        // owning position §6.10 rejects. Diagnose only; the classification
-        // below still runs.
-        if (ownedSink)
+        // IAsyncDisposable` parameter — is an owning position §6.10
+        // rejects. Diagnose only; the classification below still runs.
+        //
+        // fix #8160 (stdlib §6.10, v0.355; #5657): the same rule, now also
+        // over an `owned` CHOICE PAYLOAD — the position §6.10 names
+        // explicitly ("a choice payload") and that #8118's comment here
+        // claimed to cover but did NOT: the §28.1 per-instantiation erasure
+        // above turns a payload declared `owned o: Object` into a non-sink
+        // (the marker is vacuous at `Object` — §28.1: "a runtime-managed
+        // value there — a boxed value, a `string`, a function value —
+        // carries no obligation"), so the sink arm never ran for it and the
+        // TaskScope reached the payload unchallenged. The position's
+        // DECLARED kind is what §6.10 reads, so the check keys on
+        // `argIsOwnedChoicePayload` (the marker as written) and not on the
+        // erasure-adjusted sink flag.
+        if (argIsOwnedChoicePayload(args, pos, callee))
+            reportTaskScopeInOwningPosition(*a.value,
+                                            "an `owned` choice payload");
+        else if (ownedSink)
             reportTaskScopeInOwningPosition(*a.value, "an `owned` parameter");
 
         // §22.3 (v0.169, #1348): the `owned` call-site marker is valid ONLY on
@@ -1986,6 +2013,32 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
     // is not disturbed by the consume walk above; the two directions are
     // disjoint per argument (an arg is either owned-IN or owned-OUT).
     markOutOwnedArgs(args, callee);
+}
+
+// fix #8160 (stdlib §6.10, v0.355; #5657): is the argument at `pos` an
+// `owned` CHOICE PAYLOAD slot — the position §6.10 names ("a choice
+// payload")? The slot's DECLARED marker is what the rule reads: the §28.1
+// per-instantiation erasure answers a DIFFERENT question (whether the VALUE
+// in the slot carries a disposal obligation at THIS instantiation — a boxed
+// value at an `owned Object` payload carries none), and it must not switch
+// the §6.10 rule off.
+//
+// One reader for both call paths: `recordMovesInArgs` (the LocalDecl-
+// initializer / assignment-RHS path) and `handleDischarge` (the bare-statement
+// path) — the two are disjoint walks of the same AST, so the position must be
+// classified the same way in both. // per stdlib §6.10, spec §28.1, v0.355
+bool MethodOwnership::argIsOwnedChoicePayload(
+        const std::vector<ast::CallArgument>& args, std::size_t pos,
+        const ast::Expr* callee) const {
+    if (!callee) return false;
+    auto* cc =
+        dynamic_cast<const sema::ChoiceCaseSymbol*>(ctx_.exprSymbol(*callee));
+    if (!cc || !cc->caseDecl) return false;
+    const CalleeFormals formals = calleeOrChainFormals(callee, args);
+    if (!formals.valid()) return false;
+    const std::size_t boundPos = boundParamIndex(args, pos, formals);
+    if (boundPos >= formals.size()) return false;
+    return formals.modifier(boundPos) == "owned";
 }
 
 bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args,
@@ -2459,7 +2512,18 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             // fix-forward #8118 (stdlib §6.10, v0.355; #5657): the bare-
             // statement-call twin of recordMovesInArgs' owned-sink TaskScope
             // rejection (`Take(new TaskScope());` with `owned d: Object`).
-            if (ownedSink)
+            //
+            // fix #8160 (stdlib §6.10, v0.355; #5657): the same rule over an
+            // `owned` CHOICE PAYLOAD — the position §6.10 names, and the one
+            // the §28.1 per-instantiation erasure vacates (`owned o: Object`),
+            // so the sink flag above is false for it and the TaskScope would
+            // reach the payload unchallenged. The recordMovesInArgs twin is
+            // the LocalDecl-initializer / assignment-RHS path; this arm is
+            // the bare-statement path, and the two walks are disjoint.
+            if (argIsOwnedChoicePayload(call->args, pos, call->callee.get()))
+                reportTaskScopeInOwningPosition(*a.value,
+                                                "an `owned` choice payload");
+            else if (ownedSink)
                 reportTaskScopeInOwningPosition(*a.value,
                                                 "an `owned` parameter");
             if (a.modifier == "owned" && !ownedSink) {
@@ -18944,6 +19008,23 @@ bool MethodOwnership::targetIsOwnedField(const ast::Expr& target) const {
     return exprIsOwnedFieldRead(target);
 }
 
+// fix #8160 (stdlib §6.10, v0.355; #5657): is the assignment TARGET an
+// `out owned` PARAMETER? §6.10 names "a parameter (`out` and lambda
+// parameters included)" among the positions §28.1 admits `owned` at, and an
+// `out owned` slot is the owned-OUT direction (§22.4 / §28.8): the CALLEE
+// produces the value and the CALLER becomes responsible for discharging it —
+// so a TaskScope stored there is discharged on the caller's ordinary
+// synchronous path, which cannot await the drain of its children.
+//
+// The target is the bare identifier naming the parameter; sema attaches the
+// ParameterSymbol (carrying its `out owned` modifier) to it.
+bool MethodOwnership::targetIsOutOwnedParameter(const ast::Expr& target) const {
+    if (!dynamic_cast<const ast::IdentifierExpr*>(&target)) return false;
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(target));
+    if (!ps) return false;
+    return ps->modifier == "out owned";
+}
+
 // §9.7 / §9.1 (issue #1251): see the header for the rule. Reads the declaring
 // type of the member the target names — sema attaches the FieldSymbol /
 // PropertySymbol to both the `obj.f` member-access form and the bare
@@ -23448,6 +23529,43 @@ bool MethodOwnership::exprTypeIsTaskScope(const ast::Expr& e) const {
         // caught reaches here only when the typecheck pass did not run.
     }
     return false;
+}
+
+// fix #8160 (stdlib §6.10, v0.355; #5657): the DECLARED return type of the
+// body under analysis is `OwningTask<T>` — the owning task (§30.3), whose
+// RESULT slot is an owning position: the task "disposes any unconsumed owned
+// result" (§30.10), so a TaskScope placed in it would be discharged on a
+// synchronous path that cannot await the drain of its children.
+bool MethodOwnership::declaredReturnIsOwningTask() const {
+    if (!returnType_) return false;
+    const sema::TypeRef* rt = ctx_.resolvedType(*returnType_);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    // `OwningTask` is a compiler-known generic type (§30.3): its Named
+    // TypeRef carries the head on the AST node (or as the imported name).
+    return rt->headName() == "OwningTask";
+}
+
+// fix #8160 (stdlib §6.10, v0.355; #5657): the DECLARED return type of the
+// body under analysis is `Object` — the builtin root class (§8.1: "public
+// class Object"), the ONE class-typed `static` return the §28.3.6
+// declaration-site rule does not reach: that rule keys on a resolved
+// TypeDecl (`isClassOrInterfaceResult`), and `Object` resolves to the
+// builtin primitive lookup key (`PrimitiveType::Object`) instead — MEASURED:
+// `static method Make(): Item` is rejected at the declaration, and
+// `static method Make(): Object` is admitted.
+//
+// Why the §6.10 rule reaches it: a `static` method's class-typed return slot
+// is a position where §28.3.6 REQUIRES the `owned` marker (it is the only
+// legal spelling of a class-typed static return — "the declared type itself
+// announces the classification"), so the slot IS an owning position of the
+// §6.10 kind; §6.10's own enumeration names "a return slot". The
+// declaration-site rule is silent on `Object`, so the expression-side rule
+// is what closes the position.
+bool MethodOwnership::declaredReturnIsObject() const {
+    if (!returnType_) return false;
+    const sema::TypeRef* rt = ctx_.resolvedType(*returnType_);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Primitive) return false;
+    return rt->primitive == sema::PrimitiveType::Object;
 }
 
 namespace {
@@ -28915,11 +29033,36 @@ void MethodOwnership::taskScopeUsageScanStmt(const ast::Stmt& s,
 // wider-declared-type form is checkTaskScopeConsumption's. Until #8118 the
 // `owned Object` return was rejected only by ACCIDENT (Object was misread as a
 // primitive by checkOwnedDeclType); the rule itself was never enforced there.
+//
+// fix #8160 (stdlib §6.10, v0.355; #5657): the SAME function, extended. The
+// #8118 form keys on the EXPRESSION's own static type, so it missed every
+// position whose declared type is WIDER than `TaskScope` and where the
+// expression's static type is the WIDER one too:
+//
+//   - `new TaskScope() as Object` passed to an `owned o: Object` parameter:
+//     the cast widens the expression's static type, but the VALUE placed in
+//     the owning position is the TaskScope. §6.10 names "an owning position
+//     of a wider static type reached by a language spec §5.1 reference
+//     conversion" as a compile error, so the OPERAND's static type is what
+//     the rule reads — `lookThroughAsCast` recovers it.
+//
+// The remaining positions #8160 adds are new CALLERS of this one function
+// (an `out owned` parameter store, an `owned` choice payload, an `owned`
+// function-type slot, an `OwningTask<T>` result slot, a `static` method's
+// class-typed return slot) — there is no second checker.
 void MethodOwnership::reportTaskScopeInOwningPosition(
     const ast::Expr& e, std::string_view position) {
     const ast::Expr* v = lookThroughForceUnwrap(&e);
     if (!v) v = &e;
-    if (!exprTypeIsTaskScope(e) && !exprTypeIsTaskScope(*v)) return;
+    if (!exprTypeIsTaskScope(e) && !exprTypeIsTaskScope(*v)) {
+        // fix #8160: a §5.1 reference conversion spelled as an `as` cast
+        // (`e as Object`) widens the expression's static type; the value
+        // placed in the owning position is the OPERAND. `TaskScope?`
+        // reads as `TaskScope` throughout (§6.10), and the nullability of
+        // the cast target does not change the operand's type.
+        const ast::Expr* cast = lookThroughAsCast(v);
+        if (!cast || !exprTypeIsTaskScope(*cast)) return;
+    }
     report(Severity::Error, e.span.begin,
            std::string("a TaskScope may not be placed in ") +
                std::string(position) +

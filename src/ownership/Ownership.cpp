@@ -1855,16 +1855,29 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
         bool isStatic, const GenericReturnContext* genericCtx) {
     returnType_ = returnType;
     returnOwned_ = returnOwned;
-    // fix-forward #8118 (stdlib §6.10, v0.355; #5657): the `=> E` twin of
-    // handleReturn's TaskScope owning-return rejection.
-    if (returnOwned_)
-        reportTaskScopeInOwningPosition(exprBody, "an `owned` return slot");
     // SB01-B (§28.3, v0.190, #1786): set `isAsync_` so
     // `checkBorrowReturnedThroughOwningType` exempts an `async` expression body
     // (its `=> E` body is the awaited value, not a task). The block-body path
     // seeds this via `run(...)`; the `=>` path previously left it default-false.
     isAsync_ = isAsync;
     isStatic_ = isStatic;
+    // fix-forward #8118 (stdlib §6.10, v0.355; #5657): the `=> E` twin of
+    // handleReturn's TaskScope owning-return rejection.
+    if (returnOwned_)
+        reportTaskScopeInOwningPosition(exprBody, "an `owned` return slot");
+    // fix #8160 (stdlib §6.10, v0.355; #5657): the `=> E` twin of handleReturn's
+    // two added owning RETURN slots — an `OwningTask<T>` result slot (an async
+    // method) and a `static` method's class-typed return slot. See handleReturn's
+    // own comment for the reasoning; the `isAsync_` / `isStatic_` seeds this
+    // arm reads are set ABOVE it.
+    if (!returnOwned_) {
+        if (isAsync_ && declaredReturnIsOwningTask())
+            reportTaskScopeInOwningPosition(exprBody,
+                                            "an `OwningTask<T>` result slot");
+        else if (isStatic_ && declaredReturnIsObject())
+            reportTaskScopeInOwningPosition(exprBody,
+                                            "a `static` method's return slot");
+    }
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): classify the return
     // context before the narrow checks run (the `=>` body IS the return value).
     computeBareReturnContext(paramSyms, genericCtx);
@@ -9822,6 +9835,16 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         // no diagnostic is duplicated. // per §28.11, §28.3
         handleOwnedFieldAssignment(as, flagged386,
                                    /*intoOwningArraySlot=*/true);
+    } else if (targetIsOutOwnedParameter(*as.target)) {
+        // fix #8160 (stdlib §6.10, v0.355; #5657): a TaskScope stored into
+        // an `out owned` PARAMETER. §6.10 names "a parameter (`out` and
+        // lambda parameters included)" among the positions it rejects a
+        // TaskScope in; the owned-OUT direction (§22.4 / §28.8) hands the
+        // value to the CALLER, which discharges it on the ordinary
+        // synchronous path — which cannot await the drain of its children.
+        if (as.value)
+            reportTaskScopeInOwningPosition(*as.value,
+                                            "an `out owned` parameter");
     } else if (!flagged386 && targetIsNonOwnedField(*as.target) &&
                !targetIsMoveOnlyValueField(*as.target) &&
                // fix #7856 (§28.6 "Leak prevention", v0.353): THE ONE
@@ -11052,6 +11075,39 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // IAsyncDisposable`, at any declared type — is an owning position.
     if (returnOwned_)
         reportTaskScopeInOwningPosition(e, "an `owned` return slot");
+    // fix #8160 (stdlib §6.10, v0.355; #5657): two more owning RETURN slots
+    // the #8118 arm did not reach, both spelled at the DECLARATION:
+    //
+    //  (a) an ASYNC method whose declared return type is `OwningTask<T>`: the
+    //      returned value is placed in the task's OWNING result slot (§30.3 /
+    //      §30.10 — the task disposes an unconsumed owned result), so a
+    //      TaskScope there is discharged on a synchronous path that cannot
+    //      await the drain of its children. §6.10's enumeration names "a
+    //      return slot", and the slot's static type (`Object` at
+    //      `OwningTask<Object>`) is WIDER than `TaskScope` — §6.10's last
+    //      clause: "an owning position of a wider static type reached by a
+    //      language spec §5.1 reference conversion".
+    //
+    //  (b) a STATIC method whose declared return type is a class type: §28.3.6
+    //      requires the `owned` marker there (the only legal spelling of a
+    //      class-typed static return), so the slot IS an owning position of
+    //      the §6.10 kind. The §28.3.6 declaration-site rule rejects every
+    //      class-typed static return EXCEPT `Object` — the builtin root class
+    //      has no resolved TypeDecl, so that rule's class/interface test
+    //      cannot see it (MEASURED: `static method Make(): Item` is rejected
+    //      at the declaration, `static method Make(): Object` was admitted) —
+    //      so the §6.10 expression-side rule is what closes that position.
+    //      Every OTHER class-typed static return is already rejected at the
+    //      declaration, and this arm is keyed on `Object` alone so the two
+    //      rules never report the same slot twice.
+    if (!returnOwned_) {
+        if (isAsync_ && declaredReturnIsOwningTask())
+            reportTaskScopeInOwningPosition(e,
+                                            "an `OwningTask<T>` result slot");
+        else if (isStatic_ && declaredReturnIsObject())
+            reportTaskScopeInOwningPosition(e,
+                                            "a `static` method's return slot");
+    }
     // fix #4962 (§17.15 / §28.3, v0.307): pre-populate
     // `states_[clause].source` for every binding-atom clause reachable
     // from the return expression so the §28.3 / §9.7 indirect-escape
@@ -15603,6 +15659,18 @@ void MethodOwnership::checkOneLambdaOwnedReturnDirectBorrow(
         return;
     MethodOwnership sub(ctx_);
     auto classifyReturn = [&](const ast::Expr& re) {
+        // fix #8160 (stdlib §6.10, v0.355; #5657): the `owned` FUNCTION-TYPE
+        // slot is an owning position §6.10 names ("a function-type slot"): the
+        // lambda's target function type declares an `owned` return, so the
+        // caller receives a value it must dispose — and a TaskScope's
+        // discharge is §28.12's implicit synchronous path, which cannot await
+        // the drain of its children. §6.10 reports it "at the expression that
+        // would place a `TaskScope` in one", i.e. at the lambda's return
+        // expression. The gate above (`effOwned`) is what makes the slot an
+        // owning one: a lambda whose function type returns a BORROW
+        // (`(TaskScope) -> TaskScope`) is not an owning position, and §6.10
+        // leaves borrows unrestricted.
+        reportTaskScopeInOwningPosition(re, "an `owned` function-type slot");
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&re))
             if (un->op == "move") return;  // owned transfer, not a borrow
         if (sub.exprIsOwnedFieldRead(*lookThroughForceUnwrap(&re)))
