@@ -18094,6 +18094,17 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
                             const ast::TypeDecl* enclosingType,
                             const ast::ExtensionDecl* enclosingExtension) {
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
+        // fix #7968 (§26.7 / §28.3 / §28.9, v0.355): an EXTENSION body may
+        // not store its receiver. §26.7: "The receiver is always a borrow;
+        // extensions cannot store `this`, return it as `owned`, or dispose
+        // it." §28.3 clause 2 admits a receiver-sourced borrow into a field
+        // in a DECLARED member's body, so the check is extension-only — the
+        // stricter case §26.7 names. Measured on the base: an `extension
+        // Object` body that stored `this` into an `Object?` field compiled
+        // clean and then died at run time (rc=134 "refcount over-release
+        // (box)"; an ASan SEGV / OOM for the call-argument shape).
+        if (enclosingExtension)
+            checkExtensionReceiverStore(*md, *enclosingExtension, ctx);
         // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): assemble the
         // generic context the callee-side check keys on — this method's generic
         // parameters and `where` constraints, and (when the method is a type

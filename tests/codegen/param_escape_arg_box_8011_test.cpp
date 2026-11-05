@@ -447,9 +447,14 @@ const char* kPassOnSealedRead =
 //   precisely, a borrow with the same source as `x`)". So `o as IFoo` /
 //   `o as Object` IS the parameter's box, and a store of it keeps the box.
 // §26.7 (v0.355): "The receiver is always a borrow; extensions cannot store
-//   `this`" — an extension member's `this` is the receiver reference itself,
-//   and the compiler does not yet reject the store (#7823 / #7968), so a
-//   receiver call that reaches an extension member must count as an escape.
+//   `this`" — an extension member's `this` is the receiver reference itself.
+//   fix #7968 (v0.355) closed the "the compiler does not yet reject the store
+//   (#7823 / #7968)" gap: an extension body that stores its receiver is now
+//   REJECTED at compile time, so the rows below that used to exercise the
+//   runtime box-retention of such a store pin the rejection instead. The
+//   escape verdict this walker's receiver arm carries is still load-bearing
+//   for every OTHER extension-member receiver (a read-only extension member,
+//   an extension property), which the walk still has to treat as an escape.
 //
 // The `keeps_box` rows below read the stored box AFTER the outer call
 // returned, 100x, under ASan with leak detection off: a premature release is
@@ -777,6 +782,27 @@ const char* kAsIfaceBangRecvReadFwd =
 
 }  // namespace
 
+// fix #7968 (§26.7, v0.355): the extension-receiver store check rejects an
+// extension body that stores its receiver, so the rows below that used to
+// exercise the RUNTIME box-retention of such a store now pin the
+// REJECTION instead. Asserted on the diagnostic TEXT: `runAot`'s
+// WIFSIGNALED path synthesizes an Error diagnostic for a runtime crash too,
+// so `!r.ran` alone cannot distinguish a genuine rejection from a segfault
+// (tests/README.md).
+namespace {
+
+bool rejectedByExtensionReceiverRule(const char* program) {
+    JitResult r = runAotChecked(program);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("§26.7") != std::string::npos &&
+            d.message.find("must not store its receiver") != std::string::npos)
+            return true;
+    return false;
+}
+
+}  // namespace
+
 // per §8.6 / §28.3, v0.353 — the corrected repro: the argument box of
 // `Tag(5)` is released after each call (100 x 24 B leaked before the fix).
 BEZEL_TEST(codegen_param_escape_arg_box_8011,
@@ -981,34 +1007,31 @@ BEZEL_TEST(codegen_param_escape_arg_box_8011,
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
 }
 
-// per §26.7 / §8.6, v0.355 — the forwarded receiver call reaches an
-// `extension Object` member whose `this` (the box) is stored: kept.
+// per §26.7 / §8.6, v0.355 — fix #7968: the forwarded receiver call reaches
+// an `extension Object` member whose `this` (the box) is stored, and §26.7
+// forbids exactly that store ("The receiver is always a borrow; extensions
+// cannot store `this`, return it as `owned`, or dispose it."). The row now
+// pins the REJECTION; before it, the box was kept at run time and the store
+// left a dangling borrow behind (§28.3's residual trust).
 BEZEL_TEST(codegen_param_escape_arg_box_8011,
-           extension_recv_store_fwd_keeps_box_spec_26_7) {
-    JitResult r = runAotCheckedLenient(kExtensionRecvStoreFwd);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+           extension_recv_store_fwd_rejected_spec_26_7) {
+    BEZEL_EXPECT_TRUE(rejectedByExtensionReceiverRule(kExtensionRecvStoreFwd));
 }
 
-// per §26.7 / §8.6, v0.355 — the same extension call in the directly
-// called method.
+// per §26.7 / §8.6, v0.355 — fix #7968: the same extension call in the
+// directly called method.
 BEZEL_TEST(codegen_param_escape_arg_box_8011,
-           extension_recv_store_direct_keeps_box_spec_26_7) {
-    JitResult r = runAotCheckedLenient(kExtensionRecvStoreDirect);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+           extension_recv_store_direct_rejected_spec_26_7) {
+    BEZEL_EXPECT_TRUE(
+        rejectedByExtensionReceiverRule(kExtensionRecvStoreDirect));
 }
 
-// per §26.7 / §8.6, v0.355 — an interface-typed parameter whose
-// `extension IFoo` member stores `this`, through a forwarder: kept.
+// per §26.7 / §8.6, v0.355 — fix #7968: an interface-typed parameter whose
+// `extension IFoo` member stores `this`, through a forwarder.
 BEZEL_TEST(codegen_param_escape_arg_box_8011,
-           iface_extension_store_this_fwd_keeps_box_spec_26_7) {
-    JitResult r = runAotCheckedLenient(kIfaceExtensionStoreThisFwd);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+           iface_extension_store_this_fwd_rejected_spec_26_7) {
+    BEZEL_EXPECT_TRUE(
+        rejectedByExtensionReceiverRule(kIfaceExtensionStoreThisFwd));
 }
 
 // per §17.4 / §8.6, v0.355 — admitting twin: `(o as IFoo) <> null` in the
@@ -1045,14 +1068,13 @@ BEZEL_TEST(codegen_param_escape_arg_box_8011,
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
 }
 
-// per §17.4 / §26.7 / §8.6, v0.355 — the receiver `(o as IFoo)!` reaches
-// an `extension IFoo` member storing `this`: kept.
+// per §17.4 / §26.7 / §8.6, v0.355 — fix #7968: the receiver `(o as IFoo)!`
+// reaches an `extension IFoo` member storing `this`, and §26.7 forbids that
+// store.
 BEZEL_TEST(codegen_param_escape_arg_box_8011,
-           as_iface_bang_extension_recv_store_fwd_keeps_box_spec_26_7) {
-    JitResult r = runAotCheckedLenient(kAsIfaceBangExtensionRecvStoreFwd);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+           as_iface_bang_extension_recv_store_fwd_rejected_spec_26_7) {
+    BEZEL_EXPECT_TRUE(
+        rejectedByExtensionReceiverRule(kAsIfaceBangExtensionRecvStoreFwd));
 }
 
 // per §17.4 / §17.8 / §8.6, v0.355 — admitting twin: `(o as IFoo)!.Get()`

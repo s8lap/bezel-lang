@@ -35487,8 +35487,23 @@ bool Emitter::lowerBoxFieldStore(const ast::Expr& target,
     // another store (same field, same class, same box-only pattern), it stays
     // in the set — the pre-pass collectBoxStorageFields ensures no class-ref
     // stores reach this path.
+    //
+    // fix #7968 (§26.7 / §28.9, v0.355): the PRE-PASS IS THE AUTHORITY — its
+    // own header says so ("a field is only a box storage field if the pre-pass
+    // confirmed all stores are box-valued"). This re-insert used to be
+    // unconditional, so a field the pre-pass EXCLUDED (some store of it carries
+    // a class-reference source) was put back into the set by the first boxable
+    // store into it, and the disposer then called `bz_box_release` on a class
+    // instance — "bezel: fatal: refcount over-release (box)". The pre-pass now
+    // also sees the stores made from an EXTENSION body (an extension method has
+    // a null `parent`, so the old `msym->parent != ts` gate skipped every one
+    // of them), which is how an extension's store reached the field at all.
+    // Gating the re-insert on the pre-pass's verdict makes the code match its
+    // stated contract; the set is unchanged for every field the pre-pass
+    // admitted (the re-insert was a no-op there).
     sema::Symbol* sym = ctx_.exprSymbol(target);
-    if (sym) boxStorageFields_.insert(static_cast<const void*>(sym));
+    if (sym && isBoxStorageMember(sym))
+        boxStorageFields_.insert(static_cast<const void*>(sym));
     return true;
 }
 
@@ -47407,6 +47422,26 @@ bool Emitter::isUserMethodObjectStringReturnCall(const ast::Expr* init) const {
 // during lowering), but the pre-pass is the authoritative gate: a field is only
 // a box storage field if the pre-pass confirmed all stores are box-valued.
 void Emitter::collectBoxStorageFields() {
+    // fix-forward #7968 (§23.3 / §28.9, v0.355): the PROPERTY / INDEXER
+    // accessor bodies, collected once. A block or arrow setter
+    // (`set => _box := value;` is parsed into a one-statement accessor body)
+    // stores into a field exactly as a method does, but accessors are not in
+    // `methodFns_`, so the scan below never saw them. MEASURED: once a
+    // `:= null` initializer stopped excluding the field, the setter's
+    // `_box := value` (an `Object` borrow, never retained) left the field
+    // "box-only" and its disposer over-released the last box (the
+    // `codegen_non_virtual_property_setter_producer_leak_2568` program).
+    std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*> accessorBodies;
+    for (auto& asym : ctx_.symbols()) {
+        if (ctx_.isImported(asym.get())) continue;
+        // SEAM-ACCESSOR: gated by the `if (ctx_.isImported(...)) continue;`
+        // line just above -- never reached for an imported symbol. #3152
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(asym->decl);
+        if (!pd) continue;
+        for (auto& acc : pd->accessors)
+            if (!acc.stmts.empty()) accessorBodies.push_back(&acc.stmts);
+    }
+
     // For each class, collect its Object/interface instance field symbols.
     for (auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
@@ -47443,6 +47478,14 @@ void Emitter::collectBoxStorageFields() {
             auto it = ok.find(static_cast<const void*>(fsym));
             if (it == ok.end()) return;  // not a candidate field
             if (!it->second) return;     // already excluded
+            // fix-forward #7968 (§8.6 / §28.9, v0.355): a `null` literal
+            // store puts no class instance in the field, so it cannot make a
+            // `bz_box_release` at disposal unsound (the release is
+            // null-safe). It is NEUTRAL here. Excluding the field for it
+            // (a constructor's `o := null`) leaked the last box the field
+            // was later given: `lowerBoxFieldStore` no longer re-admits a
+            // field this pre-pass excluded.
+            if (dynamic_cast<const ast::NullLiteralExpr*>(val)) return;
             const sema::TypeRef* srcTy = ctx_.exprType(*val);
             if (!srcTy) { it->second = false; return; }
             bool isBoxableSource =
@@ -47493,6 +47536,9 @@ void Emitter::collectBoxStorageFields() {
             else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
                 init = pd->autoInitializer.get();
             if (!init) continue;  // no initializer → calloc-zeroed null → OK
+            // fix-forward #7968: a `:= null` initializer is the same zeroed
+            // null — neutral, exactly as in `checkStore` above.
+            if (dynamic_cast<const ast::NullLiteralExpr*>(init)) continue;
             // Synthesize a check: the "target" symbol is m, the "source" is
             // init. We check the init directly.
             auto it = ok.find(static_cast<const void*>(m));
@@ -47507,27 +47553,61 @@ void Emitter::collectBoxStorageFields() {
         }
 
         // Check all method bodies for stores to these fields.
+        //
+        // fix #7968 (§26.7 / §28.9, v0.355): an EXTENSION method's body is
+        // scanned too. An extension method has a NULL `parent` (fix #2328:
+        // "extension methods have a null `ms->parent`"), so the
+        // `msym->parent != ts` gate below skipped every extension body — and
+        // an extension body can store into ANY class's field (`extension
+        // Object { method Stash(h: H) h.o := v; end }` writes `H`'s field).
+        // The store path (`isBoxFieldLvalue` / `lowerBoxFieldStore`) correctly
+        // classified such a store as a CLASS-REFERENCE source (no retain, no
+        // release), but this pre-pass never saw it, so the field stayed
+        // "box-only" and the disposer called `bz_box_release` on a class
+        // instance — MEASURED on the base: "bezel: fatal: refcount
+        // over-release (box) — two releases for one reference; terminating per
+        // §28.9" (rc=134), because a class instance's offset 8 is its
+        // disposed-flag word, not a box refcount (src/runtime/bezel_runtime.h
+        // : "these helpers are NEVER handed a class instance").
+        //
+        // fix-forward #7968: the hole is not extension-specific. A method or
+        // constructor of ANOTHER class reaches the field just as well
+        // (`static method Put(h: Holder, b: Box) h.o := b;` in class
+        // `Other`) — MEASURED: such a store made the disposer run
+        // `bz_box_release` on the `Box` instance and corrupt its field (it
+        // printed 6 for a `v := 7`). So EVERY locally compiled method and
+        // constructor body is scanned, whatever its parent.
+        //
+        // The scan stays PRECISE per field: `checkStore` keys on the store
+        // TARGET's symbol, so a store into a field of another class is
+        // ignored by this class's loop and the verdict for a given field
+        // depends only on the SOURCE TYPE of each store that reaches it. A
+        // body that stores a BOXABLE value leaves the field box-only; one
+        // that stores a class reference excludes it, which is the sound
+        // direction (the field is then not released as a box).
         for (auto& [msym, fn] : methodFns_) {
             if (ctx_.isImported(msym)) continue;
             // SEAM-ACCESSOR: gated by the `if (ctx_.isImported(...)) continue;`
             // line just above -- never reached for an imported symbol. #3152
             auto* md = dynamic_cast<const ast::MethodDecl*>(msym->decl);
             if (!md) continue;
-            // Only scan methods that belong to THIS class (ts).
-            if (msym->parent != ts) continue;
             for (auto& s : md->stmts) scanStmt(s.get());
         }
 
-        // Check all constructor bodies for stores to these fields.
+        // Check all constructor bodies (of any class) for stores to these
+        // fields.
         for (auto& [csym, fn] : ctorFns_) {
             if (ctx_.isImported(csym)) continue;
             // SEAM-ACCESSOR: gated by the `if (ctx_.isImported(...)) continue;`
             // line just above -- never reached for an imported symbol. #3152
             auto* cd = dynamic_cast<const ast::ConstructorDecl*>(csym->decl);
             if (!cd) continue;
-            if (csym->parent != ts) continue;
             for (auto& s : cd->body) scanStmt(s.get());
         }
+
+        // fix-forward #7968: every local property / indexer accessor body.
+        for (auto* body : accessorBodies)
+            for (auto& s : *body) scanStmt(s.get());
 
         // Also scan the class's destructor if any.
         for (const sema::Symbol* m : ts->members) {
