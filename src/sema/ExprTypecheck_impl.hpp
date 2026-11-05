@@ -754,6 +754,12 @@ private:
     // parameter guarantees no conformance and no derived property, so a §5
     // block's `where T: …` clause is PROVABLY unsatisfied at it.
     bool linqElemIsUnconstrainedTypeParam(const TypeRef* elem) const;
+    // fix-forward #8181 (spec §14.2 *Constraints on overrides and interface
+    // implementations*, v0.355): may the current METHOD's type parameter `n`
+    // carry a constraint INHERITED from a method it overrides or implements
+    // (the recommended spelling omits the `where` clause)? Defined beside
+    // `linqElemIsUnconstrainedTypeParam` in ExprTypecheck_Calls.cpp.
+    bool currentMethodTypeParamMayInherit(std::string_view n) const;
     // fix #7967 (§26.5.1, v0.355): is the argument a FUNCTION value? The
     // three-valued answer the §5 overload's `(T) -> …` parameter needs; see
     // `stdlibLinqCandidateApplicable`'s header in ExprTypecheck.cpp.

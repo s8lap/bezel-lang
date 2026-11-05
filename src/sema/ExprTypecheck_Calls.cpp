@@ -982,7 +982,87 @@ bool ExprTC::linqElemIsUnconstrainedTypeParam(const TypeRef* elem) const {
         return false;
     const std::string_view n = elem->headName();
     if (n.empty() || !isInScopeTypeParam(n)) return false;
-    return !isCurrentScopeTypeParamConstrained(n);
+    if (isCurrentScopeTypeParamConstrained(n)) return false;
+    // fix-forward #8181 (spec §14.2 *Constraints on overrides and interface
+    // implementations*, v0.355): "An `override` of a generic method, and a
+    // method implementing a generic interface method ... inherits the
+    // overridden or implemented declaration's constraints. Omitting the
+    // `where` clauses is the recommended spelling and means exactly the
+    // inherited set". The SYNTACTIC test above reads only the clauses
+    // written here, so for that recommended spelling it cannot tell an
+    // inherited `where T: INumber<T>` from no constraint at all.
+    return !currentMethodTypeParamMayInherit(n);
+}
+
+// fix-forward #8181: may the CURRENT method's type parameter `n` carry a
+// constraint it inherits rather than writes (spec §14.2, quoted above)? `true`
+// means "it may" and the caller KEEPS the §5 candidate (the sound direction);
+// `false` only when the method writes no clause on `n` (checked by the caller)
+// AND nothing it could override or implement constrains the parameter at the
+// same position (§14.2: "The two declarations' method-level type parameters,
+// equal in number, correspond by position").
+//   1. The override's own `GenericParamSymbol::constraints`, where fix
+//      #5039/#5075 (TypeResolution_Checks.cpp, `materializeConstraintUpChain`)
+//      copies an override's inherited class-chain set;
+//   2. every same-name / same-arity / same-generic-arity method anywhere in
+//      the enclosing type's BASE CLOSURE (classes AND interfaces — the
+//      interface-implementation case is not materialized onto the symbol by
+//      #5039, which runs for `override` only), constrained at position `gi`
+//      by its own written clause or its own materialized set;
+//   3. an IMPORTED such method (no `ast::MethodDecl`) is constrained unless
+//      the module side table says its parameter at `gi` carries nothing.
+// Matching by shape over-approximates (an unrelated overload of the same
+// shape KEEPS the candidate) — never under-approximates, which is what a
+// PROVABLE-violation test needs. A type parameter that is not the current
+// METHOD's (a class's or an extension block's) inherits nothing.
+bool ExprTC::currentMethodTypeParamMayInherit(std::string_view n) const {
+    const ast::MethodDecl* md = currentMethodDecl_;
+    if (!md || !currentType_) return false;
+    std::size_t gi = md->genericParams.size();
+    for (std::size_t i = 0; i < md->genericParams.size(); ++i)
+        if (md->genericParams[i].name == n) { gi = i; break; }
+    if (gi == md->genericParams.size()) return false;
+    auto symConstrained = [gi](const MethodSymbol* ms) {
+        if (gi >= ms->genericParams.size()) return false;
+        auto* gp = dynamic_cast<const GenericParamSymbol*>(ms->genericParams[gi]);
+        return gp && !gp->constraints.empty();
+    };
+    // 1. The current method's own symbol (materialized inherited set).
+    for (const Symbol* mem : currentType_->members)
+        if (auto* ms = dynamic_cast<const MethodSymbol*>(mem))
+            if (ms->decl == md && symConstrained(ms)) return true;
+    // 2./3. The base closure, cycle-guarded like `inheritsBuiltinInterface`.
+    std::vector<const TypeSymbol*> queue;
+    std::unordered_set<const TypeSymbol*> seen{currentType_};
+    for (const TypeSymbol* b : currentType_->baseTypes)
+        if (b && seen.insert(b).second) queue.push_back(b);
+    for (std::size_t qi = 0; qi < queue.size(); ++qi) {
+        const TypeSymbol* cur = queue[qi];
+        for (const Symbol* mem : cur->members) {
+            auto* ms = dynamic_cast<const MethodSymbol*>(mem);
+            if (!ms || ms->isOperator || ms->name != md->name ||
+                ms->params.size() != md->params.size() ||
+                ms->genericParams.size() != md->genericParams.size())
+                continue;
+            if (auto* bd = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+                if (gi < bd->genericParams.size())
+                    for (const auto& gc : bd->genericConstraints)
+                        if (gc.typeParam == bd->genericParams[gi].name)
+                            return true;
+                if (symConstrained(ms)) return true;
+                continue;  // omitted at this level too; the closure walk
+                           // reaches the level that writes it, if any
+            }
+            const auto* igc = ctx_.importedGenericConstraints(ms);
+            if (!igc || gi >= igc->size()) return true;  // unknown: KEEP
+            if (!(*igc)[gi].specialConstraints.empty() ||
+                !(*igc)[gi].constraintTypes.empty())
+                return true;
+        }
+        for (const TypeSymbol* b : cur->baseTypes)
+            if (b && seen.insert(b).second) queue.push_back(b);
+    }
+    return false;
 }
 
 // fix #8180 (stdlib §5.1, spec §14.2 *Interface conformance*, v0.355): see the
