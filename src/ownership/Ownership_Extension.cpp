@@ -83,6 +83,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace bezel::ownership {
@@ -366,22 +367,28 @@ void walkStmtForReceiverStore(const ast::Stmt& s, ExtensionScan& scan,
 void collectAliases(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
                     ExtensionScan& scan, const sema::SemaContext& ctx) {
     // Collect the candidate declarations first (every LocalDecl with an
-    // initializer), then iterate to a fixpoint over the alias relation.
-    std::vector<const ast::LocalDecl*> decls;
+    // initializer, and every §21.1 `const` local), then iterate to a fixpoint
+    // over the alias relation. A `const a := this;` is the same laundering as
+    // `var a := this;`, so the candidates are held as `const ast::Node*` and
+    // each carries its initializer expression alongside.
+    std::vector<std::pair<const ast::Node*, const ast::Expr*>> decls;
     for (const auto& s : stmts) {
         if (!s) continue;
         forEachNestedStmt(*s, [&](const ast::Stmt& inner) {
-            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&inner))
-                if (ld->initializer) decls.push_back(ld);
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&inner)) {
+                if (ld->initializer) decls.emplace_back(ld, ld->initializer.get());
+            } else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&inner)) {
+                if (lc->value) decls.emplace_back(lc, lc->value.get());
+            }
         });
     }
     bool changed = true;
     while (changed) {
         changed = false;
-        for (const ast::LocalDecl* ld : decls) {
-            if (scan.aliases.count(ld)) continue;
-            if (!isReceiverExpr(ld->initializer.get(), scan.aliases, ctx)) continue;
-            scan.aliases.insert(ld);
+        for (const auto& [decl, init] : decls) {
+            if (scan.aliases.count(decl)) continue;
+            if (!isReceiverExpr(init, scan.aliases, ctx)) continue;
+            scan.aliases.insert(decl);
             changed = true;
         }
     }

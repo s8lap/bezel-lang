@@ -216,6 +216,42 @@ BEZEL_TEST(codegen_extension_this_stash_7968,
 }
 
 // ---------------------------------------------------------------------------
+// 3b. MUST-REJECT — a §21.1 `const` LOCAL alias of the receiver (#3591 class).
+//
+// §26.7 (v0.355): extensions cannot store `this`. `const a := this; h.o := a;`
+// is the same store as row 3's `var` spelling, laundered through a `const`
+// binding (§21.1 local `const`). The alias walk must hold the `const` form as
+// a candidate too, or the store compiles clean and over-releases at run time.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(codegen_extension_this_stash_7968,
+           extension_const_local_alias_store_of_receiver_rejected) {
+    BEZEL_EXPECT_TRUE(rejectedByExtensionReceiverRule(
+        "module M7968D2; "
+        "public class Holder "
+        "  public o: Object?; "
+        "  public constructor() end constructor; "
+        "end Holder; "
+        "public class Box "
+        "  public constructor() end constructor; "
+        "end Box; "
+        "public extension Object "
+        "  public method Stash(h: Holder) "
+        "    const a := this; "
+        "    h.o := a; "
+        "  end Stash; "
+        "end extension; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var h := new Holder(); "
+        "    using var b := new Box(); "
+        "    b.Stash(h); "
+        "    Console.WriteLine(\"never\"); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;"));
+}
+
+// ---------------------------------------------------------------------------
 // 4. MUST-REJECT — a store of the receiver inside a LAMBDA in the extension
 // body.
 //
