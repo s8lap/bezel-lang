@@ -1371,7 +1371,7 @@ static std::string_view callsNamedTypeSimpleName(const TypeRef* ref) {
 // constraint") and the `IComparable<T>` clause is the §5.1 `Min()`/`Max()`
 // gate's own verdict (#8180) — neither is decided here.
 bool ExprTC::linqElemTypeParamClauseUnsatisfied(const TypeRef* elem,
-                                                std::string_view clause) const {
+                                                std::string_view clause) {
     if (!elem || elem->kind != TypeRef::Kind::Named || elem->declaration ||
         !elem->genericArgs.empty())
         return false;
@@ -1420,29 +1420,34 @@ bool ExprTC::linqElemTypeParamClauseUnsatisfied(const TypeRef* elem,
     if (items.empty()) return false;
 
     if (clause == "where T: INumber<T>") {
-        // §14.2 *Interface conformance* rule 6: a TYPE-BOUND constraint
-        // naming I guarantees the conformance — but only for the bound that
-        // names `INumber<P>` ITSELF. `INumber` is INVARIANT (§12.9), so a
-        // bound naming `INumber<SomeBase>` (or an interface extending it)
-        // gives `P : INumber<SomeBase>`, NOT `P : INumber<P>`, and does not
-        // guarantee the clause; and a CLASS bound cannot either (a class
-        // conforms to `INumber<ThatClass>`, not to `INumber<P>`).
-        for (const ast::ConstraintItem* it : items) {
-            if (it->kind != "type" || !it->typeArg) continue;
-            const TypeRef* b = ctx_.resolvedType(*it->typeArg);
-            if (!b || b->kind != TypeRef::Kind::Named) continue;
-            if (callsNamedTypeSimpleName(b) != "INumber") continue;
-            if (b->genericArgs.size() != 1 || !b->genericArgs[0]) continue;
-            const TypeRef* ga = b->genericArgs[0];
-            // The bound's argument must be the parameter ITSELF (`where P:
-            // INumber<P>`) — the self-parameterised interface.
-            if (ga->kind == TypeRef::Kind::Named && !ga->declaration &&
-                ga->genericArgs.empty() && ga->headName() == p)
-                return false;  // GUARANTEED → the §5 candidate is KEPT
+        // §14.2 *Interface conformance* rule 6: "a type-bound constraint
+        // naming I or an interface extending I, or a class bound naming a
+        // class that conforms to I under rule 1, directly or through a
+        // `where T: U` chain." I is `INumber<P>`: a bound naming it, or an
+        // interface that extends it at `P` (`where P: IMyNum<P>` over
+        // `interface IMyNum<T>: INumber<T>`, at any depth), or a class bound
+        // conforming to it, GUARANTEES the clause. `INumber` is INVARIANT
+        // (§11.8 (2), §12.9), so a bound reaching only `INumber<X>` for
+        // another `X` (`where T: U where U: INumber<U>`) gives `P :
+        // INumber<X>`, not `P : INumber<P>`, and does not.
+        //
+        // fix-forward #8198: the first cut read only a bound spelled
+        // `INumber<P>` LITERALLY, so `where T: IMyNum<T>` dropped the
+        // applicable, more specific §5 `Sum()` and the user's
+        // `extension Object { Sum() }` answered — MEASURED 4040 where the
+        // spec answer is 11 (silent wrong code). A bound whose bases cannot
+        // be read is UNDECIDED and the §5 candidate is KEPT.
+        TypeSymbol* inum = ctx_.builtinInterfaceSym("INumber");
+        switch (typeParamGuaranteesSelfInterface(p, elem, inum)) {
+            case SelfBoundVerdict::Guaranteed:
+            case SelfBoundVerdict::Undecided:
+                return false;  // the §5 candidate is KEPT
+            case SelfBoundVerdict::NotGuaranteed:
+                // The declared constraints cannot hold the clause at every
+                // substitution they admit → PROVABLY unsatisfied.
+                return true;
         }
-        // The declared constraints name no `INumber<P>` → the clause cannot
-        // hold at every substitution they admit → PROVABLY unsatisfied.
-        return true;
+        return false;
     }
     return false;
 }

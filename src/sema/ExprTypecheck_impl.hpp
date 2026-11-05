@@ -763,7 +763,7 @@ private:
     // candidate is KEPT — the sound direction). Defined beside
     // `linqElemIsUnconstrainedTypeParam` in ExprTypecheck_Calls.cpp.
     bool linqElemTypeParamClauseUnsatisfied(const TypeRef* elem,
-                                             std::string_view clause) const;
+                                             std::string_view clause);
     // fix-forward #8181 (spec §14.2 *Constraints on overrides and interface
     // implementations*, v0.355): may the current METHOD's type parameter `n`
     // carry a constraint INHERITED from a method it overrides or implements
@@ -2754,6 +2754,24 @@ private:
     // compare reads the head spelling instead (#6315).
     bool typeParamSatisfiesSelfComparable(std::string_view paramName,
                                            const TypeRef* paramRef);
+    // fix-forward #8198 (§14.2 *A type parameter as the type argument* case
+    // 1 and *Interface conformance* rules 1, 3 and 6, §26.5.1, v0.355): do
+    // the DECLARED constraints of the type parameter `paramName` guarantee
+    // conformance to the self-parameterised interface `target<P>` (`P` the
+    // parameter itself, `paramRef` its own resolved reference)? Rule 6: "a
+    // type-bound constraint naming I or an interface extending I, or a class
+    // bound naming a class that conforms to I under rule 1, directly or
+    // through a `where T: U` chain" — so a bound reaching `target<P>` through
+    // its declared bases (each level instantiated at its own arguments)
+    // guarantees it; a bound reaching only `target<X>` for another `X` does
+    // not (invariance, §12.9). The same walk as
+    // `typeParamSatisfiesSelfComparable`, three-valued: `Undecided` where a
+    // base on the path is not readable, so the §26.5.1 caller KEEPS the
+    // candidate it cannot prove inapplicable.
+    enum class SelfBoundVerdict { Guaranteed, NotGuaranteed, Undecided };
+    SelfBoundVerdict typeParamGuaranteesSelfInterface(
+        std::string_view paramName, const TypeRef* paramRef,
+        TypeSymbol* target);
 
     // fix #4229 (§31.2.1 / §12.7 / §2.8.3 rule 4 / §17.4, §19.3, v0.300): does
     // `t` mention a free/rigid type parameter of the ENCLOSING scope anywhere —

@@ -193,6 +193,114 @@ std::string looped() {
         "end D;\n";
 }
 
+// fix-forward #8198 — the `Money` record conforming to a user interface `I`
+// (the reviewer's probe a14's declaration, verbatim in shape): it declares
+// the whole §2.19 `INumber<T>` member set, so it conforms to `INumber<Money>`
+// through `I` (§14.2 *Interface conformance* rule 2 via rule 3).
+std::string moneyRecord(const char* iface) {
+    return std::string("public record Money(Cents: int): ") + iface +
+           "<Money>\n"
+           "  public static method Zero(): Money => new Money(0);\n"
+           "  public static method One(): Money => new Money(1);\n"
+           "  public static method operator +(a: Money, b: Money): Money =>"
+           " new Money(a.Cents + b.Cents);\n"
+           "  public static method operator -(a: Money, b: Money): Money =>"
+           " new Money(a.Cents - b.Cents);\n"
+           "  public static method operator *(a: Money, b: Money): Money =>"
+           " new Money(a.Cents * b.Cents);\n"
+           "  public static method operator /(a: Money, b: Money): Money =>"
+           " new Money(a.Cents / b.Cents);\n"
+           "  public static method operator <(a: Money, b: Money): bool =>"
+           " a.Cents < b.Cents;\n"
+           "  public static method operator >(a: Money, b: Money): bool =>"
+           " a.Cents > b.Cents;\n"
+           "  public static method operator <=(a: Money, b: Money): bool =>"
+           " a.Cents <= b.Cents;\n"
+           "  public static method operator >=(a: Money, b: Money): bool =>"
+           " a.Cents >= b.Cents;\n"
+           "end Money;\n";
+}
+
+// fix-forward #8198 — the reviewer's probe a14, verbatim: `where T:
+// IMyNum<T>` over `interface IMyNum<T>: INumber<T>`. §14.2 *Interface
+// conformance* rule 6: "a type-bound constraint naming I or an interface
+// extending I" — the bound guarantees `T: INumber<T>`, so the §5 `Sum()` is
+// applicable and more specific (its `IEnumerable<T>` head beats `Object`,
+// §26.5.1): 5 + 6 = 11.
+std::string extendingInterfaceBoundSum() {
+    return
+        "module M;\n"
+        "public interface IMyNum<T>: INumber<T> where T: IMyNum<T>\n"
+        "end IMyNum;\n" +
+        moneyRecord("IMyNum") +
+        "extension Object\n"
+        "  public method Sum(): int => 4040;\n"
+        "end;\n"
+        "public class Program\n"
+        "  static method G<T>(a: Array<T>): T where T: IMyNum<T> =>"
+        " a.Sum();\n"
+        "  static method H<T>(a: Array<T>): T where T: INumber<T> =>"
+        " a.Sum();\n"
+        "  public static method Main()\n"
+        "    var a := new Array<Money>();\n"
+        "    a.Add(new Money(5)); a.Add(new Money(6));\n"
+        "    Console.WriteLine(G(a).Cents);\n"
+        "  end Main;\n"
+        "end Program;\n";
+}
+
+// fix-forward #8198 CONTROL — an UNRELATED interface bound: `IOther<T>`
+// extends nothing, so `where T: IOther<T>` guarantees no `INumber<T>`
+// conformance (rule 6 needs "I or an interface extending I"), the §5 `Sum()`
+// is not applicable, and the user's extension answers 4040.
+std::string unrelatedInterfaceBoundSum() {
+    return
+        "module M;\n"
+        "public interface IOther<T>\n"
+        "  method Tag(): int;\n"
+        "end IOther;\n"
+        "public record Ticket(N: int): IOther<Ticket>\n"
+        "  public method Tag(): int => N;\n"
+        "end Ticket;\n"
+        "extension Object\n"
+        "  public method Sum(): int => 4040;\n"
+        "end;\n"
+        "public class Program\n"
+        "  static method G<T>(a: Array<T>): int where T: IOther<T> =>"
+        " a.Sum();\n"
+        "  public static method Main()\n"
+        "    var a := new Array<Ticket>();\n"
+        "    a.Add(new Ticket(5)); a.Add(new Ticket(6));\n"
+        "    Console.WriteLine(G(a));\n"
+        "  end Main;\n"
+        "end Program;\n";
+}
+
+// fix-forward #8198 — the reviewer's probe a07, verbatim: `where T: U where
+// U: INumber<U>`. Through the `where T: U` chain rule 6 gives `T:
+// INumber<U>`, and `INumber` is invariant (§11.8 (2), §12.9), so the bound
+// does not guarantee `T: INumber<T>` "at every substitution they admit"
+// (§14.2 case 1; a class `U` conforming to `INumber<U>` admits a derived `T`
+// that conforms to `INumber<U>` only). The §5 `Sum()` is not applicable and
+// the user's extension answers 4040.
+std::string chainedOtherArgumentBoundSum() {
+    return
+        "module M;\n"
+        "extension Object\n"
+        "  public method Sum(): int => 4040;\n"
+        "end;\n"
+        "class C\n"
+        "  static method G<T, U>(a: Array<T>, u: U): int where T: U where U:"
+        " INumber<U> => a.Sum();\n"
+        "  public static method Main(): int\n"
+        "    var a := new Array<int>();\n"
+        "    a.Add(5); a.Add(6);\n"
+        "    Console.WriteLine(G(a, 1));\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n";
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -285,4 +393,63 @@ BEZEL_TEST(codegen_linq_generic_body_where_applicability_8198,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "11\n");
+}
+
+// ---------------------------------------------------------------------------
+// fix-forward #8198 (§14.2 *Interface conformance* rule 6, §26.5.1, v0.355).
+//
+// F1 — the reviewer's probe a14: `where T: IMyNum<T>`, `IMyNum<T>:
+// INumber<T>`. The bound GUARANTEES the clause ("a type-bound constraint
+// naming I or an interface extending I"), so the §5 `Sum()` is applicable and
+// more specific than the user's `extension Object { Sum() }`: the spec answer
+// is 11, and the extension's 4040 is WRONG CODE.
+//
+// THE ORACLE IS TWO-PART, because the spec answer is not reachable yet: the
+// §5 `Sum()` lowering over a user `INumber<T>` conformer is a PRE-EXISTING
+// codegen gap (#8223 — the same malformed IR under a literal `where T:
+// INumber<T>` bound, on every arm). So: never the extension's 4040 (the
+// #8198 selection this row pins), and once the program runs, exactly 11.
+// #8223's fix tightens this row to a strict `ran` + "11".
+//
+// ON ed7d47d7 ALONE: COMPILES and PRINTS 4040 (the first cut read only a
+// literal `INumber<P>` bound and dropped the applicable §5 candidate —
+// silent wrong code), so this row FAILS there. With the fix-forward the §5
+// candidate is kept and the compile stops at #8223's malformed IR, as on
+// b52409a7.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(codegen_linq_generic_body_where_applicability_8198,
+           extending_interface_bound_keeps_the_builtin_sum) {
+    JitResult r = runAotChecked(extendingInterfaceBoundSum());
+    BEZEL_EXPECT_FALSE(r.stdoutText == "4040\n");
+    if (r.ran) {
+        BEZEL_EXPECT_EQ(r.exitCode, 0);
+        BEZEL_EXPECT_EQ(r.stdoutText, "11\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F2 — CONTROL: an UNRELATED interface bound drops the §5 candidate; the
+// user's extension answers 4040 (ed7d47d7's verdict, which must NOT change).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(codegen_linq_generic_body_where_applicability_8198,
+           unrelated_interface_bound_answers_the_applicable_extension) {
+    JitResult r = runAotChecked(unrelatedInterfaceBoundSum());
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "IR verification failed"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "4040\n");
+}
+
+// ---------------------------------------------------------------------------
+// F3 — the reviewer's probe a07: `where T: U where U: INumber<U>` does not
+// guarantee `T: INumber<T>` (invariance), so the user's extension answers
+// 4040. A BEHAVIOUR FLIP from the pre-#8198 base, which printed 11.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(codegen_linq_generic_body_where_applicability_8198,
+           chained_bound_at_another_argument_answers_the_applicable_extension) {
+    JitResult r = runAotChecked(chainedOtherArgumentBoundSum());
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "IR verification failed"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "4040\n");
 }

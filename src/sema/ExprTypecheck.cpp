@@ -6037,62 +6037,88 @@ bool ExprTC::isCurrentScopeTypeParamConstrained(std::string_view name)
     return false;
 }
 
-// fix #6295 item 1 (§14.2, §27.6, stdlib §2.2, v0.355): the helper that
-// decides a TYPE-PARAMETER type argument against §2.2's `where T:
-// IComparable<T>` bound. See the declaration comment on the impl header for
-// the spec citations.
+// fix #6295 item 1 (§14.2, §27.6, stdlib §2.2, v0.355), generalised by the
+// #8198 fix-forward (§14.2 *Interface conformance* rules 1, 3 and 6,
+// §26.5.1, v0.355): the helper that decides a TYPE-PARAMETER type argument
+// against a SELF-PARAMETERISED interface bound — §2.2's `where T:
+// IComparable<T>` and stdlib §5.1's `where T: INumber<T>`. See the
+// declaration comments on the impl header for the spec citations.
 //
-// (b) `where V: J<V>` where `J` EXTENDS `IComparable<V>` — §14.2
-// *Interface conformance* rule 6's "an interface extending `I`". The
-// extension chain is walked in the context of the instantiation's OWN
-// arguments (§14.1 instantiation), so `interface J<T>: IComparable<T>` read
-// at `J<V>` yields the base `IComparable<V>` and not `IComparable<T>`.
+// (b) `where V: J<V>` where `J` EXTENDS `I<V>` — §14.2 *Interface
+// conformance* rule 6's "an interface extending `I`". The extension chain is
+// walked in the context of each instantiation's OWN arguments (§14.1
+// instantiation), so `interface J<T>: IComparable<T>` read at `J<V>` yields
+// the base `IComparable<V>` and not `IComparable<T>`.
 //
-// The walk is over the DECLARED bases (`baseTypeRefs`), each instantiated
-// with the declaration's own parameters bound to the bound's arguments; a
-// base that is not an interface contributes nothing (a class base cannot
-// establish an INTERFACE conformance for a DIFFERENT type argument —
-// `IComparable` is invariant, §12.9).
-static bool interfaceExtendsSelfComparable(
-    const TypeRef* inst, TypeSymbol* icmp,
+// The walk is over the DECLARED bases (`baseTypeRefs`). Each base is
+// instantiated with ITS OWN declaration's parameters bound to the arguments
+// of the instantiation it was reached through, and the INSTANTIATED base is
+// what the frontier carries — so a two-level chain whose levels spell their
+// parameters differently (`interface IA<X>: IB<X>`, `interface IB<Y>:
+// INumber<Y>`, read at `IA<P>`) reaches `INumber<P>`. (The #6295 walk carried
+// bare declarations and substituted every level with the FIRST level's
+// parameter names, so the second level's `INumber<Y>` stayed `INumber<Y>`.)
+// A class bound (`where T: SomeClass`, rule 6's "a class bound naming a class
+// that conforms to I under rule 1") is walked the same way: a class's bases
+// are its base class and its interface list, and rule 1 conforms it through
+// either. The target's OTHER instantiations (`INumber<SomeBase>`) do not
+// satisfy the bound: the self-parameterised interfaces are invariant (§11.8
+// (2), §12.9).
+//
+// UNDECIDED: a declaration whose bases are not all readable as references
+// (`baseTypeRefs` shorter than `baseTypes`, or a null entry), or a
+// declaration reached twice (a diamond, whose second instantiation this walk
+// does not re-read), leaves the answer undecided when the target was not
+// reached — the caller that must never DROP an applicable candidate reads
+// that as "keep".
+enum class SelfBoundWalk { Reached, NotReached, Undecided };
+
+static SelfBoundWalk interfaceExtendsSelfInterface(
+    const TypeRef* inst, TypeSymbol* target,
     const std::function<bool(const TypeRef*)>& isTheParam, SemaContext& ctx) {
-    if (!inst || !inst->declaration || !icmp) return false;
-    TypeSymbol* decl = inst->declaration;
-    // The instantiation's own arguments, keyed by the DECLARATION's parameter
-    // names (§14.1).
-    std::unordered_map<std::string_view, TypeRef*> subst;
-    for (std::size_t i = 0;
-         i < decl->genericParams.size() && i < inst->genericArgs.size(); ++i) {
-        Symbol* gp = decl->genericParams[i];
-        TypeRef* ga = inst->genericArgs[i];
-        if (gp && ga) subst[gp->name] = ga;
-    }
-    std::vector<TypeSymbol*> frontier{decl};
-    std::unordered_set<TypeSymbol*> seen{decl};
+    if (!inst || !inst->declaration || !target) return SelfBoundWalk::NotReached;
+    bool undecided = false;
+    std::vector<const TypeRef*> frontier{inst};
+    std::unordered_set<TypeSymbol*> seen{inst->declaration};
     while (!frontier.empty()) {
-        TypeSymbol* t = frontier.back();
+        const TypeRef* cur = frontier.back();
         frontier.pop_back();
-        for (const TypeRef* br : t->baseTypeRefs) {
-            if (!br) continue;
+        TypeSymbol* decl = cur->declaration;
+        // This instantiation's own arguments, keyed by ITS declaration's
+        // parameter names (§14.1).
+        std::unordered_map<std::string_view, TypeRef*> subst;
+        for (std::size_t i = 0;
+             i < decl->genericParams.size() && i < cur->genericArgs.size();
+             ++i) {
+            Symbol* gp = decl->genericParams[i];
+            TypeRef* ga = cur->genericArgs[i];
+            if (gp && ga) subst[gp->name] = ga;
+        }
+        if (decl->baseTypeRefs.size() < decl->baseTypes.size())
+            undecided = true;
+        for (const TypeRef* br : decl->baseTypeRefs) {
+            if (!br) { undecided = true; continue; }
             TypeRef* base = const_cast<TypeRef*>(br);
             if (!subst.empty()) {
                 SubstArgs sa = {ctx, subst};
                 base = sema::substituteGenericArgs(base, sa);
             }
-            if (!base) continue;
-            if (base->declaration == icmp) {
+            if (!base) { undecided = true; continue; }
+            if (base->declaration == target) {
                 if (base->genericArgs.size() == 1 &&
                     isTheParam(base->genericArgs[0]))
-                    return true;
+                    return SelfBoundWalk::Reached;
                 continue;
             }
-            if (base->declaration &&
-                base->declaration->kind == ast::TypeDeclKind::Interface &&
-                seen.insert(base->declaration).second)
-                frontier.push_back(base->declaration);
+            if (!base->declaration) continue;
+            if (!seen.insert(base->declaration).second) {
+                undecided = true;
+                continue;
+            }
+            frontier.push_back(base);
         }
     }
-    return false;
+    return undecided ? SelfBoundWalk::Undecided : SelfBoundWalk::NotReached;
 }
 
 bool ExprTC::typeParamSatisfiesSelfComparable(std::string_view paramName,
@@ -6128,12 +6154,60 @@ bool ExprTC::typeParamSatisfiesSelfComparable(std::string_view paramName,
             if (!ctr->declaration ||
                 ctr->declaration->kind != ast::TypeDeclKind::Interface)
                 return false;
-            if (!interfaceExtendsSelfComparable(ctr, icmp, isTheParam, ctx_))
+            if (interfaceExtendsSelfInterface(ctr, icmp, isTheParam, ctx_) !=
+                SelfBoundWalk::Reached)
                 return false;
             admitted = true;
             return true;
         });
     return admitted;
+}
+
+// fix-forward #8198 (§14.2 *A type parameter as the type argument* case 1 and
+// *Interface conformance* rule 6, §26.5.1, v0.355): see the declaration
+// comment on the impl header.
+ExprTC::SelfBoundVerdict ExprTC::typeParamGuaranteesSelfInterface(
+    std::string_view paramName, const TypeRef* paramRef, TypeSymbol* target) {
+    if (!target) return SelfBoundVerdict::Undecided;
+    auto isTheParam = [&](const TypeRef* t) -> bool {
+        return t && !t->nullable && t->kind == TypeRef::Kind::Named &&
+               !t->declaration &&
+               Resolver::typeRefEqualSameScope(t, paramRef);
+    };
+    bool undecided = false;
+    bool guaranteed = false;
+    // THE ONE WALK (`forEachConstraintBound`), the `where T: U` chain
+    // followed. A bound with no declaration that is not a chained type
+    // parameter is one of the builtin collection heads (#7086), whose
+    // conformance is to no self-parameterised static-member interface.
+    forEachConstraintBound(paramName, [&](TypeRef* ctr) -> bool {
+        if (!ctr || !ctr->declaration) return false;
+        // (a) the bound names the target ITSELF at the parameter.
+        if (ctr->declaration == target) {
+            if (ctr->genericArgs.size() == 1 &&
+                isTheParam(ctr->genericArgs[0])) {
+                guaranteed = true;
+                return true;
+            }
+            return false;  // another instantiation: invariant (§12.9)
+        }
+        // (b) an interface extending the target, or a class conforming to
+        // it under rule 1 — its declared bases, instantiated.
+        switch (interfaceExtendsSelfInterface(ctr, target, isTheParam, ctx_)) {
+            case SelfBoundWalk::Reached:
+                guaranteed = true;
+                return true;
+            case SelfBoundWalk::Undecided:
+                undecided = true;
+                return false;
+            case SelfBoundWalk::NotReached:
+                return false;
+        }
+        return false;
+    });
+    if (guaranteed) return SelfBoundVerdict::Guaranteed;
+    return undecided ? SelfBoundVerdict::Undecided
+                     : SelfBoundVerdict::NotGuaranteed;
 }
 
 // fix #4916 (§3.6 rule 2, §5.1, §14.2, v0.307): the #4810 `checkAssignable`
