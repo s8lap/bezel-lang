@@ -5948,6 +5948,34 @@ std::unordered_set<std::string_view> ExprTC::currentScopeGenericParamNames()
     return names;
 }
 
+// fix #6530 (§3.6 rule 2 / §14.1, v0.355) — see the declaration in
+// ExprTypecheck_impl.hpp for the full rationale. The POSITIVE test for "this
+// bare name is a TYPE PARAMETER" is the enclosing scope's declared parameter
+// names (§14.1), not the name-keyed builtin registry test.
+//
+// MEASURED on the pre-fix base, the name-keyed test over-rejected valid
+// generic code in THREE guards, all in ExprTypecheck_Exprs.cpp and all with
+// the same shape — a type parameter named after a reserved builtin:
+//
+//   * #6500's range-index guard (`Dictionary<Range, int>` indexed by `1..5`)
+//     -> "range index `[a..b]` is not admitted on `Dictionary<K, V>`";
+//   * the `in` operator's §5.1 key-slot check (`(0..1) in d` over a
+//     `Dictionary<Range, int>`) -> "the left operand of `in` over
+//     `Dictionary` has a type that is not implicitly convertible to the
+//     target type (§5.1)";
+//   * the index-argument check's unsubstituted-parameter walk (`d[0]` over a
+//     `Dictionary<Range, int>`) -> "a value of primitive type `int` does not
+//     implicitly convert to the type parameter `Range`".
+//
+// The same three programs with the type parameter named `T` are ACCEPTED on
+// that base — the asymmetry IS the defect. The registry test survives as the
+// fallback for a name the scope does not declare (see the header).
+bool ExprTC::isBareTypeParamName(std::string_view name) const {
+    if (isInScopeTypeParam(name)) return true;
+    return !common::isReservedBuiltinTypeName(name) &&
+           !common::isBuiltinExceptionName(name);
+}
+
 // Sibling of `isExtensionTargetTypeParam` (tests one name) — same walk
 // (§26.4), collecting every bound name instead of testing a single one.
 void ExprTC::collectExtensionTargetTypeParamNames(

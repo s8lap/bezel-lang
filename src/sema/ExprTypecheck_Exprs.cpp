@@ -1017,6 +1017,18 @@ static bool sameIndexParamType(const TypeRef* p, const TypeRef* a) {
 // fix #7064 (§14.1 / §14.2, v0.343) — does this type still carry an
 // UNSUBSTITUTED type parameter?
 //
+// fix #6530 (§3.6 rule 2 / §14.1, v0.355): this was a file-static, and its
+// leaf test was NAME-keyed — "not a reserved builtin name, therefore a type
+// parameter" — so a type parameter named after a reserved builtin (`Range`,
+// `Guid`) was read as a CONCRETE type and the check fired on valid
+// generic code. It is a MEMBER now so the leaf test can ask the SCOPE
+// (`isBareTypeParamName`): a bare name that IS a declared type parameter of
+// the enclosing scope is a type parameter whatever it is spelled. MEASURED on
+// the pre-fix base: `method F<Range>(d: Dictionary<Range, int>): int
+// return d[0];` is rejected with "a value of primitive type `int` does not
+// implicitly convert to the type parameter `Range`", while the same program
+// with the type parameter named `T` is accepted.
+//
 // A declared index-parameter type read off an INHERITED generic member can
 // still carry the DERIVED class's type parameter. MEASURED repro (#6319's
 // `indexer_vtable_dispatch_6319.ancestor_chain_substitutes_generic_key`):
@@ -1038,12 +1050,10 @@ static bool sameIndexParamType(const TypeRef* p, const TypeRef* a) {
 // already applies to a bare `property [i: T]`. The RECURSION matters: the
 // bare parameter is EMBEDDED in a constructed type here, so a top-level-only
 // test would have read `Array<U>` as a concrete type and rejected `m[a]`.
-static bool containsUnsubstitutedTypeParam(const TypeRef* t) {
+bool ExprTC::containsUnsubstitutedTypeParam(const TypeRef* t) const {
     if (!t) return false;
     if (t->kind == TypeRef::Kind::Named && !t->declaration &&
-        t->genericArgs.empty() &&
-        !common::isReservedBuiltinTypeName(t->headName()) &&
-        !common::isBuiltinExceptionName(t->headName()))
+        t->genericArgs.empty() && isBareTypeParamName(t->headName()))
         return true;
     for (const TypeRef* ga : t->genericArgs)
         if (containsUnsubstitutedTypeParam(ga)) return true;
@@ -6103,25 +6113,39 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             // here: at `T := Range<int>` the index is admitted
                             // and at `T := int` it is not, and the decision
                             // belongs to the instantiation, not to this
-                            // declaration. Fail OPEN there — a declaration-less
-                            // single-part Named TypeRef is "a reserved builtin,
-                            // or a type parameter" (BuiltinRegistry.hpp), so
-                            // `common::isReservedBuiltinTypeName` is the
-                            // project's own positive test for which one this
-                            // is, and claiming only a name the registry knows
-                            // keeps a missed built-in costing a rejection that
-                            // does not fire rather than a false one. MEASURED
-                            // on the pre-fix base: `method F<T>(k: T)` with
-                            // `Dictionary<T, string>` indexed by `0..1`
-                            // compiles, and it still compiles here.
+                            // declaration. Fail OPEN there.
+                            //
+                            // fix #6530 (§3.6 rule 2 / §14.1, v0.355): the
+                            // test for "this name is a TYPE PARAMETER" is the
+                            // ENCLOSING SCOPE's declared parameter names
+                            // (`isBareTypeParamName`, §14.1) — NOT a name-keyed
+                            // registry test. A declaration-less single-part
+                            // Named TypeRef is ambiguous between "a reserved
+                            // builtin" and "a type parameter"
+                            // (BuiltinRegistry.hpp says so), and the NAME
+                            // cannot tell the two apart: a type parameter
+                            // named `Range` or `Guid` was read as the
+                            // builtin and this guard fired on valid generic
+                            // code. MEASURED on the pre-fix base:
+                            // `method F<Range>(k: Range)` with
+                            // `Dictionary<Range, int>` indexed by `1..5` is
+                            // rejected with this very message, while the
+                            // same body under `F<T>` compiles.
+                            //
+                            // The registry test survives inside
+                            // `isBareTypeParamName` as the FALLBACK for a name
+                            // the scope does NOT declare: a name the registry
+                            // does not know is not a builtin, so it is a type
+                            // parameter (or an unresolved name, which fails
+                            // open too) — #6500's own rule, which keeps a
+                            // MISSED built-in name costing a rejection that
+                            // does not fire rather than one that fires
+                            // falsely.
                             bool keyIsBareParam = false;
                             if (keyT && keyT->kind == TypeRef::Kind::Named &&
                                 !keyT->declaration && keyT->genericArgs.empty())
                                 keyIsBareParam =
-                                    !common::isReservedBuiltinTypeName(
-                                        keyT->headName()) &&
-                                    !common::isBuiltinExceptionName(
-                                        keyT->headName());
+                                    isBareTypeParamName(keyT->headName());
                             if (rangeIdx && !keyIsRange && !keyIsBareParam)
                                 ctx_.diagnostics().report(
                                     Severity::Error, e.span.begin,
@@ -10883,6 +10907,14 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
         // PARAMETER key (`Dictionary<T, V>` in a generic body, §14.2 rule 2) is
         // undecidable at the declaration and fails OPEN, exactly as #6500's
         // indexer guard does, so `Helper.F<Range<int>>()` still resolves.
+        //
+        // fix #6530 (§3.6 rule 2 / §14.1, v0.355): the bare-parameter test
+        // is the SCOPE's (`isBareTypeParamName`), not the name-keyed registry
+        // test. MEASURED on the pre-fix base: with the type parameter named
+        // `Range`, `(0 .. 1) in d` over a `Dictionary<Range, int>` is rejected
+        // with "the left operand of `in` over `Dictionary` has a type that is
+        // not implicitly convertible to the target type (§5.1)", while the
+        // same program with the type parameter named `T` is accepted.
         if (be.left && inLt && inRt && inRt->kind == TypeRef::Kind::Named &&
             !inRt->genericArgs.empty() && inRt->genericArgs[0]) {
             std::string_view inHead = inRt->aliasResolvedHead.empty()
@@ -10911,8 +10943,7 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 if (keyT && keyT->kind == TypeRef::Kind::Named &&
                     !keyT->declaration && keyT->genericArgs.empty())
                     keyIsBareParam =
-                        !common::isReservedBuiltinTypeName(keyT->headName()) &&
-                        !common::isBuiltinExceptionName(keyT->headName());
+                        isBareTypeParamName(keyT->headName());
                 if (!keyIsBareParam) {
                     // A `RangeExpr` node reaches sema with a default-
                     // constructed span (the parser's `stampSpan` runs on the

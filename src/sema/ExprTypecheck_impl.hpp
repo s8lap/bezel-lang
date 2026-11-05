@@ -2618,6 +2618,43 @@ private:
     // to RETURN the set so `variantGenericAssignable`'s recursion can test
     // membership at arbitrary nesting depth.
     std::unordered_set<std::string_view> currentScopeGenericParamNames() const;
+    // fix #6530 (§3.6 rule 2 / §14.1, v0.355): is `name` — a bare,
+    // declaration-less, single-part Named type — a TYPE PARAMETER in the
+    // enclosing scope?
+    //
+    // THE QUESTION IS ABOUT THE SCOPE, NOT ABOUT THE NAME. A declaration-less,
+    // single-part `Named` TypeRef is ambiguous between "a reserved builtin"
+    // and "a type parameter" (BuiltinRegistry.hpp says so, and explains that
+    // CODEGEN has no choice but to ask it negatively — "not a builtin name,
+    // therefore a type parameter" — because codegen has no scope to consult).
+    // SEMA DOES have a scope: §14.1 makes the type parameters in scope at a
+    // declaration the enclosing type's and the enclosing method's own (plus an
+    // enclosing extension block's, §26.4). So the POSITIVE test for "a type
+    // parameter" is `isInScopeTypeParam`, and the name-keyed test is the wrong
+    // SHAPE for it — measurably so: a type parameter named `Range`, `Guid` or
+    // `Guid` (both reserved builtin names) was read as the builtin, and every
+    // guard keyed on that read rejected valid generic code.
+    //
+    // The registry test survives as the FALLBACK for a name the scope does not
+    // declare: a name the registry does not know is not a builtin, so it is a
+    // type parameter (or an unresolved name, which fails open too). That keeps
+    // #6500's own rule — a MISSED built-in name costs a rejection that does
+    // not fire rather than one that fires falsely — so the ONLY behaviour this
+    // changes is the shape it is meant to change.
+    //
+    // ONE helper, three call sites: the #6500 range-index guard
+    // (ExprTypecheck_Exprs.cpp), the `in` operator's key-slot check
+    // (#6527/#6535, same file) and the index-argument check's
+    // unsubstituted-parameter walk (#7064/#6319, same file) all asked the
+    // name-keyed question, and all three over-rejected identically.
+    bool isBareTypeParamName(std::string_view name) const;
+    // fix #6530 (§3.6 rule 2 / §14.1, v0.355): the #7064/#6319 walk — does
+    // `t` still carry an UNSUBSTITUTED type parameter anywhere (a bare one,
+    // `property [i: T]` in a generic class, or one EMBEDDED in a constructed
+    // type)? Was a file-static in ExprTypecheck_Exprs.cpp; promoted to a
+    // member so its leaf test can ask the SCOPE (`isBareTypeParamName`)
+    // instead of the name.
+    bool containsUnsubstitutedTypeParam(const TypeRef* t) const;
     // Sibling of `isExtensionTargetTypeParam` (which tests one name) that
     // collects EVERY name the same walk would recognize, for
     // `currentScopeGenericParamNames`'s extension arm.
