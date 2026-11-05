@@ -3528,6 +3528,172 @@ int builtinNullableOutTypeArgIndex(std::string_view head,
         return 1;
     return -1;
 }
+
+// fix #5911 (§15.1 / §14.2, v0.355): the receiver type-argument INDEX at
+// which a builtin member's `*OrNull` SIGNATURE forms `T?` as its RESULT, or
+// -1 when it forms none.
+//
+// §15.1's conditionally-admitted register covers the `*OrNull` tier beside
+// the `Try*(out item: T?)` family (the register sentence names `FirstOrNull`
+// and `TryPop`/`TryReceive` among them), and it is POSITIONAL in the same
+// way `builtinNullableOutTypeArgIndex` above reads it for the `Try*` family:
+// a member is over the register only when the type argument its `T?` is
+// formed at is an inline array — the ELEMENT type, or a dictionary's VALUE
+// type. The KEY type of a dictionary participates in no `T?` its signature
+// forms (`key: K` is K, not K?), so `Dictionary<[3]int, string>` is not over
+// the register and `GetOrNull` there is ADMITTED.
+//
+// The difference from the `Try*` table is only WHERE the `T?` is formed: the
+// `Try*` family forms it as an `out` slot, the `*OrNull` tier as the RESULT.
+// The position table is therefore separate but parallel — keyed (head,
+// member) the same way — so the argument-vs-value distinction cannot drift
+// between the two.
+//
+// The members are stdlib §1's `*OrNull` tier as listed per type:
+//   * a dictionary's VALUE type (genericArgs[1]) — `Dictionary`/
+//     `SortedDictionary`/`OwningDictionary` `GetOrNull` (stdlib §4.8 / §4.9
+//     / §4.17).
+//   * the ELEMENT type (genericArgs[0]) — the §5 sequence accessors
+//     `FirstOrNull` / `LastOrNull` / `SingleOrNull` / `ElementAtOrNull`
+//     (stdlib §5) and §5.1's `MinOrNull` / `MaxOrNull`.
+//
+// `IGrouping<TKey, T>` (stdlib §4.12) is the one receiver whose ELEMENT type
+// is not genericArgs[0]: its genericArgs[0] is the KEY type and the element
+// is genericArgs[1].
+//
+// The STATIC tiers (`ParseOrNull`, `ReadKeyOrNull`) and the enum
+// compiler-provided forms (`FromNameOrNull`, `FromUnderlyingOrNull`) form
+// their `T?` at NO receiver type argument — their receiver is a primitive or
+// an enum, not a type-parameterised collection — so they are absent here.
+int builtinNullableOrNullTypeArgIndex(std::string_view head,
+                                      std::string_view member) {
+    auto isOneOf = [](std::initializer_list<std::string_view> names,
+                      std::string_view x) {
+        for (std::string_view n : names)
+            if (n == x) return true;
+        return false;
+    };
+    // A dictionary's VALUE type — genericArgs[1]. The key type (index 0)
+    // participates in no `T?` this signature forms: `key: K` is K, not K?.
+    if (member == "GetOrNull" &&
+        isOneOf({"Dictionary", "SortedDictionary", "OwningDictionary"}, head))
+        return 1;
+    // `OwningSlotMap<T>.GetOrNull(handle: SlotHandle): T?` (stdlib §4.21)
+    // forms its `T?` at the ELEMENT type. That type's own `where T: class`
+    // constraint is what keeps an inline array out — NOT the absence of a
+    // `T?` — so the position is read here too, exactly as the `Try*` table's
+    // footer records for `OwningSlotMap`'s `TryGetValue`/`TryPopValue`.
+    if (member == "GetOrNull" && head == "OwningSlotMap")
+        return 0;
+    // The ELEMENT type — genericArgs[0] (genericArgs[1] for `IGrouping`).
+    if (isOneOf({"FirstOrNull", "LastOrNull", "SingleOrNull",
+                 "ElementAtOrNull", "MinOrNull", "MaxOrNull"}, member)) {
+        // A DICTIONARY is NOT over the register here: `Dictionary<K,V>` is
+        // `ICollection<DictionaryEntry<K,V>>` (stdlib §4.8 / §4.17), so its
+        // §5 element accessors form `T?` at the SYNTHETIC entry type — a
+        // record that wraps K and V — and not at any receiver type argument.
+        // The KEY type is not the position either (`key: K` is K, not K?).
+        // So `Dictionary<[3]int, string>.FirstOrNull()` is not over the
+        // register, and reading the KEY here would reject it wrongly.
+        if (isOneOf({"Dictionary", "SortedDictionary", "OwningDictionary"},
+                    head))
+            return -1;
+        if (head == "IGrouping") return 1;
+        return 0;
+    }
+    return -1;
+}
+
+// fix #5911 (§15.1 / §14.2, v0.355): the receiver type argument at which the
+// `*OrNull` member `member` forms its `T?`, or nullptr when it forms none.
+//
+// The position is read through `builtinNullableOrNullTypeArgIndex` above, so
+// every `*OrNull` gate in this file agrees on WHERE the `T?` is formed — and
+// a dictionary's VALUE type cannot be confused with its KEY type.
+const TypeRef* nullableOrNullFormedTypeArg(const TypeRef* recvTy,
+                                           std::string_view head,
+                                           std::string_view member) {
+    if (!recvTy) return nullptr;
+    const int idx = builtinNullableOrNullTypeArgIndex(head, member);
+    if (idx < 0) return nullptr;
+    const auto& args = recvTy->genericArgs;
+    if (static_cast<std::size_t>(idx) >= args.size()) return nullptr;
+    return args[idx];
+}
+
+// fix #5911: the same read, with the receiver's OWN head as the position
+// key. The lazy sentinel (no astNode, no declaration) carries its element
+// type at genericArgs[0], so its empty head resolves to the element
+// position — the same one the named sequence receivers use.
+const TypeRef* nullableOrNullFormedTypeArg(const TypeRef* recvTy,
+                                           std::string_view member) {
+    if (!recvTy) return nullptr;
+    return nullableOrNullFormedTypeArg(recvTy, recvTy->headName(), member);
+}
+
+// fix #5911: the article for a builtin receiver head in a diagnostic clause
+// ("an `Array`", "a `Stack`").
+std::string_view articleForHead(std::string_view head) {
+    if (head.empty()) return "a";
+    switch (head[0]) {
+        case 'A': case 'E': case 'I': case 'O': case 'U':
+            return "an";
+        default:
+            return "a";
+    }
+}
+
+// fix #5911: the diagnostic clause naming the receiver and the POSITION the
+// `*OrNull` tier forms its `T?` at.
+//
+// The ELEMENT position — "an `Array` of an inline array".
+std::string orNullElementClause(std::string_view head) {
+    return std::string(articleForHead(head)) + " `" + std::string(head) +
+           "` of an inline array";
+}
+
+// The VALUE position (a dictionary) — "a `Dictionary` whose value type is an
+// inline array". The clause names the VALUE type because the KEY type is
+// NOT over the register: `Dictionary<[3]int, string>.GetOrNull` is admitted,
+// `Dictionary<string, [3]int>.GetOrNull` is not.
+std::string orNullValueClause(std::string_view head) {
+    return std::string(articleForHead(head)) + " `" + std::string(head) +
+           "` whose value type is an inline array";
+}
+
+// fix #5911 (§15.1 / §14.2, v0.355): the §15.1 conditionally-admitted-member
+// diagnostic for a `*OrNull` member whose `T?` is formed at an inline-array
+// receiver type argument.
+//
+// The wording REUSES #5641's diagnostic shape — the same skeleton (the
+// member's name, the "is not admitted on …" clause, the "the … would be a
+// nullable inline array, which §15.1 does not admit" clause, the
+// §-and-revision citation, and the `inline array` diagnostic tag) — with the
+// `out`-parameter clause replaced by the RETURN clause, because the `*OrNull`
+// tier forms its `T?` as a RESULT and the `Try*(out item: T?)` family forms
+// it as an `out` slot.
+//
+// `receiverClause` names the receiver and the position the `T?` is formed at,
+// so the user sees WHICH type argument is over the register.
+//
+// Returns true when a diagnostic was reported — the caller must then NOT
+// form the nullable result type.
+bool reportOrNullInlineArrayDiag(SemaContext& ctx,
+                                 const TypeRef* formedAt,
+                                 std::string_view member,
+                                 std::string_view receiverClause,
+                                 const SourceLocation& loc) {
+    if (!formedAt || formedAt->kind != TypeRef::Kind::InlineArray)
+        return false;
+    ctx.diagnostics().report(
+        Severity::Error, loc,
+        std::string(member) + "() is not admitted on " +
+            std::string(receiverClause) +
+            " — the return type would be a nullable inline array, which §15.1 "
+            "does not admit (spec §15.1 / §14.2, v0.355; diagnostic: "
+            "`inline array`)");
+    return true;
+}
 }  // namespace
 
 // fix #4806 (§12.7 / §22.3, v0.307): a bare `ref`/`out` operand names its
@@ -12486,19 +12652,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // of srcElem (set nullable flag on a fresh TypeRef copy).
                     // §15.1 / §14.2 (fix #5641): reject if srcElem is an inline
                     // array (the return type would be a nullable inline array).
+                    // fix #5911 (§15.1 / §14.2, v0.355): the position the
+                    // `T?` is formed at is read through the §15.1 position
+                    // table (`nullableOrNullFormedTypeArg`), so this gate and
+                    // the dictionary's `GetOrNull` gate cannot drift on
+                    // WHICH type argument is over the register.
                     if ((m == "FirstOrNull" || m == "LastOrNull" ||
                          m == "SingleOrNull") && ce.args.empty()) {
                         if (srcElem) {
-                            if (srcElem->kind == TypeRef::Kind::InlineArray) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, ce.span.begin,
-                                    std::string(m) +
-                                    "() is not admitted on a lazy sequence of an "
-                                    "inline array element type — the return type "
-                                    "would be a nullable inline array, which §15.1 "
-                                    "does not admit (spec §15.1 / §14.2, v0.327; "
-                                    "diagnostic: `inline array`)");
-                            } else {
+                            if (!reportOrNullInlineArrayDiag(
+                                    ctx_,
+                                    nullableOrNullFormedTypeArg(recvTy, m),
+                                    m,
+                                    "a lazy sequence of an inline array element "
+                                    "type",
+                                    ce.span.begin)) {
                                 auto* nullTy = ctx_.makeTypeRef();
                                 *nullTy = *srcElem;
                                 nullTy->nullable = true;
@@ -12510,20 +12678,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // stdlib §5 (#650/#661/#789): FirstOrNull(pred) /
                     // LastOrNull(pred) / SingleOrNull(pred) on lazy receiver → T?.
                     // §15.1 / §14.2 (fix #5641): same inline-array check.
+                    // fix #5911 (§15.1 / §14.2, v0.355): same position table.
                     if ((m == "FirstOrNull" || m == "LastOrNull" ||
                          m == "SingleOrNull") &&
                         ce.args.size() == 1) {
                         if (srcElem) {
-                            if (srcElem->kind == TypeRef::Kind::InlineArray) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, ce.span.begin,
-                                    std::string(m) +
-                                    "() is not admitted on a lazy sequence of an "
-                                    "inline array element type — the return type "
-                                    "would be a nullable inline array, which §15.1 "
-                                    "does not admit (spec §15.1 / §14.2, v0.327; "
-                                    "diagnostic: `inline array`)");
-                            } else {
+                            if (!reportOrNullInlineArrayDiag(
+                                    ctx_,
+                                    nullableOrNullFormedTypeArg(recvTy, m),
+                                    m,
+                                    "a lazy sequence of an inline array element "
+                                    "type",
+                                    ce.span.begin)) {
                                 auto* nullTy = ctx_.makeTypeRef();
                                 *nullTy = *srcElem;
                                 nullTy->nullable = true;
@@ -12848,13 +13014,32 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                              m == "ElementAt")
                         ctx_.setExprType(&ce, srcElem);
                     // stdlib §5 *OrNull (lazy receiver): return nullable T.
+                    // fix #5911 (§15.1 / §14.2, v0.355): the `*OrNull` tier
+                    // over an inline-array ELEMENT type is a compile error at
+                    // the call (spec §15.1's conditionally-admitted register).
+                    // MEASURED before this fix: the lazy terminal path formed
+                    // `T?` with NO gate, so `arr.Where(...).FirstOrNull()` on
+                    // an `Array<[3]int>` compiled clean (rc=0) and the
+                    // malformed nullable inline array reached codegen.
+                    // The position is read through the §15.1 position table,
+                    // so the element type of an `IGrouping<TKey, T>` (the one
+                    // receiver whose element is NOT genericArgs[0]) is read
+                    // correctly too.
                     else if ((m == "FirstOrNull" || m == "LastOrNull" ||
                               m == "SingleOrNull") && ce.args.empty()) {
                         if (srcElem) {
-                            auto* nullTy = ctx_.makeTypeRef();
-                            *nullTy = *srcElem;
-                            nullTy->nullable = true;
-                            ctx_.setExprType(&ce, nullTy);
+                            if (!reportOrNullInlineArrayDiag(
+                                    ctx_,
+                                    nullableOrNullFormedTypeArg(recvTy, m),
+                                    m,
+                                    "a lazy sequence of an inline array element "
+                                    "type",
+                                    ce.span.begin)) {
+                                auto* nullTy = ctx_.makeTypeRef();
+                                *nullTy = *srcElem;
+                                nullTy->nullable = true;
+                                ctx_.setExprType(&ce, nullTy);
+                            }
                         }
                     }
                     // fix #3784 (stdlib §5.1, v0.286): MinOrNull()/MaxOrNull()
@@ -12874,6 +13059,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // i32-default branch the direct-Array case hit.
                     else if ((m == "MinOrNull" || m == "MaxOrNull") &&
                              ce.args.empty() && srcElem) {
+                        // fix #5911 (§15.1 / §14.2, v0.355): the `*OrNull`
+                        // tier over an inline-array ELEMENT type is a compile
+                        // error at the call — the gate runs BEFORE the
+                        // IComparable<T> check below, because §14.2's
+                        // applicability question (is the member admitted at
+                        // this instantiation?) precedes §5.1's constraint.
+                        // MEASURED before this fix: this arm formed `T?` with
+                        // NO §15.1 gate, so the malformed nullable inline
+                        // array reached codegen, which refused it with
+                        // #2783's "not yet implemented for this element type"
+                        // — a §5.1-shaped message for a §15.1 violation.
+                        if (reportOrNullInlineArrayDiag(
+                                ctx_, nullableOrNullFormedTypeArg(recvTy, m),
+                                m,
+                                "a lazy sequence of an inline array element type",
+                                ce.span.begin))
+                            return;
                         // Defer the IComparable<T> check at a generic-var
                         // placeholder srcElem (§14.2's
                         // check-runs-at-instantiation rule; mirrors the
@@ -13053,6 +13255,33 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     ienumRecv && recvTy->headName() != "IEnumerable";
                 bool listIfaceSkip = false;
                 if (listIfaceRecv) {
+                    // fix #5911 (§15.1 / §14.2, v0.355): the §1 `*OrNull`
+                    // tier over an inline-array ELEMENT type is a compile
+                    // error at the call, on a list interface too — §4.1
+                    // declares `IList<T>` / `IReadOnlyList<T>` as inheriting
+                    // `IEnumerable<T>`, so §5's `FirstOrNull` / `LastOrNull` /
+                    // `SingleOrNull` are members of those surfaces and their
+                    // signature forms `T?` at the element type.
+                    //
+                    // The gate is placed HERE, before the `listIfaceSkip`
+                    // decision below, because the members the list-interface
+                    // path leaves UNTYPED (the `*OrNull` accessors are not in
+                    // `kLoweredOnListIface`) never reach the §5 typing arms
+                    // — so a gate placed there would never fire.
+                    // MEASURED at the base commit: `IList<[3]int>.FirstOrNull()`
+                    // compiled clean (rc=0) with no diagnostic, and using the
+                    // result SEGFAULTED the compiler (rc=139).
+                    //
+                    // The `!recvTy->declaration` guard keeps a USER's own class
+                    // named `IList` out (the builtin generic interfaces carry
+                    // NO TypeSymbol — §2.5 / #495), so the stdlib §1 register
+                    // is applied to the stdlib's own surface only.
+                    if (!recvTy->declaration &&
+                        reportOrNullInlineArrayDiag(
+                            ctx_, nullableOrNullFormedTypeArg(recvTy, m), m,
+                            orNullElementClause(recvTy->headName()),
+                            ce.span.begin))
+                        listIfaceSkip = true;
                     // fix #7625 (stdlib §5 / §4.1, v0.355): the DEFERRED
                     // operators and the `ToSet` materializer are lowered too:
                     // codegen's `tryLowerLazyLinqCall` wraps the borrowing,
@@ -13100,7 +13329,45 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // immediately. Same as the lazy / concrete-collection
                     // paths, with the defer behaviour the §14.2 check-runs-
                     // at-instantiation rule mandates.
-                    if ((m == "ToArray" || m == "ToSet") && ce.args.empty()) {
+                    //
+                    // fix #5911 (§15.1 / §14.2, v0.355): the `*OrNull` tier
+                    // over an inline-array ELEMENT type is a compile error at
+                    // the call, on an `IEnumerable<T>` receiver too — §5's
+                    // `FirstOrNull` / `LastOrNull` / `SingleOrNull` /
+                    // `ElementAtOrNull` and §5.1's `MinOrNull` / `MaxOrNull`
+                    // are declared on `IEnumerable<T>` (stdlib §4.12) and
+                    // each forms `T?` at the element type.
+                    //
+                    // The gate is placed FIRST in this block and the arms
+                    // below are chained onto it, so a rejected call is not
+                    // typed a second time: the `*OrNull` accessors are typed
+                    // by `typeLinqOperator` (the fallback at the end of this
+                    // block), which carries its own gate — two gates on one
+                    // call would report the same violation twice.
+                    //
+                    // MEASURED at the base commit: `IEnumerable<[3]int>
+                    // .MinOrNull()` was refused by CODEGEN (#2783's "not yet
+                    // implemented for this element type") and
+                    // `.ElementAtOrNull(0)` by #2457 ("produced no value, and
+                    // no dispatch arm") — §5.1- and §4.5-shaped messages for
+                    // §15.1 violations, reached because sema never formed the
+                    // `T?` these signatures form.
+                    //
+                    // The `!recvTy->declaration` guard keeps a USER's own
+                    // interface named `IEnumerable` out: the builtin generic
+                    // interfaces carry NO TypeSymbol (§2.5 / #495 — "those
+                    // with null TypeSymbol declarations", ExprTypecheck.cpp's
+                    // builtin-interface list), so a receiver that HAS a
+                    // declaration is the user's, and the stdlib §1 register
+                    // says nothing about it.
+                    if (!recvTy->declaration &&
+                        reportOrNullInlineArrayDiag(
+                            ctx_, nullableOrNullFormedTypeArg(recvTy, m), m,
+                            orNullElementClause(recvTy->headName()),
+                            ce.span.begin))
+                        ;  // §15.1 rejection reported; skip typing
+                    else if ((m == "ToArray" || m == "ToSet") &&
+                             ce.args.empty()) {
                         if (m == "ToSet" &&
                             !linqHashableCheck(m, srcElem2, ce.span.begin, ctx_))
                             ;  // diagnostic reported; skip typing
@@ -15177,16 +15444,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // §15.1 / §14.2 (fix #5641): a stdlib member whose
                             // signature forms `T?` at a type argument substituted by
                             // an inline array is a compile error at the use.
-                            if (recvTy->genericArgs[0]->kind == TypeRef::Kind::InlineArray) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, ce.span.begin,
-                                    std::string(m) +
-                                    "() is not admitted on an `Array` of an "
-                                    "inline array — the return type would be a "
-                                    "nullable inline array, which §15.1 does not "
-                                    "admit (spec §15.1 / §14.2, v0.327; "
-                                    "diagnostic: `inline array`)");
-                            } else {
+                            // fix #5911 (§15.1 / §14.2, v0.355): the position
+                            // the `T?` is formed at is read through the §15.1
+                            // position table, and the clause names the
+                            // receiver family this arm serves (the isArrLike
+                            // block covers `Array`/`Stack`/`Queue`/`Set`/
+                            // `LinkedList`/`SortedSet` and their owning
+                            // twins — the clause used to say "`Array`" for
+                            // all of them).
+                            if (!reportOrNullInlineArrayDiag(
+                                    ctx_,
+                                    nullableOrNullFormedTypeArg(recvTy, colName,
+                                                               m),
+                                    m, orNullElementClause(colName),
+                                    ce.span.begin)) {
                                 auto* nullTy = ctx_.makeTypeRef();
                                 *nullTy = *recvTy->genericArgs[0];
                                 nullTy->nullable = true;
@@ -15223,6 +15494,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  !recvTy->genericArgs.empty() &&
                                  recvTy->genericArgs[0]) {
                             TypeRef* elem = recvTy->genericArgs[0];
+                            // fix #5911 (§15.1 / §14.2, v0.355): the `*OrNull`
+                            // tier over an inline-array ELEMENT type is a
+                            // compile error at the call — the gate runs
+                            // BEFORE the IComparable<T> check below, because
+                            // §14.2's applicability question (is the member
+                            // admitted at this instantiation?) precedes §5.1's
+                            // constraint. MEASURED before this fix: this arm
+                            // formed `T?` with NO §15.1 gate, so the malformed
+                            // nullable inline array reached codegen, which
+                            // refused it with #2783's "not yet implemented for
+                            // this element type" — a §5.1-shaped message for a
+                            // §15.1 violation.
+                            if (reportOrNullInlineArrayDiag(
+                                    ctx_,
+                                    nullableOrNullFormedTypeArg(recvTy, colName,
+                                                               m),
+                                    m, orNullElementClause(colName),
+                                    ce.span.begin))
+                                return;
                             // stdlib §5.1: `where T: IComparable<T>`. For
                             // primitive elements (int/long/double/…) the
                             // constraint is trivially satisfied; for
@@ -15294,16 +15584,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  recvTy->genericArgs[0]) {
                             // §15.1 / §14.2 (fix #5641): same check as the
                             // zero-arg form above.
-                            if (recvTy->genericArgs[0]->kind == TypeRef::Kind::InlineArray) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, ce.span.begin,
-                                    std::string(m) +
-                                    "() is not admitted on an `Array` of an "
-                                    "inline array — the return type would be a "
-                                    "nullable inline array, which §15.1 does not "
-                                    "admit (spec §15.1 / §14.2, v0.327; "
-                                    "diagnostic: `inline array`)");
-                            } else {
+                            // fix #5911 (§15.1 / §14.2, v0.355): same
+                            // position table and same clause.
+                            if (!reportOrNullInlineArrayDiag(
+                                    ctx_,
+                                    nullableOrNullFormedTypeArg(recvTy, colName,
+                                                               m),
+                                    m, orNullElementClause(colName),
+                                    ce.span.begin)) {
                                 auto* nullTy = ctx_.makeTypeRef();
                                 *nullTy = *recvTy->genericArgs[0];
                                 nullTy->nullable = true;
@@ -16070,9 +16358,34 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // §4.8/§4.9 prose is explicit that `?` is idempotent under
                         // substitution (spec §7.10), so an already-nullable V is
                         // unchanged by this.
+                        //
+                        // fix #5911 (§15.1 / §14.2, v0.355): the §1 `*OrNull`
+                        // tier over an inline-array VALUE type is a compile
+                        // error at the call. This is the issue's own repro:
+                        // `Dictionary<[3]int,[3]int>.GetOrNull(k)` formed
+                        // `V?` = `[3]int?` with NO diagnostic, and codegen
+                        // then failed ("Trunc only produces integer" / "ZExt
+                        // only operates on integer"). MEASURED at the base
+                        // commit: the program compiled to a malformed-IR
+                        // failure, and with the result unwrapped (`v![0]`) the
+                        // compiler SEGFAULTED (rc=139).
+                        //
+                        // The POSITION is the VALUE type (genericArgs[1]),
+                        // never the KEY type (genericArgs[0]) — §15.1's
+                        // register says "a dictionary's value type", and
+                        // `key: K` is K, not K?. So
+                        // `Dictionary<[3]int, string>.GetOrNull` stays
+                        // ADMITTED.
                         else if (m == "GetOrNull" && ce.args.size() == 1 &&
                                  recvTy && recvTy->genericArgs.size() > 1 &&
                                  recvTy->genericArgs[1]) {
+                            if (reportOrNullInlineArrayDiag(
+                                    ctx_,
+                                    nullableOrNullFormedTypeArg(recvTy, colName,
+                                                               m),
+                                    m, orNullValueClause(colName),
+                                    ce.span.begin))
+                                return;
                             auto* vt = ctx_.makeTypeRef();
                             *vt = *recvTy->genericArgs[1];
                             vt->nullable = true;
@@ -16201,9 +16514,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // otherwise type the call as the NON-nullable value type,
                         // which is the same clobbering shape #3372 recorded for
                         // `TryAdd` and #2546 for `GetEnumerator`.
+                        //
+                        // fix #5911 (§15.1 / §14.2, v0.355): the §1 `*OrNull`
+                        // tier over an inline-array VALUE type is a compile
+                        // error at the call (the VALUE type is the position —
+                        // never the KEY type, which participates in no `T?`).
                         else if (m == "GetOrNull" && ce.args.size() == 1 &&
                                  recvTy && recvTy->genericArgs.size() > 1 &&
                                  recvTy->genericArgs[1]) {
+                            if (reportOrNullInlineArrayDiag(
+                                    ctx_,
+                                    nullableOrNullFormedTypeArg(recvTy, colName,
+                                                               m),
+                                    m, orNullValueClause(colName),
+                                    ce.span.begin))
+                                return;
                             auto* vt = ctx_.makeTypeRef();
                             *vt = *recvTy->genericArgs[1];
                             vt->nullable = true;
