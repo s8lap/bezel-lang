@@ -1953,6 +1953,19 @@ private:
                                          TypeSymbol* ifaceDecl,
                                          std::vector<TypeRef*>& out);
 
+    // fix #8161 (spec §14.2 *Interface conformance* rule 2 / §14.1
+    // *Instantiation and its site*, stdlib §2.8 / §5.1, v0.355): does the USER
+    // RECORD element type `elem` satisfy stdlib §5.1's `where T:
+    // IComparable<T>` constraint AT THIS INSTANTIATION? The judgement is
+    // §12.9's OWN — `collectAncestorInstantiationsOf` above (the §12.9 helper
+    // that collects every instantiation of the interface a type reaches, each
+    // re-expressed in the type's OWN arguments) — so the constraint check and
+    // the §12.9 assignment check cannot disagree. Defined in
+    // ExprTypecheck_Calls.cpp; used by the no-selector `Min()`/`Max()` gate
+    // on the CONCRETE-collection receiver and by the same gate on the LAZY
+    // (`Where(…)`) receiver.
+    bool userRecordComparableAtInstance(const TypeRef* elem);
+
     // fix #4183 (§14.5 phase 1, §26.5, v0.296/v0.298): the BUILTIN
     // counterpart of collectAncestorInstantiationsOf above. A builtin
     // collection type (`Array<T>`, `IList<T>`, ...) has no TypeSymbol —

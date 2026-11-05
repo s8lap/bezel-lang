@@ -6576,6 +6576,60 @@ static void checkBuiltinPathCallArity(
     SemaContext& ctx, const ast::CallExpr& ce, Symbol* calleeSym,
     const std::unordered_set<std::string>& ambiguousHeads);
 
+// fix #8161 (spec §14.2 *Interface conformance* rule 2 / §14.1
+// *Instantiation and its site*, stdlib §2.8 / §5.1, v0.355): does the USER
+// RECORD element type `elem` satisfy stdlib §5.1's `where T: IComparable<T>`
+// constraint AT THIS INSTANTIATION?
+//
+// §14.2's conformance rule is about the INSTANTIATION, not the declaration:
+// `record W<T>(v: int): IComparable<W<int>>` implements `IComparable<W<int>>`
+// — the SAME instantiation at every use, because the type argument is a
+// CONCRETE type and not the record's own parameter — so `W<string>` does NOT
+// implement `IComparable<W<string>>` and does not satisfy the constraint.
+// Only `record W<T>(v: int): IComparable<W<T>>` conforms at every
+// instantiation, because there the type argument IS the record's own
+// parameter, which §14.1's substitution re-expresses as the instance.
+//
+// THE JUDGEMENT IS §12.9's OWN. The assignment
+// `var x: IComparable<W<string>> := a[0]` is rejected ("`W` reaches
+// `IComparable` only at other type arguments") because
+// `collectAncestorInstantiationsOf` — the §12.9 helper that collects every
+// instantiation of the interface a type reaches, each re-expressed in the
+// type's OWN arguments — yields `IComparable<W<int>>`, not
+// `IComparable<W<string>>`. This helper consults the SAME walk, so the
+// constraint check and the assignment check cannot disagree.
+//
+// Returns false for any shape that is not a user record: the callers decide
+// the class/interface and built-in-value families themselves.
+bool ExprTC::userRecordComparableAtInstance(const TypeRef* elem) {
+    if (!elem || elem->nullable || elem->kind != TypeRef::Kind::Named ||
+        !elem->declaration ||
+        elem->declaration->kind != ast::TypeDeclKind::Record)
+        return false;
+    const TypeSymbol* rs = elem->declaration;
+    // The NAME question first: does the record reach `IComparable` at all —
+    // possibly through an interface that EXTENDS it (spec §11 rule 2,
+    // v0.355: "lists I (or any interface extending I)")?
+    if (!inheritsBuiltinInterface(rs, "IComparable")) return false;
+    // The INSTANTIATION question: at `elem`'s OWN type arguments, does the
+    // record reach `IComparable<elem>`?
+    std::vector<TypeRef*> impls;
+    collectAncestorInstantiationsOf(
+        elem, ctx_.builtinInterfaceSym("IComparable"), impls);
+    if (impls.empty()) {
+        // The walk could not compose the instantiation (the symbol carries no
+        // parallel `baseTypeRefs` entry) — the NAME answer stands, exactly as
+        // the pre-#8161 walk's "unknown: keep" branch did.
+        return true;
+    }
+    for (TypeRef* impl : impls) {
+        if (!impl || impl->genericArgs.size() != 1) continue;
+        const TypeRef* ga = impl->genericArgs[0];
+        if (ga && typeRefEqual(ga, elem)) return true;
+    }
+    return false;
+}
+
 void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (!ce.callee) return;
     // §22.16 (v0.250, #3038): `old(E)` — the callee is the contextual
@@ -14200,12 +14254,43 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // v0.355: "lists I (or any interface extending
                             // I)"), so the closure walk
                             // `inheritsBuiltinInterface` answers the name
-                            // question and `selfArgReaches` below follows the
-                            // type argument through each extending interface
-                            // (#8139).
-                            const bool userRecordComparable =
+                            // question and the instantiation walk below
+                            // follows the type argument through each
+                            // extending interface (#8139).
+                            //
+                            // fix #8161 (spec §14.2 *Interface conformance*
+                            // rule 2 / §14.1 *Instantiation and its site*,
+                            // stdlib §2.8 / §5.1, v0.355): the conformance
+                            // must be judged AT THE INSTANCE's type
+                            // arguments. `record W<T>(v: int):
+                            // IComparable<W<int>>` conforms at `W<int>` and
+                            // NOT at `W<string>` — the DECLARED interface's
+                            // type argument is `W<int>`, and §14.1's
+                            // substitution (the instance's arguments into
+                            // the declaration) is what tells the two
+                            // instantiations apart. The pre-fix walk
+                            // compared only the DECLARATION
+                            // (`ga->declaration == rs`), so `W<int>` and
+                            // `W<string>` were INDISTINGUISHABLE and
+                            // `Array<W<string>>.Min()` was ADMITTED — then
+                            // ordered by a `CompareTo` monomorphized at
+                            // the WRONG layout, printing garbage.
+                            //
+                            // The judgement is §12.9's OWN: the assignment
+                            // `var x: IComparable<W<string>> := a[0]` is
+                            // REJECTED ("reaches `IComparable` only at other
+                            // type arguments") because
+                            // `collectAncestorInstantiationsOf` — the
+                            // §12.9 helper that collects every
+                            // instantiation of the interface a type
+                            // reaches, each re-expressed in the type's OWN
+                            // arguments — yields `IComparable<W<int>>`, not
+                            // `IComparable<W<string>>`.
+                            // `userRecordComparableAtInstance` consults the
+                            // SAME helper, so the two cannot disagree.
+                            bool userRecordComparable =
                                 userRecordElem &&
-                                userRecordSelfComparable(elem->declaration);
+                                userRecordComparableAtInstance(elem);
                             // A RECORD with NO `CompareTo` has NO order, so
                             // §5.1's extension does not apply to it and the
                             // call must be REFUSED — exactly as the
