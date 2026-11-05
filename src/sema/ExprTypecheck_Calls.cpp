@@ -11699,32 +11699,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
                 }
             }
-            int expectedArity = -1;
-            if (umName == "Equals")               expectedArity = 1;
-            else if (umName == "ToString" ||
-                     umName == "GetHashCode" ||
-                     umName == "GetType"    ||
-                     umName == "Dispose")         expectedArity = 0;
-            else if (umName == "ReferenceEquals") expectedArity = 2;
-            if (expectedArity >= 0 && !targetIsStaticReceiver &&
-                    !receiverHasTypeSpecificOverloads) {
-                const std::size_t nargs = ce.args.size();
-                if (static_cast<int>(nargs) != expectedArity) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, ce.span.begin,
-                        std::string("the universal `Object.") +
-                            std::string(umName) +
-                            "` member takes " +
-                            std::to_string(expectedArity) +
-                            " argument(s) but the call supplies " +
-                            std::to_string(nargs) + " (§8.1)");
-                }
-            }
-            // §2.18 / §18.5 (v0.344, fix #7333): a format spec on a `bool`
-            // or `char` receiver is a COMPILE ERROR — stdlib §2.18's
-            // specifier table gives `bool`, `char` and `string` an EMPTY
-            // vocabulary ("a format spec on these is a compile error"), so no
-            // specifier can ever apply to them.
+            // §2.18 / §18.5 (v0.344, fix #7333; v0.355, fix #7377): a format
+            // spec on a receiver whose type has NO format vocabulary is a
+            // COMPILE ERROR — stdlib §2.18's specifier table gives `bool`,
+            // `char` and `string` an EMPTY vocabulary ("a format spec on these
+            // is a compile error"), and §2.18's general sentence makes "a
+            // format spec on any other non-conforming operand" a compile error
+            // too. §18.5 says the same of the dispatch rule: "A format spec on
+            // an operand whose type is neither intrinsically formattable nor
+            // `IFormattable` is a compile error naming this rule."
             //
             // THE DECISION IS ABOUT THE RECEIVER'S TYPE, NOT ABOUT THE
             // ARGUMENT. The argument is a `string` in every case; what §2.18
@@ -11737,6 +11720,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // the member call said nothing at all (`true.ToString("F4")`
             // compiled and rendered "True").
             //
+            // fix #7377 (v0.355): THE RECIPIENT OF THIS GATE IS EVERY
+            // RECEIVER, NOT ONLY THE ONES WITH TYPE-SPECIFIC OVERLOADS. The
+            // gate used to require `receiverHasTypeSpecificOverloads` (a
+            // primitive or a value builtin), on the ground that a user type's
+            // wrong-arity call was "already reported by the arity check
+            // above". That ground was §8.1's ARITY rule speaking about a
+            // VOCABULARY fact: an ENUM receiver's `e.ToString("F4")` was
+            // reported as "the universal `Object.ToString` member takes 0
+            // argument(s) but the call supplies 1 (§8.1)" while the SAME
+            // obligation spelled as a hole, `$"{e:F4}"`, was reported as "a
+            // format spec requires an intrinsically-formattable operand …
+            // `E` is neither (§18.5)". One mistake, two explanations, and the
+            // first one blamed arity for what is a vocabulary fact. The
+            // §2.18/§18.5 rule is the one that owns the question ("does this
+            // type have a declared `ToString(format)` with a non-empty
+            // vocabulary?"), so it now answers it for EVERY receiver — and the
+            // §8.1 arity message is SUPPRESSED below for the one call shape
+            // this gate owns (`ToString` with exactly one argument), so the
+            // reader still gets exactly ONE diagnostic for the one mistake.
+            //
             // ONLY A SPEC THE COMPILER CAN SEE IS DECIDED HERE. The argument
             // is a literal, so its content is known at compile time; a format
             // string whose content is unknown (`b.ToString(fmt)`) is the
@@ -11744,15 +11747,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // specifier raises `FormatException` (stdlib §2.18, spec §18.5).
             // This gate does not touch it, and it must not: a compile-time
             // rejection of the runtime spelling would take that spelling away
-            // from the rule that owns it.
-            //
-            // `receiverHasTypeSpecificOverloads` (computed above) is exactly
-            // the case where the §8.1 universal-arity check does NOT fire:
-            // the receiver carries its own overloads (a primitive, or a value
-            // builtin). A user type keeps the universal `Object.ToString`
-            // surface, so its wrong-arity call is already reported by the
-            // arity check above — that is §8.1's error, not this rule's, and
-            // reporting both would be one mistake with two diagnostics.
+            // from the rule that owns it. (For a receiver with no vocabulary
+            // at all the RUNTIME spelling cannot succeed either, and it keeps
+            // §8.1's arity message — the shape §8.1 owns.)
             //
             // `string` is excluded on the same ground: stdlib §9.6 declares
             // `ToString(): string` at arity 0, so the §9.6 arity gate
@@ -11760,9 +11757,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // rule owns (§22.5; §9.6). The spec does not say which of the
             // two rules owns the string receiver, so the existing error
             // stands.
+            bool formatSpecRejected = false;
             if (umName == "ToString" && ce.args.size() == 1 &&
-                    !targetIsStaticReceiver && receiverHasTypeSpecificOverloads &&
-                    umTarget) {
+                    !targetIsStaticReceiver && umTarget) {
                 const ast::Expr* fmtArg = ce.args[0].value.get();
                 const bool specIsVisible =
                     fmtArg != nullptr &&
@@ -11772,18 +11769,40 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                          nullptr);
                 if (specIsVisible) {
                     const TypeRef* recvTy = ctx_.exprType(*umTarget);
-                    if (recvTy && recvTy->kind == TypeRef::Kind::Primitive &&
-                            recvTy->primitive != PrimitiveType::String &&
+                    const bool stringReceiver =
+                        recvTy && recvTy->kind == TypeRef::Kind::Primitive &&
+                        recvTy->primitive == PrimitiveType::String;
+                    if (recvTy && !stringReceiver &&
                             !isFormattableOperandType(recvTy)) {
+                        // THE ONE MESSAGE (fix #7377): the same builder the
+                        // interpolation hole uses, so the two spellings of one
+                        // obligation cannot drift apart again.
                         ctx_.diagnostics().report(
                             Severity::Error, ce.span.begin,
-                            "a format spec requires an intrinsically-formattable "
-                            "receiver (a numeric/temporal/Guid) or one "
-                            "implementing `IFormattable`; `" +
-                                std::string(primitiveSpellingForDiag(
-                                    recvTy->primitive)) +
-                                "` is neither (§2.18; §18.5)");
+                            formatVocabularyRejectMessage(recvTy));
+                        formatSpecRejected = true;
                     }
+                }
+            }
+            int expectedArity = -1;
+            if (umName == "Equals")               expectedArity = 1;
+            else if (umName == "ToString" ||
+                     umName == "GetHashCode" ||
+                     umName == "GetType"    ||
+                     umName == "Dispose")         expectedArity = 0;
+            else if (umName == "ReferenceEquals") expectedArity = 2;
+            if (expectedArity >= 0 && !targetIsStaticReceiver &&
+                    !receiverHasTypeSpecificOverloads && !formatSpecRejected) {
+                const std::size_t nargs = ce.args.size();
+                if (static_cast<int>(nargs) != expectedArity) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        std::string("the universal `Object.") +
+                            std::string(umName) +
+                            "` member takes " +
+                            std::to_string(expectedArity) +
+                            " argument(s) but the call supplies " +
+                            std::to_string(nargs) + " (§8.1)");
                 }
             }
         }

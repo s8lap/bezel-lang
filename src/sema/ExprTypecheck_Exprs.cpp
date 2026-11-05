@@ -4881,18 +4881,13 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             const TypeRef* t = ctx_.exprType(*part.expr);
             if (t && t->kind != TypeRef::Kind::Error &&
                 !isFormattableOperandType(t)) {
-                std::string what;
-                if (t->kind == TypeRef::Kind::Primitive)
-                    what = std::string("`") + primitiveSpelling(t->primitive) + "`";
-                else if (!namedTypeName(t).empty())
-                    what = std::string("`") + std::string(namedTypeName(t)) + "`";
-                else
-                    what = "this operand";
-                ctx_.diagnostics().report(
-                    Severity::Error, e.span.begin,
-                    "a format spec requires an intrinsically-formattable operand "
-                    "(a numeric/temporal/Guid) or one implementing `IFormattable`; "
-                    + what + " is neither (\xC2\xA7""18.5)");
+                // fix #7377 (v0.355): the ONE message for "this operand has no
+                // format vocabulary", shared with the explicit member call
+                // `x.ToString("F4")` (spec §18.5's "Format dispatch" makes
+                // the hole a call to the operand's `ToString(format)`, so the
+                // two spellings are ONE obligation and must answer alike).
+                ctx_.diagnostics().report(Severity::Error, e.span.begin,
+                                          formatVocabularyRejectMessage(t));
             }
         }
         ctx_.setExprType(

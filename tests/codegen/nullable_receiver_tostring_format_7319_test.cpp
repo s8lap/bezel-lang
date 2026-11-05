@@ -260,7 +260,7 @@ BEZEL_TEST(nullable_receiver_tostring_format_7319,
         prog(narrowed("var x: bool? := true;", "x.ToString(\"F4\")")));
     BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
-        r, "a format spec requires an intrinsically-formattable receiver"));
+        r, "a format spec requires an intrinsically-formattable operand"));
 }
 
 // #7333 / stdlib §2.18 (v0.344) — the `char` receiver, at the NARROWED
@@ -275,7 +275,7 @@ BEZEL_TEST(nullable_receiver_tostring_format_7319,
         prog(narrowed("var x: char? := 'Z';", "x.ToString(\"F4\")")));
     BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
-        r, "a format spec requires an intrinsically-formattable receiver"));
+        r, "a format spec requires an intrinsically-formattable operand"));
 }
 
 // #7319 / spec §7.4 + §22.6 + stdlib §2.18 — the `uint` receiver. The hex

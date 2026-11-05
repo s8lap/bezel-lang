@@ -93,7 +93,7 @@ BEZEL_TEST(narrowed_residual_7333, bool_receiver_with_a_format_spec_is_refused) 
     auto r = runAot(prog("    var b := true;",
                          "    Console.WriteLine(b.ToString(\"F4\"));"));
     expectRefused(r,
-        "a format spec requires an intrinsically-formattable receiver "
+        "a format spec requires an intrinsically-formattable operand "
         "(a numeric/temporal/Guid) or one implementing `IFormattable`; "
         "`bool` is neither (§2.18; §18.5)");
 }
@@ -104,7 +104,7 @@ BEZEL_TEST(narrowed_residual_7333, char_receiver_with_a_format_spec_is_refused) 
     auto r = runAot(prog("    var c := 'a';",
                          "    Console.WriteLine(c.ToString(\"F4\"));"));
     expectRefused(r,
-        "a format spec requires an intrinsically-formattable receiver "
+        "a format spec requires an intrinsically-formattable operand "
         "(a numeric/temporal/Guid) or one implementing `IFormattable`; "
         "`char` is neither (§2.18; §18.5)");
 }
@@ -117,7 +117,7 @@ BEZEL_TEST(narrowed_residual_7333,
     auto r = runAot(prog("    var b: bool? := true;",
                          "    if b <> null then Console.WriteLine(b.ToString(\"F4\")); end;"));
     expectRefused(r,
-        "a format spec requires an intrinsically-formattable receiver "
+        "a format spec requires an intrinsically-formattable operand "
         "(a numeric/temporal/Guid) or one implementing `IFormattable`; "
         "`bool` is neither (§2.18; §18.5)");
 }
@@ -128,7 +128,7 @@ BEZEL_TEST(narrowed_residual_7333,
     auto r = runAot(prog("    var c: char? := 'a';",
                          "    if c <> null then Console.WriteLine(c.ToString(\"F4\")); end;"));
     expectRefused(r,
-        "a format spec requires an intrinsically-formattable receiver "
+        "a format spec requires an intrinsically-formattable operand "
         "(a numeric/temporal/Guid) or one implementing `IFormattable`; "
         "`char` is neither (§2.18; §18.5)");
 }
@@ -140,7 +140,7 @@ BEZEL_TEST(narrowed_residual_7333, object_receiver_with_a_format_spec_is_refused
     auto r = runAot(prog("    var o: Object := true;",
                          "    Console.WriteLine(o.ToString(\"F4\"));"));
     expectRefused(r,
-        "a format spec requires an intrinsically-formattable receiver "
+        "a format spec requires an intrinsically-formattable operand "
         "(a numeric/temporal/Guid) or one implementing `IFormattable`; "
         "`Object` is neither (§2.18; §18.5)");
 }
@@ -153,7 +153,7 @@ BEZEL_TEST(narrowed_residual_7333, hole_with_a_format_spec_on_a_bool_is_refused)
     expectRefused(r,
         "a format spec requires an intrinsically-formattable operand "
         "(a numeric/temporal/Guid) or one implementing `IFormattable`; "
-        "`bool` is neither (§18.5)");
+        "`bool` is neither (§2.18; §18.5)");
 }
 
 // The `string` receiver: stdlib §9.6 declares `ToString(): string` — no
