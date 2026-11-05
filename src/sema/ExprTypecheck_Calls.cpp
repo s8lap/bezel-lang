@@ -21306,8 +21306,99 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                             if (ok) ctx_.setExprType(&ce, timeProbe);
                         }
+                        // fix #7935 (stdlib §2.2, §2.6, §2.8, spec §14.2,
+                        // v0.355): the BUILT-IN `Guid` value record declares
+                        //     public record Guid: IComparable<Guid>, IEquatable<Guid>
+                        // (stdlib §2.6) — "CompareTo = lexicographic over the 16
+                        // canonical big-endian bytes" — so it SATISFIES stdlib
+                        // §2.2's `where T: IComparable<T>`, and `Math.Min` /
+                        // `Max` / `Clamp` over a `Guid` MUST be admitted and
+                        // ordered by §2.6's rule.
+                        //
+                        // `Guid` carries no user TypeDecl (it is a BUILT-IN value
+                        // record), so its TypeRef has no `baseTypeRefs` and the
+                        // class/record/interface arm below — the arm that reads
+                        // `isSubtype(decl, IComparable)` — never saw the
+                        // conformance. The refusal it produced was
+                        //     "type argument `Guid` does not satisfy the
+                        //      constraint `where T: IComparable<T>` — `Math.Max`
+                        //      requires an argument type that implements
+                        //      `IComparable<T>` (§14.2, stdlib §2.2)"
+                        // (issue #7935). It is the shape #7900 fixed for stdlib
+                        // §2.5's temporal records and the shape #8237 fixed for
+                        // stdlib §4.4's `Array<T>.Sort()`.
+                        //
+                        // THE PROBE SCANS EVERY OPERAND, not just the first
+                        // (the time-value probe above takes the first). A `Guid`
+                        // beside a primitive is a §14.5 disagreement ("all
+                        // arguments for a type parameter must agree"), and the
+                        // MIRROR-IMAGE spelling `Math.Max(1, guid)` reached
+                        // codegen and ABORTED the compiler inside the LLVM
+                        // verifier ("Both operands to ICmp instruction are not
+                        // of the same type!") — the same crash #7947 fixed for
+                        // the time values. Scanning every operand is what
+                        // catches it.
+                        //
+                        // An EXPLICIT type list BINDS T (stdlib §2.2 declares
+                        // ONE type parameter for the whole call), so
+                        // `Math.Max<Guid>(a, b)` is the `Guid` head whatever
+                        // the operands look like, and `Math.Max<int>(a, b)`
+                        // keeps its pre-existing refusal (the arm below reads
+                        // the operands, not the list).
+                        TypeRef* guidProbe = nullptr;
+                        if (!timeProbe && mathNarrowedOk) {
+                            const TypeRef* explicitT = nullptr;
+                            if (ma->typeArgs.size() == 1 && ma->typeArgs[0])
+                                explicitT = ctx_.resolvedType(*ma->typeArgs[0]);
+                            if (explicitT && sema::isStdlibGuidType(explicitT)) {
+                                guidProbe = const_cast<TypeRef*>(explicitT);
+                            } else if (!explicitT) {
+                                for (const auto& arg : ce.args) {
+                                    if (!arg.value) continue;
+                                    const TypeRef* at =
+                                        mathArgType(*arg.value);
+                                    if (at && sema::isStdlibGuidType(at)) {
+                                        guidProbe = const_cast<TypeRef*>(at);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (guidProbe) {
+                            bool ok = true;
+                            for (const auto& arg : ce.args) {
+                                if (!ok) break;
+                                if (!arg.value) continue;
+                                const TypeRef* at = mathArgType(*arg.value);
+                                if (!at) continue;
+                                if (at->nullable) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, arg.value->span.begin,
+                                        "nullable type `" +
+                                        spellTypeRefForDiag(at) +
+                                        "` does not "
+                                        "satisfy the `where T: "
+                                        "IComparable<T>` constraint — "
+                                        "nullable types do not implement "
+                                        "interface constraints (§14.2)");
+                                    ok = false;
+                                } else if (!sema::isStdlibGuidType(at)) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, arg.value->span.begin,
+                                        "inconsistent type-argument inference: "
+                                        "type parameter `T` of `Math." +
+                                        std::string(ma->member) +
+                                        "` is `Guid`, but this argument is "
+                                        "not (§14.5, stdlib §2.2); all "
+                                        "arguments for a type parameter must "
+                                        "agree");
+                                    ok = false;
+                                }
+                            }
+                            if (ok) ctx_.setExprType(&ce, guidProbe);
+                        }
                         if (auto* argTy = ctx_.exprType(*ce.args[0].value))
-                            if (!timeProbe &&
+                            if (!timeProbe && !guidProbe &&
                                 argTy->kind == TypeRef::Kind::Named &&
                                 argTy->declaration &&
                                 (argTy->declaration->kind ==

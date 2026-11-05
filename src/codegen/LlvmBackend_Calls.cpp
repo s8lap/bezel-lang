@@ -16805,6 +16805,92 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* cmpFn = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
             return builder_.CreateCall(cmpFn, {aSlot, bSlot}, "mm.deccmp");
         };
+        // fix #7935 (stdlib §2.2, §2.6, §2.8, spec §14.2, v0.355): the
+        // BUILT-IN `Guid` value record declares `IComparable<Guid>`
+        // (stdlib §2.6), so `Math.Min` / `Max` / `Clamp` over a `Guid` is
+        // ADMITTED by the front end and must be ORDERED here, by §2.6's rule:
+        // "CompareTo = lexicographic over the 16 canonical big-endian bytes".
+        //
+        // A `Guid` is stored INLINE as a 16-byte `{i64,i64}` STRUCT (§2.6) —
+        // neither an integer nor a pointer — so every arm above declines it
+        // (the integer arm needs an integer, the `CompareTo` arm needs a
+        // user `CompareTo` MethodSymbol, the string arm needs a pointer, the
+        // decimal arm needs the decimal struct), and the FLOATING fallback
+        // would `CreateSIToFP` a struct — malformed IR, an ABORT inside the
+        // LLVM verifier. So the `Guid` gets its own arm.
+        //
+        // The comparison is the runtime's `bz_guid_compare`, which IS §2.6's
+        // order (a `memcmp` over the 16 raw bytes, compared UNSIGNED — and
+        // those bytes ARE the canonical bytes, since the parse path memcpy's
+        // the 16 canonical bytes into the struct in order). It is the very
+        // comparison `Guid.CompareTo` dispatches to, so the `Math` order and
+        // the member's order cannot drift apart — the same agreement #8237
+        // established for `Array<Guid>.Sort()`.
+        //
+        // The predicate is `sema::isStdlibGuidType` — THE SAME predicate
+        // sema's §2.2 constraint gate consults (sema/BuiltinValueTypes.hpp).
+        // Sema ADMITS the operand; codegen must then ORDER it by §2.6's rule.
+        // A codegen that failed to recognise an admitted `Guid` would fall
+        // through to the floating fallback and emit malformed IR — worse than
+        // the refusal this fixes. One definition, two sides.
+        auto isGuidArg = [&](const ast::Expr* e) -> bool {
+            const sema::TypeRef* t =
+                e ? resolveTypeParamRef(ctx_.exprType(*e)) : nullptr;
+            return sema::isStdlibGuidType(t);
+        };
+        // The `Guid` comparison: each operand is spilled to a 16-byte slot
+        // (the layout `bz_guid_compare` reads) and the runtime compares the
+        // two slots. Fails CLOSED (null) when an operand is not a `Guid`
+        // struct, so a mixed call can never compare an i32 with a struct.
+        auto emitGuidCmp = [&](llvm::Value* a, llvm::Value* b)
+                -> llvm::Value* {
+            llvm::StructType* gst = guidStructType();
+            if (!a || !b || !gst) return nullptr;
+            auto slotOf = [&](llvm::Value* v) -> llvm::AllocaInst* {
+                if (v->getType()->isPointerTy())
+                    v = builder_.CreateLoad(gst, v, "guid.cmp.load");
+                if (v->getType() != gst) return nullptr;
+                llvm::AllocaInst* slot = entryAlloca(gst);
+                builder_.CreateStore(v, slot);
+                return slot;
+            };
+            llvm::AllocaInst* aSlot = slotOf(a);
+            llvm::AllocaInst* bSlot = slotOf(b);
+            if (!aSlot || !bSlot) return nullptr;
+            auto* cmpFn = declareC("bz_guid_compare", i32(), {ptrTy(), ptrTy()});
+            return builder_.CreateCall(cmpFn, {aSlot, bSlot}, "mm.guidcmp");
+        };
+        // fix #7935 (spec §14.5, stdlib §2.2, v0.355): a `Guid` beside a
+        // non-`Guid` operand is a §14.5 disagreement — "all arguments for a
+        // type parameter must agree". The front end refuses it (the `Math`
+        // gate in sema/ExprTypecheck_Calls.cpp), but the lowering must FAIL
+        // CLOSED rather than compare an i32 with a 16-byte struct: the
+        // integer arm above would emit `icmp sgt i32 1, %bz.guid %4` and the
+        // LLVM verifier would ABORT the compiler on a program that must be
+        // REJECTED with a diagnostic (the same shape #7947 fixed for the time
+        // values, and the same shape the `Math.Max(1, guid)` mirror-image
+        // spelling had before this fix).
+        auto rejectMixedGuidOperands =
+            [&](const std::vector<const ast::Expr*>& args) -> bool {
+            bool sawGuid = false;
+            bool sawOther = false;
+            for (const ast::Expr* e : args) {
+                if (!e) continue;
+                const sema::TypeRef* t =
+                    resolveTypeParamRef(ctx_.exprType(*e));
+                if (!t) continue;
+                if (sema::isStdlibGuidType(t)) sawGuid = true;
+                else sawOther = true;
+            }
+            if (!sawGuid || !sawOther) return false;
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "inconsistent type-argument inference: type parameter `T` of "
+                "`Math." + std::string(m) + "` is `Guid`, but this argument "
+                "is not (§14.5, stdlib §2.2); all arguments for a type "
+                "parameter must agree");
+            return true;
+        };
         auto emitCompareToCmp = [&](sema::MethodSymbol* cmpMs, llvm::Value* a,
                                     llvm::Value* b,
                                     const ast::Expr* recvExpr) -> llvm::Value* {
@@ -17204,7 +17290,30 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 rejectMixedMathOperands({call.args[0].value.get(),
                                          call.args[1].value.get()}))
                 return nullptr;
+            // fix #7935 (spec §14.5, stdlib §2.2): the `Guid`-beside-a-
+            // primitive guard (a `Guid` is a struct, so the integer arm
+            // below would compare an i32 with it and abort the verifier).
+            if ((m == "Min" || m == "Max") &&
+                rejectMixedGuidOperands({call.args[0].value.get(),
+                                         call.args[1].value.get()}))
+                return nullptr;
             if (m == "Min") {
+                // fix #7935 (stdlib §2.2, §2.6, v0.355): the BUILT-IN `Guid`
+                // value record declares `IComparable<Guid>` (stdlib §2.6), so
+                // the call is ADMITTED and must order by §2.6's rule ("CompareTo
+                // = lexicographic over the 16 canonical big-endian bytes").
+                // It is a 16-byte STRUCT (§2.6), so the integer arm below
+                // declines it and the floating fallback would `CreateSIToFP`
+                // a struct; this arm compares the two canonical byte strings
+                // with the runtime's `bz_guid_compare` — the very comparison
+                // `Guid.CompareTo` dispatches to.
+                if (isGuidArg(call.args[aSrc].value.get())) {
+                    llvm::Value* cmp = emitGuidCmp(a, b);
+                    if (!cmp) return nullptr;
+                    llvm::Value* le = builder_.CreateICmpSLE(
+                        cmp, llvm::ConstantInt::get(cmp->getType(), 0));
+                    return builder_.CreateSelect(le, a, b, "min.guid.result");
+                }
                 // Handle int or double operands.
                 if (a->getType()->isIntegerTy()) {
                     // per stdlib §2.2 (v0.340): ordering is T's own CompareTo,
@@ -17258,6 +17367,16 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 }
             }
             if (m == "Max") {
+                // fix #7935 (stdlib §2.2, §2.6, v0.355): the `Guid` twin of
+                // the `Min` arm above — the same `bz_guid_compare`, the same
+                // §2.6 order, the other direction of the comparison.
+                if (isGuidArg(call.args[aSrc].value.get())) {
+                    llvm::Value* cmp = emitGuidCmp(a, b);
+                    if (!cmp) return nullptr;
+                    llvm::Value* ge = builder_.CreateICmpSGE(
+                        cmp, llvm::ConstantInt::get(cmp->getType(), 0));
+                    return builder_.CreateSelect(ge, a, b, "max.guid.result");
+                }
                 if (a->getType()->isIntegerTy()) {
                     if (mathTIsDateTime)   // #7716: `a` when ticks(a) >= ticks(b)
                         return builder_.CreateSelect(
@@ -17359,6 +17478,12 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                                          call.args[1].value.get(),
                                          call.args[2].value.get()}))
                 return nullptr;
+            // fix #7935 (spec §14.5, stdlib §2.2): the `Guid`-beside-a-
+            // primitive guard, the `Clamp` twin of the `Min`/`Max` one.
+            if (rejectMixedGuidOperands({call.args[0].value.get(),
+                                         call.args[1].value.get(),
+                                         call.args[2].value.get()}))
+                return nullptr;
             // fix #7199 (§22.5, v0.343): `value`, `low` and `high` are
             // PARAMETERS (stdlib §2.2: `Clamp<T>(value: T, low: T, high: T)`),
             // and a named argument binds the parameter it NAMES. Read
@@ -17398,6 +17523,26 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* val = mathConvertToT(vals[0], call.args[valSrc].value.get());   // #6948
             llvm::Value* lo  = mathConvertToT(vals[1], call.args[loSrc].value.get());
             llvm::Value* hi  = mathConvertToT(vals[2], call.args[hiSrc].value.get());
+            // fix #7935 (stdlib §2.2, §2.6, v0.355): the BUILT-IN `Guid`
+            // value record declares `IComparable<Guid>` (stdlib §2.6), so the
+            // call is ADMITTED and must order by §2.6's rule. stdlib §2.2's
+            // own order for `Clamp`: "`Clamp(value, low, high)` returns `low`
+            // when `value` compares less than `low`, `high` when it compares
+            // greater than `high`, and `value` otherwise" — the SAME order
+            // the `string`, `decimal`, `IComparable` and `DateTime` arms of
+            // this very call already implement.
+            if (isGuidArg(call.args[valSrc].value.get())) {
+                llvm::Value* cmpLo = emitGuidCmp(val, lo);
+                llvm::Value* cmpHi = emitGuidCmp(val, hi);
+                if (!cmpLo || !cmpHi) return nullptr;
+                llvm::Value* ltLo = builder_.CreateICmpSLT(
+                    cmpLo, llvm::ConstantInt::get(cmpLo->getType(), 0));
+                llvm::Value* gtHi = builder_.CreateICmpSGT(
+                    cmpHi, llvm::ConstantInt::get(cmpHi->getType(), 0));
+                llvm::Value* inner = builder_.CreateSelect(gtHi, hi, val);
+                return builder_.CreateSelect(ltLo, lo, inner,
+                                             "clamp.guid.result");
+            }
             if (val->getType()->isIntegerTy()) {
                 if (mathTIsDateTime) {
                     // #7716: by ticks, in the stdlib §2.2 form — `low` when
