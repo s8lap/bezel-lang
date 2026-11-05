@@ -5791,9 +5791,8 @@ private:
     //   protected — declaring type + derived types (§13.1).
     //   internal  — same module only; cross-module import → rejected (§13.4).
     //   public    — always allowed.
-    // The overload-suppression heuristic (a non-private sibling with the same
-    // name → suppress the error) is applied for private and protected, matching
-    // the original private-only check.
+    // The overload-suppression heuristic (a VISIBLE sibling with the same
+    // name → suppress the error, #8303) is applied for private and protected.
     // `receiver` (optional, default null): the dot-call's receiver TypeRef,
     // when known. §26.5 step 1 (v0.183): when supplied and access is
     // rejected, the diagnostic notes a same-named extension that matches
@@ -5806,6 +5805,16 @@ private:
     // §11.6 / §13.1 (#6727): lexical nesting grant, mutual between a type and
     // the types its body encloses at any depth; siblings excluded.
     bool nestingGrantsAccess(const TypeSymbol* declaring) const;
+    // §13.1 (#8303, v0.355): is `msym` VISIBLE from the current type context?
+    // The silent twin of `checkMemberVisibility` (same four levels, same §11.6
+    // nesting grant): no diagnostic. §22.6 resolves a call over the members the
+    // call site can see, so overload-candidate collection filters by this.
+    bool isMemberAccessible(const MemberSymbol* msym);
+    // §13.1 (#8303, v0.355): `lookupMember` stops at the FIRST same-name
+    // method, which may be one the site cannot see. When `found` is such a
+    // method and the overload group (`collectHierarchyOverloads`) holds a
+    // visible one, returns that visible member instead; otherwise `found`.
+    Symbol* preferVisibleOverload(Symbol* found);
 
     // §7.5 null-conditional member access `x?.M`. Resolves the member on
     // the target's (non-nullable) type exactly like `.`, but the result

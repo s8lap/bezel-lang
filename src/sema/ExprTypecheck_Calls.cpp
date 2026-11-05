@@ -4266,6 +4266,23 @@ void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
         for (TypeSymbol* b : cur->baseTypes)
             if (b && b->kind == ast::TypeDeclKind::Class) frontier.push_back(b);
     }
+    // §13.1 (#8303, v0.355): an overload the call site cannot see is not a
+    // candidate. `private` is visible "to the declaring class only" (and
+    // `protected` / `internal` to their own audiences), so a member the
+    // current type context cannot see does not take part in §22.6's pipeline:
+    // `v.Len()` beside `private Len()` and `public Len(x: int)` resolves among
+    // the public ones only, and is an ordinary no-applicable-overload error
+    // here. When NO candidate is visible the set is left whole, so the
+    // single-candidate §13.1 diagnostic (checkMemberVisibility) still fires.
+    bool anyVisible = false;
+    for (MethodSymbol* c : out)
+        if (isMemberAccessible(c)) { anyVisible = true; break; }
+    if (anyVisible)
+        out.erase(std::remove_if(out.begin(), out.end(),
+                                 [&](MethodSymbol* c) {
+                                     return !isMemberAccessible(c);
+                                 }),
+                  out.end());
 }
 
 // §22.6 *`owned` and overload resolution* (v0.334) — the ownership
@@ -4498,6 +4515,17 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
         return initial;
     }
     if (overloads.empty()) overloads.push_back(initial);
+    // §13.1 (#8303): `initial` is lookupMember's first same-name member and may
+    // be one the call site cannot see; collectHierarchyOverloads dropped it. The
+    // resolution below starts from a visible member of the set instead, so no
+    // fallback path returns the hidden one.
+    if (std::find(overloads.begin(), overloads.end(), initial) ==
+        overloads.end()) {
+        MethodSymbol* repl = overloads.front();
+        for (MethodSymbol* c : overloads)
+            if (sema::formalParamCount(*c) == ce.args.size()) { repl = c; break; }
+        initial = repl;
+    }
 
     bool hasNamed = false;
     for (const auto& a : ce.args)
@@ -32657,10 +32685,10 @@ void ExprTC::checkEventVisibilityFence(EventSymbol* es, std::string_view op,
 //               type that derives (transitively) from the declaring type (§13.1).
 //   private   — allowed only when currentType_ == declaring type (§13.1, slice S8).
 //
-// Overload-suppression: for private and protected, if a non-private-or-accessible
-// sibling with the same name exists on the declaring type (i.e. there is a
-// public/internal overload of the same name), the error is suppressed — the
-// codegen overload-resolution step will pick the accessible variant.
+// Overload-suppression: for private and protected, if a VISIBLE sibling with
+// the same name exists on the declaring type (isMemberAccessible), the error is
+// suppressed — overload resolution picks among the visible candidates only
+// (collectHierarchyOverloads filters by visibility, §13.1, #8303).
 // §11.6 (#954): is `inner` a nested type of `outer` — directly, or transitively
 // through a deeper nesting chain? A nested type is recorded as a
 // NestedTypeSymbol in its enclosing type's member list (no back-pointer), so
@@ -32682,6 +32710,40 @@ bool ExprTC::nestingGrantsAccess(const TypeSymbol* declaring) const {
     return currentType_ && declaring && currentType_ != declaring &&
            (isNestedWithin(currentType_, declaring) ||
             isNestedWithin(declaring, currentType_));
+}
+
+// §13.1 (#8303, v0.355): the silent twin of checkMemberVisibility below.
+bool ExprTC::isMemberAccessible(const MemberSymbol* msym) {
+    if (!msym || !msym->parent) return true;
+    TypeSymbol* declaring = msym->parent;
+    switch (msym->visibility) {
+        case ast::Visibility::Public:
+        case ast::Visibility::None:
+            return true;
+        default: break;
+    }
+    if (nestingGrantsAccess(declaring)) return true;
+    switch (msym->visibility) {
+        case ast::Visibility::Internal:
+            return !ctx_.isImported(msym);
+        case ast::Visibility::Protected:
+            return currentType_ == declaring ||
+                   (currentType_ && isSubtype(currentType_, declaring));
+        case ast::Visibility::Private:
+            return declaring == currentType_;
+        default:
+            return true;
+    }
+}
+
+Symbol* ExprTC::preferVisibleOverload(Symbol* found) {
+    auto* ms = dynamic_cast<MethodSymbol*>(found);
+    if (!ms || !ms->parent || isMemberAccessible(ms)) return found;
+    std::vector<MethodSymbol*> group;
+    collectHierarchyOverloads(ms->parent, ms->name, group);
+    // The group is filtered to the visible overloads whenever any is visible.
+    if (!group.empty() && isMemberAccessible(group.front())) return group.front();
+    return found;
 }
 
 bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
@@ -32736,9 +32798,9 @@ bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
         for (Symbol* sib : declaring->members) {
             if (!sib || sib == msym || sib->name != memberName) continue;
             if (auto* sm = dynamic_cast<MemberSymbol*>(sib)) {
-                if (sm->visibility != ast::Visibility::Private &&
-                    sm->visibility != ast::Visibility::Protected)
-                    hasAccessibleOverload = true;
+                // §13.1 (#8303): a sibling suppresses the error only when it
+                // is itself VISIBLE here, not merely non-private.
+                if (isMemberAccessible(sm)) hasAccessibleOverload = true;
             }
         }
         if (hasAccessibleOverload) return false;
@@ -32764,8 +32826,9 @@ bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
         for (Symbol* sib : declaring->members) {
             if (!sib || sib == msym || sib->name != memberName) continue;
             if (auto* sm = dynamic_cast<MemberSymbol*>(sib)) {
-                if (sm->visibility != ast::Visibility::Private)
-                    hasPublicOverload = true;
+                // §13.1 (#8303): visible here, not merely non-private (a
+                // `protected` sibling is no more reachable than the private).
+                if (isMemberAccessible(sm)) hasPublicOverload = true;
             }
         }
         if (hasPublicOverload) return false;
@@ -42896,7 +42959,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // Lookup member by name. Slice S5: walks own members first,
     // then transitively each base type — first match wins (no
     // ambiguity resolution between base interfaces yet).
-    Symbol* member = lookupMember(targetType, ma.member);
+    Symbol* member = preferVisibleOverload(lookupMember(targetType, ma.member));
     // fix #5403 (§22.10, v0.315): a primary-constructor parameter's capture
     // field is not a declared member. `this.name` is member access (§2.7) and
     // reaches declared members only, never a primary-constructor parameter or
@@ -45128,7 +45191,8 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         return;
     }
     TypeSymbol* targetType = memberTargetType(nm.target.get());
-    Symbol* member = targetType ? lookupMember(targetType, nm.member) : nullptr;
+    Symbol* member = targetType ? preferVisibleOverload(lookupMember(targetType, nm.member))
+                                : nullptr;
     const TypeRef* recvTyForDiag = nm.target ? ctx_.exprType(*nm.target) : nullptr;
     // fix #5112 (§31.4, v0.307): the §31.4 builtin exception surface members
     // (Message / StackTrace / CauseChain / ParamName) are typed specially in the
