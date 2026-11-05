@@ -6979,6 +6979,27 @@ genericExtBlockBinding(const sema::SemaContext& ctx,
     return bnd;
 }
 
+// fix-forward #8121 (§28.9, v0.355): the +1 a closure call's CALLER releases
+// on its result, classified by the result's type. §28.9's runtime-managed
+// tier — `string` ("pervasive") and "Function-typed values" — is what a
+// closure call hands back at +1 (#429 / #2688), and `string?` is in it too
+// (#2196: isPlusOneStringProducer's closure-call arm admits "nullable OR
+// non-nullable"). A class, interface, record or collection result is not in
+// the tier ("no reference counts ... for user-defined classes") and is a
+// borrow the caller never releases, so it is `None` by construction. One
+// predicate serves both the DECLARED return type (did the body's own
+// `return` mint?) and the SUBSTITUTED one (must the thunk mint?).
+enum class ClosureResultMint { None, String, Closure };
+static ClosureResultMint closureResultMint(const sema::TypeRef* t) {
+    if (!t) return ClosureResultMint::None;
+    if (t->kind == sema::TypeRef::Kind::Primitive &&
+        t->primitive == sema::PrimitiveType::String)
+        return ClosureResultMint::String;
+    if (t->kind == sema::TypeRef::Kind::Function)
+        return ClosureResultMint::Closure;
+    return ClosureResultMint::None;
+}
+
 llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
                                              llvm::Value* receiverVal,
                                              const ast::Expr* refExpr) {
@@ -7263,15 +7284,30 @@ llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
     bool emitted = false;
     llvm::Value* result = emitInlineGenericMethod(ms, callArgs, &emitted);
     // fix #8121 (§27.6 / §28.9, v0.355): a closure CALL returns +1 for a
-    // non-nullable `string` (and a function-typed) result — the contract a
-    // lambda body keeps (LlvmBackend_Exprs2.cpp, #429/#2688) and that the
-    // non-generic method thunk inherits from the callee's own #429 return
-    // mint. The inlined generic member does not mint: an EXPRESSION body
-    // yields its raw value, and a BLOCK body's `return` keys its mint on the
-    // declared return type node, which for `T` does not resolve to `string`.
-    // So the thunk mints here, under the reference's substitution, with the
-    // lambda body's transfer exclusions; a block body whose declared return
-    // IS `string` already minted in its own `return`.
+    // RUNTIME-MANAGED result (`closureResultMint`: a `string` of either
+    // nullability, or a function-typed value) — the contract a lambda body
+    // keeps (LlvmBackend_Exprs2.cpp, #429/#2688) and that the non-generic
+    // method thunk inherits from the callee's own #429 / #2196 return mint.
+    // The inlined generic member does not mint: an EXPRESSION body yields
+    // its raw value, and a BLOCK body's `return` keys its mint on the
+    // declared return type node, which for `T` (or `T?`) does not resolve to
+    // `string`. So the thunk mints here, under the reference's SUBSTITUTED
+    // result type, with the lambda body's transfer exclusions; a block body
+    // whose declared return is itself a minted kind already minted in its
+    // own `return`. The declared and the substituted type are classified by
+    // the SAME predicate, so the two cannot drift apart.
+    //
+    // fix-forward #8121 (review r39-rev-8121b, D1): the string arm was
+    // gated `!retSema->nullable`, so `Head(): T` at `Array<string?>` and
+    // `HeadN(): T?` at `Array<string>` handed the caller a +0 the caller
+    // released (isPlusOneStringProducer's closure-call arm admits a
+    // nullable string result, #2196): measured, a heap-use-after-free under
+    // ASan and "refcount over-release (string)" natively, in both spellings.
+    // A class, interface or collection result is not in this tier at all
+    // (§28.9: "no reference counts" for classes — the caller borrows it, as
+    // from the direct call), so `T` at `OwningArray<Item>`, `T?` over a
+    // class and `T` at `Array<Array<long>>` mint nothing here, by
+    // construction of the predicate rather than by a list of exclusions.
     if (extBlock && result && retSema && result->getType()->isPointerTy() &&
         emitted && !diverged_) {
         CallableInfo rci;
@@ -7281,26 +7317,22 @@ llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
                 ? rci.exprBody : nullptr;
         bool declMints = false;
         if (haveCi && rci.bodyKind == ast::MethodBodyKind::Block &&
-            rci.returnType) {
-            const sema::TypeRef* d = ctx_.resolvedType(*rci.returnType);
-            declMints = d && ((d->kind == sema::TypeRef::Kind::Primitive &&
-                               d->primitive == sema::PrimitiveType::String) ||
-                              d->kind == sema::TypeRef::Kind::Function);
-        }
-        if (haveCi && !declMints) {
-            if (!retSema->nullable &&
-                retSema->kind == sema::TypeRef::Kind::Primitive &&
-                retSema->primitive == sema::PrimitiveType::String &&
-                !(body && (isPlusOneStringProducer(body) ||
-                           returnedStringLocalOwnsPlusOne(body))))
-                emitStringRetain(result);
-            else if (retSema->kind == sema::TypeRef::Kind::Function &&
-                     !(body && (isPlusOneClosureProducer(body) ||
-                                isUserMethodClosureReturnCall(body) ||
-                                isLambdaClosureReturnCall(body) ||
-                                returnedClosureLocalOwnsPlusOne(body))))
-                emitClosureRetain(result);
-        }
+            rci.returnType)
+            declMints = closureResultMint(ctx_.resolvedType(*rci.returnType)) !=
+                        ClosureResultMint::None;
+        const ClosureResultMint mint =
+            haveCi && !declMints ? closureResultMint(retSema)
+                                 : ClosureResultMint::None;
+        if (mint == ClosureResultMint::String &&
+            !(body && (isPlusOneStringProducer(body) ||
+                       returnedStringLocalOwnsPlusOne(body))))
+            emitStringRetain(result);
+        else if (mint == ClosureResultMint::Closure &&
+                 !(body && (isPlusOneClosureProducer(body) ||
+                            isUserMethodClosureReturnCall(body) ||
+                            isLambdaClosureReturnCall(body) ||
+                            returnedClosureLocalOwnsPlusOne(body))))
+            emitClosureRetain(result);
     }
     genericSubst_ = std::move(savedSubst);
     genericSubstSemaTy_ = std::move(savedSema);

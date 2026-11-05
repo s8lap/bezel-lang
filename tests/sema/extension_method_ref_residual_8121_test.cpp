@@ -773,3 +773,272 @@ BEZEL_TEST(sema_extension_method_ref_residual_8121,
                             "    end;\n"),
         "lit\nm=2\nn=2\n");
 }
+
+// ── fix-forward (review r39-rev-8121b, D1): the mint covers EVERY result ──
+// ── type a closure call's caller releases ─────────────────────────────────
+//
+// §28.9 (v0.355) names the runtime-managed tier: `string` and "Function-typed
+// values"; a class has "no reference counts". A closure call hands its caller
+// +1 for a `string` result of EITHER nullability (#2196), so a generic-block
+// member instantiated at `string?` — `Head(): T` at `Array<string?>`, or
+// `HeadN(): T?` at `Array<string>` — must mint exactly as the non-nullable
+// row above does. Measured on 1fb88acb: the thunk's mint was gated
+// `!nullable`, so each call over-released the element — a heap-use-after-free
+// under ASan, "bezel: fatal: refcount over-release (string)" natively, in
+// both spellings and both body forms (the review's probes r05a–d). A class,
+// a nullable class and a collection result are borrows the caller never
+// releases, so those rows are controls: green before and after.
+// Every row loops 100x so a surplus +1 (a leak) is as visible as a
+// missing one (the UAF), and reads the data the thunk hands back.
+//
+// The `T` = `string?` row's receiver is a generic CLASS, not an
+// `Array<string?>`: a `var` local over an `Array<string?>` is never
+// reclaimed on the base (open #6516 / #7830 — measured, 4 allocations
+// leaked with no reference and no call at all), so the review's literal
+// r05a/r05b programs cannot be green under the checked oracle. The thunk
+// path is the same (the block's `T` bound to `string?`, both spellings).
+
+namespace {
+
+// `Head(): T` (T itself nullable at the use) and `HeadN(): T?` (the
+// member's result nullable). The element is a heap string built in place,
+// read back after the loop to show nothing was freed under it.
+const char* const kNullableHeads =
+    "extension Array<T>\n"
+    "  public method Head(): T => this[0];\n"
+    "  public method HeadN(): T? => this[0];\n"
+    "end;\n";
+
+// A generic class receiver with `T` fields (see the note above on why the
+// `string?` row does not use `Array<string?>`).
+const char* const kBoxClass =
+    "class Box<T>\n"
+    "  public v: T;\n"
+    "  public w: T;\n"
+    "  public constructor(v: T, w: T)\n"
+    "    this.v := v;\n"
+    "    this.w := w;\n"
+    "  end constructor;\n"
+    "end Box;\n"
+    "extension Box<T>\n"
+    "  public method Head(): T => this.v;\n"
+    "  public method HeadN(): T? => this.w;\n"
+    "end;\n";
+
+}  // namespace
+
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           generic_block_reference_at_a_nullable_string_binding_does_not_over_release) {
+    // per §27.6 (v0.355) + §26.4 (v0.355) + §28.9 (v0.355)
+    expectCheckedStdout(
+        std::string("module M;\n") + kBoxClass +
+            "class C\n"
+            "  public static method Show(p: Box<string?>): int\n"
+            "    var g: (Box<string?>) -> string? := Box<string?>.Head;\n"
+            "    var j := 0;\n"
+            "    var tot := 0;\n"
+            "    while j < 100 do\n"
+            "      var s2 := g(p);\n"
+            "      tot := tot + (s2 ?? \"\").Length;\n"
+            "      j := j + 1;\n"
+            "    end;\n"
+            "    Console.WriteLine(tot);\n"
+            "    Console.WriteLine(p.v ?? \"null\");\n"
+            "    return 0;\n"
+            "  end Show;\n"
+            "  public static method Main(): int\n"
+            "    var n := 41;\n"
+            "    using var p := new Box<string?>(\"v\" + n.ToString(), null);\n"
+            "    var f: () -> string? := p.Head;\n"
+            "    var i := 0;\n"
+            "    var tot := 0;\n"
+            "    while i < 100 do\n"
+            "      var s1 := f();\n"
+            "      tot := tot + (s1 ?? \"\").Length;\n"
+            "      i := i + 1;\n"
+            "    end;\n"
+            "    Console.WriteLine(tot);\n"
+            "    Console.WriteLine(p.v ?? \"null\");\n"
+            "    Console.WriteLine(p.w ?? \"null\");\n"
+            "    return C.Show(p);\n"
+            "  end Main;\n"
+            "end C;\n",
+        "300\nv41\nnull\n300\nv41\n");
+}
+
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           generic_block_reference_with_a_nullable_type_variable_result_does_not_over_release) {
+    // per §27.6 (v0.355) + §26.4 (v0.355) + §28.9 (v0.355)
+    expectCheckedStdout(
+        genericBlockProgram(kNullableHeads, "Array<string>",
+                            "    var n := 41;\n"
+                            "    var b: Array<string> := [\"w\" + n.ToString(), \"x\"];\n",
+                            "    var f: () -> string? := b.HeadN;\n"
+                            "    var i := 0;\n"
+                            "    var tot := 0;\n"
+                            "    while i < 100 do\n"
+                            "      var s1 := f();\n"
+                            "      tot := tot + (s1 ?? \"\").Length;\n"
+                            "      i := i + 1;\n"
+                            "    end;\n"
+                            "    Console.WriteLine(tot);\n"
+                            "    Console.WriteLine(b[0]);\n",
+                            "    var g: (Array<string>) -> string? := Array<string>.HeadN;\n"
+                            "    var j := 0;\n"
+                            "    var tot := 0;\n"
+                            "    while j < 100 do\n"
+                            "      var s2 := g(b);\n"
+                            "      tot := tot + (s2 ?? \"\").Length;\n"
+                            "      j := j + 1;\n"
+                            "    end;\n"
+                            "    Console.WriteLine(tot);\n"
+                            "    Console.WriteLine(b[0]);\n"),
+        "300\nw41\n300\nw41\n");
+}
+
+// A BLOCK body's `return this[0];` against a declared `T?` does not mint
+// in its own `return` (the declared node is not `string`), so the thunk
+// mints — the nullable twin of the block-body row above.
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           generic_block_reference_with_a_nullable_block_body_result_does_not_over_release) {
+    // per §27.6 (v0.355) + §26.4 (v0.355) + §28.9 (v0.355)
+    expectCheckedStdout(
+        genericBlockProgram("extension Array<T>\n"
+                            "  public method HeadN(): T?\n"
+                            "    return this[0];\n"
+                            "  end HeadN;\n"
+                            "end;\n",
+                            "Array<string>",
+                            "    var n := 41;\n"
+                            "    var b: Array<string> := [\"w\" + n.ToString(), \"x\"];\n",
+                            "    var f: () -> string? := b.HeadN;\n"
+                            "    var i := 0;\n"
+                            "    var tot := 0;\n"
+                            "    while i < 100 do\n"
+                            "      var s := f();\n"
+                            "      tot := tot + (s ?? \"\").Length;\n"
+                            "      i := i + 1;\n"
+                            "    end;\n"
+                            "    Console.WriteLine(tot);\n"
+                            "    Console.WriteLine(b[0]);\n",
+                            "    var g: (Array<string>) -> string? := Array<string>.HeadN;\n"
+                            "    var j := 0;\n"
+                            "    var tot := 0;\n"
+                            "    while j < 100 do\n"
+                            "      var s := g(b);\n"
+                            "      tot := tot + (s ?? \"\").Length;\n"
+                            "      j := j + 1;\n"
+                            "    end;\n"
+                            "    Console.WriteLine(tot);\n"
+                            "    Console.WriteLine(b[0]);\n"),
+        "300\nw41\n300\nw41\n");
+}
+
+// CONTROLS (green on 1fb88acb too): a class element, a NULLABLE class
+// element and a collection element are borrows — §28.9: "no reference
+// counts ... for user-defined classes" — so the thunk mints nothing for
+// them and the loop neither frees nor leaks the element.
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           generic_block_reference_over_a_class_element_is_a_borrow) {
+    // per §27.6 (v0.355) + §26.4 (v0.355) + §28.9 (v0.355)
+    expectCheckedStdout(
+        genericBlockProgram("extension OwningArray<T> where T: class\n"
+                            "  public method Head(): T => this[0];\n"
+                            "  public method HeadN(): T? => this[0];\n"
+                            "end;\n",
+                            "OwningArray<Item>",
+                            "    using var b: OwningArray<Item> := new OwningArray<Item>();\n"
+                            "    b.Add(new Item(5));\n",
+                            "    var f: () -> Item := b.Head;\n"
+                            "    var fn: () -> Item? := b.HeadN;\n"
+                            "    var i := 0;\n"
+                            "    var tot := 0;\n"
+                            "    while i < 100 do\n"
+                            "      tot := tot + f().n;\n"
+                            "      var x := fn();\n"
+                            "      if x is not null then\n"
+                            "        tot := tot + x.n;\n"
+                            "      end;\n"
+                            "      i := i + 1;\n"
+                            "    end;\n"
+                            "    Console.WriteLine(tot);\n",
+                            "    var g: (OwningArray<Item>) -> Item := OwningArray<Item>.Head;\n"
+                            "    var gn: (OwningArray<Item>) -> Item? := OwningArray<Item>.HeadN;\n"
+                            "    var j := 0;\n"
+                            "    var tot := 0;\n"
+                            "    while j < 100 do\n"
+                            "      tot := tot + g(b).n;\n"
+                            "      var y := gn(b);\n"
+                            "      if y is not null then\n"
+                            "        tot := tot + y.n;\n"
+                            "      end;\n"
+                            "      j := j + 1;\n"
+                            "    end;\n"
+                            "    Console.WriteLine(tot);\n"),
+        "1000\n1000\n");
+}
+
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           generic_block_reference_over_an_array_element_is_a_borrow) {
+    // per §27.6 (v0.355) + §26.4 (v0.355) + §28.9 (v0.355)
+    expectCheckedStdout(
+        genericBlockProgram(kGenericBlock, "Array<Array<long>>",
+                            "    var b: Array<Array<long>> := [[5000000000L, 2L], [3L]];\n",
+                            "    var f: () -> Array<long> := b.Head;\n"
+                            "    var i := 0;\n"
+                            "    var tot := 0L;\n"
+                            "    while i < 100 do\n"
+                            "      tot := tot + f()[0];\n"
+                            "      i := i + 1;\n"
+                            "    end;\n"
+                            "    Console.WriteLine(tot);\n",
+                            "    var g: (Array<Array<long>>) -> Array<long> := Array<Array<long>>.Head;\n"
+                            "    var j := 0;\n"
+                            "    var tot := 0L;\n"
+                            "    while j < 100 do\n"
+                            "      tot := tot + g(b)[0];\n"
+                            "      j := j + 1;\n"
+                            "    end;\n"
+                            "    Console.WriteLine(tot);\n"),
+        "500000000000\n500000000000\n");
+}
+
+// The other runtime-managed result: a FUNCTION-typed element (§28.9) is
+// handed back at +1 by the thunk's closure mint, and the caller releases it.
+// (A class receiver with capture-free lambdas: an `Array<() -> long>` local
+// is not reliably reclaimed on the base either, the #6516 class, and a
+// capturing lambda is refused at a bare `T` parameter per §28.3.)
+BEZEL_TEST(sema_extension_method_ref_residual_8121,
+           generic_block_reference_over_a_function_element_is_balanced) {
+    // per §27.6 (v0.355) + §26.4 (v0.355) + §28.9 (v0.355)
+    expectCheckedStdout(
+        std::string("module M;\n") + kBoxClass +
+            "class C\n"
+            "  public static method Show(p: Box<() -> long>): int\n"
+            "    var g: (Box<() -> long>) -> () -> long := Box<() -> long>.Head;\n"
+            "    var j := 0;\n"
+            "    var tot := 0L;\n"
+            "    while j < 100 do\n"
+            "      var h := g(p);\n"
+            "      tot := tot + h();\n"
+            "      j := j + 1;\n"
+            "    end;\n"
+            "    Console.WriteLine(tot);\n"
+            "    return 0;\n"
+            "  end Show;\n"
+            "  public static method Main(): int\n"
+            "    using var p := new Box<() -> long>(lambda() => 5000000001L, lambda() => 3L);\n"
+            "    var f: () -> () -> long := p.Head;\n"
+            "    var i := 0;\n"
+            "    var tot := 0L;\n"
+            "    while i < 100 do\n"
+            "      var h := f();\n"
+            "      tot := tot + h();\n"
+            "      i := i + 1;\n"
+            "    end;\n"
+            "    Console.WriteLine(tot);\n"
+            "    return C.Show(p);\n"
+            "  end Main;\n"
+            "end C;\n",
+        "500000000100\n500000000100\n");
+}
