@@ -4694,6 +4694,14 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         ref.kind = TypeRef::Kind::Error;
         return;
     }
+    // fix #8213 (§27.8, v0.355): the resolver's answer to "does this spelling
+    // name a type parameter?" is the record every later reader consults, and
+    // it is TRI-STATE (see TypeRef.hpp). Default it to "the resolver resolved
+    // this spelling and it is NOT a type parameter"; the type-parameter-marker
+    // path below flips it to `Param`. A TypeRef the resolver never resolved
+    // (module metadata, a later pass's synthesised ref) keeps `Unknown` and
+    // its readers fall back to the name test.
+    ref.typeParam = TypeRef::TypeParamBinding::NotParam;
     std::string_view first = t.name->parts.front();
     // fix #4698 (§2.2, v0.313; §2.7 rule 1): `Alias.Builtin` where `Alias` is
     // an unshadowed import alias of the module that declares the compiler-
@@ -5358,7 +5366,12 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             // record is per-resolution (per TypeRef), not on `t`: the same
             // AST node can be resolved again in another scope (an alias body
             // at each of its use sites), where the answer may differ.
-            ref.typeParam = true;
+            //
+            // fix #8213 (§27.8, v0.355): the record is TRI-STATE — this arm
+            // writes `Param`, the resolver's default (set at the top of
+            // resolveNamed) writes `NotParam`, and a spelling the resolver
+            // never resolved keeps `Unknown`.
+            ref.typeParam = TypeRef::TypeParamBinding::Param;
             return;
         }
         // fix #5172 (§2.2, v0.310): arity selects among rule 1's types.
@@ -7001,8 +7014,33 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // a per-alias scope binding the alias's own generic params and
                 // pass it to resolveType.  This is the broad-coverage fallback
                 // for nested non-bare alias bodies.
+                //
+                // fix #8213 (§27.8, v0.355): the alias body is resolved in the
+                // alias's DECLARATION scope, NOT in the reference site's scope.
+                // §27.8: "A type alias is a pure synonym — it does not create a
+                // new type." The alias denotes the ONE type its declaration
+                // denotes, and the names its body may name are the ones visible
+                // at that declaration — the module scope plus the alias's own
+                // generic parameters. The old parent (`scope`, the REFERENCE
+                // site's scope) let a type parameter spelled like a builtin
+                // CAPTURE the body: `type GMap := Dictionary<Guid, int>;`
+                // used inside `F<Guid>` denoted `Dictionary<F's Guid, int>`
+                // instead of `Dictionary<System.Guid, int>`, so r4c ACCEPTED a
+                // `Dictionary<int, int>` where a `Dictionary<Guid, int>` was
+                // required, r4e REJECTED a real `Dictionary<Guid, int>`, and
+                // r4b ACCEPTED an `int` index on a Guid-keyed dictionary.
+                //
+                // The parent is the module scope — the SAME scope object
+                // resolveTopDecl's TypeAlias arm and
+                // resolveAliasForwardReferences use as the alias body's
+                // declaration scope, so a body now resolves IDENTICALLY at its
+                // declaration and at every reference site. #4105's fallback is
+                // preserved: the alias's OWN generic parameters are bound as
+                // markers in `aliasScope` itself, so `type Alias<T> := [1]T;`
+                // still resolves its `T` from a reference site that does not
+                // bind `T`.
                 Scope aliasScope;
-                aliasScope.parent = scope;
+                aliasScope.parent = moduleScope_ ? moduleScope_ : scope;
                 for (const auto& g : aliasDecl->genericParams) {
                     aliasScope.names[g.name] = nullptr;
                 }
@@ -7087,8 +7125,13 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             resolveType(*aliasDecl->aliasedType, &aliasScope)) {
                         underlying = resolved;
                     } else {
-                        underlying =
-                            resolveType(*aliasDecl->aliasedType, scope);
+                        // fix #8213 (§27.8, v0.355): the fallback resolves the
+                        // body in the DECLARATION scope too — resolving it in
+                        // the reference site's scope here would reintroduce the
+                        // capture the `aliasScope` parent above just removed.
+                        underlying = resolveType(
+                            *aliasDecl->aliasedType,
+                            moduleScope_ ? moduleScope_ : scope);
                     }
                 }
                 if (underlying) {

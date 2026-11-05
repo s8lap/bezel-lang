@@ -299,6 +299,13 @@ void Resolver::run(const ast::SourceFile& src) {
         }
     }
     Scope moduleScope;
+    // fix #8213 (§27.8, v0.355): the module scope IS the declaration scope of
+    // every module-level type alias (A.2 `TypeAliasDecl` is a TopDecl), so a
+    // reference site's alias body must be resolved against THIS scope — not
+    // against the reference site's — or a type parameter spelled like a
+    // builtin captures the body. See the member's comment in
+    // TypeResolution_impl.hpp.
+    moduleScope_ = &moduleScope;
     // Populate module-scope: every top-level type / alias by name.
     // #2131 / §2.3 v0.226: a local top-level declaration of the same name as
     // an auto-imported prelude type SHADOWS the prelude (the prelude is

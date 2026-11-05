@@ -254,6 +254,27 @@ private:
         Scope* parent = nullptr;
     };
 
+    // fix #8213 (§27.8, v0.355): the MODULE scope of the file being resolved
+    // — the DECLARATION scope of every module-level type alias (A.2
+    // `TypeAliasDecl` is a TopDecl, so an alias is declared at module level
+    // and nothing else).
+    //
+    // §27.8: "A type alias is a pure synonym — it does not create a new
+    // type." An alias therefore denotes the ONE type its DECLARATION denotes,
+    // and the names its body may name are the ones visible AT THAT
+    // DECLARATION — the module scope (plus the alias's own generic
+    // parameters). Resolving the body in the REFERENCE site's scope instead
+    // lets a type parameter spelled like a builtin capture the body:
+    // `type GMap := Dictionary<Guid, int>;` used inside `F<Guid>` denoted
+    // `Dictionary<F's Guid, int>` instead of `Dictionary<System.Guid, int>`
+    // (issue #8213).
+    //
+    // The pointer is set by run() (the module scope is a local there) and is
+    // null in the LATE-PASS Resolvers (checkClassSerializationEligibilityLate
+    // and friends), which never resolve a type; resolveNamed's alias arm falls
+    // back to the reference site's scope when it is null.
+    Scope* moduleScope_ = nullptr;
+
     SemaContext& ctx_;
 
     // §2.15 / issue #631: the set of dotted namespace names declared with

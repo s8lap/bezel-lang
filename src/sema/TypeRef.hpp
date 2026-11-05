@@ -130,8 +130,44 @@ struct TypeRef {
     // resolver (module metadata, sema-synthesised refs) stays false, and the
     // reader falls back to the name test, so such a ref is never read as a
     // type parameter it is not — the fail-closed direction.
-    bool typeParam = false;
-    bool isResolvedTypeParam() const { return typeParam; }
+    //
+    // fix #8213 (§27.8, v0.355): the record is TRI-STATE — the resolver's
+    // answer to "does this spelling name a TYPE PARAMETER?" has three
+    // answers, and the two the old single bool conflated are exactly the two
+    // a substitution has to tell apart:
+    //
+    //   * `Param`    — the spelling bound to a type-parameter marker of the
+    //                   scope it was resolved in.
+    //   * `NotParam` — the resolver resolved the spelling to something else
+    //                   (a built-in, a module type, an imported type): the
+    //                   spelling names a CONCRETE type.
+    //   * `Unknown`  — the resolver did not resolve this spelling at all (a
+    //                   TypeRef the module loader built, or one a later pass
+    //                   synthesised): there is NO record, so a reader falls
+    //                   back to the name test.
+    //
+    // `NotParam` is what lets the substitution walker (§14.1) tell a
+    // built-in from a type parameter by ORIGIN instead of by NAME. §27.8: "A
+    // type alias is a pure synonym — it does not create a new type": an
+    // alias's body is resolved in its DECLARATION scope, so
+    // `type GMap := Dictionary<Guid, int>` names the built-in `Guid` at its
+    // declaration and keeps naming it at EVERY reference site — an enclosing
+    // generic's parameter spelled `Guid` does not capture it (issue #8213).
+    enum class TypeParamBinding : unsigned char {
+        Unknown = 0,
+        Param,
+        NotParam,
+    };
+    TypeParamBinding typeParam = TypeParamBinding::Unknown;
+    bool isResolvedTypeParam() const {
+        return typeParam == TypeParamBinding::Param;
+    }
+    // fix #8213: the resolver resolved this spelling and it did NOT name a
+    // type parameter — the spelling denotes a concrete type, whatever its
+    // NAME says.
+    bool isResolvedNonTypeParam() const {
+        return typeParam == TypeParamBinding::NotParam;
+    }
 
     // InlineArray:
     const ast::Expr* arraySize = nullptr;   // ConstIntExpr; sema later evaluates

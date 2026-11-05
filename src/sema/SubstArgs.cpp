@@ -62,7 +62,31 @@ TypeRef* applyBareParamSubst(const TypeRef* sub,
                               bool aliasChainParams) {
     if (!sub || sub->kind != TypeRef::Kind::Named || sub->declaration) return nullptr;
     std::string_view head = paramHead(sub);
-    auto it = head.empty() ? subst.end() : subst.find(head);
+    auto it = subst.end();
+    // fix #8213 (§27.8, v0.355): the resolver's record is the authority for
+    // "does this spelling name a TYPE PARAMETER?" — the name-keyed lookup
+    // below is only a FALLBACK for a spelling the resolver never resolved.
+    //
+    // §27.8: "A type alias is a pure synonym — it does not create a new
+    // type." An alias's body is resolved in its DECLARATION scope (the module
+    // scope plus the alias's own generic parameters), so the names it may
+    // name are the ones visible AT THAT DECLARATION — and it denotes the one
+    // type that declaration denotes, at EVERY reference site. A body that
+    // spells a reserved built-in (`type GMap := Dictionary<Guid, int>`) names
+    // `System.Guid`, NOT a type parameter of an enclosing generic that
+    // happens to be spelled `Guid`: the resolver resolved that spelling to
+    // the built-in and recorded `NotParam`, so the enclosing method's
+    // substitution must NOT rewrite it (issue #8213 — without this the call
+    // `F<int>(d)` accepted a `Dictionary<int, int>` where the alias's
+    // `Dictionary<Guid, int>` was required, and rejected a real
+    // `Dictionary<Guid, int>`).
+    //
+    // A spelling the resolver never resolved (module metadata, a later
+    // pass's synthesised ref) has NO record (`Unknown`) and keeps the
+    // name-keyed fallback — the fail-open direction for a ref the resolver
+    // cannot vouch for.
+    if (!sub->isResolvedNonTypeParam())
+        it = head.empty() ? subst.end() : subst.find(head);
     // #6321 (§27.8, v0.338): an alias-of-alias body's parameter node carries
     // the inner alias's use site as `astNode`; its parameter name is its
     // `aliasResolvedHead` (see SubstArgs::aliasChainParams). A built-in head
@@ -70,7 +94,8 @@ TypeRef* applyBareParamSubst(const TypeRef* sub,
     if (it == subst.end() && aliasChainParams && sub->astNode &&
         sub->genericArgs.empty() && !sub->aliasResolvedHead.empty() &&
         sub->aliasResolvedHead != head &&
-        !isBuiltinTypeName(sub->aliasResolvedHead))
+        !isBuiltinTypeName(sub->aliasResolvedHead) &&
+        !sub->isResolvedNonTypeParam())
         it = subst.find(sub->aliasResolvedHead);
     if (it == subst.end()) return nullptr;
     TypeRef* substituted = it->second;

@@ -32714,7 +32714,28 @@ TypeRef* ExprTC::substituteReturnType(
         declared->genericArgs.empty()) {
         // Only a bare param reference has no genericArgs and no declaration.
         // Check if this name is a solved type parameter.
-        auto it = solved.find(declared->headName());
+        //
+        // fix #8213 (§27.8, v0.355): the resolver's record is the authority
+        // for "does this spelling name a TYPE PARAMETER?" — the name-keyed
+        // lookup is only the FALLBACK for a spelling the resolver never
+        // resolved (a module-metadata TypeRef, a synthesised one).
+        //
+        // §27.8: "A type alias is a pure synonym — it does not create a new
+        // type." An alias's body is resolved in its DECLARATION scope (the
+        // module scope plus the alias's own generic parameters), so the names
+        // it may name are the ones visible AT THAT DECLARATION, and it
+        // denotes the one type that declaration denotes at EVERY reference
+        // site. A body that spells a reserved built-in (`type GMap :=
+        // Dictionary<Guid, int>`) names `System.Guid` — NOT a type parameter
+        // of an enclosing generic that happens to be spelled `Guid`: the
+        // resolver resolved that spelling to the built-in and recorded
+        // `NotParam`, so an enclosing method's substitution must NOT rewrite
+        // it (issue #8213 — without this the call `F<int>(d)` accepted a
+        // `Dictionary<int, int>` where the alias's `Dictionary<Guid, int>`
+        // was required, and rejected a real `Dictionary<Guid, int>`).
+        auto it = solved.end();
+        if (!declared->isResolvedNonTypeParam())
+            it = solved.find(declared->headName());
         if (it != solved.end() && it->second) {
             TypeRef* sub = it->second;
             if (declared->nullable && !sub->nullable) {
