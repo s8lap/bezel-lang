@@ -3951,6 +3951,42 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
             return emitChoiceToString(val, ts, fieldTy);
         }
         if (ts->kind == ast::TypeDeclKind::Class && val->getType()->isPointerTy()) {
+            // fix #8142 (§8.5 / §18.5, v0.355): a class renders through its
+            // `ToString`, and §8.5's first sentence puts the interpolation hole
+            // under VIRTUAL dispatch — "`ToString` is invoked implicitly inside
+            // string interpolation (§18.5) via virtual dispatch". The MEMBER
+            // call `b.ToString()` already dispatched VIRTUALLY (the RECEIVER's
+            // own vtable, slot 3 — `lowerObjectToString`, the route the
+            // `Object`-typed and the interface-typed spellings take), but this
+            // arm RESOLVED `ToString` against the STATIC class chain and,
+            // finding none, answered with the STATIC type's qualified name.
+            // Two spellings of one rule therefore disagreed. The issue's own
+            // repro printed:
+            //
+            //   M.Base     <- $"{b}"      (the hole: the STATIC type's name)
+            //   D!         <- b.ToString() (the member call: the override)
+            //   M.Base2    <- $"{b2}"
+            //   M.Derived2 <- b2.ToString()
+            //
+            // The fix dispatches through the RECEIVER's vtable, so the answer
+            // is the RUNTIME class's: its override if it declares one, else
+            // ITS qualified name (§8.5's class bullet — the default comes from
+            // the runtime class, NOT from the static spelling). That is
+            // exactly what `b.ToString()` answers, so the two agree — and the
+            // aligned hole (`$"{b,10}"`, §18.5) and the console's argument
+            // rendering reach this same arm, so they agree too.
+            //
+            // `builtinTypeName(fieldTy).empty()` is the ONE discriminator
+            // between a genuine user class (a heap object with a Bezel vtable
+            // at word 0 — §8.1) and the SYNTHETIC built-in class stubs
+            // (`builtinClassSym`: Stopwatch, CancellationToken, FrozenArray,
+            // CString, WString, RawBytes, …), whose runtime value is a plain
+            // C struct with NO vtable — a slot-3 dispatch on one of those is a
+            // WILD JUMP, not a render (#3907 / #4120 / #4126's measurements).
+            // A synthetic stub keeps the static-name default it has today.
+            if (builtinTypeName(fieldTy).empty()) {
+                if (llvm::Value* r = lowerObjectToString(val)) return r;
+            }
             // §8.5: a class field formats via its ToString override if any,
             // else the type name. Walk the class chain for a ToString method.
             sema::MethodSymbol* toStr = nullptr;

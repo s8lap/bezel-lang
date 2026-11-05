@@ -1803,35 +1803,37 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         // Could be string (use as-is) or class (call ToString).
                         if (rt && rt->kind == sema::TypeRef::Kind::Named &&
                             rt->declaration) {
-                            // Class/interface: call ToString() if available.
-                            auto* ts = rt->declaration;
-                            sema::MethodSymbol* toStr = nullptr;
-                            for (auto* cur = ts; cur && !toStr;) {
-                                for (auto* sym : cur->members) {
-                                    auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
-                                    if (ms && ms->name == "ToString" && ms->params.empty()) {
-                                        toStr = ms; break;
-                                    }
-                                }
-                                sema::TypeSymbol* nxt = nullptr;
-                                for (auto* b : cur->baseTypes)
-                                    if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
-                                cur = nxt;
-                            }
-                            if (toStr) {
-                                std::vector<llvm::Value*> args{ev};
-                                pv = emitMethodCall(toStr, args, false);
-                            } else {
-                                // §8.5 (#1077): a class/interface with NO explicit
-                                // ToString override interpolates as its type name
-                                // (the §8.5 default), NOT the raw pointer.
-                                // emitValueToString handles the Named class/iface
-                                // case — the same path an Object-typed interpolation
-                                // already uses. Previously this treated the class
-                                // pointer as a bz_string*, so `$"{obj}"` produced an
-                                // empty / garbage string.
-                                pv = emitValueToString(ev, rt);
-                            }
+                            // fix #8142 (§8.5 / §18.5, v0.355): a class- or
+                            // interface-typed hole renders through the ONE
+                            // renderer (`emitValueToString`), which dispatches
+                            // `ToString` VIRTUALLY — the RECEIVER's own vtable
+                            // slot 3, the same dispatch the member call
+                            // `b.ToString()` uses. The static-class-chain walk
+                            // that used to live HERE is what made the two
+                            // spellings disagree: it resolved `ToString`
+                            // against the STATIC chain and, finding none,
+                            // answered with the STATIC type's qualified name
+                            // (`$"{b}"` printed `M.Base` while `b.ToString()`
+                            // printed the runtime override `D!`).
+                            //
+                            // The walk is DELETED, not repaired: it was this
+                            // chain's SECOND copy of the §8.5 dispatch, and a
+                            // second copy is what let the two drift (the
+                            // #2913 / #2969 / #3118 / #8142 family). The
+                            // renderer below is the one the `Object`-typed
+                            // hole, the console's argument rendering, the
+                            // record component and the generic-T operand all
+                            // reach, so one change moves all of them together.
+                            //
+                            // §8.5 (#1077): a class/interface with NO explicit
+                            // ToString override renders as its type name (the
+                            // §8.5 default), NOT the raw pointer — the
+                            // renderer handles the Named class/iface case,
+                            // the same path an `Object`-typed interpolation
+                            // already uses. Previously this treated the class
+                            // pointer as a bz_string*, so `$"{obj}"` produced
+                            // an empty / garbage string.
+                            pv = emitValueToString(ev, rt);
                         } else if (rt && rt->kind == sema::TypeRef::Kind::Named &&
                                    !rt->declaration) {
                             // §8.5 (#1118): a generic type-parameter operand
