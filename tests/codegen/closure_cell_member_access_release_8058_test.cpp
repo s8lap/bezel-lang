@@ -61,11 +61,10 @@
 // WHEN THE RECEIVER MAY BE RELEASED AT SCOPE END — and when it may NOT.
 // §8.1 (v0.355) declares `Object`'s instance surface as `GetType`, `Equals`,
 // `GetHashCode` and `ToString`, with "method bodies ... provided by the
-// runtime"; §26.5 rule 1 ("Instance members win — by name") sends every call
-// spelled with one of those names to that body, never to an extension. No
-// user code runs on the receiver, so the call cannot store it anywhere that
-// outlives the call: the receiver's own reference stays in its slot, and the
-// slot's scope-end release is exactly-once. §28.3.8 clause 4 (v0.355) draws
+// runtime". When a call reaches one of THOSE bodies, no user code runs on
+// the receiver, so the call cannot store it anywhere that outlives the call:
+// the receiver's own reference stays in its slot, and the slot's scope-end
+// release is exactly-once. §28.3.8 clause 4 (v0.355) draws
 // the same line: "A function value as the receiver of a member `Object`
 // declares (`f.ToString()`, `f.GetHashCode()`, an interpolation hole) is not
 // at a set-erasing position; as the receiver of an extension call whose head
@@ -74,7 +73,15 @@
 // its receiver keeps the conservative ESCAPE. The first version of this fix
 // (83c9a9cd) relaxed EVERY member call and turned an extension's stored
 // alias into a heap-use-after-free; the FIX-FORWARD rows at the end of this
-// file pin that line.
+// file pin that line. The second version (eb91cd7a) relaxed by member NAME,
+// on §26.5 rule 1 ("Instance members win — by name"); but sema does not
+// enforce rule 1 everywhere (#8051): an `extension Object` member that
+// REUSES `ToString` / `Equals` / `GetHashCode` at another arity is silently
+// bound, and the name-keyed relaxation freed its receiver under a live
+// alias. The walker now asks what the call RESOLVED TO (the callee's
+// `exprSymbol`: an extension `MethodSymbol`, or none for `Object`'s own
+// runtime-provided member); the SAME-NAMED-EXTENSION rows at the end of this
+// file pin that.
 //
 // ── THE ORACLE ─────────────────────────────────────────────────────────────
 // The defect is a LEAK, so the oracle is the STRICT harness (`runAotChecked`):
@@ -966,4 +973,124 @@ class P
 end P;
 )BZL"),
                  "100\n");
+}
+
+// ===========================================================================
+// SAME-NAMED EXTENSION — an `extension Object` member that REUSES an `Object`
+// member's NAME at another arity. §26.5 rule 1 (v0.355) says extension
+// blocks are "never consulted for that name on that receiver", but sema does
+// not enforce the rule on every receiver (#8051: the primitive-receiver
+// hole), so the call BINDS to the extension and user code runs on the
+// receiver — `xs.Add(this)` / `=> this`, exactly the alias §9.7 (v0.355)
+// warns of: "the extension body reads `this` at the head type and may pass
+// it on to a parameter that stores it". The receiver is therefore §28.3.8
+// clause 4's set-erasing "receiver of an extension call whose head is
+// `Object`", and the closure local must NOT release its cell at scope end.
+//
+// MEASURED at eb91cd7a (the name-keyed relaxation), each row's program via
+// `scripts/agent_check.sh --probe --asan`: `ERROR: AddressSanitizer:
+// heap-use-after-free`, freed by `bz_closure_release`. On the base tree
+// 8845ad4e and on this fix: "100", no AddressSanitizer report.
+//
+// Lenient harness (LeakSanitizer OFF): the escaped cells have no releaser —
+// the conservative escape's PRE-EXISTING leak (MEASURED on base: 97–99 × 64
+// B), a separate defect from the use-after-free these rows pin. The final
+// read is `o.GetHashCode()`, which dereferences the stored cell (a freed one
+// is caught); `o.ToString()` on that Object view crashes on the pre-existing
+// #7247-family defect and would not reach the oracle.
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           a_same_named_extension_to_string_storing_this_keeps_the_closure_cell_alive) {
+    expectNoMemoryError(runAotCheckedLenient(R"BZL(
+module M;
+extension Object
+  public method ToString(xs: Array<Object>): string
+    xs.Add(this);
+    return "x";
+  end ToString;
+end;
+class P
+  public static method Run(xs: Array<Object>): int
+    var g: (int)->int := lambda(x: int) => x + 1;
+    return g.ToString(xs).Length;
+  end Run;
+  public static method Main(): int
+    var xs := new Array<Object>();
+    var i: int := 0;
+    while i < 100 do
+      _ := P.Run(xs);
+      i := i + 1;
+    end;
+    var n: int := 0;
+    for var o in xs do
+      if o.GetHashCode() = o.GetHashCode() then n := n + 1; end;
+    end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                        "100\n");
+}
+
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           a_same_named_extension_equals_storing_this_keeps_the_closure_cell_alive) {
+    expectNoMemoryError(runAotCheckedLenient(R"BZL(
+module M;
+extension Object
+  public method Equals(xs: Array<Object>, k: int): bool
+    xs.Add(this);
+    return true;
+  end Equals;
+end;
+class P
+  public static method Run(xs: Array<Object>): int
+    var g: (int)->int := lambda(x: int) => x + 1;
+    return (if g.Equals(xs, 1) then 1 else 0);
+  end Run;
+  public static method Main(): int
+    var xs := new Array<Object>();
+    var i: int := 0;
+    while i < 100 do
+      _ := P.Run(xs);
+      i := i + 1;
+    end;
+    var n: int := 0;
+    for var o in xs do
+      if o.GetHashCode() = o.GetHashCode() then n := n + 1; end;
+    end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                        "100\n");
+}
+
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           a_same_named_extension_get_hash_code_returning_this_keeps_the_closure_cell_alive) {
+    expectNoMemoryError(runAotCheckedLenient(R"BZL(
+module M;
+extension Object
+  public method GetHashCode(tag: string): Object => this;
+end;
+class P
+  public static method Make(): Object
+    var g: (int)->int := lambda(x: int) => x + 1;
+    return g.GetHashCode("t");
+  end Make;
+  public static method Main(): int
+    var i: int := 0;
+    var n: int := 0;
+    while i < 100 do
+      var o := P.Make();
+      if o.GetHashCode() = o.GetHashCode() then n := n + 1; end;
+      i := i + 1;
+    end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                        "100\n");
 }

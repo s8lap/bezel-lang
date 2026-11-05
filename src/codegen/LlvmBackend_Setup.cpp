@@ -37218,24 +37218,42 @@ struct ClosureEscapeWalker {
     // member `Object` declares (`f.ToString()`, `f.GetHashCode()`, an
     // interpolation hole) is not at a set-erasing position".
     //
-    // WHY BY NAME. §26.5 rule 1 (v0.355): "Instance members win — by name. If
-    // `x`'s declared type (or any base type) *declares* any instance member
-    // named `Foo` [...] extension blocks are **never consulted** for that name
-    // on that receiver." Every type has `Object` as a base (§8.1), so a call
-    // spelled with one of those four names never reaches an extension member.
+    // WHICH members are NOT relaxed: an EXTENSION member. On a function-typed
+    // receiver any member that is not `Object`'s own can only reach an
+    // extension whose head is `Object` (§26.5 rule 2), and the extension body
+    // is USER CODE that reads `this` at `Object` and "may pass it on to a
+    // parameter that stores it" (spec §9.7, v0.355) — `xs.Add(this)`, or
+    // `method Self(): Object => this` whose result the caller stores.
+    // §28.3.8 clause 4 names that receiver as set-erasing: "as the receiver
+    // of an extension call whose head is `Object` [...] it is". So such a
+    // receiver keeps the conservative ESCAPE (the `MemberAccessExpr` arm
+    // below, reached through `expr(callee, ...)`): arming a scope-end release
+    // there freed the cell while the extension's stored alias survived
+    // (MEASURED, review of 83c9a9cd: heap-use-after-free, freed by
+    // `bz_closure_release`).
     //
-    // WHICH members are NOT relaxed: every OTHER name. On a function-typed
-    // receiver any other member name can only reach an extension whose head
-    // is `Object` (§26.5 rule 2), and the extension body is USER CODE that
-    // reads `this` at `Object` and "may pass it on to a parameter that stores
-    // it" (spec §9.7, v0.355) — `xs.Add(this)`, or `method Self(): Object =>
-    // this` whose result the caller stores. §28.3.8 clause 4 names that
-    // receiver as set-erasing: "as the receiver of an extension call whose
-    // head is `Object` [...] it is". So such a receiver keeps the
-    // conservative ESCAPE (the `MemberAccessExpr` arm below, reached through
-    // `expr(callee, ...)`): arming a scope-end release there freed the cell
-    // while the extension's stored alias survived (MEASURED, review of
-    // 83c9a9cd: heap-use-after-free, freed by `bz_closure_release`).
+    // WHY THE RESOLVED SYMBOL, NOT THE NAME. §26.5 rule 1 (v0.355) — "Instance
+    // members win — by name. [...] extension blocks are **never consulted**
+    // for that name on that receiver" — would make the four names above
+    // sufficient on their own, and the first fix-forward keyed on exactly
+    // that. But sema does NOT enforce rule 1 on every receiver (#8051, the
+    // same hole on a primitive receiver): an `extension Object` member that
+    // REUSES one of those names at another arity — `ToString(xs:
+    // Array<Object>)`, `Equals(xs, k)`, `GetHashCode(tag): Object => this` —
+    // is silently BOUND, and the call runs user code on the receiver after
+    // all (MEASURED, review of eb91cd7a: heap-use-after-free on each, freed
+    // by the scope-end `bz_closure_release` the name-keyed relaxation armed).
+    // The walker therefore asks what the call RESOLVED TO: sema's
+    // `resolveExtensionMember` stamps the bound extension `MethodSymbol` on
+    // the callee member-access node (`ctx.exprSymbol`), and such a symbol is
+    // an extension member exactly when its `extensionDecl` is set (§26 /
+    // #433, the same test codegen's `isExtensionMethod` makes when it lowers
+    // the call). `Object`'s own universal members bind NO `MethodSymbol`
+    // (their bodies are runtime intrinsics, #2781). So the receiver is
+    // relaxed only when BOTH hold: the member is one §8.1 declares on
+    // `Object`, AND sema did not bind the access to an extension member. The
+    // name alone is NOT the decider; it only names the §8.1 surface the
+    // runtime-provided bodies implement.
     //
     // BEFORE this, the walker's `MemberAccessExpr` arm forced `safeRead=false`
     // on every receiver, on the stated premise that "Member access / indexing
@@ -37262,22 +37280,46 @@ struct ClosureEscapeWalker {
                name == "GetHashCode" || name == "GetType";
     }
 
+    // Did sema bind this callee member access to an EXTENSION member (§26.5
+    // rule 2)? True exactly when the node's resolved symbol is a
+    // `MethodSymbol` declared in an `extension` block (`extensionDecl` set,
+    // §26 / #433). `Object`'s own universal members leave the node
+    // symbol-less, so they answer false.
+    bool calleeBindsExtensionMember(const ast::Expr& calleeNode) const {
+        auto* ms = dynamic_cast<const sema::MethodSymbol*>(
+            ctx.exprSymbol(calleeNode));
+        return ms != nullptr && ms->extensionDecl != nullptr;
+    }
+
+    // The receiver of `calleeNode` (a callee-position member access naming
+    // `member`) is a BORROW for the call's duration iff the call reaches
+    // `Object`'s OWN member: a §8.1 name that sema did NOT bind to an
+    // extension member. See the comment block above for why the name alone
+    // does not decide (#8051).
+    bool calleeReachesObjectOwnMember(const ast::Expr& calleeNode,
+                                      std::string_view member) const {
+        return isObjectDeclaredInstanceMember(member) &&
+               !calleeBindsExtensionMember(calleeNode);
+    }
+
     void exprCallee(const ast::Expr* callee) {
         if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(callee)) {
-            if (isObjectDeclaredInstanceMember(m->member)) {
+            if (calleeReachesObjectOwnMember(*m, m->member)) {
                 expr(m->target.get(), /*safeRead=*/true);
                 return;
             }
         } else if (auto* m =
                        dynamic_cast<const ast::NullCondMemberExpr*>(callee)) {
-            if (isObjectDeclaredInstanceMember(m->member)) {
+            if (calleeReachesObjectOwnMember(*m, m->member)) {
                 expr(m->target.get(), /*safeRead=*/true);
                 return;
             }
         }
-        // Any other member name (an extension call, §26.5 rule 2) falls
-        // through to the `MemberAccessExpr` / `NullCondMemberExpr` arm, whose
-        // receiver walk is the conservative escape.
+        // Any other callee member access — an extension call (§26.5 rule 2),
+        // including one that reuses an `Object` member's NAME at another
+        // arity (#8051) — falls through to the `MemberAccessExpr` /
+        // `NullCondMemberExpr` arm, whose receiver walk is the conservative
+        // escape.
         expr(callee, /*safeRead=*/true);
     }
 
