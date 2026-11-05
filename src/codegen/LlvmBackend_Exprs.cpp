@@ -2571,7 +2571,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         }
                     }
                     if (tt && tt->kind == sema::TypeRef::Kind::Primitive) {
-                        if (tt->primitive == sema::PrimitiveType::String) {
+                        // fix #7841 (§26.5 rules 1-2, §22.5, §26.7, v0.355):
+                        // a call sema bound to a user `extension string`
+                        // member is the extension's, and the extension
+                        // lowering lowers its own receiver.  The arm below
+                        // lowers the receiver (the +1 producer pre-lower, or
+                        // inside tryLowerStringMethod) BEFORE it knows it will
+                        // decline, so a call-result receiver ran TWICE
+                        // (`Make.Str(1).Len2()` called `Str` twice).  Decline
+                        // here, before any receiver IR is emitted.
+                        const bool strBoundToExtension = [&] {
+                            auto* msS = dynamic_cast<sema::MethodSymbol*>(
+                                ctx_.exprSymbol(*call->callee));
+                            return isExtensionMethod(msS);
+                        }();
+                        if (tt->primitive == sema::PrimitiveType::String &&
+                            !strBoundToExtension) {
                             // CG27f: stdlib §9.6 string methods.
                             // #429 (OPERATOR-OPERAND category) / §4.6 / §28.9:
                             // pre-lower the receiver so we can release it after

@@ -18188,6 +18188,27 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         }
     }
 
+    // fix #7841 (§26.7, §28.9, v0.355): a `string` +1 producer used as the
+    // receiver of a user `extension string` call (`Make.Str(1).Len2()`).  The
+    // §9.6 string arm no longer pre-lowers it (it declines an extension-bound
+    // call before any receiver IR), so THIS lowering is the one place the
+    // receiver is evaluated, and nothing else owns the temporary: release it
+    // once the call has returned, exactly as the §9.6 member path does.  A
+    // result that returns the receiver (`this`) carries its own +1 (§28.9),
+    // so the release here is the receiver temporary's own reference.
+    if (!diverged_ && isExtensionMethod(ms) && !args.empty() &&
+        args[0]->getType()->isPointerTy()) {
+        if (auto* maR = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            const sema::TypeRef* rt =
+                maR->target ? ctx_.exprType(*maR->target) : nullptr;
+            if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                rt->primitive == sema::PrimitiveType::String &&
+                isPlusOneStringProducer(maR->target.get()))
+                emitStringRelease(args[0]);
+        }
+    }
+
     // #1039 / #1053 / §28.3: a fresh owned-producer (`new <class>()` or an
     // `owned`-returning call) used only as the receiver of an instance-method
     // call (args[0] = receiver) leaves the temporary owned by nothing — dispose
