@@ -11,7 +11,9 @@
 //! notes: The pre-fix compiler fails this program with an internal IR
 //!   verification error instead of the purity diagnostic, so the runner's
 //!   reject check cannot tell it from a correct rejection there. Only the
-//!   staging tip gives the 22.15 diagnostic.
+//!   staging tip gives the 22.15 diagnostic. The pre-fix failure is the
+//!   independent #3524 (a 22.10 base call into a concrete generic base
+//!   emits malformed IR), so this row does not discriminate #8163.
 module M;
 
 class GB<T> : Exception
