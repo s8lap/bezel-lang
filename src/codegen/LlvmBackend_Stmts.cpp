@@ -2716,11 +2716,26 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // apply OP (overflow-checked like plain arithmetic),
                 // write back.
                 llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
+                // fix #8245 (stdlib §2.5, v0.355; §6.6): the operands' SEMA
+                // types travel with the operands, so `emitCompoundOp`'s
+                // DateTime / TimeSpan arm can apply stdlib §2.5's tick-domain
+                // check. §6.6: "the statement `x op= e` is equivalent to `x :=
+                // x op e` with the target evaluated once" — so this compound
+                // form is the binary operator's computation, and the binary
+                // operator raises `OverflowException` when the result falls
+                // outside `MinValue..MaxValue`. Before this the check was
+                // reachable only for a LOCAL target (sema's #8059 rewrite
+                // lowers a bare identifier's `x op= e` into `x := x op e`,
+                // and it is deliberately limited to bare identifiers because
+                // §6.6 requires the target to be evaluated exactly once), so
+                // a FIELD, a STATIC FIELD, an ARRAY ELEMENT and every other
+                // non-local lvalue stored the out-of-range tick word.
                 llvm::Value* res = emitCompoundOp(
                     op, cur, rhs, elemTy->isFloatingPointTy(),
                     isUnsignedTargetExpr(*as->target),
                     isCharTargetExpr(*as->target),      // §6.6/§5.2 #1961
-                    isUnsignedTargetExpr(*as->value));  // §6.2/§6.6 #2140 rUns
+                    isUnsignedTargetExpr(*as->value),    // §6.2/§6.6 #2140 rUns
+                    ctx_.exprType(*as->target), ctx_.exprType(*as->value));
                 if (res) {
                     invEntry4682();  // §22.16 setter ENTRY (#4682)
                     builder_.CreateStore(res, addr);

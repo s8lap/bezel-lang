@@ -22,9 +22,12 @@ namespace bezel::codegen {
 // DOMAIN is [0, MaxValue], and the `Add*` family, `Add`,
 // `Subtract(span: TimeSpan)`, the `+`/`-` operators with a TimeSpan and
 // `DateTime.FromTicks` raise `OverflowException` when the result falls
-// outside it. The same constant is spelled in LlvmBackend_Calls.cpp, where the
-// MEMBER arms are lowered (the two files are the two arms of one rule).
-static constexpr std::int64_t kDateTimeMaxTicks = 3155378975999999999LL;
+// outside it. fix #8245: the constant now lives in ONE place -- `Emitter::
+// kDateTimeMaxTicks` (LlvmBackend_impl.hpp), beside the tick-layout helpers
+// (`dtTicksOf` / `dtKindBitsOf` / `dtCompose`) it belongs with -- and the
+// three arms of the rule (the `+`/`-` OPERATOR arm here, the MEMBER arm in
+// LlvmBackend_Calls.cpp, and the COMPOUND arm in LlvmBackend_Layout.cpp)
+// share it.
 
 namespace {
 

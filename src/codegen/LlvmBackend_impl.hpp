@@ -6784,6 +6784,13 @@ private:
     // the plain tick count. These four helpers are the ONLY place the layout
     // is spelled in codegen.
     static constexpr std::int64_t kDtTicksMask = 0x3FFFFFFFFFFFFFFFLL;
+    // fix #8245 (stdlib §2.5, v0.355): the DateTime tick DOMAIN's upper
+    // bound -- "MaxValue is the last tick of `9999-12-31` (`Ticks`
+    // 3155378975999999999)" -- the ONE spelling of the constant the three
+    // arms of the rule share (the `+`/`-` OPERATOR arm in
+    // LlvmBackend_Exprs.cpp, the MEMBER arm in LlvmBackend_Calls.cpp, and the
+    // COMPOUND arm in LlvmBackend_Layout.cpp).
+    static constexpr std::int64_t kDateTimeMaxTicks = 3155378975999999999LL;
     // The tick count with the kind bits cleared.
     llvm::Value* dtTicksOf(llvm::Value* v) {
         return builder_.CreateAnd(v, builder_.getInt64(kDtTicksMask), "dt.ticks");
@@ -6866,7 +6873,43 @@ private:
     // per-caller copy — see the arm's own comment in LlvmBackend_Layout.cpp.
     llvm::Value* emitCompoundOp(const std::string& op, llvm::Value* l,
                                 llvm::Value* r, bool fp, bool uns,
-                                bool charTarget = false, bool rUns = false);
+                                bool charTarget = false, bool rUns = false,
+                                // fix #8245 (stdlib §2.5, v0.355; §6.6): the
+                                // operands' SEMA types, so the DateTime /
+                                // TimeSpan arm can recognise the stdlib value
+                                // builtins — the tick-domain check is a
+                                // property of the TYPES, and the lowered i64
+                                // word alone cannot say whether it is a
+                                // DateTime or a plain `long`. A null type on
+                                // either side (the `++`/`--` spelling has no
+                                // RHS node) simply finds no stdlib value
+                                // builtin, so the arm declines.
+                                const sema::TypeRef* leftTy = nullptr,
+                                const sema::TypeRef* rightTy = nullptr);
+
+    // fix #8245 (stdlib §2.5, v0.355; §6.6): the COMPOUND form of the
+    // stdlib §2.5 DateTime / TimeSpan operators — the arm `emitCompoundOp`
+    // dispatches to when the operands are a `DateTime` and a `TimeSpan` (or
+    // two `TimeSpan`s). §6.6, verbatim: "the statement `x op= e` is
+    // equivalent to `x := x op e` with the target evaluated once" — so the
+    // compound form MUST carry the binary operator's tick-domain check, and
+    // the compound form's result MUST keep the `DateTime` operand's `Kind`.
+    //
+    // stdlib §2.5, verbatim: "The `Add*` family, `Add`, `Subtract(span:
+    // TimeSpan)`, and `DateTime.FromTicks` raise `OverflowException` when the
+    // result falls outside `MinValue..MaxValue`" and "The `Add*` family,
+    // `Add`, `Subtract(span)` and the `+`/`-` operators with a `TimeSpan`
+    // keep the `DateTime` operand's `Kind`" — the `+`/`-` operators are the
+    // operator spelling of `Add` / `Subtract(span: TimeSpan)`, so the
+    // compound form of them raises on the same condition.
+    //
+    // Returns null when the operands are not a stdlib value builtin pair (the
+    // ordinary compound path then owns the computation), and never returns
+    // null for a pair it owns.
+    llvm::Value* emitCompoundDateTimeTimeSpan(const std::string& op,
+                                              llvm::Value* l, llvm::Value* r,
+                                              const sema::TypeRef* leftTy,
+                                              const sema::TypeRef* rightTy);
 
     // fix #2904 (§25.1 / §25.2 / §6.6, v0.240): the §25 USER-OPERATOR arm
     // `emitCompoundOp` structurally cannot have — it sees only the two lowered

@@ -486,13 +486,110 @@ llvm::Value* Emitter::emitCompoundOpTyped(const std::string& op, llvm::Value* l,
         fitUserOperatorArgs(om, args, {leftTy, rightTy}, /*unwrap=*/true);
         return emitMethodCall(om, args, /*baseQualified=*/false);
     }
-    return emitCompoundOp(op, l, r, fp, uns, charTarget, rUns);
+    // fix #8245 (stdlib §2.5, v0.355; §6.6): thread the operands' SEMA
+    // types into `emitCompoundOp` so its DateTime / TimeSpan arm can see
+    // them — the tick-domain check is a property of the TYPES, and the
+    // lowered i64 word alone cannot say whether it is a DateTime or a plain
+    // `long`. A null type on either side (the `++`/`--` spelling has no RHS
+    // node) simply finds no stdlib value builtin, so the arm declines.
+    return emitCompoundOp(op, l, r, fp, uns, charTarget, rUns, leftTy, rightTy);
 }
 
 
+// fix #8245 (stdlib §2.5, v0.355; §6.6): the COMPOUND form of stdlib §2.5's
+// DateTime / TimeSpan operators — the arm `emitCompoundOp` dispatches to.
+//
+// §6.6, verbatim: "the statement `x op= e` is equivalent to `x := x op e` with
+// the target evaluated once". The compound form IS the binary operator's
+// computation, so it carries the binary operator's tick-domain check.
+//
+// stdlib §2.5, verbatim: "The `Add*` family, `Add`, `Subtract(span:
+// TimeSpan)`, and `DateTime.FromTicks` raise `OverflowException` when the
+// result falls outside `MinValue..MaxValue`: the condition is a data-dependent
+// overflow of the tick domain" and "`DateTime.MinValue` is `0001-01-01T00:00:00`
+// (`Ticks` 0) and `MaxValue` is the last tick of `9999-12-31` (`Ticks`
+// 3155378975999999999), so every valid set of components names a value between
+// them."
+//
+// And of the operators' `Kind` rule: "The `Add*` family, `Add`, `Subtract(span)`
+// and the `+`/`-` operators with a `TimeSpan` keep the `DateTime` operand's
+// `Kind`" — so the compound form's result keeps it too.
+//
+// THE TWO SHAPES. A `DateTime` is one i64 — the tick count in bits 0..61 and
+// the `Kind` in bits 62..63 (dtTicksOf / dtKindBitsOf) — so the arithmetic runs
+// over the TICK COUNTS and the result is re-composed with the operand's kind
+// bits. A `TimeSpan` is one i64 too, but a PLAIN tick count (its domain is
+// the whole signed 64-bit range: `MinValue` is `FromTicks(long.MinValue)` and
+// `MaxValue` is `FromTicks(long.MaxValue)`), so its check is the ordinary i64
+// overflow check the binary operator applies.
+//
+// The bounds are computed in i64 -- EXACT, where a double bound would round at
+// these magnitudes -- so an admitted result can never wrap: `base + delta` is
+// in the domain exactly when `delta` is in [-base, MaxValue - base], and
+// `base - delta` is in the domain exactly when `delta` is in [base - MaxValue,
+// base]. This is the very arithmetic `lowerBinary`'s DateTime arm performs
+// (LlvmBackend_Exprs.cpp), which is why the two agree by construction.
+//
+// Returns null when the operands are not a stdlib value builtin pair — the
+// ordinary compound path then owns the computation.
+llvm::Value* Emitter::emitCompoundDateTimeTimeSpan(const std::string& op,
+                                                    llvm::Value* l, llvm::Value* r,
+                                                    const sema::TypeRef* leftTy,
+                                                    const sema::TypeRef* rightTy) {
+    if (!l || !r) return nullptr;
+    if (!leftTy || !rightTy) return nullptr;
+    if (op != "+" && op != "-") return nullptr;
+    // A DateTime / TimeSpan is one i64 (a tick count); anything else is not
+    // this arm's computation.
+    if (!l->getType()->isIntegerTy(64) || !r->getType()->isIntegerTy(64))
+        return nullptr;
+    const sema::TypeRef* lt = resolveTypeParamRef(leftTy);
+    const sema::TypeRef* rt = resolveTypeParamRef(rightTy);
+    if (!lt || !rt) return nullptr;
+    const std::string_view ln = builtinTypeName(lt);
+    const std::string_view rn = builtinTypeName(rt);
+    if (ln.empty() || rn.empty()) return nullptr;
+    const bool dtOpSpan = (ln == "DateTime" && rn == "TimeSpan");
+    const bool spanOpSpan = (ln == "TimeSpan" && rn == "TimeSpan");
+    if (!dtOpSpan && !spanOpSpan) return nullptr;
+    if (dtOpSpan) {
+        // DateTime +- TimeSpan: the tick domain is [0, MaxValue] and the
+        // result keeps the DateTime operand's Kind.
+        llvm::Value* base = dtTicksOf(l);
+        llvm::Value* delta = r;
+        llvm::Value* ticks = nullptr;
+        if (op == "+") {
+            llvm::Value* lo = builder_.CreateNeg(base, "dt.cplus.lo");
+            llvm::Value* hi = builder_.CreateSub(
+                builder_.getInt64(kDateTimeMaxTicks), base, "dt.cplus.hi");
+            llvm::Value* inRange = builder_.CreateAnd(
+                builder_.CreateICmpSGE(delta, lo),
+                builder_.CreateICmpSLE(delta, hi));
+            emitGuardThrow(builder_.CreateNot(inRange), "OverflowException");
+            ticks = builder_.CreateAdd(base, delta, "dt.cplus");
+        } else {
+            llvm::Value* lo = builder_.CreateSub(
+                base, builder_.getInt64(kDateTimeMaxTicks), "dt.cminus.lo");
+            llvm::Value* inRange = builder_.CreateAnd(
+                builder_.CreateICmpSGE(delta, lo),
+                builder_.CreateICmpSLE(delta, base));
+            emitGuardThrow(builder_.CreateNot(inRange), "OverflowException");
+            ticks = builder_.CreateSub(base, delta, "dt.cminus");
+        }
+        return dtCompose(ticks, dtKindBitsOf(l));
+    }
+    // TimeSpan +- TimeSpan: the domain IS the signed 64-bit tick range, so the
+    // check is the i64 overflow check the binary operator applies (stdlib
+    // §2.5's "the fault `TimeSpan`'s arithmetic above already raises").
+    return op == "+"
+               ? emitCheckedArith(llvm::Intrinsic::sadd_with_overflow, l, r)
+               : emitCheckedArith(llvm::Intrinsic::ssub_with_overflow, l, r);
+}
+
 llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
                             llvm::Value* r, bool fp, bool uns, bool charTarget,
-                            bool rUns) {
+                            bool rUns, const sema::TypeRef* leftTy,
+                            const sema::TypeRef* rightTy) {
     // §7.11 (#2888): a nullable VALUE left operand. It must be tested FIRST —
     // ahead of the char arm, which would otherwise hand the whole tagged struct
     // to emitCharRangeCheck, and ahead of the integer tail, which handed it to
@@ -563,8 +660,13 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
             // narrowing cases are handled by the recursion itself, exactly as
             // on the non-nullable path.
             rPay = coerceNumericToType(rPay, payTy, rUns);
+            // fix #8245 (stdlib §2.5, v0.355): the operands' TYPES travel down
+            // the recursion, so the DateTime / TimeSpan arm below sees them on
+            // the PAYLOADS (the lifted `DateTime?` / `TimeSpan?` pair) and
+            // applies the §2.5 tick-domain check to the unwrapped values —
+            // §7.11's lifting lifts the OPERATOR, so it lifts its check too.
             pay = emitCompoundOp(op, lPay, rPay, payTy->isFloatingPointTy(),
-                                 uns, charTarget, rUns);
+                                 uns, charTarget, rUns, leftTy, rightTy);
         }
         // The payload op may have spun off guard-throw blocks (§6.1 overflow,
         // §5.2 char range, §6.1 divide-by-zero), so the PHI's predecessor is
@@ -669,6 +771,40 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
         if (r->getType() != decimalStructType()) return nullptr;
         return emitDecimalArith(op, l, r);
     }
+    // fix #8245 (stdlib §2.5, v0.355; §6.6): the COMPOUND form of stdlib
+    // §2.5's DateTime / TimeSpan operators.
+    //
+    // §6.6, verbatim: "the statement `x op= e` is equivalent to `x := x op e`
+    // with the target evaluated once" — so the compound form IS the binary
+    // operator's computation and must carry the binary operator's
+    // tick-domain check.
+    //
+    // stdlib §2.5, verbatim: "The `Add*` family, `Add`, `Subtract(span:
+    // TimeSpan)`, and `DateTime.FromTicks` raise `OverflowException` when the
+    // result falls outside `MinValue..MaxValue`" — and the `+`/`-` operators
+    // with a `TimeSpan` are the operator spelling of `Add` / `Subtract(span:
+    // TimeSpan)`, so the compound form of them raises on the same condition.
+    //
+    // WHY THE ARM LIVES HERE. The check was on the BINARY operator's arm only
+    // (LlvmBackend_Exprs.cpp's `lowerBinary`), and the LOCAL spelling reached
+    // it only because sema's #8059 rewrite lowers a bare identifier's
+    // `x op= e` into `x := x op e` — a rewrite it deliberately limits to bare
+    // identifiers, because §6.6 requires the target to be evaluated exactly
+    // once and a field / property / element target's receiver cannot be
+    // evaluated twice. Every OTHER lvalue kind therefore computed a raw i64
+    // tick addition and stored the out-of-range word (MEASURED on r30-c1:
+    // `h.D += span` on a `DateTime.MaxValue` field stored
+    // 3155378976000000000 — MaxValue + 1 tick — with no raise, while the
+    // local spelling raised). This function is the ONE funnel every compound
+    // assignment already passes through, so the arm belongs here.
+    //
+    // The types are the CALLER's to supply (the lowered i64 word cannot say
+    // whether it is a DateTime or a plain `long`); a caller with none — the
+    // `++`/`--` spelling, whose operand sema restricts to the built-in
+    // numerics — simply finds no stdlib value builtin and the arm declines.
+    if (llvm::Value* v =
+            emitCompoundDateTimeTimeSpan(op, l, r, leftTy, rightTy))
+        return v;
     // §4.6 (#857): string compound concatenation when BOTH operands are string
     // pointers (e.g. an indexer/property `s[i] += t`). A string is a pointer, not
     // a number, so the integer checked-add intrinsic below emits malformed IR.

@@ -5374,11 +5374,19 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         // the math end-to-end.
         rhs = coerceNumericToType(rhs, valLlvm,
                                   isUnsignedTargetExpr(*as.value));
+        // fix #8245 (stdlib §2.5, v0.355; §6.6): the operands' SEMA types
+        // travel with the operands, so `emitCompoundOp`'s DateTime / TimeSpan
+        // arm can apply stdlib §2.5's tick-domain check to a `DateTime`
+        // element (§6.6: "the statement `x op= e` is equivalent to `x := x op
+        // e`"). The LEFT type is the CONTAINER's value type -- this branch's
+        // own authority for what a `d[k]` element is -- exactly as for the
+        // §25.2 overload lookup above.
         llvm::Value* newVal = emitCompoundOp(
             op, cur, rhs, valLlvm->isFloatingPointTy(),
             isUnsignedTargetExpr(*as.target),
             isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
-            isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
+            isUnsignedTargetExpr(*as.value),    // §6.2 #2140 rUns
+            valTy, ctx_.exprType(*as.value));
         if (!newVal) return false;
         // fix #2596 (§23.4 / §28.9 / §4.6, v0.236): the DICT compound-assignment
         // leak on a borrowing Dictionary<K,string> (and SortedDictionary<K,string>).
@@ -5506,10 +5514,10 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
     // branch's own authority for what `arr[i]` is); the write-back below stays
     // local for the §17.6 single-evaluation reason stated there.
     llvm::Value* newVal = nullptr;
+    const sema::TypeRef* elemTyRef =
+        (recvTy && !recvTy->genericArgs.empty())
+            ? recvTy->genericArgs[0] : nullptr;
     {
-        const sema::TypeRef* elemTyRef =
-            (recvTy && !recvTy->genericArgs.empty())
-                ? recvTy->genericArgs[0] : nullptr;
         sema::MethodSymbol* opMethod = findCompoundOperatorOverload(
             op, elemTyRef, ctx_.exprType(*as.value),
             ctx_.stmtOperatorSymbol(as));
@@ -5533,20 +5541,25 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
 
     // Non-overload path: compute the new value with the built-in operator.
     if (!newVal) {
+        // fix #8245 (stdlib §2.5, v0.355; §6.6): the operands' SEMA types
+        // travel with the operands, so `emitCompoundOp`'s DateTime / TimeSpan
+        // arm can apply stdlib §2.5's tick-domain check to a `DateTime`
+        // element (§6.6: "the statement `x op= e` is equivalent to `x := x op
+        // e`"). The LEFT type is the CONTAINER's element type -- this
+        // branch's own authority for what `arr[i]` is -- exactly as for the
+        // §25.2 overload lookup above.
         newVal = emitCompoundOp(
             op, cur, rhs, elemTy->isFloatingPointTy(),
             isUnsignedTargetExpr(*as.target),
             isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
-            isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
+            isUnsignedTargetExpr(*as.value),    // §6.2 #2140 rUns
+            elemTyRef, ctx_.exprType(*as.value));
         if (!newVal) return false;
     }
 
     // --- Lift nullable-value-typed result (mirrors lowerCollectionIndexerSet
     //     fix #455 / §4.5). ---
     {
-        const sema::TypeRef* elemTyRef =
-            (recvTy && !recvTy->genericArgs.empty())
-            ? recvTy->genericArgs[0] : nullptr;
         if (elemTyRef && isNullableValueTy(elemTyRef)) {
             llvm::StructType* expected = nullableValueStructTy(elemTyRef);
             if (expected && newVal->getType() != expected) {
