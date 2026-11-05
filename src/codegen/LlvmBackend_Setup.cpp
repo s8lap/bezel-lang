@@ -37197,6 +37197,58 @@ struct ClosureEscapeWalker {
         return true;
     }
 
+    // fix #8058 (§8.1 / §8.5 / §26.2 / §27.6 / §28.9, v0.355): walk a CALL's
+    // CALLEE position, where a member access's RECEIVER is read as a BORROW
+    // for the call's duration rather than as an escape.
+    //
+    // §26.2 (v0.355) closes the extendable list against function types —
+    // "Function types" are in the *What cannot be extended* list — so a
+    // function value's member surface is exactly `Object`'s: §8.5's `ToString`
+    // rendering and §8.2's `GetType`. BOTH are compiler-provided intrinsics:
+    // NO user code runs on the receiver, so the call cannot store it anywhere
+    // that outlives the call, and the receiver's own +1 stays in the
+    // receiver's slot. A scope-end release of that slot is therefore sound,
+    // and the closure cell is RECLAIMED instead of leaked.
+    //
+    // BEFORE this, the walker's `MemberAccessExpr` arm forced `safeRead=false`
+    // on the receiver, on the stated premise that "Member access / indexing /
+    // interpolation do not apply to a function value". §8.1 (v0.355)
+    // invalidates that premise: a function type reaches `Object` "via [its]
+    // reference-type heap representation", and §8.5 (v0.355) renders a
+    // function value through `Object.ToString()` — so the shape is not merely
+    // possible, it is the DOCUMENTED rendering route, and #7592's fix made it
+    // a tested one. The consequence was MEASURED on the base tree: the
+    // 64-byte closure cell behind a `var g := lambda(...) => ...;` local was
+    // never reclaimed at exit ("SUMMARY: AddressSanitizer: 64 byte(s) leaked
+    // in 1 allocation(s)"), although §28.9 (v0.355) assigns the function
+    // value's lifetime to the runtime — "Runtime management governs the
+    // *function value itself* — the heap-allocated closure object that backs
+    // it".
+    //
+    // The relaxation is deliberately confined to the CALLEE position. A member
+    // access that is NOT called is a §27.6 METHOD-REFERENCE FORMATION, which
+    // CAPTURES the receiver into the formed closure — a different lifetime
+    // rule — so that position keeps the conservative escape. (MEASURED: a
+    // method reference over a function-value receiver does not lower at all
+    // today — the local degrades to a zero-initialized value and the #2434
+    // warning fires — so no WORKING program reaches that position; the
+    // conservative treatment is kept there anyway.)
+    //
+    // Every other callee shape (a bare identifier `f(...)`, a conditional
+    // callee, a `f!` callee) keeps the existing treatment: the callee is a
+    // non-consuming read.
+    void exprCallee(const ast::Expr* callee) {
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(callee)) {
+            expr(m->target.get(), /*safeRead=*/true);
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(callee)) {
+            expr(m->target.get(), /*safeRead=*/true);
+            return;
+        }
+        expr(callee, /*safeRead=*/true);
+    }
+
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e) return;
         // fix #2107-follow-up / lane-35 narrow (#4422, §27.5 / §28.9, v0.298):
@@ -37313,7 +37365,7 @@ struct ClosureEscapeWalker {
                 }
             }
             scanCalleePosition(c->callee.get());  // fix #3805 (+ follow-up)
-            expr(c->callee.get(), /*safeRead=*/true);
+            exprCallee(c->callee.get());  // fix #8058 (member-access receiver)
             for (std::size_t ai = 0; ai < c->args.size(); ++ai) {
                 bool safeArg = getOrAddFactoryTargetSafe && ai == 1;
                 // narrow #5129 (§27.5 / §28.3 / §28.14, v0.313): a bare
@@ -37332,7 +37384,7 @@ struct ClosureEscapeWalker {
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
             // `f?(...)` null-conditional call (§27.7): callee is a read.
             scanCalleePosition(c->callee.get());  // fix #3805 (+ follow-up)
-            expr(c->callee.get(), /*safeRead=*/true);
+            exprCallee(c->callee.get());  // fix #8058 (member-access receiver)
             for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
             return;
         }
@@ -37354,9 +37406,24 @@ struct ClosureEscapeWalker {
             expr(t->operand.get(), /*safeRead=*/true);
             return;
         }
-        // Member access / indexing / interpolation do not apply to a function
-        // value; treat any contained occurrence conservatively as an ESCAPE
-        // (safeRead=false) rather than recognize a safe read that cannot occur.
+        // A member access NOT in callee position, an indexing, and an
+        // interpolation: treat any contained occurrence conservatively as an
+        // ESCAPE (safeRead=false).
+        //
+        // fix #8058 (§8.1 / §8.5 / §26.2 / §27.6 / §28.9, v0.355): the
+        // CALLEE-position member access (`g.ToString()`) is handled by
+        // `exprCallee` above — its RECEIVER is a borrow for the call's
+        // duration, not an escape. This arm now covers only the REMAINING
+        // positions, where a member access is a §27.6 METHOD-REFERENCE
+        // FORMATION that CAPTURES the receiver into the formed closure — a
+        // different lifetime rule, so the conservative escape stays. (The
+        // premise this arm used to state — "Member access / indexing /
+        // interpolation do not apply to a function value" — was false: §8.1
+        // makes a function type reach `Object` "via [its] reference-type heap
+        // representation" and §8.5 renders it through `Object.ToString()`, so
+        // the member-access shape is the DOCUMENTED rendering route. See
+        // `exprCallee`'s comment for the measured 64-byte cell leak this
+        // caused.)
         if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
             expr(m->target.get(), /*safeRead=*/false);
             return;
