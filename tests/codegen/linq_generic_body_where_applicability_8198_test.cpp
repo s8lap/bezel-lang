@@ -420,11 +420,11 @@ BEZEL_TEST(codegen_linq_generic_body_where_applicability_8198,
 BEZEL_TEST(codegen_linq_generic_body_where_applicability_8198,
            extending_interface_bound_keeps_the_builtin_sum) {
     JitResult r = runAotChecked(extendingInterfaceBoundSum());
+    // #8223 fixed: the strict oracle (the program must run and print 11).
+    BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(r.stdoutText == "4040\n");
-    if (r.ran) {
-        BEZEL_EXPECT_EQ(r.exitCode, 0);
-        BEZEL_EXPECT_EQ(r.stdoutText, "11\n");
-    }
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "11\n");
 }
 
 // ---------------------------------------------------------------------------

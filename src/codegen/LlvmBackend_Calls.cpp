@@ -5002,6 +5002,77 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             const bool relCl = argIsInlineLambda(0);
             llvm::Type* elemTy = getElemTy();
 
+            // fix #8223 (stdlib §5.1, spec §11.8 / §14.2 *Interface
+            // conformance*, v0.355): the no-selector `Sum(): owned T` is the
+            // `INumber<T>` accumulation `acc := T.Zero(); acc := acc + el` —
+            // for a USER record conformer both are the conformer's own static
+            // members, not a primitive `add`. The arms below are primitive-only
+            // (their accumulator is an int/float/decimal slot), so a record
+            // element reached `add i32, %record.Money` and failed IR
+            // verification. The element type is read through the generic
+            // substitution (`resolveTypeParamRef`): inside a generic body
+            // `Array<T>` at T=Money is lowered per instantiation.
+            if (call.args.empty() && recvTy && !recvTy->genericArgs.empty() &&
+                recvTy->genericArgs[0]) {
+                const sema::TypeRef* rawElem =
+                    resolveTypeParamRef(recvTy->genericArgs[0]);
+                if (rawElem && rawElem->kind == sema::TypeRef::Kind::Named &&
+                    !rawElem->nullable && rawElem->declaration &&
+                    rawElem->declaration->kind == ast::TypeDeclKind::Record) {
+                    sema::MethodSymbol* zeroM = nullptr;
+                    sema::MethodSymbol* plusM = nullptr;
+                    for (sema::Symbol* sm : rawElem->declaration->members) {
+                        auto* cand = dynamic_cast<sema::MethodSymbol*>(sm);
+                        if (!cand) continue;
+                        if (cand->isOperator && cand->operatorToken == "+" &&
+                            cand->params.size() == 2)
+                            plusM = cand;
+                        else if (!cand->isOperator && cand->name == "Zero" &&
+                                 cand->params.empty())
+                            zeroM = cand;
+                    }
+                    if (zeroM && plusM) {
+                        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                        llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                        auto* idxSlot = entryAlloca(i64());
+                        auto* accSlot = entryAlloca(elemTy);
+                        builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                        std::vector<llvm::Value*> zargs;
+                        llvm::Value* zero =
+                            emitMethodCall(zeroM, zargs, /*baseQualified=*/false);
+                        if (!zero) return nullptr;
+                        builder_.CreateStore(zero, accSlot);
+                        auto* condBB = llvm::BasicBlock::Create(llvm_, "sum.c", currentFn_);
+                        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sum.b", currentFn_);
+                        auto* endBB  = llvm::BasicBlock::Create(llvm_, "sum.e", currentFn_);
+                        builder_.CreateBr(condBB);
+                        builder_.SetInsertPoint(condBB);
+                        llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                        builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len),
+                                              bodyBB, endBB);
+                        builder_.SetInsertPoint(bodyBB);
+                        auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                               {ptrTy(), i64(), i64()});
+                        llvm::Value* ep = builder_.CreateCall(
+                            ptrFn, {recv, idx, builder_.getInt64(esz)});
+                        llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                        llvm::Value* acc = builder_.CreateLoad(elemTy, accSlot);
+                        std::vector<llvm::Value*> pargs{acc, el};
+                        llvm::Value* next =
+                            emitMethodCall(plusM, pargs, /*baseQualified=*/false);
+                        if (!next) return nullptr;
+                        builder_.CreateStore(next, accSlot);
+                        builder_.CreateStore(
+                            builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                        builder_.CreateBr(condBB);
+                        builder_.SetInsertPoint(endBB);
+                        freeLazyTemp();
+                        freeFreshInputTemp();
+                        return builder_.CreateLoad(elemTy, accSlot, "sum.r");
+                    }
+                }
+            }
+
             // fix #666 / stdlib §5: decimal Sum — element/selector result is a
             // 16-byte %bz.decimal struct; accumulate via bz_decimal_add into an
             // alloca'd slot (pointer-based ABI, same as all other decimal ops).
