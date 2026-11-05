@@ -58,14 +58,23 @@
 // value through `Object.ToString()` — so the member-access shape is the
 // DOCUMENTED rendering route (issue #7592's own regression row exercises it).
 //
-// WHY THE RECEIVER MAY BE RELEASED AT SCOPE END. §26.2 (v0.355) closes the
-// extendable list against function types ("What cannot be extended: […]
-// Function types"), so a function value's member surface is exactly
-// `Object`'s — §8.5's `ToString` rendering and §8.2's `GetType` — and BOTH
-// are compiler-provided intrinsics: no user code runs on the receiver, so the
-// call cannot store it anywhere that outlives the call. The receiver's own
-// reference stays in the receiver's slot, and the slot's scope-end release is
-// therefore exactly-once and free of any dangling alias.
+// WHEN THE RECEIVER MAY BE RELEASED AT SCOPE END — and when it may NOT.
+// §8.1 (v0.355) declares `Object`'s instance surface as `GetType`, `Equals`,
+// `GetHashCode` and `ToString`, with "method bodies ... provided by the
+// runtime"; §26.5 rule 1 ("Instance members win — by name") sends every call
+// spelled with one of those names to that body, never to an extension. No
+// user code runs on the receiver, so the call cannot store it anywhere that
+// outlives the call: the receiver's own reference stays in its slot, and the
+// slot's scope-end release is exactly-once. §28.3.8 clause 4 (v0.355) draws
+// the same line: "A function value as the receiver of a member `Object`
+// declares (`f.ToString()`, `f.GetHashCode()`, an interpolation hole) is not
+// at a set-erasing position; as the receiver of an extension call whose head
+// is `Object` [...] it is". An `extension Object` member is USER code that
+// "may pass [`this`] on to a parameter that stores it" (§9.7, v0.355), so
+// its receiver keeps the conservative ESCAPE. The first version of this fix
+// (83c9a9cd) relaxed EVERY member call and turned an extension's stored
+// alias into a heap-use-after-free; the FIX-FORWARD rows at the end of this
+// file pin that line.
 //
 // ── THE ORACLE ─────────────────────────────────────────────────────────────
 // The defect is a LEAK, so the oracle is the STRICT harness (`runAotChecked`):
@@ -98,7 +107,7 @@
 // it would measure THAT defect instead of #8058's. The generated-code
 // AddressSanitizer stays ON, so a double free is still caught.
 //
-// Spec: §28.9 (v0.355), §8.1, §8.5, §26.2, §27.6, §28.3, §28.14, stdlib §2.1
+// Spec: §28.9 (v0.355), §8.1, §8.5, §9.7, §26.2, §26.5, §26.7, §27.6, §28.3, §28.3.8, §28.14, stdlib §2.1
 // (v0.355).
 
 #include <iostream>
@@ -174,6 +183,35 @@ std::string repeated(const std::string& line, int n) {
     std::string out;
     for (int i = 0; i < n; ++i) out += line;
     return out;
+}
+
+// fix-forward of #8058 (§28.3.8 clause 4, v0.355): the oracle for a program
+// the spec REJECTS but the compiler still ACCEPTS today. A capture-bearing
+// function value at the receiver of an extension call whose head is `Object`
+// is at a set-erasing position ("as the receiver of an extension call whose
+// head is `Object` [...] it is", §28.3.8 clause 4), and an extension body may
+// not store `this` (§26.7); neither is enforced yet (#7259, #7704). So the
+// row accepts EITHER outcome the spec allows a future compiler to reach — a
+// genuine compile-time rejection naming §28.3 or §26.7 — OR, while the
+// program is still accepted, pins the one property THIS fix owns: the
+// producing local's scope-end release must not free the closure cell while
+// the extension's alias still lives (no heap-use-after-free, no double
+// free). These programs ALSO crash on a PRE-EXISTING, separate defect — the
+// `Object` view of a function value reached through an extension's `this`
+// is misread (#7247 family; MEASURED identical on the base tree 8845ad4e:
+// `System.OverflowException` or an ASan SEGV inside `bz_string_release`) —
+// so a clean run is NOT asserted; the row asserts only the absence of the
+// use-after-free this fix's predecessor 83c9a9cd introduced.
+void expectRejectedOrNoClosureUseAfterFree(const JitResult& r) {
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    if (bezel::test::failedAtCompileTimeWithRealLocation(r)) {
+        BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, "§28.3") ||
+                          bezel::test::diagnosticMessageContains(r, "§26.7"));
+        return;
+    }
+    BEZEL_EXPECT_FALSE(bezel::test::diagnosticMessageContains(r, "heap-use-after-free"));
+    BEZEL_EXPECT_FALSE(bezel::test::diagnosticMessageContains(r, "double-free"));
+    BEZEL_EXPECT_FALSE(bezel::test::diagnosticMessageContains(r, "attempting free on address"));
 }
 
 }  // namespace
@@ -454,11 +492,14 @@ class P
   end Main;
 end P;
 )BZL");
-    // The program must be REJECTED (it never runs), and the diagnostic must
-    // name §28.14 — the rule that makes the storing shape unreachable.
-    BEZEL_EXPECT_FALSE(r.ran);
-    const std::string text = diagnosticText(r);
-    BEZEL_EXPECT_TRUE(text.find("§28.14") != std::string::npos);
+    // The program must be REJECTED BY THE COMPILER at a real source location
+    // (never a crash, a signal, a timeout or an ASan report — `r.ran` alone
+    // cannot tell those apart, #3892), and the diagnostic must be §28.14's
+    // call-bounded-parameter rule — the rule that makes the storing shape
+    // unreachable.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, "is call-bounded"));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, "§28.14"));
 }
 
 // ===========================================================================
@@ -491,4 +532,438 @@ class P
 end P;
 )BZL"),
                   "");
+}
+
+// ###########################################################################
+// FIX-FORWARD ROWS (review of 83c9a9cd). 83c9a9cd relaxed the receiver of
+// EVERY callee-position member access; the relaxation is sound only for a
+// member `Object` itself DECLARES (§8.1: GetType, Equals, GetHashCode,
+// ToString). An EXTENSION call whose head is `Object` — which §26.5 rule 2
+// reaches from a function-typed receiver — runs USER code that "may pass
+// [`this`] on to a parameter that stores it" (spec §9.7, v0.355), and
+// §28.3.8 clause 4 (v0.355) names that receiver set-erasing. Arming the
+// scope-end release there freed the cell while the extension's alias lived
+// (MEASURED at 83c9a9cd: heap-use-after-free, freed by `bz_closure_release`).
+// ###########################################################################
+
+// ===========================================================================
+// FIX-FORWARD 1 — the review's r24: an `extension Object` member returns
+// `this` (non-owned, which §26.7 permits) and the caller STORES the result
+// in an `Array<Object>`. The function value is CAPTURE-FREE, so §28.3.8's
+// set-erasing check admits it: the program is LEGAL. The stored alias is the
+// closure cell itself, so the producing local must NOT release the cell at
+// scope end.
+//
+// The final read is `o.GetHashCode()` rather than the review probe's
+// `o.ToString()`: `ToString()` on that Object view crashes on a PRE-EXISTING,
+// separate defect (#7247 family — MEASURED identical on the base tree
+// 8845ad4e and on this fix: ASan SEGV inside `bz_string_release`).
+// `GetHashCode()` reads the stored object, so a freed cell is caught.
+//
+// MEASURED at 83c9a9cd: heap-use-after-free (freed by `bz_closure_release`).
+// AFTER the fix-forward: "100", no AddressSanitizer report.
+// The LEAK oracle is off (lenient harness): the escaped cells are never
+// released by anything (MEASURED: 97–98 × 64 B — the conservative escape's
+// PRE-EXISTING leak, the same code path as the base tree's for a non-`Object`
+// member name), a separate defect from the use-after-free this row pins.
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           an_extension_object_self_result_stored_keeps_the_closure_cell_alive) {
+    expectNoMemoryError(runAotCheckedLenient(R"BZL(
+module M;
+extension Object
+  public method Self(): Object => this;
+end;
+class P
+  public static method Run(xs: Array<Object>): int
+    var g: (int)->int := lambda(x: int) => x + 1;
+    xs.Add(g.Self());
+    return 0;
+  end Run;
+  public static method Main(): int
+    var xs := new Array<Object>();
+    var i: int := 0;
+    while i < 100 do
+      _ := P.Run(xs);
+      i := i + 1;
+    end;
+    var n: int := 0;
+    for var o in xs do
+      if o.GetHashCode() = o.GetHashCode() then n := n + 1; end;
+    end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                        "100\n");
+}
+
+// ===========================================================================
+// FIX-FORWARD 2 — the review's r18, capture-free: `return g.Self();` hands
+// the closure cell itself to the caller through an `Object`-typed return.
+// The producing local must not release it at scope end; the caller reads it.
+//
+// MEASURED at 83c9a9cd: heap-use-after-free. AFTER: "100", no ASan report.
+// Lenient harness: the returned Object view's +1 is never released
+// (MEASURED 100 × 64 B — pre-existing, the conservative escape's leak).
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           an_extension_object_self_result_returned_keeps_the_closure_cell_alive) {
+    expectNoMemoryError(runAotCheckedLenient(R"BZL(
+module M;
+extension Object
+  public method Self(): Object => this;
+end;
+class P
+  public static method Make(): Object
+    var g: (int)->int := lambda(x: int) => x + 1;
+    return g.Self();
+  end Make;
+  public static method Main(): int
+    var i: int := 0;
+    var n: int := 0;
+    while i < 100 do
+      var o := P.Make();
+      if o.GetHashCode() = o.GetHashCode() then n := n + 1; end;
+      i := i + 1;
+    end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                        "100\n");
+}
+
+// ===========================================================================
+// FIX-FORWARD 3 — the review's r25: the extension BODY stores `this`
+// (`xs.Add(this)`). §26.7 (v0.355) forbids it ("extensions cannot store
+// `this`") but the compiler does not enforce it yet (#7704). So a
+// compile-time rejection naming §26.7 is accepted; while the program is
+// still accepted it must not read a freed cell.
+//
+// MEASURED at 83c9a9cd: heap-use-after-free. AFTER: "100", no ASan report.
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           an_extension_object_body_storing_this_keeps_the_closure_cell_alive) {
+    const JitResult r = runAotCheckedLenient(R"BZL(
+module M;
+extension Object
+  public method KeepIn(xs: Array<Object>): int
+    xs.Add(this);
+    return 0;
+  end KeepIn;
+end;
+class P
+  public static method Run(xs: Array<Object>): int
+    var g: (int)->int := lambda(x: int) => x + 1;
+    return g.KeepIn(xs);
+  end Run;
+  public static method Main(): int
+    var xs := new Array<Object>();
+    var i: int := 0;
+    while i < 100 do
+      _ := P.Run(xs);
+      i := i + 1;
+    end;
+    var n: int := 0;
+    for var o in xs do
+      if o.GetHashCode() = o.GetHashCode() then n := n + 1; end;
+    end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL");
+    if (bezel::test::failedAtCompileTimeWithRealLocation(r)) {
+        BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, "§26.7"));
+    } else {
+        expectNoMemoryError(r, "100\n");
+    }
+}
+
+// ===========================================================================
+// FIX-FORWARD — the review's r19 (`xs.Add(g.Self())`, capture-bearing), verbatim.
+// The program is one §28.3.8 clause 4 rejects (#7259 / #7704 open), and it
+// crashes on the pre-existing Object-view defect on the base tree too
+// (MEASURED 8845ad4e and this fix: `System.OverflowException`, exit 70). See
+// `expectRejectedOrNoClosureUseAfterFree`.
+//
+// MEASURED at 83c9a9cd: heap-use-after-free, freed by `bz_closure_release`.
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           a_capturing_closure_stored_through_an_extension_object_self_is_not_freed_early) {
+    expectRejectedOrNoClosureUseAfterFree(runAotCheckedLenient(R"BZL(
+module M;
+extension Object
+  public method Self(): Object => this;
+end;
+class P
+  public static method Run(xs: Array<Object>, k: int): int
+    var g: (int)->int := lambda(x: int) => x + k;
+    xs.Add(g.Self());
+    return 0;
+  end Run;
+  public static method Main(): int
+    var xs := new Array<Object>();
+    var i: int := 0;
+    while i < 100 do
+      _ := P.Run(xs, i);
+      i := i + 1;
+    end;
+    var n: int := 0;
+    for var o in xs do n := n + o.ToString().Length; end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"));
+}
+
+// ===========================================================================
+// FIX-FORWARD — the review's r18 (`return g.Self();`, capture-bearing), verbatim.
+// The program is one §28.3.8 clause 4 rejects (#7259 / #7704 open), and it
+// crashes on the pre-existing Object-view defect on the base tree too
+// (MEASURED 8845ad4e and this fix: `System.OverflowException`, exit 70). See
+// `expectRejectedOrNoClosureUseAfterFree`.
+//
+// MEASURED at 83c9a9cd: heap-use-after-free, freed by `bz_closure_release`.
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           a_capturing_closure_returned_through_an_extension_object_self_is_not_freed_early) {
+    expectRejectedOrNoClosureUseAfterFree(runAotCheckedLenient(R"BZL(
+module M;
+extension Object
+  public method Self(): Object => this;
+end;
+class P
+  public static method Make(k: int): Object
+    var g: (int)->int := lambda(x: int) => x + k;
+    return g.Self();
+  end Make;
+  public static method Main(): int
+    var i: int := 0;
+    var n: int := 0;
+    while i < 100 do
+      var o := P.Make(i);
+      n := n + o.ToString().Length;
+      i := i + 1;
+    end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"));
+}
+
+// ===========================================================================
+// FIX-FORWARD — the review's r12 (extension body `xs.Add(this)`, capture-bearing), verbatim.
+// The program is one §28.3.8 clause 4 rejects (#7259 / #7704 open), and it
+// crashes on the pre-existing Object-view defect on the base tree too
+// (MEASURED 8845ad4e and this fix: `System.OverflowException`, exit 70). See
+// `expectRejectedOrNoClosureUseAfterFree`.
+//
+// MEASURED at 83c9a9cd: heap-use-after-free, freed by `bz_closure_release`.
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           a_capturing_closure_stored_by_an_extension_object_body_is_not_freed_early) {
+    expectRejectedOrNoClosureUseAfterFree(runAotCheckedLenient(R"BZL(
+module M;
+extension Object
+  public method KeepIn(xs: Array<Object>): int
+    xs.Add(this);
+    return 0;
+  end KeepIn;
+end;
+class P
+  public static method Run(xs: Array<Object>, k: int): int
+    var g: (int)->int := lambda(x: int) => x + k;
+    return g.KeepIn(xs);
+  end Run;
+  public static method Main(): int
+    var xs := new Array<Object>();
+    var i: int := 0;
+    while i < 100 do
+      _ := P.Run(xs, i);
+      i := i + 1;
+    end;
+    var n: int := 0;
+    for var o in xs do n := n + o.ToString().Length; end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"));
+}
+
+// ###########################################################################
+// FIX-FORWARD CONTROLS: `g.ToString()` (a member `Object` DECLARES — the
+// relaxed position) COMBINED with each escaping shape. The relaxation removes
+// ONE escape source; each of the shapes below must still keep the local
+// escaped, or the scope-end release frees a cell that is still referenced.
+// Each asserts the exact output and no AddressSanitizer report. The leak
+// oracle is armed only where the shape is LSan-clean (the return); the
+// field / capture / collection shapes keep PRE-EXISTING leaks of the escaped
+// reference (MEASURED identical on 8845ad4e, 83c9a9cd and this fix:
+// r01 7600 B / 300, r03 400 B / 100, r04 7448 B / 294 — the review's matrix).
+// ###########################################################################
+
+// ===========================================================================
+// CONTROL — the review's r01: `g.ToString()` then `h.Fn := g;`; the field is
+// called after the producing scope ends.
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           to_string_then_a_field_store_keeps_the_closure_cell_alive) {
+    expectNoMemoryError(runAotCheckedLenient(R"BZL(
+module M;
+class Holder
+  public Fn: (int)->int;
+  public constructor() this.Fn := lambda(x: int) => 0; end constructor;
+end Holder;
+class P
+  public static method Fill(h: Holder, k: int): string
+    var g: (int)->int := lambda(x: int) => x + k;
+    var s := g.ToString();
+    h.Fn := g;
+    return s;
+  end Fill;
+  public static method Main(): int
+    using var h := new Holder();
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do
+      var s := P.Fill(h, i);
+      total := total + h.Fn(1) + s.Length;
+      i := i + 1;
+    end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                        "6250\n");
+}
+
+// ===========================================================================
+// CONTROL — the review's r02: `g.ToString()` then `return g;`. STRICT: the
+// shape is LSan-clean (the caller releases the transferred reference).
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           to_string_then_a_return_keeps_the_closure_cell_alive) {
+    expectNoLeak(runAotChecked(R"BZL(
+module M;
+class P
+  public static method Make(k: int): (int)->int
+    var g: (int)->int := lambda(x: int) => x + k;
+    Console.WriteLine(g.ToString());
+    return g;
+  end Make;
+  public static method Main(): int
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do
+      var f := P.Make(i);
+      total := total + f(1);
+      i := i + 1;
+    end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                 repeated("(int) -> int\n", 100) + "5050\n");
+}
+
+// ===========================================================================
+// CONTROL — the review's r03: `g.ToString()` then `g` captured by a
+// returned lambda, which calls it after the producing scope ends.
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           to_string_then_a_capture_keeps_the_closure_cell_alive) {
+    expectNoMemoryError(runAotCheckedLenient(R"BZL(
+module M;
+class P
+  public static method Make(k: int): () -> int
+    var g: (int)->int := lambda(x: int) => x + k;
+    var s := g.ToString();
+    var h := lambda() => g(s.Length);
+    return h;
+  end Make;
+  public static method Main(): int
+    var i: int := 0;
+    var total: int := 0;
+    while i < 100 do
+      var f := P.Make(i);
+      total := total + f();
+      i := i + 1;
+    end;
+    Console.WriteLine(total.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                        "6150\n");
+}
+
+// ===========================================================================
+// CONTROL — the review's r04: `g.ToString()` then `xs.Add(g)`; every
+// stored element is called after the producing scopes end.
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           to_string_then_a_collection_add_keeps_the_closure_cell_alive) {
+    expectNoMemoryError(runAotCheckedLenient(R"BZL(
+module M;
+class P
+  public static method Fill(xs: Array<(int)->int>, k: int): string
+    var g: (int)->int := lambda(x: int) => x + k;
+    var s := g.ToString();
+    xs.Add(g);
+    return s;
+  end Fill;
+  public static method Main(): int
+    var xs := new Array<(int)->int>();
+    var i: int := 0;
+    var n: int := 0;
+    while i < 100 do
+      n := n + P.Fill(xs, i).Length;
+      i := i + 1;
+    end;
+    var total: int := 0;
+    for var f in xs do
+      total := total + f(1);
+    end;
+    Console.WriteLine(total.ToString() + " " + n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                        "5050 1200\n");
+}
+
+// ===========================================================================
+// POSITIVE — the relaxation covers EVERY member `Object` declares (§8.1),
+// not only `ToString`: `g.GetHashCode()` is §28.3.8 clause 4's own example
+// of a non-set-erasing receiver. STRICT: no leaked cell, looped 100×.
+// MEASURED on this fix: "100", LSan-clean.
+// ===========================================================================
+BEZEL_TEST(closure_cell_member_access_release_8058,
+           get_hash_code_on_a_closure_local_reclaims_the_closure_cell) {
+    expectNoLeak(runAotChecked(R"BZL(
+module M;
+class P
+  public static method Main(): int
+    var i: int := 0;
+    var n: int := 0;
+    while i < 100 do
+      var g: (int)->int := lambda(x: int) => x;
+      if g.GetHashCode() = g.GetHashCode() then n := n + 1; end;
+      i := i + 1;
+    end;
+    Console.WriteLine(n.ToString());
+    return 0;
+  end Main;
+end P;
+)BZL"),
+                 "100\n");
 }
