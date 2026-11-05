@@ -20416,6 +20416,11 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         !disposeStack_.empty()) {
         Disposal d{slot, nullptr};
         d.dictEntryKeyRelease = true;
+        // fix #8232 (stdlib §5 / §4.8, v0.355): §5's `ElementAtOrNull` forms
+        // its `T?` at a dictionary's ELEMENT type, so the local's slot holds
+        // the NULLABLE synthetic entry (the tagged `{i8 hasValue; {K, V}}`
+        // struct) and the Key sits one level down, in the payload.
+        d.dictEntryKeyReleaseNullable = dictEntryLocalIsNullable(init);
         disposeStack_.back().push_back(d);
     }
     // fix #6470 / §28.11 *Collection element ownership*, stdlib §4.8 (v0.338):
@@ -20441,6 +20446,10 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         !disposeStack_.empty()) {
         Disposal d{slot, nullptr};
         d.dictEntryValueRelease = true;
+        // fix #8232 (stdlib §5 / §4.8, v0.355): the nullable sibling of the
+        // Key flag above -- the Value sits at field 1 of the nullable's
+        // `{K, V}` payload.
+        d.dictEntryValueReleaseNullable = dictEntryLocalIsNullable(init);
         disposeStack_.back().push_back(d);
     }
     // fix #1747 / §28.9 / §9.7 / §28.3: if this plain `var` RECORD local was
@@ -41478,6 +41487,12 @@ bool Emitter::isFreshDictEntryKeyReleaseTerminalLocal(
     // SAME method names called on an unrelated `Array<DictionaryEntry<
     // string,V>>` receiver — a completely different codegen path with its
     // own ownership story — would also match on result type alone).
+    //
+    // fix #8232 (stdlib §5 / §4.8, v0.355): `ElementAtOrNull` joins the
+    // set — it is the `T?` sibling of `ElementAt` on the SAME §5 block, and
+    // the isDict block lowers it through the SAME decode (the Key rebuild and
+    // the Value mint are the same), so the rebuilt Key needs the same
+    // scope-end release.
     auto* call = dynamic_cast<const ast::CallExpr*>(view.init);
     if (!call || !call->callee) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
@@ -41487,9 +41502,18 @@ bool Emitter::isFreshDictEntryKeyReleaseTerminalLocal(
     std::string_view mm = ma->member;
     if (mm == "First" || mm == "Last" || mm == "Single")
         return call->args.empty();
-    if (mm == "ElementAt")
+    if (mm == "ElementAt" || mm == "ElementAtOrNull")
         return call->args.size() == 1 && call->args[0].value != nullptr;
     return false;
+}
+
+// fix #8232 (stdlib §5 / §4.8, v0.355): the NULLABLE-form test the two
+// dict-entry release Disposals read — see the declaration in
+// LlvmBackend_impl.hpp.
+bool Emitter::dictEntryLocalIsNullable(const ast::Expr* init) const {
+    if (!init) return false;
+    const sema::TypeRef* rt = ctx_.exprType(*init);
+    return rt && rt->nullable;
 }
 
 // fix #6470 / §28.11 *Collection element ownership*, stdlib §4.8 (v0.338): the
@@ -41529,6 +41553,10 @@ bool Emitter::isFreshDictEntryValueReleaseTerminalLocal(
     // method names LlvmBackend_Calls.cpp's isDict block lowers this way, over
     // a Dictionary/SortedDictionary receiver — the identical condition, spelled
     // identically to the sibling above, so the two cannot drift.
+    //
+    // fix #8232 (stdlib §5 / §4.8, v0.355): `ElementAtOrNull` joins the set
+    // — the isDict block lowers it through the SAME decode, so the minted
+    // Value needs the same scope-end release.
     auto* call = dynamic_cast<const ast::CallExpr*>(view.init);
     if (!call || !call->callee) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
@@ -41538,7 +41566,7 @@ bool Emitter::isFreshDictEntryValueReleaseTerminalLocal(
     std::string_view mm = ma->member;
     if (mm == "First" || mm == "Last" || mm == "Single")
         return call->args.empty();
-    if (mm == "ElementAt")
+    if (mm == "ElementAt" || mm == "ElementAtOrNull")
         return call->args.size() == 1 && call->args[0].value != nullptr;
     return false;
 }

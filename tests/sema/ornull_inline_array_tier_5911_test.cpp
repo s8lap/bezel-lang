@@ -55,10 +55,15 @@
 // The rows below pin the gate at EVERY position the `*OrNull` tier forms its
 // `T?` at, and pin the three ADMITTED shapes the register leaves alone.
 //
-// `ElementAtOrNull` (stdlib §5) has ONE row (R13, the `IEnumerable<T>`
-// receiver): on a CONCRETE collection the compiler does not declare it at
-// all (`Array<T>.ElementAtOrNull` is "no member `ElementAtOrNull` on
-// `Array<T>`"), so there is no signature to be over the register there.
+// `ElementAtOrNull` (stdlib §5) has TWO rows: R13 (the `IEnumerable<T>`
+// receiver) and R13b (the CONCRETE receiver, added by fix #8232). At the
+// base commit the compiler did not declare `ElementAtOrNull` on a concrete
+// collection at all (`Array<T>.ElementAtOrNull` was "no member
+// `ElementAtOrNull` on `Array<T>`"), so there was no signature to be over
+// the register there. fix #8232 (stdlib §5, v0.355) admitted the name on
+// every concrete collection — it is the `T?` sibling of `ElementAt` on the
+// SAME `public extension IEnumerable<T>` block — so the concrete receiver IS
+// over the register now, and R13b pins it.
 
 #include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
@@ -322,6 +327,23 @@ BEZEL_TEST(sema_ornull_inline_array_tier_5911,
              "  var e: IEnumerable<[3]int> := xs;\n"
              "  var v := e.ElementAtOrNull(0);\n"),
         "ElementAtOrNull", "an `IEnumerable` of an inline array");
+}
+
+// R13b — fix #8232 (stdlib §5, v0.355): the CONCRETE receiver. §5's
+// `ElementAtOrNull(index: int): T?` is now admitted on every concrete
+// collection (it is the `T?` sibling of `ElementAt` on the SAME
+// `public extension IEnumerable<T>` block), so `Array<[3]int>.
+// ElementAtOrNull(0)` forms its `T?` at the element type — and an inline
+// array has no nullable form (spec §15.1), so the call is a compile error at
+// the use, naming the member and the receiver.
+BEZEL_TEST(sema_ornull_inline_array_tier_5911,
+           array_element_at_or_null_inline_rejected) {
+    expectOrNullRejected(
+        prog("  using var xs := new Array<[3]int>();\n"
+             "  var a: [3]int := [1, 2, 3];\n"
+             "  xs.Add(a);\n"
+             "  var v := xs.ElementAtOrNull(0);\n"),
+        "ElementAtOrNull", "an `Array` of an inline array");
 }
 
 // R14 — the LIST INTERFACE: `IList<T>` inherits `IEnumerable<T>` (stdlib

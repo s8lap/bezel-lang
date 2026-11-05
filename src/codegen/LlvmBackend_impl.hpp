@@ -3064,6 +3064,15 @@ private:
         // back to for a runtime-managed value it cannot prove non-escaping).
         // Fires on BOTH the normal and unwind exit, mirroring `grouping`.
         bool dictEntryKeyRelease = false;
+        // fix #8232 (stdlib §5 / §4.8, v0.355): the local's slot holds the
+        // NULLABLE form of the synthetic `DictionaryEntry<K, V>` -- §5's
+        // `ElementAtOrNull(index: int): T?` forms its `T?` at a dictionary's
+        // ELEMENT type, and that element type is the synthetic entry. The
+        // nullable form lowers to the tagged `{i8 hasValue; {K, V}}` struct
+        // (spec §7.2), so the Key sits at field 0 of the PAYLOAD (field 1 of
+        // the slot), not at field 0 of the slot -- the two release Disposals
+        // read this flag to GEP into the payload instead of the slot.
+        bool dictEntryKeyReleaseNullable = false;
         // fix #6470 / §28.11 *Collection element ownership*, stdlib §4.8
         // (v0.338): the VALUE-column sibling of `dictEntryKeyRelease` above,
         // for the same terminal-local shape but a STRING-V dictionary
@@ -3100,6 +3109,10 @@ private:
         // unwind exit (the reference dies either way, and a given exit goes
         // one way only), mirroring `dictEntryKeyRelease` exactly.
         bool dictEntryValueRelease = false;
+        // fix #8232 (stdlib §5 / §4.8, v0.355): the VALUE-column sibling of
+        // `dictEntryKeyReleaseNullable` above -- the Value sits at field 1 of
+        // the nullable's `{K, V}` payload, not at field 1 of the slot.
+        bool dictEntryValueReleaseNullable = false;
         // fix #4129 (§29.12 / §28.3, stdlib §4.8, v0.295): a `for var entry in
         // dict` entry-iteration's own key/value SNAPSHOT SPINE arrays — the
         // malloc'd arrays bz_dict_keys_str/bz_dict_keys_gen/bz_dict_values_str/
@@ -7056,6 +7069,30 @@ private:
     // unified by isNullableValueTy below. Defined in LlvmBackend_Layout.cpp
     // (needs the record-declaration kind check, like isNullableEnumTy).
     bool isNullableRecordTy(const sema::TypeRef* rt);
+    // fix #8232 (stdlib §4.8 / §5, v0.355): is rt a NULLABLE SYNTHETIC
+    // `DictionaryEntry<K, V>` -- the declaration-less Named TypeRef sema
+    // builds for a dictionary's §5 element type (`importedName ==
+    // "DictionaryEntry"`, `genericArgs == [K, V]`)?
+    //
+    // stdlib §5's `public method ElementAtOrNull(index: int): T?;` forms its
+    // `T?` at the ELEMENT type, and a `Dictionary<K, V>`'s element type is
+    // the synthetic `DictionaryEntry<K, V>` (stdlib §4.8: `public class
+    // Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>`). The synthetic
+    // type has NO TypeSymbol, so `isNullableRecordTy` (which requires
+    // `rt->declaration` to be a record) does not recognise it -- and before
+    // this fix a NULLABLE synthetic entry had NO null representation at all:
+    // `lowerTypeRef` returned the BARE `{K, V}` struct for it, so "null" and
+    // "the entry" were the same bits. The predicate gives the family the
+    // SAME tagged `{i8 hasValue; {K, V}}` struct a nullable record gets
+    // (spec §7.2), so the out-of-range answer is distinguishable from the
+    // entry.
+    //
+    // It is deliberately NARROW: it requires the declaration-less synthetic
+    // shape AND the "DictionaryEntry" imported name AND two type arguments.
+    // A WRITTEN `DictionaryEntry<K, V>` (stdlib §4.8 declares it as a real
+    // record, so a user can name it) carries a declaration and is
+    // `isNullableRecordTy`'s business, not this predicate's.
+    bool isNullableSyntheticDictEntryTy(const sema::TypeRef* rt);
     // fix #2447 / §35.9 / §7.2: is rt a NULLABLE CHOICE (a nullable Named
     // TypeRef whose declaration is a choice)? "`C?` is the ordinary
     // nullable value type (§7.2)" (§35.9, "Nullable `C?`") — a choice's
@@ -7252,6 +7289,12 @@ private:
                isNullableRecordTy(rt) || isNullableChoiceTy(rt) ||
                isNullableValueBuiltinTy(rt) ||
                isNullableValueStructBuiltinTy(rt) || isNullableUnitTy(rt) ||
+               // fix #8232 (stdlib §4.8 / §5, v0.355): the NULLABLE synthetic
+               // `DictionaryEntry<K, V>` -- §5's `ElementAtOrNull` forms its
+               // `T?` at a dictionary's element type, and that type is the
+               // synthetic (declaration-less) entry. See the predicate's own
+               // declaration for why it needs its own term.
+               isNullableSyntheticDictEntryTy(rt) ||
                isNullableTextWriterTy(rt);
     }
     // narrow #7792 (stdlib §2.1 / §7.4, v0.355): `TextWriter?` — the nullable
@@ -20754,6 +20797,15 @@ private:
     // `dictEntryValueRelease` Disposal, which discharges the terminal's mint.
     bool isFreshDictEntryValueReleaseTerminalLocal(
         const LocalDeclInitView& view) const;
+    // fix #8232 (stdlib §5 / §4.8, v0.355): true when the initializer's
+    // type is a NULLABLE one — the shape §5's `ElementAtOrNull(index: int):
+    // T?` produces for a dictionary's synthetic `DictionaryEntry<K, V>`
+    // ELEMENT type. The nullable form lowers to the tagged
+    // `{i8 hasValue; {K, V}}` struct, so the Key/Value sit inside the
+    // PAYLOAD (field 1 of the local's slot), one level down from where the
+    // non-nullable entry keeps them. The two dict-entry release Disposals
+    // read this to GEP the right way.
+    bool dictEntryLocalIsNullable(const ast::Expr* init) const;
     // fix #8136 (stdlib §4.8, v0.355; §28.9 / §9.7): the CONSTRUCTED-entry
     // sibling of the two predicates above — a plain `var`/`const e := new
     // DictionaryEntry<K, V>(…)` whose target's generic slot `slot` (0 = the

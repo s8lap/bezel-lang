@@ -61,11 +61,18 @@
 // of the two — this lane's — was corrected). Out of scope for #3786 (this
 // lane owns `BuiltinRegistry.cpp` and the MinOrNull/MaxOrNull arm only).
 //
-// `ElementAtOrNull`/`OfType` (the OTHER two names #3444 flagged) are NOT
-// added here — `ElementAtOrNull` has no lowering on any receiver (a
-// separate, larger gap per #3444/#3764) and `OfType` was removed from the
-// stdlib entirely at v0.284 (issue #3559) — both stay gated and are pinned
-// still-rejected below.
+// `OfType` (the OTHER name #3444 flagged) is NOT added here — it was removed
+// from the stdlib entirely at v0.284 (issue #3559) — it stays gated and is
+// pinned still-rejected below.
+//
+// fix #8232 (stdlib §5, v0.355) ADDED `ElementAtOrNull`: the `T?` sibling of
+// `ElementAt` on the SAME `public extension IEnumerable<T>` block. #3444
+// flagged the name as "no lowering on ANY receiver" — a separate, larger
+// gap — and fix #8229 CLOSED it (the name reached
+// `LlvmBackend_Calls.cpp`'s `isArrTerminal` and the `T?` arm this receiver's
+// materialize path runs), so the gate this file's table implements was the
+// last refusal standing between the name and a working call. The row that
+// pinned the refusal is flipped below.
 
 #include <string>
 
@@ -223,13 +230,27 @@ BEZEL_TEST(minornull_maxornull_string_receiver_3786,
 }
 
 BEZEL_TEST(minornull_maxornull_string_receiver_3786,
-           still_gated_element_at_or_null) {
-    // stdlib §5, fix #1220: ElementAtOrNull has no lowering on ANY receiver
-    // (a separate, larger gap per issue #3444/#3764) — must stay rejected.
-    BEZEL_EXPECT_TRUE(hasErrorContaining(
+           element_at_or_null_is_now_admitted) {
+    // fix #8232 (stdlib §5, v0.355): `ElementAtOrNull` is the `T?` sibling of
+    // `ElementAt` on the SAME `public extension IEnumerable<T>` block, and a
+    // `string` is an `IEnumerable<char>` (stdlib §9.6 / #1220). #3444 flagged
+    // the name as "no lowering on ANY receiver"; fix #8229 CLOSED that gap
+    // (the name reached `LlvmBackend_Calls.cpp`'s `isArrTerminal` and its
+    // `T?` arm, which this receiver's materialize path runs), so the last
+    // refusal — this table's own `kStringLinqOperatorMemberNames` gate — is
+    // gone. The result is a `char?`: null when the index is out of range.
+    BEZEL_EXPECT_FALSE(hasErrorContaining(
         prog("    var s := \"abc\";\n"
-             "    var e := s.ElementAtOrNull(0);"),
+             "    var e := s.ElementAtOrNull(1);\n"
+             "    Console.WriteLine(int(e!));"),
         "not yet supported in codegen"));
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog("    var s := \"abc\";\n"
+                       "    var e := s.ElementAtOrNull(1);\n"
+                       "    var f := s.ElementAtOrNull(3);\n"
+                       "    Console.WriteLine(int(e!));\n"
+                       "    Console.WriteLine(f = null);")),
+        "98\nTrue");
 }
 
 BEZEL_TEST(minornull_maxornull_string_receiver_3786, still_gated_of_type) {

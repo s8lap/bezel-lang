@@ -11133,7 +11133,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // (the SortedDictionary exclusion and the missing OwningDictionary
         // typing rule) are filed as #3716.
         if ((call.args.empty() && (m == "First" || m == "Last" || m == "Single")) ||
-            (m == "ElementAt" && call.args.size() == 1 && call.args[0].value)) {
+            ((m == "ElementAt" || m == "ElementAtOrNull") &&
+             call.args.size() == 1 && call.args[0].value)) {
             // fix #3720 / stdlib §5 / §4.8 / §4.17 (v0.294): lifts narrow
             // #3576's own string-key reject (the `if (!keyTy)` diagnostic
             // this arm used to emit here — see git history) now that a
@@ -11229,7 +11230,54 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // InvalidOperationException when count != 1; ElementAt throws
             // IndexOutOfRangeException out of bounds) -- before any snapshot
             // allocation, per the note above.
+            //
+            // fix #8232 (stdlib §5 / §4.8, v0.355): `ElementAtOrNull` is the
+            // `T?` sibling of `ElementAt` on the SAME `extension
+            // IEnumerable<T>` block -- it returns the entry at `i` as
+            // `DictionaryEntry<K, V>?`, NULL when the index is out of range,
+            // where `ElementAt` throws. So its out-of-range answer is a VALUE,
+            // not a throw: the guard below becomes a BRANCH to a null arm
+            // (and the null arm takes no snapshot, so the "no allocation
+            // before reject" discipline holds on that path too -- there is
+            // simply nothing to reject).
             llvm::Value* dtIdx;
+            // The `ElementAtOrNull` block trio: the null arm, the present arm
+            // (where the snapshot + decode run), and the merge the two PHI
+            // into. Declared here so the tail of the arm can build the
+            // nullable result.
+            llvm::BasicBlock* dtNullBB = nullptr;
+            llvm::BasicBlock* dtPresentBB = nullptr;
+            llvm::BasicBlock* dtMergeBB = nullptr;
+            // The block each arm ENDS in — the PHI's incoming predecessors.
+            // NOT the arm's first block: the present arm runs the snapshot
+            // free loop (its own cond/body/end blocks) before the branch, so
+            // the merge's predecessor is the arm's LAST block.
+            llvm::BasicBlock* dtNullEndBB = nullptr;
+            llvm::BasicBlock* dtPresentEndBB = nullptr;
+            llvm::Value* dtNullRes = nullptr;
+            // The nullable result's LLVM type — the tagged
+            // `{i8 hasValue; {K, V}}` struct (spec §7.2). Computed ONCE, so
+            // the null arm and the tail agree on it.
+            llvm::StructType* dtNullableTy = nullptr;
+            if (m == "ElementAtOrNull") {
+                const sema::TypeRef* dtEaTy = ctx_.exprType(call);
+                if (!dtEaTy || !isNullableSyntheticDictEntryTy(dtEaTy)) {
+                    // Refuse LOUDLY rather than miscompile: this arm builds a
+                    // `T?` value, so it is sound only where sema typed the
+                    // call `DictionaryEntry<K, V>?`. (The array family's arm
+                    // refuses the same way — see its own "was not typed `T?`"
+                    // diagnostic.)
+                    if (!ctx_.diagnostics().hasErrors())
+                        ctx_.diagnostics().report(
+                            Severity::Error, call.span.begin,
+                            "internal: `ElementAtOrNull` (stdlib \xC2\xA7""5, "
+                            "returns `T?`) was not typed `T?` on this receiver, "
+                            "so its result cannot be lowered soundly; the call "
+                            "is refused rather than miscompiled (#8232)");
+                    return nullptr;
+                }
+                dtNullableTy = nullableValueStructTy(dtEaTy);
+            }
             if (m == "First") {
                 emitGuardThrow(
                     builder_.CreateICmpEQ(dtCnt0, builder_.getInt64(0)),
@@ -11255,11 +11303,42 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 llvm::Value* rawIdx = lowerExpr(*call.args[0].value);
                 if (!rawIdx) return nullptr;
                 dtIdx = builder_.CreateSExt(rawIdx, i64());
-                llvm::Value* neg =
-                    builder_.CreateICmpSLT(dtIdx, builder_.getInt64(0));
-                llvm::Value* oor = builder_.CreateICmpSGE(dtIdx, dtCnt0);
-                emitGuardThrow(builder_.CreateOr(neg, oor),
-                               "IndexOutOfRangeException");
+                if (m == "ElementAtOrNull") {
+                    // unsigned compare: a negative index becomes huge, so ONE
+                    // test covers both `i < 0` and `i >= count` -- the same
+                    // one-test shape the array family's `ElementAtOrNull` arm
+                    // uses (LlvmBackend_Calls.cpp's `isArr` block).
+                    llvm::Value* inRange =
+                        builder_.CreateICmpULT(dtIdx, dtCnt0);
+                    dtNullBB = llvm::BasicBlock::Create(
+                        llvm_, "dictterm.null", currentFn_);
+                    dtPresentBB = llvm::BasicBlock::Create(
+                        llvm_, "dictterm.present", currentFn_);
+                    dtMergeBB = llvm::BasicBlock::Create(
+                        llvm_, "dictterm.merge", currentFn_);
+                    builder_.CreateCondBr(inRange, dtPresentBB, dtNullBB);
+                    // The null arm: NO snapshot is taken (nothing is decoded,
+                    // so nothing is minted), and the receiver's own temporary
+                    // is reclaimed exactly as the present arm reclaims it --
+                    // an unbound `a.ToDictionary(...)` receiver must be freed
+                    // on BOTH paths or it leaks on the null one.
+                    builder_.SetInsertPoint(dtNullBB);
+                    freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv,
+                                                       recvTy,
+                                                       /*dictValueColumnEscapes=*/
+                                                       false);
+                    dtNullRes = llvm::Constant::getNullValue(dtNullableTy);
+                    dtNullEndBB = builder_.GetInsertBlock();
+                    builder_.CreateBr(dtMergeBB);
+                    // The present arm continues with the snapshot + decode.
+                    builder_.SetInsertPoint(dtPresentBB);
+                } else {
+                    llvm::Value* neg =
+                        builder_.CreateICmpSLT(dtIdx, builder_.getInt64(0));
+                    llvm::Value* oor = builder_.CreateICmpSGE(dtIdx, dtCnt0);
+                    emitGuardThrow(builder_.CreateOr(neg, oor),
+                                   "IndexOutOfRangeException");
+                }
             }
 
             // Guard passed (dtCnt0 > 0 for First/Last; dtCnt0 == 1 for Single;
@@ -11515,6 +11594,32 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* dtEntryVal = llvm::UndefValue::get(dtEntryStTy);
             dtEntryVal = builder_.CreateInsertValue(dtEntryVal, dtKeyDecoded, {0u});
             dtEntryVal = builder_.CreateInsertValue(dtEntryVal, dtValDecoded, {1u});
+            // fix #8232 (stdlib §5 / §4.8, v0.355): `ElementAtOrNull` returns
+            // the entry as `DictionaryEntry<K, V>?` -- the tagged
+            // `{i8 hasValue; {K, V}}` struct (the SAME shape a nullable
+            // record gets, spec §7.2; the synthetic entry's nullable form is
+            // recognised by `isNullableSyntheticDictEntryTy`). The present
+            // arm wraps the decoded entry with the tag set; the null arm
+            // produced the all-zero struct; the merge PHI picks between them.
+            if (m == "ElementAtOrNull") {
+                llvm::Value* dtWrapped = llvm::UndefValue::get(dtNullableTy);
+                dtWrapped = builder_.CreateInsertValue(
+                    dtWrapped,
+                    llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+                dtWrapped = builder_.CreateInsertValue(dtWrapped, dtEntryVal,
+                                                       {1u});
+                dtPresentEndBB = builder_.GetInsertBlock();
+                builder_.CreateBr(dtMergeBB);
+                builder_.SetInsertPoint(dtMergeBB);
+                // IMPORTANT: the PHI must be the FIRST instruction in the
+                // merge block (the LLVM "PHI at top" invariant) -- so it is
+                // created before anything else is emitted into that block.
+                llvm::PHINode* dtPhi = builder_.CreatePHI(dtNullableTy, 2,
+                                                         "dictornull");
+                dtPhi->addIncoming(dtWrapped, dtPresentEndBB);
+                dtPhi->addIncoming(dtNullRes, dtNullEndBB);
+                return dtPhi;
+            }
             return dtEntryVal;
         }
 

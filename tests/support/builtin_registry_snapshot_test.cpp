@@ -1113,28 +1113,35 @@ BEZEL_TEST(builtin_registry_snapshot, keyword_alias_builtin_set) {
 //     `lazyTerminal` disjunction #3764 widened) was proven end-to-end to
 //     compose with the #2783 array arm, and a genuine codegen bug in the
 //     `elemTypeRef`/`isValTy` derivation for a string receiver (found while
-//     proving it) was fixed alongside. `ElementAtOrNull`/`OfType` remain
-//     OUT — `ElementAtOrNull` has no lowering on ANY receiver (a separate,
-//     larger gap: #3444/#3764), and `OfType` was removed from the stdlib
-//     entirely at v0.284 (issue #3559) — #3786 does not touch either.
+//     proving it) was fixed alongside. `OfType` remains OUT — it was removed
+//     from the stdlib entirely at v0.284 (issue #3559) — #3786 does not
+//     touch it.
+//
+// fix #8232 (stdlib §5, v0.355) ADDED `ElementAtOrNull`: the `T?` sibling
+// of `ElementAt` on the SAME `public extension IEnumerable<T>` block, and a
+// `string` is an `IEnumerable<char>` (stdlib §9.6). The "no lowering on ANY
+// receiver" gap #3444 flagged was CLOSED by fix #8229 (the name reached
+// `LlvmBackend_Calls.cpp`'s `isArrTerminal` and its `T?` arm, which the
+// string receiver's materialize path runs), so the name's absence from THIS
+// table was the last refusal — "string member `.ElementAtOrNull` is not yet
+// supported in codegen" (issue #8232).
 BEZEL_TEST(builtin_registry_snapshot, string_linq_operator_member_name_set) {
-    static constexpr std::array<std::string_view, 39> kSnapshot = {
+    static constexpr std::array<std::string_view, 40> kSnapshot = {
         "Where", "Select", "SelectMany", "Skip", "Take", "TakeWhile",
         "SkipWhile", "Distinct", "OrderBy", "OrderByDescending", "ThenBy",
         "ThenByDescending", "Concat", "Zip", "Union", "Intersect", "Except",
         "Reverse", "Any", "All", "Count", "Sum", "Min", "Max", "Average",
         "First", "Last", "Single", "ElementAt", "FirstOrNull", "LastOrNull",
         "SingleOrNull", "ToArray", "ToSet", "ToDictionary", "GroupBy",
-        "Aggregate", "MinOrNull", "MaxOrNull",
+        "Aggregate", "MinOrNull", "MaxOrNull", "ElementAtOrNull",
     };
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isStringLinqOperatorMemberName(n));
     // Real stdlib §5/§5.1 names deliberately absent from THIS table (see
-    // above: `ElementAtOrNull`/`OfType` stay gated on purpose), plus
+    // above: `OfType` stays gated on purpose), plus
     // `ForEach` retired by #3636 (not a stdlib §5 instance member — only the
     // static `Parallel.ForEach` exists), plus a retired/never-real name and a
     // near-neighbour typo.
-    for (std::string_view n : {"ElementAtOrNull",
-                               "Contains", "OfType", "ToList", "Sorted",
+    for (std::string_view n : {"Contains", "OfType", "ToList", "Sorted",
                                "Reversed", "ForEach", ""})
         BEZEL_EXPECT_FALSE(isStringLinqOperatorMemberName(n));
 }
@@ -1147,21 +1154,28 @@ BEZEL_TEST(builtin_registry_snapshot, string_linq_operator_member_name_set) {
 //     see the header comment for the full #3589 reasoning). `Reverse`/
 //     `Count`/`Contains` stay OUT on purpose: each builtin family pre-empts
 //     them through its own dedicated handler before this gate runs.
+//
+// fix #8232 (stdlib §5, v0.355) ADDED `ElementAtOrNull`: it is the `T?`
+// sibling of `ElementAt` on the SAME `public extension IEnumerable<T>` block
+// (stdlib §5: `public method ElementAtOrNull(index: int): T?;`), and every
+// concrete collection is an `IEnumerable<T>`. Its absence from THIS table was
+// the whole reason sema refused the call on every one of them ("no member
+// `ElementAtOrNull` on `Array<T>` … or a LINQ operator" — issue #8232).
 BEZEL_TEST(builtin_registry_snapshot,
            builtin_collection_linq_operator_name_set) {
-    static constexpr std::array<std::string_view, 38> kSnapshot = {
+    static constexpr std::array<std::string_view, 39> kSnapshot = {
         "Where", "OfType", "Select", "SelectMany", "Any", "All", "First",
         "FirstOrNull", "Last", "LastOrNull", "Single", "SingleOrNull",
         "ElementAt", "Sum", "Min", "Max", "MinOrNull", "MaxOrNull",
         "Average", "Aggregate", "OrderBy", "OrderByDescending", "Distinct",
         "Union", "Intersect", "Except", "Take", "TakeWhile", "Skip",
         "SkipWhile", "Concat", "Zip", "GroupBy", "ToArray", "ToDictionary",
-        "ToSet", "ThenBy", "ThenByDescending",
+        "ToSet", "ThenBy", "ThenByDescending", "ElementAtOrNull",
     };
     for (auto n : kSnapshot)
         BEZEL_EXPECT_TRUE(isBuiltinCollectionLinqOperatorName(n));
     // Pre-empted-elsewhere exclusions (see header) plus fictitious names.
-    for (std::string_view n : {"Reverse", "Count", "Contains", "ElementAtOrNull",
+    for (std::string_view n : {"Reverse", "Count", "Contains",
                                "ToList", "Append", "SequenceEqual", "Join",
                                "AsReadOnly", "ForEach", ""})
         BEZEL_EXPECT_FALSE(isBuiltinCollectionLinqOperatorName(n));

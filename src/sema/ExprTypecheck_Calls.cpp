@@ -16154,31 +16154,55 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                                    ce, recvTy->genericArgs[0])));
                         }
                         // stdlib §5 *OrNull (Array receiver): return nullable T.
-                        else if ((m == "FirstOrNull" || m == "LastOrNull" ||
-                                  m == "SingleOrNull") && ce.args.empty() &&
-                                 !recvTy->genericArgs.empty() &&
-                                 recvTy->genericArgs[0]) {
-                            // §15.1 / §14.2 (fix #5641): a stdlib member whose
-                            // signature forms `T?` at a type argument substituted by
-                            // an inline array is a compile error at the use.
-                            // fix #5911 (§15.1 / §14.2, v0.355): the position
-                            // the `T?` is formed at is read through the §15.1
-                            // position table, and the clause names the
-                            // receiver family this arm serves (the isArrLike
-                            // block covers `Array`/`Stack`/`Queue`/`Set`/
-                            // `LinkedList`/`SortedSet` and their owning
-                            // twins — the clause used to say "`Array`" for
-                            // all of them).
-                            if (!reportOrNullInlineArrayDiag(
-                                    ctx_,
-                                    nullableOrNullFormedTypeArg(recvTy, colName,
-                                                               m),
-                                    m, orNullElementClause(colName),
-                                    ce.span.begin)) {
-                                auto* nullTy = ctx_.makeTypeRef();
-                                *nullTy = *recvTy->genericArgs[0];
-                                nullTy->nullable = true;
-                                ctx_.setExprType(&ce, nullTy);
+                        //
+                        // fix #8232 (stdlib §5, v0.355) added `ElementAtOrNull`
+                        // — the fourth `*OrNull` accessor — to this arm. It is
+                        // the `T?` sibling of `ElementAt` on the SAME
+                        // `public extension IEnumerable<T>` block (stdlib §5:
+                        // `public method ElementAtOrNull(index: int): T?;`),
+                        // so on a concrete collection it forms its `T?` at the
+                        // ELEMENT type exactly as its three no-arg siblings
+                        // do — the §15.1 position table
+                        // (`builtinNullableOrNullTypeArgIndex`) already names
+                        // it, so the gate below reads the same position. It
+                        // takes ONE argument (the index); the three siblings
+                        // take none, so the two shapes are spelled apart.
+                        //
+                        // Before this arm the call was refused outright on
+                        // every concrete receiver (issue #8232): the name was
+                        // missing from `kBuiltinCollectionLinqOperatorNames`
+                        // (`src/common/BuiltinRegistry.cpp`), which is what
+                        // `allowedOwningMethod`/`allowedNonOwningMethod` read,
+                        // so the call never reached a typing rule at all.
+                        else if (((m == "FirstOrNull" || m == "LastOrNull" ||
+                                   m == "SingleOrNull") && ce.args.empty()) ||
+                                 (m == "ElementAtOrNull" && ce.args.size() == 1)) {
+                            if (!recvTy->genericArgs.empty() &&
+                                recvTy->genericArgs[0]) {
+                                // §15.1 / §14.2 (fix #5641): a stdlib member
+                                // whose signature forms `T?` at a type argument
+                                // substituted by an inline array is a compile
+                                // error at the use.
+                                // fix #5911 (§15.1 / §14.2, v0.355): the position
+                                // the `T?` is formed at is read through the §15.1
+                                // position table, and the clause names the
+                                // receiver family this arm serves (the isArrLike
+                                // block covers `Array`/`Stack`/`Queue`/`Set`/
+                                // `LinkedList`/`SortedSet` and their owning
+                                // twins — the clause used to say "`Array`" for
+                                // all of them).
+                                if (!reportOrNullInlineArrayDiag(
+                                        ctx_,
+                                        nullableOrNullFormedTypeArg(recvTy,
+                                                                   colName,
+                                                                   m),
+                                        m, orNullElementClause(colName),
+                                        ce.span.begin)) {
+                                    auto* nullTy = ctx_.makeTypeRef();
+                                    *nullTy = *recvTy->genericArgs[0];
+                                    nullTy->nullable = true;
+                                    ctx_.setExprType(&ce, nullTy);
+                                }
                             }
                         }
                         // fix #3784 (stdlib §5.1, v0.286): MinOrNull()/MaxOrNull()
@@ -16608,7 +16632,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // scoped to `OwningDictionary`.
                     if (colName == "OwningDictionary" &&
                         (m == "First" || m == "Last" || m == "Single" ||
-                         m == "ElementAt")) {
+                         m == "ElementAt" ||
+                         // fix #8232 (stdlib §4.9 / §5, v0.355): the same
+                         // reasoning covers §5's fourth `*OrNull` accessor —
+                         // `ElementAtOrNull` is an `extension IEnumerable<T>`
+                         // member, and §4.9's conformance is `IDisposable`
+                         // only, so it has no applicable stdlib member on an
+                         // `OwningDictionary<K, V>` either.
+                         m == "ElementAtOrNull")) {
                         ctx_.diagnostics().report(
                             Severity::Error, ce.span.begin,
                             std::string("`OwningDictionary<K, V>` does not "

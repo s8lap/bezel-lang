@@ -10045,8 +10045,25 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         if (it->dictEntryKeyRelease) {
             if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
                     it->slot->getAllocatedType())) {
-                llvm::Value* keyAddr =
-                    builder_.CreateStructGEP(st, it->slot, 0, "dictek.addr");
+                // fix #8232 (stdlib §5 / §4.8, v0.355): the NULLABLE form of
+                // the synthetic entry (what §5's `ElementAtOrNull` returns)
+                // lowers to the tagged `{i8 hasValue; {K, V}}` struct, so the
+                // Key sits at field 0 of the PAYLOAD (field 1 of the slot).
+                // The non-nullable form keeps it at field 0 of the slot.
+                llvm::Value* keyAddr;
+                if (it->dictEntryKeyReleaseNullable &&
+                    st->getNumElements() == 2 &&
+                    st->getElementType(1)->isStructTy()) {
+                    llvm::Value* payload =
+                        builder_.CreateStructGEP(st, it->slot, 1, "dictek.pl");
+                    auto* pst = llvm::cast<llvm::StructType>(
+                        st->getElementType(1));
+                    keyAddr = builder_.CreateStructGEP(pst, payload, 0,
+                                                       "dictek.addr");
+                } else {
+                    keyAddr = builder_.CreateStructGEP(st, it->slot, 0,
+                                                       "dictek.addr");
+                }
                 llvm::Value* keyVal =
                     builder_.CreateLoad(ptrTy(), keyAddr, "dictek.val");
                 emitStringRelease(keyVal);
@@ -10075,8 +10092,24 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         if (it->dictEntryValueRelease) {
             if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
                     it->slot->getAllocatedType())) {
-                llvm::Value* valAddr =
-                    builder_.CreateStructGEP(st, it->slot, 1, "dictev.addr");
+                // fix #8232 (stdlib §5 / §4.8, v0.355): the NULLABLE form of
+                // the synthetic entry (what §5's `ElementAtOrNull` returns)
+                // lowers to the tagged `{i8 hasValue; {K, V}}` struct, so the
+                // Value sits at field 1 of the PAYLOAD (field 1 of the slot).
+                llvm::Value* valAddr;
+                if (it->dictEntryValueReleaseNullable &&
+                    st->getNumElements() == 2 &&
+                    st->getElementType(1)->isStructTy()) {
+                    llvm::Value* payload =
+                        builder_.CreateStructGEP(st, it->slot, 1, "dictev.pl");
+                    auto* pst = llvm::cast<llvm::StructType>(
+                        st->getElementType(1));
+                    valAddr = builder_.CreateStructGEP(pst, payload, 1,
+                                                       "dictev.addr");
+                } else {
+                    valAddr = builder_.CreateStructGEP(st, it->slot, 1,
+                                                       "dictev.addr");
+                }
                 llvm::Value* valVal =
                     builder_.CreateLoad(ptrTy(), valAddr, "dictev.val");
                 emitStringRelease(valVal);

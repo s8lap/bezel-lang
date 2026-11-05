@@ -1535,7 +1535,21 @@ constexpr std::array<std::string_view, 19> kBuiltinValueParamHeads = {
 // materializes via `bz_lazy_to_array(lazy, esz=4)` and runs the existing
 // #2783 array arm exactly as First/Sum/Min/Max/... already do (verified
 // end-to-end below before this table changed, not assumed).
-constexpr std::array<std::string_view, 39> kStringLinqOperatorMemberNames = {
+//
+// fix #8232 (stdlib §5, v0.355) added `ElementAtOrNull`: it is the `T?`
+// sibling of `ElementAt` on the SAME `public extension IEnumerable<T>` block
+// (stdlib §5: `public method ElementAtOrNull(index: int): T?;      // — null
+// when index is out of range`), and a `string` IS an `IEnumerable<char>`
+// (stdlib §9.6 / #1220). #3444 flagged the name as "no lowering on ANY
+// receiver" — that gap was CLOSED by fix #8229, which added the name to
+// `LlvmBackend_Calls.cpp`'s `isArrTerminal` and to the `T?` arm the
+// string receiver's materialize path (`isStringRecvTerm` → `lazyTerminal` →
+// `bz_lazy_to_array(lazy, esz=4)`) runs, exactly as #3764 proved for
+// `MinOrNull`/`MaxOrNull`. The only thing still missing was THIS table, so
+// the name was refused with "string member `.ElementAtOrNull` is not yet
+// supported in codegen" — a refusal for a member the lowering already
+// implements.
+constexpr std::array<std::string_view, 40> kStringLinqOperatorMemberNames = {
     "Where",     "Select",     "SelectMany", "Skip",
     "Take",      "TakeWhile",  "SkipWhile",  "Distinct",
     "OrderBy",   "OrderByDescending",        "ThenBy",
@@ -1547,6 +1561,7 @@ constexpr std::array<std::string_view, 39> kStringLinqOperatorMemberNames = {
     "LastOrNull", "SingleOrNull",            "ToArray",
     "ToSet",     "ToDictionary",             "GroupBy",
     "Aggregate", "MinOrNull",  "MaxOrNull",
+    "ElementAtOrNull",
 };
 
 // fix #3589 (stdlib §5): see the header — the builtin-collection-family
@@ -1555,7 +1570,25 @@ constexpr std::array<std::string_view, 39> kStringLinqOperatorMemberNames = {
 // identical (three were already byte-identical; the fourth, the
 // `Array`/`OwningArray` copy, was missing `ToArray` only because that
 // family's `isDeclaredMethod` set admits it separately — see the header).
-constexpr std::array<std::string_view, 38> kBuiltinCollectionLinqOperatorNames = {
+//
+// fix #8232 (stdlib §5, v0.355) added `ElementAtOrNull` (39 names): it is the
+// `T?` sibling of `ElementAt` on the SAME `public extension IEnumerable<T>`
+// block — stdlib §5 declares `public method ElementAtOrNull(index: int): T?;
+// // — null when index is out of range` — and EVERY concrete collection is an
+// `IEnumerable<T>` (`Array<T>`/`OwningArray<T>` §4.4/§4.5, `LinkedList<T>`/
+// `OwningLinkedList<T>` §4.6/§4.7, `Set<T>`/`OwningSet<T>` §4.10,
+// `SortedSet<T>` §4.18, `Dictionary<K,V>`/`SortedDictionary<K,V>` §4.8/§4.17).
+// The name was MISSING here, so sema's concrete-collection admission gate
+// (`ExprTypecheck_Calls.cpp`'s `allowedOwningMethod`/`allowedNonOwningMethod`,
+// which end with `common::isBuiltinCollectionLinqOperatorName(mm)`) refused
+// the call on every one of them: "no member `ElementAtOrNull` on `Array<T>`
+// (§22.5 / §4.x) — it is not part of this collection's method surface, a
+// universal Object member, or a LINQ operator" (issue #8232). The codegen
+// half was NOT the gap: `LlvmBackend_Calls.cpp`'s `isArr` block already
+// carries the `T?` `ElementAtOrNull` arm (fix #8229), and the LinkedList /
+// Set / SortedSet receivers reach that same arm through the `lazyTerminal`
+// materialize path.
+constexpr std::array<std::string_view, 39> kBuiltinCollectionLinqOperatorNames = {
     "Where",     "OfType",     "Select",     "SelectMany",
     "Any",       "All",        "First",      "FirstOrNull",
     "Last",      "LastOrNull", "Single",     "SingleOrNull",
@@ -1566,6 +1599,7 @@ constexpr std::array<std::string_view, 38> kBuiltinCollectionLinqOperatorNames =
     "TakeWhile", "Skip",       "SkipWhile",  "Concat",
     "Zip",       "GroupBy",    "ToArray",    "ToDictionary",
     "ToSet",     "ThenBy",     "ThenByDescending",
+    "ElementAtOrNull",
 };
 
 // fix #3670 (stdlib §5): see the header — the lambda-parameter-seeding gate.
