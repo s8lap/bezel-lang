@@ -6983,6 +6983,12 @@ void ExprTC::admitTextWriterSubclassOperandReads(const ast::Expr& e) {
             textWriterSubclassReadOk_.insert(l);
         if (rt && (lt || objectOperand(l)))
             textWriterSubclassReadOk_.insert(r);
+        // narrow #7792 second fix-forward: the one read admitted for such a
+        // local declared `TextWriter?` (its presence flag).
+        if (lt && dynamic_cast<const ast::NullLiteralExpr*>(r))
+            textWriterSubclassNullTestOk_.insert(l);
+        if (rt && dynamic_cast<const ast::NullLiteralExpr*>(l))
+            textWriterSubclassNullTestOk_.insert(r);
         return;
     }
     if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
@@ -7014,16 +7020,25 @@ void ExprTC::checkTextWriterSubclassLocalReads() {
         SourceLocation loc;
         std::string name;
         std::string sub;
+        bool nullable;
     };
     std::vector<Bad> bad;
     for (const auto& [e, sym] : ctx_.allExprSymbols()) {
         const std::string* sub = textWriterSubclassLocalRead(e);
         if (!sub) continue;
-        if (textWriterSubclassReadOk_.count(e) &&
-            !textWriterSubclassReadDenied_.count(e))
+        // narrow #7792 second fix-forward (the review's r09e/f/g, q09d): a
+        // `TextWriter?` local keeps the object in the {i8, i32} carrier of a
+        // descriptor. MEASURED on 225833d4: `Console.WriteLine(t)` printed
+        // `0`, `t is W` was false and `$"{t}"` was empty. Only `= null` /
+        // `<> null` read it correctly (the flag), so only those are admitted.
+        const bool nullable = textWriterSubclassNullableLocals_.count(
+            dynamic_cast<const LocalSymbol*>(ctx_.exprSymbol(*e))) > 0;
+        if (nullable ? textWriterSubclassNullTestOk_.count(e) > 0
+                     : (textWriterSubclassReadOk_.count(e) &&
+                        !textWriterSubclassReadDenied_.count(e)))
             continue;
         auto* id = static_cast<const ast::IdentifierExpr*>(e);
-        bad.push_back({e->span.begin, std::string(id->name), *sub});
+        bad.push_back({e->span.begin, std::string(id->name), *sub, nullable});
     }
     // The map is unordered: report in source order, once per location.
     std::sort(bad.begin(), bad.end(), [](const Bad& a, const Bad& b) {
@@ -7039,10 +7054,67 @@ void ExprTC::checkTextWriterSubclassLocalReads() {
             "the local `" + bad[i].name + "` holds a `" + bad[i].sub +
             "`, a user subclass of `TextWriter`; converting it to the "
             "built-in `TextWriter` type is not implemented by this compiler, "
-            "so this use of it is rejected. Such a local may be compared "
-            "(`=`, `<>`), tested or cast to a user type (`is`, `as`), "
-            "converted to `Object`, interpolated, or written with "
-            "`Console.Write` / `WriteLine`; it may not be assigned again "
+            "so this use of it is rejected. " +
+            (bad[i].nullable
+                 ? std::string("Declared `TextWriter?`, such a local may only "
+                               "be compared with `null` (`= null`, `<> "
+                               "null`); declare it `TextWriter` or `" +
+                               bad[i].sub + "` to use the object")
+                 : std::string("Such a local may be compared (`=`, `<>`), "
+                               "tested or cast to a user type (`is`, `as`), "
+                               "converted to `Object`, interpolated, or "
+                               "written with `Console.Write` / `WriteLine`")) +
+            "; it may not be assigned again (stdlib \xC2\xA7""7.4, #7792)");
+    }
+}
+
+// narrow #7792 second fix-forward (stdlib §7.4, §1 *Extensibility*; spec
+// §17.4, §19.3, v0.355): a built-in `TextWriter` value is the i32 descriptor
+// of a standard stream, and an object (an `Object`, an interface value, a
+// type parameter, a user subclass) has no representation as one. So a
+// runtime type test or cast INTO `TextWriter` / `TextWriter?` cannot produce
+// a value, and one OF a descriptor cannot inspect a runtime type. MEASURED on
+// 225833d4 (review probes u05 u08, and their spellings): `(new W() as
+// TextWriter)!`, `(o as TextWriter)!` over an `Object` or interface carrier,
+// `?? Console.Out`, a conditional arm and a generic `x as TextWriter` all
+// lowered to a zero `TextWriter` with only the #2434 / #2491 degrade warning,
+// so `t.WriteLine("hi")` wrote to descriptor 0; `o is TextWriter` and `tw is
+// W` emitted nothing (not even the line of the `Console.WriteLine` holding
+// them); `case o of var t: TextWriter => …` ran no arm. Each is a located
+// compile error instead. A local holding a user subclass is the exception on
+// the operand side: its `is` / `as` a user type reads the object (see
+// `textWriterSubclassLocalInit_`).
+void ExprTC::checkTextWriterTypeTest(const TypeRef* operandTy,
+                                     const ast::Expr* operand,
+                                     const TypeRef* target, const char* form,
+                                     SourceLocation loc) {
+    auto isBuiltinTw = [](const TypeRef* t) {
+        return t && t->kind == TypeRef::Kind::Named && !t->declaration &&
+               t->genericArgs.empty() && t->headName() == "TextWriter";
+    };
+    if (isBuiltinTw(target)) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("a type test or cast into the built-in `TextWriter` "
+                        "(") + form + ") is not implemented by this compiler: "
+            "a `TextWriter` value is the descriptor of a standard stream "
+            "(`Console.Out`, `Console.Error`), and no other value (an "
+            "`Object`, an interface value, a type parameter or a user "
+            "subclass of `TextWriter`) has a representation as one, so this "
+            "use is rejected. Use `Console.Out` / `Console.Error` directly, or "
+            "keep the user subclass at its own type (stdlib \xC2\xA7""7.4, "
+            "#7792)");
+        return;
+    }
+    if (isBuiltinTw(operandTy) && target &&
+        target->kind != TypeRef::Kind::Error &&
+        !(operand && textWriterSubclassLocalRead(operand))) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("a type test or cast of a built-in `TextWriter` value "
+                        "(") + form + ") is not implemented by this compiler: "
+            "the value is the descriptor of a standard stream, which carries "
+            "no runtime type to test, so this use is rejected "
             "(stdlib \xC2\xA7""7.4, #7792)");
     }
 }
@@ -26183,9 +26255,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         !dt->declaration && dt->genericArgs.empty() &&
                         dt->headName() == "TextWriter" && it &&
                         it->kind == TypeRef::Kind::Named && it->declaration &&
-                        typeReachesBuiltinTextWriter(it->declaration))
+                        typeReachesBuiltinTextWriter(it->declaration)) {
                         textWriterSubclassLocals_[lsym] =
                             std::string(namedTypeSimpleName(it));
+                        if (dt->nullable)
+                            textWriterSubclassNullableLocals_.insert(lsym);
+                    }
                 }
             } else if (ld->initializer) {
                 // per §15.4: a collection literal has no standalone type; a
@@ -31517,6 +31592,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 lsym->declType = bp->type ? ctx_.resolvedType(*bp->type)
                                           : scrutTy;
                 armScope.names[bp->name] = lsym;
+                // narrow #7792 second fix-forward (stdlib §7.4, §19.3,
+                // v0.355): a typed binding is a type test of the
+                // scrutinee; see `checkTextWriterTypeTest`. Only the
+                // TARGET half: over a `TextWriter` scrutinee a user-type
+                // arm correctly never matches (MEASURED on 225833d4).
+                if (bp->type)
+                    checkTextWriterTypeTest(
+                        nullptr, nullptr, lsym->declType,
+                        "a typed `case` binding", bp->span.begin);
                 // fix #5659 (§9.7 / §19.3, v0.330): the TYPED-PATTERN-BINDING
                 // route of the borrow-erasing rule — the CaseStmt twin of the
                 // CaseExpr arm at ExprTypecheck_Exprs.cpp:12693, which is a

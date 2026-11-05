@@ -5061,6 +5061,15 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "static type (§12.7/§2.8.3 rule 4/§17.4)");
             }
         }
+        // narrow #7792 second fix-forward (stdlib §7.4, §17.4, v0.355): see
+        // `checkTextWriterTypeTest`.
+        if (te->testType && te->operand)
+            checkTextWriterTypeTest(
+                ctx_.exprType(*te->operand), te->operand.get(),
+                ctx_.resolvedType(*te->testType),
+                te->op == "as" ? "`as`"
+                               : (te->op == "is" ? "`is`" : "`is not`"),
+                e.span.begin);
         // fix #5146 (§12.7/§8.6, v0.309): "Value-typed operands" — an operand
         // whose static type is a value type (or the nullable form of one)
         // tested by `is`/`is not`/`as` against a REFERENCE target (a class,
@@ -16938,6 +16947,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 lsym->declType = bp->type ? ctx_.resolvedType(*bp->type)
                                           : scrutTy;
                 armScope.names[bp->name] = lsym;
+                // narrow #7792 second fix-forward (stdlib §7.4, §19.3,
+                // v0.355): a typed binding is a type test of the
+                // scrutinee; see `checkTextWriterTypeTest`. Only the
+                // TARGET half: over a `TextWriter` scrutinee a user-type
+                // arm correctly never matches (MEASURED on 225833d4).
+                if (bp->type)
+                    checkTextWriterTypeTest(
+                        nullptr, nullptr, lsym->declType,
+                        "a typed `case` binding", bp->span.begin);
                 // fix #5659 (§9.7 / §19.3, v0.330): the TYPED-PATTERN-BINDING
                 // route of the borrow-erasing rule, named verbatim alongside
                 // the implicit and `as` routes — "implicit or by an `as`

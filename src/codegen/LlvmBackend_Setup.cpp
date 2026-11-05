@@ -19896,6 +19896,21 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 unconstructedBuiltinNewNote(builtinNewName,
                                             "initialize this local"));
         } else if (init && !ctx_.diagnostics().hasErrors() &&
+                   !emittingGenericTemplateBody_ &&
+                   isBuiltinTextWriterTypeRef(
+                       declType ? ctx_.resolvedType(*declType) : initTy)) {
+            // narrow #7792 second fix-forward (stdlib §7.4, v0.355): a zero
+            // `TextWriter` slot is descriptor 0, so the degrade below would
+            // make every later write go to standard input (MEASURED on
+            // 225833d4, review probe u05). Never degrade one: sema rejects
+            // each shape known to reach here, and any other is an error too.
+            ctx_.diagnostics().report(
+                Severity::Error, init->span.begin,
+                "this `TextWriter` initializer has no representation in this "
+                "compiler (it failed to lower to a stream descriptor), so it "
+                "is rejected rather than degraded to descriptor 0 "
+                "(stdlib \xC2\xA7""7.4, #7792; #2434)");
+        } else if (init && !ctx_.diagnostics().hasErrors() &&
                    // fix #7257 (§14.1, §3.6 rule 2, v0.344): in the
                    // UNSPECIALIZED generic TEMPLATE body the initializer is
                    // written against the ABSTRACT type parameter, whose

@@ -4563,6 +4563,21 @@ private:
     // interpolation hole). Called from visitExpr once `e` is typed.
     void admitTextWriterSubclassOperandReads(const ast::Expr& e);
     void checkTextWriterSubclassLocalReads();
+    // narrow #7792 second fix-forward (stdlib §7.4, v0.355): such a local
+    // declared `TextWriter?` keeps the object in the {i8, i32} nullable
+    // carrier of a descriptor, so only its presence flag is sound. Its reads
+    // are admitted only as an operand of `= null` / `<> null`
+    // (`textWriterSubclassNullTestOk_`); every other read is rejected.
+    std::unordered_set<const LocalSymbol*> textWriterSubclassNullableLocals_;
+    std::unordered_set<const ast::Expr*> textWriterSubclassNullTestOk_;
+    // narrow #7792 second fix-forward: a type test or cast (`is`, `is not`,
+    // `as`, a typed `case` binding) whose target is the built-in `TextWriter`,
+    // or whose operand is a built-in `TextWriter` value, is a located compile
+    // error (see the definition). `form` names the construct in the message.
+    void checkTextWriterTypeTest(const TypeRef* operandTy,
+                                 const ast::Expr* operand,
+                                 const TypeRef* target, const char* form,
+                                 SourceLocation loc);
     struct RangeIEnumSite {
         const ast::Expr*& slot;
         const ast::Expr* saved;

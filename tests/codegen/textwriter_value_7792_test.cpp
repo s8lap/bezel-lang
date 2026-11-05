@@ -31,8 +31,11 @@
 // slot (a heap overrun) or an IR verifier abort. A LOCAL declared `TextWriter`
 // holds the object itself, so its object uses (`is` / `as` a user type,
 // `Object`, `=`, printing) run, and every use as a built-in `TextWriter` is
-// rejected. A `TextWriter` never given a stream is a §7.9 / §17.11 compile
-// error, as for a user class. The last rows pin all of that.
+// rejected; declared `TextWriter?`, only its `= null` / `<> null` reads are
+// admitted. A type test or cast into `TextWriter` (`as`, `is`, a typed `case`
+// binding), and one of a `TextWriter` value, is a located compile error. A
+// `TextWriter` never given a stream is a §7.9 / §17.11 compile error, as for
+// a user class. The last rows pin all of that.
 
 #include <memory>
 #include <string>
@@ -480,4 +483,157 @@ BEZEL_TEST(textwriter_value_7792, assigned_textwriter_local_and_field_run_7_9) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("local\nfield\n"));
+}
+
+// narrow #7792 second fix-forward (stdlib §7.4, spec §17.4, §19.3, v0.355): a
+// type test or cast INTO the built-in `TextWriter` cannot produce a stream
+// descriptor from an object, so every spelling is a located compile error.
+// MEASURED on 225833d4: the review's u05 (`(new W() as TextWriter)!`) and u08
+// (`(o as TextWriter)!` over an `Object`) compiled with only the #2434 degrade
+// warning and `t.WriteLine("hi")` wrote to descriptor 0 (stdin); `??`, a
+// conditional arm, an interface carrier, a generic `x as TextWriter` and the
+// inferred local did the same; `o is TextWriter` emitted nothing (not even
+// the line); a typed `case` binding ran no arm at all.
+BEZEL_TEST(textwriter_value_7792, type_test_into_textwriter_rejected_17_4) {
+    const std::string pre = std::string("module M; interface I end I; ") +
+        "class W: TextWriter, I "
+        "  public constructor() end constructor; "
+        "  public override method Write(value: string) Console.Write(\"[\" + value + \"]\"); end Write; "
+        "  public override method Write(value: char) Console.Write(\"<c>\"); end Write; "
+        "  public override method Flush() end Flush; "
+        "end W; "
+        "class P public static method Main() var w := new W(); var o: Object := w; "
+        "var i: I := w; var b := true; ";
+    const char* post = " Console.WriteLine(\"end\"); end Main; end P;";
+    const char* bodies[] = {
+        // u05: a user subclass cast straight into `TextWriter`.
+        "var t: TextWriter := (new W() as TextWriter)!; t.WriteLine(\"hi\");",
+        // u08: out of an `Object` carrier.
+        "var t: TextWriter := (o as TextWriter)!; t.WriteLine(\"hi\");",
+        // `??` with a real stream on the right.
+        "var t: TextWriter := (o as TextWriter) ?? Console.Out; t.WriteLine(\"hi\");",
+        // A conditional arm.
+        "var t: TextWriter := (if b then (o as TextWriter)! else Console.Out); "
+        "t.WriteLine(\"hi\");",
+        // Out of an interface carrier.
+        "var t: TextWriter := (i as TextWriter)!; t.WriteLine(\"hi\");",
+        // The inferred local, and the cast used directly as a receiver.
+        "var t := (w as TextWriter)!; t.WriteLine(\"hi\");",
+        "(o as TextWriter)!.WriteLine(\"hi\");",
+        // `as TextWriter?` and a nullable local.
+        "var t: TextWriter? := o as TextWriter?; Console.WriteLine(t = null);",
+        // `is` / `is not` (emitted nothing at all).
+        "Console.WriteLine(o is TextWriter);",
+        "Console.WriteLine(i is not TextWriter);",
+        // A typed `case` binding (ran no arm).
+        "case o of var t: TextWriter => t.WriteLine(\"hi\"), _ => Console.WriteLine(\"no\") end;",
+        // Even from a built-in stream (lowered to null: a NullReferenceException).
+        "var t := Console.Out as TextWriter; t!.WriteLine(\"hi\");",
+    };
+    for (const char* b : bodies) {
+        auto r = runAot(pre + b + post);
+        BEZEL_EXPECT_FALSE(r.ran);
+        BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+        BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+            r, "a type test or cast into the built-in `TextWriter`"));
+    }
+    // A generic `x as TextWriter` (the template body is the site).
+    {
+        auto r = runAot(std::string("module M; ") + kSub +
+            "class G public static method F<T>(x: T): TextWriter? "
+            "return x as TextWriter; end F; end G; "
+            "class P public static method Main() var w := new W(); var o: Object := w; "
+            "var t := G.F<Object>(o); t!.WriteLine(\"hi\"); end Main; end P;");
+        BEZEL_EXPECT_FALSE(r.ran);
+        BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+        BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+            r, "a type test or cast into the built-in `TextWriter`"));
+    }
+}
+
+// narrow #7792 second fix-forward: the OPERAND side. A built-in `TextWriter`
+// value is a descriptor with no runtime type, so `tw is W` / `tw as W` is a
+// located compile error. MEASURED on 225833d4: `Console.WriteLine(tw is W)`
+// emitted nothing, `tw as W` degraded with the #2434 warning.
+BEZEL_TEST(textwriter_value_7792, type_test_of_textwriter_value_rejected_17_4) {
+    const std::string pre = std::string("module M; ") + kSub +
+        "class P public static method H(tw: TextWriter) ";
+    const char* post = " end H; public static method Main() H(Console.Out); end Main; end P;";
+    const char* bodies[] = {
+        "Console.WriteLine(tw is W);",
+        "var u := tw as W; Console.WriteLine(u = null);",
+    };
+    for (const char* b : bodies) {
+        auto r = runAot(pre + b + post);
+        BEZEL_EXPECT_FALSE(r.ran);
+        BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+        BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+            r, "a type test or cast of a built-in `TextWriter` value"));
+    }
+}
+
+// Controls for the two rows above: a `case` over a `TextWriter` with a user
+// arm never matches (correct, and still admitted); a user-type test of an
+// `Object` carrier runs.
+BEZEL_TEST(textwriter_value_7792, type_test_controls_still_run_17_4) {
+    const std::string pre = std::string("module M; ") + kSub;
+    struct Row { const char* body; const char* out; };
+    const Row rows[] = {
+        {"class P static method H(tw: TextWriter) "
+         "case tw of var x: W => Console.WriteLine(\"w\"), _ => Console.WriteLine(\"no\") end; "
+         "end H; public static method Main() H(Console.Out); end Main; end P;",
+         "no\n"},
+        {"class P public static method Main() var w := new W(); var o: Object := w; "
+         "Console.WriteLine(o is W); var b := o as W; b!.Write(\"o\"); Console.WriteLine(); "
+         "end Main; end P;",
+         "True\n[o]\n"},
+    };
+    for (const Row& row : rows) {
+        auto r = runAotChecked(pre + row.body);
+        BEZEL_EXPECT_TRUE(r.ran);
+        BEZEL_EXPECT_EQ(r.exitCode, 0);
+        BEZEL_EXPECT_EQ(r.stdoutText, std::string(row.out));
+    }
+}
+
+// narrow #7792 second fix-forward: a local declared `TextWriter?` holding a
+// user subclass keeps the object in the {i8, i32} carrier of a descriptor,
+// so only its presence flag reads correctly. MEASURED on 225833d4 (the
+// review's r09e r09f r09g q09d): `Console.WriteLine(t)` printed `0`, `t is W`
+// was false, `$"{t}"` was empty. Every read but `= null` / `<> null` is now a
+// located compile error.
+BEZEL_TEST(textwriter_value_7792, nullable_subclass_local_reads_rejected_7_4) {
+    const std::string pre = std::string("module M; ") + kSub +
+        "class P public static method Main() var w := new W(); var t: TextWriter? := w; ";
+    const char* post = " end Main; end P;";
+    const char* bodies[] = {
+        "Console.WriteLine(t);",                                  // r09e / q09d
+        "if t is W then Console.WriteLine(\"isW\"); end;",          // r09f
+        "Console.WriteLine($\"{t}\");",                           // r09g
+        "var x := t as W; Console.WriteLine(x = null);",
+        "var o: Object? := t; Console.WriteLine(o = null);",
+        "var u: TextWriter? := w; Console.WriteLine(t = u);",
+        "if t <> null then Console.WriteLine(t); end;",
+    };
+    for (const char* b : bodies) {
+        auto r = runAot(pre + b + post);
+        BEZEL_EXPECT_FALSE(r.ran);
+        BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+        BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, kSubNeedle));
+        BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+            r, "may only be compared with `null`"));
+    }
+}
+
+// Control: its `= null` / `<> null` reads still run (the flag is sound), in a
+// loop under the checked oracle.
+BEZEL_TEST(textwriter_value_7792, nullable_subclass_local_null_test_runs_7_4) {
+    auto r = runAotChecked(std::string("module M; ") + kSub +
+        "class P public static method Main() var n := 0; var i := 0; "
+        "while i < 100 do var t: TextWriter? := new W(); "
+        "if t <> null then n := n + 1; end; if t = null then n := n - 1000; end; "
+        "i := i + 1; end; Console.WriteLine(n); end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
 }
