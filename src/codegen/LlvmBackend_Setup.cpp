@@ -31406,7 +31406,7 @@ struct StringEscapeWalker {
                static_cast<const void*>(loc->decl) == target;
     }
 
-    // fix-forward #8162 (stdlib §3.3, v0.355): the DERIVED-SPAN mode. Set ONLY
+    // fix-forward #8162 (stdlib §3.3, v0.355): the DERIVED-SPAN mode. Raised ONLY
     // by collectCtorSpanBorrowEligible — the pass that decides whether a
     // constructor-built `ReadOnlyStringSpan` may be admitted as a CALL-BOUNDED
     // BORROW of its source string.

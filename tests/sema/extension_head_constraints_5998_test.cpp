@@ -330,8 +330,8 @@ BEZEL_TEST(sema_extension_head_constraints_5998,
 // §4.8) and `Set<T>` (stdlib §4.10) declare NO `where` clause, so §26.4 has
 // no declared constraint to restate at their heads — their key rule is the
 // §3.6 rule 2 check at the instantiation site, "carried to that declaration's
-// instantiations" (stdlib §4.20's recorded ruling). The Dictionary rows at
-// the end of this block pin that reading.
+// instantiations" (stdlib §4.20's recorded ruling). The rows for the hash-keyed
+// builtins at the end of this block pin that reading.
 // ---------------------------------------------------------------------------
 
 // One reject row per constrained builtin head: a head that does not restate

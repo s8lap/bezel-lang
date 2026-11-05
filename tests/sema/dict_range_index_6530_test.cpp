@@ -563,7 +563,7 @@ BEZEL_TEST(dict_range_index_6530,
 // `F<Guid>` deleted — stayed rejected. An unrelated declaration must not flip
 // a verdict (§14.1: the answer belongs to the spelling IN ITS SCOPE), so the
 // record lives on the TypeRef each resolution produces. §5.1 admits no `int`
-// -> `Guid`, and stdlib §4.8 / §23.4 admit no range index on a
+// -> the key type, and stdlib §4.8 / §23.4 admit no range index on a
 // `Dictionary<Guid, V>`. (Rows from the r39-rev-6530b review, probes r8/r8b/r8c.)
 
 namespace {

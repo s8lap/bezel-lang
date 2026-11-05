@@ -135,8 +135,8 @@ const char* kConstraintNeedle =
 //
 // `record W<T>(v: int): IComparable<W<int>>` used at `W<string>`:
 // `W<string>` does NOT implement `IComparable<W<string>>` (it implements
-// `IComparable<W<int>>`), so stdlib §5.1's `where T: IComparable<T>` is
-// NOT satisfied and the call must be REJECTED at compile time.
+// `IComparable<W<int>>`), so the `where` clause of stdlib §5.1's `Min`
+// (the interface is stdlib §2.8) is NOT satisfied and the call must be REJECTED at compile time.
 //
 // Pre-fix: the call was ADMITTED and the program compiled — printing the
 // element read through the WRONG layout (garbage). The row is RED on the

@@ -3557,7 +3557,7 @@ int builtinNullableOutTypeArgIndex(std::string_view head,
 //     `FirstOrNull` / `LastOrNull` / `SingleOrNull` / `ElementAtOrNull`
 //     (stdlib §5) and §5.1's `MinOrNull` / `MaxOrNull`.
 //
-// `IGrouping<TKey, T>` (stdlib §4.12) is the one receiver whose ELEMENT type
+// `IGrouping<TKey, T>` (stdlib §5) is the one receiver whose ELEMENT type
 // is not genericArgs[0]: its genericArgs[0] is the KEY type and the element
 // is genericArgs[1].
 //
@@ -6743,8 +6743,8 @@ static void checkBuiltinPathCallArity(
 
 // fix #8161 (spec §14.2 *Interface conformance* rule 2 / §14.1
 // *Instantiation and its site*, stdlib §2.8 / §5.1, v0.355): does the USER
-// RECORD element type `elem` satisfy stdlib §5.1's `where T: IComparable<T>`
-// constraint AT THIS INSTANTIATION?
+// RECORD element type `elem` satisfy the `where` constraint of stdlib §5.1's
+// no-selector overloads (`T: IComparable<T>`, stdlib §2.8) AT THIS INSTANTIATION?
 //
 // §14.2's conformance rule is about the INSTANTIATION, not the declaration:
 // `record W<T>(v: int): IComparable<W<int>>` implements `IComparable<W<int>>`
@@ -12966,8 +12966,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     std::string(m) +
                                     "() without a selector requires the "
                                     "element type to implement "
-                                    "IComparable<T> (stdlib §5.1 / §14.2 "
-                                    "/ #1198); " +
+                                    "IComparable<T> (stdlib §2.8 / §5.1 / "
+                                    "§14.2 / #1198); " +
                                     std::string(srcElem->declaration->name) +
                                     " does not implement IComparable<T>. "
                                     "Use " + std::string(m) +
