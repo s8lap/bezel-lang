@@ -741,6 +741,13 @@ private:
                                        std::ptrdiff_t arity,
                                        const TypeRef* elemTy,
                                        const std::string& whereClause);
+    // fix #8180 (stdlib §5.1, spec §14.2 *Interface conformance*, v0.355):
+    // does the element type `elem` PROVABLY fail `T: IComparable<T>`? ONE
+    // verdict read by the §5.1 `Min()`/`Max()` gate and by the §26.5.1
+    // applicability filter, so the two never disagree. `false` means
+    // "conforms OR cannot be decided here" (the candidate is KEPT).
+    // Defined in ExprTypecheck_Calls.cpp beside the gate.
+    bool linqIComparableProvablyViolated(const TypeRef* elem) const;
     // fix #7967 (§26.5.1, v0.355): is the argument a FUNCTION value? The
     // three-valued answer the §5 overload's `(T) -> …` parameter needs; see
     // `stdlibLinqCandidateApplicable`'s header in ExprTypecheck.cpp.

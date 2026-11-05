@@ -14523,10 +14523,12 @@ bool ExprTC::extWhereClauseProvablyViolated(
 //         computation the `where T: hashable` gate uses. A type it rejects
 //         PROVABLY violates it; an unresolved type-parameter placeholder
 //         DEFERS, so the candidate is KEPT.
-//     `where T: IComparable<T>` is NOT applied here: the §5.1 `Min()`/`Max()`
-//     gate owns that verdict (its class/interface/enum/built-in-value-record
-//     cases are a per-kind computation this filter does not second-guess), so
-//     the candidate is KEPT and the §5 typing path reports it as before.
+//       * `where T: IComparable<T>` — fix #8180: the PROVABLE violations of
+//         `linqIComparableProvablyViolated` (ExprTypecheck_Calls.cpp), the ONE
+//         verdict the §5.1 `Min()`/`Max()` gate also reads. Every element that
+//         helper does not decide (numeric primitives, `char`, `string`, the
+//         built-in value records, enums, an unresolved element) is KEPT, and
+//         the §5 typing path reports it as before.
 //
 // (2) THE CALL'S ARGUMENT TYPES, for the §5 overloads whose parameter is a
 //     FUNCTION value (the `(T) -> …` predicate / selector / key forms — the
@@ -14616,8 +14618,18 @@ bool ExprTC::stdlibLinqCandidateApplicable(std::string_view name,
                 (elemTy->kind == TypeRef::Kind::Named &&
                  !elemTy->declaration && !elemTy->astNode);
             if (!defers && !isEqualityBearing(elemTy, ctx_)) return false;
+        } else if (whereClause == "where T: IComparable<T>") {
+            // fix #8180 (stdlib §5.1, spec §14.2 *Interface conformance*,
+            // v0.355): `where T: IComparable<T>` IS decided here, by the ONE
+            // verdict the §5.1 `Min()`/`Max()` gate reads
+            // (`linqIComparableProvablyViolated`), so the filter and the gate can
+            // never disagree. It was left out, so a §5 `Min()` that cannot apply
+            // (a function / class / record element that is not comparable) beat
+            // the user's applicable `extension Object { Min() }` — MEASURED: a
+            // function element emitted `icmp slt ptr, i32` (malformed IR) and a
+            // non-comparable class element was REFUSED with the §5.1 diagnostic.
+            if (linqIComparableProvablyViolated(elemTy)) return false;
         }
-        // `where T: IComparable<T>` is NOT decided here — see the header.
     }
     // (2) THE CALL'S ARGUMENT TYPES — for the §5 overloads whose parameter is
     // a FUNCTION value.

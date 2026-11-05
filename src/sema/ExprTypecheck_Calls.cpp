@@ -113,6 +113,107 @@ bool isNoSelectorAggregationElem(PrimitiveType p) {
     return bezel::sema::linqInumberConformerPrimitive(p);
 }
 
+// fix #8180 (stdlib §5.1, spec §14.2 rule 2, v0.355): does the USER RECORD
+// `rs` conform to `IComparable<rs>`? Extracted VERBATIM from the §5.1
+// `Min()`/`Max()` gate (#8092 F4 / #8139), so the gate and the §26.5.1
+// applicability filter (`ExprTC::linqIComparableProvablyViolated`) read ONE
+// computation and can never disagree about a record element. The record must
+// name `IComparable` (directly or through an extending interface, spec §11
+// rule 2) AND the type argument must be the record ITSELF (§14.2:
+// `IComparable<Self>`; stdlib §2.8: `CompareTo(other: T)`), followed through
+// each extending interface's own type arguments.
+bool userRecordSelfComparable(const TypeSymbol* rs) {
+    if (!rs || !inheritsBuiltinInterface(rs, "IComparable")) return false;
+    std::unordered_set<const TypeSymbol*> onPath;
+    // `sym`'s IComparable argument, with `sym`'s own
+    // type parameters replaced by `inst` (the
+    // arguments `sym` was listed with).
+    std::function<bool(
+        const TypeSymbol*,
+        const std::vector<const TypeRef*>&)>
+        selfArgReaches =
+        [&](const TypeSymbol* sym,
+            const std::vector<const TypeRef*>& inst)
+        -> bool {
+        if (!onPath.insert(sym).second) return false;
+        auto subst = [&](const TypeRef* t)
+            -> const TypeRef* {
+            if (t && t->kind == TypeRef::Kind::Named &&
+                !t->declaration &&
+                t->genericArgs.empty()) {
+                for (std::size_t k = 0;
+                     k < sym->genericParams.size() &&
+                     k < inst.size(); ++k)
+                    if (sym->genericParams[k] &&
+                        sym->genericParams[k]->name ==
+                            t->headName())
+                        return inst[k];
+            }
+            return t;
+        };
+        bool found = false;
+        for (std::size_t bi = 0;
+             bi < sym->baseTypes.size() && !found;
+             ++bi) {
+            const TypeSymbol* b = sym->baseTypes[bi];
+            if (!b) continue;
+            const bool isIComp =
+                b->isSynthesizedBuiltinInterface &&
+                b->name == "IComparable";
+            const bool isUserIface =
+                !b->isSynthesizedBuiltinInterface &&
+                b->kind ==
+                    ast::TypeDeclKind::Interface;
+            if (!isIComp && !isUserIface) continue;
+            const TypeRef* ref =
+                bi < sym->baseTypeRefs.size()
+                    ? sym->baseTypeRefs[bi]
+                    : nullptr;
+            if (isIComp) {
+                if (!ref ||
+                    ref->genericArgs.size() != 1) {
+                    found = true;  // unknown: keep
+                    continue;
+                }
+                const TypeRef* ga =
+                    subst(ref->genericArgs[0]);
+                if (ga && ga->declaration == rs &&
+                    !ga->nullable)
+                    found = true;
+            } else {
+                if (!ref) continue;
+                std::vector<const TypeRef*> next;
+                for (const TypeRef* ga :
+                     ref->genericArgs)
+                    next.push_back(subst(ga));
+                if (selfArgReaches(b, next))
+                    found = true;
+            }
+        }
+        onPath.erase(sym);
+        return found;
+    };
+    return selfArgReaches(rs, std::vector<const TypeRef*>{});
+}
+
+// fix #8180 (stdlib §5.1, spec §14.2, v0.355): the diagnostic for a
+// no-selector `Min()`/`Max()` over a NON-Named element that PROVABLY fails
+// `T: IComparable<T>` (a function type, a nullable primitive, `bool`). Worded
+// as the #1198 class/record arms word theirs, so one family reads alike.
+std::string noSelectorNotComparableMsg(std::string_view m, const TypeRef* elem) {
+    std::string what;
+    if (elem->kind == TypeRef::Kind::Function)
+        what = "a function type";
+    else
+        what = std::string("`") + primitiveSpellingForDiag(elem->primitive) +
+               (elem->nullable ? "?" : "") + "`";
+    return std::string(m) +
+           "() without a selector requires the element type to implement "
+           "IComparable<T> (stdlib §5.1 / §14.2 / #1198); " + what +
+           " does not implement IComparable<T>. Use " + std::string(m) +
+           "(selector: (T) -> U) instead.";
+}
+
 std::string typeNameForDiag(const TypeRef* t) {
     if (!t) return "<unresolved>";
     std::string s;
@@ -863,6 +964,50 @@ bool truncatedDoubleFits(double t, PrimitiveType pt) {
 }
 
 }  // namespace
+
+// fix #8180 (stdlib §5.1, spec §14.2 *Interface conformance*, v0.355): see the
+// declaration in ExprTypecheck_impl.hpp. stdlib §5.1 declares
+//     public extension IEnumerable<T> where T: IComparable<T>
+//       public method Min(): T;  public method Max(): T; ...
+// and §14.2 says T "conforms to I exactly when one of the following holds"
+// (rules 1-7: a class, record, interface, enum, primitive, type parameter or
+// choice that lists / is declared with I). The PROVABLE violations:
+//   * a FUNCTION type — none of rules 1-7 names one;
+//   * a NULLABLE primitive — "A type-bound constraint — naming a class or
+//     interface — implies non-null T" (§14.2);
+//   * `bool` — rule 5 reads the primitive's stdlib declaration, and "the stdlib
+//     `Boolean` wrapper deliberately declares no `IComparable`" (spec §3.5);
+//   * a class / interface element whose declaration does not declare
+//     `IComparable` — the SAME accessor (`declaresBuiltinInterface`) the
+//     #1198 / #3139 gate below uses;
+//   * a USER RECORD that is not `IComparable<Self>` — the SAME
+//     `userRecordSelfComparable` the #8092 gate uses.
+// Every other element (numeric primitives, `char`, `string`, the built-in value
+// records, enums, `Guid`, an unresolved / constrained element) is NOT decided
+// here; the §5.1 gate keeps its own per-kind verdict for those.
+bool ExprTC::linqIComparableProvablyViolated(const TypeRef* elem) const {
+    if (!elem) return false;
+    switch (elem->kind) {
+        case TypeRef::Kind::Function:
+            return true;
+        case TypeRef::Kind::Primitive:
+            return elem->nullable || elem->primitive == PrimitiveType::Bool;
+        case TypeRef::Kind::Named: {
+            // An unresolved or nullable element is not decided here.
+            if (!elem->declaration || elem->nullable) return false;
+            const auto k = elem->declaration->kind;
+            if (k == ast::TypeDeclKind::Class ||
+                k == ast::TypeDeclKind::Interface)
+                return !declaresBuiltinInterface(elem->declaration,
+                                                 "IComparable");
+            if (k == ast::TypeDeclKind::Record)
+                return !userRecordSelfComparable(elem->declaration);
+            return false;
+        }
+        default:
+            return false;
+    }
+}
 
 // This translation unit holds the call-resolution and member-access
 // definitions of the ExprTC worker: CallExpr return-type / arity checking
@@ -12297,6 +12442,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
                     // fix #666 / stdlib §5/§5.1: Sum/Min/Max/Average on a lazy
                     // IEnumerable<decimal> return decimal, not int/double.
+                    // fix #8180 (stdlib §5.1, spec §14.2, v0.355): the lazy
+                    // twin of the concrete-collection arm's gate — a FUNCTION,
+                    // NULLABLE-primitive or `bool` element PROVABLY fails
+                    // `T: IComparable<T>` (`linqIComparableProvablyViolated`),
+                    // and it fell to the `int` default below, so codegen built
+                    // `icmp slt ptr, i32` (MEASURED on
+                    // `a.Where(lambda(f) => true).Min()` over
+                    // `Array<(int) -> int>`: malformed IR).
+                    else if ((m == "Min" || m == "Max") && ce.args.empty() &&
+                             srcElem &&
+                             srcElem->kind != TypeRef::Kind::Named &&
+                             linqIComparableProvablyViolated(srcElem)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            noSelectorNotComparableMsg(m, srcElem));
+                    }
                     else if (m == "Sum" || m == "Min" || m == "Max") {
                         bool elemIsDecimal =
                             srcElem &&
@@ -12636,6 +12797,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     else if (m == "First" || m == "Last" || m == "Single" ||
                              m == "ElementAt")
                         ctx_.setExprType(&ce, srcElem2);
+                    // fix #8180 (stdlib §5.1, spec §14.2, v0.355): the
+                    // vtable-backed `IEnumerable<T>` twin of the
+                    // concrete-collection and lazy arms' gate (MEASURED:
+                    // `xs.Min()` over an `IEnumerable<(int) -> int>` parameter
+                    // emitted malformed IR).
+                    else if ((m == "Min" || m == "Max") && ce.args.empty() &&
+                             srcElem2 &&
+                             srcElem2->kind != TypeRef::Kind::Named &&
+                             linqIComparableProvablyViolated(srcElem2))
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            noSelectorNotComparableMsg(m, srcElem2));
                     else if (m == "Min" || m == "Max") {
                         // fix #1901 / stdlib §5: the selector overload
                         // `Min<U>/Max<U>(sel: (T) -> U): U` returns `U`, the
@@ -13813,83 +13986,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // question and `selfArgReaches` below follows the
                             // type argument through each extending interface
                             // (#8139).
-                            bool userRecordComparable =
-                                userRecordElem && inheritsBuiltinInterface(
-                                    elem->declaration, "IComparable");
-                            if (userRecordComparable) {
-                                const TypeSymbol* rs = elem->declaration;
-                                std::unordered_set<const TypeSymbol*> onPath;
-                                // `sym`'s IComparable argument, with `sym`'s own
-                                // type parameters replaced by `inst` (the
-                                // arguments `sym` was listed with).
-                                std::function<bool(
-                                    const TypeSymbol*,
-                                    const std::vector<const TypeRef*>&)>
-                                    selfArgReaches =
-                                    [&](const TypeSymbol* sym,
-                                        const std::vector<const TypeRef*>& inst)
-                                    -> bool {
-                                    if (!onPath.insert(sym).second) return false;
-                                    auto subst = [&](const TypeRef* t)
-                                        -> const TypeRef* {
-                                        if (t && t->kind == TypeRef::Kind::Named &&
-                                            !t->declaration &&
-                                            t->genericArgs.empty()) {
-                                            for (std::size_t k = 0;
-                                                 k < sym->genericParams.size() &&
-                                                 k < inst.size(); ++k)
-                                                if (sym->genericParams[k] &&
-                                                    sym->genericParams[k]->name ==
-                                                        t->headName())
-                                                    return inst[k];
-                                        }
-                                        return t;
-                                    };
-                                    bool found = false;
-                                    for (std::size_t bi = 0;
-                                         bi < sym->baseTypes.size() && !found;
-                                         ++bi) {
-                                        const TypeSymbol* b = sym->baseTypes[bi];
-                                        if (!b) continue;
-                                        const bool isIComp =
-                                            b->isSynthesizedBuiltinInterface &&
-                                            b->name == "IComparable";
-                                        const bool isUserIface =
-                                            !b->isSynthesizedBuiltinInterface &&
-                                            b->kind ==
-                                                ast::TypeDeclKind::Interface;
-                                        if (!isIComp && !isUserIface) continue;
-                                        const TypeRef* ref =
-                                            bi < sym->baseTypeRefs.size()
-                                                ? sym->baseTypeRefs[bi]
-                                                : nullptr;
-                                        if (isIComp) {
-                                            if (!ref ||
-                                                ref->genericArgs.size() != 1) {
-                                                found = true;  // unknown: keep
-                                                continue;
-                                            }
-                                            const TypeRef* ga =
-                                                subst(ref->genericArgs[0]);
-                                            if (ga && ga->declaration == rs &&
-                                                !ga->nullable)
-                                                found = true;
-                                        } else {
-                                            if (!ref) continue;
-                                            std::vector<const TypeRef*> next;
-                                            for (const TypeRef* ga :
-                                                 ref->genericArgs)
-                                                next.push_back(subst(ga));
-                                            if (selfArgReaches(b, next))
-                                                found = true;
-                                        }
-                                    }
-                                    onPath.erase(sym);
-                                    return found;
-                                };
-                                userRecordComparable = selfArgReaches(
-                                    rs, std::vector<const TypeRef*>{});
-                            }
+                            const bool userRecordComparable =
+                                userRecordElem &&
+                                userRecordSelfComparable(elem->declaration);
                             // A RECORD with NO `CompareTo` has NO order, so
                             // §5.1's extension does not apply to it and the
                             // call must be REFUSED — exactly as the
@@ -13920,6 +14019,30 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     " does not implement IComparable<T>. "
                                     "Use " + std::string(m) +
                                     "(selector: (T) -> U) instead.");
+                                return;
+                            }
+                            // fix #8180 (stdlib §5.1, spec §14.2 *Interface
+                            // conformance*, v0.355): a FUNCTION element, a
+                            // NULLABLE primitive element and a `bool` element
+                            // PROVABLY fail `T: IComparable<T>`
+                            // (`linqIComparableProvablyViolated` names the
+                            // spec sentence for each), but no arm here refused
+                            // them: they fell to the numeric `int` default
+                            // below, and codegen's numeric path built
+                            // `icmp slt ptr, i32` / `icmp slt {i8,i32}, i32` /
+                            // an `i1` compare — MEASURED: "Both operands to
+                            // ICmp instruction are not of the same type!",
+                            // `bezelc` aborting with malformed IR. A located
+                            // diagnostic replaces the abort; no program that
+                            // compiled before is refused. The Named arms (class,
+                            // interface, record) keep their own diagnostics
+                            // above and below.
+                            if ((m == "Min" || m == "Max") && ce.args.empty() &&
+                                elem && elem->kind != TypeRef::Kind::Named &&
+                                linqIComparableProvablyViolated(elem)) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    noSelectorNotComparableMsg(m, elem));
                                 return;
                             }
                             const bool comparableElem =
