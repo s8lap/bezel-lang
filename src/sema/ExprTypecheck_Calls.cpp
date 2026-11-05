@@ -997,9 +997,11 @@ bool ExprTC::linqElemIsUnconstrainedTypeParam(const TypeRef* elem) const {
 //     interface — implies non-null T" (§14.2);
 //   * `bool` — rule 5 reads the primitive's stdlib declaration, and "the stdlib
 //     `Boolean` wrapper deliberately declares no `IComparable`" (spec §3.5);
-//   * a class / interface element whose declaration does not declare
-//     `IComparable` — the SAME accessor (`declaresBuiltinInterface`) the
-//     #1198 / #3139 gate below uses;
+//   * a class / interface element with NO `IComparable` anywhere in its
+//     base closure (`inheritsBuiltinInterface`, §14.2 rules 1 and 3 —
+//     fix-forward #8180; the #1198 / #3139 gate below still reads the
+//     direct-only `declaresBuiltinInterface`, a stricter test, so every
+//     element this calls violated the gate also refuses);
 //   * a USER RECORD that is not `IComparable<Self>` — the SAME
 //     `userRecordSelfComparable` the #8092 gate uses;
 //   * an UNCONSTRAINED type parameter in scope (rule 6, #8181).
@@ -1020,9 +1022,19 @@ bool ExprTC::linqIComparableProvablyViolated(const TypeRef* elem) const {
             // A nullable element is not decided here.
             if (elem->nullable) return false;
             const auto k = elem->declaration->kind;
+            // fix-forward #8180: the CLOSURE, not the direct base list.
+            // §14.2 *Interface conformance* rule 1: "T is a class that lists
+            // I (or any interface extending I) in its inheritance clause,
+            // that inherits from a class which conforms to I"; rule 3: "T is
+            // an interface that has I in its extension chain". A class or
+            // interface that reaches `IComparable` through ANY base is
+            // therefore not a provable violation and is KEPT (the direct-only
+            // `declaresBuiltinInterface` sent such an element to a user
+            // `extension Object { Min() }`). The type argument is not
+            // followed here: a closure hit merely KEEPS the candidate.
             if (k == ast::TypeDeclKind::Class ||
                 k == ast::TypeDeclKind::Interface)
-                return !declaresBuiltinInterface(elem->declaration,
+                return !inheritsBuiltinInterface(elem->declaration,
                                                  "IComparable");
             if (k == ast::TypeDeclKind::Record)
                 return !userRecordSelfComparable(elem->declaration);

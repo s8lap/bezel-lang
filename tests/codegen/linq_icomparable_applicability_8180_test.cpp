@@ -148,3 +148,114 @@ BEZEL_TEST(codegen_linq_icomparable_applicability_8180,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "1200\napple\nzoo\n2\n");
 }
+
+// fix-forward #8180 (spec §14.2 *Interface conformance*, v0.355): an element
+// that conforms to `IComparable` TRANSITIVELY is not a provable violation, so
+// the applicability filter KEEPS the §5 `Min()` and a user
+// `extension Object { Min() }` must NEVER answer it. QUOTED rule 1: "T is a
+// class that lists I (or any interface extending I) in its inheritance clause,
+// that inherits from a class which conforms to I"; rule 3: "T is an interface
+// that has I in its extension chain".
+//
+// The spec answer is the §5 `Min()` (the expected stdout below). This tree's
+// §5.1 no-selector gate (#1198 / #3139) still reads the DIRECT base list
+// (`declaresBuiltinInterface`), so it REFUSES these three elements with its
+// own located diagnostic — the pre-existing over-reject (the class/interface
+// twin of #8139, which fixed records), reported by lane r39-fix-8180b. Both
+// arms are therefore pinned exactly: refused by THAT gate diagnostic, or run
+// with the §5 answer. What is never admitted is the extension's 4242.
+// PARENT (737e6d0a): refused by the gate. bbdd4bb8 / dece4010: the extension's
+// `int` answered (review r39-rev-8180 r1b / r1c / r1d: 4242), so `.X` /
+// `.Area()` on it is refused as a member of `int` — neither pinned arm.
+namespace {
+
+void expectSection5MinNotTheExtension(const JitResult& r,
+                                      const std::string& elemName,
+                                      const std::string& expectedStdout) {
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "IR verification failed"));
+    if (r.ran) {
+        BEZEL_EXPECT_EQ(r.exitCode, 0);
+        BEZEL_EXPECT_EQ(r.stdoutText, expectedStdout);
+        return;
+    }
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, (elemName + " does not implement IComparable<T>").c_str()));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+}
+
+}  // namespace
+
+// Rule 1, through an interface extending `IComparable<T>`. §5: K2 each time.
+BEZEL_TEST(codegen_linq_icomparable_applicability_8180,
+           class_comparable_through_an_extending_interface_never_answers_the_extension) {
+    JitResult r = runAotChecked(looped(
+        std::string("public interface IOrd<T>: IComparable<T> end IOrd;\n"
+                    "class K: IOrd<K>\n"
+                    "  public X: int;\n"
+                    "  public constructor(x: int)\n"
+                    "    X := x;\n"
+                    "  end;\n"
+                    "  public method CompareTo(other: K): int => X - other.X;\n"
+                    "end K;\n") + kObjectMinMax,
+        "      var a := new Array<K>();\n"
+        "      var k7 := new K(7);\n"
+        "      a.Add(k7);\n"
+        "      var k2 := new K(2);\n"
+        "      a.Add(k2);\n"
+        "      t := t + a.Min().X;\n"));
+    expectSection5MinNotTheExtension(r, "K", "200\n");
+}
+
+// Rule 1, inherited from a GENERIC base class that conforms. §5: D2 each time.
+BEZEL_TEST(codegen_linq_icomparable_applicability_8180,
+           class_comparable_through_a_generic_base_never_answers_the_extension) {
+    JitResult r = runAotChecked(looped(
+        std::string("class B<T>: IComparable<T>\n"
+                    "  public X: int;\n"
+                    "  public constructor(x: int)\n"
+                    "    X := x;\n"
+                    "  end;\n"
+                    "  public virtual method CompareTo(other: T): int => 0;\n"
+                    "end B;\n"
+                    "class D: B<D>\n"
+                    "  public constructor(x: int)\n"
+                    "    base(x);\n"
+                    "  end;\n"
+                    "  public override method CompareTo(other: D): int =>"
+                    " X - other.X;\n"
+                    "end D;\n") + kObjectMinMax,
+        "      var a := new Array<D>();\n"
+        "      var d7 := new D(7);\n"
+        "      a.Add(d7);\n"
+        "      var d2 := new D(2);\n"
+        "      a.Add(d2);\n"
+        "      t := t + a.Min().X;\n"));
+    expectSection5MinNotTheExtension(r, "D", "200\n");
+}
+
+// Rule 3, an INTERFACE element whose extension chain reaches `IComparable<T>`.
+// §5: the area-1 square each time.
+BEZEL_TEST(codegen_linq_icomparable_applicability_8180,
+           interface_element_comparable_through_its_chain_never_answers_the_extension) {
+    JitResult r = runAotChecked(looped(
+        std::string("public interface IOrd<T>: IComparable<T> end IOrd;\n"
+                    "public interface IShape: IOrd<IShape>\n"
+                    "  method Area(): int;\n"
+                    "end IShape;\n"
+                    "class Sq: IShape\n"
+                    "  public S: int;\n"
+                    "  public constructor(s: int)\n"
+                    "    S := s;\n"
+                    "  end;\n"
+                    "  public method Area(): int => S * S;\n"
+                    "  public method CompareTo(other: IShape): int =>"
+                    " Area() - other.Area();\n"
+                    "end Sq;\n") + kObjectMinMax,
+        "      var a := new Array<IShape>();\n"
+        "      var s3 := new Sq(3);\n"
+        "      a.Add(s3);\n"
+        "      var s1 := new Sq(1);\n"
+        "      a.Add(s1);\n"
+        "      t := t + a.Min().Area();\n"));
+    expectSection5MinNotTheExtension(r, "IShape", "100\n");
+}
