@@ -41893,7 +41893,56 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // §2.2) is read here exactly as at a call with the
                         // same list (the call-side check is in typeCall).
                         bool admitted = true;
-                        if (ta && !mathOrderedTimeValueHead(ta).empty()) {
+                        if (ta && ta->kind == TypeRef::Kind::Named &&
+                            !ta->declaration && ta->astNode &&
+                            !ta->astNode->aliasQualifiedBuiltin &&
+                            isInScopeTypeParam(ta->headName())) {
+                            // fix #6295 item 1 (spec §14.2, §27.6, stdlib
+                            // §2.2, v0.355): a TYPE PARAMETER as the type
+                            // argument.
+                            //
+                            // WHAT THE DEFECT WAS. The arm below read
+                            // `else if (ta->kind != Primitive) admitted =
+                            // false` — a type parameter's TypeRef is a
+                            // declaration-less Named ref, so it took that
+                            // arm and the formation was REFUSED with "type
+                            // argument does not satisfy the constraint
+                            // `where T: IComparable<T>`". The program is
+                            // VALID: §14.2 decides such an argument by the
+                            // parameter's OWN constraints, and
+                            // `where V: IComparable<V>` establishes it.
+                            //
+                            // §14.2 *A type parameter as the type argument*
+                            // case 1: "The argument is a type parameter `P`
+                            // ... the constraint is decided at that site, by
+                            // `P`'s own constraints. `P` satisfies the
+                            // constraint exactly when its constraints
+                            // guarantee it at every substitution they
+                            // admit"; *Interface conformance* rule 6: "`T` is
+                            // a type parameter whose constraints guarantee
+                            // conformance to `I`"; and
+                            // *Conditionally-admitted members* rule 2 states
+                            // the shape outright — "`Array<T>.Sort()` is
+                            // rejected in a body whose `T` is unconstrained
+                            // and admitted under `where T: IComparable<T>`,
+                            // as `x.CompareTo(y)` on a `T`-typed `x` would
+                            // be."
+                            //
+                            // The decision is made by
+                            // `typeParamSatisfiesSelfComparable` — ONE
+                            // walk (`forEachConstraintBound`), the routine
+                            // the compiler already uses to read what a type
+                            // parameter's `where` clause establishes.
+                            //
+                            // The arm is FIRST so a type parameter that
+                            // SHADOWS a stdlib value name (`where
+                            // DateTime: ...`) is read as the parameter it
+                            // is, not as the builtin `DateTime` the
+                            // time-value arm below matches by name.
+                            admitted = !ta->nullable &&
+                                typeParamSatisfiesSelfComparable(
+                                    ta->headName(), ta);
+                        } else if (ta && !mathOrderedTimeValueHead(ta).empty()) {
                             // fix #7911 (stdlib §2.2, §2.5, §14.2, v0.350):
                             // `DateTime` / `TimeSpan` / `DateOnly` /
                             // `TimeOnly` declare `IComparable<Self>`; either

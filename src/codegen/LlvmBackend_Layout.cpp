@@ -8171,15 +8171,47 @@ llvm::Value* Emitter::makePrimIntrinsicThunk(const ast::MemberAccessExpr& ma,
     const bool isMath = id->name == "Math";
     if (pt == sema::PrimitiveType::None && !isMath) return nullptr;
 
+    // fix #6295 item 1 (§14.2, §27.6, stdlib §2.2, v0.355): a `Math.Max<T>`
+    // reference formed in a GENERIC BODY names the ENCLOSING type parameter,
+    // and the thunk must be built at the CONCRETE substitution of that
+    // parameter.
+    //
+    // WHAT THE DEFECT WAS. The thunk read the parameter's type UNRESOLVED:
+    // `lowerTypeRef(V)` in the ERASED template body is the i32 placeholder,
+    // and the synthetic call's arguments carried the placeholder type too, so
+    // the comparison was emitted at the placeholder's width and SIGNEDNESS.
+    // The thunk is CACHED under the type argument's identity key, and the
+    // erased body and every specialization share that key — so the erased
+    // thunk (built for `V`) was the one every instantiation called. MEASURED
+    // with a sema-only admission (R37 lane C2-07; recorded in #7519): on that
+    // tip, `F<uint>()`'s reference ordered `4000000000u` BELOW `3u` (a signed
+    // i32 compare) and `F<decimal>()`'s reference compared the decimal
+    // payload as a word (garbage).
+    //
+    // `resolveTypeParamRef` is THE ONE resolver of a bare type-parameter
+    // reference through the active monomorphization binding (#567); it is
+    // what the `Math` lowering's own unsigned/decimal predicates already
+    // read. In the erased template body the binding is empty, so the
+    // placeholder is kept there — and the CACHE KEY below is computed from
+    // the SAME resolved type, so the erased thunk and a specialization's
+    // thunk are DISTINCT entries and neither is handed to the other.
+    auto resolvedParamTy = [&](std::size_t i) -> const sema::TypeRef* {
+        if (i >= fnTy->funcParams.size()) return nullptr;
+        return resolveTypeParamRef(fnTy->funcParams[i].type);
+    };
+
     // Thunk signature: ret (ptr env, params…) — the closure ABI the LINQ
     // trampolines and the general function-value call site expect (fn(env, args)).
     // env is null for this static reference (no captures); the thunk ignores it.
-    llvm::Type* retTy = fnTy->funcReturn ? lowerTypeRef(fnTy->funcReturn)
-                                         : llvm::Type::getVoidTy(llvm_);
+    llvm::Type* retTy = fnTy->funcReturn
+        ? lowerTypeRef(resolveTypeParamRef(fnTy->funcReturn))
+        : llvm::Type::getVoidTy(llvm_);
     std::vector<llvm::Type*> thunkParamTys;
     thunkParamTys.push_back(ptrTy());  // env (ignored)
-    for (const auto& fp : fnTy->funcParams)
-        thunkParamTys.push_back(fp.type ? lowerTypeRef(fp.type) : ptrTy());
+    for (std::size_t i = 0; i < fnTy->funcParams.size(); ++i) {
+        const sema::TypeRef* paramTy = resolvedParamTy(i);
+        thunkParamTys.push_back(paramTy ? lowerTypeRef(paramTy) : ptrTy());
+    }
     auto* thunkFnTy = llvm::FunctionType::get(retTy, thunkParamTys, false);
 
     // Reuse a cached thunk per (kind, member) so repeated references share ONE fn
@@ -8187,7 +8219,7 @@ llvm::Value* Emitter::makePrimIntrinsicThunk(const ast::MemberAccessExpr& ma,
     // alone (the #1170 stability reasoning applied to primitive intrinsics).
     std::pair<int, std::string> key{static_cast<int>(pt), std::string(ma.member)};
     if (isMath && !fnTy->funcParams.empty())
-        key.second += "|" + typeRefIdentityKey(fnTy->funcParams[0].type);
+        key.second += "|" + typeRefIdentityKey(resolvedParamTy(0));
     if (auto cit = primIntrinsicThunks_.find(key);
         cit != primIntrinsicThunks_.end())
         return buildMethodClosureCell(cit->second, /*instMethod=*/false,
@@ -8248,10 +8280,17 @@ llvm::Value* Emitter::makePrimIntrinsicThunk(const ast::MemberAccessExpr& ma,
         exprValueOverride_[argExpr.get()] = thunk->getArg(static_cast<unsigned>(i) + 1);
         // Some intrinsic handlers (numeric Parse) inspect the arg's exprType to
         // select the string-parse branch — give the synthetic arg its param type.
-        if (fnTy->funcParams[i].type)
-            ctx_.setExprType(
-                argExpr.get(),
-                const_cast<sema::TypeRef*>(fnTy->funcParams[i].type));
+        //
+        // fix #6295 item 1: the type is the RESOLVED one (the active
+        // monomorphization's), so the `Math` lowering's own predicates — the
+        // unsigned-ordering test, the decimal test, the string test and the
+        // `CompareTo` lookup — read the CONCRETE type of the substitution and
+        // not the erased type parameter. (An unresolved `V` reaches none of
+        // them: the unsigned test reads a Primitive and finds none, so the
+        // comparison was emitted SIGNED.)
+        const sema::TypeRef* argTy = resolvedParamTy(i);
+        if (argTy)
+            ctx_.setExprType(argExpr.get(), const_cast<sema::TypeRef*>(argTy));
         synthArgs.push_back(argExpr.get());
         arg.value = std::move(argExpr);
         synthCall->args.push_back(std::move(arg));

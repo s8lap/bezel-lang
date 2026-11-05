@@ -2628,6 +2628,40 @@ private:
     // clause the parameter is unconstrained and we fire.
     bool isCurrentScopeTypeParamConstrained(std::string_view name) const;
 
+    // fix #6295 item 1 (§14.2, §27.6, stdlib §2.2, v0.355): does the type
+    // parameter `paramName` satisfy the SELF-RECURRENT bound `where T:
+    // IComparable<T>`?
+    //
+    // §14.2 *A type parameter as the type argument* case 1: "The argument is
+    // a type parameter `P` ... the constraint is decided at that site, by `P`'s
+    // own constraints. `P` satisfies the constraint exactly when its
+    // constraints guarantee it at every substitution they admit, as a matter
+    // of language rule — an ordinary interface's conforming set is open, so an
+    // interface bound excludes only what a language rule excludes."
+    //
+    // §14.2 *Interface conformance* rule 6: "`T` is a type parameter whose
+    // constraints guarantee conformance to `I`: a type-bound constraint naming
+    // `I` or an interface extending `I`".
+    //
+    // §14.2 *Conditionally-admitted members* rule 2 states the shape outright:
+    // "`Array<T>.Sort()` is rejected in a body whose `T` is unconstrained and
+    // admitted under `where T: IComparable<T>`, as `x.CompareTo(y)` on a
+    // `T`-typed `x` would be."
+    //
+    // THE ONE WALK. `forEachConstraintBound` is the routine the compiler
+    // already uses to read what a type parameter's `where` clause establishes
+    // (the #484 member-through-constraint resolver, §11.8's static-operator
+    // lookup, §14.2's collection view). A second walk would be a second,
+    // drifting answer to the same question.
+    //
+    // `paramRef` is the parameter's OWN resolved reference (the type argument
+    // the caller read), so the bound's argument is compared with it — a bare
+    // type-parameter reference has no declaration, so `Resolver::typeRefEqual`
+    // (a declaration compare) would equate ANY two of them; the same-scope
+    // compare reads the head spelling instead (#6315).
+    bool typeParamSatisfiesSelfComparable(std::string_view paramName,
+                                           const TypeRef* paramRef);
+
     // fix #4229 (§31.2.1 / §12.7 / §2.8.3 rule 4 / §17.4, §19.3, v0.300): does
     // `t` mention a free/rigid type parameter of the ENCLOSING scope anywhere —
     // the shape (`Named` + no decl + no args + non-empty head) used as a proxy

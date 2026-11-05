@@ -6001,6 +6001,105 @@ bool ExprTC::isCurrentScopeTypeParamConstrained(std::string_view name)
     return false;
 }
 
+// fix #6295 item 1 (§14.2, §27.6, stdlib §2.2, v0.355): the helper that
+// decides a TYPE-PARAMETER type argument against §2.2's `where T:
+// IComparable<T>` bound. See the declaration comment on the impl header for
+// the spec citations.
+//
+// (b) `where V: J<V>` where `J` EXTENDS `IComparable<V>` — §14.2
+// *Interface conformance* rule 6's "an interface extending `I`". The
+// extension chain is walked in the context of the instantiation's OWN
+// arguments (§14.1 instantiation), so `interface J<T>: IComparable<T>` read
+// at `J<V>` yields the base `IComparable<V>` and not `IComparable<T>`.
+//
+// The walk is over the DECLARED bases (`baseTypeRefs`), each instantiated
+// with the declaration's own parameters bound to the bound's arguments; a
+// base that is not an interface contributes nothing (a class base cannot
+// establish an INTERFACE conformance for a DIFFERENT type argument —
+// `IComparable` is invariant, §12.9).
+static bool interfaceExtendsSelfComparable(
+    const TypeRef* inst, TypeSymbol* icmp,
+    const std::function<bool(const TypeRef*)>& isTheParam, SemaContext& ctx) {
+    if (!inst || !inst->declaration || !icmp) return false;
+    TypeSymbol* decl = inst->declaration;
+    // The instantiation's own arguments, keyed by the DECLARATION's parameter
+    // names (§14.1).
+    std::unordered_map<std::string_view, TypeRef*> subst;
+    for (std::size_t i = 0;
+         i < decl->genericParams.size() && i < inst->genericArgs.size(); ++i) {
+        Symbol* gp = decl->genericParams[i];
+        TypeRef* ga = inst->genericArgs[i];
+        if (gp && ga) subst[gp->name] = ga;
+    }
+    std::vector<TypeSymbol*> frontier{decl};
+    std::unordered_set<TypeSymbol*> seen{decl};
+    while (!frontier.empty()) {
+        TypeSymbol* t = frontier.back();
+        frontier.pop_back();
+        for (const TypeRef* br : t->baseTypeRefs) {
+            if (!br) continue;
+            TypeRef* base = const_cast<TypeRef*>(br);
+            if (!subst.empty()) {
+                SubstArgs sa = {ctx, subst};
+                base = sema::substituteGenericArgs(base, sa);
+            }
+            if (!base) continue;
+            if (base->declaration == icmp) {
+                if (base->genericArgs.size() == 1 &&
+                    isTheParam(base->genericArgs[0]))
+                    return true;
+                continue;
+            }
+            if (base->declaration &&
+                base->declaration->kind == ast::TypeDeclKind::Interface &&
+                seen.insert(base->declaration).second)
+                frontier.push_back(base->declaration);
+        }
+    }
+    return false;
+}
+
+bool ExprTC::typeParamSatisfiesSelfComparable(std::string_view paramName,
+                                               const TypeRef* paramRef) {
+    TypeSymbol* icmp = ctx_.builtinInterfaceSym("IComparable");
+    if (!icmp) return false;
+    // The bound's argument must BE this parameter: both are the same bare
+    // type-parameter reference, whose only identity is its SPELLING (§14.1 —
+    // "A type parameter has no qualified spelling").
+    auto isTheParam = [&](const TypeRef* t) -> bool {
+        return t && !t->nullable && t->kind == TypeRef::Kind::Named &&
+               !t->declaration &&
+               Resolver::typeRefEqualSameScope(t, paramRef);
+    };
+    bool admitted = false;
+    // THE ONE WALK: `forEachConstraintBound` — the method's constraints
+    // first, then the enclosing type's, then the enclosing extension's, with
+    // the `where T: U` chain followed (§14.2 *Type-parameter bounds*).
+    forEachConstraintBound(
+        paramName, [&](TypeRef* ctr) -> bool {
+            if (!ctr) return false;
+            // (a) `where V: IComparable<V>` — the bound names the interface
+            // ITSELF, with the parameter as its single argument.
+            if (ctr->declaration == icmp) {
+                if (ctr->genericArgs.size() == 1 &&
+                    isTheParam(ctr->genericArgs[0])) {
+                    admitted = true;
+                    return true;
+                }
+                return false;
+            }
+            // (b) `where V: J<V>` where `J` extends `IComparable<V>`.
+            if (!ctr->declaration ||
+                ctr->declaration->kind != ast::TypeDeclKind::Interface)
+                return false;
+            if (!interfaceExtendsSelfComparable(ctr, icmp, isTheParam, ctx_))
+                return false;
+            admitted = true;
+            return true;
+        });
+    return admitted;
+}
+
 // fix #4916 (§3.6 rule 2, §5.1, §14.2, v0.307): the #4810 `checkAssignable`
 // arm's diagnostic must name the SOURCE TYPE — `from->primitive` — so the
 // user knows WHICH primitive the rule is rejecting (the OLD wording said
