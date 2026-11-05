@@ -15583,6 +15583,35 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     elemTy472,
                                     ctx_.builtinInterfaceSym("IComparable")))
                                 isComparableElem = true;
+                            // fix #7766 (stdlib §2.5 / §4.4 / §2.8, spec
+                            // §14.2, v0.355): (d) a BUILT-IN VALUE RECORD.
+                            // stdlib §2.5 declares `DateTime: IComparable<
+                            // DateTime>`, `TimeSpan: IComparable<TimeSpan>`,
+                            // `DateOnly: IComparable<DateOnly>` and `TimeOnly:
+                            // IComparable<TimeOnly>`, and §14.2 admits
+                            // "records ... implementing it". They carry no
+                            // user TypeDecl (no `baseTypeRefs`), so none of
+                            // the arms above saw the conformance. A user type
+                            // of the same name (a real `decl`) keeps the
+                            // arms above, and a NULLABLE element never
+                            // satisfies a type bound (§14.2). `Guid` (also
+                            // `IComparable<Guid>`, §2.6) is a 128-bit struct
+                            // whose lowering is not a scalar word, so it keeps
+                            // its pre-existing refusal, as #8049 did for
+                            // `Min()`/`Max()`.
+                            if (!isComparableElem && elemTy472 &&
+                                elemTy472->kind == TypeRef::Kind::Named &&
+                                !elemTy472->nullable &&
+                                !(elemTy472->declaration &&
+                                  elemTy472->declaration->decl)) {
+                                std::string_view bn7766 =
+                                    namedTypeName(elemTy472);
+                                if (bn7766 == "DateTime" ||
+                                    bn7766 == "TimeSpan" ||
+                                    bn7766 == "DateOnly" ||
+                                    bn7766 == "TimeOnly")
+                                    isComparableElem = true;
+                            }
                             if (!isComparableElem) {
                                 // fix #2790: name the form the user actually
                                 // wrote, and point at that form's comparer

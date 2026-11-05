@@ -7768,11 +7768,35 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // names are MODULE-QUALIFIED (`mangledTypeName`), per §2.8.3
             // rule 3 — see buildObjectCompareToThunk for what the unqualified
             // class name cost (#3512).
+            // fix #7766 (stdlib §2.5 / §4.4 / §2.8, spec §14.2, v0.355): a
+            // BUILT-IN VALUE RECORD element (`DateTime`, `TimeSpan`,
+            // `DateOnly`, `TimeOnly`) is stored INLINE as ONE scalar word and
+            // has no user TypeDecl, so none of the comparators below fit it:
+            // `bz$intcmp` loads an i32 and would sort a 64-bit tick word by its
+            // low half (and by a wrapping subtraction). Order it by its own
+            // `CompareTo` (§2.5: DateTime by TICKS with `Kind` masked off,
+            // TimeSpan by signed ticks, DateOnly by day number, TimeOnly by
+            // millisecond-of-day) via the shared value comparator the
+            // SortedDictionary key path uses (`buildSortedKeyComparator`).
+            // `Guid` is NOT here (a 128-bit struct; sema keeps refusing it).
+            llvm::Function* temporalCmpFn = nullptr;
+            if (elemTR && elemTR->kind == sema::TypeRef::Kind::Named &&
+                !elemTR->nullable) {
+                const sema::TypeRef* er7766 = resolveTypeParamRef(elemTR);
+                std::string_view h7766 =
+                    (er7766 && !er7766->nullable) ? builtinTypeName(er7766)
+                                                  : std::string_view{};
+                if (h7766 == "DateTime" || h7766 == "TimeSpan" ||
+                    h7766 == "DateOnly" || h7766 == "TimeOnly")
+                    temporalCmpFn = buildSortedKeyComparator(elemTR);
+            }
             bool isStringElem =
                 !classCompareMs && !ifaceCmpFn && (elemTy2 == ptrTy());
             llvm::Function* cmpFn = nullptr;
             if (ifaceCmpFn) {
                 cmpFn = ifaceCmpFn;
+            } else if (temporalCmpFn) {
+                cmpFn = temporalCmpFn;
             } else if (classCompareMs) {
                 // Class IComparable<T> comparator thunk: dispatches a.CompareTo(b)
                 // via vtable (virtual/override) or direct compiled call otherwise.
@@ -8056,11 +8080,35 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 ifaceCompareMs2
                     ? ensureIfaceCmpThunk(elemTR2->declaration, ifaceCompareMs2)
                     : nullptr;
+            // fix #7766 (stdlib §2.5 / §4.4 / §2.8, spec §14.2, v0.355): a
+            // BUILT-IN VALUE RECORD element (`DateTime`, `TimeSpan`,
+            // `DateOnly`, `TimeOnly`) is stored INLINE as ONE scalar word and
+            // has no user TypeDecl, so none of the comparators below fit it:
+            // `bz$intcmp` loads an i32 and would sort a 64-bit tick word by its
+            // low half (and by a wrapping subtraction). Order it by its own
+            // `CompareTo` (§2.5: DateTime by TICKS with `Kind` masked off,
+            // TimeSpan by signed ticks, DateOnly by day number, TimeOnly by
+            // millisecond-of-day) via the shared value comparator the
+            // SortedDictionary key path uses (`buildSortedKeyComparator`).
+            // `Guid` is NOT here (a 128-bit struct; sema keeps refusing it).
+            llvm::Function* temporalCmpFn2 = nullptr;
+            if (elemTR2 && elemTR2->kind == sema::TypeRef::Kind::Named &&
+                !elemTR2->nullable) {
+                const sema::TypeRef* er7766 = resolveTypeParamRef(elemTR2);
+                std::string_view h7766 =
+                    (er7766 && !er7766->nullable) ? builtinTypeName(er7766)
+                                                  : std::string_view{};
+                if (h7766 == "DateTime" || h7766 == "TimeSpan" ||
+                    h7766 == "DateOnly" || h7766 == "TimeOnly")
+                    temporalCmpFn2 = buildSortedKeyComparator(elemTR2);
+            }
             bool isStringElem2 =
                 !classCompareMs2 && !ifaceCmpFn2 && (elemTy2 == ptrTy());
             llvm::Function* cmpFn2 = nullptr;
             if (ifaceCmpFn2) {
                 cmpFn2 = ifaceCmpFn2;
+            } else if (temporalCmpFn2) {
+                cmpFn2 = temporalCmpFn2;
             } else if (classCompareMs2) {
                 // Class IComparable<T> comparator thunk. per §14.2 / #1195.
                 //
