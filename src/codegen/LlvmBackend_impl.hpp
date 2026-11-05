@@ -16369,6 +16369,56 @@ private:
     std::unordered_set<const void*> recordCallResultReleaseEligible_;
     llvm::Function* recordCallResultReleaseEligibleFn_ = nullptr;
 
+    // fix #8162 (stdlib §3.3, v0.355): the MAP from a `new
+    // ReadOnlyStringSpan(source, start, length)` NewExpr node to the
+    // LocalDecl node it initializes — populated ONLY for the spans the
+    // conservative escape walk proved NON-escaping (see
+    // collectCtorSpanBorrowEligible).
+    //
+    // WHAT THE MAP MEANS. stdlib §3.3 (v0.355) defines `Slice` — the
+    // factory that mints a span — as `new ReadOnlyStringSpan(Source,
+    // this.Start + start, length)`: the span's `Source` is the SOURCE
+    // STRING'S OWN REFERENCE, and the span BORROWS it (the span is a
+    // {ptr,i32,i32} value struct; it mints no +1 of its own — the same
+    // discipline the `AsSpan`/`Slice` factories use). The brief for #8162
+    // asks for exactly that: "make the constructor path dispose like the
+    // Slice path" — the SOURCE's own scope-end release fires, and the
+    // constructor path is not the `Slice` path's twin.
+    //
+    // WHY THE MAP IS NEEDED. The conservative escape walk
+    // (StringEscapeWalker::walkNewArgs) treats EVERY argument of a
+    // `new T(args)` expression as an ESCAPE unless the constructor is a
+    // RESOLVED USER constructor (#2023) or one of the §31.4 built-in
+    // exception constructors (#2324). `ReadOnlyStringSpan` is a built-in
+    // record with NEITHER, so the source local was an unconditional
+    // ESCAPE, was excluded from `stringReleaseEligible_`, and its
+    // scope-end `bz_string_release` never fired — the leak of issue
+    // #8162 (4334 B in 202 allocations over 100 iterations).
+    //
+    // WHY THE MAP IS THE GATE. The relaxation (the source's scope-end
+    // release fires) is sound ONLY while the span cannot outlive the
+    // source's release, so it is admitted ONLY for a span that
+    //   (a) is the INITIALIZER of a local declaration — a span built in
+    //       a return value, an argument, or an assignment is not in the
+    //       map, and keeps the conservative escape; and
+    //   (b) never ESCAPES — returned, captured by a closure, stored into
+    //       a field/collection, or passed as an argument is an escape
+    //       (the SAME conservative walk the string-local releases use),
+    //       and keeps the conservative escape.
+    // A span in the map dies no later than its source's scope end (the
+    // source is in scope at the span's declaration, so the source's scope
+    // encloses or equals the span's), so releasing the source at its own
+    // scope end can never free a string an alive span still points at.
+    // A span that ESCAPES keeps the conservative escape: its source is
+    // not released (a leak — the safe direction), so the escaped span
+    // stays valid, exactly as §3.3 requires ("the span may sit in
+    // fields, cross `await`, and outlive any scope").
+    //
+    // Keyed by the NewExpr node pointer; the value is the candidate's OWN
+    // LocalDecl node pointer, exactly like `recordCallResultReleaseEligible_`
+    // above.
+    std::unordered_map<const void*, const void*> ctorSpanBorrowDecl_;
+
     // fix #4266 (§9.7 / §28.9): the "declare, then assign" twin of the set
     // above — a plain `var outer: P;` (NO initializer) whose SOLE
     // reassignment anywhere in the body is `outer := <call>;` /
@@ -20083,6 +20133,15 @@ private:
     llvm::Function* stringReleaseEligibleFn_ = nullptr;
     // Compute stringReleaseEligible_ for a block body (see the .cpp).
     void collectStringReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // fix #8162 (stdlib §3.3, v0.355): compute ctorSpanBorrowDecl_ for a
+    // block body — the `new ReadOnlyStringSpan(source, start, length)`
+    // expressions that initialize a local declaration and whose span the
+    // conservative escape walk proved non-escaping (see the map's own
+    // comment). Called from INSIDE collectStringReleaseEligible, before its
+    // two string walks, so the map and the walk that consults it always
+    // describe the SAME body.
+    void collectCtorSpanBorrowEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // fix #6170 step 2/3 (§28.9 / §35.4, v0.338): the #2115 armed set of
     // value-like choice owner locals among `cands` (all declared in `body`):

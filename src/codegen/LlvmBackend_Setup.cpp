@@ -11471,6 +11471,16 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // test beside it documents the invariant rather than a behaviour change.
     stringLocalCandidates_.clear();
     stringReleaseEligibleFn_ = fn;
+    // fix #8162 (stdlib §3.3, v0.355): the `new ReadOnlyStringSpan(source,
+    // start, length)` construction sites whose `Source` argument is a
+    // CALL-BOUNDED BORROW (the map from the NewExpr node to the LocalDecl
+    // node it initializes). The clear()+populate contract (mirrors every
+    // sibling set above): the map is populated ONLY by
+    // collectCtorSpanBorrowEligible, which runs under the
+    // `ci.bodyKind == Block && ci.stmts` gate a few lines below — so the
+    // map is cleared here unconditionally, and an expression-bodied method
+    // never inherits the previous body's verdict.
+    ctorSpanBorrowDecl_.clear();
     // #1003 / stdlib §5 / §28: which plain `var` borrowing-Array locals bound to a
     // fresh materializer (ToArray/Sorted/Reversed) may have their backing reclaimed
     // at scope end (mirrors stringReleaseEligible_; consulted in lowerLocalDecl).
@@ -31187,6 +31197,27 @@ struct StringEscapeWalker {
     // the source local keeps (and may release) its own. Null => every
     // construction argument stays a conservative escape.
     const std::unordered_set<const void*>* retainedCtorArgs = nullptr;
+    // fix #8162 (stdlib §3.3, v0.355): the MAP from a `new
+    // ReadOnlyStringSpan(source, start, length)` NewExpr node to the
+    // LocalDecl node it initializes, populated ONLY for the spans the
+    // conservative escape walk proved non-escaping
+    // (collectCtorSpanBorrowEligible). A NewExpr IN the map is a
+    // CALL-BOUNDED BORROW of its `Source` argument — the span borrows the
+    // source's storage and mints no +1 of its own (the `Slice`/`AsSpan`
+    // factories' own discipline, §3.3), so the source local keeps its own
+    // reference and may release it at its scope end.
+    //
+    // A NewExpr NOT in the map is a conservative ESCAPE: the source local
+    // is excluded from `stringReleaseEligible_` and its scope-end release
+    // never fires — the leak-over-UAF direction, and the behaviour of every
+    // non-built-in constructor argument in this walker.
+    //
+    // Null in every walk that does not decide a string local's scope-end
+    // release (the dict-materializer, grouping, borrowing-`Array`,
+    // value-like-choice, record and out-var walks), so those are
+    // bit-identical to before.
+    const std::unordered_map<const void*, const void*>* ctorSpanBorrowDecl =
+        nullptr;
     // fix #6170 step 2 (§28.9 / §35.4, v0.338): the value-like choice OWNER
     // locals of this body (the #2115 walk's current armed set). Each such
     // local retains its whole value when it is bound from a copy and when it
@@ -32521,6 +32552,95 @@ struct StringEscapeWalker {
                     ct->primitive == sema::PrimitiveType::String &&
                     a.modifier.empty() && !a.isDiscard;
                 expr(a.value.get(), safeArg);
+            }
+            return;
+        }
+        // fix #8162 (stdlib §3.3, v0.355): the BUILT-IN `ReadOnlyStringSpan`
+        // record's positional constructor — `new ReadOnlyStringSpan(source,
+        // start, length)` — is a third built-in whose constructor takes a
+        // plain `string` parameter (the other two are the §31.4 exception
+        // ctors above and the resolved user ctors below).
+        //
+        // §3.3 defines the span's own factory in terms of this constructor
+        // — "`Slice` is `new ReadOnlyStringSpan(Source, this.Start + start,
+        // length)`" — and the span it builds is a {ptr,i32,i32} VALUE struct
+        // that BORROWS the source: it mints no +1 of its own, exactly like
+        // the `AsSpan`/`Slice` factories. So the constructor's `Source`
+        // argument is a CALL-BOUNDED BORROW of the caller's local, and the
+        // source local keeps its own reference and may release it at its
+        // scope end.
+        //
+        // WITHOUT this relaxation the source local is an unconditional
+        // ESCAPE, so its scope-end release never fires and the source
+        // string leaks — issue #8162: 4334 bytes in 202 allocations over
+        // 100 iterations of `new ReadOnlyStringSpan(w, 1, 3)`.
+        //
+        // NARROW, and deliberately so — the relaxation is admitted ONLY for
+        // a NewExpr in `ctorSpanBorrowDecl` (fix #8162's map), i.e. one
+        // that (a) initializes a LOCAL DECLARATION and (b) is proven
+        // non-escaping by the SAME conservative escape walk the string
+        // locals use. A span built in a return value, in an argument, or
+        // in an assignment is NOT in the map, and a span that escapes (is
+        // returned, captured by a closure, stored into a field/collection,
+        // or passed as an argument) is NOT in the map either: for those the
+        // conservative escape stands, the source is not released, and the
+        // span stays valid (§3.3: "the span may sit in fields, cross
+        // `await`, and outlive any scope") — leak over UAF, the safe
+        // direction. A span IN the map dies no later than its source's
+        // scope end (the source is in scope at the span's declaration), so
+        // releasing the source at its own scope end can never free a string
+        // an alive span still points at.
+        //
+        // The argument shape is resolved to its FIELD SLOT exactly as the
+        // ctor arm resolves it (LlvmBackend_Exprs2.cpp's
+        // `ReadOnlyStringSpan` arm): a positional argument takes the next
+        // unclaimed slot, a named argument takes the slot its field name
+        // names, so the named spelling
+        // `new ReadOnlyStringSpan(Start := 1, Length := 3, Source := w)` is
+        // admitted too, and an argument that binds nothing (or two
+        // arguments that claim the same slot — the ctor arm DECLINES both)
+        // falls back to the conservative escape. Only the `Source` slot is
+        // a safe read — `Start`/`Length` are integers and carry no
+        // reference — and a modified (`owned`/`ref`/`out`) or discarded
+        // argument is not a plain borrow, so the conservative escape
+        // applies to it.
+        if (ne->type && ne->type->name && !ne->type->name->parts.empty() &&
+            ne->type->name->parts[0] == "ReadOnlyStringSpan" &&
+            ne->args.size() == 3) {
+            static const char* const kROSSFields[3] = {
+                "Source", "Start", "Length"};              // stdlib §3.3
+            std::size_t rossSlotOf[3] = {3, 3, 3};
+            bool rossClaimed[3] = {false, false, false};
+            std::size_t rossPos = 0;
+            bool rossOk = true;
+            for (std::size_t ai = 0; ai < 3; ++ai) {
+                const ast::CallArgument& a = ne->args[ai];
+                std::size_t slot = 3;
+                if (a.name.empty()) {
+                    slot = rossPos++;
+                } else {
+                    for (std::size_t j = 0; j < 3; ++j)
+                        if (a.name == kROSSFields[j]) { slot = j; break; }
+                }
+                if (slot >= 3 || rossClaimed[slot]) { rossOk = false; break; }
+                rossClaimed[slot] = true;
+                rossSlotOf[ai] = slot;
+            }
+            // fix #8162: the borrow is admitted ONLY for a map entry — a
+            // local-declaration initializer whose span the conservative
+            // escape walk proved non-escaping.
+            const bool rossBorrow =
+                ctorSpanBorrowDecl &&
+                ctorSpanBorrowDecl->count(static_cast<const void*>(ne)) > 0;
+            if (!rossOk) {
+                walkAllEscape();
+                return;
+            }
+            for (std::size_t ai = 0; ai < 3; ++ai) {
+                const ast::CallArgument& a = ne->args[ai];
+                bool plain = a.modifier.empty() && !a.isDiscard;
+                expr(a.value.get(),
+                     /*safeRead=*/plain && rossBorrow && rossSlotOf[ai] == 0);
             }
             return;
         }
@@ -37918,6 +38038,20 @@ void Emitter::collectStringReleaseEligible(
     stringBorrowAll_.clear();
     stringLocalCandidates_.clear();               // fix #2817
     valueLikeChoiceStrReleaseEligible_.clear();  // fix #2115
+    // fix #8162 (stdlib §3.3, v0.355): populate the CONSTRUCTOR-BORROW map
+    // for THIS body — the `new ReadOnlyStringSpan(source, start, length)`
+    // construction sites whose span the conservative escape walk proves
+    // non-escaping. The two string walks below consult it: the source of
+    // such a span is a CALL-BOUNDED BORROW (§3.3 — the span is a
+    // {ptr,i32,i32} value struct that mints no +1 of its own), so the
+    // source local's own scope-end release may fire (issue #8162's leak).
+    //
+    // The map is populated HERE, inside the pass that consults it, so the
+    // two always describe the SAME body — the pass is called for every body
+    // the string walks run over (a method body, a lambda body, a
+    // constructor body, an iterator body, a `do` block, a `finally` block),
+    // and each such call re-populates the map for that body.
+    collectCtorSpanBorrowEligible(body);
     // fix #6170 step 3: the field-owner scan feeds the const predicate
     // valueLikeChoiceLocalMintsStringPayload below, so it runs first.
     collectValueLikeChoiceFieldOwners();
@@ -38392,6 +38526,13 @@ void Emitter::collectStringReleaseEligible(
         // collectObjectStringReleaseEligible (which populates the set).
         w.objectStringBorrowAliases = &objectStringBorrowAll_;
         w.retainedCtorArgs = &retainedCtorArgs;  // fix #6170
+        // fix #8162 (stdlib §3.3, v0.355): consult the CONSTRUCTOR-BORROW
+        // MAP — a `new ReadOnlyStringSpan(source, start, length)` in the map
+        // borrows its source (the span mints no +1 of its own, §3.3), so the
+        // source local's own scope-end release may fire. A construction site
+        // NOT in the map (a span built in a return value, an argument or an
+        // assignment, or a span that escapes) keeps the conservative escape.
+        w.ctorSpanBorrowDecl = &ctorSpanBorrowDecl_;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringReleaseEligible_.insert(static_cast<const void*>(ld));
@@ -38423,6 +38564,13 @@ void Emitter::collectStringReleaseEligible(
         // string is a borrow too).
         w.objectStringBorrowAliases = &objectStringBorrowAll_;
         w.retainedCtorArgs = &retainedCtorArgs;  // fix #6170
+        // fix #8162 (stdlib §3.3, v0.355): consult the CONSTRUCTOR-BORROW
+        // MAP — a `new ReadOnlyStringSpan(source, start, length)` in the map
+        // borrows its source (the span mints no +1 of its own, §3.3), so the
+        // source local's own scope-end release may fire. A construction site
+        // NOT in the map (a span built in a return value, an argument or an
+        // assignment, or a span that escapes) keeps the conservative escape.
+        w.ctorSpanBorrowDecl = &ctorSpanBorrowDecl_;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringBorrowRetainEligible_.insert(static_cast<const void*>(ld));
@@ -38638,6 +38786,96 @@ static bool isClassWithRecordOrChoiceField(const sema::TypeSymbol* ts,
         }
     }
     return false;
+}
+// fix #8162 (stdlib §3.3, v0.355): compute ctorSpanBorrowDecl_ — the
+// `new ReadOnlyStringSpan(source, start, length)` expressions that
+// initialize a LOCAL DECLARATION and whose span the conservative escape walk
+// proves NON-escaping. Those are the constructor calls whose `Source`
+// argument is a CALL-BOUNDED BORROW, so the source local's own scope-end
+// release may fire (the map's own comment in LlvmBackend_impl.hpp carries
+// the full argument).
+//
+// WHY A MAP AND NOT A FLAG. The relaxation the map enables is a property of
+// the CONSTRUCTION SITE, not of the constructor: the same `new
+// ReadOnlyStringSpan(w, 1, 3)` expression is a safe borrow when it
+// initializes a local that never escapes, and an ESCAPE when it is returned,
+// passed as an argument, or assigned — the span then outlives the source's
+// scope, so the source must NOT be released. The conservative escape walk
+// (StringEscapeWalker) answers exactly that question, per construction site.
+//
+// THE ESCAPE PROOF uses the walker's DEFAULT (conservative) mode — NOT the
+// string walk's `stringReleaseMode` opt-ins. The span local is a RECORD, not
+// a string, so the string-specific relaxations do not apply to it, and
+// leaving them off makes EVERY use of the span beyond a plain field / index
+// read an escape: a span that is returned, captured by a closure, stored into
+// a field or a collection, or passed as an argument is NOT admitted, so its
+// source keeps the conservative escape (the source is not released — a leak,
+// the safe direction) and the span stays valid (§3.3: "the span may sit in
+// fields, cross `await`, and outlive any scope").
+//
+// THE ADMITTED SHAPE is sound because a span in the map dies no later than
+// its source: the source is in scope at the span's declaration, so the
+// source's scope encloses or equals the span's, and the span's own scope end
+// is at or before the source's. Releasing the source at the source's scope
+// end therefore cannot free a string an alive span still points at.
+void Emitter::collectCtorSpanBorrowEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    ctorSpanBorrowDecl_.clear();
+    // The candidate PAIRS: the LocalDecl node (the escape walk's target) and
+    // the NewExpr node (the map's key).
+    std::vector<std::pair<const ast::Node*, const ast::NewExpr*>> candidates;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            // LOCALDECL-ONLY: a §21.1 runtime `const` (ast::LocalConstDecl)
+            // is a sibling node with no `initializer`, so it never matches
+            // here — and it takes no disposal obligation anyway.
+            LocalDeclInitView v = localDeclInitView(ld);
+            if (v.init && !v.isUsing) {
+                if (auto* ne = dynamic_cast<const ast::NewExpr*>(v.init)) {
+                    if (ne->type && ne->type->name &&
+                        !ne->type->name->parts.empty() &&
+                        ne->type->name->parts[0] == "ReadOnlyStringSpan" &&
+                        ne->args.size() == 3)
+                        candidates.emplace_back(ld, ne);
+                }
+            }
+        }
+        // Recurse into nested blocks — the candidate decl is usually INSIDE a
+        // loop body (the issue's own repro constructs the span in a `for`
+        // body). Mirrors collectStringReleaseEligible's own scan.
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+    for (auto& c : candidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(c.first)};
+        // DEFAULT (conservative) mode: `stringReleaseMode` stays FALSE, so
+        // every use of the span beyond a plain field / index read is an
+        // escape, and the span's own declaration is never mistaken for one.
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            ctorSpanBorrowDecl_.insert(
+                {static_cast<const void*>(c.second),
+                 static_cast<const void*>(c.first)});
+    }
 }
 void Emitter::collectRecordCallResultReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
