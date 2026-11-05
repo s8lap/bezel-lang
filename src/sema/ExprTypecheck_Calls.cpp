@@ -1110,8 +1110,29 @@ bool ExprTC::linqIComparableProvablyViolated(const TypeRef* elem) const {
             // interface that reaches `IComparable` through ANY base is
             // therefore not a provable violation and is KEPT (the direct-only
             // `declaresBuiltinInterface` sent such an element to a user
-            // `extension Object { Min() }`). The type argument is not
-            // followed here: a closure hit merely KEEPS the candidate.
+            // `extension Object { Min() }`).
+            //
+            // fix #8209: the type argument is still not followed HERE — this
+            // filter is the §26.5.1 APPLICABILITY filter, and a filter never
+            // rejects: it only decides whether the §5 candidate is KEPT, so
+            // the sound direction is to KEEP every element whose conformance
+            // is not PROVABLY absent. The §5.1 GATE (the #1198 / #3139 check
+            // in the `Min()`/`Max()` arms) is the place that decides the
+            // precise question, and since #8209 it asks it at the
+            // INSTANTIATION (`classOrIfaceComparableAtInstance`): a class
+            // implementing `IComparable<int>` is not `IComparable<K>`, so the
+            // gate refuses it. The filter KEEPS the §5 candidate for that
+            // element and the gate then refuses the call — so a user's
+            // `extension Object { Min() }` does not answer it, and the call
+            // is a compile-time rejection rather than an IR-verifier abort.
+            //
+            // ⚠ THE RECORD FAMILY DIVERGES HERE, and the divergence is
+            // pre-existing (it is #8139's / #8161's shape, unchanged by
+            // #8209): a record's filter arm is DECLARATION-level
+            // (`userRecordSelfComparable`), so a record implementing
+            // `IComparable<Other>` IS a provable violation, the §5 candidate
+            // is DROPPED, and a user's `extension Object { Min() }` answers
+            // it instead of the §5.1 diagnostic. Tracked as a follow-up.
             if (k == ast::TypeDeclKind::Class ||
                 k == ast::TypeDeclKind::Interface)
                 return !inheritsBuiltinInterface(elem->declaration,
@@ -6786,6 +6807,83 @@ bool ExprTC::userRecordComparableAtInstance(const TypeRef* elem) {
         // The walk could not compose the instantiation (the symbol carries no
         // parallel `baseTypeRefs` entry) — the NAME answer stands, exactly as
         // the pre-#8161 walk's "unknown: keep" branch did.
+        return true;
+    }
+    for (TypeRef* impl : impls) {
+        if (!impl || impl->genericArgs.size() != 1) continue;
+        const TypeRef* ga = impl->genericArgs[0];
+        if (ga && typeRefEqual(ga, elem)) return true;
+    }
+    return false;
+}
+
+// fix #8209 (spec §14.2 *Interface conformance* rules 1 and 3 / §14.1
+// *Instantiation and its site*, stdlib §5.1 / §2.8, v0.355): the CLASS and
+// INTERFACE counterpart of `userRecordComparableAtInstance` above — does the
+// element type `elem` satisfy stdlib §5.1's `where T: IComparable<T>`
+// constraint AT THIS INSTANTIATION?
+//
+// THE DEFECT THIS CLOSES. The §5.1 gate read the interface NAME through the
+// base closure and never looked at its TYPE ARGUMENT, so
+//
+//     public interface IW: IComparable<int> end IW;
+//     public class K: IW
+//       public method CompareTo(o: int): int => …;
+//
+// satisfied the gate for an element of type `K`, even though `K` implements
+// `IComparable<int>` and NOT `IComparable<K>` — so `where T: IComparable<T>`
+// (stdlib §5.1) is NOT satisfied at `K`. MEASURED on r30-c1: the call was
+// ADMITTED by sema and codegen then dispatched the comparison through
+// `CompareTo(other: int)` with an `other: K` operand, and the compile aborted
+// with "Call parameter type does not match function signature!" → "IR
+// verification failed (malformed IR emitted)". Three spellings reach it: the
+// DIRECT base (`class K: IComparable<int>`), an EXTENDING INTERFACE
+// (`class K: IW` where `IW: IComparable<int>`), and a GENERIC BASE
+// (`class B<T>: IComparable<int>`, `class K: B<int>`).
+//
+// THE TWO QUESTIONS, in the same order as the record family's twin:
+//   1. the NAME question — does the element's base closure reach
+//      `IComparable` at all (spec §14.2 rules 1 and 3)? A class that reaches
+//      it through an EXTENDING INTERFACE or a GENERIC BASE conforms (rule 1);
+//      an interface that has it in its extension chain conforms (rule 3).
+//   2. the INSTANTIATION question — at `elem`'s OWN type arguments, does the
+//      closure reach `IComparable<elem>`? §14.1's substitution (the instance's
+//      arguments into the declaration) is what tells `Box<int>` from
+//      `Box<string>`, and §12.9's own `collectAncestorInstantiationsOf` walk
+//      is what composes it — the SAME helper the record family's twin and the
+//      §12.9 assignment check use, so the three cannot disagree.
+//
+// The "unknown: keep" branch (an empty `impls`) is the conservative position
+// `userRecordComparableAtInstance` takes: an IMPORTED class whose symbol
+// carries no parallel `baseTypeRefs` entry cannot be composed, so the NAME
+// answer stands.
+bool ExprTC::classOrIfaceComparableAtInstance(const TypeRef* elem) {
+    if (!elem || elem->kind != TypeRef::Kind::Named || !elem->declaration)
+        return false;
+    const auto k = elem->declaration->kind;
+    if (k != ast::TypeDeclKind::Class &&
+        k != ast::TypeDeclKind::Interface)
+        return false;
+    // The NAME question first: does the element reach `IComparable` at all —
+    // possibly through an interface that EXTENDS it, or through a base class?
+    if (!inheritsBuiltinInterface(elem->declaration, "IComparable")) return false;
+    // A NULLABLE element is NOT decided here. §14.2 says a type-bound
+    // constraint naming a class or interface "implies non-null T", so
+    // `T = K?` does not satisfy `where T: IComparable<T>` — but this gate has
+    // never decided it, and the refusal it produces is a DIFFERENT one (the
+    // codegen #2770 guard's "its `CompareTo` could not be resolved for
+    // dispatch", which owns the nullable-interface-element shape). Leaving it
+    // undecided here keeps that shape's diagnostic exactly as it is.
+    if (elem->nullable) return true;
+    // The INSTANTIATION question: at `elem`'s OWN type arguments, does the
+    // closure reach `IComparable<elem>`?
+    std::vector<TypeRef*> impls;
+    collectAncestorInstantiationsOf(
+        elem, ctx_.builtinInterfaceSym("IComparable"), impls);
+    if (impls.empty()) {
+        // The walk could not compose the instantiation (the symbol carries no
+        // parallel `baseTypeRefs` entry) — the NAME answer stands, exactly as
+        // the pre-#8209 gate's answer stood.
         return true;
     }
     for (TypeRef* impl : impls) {
@@ -13141,8 +13239,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  ast::TypeDeclKind::Class ||
                              srcElem->declaration->kind ==
                                  ast::TypeDeclKind::Interface))
-                            implIComp = inheritsBuiltinInterface(
-                                srcElem->declaration, "IComparable");
+                            implIComp = classOrIfaceComparableAtInstance(
+                                srcElem);
                         // fix #8161 (stdlib §5.1 / §2.8 / §14.2, v0.355): a
                         // RECORD element was NOT gated at all on this path —
                         // the check above covers only a class/interface
@@ -14767,8 +14865,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // the walk #8180's filter uses), not the direct
                                 // list: a class through an extending interface
                                 // or a generic base, and an interface through
-                                // its chain, conform. Like the filter, a closure
-                                // hit does not follow the type argument.
+                                // its chain, conform.
+                                //
+                                // fix #8209 (spec §14.2 *Interface conformance*
+                                // rules 1 and 3 / §14.1 *Instantiation and its
+                                // site*, stdlib §5.1 / §2.8, v0.355): a closure
+                                // hit is not enough — the closure must reach
+                                // `IComparable<elem>` AT THIS INSTANTIATION.
+                                // `classOrIfaceComparableAtInstance` asks
+                                // exactly that question (the NAME question
+                                // first, then §12.9's own instantiation
+                                // walk), so a class implementing
+                                // `IComparable<int>` — NOT
+                                // `IComparable<K>` — no longer satisfies
+                                // `where T: IComparable<T>` at an element of
+                                // type `K`. Before this, the call was ADMITTED
+                                // and codegen dispatched the comparison
+                                // through `CompareTo(other: int)` with an
+                                // `other: K` operand → "IR verification
+                                // failed".
                                 //
                                 // fix #8092 (stdlib §2.5 / §2.8, spec §14.2,
                                 // v0.355): a BUILT-IN VALUE RECORD element is
@@ -14788,8 +14903,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     elem->declaration &&
                                     !builtinValueRecordElem &&
                                     !userRecordComparable)
-                                    implIComp = inheritsBuiltinInterface(
-                                        elem->declaration, "IComparable");
+                                    implIComp = classOrIfaceComparableAtInstance(
+                                        elem);
                                 if (!implIComp) {
                                     ctx_.diagnostics().report(
                                         Severity::Error, ce.span.begin,
@@ -15579,8 +15694,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                      ast::TypeDeclKind::Class ||
                                  elem->declaration->kind ==
                                      ast::TypeDeclKind::Interface))
-                                implIComp = inheritsBuiltinInterface(
-                                    elem->declaration, "IComparable");
+                                implIComp = classOrIfaceComparableAtInstance(
+                                    elem);
                             // fix #8161 (stdlib §5.1 / §2.8, spec §14.2 /
                             // §14.1, v0.355): a RECORD element is gated by the
                             // SAME instantiation-aware predicate the

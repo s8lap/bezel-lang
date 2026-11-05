@@ -1966,6 +1966,30 @@ private:
     // (`Where(…)`) receiver.
     bool userRecordComparableAtInstance(const TypeRef* elem);
 
+    // fix #8209 (spec §14.2 *Interface conformance* rules 1 and 3 / §14.1
+    // *Instantiation and its site*, stdlib §5.1 / §2.8, v0.355): does the CLASS
+    // or INTERFACE element type `elem` satisfy stdlib §5.1's `where T:
+    // IComparable<T>` constraint AT THIS INSTANTIATION? The RECORD family's
+    // twin is `userRecordComparableAtInstance` above; this is its
+    // class/interface counterpart, and it answers the SAME two questions in the
+    // SAME order:
+    //   1. the NAME question — does the element's base closure reach
+    //      `IComparable` at all (spec §14.2 rules 1 and 3)? and
+    //   2. the INSTANTIATION question — at `elem`'s OWN type arguments, does
+    //      the closure reach `IComparable<elem>`?
+    // The judgement is §12.9's OWN — `collectAncestorInstantiationsOf` above,
+    // the §12.9 helper that collects every instantiation of the interface a
+    // type reaches, each re-expressed in the type's OWN arguments — so the
+    // constraint check and the §12.9 assignment check cannot disagree.
+    //
+    // ⚠ BEFORE #8209 the gate asked ONLY the NAME question, so a class
+    // implementing `IComparable<int>` satisfied `where T: IComparable<T>` for
+    // an element of type `K` — and codegen then dispatched the comparison
+    // through `CompareTo(other: int)` with an `other: K` operand: malformed
+    // IR ("IR verification failed"), not a diagnostic.
+    // Defined in ExprTypecheck_Calls.cpp beside `userRecordComparableAtInstance`.
+    bool classOrIfaceComparableAtInstance(const TypeRef* elem);
+
     // fix #4183 (§14.5 phase 1, §26.5, v0.296/v0.298): the BUILTIN
     // counterpart of collectAncestorInstantiationsOf above. A builtin
     // collection type (`Array<T>`, `IList<T>`, ...) has no TypeSymbol —

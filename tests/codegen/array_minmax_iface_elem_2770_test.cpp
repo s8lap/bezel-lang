@@ -396,6 +396,17 @@ BEZEL_TEST(array_minmax_iface_elem_2770, control_nullable_interface_element_reje
 // compare only the head `IG` and wrongly admit this — and would then hand the
 // itable thunk an interface whose CompareTo takes a DIFFERENT type.
 // MEASURED to abort the compiler before this fix.
+//
+// fix #8209 (spec §14.2 *Interface conformance* rules 1 and 3 / §14.1
+// *Instantiation and its site*, stdlib §5.1 / §2.8, v0.355): the §5.1 gate
+// now asks the SAME question at the INSTANTIATION, so this shape is refused
+// EARLIER — by SEMA, with the §5.1 constraint diagnostic, instead of by
+// codegen's #2770 guard.  The REFUSAL is unchanged (the program is rejected
+// either way, and it was rejected for the same reason: `IG<string>` does not
+// conform to `IComparable<IG<string>>`); only the stage that reports it and
+// the wording moved.  The needle below is therefore the §5.1 diagnostic, and
+// it names the element — a program rejected for an unrelated reason cannot
+// satisfy it.
 BEZEL_TEST(array_minmax_iface_elem_2770,
            control_invariant_generic_argument_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
@@ -418,5 +429,5 @@ BEZEL_TEST(array_minmax_iface_elem_2770,
         "    return 7; "
         "  end Main; "
         "end C; ",
-        "#2770"));
+        "IG does not implement IComparable<T>"));
 }
