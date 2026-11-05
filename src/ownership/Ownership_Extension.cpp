@@ -71,6 +71,22 @@
 // (a fixpoint over the body's local declarations) and treated as the receiver
 // itself.
 //
+// fix #8212 (§26.7 / §28.3, v0.355) adds TWO more spellings of the same
+// store:
+//
+//   * an ASSIGNMENT of the receiver to a local binding — `var a: Object? :=
+//     null; a := this; h.o := a;`. The issue's own repro binds the receiver
+//     this way, not through an initializer, so the initializer-only alias
+//     fixpoint never saw it. The alias fixpoint now reads the body's
+//     assignments as well.
+//
+//   * a CALL that RETURNS the receiver — `h.o := this.Self()`, where
+//     `Self(): Box => this`. The callee must be a locally declared instance
+//     method whose body returns the receiver (or a binding that holds it); a
+//     callee the compiler cannot read (an interface method, an imported
+//     method, a builtin) is not treated as returning the receiver, which is
+//     the direction §28.3 clause 3's residual trust already leaves open.
+//
 // fix #8217 (§26.7 / §28.3, v0.355) adds the BUILTIN CLASS head: a builtin
 // class (`StringBuilder`, `FileStream`, a collection, a task, a sync
 // primitive) resolves with `declaration == nullptr` — the compiler has no
@@ -99,11 +115,14 @@ namespace bezel::ownership {
 
 namespace {
 
-// The local bindings that hold the extension's receiver. Keyed by the
-// LocalDecl node — sema records it as the LocalSymbol's `decl`
-// (ExprTypecheck.cpp's LocalDecl arm: `lsym->decl = ld;`) — so a same-named
-// binding in another scope can never be mistaken for the alias.
-using AliasDecls = std::unordered_set<const ast::Node*>;
+// The local bindings that hold the extension's receiver.
+//
+// The key is the binding's IDENTITY: a local's DECLARATION node — sema records
+// it as the LocalSymbol's `decl` (ExprTypecheck.cpp's LocalDecl arm:
+// `lsym->decl = ld;`) — or, for a PARAMETER (whose symbol carries no `decl`),
+// the symbol itself. Either way the key is the binding's own object, so a
+// same-named binding in another scope can never be mistaken for the alias.
+using AliasDecls = std::unordered_set<const void*>;
 
 // The walk state: the receiver's aliases and whether a diagnostic was
 // already reported (one report per body is enough — the compiler reports the
@@ -113,6 +132,27 @@ struct ExtensionScan {
     bool reported = false;
 };
 
+// The bound on the "does this call return the receiver?" analysis. `Self(): T
+// => this` is one level deep; a method that returns `this.M()` where `M`
+// returns `this.M()` is deeper. The bound keeps the analysis finite on a
+// recursive method.
+constexpr int kReceiverCallDepthLimit = 8;
+
+// Forward declarations — the receiver test, the call test, the alias
+// collection and the statement walk call each other (a call's callee is a
+// member access whose target is tested for the receiver; a method body is
+// walked for its returns; the alias fixpoint feeds the receiver test).
+bool isReceiverExpr(const ast::Expr* e, const AliasDecls& aliases,
+                    const sema::SemaContext& ctx, int depth);
+bool callReturnsReceiver(const ast::CallExpr* ce, const AliasDecls& aliases,
+                         const sema::SemaContext& ctx, int depth);
+bool methodReturnsReceiver(const ast::MethodDecl& md,
+                           const sema::SemaContext& ctx, int depth);
+bool isStaticMethod(const sema::MethodSymbol& ms);
+void collectAliases(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+                    ExtensionScan& scan, const sema::SemaContext& ctx,
+                    int depth);
+
 // §26.7 (fix #7968): does `e` evaluate to the extension's receiver, or to a
 // binding that holds it?
 //
@@ -120,29 +160,115 @@ struct ExtensionScan {
 // borrow: `!` (§17.8), `as` (§17.4), `??` (§28.3 K2.2's union), a
 // conditional (§28.3's "either operand may be the value selected") and a
 // `do … end` binding atom (§17.15). A MEMBER READ off the receiver
-// (`this.f`) is NOT the receiver — it is a read of the receiver's storage —
-// and a CALL result is not the receiver either.
+// (`this.f`) is NOT the receiver — it is a read of the receiver's storage.
+//
+// fix #8212 (§26.7 / §28.3, v0.355): a CALL RESULT is the receiver when the
+// call RETURNS the receiver — the `Self(): T => this` idiom. `h.o := this` and
+// `h.o := this.Self()` are the same store; only the spelling differs. A call
+// that returns a DIFFERENT object (`this.Child()`) is not the receiver and
+// stays admitted.
 bool isReceiverExpr(const ast::Expr* e, const AliasDecls& aliases,
-                    const sema::SemaContext& ctx) {
+                    const sema::SemaContext& ctx, int depth) {
     if (!e) return false;
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
         if (id->name == "this") return true;
         const sema::Symbol* s = ctx.exprSymbol(*id);
-        return s && aliases.count(s->decl) != 0;
+        if (!s) return false;
+        // A local is keyed by its DECLARATION node; a parameter (whose symbol
+        // carries no `decl`) by the symbol itself. Neither key can be the
+        // other's object.
+        return aliases.count(s->decl) != 0 || aliases.count(s) != 0;
     }
     if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
-        return isReceiverExpr(pb->operand.get(), aliases, ctx);
+        return isReceiverExpr(pb->operand.get(), aliases, ctx, depth);
     if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e))
-        return tt->op == "as" && isReceiverExpr(tt->operand.get(), aliases, ctx);
+        return tt->op == "as" &&
+               isReceiverExpr(tt->operand.get(), aliases, ctx, depth);
     if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e))
-        return isReceiverExpr(co->thenValue.get(), aliases, ctx) ||
-               isReceiverExpr(co->elseValue.get(), aliases, ctx);
+        return isReceiverExpr(co->thenValue.get(), aliases, ctx, depth) ||
+               isReceiverExpr(co->elseValue.get(), aliases, ctx, depth);
     if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(e))
         return bin->op == "??" &&
-               (isReceiverExpr(bin->left.get(), aliases, ctx) ||
-                isReceiverExpr(bin->right.get(), aliases, ctx));
+               (isReceiverExpr(bin->left.get(), aliases, ctx, depth) ||
+                isReceiverExpr(bin->right.get(), aliases, ctx, depth));
     if (auto* bx = dynamic_cast<const ast::BindExpr*>(e))
-        return isReceiverExpr(bx->body.get(), aliases, ctx);
+        return isReceiverExpr(bx->body.get(), aliases, ctx, depth);
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e))
+        return callReturnsReceiver(ce, aliases, ctx, depth);
+    return false;
+}
+
+// fix #8212 (§26.7 / §28.3, v0.355): does this call RETURN the receiver?
+//
+// §26.7: "extensions cannot store `this`". A call that returns the receiver
+// — `public method Self(): Box => this;` — makes `this.Self()` the receiver,
+// laundered through a call; storing it is the same store as `h.o := this`.
+//
+// The callee must be a LOCALLY DECLARED instance method whose body returns
+// the receiver (or a binding that holds it). A callee the compiler cannot
+// read — an interface method (no body), an IMPORTED method (no AST), a
+// builtin — is NOT treated as returning the receiver: §28.3 clause 3's
+// residual trust leaves those shapes admitted at the call, and admitting is
+// the direction this check does not move in.
+bool callReturnsReceiver(const ast::CallExpr* ce, const AliasDecls& aliases,
+                         const sema::SemaContext& ctx, int depth) {
+    if (depth > kReceiverCallDepthLimit) return false;
+    if (!ce || !ce->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
+    if (!ma || !ma->target) return false;
+    if (!isReceiverExpr(ma->target.get(), aliases, ctx, depth)) return false;
+    const sema::Symbol* sym = ctx.exprSymbol(*ma);
+    auto* ms = dynamic_cast<const sema::MethodSymbol*>(sym);
+    if (!ms) return false;
+    if (isStaticMethod(*ms)) return false;  // a static method has no receiver
+    if (ctx.isImported(ms)) return false;    // no AST body to read
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md) return false;
+    return methodReturnsReceiver(*md, ctx, depth + 1);
+}
+
+// Is this method a STATIC one? A static method has no receiver, so a call
+// through an instance cannot return the receiver. The modifier list is the
+// symbol's own record of the declaration (`MemberSymbol::modifiers`).
+bool isStaticMethod(const sema::MethodSymbol& ms) {
+    for (std::string_view mod : ms.modifiers)
+        if (mod == "static") return true;
+    return false;
+}
+
+// fix #8212 (§26.7 / §28.3, v0.355): does this method's body return ITS
+// receiver?
+//
+// `public method Self(): Box => this;` and `public method Self(): Box { var
+// x := this; return x; }` both do; a method that returns a fresh object does
+// not. A method with several returns is a "MAY return the receiver" — the
+// store is rejected, because on that path the stored value IS the receiver.
+//
+// The `this` inside the callee's body is the CALLEE's receiver, so the
+// callee's own aliases are collected for its body — the same machinery the
+// extension body's own aliases use.
+bool methodReturnsReceiver(const ast::MethodDecl& md,
+                           const sema::SemaContext& ctx, int depth) {
+    if (depth > kReceiverCallDepthLimit) return false;
+    ExtensionScan scan;
+    if (md.bodyKind == ast::MethodBodyKind::Block) {
+        collectAliases(md.stmts, scan, ctx, depth);
+        for (const auto& s : md.stmts) {
+            if (!s) continue;
+            bool returns = false;
+            forEachNestedStmt(*s, [&](const ast::Stmt& inner) {
+                if (returns) return;
+                auto* rs = dynamic_cast<const ast::ReturnStmt*>(&inner);
+                if (!rs || !rs->value) return;
+                if (isReceiverExpr(rs->value.get(), scan.aliases, ctx, depth))
+                    returns = true;
+            });
+            if (returns) return true;
+        }
+        return false;
+    }
+    if (md.bodyKind == ast::MethodBodyKind::Expression && md.exprBody)
+        return isReceiverExpr(md.exprBody.get(), scan.aliases, ctx, depth);
     return false;
 }
 
@@ -196,7 +322,7 @@ void handleStmtForReceiverStore(const ast::Stmt& s, ExtensionScan& scan,
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
         if (as->op == ":=" && as->target && as->value &&
             isMemberSlotTarget(as->target.get(), ctx) &&
-            isReceiverExpr(as->value.get(), scan.aliases, ctx)) {
+            isReceiverExpr(as->value.get(), scan.aliases, ctx, 0)) {
             reportStore(scan, ctx, as->value->span.begin, memberSlotDiagnostic());
         }
         walkExprForReceiverStore(as->target.get(), scan, ctx);
@@ -371,16 +497,37 @@ void walkStmtForReceiverStore(const ast::Stmt& s, ExtensionScan& scan,
 }
 
 // The receiver's ALIASES: the local declarations whose initializer is the
-// receiver (or an alias of it). A fixpoint over the body's declarations, so
-// `var a := this; var b := a;` marks both.
+// receiver (or an alias of it) — a `var` or a §21.1 `const` local — and the
+// bindings an ASSIGNMENT gives the receiver. A fixpoint over the body's
+// declarations and assignments, so `var a := this; var b := a;` marks both.
+//
+// fix #8212 (§26.7 / §28.3, v0.355): the ASSIGNMENT arm. The issue's own
+// repro binds the receiver through an ASSIGNMENT, not through an
+// initializer:
+//
+//     var a: Object? := null; a := this; h.o := a;
+//
+// so the initializer-only fixpoint never saw `a` and the store was admitted.
+// The alias key is the binding's IDENTITY — a local's DECLARATION node (sema
+// records it as the LocalSymbol's `decl`, ExprTypecheck.cpp's LocalDecl arm:
+// `lsym->decl = ld;`) or, for a PARAMETER (whose symbol carries no `decl`),
+// the symbol itself — so a same-named binding in another scope can never be
+// mistaken for the alias.
+//
+// The set is FLOW-INSENSITIVE — a binding that holds the receiver anywhere
+// in the body is treated as holding it — the same posture the initializer
+// fixpoint already had: the rule is a rejection, and over-approximating
+// "this binding may hold the receiver" is the safe direction.
 void collectAliases(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
-                    ExtensionScan& scan, const sema::SemaContext& ctx) {
-    // Collect the candidate declarations first (every LocalDecl with an
-    // initializer, and every §21.1 `const` local), then iterate to a fixpoint
-    // over the alias relation. A `const a := this;` is the same laundering as
-    // `var a := this;`, so the candidates are held as `const ast::Node*` and
-    // each carries its initializer expression alongside.
+                    ExtensionScan& scan, const sema::SemaContext& ctx,
+                    int depth) {
+    // Collect the candidate declarations and assignments first, then iterate
+    // to a fixpoint over the alias relation. A `const a := this;` is the same
+    // laundering as `var a := this;`, so the candidates are held as
+    // `const ast::Node*` and each carries its initializer expression
+    // alongside.
     std::vector<std::pair<const ast::Node*, const ast::Expr*>> decls;
+    std::vector<const ast::AssignmentStmt*> assigns;
     for (const auto& s : stmts) {
         if (!s) continue;
         forEachNestedStmt(*s, [&](const ast::Stmt& inner) {
@@ -388,6 +535,10 @@ void collectAliases(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
                 if (ld->initializer) decls.emplace_back(ld, ld->initializer.get());
             } else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&inner)) {
                 if (lc->value) decls.emplace_back(lc, lc->value.get());
+            } else if (auto* as =
+                           dynamic_cast<const ast::AssignmentStmt*>(&inner)) {
+                if (as->op == ":=" && as->target && as->value)
+                    assigns.push_back(as);
             }
         });
     }
@@ -396,8 +547,31 @@ void collectAliases(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
         changed = false;
         for (const auto& [decl, init] : decls) {
             if (scan.aliases.count(decl)) continue;
-            if (!isReceiverExpr(init, scan.aliases, ctx)) continue;
+            if (!isReceiverExpr(init, scan.aliases, ctx, depth)) continue;
             scan.aliases.insert(decl);
+            changed = true;
+        }
+        for (const ast::AssignmentStmt* as : assigns) {
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(as->target.get());
+            if (!id) continue;
+            const sema::Symbol* sym = ctx.exprSymbol(*id);
+            if (!sym) continue;
+            // A LOCAL (a `var` or a `const`) or a PARAMETER — the bindings a
+            // store can be laundered through. A FIELD is NOT one: the
+            // receiver's own field is a member slot, and §28.3's field-store
+            // bullet admits a receiver-SOURCED borrow (a field read) into
+            // another slot, so a field must not become an alias.
+            const void* key = nullptr;
+            if (dynamic_cast<const sema::LocalSymbol*>(sym))
+                key = sym->decl;   // the DECLARATION node
+            else if (dynamic_cast<const sema::ParameterSymbol*>(sym))
+                key = sym;         // a parameter's symbol carries no `decl`
+            else
+                continue;
+            if (!key || scan.aliases.count(key)) continue;
+            if (!isReceiverExpr(as->value.get(), scan.aliases, ctx, depth))
+                continue;
+            scan.aliases.insert(key);
             changed = true;
         }
     }
@@ -471,7 +645,7 @@ void checkExtensionReceiverStore(const ast::MethodDecl& md,
     if (!receiverIsReference(ext, ctx)) return;
     ExtensionScan scan;
     if (md.bodyKind == ast::MethodBodyKind::Block) {
-        collectAliases(md.stmts, scan, ctx);
+        collectAliases(md.stmts, scan, ctx, 0);
         for (const auto& s : md.stmts)
             if (s) walkStmtForReceiverStore(*s, scan, ctx);
     } else if (md.bodyKind == ast::MethodBodyKind::Expression && md.exprBody) {
