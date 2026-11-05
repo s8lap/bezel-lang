@@ -32148,141 +32148,32 @@ void ExprTC::resolveExtensionMember(const ast::MemberAccessExpr& ma,
         // §27.6: a bare `x.M` in value position is a method reference of type
         // `(paramTypes) -> returnType`. The CallExpr handler (typeCall) reads
         // the MethodSymbol's decl directly for `x.M(...)`, so this Function
-        // type only affects the bare-reference case. No receiver substitution:
-        // an extension member is not generic over the receiver in this slice.
+        // type only affects the bare-reference case.
+        //
         // §27.6 (#1306): for an UNBOUND extension-method reference (type-name
         // qualifier, e.g. `Vec.Scaled`), "the resulting function has the
         // receiver as its first parameter" — so `Vec.Scaled` is `(Vec) -> int`.
         // For a BOUND reference (instance qualifier, e.g. `x.Double`), the
         // receiver is captured (#457), so the type is `() -> T` (no receiver
-        // parameter). Detect the type-name qualifier via its exprSymbol: a type
-        // name resolves to a TypeSymbol; an instance resolves to a value symbol
-        // (LocalSymbol/ParameterSymbol). The receiver (`this`) is implicit
-        // (absent from ms->params), so prepend the extension's target type as
-        // the leading function parameter ONLY for the unbound case.
-        auto* ft = ctx_.makeTypeRef();
-        ft->kind = TypeRef::Kind::Function;
-        bool unboundExtRef = false;
-        if (ms->extensionDecl && ma.target) {
-            if (auto* tgtSym = ctx_.exprSymbol(*ma.target)) {
-                unboundExtRef = dynamic_cast<TypeSymbol*>(tgtSym) != nullptr;
-                // fix #4070 (§27.6/§27.8, v0.294): a `type` alias of the
-                // extension's target class/record/interface/enum resolves
-                // `tgtSym` to a `TypeAliasSymbol`, not a `TypeSymbol` — the
-                // identical missing-arm shape #4038/#4048/#4050/#4051 all
-                // fixed in their own call chains. Left unhandled,
-                // `unboundExtRef` stays false for `AliasOfExt.Val`, so the
-                // Function TypeRef built below omits the leading receiver
-                // parameter §27.6 requires for the UNBOUND form — a real
-                // mismatch between the reference's computed type and its
-                // (correctly receiver-prepended, since codegen's own
-                // extRef derivation is independent — see makeMethodThunk)
-                // runtime thunk shape, observed as either a declared-type
-                // mismatch (§5.1) or a call-arity mismatch (§5.1) depending
-                // on whether the local's type is explicit or inferred.
-                // Resolve through the shared `resolveAliasToTypeSymbol`
-                // helper (ExprTypecheck.cpp; #4050/#4051) so an alias of the
-                // extension's target is recognized as the UNBOUND
-                // type-name-qualifier form exactly like a direct type name.
-                if (!unboundExtRef) {
-                    if (auto* aliasSym =
-                            dynamic_cast<TypeAliasSymbol*>(tgtSym)) {
-                        if (resolveAliasToTypeSymbol(aliasSym)) {
-                            unboundExtRef = true;
-                        } else if (auto* aliasDecl =
-                                       dynamic_cast<const ast::TypeAlias*>(
-                                           aliasSym->decl)) {
-                            // fix #4080 (§27.6 / §27.8, v0.294): the
-                            // shared `resolveAliasToTypeSymbol` helper is
-                            // Named-only — its signature returns
-                            // TypeSymbol* and its guard
-                            // (`underlying->kind != TypeRef::Kind::Named`)
-                            // excludes every Primitive-kind underlying by
-                            // construction. A `type` alias of a PRIMITIVE
-                            // (`type MyInt := int;`) has a Primitive-kind
-                            // `aliasedType`, so the helper above returns
-                            // null and `unboundExtRef` stays false —
-                            // mirroring the class/record/interface/enum
-                            // alias gap #4070 closed for Named underlyings
-                            // on the exact same classification site. The
-                            // `else if` arm below this block already
-                            // detects `int.Doubled` (the bare primitive-
-                            // keyword spelling, §27.6's "the reference
-                            // uses the extended type's name as
-                            // qualifier"), so an alias of a primitive
-                            // names the extended type in qualifier
-                            // position just as much — treat it as the
-                            // unbound form and prepend the receiver
-                            // parameter §27.6 requires.
-                            if (aliasDecl->aliasedType) {
-                                if (auto* underlying = ctx_.resolvedType(
-                                        *aliasDecl->aliasedType)) {
-                                    unboundExtRef = underlying->kind ==
-                                        TypeRef::Kind::Primitive;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
-                           ma.target.get())) {
-                // fix #1633: a PRIMITIVE type-name qualifier (`int.Doubled`)
-                // has NO exprSymbol at all — §5.2/ExprTypecheck_Exprs.cpp
-                // types a bare primitive-keyword identifier without a value
-                // symbol ("it has no value symbol; the enclosing call
-                // resolves the conversion"), unlike a user TypeSymbol, so the
-                // exprSymbol check above never fires for it. Detect this
-                // qualifier shape directly: a primitive keyword name in
-                // qualifier position is always a TYPE reference (never a
-                // value — no local/parameter can be named `int`, a reserved
-                // word), so it is unbound exactly like a user-type qualifier.
-                unboundExtRef = primitiveFromName(tid->name) != PrimitiveType::None;
-            }
-        }
-        if (unboundExtRef && ms->extensionDecl &&
-            ms->extensionDecl->targetType) {
-            if (auto* recvTy =
-                    ctx_.resolvedType(*ms->extensionDecl->targetType)) {
-                TypeRef::FuncParam recv;
-                recv.type = recvTy;  // by-value for records/primitives; the
-                                     // reference itself for a class receiver
-                ft->funcParams.push_back(recv);
-            }
-        }
-        for (auto* psym : ms->params) {
-            auto* par = dynamic_cast<ParameterSymbol*>(psym);
-            if (!par) continue;
-            TypeRef::FuncParam fp;
-            fp.modifier = par->modifier;
-            fp.name = par->name;
-            // fix #6898 (§27.6 / §2.5, v0.340): an IMPORTED extension method's
-            // parameter carries no syntactic `declType`, only the loader's
-            // `resolvedDeclType`; reading the AST alone left the formed
-            // function type's parameter null (sema: "not implicitly
-            // convertible" or, for a builtin receiver, a zero-valued slot).
-            if (par->declType) fp.type = ctx_.resolvedType(*par->declType);
-            if (!fp.type) fp.type = par->resolvedDeclType;
-            ft->funcParams.push_back(fp);
-        }
-        // fix #4988 (§27 / §28.3, v0.307 — sister accessor to
-        // `methodReturnsOwned` for umbrella #3152): the resolved declared
-        // return type, read both-sources. null means unit, the universal
-        // default; non-null carries the resolved declared shape. The
-        // `owned` marker is read separately through the sister accessor so
-        // the two halves never announce owned transfer on a unit-typed
-        // slot. Replaces the hand-written copy that fix #3193 (§27.6 /
-        // §26.1, v0.254) put here to thread the imported extension method's
-        // return type and `owned` marker through the formed Function
-        // TypeRef — the consolidation preserves that behaviour verbatim.
-        if (TypeRef* rt = sema::methodReturnResolvedType(*ms, ctx_)) {
-            ft->funcReturn = rt;
-        } else {
-            auto* unit = ctx_.makeTypeRef();
-            unit->kind = TypeRef::Kind::Unit;
-            ft->funcReturn = unit;
-        }
-        ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
-        ctx_.setExprType(&ma, ft);
+        // parameter). The receiver (`this`) is implicit (absent from
+        // ms->params), so the extension's target type is prepended as the
+        // leading function parameter ONLY for the unbound case.
+        //
+        // §26.4 / §27.6 (v0.355): a reference over a member of a GENERIC
+        // extension block binds the block's parameters by its qualifier, so the
+        // formed type carries the CONCRETE instantiation, not the block's
+        // abstract free variable — `extension Array<T>`'s `Head(): T` forms
+        // `() -> int` at an `Array<int>` receiver and `(Array<int>) -> int` in
+        // the type-qualified spelling. The binding is the one the formation
+        // recorded (`ctx_.exprExtBinding`, set by the §26.5 rule-2 lookup).
+        //
+        // The CALL spelling keeps the UNSUBSTITUTED shape: the call's own
+        // typing (`typeCall`) substitutes the extension's free vars into the
+        // call's return type, and the callee's expression type is not the
+        // call's type.
+        const bool isCallForm = &ma == calleeOfCallCtx_;
+        if (TypeRef* ft = buildExtensionRefType(ms, &ma, !isCallForm))
+            ctx_.setExprType(&ma, ft);
     } else if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
         // §26.1: a computed read-only extension property — its type is the
         // declared `: T`. (Property codegen is DEFERRED, #433; this types the

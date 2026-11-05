@@ -6212,6 +6212,174 @@ TypeRef* ExprTC::buildMethodRefType(const MethodSymbol* ms) {
     return ft;
 }
 
+// §27.6 (v0.355): the candidate set a method reference's overload selection
+// ranks over.
+//
+// An ordinary method's set is the same-name overloads of the receiver's class
+// hierarchy (`collectHierarchyOverloads`, §12.1/§22.6). An EXTENSION member
+// has no `parent` TypeSymbol (§26.1 — an extension method's owner is the
+// extension block, not a type), so the hierarchy walk answers nothing and the
+// selection degraded to "the first-declared member of the block" — the #8121
+// gap: the reference to an overloaded extension member was resolved by
+// DECLARATION ORDER instead of by the target function type (§27.6: "When the
+// named method (or property) is overloaded, the reference is resolved using
+// the target function type at the use site").
+//
+// The block is found by scanning the SAME candidate set `lookupExtensionMember`
+// scans (this module's own extension blocks plus the imported ones) — the
+// member symbol identifies its owner, exactly as `owningExtensionDeclOf` does
+// for the #4292 self-call check. No applicability decision is re-derived here,
+// so the set cannot drift from what the lookup actually selected.
+std::vector<MethodSymbol*> ExprTC::methodRefOverloadCandidates(
+    const MethodSymbol* ms) {
+    std::vector<MethodSymbol*> out;
+    if (!ms) return out;
+    if (ms->parent) {
+        collectHierarchyOverloads(ms->parent, ms->name, out);
+        return out;
+    }
+    if (!ms->extensionDecl) return out;
+    ExtensionSymbol* owner = nullptr;
+    auto scan = [&](ExtensionSymbol* e) {
+        if (owner) return;
+        for (Symbol* cand : e->members)
+            if (cand == ms) { owner = e; return; }
+    };
+    if (ctx_.module()) {
+        for (Symbol* child : ctx_.module()->children)
+            if (auto* e = dynamic_cast<ExtensionSymbol*>(child)) scan(e);
+    }
+    for (ExtensionSymbol* e : importedExtensions_) scan(e);
+    if (!owner) return out;
+    for (Symbol* cand : owner->members) {
+        if (!cand || cand->name != ms->name) continue;
+        if (auto* mm = dynamic_cast<MethodSymbol*>(cand)) out.push_back(mm);
+    }
+    return out;
+}
+
+// §27.6 (v0.355): the function type a method reference over an EXTENSION
+// member forms.
+//
+//   "**Type-qualified**, the reference uses the extended type's name as
+//    qualifier, at the type arguments that bind a generic block's parameters
+//    (§26.4); it captures no receiver, and the resulting function has the
+//    receiver as its first parameter. **Receiver-qualified** — `v.Scaled` over
+//    `extension Vec`, the member resolved on the value exactly as the call
+//    `v.Scaled()` is (§26.5) — … the resulting function has the method's own
+//    parameters only (`var scaled: () -> int := v.Scaled;`)."
+//
+// The block's FREE TYPE VARIABLES are substituted by the binding the
+// formation recorded (`ctx_.exprExtBinding`, §26.4 — "A reference over a
+// member of a generic extension block binds the block's parameters by its
+// qualifier"), so a reference over `extension Array<T>`'s `Head(): T` forms
+// `() -> int` at an `Array<int>` receiver and `(Array<int>) -> int` in the
+// type-qualified spelling. Without the substitution the reference formed over
+// the ABSTRACT `T`, and every use of it against a concrete target was refused
+// (§5.1) — the #8121 generic-block gap.
+TypeRef* ExprTC::buildExtensionRefType(const MethodSymbol* ms,
+                                        const ast::Expr* refExpr,
+                                        bool substitute) {
+    if (!ms) return nullptr;
+    auto* ft = ctx_.makeTypeRef();
+    ft->kind = TypeRef::Kind::Function;
+    // The free-var binding the formation recorded (§26.4).
+    std::unordered_map<std::string_view, TypeRef*> subst;
+    if (substitute && refExpr) {
+        if (const auto* bnd = ctx_.exprExtBinding(*refExpr)) {
+            for (const auto& [nm, ty] : *bnd)
+                if (ty) subst[nm] = ty;
+        }
+    }
+    const auto* ma =
+        refExpr ? dynamic_cast<const ast::MemberAccessExpr*>(refExpr) : nullptr;
+    const bool unbound = ma ? extensionRefIsUnbound(*ma) : false;
+    if (unbound && ms->extensionDecl && ms->extensionDecl->targetType) {
+        if (auto* recvTy = ctx_.resolvedType(*ms->extensionDecl->targetType)) {
+            TypeRef::FuncParam recv;
+            recv.type = subst.empty() ? recvTy
+                                      : substituteReturnType(recvTy, subst);
+            ft->funcParams.push_back(recv);
+        }
+    }
+    for (auto* psym : ms->params) {
+        auto* par = dynamic_cast<ParameterSymbol*>(psym);
+        if (!par) continue;
+        TypeRef::FuncParam fp;
+        fp.modifier = par->modifier;
+        fp.name = par->name;
+        // fix #6898 (§27.6 / §2.5, v0.340): an IMPORTED extension method's
+        // parameter carries no syntactic `declType`, only the loader's
+        // `resolvedDeclType` — the same two-source read `buildMethodRefType`
+        // uses.
+        TypeRef* pt = par->declType ? ctx_.resolvedType(*par->declType) : nullptr;
+        if (!pt) pt = par->resolvedDeclType;
+        if (pt && !subst.empty()) pt = substituteReturnType(pt, subst);
+        fp.type = pt;
+        ft->funcParams.push_back(fp);
+    }
+    if (TypeRef* rt = sema::methodReturnResolvedType(*ms, ctx_)) {
+        ft->funcReturn = subst.empty() ? rt : substituteReturnType(rt, subst);
+    } else {
+        auto* unit = ctx_.makeTypeRef();
+        unit->kind = TypeRef::Kind::Unit;
+        ft->funcReturn = unit;
+    }
+    ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
+    return ft;
+}
+
+// §27.6 (v0.355): is this member access the UNBOUND (type-qualified)
+// spelling of an extension-member reference? The qualifier names a TYPE (not
+// a value), so the reference captures no receiver and the formed function
+// carries the receiver as its first parameter.
+//
+// The qualifier shapes that name a type:
+//
+//   * a user type name — resolves to a TypeSymbol;
+//   * a `type` ALIAS of one — resolves to a TypeAliasSymbol, not a
+//     TypeSymbol (fix #4070, §27.6/§27.8, v0.294: the identical missing-arm
+//     shape #4038/#4048/#4050/#4051 all fixed in their own call chains).
+//     Resolved through the shared `resolveAliasToTypeSymbol` helper
+//     (ExprTypecheck.cpp; #4050/#4051) so an alias of the extension's target
+//     is recognized as the unbound type-name-qualifier form exactly like a
+//     direct type name. That helper is Named-only (its guard
+//     `underlying->kind != TypeRef::Kind::Named` excludes every
+//     Primitive-kind underlying by construction), so a `type` alias of a
+//     PRIMITIVE (`type MyInt := int;`) is recognized separately (fix #4080,
+//     §27.6/§27.8, v0.294) — the alias names the extended type in qualifier
+//     position just as much;
+//   * a PRIMITIVE keyword (`int.Doubled`) — fix #1633: a primitive-keyword
+//     identifier has NO exprSymbol at all (§5.2/ExprTypecheck_Exprs.cpp types
+//     a bare primitive-keyword identifier without a value symbol), so the
+//     symbol test never fires for it. Such a qualifier is always a TYPE
+//     reference (never a value — no local or parameter can be named `int`, a
+//     reserved word), so it is unbound exactly like a user-type qualifier.
+bool ExprTC::extensionRefIsUnbound(const ast::MemberAccessExpr& ma) {
+    if (!ma.target) return false;
+    if (auto* tgtSym = ctx_.exprSymbol(*ma.target)) {
+        if (dynamic_cast<TypeSymbol*>(tgtSym) != nullptr) return true;
+        if (auto* aliasSym = dynamic_cast<TypeAliasSymbol*>(tgtSym)) {
+            if (resolveAliasToTypeSymbol(aliasSym)) return true;
+            if (auto* aliasDecl =
+                    dynamic_cast<const ast::TypeAlias*>(aliasSym->decl)) {
+                if (aliasDecl->aliasedType) {
+                    if (auto* underlying =
+                            ctx_.resolvedType(*aliasDecl->aliasedType)) {
+                        return underlying->kind == TypeRef::Kind::Primitive;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+    if (auto* tid =
+            dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+        return primitiveFromName(tid->name) != PrimitiveType::None;
+    }
+    return false;
+}
+
 // §27.6 (v0.338, #5814): a bare, built-in `Math.Abs` (no list, no user symbol)
 // typed by resolveMemberAccess as a function value.
 bool ExprTC::isMathAbsReference(const ast::Expr* e) const {
@@ -6293,7 +6461,15 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
     if (!fromExpr || !target || target->kind != TypeRef::Kind::Function)
         return MethodRefOverloadResult::SingleOverload;
     auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*fromExpr));
-    if (!ms || !ms->parent)
+    if (!ms) return MethodRefOverloadResult::SingleOverload;
+    // §27.6 (v0.355): an EXTENSION member takes part in the selection too.
+    // It has no `parent` TypeSymbol (§26.1), so the old `!ms->parent` guard
+    // answered "SingleOverload" for EVERY extension reference — the reference
+    // was resolved by DECLARATION ORDER (the block's first same-named member)
+    // instead of by the target function type, and a target that selects the
+    // other overload was refused (§5.1) — the #8121 gap. Its candidate set is
+    // the block's same-name members (`methodRefOverloadCandidates`).
+    if (!ms->parent && !ms->extensionDecl)
         return MethodRefOverloadResult::SingleOverload;
 
     // §12.1/§22.6 (#1090): the candidate set is every same-name overload on
@@ -6301,9 +6477,10 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
     // stopped at — otherwise an overload declared only in a base class is
     // invisible and a valid call to it is mis-rejected. Most-derived first so
     // first-wins arity selection still honours §22.6 closer-wins. Re-use the
-    // existing helper (mirrors `resolveMethodOverload` for plain calls).
-    std::vector<MethodSymbol*> overloads;
-    collectHierarchyOverloads(ms->parent, ms->name, overloads);
+    // existing helper (mirrors `resolveMethodOverload` for plain calls). For an
+    // EXTENSION member the set is the block's same-name members instead.
+    std::vector<MethodSymbol*> overloads =
+        methodRefOverloadCandidates(ms);
     if (overloads.size() < 2)
         return MethodRefOverloadResult::SingleOverload;
 
@@ -6333,12 +6510,29 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
     else if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(fromExpr))
         refTypeArgs = &rid->typeArgs;
     if (!refTypeArgs) refTypeArgs = &kNoTypeArgs;
+    const bool isExt = ms->extensionDecl != nullptr;
     for (MethodSymbol* ov : overloads) {
-        if (sema::formalParamCount(*ov) != arity) continue;
         if (ov->genericParams.size() != refTypeArgs->size()) continue;
 
-        TypeRef* ft = buildMethodRefType(ov);
-        if (ft && !refTypeArgs->empty())
+        // The candidate's own function type. An EXTENSION member's type is
+        // the §27.6 extension shape — the receiver as the first parameter in
+        // the type-qualified spelling, the method's own parameters only in
+        // the receiver-qualified one — with the block's free type variables
+        // substituted by the formation's binding (§26.4).
+        TypeRef* ft = isExt ? buildExtensionRefType(ov, fromExpr, true)
+                             : buildMethodRefType(ov);
+        if (!ft) continue;
+        // The ARITY axis: the candidate's own parameter count. For an ordinary
+        // method that is the declared formal count (`formalParamCount`); for an
+        // EXTENSION member it is the §27.6 extension shape's count (the
+        // receiver counts as one in the type-qualified spelling), so it is
+        // read off the built type.
+        if (isExt) {
+            if (ft->funcParams.size() != arity) continue;
+        } else if (sema::formalParamCount(*ov) != arity) {
+            continue;
+        }
+        if (!refTypeArgs->empty())
             ft = substituteMethodRefTypeArgs(*refTypeArgs, *ov, ft);
         if (!ft) continue;
 
@@ -6472,10 +6666,16 @@ bool ExprTC::reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
         !dynamic_cast<const ast::MemberAccessExpr*>(initExpr))
         return false;
     auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*initExpr));
-    if (!ms || !ms->parent) return false;
+    if (!ms) return false;
+    // §27.6 (v0.355): an EXTENSION member takes part in the no-target rule
+    // too. It has no `parent` TypeSymbol (§26.1), so the old `!ms->parent`
+    // guard answered "no rule" for EVERY extension reference: `var f :=
+    // v.Len;` over two same-named extension members compiled silently, with
+    // the reference resolved by declaration order — the #8121 gap. The
+    // candidate set is the block's same-name members.
+    if (!ms->parent && !ms->extensionDecl) return false;
 
-    std::vector<MethodSymbol*> overloads;
-    collectHierarchyOverloads(ms->parent, ms->name, overloads);
+    std::vector<MethodSymbol*> overloads = methodRefOverloadCandidates(ms);
     if (overloads.size() < 2) return false;
 
     // Build the candidates' signatures for the diagnostic.
@@ -6506,7 +6706,12 @@ bool ExprTC::reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
         return std::string(t->headName());
     };
     for (MethodSymbol* ov : overloads) {
-        TypeRef* ft = buildMethodRefType(ov);
+        // The candidate's signature as the reference would form it: an
+        // EXTENSION member's is the §27.6 extension shape (the receiver as the
+        // first parameter in the type-qualified spelling).
+        TypeRef* ft = ms->extensionDecl
+                          ? buildExtensionRefType(ov, initExpr, true)
+                          : buildMethodRefType(ov);
         if (!ft) continue;
         if (!sigs.empty()) sigs += ", ";
         sigs += "`(";
@@ -8305,8 +8510,154 @@ void ExprTC::checkAssignable(
             dynamic_cast<const ast::LambdaExpr*>(fromExpr);
         bool skipShapeCheck = freshReferenceFormation || freshLambda;
 
+        // §27.6 (v0.355) / fix #4978 (v0.307): target-typed OVERLOAD
+        // SELECTION for a method reference. The reference is resolved by the
+        // TARGET function type: "When the named method (or property) is
+        // overloaded, the reference is resolved using the target function type
+        // at the use site."
+        //
+        // The selection runs BEFORE the arity and shape checks below, because
+        // the bare-method-access TypeRef carried by `from` is built from the
+        // FIRST-DECLARED overload, which is not necessarily the overload the
+        // target selects. Measured before this move: `var g: (int) -> int :=
+        // v.Len;` over a class (or an extension block) declaring `Len()` and
+        // `Len(x: int)` was REFUSED ("the initializer for `g` has a type that
+        // is not implicitly convertible to the target type (§5.1)") — the arity
+        // check measured the FIRST-DECLARED overload's arity (0) against the
+        // target's (1) and rejected before the selector ever ran, so §27.6's
+        // target-typed selection never got its say (#8121).
+        //
+        // The selection is skipped where the caller opted out
+        // (`allowMethodRefOverloadSelection=false` — the event-handler
+        // position, #4901/#4968-c06: "an event-handler position considers no
+        // overload but the one `h` already names") and for a lambda (a lambda
+        // is target-typed by construction, §27.4).
+        if (freshReferenceFormation && !freshLambda &&
+            allowMethodRefOverloadSelection) {
+            auto* ms0 = dynamic_cast<MethodSymbol*>(
+                ctx_.exprSymbol(*fromExpr));
+            const bool isExt = ms0 && ms0->extensionDecl != nullptr;
+            const TypeRef* chosen = nullptr;
+            switch (selectMethodRefOverload(fromExpr, to, chosen)) {
+                case MethodRefOverloadResult::Unique:
+                    selFrom = chosen;
+                    break;
+                case MethodRefOverloadResult::Ambiguous: {
+                    // §27.6: report the candidates (the spec calls this
+                    // out explicitly — "the compiler reports the
+                    // candidates"). Mirror the §22.6 ambiguous-call
+                    // diagnostic shape: name the method and the
+                    // overloads' signatures.
+                    std::string sigs;
+                    std::vector<MethodSymbol*> overloads =
+                        methodRefOverloadCandidates(ms0);
+                    for (MethodSymbol* ov : overloads) {
+                        // The candidate's signature as the reference would
+                        // form it: an EXTENSION member's is the §27.6
+                        // extension shape (the receiver as the first
+                        // parameter in the type-qualified spelling).
+                        TypeRef* ft = isExt
+                                          ? buildExtensionRefType(ov, fromExpr,
+                                                                  true)
+                                          : buildMethodRefType(ov);
+                        if (!ft) continue;
+                        bool modMatch = true;
+                        for (std::size_t i = 0;
+                             i < to->funcParams.size(); ++i) {
+                            if (ft->funcParams[i].modifier !=
+                                to->funcParams[i].modifier) {
+                                modMatch = false; break;
+                            }
+                        }
+                        if (!modMatch) continue;
+                        bool fits = true, exact = true;
+                        for (std::size_t i = 0;
+                             i < to->funcParams.size() && fits; ++i) {
+                            const TypeRef* tpar =
+                                to->funcParams[i].type;
+                            const TypeRef* spar = ft->funcParams[i].type;
+                            if (functionSlotTypeRefEqual(tpar, spar))
+                                continue;
+                            if (implicitlyConvertible(tpar, spar))
+                                exact = false;
+                            else
+                                fits = false;
+                        }
+                        if (fits &&
+                            !functionSlotTypeRefEqual(
+                                ft->funcReturn, to->funcReturn)) {
+                            if (implicitlyConvertible(
+                                    ft->funcReturn, to->funcReturn))
+                                exact = false;
+                            else
+                                fits = false;
+                        }
+                        if (!fits) continue;
+                        // Compact signature for the diagnostic: head name
+                        // for Named / primitive kind, otherwise a placeholder.
+                        auto sigOne = [](const TypeRef* t) -> std::string {
+                            if (!t) return "?";
+                            if (t->kind == TypeRef::Kind::Primitive) {
+                                switch (t->primitive) {
+                                    case PrimitiveType::Bool:   return "bool";
+                                    case PrimitiveType::SByte:  return "sbyte";
+                                    case PrimitiveType::Byte:   return "byte";
+                                    case PrimitiveType::Short:  return "short";
+                                    case PrimitiveType::UShort: return "ushort";
+                                    case PrimitiveType::Int:    return "int";
+                                    case PrimitiveType::UInt:   return "uint";
+                                    case PrimitiveType::Long:   return "long";
+                                    case PrimitiveType::ULong:  return "ulong";
+                                    case PrimitiveType::Float:  return "float";
+                                    case PrimitiveType::Double: return "double";
+                                    case PrimitiveType::Decimal:return "decimal";
+                                    case PrimitiveType::Char:   return "char";
+                                    case PrimitiveType::String: return "string";
+                                    case PrimitiveType::Object: return "Object";
+                                    default: return "?";
+                                }
+                            }
+                            if (t->kind == TypeRef::Kind::Unit) return "()";
+                            return std::string(t->headName());
+                        };
+                        if (!sigs.empty()) sigs += ", ";
+                        sigs += "`(";
+                        for (std::size_t i = 0;
+                             i < ft->funcParams.size(); ++i) {
+                            if (i > 0) sigs += ", ";
+                            sigs += sigOne(ft->funcParams[i].type);
+                        }
+                        sigs += ") -> " + sigOne(ft->funcReturn) + "`";
+                    }
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        std::string("the method reference `") +
+                            std::string(ms0->name) +
+                            "` is ambiguous against the target type "
+                            "(\xC2\xA7""27.6 v0.307) — multiple "
+                            "overloads unify through implicit "
+                            "conversion and none matches exactly "
+                            "(candidates: " + sigs + ")");
+                    return;
+                }
+                case MethodRefOverloadResult::NoFit:
+                    // No overload fits the target. Fall through to the
+                    // §5.1 formation-site check below, which will
+                    // report the mismatch — the first-declared
+                    // overload's mismatch is the most informative
+                    // surface for that report.
+                    break;
+                case MethodRefOverloadResult::SingleOverload:
+                    break;
+            }
+        }
+
         // Arity mismatch is never assignable (§27.1.1), formation or not.
-        if (from->funcParams.size() != to->funcParams.size()) {
+        // The CHOSEN overload's arity is the reference's arity (§27.6: the
+        // reference is resolved by the target function type), so the check
+        // reads `selFrom` — the selection above may have replaced the
+        // first-declared overload's type with the selected one's.
+        if (selFrom->funcParams.size() != to->funcParams.size()) {
             reportNotConvertible();
             return;
         }
@@ -8319,10 +8670,14 @@ void ExprTC::checkAssignable(
         // Modifier slots (owned/ref/out/out owned/scoped) must match
         // EXACTLY, always — §27.1's identity rule; §27.1.1's fourth bullet
         // restates it for value-assignability, and §27.6 confirms it is not
-        // part of what a formation-site adapter may bridge.
-        for (std::size_t i = 0; i < from->funcParams.size(); ++i) {
-            if (from->funcParams[i].modifier != to->funcParams[i].modifier) {
-                const bool fromScoped = from->funcParams[i].modifier == "scoped";
+        // part of what a formation-site adapter may bridge. The slots read are
+        // the SELECTED overload's (§27.6's target-typed selection ran above):
+        // the selection itself filters the candidates by modifier match, so
+        // the selected overload's slots are the reference's slots.
+        for (std::size_t i = 0; i < selFrom->funcParams.size(); ++i) {
+            if (selFrom->funcParams[i].modifier !=
+                to->funcParams[i].modifier) {
+                const bool fromScoped = selFrom->funcParams[i].modifier == "scoped";
                 const bool toScoped = to->funcParams[i].modifier == "scoped";
                 std::string detail;
                 if (fromScoped != toScoped) {
@@ -8530,136 +8885,13 @@ void ExprTC::checkAssignable(
         // are inferred FROM the target, not independently — so no
         // formation-site check applies; the formed-value arm above is
         // also skipped for freshLambda).
+        //
+        // The per-slot checks read `selFrom` — the SELECTED overload's type
+        // (§27.6's target-typed selection ran at the top of this block, before
+        // the arity check, so `selFrom` is the overload the target selects and
+        // not the first-declared one). The #1820 mint-announcing /
+        // iterable-family fences further below read the same rewritten type.
         if (freshReferenceFormation && !freshLambda) {
-            // §27.6 / fix #4978 (v0.307): target-typed overload selection
-            // for a method reference. The bare-method-access TypeRef carried
-            // by `from` is built from the FIRST-declared overload
-            // (`lookupMember`'s first-match BFS at `resolveMemberAccess`,
-            // ExprTypecheck_Calls.cpp:24242), which is not necessarily the
-            // overload that fits `to` — #4968 c06's reproducer binds the
-            // `string` overload at an `(int) -> ()` event handler. Run the
-            // §27.6 overload-selection rule here, where both the source
-            // symbol AND the target type are visible. When a unique winner
-            // exists, use its Function TypeRef for the §5.1 formation-site
-            // check (and downstream readers — codegen's method-thunk
-            // emission, in particular, sees the same overload via this
-            // reference). The #1820 mint-announcing / iterable-family fences
-            // further below re-check `from->funcReturn` directly; they pick
-            // up the chosen overload through this rewrite too.
-            if (allowMethodRefOverloadSelection) {
-            if (auto* ms0 = dynamic_cast<MethodSymbol*>(
-                    ctx_.exprSymbol(*fromExpr))) {
-                const TypeRef* chosen = nullptr;
-                switch (selectMethodRefOverload(fromExpr, to, chosen)) {
-                    case MethodRefOverloadResult::Unique:
-                        selFrom = chosen;
-                        break;
-                    case MethodRefOverloadResult::Ambiguous: {
-                        // §27.6: report the candidates (the spec calls this
-                        // out explicitly — "the compiler reports the
-                        // candidates"). Mirror the §22.6 ambiguous-call
-                        // diagnostic shape: name the method and the
-                        // overloads' signatures.
-                        std::string sigs;
-                        std::vector<MethodSymbol*> overloads;
-                        collectHierarchyOverloads(ms0->parent, ms0->name,
-                                                  overloads);
-                        for (MethodSymbol* ov : overloads) {
-                            if (sema::formalParamCount(*ov) !=
-                                to->funcParams.size()) continue;
-                            TypeRef* ft = buildMethodRefType(ov);
-                            if (!ft) continue;
-                            bool modMatch = true;
-                            for (std::size_t i = 0;
-                                 i < to->funcParams.size(); ++i) {
-                                if (ft->funcParams[i].modifier !=
-                                    to->funcParams[i].modifier) {
-                                    modMatch = false; break;
-                                }
-                            }
-                            if (!modMatch) continue;
-                            bool fits = true, exact = true;
-                            for (std::size_t i = 0;
-                                 i < to->funcParams.size() && fits; ++i) {
-                                const TypeRef* tpar =
-                                    to->funcParams[i].type;
-                                const TypeRef* spar = ft->funcParams[i].type;
-                                if (functionSlotTypeRefEqual(tpar, spar))
-                                    continue;
-                                if (implicitlyConvertible(tpar, spar))
-                                    exact = false;
-                                else
-                                    fits = false;
-                            }
-                            if (fits &&
-                                !functionSlotTypeRefEqual(
-                                    ft->funcReturn, to->funcReturn)) {
-                                if (implicitlyConvertible(
-                                        ft->funcReturn, to->funcReturn))
-                                    exact = false;
-                                else
-                                    fits = false;
-                            }
-                            if (!fits) continue;
-                            // Compact signature for the diagnostic: head name
-                            // for Named / primitive kind, otherwise a placeholder.
-                            auto sigOne = [](const TypeRef* t) -> std::string {
-                                if (!t) return "?";
-                                if (t->kind == TypeRef::Kind::Primitive) {
-                                    switch (t->primitive) {
-                                        case PrimitiveType::Bool:   return "bool";
-                                        case PrimitiveType::SByte:  return "sbyte";
-                                        case PrimitiveType::Byte:   return "byte";
-                                        case PrimitiveType::Short:  return "short";
-                                        case PrimitiveType::UShort: return "ushort";
-                                        case PrimitiveType::Int:    return "int";
-                                        case PrimitiveType::UInt:   return "uint";
-                                        case PrimitiveType::Long:   return "long";
-                                        case PrimitiveType::ULong:  return "ulong";
-                                        case PrimitiveType::Float:  return "float";
-                                        case PrimitiveType::Double: return "double";
-                                        case PrimitiveType::Decimal:return "decimal";
-                                        case PrimitiveType::Char:   return "char";
-                                        case PrimitiveType::String: return "string";
-                                        case PrimitiveType::Object: return "Object";
-                                        default: return "?";
-                                    }
-                                }
-                                if (t->kind == TypeRef::Kind::Unit) return "()";
-                                return std::string(t->headName());
-                            };
-                            if (!sigs.empty()) sigs += ", ";
-                            sigs += "`(";
-                            for (std::size_t i = 0;
-                                 i < ft->funcParams.size(); ++i) {
-                                if (i > 0) sigs += ", ";
-                                sigs += sigOne(ft->funcParams[i].type);
-                            }
-                            sigs += ") -> " + sigOne(ft->funcReturn) + "`";
-                        }
-                        ctx_.diagnostics().report(
-                            Severity::Error, loc,
-                            std::string("the method reference `") +
-                                std::string(ms0->name) +
-                                "` is ambiguous against the target type "
-                                "(\xC2\xA7""27.6 v0.307) — multiple "
-                                "overloads unify through implicit "
-                                "conversion and none matches exactly "
-                                "(candidates: " + sigs + ")");
-                        return;
-                    }
-                    case MethodRefOverloadResult::NoFit:
-                        // No overload fits the target. Fall through to the
-                        // §5.1 formation-site check below, which will
-                        // report the mismatch — the first-declared
-                        // overload's mismatch is the most informative
-                        // surface for that report.
-                        break;
-                    case MethodRefOverloadResult::SingleOverload:
-                        break;
-                }
-            }
-            }
             for (std::size_t i = 0; i < selFrom->funcParams.size(); ++i) {
                 const TypeRef* targetParam = to->funcParams[i].type;
                 const TypeRef* sourceParam = selFrom->funcParams[i].type;

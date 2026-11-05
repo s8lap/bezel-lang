@@ -4590,6 +4590,38 @@ private:
     // no return type).
     TypeRef* buildMethodRefType(const MethodSymbol* ms);
 
+    // §27.6 (v0.355): the candidate set a method reference's overload
+    // selection ranks over. For an ordinary method it is the same-name
+    // overloads of the receiver's class hierarchy (`collectHierarchyOverloads`);
+    // for an EXTENSION member it is the same-name members of the extension
+    // BLOCK that declares it — an extension method has no `parent` TypeSymbol
+    // (§26.1), so the hierarchy walk finds nothing and the selection silently
+    // degraded to "the first-declared member", which is the #8121 gap.
+    std::vector<MethodSymbol*> methodRefOverloadCandidates(
+        const MethodSymbol* ms);
+
+    // §27.6 (v0.355): the function type a method reference over an EXTENSION
+    // member forms. The type-qualified (unbound) spelling carries the
+    // receiver as its FIRST parameter; the receiver-qualified (bound) spelling
+    // has the method's own parameters only. The block's free type variables
+    // are substituted by the binding the formation recorded (§26.4), so a
+    // reference over `extension Array<T>`'s member `Head(): T` forms
+    // `() -> int` at an `Array<int>` receiver.
+    //
+    // `substitute` is false for the CALL spelling: the call's own typing
+    // (`typeCall`) substitutes the extension's free vars itself, and the
+    // callee's expression type is not the call's type.
+    TypeRef* buildExtensionRefType(const MethodSymbol* ms,
+                                   const ast::Expr* refExpr,
+                                   bool substitute);
+
+    // §27.6 (v0.355): is this member access the UNBOUND (type-qualified)
+    // spelling of an extension-member reference — `V.Len`, `int.Doubled` —
+    // whose function type carries the receiver as its FIRST parameter? The
+    // receiver-qualified spelling (`v.Len`) is BOUND: the receiver is
+    // captured and the function has the method's own parameters only.
+    bool extensionRefIsUnbound(const ast::MemberAccessExpr& ma);
+
     // §27.6 (issue #4978, v0.307): the spec's no-target rule — "When no
     // target type is available (e.g., `var f := Math.Abs;` with no
     // annotation), the reference is ambiguous and the compiler reports an
