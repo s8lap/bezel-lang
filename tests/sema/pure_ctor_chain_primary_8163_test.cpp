@@ -418,3 +418,113 @@ BEZEL_TEST(pure_ctor_chain_primary_8163,
         "end MyError;\n");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// =========================================================================
+// narrow #8163 (round 3) — the primary's invoked BASE-CONSTRUCTOR target.
+// §22.15 (v0.355): "A pure constructor's `base(...)`/`this(...)` chain target
+// must itself be pure." The primary `class E(m): ImpureBase(m)` invokes
+// ImpureBase's body constructor, which a pure constructor chained to E's
+// primary therefore runs. The diagnostic is the chain-call family's text.
+// =========================================================================
+
+namespace {
+constexpr const char* kBaseChainNeedle =
+    "base(...) target is not pure";
+
+constexpr const char* kImpureBaseHead =
+    "module M;\n"
+    "class ImpureBase : Exception\n"
+    "  public constructor(m: string) base(m);\n"
+    "    Console.WriteLine(\"impure base ctor\");\n"
+    "  end constructor;\n"
+    "end ImpureBase;\n";
+constexpr const char* kPureBaseHead =
+    "module M;\n"
+    "class ImpureBase : Exception\n"
+    "  public pure constructor(m: string) base(m);\n"
+    "  end constructor;\n"
+    "end ImpureBase;\n";
+constexpr const char* kPrimaryE =
+    "class E(m: string): ImpureBase(m)\n"
+    "  public pure constructor() this(\"d\"); end constructor;\n"
+    "end E;\n";
+}  // namespace
+
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           pure_ctor_chain_to_primary_with_impure_base_ctor_rejected_8163) {
+    auto r = pureCheck(std::string(kImpureBaseHead) + kPrimaryE);
+    BEZEL_EXPECT_TRUE(theDiagnosticContaining(r, kBaseChainNeedle) != nullptr);
+}
+
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           pure_ctor_chain_to_primary_through_base_primary_rejected_8163) {
+    auto r = pureCheck(std::string(kImpureBaseHead) +
+        "class B(m: string): ImpureBase(m)\nend B;\n"
+        "class E(m: string): B(m)\n"
+        "  public pure constructor() this(\"d\"); end constructor;\n"
+        "end E;\n");
+    BEZEL_EXPECT_TRUE(theDiagnosticContaining(r, kBaseChainNeedle) != nullptr);
+}
+
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           pure_ctor_chain_to_primary_base_ctor_arg_impure_rejected_8163) {
+    auto r = pureCheck(std::string(kPureBaseHead) +
+        "class Helper\n"
+        "  public static method Msg(m: string): string\n"
+        "    Console.WriteLine(\"x\");\n"
+        "    return m;\n"
+        "  end Msg;\n"
+        "end Helper;\n"
+        "class E(m: string): ImpureBase(Helper.Msg(m))\n"
+        "  public pure constructor() this(\"d\"); end constructor;\n"
+        "end E;\n");
+    BEZEL_EXPECT_TRUE(theDiagnosticContaining(r, kUserImpureCall) != nullptr);
+}
+
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           pure_ctor_chain_to_primary_with_pure_base_ctor_admitted_8163) {
+    auto r = pureCheck(std::string(kPureBaseHead) + kPrimaryE);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           non_pure_ctor_chain_to_primary_with_impure_base_ctor_admitted_8163) {
+    auto r = pureCheck(std::string(kImpureBaseHead) +
+        "class E(m: string): ImpureBase(m)\n"
+        "  public constructor() this(\"d\"); end constructor;\n"
+        "end E;\n");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           pure_ctor_chain_to_primary_with_impure_base_ctor_rejected_by_driver_8163) {
+    BEZEL_EXPECT_TRUE(aotRejectsWith(
+        std::string(kImpureBaseHead) + kPrimaryE +
+        "class Program\n"
+        "  public static pure method Run(x: int): int\n"
+        "    if x < 0 then throw new E(); end;\n"
+        "    return x;\n"
+        "  end Run;\n"
+        "  public static method Main(): int\n"
+        "    try Console.WriteLine(Run(-1));\n"
+        "    catch var e: Exception => Console.WriteLine(\"caught\");\n"
+        "    end;\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n", kBaseChainNeedle));
+}
+
+BEZEL_TEST(pure_ctor_chain_primary_8163,
+           non_pure_ctor_chain_to_primary_with_impure_base_ctor_runs_8163) {
+    BEZEL_EXPECT_TRUE(aotRunsWithExitZero(
+        std::string(kImpureBaseHead) +
+        "class E(m: string): ImpureBase(m)\n"
+        "  public constructor() this(\"d\"); end constructor;\n"
+        "end E;\n"
+        "class Program\n"
+        "  public static method Main(): int\n"
+        "    var e: E := new E();\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n"));
+}

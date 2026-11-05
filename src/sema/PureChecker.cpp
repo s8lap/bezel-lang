@@ -526,7 +526,12 @@ public:
     // every class with a pure constructor ("a class with a pure constructor
     // must have field initializers satisfying the pure-body rules"), and
     // walking them twice would report the same impurity twice.
-    void checkPrimaryCtorConstructionContent(const ast::TypeDecl& td);
+    //
+    // fix #8163b (§22.15, v0.355): `cls` is the class symbol of `td`; the
+    // base constructor the inheritance clause INVOKES is walked too.
+    void checkPrimaryCtorConstructionContent(const ast::TypeDecl& td,
+                                             const TypeSymbol* cls,
+                                             int depth = 0);
 
     // §22.16 (v0.203, #2053): walk each contract clause's expression under
     // the §22.15 pure-body rules APPLIED EXPRESSION-WISE, with the clause-
@@ -1203,7 +1208,7 @@ void PureBodyWalker::checkPureCtorChainPurity(
                 dynamic_cast<const ast::TypeDecl*>(targetClass->decl);
             if (td && td->kind == ast::TypeDeclKind::Class &&
                 td->hasPositionalFields) {
-                checkPrimaryCtorConstructionContent(*td);
+                checkPrimaryCtorConstructionContent(*td, targetClass);
             }
         }
         return;
@@ -1255,7 +1260,7 @@ void PureBodyWalker::checkPureCtorChainPurity(
 // the primary invokes) is a further step up the hierarchy and is NOT walked
 // here; that is recorded as a residual in the fix's report.
 void PureBodyWalker::checkPrimaryCtorConstructionContent(
-    const ast::TypeDecl& td) {
+    const ast::TypeDecl& td, const TypeSymbol* cls, int depth) {
     for (const ast::CallArgument& a : td.primaryBaseCtorArgs) {
         if (!a.value) continue;
         checkExpr(a.value.get());
@@ -1263,6 +1268,53 @@ void PureBodyWalker::checkPrimaryCtorConstructionContent(
     for (const ast::Param& p : td.positionalFields) {
         if (!p.defaultValue) continue;
         checkExpr(p.defaultValue.get());
+    }
+    // fix #8163b (§22.15, v0.355): the BASE-CONSTRUCTOR TARGET the
+    // inheritance clause invokes (§22.10 / §22.8 step 0) runs as part of this
+    // construction too, so it must itself be pure ("A pure constructor's
+    // `base(...)`/`this(...)` chain target must itself be pure").
+    if (!cls || depth > 16) return;
+    const TypeSymbol* base = nullptr;
+    for (const TypeSymbol* b : cls->baseTypes)
+        if (b && b->kind == ast::TypeDeclKind::Class) {
+            base = b;
+            break;
+        }
+    if (!base) return;
+    const SourceLocation at = !td.primaryBaseCtorArgs.empty() &&
+                                      td.primaryBaseCtorArgs.front().value
+                                  ? td.primaryBaseCtorArgs.front().value->span.begin
+                                  : td.span.begin;
+    // The invoked base constructor, read off the SYMBOLS (an imported base
+    // carries no AST): the unique non-static constructor whose formals the
+    // clause's arguments bind. A base with NO constructor symbol is a
+    // primary-ctor class: climb to ITS base, binding against ITS clause
+    // arguments through the both-sources accessor (never the AST), so the
+    // chain primary -> base primary -> impure base is followed too. The
+    // climbed primaries' own argument expressions are not walked (that
+    // would need their AST; SEAM-DEBT #8182).
+    const std::vector<ast::CallArgument>* args = &td.primaryBaseCtorArgs;
+    for (; base && depth <= 16; ++depth) {
+        if (const ConstructorSymbol* invoked =
+                findInvokedUserCtor(base, *args)) {
+            if (!constructorIsPure(invoked))
+                reportPureViolation(
+                    at, "constructor chain call",
+                    "base(...) target is not pure \xE2\x80\x94 a pure "
+                    "constructor's chain target must itself be declared "
+                    "`pure`");
+            return;
+        }
+        static const std::vector<ast::CallArgument> kNoArgs;
+        const auto* baseArgs = primaryBaseCtorArgsOf(base);
+        const TypeSymbol* next = nullptr;
+        for (const TypeSymbol* b : base->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) {
+                next = b;
+                break;
+            }
+        args = baseArgs ? baseArgs : &kNoArgs;
+        base = next;
     }
 }
 
