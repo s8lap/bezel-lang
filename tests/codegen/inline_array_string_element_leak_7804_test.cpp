@@ -198,7 +198,7 @@ std::string repeatedBlock(const char* block, int n) {
 // POST-FIX: no leak, and the same three lines of output.
 //
 // The printed text is pinned too: §8.5's default for an inline array is the
-// type's own name -- "[2]string" and "[2]Cls?" -- so a fix that changed the
+// type's own name -- "[2]string" and "[2]M.Cls?" -- so a fix that changed the
 // RENDERING (rather than the ownership) would be caught.
 // ===========================================================================
 BEZEL_TEST(inline_array_string_element_leak_7804,
@@ -221,7 +221,7 @@ class P
   end Main;
 end P;
 )BZL"),
-                 repeatedBlock("[2]string\n[2]Cls?\n[2]string [2]Cls?\n", 200)
+                 repeatedBlock("[2]string\n[2]M.Cls?\n[2]string [2]M.Cls?\n", 200)
                      .c_str());
 }
 

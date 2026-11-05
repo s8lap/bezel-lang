@@ -256,7 +256,7 @@ BEZEL_TEST(sema_move_only_cannot_be_boxed_2912,
     // Both renderings must be present and NON-EMPTY — §8.5 fixes the answer to
     // "the type's name", so an empty string or a "null" would be a regression
     // even though the program compiled.
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("]R") != std::string::npos);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("]M.R") != std::string::npos);
 }
 
 BEZEL_TEST(sema_move_only_cannot_be_boxed_2912,

@@ -287,7 +287,7 @@ BEZEL_TEST(codegen_inline_array_receiver_expression_evaluated_3445,
         "    Console.WriteLine(oa[1].V.ToString()); "));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("[2 owned]R\n1\n2\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("[2 owned]M3445.R\n1\n2\n"));
 }
 
 // ── T10 — fix #3465 (§28.2 / §28.3 / §15.3, v0.283): an OWNING-INLINE-ARRAY

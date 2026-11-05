@@ -130,12 +130,12 @@ BEZEL_TEST(inline_array_owning_tostring_2959,
             "  Console.WriteLine($\"[{os3}]\"); "
             "  Console.WriteLine($\"[{oif.ToString()}]\"); "
             "  Console.WriteLine($\"[{oif}]\");"),
-        "[[2 owned]R]\n"
-        "[[2 owned]R]\n"
-        "[[3 owned]S]\n"
-        "[[3 owned]S]\n"
-        "[[2 owned]I]\n"
-        "[[2 owned]I]\n");
+        "[[2 owned]M.R]\n"
+        "[[2 owned]M.R]\n"
+        "[[3 owned]M.S]\n"
+        "[[3 owned]M.S]\n"
+        "[[2 owned]M.I]\n"
+        "[[2 owned]M.I]\n");
 }
 
 // AXIS (c) — class-typed element on its own. The axis "class element" is
@@ -146,7 +146,7 @@ BEZEL_TEST(inline_array_owning_tostring_2959,
     BEZEL_EXPECT_EQ(out("  var own: [2 owned]R := [new R(), new R()]; "
                         "  Console.WriteLine(own.ToString()); "
                         "  Console.WriteLine($\"{own}\");"),
-                    "[2 owned]R\n[2 owned]R\n");
+                    "[2 owned]M.R\n[2 owned]M.R\n");
 }
 
 // AXIS (a) — arity 3. The issue spelled this axis `[3 owned]int`; §15.1.1
@@ -162,7 +162,7 @@ BEZEL_TEST(inline_array_owning_tostring_2959,
     BEZEL_EXPECT_EQ(out("  var own: [3 owned]S := [new S(), new S(), new S()]; "
                         "  Console.WriteLine(own.ToString()); "
                         "  Console.WriteLine($\"{own}\");"),
-                    "[3 owned]S\n[3 owned]S\n");
+                    "[3 owned]M.S\n[3 owned]M.S\n");
 }
 
 // ACCEPT-CONTROL — the non-owning form is the #2804/#2913 baseline and must

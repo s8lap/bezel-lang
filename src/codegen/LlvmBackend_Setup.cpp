@@ -55215,8 +55215,12 @@ std::string Emitter::inlineArrayTypeSpelling(const sema::TypeRef* rt) {
             }
             break;
         case K::Named:
-            s = rt->declaration ? std::string(rt->declaration->name)
-                                : std::string(rt->headName());
+            // fix #7794 (§8.5 v0.355; stdlib §2.13 rule 4): an element is
+            // rendered in its FullName form, module-qualified like a bare class
+            // or enum default, and a generic instantiation recurses into its
+            // arguments. Keyword primitives never reach this arm. Nullability is
+            // appended below, once, for every kind.
+            s = spec85TypeRefQualifiedName(rt);
             if (s.empty()) s = "?";
             break;
         case K::Unit:

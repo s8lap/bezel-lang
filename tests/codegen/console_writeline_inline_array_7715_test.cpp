@@ -57,7 +57,7 @@ BEZEL_TEST(console_writeline_inline_array_7715, element_type_matrix) {
         "var n: [3]int? := [1, null, 3]; Console.WriteLine(n);", ran);
     BEZEL_EXPECT_TRUE(ran);
     BEZEL_EXPECT_EQ(s, std::string(
-        "[2]string\n[2]double\n[2]bool\n[2]char\n[2]Rec\n[3]int?\n"));
+        "[2]string\n[2]double\n[2]bool\n[2]char\n[2]M.Rec\n[3]int?\n"));
 }
 
 // Console.Error.WriteLine/Write and Console.Out compile and run (stderr is not
