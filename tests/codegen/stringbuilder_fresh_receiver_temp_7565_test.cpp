@@ -28,6 +28,9 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
+using bezel::test::runAot;
 using bezel::test::runAotCheckedLenient;
 using bezel::test::runAotChecked;
 
@@ -221,8 +224,12 @@ BEZEL_TEST(stringbuilder_fresh_receiver_temp_7565,
 }
 
 BEZEL_TEST(stringbuilder_fresh_receiver_temp_7565,
-           instance_identity_result_returned_is_not_disposed_r22_spec_28_3) {
-    JitResult r = runAotCheckedLenient(
+           instance_identity_result_returned_is_rejected_8170_spec_28_3) {
+    // #8170 flip: this instance method returns its plain `StringBuilder` parameter,
+    // which §28.3 (v0.355, K8.4) rejects -- an instance method's non-`owned` return
+    // may be only receiver-sourced. The row pinned it as ACCEPTED (the "until sema
+    // rejects the escaping borrow" case in the header); it now pins the rejection.
+    JitResult r = runAot(
         "module M;\n"
         "class K\n"
         "  public constructor() end constructor;\n"
@@ -242,7 +249,10 @@ BEZEL_TEST(stringbuilder_fresh_receiver_temp_7565,
         "    return 0;\n"
         "  end Main;\n"
         "end C;\n");
-    expectClean(r, "300\n");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "a borrow reached through parameter `b` may not be returned from an "
+           "instance method"));
 }
 
 // A callee that STORES its plain parameter (§28.3 v0.350, "A callee that

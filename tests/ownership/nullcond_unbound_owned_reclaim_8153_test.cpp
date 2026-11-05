@@ -86,16 +86,18 @@ std::string prog(const std::string& body) {
            "end C;";
 }
 
-// `prog` with a class whose instance method returns its plain `Array`
-// parameter, so `h.Id(a)` is a borrow of `a`'s array (the r39-rev-8153 q40
-// shape).
+// `prog` with an extension method on `Array<string>` returning its receiver, so
+// `a.Id()` is a borrow of `a`'s array (the r39-rev-8153 q40 shape). #8170
+// re-shaped this from an instance method `Id(a: Array<string>): Array<string>
+// return a;`, which §28.3 (v0.355, K8.4) rejects: an instance method's non-
+// `owned` return may be only receiver-sourced, never parameter-sourced. The
+// extension receiver-parameter borrow is the spec-admitted spelling.
 std::string progH(const std::string& body) {
     std::string p = prog(body);
     p.insert(p.find("class C "),
-             "class Holder "
-             "  public constructor() end constructor; "
-             "  public method Id(a: Array<string>): Array<string> return a; end Id; "
-             "end Holder; ");
+             "public extension Array<string> "
+             "  public method Id(): Array<string> => this; "
+             "end extension; ");
     return p;
 }
 
@@ -262,7 +264,7 @@ BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
 // ===========================================================================
 // (C) MUST NOT USE-AFTER-FREE — a REASSIGNED materializer local whose
 //     displaced array is still read through a local alias (`var b := a`), an
-//     iteration (`for var x in a`) or a borrow a call returned (`h.Id(a)`).
+//     iteration (`for var x in a`) or a borrow a call returned (`a.Id()`).
 //
 //     §28.7: "Assignment to an owned field or owned local disposes the
 //     displaced value"; and *Overwrite while borrowed*: "Reassigning a
@@ -309,7 +311,7 @@ BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
 BEZEL_TEST(ownership_nullcond_unbound_owned_reclaim_8153,
            spec_28_7_reassigned_local_call_borrow_is_not_freed_under_it) {
     expectClean(runAotCheckedLenient(progH(
-                    "      var h := new Holder(); var a := t.Split(\",\"); var d := h.Id(a); "
+                    "      var a := t.Split(\",\"); var d := a.Id(); "
                     "      a := t.Split(\";\"); "
                     "      k := k + d.Count + d[1].Length + a.Count; ")),
                 "600\n");

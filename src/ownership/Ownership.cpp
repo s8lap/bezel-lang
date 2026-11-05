@@ -15966,7 +15966,20 @@ void MethodOwnership::checkInstanceBorrowReturn(const ast::Expr& e) {
         if (common::isIterableInterfaceHead(retHead)) return;
         if (common::isTaskFamilyHead(retHead)) return;
     }
-    if (!isBorrowableType(ctx_.resolvedType(*returnType_))) return;
+    // fix #8170 (§28.3, K8.4, v0.355): a declaration-less builtin CLASS return
+    // (`Array<T>`, `Dictionary<K,V>`, `LinkedList<T>`, ...) is a heap class
+    // reference like a user class, so a parameter-sourced borrow of one is the
+    // same use-after-free; `isBorrowableType` alone reads `declaration->kind`
+    // and answered false for it. Use the owned-sink twin that also recognises
+    // the borrow-bearing builtin class heads. // per §28.3
+    // The row-4 fresh-owned-value rejection below stays on the narrower
+    // `isBorrowableType` gate: a fresh `new Array<X>(..)` returned unmarked is a
+    // separate question this fix does not decide (no #8170 rule covers it).
+    const bool declBorrowable =
+        isBorrowableType(ctx_.resolvedType(*returnType_));
+    if (!declBorrowable &&
+        !isBorrowableOwnedSinkType(ctx_.resolvedType(*returnType_)))
+        return;
     // §28.3 announcement table row 4 (v0.307): an instance method's
     // non-`owned` plain concrete class/interface return admits ONLY a
     // receiver-sourced borrow — "return only a receiver-(parameter-)
@@ -16007,7 +16020,7 @@ void MethodOwnership::checkInstanceBorrowReturn(const ast::Expr& e) {
                 isFreshOwnedProducer =
                     st->state == OwnershipState::Owned && !st->maybeConsumed;
         }
-        if (isFreshOwnedProducer) {
+        if (isFreshOwnedProducer && declBorrowable) {
             report(
                 Severity::Error, e.span.begin,
                 "an instance method whose declared return type is a plain "

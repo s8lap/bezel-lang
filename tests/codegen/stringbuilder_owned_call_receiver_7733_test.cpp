@@ -147,7 +147,7 @@ end C;
                 "1000|400\n");
 }
 
-// An instance method, a qualified static call and an extension, each returning `owned`; the non-`owned` `Same` returns its parameter and must NOT be disposed (soundness).
+// An instance method, a qualified static call and an extension, each returning `owned`; the non-`owned` extension `Same` returns its receiver (a parameter-returning instance method is rejected, §28.3 K8.4, #8170) and must NOT be disposed (soundness).
 BEZEL_TEST(stringbuilder_owned_call_receiver_7733, instance_qualified_and_extension_roots_loop_100_spec_28_3) {
     expectClean(runAotChecked(R"BZL(
 module M; import System; import System.Text;
@@ -156,11 +156,9 @@ class H
     sb.Append("M");
     return new StringBuilder("abc");
   end Make;
-  public method Same(sb: StringBuilder): StringBuilder
-    return sb;
-  end Same;
 end H;
 extension StringBuilder
+  public method Same(): StringBuilder => this;
   public method Ext(n: int): owned StringBuilder
     return new StringBuilder("ext");
   end Ext;
@@ -177,8 +175,8 @@ class C
     for var i in 0..<100 do
       total += h.Make(sb).Insert(1, "x").ToString().Length;
       total += C.Fresh(sb).Append("q").Length;
-      total += h.Same(sb).Length;
-      total += h.Same(sb).Append("w").ToString().Length;
+      total += sb.Same().Length;
+      total += sb.Same().Append("w").ToString().Length;
       total += sb.Ext(1).Insert(0, "e").Length;
     end for;
     Console.WriteLine(total.ToString() + "|" + sb.Length.ToString());
