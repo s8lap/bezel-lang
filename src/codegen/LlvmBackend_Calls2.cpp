@@ -9784,6 +9784,12 @@ struct ThisStringEscapeWalker {
         if (isFunctionTyped(access)) return false;
         if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(sym)) {
             if (ms->extensionDecl) {
+                // SEAM-ACCESSOR: local-path cast; an imported extension
+                // method has no `decl`, so `md` is null and the answer is
+                // the conservative "may carry `this`" (false); a method that
+                // does carry one is judged by `methodEscapes`, which ends in
+                // `thisStringMayEscape`'s `isImported` early return (fix
+                // #7841, §26.7, §28.9).
                 auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
                 return md && resultCannotCarryThis(md->returnType.get()) &&
                        !methodEscapes(ms);
@@ -9792,6 +9798,12 @@ struct ThisStringEscapeWalker {
         }
         if (auto* ps = dynamic_cast<const sema::PropertySymbol*>(sym)) {
             if (ps->decl || ctx.isImported(ps)) {
+                // SEAM-ACCESSOR: an imported extension property CAN carry a
+                // `decl` (the loader re-parses its body), so this admits it;
+                // the conservative answer comes from `propertyEscapes` ->
+                // `thisStringMayEscapeProperty`, whose `ctx_.isImported`
+                // early return reports "escapes" before any body is walked
+                // (fix #7841, §26.3, §28.9).
                 auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
                 return pd && resultCannotCarryThis(pd->type.get()) &&
                        !propertyEscapes(ps);
@@ -10103,6 +10115,8 @@ bool Emitter::thisStringMayEscape(
         const sema::MethodSymbol* ms,
         std::unordered_set<const ast::Node*>& inProgress) {
     if (!ms || !ms->decl || ctx_.isImported(ms)) return true;
+    // SEAM-ACCESSOR: local-path cast; `ctx_.isImported(ms)` returned the
+    // conservative "escapes" above (fix #7841, §26.7, §28.9).
     const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md) return true;
     auto it = thisStringEscape_.find(md);
@@ -10142,6 +10156,8 @@ bool Emitter::thisStringMayEscapeProperty(
         const sema::PropertySymbol* ps,
         std::unordered_set<const ast::Node*>& inProgress) {
     if (!ps || !ps->decl || ctx_.isImported(ps)) return true;
+    // SEAM-ACCESSOR: local-path cast; `ctx_.isImported(ps)` returned the
+    // conservative "escapes" above (fix #7841, §26.3, §28.9).
     const auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd || pd->bodyKind != ast::PropertyBodyKind::Expression ||
         !pd->exprBody)

@@ -956,6 +956,9 @@ bool Resolver::paramCarriesConstraint(std::string_view name,
     if (currentMethodConstraints_ && scan(*currentMethodConstraints_))
         return true;
     if (currentOuterType_) {
+        // SEAM-ACCESSOR: `currentOuterType_` is the type this resolver is
+        // resolving in THIS compilation, so it is always a local type with
+        // an AST (never an import).
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(
                 currentOuterType_->decl))
             if (scan(td->genericConstraints)) return true;

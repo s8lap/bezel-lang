@@ -234,6 +234,9 @@ llvm::Type* Emitter::extensionThisType(const sema::MethodSymbol* ms,
 // fix #7841 — see the declaration.
 bool Emitter::extStringRecvK8Eligible(const sema::MethodSymbol* ms) const {
     if (!ms) return false;
+    // SEAM-ACCESSOR: local-path cast; an imported extension method has no
+    // `decl`, so `md` is null and the answer is the conservative "not
+    // eligible" (false) (fix #7841, §26.7, §28.9).
     const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md || !md->returnType) return false;
     const sema::TypeRef* tr = ctx_.resolvedType(*md->returnType);
