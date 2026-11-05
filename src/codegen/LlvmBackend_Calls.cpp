@@ -6864,6 +6864,29 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!isStrElem && elemTypeRef && !elemTypeRef->nullable &&
                 elemTypeRef->kind == sema::TypeRef::Kind::Named)
                 recCmpThunk = buildRecordCompareToThunk(elemTypeRef);
+            // fix #8161 (stdlib §5.1 / §2.8, spec §14.1 / §14.2, v0.355):
+            // a GENERIC RECORD element — `record W<T>(v: int):
+            // IComparable<W<T>>` — is admitted by SEMA (spec §14.2
+            // *Interface conformance* rule 2: a record listing the interface
+            // with the matching member conforms at EVERY instantiation), and
+            // its order is its OWN `CompareTo` MONOMORPHIZED at the
+            // instantiation (spec §14.1). `buildRecordCompareToThunk` DECLINES
+            // a generic record (its `CompareTo` would need monomorphization),
+            // so before this the shape fell through to the refusal below —
+            // whose return value was the BARE element where the arm's result
+            // type is `T?` (the `{i8 hasValue; T value}` tagged struct), so
+            // the caller stored a bare record into a `{i8, T}` slot and the
+            // `!` unwrap then extracted field 1 of a ONE-FIELD struct:
+            //     bezelc: Segmentation fault (llvm::Value::setName)
+            // `buildGenericRecordCompareToThunk` is the generic-record
+            // comparator #8140 added for the plain `Min()`/`Max()` arm; it
+            // is tried ONLY after the ordinary thunk declined (which is the
+            // case for every generic record), so every shape that works
+            // today is bit-identical.
+            if (!recCmpThunk && !isStrElem && elemTypeRef &&
+                !elemTypeRef->nullable &&
+                elemTypeRef->kind == sema::TypeRef::Kind::Named)
+                recCmpThunk = buildGenericRecordCompareToThunk(elemTypeRef);
             if (isStrElem || cmpMs || ifaceCmpFn) {
                 // Pointer-typed element: §9.6 ordinal string relation,
                 // itable CompareTo (interface, #2770), or direct
@@ -6955,6 +6978,25 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     "the no-selector overload are numeric primitives "
                     "(int/long/uint/ulong/float/double), string, and "
                     "class/interface types implementing `IComparable<T>`.");
+                // fix #8161 (stdlib §5.1, v0.355): the refusal must hand back
+                // a value of THIS ARM's result type (`T?`), not the bare
+                // element. The arm returns the tagged `{i8 hasValue; T value}`
+                // struct for a VALUE-typed element, so returning the bare
+                // element made the caller store a one-field record into a
+                // two-field slot — and the `!` unwrap then extracted field 1
+                // of a struct that has only field 0, which SEGFAULTED
+                // `bezelc` inside LLVM (`llvm::Value::setName`). The
+                // diagnostic above is the reportable outcome; the constant
+                // below is what keeps the rest of the compile well-typed so
+                // the diagnostic is DELIVERED instead of the compiler dying.
+                sema::TypeRef nullRT;
+                if (elemTypeRef) {
+                    nullRT = *elemTypeRef;
+                    nullRT.nullable = true;
+                }
+                if (elemTypeRef && isNullableValueTy(&nullRT))
+                    return llvm::Constant::getNullValue(
+                        nullableValueStructTy(&nullRT));
                 return llvm::Constant::getNullValue(elemLLTy);
             }
             builder_.CreateCondBr(shouldUpdate, updBB, nextBB);

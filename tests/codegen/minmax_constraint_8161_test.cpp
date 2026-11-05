@@ -113,6 +113,16 @@ std::string w2FixedDecl() {
            "end W2; ";
 }
 
+// The CONFORMING generic record with a `T`-TYPED component (the shape whose
+// struct layout differs per instantiation). Same REVERSED `CompareTo`.
+std::string w2SelfDecl() {
+    return "record W2<T>(tag: T, v: int): IComparable<W2<T>> "
+           "  public method CompareTo(other: W2<T>): int => "
+           "    (if v > other.v then -1 else "
+           "     (if v < other.v then 1 else 0)); "
+           "end W2; ";
+}
+
 // The constraint diagnostic the no-selector `Min()`/`Max()` gate reports
 // (stdlib §5.1 / §14.2 / #1198). The element's simple name is `W`.
 const char* kConstraintNeedle =
@@ -240,4 +250,152 @@ BEZEL_TEST(minmax_constraint_8161,
                  "Console.WriteLine(a.Max().v); ")),
         "3\n"
         "1\n");
+}
+
+// =====================================================================
+// ROW 7 — `MinOrNull()` OVER A GENERIC RECORD ELEMENT (part 2).
+//
+// `record W<T>(v: int): IComparable<W<T>>` at `W<string>` — the shape that
+// SEGFAULTED `bezelc` (the `!` unwrap read field 1 of a ONE-FIELD struct,
+// because the `MinOrNull()` refusal handed back the BARE element where the
+// arm's result type is `T?`).
+//
+// The REVERSED `CompareTo` makes the ordering visible: `MinOrNull()` is the
+// LARGEST `v` (3) and `MaxOrNull()` the SMALLEST (1).
+//
+// Pre-fix: `bezelc` dies with SIGSEGV. Fixed: "3" / "1".
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           min_or_null_over_a_generic_record_element) {
+    BEZEL_EXPECT_EQ(
+        out(prog(wSelfDecl(),
+                 "var a: Array<W<string>> := "
+                 "[new W<string>(3), new W<string>(1)]; "
+                 "var m := a.MinOrNull(); "
+                 "if m <> null then Console.WriteLine($\"{m!.v}\"); end if; "
+                 "var x := a.MaxOrNull(); "
+                 "if x <> null then Console.WriteLine($\"{x!.v}\"); end if; ")),
+        "3\n"
+        "1\n");
+}
+
+// =====================================================================
+// ROW 8 — THE EMPTY SOURCE: stdlib §5.1's `*OrNull` contract is "null on
+// an empty source" (the no-selector `Min()`/`Max()` throw instead). The
+// generic-record arm keeps that contract.
+//
+// Pre-fix: `bezelc` dies with SIGSEGV. Fixed: "null".
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           min_or_null_over_an_empty_generic_record_source_is_null) {
+    BEZEL_EXPECT_EQ(
+        out(prog(wSelfDecl(),
+                 "var e: Array<W<string>> := []; "
+                 "var m := e.MinOrNull(); "
+                 "if m <> null then Console.WriteLine(\"present\"); "
+                 "else Console.WriteLine(\"null\"); end if; ")),
+        "null\n");
+}
+
+// =====================================================================
+// ROW 9 — A GENERIC RECORD WITH A `T`-TYPED COMPONENT: `W2<string>`'s
+// struct is {ptr, i32} and `W2<int>`'s is {i32, i32}, so the element must
+// be read at the INSTANTIATION's own layout.
+//
+// Pre-fix: `bezelc` dies with SIGSEGV. Fixed: "3" / "1".
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           min_or_null_over_a_generic_record_with_a_t_typed_component) {
+    BEZEL_EXPECT_EQ(
+        out(prog(w2SelfDecl(),
+                 "var a: Array<W2<string>> := "
+                 "[new W2<string>(\"x\", 3), new W2<string>(\"y\", 1)]; "
+                 "var m := a.MinOrNull(); "
+                 "if m <> null then Console.WriteLine($\"{m!.v}\"); end if; "
+                 "var x := a.MaxOrNull(); "
+                 "if x <> null then Console.WriteLine($\"{x!.v}\"); end if; ")),
+        "3\n"
+        "1\n");
+}
+
+// =====================================================================
+// ROW 10 — TWO INSTANTIATIONS IN ONE PROGRAM: the comparator thunk is
+// cached per INSTANTIATION, so a fix that minted ONE thunk per record
+// DECLARATION would order the second array by the first's `CompareTo`.
+//
+// Pre-fix: `bezelc` dies with SIGSEGV. Fixed: "3" / "7".
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           min_or_null_over_two_instantiations_in_one_program) {
+    BEZEL_EXPECT_EQ(
+        out(prog(wSelfDecl(),
+                 "var a: Array<W<string>> := "
+                 "[new W<string>(3), new W<string>(1)]; "
+                 "var b: Array<W<int>> := [new W<int>(7), new W<int>(5)]; "
+                 "var m := a.MinOrNull(); "
+                 "if m <> null then Console.WriteLine($\"{m!.v}\"); end if; "
+                 "var n := b.MinOrNull(); "
+                 "if n <> null then Console.WriteLine($\"{n!.v}\"); end if; ")),
+        "3\n"
+        "7\n");
+}
+
+// =====================================================================
+// ROW 11 — CONTROL: a NON-GENERIC record element is unchanged — the path
+// the generic arm sits beside. It already worked, so it must stay working.
+//
+// Base and fixed: "3" / "1".
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           control_min_or_null_over_a_non_generic_record_is_unchanged) {
+    BEZEL_EXPECT_EQ(
+        out(prog("record R(v: int): IComparable<R> "
+                 "  public method CompareTo(other: R): int => "
+                 "    (if v > other.v then -1 else "
+                 "     (if v < other.v then 1 else 0)); "
+                 "end R; ",
+                 "var a: Array<R> := [new R(3), new R(1)]; "
+                 "var m := a.MinOrNull(); "
+                 "if m <> null then Console.WriteLine($\"{m!.v}\"); end if; "
+                 "var x := a.MaxOrNull(); "
+                 "if x <> null then Console.WriteLine($\"{x!.v}\"); end if; ")),
+        "3\n"
+        "1\n");
+}
+
+// =====================================================================
+// ROW 12 — CONTROL: an `int` element is unchanged (the numeric no-selector
+// path). The order is NUMERIC here, so `MinOrNull()` is 1 and
+// `MaxOrNull()` is 3.
+//
+// Base and fixed: "1" / "3".
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           control_min_or_null_over_an_int_element_is_unchanged) {
+    BEZEL_EXPECT_EQ(
+        out(prog("",
+                 "var a: Array<int> := [3, 1]; "
+                 "var m := a.MinOrNull(); "
+                 "if m <> null then Console.WriteLine($\"{m!}\"); end if; "
+                 "var x := a.MaxOrNull(); "
+                 "if x <> null then Console.WriteLine($\"{x!}\"); end if; ")),
+        "1\n"
+        "3\n");
+}
+
+// =====================================================================
+// ROW 13 — CONTROL: the REFUSAL path still reports CLEANLY. A `decimal`
+// element is not supported by the no-selector `*OrNull` overload, so the
+// call is REFUSED with the diagnostic — never a crash.
+//
+// Base and fixed: the same diagnostic.
+// =====================================================================
+BEZEL_TEST(minmax_constraint_8161,
+           control_min_or_null_over_an_unsupported_element_is_refused) {
+    BEZEL_EXPECT_TRUE(rejectsWith(
+        prog("",
+             "var a: Array<decimal> := [3m, 1m]; "
+             "var m := a.MinOrNull(); "
+             "if m <> null then Console.WriteLine($\"{m!}\"); end if; "),
+        "is not yet implemented for this element type"));
 }
