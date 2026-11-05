@@ -1327,6 +1327,126 @@ static std::string_view callsNamedTypeSimpleName(const TypeRef* ref) {
     return {};
 }
 
+// fix #8198 (spec §14.2 *A type parameter as the type argument* /
+// *Interface conformance* rule 6, §26.5.1, v0.355): see the declaration in
+// ExprTypecheck_impl.hpp.
+//
+// THE QUESTION. The stdlib §5 block's `where` clause must be "satisfied by
+// the arguments inferred from the receiver" (§26.5.1). The argument inferred
+// here is the receiver's element type P. When P is a TYPE PARAMETER in scope,
+// §14.2 *A type parameter as the type argument* case 1 decides it: "The
+// argument is a type parameter `P` ... the constraint is decided at that site,
+// by `P`'s own constraints. `P` satisfies the constraint exactly when its
+// constraints guarantee it at every substitution they admit, as a matter of
+// language rule ... A type bound guarantees `where T: IFoo` by *Interface
+// conformance* rule 6 below ... A derived-property constraint is guaranteed
+// only by `P`'s carrying the same constraint, since nothing is inferred."
+//
+// §14.2 *Interface conformance* rule 6: "T is a type parameter whose
+// constraints guarantee conformance to I: a type-bound constraint naming I or
+// an interface extending I, or a class bound naming a class that conforms to
+// I under rule 1, directly or through a `where T: U` chain."
+//
+// So `where P: class` / `where P: notnull` name NO type bound and therefore
+// guarantee NO conformance: at P the §5 `Sum()`'s `where T: INumber<T>`
+// clause cannot hold, the §5 candidate is NOT applicable, and §26.5.1 leaves
+// the user's applicable `extension Object { Sum() }` as the only candidate.
+// MEASURED: at `where T: class` the §5 `Sum()` was admitted by name, beat the
+// user's extension, and lowered per instantiation — at T = string it emitted
+// `add i32 %15, ptr %14` and `bezelc` aborted with malformed IR; at
+// `where T: notnull` it answered 11 (the §5 `Sum()`) instead of 4040.
+//
+// THE INHERITED SET. A method type parameter of an override or an interface
+// implementation inherits the overridden/implemented declaration's constraint
+// set, and the recommended spelling OMITS the `where` clause (§14.2
+// *Constraints on overrides and interface implementations*: "a method's
+// **constraint set** is its stated clauses or, where it omits them, the set
+// it inherits here"). The inherited set is not readable from the AST here, so
+// an omitted clause is UNDECIDED and the §5 candidate is KEPT — the sound
+// direction. A STATED clause is the whole set (a differing clause is a
+// compile error at the declaration), so it is read here.
+//
+// Only the `where T: INumber<T>` clause is decided. The `hashable` clause is
+// a derived-property constraint ("guaranteed only by `P`'s carrying the same
+// constraint") and the `IComparable<T>` clause is the §5.1 `Min()`/`Max()`
+// gate's own verdict (#8180) — neither is decided here.
+bool ExprTC::linqElemTypeParamClauseUnsatisfied(const TypeRef* elem,
+                                                std::string_view clause) const {
+    if (!elem || elem->kind != TypeRef::Kind::Named || elem->declaration ||
+        !elem->genericArgs.empty())
+        return false;
+    const std::string_view p = elem->headName();
+    if (p.empty() || !isInScopeTypeParam(p)) return false;
+
+    // The CURRENT METHOD's own type parameter: its constraint set is its
+    // stated clauses or, where it omits them, the inherited set.
+    bool methodOwn = false;
+    bool methodStates = false;
+    if (currentMethodDecl_) {
+        for (const auto& gp : currentMethodDecl_->genericParams)
+            if (gp.name == p) methodOwn = true;
+        for (const auto& gc : currentMethodDecl_->genericConstraints)
+            if (gc.typeParam == p) methodStates = true;
+    }
+    if (methodOwn && !methodStates) {
+        // The clause is OMITTED: the set is the inherited one, or none.
+        // An inherited set is not decidable here → KEEP the §5 candidate.
+        if (currentMethodTypeParamMayInherit(p)) return false;
+        // No inherited set: the parameter is UNCONSTRAINED, which
+        // `linqElemIsUnconstrainedTypeParam` already decides.
+        return false;
+    }
+
+    // The DECLARED constraint set of `p` — the method's, the enclosing
+    // type's and the extension block's written clauses (§14.2's three
+    // sources, the same ones `isCurrentScopeTypeParamConstrained` reads).
+    std::vector<const ast::ConstraintItem*> items;
+    auto collect = [&](const std::vector<ast::GenericConstraint>& gcs) {
+        for (const auto& gc : gcs) {
+            if (gc.typeParam != p) continue;
+            for (const auto& it : gc.items) items.push_back(&it);
+        }
+    };
+    if (currentMethodDecl_) collect(currentMethodDecl_->genericConstraints);
+    if (currentType_ && currentType_->decl)
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl))
+            collect(td->genericConstraints);
+    if (currentExtension_ && currentExtension_->decl)
+        if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                currentExtension_->decl))
+            collect(ed->genericConstraints);
+    // No clause at all → unconstrained → `linqElemIsUnconstrainedTypeParam`
+    // already decides it.
+    if (items.empty()) return false;
+
+    if (clause == "where T: INumber<T>") {
+        // §14.2 *Interface conformance* rule 6: a TYPE-BOUND constraint
+        // naming I guarantees the conformance — but only for the bound that
+        // names `INumber<P>` ITSELF. `INumber` is INVARIANT (§12.9), so a
+        // bound naming `INumber<SomeBase>` (or an interface extending it)
+        // gives `P : INumber<SomeBase>`, NOT `P : INumber<P>`, and does not
+        // guarantee the clause; and a CLASS bound cannot either (a class
+        // conforms to `INumber<ThatClass>`, not to `INumber<P>`).
+        for (const ast::ConstraintItem* it : items) {
+            if (it->kind != "type" || !it->typeArg) continue;
+            const TypeRef* b = ctx_.resolvedType(*it->typeArg);
+            if (!b || b->kind != TypeRef::Kind::Named) continue;
+            if (callsNamedTypeSimpleName(b) != "INumber") continue;
+            if (b->genericArgs.size() != 1 || !b->genericArgs[0]) continue;
+            const TypeRef* ga = b->genericArgs[0];
+            // The bound's argument must be the parameter ITSELF (`where P:
+            // INumber<P>`) — the self-parameterised interface.
+            if (ga->kind == TypeRef::Kind::Named && !ga->declaration &&
+                ga->genericArgs.empty() && ga->headName() == p)
+                return false;  // GUARANTEED → the §5 candidate is KEPT
+        }
+        // The declared constraints name no `INumber<P>` → the clause cannot
+        // hold at every substitution they admit → PROVABLY unsatisfied.
+        return true;
+    }
+    return false;
+}
+
 // fix #8015 (spec §5.1, v0.350): is `t` the compiler's OWN built-in type — the
 // standard library's DECLARED ENTITY — and not a USER's type that merely
 // shares the name?

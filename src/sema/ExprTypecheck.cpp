@@ -14991,6 +14991,20 @@ bool ExprTC::stdlibLinqCandidateApplicable(std::string_view name,
         // malformed IR. A CONSTRAINED parameter is not decided here (KEPT).
         if (linqElemIsUnconstrainedTypeParam(elemTy)) return false;
         if (whereClause == "where T: INumber<T>") {
+            // fix #8198 (spec §14.2 *A type parameter as the type argument* /
+            // *Interface conformance* rule 6, §26.5.1, v0.355): a CONSTRAINED
+            // type parameter whose OWN declared constraints do not GUARANTEE
+            // the clause (`where T: class`, `where T: notnull` — no type bound
+            // at all) cannot satisfy it, so the §5 candidate is NOT
+            // applicable. The #8181 fix above decides only the UNCONSTRAINED
+            // parameter; a constrained one was KEPT, so the §5 `Sum()` beat
+            // the user's applicable `extension Object { Sum() }` and lowered
+            // per instantiation — MEASURED: at `where T: class` with
+            // T = string it emitted `add i32 %15, ptr %14` and `bezelc`
+            // aborted with malformed IR; at `where T: notnull` it answered 11
+            // (the §5 `Sum()`) instead of 4040.
+            if (linqElemTypeParamClauseUnsatisfied(elemTy, whereClause))
+                return false;
             // The ELEVEN §2.19 `INumber<T>` conformer primitives — the same
             // set the §5.1 `Sum()`/`Average()` gate uses (#4730). A class /
             // interface element DEFERS (§14.2), so it is not decided here.

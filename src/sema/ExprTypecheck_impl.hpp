@@ -754,6 +754,16 @@ private:
     // parameter guarantees no conformance and no derived property, so a §5
     // block's `where T: …` clause is PROVABLY unsatisfied at it.
     bool linqElemIsUnconstrainedTypeParam(const TypeRef* elem) const;
+    // fix #8198 (spec §14.2 *A type parameter as the type argument* /
+    // *Interface conformance* rule 6, §26.5.1, v0.355): is the §5 block's
+    // `where` clause PROVABLY unsatisfied at the element type `elem` — a type
+    // parameter IN SCOPE whose own DECLARED constraints do not GUARANTEE the
+    // clause? `true` means the clause cannot hold (the §5 candidate is NOT
+    // applicable); `false` means "satisfied OR cannot be decided here" (the
+    // candidate is KEPT — the sound direction). Defined beside
+    // `linqElemIsUnconstrainedTypeParam` in ExprTypecheck_Calls.cpp.
+    bool linqElemTypeParamClauseUnsatisfied(const TypeRef* elem,
+                                             std::string_view clause) const;
     // fix-forward #8181 (spec §14.2 *Constraints on overrides and interface
     // implementations*, v0.355): may the current METHOD's type parameter `n`
     // carry a constraint INHERITED from a method it overrides or implements
