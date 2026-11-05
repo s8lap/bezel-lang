@@ -4238,13 +4238,25 @@ llvm::Value* Emitter::lowerObjectToString(llvm::Value* recv) {
     llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
     auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false);
     llvm::Value* vtResult = builder_.CreateCall(fnTy, fnPtr, {recv}, "ts.obj.r");
+    // fix-forward #8142 (§8.5 / §18.5 / §31.2, v0.355): the dispatched
+    // `ToString` is a CALL, and a call may throw. A throwing override leaves
+    // its exception in the in-flight slot and returns null, so without the
+    // pending check the caller consumed that null as a string (a SEGV reading
+    // the length word at 0x8) and the enclosing `catch` was never reached.
+    // Every resolved method call routes through `emitPendingCheck`
+    // (`emitMethodCall`); this dispatch is the same call by another road, so it
+    // routes the same way. #8142 put the class-typed interpolation hole on
+    // this road; the member call `t.ToString()`, the `Object`-typed and the
+    // interface-typed holes were already on it, and silently lost the throw.
+    emitPendingCheck();
+    llvm::BasicBlock* vtEnd = builder_.GetInsertBlock();
     builder_.CreateBr(endBB);
 
     builder_.SetInsertPoint(endBB);
     auto* phi = builder_.CreatePHI(ptrTy(), 3, "ts.obj.res");
     phi->addIncoming(nullStr, nullBB);
     phi->addIncoming(strResult, strBB);
-    phi->addIncoming(vtResult, vtBB);
+    phi->addIncoming(vtResult, vtEnd);
     return phi;
 }
 

@@ -52540,6 +52540,7 @@ llvm::Constant* Emitter::valueBuiltinBoxToStringThunk(const char* name) {
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         std::string_view mod = common::builtinClassModulePathOf(name);
         std::string rendered = mod.empty()
                                    ? std::string(name)
@@ -52659,6 +52660,7 @@ llvm::GlobalVariable* Emitter::valueBuiltinBoxVtableFor(const char* name) {
         // insertion point and restores them afterwards (the §8.5/§8.6 thunk
         // pattern every other thunk in this file uses).
         ThunkScope scope(currentFn_, builder_, tostrFn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* pay = builder_.CreateGEP(
             ptrTy(), tostrFn->getArg(0), {builder_.getInt32(2)}, "vb.pay");
         llvm::Value* val = builder_.CreateLoad(payloadTy, pay, "vb.val");
@@ -52673,6 +52675,7 @@ llvm::GlobalVariable* Emitter::valueBuiltinBoxVtableFor(const char* name) {
     {
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", eqFn);
         ThunkScope scope(currentFn_, builder_, eqFn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* self  = eqFn->getArg(0);
         llvm::Value* other = eqFn->getArg(1);
         auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
@@ -52715,6 +52718,7 @@ llvm::GlobalVariable* Emitter::valueBuiltinBoxVtableFor(const char* name) {
     {
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", hashFn);
         ThunkScope scope(currentFn_, builder_, hashFn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* pay = builder_.CreateGEP(
             ptrTy(), hashFn->getArg(0), {builder_.getInt32(2)}, "vbh.pay");
         llvm::Value* val = builder_.CreateLoad(payloadTy, pay, "vbh.val");
@@ -52792,6 +52796,7 @@ void Emitter::emitClassToStringThunkBody(const sema::TypeSymbol* ts,
                                          llvm::Function* target) {
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     ThunkScope scope(currentFn_, builder_, thunk, entry);
+    ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
     llvm::Value* result = nullptr;
     if (target)
         // Call the real user ToString non-virtually (the thunk IS the
@@ -52893,6 +52898,7 @@ void Emitter::emitClassEqualsThunkBody(llvm::Function* thunk,
                                        llvm::Function* target) {
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     ThunkScope scope(currentFn_, builder_, thunk, entry);
+    ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
     llvm::Value* result = nullptr;
     if (target) {
         // Call the real user Equals non-virtually (the thunk IS the
@@ -52967,6 +52973,7 @@ void Emitter::emitClassHashCodeThunkBody(llvm::Function* thunk,
                                          llvm::Function* target) {
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     ThunkScope scope(currentFn_, builder_, thunk, entry);
+    ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
     llvm::Value* result = nullptr;
     if (target) {
         llvm::Value* r = builder_.CreateCall(target->getFunctionType(), target,
@@ -53030,6 +53037,7 @@ llvm::Constant* Emitter::boxDefaultEqualsThunk() {
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         builder_.CreateRet(
             builder_.CreateICmpEQ(thunk->getArg(0), thunk->getArg(1)));
     }
@@ -53055,6 +53063,7 @@ llvm::Constant* Emitter::boxDefaultHashCodeThunk() {
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         builder_.CreateRet(builder_.CreateCall(
             declareC("bz_obj_identity_hash", i32(), {ptrTy()}),
             {thunk->getArg(0)}));
@@ -53094,6 +53103,7 @@ llvm::Function* Emitter::boxRecordEqualsThunkCore(const sema::TypeSymbol* ts,
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* self  = thunk->getArg(0);
         llvm::Value* other = thunk->getArg(1);
         auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
@@ -53198,6 +53208,7 @@ llvm::Function* Emitter::boxRecordIEquatableEqualsThunk(
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* selfPayload = builder_.CreateGEP(
             ptrTy(), thunk->getArg(0), {builder_.getInt32(2)}, "bieq.spay");
         llvm::Value* sv = builder_.CreateLoad(st, selfPayload, "bieq.sv");
@@ -53261,6 +53272,7 @@ llvm::Function* Emitter::boxRecordHashThunkCore(const sema::TypeSymbol* ts,
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* self = thunk->getArg(0);
         llvm::Value* payload = builder_.CreateGEP(
             ptrTy(), self, {builder_.getInt32(2)}, "bhash.pay");
@@ -53351,6 +53363,7 @@ llvm::Constant* Emitter::primBoxEqualsThunk(sema::PrimitiveType prim,
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* self  = thunk->getArg(0);
         llvm::Value* other = thunk->getArg(1);
         auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
@@ -53449,6 +53462,7 @@ llvm::Constant* Emitter::primBoxHashThunk(sema::PrimitiveType prim,
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* self = thunk->getArg(0);
         llvm::Value* payload = builder_.CreateGEP(
             ptrTy(), self, {builder_.getInt32(2)}, "phash.pay");
@@ -53845,6 +53859,7 @@ llvm::Constant* Emitter::boxToStringThunk(const sema::TypeSymbol* ts) {
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* result = nullptr;
         if (ts->kind == ast::TypeDeclKind::Enum) {
             // per §10.5 (v0.183): a user `ToString(): string` replaces the §8.5
@@ -54023,6 +54038,7 @@ llvm::Function* Emitter::recordToStringHelperFn(const sema::TypeSymbol* rec,
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
     {
         ThunkScope scope(currentFn_, builder_, fn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* recVal =
             builder_.CreateLoad(recTy, fn->getArg(0), "vtostr.load");
         llvm::Value* result = emitRecordToString(recVal, rec);
@@ -54054,6 +54070,7 @@ llvm::Function* Emitter::recordEqualityHelperFn(const sema::TypeSymbol* rec,
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
     {
         ThunkScope scope(currentFn_, builder_, fn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* lVal = builder_.CreateLoad(recTy, fn->getArg(0), "veq.l");
         llvm::Value* rVal = builder_.CreateLoad(recTy, fn->getArg(1), "veq.r");
         llvm::Value* result = emitStructEquality(lVal, rVal, recTy, rec);
@@ -54079,6 +54096,7 @@ llvm::Function* Emitter::recordHashCodeHelperFn(const sema::TypeSymbol* rec,
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
     {
         ThunkScope scope(currentFn_, builder_, fn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* recVal =
             builder_.CreateLoad(recTy, fn->getArg(0), "vhash.load");
         llvm::Value* result = emitRecordHashCode(recVal, rec);
@@ -54110,6 +54128,7 @@ llvm::Constant* Emitter::primBoxToStringThunk(sema::PrimitiveType prim,
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* boxPtr = thunk->getArg(0);
         llvm::Value* payload = builder_.CreateGEP(
             ptrTy(), boxPtr, {builder_.getInt32(2)}, "box.valptr");
@@ -54539,6 +54558,7 @@ llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy,
             "bzspan$ToString$" + std::string(head), module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", toStringFn);
         ThunkScope scope(currentFn_, builder_, toStringFn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* spanPtr = builder_.CreateGEP(
             ptrTy(), toStringFn->getArg(0),
             {llvm::ConstantInt::get(i32(), 2)}, "span.ptr");
@@ -54803,6 +54823,7 @@ llvm::GlobalVariable* Emitter::ensureInlineArrayBoxVtable(
                                          "bz$iatostr$" + sfx, module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", toStrFn);
         ThunkScope scope(currentFn_, builder_, toStrFn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         builder_.CreateRet(lowerStringLiteral("\"" + spelling + "\"", false));
     }
 
@@ -54821,6 +54842,7 @@ llvm::GlobalVariable* Emitter::ensureInlineArrayBoxVtable(
                                       "bz$iaeq$" + sfx, module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", eqFn);
         ThunkScope scope(currentFn_, builder_, eqFn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* self  = eqFn->getArg(0);
         llvm::Value* other = eqFn->getArg(1);
         auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
@@ -54883,6 +54905,7 @@ llvm::GlobalVariable* Emitter::ensureInlineArrayBoxVtable(
                                         "bz$iahash$" + sfx, module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", hashFn);
         ThunkScope scope(currentFn_, builder_, hashFn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* payload = builder_.CreateGEP(
             ptrTy(), hashFn->getArg(0), {builder_.getInt32(2)}, "iahash.pay");
         llvm::Value* val = builder_.CreateLoad(arrTy, payload, "iahash.val");
@@ -54988,6 +55011,7 @@ llvm::GlobalVariable* Emitter::ensureUnitBoxVtable() {
                                          "bz$unittostr", module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", toStrFn);
         ThunkScope scope(currentFn_, builder_, toStrFn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         // fix #3442: §8.5's unit rendering, from its one spelling
         // (`kUnitToStringSource`), so this thunk and the three unboxed
         // positions cannot disagree — the ToString twin of what #3422 did for
@@ -55040,6 +55064,7 @@ llvm::GlobalVariable* Emitter::ensureUnitBoxVtable() {
                                       "bz$uniteq", module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", eqFn);
         ThunkScope scope(currentFn_, builder_, eqFn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         // The helper's guards cannot fire here (a `ptr` argument, a live
         // `vtGV`, `currentFn_` == eqFn under ThunkScope), but a thunk that
         // `CreateRet(nullptr)`s would be malformed IR rather than a decline, so
@@ -55057,6 +55082,7 @@ llvm::GlobalVariable* Emitter::ensureUnitBoxVtable() {
                                         "bz$unithash", module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", hashFn);
         ThunkScope scope(currentFn_, builder_, hashFn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         // Deliberately NOT 0: a degenerate 0 is the value every UNBOXED /
         // dropped path already produces (#2804 recorded that exact trap — three
         // distinct boxes all "agreeing" at hash 0), so a test asserting the
@@ -55332,6 +55358,7 @@ llvm::GlobalVariable* Emitter::ensureRangeBoxVtable(const sema::TypeRef* rt) {
                                          "bz$rngtostr$" + sfx, module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", toStrFn);
         ThunkScope scope(currentFn_, builder_, toStrFn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* box = toStrFn->getArg(0);
         // Load the struct payload at the fixed offset two words past the
         // vtable pointer (BZ_BOX_RC_OFFSET is the rc word, then the
@@ -55376,6 +55403,7 @@ llvm::GlobalVariable* Emitter::ensureRangeBoxVtable(const sema::TypeRef* rt) {
                                       "bz$rngeq$" + sfx, module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", eqFn);
         ThunkScope scope(currentFn_, builder_, eqFn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* self  = eqFn->getArg(0);
         llvm::Value* other = eqFn->getArg(1);
         auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
@@ -55442,6 +55470,7 @@ llvm::GlobalVariable* Emitter::ensureRangeBoxVtable(const sema::TypeRef* rt) {
                                         "bz$rnghash$" + sfx, module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", hashFn);
         ThunkScope scope(currentFn_, builder_, hashFn, entry);
+        ThunkUnwindIsolation unwindIso(*this);  // fix-forward #8142
         llvm::Value* self = hashFn->getArg(0);
         llvm::Value* pptr = builder_.CreateGEP(
             ptrTy(), self, {builder_.getInt32(2)}, "rngh.pptr");

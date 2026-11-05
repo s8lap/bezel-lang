@@ -3568,6 +3568,52 @@ private:
     // exception propagates out of them (§28.3). 0 = dispose all (the
     // function propagate path).
     std::size_t unwindScopeDepth_ = 0;
+    // fix-forward #8142 (§31.2 / §28.3, v0.355): the unwind state above is
+    // PER FUNCTION, and a Setup-time object-protocol thunk (`ThunkScope`: the
+    // box/record ToString, Equals and GetHashCode thunks) is a DIFFERENT
+    // function, minted while another body may be half emitted. A pending check
+    // inside such a thunk (a component's dispatched `ToString` may throw) must
+    // unwind to the THUNK's own propagate block (return to the caller, whose
+    // own pending check routes it on) and dispose only the thunk's scopes —
+    // never branch into the outer body's catch dispatch or propagate block
+    // ("Referring to a basic block in another function") or replay the outer
+    // body's live disposals. This RAII clears that state for the thunk's
+    // lifetime and restores it on exit; it is used next to every `ThunkScope`.
+    struct ThunkUnwindIsolation {
+        Emitter& e;
+        std::vector<std::vector<Disposal>> disposeStack;
+        llvm::BasicBlock* unwindTarget;
+        llvm::BasicBlock* propagateBB;
+        llvm::Value* currentCaughtExc;
+        llvm::BasicBlock* caughtExcArmTarget;
+        std::size_t unwindScopeDepth;
+        bool diverged;
+        explicit ThunkUnwindIsolation(Emitter& em)
+            : e(em), disposeStack(std::move(em.disposeStack_)),
+              unwindTarget(em.unwindTarget_), propagateBB(em.propagateBB_),
+              currentCaughtExc(em.currentCaughtExc_),
+              caughtExcArmTarget(em.caughtExcArmTarget_),
+              unwindScopeDepth(em.unwindScopeDepth_), diverged(em.diverged_) {
+            em.disposeStack_.clear();
+            em.unwindTarget_ = nullptr;
+            em.propagateBB_ = nullptr;
+            em.currentCaughtExc_ = nullptr;
+            em.caughtExcArmTarget_ = nullptr;
+            em.unwindScopeDepth_ = 0;
+            em.diverged_ = false;
+        }
+        ~ThunkUnwindIsolation() {
+            e.disposeStack_ = std::move(disposeStack);
+            e.unwindTarget_ = unwindTarget;
+            e.propagateBB_ = propagateBB;
+            e.currentCaughtExc_ = currentCaughtExc;
+            e.caughtExcArmTarget_ = caughtExcArmTarget;
+            e.unwindScopeDepth_ = unwindScopeDepth;
+            e.diverged_ = diverged;
+        }
+        ThunkUnwindIsolation(const ThunkUnwindIsolation&) = delete;
+        ThunkUnwindIsolation& operator=(const ThunkUnwindIsolation&) = delete;
+    };
     // fix #1878 + #1882 (§28.4, v0.306): how many disposal emissions that can
     // run USER code have been emitted so far in this module. Read only as a
     // difference across a disposal pass, so its absolute value is meaningless
