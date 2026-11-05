@@ -7318,6 +7318,8 @@ bool MethodOwnership::isFreshOwnedArrayMaterializerLocal(
     // it is by §21.1's rejection of a `const` over an owned production). A
     // for-loop induction variable's `decl` is the `ForStmt` itself, so the
     // cast declines it.
+    // LOCALDECL-ONLY: a `const` local cannot reach here -- §21.1 rejects a
+    // `const` over an owned production, so the exclusion is the rule.
     const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
     if (!ld || !ld->initializer) return false;
     return isFreshOwnedArrayMaterializerExpr(*ld->initializer);
@@ -8270,8 +8272,8 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             // read `owned` from), so `isEscapeBoundLocal` — which reads the
             // state — misses it, while the class-instance twin
             // (`var a := new Item(1);`) is caught. §28.3's producers table
-            // makes the Array-materializer production Owned (stdlib §9.6
-            // declares `Split` / `ToCharArray` `owned Array<T>`), so the two
+            // makes the materializer production Owned (stdlib §9.6 declares
+            // `Split` / `ToCharArray` `owned Array<T>`), so the two
             // spellings must agree. // per §28.3, §28.3.8, §28.9
             if (isEscapeBoundLocal(sym) ||
                 isFreshOwnedArrayMaterializerLocal(sym))
