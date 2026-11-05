@@ -3278,9 +3278,18 @@ void ExprTC::resolveMemberAccessWithRule1(const ast::MemberAccessExpr& ma) {
     if (&ma == calleeOfCallCtx_ && currentCallArity_ > 0 && ma.target &&
         ctx_.diagnostics().errorCount() == errorsBefore) {
         TypeRef* recvTy = ctx_.exprType(*ma.target);
-        if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
-            !recvTy->declaration) {
-            const std::string_view head = recvTy->headName();
+        // fix #8297 (§26.5 rule 1, §22.6, stdlib §2.5-§2.7 / §6.1, v0.355):
+        // a built-in CLASS STUB receiver (`var t := CancellationToken.None`,
+        // `var d := DateTime.UtcNow`) carries a non-null `declaration` — the
+        // synthetic `builtinClassSym` — and the declaration-less test above
+        // skipped it, so the arity-1 call `t.IsCancellationRequested(1)` was
+        // silently accepted. `valueRecordHeadOf` names the builtin head for
+        // that shape and excludes a user type, the same resolver the `?.`
+        // twin already uses (`builtinSurfaceDeclaresArity0Member`).
+        if (recvTy && recvTy->kind == TypeRef::Kind::Named) {
+            const std::string_view head =
+                recvTy->declaration ? valueRecordHeadOf(recvTy)
+                                    : recvTy->headName();
             const ValueRecordSurface* s = valueRecordSurfaceOf(head);
             if (s && surfaceDeclaresProperty(*s, ma.member)) {
                 auto loc = ma.span.begin;

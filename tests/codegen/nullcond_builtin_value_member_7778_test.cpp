@@ -131,12 +131,12 @@ BEZEL_TEST(nullcond_builtin_value_member_7778, spec_7_4_narrowed_read_agrees_wit
 BEZEL_TEST(nullcond_builtin_value_member_7778, stdlib_2_5_property_invoked_as_method_on_factory_shape_is_rejected) {
     BEZEL_EXPECT_TRUE(hasError(prog(
         "var a := new DateTime(2020, 1, 2, 3, 4, 5); var d := a.Date; "
-        "var x := d.Year(1); "), "`Year` on built-in type `DateOnly` produced no value"));
+        "var x := d.Year(1); "), "`Year` on `DateOnly` is an instance member"));
     BEZEL_EXPECT_TRUE(hasError(prog(
         "var a := new DateTime(2020, 1, 2, 3, 4, 5); var o := a.TimeOfDay; "
-        "var x := o.Hour(1); "), "`Hour` on built-in type `TimeOnly` produced no value"));
+        "var x := o.Hour(1); "), "`Hour` on `TimeOnly` is an instance member"));
     BEZEL_EXPECT_TRUE(hasError(prog(
         "var a := new DateTime(2020, 1, 2, 3, 4, 5); "
         "var b := new DateTime(2020, 1, 3, 5, 4, 5); var t := b - a; "
-        "var x := t.Days(1); "), "`Days` on built-in type `TimeSpan` produced no value"));
+        "var x := t.Days(1); "), "`Days` on `TimeSpan` is an instance member"));
 }
