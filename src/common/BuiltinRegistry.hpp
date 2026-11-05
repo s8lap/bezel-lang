@@ -300,7 +300,22 @@ bool isFfiBufferBuiltinName(std::string_view n);
 // `.Length`/`.Pointer`/`.ToBytes`/`.CopyTo` dispatch) that does not apply to
 // either of these two — a shared boolean would give a reader the false
 // impression the two families are interchangeable.
-// per §6.1 / §8.1, stdlib preamble (both live in `System.*` per
+//
+// fix #8252 (stdlib §6.2/§8.1/§8.3/§8.5, v0.355): `Lock` (stdlib §6.2, a
+// `bz_lock_t*` handle) joins the row.  stdlib §6.2 declares it with no public
+// constructor and no declared instance member but its destructor, so the
+// §8.1 universal-Object surface it inherits has no override on it: the §8.5
+// default is the qualified name "System.Threading.Lock" and §8.3's default
+// is reference identity — exactly what the `Object`-carrier spelling of the
+// same value already answered (through the runtime's `bz_lock_vtable`, whose
+// slot 3 is `bz_lock_obj_tostring` — #8000).  The DIRECT spelling was
+// rejected by codegen's §8.1 gate ("... not yet implemented by this compiler
+// for this receiver (tracked #2457)"), so the two spellings of ONE value
+// disagreed.  The row is the compiler-side dispatch for a built-in class with
+// no declared override of the §8.1 members; it is deliberately not widened to
+// `Semaphore` / `SemaphoreToken` / `TaskScope` / `Random` / `FileStream`
+// (separate #2457 slices, issue #3896).
+// per §6.1 / §8.1, stdlib preamble (all live in `System.*` per
 // `kBuiltinClassModulePaths`, BuiltinRegistry.cpp)
 bool isNoOverrideIdentityBuiltinName(std::string_view n);
 

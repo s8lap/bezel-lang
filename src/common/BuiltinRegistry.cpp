@@ -247,8 +247,45 @@ constexpr std::array<std::string_view, 3> kFfiBufferBuiltins = {
 // kept as their own row rather than folded into `kFfiBufferBuiltins` (which
 // also drives FFI-specific malloc/free disposal and member dispatch that
 // does not apply to either of these).
-constexpr std::array<std::string_view, 2> kNoOverrideIdentityBuiltins = {
-    "Stopwatch", "CancellationToken",
+//
+// fix #8252 (stdlib §6.2/§8.1/§8.3/§8.5, v0.355): `Lock` joins the row.
+// stdlib §6.2 declares `public class Lock` with NO public constructor and NO
+// declared instance member other than its destructor:
+//
+//   public class Lock
+//     // No public constructor; obtained from Mutex.Acquire / TryAcquire.
+//     destructor;       // releases the held lock
+//   end Lock;
+//
+// so the §8.1 universal-Object surface it inherits (`ToString`, `Equals`,
+// `GetHashCode`) has NO override on it, and the §8.5 default ("For classes:
+// the type's qualified name") is `System.Threading.Lock` -- the very string
+// the `Object`-carrier path already produced for the same value
+// (`var o: Object := l; o.ToString()` -> "System.Threading.Lock", through
+// the runtime-owned `bz_lock_vtable`'s slot 3, `bz_lock_obj_tostring`,
+// installed by #8000).  Before this row the DIRECT spelling was rejected by
+// codegen's §8.1 gate with "member `ToString` on `Lock` is declared via the
+// universal Object contract ... but is not yet implemented by this compiler
+// for this receiver (tracked #2457)", while the carrier spelling worked --
+// the two spellings of ONE value disagreed (issue #8252).
+//
+// WHY THIS ROW AND NOT A NEW ONE.  The row selects the compiler-side
+// dispatch for a built-in class that declares NO override of the §8.1
+// members: the §8.5 qualified-name `ToString` literal (the same literal
+// chain `Array` / `Stack` / `DrainedEntry` / `Stopwatch` / `CancellationToken`
+// use) and §8.3's reference-identity `Equals` / identity `GetHashCode`.  Both
+// are exactly what the runtime's own vtable slot 3 / 4 / 5 answer for the
+// `Object`-carrier spelling (`bz_lock_obj_tostring` returns the qualified
+// name; `bz_builtin_obj_equals` is `a == b`; `bz_builtin_obj_hash` is
+// `bz_obj_identity_hash`), so the direct and carrier spellings now answer
+// alike.
+//
+// The row is deliberately NOT widened to `Semaphore` / `SemaphoreToken` /
+// `TaskScope` / `Random` / `FileStream`: those are separate #2457 slices
+// (issue #3896), and `Random` in particular is pinned as still-rejected by
+// `tests/codegen/object_contract_unlowered_member_2922_test.cpp`.
+constexpr std::array<std::string_view, 3> kNoOverrideIdentityBuiltins = {
+    "Stopwatch", "CancellationToken", "Lock",
 };
 
 // The heap-pointer reference builtins shared by BOTH codegen rep paths in

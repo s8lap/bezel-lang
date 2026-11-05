@@ -441,20 +441,24 @@ BEZEL_TEST(builtin_registry_snapshot, ffi_buffer_builtin_set) {
         BEZEL_EXPECT_FALSE(isFfiBufferBuiltinName(n));
 }
 
-// --- isNoOverrideIdentityBuiltinName (#4126, stdlib §6.1/§8.1): the two
-// builtin heap-pointer CLASSES (Stopwatch, CancellationToken) sharing the
-// FFI-buffer trio's "no vtable, no dedicated Object-contract interceptor"
-// shape but kept as their own registry row (see BuiltinRegistry.cpp for
-// why a shared boolean with kFfiBufferBuiltins would misstate the two
-// families as interchangeable). ---
+// --- isNoOverrideIdentityBuiltinName (#4126, stdlib §6.1/§8.1; #8252,
+// stdlib §6.2/§8.1/§8.3/§8.5): the builtin heap-pointer CLASSES with no
+// declared override of the §8.1 universal members — Stopwatch and
+// CancellationToken (stdlib §8.1/§6.1), and, since #8252, Lock (stdlib
+// §6.2) — sharing the FFI-buffer trio's "no dedicated Object-contract
+// interceptor" shape but kept as their own registry row (see
+// BuiltinRegistry.cpp for why a shared boolean with kFfiBufferBuiltins would
+// misstate the two families as interchangeable). ---
 BEZEL_TEST(builtin_registry_snapshot, no_override_identity_builtin_set) {
-    static constexpr std::array<std::string_view, 2> kSnapshot = {
-        "Stopwatch", "CancellationToken",
+    static constexpr std::array<std::string_view, 3> kSnapshot = {
+        "Stopwatch", "CancellationToken", "Lock",
     };
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isNoOverrideIdentityBuiltinName(n));
     for (std::string_view n : {"CString", "WString", "RawBytes", "Guid",
                                "Range", "DateTime", "TimeSpan",
-                               "CancellationTokenSource", "Random", ""})
+                               "CancellationTokenSource", "Random",
+                               "Semaphore", "SemaphoreToken", "TaskScope",
+                               "FileStream", ""})
         BEZEL_EXPECT_FALSE(isNoOverrideIdentityBuiltinName(n));
 }
 
