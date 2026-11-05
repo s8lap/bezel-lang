@@ -10673,6 +10673,91 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return builder_.CreateIntToPtr(asI64, ptrTy());
         };
 
+        // fix #8169 (stdlib §4.8, v0.355): the ENTRY-SHAPED `ICollection`
+        // forms of `Dictionary<K, V>`.
+        //
+        // §4.8 declares `Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>`,
+        // so the interface's `Add(item)` / `Contains(item)` / `Remove(item)`
+        // are reachable on the CONCRETE dictionary with a
+        // `DictionaryEntry<K, V>` argument (§1's elision rule). §4.8 states
+        // their behaviour in one sentence (stdlib §4.8, v0.355):
+        //
+        //   "`Add(entry)` is `Add(entry.Key, entry.Value)` — ArgumentException
+        //    on a present key; `Contains(entry)` is `true` iff the key is
+        //    present and the stored value equals `entry.Value` under the
+        //    type's standard equality; `Remove(entry)` removes only when both
+        //    match, else returns `false` with no change."
+        //
+        // Only `Dictionary<K, V>` carries the entry forms: §4.9's
+        // `OwningDictionary<K, V>` conforms to `IDisposable` ONLY (no
+        // `ICollection` conformance, hence no entry form) and §4.17's
+        // `SortedDictionary<K, V>` conforms to `IReadOnlyCollection` (no
+        // mutating member, and its `Contains(key: K)` is the KEYED alias).
+        // The gate below therefore reads the receiver's own head name, not
+        // just the member name.
+        //
+        // The DISAMBIGUATION between the keyed one-argument forms
+        // (`Contains(key: K)` / `Remove(key: K)`) and the entry forms is the
+        // ARGUMENT'S TYPE: the entry form's parameter is
+        // `DictionaryEntry<K, V>` — the receiver's OWN element type — while
+        // the keyed form's is `K`. The two can never coincide (`K` cannot be
+        // `DictionaryEntry<K, V>`: that is an infinitely recursive
+        // instantiation), so the check is exact and needs no overload
+        // resolution.
+        const sema::TypeRef* dictEntryArgTy = nullptr;
+        bool dictEntryForm = false;
+        if (call.args.size() == 1 && call.args[0].value &&
+            (m == "Add" || m == "Contains" || m == "Remove") &&
+            recvTy && recvTy->headName() == "Dictionary" &&
+            recvTy->genericArgs.size() >= 2 &&
+            (dictEntryArgTy = ctx_.exprType(*call.args[0].value)) &&
+            dictEntryArgTy->kind == sema::TypeRef::Kind::Named &&
+            !dictEntryArgTy->declaration &&
+            dictEntryArgTy->headName() == "DictionaryEntry" &&
+            dictEntryArgTy->genericArgs.size() >= 2 &&
+            typeRefIdentityKey(dictEntryArgTy->genericArgs[0]) ==
+                typeRefIdentityKey(recvTy->genericArgs[0]) &&
+            typeRefIdentityKey(dictEntryArgTy->genericArgs[1]) ==
+                typeRefIdentityKey(recvTy->genericArgs[1]))
+            dictEntryForm = true;
+        // Read the entry's `Key` and `Value` fields — the SAME {K, V} struct
+        // the §4.8 field-read arm (`entry.Key` / `entry.Value`; #548 / #2471 /
+        // #3876) reads, with the same capture-cell handling: a CAPTURED entry
+        // local's `locals_` entry is REBOUND to the ptr-sized cell-HOLDER
+        // alloca and the real {K,V} struct lives in the heap cell the holder
+        // points AT (`boxedStorage` is the funnel every other boxed read/write
+        // already goes through).
+        auto readDictEntryFields = [&](const ast::Expr* entryExpr,
+                                        llvm::Value*& keyOut,
+                                        llvm::Value*& valOut) -> bool {
+            if (!entryExpr || !dictEntryArgTy) return false;
+            llvm::Type* kTy = lowerTypeRef(dictEntryArgTy->genericArgs[0]);
+            llvm::Type* vTy = lowerTypeRef(dictEntryArgTy->genericArgs[1]);
+            if (!kTy || !vTy) return false;
+            llvm::StructType* entryStTy =
+                llvm::StructType::get(llvm_, {kTy, vTy});
+            llvm::Value* base = nullptr;
+            if (llvm::AllocaInst* slot = localSlot(*entryExpr)) {
+                llvm::Type* baseElemTy = nullptr;
+                base = boxedStorage(slot, baseElemTy);
+            } else if (llvm::Value* v = lowerExpr(*entryExpr)) {
+                if (!v->getType()->isStructTy()) return false;
+                llvm::AllocaInst* tmp = entryAlloca(entryStTy);
+                builder_.CreateStore(v, tmp);
+                base = tmp;
+            } else {
+                return false;
+            }
+            keyOut = builder_.CreateLoad(
+                kTy, builder_.CreateStructGEP(entryStTy, base, 0, "de.key"),
+                "de.key");
+            valOut = builder_.CreateLoad(
+                vTy, builder_.CreateStructGEP(entryStTy, base, 1, "de.val"),
+                "de.val");
+            return true;
+        };
+
+
         // narrow #3576 / stdlib §5 / §4.8 / §4.17 (v0.286); fix #3761:
         // First()/Last()/ElementAt(i)/Single() over a Dictionary/
         // SortedDictionary receiver. Sema
@@ -11225,7 +11310,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         }
         // .ContainsKey(k) / .Contains(k) (alias, §4.8): bool
         if ((m == "ContainsKey" || m == "Contains") &&
-            call.args.size() == 1 && call.args[0].value) {
+            call.args.size() == 1 && call.args[0].value &&
+            !dictEntryForm) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
             if (keyTy) {
@@ -11373,11 +11459,24 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // value (they are documented to throw DuplicateKey on .Add; .Set simply
         // overwrites without disposal — the indexer setter `d[k] := v` is the
         // overwriting path and IS handled in lowerCollectionIndexerSet).
-        if ((m == "Add" || m == "Set") && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
-            llvm::Value* k = lowerExpr(*call.args[0].value);
-            llvm::Value* v = lowerExpr(*call.args[1].value);
-            if (!k || !v) return nullptr;
+        // The keyed insert, shared by the two-argument form
+        // `Add(key: K, value: V)` and the ENTRY-shaped form `Add(entry)`
+        // (stdlib §4.8, v0.355 — the entry-form block above carries the
+        // citation and the scope ruling).
+        //
+        // `keyExpr` / `valExpr` are the SOURCE argument expressions; the arm
+        // consults them for the §28.9 +1-producer questions — a fresh +1 KEY
+        // producer is RELEASED after the insert (the table copies the key
+        // bytes), a fresh +1 VALUE producer is TRANSFERRED into the table
+        // rather than retained. The entry form passes nullptr for both: the
+        // entry's Key and Value are BORROWS of the source dictionary's own
+        // storage (the entry owns its copies and releases them at its own
+        // scope end), so neither is a producer here — the key is not released
+        // (the entry owns it) and the string VALUE is RETAINED (the new table
+        // takes its own +1 on the borrowed value).
+        auto emitDictAdd = [&](llvm::Value* k, llvm::Value* v,
+                               const ast::Expr* keyExpr,
+                               const ast::Expr* valExpr) -> llvm::Value* {
             // §4.8 / #1201 / #1214: Dictionary.Add and OwningDictionary.Add must
             // throw ArgumentException when the key is already present (the indexer
             // setter `d[k] := v` is the add-or-update / overwrite path and must
@@ -11392,7 +11491,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto* cf = declareC("bz_dict_contains_gen",
                                         i1(), {ptrTy(), ptrTy()});
                     emitGuardThrow(
-                        builder_.CreateCall(cf, {recv, genKeyPtr(k, call.args[0].value.get())}, "add.dup"),
+                        builder_.CreateCall(cf, {recv, genKeyPtr(k, keyExpr)}, "add.dup"),
                         "ArgumentException");
                 } else {
                     auto [kd0, kl0, kw0] = strDataLen(k);
@@ -11407,7 +11506,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     // instead (manual branch mirrors the OwningDictionary
                     // arm's dispose-then-throw just below); every other case
                     // (a borrowed key) keeps the plain emitGuardThrow.
-                    if (isPlusOneStringProducer(call.args[0].value.get())) {
+                    if (isPlusOneStringProducer(keyExpr)) {
                         auto* dupBB = llvm::BasicBlock::Create(
                             llvm_, "add.dup.keyrel", currentFn_);
                         auto* contBB = llvm::BasicBlock::Create(
@@ -11433,7 +11532,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 if (keyTy) {
                     auto* cf = declareC("bz_dict_contains_gen",
                                         i1(), {ptrTy(), ptrTy()});
-                    isDup = builder_.CreateCall(cf, {recv, genKeyPtr(k, call.args[0].value.get())},
+                    isDup = builder_.CreateCall(cf, {recv, genKeyPtr(k, keyExpr)},
                                                 "add.dup");
                 } else {
                     auto [kd0, kl0, kw0] = strDataLen(k);
@@ -11455,7 +11554,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // — the real insert's re-derived kd/kl (and this fix's release
                 // after it) never run on this duplicate edge; release a fresh
                 // +1 KEY producer here, before throwing, instead.
-                if (!keyTy && isPlusOneStringProducer(call.args[0].value.get()))
+                if (!keyTy && isPlusOneStringProducer(keyExpr))
                     emitStringRelease(k);
                 emitThrowBuiltin("ArgumentException");
                 builder_.SetInsertPoint(contBB);
@@ -11464,13 +11563,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // encoding (v is still the raw bz_string* at this point; encodeValue
             // returns it as-is for pointers). dictIsStringValue derived from dictValPol.
             if (dictIsStringValue &&
-                !isPlusOneStringProducer(call.args[1].value.get()))
+                !isPlusOneStringProducer(valExpr))
                 emitStringRetain(v);
             llvm::Value* vPtr = encodeValue(v);
             if (keyTy) {
                 auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {recv, genKeyPtr(k, call.args[0].value.get()), vPtr});
+                builder_.CreateCall(fn, {recv, genKeyPtr(k, keyExpr), vPtr});
                 // fix #1970 / §28.4 / §28.6: for OwningDictionary<K,V>.Add the
                 // value parameter is `owned` and has just been stored into the
                 // dict's table (the duplicate-key branch above already disposed
@@ -11486,14 +11585,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // dict's table disposal on Clear/Drain). Mirror the OwningArray
                 // / OwningSet Add nulling paths.
                 if (dictValIsOwning)
-                    nullTransferredOwnedLocalSlot(call.args[1].value.get());
+                    nullTransferredOwnedLocalSlot(valExpr);
                 // fix #6419: the insert is the last read of `recv` — the table
-                // now OWNS the value, and `.Add` returns `unit`, so nothing this
-                // arm hands back aliases the backing and §28.3's reclaim goes
-                // here, after the insert. Placed after `nullTransferredOwned
-                // LocalSlot` so the transfer bookkeeping is unchanged; the two
-                // touch disjoint state (the caller's slot vs the dict header).
-                freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+                // now OWNS the value, and `.Add` returns `unit`, so nothing
+                // this arm hands back aliases the backing and §28.3's reclaim
+                // is the CALLER's to make (the two call sites below each emit
+                // it exactly once, on the arm's single returning edge).
                 return llvm::ConstantInt::get(i32(), 0);
             }
             auto [kd, kl, kw] = strDataLen(k);
@@ -11506,7 +11603,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // slot; the UnwindIneligibleWalker-eligible unwindOnly disposal
             // stays exactly-once (throw-before disposes, throw-after skips).
             if (dictValIsOwning)
-                nullTransferredOwnedLocalSlot(call.args[1].value.get());
+                nullTransferredOwnedLocalSlot(valExpr);
             // fix #3703 / §28.9: release a fresh +1 KEY producer — this
             // insert is the final use of `k` on the non-duplicate path (the
             // table copies kd/kl's bytes, never retaining `k` itself, unlike
@@ -11514,13 +11611,28 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // its own copy of `k` before diverging (see the manual
             // dup-then-release-then-throw branches, both arms), so this is
             // exactly-once regardless of which edge fires.
-            if (isPlusOneStringProducer(call.args[0].value.get()))
+            if (isPlusOneStringProducer(keyExpr))
                 emitStringRelease(k);
-            // fix #6419: the twin of the generic-key reclaim above, on this arm's
-            // one non-throwing return. §28.3's boundary is the end of the full
-            // expression, which for a `unit`-returning arm IS its own return.
-            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+            // fix #6419: the twin of the generic-key reclaim above, on this
+            // arm's one non-throwing return. §28.3's boundary is the end of
+            // the full expression, which for a `unit`-returning arm IS its
+            // own return — the CALLER's reclaim (see the two call sites).
             return llvm::ConstantInt::get(i32(), 0);
+        };
+        if ((m == "Add" || m == "Set") && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* k = lowerExpr(*call.args[0].value);
+            llvm::Value* v = lowerExpr(*call.args[1].value);
+            if (!k || !v) return nullptr;
+            llvm::Value* addResult =
+                emitDictAdd(k, v, call.args[0].value.get(),
+                            call.args[1].value.get());
+            // fix #6419: the insert is the last read of `recv` — the table
+            // now OWNS the value, and `.Add` returns `unit`, so nothing this
+            // arm hands back aliases the backing and §28.3's reclaim goes
+            // here, after the insert.
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+            return addResult;
         }
         // .Remove(k): bool — per §4.9: OwningDictionary.Remove disposes the
         // removed value (exactly once) before unlinking; a non-owning
@@ -11529,9 +11641,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // stored value — Remove must release the removed value's +1 (else it
         // leaks). Use the disposing-remove variant with stringElementReleaseThunk
         // as the value-disposer, exactly mirroring the OwningDictionary path.
-        if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
-            llvm::Value* k = lowerExpr(*call.args[0].value);
-            if (!k) return nullptr;
+        // The keyed remove, shared by the one-argument form `Remove(key: K)`
+        // and the ENTRY-shaped form `Remove(entry)` (stdlib §4.8, v0.355).
+        // `keyExpr` is the SOURCE argument expression — the entry form passes
+        // nullptr (the entry's Key is a borrow the entry itself owns, so the
+        // keyed arm's "fresh +1 KEY producer" release must not fire).
+        auto emitDictRemoveKey = [&](llvm::Value* k,
+                                     const ast::Expr* keyExpr) -> llvm::Value* {
             // For an OwningDictionary<K, class> get the value disposer thunk
             // (same helper Clear uses, so the dispose logic is exactly-once
             // and consistent). For a borrowing Dictionary<K, V> (or
@@ -11568,18 +11684,18 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto* fn = declareC("bz_dict_remove_gen_disposing", i1(),
                                         {ptrTy(), ptrTy(), ptrTy()});
                     removeResult = builder_.CreateCall(
-                        fn, {recv, genKeyPtr(k, call.args[0].value.get()), llvm::cast<llvm::Value>(valDisp)},
+                        fn, {recv, genKeyPtr(k, keyExpr), llvm::cast<llvm::Value>(valDisp)},
                         "dict.remove");
                 } else {
                     auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
                     removeResult = builder_.CreateCall(
-                        fn, {recv, genKeyPtr(k, call.args[0].value.get())}, "dict.remove");
+                        fn, {recv, genKeyPtr(k, keyExpr)}, "dict.remove");
                 }
                 // fix #6419: the removed value is DISPOSED inside the call
                 // (`_disposing` variant) or never entered the table, and the
                 // `bool` this arm hands back aliases no slot of it — so the
-                // unbound receiver is spent here and §28.3's reclaim is safe.
-                freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+                // unbound receiver is spent on the caller's edge and §28.3's
+                // reclaim is safe there.
                 return removeResult;
             }
             auto [kd, kl, kw] = strDataLen(k);
@@ -11599,13 +11715,167 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // fix #3703 / §28.9: Remove never throws (absent key just returns
             // false), so `k`'s single use above (kd/kl) is unconditionally
             // complete by this point — release a fresh +1 KEY producer now.
-            if (isPlusOneStringProducer(call.args[0].value.get()))
+            if (isPlusOneStringProducer(keyExpr))
                 emitStringRelease(k);
             // fix #6419: the twin of the generic-key reclaim above, placed at
             // this arm's single return so BOTH the disposing and the plain
-            // `bz_dict_remove_str` variants are covered by the one call.
+            // `bz_dict_remove_str` variants are covered by the one call — and
+            // the CALLER's reclaim runs on that same edge.
+            return removeResult;
+        };
+        if (m == "Remove" && call.args.size() == 1 && call.args[0].value &&
+            !dictEntryForm) {
+            llvm::Value* k = lowerExpr(*call.args[0].value);
+            if (!k) return nullptr;
+            llvm::Value* removeResult =
+                emitDictRemoveKey(k, call.args[0].value.get());
+            // fix #6419: the removed value is DISPOSED inside the call
+            // (`_disposing` variant) or never entered the table, and the
+            // `bool` this arm hands back aliases no slot of it — so the
+            // unbound receiver is spent here and §28.3's reclaim is safe.
             freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
             return removeResult;
+        }
+        // fix #8169 (stdlib §4.8, v0.355): the ENTRY-SHAPED forms —
+        // `Add(entry)`, `Contains(entry)` and `Remove(entry)` on a
+        // `Dictionary<K, V>` receiver. (The §4.8 citation, the scope ruling
+        // and the argument-type disambiguation are in the entry-form block
+        // above; the keyed `Add`/`Remove` arms above supply the two
+        // primitives the entry forms are defined in terms of.)
+        if (dictEntryForm) {
+            llvm::Value* ek = nullptr;   // the entry's Key
+            llvm::Value* ev = nullptr;   // the entry's Value
+            if (!readDictEntryFields(call.args[0].value.get(), ek, ev))
+                return nullptr;
+            if (m == "Add") {
+                // §4.8: "`Add(entry)` is `Add(entry.Key, entry.Value)`" — the
+                // SAME insert the keyed form performs, duplicate-key
+                // ArgumentException included (the keyed arm's own §4.8 /
+                // #1201 probe fires on it unchanged).
+                llvm::Value* addResult =
+                    emitDictAdd(ek, ev, /*keyExpr=*/nullptr, /*valExpr=*/nullptr);
+                freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+                return addResult;
+            }
+            // §4.8: "`Contains(entry)` is `true` iff the key is present AND
+            // the stored value equals `entry.Value` under the type's standard
+            // equality"; "`Remove(entry)` removes only when both match, else
+            // returns `false` with no change."
+            //
+            // The lookup is ONE probe: `bz_dict_try_get_*` answers "present"
+            // AND yields the stored value in one call. The stored value is
+            // then compared with the entry's own Value under the type's
+            // standard equality — the SAME authority the collection equality
+            // search uses (`emitRemoveElementEquality`: §8.3 record
+            // structural equality, §8.4 class `Equals`/reference identity,
+            // §4.6 string content, §9.2 value equality).
+            llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : ptrTy();
+            if (!valLlvm) valLlvm = ptrTy();
+            auto* tmpSlot = entryAlloca(ptrTy());
+            // §28.11, #891: pre-null the slot so the miss path — where
+            // `bz_dict_try_get_*` does NOT write — reads null, not stack
+            // garbage (the same pre-null TryGetValue does).
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 tmpSlot);
+            llvm::Value* found;
+            if (keyTy) {
+                auto* fn = declareC("bz_dict_try_get_gen", i1(),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, genKeyPtr(ek), tmpSlot},
+                                            "de.found");
+            } else {
+                auto [kd, kl, kw] = strDataLen(ek);
+                auto* fn = declareC("bz_dict_try_get_str", i1(),
+                                    {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot},
+                                            "de.found");
+            }
+            // The value comparison runs ONLY on the present path: an
+            // aggregate V is heap-boxed, and the miss path's slot holds null —
+            // loading the box there would be a null dereference.
+            auto* missBB = llvm::BasicBlock::Create(llvm_, "de.miss", currentFn_);
+            auto* hitBB  = llvm::BasicBlock::Create(llvm_, "de.hit", currentFn_);
+            auto* eqBB   = llvm::BasicBlock::Create(llvm_, "de.eq", currentFn_);
+            auto* neqBB  = llvm::BasicBlock::Create(llvm_, "de.neq", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "de.end", currentFn_);
+            builder_.CreateCondBr(found, hitBB, missBB);
+            // missBB: the key is absent — §4.8's answer is `false` for both
+            // `Contains(entry)` and `Remove(entry)`, and nothing changes.
+            builder_.SetInsertPoint(missBB);
+            llvm::Value* missVal = builder_.getFalse();
+            builder_.CreateBr(endBB);
+            llvm::BasicBlock* missEnd = builder_.GetInsertBlock();
+            // hitBB: the key is present — compare the stored value with the
+            // entry's Value.
+            builder_.SetInsertPoint(hitBB);
+            llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot, "de.vptr");
+            // Decode the stored void* into the value's own representation —
+            // the same decode TryGetValue/GetOrNull perform (issue D4 / #685:
+            // an aggregate V is heap-boxed and the bytes are loaded back).
+            llvm::Value* dv;
+            if (valLlvm->isStructTy()) {
+                dv = builder_.CreateLoad(valLlvm, valPtr, "de.rec");
+            } else if (!valLlvm->isPointerTy()) {
+                llvm::Value* asI64 = builder_.CreatePtrToInt(valPtr, i64());
+                dv = asI64;
+                if (valLlvm->isFloatingPointTy()) {
+                    if (valLlvm->isDoubleTy())
+                        dv = builder_.CreateBitCast(asI64, valLlvm);
+                    else
+                        dv = builder_.CreateBitCast(
+                            builder_.CreateTrunc(asI64, i32()), valLlvm);
+                } else if (!valLlvm->isIntegerTy(64)) {
+                    dv = builder_.CreateTrunc(asI64, valLlvm);
+                }
+            } else {
+                dv = valPtr;  // pointer value (string / class)
+            }
+            // The value slot's class-ness, read off the §28.11 element policy
+            // exactly as the array family reads its element (`arrElemIsClass`):
+            // a class/interface value compares by `Equals`/identity, a string
+            // by CONTENT (§4.6) — so the string row must NOT widen into the
+            // class row.
+            bool dictEntryValIsClass =
+                dictValPol.cat == ElementPolicy::Category::ClassOwned ||
+                dictValPol.cat == ElementPolicy::Category::ClassBorrow ||
+                hasObjectHeaderEquality(valTy);
+            llvm::Value* eq =
+                emitRemoveElementEquality(dv, ev, valTy, dictEntryValIsClass);
+            if (!eq) return nullptr;
+            builder_.CreateCondBr(eq, eqBB, neqBB);
+            // eqBB: both the key and the value match.
+            builder_.SetInsertPoint(eqBB);
+            llvm::Value* eqVal;
+            if (m == "Contains") {
+                // §4.8: the key is present and the value matches → `true`.
+                eqVal = builder_.getTrue();
+            } else {
+                // §4.8: "`Remove(entry)` removes only when both match" — the
+                // keyed remove (the SAME call `Remove(key)` makes, so the
+                // value's disposal obligation is discharged exactly as it is
+                // there: §4.9's owning dispose / §28.9's string release /
+                // #3787's box free).
+                eqVal = emitDictRemoveKey(ek, /*keyExpr=*/nullptr);
+            }
+            builder_.CreateBr(endBB);
+            llvm::BasicBlock* eqEnd = builder_.GetInsertBlock();
+            // neqBB: the key is present but the value differs → `false`, and
+            // (for `Remove`) NOTHING changes.
+            builder_.SetInsertPoint(neqBB);
+            llvm::Value* neqVal = builder_.getFalse();
+            builder_.CreateBr(endBB);
+            llvm::BasicBlock* neqEnd = builder_.GetInsertBlock();
+            builder_.SetInsertPoint(endBB);
+            auto* phi = builder_.CreatePHI(i1(), 3, "de.res");
+            phi->addIncoming(missVal, missEnd);
+            phi->addIncoming(eqVal, eqEnd);
+            phi->addIncoming(neqVal, neqEnd);
+            // fix #6419 (§28.3 *Unbound owned temporaries*): the receiver's
+            // §28.3 reclaim runs at the end of the full expression — ONE
+            // call, on the single edge this arm returns through, whichever
+            // of the three outcomes fired.
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+            return phi;
         }
         // fix #643 / stdlib §4.9: .PopValue(k): owned V — retrieve the owned
         // value for key k, remove the entry WITHOUT disposing the value
