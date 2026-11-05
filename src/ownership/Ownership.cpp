@@ -6297,6 +6297,31 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
             }
         }
     }
+    // fix #8137 (§30.3 / §28.3 / §30.5, v0.355): the `Result` READ of a
+    // Pattern B `OwningTask<T:class>` — the `.` spelling (`t.Result`) and the
+    // `?.` spelling (`o?.Result`) — is the SYNCHRONOUS sibling of that await,
+    // and §30.3 says it transfers ownership exactly as `await` does:
+    // "reading it on a completed task in an owned-consuming position transfers
+    // ownership of the result to the reader exactly as `await` does — the
+    // result buffer is consumed".
+    //
+    // So the read produces an OWNED value, and the standard §28.3 owned-local
+    // discharge rules apply to the binding that receives it — exactly as they
+    // do for the `await` sibling above. Before this arm the read fell through
+    // to Borrowed, so a plain `var c := t.Result` (and `var c := o?.Result`)
+    // was classified as a BORROW: no auto-drop was ever flagged, no scope-end
+    // disposal was ever registered, and the transferred class object was
+    // freed by NOBODY (MEASURED: 16 B per read; 1600 B over a 100x loop under
+    // ASan/LSan). The `using var` spelling was already discharged (codegen's
+    // case (b0d) registers the scope-end disposal for it), which is why the
+    // defect was spelling-dependent.
+    //
+    // The gate is the SHARED fact (`common::owningTaskResultReadOwnsClassResult`),
+    // the same one codegen's case (b0d) consults to register the disposal, so
+    // the classification and the emitted disposal cannot drift.
+    // // per §30.3, §28.3, v0.355, #8137
+    if (common::owningTaskResultReadOwnsClassResult(&e, ctx_))
+        return OwnershipState::Owned;
     // §28.6 / §28.11 (#1107 finding D): a `move X` whose value is an OWNING
     // COLLECTION (OwningArray/OwningStack/OwningQueue/OwningSet/OwningDictionary/
     // OwningLinkedList) transfers the CONTAINER ownership the source local holds

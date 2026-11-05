@@ -3661,4 +3661,49 @@ bool stateMachineOwnedParamIsFrameNullable(
     return scan.ok;
 }
 
+// fix #8137 (§30.3 / §28.3 / §30.5, v0.355) — see the header declaration.
+// The `Result` read of a Pattern B `OwningTask<T>` TRANSFERS ownership of the
+// task's result to the reader, so the reader owns the heap object and must
+// dispose it exactly once.
+//
+// The receiver gate is the `OwningTask` HEAD (§30.3's Pattern B container), read
+// the same way the rest of the compiler reads a builtin head: a Named TypeRef
+// with NO declaration (a USER class named `OwningTask` has a declaration and
+// does not qualify) whose syntactic head is "OwningTask". The NULLABLE
+// receiver is admitted: `o?.Result` over an `OwningTask<Cell>?` performs the
+// very access `o.Result` performs (§7.5) and yields the NULLABLE of the member
+// type — the transfer included.
+//
+// The class/interface gate is on the READ'S result type, so it is exactly the
+// question codegen's dynamic scope-end disposal asks.
+bool owningTaskResultReadOwnsClassResult(
+    const ast::Expr* e, const sema::SemaContext& ctx,
+    const TypeParamResolver& resolveParam) {
+    if (!e) return false;
+    const ast::Expr* recv = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        if (ma->member != "Result" || !ma->target) return false;
+        recv = ma->target.get();
+    } else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+        if (nm->member != "Result" || !nm->target) return false;
+        recv = nm->target.get();
+    } else {
+        return false;
+    }
+    const sema::TypeRef* rt = ctx.exprType(*recv);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    if (rt->headName() != "OwningTask") return false;
+    const sema::TypeRef* resTy = ctx.exprType(*e);
+    if (!resTy) return false;
+    if (resolveParam) resTy = resolveParam(resTy);
+    if (!resTy || resTy->kind != sema::TypeRef::Kind::Named ||
+        !resTy->declaration)
+        return false;
+    return resTy->declaration->kind == ast::TypeDeclKind::Class ||
+           resTy->declaration->kind == ast::TypeDeclKind::Interface;
+}
+
 }  // namespace bezel::common

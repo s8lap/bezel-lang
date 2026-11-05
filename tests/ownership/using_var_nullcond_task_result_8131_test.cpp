@@ -60,6 +60,18 @@
 // runs under `runAotCheckedLenient` (LeakSanitizer off, AddressSanitizer on)
 // and pins what this fix must guarantee -- NO DOUBLE FREE -- while the
 // residual leak is left for a separate fix.
+//
+// fix #8137 (§30.3 / §28.3, v0.355): THAT RESIDUAL IS NOW FIXED, and this row
+// is FLIPPED with it. The plain `var` spelling of a `Result` read on an
+// `OwningTask<Cell>` is an OWNERSHIP TRANSFER (§30.3), so the plain binding
+// owns the transferred class object and §28.3 auto-drops it at scope end.
+// The ownership pass now classifies the read as an owned producer
+// (`MethodOwnership::producerState`), the §28.3 auto-drop fires, and the
+// value is disposed exactly once. So this row now runs under the STRICT
+// `runAotChecked` oracle (ASan + LeakSanitizer) and expects the live counter
+// back at ZERO -- `live 0`, not `live 100` -- with no leak reported. The
+// row's original purpose (NO DOUBLE FREE) is unchanged and still pinned: the
+// live counter is exactly 0, so the value was disposed ONCE, not twice.
 
 #include <iostream>
 #include <string>
@@ -70,7 +82,6 @@
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
-using bezel::test::runAotCheckedLenient;
 
 namespace {
 
@@ -243,20 +254,22 @@ BEZEL_TEST(using_var_nullcond_task_result_8131,
     expectNoLeak(r, "700\n");
 }
 
-// §28.3 -- the PLAIN `var` spelling, the NO-DOUBLE-FREE control. This fix
-// does not change this shape: the plain `var` leaks in BOTH spellings (the
-// `.` form leaked identically before the fix -- a spelling-INDEPENDENT
-// ownership-pass defect, reported separately), so this row runs with
-// LeakSanitizer OFF (the residual leak would otherwise drown the row) and
-// AddressSanitizer ON, and pins what this fix must guarantee: the `?.`
-// spelling does not dispose the transferred value twice, and does not crash.
+// §28.3 -- the PLAIN `var` spelling, FLIPPED by fix #8137 (§30.3 / §28.3,
+// v0.355). This row used to pin the OLD behaviour: the plain `var` leaked in
+// BOTH spellings (the `.` form leaked identically before #8131 -- a
+// spelling-INDEPENDENT ownership-pass defect, reported separately), so the row
+// ran with LeakSanitizer OFF and expected the live counter to stand at 100.
 //
-// The live counter stands at 100 -- the plain `var` binding never disposes
-// the transferred value (neither spelling does). That number is the CURRENT
-// behaviour of a shape this fix leaves alone, not an endorsement of it.
+// #8137 closes that residual: the `.Result` read on an `OwningTask<Cell>` is
+// an ownership transfer (§30.3), so the plain binding owns the transferred
+// class object and §28.3 auto-drops it at scope end -- disposed EXACTLY once.
+// The row therefore moves to the STRICT `runAotChecked` oracle (ASan +
+// LeakSanitizer) and expects `live 0` with no leak reported. The row's
+// original NO-DOUBLE-FREE purpose is unchanged and still pinned: the live
+// counter is exactly 0, so the value was disposed once and not twice.
 BEZEL_TEST(using_var_nullcond_task_result_8131,
            plain_var_nullcond_result_does_not_double_free_spec_28_3) {
-    JitResult r = runAotCheckedLenient(prog(
+    JitResult r = runAotChecked(prog(
         "      using var t := Mk(); "
         "      var o: OwningTask<Cell>? := t; "
         "      var c := o?.Result; "
@@ -264,9 +277,16 @@ BEZEL_TEST(using_var_nullcond_task_result_8131,
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "500\nlive 100\n");
+    BEZEL_EXPECT_EQ(r.stdoutText, "500\nlive 0\n");
     const std::string text = diagnosticText(r);
     BEZEL_EXPECT_TRUE(text.find("ERROR: AddressSanitizer") == std::string::npos);
+    BEZEL_EXPECT_TRUE(text.find("ERROR: LeakSanitizer") == std::string::npos);
     BEZEL_EXPECT_TRUE(text.find("attempting double-free") == std::string::npos);
     BEZEL_EXPECT_TRUE(text.find("heap-use-after-free") == std::string::npos);
+    unsigned long long leakedBytes = 0, leakedAllocs = 0;
+    if (bezel::test::aot_detail::parseLeakSummary(text, leakedBytes,
+                                                    leakedAllocs)) {
+        BEZEL_EXPECT_EQ(leakedAllocs, 0ull);
+        BEZEL_EXPECT_EQ(leakedBytes, 0ull);
+    }
 }

@@ -48937,34 +48937,24 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
     // through the SAME `.` lowering over a synthetic MemberAccessExpr, so the
     // `bz_task_take_result` drain that keeps the task's own disposal from
     // double-freeing the transferred value runs on this spelling too.
-    if (!ld->type) {
-        // The receiver of the `Result` read, for EITHER spelling.
-        const ast::Expr* resultRecv = nullptr;
-        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                ld->initializer.get())) {
-            if (ma->member == "Result" && ma->target)
-                resultRecv = ma->target.get();
-        } else if (auto* nm =
-                       dynamic_cast<const ast::NullCondMemberExpr*>(
-                           ld->initializer.get())) {
-            if (nm->member == "Result" && nm->target)
-                resultRecv = nm->target.get();
-        }
-        if (resultRecv) {
-            const sema::TypeRef* targetTy = ctx_.exprType(*resultRecv);
-            if (targetTy && targetTy->kind == sema::TypeRef::Kind::Named &&
-                !targetTy->declaration && targetTy->astNode &&
-                targetTy->astNode->name &&
-                !targetTy->astNode->name->parts.empty() &&
-                targetTy->headName() == "OwningTask" &&
-                !targetTy->genericArgs.empty() && targetTy->genericArgs[0]) {
-                const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
-                if (isClassOrInterfaceRef(initTy) ||
-                    isClassOrInterfaceRef(resolveTypeParamRef(initTy)))
-                    return true;
-            }
-        }
-    }
+    //
+    // fix #8137 (§30.3 / §28.3, v0.355): the READ ITSELF is now the SHARED
+    // fact (`common::owningTaskResultReadOwnsClassResult`), the same one the
+    // ownership pass's `producerState` consults to classify the read as an
+    // OWNED transfer. Before this, codegen and the ownership pass each
+    // carried their OWN copy of "is this a `Result` read of an OwningTask whose
+    // result is a class?" — and the copies had DIVERGED in EFFECT: the
+    // ownership pass classified the read as a BORROW, so a plain
+    // `var c := t.Result` was never flagged for auto-drop and this arm (which
+    // only runs for a local the ownership pass flagged) never fired for it.
+    // One fact, one home: the classification and the disposal registration now
+    // read the same predicate and cannot drift.
+    // // per §30.3, §28.3, v0.355, #8137
+    if (!ld->type &&
+        common::owningTaskResultReadOwnsClassResult(
+            ld->initializer.get(), ctx_,
+            [this](const sema::TypeRef* t) { return resolveTypeParamRef(t); }))
+        return true;
     return false;
 }
 

@@ -1216,4 +1216,40 @@ bool stateMachineOwnedParamIsFrameNullable(
     const sema::SemaContext& ctx, const sema::Symbol* param,
     const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
+// §30.3 / §28.3 / §30.5 (#8137): the `Result` READ of a Pattern B
+// `OwningTask<T>` — the `.` spelling (`ast::MemberAccessExpr`) and the `?.`
+// spelling (`ast::NullCondMemberExpr`) — is an OWNERSHIP TRANSFER: "reading it
+// on a completed task in an owned-consuming position transfers ownership of the
+// result to the reader exactly as `await` does — the result buffer is consumed"
+// (language spec §30.3, v0.355). The reader therefore OWNS the transferred
+// heap object, and §28.3's ordinary discharge rules apply to the binding.
+//
+// This predicate is the ONE home for that question. Two consumers consult it:
+//   * the OWNERSHIP pass (`MethodOwnership::producerState`,
+//     src/ownership/Ownership.cpp) — the classification that makes a plain
+//     `var c := t.Result` an OWNED binding (so §28.3 auto-drops it at scope
+//     end), and
+//   * CODEGEN (`Emitter::usingVarOwnsClassObjectDynamically`, case (b0d),
+//     src/codegen/LlvmBackend_Setup.cpp) — the scope-end disposal registration
+// so the CLASSIFICATION and the emitted DISPOSAL cannot drift (the #1414
+// "one fact, one home" rule).
+//
+// The class/interface gate is on the READ'S OWN result type — the value the
+// reader ends up holding — so it is the SAME question codegen's dynamic
+// disposal asks (`isClassOrInterfaceRef`): a `Result` whose result is a class
+// or interface is a heap object with a disposal obligation; a value-typed /
+// runtime-managed result carries none. The owning-COLLECTION family
+// (`OwningTask<OwningArray<T>>`) is excluded here as well: it has its own
+// §28.11 collection disposal path, and codegen's per-T result disposer (the
+// `bz_task_take_result` drain that makes the transfer observable) is attached
+// for the class/interface family only.
+//
+// `resolveParam` is the documented shared resolver hook: CODEGEN passes its
+// monomorphization-aware `resolveTypeParamRef` (so a generic body's bare `T`
+// resolves to the concrete class at the instantiation); SEMA — which runs
+// before monomorphization — passes the identity (or nothing).
+bool owningTaskResultReadOwnsClassResult(
+    const ast::Expr* e, const sema::SemaContext& ctx,
+    const TypeParamResolver& resolveParam = {});
+
 }  // namespace bezel::common
