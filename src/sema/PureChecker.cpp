@@ -461,6 +461,44 @@ std::string_view builtinReceiverHead(const TypeRef* rt, Symbol* recvSym) {
     return {};
 }
 
+// The head of a KEYWORD-TYPE receiver — the STATIC spelling of a primitive
+// type's own members: `string.Join(...)`, `int.MaxValue`, `double.Parse(...)`.
+//
+// WHY A FOURTH SHAPE. §3.4's keyword alias names a TYPE, not a value, so the
+// identifier `string` in `string.Join(...)` is a type name: the typecheck
+// pass attaches no value type to it and no TypeSymbol either (the
+// primitive-keyword static branch in ExprTypecheck_Calls.cpp reads the NAME
+// and dispatches on it — "The target is an identifier that names a primitive
+// type; there's no TypeSymbol in scope for it"). `builtinReceiverHead`
+// therefore answered "" for that receiver, and the standard-library arm
+// stood down: the static member of a keyword-aliased type was never read
+// against the library's `pure` markers, so `string.Join(",", xs)` — whose
+// `Join` the stdlib does NOT mark `pure` (stdlib §9.6) — compiled in a
+// `pure` body.
+//
+// THE KEY. The name is the §3.4 KEYWORD ALIAS (`common::isKeywordAliasBuiltinName`
+// — the fourteen lowercase spellings) or its PascalCase twin `String`
+// ("the keyword `string` and the standard-library type name `String` name the
+// same type — they are interchangeable in source", §1.4/§3.4). The table
+// normalises both spellings itself (`purityTableHeadOf`), so the raw name is
+// what this returns.
+//
+// THE GUARD. The receiver must NAME a type, not hold a value: a local
+// spelled `String` carries a value type, and `recvTy` is then non-null, so
+// the keyword reading never swallows it. (The fourteen lowercase aliases
+// cannot be shadowed at all — "a reserved keyword ... cannot be used as an
+// identifier", Appendix B.1.)
+std::string_view keywordTypeReceiverHead(const ast::Expr* target,
+                                         const TypeRef* recvTy) {
+    if (recvTy) return {};
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(target);
+    if (!id) return {};
+    const std::string_view name = id->name;
+    if (common::isKeywordAliasBuiltinName(name)) return name;  // §3.4
+    if (name == "String") return name;                         // §3.4's alias
+    return {};
+}
+
 // §22.15 (v0.202, #2052) — the closed-body checker. A `PureBodyWalker` is
 // constructed per pure member and walks its statements/expressions.
 //
@@ -613,6 +651,14 @@ private:
     // is rejected. Returns true iff admitted.
     bool callTargetIsPure(Symbol* calleeSym);
 
+    // fix #8133 (§22.15 rule 6, v0.355): the head of a STANDARD-LIBRARY
+    // receiver for the two member-access arms (`.` and `?.`). It is the
+    // receiver's own built-in type head (`builtinReceiverHead`) and, when
+    // the receiver names a TYPE rather than holding a value, the
+    // KEYWORD-TYPE spelling (`keywordTypeReceiverHead` — `string.Join(...)`,
+    // `int.MaxValue`).
+    std::string_view stdlibReceiverHead(const ast::Expr* target) const;
+
     // narrow #3610 (§22.15 rule 6, v0.286): rule 6's admitted call forms name
     // "method, **operator**, accessor read, or constructor" — the operator
     // form was the one this walker never asked about. A §25 user-declared
@@ -707,6 +753,23 @@ bool PureBodyWalker::isTrivialDisposeClass(const TypeRef* rt) const {
     // so this passes it straight through rather than fabricating a synthetic
     // one; `ctx_` is this walker's own SemaContext member.
     return !common::isNonTrivialDisposeClass(rt, ctx_);
+}
+
+// fix #8133 (§22.15 rule 6, v0.355): the head of a STANDARD-LIBRARY receiver
+// for the two member-access arms (`.` and `?.`). It is the receiver's own
+// built-in type head, and — when the receiver NAMES a type rather than
+// holding a value — the KEYWORD-TYPE spelling (`string.Join(...)`,
+// `int.MaxValue`). The two are disjoint: `builtinReceiverHead` answers ""
+// for a receiver that is a type name, and `keywordTypeReceiverHead` answers
+// "" for a receiver that holds a value.
+std::string_view PureBodyWalker::stdlibReceiverHead(
+    const ast::Expr* target) const {
+    if (!target) return {};
+    const TypeRef* rt = ctx_.exprType(*target);
+    Symbol* rs = ctx_.exprSymbol(*target);
+    const std::string_view head = builtinReceiverHead(rt, rs);
+    if (!head.empty()) return head;
+    return keywordTypeReceiverHead(target, rt);
 }
 
 bool PureBodyWalker::callTargetIsPure(Symbol* calleeSym) {
@@ -2319,8 +2382,7 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
             // member, whose purity the `PropertySymbol` arm above (and the
             // CallExpr arm's `callTargetIsPure`) reads from the declaration
             // or the artifact interface.
-            const std::string_view head = builtinReceiverHead(
-                ctx_.exprType(*ma->target), ctx_.exprSymbol(*ma->target));
+            const std::string_view head = stdlibReceiverHead(ma->target.get());
             if (!head.empty() &&
                 !stdlibMemberIsPure(head, ma->member)) {
                 reportPureViolation(
@@ -2340,6 +2402,70 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
             }
         }
         checkExpr(ma->target.get());
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+        // fix #8133 (§22.15 rule 6, v0.355): the `?.` SPELLING of a member
+        // access. §22.15 rule 6 admits "a call — method, operator, accessor
+        // read, or constructor in the admitted positions" iff the member is
+        // `pure`-declared or pure-classified, and §22.15 "Intrinsic purity
+        // (the stdlib contract)" makes the standard library's own marker the
+        // authority for a standard-library member. The rule says nothing
+        // about the RECEIVER SPELLING — `sb?.Append("x")` is the same
+        // member of the same type as `sb.Append("x")`.
+        //
+        // WHAT WAS MISSING. A `?.` member access is its own AST node
+        // (`ast::NullCondMemberExpr`), and this walker had no arm for it: the
+        // `MemberAccessExpr` arm above — which carries the standard-library
+        // check fix #7453 landed — never saw it. So the standard-library
+        // member reached through `?.` was admitted unconditionally, while
+        // the SAME member spelled with a dot was rejected
+        // (`sb?.Append("x")` compiled in a `pure` body; `sb.Append("x")`
+        // did not). The user-member twin was already rejected, because the
+        // CallExpr arm resolves the callee symbol (`ctx_.exprSymbol` on the
+        // `NullCondMemberExpr` node) and asks `callTargetIsPure` — but a
+        // STANDARD-LIBRARY member resolves to no symbol at all (a built-in
+        // carries no AST declaration), so the declaration-based predicates
+        // had nothing to ask and the call was admitted.
+        //
+        // WHAT IS CHECKED. The same two questions the `.` arm asks, of the
+        // same node: an accessor read of a USER property (the `PropertySymbol`
+        // arm — `propertyGetterIsPure`, the predicate #3630 introduced and
+        // #3721 shares with the indexer arm), and a member of a
+        // STANDARD-LIBRARY receiver (the built-in table). A `?.` CALL
+        // (`x?.M()`) is a `CallExpr` whose callee is this node: the CallExpr
+        // arm has already asked `callTargetIsPure` about the resolved
+        // symbol, so the `else if` below stands down for it and this arm
+        // adds the standard-library question the CallExpr arm cannot ask
+        // (a built-in member resolves to no symbol).
+        if (auto* ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(*e))) {
+            if (!propertyGetterIsPure(ps)) {
+                reportPureViolation(
+                    e->span.begin, "accessor read",
+                    std::string("the resolved target `") +
+                        std::string(ps->name) +
+                        "` is not pure-declared (§22.15 rule 6 / #3630)");
+            }
+        } else if (!ctx_.exprSymbol(*e)) {
+            const std::string_view head = stdlibReceiverHead(nm->target.get());
+            if (!head.empty() && !stdlibMemberIsPure(head, nm->member)) {
+                reportPureViolation(
+                    e->span.begin,
+                    inCallee_ ? "call to a standard-library member"
+                               : "accessor read of a standard-library member",
+                    std::string("the standard library does not declare `") +
+                        std::string(head) + "." + std::string(nm->member) +
+                        "` pure — §22.15 rule 6 admits a call only when the "
+                        "resolved member is pure-declared (a standard-library "
+                        "member carries the marker the library states for it; "
+                        "§22.15 \"Intrinsic purity (the stdlib contract)\")");
+                // The access chain is rejected; do not descend into the
+                // target (a second report on the same chain would blame
+                // the wrong link).
+                return;
+            }
+        }
+        checkExpr(nm->target.get());
         return;
     }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
