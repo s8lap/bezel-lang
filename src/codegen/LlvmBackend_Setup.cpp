@@ -48058,6 +48058,68 @@ void Emitter::collectObjectStringStorageFields() {
             objectStringStorageFields_.insert(static_cast<const void*>(m));
         }
     }
+
+    // fix #8306 (§28.9 / §4.6 / §8.6, v0.355): the IMPORTED classes'
+    // Object/interface-typed instance fields. The scan above walks
+    // `ctx_.symbols()` — THIS module's symbols only — so a dependency's
+    // public `Object`-typed field was never a member of the set, and
+    // isObjectStringFieldLvalue below answered false for it: a store of a
+    // string into an IMPORTED class's `Object` field did NOT retain, the
+    // source's scope-end release freed the string, and the later read was a
+    // use-after-free (`free(): invalid pointer`, rc 134; a heap-use-after-free
+    // READ under the generated-code ASan). MEASURED on the base: the
+    // two-module program aborted, while its single-module twin printed 690.
+    //
+    // WHERE THE IMPORTED CLASS'S FIELD KINDS COME FROM. The dependency's
+    // EXPORTED INTERFACE, not this module: `ModuleMetadataBuilder` writes
+    // every exported member's declared type into the dependency's
+    // `.bezel.meta` as a `MetaType` (a `MetaMember::type` whose
+    // `primitive` is `PrimitiveKind::Object` for `Object`, or whose
+    // `namedName` names an interface), and `ModuleLoader` rebuilds that
+    // member as a `sema::FieldSymbol` / `sema::PropertySymbol` and parks the
+    // RESOLVED `sema::TypeRef` in the context's side table
+    // (`SemaContext::importedMemberTypes_`, reached through
+    // `SemaContext::importedMemberType`). `recordMemberType` below is the ONE
+    // accessor that consults both sources (it delegates to
+    // `sema::storageComponentType`, whose imported fallback is
+    // `ctx.importedMemberType(m)`), so the imported field's TYPE — and with
+    // it the Object/interface-vs-string-vs-value classification — comes from
+    // the other module's metadata, and the predicate below reads it from
+    // there. The imported class's TypeSymbol itself is reached through
+    // `ctx_.importedSymbols()` (SemaContext keeps imported symbols in a list
+    // SEPARATE from `symbols_`, so codegen never emits a body for them).
+    //
+    // The MEMBER LIST is `collectInstanceStorage` — the SAME enumeration
+    // `classStruct` uses to lay the class out, so "is instance storage" and
+    // "has a slot" cannot drift. It is used instead of `fieldIndex_` because
+    // the imported class's struct is built LAZILY (on the first `new` / field
+    // access), i.e. AFTER this pre-pass: `fieldIndex_` has no entry for an
+    // imported field at this point, and requiring one would drop every
+    // imported field again — the very hole this fixes. `collectInstanceStorage`
+    // also excludes `static` fields and non-storage properties, which is what
+    // the local arm's `fieldIndex_` gate excluded.
+    //
+    // The classification is the SAME one the local arm uses (the declared type
+    // is `Object` or an interface), so retaining needs no new analysis: per
+    // STORE the SOURCE's static type says it is a string. An imported class's
+    // field is therefore admitted to the set for exactly the same reason a
+    // local one is — the field is a runtime-managed slot that outlives the
+    // store's scope (§28.9), and a store into it must take its own reference.
+    // The field's +1 still LEAKS (nothing releases it: the slot may also hold
+    // a class instance and no runtime discriminator says which — #8215 /
+    // #5059), exactly as for a local field; a leak, never a use-after-free.
+    // (the loop is empty — and free — when nothing was imported)
+    for (const sema::Symbol* sym : ctx_.importedSymbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym);
+        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        std::vector<const sema::Symbol*> storage;
+        collectInstanceStorage(ts, storage);
+        for (const sema::Symbol* m : storage) {
+            const sema::TypeRef* ft = recordMemberType(m);
+            if (!ft || !isObjectOrInterfaceTarget(ft)) continue;
+            objectStringStorageFields_.insert(static_cast<const void*>(m));
+        }
+    }
 }
 
 
