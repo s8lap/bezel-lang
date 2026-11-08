@@ -5291,8 +5291,34 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // accumulator off the element removes the mismatch at its
                 // source rather than patching the cast: per stdlib §5 "a
                 // narrow integer element type accumulates in that type".
-                sema::TypeRef* e = recvTy->genericArgs[0];
-                if (e->kind == sema::TypeRef::Kind::Primitive && !e->nullable) {
+                //
+                // fix #8253 (stdlib §5.1, spec §11.8 / §14.2, v0.355): read
+                // the element type through the generic substitution
+                // (`resolveTypeParamRef`) — the SAME resolution the #8223
+                // record arm above uses. Inside a generic body the receiver's
+                // first generic argument is still the PLACEHOLDER `T`, so the
+                // accumulator's width was taken from an unresolved type
+                // parameter: the `Primitive` test below never matched, the
+                // accumulator fell back to `int`, and the emitted IR mixed it
+                // with the INSTANTIATED element type — `add i32, double` at
+                // T = double and `add i32, float` at T = float (both malformed
+                // IR: the compile aborted in the verifier), `trunc i8/i16 to
+                // i32` at T = byte/short (malformed IR), and at T = long/ulong
+                // a SILENT 32-bit truncation of the total (9_000_000_000
+                // printed as 410_065_408). stdlib §5.1's `Sum(): owned T`
+                // accumulates in T's OWN type (spec §11.8's model: `T.Zero()`
+                // then `+`), so the accumulator is typed from the
+                // INSTANTIATED element type. A NULLABLE element (`T?`) keeps
+                // the pre-fix reading: `resolveTypeParamRef` strips the `?`
+                // (see its own comment), and a nullable element is not an
+                // §2.19 `INumber<T>` conformer, so the sema gate (#4730)
+                // owns that shape.
+                const sema::TypeRef* rawElem = recvTy->genericArgs[0];
+                const sema::TypeRef* e = rawElem->nullable
+                    ? rawElem
+                    : resolveTypeParamRef(rawElem);
+                if (e && e->kind == sema::TypeRef::Kind::Primitive &&
+                    !e->nullable) {
                     switch (e->primitive) {
                         case sema::PrimitiveType::Byte:
                         case sema::PrimitiveType::SByte:
