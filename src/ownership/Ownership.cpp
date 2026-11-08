@@ -8959,6 +8959,65 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
         // Without a declared type this is exactly the prior behavior.
         const sema::TypeRef* rhsTy = ld.type ? ctx_.resolvedType(*ld.type)
                                               : ctx_.exprType(*ld.initializer);
+        //
+        // #7523 / #7922 (§28.9 / §28.10 / §28.12, v0.350): the `Object`
+        // PRIMITIVE is the ONE primitive that may hold a class instance
+        // (§4 / §8.1), and it is NOT one of §28.9's runtime-managed kinds —
+        // that tier is `string`, `Type`, boxed value types and function
+        // values, "none of them is a class", and the tier is exhaustive. So
+        // the static type `Object` establishes NOTHING about the binding's
+        // disposal obligation, and this lint's PREMISE — "the RHS is a
+        // value-typed/runtime-managed value with no disposal obligation
+        // (§28.9)" — is NOT established for an `Object`-typed right-hand side:
+        // the answer is UNKNOWN, not "no obligation". Before this fix the
+        // `Object` head fell through the arm's three NEGATED checks (not a
+        // borrow, not a disposable class type, not an owning choice) into
+        // "value-typed/runtime-managed" — a default, not a classification.
+        //
+        // §28.12 (v0.350) is the object-central reading this lint has to
+        // live with: the logical-disposal path is selected "by the class of
+        // the object the binding holds ... never by the binding's static
+        // type", and §30.7 says of an `Object`-static-type `await using var`
+        // that "neither an interface nor `Object` can promise a destructor,
+        // and the disposal path is the run-time object's, so the runtime
+        // type's fallback posture is statically unknowable". A lint that
+        // reads the static type `Object` and concludes "value-typed/
+        // runtime-managed" contradicts that. §28.9's own sentence ("The
+        // compiler does not warn about undisposed runtime-managed values")
+        // has NO converse: nothing licenses a vacuity claim about a binding
+        // that is not on the tier.
+        //
+        // THE VALUE BOUND is the evidence the `Object` slot's static type
+        // cannot give, and the initializer's own type is it: `using var x:
+        // Object := 5;` binds a boxed value (§8.6) and `using var x: Object :=
+        // "s";` binds a runtime-managed string — both ARE §28.9's tier, and
+        // both KEEP the warning. `using var x: Object := v;` where `v:
+        // Object` binds whatever `v` holds, which the static type does not
+        // say: UNKNOWN, so the lint stays quiet — the posture
+        // rhsIsVacuousBorrowPin takes ("Conservative: returns false when the
+        // source cannot be classified, so the lint stays quiet rather than
+        // wrong"). The same holds for the INFERRED head (`using var x :=
+        // v;` over an `Object`-typed source): there the classification type
+        // IS the initializer's own type, and an `Object` one is UNKNOWN.
+        //
+        // The `Object` head is the ONLY declared type that names no kind: a
+        // class or interface head names a borrow-bearing kind, a primitive
+        // names a value kind, and a bare type parameter never reaches this
+        // arm (isGenericBody_). So this is the ONE place where the declared
+        // type is replaced by the initializer's, and the replacement is
+        // confined to the `Object` head — #2451's precedence over every
+        // other declared type is untouched.
+        if (rhsTy && rhsTy->kind == sema::TypeRef::Kind::Primitive &&
+            rhsTy->primitive == sema::PrimitiveType::Object) {
+            const sema::TypeRef* initTy = ctx_.exprType(*ld.initializer);
+            // An `Object` initializer is UNKNOWN: the binding holds whatever
+            // the source holds, and the source's static type says nothing
+            // about that. A null `initTy` (error recovery) is UNKNOWN too.
+            const bool initIsObject =
+                initTy && initTy->kind == sema::TypeRef::Kind::Primitive &&
+                initTy->primitive == sema::PrimitiveType::Object;
+            rhsTy = (initTy && !initIsObject) ? initTy : nullptr;
+        }
         // §35.4 (#2047): an OWNING choice (`Result<Connection, string>`) is a
         // value type that DOES carry a disposal obligation — its active case's
         // owned payloads are disposed at scope end (§35.4). It is neither
