@@ -204,6 +204,15 @@ bool userRecordSelfComparable(const TypeSymbol* rs) {
 // no-selector `Min()`/`Max()` over a NON-Named element that PROVABLY fails
 // `T: IComparable<T>` (a function type, a nullable primitive, `bool`). Worded
 // as the #1198 class/record arms word theirs, so one family reads alike.
+//
+// fix #8326 (stdlib §5.1 / §2.8, spec §14.2, v0.355): the citation now names
+// #2770 as well, because this IS the #2770 guard's family — codegen's #2770
+// backstop is the same constraint ("requires the element type to satisfy
+// `T: IComparable<T>`") refused later and for a different reason. The sema
+// gate is the FRONT half of that guard, so a reader who greps "#2770" finds
+// the refusal that replaces the backstop's. The #1198 needle stays: it is the
+// gate's own issue, and the lit check (tests/lit/
+// xmod_builtin_iface_conformance_reject_3139.bzl) pins it.
 std::string noSelectorNotComparableMsg(std::string_view m, const TypeRef* elem) {
     std::string what;
     if (elem->kind == TypeRef::Kind::Function)
@@ -213,7 +222,7 @@ std::string noSelectorNotComparableMsg(std::string_view m, const TypeRef* elem) 
                (elem->nullable ? "?" : "") + "`";
     return std::string(m) +
            "() without a selector requires the element type to implement "
-           "IComparable<T> (stdlib §5.1 / §14.2 / #1198); " + what +
+           "IComparable<T> (stdlib §5.1 / §14.2 / #1198 / #2770); " + what +
            " does not implement IComparable<T>. Use " + std::string(m) +
            "(selector: (T) -> U) instead.";
 }
@@ -1136,6 +1145,10 @@ bool ExprTC::currentMethodTypeParamMayInherit(std::string_view n) const {
 //     interface — implies non-null T" (§14.2);
 //   * `bool` — rule 5 reads the primitive's stdlib declaration, and "the stdlib
 //     `Boolean` wrapper deliberately declares no `IComparable`" (spec §3.5);
+//   * `Object` — rule 1 reads the class's inheritance clause (spec §8.1's
+//     declaration lists NO interface) and rule 5 reads the primitive's stdlib
+//     declaration (it lists none either), and stdlib §2.8 closes the other
+//     door ("no `IComparable<Object>` view of them exists") — fix #8326;
 //   * a class / interface element with NO `IComparable` anywhere in its
 //     base closure (`inheritsBuiltinInterface`, §14.2 rules 1 and 3 —
 //     fix-forward #8180; the #1198 / #3139 gate reads the same closure
@@ -1152,7 +1165,45 @@ bool ExprTC::linqIComparableProvablyViolated(const TypeRef* elem) const {
         case TypeRef::Kind::Function:
             return true;
         case TypeRef::Kind::Primitive:
-            return elem->nullable || elem->primitive == PrimitiveType::Bool;
+            // fix #8326 (stdlib §5.1 / §2.8, spec §14.2 *Interface
+            // conformance* rules 1 and 5, v0.355): `Object` PROVABLY fails
+            // `T: IComparable<T>` as well.
+            //
+            // §8.1 declares `Object` as
+            //     public class Object
+            //       public method GetType(): Type;
+            //       public virtual method Equals(other: Object?): bool;
+            //       public virtual method GetHashCode(): int;
+            //       public virtual method ToString(): string;
+            //       public static method ReferenceEquals(a: Object?, b: Object?): bool;
+            //     end Object;
+            // — it lists NO interface in its inheritance clause and declares
+            // NO `CompareTo`, so §14.2 rule 1 ("T is a class that lists I (or
+            // any interface extending I) in its inheritance clause") does not
+            // hold, and rule 5 (a primitive conforms to the interfaces its
+            // standard-library declaration lists) does not either: the
+            // declaration lists none. And §2.8 closes the other door — "the
+            // stdlib's primitives and `string` conform to `IComparable<T>` …
+            // at their own type only … both interfaces are invariant … so no
+            // `IComparable<Object>`/`IEquatable<Object>` view of them
+            // exists" — so there is no `IComparable<Object>` view to reach
+            // `Object` through either.
+            //
+            // MEASURED on the base (6b3057bc): `Object` was NOT in this
+            // filter, so the §5.1 gate did not fire, the call was ADMITTED,
+            // and codegen's numeric path built `icmp slt ptr %15, i32 %17`
+            // — "Both operands to ICmp instruction are not of the same type!"
+            // and "IR verification failed" (issue #8326). The element is a
+            // REFERENCE (a boxed value or a class instance), so the numeric
+            // path could never be right for it.
+            //
+            // The verdict is the SAME shape the `bool` / function / nullable
+            // primitives already get, so the three receiver kinds (the
+            // concrete `Array<T>`, the lazy `Where(…)` and the vtable-backed
+            // `IEnumerable<T>` / `IList<T>`) all report the §5.1 constraint
+            // diagnostic instead of admitting the call.
+            return elem->nullable || elem->primitive == PrimitiveType::Bool ||
+                   elem->primitive == PrimitiveType::Object;
         case TypeRef::Kind::Named: {
             // fix #8181: an UNCONSTRAINED type parameter in scope (rule 6).
             if (!elem->declaration) {
