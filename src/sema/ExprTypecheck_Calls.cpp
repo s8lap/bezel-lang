@@ -21512,6 +21512,141 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                         ma->target.get())) {
                     if (tid->name == "Math") {
+                        // fix #8313 (stdlib §2.2, spec §14.2 *A type parameter
+                        // as the type argument* case 1 / *Interface conformance*
+                        // rule 6, v0.355): the TYPE-PARAMETER type argument.
+                        //
+                        // stdlib §2.2 declares
+                        //     public static method Max<T>(a: T, b: T): T
+                        //       where T: IComparable<T>;
+                        // so the constraint's satisfaction TURNS ON the type
+                        // argument T. When T is a type parameter IN SCOPE,
+                        // §14.2 *A type parameter as the type argument* case 1
+                        // decides it: "The argument is a type parameter `P` …
+                        // a call `G<U>(…)` at written or inferred type arguments
+                        // in the body of `F<U>`: the constraint is decided at
+                        // that site, by `P`'s own constraints. `P` satisfies the
+                        // constraint exactly when its constraints guarantee it
+                        // at every substitution they admit, as a matter of
+                        // language rule"; *Interface conformance* rule 6: "`T`
+                        // is a type parameter whose constraints guarantee
+                        // conformance to `I`: a type-bound constraint naming I
+                        // or an interface extending I, or a class bound naming
+                        // a class that conforms to I under rule 1, directly or
+                        // through a `where T: U` chain".
+                        //
+                        // ⇒ THE DECISION IS AT THE CALL SITE — the
+                        // `Math.Max(a, b)` in the generic body — and §14.2 says
+                        // so in as many words: "An unsatisfied constraint is a
+                        // compile error at that site, naming the constraint,
+                        // the argument and the parameter it turns on; nothing
+                        // of it is carried to the naming declaration's
+                        // instantiations, which satisfy the constraint by
+                        // construction". The INSTANTIATION (`G.F(x, y)`) is
+                        // not where the error belongs, and neither is codegen.
+                        //
+                        // MEASURED on the base (6b3057bc): the UNCONSTRAINED
+                        // form was ADMITTED and PRINTED (`G.F(3, 4)` printed 4),
+                        // and the class-typed instantiation was refused LATE, in
+                        // codegen, with the MISATTRIBUTED #2786 message
+                        // ("`Math.Max` could not lower a comparison for this
+                        // argument type … (#2786)") pointing INTO the generic
+                        // body's line. Both are the same defect: the
+                        // constraint was never read at the call.
+                        {
+                            // The effective type argument of §2.2's
+                            // `Math.Max<T>`: an explicit type list BINDS T
+                            // (stdlib §2.2 declares ONE type parameter for the
+                            // whole call); otherwise T is INFERRED from the
+                            // arguments (§14.5), and the constraint turns on a
+                            // type parameter exactly when an argument's type IS
+                            // one.
+                            const TypeRef* tArg = nullptr;
+                            if (ma->typeArgs.size() == 1 && ma->typeArgs[0])
+                                tArg = ctx_.resolvedType(*ma->typeArgs[0]);
+                            if (!tArg)
+                                for (const auto& arg : ce.args) {
+                                    if (!arg.value) continue;
+                                    const TypeRef* at =
+                                        mathArgType(*arg.value);
+                                    if (at && linqElemIsInScopeTypeParam(at)) {
+                                        tArg = at;
+                                        break;
+                                    }
+                                }
+                            // `linqElemIsInScopeTypeParam` is the ONE
+                            // "this Named ref with no declaration IS a type
+                            // parameter in scope" test (it carries the
+                            // built-in-collision guard of #6530's stamp test);
+                            // it is not §5-specific.
+                            if (tArg && linqElemIsInScopeTypeParam(tArg)) {
+                                const std::string_view p = tArg->headName();
+                                // §14.2 rule 6: P satisfies
+                                // `where T: IComparable<T>` exactly when P's
+                                // own constraints GUARANTEE conformance to
+                                // `IComparable<P>`. `typeParamSatisfiesSelf-
+                                // Comparable` is the ONE walk
+                                // (`forEachConstraintBound`) the compiler uses
+                                // to read what a type parameter's `where`
+                                // clause establishes — the same decision the
+                                // EXPLICIT-type-argument path reads for
+                                // `Math.Max<T>(a, b)` (#6295), so the inferred
+                                // and the written type argument cannot disagree.
+                                const bool guaranteed =
+                                    typeParamSatisfiesSelfComparable(p, tArg);
+                                // The UNDECIDED shapes keep the call — the
+                                // sound direction:
+                                //   * an `override` / interface implementation
+                                //     that OMITS the `where` clause INHERITS
+                                //     the constraint set (§14.2 *Constraints on
+                                //     overrides and interface implementations*),
+                                //     and the inherited set is not readable
+                                //     here;
+                                //   * an IMPORTED enclosing type's clauses are
+                                //     not in the AST the walk reads (#3141), so
+                                //     they are undecidable here too.
+                                bool undecided = false;
+                                if (currentMethodDecl_) {
+                                    bool methodOwn = false;
+                                    bool methodStates = false;
+                                    for (const auto& gp :
+                                             currentMethodDecl_->genericParams)
+                                        if (gp.name == p) methodOwn = true;
+                                    for (const auto& gc :
+                                             currentMethodDecl_->genericConstraints)
+                                        if (gc.typeParam == p)
+                                            methodStates = true;
+                                    if (methodOwn && !methodStates &&
+                                        currentMethodTypeParamMayInherit(p))
+                                        undecided = true;
+                                }
+                                if (!undecided && currentType_ &&
+                                    !currentType_->decl)
+                                    for (const Symbol* gs :
+                                             currentType_->genericParams)
+                                        if (gs && gs->name == p) {
+                                            undecided = true;
+                                            break;
+                                        }
+                                if (!guaranteed && !undecided) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "type argument `" + std::string(p) +
+                                        "` does not satisfy the constraint "
+                                        "`where T: IComparable<T>` — `Math." +
+                                        std::string(ma->member) +
+                                        "` requires an argument type that "
+                                        "implements `IComparable<T>` (§14.2, "
+                                        "stdlib §2.2); the constraint turns on "
+                                        "the type parameter `" +
+                                        std::string(p) +
+                                        "` in scope, whose own constraints do "
+                                        "not establish it (§14.2 *A type "
+                                        "parameter as the type argument*)");
+                                    return;
+                                }
+                            }
+                        }
                         // fix #2785 (stdlib §2.2 / §9.6, spec §14.2, v0.240): a
                         // NULLABLE string argument. §14.2: "nullable types do
                         // not themselves implement the interfaces of their
