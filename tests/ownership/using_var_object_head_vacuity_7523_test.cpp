@@ -322,6 +322,64 @@ BEZEL_TEST(using_var_object_head_vacuity_7523,
 }
 
 // ============================================================================
+// #7922 — the PARENTHESISED spelling. The sibling issue's probe is
+// `/var/tmp/bezel-scratch/r37-rev-rulings-a/probes/r01_paren.bzl`.
+//
+// MEASURED: the parenthesised spelling is NOT a different operand shape. The
+// parser keeps NO ParenExpr node ("no ParenExpr node survives into the AST",
+// src/parser/Parser_Exprs.cpp), so `(s)` and `s` are the same AST node and the
+// same classification — #7922 and #7523 are ONE defect, and the fix in
+// c710c7ee covers both. These rows pin the sibling issue's own spelling so
+// the shared-defect finding is executable, not just a claim.
+// ============================================================================
+
+// per §28.9 / §28.10 / §28.12, fix #7523 / #7922
+BEZEL_TEST(using_var_object_head_vacuity_7523,
+            the_parenthesised_object_probe_is_rejected_for_adoption_and_draws_no_vacuity_warning_28_10) {
+    // The issue's own probe, with the parenthesised right-hand side.
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "public class Res "
+        "  public constructor() end constructor; "
+        "  destructor Console.WriteLine(\"DTOR\"); end destructor; "
+        "end Res; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var s: Object := new Res(); "
+        "    using var x := (s); "
+        "    return 0; "
+        "  end Main; "
+        "end Program; ");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasAdoptionAmbiguityError(r));
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "x"));
+}
+
+// per §28.9 / §28.10 / §28.12, fix #7523 / #7922
+//
+// The same parenthesised spelling over a BORROW-STATE source, so the program
+// COMPILES: the §28.9 vacuity warning must not be drawn on it.
+BEZEL_TEST(using_var_object_head_vacuity_7523,
+            the_parenthesised_object_source_does_not_draw_the_vacuity_warning_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "public class Res "
+        "  public constructor() end constructor; "
+        "  destructor Console.WriteLine(\"DTOR\"); end destructor; "
+        "end Res; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var s: Object := new Res(); "
+        "    var src: Object := s; "
+        "    using var x := (src); "
+        "    return 0; "
+        "  end Main; "
+        "end Program; ");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "x"));
+}
+
+// ============================================================================
 // THE CONTROLS — the lint must NOT be silenced wholesale.
 //
 // These rows are what make the absence rows above non-vacuous: the SAME lint,
