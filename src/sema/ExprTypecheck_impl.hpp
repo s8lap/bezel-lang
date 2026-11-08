@@ -1109,6 +1109,20 @@ private:
     // owning-match scrutinee production — routed to the §35.5 targeted
     // rejection (#2124), not the A7 positional reject.
     const ast::Expr* caseScrutineeSlot_ = nullptr;
+    // fix #7926 (§28.8.1 / Appendix A.7 MoveExpr, v0.350): the LOCAL
+    // DECLARATION INITIALIZER node currently being visited. Set
+    // (saved/restored) around the initializer's visit, exactly like
+    // `markedArmSlot_` / `caseScrutineeSlot_` above. The `move` operand
+    // checks in ExprTypecheck_Exprs.cpp read it to know that the `move`
+    // expression being typed is a BINDING POSITION (the whole RHS of a
+    // `var` / `using var` declaration) — the position §28.3's consume table
+    // and A.7's "the entire RHS of a binding" name, and the one the
+    // fresh-producer marker rule (§22.3 / K3.13) is decided at. The other
+    // positions have their own authority (§22.3's call-site marker economy
+    // at an owned argument, §28.3's marker-free positions at a return /
+    // throw / discard / owned-slot store), so the operand rule is not
+    // extended to them here.
+    const ast::Expr* localDeclInitSlot_ = nullptr;
     // #721/§29.5: true while visiting an iterator method body (sync or async,
     // i.e. it contains `yield`). A plain `return;` in an iterator is forbidden
     // (use `yield break`); for an ASYNC iterator §21.7 does not catch it (it is

@@ -26012,7 +26012,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // fix #7926 (§28.8.1 / Appendix A.7 MoveExpr, v0.350): mark the
+        // LOCAL DECLARATION INITIALIZER while it is visited, so the `move`
+        // operand checks in ExprTypecheck_Exprs.cpp can tell a BINDING
+        // POSITION from the other positions. Set/restored exactly like
+        // `markedArmSlot_` / `caseScrutineeSlot_`.
+        const ast::Expr* savedLocalDeclInit = localDeclInitSlot_;
+        localDeclInitSlot_ = ld->initializer.get();
         if (ld->initializer) visitExpr(*ld->initializer);
+        localDeclInitSlot_ = savedLocalDeclInit;
         pendingLambdaReturnType_ = savedLamRet;
         pendingLambdaParamTypes_ = savedLamParams;
         pendingLambdaTargetReturn_ = savedLamTargetRet;

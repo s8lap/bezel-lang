@@ -44,6 +44,16 @@
 // `FieldSymbol` — unconditionally, since a property/indexer getter can never
 // be a legitimate owned source (axiom A4).
 //
+// SINCE narrow #7926. The ownership pass's own rule above is UNCHANGED — a
+// `move` of a fresh owned producer is still not rejected BY IT (`producerState`
+// is still consulted, and `return move C.Fresh();` is still admitted by it).
+// What changed is a SEPARATE, SEMANTIC rule in SEMA: §28.8.1 / A.7's closed
+// operand set ("a fresh producer ... needs no marker anywhere ... so `move
+// (new Cell(1))` is a compile error at EVERY position", v0.350) rejects the
+// marker on a fresh producer at a BINDING POSITION. Row (5) below is
+// therefore flipped by that sema rule, not by this file's — and it now also
+// pins that the marker-free `owned`-return position still compiles.
+//
 // OBSERVABILITY. The pre-fix behaviour is a clean COMPILE, so the oracle is
 // the SPECIFIC diagnostic text, never `failedAtCompileTimeWithRealLocation`
 // (which would answer true for any unrelated rejection) and never `!r.ran`
@@ -155,15 +165,30 @@ BEZEL_TEST(move_borrow_producing_operand_4683,
         "    return 0; "), kCallNeedle));
 }
 
-// --- ACCEPT controls: shapes the fix must NOT touch -------------------------
-
 // (5) `move` of a genuinely OWNED-producing call — the K3.13 "redundant
-// marker on a fresh producer" case. Guards against the call-side check
-// becoming a blanket ban on every CallExpr operand rather than consulting
-// `producerState`. Mirrors move_borrow_owned_return_1995_test.cpp's own
-// pinned ACCEPT row for this exact shape (`return move C.Fresh();`).
+// marker on a fresh producer" case. REJECTED at a binding position since
+// narrow #7926 — a SEMANTIC change, not this file's rule: see the note in
+// the file header.
+//
+// (5a) AT A BINDING POSITION it is now REJECTED. §28.8.1 (v0.350) closes
+// the operand set and says so in its own words: "No other operand is
+// admitted (A.7): a fresh producer (a `new` expression, a call returning
+// `owned T`, an owned operator result) needs no marker anywhere (K3.13) and
+// takes none, so `move (new Cell(1))` is a compile error at EVERY position".
+// A BINDING POSITION is one of those positions, so the marker on
+// `W.Fresh()` — a call returning `owned T` — is a compile error there
+// (narrow #7926: the §22.3 fresh-producer rule, extended to this position).
+// This row was pinned ACCEPTED before that change (the position-scoped
+// exemption it encoded is not one the spec grants).
+//
+// (5b) The guard this row still carries is that the rejection is
+// POSITION-SCOPED, not a blanket ban on every CallExpr operand: the SAME
+// `move` of the SAME owned-returning call at a MARKER-FREE position (an
+// `owned` return) still compiles. That is the shape
+// move_borrow_owned_return_1995_test.cpp pins ACCEPTed on its own
+// (`return move C.Fresh();`).
 BEZEL_TEST(move_borrow_producing_operand_4683,
-           move_of_owned_returning_call_still_accepted_spec_28_8_1) {
+           move_of_owned_returning_call_rejected_at_a_binding_position_spec_28_8_1) {
     const char* kCellPrelude =
         "module M; "
         "class Cell "
@@ -179,11 +204,37 @@ BEZEL_TEST(move_borrow_producing_operand_4683,
         "    return 0; "
         "  end Main; "
         "end W;";
+    // (5a) the binding position: REJECTED by the fresh-producer rule. The
+    // ORACLE is the diagnostic text (a crash would synthesise an Error
+    // diagnostic too — tests/README.md — so `!r.ran` below is only a
+    // supplementary assertion, never the oracle).
     auto r = runAot(kCellPrelude);
-    BEZEL_EXPECT_FALSE(hasErrorContaining(r, kCallNeedle));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("3") != std::string::npos);
+    BEZEL_EXPECT_TRUE(
+        hasErrorContaining(r, "not written on a fresh producer"));
+    BEZEL_EXPECT_FALSE(r.ran);
+
+    // (5b) the `owned`-return position (marker-free): still COMPILES.
+    const char* kReturnPrelude =
+        "module M; "
+        "class Cell "
+        "  public Id: int; "
+        "  public constructor(id: int) Id := id; end constructor; "
+        "  destructor Console.WriteLine(\"D\" + Id.ToString()); end destructor; "
+        "end Cell; "
+        "class W "
+        "  public static method Fresh(): owned Cell return new Cell(3); end Fresh; "
+        "  public static method Take(): owned Cell return move W.Fresh(); end Take; "
+        "  public static method Main(): int "
+        "    using var live := W.Take(); "
+        "    Console.WriteLine(live.Id.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end W;";
+    auto r2 = runAot(kReturnPrelude);
+    BEZEL_EXPECT_FALSE(hasErrorContaining(r2, kCallNeedle));
+    BEZEL_EXPECT_TRUE(r2.ran);
+    BEZEL_EXPECT_EQ(r2.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r2.stdoutText.find("3") != std::string::npos);
 }
 
 // (6) A plain (non-`move`) READ through the same borrow-returning call,

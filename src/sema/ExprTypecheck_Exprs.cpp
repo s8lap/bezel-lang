@@ -12367,6 +12367,75 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         ctx_.setExprType(&ue, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         return;
     }
+    // fix #7926 (§22.3 / §28.3 K3.13 / §28.8.1 / Appendix A.7 MoveExpr,
+    // v0.350): at a BINDING POSITION — the whole RHS of a `var` /
+    // `using var` declaration, which is where A.7 admits the `move` marker
+    // ("the entire RHS of a binding or assignment ... an argument root ...")
+    // — the marker is written on a NAMED OWNED BINDING (a local or an
+    // `owned` parameter), and on nothing else. Two operand shapes are
+    // admitted by neither §22.3 nor A.7:
+    //
+    //   (a) a CALL whose declared return type is `owned` — a FRESH PRODUCER.
+    //       §22.3: "A fresh producer ... stays unmarked: no live binding is
+    //       invalidated, so there is nothing to announce", and §28.3 K3.13:
+    //       "Fresh producers need no marker anywhere". So `var a := move
+    //       Mk();` writes a marker on a value that needs none; the remedy is
+    //       to drop the `move`. (The ownership pass's own §22.3 check
+    //       covers the CALL-SITE positions — an `owned` argument, a
+    //       constructor argument — but not the binding position, which is
+    //       where this hole was measured.)
+    //
+    //   (b) a LITERAL — not a movable location at all. Appendix A.7's
+    //       MoveExpr admits exactly three operand shapes: an `owned` field
+    //       of a class instance, a slot of an owning collection, and a bare
+    //       identifier naming a local binding or `owned` parameter. "Any
+    //       other operand is a compile error."
+    //
+    // The rule is checked at the LOCAL DECLARATION INITIALIZER only: the
+    // other positions carry their own authority (§22.3's call-site marker
+    // economy at an `owned` argument; §28.3's marker-free positions at a
+    // `return` / `throw` / discard / owned-slot store, where a marker is
+    // redundant rather than misplaced), and this lane does not extend the
+    // operand rule to them.
+    if (op == "move" && ue.operand && &ue == localDeclInitSlot_) {
+        const ast::Expr* mo = ue.operand.get();
+        while (const auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(mo))
+            mo = pb->operand.get();
+        if (const auto* call = dynamic_cast<const ast::CallExpr*>(mo)) {
+            // (a) the fresh-producer call. `calleeReturnsOwned` is the
+            // established "the callee is declared to return `owned T`"
+            // predicate (§28.1 / §28.3, #3189) — the same one the §35.5
+            // scrutinee rule uses.
+            if (common::calleeReturnsOwned(*call, ctx_)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ue.span.begin,
+                    "the `move` marker is not written on a fresh producer (a "
+                    "call returning `owned T`) — no live binding is "
+                    "invalidated, so there is nothing to announce; remove "
+                    "`move` (§22.3, v0.307, §28.3 K3.13)");
+            }
+        } else if (dynamic_cast<const ast::IntLiteralExpr*>(mo) ||
+                   dynamic_cast<const ast::FloatLiteralExpr*>(mo) ||
+                   dynamic_cast<const ast::CharLiteralExpr*>(mo) ||
+                   dynamic_cast<const ast::StringLiteralExpr*>(mo) ||
+                   dynamic_cast<const ast::VerbatimStringExpr*>(mo) ||
+                   dynamic_cast<const ast::InterpolatedStringExpr*>(mo) ||
+                   dynamic_cast<const ast::BoolLiteralExpr*>(mo)) {
+            // (b) the literal operand. (A `null` literal is not listed here:
+            // `move null` is ALREADY rejected everywhere by the §7.4 / §7.8
+            // "unary operator `move` is not defined on a nullable value type"
+            // rule — MEASURED on base a939f913 — so listing it here would
+            // only double-report the same span.)
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                "`move` is not admitted on a literal: the operand of `move` "
+                "must be a movable location — a named binding, an `owned` "
+                "field, or an owning collection's slot — and no other "
+                "operand is admitted (Appendix A.7 MoveExpr, §28.8.1, "
+                "v0.350). A literal is a value, not a place, so there is "
+                "nothing to transfer; drop the `move`");
+        }
+    }
     // §28.8.1 / §22.12 note (h) / K9.4 (v0.350): a `move arr[j]` (bare or
     // replacing) through a `static readonly` owning inline array is a compile
     // error naming K9.4 -- static owned storage is disposed only by the §22.13
