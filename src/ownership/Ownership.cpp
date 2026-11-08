@@ -10265,6 +10265,43 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // is the other-binding arm below (the fourth fix-forward of
             // #8137); widening to every borrow RHS (`t := someBorrowingCall()`)
             // is #4846 and needs its own census.
+            // fix #8328 (§28.3 *State match on reassignment*, v0.355): a
+            // §28.3 state-match VIOLATION is a REJECTED store, so the store
+            // never happens: the binding keeps the value — and the ownership
+            // STATE — it held. Modelling the rejected store as a no-op is
+            // what keeps the violation VISIBLE at the assignment site when
+            // the assignment sits INSIDE A LOOP BODY.
+            //
+            // WHY — THE LOOP-HEAD JOIN IS WHERE THE OWNED STATE WAS LOST.
+            // §28.3 *Ownership state of locals*: "At every control-flow join
+            // the compiler applies K7's meet to each variable's tracked
+            // state". A loop header is such a join: the pre-header edge
+            // (the local is OWNED) meets the back edge (the local is BORROWED
+            // — the violating store's effect), and K7.3's mixed merge
+            // (owned ⊓ borrowed) is REJECTED, which `joinInto` implements as
+            // POISON (Ownership_Checks.cpp's `ownedBorrowedClash` arm). The
+            // Poison then hides the very violation that produced it: the
+            // assignment is re-examined in the FINAL emit pass against the
+            // loop header's CONVERGED state, which is no longer Owned, so
+            // §28.3's state match — the rule that rejects the store — never
+            // fires.
+            //
+            // MEASURED on the base (74c9d282), the issue's repro: the
+            // straight-line twin (`x := b;` outside the loop) is REJECTED with
+            // §28.3's state-match diagnostic, while the same statement inside
+            // a `while` body COMPILES and is a heap-use-after-free under ASan
+            // (the local's §28.7 drop-on-overwrite and its §28.3 scope-end
+            // auto-drop then dispose the CALLER's value). The two differ ONLY
+            // in the loop-head join.
+            //
+            // THE FIX: a rejected store does not change the tracked state, so
+            // the back edge carries the same OWNED state the pre-header edge
+            // does; the loop-header join is then owned ⊓ owned = owned (no
+            // K7.3 mixed merge, nothing left to hide the violation), and the
+            // FINAL emit pass rejects the store at the assignment with the
+            // SAME diagnostic the straight-line twin draws — same text, same
+            // site (the RHS), same severity.
+            bool stateMatchRejected = false;
             if (st.state == OwnershipState::Owned && !as.valueHasOwnedMarker) {
                 // (2) the RHS is the unmarked read of THIS binding. Peel a
                 // force-unwrap (`t := t!` reads the same slot) exactly as
@@ -10300,6 +10337,11 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                                "it is not a §28.7 drop-and-replace discharge. "
                                "Delete the statement, or spell the transfer "
                                "explicitly with `move`");
+                // fix #8328 (§28.3 *State match on reassignment*, v0.355): the
+                // self-assignment IS a state-match violation (a BORROW into an
+                // OWNED-state LHS), so the store is rejected and never
+                // happens — see the flag's own comment.
+                if (selfRead && !moveOnlyTarget) stateMatchRejected = true;
                 // fix-forward #8137 (§28.3 *State match on reassignment*,
                 // §28.7, §30.3, v0.355): the state match for an unmarked read
                 // of ANOTHER binding. §28.3: "Assigning a borrow to an
@@ -10353,7 +10395,7 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                     const bool rhsBorrow =
                         isBinding && !rhsOwnedUnmarked &&
                         ownedArgSourceIsBorrow(*rid);
-                    if (isBinding && (rhsBorrow || rhsOwnedUnmarked))
+                    if (isBinding && (rhsBorrow || rhsOwnedUnmarked)) {
                         report(Severity::Error, rid->span.begin,
                                std::string("cannot assign `") +
                                    std::string(rid->name) + "` to `" +
@@ -10376,6 +10418,11 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                                         : std::string(
                                               "Bind the borrow to a separate "
                                               "local instead")));
+                        // fix #8328 (§28.3 *State match on reassignment*,
+                        // v0.355): the store is REJECTED, so it never happens
+                        // — see the flag's own comment.
+                        stateMatchRejected = true;
+                    }
                 }
             }
             // fix #4329 (§28.3 / §28.7 / O4 silent-poison design, v0.298): at a
@@ -10487,6 +10534,20 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // // per §28.7, §28.3 K1.3, v0.294, #3950
             if (!suppressDiag_ && st.state == OwnershipState::MovedFrom)
                 const_cast<ast::AssignmentStmt&>(as).lhsMovedFromAtStore = true;
+            // fix #8328 (§28.3 *State match on reassignment*, v0.355): the
+            // store above was REJECTED by §28.3's state match, so it never
+            // happens: the binding keeps the value — and the ownership STATE —
+            // it held, and the transition below is NOT applied. This is what
+            // makes the rejection visible inside a LOOP BODY: the back edge
+            // then carries the same OWNED state the pre-header edge does, the
+            // loop-header join is owned ⊓ owned (no K7.3 mixed merge to hide
+            // the violation), and the FINAL emit pass rejects the store at the
+            // assignment with the SAME diagnostic the straight-line twin
+            // draws. The straight-line twin's own diagnostics are UNCHANGED:
+            // the local keeps the OWNED state and the DECLARATION's
+            // obligation origin it had, so §28.3's scope-end auto-drop still
+            // names the declaration.
+            if (stateMatchRejected) return;
             st.state = producerState(*as.value);
             st.obligationOrigin = &as;
             // §28.3 (#1626): a reassignment writes a fresh value, so any
