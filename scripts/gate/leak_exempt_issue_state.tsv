@@ -7,9 +7,10 @@
 # indistinguishable from staleness. See that script's own header, and
 # sanitizer_leak_exempt.txt's header, for the full rationale.
 #
-# asof: 2026-11-05 (gh issue view <n> --json state, this run)
+# asof: 2026-11-08 (gh issue view <n> --json state, this run)
 #
 # issue	state
 3541	OPEN
 4717	OPEN
+5059	OPEN
 8327	OPEN
