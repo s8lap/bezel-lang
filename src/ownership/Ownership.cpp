@@ -393,22 +393,26 @@ static SourceLocation obligationDiagLoc(sema::Symbol* sym,
     return SourceLocation{};
 }
 
-// fix #7791 (§28.3 *Auto-drop (affine)*, §28.10, §17.13, v0.350): the adoption
-// remedy a state-machine `owned` parameter's frame-teardown warning names.
+// fix #7791 / #7843 (§28.3 *Auto-drop (affine)*, §28.10 *The anonymous
+// binding*, §17.13 axiom A6, v0.350 / v0.355): the adoption remedy an
+// auto-drop warning names, for a value of the resolved type `pt` bound by the
+// name `name`.
 // The marked adoption is spelled with `move` (`owned` stopped being the
-// binding-position marker at v0.286), and §28.10 *The anonymous binding* says
+// binding-position marker at v0.246 — proposal 0090 / #3056; the `owned`
+// marker became purely declarative), and §28.10 *The anonymous binding* says
 // "Adoption composes: `using var _ := move x;` consumes `x` into the anonymous
 // binding" -- EXCEPT over a `Task`-family value, which "may not be bound this
 // way (§17.13, axiom A6)": there the remedy is the NAMED
 // `using var t2 := move t;` (§28.10: "`using var _ := move x;` is never
 // offered as its remedy" over a Task-family source). Nullability is stripped
 // by headName(). The returned text carries its own backticks.
-// // per §28.10, §17.13, A6, v0.350
-static std::string frameParamAdoptionRemedy(const sema::ParameterSymbol& ps,
-                                            std::string_view name,
-                                            sema::SemaContext& ctx) {
-    const sema::TypeRef* pt = ps.declType ? ctx.resolvedType(*ps.declType)
-                                          : ps.resolvedDeclType;
+// The type is read at its DECLARED, PRE-SUBSTITUTION type (§17.13 axiom A6:
+// "nullability stripped and read at the operand's declared, pre-substitution
+// type"), so a bare type parameter takes the ordinary anonymous remedy and
+// the instantiation-site check owns the rest.
+// // per §28.10, §17.13, A6, v0.350, v0.355
+static std::string adoptionRemedyText(const sema::TypeRef* pt,
+                                      std::string_view name) {
     const bool taskFamily = pt && pt->kind == sema::TypeRef::Kind::Named &&
                             common::isTaskFamilyHead(pt->headName());
     if (taskFamily)
@@ -416,6 +420,36 @@ static std::string frameParamAdoptionRemedy(const sema::ParameterSymbol& ps,
                std::string(name) + ";` (the anonymous `using var _` is "
                "rejected for a `Task`, §17.13)";
     return "`using var _ := move " + std::string(name) + ";`";
+}
+
+// fix #7791 (§28.3 *Auto-drop (affine)*, §28.10, §17.13, v0.350): the adoption
+// remedy a state-machine `owned` parameter's frame-teardown warning names.
+// // per §28.10, §17.13, A6, v0.350
+static std::string frameParamAdoptionRemedy(const sema::ParameterSymbol& ps,
+                                            std::string_view name,
+                                            sema::SemaContext& ctx) {
+    const sema::TypeRef* pt = ps.declType ? ctx.resolvedType(*ps.declType)
+                                          : ps.resolvedDeclType;
+    return adoptionRemedyText(pt, name);
+}
+
+// fix #7843 (§28.3 *Auto-drop (affine)*, §28.10 *The anonymous binding*,
+// §17.13 axiom A6, v0.355): the adoption remedy the out-owned RECIPIENT's
+// auto-drop warning names. The recipient is a LOCAL — a pre-declared
+// `var it: T? := null;` passed as a plain `out it` against an `out owned`
+// formal (§22.4) — so its type is the LOCAL's declared type
+// (`LocalSymbol::declType`): the very type the callee's `out` formal aliases
+// ("a `ref`/`out` argument aliases the caller's location (§22.3), so the type
+// must match exactly"), which makes the local's type the recipient's type.
+// A `Task`-family recipient is REACHABLE here (an `out owned t: Task?`
+// formal is admitted — `Task` is a class type, §28.1 *Type requirement* — and
+// the recipient adopts owned like any other), and over it the ANONYMOUS
+// binding is a compile error (§28.10 / §17.13 axiom A6), so the remedy is
+// the NAMED form there.
+// // per §28.10, §17.13, A6, v0.355
+static std::string outRecipientAdoptionRemedy(const sema::LocalSymbol& ls,
+                                              std::string_view name) {
+    return adoptionRemedyText(ls.declType, name);
 }
 }  // namespace
 
@@ -944,6 +978,21 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 loopCondOutOwnedSyms_.count(sym) == 0) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
                     ls->autoDropAtScopeEnd = true;
+                    // fix #7843 (§28.3 *Auto-drop (affine)*, §28.10 *The
+                    // anonymous binding*, §17.13 axiom A6, v0.355): the remedy
+                    // half of this warning named a hard-coded `item` and the
+                    // RETIRED `owned` binding marker (`move` replaced `owned`
+                    // as the binding-position marker at v0.246 — proposal 0090
+                    // / #3056 — so the remedy named a spelling the spec no
+                    // longer sanctions), and it did not name the local the
+                    // warning's own first clause names. The list now names
+                    // THIS local and adopts it with `move`, in the shape the
+                    // sibling parameter-site remedy uses
+                    // (`adoptionRemedyText`): the anonymous
+                    // `using var _ := move x;` for an ordinary value, the NAMED
+                    // `using var t2 := move t;` for a `Task`-family one, over
+                    // which the anonymous binding is a compile error (§28.10 /
+                    // §17.13 axiom A6).
                     ctx_.diagnostics().report(
                         Severity::Warning,
                         st.obligationOrigin ? st.obligationOrigin->span.begin
@@ -951,9 +1000,12 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         std::string("owned value in `") +
                         std::string(sym->name) +
                         "` is implicitly disposed at the end of its scope "
-                        "(§28.3 must-use / auto-drop); use `item?.Dispose()`, `move`, "
-                        "`using var _ := owned item`, or `return` to discharge "
-                        "it explicitly (§28.3/§28.11)");
+                        "(§28.3 must-use / auto-drop); use `" +
+                        std::string(sym->name) +
+                        "?.Dispose()`, `move`, " +
+                        outRecipientAdoptionRemedy(*ls, sym->name) +
+                        ", or `return` to discharge it explicitly "
+                        "(§28.3/§28.11)");
                     continue;
                 }
             }
