@@ -13463,6 +13463,82 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         return;
                     }
                 }
+                // fix #8242 (stdlib §5.1, spec §14.2, v0.355):
+                // the no-selector `Min()`/`Max()` RESULT TYPE for an element
+                // that satisfies §5.1's `where T: IComparable<T>`.
+                //
+                // stdlib §5.1 declares
+                //     public extension IEnumerable<T> where T: IComparable<T>
+                //       public method Min(): T;  public method Max(): T;
+                // so the result is the ELEMENT type for every T the constraint
+                // admits — a `string` (stdlib §9.6's `IComparable<string>`), a
+                // class / interface (the constraint itself), a user record, a
+                // built-in value record (stdlib §2.5's `IComparable<Self>`), and
+                // the numeric primitives the arm below keys off.
+                //
+                // ONE decision, read by BOTH non-concrete receiver arms — the
+                // LAZY sentinel / `Range<T>` / `IGrouping` /
+                // `IOrderedEnumerable<T>` arm and the vtable-backed
+                // `IEnumerable<T>` / `IList<T>` arm — so the two cannot drift.
+                // (The drift: `IEnumerable<string>.Min()` was typed `int` while
+                // its LAZY twin typed `string` — #8242.)
+                //
+                // The per-family constraint checks are the SAME helpers the
+                // CONCRETE-collection arm uses (`classOrIfaceComparableAtInstance`
+                // — #8209's instantiation-aware check;
+                // `userRecordComparableAtInstance` — #8161's), so a class /
+                // record element is admitted or refused identically on every
+                // receiver.
+                enum class NoSelCmp { Undecided, Element, Refused };
+                auto noSelectorComparableElem = [&](const TypeRef* elem)
+                        -> NoSelCmp {
+                    if (!elem) return NoSelCmp::Undecided;
+                    if (elem->kind == TypeRef::Kind::Named &&
+                        elem->declaration) {
+                        const auto k = elem->declaration->kind;
+                        if (k == ast::TypeDeclKind::Class ||
+                            k == ast::TypeDeclKind::Interface) {
+                            // A NULLABLE class / interface element is not
+                            // decided here — the LAZY twin left it on the
+                            // `int` default, and the EAGER twin's own answer
+                            // for it belongs to the codegen #2770 guard, which
+                            // owns the nullable element (§14.2: "A type-bound
+                            // constraint — naming a class or interface —
+                            // implies non-null T"; it already refuses the
+                            // nullable-INTERFACE element `Array<IFoo?>`).
+                            if (elem->nullable) return NoSelCmp::Undecided;
+                            return classOrIfaceComparableAtInstance(elem)
+                                       ? NoSelCmp::Element
+                                       : NoSelCmp::Refused;
+                        }
+                        if (k == ast::TypeDeclKind::Record) {
+                            // A NULLABLE record element is NOT decided here —
+                            // the concrete arm does not decide it either.
+                            if (elem->nullable) return NoSelCmp::Undecided;
+                            return userRecordComparableAtInstance(elem)
+                                       ? NoSelCmp::Element
+                                       : NoSelCmp::Refused;
+                        }
+                        return NoSelCmp::Undecided;
+                    }
+                    // A `string` element: stdlib §9.6 declares
+                    // `IComparable<string>`, so the constraint holds.
+                    if (!elem->nullable &&
+                        elem->kind == TypeRef::Kind::Primitive &&
+                        elem->primitive == P::String)
+                        return NoSelCmp::Element;
+                    // A BUILT-IN VALUE RECORD (`DateTime`, `TimeSpan`,
+                    // `DateOnly`, `TimeOnly`): stdlib §2.5 declares
+                    // `IComparable<Self>` on each, and the stdlib declaration
+                    // is the authority for them (they carry no user TypeDecl,
+                    // so the symbol probe cannot answer for them).
+                    if (!elem->nullable &&
+                        elem->kind == TypeRef::Kind::Named &&
+                        !elem->declaration &&
+                        !mathOrderedTimeValueHead(elem).empty())
+                        return NoSelCmp::Element;
+                    return NoSelCmp::Undecided;
+                };
                 if (isLazyRecv || isRangeLinqRecv || isGroupingLinqRecv ||
                     isOrderedEnumerableLinqRecv) {
                     TypeRef* srcElem = isGroupingLinqRecv ? recvTy->genericArgs[1]
@@ -13567,35 +13643,63 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, srcElem);
                             noSelectorKeyed = true;
                         }
-                        // fix #8161 (stdlib §5.1 / §2.8 / §14.2, v0.355): the
-                        // no-selector `Min()`/`Max()` returns the ELEMENT type
-                        // `T` for EVERY `T` that satisfies §5.1's
-                        // `where T: IComparable<T>` — not only for the
-                        // numeric primitives the arm above keys off. A USER
-                        // RECORD element was left on the `int` default, so
-                        // `arr.Where(…).Min().v` did not resolve ("no member
-                        // `v` on primitive type `int`") on a program stdlib
-                        // §5.1 admits. The CONCRETE-collection path has always
-                        // typed the element here (#8092); this is the LAZY
-                        // receiver's twin.
+                        // fix #8161 / #8208 / #8242 (stdlib §5.1 / §2.8 / §9.6 /
+                        // §14.2, v0.355): the no-selector `Min()`/`Max()` returns
+                        // the ELEMENT type `T` for EVERY `T` that satisfies
+                        // §5.1's `where T: IComparable<T>` — not only for the
+                        // numeric primitives the arm above keys off. The
+                        // families, and what each was worth before this fix:
+                        //   * a USER RECORD element — left on the `int` default,
+                        //     so `arr.Where(…).Min().v` did not resolve ("no
+                        //     member `v` on primitive type `int`") on a program
+                        //     stdlib §5.1 admits (#8161). The CONCRETE-collection
+                        //     path has always typed the element here (#8092);
+                        //     this is the LAZY receiver's twin.
+                        //   * a `string` element — stdlib §9.6 declares
+                        //     `IComparable<string>`, so the result is the
+                        //     string. MEASURED before this fix:
+                        //     `arr.Where(…).Min()` over `Array<string>`
+                        //     PRINTED GARBAGE (2393792 — the string pointer
+                        //     truncated to an int) where the eager
+                        //     `arr.Min()` printed "a" (#8208).
+                        //   * a CLASS / INTERFACE element — the result is the
+                        //     class. MEASURED before this fix:
+                        //     `arr.Where(…).Min().X` was REFUSED ("no member
+                        //     `X` on primitive type `int`"), and the bare
+                        //     `arr.Where(…).Min()` printed the element's
+                        //     ADDRESS as an int (469591088) (#8208).
+                        //   * a BUILT-IN VALUE RECORD (`DateTime`, `TimeSpan`,
+                        //     `DateOnly`, `TimeOnly` — stdlib §2.5 declares
+                        //     `IComparable<Self>` on each) — the result is the
+                        //     record. MEASURED before this fix:
+                        //     `arr.Where(…).Min().Year` was REFUSED ("no member
+                        //     `Year` on primitive type `int`"), where the
+                        //     eager `arr.Min().Year` printed 2023 (#8208).
                         //
-                        // The §5.1 CONSTRAINT is applied with the SAME helper
+                        // The §5.1 CONSTRAINT is applied with the SAME helpers
                         // the concrete path uses
-                        // (`userRecordComparableAtInstance`, §12.9's
+                        // (`userRecordComparableAtInstance` and
+                        // `classOrIfaceComparableAtInstance`, §12.9's
                         // `collectAncestorInstantiationsOf` walk), so a record
-                        // that does not implement `IComparable<T>` AT THIS
-                        // INSTANTIATION is REFUSED with the same diagnostic
+                        // or class that does not implement `IComparable<T>` AT
+                        // THIS INSTANTIATION is REFUSED with the same diagnostic
                         // instead of being admitted and then aborting the
-                        // compile in codegen (the pre-fix shape: "Both
-                        // operands to ICmp instruction are not of the same
-                        // type!" → "IR verification failed").
+                        // compile in codegen (the pre-fix shape: "Both operands
+                        // to ICmp instruction are not of the same type!" → "IR
+                        // verification failed").
+                        //
+                        // fix #8242 (stdlib §5.1, spec §14.2, v0.355): the
+                        // decision is now ONE shared helper
+                        // (`noSelectorComparableElem`, above), read by this arm
+                        // AND by the vtable-backed `IEnumerable<T>` arm below,
+                        // so the two receivers cannot drift — the drift that
+                        // left `IEnumerable<string>.Min()` typed `int` while
+                        // this LAZY twin typed `string`.
                         if (!noSelectorKeyed && (m == "Min" || m == "Max") &&
-                            ce.args.empty() && srcElem && !srcElem->nullable &&
-                            srcElem->kind == TypeRef::Kind::Named &&
-                            srcElem->declaration &&
-                            srcElem->declaration->kind ==
-                                ast::TypeDeclKind::Record) {
-                            if (!userRecordComparableAtInstance(srcElem)) {
+                            ce.args.empty() && srcElem) {
+                            const NoSelCmp verdict =
+                                noSelectorComparableElem(srcElem);
+                            if (verdict == NoSelCmp::Refused) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, ce.span.begin,
                                     std::string(m) +
@@ -13609,96 +13713,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     "(selector: (T) -> U) instead.");
                                 return;
                             }
-                            ctx_.setExprType(&ce, srcElem);
-                            noSelectorKeyed = true;
-                        }
-                        // fix #8208 (stdlib §5.1 / §2.8 / §9.6, spec §14.2,
-                        // v0.355): the no-selector `Min()`/`Max()` returns the
-                        // ELEMENT type `T` for EVERY `T` that satisfies §5.1's
-                        // `where T: IComparable<T>` — and the LAZY receiver's
-                        // arm still keyed the result off the numeric
-                        // primitives and the USER RECORD only. THREE more
-                        // families were left on the `int` default, and each
-                        // was wrong in a way the EAGER twin shows:
-                        //   * a `string` element — stdlib §9.6 declares
-                        //     `IComparable<string>`, so the result is the
-                        //     string. MEASURED before this fix:
-                        //     `arr.Where(…).Min()` over `Array<string>`
-                        //     PRINTED GARBAGE (2393792 — the string pointer
-                        //     truncated to an int) where the eager
-                        //     `arr.Min()` printed "a";
-                        //   * a CLASS / INTERFACE element — the result is the
-                        //     class. MEASURED before this fix:
-                        //     `arr.Where(…).Min().X` was REFUSED ("no member
-                        //     `X` on primitive type `int`"), and the bare
-                        //     `arr.Where(…).Min()` printed the element's
-                        //     ADDRESS as an int (469591088);
-                        //   * a BUILT-IN VALUE RECORD (`DateTime`, `TimeSpan`,
-                        //     `DateOnly`, `TimeOnly` — stdlib §2.5 declares
-                        //     `IComparable<Self>` on each) — the result is the
-                        //     record. MEASURED before this fix:
-                        //     `arr.Where(…).Min().Year` was REFUSED ("no member
-                        //     `Year` on primitive type `int`"), where the
-                        //     eager `arr.Min().Year` printed 2023.
-                        //
-                        // The CONCRETE-collection path has always typed the
-                        // element here (#8092 / #8049 / #4731); this is the
-                        // LAZY receiver's twin, and the SAME element-typing
-                        // decisions are reused verbatim so the two arms
-                        // cannot disagree.
-                        //
-                        // The §5.1 CONSTRAINT on the CLASS / INTERFACE family
-                        // is applied with the SAME helper the concrete path
-                        // uses (`classOrIfaceComparableAtInstance`, #8209's
-                        // instantiation-aware check), so a class that does not
-                        // implement `IComparable<T>` AT THIS INSTANTIATION is
-                        // REFUSED with the same diagnostic instead of being
-                        // admitted and then failing in codegen.
-                        if (!noSelectorKeyed && (m == "Min" || m == "Max") &&
-                            ce.args.empty() && srcElem && !srcElem->nullable) {
-                            bool keyed = false;
-                            // A CLASS or INTERFACE element: the §5.1
-                            // constraint decides, exactly as on the concrete
-                            // path.
-                            if (srcElem->kind == TypeRef::Kind::Named &&
-                                srcElem->declaration &&
-                                (srcElem->declaration->kind ==
-                                     ast::TypeDeclKind::Class ||
-                                 srcElem->declaration->kind ==
-                                     ast::TypeDeclKind::Interface)) {
-                                if (!classOrIfaceComparableAtInstance(srcElem)) {
-                                    ctx_.diagnostics().report(
-                                        Severity::Error, ce.span.begin,
-                                        std::string(m) +
-                                        "() without a selector requires the "
-                                        "element type to implement "
-                                        "IComparable<T> (stdlib §2.8 / §5.1 / §14.2 "
-                                        "/ #1198); " +
-                                        std::string(
-                                            srcElem->declaration->name) +
-                                        " does not implement IComparable<T>. "
-                                        "Use " + std::string(m) +
-                                        "(selector: (T) -> U) instead.");
-                                    return;
-                                }
-                                keyed = true;
-                            }
-                            // A `string` element: stdlib §9.6 declares
-                            // `IComparable<string>`, so the constraint holds
-                            // (the concrete path's `ptrComparableElem` arm).
-                            else if (srcElem->kind == TypeRef::Kind::Primitive &&
-                                     srcElem->primitive == P::String)
-                                keyed = true;
-                            // A BUILT-IN VALUE RECORD: stdlib §2.5 declares
-                            // `IComparable<Self>` on each of the four, and the
-                            // stdlib declaration is the authority for them
-                            // (they carry no user TypeDecl, so the symbol
-                            // probe cannot answer for them).
-                            else if (srcElem->kind == TypeRef::Kind::Named &&
-                                     !srcElem->declaration &&
-                                     !mathOrderedTimeValueHead(srcElem).empty())
-                                keyed = true;
-                            if (keyed) {
+                            if (verdict == NoSelCmp::Element) {
                                 ctx_.setExprType(&ce, srcElem);
                                 noSelectorKeyed = true;
                             }
@@ -14222,6 +14237,46 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         else if (ce.args.empty() &&
                                  linqElemIsInScopeTypeParam(srcElem2))
                             noSelTy = srcElem2;
+                        // fix #8242 (stdlib §5.1, spec §14.2, v0.355): the
+                        // NO-SELECTOR form's RESULT TYPE is the ELEMENT type for
+                        // every element §5.1's `where T: IComparable<T>` admits
+                        // — a `string` element (stdlib §9.6's
+                        // `IComparable<string>`), a class / interface element
+                        // (the §5.1 constraint, at the instantiation), a user
+                        // record, a built-in value record (stdlib §2.5's
+                        // `IComparable<Self>`).
+                        //
+                        // MEASURED before this fix: `xs.Min()` over an
+                        // `IEnumerable<string>` PARAMETER was typed `int`, so
+                        // the §5.1 result was rejected ("the returned value has
+                        // a type that is not implicitly convertible to the
+                        // target type (§5.1)") where the CONCRETE and the LAZY
+                        // twin typed the element — the receiver's INTERFACE-ness
+                        // was what broke it.
+                        //
+                        // The decision is the SAME helper the LAZY receiver arm
+                        // reads (`noSelectorComparableElem`), so the two
+                        // receivers cannot drift.
+                        if (!noSelTy && ce.args.empty() && srcElem2) {
+                            const NoSelCmp verdict =
+                                noSelectorComparableElem(srcElem2);
+                            if (verdict == NoSelCmp::Refused) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string(m) +
+                                    "() without a selector requires the "
+                                    "element type to implement "
+                                    "IComparable<T> (stdlib §2.8 / §5.1 / "
+                                    "§14.2 / #1198); " +
+                                    std::string(srcElem2->declaration->name) +
+                                    " does not implement IComparable<T>. "
+                                    "Use " + std::string(m) +
+                                    "(selector: (T) -> U) instead.");
+                                return;
+                            }
+                            if (verdict == NoSelCmp::Element)
+                                noSelTy = srcElem2;
+                        }
                         ctx_.setExprType(
                             &ce, uTy ? uTy
                                      : (noSelTy ? noSelTy
