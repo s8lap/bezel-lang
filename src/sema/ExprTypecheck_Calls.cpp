@@ -13522,9 +13522,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 //     public extension IEnumerable<T> where T: IComparable<T>
                 //       public method Min(): T;  public method Max(): T;
                 // so the result is the ELEMENT type for every T the constraint
-                // admits — a `string` (stdlib §9.6's `IComparable<string>`), a
+                // admits — a `string` (stdlib §2.8's `IComparable<string>`), a
                 // class / interface (the constraint itself), a user record, a
-                // built-in value record (stdlib §2.5's `IComparable<Self>`), and
+                // built-in value record (stdlib §2.5's `DateTime`, which conforms
+                // to stdlib §2.8's `IComparable<DateTime>`), and
                 // the numeric primitives the arm below keys off.
                 //
                 // ONE decision, read by BOTH non-concrete receiver arms — the
