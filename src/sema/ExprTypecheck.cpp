@@ -6438,6 +6438,46 @@ TypeRef* ExprTC::buildMethodRefType(const MethodSymbol* ms) {
     return ft;
 }
 
+// §27.6 (v0.355) *References to generic methods* / §14.5's list rule: the
+// number of type arguments the reference names on the member name.
+//
+//   "Overload selection follows §14.5's list rule: with a list, only
+//    candidates declaring that many type parameters of their own take part;
+//    without one, only candidates declaring none take part, and the error
+//    above is reported where every candidate is generic."
+//
+// The list is the reference's OWN — `Util.Keep<Pair>`, `xs.Select(Util.Id<int>)`
+// — so it rides on the MemberAccessExpr's `typeArgs` (or the bare
+// IdentifierExpr's). Zero means "no list", which is the case the rule reads
+// as "only candidates declaring no type parameters of their own take part".
+static std::size_t methodRefTypeArgCount(const ast::Expr* refExpr) {
+    if (auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(refExpr))
+        return rma->typeArgs.size();
+    if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(refExpr))
+        return rid->typeArgs.size();
+    return 0;
+}
+
+// §27.6 (v0.355) *References to generic methods* / §14.5's list rule, applied
+// to a candidate SET: "with a list, only candidates declaring that many type
+// parameters of their own take part; without one, only candidates declaring
+// none take part, and the error above is reported where every candidate is
+// generic."
+//
+// The rule decides WHICH candidates take part, so it is a filter on the set
+// itself — applied once, on the set every consumer ranks over, so the set
+// cannot drift between the formation site, the target-typed selector and the
+// no-target ambiguity check.
+static void applyMethodRefListRule(std::vector<MethodSymbol*>& out,
+                                   const ast::Expr* refExpr) {
+    const std::size_t listSize = methodRefTypeArgCount(refExpr);
+    out.erase(std::remove_if(out.begin(), out.end(),
+                             [&](const MethodSymbol* ov) {
+                                 return ov->genericParams.size() != listSize;
+                             }),
+              out.end());
+}
+
 // §27.6 (v0.355): the candidate set a method reference's overload selection
 // ranks over.
 //
@@ -6463,6 +6503,10 @@ std::vector<MethodSymbol*> ExprTC::methodRefOverloadCandidates(
     if (!ms) return out;
     if (ms->parent) {
         collectHierarchyOverloads(ms->parent, ms->name, out);
+        // fix #8295 (§27.6 *References to generic methods* / §14.5's list
+        // rule, v0.355): the list rule is a filter on the candidate SET, and
+        // this is the set the selection ranks over.
+        applyMethodRefListRule(out, refExpr);
         return out;
     }
     if (!ms->extensionDecl) return out;
@@ -6531,6 +6575,99 @@ std::vector<MethodSymbol*> ExprTC::methodRefOverloadCandidates(
                 out.push_back(mm);
         }
     }
+    // fix #8295 (§27.6 *References to generic methods* / §14.5's list rule,
+    // v0.355): the list rule is a FILTER on the candidate set — it decides
+    // WHICH candidates take part, and it is read BEFORE the target selects
+    // among the survivors ("with a list, only candidates declaring that many
+    // type parameters of their own take part; without one, only candidates
+    // declaring none take part").
+    //
+    // It is applied HERE, once, on the set every consumer ranks over, so the
+    // set cannot drift between the formation site, the target-typed selector
+    // and the no-target ambiguity check. Before, the filter lived in the two
+    // consumers and not in the set itself: the EXTENSION path had no filter
+    // at all, so a reference with no list over a block whose most specific
+    // member is a GENERIC one (`extension Array<T>` declaring `Len<U>(x: U)`
+    // beside `extension IEnumerable<T>` declaring `Len(): int`) denoted the
+    // generic member — the generic member's own signature became the
+    // reference's type, and the call through it was refused
+    // ("call supplies 0 argument(s) but the function value expects 1").
+    applyMethodRefListRule(out, refExpr);
+    return out;
+}
+
+// (forward declarations — the definitions are further down this file; the
+// free-var binding below reuses the lookup's own two helpers.)
+static const TypeRef* extensionFindMatchingAncestor(
+    const TypeRef* target, const TypeRef* recv,
+    const std::unordered_set<std::string_view>& freeVars,
+    std::vector<std::unique_ptr<TypeRef>>& owned);
+static void collectFreeVarBinding(
+    const TypeRef* target, const TypeRef* matchedAncestor,
+    const std::unordered_set<std::string_view>& freeVars,
+    std::vector<std::pair<std::string, TypeRef*>>& binding);
+
+// The receiver type a receiver-qualified method reference resolves on
+// (§26.5): the type of the qualifier. Null when the qualifier names no
+// value (the type-qualified spelling, §27.6) or carries no type.
+static const TypeRef* methodRefReceiverType(const SemaContext& ctx,
+                                             const ast::Expr* refExpr) {
+    const auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(refExpr);
+    if (!rma || !rma->target) return nullptr;
+    return ctx.exprType(*rma->target);
+}
+
+// §26.4: the free-var binding (T → the receiver's concrete instantiation) of
+// the extension block that DECLARES `m`, for the receiver `recv`.
+//
+// This is the §26.5 lookup's own computation — the block's free type
+// variables, the receiver's matching ancestor, the positional free-var
+// binding — recomputed for the block that declares the member a reference
+// actually denotes. The substitution map is keyed by the BLOCK's own
+// free-var NAMES, so the map the lookup recorded for the block it selected
+// cannot be reused for a member of a different block (the §14.5 list rule's
+// survivor may sit in a less specific block than the winner).
+//
+// `recv` is the receiver-qualified reference's receiver type; null for the
+// type-qualified spelling, whose binding the lookup records from the
+// qualifier's own type arguments.
+static std::vector<std::pair<std::string, TypeRef*>> extensionBlockBinding(
+    const SemaContext& ctx, const MethodSymbol* m, const TypeRef* recv) {
+    std::vector<std::pair<std::string, TypeRef*>> out;
+    if (!m || !m->extensionDecl || !m->extensionDecl->targetType || !recv)
+        return out;
+    const ast::ExtensionDecl* decl = m->extensionDecl;
+    const TypeRef* target = ctx.resolvedType(*decl->targetType);
+    if (!target) return out;
+    // The block's free type variables: the ones its `where` clauses name,
+    // plus the ones its target type introduces implicitly (§26.4: "each bare
+    // single-segment non-nullable identifier introduces a fresh block-level
+    // type parameter — always").
+    std::unordered_set<std::string_view> freeVars;
+    for (const auto& gc : decl->genericConstraints)
+        freeVars.insert(gc.typeParam);
+    std::function<void(const TypeRef*)> scanFreeVars =
+        [&](const TypeRef* tr) {
+            if (!tr) return;
+            if (tr->kind == TypeRef::Kind::Named && !tr->declaration) {
+                std::string_view vname;
+                if (tr->astNode && tr->astNode->name &&
+                    !tr->astNode->name->parts.empty())
+                    vname = tr->astNode->name->parts.back();
+                else if (!tr->importedName.empty())
+                    vname = tr->importedName;
+                if (!vname.empty() && tr->genericArgs.empty())
+                    freeVars.insert(vname);
+            }
+            for (const TypeRef* ga : tr->genericArgs) scanFreeVars(ga);
+        };
+    scanFreeVars(target);
+    if (freeVars.empty()) return out;
+    std::vector<std::unique_ptr<TypeRef>> ownedAncs;
+    const TypeRef* matchedAnc =
+        extensionFindMatchingAncestor(target, recv, freeVars, ownedAncs);
+    if (!matchedAnc) return out;
+    collectFreeVarBinding(target, matchedAnc, freeVars, out);
     return out;
 }
 
@@ -6557,6 +6694,60 @@ TypeRef* ExprTC::buildExtensionRefType(const MethodSymbol* ms,
                                         const ast::Expr* refExpr,
                                         bool substitute) {
     if (!ms) return nullptr;
+    // fix #8295 (§27.6 *References to generic methods* / §14.5's list rule,
+    // v0.355): the reference's OWN candidate set is
+    // `methodRefOverloadCandidates`'s — the same-name members of every
+    // applicable extension block — and §14.5's list rule decides which of
+    // them take part: "without one, only candidates declaring none take
+    // part".
+    //
+    // A reference with NO list therefore does not denote a generic member at
+    // all. Where the list rule leaves exactly ONE candidate, that candidate
+    // IS the reference's method — the same reading the class-member path
+    // gives (`applyMethodRefTypeArgs`, §27.6 / §14.5, v0.338: "where the
+    // first-declared member is generic, a UNIQUE non-generic candidate is
+    // the reference's method, exactly as the list branch below takes a
+    // unique fit").
+    //
+    // Before: the EXTENSION path had no list rule at all. The lookup picked
+    // the block by §26.5.1's specificity and the member within it by
+    // declaration order, so `a.Len` over `extension Array<T>` declaring
+    // `Len<U>(x: U)` beside `extension IEnumerable<T>` declaring `Len(): int`
+    // denoted the GENERIC member, and the generic member's own signature
+    // (`(U) -> int`) became the reference's type — a call through it was
+    // refused ("call supplies 0 argument(s) but the function value expects
+    // 1", §5.1).
+    //
+    // The BINDING moves with the type: the expression's symbol and the
+    // selected-overload side table are re-pointed at the surviving member,
+    // so codegen's thunk emission dispatches that member's body and not the
+    // generic one's. The §26.4 free-var binding moves with it too — the
+    // substitution map is keyed by the BLOCK's own free-var names, so the
+    // lookup winner's map cannot be reused for a member of another block.
+    const MethodSymbol* bound = ms;
+    if (substitute && !ms->genericParams.empty() &&
+        methodRefTypeArgCount(refExpr) == 0) {
+        std::vector<MethodSymbol*> cands =
+            methodRefOverloadCandidates(ms, refExpr);
+        if (cands.size() == 1) {
+            bound = cands[0];
+            if (refExpr) {
+                const auto* rma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(refExpr);
+                const TypeRef* recv =
+                    (rma && rma->target) ? ctx_.exprType(*rma->target) : nullptr;
+                std::vector<std::pair<std::string, TypeRef*>> bnd =
+                    extensionBlockBinding(ctx_, bound, recv);
+                if (!bnd.empty()) ctx_.setExprExtBinding(refExpr, bnd);
+            }
+        }
+    }
+    if (bound != ms && refExpr) {
+        auto* boundSym = const_cast<MethodSymbol*>(bound);
+        ctx_.setExprSymbol(refExpr, boundSym);
+        ctx_.setMethodRefSelectedOverload(refExpr, boundSym);
+    }
+    ms = bound;
     auto* ft = ctx_.makeTypeRef();
     ft->kind = TypeRef::Kind::Function;
     // The free-var binding the formation recorded (§26.4).
@@ -6758,8 +6949,6 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
     std::vector<std::size_t> tiedArities;
     std::vector<MethodSymbol*> overloads =
         methodRefOverloadCandidates(ms, fromExpr, &tiedArities);
-    if (overloads.size() < 2)
-        return MethodRefOverloadResult::SingleOverload;
 
     // fix #8205 (§27.6 / §26.5 rule 4, v0.355): the receiver-qualified
     // reference is "the member resolved on the value exactly as the call
@@ -6771,24 +6960,41 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
     // blocks were chosen by declaration order (swapping them swapped the
     // program's output). The winner is still returned (error recovery), so
     // the §5.1 check adds no second diagnostic.
-    auto reportTieIfSelected = [&](const MethodSymbol* winner) {
-        if (!winner || !winner->extensionDecl) return;
-        const std::size_t n = winner->params.size();
-        if (std::find(tiedArities.begin(), tiedArities.end(), n) ==
-            tiedArities.end())
-            return;
-        const auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(fromExpr);
-        if (!rma || !rma->target) return;
+    //
+    // fix #8294 (§26.5 rule 4 / §26.5.1 / §27.6, v0.355): the tie is read
+    // AT THE ARITY THE TARGET SELECTS, not on the member NAME. The rule-4
+    // tie is a per-arity fact (§26.5.1 ranks the APPLICABLE candidates, and
+    // an extension member matches a call's arity), so a tie at an arity the
+    // target does NOT select is not a tie that matters. The tie is therefore
+    // reported for the SELECTED arity — here, and (for a reference with no
+    // target at all) at `reportUncalledOverloadedMethodRef`'s no-target rule.
+    //
+    // Before: the tie was reported by the lookup itself, before the target
+    // was known, so a tie at an arity the target does not select was
+    // reported as a tie and the reference was refused.
+    const std::size_t arity = target->funcParams.size();
+    auto reportTieAtSelectedArity = [&](std::size_t n) {
+        if (!ms->extensionDecl) return;
+        const TypeRef* recv = methodRefReceiverType(ctx_, fromExpr);
+        if (!recv) return;
+        // Is the rule-4 tie REAL at this arity? The lookup answers that
+        // question on its own — §26.5.1 ranks "the APPLICABLE candidates",
+        // and an extension member "matches the call's arity" — so the tie is
+        // ASKED for at the arity, not inferred from the member name.
+        bool tie = false;
+        lookupExtensionMember(recv, ms->name, nullptr, SourceLocation{}, false,
+                              static_cast<std::ptrdiff_t>(n), &tie);
+        if (!tie) return;
         if (methodRefAmbiguityAlreadyReported(fromExpr)) return;
         const std::size_t idx = ctx_.diagnostics().diagnostics().size();
-        lookupExtensionMember(ctx_.exprType(*rma->target), ms->name, nullptr,
-                              fromExpr->span.begin, true,
-                              static_cast<std::ptrdiff_t>(n));
+        lookupExtensionMember(recv, ms->name, nullptr, fromExpr->span.begin,
+                              true, static_cast<std::ptrdiff_t>(n));
         if (ctx_.diagnostics().diagnostics().size() > idx)
             recordMethodRefAmbiguity(fromExpr, idx);
     };
-
-    const std::size_t arity = target->funcParams.size();
+    reportTieAtSelectedArity(arity);
+    if (overloads.size() < 2)
+        return MethodRefOverloadResult::SingleOverload;
 
     // First pass: filter by arity + modifier slots, build each survivor's
     // Function TypeRef, and classify as exact / converting / no-fit. Among
@@ -6903,7 +7109,9 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
         // declared overload from `lookupMember`). See
         // `setMethodRefSelectedOverload`.
         ctx_.setMethodRefSelectedOverload(fromExpr, exactWinnerMs);
-        reportTieIfSelected(exactWinnerMs);
+        // fix #8294: the tie at the SELECTED arity was already reported (the
+        // one-report-per-reference discipline) — the winner's arity IS the
+        // target's arity, so the arity-driven report above covers it.
         return MethodRefOverloadResult::Unique;
     }
     if (convertingWinners.size() == 1) {
@@ -6913,7 +7121,6 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
         // MethodSymbol — every `Unique` return is a §27.6 selection
         // that codegen must honor.
         ctx_.setMethodRefSelectedOverload(fromExpr, convertingWinnerMs[0]);
-        reportTieIfSelected(convertingWinnerMs[0]);
         return MethodRefOverloadResult::Unique;
     }
     if (convertingWinners.size() > 1) {
@@ -6981,35 +7188,83 @@ bool ExprTC::reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
     // candidate set is the block's same-name members.
     if (!ms->parent && !ms->extensionDecl) return false;
 
-    std::vector<MethodSymbol*> overloads = methodRefOverloadCandidates(ms, initExpr);
-    // fix #8205 (§27.6 / §14.5, v0.355): the list rule decides which
-    // candidates take part BEFORE ambiguity is judged — "with a list, only
-    // candidates declaring that many type parameters of their own take part
-    // ...; without one, only candidates declaring none take part" (the same
-    // filter `selectMethodRefOverload` applies). So `v.Len` over `Len(): int`
-    // and `Len<T>(x: T): int` has ONE candidate and is not ambiguous. Before:
+    // fix #8295 (§27.6 / §14.5, v0.355): the list rule is now a FILTER on the
+    // candidate set itself (`methodRefOverloadCandidates`), so it is applied
+    // once, there — "with a list, only candidates declaring that many type
+    // parameters of their own take part; without one, only candidates
+    // declaring none take part". So `v.Len` over `Len(): int` and
+    // `Len<T>(x: T): int` has ONE candidate and is not ambiguous. Before:
     // the generic overload was counted, and `var f := v.Len;` /
     // `Console.WriteLine(v.Len)` were refused as having no target to select
     // by. Where every candidate is generic the set is empty and the
     // generic-reference-without-a-list error reports instead.
-    {
-        std::size_t listSize = 0;
-        if (auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(initExpr))
-            listSize = rma->typeArgs.size();
-        else if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(initExpr))
-            listSize = rid->typeArgs.size();
-        overloads.erase(
-            std::remove_if(overloads.begin(), overloads.end(),
-                           [&](const MethodSymbol* ov) {
-                               return ov->genericParams.size() != listSize;
-                           }),
-            overloads.end());
-    }
-    if (overloads.size() < 2) return false;
+    std::vector<std::size_t> tiedArities;
+    std::vector<MethodSymbol*> overloads =
+        methodRefOverloadCandidates(ms, initExpr, &tiedArities);
+
     // fix #8205 (§27.6, v0.355): one report per reference — a reference can
     // reach this rule from two checks (a call's special-cased `Object`
     // argument and the ordinary §5.1 one).
     if (methodRefAmbiguityAlreadyReported(initExpr)) return true;
+
+    if (overloads.size() < 2) {
+        // fix #8294 (§26.5 rule 4 / §26.5.1 / §27.6, v0.355): the §27.6
+        // no-target rule cannot fire (the candidate set holds fewer than two
+        // members), but the extension BLOCKS may still TIE — §26.5 rule 4's
+        // "two or more equally specific applicable blocks are a compile
+        // error". The tie is a PER-ARITY fact (§26.5.1 ranks "the APPLICABLE
+        // candidates", and an extension member "matches the call's arity"),
+        // and a reference with NO target selects no arity — so a tie at ANY
+        // arity it could select is a tie that matters here.
+        //
+        // The tie is ASKED for at each arity, not inferred from the member
+        // NAME: the lookup answers "is this arity a tie?" on its own (§26.5.1
+        // over the arity-filtered candidate set), and the deferred report is
+        // re-asked for in the lookup's own wording.
+        //
+        // Before: the lookup reported the tie at the BARE-reference arity
+        // (-1), where the per-block scan picks each block's FIRST same-name
+        // member regardless of arity — so a tie between blocks whose members
+        // have DIFFERENT arities was reported as a tie, and a tie at an arity
+        // the target does not select was reported too.
+        const TypeRef* recv = methodRefReceiverType(ctx_, initExpr);
+        if (recv) {
+            std::vector<std::size_t> arities;
+            for (MethodSymbol* ov : overloads) {
+                const std::size_t a = ov->params.size();
+                if (std::find(arities.begin(), arities.end(), a) ==
+                    arities.end())
+                    arities.push_back(a);
+            }
+            for (std::size_t a : tiedArities) {
+                if (std::find(arities.begin(), arities.end(), a) ==
+                    arities.end())
+                    arities.push_back(a);
+            }
+            for (std::size_t a : arities) {
+                bool tie = false;
+                lookupExtensionMember(recv, ms->name, nullptr, SourceLocation{},
+                                      false, static_cast<std::ptrdiff_t>(a),
+                                      &tie);
+                if (!tie) continue;
+                if (methodRefAmbiguityAlreadyReported(initExpr)) return true;
+                SourceLocation tieLoc = loc;
+                if (tieLoc.line == 0) {
+                    const auto* rma =
+                        dynamic_cast<const ast::MemberAccessExpr*>(initExpr);
+                    if (rma && rma->target) tieLoc = rma->target->span.begin;
+                }
+                const std::size_t idx = ctx_.diagnostics().diagnostics().size();
+                lookupExtensionMember(recv, ms->name, nullptr, tieLoc, true,
+                                      static_cast<std::ptrdiff_t>(a));
+                if (ctx_.diagnostics().diagnostics().size() > idx) {
+                    recordMethodRefAmbiguity(initExpr, idx);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 
     // Build the candidates' signatures for the diagnostic.
     std::string sigs;
@@ -9224,6 +9479,14 @@ void ExprTC::checkAssignable(
                     selFrom = chosen;
                     break;
                 case MethodRefOverloadResult::Ambiguous: {
+                    // fix #8294 (§26.5 rule 4 / §26.5.1 / §27.6, v0.355): the
+                    // rule-4 tie at the SELECTED arity was already reported by
+                    // `selectMethodRefOverload` (the "ambiguous extension
+                    // member" wording, the lookup's own). One report per
+                    // reference — the §27.6 ambiguity is reported only where
+                    // the reference has a single target and the target does
+                    // not settle it.
+                    if (methodRefAmbiguityAlreadyReported(fromExpr)) return;
                     // §27.6: report the candidates (the spec calls this
                     // out explicitly — "the compiler reports the
                     // candidates"). Mirror the §22.6 ambiguous-call
@@ -16821,6 +17084,56 @@ Symbol* ExprTC::lookupExtensionMember(
         }
         if (!dominated) maximal.push_back(i);
     }
+    // fix #8294 (§26.5 rule 4 / §26.5.1 / §27.6, v0.355): the rule-4 tie is
+    // a PER-ARITY fact — §26.5.1 ranks "the APPLICABLE candidates", and an
+    // extension member "matches the call's arity" — and the BARE-REFERENCE
+    // lookup (`arity < 0`) does not know which arity the reference will
+    // select: §27.6 resolves the reference "using the target function type
+    // at the use site".
+    //
+    // So the report here is DEFERRED when the tied blocks COMPETE at some
+    // arity — the arity-asked report then fires there (at the target's arity
+    // for a reference that has one, at the no-target rule otherwise), and a
+    // tie at an arity the target does NOT select is not a tie that matters.
+    //
+    // The tied blocks compete at an arity when they declare a same-named
+    // member of that arity — the intersection of their arities. When the
+    // intersection is EMPTY the tied blocks never compete at the same arity:
+    // no arity-asked report can ever fire, so the ambiguity is reported HERE,
+    // at the bare-reference arity, exactly as before.
+    bool deferTieReport = false;
+    if (arity < 0 && maximal.size() >= 2) {
+        // The arities a candidate's BLOCK declares under this name. The
+        // stdlib §5 candidate is compiler-known and carries no source-level
+        // block, so its arity is read off the member symbol it mirrors.
+        auto blockArities = [&](const ExtCandidate& c) {
+            std::vector<std::size_t> as;
+            if (c.ext) {
+                for (Symbol* m : c.ext->members) {
+                    auto* mm = dynamic_cast<MethodSymbol*>(m);
+                    if (!mm || mm->name != name) continue;
+                    if (std::find(as.begin(), as.end(), mm->params.size()) ==
+                        as.end())
+                        as.push_back(mm->params.size());
+                }
+            } else if (auto* mm =
+                           dynamic_cast<MethodSymbol*>(c.member)) {
+                as.push_back(mm->params.size());
+            }
+            return as;
+        };
+        std::vector<std::size_t> common = blockArities(found[maximal[0]]);
+        for (std::size_t i = 1; i < maximal.size() && !common.empty(); ++i) {
+            const std::vector<std::size_t> other =
+                blockArities(found[maximal[i]]);
+            std::vector<std::size_t> next;
+            for (std::size_t a : common)
+                if (std::find(other.begin(), other.end(), a) != other.end())
+                    next.push_back(a);
+            common = next;
+        }
+        deferTieReport = !common.empty();
+    }
     if (maximal.size() == 1) {
         const ExtCandidate& winner = found[maximal[0]];
         // fix #7775 (§26.5 rule 3, §26.5.1, v0.350): the auto-imported stdlib
@@ -16839,7 +17152,28 @@ Symbol* ExprTC::lookupExtensionMember(
     // compile error naming each one by "its defining module, its declared
     // head including any where clause, and its declaration site" (spec's own
     // wording, since extension blocks are nameless).
-    if (reportAmbiguity) {
+    //
+    // fix #8294 (§26.5 rule 4 / §26.5.1 / §27.6, v0.355): the rule-4 tie is
+    // a PER-ARITY fact — §26.5.1 ranks "the APPLICABLE candidates", and an
+    // extension member "matches the call's arity" (§26.5.1). A BARE METHOD
+    // REFERENCE (`v.Len`, `arity < 0` — the lookup is not in a call context)
+    // has no arity here, and its arity is chosen LATER, by the target
+    // function type at the use site (§27.6: "the reference is resolved using
+    // the target function type at the use site"). Reporting the tie here
+    // therefore read it off the member NAME, before the target had selected
+    // — and a tie at an arity the target does NOT select was reported as a
+    // tie.
+    //
+    // So the bare-reference case DEFERS the report when the tied blocks
+    // compete at some arity (`deferTieReport`, computed above): the tie is
+    // read at the arity the target selects (`selectMethodRefOverload`'s
+    // `reportTieAtSelectedArity`), and a reference with no target at all
+    // reports it at the no-target rule (`reportUncalledOverloadedMethodRef`).
+    // When the tied blocks never compete at the same arity the report stays
+    // here — no arity-asked report could ever fire, and the ambiguity would
+    // go unreported. The CALL spelling keeps the report here — a call's
+    // arity is known.
+    if (reportAmbiguity && !deferTieReport) {
         std::string msg = "ambiguous extension member `" + std::string(name) +
             "`: " + std::to_string(maximal.size()) +
             " extensions are equally specific for this receiver — neither is "
