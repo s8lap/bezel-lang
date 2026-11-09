@@ -3166,9 +3166,55 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     // (ToDictionary, the one site that passes this out-param) opts out; with it,
     // the out-param below is null and the runtime reclaims instead.
     if (outRecvArr && !srcIsUnboundOwnedTemp) *outRecvArr = recv;
-    return ownWrappedSource(
-        builder_.CreateCall(wrapFn, {recv, builder_.getInt64(esz)}, "lazy.src"),
-        recv);
+    llvm::Value* lazy =
+        builder_.CreateCall(wrapFn, {recv, builder_.getInt64(esz)}, "lazy.src");
+    // fix #8370 (stdlib §4.11 / §5, v0.355): the STACK family's lazy source
+    // must be built in TAKE order.
+    //
+    // stdlib §4.11 "Iteration order" (v0.355, line 2489):
+    //   "All four types iterate (via `IReadOnlyCollection<T>`) in take order —
+    //    a stack top-to-bottom (pop order), a queue front-to-back (dequeue
+    //    order); the owning forms iterate identically, yielding borrows."
+    //
+    // THE DEFECT.  `bz_lazy_from_array` walks the backing `bz_array_t*` FORWARD
+    // (index 0 → n-1) and a stack's backing array runs BOTTOM-to-TOP (index 0
+    // is the bottom — the index `Pop()` itself reads), so the lazy source
+    // enumerated a stack in PUSH order while the `for ... in` over the very
+    // same value enumerated it in TAKE order.  Every §5 lazy operator
+    // (`Where` / `Select` / `Take` / `Skip` / …) consumes whatever this source
+    // produced, so the WHOLE lazy surface — and every terminal over it — was
+    // silently wrong.  MEASURED on the base (r30-c1 @ 1926ccf7), a `Stack<int>`
+    // with 10, 20, 30 pushed printed `30 20 10` for the for-in and `20 30` for
+    // `s.Where(x => x > 15).ToArray()` (stdlib §4.11 requires `30 20`).
+    //
+    // THE FIX.  The source is the stack's array read BACKWARDS, i.e. the same
+    // order the house's own take-order reads use (the for-in desugaring's
+    // `CreateSub(len, 1)` reversal and `wrapStackAsIEnumerator`'s
+    // before-the-top enumerator).  The runtime has no "reverse array" lazy
+    // kind and the runtime file is another lane's, so the reversal reuses the
+    // ONE existing entry point that reads a sequence backwards:
+    // `bz_lazy_reverse`, whose documented contract is exactly this (§5
+    // Ordering: "materialize the upstream sequence, then yield elements
+    // backwards").  It snapshots the upstream into its own array and yields it
+    // from the end, so the stack's take order (top first) is what the
+    // pipeline sees.  The snapshot is a BYTE copy of the element slots
+    // (borrowed elements, freed with a null disposer at dispose), so it
+    // neither owns nor releases an element.
+    //
+    // ONLY THE STACK FAMILY IS AFFECTED.  A `Queue<T>`'s take order IS its
+    // storage order (front first) and an `Array<T>` states no take-order
+    // contract distinct from its element order, so both keep the forward
+    // source.  The `Reverse()` OPERATOR over a stack now reverses the stack's
+    // take order (stdlib §5's `Reverse()` reverses the receiver's ITERATION
+    // order) — it is applied to the same take-order source, so it stays
+    // consistent with the queue's `Reverse()` (which reverses its own
+    // front-to-back order).
+    if (recvTy && (recvTy->headName() == "Stack" ||
+                   recvTy->headName() == "OwningStack")) {
+        auto* revFn = declareC("bz_lazy_reverse", ptrTy(), {ptrTy()});
+        lazy = builder_.CreateCall(revFn, {lazy}, "lazy.src.take");
+    }
+    return ownWrappedSource(lazy, recv);
 }
 
 llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
@@ -3525,6 +3571,256 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                 emitGuardThrow(absent, m == "ElementAt"
                     ? "IndexOutOfRangeException" : "InvalidOperationException");
                 result = readElem();
+            }
+            // §28.3's unbound-owned-temporary reclaim — the eager-terminal
+            // twin of the array path's `freeFreshInputTemp`: a receiver that
+            // is a FRESH owned value no name holds is reclaimed at the end of
+            // the full expression, and this terminal is that boundary.  The
+            // §28.11 string-element escape rule DECLINES the reclaim when the
+            // element is a `string` (a shared-reference slot; the result
+            // borrows it, so releasing the collection would dangle it).
+            const bool elemIsString =
+                elemRef && !elemRef->nullable &&
+                elemRef->kind == sema::TypeRef::Kind::Primitive &&
+                elemRef->primitive == sema::PrimitiveType::String;
+            if (!elemIsString)
+                freeUnboundOwnedBorrowingArrayTemp(ma->target.get(),
+                                                   stackArr, recvTy);
+            return result;
+        }
+    }
+
+    // fix #8369 (stdlib §4.11 / §5, v0.355): the §5 PREDICATE element
+    // terminals over a CONCRETE `Stack<T>` / `OwningStack<T>` must answer in
+    // the receiver's TAKE order — the order the `for ... in` over the very
+    // same value visits it.
+    //
+    // stdlib §4.11 "Iteration order" (v0.355, line 2489):
+    //   "All four types iterate (via `IReadOnlyCollection<T>`) in take order —
+    //    a stack top-to-bottom (pop order), a queue front-to-back (dequeue
+    //    order); the owning forms iterate identically, yielding borrows."
+    // stdlib §5 (v0.355, line 3760) defines the predicate overloads as
+    //   "equivalent to the corresponding no-argument method applied after
+    //    `Where(pred)` — `xs.First(pred)` is `xs.Where(pred).First()`",
+    // and `First` / `Last` are defined over the receiver's ITERATION order.
+    // ⇒ over a stack, `First(pred)` is the first match in TAKE order (the
+    // TOP first) and `Last(pred)` the last one (the BOTTOM-most match).
+    //
+    // THE DEFECT.  The predicate arms are lowered by the ordinary
+    // array-receiver path (`tryLowerCollectionInstanceCall`,
+    // LlvmBackend_Calls.cpp), which scans `bz_array_ptr_at(recv, idx, esz)`
+    // FORWARD from index 0 — the BOTTOM of a stack — and keeps the first
+    // (resp. last) match.  So `First(pred)` answered with the BOTTOM-most
+    // match and `Last(pred)` with the TOP-most one: exactly the OPPOSITE of
+    // the no-argument siblings, which #8276 already moved to take order, and
+    // of the iteration of the same value.  MEASURED on the base (r30-c1 @
+    // 1926ccf7), a `Stack<int>` with 10, 20, 30 pushed answered `20` for
+    // `s.First(x => x > 15)` and `30` for `s.Last(x => x > 15)`; stdlib §4.11
+    // requires `30` and `20`.
+    //
+    // WHERE THIS FIX LIVES.  The predicate arms themselves live in
+    // `LlvmBackend_Calls.cpp` — another lane's file — so the fix lands HERE,
+    // in the §5 dispatch that runs FIRST (`lowerCallDispatch` tries
+    // `tryLowerLazyLinqCall` before `tryLowerCollectionInstanceCall`),
+    // intercepting the PREDICATE tier for the stack family only, next to
+    // #8276's element-access tier.
+    //
+    // ONLY THE ORDER CHANGES.  The element type, the
+    // `InvalidOperationException` on no match, the nullable shape of the
+    // `*OrNull` siblings, the §28.11 string-element escape rule and the
+    // §28.3 unbound-owned-temporary reclaim are the SAME rules the array
+    // receiver applies, so the two orderings cannot drift.
+    if (recvTy && (recvTy->headName() == "Stack" ||
+                   recvTy->headName() == "OwningStack")) {
+        // stdlib §5's predicate overloads of the element terminals:
+        // `First(pred)` / `Last(pred)` / `FirstOrNull(pred)` /
+        // `LastOrNull(pred)`.  The no-argument and index forms are #8276's
+        // tier above; `Single(pred)` / `SingleOrNull(pred)` are NOT here —
+        // they are order-INDEPENDENT (they answer the SOLE match, or count
+        // the matches), so their order was never wrong.
+        const bool predTerminal =
+            call.args.size() == 1 && call.args[0].value &&
+            (m == "First" || m == "Last" || m == "FirstOrNull" ||
+             m == "LastOrNull");
+        // The element type of the receiver (stdlib §4.11's `Stack<T>`).
+        sema::TypeRef* elemRef =
+            recvTy->genericArgs.empty() ? nullptr : recvTy->genericArgs[0];
+        llvm::Type* elemTy = elemRef ? lowerTypeRef(elemRef) : nullptr;
+        if (predTerminal && elemRef && elemTy) {
+            // The receiver's value — the stack's `bz_array_t*` backing.
+            llvm::Value* stackArr = lowerExpr(*ma->target);
+            if (!stackArr || !stackArr->getType()->isPointerTy())
+                return nullptr;
+            // §28.2's checked-disposal backstop — the SAME guard the
+            // array-receiver path emits before it reads a collection
+            // (LlvmBackend_Calls.cpp's `isArr` block): a disposed
+            // collection's data buffer is already freed, so the element read
+            // below would be a use-after-free.  The guard reads the STACK's
+            // own header, not a copy of it.
+            if (checkedDisposal_) {
+                llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                auto* isFn =
+                    declareC("bz_array_is_disposed", i8Ty, {ptrTy()});
+                llvm::Value* flag =
+                    builder_.CreateCall(isFn, {stackArr}, "cd.arrdis");
+                llvm::Value* disposed = builder_.CreateICmpNE(
+                    flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+                emitGuardThrow(disposed, "DisposedAccessException");
+            }
+            const int64_t esz = collectionElemSize(recvTy);
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len =
+                builder_.CreateCall(lenFn, {stackArr}, "stk.len");
+            // THE PREDICATE CLOSURE.  stdlib §5's predicate overloads take a
+            // `(T) -> bool` callback; the closure is lowered with the
+            // RECEIVER'S element type, so an unannotated lambda parameter
+            // gets the right LLVM type (the same shape the array receiver's
+            // eager predicate arms lower — `expectedFunctionType_`).
+            auto* predFuncRef = ctx_.makeTypeRef();
+            predFuncRef->kind = sema::TypeRef::Kind::Function;
+            predFuncRef->funcReturn =
+                ctx_.primitiveTypeRef(sema::PrimitiveType::Bool);
+            {
+                sema::TypeRef::FuncParam fp;
+                fp.type = elemRef;
+                predFuncRef->funcParams.push_back(std::move(fp));
+            }
+            const sema::TypeRef* savedExpected = expectedFunctionType_;
+            expectedFunctionType_ = predFuncRef;
+            llvm::Value* closure = lowerExpr(*call.args[0].value);
+            expectedFunctionType_ = savedExpected;
+            if (!closure) return nullptr;
+            // The closure call: the closure cell is `{ fnPtr, envPtr }` and
+            // the callback is invoked as `fn(env, element)` — the same shape
+            // the array receiver's eager predicate arms use.
+            auto callPredicate = [&](llvm::Value* el) -> llvm::Value* {
+                llvm::Value* fnPtr =
+                    builder_.CreateLoad(ptrTy(), closure, "cl.fn");
+                llvm::Value* envSlot = builder_.CreateGEP(
+                    ptrTy(), closure, {builder_.getInt32(1)});
+                llvm::Value* envPtr =
+                    builder_.CreateLoad(ptrTy(), envSlot, "cl.env");
+                auto* fnTy = llvm::FunctionType::get(
+                    i1(), {ptrTy(), el->getType()}, false);
+                return builder_.CreateCall(fnTy, fnPtr, {envPtr, el}, "cl.ret");
+            };
+            // THE SCAN — in TAKE order.  The backing array runs bottom-to-top,
+            // so the take-order position `t` is the storage index
+            // `Count - 1 - t`: the scan starts at the TOP (index Count-1) and
+            // steps DOWN to the BOTTOM (index 0).  `First(pred)` is the FIRST
+            // match in that order (the scan stops at it); `Last(pred)` is the
+            // LAST match in that order (the scan continues, so the
+            // bottom-most match survives).
+            const bool isFirstForm = (m == "First" || m == "FirstOrNull");
+            auto* resultSlot = entryAlloca(elemTy);
+            auto* foundSlot = entryAlloca(i1());
+            builder_.CreateStore(builder_.getFalse(), foundSlot);
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(
+                builder_.CreateSub(len, builder_.getInt64(1)), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "stkpd.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "stkpd.b", currentFn_);
+            auto* foundBB = llvm::BasicBlock::Create(llvm_, "stkpd.f", currentFn_);
+            auto* nextBB = llvm::BasicBlock::Create(llvm_, "stkpd.n", currentFn_);
+            auto* endBB = llvm::BasicBlock::Create(llvm_, "stkpd.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(
+                builder_.CreateICmpSGE(idx, builder_.getInt64(0)),
+                bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            auto* ptrFn =
+                declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* ep = builder_.CreateCall(
+                ptrFn, {stackArr, idx, builder_.getInt64(esz)});
+            llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+            llvm::Value* ok = callPredicate(el);
+            builder_.CreateCondBr(ok, foundBB, nextBB);
+            builder_.SetInsertPoint(foundBB);
+            builder_.CreateStore(el, resultSlot);
+            builder_.CreateStore(builder_.getTrue(), foundSlot);
+            if (isFirstForm)
+                builder_.CreateBr(endBB);      // the first match in take order
+            else
+                builder_.CreateBr(nextBB);     // keep scanning — the last match
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(
+                builder_.CreateSub(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            // §28.9 / §28.3: an INLINE predicate closure (a lambda literal, or
+            // a bare primitive-intrinsic method reference) is a +1 transient
+            // this eager terminal consumes and must release; a closure
+            // arriving through a variable/field is a BORROW and is left
+            // alone.  The SAME rule the array receiver's eager predicate arms
+            // apply.
+            const bool predIsInline =
+                dynamic_cast<const ast::LambdaExpr*>(
+                    call.args[0].value.get()) != nullptr ||
+                isPrimIntrinsicMethodRef(call.args[0].value.get());
+            if (predIsInline) emitClosureRelease(closure);
+            llvm::Value* found = builder_.CreateLoad(i1(), foundSlot);
+            llvm::Value* result = nullptr;
+            if (m == "FirstOrNull" || m == "LastOrNull") {
+                // stdlib §5 (line 3758): "the `*OrNull` variants return
+                // `null` instead" of the fault.  The result SHAPE is the
+                // array receiver's: a VALUE element type yields the tagged
+                // `{i8 hasValue; T value}` struct; a class or `string`
+                // element yields a nullable POINTER (null = absent).
+                sema::TypeRef nullRT;
+                if (elemRef) { nullRT = *elemRef; nullRT.nullable = true; }
+                const bool isValTy = isNullableValueTy(&nullRT);
+                auto* loadBB = llvm::BasicBlock::Create(
+                    llvm_, "stkpd.on.load", currentFn_);
+                auto* nullBB = llvm::BasicBlock::Create(
+                    llvm_, "stkpd.on.null", currentFn_);
+                auto* mergeBB = llvm::BasicBlock::Create(
+                    llvm_, "stkpd.on.end", currentFn_);
+                builder_.CreateCondBr(found, loadBB, nullBB);
+                builder_.SetInsertPoint(loadBB);
+                llvm::Value* loaded =
+                    builder_.CreateLoad(elemTy, resultSlot, "stkpd.r");
+                builder_.CreateBr(mergeBB);
+                builder_.SetInsertPoint(nullBB);
+                builder_.CreateBr(mergeBB);
+                builder_.SetInsertPoint(mergeBB);
+                // The PHI nodes must be the FIRST instructions of the merge
+                // block (LLVM's invariant).
+                if (isValTy) {
+                    auto* nst = nullableValueStructTy(&nullRT);
+                    auto* valPhi =
+                        builder_.CreatePHI(elemTy, 2, "stkpd.on.val");
+                    valPhi->addIncoming(loaded, loadBB);
+                    valPhi->addIncoming(
+                        llvm::Constant::getNullValue(elemTy), nullBB);
+                    auto* hvPhi = builder_.CreatePHI(
+                        nullablePrimHasValTy(), 2, "stkpd.on.hv");
+                    hvPhi->addIncoming(
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                        loadBB);
+                    hvPhi->addIncoming(
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 0),
+                        nullBB);
+                    llvm::Value* res = builder_.CreateInsertValue(
+                        llvm::UndefValue::get(nst), hvPhi, {0u});
+                    result = builder_.CreateInsertValue(res, valPhi, {1u});
+                } else {
+                    auto* ptrPhi =
+                        builder_.CreatePHI(elemTy, 2, "stkpd.on.ptr");
+                    ptrPhi->addIncoming(loaded, loadBB);
+                    ptrPhi->addIncoming(
+                        llvm::Constant::getNullValue(elemTy), nullBB);
+                    result = ptrPhi;
+                }
+            } else {
+                // stdlib §5 (line 3760): "`First(pred)`/`Last(pred)` …
+                // throw `InvalidOperationException` when no element matches".
+                // The fault is emitted AFTER the scan, so the match (or the
+                // absence of one) is known.
+                llvm::Value* notFound = builder_.CreateNot(found);
+                emitGuardThrow(notFound, "InvalidOperationException");
+                result = builder_.CreateLoad(elemTy, resultSlot, "stkpd.r");
             }
             // §28.3's unbound-owned-temporary reclaim — the eager-terminal
             // twin of the array path's `freeFreshInputTemp`: a receiver that
