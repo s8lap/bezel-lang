@@ -7996,13 +7996,128 @@ void Emitter::disposeDisplacedOwnedClassLocal(const ast::Expr* target,
     if (!loc) return;  // a parameter (borrow or owned) — excluded
     auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
     if (!ld) return;  // not a plain `var` local
+    // fix #7882 (§28.7 / §30.5, v0.355): the drop-on-overwrite of an owned
+    // TASK-FAMILY local. §28.7 is type-agnostic — "Assignment to an owned
+    // field or owned local disposes the displaced value" — but a Task is
+    // disposed through `bz_task_free` / the fire-and-forget protocol, NOT
+    // through the class vtable, so `unwindOwnedLocalClass` declines it
+    // ("stdlib §6.7 / §30.5: Task / Task<T> — disposed via bz_task_free, not
+    // class vtable dispatch. Exclude from the owned-class unwind path") and
+    // the class helper below never ran for it: `var t := W(); t := W();`
+    // leaked the displaced frame (MEASURED: LSan, 100 iterations, 18216 B in
+    // 99 allocations + 184 B in 1 + 704 B in 3 on the base).
+    //
+    // The gate is `taskLocalOwnsFrame(ld)` — THE owns-the-frame test, the same
+    // one the `d.task` scope-end registration reads (LlvmBackend_Stmts.cpp),
+    // so "the obligation moved" and "the obligation registered" are selected
+    // by ONE expression: a BORROW of a task (a plain `var t2 := t;`, a
+    // `using var` over a stored-task property) owns no frame and must not be
+    // disposed here.
+    //
+    // The disposal itself is `emitTaskDisposal` — the FULL using-var task
+    // protocol extracted for the field-store sibling (#2173): the §30.9
+    // fault-ownership error_obj prelude, the §30.5 per-T result disposer,
+    // then `bz_task_fire_and_forget` (the checked variant in checked
+    // disposal mode). A bare `bz_task_free` would reclaim only the task
+    // struct and leak the fault object / the unconsumed result.
+    //
+    // The slot is NULLed before the disposal, exactly as the field sibling
+    // (`lowerOwnedTaskFieldStore`) does (#2173): a fire-and-forget completion
+    // continuation can re-enter and read the slot, and it must not see the
+    // pointer being freed. The assignment's own store (the new value) is
+    // emitted by the caller AFTER this helper returns, so the slot is live
+    // again by the time the statement completes.
+    if (const sema::TypeRef* taskTy = taskTypeOfLocal(ld)) {
+        if (!taskLocalOwnsFrame(ld)) return;
+        // The load uses the CALLER's element type, exactly as the class arm
+        // below does (`CreateLoad(elemTy, addr)`): `addr` and `elemTy` are one
+        // pair, computed together by the store sequence, so loading with
+        // anything else would read the wrong width. A task slot is a plain
+        // pointer (a `Task?` is a nullable pointer, not a boxed struct — the
+        // same representation the class arm relies on), and the non-pointer
+        // case is declined rather than mis-read.
+        llvm::Value* told = builder_.CreateLoad(elemTy, addr, "task.reassign.old");
+        if (!told->getType()->isPointerTy()) return;
+        llvm::Value* tnullp = llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* tlive = builder_.CreateICmpNE(told, tnullp, "task.reassign.live");
+        llvm::Value* tdoDispose = tlive;
+        if (newVal && newVal->getType()->isPointerTy())
+            tdoDispose = builder_.CreateAnd(
+                tlive, builder_.CreateICmpNE(told, newVal, "task.reassign.diff"));
+        auto* tdispBB =
+            llvm::BasicBlock::Create(llvm_, "task.reassign.dispose", currentFn_);
+        auto* tcontBB =
+            llvm::BasicBlock::Create(llvm_, "task.reassign.cont", currentFn_);
+        builder_.CreateCondBr(tdoDispose, tdispBB, tcontBB);
+        builder_.SetInsertPoint(tdispBB);
+        builder_.CreateStore(tnullp, addr);
+        emitTaskDisposal(taskTy, told);
+        builder_.CreateBr(tcontBB);
+        builder_.SetInsertPoint(tcontBB);
+        return;
+    }
     // fix-forward #8137 (§28.7 / §30.3, v0.355) — the owned-`Result`-read
     // form, beside the initializer-form classifier, in the CLASSIFICATION
     // form the ownership pass reads (see above).
     bool ownsTransferredResult =
         ld->initializer && common::owningTaskResultReadClassifiesOwned(
                                ld->initializer.get(), ctx_);
-    if (!unwindOwnedLocalClass(ld) && !ownsTransferredResult)
+    // fix #7759 (§28.7 / §17.8, v0.355): the `!` SPELLING of a fresh owned
+    // class producer — `var w := h.MkW()!;`.
+    //
+    // §17.8: "`x!` — the result is non-nullable, KEEPS `x`'s OWN
+    // classification", and the table row at docs/Bezel_Language_Spec.md:7148:
+    // "a fresh producer's `!` is owned". So `h.MkW()!` is an OWNED fresh
+    // producer and `w` is an owned local — exactly as the BARE spelling
+    // `var w := h.MkW();` is.
+    //
+    // `unwindOwnedLocalClass` classifies a local by its INITIALIZER FORM
+    // (a `new C()`, an `owned`-returning call, an owned operator, a `??`
+    // fresh producer, …) and a postfix `!` is INVISIBLE to every one of
+    // those arms (the initializer is a `PostfixBangExpr`, not a NewExpr /
+    // CallExpr / …), so the `!` spelling fell through to `return nullptr`
+    // and this helper DECLINED — the displaced value was never disposed.
+    // MEASURED on the base (r30-c1): `var w := h.MkW()!; w := h.MkW()!;` in
+    // a 100-iteration loop leaves `ds=100` of 200 and leaks 1600 B in 100
+    // allocations, while the byte-identical BARE spelling (`a14c`) is clean
+    // (`ds=200`). The ownership pass already classifies the `!` spelling as
+    // Owned (issue #7678) and already says the drop-on-overwrite is COVERED
+    // (`localDropOnOverwriteCovered`), so the two sides disagreed: the
+    // ownership side promised a disposal that codegen never emitted.
+    //
+    // The fix is the GENERAL drop-on-overwrite with the `!` spelling
+    // classified correctly — NOT a special case for `!`: the gate below
+    // peels the `!` layers and asks the SHARED fresh-owned-producer
+    // predicate (`isFreshOwnedClassProducer` → `common::isFreshOwnedClassProducer`,
+    // the same fact the ownership pass's producerState reads), so a `!` over
+    // a FRESH producer is admitted and a `!` over a PLACE (a named owned
+    // local read, a field read, a plain parameter — all BORROWS per §17.8)
+    // is NOT. The scope-end side already agrees: `registerUsingDisposal`'s
+    // `usingVarOwnsClassObjectDynamically` already admits the `!`-over-fresh-
+    // producer shape (its (b0e) arm, #1987), which is why the FINAL value of
+    // the `!`-spelled local IS disposed at scope end (measured `ds=100` for
+    // the single-binding control) — only the displaced one was not.
+    bool ownsBangFreshProducer = false;
+    if (ld->initializer) {
+        const ast::Expr* core = ld->initializer.get();
+        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core)) {
+            if (!pb->operand) { core = nullptr; break; }
+            core = pb->operand.get();
+        }
+        // `core != ld->initializer.get()` — the initializer really IS a `!`
+        // (the peeled core is a DIFFERENT node).
+        if (core && core != ld->initializer.get() &&
+            isFreshOwnedClassProducer(core)) {
+            // `isFreshOwnedClassProducer` already requires the producer's
+            // result to be a heap CLASS instance (a Named TypeRef with a class
+            // declaration), so the value the local holds is a class object and
+            // the dynamic (vtable) disposal below is the right one — the same
+            // requirement `unwindOwnedLocalClass`'s (b) arm imposes.
+            ownsBangFreshProducer = true;
+        }
+    }
+    if (!unwindOwnedLocalClass(ld) && !ownsTransferredResult &&
+        !ownsBangFreshProducer)
         return;  // not an owned plain class local
     llvm::Value* old = builder_.CreateLoad(elemTy, addr, "reassign.old");
     if (!old->getType()->isPointerTy()) return;
