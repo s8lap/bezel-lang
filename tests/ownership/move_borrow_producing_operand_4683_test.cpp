@@ -52,7 +52,11 @@
 // (new Cell(1))` is a compile error at EVERY position", v0.350) rejects the
 // marker on a fresh producer at a BINDING POSITION. Row (5) below is
 // therefore flipped by that sema rule, not by this file's — and it now also
-// pins that the marker-free `owned`-return position still compiles.
+// pins that the marker-free `owned`-return position still compiles. That
+// second pin is CURRENT BEHAVIOUR (the `owned`-return position is a marker-free
+// one, so §28.8.1 / A.7 call the marker redundant there and #8330 owns that
+// half); it is pinned so the binding-position rule is shown to be
+// POSITION-SCOPED.
 //
 // OBSERVABILITY. The pre-fix behaviour is a clean COMPILE, so the oracle is
 // the SPECIFIC diagnostic text, never `failedAtCompileTimeWithRealLocation`
@@ -184,9 +188,16 @@ BEZEL_TEST(move_borrow_producing_operand_4683,
 // (5b) The guard this row still carries is that the rejection is
 // POSITION-SCOPED, not a blanket ban on every CallExpr operand: the SAME
 // `move` of the SAME owned-returning call at a MARKER-FREE position (an
-// `owned` return) still compiles. That is the shape
-// move_borrow_owned_return_1995_test.cpp pins ACCEPTed on its own
-// (`return move C.Fresh();`).
+// `owned` return) still compiles.
+//
+// CURRENT BEHAVIOUR, NOT A SPEC-SANCTIONED ACCEPTANCE. §28.8.1 (v0.350)
+// makes the marker on a fresh producer "a compile error at every position",
+// and Appendix A.7 rejects a marker at a marker-free position (a `return`
+// operand is one) as redundant — so the ACCEPT asserted below is a position
+// #8330 owns and will flip. It is pinned here so that the binding-position
+// rule is shown to be POSITION-SCOPED (a widening would change this row).
+// The same shape is pinned ACCEPTed on its own by
+// move_borrow_owned_return_1995_test.cpp (`return move C.Fresh();`).
 BEZEL_TEST(move_borrow_producing_operand_4683,
            move_of_owned_returning_call_rejected_at_a_binding_position_spec_28_8_1) {
     const char* kCellPrelude =

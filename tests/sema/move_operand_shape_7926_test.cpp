@@ -17,6 +17,26 @@
 //       other operand is a compile error". Before the fix `var b := move 5;`
 //       compiled silently.
 //
+//   (c) A `new` EXPRESSION is the other FRESH PRODUCER. §28.8.1 names it
+//       verbatim: "a fresh producer (a `new` expression, a call returning
+//       `owned T`, an owned operator result) needs no marker anywhere (K3.13)
+//       and takes none, so `move (new Cell(1))` is a compile error at every
+//       position, an `owned` argument and an owned-slot store alike; the
+//       remedy is to drop the `move`." This is the ISSUE'S OWN THIRD REPRO
+//       (`var c := move (new Cell(1));`), and before the fix it compiled with
+//       only the §28.3 must-use auto-drop warning.
+//
+//       THE PARENTHESISED SPELLING IS NOT A DIFFERENT SHAPE. Appendix A.7's
+//       `MoveExpr` is `"move" PrimaryExpr`, and source-level parentheses
+//       leave NO `ParenExpr` node in the AST (ast/Node.hpp: "source-level
+//       parens leave no ParenExpr node — the tree shape encodes grouping —
+//       so the parser stamps this flag on the inner expression of a `(...)`
+//       group"): the group only groups the parse and stamps `parenthesized`
+//       on the node inside it. MEASURED with the shipping parser (this lane's
+//       AST-dump probe): `move (new Cell(1))` and `move new Cell(1)` are the
+//       SAME `ast::NewExpr` operand, differing only in that flag. So the one
+//       arm rejects both spellings, and rows R4 and R5 pin both.
+//
 // The rule is checked at the LOCAL DECLARATION INITIALIZER only; the other
 // positions carry their own authority (§22.3's call-site marker economy at an
 // `owned` argument; §28.3's marker-free positions at a `return` / `throw` /
@@ -27,11 +47,24 @@
 //   R1  `var a := move Mk();` — a fresh-producer call at a binding position
 //   R2  `var b := move 5;` — a literal at a binding position
 //   R3  `var b := move "s";` — a string literal at a binding position
+//   R4  `var c := move (new Cell(1));` — the issue's own third repro: the
+//       PARENTHESISED `new` at a binding position
+//   R5  `var c := move new Cell(1);` — the BARE `new` at a binding position
+//       (the same AST node as R4 — see the note above)
+//   R6  CONTROL: `Take(move (new Cell(1)))` at an owned ARGUMENT — still
+//       rejected, and still with §22.3's own CALL-SITE diagnostic (this
+//       lane's binding-position rule does not take that position over)
 //   C1  CONTROL: `arr.Add(move (new Item(3)))` on an `OwningArray<Item>` — the
-//       owned-slot store, still COMPILING (the `move` of a fresh producer at a
-//       marker-free position is not this lane's rule)
-//   C2  CONTROL: `return move C.Fresh();` through an `owned` return — still
-//       COMPILING
+//       owned-slot store. CURRENT BEHAVIOUR: it still compiles; §28.8.1
+//       (v0.350) calls it "a compile error at every position, an `owned`
+//       argument and an owned-slot store alike", so #8330 will flip this row
+//       to a REJECT. It is pinned here as CURRENT BEHAVIOUR, not as a
+//       spec-sanctioned acceptance.
+//   C2  CONTROL: `return move C.Fresh();` through an `owned` return — CURRENT
+//       BEHAVIOUR: it still compiles. §28.8.1 (v0.350) makes the marker on a
+//       fresh producer "a compile error at every position" and A.7 rejects a
+//       marker at a marker-free position as redundant, so #8330 will flip
+//       this row too. Pinned as CURRENT BEHAVIOUR.
 //   C3  CONTROL: `using var h := move c;` — a named owned local (A.7 (c))
 //   C4  CONTROL: `move _f` — an `owned` field (A.7 (a))
 //   C5  CONTROL: `move a[0]` — an owning collection's slot (A.7 (b))
@@ -56,6 +89,18 @@ namespace {
 // The stable substring of the #7926 fresh-producer diagnostic: §22.3's own
 // wording, which the ownership pass's call-site twin carries too.
 constexpr const char* kFreshProducer = "not written on a fresh producer";
+
+// The stable substring of the #7926 fresh-producer diagnostic for the `new`
+// shape. It names the SHAPE, so it distinguishes this lane's BINDING-position
+// diagnostic ("... a fresh producer (a `new` expression) — ...") from §22.3's
+// CALL-SITE one ("... a fresh producer (a `new` expression or a call returning
+// an owned result) — ..."), which the closing parenthesis makes non-matching.
+constexpr const char* kFreshProducerNew = "fresh producer (a `new` expression)";
+
+// The stable substring of the ownership pass's own CALL-SITE fresh-producer
+// diagnostic (§22.3) — the position this lane does NOT touch.
+constexpr const char* kCallSiteFreshProducer =
+    "the `move` call-site marker is not written on a fresh producer";
 
 // The stable substring of the #7926 literal-operand diagnostic.
 constexpr const char* kLiteralOperand = "not admitted on a literal";
@@ -115,9 +160,73 @@ BEZEL_TEST(sema_move_operand_shape_7926,
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kLiteralOperand));
 }
 
+// R4 — THE ISSUE'S OWN THIRD REPRO, verbatim: the PARENTHESISED `new` at a
+// binding position. §28.8.1 (v0.350): "a fresh producer (a `new` expression,
+// ...) needs no marker anywhere (K3.13) and takes none, so `move (new
+// Cell(1))` is a compile error at every position".
+BEZEL_TEST(sema_move_operand_shape_7926,
+           parenthesised_new_is_not_admitted_at_a_binding_position) {
+    auto r = runAot(
+        "module M7926R4; " + std::string(kCell) +
+        "class Program "
+        "  public static method Main(): int "
+        "    var c := move (new Cell()); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kFreshProducerNew));
+}
+
+// R5 — the BARE `new` spelling at a binding position. It is the SAME AST node
+// as R4 (source-level parentheses leave no `ParenExpr` node — the parser
+// stamps `parenthesized` on the node inside the group), so the one arm
+// rejects both spellings; this row pins that the rule is about the SHAPE and
+// not about the spelling.
+BEZEL_TEST(sema_move_operand_shape_7926,
+           bare_new_is_not_admitted_at_a_binding_position) {
+    auto r = runAot(
+        "module M7926R5; " + std::string(kCell) +
+        "class Program "
+        "  public static method Main(): int "
+        "    var c := move new Cell(); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kFreshProducerNew));
+}
+
+// R6 — CONTROL: the same shape at an owned ARGUMENT is still rejected, and
+// still by the OWNERSHIP PASS's own §22.3 call-site diagnostic. This lane's
+// rule is a BINDING-position rule; it must not take the call-site position
+// over, and the two diagnostics must stay distinguishable.
+BEZEL_TEST(sema_move_operand_shape_7926,
+           control_owned_argument_keeps_the_call_site_diagnostic) {
+    auto r = runAot(
+        "module M7926R6; " + std::string(kCell) +
+        "class Program "
+        "  public static method Take(owned p: Cell) "
+        "    using var h := move p; "
+        "  end Take; "
+        "  public static method Main(): int "
+        "    Take(move (new Cell())); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kCallSiteFreshProducer));
+}
+
 // C1 — CONTROL: the owned-slot store. `arr.Add(move (new Item(3)))` on an
-// `OwningArray<Item>` is a marker-free position, and the `move` of a fresh
-// producer there is NOT this lane's rule: it must still compile.
+// `OwningArray<Item>` is a marker-free position.
+//
+// CURRENT BEHAVIOUR, NOT A SPEC-SANCTIONED ACCEPTANCE. §28.8.1 (v0.350)
+// names this exact position: "so `move (new Cell(1))` is a compile error at
+// every position, an `owned` argument and an owned-slot store alike". The
+// program still compiles today; #8330 owns the owned-slot-store half and will
+// flip this row to a REJECT. The row is pinned here so that THIS lane's
+// change is shown not to have moved the position.
 BEZEL_TEST(sema_move_operand_shape_7926,
            control_owned_slot_store_still_compiles) {
     auto r = runAot(
@@ -138,6 +247,13 @@ BEZEL_TEST(sema_move_operand_shape_7926,
 }
 
 // C2 — CONTROL: `return move C.Fresh();` through an `owned` return.
+//
+// CURRENT BEHAVIOUR, NOT A SPEC-SANCTIONED ACCEPTANCE. §28.8.1 (v0.350)
+// makes the marker on a fresh producer "a compile error at every position",
+// and Appendix A.7 rejects a marker at a marker-free position (a `return`
+// operand is one) as redundant. The program still compiles today; #8330 owns
+// that half and will flip this row. The row is pinned here so that THIS
+// lane's change is shown not to have moved the position.
 BEZEL_TEST(sema_move_operand_shape_7926,
            control_owned_return_of_a_fresh_producer_still_compiles) {
     auto r = runAot(

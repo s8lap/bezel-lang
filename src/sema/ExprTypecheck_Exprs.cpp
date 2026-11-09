@@ -12372,7 +12372,7 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     // `using var` declaration, which is where A.7 admits the `move` marker
     // ("the entire RHS of a binding or assignment ... an argument root ...")
     // — the marker is written on a NAMED OWNED BINDING (a local or an
-    // `owned` parameter), and on nothing else. Two operand shapes are
+    // `owned` parameter), and on nothing else. Three operand shapes are
     // admitted by neither §22.3 nor A.7:
     //
     //   (a) a CALL whose declared return type is `owned` — a FRESH PRODUCER.
@@ -12390,6 +12390,28 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     //       of a class instance, a slot of an owning collection, and a bare
     //       identifier naming a local binding or `owned` parameter. "Any
     //       other operand is a compile error."
+    //
+    //   (c) a `new` EXPRESSION — the other FRESH PRODUCER. §28.8.1 names it
+    //       in its own words: "a fresh producer (a `new` expression, a call
+    //       returning `owned T`, an owned operator result) needs no marker
+    //       anywhere (K3.13) and takes none, so `move (new Cell(1))` is a
+    //       compile error at every position ... the remedy is to drop the
+    //       `move`." A `new` expression is the production itself, so the
+    //       marker announces nothing: no live binding is invalidated.
+    //
+    //       THE PARENTHESISED SPELLING IS THE SAME SHAPE, NOT A DIFFERENT
+    //       ONE. Appendix A.7's MoveExpr is `"move" PrimaryExpr`, and
+    //       source-level parentheses leave NO `ParenExpr` node in the AST
+    //       (§17.1: "source-level parens leave no ParenExpr node — the tree
+    //       shape encodes grouping — so the parser stamps this flag on the
+    //       inner expression of a `(...)` group", ast/Node.hpp): the `(...)`
+    //       group only groups the parse and stamps `parenthesized` on the
+    //       node inside it. MEASURED with the shipping parser (the AST dump
+    //       probe in this lane's scratch): `move (new Cell(1))` and `move new
+    //       Cell(1)` produce the SAME `ast::NewExpr` operand, differing only
+    //       in that flag (true / false). So one arm covers both spellings,
+    //       and the issue's own repro — the parenthesised one — is the same
+    //       node as the bare one.
     //
     // The rule is checked at the LOCAL DECLARATION INITIALIZER only: the
     // other positions carry their own authority (§22.3's call-site marker
@@ -12434,6 +12456,25 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 "operand is admitted (Appendix A.7 MoveExpr, §28.8.1, "
                 "v0.350). A literal is a value, not a place, so there is "
                 "nothing to transfer; drop the `move`");
+        } else if (dynamic_cast<const ast::NewExpr*>(mo)) {
+            // (c) the `new` expression — the other fresh producer (§22.3:
+            // "A fresh producer — a `new` expression, a call returning
+            // `owned T`, an operator result, or a `move obj._field` — stays
+            // unmarked: no live binding is invalidated, so there is nothing
+            // to announce"; §28.3 K3.13: "Fresh producers need no marker
+            // anywhere"). The same wording as the (a) arm, with the shape
+            // named: this is the `new` half of §28.8.1's fresh-producer
+            // list, and §28.8.1 (v0.350) makes it "a compile error at every
+            // position". (The ownership pass's own §22.3 call-site check
+            // covers the CALL-SITE positions — an `owned` argument, a
+            // constructor argument — but not the binding position, which is
+            // where this hole was measured.)
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                "the `move` marker is not written on a fresh producer (a "
+                "`new` expression) — no live binding is invalidated, so there "
+                "is nothing to announce; remove `move` (§22.3, v0.307, "
+                "§28.3 K3.13, §28.8.1, v0.350)");
         }
     }
     // §28.8.1 / §22.12 note (h) / K9.4 (v0.350): a `move arr[j]` (bare or
