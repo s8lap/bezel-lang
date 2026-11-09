@@ -11909,8 +11909,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // §28.12 / §30 (`await using var`): async disposal path. On the NORMAL
         // exit (not isUnwind): call DisposeAsync() directly, await the returned
         // Task (a proper suspend point), then free the block (physical reclamation).
-        // On the UNWIND path (exception in flight): synchronous Dispose() fallback —
-        // the resource is reclaimed on every exit path.
+        // On the UNWIND path (exception in flight) inside the async body's own
+        // resume function: the same await, with the exception parked across it
+        // (fix #7705, below). Anywhere else the unwind path takes the
+        // synchronous Dispose() fallback — the resource is reclaimed on every
+        // exit path.
         if (it->asyncDispose) {
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
@@ -11943,8 +11946,182 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // reclamation uses the already-loaded `obj`, not a reload.
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
+            // fix #7705 (§28.12, v0.350): the EXCEPTION edge awaits too.
+            // `await using`'s "implicit `finally` awaits `DisposeAsync` on
+            // both the normal and exception edges of an async body", and step
+            // 1: "the destructor body (if any) is not also run, because
+            // `DisposeAsync` supersedes it". The unwind pass passed a null
+            // `DisposeAsync` here, so every exception edge took the
+            // synchronous fallback: the destructor body ran and `DisposeAsync`
+            // never did. An unwind pass emitted inside the async body's own
+            // resume function can suspend, so now it does, with the in-flight
+            // exception PARKED across the await:
+            //   * saved into a frame-backed slot and CLEARED from the thread's
+            //     slot before `DisposeAsync` runs: during the suspend other
+            //     tasks run on this thread, and `DisposeAsync`'s own body must
+            //     see a clean exception context (its calls' pending checks
+            //     would otherwise fire on an exception that is merely
+            //     propagating) — the finally-body shape of lowerTry (#438);
+            //   * restored on the `await.ok` edge, so the pass goes on with the
+            //     exception it entered with;
+            //   * on a fault edge the NEW exception stays in flight and the
+            //     parked one is superseded (§31.2: "disposed by the runtime
+            //     exactly once", except "a task-owned fault instance" which
+            //     "is dropped from the in-flight slot undisposed; the owning
+            //     task's rules in §30.9 are unchanged"), and the pass
+            //     CONTINUES: every remaining disposal still runs (§28.4), then
+            //     the site branches to its own unwind target — the contract a
+            //     synchronous disposer that throws on an unwind pass already
+            //     has.
+            // The §30.9 borrowed / deferred marks are NOT touched by the park:
+            // they are facts about the instance, and the runtime keeps them in
+            // process-wide sets (fix #7795), so a resume on another worker
+            // reads them unchanged. The second refuted attempt moved them out
+            // of thread-local sets and back, and put them back only AFTER
+            // `emitPhysicalReclamation` — which, for a head that owns the
+            // faulted task, is the `otask.eo` disposal that consults them
+            // (MEASURED: review r37-rev-u-await2 r04 / r04i / r06, the
+            // in-flight fault freed by its owning task).
+            //
+            // Outside an async body's resume function (a destructor body, an
+            // async iterator, a lambda emitted mid-pass) there is no suspend
+            // point to use, so those keep the synchronous fallback.
+            const bool awaitOnUnwind =
+                isUnwind && smKind_ == SuspendKind::Await && smStateStruct_ &&
+                smSelf_ && asyncResumeFn_ && currentFn_ == asyncResumeFn_ &&
+                (it->disposeAsyncFn ||
+                 it->disposeAsyncVSlot == kDisposeAsyncRunTimeDispatch);
+            if (awaitOnUnwind) {
+                // ONE shared block per head per resume function (see
+                // SmUnwindAwaitBlock): this site hands it the object and its
+                // site number, and the block switches back to `contBB`.
+                SmUnwindAwaitBlock& sh = smUnwindAwaitBlocks_[it->slot];
+                if (!sh.entry || sh.fn != currentFn_) {
+                    sh = SmUnwindAwaitBlock{};
+                    sh.fn = currentFn_;
+                    sh.objSlot = entryAlloca(ptrTy());
+                    sh.siteSlot = entryAlloca(builder_.getInt32Ty());
+                    sh.excSlot = entryAlloca(ptrTy());
+                    // All three are stored before the suspend and read after
+                    // it, so they live in the frame (a cross-thread resume).
+                    asyncHandlerSpillSlots_.push_back(sh.objSlot);
+                    asyncHandlerSpillSlots_.push_back(sh.siteSlot);
+                    asyncHandlerSpillSlots_.push_back(sh.excSlot);
+                    llvm::IRBuilderBase::InsertPointGuard ipGuard(builder_);
+                    sh.entry = llvm::BasicBlock::Create(
+                        llvm_, "awaitusing.unwind", currentFn_);
+                    auto* joinBB = llvm::BasicBlock::Create(
+                        llvm_, "awaitusing.unwind.join", currentFn_);
+                    builder_.SetInsertPoint(sh.entry);
+                    llvm::Value* headObj = builder_.CreateLoad(
+                        ptrTy(), sh.objSlot, "unwind.headobj");
+                    builder_.CreateStore(
+                        builder_.CreateLoad(ptrTy(), emitExcSlot(),
+                                            "unwind.inflight"),
+                        sh.excSlot);
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
+                    llvm::AllocaInst* excSlot = sh.excSlot;
+                    auto unwindFaultTail = [this, excSlot,
+                                            joinBB](llvm::Value* newExc) {
+                        // `newExc` is in flight. The parked exception is
+                        // superseded by it — unless the fault IS the parked
+                        // exception (an awaited task's fault is re-raised
+                        // with the task's own error object, which
+                        // `DisposeAsync` may await again), in which case it
+                        // simply stays in flight.
+                        llvm::Value* parked = builder_.CreateLoad(
+                            ptrTy(), excSlot, "unwind.parkedexc");
+                        llvm::Value* hadParked = builder_.CreateICmpNE(
+                            parked, llvm::ConstantPointerNull::get(ptrTy()));
+                        llvm::Value* differs =
+                            builder_.CreateICmpNE(parked, newExc);
+                        auto* supBB = llvm::BasicBlock::Create(
+                            llvm_, "unwind.supersede", currentFn_);
+                        auto* borrowedBB = llvm::BasicBlock::Create(
+                            llvm_, "unwind.supersede.borrowed", currentFn_);
+                        auto* ownedBB = llvm::BasicBlock::Create(
+                            llvm_, "unwind.supersede.owned", currentFn_);
+                        auto* drainBB = llvm::BasicBlock::Create(
+                            llvm_, "unwind.supersede.drain", currentFn_);
+                        builder_.CreateCondBr(
+                            builder_.CreateAnd(hadParked, differs), supBB,
+                            joinBB);
+                        builder_.SetInsertPoint(supBB);
+                        auto* isBorrowedFn = declareC(
+                            "bz_is_exc_borrowed", llvm::Type::getInt8Ty(llvm_),
+                            {ptrTy()});
+                        llvm::Value* borrowed = builder_.CreateICmpNE(
+                            builder_.CreateCall(isBorrowedFn, {parked}),
+                            llvm::ConstantInt::get(
+                                llvm::Type::getInt8Ty(llvm_), 0));
+                        builder_.CreateCondBr(borrowed, borrowedBB, ownedBB);
+                        // §30.9: a BORROWED parked exception is a bound
+                        // task's fault whose handling ends here. Unmark it;
+                        // if its owner was disposed meanwhile and deferred
+                        // the disposal to the end of handling, that is now
+                        // (the catch arm's own drain will not run on this
+                        // edge); otherwise the owning task still disposes it
+                        // at its scope end (§31.2's exception for a
+                        // task-owned fault instance) and may re-raise it to
+                        // another awaiter first (§30.4).
+                        builder_.SetInsertPoint(borrowedBB);
+                        builder_.CreateCall(
+                            declareC("bz_unmark_exc_borrowed",
+                                     llvm::Type::getVoidTy(llvm_), {ptrTy()}),
+                            {parked});
+                        auto* isDeferredFn = declareC(
+                            "bz_is_exc_deferred", llvm::Type::getInt8Ty(llvm_),
+                            {ptrTy()});
+                        llvm::Value* deferred = builder_.CreateICmpNE(
+                            builder_.CreateCall(isDeferredFn, {parked}),
+                            llvm::ConstantInt::get(
+                                llvm::Type::getInt8Ty(llvm_), 0));
+                        builder_.CreateCondBr(deferred, drainBB, joinBB);
+                        // An OWNED parked exception has no other owner now:
+                        // dispose it here, exactly once (§31.2). The deferred
+                        // clear is a no-op for it and keeps the one spelling
+                        // emitSupersedeCaughtExc uses.
+                        builder_.SetInsertPoint(ownedBB);
+                        builder_.CreateBr(drainBB);
+                        builder_.SetInsertPoint(drainBB);
+                        builder_.CreateCall(
+                            declareC("bz_clear_exc_deferred",
+                                     llvm::Type::getVoidTy(llvm_), {ptrTy()}),
+                            {parked});
+                        emitDisposeAndReclaim(parked);
+                        builder_.CreateBr(joinBB);
+                    };
+                    emitAsyncDisposeAwaitAndFree(
+                        headObj, it->disposeAsyncFn, it->asyncDisposeCls,
+                        it->disposeAsyncVSlot, unwindFaultTail);
+                    // await.ok: the pass resumes with the exception it entered
+                    // with.
+                    builder_.CreateStore(
+                        builder_.CreateLoad(ptrTy(), excSlot,
+                                            "unwind.parkedexc"),
+                        emitExcSlot());
+                    builder_.CreateBr(joinBB);
+                    builder_.SetInsertPoint(joinBB);
+                    llvm::Value* site = builder_.CreateLoad(
+                        builder_.getInt32Ty(), sh.siteSlot, "unwind.site");
+                    auto* noSiteBB = llvm::BasicBlock::Create(
+                        llvm_, "awaitusing.unwind.nosite", currentFn_);
+                    sh.dispatch = builder_.CreateSwitch(site, noSiteBB);
+                    builder_.SetInsertPoint(noSiteBB);
+                    builder_.CreateUnreachable();
+                }
+                const unsigned siteNo = sh.nextSite++;
+                builder_.CreateStore(obj, sh.objSlot);
+                builder_.CreateStore(builder_.getInt32(siteNo), sh.siteSlot);
+                builder_.CreateBr(sh.entry);
+                sh.dispatch->addCase(builder_.getInt32(siteNo), contBB);
+                builder_.SetInsertPoint(contBB);
+                continue;
+            }
             // Pass the direct function pointer; null means sync fallback.
-            // On the unwind path, always use sync fallback (pass null).
+            // On an unwind path that cannot suspend, use sync fallback (pass
+            // null).
             // fix #7629 + #7630 (§31.2 / §28.4 / §28.2, v0.350): the fault
             // edges of this disposal leave the pass in the MIDDLE of this
             // scope. The entries declared before this one (`scope` indices

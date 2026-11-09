@@ -885,19 +885,42 @@ int8_t bz_task_fault_borrowed(void* tp) {
 // caught-exception disposal skips a borrowed object. A PER-OBJECT set (not a
 // single flag) is required: an arm body may throw/catch a nested NORMAL exception
 // between the mark and the borrowed object's own disposal, so membership must be
-// keyed by the object pointer. Thread-local because the in-flight exception slot
-// (bz_exc) is thread-local (§30.14). Idempotent: mark/unmark of a pointer already
+// keyed by the object pointer. Idempotent: mark/unmark of a pointer already
 // in/absent from the set is a no-op.
-static thread_local std::unordered_set<void*> g_borrowed_exc;
+//
+// fix #7795 / #7705 (§30.9 / §31.2, v0.350): PROCESS-WIDE, not thread-local.
+// Both this set and g_deferred_exc_dispose below were thread-local "because the
+// in-flight exception slot (bz_exc) is thread-local". But a mark is a fact about
+// the INSTANCE — it is task-owned and in flight; its owner was disposed while it
+// was in flight — and the activation that marks it and the one that reads it
+// are separated by suspends: a catch arm or finally that awaits (§30.9: `await`
+// is unrestricted inside those bodies) and, since #7705, an `await using`
+// head's awaited DisposeAsync on the exception edge. The body resumes on
+// whichever worker completes the awaited task, and a thread-local set stays
+// behind on the suspending thread: the resumed reader saw a bound task's fault
+// as OWNED and freed it (task.eo.dispnow) while the instance was still in
+// flight, or disposed a caught borrow at the arm's exit — heap-use-after-free
+// (MEASURED, review r37-rev-u-await q23/q24/q25 and r37-rev-u-await2 r15/r33).
+// Pointers are unique process-wide, so one set keyed by them has exactly the
+// thread-local semantics minus the loss. Mutex-guarded (the paths are exception
+// paths: a re-raise, a catch arm's exit, a faulted task's scope end).
+static std::mutex g_exc_marks_mtx;
+static std::unordered_set<void*> g_borrowed_exc;
 
 extern "C" void bz_mark_exc_borrowed(void* obj) {
-    if (obj) g_borrowed_exc.insert(obj);
+    if (!obj) return;
+    std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
+    g_borrowed_exc.insert(obj);
 }
 extern "C" int8_t bz_is_exc_borrowed(void* obj) {
-    return (obj && g_borrowed_exc.count(obj)) ? 1 : 0;
+    if (!obj) return 0;
+    std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
+    return g_borrowed_exc.count(obj) ? 1 : 0;
 }
 extern "C" void bz_unmark_exc_borrowed(void* obj) {
-    if (obj) g_borrowed_exc.erase(obj);
+    if (!obj) return;
+    std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
+    g_borrowed_exc.erase(obj);
 }
 
 // §30.9 fault ownership (v0.179), in-flight-deferral refinement (a). A faulted
@@ -914,18 +937,25 @@ extern "C" void bz_unmark_exc_borrowed(void* obj) {
 // and, instead of disposing it there, records it here; the disposal is then
 // performed as the TERMINAL ACT of exception handling, at the catch arm's normal
 // exit (bz_is_exc_deferred → codegen emits the real Dispose + reclaim, then
-// bz_clear_exc_deferred). Thread-local like g_borrowed_exc because the in-flight
-// exception slot (bz$exc) is thread-local (§30.14).
-static thread_local std::unordered_set<void*> g_deferred_exc_dispose;
+// bz_clear_exc_deferred). Process-wide like g_borrowed_exc, for the same reason
+// (fix #7795 / #7705): the recording scope end and the draining arm exit may
+// run on different workers.
+static std::unordered_set<void*> g_deferred_exc_dispose;
 
 extern "C" void bz_defer_exc_dispose(void* obj) {
-    if (obj) g_deferred_exc_dispose.insert(obj);
+    if (!obj) return;
+    std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
+    g_deferred_exc_dispose.insert(obj);
 }
 extern "C" int8_t bz_is_exc_deferred(void* obj) {
-    return (obj && g_deferred_exc_dispose.count(obj)) ? 1 : 0;
+    if (!obj) return 0;
+    std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
+    return g_deferred_exc_dispose.count(obj) ? 1 : 0;
 }
 extern "C" void bz_clear_exc_deferred(void* obj) {
-    if (obj) g_deferred_exc_dispose.erase(obj);
+    if (!obj) return;
+    std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
+    g_deferred_exc_dispose.erase(obj);
 }
 
 bool bz_task_is_done(void* tp) {

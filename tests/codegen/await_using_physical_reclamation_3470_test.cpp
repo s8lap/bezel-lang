@@ -172,12 +172,12 @@ BEZEL_TEST(await_using_physical_reclamation_3470, anonymous_binding_cascades_too
         "end C;"), 0);
 }
 
-// §28.12's synchronous-fallback path is untouched: on the UNWIND edge the
-// emitter passes a null DisposeAsync (awaiting across an active unwind is a
-// deferred increment), so the destructor runs, DisposeAsync does not, and the
-// owned field is still reclaimed. Observable = Cell.n*100 + Res.da*10 + Res.dt
-// = 0 + 0 + 1. This row guards the arm the fix routes AROUND.
-BEZEL_TEST(await_using_physical_reclamation_3470, unwind_edge_sync_fallback_unchanged) {
+// §28.12 (v0.350): on the UNWIND edge `await using` awaits `DisposeAsync` too
+// (issue #7705 flipped this row, which pinned the former synchronous fallback:
+// destructor 1, DisposeAsync 0 => 1). Step 1: the destructor body does not run;
+// step 2: the owned field is still reclaimed. Observable =
+// Cell.n*100 + Res.da*10 + Res.dt = 0 + 10 + 0.
+BEZEL_TEST(await_using_physical_reclamation_3470, unwind_edge_awaits_dispose_async_spec_28_12_7705) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kCell + kRes +
         "class C "
@@ -193,5 +193,5 @@ BEZEL_TEST(await_using_physical_reclamation_3470, unwind_edge_sync_fallback_unch
         "    end; "
         "    return Cell.n * 100 + Res.da * 10 + Res.dt; "
         "  end Main; "
-        "end C;"), 1);
+        "end C;"), 10);
 }

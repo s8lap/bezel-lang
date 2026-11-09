@@ -185,13 +185,14 @@ BEZEL_TEST(await_using_fault_edge_3494, non_throwing_disposeasync_path_unchanged
         "end C;"), 10);
 }
 
-// CONTROL — the UNWIND edge (a throw in the BODY, not in DisposeAsync) keeps
-// §28.12's synchronous fallback: awaiting across an already-active unwind is a
-// deferred increment, so the destructor runs and DisposeAsync does not. This is
-// the arm the fix moves the slot-null in front of, so it is the row that would
-// catch the move over-reaching. Observable =
-// Cell.n * 100 + Ok.da * 10 + Ok.dt = 1.
-BEZEL_TEST(await_using_fault_edge_3494, body_throw_unwind_edge_sync_fallback_unchanged) {
+// The UNWIND edge (a throw in the BODY, not in DisposeAsync): §28.12 (v0.350) has
+// `await using`'s implicit finally await `DisposeAsync` "on both the normal and
+// exception edges of an async body", so DisposeAsync runs and the destructor
+// body does not (step 1). Issue #7705 flipped this row: it pinned the former
+// synchronous fallback (destructor 1, DisposeAsync 0 => 1). It is also the arm
+// the #3494 slot-null move sits in front of, so it still catches that move
+// over-reaching. Observable = Cell.n * 100 + Ok.da * 10 + Ok.dt = 10.
+BEZEL_TEST(await_using_fault_edge_3494, body_throw_unwind_edge_awaits_dispose_async_spec_28_12_7705) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kCell +
         "class Ok: IAsyncDisposable public static da: int := 0; "
@@ -210,7 +211,7 @@ BEZEL_TEST(await_using_fault_edge_3494, body_throw_unwind_edge_sync_fallback_unc
         "    try await C.Run(); catch Exception => Console.Write(\"\"), end; "
         "    return Cell.n * 100 + Ok.da * 10 + Ok.dt; "
         "  end Main; "
-        "end C;"), 1);
+        "end C;"), 10);
 }
 
 // §28.12 step 2's "the base class's reclamation chains", on the FAULT edge. The

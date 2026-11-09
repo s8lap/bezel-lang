@@ -1716,12 +1716,12 @@ BEZEL_TEST(async_28_12, await_using_crossthread_disposes_via_disposeasync) {
 }
 
 // §28.12 (#443): fault path — a synchronous throw inside an `await using` scope.
-// Per §28.12, the class should have a destructor for the synchronous fallback;
-// the awaiting-across-active-unwind path is a deferred increment. The sync
-// Dispose (destructor, +1) runs on the unwind path; DisposeAsync (+10) does NOT.
-// The caught exception leaves the destructor running once → disposed == 1.
-// Exit code 1 proves the SYNC path ran (not the async path which would give 10).
-BEZEL_TEST(async_28_12, await_using_fault_path_sync_dispose_fallback) {
+// Per §28.12 (v0.350) `await using`'s implicit finally awaits `DisposeAsync` on
+// the exception edge too, and step 1 skips the destructor body: DisposeAsync
+// (+10) runs on the unwind path, the destructor (+1) does not. Issue #7705
+// flipped this row: it pinned the former synchronous fallback (disposed == 1).
+// Exit code 10 proves the ASYNC path ran (the sync path would give 1).
+BEZEL_TEST(async_28_12, await_using_fault_path_awaits_dispose_async_spec_28_12_7705) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; "
         "class AsyncRes: IAsyncDisposable "
@@ -1745,7 +1745,7 @@ BEZEL_TEST(async_28_12, await_using_fault_path_sync_dispose_fallback) {
         "    return result; "
         "  end Main; "
         "end C;"),
-        1);
+        10);
 }
 
 // §28.12 (#443): `await using var` scope body also contains explicit awaits.

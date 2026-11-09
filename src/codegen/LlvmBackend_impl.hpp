@@ -18090,6 +18090,27 @@ private:
     // above — this fold must not silently change its container (and hence its
     // iteration-order properties) as a side effect of protecting it.
     using SmFrameAllocaIndexMap = std::unordered_map<llvm::AllocaInst*, unsigned>;
+    // fix #7705 (§28.12, v0.350): ONE exception-edge `await DisposeAsync`
+    // block per `await using` head per resume function, shared by every
+    // unwind pass that reaches the head (emitDisposals' asyncDispose arm).
+    // An unwind pass is emitted inline at every throw site, so emitting the
+    // await (its suspend state, spill/restore group and fault edges) per site
+    // multiplied the body by the site count. A site stores the object and its
+    // site number, branches to `entry`, and `dispatch` switches back to the
+    // site's own continuation on both the ok and the fault edge. The in-flight
+    // exception is parked in `excSlot` across the await. Keyed by the head's
+    // disposal slot; looked up only for the function it was built in.
+    struct SmUnwindAwaitBlock {
+        llvm::Function* fn = nullptr;
+        llvm::BasicBlock* entry = nullptr;
+        llvm::AllocaInst* objSlot = nullptr;
+        llvm::AllocaInst* siteSlot = nullptr;
+        llvm::AllocaInst* excSlot = nullptr;
+        llvm::SwitchInst* dispatch = nullptr;
+        unsigned nextSite = 0;
+    };
+    using SmFrameUnwindAwaitMap =
+        std::unordered_map<const llvm::Value*, SmUnwindAwaitBlock>;
 
 #define BEZEL_SM_FRAME_MEMBERS(X)                                              \
     /* kind-agnostic frame scaffolding */                                      \
@@ -18113,6 +18134,7 @@ private:
        same "reset per iterator body" contract) -- was not folded in when     \
        #3505 first built this list. */                                        \
     X(SmFrameAllocaIndexMap,  smIterEnumFrameSlot_,      {}) /* §29.7 (#944) */\
+    X(SmFrameUnwindAwaitMap,  smUnwindAwaitBlocks_,      {}) /* fix #7705 */   \
     /* iterator-specific half */                                               \
     X(unsigned,               iterCurrentValField_,      0)                    \
     X(llvm::Type*,            iterElemTy_,               nullptr)              \
@@ -18664,6 +18686,9 @@ private:
     // suspend state allocated beyond the statically counted ones can be given
     // its case (emitAwaitSuspend).
     llvm::SwitchInst* smResumeSwitch_ = nullptr;
+    // fix #7705: the shared exception-edge DisposeAsync await blocks (see
+    // SmUnwindAwaitBlock).
+    SmFrameUnwindAwaitMap smUnwindAwaitBlocks_;
     unsigned smNextSuspendState_ = 0;
     // Maps LocalDecl/ForStmt AST node → frame field index for suspend-locals.
     std::unordered_map<const ast::Node*, unsigned> smLocalFields_;
