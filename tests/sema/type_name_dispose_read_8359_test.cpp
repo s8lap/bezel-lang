@@ -195,12 +195,23 @@ BEZEL_TEST(type_name_dispose_read_8359,
     BEZEL_EXPECT_TRUE(rejectedWith(p, "\xc2\xa7""11.3, \xc2\xa7""12.1"));
 }
 
-// (5) CONTROL: an enum that DECLARES a case named `Dispose` — §26.5 rule 2
-// resolves a type name's chain against the type's enum constants, so that
-// read is a legal constant read and stays admitted. (The §28.2 prohibition on
-// DECLARING the name is a different rule and a different diagnostic.)
+// (5) CONTROL (FLIPPED by #8357, §28.2): an enum that DECLARES a case named
+// `Dispose` — §26.5 rule 2 resolves a type name's chain against the type's
+// enum constants, so that read is a constant read.
+//
+// ...but the DECLARATION is now an error in its own right: §28.2 (v0.355)
+// forbids the name on an enum "whatever its parameter list and whatever its
+// kind — a method, instance or `static`, a field, a property, a `const`, AN
+// ENUM CONSTANT, a choice case or a nested type", and the error is AT THAT
+// DECLARATION. So this program is refused before the read is ever reached
+// (#8357), and the row that used to assert the opposite is corrected here.
+//
+// The §28.2 prohibition on DECLARING the name is the same rule this row's
+// read half was measured against, and it now fires: the declaration check
+// (the #7517 gate) refused a member of that name only when the member was a
+// MethodSymbol, so an EnumConstantSymbol passed it.
 BEZEL_TEST(type_name_dispose_read_8359,
-           enum_case_named_dispose_stays_readable_spec_26_5_rule_2) {
+           enum_case_named_dispose_is_refused_at_its_declaration_spec_28_2) {
     const std::string p = prog({
         "module M;",
         "public enum E Red, Dispose; end E;",
@@ -211,7 +222,9 @@ BEZEL_TEST(type_name_dispose_read_8359,
         kMainEnd,
         "end Program;",
     });
-    expectCompiles(p);
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        p, "may not declare an enum constant named `Dispose`"));
+    BEZEL_EXPECT_TRUE(rejectedWith(p, "\xc2\xa7""28.2"));
 }
 
 // (6) CONTROL: the CALL spelling over an enum keeps its own §8.7 diagnostic

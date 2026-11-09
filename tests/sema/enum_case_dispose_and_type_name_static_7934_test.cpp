@@ -240,11 +240,19 @@ BEZEL_TEST(enum_case_dispose_and_type_name_static_7934,
            "`Dispose` member"));
 }
 
-// CONTROL: the enum constant named `Dispose` in the NESTED enum is a legal
-// READ too — the fix rejects the CALL, not the name, at either nesting
-// depth.
+// CONTROL (FLIPPED by #8357, §28.2): the enum constant named `Dispose` is
+// NO LONGER DECLARABLE — §28.2 (v0.355) forbids the name on an enum "whatever
+// its parameter list and whatever its kind — a method, instance or `static`,
+// a field, a property, a `const`, AN ENUM CONSTANT, a choice case or a nested
+// type" — so the program is refused AT THE DECLARATION and the READ never
+// comes up. The read of an ADMISSIBLE enum constant through a type name stays
+// admitted (§26.5 rule 2); see
+// enum_case_read_through_the_type_name_stays_admitted_spec_26_5_rule_2.
+//
+// The nesting depth is the point of this row: the §28.2 declaration refusal
+// reaches a nested enum exactly as it reaches a module-level one.
 BEZEL_TEST(enum_case_dispose_and_type_name_static_7934,
-           nested_enum_case_named_dispose_stays_readable_spec_26_5_rule_2) {
+           nested_enum_case_named_dispose_is_refused_at_its_declaration_spec_28_2) {
     const std::string p = prog({
         "module M;",
         "public class Container",
@@ -257,14 +265,19 @@ BEZEL_TEST(enum_case_dispose_and_type_name_static_7934,
         kMainEnd,
         "end Program;",
     });
-    expectCompiles(p);
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        p, "may not declare an enum constant named `Dispose`"));
+    BEZEL_EXPECT_TRUE(rejectedWith(p, "\xc2\xa7""28.2"));
 }
 
-// CONTROL: the enum constant named `Dispose` is a legal READ — §26.5 rule 2
-// resolves a type name's chain against the type's enum constants. The fix
-// rejects the CALL, not the name.
+// CONTROL (FLIPPED by #8357, §28.2): the enum constant named `Dispose` is NO
+// LONGER DECLARABLE — §28.2 (v0.355) forbids the name on an enum in every
+// member kind, the constant included, so the error is AT THE DECLARATION and
+// the READ is never reached. (Before #8357 this row asserted the opposite:
+// that the constant was declarable and therefore readable. The §28.2 text is
+// what decides it — the DECLARATION is the error.)
 BEZEL_TEST(enum_case_dispose_and_type_name_static_7934,
-           enum_case_named_dispose_stays_readable_spec_26_5_rule_2) {
+           enum_case_named_dispose_is_refused_at_its_declaration_spec_28_2) {
     const std::string p = prog({
         "module M;",
         kEnumWithDisposeCase[0],
@@ -277,17 +290,27 @@ BEZEL_TEST(enum_case_dispose_and_type_name_static_7934,
         kMainEnd,
         "end Program;",
     });
-    expectCompiles(p);
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        p, "may not declare an enum constant named `Dispose`"));
+    BEZEL_EXPECT_TRUE(rejectedWith(p, "enum `E`"));
+    BEZEL_EXPECT_TRUE(rejectedWith(p, "\xc2\xa7""28.2"));
 }
 
-// CONTROL: an ordinary case of the same enum reads the same way.
+// CONTROL: an ordinary case of an enum reads the same way — §26.5 rule 2
+// resolves a type name's chain against the type's enum constants, and the
+// read is a value read.
+//
+// (FIXTURE, #8357): the enum here declares no constant named `Dispose`. It
+// used to declare one beside `Green`, and the row's claim — that an ordinary
+// case reads the same way — was then true only of a program §28.2 forbids
+// (the declaration of that constant is now an error, #8357), so the whole
+// program was refused and the read never came up. The row's claim is about
+// the ORDINARY case; the ordinary case needs an ordinary enum.
 BEZEL_TEST(enum_case_dispose_and_type_name_static_7934,
            enum_case_read_through_the_type_name_stays_admitted_spec_26_5_rule_2) {
     const std::string p = prog({
         "module M;",
-        kEnumWithDisposeCase[0],
-        kEnumWithDisposeCase[1],
-        kEnumWithDisposeCase[2],
+        "public enum E Green; end E;",
         kMain,
         kMainBody,
         "    E.Green;",

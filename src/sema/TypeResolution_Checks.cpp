@@ -3384,17 +3384,76 @@ void Resolver::checkUserDeclaredDispose() {
         default: return;
         }
         for (Symbol* m : t->members) {
+            if (!m || m->name != "Dispose") continue;
             auto* ms = dynamic_cast<MethodSymbol*>(m);
-            if (!ms || ms->name != "Dispose") continue;
-            ctx_.diagnostics().report(
-                Severity::Error, ms->declLoc,
-                std::string(kindWord) +
-                " `" + std::string(t->name) +
-                "` may not declare a `Dispose` method directly (§28.2): "
-                "the compiler synthesises `Dispose()` from the `destructor`; "
-                "user-declared `Dispose` bodies are never called by the "
-                "ownership machinery.  Use a `destructor` for cleanup logic "
-                "and `owned` fields for resource fields instead.");
+            if (ms) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ms->declLoc,
+                    std::string(kindWord) +
+                    " `" + std::string(t->name) +
+                    "` may not declare a `Dispose` method directly (§28.2): "
+                    "the compiler synthesises `Dispose()` from the `destructor`; "
+                    "user-declared `Dispose` bodies are never called by the "
+                    "ownership machinery.  Use a `destructor` for cleanup logic "
+                    "and `owned` fields for resource fields instead.");
+                continue;
+            }
+            // fix #8357 (§28.2, v0.355): §28.2's rule reaches "whatever its
+            // parameter list and whatever its kind — a method, instance or
+            // `static`, a field, a property, a `const`, AN ENUM CONSTANT, A
+            // CHOICE CASE or a nested type". The gate above refused a member
+            // of that name only when the member was a MethodSymbol, so an
+            // EnumConstantSymbol and a ChoiceCaseSymbol — member symbols of
+            // another kind — passed it and the DECLARATION was admitted. The
+            // error is AT THE DECLARATION (§28.2), so it is reported at the
+            // constant's / the case's own declaration location.
+            //
+            // The `Dispose` NAME is reserved on an enum and on a choice
+            // because neither kind has a `Dispose()` member at all (§8.7:
+            // "Static classes, records, enums, choices, primitives, and
+            // inline arrays do not implement `IDisposable`"), so a member of
+            // that name promises a disposal contract the kind does not have
+            // (§28.2). The two customization points §28.2 names for the
+            // remedy — a `destructor` for cleanup logic and `owned` fields
+            // for resource fields — are a class's and a record's: an enum
+            // declares neither, and a choice declares no `destructor` and no
+            // fields (an `owned` PAYLOAD is where a choice's owned state
+            // goes). So the remedy these two kinds can act on is the rename.
+            if (auto* ec = dynamic_cast<EnumConstantSymbol*>(m)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ec->declLoc,
+                    std::string(kindWord) + " `" + std::string(t->name) +
+                    "` may not declare an enum constant named `Dispose` "
+                    "(§28.2): the name is reserved on an enum — an enum has no "
+                    "`Dispose()` member and implements no `IDisposable` "
+                    "(§8.7), so a member of that name promises a disposal "
+                    "contract the kind does not have.  Rename the constant: "
+                    "the customization points §28.2 names — a `destructor` for "
+                    "cleanup logic and `owned` fields for resource fields — are "
+                    "a class's and a record's, and an enum declares neither.");
+                continue;
+            }
+            if (auto* cc = dynamic_cast<ChoiceCaseSymbol*>(m)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, cc->declLoc,
+                    std::string(kindWord) + " `" + std::string(t->name) +
+                    "` may not declare a case named `Dispose` (§28.2): the "
+                    "name is reserved on a choice — a choice has no "
+                    "`Dispose()` member and implements no `IDisposable` "
+                    "(§8.7), so a member of that name promises a disposal "
+                    "contract the kind does not have.  Rename the case: the "
+                    "customization points §28.2 names — a `destructor` for "
+                    "cleanup logic and `owned` fields for resource fields — "
+                    "are a class's and a record's; a choice declares no "
+                    "`destructor` and no fields (an `owned` payload carries "
+                    "owned state).");
+                continue;
+            }
+            // A FIELD, a PROPERTY, a `const` or a NESTED TYPE named `Dispose`
+            // is NOT refused here: §28.2's list names those spellings too,
+            // but the question what to do with them is an open spec-question
+            // (#7914), and this check must not widen its own reach past the
+            // member kinds it was decided for.
         }
     });
 }

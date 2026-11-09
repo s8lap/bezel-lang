@@ -3537,6 +3537,96 @@ void ExprTC::resolveMemberAccessWithRule1(const ast::MemberAccessExpr& ma) {
     }
 }
 
+namespace {
+
+// fix #8358 (§26.5 rule 2, §10.1, §10.2, v0.355): THE ENUM MIRROR of the
+// CHOICE case-construction check (`checkChoiceCaseConstruction`, §35.3 /
+// §35.5) — a call whose callee resolves to an ENUM CONSTANT.
+//
+// §26.5 rule 2 (v0.355): "Through a type name (§2.7 rule 1) the chain
+// resolves against the type's nested types, enum constants and static
+// members, declared or inherited". So `E.Green` RESOLVES — to the enum
+// CONSTANT — and the chain's resolution is not the end of it: a CALL needs a
+// method to call.
+//
+// §10.1 (v0.355): an enum constant is a VALUE of the enum type ("This
+// declares constants `Priority.Low`, `Priority.Medium`, `Priority.High` of
+// type `Priority`"). §10.2 (v0.355) gives it its underlying integer at the
+// DECLARATION (`Ok := 200`), and §5.4's enum cast `E(n)` is spelled on the
+// TYPE NAME. There is therefore NO call form for an enum constant in this
+// language — neither an argument-free one nor one carrying the underlying
+// value — and the rule is the blanket one: a call of an enum constant names
+// no method. (This is the choice check's shape with the arity clause
+// dropped: a choice case MAY carry a payload, so §35.3's rule for it is the
+// ARITY rule ("a payload-free case is the value `Ch.Dispose`, not a call"),
+// while an enum constant carries no payload at all and has no call form in
+// any arity.)
+//
+// The CHOICE side of the family is already refused — the payload-free case
+// call by §35.3 / §35.5, and the `Dispose`-named call by #7927 / #7934 —
+// and this check is the enum side of the same gap. It fires on the RESOLVED
+// SYMBOL, so it covers every spelling the chain resolves: the qualified
+// `E.Green()`, a type ALIAS of the enum (`EA.Green()`), a NESTED enum
+// (`Container.Status.Green()`), and the bare form an enum scrutinee arm
+// admits (`Green()`).
+//
+// #7934 / #7927 own the NAME `Dispose`: the type-name call `E.Dispose()` on
+// an enum or a choice is already refused there, with its own diagnostic
+// ("`Dispose` is not admitted on an enum value" — §8.7 / §28.2), and that
+// arm runs WHETHER OR NOT THE CALLEE RESOLVED. Reporting the same call here
+// as well would double-report one call, so the `Dispose` name is left to
+// that arm: #8358 is about CALLING A VALUE, not about the `Dispose` name.
+//
+// The READ `E.Green` is NOT affected — this is a CALL check, and the read is
+// a value read (§26.5 rule 2), which stays admitted.
+void checkEnumConstantCall(SemaContext& ctx, const ast::CallExpr& ce) {
+    if (!ce.callee) return;
+    auto* ec = dynamic_cast<EnumConstantSymbol*>(ctx.exprSymbol(*ce.callee));
+    if (!ec) return;
+    if (ec->name == "Dispose") return;  // #7927 / #7934 own that name.
+    // The AS-WRITTEN dotted spelling of the callee — `E.Green`,
+    // `Container.Status.Green`, `EA.Green` — so the diagnostic names the
+    // access as the author wrote it (the #7934 diagnostic's spelling), and
+    // the ENUM's own written spelling (everything but the last segment),
+    // which the remedy's cast form needs.
+    std::string written;
+    std::string enumWritten;
+    {
+        const ast::Expr* cur = ce.callee.get();
+        std::string tail;
+        while (auto* m =
+                   dynamic_cast<const ast::MemberAccessExpr*>(cur)) {
+            tail = tail.empty() ? std::string(m->member)
+                                 : std::string(m->member) + "." + tail;
+            cur = m->target.get();
+        }
+        std::string head;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(cur))
+            head = std::string(id->name);
+        written = head.empty() ? tail
+                               : (tail.empty() ? head : head + "." + tail);
+        const std::size_t dot = written.rfind('.');
+        if (dot != std::string::npos)
+            enumWritten = written.substr(0, dot);
+    }
+    if (written.empty()) written = std::string(ec->name);
+    if (enumWritten.empty() && ec->parent)
+        enumWritten = std::string(ec->parent->name);
+    auto loc = ce.callee->span.begin;
+    if (loc.line == 0) loc = ce.span.begin;
+    ctx.diagnostics().report(
+        Severity::Error, loc,
+        "the enum constant `" + written +
+        "` is a value, not a method: an enum constant is a value of the enum "
+        "type, and there is no call form for one (\xc2\xa7""26.5 rule 2, "
+        "v0.355; \xc2\xa7""10.1, v0.355; \xc2\xa7""10.2, v0.355) \xe2\x80\x94 "
+        "read the constant as a value (`" + written + "`), or build a value "
+        "of the enum from its underlying integer with the cast `" +
+        enumWritten + "(n)` (\xc2\xa7""5.4)");
+}
+
+}  // namespace
+
 void ExprTC::visitExpr(const ast::Expr& e) {
     // fix #8047 (§26.5 rule 1, §22.6, stdlib §2.5-§2.7 / §9.6, v0.350): the
     // §26.5 rule-1 COMMITMENT for the `?.` spelling.
@@ -8756,6 +8846,10 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 rule1Hide.hide();
         typeCall(*ce);
         checkChoiceCaseConstruction(*ce);
+        // fix #8358 (§26.5 rule 2, §10.1, §10.2, v0.355): the ENUM mirror of
+        // the choice check above — a call whose callee resolves to an ENUM
+        // CONSTANT names a VALUE, not a method, and is a compile error.
+        checkEnumConstantCall(ctx_, *ce);
         // fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): the §17.11
         // obligation of an IMPORTED generic method whose body could not be
         // reconstructed — the importer's own replay is keyed on the method's
