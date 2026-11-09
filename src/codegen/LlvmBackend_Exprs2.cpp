@@ -7300,6 +7300,52 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 }
                 return bad;
             };
+            // fix #7819 (stdlib §2.5, v0.355): the LENGTH of the month, for
+            // the "day 1 to the length of that month in that year of the
+            // proleptic Gregorian calendar that ISO 8601 uses (February 29
+            // exists only in a leap year)" rule. The year and the month are
+            // RUNTIME values here, so the length is computed in the IR: 31 for
+            // the 31-day months, 30 for the 30-day months, and 28 or 29 for
+            // February — 29 only in a leap year, `y % 4 == 0 && (y % 100 != 0
+            // || y % 400 == 0)` (the very rule the runtime's
+            // `bz_datetime_add_months` applies, src/runtime/
+            // bezel_runtime_time.cpp). The divisibility tests are the MODULO
+            // form: 100 and 400 are not powers of two, so no mask test can
+            // decide them (`y & 99` is not "y is divisible by 100").
+            // `srem` is C's `%` (truncated toward zero), so the test agrees
+            // with the runtime's for every value, negative years included.
+            auto dateDaysInMonth = [&](llvm::Value* y,
+                                       llvm::Value* mo) -> llvm::Value* {
+                llvm::Value* by4 = builder_.CreateICmpEQ(
+                    builder_.CreateSRem(y, builder_.getInt32(4)),
+                    builder_.getInt32(0), "dim.by4");
+                llvm::Value* by100 = builder_.CreateICmpEQ(
+                    builder_.CreateSRem(y, builder_.getInt32(100)),
+                    builder_.getInt32(0), "dim.by100");
+                llvm::Value* by400 = builder_.CreateICmpEQ(
+                    builder_.CreateSRem(y, builder_.getInt32(400)),
+                    builder_.getInt32(0), "dim.by400");
+                llvm::Value* leap = builder_.CreateAnd(
+                    by4, builder_.CreateOr(builder_.CreateNot(by100), by400),
+                    "dim.leap");
+                llvm::Value* feb = builder_.CreateSelect(
+                    leap, builder_.getInt32(29), builder_.getInt32(28), "dim.feb");
+                llvm::Value* isFeb = builder_.CreateICmpEQ(
+                    mo, builder_.getInt32(2), "dim.isfeb");
+                llvm::Value* is30 = builder_.CreateOr(
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(mo, builder_.getInt32(4)),
+                        builder_.CreateICmpEQ(mo, builder_.getInt32(6))),
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(mo, builder_.getInt32(9)),
+                        builder_.CreateICmpEQ(mo, builder_.getInt32(11))),
+                    "dim.is30");
+                return builder_.CreateSelect(
+                    is30, builder_.getInt32(30),
+                    builder_.CreateSelect(isFeb, feb, builder_.getInt32(31),
+                                          "dim.rest"),
+                    "dim.days");
+            };
             // Determine element size from the first generic arg (if present).
             // For pointer-typed elements (class, string) → sizeof(ptr) = 8.
             // For int → 4, long → 8, double → 8, bool → 1, etc.
@@ -8997,19 +9043,42 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // properties the components read back through: Month 1..12,
                 // Day 1..31, Hour 0..23, Minute 0..59, Second 0..59.
                 // Without the guard the C `timegm` normalised the value
-                // (day -1 read back as 30).  Year, Millisecond and the
-                // day-of-month-for-the-month rule state no range in §2.5 and
-                // are NOT checked here (reported as spec questions).
+                // (day -1 read back as 30).
+                //
+                // fix #7819 (stdlib §2.5, v0.355) — the FULL component set.
+                // The v0.355 "Component ranges" paragraph states the ranges
+                // the constructors must enforce: "`year` 1..9999, `month`
+                // 1..12, `day` 1 to the length of that month in that year of
+                // the proleptic Gregorian calendar that ISO 8601 uses
+                // (February 29 exists only in a leap year), `hour` 0..23,
+                // `minute` 0..59, `second` 0..59 and `millisecond` 0..999".
+                // The v0.350 text the earlier fix cited stated NO range for
+                // the year, the millisecond or the day-of-month-for-the-month
+                // rule, so those three went unchecked; the v0.355 text states
+                // all three, and the millisecond is what the issue's own a9
+                // probe (2000000) exercises.
+                //
                 // A construction with NO arguments is the generic body's
                 // `new T()` at `T = DateTime` (spec §14.2 `where T: new()`:
                 // for a value type it is `default(T)`); it has no components
                 // to validate.
-                if (!ne.args.empty())
+                if (!ne.args.empty()) {
+                    // The day-of-month limit is a RUNTIME quantity (the year
+                    // and the month are runtime values), so it is computed in
+                    // the IR — `dateDaysInMonth`.
+                    llvm::Value* dim = dateDaysInMonth(yr, mo);
+                    llvm::Value* dayBad = builder_.CreateICmpUGT(
+                        builder_.CreateSub(day, builder_.getInt32(1)),
+                        builder_.CreateSub(dim, builder_.getInt32(1)),
+                        "dt.day.oob");
                     emitGuardThrow(
-                        dateComponentOutOfRange({{mo, 1, 12}, {day, 1, 31},
-                                                 {hr, 0, 23}, {mn, 0, 59},
-                                                 {sec, 0, 59}}),
+                        builder_.CreateOr(
+                            dateComponentOutOfRange({{yr, 1, 9999}, {mo, 1, 12},
+                                                     {hr, 0, 23}, {mn, 0, 59},
+                                                     {sec, 0, 59}, {ms, 0, 999}}),
+                            dayBad),
                         "ArgumentOutOfRangeException");
+                }
                 auto* fn = declareC("bz_datetime_parts_to_ticks", i64(),
                     {i32(), i32(), i32(), i32(), i32(), i32(), i32()});
                 llvm::Value* ticks = builder_.CreateCall(fn,
@@ -9099,11 +9168,27 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // components carry the ranges §2.5 states for `DateTime`'s
                 // (`DateTime.Date: DateOnly` is "the date components"):
                 // Month 1..12, Day 1..31.
+                // fix #7819 (stdlib §2.5, v0.355): the "Component ranges"
+                // paragraph states the DATE ranges the constructors must
+                // enforce — "`year` 1..9999, `month` 1..12, `day` 1 to the
+                // length of that month in that year of the proleptic
+                // Gregorian calendar that ISO 8601 uses (February 29 exists
+                // only in a leap year)" — and "`DateOnly` takes the date
+                // ranges". So the year and the day-of-month-for-the-month
+                // rule are checked too.
                 // (No arguments: the §14.2 generic `new T()` at `T = DateOnly`.)
-                if (!ne.args.empty())
+                if (!ne.args.empty()) {
+                    llvm::Value* dim = dateDaysInMonth(yr, mo);
+                    llvm::Value* dayBad = builder_.CreateICmpUGT(
+                        builder_.CreateSub(day, builder_.getInt32(1)),
+                        builder_.CreateSub(dim, builder_.getInt32(1)),
+                        "do.day.oob");
                     emitGuardThrow(
-                        dateComponentOutOfRange({{mo, 1, 12}, {day, 1, 31}}),
+                        builder_.CreateOr(
+                            dateComponentOutOfRange({{yr, 1, 9999}, {mo, 1, 12}}),
+                            dayBad),
                         "ArgumentOutOfRangeException");
+                }
                 auto* fn = declareC("bz_datetime_parts_to_ticks", i64(),
                     {i32(), i32(), i32(), i32(), i32(), i32(), i32()});
                 llvm::Value* ticks = builder_.CreateCall(fn,
@@ -9131,6 +9216,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 llvm::Value* mn  = getI32to(1);
                 llvm::Value* sc  = getI32to(2);
                 llvm::Value* ms  = getI32to(3);
+                // fix #7819 (stdlib §2.5, v0.355): the `TimeOnly` constructor
+                // "raises ArgumentOutOfRangeException on invalid components",
+                // and §2.5's "Component ranges" paragraph says "`TimeOnly`
+                // takes the time ranges": "`hour` 0..23, `minute` 0..59,
+                // `second` 0..59 and `millisecond` 0..999". Without the guard
+                // the arm summed the components into a millisecond-of-midnight
+                // and read back a WRAPPED value (the issue's d2 probe: a
+                // millisecond of 65535 read back 0).
+                // (No arguments: the §14.2 generic `new T()` at
+                // `T = TimeOnly`.)
+                if (!ne.args.empty())
+                    emitGuardThrow(
+                        dateComponentOutOfRange({{hr, 0, 23}, {mn, 0, 59},
+                                                 {sc, 0, 59}, {ms, 0, 999}}),
+                        "ArgumentOutOfRangeException");
                 // ms_from_midnight = hr*3600000 + mn*60000 + sc*1000 + ms
                 llvm::Value* r = builder_.CreateMul(hr, builder_.getInt32(3600000));
                 r = builder_.CreateAdd(r, builder_.CreateMul(mn, builder_.getInt32(60000)));
