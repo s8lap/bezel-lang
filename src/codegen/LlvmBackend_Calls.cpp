@@ -5996,6 +5996,110 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return builder_.CreateFDiv(total, cnt, "avg.r");
         }
+        // fix #8272 (spec §14.2 *Interface conformance* rule 1 / §14.1,
+        // stdlib §5.1 / §2.8, v0.355): the element's `CompareTo` when it is
+        // INHERITED from a GENERIC base class — the ORDERING AUTHORITY the
+        // no-selector `Min()`/`Max()` (and their `*OrNull` siblings) must use.
+        //
+        // WHAT THE DOCUMENTS REQUIRE.
+        //   * stdlib §5.1 declares the no-selector form as
+        //         public extension IEnumerable<T> where T: IComparable<T>
+        //           public method Min(): T;  public method Max(): T;
+        //     and stdlib §2.8 declares the ordering authority
+        //         public interface IComparable<T>
+        //           method CompareTo(other: T): int;
+        //   * spec §14.2 *Interface conformance* rule 1 admits an INHERITED
+        //     implementation — "a base class declares them" — so an element
+        //     that reaches `IComparable<E>` through a GENERIC base conforms.
+        //   * spec §14.1 makes that authority the MONOMORPHIZED member: "An
+        //     instantiation of a generic declaration is the constructed type
+        //     or constructed member obtained by substituting type arguments
+        //     for its type parameters" — so the ordering `CompareTo` is
+        //     `B2<E>.CompareTo(other: E)`, NOT the erased template
+        //     `B2<T>.CompareTo(other: T)`.
+        //
+        // THE DEFECT (MEASURED). `findMethodByName` returns the BASE's method
+        // SYMBOL, and `methodFns_[symbol]` is the ERASED TEMPLATE: its
+        // `T`-typed parameter lowers to the i32 placeholder, so the template
+        // is `i32 (ptr, i32)` while the ordering call passes the element
+        // POINTER:
+        //     i32 %54 = call i32 @"bz$M.B2$CompareTo"(ptr %mm.el, ptr %mm.acc)
+        // and the IR verifier ABORTED the compiler ("Call parameter type does
+        // not match function signature!") on a program stdlib §5.1 admits.
+        //
+        // THE FIX. Ask `buildSpecializedMethodFn` — the ONE generic-method
+        // instantiation path (§14.1) — for the body under the ancestor
+        // substitution `computeAncestorGenericSubst` derives (the same walk
+        // the source-level `el.CompareTo(acc)` call site uses, so the
+        // ordering and a written-out call agree on ONE function), and call
+        // that specialization directly: a NON-VIRTUAL `CompareTo` dispatches
+        // statically, so the direct call IS the dispatch.
+        //
+        // ⚠ A VIRTUAL `CompareTo` is EXCLUDED — it dispatches through the
+        // vtable, and a direct call would bypass a further-derived class's
+        // override. The vtable path is left exactly as it was.
+        //
+        // `applied` distinguishes "this shape does not apply" (the caller
+        // keeps its existing lowering, byte for byte) from "this shape
+        // applies but the specialization could not be built" — which must
+        // become a DIAGNOSTIC, never a mistyped call.
+        auto genericBaseCompareToFn =
+            [&](sema::MethodSymbol* cmpMs, const sema::TypeRef* elemTy,
+                bool* applied) -> llvm::Function* {
+            if (applied) *applied = false;
+            if (!cmpMs || !elemTy || !cmpMs->parent ||
+                elemTy->kind != sema::TypeRef::Kind::Named ||
+                !elemTy->declaration)
+                return nullptr;
+            // The `CompareTo` must be INHERITED (declared by a STRICT base of
+            // the element): a `CompareTo` the element declares itself is
+            // already compiled against the element's own layout.
+            if (cmpMs->parent == elemTy->declaration) return nullptr;
+            // ... and that base must be GENERIC: only then is the compiled
+            // body the ERASED TEMPLATE.
+            if (sema::genericParamCount(cmpMs->parent) == 0) return nullptr;
+            // A VIRTUAL `CompareTo` dispatches through the vtable (§12).
+            if (vtableSlot_.count(cmpMs)) return nullptr;
+            // The erased TEMPLATE's own shape decides whether the existing
+            // call is MISTYPED: a `T`-typed parameter lowers to the i32
+            // placeholder, so the template takes an `i32` where the call
+            // passes the element pointer. A template that already takes a
+            // pointer is left alone — its call is well-typed.
+            auto fnIt = methodFns_.find(cmpMs);
+            if (fnIt == methodFns_.end()) return nullptr;
+            llvm::FunctionType* tft = fnIt->second->getFunctionType();
+            if (tft->getNumParams() != 2 || tft->isVarArg() ||
+                tft->getParamType(1)->isPointerTy())
+                return nullptr;
+            if (applied) *applied = true;
+            // §14.1: the ancestor's type parameters, bound at the ELEMENT's
+            // instantiation.
+            std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+            if (!computeAncestorGenericSubst(elemTy, cmpMs->parent, ancSubst,
+                                              ancSema))
+                return nullptr;
+            CallableInfo ci;
+            if (!callableInfo(cmpMs, ci)) return nullptr;
+            auto savedSubst = genericSubst_;
+            auto savedSemaTy = genericSubstSemaTy_;
+            genericSubst_ = std::move(ancSubst);
+            genericSubstSemaTy_ = std::move(ancSema);
+            llvm::Function* specFn =
+                buildSpecializedMethodFn(cmpMs, ci, {ptrTy(), ptrTy()});
+            genericSubst_ = std::move(savedSubst);
+            genericSubstSemaTy_ = std::move(savedSemaTy);
+            if (!specFn) return nullptr;
+            // The specialization's OWN shape decides whether it can carry
+            // this call: `int CompareTo(ptr this, ptr other)`.
+            llvm::FunctionType* sft = specFn->getFunctionType();
+            if (sft->getNumParams() != 2 || sft->isVarArg() ||
+                !sft->getReturnType()->isIntegerTy(32) ||
+                !sft->getParamType(0)->isPointerTy() ||
+                !sft->getParamType(1)->isPointerTy())
+                return nullptr;
+            return specFn;
+        };
         // per §5 LINQ: .Min/.Max (fn: (T)->int): int  or no-arg for Array<int>
         // fix #666 / stdlib §5.1: also handles Min/Max over Array<decimal> via bz_decimal_cmp.
         if ((m == "Min" || m == "Max") &&
@@ -6204,6 +6308,38 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                             findMethodByName(elemTypeRef->declaration, "CompareTo"))
                         if (cm->params.size() == 1) cmpMs = cm;
                 }
+                // fix #8272 (spec §14.2 rule 1 / §14.1, stdlib §5.1 / §2.8,
+                // v0.355): an INHERITED `CompareTo` from a GENERIC base orders
+                // by the MONOMORPHIZED member (`B2<E>.CompareTo(other: E)`),
+                // not by the erased template — whose `T`-typed parameter is
+                // the i32 placeholder, so the ordering call passed the
+                // element POINTER where an `i32` was expected and the IR
+                // verifier aborted the compiler.
+                //
+                // Resolved HERE, before the comparison loop's blocks exist, so
+                // a shape that cannot be monomorphized ends the compile with a
+                // DIAGNOSTIC and a well-formed module (LlvmBackend.cpp's
+                // emitObjectFile verifies the module BEFORE any file I/O).
+                llvm::Function* genCmpFn = nullptr;
+                if (cmpMs) {
+                    bool applied = false;
+                    genCmpFn =
+                        genericBaseCompareToFn(cmpMs, elemTypeRef, &applied);
+                    if (applied && !genCmpFn) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, call.span.begin,
+                            std::string(m) +
+                            "() without a selector cannot order the element "
+                            "type `" + std::string(elemTypeRef->headName()) +
+                            "`: its `CompareTo` is inherited from the generic "
+                            "base `" + std::string(cmpMs->parent->name) +
+                            "` and could not be monomorphized at the element's "
+                            "own instantiation (stdlib §5.1 / §2.8, spec §14.2 "
+                            "/ §14.1 / #8272). Use " + std::string(m) +
+                            "(selector: (T) -> U) instead.");
+                        return llvm::ConstantPointerNull::get(ptrTy());
+                    }
+                }
                 // fix #2770 (stdlib §5.1, spec §14.2, v0.240): an INTERFACE
                 // element never satisfies the probe above — findMethodByName
                 // walks CLASS bases only (baseClassOf) and additionally demands
@@ -6295,6 +6431,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         // `el.CompareTo(acc)` uses. `ep` and `accSlot` are slot
                         // ADDRESSES, which is the thunk's ABI.
                         cmp = builder_.CreateCall(ifaceCmpFn, {ep, accSlot},
+                                                  "mm.cmp");
+                    } else if (genCmpFn) {
+                        // fix #8272: the MONOMORPHIZED inherited `CompareTo`
+                        // (spec §14.1) — the very function a written-out
+                        // `el.CompareTo(acc)` calls for this element.
+                        cmp = builder_.CreateCall(genCmpFn, {el, acc},
                                                   "mm.cmp");
                     } else {
                         std::vector<llvm::Value*> cargs{el, acc};
@@ -7086,6 +7228,67 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 !elemTypeRef->nullable &&
                 isUnsignedPrim(elemTypeRef->primitive);
             llvm::Type* elemLLTy = getElemTy();
+            // fix #8272 (spec §14.2 *Interface conformance* rule 1 / §14.1,
+            // stdlib §5.1 / §2.8, v0.355): the ORDERING AUTHORITY for a
+            // pointer element — the §9.6 string relation, the §13 itable
+            // `CompareTo` (interface), or the element's own `CompareTo`
+            // (class). Resolved HERE, before the comparison loop's blocks
+            // exist, so the INHERITED GENERIC-BASE case can be
+            // monomorphized (and, when it cannot be, reported as a
+            // DIAGNOSTIC) while the module is still well-formed
+            // (LlvmBackend.cpp's emitObjectFile verifies the module BEFORE
+            // any file I/O).
+            llvm::Value* shouldUpdate;
+            bool isStrElem = isStringTypeRefNonNull(elemTypeRef);
+            sema::MethodSymbol* cmpMs = nullptr;
+            llvm::Function* ifaceCmpFn = nullptr;
+            if (!isStrElem && elemTypeRef &&
+                elemTypeRef->kind == sema::TypeRef::Kind::Named &&
+                (elemTypeRef->declaration == nullptr ||
+                 elemTypeRef->declaration->kind ==
+                     ast::TypeDeclKind::Class ||
+                 elemTypeRef->declaration->kind ==
+                     ast::TypeDeclKind::Interface)) {
+                if (elemTypeRef->declaration) {
+                    if (sema::MethodSymbol* cm =
+                            findMethodByName(elemTypeRef->declaration,
+                                             "CompareTo"))
+                        if (cm->params.size() == 1) cmpMs = cm;
+                }
+                if (!cmpMs) {
+                    if (sema::MethodSymbol* ifm =
+                            selfComparableIfaceCompareTo(elemTypeRef))
+                        ifaceCmpFn =
+                            ensureIfaceCmpThunk(
+                                elemTypeRef->declaration, ifm);
+                }
+            }
+            // fix #8272: an INHERITED `CompareTo` from a GENERIC base orders
+            // by the MONOMORPHIZED member (`B2<E>.CompareTo(other: E)`), not
+            // by the erased template — whose `T`-typed parameter is the i32
+            // placeholder, so the ordering call passed the element POINTER
+            // where an `i32` was expected and the IR verifier aborted the
+            // compiler.
+            llvm::Function* genCmpFn = nullptr;
+            if (cmpMs) {
+                bool applied = false;
+                genCmpFn =
+                    genericBaseCompareToFn(cmpMs, elemTypeRef, &applied);
+                if (applied && !genCmpFn) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, call.span.begin,
+                        std::string(m) +
+                        "() without a selector cannot order the element "
+                        "type `" + std::string(elemTypeRef->headName()) +
+                        "`: its `CompareTo` is inherited from the generic "
+                        "base `" + std::string(cmpMs->parent->name) +
+                        "` and could not be monomorphized at the element's "
+                        "own instantiation (stdlib §5.1 / §2.8, spec §14.2 "
+                        "/ §14.1 / #8272). Use " + std::string(m) +
+                        "(selector: (T) -> U) instead.");
+                    return llvm::ConstantPointerNull::get(ptrTy());
+                }
+            }
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
             // Empty path: return null T? (skip the scan entirely).
@@ -7133,31 +7336,6 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // bz_str_compare_cp (string, §9.6), itable CompareTo (interface,
             // #2770), or direct CompareTo call (class). For numeric
             // primitive elements, use direct icmp/fcmp.
-            llvm::Value* shouldUpdate;
-            bool isStrElem = isStringTypeRefNonNull(elemTypeRef);
-            sema::MethodSymbol* cmpMs = nullptr;
-            llvm::Function* ifaceCmpFn = nullptr;
-            if (!isStrElem && elemTypeRef &&
-                elemTypeRef->kind == sema::TypeRef::Kind::Named &&
-                (elemTypeRef->declaration == nullptr ||
-                 elemTypeRef->declaration->kind ==
-                     ast::TypeDeclKind::Class ||
-                 elemTypeRef->declaration->kind ==
-                     ast::TypeDeclKind::Interface)) {
-                if (elemTypeRef->declaration) {
-                    if (sema::MethodSymbol* cm =
-                            findMethodByName(elemTypeRef->declaration,
-                                             "CompareTo"))
-                        if (cm->params.size() == 1) cmpMs = cm;
-                }
-                if (!cmpMs) {
-                    if (sema::MethodSymbol* ifm =
-                            selfComparableIfaceCompareTo(elemTypeRef))
-                        ifaceCmpFn =
-                            ensureIfaceCmpThunk(
-                                elemTypeRef->declaration, ifm);
-                }
-            }
             // fix #8092 (stdlib §2.5 / §5.1 / §2.8, spec §14.2, v0.355): a
             // VALUE-typed element that is not a pointer — a BUILT-IN VALUE
             // RECORD (`DateTime`, `TimeSpan`, `DateOnly`, `TimeOnly`) or a
@@ -7236,6 +7414,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                              {ptrTy(), ptrTy(), i32()});
                     cmp = builder_.CreateCall(
                         cmpCpFn, {el, acc, builder_.getInt32(0)}, "mon.cmp");
+                } else if (genCmpFn) {
+                    // fix #8272: the MONOMORPHIZED inherited `CompareTo`
+                    // (spec §14.1) — the very function a written-out
+                    // `el.CompareTo(acc)` calls for this element.
+                    cmp = builder_.CreateCall(genCmpFn, {el, acc}, "mon.cmp");
                 } else if (ifaceCmpFn) {
                     cmp = builder_.CreateCall(ifaceCmpFn, {ep, accSlot},
                                               "mon.cmp");
