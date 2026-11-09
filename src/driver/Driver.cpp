@@ -5,6 +5,7 @@
 #include <memory>
 #include <sstream>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -202,6 +203,149 @@ void injectStdlibPrelude(ast::SourceFile& unit) {
     injectOnePrelude(unit, timeSrc);     // stdlib §2.5 DayOfWeek / DateTimeKind
 }
 
+// fix #7680 (stdlib §2.5 / §7.1-§7.2, spec §2.8.3 rule 3, v0.355): make the
+// auto-imported stdlib prelude ENUMS one type across modules.
+//
+// WHY. The driver injects the stdlib prelude declarations into EVERY
+// compilation unit (`injectStdlibPrelude` above), so every module parses its
+// own copy of `DayOfWeek` / `DateTimeKind` (stdlib §2.5) and of
+// `SeekOrigin` / `FileMode` / `FileAccess` (stdlib §7.1-§7.2). Each copy is
+// declared in the USER's module — `SymbolCollection::collectTypeDecl` reads
+// the enclosing module — so under spec §2.8.3 rule 3 ("a type is identified
+// program-wide by its declaring module name, its qualified type name ... and
+// its generic arity") the copies are DIFFERENT types, although the stdlib
+// declares exactly one of each (stdlib §2, the auto-imported `System`).
+//
+// The consequence at a module boundary: the exporter does not export the
+// prelude decl (`ModuleMetadataBuilder` skips an `isSynthesizedPrelude` type —
+// every importer injects its own copy), so the importer's `Loader::convert`
+// finds no exported type named "DayOfWeek" and the imported reference arrives
+// with `declaration == nullptr`. An unbound Named reference is an OPAQUE type
+// to the importer: it lowers to the i32 placeholder (so the value read back
+// from the exporter's byte-wide enum return slot was garbage), and the §8.4
+// enum-equality rule rejects a comparison of it with the importing module's
+// own `DayOfWeek` ("operator `=` compares enum `DayOfWeek` with a non-enum
+// operand").
+//
+// WHAT. Bind such an IMPORTED reference to the importing module's OWN copy of
+// the prelude enum — the very symbol its own `DayOfWeek.Friday` resolves to —
+// so the two are ONE type: the comparison is admitted, the imported value
+// carries the enum's own storage width (byte, per stdlib §2.5), and the §8.5
+// ToString renders the stdlib module's qualified name ("System.DayOfWeek")
+// exactly as the same-module spelling does.
+//
+// ONLY a reference the loader left UNBOUND is bound, and it is bound by NAME
+// against the prelude decls THIS module actually carries:
+//   - a reference that already bound to a real exported type keeps that
+//     binding, so a dependency that exports its OWN `DayOfWeek` is never
+//     silently re-typed as the stdlib enum (§2.8.3 rule 3);
+//   - a module that declares its own top-level `DayOfWeek` shadows the
+//     prelude (§2.3), so it has no prelude enum to bind to and the §8.4
+//     rejection of a comparison against the user's own enum stands.
+//
+// THE LIMIT THIS SEAM CANNOT CROSS (measured; reported, not fixed here).
+// The artifact interface carries a type by its QUALIFIED NAME only
+// (`ModuleMetadataBuilder::convertType` writes `declaration->qualifiedTypeName()`),
+// so a dependency that declares its OWN non-exported type of a prelude's name
+// and exposes it in a public signature is indistinguishable on the wire from
+// the dependency's own prelude copy — the name is the same string. This
+// binding then re-types that reference as the stdlib enum, where the
+// pre-fix compiler left it opaque (and the §8.4 comparison rejected).
+// Closing that needs the exporter's interface to SAY that the name is the
+// stdlib type (`src/module/ModuleMetadataBuilder.cpp`'s `convertType` plus
+// `src/module/ModuleLoader.cpp`'s `Loader::convert`), which is outside this
+// lane's grant; the shape is measured as row r15 in the handback.
+//
+// The prelude CHOICE (`Result<T, E>`, stdlib §2.20) is NOT bound here: it is
+// not an enum, and its cross-module identity is a separate question (the
+// choice's cases are matched, not compared) — measured as row r11.
+void bindImportedPreludeEnums(sema::SemaContext& ctx) {
+    sema::ModuleSymbol* mod = ctx.module();
+    if (!mod) return;
+    // The imported symbols, once. `hasImports()` is NOT the gate: a dependency
+    // that exports only extension blocks never populates `importedByModule_`,
+    // yet its extension members' signatures carry types too.
+    std::vector<sema::Symbol*> imported = ctx.importedSymbols();
+    if (imported.empty()) return;
+    // The prelude enums THIS module carries. `isSynthesizedPrelude` is the
+    // marker (the same one `ExprTypecheck_Calls.cpp`'s DateTime property and
+    // `LlvmBackend_impl.hpp`'s §8.5 rendering read), so a USER type of the
+    // same name is never mistaken for the stdlib one.
+    std::unordered_map<std::string_view, sema::TypeSymbol*> preludeEnums;
+    for (sema::Symbol* child : mod->children) {
+        auto* ts = dynamic_cast<sema::TypeSymbol*>(child);
+        if (!ts || !ts->isSynthesizedPrelude) continue;
+        if (ts->kind != ast::TypeDeclKind::Enum) continue;
+        preludeEnums.emplace(ts->name, ts);
+    }
+    if (preludeEnums.empty()) return;
+
+    // Every type an IMPORTED signature carries: a method's return type, a
+    // member's type, a formal's type, a choice payload's type and a base
+    // type's refs (each is a `TypeRef` the loader reconstructed from the
+    // dependency's metadata).
+    std::vector<sema::TypeRef*> pending;
+    auto add = [&pending](sema::TypeRef* t) {
+        if (t) pending.push_back(t);
+    };
+    for (sema::Symbol* sym : imported) {
+        if (auto* p = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            add(p->resolvedDeclType);
+        } else if (auto* m = dynamic_cast<sema::MethodSymbol*>(sym)) {
+            add(ctx.importedReturnType(m));
+        } else if (auto* f = dynamic_cast<sema::FieldSymbol*>(sym)) {
+            add(ctx.importedMemberType(f));
+        } else if (auto* p = dynamic_cast<sema::PropertySymbol*>(sym)) {
+            add(ctx.importedMemberType(p));
+        } else if (auto* e = dynamic_cast<sema::EventSymbol*>(sym)) {
+            add(ctx.importedMemberType(e));
+        } else if (auto* c = dynamic_cast<sema::ConstMemberSymbol*>(sym)) {
+            add(ctx.importedMemberType(c));
+        } else if (auto* cs = dynamic_cast<sema::ChoiceCaseSymbol*>(sym)) {
+            // A choice payload's type rides the reconstructed `ast::Param`'s
+            // type NODE (the loader publishes it with `setResolvedType`), not
+            // the `importedMemberType` side table.
+            if (cs->caseDecl)
+                for (const ast::Param& pf : cs->caseDecl->payload)
+                    if (pf.type) add(ctx.resolvedType(*pf.type));
+        } else if (auto* t = dynamic_cast<sema::TypeSymbol*>(sym)) {
+            for (sema::TypeRef* base : t->baseTypeRefs) add(base);
+        } else if (auto* n = dynamic_cast<sema::NestedTypeSymbol*>(sym)) {
+            if (n->type)
+                for (sema::TypeRef* base : n->type->baseTypeRefs) add(base);
+        }
+    }
+
+    // Bind, walking into the type arguments and function types a reference
+    // carries, so a prelude enum nested in a generic argument is bound too.
+    while (!pending.empty()) {
+        sema::TypeRef* t = pending.back();
+        pending.pop_back();
+        if (!t) continue;
+        if (t->kind == sema::TypeRef::Kind::Named) {
+            if (!t->declaration && !t->importedName.empty()) {
+                auto it = preludeEnums.find(t->importedName);
+                if (it != preludeEnums.end()) {
+                    t->declaration = it->second;
+                    // The loader clears `importedName` on a successful
+                    // by-name bind (`Loader::resolvePendingNamed`), so the
+                    // reference becomes indistinguishable from one bound
+                    // eagerly: every reader that prefers `declaration` and
+                    // falls back to `importedName` sees one consistent state.
+                    t->importedName = std::string_view{};
+                }
+            }
+            for (sema::TypeRef* arg : t->genericArgs) pending.push_back(arg);
+        } else if (t->kind == sema::TypeRef::Kind::InlineArray) {
+            pending.push_back(t->arrayElement);
+        } else if (t->kind == sema::TypeRef::Kind::Function) {
+            for (const sema::TypeRef::FuncParam& fp : t->funcParams)
+                pending.push_back(fp.type);
+            pending.push_back(t->funcReturn);
+        }
+    }
+}
+
 // Proposal 0082 §3 stage-1 PROTOTYPE (#3048), reached only when
 // `CodegenOptions::scopedAwaitBind` is set — off by default, so with the flag
 // off not one instruction of this runs and the pipeline below is bit-for-bit
@@ -253,6 +397,14 @@ std::vector<SourceLocation> collectScopedAwaitBindSites(
                                              &failedPath, rootName))
             return sites;   // the real run reports it; stay silent here
     }
+    // fix #7680 (stdlib §2.5 / §7.1-§7.2, spec §2.8.3 rule 3, v0.355): the
+    // stdlib prelude enums are ONE type program-wide, so an imported
+    // reference to one binds to this module's own copy of it. After the
+    // loader (which is what leaves such a reference unbound), before type
+    // resolution (which is what reads the bound symbol). This scratch run
+    // mirrors compileExecutableObject's phase sequence verbatim, so the bind
+    // belongs here too.
+    bindImportedPreludeEnums(ctx);
     sema::resolveTypes(*unit, ctx);
     sema::typecheckExpressions(*unit, ctx);
     sema::checkPureBodies(*unit, ctx);
@@ -750,6 +902,12 @@ CompileResult Driver::compileExecutableObject(
                 return CompileResult{false, 1};
             }
         }
+        // fix #7680 (stdlib §2.5 / §7.1-§7.2, spec §2.8.3 rule 3, v0.355): the
+        // stdlib prelude enums are ONE type program-wide, so an imported
+        // reference to one binds to this module's own copy of it. After the
+        // loader (which is what leaves such a reference unbound), before type
+        // resolution (which is what reads the bound symbol).
+        bindImportedPreludeEnums(semaCtx);
         sema::resolveTypes(*unit, semaCtx);
         sema::typecheckExpressions(*unit, semaCtx);
         // §22.15 (v0.202, #2052): enforce the pure-body rule set on every
@@ -918,6 +1076,12 @@ CompileResult Driver::compileObject(const std::string& path,
                 return CompileResult{false, 1};
             }
         }
+        // fix #7680 (stdlib §2.5 / §7.1-§7.2, spec §2.8.3 rule 3, v0.355): the
+        // stdlib prelude enums are ONE type program-wide, so an imported
+        // reference to one binds to this module's own copy of it. After the
+        // loader (which is what leaves such a reference unbound), before type
+        // resolution (which is what reads the bound symbol).
+        bindImportedPreludeEnums(semaCtx);
         sema::resolveTypes(*unit, semaCtx);
         sema::typecheckExpressions(*unit, semaCtx);
         // §22.15 (v0.202, #2052): enforce the pure-body rule set on every
