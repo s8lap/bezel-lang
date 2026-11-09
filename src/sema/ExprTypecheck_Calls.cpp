@@ -15476,6 +15476,43 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             const bool builtinValueRecordElem =
                                 elem && !elem->nullable &&
                                 !mathOrderedTimeValueHead(elem).empty();
+                            // fix #8323 / #8264 (stdlib §2.6 / §2.8 / §5.1,
+                            // spec §14.2, v0.355): the BUILT-IN `Guid`.
+                            // stdlib §2.6 declares
+                            //     public record Guid: IComparable<Guid>, IEquatable<Guid>
+                            // with "CompareTo = lexicographic over the 16
+                            // canonical big-endian bytes", so `T = Guid`
+                            // SATISFIES §5.1's `where T: IComparable<T>` and
+                            // §14.2 admits it ("records and enums implementing
+                            // it"). `Guid` is a BUILT-IN value record: it
+                            // carries no user `TypeDecl`, so it has no
+                            // `baseTypeRefs` and the class/record/interface
+                            // arms above could not see its conformance — the
+                            // same shape #7766 fixed for §2.5's temporal
+                            // records and #8237 fixed for §4.4's
+                            // `Array<Guid>.Sort()`.
+                            //
+                            // The predicate is `sema::isStdlibGuidType` (sema/
+                            // BuiltinValueTypes.hpp) — THE SAME predicate
+                            // codegen consults for §2.6's `Guid`, so the two
+                            // sides cannot disagree about WHICH type this is
+                            // (a USER type named `Guid` is not the built-in).
+                            //
+                            // ⚠ THE ORDERING half is NOT here: the collection
+                            // `Min()` / `Max()` lowering in
+                            // `src/codegen/LlvmBackend_Calls.cpp` has no
+                            // `Guid` arm (its own comment: "`Guid` … is NOT
+                            // here: it is a `{i64,i64}` STRUCT whose §2.6
+                            // order is 'lexicographic over the 16 canonical
+                            // big-endian bytes', not a scalar-word order, so
+                            // it needs a structural comparison of its own"),
+                            // so the call is still refused there. What this
+                            // hunk fixes is the SEMANTIC half: the §5.1 gate
+                            // admits the call and its RESULT TYPE is `T`
+                            // (§5.1's `public method Min(): T;`), not the
+                            // `int` default the un-decided element fell to.
+                            const bool builtinGuidElem =
+                                elem && sema::isStdlibGuidType(elem);
                             const bool userRecordElem =
                                 elem && !elem->nullable &&
                                 elem->kind == TypeRef::Kind::Named &&
@@ -15596,7 +15633,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                             const bool comparableElem =
                                 ptrComparableElem || builtinValueRecordElem ||
-                                userRecordComparable;
+                                userRecordComparable || builtinGuidElem;
                             if ((m == "Min" || m == "Max") && ce.args.empty() &&
                                 comparableElem) {
                                 // per §5.1 / §14.2 (#1198): enforce the
@@ -15667,6 +15704,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 if (elem->kind == TypeRef::Kind::Named &&
                                     elem->declaration &&
                                     !builtinValueRecordElem &&
+                                    !builtinGuidElem &&
                                     !userRecordComparable)
                                     implIComp = classOrIfaceComparableAtInstance(
                                         elem);
@@ -16336,11 +16374,30 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // the stdlib section that declares the member
                                 // (§4.4 for `Array<T>`, §4.5 for
                                 // `OwningArray<T>`). Element name via the
-                                // file-local `typeNameForDiag` (line 43) so the
-                                // message names the failing type and its
+                                // file-local `spelledResolvedTypeForSignature`
+                                // so the message names the failing type and its
                                 // `IComparable<>` substitution concretely.
+                                //
+                                // fix #8273 (spec §14.2, stdlib §4.4, v0.355):
+                                // the element is spelled with the TRAILING
+                                // nullable marker (`Guid?`), not the PREFIXED
+                                // `?Guid` `typeNameForDiag` produces. `?Guid` is
+                                // NOT valid Bezel — the grammar spells a
+                                // nullable type with a TRAILING `?` — so the
+                                // suggested remedy
+                                // `Sort(comparer: (?Guid, ?Guid) -> int)`
+                                // could not be pasted back into a program, and
+                                // neither could the type named in the
+                                // constraint. `spelledResolvedTypeForSignature`
+                                // (this file, fix #6871) is the house
+                                // spelling for the trailing form — the SAME
+                                // function the signature-printing diagnostics
+                                // already use — so the two cannot drift apart.
+                                // A NON-NULLABLE element (`Plain`, `Widget`) is
+                                // spelled identically by both helpers, so only
+                                // the nullable case changes.
                                 const std::string elemName =
-                                    typeNameForDiag(elemTy472);
+                                    spelledResolvedTypeForSignature(elemTy472);
                                 const std::string stdlibSection =
                                     (colName == "OwningArray")
                                         ? "stdlib §4.5"
@@ -16351,7 +16408,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     ">." + std::string(m) +
                                     "() requires T: IComparable<T> "
                                     "(spec §14.2, " + stdlibSection +
-                                    ", v0.276); " +
+                                    ", v0.355); " +
                                     elemName + " does not implement " +
                                     "IComparable<" + elemName + ">. Use " +
                                     std::string(m) +

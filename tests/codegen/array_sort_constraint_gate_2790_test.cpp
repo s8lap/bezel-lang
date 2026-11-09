@@ -105,7 +105,7 @@ BEZEL_TEST(array_sort_constraint_gate_2790, sort_non_comparable_class_rejected) 
         "    arr.Sort(); "
         "    return arr[0].V() * 16 + arr[1].V() * 4 + arr[2].V(); "),
 "Array<Plain>.Sort() requires T: IComparable<T> "
-        "(spec §14.2, stdlib §4.4, v0.276); Plain does not implement "
+        "(spec §14.2, stdlib §4.4, v0.355); Plain does not implement "
         "IComparable<Plain>"));
 }
 
