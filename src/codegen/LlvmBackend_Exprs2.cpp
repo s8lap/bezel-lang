@@ -398,9 +398,57 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
     builder_.CreateCondBr(isNull, rhsBB, endBB);
 
     builder_.SetInsertPoint(rhsBB);
-    llvm::Value* r = lowerExpr(*bin.right);
+    // fix #7879 (§7.7 / §15.4 / §20, v0.355): the RIGHT OPERAND of a `??` may
+    // be a COLLECTION LITERAL (`a ?? [1]`). A collection literal is not a
+    // general expression value — `lowerExpr` returns null for a
+    // `CollectionLiteralExpr` (it names no target type of its own; §15.4 gives
+    // it one from the CONTEXT) — so the literal must be MATERIALIZED against
+    // the join's contextual target type, exactly as the return / local-decl /
+    // call-argument arms do (`lowerReturnCollectionLiteral`, the shared
+    // "materialize this literal against this target type" helper).
+    //
+    // §7.7's typing rule names that target: "for a left operand of type `T?`,
+    // the right operand must be implicitly convertible (§5.1) to `T` or to
+    // `T?`" — so it is the LEFT operand's type `T`, which is also the `??`
+    // expression's own result type (sema derives the result from the LHS:
+    // `ctx_.exprType(bin)`). A literal right operand is never nullable, so
+    // the result type is `T` (the non-nullable form of the LHS's type).
+    //
+    // MEASURED (R41, base a30bb11d): through the plain `lowerExpr` path the
+    // literal never lowered — `r` came back null and `lowerCoalesce` bailed
+    // out with `return nullptr` AFTER the entry block had already been
+    // branched to `coalesce.rhs` / `coalesce.end`, so NOTHING ever terminated
+    // `coalesce.end`: the merge block was left open and the LLVM verifier
+    // rejected the whole module ("Basic Block in function 'bz$M.C$Bad' does
+    // not have terminator!"). The #2491 / #2434 degrade notes were the
+    // SYMPTOM of that bail-out, not its cause.
+    llvm::Value* r = nullptr;
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+            bin.right.get())) {
+        const sema::TypeRef* coalTargetTy = ctx_.exprType(bin);
+        if (!coalTargetTy && bin.left) coalTargetTy = ctx_.exprType(*bin.left);
+        if (coalTargetTy) r = lowerReturnCollectionLiteral(cl, coalTargetTy);
+    }
+    if (!r) r = lowerExpr(*bin.right);
     bool rhsDiverged = diverged_;  // CG40: e.g. `a ?? throw E`
-    if (!r) return nullptr;
+    if (!r) {
+        // fix #7879 (§7.7): `??` is a CONTROL-FLOW JOIN (K7) — a PHI-join of
+        // two branches — so the merge block this function creates MUST be
+        // terminated. Bailing out here WITHOUT closing the join's shape left
+        // `%coalesce.end` open and the module malformed (the verifier
+        // rejected it), whatever the caller did with the null. Close the
+        // shape first: terminate the right-operand block into the merge
+        // block and leave the insert point IN the merge block, so the
+        // caller's degraded value (its own #2434 / #2491 note) lands there
+        // and the caller's terminator closes the block. The `??` still
+        // degrades to the caller's null value — only the IR SHAPE is
+        // repaired; a right operand that does not lower stays a degrade.
+        if (rhsDiverged) return nullptr;  // threw: rhsBB already terminated
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        return nullptr;
+    }
     // fix #1948 (RHS arm of the string `??` normalization above): mint the +1
     // the null path's result needs, in rhsEndBB (the block r is defined in, which
     // flows to endBB), before the branch. Skipped when the RHS is itself a +1
