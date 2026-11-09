@@ -36746,7 +36746,63 @@ bool Emitter::lowerOwnedChoiceFieldStore(const ast::Expr& target,
     // state: inside a destructor the sole disposal site for an owned location is
     // the auto-dispose pass, so vacating a local there would make it skip a
     // still-owned payload — a LEAK.
-    markOwningChoiceMovedFromCore(/*targetLd=*/nullptr, rhsExpr);
+    //
+    // fix #7858 (§17.8 / §35.4 / §15.3, v0.355): PEEL the `!` (and `move`)
+    // layers before the mark, so the marker sees the BARE IDENTIFIER the `!`
+    // read denotes.
+    //
+    // §17.8: "Over a named owned binding, `x!` is therefore classified by its
+    // position exactly as the bare read `x` is ... `sink._f := x!;` consumes `x`
+    // exactly as `sink._f := x;` does" (spec:3662). So `h.G := o!` is the SAME
+    // whole-value transfer as `h.G := o` — the local `o` is the TAKER and must
+    // be vacated with the payload — and the plain spelling's field-store caller
+    // marks it (this very call site, with a bare `rhsExpr`). The `!` spelling
+    // did not: `markOwningChoiceMovedFromCore`'s source test is a BARE
+    // IDENTIFIER (`dynamic_cast<const ast::IdentifierExpr*>`), and a
+    // `PostfixBangExpr` wrapper is not one, so the mark was DECLINED and the
+    // taker kept its scope-end active-case disposal while the field had
+    // already taken the payload — a double free.
+    //
+    // The peel is the SAME one the local-target sibling
+    // `markOwningChoiceLocalMovedFrom` (LlvmBackend_Disposal.cpp:8412) applies
+    // before it calls the same core — "The `!` and `move` layers, in either
+    // order, are peeled to the identifier the core marks". This field-store
+    // caller was the one the sibling's comment names as still keeping "their
+    // existing shapes" ("the argument and field-store callers of the core keep
+    // their existing shapes"), and that is the shape #7858 measures.
+    //
+    // MEASURED at r30-c1 (7d4c6614) on
+    //   var o: OC? := OC.Text(new Res()); var h := new Hold(); h.G := o!;
+    // -> AddressSanitizer: heap-use-after-free (READ of size 8) — the payload
+    // freed by the field's own disposal and read again by `o`'s scope-end
+    // active-case pass. The differential control is the plain spelling
+    // (`h.G := o`), which is clean today and stays clean.
+    //
+    // Only the postfix `!` and the `move` unary are peeled, and only the
+    // peeled result is substituted when it is a bare IDENTIFIER — the same
+    // admission the sibling uses, so a conditional or a fresh construction
+    // still reaches the core unchanged and the core's own conditional arm
+    // keeps its per-branch marking.
+    const ast::Expr* markSrc = rhsExpr;
+    {
+        const ast::Expr* core = markSrc;
+        while (core) {
+            if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core)) {
+                if (!pb->operand) break;
+                core = pb->operand.get();
+                continue;
+            }
+            if (auto* u = dynamic_cast<const ast::UnaryExpr*>(core)) {
+                if (u->op != "move" || !u->operand) break;
+                core = u->operand.get();
+                continue;
+            }
+            break;
+        }
+        if (core != markSrc && dynamic_cast<const ast::IdentifierExpr*>(core))
+            markSrc = core;
+    }
+    markOwningChoiceMovedFromCore(/*targetLd=*/nullptr, markSrc);
     builder_.CreateBr(joinBB);
     builder_.SetInsertPoint(joinBB);
     return true;

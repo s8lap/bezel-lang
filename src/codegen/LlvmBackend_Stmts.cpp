@@ -5121,6 +5121,96 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         disposeStack_.pop_back();
                     }
                 }
+            } else if (unboundOwningChoiceTemp(ds->value.get(),
+                                               ctx_.exprType(*ds->value))) {
+                // fix #7861 / §17.13 / §28.3 / §35.4 (v0.355): a discard
+                // `_ := Ret();` where `Ret` returns an OWNING-classified choice
+                // is an unbound owned temporary of a MOVE-ONLY value type, and
+                // §17.13 disposes it at the end of the discard statement:
+                // "For a **move-only value** (an owning inline array
+                // `[N owned]T?`/`[N owned]T`, or an owning-classified choice)
+                // its owned slots — for a choice, the active case's owned
+                // payloads — are disposed in the usual order" (spec:3841).
+                //
+                // The CLASS half of §17.13 was implemented (#1009's
+                // `disposeOwnedValue`), the owning-INLINE-ARRAY half (#1016's
+                // `disposeInlineOwnedArray`, the arm above), and the owning
+                // COLLECTION half (#1909's `disposeOwnedCollectionValue`) — but
+                // the owning-CHOICE half had NO arm: no `ast::DiscardStmt`
+                // flag names it, so the discarded choice was owned by NOTHING
+                // and its active case's payloads leaked outright.
+                //
+                // MEASURED at r30-c1 (7d4c6614) on
+                //   public static method Ret(): OC
+                //     var o: OC := OC.Text(new Res()); return o; end Ret;
+                //   public static method T() var o: OC? := OC.Text(new Res());
+                //     _ := Ret(); end T;
+                // printed `100` where `200` is the correct count (T's own
+                // local and Ret's local are two `Res` per iteration) and
+                // LeakSanitizer reported "1600 byte(s) leaked in 100
+                // allocation(s)" — exactly ONE of the two payloads per
+                // iteration, the discarded one. The same shape in the NULLABLE
+                // spelling (`Ret(): OC?`) and with the `!` spelling inside
+                // `Ret` (`return o!;`) leak identically.
+                //
+                // THE GATE IS THE BACKEND'S OWN OWNING-CHOICE AUTHORITY.
+                // `unboundOwningChoiceTemp` (LlvmBackend_Disposal.cpp) is the
+                // gate the §35.5 owning-match scrutinee temporary already
+                // reads, and it says: "THE ADMITTED SHAPE IS A CALL, and only a
+                // call. §15.3 makes an owning choice a move-only value type
+                // whose 'return transfers', and §35.3's case construction
+                // (`Outcome.Fetched(new Widget())`) is itself a CallExpr whose
+                // callee resolves to a ChoiceCaseSymbol — so both mint." It
+                // EXCLUDES a bare identifier (a named local — disposed by
+                // `registerOwningChoiceDisposal`'s scope-end active-case pass)
+                // and a field / property / indexer read (a borrow of its
+                // storage). Reading the SAME authority here is what keeps the
+                // two owning-choice disposal sites from drifting — the reason
+                // `unboundOwningChoiceTemp` itself records ("The owning-choice
+                // family is already classified codegen-side by
+                // `registerOwningChoiceDisposal` (which likewise consults no
+                // ownership flag), so keeping this gate beside it keeps the two
+                // owning-choice disposal sites reading one authority").
+                //
+                // The disposal itself is the §35.4 ACTIVE-CASE disposal the
+                // scope-end pass runs for an owning-choice local: the
+                // `owningChoice` Disposal arm of `emitDisposals`, which walks
+                // the value's tag and disposes the active case's owned
+                // payloads in payload declaration order (§35.4 "Disposal is
+                // defined by the active case"). The value is spilled to an
+                // entry alloca first because the choice is a VALUE (a struct),
+                // not a reference — the same shape the §35.5 scrutinee
+                // temporary uses (`scrutChoiceSlot = entryAlloca(scrut->getType())`).
+                //
+                // THE ONE-ENTRY SCOPE IS OPENED AFTER THE LOWER, for #3293's
+                // reason: opening it first would RE-HOME every disposal the
+                // expression lowering itself pushes onto `disposeStack_.back()`
+                // (the `out owned var` constructor-recipient case). Lowering
+                // first leaves those BLOCK-scope registrations where they
+                // belong, and the discard's own one-entry scope covers the
+                // discard's own value.
+                //
+                // NOT a double free: the discarded value is a FRESH production
+                // (a call's result), so nothing else owns its payloads. The
+                // named-binding shape (`_ := o;` over an owning-choice local)
+                // is the `discardOutOwnedVar` arm above — a different
+                // operand shape, and it never reaches this arm.
+                // per §17.13, §28.3, §35.4, §35.3
+                const sema::TypeRef* rt =
+                    resolveTypeParamRef(ctx_.exprType(*ds->value));
+                llvm::Value* v = lowerExpr(*ds->value);
+                if (!diverged_ && v && rt && !v->getType()->isPointerTy()) {
+                    disposeStack_.emplace_back();
+                    llvm::AllocaInst* slot = entryAlloca(v->getType());
+                    builder_.CreateStore(v, slot);
+                    Disposal d{slot, nullptr};
+                    d.owningChoice = true;
+                    d.owningChoiceTy = rt->declaration;
+                    d.owningChoiceRef = rt;
+                    disposeStack_.back().push_back(d);
+                    emitDisposals(disposeStack_.back());
+                    disposeStack_.pop_back();
+                }
             } else {
                 // §17.13 / stdlib §5 / §28 (#1015): a discard of a FRESH-ownerless
                 // collection materializer (`_ := items.ToArray()` / `.Sorted()` /
