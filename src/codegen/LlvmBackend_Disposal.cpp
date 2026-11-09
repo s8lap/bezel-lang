@@ -2718,6 +2718,251 @@ llvm::Function* Emitter::emitSpecializedDisposer(const sema::TypeSymbol* ts,
 }
 
 
+// fix #7887 / #7941 (§28.12 step 1/2, v0.355): the PER-INSTANTIATION physical
+// reclamation of a GENERIC `await using` head. The mirror image of
+// emitSpecializedDisposer: where that builds the SYNC disposer (the run-once
+// wrapper around the core that runs the destructor body, the owned fields and
+// the base chain), this builds the RECLAIM half — the run-once-guarded
+// owned-field cascade and base chain with the head's OWN destructor body
+// OMITTED, because §28.12 step 1 says the awaited `DisposeAsync` supersedes
+// it.
+//
+// WHY IT IS PER-INSTANTIATION. A generic class has no single
+// `bz$<C>$DisposeReclaim`: its owned-field classification and its field
+// offsets are the INSTANTIATION's (§14.1 / §28.5 — the #816 / #2019
+// specialized-disposer machinery), so a shared template body would read the
+// wrong offsets and skip (or mis-dispose) an owned type-parameter field. The
+// head's instantiation's substitution is therefore ACTIVE for the whole
+// emission, exactly as it is for emitSpecializedDisposer.
+//
+// The body itself is `emitDisposerReclaimBody` — the ONE spelling of the
+// concrete head's reclaim (LlvmBackend_Setup.cpp's `bz$<C>$DisposeReclaim`),
+// so the generic and the concrete head run the SAME cascade, the SAME base
+// chain and the SAME run-once guard. The head's own destructor body is not
+// run: §28.12 step 1 supersedes it, and §28.12 step 2's per-level rule (a
+// level's destructor body runs iff that level does not declare or override a
+// non-`abstract` `DisposeAsync`) is the BASE chain's business, not the
+// head's — the base chain chains to each base's CORE, so the BASE level's
+// destructor body still runs (bdt=1), exactly as the concrete head's does.
+//
+// State: the caller (the `await using` disposal site, mid-emission of an
+// async state machine) owns builder_/currentFn_/etc.; we save the full
+// disposer-emit state and the builder insert point and restore them, so the
+// caller can continue emitting where it left off.
+llvm::Function* Emitter::emitSpecializedReclaim(const sema::TypeSymbol* ts,
+                                                const std::string& suffix) {
+    auto* fnType = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(
+        fnType, llvm::Function::InternalLinkage,
+        "bz$" + std::string(ts->name) + "$DisposeReclaim" + suffix,
+        module_.get());
+
+    // Save all state the reclaim emission clobbers, plus the builder insert
+    // point — the same save/restore set emitSpecializedDisposer uses. The
+    // caller may be mid-emission of an async state machine (the `await using`
+    // disposal site), so the insert point MUST come back unchanged.
+    //
+    // MOVE, NOT COPY, for the vectors. The `await using` disposal site is
+    // inside `emitDisposals(disposeStack_.back())` — a walk over a scope
+    // vector that lives INSIDE `disposeStack_`, with an iterator into it. A
+    // copy-and-restore would replace the outer vector's buffer (and every
+    // inner scope vector's buffer) and leave that iterator dangling — a
+    // use-after-free in the compiler, measured as a SIGSEGV in
+    // `boxedStorage` on the walk itself. Moving the vectors out and back
+    // transfers the SAME buffers, so the walk's iterator stays valid.
+    llvm::Function* savedFn = currentFn_;
+    llvm::Value* savedThis = currentThis_;
+    auto savedLocals = std::move(locals_);
+    auto savedParamSlots = std::move(paramSlots_);
+    auto savedRefParams = std::move(refParams_);
+    auto savedDisposeStack = std::move(disposeStack_);
+    auto savedLoopStack = std::move(loopStack_);
+    auto savedFinallyStack = std::move(finallyStack_);
+    llvm::BasicBlock* savedPropagate = propagateBB_;
+    llvm::BasicBlock* savedUnwind = unwindTarget_;
+    llvm::Value* savedCaughtExc = currentCaughtExc_;
+    std::string_view savedCaughtName = currentCaughtName_;
+    std::size_t savedScopeDepth = unwindScopeDepth_;
+    llvm::IRBuilder<>::InsertPoint savedIP = builder_.saveIP();
+
+    // genericSubst_ / genericSubstSemaTy_ stay ACTIVE: the instantiation's
+    // substitution is what makes the owned-field classification and the field
+    // offsets this instantiation's.
+    emitDisposerReclaimBody(ts, fn);
+
+    currentFn_ = savedFn;
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals);
+    paramSlots_ = std::move(savedParamSlots);
+    refParams_ = std::move(savedRefParams);
+    disposeStack_ = std::move(savedDisposeStack);
+    loopStack_ = std::move(savedLoopStack);
+    finallyStack_ = std::move(savedFinallyStack);
+    propagateBB_ = savedPropagate;
+    unwindTarget_ = savedUnwind;
+    currentCaughtExc_ = savedCaughtExc;
+    currentCaughtName_ = savedCaughtName;
+    unwindScopeDepth_ = savedScopeDepth;
+    builder_.restoreIP(savedIP);
+    return fn;
+}
+
+
+// fix #7887 / #7941 (§28.12 step 2, v0.355): the per-instantiation reclaim
+// function of a GENERIC head, built from the head's instantiation TypeRef
+// (`Der<int>`) and cached per instantiation.
+//
+// ⭐ THE CACHE KEY IS THE INSTANTIATION'S DESCRIPTOR IDENTITY.
+//
+// `descIdentityKey(ts, args)` is the structural key "declaration identity +
+// recursive type arguments" — the very identity the runtime `is` / `as`
+// honours (§12.7 / §2.8.3 rule 4: one runtime type identity per
+// monomorphization) and the key the SIBLING vtable path keeps BESIDE its
+// field-type key (`specVtablesByDesc_`, LlvmBackend_Setup.cpp). It is
+// INJECTIVE in the instantiation.
+//
+// ⭐ THE ARGUMENTS THE KEY READS ARE THE **RESOLVED** ONES — the head's type
+// arguments as the ACTIVE substitution resolved them, which is exactly how the
+// sibling derives them (`specializedVtableFor`: "Derive the concrete type
+// arguments from the active substitution (genericSubstSemaTy_, set up by
+// lowerNew)"). The SYNTACTIC arguments are NOT enough: inside a generic
+// METHOD the head's argument is the method's own type parameter (`Box<T>`
+// inside `Run<T>`), the same text for every monomorphization, so keying on
+// it collapses `Run<Dog>`, `Run<Cat>` and `Run<Task<int>>` onto one body.
+// `substituteTypeRefLocal` resolves them RECURSIVELY, so a constructed
+// argument (`List<T>`) is resolved through to `List<Dog>` too.
+//
+// ⭐ THE FIELD-TYPE VECTOR IS NOT INJECTIVE, AND THAT IS THE WHO DEFECT. The
+// substituted field-type vector is a vector of LOWERED LLVM types, and every
+// class type erases to `ptr` — so `Box<Dog>` and `Box<Task<int>>` produce the
+// SAME key. The reclaim BODY is not the same for the two: the owned field's
+// classification (`isOwnedReferenceField` / the Task-family arm) is resolved
+// under the ACTIVE SUBSTITUTION, so the `Dog` instantiation's body must
+// vtable-dispose its field while the `Task<int>` instantiation's body must
+// task-dispose it. One body built for the first instantiation and reused for
+// the second is a WRONG RECLAMATION: on a program the base runs cleanly it
+// strands an owned field (the `Dog`'s destructor body never runs) or reads
+// through a null/garbage pointer and aborts under ASan.
+//
+// TWO MAPS, THE SIBLING'S SHAPE. The descriptor-identity map
+// (`genericReclaimFnsByDesc_`) is the PRIMARY key and is used for every
+// instantiation that HAS a per-instantiation identity (all of whose type
+// arguments are concrete — `descArgsConcrete`, the same oracle
+// `instanceDescriptorFor` uses to decide whether to mint a per-instantiation
+// descriptor). The erased field-type map (`genericReclaimFns_`) is the SECOND
+// regime, for an instantiation with no such identity; its VALUE carries the
+// descriptor identity of the instantiation the body was built for, and a hit
+// is accepted ONLY when that identity matches — which is what makes the
+// second regime injective too.
+//
+// The suffix counter counts BOTH maps, so the two keying regimes cannot mint
+// the same function name.
+//
+// The substitution is installed for the emission and restored afterwards: the
+// caller is the `await using` disposal site, which may be inside a generic
+// method whose OWN substitution must survive the call.
+llvm::Function* Emitter::genericReclaimFor(const sema::TypeSymbol* ts,
+                                           const sema::TypeRef* inst) {
+    if (!ts || ts->genericParams.empty()) return nullptr;
+    if (!inst || inst->kind != sema::TypeRef::Kind::Named ||
+        inst->declaration != ts)
+        return nullptr;
+    const std::vector<std::string_view> pnames = sema::genericParamNames(ts);
+    if (pnames.empty() || inst->genericArgs.size() != pnames.size())
+        return nullptr;
+
+    auto savedSubst = genericSubst_;
+    auto savedSema = genericSubstSemaTy_;
+
+    // ⭐ RESOLVE the head's type arguments through the ACTIVE substitution
+    // BEFORE they are used as the identity — this is the sibling's own
+    // derivation (`specializedVtableFor`: "Derive the concrete type arguments
+    // from the active substitution (genericSubstSemaTy_, set up by lowerNew)").
+    //
+    // `inst->genericArgs` is SYNTACTIC. Inside a generic METHOD the head's
+    // argument is the METHOD's own type parameter — `Box<T>` inside
+    // `Run<T>(owned v: T)` — and that text is the SAME for every
+    // monomorphization. Keying on it collapses `Run<Dog>`, `Run<Cat>` and
+    // `Run<Task<int>>` onto ONE reclaim body whose owned-field
+    // classification is right for only one of them: the `Task<int>`
+    // instantiation then vtable-disposes its field and reads through a null
+    // pointer (an AddressSanitizer SEGV), while the `Dog` instantiation's
+    // field is silently stranded. The ACTIVE substitution is what the
+    // monomorphization resolved those arguments to, and it is what the
+    // emitted body is built against — so it, and not the syntax, is the
+    // identity that matters.
+    //
+    // `substituteTypeRefLocal` resolves RECURSIVELY, so a CONSTRUCTED
+    // argument (`List<T>`) is resolved through to `List<Dog>` and is not left
+    // symbolic; a bare parameter placeholder is resolved by its head name.
+    std::vector<const sema::TypeRef*> args;
+    args.reserve(pnames.size());
+    std::unordered_map<std::string_view, llvm::Type*> newSubst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+    for (std::size_t gi = 0; gi < pnames.size(); ++gi) {
+        const sema::TypeRef* a =
+            substituteTypeRefLocal(inst->genericArgs[gi], genericSubstSemaTy_);
+        if (!a) a = inst->genericArgs[gi];
+        args.push_back(a);
+        newSubst[pnames[gi]] = lowerTypeRef(a);
+        newSema[pnames[gi]] = a;
+    }
+    genericSubst_ = std::move(newSubst);
+    genericSubstSemaTy_ = std::move(newSema);
+
+    // The RESOLVED instantiation's type arguments, in the shape the identity
+    // key takes (`descIdentityKey` reads the SEMANTIC arguments, never the
+    // lowered ones — that is the whole point).
+    const std::string descKey = descIdentityKey(ts, args);
+
+    // The erased field-type vector — the SIBLING'S SECOND KEY. Kept because
+    // the second regime below is keyed by it; it is NOT used as a key on its
+    // own (see the note above: it is not injective in the instantiation).
+    std::vector<const sema::Symbol*> storage;
+    collectInstanceStorage(ts, storage);
+    std::vector<llvm::Type*> specFieldTys;
+    specFieldTys.push_back(ptrTy());
+    specFieldTys.push_back(disposedFlagTy());
+    for (const sema::Symbol* m : storage)
+        specFieldTys.push_back(storageType(m));
+
+    // The regime split, the sibling's: an instantiation whose arguments are
+    // all CONCRETE has a per-instantiation identity (`instanceDescriptorFor`
+    // mints one for it); one whose arguments are not does not, and falls to
+    // the second regime.
+    const bool hasIdentity = descArgsConcrete(args);
+
+    llvm::Function* result = nullptr;
+    auto& descMap = genericReclaimFnsByDesc_[ts];
+    auto& specMap = genericReclaimFns_[ts];
+    if (hasIdentity) {
+        auto dit = descMap.find(descKey);
+        if (dit != descMap.end()) result = dit->second;
+    } else {
+        auto sit = specMap.find(specFieldTys);
+        // The erased key alone does NOT identify the instantiation: accept
+        // the entry only when the descriptor identity it was built for is
+        // this instantiation's.
+        if (sit != specMap.end() && sit->second.first == descKey)
+            result = sit->second.second;
+    }
+    if (!result) {
+        // The suffix counts BOTH maps, so the two keying regimes cannot mint
+        // the same name.
+        std::string suffix =
+            "$spec" + std::to_string(specMap.size() + descMap.size());
+        result = emitSpecializedReclaim(ts, suffix);
+        if (hasIdentity) descMap[descKey] = result;
+        else specMap[specFieldTys] = {descKey, result};
+    }
+
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSema);
+    return result;
+}
+
+
 llvm::GlobalVariable* Emitter::excGlobal() {
     if (!excGlobal_) {
         // fix #492 / §31.1 / §2.6: emit an ExternalLinkage DECLARATION (no
@@ -12209,7 +12454,8 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                     };
                     emitAsyncDisposeAwaitAndFree(
                         headObj, it->disposeAsyncFn, it->asyncDisposeCls,
-                        it->disposeAsyncVSlot, unwindFaultTail);
+                        it->asyncDisposeRef, it->disposeAsyncVSlot,
+                        unwindFaultTail);
                     // await.ok: the pass resumes with the exception it entered
                     // with.
                     builder_.CreateStore(
@@ -12271,6 +12517,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             emitAsyncDisposeAwaitAndFree(
                 obj, isUnwind ? nullptr : it->disposeAsyncFn,
                 isUnwind ? nullptr : it->asyncDisposeCls,
+                isUnwind ? nullptr : it->asyncDisposeRef,
                 isUnwind ? -1 : it->disposeAsyncVSlot, faultTail);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);

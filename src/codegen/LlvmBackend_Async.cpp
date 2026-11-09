@@ -6349,6 +6349,7 @@ void Emitter::emitDisposeAsyncSyncThrowEdge(
 void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
                                            llvm::Function* disposeAsyncFn,
                                            const sema::TypeSymbol* cls,
+                                           const sema::TypeRef* clsRef,
                                            int disposeAsyncVSlot,
                                            const std::function<void(llvm::Value*)>&
                                                faultTail) {
@@ -6417,15 +6418,51 @@ void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
         auto rit = disposerReclaimFns_.find(cls);
         if (rit != disposerReclaimFns_.end()) reclaimFn = rit->second;
     }
+    // fix #7887 / #7941 (§28.12 step 1/2, v0.355): a GENERIC head has NO
+    // `bz$<C>$DisposeReclaim` — the per-class reclaim population
+    // (LlvmBackend_Setup.cpp) creates one only for a class with an EMPTY
+    // `genericParams`, because "a generic class is excluded — its owned-field
+    // classification is per-instantiation (the #816/#2019
+    // specialized-disposer machinery), so the shared template body would be
+    // wrong". The head's PER-INSTANTIATION reclaim function is built instead
+    // (`genericReclaimFor`), keyed on the instantiation's DESCRIPTOR IDENTITY
+    // so two instantiations of one generic never share a body — the erased
+    // field-type vector is NOT injective in the instantiation (`Box<Dog>` and
+    // `Box<Task<int>>` both erase to `ptr`) and sharing one body between them
+    // is a wrong reclamation.
+    //
+    // The IMPORTED head's degrade is untouched: an imported class's
+    // `bz$<C>$DisposeReclaim` belongs to the defining module and is not in
+    // this module's exported ABI (§2.5), so the compiler cannot call it and
+    // the degrade there is unavoidable. `ctx_.isImported(cls)` is the ONE
+    // predicate that separates the two arms.
+    //
+    // The resolution is done ONCE, before the reclamation lambda (the lambda
+    // is emitted on the normal edge, on the fault edge and on the
+    // synchronous-throw edge, and building a function is not an emission that
+    // may be repeated).
+    llvm::Function* genericReclaimFn = nullptr;
+    if (!reclaimFn && cls && !cls->genericParams.empty() &&
+        !ctx_.isImported(cls))
+        genericReclaimFn = genericReclaimFor(cls, clsRef);
     auto emitPhysicalReclamation = [&]() {
         if (reclaimFn) {
             builder_.CreateCall(reclaimFn, {obj});
+            emitReclaimBlock(obj);
+        } else if (genericReclaimFn) {
+            // The GENERIC head's own physical reclamation: the same two steps
+            // the concrete arm runs — the per-instantiation reclaim body (the
+            // run-once-guarded owned-field cascade + base chain, with the
+            // head's OWN destructor body omitted per §28.12 step 1) and then
+            // the block release.
+            builder_.CreateCall(genericReclaimFn, {obj});
             emitReclaimBlock(obj);
         } else {
             // DEGRADE, in the recoverable direction. No reclaim function exists
             // for this head: the class is IMPORTED (its `bz$<C>$DisposeReclaim`
             // belongs to the defining module and is not part of the exported
-            // ABI) or GENERIC (its physical reclamation is per-instantiation).
+            // ABI, §2.5). A GENERIC head is NOT a degrade any more — it takes
+            // the per-instantiation arm above (fix #7887 / #7941).
             // Fall back to the FULL synchronous reclamation, which is the same
             // arm the `!disposeAsyncFn` sync fallback above already takes: the
             // object's owned subtree and base chain are reclaimed correctly

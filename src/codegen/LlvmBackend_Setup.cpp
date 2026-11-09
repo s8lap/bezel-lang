@@ -21755,6 +21755,17 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                         else
                             dd.asyncDisposeCls = cls;
                     }
+                    // fix #7887 / #7941 (§28.12 step 1/2, v0.355): carry the
+                    // head's PER-INSTANTIATION type reference. §28.12 step 2's
+                    // reclamation of a GENERIC head is per-INSTANTIATION: the
+                    // owned-field classification and the field offsets are the
+                    // instantiation's (§28.5 / §14.1), so the reclaim
+                    // function must be built from the instantiation's type
+                    // ARGUMENTS — which the bare `Der<T>` TypeSymbol
+                    // `asyncDisposeCls` carries cannot. `repTy` is the
+                    // representation type (`Der<int>`), already resolved at
+                    // this site. Null for every non-generic head.
+                    dd.asyncDisposeRef = repTy;
                     // fix #3493 / §28.12 step 1 (v0.283): the SAME `dams`
                     // this resolution already answered, asked of the
                     // authority that already decides "does this method

@@ -2740,6 +2740,17 @@ private:
         // disposerReclaimFns_ for §28.12 step 2's owned-field cascade + base
         // chain, which the async arm previously replaced with a bare `free`.
         const sema::TypeSymbol* asyncDisposeCls = nullptr;
+        // fix #7887 / #7941 (§28.12 step 1/2, v0.355): the head's
+        // PER-INSTANTIATION type reference — `Der<int>`, not the bare `Der<T>`
+        // TypeSymbol `asyncDisposeCls` carries. §28.12 step 2's physical
+        // reclamation of a GENERIC head is per-INSTANTIATION: the owned-field
+        // classification and the field offsets are the INSTANTIATION's
+        // (§28.5 / §14.1 — the #816 / #2019 specialized-disposer machinery), so
+        // the per-instantiation reclaim function must be built from the
+        // instantiation's type ARGUMENTS, which a bare TypeSymbol cannot
+        // carry. Null for every non-generic head (and for the run-time
+        // dispatch arm, where the concrete class is not statically known).
+        const sema::TypeRef* asyncDisposeRef = nullptr;
         // fix #3493 / §28.12 step 1 (v0.283): the VTABLE SLOT of the same
         // `DisposeAsync` `disposeAsyncFn` was resolved from — `vtableSlot_`'s
         // answer for that one MethodSymbol, not a second lookup — or -1 when
@@ -14527,6 +14538,89 @@ private:
     llvm::Function* emitSpecializedDisposer(const sema::TypeSymbol* ts,
                                             const std::string& suffix);
 
+    // fix #7887 / #7941 (§28.12 step 1/2, v0.355): the RECLAIM half of the
+    // per-instantiation machinery — the mirror image of
+    // emitSpecializedDisposer. Where that builds the SYNC disposer (the
+    // run-once wrapper around the core that runs the destructor body, the
+    // owned fields and the base chain), this builds the RECLAIM body — the
+    // run-once-guarded owned-field cascade and base chain with the head's OWN
+    // destructor body OMITTED, because §28.12 step 1 says the awaited
+    // `DisposeAsync` supersedes it.
+    //
+    // It is emitted with the INSTANTIATION's substitution active, exactly as
+    // emitSpecializedDisposer is: the owned-field classification and the field
+    // offsets are the instantiation's (§28.5 / §14.1). The body itself is
+    // `emitDisposerReclaimBody` — the ONE spelling the concrete head's
+    // `bz$<C>$DisposeReclaim` already uses — so the generic and the concrete
+    // head run the same cascade, the same base chain and the same run-once
+    // guard. `suffix` disambiguates the function names across
+    // instantiations.
+    llvm::Function* emitSpecializedReclaim(const sema::TypeSymbol* ts,
+                                            const std::string& suffix);
+
+    // fix #7887 / #7941 (§28.12 step 2, v0.355): the per-instantiation
+    // physical reclamation of a GENERIC `await using` head — the head's own
+    // reclaim function, built from the head's instantiation TypeRef
+    // (`Der<int>`) and cached per instantiation.
+    //
+    // THE CACHE KEY IS THE INSTANTIATION'S DESCRIPTOR IDENTITY — the
+    // structural `descIdentityKey` (declaration identity + the recursive
+    // encoding of every type argument), the same identity the runtime `is` /
+    // `as` honours and the same key the sibling vtable path keeps BESIDE its
+    // field-type key (`specVtablesByDesc_`). It is INJECTIVE in the
+    // instantiation: every class type erases to `ptr`, so the substituted
+    // FIELD-TYPE vector is NOT — `Box<Dog>` and `Box<Task<int>>` produce the
+    // SAME field-type vector while their reclaim bodies are NOT the same (the
+    // owned field's classification is resolved under the ACTIVE SUBSTITUTION,
+    // so the `Dog` instantiation must vtable-dispose its field and the
+    // `Task<int>` instantiation must task-dispose it).
+    //
+    // The arguments the key reads are the RESOLVED ones — the head's type
+    // arguments as the ACTIVE substitution resolved them, derived exactly as
+    // the sibling derives them (`specializedVtableFor`). The SYNTACTIC
+    // arguments are not enough: inside a generic METHOD the head's argument
+    // is the method's own type parameter (`Box<T>` inside `Run<T>`), the
+    // same text for every monomorphization, so keying on it would collapse
+    // `Run<Dog>`, `Run<Cat>` and `Run<Task<int>>` onto one body.
+    //
+    // Two maps, the sibling's shape: the DESCRIPTOR-IDENTITY map
+    // (`genericReclaimFnsByDesc_`) is the primary key, and the erased
+    // field-type map (`genericReclaimFns_`) is the second regime, for an
+    // instantiation that has no per-instantiation identity (an argument that
+    // is not a concrete type). The second regime's VALUE carries the
+    // descriptor identity of the instantiation the body was built for, and a
+    // hit is accepted only when that identity matches — the erased key alone
+    // is not injective in the instantiation, and a reclaim body's semantics DO
+    // depend on it (a vtable's do not, which is why the sibling vtable path
+    // can demote its field-type regime; a reclaim body cannot).
+    //
+    // The suffix counter counts BOTH maps, so the two keying regimes cannot
+    // mint the same function name.
+    llvm::Function* genericReclaimFor(const sema::TypeSymbol* ts,
+                                       const sema::TypeRef* inst);
+
+    // fix #7887 / #7941 (§28.12 step 2, v0.355): the per-instantiation
+    // reclaim functions of a GENERIC head.
+    //
+    // `genericReclaimFnsByDesc_[ts][descIdentityKey]` — the PRIMARY key: the
+    // instantiation's DESCRIPTOR IDENTITY (declaration identity + recursive
+    // type arguments), read from the RESOLVED arguments (the head's type
+    // arguments as the ACTIVE substitution resolved them). Injective in the
+    // instantiation.
+    //
+    // `genericReclaimFns_[ts][field-type vector]` — the SECOND regime, for an
+    // instantiation with no per-instantiation identity. The value is
+    // (descriptor identity, function): the erased field-type vector is NOT
+    // injective in the instantiation (every class type erases to `ptr`), so
+    // the identity is verified on a hit.
+    std::map<const sema::TypeSymbol*,
+             std::map<std::string, llvm::Function*>>
+        genericReclaimFnsByDesc_;
+    std::map<const sema::TypeSymbol*,
+             std::map<std::vector<llvm::Type*>,
+                      std::pair<std::string, llvm::Function*>>>
+        genericReclaimFns_;
+
     // §28.5 / §14.1 / §2.5 (#662 foundation A): build (and cache) the
     // complete per-instantiation vtable for an IMPORTED generic class, using
     // the currently active `genericSubst_`.  Unlike `specializedVtableFor`
@@ -17897,7 +17991,13 @@ private:
     // synchronous fallback.
     void emitAsyncDisposeAwaitAndFree(
         llvm::Value* obj, llvm::Function* disposeAsyncFn,
-        const sema::TypeSymbol* cls = nullptr, int disposeAsyncVSlot = -1,
+        const sema::TypeSymbol* cls = nullptr,
+        // fix #7887 / #7941 (§28.12 step 2, v0.355): the head's
+        // PER-INSTANTIATION type reference (`Der<int>`), carried so a GENERIC
+        // head's physical reclamation is the instantiation's own
+        // (genericReclaimFor) instead of degrading to the synchronous
+        // destructor body. Null for a non-generic head.
+        const sema::TypeRef* clsRef = nullptr, int disposeAsyncVSlot = -1,
         const std::function<void(llvm::Value*)>& faultTail = {});
     static constexpr int kDisposeAsyncRunTimeDispatch = -2;
     // The run-time arm itself (normal exit of an active async state machine;
