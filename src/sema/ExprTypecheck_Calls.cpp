@@ -46205,6 +46205,87 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 }
             }
         }
+        // fix #8348 (stdlib §1 *Block-by-name*, §4.4-§4.11, §4.17-§4.19;
+        // spec §7.5, v0.355): the `?.` twin of the `.` form's PER-HEAD
+        // CALL-SURFACE gate (fix #8331's, typeCall's ~14885).
+        //
+        // THE DEFECT. §7.5 (v0.350): "`x?.M` resolves `M` as `x.M` does."
+        // The `.` spelling of a member a stdlib collection head does NOT
+        // declare is REFUSED with the stdlib's own documented-surface
+        // diagnostic ("no member `IndexOf` on `Set` (stdlib §4.10) -- it is
+        // not part of this collection's documented surface (...), a universal
+        // `ToString`/`Equals`/`GetHashCode`/`GetType` member (language spec
+        // §8.1), or a stdlib §5 LINQ extension operator"). The `?.` spelling
+        // of the SAME member was ACCEPTED: the `?.` CALL is typed by the
+        // synthetic `.` TWIN this file builds for it (typeCall's #6529 arm),
+        // and that twin's diagnostics are DISCARDED (the twin is
+        // speculative: `ctx_.diagnostics().rollbackTo(mark)`), so the `.`
+        // spelling's refusal was rolled back with the rest of the twin's
+        // report. The two spellings of ONE member disagreed, which §7.5
+        // forbids.
+        //
+        // MEASURED (issue #8348): `s?.IndexOf(1)` on a `Set<int>?`,
+        // `d?.IndexOf(1)` on a `Dictionary<int, int>?` and
+        // `g?.IndexOf(1)` on a `FrozenArray<int>?` all COMPILED with NO
+        // diagnostic (the `.` spellings of the same three calls are refused),
+        // and the call then SILENTLY DEGRADED — codegen's `lowerNullCondCall`
+        // never reaches the per-family call-surface gate, so the call lowered
+        // to nothing behind codegen's #3079 "the argument of this
+        // `Console.WriteLine` failed to lower to a value" warning (the whole
+        // statement emitted nothing) or #2434's zero-initialized-slot
+        // degrade. A member the head DOES declare (`a?.IndexOf(1)` on an
+        // `Array<int>?`, §4.4) took the same path on the heads that are not
+        // array-backed, so the `?.` spelling did not even lower a DECLARED
+        // member.
+        //
+        // THE FIX. The gate lives HERE — where the `?.` spelling resolves its
+        // member, and therefore where the `.` twin is built — and it reads
+        // the SAME per-head table the `.` spelling's gate reads
+        // (`concreteCollectionSurfaces()` / `isDocumentedConcreteCollection-
+        // Member`, read here through `concreteCollectionCallSurfaceAdmits`
+        // and `concreteCollectionCallHasDedicatedDiagnostic`). The head that
+        // DECLARES a name and the head that does not can no longer disagree
+        // about it, and the diagnostic is the SAME SENTENCE the `.` spelling
+        // emits (same table, same stdlib section, same quoted surface), so
+        // the two spellings of one member cannot disagree about it either.
+        //
+        // §26.5 rule 2 is preserved: the extension blocks were consulted
+        // ABOVE (the `lookupExtensionMember` call in the `if (!member)` block
+        // this arm follows), so a USER extension that declares the name on
+        // the receiver IS the member and is NOT refused here — exactly as the
+        // `.` spelling treats it (stdlib §1's Block-by-name rule makes an
+        // instance member block a same-named extension, and a member a type
+        // does not declare is not a member of that type at all).
+        //
+        // The CALL form only. The BARE-reference form (`d?.Bogus`, no call)
+        // is the `.` spelling's OTHER gate (the #2536 catch-all, ~42457),
+        // which this arm does not touch.
+        if (!member && &nm == calleeOfCallCtx_ && recvTyForDiag) {
+            const std::string_view surfaceHead =
+                concreteCollectionReceiverHead(recvTyForDiag);
+            if (!surfaceHead.empty() &&
+                !concreteCollectionCallSurfaceAdmits(surfaceHead, nm.member) &&
+                !concreteCollectionCallHasDedicatedDiagnostic(surfaceHead,
+                                                              nm.member)) {
+                const ConcreteCollectionSurface* row =
+                    concreteCollectionSurfaceRow(surfaceHead);
+                SourceLocation loc = nm.span.begin;
+                if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("no member `") + std::string(nm.member) +
+                        "` on `" + std::string(surfaceHead) + "` (stdlib " +
+                        (row ? ("\xC2\xA7" + std::string(row->section))
+                             : std::string("\xC2\xA7""4.x")) +
+                        ") -- it is not part of this collection's "
+                        "documented surface (" +
+                        concreteCollectionSurfaceList(surfaceHead) +
+                        "), a universal `ToString`/`Equals`/`GetHashCode`/"
+                        "`GetType` member (language spec \xC2\xA7""8.1), or "
+                        "a stdlib \xC2\xA7""5 LINQ extension operator");
+                return;
+            }
+        }
         // §7.5 / #751: a string/primitive built-in member (e.g. `Length`) has
         // no Symbol — resolveMemberAccess types these via a large inlined
         // intrinsic block this function does not run, so `s?.Length` was left

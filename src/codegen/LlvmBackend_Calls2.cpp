@@ -25004,14 +25004,61 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                             // names, LlvmBackend_Calls2.cpp ~6871) and the
                             // §8.3 reference-identity default for
                             // Equals/GetHashCode (the SAME ops
-                            // `isBuiltinIdentityRecv` gives them, ~7330) —
-                            // reusing `lowerExpr` rather than
-                            // `lowerUniversalEqualsArg` for the Equals
-                            // argument, matching `isBuiltinIdentityRecv`'s own
-                            // choice: a CString/WString/RawBytes argument is
-                            // already reference-shaped (a bare pointer), so
-                            // no §8.6 boxing is needed to compare it by
-                            // identity.
+                            // `isBuiltinIdentityRecv` gives them, ~7330).
+                            //
+                            // fix #8334 (§8.1 / §8.6 / §8.3, v0.355): the
+                            // Equals ARGUMENT is lowered through the SAME
+                            // §8.6 helper the other three §8.1 faces use —
+                            // `lowerUniversalEqualsArg` — NOT through a bare
+                            // `lowerExpr`.
+                            //
+                            // THE DEFECT THIS FIXES. The premise this arm used
+                            // to carry ("a CString/WString/RawBytes argument
+                            // is already reference-shaped, so no §8.6 boxing
+                            // is needed") is about the ARGUMENT's SHAPE, but
+                            // the argument of §8.1's universal
+                            // `Equals(other: Object?)` is NOT restricted to
+                            // an FFI buffer: it may be ANY value type, and
+                            // §8.6 then REQUIRES it to be boxed — "When a
+                            // value type is used where `Object` (or an
+                            // interface implemented by the value type) is
+                            // expected, the value is boxed". The bare
+                            // `lowerExpr` handed the RAW lowered value to
+                            // `CreateICmpEQ` against the receiver pointer, so
+                            // a value-typed argument produced
+                            // `icmp eq ptr %1, i32 5` — mismatched operand
+                            // types — and the compiler ABORTED with an IR
+                            // VERIFICATION FAILURE ("Both operands to ICmp
+                            // instruction are not of the same type!").
+                            //
+                            // MEASURED (issue #8334's repro): `c?.Equals(5)`
+                            // on a `CString?` FAILED TO COMPILE (IR
+                            // verification), as did the `WString` and
+                            // `RawBytes` twins.
+                            //
+                            // The comparison stays an IDENTITY comparison —
+                            // §8.3's class row ("Reference equality") is the
+                            // default for these receivers, which declare no
+                            // `Equals` override — so a boxed argument is
+                            // never equal to the receiver and the answer is
+                            // `False`, the same answer §8.4's
+                            // `Object.ReferenceEquals` gives for a fresh box.
+                            // The reference-typed argument forms
+                            // (`c?.Equals(o)`, `c?.Equals(null)`) are
+                            // UNAFFECTED: a reference-typed argument is not
+                            // boxed, so it reaches this comparison unchanged
+                            // and no box is minted and no release is emitted.
+                            //
+                            // The BOX DISCHARGE (§28.9) is the shape fix
+                            // #8296's `.`-spelling arm already uses
+                            // (`bltn.eq.ref`, LlvmBackend_Calls2.cpp ~5469):
+                            // this arm compares two POINTERS and stores
+                            // neither, and there is no vtable dispatch here
+                            // and no user override that could keep the box
+                            // (the receiver declares none), so the fresh box
+                            // is dead the instant the comparison is built and
+                            // the producer's `+1` is discharged HERE. A box
+                            // that is minted but not discharged is a LEAK.
                             if (isToString) {
                                 std::string_view arn = builtinTypeName(recvTy0);
                                 std::string_view mod =
@@ -25033,11 +25080,36 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                                 // §7.5: lowered here, inside the non-null-
                                 // receiver arm, so a null receiver never
                                 // evaluates the argument.
+                                //
+                                // fix #8334 (§8.1 / §8.6 / §8.3 / §28.9,
+                                // v0.355): the argument is lowered through
+                                // `lowerUniversalEqualsArg` — the SHARED §8.6
+                                // helper the `.` form, the generic-T redirect
+                                // and the `?.` mirror use — so the four
+                                // spellings of §8.1's one member cannot
+                                // disagree about whether the argument is
+                                // boxed.
+                                llvm::Value* ncoArgMint = nullptr;
                                 llvm::Value* ncoOther =
-                                    lowerExpr(*call.args[0].value);
-                                if (ncoOther)
-                                    ncoRes = builder_.CreateICmpEQ(
-                                        recv, ncoOther, "nco.ffi.eq");
+                                    lowerUniversalEqualsArg(
+                                        *call.args[0].value, &ncoArgMint);
+                                llvm::Value* ncoEq =
+                                    (recv && ncoOther)
+                                        ? builder_.CreateICmpEQ(
+                                              recv, ncoOther, "nco.ffi.eq")
+                                        : nullptr;
+                                // §28.9: the fresh argument box is dead the
+                                // instant the comparison is built — this arm
+                                // compares two POINTERS and stores neither,
+                                // so the box cannot escape (there is no
+                                // vtable dispatch here and no user override
+                                // that could keep it: the FFI-buffer receiver
+                                // declares no `Equals` override). Discharge
+                                // the producer's `+1` here, on the same
+                                // reasoning fix #8296's `bltn.eq.ref` arm
+                                // discharges its argument box.
+                                emitBoxRelease(ncoArgMint);  // null-safe (§28.9)
+                                if (ncoEq) ncoRes = ncoEq;
                             }
                         } else if (isToString) {
                             ncoRes = lowerObjectToString(recv);
