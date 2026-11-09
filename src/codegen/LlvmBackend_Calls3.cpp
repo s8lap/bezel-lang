@@ -3330,6 +3330,220 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         }
     }
 
+    // fix #8276 (stdlib §4.11 / §5, v0.355): the §5 ELEMENT-ACCESS terminals
+    // over a CONCRETE `Stack<T>` / `OwningStack<T>` must answer in the
+    // receiver's TAKE order — the order the `for ... in` over the very same
+    // value visits it.
+    //
+    // stdlib §4.11 "Iteration order" (v0.355):
+    //   "All four types iterate (via `IReadOnlyCollection<T>`) in take order —
+    //    a stack top-to-bottom (pop order), a queue front-to-back (dequeue
+    //    order); the owning forms iterate identically, yielding borrows."
+    // stdlib §5 defines `First`/`Last`/`ElementAt` — and their `*OrNull`
+    // siblings — over `IEnumerable<T>`, i.e. over the receiver's ITERATION
+    // order. ⇒ the terminals must agree with the iteration of the same value.
+    //
+    // THE DEFECT (MEASURED on origin/main a30bb11d).  A `Stack<T>` is stored
+    // BOTTOM-to-TOP (index 0 = the bottom, index Count-1 = the top — the
+    // index `Pop()` itself reads), and the §5 terminals read that backing
+    // array BY ELEMENT INDEX: `First()` → 0 (the BOTTOM), `Last()` → Count-1
+    // (the TOP), `ElementAt(i)` → i.  So they answered in PUSH order while
+    // the `for ... in` over the same value answered in TAKE order:
+    // `First()` returned the bottom element and `Last()` the top — the
+    // opposite of the documented order (issue #8276).  MEASURED, a concrete
+    // `Stack<int>` with 10, 20, 30 pushed printed `30 20 10` for the
+    // for-in and `10 / 30 / 10 / 30` for First / Last / ElementAt(0) /
+    // ElementAt(2).
+    //
+    // WHERE THIS FIX LIVES.  The concrete terminal is lowered by
+    // `tryLowerCollectionInstanceCall`'s array-receiver block
+    // (LlvmBackend_Calls.cpp), which reads the element index directly; that
+    // file belongs to another lane, so the fix lands HERE — in the §5
+    // dispatch that runs FIRST (LlvmBackend_Calls2.cpp's `lowerCallDispatch`
+    // tries `tryLowerLazyLinqCall` before `tryLowerCollectionInstanceCall`),
+    // intercepting the element-access tier for the stack family only.
+    //
+    // ONLY THE ORDER CHANGES.  The element type, the `InvalidOperationException`
+    // on an empty source, the `IndexOutOfRangeException` on an out-of-range
+    // `ElementAt`, the nullable form of the `*OrNull` siblings, the
+    // string-element escape rule (§28.11) and the unbound-owned-temporary
+    // reclaim (§28.3) are the SAME rules the array receiver applies, so the
+    // two orderings cannot drift.  A `Queue<T>` and an `Array<T>` are NOT
+    // stack-family heads and keep their own order: stdlib §4.11 gives the
+    // queue its front-to-back (dequeue) order, and an array states no
+    // take-order contract distinct from storage order (its `First()` IS its
+    // element 0).
+    if (recvTy && (recvTy->headName() == "Stack" ||
+                   recvTy->headName() == "OwningStack")) {
+        // stdlib §5's element-access tier over `IEnumerable<T>`: the
+        // no-predicate forms and the index forms.  The PREDICATE forms
+        // (`First(pred)` / `Last(pred)` / `FirstOrNull(pred)` /
+        // `LastOrNull(pred)`) and the §5 LAZY operators over a stack are a
+        // DIFFERENT family — they scan / materialize the receiver FORWARD —
+        // and are OUT of this fix's scope (reported in the commit body and
+        // filed as a follow-up issue).
+        const bool elemAccessNoArg =
+            call.args.empty() &&
+            (m == "First" || m == "Last" || m == "FirstOrNull" ||
+             m == "LastOrNull");
+        const bool elemAccessIndex =
+            call.args.size() == 1 && call.args[0].value &&
+            (m == "ElementAt" || m == "ElementAtOrNull");
+        // The element type of the receiver (stdlib §4.11's `Stack<T>`).
+        const sema::TypeRef* elemRef =
+            recvTy->genericArgs.empty() ? nullptr : recvTy->genericArgs[0];
+        llvm::Type* elemTy = elemRef ? lowerTypeRef(elemRef) : nullptr;
+        // The index argument must be an integer (stdlib §5
+        // `ElementAt(index: int)`).  A non-integer index is DECLINED here,
+        // BEFORE any IR is emitted (§22.5: an operand is evaluated once), so
+        // the ordinary array path reports it — the `ElementAtOrNull` refusal
+        // of #8229 among them.
+        const sema::TypeRef* idxTyRef =
+            elemAccessIndex ? ctx_.exprType(*call.args[0].value) : nullptr;
+        llvm::Type* idxTy = idxTyRef ? lowerTypeRef(idxTyRef) : nullptr;
+        const bool idxIsInt = !elemAccessIndex || (idxTy && idxTy->isIntegerTy());
+        if ((elemAccessNoArg || elemAccessIndex) && elemRef && elemTy &&
+            idxIsInt) {
+            // The receiver's value — the stack's `bz_array_t*` backing.
+            llvm::Value* stackArr = lowerExpr(*ma->target);
+            if (!stackArr || !stackArr->getType()->isPointerTy())
+                return nullptr;
+            const int64_t esz = collectionElemSize(recvTy);
+            // §28.2's checked-disposal backstop — the SAME guard the
+            // array-receiver path emits before it reads a collection
+            // (LlvmBackend_Calls.cpp's `isArr` block): a disposed
+            // collection's data buffer is already freed, so the element read
+            // below would be a use-after-free.  The guard reads the STACK's
+            // own header, not a copy of it.
+            if (checkedDisposal_) {
+                llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                auto* isFn =
+                    declareC("bz_array_is_disposed", i8Ty, {ptrTy()});
+                llvm::Value* flag =
+                    builder_.CreateCall(isFn, {stackArr}, "cd.arrdis");
+                llvm::Value* disposed = builder_.CreateICmpNE(
+                    flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+                emitGuardThrow(disposed, "DisposedAccessException");
+            }
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len =
+                builder_.CreateCall(lenFn, {stackArr}, "stk.len");
+            // THE TAKE ORDER.  The backing array runs bottom-to-top, so the
+            // take-order position `t` is the storage index `Count - 1 - t`:
+            //   First()      -> t = 0       -> the TOP     (storage Count-1)
+            //   Last()       -> t = Count-1 -> the BOTTOM (storage 0)
+            //   ElementAt(i) -> t = i       -> storage Count-1-i
+            // `absent` is 1 when the request has no element at all (an empty
+            // source, or an index outside the source).
+            llvm::Value* takeIdx = nullptr;  // the STORAGE index (i64)
+            llvm::Value* absent = nullptr;   // 1 when there is no element
+            if (elemAccessNoArg) {
+                absent = builder_.CreateICmpEQ(len, builder_.getInt64(0));
+                takeIdx = (m == "First" || m == "FirstOrNull")
+                    ? builder_.CreateSub(len, builder_.getInt64(1))
+                    : builder_.getInt64(0);
+            } else {
+                llvm::Value* i = lowerExpr(*call.args[0].value);
+                if (!i) return nullptr;
+                i = builder_.CreateSExt(i, i64());
+                llvm::Value* neg =
+                    builder_.CreateICmpSLT(i, builder_.getInt64(0));
+                llvm::Value* oor = builder_.CreateICmpSGE(i, len);
+                absent = builder_.CreateOr(neg, oor);
+                takeIdx = builder_.CreateSub(
+                    builder_.CreateSub(len, builder_.getInt64(1)), i);
+            }
+            // The element slot, and the read of the take-order element.
+            llvm::AllocaInst* elemSlot = entryAlloca(elemTy);
+            auto* getFn = declareC("bz_array_get",
+                                   llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64()});
+            auto readElem = [&]() -> llvm::Value* {
+                builder_.CreateCall(getFn, {stackArr, takeIdx, elemSlot,
+                                           builder_.getInt64(esz)});
+                return builder_.CreateLoad(elemTy, elemSlot, "stk.elem");
+            };
+            llvm::Value* result = nullptr;
+            if (m == "FirstOrNull" || m == "LastOrNull" ||
+                m == "ElementAtOrNull") {
+                // stdlib §5 (line 3758): "the `*OrNull` variants return
+                // `null` instead" of the fault.  The result SHAPE is the
+                // array receiver's: a VALUE element type yields the tagged
+                // `{i8 hasValue; T value}` struct; a class or `string`
+                // element yields a nullable POINTER (null = absent).
+                sema::TypeRef nullRT;
+                if (elemRef) { nullRT = *elemRef; nullRT.nullable = true; }
+                const bool isValTy = isNullableValueTy(&nullRT);
+                auto* loadBB = llvm::BasicBlock::Create(
+                    llvm_, "stk.on.load", currentFn_);
+                auto* nullBB = llvm::BasicBlock::Create(
+                    llvm_, "stk.on.null", currentFn_);
+                auto* mergeBB = llvm::BasicBlock::Create(
+                    llvm_, "stk.on.end", currentFn_);
+                llvm::Value* has = builder_.CreateNot(absent);
+                builder_.CreateCondBr(has, loadBB, nullBB);
+                builder_.SetInsertPoint(loadBB);
+                llvm::Value* loaded = readElem();
+                builder_.CreateBr(mergeBB);
+                builder_.SetInsertPoint(nullBB);
+                builder_.CreateBr(mergeBB);
+                builder_.SetInsertPoint(mergeBB);
+                // The PHI nodes must be the FIRST instructions of the merge
+                // block (LLVM's invariant).
+                if (isValTy) {
+                    auto* nst = nullableValueStructTy(&nullRT);
+                    auto* valPhi =
+                        builder_.CreatePHI(elemTy, 2, "stk.on.val");
+                    valPhi->addIncoming(loaded, loadBB);
+                    valPhi->addIncoming(
+                        llvm::Constant::getNullValue(elemTy), nullBB);
+                    auto* hvPhi = builder_.CreatePHI(
+                        nullablePrimHasValTy(), 2, "stk.on.hv");
+                    hvPhi->addIncoming(
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                        loadBB);
+                    hvPhi->addIncoming(
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 0),
+                        nullBB);
+                    llvm::Value* res = builder_.CreateInsertValue(
+                        llvm::UndefValue::get(nst), hvPhi, {0u});
+                    result = builder_.CreateInsertValue(res, valPhi, {1u});
+                } else {
+                    auto* ptrPhi =
+                        builder_.CreatePHI(elemTy, 2, "stk.on.ptr");
+                    ptrPhi->addIncoming(loaded, loadBB);
+                    ptrPhi->addIncoming(
+                        llvm::Constant::getNullValue(elemTy), nullBB);
+                    result = ptrPhi;
+                }
+            } else {
+                // stdlib §5 (line 3758): "`First`/`Last`/`Single`/`ElementAt`
+                // throw `InvalidOperationException` (or
+                // `IndexOutOfRangeException` for `ElementAt`) on
+                // missing-element".  The fault is emitted BEFORE the read, so
+                // the out-of-range read never happens.
+                emitGuardThrow(absent, m == "ElementAt"
+                    ? "IndexOutOfRangeException" : "InvalidOperationException");
+                result = readElem();
+            }
+            // §28.3's unbound-owned-temporary reclaim — the eager-terminal
+            // twin of the array path's `freeFreshInputTemp`: a receiver that
+            // is a FRESH owned value no name holds is reclaimed at the end of
+            // the full expression, and this terminal is that boundary.  The
+            // §28.11 string-element escape rule DECLINES the reclaim when the
+            // element is a `string` (a shared-reference slot; the result
+            // borrows it, so releasing the collection would dangle it).
+            const bool elemIsString =
+                elemRef && !elemRef->nullable &&
+                elemRef->kind == sema::TypeRef::Kind::Primitive &&
+                elemRef->primitive == sema::PrimitiveType::String;
+            if (!elemIsString)
+                freeUnboundOwnedBorrowingArrayTemp(ma->target.get(),
+                                                   stackArr, recvTy);
+            return result;
+        }
+    }
+
     // Element LLVM type for the receiver's element TypeRef.
     auto elemLlvmOf = [&](sema::TypeRef* er) -> llvm::Type* {
         if (er) if (auto* t = lowerTypeRef(er)) return t;

@@ -296,6 +296,14 @@ end C;
 
 // `Stack<T>` (stdlib section 4.11) -- an `IReadOnlyCollection<T>`, so
 // section 5's extension applies to it too.
+//
+// fix #8276 (stdlib section 4.11 "Iteration order" / section 5, v0.355): the
+// pinned VALUE moved from 10 to 30.  A stack iterates in TAKE order -- top to
+// bottom -- so section 5's `ElementAtOrNull(i)` (defined over the
+// `IEnumerable<T>` iteration order) answers with the i-th element of THAT
+// order: `ElementAtOrNull(0)` is the TOP (30), not the bottom (10).  The
+// out-of-range row is unchanged: index 3 of a 3-element stack is still absent,
+// so it is still null.
 BEZEL_TEST(collection_elementatornull_8232, stack_receiver) {
     expectOut(runAotChecked(R"BZL(
 module M; import System; import System.Collections.Generic;
@@ -309,7 +317,7 @@ class C
   end Main;
 end C;
 )BZL"),
-              "10\n-1\n");
+              "30\n-1\n");
 }
 
 // `Queue<T>` (stdlib section 4.11).

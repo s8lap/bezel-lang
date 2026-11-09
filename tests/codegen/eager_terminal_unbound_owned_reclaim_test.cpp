@@ -292,8 +292,19 @@ void expectReclaimedStandalone(const char* moduleName, const std::string& stmt,
 // THE FOUR SHAPES — the sample the #6380 review measured: `.Any()` and
 // `.First()` with NO lazy operator before them, on the two eager families.
 // 12,120 B each on this fix's parent. Each row also pins the terminal's VALUE
-// (`Any` true, `First` 1), so an over-eager reclaim that returned garbage from
-// a freed backing would fail here too.
+// (`Any` true, `First` 1 on an `Array<T>`), so an over-eager reclaim that
+// returned garbage from a freed backing would fail here too.
+//
+// fix #8276 (stdlib §4.11 / §5, v0.355) — the three `Stack<T>` rows whose
+// VALUE is a §5 element terminal changed, because stdlib §4.11's "Iteration
+// order" makes a stack's `First()` its TOP and its `Last()` its BOTTOM:
+//   "All four types iterate (via `IReadOnlyCollection<T>`) in take order — a
+//    stack top-to-bottom (pop order) …"
+// The producer's literal `[1, 2, 3]` lists the elements BOTTOM-to-top (stdlib
+// §4.11's "Construction via collection literal"), so the top is 3 and the
+// bottom is 1: `First()` 1 → 3, `Last()` 3 → 1, `FirstOrNull()` 1 → 3.  The
+// RECLAIM these rows measure is unaffected — only the pinned value moved, and
+// the ASan leg is still what proves the reclaim fires.
 // ===========================================================================
 BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
            array_any_terminal_of_an_unbound_owned_temp_is_reclaimed_spec_28_3) {
@@ -314,7 +325,11 @@ BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
 
 BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
            stack_first_terminal_of_an_unbound_owned_temp_is_reclaimed_spec_28_3) {
-    expectReclaimed(makeStack(), "MEGS2", "acc := acc + f.Make().First();", 2);
+    // fix #8276 (stdlib §4.11 / §5, v0.355): the value moved from 1 to 3 —
+    // a stack's `First()` is the TOP of the take order, and the producer's
+    // literal `[1, 2, 3]` is bottom-to-top, so the top is 3.  The reclaim
+    // this row measures is unchanged.
+    expectReclaimed(makeStack(), "MEGS2", "acc := acc + f.Make().First();", 4);
 }
 
 // ===========================================================================
@@ -440,7 +455,11 @@ BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
 
 BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
            stack_last_terminal_of_an_unbound_owned_temp_is_reclaimed_spec_28_3) {
-    expectReclaimed(makeStack(), "MEGS5", "acc := acc + f.Make().Last();", 4);
+    // fix #8276 (stdlib §4.11 / §5, v0.355): the value moved from 3 to 1 —
+    // a stack's `Last()` is the BOTTOM of the take order, and the producer's
+    // literal `[1, 2, 3]` is bottom-to-top, so the bottom is 1.  The reclaim
+    // this row measures is unchanged.
+    expectReclaimed(makeStack(), "MEGS5", "acc := acc + f.Make().Last();", 2);
 }
 
 BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
@@ -462,9 +481,13 @@ BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
 
 BEZEL_TEST(eager_terminal_unbound_owned_reclaim,
            stack_firstornull_terminal_of_an_unbound_owned_temp_is_reclaimed_spec_28_3) {
+    // fix #8276 (stdlib §4.11 / §5, v0.355): the value moved from 1 to 3 —
+    // `FirstOrNull()` is the nullable sibling of `First()` on the same §5
+    // extension block, over the same iteration order, so it is the TOP too.
+    // The reclaim this row measures is unchanged.
     expectReclaimed(makeStack(), "MEGS9",
                     "var v := f.Make().FirstOrNull(); if v <> null then acc := acc + v!; end;",
-                    2);
+                    4);
 }
 
 // ===========================================================================
