@@ -158,8 +158,16 @@ BEZEL_TEST(timespan_operator_operand_type_7547,
 }
 
 // ── A4 ─ the `?` is GONE: an annotated TimeSpan with no applicable overload
-// names `TimeSpan` — the operand's type is no longer lost. (`* 2L` is not
-// the declared `double` factor, so no operator applies.)
+// names `TimeSpan` — the operand's type is no longer lost.
+//
+// FLIPPED by fix #7605 (spec §5.1, v0.355; §25.2, v0.350; stdlib §2.5,
+// v0.350): this row used `* 2L` as its "no applicable overload" shape,
+// because the arm demanded an EXACT `double` factor. §5.1 widens `long` to
+// `double` IMPLICITLY, so `ts * 2L` now binds the operand to the declared
+// `factor: double` parameter by the ordinary argument rules (§25.2) and
+// COMPILES — 5 ticks * 2 = 10 ticks. The row's INTENT (the diagnostic names
+// `TimeSpan`, never the `?` placeholder) is kept by A4b below, which uses a
+// shape that still has no applicable overload.
 BEZEL_TEST(timespan_operator_operand_type_7547,
            reject_names_the_timespan_operand_not_the_placeholder_spec_25) {
     auto r = runAot(
@@ -167,6 +175,28 @@ BEZEL_TEST(timespan_operator_operand_type_7547,
         "class C public static method Main(): int "
         "  var ts: TimeSpan := TimeSpan.FromTicks(5L); "
         "  var m := ts * 2L; "
+        "  Console.WriteLine($\"{m.Ticks}\"); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("10\n"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "type `?`"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "a: ?, b: ?"));
+}
+
+// ── A4b ─ the row A4 kept: an annotated TimeSpan with NO applicable
+// overload still names `TimeSpan` (never the `?` placeholder). `ts * ts`
+// is that shape — stdlib §2.5 declares no `*(TimeSpan, TimeSpan)`, and
+// §5.1 converts no type to `TimeSpan` (fix #7605 widened the FACTOR, not
+// the operand pair).
+BEZEL_TEST(timespan_operator_operand_type_7547,
+           reject_names_the_timespan_operand_not_the_placeholder_spec_25_pair) {
+    auto r = runAot(
+        "module M7547D2; "
+        "class C public static method Main(): int "
+        "  var ts: TimeSpan := TimeSpan.FromTicks(5L); "
+        "  var m := ts * ts; "
         "  return 0; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));

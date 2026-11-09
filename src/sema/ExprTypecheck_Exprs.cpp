@@ -9831,6 +9831,66 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     }
 }
 
+// fix #7605 (§5.1, v0.355; stdlib §2.5, v0.350): REALIZE the §5.1 widening of
+// a stdlib §2.5 `TimeSpan` operator's `double` factor.
+//
+// stdlib §2.5 declares `operator *(a: TimeSpan, factor: double)` and
+// `operator /(a: TimeSpan, divisor: double)`. §25.2 matches the operands to
+// the parameters IN ORDER, by the ordinary argument rules, and §5.1's table
+// widens `int`/`long`/`float` (and the other numeric rows) to `double`
+// IMPLICITLY — so `ts * 2` binds the `int` operand to the `factor: double`
+// parameter exactly as `ts * 2.0` does.
+//
+// THE CONVERSION IS REALIZED, NOT MERELY ADMITTED. Codegen's stdlib §2.5 arm
+// lowers the product over the TICK COUNT in `double` and requires the
+// factor's LLVM value to be an `f64`; an `int` operand lowered as `i32` would
+// reach `fmul double, i32` — malformed IR the verifier rejects (the same
+// failure #8059 recorded for `a *= 2.0`). So the operand is REWRITTEN to the
+// explicit §5.2 conversion `double(x)`, whose own lowering (`lowerConversion`
+// → `lowerPrimCastScalar`) performs the widening with the SOURCE's signedness
+// (`sitofp` / `uitofp` / `fpext`) — the same conversion the mixed int/float
+// binary path performs through `promoteOperandToFP`, reached here by the
+// spelling the language already has. The AST rewrite is the same mechanism
+// #8059 uses for the compound form (`x op= e` → `x := x op e`): the
+// expression tree is edited in sema and the later passes (purity, definite
+// assignment, ownership) walk the rewritten tree.
+//
+// The rewrite is confined to a PRIMITIVE, NON-NULLABLE operand that §5.1
+// widens to `double`: a nullable operand has no implicit conversion to a
+// non-nullable `double` (§5.1's lifting reaches only the nullable forms), and
+// `decimal` is never implicitly convertible to a binary float (§5.1's "never
+// implicit" list), so neither is admitted.
+//
+// The conversion call is typed exactly as a source-level `double(x)` is
+// (§5.2, ExprTypecheck_Calls.cpp): the call's type is `double` and the callee
+// carries NO symbol — which is what codegen's explicit-conversion dispatch
+// (`lowerCallDispatch`) keys on.
+static bool widenTimeSpanFactorToDouble(SemaContext& ctx,
+                                         const ast::BinaryExpr& be) {
+    if (!be.right) return false;
+    TypeRef* rr = ctx.exprType(*be.right);
+    if (!rr || rr->kind != TypeRef::Kind::Primitive || rr->nullable)
+        return false;
+    if (!primitiveImplicitlyWidens(rr->primitive, PrimitiveType::Double))
+        return false;
+    const SourceSpan argSpan = be.right->span;
+    auto conv = std::make_unique<ast::CallExpr>();
+    conv->span = argSpan;
+    auto callee = std::make_unique<ast::IdentifierExpr>();
+    callee->span = argSpan;
+    callee->name = "double";
+    conv->callee = std::move(callee);
+    ast::CallArgument arg;
+    // The operand is MOVED into the conversion's argument slot: it is
+    // evaluated exactly once, in place, as the argument of the conversion.
+    auto& mut = const_cast<ast::BinaryExpr&>(be);
+    arg.value = std::move(mut.right);
+    conv->args.push_back(std::move(arg));
+    ctx.setExprType(conv.get(), ctx.primitiveTypeRef(PrimitiveType::Double));
+    mut.right = std::move(conv);
+    return true;
+}
+
 void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                              bool& stringArithRuleReached) {
     const auto& op = be.op;
@@ -11390,6 +11450,13 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
         // declares no lifted (`TimeSpan?`) operator, so a nullable operand
         // stays on the §25 reject (and its type is now NAMED there, not `?`).
         bool tsOperandPair = false;
+        // The left operand must be a stdlib §2.5 `TimeSpan` (either shape —
+        // the value-producing one and the ANNOTATION one, see
+        // `stdlibValueBuiltinName` above) for the `*`/`/` arm to apply at
+        // all; the factor widening below is bound to it.
+        const bool tsLeft = lt && lt->kind == TypeRef::Kind::Named &&
+                            !lt->nullable &&
+                            stdlibValueBuiltinName(lt) == "TimeSpan";
         if (be.right) {
             TypeRef* rr = ctx_.exprType(*be.right);
             if (op == "+" || op == "-") {
@@ -11399,10 +11466,31 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
             } else if (op == "*" || op == "/") {
                 tsOperandPair = rr && rr->kind == TypeRef::Kind::Primitive &&
                                 rr->primitive == PrimitiveType::Double;
+                // fix #7605 (spec §5.1, v0.355; §25.2, v0.350; stdlib §2.5,
+                // v0.350): the declared factor is a `double`, and §5.1's
+                // table widens `int`/`long`/`float` (and the other numeric
+                // rows) to `double` IMPLICITLY — so `ts * 2`, `ts * 2L` and
+                // `ts * 2.0f` bind their operand to the `factor: double`
+                // parameter by the ordinary argument rules (§25.2), exactly
+                // as `ts * 2.0` does. Before this the arm demanded an
+                // EXACT `double` operand and the three shapes fell through
+                // to the §25 reject ("operator `*` is not defined for type
+                // `TimeSpan`") — the over-rejection #7605 reports.
+                //
+                // The widening is REALIZED, not merely admitted: the operand
+                // becomes a `double` value (see
+                // `widenTimeSpanFactorToDouble` above), so codegen's stdlib
+                // §2.5 arm lowers the product over the ticks in `double`
+                // instead of reaching `fmul double, i32`.
+                if (!tsOperandPair && tsLeft && rr &&
+                    rr->kind == TypeRef::Kind::Primitive && !rr->nullable &&
+                    primitiveImplicitlyWidens(rr->primitive,
+                                              PrimitiveType::Double)) {
+                    tsOperandPair = widenTimeSpanFactorToDouble(ctx_, be);
+                }
             }
         }
-        if (lt && lt->kind == TypeRef::Kind::Named && !lt->nullable &&
-            stdlibValueBuiltinName(lt) == "TimeSpan" && tsOperandPair) {
+        if (tsLeft && tsOperandPair) {
             auto* tsTy = ctx_.makeTypeRef();
             tsTy->kind = TypeRef::Kind::Named;
             tsTy->declaration = builtinClassSym("TimeSpan");
