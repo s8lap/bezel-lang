@@ -44783,6 +44783,59 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             targetType->kind != ast::TypeDeclKind::Enum &&
             targetType->kind != ast::TypeDeclKind::Choice;
         if (typeNameDispose) isUniversalObjectMember = false;
+        //
+        // fix #8359 (§27.6, v0.350 / §8.7, v0.350 / §26.5 rule 2, v0.355 /
+        // §28.2, v0.355): the READ spelling of the same access through an
+        // ENUM or a CHOICE type name — `E.Dispose;` — is a compile error
+        // too, and it is the SAME error the CALL spelling gets.
+        //
+        // §8.7 (v0.350): "`Dispose()` is a member of a class type, of an
+        // interface type that is or extends `IDisposable` ... and of an
+        // interface that declares `method Dispose();` itself (§28.2), and of
+        // nothing else." An enum and a choice implement neither, so they have
+        // NO `Dispose` member at all. §28.2 (v0.355) then forbids the name on
+        // those kinds in every member kind ("a method, instance or `static`,
+        // a field, a property, a `const`, an enum constant, a choice case or
+        // a nested type"), so nothing can supply it either.
+        //
+        // §27.6 (v0.350) selects the diagnostic for this spelling: "Where the
+        // receiver's type has no `Dispose` member at all (§8.7), the no-member
+        // diagnostic applies instead." The receiver's type here IS an enum or a
+        // choice, so the no-member diagnostic is the one that applies — the
+        // §27.6 method-reference rule (which #7344 tracks, and whose read
+        // half against §26.5 rule 2 is the open spec-question #8065) governs
+        // the CLASS and INTERFACE type names, NOT these two kinds.
+        //
+        // §26.5 rule 2 (v0.355) is the other half: "Through a type name
+        // (§2.7 rule 1) the chain resolves against the type's nested types,
+        // enum constants and static members, declared or inherited — and a
+        // call or read `T.M` that none of them supplies names no member and
+        // is the same compile error: an instance method of the name does not
+        // supply it, there being no receiver, and an extension does not,
+        // extensions having no static-invocation form (rule 4)." `Dispose` is
+        // none of those (a generated INSTANCE member, §8.7), and an enum
+        // constant is a VALUE of the enum type (§10.2, v0.355: "everywhere
+        // else, member bodies included, an enum constant is a value of the
+        // enum type"), so a constant named `Dispose` — which §28.2 forbids
+        // anyway — is not a member reference either.
+        //
+        // The CALL spelling over an enum or a choice is rejected elsewhere
+        // (the #7927 arm: "`Dispose` is not admitted on an enum value" /
+        // "... on a choice value"), so this const covers the READ spelling
+        // only — `calleeOfCallCtx_ != &ma` — and leaves the CALL spelling
+        // exactly as it was.
+        //
+        // A type name that DOES supply the name is unaffected: an enum or a
+        // choice that declares a case named `Dispose` resolves it in the
+        // member lookup above (`TypeSymbol::members` carries the enum
+        // constants and the choice cases), so it never reaches this gate —
+        // §26.5 rule 2's "enum constants" arm still supplies that read.
+        const bool typeNameDisposeRead =
+            receiverIsTypeName && mm == "Dispose" && targetType &&
+            calleeOfCallCtx_ != &ma &&
+            (targetType->kind == ast::TypeDeclKind::Enum ||
+             targetType->kind == ast::TypeDeclKind::Choice);
+        if (typeNameDisposeRead) isUniversalObjectMember = false;
         // §9.8 / issue #550: Serialize and Deserialize are synthesized for
         // records/enums/serialized-tree-classes that declare
         // ISerializable/IDeserializable. They have no MemberSymbol, so we must
