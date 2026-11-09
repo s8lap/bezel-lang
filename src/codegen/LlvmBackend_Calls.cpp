@@ -833,6 +833,64 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             strPtr = emitValueToString(arg, argTy);
             if (!strPtr) return false;
             if (freshFnArg) emitClosureRelease(arg);
+            // fix #7803 / §28.3.11 *Unbound owned temporaries* + §28.3 *A callee
+            // that stores a plain argument* (v0.355): the console's ONE argument
+            // is a BORROWING USE whenever the argument is a FRESH OWNED
+            // PRODUCER. A FUNCTION VALUE IS A CLOSURE (§28.9: a function value
+            // is runtime-managed, its cell a heap object with a reference
+            // count), so a fresh closure cell is an owned producer in exactly
+            // the sense §28.3.11 governs: the call that mints it holds a +1
+            // that the CALL SITE solely owns, and a call site that hands the
+            // value to a plain parameter and binds nothing must release that
+            // +1 at the end of the full expression (§28.3.11, spec line 7712:
+            // such a temporary "is disposed at the **end of the full
+            // expression** in which it is produced, after every use of it
+            // within that expression has completed"). §28.3 (spec line 7759)
+            // *A callee that stores a plain argument*: "A non-`owned` argument
+            // position is a borrowing use whatever the callee's body does with
+            // the parameter" — `Console.WriteLine(value: Object)` (stdlib §2.1)
+            // takes its parameter PLAIN, so the console never takes the +1 and
+            // the temporary's discharge is the call site's own obligation.
+            //
+            // THE DEFECT. The console lowering had NO closure discharge at all:
+            // the ONLY release it emitted was `freshFnArg`'s, the #5943
+            // INLINE-LAMBDA form (`lastStampedFnCell_` — a forming expression
+            // nothing binds). A closure cell minted by a CALL — `MkFn()`,
+            // whose callee "mints exactly +1 on return" (#429 RETURN category)
+            // — reached the console as an unbound owned temporary that NOBODY
+            // released. MEASURED on this tree's base under
+            // `bezelc --sanitize=address` (ASan/LSan),
+            // `Console.WriteLine(MkFn())` in a 200-iteration loop leaked
+            // 12800 B in 200 allocations (64 B per call — the closure cell;
+            // `bz.closure` is {ptr, ptr, i64, ptr, i64, i8, ptr, ptr} = 64 B).
+            // The byte-identical BOUND arm (`var g := MkFn();`) is CLEAN — the
+            // binding takes the +1 and the local's scope-end discharge owns it.
+            //
+            // THE FIX. The SAME two recognizers the closure-local binding path
+            // uses to decide that the slot owns the producer's +1:
+            // `isUserMethodClosureReturnCall` (a call to a user-defined,
+            // locally-compiled method whose declared return type is a function
+            // type — the callee mints exactly +1 on return) and its lambda twin
+            // `isLambdaClosureReturnCall` (a call to a lambda-typed local or
+            // parameter, whose body shape is statically known to mint +1).
+            // Both are the NARROW forms of the blanket "every closure-valued
+            // call is a +1 producer" that `isPlusOneClosureProducer`'s own
+            // comment DECLINED ("the callee may hand back a function value
+            // WITHOUT a fresh +1 ... so caller-side release of a call result
+            // could free a value the callee still references (UAF)") — so the
+            // discharge can never free a value the callee still holds.
+            //
+            // ⇒ THE GATE IS THE ARGUMENT EXPRESSION'S SHAPE, NEVER ITS VALUE:
+            // only a CALL can match. A NAMED LOCAL, a field, a parameter or an
+            // alias is an IdentifierExpr / MemberAccessExpr and can NEVER
+            // match, so the local's own scope-end discharge keeps sole
+            // ownership of its +1 — no double release, no double free. (That
+            // is the §28.9 contract for a function-typed local: it holds the
+            // producer's single reference and releases it at its scope end.)
+            if (!freshFnArg && call.args[0].value &&
+                (isUserMethodClosureReturnCall(call.args[0].value.get()) ||
+                 isLambdaClosureReturnCall(call.args[0].value.get())))
+                emitClosureRelease(arg);
             releaseRender = true;
         } else if (argTy->kind == sema::TypeRef::Kind::Named &&
                    (argTy->declaration || isVtablelessBuiltinRef(argTy) ||
@@ -973,6 +1031,67 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         releaseRender = (strPtr != arg);
     }
     if (!strPtr) return false;
+    // fix #7793 / §28.3.11 *Unbound owned temporaries* + §28.3 *A callee that
+    // stores a plain argument* (v0.355): the console's ONE argument is a
+    // BORROWING USE whenever the argument is a FRESH OWNED PRODUCER — a
+    // `new C(...)` or an `owned C`-returning call. §28.3.11 (spec line 7712):
+    // such a value "is disposed at the **end of the full expression** in which
+    // it is produced, after every use of it within that expression has
+    // completed"; and §28.3 (spec line 7759) *A callee that stores a plain
+    // argument*: "A non-`owned` argument position is a borrowing use whatever
+    // the callee's body does with the parameter, and the temporary's disposal
+    // at its boundary does not depend on that body." The console's
+    // `WriteLine(value: Object)` parameter is plain (stdlib §2.1), so the
+    // temporary is owed a disposal at the K8 boundary — the callee's body
+    // (here: the compiler's own console lowering) is irrelevant to that.
+    //
+    // THE DEFECT. `tryLowerConsoleCall` lowers its argument directly
+    // (`lowerExpr(*call.args[0].value)`) and registers NO disposal for it, so
+    // a fresh class-typed temporary was owned by NOBODY: MEASURED on this
+    // tree's base under `bezelc --sanitize=address` (ASan/LSan),
+    // `Console.WriteLine(new Cls())` in a 200-iteration loop leaked 3200 B in
+    // 200 allocations (16 B per call — the instance), and
+    // `Console.Out.WriteLine(new Cls())` the same. The byte-identical
+    // NAMED-LOCAL arm (`var c := new Cls(); Console.WriteLine(c);`) is CLEAN,
+    // because the local's own scope-end discharge owns that value — the
+    // difference between the two spellings was the whole defect. A class with
+    // a destructor leaked its instance too, and its destructor never ran.
+    //
+    // THE FIX. The K8 queue the user-call path already uses
+    // (`buildOrderedArgs`'s class-instance arm → `deferUnboundOwnedTempToK8`):
+    // the value is parked in a slot, an unwind-only disposal is registered on
+    // the current scope (the EXCEPTION edge — §28.3.11's *Exception-path
+    // discharge*), and the normal edge is the K8 full-expression flush, which
+    // dispatches the object's own vtable `Dispose` and reclaims the block.
+    // ⇒ the discharge runs AFTER the write (the console renders the argument
+    // through its `ToString` first), exactly once, and never on a bound
+    // value: the gate is `isFreshOwnedClassProducer`, so a named local, a
+    // field, a parameter, an alias or a `move` argument is NOT admitted and
+    // keeps its own owner's discharge (no double disposal).
+    if (arg && arg->getType()->isPointerTy() && call.args[0].value &&
+        isFreshOwnedClassProducer(call.args[0].value.get())) {
+        llvm::AllocaInst* argTmpSlot = entryAllocaNullPtr();
+        builder_.CreateStore(arg, argTmpSlot);
+        if (!deferUnboundOwnedTempToK8(argTmpSlot)) {
+            // No K8 boundary to queue on (a disposer body): fall back to an
+            // immediate, null-guarded discharge so the value is not leaked
+            // outright — the same fallback the function-value invoke path
+            // uses (LlvmBackend_Calls2.cpp).
+            llvm::Value* obj =
+                builder_.CreateLoad(ptrTy(), argTmpSlot, "console.argtmp");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                obj, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB = llvm::BasicBlock::Create(
+                llvm_, "console.argtmp.dispose", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(
+                llvm_, "console.argtmp.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            emitDisposeAndReclaim(obj);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+        }
+    }
     emitConsoleWrite(strPtr, isWriteLine, fdArg);
     // issue #421 / fix #2875: discharge the write-only render. Done AFTER the
     // write, which only reads the string. `bz_string_release` frees the data
@@ -19453,6 +19572,72 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "FromByteArray" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* arr = lowerExpr(*call.args[0].value);
             if (!arr) return nullptr;
+            // fix #7855 / §28.3.11 *Unbound owned temporaries* + §28.3 *A callee
+            // that stores a plain argument* (v0.355): `FromByteArray(bytes:
+            // Array<byte>)` takes its parameter as a BORROW (stdlib §2.6: it
+            // COPIES the 16 bytes out and keeps nothing), so a FRESH OWNED
+            // ARRAY passed here is an unbound owned temporary used only by a
+            // borrowing operation — §28.3.11 (spec line 7712) lists "as a
+            // non-`owned` argument" among the borrowing uses — and is "disposed
+            // at the **end of the full expression** in which it is produced,
+            // after every use of it within that expression has completed".
+            //
+            // THE DEFECT. This arm is a BUILTIN lowering: it lowers its
+            // argument directly and registers NO disposal for it, so the array
+            // was owned by NOBODY. MEASURED on this tree's base under
+            // `bezelc --sanitize=address` (ASan/LSan),
+            // `Guid.FromByteArray(g.ToByteArray())` in a 200-iteration loop
+            // leaked 19200 B in 400 allocations (the array header + its 16-byte
+            // buffer per call), and the `Encoding.UTF8.GetBytes(s)` twin
+            // leaked 14400 B in 300. The byte-identical BOUND arm
+            // (`var b := g.ToByteArray(); Take(b);`) is CLEAN — the local's
+            // own discharge owns that value.
+            //
+            // THE FIX. The same shape the user-call path registers
+            // (`buildOrderedArgs`'s owned-`Array` arm): the array is parked in
+            // a slot, a `releaseOnUnwindOnly` collection disposal is registered
+            // on the current scope (the EXCEPTION edge — the
+            // `ArgumentException` this very arm raises for a wrong-length
+            // array must not leak the array), and the normal edge is the K8
+            // full-expression flush, which frees the backing and cascades the
+            // §28.11 element disposer (null for a `byte` element). The gate
+            // is the SAME recognizer pair the user-call path uses —
+            // `isFreshOwnerlessArrayMaterializerExpr` /
+            // `isUnboundOwnedBorrowingArrayCallExpr` — plus the stdlib's own
+            // `owned`-materializer table (`common::isBuiltinOwnedMaterializerCall`,
+            // which is what admits `Encoding.UTF8.GetBytes(s)` — stdlib §3.2's
+            // `owned Array<byte>` — whose callee carries NO sema symbol and is
+            // therefore invisible to the `owned`-marker read the other two
+            // recognizers use). So a bound local, a field, a parameter or an
+            // alias argument is NOT admitted and keeps its own owner's
+            // discharge (no double disposal).
+            if (arr->getType()->isPointerTy() && !disposeStack_.empty()) {
+                const sema::TypeRef* at = ctx_.exprType(*call.args[0].value);
+                const bool isBorrowingArrayHead =
+                    at && at->kind == sema::TypeRef::Kind::Named &&
+                    !at->declaration && builtinTypeName(at) == "Array";
+                const ast::CallExpr* argCall =
+                    dynamic_cast<const ast::CallExpr*>(call.args[0].value.get());
+                if (isBorrowingArrayHead &&
+                    (isFreshOwnerlessArrayMaterializerExpr(
+                         call.args[0].value.get()) ||
+                     isUnboundOwnedBorrowingArrayCallExpr(
+                         call.args[0].value.get()) ||
+                     (argCall && common::isBuiltinOwnedMaterializerCall(
+                                     *argCall, ctx_)))) {
+                    llvm::AllocaInst* arrSlot = entryAllocaNullPtr();
+                    if (smStateStruct_)
+                        asyncHandlerSpillSlots_.push_back(arrSlot);
+                    builder_.CreateStore(arr, arrSlot);
+                    Disposal coll = buildCollectionTempDisposal(arrSlot, at);
+                    coll.unwindOnly = false;
+                    coll.dynamicDispose = false;
+                    coll.releaseOnUnwindOnly = true;
+                    disposeStack_.back().push_back(coll);
+                    k8RecvTemps_.push_back(
+                        K8RecvTemp{arrSlot, currentFn_, "Array"});
+                }
+            }
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {arr}, "guid.fb.len");
             emitGuardThrow(
