@@ -12343,12 +12343,46 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // (MEASURED: review r37-rev-u-await2 r04 / r04i / r06, the
             // in-flight fault freed by its owning task).
             //
-            // Outside an async body's resume function (a destructor body, an
-            // async iterator, a lambda emitted mid-pass) there is no suspend
-            // point to use, so those keep the synchronous fallback.
+            // Outside an async body's resume function (a destructor body, a
+            // lambda emitted mid-pass) there is no suspend point to use, so
+            // those keep the synchronous fallback.
+            //
+            // fix #7888 / §28.12 (v0.355): the ASYNC ITERATOR is NOT such a
+            // context. §30.7's async iterator IS an async state machine: its
+            // body is lowered into a resume function with the same
+            // `smStateStruct_` / `smSelf_` / `asyncResumeFn_` machinery an
+            // ordinary async method has (`emitAsyncIteratorMethod` sets all
+            // three and `smKind_ = SuspendKind::AsyncYield`), and `await`
+            // inside it lowers a real suspend point (`emitAwaitSuspend`
+            // admits AsyncYield — see its §30.7 gate). So the iterator's body
+            // HAS a suspend point, and §28.12's "implicit `finally` awaits
+            // `DisposeAsync` on both the normal and exception edges of an
+            // async body" applies to it exactly as to an async method.
+            //
+            // The `smKind_ == SuspendKind::Await` gate excluded it, so an
+            // async iterator's exception edge took the SYNCHRONOUS fallback:
+            // the destructor body ran and `DisposeAsync` never did — the
+            // body §28.12 step 1 says `DisposeAsync` supersedes. MEASURED on
+            // this tree's base (f0a1818e) under `bezelc --sanitize=address`:
+            // the issue's own repro (r28b_async_iter_body_throw_bound.bzl)
+            // printed `oda=0 odt=100` — the destructor body ran 100 times
+            // and the awaited `DisposeAsync` ran NONE. The expected output is
+            // `oda=100 odt=0`.
+            //
+            // The gate becomes "an async STATE MACHINE's own resume
+            // function": Await (an ordinary async method, #7705) or
+            // AsyncYield (an async iterator, #7888). `currentFn_ ==
+            // asyncResumeFn_` is the half that keeps a DESTRUCTOR body or a
+            // LAMBDA emitted mid-pass out: those have no resume function of
+            // their own and no suspend point, so they keep the synchronous
+            // fallback (§28.12's "Implicit discharge is synchronous": "an
+            // implicit disposal point never awaits").
             const bool awaitOnUnwind =
-                isUnwind && smKind_ == SuspendKind::Await && smStateStruct_ &&
-                smSelf_ && asyncResumeFn_ && currentFn_ == asyncResumeFn_ &&
+                isUnwind &&
+                (smKind_ == SuspendKind::Await ||
+                 smKind_ == SuspendKind::AsyncYield) &&
+                smStateStruct_ && smSelf_ && asyncResumeFn_ &&
+                currentFn_ == asyncResumeFn_ &&
                 (it->disposeAsyncFn ||
                  it->disposeAsyncVSlot == kDisposeAsyncRunTimeDispatch);
             if (awaitOnUnwind) {
