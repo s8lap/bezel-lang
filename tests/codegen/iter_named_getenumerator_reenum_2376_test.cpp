@@ -418,7 +418,13 @@ BEZEL_TEST(iter_named_getenumerator_reenum_2376,
         "  end Gen; "
         "end C; "
         "class Holder "
-        "  private seq: IEnumerable<int>; "
+        // fix #7762 (§28.3.6 clause 1/4 + §28.6's fresh-store rule, v0.355):
+        // `Gen()`'s declared return type is a mint-announcing head, so the
+        // call MINTS an owned frame at the call site — a fresh owned value
+        // stored into a NON-`owned` field is §28.6's fresh-store error, so
+        // the field is now `owned` and the holder owns (and disposes) the
+        // frame it stores.
+        "  private owned seq: IEnumerable<int>; "
         "  public constructor() seq := C.Gen(); end constructor; "
         "  public method Run(): int "
         "    using var e1 := seq.GetEnumerator(); "

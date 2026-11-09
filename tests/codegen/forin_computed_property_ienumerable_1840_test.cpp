@@ -28,6 +28,9 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 // ---------------------------------------------------------------------------
@@ -35,12 +38,31 @@ using bezel::test::runAotChecked;
 // ---------------------------------------------------------------------------
 
 // HEADLINE: the computed property `=> C.Gen()` returns a fresh owned
-// IEnumerable<int> per read. The for-in iterates that fresh value and MUST
-// dispose the source frame at loop end (auto-drop it, exactly as a CallExpr
-// temporary). Without the fix the source frame leaks (LSan 32B). Exit code
-// pins 10+20+30 = 60 (a premature free would corrupt the yield values).
+// IEnumerable<int> per read.
+//
+// fix #7762 (§28.6 bullet 5 + §28.3.6 clause 1, v0.355): the calls-mint
+// classification now covers the ITERABLE half of the mint-announcing
+// families, so `C.Gen()` — an UNMARKED `IEnumerable<int>` return — produces
+// an OWNED FRAME at the call site (§28.3.6 clause 1: "A call whose declared
+// return type ... is a mint-announcing type produces an owned frame at the
+// call site"). §28.6 bullet 5 then rejects the GETTER that returns it:
+// "A property or indexer getter may not return a freshly-produced owned value
+// (axiom A4) ... This holds at every declared type, a mint-announcing one
+// included ... and in every spelling: `get => _items.Drain()`, an
+// expression-bodied property, and the fresh value first bound to a getter-local
+// and returned (`var v := _items.Drain(); return v;`) are all this error. Expose
+// the factory as a method returning `owned T` instead, which can hand the
+// caller ownership."
+//
+// So the per-read frame this row used to observe at RUNTIME is now rejected at
+// COMPILE time — the leak the row pinned is unreachable through this spelling
+// (the `Task`-family twin of the same shape — `property T: Task<int> =>
+// Task.FromResult(0);` — has been rejected by the same §28.6 rule since the
+// Task row of the calls-mint set landed). The runtime coverage moves to the
+// METHOD spelling below, which is §28.6's own named remedy and keeps the
+// "a fresh per-read source frame is disposed once by the for-in" assertion.
 BEZEL_TEST(forin_computed_property_ienumerable_1840,
-           computed_ienumerable_property_disposed_lsan_clean_29_2) {
+           computed_ienumerable_property_rejected_by_a4_spec_28_6) {
     const std::string src =
         "module M; "
         "class C public static method Gen(): IEnumerable<int> "
@@ -51,6 +73,36 @@ BEZEL_TEST(forin_computed_property_ienumerable_1840,
         "  public method Sum(): int "
         "    var total: int := 0; "
         "    for var x in Seq do total := total + x; end for; "
+        "    return total; "
+        "  end Sum; "
+        "end Holder; "
+        "class C2 public static method Main(): int "
+        "  using var h := new Holder(); return h.Sum(); "
+        "end Main; end C2;";
+    JitResult r = runAot(src);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "a property or indexer getter may not return a freshly-produced "
+           "owned value"));
+}
+
+// The METHOD spelling (§28.6 bullet 5's own remedy: "Expose the factory as a
+// method returning `owned T` instead") — the per-read source frame is still
+// fresh, still owned at the call site, and the for-in must dispose it exactly
+// once (LSan-clean). Exit code pins 10+20+30 = 60 (a premature free would
+// corrupt the yield values).
+BEZEL_TEST(forin_computed_property_ienumerable_1840,
+           method_spelling_source_frame_disposed_lsan_clean_29_2) {
+    const std::string src =
+        "module M; "
+        "class C public static method Gen(): IEnumerable<int> "
+        "  yield return 10; yield return 20; yield return 30; "
+        "end Gen; end C; "
+        "class Holder "
+        "  public method Seq(): IEnumerable<int> => C.Gen(); "
+        "  public method Sum(): int "
+        "    var total: int := 0; "
+        "    for var x in Seq() do total := total + x; end for; "
         "    return total; "
         "  end Sum; "
         "end Holder; "
@@ -95,9 +147,16 @@ BEZEL_TEST(forin_computed_property_ienumerable_1840,
 // computed value 100+200+300 = 600 exceeds the 8-bit exit-code truncation
 // (600 & 0xFF = 88), so the test pins the result via stdout (r.stdoutText)
 // — the runAotChecked helper captures the program's stdout separately from
-// the truncated exit code. // per §29.2, §28.5
+// the truncated exit code.
+//
+// fix #7762 (§28.6 bullet 5 + §28.3.6 clause 1, v0.355): the per-read frame
+// of a computed property at a mint-announcing head is an OWNED frame at the
+// call site now, so the getter that returns it is rejected by §28.6's A4
+// rule (the `Task`-family twin has been rejected the same way since the Task
+// row of the calls-mint set landed). The runtime coverage of the member-access
+// face moves to the METHOD spelling row below.
 BEZEL_TEST(forin_computed_property_ienumerable_1840,
-           member_access_computed_property_disposed_lsan_clean_29_2) {
+           member_access_computed_property_rejected_by_a4_spec_28_6) {
     const std::string src =
         "module M; "
         "class C public static method Gen(): IEnumerable<int> "
@@ -110,6 +169,34 @@ BEZEL_TEST(forin_computed_property_ienumerable_1840,
         "  using var h := new Holder(); "
         "  var s := 0; "
         "  for var x in h.Seq do s := s + x; end; "
+        "  Console.WriteLine(s.ToString()); "
+        "  return 0; "
+        "end Main; end C2;";
+    JitResult r = runAot(src);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "a property or indexer getter may not return a freshly-produced "
+           "owned value"));
+}
+
+// The METHOD spelling of the member-access face — the per-read source frame
+// is disposed once at the loop's end (LSan-clean), and the printed "600"
+// confirms 100+200+300=600 was reached (a premature free would corrupt the
+// yield values mid-loop).
+BEZEL_TEST(forin_computed_property_ienumerable_1840,
+           member_access_method_spelling_disposed_lsan_clean_29_2) {
+    const std::string src =
+        "module M; "
+        "class C public static method Gen(): IEnumerable<int> "
+        "  yield return 100; yield return 200; yield return 300; "
+        "end Gen; end C; "
+        "class Holder "
+        "  public method Seq(): IEnumerable<int> => C.Gen(); "
+        "end Holder; "
+        "class C2 public static method Main(): int "
+        "  using var h := new Holder(); "
+        "  var s := 0; "
+        "  for var x in h.Seq() do s := s + x; end; "
         "  Console.WriteLine(s.ToString()); "
         "  return 0; "
         "end Main; end C2;";

@@ -130,6 +130,9 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -276,6 +279,20 @@ const char* kMainE =
     "    for var i in 0..<200 do "
     "      var h := new HolderE(); "
     "      for var x in h.Seq do s := s + x; end; "
+    "    end for; "
+    "    Console.WriteLine($\"s={s}\"); "
+    "    return 0; "
+    "  end Main; ";
+
+// The METHOD spelling of the same read (fix #7762, §28.6 bullet 5's named
+// remedy for a produced value): every read of `h.Seq()` mints a fresh frame,
+// and the for-in reclaims it.
+const char* kMainEMethod =
+    "  public static method Main(): int "
+    "    var s := 0; "
+    "    for var i in 0..<200 do "
+    "      var h := new HolderE(); "
+    "      for var x in h.Seq() do s := s + x; end; "
     "    end for; "
     "    Console.WriteLine($\"s={s}\"); "
     "    return 0; "
@@ -504,24 +521,56 @@ BEZEL_TEST(for_in_property_read_is_a_lend_6397,
 }
 
 // ===========================================================================
-// CONTROL — the getter that PRODUCES a value. The direction a
+// CONTROL — the source that PRODUCES a value. The direction a
 // "a property read is a lend" simplification breaks, and the shape #1840's
 // landed rows already pin.
 //
-// `G.Gen()` is a yielding generator, so every read of `Seq` allocates a fresh
-// iterator that nothing else can reach and no §29.2 wrap is involved at all —
-// the value is already an `IEnumerable<int>`. The reader owns it, and 200 reads
-// that nobody reclaims are 200 leaked iterators. A consumer keyed on "did a
-// wrap mint a frame" answers "no" here and turns
-// `forin_computed_property_ienumerable_1840`'s member-access row RED with
-// `Direct leak of 40 byte(s) in 1 object(s) allocated from bz$M.C$Gen` —
-// MEASURED on this lane's own tree before the classification was widened.
+// fix #7762 (§28.6 bullet 5 + §28.3.6 clause 1, v0.355): `G.Gen()`'s declared
+// return type is a mint-announcing head, so the call MINTS an owned frame at
+// the call site, and §28.6 bullet 5 rejects the GETTER that returns it ("A
+// property or indexer getter may not return a freshly-produced owned value
+// (axiom A4) ... This holds at every declared type, a mint-announcing one
+// included ... Expose the factory as a method returning `owned T` instead").
+// The `Task`-family twin of this shape has been rejected by the same rule
+// since the Task row of the calls-mint set landed.
+//
+// So the produced-value source is now expressed at the METHOD spelling —
+// §28.6's own named remedy — and the 200-read reclamation assertion stays
+// exactly where it was: every read mints a fresh frame and the reader (the
+// for-in) reclaims it. The direct getter spelling's new verdict is pinned by
+// the row below.
 //
 // 200 × (1 + 2 + 3) = 1200.
 // ===========================================================================
 BEZEL_TEST(for_in_property_read_is_a_lend_6397,
-           produced_value_getter_source_is_still_reclaimed_spec_28_3) {
+           produced_value_method_source_is_still_reclaimed_spec_28_3) {
     JitResult r = checked(
+        std::string("module TE; ") +
+        "class G public static method Gen(): IEnumerable<int> "
+        "  yield return 1; yield return 2; yield return 3; "
+        "end Gen; end G; "
+        "public class HolderE "
+        "  public method Seq(): IEnumerable<int> => G.Gen(); "
+        "end HolderE; "
+        "public class TEImpl " + kMainEMethod + "end TEImpl;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("s=1200") != std::string::npos);
+}
+
+// ===========================================================================
+// The GETTER spelling of the row above — now a COMPILE error.
+//
+// fix #7762 (§28.6 bullet 5 + §28.3.6 clause 1, v0.355): the calls-mint
+// classification covers the ITERABLE half of the mint-announcing families, so
+// `G.Gen()` — an UNMARKED `IEnumerable<int>` return — produces an OWNED FRAME
+// at the call site, and a getter may not return a freshly-produced owned
+// value "at every declared type, a mint-announcing one included" (§28.6
+// bullet 5).
+// ===========================================================================
+BEZEL_TEST(for_in_property_read_is_a_lend_6397,
+           produced_value_getter_rejected_by_a4_spec_28_6) {
+    JitResult r = runAot(
         std::string("module TE; ") +
         "class G public static method Gen(): IEnumerable<int> "
         "  yield return 1; yield return 2; yield return 3; "
@@ -530,9 +579,10 @@ BEZEL_TEST(for_in_property_read_is_a_lend_6397,
         "  public property Seq: IEnumerable<int> => G.Gen(); "
         "end HolderE; "
         "public class TEImpl " + kMainE + "end TEImpl;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("s=1200") != std::string::npos);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "a property or indexer getter may not return a freshly-produced "
+           "owned value"));
 }
 
 // ===========================================================================

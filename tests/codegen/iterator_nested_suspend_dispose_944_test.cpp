@@ -201,7 +201,12 @@ BEZEL_TEST(iterator_nested_suspend_dispose_944, named_local_source_disposed_once
         "  public static method Inner(): IEnumerable<Cell> "
         "    using var c1 := new Cell(); yield return c1; end Inner; "
         "  public static method Outer(): IEnumerable<int> "
-        "    var src := P.Inner(); "           // named-local source
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): `Inner`'s declared return
+        // type is a mint-announcing head, so the call MINTS an owned frame at
+        // the call site and the caller holds the container obligation — the
+        // plain `var` spelling left it undischarged in a generator body (no
+        // scope-end auto-drop there), so it is now `using var`.
+        "    using var src := P.Inner(); "   // named-local source
         "    for var x in src do yield return 1; end; end Outer; "
         "  public static method Main(): int "
         "    for var x in P.Outer() do break; end; "  // abandon mid-loop

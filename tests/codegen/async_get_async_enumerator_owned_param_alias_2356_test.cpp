@@ -132,7 +132,12 @@ BEZEL_TEST(async_get_async_enumerator_owned_param_alias_2356,
         "    yield return c.V; "
         "  end UseCell; "
         "  public static async method Main(): Task<int> "
-        "    var src := P.UseCell(new Cell()); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): `UseCell`'s declared
+        // return type is a mint-announcing head, so the call MINTS an owned
+        // frame at the call site and the caller holds the container
+        // obligation — discharged here by `using var` (the plain `var`
+        // spelling left it undischarged in an async body).
+        "    using var src := P.UseCell(new Cell()); "
         "    await using var en := src.GetAsyncEnumerator(); "
         "    var m1 := await en.MoveNextAsync(); "
         "    if m1 then return 1; else return 2; end; "
@@ -160,7 +165,11 @@ BEZEL_TEST(async_get_async_enumerator_owned_param_alias_2356,
         "  public static async method Main(): Task<int> "
         "    var v: int := 0; "
         "    do "
-        "      var src := P.UseCell(new Cell()); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): the minted frame is owned
+        // at the call site — `using var` discharges it at this scope's end
+        // (the same point the old borrow-shaped local's own scope-end
+        // disposal fired, so the exactly-once counter is unchanged).
+        "      using var src := P.UseCell(new Cell()); "
         "      await using var en := src.GetAsyncEnumerator(); "
         "      var m1 := await en.MoveNextAsync(); "
         "      if m1 then v := en.Current; end; "
@@ -194,7 +203,10 @@ BEZEL_TEST(async_get_async_enumerator_owned_param_alias_2356,
         "  public static async method Main(): Task<int> "
         "    var v: int := 0; "
         "    do "
-        "      var src := P.UseCell(new Cell()); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): `using var` — the minted
+        // frame is owned at the call site and is discharged at this scope's
+        // end (the abandoned enumerator's own teardown is separate).
+        "      using var src := P.UseCell(new Cell()); "
         "      await using var en := src.GetAsyncEnumerator(); "
         "      var m1 := await en.MoveNextAsync(); "  // only ONE of three
         "      if m1 then v := en.Current; end; "
@@ -281,7 +293,9 @@ BEZEL_TEST(async_get_async_enumerator_owned_param_alias_2356,
         "    yield return 1; yield return 2; yield return 3; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
-        "    var src := C.Gen(); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): the minted frame is owned
+        // at the call site — `using var` discharges it at this scope's end.
+        "    using var src := C.Gen(); "
         "    var sum1 := 0; "
         "    do "
         "      await using var en1 := src.GetAsyncEnumerator(); "
@@ -323,7 +337,9 @@ BEZEL_TEST(async_get_async_enumerator_owned_param_alias_2356,
         "    yield return 1; yield return 2; yield return 3; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
-        "    var src := C.Gen(); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): the minted frame is owned
+        // at the call site — `using var` discharges it at this scope's end.
+        "    using var src := C.Gen(); "
         "    var first := 0; "
         "    do "
         "      await using var en1 := src.GetAsyncEnumerator(); "
@@ -377,7 +393,9 @@ BEZEL_TEST(async_get_async_enumerator_owned_param_alias_2356,
         "  public static async method Main(): Task<int> "
         "    var a := 0; var caught := 0; "
         "    do "
-        "      var src := P.UseCell(new Cell()); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): the minted frame is owned
+        // at the call site — `using var` discharges it at this scope's end.
+        "      using var src := P.UseCell(new Cell()); "
         "      await using var en1 := src.GetAsyncEnumerator(); "
         "      if await en1.MoveNextAsync() then a := en1.Current; end; "
         "      try "
@@ -408,7 +426,9 @@ BEZEL_TEST(async_get_async_enumerator_owned_param_alias_2356,
         "    yield return 42; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
-        "    var src := C.Gen(); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): the minted frame is owned
+        // at the call site — `using var` discharges it at this scope's end.
+        "    using var src := C.Gen(); "
         "    await using var en := src.GetAsyncEnumerator(); "
         "    var m1 := await en.MoveNextAsync(); "
         "    if not m1 then return 1; end; "

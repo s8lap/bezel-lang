@@ -6581,6 +6581,110 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                     if (declRet->kind == sema::TypeRef::Kind::Named &&
                         common::isTaskFamilyHead(declRet->headName()))
                         return OwnershipState::Owned;
+            // fix #7762 (§28.3 / §28.3.6 *Calls mint for the mint-announcing
+            // families*, §28.3.5 *The announcement table* row 2, v0.355): the
+            // ITERABLE half of the mint-announcing families — the row SB01-A
+            // above implements for the `Task` family alone.
+            //
+            // THE DEFECT. The calls-mint set named only the `Task` family. The
+            // spec names TWO families: §28.3.6 clause 2 — "The mint-announcing
+            // types are the **`Task` family** (`Task`, `Task<T>`, `OwningTask<T>`)
+            // and the **iterable family** — the §29.3/§30.7 iterable and
+            // enumerator interfaces (`IEnumerable<T>`, `IEnumerator<T>`,
+            // `IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `IOwningEnumerable<T>`,
+            // `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`,
+            // `IOwningAsyncEnumerator<T>`) together with the lazy query" — and
+            // §28.3.6 clause 1 — "A call whose declared return type — read from
+            // the signature *before* generic substitution, with nullability
+            // stripped (`Task?`, `IEnumerable<T>?` qualify) — is a
+            // mint-announcing type produces an owned frame at the call site, at
+            // every callee kind — the announcement table's rows 2–3, all four
+            // columns". §28.6 bullet 2's own parenthetical names the two
+            // families verbatim: "the mint-announcing families — `Task` and
+            // iterable".
+            //
+            // MEASURED (issue #7762, on the base a30bb11d): `public method
+            // MkU(): IEnumerable<int>?` — the UNMARKED spelling of a mint that
+            // returns a FRESH frame — was classified BORROW at the call site
+            // (its declared head `IEnumerable` matched no calls-mint row), so
+            // `var e := h.MkU(); s.Take(move e);` was refused with §28.8's "a
+            // borrow cannot be passed where an `owned` value is required". The
+            // MARKED spelling (`owned IEnumerable<int>?`) compiled — but §28.1
+            // says the marker on a mint-announcing return type "announces
+            // nothing the declared type has not already announced: **either
+            // spelling matches, in either direction**" (the announcement table's
+            // rows 2 and 3 are identical on both sides). The two spellings of
+            // one mint-announcing return type must classify IDENTICALLY.
+            //
+            // WHY THE OWNING HEADS ALREADY WORKED. The four OWNING iterable
+            // heads (`IOwningEnumerable` …) were already classified Owned, but
+            // by a DIFFERENT and weaker arm — the `isOwningTypeHead` fallback
+            // further down, which keys on the RESOLVED RESULT type (post-
+            // substitution) and so also admits a bare-type-parameter return
+            // (`First<T>(): T` at `T = IOwningEnumerable<X>`) the announcement
+            // table's Keying rule excludes. The four NON-OWNING heads
+            // (`IEnumerable`, `IEnumerator`, `IAsyncEnumerable`,
+            // `IAsyncEnumerator`) matched no arm at all — that is the measured
+            // hole. This hunk keys on the DECLARED, pre-substitution return,
+            // exactly as SB01-A does for the `Task` family, so the
+            // announcement table's Keying rule ("read from the callee's
+            // declared return type, before generic substitution, with
+            // nullability stripped") holds here too, and the generic guard
+            // (`callDeclaredReturnIsBareTypeParam`) keeps a bare-type-
+            // parameter return on *Bare-type-parameter returns*' ground at
+            // every instantiation.
+            //
+            // THE SET IS FIXED AND HEAD-KEYED (no widening). The predicate is
+            // `common::isIterableInterfaceHead` — the compiler's own spelling
+            // of the eight §29.3/§30.7 heads (`BuiltinRegistry.cpp`'s
+            // `kIterableInterfaceHeads`), the same registry set the §28.6
+            // stored-view exclusion and the §28.14 deferred-activation checks
+            // consult. A USER-DEFINED interface that merely looks iterable
+            // (`ISequence`) is NOT in the set and keeps the borrow
+            // classification; so does every non-iterable, non-`Task` reference
+            // type. `isOwningTypeHead` is DELIBERATELY NOT consulted (it is a
+            // superset carrying the six concrete owning COLLECTIONS, which
+            // §28.6 bullet 2's own worked example rejects as a mint-announcing
+            // return). The lazy query is already covered by the §29.11
+            // deferred-activation arm below.
+            //
+            // SOUNDNESS OF THE WIDENING. The definition side already rejects
+            // the borrow returns that would launder a second owner: §28.6's
+            // stored-view exclusion (a receiver-owned-field bare read returned
+            // through an unmarked mint-announcing return) fires for the four
+            // NON-OWNING heads, and the owning-wrapper branch rejects the
+            // borrow return through the four OWNING heads. The heads this hunk
+            // newly admits are the four NON-OWNING ones, whose frame teardown
+            // is IDEMPOTENT (stdlib §4.13: only the owning heads extend
+            // `IDisposable`; a non-owning frame's generator `finally` runs at
+            // most once) — MEASURED: a frame returned through an unmarked
+            // mint-announcing return and bound to two owners disposes its
+            // teardown exactly once (the `fins` counter reaches 1, not 2).
+            //
+            // RESIDUAL (not this fix's to close, reported separately): §28.3.6
+            // clause 6 — "Borrow returns rejected. Returning a **borrow** — a
+            // bare field or property read, a plain parameter, a captured
+            // binding — is a compile error" — is enforced by the compiler's
+            // definition-side check only for the four OWNING heads and for the
+            // §28.6 stored-view case; a PLAIN-PARAMETER passthrough through
+            // an unmarked non-owning iterable return
+            // (`method Wrap(src: IEnumerable<int>): IEnumerable<int> => src;`)
+            // is still ADMITTED at the definition site. With this hunk the
+            // CALLER of such a method now classifies the result as an owned
+            // frame, so that caller carries a disposal obligation for a frame
+            // it does not own. MEASURED: no double-free (the teardown is
+            // idempotent), but a spurious §28.3 auto-drop warning. The
+            // definition-side gap is a SEPARATE defect (a missing §28.3.6
+            // clause-6 check) and is deliberately NOT closed here — closing it
+            // would delete admissions, the one direction this fix may not
+            // travel. // per §28.3 (v0.355), §28.3.5, §28.3.6, §28.1, §29.3,
+            //            §30.7, §28.6, §28.8, K6.2, #7762
+            if (md->returnType && !callDeclaredReturnIsBareTypeParam(*ce, *md))
+                if (const sema::TypeRef* declRet =
+                        ctx_.resolvedType(*md->returnType))
+                    if (declRet->kind == sema::TypeRef::Kind::Named &&
+                        common::isIterableInterfaceHead(declRet->headName()))
+                        return OwnershipState::Owned;
             // §28.3 "Factory methods and sourceless returns" / Appendix C.3
             // (fix #1499): an unannotated STATIC method whose EVERY return is a
             // fresh owned producer (`new T(...)` / an `owned`-returning call)
@@ -6830,6 +6934,33 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                         calleeTy->funcReturn->kind ==
                             sema::TypeRef::Kind::Named &&
                         common::isTaskFamilyHead(
+                            calleeTy->funcReturn->headName()))
+                        return OwnershipState::Owned;
+                    // fix #7762 (§28.3 / §28.3.6 *Calls mint for the
+                    // mint-announcing families*, §28.3.5 *The announcement
+                    // table* row 2, v0.355): the ITERABLE half of the
+                    // function-value column — the announcement table's FOURTH
+                    // column, which §28.3.6 clause 1 puts on the same footing
+                    // as the instance / static / interface calls
+                    // ("at every callee kind — the announcement table's rows
+                    // 2–3, all four columns"). A call through a function value
+                    // whose DECLARED return slot is one of the eight §29.3 /
+                    // §30.7 iterable/enumerator heads mints an OWNED frame at
+                    // the call site, exactly as the `Task`-family slot above
+                    // does. Keyed PRE-SUBSTITUTION off the callee's declared
+                    // function-type return slot (`funcReturn`), NEVER the
+                    // resolved result type, so the recorded v0.194 decline
+                    // holds — a function value invoked through a BARE-TYPE-
+                    // PARAMETER slot (`Wrap<T>(f: () -> T): T` at `T =
+                    // IEnumerable<int>`) has declared slot head `T`, not
+                    // `IEnumerable`, and is NOT minted here. The set is the
+                    // compiler's own `isIterableInterfaceHead` — the same eight
+                    // heads, the same fixed head list. // per §28.3 (v0.355),
+                    //            §28.3.5, §28.3.6, §29.3, §30.7, #7762
+                    if (calleeTy->funcReturn &&
+                        calleeTy->funcReturn->kind ==
+                            sema::TypeRef::Kind::Named &&
+                        common::isIterableInterfaceHead(
                             calleeTy->funcReturn->headName()))
                         return OwnershipState::Owned;
                 }

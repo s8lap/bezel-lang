@@ -127,7 +127,16 @@ BEZEL_TEST(vacuous_using_var_iterator_2357,
 // ITERATION-PROTOCOL ALLOWLIST ARM (mechanically confirmed: temporarily
 // commenting lines 4753-4757 of `src/ownership/Ownership.cpp` reproduces
 // the inert-RHS warning message verbatim).
-// // per §28.10, §29.1, §30.7, #2385, #2451, #2357
+// fix #7762 (§28.3 / §28.3.6, v0.355): `C.Gen()`'s declared return type is
+// `IAsyncEnumerable<int>` — a MINT-ANNOUNCING head (§28.3.6 clause 2) — so
+// the call now MINTS AN OWNED FRAME (the announcement table's row 2) and the
+// caller holds the container obligation (§28.3.6 clause 4). The `src` binding
+// is therefore discharged with `await using var` (the scope-bound disposal),
+// not left as an undischarged plain `var` — which would draw §28.3's
+// "owned value in `src` would be dropped here without disposal" ERROR in an
+// `async` body (the auto-drop arm is skipped there). The row's SUBJECT — the
+// `en` binding over the async enumerator — is unchanged.
+// // per §28.10, §29.1, §30.7, #2385, #2451, #2357, #7762
 BEZEL_TEST(vacuous_using_var_iterator_2357,
            await_using_var_getasyncenumerator_no_warn_spec_29_1_30_7) {
     auto r = parseAndCheckOwnership(
@@ -137,7 +146,7 @@ BEZEL_TEST(vacuous_using_var_iterator_2357,
         "    yield return 1; yield return 2; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
-        "    var src := C.Gen(); "
+        "    await using var src := C.Gen(); "
         "    await using var en := src.GetAsyncEnumerator(); "
         "    return 0; "
         "  end Main; "
@@ -179,7 +188,13 @@ BEZEL_TEST(vacuous_using_var_iterator_2357,
 
 // #2357 async twin with explicit declared-type path. Same
 // precedence-proof rationale as the sync version above.
-// // per §28.10, §29.1, §30.7, #2451 (rework 4), #2357
+//
+// fix #7762 (§28.3 / §28.3.6, v0.355): the `src` binding is now an OWNED
+// frame (the mint-announcing `IAsyncEnumerable<int>` return mints at the call
+// site), so it is discharged with `await using var` — the same repair as the
+// row above. The row's SUBJECT — the `en` binding, at the EXPLICIT declared
+// type — is unchanged.
+// // per §28.10, §29.1, §30.7, #2451 (rework 4), #2357, #7762
 BEZEL_TEST(vacuous_using_var_iterator_2357,
            await_using_var_getasyncenumerator_declared_type_no_warn_spec_29_1_30_7_2451) {
     auto r = parseAndCheckOwnership(
@@ -189,7 +204,7 @@ BEZEL_TEST(vacuous_using_var_iterator_2357,
         "    yield return 1; yield return 2; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
-        "    var src := C.Gen(); "
+        "    await using var src := C.Gen(); "
         "    await using var en: IAsyncEnumerator<int> := src.GetAsyncEnumerator(); "
         "    return 0; "
         "  end Main; "

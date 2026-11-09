@@ -202,13 +202,41 @@ int compileRunAsan2485Local(const std::string& src) {
     return WEXITSTATUS(status);
 }
 
+// fix #7762 (§28.3.6 clause 1 / §28.5 / §28.6, v0.355): the holder's source
+// now lives in an explicit `owned` FIELD and the property re-exposes it —
+// §28.6's own named remedy ("a stored frame is re-exposed through a
+// property, field, or collection slot, whose reads are borrows of their
+// storage") and §28.3.6's own worked example (`private owned _lines: …;
+// public property Lines: IEnumerable<string> => _lines;`).
+//
+// The AUTO-property spelling (`public property Items: IEnumerable<int> :=
+// Gen2485.Seq();`) is no longer ADMISSIBLE: with the calls-mint classification
+// covering the ITERABLE half of the mint-announcing families, `Gen2485.Seq()`
+// produces an OWNED FRAME at the call site (§28.3.6 clause 1), and a
+// freshly-produced owned value cannot initialize an auto-property (its
+// generated backing field is non-`owned`, so the value would leak — §28.5).
+// The auto-property spelling's new verdict is pinned by its own row below.
+//
+// The re-exposed storage is a CONCRETE collection (`Array<int>`), not a
+// generator frame: a frame's frame teardown is the #2485 hazard's payload
+// (the erroneous disposal frees the iterator block the second loop re-reads),
+// and an imported property over an owned FRAME is a separate, pre-existing
+// defect (MEASURED on the base a30bb11d: the same shape SEGVFAULTS there —
+// the double enumeration of an imported frame-backed property reads a
+// disposed frame; unchanged by this fix). The concrete collection keeps the
+// row's SUBJECT — a NAMED source is BORROWED by the for-in and never disposed
+// by it (60+60 = 120, ASan-clean).
 const char* kLib2485 =
     "module Lib2485; "
     "public class Gen2485 public static method Seq(): IEnumerable<int> "
     "  yield return 10; yield return 20; yield return 30; "
     "end Seq; end Gen2485; "
     "public class Holder2485 "
-    "  public property Items: IEnumerable<int> := Gen2485.Seq(); "
+    "  private owned _items: Array<int> := new Array<int>(); "
+    "  public constructor() "
+    "    _items.Add(10); _items.Add(20); _items.Add(30); "
+    "  end constructor; "
+    "  public property Items: Array<int> => _items; "
     "end Holder2485;";
 
 }  // namespace
@@ -247,16 +275,24 @@ BEZEL_TEST(xmod_auto_property_forin_disposal_2485,
 // for every symbol, so `isAutoPropertyStorage` takes its first (unchanged,
 // pre-existing `isAutoProperty`) branch exactly as before this fix. Guards
 // against a regression in the already-correct local classification.
+//
+// fix #7762 (§28.3.6 clause 1 / §28.5 / §28.6, v0.355): the holder's source
+// lives in an explicit `owned` FIELD and the property re-exposes it — §28.6's
+// named remedy and §28.3.6's own worked example. The AUTO-property spelling
+// of the same frame is now a COMPILE error (its backing field is non-`owned`,
+// so a freshly-produced owned value could not be stored there); that verdict
+// is pinned by its own row below.
 // ===========================================================================
 BEZEL_TEST(xmod_auto_property_forin_disposal_2485,
            double_forin_over_local_auto_property_source_control_29_2) {
     const std::string src =
         "module LocalCtl2485T2; "
-        "public class Gen2485T2 public static method Seq(): IEnumerable<int> "
-        "  yield return 10; yield return 20; yield return 30; "
-        "end Seq; end Gen2485T2; "
         "public class Holder2485T2 "
-        "  public property Items: IEnumerable<int> := Gen2485T2.Seq(); "
+        "  private owned _items: Array<int> := new Array<int>(); "
+        "  public constructor() "
+        "    _items.Add(10); _items.Add(20); _items.Add(30); "
+        "  end constructor; "
+        "  public property Items: Array<int> => _items; "
         "end Holder2485T2; "
         "public class Program2485T2 "
         "  public static method Main(): int "
@@ -270,6 +306,48 @@ BEZEL_TEST(xmod_auto_property_forin_disposal_2485,
     int r = compileRunAsan2485Local(src);
     if (r == -2) return;
     BEZEL_EXPECT_EQ(r, 120);
+}
+
+// ===========================================================================
+// T4 — the AUTO-PROPERTY spelling of the same frame is now a COMPILE error.
+//
+// fix #7762 (§28.3.6 clause 1 / §28.5, v0.355): the calls-mint
+// classification covers the ITERABLE half of the mint-announcing families, so
+// `Gen2485.Seq()` — an UNMARKED `IEnumerable<int>` return — produces an OWNED
+// FRAME at the call site; an auto-property's generated backing field is
+// non-`owned` (§28.5), so a freshly-produced owned value cannot be stored
+// there ("a freshly-produced owned value cannot initialize auto-property
+// `Items` — its generated backing field is non-`owned`, so the value would
+// leak; store the value in an explicit `owned` field whose containing class
+// disposes it"). The `Task`-family twin of this shape has been rejected by
+// the same rule since the Task row of the calls-mint set landed.
+//
+// ⇒ The auto-property AS A FRAME SOURCE is unreachable through this spelling;
+// the runtime coverage above moved to §28.6's own remedy (an `owned` field and
+// a property re-exposing it).
+// ===========================================================================
+BEZEL_TEST(xmod_auto_property_forin_disposal_2485,
+           auto_property_initializer_of_a_mint_frame_rejected_spec_28_5) {
+    const std::string src =
+        "module AutoProp2485T4; "
+        "public class Gen2485T4 public static method Seq(): IEnumerable<int> "
+        "  yield return 10; yield return 20; yield return 30; "
+        "end Seq; end Gen2485T4; "
+        "public class Holder2485T4 "
+        "  public property Items: IEnumerable<int> := Gen2485T4.Seq(); "
+        "end Holder2485T4; "
+        "public class Program2485T4 "
+        "  public static method Main(): int "
+        "    using var h := new Holder2485T4(); "
+        "    var total: int := 0; "
+        "    for var x in h.Items do total := total + x; end for; "
+        "    return total; "
+        "  end Main; "
+        "end Program2485T4;";
+    int r = compileRunAsan2485Local(src);
+    // A compile rejection is NOT a program exit code: the compile helper
+    // returns -1 when the compile fails.
+    BEZEL_EXPECT_EQ(r, -1);
 }
 
 // ===========================================================================

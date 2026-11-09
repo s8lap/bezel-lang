@@ -40,10 +40,20 @@ namespace {
 //  - Peek(r): int — an ORDINARY (non-deferred-activation) borrowing call,
 //    a regression guard that this rule does not over-fire on every unbound
 //    temp argument, only deferred-activation callees.
-//  - Holder.Items(): IEnumerable<int> — an INSTANCE method (receiver-
-//    sourced borrow, not a sourceless static factory), a regression guard
-//    that the rule does not flag a receiver-borrowed iterable as an
-//    "unbound owned temporary" argument.
+//  - Holder.Items(): Array<int> — an INSTANCE method whose return is a
+//    RECEIVER-SOURCED BORROW (the announcement table's row 4: "a plain
+//    concrete class or interface type -> Borrow, source: the receiver"), a
+//    regression guard that the rule does not flag a receiver-borrowed
+//    collection as an "unbound owned temporary" argument.
+//    fix #7762 (§28.3 / §28.3.6, v0.355): this helper's return type WAS
+//    `IEnumerable<int>` — a MINT-ANNOUNCING head (§28.3.6 clause 2), so the
+//    call `h.Items()` is an OWNED FRAME (the announcement table's row 2), not
+//    a receiver-sourced borrow, and §28.3's unbound-owned-temporary rule
+//    correctly fires on it. The row's INTENT — "an instance method's plain
+//    return is a receiver-sourced borrow, not a sourceless static factory" —
+//    is the row-4 shape, so the helper now declares the CONCRETE collection
+//    type. The mint-announcing sibling shape is pinned by
+//    `unmarked_iterable_mint_move_7762_test.cpp`.
 std::string wrap(const std::string& body, const std::string& sig) {
     return std::string("module M; "
         "class Res "
@@ -53,9 +63,8 @@ std::string wrap(const std::string& body, const std::string& sig) {
         "  end; "
         "end Res; "
         "class Holder "
-        "  public method Items(): IEnumerable<int> "
-        "    yield return 7; "
-        "  end Items; "
+        "  private owned _items: Array<int> := new Array<int>(); "
+        "  public method Items(): Array<int> => _items; "
         "end Holder; "
         "class Program "
         "  public static method MakeRes(v: int): owned Res "
@@ -289,11 +298,21 @@ BEZEL_TEST(deferred_activation_temp, ordinary_non_deferred_callee_not_flagged) {
 
 // `Holder.Items()` is an INSTANCE method — its return is a borrow sourced
 // from the receiver `h` (§28.3 Producers: "Method call returning `T` (no
-// `owned`) ... instance method: source is the receiver"), not a sourceless
+// `owned`) ... instance method: source is the receiver"; the announcement
+// table's ROW 4 — a plain concrete class or interface type), not a sourceless
 // static factory return, so it is not an "unbound owned temporary" at all
 // under this rule even though it is a bare, unnamed call syntactically.
 // `h` outlives the `for` loop (it is `using var`-bound in the enclosing
 // scope), so `Doubled(h.Items())` used directly as a `for` source is clean.
+//
+// fix #7762 (§28.3 / §28.3.6, v0.355): `Holder.Items()`'s return type was
+// `IEnumerable<int>` — a MINT-ANNOUNCING head (§28.3.6 clause 2) — so the
+// call minted an OWNED FRAME (the announcement table's row 2) rather than
+// borrowing the receiver, and §28.3's unbound-owned-temporary rule then
+// fired on it. The helper now declares the CONCRETE collection type
+// `Array<int>`, which IS the row-4 receiver-sourced borrow this row names;
+// the mint-announcing sibling shape is pinned by
+// `unmarked_iterable_mint_move_7762_test.cpp`.
 BEZEL_TEST(deferred_activation_temp, instance_method_receiver_borrow_not_flagged) {
     auto r = parseAndCheckOwnership(wrap(
         "using var h := new Holder(); "

@@ -271,9 +271,15 @@ BEZEL_TEST(iterator_frame_string_retain, controls_release_once_spec_29_4_7798) {
 // §29.13 / §30.7: the async iterator, bound then `await for`, enumerated
 // twice (each GetAsyncEnumerator clone takes its own reference), and inline.
 BEZEL_TEST(iterator_frame_string_retain, async_iterator_string_param_spec_30_7_7798) {
-    expectRun(asyncProgram(withConcat("var it := AIt(", "); await for var x in it do t := t + x; end;")),
+    // fix #7762 (§28.3.6 clause 1/4, v0.355): `AIt`'s declared return type is
+    // a mint-announcing head, so the call MINTS an owned frame at the call
+    // site and the caller holds the container obligation — the plain `var`
+    // spelling left it undischarged in an async body, so it is now
+    // `using var` (discharged at this scope's end, as the old borrow-shaped
+    // local's own scope-end disposal was).
+    expectRun(asyncProgram(withConcat("using var it := AIt(", "); await for var x in it do t := t + x; end;")),
               "10770 0\n");
-    expectRun(asyncProgram(withConcat("var it := AIt(", "); await for var x in it do t := t + x; end; "
+    expectRun(asyncProgram(withConcat("using var it := AIt(", "); await for var x in it do t := t + x; end; "
                                       "await for var y in it do t := t + y; end;")),
               "21540 0\n");
     expectRun(asyncProgram(withConcat("await for var x in AIt(", ") do t := t + x; end;")),
@@ -283,10 +289,12 @@ BEZEL_TEST(iterator_frame_string_retain, async_iterator_string_param_spec_30_7_7
 // The async iterator frame returned past the local's scope, as a parameter
 // (enumerated twice) and as an `extension string` receiver.
 BEZEL_TEST(iterator_frame_string_retain, async_frame_returned_past_local_scope_spec_30_7_7798) {
-    expectRun(asyncProgram("var it := MkAIt(i); await for var x in it do t := t + x; end; "
+    // fix #7762 (§28.3.6 clause 1/4, v0.355): the minted frame is owned at
+    // the call site — `using var` discharges it at this scope's end.
+    expectRun(asyncProgram("using var it := MkAIt(i); await for var x in it do t := t + x; end; "
                            "await for var y in it do t := t + y; end;"),
               "28740 0\n");
-    expectRun(asyncProgram("var it := MkAEach(i); await for var x in it do t := t + x; end;"),
+    expectRun(asyncProgram("using var it := MkAEach(i); await for var x in it do t := t + x; end;"),
               "14370 0\n");
 }
 

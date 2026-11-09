@@ -30,7 +30,13 @@ BEZEL_TEST(async_get_async_enumerator_757, repro_no_crash) {
         "    yield return 1; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
-        "    var source := Gen(); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): `Gen()`'s declared return
+        // type is a mint-announcing head, so the call MINTS an owned frame at
+        // the call site — the caller holds the container obligation and must
+        // discharge it (§28.3.6 clause 4). The plain `var source := Gen();`
+        // spelling left that frame undischarged in an async body (no
+        // scope-end auto-drop there), so it is now `using var`.
+        "    using var source := Gen(); "
         "    await using var en := source.GetAsyncEnumerator(CancellationToken.None); "
         "    return 5; "
         "  end Main; "
@@ -49,7 +55,11 @@ BEZEL_TEST(async_get_async_enumerator_757, drives_iteration) {
         "    yield return 99; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
-        "    var source := Gen(); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): the minted frame is an
+        // owned value at the call site — `using var` discharges it at this
+        // scope's end (the `en` below is an INDEPENDENT clone, so the two
+        // disposals are of two distinct objects).
+        "    using var source := Gen(); "
         "    await using var en := source.GetAsyncEnumerator(CancellationToken.None); "
         "    var m1 := await en.MoveNextAsync(); "
         "    if not m1 then return 1; end; "

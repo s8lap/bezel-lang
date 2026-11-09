@@ -47,7 +47,11 @@ BEZEL_TEST(async_iter_reiterate_bound_source_1268, repro_two_await_for_one_local
         "    yield return 7; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
-        "    var src := Gen(); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): `Gen()`'s declared return
+        // type is a mint-announcing head, so the call MINTS an owned frame at
+        // the call site and the caller holds the container obligation — the
+        // plain `var` spelling left it undischarged in an async body.
+        "    using var src := Gen(); "
         "    var s1: int := 0; "
         "    await for var x in src do s1 := x; end; "
         "    var s2: int := 0; "
@@ -73,7 +77,9 @@ BEZEL_TEST(async_iter_reiterate_bound_source_1268, replays_full_sequence) {
         "    yield return 3; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
-        "    var src := Gen(); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): the minted frame is owned
+        // at the call site — `using var` discharges it at this scope's end.
+        "    using var src := Gen(); "
         "    var a: int := 0; "
         "    await for var x in src do a := a + x; end; "
         "    var b: int := 0; "
@@ -100,7 +106,9 @@ BEZEL_TEST(async_iter_reiterate_bound_source_1268, three_loops_with_await_in_bod
         "    yield return 5; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
-        "    var src := Gen(); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): the minted frame is owned
+        // at the call site — `using var` discharges it at this scope's end.
+        "    using var src := Gen(); "
         "    var total: int := 0; "
         "    await for var x in src do total := total + x; end; "
         "    await for var x in src do total := total + x; end; "
@@ -129,7 +137,9 @@ BEZEL_TEST(async_iter_reiterate_bound_source_1268, break_then_reiterate) {
         "    end; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
-        "    var src := Gen(); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): the minted frame is owned
+        // at the call site — `using var` discharges it at this scope's end.
+        "    using var src := Gen(); "
         "    var first: int := 0; "
         "    await for var x in src do first := x; break; end; "
         "    var full: int := 0; "
@@ -196,7 +206,11 @@ BEZEL_TEST(async_iter_reiterate_bound_source_1268, owned_param_iterator_self_enu
         "  public static async method Main(): Task<int> "
         "    var got: int := 0; "
         "    do "
-        "      var src := UseCell(new Cell()); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): the minted frame is owned
+        // at the call site — `using var` discharges it at this scope's end
+        // (the same point the old borrow-shaped local's own scope-end
+        // disposal fired, so the exactly-once counter is unchanged).
+        "      using var src := UseCell(new Cell()); "
         "      await for var x in src do got := x; end; "
         "    end; "
         "    return got * 10 + Cell.n; "  // 70: yielded 7, Cell disposed once
@@ -216,7 +230,9 @@ BEZEL_TEST(async_iter_reiterate_bound_source_1268, two_get_async_enumerators) {
         "    yield return 6; "
         "  end Gen; "
         "  public static async method Main(): Task<int> "
-        "    var src := Gen(); "
+        // fix #7762 (§28.3.6 clause 1/4, v0.355): the minted frame is owned
+        // at the call site — `using var` discharges it at this scope's end.
+        "    using var src := Gen(); "
         "    var a: int := 0; "
         "    do "
         "      await using var e1 := src.GetAsyncEnumerator(CancellationToken.None); "
