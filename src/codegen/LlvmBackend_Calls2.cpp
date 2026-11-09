@@ -20167,8 +20167,41 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
         return t && t->kind == sema::TypeRef::Kind::Primitive &&
                t->primitive == sema::PrimitiveType::Int && !t->nullable;
     };
-    auto isOpenTypeParam = [](const sema::TypeRef* t) {
+    // A Named ref with NO declaration is the shape of a TYPE-PARAMETER
+    // reference — and ALSO the shape a BUILT-IN reaches TypeResolution in:
+    // the value builtins (DateTime, TimeSpan, Guid, …) keep `declaration =
+    // null` ON PURPOSE (#1463 / §4.2 — `new T(...)` lowering keys off its
+    // absence). fix #7876 (§14.1 / §2.8.2 / §2.8.3 rule 4, v0.355): reading
+    // the built-in as an open type parameter made this gate SKIP it, so an
+    // imported generic was instantiated at T=DateTime against the `int` (i32)
+    // placeholder and silently MISCOUNTED — the #1943/#428 family.
+    // MEASURED on a30bb11d (base): `L.Uniq(xs)` over `Array<DateTime>`
+    // compiled and ran, printing 2 where the same-module twin printed 1;
+    // `L.Uniq<DateTime>(xs)` printed 2 as well. `L.Idx` / `L.Same` (a bare-`T`
+    // formal) were already rejected, by the #1943 width gate, and so were
+    // `Array<string>`, `Array<Pt>` and `Array<Range<int>>` (this gate).
+    //
+    // The DISCRIMINATOR is the codebase's own (§14.1; #8174 / #6530 / #8213):
+    // a type parameter is a BARE single-part spelling that is not a reserved
+    // built-in name (`isBareTypeParamRef`), and a spelling that DOES name a
+    // built-in (`class Box<Guid>`) is a type parameter only when the resolver
+    // bound THIS spelling to one in THIS scope
+    // (`TypeRef::isResolvedTypeParam`); the resolver's negative record
+    // (`isResolvedNonTypeParam`) says it did not. `isBareTypeParamRef`
+    // consults the ONE reserved-name set (`common::isReservedBuiltinTypeName`
+    // through `isBuiltinTypeRefName`), so no name list is duplicated here.
+    auto isTypeParamRef = [](const sema::TypeRef* t) {
         return t && t->kind == sema::TypeRef::Kind::Named && !t->declaration;
+    };
+    // The CALLER's side: an OPEN type parameter (the caller's own unbound
+    // parameter) is not a concrete binding, so this gate stands down for it;
+    // a built-in IS a concrete type and is reported like any other non-`int`
+    // binding.
+    auto isOpenTypeParam = [&](const sema::TypeRef* t) {
+        if (!isTypeParamRef(t)) return false;
+        if (t->isResolvedTypeParam()) return true;
+        if (t->isResolvedNonTypeParam()) return false;
+        return isBareTypeParamRef(t);
     };
     auto report = [&](SourceLocation loc, const sema::TypeRef* t) {
         // fix #6818: the qualified name of a nullable enum drops its `?`
@@ -20244,7 +20277,12 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
     const std::size_t off =
         isStaticMethod(const_cast<sema::MethodSymbol*>(ms)) ? 0u : 1u;
     auto ownParamIndex = [&](const sema::TypeRef* f) -> std::size_t {
-        if (!isOpenTypeParam(f)) return ms->genericParams.size();
+        // The CALLEE's own formal: a type-parameter reference, matched by
+        // NAME against the callee's parameter list. The raw shape test
+        // (`isTypeParamRef`) is the one here, not the caller's-side
+        // `isOpenTypeParam`: a callee is free to spell a parameter
+        // `DateTime`, and that is still its own parameter.
+        if (!isTypeParamRef(f)) return ms->genericParams.size();
         for (std::size_t k = 0; k < ms->genericParams.size(); ++k)
             if (ms->genericParams[k] &&
                 ms->genericParams[k]->name == f->headName())
