@@ -7022,21 +7022,86 @@ void ExprTC::checkBorrowErasingPosition(TypeRef* from, TypeRef* to,
     const bool sourceIsBorrowBearing =
         sourceIsIReadOnlySpan ||
         common::isBorrowBearingRecordOrSpan(from, ctx_);
-    // fix #5659 (v0.315): §8.6 says non-owning inline arrays (`[N]T` and
-    // `[N]T?`) are ordinary value types and box per the general rule. They
-    // are not rejected at the boxing site, even when their element type is
-    // a reference type. (The elements' borrows, if any, are subject to
-    // lifetime constraints after boxing; the box itself is allowed.)
-    const bool sourceIsNonOwningInlineArray =
-        from->kind == TypeRef::Kind::InlineArray && !from->arrayOwned;
+    // fix #7852 (§8.6 / §15.1.2 / §9.7, v0.355): the v0.315 escape for
+    // NON-OWNING INLINE ARRAYS is GONE. It used to read:
+    //
+    //   "fix #5659 (v0.315): §8.6 says non-owning inline arrays (`[N]T` and
+    //    `[N]T?`) are ordinary value types and box per the general rule.
+    //    They are not rejected at the boxing site, even when their element
+    //    type is a reference type."
+    //
+    // That reading is STALE: the v0.315 §8.6 it cites has been superseded by
+    // the CURRENT §8.6 (spec line 1256, *Boxing of inline arrays*), which now
+    // reads, verbatim:
+    //
+    //   "Non-owning inline arrays (`[N]T` and `[N]T?`) are ordinary value
+    //    types and box per the general rule. When the array is borrow-bearing
+    //    (§15.1.2), the boxed array carries borrows; the same borrow-lifetime
+    //    constraints apply as for boxed borrow-bearing records (above)."
+    //
+    // and §15.1.2 (spec line 3004, *Lifetime of inline arrays carrying
+    // borrows*) makes the array borrow-bearing in exactly the case that
+    // escaped:
+    //
+    //   "An inline array without the `owned` marker is borrow-bearing exactly
+    //    when its element type, nullability stripped, is a class or interface
+    //    type that is not runtime-managed, a borrow-bearing record, or a
+    //    choice that holds borrows."
+    //
+    // §8.6's *Boxing of borrow-bearing records* (spec line 1251) is the rule
+    // the escaped array now falls under: "a value that holds borrows is
+    // converted to `Object` or to an interface type at exactly **one
+    // position**: as the **receiver** of a member call … Every other
+    // conversion — at a parameter … at a local, a field, a collection slot …
+    // — is a **compile error at the conversion**." §9.7 (spec line 1558) is
+    // the same bullet in its own words, and it names the positions:
+    //
+    //   "A value that holds borrows may not reach a **borrow-erasing
+    //    position**: a position declared `Object` or an interface type — a
+    //    parameter, plain or `scoped`, a local, a field, a record component, a
+    //    choice payload, an inline-array slot, a collection slot or
+    //    collection-literal element, a `ref` or `out` location, a return
+    //    slot — … The conversion … is a compile error at the conversion site."
+    //
+    // So a BORROW-BEARING inline array now reaches the same verdict as its
+    // RECORD TWIN (`record Pair(A: Cls, B: Cls)`, identical borrows) at every
+    // one of those positions, and the escape is not needed for the arrays that
+    // do NOT hold borrows: `sourceIsBorrowBearing` is false for them, so they
+    // are admitted by the general rule (§8.6) — `[2]int`, `[2]string`, and an
+    // array of a record that is not borrow-bearing all still box.
+    //
+    // The escape was the ONLY thing that made the inline array the one value
+    // kind that could be simultaneously "borrow-bearing" and "not rejected".
+    // MEASURED on a30bb11d (the escape): `Console.WriteLine(m)` and
+    // `w.WriteLine(m)` over `m: [2]Cls` compiled clean, while the
+    // character-identical `record Pair` argument was rejected — and the same
+    // array was admitted at a LOCAL, a FIELD, a RECORD COMPONENT, a CHOICE
+    // PAYLOAD, a COLLECTION SLOT and a RETURN SLOT, all of which the record
+    // twin was rejected at. At a choice payload the admitted array did not
+    // even survive codegen: it emitted a malformed `insertvalue` and the
+    // backend aborted with "IR verification failed".
+    //
+    // Nothing else is read here: the classification stays §3.6's / §15.1.2's
+    // own (`common::isBorrowBearingRecordOrSpan`, whose `#5627` inline-array
+    // leg already classifies `[N]Cls` and `[N]Pair` as borrow-bearing), and
+    // the ONE admitted position — the receiver of a member call, and an
+    // `IReadOnlySpan<TElement>`-declared position — is untouched.
+    //
+    // ONE CONFORMANCE ROW MOVES, and it moves because it pinned the OLD
+    // reading: `tests/conformance/rules/cases/s8_6_0002.bzl` ("a non-owning
+    // inline array boxes per the general rule") boxes a `[2]Connection` into
+    // an `Object` local and expects ACCEPT — the v0.315 §8.6 first sentence
+    // alone, without §8.6's borrow-bearing sentence or §15.1.2. Under the
+    // current §8.6 / §15.1.2 / §9.7 that program is a compile error, so the
+    // rule-corpus row now DIVERGES from the implementation and its baseline
+    // entry needs re-banking (the corpus baseline is the coordinator's file).
+    //
     // The target guard applies to an IReadOnlySpan source too — an
     // `IReadOnlySpan -> IReadOnlySpan` conversion is legal, and that declared
     // position is one of §9.7's two admitted ones. The source predicate needs
     // no separate IReadOnlySpan disjunct: `sourceIsBorrowBearing` already
     // includes `sourceIsIReadOnlySpan`.
-    if (!sourceIsBorrowBearing || sourceIsNonOwningInlineArray ||
-        common::isIReadOnlySpanType(to))
-        return;
+    if (!sourceIsBorrowBearing || common::isIReadOnlySpanType(to)) return;
     std::string fromName(namedTypeSimpleName(from));
     if (fromName.empty()) fromName = spellMoveOnlySource(from);
     std::string toName =
