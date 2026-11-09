@@ -150,8 +150,10 @@ BEZEL_TEST(ownership_using_var_adopt_named_owned_object_7568,
            spec_28_12_move_adopts_an_owned_object_local_into_await_using_var_and_disposes_once) {
     // The adopt remedy, in the await spelling: `x` takes the obligation and the
     // single DTOR runs when `x`'s scope ends. (The plain-`using var` spelling of
-    // this `move` adoption leaks today: a separate defect reported with this
-    // commit, so it is not pinned as a run here.)
+    // this `move` adoption does NOT leak: MEASURED on the base 74c9d282 under
+    // ASan/LSan it disposes once and reports no leak, so the sync spelling is
+    // pinned as a run below. The sibling leak that DOES still reproduce is the
+    // 24-byte box of `using var x: Object := 7;`, tracked as issue #7916.)
     expectRunOutput(runAotChecked(
         std::string("module M; ") + kRes +
         "public class Program "
@@ -162,6 +164,97 @@ BEZEL_TEST(ownership_using_var_adopt_named_owned_object_7568,
         "  end Main; "
         "end Program;"),
         "END\nDTOR\n");
+}
+
+// --- ACCEPT: the adopt remedy in its SYNC spelling (issue #7915) ------------
+//
+// per §28.10, §28.12 (v0.355): `using var y := move x;` transfers a named
+// owned local into a scope-bound binding — `y` takes over the disposal
+// obligation and `x` is left moved-from — so the adopted object's destructor
+// runs EXACTLY ONCE, at the end of `y`'s scope. §28.12 makes the `await using`
+// spelling the async counterpart of the same rule; the SYNC spelling is the
+// same rule.
+//
+// Issue #7915 reported that the sync spelling of this adoption never ran the
+// destructor (a 16 B leak). MEASURED on the base 74c9d282 (issue #7915 was
+// filed against an older base): every shape below disposes once and reports no
+// leak under ASan/LSan — the defect was already fixed, and these rows PIN it.
+// Each row asserts the EXACT stdout, so a MISSING destructor and a DOUBLED one
+// both fail the row.
+
+BEZEL_TEST(ownership_using_var_adopt_named_owned_object_7568,
+           spec_28_10_move_adopts_an_owned_object_local_into_using_var_and_disposes_once) {
+    // The adopt remedy, in the sync spelling: `x` takes the obligation and the
+    // single DTOR runs when `x`'s scope ends — after `END`.
+    expectRunOutput(runAotChecked(mainProg(
+        "var s: Object := new Res(); using var x: Object := move s; ")),
+        "END\nDTOR\n");
+}
+
+BEZEL_TEST(ownership_using_var_adopt_named_owned_object_7568,
+           spec_28_10_move_adopts_an_owned_object_local_into_an_unannotated_using_var_and_disposes_once) {
+    // The same adoption without the type annotation: the RHS is a marked
+    // transfer, so the binding is owned whatever its spelling (§28.10).
+    expectRunOutput(runAotChecked(mainProg(
+        "var s: Object := new Res(); using var x := move s; ")),
+        "END\nDTOR\n");
+}
+
+BEZEL_TEST(ownership_using_var_adopt_named_owned_object_7568,
+           spec_28_10_move_adoption_through_a_second_object_local_disposes_once) {
+    // The adoption chained through a second `Object`-typed local: `s` moves
+    // into `y`, `y` moves into `x`, and `x`'s scope-end disposal is the only
+    // one — the chain does not dispose at each hop.
+    expectRunOutput(runAotChecked(mainProg(
+        "var s: Object := new Res(); var y: Object := move s; "
+        "using var x: Object := move y; ")),
+        "END\nDTOR\n");
+}
+
+BEZEL_TEST(ownership_using_var_adopt_named_owned_object_7568,
+           spec_28_10_move_adoption_into_using_var_disposes_once_per_iteration) {
+    // The one-shot-disposal guard: each iteration's adopted object is disposed
+    // at the end of THAT iteration's scope, so three iterations print three
+    // DTORs — before `END`, which follows the loop.
+    expectRunOutput(runAotChecked(
+        std::string("module M; ") + kRes +
+        "public class Program "
+        "  public static method Main(): int "
+        "    var i := 0; "
+        "    while i < 3 do "
+        "      var s: Object := new Res(); "
+        "      using var x: Object := move s; "
+        "      i := i + 1; "
+        "    end; "
+        "    Console.WriteLine(\"END\"); return 0; "
+        "  end Main; "
+        "end Program;"),
+        "DTOR\nDTOR\nDTOR\nEND\n");
+}
+
+BEZEL_TEST(ownership_using_var_adopt_named_owned_object_7568,
+           spec_28_10_move_adoption_into_using_var_disposes_each_adopted_object_exactly_once) {
+    // Exactly once per adopted object, at scale: 200 adoptions, 200
+    // destructions. A doubled disposal would print 400; a suppressed one 0.
+    expectRunOutput(runAotChecked(
+        "module M; "
+        "public class Res "
+        "  public static n: int := 0; "
+        "  public constructor() end constructor; "
+        "  destructor Res.n := Res.n + 1; end destructor; "
+        "end Res; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var i := 0; "
+        "    while i < 200 do "
+        "      var s: Object := new Res(); "
+        "      using var x: Object := move s; "
+        "      i := i + 1; "
+        "    end; "
+        "    Console.WriteLine(Res.n); return 0; "
+        "  end Main; "
+        "end Program;"),
+        "200\n");
 }
 
 BEZEL_TEST(ownership_using_var_adopt_named_owned_object_7568,
@@ -221,7 +314,7 @@ BEZEL_TEST(ownership_using_var_adopt_named_owned_object_7568,
     // The owner ruling's carve-out: `var o: Object := 7;` is K1 UNCLASSIFIED
     // (holds only runtime-managed values), not in owned state, so the unmarked
     // form is the borrow-pin and is accepted. `runAot`, not `runAotChecked`:
-    // the box leaks under LSan independent of this rule (a separate defect,
+    // the box leaks under LSan independent of this rule (issue #7916;
     // `using var x: Object := 7;` leaks the same 24 bytes), so this row pins
     // ACCEPTANCE and the printed value only.
     JitResult r = runAot(
