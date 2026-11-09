@@ -5871,9 +5871,95 @@ static std::string spellMoveOnlySource(const TypeRef* t) {
 // diagnostic's gate in primitiveNeverImplicitReason move together, since a
 // mismatched pair would report the wrong §5.1 sub-rule for an out-of-range
 // wide constant.
+// fix #8293 (§22.6 *Method-reference arguments* / §27.6, v0.355): the
+// PER-CANDIDATE formation of a method-reference ARGUMENT.
+//
+//   "A method-reference argument ([§27.6](#sec-method-references)) likewise
+//    has no static type of its own until it is formed against a target; at an
+//    overloaded callee it is formed per candidate against that candidate's
+//    parameter type ... and it ranks as a lambda literal does. ... Where the
+//    referenced name is overloaded, [§27.6](#sec-method-references-to-overloaded-methods)'s
+//    exact-preferred ranking selects the reference's overload against the
+//    candidate's slot first; where that ranking finds no unique winner against
+//    a candidate's slot, **formation fails at that candidate** and the
+//    candidate is inapplicable at the position ... never an error reported at
+//    that candidate; §27.6's ambiguity is reported only where the reference
+//    has a single target."
+//
+// The formation runs HERE — at the §22.6 CANDIDATE RANKING's per-candidate
+// re-type hook. The ranking calls this function once per candidate, with THAT
+// candidate's parameter type, and grades the candidate against the argument's
+// type afterwards; so forming the reference here is what makes the ranking
+// decide the callee candidate by APPLICABILITY (§22.6 stage 3) instead of by
+// declaration order.
+//
+// MEASURED on the issue's repro (a method-reference argument at an overloaded
+// callee whose candidates are `Show(o: Object)` and `Show(f: (int) -> int)`):
+// before, the argument's type was the reference's FIRST-DECLARED overload's
+// type (`() -> int`), which matches NEITHER candidate's parameter type, so
+// §22.6's grid could not grade the argument (a Function-kind type is not
+// judgeable) and the resolution fell back to the first-declared candidate —
+// the callee was chosen by DECLARATION ORDER, and with `Show(o: Object)`
+// declared first the §27.6 no-target rule then reported the reference as
+// ambiguous ("the method reference `Len` is overloaded and has no target type
+// to select by"). With the two declarations swapped the same program
+// compiled and called `Show(f: (int) -> int)` — the issue's own shape.
+//
+// WHY THIS IS NOT THE ORDINARY §5.1 CONVERSION CHECK: `checkAssignable` is a
+// DIFFERENT call site, and the event-handler position there deliberately opts
+// out of target-typed overload selection (#4901/#4968-c06: "an event-handler
+// position considers no overload but the one `h` already names") — a
+// formation there would form the reference at the handler's payload type,
+// exactly what that opt-out forbids. The flag below suppresses the formation
+// at that call site, and only there.
+namespace {
+// fix #8293 (§22.6 *Method-reference arguments*): set while an ordinary §5.1
+// conversion check runs, so the per-candidate formation does NOT run there.
+bool g_methodRefFormationSuppressed = false;
+}  // namespace
+
 TypeRef* ExprTC::narrowIntConstantToTarget(const ast::Expr* fromExpr,
                                            TypeRef* from, TypeRef* to) {
     if (!fromExpr || !from || !to) return from;
+    // fix #8293 (§22.6 *Method-reference arguments* / §27.6, v0.355): the
+    // per-candidate formation of a method-reference ARGUMENT — see the block
+    // comment above. The reference is formed at THIS candidate's parameter
+    // type and re-typed to the type it forms there, so the §22.6 ranking
+    // grades this candidate against the formed type.
+    if (!g_methodRefFormationSuppressed &&
+        from->kind == TypeRef::Kind::Function &&
+        to->kind == TypeRef::Kind::Function) {
+        auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*fromExpr));
+        // An EXTENSION member takes part in §27.6's selection too, but its
+        // block tie is reported by the lookup itself, at the arity the target
+        // selects — a report that must not be made for a candidate the call
+        // may not select. The class-member path is the one formed here.
+        if (ms && ms->parent && ctx_.exprType(*fromExpr) == from) {
+            // The §27.6 selection publishes the overload it chose; the
+            // publication is restored afterwards, because the §5.1 formation
+            // check for the candidate the call actually SELECTS publishes
+            // that one (codegen reads the publication to bind the thunk).
+            MethodSymbol* prevSel = ctx_.methodRefSelectedOverload(*fromExpr);
+            const TypeRef* chosen = nullptr;
+            const MethodRefOverloadResult sel =
+                selectMethodRefOverload(fromExpr, to, chosen);
+            ctx_.setMethodRefSelectedOverload(fromExpr, prevSel ? prevSel : ms);
+            // `SingleOverload` means the group holds one member — the
+            // reference already carries that member's type, and nothing is
+            // formed. `Unique` is the §27.6 exact-preferred winner: the
+            // reference is formed at THIS slot.
+            if (sel == MethodRefOverloadResult::Unique && chosen) {
+                TypeRef* formed = const_cast<TypeRef*>(chosen);
+                ctx_.setExprType(const_cast<ast::Expr*>(fromExpr), formed);
+                return formed;
+            }
+            // `Ambiguous` / `NoFit`: the formation FAILS at this candidate
+            // (§22.6 *Method-reference arguments*: "the candidate is
+            // inapplicable at the position ... never an error reported at that
+            // candidate"), so the argument keeps its own type and the ranking
+            // grades this candidate against that.
+        }
+    }
     // The rule's SOURCE side: "an expression of integer type that is a
     // compile-time constant" — and, per fix #6554 (§5.1, v0.338), VALUE-BASED,
     // not type-based: "the source may be a compile-time constant of ANY
@@ -7732,7 +7818,20 @@ void ExprTC::checkAssignable(
     }
     // §5.1 "Constant narrowing" (#2925): applied HERE, once, for every §5.1
     // conversion site — see narrowIntConstantToTarget above.
-    from = narrowIntConstantToTarget(fromExpr, from, to);
+    //
+    // fix #8293 (§22.6 *Method-reference arguments*): the per-candidate
+    // formation of a method-reference argument belongs to the §22.6
+    // CANDIDATE RANKING's re-type hook, NOT to this §5.1 conversion check:
+    // the event-handler position below deliberately opts out of target-typed
+    // overload selection (#4901/#4968-c06), and a formation here would form
+    // the reference at the handler's payload type — the very thing that
+    // opt-out forbids. The flag suppresses it here, and only here.
+    {
+        const bool savedSuppression = g_methodRefFormationSuppressed;
+        g_methodRefFormationSuppressed = true;
+        from = narrowIntConstantToTarget(fromExpr, from, to);
+        g_methodRefFormationSuppressed = savedSuppression;
+    }
     // narrow #7792 (stdlib §1 *Extensibility*, §7.4, v0.355): a user class
     // derived from the built-in `TextWriter` converted to `TextWriter`. The
     // stdlib opens `TextWriter` to user subclasses, but this compiler
