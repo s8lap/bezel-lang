@@ -13229,6 +13229,13 @@ void ExprTC::collectBuiltinAncestorInstantiationsOf(
 // check may soundly REJECT rather than conservatively accept — e.g. `Stack<Dog>`
 // is not assignable to the unrelated sibling `IList<Dog>`.
 //
+// The predicate's SEMANTIC is "the builtin generics whose COMPLETE
+// generic-interface set is captured by builtinInterfaceAncestors above" (see
+// the #4793 note below on the historical name): a member whose table row is
+// complete may be REJECTed on a not-found candidate. `FrozenArray<T>` joined
+// that set in #8258 — stdlib §4.19 declares it `public class FrozenArray<T>:
+// IEnumerable<T>` and nothing else, and the #8103 row models exactly that.
+//
 // Deliberately EXCLUDED (retain conservative-accept): the owning family
 // (Owning*, IOwning*) whose owning graph — IOwningEnumerable, IOwningEnumerator
 // — is not modeled here, and the arity-2 maps (Dictionary, SortedDictionary)
@@ -13237,6 +13244,22 @@ void ExprTC::collectBuiltinAncestorInstantiationsOf(
 static bool builtinBorrowingCollectionFullyModeled(std::string_view name) {
     return name == "Array" || name == "LinkedList" || name == "Set" ||
            name == "Stack" || name == "Queue" || name == "SortedSet" ||
+           // fix #8258 (stdlib §4.19, §5.1, v0.355): `FrozenArray<T>`'s
+           // interface set is COMPLETELY captured by builtinInterfaceAncestors
+           // above — stdlib §4.19 declares `public class FrozenArray<T>:
+           // IEnumerable<T>` and NOTHING else (no `IReadOnlyList<T>`, no
+           // `IReadOnlyCollection<T>`, no `IList<T>`, no `Count`), and the
+           // #8103 row in that table models exactly that single interface.
+           // So a not-found candidate in the both-builtin variance search is
+           // PROOF that `FrozenArray<T>` does not conform to the requested
+           // builtin interface (the #1851 rationale), and the search may
+           // soundly REJECT instead of falling through to the conservative
+           // accept. Without this entry the fallback admitted
+           // `FrozenArray<int>` at an `IReadOnlyList<int>` parameter
+           // (§5.1 lists "a type to an interface it implements or conforms
+           // to" — a class conforms only by DECLARATION or INHERITANCE, and
+           // `FrozenArray<T>` declares only `IEnumerable<T>`).
+           name == "FrozenArray" ||
            // fix #4793 / §6.5 (v0.307): SharedEventSource<T>'s interface
            // set is COMPLETELY captured by builtinInterfaceAncestors above
            // — the single declared interface ISharedEvent<T> — so its
