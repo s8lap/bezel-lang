@@ -32,6 +32,80 @@ struct RecordSubstEnv;  // §9.7/#2145 instantiation-site substitution env
 
 namespace bezel::ownership {
 
+// fix #7483 (§15.3 *Parameter passing* / §22.3, v0.355): is this formal's
+// DECLARED TYPE a MOVE-ONLY VALUE TYPE — the owning inline array
+// (`[N owned]T` / `[N owned]T?`, §15.1.1) or the owning-classified choice
+// (§35.4)?
+//
+// §15.3, verbatim: "A parameter declared `(owned x: V)` is identical to plain
+// `(x: V)` for a move-only V; the modifier is admitted for documentation but
+// is redundant. The redundancy reaches the **call site**: at either parameter
+// spelling the argument is written **unmarked** — `Take(arr)`, not
+// `Take(move arr)` … The position is [K3.12]'s marker-free store into an
+// owning location, not [K3.3]'s marked `owned` argument: [§22.3]'s marker
+// disambiguates borrow from transfer, and a move-only value has no borrow
+// reading to disambiguate, so `move` at such an argument is rejected as at any
+// marker-free position ([§28.8.1])."
+//
+// ⇒ AT THE CALL SITE an `owned` formal of a move-only value type is NOT an
+// `owned` SINK: it is the plain by-value-move parameter §15.3 describes. The
+// argument is written UNMARKED, and a `move` marker there is rejected.
+//
+// WHY THIS PREDICATE LIVES HERE AND NOT IN THE RESERVED CALLER. Every
+// owned-sink decision in the ownership pass reads the formal's modifier
+// through `CalleeFormals::modifier` — `isImplicitOwned` (the bare-statement
+// call's sink test), `recordMovesInArgs` (the LocalDecl-initializer /
+// assignment-RHS twin), the §22.3 marker checks and the `out owned` /
+// `scoped` arms. Hiding the REDUNDANT `owned` marker AT THIS ACCESSOR makes
+// every one of them answer "not an owned sink" for a move-only formal, so
+// the two sites cannot disagree (§15.3's call-site rule is ONE rule).
+//
+// CTX-FREE BY CONSTRUCTION. `CalleeFormals` carries no `SemaContext`, so the
+// classification reads the AST node (`ast::Type::arrayOwned` — §15.1.1's
+// `owned` modifier, the STRUCTURAL fact §15.3 says decides move-only
+// membership) and, for an IMPORTED formal, the already-resolved `TypeRef`
+// (`arrayOwned` again, and the choice declaration's `owned` payload markers).
+// The OWNING-CHOICE arm reads the declaration's case payloads directly
+// (§35.4: a choice is owning when a case payload carries the `owned`
+// marker) — the same structural fact `common::classifyChoiceType` reads, so
+// the two agree on every non-generic choice.
+//
+// THE CHOICE ARM IS CONSERVATIVE: a generic choice (one whose owning-ness
+// depends on the §28.1 per-instantiation erasure oracle) is NOT claimed here
+// — the predicate answers "no", so the call site keeps the §22.3 marker rule
+// for it, exactly as today. A false "no" never over-accepts; only a false
+// "yes" could, and the structural facts read here are the spec's own.
+// // per §15.3, §22.3, §28.8.1, §35.4, fix #7483
+inline bool formalIsMoveOnlyValued(const ast::Type* declTy,
+                                   const sema::TypeRef* resolvedTy) {
+    // §15.1.1 / §15.3: the owning inline array — `[N owned]T` / `[N owned]T?`.
+    // The AST node carries the `owned` modifier (`arrayOwned`); the resolved
+    // TypeRef carries the same flag for an IMPORTED formal.
+    if (declTy && declTy->kind == ast::TypeKind::InlineArray &&
+        declTy->arrayOwned)
+        return true;
+    if (resolvedTy &&
+        resolvedTy->kind == sema::TypeRef::Kind::InlineArray &&
+        resolvedTy->arrayOwned)
+        return true;
+    // §35.4: the owning-classified choice — a case payload marked `owned`.
+    if (!resolvedTy || resolvedTy->kind != sema::TypeRef::Kind::Named ||
+        !resolvedTy->declaration)
+        return false;
+    const sema::TypeSymbol* ts = resolvedTy->declaration;
+    const ast::TypeDecl* td =
+        ts->decl ? dynamic_cast<const ast::TypeDecl*>(ts->decl) : nullptr;
+    if (!td || td->kind != ast::TypeDeclKind::Choice) return false;
+    // A GENERIC choice's owning-ness is per-instantiation (§3.6 rule 2,
+    // §28.1's erasure oracle) and needs the SemaContext this view does not
+    // carry — leave it to the `owned`-marker rule (the pre-#7483 answer).
+    if (!td->genericParams.empty()) return false;
+    for (const ast::ChoiceCase& cc : td->choiceCases)
+        for (const ast::Param& p : cc.payload)
+            if (p.modifier == "owned") return true;
+    return false;
+}
+
 // §22.10 / §22.3 / §2.5 (#1627, #2659, #3176): a resolved CALLEE's formal list,
 // abstracted over every source one can have — a local `ast::Param` vector (a
 // user constructor, a method, an `operator`, a class primary constructor's
@@ -89,6 +163,29 @@ struct CalleeFormals {
         return methSym ? sema::formalParamCount(*methSym) : 0;
     }
     std::string_view modifier(std::size_t i) const {
+        const std::string_view m = rawModifier(i);
+        // fix #7483 (§15.3 *Parameter passing* / §22.3 / §28.8.1, v0.355):
+        // the `owned` marker on a MOVE-ONLY VALUE formal is REDUNDANT — "A
+        // parameter declared `(owned x: V)` is identical to plain `(x: V)` for
+        // a move-only V" (§15.3) — so AT THE CALL SITE the position is the
+        // plain by-value-move parameter: the argument is written UNMARKED
+        // (`Take(arr)`, not `Take(move arr)`), and a `move` marker there is
+        // "rejected as at any marker-free position (§28.8.1)".
+        //
+        // The marker is hidden HERE, at the ONE accessor every owned-sink
+        // decision reads, so the bare-statement call (`isImplicitOwned`), the
+        // LocalDecl-initializer / assignment-RHS twin (`recordMovesInArgs`),
+        // the §22.3 marker checks and the `out owned` / `scoped` arms cannot
+        // disagree about whether the position takes ownership.
+        if (m == "owned" &&
+            formalIsMoveOnlyValued(declType(i), resolvedType(i)))
+            return {};
+        return m;
+    }
+    // The formal's modifier AS WRITTEN — the `owned` marker included. The
+    // `modifier` accessor above is the CALL-SITE view (§15.3's redundancy);
+    // this is the raw syntax.
+    std::string_view rawModifier(std::size_t i) const {
         if (declParams) return i < declParams->size() ? (*declParams)[i].modifier
                                                       : std::string_view{};
         if (!posFields.empty()) {
