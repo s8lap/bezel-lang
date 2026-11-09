@@ -3126,6 +3126,85 @@ bool builtinSurfaceDeclaresArity0Member(const TypeRef* recvTy,
     return s && surfaceDeclaresProperty(*s, member);
 }
 
+// fix #8270 (stdlib §2.1, §14.1 / §14.5, v0.355): the DECLARED type of a
+// `Console` static STREAM-property read, for the CALL-ARGUMENT position.
+//
+// stdlib §2.1 declares THREE static readonly properties on `Console`
+// (docs/Bezel_Standard_Library.md:115-117):
+//
+//   public static readonly property In: TextReader;
+//   public static readonly property Out: TextWriter;
+//   public static readonly property Error: TextWriter;
+//
+// The declared type is read from `common::builtinDeclaredProperty` — the
+// registry table that carries the stdlib's own declaration blocks verbatim
+// (BuiltinRegistry.cpp:2828-2830) — so this helper cannot drift from the
+// stdlib: it mints whatever the declaration says.
+//
+// WHY A HELPER OF ITS OWN, and not `ExprTC::typeConsoleStreamOperand`.
+// That helper (#7924 / narrow #7792) mints the `TextWriter` type for the
+// `Out` / `Error` pair ONLY, because those are the two the compiler can
+// LOWER (a `TextWriter` value is the i32 stream descriptor, stdlib §7.4).
+// `Console.In` is the third member of the same declaration block and its
+// declared type is `TextReader` — a different type, and one this compiler has
+// no runtime representation for (codegen degrades the read to a
+// zero-initialised slot behind the #2434 warning, on EVERY `Console.In`
+// position: `var r: TextReader := Console.In;` and `Console.In.ReadLine()`
+// both degrade on the base). The DECLARED type is nonetheless what §14.5's
+// argument-driven inference reads, and a `TextReader` type argument is a
+// legitimate one (`Id<T>(x: T): T` at `T = TextReader`).
+//
+// The minted TypeRef has the SAME SHAPE `consoleStreamInferredType` mints for
+// `Out` / `Error` — a Named ref with no declaration and the name in
+// `importedName` — so the two cannot drift apart in the checks that read it
+// (`typeRefEqual` compares declaration-less Named refs by that pair, and
+// `headName()` reports the same name for both spellings).
+//
+// WHY `Console.In` IS INCLUDED, when the sibling helper excludes it. That
+// helper mints `TextWriter` for the `Out` / `Error` pair only, because those
+// are the two the compiler can LOWER (a `TextWriter` value is the i32 stream
+// descriptor, stdlib §7.4). `Console.In` is the third member of the same
+// declaration block and its declared type is `TextReader` — a different type,
+// and one this compiler has no runtime representation for (codegen degrades
+// the read to a zero-initialised slot behind the #2434 warning, on EVERY
+// `Console.In` position: `var r: TextReader := Console.In;` and
+// `Console.In.ReadLine()` both degrade on the base, and `Emit(Console.In)` at
+// a `TextReader` parameter fails in codegen there with the very same #1386
+// diagnostic this lane's argument position now reaches). The DECLARED type is
+// nonetheless what §14.5's argument-driven inference reads, and a
+// `TextReader` type argument is a legitimate one (`Id<T>(x: T): T` at
+// `T = TextReader`). The sema verdict is therefore the sibling shape's
+// verdict, and the codegen gap stays where it was.
+//
+// The mint is only reached at a CALL-ARGUMENT position (the caller below),
+// which is the position §14.5's inference reads. The read stays untyped
+// everywhere else, so #7924's "left untyped by design" invariant (#7924: the
+// chained `Console.Out.Write` paths are syntactic) is untouched.
+TypeRef* consoleStreamArgumentType(SemaContext& ctx, const ast::Expr& e) {
+    if (ctx.exprType(e)) return ctx.exprType(e);
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e);
+    if (!ma || !ma->target) return nullptr;
+    // fix #8126 (§2.7 rule 1, v0.355): a VALUE named `Console` is not the
+    // built-in `Console` class, so its `Out` / `Error` / `In` members are
+    // the user's own and carry the user's own types.
+    auto* cid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!cid || cid->name != "Console") return nullptr;
+    if (!receiverMayReachBuiltinStaticArm(ctx.exprSymbol(*cid))) return nullptr;
+    const common::BuiltinPropertyDecl* d =
+        common::builtinDeclaredProperty("Console", ma->member);
+    if (!d || !d->isStatic) return nullptr;
+    // stdlib §2.1 declares exactly three static properties on `Console`, and
+    // only the two STREAM ones are named `TextWriter` / `TextReader`; the
+    // table's other `Console` rows (there are none today) are not streams.
+    if (d->type != "TextWriter" && d->type != "TextReader") return nullptr;
+    TypeRef* ref = ctx.makeTypeRef();
+    ref->kind = TypeRef::Kind::Named;
+    ref->declaration = nullptr;
+    ref->importedName = d->type;
+    ctx.setExprType(&e, ref);
+    return ref;
+}
+
 }  // namespace
 
 // fix #7756 (§26.5 rules 1-2, v0.355): see ExprTypecheck_impl.hpp. The two
@@ -14868,6 +14947,61 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         : nullptr;
                 visitExpr(*a.value);
                 refOutArgTargetNode_ = savedRefOut;
+                // fix #8270 (§14.1 / §14.5, stdlib §2.1, v0.355): the CALL
+                // ARGUMENT position is a VALUE position, exactly like the
+                // `??` / `if` / `case` operand positions (narrow #7792) and
+                // the unannotated-local initializer position (#7924), so a
+                // bare `Console.Out` / `Console.Error` read carries the
+                // property's DECLARED type here too — `TextWriter`
+                // (stdlib §2.1: `public static readonly property Error:
+                // TextWriter;`).
+                //
+                // MEASURED on the pre-fix base (90087bc4): the read is left
+                // UNTYPED by design (#7924's comment: "the property read
+                // itself is left untyped by design"), and the CALL-argument
+                // position was the one VALUE position the minted type never
+                // reached. So the argument carried NO type at all, and
+                // §14.5's phase-1 argument-driven unification had nothing to
+                // unify against the formal `T`:
+                //
+                //   static method Id<T>(x: T): T ... end Id;
+                //   var w := Id(Console.Error);
+                //     -> "cannot infer the type argument `T` of `Id`'s call
+                //        — it is mentioned only inside a parameter whose
+                //        declared type did not unify with that argument's
+                //        actual type" (rc 1)
+                //
+                // — the diagnostic #8270 reports, and it is the SAME
+                // diagnostic an `int`, a `string` or a user-class argument
+                // does NOT get, because those arguments DO have a type.
+                // The issue's own hypothesis blames the unifier's treatment
+                // of the declaration-less Named `TextWriter` TypeRef
+                // (`isInScopeTypeParamRef`); MEASURED, that is NOT the
+                // cause: the argument's TypeRef is NULL, so the unifier is
+                // never reached. The unifier's name-keyed fallback is a
+                // separate, pre-existing question (see the sibling note in
+                // `isInScopeTypeParamRef`'s own header) and this fix does not
+                // touch it.
+                //
+                // WHY THE CALL-ARGUMENT POSITION AND NOT THE READ ITSELF.
+                // #7924 left the read untyped so that the CHAINED
+                // `Console.Out.Write` paths stay syntactic; typing the read
+                // everywhere would re-route that chain through the typed
+                // `TextWriter` path. The ARGUMENT position is a plain value
+                // position with no chained member access on it, so minting
+                // the type there leaves every existing path byte-identical:
+                // `Console.Error.WriteLine("x")` (the read is the RECEIVER,
+                // not an argument) is untouched, and only the argument
+                // `Console.Error` — the shape §14.5's inference reads —
+                // gains the type its declared property already gives it.
+                //
+                // The minted type has the SAME SHAPE the sibling value
+                // positions use (`consoleStreamInferredType` in
+                // `src/sema/ExprTypecheck.cpp`, reached from there through
+                // `ExprTC::typeConsoleStreamOperand`), so the positions
+                // cannot drift: stdlib §2.1 declares ONE type per property,
+                // and the property read carries it wherever it is a value.
+                consoleStreamArgumentType(ctx_, *a.value);
                 // fix #6107 (§12.7 "the target's where inferred", v0.338): the
                 // lambda argument at an explicit function-typed type argument
                 // is formed at that type, so its expression type IS the
