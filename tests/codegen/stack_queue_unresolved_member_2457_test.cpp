@@ -192,8 +192,13 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, compareto_call_no_longer_double_r
         "  return 0; "
         "end Main; end C;";
     // Still rejected (the pre-existing #920/#1112 call-site check, unrelated
-    // to and unaffected by this slice).
-    BEZEL_EXPECT_TRUE(hasError(program, "no member `CompareTo` on `Stack<T>`"));
+    // to and unaffected by this slice). UPDATED BY fix #8331 (stdlib §4.11,
+    // v0.355): the CALL form is now rejected by the per-head surface gate,
+    // whose wording names the head WITHOUT the `<T>` suffix and cites the
+    // section that declares it ("no member `CompareTo` on `Stack`
+    // (stdlib §4.11) -- ...").
+    BEZEL_EXPECT_TRUE(
+        hasError(program, "no member `CompareTo` on `Stack` (stdlib \xC2\xA7""4.11)"));
     // The #2465 placeholder wording must no longer ALSO fire for Stack/Queue
     // now that this slice has audited them — the one observable difference
     // `isAuditedElsewhere`'s update makes for this call.

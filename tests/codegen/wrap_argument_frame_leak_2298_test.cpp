@@ -116,6 +116,13 @@ BEZEL_TEST(wrap_argument_frame_leak_2298,
 // Queue<T> argument: same path as Array (wrapArrayAsIEnumerable; Queue is in
 // the array-backed family). Same gap. Before the fix: 32B leak. After the
 // fix: leak-free.
+//
+// UPDATED BY fix #8331 (stdlib §4.11, v0.355): the queue is filled with
+// `Enqueue`, the member stdlib §4.11 declares for `Queue<T>`. It used `Add`,
+// which §4.11 does NOT declare for it (the queue's fill spelling is
+// `Enqueue`); the compiler admitted `Add` through the old SHARED name list,
+// and #8331's per-head surface table refuses it. The row's ORACLE (the sum
+// is 11, and no wrapper leak) is unchanged.
 BEZEL_TEST(wrap_argument_frame_leak_2298,
            queue_as_ienumerable_argument_no_wrapper_leak_spec_28_9) {
     std::string src =
@@ -127,7 +134,7 @@ BEZEL_TEST(wrap_argument_frame_leak_2298,
         "  end Sum; "
         "  public static method Main(): int "
         "    using var s := new Queue<int>(); "
-        "    s.Add(5); s.Add(6); "
+        "    s.Enqueue(5); s.Enqueue(6); "
         "    return C.Sum(s); "
         "  end Main; "
         "end C;";

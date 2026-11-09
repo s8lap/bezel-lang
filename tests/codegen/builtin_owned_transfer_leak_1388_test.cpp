@@ -25,6 +25,17 @@
 //       Stack.Pop) must NOT be treated as an owned producer — no warning, no
 //       double-free.
 //
+// UPDATED BY fix #8331 (stdlib §4.4/§4.8/§4.9/§4.5, v0.355): the FOUR
+// positional/keyed transfer names (PopLast/PopFirst/PopAt/PopValue) are
+// declared by the OWNING heads ONLY — §4.5's `OwningArray<T>`,
+// §4.7's `OwningLinkedList<T>`, §4.9's `OwningDictionary<K,V>`. The
+// borrowing `Array<T>` (§4.4) and `Dictionary<K,V>` (§4.8) declare NONE of
+// them, so #8331's per-head surface table REFUSES those calls. The four
+// "borrowing_*_no_warn" rows and the two ASan CONTROL rows that used them
+// now pin that refusal instead (the shape they probed — a borrow that the
+// §28.3 auto-drop must not dispose — is no longer WRITABLE, so the
+// soundness property holds STRICTLY STRONGERLY).
+//
 // Spec citations: §28.3 (affine auto-drop), §28.11 (owning-collection element
 // disposal), §29.1 v0.161 (TakeCurrent), stdlib §4.5/§4.7/§4.9/§4.11.
 
@@ -119,6 +130,21 @@ const std::string kR =
 bool warnsAutoDrop(const std::string& body, const std::string& name) {
     auto r = parseAndCheckOwnership("module M; " + kR + body);
     return !r.diagnostics.hasErrors() && hasAutoDropWarning(r, name);
+}
+
+// fix #8331 (stdlib §4.4/§4.8, v0.355): the program is REFUSED with an error
+// carrying `needle`. Used by the rows whose shape became UNWRITABLE — the
+// members they exercised are declared by the OWNING heads only, so the
+// per-head surface table refuses the call before the ownership pass runs.
+bool rejectsWith(const std::string& body, const std::string& needle) {
+    auto r = parseAndCheckOwnership("module M; " + kR + body);
+    if (!r.diagnostics.hasErrors()) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find(needle) != std::string::npos)
+            return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -287,48 +313,68 @@ BEZEL_TEST(builtin_owned_transfer_1388, borrowing_stack_pop_no_warn_spec_28_3) {
 // isOwningCollectionHead gate they were classified Owned unconditionally, so
 // the §28.3 auto-drop disposed a borrow → double-free / SEGV. Each must NOT
 // warn (and the AOT control below proves each does NOT double-free).
+//
+// UPDATED BY fix #8331 (stdlib §4.4/§4.8, v0.355): the four transfer names
+// are declared by the OWNING heads ONLY — stdlib §4.5's `OwningArray<T>`
+// (`PopAt`/`PopFirst`/`PopLast`) and §4.7's `OwningLinkedList<T>`
+// (`PopFirst`/`PopLast`), §4.9's `OwningDictionary<K,V>` (`PopValue`).
+// `Array<T>` (§4.4) and `Dictionary<K,V>` (§4.8) declare NONE of them, so
+// #8331's per-head surface table REFUSES the call on a borrowing head
+// (stdlib §1's Block-by-name rule): the shape this row existed to probe is
+// no longer WRITABLE, and the soundness property it checked (the §28.3
+// auto-drop must not dispose a borrow) now holds STRICTLY STRONGERLY — the
+// program does not compile at all.
+//
+// The row therefore pins the REFUSAL. The ownership-classification coverage
+// it used to add is still carried by the OWNING-head rows above (the
+// `OwningArray`/`OwningDictionary`/`OwningStack` transfer rows) and by the
+// borrowing `Stack.Pop()` row below.
 BEZEL_TEST(builtin_owned_transfer_1388, borrowing_array_poplast_no_warn_spec_28_3) {
-    BEZEL_EXPECT_FALSE(warnsAutoDrop(
+    BEZEL_EXPECT_TRUE(rejectsWith(
         "class C public static method Main(): int "
         "  using var owner := new R(1); "
         "  using var arr := new Array<R>(); "
         "  arr.Add(owner); "
-        "  var x := arr.PopLast(); "  // borrow — owned by `owner`
+        "  var x := arr.PopLast(); "  // §4.4 declares no `PopLast` on Array<T>
         "  return 0; "
-        "end Main; end C;", "x"));
+        "end Main; end C;",
+        "no member `PopLast` on `Array` (stdlib \xC2\xA7""4.4)"));
 }
 
 BEZEL_TEST(builtin_owned_transfer_1388, borrowing_array_popfirst_no_warn_spec_28_3) {
-    BEZEL_EXPECT_FALSE(warnsAutoDrop(
+    BEZEL_EXPECT_TRUE(rejectsWith(
         "class C public static method Main(): int "
         "  using var owner := new R(1); "
         "  using var arr := new Array<R>(); "
         "  arr.Add(owner); "
         "  var x := arr.PopFirst(); "
         "  return 0; "
-        "end Main; end C;", "x"));
+        "end Main; end C;",
+        "no member `PopFirst` on `Array` (stdlib \xC2\xA7""4.4)"));
 }
 
 BEZEL_TEST(builtin_owned_transfer_1388, borrowing_array_popat_no_warn_spec_28_3) {
-    BEZEL_EXPECT_FALSE(warnsAutoDrop(
+    BEZEL_EXPECT_TRUE(rejectsWith(
         "class C public static method Main(): int "
         "  using var owner := new R(1); "
         "  using var arr := new Array<R>(); "
         "  arr.Add(owner); "
         "  var x := arr.PopAt(0); "
         "  return 0; "
-        "end Main; end C;", "x"));
+        "end Main; end C;",
+        "no member `PopAt` on `Array` (stdlib \xC2\xA7""4.4)"));
 }
 
 BEZEL_TEST(builtin_owned_transfer_1388, borrowing_dict_popvalue_no_warn_spec_28_3) {
-    BEZEL_EXPECT_FALSE(warnsAutoDrop(
+    BEZEL_EXPECT_TRUE(rejectsWith(
         "class C public static method Main(): int "
         "  using var owner := new R(1); "
         "  using var d := new Dictionary<int, R>(); "
         "  d.Add(1, owner); "
         "  var x := d.PopValue(1); "
         "  return 0; "
-        "end Main; end C;", "x"));
+        "end Main; end C;",
+        "no member `PopValue` on `Dictionary` (stdlib \xC2\xA7""4.8)"));
 }
 
 // ===========================================================================
@@ -426,14 +472,27 @@ BEZEL_TEST(builtin_owned_transfer_1388, asan_owning_stack_peek_borrow_clean_28_3
 // not disposed; `owner` is disposed exactly once by its own using var. Must be
 // double-free-clean AND leak-clean. Covers PopFirst/PopAt/PopValue by the same
 // codegen path.
-BEZEL_TEST(builtin_owned_transfer_1388, asan_borrowing_array_poplast_no_double_free_28_3) {
+// AOT + ASan CONTROL: a BORROWING collection's removal returns a BORROW, so
+// the §28.3 auto-drop must not dispose it — no double-free.
+//
+// UPDATED BY fix #8331 (stdlib §4.4/§4.11, v0.355): the row's ORIGINAL shape
+// was `Array<R>.PopLast()`, and `Array<T>` (stdlib §4.4) declares NO
+// `PopLast` — the popping member is `OwningArray<T>`'s (stdlib §4.5, which
+// TRANSFERS the owned element out), so #8331's per-head surface table
+// refuses the call on the borrowing head and the program no longer compiles.
+// The row keeps its ORACLE (a borrowing collection's removal yields a borrow
+// that must not be double-freed) on the borrowing head that DOES declare a
+// removing member: `Stack<T>.Pop()` (stdlib §4.11 — "a borrowing Stack.Pop
+// returns a BORROW"), the sibling of the `borrowing_stack_pop_no_warn` row
+// above.
+BEZEL_TEST(builtin_owned_transfer_1388, asan_borrowing_stack_pop_no_double_free_28_3) {
     int rc = runUnderASan(
         "module M; " + kR +
         "class C public static method Main(): int "
         "  using var owner := new R(1); "
-        "  using var arr := new Array<R>(); "
-        "  arr.Add(owner); "
-        "  var x := arr.PopLast(); "  // borrow — was double-freed pre-fix
+        "  using var s := new Stack<R>(); "
+        "  s.Push(owner); "
+        "  var x := s.Pop(); "  // borrow — owned by `owner`
         "  return 0; "
         "end Main; end C;");
     if (rc == -1) return;  // toolchain unavailable — skip
@@ -442,17 +501,27 @@ BEZEL_TEST(builtin_owned_transfer_1388, asan_borrowing_array_poplast_no_double_f
 
 // AOT + ASan CONTROL: a borrowing Dictionary<int,R>.PopValue(k) — same guard,
 // same no-double-free requirement.
-BEZEL_TEST(builtin_owned_transfer_1388, asan_borrowing_dict_popvalue_no_double_free_28_3) {
+//
+// UPDATED BY fix #8331 (stdlib §4.8/§4.11, v0.355): the row's ORIGINAL shape
+// was `Dictionary<int,R>.PopValue(k)`, and `Dictionary<K, V>` (stdlib §4.8)
+// declares NO `PopValue` — the popping member is `OwningDictionary<K, V>`'s
+// (stdlib §4.9, `PopValue` transfers the OWNED value out and disposes the
+// entry), so #8331's per-head surface table refuses the call on the
+// borrowing head and the program no longer compiles. The row keeps its
+// ORACLE (a borrowing collection's keyed removal yields a borrow that must
+// not be double-freed) on the borrowing head that DOES declare a removing
+// member: `Queue<T>.Dequeue()` (stdlib §4.11 — the FIFO sibling of
+// `Stack<T>.Pop()`).
+BEZEL_TEST(builtin_owned_transfer_1388, asan_borrowing_queue_dequeue_no_double_free_28_3) {
     int rc = runUnderASan(
         "module M; " + kR +
         "class C public static method Main(): int "
         "  using var owner := new R(1); "
-        "  using var d := new Dictionary<int, R>(); "
-        "  d.Add(1, owner); "
-        "  var x := d.PopValue(1); "
+        "  using var q := new Queue<R>(); "
+        "  q.Enqueue(owner); "
+        "  var x := q.Dequeue(); "  // borrow — owned by `owner`
         "  return 0; "
         "end Main; end C;");
     if (rc == -1) return;            // toolchain unavailable: SKIP (#3626)
-    BEZEL_EXPECT_TRUE(rc >= 0);      // -2 program-compile / -3 link / -4 system() → FAIL (#3633)
-    BEZEL_EXPECT_EQ(rc, 0);
+    BEZEL_EXPECT_EQ(rc, 0);          // 0 = no double-free, no leak (was SEGV)
 }

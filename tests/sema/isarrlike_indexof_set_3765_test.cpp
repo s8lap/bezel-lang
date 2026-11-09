@@ -17,7 +17,16 @@
 // sortedSetMemberUndeclared arm. This file pins that behavior:
 //
 //   - Row 1 (the issue's own repro): `Set<int>.IndexOf(1)` is rejected with
-//     the new "no member `IndexOf` on `Set<T>`" diagnostic.
+//     the new "no member `IndexOf` on `Set`" diagnostic.
+//
+// fix #8331 (stdlib §4.6/§4.10/§4.11, v0.355): the refusal now comes from
+// the stdlib's own PER-HEAD surface table (`concreteCollectionSurfaces()`),
+// so the diagnostic is the stdlib's documented-surface sentence and it names
+// the head WITHOUT the `<T>` suffix ("no member `IndexOf` on `Set`") — the
+// needles below are updated to that wording. The rows' MEANING is unchanged:
+// the same calls are still refused, for the same spec reason (§4.4's
+// `Array<T>` and §4.5's `OwningArray<T>` are the only heads that declare
+// `IndexOf`).
 //   - Row 2 (control — the array family that DOES declare IndexOf): no
 //     regression on `Array<int>.IndexOf(1)` (still types, runs, returns the
 //     matched index) — proves the fix is NARROW, not a blanket IndexOf
@@ -78,7 +87,7 @@ bool hasErrorContaining(const JitResult& r, const std::string& needle) {
 // Row 1 — the issue's own repro: `Set<int>.IndexOf(1)`.
 // PRE-FIX: typed as int via the unconditional isArrLike arm, codegen has
 // no dispatch arm, slot zero-fills via #2434 (silent zero). POST-FIX: a
-// precise "no member `IndexOf` on `Set<T>`" diagnostic on the call line.
+// precise "no member `IndexOf` on `Set`" diagnostic on the call line.
 // ===========================================================================
 BEZEL_TEST(isarrlike_indexof_set_3765, set_indexof_rejected_not_declared) {
     const std::string src =
@@ -94,7 +103,7 @@ BEZEL_TEST(isarrlike_indexof_set_3765, set_indexof_rejected_not_declared) {
         "  end Main;\n"
         "end C;\n";
     auto r = runAot(src);
-    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "no member `IndexOf` on `Set<T>`"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "no member `IndexOf` on `Set`"));
 }
 
 // ===========================================================================
@@ -140,7 +149,7 @@ BEZEL_TEST(isarrlike_indexof_set_3765, stack_indexof_rejected_not_declared) {
         "  end Main;\n"
         "end C;\n";
     auto r = runAot(src);
-    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "no member `IndexOf` on `Stack<T>`"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "no member `IndexOf` on `Stack`"));
 }
 
 // ===========================================================================
@@ -162,7 +171,7 @@ BEZEL_TEST(isarrlike_indexof_set_3765, queue_indexof_rejected_not_declared) {
         "  end Main;\n"
         "end C;\n";
     auto r = runAot(src);
-    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "no member `IndexOf` on `Queue<T>`"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "no member `IndexOf` on `Queue`"));
 }
 
 // ===========================================================================
@@ -186,7 +195,7 @@ BEZEL_TEST(isarrlike_indexof_set_3765, linkedlist_indexof_rejected_not_declared)
         "end C;\n";
     auto r = runAot(src);
     BEZEL_EXPECT_TRUE(
-        hasErrorContaining(r, "no member `IndexOf` on `LinkedList<T>`"));
+        hasErrorContaining(r, "no member `IndexOf` on `LinkedList`"));
 }
 
 // ===========================================================================
@@ -219,7 +228,7 @@ BEZEL_TEST(isarrlike_indexof_set_3765,
         "end C;\n";
     auto r = runAot(src);
     BEZEL_EXPECT_TRUE(
-        hasErrorContaining(r, "no member `IndexOf` on `OwningSet<T>`"));
+        hasErrorContaining(r, "no member `IndexOf` on `OwningSet`"));
 }
 
 }  // namespace

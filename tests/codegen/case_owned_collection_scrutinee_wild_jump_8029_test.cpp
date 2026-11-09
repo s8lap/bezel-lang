@@ -3,6 +3,14 @@
 // VTABLE-DISPATCH flag (`unwindOnly`), and a built-in collection has no
 // vtable -- so the dispatch was a WILD JUMP.
 //
+// UPDATED BY fix #8331 (stdlib §4.11, v0.355): the `OwningStack<T>` and
+// `OwningQueue<T>` rows now use the member those heads DECLARE (`Push` /
+// `Enqueue`). They used `Add`, which stdlib §4.11 does NOT declare for them
+// (`Stack<T>`/`Queue<T>` and their owning forms conform to
+// `IReadOnlyCollection<T>` only); the compiler admitted `Add` on them through
+// the old SHARED name list, and #8331's per-head surface table refuses it.
+// The rows' ORACLE (the program COMPLETES, no wild jump) is unchanged.
+//
 // THE DEFECT. `lowerCaseStmt` (src/codegen/LlvmBackend_Stmts.cpp) and
 // `lowerCaseExpr` (src/codegen/LlvmBackend_Exprs2.cpp) capture the case
 // scrutinee's fresh owned temporary into an entry alloca and register a
@@ -265,7 +273,7 @@ BEZEL_TEST(case_owned_collection_scrutinee_wild_jump_8029,
            statement_owning_stack_scrutinee_throw_completes_spec_28_3) {
     expectCompletesClean(
         runAotChecked(statementProgram("OwningStack", "Cell",
-                                       "d.Add(new Cell());")),
+                                       "d.Push(new Cell());")),
         "0\n");
 }
 
@@ -273,7 +281,7 @@ BEZEL_TEST(case_owned_collection_scrutinee_wild_jump_8029,
            statement_owning_queue_scrutinee_throw_completes_spec_28_3) {
     expectCompletesClean(
         runAotChecked(statementProgram("OwningQueue", "Cell",
-                                       "d.Add(new Cell());")),
+                                       "d.Enqueue(new Cell());")),
         "0\n");
 }
 

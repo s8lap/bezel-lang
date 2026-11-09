@@ -27,10 +27,15 @@
 //      these nine receiver families, so admitting the name here only routed
 //      an already-doomed call to a WORSE, generic "#2457 no dispatch arm"
 //      diagnostic instead of this predicate's own precise
-//      "no member ... (§22.5 / §4.x)" one. This test pins that diagnostic
+//      "no member ... (stdlib §4.x)" one. This test pins that diagnostic
 //      change (FAIL-WITHOUT: `#2457`'s "produced no value, and no dispatch
 //      arm..." wording; PASS-WITH: the collection-specific "no member"
 //      wording).
+//
+// UPDATED BY fix #8331 (stdlib §4.4, v0.355): the collection's call surface
+// is now the stdlib's PER-HEAD table, so the diagnostic names the head
+// WITHOUT the `<T>` suffix and cites the section that DECLARES the head
+// ("no member `ToList` on `Array` (stdlib §4.4) -- ...").
 //
 // `OfType`, `Reversed`, and `Sorted` are DELIBERATELY still admitted by
 // every list this fix touches (see the BuiltinRegistry.hpp comments):
@@ -41,7 +46,7 @@
 // touches: it is NOT a stdlib §5 instance member (the only documented
 // `ForEach` is the unrelated static `Parallel.ForEach`), and the broken
 // codegen path's malformed IR finally had to be retired, with a clean
-// "no member ... (§22.5 / §4.x)" diagnostic taking its place. This file
+// "no member ... (stdlib §4.4)" diagnostic taking its place. This file
 // pins that none of the three remaining names regressed to the "no member"
 // wording either.
 
@@ -87,14 +92,14 @@ BEZEL_TEST(linq_operator_name_list_dedup_3589, tolist_rejected_precise_stdlib_5)
     // stdlib §5's own text: "There is no `ToList()`..." — never a real member.
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         arrayProgram("a.ToList()"),
-        "no member `ToList` on `Array<T>` (\xC2\xA7""22.5 / \xC2\xA7""4.x)"));
+        "no member `ToList` on `Array` (stdlib \xC2\xA7""4.4)"));
 }
 
 BEZEL_TEST(linq_operator_name_list_dedup_3589, append_rejected_precise_stdlib_3_1) {
     // `Append` is real, but on `StringBuilder` (stdlib §3.1), not on `Array<T>`.
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         arrayProgram("a.Append(4)"),
-        "no member `Append` on `Array<T>` (\xC2\xA7""22.5 / \xC2\xA7""4.x)"));
+        "no member `Append` on `Array` (stdlib \xC2\xA7""4.4)"));
 }
 
 BEZEL_TEST(linq_operator_name_list_dedup_3589,
@@ -103,7 +108,7 @@ BEZEL_TEST(linq_operator_name_list_dedup_3589,
     // (stdlib §4.14/§4.15), not on `Array<T>` itself.
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         arrayProgram("a.SequenceEqual(a)"),
-        "no member `SequenceEqual` on `Array<T>` (\xC2\xA7""22.5 / \xC2\xA7""4.x)"));
+        "no member `SequenceEqual` on `Array` (stdlib \xC2\xA7""4.4)"));
 }
 
 BEZEL_TEST(linq_operator_name_list_dedup_3589, join_rejected_precise_stdlib_6_10) {
@@ -111,7 +116,7 @@ BEZEL_TEST(linq_operator_name_list_dedup_3589, join_rejected_precise_stdlib_6_10
     // `string.Join(sep, items)`, not an `Array<T>` instance method.
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         arrayProgram("a.Join()"),
-        "no member `Join` on `Array<T>` (\xC2\xA7""22.5 / \xC2\xA7""4.x)"));
+        "no member `Join` on `Array` (stdlib \xC2\xA7""4.4)"));
 }
 
 BEZEL_TEST(linq_operator_name_list_dedup_3589,
@@ -120,7 +125,7 @@ BEZEL_TEST(linq_operator_name_list_dedup_3589,
     // §4.14/§4.15), not on `Array<T>` itself.
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         arrayProgram("a.AsReadOnly()"),
-        "no member `AsReadOnly` on `Array<T>` (\xC2\xA7""22.5 / \xC2\xA7""4.x)"));
+        "no member `AsReadOnly` on `Array` (stdlib \xC2\xA7""4.4)"));
 }
 
 // ── Deliberately-retained names must NOT regress to the "no member"
@@ -164,5 +169,5 @@ BEZEL_TEST(linq_operator_name_list_dedup_3589,
     // is a separate, dedicated diagnostic this test does not re-pin).
     BEZEL_EXPECT_FALSE(hasErrorContaining(
         arrayProgram("a.OfType<int>()"),
-        "no member `OfType` on `Array<T>` (\xC2\xA7""22.5 / \xC2\xA7""4.x)"));
+        "no member `OfType` on `Array` (stdlib \xC2\xA7""4.4)"));
 }

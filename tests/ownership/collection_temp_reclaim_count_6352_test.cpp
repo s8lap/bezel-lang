@@ -243,6 +243,18 @@ BEZEL_TEST(collection_temp_reclaim_count_6352,
 // — and pre-fix both arms returned straight out of the `bz_dict_count` runtime
 // call. Kept as its own row so the reclaim is pinned on the member, not only on
 // the call site that happens to host it today.
+//
+// UPDATED BY fix #8331 (stdlib §4.10, v0.355): `Set<T>` declares NO
+// `IsEmpty` — the v0.231 changelog's ruling is explicit ("the §4 add/remove
+// collections carry `Count` only and gain no `IsEmpty`"; the property belongs
+// to the extent-bearing `Length` types — the spans §4.14/§4.15/§4.16,
+// `string` §9.6, `Range<T>` §9.8). #8331's per-head surface table therefore
+// REFUSES the call, so the shape this row existed to probe is no longer
+// WRITABLE and the Set `.IsEmpty` reclaim arm has no reachable caller.
+//
+// The row now pins the REFUSAL. The reclaim coverage it used to add is
+// carried by the `.Count` row above — the SAME codegen arm's sibling, on the
+// member `Set<T>` DOES declare.
 BEZEL_TEST(collection_temp_reclaim_count_6352,
            is_empty_unbound_owned_set_reclaimed) {
     std::string src = std::string(kPreamble) +
@@ -255,9 +267,20 @@ BEZEL_TEST(collection_temp_reclaim_count_6352,
         "  return 0; "
         "  end Main; "
         "end C; ";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_TRUE(r.exitCode == 0);
+    auto r = runAot(src);
+    // The refusal: stdlib §4.10's `Set<T>` row does not name `IsEmpty`, so
+    // the stdlib's documented-surface diagnostic is what the user sees.
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool sawRefusal = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("no member `IsEmpty` on `Set`") !=
+                std::string::npos) {
+            sawRefusal = true;
+            break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(sawRefusal);
 }
 
 // §28.3 / §28.9 / #6352 (v0.338): the BOUND-receiver twin of the row above,

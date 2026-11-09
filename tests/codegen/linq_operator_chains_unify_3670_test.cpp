@@ -85,7 +85,7 @@ BEZEL_TEST(linq_operator_chains_unify_3670, owning_array_bogus_member_rejected_p
         "  var r := oa.ToList(); "
         "  return 0; "
         "end Main; end C;",
-        "no member `ToList` on `OwningArray<T>` (\xC2\xA7""22.5 / \xC2\xA7""4.x)"));
+        "no member `ToList` on `OwningArray` (stdlib \xC2\xA7""4.5)"));
 }
 
 // A real §5 LINQ operator (`Where`, present in the routed table, not in the

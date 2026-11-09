@@ -37,6 +37,15 @@
 // `hasErrors()` alone (§3 of the lane rules: "assert diagnostic TEXT, not
 // hasErrors()").
 //
+// fix #8331 (stdlib §4.18, v0.355): the Category B rejections now come from
+// the stdlib's own PER-HEAD surface table (`concreteCollectionSurfaces()`),
+// so the diagnostic is the stdlib's documented-surface sentence and it names
+// the head WITHOUT the `<T>` suffix ("no member `Get` on `SortedSet`") — the
+// needles below are updated to that wording. The rows' MEANING is unchanged:
+// the same calls are still refused, for the same spec reason (§4.18 declares
+// no `Get`/`Peek`/`Pop`/`Dequeue`/`PopFirst`/`PopLast`/`PopAt`/`IndexOf`/
+// `Length`/`TryPop`).
+//
 // Citations verified verbatim against docs/ at v0.286:
 //   stdlib §4.18 `SortedSet<T>`:
 //     "public class SortedSet<T>: IReadOnlyCollection<T> where T:
@@ -140,48 +149,48 @@ BEZEL_TEST(sortedset_isarrlike_3730, contains_still_types_no_hashable_reject) {
 
 BEZEL_TEST(sortedset_isarrlike_3730, get_rejected_not_declared) {
     BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.Get(0);"), "no member `Get` on `SortedSet<T>`"));
+        reject("    var x := s.Get(0);"), "no member `Get` on `SortedSet`"));
 }
 
 BEZEL_TEST(sortedset_isarrlike_3730, peek_rejected_not_declared) {
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         reject("    var x := s.Peek();"),
-        "no member `Peek` on `SortedSet<T>`"));
+        "no member `Peek` on `SortedSet`"));
 }
 
 BEZEL_TEST(sortedset_isarrlike_3730, pop_rejected_not_declared) {
     BEZEL_EXPECT_TRUE(hasErrorContaining(
-        reject("    var x := s.Pop();"), "no member `Pop` on `SortedSet<T>`"));
+        reject("    var x := s.Pop();"), "no member `Pop` on `SortedSet`"));
 }
 
 BEZEL_TEST(sortedset_isarrlike_3730, dequeue_rejected_not_declared) {
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         reject("    var x := s.Dequeue();"),
-        "no member `Dequeue` on `SortedSet<T>`"));
+        "no member `Dequeue` on `SortedSet`"));
 }
 
 BEZEL_TEST(sortedset_isarrlike_3730, popfirst_rejected_not_declared) {
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         reject("    var x := s.PopFirst();"),
-        "no member `PopFirst` on `SortedSet<T>`"));
+        "no member `PopFirst` on `SortedSet`"));
 }
 
 BEZEL_TEST(sortedset_isarrlike_3730, poplast_rejected_not_declared) {
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         reject("    var x := s.PopLast();"),
-        "no member `PopLast` on `SortedSet<T>`"));
+        "no member `PopLast` on `SortedSet`"));
 }
 
 BEZEL_TEST(sortedset_isarrlike_3730, popat_rejected_not_declared) {
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         reject("    var x := s.PopAt(0);"),
-        "no member `PopAt` on `SortedSet<T>`"));
+        "no member `PopAt` on `SortedSet`"));
 }
 
 BEZEL_TEST(sortedset_isarrlike_3730, indexof_rejected_not_declared) {
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         reject("    var x := s.IndexOf(10);"),
-        "no member `IndexOf` on `SortedSet<T>`"));
+        "no member `IndexOf` on `SortedSet`"));
 }
 
 BEZEL_TEST(sortedset_isarrlike_3730, length_call_rejected_not_declared) {
@@ -192,19 +201,19 @@ BEZEL_TEST(sortedset_isarrlike_3730, length_call_rejected_not_declared) {
     // fix's guard.
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         reject("    var x := s.Length();"),
-        "no member `Length` on `SortedSet<T>`"));
+        "no member `Length` on `SortedSet`"));
 }
 
 BEZEL_TEST(sortedset_isarrlike_3730, trypop_rejected_not_declared) {
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         reject("    var out2: int?; var ok := s.TryPop(out out2);"),
-        "no member `TryPop` on `SortedSet<T>`"));
+        "no member `TryPop` on `SortedSet`"));
 }
 
 BEZEL_TEST(sortedset_isarrlike_3730, trytake_rejected_not_declared) {
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         reject("    var out2: int?; var ok := s.TryTake(10, out out2);"),
-        "no member `TryTake` on `SortedSet<T>`"));
+        "no member `TryTake` on `SortedSet`"));
 }
 
 // ===========================================================================

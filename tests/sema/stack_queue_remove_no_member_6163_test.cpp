@@ -16,6 +16,14 @@
 // (a sibling family has it), so `s.Remove(1)` compiled and was dropped at
 // lowering with warning #3079. Post-fix it is the same "no member" error
 // `s.Frob()` already draws.
+//
+// fix #8331 (stdlib §4.11, v0.355): the refusal now comes from the stdlib's
+// own PER-HEAD surface table (`concreteCollectionSurfaces()`), so the
+// diagnostic is the stdlib's documented-surface sentence and it names the
+// head WITHOUT the `<T>` suffix ("no member `Remove` on `Stack`") — the
+// needles below are updated to that wording. The rows' MEANING is unchanged:
+// the same calls are still refused, for the same spec reason (§4.11's four
+// heads are `IReadOnlyCollection<T>`, which declares no `Remove`).
 
 #include "sema/ExprTypecheck.hpp"
 #include "sema/TypeResolution.hpp"
@@ -53,31 +61,31 @@ std::string prog(const std::string& decl, const std::string& stmt) {
 BEZEL_TEST(stack_queue_remove_no_member_6163, stack_remove_rejected) {
     auto r = parseSemaAll(prog("using var s := new Stack<int>(); s.Push(1);",
                                "s.Remove(1);"));
-    BEZEL_EXPECT_TRUE(hasError(r, "no member `Remove` on `Stack<T>`"));
+    BEZEL_EXPECT_TRUE(hasError(r, "no member `Remove` on `Stack`"));
 }
 
 BEZEL_TEST(stack_queue_remove_no_member_6163, stack_remove_var_rejected) {
     auto r = parseSemaAll(prog("using var s := new Stack<int>(); s.Push(1);",
                                "var x := s.Remove(1);"));
-    BEZEL_EXPECT_TRUE(hasError(r, "no member `Remove` on `Stack<T>`"));
+    BEZEL_EXPECT_TRUE(hasError(r, "no member `Remove` on `Stack`"));
 }
 
 BEZEL_TEST(stack_queue_remove_no_member_6163, queue_remove_rejected) {
     auto r = parseSemaAll(prog("using var q := new Queue<int>(); q.Enqueue(1);",
                                "q.Remove(1);"));
-    BEZEL_EXPECT_TRUE(hasError(r, "no member `Remove` on `Queue<T>`"));
+    BEZEL_EXPECT_TRUE(hasError(r, "no member `Remove` on `Queue`"));
 }
 
 BEZEL_TEST(stack_queue_remove_no_member_6163, owningstack_remove_rejected) {
     auto r = parseSemaAll(prog("using var s := new OwningStack<Cell>();",
                                "using var c := new Cell(1); s.Remove(c);"));
-    BEZEL_EXPECT_TRUE(hasError(r, "no member `Remove` on `OwningStack<T>`"));
+    BEZEL_EXPECT_TRUE(hasError(r, "no member `Remove` on `OwningStack`"));
 }
 
 BEZEL_TEST(stack_queue_remove_no_member_6163, owningqueue_remove_rejected) {
     auto r = parseSemaAll(prog("using var q := new OwningQueue<Cell>();",
                                "using var c := new Cell(1); q.Remove(c);"));
-    BEZEL_EXPECT_TRUE(hasError(r, "no member `Remove` on `OwningQueue<T>`"));
+    BEZEL_EXPECT_TRUE(hasError(r, "no member `Remove` on `OwningQueue`"));
 }
 
 // Controls: the families that DO declare Remove are unaffected, as are the

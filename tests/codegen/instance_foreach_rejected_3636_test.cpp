@@ -22,11 +22,16 @@
 // `Parallel.ForEach`, stdlib §6.12, in `Parallel` namespace). It is REMOVED
 // from every list/gate above. The post-fix behavior for both receivers is
 // the precise collection-specific diagnostic
-//     "no member `ForEach` on `Array<T>` (§22.5 / §4.x) — ..."
+//     "no member `ForEach` on `Array` (stdlib §4.4) — ..."
 // — not the malformed-IR crash, and not a generic "#2457 no dispatch arm"
 // wording either. This file pins that the rejection happens at the right
 // site (sema, with the right wording) and that the unrelated static
 // `Parallel.ForEach` is unchanged.
+//
+// UPDATED BY fix #8331 (stdlib §4.4, v0.355): the collection's call surface
+// is now the stdlib's PER-HEAD table, so the diagnostic names the head
+// WITHOUT the `<T>` suffix and cites the section that DECLARES the head
+// ("no member `ForEach` on `Array` (stdlib §4.4) — ...").
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness
 #include "support/codegen_support.hpp"
@@ -88,7 +93,7 @@ BEZEL_TEST(instance_foreach_rejected_3636, array_foreach_explicit_lambda_rejecte
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         arrayStatementProgram(
             "a.ForEach(lambda(x: int) => do end);"),
-        "no member `ForEach` on `Array<T>` (\xC2\xA7""22.5 / \xC2\xA7""4.x)"));
+        "no member `ForEach` on `Array` (stdlib \xC2\xA7""4.4)"));
 }
 
 BEZEL_TEST(instance_foreach_rejected_3636,
@@ -99,7 +104,7 @@ BEZEL_TEST(instance_foreach_rejected_3636,
     BEZEL_EXPECT_TRUE(hasErrorContaining(
         arrayProgram(
             "a.ForEach(lambda(x: int) => do end)"),
-        "no member `ForEach` on `Array<T>` (\xC2\xA7""22.5 / \xC2\xA7""4.x)"));
+        "no member `ForEach` on `Array` (stdlib \xC2\xA7""4.4)"));
 }
 
 // ── Same diagnostic, string receiver — the "unification" half of #3636.
@@ -161,16 +166,16 @@ BEZEL_TEST(instance_foreach_rejected_3636, string_foreach_rejected_no_longer_cra
 //    (stdlib §6.12, in the `Parallel` namespace) is unaffected. A compile-
 //    time shape that DOES use it should still produce a `Task`-typed
 //    expression (or the right domain error — but NOT the `no member on
-//    Array<T>` wording we test above, which is the diagnostic the fix
+//    Array` wording we test above, which is the diagnostic the fix
 //    pins for the instance form). We don't run the actual call (it would
 //    need a TaskScope / thread pool); we just pin that the static form
-//    is NOT routed to the `no member on Array<T>` wording. ─────────────
+//    is NOT routed to the `no member on Array` wording. ─────────────
 
 BEZEL_TEST(instance_foreach_rejected_3636,
            static_parallel_foreach_not_routed_to_array_no_member) {
     // The static `Parallel.ForEach<A>(items, body, degree)` exists; a
     // bare call (`Parallel.ForEach(...)`) should NOT trigger the
-    // collection-specific `no member \`ForEach\` on \`Array<T>\``
+    // collection-specific `no member \`ForEach\` on \`Array\``
     // wording — that wording is the precise post-fix rejection of the
     // INSTANCE form that this test exists to pin. (Whether the static
     // call itself type-checks / works is a separate question, out of
@@ -186,5 +191,5 @@ BEZEL_TEST(instance_foreach_rejected_3636,
         "end Main; end C;";
     BEZEL_EXPECT_FALSE(hasErrorContaining(
         program,
-        "no member `ForEach` on `Array<T>` (\xC2\xA7""22.5 / \xC2\xA7""4.x)"));
+        "no member `ForEach` on `Array` (stdlib \xC2\xA7""4.4)"));
 }

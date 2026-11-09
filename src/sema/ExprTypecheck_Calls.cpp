@@ -7336,6 +7336,81 @@ bool ExprTC::classOrIfaceComparableAtInstance(const TypeRef* elem) {
     return false;
 }
 
+// fix #8331 (stdlib §1 *Block-by-name*, §4.4-§4.19, v0.355): the CONCRETE
+// built-in collection heads' documented surface — ONE row per head — and the
+// gate that reads it.
+//
+// A row is the head's own stdlib §4.x members plus the ones it INHERITS from
+// the interfaces its `class` line names (`Array<T>: IList<T>` brings `Count`,
+// `IsReadOnly`, `Add`, `Clear`, `Contains`, `Remove`, `Insert`,
+// `GetEnumerator`; `OwningArray<T>: IOwningList<T>, IOwningEnumerable<T>`
+// additionally `Dispose` and `GetOwningEnumerator`; `Stack<T>`/`Queue<T>` and
+// their owning forms conform to `IReadOnlyCollection<T>` ONLY, so no
+// `Add`/`Remove`/`IsReadOnly` — stdlib §4.11 *Surface coherence*;
+// `Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>`,
+// `OwningDictionary<K, V>: IDisposable` alone). Static members
+// (`FromCollectionLiteral`, `FrozenArray.From`) are not instance members and
+// are not listed. The universal `Object` members (spec §8.1) are not listed
+// either, as in the interface table: they are not what the stdlib §4 listing
+// declares.
+//
+// The `section` field is the stdlib section that DECLARES the row: the
+// diagnostic names it, so the user is told WHICH section to read.
+//
+// The `compilerAccessors` field is the OTHER direction: members the COMPILER
+// dispatches for that head that the stdlib's §4 listing does NOT declare.
+// There is exactly one such family today — `Get(i)`, the compiler's
+// array-STORAGE read (`coll.Get(i)` reads the backing store's slot `i`; the
+// stdlib's element read is the INDEXER `coll[i]`, and no §4 listing declares
+// a `Get` method). It is listed PER HEAD and only for the heads where the
+// compiler really dispatches it to a VALUE (measured on the base tree: the
+// array-backed heads — `Array`, `FrozenArray`, `OwningArray`, `OwningQueue`,
+// `OwningSet`, `OwningStack`, `Queue`, `Stack`); on `LinkedList` /
+// `OwningLinkedList` / `Set` / `SortedDictionary` the same call DEGRADES to a
+// zero-initialized slot (#2434, a silent wrong answer), and on `Dictionary` /
+// `OwningDictionary` / `SortedSet` it reaches codegen's "no dispatch arm"
+// backstop — so on those heads the table-driven gate turns the silent degrade
+// into a loud error, which is the lane's point.
+//
+// The accessors are kept OUT of `members` on purpose: `members` is what the
+// diagnostic QUOTES as the head's "documented surface", and a hand-added
+// `Get` there would put an undeclared name into a list that claims to be the
+// stdlib's documented one — the mistake issue #8333 records. The table
+// therefore carries BOTH lists, and the gate reads both.
+//
+// fix #8331: the CALL form's admission is decided by THIS table, per head.
+// Before this fix the call surface was a NAME LIST shared by every head of a
+// family (`allowedOwningMethod` / `allowedNonOwningMethod`), so a name a
+// SIBLING head declared was admitted on every head: `FrozenArray<T>.Add`
+// (stdlib §4.19 declares no mutator at all) and `SortedDictionary<K,
+// V>.Insert` (§4.17) compiled, silently, and codegen's array arms then
+// lowered the call as if the head were `Array<T>`. With the table as the
+// authority, the head that DECLARES a name and the head that does not can
+// never disagree about it — the same property #7700 established for the
+// §26.5 rule-1 lookup — and the diagnostic's surface list is GENERATED from
+// the very row the gate reads (issue #8333's lesson: a hand-copied list
+// drifts from the table it claims to quote).
+struct ConcreteCollectionSurface {
+    std::string_view head;
+    std::string_view section;
+    std::vector<std::string_view> members;
+    std::vector<std::string_view> compilerAccessors;
+};
+static const std::vector<ConcreteCollectionSurface>& concreteCollectionSurfaces();
+static bool isDocumentedConcreteCollectionMember(std::string_view head,
+                                                 std::string_view member);
+static bool isCompilerDispatchedCollectionAccessor(std::string_view head,
+                                                   std::string_view member);
+static const ConcreteCollectionSurface* concreteCollectionSurfaceRow(
+    std::string_view head);
+static std::string concreteCollectionSurfaceList(std::string_view head);
+static bool concreteCollectionCallSurfaceAdmits(std::string_view head,
+                                                std::string_view member);
+static bool concreteCollectionCallHasDedicatedDiagnostic(
+    std::string_view head, std::string_view member);
+static std::string_view concreteCollectionReceiverHead(const TypeRef* t);
+static bool isDocumentedStdlibLinqOperatorName(std::string_view n);
+
 void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (!ce.callee) return;
     // §22.16 (v0.250, #3038): `old(E)` — the callee is the contextual
@@ -14583,6 +14658,136 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
                     }
                 }
+                // fix #8331 (stdlib §1 *Block-by-name*, §4.4-§4.19, v0.355):
+                // the PER-HEAD surface gate. A call on a stdlib collection
+                // head names a member the head does not declare: stdlib
+                // §1's Block-by-name rule makes a member a type does not
+                // declare NOT a member of that type at all, so the call is
+                // an error — and stdlib §5's `extension IEnumerable<T>`
+                // block declares no such name either, so no extension can
+                // supply it.
+                //
+                // Before this fix the call surface was a NAME LIST shared
+                // by every head of a family (`allowedOwningMethod` /
+                // `allowedNonOwningMethod`), so a name a SIBLING head
+                // declared was admitted on every head:
+                // `FrozenArray<T>.Add` (stdlib §4.19 declares no mutator
+                // at all) and `SortedDictionary<K, V>.Insert` (§4.17)
+                // compiled, silently, and codegen's array arms then
+                // lowered the call as if the head were `Array<T>`. The
+                // authority is now the stdlib's own PER-HEAD TABLE
+                // (`concreteCollectionSurfaces`), so the head that DECLARES
+                // a name and the head that does not can never disagree
+                // about it — the property #7700 established for the §26.5
+                // rule-1 lookup.
+                //
+                // The diagnostic is the stdlib's own documented-surface
+                // sentence — the same sentence the `LastIndexOf` row of
+                // #8310 uses, with the CONCRETE collection's phrasing
+                // ("this collection's documented surface"; the §4.12
+                // `IEnumerable` row says "this interface's" because that
+                // head IS an interface). The surface list is GENERATED
+                // from the very row the gate reads (issue #8333's lesson:
+                // the predecessor's codegen gate quoted a hand-copied
+                // list that omitted `Add`, `Count` and `TryAdd` for
+                // `SortedDictionary`), and the section named is the one
+                // that DECLARES the head.
+                //
+                // The list quoted is the row's DOCUMENTED members alone. The
+                // row's COMPILER accessors (`Get(i)` — the array-storage
+                // read the compiler dispatches although no stdlib section
+                // declares it) are admitted by the gate but are NOT quoted:
+                // a list that claims to be the stdlib's documented surface
+                // must not carry an undeclared name (issue #8333 again).
+                //
+                // Two names keep their own diagnostics, because they are
+                // not "a member this head lacks" but "a name NO
+                // collection has" / "an API retired from the whole
+                // surface": `.Set()` (not a method on any collection type
+                // — the indexer is the write surface) and
+                // `.DisposeElements()` (retired with axiom A8, §28.6 /
+                // §28.11). Two more names have their own diagnostics
+                // further down the collection-typing chain, and the gate
+                // DEFERS on them rather than shadowing them:
+                // `OfType<U>()` (removed from stdlib §5 at v0.284 —
+                // `ofTypeRemovedMessage`) and `Reversed()`/`Sorted()` on
+                // `OwningArray<T>` (stdlib §4.5 — a shallow copy of
+                // uniquely-owned elements would double-own them, §28.3;
+                // #472's own wording).
+                bool isOwningContainer =
+                    colName == "OwningArray" || colName == "OwningStack" ||
+                    colName == "OwningQueue" || colName == "OwningLinkedList" ||
+                    colName == "OwningSet" || colName == "OwningDictionary";
+                bool isNonOwningContainer =
+                    colName == "Array" || colName == "Stack" ||
+                    colName == "Queue" || colName == "Set" ||
+                    colName == "LinkedList" || colName == "Dictionary" ||
+                    // §4.17/§4.18 (#1354): sorted collections
+                    colName == "SortedDictionary" || colName == "SortedSet";
+                const std::string_view surfaceHead =
+                    concreteCollectionReceiverHead(recvTy);
+                if (!surfaceHead.empty()) {
+                    // §4.8/§4.9 v0.155 (#920/#1112): `.Set()` is not a
+                    // method on any collection type; the indexer
+                    // `coll[i] := v` or `dict[key] := value` is the
+                    // spec-declared write surface. Emit a targeted hint
+                    // before the generic "not in surface" reject so the
+                    // user knows exactly what to use instead.
+                    if (m == "Set") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "`.Set()` is not a method on any collection type "
+                            "(§4.8/§4.9 v0.155, #920/#1112): use the indexer "
+                            "`coll[i] := v` to update a slot in an "
+                            "array/stack/queue, or `dict[key] := value` to "
+                            "add-or-update a dictionary entry");
+                        return;
+                    }
+                    // §28.6 / §28.11 (v0.213, axiom A8 retired, #2081):
+                    // targeted hint for the removed `.DisposeElements()`.
+                    // The bulk element-disposal escape hatch — and its
+                    // per-element manual form — were retired with axiom A8
+                    // (the #2075 corpus sweep found no load-bearing
+                    // client); a borrowing collection never disposes its
+                    // elements. (The OWNING family's own spelling of the
+                    // refusal is the surface diagnostic below — the
+                    // borrowing family's is this one, as before.)
+                    if (m == "DisposeElements" && !isOwningContainer) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            std::string("`.DisposeElements()` was removed "
+                            "from the collection surface (§28.6 / §28.11, "
+                            "v0.213 — axiom A8, the transit exception, is "
+                            "retired): a borrowing collection is a transit "
+                            "point and never disposes its elements. If `") +
+                            std::string(surfaceHead) +
+                            "<T>` semantically owns its elements, declare "
+                            "the owning family (OwningArray/OwningDictionary/…) "
+                            "and let `Dispose()` cascade; for selective "
+                            "cleanup take each element out first (`Drain()`, "
+                            "the `Pop*` family, or `move coll[i]`) into an "
+                            "owned binding");
+                        return;
+                    }
+                    if (!concreteCollectionCallSurfaceAdmits(surfaceHead, m) &&
+                        !concreteCollectionCallHasDedicatedDiagnostic(surfaceHead,
+                                                                      m)) {
+                        const ConcreteCollectionSurface* row =
+                            concreteCollectionSurfaceRow(surfaceHead);
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            std::string("no member `") + std::string(m) +
+                            "` on `" + std::string(surfaceHead) +
+                            "` (stdlib \xC2\xA7" + std::string(row->section) +
+                            ") -- it is not part of this collection's "
+                            "documented surface (" +
+                            concreteCollectionSurfaceList(surfaceHead) +
+                            "), a universal `ToString`/`Equals`/`GetHashCode`/"
+                            "`GetType` member (language spec \xC2\xA7""8.1), or "
+                            "a stdlib \xC2\xA7""5 LINQ extension operator");
+                        return;
+                    }
+                }
                 if (!colName.empty()) {
                     // fix #4749 (stdlib §4.5 + spec §26.5 rule 1, v0.307):
                     // `OwningArray<T>` declares no instance member named
@@ -14629,287 +14834,6 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             "(copying would double-own its elements, §4.5); drain it "
                             "(`Drain`/`PopAt`/`PopFirst`/`PopLast`) to transfer "
                             "ownership out, or use a borrowing `Array<T>`");
-                    }
-                    // §22.5 / §4.x (#920 / #1103-B): a method call on an OWNING
-                    // CONTAINER collection whose name is not part of that family's
-                    // stdlib surface (nor a universal Object member, a borrowing
-                    // LINQ operator, or the enumerable protocol) was silently
-                    // ACCEPTED and mis-lowered — e.g. `arr.TakeAt(0)` (nonexistent),
-                    // `arr.Set(0, v)` (`Set` is no collection's method), an arbitrary
-                    // `arr.Frobnicate()`. Reject any name outside a GENEROUS union of
-                    // every valid owning-collection method (over-inclusion never
-                    // over-rejects — a name valid on a SIBLING owning type is allowed
-                    // here too; that finer per-type precision is a follow-up). Scoped
-                    // to the six owning CONTAINER collections (not OwningBuffer / the
-                    // owning iterators, whose surfaces differ). Only a DIRECT owning
-                    // receiver triggers it; a LINQ query result has an IEnumerable
-                    // receiver (colName != Owned*) and is unaffected.
-                    bool isOwningContainer =
-                        colName == "OwningArray" || colName == "OwningStack" ||
-                        colName == "OwningQueue" || colName == "OwningLinkedList" ||
-                        colName == "OwningSet" || colName == "OwningDictionary";
-                    if (isOwningContainer) {
-                        // §4.8/§4.9 v0.155 (#920/#1112): `.Set()` is not a method
-                        // on any collection type; the indexer `coll[i] := v` or
-                        // `dict[key] := value` is the spec-declared write surface.
-                        // Emit a targeted hint before the generic "not in surface"
-                        // reject so the user knows exactly what to use instead.
-                        if (m == "Set") {
-                            ctx_.diagnostics().report(
-                                Severity::Error, ce.span.begin,
-                                "`.Set()` is not a method on any collection type "
-                                "(§4.8/§4.9 v0.155, #920/#1112): use the indexer "
-                                "`coll[i] := v` to update a slot in an "
-                                "array/stack/queue, or `dict[key] := value` to "
-                                "add-or-update a dictionary entry");
-                        } else {
-                        auto allowedOwningMethod = [](std::string_view mm) -> bool {
-                            return
-                                // §4.x native owning-collection surface (union over
-                                // OwningArray/Stack/Queue/LinkedList/Set/Dictionary).
-                                mm == "Add" || mm == "AddRange" || mm == "AddFirst" ||
-                                mm == "AddLast" || mm == "AddBefore" ||
-                                mm == "AddAfter" || mm == "Insert" ||
-                                mm == "Remove" || mm == "RemoveAt" ||
-                                mm == "RemoveFirst" || mm == "RemoveLast" ||
-                                mm == "RemoveNode" || mm == "Clear" ||
-                                mm == "Contains" || mm == "ContainsKey" ||
-                                mm == "IndexOf" || mm == "Find" || mm == "Sort" ||
-                                mm == "Reverse" || mm == "Push" || mm == "Pop" ||
-                                mm == "Peek" || mm == "TryPop" || mm == "TryPeek" ||
-                                mm == "Enqueue" || mm == "Dequeue" ||
-                                mm == "TryDequeue" || mm == "PopAt" ||
-                                mm == "PopFirst" || mm == "PopLast" ||
-                                mm == "TryPopFirst" || mm == "TryPopLast" ||
-                                mm == "PopValue" || mm == "TryPopValue" ||
-                                mm == "TryAdd" ||
-                                mm == "Get" || mm == "TryGetValue" ||
-                                // fix #3510 / stdlib §4.9 (v0.285): `GetOrNull`
-                                // is declared on `OwningDictionary<K, V>` beside
-                                // `GetOrAdd` (the §1 *OrNull tier, v0.231). It
-                                // was absent from THIS surface list while the
-                                // member-access list below (`isDeclaredMethod`)
-                                // already carried it, so the call form was
-                                // rejected by a message that itself enumerates
-                                // `GetOrNull` as part of the surface.
-                                mm == "GetOrAdd" || mm == "GetOrNull" ||
-                                mm == "UnionWith" || mm == "IntersectWith" ||
-                                mm == "ExceptWith" || mm == "IsSubsetOf" ||
-                                mm == "IsSupersetOf" || mm == "Drain" ||
-                                mm == "DrainAndProcess" ||
-                                // common property/length accessors also usable in
-                                // `.Count()` method form.
-                                mm == "Count" || mm == "Capacity" ||
-                                mm == "Length" || mm == "IsEmpty" ||
-                                mm == "IsReadOnly" || mm == "Keys" ||
-                                mm == "Values" || mm == "First" || mm == "Last" ||
-                                mm == "FirstNode" || mm == "LastNode" ||
-                                // universal Object members (§8.1) + IDisposable.
-                                mm == "ToString" || mm == "Equals" ||
-                                mm == "GetHashCode" || mm == "GetType" ||
-                                mm == "Dispose" ||
-                                // enumerable protocol (§4.12/§4.13).
-                                mm == "GetEnumerator" ||
-                                mm == "GetAsyncEnumerator" ||
-                                mm == "MoveNext" || mm == "MoveNextAsync" ||
-                                // borrowing LINQ operators (§5) — valid on any
-                                // IEnumerable, incl. an owning collection. Included
-                                // generously; the materializer copy-forms
-                                // (ToArray/ToSet/ToDictionary) are rejected above for
-                                // owning receivers but kept here so this check does
-                                // not double-report them. `Reversed`/`Sorted` are
-                                // NOT §5 — they are Array<T>'s own native copy-form
-                                // methods (stdlib §4.4) — kept in this union for the
-                                // same "valid to call at all" reason. `OfType` is
-                                // kept though retired from stdlib §5 (fix #3559):
-                                // that fix's commit records the membership lists are
-                                // deliberately left so a bare/call reference gets
-                                // the specific removal diagnostic rather than a
-                                // generic "no member" one.
-                                //
-                                // fix #3589: `Append`/`SequenceEqual`/`Join`/
-                                // `AsReadOnly`/`ToList` were REMOVED from this list.
-                                // None is declared on Array/OwningArray (or any
-                                // other receiver this predicate governs) by stdlib
-                                // §4/§5 — each is a real member of a DIFFERENT type
-                                // (`StringBuilder.Append`, `ArraySpan<T>.
-                                // SequenceEqual`/`.AsReadOnly`, `TaskScope.Join`/
-                                // `string.Join`, and `ToList` does not exist at all,
-                                // per `Bezel_Standard_Library.md` §5's own "There is
-                                // no ToList()" note) — confirmed by grepping every
-                                // codegen dispatch arm for each name: none fires for
-                                // an Array/Dictionary/Stack/Queue/Set/LinkedList
-                                // receiver, so admitting them here only routed a
-                                // certain-to-fail call to a worse, generic "#2457 no
-                                // dispatch arm" diagnostic instead of this
-                                // predicate's own precise "no member ... (§22.5 /
-                                // §4.x)" one. `grep -rn '\.NAME(' tests/` (excluding
-                                // the real-receiver uses above) found zero instance
-                                // calls of any of the five on a governed receiver in
-                                // the whole suite.
-                                //
-                                // fix #3670: this ~38-name OR-chain was a hand-
-                                // written byte-twin of the one in
-                                // allowedNonOwningMethod below and had drifted from
-                                // stdlib §5 independently of it — now both read the
-                                // shared common::isBuiltinCollectionLinqOperatorName
-                                // table. `Reversed`/`Sorted` stay as an explicit
-                                // addition (see the comment above): they are real
-                                // Array<T> §4.4 copy-forms, not §5, and are not in
-                                // that table. The table additionally admits `First`/
-                                // `Last`, which this lambda already accepts via its
-                                // native-surface arm above (`mm == "First" || mm ==
-                                // "Last"`) — PROVEN inert by the same masking
-                                // argument #3589's own commit made for `ToArray`.
-                                common::isBuiltinCollectionLinqOperatorName(mm) ||
-                                mm == "Reversed" || mm == "Sorted";
-                        };
-                        if (!allowedOwningMethod(m)) {
-                            ctx_.diagnostics().report(
-                                Severity::Error, ce.span.begin,
-                                std::string("no member `") + std::string(m) +
-                                "` on `" + std::string(colName) +
-                                "<T>` (§22.5 / §4.x) — it is not part of the owning "
-                                "collection's surface, a universal Object member, or "
-                                "a LINQ operator");
-                        }
-                        }  // end else (m != "Set")
-                    }
-                    // §4.x / §22.5 (#920/#1112 v0.155): validate non-owning
-                    // collection method calls. A DIRECT non-owning-collection
-                    // receiver whose called method name is not on that family's
-                    // stdlib surface (nor a universal Object member / LINQ
-                    // operator / enumerable protocol) was silently accepted and
-                    // mis-lowered — e.g. `d.Nope()` on a Dictionary would produce
-                    // a SIGSEGV at runtime. Reject any name outside a generous
-                    // union of every valid non-owning-collection method.
-                    bool isNonOwningContainer =
-                        colName == "Array" || colName == "Stack" ||
-                        colName == "Queue" || colName == "Set" ||
-                        colName == "LinkedList" || colName == "Dictionary" ||
-                        // §4.17/§4.18 (#1354): sorted collections
-                        colName == "SortedDictionary" || colName == "SortedSet";
-                    if (isNonOwningContainer) {
-                        // §4.8/§4.9 v0.155 (#920/#1112): targeted hint for .Set.
-                        if (m == "Set") {
-                            ctx_.diagnostics().report(
-                                Severity::Error, ce.span.begin,
-                                "`.Set()` is not a method on any collection type "
-                                "(§4.8/§4.9 v0.155, #920/#1112): use the indexer "
-                                "`coll[i] := v` to update a slot in an "
-                                "array/stack/queue, or `dict[key] := value` to "
-                                "add-or-update a dictionary entry");
-                        // §28.6 / §28.11 (v0.213, axiom A8 retired, #2081):
-                        // targeted hint for the removed `.DisposeElements()`. The
-                        // bulk element-disposal escape hatch — and its per-element
-                        // manual form — were retired with axiom A8 (the #2075
-                        // corpus sweep found no load-bearing client); a borrowing
-                        // collection never disposes its elements.
-                        } else if (m == "DisposeElements") {
-                            ctx_.diagnostics().report(
-                                Severity::Error, ce.span.begin,
-                                std::string("`.DisposeElements()` was removed from "
-                                "the collection surface (§28.6 / §28.11, v0.213 — "
-                                "axiom A8, the transit exception, is retired): a "
-                                "borrowing collection is a transit point and never "
-                                "disposes its elements. If `") +
-                                std::string(colName) +
-                                "<T>` semantically owns its elements, declare the "
-                                "owning family (OwningArray/OwningDictionary/…) and "
-                                "let `Dispose()` cascade; for selective cleanup take "
-                                "each element out first (`Drain()`, the `Pop*` "
-                                "family, or `move coll[i]`) into an owned binding");
-                        } else {
-                        auto allowedNonOwningMethod = [colName](std::string_view mm) -> bool {
-                            return
-                                // §4.x native non-owning surface (union over
-                                // Array/Stack/Queue/Set/LinkedList/Dictionary).
-                                mm == "Add" || mm == "AddRange" || mm == "AddFirst" ||
-                                mm == "AddLast" || mm == "AddBefore" ||
-                                mm == "AddAfter" || mm == "Insert" ||
-                                mm == "Remove" || mm == "RemoveAt" ||
-                                mm == "RemoveFirst" || mm == "RemoveLast" ||
-                                mm == "RemoveNode" || mm == "Clear" ||
-                                mm == "Contains" || mm == "ContainsKey" ||
-                                mm == "IndexOf" || (mm == "LastIndexOf" && colName == "Array") ||
-                                mm == "Find" || mm == "Sort" ||
-                                mm == "Reverse" || mm == "Push" || mm == "Pop" ||
-                                mm == "Peek" || mm == "TryPop" || mm == "TryPeek" ||
-                                mm == "Enqueue" || mm == "Dequeue" ||
-                                mm == "TryDequeue" || mm == "TryAdd" ||
-                                mm == "Get" || mm == "TryGetValue" || mm == "GetOrAdd" ||
-                                // fix #3510 / stdlib §4.8 / §4.17 (v0.285):
-                                // `GetOrNull(key: K): V?` is declared on both
-                                // `Dictionary<K, V>` and `SortedDictionary<K, V>`.
-                                mm == "GetOrNull" ||
-                                mm == "UnionWith" || mm == "IntersectWith" ||
-                                mm == "ExceptWith" || mm == "IsSubsetOf" ||
-                                mm == "IsSupersetOf" ||
-                                mm == "Count" || mm == "Capacity" ||
-                                mm == "Length" || mm == "IsEmpty" ||
-                                mm == "IsReadOnly" || mm == "Keys" ||
-                                mm == "Values" || mm == "First" || mm == "Last" ||
-                                mm == "FirstNode" || mm == "LastNode" ||
-                                // §4.17 SortedDictionary-specific (#1354).
-                                mm == "FirstKey" || mm == "LastKey" ||
-                                // Dict-specific.
-                                mm == "PopValue" || mm == "TryPopValue" ||
-                                mm == "Drain" || mm == "DrainAndProcess" ||
-                                // Array/Stack/Queue-specific.
-                                mm == "PopAt" || mm == "PopFirst" || mm == "PopLast" ||
-                                mm == "TryPopFirst" || mm == "TryPopLast" ||
-                                mm == "AsSpan" || mm == "AsReadOnlySpan" ||
-                                // stdlib §4.4 / §16.3 (v0.182, #1579): Array<T>.Slice(r).
-                                mm == "Slice" ||
-                                // (§28.11 v0.213: `DisposeElements` retired with
-                                // axiom A8 — handled by the targeted hint above.)
-                                // universal Object members (§8.1) + IDisposable.
-                                mm == "ToString" || mm == "Equals" ||
-                                mm == "GetHashCode" || mm == "GetType" ||
-                                mm == "Dispose" ||
-                                // enumerable protocol.
-                                mm == "GetEnumerator" ||
-                                mm == "GetAsyncEnumerator" ||
-                                mm == "MoveNext" || mm == "MoveNextAsync" ||
-                                // borrowing LINQ operators (§5). See the
-                                // allowedOwningMethod copy above for why
-                                // `Reversed`/`Sorted`/`OfType` stay and
-                                // `Append`/`SequenceEqual`/`Join`/
-                                // `AsReadOnly`/`ToList`/`ForEach` were
-                                // removed (fix #3589 + #3636) — same
-                                // reasoning, same receiver family union.
-                                // `ForEach` is removed because it is NOT in
-                                // stdlib §5 at all (the only documented form
-                                // is the unrelated static `Parallel.ForEach`):
-                                // admitting it here silently routed a doomed
-                                // call to a malformed-IR codegen path
-                                // (`for #3636: Instruction has a name, but
-                                // provides a void value!`).
-                                //
-                                // fix #3670: this ~38-name OR-chain was a
-                                // byte-twin of allowedOwningMethod's copy
-                                // above — both now read the shared
-                                // common::isBuiltinCollectionLinqOperatorName
-                                // table; see that copy's comment for the
-                                // `Reversed`/`Sorted` and inert-`First`/`Last`
-                                // notes, which apply identically here (this
-                                // lambda's own native-surface arm above
-                                // already admits `First`/`Last`, so the
-                                // table's redundant inclusion of them changes
-                                // nothing observable).
-                                common::isBuiltinCollectionLinqOperatorName(mm) ||
-                                mm == "Reversed" || mm == "Sorted";
-                        };
-                        if (!allowedNonOwningMethod(m)) {
-                            ctx_.diagnostics().report(
-                                Severity::Error, ce.span.begin,
-                                std::string("no member `") + std::string(m) +
-                                "` on `" + std::string(colName) +
-                                "<T>` (§22.5 / §4.x) — it is not part of this "
-                                "collection's method surface, a universal Object "
-                                "member, or a LINQ operator");
-                        }
-                        }  // end else (m != "Set")
                     }
                     // v0.171 (#1336): every extraction Try's out parameter is
                     // nullable (`T?`/`V?`) — the false path assigns `null`
@@ -15063,31 +14987,28 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // loud reject over a member that now lowers correctly
                         // is the #3735 defect this block already records one
                         // paragraph up.
-                        bool sortedSetMemberUndeclared =
-                            m == "Get" || m == "Peek" || m == "Pop" ||
-                            m == "Dequeue" || m == "PopLast" ||
-                            m == "PopFirst" || m == "PopAt" ||
-                            m == "IndexOf" || m == "TryPop" ||
-                            m == "TryDequeue" || m == "TryPeek" ||
-                            m == "TryPopFirst" || m == "TryPopLast" ||
-                            m == "Length";
-                        if (colName == "SortedSet" &&
-                            sortedSetMemberUndeclared) {
-                            ctx_.diagnostics().report(
-                                Severity::Error, ce.span.begin,
-                                std::string("no member `") + std::string(m) +
-                                "` on `SortedSet<T>` (stdlib §4.18 / §22.5) — "
-                                "SortedSet<T> declares Count/Add/TryAdd/"
-                                "Contains/Remove/Clear/First/Last plus the "
-                                "stdlib §5 IEnumerable<T> surface; it has no "
-                                "positional index, no front/back, and no "
-                                "extraction query to `" + std::string(m) + "`");
-                        }
+                        // fix #8331 (stdlib §4.18, v0.355): the REJECT half
+                        // of #3730 — the name list (`Get`/`Peek`/`Pop`/
+                        // `Dequeue`/`PopLast`/`PopFirst`/`PopAt`/`IndexOf`/
+                        // `TryPop`/`TryDequeue`/`TryPeek`/`TryPopFirst`/
+                        // `TryPopLast`/`Length`) `SortedSet<T>` does not
+                        // declare — is DELETED here: the per-head surface gate
+                        // above rejects every one of them, from the stdlib's
+                        // own per-head table (stdlib §4.18's `SortedSet<T>`
+                        // row), with the documented-surface diagnostic. A name
+                        // list can drift from the table it claims to mirror;
+                        // the table cannot. The TYPING arms below are
+                        // unchanged (they serve the heads that DO declare
+                        // these members — `Stack`/`Queue`/`OwningStack`/
+                        // `OwningQueue` declare `Pop`/`Peek`/`Dequeue`, and
+                        // `OwningArray`/`OwningLinkedList` declare `PopAt`/
+                        // `PopFirst`/`PopLast`).
+                        //
                         // fix #3345: the static-call form
                         // `Array.Sort(a)` / `Array.Reverse(a)` is handled
                         // by the early-return above; the arms below are
                         // for the instance-call form only.
-                        else if (m == "Length" || m == "Count")
+                        if (m == "Length" || m == "Count")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         else if (m == "IsEmpty")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
@@ -15136,27 +15057,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // own arms (LinkedList L11392, Dictionary, SortedSet).
                         else if (m == "Remove" && ce.args.size() == 1 &&
                                  (colName == "Array" || colName == "OwningArray" ||
-                                  colName == "Set" || colName == "OwningSet"))
+                                  colName == "Set" || colName == "OwningSet")) {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        }
                         // fix #6163 / stdlib §4.11: Stack<T>, OwningStack<T>,
                         // Queue<T> and OwningQueue<T> declare no `Remove` (they
                         // are IReadOnlyCollection<T>, #1354; Push/Pop/Peek/
                         // Enqueue/Dequeue/Contains/TryPop/TryPeek/TryDequeue/
-                        // Clear/Drain only). The generous member-surface union
-                        // above admits the name because a sibling family has
-                        // it, so the call was accepted and dropped at lowering
-                        // (#3079). Same diagnostic shape as the surface check.
-                        else if (m == "Remove" &&
-                                 (colName == "Stack" || colName == "Queue" ||
-                                  colName == "OwningStack" ||
-                                  colName == "OwningQueue")) {
-                            ctx_.diagnostics().report(
-                                Severity::Error, ce.span.begin,
-                                std::string("no member `Remove` on `") +
-                                std::string(colName) +
-                                "<T>` (§22.5 / §4.11) — it is not part of this "
-                                "collection's method surface");
-                        }
+                        // Clear/Drain only).
+                        //
+                        // fix #8331 (stdlib §4.11, v0.355): the REJECT half is
+                        // DELETED — the per-head surface gate above refuses
+                        // `Remove` on these four heads from the stdlib's own
+                        // per-head table, with the documented-surface
+                        // diagnostic. The generous member-surface union this
+                        // arm used to correct is gone with the union itself:
+                        // the union admitted the name because a SIBLING family
+                        // has it.
                         // per §3: Contains → bool, IndexOf → int
                         // per §4.10 stdlib: TryAdd(item: T): bool
                         // §4.11/§4.12 (#725): Stack.TryPop/TryPeek,
@@ -15298,28 +15215,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 else
                                     ctx_.setExprType(&ce,
                                                      ctx_.primitiveTypeRef(P::Int));
-                            } else {
-                                // Stack/Queue/Set/LinkedList and their owning
-                                // twins, plus SortedSet — none declares
-                                // `IndexOf`. Emit the diagnostic HERE so the
-                                // user sees the precise "no member" wording
-                                // with the §4.x citation on the call line
-                                // (§6c: loud, located, not the silent zero).
-                                // SortedSet has its own reject above for the
-                                // same name; this branch covers the rest.
-                                ctx_.diagnostics().report(
-                                    Severity::Error, ce.span.begin,
-                                    std::string("no member `IndexOf` on `") +
-                                    std::string(colName) +
-                                    "<T>` (stdlib §22.5 / §4.x) — `IndexOf` "
-                                    "is declared only by `Array<T>` (§4.4) "
-                                    "and `OwningArray<T>` (§4.5); for "
-                                    "membership testing on the unordered "
-                                    "set/queue/stack/linked-list families "
-                                    "use `Contains`, and for an index on an "
-                                    "ordered source materialize it as "
-                                    "`s.ToArray()` first");
                             }
+                            // fix #8331 (stdlib §4.4/§4.5, §4.6/§4.7/§4.10/
+                            // §4.11/§4.18, v0.355): the REJECT half of #3765
+                            // is DELETED — the per-head surface gate above
+                            // refuses `IndexOf` on every head that does not
+                            // declare it (stdlib §4.4's `Array<T>` and §4.5's
+                            // `OwningArray<T>` declare it; §4.6/§4.7/§4.10/
+                            // §4.11/§4.18's do not), with the
+                            // documented-surface diagnostic, and the same for
+                            // the NON-isArrLike receivers
+                            // (`Dictionary`/`SortedDictionary`/`FrozenArray`),
+                            // which this arm never reached.
                         }
                         // fix #7671 (stdlib §4.4, v0.350): `Array<T>` declares
                         // `public method LastIndexOf(item: T): int;` ("last
@@ -15356,15 +15263,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     " argument(s) on `Array<T>` (stdlib "
                                     "§4.4): `LastIndexOf` takes exactly one "
                                     "argument, `item: T`");
-                            } else {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, ce.span.begin,
-                                    std::string("no member `LastIndexOf` on `") +
-                                    std::string(colName) +
-                                    "<T>` (stdlib §22.5 / §4.x) — "
-                                    "`LastIndexOf` is declared only by "
-                                    "`Array<T>` (§4.4)");
                             }
+                            // fix #8331 (stdlib §4.4, v0.355): the REJECT
+                            // half of #7671 is DELETED — the per-head surface
+                            // gate above refuses `LastIndexOf` on every head
+                            // but `Array<T>` (stdlib §4.4 is the only section
+                            // that declares it) with the documented-surface
+                            // diagnostic.
                         }
                         // per §5 LINQ: Any/All → bool, Count(pred) → int
                         else if (m == "Any" || m == "All")
@@ -35042,75 +34947,97 @@ static bool builtinCollectionSurfaceDeclaresMember(const TypeRef* recvTy,
 // (spec §8.1) are not listed either, as in the interface table: they are
 // not what the stdlib §4 listing declares.
 //
-namespace {
-struct ConcreteCollectionSurface {
-    std::string_view head;
-    std::vector<std::string_view> members;
-};
-}  // namespace
-
+// fix #8331: the struct and the table's declaration live with `typeCall`,
+// the gate's only consumer, so the table and the gate that reads it cannot
+// drift apart.
 static const std::vector<ConcreteCollectionSurface>&
 concreteCollectionSurfaces() {
     // The owning forms' shared IOwningCollection<T> / IDisposable members are
     // spelled out in each row so a row reads as the stdlib's own declaration.
+    // fix #8331: the middle field is the stdlib section that DECLARES the
+    // row — the diagnostic names it, so the user is told which section to
+    // read (stdlib §4.4 / §4.5 / §4.6 / §4.7 / §4.8 / §4.9 / §4.10 / §4.11 /
+    // §4.17 / §4.18 / §4.19, v0.355).
+    //
+    // fix #8331: the FOURTH field is the head's COMPILER accessors — the
+    // members the compiler dispatches for it that no stdlib section declares
+    // (`Get(i)`, the array-storage read; the stdlib's element read is the
+    // indexer). They are per head and only where the compiler really
+    // dispatches a VALUE (measured on the base tree), so a head whose
+    // `Get(i)` degraded to a zero-initialized slot (#2434) or reached
+    // codegen's "no dispatch arm" backstop is NOT excused by them.
     static const std::vector<ConcreteCollectionSurface> kRows = {
-        {"Array",
+        {"Array", "4.4",
          {"Add", "AddRange", "AsReadOnlySpan", "AsSpan", "Capacity", "Clear",
           "Contains", "Count", "GetEnumerator", "IndexOf", "Insert",
           "IsReadOnly", "LastIndexOf", "Remove", "RemoveAt", "Reverse",
-          "Reversed", "Slice", "Sort", "Sorted", "ToArray"}},
-        {"Dictionary",
+          "Reversed", "Slice", "Sort", "Sorted", "ToArray"},
+         {"Get"}},
+        {"Dictionary", "4.8",
          {"Add", "Clear", "Contains", "ContainsKey", "Count", "GetEnumerator",
           "GetOrAdd", "GetOrNull", "IsReadOnly", "Keys", "Remove", "TryAdd",
-          "TryGetValue", "Values"}},
-        {"FrozenArray", {"GetEnumerator", "Length", "ToArray"}},
-        {"LinkedList",
+          "TryGetValue", "Values"},
+         {}},
+        {"FrozenArray", "4.19", {"GetEnumerator", "Length", "ToArray"}, {"Get"}},
+        {"LinkedList", "4.6",
          {"Add", "AddAfter", "AddBefore", "AddFirst", "AddLast", "Clear",
           "Contains", "Count", "Find", "First", "FirstNode", "GetEnumerator",
           "IsReadOnly", "Last", "LastNode", "Remove", "RemoveFirst",
-          "RemoveLast", "RemoveNode"}},
-        {"OwningArray",
+          "RemoveLast", "RemoveNode"},
+         {}},
+        {"OwningArray", "4.5",
          {"Add", "AddRange", "Capacity", "Clear", "Contains", "Count", "Dispose",
           "Drain", "GetEnumerator", "GetOwningEnumerator", "IndexOf", "Insert",
           "IsReadOnly", "PopAt", "PopFirst", "PopLast", "Remove", "RemoveAt",
-          "Reverse", "Sort", "TryPopFirst", "TryPopLast"}},
-        {"OwningDictionary",
+          "Reverse", "Sort", "TryPopFirst", "TryPopLast"},
+         {"Get"}},
+        {"OwningDictionary", "4.9",
          {"Add", "Clear", "Contains", "ContainsKey", "Count", "Dispose", "Drain",
           "GetOrAdd", "GetOrNull", "Keys", "PopValue", "Remove", "TryAdd",
-          "TryGetValue", "TryPopValue", "Values"}},
-        {"OwningLinkedList",
+          "TryGetValue", "TryPopValue", "Values"},
+         {}},
+        {"OwningLinkedList", "4.7",
          {"Add", "AddAfter", "AddBefore", "AddFirst", "AddLast", "Clear",
           "Contains", "Count", "Dispose", "Drain", "Find", "First", "FirstNode",
           "GetEnumerator", "IsReadOnly", "Last", "LastNode", "PopFirst",
           "PopLast", "Remove", "RemoveFirst", "RemoveLast", "RemoveNode",
-          "TryPopFirst", "TryPopLast"}},
-        {"OwningQueue",
+          "TryPopFirst", "TryPopLast"},
+         {}},
+        {"OwningQueue", "4.11",
          {"Clear", "Contains", "Count", "Dequeue", "Drain", "Enqueue",
-          "GetEnumerator", "Peek", "TryDequeue", "TryPeek"}},
-        {"OwningSet",
+          "GetEnumerator", "Peek", "TryDequeue", "TryPeek"},
+         {"Get"}},
+        {"OwningSet", "4.10",
          {"Add", "Clear", "Contains", "Count", "Dispose", "Drain", "ExceptWith",
           "GetEnumerator", "IntersectWith", "IsReadOnly", "IsSubsetOf",
-          "IsSupersetOf", "Pop", "Remove", "TryAdd", "TryPop", "UnionWith"}},
-        {"OwningStack",
+          "IsSupersetOf", "Pop", "Remove", "TryAdd", "TryPop", "UnionWith"},
+         {"Get"}},
+        {"OwningStack", "4.11",
          {"Clear", "Contains", "Count", "Drain", "GetEnumerator", "Peek", "Pop",
-          "Push", "TryPeek", "TryPop"}},
-        {"Queue",
+          "Push", "TryPeek", "TryPop"},
+         {"Get"}},
+        {"Queue", "4.11",
          {"Clear", "Contains", "Count", "Dequeue", "Enqueue", "GetEnumerator",
-          "Peek", "TryDequeue", "TryPeek"}},
-        {"Set",
+          "Peek", "TryDequeue", "TryPeek"},
+         {"Get"}},
+        {"Set", "4.10",
          {"Add", "Clear", "Contains", "Count", "ExceptWith", "GetEnumerator",
           "IntersectWith", "IsReadOnly", "IsSubsetOf", "IsSupersetOf", "Remove",
-          "TryAdd", "UnionWith"}},
-        {"SortedDictionary",
+          "TryAdd", "UnionWith"},
+         {}},
+        {"SortedDictionary", "4.17",
          {"Add", "Clear", "Contains", "ContainsKey", "Count", "FirstKey",
           "GetEnumerator", "GetOrNull", "LastKey", "Remove", "TryAdd",
-          "TryGetValue"}},
-        {"SortedSet",
+          "TryGetValue"},
+         {}},
+        {"SortedSet", "4.18",
          {"Add", "Clear", "Contains", "Count", "First", "GetEnumerator", "Last",
-          "Remove", "TryAdd"}},
-        {"Stack",
+          "Remove", "TryAdd"},
+         {}},
+        {"Stack", "4.11",
          {"Clear", "Contains", "Count", "GetEnumerator", "Peek", "Pop", "Push",
-          "TryPeek", "TryPop"}},
+          "TryPeek", "TryPop"},
+         {"Get"}},
     };
     return kRows;
 }
@@ -35125,6 +35052,157 @@ static bool isDocumentedConcreteCollectionMember(std::string_view head,
                row.members.end();
     }
     return false;
+}
+
+// fix #8331 (stdlib §4.4-§4.11, §4.17-§4.19, v0.355): the head's COMPILER
+// accessors — the members the compiler dispatches for it that no stdlib
+// section declares (`Get(i)`, the array-storage read). Read from the SAME
+// row, so the accessor list cannot drift from the head it belongs to.
+//
+// These are NOT part of the head's documented surface: the diagnostic's
+// quoted list is `members` alone, so a list that claims to be the stdlib's
+// documented one never carries an undeclared name (issue #8333's lesson).
+static bool isCompilerDispatchedCollectionAccessor(std::string_view head,
+                                                   std::string_view member) {
+    for (const auto& row : concreteCollectionSurfaces()) {
+        if (row.head != head) continue;
+        return std::find(row.compilerAccessors.begin(),
+                         row.compilerAccessors.end(),
+                         member) != row.compilerAccessors.end();
+    }
+    return false;
+}
+
+// fix #8331 (stdlib §4.4-§4.11, §4.17-§4.19, v0.355): the table's ROW for
+// `head` — the one authority the gate and the diagnostic both read.
+static const ConcreteCollectionSurface* concreteCollectionSurfaceRow(
+    std::string_view head) {
+    for (const auto& row : concreteCollectionSurfaces()) {
+        if (row.head == head) return &row;
+    }
+    return nullptr;
+}
+
+// fix #8331 (stdlib §4.4-§4.11, §4.17-§4.19, v0.355): the head's documented
+// surface as the "/"-joined list the diagnostic quotes — GENERATED from the
+// row the gate reads, so the message and the gate can never disagree.
+//
+// Issue #8333 is the lesson: the predecessor's codegen gate quoted a
+// hand-copied surface list that omitted `Add`, `Count` and `TryAdd` for
+// `SortedDictionary` — members stdlib §4.17 DOES declare. A list that is
+// generated cannot drift from the table it claims to quote.
+//
+// The list is SORTED, so the message is deterministic (the rows are stored
+// in the stdlib's own declaration order, which is not alphabetical).
+static std::string concreteCollectionSurfaceList(std::string_view head) {
+    const ConcreteCollectionSurface* row = concreteCollectionSurfaceRow(head);
+    if (!row) return {};
+    std::vector<std::string_view> names = row->members;
+    std::sort(names.begin(), names.end());
+    std::string out;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (i) out += '/';
+        out += names[i];
+    }
+    return out;
+}
+
+// fix #8331 (stdlib §1 *Block-by-name*, §4.4-§4.11, §4.17-§4.19, v0.355):
+// may `member` be CALLED on the concrete built-in collection head `head`?
+//
+// The head's OWN documented surface answers it (the per-head table): stdlib
+// §1's Block-by-name rule makes a member a type does not declare NOT a
+// member of that type at all, so a call naming it is an error.
+//
+// Four families of names are exempt, because they are members of the head
+// by another authority:
+//   * the universal `Object` members (language spec §8.1) — every value
+//     carries them;
+//   * `Dispose()` (language spec §8.7) — a member of every class type;
+//   * stdlib §5's `extension IEnumerable<T>` operators — the LINQ surface
+//     every one of these heads reaches through its `IEnumerable<T>`
+//     conformance (stdlib §4.12). The whole DOCUMENTED §5 name set is
+//     exempt, read from the same table the §5 arity gate reads
+//     (`kStdlibLinqOverloads`), not the narrower "names the compiler
+//     dispatches structurally" list;
+//   * the head's COMPILER accessors (`Get(i)` on the array-backed heads) —
+//     the compiler dispatches them to a value although no stdlib section
+//     declares them, and the shipped corpus reads elements through them.
+static bool concreteCollectionCallSurfaceAdmits(std::string_view head,
+                                                std::string_view member) {
+    if (isDocumentedConcreteCollectionMember(head, member)) return true;
+    if (isCompilerDispatchedCollectionAccessor(head, member)) return true;
+    if (member == "ToString" || member == "Equals" ||
+        member == "GetHashCode" || member == "GetType" ||
+        member == "ReferenceEquals")
+        return true;
+    if (member == "Dispose") return true;
+    if (isDocumentedStdlibLinqOperatorName(member)) return true;
+    // fix #3559 / #3710 (stdlib §5, v0.284-0.285): `OfType<U>()` was
+    // REMOVED from stdlib §5 and its DEDICATED removal diagnostic (the
+    // v0.284-removal wording, `ofTypeRemovedMessage`) owns that name. The
+    // name is deliberately NOT in the §5 operator table, so it is not
+    // admitted as a §5 operator; it is admitted HERE so this gate does not
+    // shadow the removal wording with a generic "not part of the surface"
+    // sentence — the same precedence `.Set()` and `.DisposeElements()` keep
+    // below.
+    if (member == "OfType") return true;
+    return false;
+}
+
+// fix #8331 (stdlib §4.5, v0.355): the (head, member) pairs whose refusal
+// has a DEDICATED diagnostic that says WHY and names the remedy — the gate
+// must not shadow them with the generic "not part of the documented surface"
+// sentence.
+//
+// stdlib §4.5's `OwningArray<T>` declares no copy-form (`Reversed`/
+// `Sorted`): unique ownership makes a shallow copy unsound (two owners of
+// the same element, §28.3). The dedicated diagnostic says exactly that and
+// points at the remedy (`ToArray()` first), so it must remain the authority
+// — `tests/codegen/owningarray_sort_constraint_gate_3325_test.cpp` pins that
+// the ownership reason (not element comparability) is the one the user sees.
+//
+// The gate DEFERS on these pairs: it does not report and does not return, so
+// the dedicated diagnostic further down the collection-typing chain fires.
+static bool concreteCollectionCallHasDedicatedDiagnostic(
+    std::string_view head, std::string_view member) {
+    if (head == "OwningArray" &&
+        (member == "Reversed" || member == "Sorted"))
+        return true;
+    return false;
+}
+
+// fix #8331 (stdlib §4.4-§4.11, §4.17-§4.19, v0.355): the receiver's
+// stdlib collection head, for the per-head surface gate — empty when the
+// receiver is not one of the table's heads.
+//
+// THREE shapes carry a built-in collection head:
+//   * the declaration-less Named with an AST node (`Array<int>`, the shape
+//     every §4 heap collection carries);
+//   * the declaration-less Named whose head is an alias-resolved head
+//     (`type OA := OwningArray<R>` — §27.8's transparent alias);
+//   * the compiler's builtin-class STUB (`FrozenArray<T>.From(...)`'s result,
+//     stdlib §4.19: `declaration = builtinClassSym("FrozenArray")` and NO
+//     astNode) — the head is the SYMBOL's name.
+//
+// A USER type that reuses a head's name is NOT a built-in head: it carries
+// an AST declaration (or a module), so it is excluded here and the gate
+// never fires on it.
+static std::string_view concreteCollectionReceiverHead(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return {};
+    std::string_view head;
+    if (t->declaration) {
+        // The builtin-class STUB. A user-declared type (its own AST node) or
+        // an imported one (a module) is not a compiler built-in.
+        if (t->declaration->decl || !t->declaration->moduleName.empty())
+            return {};
+        head = t->declaration->name;
+    } else {
+        head = t->headName();
+    }
+    if (head.empty()) return {};
+    if (!concreteCollectionSurfaceRow(head)) return {};
+    return head;
 }
 
 // fix #7700 (§26.5 rule 1, v0.350): the receiver is a concrete built-in

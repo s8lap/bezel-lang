@@ -1,6 +1,15 @@
 // Regression tests for #8009 -- an `owned` OWNING COLLECTION returned from a
 // static method, then used as a chain root, LEAKED THE COLLECTION.
 //
+// UPDATED BY fix #8331 (stdlib §4.11, v0.355): the two rows that filled an
+// `OwningStack<T>` / `OwningQueue<T>` now use the member those heads
+// DECLARE (`Push` / `Enqueue`). They used `Add`, which stdlib §4.11 does
+// NOT declare for them (`Stack<T>`/`Queue<T>` and their owning forms conform
+// to `IReadOnlyCollection<T>` only — the push/enqueue spelling is theirs);
+// the compiler admitted `Add` on them through the old SHARED name list, and
+// #8331's per-head surface table refuses it. The rows' MEASUREMENT (the leak
+// census over a 100-iteration chain) is unchanged.
+//
 // The #7906 fix (`ee76372b`) disposed a fresh owned built-in CHAIN ROOT at the
 // §28.3 K8.1 boundary, but its covered set is the NAME-KEYED release table
 // (`vtablelessBuiltinReleaseIsKnown` -> `classifyVtablelessBuiltinRelease`,
@@ -204,7 +213,7 @@ end Cell;
 class C
   public static method Mk(): owned OwningStack<Cell>
     var s := new OwningStack<Cell>();
-    s.Add(new Cell());
+    s.Push(new Cell());
     return s;
   end Mk;
   public static method Main(): int
@@ -228,7 +237,7 @@ end Cell;
 class C
   public static method Mk(): owned OwningQueue<Cell>
     var s := new OwningQueue<Cell>();
-    s.Add(new Cell());
+    s.Enqueue(new Cell());
     return s;
   end Mk;
   public static method Main(): int
