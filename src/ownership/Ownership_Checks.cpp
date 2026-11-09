@@ -2277,6 +2277,16 @@ void MethodOwnership::markCaseExprOwnedScrutineeInStmt(const ast::Stmt& s) {
     markOnlyCaseWalk_ = saved;
 }
 
+// fix #7859 (§15.3 *Parameter passing*, §25.2, v0.355): FORWARD DECLARATION.
+// `moveOnlyArgIsConsumed` is defined further down this file, under its own
+// §15.3 / §22.3 / §25.2 comment header (#4803), but `handleDischarge` — the
+// BARE-STATEMENT call/constructor argument path — now consults it for the
+// §25.2 `Equals(T)` borrow carve, and it sits ABOVE that definition. The
+// definition itself is UNCHANGED and remains the single one; this is only a
+// declaration, so the two sites cannot drift.
+static bool moveOnlyArgIsConsumed(const ast::Expr* callee,
+                                  const ast::CallArgument& a);
+
 void MethodOwnership::handleDischarge(const ast::Expr& e) {
     // §31.1 / §28.8 / §17.12 (issue #406): a `throw` in EXPRESSION position
     // (`x ?? throw new Wrap(b)`, `case ... => throw new Wrap(b)`) is a
@@ -2958,6 +2968,36 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                         long long moSize = 0;
                         if (isMoveOnlyInlineArrayType(pt, moSize))
                             noteMoveOnlyArrayWholeMoveRead(*a.value);
+                        // fix #7859 (§15.3 *Parameter passing*, §25.2, v0.355): the
+                        // OWNING-CHOICE twin of the inline-array note above, on
+                        // the BARE-STATEMENT call path. #5436 added the choice
+                        // twin to the two BOUND argument gates
+                        // (`recordMovesInArgs` and `recordMovesIn`'s
+                        // `new T(...)` arm) but never to this one, so an
+                        // owning-choice local stayed live after a
+                        // statement-position call took it:
+                        // `Sink.Take(o!); var n := o;` compiled with no
+                        // moved-from error (issue #7859). §15.3: "for a
+                        // move-only V, it is by value-move (transfer
+                        // ownership). The caller's argument expression is in
+                        // moved-from state after the call." — and §17.8 makes
+                        // the `!` spelling transparent ("Over a named owned
+                        // binding, `x!` is therefore classified by its position
+                        // exactly as the bare read `x` is"), so the bare twin
+                        // `Sink.Take(o);` is the same rule.
+                        //
+                        // THE §25.2 CARVE. §15.3's own bullet EXCLUDES the
+                        // comparison surface's `Equals(T)` parameter ("bind
+                        // borrows — §25.2"), and §25.2: "`a.Equals(b)`
+                        // consumes neither value." So a `ref` / `out` argument
+                        // and an `Equals` argument are NOT by-value-moves and
+                        // must NOT be marked moved-from. `moveOnlyArgIsConsumed`
+                        // is the repo's own predicate for exactly that question
+                        // (#4803) — the same one `rejectMoveOnlyFieldReadArg`
+                        // and `recordMovesIn`'s `owned`-argument arms consult.
+                        // // per §15.3 *Parameter passing*, §25.2
+                        if (pt && moveOnlyArgIsConsumed(call->callee.get(), a))
+                            noteOwningChoiceWholeMoveRead(*a.value);
                     }
                 }
             }
@@ -3353,6 +3393,18 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                         long long moSize = 0;
                         if (isMoveOnlyInlineArrayType(pt, moSize))
                             noteMoveOnlyArrayWholeMoveRead(*a.value);
+                        // fix #7859 (§15.3 *Parameter passing*, §25.2, v0.355): the
+                        // bare-statement CONSTRUCTOR twin of the note above —
+                        // `new Holder(o!); var n := o;` is the same §15.3
+                        // by-value-move as the call twin (and the same defect:
+                        // #5436 never reached this site either). A constructor
+                        // call has NO callee expression, so the §25.2 carve is
+                        // consulted with a null callee — the repo's own
+                        // precedent for that shape is
+                        // `moveOnlyArgIsConsumed(nullptr, a)` in `recordMovesIn`'s
+                        // `new T(...)` arm. // per §15.3 *Parameter passing*, §25.2
+                        if (pt && moveOnlyArgIsConsumed(nullptr, a))
+                            noteOwningChoiceWholeMoveRead(*a.value);
                     }
                 }
             }
