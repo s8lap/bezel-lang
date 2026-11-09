@@ -48012,10 +48012,10 @@ bool Emitter::isUserMethodObjectStringReturnCall(const ast::Expr* init) const {
 
 // #429 (box FIELD-STORE / disposal) / §8.6 / §28.9: see the declaration in
 // LlvmBackend_impl.hpp. For every class TypeSymbol, find all Object/interface-
-// typed instance fields and auto-properties. Then scan EVERY method and
-// constructor body of that class for AssignmentStmt stores (:=) to those
-// fields. Additionally, check each field's own AST initializer (FieldDecl /
-// PropertyDecl autoInitializer). A field is added to boxStorageFields_ ONLY if:
+// typed instance fields and auto-properties. Then scan EVERY body the module
+// compiles for AssignmentStmt stores (:=) to those fields. Additionally,
+// check each field's own AST initializer (FieldDecl / PropertyDecl
+// autoInitializer). A field is added to boxStorageFields_ ONLY if:
 //   (a) every such store has a BOXABLE VALUE source type (isBoxableValueType or
 //       isNullableValueTy on ctx_.exprType(*valueExpr)); OR
 //   (b) the store is a call to a box-return method (isUserMethodBoxReturnCall) —
@@ -48023,6 +48023,32 @@ bool Emitter::isUserMethodObjectStringReturnCall(const ast::Expr* init) const {
 // A field that receives ANY class-reference store (a reference source type) is
 // excluded. This guarantees that bz_box_release in emitDisposerCore never fires
 // for an Object field that might hold a class instance.
+//
+// THE VERDICT IS A JOIN OVER EVERY WRITE TO THE FIELD. That is what makes it
+// answer BOTH questions the field's box-ness raises:
+//   (i)  the DISPOSAL question — "may the owner's disposer release this field
+//        as a box at scope end?"; and
+//   (ii) the STORE question — "is the DISPLACED value at this `:=` a box?"
+//        (the store site's `emitBoxRelease(oldVal)`, see #8344).
+// A join over all writes implies (i) and (ii) alike: the slot can only ever
+// hold a box (or null), so the value a store displaces is a box (or null —
+// `bz_box_release` is null-safe). A field the join does NOT admit may hold a
+// class instance, a string or a value of unknown provenance at some point, so
+// neither the disposer nor a store site may release it as a box.
+//
+// fix #8216 (§28.9, v0.355): the scan now reaches EVERY body the module
+// compiles. Two families were invisible to it, and a field that receives such
+// a store stayed "box-only" — so the disposer released a CLASS INSTANCE as a
+// box ("bezel: fatal: refcount over-release (box)", rc=134; and a
+// heap-use-after-free in the generated DisposeCore):
+//   (1) a store made from a LAMBDA BODY — the closure runs, so the store
+//       happens;
+//   (2) a store made from ANOTHER CLASS'S DESTRUCTOR — the destructor runs
+//       while the field's owner is alive.
+// The scan therefore descends into expressions (a lambda can appear in a
+// local initializer, a call argument, a `case` arm, a binding atom, …) and
+// walks the destructors of every local class, not only a class's own.
+//
 // NOTE: this pre-pass only runs the STATIC analysis. lowerBoxFieldStore also
 // adds to boxStorageFields_ at emission time (for fields that pass isBoxFieldLvalue
 // during lowering), but the pre-pass is the authoritative gate: a field is only
@@ -48048,186 +48074,391 @@ void Emitter::collectBoxStorageFields() {
             if (!acc.stmts.empty()) accessorBodies.push_back(&acc.stmts);
     }
 
-    // For each class, collect its Object/interface instance field symbols.
+    // fix #8216 (§28.9, v0.355): the DESTRUCTOR bodies of EVERY local class,
+    // collected once. A destructor of ANOTHER class stores into a field just
+    // as well as the field's own class's members do — the destructor runs
+    // while the field's owner is still alive, and the store it makes is a
+    // store the program makes. MEASURED on the base: with only the field's
+    // OWN class's destructor scanned, a `Holder.o` that another class's
+    // destructor filled with a class instance stayed "box-only", and the
+    // holder's disposer called `bz_box_release` on the class instance — an
+    // ASan heap-use-after-free in the generated `DisposeCore` (the instance
+    // was FREED as if it were a box).
+    std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*> destructorBodies;
+    for (auto& asym : ctx_.symbols()) {
+        if (ctx_.isImported(asym.get())) continue;
+        // SEAM-ACCESSOR: same reason as the accessor loop just above. #3152
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(asym.get());
+        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        for (const sema::Symbol* m : ts->members) {
+            // fix #8216 (§28.9, v0.355): a destructor is a `sema::
+            // DestructorSymbol` — NOT a `sema::MethodSymbol`
+            // (src/sema/Symbol.hpp: `struct DestructorSymbol : MemberSymbol
+            // {}`), so the pre-fix scan, which asked for a MethodSymbol and
+            // then dynamic_cast its `decl` to a DestructorDecl, NEVER MATCHED:
+            // NO destructor body was scanned at all, not even the field's own
+            // class's. That is the whole of the h17 hole.
+            auto* ds = dynamic_cast<const sema::DestructorSymbol*>(m);
+            if (!ds) continue;
+            auto* dd = dynamic_cast<const ast::DestructorDecl*>(ds->decl);
+            if (!dd) continue;
+            destructorBodies.push_back(&dd->body);
+        }
+    }
+
+    // PHASE 1 — the candidate fields: every Object/interface-typed instance
+    // field and auto-property of every class compiled in this module.
+    //
+    // #3152: the AST-ONLY predicate is correct HERE, not an oversight —
+    // `ctx_.symbols()` holds only the module being compiled
+    // (`importedSymbols_` is a separate list, SemaContext.hpp :225), so `ts`
+    // is always local and every member of it has a decl. The two answers
+    // coincide; the AST-only one says so.
+    //
+    // The map is keyed by the SYMBOL (not by a void*) so that the initializer
+    // phase can reach the declaration through the same entry.
+    std::unordered_map<const sema::Symbol*, bool> ok;
     for (auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
         if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
-
-        // Collect candidate fields: Object/interface typed instance fields.
-        // #3152: the AST-ONLY predicate is correct HERE, not an oversight —
-        // the loop above iterates `ctx_.symbols()`, which holds only the module
-        // being compiled (`importedSymbols_` is a separate list, SemaContext.hpp
-        // :225), so `ts` is always local and every member of it has a decl. The
-        // two answers coincide; the AST-only one says so.
-        std::vector<const sema::Symbol*> candidates;
         for (const sema::Symbol* m : ts->members) {
             bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
             if (!isField && !sema::hasAstAutoPropertyDecl(m)) continue;
             if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
             const sema::TypeRef* ft = recordMemberType(m);
             if (!ft || !isObjectOrInterfaceTarget(ft)) continue;
-            candidates.push_back(m);
+            ok[m] = true;   // "box only" until a store says otherwise
         }
-        if (candidates.empty()) continue;
+    }
+    if (ok.empty()) return;
 
-        // Track which candidates are still "box only" (start as true).
-        std::unordered_map<const void*, bool> ok;
-        for (const sema::Symbol* m : candidates)
-            ok[static_cast<const void*>(m)] = true;
+    // Helper: check a store to an Object/interface field — if the source
+    // type is NOT boxable (and not a box-return call), mark it non-box.
+    auto checkStore = [&](const ast::Expr* target, const ast::Expr* val) {
+        if (!target || !val) return;
+        sema::Symbol* fsym = ctx_.exprSymbol(*target);
+        if (!fsym) return;
+        auto it = ok.find(fsym);
+        if (it == ok.end()) return;  // not a candidate field
+        if (!it->second) return;     // already excluded
+        // fix-forward #7968 (§8.6 / §28.9, v0.355): a `null` literal
+        // store puts no class instance in the field, so it cannot make a
+        // `bz_box_release` at disposal unsound (the release is
+        // null-safe). It is NEUTRAL here. Excluding the field for it
+        // (a constructor's `o := null`) leaked the last box the field
+        // was later given: `lowerBoxFieldStore` no longer re-admits a
+        // field this pre-pass excluded.
+        if (dynamic_cast<const ast::NullLiteralExpr*>(val)) return;
+        const sema::TypeRef* srcTy = ctx_.exprType(*val);
+        if (!srcTy) { it->second = false; return; }
+        bool isBoxableSource =
+            isBoxableValueType(srcTy) || isNullableValueTy(srcTy);
+        bool isBoxReturnCall = isUserMethodBoxReturnCall(val);
+        if (!isBoxableSource && !isBoxReturnCall)
+            it->second = false;
+    };
 
-        // Helper: check a store to an Object/interface field — if the source
-        // type is NOT boxable (and not a box-return call), mark it non-box.
-        auto checkStore = [&](const ast::Expr* target, const ast::Expr* val) {
-            if (!target || !val) return;
-            sema::Symbol* fsym = ctx_.exprSymbol(*target);
-            if (!fsym) return;
-            auto it = ok.find(static_cast<const void*>(fsym));
-            if (it == ok.end()) return;  // not a candidate field
-            if (!it->second) return;     // already excluded
-            // fix-forward #7968 (§8.6 / §28.9, v0.355): a `null` literal
-            // store puts no class instance in the field, so it cannot make a
-            // `bz_box_release` at disposal unsound (the release is
-            // null-safe). It is NEUTRAL here. Excluding the field for it
-            // (a constructor's `o := null`) leaked the last box the field
-            // was later given: `lowerBoxFieldStore` no longer re-admits a
-            // field this pre-pass excluded.
-            if (dynamic_cast<const ast::NullLiteralExpr*>(val)) return;
-            const sema::TypeRef* srcTy = ctx_.exprType(*val);
-            if (!srcTy) { it->second = false; return; }
-            bool isBoxableSource =
-                isBoxableValueType(srcTy) || isNullableValueTy(srcTy);
-            bool isBoxReturnCall = isUserMethodBoxReturnCall(val);
-            if (!isBoxableSource && !isBoxReturnCall)
-                it->second = false;
-        };
-
-        // Recursive statement scanner for stores.
-        std::function<void(const ast::Stmt*)> scanStmt;
-        scanStmt = [&](const ast::Stmt* s) {
-            if (!s) return;
-            if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
-                if (as->op == ":=" && as->target && as->value)
-                    checkStore(as->target.get(), as->value.get());
+    // PHASE 2 — the recursive scanner for stores.
+    //
+    // fix #8216 (§28.9, v0.355): the scan reaches EVERY store the program can
+    // make, so it descends into the EXPRESSION forms as well: a lambda (whose
+    // body carries statements) can appear in a local initializer, a call
+    // argument, a `case` arm, a binding atom, … and the store its body makes
+    // is a store the program makes.
+    //
+    // The statement forms enumerated below are the whole `ast::Stmt` family
+    // that can carry an expression or a nested body (BreakStmt /
+    // ContinueStmt / LocalTypeDecl carry neither). The expression forms are
+    // the whole `ast::Expr` family that can carry a nested expression or a
+    // statement list; the remaining ones are literals.
+    std::function<void(const ast::Stmt*)> scanStmt;
+    std::function<void(const ast::Expr*)> scanExpr;
+    scanStmt = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            if (as->op == ":=" && as->target && as->value)
+                checkStore(as->target.get(), as->value.get());
+            scanExpr(as->target.get());
+            scanExpr(as->value.get());
+            return;
+        }
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            scanExpr(ld->initializer.get());
+            return;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            scanExpr(lc->value.get());
+            return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            scanExpr(es->expr.get());
+            return;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            scanExpr(rs->value.get());
+            return;
+        }
+        if (auto* ts3 = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            scanExpr(ts3->value.get());
+            return;
+        }
+        if (auto* dsc = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            scanExpr(dsc->value.get());
+            return;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            scanExpr(ys->value.get());
+            return;
+        }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            scanExpr(inc->target.get());
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            scanExpr(is->ifBranch.condition.get());
+            for (auto& b : is->ifBranch.body) scanStmt(b.get());
+            for (auto& br : is->elifBranches) {
+                scanExpr(br.condition.get());
+                for (auto& b : br.body) scanStmt(b.get());
             }
-            if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
-                for (auto& b : is->ifBranch.body) scanStmt(b.get());
-                for (auto& br : is->elifBranches)
-                    for (auto& b : br.body) scanStmt(b.get());
-                for (auto& b : is->elseBody) scanStmt(b.get());
-            } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
-                for (auto& b : ws->body) scanStmt(b.get());
-            } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
-                for (auto& b : fs->body) scanStmt(b.get());
-            } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
-                for (auto& b : d->body) scanStmt(b.get());
-            } else if (auto* ts2 = dynamic_cast<const ast::TryStmt*>(s)) {
-                for (auto& b : ts2->body) scanStmt(b.get());
-                for (auto& c : ts2->catches)
-                    if (c.body) scanStmt(c.body.get());
-                for (auto& b : ts2->finallyBody) scanStmt(b.get());
-            } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
-                for (auto& arm : cs->arms)
-                    for (auto& a : arm.stmts) scanStmt(a.get());
+            for (auto& b : is->elseBody) scanStmt(b.get());
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            scanExpr(ws->condition.get());
+            for (auto& b : ws->body) scanStmt(b.get());
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            scanExpr(fs->iterable.get());
+            scanExpr(fs->withExpr.get());
+            for (auto& b : fs->body) scanStmt(b.get());
+            return;
+        }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scanStmt(b.get());
+            return;
+        }
+        if (auto* ts2 = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts2->body) scanStmt(b.get());
+            for (auto& c : ts2->catches) {
+                scanExpr(c.guard.get());
+                if (c.body) scanStmt(c.body.get());
             }
-        };
-
-        // Check field initializers (AST FieldDecl / PropertyDecl initializer).
-        for (const sema::Symbol* m : candidates) {
-            const ast::Expr* init = nullptr;
-            // SEAM-ACCESSOR: see the note just above -- ts is local, so
-            // every m->decl here is always local. #3152
-            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
-                init = fd->initializer.get();
-            // SEAM-ACCESSOR: same reason as the FieldDecl arm just above.
-            else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
-                init = pd->autoInitializer.get();
-            if (!init) continue;  // no initializer → calloc-zeroed null → OK
-            // fix-forward #7968: a `:= null` initializer is the same zeroed
-            // null — neutral, exactly as in `checkStore` above.
-            if (dynamic_cast<const ast::NullLiteralExpr*>(init)) continue;
-            // Synthesize a check: the "target" symbol is m, the "source" is
-            // init. We check the init directly.
-            auto it = ok.find(static_cast<const void*>(m));
-            if (!it->second) continue;
-            const sema::TypeRef* srcTy = ctx_.exprType(*init);
-            if (!srcTy) { it->second = false; continue; }
-            bool isBoxableSource =
-                isBoxableValueType(srcTy) || isNullableValueTy(srcTy);
-            bool isBoxReturnCall = isUserMethodBoxReturnCall(init);
-            if (!isBoxableSource && !isBoxReturnCall)
-                it->second = false;
+            for (auto& b : ts2->finallyBody) scanStmt(b.get());
+            return;
         }
-
-        // Check all method bodies for stores to these fields.
-        //
-        // fix #7968 (§26.7 / §28.9, v0.355): an EXTENSION method's body is
-        // scanned too. An extension method has a NULL `parent` (fix #2328:
-        // "extension methods have a null `ms->parent`"), so the
-        // `msym->parent != ts` gate below skipped every extension body — and
-        // an extension body can store into ANY class's field (`extension
-        // Object { method Stash(h: H) h.o := v; end }` writes `H`'s field).
-        // The store path (`isBoxFieldLvalue` / `lowerBoxFieldStore`) correctly
-        // classified such a store as a CLASS-REFERENCE source (no retain, no
-        // release), but this pre-pass never saw it, so the field stayed
-        // "box-only" and the disposer called `bz_box_release` on a class
-        // instance — MEASURED on the base: "bezel: fatal: refcount
-        // over-release (box) — two releases for one reference; terminating per
-        // §28.9" (rc=134), because a class instance's offset 8 is its
-        // disposed-flag word, not a box refcount (src/runtime/bezel_runtime.h
-        // : "these helpers are NEVER handed a class instance").
-        //
-        // fix-forward #7968: the hole is not extension-specific. A method or
-        // constructor of ANOTHER class reaches the field just as well
-        // (`static method Put(h: Holder, b: Box) h.o := b;` in class
-        // `Other`) — MEASURED: such a store made the disposer run
-        // `bz_box_release` on the `Box` instance and corrupt its field (it
-        // printed 6 for a `v := 7`). So EVERY locally compiled method and
-        // constructor body is scanned, whatever its parent.
-        //
-        // The scan stays PRECISE per field: `checkStore` keys on the store
-        // TARGET's symbol, so a store into a field of another class is
-        // ignored by this class's loop and the verdict for a given field
-        // depends only on the SOURCE TYPE of each store that reaches it. A
-        // body that stores a BOXABLE value leaves the field box-only; one
-        // that stores a class reference excludes it, which is the sound
-        // direction (the field is then not released as a box).
-        for (auto& [msym, fn] : methodFns_) {
-            if (ctx_.isImported(msym)) continue;
-            // SEAM-ACCESSOR: gated by the `if (ctx_.isImported(...)) continue;`
-            // line just above -- never reached for an imported symbol. #3152
-            auto* md = dynamic_cast<const ast::MethodDecl*>(msym->decl);
-            if (!md) continue;
-            for (auto& s : md->stmts) scanStmt(s.get());
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            scanExpr(cs->scrutinee.get());
+            for (auto& arm : cs->arms) {
+                scanExpr(arm.guard.get());
+                scanExpr(arm.exprBody.get());
+                for (auto& a : arm.stmts) scanStmt(a.get());
+            }
+            return;
         }
-
-        // Check all constructor bodies (of any class) for stores to these
-        // fields.
-        for (auto& [csym, fn] : ctorFns_) {
-            if (ctx_.isImported(csym)) continue;
-            // SEAM-ACCESSOR: gated by the `if (ctx_.isImported(...)) continue;`
-            // line just above -- never reached for an imported symbol. #3152
-            auto* cd = dynamic_cast<const ast::ConstructorDecl*>(csym->decl);
-            if (!cd) continue;
-            for (auto& s : cd->body) scanStmt(s.get());
+    };
+    scanExpr = [&](const ast::Expr* e) {
+        if (!e) return;
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            // fix #8216: a LAMBDA BODY is a body the program runs. The store
+            // it makes is a store the program makes, and the pre-pass has to
+            // see it or the field stays "box-only" and the disposer releases
+            // whatever the closure put there as a box. MEASURED on the base:
+            // "bezel: fatal: refcount over-release (box) — two releases for
+            // one reference; terminating per §28.9" (rc=134), the closure
+            // having stored a `StringBuilder` (a class instance) into the
+            // field.
+            scanExpr(lam->exprBody.get());
+            for (auto& st : lam->stmts) scanStmt(st.get());
+            return;
         }
-
-        // fix-forward #7968: every local property / indexer accessor body.
-        for (auto* body : accessorBodies)
-            for (auto& s : *body) scanStmt(s.get());
-
-        // Also scan the class's destructor if any.
-        for (const sema::Symbol* m : ts->members) {
-            auto* ds = dynamic_cast<const sema::MethodSymbol*>(m);
-            if (!ds) continue;
-            auto* dd = dynamic_cast<const ast::DestructorDecl*>(ds->decl);
-            if (!dd) continue;
-            for (auto& s : dd->body) scanStmt(s.get());
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            scanExpr(m->target.get());
+            return;
         }
-
-        // Add fields that survived as box-only to boxStorageFields_.
-        for (auto& [voidPtr, isOk] : ok) {
-            if (isOk) boxStorageFields_.insert(voidPtr);
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            scanExpr(m->target.get());
+            return;
         }
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            scanExpr(c->callee.get());
+            for (auto& a : c->args) scanExpr(a.value.get());
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            scanExpr(c->callee.get());
+            for (auto& a : c->args) scanExpr(a.value.get());
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            scanExpr(ix->target.get());
+            for (auto& a : ix->indices) scanExpr(a.value.get());
+            return;
+        }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            scanExpr(b->left.get());
+            scanExpr(b->right.get());
+            return;
+        }
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            scanExpr(u->operand.get());
+            scanExpr(u->replacement.get());
+            return;
+        }
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            scanExpr(p->operand.get());
+            return;
+        }
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            scanExpr(t->operand.get());
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            scanExpr(c->condition.get());
+            scanExpr(c->thenValue.get());
+            scanExpr(c->elseValue.get());
+            return;
+        }
+        if (auto* t = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            scanExpr(t->operand.get());
+            return;
+        }
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+            scanExpr(r->lo.get());
+            scanExpr(r->hi.get());
+            scanExpr(r->step.get());
+            return;
+        }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (auto& a : n->args) scanExpr(a.value.get());
+            return;
+        }
+        if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+            scanExpr(w->source.get());
+            for (auto& a : w->assigns) scanExpr(a.value.get());
+            return;
+        }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& el : cl->elements) scanExpr(el.get());
+            for (auto& k : cl->keys) scanExpr(k.get());
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : is->parts) scanExpr(part.expr.get());
+            return;
+        }
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+            scanExpr(ce->scrutinee.get());
+            for (auto& arm : ce->arms) {
+                scanExpr(arm.guard.get());
+                scanExpr(arm.exprBody.get());
+                for (auto& st : arm.stmts) scanStmt(st.get());
+            }
+            return;
+        }
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+            for (auto& c : bx->clauses) scanExpr(c->initializer.get());
+            scanExpr(bx->body.get());
+            return;
+        }
+        // Literals and the remaining leaf expression forms carry neither a
+        // nested expression nor a statement list.
+    };
+
+    // PHASE 3 — scan every body the module compiles.
+    //
+    // fix #7968 (§26.7 / §28.9, v0.355): an EXTENSION method's body is
+    // scanned too. An extension method has a NULL `parent` (fix #2328:
+    // "extension methods have a null `ms->parent`"), so the
+    // `msym->parent != ts` gate below skipped every extension body — and
+    // an extension body can store into ANY class's field (`extension
+    // Object { method Stash(h: H) h.o := v; end }` writes `H`'s field).
+    // The store path (`isBoxFieldLvalue` / `lowerBoxFieldStore`) correctly
+    // classified such a store as a CLASS-REFERENCE source (no retain, no
+    // release), but this pre-pass never saw it, so the field stayed
+    // "box-only" and the disposer called `bz_box_release` on a class
+    // instance — MEASURED on the base: "bezel: fatal: refcount
+    // over-release (box) — two releases for one reference; terminating per
+    // §28.9" (rc=134), because a class instance's offset 8 is its
+    // disposed-flag word, not a box refcount (src/runtime/bezel_runtime.h
+    // : "these helpers are NEVER handed a class instance").
+    //
+    // fix-forward #7968: the hole is not extension-specific. A method or
+    // constructor of ANOTHER class reaches the field just as well
+    // (`static method Put(h: Holder, b: Box) h.o := b;` in class
+    // `Other`) — MEASURED: such a store made the disposer run
+    // `bz_box_release` on the `Box` instance and corrupt its field (it
+    // printed 6 for a `v := 7`). So EVERY locally compiled method and
+    // constructor body is scanned, whatever its parent.
+    //
+    // The scan stays PRECISE per field: `checkStore` keys on the store
+    // TARGET's symbol, so a store into a field of another class is
+    // ignored by that field's own verdict, and the verdict for a given
+    // field depends only on the SOURCE TYPE of each store that reaches it.
+    // A body that stores a BOXABLE value leaves the field box-only; one
+    // that stores a class reference excludes it, which is the sound
+    // direction (the field is then not released as a box).
+    for (auto& [msym, fn] : methodFns_) {
+        if (ctx_.isImported(msym)) continue;
+        // SEAM-ACCESSOR: gated by the `if (ctx_.isImported(...)) continue;`
+        // line just above -- never reached for an imported symbol. #3152
+        auto* md = dynamic_cast<const ast::MethodDecl*>(msym->decl);
+        if (!md) continue;
+        for (auto& s : md->stmts) scanStmt(s.get());
+    }
+
+    // Check all constructor bodies (of any class) for stores to these fields.
+    for (auto& [csym, fn] : ctorFns_) {
+        if (ctx_.isImported(csym)) continue;
+        // SEAM-ACCESSOR: gated by the `if (ctx_.isImported(...)) continue;`
+        // line just above -- never reached for an imported symbol. #3152
+        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(csym->decl);
+        if (!cd) continue;
+        for (auto& s : cd->body) scanStmt(s.get());
+    }
+
+    // fix-forward #7968: every local property / indexer accessor body.
+    for (auto* body : accessorBodies)
+        for (auto& s : *body) scanStmt(s.get());
+
+    // fix #8216: every local class's DESTRUCTOR body — not only the field's
+    // own class's (see the note at the collection site above).
+    for (auto* body : destructorBodies)
+        for (auto& s : *body) scanStmt(s.get());
+
+    // PHASE 4 — the field initializers (AST FieldDecl / PropertyDecl
+    // initializer). An initializer is a WRITE to the field like any other,
+    // and it is the one write that happens before any body runs — so it is
+    // what a FIRST store displaces.
+    for (auto& [m, isOk] : ok) {
+        if (!isOk) continue;
+        const ast::Expr* init = nullptr;
+        // SEAM-ACCESSOR: see the note in PHASE 1 -- ts is local, so
+        // every m->decl here is always local. #3152
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+            init = fd->initializer.get();
+        // SEAM-ACCESSOR: same reason as the FieldDecl arm just above.
+        else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+            init = pd->autoInitializer.get();
+        if (!init) continue;  // no initializer → calloc-zeroed null → OK
+        // fix-forward #7968: a `:= null` initializer is the same zeroed
+        // null — neutral, exactly as in `checkStore` above.
+        if (dynamic_cast<const ast::NullLiteralExpr*>(init)) continue;
+        // Synthesize a check: the "target" symbol is m, the "source" is
+        // init. We check the init directly.
+        const sema::TypeRef* srcTy = ctx_.exprType(*init);
+        if (!srcTy) { isOk = false; continue; }
+        bool isBoxableSource =
+            isBoxableValueType(srcTy) || isNullableValueTy(srcTy);
+        bool isBoxReturnCall = isUserMethodBoxReturnCall(init);
+        if (!isBoxableSource && !isBoxReturnCall)
+            isOk = false;
+    }
+
+    // PHASE 5 — add the fields that survived as box-only to boxStorageFields_.
+    for (auto& [m, isOk] : ok) {
+        if (isOk) boxStorageFields_.insert(static_cast<const void*>(m));
     }
 }
 
