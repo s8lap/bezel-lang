@@ -1048,6 +1048,102 @@ Measured 2026-11-05 (R39): **105 worktrees removed and 21 build dirs dropped too
 `/mnt/fast` from 89 % to 55 %**, with no commit lost: every detached tip got a `keep/` ref
 first, and every WIP tree kept its sources.
 
+### ⚠ HOW TO CHECK FOR LIVE LANES — THE THREE-WAY TEST (AND THE TWO THINGS THAT LIE)
+
+**Measured 2026-11-09 (R41).** A coordinator asked "the UI shows 11 subagents — is something stale?"
+**⇒ THE ANSWER REQUIRED THREE INDEPENDENT SIGNALS, AND TWO OF THE OBVIOUS ONES LIE.**
+
+**⇒ THE THREE SOURCES, AND WHAT EACH ONE ACTUALLY MEANS:**
+
+| source | what it really reports | how to read it |
+|---|---|---|
+| the **ledger** (`claims.tsv`) | the LAST row per key `(lane, issue)`; **status = the LAST column** | a lane is claimed-live only if its last row's status starts with `live` **and** carries a `ses_…` id |
+| the **agent processes** (`ps`) | one `opencode run --session ses_…` per live lane | **⇒ THIS IS THE GROUND TRUTH FOR "RUNNING"** |
+| the **opencode session tree** (`opencode api GET /api/session`) | **every session record ever created** | a record is **NOT** a live agent |
+
+**⇒ THE TWO THINGS THAT LIE:**
+
+1. **`run_status.sh`'s `stale` row counts CANDIDATES, NOT STALE PROCESSES.** It parses
+   `candidates: N` out of `reap_stale.sh`'s output — and that number is the processes
+   **examined**, all of which may be EXEMPT (working / working-tree / io-blocked). **⇒ THE REAPER'S
+   OWN VERDICT IS THE ONE THAT COUNTS: its last line says `stale: 0` or "no stale dev processes".**
+   **⇒ NEVER report "N stale processes" from the status table — report the reaper's verdict.**
+2. **THE UI's "N subagents" LIST IS SESSION RECORDS, NOT LIVE AGENTS.** A finished lane's record
+   survives in the session store forever, and it is still a *child of this coordinator session*, so
+   the UI lists it as a subagent. **Measured: 36 children of the coordinator session, 11 running**
+   (`GET /api/session/active` returned exactly 11), and `ps` showed exactly 11 `opencode run`
+   processes — **the same 11**. **⇒ 25 were FINISHED lanes whose session records were never
+   cleaned up.**
+
+**⇒ THE CHECK, AS A COMMAND (this is the one to run every tick):**
+
+```bash
+# 1. the ground truth: which lanes have a RUNNING agent process?
+ps -eo args | grep -o 'opencode run --session ses_[A-Za-z0-9]*' | sed 's/.*--session //' | sort -u
+
+# 2. the server's own view: which sessions are RUNNING (a turn in flight)?
+opencode api GET /api/session/active     # {"data":{"ses_…":{"type":"running"}}}
+
+# 3. the ledger's view: which lanes hold a live claim?
+#    status = the LAST column; the key is (lane, issue); LAST ROW WINS
+awk -F'\t' '$NF ~ /^live/ {for(i=1;i<=NF;i++) if($i ~ /ses_/) print $2, $i}' claims.tsv | sort -u
+```
+
+**⇒ THE THREE MUST AGREE.** A lane in the ledger with no process is a **PHANTOM CLAIM** (close it
+with a `done:` row). A process with no ledger row is an **UNRECORDED AGENT** (write the row NOW, in
+the same turn). A session record with neither is **DEBRIS** — see below.
+
+**⇒ ⇒ THE LEDGER'S "LAST ROW WINS" IS PER KEY `(lane, issue)`, NOT PER LANE.** A lane re-dispatched
+under a NEW name leaves its OLD lane's row `live:` forever unless a `done:` row supersedes it for
+the SAME `(lane, issue)` key. **⇒ THE LEDGER CAN CLAIM 36 LIVE LANES WHILE 11 ARE RUNNING — always
+recompute the live set from the last row per key, never by grepping for `live`.**
+
+**⇒ ⇒ AND A LANE THAT FINISHES MUST GET A `done:` ROW IN THE SAME TURN.** Otherwise its claim stays
+`live:` with a session id that no longer exists, and `pool_lanes.sh` reports it as DEAD.
+
+**⇒ RECLAIMING THE DEBRIS — the session records.** `opencode api DELETE /api/session/{sessionID}`
+deletes a session record. **⚠ THE PATH NEEDS THE `/api` PREFIX — `DELETE /session/{id}` IS
+`405 Method Not Allowed`.** **⇒ THE SAFE SET IS: a session that is NOT in
+`/api/session/active`, has NO `opencode run` process, and is NOT this coordinator session.**
+**⇒ NEVER DELETE A SESSION WHOSE TRANSCRIPT IS STILL NEEDED** — a lane's `report.md` and its
+probes are the durable copy; the session record is the expendable one. **⇒ DELETE IN A LOOP**: the
+list endpoint is PAGINATED, so one pass leaves a residue — re-check and repeat until the dead set is
+empty (measured: 33 + 3 + 0 over three passes).
+
+**⇒ ⇒ ⇒ THE RECIPE, IN ONE LINE:** *a live lane is a **process**, not a session record, not a ledger
+row, and not a UI entry.*
+
+### ⚠ DISPATCH A LANE AT AN EXPLICIT EFFORT VARIANT — NEVER AT THE DEFAULT
+
+**Measured 2026-11-09 (R41).** Every lane of a whole run was dispatched at the DEFAULT effort,
+because the dispatcher was called without `--model` and the default carries no variant. **⇒ 11 live
+sessions ran as `--model minimax/MiniMax-M3.1-Flash` with NO variant ⇒ the default effort ⇒ a
+directive ("never dispatch at default effort; at most `medium`, prefer `low`") was violated for the
+whole run and nobody noticed, because the model NAME looks correct either way.**
+
+**⇒ `opencode run --model` TAKES `provider/model#VARIANT`.** The variants are declared per model in
+`~/.config/opencode/opencode.json` under `providers.<p>.models.<m>.variants` (an array of `{id, body}`
+— for MiniMax the ids are `low`, `medium`, `high`, `xhigh`, `max`, each setting `reasoning_effort`).
+
+**⇒ `scripts/lane_dispatch.sh`'s DEFAULT IS NOW `minimax/MiniMax-M3.1-Flash#low`** — so a dispatch
+that omits `--model` is no longer at the default effort. **⇒ BUT PASS `--model` EXPLICITLY ANYWAY**,
+because the effort you want differs by lane type:
+
+| lane type | variant | why |
+|---|---|---|
+| **verifier / repro-sweep / probe** | `#low` | mechanical: run a probe, read a verdict, no judgement |
+| **producer** (a real fix) | `#medium` | it must reason about the spec and the code |
+| **reviewer** | `#medium` | it must JUDGE a commit; a low-effort review is not a review |
+
+**⇒ VERIFY IT, DO NOT ASSUME IT — the check that catches a whole-run violation at once:**
+
+```bash
+ps -eo args | grep -o '\-\-model minimax/MiniMax-M3.1-Flash#[a-z]*' | sort | uniq -c
+```
+
+**⇒ A RESULT WITH NO `#` IS A DEFECT.** (Also note the session record stores the variant it ran at:
+`GET /api/session/{id}` → `"model":{"variant":"default"}` ⇒ that session ran at the DEFAULT effort.)
+
 ### ⚠ At most TWO lanes may cold-build `--area codegen` at once
 
 Measured 2026-09-23 by **three independent lanes in one cycle**, all reporting the same
@@ -1746,6 +1842,53 @@ write a case, so the defects were authoring defects: an invented `rule:`, an exp
 copied from a rejected fix's tip, a spec-illegal shared fixture, a host-defined stdout order, a
 vacuous shadowing case, a RED row citing the wrong issue. Hence the self-check, the effort tier
 and the cap, and hence the brief's committed copy rather than a scratch one.
+
+### ⚠ CLOSING A GITHUB ISSUE: A CLOSE IS A CLAIM, AND A PARTIAL FIX IS NOT A CLOSE
+
+**Measured 2026-11-09 (R41).** A verifier lane closed 10 campaign issues whose defects were already
+fixed upstream. **⇒ FOUR OF THE TEN IT THEN REOPENED ITSELF, 15 MINUTES LATER, WITH A MEASUREMENT**
+— because it had closed them on ONE probe, while the issue named a **POPULATION** of shapes.
+
+- `#8005` — closed on `new JsonSerializer(n)` over `var n: int?`; **reopened** because the issue says
+  *"every one of those rows"* — 106 of the 355 built-in-parameter rows carry no type opinion, and a
+  **different** row with an all-zero `kinds` column still accepts any argument type.
+- `#8165` — closed on two probes; **reopened** because the issue names **four** legs still admitted
+  after the fix, and the class-instance twins are rejected while the **Array-materializer** spelling
+  is still admitted.
+- `#8168` — closed on six numeric probes; **reopened** because the **built-in generic callee** never
+  passes the target's return type into the lambda typecheck — the six numerics were only one shape.
+- `#8179` — closed on the **lazy-sequence** receiver; **reopened** because the issue names **two**
+  receivers, and the **`Dictionary<K,V>`** leg is still rejected with the §5 arity error.
+
+**⇒ ⇒ ⇒ THE RULE: A CLOSE MUST COVER THE ISSUE'S WHOLE POPULATION, NOT ONE PROBE.**
+
+1. **⇒ COUNT THE LEGS FIRST.** Before measuring, enumerate the shapes the issue names: numbered
+   items, `Defect N` headings, "or a `Dictionary<K,V>`", "every one of those rows", "two receivers".
+   **⇒ THE NUMBER OF LEGS IS THE NUMBER OF MEASUREMENTS YOU OWE.** (`#8223` says "Defect 1" **and**
+   "Defect 2"; measuring only Defect 1 is a partial close. Measured 2026-11-09: `#8223` was closed
+   on Defect 1, found by the coordinator to have a surviving Defect 2, and **reopened**.)
+2. **⇒ A FIX THAT COVERS SOME OF A POPULATION IS A `narrow` — AND `narrow #N` DOES NOT CLOSE.**
+   **⇒ ⇒ THE MECHANISM IS BOTH A HAZARD AND THE OPPORTUNITY:**
+   - **HAZARD:** a `narrow #N` commit on `origin/main` **leaves issue N OPEN** ⇒ **every**
+     `narrow #N` commit on `origin/main` whose issue is still open is a **candidate free closure**;
+   - **OPPORTUNITY:** the same fact is why an issue can be closed **without waiting for the gate**.
+3. **⇒ THE PROOF A CLOSE NEEDS:** (a) the **measured** verdict on **every** leg — a source comment
+   is a lead, never a proof; (b) **the commit that carries the fix, NAMED**, and it must be an
+   **ancestor of `origin/main`** (if the fix is only on the staging branch, the issue closes at the
+   gate, not before); (c) the **exact command, the exact diagnostic and the rc** for each leg.
+4. **⇒ ⚠ THE SIBLING TRAP, AGAIN — `git merge-base --is-ancestor` IS NOT THE TEST.** A commit whose
+   patch IS already on `origin/main` may sit on a lane branch under a **different SHA** (same parent,
+   same patch) ⇒ `--is-ancestor` says **NO** for a commit that is already landed. **⇒ THE RELIABLE
+   TESTS ARE `git diff A B -- src/` AND THE PATCH-ID.**
+5. **⇒ IF ANY LEG SURVIVES, THE VERDICT IS `STILL-OPEN` — and say WHICH LEGS SURVIVE.** That is the
+   most valuable answer a verifier can produce: it becomes the next producer's work list.
+6. **⇒ IF YOU CANNOT MEASURE A LEG (a runtime/leak/UAF issue needs an ASan build), THE VERDICT IS
+   `STILL-OPEN` WITH THAT REASON — never a guessed close.** A compile-time verdict does not
+   discriminate a runtime defect.
+7. **⇒ A REOPEN IS NOT A FAILURE — IT IS THE LANE DOING ITS JOB.** When a lane reopens its own
+   close, that is the partial-fix rule working. **⇒ THE COORDINATOR MUST THEN ALSO RE-VERIFY ITS
+   OWN CLOSES against the same rule** — measured 2026-11-09, the coordinator's own `#8223` close was
+   unsound for exactly this reason.
 
 ### Commits
 

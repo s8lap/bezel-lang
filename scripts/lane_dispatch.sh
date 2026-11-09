@@ -43,7 +43,7 @@
 # EXIT: 0 dispatched · 64 usage/refusal · 70 the server was unreachable.
 set -u
 
-TITLE=""; LOG=""; BRIEF_FILE=""; MODEL="minimax/MiniMax-M3.1-Flash"; AGENT="general"
+TITLE=""; LOG=""; BRIEF_FILE=""; MODEL="minimax/MiniMax-M3.1-Flash#low"; AGENT="general"
 # The project root is DERIVED FROM THIS SCRIPT'S OWN LOCATION, never a literal
 # checkout path: a hardcoded absolute path is the defect the gate's
 # repo-identity self-test (scripts/gate/tests/test_repo_identity.py,
