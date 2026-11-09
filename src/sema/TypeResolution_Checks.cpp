@@ -8805,6 +8805,73 @@ void Resolver::checkHidingAndOverride() {
     }
 }
 
+// fix #7569 (§11.2 / §28.12, v0.355): the display spelling of a type
+// reference for the `IAsyncDisposable` conformance diagnostics below.
+// `primitiveKeyword` is DEFINED further down this file (its own forward
+// declaration sits below the check); declare it here so the two helpers of
+// this pair can live together.
+static const char* primitiveKeyword(PrimitiveType p);
+
+// fix #7569 (§11.2 / §28.12, v0.355): true when `t` is EXACTLY the built-in
+// `Task` — the return type the built-in `IAsyncDisposable` declares
+// (`method DisposeAsync(): Task;`, stdlib §2.10; spec §28.12,
+// `docs/Bezel_Language_Spec.md` line 8428).
+//
+// `Task` is a compiler-known heap-pointer built-in with NO user TypeSymbol
+// (`common::isHeapPointerReferenceBuiltin`), so the resolved TypeRef for it
+// is a Named ref with a NULL declaration, no generic arguments and the head
+// name `Task`. Each of the three rejections below is a §11.2 mismatch in its
+// own right:
+//   * a generic argument — `Task<int>` is a DIFFERENT type, and §11.2 says
+//     "Return types must match exactly (no covariance in this version)";
+//   * nullability — `Task?` is not "exactly equal" to `Task`;
+//   * a declaration — a USER type named `Task` (§2.3 permits shadowing an
+//     auto-imported name) is a different type from the standard library's;
+//   * a TYPE PARAMETER named `Task` (`class Box<Task>`) is a different type
+//     again — the resolver stamps that record on the TypeRef
+//     (`TypeRef::typeParam`), so a type parameter is told apart from the
+//     built-in by ORIGIN, not by name (#8213).
+static bool isExactlyBuiltinTask(const TypeRef* t) {
+    if (!t) return false;
+    if (t->kind != TypeRef::Kind::Named) return false;
+    if (t->declaration) return false;            // a user-declared `Task`
+    if (t->isResolvedTypeParam()) return false;  // a type parameter `Task`
+    if (t->nullable) return false;               // `Task?`
+    if (!t->genericArgs.empty()) return false;   // `Task<int>`
+    return t->headName() == "Task";
+}
+
+// fix #7569 (§11.2 / §28.12, v0.355): the display spelling of a type
+// reference, for the `IAsyncDisposable` conformance diagnostic that names
+// what the implementation declared.
+static std::string spellReturnTypeForDiag(const TypeRef* t) {
+    if (!t) return "(none)";
+    switch (t->kind) {
+        case TypeRef::Kind::Primitive: {
+            std::string s(primitiveKeyword(t->primitive));
+            if (t->nullable) s += '?';
+            return s;
+        }
+        case TypeRef::Kind::Named: {
+            std::string s = t->declaration ? std::string(t->declaration->name)
+                                            : std::string(t->headName());
+            if (s.empty()) s = "?";
+            if (!t->genericArgs.empty()) {
+                s += "<";
+                for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                    if (i) s += ", ";
+                    s += spellReturnTypeForDiag(t->genericArgs[i]);
+                }
+                s += ">";
+            }
+            if (t->nullable) s += "?";
+            return s;
+        }
+        case TypeRef::Kind::Unit: return "unit";
+        default: return "?";
+    }
+}
+
 bool Resolver::methodIsAbstract(MethodSymbol* ms) {
     if (ms->parent &&
         ms->parent->kind == ast::TypeDeclKind::Interface) {
@@ -11395,6 +11462,216 @@ void Resolver::checkAbstractImplementations() {
                 "(\xC2\xA7""9.1 / \xC2\xA7""11.2)");
         }
     }
+    // fix #7569 (§11.2 / §28.12, v0.355): THE `IAsyncDisposable` MEMBER
+    // OBLIGATION — the one §11.2 interface obligation the machinery above
+    // cannot see, and why.
+    //
+    // WHY THE WITNESS ABOVE IS BLIND HERE. §11.2's matching rule applies to
+    // every interface a type lists. This function implements it by walking
+    // the class's BASE-TYPE closure (`TypeSymbol::baseTypes`) and reading
+    // each reached interface's MEMBERS (`ifaceObligationsByName`). The
+    // built-in `IAsyncDisposable` is a NULL-DECLARATION built-in interface:
+    // it has no user `TypeDecl`, hence no `TypeSymbol` and no `MethodSymbol`
+    // for the member it declares — `method DisposeAsync(): Task;` (stdlib
+    // §2.10; spec §28.12, `docs/Bezel_Language_Spec.md` line 8428).
+    // `Resolver::builtinTypeArity` (TypeResolution_Names.cpp) lists the NAME
+    // and `common::kBuiltinDisposalFamilyHeads` (BuiltinRegistry.cpp) records
+    // its extension chain, but NOTHING in the compiler holds the MEMBER it
+    // declares.
+    //
+    // A conformance to it is therefore carried on the OTHER carriage:
+    // `TypeSymbol::nonSymbolBaseRefs` — the declared bases that carry no
+    // user `TypeSymbol` (Symbol.hpp's own note on the two carriages). The
+    // BFS above walks `baseTypes` only, so the `IAsyncDisposable` edge is
+    // INVISIBLE to it: there is no interface symbol to read a member from,
+    // and the class's own `DisposeAsync` is therefore never compared with
+    // anything. (Of the three readings a reader would try first — "the
+    // check does not fire", "the comparison is against the erased `Task`",
+    // "the member lookup misses it" — the truth is one step EARLIER than all
+    // three: there is no `IAsyncDisposable` symbol at all, so there is no
+    // member to look up and no comparison to make.)
+    //
+    // MEASURED on r30-c1 (2e09616d), the two shapes #7569 names:
+    //   (a) `class Res: IAsyncDisposable` with NO `DisposeAsync` — COMPILES;
+    //   (b) `class Res: IAsyncDisposable` with `DisposeAsync(): Task<int>` —
+    //       COMPILES.
+    // (b) is also a latent wrong-shape dispatch, not merely a §11.2
+    // formality: codegen assumes the erased `Task` ("Result type is null
+    // (DisposeAsync returns Task, not Task<T>)" — LlvmBackend_Async.cpp).
+    //
+    // WHAT THIS CHECK DOES. It states the obligation the built-in interface
+    // declares and enforces it where §11.2 enforces every other interface
+    // member — at the implementing class. The class must provide a
+    // `DisposeAsync` member — its own, or inherited from a base class (§11.2
+    // imposes no restriction that the match be declared on the implementing
+    // type; the witness above applies the same rule to a user interface's
+    // members) — with the interface's arity (ZERO parameters) and the
+    // interface's return type (`Task`, EXACTLY).
+    //
+    // THE `async` MODIFIER IS NOT PART OF THE MATCH. §11.2's list is
+    // "declared `public`, has the same name, the same arity (parameter
+    // count), the same number of type parameters of its own, the same
+    // parameter modifiers ..., parameter types that are exactly equal ...
+    // and a return type that is exactly equal" — `async` is on no list, it
+    // is an implementation-side modifier (§28.12), and codegen's own #3483
+    // comment describes "a non-`async` `DisposeAsync`" as a shape it
+    // handles. So a non-`async` `DisposeAsync(): Task` MATCHES here, and
+    // this check does not require `async`.
+    //
+    // SCOPE: THE `IAsyncDisposable` OBLIGATION ALONE. The other built-in
+    // ASYNC heads (`IAsyncEnumerator<T>`, `IOwningAsyncEnumerable<T>`,
+    // `IOwningAsyncEnumerator<T>` — stdlib §4.12 / §4.13) inherit
+    // `DisposeAsync` from `IAsyncDisposable` too, but their OWN member sets
+    // (`MoveNextAsync`, `Current`) are unchecked by the compiler as well —
+    // enforcing one member of theirs would enforce a fragment of a larger
+    // unchecked obligation set, and it would reject
+    // `class AsyncEnum: IAsyncEnumerator<int>` as it stands today
+    // (tests/sema/await_for_source_async_iterability_7903_test.cpp declares
+    // no `DisposeAsync` on it). That whole built-in obligation family is a
+    // SEPARATE defect; this check does not reach it.
+    forEachTypeAndNested([&](TypeSymbol* nested) {
+        // Only a CLASS can implement `IAsyncDisposable` (§28.12 / §9.7:
+        // "only a class implements it — a record, enum or choice that lists
+        // it, or lists an interface extending it, is a compile error at the
+        // declaration"). The record/enum/choice arm is rejected by the
+        // §9.7 declaration-site check, so there is nothing to do here.
+        if (nested->kind != ast::TypeDeclKind::Class) return;
+        // §12.5: an abstract (or `closed`) class need not implement its
+        // inherited obligations — the concrete subclass carries them. The
+        // witness above skips the same kinds for the same reason.
+        if (typeIsAbstractOrClosed(nested)) return;
+        // The obligation exists only where the class — or an ancestor, or an
+        // interface it lists — declares the BUILT-IN `IAsyncDisposable`.
+        // `inheritsBuiltinInterface` answers BY IDENTITY (Symbol.hpp): a
+        // USER interface named `IAsyncDisposable` (§2.3 permits the shadow)
+        // is a DIFFERENT type and carries no such obligation — that one IS
+        // enforced by the witness above, which can see it (it has a
+        // TypeSymbol and its members).
+        if (!inheritsBuiltinInterface(nested, "IAsyncDisposable")) return;
+        // The implementing member: the most-derived `DisposeAsync` on the
+        // class or on its base-class chain.
+        MethodSymbol* impl = nullptr;
+        bool sawMember = false;
+        std::size_t declaredArity = 0;
+        for (TypeSymbol* c = nested; c;) {
+            for (Symbol* m : c->members) {
+                auto* ms = dynamic_cast<MethodSymbol*>(m);
+                if (!ms || ms->name != "DisposeAsync") continue;
+                if (ms->isOperator || hasMod(ms, "static")) continue;
+                if (!sawMember) {
+                    sawMember = true;
+                    declaredArity = ms->params.size();
+                }
+                if (ms->params.size() == 0) { impl = ms; break; }
+            }
+            if (impl) break;
+            TypeSymbol* next = nullptr;
+            for (TypeSymbol* b : c->baseTypes)
+                if (b && b->kind == ast::TypeDeclKind::Class) {
+                    next = b;
+                    break;
+                }
+            c = next;
+        }
+        if (!impl) {
+            // §11.2 / §28.12: the class declares the built-in
+            // `IAsyncDisposable` and provides no `DisposeAsync` member of
+            // the interface's shape.
+            if (!sawMember) {
+                ctx_.diagnostics().report(
+                    Severity::Error, nested->declLoc,
+                    std::string("class `") + std::string(nested->name) +
+                    "` does not implement interface member `DisposeAsync` of "
+                    "`IAsyncDisposable` — the interface declares `method "
+                    "DisposeAsync(): Task;`, and §11.2 requires the "
+                    "implementing class to declare a matching member "
+                    "(\xC2\xA7""11.2 / \xC2\xA7""28.12)");
+                return;
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, nested->declLoc,
+                std::string("class `") + std::string(nested->name) +
+                "` does not implement interface member `DisposeAsync` of "
+                "`IAsyncDisposable` with the required 0-parameter signature "
+                "— the implementation declares " +
+                std::to_string(declaredArity) +
+                " parameter(s); the implementing method's parameter count "
+                "must match the interface member exactly (\xC2\xA7""11.2)");
+            return;
+        }
+        // The implementation's declared return type: the AST when there is
+        // one, else the loader's `importedReturnType` record — the SAME
+        // both-sources derivation the witness above uses for the same
+        // purpose (#2373 / #3194): an IMPORTED witness has no AST.
+        auto* implDecl = dynamic_cast<const ast::MethodDecl*>(impl->decl);
+        TypeRef* implRetRef = nullptr;
+        bool implDeclaresReturn = false;
+        // `implReturnKnown` is false when the implementation's return type
+        // CANNOT be read at all — the loader recorded no return type for an
+        // IMPORTED member, or the local AST node was never resolved. The
+        // check DEFERS in that case rather than reporting a mismatch it
+        // cannot decide: a false REJECT here would reject a conforming class
+        // across a module boundary. (The §11.2 witness above takes the same
+        // fail-open posture on the same axes.)
+        bool implReturnKnown = true;
+        if (implDecl) {
+            if (implDecl->returnType.get()) {
+                implRetRef = ctx_.resolvedType(*implDecl->returnType.get());
+                implDeclaresReturn = true;
+                // An unresolved type is another diagnostic's business (the
+                // type-resolution pass reports it); an Error-kind reference
+                // is that report's own product, so defer on it too.
+                if (!implRetRef ||
+                    implRetRef->kind == TypeRef::Kind::Error)
+                    implReturnKnown = false;
+            }
+        } else if (ctx_.isImported(impl)) {
+            TypeRef* r = ctx_.importedReturnType(impl);
+            if (!r) {
+                // Nothing recorded for this imported member — the return
+                // type is UNKNOWN, not "absent".
+                implReturnKnown = false;
+            } else if (r->kind != TypeRef::Kind::Unit) {
+                // A Unit return is "declares no return type", exactly as a
+                // null `returnType` node is on the AST side — the same
+                // normalisation the witness above performs.
+                implRetRef = r;
+                implDeclaresReturn = true;
+            }
+        } else {
+            // A local witness with no `ast::MethodDecl` and no imported
+            // record: the return type is UNKNOWN.
+            implReturnKnown = false;
+        }
+        if (!implReturnKnown) return;  // defer — nothing to decide
+        if (!implDeclaresReturn) {
+            ctx_.diagnostics().report(
+                Severity::Error,
+                ctx_.isImported(impl) ? nested->declLoc : impl->declLoc,
+                std::string("method `DisposeAsync` does not match interface "
+                            "`IAsyncDisposable`'s return type — return types "
+                            "must match exactly (no covariance); the interface "
+                            "declares `Task`, the implementation declares no "
+                            "return type (\xC2\xA7""11.2)"));
+            return;
+        }
+        // §11.2: "a return type that is exactly equal under the interface's
+        // substitution" / "Return types must match exactly (no covariance in
+        // this version)". The interface declares `Task` — the built-in, bare,
+        // non-nullable. `Task<T>` is a DIFFERENT type (no covariance),
+        // `Task?` is a DIFFERENT type (nullability is not "exactly equal"),
+        // and a user-declared `Task` (§2.3 permits shadowing an
+        // auto-imported name) is a different type again.
+        if (isExactlyBuiltinTask(implRetRef)) return;
+        ctx_.diagnostics().report(
+            Severity::Error,
+            ctx_.isImported(impl) ? nested->declLoc : impl->declLoc,
+            std::string("method `DisposeAsync` does not match interface "
+                        "`IAsyncDisposable`'s return type — return types must "
+                        "match exactly (no covariance); the interface declares "
+                        "`Task`, the implementation declares `") +
+                        spellReturnTypeForDiag(implRetRef) + "` (\xC2\xA7""11.2)");
+    });
 }
 
 // §11.8 / §14.2 (v0.176, #807): re-run the type-bound BFS for every failure
