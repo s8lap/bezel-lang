@@ -31,4 +31,4 @@ class P
   end Main;
 end P;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: no member `IndexOf` on `SortedDictionary` (stdlib §4.17) -- it is not part of this collection's documented surface (ContainsKey/Contains/TryGetValue/GetOrNull/Remove/Clear/FirstKey/LastKey/GetEnumerator), a universal `ToString`/`Equals`/`GetHashCode`/`GetType` member (language spec §8.1), or a stdlib §5 LINQ extension operator
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: no member `IndexOf` on `SortedDictionary` (stdlib §4.17) -- it is not part of this collection's documented surface (Add/Clear/Contains/ContainsKey/Count/FirstKey/GetEnumerator/GetOrNull/LastKey/Remove/TryAdd/TryGetValue), a universal `ToString`/`Equals`/`GetHashCode`/`GetType` member (language spec §8.1), or a stdlib §5 LINQ extension operator

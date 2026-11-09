@@ -24,4 +24,4 @@ class P
   end Main;
 end P;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: no member `IndexOf` on `Dictionary` (stdlib §4.8) -- it is not part of this collection's documented surface (Add/ContainsKey/Contains/Remove/TryGetValue/GetOrNull/GetOrAdd/Clear/IsReadOnly/GetEnumerator), a universal `ToString`/`Equals`/`GetHashCode`/`GetType` member (language spec §8.1), or a stdlib §5 LINQ extension operator
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: no member `IndexOf` on `Dictionary` (stdlib §4.8) -- it is not part of this collection's documented surface (Add/Clear/Contains/ContainsKey/Count/GetEnumerator/GetOrAdd/GetOrNull/IsReadOnly/Keys/Remove/TryAdd/TryGetValue/Values), a universal `ToString`/`Equals`/`GetHashCode`/`GetType` member (language spec §8.1), or a stdlib §5 LINQ extension operator
