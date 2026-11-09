@@ -13785,6 +13785,22 @@ private:
     ArrEnumMachinery ensureStackEnumMachinery(llvm::Type* elemTy);
     llvm::Value* wrapStackAsIEnumerator(llvm::Value* arr,
                                         const sema::TypeRef* iEnumTy);
+    // fix #8265 (stdlib §4.11 "Iteration order", v0.355): the TAKE-ORDER test
+    // for an ERASED collection interface's backing — an i1 that is true when
+    // the `bz_array_t*` behind an `IReadOnlyCollection<T>` / `ICollection<T>` /
+    // `IReadOnlyList<T>` / `IList<T>` receiver is a `Stack<T>` /
+    // `OwningStack<T>` (whose PHYSICAL order is bottom-to-top while §4.11's
+    // take order is top-to-bottom). The signal is the runtime's own
+    // per-instantiation descriptor (word 1 of `bz_array_t`, read back by
+    // `bz_array_inst_desc`), compared against the `Stack<T>` /
+    // `OwningStack<T>` descriptors — the same address comparison `o is
+    // Stack<int>` performs. Returns null when no descriptor can be formed (a
+    // non-concrete element type), and the caller then keeps the forward scan.
+    // Defined in LlvmBackend_Iterators.cpp; called from
+    // `lowerIEnumerableBuiltinFor`'s array-backed branch
+    // (LlvmBackend_Stmts.cpp).
+    llvm::Value* erasedCollBackingIsTakeReversed(llvm::Value* arr,
+                                                 const sema::TypeRef* elemTyRef);
     // fix #2987 (§28.3 / §28.9 / §29.2, v0.240): the OWNING sibling of
     // wrapStackAsIEnumerator — same 4-field struct layout ({vtable, arr, idx,
     // esz}, populated identically: idx = bz_array_len(arr) for the §4.11

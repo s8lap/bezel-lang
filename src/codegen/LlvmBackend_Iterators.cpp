@@ -16,6 +16,88 @@ namespace bezel::codegen {
 // top of those helpers. No behavior changes for iterators.
 // ===========================================================================
 
+// ===========================================================================
+// #8265 (stdlib §4.11 "Iteration order", v0.355): the TAKE-ORDER test for an
+// ERASED collection interface's backing — the runtime predicate the
+// array-backed for-in scan dispatches its ORDER on.
+// ===========================================================================
+
+// fix #8265 (stdlib §4.11 "Iteration order", v0.355): the TAKE-ORDER test for
+// an ERASED collection interface's backing.
+//
+// §4.11: "All four types iterate (via `IReadOnlyCollection<T>`) in take order
+// — a stack top-to-bottom (pop order), a queue front-to-back (dequeue order);
+// the owning forms iterate identically, yielding borrows." A CONCRETE
+// `Stack<T>` receiver knows this statically — #2472's `isStackFamily` reverses
+// the direct-indexed scan in `lowerArrayFor` — but a `Stack<T>` reached
+// through an ERASED `IReadOnlyCollection<T>` does not: the erased slot holds
+// the same `bz_array_t*`, whose PHYSICAL order is bottom-to-top, so the
+// erased scan visited 1,2,3 for pushes 1,2,3 (the issue's repro) while the
+// concrete scan visited 3,2,1.
+//
+// THE RUNTIME SIGNAL. `bz_array_t`'s word 1 is the per-INSTANTIATION
+// descriptor #6776 stamps at a construction site whose static type is known
+// (`stampBuiltinTypeDesc` → `bz_array_set_type_desc`; `btd$builtin$<qualified
+// name>`). It IS the runtime identity of the concrete builtin, and it is
+// already read back by `bz_array_inst_desc` for `o is Stack<int>`. So the
+// erased receiver's backing can be identified at RUNTIME by comparing that
+// descriptor against the `Stack<T>` / `OwningStack<T>` descriptors — the same
+// address comparison `o is Stack<int>` performs.
+//
+// WHY NOT A NEW HEADER WORD. #7574's fix-forward (1d0f3b4f) added a
+// `take_reversed` word to `bz_array_t` for the §5-operator path; that commit
+// is NOT in this tree, and re-adding the word here would collide with it (two
+// definitions of the same header word at two positions is an ABI mismatch, not
+// a merge). The descriptor word already carries the information, is already
+// stamped at every construction site, and needs no runtime change.
+//
+// THE SCOPE. The comparison is by the EXACT instantiation, so it answers for
+// a backing whose element type is the erased receiver's element type — the
+// shape §4.11 names (`IReadOnlyCollection<T>` over a `Stack<T>`). A COVARIANT
+// widening (`IReadOnlyCollection<Animal>` over a `Stack<Dog>`) names a
+// different instantiation and is NOT recognised here; that corner needs a
+// family-level marker (the `take_reversed` word), which is #7574's
+// mechanism and is deferred with it.
+//
+// The covariant widening is REACHABLE — stdlib §4.1 states that
+// "`IReadOnlyCollection<T>` and `IReadOnlyList<T>` are covariant in T
+// (`out T`)" and spec §12.9 admits the assignment, so the program COMPILES
+// and RUNS — and it still visits the stack in PUSH order, disagreeing with
+// the concrete for-in over the same stack. That gap is TRACKED as #8361 and
+// is pinned in-tree by the known-gap row (R) of
+// `tests/codegen/stack_erased_collection_forin_order_8265_test.cpp`.
+//
+// Returns null when no descriptor can be formed (a non-concrete element type,
+// e.g. an unbound type parameter) — the caller then keeps the forward scan.
+llvm::Value* Emitter::erasedCollBackingIsTakeReversed(
+    llvm::Value* arr, const sema::TypeRef* elemTyRef) {
+    if (!arr || !elemTyRef) return nullptr;
+    // A monomorphized generic body binds the erased receiver's element type
+    // through the ACTIVE substitution; resolve it here so a
+    // `IReadOnlyCollection<T>` receiver (T bound at this instantiation) names
+    // the same instantiation the backing carries.
+    const sema::TypeRef* elem = resolveTypeParamRef(elemTyRef);
+    if (!elem) elem = elemTyRef;
+    auto* descFn = declareC("bz_array_inst_desc", ptrTy(), {ptrTy()});
+    llvm::Value* desc = builder_.CreateCall(descFn, {arr}, "iroc.desc");
+    llvm::Value* isTakeRev = nullptr;
+    for (const char* head : {"Stack", "OwningStack"}) {
+        // A synthesized Named TypeRef for the concrete head at this element
+        // type: `builtinInstanceDescriptorFor` renders it exactly as the
+        // construction site's own TypeRef does (the cache is keyed on the
+        // rendered name), so the two addresses are the same global.
+        sema::TypeRef tr;
+        tr.kind = sema::TypeRef::Kind::Named;
+        tr.importedName = head;
+        tr.genericArgs.push_back(const_cast<sema::TypeRef*>(elem));
+        llvm::GlobalVariable* d = builtinInstanceDescriptorFor(&tr);
+        if (!d) continue;
+        llvm::Value* eq = builder_.CreateICmpEQ(desc, d, "iroc.isstack");
+        isTakeRev = isTakeRev ? builder_.CreateOr(isTakeRev, eq) : eq;
+    }
+    return isTakeRev;
+}
+
 bool Emitter::forInBuiltinEnumeratorNeedsFrameSlot(const ast::ForStmt& fs) {
     // §29.7 (#944): collectSuspendLocals must reserve a frame field for EXACTLY
     // the for-ins whose lowering creates an iterator-format enumerator (Dispose

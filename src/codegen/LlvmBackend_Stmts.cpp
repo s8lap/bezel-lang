@@ -10590,8 +10590,79 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
         auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
         llvm::Value* len = builder_.CreateCall(lenFn, {enumObj});
+        // fix #8265 (stdlib §4.11 "Iteration order", v0.355): the ORDER of an
+        // ERASED collection-interface scan is decided by the BACKING, and at
+        // this point the backing is known only at RUN TIME — the interface slot
+        // erased which concrete collection it holds.
+        //
+        // §4.11 (v0.355): "All four types iterate (via `IReadOnlyCollection<T>`)
+        // in take order — a stack top-to-bottom (pop order), a queue
+        // front-to-back (dequeue order); the owning forms iterate identically,
+        // yielding borrows." A `Stack<T>` is stored bottom-to-top (physical
+        // index 0 is the bottom, index Count-1 the top — the same index
+        // `Pop()` reads), so the forward scan below visited 1,2,3 for pushes
+        // 1,2,3: the exact reverse of §4.11's take order, and the exact
+        // reverse of what the CONCRETE `Stack<T>` receiver yields (#2472's
+        // `isStackFamily` reversal in `lowerArrayFor`, a few hundred lines
+        // above — the same contract, same stdlib section, same repository).
+        //
+        // THE RUNTIME SIGNAL. `bz_array_t`'s word 1 is the per-INSTANTIATION
+        // descriptor #6776 stamps at every collection construction site whose
+        // static type is known (`stampBuiltinTypeDesc` →
+        // `bz_array_set_type_desc`; the global is `btd$builtin$<qualified
+        // name>`). It IS the runtime identity of the concrete built-in, and it
+        // is already read back by `bz_array_inst_desc` for `o is Stack<int>`
+        // (#4926's arm in `emitIsA`, LlvmBackend_Layout.cpp ~4807). So the
+        // erased receiver's backing is identified by comparing that descriptor
+        // against the `Stack<T>` / `OwningStack<T>` descriptors — the same
+        // address comparison `o is Stack<int>` performs, and the same
+        // LinkOnceODR folding that makes one instantiation's descriptor ONE
+        // address across the modules of a program.
+        //
+        // WHY NOT A NEW RUNTIME WORD. #7574's fix-forward (1d0f3b4f) added a
+        // `take_reversed` word to `bz_array_t` for the §5-OPERATOR path; that
+        // commit is not an ancestor of this tree, and appending the same word
+        // here would collide with it (two definitions of one header word at two
+        // positions is an ABI mismatch, not a merge). The descriptor word
+        // already carries the information, is already stamped at every
+        // construction site, and needs no runtime change at all.
+        //
+        // THE SCOPE. The comparison is by the EXACT instantiation, so it
+        // answers for a backing whose element type is the erased receiver's
+        // element type — the shape §4.11 names (`IReadOnlyCollection<T>` over
+        // a `Stack<T>`). Every other backing keeps the forward scan: an
+        // `Array<T>` and a `Queue<T>` / `OwningQueue<T>` iterate front-to-back,
+        // which IS their physical order (§4.11's queue clause), and no other
+        // §4.x collection states a take-order contract distinct from storage
+        // order.
+        // ONE EXCEPTION IS A KNOWN GAP, NOT A DIFFERENT CONTRACT: a COVARIANTLY
+        // WIDENED receiver (`IReadOnlyCollection<Animal>` over a `Stack<Dog>`)
+        // names a different instantiation, so it keeps the forward scan and
+        // visits in PUSH order, disagreeing with the concrete for-in over the
+        // same stack. That shape is REACHABLE (stdlib §4.1's `out T`, spec
+        // §12.9) and is tracked as #8361.
+        // The runtime signal itself lives in `erasedCollBackingIsTakeReversed`
+        // (LlvmBackend_Iterators.cpp): the per-instantiation descriptor of the
+        // backing compared against the `Stack<T>` / `OwningStack<T>`
+        // descriptors. It returns null when no descriptor can be formed (a
+        // non-concrete element type), and the forward scan is kept then.
+        llvm::Value* takeRev = erasedCollBackingIsTakeReversed(
+            enumObj, iterTy->genericArgs.empty() ? nullptr
+                                                 : iterTy->genericArgs[0]);
+        // The scan's start index and step are SELECTED from that runtime
+        // signal: top-first (start len-1, step -1) for a stack backing,
+        // unchanged (start 0, step +1) for every other backing.
+        llvm::Value* idxInit = builder_.getInt64(0);
+        llvm::Value* idxStep = builder_.getInt64(1);
+        if (takeRev) {
+            idxInit = builder_.CreateSelect(
+                takeRev, builder_.CreateSub(len, builder_.getInt64(1)),
+                builder_.getInt64(0), "ib.init");
+            idxStep = builder_.CreateSelect(
+                takeRev, builder_.getInt64(-1), builder_.getInt64(1), "ib.step");
+        }
         auto* idxSlot = entryAlloca(i64());
-        builder_.CreateStore(builder_.getInt64(0), idxSlot);
+        builder_.CreateStore(idxInit, idxSlot);
         auto* varSlot = entryAlloca(elemTy);
         locals_[&fs] = varSlot;
         registerForLoopSpillSlots(fs, {idxSlot, varSlot});  // #747 R42
@@ -10602,7 +10673,19 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(condBB);
         llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-        builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+        llvm::Value* inRange = builder_.CreateICmpSLT(idx, len);
+        if (takeRev) {
+            // The reversed scan runs from the last index DOWN to 0, so its
+            // bound is `idx >= 0`; the forward scan's bound is `idx < len`.
+            // `takeRev` is loop-invariant (the backing cannot change under a
+            // scan), so the bound is SELECTED once per iteration rather than
+            // recomputed — and the forward case keeps exactly the condition it
+            // had before this fix.
+            llvm::Value* revRange =
+                builder_.CreateICmpSGE(idx, builder_.getInt64(0));
+            inRange = builder_.CreateSelect(takeRev, revRange, inRange, "ib.range");
+        }
+        builder_.CreateCondBr(inRange, bodyBB, endBB);
         builder_.SetInsertPoint(bodyBB);
         llvm::Value* idx2 = builder_.CreateLoad(i64(), idxSlot);
         llvm::Value* ep = builder_.CreateCall(ptrAtFn, {enumObj, idx2, builder_.getInt64(esz)});
@@ -10615,7 +10698,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             builder_.CreateBr(incBB);
         builder_.SetInsertPoint(incBB);
         llvm::Value* oldIdx = builder_.CreateLoad(i64(), idxSlot);
-        builder_.CreateStore(builder_.CreateAdd(oldIdx, builder_.getInt64(1)), idxSlot);
+        builder_.CreateStore(builder_.CreateAdd(oldIdx, idxStep), idxSlot);
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(endBB);
         return true;
