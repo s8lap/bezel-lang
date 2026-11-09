@@ -2414,9 +2414,64 @@ const sema::TypeSymbol* Emitter::indexAccessReceiverDecl(
             break;
         }
     }
+    // fix #7667 (§23.4 Indexers / §26.5 Resolution, v0.355): the SAME false
+    // alarm, one sibling step on — a NON-GENERIC extension on a BUILT-IN
+    // collection target (`extension Array<int> … this[0] := this[0] + 10;`)
+    // draws it too. The receiver is a builtin collection whose TypeRef has no
+    // TypeSymbol, so the recovery above cannot succeed for it BY
+    // CONSTRUCTION; the access is lowered by the COLLECTION indexer path and
+    // the program's value is correct (MEASURED on this tree: `11` / `7` for
+    // the `Array<int>` repro and `y` / `x` for the `Array<string>` twin — the
+    // values are the CORRECT ones, so the announcement's "the read degrades to
+    // a zero/null value and a write is silently discarded" is false).
+    //
+    // #4160 covered the UNSPECIALIZED template body of a GENERIC extension
+    // and #7561 its SPECIALIZATION; neither covers the non-generic block,
+    // whose target type carries a CONCRETE element type — so #4160's "a
+    // generic argument no active substitution binds" gate cannot fire on it,
+    // and #7561's arm needs a specialization this block never forms.
+    //
+    // WHY THE RECEIVER IS RECOVERED HERE. The enclosing function IS the
+    // extension method, and the extension method's receiver's type IS the
+    // extension's target type — sema publishes it for `this` inside a
+    // builtin extension body (#456), which is what lets the collection path
+    // lower the access. The announcement denies exactly that ("the receiver
+    // could not be recovered ... from the enclosing function"), so its
+    // premise is false in this shape.
+    //
+    // GATED ON THE COLLECTION PATH'S OWN RECEIVER PREDICATES — the three
+    // `lowerCollectionIndexerGet` reads for its `isArr` / `isDict` arms — so
+    // the gate says "this access IS lowered by the collection indexer path"
+    // rather than "the target is some builtin": a builtin target the
+    // collection path does NOT handle keeps the announcement.
+    //
+    // AND GATED ON THE ENCLOSING FUNCTION BEING THE EXTENSION METHOD (the
+    // `methodFns_` lookup above), so a nested closure body — a lambda or an
+    // `async` body, where the enclosing function is the CLOSURE and not the
+    // extension method — still announces: THERE the receiver genuinely
+    // cannot be recovered from the enclosing function, and there is no
+    // indexer PropertySymbol to recover it from either (a builtin
+    // collection declares no indexer member, #2530). That is the #2833
+    // family this announcement was written for, and it stays armed.
+    bool builtinCollectionExtBody = false;
+    if (id && id->name == "this" && currentFn_) {
+        for (const auto& [ms, fn] : methodFns_) {
+            if (fn != currentFn_) continue;
+            if (!isExtensionMethod(ms) || !ms->extensionDecl->targetType)
+                break;
+            const sema::TypeRef* t =
+                ctx_.resolvedType(*ms->extensionDecl->targetType);
+            if (!t) break;
+            if (isCollectionTypeName(t) || isListInterfaceName(t) ||
+                isDictTypeName(t))
+                builtinCollectionExtBody = true;
+            break;
+        }
+    }
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(target)) {
         if ((id->name == "this" || id->name == "base") &&
             !deadGenericExtTemplateBody &&
+            !builtinCollectionExtBody &&
             !ctx_.diagnostics().hasErrors()) {
             ctx_.diagnostics().report(
                 Severity::Warning, id->span.begin,
