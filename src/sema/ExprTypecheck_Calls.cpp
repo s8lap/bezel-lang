@@ -35427,6 +35427,212 @@ static std::string_view concreteCollectionReceiverHead(const TypeRef* t) {
     return head;
 }
 
+// fix #8350 (stdlib §4.19, v0.355): the BARE-REFERENCE path's receiver head,
+// in BOTH of the shapes a built-in collection type carries:
+//
+//   * the ANNOTATION shape — a declaration-less Named TypeRef with an AST node
+//     (`Array<int>`, `Dictionary<int, int>`, ...); and
+//   * the compiler's builtin-class STUB — `FrozenArray<int>.From(a)`'s result
+//     carries `builtinClassSym("FrozenArray")` (stdlib §4.19: a TypeSymbol
+//     with NO AST declaration and NO module of origin), the same shape
+//     `concreteCollectionReceiverHead` (the CALL path's reader) accepts.
+//
+// The CALL path's gate reached the §4.19 head only through the stub shape;
+// the bare-reference path saw NEITHER (the #2536 catch-all's guard demanded
+// a declaration-less receiver), which is why a bare reference to a member
+// §4.19 does not declare compiled silently (issue #8350).
+//
+// A USER type that reuses a head's name is not a built-in head: it carries an
+// AST declaration (or a module), so it is excluded here and the bare-
+// reference surface never fires on it.
+// fix #8350 (stdlib §4.19, v0.355): the ANNOTATION shape's head — a
+// declaration-less Named TypeRef with an AST node (`Array<int>`,
+// `Dictionary<int, int>`, `FrozenArray<int>` written out, ...).
+//
+// The shape is kept SEPARATE from the builtin-class STUB shape below because
+// the two reach the bare-reference catch-all from two DIFFERENT places (the
+// stub shape's receiver carries a TypeSymbol, so it never enters the
+// `!targetType` block the annotation shape's catch-all lives in — see the
+// call sites).
+static std::string_view bareRefAnnotationCollectionHead(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return {};
+    if (t->declaration) return {};
+    if (!t->astNode || !t->astNode->name ||
+        t->astNode->name->parts.empty())
+        return {};
+    return t->headName();
+}
+
+// fix #8350 (stdlib §4.19, v0.355): the builtin-class STUB shape's head —
+// `FrozenArray<int>.From(a)`'s result carries `builtinClassSym("FrozenArray")`
+// (stdlib §4.19: a TypeSymbol with NO AST declaration and NO module of
+// origin), the same shape `concreteCollectionReceiverHead` (the CALL path's
+// reader) accepts.
+//
+// The stub shape's receiver carries a TypeSymbol, so `targetType` is
+// non-null in `resolveMemberAccess` and the `!targetType` block the #2536
+// catch-all lives in is NOT entered for it — which is exactly why a bare
+// reference to a member §4.19 does not declare compiled silently in the
+// factory-result shape (issue #8350) while the ANNOTATED twin of the same
+// type is refused.
+static std::string_view bareRefStubCollectionHead(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return {};
+    if (!t->declaration) return {};
+    if (t->declaration->decl || !t->declaration->moduleName.empty())
+        return {};
+    return t->declaration->name;
+}
+
+// fix #8350 / #8351 (stdlib §4.6-§4.10, §4.17-§4.19, v0.355): the heads whose
+// BARE-REFERENCE surface this file decides from the per-head table
+// (`concreteCollectionSurfaces`).
+//
+// The eight families are the #2536 catch-all's own set (unchanged — the
+// `Array`/`OwningArray` and `Stack`/`OwningStack`/`Queue`/`OwningQueue`
+// families have their OWN earlier per-family blocks, #2470/#2492 and #2457,
+// which own their bare-reference surface and fire first). stdlib §4.19's
+// `FrozenArray<T>` is ADDED: it had no bare-reference catch-all at all, so a
+// bare reference to a member §4.19 does not declare compiled silently and
+// degraded to a zero-initialized slot (issue #8350).
+static bool bareRefSurfaceHeadCovers(std::string_view head) {
+    return head == "Dictionary" || head == "SortedDictionary" ||
+           head == "OwningDictionary" || head == "Set" || head == "OwningSet" ||
+           head == "SortedSet" || head == "LinkedList" ||
+           head == "OwningLinkedList" || head == "FrozenArray";
+}
+
+// fix #8350 / #8351 (stdlib §4.6-§4.10, §4.17-§4.19, v0.355): the
+// bare-reference "no member" catch-all for the concrete built-in collection
+// heads, in ONE place, so the two receiver shapes of one head cannot disagree.
+//
+// THE DECISION and the QUOTED LIST both come from the head's OWN row of
+// `concreteCollectionSurfaces()` — the per-head table the CALL path reads
+// (fix #8331) — so the message and the gate can never disagree (issue #8351:
+// the hand-written per-family list this replaces omitted `Add`, `Count` and
+// `TryAdd` for `SortedDictionary` and `Count`, `Keys`, `Values` and `TryAdd`
+// for `Dictionary`; the list and the gate now read ONE row).
+//
+// `cn` is the head, already resolved by the caller — the ANNOTATION shape and
+// the builtin-class STUB shape are two receivers that reach this catch-all
+// from two different places (the stub shape's receiver carries a TypeSymbol,
+// so `resolveMemberAccess` never enters the `!targetType` block the
+// annotation shape's catch-all lives in).
+//
+// `compareToHasResidualDiagnostic` says whether the #3896 residual block
+// ("no member `CompareTo` on `FrozenArray<T>` (stdlib §4.19 declares no
+// `IComparable<T>` conformance for this type)") is reachable for this
+// receiver — it is NOT for the stub shape, whose `CompareTo` must therefore
+// draw THIS block's documented-surface diagnostic (the same verdict the stub
+// shape's CALL form already draws from the CALL-path gate).
+//
+// Returns true when it reported (the caller stops there).
+static bool bareRefCollectionSurfaceReject(SemaContext& ctx,
+                                            const ast::MemberAccessExpr& ma,
+                                            const ast::Expr* calleeOfCall,
+                                            std::string_view cn,
+                                            bool compareToHasResidualDiagnostic) {
+    if (cn.empty()) return false;
+    const ConcreteCollectionSurface* row = concreteCollectionSurfaceRow(cn);
+    if (!row || !bareRefSurfaceHeadCovers(cn)) return false;
+    const auto& mbr = ma.member;
+    // The CALL form has its own path: the CALL-path surface gate (fix #8331)
+    // reads the SAME table and refuses the SAME names.
+    if (&ma == calleeOfCall) return false;
+    // Universal Object members every reference type carries (language spec
+    // §8.1) — not enumerated in each family's stdlib section but still real
+    // members.
+    bool isUniversalObjectMember =
+        mbr == "ToString" || mbr == "Equals" ||
+        mbr == "GetHashCode" || mbr == "GetType" ||
+        mbr == "ReferenceEquals";
+    // stdlib §5 IEnumerable<T> LINQ extension operators — applicable to every
+    // family here (all conform to IEnumerable<T> via ICollection<T>/
+    // IReadOnlyCollection<T> EXCEPT OwningDictionary, which implements
+    // IDisposable only; the LINQ extension still applies to OwningDictionary
+    // because the extension machinery (language spec §26.5) dispatches
+    // structurally, exactly like the Stack/Queue block above).
+    // fix #3589: was the fourth hand-spelled copy of this same list — now the
+    // shared table.
+    bool isLinqOperator =
+        common::isBuiltinCollectionLinqOperatorName(mbr);
+    // fix #8350 / #8351 (stdlib §4.6-§4.10, §4.17-§4.19, v0.355): the
+    // DECISION and the QUOTED LIST both come from the head's OWN row of
+    // `concreteCollectionSurfaces()` — the per-head table the CALL path reads
+    // (fix #8331).
+    //
+    // Before this fix the decision was a hand-written FAMILY UNION (the
+    // `isKnownProperty` / `isDeclaredMethod` / `isInheritedIsReadOnly` lists)
+    // and the quoted list was a SECOND, hand-written per-family list; the two
+    // drifted from each other AND from the standard library (issue #8351: the
+    // `SortedDictionary` list omitted `Add`, `Count` and `TryAdd`; the
+    // `Dictionary` list omitted `Count`, `Keys`, `Values` and `TryAdd`), and
+    // the §4.19 head had no row at all (issue #8350).
+    //
+    // The per-head row reproduces the old decision EXACTLY where the old
+    // decision was right, and TIGHTENS it where the old decision over-
+    // included:
+    //   * `Count` — every one of these heads' rows declares it (stdlib
+    //     §4.6-§4.10, §4.17, §4.18), as the old unconditional
+    //     `isKnownProperty` allowed;
+    //   * `Keys`/`Values` — only the §4.8/§4.9 rows declare them (stdlib
+    //     §4.17's `SortedDictionary` has `FirstKey`/`LastKey` but no
+    //     `Keys`/`Values`; the set and list families are not maps at all), as
+    //     the old per-family gate allowed;
+    //   * `IsReadOnly` — only the §4.8/§4.10/§4.6/§4.7 rows declare it
+    //     (stdlib §4.9's `OwningDictionary` implements `IDisposable` only, and
+    //     §4.17/§4.18's heads conform to `IReadOnlyCollection` only), as the
+    //     old `isInheritedIsReadOnly` gate allowed;
+    //   * every declared METHOD — the row's own members (the old family union
+    //     admitted a name SOME head of the family declares, so it claimed
+    //     `Set<T>.ContainsKey` and `SortedDictionary<K, V>.GetOrAdd` were
+    //     "real members" — neither stdlib §4.10 nor stdlib §4.17 declares
+    //     them).
+    //
+    // The §4.19 row declares `Length`, the indexer `[i: int]: T`, `ToArray()`
+    // and `GetEnumerator()` — and NO `Count` (that is §4.4's `Array<T>`
+    // member), so a bare reference to it is refused with this diagnostic
+    // instead of compiling and silently degrading to a zero-initialized slot
+    // (#8350).
+    bool isDeclaredMember = isDocumentedConcreteCollectionMember(cn, mbr);
+    // fix #8350: `CompareTo` on the §4.19 head belongs to the #3896 residual
+    // block (the `IComparable<T>`-conformance diagnostic), which is the
+    // authority the CALL form of `FrozenArray.CompareTo` draws today — so the
+    // BARE form must draw the SAME one (the two forms of one member on one
+    // head must agree; their disagreement is issue #8350's defect). The
+    // §4.6-§4.10/§4.17/§4.18/§4.8/§4.9 heads keep THIS block's
+    // documented-surface diagnostic for `CompareTo`, exactly as they always
+    // have.
+    bool isResidualCompareTo =
+        compareToHasResidualDiagnostic && cn == "FrozenArray" &&
+        mbr == "CompareTo";
+    if (isUniversalObjectMember || isLinqOperator || isDeclaredMember ||
+        isResidualCompareTo)
+        return false;
+    // The stdlib section that DECLARES the head's surface, and the members
+    // that section declares — BOTH read from the head's own row, so the
+    // diagnostic quotes exactly the surface the decision was made against (the
+    // same sentence the CALL path's gate emits, fix #8331; the hand-written
+    // list this replaces drifted from the table it claimed to quote — issue
+    // #8351).
+    std::string section = "\xC2\xA7" + std::string(row->section);
+    std::string surface = concreteCollectionSurfaceList(cn);
+    auto loc = ma.span.begin;
+    if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+    ctx.diagnostics().report(
+        Severity::Error, loc,
+        std::string("no member `") + std::string(mbr) + "` on `" +
+            std::string(cn) + "` (stdlib " + section +
+            ") -- it is not part of this "
+            "collection's documented surface (" + surface +
+            "), a universal "
+            "`ToString`/`Equals`/`GetHashCode`/"
+            "`GetType` member (language spec "
+            "\xC2\xA7""8.1), or a stdlib "
+            "\xC2\xA7""5 LINQ extension "
+            "operator");
+    return true;
+}
+
 // fix #7700 (§26.5 rule 1, v0.350): the receiver is a concrete built-in
 // collection and its declared surface names `member`, so instance resolution
 // is committed by NAME and the extension blocks are never consulted. Like
@@ -38944,6 +39150,43 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
            targetType == builtinClassSym("DateOnly") ||
            targetType == builtinClassSym("TimeOnly") ||
            targetType == builtinClassSym("Guid"))));
+    // fix #8350 (stdlib §4.19, v0.355): the bare-reference "no member"
+    // catch-all for the BUILTIN-CLASS STUB shape — the factory-result
+    // receiver `FrozenArray<int>.From(a)` carries, whose TypeRef's
+    // `declaration` is the synthetic `builtinClassSym("FrozenArray")`.
+    //
+    // WHY IT NEEDS ITS OWN CALL SITE. The #2536 catch-all (below, inside the
+    // `!targetType` block) is reached only when the receiver carries NO
+    // TypeSymbol. The stub shape's receiver DOES carry one (the synthetic
+    // builtin class symbol), so `targetType` is non-null here and that block
+    // is never entered for it — MEASURED: before this fix the ANNOTATED twin
+    // of the very same type (`var f: FrozenArray<int> := ...`) was refused
+    // with the stdlib's documented-surface diagnostic while the factory-result
+    // twin (`var f := FrozenArray<int>.From(a);`) compiled clean and degraded
+    // to a zero-initialized slot. The two shapes of one type disagreed about
+    // one head's surface, which is issue #8350's defect.
+    //
+    // The stub shape is the ONLY receiver this call site can fire on: the
+    // head is read from the synthetic symbol, so a USER type that reuses the
+    // name (it carries an AST declaration or a module) is excluded, and a
+    // receiver with no TypeSymbol at all is the ANNOTATION shape, which the
+    // catch-all below already owns. The DECISION and the QUOTED LIST come
+    // from the same per-head table row the CALL path reads (fix #8331) and
+    // the ANNOTATION shape's catch-all reads, so the three paths (call,
+    // annotation, stub) quote ONE surface per head.
+    //
+    // The stub shape has NO #3896 residual block (that block lives in the
+    // `!targetType` block too), so `CompareTo` is NOT exempt here: it draws
+    // this block's documented-surface diagnostic — the same verdict the stub
+    // shape's CALL form already draws from the CALL-path gate.
+    if (ma.target && !ctx_.exprType(ma)) {
+        if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+            bareRefCollectionSurfaceReject(
+                ctx_, ma, calleeOfCallCtx_,
+                bareRefStubCollectionHead(tt),
+                /*compareToHasResidualDiagnostic=*/false);
+        }
+    }
     if (!targetType || builtinDateTimeRecv) {
         // §31 / #600 phase c: `e.Message` where `e` is typed as a PURE built-in
         // exception (declaration==nullptr, no user TypeSymbol — e.g. a caught
@@ -42005,10 +42248,28 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // OwningLinkedList only; Dispose on every owning
                         // family). Excluding property names on purpose
                         // (see the block comment).
+                        //
+                        // fix #8351 (stdlib §4.10, v0.355): the list above is
+                        // the FAMILY UNION — it names a method some head of
+                        // the family declares, and the block used to claim
+                        // the name was a "real member" of EVERY head of the
+                        // family. stdlib §4.10's `Set<T>` declares no
+                        // `ContainsKey`/`TryGetValue`/`Drain`, §4.17's
+                        // `SortedDictionary<K, V>` declares no `GetOrAdd`,
+                        // and §4.6/§4.7's `LinkedList`/`OwningLinkedList`
+                        // declare no `Add` — so this block told the user a
+                        // member the standard library does NOT declare on
+                        // that head was real. The head's OWN row of
+                        // `concreteCollectionSurfaces()` is the authority now
+                        // (the same table the CALL path reads), so the claim
+                        // is true for every name this block fires on: a name
+                        // the head does not declare falls through to the
+                        // #2536 catch-all below, which rejects it with the
+                        // stdlib's documented-surface diagnostic.
                         bool isDeclaredMethod =
                             // Dictionary/OwningDictionary/
                             // SortedDictionary shared surface
-                            mbr == "Add" || mbr == "Contains" ||
+                            (mbr == "Add" || mbr == "Contains" ||
                             mbr == "ContainsKey" ||
                             mbr == "Remove" || mbr == "TryGetValue" ||
                             mbr == "GetOrNull" || mbr == "GetOrAdd" ||
@@ -42024,6 +42285,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             mbr == "IsSupersetOf" ||
                             // Set/OwningSet/SortedSet — stdlib §4.10/§4.18
                             mbr == "TryAdd" ||
+                            // OwningSet-only (stdlib §4.10: `Pop`/`TryPop`
+                            // — the names §4.10 renamed `Take`/`TryTake` to)
+                            mbr == "Pop" || mbr == "TryPop" ||
                             // LinkedList/OwningLinkedList surface
                             mbr == "AddFirst" || mbr == "AddLast" ||
                             mbr == "AddBefore" || mbr == "AddAfter" ||
@@ -42043,7 +42307,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             // (OwningDictionary's GetEnumerator is the
                             // #2521 distinct diagnostic above — that
                             // block returns before this one runs).
-                            mbr == "GetEnumerator";
+                            mbr == "GetEnumerator") &&
+                            // fix #8351 (stdlib §4.6-§4.10, §4.17, v0.355):
+                            // the head's OWN row of the per-head table is the
+                            // authority — the family union above names a
+                            // method SOME head of the family declares, so the
+                            // union alone would claim a member the standard
+                            // library does NOT declare on THIS head is real.
+                            isDocumentedConcreteCollectionMember(cn, mbr);
                         // stdlib §5 IEnumerable<T> LINQ extension operators.
                         // fix #3589: was a hand-spelled copy (this comment
                         // used to say it "mirrors the #2536 block's identical
@@ -42058,24 +42329,17 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             // exactly the same set the #2536 catch-all
                             // below uses, so the two rejects are
                             // internally consistent.
-                            const char* section = "\xC2\xA7""4.x";
-                            if (isOwningDictionary) {
-                                section = "\xC2\xA7""4.9";
-                            } else if (isDictionaryFamily) {
-                                section = cn == "Dictionary"
-                                    ? "\xC2\xA7""4.8"
-                                    : "\xC2\xA7""4.17";
-                            } else if (isSetFamily) {
-                                section = cn == "SortedSet"
-                                    ? "\xC2\xA7""4.18"
-                                    : "\xC2\xA7""4.10";
-                            } else {
-                                // isLinkedListFamily: LinkedList §4.6,
-                                // OwningLinkedList §4.7.
-                                section = cn == "OwningLinkedList"
-                                    ? "\xC2\xA7""4.7"
-                                    : "\xC2\xA7""4.6";
-                            }
+                            //
+                            // fix #8351 (stdlib §4.6-§4.10, §4.17, v0.355):
+                            // the section is READ from the head's own row of
+                            // `concreteCollectionSurfaces()` — the same table
+                            // the CALL path reads — so the citation and the
+                            // decision can never name different sections.
+                            const ConcreteCollectionSurface* row =
+                                concreteCollectionSurfaceRow(cn);
+                            std::string section =
+                                row ? ("\xC2\xA7" + std::string(row->section))
+                                     : std::string("\xC2\xA7""4.x");
                             auto loc = ma.span.begin;
                             if (loc.line == 0 && ma.target)
                                 loc = ma.target->span.begin;
@@ -42085,7 +42349,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                     std::string(mbr) + "` (language spec "
                                     "\xC2\xA7""27.6) is not yet "
                                     "supported on `" + std::string(cn) +
-                                    "` (stdlib " + std::string(section) +
+                                    "` (stdlib " + section +
                                     ", #2537): `" + std::string(mbr) +
                                     "` is a real member (declared, a "
                                     "universal Object member -- language "
@@ -42188,6 +42452,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // only, so those are genuinely "not a member" rather than "real
         // member but no function value yet").
         //
+        // fix #8350 / #8351 (stdlib §4.6-§4.10, §4.17-§4.19, v0.355): the
+        // catch-all now reads the stdlib's own PER-HEAD table
+        // (`concreteCollectionSurfaces`) — the same table the CALL path's
+        // surface gate reads (fix #8331) — for BOTH the decision and the
+        // quoted surface list, and stdlib §4.19's `FrozenArray<T>` is
+        // ADDED to the heads it covers (issue #8350: the §4.19 head had no
+        // bare-reference catch-all at all, so a bare reference to a member
+        // §4.19 does not declare compiled silently and degraded to a
+        // zero-initialized slot). The quoted list is GENERATED from the row
+        // the decision was made against (issue #8351: the hand-written
+        // per-family list drifted from the table it claimed to quote — it
+        // omitted `Add`, `Count` and `TryAdd` for `SortedDictionary`, and
+        // `Count`, `Keys`, `Values` and `TryAdd` for `Dictionary`).
+        //
         // This is the "no member" catch-all ONLY — for a name that is
         // not part of the family's stdlib-documented surface. Names
         // that ARE documented members are deliberately LEFT TO FALL
@@ -42205,357 +42483,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // existing test that bare-references a documented member.
         if (ma.target && !ctx_.exprType(ma)) {
             if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
-                if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
-                    tt->astNode && tt->astNode->name &&
-                    !tt->astNode->name->parts.empty()) {
-                    std::string_view cn = tt->headName();
-                    bool isOwningDictionary = cn == "OwningDictionary";
-                    bool isDictionaryFamily =
-                        cn == "Dictionary" || cn == "SortedDictionary";
-                    bool isSetFamily =
-                        cn == "Set" || cn == "OwningSet" ||
-                        cn == "SortedSet";
-                    bool isLinkedListFamily =
-                        cn == "LinkedList" || cn == "OwningLinkedList";
-                    if (isOwningDictionary || isDictionaryFamily ||
-                        isSetFamily || isLinkedListFamily) {
-                        const auto& mbr = ma.member;
-                        bool isCallForm = &ma == calleeOfCallCtx_;
-                        if (!isCallForm) {
-                            // Universal Object members every reference
-                            // type carries (language spec §8.1) — not
-                            // enumerated in each family's stdlib section
-                            // but still real members.
-                            bool isUniversalObjectMember =
-                                mbr == "ToString" || mbr == "Equals" ||
-                                mbr == "GetHashCode" || mbr == "GetType" ||
-                                mbr == "ReferenceEquals";
-                            // stdlib §5 IEnumerable<T> LINQ extension
-                            // operators — applicable to every family here
-                            // (all conform to IEnumerable<T> via ICollection
-                            // <T>/IReadOnlyCollection<T> EXCEPT
-                            // OwningDictionary, which implements
-                            // IDisposable only; the LINQ extension still
-                            // applies to OwningDictionary because the
-                            // extension machinery (language spec §26.5)
-                            // dispatches structurally, exactly like the
-                            // Stack/Queue block above).
-                            // fix #3589: was the fourth hand-spelled copy of
-                            // this same list — now the shared table.
-                            bool isLinqOperator =
-                                common::isBuiltinCollectionLinqOperatorName(
-                                    mbr);
-                            // Known property names — handled by dedicated
-                            // property handlers above (~10908 Keys/Values,
-                            // ~10947 Count) for the families in their
-                            // explicit list, but a FEW families are missing
-                            // from those handlers and would otherwise be
-                            // false-rejected here as "no member" on a bare
-                            // reference:
-                            //   - SortedSet/SortedDictionary: `Count` is
-                            //     typed by the call-form handler at ~5382
-                            //     (sets exprType on the CallExpr, not the
-                            //     MemberAccessExpr), so the bare-reference
-                            //     form `var f := s.Count;` falls through
-                            //     here untyped. The property handler at
-                            //     ~10947 explicitly excludes SortedSet/
-                            //     SortedDictionary from its `hasCount` list
-                            //     — a pre-existing gap this block would
-                            //     otherwise expose.
-                            // `Count` is in the stdlib-documented surface of
-                            // every one of the eight families in this block
-                            // (std §4.7-§4.10, §4.17, §4.18), so it is allowed
-                            // unconditionally here.
-                            //
-                            // `Keys`/`Values` (stdlib §4.8/§4.9 only):
-                            // Dictionary<K,V> (§4.8) and OwningDictionary<K,V>
-                            // (§4.9) are the ONLY families whose stdlib
-                            // surface declares them. SortedDictionary (§4.17,
-                            // has FirstKey/LastKey but no Keys/Values),
-                            // SortedSet (§4.18), Set/OwningSet (§4.10), and
-                            // LinkedList/OwningLinkedList (§4.6/§4.7, sets
-                            // and lists — not maps at all) do NOT declare
-                            // either property. Without the per-family gate
-                            // below, a bare reference like
-                            //   `var k := sd.Keys;`
-                            // compiled silently on HEAD at exit 0 with no
-                            // diagnostic and no sema-typed result (the
-                            // property handler at ~10908 covers Dictionary/
-                            // OwningDictionary only; the catch-all here
-                            // exempts the name from the "no member" reject;
-                            // codegen's #2434 zero-init fallback then
-                            // degraded the local to `i32`). Gating on the
-                            // family name converts the silent false-accept
-                            // into a proper "no member" reject — exactly
-                            // what the catch-all was designed to do for
-                            // names outside the documented surface (#2457).
-                            //
-                            // #2538: `IsReadOnly` is declared on
-                            // `ICollection<T>` (§4.1) and `IOwningCollection<T>`
-                            // (§4.2); every standard collection implementing
-                            // either inherits it (the stdlib §4.1 prose names
-                            // `Array<T>`, `LinkedList<T>`, `Set<T>`,
-                            // `Dictionary<K,V>` and the owning-family
-                            // counterpart). OwningDictionary intentionally
-                            // omits (it implements `IDisposable` only, §4.9),
-                            // so IsReadOnly is gated on the family name
-                            // (checked together with the rest of the
-                            // documented surface further below).
-                            bool isKnownProperty =
-                                mbr == "Count" ||
-                                ((mbr == "Keys" || mbr == "Values") &&
-                                 (cn == "Dictionary" || cn == "OwningDictionary"));
-                            // Per-family documented methods (stdlib
-                            // §4.7-§4.10, §4.17, §4.18). Enumerated as a
-                            // catch-all UNION across the family's own
-                            // declared methods (owning vs. borrowing
-                            // variants share most names; the ones that
-                            // differ — PopValue/TryPopValue/Drain on
-                            // OwningDictionary only, GetOrAdd on
-                            // Dictionary only, PopFirst/PopLast/
-                            // TryPopFirst/TryPopLast on OwningLinkedList
-                            // only — are included unconditionally so a
-                            // name legitimate on EITHER variant is allowed
-                            // on both, matching the #2457 blocks' identical
-                            // over-inclusion reasoning).
-                            //
-                            // #2538 (follow-up to #2536): the original block
-                            // omitted the names inherited from the underlying
-                            // interfaces — `GetEnumerator` (from
-                            // `IEnumerable<T>` via `ICollection<T>` on the
-                            // borrowing families and via `IReadOnlyCollection
-                            // <T>` on `IOwningCollection<T>` for the owning
-                            // ones, stdlib §4.1/§4.12; OwningDictionary
-                            // correctly omits per §4.9 — it implements
-                            // `IDisposable` only) and `TryAdd` (from
-                            // `Set<T>`/`OwningSet<T>` §4.10 and
-                            // `SortedSet<T>` §4.18). A bare reference to a
-                            // real documented member is supposed to fall through
-                            // to the #2537 "real member but no function value"
-                            // path (the symptom this catch-all is designed to
-                            // avoid conflating with the bogus-name case); the
-                            // omission produced a false "no member" reject
-                            // (#2538). Also includes `IsReadOnly` (from
-                            // `ICollection<T>` §4.1 / `IOwningCollection<T>`
-                            // §4.2 — all six non-dictionary-owning families
-                            // inherit it; OwningDictionary intentionally
-                            // omits) and the OwningLinkedList-only Pop/Pop
-                            // exhausters (stdlib §4.7 — same Union reasoning
-                            // as PopValue/TryPopValue/Drain above).
-                            bool isDeclaredMethod =
-                                // Dictionary/OwningDictionary/
-                                // SortedDictionary shared surface
-                                mbr == "Add" || mbr == "Contains" ||
-                                mbr == "ContainsKey" ||
-                                mbr == "Remove" || mbr == "TryGetValue" ||
-                                mbr == "GetOrNull" || mbr == "GetOrAdd" ||
-                                mbr == "Clear" ||
-                                // OwningDictionary-only (stdlib §4.9)
-                                mbr == "PopValue" || mbr == "TryPopValue" ||
-                                mbr == "Drain" ||
-                                // Set/OwningSet/SortedSet surface
-                                mbr == "UnionWith" ||
-                                mbr == "IntersectWith" ||
-                                mbr == "ExceptWith" ||
-                                mbr == "IsSubsetOf" ||
-                                mbr == "IsSupersetOf" ||
-                                // Set/OwningSet/SortedSet — stdlib §4.10 /
-                                // §4.18 (TryAdd: false on duplicate, the
-                                // bool-returning counterpart of `Add`).
-                                mbr == "TryAdd" ||
-                                // LinkedList/OwningLinkedList surface
-                                mbr == "AddFirst" || mbr == "AddLast" ||
-                                mbr == "AddBefore" || mbr == "AddAfter" ||
-                                mbr == "RemoveFirst" ||
-                                mbr == "RemoveLast" ||
-                                mbr == "RemoveNode" || mbr == "Find" ||
-                                // OwningLinkedList-only (stdlib §4.7)
-                                mbr == "PopFirst" || mbr == "PopLast" ||
-                                mbr == "TryPopFirst" ||
-                                mbr == "TryPopLast" ||
-                                // IDisposable (every owning family)
-                                mbr == "Dispose" ||
-                                // #2538 sweep: IEnumerable<T> ancestor
-                                // (`ICollection<T>` §4.1 / `IReadOnlyCollection
-                                // <T>` §4.1 / `IOwningCollection<T>` §4.2 →
-                                // `IEnumerable<T>` §4.12). All seven families
-                                // in this block EXCEPT OwningDictionary
-                                // inherit it; included unconditionally for
-                                // the same over-inclusion reasoning
-                                // (GetOrAdd on Dictionary only, etc.).
-                                mbr == "GetEnumerator";
-                            // #2538: `IsReadOnly` is declared on
-                            // `ICollection<T>` (§4.1) and `IOwningCollection<T>`
-                            // (§4.2); every standard collection that conforms
-                            // to either inherits it. The families that
-                            // implement (any of) those interfaces are
-                            // `Dictionary` (§4.8 — `ICollection
-                            // <DictionaryEntry<K,V>>`), `Set` (§4.10 —
-                            // `ICollection<T>`), `OwningSet` (§4.10 —
-                            // `IOwningCollection<T>`), `LinkedList`
-                            // (§4.6 — `ICollection<T>`), `OwningLinkedList`
-                            // (§4.7 — `IOwningCollection<T>`). The
-                            // `SortedDictionary` (§4.17), `SortedSet`
-                            // (§4.18), and `OwningDictionary` (§4.9)
-                            // DEFS use `IReadOnlyCollection<…>` or
-                            // `IDisposable`-only conformance and do NOT
-                            // inherit `IsReadOnly` — the bare reference
-                            // keeps rejecting (`OwningDictionary`) or
-                            // doesn't reach this block
-                            // (`SortedDictionary`/`SortedSet` — the
-                            // dedicated property handler at ~10947 doesn't
-                            // name `IsReadOnly` either, so the bare form
-                            // currently lands here and rejects; that is the
-                            // documented behavior, not a bug).
-                            bool isInheritedIsReadOnly =
-                                mbr == "IsReadOnly" &&
-                                (cn == "Dictionary" || cn == "Set" ||
-                                 cn == "OwningSet" || cn == "LinkedList" ||
-                                 cn == "OwningLinkedList");
-                            if (!isUniversalObjectMember &&
-                                !isLinqOperator &&
-                                !isDeclaredMethod &&
-                                !isKnownProperty &&
-                                !isInheritedIsReadOnly) {
-                                // Build a family-specific surface citation
-                                // so the diagnostic names the real
-                                // documented members (§4.7-§4.10, §4.17,
-                                // §4.18), not a generic "no member" that
-                                // leaves the user guessing what IS a
-                                // member.
-                                std::string surface;
-                                const char* section = "\xC2\xA7""4.x";
-                                if (isOwningDictionary) {
-                                    // §4.9: OwningDictionary implements
-                                    // `IDisposable` only — no `GetEnumerator`
-                                    // (the #2521 distinct diagnostic above
-                                    // covers that), no `IsReadOnly`. Cite
-                                    // only the union of the family + its
-                                    // interface ancestors.
-                                    section = "\xC2\xA7""4.9";
-                                    surface = "Add/ContainsKey/Contains/"
-                                              "Remove/TryGetValue/"
-                                              "GetOrNull/GetOrAdd/PopValue/"
-                                              "TryPopValue/Drain/Clear";
-                                } else if (isDictionaryFamily) {
-                                    // §4.8 Dictionary / §4.17 SortedDictionary:
-                                    // both inherit `IEnumerable<T>` (via
-                                    // `ICollection<DictionaryEntry<K,V>>` and
-                                    // `IReadOnlyCollection<DictionaryEntry<K,V>>`
-                                    // respectively, §4.1) and `ICollection<T>`'s
-                                    // `IsReadOnly` (Dictionary only, §4.1).
-                                    // SortedDictionary uses `IReadOnlyCollection`
-                                    // so the `IsReadOnly` prose does not apply
-                                    // — the comment sharpens the citation
-                                    // below.
-                                    section = cn == "Dictionary"
-                                        ? "\xC2\xA7""4.8"
-                                        : "\xC2\xA7""4.17";
-                                    if (cn == "Dictionary") {
-                                        surface = "Add/ContainsKey/Contains/"
-                                                  "Remove/TryGetValue/"
-                                                  "GetOrNull/GetOrAdd/Clear/"
-                                                  "IsReadOnly/GetEnumerator";
-                                    } else {
-                                        // SortedDictionary: drops
-                                        // `Add`/`GetOrAdd`/`IsReadOnly`
-                                        // (no `ICollection<T>`) but adds
-                                        // `FirstKey`/`LastKey` (note: those
-                                        // two are typed by the dedicated
-                                        // property handler at ~11081, so the
-                                        // catch-all here is only relevant if
-                                        // `FirstKey`/`LastKey` ever fell
-                                        // through).
-                                        surface = "ContainsKey/Contains/"
-                                                  "TryGetValue/GetOrNull/"
-                                                  "Remove/Clear/FirstKey/"
-                                                  "LastKey/GetEnumerator";
-                                    }
-                                } else if (isSetFamily) {
-                                    // §4.10 Set/OwningSet, §4.18 SortedSet.
-                                    // All three inherit `IEnumerable<T>` via
-                                    // `ICollection<T>` (Set, §4.1) or
-                                    // `IReadOnlyCollection<T>` (OwningSet,
-                                    // §4.2; SortedSet, §4.18). `IsReadOnly`
-                                    // applies to the two `ICollection<T>` /
-                                    // `IOwningCollection<T>` conformers
-                                    // (Set, OwningSet) — SortedSet uses
-                                    // `IReadOnlyCollection` only and does
-                                    // not declare `IsReadOnly`. `TryAdd`
-                                    // (§4.10 / §4.18) and `First`/`Last`
-                                    // (SortedSet §4.18) round out the
-                                    // surface.
-                                    section = cn == "SortedSet"
-                                        ? "\xC2\xA7""4.18"
-                                        : "\xC2\xA7""4.10";
-                                    if (cn == "SortedSet") {
-                                        surface = "Add/Remove/Contains/Clear/"
-                                                  "TryAdd/GetEnumerator/First/"
-                                                  "Last";
-                                    } else {
-                                        surface = "Add/Remove/Contains/Clear/"
-                                                  "UnionWith/IntersectWith/"
-                                                  "ExceptWith/IsSubsetOf/"
-                                                  "IsSupersetOf/TryAdd/"
-                                                  "IsReadOnly/GetEnumerator";
-                                    }
-                                } else {
-                                    // isLinkedListFamily — stdlib §4.6 is
-                                    // `LinkedList<T>` (borrowing), §4.7 is
-                                    // `OwningLinkedList<T>` (owning); they
-                                    // are split the same way Dictionary
-                                    // (§4.8/§4.17) and Array (§4.4/§4.5)
-                                    // are, unlike `Set<T>`/`OwningSet<T>`
-                                    // which share a heading (§4.10).
-                                    // Both inherit `IEnumerable<T>` via
-                                    // `ICollection<T>` (LinkedList, §4.1) or
-                                    // `IOwningCollection<T>` (OwningLinkedList,
-                                    // §4.2). `IsReadOnly` applies to the
-                                    // `ICollection<T>` / `IOwningCollection<T>`
-                                    // conformers. OwningLinkedList additionally
-                                    // carries `PopFirst`/`PopLast`/
-                                    // `TryPopFirst`/`TryPopLast` (§4.7).
-                                    section = cn == "OwningLinkedList"
-                                        ? "\xC2\xA7""4.7"
-                                        : "\xC2\xA7""4.6";
-                                    if (cn == "LinkedList") {
-                                        surface = "AddFirst/AddLast/AddBefore/"
-                                                  "AddAfter/RemoveFirst/"
-                                                  "RemoveLast/RemoveNode/Find/"
-                                                  "Contains/Clear/IsReadOnly/"
-                                                  "GetEnumerator";
-                                    } else {
-                                        surface = "AddFirst/AddLast/AddBefore/"
-                                                  "AddAfter/RemoveFirst/"
-                                                  "RemoveLast/RemoveNode/Find/"
-                                                  "Contains/Clear/IsReadOnly/"
-                                                  "GetEnumerator/PopFirst/"
-                                                  "PopLast/TryPopFirst/"
-                                                  "TryPopLast";
-                                    }
-                                }
-                                auto loc = ma.span.begin;
-                                if (loc.line == 0 && ma.target)
-                                    loc = ma.target->span.begin;
-                                ctx_.diagnostics().report(
-                                    Severity::Error, loc,
-                                    std::string("no member `") +
-                                        std::string(mbr) + "` on `" +
-                                        std::string(cn) +
-                                        "` (stdlib " + section +
-                                        ") -- it is not part of this "
-                                        "collection's documented surface (" +
-                                        surface + "), a universal "
-                                        "`ToString`/`Equals`/`GetHashCode`/"
-                                        "`GetType` member (language spec "
-                                        "\xC2\xA7""8.1), or a stdlib "
-                                        "\xC2\xA7""5 LINQ extension "
-                                        "operator");
-                                return;
-                            }
-                        }
-                    }
-                }
+                // fix #8350 (stdlib §4.19, v0.355): the head is read in the
+                // ANNOTATION shape (a declaration-less Named TypeRef with an
+                // AST node) here. The builtin-class STUB shape
+                // (`FrozenArray<int>.From(...)`'s result carries
+                // `builtinClassSym("FrozenArray")`) cannot reach this block —
+                // its receiver carries a TypeSymbol, so `targetType` is
+                // non-null and the `!targetType` block this catch-all lives in
+                // is never entered for it — so it has its own call site below
+                // the block. The two shapes read the SAME table row, so they
+                // cannot disagree about a head's surface.
+                bareRefCollectionSurfaceReject(
+                    ctx_, ma, calleeOfCallCtx_,
+                    bareRefAnnotationCollectionHead(tt),
+                    /*compareToHasResidualDiagnostic=*/true);
             }
         }
         // #2444 (sibling gap to #2423/#2433; stdlib §4.8/§4.9; language spec
