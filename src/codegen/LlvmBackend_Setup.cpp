@@ -34233,6 +34233,89 @@ struct StringEscapeWalker {
                     expr(as->value.get(), /*safeRead=*/true);
                     return;
                 }
+                // fix #8278 (stdlib §4.8 / §28.11 / §28.9, v0.355): the
+                // BUILT-IN dictionary indexer-SET twin of the user-indexer
+                // relaxation immediately above — `d[k] := s;` on a BORROWING
+                // built-in `Dictionary<K,string>` / `Dictionary<K,string?>` (and
+                // its `SortedDictionary` twin, which lowers through the
+                // identical arm — LlvmBackend_Assign.cpp has no
+                // SortedDictionary-specific indexer arm).
+                //
+                // WHY THE STORE IS A BORROW. The dict indexer-set lowering
+                // (LlvmBackend_Assign.cpp's `lowerCollectionIndexerSet`, the
+                // `isStrVal` arm) RETAINS the stored value into the table
+                // BEFORE the store — `bz_string_retain(val)` then
+                // `bz_dict_set_gen_disposing(..., bz$strElemRelease)` — so the
+                // DICTIONARY takes its OWN +1 and the SOURCE local's own +1
+                // stays in its slot. That is the same "the container takes its
+                // own +1, the source keeps its own" fact #2505/#2535 (a class
+                // property setter) and #8214 (an object-typed string storage
+                // field) already established for their own store sites, and it
+                // is what the spec states for the borrowing family: §28.11's
+                // element slot policy classifies a runtime-managed reference
+                // (`string`) element as a SHARED reference in a borrowing
+                // collection's slot — "store references whose holders continue
+                // to own the elements" — so the collection co-owns a reference
+                // of its own and the source holder keeps its own +1.
+                //
+                // WHY THE WALKER MUST KNOW. Before this arm the store was a
+                // conservative ESCAPE, so the source local lost its scope-end
+                // release and its +1 was orphaned: the `d[k] := v;` shape
+                // leaked the stored string's header + payload (MEASURED on the
+                // pre-fix build: a 32-byte Direct leak + a 3-byte Indirect
+                // leak for one store of a producer-initialized `string?`).
+                // That leak was MASKED on the issue's own repro by the
+                // over-release: the `??` read consumed the source slot's +1
+                // instead (see lowerCoalesce in LlvmBackend_Exprs2.cpp), so
+                // the program died with §28.9's "refcount over-release" fatal
+                // before the leak could be observed. Fixing the read WITHOUT
+                // this arm turns the masked over-release into a VISIBLE leak —
+                // the two halves are one fix, exactly as in #1951's
+                // retain-not-transfer + walker-relaxation pair.
+                //
+                // THE OWNING DICTIONARY IS EXCLUDED. `OwningDictionary<K,V>`
+                // TRANSFERS the value: its indexer-set nulls the source slot
+                // (`nullTransferredOwnedLocalSlot`) and the dictionary owns the
+                // reference the source had, so the source local's +1 must NOT
+                // be released again. Only the VALUE side differs from
+                // `Dictionary` (the KEY side is byte-identical — #3872), so
+                // the exclusion is exactly the head-name test below.
+                //
+                // Gated on `stringReleaseMode` (the string-release walk family
+                // only — the dict-materializer / grouping / borrowing-Array
+                // walks reuse this walker but release nothing here, so for
+                // them the store genuinely aliases one reference and must keep
+                // tainting the source) and on `!inLambda` (a store inside a
+                // lambda body outlives the producing scope — the env holds the
+                // captured value — the same `inLambda` clause the #1997 /
+                // #2764 / #8214 relaxations use).
+                bool builtinDictStrIdxSet = false;
+                if (stringReleaseMode && !inLambda) {
+                    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(
+                            as->target.get())) {
+                        if (ix->target) {
+                            if (const sema::TypeRef* rt =
+                                    ctx.exprType(*ix->target)) {
+                                const sema::TypeRef* vt =
+                                    rt->genericArgs.size() > 1
+                                        ? rt->genericArgs[1] : nullptr;
+                                builtinDictStrIdxSet =
+                                    isBuiltinDictionaryTypeRef(rt) &&
+                                    rt->headName() != "OwningDictionary" &&
+                                    vt &&
+                                    vt->kind ==
+                                        sema::TypeRef::Kind::Primitive &&
+                                    vt->primitive ==
+                                        sema::PrimitiveType::String;
+                            }
+                        }
+                    }
+                }
+                if (builtinDictStrIdxSet) {
+                    expr(as->target.get(), /*safeRead=*/false);
+                    expr(as->value.get(), /*safeRead=*/true);
+                    return;
+                }
                 // fix #2806 / §4.6 / §28.3 K1.6 / §28.9 (v0.282): the
                 // LOCAL-TO-LOCAL string ASSIGNMENT twin of #2764's
                 // declaration form — `alias := built;` where `alias` is an

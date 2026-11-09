@@ -363,12 +363,54 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
     // before the endBB PHI — the SAME per-arm mint lowerCaseExpr/lowerConditional
     // apply to the sibling case/when result and the if-expression (#1934/#1948):
     //   • LHS arm (this entry block, the non-null path l→endBB): retained unless
-    //     it is itself a +1 producer or a string local owning +1. The retain is
-    //     emitted UNCONDITIONALLY here, but on the *null* path l is null and
-    //     bz_string_retain is a null no-op — so it counts only when l is the
-    //     result (the non-null path), exactly where the PHI takes l.
-    //   • RHS arm (below, in rhsEndBB): retained unless a +1 producer / owning
-    //     local, minting the +1 the null path needs.
+    //     it is itself a +1 producer. The retain is emitted UNCONDITIONALLY
+    //     here, but on the *null* path l is null and bz_string_retain is a
+    //     null no-op — so it counts only when l is the result (the non-null
+    //     path), exactly where the PHI takes l.
+    //   • RHS arm (below, in rhsEndBB): retained unless a +1 producer, minting
+    //     the +1 the null path needs.
+    //
+    // fix #8278 (§28.9 / §28.3, v0.355): a `??` READ of a string local is a
+    // BORROW-READ, never a transfer-out. The arm mint used to skip the retain
+    // whenever `returnedStringLocalOwnsPlusOne(operand)` answered true — that
+    // predicate answers "does this local own a +1 that a RETURN may transfer
+    // out?", and it is true for an ESCAPING producer local (one the escape
+    // walk could not prove non-escaping, so it has no scope-end release) and
+    // for an ESCAPING borrow local. Reusing it here made every `??` read of
+    // such a local HAND the slot's single +1 to its consumer — a transfer-out
+    // that may happen N times. The issue's repro reads the same escaping
+    // producer local twice: the first read consumed the slot's +1 (the
+    // consumer's release dropped it), the second read handed out a reference
+    // the slot no longer had, and the program died with "refcount over-release
+    // (string) — two releases for one reference" (rc 134, §28.9). The lambda
+    // twin (`var f := lambda() => v;`) died the same way — worse, as a
+    // use-after-free in bz_string_to_utf8z on the second read, because the
+    // closure BORROWS the local's reference and the first read freed it.
+    //
+    // §28.9 says a string is runtime-managed: reading a local twice must not
+    // change its lifetime, and each read must observe the value. A read
+    // therefore mints its own +1 (the consumer owns that one and releases it),
+    // and the local keeps its own +1 for its own discharge point (the scope-end
+    // release when the escape walk proved it non-escaping; the RETURN's
+    // transfer-out when it did not). The transfer-out stays on the RETURN path,
+    // which is where "this local's +1 leaves the function" belongs.
+    //
+    // ⇒ THE ESCAPING LOCAL'S DISCHARGE POINT. The read no longer consumes the
+    // slot's +1, so the slot's own +1 needs a discharge point of its own: the
+    // scope-end release when the escape walk proved the local non-escaping,
+    // the RETURN's transfer-out when the walk could not. For the issue's
+    // escaping producer local the walk COULD not prove it non-escaping — the
+    // local is stored into a built-in Dictionary — and that store RETAINS the
+    // value into the table (§28.11's shared reference), so the local's +1 was
+    // orphaned: the base leaked it (a 32-byte Direct leak + a 3-byte Indirect
+    // leak per store, MEASURED), the base's masked leak and this fix's honest
+    // accounting met in the middle, and the only correct shape is BOTH halves
+    // at once — the read borrows (here) and the escape walk learns that the
+    // dict store retains (LlvmBackend_Setup.cpp's StringEscapeWalker, the
+    // built-in dictionary indexer-set arm), which re-arms the local's scope-end
+    // release. With only this half the over-release becomes a leak; with only
+    // the walker's half the read still over-releases. They move in lockstep,
+    // exactly as #1951's retain-not-transfer + walker-relaxation pair does.
     // The whole `??` is then a single +1 producer (isPlusOneStringProducer
     // recognizes it) the consumer TRANSFERS. Both halves are required:
     // recognition WITHOUT the per-arm mint drops a borrow arm's reference (UAF);
@@ -391,9 +433,14 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
         coalResTy &&
         coalResTy->kind == sema::TypeRef::Kind::Primitive &&
         coalResTy->primitive == sema::PrimitiveType::String;
+    // fix #8278 (§28.9, v0.355): the LHS arm's mint is skipped ONLY for a +1
+    // PRODUCER operand (a fresh +1 the arm already carries). A string LOCAL
+    // that owns a +1 (returnedStringLocalOwnsPlusOne) is NOT skipped: a `??`
+    // read is a borrow-read, so the arm must mint its own +1 — the local keeps
+    // its own reference for its own discharge point. See the block comment
+    // above for the measurement and the two-half argument.
     if (coalStringResult && l->getType()->isPointerTy() && bin.left &&
-        !isPlusOneStringProducer(bin.left.get()) &&
-        !returnedStringLocalOwnsPlusOne(bin.left.get()))
+        !isPlusOneStringProducer(bin.left.get()))
         emitStringRetain(l);
     builder_.CreateCondBr(isNull, rhsBB, endBB);
 
@@ -452,11 +499,15 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
     // fix #1948 (RHS arm of the string `??` normalization above): mint the +1
     // the null path's result needs, in rhsEndBB (the block r is defined in, which
     // flows to endBB), before the branch. Skipped when the RHS is itself a +1
-    // producer / owning local (it already carries its single reference) or when
-    // it diverged (never reaches endBB).
+    // producer (it already carries its single reference) or when it diverged
+    // (never reaches endBB).
+    // fix #8278 (§28.9, v0.355): the same rule as the LHS arm — a `??` read of
+    // a string LOCAL that owns a +1 is a borrow-read, so the arm mints its own
+    // +1 (the local keeps its own reference). `x ?? v` over an escaping
+    // producer local `v` is the RHS twin of the issue's `v ?? x` repro and
+    // over-released the same way.
     if (coalStringResult && !rhsDiverged && r->getType()->isPointerTy() &&
-        bin.right && !isPlusOneStringProducer(bin.right.get()) &&
-        !returnedStringLocalOwnsPlusOne(bin.right.get()))
+        bin.right && !isPlusOneStringProducer(bin.right.get()))
         emitStringRetain(r);
     llvm::BasicBlock* rhsEndBB = nullptr;
     if (!rhsDiverged) {
