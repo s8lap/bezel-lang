@@ -218,12 +218,21 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
 // still compiles and disposes exactly once.
 // ---------------------------------------------------------------------------
 
-// §28.8.1: `C.Sink(move this.f!)` in the same argument position was ALREADY
-// rejected — by the field-restoration check (the field is left moved-from at
-// method exit). Pin it so the #1999 fix, which reproduces that rejection for a
-// non-`this` receiver, does not disturb the `this` path. // per §28.8.1
+// §28.8.1 (*The replacing `move`*, v0.336): `C.Sink(move this.f!)` in the same
+// argument position was ALREADY rejected — by the field-restoration check (the
+// field is left moved-from at method exit). That check's ground was the
+// restoration window, which the replacing `move` retired: at a NULLABLE field
+// (`f: Cell?`) the bare take STORES `null`, so the field is left holding `null`
+// and owes no restoration — the program is now ACCEPTED. (The non-nullable
+// field's bare take is still rejected: it would leave the field EMPTY, and the
+// `with` clause §28.8.1 requires there is not implemented yet — #5923.)
+//
+// Fix #7849: the row's expectation flips from "rejected" to "accepted", and the
+// runtime twin shows the exactly-once disposal: the take stores `null`, the
+// sink disposes the value, and the holder's cascade disposes nothing through
+// the nulled field.
 BEZEL_TEST(move_field_nonthis_owned_sink_1999,
-           this_field_move_still_rejected_by_restoration_spec_28_8_1) {
+           this_field_move_of_a_nullable_field_is_accepted_spec_28_8_1) {
     auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class Box "
@@ -233,8 +242,34 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
         "  destructor end destructor; "
         "end Box; "
         "class C public static method Sink(owned c: Cell) using var k := move c; end Sink; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(errorSays(r, "left in moved-from state at method exit"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(errorSays(r, "left in moved-from state at method exit"));
+}
+
+// The runtime twin of the row above: the take stores `null` in the field, the
+// sink disposes the Cell exactly once, and the holder's cascade disposes
+// nothing through the nulled field (Cell.live == 0).
+BEZEL_TEST(move_field_nonthis_owned_sink_1999,
+           this_field_move_of_a_nullable_field_disposes_once_spec_28_8_1) {
+    std::string src =
+        std::string(kCell) +
+        "class Box "
+        "  public owned f: Cell? := null; "
+        "  public constructor() this.f := new Cell(); end constructor; "
+        "  public method Give() C.Sink(move this.f!); end Give; "
+        "  destructor end destructor; "
+        "end Box; "
+        "class C "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
+        "  public static method Main(): int "
+        "    using var box := new Box(); "
+        "    box.Give(); "
+        "    return Cell.live; "
+        "  end Main; "
+        "end C;";
+    auto r = runAotChecked(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
 // §28.6 / §23: the spec-sanctioned transfer — a take-method that moves the field

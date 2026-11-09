@@ -32,6 +32,55 @@ namespace bezel::ownership {
 // The statement/flow-walking definitions live in Ownership.cpp alongside
 // the public checkOwnership entry point.
 
+// §28.8.1 (*The replacing `move`*, v0.336) — is this owned FIELD's DECLARED
+// type nullable?
+//
+// The spec reads the nullability "as declared: `T?`, a nullable slot type, and
+// not a bare type parameter `T`, whatever its substitution", and it makes the
+// nullable case the ONE where the `with` clause may be omitted:
+//
+//   "Where the location's declared type is **nullable** ... the `with` clause
+//    may be omitted: `move x.f` stores `null`. Where it is not, the clause is
+//    required ..."
+//
+// So a NULLABLE owned field's bare take STORES `null` — it is the replacing
+// `move` — and the field is left holding `null`: never a hole and never a
+// "moved-from" state. §28.8.1 says so outright:
+//
+//   "**No location ever holds a hole** (K9.2). ... the *moved-from* state is a
+//    state of bindings only (K1). Nothing therefore needs restoring after a
+//    `move`, no exit path carries an obligation ..."
+//   "A nullable location a bare take leaves holding `null` is an ordinary null
+//    field: its holder's cascade disposes nothing through it, and a later read
+//    reads `null`."
+//
+// ⇒ A nullable owned field therefore carries NO restoration obligation: the
+// field-restoration window (the at-exit "left in moved-from state" report, the
+// double-move report, the "the exception edge is an exit path on which the
+// field is never restored" report) has no ground under it. This predicate is
+// the gate that keeps those reports off a nullable field.
+//
+// The DECLARED type is read from the field's own declaration (a `FieldDecl`, or
+// a record's positional field's parameter) so that a generic body's bare type
+// parameter `T` reads as NON-nullable whatever its substitution — the spec's
+// "not a bare type parameter `T`, whatever its substitution". The read
+// expression's own resolved type is the fallback for a field whose declaration
+// is not reachable from its symbol (an imported field).
+static bool ownedFieldDeclaredNullable(const sema::SemaContext& ctx,
+                                       const ast::Expr& fieldRead) {
+    const sema::TypeRef* rt = nullptr;
+    if (auto* fs =
+            dynamic_cast<sema::FieldSymbol*>(ctx.exprSymbol(fieldRead))) {
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
+            if (fd->type) rt = ctx.resolvedType(*fd->type);
+        } else if (fs->posParam && fs->posParam->type) {
+            rt = ctx.resolvedType(*fs->posParam->type);
+        }
+    }
+    if (!rt) rt = ctx.exprType(fieldRead);
+    return rt && rt->nullable;
+}
+
 // §28.8.1 (#1125): the operand of a `move` may be a force-unwrap of a nullable
 // owned field/local — `move _slot!` / `move this._slot!`. The null-forgiving
 // `!` is a postfix PostfixBangExpr wrapping the field/local reference. The spec
@@ -1007,7 +1056,16 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                 if (exprIsOwnedFieldRead(*mop)) {
                     // §28.8.1, #897 #898: check-then-mark via recordFieldMove
                     // so a second move of an already-moved-from field errors.
-                    recordFieldMove(id->name, un->span.begin);
+                    //
+                    // fix #7849 (§28.8.1 *The replacing `move`*, v0.336): a
+                    // NULLABLE owned field's bare take STORES `null` — the
+                    // replacing `move` — so the field is left holding `null`,
+                    // never a hole and never a moved-from state, and owes no
+                    // restoration. The field-restoration window has no ground
+                    // under it, so a nullable field is NOT marked and carries
+                    // none of the window's reports.
+                    if (!ownedFieldDeclaredNullable(ctx_, *mop))
+                        recordFieldMove(id->name, un->span.begin);
                     return;
                 }
                 markMovedByName(id->name, id->span.begin, id);
@@ -1019,7 +1077,11 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                             ma->target.get())) {
                     if (tid->name == "this") {
                         // §28.8.1, #897 #898: qualified `move this.field`.
-                        recordFieldMove(ma->member, un->span.begin);
+                        //
+                        // fix #7849 (§28.8.1, v0.336): a nullable field's bare
+                        // take stores `null` — no restoration obligation.
+                        if (!ownedFieldDeclaredNullable(ctx_, *ma))
+                            recordFieldMove(ma->member, un->span.begin);
                         return;
                     }
                 }
@@ -2645,8 +2707,14 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                 dynamic_cast<const ast::IdentifierExpr*>(mop)) {
                             // `move _field!` reads the owned field as owned;
                             // `move local!` moves the local out.
-                            if (exprIsOwnedFieldRead(*mop))
-                                recordFieldMove(id->name, un->span.begin);
+                            //
+                            // fix #7849 (§28.8.1 *The replacing `move`*, v0.336):
+                            // a NULLABLE owned field's bare take stores `null`,
+                            // so it is never moved-from and owes no restoration.
+                            if (exprIsOwnedFieldRead(*mop)) {
+                                if (!ownedFieldDeclaredNullable(ctx_, *mop))
+                                    recordFieldMove(id->name, un->span.begin);
+                            }
                             // §28.8 (#1993): `move b!` where the peeled place `b`
                             // is a BORROW (a non-`owned` parameter, a catch
                             // binding, a Borrowed-state local, a non-`owned`
@@ -2670,7 +2738,14 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                         ma->target.get())) {
                                 if (tid->name == "this") {
                                     // `M(move this.field!)` — field-move.
-                                    recordFieldMove(ma->member, un->span.begin);
+                                    //
+                                    // fix #7849 (§28.8.1 *The replacing
+                                    // `move`*, v0.336): a NULLABLE owned field's
+                                    // bare take stores `null` — no moved-from
+                                    // state, no restoration obligation.
+                                    if (!ownedFieldDeclaredNullable(ctx_, *ma))
+                                        recordFieldMove(ma->member,
+                                                        un->span.begin);
                                     consumed = true;
                                 } else if (rejectNonThisOwnedFieldMoveDischarge(
                                                *ma, un->span.begin)) {
@@ -2710,7 +2785,13 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                     ma->target.get())) {
                             if (tid->name == "this") {
                                 // §28.8.1, #897 #898: `M(move this.field)`.
-                                recordFieldMove(ma->member, un->span.begin);
+                                //
+                                // fix #7849 (§28.8.1 *The replacing `move`*,
+                                // v0.336): a NULLABLE owned field's bare take
+                                // stores `null` — no moved-from state, no
+                                // restoration obligation.
+                                if (!ownedFieldDeclaredNullable(ctx_, *ma))
+                                    recordFieldMove(ma->member, un->span.begin);
                                 consumed = true;
                             } else if (rejectNonThisOwnedFieldMoveDischarge(
                                            *ma, un->span.begin)) {
@@ -2973,7 +3054,13 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 // falling through to the local-move path.
                 if (exprIsOwnedFieldRead(*mop)) {
                     // §28.8.1, #897 #898: check-then-mark.
-                    recordFieldMove(id->name, un->span.begin);
+                    //
+                    // fix #7849 (§28.8.1 *The replacing `move`*, v0.336): a
+                    // NULLABLE owned field's bare take STORES `null` — the
+                    // field is left holding `null`, never a hole and never a
+                    // moved-from state, and owes no restoration.
+                    if (!ownedFieldDeclaredNullable(ctx_, *mop))
+                        recordFieldMove(id->name, un->span.begin);
                     return;
                 }
                 markMovedByName(id->name, id->span.begin, id);
@@ -2988,7 +3075,11 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                             ma->target.get())) {
                     if (tid->name == "this") {
                         // §28.8.1, #897 #898: qualified `move this.field`.
-                        recordFieldMove(ma->member, un->span.begin);
+                        //
+                        // fix #7849 (§28.8.1, v0.336): a nullable field's bare
+                        // take stores `null` — no restoration obligation.
+                        if (!ownedFieldDeclaredNullable(ctx_, *ma))
+                            recordFieldMove(ma->member, un->span.begin);
                         return;
                     }
                 }
@@ -3136,8 +3227,14 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                             lookThroughForceUnwrap(un->operand.get());
                         if (auto* id =
                                 dynamic_cast<const ast::IdentifierExpr*>(mop)) {
-                            if (exprIsOwnedFieldRead(*mop))
-                                recordFieldMove(id->name, un->span.begin);
+                            if (exprIsOwnedFieldRead(*mop)) {
+                                // fix #7849 (§28.8.1 *The replacing `move`*,
+                                // v0.336): a NULLABLE owned field's bare take
+                                // stores `null` — no moved-from state, no
+                                // restoration obligation.
+                                if (!ownedFieldDeclaredNullable(ctx_, *mop))
+                                    recordFieldMove(id->name, un->span.begin);
+                            }
                             // §28.8 (#1993): `move b!` where the peeled place `b`
                             // is a BORROW is not an owned value — reject it as the
                             // plain `move b` ctor-arg branch below does; otherwise
@@ -3154,7 +3251,13 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                     dynamic_cast<const ast::IdentifierExpr*>(
                                         ma->target.get())) {
                                 if (tid->name == "this") {
-                                    recordFieldMove(ma->member, un->span.begin);
+                                    // fix #7849 (§28.8.1 *The replacing
+                                    // `move`*, v0.336): a NULLABLE owned field's
+                                    // bare take stores `null` — no moved-from
+                                    // state, no restoration obligation.
+                                    if (!ownedFieldDeclaredNullable(ctx_, *ma))
+                                        recordFieldMove(ma->member,
+                                                        un->span.begin);
                                     consumed = true;
                                 } else if (rejectNonThisOwnedFieldMoveDischarge(
                                                *ma, un->span.begin)) {
@@ -24415,7 +24518,16 @@ void MethodOwnership::checkThrowableWhileFieldMovedFrom(const ast::Stmt& s) {
                                 const ast::Expr* mop = lookThroughForceUnwrap(un->operand.get());
                                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(mop)) {
                                     if (exprIsOwnedFieldRead(*mop)) {
-                                        moved.push_back(id->name);
+                                        // fix #7849 (§28.8.1 *The replacing
+                                        // `move`*, v0.336): a NULLABLE owned
+                                        // field's bare take STORES `null`, so
+                                        // the field is left holding `null` and
+                                        // nothing is unrestored on the
+                                        // exception edge — the field-
+                                        // restoration window has no ground
+                                        // under it.
+                                        if (!ownedFieldDeclaredNullable(ctx_, *mop))
+                                            moved.push_back(id->name);
                                     }
                                 }
                             }
@@ -24545,7 +24657,12 @@ void MethodOwnership::checkThrowableWhileFieldMovedFrom(const ast::Stmt& s) {
                             if (un->op == "move") {
                                 const ast::Expr* mop = lookThroughForceUnwrap(un->operand.get());
                                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(mop)) {
-                                    if (exprIsOwnedFieldRead(*mop)) {
+                                    // fix #7849 (§28.8.1 *The replacing `move`*,
+                                    // v0.336): a NULLABLE owned field's bare
+                                    // take stores `null` — nothing is unrestored
+                                    // on the exception edge.
+                                    if (exprIsOwnedFieldRead(*mop) &&
+                                        !ownedFieldDeclaredNullable(ctx_, *mop)) {
                                         bool found = false;
                                         for (auto v : moved) { if (v == id->name) { found = true; break; } }
                                         if (!found) moved.push_back(id->name);
@@ -24612,7 +24729,12 @@ void MethodOwnership::checkThrowableWhileFieldMovedFrom(const ast::Stmt& s) {
                         if (un->op == "move") {
                             const ast::Expr* mop = lookThroughForceUnwrap(un->operand.get());
                             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(mop)) {
-                                if (exprIsOwnedFieldRead(*mop)) {
+                                // fix #7849 (§28.8.1 *The replacing `move`*,
+                                // v0.336): a NULLABLE owned field's bare take
+                                // stores `null` — nothing is unrestored on the
+                                // exception edge.
+                                if (exprIsOwnedFieldRead(*mop) &&
+                                    !ownedFieldDeclaredNullable(ctx_, *mop)) {
                                     bool found = false;
                                     for (auto v : moved) { if (v == id->name) { found = true; break; } }
                                     if (!found) moved.push_back(id->name);
