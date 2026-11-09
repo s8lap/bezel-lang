@@ -41203,6 +41203,94 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             auto loc = ma.span.begin;
                             if (loc.line == 0 && ma.target)
                                 loc = ma.target->span.begin;
+                            // fix #7665 (language spec §26.5 rule 2 /
+                            // §26.5.1 / §27.6, v0.355): the reject's
+                            // stated reason — "this builtin collection
+                            // dispatches it structurally rather than
+                            // through a real method symbol, so no
+                            // function value can be formed for it yet" —
+                            // is FALSE for a USER's own extension member.
+                            //
+                            // A member declared in a user's
+                            // `extension Array<int>` block IS a real
+                            // method with a real MethodSymbol: it is
+                            // found by the §26.5 rule-2 extension lookup,
+                            // and codegen dispatches it through the
+                            // extension's own symbol, NOT through the
+                            // collection's structural dispatch. §27.6
+                            // (v0.355) is explicit: "For an extension
+                            // method, the reference is formed in either
+                            // of the two spellings a call admits. ...
+                            // Receiver-qualified — `v.Scaled` over
+                            // `extension Vec`, the member resolved on the
+                            // value exactly as the call `v.Scaled()` is
+                            // (§26.5) — the reference is a bound
+                            // reference", and §26.5 says the same of
+                            // EVERY member access: "The outcome is the
+                            // same for every member access on a value,
+                            // not only a call — a property or field read
+                            // or write, and a method reference, which
+                            // resolves its member exactly as the call
+                            // does (§27.6)".
+                            //
+                            // ⇒ The §26.5 rule-2 lookup must run BEFORE
+                            // this reject, and the reject must be SKIPPED
+                            // when the lookup finds the USER's own member.
+                            // That is the whole fix: the lookup below is
+                            // the SAME one the CALL spelling runs (the
+                            // §26.5 rule-2 arm of this function's member
+                            // resolution), so the two spellings of one
+                            // program can no longer disagree.
+                            //
+                            // §26.5 rule 1 still commits the names the
+                            // receiver's OWN declaration (or its §8.1
+                            // `Object` base) declares: "If `x`'s declared
+                            // type (or any base type) *declares* any
+                            // instance member named `Foo` — of any arity,
+                            // applicability, or accessibility — instance
+                            // resolution is committed and extension
+                            // blocks are **never consulted** for that
+                            // name on that receiver." For those names the
+                            // extension blocks are NOT consulted here
+                            // either — the reject stands, and the CALL
+                            // form's own rule-1 commitment (this file's
+                            // `builtinConcreteCollectionDeclaresMember` /
+                            // `builtinObjectBaseDeclaresMember` arms)
+                            // stays the authority on the same names. A
+                            // stdlib §5 LINQ operator name is NOT such a
+                            // member: §5's operators are EXTENSION
+                            // operators on `IEnumerable<T>` (the §5
+                            // block), not instance members of `Array<T>`,
+                            // so rule 2 governs them and the user's own
+                            // `extension Array<int>` block wins by
+                            // §26.5.1's specificity (the substituted head
+                            // `Array<int>` is a subtype of the §5 block's
+                            // `IEnumerable<int>` — the spec's own §26.5.1
+                            // worked example).
+                            //
+                            // The §5 operators THEMSELVES stay refused: the
+                            // lookup answers with the USER's member or with
+                            // nothing (the compiler-known §5 block is never
+                            // returned as a member — `lookupExtensionMember`
+                            // returns null when the §5 block would win the
+                            // ranking), so a bare reference to `Where` /
+                            // `Select` / ... on a collection with no user
+                            // block of that name still reaches the reject
+                            // below, unchanged (#2492).
+                            if (!isDeclaredMethod && !isUniversalObjectMember) {
+                                std::vector<std::pair<std::string, TypeRef*>>
+                                    binding;
+                                if (Symbol* ext = lookupExtensionMember(
+                                        tt, mbr, &binding, loc,
+                                        /*reportAmbiguity=*/true,
+                                        /*arity=*/-1)) {
+                                    if (!binding.empty())
+                                        ctx_.setExprExtBinding(
+                                            &ma, std::move(binding));
+                                    resolveExtensionMember(ma, ext);
+                                    return;
+                                }
+                            }
                             ctx_.diagnostics().report(
                                 Severity::Error, loc,
                                 std::string("a bare reference to `") +
