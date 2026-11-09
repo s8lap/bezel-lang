@@ -2967,6 +2967,76 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
         auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
 
+        // fix #7962 (§28.2, v0.350) — the frame's RECLAMATION, split out so
+        // both tails of the Dispose body (the "nothing suspended" fast path and
+        // the finally-chain switch) reclaim it the same way.
+        //
+        // §28.2: "`Dispose()` on any class instance is idempotent: the first
+        // call performs the disposal; subsequent calls are no-ops", and the
+        // checked-disposal paragraph: "the split between logical disposal and
+        // physical reclamation (§28.12) gives the implementation latitude to
+        // defer reclaiming a disposed instance's memory in checked mode
+        // (quarantine, delayed free) so that the flag remains readable after
+        // disposal".
+        //
+        // The enumerator's per-instance disposed flag IS the state sentinel
+        // `-2` stored in the frame (the `dsp.idem` guard above): it is the
+        // only place the "already disposed" fact lives, so the frame must
+        // still be readable when a SECOND `Dispose()` arrives. That is
+        // exactly what the checked-disposal quarantine is for — and exactly
+        // what the class path already does (LlvmBackend_Disposal.cpp's
+        // `emitReclaimBlock` keeps the block in checked mode so the
+        // per-instance disposed flag at slot 1/2 stays readable).
+        //
+        // WITHOUT the quarantine the frame was freed unconditionally, so the
+        // second `Dispose()`'s entry guard LOADED the `-2` sentinel out of
+        // freed memory — a heap-use-after-free (ASan: "READ of size 8 ...
+        // freed by bz$iter$...$CloneDispose"). The call site cannot paper
+        // over it: the explicit-`Dispose()` dispatch
+        // (LlvmBackend_Calls2.cpp) deliberately does NOT null the receiver
+        // slot in checked mode — "Checked mode does not null the slot — the
+        // object is quarantined — so `obj` stays non-null there and the
+        // re-dispatch is a no-op via the run-once guard in the Dispose body".
+        // The run-once guard is the `-2` sentinel; it can only work if the
+        // frame survives. Hence: quarantine in checked mode, free in
+        // unchecked mode (where the call site DOES null the slot, so the
+        // second call is skipped at the call site and the frame is
+        // unreachable).
+        //
+        // WHICH frames are quarantined: exactly the ones a surviving
+        // reference can still reach, decided by the runtime's checked-
+        // disposal escaped set (`bz_cd_may_free`, §28.2 / #4602) — the same
+        // question the class path asks at its reclaim site. `lowerExpr`
+        // records every class-like value that leaves a frame in that set
+        // (`bz_cd_mark_escaped`), so the enumerator an explicit `Dispose()`
+        // disposes IS in it: it may be disposed again, and its `-2` sentinel
+        // must stay readable → quarantine. A frame no surviving reference
+        // can reach — the per-iteration clone of a `for` loop, whose slot the
+        // compiler nulls at the end of the iteration, and whose disposal is
+        // compiler-inserted and therefore exactly-once — is freed as before,
+        // so the quarantine does not turn every checked-mode enumeration into
+        // a retained allocation.
+        auto reclaimFrame = [&](llvm::Value* frame) {
+            if (checkedDisposal_) {
+                llvm::Value* mayFree = builder_.CreateCall(
+                    declareC("bz_cd_may_free", llvm::Type::getInt8Ty(llvm_),
+                             {ptrTy()}), {frame});
+                llvm::Value* doFree = builder_.CreateICmpNE(
+                    mayFree, builder_.getInt8(0), "cd.mayfree");
+                auto* freeBB = llvm::BasicBlock::Create(
+                    llvm_, "cd.free", currentFn_);
+                auto* keepBB = llvm::BasicBlock::Create(
+                    llvm_, "cd.quarantine", currentFn_);
+                builder_.CreateCondBr(doFree, freeBB, keepBB);
+                builder_.SetInsertPoint(freeBB);
+                builder_.CreateCall(freeFn, {frame});
+                builder_.CreateBr(keepBB);
+                builder_.SetInsertPoint(keepBB);
+                return;
+            }
+            builder_.CreateCall(freeFn, {frame});
+        };
+
         // §29.8 (#945): dispose each `owned` parameter the body never moved out,
         // in REVERSE declaration order (mirroring §28.4's destructor rule), AFTER
         // the body's `using var` / `finally` cleanups and before the frame is
@@ -3331,7 +3401,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             disposeOwnedLocals();      // §29.7 (#2306): state-keyed plain-owned locals
             releaseClosureCaptures();  // #1864 §27.5/§28.9: drop frame's +1 on closure captures
             emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
-            builder_.CreateCall(freeFn, {self});
+            reclaimFrame(self);         // #7962 §28.2: quarantine in checked mode
             builder_.CreateRetVoid();
         } else {
             // Build a switch on the current state.  State == -1 (MoveNext
@@ -3517,7 +3587,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             disposeOwnedLocals();      // §29.7 (#2306): state-keyed plain-owned locals
             releaseClosureCaptures();  // #1864 §27.5/§28.9: drop frame's +1 on closure captures
             emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
-            builder_.CreateCall(freeFn, {self});
+            reclaimFrame(self);         // #7962 §28.2: quarantine in checked mode
             builder_.CreateRetVoid();
         }
     };
