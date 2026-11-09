@@ -25612,6 +25612,119 @@ static bool userTypeSupportsForIn(const TypeSymbol* root) {
     return false;
 }
 
+// §30.7 / §29.13: the ASYNC-ITERABLE heads — the heads an `await for`
+// source may have. §29.13 states the pair verbatim: "`await for` iterates
+// `IAsyncEnumerable<T>` (borrowing) and `IOwningAsyncEnumerable<T>` (owning)
+// sources." §30.7's protocol is that pair's `GetAsyncEnumerator(token)`
+// member (plus the enumerator's `MoveNextAsync()` / `Current` /
+// `DisposeAsync`).
+//
+// These are the ASYNC half of the four iterator-format enumerable heads, read
+// from the SHARED authority (`common::isIterFormatEnumerableHead` minus the
+// two synchronous ones) rather than hand-spelled: the enumerable-grid ratchet
+// (scripts/check_enumerable_grid_spellings.py) flags a hand-written head
+// chain naming two or more of the eight iterator/enumerator heads, and a
+// second spelling of this pair is exactly the drift that ratchet exists to
+// prevent. §29.2 / stdlib §4.12–§4.13.
+static bool isAsyncIterableHead(std::string_view n) {
+    return common::isIterFormatEnumerableHead(n) &&
+           !common::isSyncIterFormatEnumerableHead(n);
+}
+
+// §30.7 / §29.13: does a locally-declared user type (or any type in its base
+// closure) support ASYNC `await for` iteration — i.e. expose the §30.7
+// protocol's `GetAsyncEnumerator(token)` method, or derive from a builtin
+// `IAsyncEnumerable<T>` / `IOwningAsyncEnumerable<T>` interface? Cycle-guarded
+// BFS over the base closure — the exact ASYNC twin of `userTypeSupportsForIn`
+// above, which asks the synchronous question for the synchronous `for`.
+static bool userTypeSupportsAwaitForIn(const TypeSymbol* root) {
+    std::vector<const TypeSymbol*> queue = {root};
+    std::unordered_set<const TypeSymbol*> seen = {root};
+    for (std::size_t qi = 0; qi < queue.size(); ++qi) {
+        const TypeSymbol* t = queue[qi];
+        if (!t) continue;
+        // §30.7: a concrete type implementing IAsyncEnumerable<T> always
+        // declares GetAsyncEnumerator (the interface is abstract), so a member
+        // scan across the base closure is authoritative for such types.
+        for (auto* m : t->members)
+            if (auto* ms = dynamic_cast<MethodSymbol*>(m))
+                if (ms->name == "GetAsyncEnumerator") return true;
+        // A builtin async-enumerable base carries declaration==null and is
+        // therefore dropped from `baseTypes` (TypeResolution only records
+        // bases with a resolved TypeSymbol). Recover it from
+        // `nonSymbolBaseRefsOf` — the same recovery `userTypeSupportsForIn`
+        // above does for the synchronous family, and what makes an interface
+        // that merely EXTENDS IAsyncEnumerable<T> count as async-iterable.
+        for (const TypeRef* bt : nonSymbolBaseRefsOf(t))
+            if (bt && bt->kind == TypeRef::Kind::Named &&
+                isAsyncIterableHead(bt->headName()))
+                return true;
+        // Recurse into user (declaration-bearing) base types.
+        for (auto* bt : t->baseTypes)
+            if (bt && seen.insert(bt).second) queue.push_back(bt);
+    }
+    return false;
+}
+
+// §30.7 / §29.13: the verdict on an `await for` SOURCE's type.
+enum class AwaitForSourceVerdict {
+    AsyncIterable,   // an §30.7 async source — admitted
+    NotAsyncIterable,// definitely not — report it
+    Undecidable,     // not decidable here — leave it to the existing paths
+};
+
+// §30.7 / §29.13: classify the source type of an `await for`. The twin of
+// the §21.4 ITERABLE-source check the synchronous `for` runs (#1775).
+//
+// Conservative, like that check: only DEFINITE non-async-iterables are
+// reported. An imported type, a type parameter, or a reference this pass
+// cannot classify is `Undecidable` and is left alone — the existing paths
+// still handle it.
+static AwaitForSourceVerdict classifyAwaitForSource(const TypeRef* ty) {
+    if (!ty) return AwaitForSourceVerdict::Undecidable;
+    switch (ty->kind) {
+    // §15.1.2: an inline array "is not a class type and does not implement
+    // interfaces" — it has no `GetAsyncEnumerator`, so it is not an async
+    // iterable (it IS sync-iterable, over the §29.2 direct-indexed loop).
+    // §4.6: a string iterates its chars over the SYNCHRONOUS protocol only.
+    // A function value and the unit type are values, not objects with the
+    // §30.7 protocol.
+    case TypeRef::Kind::Primitive:
+    case TypeRef::Kind::InlineArray:
+    case TypeRef::Kind::Function:
+    case TypeRef::Kind::Unit:
+        return AwaitForSourceVerdict::NotAsyncIterable;
+    case TypeRef::Kind::Error:
+        return AwaitForSourceVerdict::Undecidable;
+    case TypeRef::Kind::Named:
+        break;
+    }
+    // The head name — the syntactic head for a locally-spelled type, the
+    // metadata name for an imported one, and the declaration's own name for a
+    // builtin-class reference whose syntax is out of reach.
+    std::string_view head = ty->headName();
+    if (head.empty() && ty->declaration) head = ty->declaration->name;
+    // §29.13's two heads.
+    if (isAsyncIterableHead(head)) return AwaitForSourceVerdict::AsyncIterable;
+    // A USER-declared type: async-iterable only when its base closure carries
+    // the §30.7 protocol. (A `decl`-bearing symbol is a type this
+    // compilation's own AST declared; an imported or synthesized one has no
+    // `decl` and falls through to the arms below.)
+    if (ty->declaration && ty->declaration->decl)
+        return userTypeSupportsAwaitForIn(ty->declaration)
+                   ? AwaitForSourceVerdict::AsyncIterable
+                   : AwaitForSourceVerdict::NotAsyncIterable;
+    // A BUILTIN type: none of the reserved builtin names is an async iterable
+    // — the collections, the span shapes, `Range<T>` (§16.3) and the
+    // SYNCHRONOUS iteration interfaces all carry the §29.1/§29.2 protocol,
+    // never §30.7's. The two async heads were admitted above.
+    if (common::isReservedBuiltinTypeName(head))
+        return AwaitForSourceVerdict::NotAsyncIterable;
+    // An imported type, a type parameter, or a synthesized reference: not
+    // decidable here.
+    return AwaitForSourceVerdict::Undecidable;
+}
+
 // §21.5 (v0.201, #2051): reject a loop label that shadows an enclosing loop's.
 void ExprTC::checkLoopLabelShadow(std::string_view label, SourceLocation loc) {
     if (label.empty()) return;
@@ -30371,6 +30484,49 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     "`for` requires an iterable source: a type implementing "
                     "`IEnumerable<T>`, an inline array, a string, or a "
                     "`Range<T>` (\xC2\xA7""21.4); this source is not iterable");
+            }
+        }
+        // §30.7 / §29.13: an `await for` iterates an ASYNC source — a value
+        // whose type is `IAsyncEnumerable<T>` (borrowing) or
+        // `IOwningAsyncEnumerable<T>` (owning), or a type implementing one of
+        // them through inheritance. §29.13: "`await for` iterates
+        // `IAsyncEnumerable<T>` (borrowing) and `IOwningAsyncEnumerable<T>`
+        // (owning) sources"; §30.7's protocol is that pair's
+        // `GetAsyncEnumerator(token)` member plus the enumerator's
+        // `MoveNextAsync()` / `Current` / `DisposeAsync`.
+        //
+        // This is the ASYNC TWIN of the §21.4 check above — and the comment
+        // on that check EXCLUDES `await for` from it ("`await for` (§30.7)
+        // iterates an async source through a separate path, so it is excluded
+        // here"), which is the HOLE: the async path had NO source check at
+        // all. A source that is not async-iterable passed sema and reached
+        // codegen, where `lowerAwaitFor` read the source's vtable out of a
+        // value that is not a pointer and emitted MALFORMED IR — issue #7903
+        // (`await for var x in move h.A with token do end;` over an inline
+        // `[2 owned]Res?` array: `Load operand must be a pointer. %18 = load
+        // ptr, [2 x ptr] %14`). The same hole admitted a `Range<T>` literal,
+        // a record, a primitive and a plain synchronous collection.
+        if (fs->isAwait && fs->iterable) {
+            // A range literal (§16.3 / §16.5) is a `Range<T>` VALUE and a
+            // collection literal (§15.4) is an `Array<T>` — both are
+            // sync-iterable only. They are recognized by AST shape (their
+            // type reference is not the source's static type in the same way),
+            // exactly as the §21.4 check above recognizes them.
+            const bool valueShapedSource =
+                dynamic_cast<const ast::RangeExpr*>(fs->iterable.get()) ||
+                dynamic_cast<const ast::CollectionLiteralExpr*>(
+                    fs->iterable.get());
+            AwaitForSourceVerdict verdict =
+                valueShapedSource
+                    ? AwaitForSourceVerdict::NotAsyncIterable
+                    : classifyAwaitForSource(ctx_.exprType(*fs->iterable));
+            if (verdict == AwaitForSourceVerdict::NotAsyncIterable) {
+                ctx_.diagnostics().report(
+                    Severity::Error, fs->span.begin,
+                    "`await for` requires an async-iterable source: a type "
+                    "implementing `IAsyncEnumerable<T>` or "
+                    "`IOwningAsyncEnumerable<T>` (\xC2\xA7""30.7 / \xC2\xA7""29.13); "
+                    "this source is not async-iterable");
             }
         }
         // §16.5: symbolize the loop variable so the body can refer to it.

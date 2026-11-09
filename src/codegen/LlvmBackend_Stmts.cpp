@@ -12186,6 +12186,35 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     // lets the disposal scope below dispose the frame on EVERY exit edge.
     llvm::Value* srcPtr = lowerExpr(*fs.iterable);
     if (!srcPtr) return false;
+    // §30.7 / §29.13 / issue #7903 — the DEFENSIVE TWIN of the sema check
+    // (ExprTypecheck.cpp's `await for` async-iterable-source check, the async
+    // twin of the §21.4 ITERABLE-source check the synchronous `for` runs).
+    //
+    // The desugaring below reads the source's VTABLE out of the source VALUE
+    // — `builder_.CreateLoad(ptrTy(), srcPtr)` — so the source must be a
+    // POINTER (a heap object carrying the §30.7 protocol's vtable). A
+    // VALUE-shaped source (an inline array (§15.1.2), a record, a `Range<T>`
+    // (§16.3), a primitive) is not, and the load emits MALFORMED IR
+    // ("Load operand must be a pointer. %18 = load ptr, [2 x ptr] %14") that
+    // the module verifier rejects AFTER sema has already accepted the
+    // program — the defect #7903 reports.
+    //
+    // Sema now rejects every source it can CLASSIFY as not async-iterable.
+    // This guard covers the shapes sema cannot classify: a generic body's
+    // type-parameter source (`await for var x in t` over a `T`), which
+    // MEASURED as malformed IR on the base commit, and any future shape a
+    // check above this one fails to fire on. A compiler must not emit
+    // malformed IR even when a check above it did not fire — report a
+    // diagnostic and refuse to lower instead.
+    if (!srcPtr->getType()->isPointerTy()) {
+        ctx_.diagnostics().report(
+            Severity::Error, fs.span.begin,
+            "`await for` requires an async-iterable source: a value of a type "
+            "implementing `IAsyncEnumerable<T>` or `IOwningAsyncEnumerable<T>` "
+            "(\xC2\xA7""30.7 / \xC2\xA7""29.13); this source's value is not an "
+            "object carrying the async-iteration protocol");
+        return true;
+    }
     // §30.7/§30.8 (#765/#1525): evaluate the optional `with` token right after
     // the source, before the GetAsyncEnumerator(token) call below — the
     // desugaring's own argument-evaluation order (receiver, then the token
