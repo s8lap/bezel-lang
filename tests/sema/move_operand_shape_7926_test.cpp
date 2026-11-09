@@ -60,11 +60,12 @@
 //       argument and an owned-slot store alike", so #8330 will flip this row
 //       to a REJECT. It is pinned here as CURRENT BEHAVIOUR, not as a
 //       spec-sanctioned acceptance.
-//   C2  CONTROL: `return move C.Fresh();` through an `owned` return — CURRENT
-//       BEHAVIOUR: it still compiles. §28.8.1 (v0.350) makes the marker on a
-//       fresh producer "a compile error at every position" and A.7 rejects a
-//       marker at a marker-free position as redundant, so #8330 will flip
-//       this row too. Pinned as CURRENT BEHAVIOUR.
+//   C2  CONTROL: `return move C.Fresh();` through an `owned` return — the
+//       `return` OPERAND position. FLIPPED by fix #8347 (v0.355): §28.8.1
+//       makes the marker on a fresh producer "a compile error at every
+//       position" and the operand rule is position-independent, so the
+//       `return` operand refuses it too. Pinned as a REJECT by the same
+//       fresh-producer diagnostic the binding position carries.
 //   C3  CONTROL: `using var h := move c;` — a named owned local (A.7 (c))
 //   C4  CONTROL: `move _f` — an `owned` field (A.7 (a))
 //   C5  CONTROL: `move a[0]` — an owning collection's slot (A.7 (b))
@@ -96,6 +97,11 @@ constexpr const char* kFreshProducer = "not written on a fresh producer";
 // CALL-SITE one ("... a fresh producer (a `new` expression or a call returning
 // an owned result) — ..."), which the closing parenthesis makes non-matching.
 constexpr const char* kFreshProducerNew = "fresh producer (a `new` expression)";
+
+// The stable substring that names the CALL operand shape of the same
+// fresh-producer diagnostic — the shape `return move C.Fresh();` writes.
+constexpr const char* kFreshProducerCall =
+    "fresh producer (a call returning `owned T`)";
 
 // The stable substring of the ownership pass's own CALL-SITE fresh-producer
 // diagnostic (§22.3) — the position this lane does NOT touch.
@@ -248,14 +254,17 @@ BEZEL_TEST(sema_move_operand_shape_7926,
 
 // C2 — CONTROL: `return move C.Fresh();` through an `owned` return.
 //
-// CURRENT BEHAVIOUR, NOT A SPEC-SANCTIONED ACCEPTANCE. §28.8.1 (v0.350)
-// makes the marker on a fresh producer "a compile error at every position",
-// and Appendix A.7 rejects a marker at a marker-free position (a `return`
-// operand is one) as redundant. The program still compiles today; #8330 owns
-// that half and will flip this row. The row is pinned here so that THIS
-// lane's change is shown not to have moved the position.
+// FLIPPED by fix #8347 (spec §28.8.1 / Appendix A.7 `MoveExpr` / §28.3 K3.13,
+// v0.355). This row used to pin the ACCEPTANCE of the marker at the `return`
+// OPERAND ("CURRENT BEHAVIOUR, NOT A SPEC-SANCTIONED ACCEPTANCE … #8330 owns
+// that half and will flip this row"). §28.8.1 makes the marker on a fresh
+// producer "a compile error at every position", and the operand rule is
+// position-independent, so the `return` operand refuses it too; the remedy is
+// to drop the `move`. The diagnostic is the OPERAND-SHAPE wording, byte-
+// identical to narrow #7926's binding-position diagnostic — the one rule
+// speaks with one voice at every position where it fires.
 BEZEL_TEST(sema_move_operand_shape_7926,
-           control_owned_return_of_a_fresh_producer_still_compiles) {
+           control_owned_return_of_a_fresh_producer_is_refused) {
     auto r = runAot(
         "module M7926E; " + std::string(kCell) +
         "class C "
@@ -268,8 +277,9 @@ BEZEL_TEST(sema_move_operand_shape_7926,
         "    return 0; "
         "  end Main; "
         "end Program;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kFreshProducer));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kFreshProducerCall));
 }
 
 // C3 — CONTROL: a named owned local (A.7 alternative (c)).

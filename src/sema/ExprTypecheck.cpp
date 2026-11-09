@@ -5329,6 +5329,119 @@ void ExprTC::checkReturnForm(const ast::ReturnStmt& rs) {
     }
 }
 
+// fix #8347 / #8366 (§28.8.1 *The `move` expression* / Appendix A.7
+// `MoveExpr` / §28.3 K3.13 *Marker economy*, v0.355): the `move` marker
+// written on a FRESH PRODUCER at a `return` operand, at an assignment's
+// right-hand side, or at the discard's right-hand side.
+//
+// THE RULE. §28.8.1 (docs/Bezel_Language_Spec.md:8049), verbatim: "No other
+// operand is admitted (A.7): a fresh producer (a `new` expression, a call
+// returning `owned T`, an owned operator result) needs no marker anywhere
+// (K3.13) and takes none, so `move (new Cell(1))` is a compile error at every
+// position, an `owned` argument and an owned-slot store alike; the remedy is
+// to drop the `move`."  Appendix A.7 (spec:12540) enumerates the three
+// ADMITTED operand shapes — (a) an `owned` field of a class instance, (b) a
+// slot of an owning collection, (c) a bare identifier naming a local binding
+// or `owned` parameter — and closes with "Any other operand is a compile
+// error."  K3.13 (spec:6827): "Fresh producers need no marker anywhere (no
+// live binding is invalidated)."
+//
+// THE OPERAND RULE IS POSITION-INDEPENDENT, so this is the SAME rule that
+// narrow #7926 applies at a binding position (a declaration initializer) and
+// that the ownership pass applies at the call-site positions (an `owned`
+// argument, a constructor argument) — one rule, one diagnostic text, now
+// reaching the three positions this lane narrows:
+//
+//   (a) a `return` OPERAND (issue #8347 — the `owned` return);
+//   (b) an ASSIGNMENT's right-hand side (issue #8347);
+//   (c) the DISCARD's right-hand side (issue #8366).
+//
+// WHY THE OPERAND-SHAPE WORDING AND NOT THE REDUNDANCY WORDING. At the
+// `return` and discard positions A.7 also calls the marker "redundant", and
+// the ownership pass already rejects a `move` over a NAMED BINDING there as
+// redundant ("the `move` marker is redundant on a `return` operand — the owned
+// return type already announces the ownership transfer ...", src/ownership/
+// Ownership.cpp).  That rule's operand is a named binding; THIS rule's operand
+// is a fresh producer, which is not a binding at all — there is no live
+// binding to invalidate and no announcement to be redundant with, so the
+// redundancy wording does not describe it.  The two rules are DISJOINT in
+// operand shape (a fresh producer is never a named binding) and so never
+// double-report at one position.  The fresh-producer wording is also the
+// wording both issues ask for: #8347 ("the same wording (\"remove `move`\") is
+// the right remedy here") and #8366 ("with the same wording as the sibling
+// fresh-producer diagnostic").
+//
+// THE TEXT is BYTE-IDENTICAL to narrow #7926's two arms, so the one rule
+// speaks with one voice at every position where it fires and shares the
+// needle "not written on a fresh producer" with the ownership pass's §22.3
+// call-site twin.
+//
+// NOT TOUCHED HERE — the positions this member does NOT reach, each reported
+// as a residual by this lane: the owned-slot store (issue #8330), a member's
+// or a lambda's `=>` EXPRESSION BODY (a different position — it is not the
+// `return` operand of Appendix A.7's marker-free list, and it is pinned
+// ACCEPTED by existing tests), the `yield return` operand, the if-expression
+// branch, the `throw` operand, the `??` operand and the operator operand.
+void ExprTC::checkMoveMarkerOnFreshProducer(const ast::Expr* value) {
+    if (!value) return;
+    const auto* ue = dynamic_cast<const ast::UnaryExpr*>(value);
+    if (!ue || ue->op != "move" || !ue->operand) return;
+    // §17.8 (#5144): the `!` is TRANSPARENT to the marker — `move x!` is the
+    // same marker as `move x`. Peel it (the same peel narrow #7926 uses) to
+    // reach the operand's shape; a parenthesised operand needs no peel
+    // (source-level parens leave no `ParenExpr` node in the AST, §17.1).
+    const ast::Expr* mo = ue->operand.get();
+    while (const auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(mo))
+        mo = pb->operand.get();
+    if (const auto* call = dynamic_cast<const ast::CallExpr*>(mo)) {
+        // The fresh-producer CALL. `calleeReturnsOwned` is the established
+        // "the callee is declared to return `owned T`" predicate (§28.1 /
+        // §28.3, #3189) — the same one narrow #7926 reads at a binding
+        // position and the §35.5 scrutinee rule uses.
+        if (common::calleeReturnsOwned(*call, ctx_)) {
+            ctx_.diagnostics().report(
+                Severity::Error, ue->span.begin,
+                "the `move` marker is not written on a fresh producer (a "
+                "call returning `owned T`) — no live binding is invalidated, "
+                "so there is nothing to announce; remove `move` (§22.3, "
+                "v0.307, §28.3 K3.13)");
+        }
+    } else if (dynamic_cast<const ast::NewExpr*>(mo)) {
+        // The fresh-producer `new` EXPRESSION — the other half of §28.8.1's
+        // list ("a `new` expression, a call returning `owned T`, an owned
+        // operator result").  The same wording as the call arm, with the
+        // shape named.
+        ctx_.diagnostics().report(
+            Severity::Error, ue->span.begin,
+            "the `move` marker is not written on a fresh producer (a `new` "
+            "expression) — no live binding is invalidated, so there is "
+            "nothing to announce; remove `move` (§22.3, v0.307, §28.3 K3.13, "
+            "§28.8.1, v0.350)");
+    }
+    // Any other operand is one of Appendix A.7's three ADMITTED shapes (an
+    // `owned` field, an owning slot, a named binding) or a shape A.7's own
+    // rule rejects elsewhere; this member does not touch them.
+}
+
+// fix #8347 (§28.3's consume table, v0.355): the K3.4-vs-K3.1 position
+// discriminator for an assignment's right-hand side. See the call site's
+// comment for the table rows this reads.
+bool ExprTC::assignmentTargetIsBinding(const ast::Expr* target) {
+    // A field or an owning-collection slot is K3.1 (#8330's position): its
+    // target is a member access or an index, never a bare name.
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(target);
+    if (!id) return false;
+    if (id->name.empty() || id->name == "this" || id->name == "base")
+        return false;
+    Symbol* tsym = lookupName(id->name);
+    if (!tsym) return false;
+    // A LOCAL or a PARAMETER is K3.4. A FIELD of the enclosing instance is a
+    // K3.1 store even when it is spelled bare (`_c := …`), and it resolves
+    // to a field symbol, not to a local or a parameter.
+    return dynamic_cast<LocalSymbol*>(tsym) != nullptr ||
+           dynamic_cast<ParameterSymbol*>(tsym) != nullptr;
+}
+
 // Slice T1: §5.1 numeric/char implicit-widening table. Returns
 // true iff `from` implicitly widens to `to` (both primitives,
 // distinct). Identity is handled by the caller.
@@ -27066,6 +27179,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             applyDeclaredResultCaseReading(
                 const_cast<ast::ReturnStmt*>(rs)->value);
         if (rs->value) visitExpr(*rs->value);
+        // fix #8347 (§28.8.1 / Appendix A.7 MoveExpr / §28.3 K3.13, v0.355):
+        // a `move` marker written on a FRESH PRODUCER at this `return`
+        // operand — the `owned` return position — is a compile error. The
+        // operand rule is position-independent ("a compile error at every
+        // position"), so it applies at an `owned` return and at a borrow
+        // return alike. The check runs AFTER the operand's visit, because
+        // `calleeReturnsOwned` reads the callee's resolved symbol.
+        if (rs->value) checkMoveMarkerOnFreshProducer(rs->value.get());
         pendingLambdaTargetReturn_ = savedLamTargetRet;
         pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;
         pendingLambdaParamTypes_ = savedLamParams;
@@ -28464,6 +28585,40 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             if (narrowedTargetSym && narrowedTargetTy)
                 narrowings_[narrowedTargetSym] = narrowedTargetTy;
             visitExpr(*as->value);
+            // fix #8347 (§28.8.1 / Appendix A.7 MoveExpr / §28.3 K3.13,
+            // v0.355): a `move` marker written on a FRESH PRODUCER at this
+            // assignment's RIGHT-HAND SIDE is a compile error — the operand
+            // rule is position-independent ("a compile error at every
+            // position").
+            //
+            // THE POSITION IS K3.4, NOT K3.1. §28.3's consume table splits
+            // the assignment statement's right-hand side into two POSITIONS:
+            //
+            //   * K3.4 — "a marked binding or assignment transfer — `var y :=
+            //     move x;`, `y := move x;`, `using var y := move x;`" — the
+            //     transfer into a LOCAL or PARAMETER binding. Its Spelling
+            //     column is `move x`: the marker is REQUIRED there, and this
+            //     is issue #8347's "an assignment's right-hand side".
+            //   * K3.1 — "store into an `owned` field or owning-collection
+            //     slot, including through a `set(owned)` accessor" — its
+            //     Spelling column is "none — the declared slot announces
+            //     (marker-free)". That is issue #8330's OWNED-SLOT STORE
+            //     position, which this lane does not touch (its blast radius
+            //     is the `move (new ` corpus population — 665 sites across
+            //     82 files — measured and reported as a residual).
+            //
+            // So the gate is the TARGET's shape: a local or parameter binding
+            // is K3.4 (this lane); a field or an owning-collection slot is
+            // K3.1 (#8330, left alone). A COMPOUND form (`x += e`, `x ??= e`)
+            // is not a plain assignment either — §6.6 desugars `x op= e` to
+            // `x := x op e`, so its `e` is an OPERATOR operand (a different
+            // position, axiom A7's narrowed bound), and `??=` is §7.7's own
+            // compound form.
+            //
+            // The check runs AFTER the RHS visit, because
+            // `calleeReturnsOwned` reads the callee's resolved symbol.
+            if (as->op == ":=" && assignmentTargetIsBinding(as->target.get()))
+                checkMoveMarkerOnFreshProducer(as->value.get());
             if (narrowedTargetSym) narrowings_.erase(narrowedTargetSym);
             if (narrowedTargetSym)
                 erasePendingTypeFact(narrowedTargetSym);  // pending #6083
@@ -29964,6 +30119,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
         }
         if (ds->value) visitExpr(*ds->value);
+        // fix #8366 (§28.8.1 / Appendix A.7 MoveExpr / §28.3 K3.13, v0.355):
+        // a `move` marker written on a FRESH PRODUCER at this DISCARD's
+        // right-hand side is a compile error — the operand rule is
+        // position-independent ("a compile error at every position"), and
+        // the discard RHS is also one of Appendix A.7's marker-free
+        // positions. Runs AFTER the value's visit, because
+        // `calleeReturnsOwned` reads the callee's resolved symbol.
+        if (ds->value) checkMoveMarkerOnFreshProducer(ds->value.get());
         // §17.13 v0.150 (#1009): a discard `_ := expr;` of a NON-trivial-dispose
         // CLASS or INTERFACE is now PERMITTED — it disposes the value at the end
         // of the discard statement (the "unbound owned temporary" form, §28.3).

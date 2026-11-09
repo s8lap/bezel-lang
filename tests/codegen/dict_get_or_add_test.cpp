@@ -308,6 +308,14 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, str_key_miss_stores_owned_and_returns_borr
 // value (tag 3, not the factory's 9). F._n stays 0 (factory never ran). The dict
 // owns the single pre-existing value, disposed once at scope end.
 // Encoded: tag*100 + F._n*10 + final = 3*100 + 0*10 + 1 = 301.
+//
+// The factory's `return new R(9);` LOST ITS `move` MARKER under fix #8347
+// (spec §28.8.1 / Appendix A.7 `MoveExpr` / §28.3 K3.13, v0.355): the marker
+// was written on a FRESH PRODUCER at a `return` OPERAND, and §28.8.1 makes
+// that "a compile error at every position … the remedy is to drop the `move`".
+// The marker took no part in the ownership — a `new` expression produces an
+// owned value (K1.5) — so dropping it changes nothing about what the factory
+// produces; the expected stdout and the LSan leg are unchanged.
 BEZEL_TEST(owned_dict_get_or_add_4_9, str_key_hit_no_factory_returns_existing_borrow) {
     // 301 > 255 → print + runAotOut (LSan leg preserved).
     expectValueOutAndLeakFree(prog(
@@ -315,7 +323,7 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, str_key_hit_no_factory_returns_existing_bo
         "do "
         "  using var d := new OwningDictionary<string, R>(); "
         "  d.Add(\"a\", move (new R(3))); "
-        "  var got := d.GetOrAdd(\"a\", lambda(k: string) => do F._n := F._n + 1; return move (new R(9)); end); "
+        "  var got := d.GetOrAdd(\"a\", lambda(k: string) => do F._n := F._n + 1; return new R(9); end); "
         "  tag := got.Tag(); "
         "end; "
         "Console.WriteLine(tag * 100 + F._n * 10 + R._n); return 0;"), "301");
@@ -350,7 +358,7 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, second_call_same_key_is_hit_no_second_valu
         "  using var d := new OwningDictionary<string, R>(); "
         "  var g1 := d.GetOrAdd(\"a\", lambda(k: string) => move (new R(4))); "
         "  tag1 := g1.Tag(); "
-        "  var g2 := d.GetOrAdd(\"a\", lambda(k: string) => do F._n := F._n + 1; return move (new R(9)); end); "
+        "  var g2 := d.GetOrAdd(\"a\", lambda(k: string) => do F._n := F._n + 1; return new R(9); end); "
         "  tag2 := g2.Tag(); "
         "end; "
         "Console.WriteLine(tag1 * 100 + tag2 * 10 + R._n); return 0;"), "441");

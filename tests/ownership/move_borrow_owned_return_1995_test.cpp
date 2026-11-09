@@ -191,10 +191,25 @@ BEZEL_TEST(move_borrow_owned_return_1995,
 }
 
 // §28.8.1: `return move C.Fresh();` / `return move C.Fresh()!;` — a `move` of a
-// fresh owned producer (a call returning `owned T`) is the legal transfer, NOT a
-// borrow. Guards against the fix flagging an owned temporary.
+// fresh owned producer (a call returning `owned T`) at the `return` OPERAND.
+//
+// FLIPPED by fix #8347 (spec §28.8.1 / Appendix A.7 `MoveExpr` / §28.3 K3.13,
+// v0.355). Before that fix this row pinned the ACCEPTANCE of the marker at this
+// position ("the fresh-producer passthrough; not a field read"). §28.8.1 says,
+// verbatim: "No other operand is admitted (A.7): a fresh producer (a `new`
+// expression, a call returning `owned T`, an owned operator result) needs no
+// marker anywhere (K3.13) and takes none, so `move (new Cell(1))` is a compile
+// error at every position, an `owned` argument and an owned-slot store alike;
+// the remedy is to drop the `move`."  K3.13: "Fresh producers need no marker
+// anywhere (no live binding is invalidated)."  The operand rule is
+// position-independent, so the marker is a compile error at the `return`
+// operand too — the remedy is to drop the `move`.
+//
+// The diagnostic is the OPERAND-SHAPE wording, byte-identical to narrow #7926's
+// binding-position diagnostic (so the one rule speaks with one voice), and it
+// is the shape — the CALL operand — that the text names.
 BEZEL_TEST(move_borrow_owned_return_1995,
-           return_move_owned_producer_disposes_once_spec_28_8_1) {
+           return_move_owned_producer_is_refused_spec_28_8_1) {
     std::string src =
         std::string(kCell) +
         "class C "
@@ -207,9 +222,13 @@ BEZEL_TEST(move_borrow_owned_return_1995,
         "    return Cell.live; "
         "  end Main; "
         "end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // The `move` marker on a fresh producer is a compile error at the `return`
+    // operand — the remedy is to drop the `move`. The ORACLE is the diagnostic
+    // text (a crash would synthesise an Error diagnostic too — tests/README.md
+    // — so the "did not run" assertion below is only supplementary).
+    auto r = parseAndCheckOwnership(src);
+    BEZEL_EXPECT_TRUE(errorSays(r, "not written on a fresh producer"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "fresh producer (a call returning `owned T`)"));
 }
 
 // §28.8.1: `move this.f!` / `move _f!` of an OWNED field is the legal owned READ

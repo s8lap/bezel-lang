@@ -2409,6 +2409,56 @@ private:
     // and is left to a definite-return slice.
     void checkReturnForm(const ast::ReturnStmt& rs);
 
+    // fix #8347 / #8366 (§28.8.1 *The `move` expression* / Appendix A.7
+    // `MoveExpr` / §28.3 K3.13 *Marker economy*, v0.355): the `move` marker
+    // written on a FRESH PRODUCER at one of the positions §28.8.1's operand
+    // rule has not reached yet.
+    //
+    // §28.8.1 (docs/Bezel_Language_Spec.md:8049), verbatim: "No other operand
+    // is admitted (A.7): a fresh producer (a `new` expression, a call returning
+    // `owned T`, an owned operator result) needs no marker anywhere (K3.13) and
+    // takes none, so `move (new Cell(1))` is a compile error at every
+    // position, an `owned` argument and an owned-slot store alike; the remedy
+    // is to drop the `move`."  K3.13 (spec:6827): "Fresh producers need no
+    // marker anywhere (no live binding is invalidated)."
+    //
+    // The rule is POSITION-INDEPENDENT, so it is the SAME rule that narrow
+    // #7926 already applies at a binding position (a declaration initializer)
+    // and that the ownership pass applies at the call-site positions (an
+    // `owned` argument, a constructor argument).  This member is the third
+    // position family: the positions this lane narrows are
+    //
+    //   (a) a `return` OPERAND — the `owned` return (issue #8347);
+    //   (b) an ASSIGNMENT's right-hand side (issue #8347);
+    //   (c) the DISCARD's right-hand side (issue #8366).
+    //
+    // The diagnostic text is BYTE-IDENTICAL to narrow #7926's, so the one rule
+    // speaks with one voice at every position where it fires (and shares the
+    // needle "not written on a fresh producer" with the ownership pass's
+    // §22.3 call-site twin).
+    //
+    // `value` is the POSITION's operand expression (the `return` operand, the
+    // assignment's right-hand side, the discard's right-hand side).  A null
+    // `value`, or a value that is not a `move` over a fresh producer, is left
+    // alone: the three ADMITTED operand shapes of Appendix A.7 — an `owned`
+    // field of a class instance, a slot of an owning collection, and a bare
+    // identifier naming a local binding or `owned` parameter — are NOT fresh
+    // producers and keep compiling.
+    void checkMoveMarkerOnFreshProducer(const ast::Expr* value);
+
+    // fix #8347 (§28.3's consume table, v0.355): is this assignment's TARGET
+    // a LOCAL or PARAMETER binding — the K3.4 position ("a marked binding or
+    // assignment transfer — `var y := move x;`, `y := move x;`"), whose
+    // Spelling column is `move x`?
+    //
+    // A target that is a FIELD or an OWNING-COLLECTION SLOT is the K3.1
+    // position ("store into an `owned` field or owning-collection slot"),
+    // whose Spelling column is "none — the declared slot announces
+    // (marker-free)" — issue #8330's owned-slot store, which this lane does
+    // not touch. A compound form's target is the same node, so the COMPOUND
+    // gate is at the call site, not here.
+    bool assignmentTargetIsBinding(const ast::Expr* target);
+
     // Slice T1: §5.1 numeric/char implicit-widening table. Returns
     // true iff `from` implicitly widens to `to` (both primitives,
     // distinct). Identity is handled by the caller.

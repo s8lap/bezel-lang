@@ -186,18 +186,20 @@ BEZEL_TEST(move_borrow_producing_operand_4683,
 // exemption it encoded is not one the spec grants).
 //
 // (5b) The guard this row still carries is that the rejection is
-// POSITION-SCOPED, not a blanket ban on every CallExpr operand: the SAME
-// `move` of the SAME owned-returning call at a MARKER-FREE position (an
-// `owned` return) still compiles.
+// POSITION-SCOPED, not a blanket ban on every CallExpr operand.
 //
-// CURRENT BEHAVIOUR, NOT A SPEC-SANCTIONED ACCEPTANCE. §28.8.1 (v0.350)
-// makes the marker on a fresh producer "a compile error at every position",
-// and Appendix A.7 rejects a marker at a marker-free position (a `return`
-// operand is one) as redundant — so the ACCEPT asserted below is a position
-// #8330 owns and will flip. It is pinned here so that the binding-position
-// rule is shown to be POSITION-SCOPED (a widening would change this row).
-// The same shape is pinned ACCEPTed on its own by
-// move_borrow_owned_return_1995_test.cpp (`return move C.Fresh();`).
+// FLIPPED by fix #8347 (spec §28.8.1 / Appendix A.7 `MoveExpr` / §28.3 K3.13,
+// v0.355): the `owned`-return position (the `return` OPERAND) is now REJECTED
+// too. §28.8.1 makes the marker on a fresh producer "a compile error at every
+// position", and the operand rule is position-independent, so the SAME `move`
+// of the SAME owned-returning call is refused at the `return` operand. Before
+// that fix the row pinned the ACCEPTANCE here ("CURRENT BEHAVIOUR, NOT A
+// SPEC-SANCTIONED ACCEPTANCE … a position #8330 owns and will flip"). The
+// remedy is to drop the `move`.
+//
+// The diagnostic is the OPERAND-SHAPE wording, byte-identical to narrow #7926's
+// binding-position diagnostic — so the one rule speaks with one voice at every
+// position where it fires.
 BEZEL_TEST(move_borrow_producing_operand_4683,
            move_of_owned_returning_call_rejected_at_a_binding_position_spec_28_8_1) {
     const char* kCellPrelude =
@@ -224,7 +226,9 @@ BEZEL_TEST(move_borrow_producing_operand_4683,
         hasErrorContaining(r, "not written on a fresh producer"));
     BEZEL_EXPECT_FALSE(r.ran);
 
-    // (5b) the `owned`-return position (marker-free): still COMPILES.
+    // (5b) the `owned`-return position (the `return` OPERAND): also REJECTED
+    // by the SAME fresh-producer rule — the operand rule is
+    // position-independent (§28.8.1: "a compile error at every position").
     const char* kReturnPrelude =
         "module M; "
         "class Cell "
@@ -242,10 +246,11 @@ BEZEL_TEST(move_borrow_producing_operand_4683,
         "  end Main; "
         "end W;";
     auto r2 = runAot(kReturnPrelude);
-    BEZEL_EXPECT_FALSE(hasErrorContaining(r2, kCallNeedle));
-    BEZEL_EXPECT_TRUE(r2.ran);
-    BEZEL_EXPECT_EQ(r2.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r2.stdoutText.find("3") != std::string::npos);
+    BEZEL_EXPECT_TRUE(
+        hasErrorContaining(r2, "not written on a fresh producer"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r2, "fresh producer (a call returning `owned T`)"));
+    BEZEL_EXPECT_FALSE(r2.ran);
 }
 
 // (6) A plain (non-`move`) READ through the same borrow-returning call,
