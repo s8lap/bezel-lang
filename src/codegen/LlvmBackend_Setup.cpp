@@ -35709,7 +35709,56 @@ bool Emitter::lowerBoxFieldStore(const ast::Expr& target,
     if (!isBoxFieldLvalue(target, valueExpr)) return false;
     if (!fieldAddr || !newVal) return false;
     if (!newVal->getType()->isPointerTy()) return false;
-    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), fieldAddr, "boxf.old");
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    // fix #8344 (§8.6 / §28.9, v0.355): THE DISPLACED VALUE'S KIND MUST BE
+    // ESTABLISHED AT THIS STORE SITE.
+    //
+    // `oldVal` is whatever the slot held BEFORE this store. Its kind is NOT a
+    // property of the NEW value (the source) — it is a property of the slot's
+    // PREVIOUS occupant, which the field's INITIALIZER or an EARLIER store put
+    // there. §8.6: a `string`, a class instance, a heap array and a function
+    // type are REFERENCE types whose values are already heap allocated and
+    // "reach `Object` directly through the inheritance chain" — they are NOT
+    // boxes. §28.9: `string` and boxed value types are RUNTIME-MANAGED, and
+    // neither is released by `bz_box_release`. So a displaced STRING or a
+    // displaced CLASS INSTANCE must never be handed to `bz_box_release`:
+    // releasing a string as a box is a write through a non-box pointer (the
+    // measured SEGV, `src/runtime/bezel_runtime_refcounting.cpp:757` in
+    // `bz_box_release`), and releasing a class instance as a box decrements
+    // the word at offset 8 — the class instance's FIRST FIELD, not a refcount.
+    //
+    // The kind is resolved STATICALLY, here at the producer/store site: the
+    // runtime deliberately does NOT inspect the vtable to tell a box from a
+    // class instance (the SAFETY note in
+    // `src/runtime/bezel_runtime_refcounting.cpp` says the distinction "is
+    // resolved at the codegen producer/store site").
+    //
+    // THE VERDICT COMES FROM THE collectBoxStorageFields PRE-PASS, whose
+    // verdict is a JOIN over EVERY write to the field — the field's own
+    // initializer plus every store made in every body the pre-pass reaches.
+    // A field is in `boxStorageFields_` iff EVERY one of those writes puts a
+    // BOX (or null) in the slot. A join over all writes IMPLIES the
+    // per-store fact this site needs: the slot can only ever hold a box or
+    // null, so the displaced value is a box (or null — `bz_box_release` is
+    // null-safe). A field the pre-pass EXCLUDED — one that receives a
+    // class-reference store, a string store, or a store of unknown
+    // provenance SOMEWHERE in the program — may hold such a value HERE, so
+    // the release is NOT emitted: the displaced value leaks, which is the
+    // conservative direction the LOCAL machinery already takes for the same
+    // question (see `boxLocalAssignmentSourceKind`'s "-1 = unknown
+    // provenance" arm: "a leak is safer than handing a class instance to
+    // `bz_box_release`").
+    //
+    // MEASURED on the base (r30-c1): `public O: Object := "";` followed by
+    // `h.O := 3;` SEGVs in `bz_box_release` (the displaced string released as
+    // a box); `h.O := "runtime"; h.O := 3;` SEGVs the same way; a field
+    // holding a user class instance that is then overwritten by a box prints
+    // `6` where `7` is expected (the class instance's first field decremented
+    // as if it were a refcount).
+    const bool displacedIsBox = sym && isBoxStorageMember(sym);
+    llvm::Value* oldVal = displacedIsBox
+        ? builder_.CreateLoad(ptrTy(), fieldAddr, "boxf.old")
+        : nullptr;
     // A +1 producer is TRANSFERRED (no retain) — its single reference flows
     // into the field. A borrow is RETAINED so the field's count is independent.
     // Producer: a freshly-boxed value source (boxable value type → boxForTarget
@@ -35721,7 +35770,12 @@ bool Emitter::lowerBoxFieldStore(const ast::Expr& target,
     if (!isProducer)
         emitBoxRetain(newVal);
     builder_.CreateStore(newVal, fieldAddr);
-    emitBoxRelease(oldVal);
+    // fix #8344: release the DISPLACED value only when the slot provably held
+    // a box (see the comment above). Before the fix this release was
+    // UNGATED: the displaced value's kind was never checked, so a displaced
+    // string or class instance was released as a box.
+    if (displacedIsBox)
+        emitBoxRelease(oldVal);
     // Record this field as a box storage field so the disposer releases it.
     // Safety: isBoxFieldLvalue already verified the source is boxable; a class-
     // reference source cannot reach here. If the field was previously added via
@@ -35742,7 +35796,6 @@ bool Emitter::lowerBoxFieldStore(const ast::Expr& target,
     // Gating the re-insert on the pre-pass's verdict makes the code match its
     // stated contract; the set is unchanged for every field the pre-pass
     // admitted (the re-insert was a no-op there).
-    sema::Symbol* sym = ctx_.exprSymbol(target);
     if (sym && isBoxStorageMember(sym))
         boxStorageFields_.insert(static_cast<const void*>(sym));
     return true;
