@@ -4968,7 +4968,15 @@ private:
     // §22.6 stage-8 ambiguity when no candidate is unambiguously better.
     // Returns true when an error was reported. Any other outcome leaves the
     // call on its existing deferred path.
-    bool reportPrimaryBodyCtorAmbiguity(const ast::NewExpr& ne, TypeSymbol* t);
+    //
+    // fix #8134 (§22.6 / §22.15, v0.355): the ranking's §22.6 WINNER is also
+    // PUBLISHED for the pure-body throw carve-out (`SemaContext::setPureNewCtor`
+    // / `setPureNewCtorIsPrimary`) — the carve-out asks which constructor a
+    // `new E(...)` invokes, and the LOCAL combined form defers to codegen, so
+    // nothing else on the table carries the answer. Publishing the compiler's
+    // own ranking is what stops a SECOND ranking from being built in the
+    // checker (the review r40-rev-8134's FINDING 1).
+    bool resolvePrimaryBodyCtorOverload(const ast::NewExpr& ne, TypeSymbol* t);
 
     // fix #4170 (§35.1/§35.2/§35.3, v0.295; mirrors #4163's §5.4/§10
     // enum rejection): neither an enum nor a choice has a constructor

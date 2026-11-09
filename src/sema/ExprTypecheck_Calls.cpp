@@ -30675,7 +30675,7 @@ bool ExprTC::recordAllowsZeroArgNew(const TypeSymbol& t) {
 // both-sources equivalent of this stage-8 ambiguity ranking today; an
 // imported `t` safely falls through to `!td` below and this check is simply
 // skipped (deferred to the existing overload path), not mis-answered.
-bool ExprTC::reportPrimaryBodyCtorAmbiguity(const ast::NewExpr& ne,
+bool ExprTC::resolvePrimaryBodyCtorOverload(const ast::NewExpr& ne,
                                             TypeSymbol* t) {
     // SEAM-DEBT: #4988 see the function comment above.
     auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
@@ -30685,11 +30685,33 @@ bool ExprTC::reportPrimaryBodyCtorAmbiguity(const ast::NewExpr& ne,
     for (const auto& a : ne.args)
         if (!a.modifier.empty() || a.isDiscard || !a.value) return false;
     const std::size_t nSupplied = ne.args.size();
+    // fix #8134 (§22.6 "Overloading" / §22.15 "The throw carve-out", v0.355):
+    // the §22.6 WINNER this ranking computes is PUBLISHED for the pure-body
+    // throw carve-out. The carve-out's condition (a) asks about the INVOKED
+    // constructor ("the invoked constructor of `E` is `pure`-declared"), and
+    // the LOCAL combined form DEFERS to codegen — so `resolvedNewCtor` (#4853)
+    // carries nothing for it, and the carve-out has to be told the answer
+    // here. Publishing the compiler's OWN §22.6 answer is what the review
+    // r40-rev-8134's FINDING 1 asked for: a SECOND ranking, built in the
+    // checker, is how that defect happened (the checker's copy had no
+    // APPLICABILITY stage, so it could not tell "inapplicable" from
+    // "converting").
+    //
+    // The publication is keyed on the `new` expression's argument list and
+    // lands in a table of its own (`SemaContext::setPureNewCtor`), NOT in
+    // `resolvedNewCtor`: that table is read by codegen to lower the
+    // constructor, and the LOCAL combined form still DEFERS to codegen's own
+    // selection — publishing into it would move what codegen lowers.
+    const bool publish = t->kind == ast::TypeDeclKind::Class;
 
     // §22.5 binding filters the candidate set first: the primary, then every
     // body constructor. A candidate that does not bind is inapplicable.
     std::vector<const std::vector<ast::Param>*> cands;
     std::vector<BindResult> binds;
+    // The candidate's ConstructorSymbol — nullptr for the class PRIMARY,
+    // which carries none (§22.10: its parameter list lives on the TypeDecl
+    // and on the positional FIELD symbols).
+    std::vector<ConstructorSymbol*> candCtors;
     {
         BindResult pb = bindArgsToParams(td->positionalFields, ne.args,
                                          ne.span.begin, std::string(),
@@ -30697,6 +30719,7 @@ bool ExprTC::reportPrimaryBodyCtorAmbiguity(const ast::NewExpr& ne,
         if (!pb.ok) return false;  // the primary is not a candidate: no tie
         cands.push_back(&td->positionalFields);
         binds.push_back(std::move(pb));
+        candCtors.push_back(nullptr);
     }
     for (Symbol* m : t->members) {
         auto* cs = dynamic_cast<ConstructorSymbol*>(m);
@@ -30708,8 +30731,16 @@ bool ExprTC::reportPrimaryBodyCtorAmbiguity(const ast::NewExpr& ne,
         if (!b.ok) continue;
         cands.push_back(&cd->params);
         binds.push_back(std::move(b));
+        candCtors.push_back(cs);
     }
-    if (cands.size() < 2) return false;
+    if (cands.size() < 2) {
+        // ONE candidate — the class PRIMARY: it binds and NO body constructor
+        // does, so the PRIMARY is the invoked constructor (§22.10). It
+        // carries no ConstructorSymbol, so it is published as the primary
+        // marker, and the carve-out reports the primary's own reason.
+        if (publish) ctx_.setPureNewCtorIsPrimary(&ne.args);
+        return false;
+    }
 
     // Lay every candidate's bound parameters out in call-argument order (the
     // shared column order resolveOverload needs; §22.5 binds each supplied
@@ -30775,6 +30806,27 @@ bool ExprTC::reportPrimaryBodyCtorAmbiguity(const ast::NewExpr& ne,
     for (std::size_t i = 0; i < nSupplied; ++i)
         ctx_.setExprType(const_cast<ast::Expr*>(argExprs[i]),
                          const_cast<TypeRef*>(argTypes[i]));
+    // fix #8134 (§22.6 / §22.15, v0.355): the §22.6 WINNER is published for
+    // the pure-body throw carve-out — the compiler's own answer, so the
+    // carve-out never re-derives it. A UNIQUE winner only: an ambiguous or
+    // unreachable set is a diagnostic of its own (the call is rejected), and
+    // an undecidable one (argument types §22.6 cannot grade) leaves the
+    // selection unpublished.
+    if (publish) {
+        if (res.outcome == OverloadOutcome::Resolved &&
+            res.winnerIndex < candCtors.size()) {
+            if (candCtors[res.winnerIndex])
+                ctx_.setPureNewCtor(&ne.args, candCtors[res.winnerIndex]);
+            else
+                ctx_.setPureNewCtorIsPrimary(&ne.args);
+        } else if (res.outcome == OverloadOutcome::Ambiguous ||
+                   res.outcome == OverloadOutcome::Unreachable) {
+            // NO winner: two APPLICABLE candidates that §22.6 cannot
+            // separate (or none applicable at all). The invoked constructor is
+            // genuinely unidentifiable, and the carve-out says exactly that.
+            ctx_.setPureNewCtorAmbiguous(&ne.args);
+        }
+    }
     return res.outcome == OverloadOutcome::Ambiguous ||
            res.outcome == OverloadOutcome::Unreachable;
 }
@@ -30896,7 +30948,7 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                             /*emit=*/true);
                     }
                 }
-                (void)reportPrimaryBodyCtorAmbiguity(ne, t);
+                (void)resolvePrimaryBodyCtorOverload(ne, t);
                 return;
             }
             // The positional fields are the constructor's parameter list
@@ -31046,7 +31098,7 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                         /*emit=*/true);
                 }
             }
-            (void)reportPrimaryBodyCtorAmbiguity(ne, t);
+            (void)resolvePrimaryBodyCtorOverload(ne, t);
             return;
         } else if (ctx_.isImported(t) && hasExplicitCtor && !ne.args.empty()) {
             // fix #3625 (§22.5 / §22.7 / §22.10 / §2.8.3 rule 4, v0.286) — the

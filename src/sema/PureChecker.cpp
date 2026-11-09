@@ -1078,15 +1078,52 @@ static bool ctorBindsArgs(const sema::FormalsView& formals,
 // fix-forward #8134: the invoked constructor of `new E(args)`, for a class
 // whose selection the typecheck pass did not publish. See the note above for
 // the two rules and why the old arity match was not enough.
+//
+// fix #8134 (§22.15 / §22.10 / §11.1, v0.355): the class PRIMARY joins the
+// invoked set as a CANDIDATE — it is a member of the constructor overload set
+// (§11.1: body constructors are declared "in addition" to it) — and it is
+// never `pure`-declared (§22.15 "Where `pure` may appear": a primary is not a
+// declaration that carries modifiers; §22.15 "Members classified by rule"
+// reaches only auto-property getters and a record's synthesized members —
+// "Authored bodies always require the explicit keyword").
+//
+// THE PRIMARY'S CANDIDACY IS DECIDED BY THE §22.6 RANKING, NOT HERE. That
+// ranking is the typecheck pass's own (it owns §5.1's conversions and
+// §22.6's APPLICABILITY stage — "a candidate whose parameter type admits no
+// conversion is [inapplicable]"), and it is PUBLISHED for the carve-out —
+// `SemaContext::pureNewCtor` / `pureNewCtorIsPrimary`, read by the caller
+// before this fallback. A SECOND ranking, built here, is exactly what the
+// review r40-rev-8134's FINDING 1 measured: the copy had no APPLICABILITY
+// stage, so it could not tell "inapplicable" from "converting" and refused
+// seven legal programs the compiler admitted before.
+//
+// So what is left here is the shapes the ranking does not reach:
+//   * a class with a primary and NO body constructor: the primary is the
+//     only constructor, so it is the invoked one;
+//   * every other shape keeps the pre-#8134 rule: ONE non-static constructor
+//     is the invoked one, and otherwise the arguments are BOUND to each
+//     candidate's formals (§22.5) so a defaulted formal left unbound — and a
+//     named argument — are honoured.
 static const ConstructorSymbol* findInvokedUserCtor(
-    const TypeSymbol* cls, const std::vector<ast::CallArgument>& args) {
+    const TypeSymbol* cls, const std::vector<ast::CallArgument>& args,
+    bool* outPrimaryInvoked) {
+    if (outPrimaryInvoked) *outPrimaryInvoked = false;
     std::vector<const ConstructorSymbol*> ctors;
     for (Symbol* m : cls->members) {
         auto* cs = dynamic_cast<ConstructorSymbol*>(m);
         if (!cs || cs->isStatic) continue;
         ctors.push_back(cs);
     }
-    if (ctors.empty()) return nullptr;
+    // The class PRIMARY (§22.10): a candidate of the invoked set that is
+    // never `pure`-declared.
+    const bool hasPrimary = cls->kind == ast::TypeDeclKind::Class &&
+                            cls->hasPositionalFields;
+    if (hasPrimary && ctors.empty()) {
+        // The primary is the ONLY constructor of the class: it is the invoked
+        // one, and the carve-out reports the primary's own reason.
+        if (outPrimaryInvoked) *outPrimaryInvoked = true;
+        return nullptr;
+    }
     // (a) ONE non-static constructor: it is the invoked one.
     if (ctors.size() == 1) return ctors[0];
     // (b) SEVERAL: the unique candidate whose formals the call binds.
@@ -1801,19 +1838,58 @@ bool PureBodyWalker::throwCarveOutAdmits(const ast::NewExpr& ne,
     // to each candidate's formals (§22.5) so a defaulted formal left
     // unbound — and a named argument — are honoured.
     //
+    // fix #8134 (§22.6 "Overloading" / §22.15 "The throw carve-out" /
+    // §22.10 "Primary constructors", v0.355): the LOCAL COMBINED FORM — a
+    // class with BOTH a primary constructor (§22.10) and body constructors —
+    // is the shape §22.15's carve-out asks about, and it is the shape the
+    // typecheck pass DEFERS to codegen (the primary's and the body
+    // constructors' parameter lists share the call site), so
+    // `resolvedNewCtor` carries nothing for it. The pass's OWN §22.6 ranking
+    // over that candidate set — the primary together with the body
+    // constructors, with §22.6's APPLICABILITY stage — is published for the
+    // carve-out in `SemaContext::pureNewCtor` / `pureNewCtorIsPrimary`, and
+    // it is read here.
+    //
+    // WHY THE RANKING IS NOT RE-DERIVED HERE. §22.6's APPLICABILITY stage
+    // needs §5.1's conversions ("a candidate whose parameter type admits no
+    // conversion is [inapplicable]"), and the typecheck pass owns them. A
+    // ranking built in this checker is a SECOND ranking, and the two can
+    // disagree — that is how the review r40-rev-8134's FINDING 1 happened:
+    // the checker's copy had no APPLICABILITY stage, so it could not tell
+    // "inapplicable" from "converting" and refused seven legal programs the
+    // compiler admitted before (an `int` argument against a `long` formal).
+    //
     // A class with NO identifiable constructor (an implicit default
-    // constructor, a primary constructor, an ambiguous overload set) has no
-    // pure constructor the carve-out can point at, so the carve-out does
-    // not admit it — the same verdict the pre-#8134 "no pure ctor on the
-    // class" answer gave.
+    // constructor, an ambiguous overload set) has no pure constructor the
+    // carve-out can point at, so the carve-out does not admit it — the same
+    // verdict the pre-#8134 "no pure ctor on the class" answer gave.
+    bool primaryInvoked = false;
+    bool ambiguous = false;
     const ConstructorSymbol* invoked = ctx_.resolvedNewCtor(&ne.args);
-    if (!invoked) invoked = findInvokedUserCtor(targetDecl, ne.args);
     if (!invoked) {
-        if (why)
-            *why = "the invoked constructor of `" +
-                   std::string(targetDecl->name) +
-                   "` could not be identified, so no `pure` constructor is "
-                   "provable for it";
+        invoked = ctx_.pureNewCtor(&ne.args);
+        primaryInvoked = ctx_.pureNewCtorIsPrimary(&ne.args);
+        ambiguous = ctx_.pureNewCtorAmbiguous(&ne.args);
+    }
+    if (!invoked && !primaryInvoked && !ambiguous)
+        invoked = findInvokedUserCtor(targetDecl, ne.args, &primaryInvoked);
+    if (!invoked) {
+        if (why) {
+            if (primaryInvoked) {
+                *why = "the invoked constructor of `" +
+                       std::string(targetDecl->name) +
+                       "` is the class's PRIMARY constructor (§22.10), which is "
+                       "never `pure`-declared — §22.15's classification reaches "
+                       "only auto-property getters and a record's synthesized "
+                       "members, and an authored body requires the explicit "
+                       "`pure` keyword";
+            } else {
+                *why = "the invoked constructor of `" +
+                       std::string(targetDecl->name) +
+                       "` could not be identified, so no `pure` constructor is "
+                       "provable for it";
+            }
+        }
         return false;
     }
     // fix #3174 (§22.15, v0.254): through the one predicate — the same
@@ -2338,6 +2414,30 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
         // carve-out admits. So the arm walks the OPERAND (where the
         // user-visible call lives) and admits the operator itself.
         checkExpr(pb->operand.get());
+        return;
+    }
+    if (auto* rg = dynamic_cast<const ast::RangeExpr*>(e)) {
+        // fix #8134 (§22.15 rule 3 / §22.15 rule 6, v0.355): a RANGE
+        // CONSTRUCTION's operands. §22.15 rule 3 admits "range construction"
+        // as one of the pure body's forms — but the CONSTRUCTION, not its
+        // operands: the bound expressions are ordinary sub-expressions of the
+        // body, and the list is closed ("A pure body may contain exactly the
+        // following"), so rule 6 governs every call in them ("A call —
+        // method, operator, accessor read, or constructor in the admitted
+        // positions — is permitted iff the member … is `pure`-declared or
+        // pure-classified").
+        //
+        // WHAT WAS MISSING. `ast::RangeExpr` had no arm in this walker, so
+        // `0..<Helper.Count()` (a `for` loop's source) and `var r :=
+        // 1..Helper.Count();` (a local's initializer) both compiled in a
+        // `pure` body and ran the impure call — while the very same call
+        // written as `var n := Helper.Count();` was rejected. §22.15 rule 5
+        // admits a `for` loop over a `Range<T>` of primitive steppable type
+        // (the counted-loop form); that admits the SOURCE, not the impure
+        // call inside the source's bounds.
+        if (rg->lo) checkExpr(rg->lo.get());
+        if (rg->hi) checkExpr(rg->hi.get());
+        if (rg->step) checkExpr(rg->step.get());
         return;
     }
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {

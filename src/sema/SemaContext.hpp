@@ -447,6 +447,62 @@ public:
         auto it = resolvedNewCtors_.find(newArgs);
         return it == resolvedNewCtors_.end() ? nullptr : it->second;
     }
+    // fix #8134 (§22.6 "Overloading" / §22.15 "The throw carve-out" /
+    // §22.10 "Primary constructors", v0.355): the §22.6 WINNER of a
+    // `new E(...)` call against a class that has BOTH a primary constructor
+    // (§22.10) and body constructors — the LOCAL combined form.
+    //
+    // WHY A TABLE OF ITS OWN. `resolvedNewCtors_` above is #4853's: codegen
+    // reads it to lower the constructor sema chose. The LOCAL combined form
+    // DEFERS to codegen (`ExprTC::checkNewExprArgs`'s
+    // `hasExplicitCtor && !ctx_.isImported(t)` arm — the primary's and the
+    // body constructors' parameter lists share the call site, #3163's wider
+    // work), so codegen's `ctorForArgs` still selects for it, and publishing
+    // into `resolvedNewCtors_` would change WHAT CODEGEN LOWERS. The
+    // pure-body throw carve-out (§22.15's condition (a) — "the INVOKED
+    // constructor of `E` is `pure`-declared") needs the same answer and must
+    // not move codegen's selection, so the winner is published HERE.
+    //
+    // The KEY is the address of the `NewExpr::args` vector — the same key
+    // shape and the same soundness argument as `resolvedNewCtors_` above.
+    //
+    // The VALUE is the winning BODY constructor, or — when the class PRIMARY
+    // won — nullptr with the primary marker set: the primary carries NO
+    // ConstructorSymbol (§22.10's parameter list lives on the TypeDecl and
+    // on the positional FIELD symbols), so it cannot be published as one.
+    void setPureNewCtor(const std::vector<ast::CallArgument>* newArgs,
+                         ConstructorSymbol* ctor) {
+        if (newArgs && ctor) pureNewCtors_[newArgs] = ctor;
+    }
+    void setPureNewCtorIsPrimary(const std::vector<ast::CallArgument>* newArgs) {
+        if (newArgs) pureNewCtorPrimaries_.insert(newArgs);
+    }
+    // fix #8134 (§22.6 / §22.15, v0.355): the ranking found NO winner — two
+    // APPLICABLE candidates that neither §22.6's exact-match ranking nor its
+    // defaulted-arity tie-break separates (or none applicable at all). The
+    // invoked constructor is then genuinely unidentifiable, and the carve-out
+    // says so with its generic reason. (The typecheck pass rejects such a
+    // call itself; this marker only tells the carve-out what to say.)
+    void setPureNewCtorAmbiguous(
+        const std::vector<ast::CallArgument>* newArgs) {
+        if (newArgs) pureNewCtorAmbiguous_.insert(newArgs);
+    }
+    ConstructorSymbol* pureNewCtor(
+        const std::vector<ast::CallArgument>* newArgs) const {
+        if (!newArgs) return nullptr;
+        auto it = pureNewCtors_.find(newArgs);
+        return it == pureNewCtors_.end() ? nullptr : it->second;
+    }
+    bool pureNewCtorIsPrimary(
+        const std::vector<ast::CallArgument>* newArgs) const {
+        if (!newArgs) return false;
+        return pureNewCtorPrimaries_.count(newArgs) != 0;
+    }
+    bool pureNewCtorAmbiguous(
+        const std::vector<ast::CallArgument>* newArgs) const {
+        if (!newArgs) return false;
+        return pureNewCtorAmbiguous_.count(newArgs) != 0;
+    }
     // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): per-IndexExpr substituted
     // indexer-parameter TypeRefs — see `indexerSubstitutedParamTypes_` below
     // for the rationale. Populated by the typecheck pass from
@@ -1384,6 +1440,22 @@ private:
     std::unordered_map<const std::vector<ast::CallArgument>*,
                        ConstructorSymbol*>
         resolvedNewCtors_;
+    // fix #8134 (§22.6 / §22.15 / §22.10, v0.355): the §22.6 winner of a
+    // `new E(...)` call against a class that has BOTH a primary constructor
+    // (§22.10) and body constructors — the LOCAL combined form. See
+    // `setPureNewCtor` above for why this is a table of its own and not
+    // `resolvedNewCtors_`.
+    std::unordered_map<const std::vector<ast::CallArgument>*,
+                       ConstructorSymbol*>
+        pureNewCtors_;
+    // The calls whose §22.6 winner is the class PRIMARY (which carries no
+    // ConstructorSymbol — see `setPureNewCtor` above).
+    std::unordered_set<const std::vector<ast::CallArgument>*>
+        pureNewCtorPrimaries_;
+    // The calls whose §22.6 ranking found NO winner (see
+    // `setPureNewCtorAmbiguous` above).
+    std::unordered_set<const std::vector<ast::CallArgument>*>
+        pureNewCtorAmbiguous_;
     // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): per-IndexExpr substituted
     // indexer-parameter TypeRefs. Populated by the typecheck pass at the
     // SAME site it computes `substituteMemberType` for the §7
