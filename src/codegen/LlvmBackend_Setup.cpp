@@ -37713,6 +37713,66 @@ struct ClosureEscapeWalker {
                 if (!safeArg && isTargetIdent(c->args[ai].value.get()) &&
                     closureArgBindsMethodOwnTypeParamBorrow(ctx, *c, ai))
                     safeArg = true;
+                // fix #7803 (stdlib §2.1 / §8.5 / §22.3 / §28.3 / §28.9,
+                // v0.355): a closure local read at the BUILT-IN console's
+                // `Write(Line)` argument position is a CALL-BOUNDED BORROW,
+                // not an escape.
+                //
+                // stdlib §2.1 declares `Console.Write(value: Object)` /
+                // `Console.WriteLine(value: Object)` — and the `Console.Out` /
+                // `Console.Error` TextWriter facets of stdlib §7.4, which
+                // route through the SAME `tryLowerConsoleCall` lowering — with
+                // a PLAIN parameter: no `owned` marker, so §22.3's rule ("the
+                // `owned` modifier is what transfers ownership") makes the
+                // position a BORROW and the CALLER keeps the obligation. The
+                // console provably never retains what it is handed: it RENDERS
+                // the one argument through §8.5's `ToString` and writes the
+                // bytes to the stream — it stores nothing, so nothing outlives
+                // the call. (That is the very premise `isConsoleNonRetainingArg`
+                // states for the string / box / inline-array walks, and the
+                // premise the console lowering's own `freshFnArg` release
+                // rests on.)
+                //
+                // WHY THE WALKER, AND NOT THE CONSOLE LOWERING. The argument
+                // here is a BOUND local, not a fresh production: the local's
+                // slot owns the producer's +1, so the LOCAL's scope-end
+                // `bz_closure_release` is the discharge that must fire. A
+                // release AT the console would free the cell while the local
+                // still points at it — a double free the moment this relief
+                // lands, and a use-after-free on any later read of the local.
+                // The console's own discharge stays keyed on the ARGUMENT'S
+                // SHAPE (`freshFnArg` — a forming expression nothing binds),
+                // so a named local, a field, a parameter or an alias is never
+                // discharged there.
+                //
+                // MEASURED (`bezelc --sanitize=address`, LSan, 200
+                // iterations): `var f: (int) -> int := lambda(x: int) => x + 1;
+                // Console.Out.WriteLine(f);` leaked 64 B in 1 allocation (the
+                // 64-byte `bz.closure` cell) — the local's scope-end release
+                // was never armed, because this walk classified the local as
+                // ESCAPED. The IR is the proof: that program's `main` has
+                // ZERO `bz_closure_release` call sites, while the
+                // byte-identical program with the closure in CALLEE position
+                // (`Console.WriteLine(f(1))`) has TWO, and the one with a
+                // USER method's plain parameter (`Use(f)`) has TWO as well —
+                // the callee is the only difference.
+                //
+                // THE RECOGNIZER IS THE SHARED ONE (`isConsoleNonRetainingArg`,
+                // the #1994 change, hoisted out of the string walker by
+                // #2865) — NOT a fourth copy of the console-shape predicate
+                // (the #2787 lesson): it is keyed on the SAME callee shapes
+                // `tryLowerConsoleCall` keys on, so the escape decision and
+                // the lowering stay in lockstep. The `c->args.size() == 1` gate
+                // mirrors the lowering's own `if (call.args.size() != 1)`
+                // (the console takes exactly one value), and the
+                // `modifier.empty()` gate refuses a `move`d argument, whose
+                // ownership the call site transfers — a moved-from slot owns
+                // nothing, so no scope-end release may fire for it.
+                if (!safeArg && ai == 0 && c->args.size() == 1 &&
+                    c->args[ai].modifier.empty() &&
+                    isTargetIdent(c->args[ai].value.get()) &&
+                    isConsoleNonRetainingArg(c->callee.get(), ai, &ctx))
+                    safeArg = true;
                 expr(c->args[ai].value.get(), /*safeRead=*/safeArg);
             }
             return;
