@@ -3460,6 +3460,141 @@ static bool isOwnedRelevantLocal(sema::Symbol* sym) {
            rt->declaration->kind == ast::TypeDeclKind::Interface;
 }
 
+// §28.2 (v0.355) "Use after a dominating explicit disposal" / §28.10 (v0.350)
+// `using var`, #7893: a USE THROUGH A HOLDER of a borrow of a value an
+// explicit `Dispose()` disposed.
+//
+// THE SPEC. §28.2 (docs/Bezel_Language_Spec.md:6652) reads, in full:
+//   "**Use after a dominating explicit disposal.** A use of a local variable —
+//    a read, a borrow taken from it, a member access, an argument position, a
+//    consume — after an explicit `Dispose()` or direct `DisposeAsync()` call
+//    … on the same variable that dominates the use site on every path is a
+//    **compile error** … **The same error reaches a use through a local borrow
+//    of the variable's value: where a local holds a borrow of that value — an
+//    alias (`var b := a;`, `const b := a;`), a `using var` pin (§28.10), a
+//    value that holds the borrow … — taken while the variable held that value,
+//    and every value in the holder's source set (K2.2) has been so disposed on
+//    every path to the use, a use of the holder — a read or member access
+//    through it, passing it, re-borrowing it, invoking the closure,
+//    enumerating or disposing the frame — is the same compile error; the
+//    diagnostic names the use, the holder, the disposed source and the
+//    disposing site.**"
+// and §28.10 (docs/Bezel_Language_Spec.md:8252) names the PIN shape
+// specifically: "an explicit `Dispose()` of the source is permitted; **a read
+// through the pinned binding that the disposal dominates is §28.2's compile
+// error**, and one the disposal reaches on only some paths raises
+// `DisposedAccessException` in checked disposal mode".
+//
+// So the severity is the SPEC'S OWN: a compile error. The DIRECT shape
+// (`a.Dispose(); a.Use();`) keeps its own diagnostic and its own severity —
+// `checkRead`'s `state == Disposed` arm, a WARNING (the §28.2 v0.131 ruling,
+// unchanged here); this check is the MISSING static rejection for the HOLDER
+// shape, with its own diagnostic.
+//
+// THE HOLDER — ONE POSITIVE RECOGNITION: a `using var` BORROW-PIN —
+// `using var p := b;` — whose declaration carries `usingVarSourceIsBorrow`
+// (§28.10 "using var initialized from a borrow": "the `using var` still
+// **pins** the borrow's source for the duration of the scope"). A pin never
+// records `LocalOwnership::source` (handleLocalDecl keeps `source` to a plain
+// `var`/`const`, #4268), so its source root is recovered from the declaration.
+//
+// THE PIN'S SOURCE — a plain LOCAL read: `b` or `b!` (the §17.8
+// null-forgiving read peeled, and a §17.4 `as` cast with it). A MEMBER read
+// or a CALL is not admitted, and the reason is §28.2's own clause — the
+// error reaches a use of the holder only where the disposal is "on the same
+// variable": `using var v := h.Borrowed();` borrows the FIELD the call
+// returns, not the holder `h`, so `h.Dispose()` is not a disposal of the
+// pinned value and the runtime backstop (§28.2 checked mode) stands behind
+// the use — the shape the spec's own rule corpus pins (case `s28_10_0012`:
+// "an explicit `Dispose()` of a borrow-pin's source is permitted, and a read
+// through the pinned binding afterwards raises `DisposedAccessException` in
+// checked disposal mode").
+//
+// THE OWNER. The pin's source is followed through the borrow chain to the
+// binding that still holds the value: a borrow-state local links to its
+// source, and the first link that is not a borrow is the owner. The owner's
+// own `Disposed` state is the house's existing "the disposal dominates"
+// criterion (the same one `checkRead`'s direct arm uses: a dominating
+// explicit disposal leaves the binding `Disposed`, a conditional one leaves
+// it `Owned` with `disposedOnSomePath` — §28.2's "A holder whose source was
+// disposed on only some paths to the use … is not rejected").
+void MethodOwnership::checkUseThroughDisposedBorrowHolder(
+        const ast::IdentifierExpr& id, sema::Symbol* sym) {
+    // The holder: a `using var` borrow-pin over a borrow.
+    const ast::LocalDecl* pld = nullptr;
+    if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+        pld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    if (!pld) return;
+    if (!pld->isUsing || !pld->usingVarSourceIsBorrow ||
+        pld->initializerHasOwnedMarker || !pld->initializer)
+        return;
+    // The pin's source: a plain local read (`b`, `b!`). A member read or a
+    // call is not a local read and has no tracked owner to chain to.
+    const ast::Expr* srcExpr = peelTopCastBang(pld->initializer.get());
+    const auto* srcId = dynamic_cast<const ast::IdentifierExpr*>(srcExpr);
+    if (!srcId) return;
+    const sema::Symbol* source = ctx_.exprSymbol(*srcId);
+    if (!source || source == sym) return;
+    // Follow the borrow chain to the OWNER — the binding that still holds the
+    // value. A borrow-state local links to its source; the owner is the first
+    // link that is not a borrow.
+    const sema::Symbol* owner = source;
+    for (int hops = 0; hops < 64; ++hops) {
+        auto it = states_.find(const_cast<sema::Symbol*>(owner));
+        if (it == states_.end()) break;
+        const LocalOwnership& so = it->second;
+        if (so.state != OwnershipState::Borrowed || !so.source ||
+            !so.source->sym)
+            break;
+        owner = so.source->sym;
+    }
+    if (!owner || owner == sym) return;
+    auto oit = states_.find(const_cast<sema::Symbol*>(owner));
+    if (oit == states_.end()) return;
+    const LocalOwnership& os = oit->second;
+    // The disposal must DOMINATE the use: the owner's own state is
+    // `Disposed` (the house's criterion — a conditional disposal leaves
+    // the binding `Owned` with `disposedOnSomePath`), and it must be an
+    // EXPLICIT `Dispose()` / direct `DisposeAsync()` — §28.2's own words
+    // ("after an explicit `Dispose()` or direct `DisposeAsync()` call").
+    //
+    // `Poisoned` is admitted alongside `Disposed`: it is the state the
+    // house's own use-after-dispose arm leaves the binding in AFTER it
+    // has reported the direct read of a disposed binding (its "suppress
+    // cascades" bookkeeping). The `await a.DisposeAsync();` spelling
+    // reaches the disposal through the await operand (the await arm
+    // routes the operand through `handleDischarge`, which records the
+    // disposal), and the receiver read of the dispose call then poisons
+    // the binding — the disposal still dominates the later read, so the
+    // read through the pin is the same error.
+    //
+    // `disposedOnSomePath` excludes the CONDITIONAL disposal, which §28.2
+    // explicitly does NOT reject: "A holder whose source was disposed on
+    // only some paths to the use … is not rejected: a use through it
+    // raises `DisposedAccessException` in checked disposal mode and is
+    // undefined behavior unchecked, the runtime backstop above."
+    if (os.state != OwnershipState::Disposed &&
+        os.state != OwnershipState::Poisoned)
+        return;
+    if (!os.explicitlyDisposed) return;
+    if (os.disposedOnSomePath) return;
+    reportOnce(
+        Severity::Error, id.span.begin,
+        std::string("use of `") + std::string(id.name) +
+        "` after a dominating explicit Dispose() of `" +
+        std::string(owner->name) +
+        "` — `" + std::string(id.name) +
+        "` is a `using var` pin of that value's borrow (§28.10), so this use "
+        "reads freed memory: a use through a local borrow of a disposed "
+        "variable is §28.2's use-after-dispose compile error (§28.2 / "
+        "§28.10; a read through the pinned binding that the disposal "
+        "dominates is §28.2's compile error)");
+    if (os.explicitDisposeLoc.line != 0)
+        report(Severity::Note, os.explicitDisposeLoc,
+               std::string("explicit Dispose() of `") +
+                   std::string(owner->name) + "` was here");
+}
+
 void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
     // §17.15 (v0.216, #2098): a binding atom reached in ANY read position is
     // processed exactly once per block visit (clauses → body → boundary);
@@ -3773,6 +3908,13 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
             // above (§28.2 / §28.3 K1.3/K7, v0.294).
             if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         }
+        // §28.2 / §28.10 (#7893): a USE THROUGH A HOLDER of a borrow of a
+        // value an explicit `Dispose()` disposed — the holder shape of the
+        // use-after-dispose rule, which the DIRECT arm above cannot see (it
+        // reads the DISPOSED binding's own state, and the holder's state is
+        // Borrowed / a pin's Owned). Runs after every plain-state arm so the
+        // direct shape keeps its own diagnostic and its own severity.
+        checkUseThroughDisposedBorrowHolder(*id, sym);
         return;
     }
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {

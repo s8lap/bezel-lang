@@ -1887,6 +1887,41 @@ private:
     // it. For everything else, MovedFrom / Disposed is a diagnostic.
     void checkRead(const ast::Expr& e, bool selfTarget);
 
+    // §28.2 (v0.355) "Use after a dominating explicit disposal" / §28.10
+    // (v0.350) `using var` (v0.355), #7893: a USE THROUGH A HOLDER of a
+    // borrow of a value that an explicit `Dispose()` disposed. §28.2: "The
+    // same error reaches a use through a local borrow of the variable's
+    // value: where a local holds a borrow of that value — an alias
+    // (`var b := a;`, `const b := a;`), a `using var` pin (§28.10) — taken
+    // while the variable held that value, and every value in the holder's
+    // source set (K2.2) has been so disposed on every path to the use, a use
+    // of the holder — a read or member access through it, passing it,
+    // re-borrowing it, invoking the closure, enumerating or disposing the
+    // frame — is the same compile error". §28.10 names the PIN shape
+    // specifically: "a read through the pinned binding that the disposal
+    // dominates is §28.2's compile error".
+    //
+    // The DIRECT shape (`a.Dispose(); a.Use();`) is `checkRead`'s own
+    // `state == Disposed` arm — a WARNING, unchanged here (the §28.2 v0.131
+    // severity ruling). This check is the MISSING static rejection for the
+    // HOLDER shape, with its own diagnostic (ERROR — §28.2 and §28.10 both
+    // say "compile error").
+    //
+    // THE HOLDER this check admits is the `using var` BORROW-PIN over a plain
+    // local read (`using var p := b;` / `using var p := b!;`): §28.10's own
+    // sentence. A pin over a MEMBER read or a CALL is not admitted — the
+    // value it borrows is not the disposed binding, so §28.2's "on the same
+    // variable" clause is not met and the runtime backstop stands behind the
+    // use (the spec's own rule corpus, case `s28_10_0012`). A plain ALIAS
+    // holder (`var b := a;`) is not admitted either: the spec's own rule
+    // corpus admits that program and expects the runtime backstop to fault
+    // it (cases `s28_2_0011` / `s28_2_0012`), so the alias form stays with
+    // §28.2's checked-mode backstop.
+    //
+    // `id` is the read identifier, `sym` the tracked local it names.
+    void checkUseThroughDisposedBorrowHolder(const ast::IdentifierExpr& id,
+                                             sema::Symbol* sym);
+
     void handleAssignment(const ast::AssignmentStmt& as);
 
     // fix #7856 (§28.3 *Producers* / §28.6, v0.353): is this expression a
