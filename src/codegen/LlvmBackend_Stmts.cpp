@@ -10729,6 +10729,199 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         else if (elemTy->isIntegerTy(16)) esz = 2;
         else if (elemTy->isStructTy())
             esz = (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy);
+        // fix #8363 (stdlib §4.10 / §4.18, v0.355): the ERASED slot's backing
+        // is NOT necessarily an ARRAY.
+        //
+        // §4.1's `IReadOnlyCollection<T>` is a COMMON ancestor of the borrowing
+        // and the owning hierarchies, and the DICT-backed family (`Set<T>` /
+        // `OwningSet<T>`, §4.10; `SortedSet<T>`, §4.18) and the LIST-backed
+        // family (`LinkedList<T>` / `OwningLinkedList<T>`, §4.6) are members of
+        // it — but their representations are NOT a `bz_array_t*`. The erased
+        // slot holds the backing pointer verbatim, and the array protocol below
+        // read it as a `bz_array_t*` — a SIGSEGV (MEASURED: exit 139, core
+        // dumped, on `Set<int>` bound to `IReadOnlyCollection<int>`).
+        //
+        // THE REPAIR. The backing's RUNTIME KIND is a header tag the runtime
+        // already stamps at allocation (§28.2's kind tag: array -1, list -2,
+        // dict -3; read back by `bz_runtime_kind`). When the erased slot holds
+        // a dict- or list-backed collection, MATERIALIZE it into an ARRAY
+        // SNAPSHOT and scan that — the same shape the CONCRETE `Set<T>` /
+        // `LinkedList<T>` for-in paths read (a snapshot of the table's keys /
+        // of the list's nodes), so the erased view agrees with the concrete
+        // view element for element, and in the same order.
+        //
+        // WHY A SNAPSHOT AND NOT A SECOND SCAN. The array protocol below is
+        // ONE loop over ONE element source; materializing keeps the erased
+        // scan a single loop (the body is emitted once) instead of forking the
+        // loop per backing kind.
+        //
+        // A DICTIONARY'S ENTRIES ARE NOT ITS KEYS. The erased
+        // `IReadOnlyCollection<DictionaryEntry<K,V>>` view over a
+        // `Dictionary<K,V>` / `SortedDictionary<K,V>` is a DIFFERENT shape —
+        // the element is the ENTRY, not the key — so materializing the table's
+        // keys for it would silently produce the wrong value. That shape is
+        // left exactly as it was (it keeps its own pre-existing behavior) and
+        // is reported separately; only the SET shape (whose element IS the
+        // table's key) is materialized here.
+        llvm::Value* scanObj = enumObj;
+        llvm::AllocaInst* materializedSlot = nullptr;
+        {
+            const sema::TypeRef* elemRef =
+                iterTy->genericArgs.empty() ? nullptr : iterTy->genericArgs[0];
+            bool entryElem = false;
+            if (elemRef) {
+                const sema::TypeRef* e = resolveTypeParamRef(elemRef);
+                if (!e) e = elemRef;
+                entryElem = (e->kind == sema::TypeRef::Kind::Named) &&
+                            (e->headName() == "DictionaryEntry");
+            }
+            auto* kindFn = declareC("bz_runtime_kind", i64(), {ptrTy()});
+            llvm::Value* kind =
+                builder_.CreateCall(kindFn, {enumObj}, "ib.kind");
+            llvm::Value* isDict = builder_.CreateICmpEQ(
+                kind, builder_.getInt64(-3), "ib.isdict");
+            llvm::Value* isLlist = builder_.CreateICmpEQ(
+                kind, builder_.getInt64(-2), "ib.isllist");
+            llvm::Value* convDict = entryElem
+                ? builder_.getFalse()
+                : builder_.CreateAnd(isDict, builder_.getTrue(), "ib.convdict");
+            llvm::Value* needsConv =
+                builder_.CreateOr(convDict, isLlist, "ib.needconv");
+            llvm::BasicBlock* preConvBB = builder_.GetInsertBlock();
+            auto* convSelBB =
+                llvm::BasicBlock::Create(llvm_, "ib.convsel", currentFn_);
+            auto* dictConvBB =
+                llvm::BasicBlock::Create(llvm_, "ib.convdict", currentFn_);
+            auto* listConvBB =
+                llvm::BasicBlock::Create(llvm_, "ib.convlist", currentFn_);
+            auto* convDoneBB =
+                llvm::BasicBlock::Create(llvm_, "ib.convdone", currentFn_);
+            auto* scanBB = llvm::BasicBlock::Create(llvm_, "ib.scan", currentFn_);
+            materializedSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 materializedSlot);
+            builder_.CreateCondBr(needsConv, convSelBB, scanBB);
+            builder_.SetInsertPoint(convSelBB);
+            builder_.CreateCondBr(convDict, dictConvBB, listConvBB);
+            // The shared helpers of the two materializations.
+            auto* allocFn =
+                declareC("bz_array_alloc_count_n", ptrTy(), {i64(), i64()});
+            auto* ptrAtFn =
+                declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            auto* memcpyFn =
+                declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            auto* freeFn =
+                declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            // --- DICT: the table's KEYS are the set's elements (§4.10) ---
+            builder_.SetInsertPoint(dictConvBB);
+            {
+                auto* keysOutSlot = entryAlloca(ptrTy());
+                auto* cntSlot = entryAlloca(i64());
+                auto* keysFn = declareC("bz_dict_keys_gen",
+                                        llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(keysFn, {enumObj, keysOutSlot, cntSlot});
+                llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
+                llvm::Value* cnt = builder_.CreateLoad(i64(), cntSlot);
+                llvm::Value* arr = builder_.CreateCall(
+                    allocFn, {builder_.getInt64(esz), cnt});
+                auto* iSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), iSlot);
+                auto* fCond =
+                    llvm::BasicBlock::Create(llvm_, "ib.fcond", currentFn_);
+                auto* fBody =
+                    llvm::BasicBlock::Create(llvm_, "ib.fbody", currentFn_);
+                auto* fEnd =
+                    llvm::BasicBlock::Create(llvm_, "ib.fend", currentFn_);
+                builder_.CreateBr(fCond);
+                builder_.SetInsertPoint(fCond);
+                llvm::Value* fi = builder_.CreateLoad(i64(), iSlot);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(fi, cnt), fBody, fEnd);
+                builder_.SetInsertPoint(fBody);
+                llvm::Value* src = builder_.CreateLoad(
+                    ptrTy(), builder_.CreateGEP(ptrTy(), keysArr, fi));
+                llvm::Value* dst = builder_.CreateCall(
+                    ptrAtFn, {arr, fi, builder_.getInt64(esz)});
+                builder_.CreateCall(memcpyFn,
+                                    {dst, src, builder_.getInt64(esz)});
+                builder_.CreateCall(freeFn, {src});
+                llvm::Value* fi2 = builder_.CreateLoad(i64(), iSlot);
+                builder_.CreateStore(builder_.CreateAdd(fi2, builder_.getInt64(1)),
+                                     iSlot);
+                builder_.CreateBr(fCond);
+                builder_.SetInsertPoint(fEnd);
+                builder_.CreateCall(freeFn, {keysArr});
+                builder_.CreateStore(arr, materializedSlot);
+                builder_.CreateBr(convDoneBB);
+            }
+            // --- LIST: the list's NODES, in chain order (§4.6) ---
+            builder_.SetInsertPoint(listConvBB);
+            {
+                auto* countFn = declareC("bz_llist_count", i64(), {ptrTy()});
+                auto* firstFn = declareC("bz_llist_first_node", ptrTy(),
+                                         {ptrTy()});
+                auto* nextFn =
+                    declareC("bz_llist_node_next", ptrTy(), {ptrTy()});
+                auto* valFn = declareC("bz_llist_node_value_ptr", ptrTy(),
+                                       {ptrTy()});
+                llvm::Value* cnt =
+                    builder_.CreateCall(countFn, {enumObj}, "ib.llcnt");
+                llvm::Value* arr = builder_.CreateCall(
+                    allocFn, {builder_.getInt64(esz), cnt});
+                auto* nodeSlot = entryAlloca(ptrTy());
+                builder_.CreateStore(builder_.CreateCall(firstFn, {enumObj}),
+                                     nodeSlot);
+                auto* iSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), iSlot);
+                auto* fCond =
+                    llvm::BasicBlock::Create(llvm_, "ib.lcond", currentFn_);
+                auto* fBody =
+                    llvm::BasicBlock::Create(llvm_, "ib.lbody", currentFn_);
+                auto* fEnd =
+                    llvm::BasicBlock::Create(llvm_, "ib.lend", currentFn_);
+                builder_.CreateBr(fCond);
+                builder_.SetInsertPoint(fCond);
+                llvm::Value* fi = builder_.CreateLoad(i64(), iSlot);
+                llvm::Value* node = builder_.CreateLoad(ptrTy(), nodeSlot);
+                llvm::Value* inRange = builder_.CreateAnd(
+                    builder_.CreateICmpSLT(fi, cnt),
+                    builder_.CreateICmpNE(
+                        node, llvm::ConstantPointerNull::get(ptrTy())),
+                    "ib.lrange");
+                builder_.CreateCondBr(inRange, fBody, fEnd);
+                builder_.SetInsertPoint(fBody);
+                llvm::Value* dst = builder_.CreateCall(
+                    ptrAtFn, {arr, fi, builder_.getInt64(esz)});
+                llvm::Value* src = builder_.CreateCall(valFn, {node});
+                builder_.CreateCall(memcpyFn,
+                                    {dst, src, builder_.getInt64(esz)});
+                llvm::Value* node2 = builder_.CreateLoad(ptrTy(), nodeSlot);
+                builder_.CreateStore(builder_.CreateCall(nextFn, {node2}),
+                                     nodeSlot);
+                llvm::Value* fi2 = builder_.CreateLoad(i64(), iSlot);
+                builder_.CreateStore(builder_.CreateAdd(fi2, builder_.getInt64(1)),
+                                     iSlot);
+                builder_.CreateBr(fCond);
+                builder_.SetInsertPoint(fEnd);
+                builder_.CreateStore(arr, materializedSlot);
+                builder_.CreateBr(convDoneBB);
+            }
+            builder_.SetInsertPoint(convDoneBB);
+            // The materialized array is LOADED HERE, in the block that both
+            // materializations branch into: a PHI's incoming value must be
+            // available in its predecessor block, and convDoneBB is where both
+            // stores have already happened.
+            llvm::Value* materialized =
+                builder_.CreateLoad(ptrTy(), materializedSlot);
+            builder_.CreateBr(scanBB);
+            builder_.SetInsertPoint(scanBB);
+            llvm::PHINode* scanPhi = llvm::cast<llvm::PHINode>(
+                builder_.CreatePHI(ptrTy(), 2));
+            scanPhi->addIncoming(enumObj, preConvBB);
+            scanPhi->addIncoming(materialized, convDoneBB);
+            scanObj = scanPhi;
+        }
         // fix #7045 (§28.2 / §28.3, v0.340): the CHECKED-DISPOSAL backstop for
         // the enumeration — the sibling of the guard in lowerArrayFor, for the
         // IEnumerable-protocol lowering of the same shape. A member access
@@ -10740,14 +10933,14 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
             auto* isFn = declareC("bz_array_is_disposed", i8Ty, {ptrTy()});
             llvm::Value* flag =
-                builder_.CreateCall(isFn, {enumObj}, "cd.arrdis");
+                builder_.CreateCall(isFn, {scanObj}, "cd.arrdis");
             llvm::Value* disposed = builder_.CreateICmpNE(
                 flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
             emitGuardThrow(disposed, "DisposedAccessException");
         }
         auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
-        llvm::Value* len = builder_.CreateCall(lenFn, {enumObj});
+        auto* ptrAtFn2 = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        llvm::Value* len = builder_.CreateCall(lenFn, {scanObj});
         // fix #8265 (stdlib §4.11 "Iteration order", v0.355): the ORDER of an
         // ERASED collection-interface scan is decided by the BACKING, and at
         // this point the backing is known only at RUN TIME — the interface slot
@@ -10770,12 +10963,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         // `bz_array_set_type_desc`; the global is `btd$builtin$<qualified
         // name>`). It IS the runtime identity of the concrete built-in, and it
         // is already read back by `bz_array_inst_desc` for `o is Stack<int>`
-        // (#4926's arm in `emitIsA`, LlvmBackend_Layout.cpp ~4807). So the
-        // erased receiver's backing is identified by comparing that descriptor
-        // against the `Stack<T>` / `OwningStack<T>` descriptors — the same
-        // address comparison `o is Stack<int>` performs, and the same
-        // LinkOnceODR folding that makes one instantiation's descriptor ONE
-        // address across the modules of a program.
+        // (#4926's arm in `emitIsA`, LlvmBackend_Layout.cpp ~4807).
         //
         // WHY NOT A NEW RUNTIME WORD. #7574's fix-forward (1d0f3b4f) added a
         // `take_reversed` word to `bz_array_t` for the §5-OPERATOR path; that
@@ -10785,27 +10973,37 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         // already carries the information, is already stamped at every
         // construction site, and needs no runtime change at all.
         //
-        // THE SCOPE. The comparison is by the EXACT instantiation, so it
-        // answers for a backing whose element type is the erased receiver's
-        // element type — the shape §4.11 names (`IReadOnlyCollection<T>` over
-        // a `Stack<T>`). Every other backing keeps the forward scan: an
-        // `Array<T>` and a `Queue<T>` / `OwningQueue<T>` iterate front-to-back,
-        // which IS their physical order (§4.11's queue clause), and no other
-        // §4.x collection states a take-order contract distinct from storage
-        // order.
-        // ONE EXCEPTION IS A KNOWN GAP, NOT A DIFFERENT CONTRACT: a COVARIANTLY
-        // WIDENED receiver (`IReadOnlyCollection<Animal>` over a `Stack<Dog>`)
-        // names a different instantiation, so it keeps the forward scan and
-        // visits in PUSH order, disagreeing with the concrete for-in over the
-        // same stack. That shape is REACHABLE (stdlib §4.1's `out T`, spec
-        // §12.9) and is tracked as #8361.
+        // fix #8361: THE COMPARISON IS BY FAMILY, NOT BY EXACT INSTANTIATION.
+        // §4.11's take-order clause is a property of the COLLECTION FAMILY —
+        // a `Stack<Dog>` iterates in take order whatever the erased receiver's
+        // element type is — so the signal answers "IS THE BACKING A `Stack` /
+        // `OwningStack` AT ALL?" by comparing the backing descriptor's
+        // RENDERED NAME PREFIX (the descriptor is a 3-element pointer array
+        // `{self, null, nameString}`; the name is the third element), NOT by
+        // comparing the descriptor ADDRESS of one exact instantiation. The
+        // exact-instantiation form could not answer for a COVARIANTLY WIDENED
+        // receiver (`IReadOnlyCollection<Animal>` over a `Stack<Dog>` — a
+        // shape stdlib §4.1's `out T` and spec §12.9 admit), which named a
+        // different instantiation and so kept the forward scan and visited in
+        // PUSH order, disagreeing with the concrete for-in over the same
+        // stack. The family-level prefix comparison needs no new
+        // `bz_array_t` header word — the descriptor's rendered name already
+        // carries the family.
+        //
+        // THE SCOPE. Every backing that is not a stack keeps the forward scan:
+        // an `Array<T>` and a `Queue<T>` / `OwningQueue<T>` iterate
+        // front-to-back, which IS their physical order (§4.11's queue clause),
+        // and no other §4.x collection states a take-order contract distinct
+        // from storage order. The erased receiver's element type must still be
+        // RUNTIME-CONCRETE — an UNBOUND type parameter is not, so that shape
+        // keeps the pre-existing forward scan.
         // The runtime signal itself lives in `erasedCollBackingIsTakeReversed`
         // (LlvmBackend_Iterators.cpp): the per-instantiation descriptor of the
-        // backing compared against the `Stack<T>` / `OwningStack<T>`
-        // descriptors. It returns null when no descriptor can be formed (a
-        // non-concrete element type), and the forward scan is kept then.
+        // backing, compared at the FAMILY level by its rendered name. It
+        // returns null when no descriptor can be formed (a non-concrete
+        // element type), and the forward scan is kept then.
         llvm::Value* takeRev = erasedCollBackingIsTakeReversed(
-            enumObj, iterTy->genericArgs.empty() ? nullptr
+            scanObj, iterTy->genericArgs.empty() ? nullptr
                                                  : iterTy->genericArgs[0]);
         // The scan's start index and step are SELECTED from that runtime
         // signal: top-first (start len-1, step -1) for a stack backing,
@@ -10824,6 +11022,11 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         auto* varSlot = entryAlloca(elemTy);
         locals_[&fs] = varSlot;
         registerForLoopSpillSlots(fs, {idxSlot, varSlot});  // #747 R42
+        // fix #8363: the MATERIALIZED snapshot's own slot is read AFTER the
+        // loop (to reclaim it), so it must survive a suspend in the body
+        // exactly like the loop's own slots do.
+        if (materializedSlot)
+            registerForLoopSpillSlots(fs, {materializedSlot});
         auto* condBB = llvm::BasicBlock::Create(llvm_, "ib.cond", currentFn_);
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ib.body", currentFn_);
         auto* incBB  = llvm::BasicBlock::Create(llvm_, "ib.inc",  currentFn_);
@@ -10846,7 +11049,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         builder_.CreateCondBr(inRange, bodyBB, endBB);
         builder_.SetInsertPoint(bodyBB);
         llvm::Value* idx2 = builder_.CreateLoad(i64(), idxSlot);
-        llvm::Value* ep = builder_.CreateCall(ptrAtFn, {enumObj, idx2, builder_.getInt64(esz)});
+        llvm::Value* ep = builder_.CreateCall(ptrAtFn2, {scanObj, idx2, builder_.getInt64(esz)});
         llvm::Value* elem = builder_.CreateLoad(elemTy, ep);
         builder_.CreateStore(elem, varSlot);
         loopStack_.push_back({incBB, endBB, disposeStack_.size()});
@@ -10859,6 +11062,21 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         builder_.CreateStore(builder_.CreateAdd(oldIdx, idxStep), idxSlot);
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(endBB);
+        // fix #8363: reclaim the MATERIALIZED snapshot the erased scan read
+        // (a null slot when the backing was already an array, so the ordinary
+        // array-backed scan pays nothing). `bz_array_free` is null-safe, and
+        // the snapshot's elements are the COLLECTION's elements (the table's
+        // key copies / the list's node bytes), so the snapshot is freed with
+        // a null disposer and the collection keeps owning its elements.
+        if (materializedSlot) {
+            auto* arrFreeFn = declareC("bz_array_free",
+                                       llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), ptrTy()});
+            builder_.CreateCall(
+                arrFreeFn,
+                {builder_.CreateLoad(ptrTy(), materializedSlot),
+                 llvm::ConstantPointerNull::get(ptrTy())});
+        }
         return true;
     }
 

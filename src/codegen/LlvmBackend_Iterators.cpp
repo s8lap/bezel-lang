@@ -17,13 +17,13 @@ namespace bezel::codegen {
 // ===========================================================================
 
 // ===========================================================================
-// #8265 (stdlib §4.11 "Iteration order", v0.355): the TAKE-ORDER test for an
-// ERASED collection interface's backing — the runtime predicate the
+// #8265 / #8361 (stdlib §4.11 "Iteration order", v0.355): the TAKE-ORDER test
+// for an ERASED collection interface's backing — the runtime predicate the
 // array-backed for-in scan dispatches its ORDER on.
 // ===========================================================================
 
-// fix #8265 (stdlib §4.11 "Iteration order", v0.355): the TAKE-ORDER test for
-// an ERASED collection interface's backing.
+// fix #8265 / fix #8361 (stdlib §4.11 "Iteration order" / §4.1 covariance,
+// v0.355): the TAKE-ORDER test for an ERASED collection interface's backing.
 //
 // §4.11: "All four types iterate (via `IReadOnlyCollection<T>`) in take order
 // — a stack top-to-bottom (pop order), a queue front-to-back (dequeue order);
@@ -39,10 +39,7 @@ namespace bezel::codegen {
 // descriptor #6776 stamps at a construction site whose static type is known
 // (`stampBuiltinTypeDesc` → `bz_array_set_type_desc`; `btd$builtin$<qualified
 // name>`). It IS the runtime identity of the concrete builtin, and it is
-// already read back by `bz_array_inst_desc` for `o is Stack<int>`. So the
-// erased receiver's backing can be identified at RUNTIME by comparing that
-// descriptor against the `Stack<T>` / `OwningStack<T>` descriptors — the same
-// address comparison `o is Stack<int>` performs.
+// already read back by `bz_array_inst_desc` for `o is Stack<int>`.
 //
 // WHY NOT A NEW HEADER WORD. #7574's fix-forward (1d0f3b4f) added a
 // `take_reversed` word to `bz_array_t` for the §5-operator path; that commit
@@ -51,21 +48,35 @@ namespace bezel::codegen {
 // a merge). The descriptor word already carries the information, is already
 // stamped at every construction site, and needs no runtime change.
 //
-// THE SCOPE. The comparison is by the EXACT instantiation, so it answers for
-// a backing whose element type is the erased receiver's element type — the
-// shape §4.11 names (`IReadOnlyCollection<T>` over a `Stack<T>`). A COVARIANT
-// widening (`IReadOnlyCollection<Animal>` over a `Stack<Dog>`) names a
-// different instantiation and is NOT recognised here; that corner needs a
-// family-level marker (the `take_reversed` word), which is #7574's
-// mechanism and is deferred with it.
+// fix #8361: THE COMPARISON IS BY FAMILY, NOT BY EXACT INSTANTIATION. §4.11's
+// take-order clause is a property of the COLLECTION FAMILY (`Stack` /
+// `OwningStack`), not of one instantiation of it: a `Stack<Dog>` iterates in
+// take order whatever the erased receiver's element type is. The exact-
+// instantiation comparison (this function's first form) built the descriptor
+// for `Stack<elem>` AT THE ERASED RECEIVER'S ELEMENT TYPE and compared
+// addresses — so a COVARIANTLY WIDENED receiver (`IReadOnlyCollection<Animal>`
+// over a `Stack<Dog>`, admitted by stdlib §4.1's `out T` and spec §12.9)
+// compared against `Stack<Animal>`, a DIFFERENT global than the backing's
+// `Stack<Dog>` one, and the stack was visited in PUSH order.
 //
-// The covariant widening is REACHABLE — stdlib §4.1 states that
-// "`IReadOnlyCollection<T>` and `IReadOnlyList<T>` are covariant in T
-// (`out T`)" and spec §12.9 admits the assignment, so the program COMPILES
-// and RUNS — and it still visits the stack in PUSH order, disagreeing with
-// the concrete for-in over the same stack. That gap is TRACKED as #8361 and
-// is pinned in-tree by the known-gap row (R) of
-// `tests/codegen/stack_erased_collection_forin_order_8265_test.cpp`.
+// THE FAMILY-LEVEL SIGNAL IS THE DESCRIPTOR'S RENDERED NAME. The
+// per-instantiation descriptor global is a 3-element pointer array
+// `{self, null, nameString}` (LlvmBackend_Layout.cpp's
+// `builtinInstanceDescriptorFor`), and the THIRD element is the `%bz.string*`
+// holding the RENDERED name — `System.Collections.Generic.Stack<int>`,
+// `System.Collections.Generic.OwningStack<M.Res>`, … . Its first field is the
+// NUL-terminated C data of that name. So "IS THE BACKING A `Stack` AT ALL?"
+// is answered at RUNTIME by comparing the RENDERED NAME's PREFIX against the
+// family's — `System.Collections.Generic.Stack<` /
+// `System.Collections.Generic.OwningStack<` — which no new `bz_array_t` word
+// is needed for, and which is exactly the family-level marker the tree's own
+// comment had asked for.
+//
+// THE SCOPE IS UNCHANGED ELSEWHERE. The erased receiver's element type must
+// still be RUNTIME-CONCRETE — an UNBOUND type parameter is not, so that shape
+// keeps the pre-existing forward scan (the caller keeps the scan order when
+// this function returns null). Only the COMPARISON moved from "this exact
+// instantiation" to "this family".
 //
 // Returns null when no descriptor can be formed (a non-concrete element type,
 // e.g. an unbound type parameter) — the caller then keeps the forward scan.
@@ -78,23 +89,67 @@ llvm::Value* Emitter::erasedCollBackingIsTakeReversed(
     // the same instantiation the backing carries.
     const sema::TypeRef* elem = resolveTypeParamRef(elemTyRef);
     if (!elem) elem = elemTyRef;
-    auto* descFn = declareC("bz_array_inst_desc", ptrTy(), {ptrTy()});
-    llvm::Value* desc = builder_.CreateCall(descFn, {arr}, "iroc.desc");
-    llvm::Value* isTakeRev = nullptr;
-    for (const char* head : {"Stack", "OwningStack"}) {
-        // A synthesized Named TypeRef for the concrete head at this element
-        // type: `builtinInstanceDescriptorFor` renders it exactly as the
-        // construction site's own TypeRef does (the cache is keyed on the
-        // rendered name), so the two addresses are the same global.
+    // THE GATE (unchanged): the erased receiver's element type must be
+    // RUNTIME-CONCRETE. `builtinInstanceDescriptorFor` refuses a type whose
+    // arguments are not runtime-concrete (an UNBOUND type parameter is not),
+    // so it answers the gate by being null — exactly the pre-existing "no
+    // descriptor can be formed" case, in which the caller keeps the forward
+    // scan.
+    {
         sema::TypeRef tr;
         tr.kind = sema::TypeRef::Kind::Named;
-        tr.importedName = head;
+        tr.importedName = "Stack";
         tr.genericArgs.push_back(const_cast<sema::TypeRef*>(elem));
-        llvm::GlobalVariable* d = builtinInstanceDescriptorFor(&tr);
-        if (!d) continue;
-        llvm::Value* eq = builder_.CreateICmpEQ(desc, d, "iroc.isstack");
-        isTakeRev = isTakeRev ? builder_.CreateOr(isTakeRev, eq) : eq;
+        if (!builtinInstanceDescriptorFor(&tr)) return nullptr;
     }
+    auto* descFn = declareC("bz_array_inst_desc", ptrTy(), {ptrTy()});
+    llvm::Value* desc = builder_.CreateCall(descFn, {arr}, "iroc.desc");
+    // The descriptor is null for a backing that carries no per-instantiation
+    // tag (a runtime-produced array, or a collection this path MATERIALIZED
+    // from a dict/list backing) and for a non-array pointer; the family
+    // comparison then answers "not a stack", so the forward scan is kept.
+    auto* nullBB = llvm::BasicBlock::Create(llvm_, "iroc.nodesc", currentFn_);
+    auto* cmpBB  = llvm::BasicBlock::Create(llvm_, "iroc.family", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "iroc.end", currentFn_);
+    builder_.CreateCondBr(
+        builder_.CreateICmpNE(desc, llvm::ConstantPointerNull::get(ptrTy()),
+                              "iroc.hasdesc"),
+        cmpBB, nullBB);
+    builder_.SetInsertPoint(cmpBB);
+    // desc[2] — the name string.
+    auto* descTy = llvm::ArrayType::get(ptrTy(), 3);
+    llvm::Value* nameSlot = builder_.CreateInBoundsGEP(
+        descTy, desc, {builder_.getInt32(0), builder_.getInt32(2)});
+    llvm::Value* nameStr = builder_.CreateLoad(ptrTy(), nameSlot);
+    // nameStr[0] — the NUL-terminated C data of the rendered name.
+    llvm::Value* nameData = builder_.CreateLoad(
+        ptrTy(), builder_.CreateStructGEP(stringType(), nameStr, 0));
+    auto* strncmpFn = declareC("strncmp", i32(), {ptrTy(), ptrTy(), i64()});
+    llvm::Value* isFamily = nullptr;
+    for (const char* head : {"Stack", "OwningStack"}) {
+        // The family's rendered-name PREFIX: the module path + the head + the
+        // `<` that opens the §2.13 rule-3 type-argument rendering. The `<`
+        // makes the prefix unambiguous — no other head of the same module
+        // shares it.
+        std::string prefix =
+            std::string(vtablelessBuiltinQualifiedName(head, nullptr)) + "<";
+        llvm::Value* pref = builder_.CreateGlobalStringPtr(prefix);
+        llvm::Value* cmp = builder_.CreateCall(
+            strncmpFn,
+            {nameData, pref, builder_.getInt64((int64_t)prefix.size())},
+            "iroc.cmp");
+        llvm::Value* eq =
+            builder_.CreateICmpEQ(cmp, builder_.getInt32(0), "iroc.isfam");
+        isFamily = isFamily ? builder_.CreateOr(isFamily, eq) : eq;
+    }
+    builder_.CreateBr(endBB);
+    builder_.SetInsertPoint(nullBB);
+    builder_.CreateBr(endBB);
+    builder_.SetInsertPoint(endBB);
+    llvm::PHINode* isTakeRev = llvm::cast<llvm::PHINode>(
+        builder_.CreatePHI(i1(), 2));
+    isTakeRev->addIncoming(builder_.getFalse(), nullBB);
+    isTakeRev->addIncoming(isFamily, cmpBB);
     return isTakeRev;
 }
 

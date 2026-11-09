@@ -431,15 +431,18 @@ BEZEL_TEST(stack_take_order_predicate_lazy_8369_8370,
                     "42\n42\n42\n42\n42\n42\n84\n");
 }
 
-// THE KNOWN GAP, PINNED AS A CONTROL.  The erased, COVARIANTLY-WIDENED
+// THE COVARIANTLY-WIDENED SHAPE — FLIPPED BY THE #8361 FIX.  This row was a
+// KNOWN-GAP control for issue #8361: the erased, COVARIANTLY-WIDENED
 // `IReadOnlyCollection<T>` view of a stack (`IReadOnlyCollection<Animal>`
-// over a `Stack<Dog>`) still visits in PUSH order — that is issue #8361's
-// territory, NOT this fix's.  This row states the CURRENT (wrong) push
-// order, so it is green today and it will go RED the moment #8361's fix
-// lands.  That failure is the point: the row is the in-tree marker for the
-// flip that #8361's fix must make in the same commit.
+// over a `Stack<Dog>`) visited in PUSH order, so the row stated the CURRENT
+// (wrong) push order and went RED the moment #8361's fix landed.  #8361's
+// fix makes the take-order comparison FAMILY-level ("is the backing a `Stack`
+// AT ALL?"), so the covariantly-widened view now visits in TAKE order and
+// agrees with the CONCRETE for-in over the very same stack.  The row's
+// `erased=` expectation is therefore flipped here, in the same commit that
+// fixes the defect.
 BEZEL_TEST(stack_take_order_predicate_lazy_8369_8370,
-           erased_iroc_covariantly_widened_over_stack_still_push_order_8361) {
+           erased_iroc_covariantly_widened_over_stack_visits_take_order_8361) {
     const std::string decls =
         "class Animal public Tag: int; "
         "  public constructor(t: int) Tag := t; end constructor; "
@@ -461,9 +464,13 @@ BEZEL_TEST(stack_take_order_predicate_lazy_8369_8370,
         "  for var d in s do acc2 := acc2 + $\"{d.Tag};\"; end for; "
         "  Console.WriteLine($\"concrete={acc2}\"); ";
     const std::string stdout = out(prog(decls, body));
-    BEZEL_EXPECT_TRUE(stdout.find("erased=1;2;3;") != std::string::npos);
+    // After the #8361 fix: the erased, covariantly-widened view visits in TAKE
+    // order (§4.11) — the same order the CONCRETE for-in over the same stack
+    // visits, which is the whole point of the row.
+    BEZEL_EXPECT_TRUE(stdout.find("erased=3;2;1;") != std::string::npos);
+    BEZEL_EXPECT_FALSE(stdout.find("erased=1;2;3;") != std::string::npos);
     // The CONCRETE for-in over the same stack visits in TAKE order (§4.11) —
-    // the disagreement this row pins.  This half stays true forever.
+    // the erased view must now AGREE with it.
     BEZEL_EXPECT_TRUE(stdout.find("concrete=3;2;1;") != std::string::npos);
 }
 

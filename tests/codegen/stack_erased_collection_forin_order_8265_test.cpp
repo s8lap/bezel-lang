@@ -69,10 +69,11 @@
 //       the substitution must resolve per instantiation, not once for the
 //       whole generic;
 //   (R) the COVARIANTLY-WIDENED shape (`IReadOnlyCollection<Animal>` over a
-//       `Stack<Dog>`) — a **KNOWN-GAP** row, pinned for #8361: it states the
-//       CURRENT (wrong) push order, so it is written to FAIL when #8361 is
-//       fixed. It is green on the base and on this tip alike, so for THIS
-//       commit it is a control row.
+//       `Stack<Dog>`) — was a **KNOWN-GAP** row pinned for #8361 (it stated
+//       the CURRENT, wrong push order, so it was written to FAIL when #8361
+//       was fixed). Its `erased=` expectation was FLIPPED to `3;2;1;` in the
+//       commit that fixes #8361, so the row is now GREEN on the fixed tip and
+//       RED on the unfixed base.
 //
 // EVERY ROW PRINTS ITS VISIT ORDER ON ONE LINE (the loop accumulates into a
 // string and prints it once), because `Console.WriteLine` appends the
@@ -542,9 +543,7 @@ BEZEL_TEST(stack_erased_collection_forin_order_8265,
 }
 
 // ---------------------------------------------------------------------------
-// (R) THE COVARIANTLY-WIDENED SHAPE — A **KNOWN-GAP** ROW (KNOWN-DEFECT,
-//     #8361), pinned here so the hole lives in the TREE, not only in a
-//     review.
+// (R) THE COVARIANTLY-WIDENED SHAPE — FLIPPED BY THE #8361 FIX.
 //
 //     `IReadOnlyCollection<Animal>` over a `Stack<Dog>`. stdlib §4.1 (v0.355)
 //     states that "`IReadOnlyCollection<T>` and `IReadOnlyList<T>` are
@@ -552,31 +551,23 @@ BEZEL_TEST(stack_erased_collection_forin_order_8265,
 //     assignment, so THIS PROGRAM COMPILES AND RUNS — it is NOT the
 //     unrelated-types assignment that §5.1 rejects.
 //
-//     But the erased scan's ORDER is dispatched on the backing's EXACT
-//     instantiation (`Stack<Dog>`), while the erased receiver's element type
-//     is `Animal` — a DIFFERENT instantiation — so the descriptor compare
-//     does not fire and the scan keeps the stack's PHYSICAL (push) order.
-//     §4.11's "All four types iterate (via `IReadOnlyCollection<T>`) in take
-//     order" applies to this shape too, so the erased view and the CONCRETE
-//     for-in over the very same stack DISAGREE: `1;2;3;` against `3;2;1;`.
+//     It was a KNOWN-GAP row (#8361): the erased scan's ORDER was dispatched
+//     on the backing's EXACT instantiation (`Stack<Dog>`), while the erased
+//     receiver's element type is `Animal` — a DIFFERENT instantiation — so
+//     the descriptor compare did not fire and the scan kept the stack's
+//     PHYSICAL (push) order. §4.11's "All four types iterate (via
+//     `IReadOnlyCollection<T>`) in take order" applies to this shape too, so
+//     the erased view and the CONCRETE for-in over the very same stack
+//     DISAGREED: `1;2;3;` against `3;2;1;`.
 //
-//     ⇒ THIS ROW IS WRITTEN TO FAIL WHEN #8361 IS FIXED. That failure is the
-//     POINT: it is the in-tree tripwire that says "the covariantly-widened
-//     shape is still broken". When #8361 lands, this row's `erased=`
-//     expectation must be flipped to `3;2;1;` in the SAME commit that fixes
-//     the defect — the row is a marker for that flip, not a claim that push
-//     order is correct.
-//
-//     It is GREEN on the base and on this commit's tip alike (both visit
-//     `1;2;3;`): the shape is UNCHANGED by this commit, so for THIS commit
-//     the row is a CONTROL row, not a fix row.
-//
-//     The fix this shape needs is a FAMILY-level marker on the backing (the
-//     `take_reversed` word — #7574's mechanism), not an exact-instantiation
-//     descriptor compare. NOT done here: #8361.
+//     The fix makes the comparison FAMILY-level ("is the backing a `Stack` /
+//     `OwningStack` AT ALL?"), so the covariantly-widened view now agrees
+//     with the concrete view. This row's `erased=` expectation is therefore
+//     FLIPPED to `3;2;1;` in the same commit that fixes the defect — the row
+//     was written to fail when the fix landed, and this is that flip.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(stack_erased_collection_forin_order_8265,
-           erased_iroc_covariantly_widened_over_stack_still_push_order_4_11_8361) {
+           erased_iroc_covariantly_widened_over_stack_visits_top_to_bottom_4_11_8361) {
     const std::string src =
         "module M; "
         "class Animal public Tag: int; "
@@ -604,10 +595,12 @@ BEZEL_TEST(stack_erased_collection_forin_order_8265,
         "end C;";
     JitResult r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
-    // The KNOWN GAP (#8361): the erased, covariantly-widened view still visits
-    // in PUSH order on the base and on this tip alike.
-    BEZEL_EXPECT_TRUE(has(r.stdoutText, "erased=1;2;3;"));
+    // After the #8361 fix: the erased, covariantly-widened view visits in TAKE
+    // order (§4.11) — the same order the CONCRETE for-in over the same stack
+    // visits, which is the whole point of the row.
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "erased=3;2;1;"));
+    BEZEL_EXPECT_FALSE(has(r.stdoutText, "erased=1;2;3;"));
     // The CONCRETE for-in over the same stack visits in TAKE order (§4.11) —
-    // the disagreement this row pins. This half stays true forever.
+    // the erased view must AGREE with it.
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "concrete=3;2;1;"));
 }
