@@ -6417,6 +6417,31 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 const bool elemIsTemporalValue =
                     elemIsDateTime || elemValueHead == "TimeSpan" ||
                     elemValueHead == "DateOnly" || elemValueHead == "TimeOnly";
+                // fix #8323 / #8264 (stdlib §2.6 / §2.8 / §5.1, spec §14.2,
+                // v0.355): the BUILT-IN `Guid` — stdlib §2.6 declares
+                //     public record Guid: IComparable<Guid>, IEquatable<Guid>
+                // so `T = Guid` satisfies §5.1's `where T: IComparable<T>`
+                // (spec §14.2: "records and enums implementing it").
+                //
+                // The predicate is `sema::isStdlibGuidType` (sema/
+                // BuiltinValueTypes.hpp) — THE SAME predicate sema's §5.1
+                // admissibility gate consults (the semantic half of this
+                // defect) and THE SAME one this file already consults for
+                // §2.6's `Guid` (`Array<Guid>.Sort()`, fix #8237, and the
+                // `Math.Min`/`Max`/`Clamp` arm, fix #7935). It is NOT a
+                // name-based test: `builtinTypeName` would also match an
+                // IMPORTED USER type named `Guid`, and `isStdlibGuidType`
+                // rejects it (`isUserDeclaredTypeSym`) — so the stdlib `Guid`
+                // and a user `Guid` cannot be confused.
+                //
+                // A NULLABLE element is excluded BY THE PREDICATE ITSELF
+                // (`isStdlibGuidType` returns false for a nullable type —
+                // spec §14.2: "a type-bound constraint — naming a class or
+                // interface — implies non-null T"), so `Array<Guid?>` keeps
+                // the #2770 refusal: the `T?` question is an OWNER RULING
+                // (#8241), not this arm's to decide.
+                const bool elemIsGuid =
+                    sema::isStdlibGuidType(resolveTypeParamRef(elemTypeRef));
                 sema::MethodSymbol* cmpMs = nullptr;
                 if (!isStrElem && elemTypeRef &&
                     elemTypeRef->kind == sema::TypeRef::Kind::Named &&
@@ -6698,6 +6723,127 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::Value* ordered = isMax
                         ? builder_.CreateICmpSGT(cmpVal, cmpAcc)
                         : builder_.CreateICmpSLT(cmpVal, cmpAcc);
+                    builder_.CreateCondBr(
+                        builder_.CreateOr(builder_.CreateNot(inited), ordered),
+                        updBB, nextBB);
+                    builder_.SetInsertPoint(updBB);
+                    builder_.CreateStore(el, accSlot);
+                    builder_.CreateStore(builder_.getTrue(), initSlot);
+                    builder_.CreateBr(nextBB);
+                    builder_.SetInsertPoint(nextBB);
+                    builder_.CreateStore(
+                        builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(endBB);
+                    freeLazyTemp();
+                    freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
+                    return builder_.CreateLoad(elemTy, accSlot, "mm.r");
+                }
+                // fix #8323 / #8264 (stdlib §2.6 / §2.8 / §5.1, spec §14.2,
+                // v0.355): the BUILT-IN `Guid` element — the ORDERING half of
+                // the defect the SEMANTIC half (sema's §5.1 gate, now reading
+                // `sema::isStdlibGuidType`) admits.
+                //
+                // WHAT THE DOCUMENTS REQUIRE. stdlib §2.6 declares
+                //     public record Guid: IComparable<Guid>, IEquatable<Guid>
+                // with "CompareTo = lexicographic over the 16 canonical
+                // big-endian bytes (stated explicitly — .NET's field-group
+                // order is a known trap)", and stdlib §5.1 declares
+                //     public extension IEnumerable<T> where T: IComparable<T>
+                //       public method Min(): T;   // InvalidOperationException if empty
+                //       public method Max(): T;   // InvalidOperationException if empty
+                // so `T = Guid` SATISFIES §5.1's constraint (spec §14.2:
+                // "records and enums implementing it") and `a.Min()` MUST BE
+                // ADMITTED — and must answer the §2.6 order.
+                //
+                // THE DEFECT. `Guid` is a BUILT-IN value record: it carries no
+                // user `TypeDecl`, so the comparator resolution above resolved
+                // NOTHING for it — `findMethodByName(elemTypeRef->declaration,
+                // "CompareTo")` needs a declaration, and
+                // `selfComparableIfaceCompareTo` (§14.2's rule-3 INTERFACE
+                // substitution) walks `declaration->baseTypeRefs` — and the
+                // #2770 guard below then REJECTED the call with
+                // "Min() without a selector requires the element type to
+                //  satisfy `T: IComparable<T>` …; `Guid` does not — its
+                //  `CompareTo` could not be resolved for dispatch."
+                //
+                // ⚠ IT CANNOT BE THE POINTER ARM. A `Guid` is stored INLINE —
+                // one 16-byte `{i64,i64}` struct per array slot (stdlib §2.6) —
+                // so the pointer arm would compare the ADDRESSES of two inline
+                // structs and answer with whichever element happened to sit
+                // lowest in memory: a WRONG answer, silently, on a program that
+                // compiles and runs. This is therefore a SEPARATE arm, exactly
+                // as #8049 made the temporal value records a separate arm.
+                //
+                // THE ORDERING is §2.6's own rule, and it is the rule the
+                // runtime's `bz_guid_compare` computes: a `memcmp` over the 16
+                // raw bytes, compared UNSIGNED — and those bytes ARE the
+                // CANONICAL bytes (the parse path memcpy's the 16 canonical
+                // bytes into the struct in order, so the struct's memory order
+                // IS the canonical order). `bz_guid_compare` is the very
+                // comparison `Guid.CompareTo` dispatches to (the member arm
+                // `mname == "CompareTo"`, above), the very one `Math.Min` /
+                // `Max` / `Clamp` order a `Guid` by (fix #7935) and the very
+                // one `Array<Guid>.Sort()` orders by (fix #8237) — so this arm
+                // and the MEMBER cannot drift apart: a `Min()` that ordered
+                // differently from `CompareTo` would be a false fix.
+                //
+                // THE ELEMENT LAYOUT is INLINE, and `elemTy` IS that layout:
+                // `lowerTypeRef` maps stdlib §2.6's `Guid` to
+                // `guidStructType()` — `{ i64, i64 }`, the same 16 bytes the
+                // runtime's `bz_guid_t` (`{ uint64_t lo; uint64_t hi; }`) reads.
+                // The accumulator therefore holds the winner's own 16 bytes and
+                // the result is the winner's own value, not a pointer to it.
+                if (elemIsGuid && elemTy == guidStructType()) {
+                    // The guard in the `if` makes the arm fail CLOSED: an
+                    // element that lowered to anything else would make the
+                    // 16-byte `bz_guid_compare` read the wrong bytes, so the
+                    // arm does not fire and the #2770 guard below refuses the
+                    // call — the pre-fix behaviour, never a wrong order.
+                    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                    llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                    // stdlib §5.1: Min()/Max() throw on an empty source.
+                    llvm::Value* isEmpty =
+                        builder_.CreateICmpEQ(len, builder_.getInt64(0));
+                    emitGuardThrow(isEmpty, "InvalidOperationException");
+                    auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                           {ptrTy(), i64(), i64()});
+                    auto* idxSlot  = entryAlloca(i64());
+                    auto* accSlot  = entryAlloca(elemTy);
+                    auto* initSlot = entryAlloca(i1());
+                    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                    builder_.CreateStore(
+                        llvm::Constant::getNullValue(elemTy), accSlot);
+                    builder_.CreateStore(builder_.getFalse(), initSlot);
+                    auto* condBB = llvm::BasicBlock::Create(llvm_, "mmg.c", currentFn_);
+                    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "mmg.b", currentFn_);
+                    auto* updBB  = llvm::BasicBlock::Create(llvm_, "mmg.u", currentFn_);
+                    auto* nextBB = llvm::BasicBlock::Create(llvm_, "mmg.n", currentFn_);
+                    auto* endBB  = llvm::BasicBlock::Create(llvm_, "mmg.e", currentFn_);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(condBB);
+                    llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                    builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len),
+                                          bodyBB, endBB);
+                    builder_.SetInsertPoint(bodyBB);
+                    llvm::Value* ep = builder_.CreateCall(
+                        ptrFn, {recv, idx, builder_.getInt64(esz)});
+                    llvm::Value* el  = builder_.CreateLoad(elemTy, ep, "mmg.el");
+                    // `bz_guid_compare` takes the ADDRESS of each 16-byte
+                    // value, so the element is spilled to its own slot; the
+                    // accumulator already lives in `accSlot`.
+                    auto* elSlot = entryAlloca(elemTy);
+                    builder_.CreateStore(el, elSlot);
+                    auto* cmpFn = declareC("bz_guid_compare", i32(),
+                                           {ptrTy(), ptrTy()});
+                    llvm::Value* cmp = builder_.CreateCall(
+                        cmpFn, {elSlot, accSlot}, "mmg.cmp");
+                    llvm::Value* inited = builder_.CreateLoad(i1(), initSlot);
+                    // §2.6's `CompareTo`: negative when `el` orders before
+                    // `acc`, positive when after.
+                    llvm::Value* ordered = isMax
+                        ? builder_.CreateICmpSGT(cmp, builder_.getInt32(0))
+                        : builder_.CreateICmpSLT(cmp, builder_.getInt32(0));
                     builder_.CreateCondBr(
                         builder_.CreateOr(builder_.CreateNot(inited), ordered),
                         updBB, nextBB);
