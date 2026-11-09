@@ -1505,7 +1505,75 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 builder_.CreateCondBr(isNull, assignBB, endBB);
                 builder_.SetInsertPoint(assignBB);
                 // RHS evaluated here ONLY (the LHS was null) — short-circuit.
-                rhs = lowerExpr(*as->value);
+                //
+                // fix #8374 (§7.7 / §15.4, v0.355): the right-hand side of a
+                // `??=` may be a COLLECTION LITERAL (`a ??= [1]`). A collection
+                // literal is NOT a general expression value — `lowerExpr`
+                // returns null for a `CollectionLiteralExpr`, because §15.4
+                // gives a collection literal its target type from the CONTEXT
+                // (the declaration / return type / parameter type) and this
+                // path had no context to give it. So the literal did not lower,
+                // the #3025 backstop below fired, and THE ASSIGNMENT WAS
+                // SILENTLY DROPPED: the target kept its previous value (null)
+                // and the program kept running — MEASURED on r30-c1 (8f4dc616)
+                // with the issue's own repro:
+                //
+                //     s5.bzl:5:11: warning: internal: ??= short-circuit RHS
+                //       expression failed to lower (degraded — target retains
+                //       its previous value) — #3025
+                //     ... and the program RUNS and returns 0: `a` is still
+                //       null after `a ??= [1];`.
+                //
+                // §7.7 decides it: "The compound form `??=` evaluates its
+                // right-hand side, and invokes the setter, only when the
+                // assignment occurs" — so WHEN THE CONDITION HOLDS THE
+                // ASSIGNMENT MUST HAPPEN. And §15.4 says the literal takes
+                // its target type "from the context"; the context HERE is the
+                // TARGET's own type.
+                //
+                // The literal is therefore MATERIALIZED against the target's
+                // type — the same shared helper the return / local-decl /
+                // call-argument / field-init / property-setter arms already
+                // use (`lowerReturnCollectionLiteral`). This is the `??=`
+                // twin of #7879's `??` fix, which materializes the same way on
+                // the non-compound join.
+                //
+                // THE TARGET TYPE is the target's own type `T` — the
+                // non-nullable form of the target's `T?`. §7.7's typing rule
+                // names it: "for a left operand of type `T?`, the right operand
+                // must be implicitly convertible (§5.1) to `T` or to `T?`" —
+                // and a collection literal is never nullable, so its target is
+                // `T`. §28.3 (spec:7149, the `a ?? b` producers row): "The
+                // compound form `a ??= b` assigns into `a` and follows the same
+                // meet rule for the assigned-into location" — so the target's
+                // own type and nullability govern what `??=` may store, and
+                // this IS that type. (NOTE: §17.8 in this tree is the
+                // null-forgiving operator `!`, not a rule about `??=`; the
+                // governing text for the compound form's store is §28.3's
+                // producers row, with §15.4 supplying the literal's target
+                // type.)
+                //
+                // A target type the materializer does not recognise (a
+                // user-defined collection without a §15.4.1 factory, an
+                // empty DICT literal against a dictionary target) leaves `rhs`
+                // null and falls through to `lowerExpr` — the #3025 backstop
+                // below, which is the pre-existing behaviour for every shape
+                // that cannot lower. The fix never turns a lowering failure
+                // into a miscompile; it only gives the literal the context
+                // §15.4 asks for.
+                if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        as->value.get())) {
+                    const sema::TypeRef* tgtTy = ctx_.exprType(*as->target);
+                    if (tgtTy) {
+                        sema::TypeRef tgtTyNN = *tgtTy;
+                        // §7.7: the literal's target is `T`, the non-nullable
+                        // form of the target's `T?`. A no-op for a target that
+                        // is not nullable.
+                        tgtTyNN.nullable = false;
+                        rhs = lowerReturnCollectionLiteral(cl, &tgtTyNN);
+                    }
+                }
+                if (!rhs) rhs = lowerExpr(*as->value);
                 if (!rhs) {
                     // fix #3025 (§28.9/§28.3, v0.240): the RHS is lowered only
                     // in §6.6's null branch, but a null lowering result used to
