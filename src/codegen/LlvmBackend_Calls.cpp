@@ -3910,6 +3910,154 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         }
     }
 
+    // fix #7831 (stdlib §1 Block-by-name, §4.4, §4.5, §4.17, §4.19, v0.355):
+    // the POSITIONAL-INDEX members on a CONCRETE stdlib collection head.
+    //
+    // Stdlib §1's Block-by-name rule is the authority: "an instance member
+    // blocks a same-named extension" — and a member a type does NOT declare is
+    // not a member of that type at all, so a call to it is an ERROR.
+    //
+    // The two names this gate covers are declared by exactly two heads:
+    // `Array<T>` (stdlib §4.4) declares `IndexOf(item: T, startIndex: int :=
+    // 0): int` AND `LastIndexOf(item: T): int`; `OwningArray<T>` (§4.5)
+    // declares `IndexOf(item: T): int` only; and NO other stdlib collection
+    // declares either — §4.17's `SortedDictionary<K, V>` declares neither,
+    // §4.19's `FrozenArray<T>` declares neither (only `Length`, the indexer,
+    // `ToArray` and the static `From`), and stdlib §5's
+    // `extension IEnumerable<T>` block declares NEITHER name (its `Contains`
+    // is a different member). `common::concreteCollectionHeadDeclares` reads
+    // the stdlib's own per-head surface table (sema's
+    // `concreteCollectionSurfaces`), so the head that DECLARES the name and
+    // the head that does not can never disagree about it.
+    //
+    // WHAT THIS FIXES (measured on the base, `a939f913`):
+    //   * `new SortedDictionary<int,int>().IndexOf(1)` COMPILED — sema's
+    //     shared non-owning allow-list admits `IndexOf` for every non-owning
+    //     container head, and codegen's dictionary arms have no `IndexOf`, so
+    //     the call degraded to the #3079 "the argument of this
+    //     `Console.WriteLine` failed to lower to a value" warning and the
+    //     program emitted NOTHING.
+    //   * `FrozenArray.From(a).IndexOf(1)` COMPILED SILENTLY — `FrozenArray`
+    //     is in NEITHER sema container table (so no call-surface gate
+    //     applies to it) and codegen's array `IndexOf` arm has no head gate,
+    //     so the call took the `Array<T>` lowering.
+    // Both are now refused with the stdlib's own documented-surface
+    // diagnostic, the same sentence the `IEnumerable` row of #8310 uses (with
+    // the CONCRETE collection's own phrasing — "this collection's documented
+    // surface", the wording this tree already uses for a concrete head; the
+    // §4.12 `IEnumerable` row says "this interface's" because that head IS
+    // an interface).
+    //
+    // WHAT THIS FIX DOES NOT DO — deliberately:
+    //   * It is NOT a general "any undeclared member on any collection head"
+    //     gate. The surface table's rows are the stdlib's authority, but a
+    //     name that no head declares (a misspelling) keeps its own #2457
+    //     "no dispatch arm" diagnostic, and a name a SIBLING head declares
+    //     keeps whatever it has today. Only the two POSITIONAL-INDEX names —
+    //     the family this issue is about — are gated here, so no valid
+    //     program can be refused by it.
+    //   * A USER extension (§26.5) that declares the name on the receiver is
+    //     the member (§26.5 rule 2: the head declares no instance member of
+    //     that name, so the extension blocks are consulted). The #7946
+    //     decline above already returns for that shape — the callee is the
+    //     extension's MethodSymbol and the head does not declare the name —
+    //     and the explicit check below keeps the gate self-contained.
+    {
+        const std::string_view headX =
+            recvTy ? builtinTypeName(recvTy) : std::string_view();
+        if (!headX.empty() && (m == "IndexOf" || m == "LastIndexOf") &&
+            common::isConcreteCollectionSurfaceHead(headX) &&
+            !common::concreteCollectionHeadDeclares(headX, m)) {
+            auto* msIdx =
+                dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+            if (!isExtensionMethod(msIdx)) {
+                // The stdlib section that DECLARES this head's surface, and
+                // the members that section declares — the stdlib document is
+                // the authority (stdlib §4.4, §4.5, §4.6, §4.7, §4.8, §4.9,
+                // §4.10, §4.11, §4.17, §4.18, §4.19).
+                struct HeadSurface {
+                    std::string_view head;
+                    const char* section;
+                    const char* surface;
+                };
+                static constexpr HeadSurface kHeadSurfaces[] = {
+                    {"Array", "\xC2\xA7""4.4",
+                     "Add/AddRange/Clear/Contains/Count/IndexOf/Insert/"
+                     "LastIndexOf/Remove/RemoveAt/Reverse/Sort/ToArray"},
+                    {"OwningArray", "\xC2\xA7""4.5",
+                     "Add/AddRange/Clear/Contains/Count/IndexOf/Insert/Remove/"
+                     "RemoveAt/Reverse/Sort/Drain"},
+                    {"LinkedList", "\xC2\xA7""4.6",
+                     "AddFirst/AddLast/AddBefore/AddAfter/RemoveFirst/"
+                     "RemoveLast/RemoveNode/Find/Contains/Clear/IsReadOnly/"
+                     "GetEnumerator"},
+                    {"OwningLinkedList", "\xC2\xA7""4.7",
+                     "AddFirst/AddLast/AddBefore/AddAfter/RemoveFirst/"
+                     "RemoveLast/RemoveNode/Find/Contains/Clear/IsReadOnly/"
+                     "GetEnumerator/PopFirst/PopLast/TryPopFirst/TryPopLast"},
+                    {"Dictionary", "\xC2\xA7""4.8",
+                     "Add/ContainsKey/Contains/Remove/TryGetValue/GetOrNull/"
+                     "GetOrAdd/Clear/IsReadOnly/GetEnumerator"},
+                    {"OwningDictionary", "\xC2\xA7""4.9",
+                     "Add/ContainsKey/Contains/Remove/TryGetValue/GetOrNull/"
+                     "GetOrAdd/PopValue/TryPopValue/Drain/Clear/GetEnumerator"},
+                    {"Set", "\xC2\xA7""4.10",
+                     "Add/Remove/Contains/Clear/UnionWith/IntersectWith/"
+                     "ExceptWith/IsSubsetOf/IsSupersetOf/TryAdd/IsReadOnly/"
+                     "GetEnumerator"},
+                    {"OwningSet", "\xC2\xA7""4.10",
+                     "Add/Remove/Contains/Clear/UnionWith/IntersectWith/"
+                     "ExceptWith/IsSubsetOf/IsSupersetOf/TryAdd/Pop/TryPop/"
+                     "Drain/GetEnumerator"},
+                    {"Stack", "\xC2\xA7""4.11",
+                     "Push/Pop/Peek/TryPop/TryPeek/Clear/Contains/GetEnumerator"},
+                    {"OwningStack", "\xC2\xA7""4.11",
+                     "Push/Pop/Peek/TryPop/TryPeek/Clear/Contains/Drain/"
+                     "GetEnumerator"},
+                    {"Queue", "\xC2\xA7""4.11",
+                     "Enqueue/Dequeue/TryDequeue/TryPeek/Clear/Contains/"
+                     "GetEnumerator"},
+                    {"OwningQueue", "\xC2\xA7""4.11",
+                     "Enqueue/Dequeue/TryDequeue/TryPeek/Clear/Contains/Drain/"
+                     "GetEnumerator"},
+                    {"SortedDictionary", "\xC2\xA7""4.17",
+                     "ContainsKey/Contains/TryGetValue/GetOrNull/Remove/Clear/"
+                     "FirstKey/LastKey/GetEnumerator"},
+                    {"SortedSet", "\xC2\xA7""4.18",
+                     "Add/Remove/Contains/Clear/TryAdd/First/Last/GetEnumerator"},
+                    {"FrozenArray", "\xC2\xA7""4.19",
+                     "Length/ToArray/GetEnumerator"},
+                };
+                const char* section = "\xC2\xA7""4.x";
+                const char* surface = "";
+                for (const auto& hs : kHeadSurfaces) {
+                    if (hs.head != headX) continue;
+                    section = hs.section;
+                    surface = hs.surface;
+                    break;
+                }
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    std::string("no member `") + std::string(m) + "` on `" +
+                        std::string(headX) + "` (stdlib " + section +
+                        ") -- it is not part of this collection's documented "
+                        "surface (" + std::string(surface) + "), a universal "
+                        "`ToString`/`Equals`/`GetHashCode`/`GetType` member "
+                        "(language spec \xC2\xA7""8.1), or a stdlib \xC2\xA7""5 "
+                        "LINQ extension operator");
+                // The result type of the refused member is `int` (stdlib
+                // §4.4's `IndexOf`/`LastIndexOf` signatures). Poison keeps
+                // the enclosing expression well-formed so the diagnostic is
+                // the one the user reads (the #853 fence's discipline).
+                llvm::Type* resTy = static_cast<llvm::Type*>(i32());
+                if (sema::TypeRef* rt = ctx_.exprType(call))
+                    if (llvm::Type* lt = lowerTypeRef(rt))
+                        resTy = lt;
+                return llvm::PoisonValue::get(resTy);
+            }
+        }
+    }
+
     if (!isArr && !isDict && !isStrBld && !lazyTerminal) return nullptr;
 
     // The materialized-array temp to free before the terminal returns its
