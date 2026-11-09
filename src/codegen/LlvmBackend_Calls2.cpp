@@ -13695,10 +13695,68 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 if (isBuiltinIdentityRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (isEqualsCall) {
-                        llvm::Value* other = lowerExpr(*call.args[0].value);
-                        if (recv && other)
-                            return builder_.CreateICmpEQ(
-                                recv, other, "bltn.eq.ref");
+                        // fix #8296 (§8.1 / §8.6 / §8.3, v0.355): §8.1's
+                        // universal `Equals(other: Object?)` takes its argument
+                        // at an `Object` LOCATION, so §8.6's boxing applies to
+                        // it HERE exactly as it does on the `Object` /
+                        // interface / class receiver arm below (fix #3443):
+                        // "When a value type is used where `Object` … is
+                        // expected, the value is boxed." The comparison here
+                        // is between two REFERENCES, so the argument must be
+                        // lowered as one.
+                        //
+                        // This arm used to hand the RAW lowered argument to
+                        // `CreateICmpEQ` against the receiver pointer, so a
+                        // value-typed argument produced `icmp eq ptr %3, i32 5`
+                        // — mismatched operand types — and the compiler ABORTED
+                        // with an IR VERIFICATION FAILURE ("Both operands to
+                        // ICmp instruction are not of the same type!"). The
+                        // argument was assumed to be reference-shaped, which is
+                        // true of the `Object` receiver's own comparison but
+                        // not of a value-typed ARGUMENT.
+                        //
+                        // MEASURED on a939f913 (the repro of #8296):
+                        // `l.Equals(5)` on a Mutex lock handle and
+                        // `sw.Equals(5)` on a Stopwatch both FAILED TO COMPILE
+                        // (IR verification), as did the `?.` spellings
+                        // `l?.Equals(5)` / `sw?.Equals(5)` — for these
+                        // receivers the `?.` form falls through to this same
+                        // arm. The reference-typed argument forms
+                        // (`l.Equals(l2)`, `sw.Equals(null)`, `sw.Equals("x")`)
+                        // compiled and printed `False` before the fix and are
+                        // unaffected by it: a reference-typed argument is not
+                        // boxed, so it reaches this comparison unchanged.
+                        //
+                        // The comparison stays an IDENTITY comparison — §8.3's
+                        // class row ("Reference equality") is the default for
+                        // these receivers, which declare no `Equals` override
+                        // — so a value-typed argument is never equal to the
+                        // receiver and the answer is `False`, the same answer
+                        // §8.4's `Object.ReferenceEquals` gives for a fresh
+                        // box ("a non-null value-typed argument produces a
+                        // fresh box and compares unequal to every other
+                        // argument").
+                        //
+                        // The argument is lowered through the SAME helper the
+                        // other three §8.1 faces use (`lowerUniversalEqualsArg`
+                        // — the `.` form, the `?.` mirror and the generic-T
+                        // redirect), so the four spellings cannot disagree
+                        // about whether the argument is boxed.
+                        llvm::Value* argMint = nullptr;
+                        llvm::Value* other = lowerUniversalEqualsArg(
+                            *call.args[0].value, &argMint);
+                        llvm::Value* r = (recv && other)
+                            ? builder_.CreateICmpEQ(recv, other, "bltn.eq.ref")
+                            : nullptr;
+                        // §28.9: the fresh argument box is dead the instant the
+                        // comparison is built — this arm compares two POINTERS
+                        // and stores neither, so the box cannot escape (there
+                        // is no vtable dispatch here and no user override that
+                        // could keep it: the receiver has none). Discharge the
+                        // producer's +1 here, on the same reasoning fix #3480's
+                        // value-receiver arm discharges its argument box.
+                        emitBoxRelease(argMint);  // null-safe (§28.9)
+                        if (r) return r;
                     } else {
                         if (recv)
                             return builder_.CreateCall(
