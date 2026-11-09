@@ -1158,18 +1158,32 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             // illegal, exactly like `move` of a plain non-`owned` field
             // (`moveOnNonOwnedFieldName`, ExprTypecheck_Exprs.cpp, the
             // sibling sema-side check this mirrors for a getter instead of
-            // a field). A CALL is different: a method call CAN legitimately
-            // be a fresh owned producer (`Take(): owned Cell return move
-            // C.Fresh();`, move_borrow_owned_return_1995_test.cpp's pinned
-            // ACCEPT — K3.13's "redundant marker on a fresh producer" is
-            // harmless, not an error), so a call is rejected only when it is
-            // NOT already an owned producer in its own right. `producerState`
-            // is the single authority for that question (the LANE_RULES
+            // a field). A CALL is different: a method call CAN be a fresh
+            // owned producer (`Take(): owned Cell return move C.Fresh();`),
+            // so a call is rejected here only when it is NOT already an
+            // owned producer in its own right. `producerState` is the single
+            // authority for that question (the LANE_RULES
             // duplicated-classification-predicate discipline — its
             // CallExpr-Owned cascade, factory heuristics included, is not
             // re-derived here); a bare identifier and `this.field` never
             // reach this point (both `return` above), so this cannot
             // reclassify either of those.
+            //
+            // fix #8332 (§28.8.1 / Appendix A.7 MoveExpr, v0.355): the
+            // message below used to list "or a call that is itself a fresh
+            // owned producer (a call returning `owned T`)" among the things
+            // `move` transfers. §28.8.1 closes the operand set — "No other
+            // operand is admitted (A.7): a fresh producer (a `new`
+            // expression, a call returning `owned T`, an owned operator
+            // result) needs no marker anywhere (K3.13) and takes none, so
+            // `move (new Cell(1))` is a compile error at every position" —
+            // so a call returning `owned T` is NOT one of the things `move`
+            // transfers, and the clause was DROPPED (it contradicted the
+            // sibling fresh-producer diagnostic, which tells the user to
+            // remove the `move`). The PREDICATE is unchanged: the marker
+            // economy on a fresh producer is SEMA's (narrow #7926 at a
+            // binding position, §22.3 at a call site); its remaining holes
+            // are filed separately.
             //
             // MEASURED (issue's own repro, on HEAD before this fix):
             // `using var live := move other.Self();` (`Self(): Widget
@@ -1192,10 +1206,8 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                            "is a borrow, not an owning place — `move` "
                            "transfers only a named binding (a local, an "
                            "`owned` parameter, or an `owned` field/"
-                           "collection slot, §28.8.1) or a call that is "
-                           "itself a fresh owned producer (a call returning "
-                           "`owned T`). This call returns a plain "
-                           "(non-`owned`) type, so its result has no "
+                           "collection slot, §28.8.1). This call returns a "
+                           "plain (non-`owned`) type, so its result has no "
                            "ownership to transfer; moving it would give the "
                            "result a SECOND owner over a value its real "
                            "owner still disposes (§28.3 K3.1/K3.6). Read it "
