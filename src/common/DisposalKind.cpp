@@ -144,7 +144,36 @@ DisposalVerdict classifyDisposal(const sema::TypeRef* t, sema::SemaContext& ctx)
     case sema::TypeRef::Kind::InlineArray:
         // §15.3: an OWNING inline array is move-only — its owned slots are
         // disposed in place.
-        if (t->arrayOwned) v.kind = DisposalKind::MoveOnly;
+        if (t->arrayOwned) {
+            v.kind = DisposalKind::MoveOnly;
+            // §15.3: an OWNING inline array's owned slots "are auto-disposed
+            // at scope end regardless of whether `using var` is used", and
+            // "No must-use warning attaches to this auto-drop at an owning
+            // inline array" — "the slot pass is unconditional and runs
+            // identically under plain `var` and under `using var`, so the two
+            // spellings differ in nothing the lint could announce". The slot
+            // pass is REAL work, so the binding CARRIES a disposal obligation.
+            //
+            // ⇒ THE §28.10 VACUITY LINT's PREMISE IS FALSE AT THIS SHAPE.
+            // Its message says "the RHS is a value-typed/runtime-managed value
+            // with no disposal obligation (§28.9)", and §28.9's tier is
+            // EXHAUSTIVE and does not name an inline array — "Note that
+            // inline arrays `[N]T` … are not on this list" (§28.9's own
+            // closing paragraph), while §28.9 adds that an owning inline
+            // array "is a move-only value type (§15.3) that participates in
+            // the ownership system as part of its host's lifecycle". So the
+            // value is neither runtime-managed nor obligation-free, and the
+            // verdict must answer "carries an obligation" — the answer the
+            // disposal-family heads already give (#7456).
+            //
+            // A NON-owning inline array (`[N]T` / `[N]T?`, §15.1) keeps the
+            // answer "no obligation": its slots are borrows, not owned
+            // payloads, so there is nothing for a scope-end slot pass to
+            // dispose — and §15.3 says the move-only property "follows from
+            // structure", an inline array being move-only "exactly when its
+            // slots carry the `owned` marker".
+            v.carriesObligation = true;
+        }
         // The unit type, an inline array and an error type are NOT
         // classifiable here, and the pre-existing path kept them ("may hold a
         // class" — the old `typeMayHoldClass` answered "unclassifiable" and its
