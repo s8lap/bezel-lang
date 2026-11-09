@@ -11658,6 +11658,125 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             }
         }
     }
+    // #7927 (§8.7, v0.350): the type-name call `E.Dispose()` — enums and
+    // choices have no `Dispose` member — is a compile error.
+    //
+    // #7934 (§8.7, v0.350 / §28.2, v0.355): THIS ARM RUNS WHETHER OR NOT THE
+    // CALLEE RESOLVED. It used to live inside the `if (!calleeSym)` block
+    // below, so it ran only when the callee resolved to NOTHING — and the
+    // call `E.Dispose()` on an enum that DECLARES a constant named `Dispose`
+    // RESOLVES (to that constant), so the arm never ran for it and the call
+    // was admitted (issue #7934). The arm reads the TYPE, not the callee's
+    // symbol, so it belongs outside that block.
+    //
+    // The "declared member" scan below asks whether the type declares a
+    // `Dispose` MEMBER, which §8.7 makes a member of a class type and of
+    // nothing else:
+    //
+    //  · An ENUM CONSTANT named `Dispose` does NOT supply the name. It is a
+    //    VALUE — §28.2 (v0.355) forbids the name on an enum in every member
+    //    kind, the constant included — so the type-name call `E.Dispose()`
+    //    calls a value, and the diagnostic says exactly that.
+    //  · A CHOICE CASE named `Dispose` DOES supply the name: a payload case
+    //    is CONSTRUCTED by a call (`Ch.Dispose(v)`, §35.3), and a payload-free
+    //    case's call is the §35.3/§35.5 arity error, which names the case
+    //    precisely ("a payload-free case is the value `Ch.Dispose`, not a
+    //    call") — the §8.7 diagnostic would only double-report it.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+        if (ma->member == "Dispose" && ma->target) {
+            const ast::Expr* tgt = ma->target.get();
+            ast::TypeDeclKind k = ast::TypeDeclKind::Class;
+            bool hit = false;
+            bool enumConstantNamedDispose = false;
+            std::string typeName;
+            // The receiver of the type-name call is a TYPE NAME. It is
+            // either a plain identifier (`E`, `KA`) or a dotted chain that
+            // ends at a type (`Container.Status`, `C.N.M`) — the chain's
+            // own symbol is the nested type's. #7934 reaches both, so the
+            // nested spelling of the same defect is not admitted either.
+            sema::TypeSymbol* ts = nullptr;
+            // The receiver's own spelling, for the diagnostic (`E`,
+            // `Container.Status`) — the AST gives the identifier's name and
+            // each member-access segment's, so a dotted type name is spelled
+            // out rather than shortened to the type's own name. The chain is
+            // left-nested (`A.B.C` is `(A.B).C`), so the segments are
+            // collected outermost-first and joined in reverse.
+            std::string recvName;
+            {
+                std::vector<std::string> segs;
+                const ast::Expr* cur = tgt;
+                while (auto* m =
+                           dynamic_cast<const ast::MemberAccessExpr*>(cur)) {
+                    segs.push_back(std::string(m->member));
+                    cur = m->target.get();
+                }
+                std::string name;
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(cur))
+                    name = std::string(id->name);
+                for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+                    if (!name.empty()) name += ".";
+                    name += *it;
+                }
+                recvName = name;
+            }
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt)) {
+                auto* tSym = ctx_.exprSymbol(*id);
+                ts = dynamic_cast<sema::TypeSymbol*>(tSym);
+                if (!ts) {
+                    if (auto* al = dynamic_cast<sema::TypeAliasSymbol*>(tSym))
+                        ts = resolveAliasToTypeSymbol(al);
+                }
+            } else if (auto* chain = dynamic_cast<const ast::MemberAccessExpr*>(tgt)) {
+                auto* tSym = ctx_.exprSymbol(*chain);
+                if (auto* nts = dynamic_cast<NestedTypeSymbol*>(tSym))
+                    ts = nts->type;
+                else if (!ts)
+                    ts = dynamic_cast<sema::TypeSymbol*>(tSym);
+                if (!ts) {
+                    if (auto* al = dynamic_cast<sema::TypeAliasSymbol*>(tSym))
+                        ts = resolveAliasToTypeSymbol(al);
+                }
+            }
+            if (ts && (ts->kind == ast::TypeDeclKind::Enum ||
+                       ts->kind == ast::TypeDeclKind::Choice)) {
+                bool declared = false;
+                for (auto* m : ts->members) {
+                    if (!m || m->name != "Dispose") continue;
+                    if (dynamic_cast<EnumConstantSymbol*>(m)) {
+                        enumConstantNamedDispose = true;
+                        continue;
+                    }
+                    declared = true;
+                }
+                if (!declared) {
+                    k = ts->kind;
+                    typeName = recvName.empty() ? std::string(ts->name)
+                                                : recvName;
+                    hit = true;
+                }
+            }
+            if (hit) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    enumConstantNamedDispose
+                        ? ("`Dispose` is not admitted on an enum value "
+                           "\xe2\x80\x94 enums do not implement "
+                           "IDisposable; the enum constant `" +
+                           typeName + ".Dispose` is a value, not a "
+                           "`Dispose` member (\xc2\xa7""8.7, v0.350; "
+                           "\xc2\xa7""28.2, v0.355)")
+                        : (k == ast::TypeDeclKind::Enum
+                            ? "`Dispose` is not admitted on an enum value "
+                              "\xe2\x80\x94 enums do not implement "
+                              "IDisposable; the type name has no `Dispose` "
+                              "member (\xc2\xa7""8.7, v0.350)"
+                            : "`Dispose` is not admitted on a choice value "
+                              "\xe2\x80\x94 choices do not implement "
+                              "IDisposable; the type name has no `Dispose` "
+                              "member (\xc2\xa7""8.7, v0.350)"));
+            }
+        }
+    }
     // CG27c / CG60: if the callee has no resolved symbol but has a type,
     // propagate the appropriate type to the CallExpr:
     // - If the callee has a Function TypeRef (e.g. indexed array element
@@ -12345,56 +12464,49 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                     }
                 }
-                // #7927 (§8.7, v0.350): "a call in any spelling (`x.Dispose()`,
-                // `x?.Dispose()`, `x!.Dispose()`)" on a type that is not a
-                // class is a compile error; so is the type-name call
-                // `E.Dispose()` (enums and choices have no `Dispose` member).
-                // The `x.Dispose()` / `x!.Dispose()` spelling is the arm
-                // below; this arm adds the `?.` receiver and the type name.
-                if (ma->member == "Dispose" && ma->target) {
-                    const ast::Expr* tgt = ma->target.get();
-                    ast::TypeDeclKind k = ast::TypeDeclKind::Class;
-                    bool hit = false;
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt)) {
-                        auto* tSym = ctx_.exprSymbol(*tgt);
-                        auto* ts = dynamic_cast<sema::TypeSymbol*>(tSym);
-                        if (!ts) {
-                            if (auto* al = dynamic_cast<sema::TypeAliasSymbol*>(tSym))
-                                ts = resolveAliasToTypeSymbol(al);
-                        }
-                        (void)id;
-                        if (ts && (ts->kind == ast::TypeDeclKind::Enum ||
-                                   ts->kind == ast::TypeDeclKind::Choice)) {
-                            bool declared = false;
-                            for (auto* m : ts->members)
-                                if (m && m->name == "Dispose") declared = true;
-                            if (!declared) {
-                                k = ts->kind;
-                                hit = true;
-                            }
-                        }
-                    }
-                    if (hit) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, ce.span.begin,
-                            k == ast::TypeDeclKind::Enum
-                                ? "`Dispose` is not admitted on an enum value "
-                                  "\xe2\x80\x94 enums do not implement "
-                                  "IDisposable; the type name has no `Dispose` "
-                                  "member (\xc2\xa7""8.7, v0.350)"
-                                : "`Dispose` is not admitted on a choice value "
-                                  "\xe2\x80\x94 choices do not implement "
-                                  "IDisposable; the type name has no `Dispose` "
-                                  "member (\xc2\xa7""8.7, v0.350)");
-                    }
-                }
                 // §35.8, v0.334: reject `Dispose()` on a choice value.
                 // Choices do not implement IDisposable; an owning choice's
                 // disposal obligation is discharged by its holder, never by
                 // calling Dispose() on it.
+                //
+                // #7927 (§8.7, v0.350): "a call in any spelling (`x.Dispose()`,
+                // `x?.Dispose()`, `x!.Dispose()`)" on a type that is not a
+                // class is a compile error. This arm is the `x.Dispose()` /
+                // `x!.Dispose()` spelling (the receiver's VALUE type); the
+                // `?.` receiver has its own arm above, and the TYPE NAME has
+                // one above the `if (!calleeSym)` block — #7934 moved that one
+                // out of it, because the callee of `E.Dispose()` on an enum
+                // that DECLARES a constant named `Dispose` RESOLVES (to that
+                // constant), so inside this block the type-name arm never ran
+                // and the call was admitted.
                 if (ma->member == "Dispose" && ma->target) {
                     auto* recvTy = ctx_.exprType(*ma->target);
-                    if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                    // #7934 (the issue's cosmetic note): a TYPE-NAME receiver
+                    // — an IDENTIFIER naming a type or a type alias — is the
+                    // #7927 type-name arm's business; that arm reports the
+                    // type-name `Dispose` and names the kind's own surface.
+                    // This arm reported the SAME mistake a second time for
+                    // the alias spelling (`EA.Dispose()` produced two
+                    // diagnostics for one error), because an alias's receiver
+                    // carries the aliased type as its expression type. One
+                    // mistake, one diagnostic.
+                    //
+                    // A VALUE receiver — a local, a field, a property, a
+                    // parameter — is never a type name, so this arm still owns
+                    // it (the #7913 / §35.8 rejections). The guard is the SAME
+                    // shape the type-name arm keys on (an identifier whose
+                    // symbol is a type or a type alias), so the two arms never
+                    // both fire and never both stay silent.
+                    bool receiverIsTypeName = false;
+                    if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                            ma->target.get())) {
+                        if (auto* rsym = ctx_.exprSymbol(*rid))
+                            receiverIsTypeName =
+                                dynamic_cast<TypeSymbol*>(rsym) != nullptr ||
+                                dynamic_cast<TypeAliasSymbol*>(rsym) != nullptr;
+                    }
+                    if (!receiverIsTypeName && recvTy &&
+                        recvTy->kind == TypeRef::Kind::Named &&
                         recvTy->declaration &&
                         recvTy->declaration->kind == ast::TypeDeclKind::Enum) {
                         // #7913 (§8.7, v0.350): "Static classes, records,
@@ -12406,7 +12518,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             "\xe2\x80\x94 enums do not implement IDisposable "
                             "(\xc2\xa7""8.7, v0.350)");
                     }
-                    if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                    if (!receiverIsTypeName && recvTy &&
+                        recvTy->kind == TypeRef::Kind::Named &&
                         recvTy->declaration &&
                         recvTy->declaration->kind == ast::TypeDeclKind::Choice) {
                         ctx_.diagnostics().report(
@@ -37160,6 +37273,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         }
     }
     TypeSymbol* targetType = nullptr;
+    // #7934 (§26.5 rule 2, v0.355): the receiver of this access is a TYPE
+    // NAME (a type, a type alias, or a nested type reached through a type
+    // name) rather than a VALUE. §26.5 rule 2: "Through a type name the
+    // chain resolves against the type's nested types, enum constants and
+    // static members, declared or inherited — and a call or read `T.M` that
+    // none of them supplies names no member and is the same compile error:
+    // an instance method of the name does not supply it, there being no
+    // receiver". Set by the type-name arms below; read by the "no member"
+    // gate, where the universal-Object-member exemption is narrowed.
+    bool receiverIsTypeName = false;
     // `this.X` — currentType_ takes precedence over name lookup so
     // we don't have to teach `this` to be an expression with type
     // currentType_.
@@ -38554,6 +38677,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     }
                 }
                 targetType = ts;
+                // #7934 (§26.5 rule 2, v0.355): the receiver is a TYPE NAME,
+                // so the chain resolves against the type's nested types, enum
+                // constants and static members only — there is no receiver,
+                // and an instance member does not supply the name.
+                receiverIsTypeName = true;
             } else if (auto* nts = dynamic_cast<NestedTypeSymbol*>(sym)) {
                 // §11.3 / #482 fix B: a NestedTypeSymbol (e.g. `Container.Status`
                 // resolves to a NestedTypeSymbol for `Status`) is used as the
@@ -38561,7 +38689,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // NestedTypeSymbol does NOT inherit TypeSymbol, so the branch above
                 // misses it. Extract the inner TypeSymbol so enum-constant lookup
                 // (and other member-access paths) work correctly.
-                if (nts->type) targetType = nts->type;
+                if (nts->type) {
+                    targetType = nts->type;
+                    // #7934 (§26.5 rule 2, v0.355): a nested type reached
+                    // through a type name is a TYPE NAME too.
+                    receiverIsTypeName = true;
+                }
             } else if (auto* aliasSym = dynamic_cast<TypeAliasSymbol*>(sym)) {
                 // fix #4038 (§27.8, v0.294): a module-level `type` alias used as
                 // the receiver of a static member access (`AliasOfFoo.Bar`) is
@@ -38621,6 +38754,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                 ctx_.resolvedType(*aliasDecl->aliasedType)) {
                             if (underlying->kind == TypeRef::Kind::Named) {
                                 targetType = underlying->declaration;
+                                // #7934 (§26.5 rule 2, v0.355): an alias used
+                                // as the receiver of a member access is a TYPE
+                                // NAME (the chain resolves against the
+                                // aliased type's nested types, enum constants
+                                // and static members — §27.8's alias
+                                // transparency makes the alias and the
+                                // aliased type one identity, so the rule
+                                // that governs the type name governs the
+                                // alias).
+                                receiverIsTypeName = true;
                                 if (targetType)
                                     ctx_.setExprType(ma.target.get(), underlying);
                             } else if (underlying->kind ==
@@ -44604,6 +44747,42 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         bool isUniversalObjectMember =
             mm == "ToString" || mm == "Equals" || mm == "GetHashCode" ||
             mm == "GetType" || mm == "ReferenceEquals" || mm == "Dispose";
+        // #7934 (§8.7, v0.350 / §26.5 rule 2, v0.355): through a TYPE NAME
+        // the chain resolves against the type's nested types, enum constants
+        // and STATIC members — "a call or read `T.M` that none of them
+        // supplies names no member and is the same compile error: an instance
+        // method of the name does not supply it, there being no receiver"
+        // (§26.5 rule 2). `Dispose` is never a static member of a type: §8.7
+        // makes it a member of a class type's INSTANCE surface (the
+        // compiler-generated `Dispose()` of a non-static class) and of an
+        // interface that declares `method Dispose();` itself, and §28.2
+        // (v0.355) forbids a class or a record from DECLARING one — so no
+        // type name ever supplies it. The universal-member exemption above
+        // exists for a VALUE receiver (`k.Dispose()`), where the
+        // compiler-generated member answers the name; through a type name it
+        // must not, or `K.Dispose()` / `KA.Dispose()` (a `type KA := K;`
+        // alias) would name a member the type does not have.
+        //
+        // The CALL form only. The READ form (`K.Dispose` as a bare
+        // expression) is a §27.6 METHOD-REFERENCE FORMATION, and §27.6 has
+        // its own rule for this name — "No method reference to `Dispose` or
+        // `DisposeAsync` ... type-qualified (`D.Dispose`,
+        // `IDisposable.Dispose`) — is a compile error at the formation" —
+        // which is tracked by #7344; and the read half of §26.5 rule 2
+        // against that formation rule is the open spec-question #8065. This
+        // fix answers neither: it rejects the CALL, the shape issue #7934
+        // reports.
+        //
+        // An ENUM or a CHOICE type name keeps the exemption: the §8.7
+        // diagnostic for those kinds (the #7927 type-name arm) is the one
+        // that reports the type-name `Dispose` there, and it names the kind's
+        // own surface ("the type name has no `Dispose` member").
+        const bool typeNameDispose =
+            receiverIsTypeName && mm == "Dispose" && targetType &&
+            calleeOfCallCtx_ == &ma &&
+            targetType->kind != ast::TypeDeclKind::Enum &&
+            targetType->kind != ast::TypeDeclKind::Choice;
+        if (typeNameDispose) isUniversalObjectMember = false;
         // §9.8 / issue #550: Serialize and Deserialize are synthesized for
         // records/enums/serialized-tree-classes that declare
         // ISerializable/IDeserializable. They have no MemberSymbol, so we must
@@ -44772,27 +44951,64 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // verified working (see the remedy_narrow_with_is_works,
             // remedy_narrow_with_as_works and remedy_declare_on_iface_works
             // controls in unknown_member_interface_3953_test.cpp).
+            // #7934: the type-name `Dispose` case gets its OWN wording, and
+            // its remedy is per KIND — a class instance is disposed through
+            // `Dispose()` (§8.7), a record has no `Dispose` member at all
+            // (§8.7: records do not implement IDisposable) and an
+            // interface's `Dispose` is an instance member of the CONFORMING
+            // type (§8.7 / §11.2). A single wording would name a remedy that
+            // does not exist for two of the three kinds.
+            std::string typeNameDisposeRemedy;
+            if (targetType->kind == ast::TypeDeclKind::Record)
+                typeNameDisposeRemedy =
+                    "a record VALUE has no `Dispose` to call either; a "
+                    "record's owned components are discharged by the "
+                    "language's own disposal points (\xc2\xa7""9.7)";
+            else if (targetType->kind == ast::TypeDeclKind::Interface)
+                typeNameDisposeRemedy =
+                    "an interface's `Dispose` is an INSTANCE member of the "
+                    "CONFORMING type (\xc2\xa7""8.7 / \xc2\xa7""11.2) \xe2\x80\x94 "
+                    "call it on a value of a conforming type";
+            else
+                typeNameDisposeRemedy =
+                    "call `Dispose()` on a VALUE of the type instead";
             std::string noMemberMsg =
-                targetType->kind == ast::TypeDeclKind::Interface
-                    ? (std::string("no member `") + std::string(ma.member) +
-                       "` on interface `" + std::string(targetType->name) +
-                       "` (§11.2/§11.3): a value of interface type `" +
+                typeNameDispose
+                    ? (std::string("no member `Dispose` on type `") +
                        std::string(targetType->name) +
-                       "` exposes only members declared on `" +
-                       std::string(targetType->name) +
-                       "` itself or inherited from an interface it extends "
-                       "— even when the underlying object's concrete type "
-                       "declares more members, they are not reachable "
-                       "through this interface-typed reference (§11.2). "
-                       "Narrow to the concrete type first (`is`/`as`, "
-                       "§17.4) to reach `" + std::string(ma.member) +
-                       "` there, or add `" + std::string(ma.member) +
-                       "` to `" + std::string(targetType->name) +
-                       "`'s own declaration (§11.2) if every conforming "
-                       "type should provide it")
-                    : (std::string("no member `") + std::string(ma.member) +
-                       "` on type `" + std::string(targetType->name) +
-                       "` (§11.3, §12.1)");
+                       "` (§11.3, §12.1, §26.5 rule 2): through a type name "
+                       "the chain resolves against the type's nested types, "
+                       "enum constants and static members, declared or "
+                       "inherited (§26.5 rule 2) — and `Dispose` is none of "
+                       "them: §8.7 makes `Dispose()` a member of a CLASS type's "
+                       "instance surface (the compiler-generated `Dispose()` of "
+                       "a non-static class) and of an INTERFACE that declares "
+                       "`method Dispose();` itself or extends `IDisposable` — "
+                       "all INSTANCE members, and §26.5 rule 2 says a type name "
+                       "supplies none of those — while a record has no "
+                       "`Dispose` member at all; §28.2 (v0.355) forbids a class "
+                       "or a record from declaring one, so no type name supplies "
+                       "it (§8.7, v0.350) — " + typeNameDisposeRemedy)
+                    : (targetType->kind == ast::TypeDeclKind::Interface
+                        ? (std::string("no member `") + std::string(ma.member) +
+                           "` on interface `" + std::string(targetType->name) +
+                           "` (§11.2/§11.3): a value of interface type `" +
+                           std::string(targetType->name) +
+                           "` exposes only members declared on `" +
+                           std::string(targetType->name) +
+                           "` itself or inherited from an interface it extends "
+                           "— even when the underlying object's concrete type "
+                           "declares more members, they are not reachable "
+                           "through this interface-typed reference (§11.2). "
+                           "Narrow to the concrete type first (`is`/`as`, "
+                           "§17.4) to reach `" + std::string(ma.member) +
+                           "` there, or add `" + std::string(ma.member) +
+                           "` to `" + std::string(targetType->name) +
+                           "`'s own declaration (§11.2) if every conforming "
+                           "type should provide it")
+                        : (std::string("no member `") + std::string(ma.member) +
+                           "` on type `" + std::string(targetType->name) +
+                           "` (§11.3, §12.1)"));
             // fix #2328 (§26.5, v0.236): if `currentCallArity_ >= 0` the
             // arity-aware `lookupExtensionMember` calls above silently
             // returned null (no candidate with the call's arity), and the
