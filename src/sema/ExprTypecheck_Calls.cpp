@@ -37580,6 +37580,50 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     std::move(bare);
             }
         }
+        // fix #8022 (§2.2, §2.7, v0.355): a QUALIFIED built-in static class
+        // head — `System.IO.Path`, `sio.Path`, `System.Environment` — is a
+        // NAME, not a value. The three admission arms below stamp it with the
+        // builtin's TypeSymbol so that the enclosing access can read its
+        // static members, and the enclosing access then REWRITES the head to
+        // the BARE spelling (the #7996 head rewrite above). That rewrite is
+        // what makes `System.IO.Path.Combine(..)` and `sio.Path.Combine(..)`
+        // behave exactly like the bare `Path.Combine(..)`.
+        //
+        // But when the qualified name is the WHOLE expression — `var x :=
+        // System.IO.Path;` — there is NO enclosing access, so no rewrite
+        // happens: the name reaches codegen still qualified, matches no
+        // built-in static-call arm, lowers to NOTHING, and the statement is
+        // SILENTLY DROPPED (the #2434 "failed to lower" warning, exit 0).
+        // MEASURED on the pre-fix code: `import System.IO;` + `var x :=
+        // System.IO.Path;` compiled, ran, and printed "after" — the
+        // statement was gone. §2.2: "The alias is an additional qualifier,
+        // not a rename"; §2.7 rule 2: the qualified spelling denotes the
+        // SAME entity as the bare one — so the two spellings must not differ
+        // in WHETHER they speak. The module-qualified arms below report
+        // "module `M` has no public type `X`" for a name the module does not
+        // home, and a built-in static class is a NAME, not a TYPE, so the
+        // same message is what a qualified static class used as a VALUE must
+        // get. (The bare `var x := Path;` is the pre-existing sibling of
+        // this shape — a class name used as a value — and stays as it is.)
+        //
+        // The qualified head is legal in exactly ONE shape: where a static
+        // member may be READ — the RECEIVER of an enclosing member access
+        // (`System.IO.Path.Combine(..)`), or the CALLEE of a call
+        // (`System.IO.Path(..)`, which the §17.7 arm refuses with its own
+        // message). `maTargetHint_` is the enclosing access's TARGET pointer
+        // and is set exactly while that target is visited, so during the
+        // resolution of a member access `ma`, `maTargetHint_ == &ma` iff `ma`
+        // IS that receiver; `calleeOfCallCtx_` is the call's callee pointer
+        // and is set exactly while the callee is visited, so
+        // `calleeOfCallCtx_ == &ma` iff `ma` IS that callee. Anywhere else
+        // the qualified name is a VALUE, and a value that names a class must
+        // be REFUSED, not silently dropped.
+        const auto admitsBuiltinStaticClassHead =
+            [&](std::string_view member, std::string_view homeModule) {
+                if (builtinStaticClassHomeOf(member) != homeModule)
+                    return false;
+                return maTargetHint_ == &ma || calleeOfCallCtx_ == &ma;
+            };
         // Case (a) + (b): target is a bare identifier (alias or module name).
         if (auto* iid =
                 dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
@@ -37631,7 +37675,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // outcome. The stamp below is the one the bare identifier gets
                 // (`ExprTypecheck_Exprs.cpp`'s builtin-class arm), so the
                 // enclosing access resolves the same member.
-                if (builtinStaticClassHomeOf(ma.member) == modName) {
+                if (admitsBuiltinStaticClassHead(ma.member, modName)) {
                     ctx_.setExprSymbol(&ma, builtinClassSym(ma.member));
                     return;
                 }
@@ -37726,7 +37770,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // enclosing access's own rewrite (above) then makes the
                     // head the bare spelling, so every consumer downstream
                     // sees it exactly as it sees `Environment.GetInt(..)`.
-                    if (builtinStaticClassHomeOf(ma.member) == name) {
+                    if (admitsBuiltinStaticClassHead(ma.member, name)) {
                         ctx_.setExprSymbol(&ma, builtinClassSym(ma.member));
                         return;
                     }
@@ -37861,7 +37905,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // lookup, the §22.5 named-argument binder, the §7 nullability
                 // gate, the closed-surface reject, and codegen's static-call
                 // ladder — sees it exactly as it sees `File.Exists(..)`.
-                if (builtinStaticClassHomeOf(ma.member) == partialMod) {
+                if (admitsBuiltinStaticClassHead(ma.member, partialMod)) {
                     ctx_.setExprSymbol(&ma, builtinClassSym(ma.member));
                     return;
                 }
