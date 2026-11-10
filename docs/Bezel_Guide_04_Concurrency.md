@@ -174,7 +174,7 @@ var sizes := await job;                              //   inputs chunk-copied at
                                                      //   results in input order
 ```
 
-First fault cancels remaining work and surfaces at the await as `DomainFaultedException` (stdlib §6.12). `Reduce`'s combiner must be associative with the seed as its identity (stdlib §6.12).
+First fault cancels remaining work and surfaces at the await as `DomainFaultedException` — as its subclass `DomainFailedException` when that fault was a failure, so that an `IFailure` arm takes it (stdlib §6.12). `Reduce`'s combiner must be associative with the seed as its identity (stdlib §6.12).
 
 **Free-range tasks** — start several, settle them together — are the exception, and the §2 holder discipline is the whole trick: name every task.
 
@@ -233,7 +233,7 @@ using var j3 := Domain.Spawn(Bump, counter);             // ERROR: a class argum
 
 The diagnostics name the failing rule. The fixes are always the same two moves: own what crosses (`OwningDictionary`, an `owned` field) or copy value-shaped data.
 
-Joins are ordinary tasks of the spawning domain: a class result crosses as a Pattern B award, a value result as a copy. A fault in the entry surfaces at the join as `DomainFaultedException` carrying the original message and stack-trace *text* — exception objects themselves do not cross (spec §30.14). Async entries are the natural form: the runtime awaits the entry's task inside the spawned domain, exactly as it drives an `async Main`.
+Joins are ordinary tasks of the spawning domain: a class result crosses as a Pattern B award, a value result as a copy. A fault in the entry surfaces at the join as `DomainFaultedException` carrying the original message and stack-trace *text* — exception objects themselves do not cross (spec §30.14). Its kind does cross: a failure in the child is joined as `DomainFailedException`, a `DomainFaultedException` that an `IFailure` arm also takes, and a bug in the child is joined as the plain class, which that arm lets pass (Guide 2 §4). Async entries are the natural form: the runtime awaits the entry's task inside the spawned domain, exactly as it drives an `async Main`.
 
 ---
 

@@ -363,7 +363,7 @@ rep("C6", CG, "§5.9, the `Double`/`Float` `Parse` line",
 
 rep("C7", CG, "§6, *Declaring, throwing and catching an exception type*",
     "Derive from `Exception` (or any built-in exception type) and chain the message to the base; a caught exception is a **borrow** valid inside its arm only, so copy out what you keep.\n\n```bezel\npublic class ConfigError(message: string): Exception(message)\nend ConfigError;",
-    "Derive from `Exception` (or any built-in exception type) and chain the message to the base; list `IFailure` when the condition comes from outside the program, since an unmarked class is a defect report (§31.4); a caught exception is a **borrow** valid inside its arm only, so copy out what you keep.\n\n```bezel\npublic class ConfigError(message: string): Exception(message), IFailure\nend ConfigError;")
+    "Derive from `Exception` (or any built-in exception type) and chain the message to the base; list `IFailure` when the condition comes from outside the program, since an unmarked class is a defect report (§31.4) — only where nothing in the base chain but `Exception` is a built-in or stdlib class, so a failure class derives from `Exception` directly (or from a failure type such as `IOException`, which needs no listing); a caught exception is a **borrow** valid inside its arm only, so copy out what you keep.\n\n```bezel\npublic class ConfigError(message: string): Exception(message), IFailure\nend ConfigError;")
 
 ins("C8", CG, "§6, a new idiom after the exception-wrapping paragraph",
     "never retained (§31.4); there is no user `InnerException`.",

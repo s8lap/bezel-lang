@@ -302,7 +302,7 @@ end Greet;
 
 `?.` reads through a possibly-null value, `??` supplies a default, and a postfix `!` asserts non-null.
 
-**Exceptions** are for the unexpected. A `catch` has comma-separated arms, matched in order:
+**Exceptions** are for the unexpected, and are of two kinds: a *failure* (a missing file, bad input), whose class implements `IFailure`, and a *defect* report, which is a bug. `IFailure => …` is the arm that takes every failure and no bug. A `catch` has comma-separated arms, matched in order:
 
 ```bezel
 try
