@@ -8251,6 +8251,326 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
     return false;
 }
 
+// ============================================================================
+// fix #7963 / #7974 (spec §28.3 / §28.3.3 / §28.8.1, v0.355) — the two
+// file-local helpers the new arms share.
+//
+// (1) `moveMarkerBorrowOperand` — the operand of a `move` marker that sits at
+//     a TRANSFER POSITION and names a BORROW-STATE LOCAL.
+//
+//     THE RULE. §28.8.1 (s28_3_0020), quoted by the arm that already enforces
+//     it for a plain PARAMETER (Ownership_Checks.cpp's `recordMovesIn`):
+//     "`move` is not admitted on a borrow — the marker asserts an ownership
+//     transfer, but a PLAIN PARAMETER (one declared without the `owned`
+//     modifier — `w: T`, not `owned w: T`) carries no obligation to transfer."
+//     The same sentence governs a borrow-state LOCAL: the marker asserts a
+//     transfer, and a local holding a borrow has no obligation to transfer.
+//     §28.3.3's second half says the same thing from the state-match side
+//     ("Assigning … an owned value to a borrowed-state LHS … is rejected"),
+//     and §22.3 lists "the marker on a borrow" among the marker's spelling
+//     errors.
+//
+//     THE GAP. `recordMovesIn`'s arm recognises the borrow only in its
+//     PARAMETER shape. A borrow-state LOCAL reached `markMovedByName` with no
+//     complaint — that function's arms cover MovedFrom / Disposed / `using
+//     var` / maybe-consumed, and NOT the Borrowed state — so the `move`
+//     marker produced a binding the pass then classified as an OWNED producer
+//     (`producerState` classifies any `move` of a class-typed operand Owned)
+//     over a value nobody owned.
+//
+//     MEASURED on the base (r30-c1 @ 758e406c), all three plain forms compile
+//     rc=0 with zero ownership diagnostics:
+//       `var a := h.En!; var b := move a;`            (the binding form)
+//       `var a := h.En!; var b := move a ?? G.It();`   (the `??` form)
+//       `var t := this.En!; return move t;`            (the return form)
+//     while the IF-ARM form — `var b := (if c then move a else G.It());` — is
+//     ALREADY rejected, by the K3.4 marked-arm machinery, with "the arm
+//     transfer marker `move a` requires a named owned binding — `a` is not an
+//     owned binding at this point (§28.3 K3.4, v0.209)". That is the WORKING
+//     TWIN: the SAME rule and the SAME §28.3 K3.4 authority, reached through
+//     the arm machinery. This arm is the plain-binding / `??` / return twin.
+//
+//     THE PREDICATE, in four conjuncts:
+//       (1) the expression's TRANSFER POSITION is a `move` marker whose
+//           operand is a bare identifier — the transfer position is the
+//           marker itself, or (for the `??` form) the `??`'s LEFT operand,
+//           which is where A.7's primary-level `move` prefix lands (A.7
+//           `MoveExpr ::= "move" PrimaryExpr`, so `move a ?? x` parses as
+//           `(move a) ?? x`);
+//       (2) the operand names a LOCAL whose tracked state is BORROWED — a live
+//           borrow, so it carries no obligation to transfer;
+//       (3) that local is an ALIAS OF A VALUE SOMEONE ELSE IN THIS FRAME
+//           STILL OWNS — the pass's own `disposeAliasSource` fact, the §28.6
+//           "it is a borrow (an alias) of `X`, which still owns it" alias
+//           source. The BORROWED state ALONE is not the same thing: the pass
+//           tracks a BORROWED state for several shapes that carry no
+//           obligation to transfer (a BOX-typed local, a collection-LITERAL
+//           local, a `CancellationToken`, a borrow of a plain PARAMETER), and
+//           the existing suite pins every one of those `move`s as ACCEPTED.
+//           The four measured shapes are listed at the conjunct itself;
+//       (4) the operand is NOT a MOVE-ONLY VALUE TYPE (§15.3's owning inline
+//           array, §35.4's owning choice): for those the bare `move` is the
+//           NORMAL — and, for a plain (non-`owned`) parameter, the only
+//           meaningful — way to transfer, and their "Borrowed" state is an
+//           artefact of the value-type classification, not a borrow.
+//
+//     A PARAMETER operand is EXCLUDED: `recordMovesIn`'s own arm already
+//     rejects a plain parameter's `move`, with its own wording, and this arm
+//     must not report the same store twice.
+//
+// (2) `isEnumeratorHeadType` — is this type at one of the four ITERATOR-FORMAT
+//     ENUMERATOR heads (`IEnumerator<T>`, `IOwningEnumerator<T>`,
+//     `IAsyncEnumerator<T>`, `IOwningAsyncEnumerator<T>`)? The authority is
+//     `common::isIterFormatEnumeratorHead`, the ONE registry predicate for
+//     that family (BuiltinRegistry's own header names it the membership test
+//     for "the four ITERATOR-FORMAT ENUMERATOR heads").
+// ============================================================================
+namespace {
+
+// §17.8: peel EVERY `!` layer. `lookThroughForceUnwrap` (Ownership_Checks.cpp)
+// peels one; `producerState`'s own null-forgiving arm peels every layer
+// ("Nested `E!!` peels every layer"), and the `!` spelling is transparent, so
+// a classifier that must see the underlying PLACE has to see through all of
+// them.
+const ast::Expr* peelForceUnwraps(const ast::Expr* e) {
+    const ast::Expr* cur = e;
+    while (cur) {
+        const ast::Expr* next = lookThroughForceUnwrap(cur);
+        if (!next || next == cur) break;
+        cur = next;
+    }
+    return cur;
+}
+
+const ast::IdentifierExpr* moveMarkerBorrowOperand(
+    const ast::Expr& e, sema::SemaContext& ctx,
+    const std::function<const LocalOwnership*(const ast::IdentifierExpr&)>&
+        stateOf) {
+    // (1) the transfer position.
+    const ast::Expr* core = &e;
+    if (const auto* be = dynamic_cast<const ast::BinaryExpr*>(core)) {
+        if (be->op == "??" && be->left) core = be->left.get();
+    }
+    const auto* un = dynamic_cast<const ast::UnaryExpr*>(core);
+    if (!un || un->op != "move" || !un->operand) return nullptr;
+    // §17.8: the `!` spelling is transparent — `move x!` is `move x`.
+    const ast::Expr* mop = peelForceUnwraps(un->operand.get());
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(mop);
+    if (!id) return nullptr;
+    // (2) the operand names a LOCAL …
+    sema::Symbol* sym = ctx.exprSymbol(*id);
+    if (!sym || !dynamic_cast<sema::LocalSymbol*>(sym)) return nullptr;
+    // … whose tracked state is BORROWED …
+    const LocalOwnership* st = stateOf(*id);
+    if (!st || st->state != OwnershipState::Borrowed) return nullptr;
+    // … AND WHICH IS AN ALIAS OF A VALUE SOMEONE ELSE IN THIS FRAME STILL
+    //     OWNS — `disposeAliasSource`, the pass's OWN §28.6 "it is a borrow
+    //     (an alias) of `X`, which still owns it" fact (OwnershipState.hpp).
+    //     This conjunct is what makes the rule say what §28.3.7 says. The
+    //     BORROWED state ALONE is not the same thing: the pass tracks a
+    //     BORROWED state for several shapes that carry no obligation to
+    //     transfer and whose `move` is legal.
+    //
+    //     MEASURED on the base (r30-c1 @ 758e406c) — four shapes the BORROWED
+    //     state alone would have rejected, and that the existing suite pins as
+    //     ACCEPTED:
+    //       * `var s: Object := new Res(); var y: Object := move s;` — the
+    //         marked transfer into an `Object`-typed (BOX) local; the pass
+    //         tracks `y` BORROWED because a box carries no obligation
+    //         (§28.9), but `y` OWNS the value the transfer handed it.
+    //       * `var a: Array<int> := [1,2,3]; var il: IList<int> := move a;`
+    //         — a collection LITERAL local; the literal is CONTEXT-TYPED
+    //         (§15.4) so the pass cannot classify the production and tracks
+    //         the local BORROWED, while §28.3's producers table makes it the
+    //         OWNER and `move a` is §28.3.7's sanctioned transfer.
+    //       * `var tok: CancellationToken := cts.Token; var t2 := move tok;`
+    //         — a `CancellationToken` carries NO disposal obligation at all
+    //         (stdlib §6.1), so there is nothing to transfer.
+    //       * `var t := x; var y := move t;` — `x` a PLAIN (unconstrained
+    //         generic) PARAMETER: `t` is a borrow of a borrow, and the
+    //         pass cannot know whether the substituted value is a class.
+    //     Each of those has NO alias source — none of them is an alias of an
+    //     owner in this frame — so the `disposeAliasSource` conjunct excludes
+    //     exactly them, and keeps the issue's own shapes: a borrow of an
+    //     `owned` FIELD (`var a := this.En!;`, `var a := h.B!;`) and a borrow
+    //     of an owned LOCAL (`var a := ownedLocal;`) both record one.
+    //
+    //     The two rules now agree by construction: §28.6 rejects a
+    //     `Dispose()` through such an alias, and §28.3.7 / §28.8.1 reject a
+    //     `move` marker on it — "the marker asserts an ownership transfer,
+    //     and a local holding a borrow carries no obligation to transfer".
+    if (!st->disposeAliasSource) return nullptr;
+    // (3) … and is not a MOVE-ONLY VALUE TYPE, whose `move` is a sanctioned
+    // transfer (§15.3 / §35.4).
+    const sema::TypeRef* t = ctx.exprType(*id);
+    const char* moKind = nullptr;
+    if (common::isMoveOnlyValueType(t, ctx, moKind)) return nullptr;
+    if (auto cv = common::classifyChoiceType(t, ctx))
+        if (*cv == common::ChoiceClassification::Owning) return nullptr;
+    return id;
+}
+
+// The §28.8.1 diagnostic for a `move` on a borrow, in the wording the
+// plain-PARAMETER twin already uses ("`move` is not admitted on a borrow: …
+// carries no obligation to transfer; …"), with the parameter clause replaced
+// by the local one. // per §28.3 / §28.8.1, v0.355
+std::string moveNotAdmittedOnBorrowMessage(const ast::IdentifierExpr& id) {
+    return std::string("`move` is not admitted on a borrow: `") +
+           std::string(id.name) +
+           "` is a borrow and carries no obligation to transfer; write `var y "
+           ":= " +
+           std::string(id.name) +
+           "` (a plain borrow) or transfer from an `owned` source (§28.3 / "
+           "§28.8.1)";
+}
+
+// §29.3 / §28.3: the four ITERATOR-FORMAT ENUMERATOR heads.
+bool isEnumeratorHeadType(const sema::TypeRef* t) {
+    return t && t->kind == sema::TypeRef::Kind::Named &&
+           common::isIterFormatEnumeratorHead(t->headName());
+}
+
+// fix #7963 (§28.3.3 / §28.3 *State match on reassignment*, v0.355): the
+// LHS states that REQUIRE AN OWNED RHS.
+//
+// §28.3.3 (v0.350) opens "Assigning a borrow to an owned-state LHS, or an
+// owned value to a borrowed-state LHS, is rejected" and then enumerates the
+// LHS states BY NAME, in "By LHS state":
+//   1. "an **owned-state** LHS requires an owned RHS — a fresh producer, or a
+//      named owned binding under the explicit transfer marker";
+//   2. "A **moved-from** LHS is an owned-state LHS holding no live value: it
+//      requires an owned RHS and displaces nothing";
+//   3. "An **explicitly-disposed** LHS requires an owned RHS too and displaces
+//      a **logically disposed** value".
+// So a borrow RHS is a violation at a MOVED-FROM and at an EXPLICITLY-DISPOSED
+// slot exactly as it is at an OWNED one — the two extra states are the same
+// rule, not a new one. The v1 arm of this fix read only `Owned`, so the
+// "dispose first, then store the borrow" and "move the slot out, then store
+// the borrow" spellings fell through it. MEASURED on the base (r30-c1 @
+// 758e406c): every one of the issue's own `a03` / `a08` / `a09` / `a11` /
+// `a22` / `a26` / `a27` / `a36` / `a44` probes compiled rc=0 with zero
+// ownership diagnostics.
+//
+// A BORROWED-state LHS is NOT in this list — §28.3's borrowed-state bullet
+// requires a borrow (or `null`) RHS, and that is the MIRROR arm's business.
+// A POLYNULL / UNINITIALIZED / UNCLASSIFIED LHS is not in it either: §28.3's
+// adoption clause admits an RHS of either classification there.
+//
+// The name the diagnostic uses for the LHS's state.
+const char* enumeratorSlotStateName(OwnershipState s) {
+    switch (s) {
+        case OwnershipState::MovedFrom: return "MOVED-FROM";
+        case OwnershipState::Disposed: return "DISPOSED";
+        default: return "OWNED";
+    }
+}
+
+// fix #7963 (§28.3.3 / §28.3 *State match on reassignment*, v0.355): the
+// mixed-write diagnostic for the ENUMERATOR family's §28.3.3 slot. ONE
+// wording, used by the method-scope arm and the lambda-body arm alike, so
+// the two spellings of the same store answer alike.
+//
+// The OWNED-state + owned-field-read case reproduces the v1 wording BYTE
+// FOR BYTE — that arm's own test rows key on it.
+std::string enumeratorBorrowStoreMessage(const std::string& name,
+                                         OwnershipState state,
+                                         const std::string& fieldName,
+                                         bool fieldRead) {
+    const char* stateName = enumeratorSlotStateName(state);
+    if (fieldRead) {
+        return std::string("cannot assign the borrow of `") + fieldName +
+               "` to `" + name + "`: `" + name + "` is in the " + stateName +
+               " state and the right-hand "
+               "side is a BORROW of `" +
+               fieldName +
+               "` — §28.3's state match on reassignment "
+               "requires an owned-state LHS to receive an "
+               "owned value (a fresh producer, or a named "
+               "owned binding under the explicit transfer "
+               "marker `x := move y`); storing the borrow "
+               "would make `" +
+               name +
+               "` dispose a value it does not own. Bind the "
+               "borrow to a separate local instead";
+    }
+    return std::string("cannot assign a BORROW to `") + name + "`: `" + name +
+           "` is in the " + stateName +
+           " state and the right-hand side is a BORROW "
+           "— §28.3's state match on reassignment "
+           "requires an owned-state LHS to receive an "
+           "owned value (a fresh producer, or a named "
+           "owned binding under the explicit transfer "
+           "marker `x := move y`); storing the borrow "
+           "would make `" +
+           name +
+           "` dispose a value it does not own. Bind the "
+           "borrow to a separate local instead";
+}
+
+// fix #7963 (§28.3.3 / §28.3 *State match on reassignment*, v0.355): is the
+// assignment's RHS a BORROW for the ENUMERATOR family's §28.3.3 slot?
+//
+// TWO shapes, and only two, because the general "any borrow RHS" question is
+// issue #4846's (a new reject rule over the whole corpus, with its own
+// blast-radius measurement) and is deliberately NOT taken here:
+//
+//   (a) an OWNED-FIELD READ — §28.3's Producers table: "Field access `obj.f`
+//       where `f` is `owned` | Borrowed (source: `obj`)". The transparent `!`
+//       is peeled (§17.8: `x!` is "exactly as the bare read `x` is"), so
+//       `this.En!` and `this.En` answer alike.
+//
+//   (b) an ARM-MEET (an `if`/`case` expression) with at least one
+//       OWNED-FIELD-READ arm — §28.3's arm-meet row: the meet of a borrow
+//       arm with anything else is not an owned meet, so the value the store
+//       would install is not an owned value (it is a borrow, or the mixed
+//       meet §28.3 K7.3 rejects outright). MEASURED on the base: the issue's
+//       own `a40` probe — `a := (if i mod 2 = 0 then this.En! else
+//       G.Gen().GetEnumerator());` — compiled rc=0, leaked 2000 B / 50
+//       allocations, and the store's own `producerState` says BORROWED (the
+//       meet is not owned).
+//
+// `isOwnedFieldRead` is the CALLER's `exprIsOwnedFieldRead` (§28.3, issue
+// #398) — passed in rather than re-derived, so the two spellings of the
+// "owned field read" question cannot drift (LANE_RULES §6).
+template <typename F>
+bool enumeratorFamilyRhsIsBorrow(const ast::Expr& rhs, sema::SemaContext& ctx,
+                                 F&& isOwnedFieldRead, std::string& fieldName,
+                                 bool& isFieldRead, SourceLocation& site) {
+    const ast::Expr* core = peelForceUnwraps(&rhs);
+    // (a) the owned-field read.
+    if (core && isOwnedFieldRead(*core)) {
+        isFieldRead = true;
+        if (sema::Symbol* fs = ctx.exprSymbol(*core))
+            fieldName = std::string(fs->name);
+        site = core->span.begin;
+        return true;
+    }
+    // (b) the arm-meet with an owned-field-read arm.
+    auto armIsOwnedFieldRead = [&](const ast::Expr* arm) -> bool {
+        if (!arm) return false;
+        const ast::Expr* ac = peelForceUnwraps(arm);
+        return ac && isOwnedFieldRead(*ac);
+    };
+    if (const auto* c = dynamic_cast<const ast::ConditionalExpr*>(core)) {
+        if (armIsOwnedFieldRead(c->thenValue.get()) ||
+            armIsOwnedFieldRead(c->elseValue.get())) {
+            site = core->span.begin;
+            return true;
+        }
+    }
+    if (const auto* ce = dynamic_cast<const ast::CaseExpr*>(core)) {
+        for (const auto& arm : ce->arms)
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression &&
+                armIsOwnedFieldRead(arm.exprBody.get())) {
+                site = core->span.begin;
+                return true;
+            }
+    }
+    return false;
+}
+
+}  // namespace
+
 void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
                                       bool fromLambdaBody) {
     // #1066 / §9.7 (v0.153): `var b := new Bag([…])` from a temporary is a
@@ -8721,6 +9041,25 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
             }
         }
     }
+    // fix #7974 (§28.3 / §28.8.1, v0.355): a `move` marker on a BORROW-STATE
+    // LOCAL is not admitted — the marker asserts an ownership transfer, and a
+    // local holding a borrow carries no obligation to transfer. The
+    // plain-PARAMETER twin of this rule already lives in `recordMovesIn`
+    // (Ownership_Checks.cpp), and the IF-ARM twin in the K3.4 marked-arm
+    // machinery; this is the plain-binding / `??` twin. Run BEFORE
+    // `recordMovesIn` below so the operand's state is still the BORROWED one
+    // the predicate reads (a recorded move would have made it MovedFrom).
+    // See `moveMarkerBorrowOperand`'s header for the predicate, its four
+    // conjuncts and its exclusions. // per §28.3 / §28.8.1
+    if (ld.initializer) {
+        if (const ast::IdentifierExpr* mid = moveMarkerBorrowOperand(
+                *ld.initializer, ctx_,
+                [&](const ast::IdentifierExpr& id) -> const LocalOwnership* {
+                    return lookupStateFor(id);
+                }))
+            report(Severity::Error, mid->span.begin,
+                   moveNotAdmittedOnBorrowMessage(*mid));
+    }
     // Slice O8: if the initializer involves `move this.field`, mark
     // the field as moved-from (the move side-effect happens at
     // initializer evaluation time, regardless of the local's `using`
@@ -9028,8 +9367,36 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
             // compile-time rejection and needs its own accept-side sweep —
             // filed as a follow-up (issue TBD, see commit body) rather than
             // folded in here.
-            if (exprIsOwnedFieldRead(*ld.initializer)) {
-                if (sema::Symbol* fsym = ctx_.exprSymbol(*ld.initializer))
+            // fix #7963 (§17.8 / §28.6, v0.355): the `!` spelling is
+            // TRANSPARENT, so the owned-field read it wraps must be recognised
+            // here exactly as the bare read is. §17.8 (v0.350): "Over a named
+            // owned binding, `x!` is therefore classified by its position
+            // exactly as the bare read `x` is" — the `!` "is purely a
+            // type-system assertion" and "does not move, copy, or borrow
+            // beyond what reading `x` already does".
+            //
+            // The test above matched the BARE spelling only, so a local bound
+            // to the `!`-spelled read of an `owned` field (`var a :=
+            // this.En!;` — the shape an `owned IEnumerator<T>?` field forces,
+            // because the field is nullable) recorded NO alias source: the
+            // local was then a borrow the pass could not name, and §28.6's
+            // "Dispose() through a borrow is a compile error" had nothing to
+            // fire on. MEASURED on the base (r30-c1 @ 758e406c): the bare
+            // spelling `var a := this.En; a!.Dispose();` is REJECTED ("cannot
+            // call `Dispose()` on `a`: it is a borrow (an alias) of `En`,
+            // which still owns it"), while the `!` spelling `var a :=
+            // this.En!; a.Dispose();` compiles clean — the SAME rule, two
+            // spellings, two answers. The class-typed twin shows the same
+            // split (`var a := this.R;` rejected, `var a := this.R!;`
+            // accepted), so this is the `!` and not the enumerator.
+            //
+            // `lookThroughForceUnwrap` is the ONE `!`-peel this file already
+            // uses for exactly this question (see the `move x!` / `x!` sites
+            // below), so the two spellings cannot drift. // per §17.8, §28.6
+            const ast::Expr* initCore =
+                peelForceUnwraps(ld.initializer.get());
+            if (initCore && exprIsOwnedFieldRead(*initCore)) {
+                if (sema::Symbol* fsym = ctx_.exprSymbol(*initCore))
                     states_[lsym].disposeAliasSource = fsym;
             }
         }
@@ -9953,6 +10320,23 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // `handleLocalDecl` uses. // per §28.3 K1.3, §28.2, v0.294, #3949
     if (!as.valueHasOwnedMarker && !isTopLevelConsumingForm(*as.value))
         checkRead(*as.value, /*selfTarget=*/false);
+    // fix #7974 (§28.3 / §28.8.1, v0.355): the ASSIGNMENT twin of the
+    // plain-binding / `??` / return twins — a `move` marker on a BORROW-STATE
+    // LOCAL is not admitted: the marker asserts an ownership transfer, and a
+    // local holding a borrow carries no obligation to transfer. `x := move a;`
+    // over a borrow-state `a` gave `x` an OWNED state over a value nobody
+    // owned, so `x`'s scope-end disposal and the real owner's both released
+    // it. See `moveMarkerBorrowOperand`'s header for the predicate, its four
+    // conjuncts and its exclusions. Runs BEFORE `recordMovesIn` below so the
+    // operand's state is still the BORROWED one the predicate reads. // per
+    // §28.3 / §28.8.1
+    if (const ast::IdentifierExpr* mid = moveMarkerBorrowOperand(
+            *as.value, ctx_,
+            [&](const ast::IdentifierExpr& id) -> const LocalOwnership* {
+                return lookupStateFor(id);
+            }))
+        report(Severity::Error, mid->span.begin,
+               moveNotAdmittedOnBorrowMessage(*mid));
     // Slice O15: side-effects in the RHS — `x := move y` should
     // transition y to MovedFrom. recordMovesIn handles `move local`,
     // `move this.field`, and `f(owned z)` in any position.
@@ -10248,6 +10632,54 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                          disposeAliasChainRoot(rsym, states_))
                 aliasSrc = root;
         }
+        // fix #7963 (§17.8 / §28.6, v0.355): the OWNED-FIELD-READ spelling of
+        // the alias source, and the transparent `!` peel.
+        //
+        // THE GAP. The derivation above accepts a BARE-IDENTIFIER RHS only.
+        // It has no `exprIsOwnedFieldRead` fallback, unlike `handleLocalDecl`
+        // (the `var` twin) and `handleLocalConstDecl` (the `const` twin),
+        // which both carry one. And the v1 commit added the `!`-peel — §17.8
+        // (v0.350): "Over a named owned binding, `x!` is therefore classified
+        // by its position exactly as the bare read `x` is"; the `!` "is
+        // purely a type-system assertion" and "does not move, copy, or borrow
+        // beyond what reading `x` already does" — at the DECLARATION site
+        // ONLY (Ownership.cpp, `handleLocalDecl`'s own site). So the SAME
+        // rule answered differently at the two spellings:
+        //
+        //   §28.6 (v0.350) "Dispose() through a borrow is a compile error":
+        //     DECLARATION spelling `var a := this.En!; a.Dispose();`
+        //       → REJECTED ("cannot call `Dispose()` on `a`: it is a borrow
+        //         (an alias) of `En`, which still owns it");
+        //     ASSIGNMENT spelling `a := this.En!; a.Dispose();`
+        //       → ACCEPTED — the SAME rule, two spellings, two answers.
+        //
+        // MEASURED on the base (r30-c1 @ 758e406c): the assignment spelling
+        // compiles rc=0 with zero ownership diagnostics, and the program then
+        // disposes a frame the FIELD still owns (§28.5). The class-typed
+        // twin splits the same way (`var a := this.R!; a.Dispose();`
+        // rejected, `a := this.R!; a.Dispose();` accepted), so this is the
+        // `!` and the SPELLING, not the enumerator.
+        //
+        // THE FALLBACK, in the two steps the declaration site already uses:
+        //   (1) peel EVERY `!` layer (§17.8) — `peelForceUnwraps`, the same
+        //       peel `producerState` uses ("Nested `E!!` peels every layer");
+        //   (2) `exprIsOwnedFieldRead` — the §28.3 authority that answers
+        //       from the leaf field's `owned` modifier, and the SAME one
+        //       `handleLocalDecl` / `handleLocalConstDecl` use (LANE_RULES §6:
+        //       reuse, don't re-derive).
+        //
+        // WHY IT IS SAFE HERE. `disposeAliasSource` is COMPILE-TIME ONLY: it
+        // is read by exactly one consumer — `checkDisposeReceiverOwnership`
+        // (Ownership.cpp), which rejects a `.Dispose()` through a borrow — and
+        // `grep -rn "disposeAliasSource" src/ --include=*.cpp --include=*.hpp`
+        // finds no reader outside `src/ownership/`. So the change cannot move
+        // a runtime disposal count; it can only ADD a compile-time rejection
+        // of the `Dispose()`-through-a-borrow spelling.
+        if (!aliasSrc) {
+            const ast::Expr* rhsCore = peelForceUnwraps(as.value.get());
+            if (rhsCore && exprIsOwnedFieldRead(*rhsCore))
+                aliasSrc = ctx_.exprSymbol(*rhsCore);
+        }
         for (auto& [sym, st] : states_) {
             if (!refersTo(sym, *id)) continue;
             // §22.3 + §28.8: assigning an owned value to an `out owned`
@@ -10485,25 +10917,29 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // SAME diagnostic the straight-line twin draws — same text, same
             // site (the RHS), same severity.
             bool stateMatchRejected = false;
+            // fix #7963 (§28.3.3 / §28.3 *State match on reassignment*,
+            // v0.355): the RHS's SELF-READ and the target's MOVE-ONLY kind
+            // are HOISTED out of the `Owned`-state block below, because the
+            // ENUMERATOR family's §28.3.3 arm — which reaches the MOVED-FROM
+            // and EXPLICITLY-DISPOSED slots too (§28.3.3's "By LHS state" list,
+            // items 2 and 3) — reads both, and it lives OUTSIDE that block.
+            // The values are unchanged: the same `lookThroughForceUnwrap` peel
+            // (`t := t!` reads the same slot) and the same SYMBOL-identity
+            // comparison `scanGetterReturns`'s own `isSelfAssignment` does.
+            const ast::Expr* rhs = lookThroughForceUnwrap(as.value.get());
+            const auto* rid = dynamic_cast<const ast::IdentifierExpr*>(rhs);
+            bool selfRead = false;
+            if (rid) {
+                sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                sema::Symbol* tsym = ctx_.exprSymbol(*id);
+                selfRead = rsym && tsym && rsym == tsym;
+            }
+            // (3-exclusion) a move-only VALUE type keeps §15.3's no-op.
+            const char* moKind = nullptr;
+            bool moveOnlyTarget =
+                common::isMoveOnlyValueType(ctx_.exprType(*as.target), ctx_,
+                                            moKind);
             if (st.state == OwnershipState::Owned && !as.valueHasOwnedMarker) {
-                // (2) the RHS is the unmarked read of THIS binding. Peel a
-                // force-unwrap (`t := t!` reads the same slot) exactly as
-                // `scanGetterReturns`'s own `isSelfAssignment` does; compare by
-                // SYMBOL identity, not by name.
-                const ast::Expr* rhs = lookThroughForceUnwrap(as.value.get());
-                const auto* rid =
-                    dynamic_cast<const ast::IdentifierExpr*>(rhs);
-                bool selfRead = false;
-                if (rid) {
-                    sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-                    sema::Symbol* tsym = ctx_.exprSymbol(*id);
-                    selfRead = rsym && tsym && rsym == tsym;
-                }
-                // (3-exclusion) a move-only VALUE type keeps §15.3's no-op.
-                const char* moKind = nullptr;
-                bool moveOnlyTarget =
-                    common::isMoveOnlyValueType(ctx_.exprType(*as.target), ctx_,
-                                                moKind);
                 if (selfRead && !moveOnlyTarget)
                     report(Severity::Error, as.target->span.begin,
                            std::string("cannot self-assign `") +
@@ -10607,6 +11043,160 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                         stateMatchRejected = true;
                     }
                 }
+            }
+            // fix #7963 (§28.3.3 first half / §28.3 *State match on
+            // reassignment*, v0.355): a BORROW assigned into an OWNED-STATE
+            // ENUMERATOR local.
+            //
+            // §28.3.3 (v0.350), verbatim: "Assigning a borrow to an
+            // owned-state LHS, or an owned value to a borrowed-state LHS,
+            // is rejected — the mismatch would silently drop or
+            // double-hold a disposal obligation." §28.3's item 1 spells
+            // the owned-state half: "an owned-state LHS requires an owned
+            // RHS — a fresh producer, or a named owned binding under the
+            // explicit transfer marker (`x := move y;`)".
+            //
+            // WHY THE ENUMERATOR FAMILY, AND WHY THIS RHS SPELLING. The
+            // other-binding arm above enforces the rule for a BARE
+            // IDENTIFIER read of another binding, and it gates on
+            // `isBorrowableOwnedSinkType` — which reads every
+            // declaration-less builtin head (the `IEnumerator<T>` /
+            // `IOwningEnumerator<T>` heads among them) as NOT
+            // borrow-bearing. So neither half of §28.3.3 reached an
+            // enumerator-typed binding: the bare-identifier RHS was
+            // skipped by the type gate, and the MEMBER-READ RHS (a read of
+            // an `owned` field — the spelling an `owned IEnumerator<T>?`
+            // field forces, the field being nullable) was skipped by the
+            // arm's own "the RHS is a bare identifier" shape test.
+            //
+            // MEASURED on the base (r30-c1 @ 758e406c), all of these
+            // compile rc=0 with zero ownership diagnostics:
+            //   `var a := G.Gen().GetEnumerator(); a := this.En!;`  (an
+            //     owned-state enumerator local receiving a borrow of an
+            //     `owned` enumerator field — the issue's own `a01`
+            //     probe)
+            //   `public method Y(owned e: IEnumerator<int>) e := this.En!;`
+            //     (the same violation through an `owned` PARAMETER — the
+            //     issue's own `a08` / `a10` probes)
+            // and the resulting local then disposed the frame the FIELD
+            // still owns (§28.5) — the double-dispose the issue names.
+            //
+            // THE PREDICATE, in three conjuncts:
+            //   (1) the LHS is at an ENUMERATOR head
+            //       (`isEnumeratorHeadType`), which is the issue's own
+            //       scope ("an owned-state enumerator local");
+            //   (2) the LHS is a tracked binding in a state that REQUIRES AN
+            //       OWNED RHS — §28.3.3's "By LHS state" list: the OWNED
+            //       state (item 1), the MOVED-FROM state (item 2: "A
+            //       **moved-from** LHS is an owned-state LHS holding no live
+            //       value: it requires an owned RHS and displaces nothing"),
+            //       and the EXPLICITLY-DISPOSED state (item 3: "An
+            //       **explicitly-disposed** LHS requires an owned RHS too and
+            //       displaces a **logically disposed** value"). The v1 arm of
+            //       this fix read only the OWNED state, so the "dispose
+            //       first, then store the borrow" and "move the slot out,
+            //       then store the borrow" spellings fell through it;
+            //   (3) the RHS is a BORROW — `enumeratorFamilyRhsIsBorrow`
+            //       (this file's file-local helper): an OWNED-FIELD READ with
+            //       the transparent `!` peeled (§17.8; the field's owner
+            //       still owns the value, so the read is a borrow), or an
+            //       ARM-MEET with an owned-field-read arm (§28.3's arm-meet
+            //       row — the issue's own `a40` probe). The GENERAL "any
+            //       borrow RHS" question is issue #4846's and is NOT taken
+            //       here.
+            // A MARKED transfer is excluded by the `!as.valueHasOwnedMarker`
+            // condition — `x := move y;` is §28.3's sanctioned spelling, and
+            // `handleMarkedOwnedAssignment` owns that position.
+            //
+            // SCOPE. The GENERAL §28.3.3 first half — the same rule for
+            // every type, and for the other RHS spellings — is issue
+            // #4846's (a new reject rule over the whole corpus, with its
+            // own blast-radius measurement). This arm is the enumerator
+            // family's instance of it, which is what #7963 asks for.
+            //
+            // THE DIAGNOSTIC reuses the other-binding arm's own §28.3
+            // state-match wording above (the same sentence, the same
+            // remedy), with the RHS clause adapted to the member-read
+            // spelling. // per §28.3.3, §28.3, v0.355
+            if (!as.valueHasOwnedMarker && !selfRead && !moveOnlyTarget &&
+                (st.state == OwnershipState::Owned ||
+                 st.state == OwnershipState::MovedFrom ||
+                 st.state == OwnershipState::Disposed) &&
+                isEnumeratorHeadType(ctx_.exprType(*id))) {
+                std::string fname;
+                bool fieldRead = false;
+                SourceLocation site;
+                if (enumeratorFamilyRhsIsBorrow(
+                        *as.value, ctx_,
+                        [this](const ast::Expr& e) { return exprIsOwnedFieldRead(e); },
+                        fname, fieldRead, site)) {
+                    report(Severity::Error, site,
+                           enumeratorBorrowStoreMessage(
+                               std::string(id->name), st.state, fname,
+                               fieldRead));
+                    // fix #8328 (§28.3 *State match on reassignment*,
+                    // v0.355): the store is REJECTED, so it never happens
+                    // — see the flag's own comment.
+                    stateMatchRejected = true;
+                }
+            }
+            // fix #7963 (§28.3.3 second half / §28.3 *State match on
+            // reassignment*, v0.355): an OWNED value assigned into a
+            // BORROWED-STATE ENUMERATOR local — the MIRROR of the arm above,
+            // and the issue's own "(or the reverse)".
+            //
+            // §28.3.3 (v0.350), verbatim: "Assigning a borrow to an
+            // owned-state LHS, or an owned value to a borrowed-state LHS, is
+            // rejected — the mismatch would silently drop or double-hold a
+            // disposal obligation." §28.3's item 1 spells the borrowed-state
+            // half: "a borrowed-state LHS requires a borrow (or `null`) RHS".
+            //
+            // THE PREDICATE, in three conjuncts:
+            //   (1) the LHS is a BORROWED-STATE tracked binding — a live
+            //       borrow, so it has no disposal obligation and no ownership
+            //       to give;
+            //   (2) the LHS is at an ENUMERATOR head
+            //       (`isEnumeratorHeadType`), the issue's own scope;
+            //   (3) the RHS is an OWNED value — `producerState` says Owned
+            //       (a fresh producer: a `new`, an owned-returning call, an
+            //       iterator factory, …). A `null` RHS is PolyNull and a
+            //       borrow is Borrowed, so neither reaches this arm: §28.3's
+            //       "a borrowed-state LHS requires a borrow (or `null`) RHS"
+            //       is satisfied by both and they stay accepted.
+            // A MARKED transfer is excluded (`!as.valueHasOwnedMarker`): the
+            // `owned` marker has its own arm (`handleMarkedOwnedAssignment`,
+            // which rejects a marked transfer into a BORROWED-state target
+            // with its own wording), and the bare `move` marker is #7974's
+            // rule, checked in `handleAssignment`'s own RHS arm above.
+            //
+            // MEASURED on the base (r30-c1 @ 758e406c):
+            // `var a := this.En!; a := G.It();` — `a` is a borrow-state
+            // enumerator local, `G.It()` is an OWNED producer (the iterator
+            // convention's announced caller-owned frame, §29.3) — compiles
+            // rc=0 with zero ownership diagnostics, and the local then
+            // disposes a frame it does not own.
+            //
+            // SCOPE. As above: the GENERAL mirror half is issue #4846's.
+            // // per §28.3.3, §28.3, v0.355
+            if (st.state == OwnershipState::Borrowed && !as.valueHasOwnedMarker &&
+                isEnumeratorHeadType(ctx_.exprType(*id)) &&
+                producerState(*as.value) == OwnershipState::Owned) {
+                report(Severity::Error, as.value->span.begin,
+                       std::string("cannot assign an owned value to `") +
+                           std::string(id->name) +
+                           "`: `" + std::string(id->name) +
+                           "` is in the BORROWED state, and §28.3's state match "
+                           "on reassignment requires a borrowed-state LHS to "
+                           "receive a borrow (or `null`) RHS — an owned value "
+                           "handed to a borrow slot would leave the value with "
+                           "no owner to dispose it, and the borrow the slot "
+                           "does hold would be dropped on the floor. Bind the "
+                           "owned value to its own local, or take the borrow "
+                           "with `move`");
+                // fix #8328 (§28.3 *State match on reassignment*, v0.355): the
+                // store is REJECTED, so it never happens — see the flag's own
+                // comment.
+                stateMatchRejected = true;
             }
             // fix #4329 (§28.3 / §28.7 / O4 silent-poison design, v0.298): at a
             // non-loop `if … then` / no-else merge, `joinInto`'s catch-all sets
@@ -11816,6 +12406,28 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // silently marked moved-from by handleDischarge's `move` arm. A no-op unless
     // the return type is `owned` and the expression is `move <borrow>`. // per §28.6
     if (checkOwnedReturnBorrowSource(e)) return;
+    // fix #7974 (§28.3 / §28.8.1, v0.355): the RETURN twin of the
+    // plain-binding / `??` twins in `handleLocalDecl` / `handleAssignment` —
+    // a `move` marker on a BORROW-STATE LOCAL is not admitted at a return
+    // position either: the marker asserts an ownership transfer, and a local
+    // holding a borrow carries no obligation to transfer. `return move t;`
+    // over a borrow-state `t` handed the caller a value the pass then
+    // classified as an OWNED producer, so the caller disposed a frame its
+    // real owner still disposes. MEASURED on the base (r30-c1 @ 758e406c):
+    // `var t := this.En!; return move t;` compiles rc=0.
+    //
+    // Runs AFTER `checkOwnedReturnBorrowSource` above (which owns the
+    // `owned`-return-type spelling of the same rule and returns early on
+    // rejection) and BEFORE `handleDischarge` below, so the operand's state
+    // is still the BORROWED one the predicate reads. See
+    // `moveMarkerBorrowOperand`'s header for the predicate, its four
+    // conjuncts and its exclusions. // per §28.3 / §28.8.1
+    if (const ast::IdentifierExpr* mid = moveMarkerBorrowOperand(
+            e, ctx_, [&](const ast::IdentifierExpr& id) -> const LocalOwnership* {
+                return lookupStateFor(id);
+            }))
+        report(Severity::Error, mid->span.begin,
+               moveNotAdmittedOnBorrowMessage(*mid));
     // For `move x` return arm: covered by handleDischarge inside
     // the expression — but we also call it here.
     handleDischarge(e);
@@ -14440,6 +15052,70 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                                    "both reachable");
                         if (!suppressDiag_) st.state = OwnershipState::Poisoned;
                         break;
+                    }
+                    // fix #7963 (§28.3.3 first half / §28.3 *State match on
+                    // reassignment*, v0.355): the ENUMERATOR family's §28.3.3
+                    // MIXED-WRITE slot, in the LAMBDA-BODY spelling.
+                    //
+                    // THE GAP. The new §28.3.3 arms live in
+                    // `MethodOwnership::handleAssignment`. A lambda body's
+                    // `AssignmentStmt` is handled by THIS arm — a different
+                    // and deliberately NARROWER one (see this arm's own
+                    // header: "Deliberately NARROW: only `checkRead` … +
+                    // `recordMovesIn` … — NOT the full `handleAssignment`").
+                    // The dataflow that drives `handleAssignment` never
+                    // enters a lambda body (see `applyUsingVarBorrowPinInLambdas`),
+                    // so the §28.3.3 mixed-write slot was OPEN in the lambda
+                    // spelling — the same rule, two spellings, two answers.
+                    //
+                    // MEASURED on the base (r30-c1 @ 758e406c): the issue's
+                    // own lambda probes `a21_lambda_fresh_then_field` and
+                    // `a23_lambda_join` compile rc=0 with zero ownership
+                    // diagnostics and LEAK 4000 B / 100 allocations each —
+                    // the fresh producer the lambda bound is displaced by a
+                    // borrow of a frame its owner still holds.
+                    //
+                    // DELIBERATELY NARROW: this arm gains the §28.3.3
+                    // MIXED-WRITE CHECK and NOTHING ELSE.
+                    // `handleAssignment`'s other work — the escape checks,
+                    // the field-store escape, the ref/out capture check — is
+                    // deliberately NOT ported; this arm's own header
+                    // explains why (those three are METHOD-scoped, and
+                    // calling the full `handleAssignment` here ran them a
+                    // SECOND time at the wrong scope and broke a banked row).
+                    //
+                    // THE PREDICATE is the method-scope arm's, verbatim: an
+                    // enumerator-head LHS in a state that REQUIRES AN OWNED
+                    // RHS (§28.3.3's "By LHS state" list: Owned, MovedFrom,
+                    // Disposed), receiving a BORROW
+                    // (`enumeratorFamilyRhsIsBorrow`). The state transition
+                    // below is SKIPPED when the store is rejected: a
+                    // rejected store never happens (fix #8328), so the
+                    // binding keeps the value — and the ownership STATE — it
+                    // held.
+                    if (as->value && !as->valueHasOwnedMarker &&
+                        (st.state == OwnershipState::Owned ||
+                         st.state == OwnershipState::MovedFrom ||
+                         st.state == OwnershipState::Disposed) &&
+                        isEnumeratorHeadType(ctx_.exprType(*tid))) {
+                        std::string fname;
+                        bool fieldRead = false;
+                        SourceLocation site;
+                        if (enumeratorFamilyRhsIsBorrow(
+                                *as->value, ctx_,
+                                [this](const ast::Expr& e) {
+                                    return exprIsOwnedFieldRead(e);
+                                },
+                                fname, fieldRead, site)) {
+                            report(Severity::Error, site,
+                                   enumeratorBorrowStoreMessage(
+                                       std::string(tid->name), st.state, fname,
+                                       fieldRead));
+                            // The store is REJECTED, so it never happens:
+                            // skip the state transition below and keep the
+                            // binding's value and state (fix #8328).
+                            break;
+                        }
                     }
                     // fix #4216 (§28.3/§28.7/§30.14, v0.298): the consume-
                     // site freeze — a live local borrow of the value THIS
