@@ -1,0 +1,21 @@
+# Candidate comparison — bounds: vars=3 len=4 features=static --block [v0.355 base] [holder destructor reads its borrow] --body 2
+baseline: 2078070 programs, 507678 accepted; 297831 accepted programs contain a K4.3 store; VIOLATIONS 0; K4.3 race residuals 6462
+baseline trust surface (accepted programs in which some run reads a dead or foreign object THROUGH A STORED BORROW): 32598 = race 6438 + fault on every run 26160 + fault on some run 0
+baseline flag surface (accepted programs that fault on every / some run, any cause): 26856 / 0   (38.0 s)
+
+| candidate | accepted | newly accepted | newly unsound | newly rejected | …race | …fault every run (holder/local) | …fault some run (holder/local) | …never fault: a dangling stored borrow exists, unread / no dangling borrow at all | left: race through a stored borrow | left: fault through a stored borrow (every/some) | left: accepted programs with an untracked K4.3 store | witness (clean rejection) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| B  derived retention (idealised) + sharp owner-outlives | 489258 | 0 | 0 | 18420 | 3468 | 13638/0 | 0/0 | 282 / 1032 | 2970 | 12522/0 | 117492 | `new a / fmove b a / newk c b / fstm a b` |
+| A  borrow-bearing classes (announced kills unfrozen) | 473352 | 0 | 0 | 34326 | 6438 | 25692/0 | 0/0 | 288 / 1908 | 0 | 468/0 | 0 | `new a / fmove b a / newk c b / fstm a b` |
+| A-static  borrow-bearing classes, Dispose frozen under a live holder | 472806 | 0 | 0 | 34872 | 6438 | 25692/0 | 0/0 | 288 / 2454 | 0 | 468/0 | 0 | `new a / fmove b a / newk c b / fstm a b` |
+| D  stricter freeze alone (Dispose frozen under any live local borrow) | 507678 | 0 | 0 | 0 | 0 | 0/0 | 0/0 | 0 / 0 | 6438 | 26160/0 | 297831 | `` |
+| A+D | 472806 | 0 | 0 | 34872 | 6438 | 25692/0 | 0/0 | 288 / 2454 | 0 | 468/0 | 0 | `new a / fmove b a / newk c b / fstm a b` |
+| E  strict mode (every K4.3 admission an error) | 209847 | 0 | 0 | 297831 | 6444 | 26160/144 | 0/0 | 288 / 264795 | 0 | 0/0 | 0 | `new a / link a` |
+
+- B: residual witnesses — every: `new a / newp b a / asg a`; race: `new a / newp b a / send a`
+- A: residual witnesses — every: `new a / fbrw b a / fst a / newk c b`
+- A-static: residual witnesses — every: `new a / fbrw b a / fst a / newk c b`
+- D: residual witnesses — every: `new a / newk b a / asg a`; race: `new a / newk b a / send a`
+- A+D: residual witnesses — every: `new a / fbrw b a / fst a / newk c b`
+
+(259.2 s)

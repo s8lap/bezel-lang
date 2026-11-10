@@ -1,0 +1,18 @@
+# Candidate comparison — bounds: vars=3 len=4 features=static [v0.355 base]
+baseline: 75306 programs, 24501 accepted; 11742 accepted programs contain a K4.3 store; VIOLATIONS 0; K4.3 race residuals 12
+baseline trust surface (accepted programs in which some run reads a dead or foreign object THROUGH A STORED BORROW): 36 = race 12 + fault on every run 24 + fault on some run 0
+baseline flag surface (accepted programs that fault on every / some run, any cause): 36 / 0   (1.3 s)
+
+| candidate | accepted | newly accepted | newly unsound | newly rejected | …race | …fault every run (holder/local) | …fault some run (holder/local) | …never fault: a dangling stored borrow exists, unread / no dangling borrow at all | left: race through a stored borrow | left: fault through a stored borrow (every/some) | left: accepted programs with an untracked K4.3 store | witness (clean rejection) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| B  derived retention (idealised) + sharp owner-outlives | 24405 | 0 | 0 | 96 | 6 | 12/0 | 0/0 | 72 / 6 | 6 | 12/0 | 4392 | `new a / newk b a / move c a / disp b` |
+| A  borrow-bearing classes (announced kills unfrozen) | 24297 | 0 | 0 | 204 | 12 | 24/0 | 0/0 | 156 / 12 | 0 | 0/0 | 0 | `new a / newk b a / move c a / disp b` |
+| A-static  borrow-bearing classes, Dispose frozen under a live holder | 24273 | 0 | 0 | 228 | 12 | 24/0 | 0/0 | 180 / 12 | 0 | 0/0 | 0 | `new a / newk b a / move c a / disp b` |
+| D  stricter freeze alone (Dispose frozen under any live local borrow) | 24501 | 0 | 0 | 0 | 0 | 0/0 | 0/0 | 0 / 0 | 12 | 24/0 | 11742 | `` |
+| A+D | 24273 | 0 | 0 | 228 | 12 | 24/0 | 0/0 | 180 / 12 | 0 | 0/0 | 0 | `new a / newk b a / move c a / disp b` |
+| E  strict mode (every K4.3 admission an error) | 12759 | 0 | 0 | 11742 | 12 | 24/0 | 0/0 | 1764 / 9942 | 0 | 0/0 | 0 | `new a / link a` |
+
+- B: residual witnesses — every: `new a / newp b a / asg a / pkuse b`; race: `new a / newp b a / send a / pkuse b`
+- D: residual witnesses — every: `new a / newk b a / asg a / kuse b`; race: `new a / newk b a / send a / kuse b`
+
+(7.9 s)

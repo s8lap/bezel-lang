@@ -1,0 +1,19 @@
+# Candidate comparison — bounds: vars=2 len=4 features=static --if [v0.355 base] [holder destructor reads its borrow]
+baseline: 56548 programs, 12732 accepted; 6234 accepted programs contain a K4.3 store; VIOLATIONS 0; K4.3 race residuals 364
+baseline trust surface (accepted programs in which some run reads a dead or foreign object THROUGH A STORED BORROW): 1128 = race 364 + fault on every run 390 + fault on some run 374
+baseline flag surface (accepted programs that fault on every / some run, any cause): 398 / 554   (1.1 s)
+
+| candidate | accepted | newly accepted | newly unsound | newly rejected | …race | …fault every run (holder/local) | …fault some run (holder/local) | …never fault: a dangling stored borrow exists, unread / no dangling borrow at all | left: race through a stored borrow | left: fault through a stored borrow (every/some) | left: accepted programs with an untracked K4.3 store | witness (clean rejection) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| B  derived retention (idealised) + sharp owner-outlives | 12176 | 0 | 0 | 556 | 196 | 212/0 | 128/0 | 16 / 4 | 168 | 178/246 | 1280 | `new a / newk b a / disp b / asg a` |
+| A  borrow-bearing classes (announced kills unfrozen) | 11714 | 0 | 0 | 1018 | 364 | 390/0 | 240/0 | 16 / 8 | 0 | 0/134 | 0 | `new a / newk b a / disp b / asg a` |
+| A-static  borrow-bearing classes, Dispose frozen under a live holder | 11576 | 0 | 0 | 1156 | 364 | 390/0 | 374/0 | 16 / 12 | 0 | 0/0 | 0 | `new a / newk b a / disp b / asg a` |
+| D  stricter freeze alone (Dispose frozen under any live local borrow) | 12660 | 0 | 0 | 72 | 0 | 0/4 | 0/68 | 0 / 0 | 364 | 390/374 | 6206 | `` |
+| A+D | 11504 | 0 | 0 | 1228 | 364 | 390/4 | 374/68 | 16 / 12 | 0 | 0/0 | 0 | `new a / newk b a / disp b / asg a` |
+| E  strict mode (every K4.3 admission an error) | 6498 | 0 | 0 | 6234 | 364 | 390/0 | 374/32 | 16 / 5058 | 0 | 0/0 | 0 | `new a / link a` |
+
+- B: residual witnesses — every: `new a / newp b a / asg a`; race: `new a / newp b a / send a`; some: `new a / newp b a / if { / } else { /   asg a / }`
+- A: residual witnesses — some: `new a / newk b a / if { / } else { /   disp a / }`
+- D: residual witnesses — every: `new a / newk b a / asg a`; race: `new a / newk b a / send a`; some: `new a / newk b a / if { / } else { /   asg a / }`
+
+(7.7 s)
