@@ -15398,6 +15398,73 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             TypeRef* elem =
                                 (recvTy && !recvTy->genericArgs.empty())
                                     ? recvTy->genericArgs[0] : nullptr;
+                            // fix #8223 / #8339 (stdlib §5.1 / §2.19, spec §14.2
+                            // *Interface conformance* rules 1 and 2, v0.355): the
+                            // §5.1 aggregation gates must ask "DOES THE ELEMENT
+                            // TYPE CONFORM?" — not "WHAT SHAPE DOES THE ELEMENT
+                            // HAVE?".
+                            //
+                            // THE CONFORMANCE QUESTION, asked ONCE. A Named
+                            // element CONFORMS to `I<Self>` (the self-
+                            // parameterised interface `I`) at THIS
+                            // INSTANTIATION when its base closure reaches `I`
+                            // (spec §14.2 rules 1 and 2 — a class or record that
+                            // LISTS `I` or any interface extending it) AND the
+                            // instantiation the closure reaches is `I<elem>`
+                            // ITSELF (§14.2: `IComparable<Self>`; §12.9:
+                            // `IComparable` is INVARIANT, so `IComparable<int>`
+                            // does NOT satisfy `where T: IComparable<T>` at a
+                            // `K`).
+                            //
+                            // The judgement is §12.9's OWN — the same
+                            // `collectAncestorInstantiationsOf` walk
+                            // (`userRecordComparableAtInstance` /
+                            // `classOrIfaceComparableAtInstance` above, and the
+                            // §12.9 assignment check) — so the aggregation gate
+                            // and the assignment check cannot disagree about
+                            // whether a type conforms. The interface is matched
+                            // by IDENTITY against the builtin symbol (#1867's
+                            // convention: `isSynthesizedBuiltinInterface` — so a
+                            // USER interface named `INumber` is a DIFFERENT type
+                            // and does not answer yes, §2.8.3 rule 3), and the
+                            // type argument by `typeRefEqual` (§14.2's exact,
+                            // component-wise, invariant identity).
+                            //
+                            // The "unknown: keep" branch (an EMPTY `impls` —
+                            // a closure the walk cannot compose, e.g. an
+                            // IMPORTED type whose symbol carries no parallel
+                            // `baseTypeRefs` entry) is the conservative position
+                            // the two IComparable twins take: the NAME answer
+                            // stands.
+                            auto elemConformsToSelfInterface =
+                                [&](const TypeRef* e,
+                                    TypeSymbol* ifaceSym) -> bool {
+                                if (!e || e->nullable ||
+                                    e->kind != TypeRef::Kind::Named ||
+                                    !e->declaration || !ifaceSym)
+                                    return false;
+                                // The NAME question: does the element's base
+                                // closure reach the interface at all (§14.2
+                                // rules 1 and 2)?
+                                if (!inheritsBuiltinInterface(e->declaration,
+                                                               ifaceSym->name))
+                                    return false;
+                                // The INSTANTIATION question: at `e`'s OWN type
+                                // arguments, does the closure reach
+                                // `ifaceSym<e>`?
+                                std::vector<TypeRef*> impls;
+                                collectAncestorInstantiationsOf(e, ifaceSym,
+                                                               impls);
+                                if (impls.empty()) return true;  // unknown: keep
+                                for (TypeRef* impl : impls) {
+                                    if (!impl ||
+                                        impl->genericArgs.size() != 1)
+                                        continue;
+                                    const TypeRef* ga = impl->genericArgs[0];
+                                    if (ga && typeRefEqual(ga, e)) return true;
+                                }
+                                return false;
+                            };
                             // stdlib §5.1 (#1194): no-selector Min()/Max() returns
                             // the element type T (`public method Max(): T`). For a
                             // PTR-typed IComparable<T> element — a user class
@@ -15885,26 +15952,133 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // constraint gate fires here at sema and emits a
                             // diagnostic that names the constraint and the
                             // offending element type, mirroring the IComparable
-                            // gate for Min/Max above. Class/interface elements
-                            // defer per §14.2 (the constraint is checked at
-                            // instantiation), so `class Meters: INumber<Meters>`
-                            // is admitted there.
+                            // gate for Min/Max above.
+                            //
+                            // fix #8223 / #8339 / #8285 (stdlib §5.1 / §2.19,
+                            // spec §14.2 *Interface conformance* rules 1, 2 and
+                            // 6, v0.355): the gate above asks WHAT SHAPE the
+                            // element has; it must ask WHETHER THE ELEMENT
+                            // TYPE CONFORMS. Three shapes were answered by
+                            // their shape:
+                            //   * a CLASS / INTERFACE element was ADMITTED on
+                            //     the ground that "the constraint is checked at
+                            //     instantiation (§14.2)". A CONCRETE receiver
+                            //     has NO instantiation, so the check never
+                            //     happened and codegen lowered the call
+                            //     through the PRIMITIVE accumulator path
+                            //     (`add i32, ptr`) — MEASURED: "Both operands
+                            //     to a binary operator are not of the same
+                            //     type!" and an IR-verification abort (#8339).
+                            //   * a USER RECORD conformer (`record Money:
+                            //     INumber<Money>`) was REFUSED: a record is
+                            //     NEITHER a class NOR an interface, so it fell
+                            //     to the refusal even though §14.2 rule 2
+                            //     admits it ("records ... implementing it") —
+                            //     MEASURED: "`Money` does not conform to
+                            //     `INumber<Money>`" (#8223).
+                            //   * a TYPE PARAMETER element was ADMITTED
+                            //     UNCONDITIONALLY (the "unresolved placeholder"
+                            //     arm), so a body whose `T` guarantees nothing
+                            //     was accepted and lowered per instantiation —
+                            //     MEASURED at `T = string`: "add i32 %17, ptr
+                            //     %16" and an IR-verification abort (#8285).
                             bool noSelectorKeyed = false;
                             if (ce.args.empty() && elem) {
                                 bool inumberAdmit = false;
+                                // Does the element CONFORM to `INumber<Self>` at
+                                // this instantiation? §14.2 rule 1 (a class or
+                                // interface that LISTS it), rule 2 (a record that
+                                // implements it). Recorded SEPARATELY from the
+                                // admission, because a CLASS / INTERFACE
+                                // conformer SATISFIES the constraint and is
+                                // still not admitted — the §5.1 fold has no
+                                // lowering for it (see the arm below), and the
+                                // diagnostic must say WHICH of the two it is.
+                                bool inumberConforms = false;
                                 // Eleven §2.19 INumber conformer primitives.
                                 if (elem->kind == TypeRef::Kind::Primitive &&
                                     !elem->nullable &&
                                     isNoSelectorAggregationElem(elem->primitive))
                                     inumberAdmit = true;
-                                // Class/interface: defer to instantiation (§14.2).
+                                // fix #8223 (stdlib §5.1 / §2.19, spec §14.2
+                                // rule 2, v0.355): a USER RECORD that CONFORMS
+                                // to `INumber<Self>` — §14.2 rule 2 admits
+                                // "records ... implementing it", and §11.8 models
+                                // the no-selector `Sum(): owned T` as the
+                                // accumulation `acc := T.Zero(); acc := acc +
+                                // el` over the CONFORMER's own static members.
+                                // Codegen's #8223 arm lowers exactly that fold
+                                // (the record's `Zero()` and its `operator +`,
+                                // graded per position), so the gate and the
+                                // lowering agree.
+                                //
+                                // ⚠ THE CONFORMER MUST REALLY CONFORM: the
+                                // type argument must be the record ITSELF
+                                // (§14.2's `IComparable<Self>` shape; §12.9:
+                                // `INumber` is INVARIANT), which is what
+                                // `elemConformsToSelfInterface` asks.
+                                else if (elem->kind == TypeRef::Kind::Named &&
+                                         elem->declaration &&
+                                         !elem->nullable &&
+                                         elem->declaration->kind ==
+                                             ast::TypeDeclKind::Record &&
+                                         elemConformsToSelfInterface(
+                                             elem, ctx_.builtinInterfaceSym(
+                                                       "INumber"))) {
+                                    inumberAdmit = true;
+                                    inumberConforms = true;
+                                }
+                                // fix #8285 (stdlib §5.1, spec §3.6 rule 2 /
+                                // §14.2 rule 6, v0.355): a TYPE PARAMETER in
+                                // scope is decided by the parameter's OWN
+                                // constraints (§14.2 rule 6: "T is a type
+                                // parameter whose constraints guarantee
+                                // conformance to I"), NOT by the placeholder's
+                                // shape. An UNCONSTRAINED parameter guarantees
+                                // nothing (`linqElemIsUnconstrainedTypeParam`),
+                                // and a CONSTRAINED one whose declared clauses do
+                                // not reach `INumber<P>` guarantees nothing
+                                // either (`linqElemTypeParamClauseUnsatisfied`
+                                // — §14.2 rule 6's own walk, the same one the
+                                // §26.5.1 applicability filter reads, so the
+                                // filter and this gate cannot disagree). Both
+                                // are REFUSED here.
+                                //
+                                // A parameter whose clauses cannot be READ is
+                                // UNDECIDED and the call is KEPT (the sound
+                                // direction) — `linqElemTypeParamClauseUnsatisfied`
+                                // reports exactly that.
+                                else if (linqElemIsInScopeTypeParam(elem)) {
+                                    if (linqElemIsUnconstrainedTypeParam(elem))
+                                        inumberAdmit = false;
+                                    else
+                                        inumberAdmit =
+                                            !linqElemTypeParamClauseUnsatisfied(
+                                                elem, "where T: INumber<T>");
+                                }
+                                // fix #8339 (stdlib §5.1 / §2.19, spec §14.2
+                                // rules 1 and 2, v0.355): a CLASS / INTERFACE
+                                // element is NOT admitted by its shape. §14.2
+                                // rule 1 admits a class that lists
+                                // `INumber<Self>` — the conformance question is
+                                // asked and ANSWERED below — but codegen's §5.1
+                                // fold has no arm for a class element (it
+                                // lowers the ELEVEN §2.19 primitives and the
+                                // #8223 RECORD arm), so admitting one emits the
+                                // same malformed IR the refusal replaces. The
+                                // refusal is the sound position.
                                 else if (elem->kind == TypeRef::Kind::Named &&
                                          elem->declaration &&
                                          (elem->declaration->kind ==
                                               ast::TypeDeclKind::Class ||
                                           elem->declaration->kind ==
-                                              ast::TypeDeclKind::Interface))
-                                    inumberAdmit = true;
+                                              ast::TypeDeclKind::Interface)) {
+                                    inumberAdmit = false;
+                                    inumberConforms =
+                                        elemConformsToSelfInterface(
+                                            elem, ctx_.builtinInterfaceSym(
+                                                      "INumber"));
+                                }
                                 // Generic-parameter placeholder — the TypeRef
                                 // is unresolved (no Declaration, no Kind::
                                 // Primitive / Named at the level the gate
@@ -15937,19 +16111,50 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                                    TypeRef::Kind::Named &&
                                                elem->declaration) {
                                         elemName = elem->declaration->name;
+                                    } else if (linqElemIsInScopeTypeParam(elem)) {
+                                        // fix #8285: a TYPE PARAMETER element is
+                                        // named by its own spelling (§14.1 — "A
+                                        // type parameter has no qualified
+                                        // spelling"), so the diagnostic says
+                                        // `T`, not `<element>`.
+                                        elemName = std::string(elem->headName());
                                     } else {
                                         elemName = "<element>";
                                     }
-                                    ctx_.diagnostics().report(
-                                        Severity::Error, ce.span.begin,
+                                    // fix #8339 / #8223: TWO messages, because
+                                    // TWO different facts can hold. A class /
+                                    // interface that does NOT list
+                                    // `INumber<Self>` fails the constraint
+                                    // (the #4730 wording, unchanged); a class /
+                                    // interface that DOES list it SATISFIES
+                                    // §14.2 rule 1 and is refused only because
+                                    // the §5.1 fold has no lowering for it —
+                                    // saying "does not conform" there would be
+                                    // false.
+                                    std::string msg =
                                         std::string("Sum() requires the "
                                                     "element type to satisfy "
                                                     "`T: INumber<T>` "
                                                     "(stdlib §5.1 / spec "
                                                     "§2.19 / #4730); `") +
+                                        elemName + "` ";
+                                    if (inumberConforms)
+                                        msg +=
+                                            "DOES conform to `INumber<" +
                                             elemName +
-                                            "` does not conform to `INumber<" +
-                                            elemName + ">`.");
+                                            ">`, but the §5.1 `Sum()` fold has "
+                                            "no lowering for a CLASS or "
+                                            "INTERFACE element — it lowers the "
+                                            "ELEVEN §2.19 primitive conformers "
+                                            "and a VALUE-TYPE record conformer "
+                                            "(stdlib §2.19, spec §11.8). Use "
+                                            "Sum(selector: (" +
+                                            elemName + ") -> U) instead.";
+                                    else
+                                        msg += "does not conform to `INumber<" +
+                                               elemName + ">`.";
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin, msg);
                                     return;
                                 }
                                 // No-selector result-type keying:
@@ -15993,6 +16198,28 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // `Min(): T` / `Max(): T` -- the result is `T`.
                                 if (!noSelectorKeyed && ce.args.empty() &&
                                     linqElemIsInScopeTypeParam(elem)) {
+                                    ctx_.setExprType(&ce, elem);
+                                    noSelectorKeyed = true;
+                                }
+                                // fix #8223 (stdlib §5.1, spec §11.8 / §14.2
+                                // rule 2, v0.355): the no-selector `Sum()` is
+                                // `public method Sum(): owned T` over
+                                // `where T: INumber<T>` — so for a USER RECORD
+                                // CONFORMER the result is the CONFORMER ITSELF
+                                // (`Money`), not the `int` default below. The
+                                // gate above admitted the conformer; without
+                                // this keying the call fell to `int` and
+                                // `s.Cents` on the result was refused with a
+                                // conversion diagnostic.
+                                if (!noSelectorKeyed && ce.args.empty() &&
+                                    m == "Sum" && elem &&
+                                    elem->kind == TypeRef::Kind::Named &&
+                                    elem->declaration && !elem->nullable &&
+                                    elem->declaration->kind ==
+                                        ast::TypeDeclKind::Record &&
+                                    elemConformsToSelfInterface(
+                                        elem, ctx_.builtinInterfaceSym(
+                                                  "INumber"))) {
                                     ctx_.setExprType(&ce, elem);
                                     noSelectorKeyed = true;
                                 }
