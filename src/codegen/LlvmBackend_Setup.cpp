@@ -18905,7 +18905,28 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             // (11373), which already reads `headName()` with no such conjunct.
             bool initIsArray = initTR &&
                 initTR->kind == sema::TypeRef::Kind::Named &&
-                common::isArrayEnumeratorWrapSourceName(initTR->headName());
+                // fix #8257 (§29.2 / stdlib §4.19, v0.355): read the SOURCE
+                // head through the DUAL-SHAPE authority (`builtinTypeName`),
+                // not through `headName()`. A `FrozenArray<T>` reaches this
+                // site in TWO TypeRef shapes: the ANNOTATION shape (a
+                // declaration-less Named with an `astNode`, whose head
+                // `headName()` reads) and the stdlib §4.19 `From(...)`
+                // factory-result shape (`declaration =
+                // builtinClassSym("FrozenArray")` — a non-null declaration
+                // with no TypeDecl and no module, no `astNode` and no
+                // `importedName`, so `headName()` reads EMPTY for it). The
+                // registry's wrap-source predicate is name-keyed, so the
+                // factory shape was INVISIBLE to it: the raw `bz_array_t*` was
+                // stored in the `IEnumerable<T>` local and the following
+                // for-in vtable-dispatched on the array's first word (a
+                // SEGV in `main`). `builtinTypeName` is the SAME dual-shape
+                // read `isCollectionTypeName` already uses for this exact
+                // two-shape problem, and it is strictly narrower than
+                // `headName()` for the shapes that are not builtins: an
+                // IMPORTED USER class reads as "" here (so a user class named
+                // `Array` cannot reach the wrap), where `headName()` read its
+                // imported name.
+                common::isArrayEnumeratorWrapSourceName(builtinTypeName(initTR));
             // fix #1069 / stdlib §4.10 / §29.2: a `Set<T>`/`OwningSet<T>` bound to
             // an explicit `IEnumerable<T>` local, mirroring the buildOrderedArgs
             // and RETURN splits (wrapAsIEnumerableForTarget). A CLASS-element set

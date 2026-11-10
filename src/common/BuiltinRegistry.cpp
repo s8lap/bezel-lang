@@ -166,9 +166,26 @@ constexpr std::array<std::string_view, 6> kBuiltinForInEnumerableHeads = {
 // the collection heads that take the ARRAY-ENUMERATOR wrap. Deliberately NOT
 // `kArrayBackedCollections`: see the header for why `Set`/`OwningSet` (hash
 // backing → snapshot) and `SortedSet` (§4.18 ordered iteration) must stay out.
-constexpr std::array<std::string_view, 7> kArrayEnumeratorWrapSources = {
+//
+// fix #8257 (stdlib §4.19, v0.355): `FrozenArray<T>` joins this family. It is
+// the same `bz_array_t*` rep as `Array<T>` (fix #3249's row in
+// `kArrayBackedCollections` below), so its elements ARE the dense element array
+// the plain array enumerator walks — there is no hash table to snapshot (the
+// `Set`/`OwningSet` reason) and no order to preserve (the `SortedSet` reason).
+// stdlib §4.19 declares `public class FrozenArray<T>: IEnumerable<T>`, so a
+// `FrozenArray<T>` widened to `IEnumerable<T>` is enumerated by exactly the
+// enumerator an `Array<T>` is; handing the callee the raw `bz_array_t*`
+// instead made the callee's for-in vtable-dispatch on the array's first word
+// (a SEGV).
+//
+// It was out of this family ONLY because it had no construction form to reach
+// the coercion with — the pin's own rationale ("`FrozenArray` has no `new`
+// form to reach the coercion with"). fix #3249 gave it the stdlib §4.19
+// `From(...)` overloads, so the reason is gone.
+constexpr std::array<std::string_view, 8> kArrayEnumeratorWrapSources = {
     "Array", "OwningArray", "OwningBuffer",
     "Stack", "OwningStack", "Queue", "OwningQueue",
+    "FrozenArray",
 };
 
 // fix #3419 / §29.2 / §29.11 / §28.6: the SIX iterator-format HEADS that the

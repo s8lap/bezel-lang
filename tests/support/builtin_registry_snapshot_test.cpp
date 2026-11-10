@@ -349,19 +349,27 @@ BEZEL_TEST(builtin_registry_snapshot, builtin_for_in_enumerable_head_set) {
 //     §4.14): the grid's SOURCE-FAMILY axis. The negatives are the whole point
 //     of the predicate existing separately from isArrayBackedCollectionName:
 //     `Set`/`OwningSet` over a value element are a generic-key HASH table that
-//     is SNAPSHOTTED rather than wrapped, `SortedSet` is excluded from the wrap
-//     outright (the snapshot is in hash order and would break stdlib §4.18's
-//     ordered-iteration contract), and `FrozenArray` has no `new` form to
-//     reach the coercion with. Both predicates answer truthfully about
-//     overlapping name sets; the DIFFERENCE is asserted here so a later lane
-//     cannot "simplify" one into the other.
+//     is SNAPSHOTTED rather than wrapped, and `SortedSet` is excluded from the
+//     wrap outright (the snapshot is in hash order and would break stdlib
+//     §4.18's ordered-iteration contract). Both predicates answer truthfully
+//     about overlapping name sets; the DIFFERENCE is asserted here so a later
+//     lane cannot "simplify" one into the other.
 BEZEL_TEST(builtin_registry_snapshot, array_enumerator_wrap_source_set) {
-    static constexpr std::array<std::string_view, 7> kSnapshot = {
+    static constexpr std::array<std::string_view, 8> kSnapshot = {
         "Array", "OwningArray", "OwningBuffer",
         "Stack", "OwningStack", "Queue", "OwningQueue",
+        // INTENTIONAL addition (fix #8257, stdlib §4.19, v0.355): FrozenArray<T>
+        // — the same bz_array_t* rep as Array<T> (fix #3249's row in
+        // kArrayBackedCollections), so its elements ARE the dense element array
+        // the plain array enumerator walks: there is no hash table to snapshot
+        // (the Set/OwningSet reason) and no order to preserve (the SortedSet
+        // reason). It was out of this family ONLY because it had no
+        // construction form to reach the coercion with — fix #3249 gave it the
+        // stdlib §4.19 `From(...)` overloads, so the reason is gone.
+        "FrozenArray",
     };
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isArrayEnumeratorWrapSourceName(n));
-    for (std::string_view n : {"Set", "OwningSet", "SortedSet", "FrozenArray",
+    for (std::string_view n : {"Set", "OwningSet", "SortedSet",
                                "LinkedList", "OwningLinkedList", "Dictionary",
                                "OwningDictionary", "SortedDictionary",
                                "IEnumerable", ""})
@@ -370,7 +378,7 @@ BEZEL_TEST(builtin_registry_snapshot, array_enumerator_wrap_source_set) {
     // is a wrap source — the containment is one-way, and that asymmetry is the
     // reason both predicates exist.
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isArrayBackedCollectionName(n));
-    for (std::string_view n : {"Set", "OwningSet", "SortedSet", "FrozenArray"}) {
+    for (std::string_view n : {"Set", "OwningSet", "SortedSet"}) {
         BEZEL_EXPECT_TRUE(isArrayBackedCollectionName(n));
         BEZEL_EXPECT_FALSE(isArrayEnumeratorWrapSourceName(n));
     }

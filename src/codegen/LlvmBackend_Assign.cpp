@@ -10220,7 +10220,27 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // #5308 did for the target axis.
     std::string_view an;
     if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named)
-        an = actualTy->headName();
+        // fix #8257 (§29.2 / stdlib §4.19, v0.355): read the SOURCE head
+        // through the DUAL-SHAPE authority (`builtinTypeName`), not through
+        // `headName()`. A `FrozenArray<T>` reaches this site in TWO TypeRef
+        // shapes: the ANNOTATION shape (a declaration-less Named with an
+        // `astNode`, whose head `headName()` reads) and the stdlib §4.19
+        // `From(...)` factory-result shape (`declaration =
+        // builtinClassSym("FrozenArray")` — a non-null declaration with no
+        // TypeDecl and no module, no `astNode` and no `importedName`, so
+        // `headName()` reads EMPTY for it). The registry's wrap-source
+        // predicate is name-keyed, so the factory shape was INVISIBLE to it:
+        // `actualIsArray` was false, the raw `bz_array_t*` was handed to the
+        // callee as an `IEnumerable<T>`, and the callee's for-in
+        // vtable-dispatched on the array's first word (a SEGV in the callee).
+        //
+        // `builtinTypeName` is the SAME dual-shape read `isCollectionTypeName`
+        // / `isFfiBufferTypeRef` / `isNoOverrideIdentityTypeRef` already use
+        // for exactly this two-shape problem, and it is strictly narrower than
+        // `headName()` for the shapes that are not builtins: an IMPORTED USER
+        // class reads as "" here (so a user class named `Array` cannot reach
+        // the wrap), where `headName()` read its imported name.
+        an = builtinTypeName(actualTy);
     // fix #3419 (§29.2 / stdlib §4.4–§4.5 / §4.11 / §4.14, v0.283): the grid's
     // SOURCE axis. This function is the wrap AUTHORITY, and its own list was
     // still one of four verbatim copies of these seven names (the local-decl

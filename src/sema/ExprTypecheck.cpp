@@ -5581,6 +5581,10 @@ static std::string_view namedTypeSimpleName(const TypeRef*);
 static bool variantGenericAssignable(
     const TypeRef*, const TypeRef*, bool (*)(TypeSymbol*, TypeSymbol*),
     const std::unordered_set<std::string_view>* freeNames);
+// fix #8257 (§5.1, v0.355): `ExprTC::checkAssignable` asks this predicate
+// which BUILTIN-stub source may skip the declared-base walk, and it is
+// defined further down with the modeled-family table it consults.
+static bool builtinBorrowingCollectionFullyModeled(std::string_view name);
 
 // fix #4892 (§5.1, §12.9, v0.307): the reason clause for a conversion whose
 // target head `from` does reach, but only at other type arguments — the
@@ -9242,7 +9246,48 @@ void ExprTC::checkAssignable(
         // ACCEPTS, letting an unrelated `MyBag<Dog>` pass as `IList<Dog>` and a
         // later interface call dispatch through an itable the object lacks (an
         // unsound accept — runtime type confusion).
-        if (from->declaration &&
+        //
+        // fix #8257 (§5.1 / stdlib §4.19, v0.355): a BUILTIN source reaches
+        // this site in TWO TypeRef shapes — the declaration-less ANNOTATION
+        // shape and the synthetic `builtinClassSym` STUB a static factory
+        // result carries (`FrozenArray<int>.From(a)`, which stamps
+        // `declaration = builtinClassSym("FrozenArray")` — a non-null
+        // declaration with NO TypeDecl and NO module). The two are the SAME
+        // built-in type: the house discriminator for "is this a USER type?"
+        // is `isUserDeclaredTypeSym` (Symbol.hpp), and the stub answers
+        // false to it. The stub's DECLARED-BASE list is empty (it is a
+        // compiler-intrinsic TypeSymbol, not a source declaration), so
+        // asking this walk about it found NO base and REJECTED a conversion
+        // stdlib §4.19 declares — `public class FrozenArray<T>:
+        // IEnumerable<T>` — while the annotation twin of the very same type
+        // was admitted. The conformance facts of a builtin live in
+        // `builtinInterfaceAncestors` (the #8103 row), not in a declared-base
+        // list.
+        //
+        // ⇒ BUT the walk is skipped for a builtin stub ONLY when that stub
+        // belongs to a family whose COMPLETE generic-interface set
+        // `builtinInterfaceAncestors` MODELS — i.e. only when the variance
+        // search below is a two-sided proof for it (it FINDS the declared
+        // interface, and — because the family is fully modeled — a candidate
+        // it does NOT find is PROOF of non-conformance, so the search can
+        // reject soundly instead of falling through to the conservative
+        // accept). `builtinBorrowingCollectionFullyModeled` is that predicate.
+        //
+        // ⇒ EVERY OTHER builtin stub — `DateTime`, `Guid`, `Stopwatch`,
+        // `TimeSpan`, `CancellationToken`, `Range`, … — is NOT modeled, so the
+        // variance search below would CONSERVATIVELY ACCEPT it; the walk
+        // must therefore still be asked about it, exactly as before fix #8257,
+        // and its empty declared-base closure is the §5.1 refusal. (Skipping
+        // the walk for those stubs is an UNSOUND widening: it admits
+        // `DateTime` at `IEnumerable<Object>`, and admits `Range<T>` at
+        // `IList<T>`/`IReadOnlyList<T>`/`ICollection<T>`/
+        // `IReadOnlyCollection<T>` — interfaces `Range<T>` does not
+        // implement — which then reaches codegen and emits malformed IR.)
+        const bool fromIsModeledBuiltinStub =
+            from->declaration && !isUserDeclaredTypeSym(from->declaration) &&
+            builtinBorrowingCollectionFullyModeled(
+                namedTypeSimpleName(from));
+        if (from->declaration && !fromIsModeledBuiltinStub &&
             !userTypeImplementsBuiltinIface(from, namedTypeSimpleName(to))) {
             reportNotConvertible();
             return;
@@ -14297,7 +14342,51 @@ static bool variantGenericAssignable(
 
     if (!to->declaration) {
         // `to` is a builtin generic interface (null declaration).
-        if (!from->declaration && !from->genericArgs.empty()) {
+        //
+        // fix #8257 (§5.1 / §12.9 / stdlib §4.19, v0.355): `from` may be a
+        // BUILTIN STUB — a static-factory result whose TypeRef carries
+        // `declaration = builtinClassSym("FrozenArray")` (a non-null
+        // declaration with NO TypeDecl and NO module). Such a stub is the
+        // SAME built-in type as the declaration-less annotation shape (the
+        // house discriminator for "is this a USER type?" is
+        // `isUserDeclaredTypeSym`, and the stub answers false to it — the
+        // #8103 discriminator, applied here), so it belongs in this "both
+        // builtin" search: its interface set is the one
+        // `builtinInterfaceAncestors` models (stdlib §4.19's
+        // `public class FrozenArray<T>: IEnumerable<T>` and NOTHING else).
+        //
+        // Without this, the search never RAN for the §4.19 `From(...)` shape:
+        // it fell through to the conservative accept, so the §5.1 gate
+        // REJECTED a conversion stdlib §4.19 declares while the annotation
+        // twin of the very same type was admitted — the issue's over-
+        // rejection. Running the search for the stub also restores TWIN
+        // PARITY: the §12.9 variance check now applies to the stub exactly
+        // as it does to the annotation twin (so a `FrozenArray<Dog>` is still
+        // refused at an `IEnumerable<Animal>`), and a target the search does
+        // NOT find is still a proof of non-conformance for both twins (the
+        // #8258 rationale, unchanged).
+        //
+        // Restricted to the families whose COMPLETE generic-interface set
+        // `builtinInterfaceAncestors` models — the same sound-reject
+        // precondition the #1851/#8258 rationale rests on. ⇒ For a stub in
+        // one of those families the search is a TWO-SIDED proof: it FINDS the
+        // declared interface, and — because the family is fully modeled — a
+        // candidate it does NOT find is PROOF of non-conformance, so the
+        // search can reject soundly rather than fall through to the
+        // conservative accept. ⇒ For a stub OUTSIDE those families the
+        // search is NOT run at all, and `ExprTC::checkAssignable` keeps the
+        // declared-base walk for it (its declared-base closure is empty, so
+        // the walk refuses it) — the behaviour such a stub had before this
+        // change. ⇒ The restriction is what keeps the modelled set
+        // sound; it is NOT by itself a guarantee that no other stub's
+        // behaviour changes — that follows from the walk staying in force
+        // for the unmodelled ones.
+        const bool fromIsBuiltinStub =
+            from->declaration && !isUserDeclaredTypeSym(from->declaration) &&
+            builtinBorrowingCollectionFullyModeled(
+                namedTypeSimpleName(from));
+        if ((!from->declaration || fromIsBuiltinStub) &&
+            !from->genericArgs.empty()) {
             // `from` is also a builtin.
             std::string_view fromName = namedTypeSimpleName(from);
             if (fromName == toName) {
