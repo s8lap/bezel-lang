@@ -26,4 +26,15 @@ run v3l5             --vars 3 --len 5
 run v3l4_block       --vars 3 --len 4 --block --body 2
 run v3l4_while       --vars 3 --len 4 --while --body 2
 run v3l5_qdtor_r40   --vars 3 --len 5 --qdtor --r40-teardown
+# Critique round 2, note 2 (proposal §4.7): the open refinement of the taken-out rule. Feature set p0212t = p0212r
+# + kdup/kself (a member's owned result over the receiver's own source / over the receiver). `compare --reach` shows
+# 0212 revised, the refinement in its closed form, and the refinement read off the declared type of an open class.
+# 4 variables: the builder must be moved into a fresh binding for the three to differ. 5 statements at 4 variables
+# was not run: it outgrew a 15 GiB machine.
+reach() { tag=$1; shift; $M compare --reach --features p0212t --v0355 "$@" > out/reach_$tag.txt 2>&1; }
+reach v3l4_kdtor     --vars 3 --len 4 --kdtor
+reach v4l4           --vars 4 --len 4
+reach v4l4_kdtor     --vars 4 --len 4 --kdtor
+reach v4l4_kq        --vars 4 --len 4 --kdtor --qdtor
+python3 -I takeout.py --qdtor > out/takeout_v3l4_qdtor.txt 2>&1
 echo DONE > out/DONE

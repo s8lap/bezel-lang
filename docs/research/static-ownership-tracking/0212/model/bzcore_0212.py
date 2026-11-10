@@ -43,6 +43,20 @@ model), extended with three statements, two rule knobs and two machine variants.
                           did `Kid := new Child(this)`), which the body's checker cannot see
   The compare command now shows the note's candidate, 0212 as first drafted, 0212 revised, and the revised oracle.
 
+  CRITIQUE ROUND 2 (the re-critique of revision 2, 4dfa0e331, note 2). Two statements, two knobs and one feature
+  (`takeout`; feature set `p0212t` = `p0212r` + takeout) for the OPEN REFINEMENT of the taken-out rule (proposal
+  §4.7). None of it is proposed text: it measures what the refinement would buy and where it would be unsound.
+    kdup y x      var y := x.Rebuild();        a member of the holder K returns `owned K` built over the holder's OWN
+                                               source (the critic's e01: `Build() => new Report(_c)`): y never borrows x
+    kself y x     var y := x.View();           a member of the holder K returns an owned holder that borrows the RECEIVER
+    takeout_by_reach      the refinement: an owned member result carries the holder's binding only where its type can
+                          reach the holder's class through borrow fields. `kdup`'s cannot, so it carries the holder's
+                          set alone; `kself`'s can, so it still carries the binding
+    reach_declared_only   the refinement read off the DECLARED return type of an OPEN class: `kself`'s declared type
+                          shows no such field and its dynamic class adds one (probe e02), so the binding is dropped
+                          for `kself` too — the model's witness that the test must see every subclass
+  `compare --reach` shows 0212 revised, the refinement, and the declared-only reading.
+
   `selftest0212` runs the worked shapes of the 0212 additions.
 
   The static-ownership-tracking study's docstring follows.
@@ -196,6 +210,8 @@ RULES = dict(
     choice_carries=False,           # 0212 rev 2: a move-only value that owns a holder carries the holder's set
     fmove_carries_holder=False,     # 0212 rev 2, R2: a replacing move's result carries the holder's binding and its set
     hidden_link=False,              # MODEL VARIANT: every R's child is linked back to it at construction (invisible to the checker)
+    takeout_by_reach=False,         # OPEN REFINEMENT (0212 §4.7, not proposed text): a member's owned result carries the holder's binding only where its type can reach the holder's class
+    reach_declared_only=False,      # the refinement read off the declared type of an open class: the binding is dropped for `kself` as well (unsound; probe e02)
 )
 # Overridable predicates for user-defined mutations (see `check --define`). Each receives the
 # checker's inputs and returns the clause's answer; None means "use the kernel's text".
@@ -218,7 +234,7 @@ HOLDER_READS = ('kuse', 'puse', 'pkuse', 'kdtor', 'euse', 'qdtor', 'wuse')
 # A statement's SITE is its position path in the program (a tuple), which also serves as
 # the allocation-site identity of the value a producer at that site mints.
 
-DECL_KINDS = ('new', 'decl', 'using', 'brw', 'move', 'usingm', 'usingb', 'fbrw', 'fmove', 'tbrw', 'newk', 'newp', 'newk2', 'erase', 'newko', 'wrap')
+DECL_KINDS = ('new', 'decl', 'using', 'brw', 'move', 'usingm', 'usingb', 'fbrw', 'fmove', 'tbrw', 'newk', 'newp', 'newk2', 'erase', 'newko', 'wrap', 'kdup', 'kself')
 PIN_KINDS = ('using', 'usingm', 'usingb')
 
 def show(prog, ind=''):
@@ -252,7 +268,7 @@ def key(prog):
 
 def reads(s):
     k = s[0]
-    if k in ('brw', 'move', 'usingm', 'usingb', 'fbrw', 'fmove', 'asgb', 'asgm', 'erase', 'wrap', 'newko'):
+    if k in ('brw', 'move', 'usingm', 'usingb', 'fbrw', 'fmove', 'asgb', 'asgm', 'erase', 'wrap', 'newko', 'kdup', 'kself'):
         return {s[2]}
     if k in ('use', 'disp', 'send', 'throw', 'fst', 'kuse', 'link', 'puse', 'pkuse', 'euse', 'wuse'):
         return {s[1]}
@@ -353,6 +369,16 @@ def carried(y, G):
     if st and st[0] == 'brw':
         for b in st[3]:
             out |= c.get(b, frozenset())
+    return out
+
+def carried_bindings(y, G):
+    """the BINDINGS whose scope bounds what y carries (the `__carryb` side of `carried`)."""
+    cb = G.get('__carryb', {})
+    out = frozenset(cb.get(y, frozenset()))
+    st = G.get(y)
+    if st and st[0] == 'brw':
+        for b in st[3]:
+            out |= cb.get(b, frozenset())
     return out
 
 def frozen(ids, G, live):
@@ -456,7 +482,7 @@ def check_body(prog, path, G, live_out, exc_live, ctx, pre_declared=(), depth=0)
     if RULES['k_dtor_reads'] and (RULES['bbc'] or RULES['derived_retention']):
         ty = dict(ctx.types)
         for s0 in prog:                                 # the owned holders this body declares: their scope-end release runs the destructor
-            if s0[0] in ('newk', 'newp', 'newk2', 'newko'): ty[s0[1]] = TYPES_K; held.add(s0[1])
+            if s0[0] in ('newk', 'newp', 'newk2', 'newko', 'kdup', 'kself'): ty[s0[1]] = TYPES_K; held.add(s0[1])
             elif s0[0] == 'wrap': ty[s0[1]] = TYPES_W; held.add(s0[1])      # the choice's release disposes the K it owns
             elif s0[0] in ('move', 'usingm') and ty.get(s0[2]) in HOLDER_TYPES + (TYPES_W,): ty[s0[1]] = ty[s0[2]]; held.add(s0[1])
             elif s0[0] in DECL_KINDS: ty[s0[1]] = TYPES_R
@@ -469,7 +495,7 @@ def check_body(prog, path, G, live_out, exc_live, ctx, pre_declared=(), depth=0)
             if s0[0] in ('new', 'using'): ty2[s0[1]] = TYPES_R; held.add(s0[1])
             elif s0[0] == 'fmove': ty2[s0[1]] = TYPES_Q; held.add(s0[1])
             elif s0[0] in ('move', 'usingm') and ty2.get(s0[2]) in (TYPES_R, TYPES_Q): ty2[s0[1]] = ty2[s0[2]]; held.add(s0[1])
-            elif s0[0] in ('newk', 'newk2', 'newko'): ty2[s0[1]] = TYPES_K
+            elif s0[0] in ('newk', 'newk2', 'newko', 'kdup', 'kself'): ty2[s0[1]] = TYPES_K
             elif s0[0] == 'wrap': ty2[s0[1]] = TYPES_W
             elif s0[0] == 'newp': ty2[s0[1]] = TYPES_P
             elif s0[0] == 'erase': ty2[s0[1]] = TYPES_E
@@ -659,6 +685,22 @@ def check_body(prog, path, G, live_out, exc_live, ctx, pre_declared=(), depth=0)
             if RULES['bbc'] and RULES['out_owned_mint']:    # rev 2: the recipient is a mint, as an `owned` return is
                 G['__carry'] = dict(G['__carry']); G['__carry'][x] = frozenset(srcs)
                 G['__carryb'] = dict(G['__carryb']); G['__carryb'][x] = frozenset(srcb)
+        elif k in ('kdup', 'kself'):                    # an `owned` result of a member of the holder x: `x.Rebuild()` / `x.View()`
+            y, x = s[1], s[2]
+            read_check(x, G, site, ctx)
+            if RULES['strict_trust']:
+                raise Reject('E-strict-trust-admission')
+            cs = carried(x, G); csb = carried_bindings(x, G)    # the receiver's set
+            # R2 clause 1: a mint carries the receiver's contribution — the receiver's binding and its set. The open
+            # refinement drops the binding where the result's type cannot reach the holder's class (`kdup`); the
+            # declared-only reading drops it for `kself` too, whose dynamic class does hold a borrow of the receiver.
+            if not (RULES['takeout_by_reach'] and (k == 'kdup' or RULES['reach_declared_only'])):
+                cs |= ids_of(G[x]) if G[x][0] != 'brw' else G[x][1]
+                csb |= frozenset({x}) if G[x][0] != 'brw' else G[x][3]
+            G[y] = ('own', frozenset({site})); ctx.types[y] = TYPES_K; declared.append(y); ctx.depth[y] = depth
+            if RULES['derived_retention'] or RULES['bbc']:
+                G['__carry'] = dict(G['__carry']); G['__carry'][y] = frozenset(cs)
+                G['__carryb'] = dict(G['__carryb']); G['__carryb'][y] = frozenset(csb)
         elif k == 'wrap':                               # `var y := Slot.Full(move x)`: an owning choice takes the holder as its owned payload
             y, x = s[1], s[2]
             cx = carried(x, G); cxb = frozenset(G['__carryb'].get(x, frozenset()))
@@ -1111,6 +1153,12 @@ class Run:
         elif k == 'newko':
             yl = self.binding(s[2])
             env[s[1]] = (self.alloc(TYPES_K, borrow=yl), 'own'); declared.append(s[1])
+        elif k == 'kdup':                               # the member reads the receiver's field and builds a holder over the SAME source
+            loc = self.read(s[2])
+            env[s[1]] = (self.alloc(TYPES_K, borrow=heap[loc][1]), 'own'); declared.append(s[1])
+        elif k == 'kself':                              # the member builds a holder over the receiver itself
+            loc = self.read(s[2])
+            env[s[1]] = (self.alloc(TYPES_K, borrow=loc), 'own'); declared.append(s[1])
         elif k == 'wrap':
             loc = self.binding(s[2])
             env[s[2]] = (loc, 'moved'); env[s[1]] = (loc, 'own'); declared.append(s[1])
@@ -1276,6 +1324,7 @@ FEATURE_SETS = {
     'p0212-erase': {'locals', 'fields', 'holders', 'holders2', 'erase'},
     'p0212-mint': {'locals', 'fields', 'holders', 'holders2', 'mint2'},
     'p0212r': {'locals', 'fields', 'holders', 'holders2', 'mint2', 'erase', 'out', 'choice'},
+    'p0212t': {'locals', 'fields', 'holders', 'holders2', 'mint2', 'erase', 'out', 'choice', 'takeout'},
 }
 
 def decl_type(decl, s):
@@ -1283,7 +1332,7 @@ def decl_type(decl, s):
     if k in ('new', 'decl', 'using'): return TYPES_R
     if k in ('brw', 'move', 'usingm', 'usingb'): return decl[s[2]]
     if k in ('fbrw', 'fmove', 'tbrw'): return TYPES_Q
-    if k in ('newk', 'newk2', 'newko'): return TYPES_K
+    if k in ('newk', 'newk2', 'newko', 'kdup', 'kself'): return TYPES_K
     if k == 'wrap': return TYPES_W
     if k == 'newp': return TYPES_P
     if k == 'erase': return TYPES_E
@@ -1308,6 +1357,7 @@ def atoms(vs, decl, feats, last, allow_decl=True):
                     if 'erase' in feats and decl[y] == TYPES_K: yield ('erase', x, y)
                     if 'choice' in feats and decl[y] == TYPES_K: yield ('wrap', x, y)
                     if 'out' in feats and decl[y] not in HOLDER_TYPES and decl[y] not in (TYPES_E, TYPES_W): yield ('newko', x, y)
+                    if 'takeout' in feats and decl[y] == TYPES_K: yield ('kdup', x, y); yield ('kself', x, y)
                     if 'mint2' in feats and decl[y] not in HOLDER_TYPES and decl[y] not in (TYPES_E, TYPES_W):
                         for z in vs:
                             if z != y and z in decl and decl[z] not in HOLDER_TYPES and decl[z] not in (TYPES_E, TYPES_W): yield ('newk2', x, y, z)
@@ -1463,7 +1513,7 @@ def summarize(rows):
             if r.warns: st['accept-with-warning'] += 1
             if any(w.startswith('§28.2') for w in r.warns): st['§28.2-warned'] += 1
             if any(s[0] == 'kuse' for s in iter_stmts(r.prog)): st['programs-with-kuse'] += 1
-            if any(s[0] in ('newk', 'kset', 'newp', 'link', 'newk2', 'newko') for s in iter_stmts(r.prog)): st['programs-with-a-trust-store'] += 1
+            if any(s[0] in ('newk', 'kset', 'newp', 'link', 'newk2', 'newko', 'kdup', 'kself') for s in iter_stmts(r.prog)): st['programs-with-a-trust-store'] += 1
             if r.hold: st['stale-read-through-a-stored-borrow:' + r.hold] += 1
             if any(s[0] == 'puse' for s in iter_stmts(r.prog)): st['programs-with-puse'] += 1
             if r.bad == ('K4.3-trust-residual',): st['K4.3-trust-residual (T3 under the recorded clause)'] += 1
@@ -1683,6 +1733,13 @@ CANDIDATES = [
     ('0212-explicit  revised, with a stored-arguments-only mint (oracle)', dict(REV2, mint_stored_only=True)),
 ]
 
+# Critique round 2, note 2: the open refinement of the taken-out rule (`compare --reach`, feature set p0212t).
+REACH_CANDIDATES = [
+    ('0212  revised: a member\'s owned result carries the holder\'s binding and its set', dict(REV2)),
+    ('0212-reach  the refinement: the binding is carried only where the result\'s type can reach its holder', dict(REV2, takeout_by_reach=True)),
+    ('0212-reach-declared  the refinement read off the declared type of an open class (unsound)', dict(REV2, takeout_by_reach=True, reach_declared_only=True)),
+]
+
 def base_class(r):
     """How a baseline-accepted program behaves at run time: the hazard class of a rejection."""
     if r.hold == 'race': return 'race'                    # a read of an object another domain owns, through a stored borrow (no flag: K4.3's domain clause)
@@ -1730,7 +1787,7 @@ def cmd_compare(a, vs, feats):
                     pass                                    # every store is tracked by type
                 elif flips.get('derived_retention'):
                     if kinds & {'kset', 'newp'}: untracked += 1      # 0132's bit covers a constructor's direct store only
-                elif kinds & {'newk', 'kset', 'newp', 'link', 'newk2', 'newko'}:
+                elif kinds & {'newk', 'kset', 'newp', 'link', 'newk2', 'newko', 'kdup', 'kself'}:
                     untracked += 1
         cls = Counter(base_class(r) for r in new_rej)
         nv = [r for r in new_rej if base_class(r) == 'never(clean)']
@@ -1999,6 +2056,27 @@ SELFTEST_0212 = [
      'accept', ['FAULT'], 'reject:0205-holder-release-after-dominating-kill', None),
 ]
 
+REACH = dict(P0212, takeout_by_reach=True)
+REACH_DECLARED = dict(P0212, takeout_by_reach=True, reach_declared_only=True)
+# (title, program, variant flips, then verdict and outcomes under: 0212 revised; the refinement; its declared-only reading)
+SELFTEST_REACH = [
+    ('critic e01 — a builder\'s product borrows the builder\'s argument: the builder is moved away while the product lives',
+     [('new', 'a'), ('newk', 'b', 'a'), ('kdup', 'c', 'b'), ('move', 'd', 'b'), ('kuse', 'c')], {},
+     'reject:K5.1-frozen-transfer', None, 'accept', ['ok'], 'accept', ['ok']),
+    ('critic e01 — the product still carries the builder\'s source: that source is sent away, then the product is read',
+     [('new', 'a'), ('newk', 'b', 'a'), ('kdup', 'c', 'b'), ('send', 'a'), ('kuse', 'c')], {},
+     'reject:K5.1-frozen-transfer', None, 'reject:K5.1-frozen-transfer', None, 'reject:K5.1-frozen-transfer', None),
+    ('probe e02 — the product borrows the builder itself: the builder is moved away and disposed, then the product is read',
+     [('new', 'a'), ('newk', 'b', 'a'), ('kself', 'c', 'b'), ('move', 'd', 'b'), ('disp', 'd'), ('kuse', 'c')], {},
+     'reject:K5.1-frozen-transfer', None, 'reject:K5.1-frozen-transfer', None, 'accept', ['FAULT']),
+    ('probe e02 — the same, with the builder released at its scope end before a product whose destructor reads it',
+     [('new', 'a'), ('newk', 'b', 'a'), ('kself', 'c', 'b'), ('move', 'd', 'b')], dict(k_dtor_reads=True),
+     'reject:K5.1-frozen-transfer', None, 'reject:K5.1-frozen-transfer', None, 'accept', ['FAULT']),
+    ('a product that borrows the builder, used while the builder lives: admitted and clean under every reading',
+     [('new', 'a'), ('newk', 'b', 'a'), ('kself', 'c', 'b'), ('kuse', 'c')], {},
+     'accept', ['ok'], 'accept', ['ok'], 'accept', ['ok']),
+]
+
 def cmd_selftest0212():
     fails = 0
     for title, prog, variant, e_base, o_base, e_new, o_new in SELFTEST_0212:
@@ -2027,7 +2105,20 @@ def cmd_selftest0212():
             line += f'\n    {tag}: {v}  runs: {got}  bad: {bad}  ' + ('OK' if ok else f'MISMATCH (expected {expect} {outs})')
             if not ok: fails += 1
         print(line)
-    total = 2 * len(SELFTEST_0212) + 2 * len(SELFTEST_REV2)
+    for title, prog, variant, e_r2, o_r2, e_rf, o_rf, e_dc, o_dc in SELFTEST_REACH:
+        line = f'--- {title}\n    ' + oneline(prog)
+        for tag, flips, expect, outs in (('0212 revised', P0212, e_r2, o_r2), ('refinement', REACH, e_rf, o_rf), ('refinement, declared type only', REACH_DECLARED, e_dc, o_dc)):
+            f2 = dict(flips); f2.update(variant)
+            with mutated(f2):
+                v, w, ctx = check(prog)
+                ok = (v == expect); got = None; bad = []
+                if v == 'accept':
+                    runs = run_all(prog, ctx); got = [r.outcome for r in runs]; bad = sorted(set(judge(runs)))
+                    if outs is not None and got != outs: ok = False
+            line += f'\n    {tag}: {v}  runs: {got}  bad: {bad}  ' + ('OK' if ok else f'MISMATCH (expected {expect} {outs})')
+            if not ok: fails += 1
+        print(line)
+    total = 2 * len(SELFTEST_0212) + 2 * len(SELFTEST_REV2) + 3 * len(SELFTEST_REACH)
     print(f'\nselftest0212: {total - fails} passed, {fails} failed')
     return fails
 
@@ -2039,6 +2130,7 @@ def main():
     ap.add_argument('--qdtor', action='store_true', help='model variant: the child class Q has a destructor that reads its back-pointer')
     ap.add_argument('--hidden-link', dest='hidden_link', action='store_true', help='model variant: every R is built with its child linked back to it; the checker cannot see the link')
     ap.add_argument('--r40-teardown', dest='r40_teardown', action='store_true', help='model variant: the disposed flag is set when Dispose() begins (r40), not when it completes (spec §28.12, v0.355)')
+    ap.add_argument('--reach', action='store_true', help='compare: show 0212 revised against the open refinement of the taken-out rule and its declared-only reading')
     ap.add_argument('--block', dest='with_block', action='store_true', help='also enumerate prefix ; do … end ; suffix')
     ap.add_argument('--kdtor', action='store_true', help='model variant: the holder class K has a destructor that reads its borrowed field')
     ap.add_argument('--v0355', action='store_true', help="apply proposal 0205's two rule flips (the v0.355 baseline)")
@@ -2068,6 +2160,7 @@ def main():
     if a.cmd == 'selftest0212':
         sys.exit(1 if cmd_selftest0212() else 0)
     if a.cmd == 'compare':
+        if a.reach: CANDIDATES[:] = REACH_CANDIDATES
         cmd_compare(a, vs, feats); return
     if a.cmd == 'selftest':
         sys.exit(1 if cmd_selftest() else 0)

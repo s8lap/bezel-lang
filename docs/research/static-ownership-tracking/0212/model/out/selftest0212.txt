@@ -90,5 +90,30 @@
     new a / fmove b a / puse b
     0212 first draft: accept  runs: ['ok']  bad: []  OK
     0212 revised: accept  runs: ['ok']  bad: []  OK
+--- critic e01 — a builder's product borrows the builder's argument: the builder is moved away while the product lives
+    new a / newk b a / kdup c b / move d b / kuse c
+    0212 revised: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+    refinement: accept  runs: ['ok']  bad: []  OK
+    refinement, declared type only: accept  runs: ['ok']  bad: []  OK
+--- critic e01 — the product still carries the builder's source: that source is sent away, then the product is read
+    new a / newk b a / kdup c b / send a / kuse c
+    0212 revised: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+    refinement: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+    refinement, declared type only: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+--- probe e02 — the product borrows the builder itself: the builder is moved away and disposed, then the product is read
+    new a / newk b a / kself c b / move d b / disp d / kuse c
+    0212 revised: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+    refinement: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+    refinement, declared type only: accept  runs: ['FAULT']  bad: []  OK
+--- probe e02 — the same, with the builder released at its scope end before a product whose destructor reads it
+    new a / newk b a / kself c b / move d b
+    0212 revised: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+    refinement: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+    refinement, declared type only: accept  runs: ['FAULT']  bad: []  OK
+--- a product that borrows the builder, used while the builder lives: admitted and clean under every reading
+    new a / newk b a / kself c b / kuse c
+    0212 revised: accept  runs: ['ok']  bad: []  OK
+    refinement: accept  runs: ['ok']  bad: []  OK
+    refinement, declared type only: accept  runs: ['ok']  bad: []  OK
 
-selftest0212: 46 passed, 0 failed
+selftest0212: 61 passed, 0 failed

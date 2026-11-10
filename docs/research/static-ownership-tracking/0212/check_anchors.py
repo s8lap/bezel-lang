@@ -11,6 +11,7 @@ import argparse, os, re, sys
 
 SPEC = "docs/Bezel_Language_Spec.md"; STD = "docs/Bezel_Standard_Library.md"; RAT = "docs/Bezel_Design_Rationale.md"
 G1 = "docs/Bezel_Guide_01_Memory_and_Ownership.md"; CG = "docs/Bezel_For_Code_Generation.md"; DEC = "docs/proposals/DECLINED.md"
+G5 = "docs/Bezel_Guide_05_Collections_and_Iteration.md"
 
 # (edit id, stage, document, start anchor, end anchor or None for a single-phrase anchor / insertion point)
 ANCHORS = [
@@ -53,6 +54,7 @@ ANCHORS = [
     ("8.11 Guide 01 §3",              "S3", G1,   "A stashed reference is not proved safe.", None),
     ("8.11 Guide 01 §5 bullet",       "S3", G1,   "- **Back-references are not `owned`.**", None),
     ("8.11 Guide 01 §5 paragraphs",   "S3", G1,   "**The back-reference's guarantee is yours — unless you say `scoped`.**", "never returned or stored in another object (spec §28.14)."),
+    ("8.11 Guide 05 §1 insertion",    "S3", G5,   "**Dictionaries in practice.**", "checked against the dictionary at every call as `Add`'s arguments are (spec §28.11)."),
     ("8.12 code-gen §4.4",            "S3", CG,   "- A borrow of a **scope-bound local** may not be stored in a field or in a longer-lived collection.", "so it is scope-bound — §28.3)."),
 ]
 

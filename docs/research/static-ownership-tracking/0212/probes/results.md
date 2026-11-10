@@ -209,6 +209,27 @@ Modes: report = --checked-disposal --report-trust-admissions; checked = --checke
 - **unchecked**: compile=accept; trust lines=0
   run exit=0; output: boom|
 
+## c13_record_key_in_place_of_comparer
+> CRITIQUE ROUND 2, NOTE 1 (the comparer rule is narrow), the rewrite to teach: the key is wrapped in a record that declares its own equality, so the dictionary needs no comparer object at all — the rewrite `SortedDictionary` already requires for an ordering (stdlib §4.17). EXPECT: compiles with no warning and no report line; clean in both modes; prints True. Under 0212: unchanged; `Dictionary<FoldedKey, int>` is not a carrier type and stays sendable.
+- **report**: compile=accept; trust lines=0
+  run exit=0; output: True|1|
+- **checked**: compile=accept; trust lines=0
+  run exit=0; output: True|1|
+- **unchecked**: compile=accept; trust lines=0
+  run exit=0; output: True|1|
+
+## c14_comparer_forwarded_through_constructor
+> CRITIQUE ROUND 2, NOTE 1, the forwarding loss: a class takes a comparer in its constructor and hands it to the dictionary it owns. Under 0212 revision 2 the parameter `cmp` is not static-storage-sourced, and `Dictionary<string, int>` is not a carrier type, so the construction is an error — whatever the caller passes, a `static readonly` instance included. The same body in a generic `Index<K>` is rejected where `Index<string>` is named and admitted at `Index<Item>` for a class `Item`. EXPECT today: the comparer-held trust clause admits it. RESULT on r40: not runnable — the comparer constructors are not implemented (as c06).
+- **report**: compile=REJECT; trust lines=0
+      c14_comparer_forwarded_through_constructor.bzl:4:3: warning: static readonly field `Instance` has class type `IgnoreCase` which is reachable from every domain — a warning: confine its use to one domain or ensure its own internal
+      c14_comparer_forwarded_through_constructor.bzl:13:11: stdlib §4.8: the 'Dictionary' IEqualityComparer constructor is not yet implemented — the comparer would be silently ignored and default equality used instead. Omit it and gi
+- **checked**: compile=REJECT; trust lines=0
+      c14_comparer_forwarded_through_constructor.bzl:4:3: warning: static readonly field `Instance` has class type `IgnoreCase` which is reachable from every domain — a warning: confine its use to one domain or ensure its own internal
+      c14_comparer_forwarded_through_constructor.bzl:13:11: stdlib §4.8: the 'Dictionary' IEqualityComparer constructor is not yet implemented — the comparer would be silently ignored and default equality used instead. Omit it and gi
+- **unchecked**: compile=REJECT; trust lines=0
+      c14_comparer_forwarded_through_constructor.bzl:4:3: warning: static readonly field `Instance` has class type `IgnoreCase` which is reachable from every domain — a warning: confine its use to one domain or ensure its own internal
+      c14_comparer_forwarded_through_constructor.bzl:13:11: stdlib §4.8: the 'Dictionary' IEqualityComparer constructor is not yet implemented — the comparer would be silently ignored and default equality used instead. Omit it and gi
+
 ## d01_dtor_body_uses_this
 > DESTRUCTOR WINDOW, flag timing: the owner's own destructor body (a) reads an expression-bodied property of `this`, (b) calls an instance method of `this`, (c) hands `this` to a static helper that reads a property. MEASURE which of the three faults in checked mode: it tells whether the disposed flag is set before the destructor body runs, and whether a member entry on `this` inside the body is flag-tested.
 - **report**: compile=accept; trust lines=0
@@ -326,6 +347,51 @@ Modes: report = --checked-disposal --report-trust-admissions; checked = --checke
   run exit=0; output: root/a/b|root disposed|a disposed|b disposed|
 - **unchecked**: compile=accept; trust lines=0
   run exit=0; output: root/a/b|root disposed|a disposed|b disposed|
+
+## e01_builder_build_returned
+> FROM THE RE-CRITIQUE of revision 2 (4dfa0e331), probe e01: a builder whose owned `Build()` result borrows the builder's ARGUMENT, never the builder. Under 0212 revision 2 the result carries the local `b` (the taken-out rule), so `return b.Build();` is rejected: a scope-bound local source. MEASURE: what r40 says today. The clean rewrite keeps the builder out of the result's life: `return new Report(c);`, or a `Build` the caller of `Make` calls on a builder it holds.
+- **report**: compile=REJECT; trust lines=2
+      e01_builder_build_returned.bzl:13:11: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source the caller mus
+      e01_builder_build_returned.bzl:20:11: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source the caller mus
+      e01_builder_build_returned.bzl:27:12: borrow returned from `b` would outlive its source — owned local `b` is auto-dropped at scope end (§28.3 borrow-lifetime rule; bind the source in the caller's scope and return the borrow fro
+- **checked**: compile=REJECT; trust lines=0
+      e01_builder_build_returned.bzl:27:12: borrow returned from `b` would outlive its source — owned local `b` is auto-dropped at scope end (§28.3 borrow-lifetime rule; bind the source in the caller's scope and return the borrow fro
+- **unchecked**: compile=REJECT; trust lines=0
+      e01_builder_build_returned.bzl:27:12: borrow returned from `b` would outlive its source — owned local `b` is auto-dropped at scope end (§28.3 borrow-lifetime rule; bind the source in the caller's scope and return the borrow fro
+
+## e02_open_class_product_borrows_builder
+> REFINEMENT COUNTER-EXAMPLE (critique round 2, note 2): the declared return type `Report` has one borrow field, a `Customer`, so a declaration-only test would say the result of `b.Build()` cannot hold a borrow of the `Builder`. `Report` is not sealed: `Build` returns a subclass that does. EXPECT today: compiles; checked = DisposedAccessException at `r.Show()`; unchecked = undefined. Under 0212 revision 2: the result carries `b`, so `Take(move b)` is frozen while `r` is live (K5.1 through K5.5). A refinement that reads only the declared type would accept this program.
+- **report**: compile=accept-with-warning; trust lines=3
+      e02_open_class_product_borrows_builder.bzl:13:11: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source th
+      e02_open_class_product_borrows_builder.bzl:21:11: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source th
+      e02_open_class_product_borrows_builder.bzl:31:11: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source th
+  run exit=70; output: Unhandled exception: System.DisposedAccessException|
+- **checked**: compile=accept; trust lines=0
+  run exit=70; output: Unhandled exception: System.DisposedAccessException|
+- **unchecked**: compile=accept; trust lines=0
+  run exit=0; output: |
+
+## e03_builder_product_bound_then_returned
+> CRITIQUE ROUND 2, NOTE 2: probe e01 with the product BOUND to a local before it is returned. MEASURE: r40 accepts this form and it runs clean, so its rejection of `return b.Build();` (e01) is a rule about a directly returned call on a local, not about what the product holds. Under 0212 revision 2: `r` carries the local `b` (the taken-out rule), so `return r;` is rejected — a clean rejection, the over-approximation §4.7 records.
+- **report**: compile=accept-with-warning; trust lines=2
+      e03_builder_product_bound_then_returned.bzl:13:11: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source t
+      e03_builder_product_bound_then_returned.bzl:20:11: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source t
+  run exit=0; output: ann|
+- **checked**: compile=accept; trust lines=0
+  run exit=0; output: ann|
+- **unchecked**: compile=accept; trust lines=0
+  run exit=0; output: ann|
+
+## e04_builder_product_not_a_carrier
+> CRITIQUE ROUND 2, NOTE 2: probe e01 with a product that is NOT of a carrier type — `Build` returns a fresh `Customer`, which stores no borrow. MEASURE: r40 rejects `return b.Build();` here too, with the same message, so that verdict does not depend on the product. Under 0212: a value that is not of a carrier type carries nothing, and the line is admitted.
+- **report**: compile=REJECT; trust lines=2
+      e04_builder_product_not_a_carrier.bzl:13:11: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source the cal
+      e04_builder_product_not_a_carrier.bzl:20:11: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source the cal
+      e04_builder_product_not_a_carrier.bzl:27:12: borrow returned from `b` would outlive its source — owned local `b` is auto-dropped at scope end (§28.3 borrow-lifetime rule; bind the source in the caller's scope and return the bor
+- **checked**: compile=REJECT; trust lines=0
+      e04_builder_product_not_a_carrier.bzl:27:12: borrow returned from `b` would outlive its source — owned local `b` is auto-dropped at scope end (§28.3 borrow-lifetime rule; bind the source in the caller's scope and return the bor
+- **unchecked**: compile=REJECT; trust lines=0
+      e04_builder_product_not_a_carrier.bzl:27:12: borrow returned from `b` would outlive its source — owned local `b` is auto-dropped at scope end (§28.3 borrow-lifetime rule; bind the source in the caller's scope and return the bor
 
 ## g01_generic_hide_owned_T_as_interface
 > GENERIC ERASURE, the note's hole: a generic body converts `owned T` to an `owned` interface. Instantiated at a class that holds a borrow, the result's type announces nothing and the body is not re-checked. EXPECT today: compiles; one report line (Account's store); checked = DisposedAccessException; unchecked = undefined. Under 0212: `Hider.Hide<Account>` is rejected where it is named (the conversion is a requirement of the body's use of T, read per instantiation).

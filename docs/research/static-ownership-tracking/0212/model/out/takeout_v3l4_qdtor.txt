@@ -1,0 +1,6 @@
+# clean rejections of 0212 revised — vars=3 len=4 features=p0212r --qdtor
+baseline accepted 31497; rejected by 0212 revised 1752; of those clean 1206
+taken-out rule: 984
+  of which: no `link` in the program: 954
+  of which: the program links a child: 30
+another rule: 222
