@@ -12,36 +12,39 @@ I wrote 40 small programs of the kind a services-and-tools developer writes, the
 
 | Cause | Rows |
 |---|---|
-| COMPILER-BUG | 39 (22 distinct bugs, `data/compiler-bugs.md`; 8 are silent wrong output) |
-| LANG-RULE | 24 |
-| MISSING | 15 |
+| COMPILER-BUG | 45 (24 distinct bugs in `data/compiler-bugs.md`, 9 of them silent wrong output; plus 6 rows on documented not-yet-implemented items) |
+| LANG-RULE | 23 |
+| MISSING | 10 |
 | DIAGNOSTIC | 8 |
-| VERBOSE/AWKWARD | 8 |
-| USER-ERROR | 2 |
+| VERBOSE/AWKWARD | 7 |
+| USER-ERROR | 3 |
 
 There are also 30 "felt good" rows (`data/good.tsv`).
 
-**The ten design themes.** They are ranked by frequency × cost. Compiler bugs are excluded here and ranked separately below.
+**The ten design themes.** Each theme scores the sum, over the distinct tasks it touched, of the highest row weight (1/2/3) in that task. Only LANG-RULE, MISSING, VERBOSE/AWKWARD and DIAGNOSTIC rows count. Ties go to the higher maximum weight, then to more tasks. `python3 data/rank.py data/frictions.tsv` re-derives both rankings. Compiler bugs are ranked separately below, by the same formula.
 
-| # | Theme | Evidence (rows / tasks) | Size |
-|---|---|---|---|
-| 1 | **Diagnostics point at the wrong place or cascade.** Examples: the B1 internal warning is followed by an error at an unrelated `for`; 60 parse errors follow a nested `case`; 5 conversion errors hide the real call-bounded cause (t28). | 9 / 9 | compiler only |
-| 2 | **Ownership friction outside resource code** (for the ownership lane; no fixes designed here). Fresh tasks cannot go into an `Array`, so `WhenAll([...])` takes 5 lines. Nested dictionaries need `OwningDictionary`. A query bound to a local warns. A closure cannot move a captured sender. | 8 / 7 | — |
-| 3 | **Text-processing stdlib gaps.** There is no whitespace split, no regex (proposal 0020 is accepted but not landed), no CSV reader, and `ReadToEnd` is broken (B1). | 3 MISSING + 2 bug / 5 | stdlib only |
-| 4 | **Closures cannot outlive their call.** Comparer combinators (`By`, `Then`, `Reverse`) are impossible, because a plain function parameter is call-bounded and a static method cannot return `scoped`. | 2 / 2 (high cost) | large |
-| 5 | **No ad-hoc products or multiple returns.** One-use records appear only to carry a projection; `Partition` uses two `out` parameters. Tuples are deferred, and D-0002's bar is "evidence from real code". | 2 + 1 implicit / 3 | large |
-| 6 | **Counting and upsert.** Code uses `d[k] := (d.GetOrNull(k) ?? 0) + 1` and an init-then-`+=` dance. `Counter<K>` is specified but not implemented (#3848). | 3 / 3 | stdlib only |
-| 7 | **Enum and case names.** A 7-arm `case` maps each constant to its name: `NameOf` is missing (B10), there is no values list (#3819), and `ToString` renders the type name by design. | 5 / 3 | stdlib + small |
-| 8 | **Expression-form limits.** A bare `Ok(...)` cannot sit in an `if`-expression (#3042, recorded "liftable"). Expression `case` arms cannot hold statements. A nested `case` needs a `do` wrapper. | 4 / 3 | small language change |
-| 9 | **Query surface.** There is no `MaxBy`/`MinBy`. `Array.Count(pred)` is shadowed by the `Count` property; `CountWhere` is "declined, evidence-gated", and this study is that evidence. | 4 / 4 | stdlib only |
-| 10 | **Serialization shape.** A record cannot hold a list. There is no end-of-object probe for hand-driven JSON. `JsonOptions` has five positional booleans with no defaults. | 5 / 2 | small + stdlib |
+| # | Theme | Score | Rows / tasks | Size |
+|---|---|---|---|---|
+| 1 | **Diagnostics point at the wrong place or cascade.** Examples: the B1 internal warning is followed by an error at an unrelated `for`; 60 parse errors follow a nested `case`; 5 conversion errors hide the real call-bounded cause (t28). | 13 | 8 / 8 | compiler only |
+| 2 | **Ownership friction outside resource code** (for the ownership lane; no fixes designed here). Fresh tasks cannot go into an `Array`, so `WhenAll([...])` takes 5 lines. Nested dictionaries need `OwningDictionary`. A closure cannot move a captured sender into `TaskScope.Spawn`. | 10 | 7 / 5 | — |
+| 3 | **Serialization shape.** A record cannot hold a list. There is no end-of-object probe for hand-driven JSON. `JsonOptions` has five positional booleans with no defaults, and there is no naming policy. | 6 | 4 design + 2 bug / 2 | small + stdlib |
+| 4 | **Query surface.** There is no `MaxBy`/`MinBy`; proposal 0026 D2 is under review. `Array.Count(pred)` is shadowed by the `Count` property; `CountWhere` is "declined, evidence-gated", and this study is that evidence. | 5 | 4 / 4 | stdlib only |
+| 5 | **Text-processing stdlib gaps.** There is no whitespace split, no regex (proposal 0020 is accepted but not landed), and no CSV reader. | 5 | 3 / 3 | stdlib only |
+| 6 | **Expression-form limits.** A bare `Ok(...)` cannot sit in an `if`-expression (#3042, recorded "liftable"). Expression `case` arms cannot hold statements. A nested `case` needs a `do` wrapper. | 4 | 4 / 3 | small language change |
+| 7 | **No ad-hoc products or multiple returns.** One-use records appear only to carry a projection; `Partition` uses two `out` parameters. Tuples are deferred, and D-0002's bar is "evidence from real code". | 4 | 2 / 2 | large |
+| 8 | **Closures cannot outlive their call.** Comparer combinators are impossible. This is spec §28.14's own *Known v1 limitation*; the deferred unbounded tier's bar is partly met. | 3 | 1 / 1 | large |
+| 9 | **Enum and case names.** `ToString` renders the type name by design, and a choice has no case-name string. The bigger cost, `NameOf` and the values list missing, is implementation (B10, #3819). | 3 | 2 design + 3 bug / 3 | small |
+| 10 | **Unused-result warnings on mutators.** `_ :=` is needed before `Remove`, `AddLast`, `BeginArray` and `Dispatch`. | 3 | 3 / 3 | small |
 
-**Compiler bugs, ranked by cluster.**
+Counting and upsert fell out of the top ten. Most of that friction is `Counter<K>`, which is specified but not implemented (#3848), so it is ranked with the bugs. What is left by design is the non-counting upsert in t16 (score 1).
 
-1. **Silent wrong query results: 6 tasks.** `OrderBy` ignores string, double and decimal keys (B4). Decimal `Sum` is wrong (B13). Sorting `DictionaryEntry` arrays fails (B5). An untyped string comparer does nothing (B7).
-2. **Strings freed with their source: 5 tasks.** This is a use-after-free (B6). Separately, `Select(x => $"{x}")` is rejected (B17).
-3. **Members the stdlib specifies but r40 lacks: 8 tasks.** These are `ParseOrNull`, `NameOf`, `ReadToEnd`, the stream span overloads and `DateOnly.ToString(format)`.
-4. **Ownership false positives: 6 tasks.** These are must-use warnings at trivial-dispose types, and a hard error in `async` bodies (B2, B12, B20).
+**Compiler bugs, ranked by cluster** (same formula over COMPILER-BUG rows):
+
+1. **Members the stdlib specifies but r40 lacks: score 11, 7 tasks.** These are `ParseOrNull`, `NameOf`, `ReadToEnd`, the stream span overloads (#1394) and `DateOnly.ToString(format)` (#2240).
+2. **Documented not-yet-implemented items: score 10, 6 tasks.** These are `Counter`, the `Json` facade, `Locked<T>`, `typeof(E).EnumValues` and stored `GroupBy` results.
+3. **Silent wrong query results: score 10, 5 tasks.** `OrderBy` ignores string, double and decimal keys (B4). Decimal `Sum` is wrong (B13). Sorting `DictionaryEntry` arrays does nothing (B5). An untyped string comparer does nothing (B7).
+4. **Strings freed with their source: score 9, 5 tasks.** This is a use-after-free (B6). Separately, `Select(x => $"{x}")` is rejected (B17, contested).
+5. **Inference: score 8, 4 tasks.** B24 is silent: `MaxBy(people, lambda(p) => p.Age)` returns the wrong element. The others are B3, B22 and B18.
 
 **Keep these.** The `*OrNull` + `?.` + `??` tier, choices with exhaustive `case` and guards, `Result` with `AndThen` method references, interpolation with alignment and format, cancellation scopes, channels that close when the last sender is dropped, `Domain.Spawn` with value results, deterministic destructors, reflection-free serialization synthesis, and FFI without attributes. 11 first drafts ran unchanged.
 
@@ -53,7 +56,9 @@ There are also 30 "felt good" rows (`data/good.tsv`).
 - **Drafts.** `programs/<task>/v1.bzl … vN.bzl` and `final.bzl`. Each revision carries a comment at the changed line naming the reason (`// r40: …` marks a compiler-bug workaround). I did not read §7 of the code-generation reference until all rows were classified.
 - **Build.** `bezelc --checked-disposal -o <exe> <file>`, then run. The final run of every program, including diagnostics, is in `data/final-outputs.txt`.
 - **Classification.** Each row has exactly one cause. A suspected bug was reduced to a minimal repro before it was called COMPILER-BUG. Two first readings did not survive a re-check, and were reclassified as DIAGNOSTIC: a `String.Equals` cascade (t09) and a `SkipValue` misreading (t25).
-- **Ranking.** Frequency counts distinct tasks per theme. Cost is weighted 1 when characters were added, 2 when lines were added or code restructured, and 3 when the design changed or the task could not be done. The weights are judgement; the rows are the evidence.
+- **Ranking.** Each row carries a `weight`: 1 when characters were added, 2 when lines were added or code restructured, 3 when the design changed or the task could not be done. Each row also carries a `report_theme` (design rows) or a `bug_cluster` (COMPILER-BUG rows). A theme's score is the sum, over its distinct tasks, of the highest weight in that task. Ties go to the higher maximum weight, then to more tasks. `data/rank.py` computes it. The weights are judgement; the rows are the evidence.
+- **Not-yet-implemented items.** Six rows meet a feature the spec already defines and r40 has not implemented, with a tracker: `Counter` #3848, `Json` #2349, `Locked` #1721, `typeof` values #3819, stored `GroupBy` #755. They are all COMPILER-BUG (cluster `C-documented-nyi`), because the design question is answered and the fix is implementation.
+- **Review.** A non-author critic reviewed the first version (ACCEPT-W-NOTES). This version applies its notes: three reclassifications (F038, F069, F049), the NYI rule above, the weights, corrected counts and citations, and existing-issue links in `data/compiler-bugs.md`.
 
 ## Per-task outcome
 
@@ -74,19 +79,19 @@ There are also 30 "felt good" rows (`data/good.tsv`).
 | t13 join | 2 | ok | `Count(pred)` shadowed |
 | t14 histogram | 1 | ok | tally dance |
 | t15 sets | 6 | **failed** | B11 (false `DisposedAccessException`) |
-| t16 inventory | 1 | ok | upsert dance; query must-use |
+| t16 inventory | 1 | ok | upsert dance; B23 (query must-use) |
 | t17 parse-or-fail | 1 | ok | — |
 | t18 retry | 2 | ok | B12 |
 | t19 Result pipeline | 2 | ok | bare case in if-expression; B9 |
 | t20 exceptions | 1 | ok | — |
 | t21 file numbering | 2 | ok | B16 (literal silently writes nothing) |
-| t22 binary file | 2 | ok | B15 (span I/O); manual byte encoding |
+| t22 binary file | 2 | ok | B15 (stream span I/O); manual byte encoding (the `ArraySpan` accessors were available) |
 | t23 directory list | 2 | ok | `Count(pred)`; no file size |
 | t24 JSON round-trip | 3 | ok, compromised (tags fixed at 2) | record cannot hold a list; B19; facade NYI |
 | t25 JSON hand-read | 5 | ok via a declared record | no object-end probe |
 | t26 plugin registry | 1 | ok | unused-result warning |
 | t27 LRU cache | 2 | ok | `??` across types; unused results |
-| t28 comparer | 3 | ok without combinators | closures cannot be returned |
+| t28 comparer | 3 | ok without combinators | closures cannot be returned; B24 |
 | t29 partition | 2 | ok | no tuples; B17, B22 |
 | t30 worker pool | 3 | ok | fresh tasks into an Array |
 | t31 channel pipeline | 3 | ok without TaskScope | closure cannot move an owned sender |
@@ -106,7 +111,7 @@ Row ids (`F0nn`) refer to `data/frictions.tsv`. "Decline status" is what rationa
 
 ### 1. Diagnostics: correct rule, wrong place
 
-- **Evidence:** F004, F018, F027, F060, F066, F073, F077, F085, F095. Nine tasks.
+- **Evidence:** F004, F018, F027, F060, F066, F077, F085, F095. Eight tasks, score 13. F073, an internal warning, is counted under bugs (B18).
 - **Pattern 1: the real cause is buried.** t28 reported five "not implicitly convertible" errors before the call-bounded cause. t40 reported "Shared<T> requires T to be a proper class type: `<unknown>`" and four "not sendable" errors after one unresolved name. t34 reported about 60 parse errors after one correct first line.
 - **Pattern 2: the error is at the use, not the producer.** In t04 the error is at `hay.Contains`, with the remedy "`hay!`". The actual cause is the if-expression above it (B8).
 - **Pattern 3: an internal degradation is shown as a warning, and the error appears somewhere else.** In t02, `ReadToEnd` became zero, and the error was reported at a `for` statement.
@@ -121,13 +126,12 @@ Row ids (`F0nn`) refer to `data/frictions.tsv`. "Decline status" is what rationa
 - **Evidence (LANG-RULE):**
   - F019: a field initialized with a fresh collection needs `owned`.
   - F020: `Dictionary<string, Dictionary<…>>` must become `OwningDictionary`, and then has no entry iteration.
-  - F038: binding a lazy query to `var` draws the must-use warning.
   - F074, F081: fresh tasks cannot go into a borrowing `Array`, so `await Task.WhenAll([F(1), F(2), F(3)])` becomes five lines. The class-typed result also needs a named task.
   - F078: an async lambda cannot move a captured owned sender, so the channel pipeline gave up on `TaskScope`.
   - F079: owned parameters that rely on teardown warn.
   - F089: `move` is required at an owned argument.
-- **Bug-amplified (COMPILER-BUG):** F015, F030, F040, F052, F080, F088, through B2, B12 and B20. These warnings and errors appear where the spec says nothing should.
-- **Weight:** 7 of 40 programs that are not about resources still met an ownership rule. The two costliest were the task fan-out and the captured-sender case. `using var` and the `move` markers themselves were cheap. The diagnostics usually named the fix.
+- **Bug-amplified (COMPILER-BUG):** F015, F030, F038, F040, F052, F080, F088, through B2, B12, B20 and B23. (F038, the query must-use warning, was first filed here; the spec says the query was spent, so it is B23.) These warnings and errors appear where the spec says nothing should.
+- **Weight:** score 10, 7 rows in 5 tasks (t05, t30, t31, t33, t36), none of them about resources. The two costliest were the task fan-out and the captured-sender case. `using var` and the `move` markers themselves were cheap. The diagnostics usually named the fix.
 - **Peers:**
   - C#: `await Task.WhenAll(F(1), F(2))`.
   - Kotlin: `awaitAll(async { … }, …)`.
@@ -135,80 +139,9 @@ Row ids (`F0nn`) refer to `data/frictions.tsv`. "Decline status" is what rationa
 - **Decline status:** §7.2 of the code-generation reference documents the task-holder and fresh-store shapes. Proposal 0082's `--experimental-scoped-await-bind` touches F081.
 - **Size:** not assessed (the ownership lane owns it).
 
-### 3. Text-processing stdlib gaps
+### 3. Serialization shape
 
-- **Evidence:**
-  - F001: no whitespace-run split.
-  - F006: no regex and no split-by-predicate. Tokenizing on non-letters took a 12-line `StringBuilder` loop, with the flush written twice.
-  - F016: no CSV reader; the quote-aware splitter took 17 lines.
-  - F002, F003: B1, the broken `ReadToEnd`.
-- **Peers:** `s.split()` (Python), `split_whitespace()` (Rust), `Regex.Matches`, `csv.reader`.
-- **Decline status:**
-  - Regex: proposal 0020 was accepted 2026-07-07 and is still absent from the stdlib (§11 lists it deferred).
-  - Whitespace split, split-by-predicate and CSV: never considered. The proposal 0062 batch covered other string members.
-- **Size:** stdlib only.
-
-### 4. Closures cannot outlive their call
-
-- **Evidence:** F065 (t28). `static method By<T, K>(key: (T) -> K): (T, T) -> int => lambda(a, b) => key(a).CompareTo(key(b))` is rejected: "parameter `key` is call-bounded; declare it `scoped` to store it". `scoped` on a static method needs an `owned` return, which a function type cannot have, so no combinator library can exist. The program fell back to one inline comparer.
-- **Related:** F078. An async lambda cannot carry an owned value into `TaskScope.Spawn`.
-- **Peers:** Java `Comparator.comparing(f).thenComparing(g)`, Kotlin `compareBy(…)`, Rust `impl Fn` returns.
-- **Decline status:** spec §28.14 (v0.177) made call-bounded the default for function parameters, and rationale §4.2 records the closure-as-borrow-carrying-value model. Returning a closure over a *function* parameter is not discussed as a decline anywhere I found. DECLINED records only the generic-`T` variants (§28.3).
-- **Size:** large language change, adjacent to ownership. The evidence suggests asking whether a capture-free-over-parameters return, where the closure captures only function parameters that are themselves capture-free, could be admitted.
-
-### 5. No ad-hoc products or multiple returns
-
-- **Evidence:**
-  - F034: a `Summary` record declared only to carry three values out of a `Select`.
-  - F070: `Partition` returns two arrays through two `out` parameters. A `Parts<T>` record cannot hold arrays either.
-  - Implicit: t30 declared `Slice(Lo, Hi)` only because `Domain.Spawn` takes one argument.
-- **Peers:** C# `(yes, no) = …` and anonymous types; Kotlin `Pair`/`Triple` with destructuring; Rust and TypeScript tuples.
-- **Decline status:** rationale §18 *deferred*: "an ergonomic convenience, not a capability gap". DECLINED D-0002 sets the reopening bar as "evidence from real code". Anonymous types are declined at D-0002, behind tuples. This study gives that evidence in 3 of 40 tasks. It is modest but real; two of the uses are in query projections, where peers reach for tuples first.
-- **Size:** large language change. A record cannot hold heap collections, so a tuple of arrays would hit the same §9.7 rule.
-
-### 6. Counting and upsert
-
-- **Evidence:**
-  - F005, F036: `counts[w] := (counts.GetOrNull(w) ?? 0) + 1;`, duplicated for the trailing word.
-  - F039: `if not d.ContainsKey(k) then d[k] := 0; end; d[k] += delta;`.
-- **Peers:** `Counter(words)`, `groupingBy().eachCount()`, `entry().or_insert(0) += 1`, `d.merge(k, 1, Int::plus)`.
-- **Decline status:** `Counter<K>` is specified (proposal 0062, graduated v0.215) but not implemented (#3848). Ref-returning indexers ("would let `dict[key]++` be one operation") are deferred in rationale §18.
-- **Size:** stdlib only (implement `Counter`). A `GetOrDefault`-style upsert on `Dictionary` would cover the non-counting case.
-
-### 7. Enum and case names
-
-- **Evidence:**
-  - F026, F093: `NameOf` and `FromNameOrNull` are missing (B10), so I wrote a 7-arm `case` twice.
-  - F029: no list of values, because `typeof(E).EnumValues` is not reachable (#3819). The loop was `for var i in 0..6` with a hard-coded bound.
-  - F028: `ToString` renders the type name by design.
-  - F025: a choice has no case-name string, so `Name()` was written by hand.
-- **Peers:** `Weekday.values()`, `Enum.GetName`, Kotlin `::class.simpleName`, Rust `#[derive(Debug)]`.
-- **Decline status:** DECLINED row "Enum name-parse over the serialized-name table … with the instance `Name` property and the §8.5 enum `ToString` default change" was declined at proposal 0124. Its `ToString` bar is "a real program showing the qualified-name default is a defect". This study does not meet that bar: `NameOf` is the designed answer and is simply unimplemented. A static `E.Values` and choice case names were never considered.
-- **Size:** compiler (B10), stdlib (`E.Values`), and a small language change for choice case names.
-
-### 8. Expression-form limits
-
-- **Evidence:**
-  - F042: `return (if even then Ok(n) else Error(…))` is rejected, and becomes an `if` with two `return`s.
-  - F083: expression-`case` arms cannot run a statement, so the state machine became a statement `case` in a helper.
-  - F084: an arm whose body is a nested `case` statement needs `do … end`.
-  - F086: `=> return x,` does not parse, and becomes `=> do return x; end,`. Yet `x := v,` without a `;` was accepted.
-- **Peers:** Kotlin `when` branches are blocks whose last expression is the value; Rust match arms take `{ stmt; expr }`.
-- **Decline status:** branch-level target typing is a *rejected* item in DECLINED that is recorded **liftable** (#3042), with "no evidence bar stated". That fits a small revisit. Statement-bearing expression arms are not recorded as a decline. Spec §19.2 states the rule.
-- **Size:** small language change.
-
-### 9. Query surface: MaxBy and the `Count(pred)` shadow
-
-- **Evidence:**
-  - F024, F068: no `MaxBy`/`MinBy`. The code-generation reference offers `OrderBy(f).First()`, which is O(n log n), and here also wrong because of B4.
-  - F035, F050: `arr.Count(pred)` is unreachable on `Array`, `Set` and `Dictionary`, so I wrote `.Where(pred).Count()`.
-- **Peers:** .NET 6+ `MaxBy`, Kotlin `maxBy`, Rust `max_by_key`.
-- **Decline status:** rationale §15: "`CountWhere` is declined, evidence-gated … The reopening bar: field evidence that the collision costs real users real time on the `Count`/`Contains` names specifically". The collision hit 2 of 40 tasks, and the code-generation reference §7.9 lists it as a trap, so the evidence suggests revisiting. `MinBy`/`MaxBy` appear only in the code-generation reference's absent list and were never considered.
-- **Size:** stdlib only (`MaxBy`). The shadow needs either the `*Where` tier or the deferred extension-call disambiguation syntax.
-
-### 10. Serialization shape
-
-- **Evidence:**
+- **Evidence** (6 rows in 2 tasks; F053, F057, F059 and F061 score 6; F054 is documented NYI and F055 is B19):
   - F053: `record Person(…, Tags: Array<string>): ISerializable` is rejected. Heap collections are class components only (spec §9.8).
   - F055: the class form was also rejected (B19), so the record took `[2]string`.
   - F059: `IDeserializer` cannot iterate an object's fields of unknown count ("driven by the object's textual extent", but no API). Hand-driven tolerant parsing went through a declared record instead.
@@ -219,38 +152,121 @@ Row ids (`F0nn`) refer to `data/frictions.tsv`. "Decline status" is what rationa
 - **Decline status:** the record clause is a deliberate §9.8/§9.7 rule. The other items were never considered.
 - **Size:** stdlib (object-end probe, options with defaults, naming policy). A small language change would be needed for defaults in positional records.
 
-### 11–20: lower-ranked themes
+### 4. Query surface: MaxBy and the `Count(pred)` shadow
 
-- **11. Unused-result warnings on mutators** (F058, F062, F064; F046 is B14). `_ :=` was needed before `Remove`, `AddLast`, `BeginArray` and `Dispatch`; the warning appeared 6 times in 4 tasks. Proposal 0063's fluent exemption covers only same-type returns, and its alternatives were declined. Size: small.
-- **12. Recursive sum types** (F087). `choice Expr … Bin(left: Expr, right: Expr)` is rejected (§35.1). The AST became an abstract class plus three sealed subclasses with owned fields, constructors and `move left`: about 25 lines grew to about 45, and an exhaustive `case` gave way to virtual dispatch. Never considered as a decline. Rust needs `Box`, but keeps the enum. Size: large language change (an indirection marker), or a documented idiom (`closed class` hierarchy with exhaustive type patterns).
-- **13. Shared mutable state across domains** (F094). `Locked<T>` is not implemented (#1721). `Shared<T>` is sendable only at stdlib synchronized types, so a user counter under a `Mutex` cannot be shared at all. Size: implementation.
-- **14. I/O gaps** (F049, F051; B15). No file size without opening a stream. Byte accessors exist only on spans.
-- **15. Generic inference with lambdas** (F069). `MaxBy<Person, int>(…)` needed explicit type arguments (B22 is the Range case).
-- **16. Dates** (F091). `DateOnly` has no `AddDays`, `DayOfWeek` or day difference, so the program used `DateTime`.
-- **17. `??` across types** (F063). `{v ?? "miss"}` with `v: int?` needs an if-expression; this matches C# and Kotlin rules.
-- **18. Exception wrapping boilerplate** (F044). A primary constructor cannot take `(message, cause)`.
-- **19. Collection-literal annotations** (F096). There are 20 annotated literals in 18 programs. They are cheap, documented, and declined with reasons (rationale §5.16). The evidence does not suggest revisiting.
-- **20. Small rules.** `out` is reserved (F076). A generic comma is not allowed inside an interpolation hole (F067; the diagnostic is excellent). An auto-property needs an initializer (F056).
+- **Evidence** (4 rows, 4 tasks, score 5):
+  - F024, F068: no `MaxBy`/`MinBy`. The code-generation reference offers `OrderBy(f).First()`, which is O(n log n), and here also wrong because of B4.
+  - F035, F050: `arr.Count(pred)` is unreachable on `Array`, `Set` and `Dictionary`, so I wrote `.Where(pred).Count()`.
+- **Peers:** .NET 6+ `MaxBy`, Kotlin `maxBy`, Rust `max_by_key`.
+- **Decline status:** rationale §15: "`CountWhere` is declined, evidence-gated … The reopening bar: field evidence that the collision costs real users real time on the `Count`/`Contains` names specifically". The collision hit 2 of 40 tasks, and the code-generation reference §7.9 lists it as a trap, so the evidence suggests revisiting. `MinBy`/`MaxBy` are proposal 0026 D2 (*LINQ additions*), under review (#1457), with `MaxByOrNull` forms.
+- **Size:** stdlib only (`MaxBy`, already drafted in 0026). The shadow needs either the `*Where` tier or the deferred extension-call disambiguation syntax.
+
+### 5. Text-processing stdlib gaps
+
+- **Evidence** (3 rows, 3 tasks, score 5; B1, the broken `ReadToEnd`, hit the same tasks and is counted under bugs):
+  - F001: no whitespace-run split.
+  - F006: no regex and no split-by-predicate. Tokenizing on non-letters took a 12-line `StringBuilder` loop, with the flush written twice.
+  - F016: no CSV reader; the quote-aware splitter took 17 lines.
+- **Peers:** `s.split()` (Python), `split_whitespace()` (Rust), `Regex.Matches`, `csv.reader`.
+- **Decline status:**
+  - Regex: proposal 0020 was accepted 2026-07-07 and is still absent from the stdlib (§11 lists it deferred).
+  - Whitespace split, split-by-predicate and CSV: never considered. The proposal 0062 batch covered other string members.
+- **Size:** stdlib only.
+
+### 6. Expression-form limits
+
+- **Evidence** (4 rows, 3 tasks, score 4):
+  - F042: `return (if even then Ok(n) else Error(…))` is rejected, and becomes an `if` with two `return`s.
+  - F083: expression-`case` arms cannot run a statement, so the state machine became a statement `case` in a helper.
+  - F084: an arm whose body is a nested `case` statement needs `do … end`.
+  - F086: `=> return x,` does not parse, and becomes `=> do return x; end,`. Yet `x := v,` without a `;` was accepted.
+- **Peers:** Kotlin `when` branches are blocks whose last expression is the value; Rust match arms take `{ stmt; expr }`.
+- **Decline status:** branch-level target typing is a *rejected* item in DECLINED that is recorded **liftable** (#3042), with "no evidence bar stated". That fits a small revisit. Statement-bearing expression arms are not recorded as a decline. Spec §19.2 states the rule.
+- **Size:** small language change.
+
+### 7. No ad-hoc products or multiple returns
+
+- **Evidence:**
+  - F034: a `Summary` record declared only to carry three values out of a `Select`.
+  - F070: `Partition` returns two arrays through two `out` parameters. A `Parts<T>` record cannot hold arrays either.
+  - Not a row: t30 also declared `Slice(Lo, Hi)` only because `Domain.Spawn` takes one argument.
+- **Peers:** C# `(yes, no) = …` and anonymous types; Kotlin `Pair`/`Triple` with destructuring; Rust and TypeScript tuples.
+- **Decline status:** rationale §18 *deferred*: "an ergonomic convenience, not a capability gap". DECLINED D-0002 sets the reopening bar as "evidence from real code". Anonymous types are declined at D-0002, behind tuples. This study gives that evidence in 2 of 40 tasks (3 counting t30). It is modest but real; two of the uses are in query projections, where peers reach for tuples first.
+- **Size:** large language change. A record cannot hold heap collections, so a tuple of arrays would hit the same §9.7 rule.
+
+### 8. Closures cannot outlive their call
+
+- **Evidence:** F065 (t28; weight 3, score 3). `static method By<T, K>(key: (T) -> K): (T, T) -> int => lambda(a, b) => key(a).CompareTo(key(b))` is rejected: "parameter `key` is call-bounded; declare it `scoped` to store it". `scoped` on a static method needs an `owned` return, which a function type cannot have, so no combinator library can exist. The program fell back to one inline comparer.
+- **Related:** F078. An async lambda cannot carry an owned value into `TaskScope.Spawn`.
+- **Peers:** Java `Comparator.comparing(f).thenComparing(g)`, Kotlin `compareBy(…)`, Rust `impl Fn` returns.
+- **Decline status:** the spec names this case. Spec §28.14, *Known v1 limitation*: "combinators that compose received callbacks into a returned **function value** (`Compose(f, g)` returning `lambda(x) => g(f(x))`) are not expressible over call-bounded parameters — the returned closure would capture them beyond the call, and no bounding frame exists. The missing third tier, an *unbounded* marker, is deferred". The DECLINED row *Unbounded retention tier for function-typed parameters* is `deferred` (#1427, closed, declined with reasons). Its bar: "a corpus program … that must return a **composed function value** capturing received callbacks, where no bounding object exists to make it a `scoped` store … **together with** a stated rule for how `unbounded` participates in §27.1's function-type identity and in §28.14's method-reference formation bar". That row measured, in 2026-09, that the only `Compose` in the tree is a negative test.
+- **t28 partly meets that bar.** It is a real program that must return composed comparers with no bounding object. It does not supply the second half: the function-type-identity rule.
+- **Size:** large language change, adjacent to ownership.
+
+### 9. Enum and case names
+
+- **Evidence** (design rows F025, F028, score 3; the larger cost is implementation):
+  - F026, F093 (bug rows): `NameOf` and `FromNameOrNull` are missing (B10), so I wrote a 7-arm `case` twice.
+  - F029 (documented NYI row): no list of values, because `typeof(E).EnumValues` is not reachable (#3819). The loop was `for var i in 0..6` with a hard-coded bound.
+  - F028: `ToString` renders the type name by design.
+  - F025: a choice has no case-name string, so `Name()` was written by hand.
+- **Peers:** `Weekday.values()`, `Enum.GetName`, Kotlin `::class.simpleName`, Rust `#[derive(Debug)]`.
+- **Decline status:** DECLINED row "Enum name-parse over the serialized-name table … with the instance `Name` property and the §8.5 enum `ToString` default change" was declined at proposal 0124. Its `ToString` bar is "a real program showing the qualified-name default is a defect". This study does not meet that bar: `NameOf` is the designed answer and is simply unimplemented. A static `E.Values` and choice case names were never considered.
+- **Size:** compiler (B10), stdlib (`E.Values`), and a small language change for choice case names.
+
+### 10. Unused-result warnings on mutators
+
+- **Evidence:** F058, F062, F064 (3 tasks, score 3). F046 is B14, a warning on a unit-returning call.
+- `_ :=` was needed before `Remove`, `AddLast`, `BeginArray` and `Dispatch`; the warning appeared 6 times in 4 tasks.
+- **Decline status:** proposal 0063's fluent exemption covers only same-type returns, and its alternatives were declined.
+- **Size:** small.
+
+### 11–18: lower-ranked themes
+
+- **11. Small rules** (score 3). `out` is reserved (F076). A generic comma is not allowed inside an interpolation hole (F067; the diagnostic is excellent). An auto-property needs an initializer (F056).
+- **12. Recursive sum types** (F087, score 2).
+  - `choice Expr … Bin(left: Expr, right: Expr)` is rejected (§35.1).
+  - §35.1 gives the idiom in its next sentence: "Recursive sums are expressed with a class node in the cycle (an `owned` class payload whose class holds the nested choice), exactly as recursive records are."
+  - I did not use it. I rewrote the AST as a full class hierarchy (about 25 lines grew to about 45, and exhaustive matching was lost). The spec's idiom would have cost roughly one wrapper class (about +8 lines) and kept the choice and its exhaustive `case`.
+  - The cost is the indirection class and its `move`s. Rust's `Box<Expr>` is the same idea, written inline.
+  - Size: small at most, since the idiom is already in the spec. A teaching example in a guide would have saved this rewrite.
+- **13. I/O gaps** (F051, score 2). There is no file size without opening a stream. Proposal 0071 (`FileStatus` and `File.GetStatus`, under review, no tracker yet) covers it. F049, the byte encoding, was my error: `ArraySpan<byte>` has the `Write*LittleEndian` accessors (stdlib §4.14/§4.15).
+- **14. Dates** (F091, score 2). `DateOnly` has no `AddDays`, `DayOfWeek` or day difference, so the program used `DateTime`.
+- **15. `??` across types** (F063, score 1). `{v ?? "miss"}` with `v: int?` needs an if-expression; this matches C# and Kotlin rules.
+- **16. Collection-literal annotations** (F096, score 1).
+  - There are 20 annotated literals in 18 programs. They are recorded as one aggregate row, so the formula counts them once.
+  - Counted per program they would score 18. Each costs one type name; they are documented and declined with reasons (rationale §5.16).
+  - The evidence does not suggest revisiting.
+- **17. Exception wrapping boilerplate** (F044, score 1). A primary constructor cannot take `(message, cause)`.
+- **18. Counting and upsert, by design** (F039, score 1).
+  - What is left by design is `if not d.ContainsKey(k) then d[k] := 0; end; d[k] += delta;`.
+  - The tally dance `counts[w] := (counts.GetOrNull(w) ?? 0) + 1` (F005, F036) is `Counter<K>`, which is specified but not implemented (#3848), so it counts as documented NYI.
+  - Ref-returning indexers are deferred (rationale §18).
+- **Removed: generic inference with lambdas.** F069 is now B24, a silent compiler bug: spec §14.5 phase 2 should infer `K` from the untyped lambda.
+- **Removed: shared mutable state.** F094, `Locked<T>`, is documented NYI.
 
 ## Compiler-bug clusters
 
-Full repros are in `data/compiler-bugs.md`. Ranked by tasks hit and severity:
+Full repros, and the existing issue for each, are in `data/compiler-bugs.md`. The clusters are ranked by the same formula over COMPILER-BUG rows (`bug_cluster` column):
 
-1. **Wrong query results with no diagnostic: 6 tasks.**
+1. **Specified members that are missing: score 11, 7 tasks.** B1 (`ReadToEnd`), B9 (`ParseOrNull`, #7318), B10 (`NameOf`, #3862), B15 (stream spans, #1394), B21 (`DateOnly.ToString(format)`, #2240).
+2. **Documented not-yet-implemented: score 10, 6 tasks.** `Counter` (#3848), `Json` facade (#2349), `Locked<T>` (#1721), `typeof(E).EnumValues` (#3819), stored `GroupBy` (#755). t40's mutex half is the costliest.
+3. **Wrong query results with no diagnostic: score 10, 5 tasks.**
    - B4: OrderBy-family keys other than `int` are ignored.
    - B13: decimal `Sum` is wrong (`34` for `7.00`).
-   - B5: `Array<DictionaryEntry>` sorts do nothing, and segfault when built with `Add`.
+   - B5: `Array<DictionaryEntry>` sorts do nothing. The `Add` segfault leg is #6557.
    - B7: an untyped string comparer does nothing.
 
    These cost the most debugging time in the study. Every one looked like a logic error in my program.
-2. **String lifetime: 5 tasks.**
-   - B6: a string passed from an element straight into a record constructor is freed with its source (use-after-free; garbage output, then crashes).
-   - B17: interpolated strings are rejected as a "launder".
-3. **Specified members that are missing: 8 tasks.** B1 (`ReadToEnd`), B9 (`ParseOrNull`), B10 (`NameOf`), B15 (stream spans), B21 (`DateOnly.ToString(format)`).
-4. **Ownership false positives: 6 tasks.** B2 and B20 are spurious must-use warnings. B12 is a hard error for a trivial-dispose local after an `await`.
-5. **Inference crashes and misses: 4 tasks.** B3 (IR verification failure on an untyped `GroupBy` key), B22, B18.
-6. **Checked-mode false fault: 1 task, unfinished.** B11.
-7. **Silent no-op and narrowing.** B16: a literal passed to `IEnumerable` writes nothing. B8: narrowing is lost through an if-expression. B14, B19.
+4. **String lifetime: score 9, 5 tasks.**
+   - B6: a string passed from an element straight into a record constructor is freed with its source (use-after-free).
+   - B17: interpolated strings are rejected as a "launder" (contested: #7170, #7215).
+5. **Inference: score 8, 4 tasks.** B24 (silent wrong `MaxBy` element), B3 (IR verification failure, #6627), B22, B18.
+6. **Miscellaneous: score 7, 3 tasks.** B8 (narrowing through an if-expression; contested: #6698). B16 (a literal at an `IEnumerable` parameter is accepted silently and writes nothing; §15.4 has no interface target, so it should be rejected). B14. B19 (regresses closed #1065).
+7. **Ownership false positives: score 7, 7 tasks.** B2 (#4418) and B20 are must-use warnings at trivial-dispose types. B23 (#8308 family) is a must-use warning on a query spent inside an interpolation hole. B12 (#1772) is a hard error for a trivial-dispose local after an `await`.
+8. **Checked-mode false fault: score 3, 1 task, unfinished.** B11 (#6314).
+
+Nine bugs are silent: B1, B4, B5, B6, B7, B11, B13, B16, B24.
 
 ## What felt good
 
@@ -283,7 +299,7 @@ I read §7 only after all rows were classified. It already documents these frict
 - The fresh-store rule behind the nested dictionary (F020; partly).
 - Returning lambdas over a generic body's `T` (F065; partly: the function-parameter case is not there).
 
-Of the 96 rows, 10 are documented there fully or in part; the column `in_codegen_s7` in `data/frictions.tsv` marks them. A documented trap is still friction: I wrote every one of these 10 after reading §§1–6. None of the 39 compiler-bug rows is documented, because §7 describes the language, not r40.
+Of the 96 rows, 10 are documented there fully or in part; the column `in_codegen_s7` in `data/frictions.tsv` marks them. A documented trap is still friction: I wrote every one of these 10 after reading §§1–6. None of the 45 compiler-bug rows is documented, because §7 describes the language, not r40.
 
 ## What I could not do
 
