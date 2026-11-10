@@ -1,0 +1,19 @@
+# Candidate comparison — bounds: vars=3 len=4 features=static --while [v0.355 base] --body 2
+baseline: 2078070 programs, 419160 accepted; 255780 accepted programs contain a K4.3 store; VIOLATIONS 0; K4.3 race residuals 48
+baseline trust surface (accepted programs in which some run reads a dead or foreign object THROUGH A STORED BORROW): 924 = race 24 + fault on every run 24 + fault on some run 876
+baseline flag surface (accepted programs that fault on every / some run, any cause): 36 / 2238   (53.2 s)
+
+| candidate | accepted | newly accepted | newly unsound | newly rejected | …race | …fault every run (holder/local) | …fault some run (holder/local) | …never fault: a dangling stored borrow exists, unread / no dangling borrow at all | left: race through a stored borrow | left: fault through a stored borrow (every/some) | left: accepted programs with an untracked K4.3 store | witness (clean rejection) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| B  derived retention (idealised) + sharp owner-outlives | 417102 | 0 | 0 | 2058 | 12 | 12/0 | 438/0 | 1590 / 6 | 12 | 12/438 | 103038 | `new a / newk b a / move c a / disp b` |
+| A  borrow-bearing classes (announced kills unfrozen) | 415338 | 0 | 0 | 3822 | 24 | 24/0 | 864/0 | 2898 / 12 | 0 | 0/12 | 0 | `new a / newk b a / move c a / disp b` |
+| A-static  borrow-bearing classes, Dispose frozen under a live holder | 415248 | 0 | 0 | 3912 | 24 | 24/0 | 876/0 | 2976 / 12 | 0 | 0/0 | 0 | `new a / newk b a / move c a / disp b` |
+| D  stricter freeze alone (Dispose frozen under any live local borrow) | 419088 | 0 | 0 | 72 | 0 | 0/0 | 0/42 | 0 / 30 | 24 | 24/876 | 255756 | `new a / brw b a / while { /   disp a /   asg a / } / brw c b` |
+| A+D | 415176 | 0 | 0 | 3984 | 24 | 24/0 | 876/42 | 2976 / 42 | 0 | 0/0 | 0 | `new a / newk b a / move c a / disp b` |
+| E  strict mode (every K4.3 admission an error) | 163380 | 0 | 0 | 255780 | 30 | 24/0 | 876/318 | 20790 / 233742 | 0 | 0/0 | 0 | `new a / link a` |
+
+- B: residual witnesses — every: `new a / newp b a / asg a / pkuse b`; race: `new a / newp b a / send a / pkuse b`; some: `new a / newp b a / while { /   asg a / } / pkuse b`
+- A: residual witnesses — some: `new a / newk b a / while { /   disp a /   asg a / } / kuse b`
+- D: residual witnesses — every: `new a / newk b a / asg a / kuse b`; race: `new a / newk b a / send a / kuse b`; some: `new a / newk b a / while { /   asg a / } / kuse b`
+
+(356.3 s)
