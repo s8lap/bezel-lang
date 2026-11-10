@@ -7512,6 +7512,20 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                     emitClosureRetain(&valArg);
                     builder_.CreateStore(&valArg, slot);
                     emitClosureRelease(oldVal);
+                } else if (classField && !strField && !tpStrField &&
+                           !closureField && !boxField &&
+                           isDynBoxStorageMember(ps) &&
+                           valArg.getType()->isPointerTy()) {
+                    // fix #8215 (§23.3 / §28.9, v0.357): a DYNAMIC box-storage
+                    // auto-property (it takes box AND non-box stores): the
+                    // boxField order below, with the retain and the release
+                    // guarded by the run-time box test -- the slot (and the
+                    // incoming value) may be a class instance or a string.
+                    llvm::Value* oldVal = builder_.CreateLoad(
+                        ptrTy(), slot, "propset.dynbox.old");
+                    emitObjectSlotBoxOp(&valArg, /*retain=*/true);
+                    builder_.CreateStore(&valArg, slot);
+                    emitObjectSlotBoxOp(oldVal, /*retain=*/false);
                 } else if (boxField) {
                     // §23.3/§28.9: load-old -> retain-new -> store-new ->
                     // release-old, mirroring the string/closure order (retain

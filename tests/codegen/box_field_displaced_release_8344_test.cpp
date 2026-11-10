@@ -65,40 +65,28 @@
 // pin that the DISPLACED BOX of a box-only field is STILL RELEASED — the fix
 // does not trade the crash for an unbounded leak.
 //
-// THE ORACLE. Two oracles, and WHY they differ.
+// THE ORACLE. `runAotChecked` links the generated program under ASan with
+// LeakSanitizer armed (`detect_leaks=1`), so a leak OR a sanitizer report
+// turns into `ran == false`. Every row uses it: a box-only field must leak
+// nothing (rows 5 and 6), and since #8215 (v0.357) neither does a MIXED field
+// -- one the pre-pass cannot admit as box-only -- whose FINAL box is now
+// released at its disposal (the run-time box test `emitObjectSlotBoxOp`).
+// Rows 1, 2 and 7 used to run under `runAot` (LeakSanitizer off) because that
+// final 24 B box leaked: the #8215 leak. The base's SEGV (rows 1 and 2) and
+// corruption (row 7) are still caught: the harness reports "program
+// terminated by signal N" / the wrong value (`ran == false` / stdout).
 //
-// `runAotChecked` links the generated program under ASan with LeakSanitizer
-// armed (`detect_leaks=1`), so a leak OR a sanitizer report turns into
-// `ran == false`. It is the oracle for the rows whose subject is the LEAK
-// (rows 5 and 6): a box-only field must leak nothing.
-//
-// `runAot` is the oracle for the rows whose subject is the CRASH (rows 1, 2
-// and 7). Those rows exercise a MIXED field — one the pre-pass cannot admit
-// as a box-storage field — and a mixed field's FINAL box is not released at
-// disposal. That is the pre-existing #8215 leak ("a box field whose class
-// also stores an Object-typed parameter leaks every box"), which this issue
-// does NOT close (see the RESIDUAL note below); it is not a leak this change
-// introduces, and it is not what these rows are about. `runAot` keeps
-// LeakSanitizer off (so the known residual does not turn the row red) while
-// still failing the row on the crash: the base's SEGV kills the program, and
-// the harness reports "program terminated by signal N" (ran == false). Under
-// the ASan sweep (`BEZEL_AOT_FORCE_SANITIZE=address`, which the gate runs)
-// `runAot` instruments the generated program with AddressSanitizer too, so
-// the base's crash is reported with its full ASan backtrace.
-//
-// The RESIDUAL, measured (base r30-c1 vs this fix, `bezelc --sanitize=address`
-// with LeakSanitizer on):
+// The measurements, base r30-c1 (8c8aef19) vs this fix, `bezelc
+// --sanitize=address` with LeakSanitizer on:
 //
 //   shape                              base                    this fix
 //   --------------------------------  ----------------------  ----------------------
-//   `O: Object := ""` then `O := 3`   SEGV in bz_box_release  "3", 24 B / 1 alloc
-//   `O := "runtime"` then `O := 3`    SEGV in bz_box_release  "3", 24 B / 1 alloc
-//   a class instance, then `O := 3`   prints "6" (corrupted)   prints "7", 24 B / 1 alloc
+//   `O: Object := ""` then `O := 3`   SEGV in bz_box_release  "3", clean
+//   `O := "runtime"` then `O := 3`    SEGV in bz_box_release  "3", clean
+//   a class instance, then `O := 3`   prints "6" (corrupted)   prints "7", clean
 //
-// The 24 B is the one box the mixed field holds at disposal — the #8215
-// residual, visible in the third row on the BASE as well (the base prints
-// "6" and leaks the same 24 B). The first two rows crash on the base, so
-// their leak is masked there; it is the same residual, not a new one.
+// (The third row's 24 B leaked on the base as well -- #8215 -- and the first
+// two crash there, which masked it.)
 //
 // ROWS 5 AND 6 ARE THE LEAK ROWS, AND THEY ARE CLEAN: a box-only field
 // releases every box it holds, at the store site and at disposal.
@@ -110,7 +98,6 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
-using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -302,7 +289,8 @@ const char* kClassInstanceDisplacedByBox =
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_box_field_displaced_release_8344,
            spec_8_6_28_9_string_initializer_then_box_store_no_segv) {
-    JitResult r = runAot(kStringInitializerThenBox);
+    JitResult r = runAotChecked(kStringInitializerThenBox);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "3\n");
@@ -315,7 +303,8 @@ BEZEL_TEST(codegen_box_field_displaced_release_8344,
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_box_field_displaced_release_8344,
            spec_8_6_28_9_string_store_then_box_store_no_segv) {
-    JitResult r = runAot(kStringStoreThenBox);
+    JitResult r = runAotChecked(kStringStoreThenBox);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "3\n");
@@ -386,7 +375,8 @@ BEZEL_TEST(codegen_box_field_displaced_release_8344,
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_box_field_displaced_release_8344,
            spec_8_6_class_instance_displaced_by_box_is_not_corrupted) {
-    JitResult r = runAot(kClassInstanceDisplacedByBox);
+    JitResult r = runAotChecked(kClassInstanceDisplacedByBox);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "7\n");

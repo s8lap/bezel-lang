@@ -2403,12 +2403,19 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             if (!isField && !sema::isAutoPropertyStorageSymbol(m, ctx_))
                 continue;  // fix #3152 — see the string walk above
             if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
-            if (!isBoxStorageMember(m)) continue;
+            const bool dynBox = isDynBoxStorageMember(m);
+            if (!isBoxStorageMember(m) && !dynBox) continue;
             unsigned idx = fieldIndex_[m];
             llvm::Value* addr = builder_.CreateStructGEP(bst, currentThis_, idx,
                                                          "boxf.addr");
             llvm::Value* val = builder_.CreateLoad(ptrTy(), addr, "boxf.val");
-            emitBoxRelease(val);
+            // fix #8215 (§28.9, v0.357): a dynamic box-storage field's slot
+            // may hold a class instance or a string as well; the release is
+            // guarded by the run-time box test.
+            if (dynBox)
+                emitObjectSlotBoxOp(val, /*retain=*/false);
+            else
+                emitBoxRelease(val);
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
         }
     }
@@ -4047,6 +4054,99 @@ void Emitter::emitObjectSlotDisposal(llvm::Value* obj) {
     // `object_box_keeps_its_own_release_rule_8_6` and
     // `object_slot_reassigned_to_box_keeps_box_8_6` pin that), while the
     // `owned`-slot arms null it themselves (the #396 slot-null precedent).
+}
+
+
+// fix #8215 (§28.9 / §8.6, v0.357): retain or release `obj` as a §8.6 BOX
+// iff the runtime value in the slot IS a box.
+//
+// An `Object`-typed class field that receives both a box and a non-box has no
+// static answer to "what does this slot hold?", and the box-ONLY classifier
+// (collectBoxStorageFields) excludes it -- so the box the field held at
+// disposal was never released and leaked (issue #8215: `Take(n: int) o := n;`
+// beside `Put(x: Object) o := x;` leaked 24 B per Holder). The slot's occupant
+// is therefore told apart AT RUN TIME, with the discriminator
+// emitObjectSlotDisposal (#8118) already established (its comment carries the
+// derivation); a box is the one occupant that none of these tests claims:
+//
+//   1. null                       -> nothing (bz_box_* are null-safe anyway);
+//   2. bz_obj_is_string           -> a `string` (word 0 is a data pointer, so
+//      it is tested FIRST: reading its "vtable" would be out of bounds);
+//   3. bz_obj_is_fnval            -> a function value, runtime-managed (§28.9);
+//   4. bz_obj_is_tagged_builtin   -> Array / StringBuilder / Mutex / CTS, never
+//      a box;
+//   5. vtable slot 2 != the shared no-op `bz$exDispose` -> a CLASS instance
+//      (its own Dispose); EVERY box vtable installs the shared no-op;
+//   6. word 0 == the `Object` root vtable -> the `Object` root class, the one
+//      class whose slot 2 is also the shared no-op.
+//
+// Every failed test leaves the value alone, so a mis-classification is a LEAK,
+// never a release of a non-box (the direction the box machinery has always
+// preferred). The store sites pair this with a +1 on every box they store
+// (lowerBoxFieldStore / lowerDynBoxFieldStore), so the release is balanced.
+void Emitter::emitObjectSlotBoxOp(llvm::Value* obj, bool retain) {
+    if (!obj) return;
+    auto* fn = declareC(retain ? "bz_box_retain" : "bz_box_release",
+                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    if (!builtinDisposeFn_) {
+        // No shared no-op Dispose in this module means no box vtable exists
+        // to be told apart from a class: nothing can be a box here.
+        return;
+    }
+    auto bb = [&](const char* n) {
+        return llvm::BasicBlock::Create(llvm_, n, currentFn_);
+    };
+    auto* nonNullBB = bb("boxop.nonnull");
+    auto* vtableBB = bb("boxop.vtable");
+    auto* slotBB = bb("boxop.slot");
+    auto* opBB = bb("boxop.do");
+    auto* contBB = bb("boxop.cont");
+    // (1) null.
+    builder_.CreateCondBr(builder_.CreateIsNotNull(obj, "boxop.notnull"),
+                          nonNullBB, contBB);
+    builder_.SetInsertPoint(nonNullBB);
+    // (2) a string, (3) a function value.
+    auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+    llvm::Value* isStr = builder_.CreateCall(
+        isStrFn, {obj, vtableTablePtr()}, "boxop.isstr");
+    auto* fnvalFn = declareC("bz_obj_is_fnval", i32(), {ptrTy()});
+    llvm::Value* isFnval = builder_.CreateCall(fnvalFn, {obj}, "boxop.fnval");
+    llvm::Value* runtimeManaged = builder_.CreateOr(
+        builder_.CreateICmpNE(isStr, builder_.getInt32(0)),
+        builder_.CreateICmpNE(isFnval, builder_.getInt32(0)),
+        "boxop.runtimemanaged");
+    builder_.CreateCondBr(runtimeManaged, contBB, vtableBB);
+    builder_.SetInsertPoint(vtableBB);
+    // (4) a runtime-owned tagged built-in.
+    auto* taggedFn = declareC("bz_obj_is_tagged_builtin", i32(), {ptrTy()});
+    llvm::Value* isTagged = builder_.CreateCall(taggedFn, {obj}, "boxop.tagged");
+    builder_.CreateCondBr(builder_.CreateICmpNE(isTagged, builder_.getInt32(0)),
+                          contBB, slotBB);
+    builder_.SetInsertPoint(slotBB);
+    // (5) the vtable's Dispose slot is the shared no-op.
+    llvm::Value* word0 = builder_.CreateLoad(ptrTy(), obj, "boxop.vt");
+    llvm::Value* disposeSlot =
+        builder_.CreateGEP(ptrTy(), word0, {builder_.getInt32(2)});
+    llvm::Value* disposeFn =
+        builder_.CreateLoad(ptrTy(), disposeSlot, "boxop.disp");
+    llvm::Value* isSharedNoop = builder_.CreateICmpEQ(
+        disposeFn, llvm::ConstantExpr::getPointerCast(builtinDisposeFn_, ptrTy()),
+        "boxop.noop");
+    // (6) ... and the vtable is not the `Object` root's.
+    llvm::Value* isBox = isSharedNoop;
+    auto objVtable = builtinVtable_.find("Object");
+    if (objVtable != builtinVtable_.end()) {
+        llvm::Value* isObjRoot = builder_.CreateICmpEQ(
+            word0, llvm::cast<llvm::Constant>(objVtable->second),
+            "boxop.isobj");
+        isBox = builder_.CreateAnd(isSharedNoop,
+                                   builder_.CreateNot(isObjRoot), "boxop.isbox");
+    }
+    builder_.CreateCondBr(isBox, opBB, contBB);
+    builder_.SetInsertPoint(opBB);
+    builder_.CreateCall(fn, {obj});
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
 }
 
 

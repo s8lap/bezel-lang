@@ -36058,8 +36058,13 @@ bool Emitter::lowerBoxFieldStore(const ast::Expr& target,
     // holding a user class instance that is then overwritten by a box prints
     // `6` where `7` is expected (the class instance's first field decremented
     // as if it were a refcount).
+    // fix #8215 (§28.9, v0.357): a DYNAMIC box-storage field (it also takes
+    // non-box stores, so the pre-pass could not call it box-only) is the one
+    // case where the displaced value's kind is decided at RUN TIME: the
+    // release-old below is the guarded emitObjectSlotBoxOp.
+    const bool dynField = sym && isDynBoxStorageMember(sym);
     const bool displacedIsBox = sym && isBoxStorageMember(sym);
-    llvm::Value* oldVal = displacedIsBox
+    llvm::Value* oldVal = (displacedIsBox || dynField)
         ? builder_.CreateLoad(ptrTy(), fieldAddr, "boxf.old")
         : nullptr;
     // A +1 producer is TRANSFERRED (no retain) — its single reference flows
@@ -36079,6 +36084,8 @@ bool Emitter::lowerBoxFieldStore(const ast::Expr& target,
     // string or class instance was released as a box.
     if (displacedIsBox)
         emitBoxRelease(oldVal);
+    else if (dynField)
+        emitObjectSlotBoxOp(oldVal, /*retain=*/false);
     // Record this field as a box storage field so the disposer releases it.
     // Safety: isBoxFieldLvalue already verified the source is boxable; a class-
     // reference source cannot reach here. If the field was previously added via
@@ -36101,6 +36108,55 @@ bool Emitter::lowerBoxFieldStore(const ast::Expr& target,
     // admitted (the re-insert was a no-op there).
     if (sym && isBoxStorageMember(sym))
         boxStorageFields_.insert(static_cast<const void*>(sym));
+    return true;
+}
+
+
+// fix #8215 (§28.9 / §8.6, v0.357): a `:=` store of a NON-box source into a
+// DYNAMIC box-storage field (see dynBoxStorageFields_): a class instance, an
+// `Object`/interface-typed value of unknown provenance (the `Put(x: Object)`
+// parameter of the issue), `null`. The field may hold a box put there by
+// another store, and the box-ONLY classifier could not release it. So this
+// store keeps the field's ownership uniform: every box the field holds is a +1
+// the field owns.
+//
+//   load-old -> retain-new (iff the run-time value is a box) -> store-new ->
+//   release-old (iff the run-time value is a box)
+//
+// The retain precedes the release so a self-assignment is transiently safe.
+// A class instance, string, function value or tagged built-in fails the box
+// test and is left alone, which is exactly what it was before this fix (no
+// retain, no release); only a genuine box is touched, and only to give the
+// field the independent +1 the box-source store gives it. The source of a
+// string kind (`x as Object` of a `string`) is the #8214 arm's, not this one's.
+bool Emitter::lowerDynBoxFieldStore(const ast::Expr& target,
+                                    llvm::Value* fieldAddr,
+                                    llvm::Value* newVal,
+                                    const ast::Expr* valueExpr) {
+    if (dynBoxStorageFields_.empty()) return false;
+    if (!fieldAddr || !newVal || !valueExpr) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    const sema::TypeRef* rt = ctx_.exprType(target);
+    if (!rt || !isObjectOrInterfaceTarget(rt)) return false;
+    if (localSlot(target)) return false;
+    {
+        llvm::Type* dummy = nullptr;
+        if (refParamAddr(target, dummy)) return false;
+    }
+    if (staticFieldGlobal(target)) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    if (!sym || !isDynBoxStorageMember(sym)) return false;
+    // A box source is lowerBoxFieldStore's, a string source is
+    // lowerObjectStringFieldStore's.
+    const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
+    if (srcTy && (isBoxableValueType(srcTy) || isNullableValueTy(srcTy)))
+        return false;
+    if (isUserMethodBoxReturnCall(valueExpr)) return false;
+    if (isObjectStringFieldLvalue(target, valueExpr)) return false;
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), fieldAddr, "dynbox.old");
+    emitObjectSlotBoxOp(newVal, /*retain=*/true);
+    builder_.CreateStore(newVal, fieldAddr);
+    emitObjectSlotBoxOp(oldVal, /*retain=*/false);
     return true;
 }
 
@@ -48366,6 +48422,15 @@ bool Emitter::isUserMethodObjectStringReturnCall(const ast::Expr* init) const {
 // local initializer, a call argument, a `case` arm, a binding atom, …) and
 // walks the destructors of every local class, not only a class's own.
 //
+// fix #8215 (§28.9 / §8.6, v0.357): a field the join EXCLUDES because it ALSO
+// takes a non-box store (a class instance, an `Object` parameter, ...) but
+// that some write fills with a BOX is no longer left unreleased (every box it
+// held leaked). It joins dynBoxStorageFields_ instead, whose slot is told
+// apart at run time (emitObjectSlotBoxOp), provided every one of its writes is
+// one the dynamic store arm sees: a compound assignment, a `ref`/`out` alias,
+// a `move` out of the field, a source of unknown type, an `Object`-typed
+// initializer and an `owned` field keep the old (excluded, leaking) verdict.
+//
 // NOTE: this pre-pass only runs the STATIC analysis. lowerBoxFieldStore also
 // adds to boxStorageFields_ at emission time (for fields that pass isBoxFieldLvalue
 // during lowering), but the pre-pass is the authoritative gate: a field is only
@@ -48449,6 +48514,23 @@ void Emitter::collectBoxStorageFields() {
     }
     if (ok.empty()) return;
 
+    // fix #8215 (§28.9 / §8.6, v0.357): the DYNAMIC classification's two
+    // facts per candidate field. `sawBox`: some write (a store or the
+    // initializer) puts a BOX in the slot. `dynBlocked`: some write cannot be
+    // given the dynamic discipline (a store the store sites below do not
+    // see -- a compound assignment, a `ref`/`out` alias, a `move` out of the
+    // field, a source of unknown type, an initializer of `Object` type whose
+    // +1 nobody takes -- or an `owned` field, whose drop-on-overwrite is
+    // the owned machinery's). A field the box-ONLY join excludes but that
+    // has `sawBox && !dynBlocked` is a DYNAMIC box-storage field.
+    std::unordered_map<const sema::Symbol*, bool> sawBox;
+    std::unordered_map<const sema::Symbol*, bool> dynBlocked;
+    auto blockDyn = [&](const ast::Expr* target) {
+        if (!target) return;
+        sema::Symbol* fsym = ctx_.exprSymbol(*target);
+        if (fsym && ok.count(fsym)) dynBlocked[fsym] = true;
+    };
+
     // Helper: check a store to an Object/interface field — if the source
     // type is NOT boxable (and not a box-return call), mark it non-box.
     auto checkStore = [&](const ast::Expr* target, const ast::Expr* val) {
@@ -48457,7 +48539,6 @@ void Emitter::collectBoxStorageFields() {
         if (!fsym) return;
         auto it = ok.find(fsym);
         if (it == ok.end()) return;  // not a candidate field
-        if (!it->second) return;     // already excluded
         // fix-forward #7968 (§8.6 / §28.9, v0.355): a `null` literal
         // store puts no class instance in the field, so it cannot make a
         // `bz_box_release` at disposal unsound (the release is
@@ -48467,11 +48548,13 @@ void Emitter::collectBoxStorageFields() {
         // field this pre-pass excluded.
         if (dynamic_cast<const ast::NullLiteralExpr*>(val)) return;
         const sema::TypeRef* srcTy = ctx_.exprType(*val);
-        if (!srcTy) { it->second = false; return; }
+        if (!srcTy) { it->second = false; dynBlocked[fsym] = true; return; }
         bool isBoxableSource =
             isBoxableValueType(srcTy) || isNullableValueTy(srcTy);
         bool isBoxReturnCall = isUserMethodBoxReturnCall(val);
-        if (!isBoxableSource && !isBoxReturnCall)
+        if (isBoxableSource || isBoxReturnCall)
+            sawBox[fsym] = true;
+        else
             it->second = false;
     };
 
@@ -48495,6 +48578,9 @@ void Emitter::collectBoxStorageFields() {
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
             if (as->op == ":=" && as->target && as->value)
                 checkStore(as->target.get(), as->value.get());
+            else
+                blockDyn(as->target.get());  // fix #8215: a store the dynamic
+                                             // store arm never sees
             scanExpr(as->target.get());
             scanExpr(as->value.get());
             return;
@@ -48600,12 +48686,22 @@ void Emitter::collectBoxStorageFields() {
         }
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
             scanExpr(c->callee.get());
-            for (auto& a : c->args) scanExpr(a.value.get());
+            for (auto& a : c->args) {
+                // fix #8215: a field passed by `ref`/`out` is written through
+                // an alias the dynamic store arm does not see.
+                if (!a.modifier.empty() && a.modifier != "scoped")
+                    blockDyn(a.value.get());
+                scanExpr(a.value.get());
+            }
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
             scanExpr(c->callee.get());
-            for (auto& a : c->args) scanExpr(a.value.get());
+            for (auto& a : c->args) {
+                if (!a.modifier.empty() && a.modifier != "scoped")
+                    blockDyn(a.value.get());
+                scanExpr(a.value.get());
+            }
             return;
         }
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
@@ -48619,6 +48715,8 @@ void Emitter::collectBoxStorageFields() {
             return;
         }
         if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            // fix #8215: `move f` vacates the field slot without a store.
+            if (u->op == "move") blockDyn(u->operand.get());
             scanExpr(u->operand.get());
             scanExpr(u->replacement.get());
             return;
@@ -48749,15 +48847,19 @@ void Emitter::collectBoxStorageFields() {
     // and it is the one write that happens before any body runs — so it is
     // what a FIRST store displaces.
     for (auto& [m, isOk] : ok) {
-        if (!isOk) continue;
         const ast::Expr* init = nullptr;
+        bool ownedField = false;
         // SEAM-ACCESSOR: see the note in PHASE 1 -- ts is local, so
         // every m->decl here is always local. #3152
-        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl)) {
             init = fd->initializer.get();
+            for (auto mod : fd->modifiers)
+                if (mod == "owned") ownedField = true;
+        }
         // SEAM-ACCESSOR: same reason as the FieldDecl arm just above.
         else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
             init = pd->autoInitializer.get();
+        if (ownedField) dynBlocked[m] = true;  // fix #8215
         if (!init) continue;  // no initializer → calloc-zeroed null → OK
         // fix-forward #7968: a `:= null` initializer is the same zeroed
         // null — neutral, exactly as in `checkStore` above.
@@ -48765,17 +48867,33 @@ void Emitter::collectBoxStorageFields() {
         // Synthesize a check: the "target" symbol is m, the "source" is
         // init. We check the init directly.
         const sema::TypeRef* srcTy = ctx_.exprType(*init);
-        if (!srcTy) { isOk = false; continue; }
+        if (!srcTy) { isOk = false; dynBlocked[m] = true; continue; }
         bool isBoxableSource =
             isBoxableValueType(srcTy) || isNullableValueTy(srcTy);
         bool isBoxReturnCall = isUserMethodBoxReturnCall(init);
-        if (!isBoxableSource && !isBoxReturnCall)
+        if (isBoxableSource || isBoxReturnCall) {
+            sawBox[m] = true;
+        } else {
             isOk = false;
+            // fix #8215: the initializer (emitInstanceInit) takes no +1 on a
+            // non-box value, so an initializer whose run-time value can be
+            // a box (an `Object`/interface-typed expression) cannot join the
+            // dynamic discipline; a class instance or a string cannot be one.
+            if (isObjectOrInterfaceTarget(srcTy)) dynBlocked[m] = true;
+        }
     }
 
     // PHASE 5 — add the fields that survived as box-only to boxStorageFields_.
     for (auto& [m, isOk] : ok) {
         if (isOk) boxStorageFields_.insert(static_cast<const void*>(m));
+        // fix #8215 (§28.9 / §8.6, v0.357): a field the box-only join
+        // excluded that nevertheless holds boxes (some store or the
+        // initializer puts one in the slot) gets the DYNAMIC discipline
+        // (dynBoxStorageFields_), provided every one of its writes is one the
+        // store sites handle. Before this the field's boxes were never
+        // released: every Holder leaked its last box.
+        else if (sawBox[m] && !dynBlocked[m])
+            dynBoxStorageFields_.insert(static_cast<const void*>(m));
     }
 }
 
@@ -48990,7 +49108,16 @@ bool Emitter::lowerObjectStringFieldStore(const ast::Expr& target,
         }
     }
     if (!producer) emitStringRetain(newVal);
+    // fix #8215 (§28.9, v0.357): a dynamic box-storage field's displaced value
+    // may be a box this field owns; release it (guarded by the run-time box
+    // test -- a displaced string or class instance is left alone).
+    sema::Symbol* dynSym = ctx_.exprSymbol(target);
+    llvm::Value* dynOld =
+        isDynBoxStorageMember(dynSym)
+            ? builder_.CreateLoad(ptrTy(), fieldAddr, "dynbox.str.old")
+            : nullptr;
     builder_.CreateStore(newVal, fieldAddr);
+    if (dynOld) emitObjectSlotBoxOp(dynOld, /*retain=*/false);
     // narrow #8214 fix-forward: the DISPLACED value is NOT released. It may
     // be a class instance, a box or a function value stored by a lambda body,
     // a `??=`, or another module, and a string release of it corrupts the

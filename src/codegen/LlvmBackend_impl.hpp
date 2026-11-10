@@ -22690,6 +22690,37 @@ private:
         return boxStorageFields_.count(static_cast<const void*>(m)) != 0;
     }
 
+    // fix #8215 (§28.9 / §8.6, v0.357): the DYNAMIC box-storage fields -- an
+    // Object/interface-typed class field that receives BOTH a box (so some
+    // store gives it a +1 box) AND a non-box (a class instance, a string, an
+    // `Object`-typed parameter, ...). The static pre-pass cannot call such a
+    // field "box-only", and a field it excludes was never released, so every
+    // box the field held leaked. The slot's occupant is told apart AT RUN
+    // TIME instead (emitObjectSlotBoxOp: the #8118 discriminator): every store
+    // takes a +1 on a box and ignores anything else, the displaced value and
+    // the disposer release a box and ignore anything else. Disjoint from
+    // boxStorageFields_ (the box-ONLY fields keep their static, unguarded
+    // retain/release).
+    std::unordered_set<const void*> dynBoxStorageFields_;
+    bool isDynBoxStorageMember(const sema::Symbol* m) {
+        return m &&
+               dynBoxStorageFields_.count(static_cast<const void*>(m)) != 0;
+    }
+
+    // fix #8215: `bz_box_retain` (retain=true) / `bz_box_release` (false) on
+    // `obj` IFF its runtime value is a genuine §8.6 box -- not null, not a
+    // string, not a function value, not a tagged built-in, not a class
+    // instance (including the `Object` root). The discriminator is the one
+    // emitObjectSlotDisposal (#8118) uses.
+    void emitObjectSlotBoxOp(llvm::Value* obj, bool retain);
+
+    // fix #8215: the store of a NON-box source (class instance, `Object`
+    // parameter, null, ...) into a dynamic box-storage field: retain-new
+    // (dynamic) / store / release-old (dynamic).
+    bool lowerDynBoxFieldStore(const ast::Expr& target, llvm::Value* fieldAddr,
+                               llvm::Value* newVal,
+                               const ast::Expr* valueExpr);
+
     // fix #8214 (§28.9 / §4.6 / §8.6, v0.355): the OBJECT-STRING STORAGE
     // fields — every Object/interface-typed instance field / auto-property of
     // a class compiled in this module (collectObjectStringStorageFields). A

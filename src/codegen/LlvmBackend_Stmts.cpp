@@ -2100,6 +2100,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled)
                     handled = lowerObjectStringFieldStore(*as->target, addr,
                                                           rhs, as->value.get());
+                // fix #8215 / §28.9 / §8.6 (v0.357): a non-box store into a
+                // DYNAMIC box-storage field (one that also takes box stores):
+                // give the field the +1 on a run-time box and release the
+                // displaced box, so every box the field holds is released at
+                // its disposal. Placed AFTER the box arm (a box source) and
+                // the string arm (a string source), which own those kinds.
+                if (!handled && as->op == ":=")
+                    handled = lowerDynBoxFieldStore(*as->target, addr, rhs,
+                                                    as->value.get());
                 // #824 / §28.5 / §28.9: a store into a CLASS `owned` collection
                 // field (OwningArray<T>/OwningStack<T>/OwningQueue<T>/OwningSet<T>/
                 // OwningLinkedList<T>/OwningBuffer<T>/OwningDictionary<T> etc.)

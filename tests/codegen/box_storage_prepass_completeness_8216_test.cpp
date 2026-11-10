@@ -63,30 +63,19 @@
 //     into the expression forms (so a lambda's body is reached wherever the
 //     lambda appears) and it scans the destructor bodies of EVERY local class.
 //
-// WHAT IS NOT CLAIMED HERE. The mixed field's LAST value is still not
-// released at disposal (a field the pre-pass excludes is not a box-storage
-// field, so its final box leaks). That is the pre-existing #8215 leak — a
-// field that also stores an `Object`-typed value leaks every box it holds —
-// and it is NOT closed by this change. What this change closes is the
-// OVER-RELEASE: nothing is released as a box that is not a box.
+// THE FINAL BOX. A mixed field's LAST value used to leak (a field the
+// pre-pass excludes is not a box-storage field, so its final box was never
+// released): the #8215 leak. Since #8215 (v0.357) such a field is released
+// through the run-time box test (`emitObjectSlotBoxOp`), so what this change
+// closes (nothing is released as a box that is not a box) and what #8215
+// closes (the box a mixed field holds IS released) both hold.
 //
 // THE ORACLE. `runAotChecked` links the generated program under ASan with
 // LeakSanitizer armed (`detect_leaks=1`), so a leak OR a sanitizer report
-// turns into `ran == false`. Rows 1, 2 and 4 use it and are leak-clean: the
-// values those rows put in the mixed field are a `StringBuilder` and a class
-// instance, neither of which is refcounted, and each is released by its own
-// owner.
-//
-// Row 3 uses `runAot` (LeakSanitizer off): the field it exercises ends up
-// holding a BOX, and a mixed field's final box is not released at disposal.
-// That is the pre-existing #8215 leak, which this issue does NOT close (see
-// the RESIDUAL note above); it is not a leak this change introduces (the
-// base leaks the same 24 B on the equivalent shape — it prints "6" instead of
-// "7" and leaks the same box). `runAot` still fails the row on the crash: on
-// the base the class instance is released as a box, so the program prints "6"
-// (the row's expected "7" fails), and under the ASan sweep
-// (`BEZEL_AOT_FORCE_SANITIZE=address`, which the gate runs) the generated
-// program is AddressSanitizer-instrumented too.
+// turns into `ran == false`. Every row uses it. Row 3 used to run under
+// `runAot` (LeakSanitizer off) because the field it exercises ends up holding
+// a BOX that leaked at disposal; on the base the class instance was released
+// as a box, so the program printed "6" (the row's expected "7" fails).
 
 #include <string>
 
@@ -95,7 +84,6 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
-using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -286,7 +274,8 @@ BEZEL_TEST(codegen_box_storage_prepass_completeness_8216,
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_box_storage_prepass_completeness_8216,
            spec_8_6_class_instance_overwritten_by_box_is_not_released_as_box) {
-    JitResult r = runAot(kClassInstanceOverwrittenByBox);
+    JitResult r = runAotChecked(kClassInstanceOverwrittenByBox);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "7\n");
