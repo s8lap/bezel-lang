@@ -1048,6 +1048,7 @@ The edits of §8.3–§8.12 cover the defining occurrences. The remaining ones a
 - **Newly admitted** (already at stage 2): a class-typed `scoped` argument against a plain `var` holder, a moved holder, and a holder placed in an `owned` field of the bounding object; `scoped` at a parameter declared at a type parameter.
 - **Newly defined:** the source set of a class instance and of a move-only value that owns one; what an `out owned` recipient, an awaited result and an owning iteration's element carry; which standard-library results carry the receiver's set alone.
 - **No longer warned:** the report's field-held, collection-held and comparer-held lines.
+- **Rejected without a stage-1 report line** (v0.357 meaning-gate note): when §30.14's "No carrier type is sendable" lands, a sealed class that is borrow-bearing only through a store member becomes unsendable. A program that uses such a class at a sendable position compiles at v0.357 and draws no stage-1 line, yet stage 3 rejects it. The positions are a `sendable`-constrained instantiation, a spawn argument and a channel element. The stage-3 Migration note must list these, or its "a program with no such warning compiles unchanged" claim is false for them. Stage 2's warning should cover them first.
 - **Ramp:** §7.3's paragraph.
 - **Spec-ahead-of-impl:** §10's trackers.
 
