@@ -783,3 +783,32 @@ BEZEL_TEST(parse_radix_binding_7285,
     if (exe.empty()) return;
     BEZEL_EXPECT_EQ(captureStdout7285(exe), std::string("255\n"));
 }
+
+// ---------------------------------------------------------------------------
+// #7315 (stdlib §9.1, v0.357): the radix arms' first-argument guard is the
+// ONE shared helper `sharedParseOperandAdmissible` (no `ReadOnlyStringSpan`
+// overload of the radix form is declared; an operand whose static type sema
+// did not stamp is admitted on its pointer shape). The operand below is a
+// generic call's result, whose static type reaches codegen through the
+// instantiation rather than as a literal `string`. Both radix arms must
+// still lower it. A RADIX-FORM `ReadOnlyStringSpan` operand stays refused
+// (stdlib §9.1 declares string input only).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(parse_radix_binding_7285,
+           radix_forms_admit_a_generic_call_string_operand_7315) {
+    JitResult r = runAot(
+        "module M;\n"
+        "class C\n"
+        "  public static method Id<T>(x: T): T => x;\n"
+        "  public static method Main(): int\n"
+        "    var v: int := 0;\n"
+        "    var ok: bool := int.TryParse(Id<string>(\"ff\"), 16, out v);\n"
+        "    Console.WriteLine(ok);\n"
+        "    Console.WriteLine(v);\n"
+        "    Console.WriteLine(int.Parse(Id<string>(\"ff\"), 16));\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n");
+    expectCompiledWithoutIRFailure(r);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("True\n255\n255\n"));
+}

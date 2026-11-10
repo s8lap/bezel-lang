@@ -2699,12 +2699,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         (pt == P::Int || pt == P::Long || pt == P::UInt || pt == P::ULong ||
          pt == P::Short || pt == P::UShort || pt == P::Byte ||
          pt == P::SByte)) {
-        {
-            auto* sTy = ctx_.exprType(*call.args[0].value);
-            if (!sTy || sTy->kind != sema::TypeRef::Kind::Primitive ||
-                sTy->primitive != P::String)
-                return nullptr;
-        }
+        // fix #7315 (stdlib §9.1, v0.357): the first-argument guard is the
+        // ONE shared spelling, `sharedParseOperandAdmissible` — §9.1
+        // declares NO `ReadOnlyStringSpan` overload of the radix form
+        // (`spanOverloadDeclared = false`), and an operand whose static type
+        // sema could not determine is admitted on its pointer SHAPE like
+        // every other guard site. The operand is lowered first (§22.5: the
+        // first argument's expression runs first) so the helper can see its
+        // shape; the guard still precedes the radix's own diagnostic.
+        llvm::Value* strVal = lowerExpr(*call.args[0].value);
+        if (!strVal) return nullptr;
+        if (!isParseableOperand(*call.args[0].value, strVal, false))
+            return nullptr;
         const ParseRadixBinding rb =
             parseRadixBinding(ctx_, *call.args[1].value);
         if (!rb.binds) {
@@ -2722,8 +2728,6 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                         "(stdlib §9.1; §5.1)" + parseRadixWhy(rb));
             return nullptr;
         }
-        llvm::Value* strVal = lowerExpr(*call.args[0].value);
-        if (!strVal) return nullptr;
         // The radix, CONVERTED to the `int` the parameter declares (§5.1) —
         // the same conversion the `Parse(s, radix)` site performs.
         //
@@ -3013,12 +3017,16 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     // guard, per-width range-check for OverflowException.
     if (m == "Parse" && call.args.size() == 2 && call.args[0].value &&
         call.args[1].value) {
-        auto* argTy = ctx_.exprType(*call.args[0].value);
-        if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
-            argTy->primitive == P::String &&
-            (pt == P::Int || pt == P::UInt || pt == P::Short ||
+        if ((pt == P::Int || pt == P::UInt || pt == P::Short ||
              pt == P::UShort || pt == P::Byte || pt == P::SByte ||
              pt == P::Long || pt == P::ULong)) {
+            // fix #7315 (stdlib §9.1, v0.357): the first-argument guard is
+            // the ONE shared spelling (no span overload of the radix form
+            // is declared; an unknown static type is admitted on its SHAPE).
+            llvm::Value* sArg = lowerExpr(*call.args[0].value);
+            if (!sArg) return nullptr;
+            if (!isParseableOperand(*call.args[0].value, sArg, false))
+                return nullptr;
             // fix #7285 (spec §5.1 / §22.6, v0.344): the `radix: int`
             // parameter (stdlib §9.1) admits the argument by IDENTITY, by
             // §5.1's WIDENING table, or by §5.1's CONSTANT NARROWING. An
@@ -3052,8 +3060,6 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                             parseRadixWhy(rb));
                 return nullptr;
             }
-            llvm::Value* sArg = lowerExpr(*call.args[0].value);
-            if (!sArg) return nullptr;
             llvm::Value* data = loadStringData(sArg);
             // The radix, CONVERTED to the `int` the parameter declares (§5.1):
             // a widened value is EXTENDED (a trunc to a wider type is
