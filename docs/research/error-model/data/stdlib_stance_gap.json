@@ -1,0 +1,25 @@
+{
+ "sections_total": 82,
+ "sections_naming_an_expected_failure": 33,
+ "of_which_with_try_member": 17,
+ "of_which_with_ornull_member": 11,
+ "of_which_with_both": 10,
+ "of_which_with_neither": 15,
+ "neither_list": [
+  "2.15 Concrete serialization formats",
+  "2.17 Built-in exception types (cross-reference)",
+  "2.18 IFormattable and format specifiers (#812/#1339)",
+  "3.1 StringBuilder",
+  "3.2 Encoding",
+  "6.1 CancellationToken and CancellationTokenSource",
+  "6.5 Events: IEvent, EventSource, ISharedEvent, SharedEventSource",
+  "6.7 Task static helpers",
+  "6.8 Domain",
+  "6.12 Parallel",
+  "7.1 Stream",
+  "7.2 FileStream",
+  "7.3 File",
+  "7.4 TextReader, TextWriter, Directory, Path",
+  "7.5 IO exception types"
+ ]
+}

@@ -1,0 +1,867 @@
+{
+ "rules": {
+  "files": 5902,
+  "programs": 5902,
+  "site_counts": {
+   "method_decl": 18071,
+   "using_var": 2651,
+   "try_stmt": 705,
+   "end_try": 0,
+   "catch_block": 689,
+   "ornull_call": 128,
+   "try_call": 145,
+   "null_forgive": 168,
+   "throw_new": 383,
+   "exception_decl": 60,
+   "result_type": 33,
+   "ok_error_ctor": 120,
+   "await": 627,
+   "choice_decl": 509,
+   "throw_bare": 11,
+   "requires": 36,
+   "throw_other": 17,
+   "finally": 93,
+   "coalesce_throw": 5,
+   "ensures": 14,
+   "invariant": 4,
+   "suppress_all": 1
+  },
+  "files_with": {
+   "method_decl": 5821,
+   "using_var": 1712,
+   "try_stmt": 531,
+   "end_try": 243,
+   "catch_block": 466,
+   "_any_exception_syntax": 601,
+   "_any_failure_signal": 831,
+   "ornull_call": 78,
+   "_any_try_or_ornull_call": 188,
+   "try_call": 110,
+   "null_forgive": 134,
+   "throw_new": 262,
+   "_two_or_more_mechanisms": 10,
+   "exception_decl": 51,
+   "result_type": 19,
+   "ok_error_ctor": 52,
+   "_any_result": 52,
+   "await": 286,
+   "choice_decl": 362,
+   "throw_bare": 11,
+   "requires": 31,
+   "throw_other": 17,
+   "finally": 84,
+   "coalesce_throw": 5,
+   "ensures": 12,
+   "invariant": 4,
+   "suppress_all": 1
+  },
+  "throw_new_by_band": {
+   "defect_band": 310,
+   "recoverable_band": 2,
+   "base_Exception": 21,
+   "other_or_user": 50
+  },
+  "catch_arm_by_band": {
+   "defect_band": 559,
+   "recoverable_band": 110,
+   "base_Exception": 73,
+   "other_or_user": 36
+  },
+  "throw_new_top": [
+   [
+    "InvalidOperationException",
+    254
+   ],
+   [
+    "ArgumentException",
+    52
+   ],
+   [
+    "Exception",
+    21
+   ],
+   [
+    "E",
+    10
+   ],
+   [
+    "BoomException",
+    10
+   ],
+   [
+    "MyError",
+    8
+   ],
+   [
+    "Boom",
+    3
+   ],
+   [
+    "IOException",
+    2
+   ],
+   [
+    "ArgumentOutOfRangeException",
+    2
+   ],
+   [
+    "InnerException",
+    2
+   ],
+   [
+    "NarrowException",
+    2
+   ],
+   [
+    "ExA",
+    2
+   ],
+   [
+    "ExB",
+    2
+   ],
+   [
+    "B",
+    1
+   ],
+   [
+    "D",
+    1
+   ],
+   [
+    "W",
+    1
+   ],
+   [
+    "IndexOutOfRangeException",
+    1
+   ],
+   [
+    "R",
+    1
+   ],
+   [
+    "HeavyError",
+    1
+   ],
+   [
+    "BadAmountException",
+    1
+   ],
+   [
+    "AmountException",
+    1
+   ],
+   [
+    "ConnectException",
+    1
+   ],
+   [
+    "SiblingB",
+    1
+   ],
+   [
+    "RetryableException",
+    1
+   ],
+   [
+    "TimeoutLikeException",
+    1
+   ]
+  ],
+  "catch_arm_top": [
+   [
+    "InvalidOperationException",
+    164
+   ],
+   [
+    "OverflowException",
+    122
+   ],
+   [
+    "ArgumentException",
+    120
+   ],
+   [
+    "DivideByZeroException",
+    74
+   ],
+   [
+    "Exception",
+    73
+   ],
+   [
+    "SerializationException",
+    45
+   ],
+   [
+    "FormatException",
+    39
+   ],
+   [
+    "ArgumentOutOfRangeException",
+    31
+   ],
+   [
+    "IndexOutOfRangeException",
+    16
+   ],
+   [
+    "OperationCanceledException",
+    14
+   ],
+   [
+    "BoomException",
+    9
+   ],
+   [
+    "TypeInitializationException",
+    8
+   ],
+   [
+    "DisposedAccessException",
+    8
+   ],
+   [
+    "NullReferenceException",
+    4
+   ],
+   [
+    "KeyNotFoundException",
+    4
+   ],
+   [
+    "ChannelClosedException",
+    4
+   ],
+   [
+    "ContractViolationException",
+    4
+   ],
+   [
+    "MatchFailureException",
+    3
+   ],
+   [
+    "ChannelFullException",
+    2
+   ],
+   [
+    "FileNotFoundException",
+    2
+   ],
+   [
+    "E",
+    2
+   ],
+   [
+    "IOException",
+    2
+   ],
+   [
+    "MyError",
+    2
+   ],
+   [
+    "InnerException",
+    2
+   ],
+   [
+    "BroadException",
+    2
+   ]
+  ]
+ },
+ "docex": {
+  "files": 688,
+  "programs": 688,
+  "site_counts": {
+   "choice_decl": 11,
+   "method_decl": 1764,
+   "requires": 29,
+   "ensures": 8,
+   "throw_new": 52,
+   "coalesce_throw": 5,
+   "using_var": 298,
+   "ornull_call": 61,
+   "try_call": 125,
+   "result_type": 17,
+   "ok_error_ctor": 37,
+   "await": 127,
+   "try_stmt": 21,
+   "end_try": 0,
+   "catch_block": 19,
+   "null_forgive": 20,
+   "invariant": 3,
+   "finally": 10,
+   "throw_other": 2,
+   "throw_bare": 6,
+   "suppress_all": 1,
+   "exception_decl": 8
+  },
+  "files_with": {
+   "method_decl": 395,
+   "choice_decl": 11,
+   "requires": 19,
+   "ensures": 8,
+   "throw_new": 41,
+   "coalesce_throw": 5,
+   "_any_exception_syntax": 59,
+   "_any_failure_signal": 132,
+   "using_var": 204,
+   "ornull_call": 35,
+   "_any_try_or_ornull_call": 75,
+   "try_call": 56,
+   "result_type": 9,
+   "ok_error_ctor": 11,
+   "_any_result": 11,
+   "_two_or_more_mechanisms": 13,
+   "await": 65,
+   "try_stmt": 21,
+   "end_try": 4,
+   "catch_block": 19,
+   "null_forgive": 18,
+   "invariant": 3,
+   "finally": 10,
+   "throw_other": 2,
+   "throw_bare": 6,
+   "suppress_all": 1,
+   "exception_decl": 7
+  },
+  "throw_new_by_band": {
+   "defect_band": 39,
+   "recoverable_band": 8,
+   "base_Exception": 0,
+   "other_or_user": 5
+  },
+  "catch_arm_by_band": {
+   "defect_band": 6,
+   "recoverable_band": 6,
+   "base_Exception": 12,
+   "other_or_user": 4
+  },
+  "throw_new_top": [
+   [
+    "IndexOutOfRangeException",
+    18
+   ],
+   [
+    "InvalidOperationException",
+    11
+   ],
+   [
+    "ArgumentException",
+    8
+   ],
+   [
+    "IOException",
+    6
+   ],
+   [
+    "FormatException",
+    2
+   ],
+   [
+    "ConfigError",
+    1
+   ],
+   [
+    "ProtocolException",
+    1
+   ],
+   [
+    "ConfigException",
+    1
+   ],
+   [
+    "DataAccessException",
+    1
+   ],
+   [
+    "UpstreamException",
+    1
+   ],
+   [
+    "ArgumentOutOfRangeException",
+    1
+   ],
+   [
+    "KeyNotFoundException",
+    1
+   ]
+  ],
+  "catch_arm_top": [
+   [
+    "Exception",
+    12
+   ],
+   [
+    "InvalidOperationException",
+    5
+   ],
+   [
+    "TransientException",
+    2
+   ],
+   [
+    "IOException",
+    2
+   ],
+   [
+    "TimeoutException",
+    2
+   ],
+   [
+    "ConfigError",
+    1
+   ],
+   [
+    "FormatException",
+    1
+   ],
+   [
+    "ArgumentException",
+    1
+   ],
+   [
+    "SqlException",
+    1
+   ],
+   [
+    "FileNotFoundException",
+    1
+   ]
+  ]
+ },
+ "lit": {
+  "files": 2574,
+  "programs": 2574,
+  "site_counts": {
+   "using_var": 540,
+   "method_decl": 4709,
+   "await": 91,
+   "exception_decl": 20,
+   "requires": 8,
+   "null_forgive": 34,
+   "throw_new": 38,
+   "try_stmt": 70,
+   "end_try": 0,
+   "catch_block": 43,
+   "choice_decl": 88,
+   "ok_error_ctor": 21,
+   "ensures": 4,
+   "invariant": 3,
+   "try_call": 71,
+   "finally": 32,
+   "ornull_call": 3,
+   "result_type": 4,
+   "throw_bare": 5,
+   "throw_other": 4
+  },
+  "files_with": {
+   "method_decl": 2329,
+   "using_var": 391,
+   "await": 60,
+   "exception_decl": 16,
+   "requires": 7,
+   "null_forgive": 30,
+   "try_stmt": 59,
+   "end_try": 16,
+   "catch_block": 34,
+   "throw_new": 28,
+   "_any_exception_syntax": 74,
+   "_any_failure_signal": 147,
+   "choice_decl": 81,
+   "ok_error_ctor": 10,
+   "_any_result": 11,
+   "ensures": 3,
+   "invariant": 1,
+   "try_call": 60,
+   "_any_try_or_ornull_call": 63,
+   "_two_or_more_mechanisms": 1,
+   "finally": 30,
+   "ornull_call": 3,
+   "result_type": 1,
+   "throw_bare": 5,
+   "throw_other": 4
+  },
+  "throw_new_by_band": {
+   "defect_band": 25,
+   "recoverable_band": 0,
+   "base_Exception": 5,
+   "other_or_user": 8
+  },
+  "catch_arm_by_band": {
+   "defect_band": 8,
+   "recoverable_band": 2,
+   "base_Exception": 34,
+   "other_or_user": 17
+  },
+  "throw_new_top": [
+   [
+    "InvalidOperationException",
+    13
+   ],
+   [
+    "ArgumentException",
+    12
+   ],
+   [
+    "Exception",
+    5
+   ],
+   [
+    "TransientError",
+    3
+   ],
+   [
+    "AppError",
+    2
+   ],
+   [
+    "Error",
+    1
+   ],
+   [
+    "MyErr",
+    1
+   ],
+   [
+    "Widget",
+    1
+   ]
+  ],
+  "catch_arm_top": [
+   [
+    "Exception",
+    34
+   ],
+   [
+    "ArgumentException",
+    6
+   ],
+   [
+    "IRetryable",
+    3
+   ],
+   [
+    "Dog",
+    3
+   ],
+   [
+    "TA",
+    2
+   ],
+   [
+    "TB",
+    2
+   ],
+   [
+    "TC",
+    2
+   ],
+   [
+    "IOException",
+    2
+   ],
+   [
+    "StackOverflowException",
+    2
+   ],
+   [
+    "DisposedAccessException",
+    1
+   ],
+   [
+    "MyErr",
+    1
+   ],
+   [
+    "TD",
+    1
+   ],
+   [
+    "Object",
+    1
+   ],
+   [
+    "OverflowException",
+    1
+   ]
+  ]
+ },
+ "gtest": {
+  "files": 4358,
+  "programs": 27745,
+  "site_counts": {
+   "using_var": 18437,
+   "method_decl": 68169,
+   "try_stmt": 2648,
+   "catch_block": 2442,
+   "null_forgive": 1753,
+   "await": 2562,
+   "ornull_call": 452,
+   "try_call": 1048,
+   "throw_new": 1102,
+   "exception_decl": 455,
+   "end_try": 0,
+   "throw_bare": 42,
+   "finally": 363,
+   "choice_decl": 1118,
+   "ok_error_ctor": 413,
+   "requires": 74,
+   "throw_other": 70,
+   "ensures": 57,
+   "invariant": 182,
+   "result_type": 296,
+   "coalesce_throw": 42,
+   "suppress_all": 4
+  },
+  "files_with": {
+   "method_decl": 4272,
+   "using_var": 2256,
+   "try_stmt": 587,
+   "catch_block": 559,
+   "_any_exception_syntax": 635,
+   "_any_failure_signal": 836,
+   "null_forgive": 453,
+   "await": 338,
+   "ornull_call": 55,
+   "_any_try_or_ornull_call": 218,
+   "try_call": 174,
+   "_two_or_more_mechanisms": 62,
+   "throw_new": 295,
+   "exception_decl": 121,
+   "end_try": 83,
+   "throw_bare": 26,
+   "finally": 65,
+   "choice_decl": 273,
+   "ok_error_ctor": 40,
+   "_any_result": 46,
+   "requires": 21,
+   "throw_other": 24,
+   "invariant": 26,
+   "ensures": 11,
+   "result_type": 20,
+   "coalesce_throw": 14,
+   "suppress_all": 2,
+   "_all_three_mechanisms": 1
+  },
+  "throw_new_by_band": {
+   "defect_band": 470,
+   "recoverable_band": 17,
+   "base_Exception": 199,
+   "other_or_user": 416
+  },
+  "catch_arm_by_band": {
+   "defect_band": 1205,
+   "recoverable_band": 370,
+   "base_Exception": 522,
+   "other_or_user": 518
+  },
+  "throw_new_top": [
+   [
+    "InvalidOperationException",
+    380
+   ],
+   [
+    "Exception",
+    199
+   ],
+   [
+    "ArgumentException",
+    73
+   ],
+   [
+    "E",
+    64
+   ],
+   [
+    "AppError",
+    49
+   ],
+   [
+    "ErrA",
+    27
+   ],
+   [
+    "Boom",
+    21
+   ],
+   [
+    "MyErr",
+    21
+   ],
+   [
+    "E1",
+    20
+   ],
+   [
+    "MyError",
+    17
+   ],
+   [
+    "AppErr",
+    17
+   ],
+   [
+    "ErrB",
+    14
+   ],
+   [
+    "BX",
+    12
+   ],
+   [
+    "E2",
+    11
+   ],
+   [
+    "IOException",
+    11
+   ],
+   [
+    "OtherErr",
+    10
+   ],
+   [
+    "Error",
+    9
+   ],
+   [
+    "C",
+    8
+   ],
+   [
+    "MyExc",
+    8
+   ],
+   [
+    "Wrap",
+    8
+   ],
+   [
+    "OverflowException",
+    7
+   ],
+   [
+    "Exc",
+    5
+   ],
+   [
+    "IndexOutOfRangeException",
+    4
+   ],
+   [
+    "A2",
+    4
+   ],
+   [
+    "GX",
+    4
+   ]
+  ],
+  "catch_arm_top": [
+   [
+    "Exception",
+    522
+   ],
+   [
+    "InvalidOperationException",
+    360
+   ],
+   [
+    "OverflowException",
+    311
+   ],
+   [
+    "ContractViolationException",
+    161
+   ],
+   [
+    "SerializationException",
+    141
+   ],
+   [
+    "FormatException",
+    141
+   ],
+   [
+    "ArgumentException",
+    101
+   ],
+   [
+    "IndexOutOfRangeException",
+    96
+   ],
+   [
+    "E",
+    74
+   ],
+   [
+    "AppError",
+    55
+   ],
+   [
+    "DisposedAccessException",
+    50
+   ],
+   [
+    "BX",
+    47
+   ],
+   [
+    "IOException",
+    43
+   ],
+   [
+    "DivideByZeroException",
+    42
+   ],
+   [
+    "Error",
+    35
+   ],
+   [
+    "E1",
+    34
+   ],
+   [
+    "ArgumentOutOfRangeException",
+    33
+   ],
+   [
+    "ErrA",
+    31
+   ],
+   [
+    "TypeInitializationException",
+    26
+   ],
+   [
+    "AppErr",
+    23
+   ],
+   [
+    "E2",
+    19
+   ],
+   [
+    "ErrB",
+    19
+   ],
+   [
+    "OperationCanceledException",
+    16
+   ],
+   [
+    "Boom",
+    16
+   ],
+   [
+    "ChannelClosedException",
+    16
+   ]
+  ]
+ }
+}

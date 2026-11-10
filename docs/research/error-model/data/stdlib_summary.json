@@ -1,0 +1,39 @@
+{
+  "document": "docs/Bezel_Standard_Library.md",
+  "member_declarations": 1342,
+  "by_kind": {
+    "method": 1036,
+    "property": 208,
+    "constructor": 92,
+    "operator": 6
+  },
+  "by_tier": {
+    "plain": 1191,
+    "nullable": 24,
+    "ornull": 26,
+    "try": 94,
+    "choice": 7
+  },
+  "documented_throwing_members_lower_bound": 90,
+  "distinct_try_names": 54,
+  "distinct_ornull_names": 11,
+  "choice_types_declared": [
+    "Result"
+  ],
+  "choice_returning_members": [
+    "Result<T, E>.Map: Result<U, E>",
+    "Result<T, E>.MapError: Result<T, F>",
+    "Result<T, E>.AndThen: Result<U, E>",
+    ".ParsePort: Result<int, string>",
+    "ConfigError.PortSetting: Result<int, ConfigError>",
+    "ConfigError.WellKnownPort: Result<int, string>",
+    ".Connect: Result<Connection, string>"
+  ],
+  "distinct_exception_type_names_in_prose": 28,
+  "exception_mentions_in_prose": 182,
+  "tier_families_same_type": 89,
+  "tier_families_three_way": 10,
+  "tier_families_base_plus_try": 71,
+  "tier_families_base_plus_ornull": 8,
+  "tier_families_try_plus_ornull_only": 0
+}

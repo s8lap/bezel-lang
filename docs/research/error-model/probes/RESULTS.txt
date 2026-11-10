@@ -1,0 +1,170 @@
+compiler: bezelc 0.0.0-a30bb11d
+== p01_three_tiers
+-- compile exit 0
+indexer threw KeyNotFoundException
+TryGetValue false
+GetOrNull ?? -1 = -1
+?? throw: no smtp port configured
+! on null: NullReferenceException ''
+Parse threw FormatException: 
+TryParse false, out = 0
+True
+Parse overflow: OverflowException
+False
+TryParse(radix 7): ArgumentException
+-- run exit 0
+
+== p02_unwind_vs_return
+p02_unwind_vs_return.bzl:23:7: warning: owned value in `c` is implicitly disposed at the end of its scope (§28.3 must-use auto-drop); declare it `using var` to make the scope-bound disposal explicit, or `move` `return` `.Dispose()` `_ := …` to discharge it
+-- compile exit 0
+normal:
+  open a
+  open b
+  open c
+  body done
+  close c
+  close b
+  finally
+  open d
+  close d
+  close a
+early return:
+  open a
+  open b
+  open c
+  close c
+  close b
+  finally
+  close a
+throw:
+  open a
+  open b
+  open c
+  close c
+  close b
+  finally
+  close a
+  caught boom
+-- run exit 0
+
+== p03_async_fault
+-- compile exit 0
+await in try:
+  open conn
+  close conn
+  caught bad reply
+two awaiters of one faulted task:
+  open conn
+  close conn
+  awaiter 1 caught bad reply
+  awaiter 2 caught bad reply
+  IsFaulted = True
+-- run exit 0
+
+== p04_domain_fault
+-- compile exit 0
+matched DomainFaultedException: Message='app.toml'
+ToString: System.Threading.DomainFaultedException
+bug also arrives as DomainFaultedException: ''
+-- run exit 0
+
+== p05_catch_borrow_escape
+p05_catch_borrow_escape.bzl:13:9: caught exception `ex` may not be assigned to `kept` — a caught exception is a borrow whose lifetime is the catch arm body (the runtime disposes it after the arm completes), and `kept` lives in an enclosing block that outlives the arm, so a later read would see a disposed exception (§31.1; copy the data you need out of it — e.g. its message — into an owned value instead)
+-- compile exit 1
+
+== p06_result_propagation
+-- compile exit 0
+ok db:5432
+error port: out of range: 70000
+error host: empty
+error port: not a number: x
+8080
+-- run exit 0
+
+== p07_task_of_owning_result
+p07_task_of_owning_result.bzl:14:53: `Task<Result>` declares a move-only value result — `Result` is an owning-classified choice (§15.3), and no §30.5 producer row admits a move-only value result: a `Task<T>`OwningTask<T>` declared over an owning choice (or an owning inline array) is a compile error at the declaration (§30.1, §30.5, §35.4)
+p07_task_of_owning_result.bzl:24:44: cannot `move` the `case` arm binding `c`: a pattern binding is a BORROW whose source is the scrutinee's source (§19.3) and an unmarked named owned binding, or a borrowed scrutinee of any provenance, in scrutinee position stays a BORROWING match, which transfers nothing, so the scrutinee's owner still disposes the value — the transfer would give it a second owner and dispose it twice (§28.3 K8.K3.1, §35.5, v0.307). Announce the consume at the SCRUTINEE instead (`case move <scrutinee> of …`, §35.5's owning match), or read through the binding without transferring.
+-- compile exit 1
+
+== p08_result_across_domain
+ZExt only operates on integer
+  %spawn.ret.zext = zext %"choice.Result$spec0" %1 to i64
+bezelc: codegen error: IR verification failed (malformed IR emitted; see report above)
+-- compile exit 1
+
+== p09_cost_of_failure
+-- compile exit 0
+TryParse failure      : 15 ms for 2000000
+Parse + catch         : 152 ms for 2000000
+Parse + catch, 8 frames: 262 ms for 2000000
+TryGetValue miss      : 7 ms for 2000000
+GetOrNull miss        : 7 ms for 2000000
+indexer + catch       : 137 ms for 2000000
+TryParse success      : 16 ms for 2000000
+Parse in try, success : 17 ms for 2000000
+-- run exit 0
+
+== p10_uncaught_exit
+-- compile exit 0
+open
+close (ran during the uncaught unwind)
+Unhandled exception: System.FormatException
+-- run exit 70
+
+== p11_exception_owned_payload
+-- compile exit 0
+  in arm: empty / field=name
+  dispose Detail field=name
+  after try
+-- run exit 0
+
+== p12_library_try_or_null
+-- compile exit 0
+named failure, bad input : True
+blanket form hides a bug : True
+named form lets the bug through: IndexOutOfRangeException
+-- run exit 0
+
+== p13_supersession
+-- compile exit 0
+caught the cleanup failure: cleanup failed
+-- run exit 0
+
+== p14_bug_and_failure_one_door
+-- compile exit 0
+case 0: one arm caught System.ContractViolationException
+case 1: one arm caught System.IndexOutOfRangeException
+case 2: one arm caught System.FormatException
+-- run exit 0
+
+== p15_owned_result_to_null
+-- compile exit 0
+good host:
+  open db
+  db <- hello
+  close db
+bad host:
+  unreachable, falling back
+-- run exit 0
+
+== p16_band_marker_interface
+-- compile exit 0
+case 0: null (a failure)
+case 1: null (a failure)
+case 2: bug propagated past the failure arm: System.IndexOutOfRangeException
+case 3: 42
+existing `catch OverflowException` still matches RangeFailure
+-- run exit 0
+
+== p17_numeric_parse_or_null
+p17_numeric_parse_or_null.bzl:12:23: type 'int' has no static method or property 'ParseOrNull' (§3.4)
+p17_numeric_parse_or_null.bzl:13:23: type 'long' has no static method or property 'ParseOrNull' (§3.4)
+p17_numeric_parse_or_null.bzl:14:23: type 'double' has no static method or property 'ParseOrNull' (§3.4)
+-- compile exit 1
+
+== p18_marker_binding
+-- compile exit 0
+interface binding: P18.BadInput
+guard form: P18.BadInput
+-- run exit 0
+

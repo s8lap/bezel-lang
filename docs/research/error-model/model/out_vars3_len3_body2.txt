@@ -1,0 +1,13 @@
+bzcore-l1 model, vars=3 len=3 body=2, features=['asgm', 'fields', 'locals', 'pins', 'temps', 'throw']
+
+Check 1: try { body } catch e { }  (the to-null desugaring)
+  programs enumerated : 333648
+  accept                : 73968
+  accept with warnings  : 3591
+  reject                : 256089
+  oracle violations among accepted programs: 0
+
+Check 2: throw edge vs normal scope exit, same disposal trace (K3.15)
+  pairs compared: 3927   identical: 3927   different: 0   skipped (either twin rejected by the checker): 6780
+  with K3.15 switched off -> compared: 3927   identical: 2541   different: 1386
+  first witness: new a / try { /   new b /   tthrow / } catch e { / }
