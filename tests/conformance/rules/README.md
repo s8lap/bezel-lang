@@ -420,3 +420,39 @@ tracker: [#5923](https://github.com/s8lap/bezel-lang/issues/5923) (0174),
 Not written: rules already pinned by banked cases (`s28_8_1_0002`,
 `s15_3_0008`, `s28_8_1_0011`, re-keyed on the trackers), a move across
 `await`/`finally`, and the open questions #5913–#5920.
+
+### v0.356 cases — 2026-11-10 (unclassified)
+
+The rules spec v0.356 introduced (proposal 0211: the failure marker `IFailure`,
+the interface-arm binding rule, `ParseRangeException`, `DomainFailedException`):
+**48 new cases** (5781 → 5829), authored from the v0.356 text and checked by
+script for verbatim `rule:` quotes; none is banked. Each was also compiled with
+r40 (`bezelc 0.0.0-a30bb11d`) with a program-declared `IFailure` spliced in, to
+catch scaffolding errors: every remaining failure is a named v0.356 delta or a
+pre-existing gap (`Parallel` and `Json` absent on r40; `FileStream` opening a
+missing file, [#2286](https://github.com/s8lap/bezel-lang/issues/2286)).
+Spec-ahead cases name their tracker:
+[#8414](https://github.com/s8lap/bezel-lang/issues/8414) (the marker and the
+library conformances), [#8415](https://github.com/s8lap/bezel-lang/issues/8415)
+(the binding rule), [#8416](https://github.com/s8lap/bezel-lang/issues/8416)
+(who may conform), [#8417](https://github.com/s8lap/bezel-lang/issues/8417)
+(`ParseRangeException`), [#8418](https://github.com/s8lap/bezel-lang/issues/8418)
+(`DomainFailedException`), and [#8410](https://github.com/s8lap/bezel-lang/issues/8410)
+(the unreachable-arm warning over an interface arm).
+
+| area | sections | cases |
+|---|---|---|
+| the marker, its kinds and who may conform (reject cases with accepting twins) | 31.4 | 17 |
+| the binding rule, `as` inside the arm, the guard form, type-parameter bounds | 31.2.1 | 9 |
+| ordering and suppression | 31.2.3, 31.2.5 | 3 |
+| the domain join and `Parallel` | 30.14, stdlib 6.12 | 4 |
+| `ParseRangeException` and arithmetic overflow | stdlib 9.1, 9.2, 9.3, 2.3 | 5 |
+| the library's failure types, its defects, and what does not change | stdlib 1, 2.5, 2.15, 6.9, 7.5; 30.9, 31.2, 22.16 | 10 |
+
+Existing cases: `s31_2_1_0007` keeps its rule and its `run` verdict and reaches
+`ShouldRetry` through `as` inside the arm, since an interface arm's binding is an
+`Exception`. Stale quotes refreshed with verdicts unchanged: `l1_0001` (the
+`ReadKey` gloss), `l2_3_0002`, `l2_3_0023`, `l9_1_0007`, `l9_2_0007`,
+`l9_2_0008`, `l9_3_0020` (`ParseRangeException`), `l6_12_0001` (the join
+class), `s31_2_1_0003`, `s31_2_1_0004` (an interface counting as `Exception`).
+`l6_8_0003` was re-read and is unchanged.

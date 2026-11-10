@@ -2,8 +2,9 @@
 //! doc: stdlib
 //! section: 6.12
 //! title: Map reassembles results in input order
-//! rule: Results in input order; first fault wins, surfaced at the await
-//!   as DomainFaultedException.
+//! rule: Results in input order; first fault wins, surfaced at the `await` as
+//!   `DomainFaultedException`, or as `DomainFailedException` where that fault
+//!   is a failure (§6.8)
 //! cites: 6.12, 30.14
 //! expect: run
 //! output: 1

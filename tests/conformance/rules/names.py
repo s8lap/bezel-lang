@@ -248,6 +248,10 @@ def build_index(docs_dir):
             text = f.read()
         for exc in re.findall(r'`([A-Z]\w*Exception)`', text):
             index.setdefault(exc, set())
+        # A built-in interface the hierarchy states in prose (spec §31.4's
+        # failure marker, v0.356): "the built-in interface `IFailure`".
+        for iface in re.findall(r'built-in interface `([A-Z]\w*)`', text):
+            index.setdefault(iface, set())
     return index
 
 

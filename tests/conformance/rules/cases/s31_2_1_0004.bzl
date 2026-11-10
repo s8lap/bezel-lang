@@ -2,9 +2,10 @@
 //! doc: spec
 //! section: 31.2.1
 //! title: a binding over unrelated types types at Exception, not either listed type
-//! rule: For alternatives sharing nothing more specific, the nearest common
-//!   base is `Exception`; every listed type is `Exception`-derived, so the
-//!   binding's static type is never narrower than that.
+//! rule: Every listed class type is `Exception`-derived (the arm-type rule below),
+//!   so the nearest common base is always `Exception` or a class deriving from
+//!   it; for alternatives sharing nothing more specific, and for every
+//!   alternative that lists an interface, it is `Exception`.
 //! cites: 31.2.1
 //! expect: reject
 //! diagnostic: convert
