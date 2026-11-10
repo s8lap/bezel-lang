@@ -81,7 +81,7 @@ std::string prog(const std::string& body) {
            body + " return 0; end Main; end P;";
 }
 
-// The owning variant (stdlib §4.2): an OwningArray viewed through the owning
+// The owning variant (stdlib §4.5): an OwningArray viewed through the owning
 // collection interfaces. `R` is a class element, so the owning collection
 // disposes it at scope end.
 std::string owningProg(const std::string& body) {

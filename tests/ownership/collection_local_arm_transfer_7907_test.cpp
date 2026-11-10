@@ -7,7 +7,7 @@
 // binding"; §20 *Ownership* states the class-typed arm-meet ("owned arms meet
 // to owned ... the marked branch `move x` transfers, consuming on the path
 // where its branch is selected and leaving the binding per-path consumed after
-// the construct"). `Array<T>` is a class (stdlib §3.1) and `new Array<int>()`
+// the construct"). `Array<T>` is a class (stdlib §4.4) and `new Array<int>()`
 // is an Owned producer (§28.3.4), so
 //
 //   var a := new Array<int>(); a.Add(1);
