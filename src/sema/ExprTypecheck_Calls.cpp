@@ -36708,6 +36708,27 @@ static std::string taskDisposeReferenceMessage() {
            "`move t`)";
 }
 
+// fix #8283 / #8329 (§26.5 rule 1, §8.1, stdlib §4.12, v0.355): the NAMES the
+// stdlib §5 LAZY-SEQUENCE SENTINEL commits by §26.5 rule 1 — its own
+// documented surface (stdlib §4.12's `GetEnumerator`), the four universal
+// `Object` members (language spec §8.1: `ToString` / `Equals` /
+// `GetHashCode` / `GetType`), and `Dispose` (the sentinel owns the pipeline it
+// defers, §28.3). Rule 1 commits a NAME on the receiver ("If `x`'s declared
+// type (or any base type) *declares* any instance member named `Foo` — of any
+// arity, applicability, or accessibility — instance resolution is committed
+// and extension blocks are **never consulted** for that name on that
+// receiver"), so an `extension Object` member of one of these names is never
+// a candidate on the sentinel.
+//
+// The #8310 gate (ExprTypecheck_Calls.cpp) reads the SAME surface: the names
+// it exempts from its "no member ... on `IEnumerable`" reject are exactly
+// these plus `OfType` (#3559's removal arm — a name stdlib §5 no longer
+// declares, so it is not a §5 operator and is not committed either).
+static bool lazySentinelCommitsMemberName(std::string_view m) {
+    return m == "ToString" || m == "Equals" || m == "GetHashCode" ||
+           m == "GetType" || m == "GetEnumerator" || m == "Dispose";
+}
+
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // §16.3 / stdlib §9.8 (#6798): `Range<T>.Start` and `.End` are `T?`
     // ("a `null` endpoint indicates the range is open-ended on that side").
@@ -43035,15 +43056,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // §26.5 rule 1 does not block it: neither `IEnumerable<T>`
                 // nor a lazy sequence declares an instance member `Select`.
                 //
-                // SCOPE — the `Object` base is consulted ONLY for a §5-named
-                // member whose arity matches NO §5 overload, and ONLY on the
-                // lazy sentinel:
-                //   * a §5 name with a §5 arity keeps §5's operator (the §5
-                //     block's `IEnumerable<T>` head is more specific than
-                //     `Object`, §26.5.1's specificity), so the same-arity
-                //     call is unchanged;
-                //   * the four universal `Object` members (§8.1) are not §5
-                //     names, so rule 1's commitment for them is untouched;
+                // SCOPE — the `Object` base is consulted ONLY on the lazy
+                // sentinel, and ONLY for a name the sentinel does not commit
+                // (§26.5 rule 1) that stdlib §5 does not answer:
+                //   * a §5 name with an APPLICABLE §5 overload keeps §5's
+                //     operator (the §5 block's `IEnumerable<T>` head is more
+                //     specific than `Object`, §26.5.1's specificity), so the
+                //     same-arity call is unchanged;
+                //   * the four universal `Object` members (§8.1) — and the
+                //     sentinel's own `GetEnumerator` / `Dispose` — are
+                //     committed by rule 1, so they are untouched;
                 //   * the lazy sentinel's runtime value is a `bz_lazy_t*` —
                 //     NEVER a dictionary / set / linked-list — so the #7822
                 //     exclusion (`builtinHeadReachesObjectExtension`) does
@@ -43056,24 +43078,73 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 //     "allocation-size-too-big" — the two heads #7822
                 //     excludes. The dictionary half of #8179 is therefore
                 //     NOT fixed here (reported instead).
+                //
+                // fix #8283 (§26.5 rule 2, §2, §12, v0.355): the NAME gate
+                // (`isBuiltinCollectionLinqOperatorName`) is GONE. The
+                // sentinel carries NO NAME, so §26.5 rule 2's search related
+                // it to no extension block at all — not to stdlib §5's own
+                // `IEnumerable<T>` block and not to the implicit `Object`
+                // base ("every type derives from Object", §2; "if no base
+                // class is specified, the implicit base is Object", §12).
+                // Rule 2 searches "extension blocks on `x`'s type, base
+                // types, or implemented interfaces", and `Object` IS a base
+                // type of the sentinel's type — so a user's `extension
+                // Object` member is a candidate for EVERY name the sentinel
+                // does not commit, §5-named or not. MEASURED (the issue's own
+                // probe): `extension Object { Frob(): int => 9; }` on
+                // `a.Where(lambda(x) => x > 0)` was rejected with the §8310
+                // gate's "no member `Frob` on `IEnumerable`" — the statement
+                // was lost.
+                //
+                // fix #8329 (§26.5.1, stdlib §5.1, spec §14.2, v0.355): the
+                // ARITY gate becomes an APPLICABILITY gate. The question the
+                // old guard asked was "does a §5 overload EXIST at this
+                // arity?"; §26.5.1 asks "is a §5 overload APPLICABLE at this
+                // receiver?" — "extension members ... with block-level
+                // `where` clauses satisfied by the arguments inferred from
+                // the receiver. A `where` clause is an *applicability* filter,
+                // never a ranking signal." stdlib §5.1's no-selector `Min()`
+                // carries `where T: IComparable<T>`, and at an `Array<int>`
+                // element that clause is PROVABLY unsatisfied (spec §14.2
+                // rule 1: a builtin class lists no interface) — so §5's
+                // `Min()` is NOT a candidate there and must not block the
+                // user's own `extension Object { Min() }`. MEASURED (the
+                // issue's own probe): `.Where(...).Min()` over
+                // `Array<Array<int>>` was refused with the #2770 diagnostic
+                // instead of reaching the user's member.
                 if (recvTy->kind == TypeRef::Kind::Named &&
                     !recvTy->declaration && !recvTy->astNode &&
                     recvTy->importedName.empty() &&
                     !recvTy->genericArgs.empty() &&
-                    common::isBuiltinCollectionLinqOperatorName(ma.member) &&
                     currentCallArity_ >= 0 &&
-                    !bezel::sema::stdlibLinqMemberMatches(
-                        ma.member, currentCallArity_)) {
-                    // the sentinel's implicit `Object` base (§2 / §12): the
-                    // §26.5 rule-2 search over the blocks on the base types.
-                    if (Symbol* ext = lookupExtensionMember(
-                            ctx_.primitiveTypeRef(PrimitiveType::Object),
-                            ma.member, &binding, extLoc,
-                            /*reportAmbiguity=*/true, currentCallArity_)) {
-                        if (!binding.empty())
-                            ctx_.setExprExtBinding(&ma, std::move(binding));
-                        resolveExtensionMember(ma, ext);
-                        return;
+                    !lazySentinelCommitsMemberName(ma.member)) {
+                    // Does stdlib §5 answer this call at this receiver? A §5
+                    // overload that does not exist at this arity is no
+                    // candidate at all; one that exists but whose `where`
+                    // clause is provably violated here is no candidate
+                    // either (§26.5.1) — and neither of them may block the
+                    // user's own member.
+                    bool stdlibAnswers = false;
+                    if (const bezel::sema::StdlibLinqOverload* e =
+                            bezel::sema::stdlibLinqLookup(
+                                ma.member, currentCallArity_)) {
+                        stdlibAnswers = stdlibLinqCandidateApplicable(
+                            ma.member, currentCallArity_,
+                            recvTy->genericArgs[0], e->where);
+                    }
+                    if (!stdlibAnswers) {
+                        // the sentinel's implicit `Object` base (§2 / §12):
+                        // the §26.5 rule-2 search over the blocks on the base
+                        // types.
+                        if (Symbol* ext = lookupExtensionMember(
+                                ctx_.primitiveTypeRef(PrimitiveType::Object),
+                                ma.member, &binding, extLoc,
+                                /*reportAmbiguity=*/true, currentCallArity_)) {
+                            if (!binding.empty())
+                                ctx_.setExprExtBinding(&ma, std::move(binding));
+                            resolveExtensionMember(ma, ext);
+                            return;
+                        }
                     }
                 }
                 }

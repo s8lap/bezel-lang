@@ -16153,6 +16153,25 @@ static const TypeRef* stdlibLinqApplicableAncestor(
     return nullptr;
 }
 
+// fix #8329 (§26.5 rule 2, stdlib §4.12, §4.1, v0.355): the stdlib §4.12
+// COLLECTION INTERFACE heads — the interfaces a builtin collection implements
+// (`builtinInterfaceAncestors`' own table, §4.12's `IEnumerable<T>` and its
+// siblings). These are the heads #7822 keeps OUT of
+// `builtinHeadReachesObjectExtension` ("the collection interface heads (which
+// may hold one of them) are left out: their `Object` view reads freed or
+// foreign memory"), and they are the heads fix #8329's `Object`-base fallback
+// is confined to.
+//
+// A USER interface named `IEnumerable` / `IList` / ... carries a TypeDecl and
+// is excluded by the CALLER (`!receiver->declaration`), so only the builtin
+// heads reach this predicate.
+static bool isBuiltinCollectionInterfaceHead(std::string_view head) {
+    return head == "IEnumerable" || head == "IReadOnlyCollection" ||
+           head == "IReadOnlyList" || head == "ICollection" ||
+           head == "IList" || head == "IOwningCollection" ||
+           head == "IOwningList";
+}
+
 // fix #7951 (§26.5 rule 2, v0.350): does any extension block in scope (this
 // module's, or one an import carries) that declares a member named `name`
 // have a head APPLICABLE to a receiver of the by-name built-in `head` --
@@ -16691,6 +16710,36 @@ Symbol* ExprTC::lookupExtensionMember(
     // public method Extra(x: int)` reaches the arity refusal below, not a
     // `where` refusal.
     std::vector<std::size_t> sameNameArities;
+    // fix #8329 (§26.5 rule 2, §26.5.1, §2, stdlib §5.1, spec §14.2,
+    // v0.355): stdlib §5's OWN candidate for the called name is INAPPLICABLE
+    // at this receiver ⇒ §26.5.1 makes it not a candidate at all ("extension
+    // members ... with block-level `where` clauses satisfied by the
+    // arguments inferred from the receiver. A `where` clause is an
+    // *applicability* filter, never a ranking signal") ⇒ the search
+    // continues to the NEXT base type — the root `Object` ("every type
+    // derives from Object", §2; "if no base class is specified, the implicit
+    // base is Object", §12) — and a user's `extension Object` member of that
+    // name answers.
+    //
+    // The gate is the SAME verdict the §5 candidate's own admission reads
+    // (`stdlibLinqCandidateApplicable`, below): one applicability filter, so
+    // the two can never disagree about whether §5 applies at this receiver.
+    // MEASURED (the issue's own probe): an `IEnumerable<Array<int>>`
+    // receiver's `.Min()` with a user's `extension Object { Min() }` in scope
+    // was refused with the #2770 diagnostic ("`Array` does not — its
+    // `CompareTo` could not be resolved for dispatch") instead of reaching
+    // the user's member.
+    bool objectBaseFallback = false;
+    if (const StdlibLinqOverload* e = stdlibLinqLookup(name, arity)) {
+        const TypeRef* enumAnc =
+            stdlibLinqApplicableAncestor(receiver, ownedAncs);
+        const TypeRef* elemTy =
+            (enumAnc && !enumAnc->genericArgs.empty() && enumAnc->genericArgs[0])
+                ? enumAnc->genericArgs[0]
+                : nullptr;
+        if (!stdlibLinqCandidateApplicable(name, arity, elemTy, e->where))
+            objectBaseFallback = true;
+    }
     for (ExtensionSymbol* ext : candidates) {
         auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext->decl);
         if (!decl || !decl->targetType) continue;
@@ -16773,6 +16822,32 @@ Symbol* ExprTC::lookupExtensionMember(
         // specificity ranking below compares.
         const TypeRef* matchedAnc = extensionFindMatchingAncestor(
             target, receiver, freeVars, ownedAncs);
+        // fix #8329 (§26.5 rule 2, §26.5.1, §2, stdlib §5.1, v0.355): the
+        // `Object` base of a BUILTIN COLLECTION-INTERFACE receiver, admitted
+        // ONLY where stdlib §5's own candidate for the called name is
+        // inapplicable at this receiver (the `objectBaseFallback` verdict
+        // above) — the case §26.5 rule 2's search over "base types" would
+        // otherwise leave with NO candidate at all.
+        //
+        // The heads are the stdlib §4.12 COLLECTION INTERFACES. They are
+        // NOT in `builtinHeadReachesObjectExtension` (#7822: "the collection
+        // interface heads (which may hold one of them) are left out: their
+        // `Object` view reads freed or foreign memory"), and that exclusion
+        // is KEPT for every other name: a `extension Object` member of a
+        // name stdlib §5 answers is still unreachable on such a receiver, so
+        // the #7822 exclusion survives this fix intact. MEASURED (the
+        // control): `extension Object { Frob(): int => 9; }` on a NAMED
+        // `IEnumerable<int>` receiver is still refused with the #8310 gate's
+        // "no member `Frob` on `IEnumerable`" — `Frob` is no stdlib §5
+        // operator, so §5 answers nothing and the `Object` base is not
+        // consulted.
+        if (!matchedAnc && objectBaseFallback && target &&
+            target->kind == TypeRef::Kind::Primitive &&
+            target->primitive == PrimitiveType::Object && receiver &&
+            receiver->kind == TypeRef::Kind::Named &&
+            !receiver->declaration &&
+            isBuiltinCollectionInterfaceHead(namedTypeSimpleName(receiver)))
+            matchedAnc = target;
         if (!matchedAnc) continue;
         // fix #8041 / #8042 (§8.1 / §26.5, v0.350): collect the ARITIES of this
         // block's name-matched members BEFORE the per-call arity filter below
