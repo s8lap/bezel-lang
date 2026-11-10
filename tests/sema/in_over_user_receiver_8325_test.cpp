@@ -422,8 +422,8 @@ BEZEL_TEST(sema_in_over_user_receiver_8325,
 // rule they break. The backend's message must be GONE (§17.5 decides the
 // operator's shape, so it is not the backend's question to answer).
 // ---------------------------------------------------------------------------
-BEZEL_TEST(sema_in_over_user_receiver_8325,
-           no_contains_is_refused_at_the_in_site_p03) {
+    // AMBIGUOUS-RAN-FALSE-DEBT: #8325 the row's message check goes through an in-file helper over the diagnostics list, which the ratchet does not recognise as protection; the row is tracked as debt until the protection is spelled in the recognised form
+BEZEL_TEST(sema_in_over_user_receiver_8325, no_contains_is_refused_at_the_in_site_p03) {
     SemaResult sr = parseAndTypecheckGated(kNoContains);
     // §17.5's structural lookup is named, at the `in` site's line.
     const bezel::Diagnostic* d =
@@ -442,8 +442,8 @@ BEZEL_TEST(sema_in_over_user_receiver_8325,
     BEZEL_EXPECT_FALSE(findRunError(r, kBackendNyI) != nullptr);
 }
 
-BEZEL_TEST(sema_in_over_user_receiver_8325,
-           non_bool_contains_is_refused_at_the_in_site_p04) {
+    // AMBIGUOUS-RAN-FALSE-DEBT: #8325 the row's message check goes through an in-file helper over the diagnostics list, which the ratchet does not recognise as protection; the row is tracked as debt until the protection is spelled in the recognised form
+BEZEL_TEST(sema_in_over_user_receiver_8325, non_bool_contains_is_refused_at_the_in_site_p04) {
     SemaResult sr = parseAndTypecheckGated(kNonBoolContains);
     // The structural lookup AND the `bool` result requirement are named.
     const bezel::Diagnostic* d =
@@ -461,8 +461,8 @@ BEZEL_TEST(sema_in_over_user_receiver_8325,
     BEZEL_EXPECT_FALSE(findRunError(r, kBackendNyI) != nullptr);
 }
 
-BEZEL_TEST(sema_in_over_user_receiver_8325,
-           two_parameter_contains_is_refused_at_the_in_site_p05) {
+    // AMBIGUOUS-RAN-FALSE-DEBT: #8325 the row's message check goes through an in-file helper over the diagnostics list, which the ratchet does not recognise as protection; the row is tracked as debt until the protection is spelled in the recognised form
+BEZEL_TEST(sema_in_over_user_receiver_8325, two_parameter_contains_is_refused_at_the_in_site_p05) {
     SemaResult sr = parseAndTypecheckGated(kTwoParameterContains);
     // The structural lookup AND the ONE-parameter requirement are named.
     const bezel::Diagnostic* d =
@@ -480,8 +480,8 @@ BEZEL_TEST(sema_in_over_user_receiver_8325,
     BEZEL_EXPECT_FALSE(findRunError(r, kBackendNyI) != nullptr);
 }
 
-BEZEL_TEST(sema_in_over_user_receiver_8325,
-           static_contains_is_refused_at_the_in_site_p07) {
+    // AMBIGUOUS-RAN-FALSE-DEBT: #8325 the row's message check goes through an in-file helper over the diagnostics list, which the ratchet does not recognise as protection; the row is tracked as debt until the protection is spelled in the recognised form
+BEZEL_TEST(sema_in_over_user_receiver_8325, static_contains_is_refused_at_the_in_site_p07) {
     SemaResult sr = parseAndTypecheckGated(kStaticContains);
     // The structural lookup is named, and the `static` member's exclusion
     // (§22.12) with it.
@@ -500,8 +500,8 @@ BEZEL_TEST(sema_in_over_user_receiver_8325,
     BEZEL_EXPECT_FALSE(findRunError(r, kBackendNyI) != nullptr);
 }
 
-BEZEL_TEST(sema_in_over_user_receiver_8325,
-           private_contains_is_not_accessible_p06) {
+    // AMBIGUOUS-RAN-FALSE-DEBT: #8325 the row's message check goes through an in-file helper over the diagnostics list, which the ratchet does not recognise as protection; the row is tracked as debt until the protection is spelled in the recognised form
+BEZEL_TEST(sema_in_over_user_receiver_8325, private_contains_is_not_accessible_p06) {
     SemaResult sr = parseAndTypecheckGated(kPrivateContains);
     // The structural lookup is named, and §13.1's ACCESSIBILITY with it.
     const bezel::Diagnostic* d =
@@ -519,8 +519,8 @@ BEZEL_TEST(sema_in_over_user_receiver_8325,
     BEZEL_EXPECT_FALSE(findRunError(r, kBackendNyI) != nullptr);
 }
 
-BEZEL_TEST(sema_in_over_user_receiver_8325,
-           nullable_receiver_is_refused_at_the_in_site_p34) {
+    // AMBIGUOUS-RAN-FALSE-DEBT: #8325 the row's message check goes through an in-file helper over the diagnostics list, which the ratchet does not recognise as protection; the row is tracked as debt until the protection is spelled in the recognised form
+BEZEL_TEST(sema_in_over_user_receiver_8325, nullable_receiver_is_refused_at_the_in_site_p34) {
     SemaResult sr = parseAndTypecheckGated(kNullableReceiver);
     // §7.4's narrowing remedies are named.
     const bezel::Diagnostic* d =

@@ -236,8 +236,8 @@ BEZEL_TEST(sema_method_ref_argument_overload_applicability_8293,
     expectRejected(program(kCalleeObjectFirst, "var f := V.Len;"), kNoTarget);
 }
 
-BEZEL_TEST(sema_method_ref_argument_overload_applicability_8293,
-           a_reference_with_no_target_is_reported_once) {
+    // AMBIGUOUS-RAN-FALSE-DEBT: #8293 the row's message check goes through an in-file helper over the diagnostics list, which the ratchet does not recognise as protection; the row is tracked as debt until the protection is spelled in the recognised form
+BEZEL_TEST(sema_method_ref_argument_overload_applicability_8293, a_reference_with_no_target_is_reported_once) {
     // control: §8205's one-report-per-reference discipline
     auto r = runAot(program(kCalleeObjectFirst, "var f := V.Len;"));
     BEZEL_EXPECT_FALSE(r.ran);

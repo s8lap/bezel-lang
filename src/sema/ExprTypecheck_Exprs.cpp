@@ -10155,6 +10155,9 @@ bool inOperatorMethodIsStatic(const MethodSymbol* ms) {
 bool inOperatorContainsReturnsBool(const MethodSymbol* ms,
                                    const SemaContext& ctx) {
     if (!ms) return false;
+    // SEAM-DEBT: #8325 the `in` operator's structural `Contains` lookup reads
+    // the member's own declaration; an IMPORTED member has none, so the
+    // lookup answers "no such member" - the pre-#8325 answer.
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md || !md->returnType) return true;   // unknown → admit
     const TypeRef* rt = ctx.resolvedType(*md->returnType);
@@ -11867,6 +11870,10 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                     case InContainsVerdict::NotBool: {
                         std::string retName = "?";
                         if (inRes.method) {
+                            // SEAM-DEBT: #8325 the diagnostic's return-type spelling
+                            // reads the resolved member's own declaration; an
+                            // IMPORTED member has none, so the spelling falls back
+                            // to "?".
                             auto* md = dynamic_cast<const ast::MethodDecl*>(
                                 inRes.method->decl);
                             if (md && md->returnType)

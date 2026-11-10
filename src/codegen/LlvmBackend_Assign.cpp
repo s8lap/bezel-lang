@@ -15389,6 +15389,9 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
             if (!enumTyRef || enumTyRef->kind != sema::TypeRef::Kind::Named)
                 return false;
             if (enumTyRef->headName() != "IEnumerator") return false;
+            // SEAM-DEBT: #8292 the yield-generator probe reads the enumerator
+            // symbol's own declaration; an IMPORTED enumerator has none, so the
+            // probe answers "not a generator" - the pre-#8292 answer.
             auto* md = dynamic_cast<const ast::MethodDecl*>(getEnumSym->decl);
             if (!md) return false;
             if (md->bodyKind != ast::MethodBodyKind::Block) return false;

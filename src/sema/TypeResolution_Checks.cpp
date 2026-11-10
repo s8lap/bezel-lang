@@ -11662,6 +11662,9 @@ void Resolver::checkAbstractImplementations() {
         // one, else the loader's `importedReturnType` record — the SAME
         // both-sources derivation the witness above uses for the same
         // purpose (#2373 / #3194): an IMPORTED witness has no AST.
+        // SEAM-DEBT: #7569 the implementation's declared return type is read off
+        // its own declaration; an IMPORTED implementation has none, so the
+        // loader's own return-type record answers instead.
         auto* implDecl = dynamic_cast<const ast::MethodDecl*>(impl->decl);
         TypeRef* implRetRef = nullptr;
         bool implDeclaresReturn = false;

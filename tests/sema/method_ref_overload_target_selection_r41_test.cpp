@@ -241,8 +241,8 @@ BEZEL_TEST(sema_method_ref_overload_target_selection_r41,
                    kTieAmbiguity);
 }
 
-BEZEL_TEST(sema_method_ref_overload_target_selection_r41,
-           the_tie_at_the_selected_arity_is_reported_once) {
+    // AMBIGUOUS-RAN-FALSE-DEBT: #8294 the row's message check goes through an in-file helper over the diagnostics list, which the ratchet does not recognise as protection; the row is tracked as debt until the protection is spelled in the recognised form
+BEZEL_TEST(sema_method_ref_overload_target_selection_r41, the_tie_at_the_selected_arity_is_reported_once) {
     // control (fix #8205's one-report-per-reference discipline): the tie is
     // ONE diagnostic for the reference
     auto r = runAot(extensionMain(kTieBlocks,

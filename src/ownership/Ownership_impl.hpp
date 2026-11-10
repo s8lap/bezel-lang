@@ -94,6 +94,9 @@ inline bool formalIsMoveOnlyValued(const ast::Type* declTy,
         return false;
     const sema::TypeSymbol* ts = resolvedTy->declaration;
     const ast::TypeDecl* td =
+        // SEAM-DEBT: #7483 the owning-choice probe reads the resolved type
+        // symbol's own declaration; an IMPORTED type has none, so the probe
+        // answers "not an owning choice" - the pre-#7483 answer.
         ts->decl ? dynamic_cast<const ast::TypeDecl*>(ts->decl) : nullptr;
     if (!td || td->kind != ast::TypeDeclKind::Choice) return false;
     // A GENERIC choice's owning-ness is per-instantiation (§3.6 rule 2,

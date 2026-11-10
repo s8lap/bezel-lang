@@ -43829,7 +43829,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // Object` member is a candidate for EVERY name the sentinel
                 // does not commit, §5-named or not. MEASURED (the issue's own
                 // probe): `extension Object { Frob(): int => 9; }` on
-                // `a.Where(lambda(x) => x > 0)` was rejected with the §8310
+                // `a.Where(lambda(x) => x > 0)` was rejected with the #8331
                 // gate's "no member `Frob` on `IEnumerable`" — the statement
                 // was lost.
                 //

@@ -17,6 +17,7 @@
 1    src/module/ModuleLoader.cpp
 5    src/module/ModuleMetadataBuilder.cpp
 1    src/ownership/Ownership_Checks.cpp
+1    src/ownership/Ownership_impl.hpp
 1    src/sema/EnumValues.hpp
 1    src/sema/ExprTypecheck.cpp
 5    src/sema/ExprTypecheck_Calls.cpp
@@ -34,7 +35,7 @@
 #         (#3149). MemberSymbol::decl is null for a non-generic import and
 #         PropertySymbol::decl is never set at all, so these answer the same
 #         silent "no" across a module boundary.
-20   src/codegen/LlvmBackend_Assign.cpp
+21   src/codegen/LlvmBackend_Assign.cpp
 29   src/codegen/LlvmBackend_Calls2.cpp
 4    src/codegen/LlvmBackend_Disposal.cpp
 7    src/codegen/LlvmBackend_Exprs.cpp
@@ -48,14 +49,14 @@
 4    src/module/ModuleLoader.cpp
 10   src/module/ModuleMetadataBuilder.cpp
 4    src/ownership/Ownership.cpp
-3    src/ownership/Ownership_Checks.cpp
+4    src/ownership/Ownership_Checks.cpp
 2    src/sema/DefiniteAssignment.cpp
 1    src/sema/EntryPoint.cpp
 11   src/sema/ExprTypecheck.cpp
 20   src/sema/ExprTypecheck_Calls.cpp
-18   src/sema/ExprTypecheck_Exprs.cpp
+20   src/sema/ExprTypecheck_Exprs.cpp
 7    src/sema/PureChecker.cpp
 7    src/sema/StaticInitCycles.cpp
 5    src/sema/SymbolCollection.cpp
-6    src/sema/TypeResolution_Checks.cpp
+7    src/sema/TypeResolution_Checks.cpp
 3    src/sema/TypeResolution_Names.cpp

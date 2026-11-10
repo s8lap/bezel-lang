@@ -71,6 +71,9 @@ static bool ownedFieldDeclaredNullable(const sema::SemaContext& ctx,
     const sema::TypeRef* rt = nullptr;
     if (auto* fs =
             dynamic_cast<sema::FieldSymbol*>(ctx.exprSymbol(fieldRead))) {
+        // SEAM-DEBT: #7849 the nullable-owned-field probe reads the field
+        // symbol's own declaration; an IMPORTED field has none, so the probe
+        // falls back to the field read's own resolved type.
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
             if (fd->type) rt = ctx.resolvedType(*fd->type);
         } else if (fs->posParam && fs->posParam->type) {
@@ -3596,6 +3599,9 @@ void MethodOwnership::checkUseThroughDisposedBorrowHolder(
     // The holder: a `using var` borrow-pin over a borrow.
     const ast::LocalDecl* pld = nullptr;
     if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+    // LOCALDECL-DEBT: #7893 the pinned-alias holder walk reads the borrow-pin's
+    // own local declaration; the const-local form of this walk is still to be
+    // written, so the site is tracked as debt.
         pld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
     if (!pld) return;
     if (!pld->isUsing || !pld->usingVarSourceIsBorrow ||
