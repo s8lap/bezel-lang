@@ -25621,6 +25621,113 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
             return;
         }
     }
+    // fix #8376 (§15.3 *Parameter passing* / *Local lifetime*, §28.1 clause 1,
+    // §28.3, §15.1.1): a MOVE-ONLY OWNING inline-array PARAMETER ([N owned]T?
+    // / [N owned]T) is a LIVE move-only binding in the callee, and the callee
+    // owns its slots.
+    //
+    // THE DEFECT. §15.3 *Parameter passing*: "for a move-only V, it is by
+    // value-move (transfer ownership). The caller's argument expression is in
+    // moved-from state after the call." The CALLER's binding is moved-from —
+    // so the CALLER disposes nothing — and the CALLEE holds the slots. §15.3
+    // *Local lifetime* then makes the callee's frame owe the slot disposal:
+    // "a move-only local's owned slots are auto-disposed at scope end by the
+    // compiler, in reverse slot order (§15.1.1)". The callee's parameter
+    // binding is such a live move-only binding (it is NOT moved-from — the
+    // CALLER's is), so the slot pass is owed to the CALLEE's frame.
+    //
+    // Before this arm, `registerUnwindOwnedParam` had NO branch for a
+    // move-only inline-array parameter: the slot fell through every check
+    // and was silently skipped. The caller had already moved its binding, so
+    // NOBODY disposed the slots — the issue's own repro disposes 0 of 100
+    // `Res` objects. (The OWNING-CHOICE arm above is the precedent, and the
+    // reason that twin does NOT leak.)
+    //
+    // §28.1 CLAUSE 1 — THE `owned` MODIFIER IS IRRELEVANT HERE. "(owned x: V)
+    // is identical to plain (x: V) for a move-only V; the modifier is admitted
+    // for documentation but is redundant." This arm is therefore deliberately
+    // NOT gated on `ps->modifier == "owned"`, and it must sit ABOVE the
+    // "Only an `owned` parameter carries a disposal obligation" gate below:
+    // a branch placed after that gate would be DEAD CODE for the plain
+    // `(e: [1 owned]T?)` spelling — which is exactly the spelling the issue's
+    // repro uses and the one that leaked.
+    if (rt) {
+        // §15.3: "A parameter whose declared type is or contains a type
+        // parameter is a move-only parameter at every instantiation whose
+        // substitution makes that type move-only (§3.6 rule 2)". Resolve the
+        // ACTIVE substitution first, exactly as the owning-choice arm above
+        // does, so a generic `method Take<T>(e: T)` instantiated at
+        // `[1 owned]Res?` reaches this arm too.
+        const sema::TypeRef* instRt = resolveTypeParamRef(rt);
+        if (instRt && instRt->kind == sema::TypeRef::Kind::InlineArray &&
+            instRt->arrayOwned) {
+            // The slot count comes from the ALLOCA, the same derivation the
+            // LOCAL path uses (`registerInlineOwnedArrayDisposal`): the
+            // parameter's slot is `entryAlloca(arg.getType())`, an [N x ptr]
+            // aggregate. A non-aggregate alloca is not an owning inline array
+            // → skip (defensive).
+            auto* arrTy =
+                llvm::dyn_cast<llvm::ArrayType>(slot->getAllocatedType());
+            if (!arrTy) return;  // defensive: a non-aggregate alloca → skip.
+            // §15.3 / §15.1.1 (#747): the TRANSFER analysis must cover THIS
+            // body before a parameter's slots may be disposed. A body the
+            // whole-body walk never analysed has UNKNOWN transfer status, and
+            // disposing a parameter that was moved out would DOUBLE-FREE (the
+            // receiver owns the slots). This is the local path's own guard
+            // (`currentFn_ != moveOnlyArrayTransferredFn_`), verbatim: skip
+            // (a safe leak, never a double-free).
+            if (currentFn_ != moveOnlyArrayTransferredFn_) return;
+            // The parameter was MOVED OUT of this body — a return, a pass-on to
+            // another callee, a local-to-local copy. The receiver owns the
+            // slots now, so disposing them here would double-free. The
+            // whole-body transfer walk (`MoveOnlyArrayTransferWalker`)
+            // collects exactly that set; `markIdent` now admits a
+            // `sema::ParameterSymbol*` into it (the walker's `dynamic_cast<
+            // sema::LocalSymbol*>` used to FAIL for a parameter, so the
+            // parameter was never recorded — which is why the parameter leaked
+            // on the one hand and would have double-freed on the other).
+            //
+            // The set is flow-INsensitive: a move under a branch suppresses
+            // the source's disposal on the untaken path too. That is the
+            // established behaviour of the LOCAL path (the same set, the same
+            // walker, the same flow-insensitivity) — a conservative LEAK, never
+            // a double-free. The path-exact alternative is the owning choice's
+            // runtime zero-store (`markOwningChoiceLocalMovedFrom`), whose
+            // call sites live in LlvmBackend_Stmts.cpp / LlvmBackend_Calls2.cpp
+            // / LlvmBackend_Exprs.cpp / LlvmBackend_Disposal.cpp — four files
+            // outside this lane's declared set, hence a handback item and not
+            // a silent edit.
+            if (moveOnlyArrayTransferred_.count(static_cast<const void*>(ps)))
+                return;
+            // §15.3 *Local lifetime*: the auto-dispose of an owning inline
+            // array is UNCONDITIONAL — "No must-use warning attaches to this
+            // auto-drop at an owning inline array (§28.3's lint, K3.14): the
+            // slot pass is unconditional and runs identically under plain `var`
+            // and under `using var`". It therefore fires on the NORMAL exit
+            // as well as the unwind exit (the array's scope ends either way;
+            // a given exit goes one way only → exactly once per exit,
+            // §15.1.1).
+            //
+            // ⇒ `releaseOnUnwindOnly` MUST stay FALSE here, and the owning-
+            // choice arm's `d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;`
+            // must NOT be copied: `autoDropAtScopeEnd` is set ONLY for an
+            // `owned` parameter (src/ownership/Ownership.cpp), and the
+            // modifier is REDUNDANT for a move-only V (§28.1 clause 1), so a
+            // plain `(e: [1 owned]T?)` parameter has `autoDropAtScopeEnd ==
+            // false` → `releaseOnUnwindOnly` would be TRUE → the disposal
+            // would fire ONLY on the unwind edge and the NORMAL exit — the
+            // path the repro takes — would STILL LEAK.
+            Disposal d{slot, nullptr};
+            d.inlineOwnedArray = true;
+            d.inlineSlotCount = static_cast<unsigned>(arrTy->getNumElements());
+            // A parameter lives for the WHOLE method, so its disposal belongs
+            // to the ROOT scope — `disposeStack_.front()`, exactly as the
+            // owning-choice parameter arm above does. (The LOCAL path uses
+            // `disposeStack_.back()`, because a local dies at ITS scope end.)
+            disposeStack_.front().push_back(d);
+            return;
+        }
+    }
     // Only an `owned` parameter carries a disposal obligation (§28.8); `ref`/
     // `out`/borrow params do not. (`out owned` is by-ref — the callee writes the
     // caller's storage and does not own at entry — and is excluded.)
@@ -27098,8 +27205,32 @@ struct MoveOnlyArrayTransferWalker {
 
     void markIdent(const ast::Expr* e) {
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
-            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id)))
+            sema::Symbol* s = ctx.exprSymbol(*id);
+            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(s)) {
                 if (loc->decl) out.insert(static_cast<const void*>(loc->decl));
+            } else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(s)) {
+                // fix #8376 (§15.3 *Parameter passing* / *Local lifetime*): a
+                // move-only inline-array PARAMETER is a by-value-MOVE binding
+                // (§15.3: "for a move-only V, it is by value-move (transfer
+                // ownership)"), so a whole-array read of it in a transfer
+                // position (a return, a pass-on to another callee, a
+                // local-to-local copy) MOVES the slots out of the parameter
+                // exactly as it moves them out of a local. Before this arm the
+                // `dynamic_cast<sema::LocalSymbol*>` FAILED for a parameter
+                // (a parameter is a `sema::ParameterSymbol*`), so the
+                // parameter was NEVER recorded as transferred — and the
+                // callee's scope-end slot-disposal pass, which is the only
+                // thing that can discharge those slots, either did not exist
+                // (the leak this issue is about) or, once it does exist,
+                // would DISPOSE slots the receiver now owns (the #4566
+                // double-free class).
+                //
+                // The key is the PARAMETER SYMBOL, not a local decl: a
+                // `sema::ParameterSymbol*` and an `ast::LocalDecl*` are
+                // distinct objects, so the two key spaces in this set never
+                // collide.
+                out.insert(static_cast<const void*>(ps));
+            }
             return;
         }
         expr(e, /*borrow=*/false);
