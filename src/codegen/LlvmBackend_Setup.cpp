@@ -54015,6 +54015,105 @@ llvm::GlobalVariable* Emitter::valueBuiltinBoxVtableFor(const char* name) {
             if (llvm::Constant* c = baseArr->getAggregateElement(i))
                 elems[i] = c;
     }
+    // fix #7875 (§14.2 conformance / §8.6 "Boxing" / §12.7, v0.357; stdlib
+    // §2.5 `DateTime: IComparable<DateTime>, IEquatable<DateTime>` and the
+    // TimeSpan / DateOnly / TimeOnly twins): a boxed value-builtin viewed
+    // through `IComparable<T>` / `IEquatable<T>` must DISPATCH. The base
+    // vtable's itmap is the shared EMPTY `itmap$box$valuebuiltin`, so the
+    // interface call's `bz_itable_lookup` found nothing and the call jumped
+    // through a null itable slot (SEGV). Build the itmap the way
+    // `buildPrimBoxItmap` does for primitives: one-slot itables holding
+    // thunks `int(ptr this, T other)` / `i1(ptr this, T other)` that load the
+    // scalar payload and run the type's own CompareTo / Equals order.
+    // Guid is excluded: a `{i64,i64}` struct needing a structural compare
+    // (tracked by #8288; sema does not admit the conversion today).
+    llvm::Constant* vbItmap = nullptr;
+    {
+        std::string_view nmv(name);
+        const bool temporal = nmv == "DateTime" || nmv == "TimeSpan" ||
+                              nmv == "DateOnly" || nmv == "TimeOnly";
+        auto* cmpSym = ctx_.builtinInterfaceSym("IComparable");
+        auto* eqSym  = ctx_.builtinInterfaceSym("IEquatable");
+        auto cmpDescIt = cmpSym ? descArray_.find(cmpSym) : descArray_.end();
+        auto eqDescIt  = eqSym ? descArray_.find(eqSym) : descArray_.end();
+        // Like buildPrimBoxItmap, only the builtin interfaces whose
+        // descriptor this module declared (i.e. that it uses) get a pair.
+        const bool haveCmp = cmpDescIt != descArray_.end();
+        const bool haveEq  = eqDescIt != descArray_.end();
+        if (temporal && payloadTy->isIntegerTy() && (haveCmp || haveEq)) {
+            auto* cmpFn = llvm::Function::Create(
+                llvm::FunctionType::get(i32(), {ptrTy(), payloadTy}, false),
+                llvm::Function::LinkOnceODRLinkage,
+                std::string("bz$vbcmpT$") + name, module_.get());
+            {
+                auto* entry = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
+                ThunkScope scope(currentFn_, builder_, cmpFn, entry);
+                ThunkUnwindIsolation unwindIso(*this);
+                llvm::Value* pay = builder_.CreateGEP(
+                    ptrTy(), cmpFn->getArg(0), {builder_.getInt32(2)},
+                    "vbc.pay");
+                llvm::Value* a = builder_.CreateLoad(payloadTy, pay, "vbc.a");
+                llvm::Value* b = cmpFn->getArg(1);
+                // per stdlib §2.5: DateTime's CompareTo is tick order (Kind
+                // not normalized); the others order their signed scalar.
+                if (nmv == "DateTime") {
+                    a = dtTicksOf(a);
+                    b = dtTicksOf(b);
+                }
+                llvm::Value* gt = builder_.CreateZExt(
+                    builder_.CreateICmpSGT(a, b), i32(), "vbc.gt");
+                llvm::Value* lt = builder_.CreateZExt(
+                    builder_.CreateICmpSLT(a, b), i32(), "vbc.lt");
+                builder_.CreateRet(builder_.CreateSub(gt, lt, "vbc.res"));
+            }
+            auto* eqTFn = llvm::Function::Create(
+                llvm::FunctionType::get(i1(), {ptrTy(), payloadTy}, false),
+                llvm::Function::LinkOnceODRLinkage,
+                std::string("bz$vbeqT$") + name, module_.get());
+            {
+                auto* entry = llvm::BasicBlock::Create(llvm_, "entry", eqTFn);
+                ThunkScope scope(currentFn_, builder_, eqTFn, entry);
+                ThunkUnwindIsolation unwindIso(*this);
+                llvm::Value* pay = builder_.CreateGEP(
+                    ptrTy(), eqTFn->getArg(0), {builder_.getInt32(2)},
+                    "vbe.pay");
+                llvm::Value* a = builder_.CreateLoad(payloadTy, pay, "vbe.a");
+                builder_.CreateRet(
+                    emitValueEquality(a, eqTFn->getArg(1), &vbTy));
+            }
+            auto mkItab = [&](llvm::Function* fn, const char* iname) {
+                auto* arrTy = llvm::ArrayType::get(ptrTy(), 1);
+                return new llvm::GlobalVariable(
+                    *module_, arrTy, /*isConstant=*/true,
+                    llvm::GlobalValue::LinkOnceODRLinkage,
+                    llvm::ConstantArray::get(
+                        arrTy, {llvm::cast<llvm::Constant>(fn)}),
+                    std::string("itab$vb$") + name + "$" + iname);
+            };
+            std::vector<llvm::Constant*> pairs;
+            if (haveCmp) {
+                pairs.push_back(llvm::cast<llvm::Constant>(cmpDescIt->second));
+                pairs.push_back(llvm::ConstantExpr::getPointerCast(
+                    mkItab(cmpFn, "IComparable"), ptrTy()));
+            }
+            if (haveEq) {
+                pairs.push_back(llvm::cast<llvm::Constant>(eqDescIt->second));
+                pairs.push_back(llvm::ConstantExpr::getPointerCast(
+                    mkItab(eqTFn, "IEquatable"), ptrTy()));
+            }
+            pairs.push_back(llvm::ConstantPointerNull::get(ptrTy()));
+            auto* itmapArrTy = llvm::ArrayType::get(ptrTy(), pairs.size());
+            vbItmap = llvm::ConstantExpr::getPointerCast(
+                new llvm::GlobalVariable(
+                    *module_, itmapArrTy, /*isConstant=*/true,
+                    llvm::GlobalValue::LinkOnceODRLinkage,
+                    llvm::ConstantArray::get(itmapArrTy, pairs),
+                    std::string("itmap$vb$") + name +
+                        (haveCmp ? "$C" : "") + (haveEq ? "$E" : "")),
+                ptrTy());
+        }
+    }
+    if (vbItmap) elems[1] = vbItmap;
     elems[kToStringSlot]    = tostrFn;
     elems[kEqualsSlot]      = eqFn;
     elems[kGetHashCodeSlot] = hashFn;
