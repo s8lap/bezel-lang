@@ -9142,8 +9142,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 }
                 if (!ne.args.empty() && ne.args[0].value) {
                     llvm::Value* v = lowerExpr(*ne.args[0].value);
-                    if (v && !v->getType()->isIntegerTy(64))
-                        v = builder_.CreateSExt(v, i64());
+                    // §5.1: a narrow integer argument is EXTENDED by its
+                    // OWN signedness (the #7863 house rule) — a `byte`
+                    // 200 is 200, not -56. The three-argument arm above
+                    // already used `ctorIntTo`; this one must too, or an
+                    // UNSIGNED narrow source (byte / ushort / uint) read as
+                    // negative.
+                    if (v)
+                        v = ctorIntTo(v, *ne.args[0].value, i64());
                     return v ? v : builder_.getInt64(0);
                 }
                 return builder_.getInt64(0);  // default: zero TimeSpan
