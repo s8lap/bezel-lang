@@ -302,15 +302,19 @@ BEZEL_TEST(reverse_set_3763, owningarray_reverse_still_mutates_in_place) {
 // fix #3825 (stdlib §5 / §4.11, v0.307): Stack/OwningStack/Queue/OwningQueue
 // declare no instance `Reverse()` per stdlib §4.11, so the §5 naming note says
 // the lazy operator applies. The old in-place behaviour is replaced; these rows
-// pin the new lazy semantics. Stack pushes 1,2,3 (top=3): lazy Reverse()
-// yields 3 first, and the source is not mutated so Pop() also returns 3.
+// pin the new lazy semantics.
+//
+// STACK: a `Stack<T>` iterates in TAKE ORDER (stdlib §4.11) — top-to-bottom —
+// so the lazy `Reverse()` of a stack pushed 1,2,3 (top=3) yields the BOTTOM
+// first (`1`). The source is not mutated, so `Pop()` still returns the TOP
+// (`3`) — the proof that `Reverse()` did not reverse the stack in place.
 BEZEL_TEST(reverse_set_3763, stack_reverse_is_lazy_not_in_place) {
     BEZEL_EXPECT_EQ(
         runAotOut(prog(
             "    using var s := new Stack<int>();\n"
             "    s.Push(1); s.Push(2); s.Push(3);\n"
             "    Console.WriteLine($\"{s.Reverse().FirstOrNull()},{s.Pop()}\");")),
-        "3,3");
+        "1,3");
 }
 
 // Queue enqueues 1,2,3 (front=1, back=3): lazy Reverse() yields 3 first,
@@ -325,6 +329,11 @@ BEZEL_TEST(reverse_set_3763, queue_reverse_is_lazy_not_in_place) {
 }
 
 // OwningStack twin with a class element (OwningStack rejects primitives).
+// §4.11 gives the owning forms the SAME take order ("the owning forms iterate
+// identically, yielding borrows"), so the lazy `Reverse()` of a stack pushed
+// 1,2,3 (top=3) yields the BOTTOM first (`1`); the source is not mutated, so
+// `Pop()` still returns the TOP (`3`) — the proof that `Reverse()` did not
+// reverse the stack in place.
 BEZEL_TEST(reverse_set_3763, owningstack_reverse_is_lazy_not_in_place) {
     BEZEL_EXPECT_EQ(
         runAotOut(
@@ -341,7 +350,7 @@ BEZEL_TEST(reverse_set_3763, owningstack_reverse_is_lazy_not_in_place) {
             "    return 0;\n"
             "  end Main;\n"
             "end C;\n"),
-        "3,3");
+        "1,3");
 }
 
 // OwningQueue twin with a class element.
