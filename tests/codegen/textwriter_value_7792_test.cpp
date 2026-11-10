@@ -685,8 +685,9 @@ BEZEL_TEST(textwriter_value_7792, type_test_into_textwriter_rejected_17_4) {
     }
     // Issue #8256: the `is` / `is not` FORMS are ANSWERED, not refused (spec
     // §12.7: a type test produces a `bool`; stdlib §7.4: `TextWriter` is a
-    // user-extensible class, so a `W` IS a `TextWriter`; stdlib §1
-    // *Extensibility* names `TextWriter` among the heads that admit a
+    // user-extensible class, so a `W` IS a `TextWriter`; stdlib §7.4
+    // states that user code may derive from it, and stdlib §1's
+    // *Extensibility* row names it among the heads that admit a
     // user-declared subclass). MEASURED on the chain's tip (a37906fc6) with
     // `bezelc`: `o is TextWriter` prints `True` (the `Object` carrier holds a
     // `W`), and `i is not TextWriter` prints `False` (the interface carrier
