@@ -1329,7 +1329,7 @@ s17_5_0001	pass
 s17_5_0003	pass	
 s17_5_0004	pass	
 s17_5_0005	pass	
-s17_5_0007	fail	divergence
+s17_5_0007	pass	
 s17_5_0008	pass	
 s17_5_0009	pass	
 s17_5_0010	pass	
@@ -2093,8 +2093,6 @@ s26_4_1107	pass
 s26_4_1108	pass	
 s26_4_1109	pass	
 s26_4_1110	pass	
-s26_4_0017	pass	
-s26_4_0018	pass	
 s26_5_0001	pass	
 s26_5_0002	pass	
 s26_5_0003	pass	
