@@ -47215,12 +47215,33 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         // #3079). Type the access `bool` here when it is the callee of a
         // one-argument call; typeCall copies a callee's type to the call and
         // lifts it to `bool?` (§7.5: the result is always nullable).
+        //
+        // fix #7557 (§7.5, stdlib §4.1 / §4.2, v0.357): the remaining
+        // collection-interface heads join `IList<T>` here. The `?.` spelling of
+        // `Contains` on them reached no typing arm either, so the call stayed
+        // untyped and codegen DROPPED the enclosing statement behind the
+        // #3079 warning — the silent wrong-code shape issue #7557 reports.
+        // The `.` spelling of the same call is REFUSED by codegen's #853
+        // fence (the polymorphic collection interfaces erase the concrete
+        // backing: array / linked-list / hash-table), and §7.5 says the `?.`
+        // spelling resolves the member exactly as the `.` spelling does. So
+        // typing the access `bool?` here sends the `?.` lowering through the
+        // SAME fence — the `?.` call's own synthetic `.Contains` node reaches
+        // `tryLowerCollectionInstanceCall`, where the `.` spelling's fence
+        // lives — and the two spellings now fail with the SAME diagnostic.
+        // (IReadOnlyList<T> is not listed: it declares no `Contains` (stdlib
+        // §4.1) — the call there is stdlib §5's `IEnumerable<T>` operator,
+        // typed by the §5 twin in typeCall, and it lowers.)
         if (!member && recvTy && &nm == calleeOfCallCtx_ &&
             currentCallArity_ == 1 && nm.member == "Contains" &&
             recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration &&
             recvTy->astNode && recvTy->astNode->name &&
             !recvTy->astNode->name->parts.empty() &&
-            recvTy->headName() == "IList") {
+            (recvTy->headName() == "IList" ||
+             recvTy->headName() == "IOwningList" ||
+             recvTy->headName() == "ICollection" ||
+             recvTy->headName() == "IReadOnlyCollection" ||
+             recvTy->headName() == "IOwningCollection")) {
             ctx_.setExprType(
                 &nm, ctx_.primitiveTypeRef(PrimitiveType::Bool,
                                           /*nullable=*/true));
@@ -47282,10 +47303,43 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                        // array-backed borrowing list interfaces declare
                        // `Count` (IReadOnlyList<T> inherits it from
                        // IReadOnlyCollection<T>; IList<T> from both), and
-                       // the `.` form lowers it. The polymorphic
-                       // ICollection / IReadOnlyCollection heads stay out:
-                       // the `.` form rejects `.Count` on them (#853).
-                       cn == "IList" || cn == "IReadOnlyList");
+                       // the `.` form lowers it.
+                       cn == "IList" || cn == "IReadOnlyList" ||
+                       // fix #7557 (§7.5, stdlib §4.2, v0.357): the OWNING
+                       // list interface IOwningList<T> declares `Count` too
+                       // (stdlib §4.2) and the `.` form LOWERS it — the
+                       // array-backed bridge in codegen's
+                       // `isListInterfaceName` arm serves it, because
+                       // IOwningList<T> is implemented only by the
+                       // array-backed OwningArray<T> for the count read.
+                       // The `?.` spelling reached no typing arm, so the
+                       // access stayed untyped and codegen DROPPED the
+                       // enclosing statement behind the #3079 warning.
+                       cn == "IOwningList" ||
+                       // fix #7557 (§7.5, stdlib §4.1, v0.357): the
+                       // POLYMORPHIC collection interfaces (ICollection<T> /
+                       // IReadOnlyCollection<T> / IOwningCollection<T>) were
+                       // left out here, and the `?.` spelling then reached NO
+                       // typing arm at all: the access stayed UNTYPED and
+                       // codegen DROPPED the enclosing statement behind the
+                       // #3079 warning — the silent wrong-code shape issue
+                       // #7557 reports. §7.5 says the `?.` spelling resolves
+                       // the member exactly as the `.` spelling does, and the
+                       // `.` spelling of this access is REFUSED (#853: these
+                       // interfaces are implemented by collections with
+                       // incompatible runtime representations, so the
+                       // concrete backing is erased at the interface and no
+                       // single runtime dispatch is sound). Typing the
+                       // access `int?` here sends the `?.` lowering through
+                       // the SAME codegen fence the `.` spelling reaches (the
+                       // MemberAccessExpr property arm's
+                       // `isCollectionInterfaceName` check, reached through
+                       // the `?.` arm's own synthetic `.Count` node), so the
+                       // two spellings now fail with the SAME diagnostic
+                       // instead of one failing and the other dropping
+                       // silently.
+                       cn == "ICollection" || cn == "IReadOnlyCollection" ||
+                       cn == "IOwningCollection");
             if (isIntProperty) {
                 ctx_.setExprType(
                     &nm, ctx_.primitiveTypeRef(PrimitiveType::Int,
