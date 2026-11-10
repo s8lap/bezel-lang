@@ -4074,9 +4074,130 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     auto releaseFreshBoxTemp = [&] {
         if (freshBoxTemp) emitBoxRelease(obj);
     };
-    if (!obj) return nullptr;
+    // fix #3090 (§12.7 / §8.6, v0.252): the operand's type AS LOWERED HERE. The
+    // suppression above lowered a §12.7-narrowed identifier as its §8.6 box /
+    // declared reference, so every classification below must read the DECLARED
+    // type, not the narrowed one — otherwise the two disagree and the decisions
+    // are made about a value that was never produced. This was a live SIGSEGV:
+    // after `if ostr is string and not (ostr is decimal) then …`, the second
+    // conjunct's `ostr` types as `string`, so `mightHoldString` answered FALSE
+    // for an operand that is exactly a bare vtable-less `bz_string*` and emitIsA
+    // walked its `char* data` as a descriptor chain (MEASURED: #2793's
+    // `other_primitive_boxes_are_unchanged` sweep, 4095 -> core dump).
+    // `narrowedIdentDeclaredType` declines for every non-narrowed operand, so
+    // this is `ctx_.exprType` everywhere else.
+    //
+    // fix #8256: this definition MOVED UP, to the head of the function, because
+    // the compiler-known-I/O-class-value arm below reads the operand's static
+    // type and must run BEFORE the `if (!obj) return nullptr;` guard — that
+    // arm's answer must not depend on the operand's lowering having succeeded
+    // (`Console.In` has no runtime value at all in this compiler, #8383 owns
+    // its representation). The definition itself is UNCHANGED, and it still
+    // sits with the classification half it must stay in step with.
+    auto operandStaticTy = [&]() -> const sema::TypeRef* {
+        if (const sema::TypeRef* d = narrowedIdentDeclaredType(*te.operand))
+            return d;
+        return ctx_.exprType(*te.operand);
+    };
     sema::TypeRef* rt = ctx_.resolvedType(*te.testType);
     if (!rt) return nullptr;
+    // fix #8256 (stdlib §2.1 / §7.4, spec §12.7, v0.355): a type test whose
+    // OPERAND is a COMPILER-KNOWN I/O CLASS VALUE — answered STATICALLY, and
+    // answered BEFORE the operand's own lowering is required to have
+    // succeeded, because the answer does not depend on the value.
+    //
+    // stdlib §2.1 declares `Console.In` as `static readonly property In:
+    // TextReader` and `Console.Out` / `Console.Error` as `TextWriter`s, and
+    // §7.4's heads are CLASSES. A class value is an instance of its own head
+    // and of `Object` (§8.1) and of no other class (§12.7) — the compiler
+    // knows all three, so the test is a COMPILE-TIME fact.
+    //
+    // WHY THIS SITS HERE. `Console.Out` / `Console.Error` lower to the
+    // standard stream's i32 DESCRIPTOR, not to a reference, so the
+    // pointer-based arms further down cannot run on them: `Console.Out is
+    // Object` reached the `is Object` arm, found a non-pointer operand, and
+    // BAILED — the test was dropped, the enclosing statement emitted nothing,
+    // and the compiler printed only the #3079 "the argument of this
+    // `Console.WriteLine` failed to lower" warning (issue #8256's rows 1, 2
+    // and 7). `Console.In` is worse: it has NO runtime value at all in this
+    // compiler, so `lowerExpr` returns null and the test could not even reach
+    // the arms below. `Console.In`'s runtime representation belongs to #8383's
+    // lane; the TYPE TEST does not have to wait for it, because the answer is
+    // a fact about the DECLARED type, not about the value.
+    //
+    // `Console.Out` / `Console.Error` / `Console.In` are recognised
+    // SYNTACTICALLY — the same way `tryLowerConsoleCall` recognises them —
+    // because #7924 leaves the property read UNTYPEd by design, so the
+    // operand carries no static type to read. A `TextWriter`-TYPED operand (a
+    // local, a parameter, a field) is recognised by its static type instead.
+    {
+        std::string_view ioHead;
+        // TRUE when the operand was recognised as one of the three
+        // `Console` stream properties. Then the answer does not depend on the
+        // operand's lowering at all.
+        bool syntacticIoValue = false;
+        if (const sema::TypeRef* opTy0 = operandStaticTy()) {
+            if (opTy0->kind == sema::TypeRef::Kind::Named &&
+                !opTy0->declaration && !opTy0->nullable &&
+                opTy0->genericArgs.empty()) {
+                const std::string_view h = opTy0->headName();
+                if (h == "TextWriter" || h == "TextReader" || h == "Stream")
+                    ioHead = h;
+            }
+        }
+        if (ioHead.empty()) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(te.operand.get())) {
+                auto* id = ma->target
+                    ? dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())
+                    : nullptr;
+                if (id && id->name == "Console" &&
+                    receiverMayReachBuiltinStaticArm(*ma->target)) {
+                    if (ma->member == "Out" || ma->member == "Error") {
+                        ioHead = "TextWriter";
+                        syntacticIoValue = true;
+                    } else if (ma->member == "In") {
+                        ioHead = "TextReader";
+                        syntacticIoValue = true;
+                    }
+                }
+            }
+        }
+        // The operand IS an I/O class VALUE — not a reference to one. A
+        // POINTER operand is not: it is an object, and the descriptor-walking
+        // arms below answer it at run time (which is where a future runtime
+        // representation of `Console.In` belongs, #8383).
+        const bool ioValueOperand =
+            !ioHead.empty() &&
+            (obj ? !obj->getType()->isPointerTy() : syntacticIoValue);
+        if (ioValueOperand) {
+            bool holds = false;
+            if (rt->kind == sema::TypeRef::Kind::Primitive &&
+                rt->primitive == sema::PrimitiveType::Object) {
+                // §8.1: every class value is an `Object`.
+                holds = true;
+            } else if (rt->kind == sema::TypeRef::Kind::Named &&
+                       !rt->declaration && !rt->nullable &&
+                       rt->genericArgs.empty() &&
+                       rt->headName() == ioHead) {
+                // §12.7: a test naming the operand's own type is statically
+                // true.
+                holds = true;
+            }
+            if (te.op == "is") { releaseFreshBoxTemp(); return builder_.getInt1(holds); }
+            if (te.op == "is not") {
+                releaseFreshBoxTemp();
+                return builder_.CreateXor(builder_.getInt1(holds),
+                                          builder_.getInt1(true));
+            }
+            // `as` is a CAST: it must produce a value of the target type, and
+            // a `TextWriter` value (the i32 descriptor) has no representation
+            // for an `Object` or a class reference. The sema gate rejects that
+            // form before codegen reaches it (see `checkTextWriterTypeTest`).
+            return nullptr;
+        }
+    }
+    if (!obj) return nullptr;
     // fix #5978 (§12.7 / §8.1, v0.338): a FUNCTION-typed operand (directly,
     // or a `T` bound to a function type at this instantiation). Its lowered
     // value is the closure cell, whose word 0 is a code pointer — every arm
@@ -4247,23 +4368,6 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                 "carries no Bezel vtable at word 0, so behind an "
                 "`Object`/interface erasure the runtime cannot answer the "
                 "test) — #8000");
-    };
-    // fix #3090 (§12.7 / §8.6, v0.252): the operand's type AS LOWERED HERE. The
-    // suppression above lowered a §12.7-narrowed identifier as its §8.6 box /
-    // declared reference, so every classification below must read the DECLARED
-    // type, not the narrowed one — otherwise the two disagree and the decisions
-    // are made about a value that was never produced. This was a live SIGSEGV:
-    // after `if ostr is string and not (ostr is decimal) then …`, the second
-    // conjunct's `ostr` types as `string`, so `mightHoldString` answered FALSE
-    // for an operand that is exactly a bare vtable-less `bz_string*` and emitIsA
-    // walked its `char* data` as a descriptor chain (MEASURED: #2793's
-    // `other_primitive_boxes_are_unchanged` sweep, 4095 -> core dump).
-    // `narrowedIdentDeclaredType` declines for every non-narrowed operand, so
-    // this is `ctx_.exprType` everywhere else.
-    auto operandStaticTy = [&]() -> const sema::TypeRef* {
-        if (const sema::TypeRef* d = narrowedIdentDeclaredType(*te.operand))
-            return d;
-        return ctx_.exprType(*te.operand);
     };
     // True when the OPERAND is statically a reference location (Object or an
     // interface): sema has already promised a pointer, so a non-pointer lowered
@@ -4491,6 +4595,20 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // them.  Fall back to builtinDesc_ via the type name so that `e is
     // Exception` and `e as Exception` work when `e`'s runtime type is a user
     // class that inherits Exception.
+    //
+    // fix #8256 (stdlib §7.1 / §7.4, spec §12.7, v0.355): the lookup is done
+    // on the RESOLVED head (`rt->headName()`), not only on the SOURCE spelling
+    // (`te.testType->name->parts.back()`). The two differ exactly where the
+    // target is a TYPE PARAMETER that monomorphizes to a compiler-known I/O
+    // class: `F<TextWriter>(o)` spells `T` at the source and `TextWriter` at
+    // the instantiation, so the source-spelling lookup missed the descriptor
+    // and the test was dropped (issue #8256's row 4, whose expected answer is
+    // `True`).
+    if (!targetDesc && rt->kind == sema::TypeRef::Kind::Named &&
+        !rt->declaration && rt->genericArgs.empty()) {
+        auto bit = builtinDesc_.find(std::string(rt->headName()));
+        if (bit != builtinDesc_.end()) targetDesc = bit->second;
+    }
     if (!targetDesc && te.testType && te.testType->name &&
             !te.testType->name->parts.empty()) {
         std::string tn(te.testType->name->parts.back());

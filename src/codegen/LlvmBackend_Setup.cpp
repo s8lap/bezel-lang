@@ -5226,6 +5226,45 @@ sema::MethodSymbol* Emitter::asyncDisposableDisposeAsyncOf(
 }
 
 
+// fix #8256 (stdlib §1 *Extensibility*, §7.1 / §7.4, spec §12.7, v0.355): the
+// COMPILER-KNOWN I/O CLASS HEADS — `Stream` (§7.1), `TextReader` and
+// `TextWriter` (§7.4) — are the built-in classes stdlib §1 opens to a
+// user-declared subclass.
+//
+// The heads have no TypeSymbol of their own (a built-in class), so they are
+// recorded on the USER class's `nonSymbolBaseRefs` — the same place the
+// built-in INTERFACES land (Symbol.hpp's `nonSymbolBaseRefsOf`) — and NOT on
+// `baseTypes` (which carries only user bases). The walk therefore mirrors
+// `sema::builtinExceptionBaseOf`: at each level of the USER base chain, read
+// the declaration-less base refs and keep the ones naming an I/O head.
+//
+// The result is the list of I/O heads the class is an instance of (§12.7), and
+// `declareVtables` appends each head's runtime descriptor to the class's own
+// descriptor chain so `emitIsA` finds it.
+static std::vector<std::string> builtinIoAncestorsOf(const sema::TypeSymbol* t) {
+    std::vector<std::string> out;
+    unsigned guard = 0;
+    for (const sema::TypeSymbol* cur = t; cur && guard < 256u; ++guard) {
+        for (const sema::TypeRef* br : sema::nonSymbolBaseRefsOf(cur)) {
+            if (!br || br->kind != sema::TypeRef::Kind::Named || br->declaration)
+                continue;
+            const std::string_view h = br->headName();
+            if (h == "TextWriter" || h == "TextReader" || h == "Stream")
+                out.push_back(std::string(h));
+        }
+        const sema::TypeSymbol* next = nullptr;
+        for (const sema::TypeSymbol* b : cur->baseTypes) {
+            if (b && b != cur && b->kind == ast::TypeDeclKind::Class) {
+                next = b;
+                break;
+            }
+        }
+        cur = next;
+    }
+    return out;
+}
+
+
 void Emitter::declareVtables() {
     // Pass 0 (CG35-itable): assign each interface method its 0-based position
     // within that interface's non-static method declaration order. This index
@@ -5601,6 +5640,14 @@ void Emitter::declareVtables() {
     // #596: builtin ancestor-chain names per user-class TypeSymbol.
     std::unordered_map<const sema::TypeSymbol*,
                        std::vector<std::string>> builtinChainOf;
+    // fix #8256 (stdlib §1 *Extensibility*, §7.1 / §7.4, spec §12.7, v0.355):
+    // the COMPILER-KNOWN I/O CLASS ancestors of the same user class — the
+    // `TextWriter` / `TextReader` / `Stream` heads it derives from. Their
+    // descriptors are appended to the class's own chain in Pass C, so
+    // `o is TextWriter` over an `Object` carrier that holds such a class
+    // answers at run time instead of dropping the test (#8000).
+    std::unordered_map<const sema::TypeSymbol*,
+                       std::vector<std::string>> builtinIoChainOf;
     // #1939 (§12.7/§12.9/§31.2.1): per-instantiation descriptors of CONCRETE
     // constructed generic ancestors (class SubExc : MyExc<string>, class C2 :
     // IM<int>), appended to the shared chain in Pass C — without them the
@@ -5635,9 +5682,12 @@ void Emitter::declareVtables() {
             bn = (pit != builtinParent.end()) ? pit->second : std::string{};
         }
         builtinChainOf[ts] = builtinChain;
+        // fix #8256: the compiler-known I/O class ancestors (§7.1 / §7.4).
+        builtinIoChainOf[ts] = builtinIoAncestorsOf(ts);
         extraInstOf[ts] = collectConcreteGenericBaseInsts(ts);
         auto* arrTy = llvm::ArrayType::get(
             ptrTy(), supers.size() + builtinChain.size() +
+                         builtinIoChainOf[ts].size() +
                          extraInstOf[ts].size() + 1);
         // §2.5 / §2.6 / §12 (issue #328 / #103): a PUBLIC, non-generic class or
         // interface's type DESCRIPTOR (`td$<Type>`) is part of its cross-module
@@ -5824,6 +5874,26 @@ void Emitter::declareVtables() {
             elems.push_back(bit != builtinDesc_.end()
                                 ? llvm::cast<llvm::Constant>(bit->second)
                                 : llvm::ConstantPointerNull::get(ptrTy()));
+        }
+        // fix #8256 (stdlib §1 *Extensibility*, §7.1 / §7.4, spec §12.7,
+        // v0.355): append the COMPILER-KNOWN I/O CLASS ancestor descriptors
+        // (btd$TextWriter / btd$TextReader / btd$Stream) for a user class that
+        // derives from one of those heads. §12.7: "`is T` tests whether a value
+        // is an instance of `T`" — a `class W: TextWriter` IS an instance of
+        // `TextWriter`, so `o is TextWriter` over an `Object` carrier holding
+        // a `W` must answer TRUE. Before this the head had no descriptor at
+        // all, so the test reached the #8000 bail, was DROPPED, and the
+        // statement that held it emitted nothing.
+        //
+        // The fallback is the SELF descriptor, NOT a null: a null in the middle
+        // of the array would TERMINATE emitIsA's walk and discard every entry
+        // after it (the #2981 rule). The self descriptor is the one constant
+        // that cannot create a false match (it is already element 0).
+        for (const std::string& bn : builtinIoChainOf[ts]) {
+            auto bit = builtinDesc_.find(bn);
+            elems.push_back(bit != builtinDesc_.end()
+                                ? llvm::cast<llvm::Constant>(bit->second)
+                                : llvm::cast<llvm::Constant>(descArray_[ts]));
         }
         // #1939 (§12.7/§12.9/§31.2.1): append the PER-INSTANTIATION descriptors
         // of the concrete constructed generic ancestors, so a SubExc value
@@ -6643,6 +6713,38 @@ void Emitter::setupBuiltinExceptions() {
             builtinDesc_[name]->getValueType());
         builtinDesc_[name]->setInitializer(
             llvm::ConstantArray::get(arrTy, elems));
+    }
+    // fix #8256 (stdlib §1 *Extensibility*, §7.1 / §7.4, spec §12.7, v0.355):
+    // the COMPILER-KNOWN I/O CLASS HEADS get a runtime type descriptor of
+    // their own, exactly as the built-in EXCEPTION heads do above.
+    //
+    // §1 *Extensibility* (stdlib): "A class of this library admits a
+    // user-declared subclass only where its section says so: … `Stream` (§7.1),
+    // `TextReader` and `TextWriter` (§7.4) …". §12.7: "`is T` tests whether a
+    // value is an instance of `T`" — so a user class that derives from one of
+    // those heads IS an instance of it, and the runtime must be able to say
+    // so. Before this the three heads had NO descriptor at all: `o is
+    // TextReader` / `o is TextWriter` / `o is Stream` over an `Object` carrier
+    // reached the #8000 bail, the test was DROPPED, and the statement that
+    // held it emitted nothing at all (issue #8256's rows 5 and 8).
+    //
+    // The descriptor is [self, null] — none of the three heads derives from
+    // another — and it is LinkOnceODR for the same reason the exception
+    // descriptors are (§2.8.4 rule 5: ONE runtime identity per type, across
+    // modules). `declareVtables` appends it to the chain of every user class
+    // that derives from the head (see `builtinIoAncestorsOf`).
+    for (const char* ioHead : {"TextWriter", "TextReader", "Stream"}) {
+        if (builtinDesc_.find(ioHead) != builtinDesc_.end()) continue;
+        auto* arrTy = llvm::ArrayType::get(ptrTy(), 2);
+        auto* desc = new llvm::GlobalVariable(
+            *module_, arrTy, /*isConstant=*/true,
+            llvm::GlobalValue::LinkOnceODRLinkage, nullptr,
+            std::string("btd$") + ioHead);
+        desc->setInitializer(llvm::ConstantArray::get(arrTy, {
+            llvm::ConstantExpr::getPointerCast(desc, ptrTy()),
+            llvm::ConstantPointerNull::get(ptrTy()),
+        }));
+        builtinDesc_[ioHead] = desc;
     }
     // Pass 3: vtable per built-in = [descriptor, itmap (null=empty), Dispose,
     // ToString]. Built-in exceptions implement no user interfaces, so the itmap

@@ -7578,6 +7578,44 @@ void ExprTC::checkBorrowErasingPosition(TypeRef* from, TypeRef* to,
             "or store its backing buffer instead)");
 }
 
+// fix #8256 (stdlib §1 *Extensibility*, §7.1 / §7.4, spec §12.7, v0.355): the
+// COMPILER-KNOWN I/O CLASS HEADS — the built-in classes stdlib §1 opens to a
+// user-declared subclass:
+//
+//   "A class of this library admits a user-declared subclass only where its
+//    section says so: `Encoding` (§3.2), `Stream` (§7.1), `TextReader` and
+//    `TextWriter` (§7.4), and the exception types."
+//
+// §7.4's two heads are `TextReader` and `TextWriter`; §7.1's is `Stream`. Those
+// THREE are the population the type-test relaxation below is scoped to, and
+// the population codegen now mints a runtime type descriptor for (so a value of
+// a user subclass of one of them carries that head in its runtime type chain
+// and `o is TextWriter` / `o is TextReader` / `o is Stream` answer at run time
+// instead of degrading).
+//
+// WHY THE SCOPE IS EXACTLY THESE THREE, and not "every declaration-less
+// type": the relaxation below is admitted ONLY where the runtime can now
+// answer the test. Every OTHER declaration-less type keeps the #7792
+// rejection — a type with no runtime descriptor still has no runtime identity,
+// and admitting it would turn a located compile error into a silent
+// wrong-value degrade.
+static bool isBuiltinIoClassHead(std::string_view name) {
+    return name == "TextWriter" || name == "TextReader" || name == "Stream";
+}
+
+// fix #8256 (stdlib §7.1 / §7.4, spec §12.7, v0.355): is `t` one of the
+// compiler-known I/O class types — a declaration-less Named reference to one
+// of the three heads (no generic arguments: `Stream<T>` is not a thing)?
+//
+// The NULLABLE form is NOT one of them: a `TextWriter?` is the `{i8, i32}`
+// carrier (stdlib §7.4, #7792), a different question with a different
+// representation, and it keeps the #7792 rejection.
+static bool isBuiltinIoClassRef(const TypeRef* t) {
+    return t && t->kind == TypeRef::Kind::Named && !t->declaration &&
+           !t->nullable && t->genericArgs.empty() &&
+           isBuiltinIoClassHead(t->headName());
+}
+
 // narrow #7792 (stdlib §1 *Extensibility*, §7.4, v0.355): does the user type
 // `root` derive, directly or through other user types, from the built-in
 // `TextWriter`?
@@ -7741,6 +7779,36 @@ void ExprTC::checkTextWriterSubclassLocalReads() {
 // compile error instead. A local holding a user subclass is the exception on
 // the operand side: its `is` / `as` a user type reads the object (see
 // `textWriterSubclassLocalInit_`).
+// fix #8256 (stdlib §7.1 / §7.4, spec §12.7, v0.355): the `is` / `is not`
+// forms over a COMPILER-KNOWN I/O CLASS are now ANSWERABLE, so the #7792
+// rejection is withdrawn for them.
+//
+// WHY THE PREMISE CHANGED. The #7792 comment above states the old premise:
+// "a built-in `TextWriter` value is the i32 descriptor of a standard stream, and
+// an object … has no representation as one. So a runtime type test or cast INTO
+// `TextWriter` / `TextWriter?` cannot produce a value, and one OF a descriptor
+// cannot inspect a runtime type." That premise is HALF true and stayed half
+// true:
+//
+//   * it is still true that a `TextWriter` VALUE cannot be produced from an
+//     object — the `as` forms keep their rejection below (a `TextWriter` slot
+//     is the i32 descriptor, and an `Object` holds a pointer);
+//   * it is NO LONGER true that the runtime cannot answer the QUESTION. A type
+//     test produces a `bool` (§12.7), and the compiler now mints a runtime type
+//     descriptor for each compiler-known I/O class head and records it in the
+//     runtime type chain of every user class that derives from that head
+//     (stdlib §1 *Extensibility*: `Stream` (§7.1), `TextReader` and
+//     `TextWriter` (§7.4) admit a user-declared subclass). So `o is TextWriter`
+//     over an `Object` carrier that holds a `W : TextWriter` answers TRUE, and
+//     `o is Stream` over one that holds an unrelated `V` answers FALSE —
+//     neither is a degrade any more.
+//
+// ⇒ THE ADMISSION IS SCOPED TO THE `is` / `is not` FORMS AND TO THE THREE
+// COMPILER-KNOWN I/O CLASS HEADS (isBuiltinIoClassHead). The `as` forms keep
+// their rejection: they must produce a VALUE of the target type, and a
+// `TextWriter` value (the i32 descriptor) has no representation for an object.
+// Every other declaration-less type keeps the rejection too — it has no
+// runtime descriptor, so the runtime still cannot answer it.
 void ExprTC::checkTextWriterTypeTest(const TypeRef* operandTy,
                                      const ast::Expr* operand,
                                      const TypeRef* target, const char* form,
@@ -7749,6 +7817,15 @@ void ExprTC::checkTextWriterTypeTest(const TypeRef* operandTy,
         return t && t->kind == TypeRef::Kind::Named && !t->declaration &&
                t->genericArgs.empty() && t->headName() == "TextWriter";
     };
+    // fix #8256: `is` / `is not` over a compiler-known I/O class head — the
+    // answer is a `bool` and the runtime can now produce it (§12.7), so the
+    // gate does not fire. `as` is a CAST and must produce a value of the
+    // target type; it keeps the rejection below. The typed `case` binding
+    // (the third caller) is a BINDING, not a test: it must produce a value
+    // of the target type, exactly like `as`, so it keeps the rejection too.
+    const std::string_view formView(form);
+    const bool isTestForm = formView == "`is`" || formView == "`is not`";
+    if (isTestForm && isBuiltinIoClassRef(target)) return;
     if (isBuiltinTw(target)) {
         ctx_.diagnostics().report(
             Severity::Error, loc,
@@ -7763,6 +7840,20 @@ void ExprTC::checkTextWriterTypeTest(const TypeRef* operandTy,
             "#7792)");
         return;
     }
+    // fix #8256: a type test OF a built-in I/O class VALUE. The value is the
+    // standard stream's descriptor — an i32, not a reference — so the
+    // pointer-based runtime test cannot inspect it; but the ANSWER is decided
+    // by the value's own class, which the compiler knows: the stream is an
+    // instance of its own head and of `Object` (§8.1) and of no other class
+    // (§12.7). Codegen answers it statically (the `is Object` / `is <class>`
+    // arms over a `TextWriter`-valued operand), so the test is admitted. The
+    // `as` form is a CAST: it must produce a `TextWriter` value (the i32
+    // descriptor) out of an object, which has no representation — it keeps the
+    // rejection.
+    if (isTestForm && isBuiltinIoClassRef(operandTy) && target &&
+        target->kind != TypeRef::Kind::Error &&
+        !(operand && textWriterSubclassLocalRead(operand)))
+        return;
     if (isBuiltinTw(operandTy) && target &&
         target->kind != TypeRef::Kind::Error &&
         !(operand && textWriterSubclassLocalRead(operand))) {
