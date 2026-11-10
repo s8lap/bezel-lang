@@ -36094,9 +36094,56 @@ bool builtinHeadReachesObjectExtension(std::string_view head) {
     // may hold one of them) are left out: their `Object` view reads freed or
     // foreign memory (#7822), so admitting them would turn today's compile
     // error into a run-time fault.
+    //
+    // fix #7936 (§26.5 rule 2, §2, §8.1, stdlib §2.5, v0.355): the built-in
+    // VALUE records `DateTime` / `DateOnly` / `TimeOnly` belong here too.
+    //
+    // §2: "every type derives from Object", and §12: "if no base class is
+    // specified, the implicit base is Object" — so an `extension Object`
+    // block is a candidate for a `DateTime` receiver exactly as it is for a
+    // record's. The three heads are declared by NAME (the stdlib §2.5
+    // surface table `builtinRecordSurfaceReason` reads), and their values
+    // behave as an `Object` in an extension body: the boxed value-builtin's
+    // `ToString` / `Equals` / `GetHashCode` thunks (`valueBuiltinBoxToStringThunk`
+    // / `bz$box$eq` / `bz$box$hash`) speak about the VALUE (§8.6 / #7817),
+    // so `this.ToString()` inside an `extension DateTime` renders the
+    // value, not the box.
+    //
+    // WHY THE THREE AND NOT `TimeSpan` / `Guid`: this predicate is consulted
+    // only for a DECLARATION-LESS receiver, and the two shapes a built-in
+    // value record reaches sema in are not the same. A value obtained from a
+    // static factory (`DateTime.FromTicks(…)`, `Guid.NewGuid()`) carries the
+    // compiler's `builtinClassSym`, and `extensionFindMatchingAncestor`'s
+    // FIRST arm already admits it (`recv->declaration` non-null). A value
+    // obtained from a CONSTRUCTION (`new DateTime(…)`) or from a written
+    // annotation (`var d: DateTime := …`) keeps `declaration == nullptr`
+    // (§2.5 / #1463: the built-in value types keep a null declaration so the
+    // compiler's `new` path can recognise them), so those receivers reached
+    // NO arm: `extension Object`'s members stayed unresolved on them and
+    // codegen dropped the call ("`Describe` on built-in type `DateTime`
+    // produced no value, and no dispatch arm emitted any code for this
+    // call", #2457). MEASURED: `extension Object { method Describe(): string }`
+    // over `new DateTime(2024, 3, 15)` was a compile error, while the very
+    // same extension over `DateTime.FromTicks(5L)` compiled and ran.
+    //
+    // `TimeSpan` and `Guid` have no construction form, so their receivers
+    // always carry the `builtinClassSym` and this predicate is never asked
+    // about them; they are left out to keep the set to the heads it decides.
+    //
+    // `Random` (§2.7) joins them for the SAME reason as the three value
+    // records: it is a by-name built-in class whose CONSTRUCTION form
+    // (`new Random(seed)`) keeps `declaration == nullptr`, so an
+    // `extension Object` member did not reach it either — the same "produced
+    // no value, and no dispatch arm emitted any code" symptom, on the same
+    // permissive-acceptance path. A `Random` is a heap class, so its `Object`
+    // view is the ordinary vtable dispatch (nothing of the #7822 freed /
+    // foreign-memory hazard the dictionary / set / linked-list families
+    // carry).
     return head == "StringBuilder" || head == "Array" ||
            head == "OwningArray" || head == "Stack" || head == "OwningStack" ||
-           head == "Queue" || head == "OwningQueue";
+           head == "Queue" || head == "OwningQueue" ||
+           head == "DateTime" || head == "DateOnly" || head == "TimeOnly" ||
+           head == "Random";
 }
 
 // fix #7373 (§26.5 rule 1, §27.1, §27.7, v0.350; stdlib §9.6): the NAMED

@@ -1118,6 +1118,30 @@ GenericArgsCloser Parser::tokensLookLikeGenericArgs() {
             // `->` separates a function type's parameters from its return;
             // `:` precedes a named function-type parameter's type (`(x: int)`).
             if (t.text == "->" || t.text == ":") continue;
+            // fix #7948 (§11.6 / §22.12 / §27.6): a QUALIFIED type name is a
+            // valid GenericArg — §27.6 admits a qualified type argument
+            // ("`Math.Max<Lib.DateTime>`"), and §11.6 makes the qualified
+            // spelling the ordinary one for a type of another module.  The
+            // scan rejected the `.` of a qualified name as "any other
+            // punctuator", so the generic reading never committed and the
+            // `<` fell to the RELATIONAL parser: `Math.Max<Lib.DateTime>`
+            // was a parse error ("expected expression") on a program the
+            // grammar admits.
+            //
+            // The `.` is admitted ONLY in the shape §11.6 gives a qualified
+            // type name — an identifier, the dot, an identifier — so the
+            // scan still cannot be walked onto by a member access that is not
+            // a type name (`a < b.c` keeps its relational parse: the scan
+            // still has to find the closing `>` and a §22.12 successor,
+            // which a relational chain does not have).
+            if (t.text == ".") {
+                const Token& before = peekAt(k - 1);
+                const Token& after = peekAt(k + 1);
+                if (before.kind == TokenKind::Identifier &&
+                    after.kind == TokenKind::Identifier)
+                    continue;
+                return GenericArgsCloser::None;
+            }
             // Punctuators valid inside a type arg: `,`, `?`, `[`, `]`.
             if (t.text == "," || t.text == "?" ||
                 t.text == "[" || t.text == "]") continue;

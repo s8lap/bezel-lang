@@ -1370,18 +1370,47 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 // DateOnly: day number since 0001-01-01; TimeOnly: ms since midnight.
                 if (n0 == "DateOnly" || n0 == "TimeOnly") return i32();
             }
-            if (rt->declaration && !rt->declaration->decl &&
-                (rt->declaration->name == "DateTime" ||
-                 rt->declaration->name == "TimeSpan")) {
+            // fix #7948 (§11.3 / §2.3 / §2.5, v0.355): the DECLARATION-shaped
+            // value-builtin arms must recognise the BUILT-IN and not a USER type
+            // that merely shares the spelling.
+            //
+            // The discriminator is `builtinTypeName(rt)` — the ONE chokepoint
+            // that answers "does this TypeRef name a compiler BUILT-IN?" — and
+            // it is the #2997 rule: a `builtinClassSym` is shaped
+            // `decl == nullptr && moduleName.empty()`, so an IMPORTED user type
+            // (the very same null-decl shape, but with a populated `moduleName`)
+            // is NOT mistaken for one.
+            //
+            // `!rt->declaration->decl` alone was NOT that discriminator: an
+            // imported type has no `ast::TypeDecl` either, so a dependency
+            // module's own `public record TimeSpan` was lowered as the BUILT-IN
+            // TimeSpan (i64) while the exporter laid it out as a record
+            // (`%record.TimeSpan = { i32 }`). The importer then declared
+            // `bz$Lib.TimeSpan$CompareTo` with an `i64` second parameter while
+            // its own call site passed the record — "Call parameter type does
+            // not match function signature!", an IR-verify failure with no
+            // diagnostic naming the cause.
+            //
+            // §11.3 reserves no names, so a dependency module is free to export
+            // a record called `TimeSpan` / `DateTime` / `Guid`; §2.3 says every
+            // always-available name but §3.4's may be shadowed. The built-in's
+            // OWN spellings are unaffected: the compiler-synthesized
+            // `builtinClassSym("TimeSpan")` has an empty `moduleName`, and the
+            // qualified spellings (`System.TimeSpan`) are stripped to the bare
+            // built-in by #6040/#4698 before they reach here.
+            if (rt->declaration &&
+                (builtinTypeName(rt) == "DateTime" ||
+                 builtinTypeName(rt) == "TimeSpan")) {
                 return i64();
             }
             // per §2.5 / #1357: DateOnly / TimeOnly — builtinClassSym shape
             // (TypeRef produced by DateOnly.Parse / TimeOnly.Parse / ToDateTime
             // return types, and DateTime.Date / DateTime.TimeOfDay properties).
             // Must be i32, not ptrTy() — they are scalar value types, not heap ptrs.
-            if (rt->declaration && !rt->declaration->decl &&
-                (rt->declaration->name == "DateOnly" ||
-                 rt->declaration->name == "TimeOnly")) {
+            // fix #7948: the same user-type discriminator as the arm above.
+            if (rt->declaration &&
+                (builtinTypeName(rt) == "DateOnly" ||
+                 builtinTypeName(rt) == "TimeOnly")) {
                 return i32();
             }
             // fix #499 / §9.8: Range<T> is a compiler-intrinsic value-type
@@ -1443,17 +1472,21 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // cts.Token has a non-null builtinClassSym declaration (used to
             // carry the type name through sema); recognise it by declaration name
             // so lowerTypeRef returns ptrTy() for it.
-            if (rt->declaration && !rt->declaration->decl &&
-                (rt->declaration->name == "CancellationToken" ||
-                 rt->declaration->name == "CancellationTokenSource" ||
+            // fix #7948: the user-type discriminator as above (an imported
+            // `class CancellationToken` is a user class — it lowers to a heap
+            // pointer by the class arm anyway, so this arm is unchanged for it).
+            if (rt->declaration &&
+                (builtinTypeName(rt) == "CancellationToken" ||
+                 builtinTypeName(rt) == "CancellationTokenSource" ||
                  // stdlib §6.10 (v0.175, #808): TaskScope via builtinClassSym.
-                 rt->declaration->name == "TaskScope")) {
+                 builtinTypeName(rt) == "TaskScope")) {
                     return ptrTy();
             }
             // per stdlib §2.6: Guid typed via builtinClassSym (declaration->name ==
             // "Guid", null decl) → value struct { i64, i64 }.
-            if (rt->declaration && !rt->declaration->decl &&
-                rt->declaration->name == "Guid") {
+            // fix #7948: an imported user `record Guid` is a RECORD, not the
+            // built-in's 128-bit value struct — same discriminator as above.
+            if (rt->declaration && builtinTypeName(rt) == "Guid") {
                 return guidStructType();
             }
             // §2.5 / §29.3 (issue #495): imported TypeRefs for builtin stdlib

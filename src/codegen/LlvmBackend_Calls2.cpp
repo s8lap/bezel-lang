@@ -5428,7 +5428,34 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
     // record the `Class`-stamped builtin symbol hides from `namedValueSem`;
     // its generated Equals/GetHashCode dispatch with the other value kinds.
     bool rangeValueSem = isRangeType(dispatchTy) && (isEquals || isGetHashCode);
-    if (!primValueSem && !namedValueSem && !choiceValueSem && !rangeValueSem)
+    // fix #7937 (§8.3 / stdlib §2.5, v0.355): the built-in VALUE RECORDs
+    // `TimeSpan` / `DateOnly` / `TimeOnly` — §8.3's value-equality pair is
+    // theirs, exactly as it is a record's or an enum's.
+    //
+    // `builtinClassSym` stamps the symbol `Class`, so the `namedValueSem`
+    // gate above (Record / Enum only) never admitted them, and the
+    // reference-semantics dispatch further out requires a POINTER receiver
+    // while these lower to a SCALAR WORD (the i64 tick count / the i32 day
+    // number / the i32 millisecond word). Both members therefore degraded to
+    // a zero (`False` / `0`) behind an `internal:` warning: MEASURED, a
+    // `TimeSpan`'s `Equals` printed nothing and its `GetHashCode` printed
+    // nothing, while the sibling `CompareTo` / `ToString` worked.
+    //
+    // `DateTime` and `Guid` are NOT in this set: they have their OWN arms
+    // (the `DateTime` instance block and the `Guid` block in
+    // LlvmBackend_Calls.cpp), and the DateTime one carries the §2.5 rule
+    // that `Equals` / `GetHashCode` read the TICKS alone — the Kind bits
+    // (62..63) do not take part. Leaving them where they are keeps that
+    // rule in one place.
+    bool builtinValueSem = false;
+    if (dispatchTy->kind == sema::TypeRef::Kind::Named && !dispatchTy->nullable &&
+        (isEquals || isGetHashCode)) {
+        std::string_view bn = builtinTypeName(dispatchTy);
+        builtinValueSem = bn == "TimeSpan" || bn == "DateOnly" ||
+                          bn == "TimeOnly";
+    }
+    if (!primValueSem && !namedValueSem && !choiceValueSem && !rangeValueSem &&
+        !builtinValueSem)
         return nullptr;
 
     llvm::Value* recv = lowerExpr(*ma->target);
@@ -5570,6 +5597,62 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
     if (recvTy->kind == sema::TypeRef::Kind::Unit && !recvTy->nullable &&
         (isGetHashCode || isEquals))
         return emitUnitUniversalAnswer(member, call);
+    // fix #7937 (§8.3 / stdlib §2.5, v0.355): the built-in VALUE RECORDs
+    // `TimeSpan` / `DateOnly` / `TimeOnly` — §8.3's value-equality pair
+    // ("a `TimeSpan` is equal to another `TimeSpan` when they carry the same
+    // tick count", §2.5's own words for the value records) is theirs, exactly
+    // as it is a record's or an enum's.
+    //
+    // `builtinClassSym` stamps the symbol `Class`, so the RECORD arm below
+    // never saw these heads, and the reference-semantics dispatch further out
+    // requires a POINTER receiver while these lower to a SCALAR WORD — the
+    // i64 tick count (TimeSpan), the i32 day number (DateOnly) and the i32
+    // millisecond word (TimeOnly). Both members therefore degraded to a zero
+    // (`False` / `0`) behind an `internal:` warning.
+    //
+    // The comparison and the hash are `emitValueEquality`'s and
+    // `emitValueHashCode`'s own VALUE arms (the same ones `=`, a record
+    // field's equality and the box thunks use), so the unboxed and the boxed
+    // answer cannot disagree, and §8.3's invariant — "equal values hash
+    // equally" — holds by construction.
+    //
+    // An argument whose static type is not this very built-in value record
+    // takes §8.1's universal route, exactly as the record arm's does: an
+    // `Object` argument may hold a BOX of the receiver's own type (and then
+    // the box identity decides), while a primitive argument can never be
+    // equal to it and answers `False` without the comparison running.
+    if (recvTy->kind == sema::TypeRef::Kind::Named && !recvTy->nullable &&
+        (isEquals || isGetHashCode)) {
+        std::string_view bn = builtinTypeName(recvTy);
+        if (bn == "TimeSpan" || bn == "DateOnly" || bn == "TimeOnly") {
+            if (isGetHashCode) return emitValueHashCode(recv, recvTy);
+            if (!call.args[0].value) return nullptr;
+            const ast::Expr& argE = *call.args[0].value;
+            const sema::TypeRef* at = resolveTypeParamRef(ctx_.exprType(argE));
+            // §22.5: classify the argument BEFORE lowering it, so a reroute
+            // below never lowers it twice.
+            if (at && !at->nullable &&
+                at->kind == sema::TypeRef::Kind::Primitive &&
+                at->primitive != sema::PrimitiveType::Object) {
+                lowerExpr(argE);   // the argument still evaluates
+                return builder_.getFalse();
+            }
+            if (!(at && !at->nullable && builtinTypeName(at) == bn))
+                return lowerValueSemUniversalEquals(recvTy, recv, call);
+            llvm::Value* other = lowerExpr(argE);
+            if (!other) return nullptr;
+            if (other->getType() != recv->getType()) {
+                // §5.1: the two operands are the SAME value type, so their
+                // LLVM widths agree; a mismatch can only be the width of one
+                // of them, and the value is converted, not reinterpreted.
+                if (!other->getType()->isIntegerTy() ||
+                    !recv->getType()->isIntegerTy())
+                    return nullptr;
+                other = builder_.CreateSExtOrTrunc(other, recv->getType());
+            }
+            return emitValueEquality(recv, other, recvTy);
+        }
+    }
     // fix #747 R43 / stdlib §9.1–§9.5: a PRIMITIVE value type (int/long/bool/
     // char/double/…) implements IEquatable<T> with an auto-generated
     // `Equals(other): bool` and a `GetHashCode(): int`. Codegen had no handler,

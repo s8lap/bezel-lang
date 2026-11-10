@@ -35,6 +35,33 @@ bool sharedParseOperandAdmissible(
         llvm::function_ref<bool(llvm::Value*)> isSpanValue,
         bool spanOverloadDeclared);
 
+// fix #7937 / #7938 (§1 *OrNull tier, stdlib §2.5-§2.6, v0.355): the
+// TypeRef of a built-in VALUE type (`DateTime` / `DateOnly` / `TimeOnly` /
+// `Guid`), optionally in its NULLABLE form.
+//
+// The `ParseOrNull` arms below have no `ast::Type` node to read the result
+// type from — a built-in class call has no MethodSymbol and no declared
+// return type — so the nullable carrier is built from a TypeRef that names
+// the built-in through its compiler-synthesized `builtinClassSym` (the same
+// symbol `DateTime.FromTicks`'s own result carries). `nullableValueStructTy`
+// then produces the carrier `nullableValueStructTy` produces for that
+// built-in everywhere else: `{i8 hasValue; <the built-in's own lowering>}`
+// — i64 for DateTime, i32 for DateOnly / TimeOnly, `{i64,i64}` for Guid — so
+// the `ParseOrNull` result and the `Parse` result have the SAME payload and
+// a `DateTime?` slot accepts both.
+//
+// The returned TypeRef is a VALUE: the callers use it only to key the
+// carrier's shape, and none of them stores the pointer.
+static sema::TypeRef builtinValueTypeRef(sema::SemaContext& ctx,
+                                          std::string_view name,
+                                          bool nullable) {
+    sema::TypeRef t;
+    t.kind = sema::TypeRef::Kind::Named;
+    t.declaration = ctx.builtinClassSym(name);
+    t.nullable = nullable;
+    return t;
+}
+
 llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
                                int fd) {
     return emitConsoleWrite(strPtr, newline, builder_.getInt32(fd));
@@ -19922,6 +19949,37 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "guid.tryp.bool");
         }
+        // fix #7937 (§1 *OrNull tier, stdlib §2.6, v0.355):
+        // `Guid.ParseOrNull(s: string): Guid?` — the *OrNull convenience form
+        // of `Parse`, null exactly where `Parse` raises FormatException. The
+        // `?` carrier is the tagged `{i8 hasValue; {i64,i64} value}` struct
+        // `nullableValueStructTy` builds for a nullable value-builtin, so the
+        // value slot is the Guid's own 128-bit struct — the SAME payload the
+        // non-nullable Guid lowers to.
+        if (m == "ParseOrNull" && call.args.size() == 1 &&
+            call.args[0].value) {
+            const ast::Expr* parseArg = call.args[0].value.get();
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, false))
+                return nullptr;
+            llvm::AllocaInst* slot = makeGuidSlot();
+            auto* fn = declareC("bz_guid_try_parse", i32(), {ptrTy(), ptrTy()});
+            llvm::Value* ok = builder_.CreateCall(fn, {strVal, slot}, "guid.pon.ok");
+            // fix #1998 / §28.3: the `s: string` parameter is a BORROW, so a
+            // fresh +1 string producer argument is released here (the same
+            // shape Guid.Parse / Guid.TryParse release).
+            if (isPlusOneStringProducer(parseArg)) emitStringRelease(strVal);
+            llvm::Value* val = builder_.CreateLoad(guidStructType(), slot, "guid.pon.val");
+            sema::TypeRef guidTy = builtinValueTypeRef(ctx_, "Guid", true);
+            llvm::StructType* st = nullableValueStructTy(&guidTy);
+            llvm::Value* wrapped = wrapNullableValue(&guidTy, val);
+            llvm::Value* nullV = llvm::ConstantAggregateZero::get(st);
+            return builder_.CreateSelect(
+                builder_.CreateICmpNE(ok, builder_.getInt32(0)), wrapped, nullV,
+                "guid.pon.sel");
+        }
         // per stdlib §2.6 / #1357: Guid.FromByteArray(bytes: Array<byte>): Guid
         // "borrows; requires Length = 16, ArgumentException otherwise" — guard
         // BEFORE the 16-byte copy (a shorter array would be an out-of-bounds
@@ -20167,6 +20225,40 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // fix #2938 / §22.3: flush any bracket on the normal-return edge.
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "dt.tryp.bool");
+        }
+        // fix #7937 / #7938 (§1 *OrNull tier, stdlib §2.5, v0.355):
+        // `DateTime.ParseOrNull(s: string): DateTime?` — the *OrNull
+        // convenience form of `Parse`, null exactly where `Parse` raises
+        // FormatException (the `?` tier's rule: "the *OrNull form returns
+        // null where the throwing form raises"). The `?` carrier is the
+        // tagged `{i8 hasValue; i64 value}` struct `nullableValueStructTy`
+        // builds for a nullable value-builtin, so the value slot is the
+        // DateTime's own i64 tick word — the SAME payload the non-nullable
+        // DateTime lowers to, so a present value and the `Parse` result
+        // agree.
+        if (m == "ParseOrNull" && call.args.size() == 1 &&
+            call.args[0].value) {
+            const ast::Expr* parseArg = call.args[0].value.get();
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, false))
+                return nullptr;
+            auto* ticksSlot = entryAlloca(i64());
+            auto* tryFn = declareC("bz_datetime_try_parse", i32(), {ptrTy(), ptrTy()});
+            llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, ticksSlot}, "dt.pon.ok");
+            // fix #1998 / §28.3: the `s: string` parameter is a BORROW, so a
+            // fresh +1 string producer argument is released here (the same
+            // shape Guid.Parse / Guid.TryParse release).
+            if (isPlusOneStringProducer(parseArg)) emitStringRelease(strVal);
+            llvm::Value* ticks = builder_.CreateLoad(i64(), ticksSlot, "dt.pon.ticks");
+            sema::TypeRef dtTy = builtinValueTypeRef(ctx_, "DateTime", true);
+            llvm::StructType* st = nullableValueStructTy(&dtTy);
+            llvm::Value* wrapped = wrapNullableValue(&dtTy, ticks);
+            llvm::Value* nullV = llvm::ConstantAggregateZero::get(st);
+            return builder_.CreateSelect(
+                builder_.CreateICmpNE(ok, builder_.getInt32(0)), wrapped, nullV,
+                "dt.pon.sel");
         }
         // per stdlib §2.5 / #1357: DateTime.FromUnixTimeSeconds(seconds: long): DateTime
         //
@@ -21687,6 +21779,37 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "do.tryp.bool");
         }
+        // fix #7937 / #7938 (§1 *OrNull tier, stdlib §2.5, v0.355):
+        // `DateOnly.ParseOrNull(s: string): DateOnly?` — the *OrNull
+        // convenience form of `Parse`, null exactly where `Parse` raises
+        // FormatException. The `?` carrier is the tagged `{i8 hasValue; i32
+        // value}` struct `nullableValueStructTy` builds for a nullable
+        // value-builtin, so the value slot is the DateOnly's own i32 day
+        // number — the SAME payload the non-nullable DateOnly lowers to.
+        if (m == "ParseOrNull" && call.args.size() == 1 &&
+            call.args[0].value) {
+            const ast::Expr* parseArg = call.args[0].value.get();
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, false))
+                return nullptr;
+            auto* ticksSlot = entryAlloca(i64());
+            auto* tryFn = declareC("bz_datetime_try_parse", i32(), {ptrTy(), ptrTy()});
+            llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, ticksSlot}, "do.pon.ok");
+            if (isPlusOneStringProducer(parseArg)) emitStringRelease(strVal);
+            llvm::Value* ticks = builder_.CreateLoad(i64(), ticksSlot, "do.pon.ticks");
+            llvm::Value* tpd = builder_.getInt64(864000000000LL);
+            llvm::Value* dn = builder_.CreateTrunc(
+                builder_.CreateSDiv(ticks, tpd), i32(), "do.pon.dn");
+            sema::TypeRef doTy = builtinValueTypeRef(ctx_, "DateOnly", true);
+            llvm::StructType* st = nullableValueStructTy(&doTy);
+            llvm::Value* wrapped = wrapNullableValue(&doTy, dn);
+            llvm::Value* nullV = llvm::ConstantAggregateZero::get(st);
+            return builder_.CreateSelect(
+                builder_.CreateICmpNE(ok, builder_.getInt32(0)), wrapped, nullV,
+                "do.pon.sel");
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -21808,6 +21931,38 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // fix #2938 / §22.3: flush any bracket on the normal-return edge.
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "to.tryp.bool");
+        }
+        // fix #7937 / #7938 (§1 *OrNull tier, stdlib §2.5, v0.355):
+        // `TimeOnly.ParseOrNull(s: string): TimeOnly?` — the *OrNull
+        // convenience form of `Parse`, null exactly where `Parse` raises
+        // FormatException. The `?` carrier is the tagged `{i8 hasValue; i32
+        // value}` struct `nullableValueStructTy` builds for a nullable
+        // value-builtin, so the value slot is the TimeOnly's own i32
+        // millisecond word — the SAME payload the non-nullable TimeOnly
+        // lowers to, so a present value and the `Parse` result agree.
+        if (m == "ParseOrNull" && call.args.size() == 1 &&
+            call.args[0].value) {
+            const ast::Expr* parseArg = call.args[0].value.get();
+            llvm::Value* strVal = lowerExpr(*call.args[0].value);
+            if (!strVal) return nullptr;
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, false))
+                return nullptr;
+            auto* msSlot = entryAlloca(i32());
+            auto* tryFn = declareC("bz_timeonly_try_parse", i32(), {ptrTy(), ptrTy()});
+            llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, msSlot}, "to.pon.ok");
+            // fix #1998 / §28.3: the `s: string` parameter is a BORROW, so a
+            // fresh +1 string producer argument is released here (the same
+            // shape Guid.Parse / Guid.TryParse release).
+            if (isPlusOneStringProducer(parseArg)) emitStringRelease(strVal);
+            llvm::Value* ms = builder_.CreateLoad(i32(), msSlot, "to.pon.ms");
+            sema::TypeRef toTy = builtinValueTypeRef(ctx_, "TimeOnly", true);
+            llvm::StructType* st = nullableValueStructTy(&toTy);
+            llvm::Value* wrapped = wrapNullableValue(&toTy, ms);
+            llvm::Value* nullV = llvm::ConstantAggregateZero::get(st);
+            return builder_.CreateSelect(
+                builder_.CreateICmpNE(ok, builder_.getInt32(0)), wrapped, nullV,
+                "to.pon.sel");
         }
     }
 
