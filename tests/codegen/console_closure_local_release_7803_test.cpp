@@ -406,6 +406,9 @@ BEZEL_TEST(console_closure_local_release_7803,
 //     →  12800 B / 200 allocations leaked, IDENTICALLY on the pre-fix and
 //        the post-fix compiler.
 //
+// (UPDATE, #8382: `Array<T>.Sort(comparer)` is now fixed by its own relief --
+// see array_sort_closure_local_release_8382_test.cpp, which pins the leak-clean
+// behaviour. This row stays as written: a lenient no-crash / value control.)
 // ⇒ the row is a SIBLING RESIDUAL, not a regression: this fix changed
 // nothing for it (the leak is the same 12800 B / 200 allocations before and
 // after). It is asserted with LSan OFF (the generated-code ASan — what

@@ -31272,6 +31272,44 @@ static bool isBuiltinReaderCollectionArg(const ast::Expr* callee, size_t i,
     return true;
 }
 
+// fix #8382 (stdlib §4.4 / spec §22.3, §28.9, v0.357): is argument `i` of a
+// call whose callee is `callee` the COMPARER of a BUILT-IN `Array<T>`'s
+// `Sort(comparer)` / `Sorted(comparer)` -- a function-typed argument at a
+// PLAIN (borrow) parameter position whose lowering only INVOKES the closure
+// during the call and never stores it?
+//
+// The lowering is Emitter::tryLowerCollectionInstanceCall's `m == "Sort"` /
+// `m == "Sorted"` one-argument arms (LlvmBackend_Calls.cpp). Each hands the
+// closure to a runtime sort through a fresh `bz$sortcmp` trampoline that loads
+// the closure's fn/env and calls it per comparison, then returns: nothing is
+// stored, so the closure cannot outlive the call. The arms release ONLY an
+// INLINE producer (`argIsInlineLambda`: a lambda literal, a fresh +1 the call
+// site owns) after the call; a BOUND closure local is deliberately left alone
+// ("a closure arriving via a variable/field is a BORROW (not ours to free)",
+// the comment on `argIsInlineLambda`), i.e. the LOCAL's scope-end release is
+// the only discharge -- which is exactly the release the escape walk must be
+// told it may arm. Keyed on the receiver's TYPE (a BUILT-IN `Array`, not a
+// user class that merely carries the name: `declaration` must be null), not
+// on the member name alone, so a user method named `Sort` -- whose parameter
+// the user-method relief already judges -- is never touched here.
+//
+// The static spelling `Array.Sort(a)` has no value receiver (`exprType` of the
+// type-name qualifier is null), so it answers false: its argument is the
+// array, not a comparer. `OwningArray<T>.Sort(comparer)` is not recognized
+// either (it is not the lowering this predicate was proved against; a
+// conservative false is the safe direction -- a leak, never a use-after-free).
+static bool isBuiltinArrayComparerArg(const ast::Expr* callee, size_t i,
+                                      const sema::SemaContext& ctx) {
+    if (i != 0) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return false;
+    if (ma->member != "Sort" && ma->member != "Sorted") return false;
+    const sema::TypeRef* rt = ctx.exprType(*ma->target);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    return rt->headName() == "Array";
+}
+
 // fix #3874 (§4.14/§4.15/§4.16/§8.6/§28.9, v0.294): is argument `i` of a call
 // whose callee is `callee` the `other` argument of `SequenceEqual` on a
 // T-element span receiver — ArraySpan<T>/ReadOnlyArraySpan<T> (§4.15,
@@ -38090,6 +38128,20 @@ struct ClosureEscapeWalker {
                     c->args[ai].modifier.empty() &&
                     isTargetIdent(c->args[ai].value.get()) &&
                     isConsoleNonRetainingArg(c->callee.get(), ai, &ctx))
+                    safeArg = true;
+                // fix #8382 (stdlib §4.4 / §22.3 / §28.9, v0.357): the SAME
+                // call-bounded borrow at a second built-in -- the comparer of
+                // `Array<T>.Sort(comparer)` / `Sorted(comparer)`, a plain
+                // function-typed parameter the sort only invokes (see
+                // isBuiltinArrayComparerArg for the lowering proof). The
+                // local keeps the +1, so its scope-end release must fire; a
+                // release at the call would free a cell the local still
+                // points at. Same one-argument / no-modifier gates as the
+                // console relief above.
+                if (!safeArg && ai == 0 && c->args.size() == 1 &&
+                    c->args[ai].modifier.empty() &&
+                    isTargetIdent(c->args[ai].value.get()) &&
+                    isBuiltinArrayComparerArg(c->callee.get(), ai, ctx))
                     safeArg = true;
                 expr(c->args[ai].value.get(), /*safeRead=*/safeArg);
             }
