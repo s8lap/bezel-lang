@@ -4173,6 +4173,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                      "Add/Remove/Contains/Clear/TryAdd/First/Last/GetEnumerator"},
                     {"FrozenArray", "\xC2\xA7""4.19",
                      "Length/ToArray/GetEnumerator"},
+                    // fix #8349 (stdlib §4.14, v0.355): the §4.14 head's own
+                    // documented surface — the same names the sema table's
+                    // row carries (the `Length` property, the two span-view
+                    // methods and the conditional `DangerousPointer`, whose
+                    // own dedicated diagnostic owns that name). This arm is
+                    // the DEFENCE-IN-DEPTH copy for the case where sema is
+                    // skipped; the sema gate is the authority and reports
+                    // first.
+                    {"OwningBuffer", "\xC2\xA7""4.14",
+                     "AsReadOnlySpan/AsSpan/DangerousPointer/Length"},
                 };
                 const char* section = "\xC2\xA7""4.x";
                 const char* surface = "";
@@ -20715,6 +20725,28 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* r = builder_.CreateCall(fn, {path});
             // fix #8016: the C-string copy is ours — the runtime only read it.
             freeCStr(path);
+            // fix #8389 (stdlib §7.3 / §21.9, v0.355): §7.3 declares
+            // `public static method Delete(path: string);` — NO result — so
+            // the call's SEMANTIC type is `()` and the §21.9 unused-result
+            // warning no longer fires on the statement form (the sema arm in
+            // ExprTypecheck_Calls.cpp no longer types this call `Bool`).
+            //
+            // THE `i1` IS STILL HANDED BACK, and that is the shape every
+            // void-returning builtin in this block already has: the runtime's
+            // answer is the VALUE the expression carries, and a condition can
+            // consume it. MEASURED (the IR, tip5): `%9 = call i1
+            // @bz_file_delete(ptr %6)` followed by `br i1 %9, label %if.body,
+            // label %if.next` — so `if File.Delete(p) then …` keeps the
+            // runtime's "did the file exist" answer, exactly as it did before
+            // this fix. The siblings agree: `Directory.Delete` hands back the
+            // `i32` of `bz_dir_delete` and `File.WriteAllText` the `i32` of
+            // `bz_file_write_all_text`, and BOTH are sema-unit calls.
+            //
+            // ⇒ DO NOT "TIGHTEN" THIS ARM by dropping the `i1`: the value is
+            // what a condition reads, and dropping it would turn
+            // `if File.Delete(p) then …` into a unit condition — a SILENT
+            // behaviour change in the wrong direction. The sema type is the
+            // thing that was wrong, and it is fixed on the sema side.
             return r;
         }
         if (m == "ReadAllText" && call.args.size() == 1 && call.args[0].value) {

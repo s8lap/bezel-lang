@@ -473,3 +473,159 @@ BEZEL_TEST(collection_undeclared_member_surface_8331,
         "end C;\n",
         "3\n0\n3\n4\n");
 }
+
+// ===========================================================================
+// fix #8349 (stdlib §4.14, v0.355): the `OwningBuffer<T>` head gets its own
+// row of the per-head table, so a call that names a member §4.14 does NOT
+// declare draws the per-head documented-surface refusal instead of codegen's
+// generic "produced no value, and no dispatch arm emitted any code" backstop
+// (#2457).
+// ===========================================================================
+
+// stdlib §4.14 (v0.355) declares `OwningBuffer<T>`'s surface: the `Length`
+// property, the indexer, `AsSpan` (four overloads), `AsReadOnlySpan` (four
+// overloads) and — on the value-typed presentation — `DangerousPointer`.
+// `BogusMember` is not among them, so the call is refused with the same
+// per-head sentence every other head gets.
+BEZEL_TEST(collection_undeclared_member_surface_8331,
+           owning_buffer_bogus_member_is_rejected) {
+    expectRejected(
+        "module M; import System; import System.Collections.Generic;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    using var buf := new OwningBuffer<int>();\n"
+        "    buf.BogusMember();\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "no member `BogusMember` on `OwningBuffer`");
+}
+
+// The refusal must name the stdlib section that DECLARES the head (§4.14)
+// and quote the head's OWN surface — the list GENERATED from the row the
+// gate reads (issue #8333's lesson: a hand-copied list drifts).
+BEZEL_TEST(collection_undeclared_member_surface_8331,
+           owning_buffer_refusal_quotes_the_section_4_14_surface) {
+    expectRejected(
+        "module M; import System; import System.Collections.Generic;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    using var buf := new OwningBuffer<int>();\n"
+        "    buf.BogusMember();\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "stdlib \xC2\xA7""4.14");
+}
+
+// CONTROL: §4.14's `Length` property keeps working, and the value it
+// reports is the buffer's stored extent.
+BEZEL_TEST(collection_undeclared_member_surface_8331,
+           owning_buffer_length_property_still_works) {
+    expectOut(
+        "module M; import System; import System.Collections.Generic;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    using var buf := new OwningBuffer<int>(3);\n"
+        "    Console.WriteLine(buf.Length);\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "3\n");
+}
+
+// CONTROL: the `Count` refusal keeps its OWN wording — "use `Length`" — and
+// does not become the generic documented-surface sentence.
+BEZEL_TEST(collection_undeclared_member_surface_8331,
+           owning_buffer_count_keeps_its_own_refusal) {
+    expectRejected(
+        "module M; import System; import System.Collections.Generic;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    using var buf := new OwningBuffer<int>();\n"
+        "    buf.Count();\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "no member `Count` on `OwningBuffer<T>`: use `Length` (stdlib "
+        "\xC2\xA7""4.14)");
+}
+
+// CONTROL: `CompareTo` keeps its dedicated refusal — §4.14 declares no
+// `IComparable<T>` conformance for the head — and is not shadowed by the
+// generic documented-surface sentence.
+BEZEL_TEST(collection_undeclared_member_surface_8331,
+           owning_buffer_compare_to_keeps_its_own_refusal) {
+    expectRejected(
+        "module M; import System; import System.Collections.Generic;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    using var buf := new OwningBuffer<int>();\n"
+        "    buf.CompareTo(1);\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "no member `CompareTo` on `OwningBuffer<T>` (stdlib \xC2\xA7""4.14 "
+        "declares no `IComparable<T>` conformance for this type)");
+}
+
+// CONTROL: the conditional `DangerousPointer` keeps its own dedicated
+// refusal (stdlib §4.14 documents it; this compiler does not implement it).
+BEZEL_TEST(collection_undeclared_member_surface_8331,
+           owning_buffer_dangerous_pointer_keeps_its_own_refusal) {
+    expectRejected(
+        "module M; import System; import System.Collections.Generic;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    using var buf := new OwningBuffer<int>();\n"
+        "    buf.DangerousPointer();\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "`DangerousPointer()` on `OwningBuffer<T>` is documented in stdlib "
+        "\xC2\xA7""4.14");
+}
+
+// CONTROL: the members §4.14 DOES declare keep compiling and running — the
+// two span views.
+BEZEL_TEST(collection_undeclared_member_surface_8331,
+           owning_buffer_span_views_still_work) {
+    expectOut(
+        "module M; import System; import System.Collections.Generic;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    using var buf := new OwningBuffer<int>(2);\n"
+        "    buf[0] := 5;\n"
+        "    Console.WriteLine(buf.AsSpan().Length);\n"
+        "    Console.WriteLine(buf.AsReadOnlySpan().Length);\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "2\n2\n");
+}
+
+// CONTROL: the members the COMPILER dispatches for the head although stdlib
+// §4.14 declares no such member (the table's fourth field) keep compiling
+// AND keep working — `Get`, `Peek`, `Pop`, `Clear` and `Sort`. Without
+// them in that field they would start drawing the surface diagnostic, which
+// would be a regression: a member that compiles today must not stop
+// compiling.
+BEZEL_TEST(collection_undeclared_member_surface_8331,
+           owning_buffer_compiler_dispatched_members_still_work) {
+    expectOut(
+        "module M; import System; import System.Collections.Generic;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    using var buf := new OwningBuffer<int>(3);\n"
+        "    buf[0] := 7; buf[1] := 8; buf[2] := 9;\n"
+        "    Console.WriteLine(buf.Get(0));\n"
+        "    Console.WriteLine(buf.Peek());\n"
+        "    buf.Pop();\n"
+        "    Console.WriteLine(buf.Length);\n"
+        "    buf.Clear();\n"
+        "    Console.WriteLine(buf.Length);\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "7\n9\n2\n0\n");
+}

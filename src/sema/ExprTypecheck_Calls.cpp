@@ -14920,7 +14920,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // elements. (The OWNING family's own spelling of the
                     // refusal is the surface diagnostic below — the
                     // borrowing family's is this one, as before.)
-                    if (m == "DisposeElements" && !isOwningContainer) {
+                    // fix #8349 (stdlib §4.14, v0.355): `OwningBuffer<T>` is
+                    // an OWNING family too (§4.14: "the buffer owns each
+                    // non-null slot's referent … the buffer's destructor
+                    // cascades through slots, disposing every non-null one"),
+                    // so the retired-name hint below must not own its
+                    // `DisposeElements` — the hint's advice ("if `X<T>`
+                    // semantically owns its elements, declare the owning
+                    // family") is wrong for a head that IS one, and the
+                    // owning family's own wording is the per-head
+                    // documented-surface refusal, which is what the other
+                    // five owning heads get for this name.
+                    if (m == "DisposeElements" && !isOwningContainer &&
+                        colName != "OwningBuffer") {
                         ctx_.diagnostics().report(
                             Severity::Error, ce.span.begin,
                             std::string("`.DisposeElements()` was removed "
@@ -18488,8 +18500,34 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (colName == "File") {
                         if (m == "ReadAllText")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
-                        else if (m == "Exists" || m == "Delete")
+                        else if (m == "Exists")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        // fix #8389 (stdlib §7.3 / §21.9, v0.355): `Delete(path:
+                        // string)` declares NO result — §7.3 declares
+                        // `public static method Delete(path: string);` — so the
+                        // call's type is `()`. Typing it `Bool` (as this arm
+                        // did) made the §21.9 UNUSED-RESULT warning fire on the
+                        // statement form `File.Delete(p);`, which §21.9
+                        // exempts: "Method calls returning `()` … draw no
+                        // warning" — the regime is keyed on the result's STATIC
+                        // TYPE, and `()` produces no value.
+                        //
+                        // The declaration is the authority, and the SIBLING
+                        // heads agree: stdlib §7.4 declares
+                        // `public static method Delete(path: string, recursive:
+                        // bool := false);` — also no result — and the
+                        // `Directory` block below leaves `Delete` UNTYPED
+                        // already. `File.WriteAllText` / `AppendAllText` /
+                        // `Copy` / `Move` are left untyped here for the same
+                        // reason (§7.3 declares no result for them either), so
+                        // `File.Delete` now matches the whole §7.3 family.
+                        //
+                        // ⇒ LEAVE THE CALL UNTYPED, as the `Dictionary` block's
+                        // own `Add`/`Clear` arms do ("unit: no type"): an
+                        // untype-`()` call draws no §21.9 warning, because the
+                        // walk asks `ascribedReturnTypeProducesValue` of the
+                        // result's type and an absent type answers no
+                        // question.
                         // §7.3: ReadAllBytes → owned Array<byte>.
                         else if (m == "ReadAllBytes")
                             ctx_.setExprType(
@@ -35605,6 +35643,47 @@ concreteCollectionSurfaces() {
           "IsReadOnly", "PopAt", "PopFirst", "PopLast", "Remove", "RemoveAt",
           "Reverse", "Sort", "TryPopFirst", "TryPopLast"},
          {"Get"}},
+        // fix #8349 (stdlib §4.14, v0.355): the §4.14 head's OWN row. It
+        // had none, so a call on an `OwningBuffer<T>` receiver that named a
+        // member §4.14 does not declare fell through to codegen's generic
+        // "produced no value, and no dispatch arm emitted any code" backstop
+        // (#2457) instead of the per-head documented-surface refusal the
+        // other heads get.
+        //
+        // THE THIRD FIELD is §4.14's OWN declaration block
+        // (`docs/Bezel_Standard_Library.md` §4.14, `sec-owned-buffers-and-spans`):
+        // the `Length` property, the two span-view methods (`AsSpan`,
+        // `AsReadOnlySpan` — four overloads each, the name is what the table
+        // holds), and `DangerousPointer` — which §4.14 declares on the
+        // VALUE-typed presentation only, under the §32.12 FFI-pointee-set
+        // condition. The table holds NAMES and has no conditional-member
+        // notion, so the conditional member is carried by its NAME and keeps
+        // its OWN dedicated diagnostic (the "documented … but NOT
+        // IMPLEMENTED" refusal, #2457/#3331 D8), which fires before this
+        // gate and returns.
+        //
+        // THE FOURTH FIELD is the head's COMPILER-DISPATCHED members that
+        // §4.14 does not declare — MEASURED on the base tree, each one
+        // really dispatched (not the #2457 backstop): `Clear` (the buffer's
+        // slots go to their defaults — MEASURED: `Length` 3 → 0), `Pop` /
+        // `PopFirst` / `PopLast` / `Dequeue` (each removes one slot —
+        // MEASURED: `Length` 3 → 2), `Peek` (reads the top slot), `Get`
+        // (the array-storage read, `Get(0)` → the stored element), and
+        // `Sort` (the ordering mutator). They are the same SHAPE as the
+        // `Array` row's `Get` accessor — a member the compiler dispatches
+        // although no stdlib section declares it — and they are listed here
+        // for the same reason the table's own comment gives: without them,
+        // the head's own dispatched members would start drawing the surface
+        // diagnostic, which would be a REGRESSION (a member that compiles
+        // today would stop compiling).
+        //
+        // The §5 LINQ operator names (`First`, `Last`, `ToArray`, `Where`,
+        // …), the universal `Object` members and `Dispose` are admitted by
+        // the gate's own exemptions and are NOT repeated here.
+        {"OwningBuffer", "4.14",
+         {"AsReadOnlySpan", "AsSpan", "DangerousPointer", "Length"},
+         {"Clear", "Dequeue", "Get", "Peek", "Pop", "PopFirst", "PopLast",
+          "Sort"}},
         {"OwningDictionary", "4.9",
          {"Add", "Clear", "Contains", "ContainsKey", "Count", "Dispose", "Drain",
           "GetOrAdd", "GetOrNull", "Keys", "PopValue", "Remove", "TryAdd",
@@ -35783,6 +35862,20 @@ static bool concreteCollectionCallHasDedicatedDiagnostic(
     if (head == "OwningArray" &&
         (member == "Reversed" || member == "Sorted"))
         return true;
+    // fix #8349 (stdlib §4.14, v0.355): `OwningBuffer<T>` declares no
+    // `IComparable<T>` conformance at all — stdlib §4.14's own member list
+    // has no `CompareTo` — and the head has a DEDICATED refusal for it
+    // ("no member `CompareTo` on `OwningBuffer<T>` (stdlib §4.14 declares no
+    // `IComparable<T>` conformance for this type)"), which names the reason
+    // and the section. That refusal is the authority for this name: the
+    // generic "not part of this collection's documented surface" sentence
+    // would replace a precise reason with a generic one.
+    //
+    // The gate DEFERS on it (it does not report and does not return), so the
+    // dedicated diagnostic further down the chain fires — exactly as it does
+    // for the seven other heads whose `CompareTo` the generic sentence
+    // already shadows.
+    if (head == "OwningBuffer" && member == "CompareTo") return true;
     return false;
 }
 
