@@ -731,6 +731,61 @@ exits 3 on a mismatch. **⇒ THE LEDGER'S LIVE ROWS NOW CARRY THEIR SESSION ID**
 (`live:<role>:ses_…`), which is what makes the reconciliation exact. **⇒ A LANE IS NOT
 "DISPATCHED" UNTIL ITS AGENT EXISTS.**
 
+**R41 session handback (2026-11-11 02:11 NZDT — the owner authorised the ONE gate to run over the
+run's 02:00 deadline; the gate is the last act and it has NOT run yet).**
+
+The R41 run took the two ACTIVE campaigns — **1 `using-heads`** (ownership) and **2
+`builtin-call-admission`** (sema/stdlib) — and carried **86 commits over `origin/main`** on the
+staging branch `r30-c1`, at tip **`8e50676fa`** (MEASURED 2026-11-11 02:11 NZDT; **THE TIP MOVES AS
+THE COORDINATOR PICKS**, so the numbers below are a reading, not constants). **THE CLOSURE COUNT IS
+`closable 100/100` AND `fix-named 98`** — printed by `scripts/run_status.sh --staging
+/mnt/fast/worktrees/r28-staging --claims /var/tmp/bezel-scratch/r41-coord/claims.tsv --pool 6
+--target 100` on its `staging` row; the ledger's own summary (`scripts/pick_ledger.sh
+origin/main..r30-c1`) reads **86 commit(s)** · **`distinct fix issues: 98`** · **`distinct issues
+GitHub would close (keyword rule, subject+body, any kind): 100`** · **`UNATTRIBUTED: 2 commit(s)`**.
+**⇒ THE OWNER's 100-CLOSURE FLOOR IS REACHED.** The 100 are **36** `campaign:using-heads`, **61**
+`campaign:builtin-call-admission` and **3** unlabelled (`#3480`, `#8361`, `#8363`); **97** are still
+OPEN on GitHub and **3** (`#3480`, `#4126`, `#7915`) are already closed, so the push re-closes those
+three as a no-op.
+
+**BOTH RATCHETS ARE GREEN ON THIS TREE** (`reviews/r41-final-ratchet.md`): the corpus ratchet reads
+**`OK (5781 cases, 3742 ok, 210 known-divergent, 1829 unclassified)`** and the internal-residual
+ratchet reads **`OK (total_internal_lines=69)`** — **69 IS THE BANKED BASELINE IN THIS TREE**, so the
+count is EXACT and not merely under it, with the runner's own summary **`0 REGRESSION, 0 UNBANKED`**.
+They were measured at `84e36307f6`, **whose TREE IS BYTE-IDENTICAL TO THIS TIP's**
+(`git rev-parse 84e36307f6^{tree}` = `git rev-parse r30-c1^{tree}` =
+`ab591f5804a24f4756abd5a54a39d1cdc8053245`): the three message surgeries that followed changed commit
+MESSAGES ONLY.
+
+**THE THREE WAYS R41 EARNED A CLOSURE — AND THE RULE EACH FOLLOWS.**
+
+* **A REVIEWED SOURCE COMMIT.** Every `fix` commit carries a **non-author** review whose recorded
+  verdict is `ACCEPT` or `ACCEPT-W-NOTES`; the two `bank:` commits have no source change to review.
+  A `narrow` commit closes nothing.
+* **A `narrow` COMMIT IS A DELIBERATE NON-CLOSE.** `narrow #8256` (`af7c61efe`) and `narrow #8265`
+  (`1c12ebe46`) exist because each of those issues is **still broken in a reachable shape** — #8256's
+  `Console.Out as Object` carrier half and #8265's covariantly-widened erased collection. **⇒ THEIR
+  ISSUES STAY OPEN ON GITHUB AFTER THE PUSH, AND THAT IS THE POINT.**
+* **A MISSED CLOSURE, BANKED BY MESSAGE SURGERY ALONE — NO SOURCE CHANGE, NO REBUILD.** An OPEN
+  issue that a commit **already in the chain** fixes, but that no commit names, gets its `Fixes #N`
+  line added by `message_surgery.py`. R41 banked `#7964` and `#7926` this way, and **`#8274`** in the
+  final hour: the `OwningBuffer<T>` row that the chain's own `fix #8389` commit added to the per-head
+  collection surface table fixes the **fourth** of #8274's **four** shapes (the value-typed
+  `OwningBuffer` receiver), the other three having been refused by sema with the right diagnostic
+  since #8331's table — so the issue's population is **fully covered** and the added line is honest.
+
+**THE CLOSURE AUDIT** (`reviews/r41-closure-audit.md`): **NO FALSE CLOSES.** The chain's 32
+subject-only closes are all real; the four prose closes (`#3480`, `#4126`, `#7915`, `#8223`) are
+no-ops or already-closed; `Refs #7805` closes nothing on its own. Two dangling SHA references that
+earlier message surgeries had created in two commit bodies were repaired by surgery before this
+record was written.
+
+**⇒ THE GATE IS THE RUN's LAST ACT AND ITS VERDICT IS NOT YET MEASURED.** The `gate` row still
+reads `pid: none | done: 0` and the newest cycle log is `a30bb11d_cycle.log`, whose last line is
+`[gate_full_cycle 23:03:30] cycle COMPLETE (/mnt/fast/worktrees/r28-staging @ a30bb11d): both oracles
+trustworthy-green + conformance green` — **`a30bb11d` IS R40's TIP, NOT R41's.**
+
+
 ---
 
 ## Appendix A — the mechanical commands

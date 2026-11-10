@@ -175,3 +175,32 @@ in its own session (cadence `13,43 * * * *`). It is not an OpenCode schedule, so
 survive the end of that session: a successor coordinator recreates it from the standing rule
 above. The rule itself is unchanged: STATUS then REKINDLE, one gate near the end, never gate or
 push from the heartbeat.
+
+**MEASURED 2026-11-11 02:11 NZDT (the R41 run's chain, with ONE gate still to come).** The staging
+branch `r30-c1` stands at **`8e50676fa`** — **86 commits over `origin/main`** (`714ba5490`) — and
+`scripts/run_status.sh --staging /mnt/fast/worktrees/r28-staging --claims
+/var/tmp/bezel-scratch/r41-coord/claims.tsv --pool 6 --target 100` prints, on its `staging` row,
+**`r30-c1 @ 8e50676fa | +86 over origin/main | closable 100/100 | fix-named 98`** — **⇒ THE OWNER's
+100-CLOSURE FLOOR IS REACHED, AND THE ROW READS `FLAG` AND NAMES `scripts/pregate.sh`.** The
+ledger's own summary (`scripts/pick_ledger.sh origin/main..r30-c1`) reads **86 commit(s)** ·
+**`distinct fix issues: 98`** · **`distinct issues GitHub would close (keyword rule, subject+body,
+any kind): 100`** · **`UNATTRIBUTED: 2 commit(s)`** — the two `bank:` commits, whose diffs touch only
+`scripts/internal_residual.baseline` and `tests/conformance/rules/baseline.tsv`, so there was no
+source change in them for a reviewer to read. **The 100 are 36 `campaign:using-heads`, 61
+`campaign:builtin-call-admission` and 3 unlabelled (#3480, #8361, #8363); 97 of them are still OPEN
+on GitHub and 3 (#3480, #4126, #7915) are already closed, so the push is a no-op re-close for those
+three.** Both ratchets are **GREEN ON THIS TREE**: the corpus ratchet reads **`OK (5781 cases, 3742
+ok, 210 known-divergent, 1829 unclassified)`** and the internal-residual ratchet reads **`OK
+(total_internal_lines=69)`** — **69 IS THE BANKED BASELINE IN THIS TREE, SO THE COUNT IS EXACT, NOT
+MERELY UNDER IT** (the corpus runner's own summary: `5781 cases: 3742 ok, 210 known-divergent, 1829
+unclassified, 0 REGRESSION, 0 UNBANKED`). They were measured at `84e36307f6`
+(`reviews/r41-final-ratchet.md`), **whose TREE IS BYTE-IDENTICAL TO THIS TIP's** —
+`git rev-parse 84e36307f6^{tree}` = `git rev-parse r30-c1^{tree}` =
+`ab591f5804a24f4756abd5a54a39d1cdc8053245` — because the three message surgeries that followed
+changed commit MESSAGES ONLY, and a message cannot move a corpus row or an `internal:` emission.
+**⇒ THE CONSEQUENCE: THE HEARTBEAT's REMAINING JOB IS TO HOLD THE POOL AND TO **NOT** GATE; THE GATE
+IS THE RUN's LAST ACT.** The R41 gate has **NOT** run — the `gate` row still reads `pid: none | done:
+0` and names `a30bb11d_cycle.log`, whose last line is `[gate_full_cycle 23:03:30] cycle COMPLETE
+(/mnt/fast/worktrees/r28-staging @ a30bb11d): both oracles trustworthy-green + conformance green`,
+and **`a30bb11d` IS R40's TIP — THE `origin/main` THIS RUN OPENED ON — NOT R41's**. **⇒ THE GATE's
+VERDICT IS NOT YET MEASURED; IT WILL BE RECORDED HERE WHEN IT IS.**
