@@ -1,0 +1,9 @@
+# what 0212 revised leaves — vars=3 len=5 features=p0212r --kdtor --qdtor --hidden-link
+accepted: 374247; with a stale read through a stored borrow on some run: 1350
+| cause | outcome | the read that meets the flag | programs | shortest witness |
+|---|---|---|---|---|
+| slot kill (fst after fbrw): K5.6 | FAULT | kdtor | 702 | `new a / fbrw b a / fst a / newk c b` |
+| announced kill of one source of two (a two-argument mint, then disp): K4.2 | FAULT | kdtor | 570 | `new a / new b / newk2 c a b / disp a` |
+| slot kill (fst after fbrw): K5.6 | FAULT | kuse | 36 | `new a / fbrw b a / fst a / newk c b / kuse c` |
+| announced kill of one source of two (a later store added the second, then disp): K4.2 | FAULT | kdtor | 24 | `new a / new b / newk c a / kset c b / disp b` |
+| announced kill of one source of two (a two-argument mint, then disp): K4.2 | FAULT | kuse | 18 | `new a / new b / newk2 c a b / disp a / kuse c` |

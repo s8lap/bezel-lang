@@ -1,0 +1,18 @@
+# Candidate comparison — bounds: vars=3 len=5 features=p0212r [v0.355 base] [child destructor reads its back-pointer] [flag set when Dispose() begins: r40]
+baseline: 2120646 programs, 471603 accepted; 316773 accepted programs contain a K4.3 store; VIOLATIONS 0; K4.3 race residuals 1434
+baseline trust surface (accepted programs in which some run reads a dead or foreign object THROUGH A STORED BORROW): 110766 = race 1422 + fault on every run 109344 + fault on some run 0
+baseline flag surface (accepted programs that fault on every / some run, any cause): 110304 / 0   (36.5 s)
+
+| candidate | accepted | newly accepted | newly unsound | newly rejected | …race | …fault every run (holder/local) | …fault some run (holder/local) | …never fault: a dangling stored borrow exists, unread / no dangling borrow at all | left: race through a stored borrow | left: fault through a stored borrow (every/some) | left: accepted programs with an untracked K4.3 store | witness (clean rejection) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A  the candidate of the note (no erasure rule) | 460443 | 0 | 0 | 11160 | 1062 | 3114/0 | 0/0 | 6378 / 606 | 360 | 106230/0 | 0 | `new a / newk b a / move c a / disp b` |
+| 0212-draft1  0212 as first drafted (A + the owned-erasure rule) | 458673 | 0 | 0 | 12930 | 1068 | 3534/0 | 0/0 | 6816 / 1512 | 354 | 105810/0 | 0 | `new a / newk b a / erase c b` |
+| 0212  revised: out-owned mint, move-only carriers, replacing move carries its holder | 425781 | 0 | 0 | 45822 | 1422 | 7044/0 | 0/0 | 14958 / 22398 | 0 | 102300/0 | 0 | `new a / fmove b a / asg a` |
+| 0212-explicit  revised, with a stored-arguments-only mint (oracle) | 425907 | 0 | 0 | 45696 | 1422 | 7062/0 | 0/0 | 14994 / 22218 | 0 | 102282/0 | 0 | `new a / fmove b a / asg a` |
+
+- A: residual witnesses — every: `new a / link a`; race: `new a / newko b a / send a / kuse b`
+- 0212-draft1: residual witnesses — every: `new a / link a`; race: `new a / newko b a / send a / kuse b`
+- 0212: residual witnesses — every: `new a / link a`
+- 0212-explicit: residual witnesses — every: `new a / link a`
+
+(191.8 s)

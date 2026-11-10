@@ -1,0 +1,188 @@
+compiler: bezelc 0.0.0-a30bb11d
+== f01_marker_shapes
+-- compile exit 0
+(A) interface binding: F01.BadInputI
+(A) guard with `as`: Message = bad digits
+  Log(Exception): bad digits
+(C) class binding: Message = bad digits
+  Log(Exception): bad digits
+(C) chained: lookup failed; causes = 1
+-- run exit 0
+
+== f02_interface_members_inherited
+-- compile exit 0
+inherited member through the interface: from the base class
+-- run exit 0
+
+== f03_interface_members_exception
+f03_interface_members_exception.bzl:11:8: class `BadInput` does not implement interface property `StackTrace` — a field does not satisfy a property contract; declare `public property StackTrace: T` (§11.2 §23)
+f03_interface_members_exception.bzl:11:8: class `BadInput` does not implement interface property `Message` — a field does not satisfy a property contract; declare `public property Message: T` (§11.2 §23)
+-- compile exit 1
+
+== f04_interface_binding_limits
+f04_interface_binding_limits.bzl:28:27: no member `Message` on interface `IFailure` (§11.§11.3): a value of interface type `IFailure` exposes only members declared on `IFailure` itself or inherited from an interface it extends — even when the underlying object's concrete type declares more members, they are not reachable through this interface-typed reference (§11.2). Narrow to the concrete type first (`is`as`, §17.4) to reach `Message` there, or add `Message` to `IFailure`'s own declaration (§11.2) if every conforming type should provide it
+f04_interface_binding_limits.bzl:29:15: caught exception `f` may not be passed to a constructor of an object that escapes the catch arm — a caught exception is a borrow whose lifetime is the catch arm body (the runtime disposes it after the arm completes); the constructed object escaping the arm would leave any stored reference to it dangling (§31.1 #430; copy the data you need out of the exception — e.g. its message — before constructing the wrapper, or re-raise with `throw;`)
+-- compile exit 1
+
+== f05_arm_forms
+-- compile exit 0
+(1) case 0: failure arm
+(1) case 1: catch-all arm
+(1) case 2: cancellation arm
+(2) alternative with an interface matched
+(3) the class arm, written first, wins
+(4) the interface arm, written first, wins
+(5) guard declined, next arm taken
+(6) re-raised with its type: bad input
+-- run exit 0
+
+== f06_arm_binding_alternative
+-- compile exit 0
+binding reads Message: bad input
+-- run exit 0
+
+== f07_generic_arm_bound
+-- compile exit 0
+(1) class bound + marker: bad input
+-- run exit 0
+
+== f08_generic_arm_bound_marker_only
+f08_generic_arm_bound_marker_only.bzl:15:7: the `catch` arm's type parameter `T` must carry an `Exception`-derived class bound (`where T: Exception`, or a class deriving from it) — an unconstrained, value-constrained, `where T: class`-only, or non-`Exception`-family bound cannot guarantee every substitution is a throwable class (§31.2.1)
+-- compile exit 1
+
+== f09_domain_band_lost
+-- compile exit 0
+failure: arrived as DomainFaultedException only ('bad input in the child')
+bug: arrived as DomainFaultedException only ('')
+-- run exit 0
+
+== f10_domain_band_subclass
+-- compile exit 0
+failure=True: marker arm
+failure=True: an existing DomainFaultedException arm still matches ('bad input in the child')
+failure=False: DomainFaultedException arm only
+failure=False: an existing DomainFaultedException arm still matches ('index out of range in the child')
+-- run exit 0
+
+== f11_async_band
+-- compile exit 0
+(1) failure through await:
+  open conn1
+  close conn1
+  marker arm took it
+(2) bug through await:
+  open conn2
+  close conn2
+  passed the marker arm: System.IndexOutOfRangeException
+(3) two awaiters:
+  open conn1
+  close conn1
+  awaiter 1: marker arm
+  awaiter 2: marker arm
+(4) WhenAll, the bug completes first:
+  open conn1
+  open conn2
+  close conn2
+  close conn1
+  WhenAll re-raised the failure
+-- run exit 0
+
+== f12_ownership_on_the_edge
+-- compile exit 0
+(1) edge 1:
+  open a
+  open b
+  close b
+  finally
+  close a
+  caught failure
+(1) edge 2:
+  open a
+  open b
+  close b
+  finally
+  close a
+  caught bug
+(2) owned payload, bare marker arm:
+  open payload
+  in the arm
+  close payload
+  after the try
+(3) throw consumes a named exception:
+  open payload2
+  in the arm
+  close payload2
+  after the try
+-- run exit 0
+
+== f13_what_passes_the_marker_arm
+-- compile exit 0
+case 0: taken by the marker arm
+case 1: taken by the marker arm
+case 2: passed the marker arm: System.ContractViolationException
+case 3: passed the marker arm: System.IndexOutOfRangeException
+case 4: passed the marker arm: System.NullReferenceException
+case 5: passed the marker arm: System.OperationCanceledException
+-- run exit 0
+
+== f14_supersession_band
+-- compile exit 0
+marker arm took: F14.FlushFailed
+-- run exit 0
+
+== f15_marker_on_non_exceptions
+-- compile exit 0
+a record conforms to the marker: True
+a non-exception class conforms to the marker: F15.Plain
+-- run exit 0
+
+== f16_throw_marker_typed_operand
+f16_throw_marker_typed_operand.bzl:20:32: the thrown value must be an exception — an instance of `Exception` or a class deriving from it (§31.1): an `Object`- or interface-typed value cannot be thrown (no interface derives from `Exception`, and an `Object` referent may be a boxed value) — narrow to the exception class first
+-- compile exit 1
+
+== f17_exception_not_sendable
+f17_exception_not_sendable.bzl:22:46: Domain.Spawn argument is not sendable: argument types to a spawned domain must satisfy §30.14 sendable-type rules (not borrow-bearing, not function-typed, class types must be transfer-closesealed owned) (§30.14, #600)
+-- compile exit 1
+
+== f18_interface_to_class_argument
+-- compile exit 0
+Log: 'hello'
+Log: ''
+-- run exit 0
+
+== f19_idioms
+-- compile exit 0
+(2) request 0: 200 port 8080
+(2) request 1: 400 bad configuration
+  defect reported: System.IndexOutOfRangeException
+(2) request 2: 500 internal error
+(2) request 3: cancellation passed the boundary
+(3) one arm, both kinds: 'port is not a number'
+(3) one arm, both kinds: ''
+(4) failure suppressed; a defect would have propagated
+-- run exit 0
+
+== f20_straddler_today
+-- compile exit 0
+case 0: OverflowException arm
+case 1: OverflowException arm
+case 2: FormatException arm
+case 3: FormatException arm
+-- run exit 0
+
+== f21_interface_members_in_the_arm
+-- compile exit 0
+(1) retry = True, message = server busy
+(2) retry = True
+-- run exit 0
+
+== f22_guard_narrowing_loses_exception
+f22_guard_narrowing_loses_exception.bzl:21:68: no member `Message` on interface `IRetryable` (§11.§11.3): a value of interface type `IRetryable` exposes only members declared on `IRetryable` itself or inherited from an interface it extends — even when the underlying object's concrete type declares more members, they are not reachable through this interface-typed reference (§11.2). Narrow to the concrete type first (`is`as`, §17.4) to reach `Message` there, or add `Message` to `IRetryable`'s own declaration (§11.2) if every conforming type should provide it
+-- compile exit 1
+
+== f23_marking_across_the_line
+-- compile exit 0
+a marker arm took a cancellation
+a state-defect arm took a class marked as a failure
+-- run exit 0
+

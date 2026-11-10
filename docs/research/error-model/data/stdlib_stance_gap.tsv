@@ -1,0 +1,34 @@
+section	title	expected_failure_types_named	try_members	ornull_members
+2.1	Console	EndOfStreamException	0	1
+2.3	Convert	FormatException	5	0
+2.5	DateTime, TimeSpan, DateOnly, TimeOnly	FormatException	1	1
+2.6	Guid	FormatException	1	1
+2.14	Serialization vocabulary	SerializationException	1	0
+2.15	Concrete serialization formats	SerializationException	0	0
+2.17	Built-in exception types (cross-reference)	DomainFaultedException,KeyNotFoundException,SerializationException	0	0
+2.18	IFormattable and format specifiers (#812/#1339)	FormatException	0	0
+2.19	INumber<T>, ISteppable<T>, IParsable<T>, and the collection-	FormatException	1	0
+3.1	StringBuilder	FormatException	0	0
+3.2	Encoding	FormatException	0	0
+4.8	Dictionary<K, V>	KeyNotFoundException	2	1
+4.9	OwningDictionary<K, V>	KeyNotFoundException	3	1
+4.17	SortedDictionary<K, V>	KeyNotFoundException	2	1
+4.21	OwningSlotMap<T> and SlotHandle	KeyNotFoundException	2	5
+6.1	CancellationToken and CancellationTokenSource	OperationCanceledException,TimeoutException	0	0
+6.2	Mutex and Lock	OperationCanceledException	2	0
+6.3	Semaphore	OperationCanceledException	2	0
+6.5	Events: IEvent, EventSource, ISharedEvent, SharedEventSource	OperationCanceledException	0	0
+6.7	Task static helpers	OperationCanceledException	0	0
+6.8	Domain	DomainFaultedException	0	0
+6.9	Channel<T> and ChannelSender<T>	ChannelClosedException,ChannelFullException,DomainFaultedException	1	0
+6.11	Locked<T> and RwLocked<T>	OperationCanceledException	6	0
+6.12	Parallel	DomainFaultedException	0	0
+7.1	Stream	EndOfStreamException	0	0
+7.2	FileStream	DirectoryNotFoundException,FileNotFoundException,IOException	0	0
+7.3	File	FormatException	0	0
+7.4	TextReader, TextWriter, Directory, Path	FileNotFoundException,IOException	0	0
+7.5	IO exception types	DirectoryNotFoundException,EndOfStreamException,FileNotFoundException,IOException	0	0
+9.1	Integer types	FormatException	1	1
+9.2	Double and Float	FormatException	1	1
+9.3	Decimal	FormatException	1	1
+9.5	Char	FormatException	1	1

@@ -1,0 +1,54 @@
+# Supporting research for proposal 0212 (borrow-bearing classes)
+
+Research lane, 2026-11-10. Base: `a77e4718a` (spec **v0.355**; the twelve documents, `src/` and `tests/` are identical to `a30bb11df`, the base of the note in the parent directory). Compiler for probes: the r40 prerelease `bezelc 0.0.0-a30bb11d`. Nothing under `src/`, `tests/` or the normative documents was edited.
+
+The proposal is [`docs/proposals/0212-borrow-bearing-classes.md`](../../../proposals/0212-borrow-bearing-classes.md). It states the conclusions; this directory holds what they were measured with.
+
+**Revision 2.** An adversarial critic rejected the first draft of the proposal (`f72926c68`): its list of the places a source set can be lost was incomplete. The critic's five probes are kept here as `probes/c01`–`c05`; `c06`–`c12` are this lane's probes for the critic's sixth finding and its notes. The model, the scanner and the sweeps were extended for the findings that can be checked, and every output here is from the revised tools.
+
+**Critique round 2.** A second critic accepted revision 2 (`4dfa0e331`) with three notes. Its probe is kept as `probes/e01`; `e02`–`e04`, `c13` and `c14` are this lane's. The model gained two statements and a comparison (`compare --reach`) for the refinement the critic suggested for the taken-out rule, which the proposal records as open (its §4.7): sound only where every class involved is `sealed`, and unsound as worded.
+
+Labels are the note's: **MEASURED** (a script or probe here produced it), **QUOTED** (from the tree), **HYPOTHESIS**.
+
+## What is here
+
+| path | what it is | how to re-run |
+|---|---|---|
+| `probes/*.bzl`, `probes/run_all.sh`, `probes/results.md` | 51 programs, each compiled by r40 in three modes (checked with the trust report, checked, unchecked) and run. `d*`: the destructor window. `g*`: owned erasure, generic and concrete. `a*`: async. `q*`: the open questions. `c*`: critique round 1's findings (c01–c05 are the critic's own) and the comparer follow-ups (c13, c14). `e*`: critique round 2's builder (e01 is the critic's own) and the open-class counter-example to its refinement. Each file's second line states what it tests, what the spec expects, and the verdict proposal 0212 gives. | `cd probes && ./run_all.sh . '*.bzl' > results.md` |
+| `model/bzcore_0212.py` | A copy of `../model/bzcore_static.py` with the additions its docstring lists: a two-argument mint (`newk2`), owned erasure (`erase`, `euse`), the owned-argument clause at `fstm`, a child destructor that reads its back-pointer (`--qdtor`), the r40 flag timing (`--r40-teardown`), and for revision 2 an `out owned` recipient (`newko`), an owning choice over a holder (`wrap`, `wuse`), the rule that a taken-out child carries its owner, and children linked in constructors (`--hidden-link`); and for critique round 2 a member's owned result over the receiver's own source (`kdup`) and over the receiver (`kself`), with the two readings of the declared-reach refinement as knobs. | `python3 -I bzcore_0212.py selftest` (the note's 42 cases) and `selftest0212` (61 checks) |
+| `model/run_sweeps.sh`, `model/table.py`, `model/out/compare_*.txt` | The sweeps of the proposal's §5.2 (`table.py` renders them as its table): the v0.355 baseline against the note's candidate, 0212 as first drafted, 0212 revised, and the revised rules with an oracle whose mint carries only stored arguments. | `./run_sweeps.sh` (about 40 minutes) |
+| `model/out/reach_*.txt`, `model/takeout.py`, `model/out/takeout_v3l4_qdtor.txt` | The open refinement of the taken-out rule (proposal §4.7). `compare --reach` over feature set `p0212t` shows 0212 revised, the refinement in its closed form, and the refinement read off the declared type of an open class. At 4 variables and 4 statements with a holder destructor: 17,940, 17,844 and 17,748 rejected; 360, 360 and 456 certain faults left; no race. `takeout.py` attributes the clean rejections at the bound the proposal cites: 984 of 1,206 are the taken-out rule's. | in `run_sweeps.sh`; alone: `python3 -I bzcore_0212.py compare --reach --features p0212t --v0355 --vars 4 --len 4 --kdtor` (about 40 seconds) |
+| `model/breakdown.py`, `model/out/breakdown_*.txt` | For one bound, the rule that rejects each baseline-accepted program and what that program did at the baseline. | `python3 -I breakdown.py [--kdtor] [--qdtor]` |
+| `model/left.py`, `model/out/left_*.txt` | For one bound, every program 0212 still accepts in which some run reads a dead or foreign object through a stored borrow, classified by cause. At 5 statements with both destructors and children linked in constructors the revised rules leave 1,350 programs, all a slot kill (K5.6) or an announced kill of one source of two (K4.2), and no race; `--draft1` shows what the first draft left, by route (1,908 at 4 statements). | `python3 -I left.py --kdtor --qdtor --hidden-link [--len 5] [--draft1]` |
+| `data/scan_0212.py`, `data/out/` | Re-runs the note's scanner unmodified (`out/base/`, whose `summary.txt` is byte-identical to the note's) and adds one pass per rule 0212 adds, and for revision 2 one pass per critique finding (`out/rev2_findings.tsv`) and the list of doc-extracted blocks whose store changes verdict. `out/summary_0212.txt` is the result the proposal's §6 quotes. | `python3 -I scan_0212.py --head <repo> --docs <exported docs corpus> --out out` |
+| `data/scan_collection_transfer.py`, `data/out/collection_transfer.txt` | One extra count: a local owned binding stored into a local borrowing collection and then moved (4 sites, 0 rejected under 0212). | `python3 -I scan_collection_transfer.py --head <repo> --docs <exported docs corpus> --out out/collection_transfer.txt` |
+| `check_anchors.py` | Verifies that each `old` anchor the proposal's §8 quotes occurs exactly once at the base, and that every section the proposed text links to exists. `--mentions` lists the consequential mentions of §8.13. | `python3 -I check_anchors.py --mentions` |
+
+The doc-example corpus the scanner reads is extracted from an exported copy of the documents with `scripts/extract_doc_examples.py`, as the note describes; the committed corpus is never regenerated (#1380).
+
+## Findings along the way (not filed)
+
+Compiler findings, all MEASURED on r40 against the v0.355 text.
+
+- **F1. §28.12's live-instance rule (#7506) is not implemented.** The disposed flag is set when `Dispose()` begins. A destructor body's call of its own instance method faults (d01; the rule-corpus case `s28_12_0014` states the spec's verdict), and so does a child's read of its owner in the cascade (d03, d11) or in the owner's destructor body (d02). This is the note's S2: an implementation divergence, not an open spec question.
+- **F2. An explicit `Dispose()` of a non-nullable owned field inside a destructor is rejected** as a double free (d02's first form), against §28.8.1 ("A destructor that wants the value of a field its class declares released before the rest of its body runs disposes it in place"). The `?.` spelling over a nullable field compiles.
+- **F3. The replacing `move` (`move f with e`) is not implemented** (g08's first form; the diagnostic says so).
+- **F4. A member access through a class-typed `scoped` parameter is rejected** with the callback rule's message, "it may not be read as a value" (q05). §28.14's scoped construction bars returning it and storing it elsewhere, and calls passing it on "an ordinary borrow argument".
+- **F4b. `scoped` is not admitted at a parameter declared at a type parameter, and a `scoped` parameter may only be forwarded to another `scoped` parameter** (q06): it cannot be passed to a standard collection's `Add`, which §28.14 calls an ordinary borrow argument. An identifier in an extension head's type-argument list is a type parameter (§26.4), so `extension Array<Item>` declares a generic extension.
+- **F4c. The `IEqualityComparer` constructors of `Dictionary`, `Set` and their owning forms are not implemented** (c06, c07: the compiler says so), so no program can depend on a retained comparer today.
+- **F4d. A read through a stored borrow of a disposed exception is not caught in checked mode** (c11): an exception that stores its cause as a borrow, thrown from the catch arm of the cause, prints an empty line with exit 0 in all three modes, and the report names no store.
+- **F4e. The report is silent on a method that stores its parameter into an owned collection field** (c09, the note's k2a): `Bus.Subscribe(o) => _seen.Add(o)` draws no line, faults in checked mode and segfaults unchecked.
+- **F4f. `return b.M();` on a local `b` is rejected whatever `M` returns** (e01, e04): "borrow returned from `b` would outlive its source", for an `owned` result of a class that stores no borrow as well. The same result bound to a local first and then returned is accepted and runs clean (e03). Whether v0.355 requires the direct form's rejection was not established.
+- **F4g. A `static readonly` field of a user comparer class draws §22.12 rule 4's warning** (c07, c14), as the spec says; it is the only spelling of a comparer that proposal 0212 admits at a sendable instantiation. A key record with its own equality needs no comparer and draws none (c13).
+- **F5. Reads of freed memory return normally in an unchecked build**: g01–g08, a03, a04 and a07 exit 0 and print an empty line where the checked build raises `DisposedAccessException`; d04, d07, d08 and d10 segfault.
+- **F6. `Shared<T>` requires a proper class type** (g05's first form), so it never erases a borrow-bearing instance to an interface. `OwningArray<IShow>` does.
+
+Spec observations.
+
+- **O1.** §28.12's sentence on an already-disposed owned field names the one read in the teardown window that is not sound. It is reachable with no stored borrow (d08). The proposal names it as a K5.6-class residual (§3.2).
+- **O2.** §28.9 keys the trivial-dispose ceremony exemption on the declared type where no producer is known. That key is right for a lint and would be unsound as "the release runs no user code"; the proposal's release rule uses the produced type, or a `sealed` declared class.
+- **O3.** With a mint that carries every argument, §28.2's dominated-use rule ("every value in the holder's source set") does not fire when the stored one of two sources is disposed. MEASURED in the model: 18 programs at 3 variables and 4 statements, 588 at 5, with both destructors. The proposal's Q11.
+
+## What could not be done
+
+The compiler was not built or modified: no rule of proposal 0212 was run, and its checker cost is unmeasured. The model has one body and no calls, generics or frames. The generics matrix was not run against the erasure rule. `OwningSlotMap<T>` is not implemented in r40 (#4604), so the owning-registry rewrite was not probed. The refinement comparison was run at 4 statements only: at 5 statements with 4 variables the sweep outgrew a 15 GiB machine and was stopped.

@@ -1,0 +1,20 @@
+# 0212 rejections of baseline-accepted programs — vars=3 len=4 features=p0212r --qdtor [0212 revised]
+programs 95382; baseline accepted 31497; rejected by 0212: 1752
+| rejecting rule | what the program did at the baseline | programs | shortest witness |
+|---|---|---|---|
+| 0205-holder-release-after-dominating-kill | never(clean) | 210 | `new a / fmove b a / disp a` |
+| 0205-holder-release-after-dominating-kill | never(dangling) | 42 | `new a / fmove b a / newk c a / disp a` |
+| 0205-holder-release-after-dominating-kill | every(holder) | 6 | `new a / link a / fmove b a / disp a` |
+| 0205-holder-use-after-dominating-kill | never(dangling) | 36 | `new a / newk b a / disp a / use b` |
+| 0205-holder-use-after-dominating-kill | never(clean) | 30 | `new a / fmove b a / disp a / use b` |
+| 0205-holder-use-after-dominating-kill | every(holder) | 18 | `new a / newk b a / disp a / kuse b` |
+| 0212-owned-erasure | never(clean) | 204 | `new a / newk b a / erase c b` |
+| 0212-owned-erasure | never(dangling) | 48 | `new a / newk b a / erase c b / asg a` |
+| A-declared-before | never(clean) | 6 | `new a / new b / fmove c b / fstm a c` |
+| K5.1-frozen-transfer | never(clean) | 414 | `new a / fmove b a / send a` |
+| K5.1-frozen-transfer | never(dangling) | 192 | `new a / newk b a / send a / use b` |
+| K5.1-frozen-transfer | race | 24 | `new a / newk b a / send a / kuse b` |
+| K5.1-frozen-transfer | every(holder) | 6 | `new a / link a / fmove b a / move c a` |
+| K5.2-frozen-overwrite | never(clean) | 342 | `new a / fmove b a / asg a` |
+| K5.2-frozen-overwrite | never(dangling) | 150 | `new a / newk b a / asg a / use b` |
+| K5.2-frozen-overwrite | every(holder) | 24 | `new a / newk b a / asg a / kuse b` |

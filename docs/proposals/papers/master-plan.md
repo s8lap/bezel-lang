@@ -785,6 +785,84 @@ reads `pid: none | done: 0` and the newest cycle log is `a30bb11d_cycle.log`, wh
 `[gate_full_cycle 23:03:30] cycle COMPLETE (/mnt/fast/worktrees/r28-staging @ a30bb11d): both oracles
 trustworthy-green + conformance green` — **`a30bb11d` IS R40's TIP, NOT R41's.**
 
+**Intake 2026-11-10: research notes** (owner directive *"File the bugs, also put into the defect campaign
+plan"*). Three research notes on main were triaged per §1.4: `docs/research/ergonomics-study/` (E),
+`docs/research/static-ownership-tracking/` (O) and `docs/research/error-model/` (M). Every repro was
+re-verified on r40 (`bezelc 0.0.0-a30bb11d`) before filing. Each new defect carries one campaign label,
+or `parking-lot`. Spec questions carry only `spec-question`. Five of them (#8401, #8402, #8404–#8406)
+are queued for proposal 0211 (in draft, the fault/failure split), not for separate rulings. Nothing
+below was dispatched.
+
+*Filed (24):*
+
+| # | title (short) | severity | campaign | src |
+|---|---|---|---|---|
+| #8383 | `Console.In.ReadToEnd()` lowers to nothing (zero-init local, empty `WriteLine`) | silent wrong-output | builtin-call-admission | E B1 |
+| #8384 | `OrderBy` family ignores `string`/`double` keys; segfaults over `Array<decimal>` | silent wrong-output + crash | enumerable-heads | E B4 |
+| #8385 | `Array<DictionaryEntry>.Sort` with an untyped comparer is a no-op | silent wrong-output | builtin-call-admission | E B5 |
+| #8386 | indexer-read `string` passed into a record constructor is freed with its source | silent wrong-output (UAF) | producer-temporaries | E B6 |
+| #8387 | untyped comparer over a `string` member does not sort | silent wrong-output | builtin-call-admission | E B7 |
+| #8388 | `Sum` with a `decimal` selector returns a wrong value | silent wrong-output | builtin-call-admission | E B13 |
+| #8389 | `File.Delete` draws the §21.9 unused-result warning | diagnostic (false warning) | builtin-call-admission | E B14 |
+| #8390 | collection literal at an `IEnumerable<string>` parameter accepted; call is a no-op | accept-invalid, silent wrong-output | builtin-call-admission | E B16 |
+| #8391 | class owning `Array<string>` not serialization-eligible (regresses #1065) | reject-valid | records-statics-misc | E B19 |
+| #8392 | must-use warning on a local reassigned in a loop then returned | diagnostic (false warning) | parking-lot | E B20 |
+| #8393 | inference fails for a `Range<int>` argument at `IEnumerable<T>` | reject-valid | generic-boundaries | E B22 |
+| #8394 | inference through an untyped lambda body binds wrongly (`MaxBy` returns the wrong element) | silent wrong-output | generic-boundaries | E B24 |
+| #8395 | trust report silent on a plain `Array<int>` parameter stored in a plain field | accept-invalid (report gap) | borrow-provenance | O S8 |
+| #8396 | corpus case `s22_6_2312` expects output from disposed temporaries | oracle defect | infra-oracles | O S5 |
+| #8397 | §28.14: do the ordered bounding forms admit `_child := new Child(scoped this)`? | spec question | — | O S1 |
+| #8398 | owned nullable result as receiver of `?.`/`!` never disposed | leak (destructor skipped) | producer-temporaries | M §10 |
+| #8399 | `DomainFaultedException.FaultStackTrace` unimplemented; diagnostic cites #2337 | reject-valid | builtin-call-admission | M §10 |
+| #8400 | `Domain.Spawn` with a record/choice result emits malformed IR | crash (compiler abort) | async-frames | M p08 |
+| #8401 | `DomainFaultedException` drops the original type name | spec question | — | M §10.1 |
+| #8402 | one exception type in two failure-signal bands | spec question | — | M §10.2 |
+| #8403 | §31.3's `<exception>` tag convention unused in the stdlib | spec question | — | M §10.3 |
+| #8404 | no-dual rule's tier vocabulary vs shape (b) `TryAcquire`/`Acquire` | spec question | — | M §10.4 |
+| #8405 | Guide 2 §7 narrower than stdlib §1 shape (b) | spec question | — | M §10.5 |
+| #8406 | no stated cost model for `Try` vs `Parse` + `catch` | spec question | — | M §10.6 |
+
+*Commented on existing open issues (22):* each comment carries the note's repro and its r40 result.
+The issues keep their labels.
+
+| # | finding | severity | campaign (existing) | src |
+|---|---|---|---|---|
+| #4418 | must-use warning on trivial-dispose `Array<string>` | diagnostic | infra-oracles | E B2 |
+| #6627 | untyped `GroupBy` key lambda: malformed IR | crash (compiler abort) | enumerable-heads | E B3 |
+| #6557 | `Add` into `Array<DictionaryEntry>`: entries corrupt (unchecked prints `z1`) | silent wrong-output / UAF | parking-lot | E B5 |
+| #6698 | narrowed local in an `if`-expression branch (repro only) | spec question | spec-trains | E B8 |
+| #7318 | numeric `ParseOrNull` (`int`, `Int32`, `long`, `double`) rejected | reject-valid | nullable-carrier | E B9, M p17 |
+| #3862 | enum `NameOf`/`FromNameOrNull` missing | reject-valid | spec-trains | E B10 |
+| #6314 | checked mode: false `DisposedAccessException` on live sets (t15) | silent wrong-output (run time) | collection-elements | E B11 |
+| #1772 | owned trivial-dispose local in an `async` body hard-rejected | reject-valid | borrow-provenance | E B12 |
+| #1394 | `Stream` span `Write`/`Read` unimplemented (diagnostic cites closed #2457) | reject-valid | features-proposals | E B15 |
+| #7170, #7215 | interpolated-string `Select` projection rejected (repro only) | spec question | infra-oracles / spec-trains | E B17 |
+| #6933 | internal warnings on `ToString()` over `T` | diagnostic (`internal:`) | generic-boundaries | E B18 |
+| #2240 | `DateOnly.ToString(format)` unimplemented | reject-valid | spec-trains | E B21 |
+| #8308 | lazy query consumed in an interpolation hole draws must-use | diagnostic | enumerable-heads | E B23 |
+| #7780 | cross-reference to #8384 (non-`DateTime` keys) | — | enumerable-heads | E B4 |
+| #7435 | 0205: alias used after a dominating `Dispose()` compiles (p07) | accept-invalid (faults; SEGV unchecked) | borrow-provenance | O S6 |
+| #7441 | 0205: record holder used after a dominating `Dispose()` compiles (p05) | accept-invalid (faults; SEGV unchecked) | borrow-provenance | O S6 |
+| #5698 | K5.5 frame-local freeze unimplemented (p26) | accept-invalid (faults; silent stale read unchecked) | spec-trains | O S7 |
+| #7468 | trust report false line on a `bool` member read (p22) | diagnostic (false report line) | borrow-provenance | O S8 |
+| #7507 | cross-reference to spec question #8397 | reject-valid (pending ruling) | closures-cells | O S1 |
+| #3261 | `Exception.SupersededChain` unimplemented | reject-valid | spec-trains | M §10 |
+| #3302 | `Exception.ToString()` omits the message | silent wrong-output | spec-trains | M §10 |
+
+*Not filed:* none of the listed items failed to reproduce. B23 was confirmed as #8308's root and
+commented there. B18 matched #6933's description of the same internal warnings in other positions and
+was commented there. #8384's `decimal` segfault was found by the filing lane's re-verification. The
+study recorded only input order for that key type.
+
+**For the coordinator's prioritisation: one 40-program study produced 9 silent wrong-output bugs.**
+Each compiles a plausible first-draft program and prints a wrong answer, or nothing: B1 #8383, B4
+#8384, B5 #8385, B6 #8386, B7 #8387, B13 #8388, B16 #8390, B24 #8394, and B11 #6314 at run time.
+Five of the nine land in **builtin-call-admission**, the campaign that is `ACTIVE` now (#8383, #8385,
+#8387, #8388, #8390). One each lands in enumerable-heads (#8384), producer-temporaries (#8386, a
+use-after-free), generic-boundaries (#8394) and collection-elements (#6314). Under §1.4, #8384,
+#8386, #8394 and #6314 wait for their campaigns. The five builtin-call-admission members are in scope
+for the active campaign's next instance lanes. #8385 and #8387 are probably one root (untyped comparer
+inference at `Sort`) and should share a lane.
 
 ---
 

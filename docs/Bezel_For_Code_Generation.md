@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.355. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.357. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.355 and `Bezel_Standard_Library.md` v0.355 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.357 and `Bezel_Standard_Library.md` v0.357 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -570,7 +570,7 @@ Choose by intent: `OwningTask<T>` for resource acquisition (one fresh single-con
 A borrow is valid only where **every** source in its source set is live; joins, `??` and arm meets take the **union** of source sets (§28.3).
 
 - A borrow may **not** be assigned to a local whose scope strictly encloses its source's scope — including flowing around a loop back edge. Rejected **at the assignment**, not at the later use.
-- A borrow of a **scope-bound local** may not be stored in a field or in a longer-lived collection. A borrow whose source *does* outlive the object **is** admissible: the **back-reference** idiom binds a constructor parameter into a plain (non-`owned`) class-typed field (`private _owner: Customer;`). The check is structural — sourced from a parameter that is not `owned` (plain or `scoped`) or from the receiver: admitted; locals, temporaries **and `owned` parameters**: rejected (an `owned` parameter is disposed at the method's end, so it is scope-bound — §28.3).
+- A borrow of a **scope-bound local** may not be stored in a field or in a longer-lived collection. A borrow whose source *does* outlive the object **is** admissible: the **back-reference** idiom binds a constructor parameter into a plain (non-`owned`) class-typed field (`private _owner: Customer;`). The check is structural — sourced from a parameter that is not `owned` (plain or `scoped`) or from the receiver: admitted; locals, temporaries **and `owned` parameters**: rejected (an `owned` parameter is disposed at the method's end, so it is scope-bound — §28.3). **Coming change (§28.15, a scheduled ramp):** a class with such a field is *borrow-bearing*, and a later revision rejects a member that is **not a constructor** keeping a plain parameter, and a source moved, reassigned or outlived while the object is in use. At v0.357 these compile and the trust-admission report classifies them; keep the back-reference in a constructor, as above.
   - The result of invoking a function-typed parameter counts as sourced from that parameter and from the call's arguments, a function-typed argument contributing what it captures and a span or other borrow-bearing value argument what it carries: `_v := make()` with `make: () -> Item` is admitted; `_v := pick(local)` and `_v := wrap(lambda() => local)` are not (§28.3).
   - Assigning a class- or interface-typed value to a class's or interface's property is that store whatever the property's accessor form: `obj.P := local` (a scope-bound local) and `obj.P := new T()` are rejected, a parameter- or receiver-sourced borrow is admitted, and a `set(owned)` property takes the value instead (§28.3).
   - A settable **static** property's assignment is the store into a mutable static field of its type: `Config.Current := new Settings()` is admitted only at a type a mutable static may have (a synchronized handle, `Task?`), where the value lives to process exit, and is rejected at any other; assigning a `static readonly` auto-property in its type's static constructor is the `static readonly` field store and is admitted (§28.3).
@@ -697,7 +697,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.355 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.357 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -728,7 +728,7 @@ Exactly four sanctioned shapes; nothing else is a Try (stdlib §1).
 
 **The `when true` postcondition is normative on every shape-(a) member** even though the per-type listings elide it: inside a `true`-narrowed region the recipient needs no `!`. It has one spelling — the clause; a hand-written `static ensures(not result or p <> null)` is an ordinary contract clause and narrows nothing (§22.16).
 
-**Three access tiers over one operation:** the **throwing** tier (absence is a bug) — `Parse`, `dict[key]`, `First()`, `PopAt`, `Pop`, `Dequeue`, `Console.ReadKey`; the **`*OrNull`** tier, returning `T?` for `??`/`?.` composition — `ParseOrNull`, `GetOrNull`, `Console.ReadKeyOrNull`, `FirstOrNull`/`LastOrNull`/`SingleOrNull`/`ElementAtOrNull`/`MinOrNull`/`MaxOrNull`, `E.FromUnderlyingOrNull`, `E.FromNameOrNull` (`E` = the enum's own name; the declared identifier, exact ordinal match — never a `serialized` rename; its inverse `E.NameOf(v): string` is total and equals `nameof(E.X)` for a written `X`); and the **`Try`** tier, the only shape that distinguishes "absent" from "present null". `*OrNull` **conflates** absent with a present `null` wherever the payload can be null — use `ContainsKey`/`Count`/the `Try` shape when the distinction matters.
+**Three access tiers over one operation:** the **throwing** tier (the call asserts the value is there and raises otherwise: a *failure* where the condition is the outside's — `Parse`, `Console.ReadKey` — and a *defect* where it is the program's own state — `dict[key]`, `First()`, `PopAt`, `Pop`, `Dequeue`); the **`*OrNull`** tier, returning `T?` for `??`/`?.` composition — `ParseOrNull`, `GetOrNull`, `Console.ReadKeyOrNull`, `FirstOrNull`/`LastOrNull`/`SingleOrNull`/`ElementAtOrNull`/`MinOrNull`/`MaxOrNull`, `E.FromUnderlyingOrNull`, `E.FromNameOrNull` (`E` = the enum's own name; the declared identifier, exact ordinal match — never a `serialized` rename; its inverse `E.NameOf(v): string` is total and equals `nameof(E.X)` for a written `X`); and the **`Try`** tier, the only shape that distinguishes "absent" from "present null". `*OrNull` **conflates** absent with a present `null` wherever the payload can be null — use `ContainsKey`/`Count`/the `Try` shape when the distinction matters.
 
 **Negative magnitudes fault:** `capacity`/`size`/`length` < 0 raises `ArgumentOutOfRangeException` on the `StringBuilder`, `Array<T>`, `OwningArray<T>`, `Dictionary`/`OwningDictionary`/`Set`/`OwningSet` capacity forms and `OwningBuffer<T>`. Zero is valid. `Channel<T>(capacity)` requires `capacity >= 1`, else `ArgumentException`.
 
@@ -778,7 +778,7 @@ public static class Convert     // string <-> T only; there is no Convert.ToInt3
   ToString(int|long|float|double|decimal|bool);   ToString(value: int|long, toBase: int);  // bases 2/8/10/16
   // = v.ToString() / v.ToString(toBase): Convert.ToString(0.1f) = "0.1";
   // char/byte/sbyte/short/ushort/uint/ulong are AMBIGUOUS (spec §22.6) — call c.ToString(), or cast
-end                                                    // faults: FormatException, OverflowException
+end                                                    // failures: FormatException, ParseRangeException
 
 public static class Environment
   public static readonly property NewLine, MachineName, UserName, OSVersion: string;   // UserName NOT YET IMPLEMENTED (#5579)
@@ -836,7 +836,7 @@ public class TypeInitializationException: Exception
 end                                                      // runtime-owned: never disposed after an arm
 ```
 
-Hierarchy: `Exception` → `ContractViolationException`; `ArgumentException` → `ArgumentNullException`, `ArgumentOutOfRangeException`; `ArithmeticException` → `OverflowException`, `DivideByZeroException`; `InvalidOperationException` → `DisposedAccessException`; plus `NotImplementedException`, `NullReferenceException`, `IndexOutOfRangeException`, `MatchFailureException`, `OperationCanceledException`, `TypeInitializationException`, `FormatException`, `StackOverflowException` (uncatchable). **There is no `OutOfMemoryException`** — allocation failure terminates. **No user `InnerException`** — chain with `base(msg, cause)`; `TypeInitializationException.InnerException` (above) is the one built-in that carries a live reference. Producer-local exceptions need the producer's import: `KeyNotFoundException`, `SerializationException`, `TimeoutException`/`ChannelClosedException`/`ChannelFullException`/`DomainFaultedException`, `IOException`/`FileNotFoundException`/`DirectoryNotFoundException`/`EndOfStreamException`/`PathTooLongException`.
+Hierarchy: `Exception` → `ContractViolationException`; `ArgumentException` → `ArgumentNullException`, `ArgumentOutOfRangeException`; `ArithmeticException` → `OverflowException`, `DivideByZeroException`; `InvalidOperationException` → `DisposedAccessException`; plus `NotImplementedException`, `NullReferenceException`, `IndexOutOfRangeException`, `MatchFailureException`, `OperationCanceledException`, `TypeInitializationException`, `FormatException`, `StackOverflowException` (uncatchable). **Kinds (§31.4):** a class that implements the member-less interface `IFailure` is a *failure* — `FormatException`, the `IOException` family, `SerializationException`, `TimeoutException`, `ChannelClosedException`, `ChannelFullException`, `ParseRangeException` (an `OverflowException`: out-of-range `Parse`/`Convert.To*` input) and `DomainFailedException` (a `DomainFaultedException`: a failure joined from another domain); every other is a *defect* report; `OperationCanceledException` is neither. Only an `Exception`-derived class may list `IFailure`, and not one under a built-in or stdlib class that is not itself a failure. **There is no `OutOfMemoryException`** — allocation failure terminates. **No user `InnerException`** — chain with `base(msg, cause)`; `TypeInitializationException.InnerException` (above) is the one built-in that carries a live reference. Producer-local exceptions need the producer's import: `KeyNotFoundException`, `SerializationException`, `TimeoutException`/`ChannelClosedException`/`ChannelFullException`/`DomainFaultedException`, `IOException`/`FileNotFoundException`/`DirectoryNotFoundException`/`EndOfStreamException`/`PathTooLongException`.
 
 `Exception.ToString()` is a **declared override** for `Exception` and every derived type. A conforming rendering contains the qualified type name, the `Message` when non-empty, every `CauseChain` entry (outermost first) and every `SupersededChain` entry (earliest first, distinguishable from causes). It renders **no stack trace**. Arrangement is implementation-defined; the member is **not `pure`**.
 
@@ -1357,6 +1357,8 @@ public static class Domain            // 18 Spawn rows: {no arg, `owned arg: A`,
   Spawn<R>(entry: () -> owned R): owned OwningTask<R>           where R: sendable, class;
   Spawn<R>(entry: () -> R): owned Task<R>                       where R: sendable, notnull;   // R likewise
 end                                   // the entry MUST be capture-free; EXACTLY ONE argument
+                                      // a fault in the entry is joined as DomainFaultedException; as
+                                      //   DomainFailedException (a subclass, IFailure) when it was a failure
 public static class Parallel          // callbacks are SPAWN POSITIONS (capture-free); NOT YET IMPLEMENTED (#3557)
   public static readonly property DefaultDegree: int;    // = Environment.ProcessorCount; degree := 0 means it
   Map<A, R>(items: Array<A>, body: (A) -> R, degree: int := 0): owned Task<Array<R>> where A: sendable, notnull where R: sendable, notnull;
@@ -1430,9 +1432,9 @@ end
 
 ### 5.9 Primitives
 
-The integer types (`Int32`, `Int64`, `Byte`, `SByte`, `Int16`, `UInt16`, `UInt32`, `UInt64`) carry: `static const MinValue/MaxValue`; `static pure Parse(s: string)`, `static TryParse(s: string, out result: T): bool`, `static pure ParseOrNull(s: string): T?`, `static pure Parse(s: string, radix: int)` (radix ∈ {2,8,10,16}), `static TryParse(s: string, radix: int, out result: T): bool`, `static pure Parse(s: ReadOnlyStringSpan)`, `static TryParse(s: ReadOnlyStringSpan, out result: T): bool`; `pure ToString()`, `pure ToString(format: string)`, `pure ToString(radix: int)`, `pure CompareTo(other)`. **`ParseOrNull` has no radix or span duals.** No whitespace tolerance anywhere. **Radix digits** are the first *r* of `0`–`9` then `A`–`Z`; `Parse(s, radix)` accepts **either case** (`int.Parse("ff", 16)` = `int.Parse("FF", 16)` = `255`), and `ToString(radix)` emits **lower case**, sign-and-magnitude — so `T.Parse(n.ToString(r), r) = n`; the no-format `ToString()` is `ToString(10)`'s text. Input grammar: optional `+`/`-`, then digits; no `0x`, no separators, no whitespace (`FormatException`), out of range `OverflowException`; a radix outside `{2,8,10,16}` is `ArgumentException` from both `Parse` and `ToString`.
+The integer types (`Int32`, `Int64`, `Byte`, `SByte`, `Int16`, `UInt16`, `UInt32`, `UInt64`) carry: `static const MinValue/MaxValue`; `static pure Parse(s: string)`, `static TryParse(s: string, out result: T): bool`, `static pure ParseOrNull(s: string): T?`, `static pure Parse(s: string, radix: int)` (radix ∈ {2,8,10,16}), `static TryParse(s: string, radix: int, out result: T): bool`, `static pure Parse(s: ReadOnlyStringSpan)`, `static TryParse(s: ReadOnlyStringSpan, out result: T): bool`; `pure ToString()`, `pure ToString(format: string)`, `pure ToString(radix: int)`, `pure CompareTo(other)`. **`ParseOrNull` has no radix or span duals.** No whitespace tolerance anywhere. **Radix digits** are the first *r* of `0`–`9` then `A`–`Z`; `Parse(s, radix)` accepts **either case** (`int.Parse("ff", 16)` = `int.Parse("FF", 16)` = `255`), and `ToString(radix)` emits **lower case**, sign-and-magnitude — so `T.Parse(n.ToString(r), r) = n`; the no-format `ToString()` is `ToString(10)`'s text. Input grammar: optional `+`/`-`, then digits; no `0x`, no separators, no whitespace (`FormatException`), out of range `ParseRangeException` (an `OverflowException`; a failure); a radix outside `{2,8,10,16}` is `ArgumentException` from both `Parse` and `ToString`.
 
-`Double`/`Float`: `MinValue MaxValue Epsilon PositiveInfinity NegativeInfinity NaN`; `static pure IsNaN/IsInfinity/IsPositiveInfinity/IsNegativeInfinity/IsFinite`; `Parse`/`TryParse` (string and `ReadOnlyStringSpan`) and `ParseOrNull` (string); `Parse` reads an optional `+`/`-`, digits, an optional `.` with digits on both sides and an optional `e`/`E` exponent, and nothing else — no whitespace, separators, hex, or bare `".5"`/`"5."` (`FormatException`, which precedes the range fault); it rounds to nearest-even like a literal and raises `OverflowException` exactly where the same digits as a literal of that type are out of range (`double.Parse("1e999")`, `float.Parse("3.5e38")`; `TryParse` → `false`, `ParseOrNull` → `null`), never yielding `±Infinity` for a finite numeral, while underflow is in range (`"1e-400"` → `0`); the five `Is*` report the operand's IEEE-754 class exactly (`IsFinite` = neither NaN nor infinity; subnormals and both zeros are finite); `static pure IeeeEquals(a,b)`, `static pure BitwiseEquals(a,b)`; `pure ToString([format])` — a non-finite value renders `NaN`/`Infinity`/`-Infinity` under every format (no digits, no `%`), and `Parse` reads back exactly those three, case-sensitive (`"nan"`, `"inf"`, `"+Infinity"` → `FormatException`) — `pure CompareTo`. `Epsilon` is the smallest positive subnormal, not machine epsilon.
+`Double`/`Float`: `MinValue MaxValue Epsilon PositiveInfinity NegativeInfinity NaN`; `static pure IsNaN/IsInfinity/IsPositiveInfinity/IsNegativeInfinity/IsFinite`; `Parse`/`TryParse` (string and `ReadOnlyStringSpan`) and `ParseOrNull` (string); `Parse` reads an optional `+`/`-`, digits, an optional `.` with digits on both sides and an optional `e`/`E` exponent, and nothing else — no whitespace, separators, hex, or bare `".5"`/`"5."` (`FormatException`, which precedes the range fault); it rounds to nearest-even like a literal and raises `ParseRangeException` exactly where the same digits as a literal of that type are out of range (`double.Parse("1e999")`, `float.Parse("3.5e38")`; `TryParse` → `false`, `ParseOrNull` → `null`), never yielding `±Infinity` for a finite numeral, while underflow is in range (`"1e-400"` → `0`); the five `Is*` report the operand's IEEE-754 class exactly (`IsFinite` = neither NaN nor infinity; subnormals and both zeros are finite); `static pure IeeeEquals(a,b)`, `static pure BitwiseEquals(a,b)`; `pure ToString([format])` — a non-finite value renders `NaN`/`Infinity`/`-Infinity` under every format (no digits, no `%`), and `Parse` reads back exactly those three, case-sensitive (`"nan"`, `"inf"`, `"+Infinity"` → `FormatException`) — `pure CompareTo`. `Epsilon` is the smallest positive subnormal, not machine epsilon.
 `Decimal`: `MinValue` = `-79228162514264337593543950335`, `MaxValue` = `79228162514264337593543950335`, `Zero One`; the no-format `ToString()` (and `G`) is the exact shortest form — no exponent, no grouping, **no trailing zeros** (`1.50m` renders `1.5`, `10m` renders `10`), scale not being part of the value; `Parse`/`TryParse`/`ParseOrNull` (`Parse` reads an optional `+`/`-`, digits, and an optional `.` with digits on both sides, and nothing else — no exponent, whitespace, separators, or bare `".5"`/`"5."`: `FormatException`); `pure ToString([format])`, `pure CompareTo`, `pure Round(digits: int)` (banker's, 0..28).
 `Boolean`: `static pure Parse(s)` ("true"/"false", case-insensitive), `static TryParse(s, out result: bool)`, `static pure ParseOrNull(s): bool?`, `pure ToString()` → `"True"`/`"False"`.
 `Char`: `MinValue MaxValue`; `static pure IsDigit/IsLetter/IsLetterOrDigit/IsWhiteSpace/IsUpper/IsLower/IsControl/IsPunctuation(c)` — Unicode-category tests (`IsDigit` = category `Nd`, **not** the `0`–`9` the parses read; `IsWhiteSpace` = the `White_Space` property), total, never raising; `ToUpper`/`ToLower` are the **simple** Unicode case mappings; `static pure ToUpper/ToLower(c): char`; `Parse`/`TryParse`/`ParseOrNull`; `pure ToString()`, `pure CompareTo`.
@@ -1732,10 +1734,10 @@ end SampleWindow;
 
 **Strings.** `var sb := new StringBuilder();` (trivial-dispose: plain `var`, no warning), `sb.Append(w).Append(' ');`, `sb.ToString().Trim()`. Casts are call syntax — `double(hits)` — and interpolation carries alignment then format: `$"|{line,-20}| {pct,6:F1}%"`.
 
-**Declaring, throwing and catching an exception type.** Derive from `Exception` (or any built-in exception type) and chain the message to the base; a caught exception is a **borrow** valid inside its arm only, so copy out what you keep.
+**Declaring, throwing and catching an exception type.** Derive from `Exception` (or any built-in exception type) and chain the message to the base; list `IFailure` when the condition comes from outside the program, since an unmarked class is a defect report (§31.4) — only where nothing in the base chain but `Exception` is a built-in or stdlib class, so a failure class derives from `Exception` or from a user class deriving from it (or from a failure type such as `IOException`, which needs no listing); a caught exception is a **borrow** valid inside its arm only, so copy out what you keep.
 
 ```bezel
-public class ConfigError(message: string): Exception(message)
+public class ConfigError(message: string): Exception(message), IFailure
 end ConfigError;
 
 public static class Settings
@@ -1760,6 +1762,19 @@ end Settings;
 ```
 
 To wrap a lower-level fault, declare the class without a primary constructor and give it `public constructor(message: string, cause: Exception) base(message, cause); end constructor;` — beside a primary constructor, every other constructor must chain `this(…)` (§11.1). The cause is snapshotted into `CauseChain`, never retained (§31.4); there is no user `InnerException`.
+
+**Catching at a boundary.** Name the marker, not `Exception`: an `IFailure` arm takes every failure and lets every bug through, and its binding is an ordinary `Exception` (§31.2.1).
+
+```bezel
+try
+  Serve(request);
+catch
+  var f: IFailure => Respond(502, f.Message),                  // failures: answered
+  var ex: Exception => do ReportDefect(ex); Respond(500); end  // a supervisor only: bugs reported
+end;
+```
+
+Leave the second arm out unless the code is a supervisor: a bug should propagate. `IFailure => ()` suppresses failures only. To reach an interface's own members inside an arm, test in the body: `var r := ex as IRetryable;`.
 
 **A class hierarchy.** Members are non-virtual unless marked; an override restates the signature exactly and says `override` (§12.1, §12.5).
 

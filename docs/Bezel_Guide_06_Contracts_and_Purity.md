@@ -1,6 +1,6 @@
 # Bezel Guide 6: Contracts and Purity
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.326.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.357.*
 
 Bezel lets a signature state obligations the compiler enforces: `requires(...)` for what the caller must guarantee, `ensures(...)` for what the member guarantees back, `invariant(...);` for what an object maintains at its public boundary (spec §22.16), and `pure` for members that promise no effects at all (spec §22.15). The syntax is small; the *postures* are what this guide teaches. Contracts are grammar, not a debug-mode assertion library: `requires` runs in every build, and a violation is a bug report, not an outcome (§1). Two postures will break habits you may bring along, and each is headed How Bezel does it. First: `requires` states only what a *correct caller already guarantees* — never validation of trust-boundary input, which is value-shape territory Guide 2 owns (§2). Second: `pure` is a promise you *declare* and the compiler verifies — never inferred from a body (§5). If you skim everything else, read those two and the table in §9.
 
@@ -101,23 +101,24 @@ if not registry.TryAdd(move session) then    // declined: an equal element is al
 end;                                         //   and on this path also disposed (stdlib §4.10)
 ```
 
-When no caller will branch — the consumer sits above the method, at a *supervision boundary*: a catch site that logs, retries, or converts failures into protocol answers — the sanctioned signal is a typed exception (Guide 2 §4; the failure-signal rule's band 4, stdlib §1). It is still never a caller bug: the input remains an expected outcome, and only the signal changes from the misclassified `requires`. Here the plain name keeps its plain contract — `Listen` returns having bound, or it throws:
+When no caller will branch — the consumer sits above the method, at a *supervision boundary*: a catch site that logs, retries, or converts failures into protocol answers — the sanctioned signal is a typed exception whose class implements `IFailure`: a failure (Guide 2 §4; the failure-signal rule's band 4, stdlib §1). It is still never a caller bug: the input remains an expected outcome, and only the signal changes from the misclassified `requires`. Here the plain name keeps its plain contract — `Listen` returns having bound, or it throws:
 
 ```bezel
 public method Listen(rawPort: string)
   var port := int.ParseOrNull(rawPort);
   if port = null then
     // Boundary-consumed expected failure: a typed exception, still never
-    // a requires. FormatException is the built-in format fault (spec §31.4).
+    // a requires. FormatException is the built-in input failure: its class
+    // implements IFailure (spec §31.4).
     throw new FormatException($"not a port: {rawPort}");
   end;
   Bind(port);                                     // narrowed by the early exit
 end Listen;
 ```
 
-Why not just call the throwing `int.Parse(rawPort)` and let its exception fly, if you were going to throw anyway? Two reasons. The throwing form is the *assert-shaped* tier — stdlib §1's words are that it "treats absence as a bug" — so calling it on boundary input re-asserts, in exception spelling, the same misclassification the bad `requires` made. And it splits the condition: `int.Parse` raises `FormatException` for a malformed numeral but `OverflowException` for an out-of-range one (stdlib §9.1, §2.3), while `Listen`'s condition is single — *not a port*. The explicit throw keeps one condition on one signal, in the domain's own words. The same reasoning rules out `ArgumentException`: the `Argument*` family is part of band 1's pre-contract defect residual (stdlib §1) — the exception that blames the *calling code* — and no caller is at fault here. Throwing it would plant a defect report in the boundary's log — telling whoever triages that log that the calling code needs fixing, when it does not; `FormatException` blames the input's shape, which is what actually failed. (The consuming side of this signal is Guide 2 §4's catch example, which handles exactly this fault.)
+Why not just call the throwing `int.Parse(rawPort)` and let its exception fly, if you were going to throw anyway? You may. What it raises is a failure either way — `FormatException` for a malformed numeral, `ParseRangeException` for an out-of-range one (stdlib §9.1, §2.3) — because the text came from outside the program, and a boundary's `IFailure` arm takes both (Guide 2 §4). The explicit throw is for the wording: `int.Parse` reports two conditions in the numeral's terms, while `Listen`'s condition is single — *not a port*. The explicit throw keeps one condition on one signal, in the domain's own words. The kind is also what rules out `ArgumentException`: the `Argument*` family is part of band 1's pre-contract defect residual (stdlib §1) — the exception that blames the *calling code* — and no caller is at fault here. Throwing it would plant a defect report in the boundary's log — telling whoever triages that log that the calling code needs fixing, when it does not; `FormatException` blames the input's shape, which is what actually failed. (The consuming side of this signal is Guide 2 §4's catch example, which handles exactly this fault.)
 
-The two-question test before writing `requires(E)`: *could a correct caller always guarantee E?* and *is a false E a bug in the calling code?* Two yeses: contract. Either no: a value shape — or, at a boundary consumed by logging/retry, a typed exception, as in the `Listen` rewrite (Guide 2 §4).
+The two-question test before writing `requires(E)`: *could a correct caller always guarantee E?* and *is a false E a bug in the calling code?* Two yeses: contract. Either no: a value shape — or, at a boundary consumed by logging/retry, a typed exception, as in the `Listen` rewrite (Guide 2 §4). The kinds follow the answer: a broken `requires` raises `ContractViolationException`, a defect report that a boundary's `IFailure` arm lets pass, and the typed exception for bad input is a failure, which that arm takes (spec §31.4).
 
 When it does run, `requires` evaluates after argument binding and before anything else — before a constructor's chain, before field initializers, before the first body statement. Clauses run in declaration order, stopping at the first `false` (spec §22.16). A constructor's `requires` may not observe `this`, since no field is assigned yet; it reads parameters and statics only.
 

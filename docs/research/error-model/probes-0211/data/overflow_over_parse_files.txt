@@ -1,0 +1,13 @@
+1	tests/codegen/decimal_521_test.cpp
+3	tests/codegen/decimal_parse_fraction_scale_2273_test.cpp
+3	tests/codegen/decimal_parse_overflow_1829_test.cpp
+2	tests/codegen/float_parse_nonfinite_spelling_7310_test.cpp
+3	tests/codegen/float_parse_signed_bare_point_7325_test.cpp
+4	tests/codegen/float_point_no_digits_7341_test.cpp
+3	tests/codegen/int_parse_radix_2024_test.cpp
+2	tests/codegen/parse_overloads_747_test.cpp
+1	tests/conformance/rules/cases/l2_3_0002.bzl
+1	tests/conformance/rules/cases/l9_1_0007.bzl
+1	tests/conformance/rules/cases/l9_2_0007.bzl
+1	tests/conformance/rules/cases/l9_3_0020.bzl
+1	tests/runtime/decimal_literal_scale_bound_ties_to_even_5174_test.cpp

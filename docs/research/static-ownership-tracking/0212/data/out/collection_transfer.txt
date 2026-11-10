@@ -1,0 +1,8 @@
+units scanned: 9521
+store of a local owned binding into a local borrowing collection, then a `move` of that binding: 4 site(s)
+  of which the collection is named again after the transfer (rejected by K5.1 through K5.5 under 0212): 0
+  in the accepted tier (rules, docs, lit; expect in ('accept', 'run', 'warn', 'quiet', 'fragment/compiles', 'program/compiles', 'program/runs', '?')): 0
+  rules	tests/conformance/rules/cases/s28_3_0162.bzl	warn	34	Program.Run	coll	item	collection not named after the transfer
+  rules	tests/conformance/rules/cases/s28_3_0163.bzl	quiet	25	Program.Run	coll	item	collection not named after the transfer
+  rules	tests/conformance/rules/cases/s28_3_0164.bzl	warn	32	Program.Run	coll	item	collection not named after the transfer
+  rules	tests/conformance/rules/cases/s28_3_0165.bzl	warn	31	Program.Run	coll	item	collection not named after the transfer

@@ -1,11 +1,11 @@
 //! case: l1_0001
 //! doc: stdlib
 //! section: 1
-//! title: ReadKey is the assert-shaped throwing tier at end of input
-//! rule: Console.ReadKey() blocks for one key and raises EndOfStreamException at
-//!   end of input; per the failure-signal rule, end of input is band 2's expected
-//!   absence, but ReadKey stays the throwing tier because absence there is a bug
-//!   at its call sites.
+//! title: ReadKey is the assert-shaped throwing tier at end of input, and raises a failure
+//! rule: `ReadKey` remains the assert-shaped throwing tier: a caller that does not
+//!   expect end of input handles nothing, and the `EndOfStreamException` then
+//!   raised is a failure (§1), end of input being the environment's and not the
+//!   program's.
 //! cites: 2.1
 //! expect: run
 //! stdout: threw

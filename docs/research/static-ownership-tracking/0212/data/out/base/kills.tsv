@@ -1,0 +1,5 @@
+corpus	unit	expect	line	member	killed	alias
+rules	tests/conformance/rules/cases/s28_2_0011.bzl	run	31	Program.Main	w	view
+rules	tests/conformance/rules/cases/s28_2_0012.bzl	accept	31	Program.Demo	w	view
+rules	tests/conformance/rules/cases/s28_3_0036.bzl	accept	20	Program.Demo	w	b
+lit	tests/lit/checked_disposal_4602_still_faults.bzl	accept	23	Program.Main	w	view

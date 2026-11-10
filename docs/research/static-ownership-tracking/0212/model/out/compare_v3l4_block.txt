@@ -1,0 +1,16 @@
+# Candidate comparison — bounds: vars=3 len=4 features=p0212r --block [v0.355 base] --body 2
+baseline: 2921382 programs, 729072 accepted; 519225 accepted programs contain a K4.3 store; VIOLATIONS 0; K4.3 race residuals 636
+baseline trust surface (accepted programs in which some run reads a dead or foreign object THROUGH A STORED BORROW): 2514 = race 594 + fault on every run 1920 + fault on some run 0
+baseline flag surface (accepted programs that fault on every / some run, any cause): 2784 / 0   (58.4 s)
+
+| candidate | accepted | newly accepted | newly unsound | newly rejected | …race | …fault every run (holder/local) | …fault some run (holder/local) | …never fault: a dangling stored borrow exists, unread / no dangling borrow at all | left: race through a stored borrow | left: fault through a stored borrow (every/some) | left: accepted programs with an untracked K4.3 store | witness (clean rejection) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A  the candidate of the note (no erasure rule) | 720114 | 0 | 0 | 8958 | 396 | 1290/0 | 0/0 | 7200 / 72 | 198 | 630/0 | 0 | `new a / newk b a / move c a / disp b` |
+| 0212-draft1  0212 as first drafted (A + the owned-erasure rule) | 716166 | 0 | 0 | 12906 | 396 | 1290/0 | 0/0 | 7536 / 3684 | 198 | 630/0 | 0 | `new a / newk b a / erase c b` |
+| 0212  revised: out-owned mint, move-only carriers, replacing move carries its holder | 700368 | 0 | 0 | 28704 | 594 | 1920/0 | 0/0 | 12420 / 13770 | 0 | 0/0 | 0 | `new a / newk b a / erase c b` |
+| 0212-explicit  revised, with a stored-arguments-only mint (oracle) | 700368 | 0 | 0 | 28704 | 594 | 1920/0 | 0/0 | 12420 / 13770 | 0 | 0/0 | 0 | `new a / newk b a / erase c b` |
+
+- A: residual witnesses — every: `new a / newko b a / asg a / kuse b`; race: `new a / newko b a / send a / kuse b`
+- 0212-draft1: residual witnesses — every: `new a / newko b a / asg a / kuse b`; race: `new a / newko b a / send a / kuse b`
+
+(282.7 s)

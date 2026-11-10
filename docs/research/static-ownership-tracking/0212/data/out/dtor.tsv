@@ -1,0 +1,9 @@
+corpus	unit	expect	class	borrow_fields	named_in_destructor	instance_methods_called
+rules	tests/conformance/rules/cases/s22_10_0019.bzl	run	Box	src		
+lit	tests/lit/dispose_elements_retired_2081.bzl	accept	BankAccount	_transactions	_transactions	
+lit	tests/lit/sema/readonly_field_narrowing_2085__non_final_segment_rejected.bzl	accept	Outer	_inner		
+lit	tests/lit/sema/sema_priv__internal_field_of_private_nested_type_rejected_956.bzl	reject	Outer	_x		
+lit	tests/lit/sema/send_1732_imported_class_sendability_lib.bzl	accept	Tree	Parent		
+lit	tests/lit/sema/send_600_class_types__closed_class_one_non_sendable_subclass_rejected_30_14.bzl	reject	BadRect	Ref		
+lit	tests/lit/sema/send_600_class_types__sealed_class_with_non_owned_class_field_rejected_30_14_rule2.bzl	reject	Tree	Parent		
+lit	tests/lit/sema/send_600_class_types__sealed_class_with_object_field_rejected_30_14_rule3.bzl	reject	Bag	Payload		

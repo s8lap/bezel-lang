@@ -1,0 +1,289 @@
+--- v0.180 probe (rationale §5.1): borrow, transfer to a domain, use the borrow
+    new x
+    brw b x
+    send x
+    use b
+    verdict: reject:K5.1-frozen-transfer  warnings: []  (expected reject:K5.1-frozen-transfer)  OK
+--- 0047 §5.3 example: var b := x; var y := move x; use b
+    new x
+    brw b x
+    move y x
+    use b
+    verdict: reject:K5.1-frozen-transfer  warnings: []  (expected reject:K5.1-frozen-transfer)  OK
+--- K5.3: explicit Dispose() under a live borrow is admitted; the later use faults deterministically
+    new x
+    brw b x
+    disp x
+    use b
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['FAULT']  bad: []
+    trace[0]: [('disp', 2), ('disp', 1)]  OK
+--- K5.2 (§28.7 Overwrite while borrowed): drop-on-overwrite under a live borrow is frozen
+    new x
+    brw b x
+    asg x
+    use b
+    verdict: reject:K5.2-frozen-overwrite  warnings: []  (expected reject:K5.2-frozen-overwrite)  OK
+--- K7.3 (§28.3.3 mixed merge): owned on one arm, borrowed on the other, rejected at the join
+    decl x
+    new a
+    if {
+      asg x
+    } else {
+      asgb x a
+    }
+    use x
+    verdict: reject:K7.3-mixed-merge  warnings: []  (expected reject:K7.3-mixed-merge)  OK
+--- §28.3.3 Pattern 1: equalize to borrowed
+    decl x
+    new a
+    new b
+    if {
+      asgb x a
+    } else {
+      asgb x b
+    }
+    use x
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok', 'ok']  bad: []
+    trace[0]: [('disp', 4), ('disp', 3), ('disp', 2), ('disp', 1)]  OK
+--- K7.4: a conditional kill joins to maybe-consumed; the later read is rejected
+    new a
+    if {
+      disp a
+    } else {
+    }
+    use a
+    verdict: reject:K1.3-read-of-moved  warnings: []  (expected reject:K1.3-read-of-moved)  OK
+--- K3.14 affinity: an undischarged owned local is disposed at scope end
+    new a
+    {
+      new b
+      use b
+    }
+    use a
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok']  bad: []
+    trace[0]: [('disp', 4), ('disp', 3), ('disp', 2), ('disp', 1)]  OK
+--- §28.2: straight-line use after an explicit kill is a warning, and faults in checked mode
+    new a
+    disp a
+    use a
+    verdict: accept  warnings: ['§28.2-use-after-dispose']  (expected accept)
+    runs: ['FAULT']  bad: []
+    trace[0]: [('disp', 2), ('disp', 1)]  OK
+--- §28.2 letter: a consume (move) of an explicitly-disposed binding is the same warning, not an error
+    new a
+    disp a
+    move y a
+    verdict: accept  warnings: ['§28.2-use-after-dispose']  (expected accept)
+    runs: ['ok']  bad: []
+    trace[0]: [('disp', 2), ('disp', 1), ('noop', 2, 'scope-end')]  OK
+--- §28.2 / #4602: a repeated Dispose() is a warning and a no-op flag read at run time
+    new a
+    disp a
+    disp a
+    verdict: accept  warnings: ['§28.2-second-dispose']  (expected accept)
+    runs: ['ok']  bad: []
+    trace[0]: [('disp', 2), ('disp', 1), ('noop', 2, 'explicit'), ('release', 2, 'scope-end')]  OK
+--- K1 explicitly-disposed + §28.3.3 rule 3: scope end and an overwrite free the block without a disposer call
+    new a
+    disp a
+    asg a
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok']  bad: []
+    trace[0]: [('disp', 2), ('disp', 1), ('release', 2, 'overwrite'), ('disp', 4), ('disp', 3)]  OK
+--- K7.4 at scope end: a maybe-consumed binding is disposed per path; the disposed path reads the flag
+    new a
+    if {
+      disp a
+    } else {
+    }
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok', 'ok']  bad: []
+    trace[0]: [('disp', 2), ('disp', 1), ('noop', 2, 'scope-end')]  OK
+--- A5: a using var may not be moved out
+    using a
+    move y a
+    verdict: reject:A5-move-out-of-using-var  warnings: []  (expected reject:A5-move-out-of-using-var)  OK
+--- A5: a using var may not be reassigned
+    using a
+    asg a
+    verdict: reject:A5-reassign-using-var  warnings: []  (expected reject:A5-reassign-using-var)  OK
+--- §28.10: unmarked `using var y := x` over an owned x is rejected
+    new a
+    usingb y a
+    verdict: reject:§28.10-unmarked-owned-into-using-var  warnings: []  (expected reject:§28.10-unmarked-owned-into-using-var)  OK
+--- §28.10: over a borrow it is a borrow-pin that keeps the source frozen while live
+    new a
+    brw b a
+    usingb p b
+    send a
+    use p
+    verdict: reject:K5.1-frozen-transfer  warnings: []  (expected reject:K5.1-frozen-transfer)  OK
+--- §28.10 adoption: using var y := move x transfers into the pin; disposed at scope end
+    new a
+    usingm y a
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok']  bad: []
+    trace[0]: [('disp', 2), ('disp', 1)]  OK
+--- K9.1: a storage read lends; its source is the holder, so a transfer of the holder is frozen (K5.1)
+    new a
+    fbrw b a
+    send a
+    use b
+    verdict: reject:K5.1-frozen-transfer  warnings: []  (expected reject:K5.1-frozen-transfer)  OK
+--- K5.6: a slot overwrite is not frozen; the stale borrow faults under K4.1
+    new a
+    fbrw b a
+    fst a
+    use b
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['FAULT']  bad: []
+    trace[0]: [('disp', 1)]  OK
+--- K9.1/K9.5: the replacing move yields the displaced value owned and disposes nothing
+    new a
+    fmove q a
+    use q
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok']  bad: []
+    trace[0]: [('disp', 1), ('disp', 2), ('disp', 3)]  OK
+--- K3.1: a store into an owned field consumes the binding; frozen under a live borrow
+    new a
+    fmove q a
+    brw b q
+    fstm a q
+    use b
+    verdict: reject:K5.1-frozen-transfer  warnings: []  (expected reject:K5.1-frozen-transfer)  OK
+--- K3.1: the store displaces the slot value (drop-on-overwrite at a slot) and the stored value is cascaded later
+    new a
+    fmove q a
+    fstm a q
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok']  bad: []
+    trace[0]: [('disp', 3), ('disp', 2), ('disp', 1)]  OK
+--- K8.1: an unbound temporary is disposed at the boundary, exactly once
+    tuse
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok']  bad: []
+    trace[0]: [('disp', 2), ('disp', 1)]  OK
+--- K3.9 on a temporary: the boundary reclaims only (no second call)
+    tdisp
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok']  bad: []
+    trace[0]: [('disp', 2), ('disp', 1), ('release', 2, 'boundary')]  OK
+--- K8.4: a borrow of a temporary may not escape its boundary
+    tbrw b
+    use b
+    verdict: reject:K8.4-temporary-escape  warnings: []  (expected reject:K8.4-temporary-escape)  OK
+--- K3.8: throw consumes; §31.1: the exception is disposed after the catch arm; K3.15: the body's local is unwound first
+    new a
+    try {
+      new b
+      throw a
+    } catch e {
+      use e
+    }
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok']  bad: []
+    trace[0]: [('disp', 4), ('disp', 3), ('disp', 2), ('disp', 1)]  OK
+--- K5.3: throw is unfrozen; a borrow surviving it reads a live object in the arm and faults after it
+    new a
+    brw b a
+    try {
+      throw a
+    } catch e {
+      use b
+    }
+    use b
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['FAULT']  bad: []
+    trace[0]: [('disp', 2), ('disp', 1)]  OK
+--- K7 at the try join: owned on the normal edge, moved on the throwing edge → maybe-consumed
+    new a
+    try {
+      if {
+        throw a
+      } else {
+      }
+    } catch e {
+    }
+    use a
+    verdict: reject:K1.3-read-of-moved  warnings: []  (expected reject:K1.3-read-of-moved)  OK
+--- K3.15 edge parity: an uncaught throw unwinds the scope, then the exception is disposed at termination
+    new a
+    new b
+    throw a
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok']  bad: []
+    trace[0]: [('disp', 4), ('disp', 3), ('disp', 2), ('disp', 1)]  OK
+--- K7.4 at a back edge: a kill inside a loop makes the binding maybe-consumed at the head; the in-loop use is rejected
+    new a
+    while {
+      use a
+      disp a
+    }
+    verdict: reject:K1.3-read-of-moved  warnings: []  (expected reject:K1.3-read-of-moved)  OK
+--- §28.3.3 loop-carried spelling: consume then reassign at the body's end stays owned around the back edge
+    new a
+    while {
+      send a
+      asg a
+    }
+    use a
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok', 'ok', 'ok']  bad: []
+    trace[0]: [('disp', 2), ('disp', 1)]  OK
+--- K2.3 at a local: a borrow of an inner-scope local may not reach an outer binding
+    decl c
+    {
+      new b
+      asgb c b
+    }
+    use c
+    verdict: reject:K2.3-borrow-outlives-source  warnings: []  (expected reject:K2.3-borrow-outlives-source)  OK
+--- §31.1 / K2.3: the catch binding's borrow may not leave the arm
+    new a
+    decl c
+    try {
+      throw a
+    } catch e {
+      asgb c e
+    }
+    use c
+    verdict: reject:K2.3-borrow-outlives-source  warnings: []  (expected reject:K2.3-borrow-outlives-source)  OK
+--- K2.3: a borrow of an outer local may be stored into an inner binding
+    new a
+    {
+      decl c
+      asgb c a
+      use c
+    }
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok']  bad: []
+    trace[0]: [('disp', 2), ('disp', 1)]  OK
+--- K5.3-b residual: a borrow across a back edge is stale only on the second iteration (stays run-time)
+    new a
+    brw b a
+    while {
+      use b
+      disp a
+      asg a
+    }
+    verdict: accept  warnings: []  (expected accept)
+    runs: ['ok', 'ok', 'FAULT']  bad: []
+    trace[0]: [('disp', 2), ('disp', 1)]  OK
+--- K5.3-b: new x / brw b x / disp x / use b
+    verdict: reject:K5.3b-use-of-killed-borrow warnings: [] (expected reject:K5.3b-use-of-killed-borrow)  OK
+--- K5.3-b: new a / disp a / use a
+    verdict: reject:K5.3b-same-variable-dominated-use warnings: [] (expected reject:K5.3b-same-variable-dominated-use)  OK
+--- K5.3-b: new a / disp a / disp a
+    verdict: accept warnings: ['§28.2-second-dispose'] (expected accept)  OK
+--- K5.3-b: new x / brw b x / if { /   disp x / } else { / } / use b
+    verdict: accept warnings: [] (expected accept)  OK
+--- K5.3-b: new x / disp x / brw b x
+    verdict: reject:K5.3b-same-variable-dominated-use warnings: [] (expected reject:K5.3b-same-variable-dominated-use)  OK
+--- K5.3-b: new a / brw b a / while { /   use b /   disp a /   asg a / }
+    verdict: accept warnings: [] (expected accept)  OK
+
+selftest: 42 passed, 0 failed

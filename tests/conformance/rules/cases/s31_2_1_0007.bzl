@@ -6,7 +6,7 @@
 //!   from `Exception`, but an `Exception`-derived class may implement one, so
 //!   the arm matches exactly the throwables whose class implements the
 //!   interface.
-//! cites: 31.2.1
+//! cites: 31.2.1, 12.7
 //! expect: run
 //! stdout: True
 module Conf;
@@ -27,7 +27,10 @@ public class Program
     try
       throw new RetryableException("boom");
     catch
-      var ex: IRetryable => Console.WriteLine(ex.ShouldRetry().ToString()),
+      var ex: IRetryable => do
+        var r := ex as IRetryable;
+        Console.WriteLine(r!.ShouldRetry().ToString());
+      end,
     end try;
   end Main;
 end Program;

@@ -1,0 +1,18 @@
+# Candidate comparison — bounds: vars=3 len=4 features=p0212r --block [v0.355 base] [child destructor reads its back-pointer] [holder destructor reads its borrow] --body 2
+baseline: 2921382 programs, 729072 accepted; 519225 accepted programs contain a K4.3 store; VIOLATIONS 0; K4.3 race residuals 11808
+baseline trust surface (accepted programs in which some run reads a dead or foreign object THROUGH A STORED BORROW): 60648 = race 11766 + fault on every run 48882 + fault on some run 0
+baseline flag surface (accepted programs that fault on every / some run, any cause): 49674 / 0   (59.1 s)
+
+| candidate | accepted | newly accepted | newly unsound | newly rejected | …race | …fault every run (holder/local) | …fault some run (holder/local) | …never fault: a dangling stored borrow exists, unread / no dangling borrow at all | left: race through a stored borrow | left: fault through a stored borrow (every/some) | left: accepted programs with an untracked K4.3 store | witness (clean rejection) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A  the candidate of the note (no erasure rule) | 678876 | 0 | 0 | 50196 | 8184 | 32190/0 | 0/0 | 378 / 9444 | 3582 | 16692/0 | 0 | `new a / fmove b a / newk c b / fstm a b` |
+| 0212-draft1  0212 as first drafted (A + the owned-erasure rule) | 675342 | 0 | 0 | 53730 | 8184 | 32376/0 | 0/0 | 390 / 12780 | 3582 | 16506/0 | 0 | `new a / newk b a / erase c b` |
+| 0212  revised: out-owned mint, move-only carriers, replacing move carries its holder | 625740 | 0 | 0 | 103332 | 11766 | 46968/0 | 0/0 | 1056 / 43542 | 0 | 1914/0 | 0 | `new a / fmove b a / asg a` |
+| 0212-explicit  revised, with a stored-arguments-only mint (oracle) | 626772 | 0 | 0 | 102300 | 11766 | 47298/0 | 0/0 | 1056 / 42180 | 0 | 1584/0 | 0 | `new a / fmove b a / asg a` |
+
+- A: residual witnesses — every: `new a / newko b a / asg a`; race: `new a / newko b a / send a`
+- 0212-draft1: residual witnesses — every: `new a / newko b a / asg a`; race: `new a / newko b a / send a`
+- 0212: residual witnesses — every: `new a / fbrw b a / fst a / newk c b`
+- 0212-explicit: residual witnesses — every: `new a / fbrw b a / fst a / newk c b`
+
+(322.3 s)

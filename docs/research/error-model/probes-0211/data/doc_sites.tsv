@@ -1,0 +1,72 @@
+group	document	line	disposition	edit_or_reason	text
+tier	docs/Bezel_Language_Spec.md	814	left	a cast is the program's own operation: a defect, as the gloss says	The checked cast is the assert-shaped tier — an undeclared value is a bug at its call site
+tier	docs/Bezel_Language_Spec.md	1853	left	a cast is the program's own operation: a defect, as the gloss says	`FromUnderlyingOrNull` returns the declared constant whose underlying value equals `value`
+catchall	docs/Bezel_Language_Spec.md	3804	left	re-raises	var ex: Exception => throw          // bare throw: re-raises the current exception
+catchall	docs/Bezel_Language_Spec.md	9648	left	logs and re-raises (§30.9's example)	var ex: Exception => do
+catchall	docs/Bezel_Language_Spec.md	9663	left	re-raises	var ex: Exception => throw          // re-raise unrecognized exceptions
+join	docs/Bezel_Language_Spec.md	10061	left	true as written: DomainFailedException is a DomainFaultedException	**Async entries.** An entry may be an `async` function — a capture-free `async` lambda or 
+join	docs/Bezel_Language_Spec.md	10079	edited	S12	**Faults.** An exception that propagates out of the entry does not cross the boundary as a
+join	docs/Bezel_Language_Spec.md	10113	edited	S13	the returned task faults with `DomainFaultedException` — this section's fault vocabulary, 
+join	docs/Bezel_Language_Spec.md	10145	left	a comment in an example; true of the subclass too	//   surfaces here as DomainFaultedException (§30.14)
+catchall	docs/Bezel_Language_Spec.md	10202	left	§31.1's closure example; the arm type is not its subject	catch var ex: Exception => do
+catchall	docs/Bezel_Language_Spec.md	10284	left	logs and re-raises, or (§31.1) shows closure confinement; the arm type is not the example's subject	var ex: Exception => do
+catchall	docs/Bezel_Language_Spec.md	10303	left	logs and re-raises, or (§31.1) shows closure confinement; the arm type is not the example's subject	var ex: Exception => do          // the catch-all (§31.2.3)
+catchall	docs/Bezel_Language_Spec.md	10346	edited	S6	var ex: Exception => Log(ex)
+catchall	docs/Bezel_Language_Spec.md	10359	left	§31.2.5's deliberate suppression; S7 adds the failures-only form beside it	Exception => ()
+tier	docs/Bezel_Standard_Library.md	63	edited	L21	Why the shapes split as they do. In (a) the bool distinguishes the outcome from a legitima
+words	docs/Bezel_Standard_Library.md	68	edited	L1	1. **Caller bug.** The condition is something a correct caller already guarantees (a bad a
+tier	docs/Bezel_Standard_Library.md	76	edited	L22	**The no-dual rule.** One primary mechanism per fault condition. A member family may addit
+tier	docs/Bezel_Standard_Library.md	126	edited	L23	`ReadKey()` blocks until one key (code point) is available and raises `EndOfStreamExceptio
+range	docs/Bezel_Standard_Library.md	220	edited	L5	The `To*` methods raise `FormatException` when the string is not a well-formed representat
+range	docs/Bezel_Standard_Library.md	446	edited	L4	**Parse and range contracts.** `DateTime.Parse` accepts exactly the type's own rendered fo
+range	docs/Bezel_Standard_Library.md	611	left	a cast, not Parse	`Reinterpret<TTo>(value)` is the general same-width bit-reinterpretation operation. The si
+join	docs/Bezel_Standard_Library.md	1136	left	names the class that declares the member	The exception types that carry declared surface beyond `Exception`'s are enumerated by ref
+tier	docs/Bezel_Standard_Library.md	1814	left	an index is the program's: a defect, as the gloss says	**The `TryPopAt` gap, recorded.** The `Pop*` surface is asymmetric against [§1](#sec-conve
+catchall	docs/Bezel_Standard_Library.md	4182	left	a handler that isolates itself from the raise on purpose (§6.5)	var ex: Exception => Log($"Handler failed: {ex.Message}")
+join	docs/Bezel_Standard_Library.md	4555	left	true as written: the subclass is a DomainFaultedException	**Async entries.** The nine async rows — elided from the listing above, each the twin of a
+join	docs/Bezel_Standard_Library.md	4557	left	introduces the declaration block, which L15 extends	The join handle completes when the entry's task completes. A fault in the entry surfaces a
+join	docs/Bezel_Standard_Library.md	4560	left	the declaration; L15 adds the subclass after it	public class DomainFaultedException: Exception
+join	docs/Bezel_Standard_Library.md	4563	edited	L15	end DomainFaultedException;
+join	docs/Bezel_Standard_Library.md	4566	edited	L16	The original exception object never crosses the boundary (no exception class is sendable —
+join	docs/Bezel_Standard_Library.md	4684	left	a comment in an example; true of the subclass too	await jt;                                            // join; faults surface as DomainFaul
+join	docs/Bezel_Standard_Library.md	4915	edited	L17	- **Results in input order**; first fault wins, surfaced at the `await` as `DomainFaultedE
+contract	docs/Bezel_Standard_Library.md	5171	left	the contract's name; true of the subclass, as L7 states	//   FormatException/OverflowException
+contract	docs/Bezel_Standard_Library.md	5182	left	the contract's name; true of the subclass, as L7 states	//   FormatException/OverflowException;
+range	docs/Bezel_Standard_Library.md	5200	edited	L6	**The radix alphabet.** The digits of radix *r* are the first *r* of `0`–`9` then `A`–`Z`;
+range	docs/Bezel_Standard_Library.md	5202	edited	L7	The span overloads (#1810) accept exactly the inputs the string forms accept — same `Forma
+range	docs/Bezel_Standard_Library.md	5281	edited	L8	**Input grammar.** `Parse` accepts an optional sign (`+` or `-`), then one or more of the 
+range	docs/Bezel_Standard_Library.md	5283	edited	L9	**Parsing and range.** `Parse` yields the value its input spells, rounded once to the type
+range	docs/Bezel_Standard_Library.md	5314	edited	L10	`Parse` accepts an optional leading sign (`+` or `-`), then one or more of the digits `0`–
+tier	docs/Bezel_Standard_Library.md	5548	left	a cast is the program's own operation: a defect	It returns the declared constant whose underlying value equals `value`, or `null` when the
+tier	docs/Bezel_Design_Rationale.md	399	left	not about exceptions	C trained generations of programmers to treat an unchecked `malloc` as a bug, so refusing 
+catchall	docs/Bezel_Design_Rationale.md	1819	left	re-raises	var ex: Exception => throw                 // re-raise unrecognized
+catchall	docs/Bezel_Design_Rationale.md	1869	left	re-raises	var ex: Exception => do throw; end       // do/end just for one statement
+catchall	docs/Bezel_Design_Rationale.md	1878	left	re-raises	var ex: Exception => throw
+catchall	docs/Bezel_Design_Rationale.md	1900	left	re-raises	Exception => throw
+join	docs/Bezel_Design_Rationale.md	2124	edited	R2	**Faults cross as `DomainFaultedException`, not as the original exception object.** No exc
+join	docs/Bezel_Design_Rationale.md	2130	left	true as written	**The compiler-known classes are closed to inheritance** ([proposal 0138](proposals/0138-c
+catchall	docs/Bezel_Design_Rationale.md	2466	left	§13.5's deliberate per-handler isolation	var ex: Exception => Log(ex)        // swallow per-handler failures
+range	docs/Bezel_Design_Rationale.md	2566	left	true of the subclass; the paragraph's own ground is that such input 'is a data problem'	`double.Parse` and `float.Parse` read a numeral at run time, and stdlib §9.2 gives them th
+range	docs/Bezel_Design_Rationale.md	2568	left	a survey of other languages	The survey (the owner's, 2026-09; sources not fetched). .NET's `double.Parse` returns `±In
+range	docs/Bezel_Design_Rationale.md	2574	left	true of the subclass	**JSON.** `ReadFloat` takes `Parse`'s reading and range, raising `SerializationException`,
+tier	docs/Bezel_For_Code_Generation.md	731	edited	C1	**Three access tiers over one operation:** the **throwing** tier (absence is a bug) — `Par
+join	docs/Bezel_For_Code_Generation.md	839	edited	C3	Hierarchy: `Exception` → `ContractViolationException`; `ArgumentException` → `ArgumentNull
+join	docs/Bezel_For_Code_Generation.md	1373	left	true as written; C3 and C4 name the subclass	`Acquire`/`TryAcquire` **block** and are a compile error inside `async` bodies — use the `
+range	docs/Bezel_For_Code_Generation.md	1433	edited	C5	The integer types (`Int32`, `Int64`, `Byte`, `SByte`, `Int16`, `UInt16`, `UInt32`, `UInt64
+range	docs/Bezel_For_Code_Generation.md	1435	edited	C6	`Double`/`Float`: `MinValue MaxValue Epsilon PositiveInfinity NegativeInfinity NaN`; `stat
+catchall	docs/Bezel_For_Code_Generation.md	2110	left	an example of a compile error	var ex: Exception => _lastError := ex;    // ERROR: `ex` is a borrow whose lifetime is the
+words	docs/Bezel_Guide_02_Errors_and_Nullability.md	9	edited	G2-1	- A **caller bug** is a contract (`requires`, §7) or defect exception.
+words	docs/Bezel_Guide_02_Errors_and_Nullability.md	10	edited	G2-1	- A **boundary fault** — I/O, network, anything logged or retried rather than branched on 
+words	docs/Bezel_Guide_02_Errors_and_Nullability.md	198	edited	G2-2	For everything the value shapes don't cover — the boundary fault, and the defect a `requir
+catchall	docs/Bezel_Guide_02_Errors_and_Nullability.md	243	left	an example of a compile error	var ex: Exception => _lastError := ex;   // ERROR: ex is a borrow;
+catchall	docs/Bezel_Guide_02_Errors_and_Nullability.md	259	edited	G2-4	var ex: Exception => RecordError(ex)
+join	docs/Bezel_Guide_04_Concurrency.md	177	edited	G4-1	First fault cancels remaining work and surfaces at the await as `DomainFaultedException` (
+join	docs/Bezel_Guide_04_Concurrency.md	236	edited	G4-2	Joins are ordinary tasks of the spawning domain: a class result crosses as a Pattern B awa
+tier	docs/Bezel_Guide_05_Collections_and_Iteration.md	56	left	a dictionary is the program's state: a defect, as the gloss says	**Dictionaries in practice.** The lookup tiers are Guide 2 §2's: the indexer throws `KeyNo
+tier	docs/Bezel_Guide_05_Collections_and_Iteration.md	240	left	an empty collection is the program's state: a defect	**Empty sources, while we are near the aggregations** (stdlib §5/§5.1): `Sum` returns the 
+tier	docs/Bezel_Guide_05_Collections_and_Iteration.md	317	left	a collection is the program's state: a defect	Three footnotes close the story. First, the tiers are the usual ones (stdlib §1): `First` 
+tier	docs/Bezel_Guide_06_Contracts_and_Purity.md	50	left	names band 1's defect exceptions; consistent	This is the boundary that matters most, and it mirrors Guide 2 §7's table exactly. The fai
+words	docs/Bezel_Guide_06_Contracts_and_Purity.md	50	left	names band 1's defect exceptions; consistent	This is the boundary that matters most, and it mirrors Guide 2 §7's table exactly. The fai
+words	docs/Bezel_Guide_06_Contracts_and_Purity.md	111	edited	G6-2	// a requires. FormatException is the built-in format fault (spec §31.4).
+tier	docs/Bezel_Guide_06_Contracts_and_Purity.md	118	edited	G6-3	Why not just call the throwing `int.Parse(rawPort)` and let its exception fly, if you were
+range	docs/Bezel_Guide_06_Contracts_and_Purity.md	118	edited	G6-3	Why not just call the throwing `int.Parse(rawPort)` and let its exception fly, if you were

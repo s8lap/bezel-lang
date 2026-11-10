@@ -1,0 +1,6 @@
+corpus	unit	expect	line	generic	arguments
+rules	tests/conformance/rules/cases/s22_6_2312.bzl	run	22	Array	Row
+docs	tests/conformance/cases/spec_0324.bzl	error/diagnose	26	Channel	Linked
+lit	tests/lit/sema/send_600_class_types__sealed_class_with_non_owned_class_field_rejected_30_14_rule2.bzl	reject	9	Channel	Tree
+lit	tests/lit/sema/send_600_class_types__sealed_class_with_object_field_rejected_30_14_rule3.bzl	reject	9	Channel	Bag
+gtest	tests/sema/type_param_identity_6315_test.cpp	mixed	495	G	A, C

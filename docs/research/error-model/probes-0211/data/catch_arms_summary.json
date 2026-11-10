@@ -1,0 +1,64 @@
+{
+ "arms_total": 3304,
+ "arms_by_corpus": {
+  "rules": 699,
+  "docex": 27,
+  "lit": 58,
+  "gtest": 2520
+ },
+ "unparsed": 11,
+ "catch_all_arms": 623,
+ "catch_all_by_guard_and_body": {
+  "guard/handles": 29,
+  "unguarded/convert": 21,
+  "unguarded/handles": 545,
+  "unguarded/reraise": 22,
+  "unguarded/suppress": 6
+ },
+ "catch_all_by_corpus": {
+  "docex/unguarded/handles": 6,
+  "docex/unguarded/reraise": 5,
+  "docex/unguarded/suppress": 1,
+  "gtest/guard/handles": 29,
+  "gtest/unguarded/convert": 20,
+  "gtest/unguarded/handles": 448,
+  "gtest/unguarded/reraise": 12,
+  "gtest/unguarded/suppress": 4,
+  "lit/unguarded/convert": 1,
+  "lit/unguarded/handles": 32,
+  "lit/unguarded/reraise": 1,
+  "rules/unguarded/handles": 59,
+  "rules/unguarded/reraise": 4,
+  "rules/unguarded/suppress": 1
+ },
+ "undivided_catch_all_arms": 566,
+ "undivided_by_corpus": {
+  "rules": 59,
+  "docex": 6,
+  "lit": 33,
+  "gtest": 468
+ },
+ "undivided_sole_arm_of_its_block": 493,
+ "undivided_files": 234,
+ "undivided_files_by_corpus": {
+  "rules": 55,
+  "docex": 6,
+  "lit": 24,
+  "gtest": 149
+ },
+ "undivided_rule_cases_by_expect": {
+  "run": 37,
+  "reject": 18
+ },
+ "undivided_lit_files_asserting_no_diagnostics": 12,
+ "everyday_programs": 40,
+ "everyday_programs_with_a_catch": 6,
+ "everyday_arm_types": {
+  "InvalidOperationException": 2,
+  "IOException": 2,
+  "FormatException": 1,
+  "ConfigError": 1,
+  "OperationCanceledException": 1,
+  "ParseError": 1
+ }
+}

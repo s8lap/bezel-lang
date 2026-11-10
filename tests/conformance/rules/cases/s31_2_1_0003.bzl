@@ -2,9 +2,9 @@
 //! doc: spec
 //! section: 31.2.1
 //! title: a multi-type binding types at the nearest common base
-//! rule: When binding, `name` has the static type of the nearest common
-//!   base of the listed types — the most specific class that is a base of
-//!   every listed type.
+//! rule: When binding, `name` has the static type of the nearest common base of the
+//!   listed types — the most specific class that is a base of every listed
+//!   type, an interface counting as `Exception`
 //! cites: 31.2.1
 //! expect: run
 //! stdout: 2

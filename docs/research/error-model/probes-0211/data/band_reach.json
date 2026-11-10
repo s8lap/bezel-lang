@@ -1,0 +1,91 @@
+{
+ "overflow_arms": {
+  "gtest / ArithmeticException / no Parse/Convert call in the try block": 3,
+  "gtest / OverflowException / no Parse/Convert call in the try block": 276,
+  "gtest / OverflowException / try block calls Parse/Convert.To*": 22,
+  "lit / OverflowException / no Parse/Convert call in the try block": 1,
+  "rules / ArithmeticException / no Parse/Convert call in the try block": 1,
+  "rules / OverflowException / no Parse/Convert call in the try block": 118,
+  "rules / OverflowException / try block calls Parse/Convert.To*": 4
+ },
+ "overflow_arms_over_parse_total": 26,
+ "overflow_arms_total": 425,
+ "overflow_over_parse_files": 13,
+ "domain_faulted_arms": {
+  "gtest / handles": 4,
+  "rules / handles": 1
+ },
+ "interface_typed_arms": {
+  "gtest / IRetryable / bind": 1,
+  "lit / IRetryable / bare": 2,
+  "lit / IRetryable / bind": 1,
+  "rules / IRetryable / bind": 1
+ },
+ "exception_class_declarations_by_root_band": {
+  "docex / Exception (direct)": 8,
+  "docex / defect": 1,
+  "gtest / Exception (direct)": 915,
+  "gtest / defect": 27,
+  "gtest / failure": 6,
+  "lit / Exception (direct)": 110,
+  "lit / defect": 2,
+  "rules / Exception (direct)": 117,
+  "rules / defect": 1
+ },
+ "exception_class_declarations_total_by_band": {
+  "Exception (direct)": 1150,
+  "defect": 31,
+  "failure": 6
+ },
+ "proposed_names": {
+  "DomainFailedException / declared": 0,
+  "DomainFailedException / mentioned": 0,
+  "Failure / declared": 0,
+  "Failure / mentioned": 0,
+  "IFailure / declared": 0,
+  "IFailure / mentioned": 0,
+  "ParseRangeException / declared": 0,
+  "ParseRangeException / mentioned": 0
+ },
+ "format_arms": {
+  "docex / neither seen": 1,
+  "gtest / format-specifier call": 33,
+  "gtest / neither seen": 32,
+  "gtest / parse or decode call": 73,
+  "rules / format-specifier call": 3,
+  "rules / neither seen": 5,
+  "rules / parse or decode call": 31
+ },
+ "format_arms_over_specifier_calls": 36,
+ "format_arms_over_specifier_files": 9,
+ "arms_by_band": {
+  "docex / catch-all": 12,
+  "docex / defect": 6,
+  "docex / failure": 6,
+  "docex / user-or-other": 4,
+  "gtest / cancellation": 17,
+  "gtest / carrier": 4,
+  "gtest / catch-all": 513,
+  "gtest / defect": 1202,
+  "gtest / failure": 349,
+  "gtest / user-or-other": 462,
+  "lit / catch-all": 34,
+  "lit / defect": 10,
+  "lit / failure": 2,
+  "lit / user-or-other": 15,
+  "rules / cancellation": 14,
+  "rules / carrier": 1,
+  "rules / catch-all": 64,
+  "rules / defect": 491,
+  "rules / failure": 95,
+  "rules / user-or-other": 36
+ },
+ "arms_total_by_band": {
+  "defect": 1709,
+  "failure": 452,
+  "user-or-other": 517,
+  "catch-all": 623,
+  "cancellation": 31,
+  "carrier": 5
+ }
+}

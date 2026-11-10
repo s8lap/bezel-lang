@@ -1,0 +1,3 @@
+corpus	unit	expect	line	member	static
+rules	tests/conformance/rules/cases/s28_3_0149.bzl	reject	22	Gate.Install	_m
+rules	tests/conformance/rules/cases/s28_3_0150.bzl	reject	27	Cache.Prime	_cfg

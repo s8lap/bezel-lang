@@ -3,9 +3,9 @@
 //! section: 2.3
 //! title: Convert.ToDouble raises FormatException for the spellings the double input grammar forbids
 //! rule: The `To*` methods raise `FormatException` when the string is not a
-//!   well-formed representation of the target type and `OverflowException` when
-//!   the value does not fit — the same contract as the §9 per-type `Parse`
-//!   family these conversions mirror
+//!   well-formed representation of the target type and `ParseRangeException`
+//!   (§9.1; an `OverflowException`) when the value does not fit — the same
+//!   contract as the §9 per-type `Parse` family these conversions mirror
 //! cites: 2.3, 9.2
 //! expect: run
 //! output: [+.5] -> FMT

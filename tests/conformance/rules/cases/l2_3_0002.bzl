@@ -1,9 +1,10 @@
 //! case: l2_3_0002
 //! doc: stdlib
 //! section: 2.3
-//! title: ToInt32 raises OverflowException when the value does not fit
-//! rule: Convert.ToInt32(value) raises OverflowException when the value does
-//!   not fit the target type.
+//! title: ToInt32 raises an OverflowException (ParseRangeException) when the value does not fit
+//! rule: The `To*` methods raise `FormatException` when the string is not a
+//!   well-formed representation of the target type and `ParseRangeException`
+//!   (§9.1; an `OverflowException`) when the value does not fit
 //! expect: run
 //! stdout: threw
 module Conf;

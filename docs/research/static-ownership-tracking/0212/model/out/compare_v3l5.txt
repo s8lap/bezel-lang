@@ -1,0 +1,18 @@
+# Candidate comparison — bounds: vars=3 len=5 features=p0212r [v0.355 base]
+baseline: 2120646 programs, 471603 accepted; 316773 accepted programs contain a K4.3 store; VIOLATIONS 0; K4.3 race residuals 1074
+baseline trust surface (accepted programs in which some run reads a dead or foreign object THROUGH A STORED BORROW): 3702 = race 1062 + fault on every run 2640 + fault on some run 0
+baseline flag surface (accepted programs that fault on every / some run, any cause): 3600 / 0   (34.8 s)
+
+| candidate | accepted | newly accepted | newly unsound | newly rejected | …race | …fault every run (holder/local) | …fault some run (holder/local) | …never fault: a dangling stored borrow exists, unread / no dangling borrow at all | left: race through a stored borrow | left: fault through a stored borrow (every/some) | left: accepted programs with an untracked K4.3 store | witness (clean rejection) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A  the candidate of the note (no erasure rule) | 461673 | 0 | 0 | 9930 | 702 | 1686/0 | 0/0 | 6792 / 750 | 360 | 954/0 | 0 | `new a / newk b a / move c a / disp b` |
+| 0212-draft1  0212 as first drafted (A + the owned-erasure rule) | 459903 | 0 | 0 | 11700 | 708 | 1704/0 | 0/0 | 7284 / 2004 | 354 | 936/0 | 0 | `new a / newk b a / erase c b` |
+| 0212  revised: out-owned mint, move-only carriers, replacing move carries its holder | 446313 | 0 | 0 | 25290 | 1062 | 2580/0 | 0/0 | 12198 / 9450 | 0 | 60/0 | 0 | `new a / newk b a / erase c b` |
+| 0212-explicit  revised, with a stored-arguments-only mint (oracle) | 446469 | 0 | 0 | 25134 | 1062 | 2604/0 | 0/0 | 12240 / 9228 | 0 | 36/0 | 0 | `new a / newk b a / erase c b` |
+
+- A: residual witnesses — every: `new a / newko b a / asg a / kuse b`; race: `new a / newko b a / send a / kuse b`
+- 0212-draft1: residual witnesses — every: `new a / newko b a / asg a / kuse b`; race: `new a / newko b a / send a / kuse b`
+- 0212: residual witnesses — every: `new a / fbrw b a / fst a / newk c b / kuse c`
+- 0212-explicit: residual witnesses — every: `new a / fbrw b a / fst a / newk c b / kuse c`
+
+(169.6 s)
