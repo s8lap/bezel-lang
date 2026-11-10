@@ -54250,7 +54250,12 @@ llvm::GlobalVariable* Emitter::valueBuiltinBoxVtableFor(const char* name) {
         // descriptor this module declared (i.e. that it uses) get a pair.
         const bool haveCmp = cmpDescIt != descArray_.end();
         const bool haveEq  = eqDescIt != descArray_.end();
-        if (temporal && payloadTy->isIntegerTy() && (haveCmp || haveEq)) {
+        // fix #8288 (stdlib §2.6 `Guid: IComparable<Guid>, IEquatable<Guid>`,
+        // v0.357): Guid's payload is the `{i64,i64}` struct; its order is the
+        // runtime's `bz_guid_compare` (a memcmp over the 16 canonical bytes).
+        const bool isGuidVb = nmv == "Guid" && payloadTy == guidStructType();
+        if (((temporal && payloadTy->isIntegerTy()) || isGuidVb) &&
+            (haveCmp || haveEq)) {
             auto* cmpFn = llvm::Function::Create(
                 llvm::FunctionType::get(i32(), {ptrTy(), payloadTy}, false),
                 llvm::Function::LinkOnceODRLinkage,
@@ -54264,6 +54269,18 @@ llvm::GlobalVariable* Emitter::valueBuiltinBoxVtableFor(const char* name) {
                     "vbc.pay");
                 llvm::Value* a = builder_.CreateLoad(payloadTy, pay, "vbc.a");
                 llvm::Value* b = cmpFn->getArg(1);
+                if (isGuidVb) {
+                    // stdlib §2.6: lexicographic over the 16 canonical bytes;
+                    // `bz_guid_compare` takes the ADDRESS of each value.
+                    auto* sa = entryAlloca(payloadTy);
+                    auto* sb = entryAlloca(payloadTy);
+                    builder_.CreateStore(a, sa);
+                    builder_.CreateStore(b, sb);
+                    auto* gcmp = declareC("bz_guid_compare", i32(),
+                                          {ptrTy(), ptrTy()});
+                    builder_.CreateRet(
+                        builder_.CreateCall(gcmp, {sa, sb}, "vbc.gcmp"));
+                } else {
                 // per stdlib §2.5: DateTime's CompareTo is tick order (Kind
                 // not normalized); the others order their signed scalar.
                 if (nmv == "DateTime") {
@@ -54275,6 +54292,7 @@ llvm::GlobalVariable* Emitter::valueBuiltinBoxVtableFor(const char* name) {
                 llvm::Value* lt = builder_.CreateZExt(
                     builder_.CreateICmpSLT(a, b), i32(), "vbc.lt");
                 builder_.CreateRet(builder_.CreateSub(gt, lt, "vbc.res"));
+                }
             }
             auto* eqTFn = llvm::Function::Create(
                 llvm::FunctionType::get(i1(), {ptrTy(), payloadTy}, false),

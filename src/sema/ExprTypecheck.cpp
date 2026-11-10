@@ -9139,6 +9139,33 @@ void ExprTC::checkAssignable(
             // nominal path at all — is now rejected. This mirrors the non-
             // generic Named-Named path just below (which already gates on the
             // same `isSubtype`).
+            // fix #8288 (§5.1 reference conversions, stdlib §2.5 / §2.6, v0.357):
+            // a compiler-intrinsic value-builtin that stdlib DECLARES
+            // `: IComparable<Self>, IEquatable<Self>` (DateTime, TimeSpan,
+            // DateOnly, TimeOnly, Guid) converts to that interface at its OWN
+            // type, exactly as `int` converts to `IComparable<int>`. These
+            // symbols carry no baseTypes, so `isSubtype` below cannot see the
+            // conformance; an expression such as `Guid.Empty` /
+            // `Guid.NewGuid()` carries the intrinsic symbol (while
+            // `new DateTime(..)` carries a null declaration and was already
+            // accepted). A user type of the same name has a real `decl` and
+            // is excluded.
+            if (from->declaration->isValueBuiltin && !from->declaration->decl &&
+                to->declaration->isSynthesizedBuiltinInterface &&
+                (to->declaration->name == "IComparable" ||
+                 to->declaration->name == "IEquatable") &&
+                to->genericArgs.size() == 1 && to->genericArgs[0] &&
+                to->genericArgs[0]->kind == TypeRef::Kind::Named &&
+                !to->genericArgs[0]->nullable &&
+                to->genericArgs[0]->headName() == from->declaration->name &&
+                (from->declaration->name == "Guid" ||
+                 from->declaration->name == "DateTime" ||
+                 from->declaration->name == "TimeSpan" ||
+                 from->declaration->name == "DateOnly" ||
+                 from->declaration->name == "TimeOnly")) {
+                if (from->nullable && !to->nullable) { reportNullable(); return; }
+                return;
+            }
             if (!isSubtype(from->declaration, to->declaration)) {
                 reportNotConvertible();
                 return;
