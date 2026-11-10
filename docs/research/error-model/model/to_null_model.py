@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
-"""Two checks of the recommended design against the ownership-kernel model
-(docs/research/soundness/bzcore-l1/bzcore.py, spec pin v0.345).
+"""Three checks against the ownership-kernel model
+(docs/research/soundness/bzcore-l1/bzcore.py, spec pin v0.345; this report is
+written against v0.355, so the model is ten revisions behind the text).
 
-Check 1 - the "to null" stance adds no ownership behaviour.
-  `try? E` desugars to `try E catch <declared failures> => () end` with a null
-  result.  In the model's fragment that is a `try` whose handler is empty.  We
-  enumerate every program of the shape  prefix ; try { body } catch e { } ;
-  suffix  at the given bounds, and report the checker's verdicts and, for the
-  accepted programs, the oracles (T1 exactly-once, T2 no silent use-after-kill,
-  T3 isolation).  Expected: zero violations.
+What these checks are NOT: a model of the proposed `(try E)` atom. bzcore-l1
+has no calls, no values, no null and no exception types. So nothing here
+models the atom's null result, its band filter (the catch arm in the model
+catches everything), an owned argument consumed by a failing call, or `await`.
+The checks cover the existing constructs the atom would be built from.
+
+Check 1 - the existing try / empty catch-all fragment.
+  Every program of the shape  prefix ; try { body } catch e { } ; suffix  at
+  the given bounds: the checker's verdicts and, for the accepted programs, the
+  oracles (T1 exactly-once, T2 no silent use-after-kill, T3 isolation).
+  Expected: zero violations.
 
 Check 2 - the throw edge and the normal scope-exit edge dispose the same values
-  in the same order (K3.15 edge parity).  This is the property that lets a
-  declared failure be implemented as a value return (an early exit of the
-  scope) instead of an unwind, with no observable change.
+  in the same order (K3.15 edge parity).
   For every accepted program  prefix ; try { body ; throw new R } catch e { } ;
   suffix  we run the twin  prefix ; block { body } ; suffix  and compare the
   disposal traces after deleting the exception object's own allocation and
   disposal from the first.  Expected: identical.  The same comparison is then
   repeated with K3.15 switched off, to show the check can fail.
+
+Check 3 - an outer owned local assigned inside the protected block (the
+  statement reading of the atom's result).
+  decl r ; prefix ; try { if * { throw new R } else { r := new R } }
+  catch e { } ; suffix.  The nondeterministic branch stands for an operand
+  that either fails or produces an owned value; `r` is uninitialized on the
+  failure path (the model has no null).  The suffix may mention `r`; a read of
+  it is rejected by the checker (K1.3), which corresponds to the null test the
+  real form needs.  Expected: zero oracle violations among accepted programs,
+  i.e. `r` is disposed exactly once on the path that assigned it and not at
+  all on the other.
 
 Usage: to_null_model.py <path-to-bzcore-l1/bzcore.py> [--vars 2] [--len 3] [--body 2]
 """
@@ -126,9 +140,36 @@ def check2():
     return compared, same, differ, skipped, witness
 
 
+def check3():
+    """decl r ; prefix ; try { if * { tthrow } else { asg r } } catch e { } ; suffix"""
+    R = "r"
+    core = ("try", [("if", [("tthrow",)], [("asg", R)])], "e", [])
+    verdicts = Counter()
+    bad = Counter()
+    n = 0
+    d0 = {R: bz.TYPES_R}
+    for pre in bz.enum_upto(VS, max(1, a.len - 1), dict(d0), FEATS, allow_throw=False, nmin=0):
+        d = dict(d0)
+        for st in pre:
+            t = bz.decl_type(d, st)
+            if t:
+                d[st[1]] = t
+        for suf in bz.enum_upto(VS + [R], 1, d, FEATS):
+            prog = [("decl", R)] + list(pre) + [core] + list(suf)
+            n += 1
+            row, _ = bz.evaluate(prog)
+            if row.verdict == "accept":
+                verdicts["accept" + (" with warnings" if row.warns else "")] += 1
+                for b in row.bad:
+                    bad[b] += 1
+            else:
+                verdicts[row.verdict] += 1
+    return n, verdicts, bad
+
+
 print(f"bzcore-l1 model, vars={a.vars} len={a.len} body={a.body}, features={sorted(FEATS)}")
 n, verdicts, bad = check1()
-print("\nCheck 1: try { body } catch e { }  (the to-null desugaring)")
+print("\nCheck 1: prefix ; try { body } catch e { } ; suffix  (existing try / empty catch-all)")
 print(f"  programs enumerated : {n}")
 for k, v in sorted(verdicts.items()):
     print(f"  {k:22s}: {v}")
@@ -142,3 +183,11 @@ c, s, d, sk, w = check2()
 print(f"  with K3.15 switched off -> compared: {c}   identical: {s}   different: {d}")
 if w:
     print(f"  first witness: {w}")
+
+bz.RULES["K3_15_edge_parity"] = True
+n, verdicts, bad = check3()
+print("\nCheck 3: decl r ; prefix ; try { if * { throw new R } else { r := new R } } catch e { } ; suffix")
+print(f"  programs enumerated : {n}")
+for k, v in sorted(verdicts.items()):
+    print(f"  {k:34s}: {v}")
+print(f"  oracle violations among accepted programs: {dict(bad) if bad else 0}")

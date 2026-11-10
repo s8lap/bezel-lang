@@ -83,7 +83,6 @@ error port: not a number: x
 
 == p07_task_of_owning_result
 p07_task_of_owning_result.bzl:14:53: `Task<Result>` declares a move-only value result — `Result` is an owning-classified choice (§15.3), and no §30.5 producer row admits a move-only value result: a `Task<T>`OwningTask<T>` declared over an owning choice (or an owning inline array) is a compile error at the declaration (§30.1, §30.5, §35.4)
-p07_task_of_owning_result.bzl:24:44: cannot `move` the `case` arm binding `c`: a pattern binding is a BORROW whose source is the scrutinee's source (§19.3) and an unmarked named owned binding, or a borrowed scrutinee of any provenance, in scrutinee position stays a BORROWING match, which transfers nothing, so the scrutinee's owner still disposes the value — the transfer would give it a second owner and dispose it twice (§28.3 K8.K3.1, §35.5, v0.307). Announce the consume at the SCRUTINEE instead (`case move <scrutinee> of …`, §35.5's owning match), or read through the binding without transferring.
 -- compile exit 1
 
 == p08_result_across_domain
@@ -94,12 +93,12 @@ bezelc: codegen error: IR verification failed (malformed IR emitted; see report 
 
 == p09_cost_of_failure
 -- compile exit 0
-TryParse failure      : 15 ms for 2000000
-Parse + catch         : 152 ms for 2000000
-Parse + catch, 8 frames: 262 ms for 2000000
+TryParse failure      : 16 ms for 2000000
+Parse + catch         : 149 ms for 2000000
+Parse + catch, 8 frames: 273 ms for 2000000
 TryGetValue miss      : 7 ms for 2000000
 GetOrNull miss        : 7 ms for 2000000
-indexer + catch       : 137 ms for 2000000
+indexer + catch       : 142 ms for 2000000
 TryParse success      : 16 ms for 2000000
 Parse in try, success : 17 ms for 2000000
 -- run exit 0
@@ -166,5 +165,38 @@ p17_numeric_parse_or_null.bzl:14:23: type 'double' has no static method or prope
 -- compile exit 0
 interface binding: P18.BadInput
 guard form: P18.BadInput
+-- run exit 0
+
+== p19_atom_positions
+p19_atom_positions.bzl:49:7: warning: owned value in `c` is implicitly disposed at the end of its scope (§28.3 must-use auto-drop); declare it `using var` to make the scope-bound disposal explicit, or `move` `return` `.Dispose()` `_ := …` to discharge it
+-- compile exit 0
+(1) outer local, good host:
+  open db
+  db <- outer local
+  close db
+(1) outer local, bad host:
+(2) ??, good host:
+  open db
+  db <- coalesced
+  close db
+(2) ??, bad host:
+  open fallback
+  fallback <- coalesced
+  close fallback
+(3) ?., good host:
+  open db
+  db <- temporary
+  after the statement
+(3) ?., bad host:
+  after the statement
+(4) !, good host:
+  open db
+  db <- asserted
+  after the statement
+(5) control, non-nullable owned receiver:
+  open db
+  db <- control
+  close db
+  after the statement
 -- run exit 0
 

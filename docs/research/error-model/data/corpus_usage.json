@@ -41,8 +41,8 @@
    "throw_new": 262,
    "_two_or_more_mechanisms": 10,
    "exception_decl": 51,
-   "result_type": 19,
    "ok_error_ctor": 52,
+   "result_type": 19,
    "_any_result": 52,
    "await": 286,
    "choice_decl": 362,
@@ -56,16 +56,20 @@
    "suppress_all": 1
   },
   "throw_new_by_band": {
-   "defect_band": 310,
-   "recoverable_band": 2,
+   "bug_only": 4,
+   "straddler": 306,
+   "failure_band": 2,
+   "cancellation": 0,
    "base_Exception": 21,
    "other_or_user": 50
   },
   "catch_arm_by_band": {
-   "defect_band": 559,
-   "recoverable_band": 110,
+   "bug_only": 153,
+   "straddler": 406,
+   "failure_band": 95,
+   "cancellation": 14,
    "base_Exception": 73,
-   "other_or_user": 36
+   "other_or_user": 37
   },
   "throw_new_top": [
    [
@@ -300,20 +304,20 @@
    "exception_decl": 8
   },
   "files_with": {
-   "method_decl": 395,
    "choice_decl": 11,
-   "requires": 19,
+   "method_decl": 395,
    "ensures": 8,
-   "throw_new": 41,
+   "requires": 19,
    "coalesce_throw": 5,
+   "throw_new": 41,
    "_any_exception_syntax": 59,
    "_any_failure_signal": 132,
    "using_var": 204,
    "ornull_call": 35,
    "_any_try_or_ornull_call": 75,
    "try_call": 56,
-   "result_type": 9,
    "ok_error_ctor": 11,
+   "result_type": 9,
    "_any_result": 11,
    "_two_or_more_mechanisms": 13,
    "await": 65,
@@ -329,14 +333,18 @@
    "exception_decl": 7
   },
   "throw_new_by_band": {
-   "defect_band": 39,
-   "recoverable_band": 8,
+   "bug_only": 20,
+   "straddler": 19,
+   "failure_band": 8,
+   "cancellation": 0,
    "base_Exception": 0,
    "other_or_user": 5
   },
   "catch_arm_by_band": {
-   "defect_band": 6,
-   "recoverable_band": 6,
+   "bug_only": 0,
+   "straddler": 6,
+   "failure_band": 6,
+   "cancellation": 0,
    "base_Exception": 12,
    "other_or_user": 4
   },
@@ -465,10 +473,10 @@
    "exception_decl": 16,
    "requires": 7,
    "null_forgive": 30,
-   "try_stmt": 59,
    "end_try": 16,
-   "catch_block": 34,
+   "try_stmt": 59,
    "throw_new": 28,
+   "catch_block": 34,
    "_any_exception_syntax": 74,
    "_any_failure_signal": 147,
    "choice_decl": 81,
@@ -486,16 +494,20 @@
    "throw_other": 4
   },
   "throw_new_by_band": {
-   "defect_band": 25,
-   "recoverable_band": 0,
+   "bug_only": 0,
+   "straddler": 25,
+   "failure_band": 0,
+   "cancellation": 0,
    "base_Exception": 5,
    "other_or_user": 8
   },
   "catch_arm_by_band": {
-   "defect_band": 8,
-   "recoverable_band": 2,
+   "bug_only": 3,
+   "straddler": 7,
+   "failure_band": 2,
+   "cancellation": 0,
    "base_Exception": 34,
-   "other_or_user": 17
+   "other_or_user": 15
   },
   "throw_new_top": [
    [
@@ -620,8 +632,8 @@
   "files_with": {
    "method_decl": 4272,
    "using_var": 2256,
-   "try_stmt": 587,
    "catch_block": 559,
+   "try_stmt": 587,
    "_any_exception_syntax": 635,
    "_any_failure_signal": 836,
    "null_forgive": 453,
@@ -648,16 +660,20 @@
    "_all_three_mechanisms": 1
   },
   "throw_new_by_band": {
-   "defect_band": 470,
-   "recoverable_band": 17,
+   "bug_only": 10,
+   "straddler": 460,
+   "failure_band": 17,
+   "cancellation": 0,
    "base_Exception": 199,
    "other_or_user": 416
   },
   "catch_arm_by_band": {
-   "defect_band": 1205,
-   "recoverable_band": 370,
+   "bug_only": 433,
+   "straddler": 772,
+   "failure_band": 350,
+   "cancellation": 16,
    "base_Exception": 522,
-   "other_or_user": 518
+   "other_or_user": 522
   },
   "throw_new_top": [
    [
