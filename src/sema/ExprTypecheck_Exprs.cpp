@@ -7,11 +7,16 @@
                                    // vocabulary predicate (fix #7333)
 #include "sema/GenericParams.hpp"  // genericParamCount / genericParamNameAt — #3143
 #include "sema/SpanFamily.hpp"      // isSpanFamilyTypeRef — §3.3 / §4.14 / §4.15 span views (fix #8211)
+#include "sema/SubstArgs.hpp"        // substituteGenericArgs — fix #8325 (§17.5): the
+                                    // `Contains` parameter's declared type, substituted
+                                    // with the receiver's type arguments (§14.1)
 #include "sema/TypeResolution.hpp"  // fix #2320: typeRefEqual for ctor overload re-resolution
 
 #include <cmath>
 #include <cstdlib>   // std::strtof — fix #5194 (§4.3, v0.312)
 #include <algorithm>  // std::find — for static-method detection via modifiers
+#include <functional> // std::function — fix #8325 (§17.5): the `in` operator's
+                     // structural `Contains` lookup's two authorities
 #include <limits>     // fix #6914: std::numeric_limits
 #include <unordered_set>
 
@@ -10064,6 +10069,242 @@ static bool widenTimeSpanFactorToDouble(SemaContext& ctx,
     return true;
 }
 
+namespace {
+
+// fix #8325 (§17.5, §26.5, §13.1, §22.12, v0.355): the `in` operator's
+// STRUCTURAL `Contains` lookup at a USER-DECLARED receiver.
+//
+// §17.5 (v0.355): "`x in collection` evaluates to `true` if
+// `collection.Contains(x)` is true. The right operand must expose a
+// `Contains(T): bool` method (instance or extension)" and "The `Contains`
+// lookup is structural rather than interface-based: any accessible method
+// named `Contains` taking one parameter of compatible type and returning
+// `bool` qualifies, whether it is an instance member or an extension method
+// (§26)."
+//
+// §26.5's TWO rules decide the ORDER of the search, and they are read here
+// rather than re-derived:
+//   rule 1 — "If `x`'s declared type (or any base type) *declares* any
+//     instance member named `Foo` — of any arity, applicability, or
+//     accessibility — instance resolution is committed and extension blocks
+//     are never consulted for that name on that receiver." So an instance
+//     `Contains` of ANY arity commits the lookup; the extension blocks are
+//     NOT consulted, and the failure is cited against the instance member.
+//   rule 2 — otherwise the extension blocks are searched (§26.5's step 2).
+//
+// The VERDICT is not the lookup's success/failure alone: §17.5 requires an
+// ACCESSIBLE member, ONE parameter, and a `bool` result, and each failure
+// has its own reason (§13.1 / §22.6 / §17.5) — so the lookup reports WHICH
+// requirement failed, and the caller words the diagnostic from it.
+enum class InContainsVerdict {
+    Admitted,       // an accessible one-parameter `Contains` returning `bool`
+    NoMember,       // no `Contains` at all — neither instance nor extension
+    Inaccessible,   // an instance `Contains` exists, but none is accessible
+    WrongArity,     // an accessible `Contains` exists, but none takes exactly
+                    // one parameter
+    NotBool,        // a one-parameter `Contains` exists, but it does not
+                    // return `bool`
+    StaticOnly,     // the only `Contains` is a `static` member — §22.12: a
+                    // static member is a member of the TYPE, not an
+                    // accessible instance member of the receiver, so it does
+                    // not supply the call (and, being no INSTANCE member, it
+                    // does not commit the lookup either — §26.5 rule 1)
+};
+
+// The two §26.5/§13.1 questions the lookup asks that need the ExprTC's own
+// (private) authorities. They are passed IN by the caller — which is a
+// member function and may reach them — so this file-local helper stays a
+// free function and the busy `ExprTypecheck_Calls.cpp` is untouched.
+struct InContainsAuthorities {
+    // §26.5 rule 2 — the extension search. `arity` < 0 asks for a member of
+    // ANY arity (the probe that tells "a `Contains` exists, but not with one
+    // parameter" from "no `Contains` at all").
+    std::function<Symbol*(std::string_view name, std::ptrdiff_t arity)>
+        lookupExtension;
+    // §13.1 — is this member accessible at the call site?
+    std::function<bool(const MemberSymbol*)> isAccessible;
+};
+
+struct InContainsResult {
+    InContainsVerdict verdict = InContainsVerdict::NoMember;
+    // The member the verdict is ABOUT (the admitted one; the one the
+    // diagnostic cites). Null when no member of the name was found at all.
+    MethodSymbol* method = nullptr;
+    // The cited member's parameter count (the diagnostic names it).
+    std::size_t arity = 0;
+    // The cited member is a `static` one (the §22.12 case).
+    bool isStatic = false;
+};
+
+// §22.12: is this method a STATIC member? A static member is reached
+// through the TYPE, never through an instance — so it is not the instance
+// member §26.5 rule 1 speaks of, and it does not supply the `in` operator's
+// `c.Contains(x)` call. Read off the member's own modifier list, the same
+// spelling the compiler's other static-member tests use.
+bool inOperatorMethodIsStatic(const MethodSymbol* ms) {
+    if (!ms) return false;
+    for (std::string_view mod : ms->modifiers)
+        if (mod == "static") return true;
+    return false;
+}
+
+// §17.5: the selected `Contains` must return `bool`. The declared return
+// type is read off the method's own declaration; an IMPORTED member (no
+// AST declaration) has no readable return type here, and is admitted (the
+// §22.6/§2.5 seam decides the cross-module shape, not this lookup).
+bool inOperatorContainsReturnsBool(const MethodSymbol* ms,
+                                   const SemaContext& ctx) {
+    if (!ms) return false;
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md || !md->returnType) return true;   // unknown → admit
+    const TypeRef* rt = ctx.resolvedType(*md->returnType);
+    if (!rt) return true;
+    return rt->kind == TypeRef::Kind::Primitive &&
+           rt->primitive == PrimitiveType::Bool && !rt->nullable;
+}
+
+// A short spelling of a resolved type, for a diagnostic that NAMES the type
+// (the `Contains` a user declared returns `int`, not `bool`). The primitive's
+// keyword or the Named head's name; anything else is spelled generically —
+// the diagnostic's POINT is the rule it cites, not the type's full
+// spelling.
+std::string inOperatorTypeSpelling(const TypeRef* t) {
+    if (!t) return "?";
+    if (t->kind == TypeRef::Kind::Primitive) {
+        switch (t->primitive) {
+            case PrimitiveType::Bool:    return "bool";
+            case PrimitiveType::Char:    return "char";
+            case PrimitiveType::String:  return "string";
+            case PrimitiveType::Byte:    return "byte";
+            case PrimitiveType::SByte:   return "sbyte";
+            case PrimitiveType::Short:   return "short";
+            case PrimitiveType::UShort:  return "ushort";
+            case PrimitiveType::Int:     return "int";
+            case PrimitiveType::UInt:    return "uint";
+            case PrimitiveType::Long:    return "long";
+            case PrimitiveType::ULong:   return "ulong";
+            case PrimitiveType::Float:   return "float";
+            case PrimitiveType::Double:  return "double";
+            case PrimitiveType::Decimal: return "decimal";
+            case PrimitiveType::Object:  return "Object";
+            case PrimitiveType::None:    break;
+        }
+        return "?";
+    }
+    if (t->kind == TypeRef::Kind::Named) {
+        const std::string_view h = t->headName();
+        return h.empty() ? std::string("?") : std::string(h);
+    }
+    if (t->kind == TypeRef::Kind::Unit) return "()";
+    return "?";
+}
+
+// §17.5's structural lookup at a user-declared receiver. See the verdict
+// table above.
+InContainsResult lookupInOperatorContains(const SemaContext& ctx,
+                                          const TypeRef* recvTy,
+                                          const InContainsAuthorities& auth) {
+    InContainsResult res;
+    if (!recvTy || !recvTy->declaration) return res;
+
+    // §26.5 rule 1 — the receiver's declared type (or any base type) and the
+    // `Contains` members it declares. The walk is the hierarchy walk the
+    // member lookup itself uses (the type, then its base types, breadth
+    // first), so a `Contains` INHERITED from a base is found here too.
+    std::vector<TypeSymbol*> frontier{recvTy->declaration};
+    std::vector<MethodSymbol*> instance;
+    std::vector<MethodSymbol*> statics;
+    for (std::size_t i = 0; i < frontier.size(); ++i) {
+        TypeSymbol* t = frontier[i];
+        for (Symbol* m : t->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (!ms || ms->name != "Contains") continue;
+            if (inOperatorMethodIsStatic(ms))
+                statics.push_back(ms);
+            else
+                instance.push_back(ms);
+        }
+        for (TypeSymbol* b : t->baseTypes)
+            if (b) frontier.push_back(b);
+    }
+
+    // §26.5 rule 1 — an INSTANCE member of the name commits the lookup: the
+    // extension blocks are never consulted, and the failure is cited against
+    // the instance member (§26.5 rule 1: "the call is a compile error citing
+    // the instance member(s)").
+    if (!instance.empty()) {
+        MethodSymbol* firstAccessible = nullptr;
+        MethodSymbol* oneParam = nullptr;
+        for (MethodSymbol* ms : instance) {
+            if (auth.isAccessible && !auth.isAccessible(ms)) continue;
+            if (!firstAccessible) firstAccessible = ms;
+            if (ms->params.size() == 1) {
+                oneParam = ms;
+                break;
+            }
+        }
+        if (!firstAccessible) {
+            // Every `Contains` the type declares is inaccessible here (§13.1).
+            res.verdict = InContainsVerdict::Inaccessible;
+            res.method = instance.front();
+            res.arity = instance.front()->params.size();
+            return res;
+        }
+        if (!oneParam) {
+            // §17.5: "taking one parameter" — none of the accessible
+            // overloads takes exactly one.
+            res.verdict = InContainsVerdict::WrongArity;
+            res.method = firstAccessible;
+            res.arity = firstAccessible->params.size();
+            return res;
+        }
+        if (!inOperatorContainsReturnsBool(oneParam, ctx)) {
+            // §17.5: "returning `bool`" — the selected `Contains` does not.
+            res.verdict = InContainsVerdict::NotBool;
+            res.method = oneParam;
+            res.arity = 1;
+            return res;
+        }
+        res.verdict = InContainsVerdict::Admitted;
+        res.method = oneParam;
+        res.arity = 1;
+        return res;
+    }
+
+    // §26.5 rule 2 — no instance member of the name: the extension blocks.
+    if (auth.lookupExtension) {
+        if (Symbol* ext = auth.lookupExtension("Contains", 1)) {
+            auto* ms = dynamic_cast<MethodSymbol*>(ext);
+            if (ms && (!auth.isAccessible || auth.isAccessible(ms))) {
+                res.method = ms;
+                res.arity = 1;
+                res.verdict = inOperatorContainsReturnsBool(ms, ctx)
+                                  ? InContainsVerdict::Admitted
+                                  : InContainsVerdict::NotBool;
+                return res;
+            }
+        }
+        if (auth.lookupExtension("Contains", -1)) {
+            // A `Contains` exists, but not with one parameter.
+            res.verdict = InContainsVerdict::WrongArity;
+            return res;
+        }
+    }
+    if (!statics.empty()) {
+        // §22.12 — a `static` member is a member of the TYPE, not an
+        // accessible instance member of the receiver.
+        res.verdict = InContainsVerdict::StaticOnly;
+        res.method = statics.front();
+        res.arity = statics.front()->params.size();
+        res.isStatic = true;
+        return res;
+    }
+    res.verdict = InContainsVerdict::NoMember;
+    return res;
+}
+
+}  // namespace
+
 void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                              bool& stringArithRuleReached) {
     const auto& op = be.op;
@@ -11437,6 +11678,212 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 "\xC2\xA7""16.6, \xC2\xA7""7.11); narrow first "
                 "(`x <> null and \xE2\x80\xA6` (\xC2\xA7""7.4), `??` "
                 "(\xC2\xA7""7.7), or `!` (\xC2\xA7""7.8))");
+        }
+        // fix #8325 (§17.5, §7.4, §26.5, §13.1, §22.12, §5.1, v0.355):
+        // `x in c` over a USER-DECLARED receiver — the §17.5 STRUCTURAL
+        // `Contains` lookup, decided HERE, at the `in` site.
+        //
+        // §17.5: "`x in collection` evaluates to `true` if
+        // `collection.Contains(x)` is true. The right operand must expose a
+        // `Contains(T): bool` method (instance or extension)" and "The
+        // `Contains` lookup is structural rather than interface-based: any
+        // accessible method named `Contains` taking one parameter of
+        // compatible type and returning `bool` qualifies, whether it is an
+        // instance member or an extension method (§26)."
+        //
+        // BEFORE this, the operator's shape was decided ONLY in codegen, and
+        // only for a receiver whose static type is a built-in collection
+        // interface: every user-declared receiver reached the backend and
+        // died with "not yet implemented: codegen for this `in` expression
+        // form" — the VALID shapes (a generic `Bag<T>`, an extension
+        // `Contains`, an interface-typed receiver) AND the INVALID ones (no
+        // `Contains`, a non-`bool` one, a two-parameter one, a `static` one,
+        // a nullable receiver) alike. §17.5 decides BOTH questions, so both
+        // are decided HERE: the valid shapes are admitted (and the admitted
+        // member is published for the backend's synthetic-call lowering), and
+        // the invalid ones get a diagnostic that NAMES the rule they break.
+        //
+        // The receiver gate: a Named type with a USER-DECLARED declaration
+        // (`isUserDeclaredTypeSym`, #5272's discriminator — the built-in
+        // collection families are DECLARATION-LESS builtins (§2.5) and the
+        // compiler-intrinsic value builtins (`Range`, `DateTime`, …) are
+        // stubs with no declaration, so both keep their own lowering arms).
+        // A user-declared class or interface is the §17.5 receiver family
+        // this rule is about.
+        if (be.left && be.right && inLt && inRt &&
+            inRt->kind == TypeRef::Kind::Named && inRt->declaration &&
+            isUserDeclaredTypeSym(inRt->declaration) &&
+            (inRt->declaration->kind == ast::TypeDeclKind::Class ||
+             inRt->declaration->kind == ast::TypeDeclKind::Interface)) {
+            // §7.4 — a NULLABLE receiver. `x in c` IS the call
+            // `c.Contains(x)`, and a member access on a nullable value
+            // requires narrowing first — the written call's own refusal, at
+            // the `in` site (§17.5, §7.4).
+            bool inRecvNarrowed = false;
+            std::string inRecvName;
+            if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                    be.right.get())) {
+                inRecvName = std::string(rid->name);
+                Symbol* rsym = lookupName(rid->name);
+                if (rsym && (dynamic_cast<LocalSymbol*>(rsym) ||
+                             dynamic_cast<ParameterSymbol*>(rsym)))
+                    inRecvNarrowed = isKnownNonNull(rsym);
+            }
+            if (inRt->nullable && !inRecvNarrowed) {
+                std::string nm = inRecvName.empty() ? "c" : inRecvName;
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    std::string("member access `.Contains` on a nullable "
+                                "value requires narrowing it to non-null "
+                                "first (§7.4): guard with `if ") + nm +
+                        " <> null`, force-unwrap with `" + nm +
+                        "!`, or use the null-conditional `" + nm +
+                        "?.Contains` (`x in c` is `c.Contains(x)`, §17.5)");
+            } else {
+                // The §17.5 structural lookup. The two authorities it needs
+                // (§26.5's extension search and §13.1's accessibility test)
+                // are the ExprTC's own — they are handed IN, so this file's
+                // helper stays a free function and the busy
+                // `ExprTypecheck_Calls.cpp` is untouched.
+                InContainsAuthorities inAuth;
+                inAuth.lookupExtension =
+                    [this, inRt](std::string_view name,
+                                 std::ptrdiff_t arity) -> Symbol* {
+                        return lookupExtensionMember(
+                            inRt, name, nullptr, SourceLocation{},
+                            /*reportAmbiguity=*/false, arity);
+                    };
+                inAuth.isAccessible = [this](const MemberSymbol* ms) -> bool {
+                    return isMemberAccessible(ms);
+                };
+                InContainsResult inRes =
+                    lookupInOperatorContains(ctx_, inRt, inAuth);
+                const std::string inRecvTypeName =
+                    std::string(inRt->declaration->name);
+                // The §17.5 rule, spelled once — every verdict below cites it.
+                const std::string inRule =
+                    "`x in c` is the call `c.Contains(x)`, and the right "
+                    "operand must expose a `Contains(T): bool` method "
+                    "(instance or extension): the `Contains` lookup is "
+                    "structural rather than interface-based — any accessible "
+                    "method named `Contains` taking one parameter of "
+                    "compatible type and returning `bool` qualifies, "
+                    "whether it is an instance member or an extension method "
+                    "(§17.5, §26). ";
+                switch (inRes.verdict) {
+                    case InContainsVerdict::Admitted: {
+                        // The admitted member is PUBLISHED on the `in` node:
+                        // the backend's synthetic-call lowering reads it, so
+                        // `x in c` lowers as the very call `c.Contains(x)`
+                        // (§17.5) — the same lowering the written call
+                        // reaches, with no second implementation of the
+                        // search.
+                        ctx_.setExprSymbol(&be, inRes.method);
+                        // §5.1 — the left operand is admitted exactly when
+                        // it is admissible as that call's argument (§17.5:
+                        // "taking one parameter of compatible type"). The
+                        // parameter's DECLARED type is substituted with the
+                        // receiver's type arguments first (§14.1), so a
+                        // generic `Contains(item: T)` is checked against the
+                        // CONCRETE `T` the receiver was instantiated with.
+                        TypeRef* inParamTy = nullptr;
+                        if (inRes.method && !inRes.method->params.empty()) {
+                            auto* ps = dynamic_cast<ParameterSymbol*>(
+                                inRes.method->params[0]);
+                            if (ps)
+                                inParamTy =
+                                    ps->resolvedDeclType
+                                        ? ps->resolvedDeclType
+                                        : (ps->declType
+                                               ? ctx_.resolvedType(*ps->declType)
+                                               : nullptr);
+                        }
+                        if (inParamTy && inRes.method->parent &&
+                            inRes.method->parent == inRt->declaration &&
+                            !inRt->genericArgs.empty() &&
+                            !inRes.method->parent->genericParams.empty()) {
+                            std::unordered_map<std::string_view, TypeRef*>
+                                inSubst;
+                            const std::size_t inN = std::min(
+                                inRt->genericArgs.size(),
+                                inRes.method->parent->genericParams.size());
+                            for (std::size_t i = 0; i < inN; ++i)
+                                inSubst[inRes.method->parent->genericParams[i]
+                                             ->name] = inRt->genericArgs[i];
+                            if (!inSubst.empty())
+                                inParamTy = substituteGenericArgs(
+                                    inParamTy, SubstArgs{ctx_, inSubst});
+                        }
+                        if (inParamTy)
+                            checkAssignable(
+                                inLt, inParamTy,
+                                be.left->span.begin.line != 0
+                                    ? be.left->span.begin
+                                    : be.span.begin,
+                                "left operand of `in` over `" +
+                                    inRecvTypeName + "`",
+                                be.left.get());  // §7.4 / §27.6 — narrowing-aware
+                        break;
+                    }
+                    case InContainsVerdict::NoMember:
+                        ctx_.diagnostics().report(
+                            Severity::Error, be.span.begin,
+                            inRule + "No accessible method named `Contains` "
+                                     "was found on type `" + inRecvTypeName +
+                                     "`.");
+                        break;
+                    case InContainsVerdict::StaticOnly:
+                        ctx_.diagnostics().report(
+                            Severity::Error, be.span.begin,
+                            inRule + "The only `Contains` type `" +
+                                inRecvTypeName +
+                                "` declares is a `static` member, and §22.12 "
+                                "makes a static member a member of the TYPE, "
+                                "not an accessible instance member of the "
+                                "receiver — declare it as an instance method "
+                                "(`public method Contains(item: T): bool …`) "
+                                "or reach it through the type (`" +
+                                inRecvTypeName + ".Contains(…)`).");
+                        break;
+                    case InContainsVerdict::Inaccessible:
+                        ctx_.diagnostics().report(
+                            Severity::Error, be.span.begin,
+                            inRule + "The method `Contains` on type `" +
+                                inRecvTypeName +
+                                "` is not accessible here (§13.1) — the "
+                                "structural lookup qualifies an ACCESSIBLE "
+                                "method only.");
+                        break;
+                    case InContainsVerdict::WrongArity:
+                        ctx_.diagnostics().report(
+                            Severity::Error, be.span.begin,
+                            inRule + "The method `Contains` on type `" +
+                                inRecvTypeName + "` takes " +
+                                std::to_string(inRes.arity) +
+                                " parameter(s); the structural lookup "
+                                "qualifies a method taking exactly ONE "
+                                "parameter — the element tested.");
+                        break;
+                    case InContainsVerdict::NotBool: {
+                        std::string retName = "?";
+                        if (inRes.method) {
+                            auto* md = dynamic_cast<const ast::MethodDecl*>(
+                                inRes.method->decl);
+                            if (md && md->returnType)
+                                retName = inOperatorTypeSpelling(
+                                    ctx_.resolvedType(*md->returnType));
+                        }
+                        ctx_.diagnostics().report(
+                            Severity::Error, be.span.begin,
+                            inRule + "The method `Contains` on type `" +
+                                inRecvTypeName +
+                                "` takes one parameter but returns `" +
+                                retName + "`, not `bool` — the `in` operator "
+                                "produces `bool` (§17.5).");
+                        break;
+                    }
+                }
+            }
         }
         ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         return;

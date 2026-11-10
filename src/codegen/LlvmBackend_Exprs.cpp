@@ -13509,6 +13509,91 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 }
             }
         }
+        // fix #8325 (§17.5, §26.5, v0.355): `x in c` over a USER-DECLARED
+        // receiver — the §17.5 STRUCTURAL `Contains` lookup, decided in SEMA.
+        //
+        // §17.5: "`x in collection` evaluates to `true` if
+        // `collection.Contains(x)` is true. The right operand must expose a
+        // `Contains(T): bool` method (instance or extension)" and "The
+        // `Contains` lookup is structural rather than interface-based: any
+        // accessible method named `Contains` taking one parameter of
+        // compatible type and returning `bool` qualifies, whether it is an
+        // instance member or an extension method (§26)."
+        //
+        // The receiver's `Contains` was RESOLVED by SEMA (the lookup's result
+        // is published on the `in` node), so this arm does not search again:
+        // it lowers the operator as the very call `c.Contains(x)` — the same
+        // synthetic-call shape the built-in collection interface arm above
+        // uses, and for the same reasons:
+        //   * the receiver and the element are evaluated ONCE, in the call's
+        //     own order (§22.5), and their VALUES are pinned into the
+        //     synthetic call's nodes (the null-conditional twin's
+        //     discipline) — every classifier that reads the receiver's or the
+        //     argument's SHAPE sees the same expression the written call
+        //     would;
+        //   * the synthetic call is lowered through `lowerExpr`, so the
+        //     ORDINARY call lowering runs and the receiver's OWN type decides
+        //     the dispatch: a generic class's per-instantiation
+        //     specialization (§14.1), an interface's vtable dispatch (§11.2),
+        //     an extension's `this` binding (§26.1) — none of which is
+        //     re-implemented here.
+        //
+        // A receiver with NO admitted `Contains` never reaches this arm:
+        // SEMA refuses it (§17.5's rule, at the `in` site), so the compile
+        // fails before the backend runs.
+        if (bin.right) {
+            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                    ctx_.exprSymbol(bin))) {
+                llvm::Value* recvVal = lowerExpr(*bin.right);
+                llvm::Value* elemVal = lowerExpr(*bin.left);
+                if (!recvVal || !elemVal) return nullptr;
+                auto& mutBin = const_cast<ast::BinaryExpr&>(bin);
+                const ast::Expr* rcvKey = mutBin.right.get();
+                const ast::Expr* elemKey = mutBin.left.get();
+                exprValueOverride_[rcvKey] = recvVal;
+                exprValueOverride_[elemKey] = elemVal;
+
+                auto synth = std::make_unique<ast::CallExpr>();
+                synth->span = bin.span;
+                {
+                    auto callee = std::make_unique<ast::MemberAccessExpr>();
+                    callee->span = bin.span;
+                    callee->member = "Contains";
+                    callee->target = std::move(mutBin.right);
+                    ctx_.setExprType(
+                        callee.get(),
+                        ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+                    // The §17.5 lookup's RESULT — the member this call binds
+                    // to. The ordinary dispatch reads the callee's symbol,
+                    // so this is what makes the synthetic call THE call
+                    // `c.Contains(x)` and not a re-implementation of it.
+                    ctx_.setExprSymbol(callee.get(), ms);
+                    synth->callee = std::move(callee);
+                }
+                {
+                    ast::CallArgument arg;
+                    arg.value = std::move(mutBin.left);
+                    synth->args.push_back(std::move(arg));
+                }
+                ctx_.setExprType(
+                    synth.get(),
+                    ctx_.primitiveTypeRef(sema::PrimitiveType::Bool));
+                llvm::Value* result = lowerExpr(*synth);
+                // Put the moved nodes back and drop the pins, whether or
+                // not the call lowered.
+                mutBin.right = std::move(
+                    static_cast<ast::MemberAccessExpr*>(synth->callee.get())
+                        ->target);
+                mutBin.left = std::move(synth->args[0].value);
+                exprValueOverride_.erase(rcvKey);
+                exprValueOverride_.erase(elemKey);
+                if (!result) return nullptr;
+                // Keep the synthetic tree (and the exprType keys it
+                // carries) alive — the null-conditional twin's discipline.
+                inOperatorSynthCalls_.push_back(std::move(synth));
+                return result;
+            }
+        }
         // #628 (part 1): unhandled `in` form — emit a hard error so the
         // caller sees a failed compile rather than silent garbage IR.
         ctx_.diagnostics().report(

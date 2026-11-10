@@ -46,10 +46,18 @@
 //  (C) The polymorphic COLLECTION interfaces keep the #853 refusal — the
 //      diagnostic is BYTE-IDENTICAL to the one `c.Contains(x)` gets, which is
 //      the point: `x in c` IS `c.Contains(x)`.
-//  (D) A USER class receiver is NOT admitted by this fix (review of a77442ad:
-//      the user-class arm accepted a `private` Contains from another class,
-//      §13.1, and a nullable receiver, §7.4, which crashed at run time). Those
-//      programs keep the base's refusal; the rows pin it.
+//  (D) A USER class receiver is NOT admitted by THIS fix (#8260): the review of
+//      a77442ad measured the user-class arm accepting a `private` Contains from
+//      another class, §13.1, and a nullable receiver, §7.4, which crashed at
+//      run time. Those programs keep the base's refusal; the rows pin it.
+//      ⇒ #8325 LATER moved this receiver family: §17.5's STRUCTURAL lookup
+//      now decides it in SEMA, so a user receiver with an ACCESSIBLE instance
+//      `Contains` COMPILES, and the two refusals the review measured are
+//      refusals with a rule NAMED at the `in` site (§13.1's accessibility,
+//      §7.4's narrowing) instead of the backend's "not yet implemented".
+//      The four (D) rows below are the #8325 flip: the other rows of this
+//      file — the interface family, the control, the #853 refusals, the
+//      function-typed element, the §5.1 left-operand check — are untouched.
 //  (G) A NULLABLE interface receiver gets the written call's §7.4 refusal.
 //  (E) The function-typed element follows the `Contains` call EXACTLY (#5520 /
 //      #7598): ADMITTED at an `IList` receiver (`IList<T>.Contains` is stdlib
@@ -241,12 +249,21 @@ const char* kIReadOnlyCollectionRefused =
     "end C;";
 
 // ---------------------------------------------------------------------------
-// (D) USER-class receivers stay refused (base behaviour). The review of
-// a77442ad measured the user-class arm accepting a `private` Contains from
-// another class (§13.1; §17.5 says "any accessible method") and a nullable
-// receiver (§7.4) that segfaulted at run time.
+// (D) USER-class receivers. #8260 kept them all refused; #8325 moved this
+// receiver family to §17.5's STRUCTURAL `Contains` lookup, decided in SEMA
+// (spec §17.5, v0.355 — "any accessible method named `Contains` taking one
+// parameter of compatible type and returning `bool` qualifies, whether it is
+// an instance member or an extension method"). So:
+//   * an ACCESSIBLE instance `Contains` on a non-null receiver COMPILES and
+//     answers the data;
+//   * a `private Contains` reached from another class is refused with §13.1's
+//     accessibility, NAMED at the `in` site (the review of a77442ad measured
+//     that arm ACCEPTING it);
+//   * a NULLABLE receiver that §7.4 has not narrowed is refused with §7.4's
+//     narrowing remedies, NAMED at the `in` site (the review measured that
+//     arm CRASHING at run time on `Q(null)`).
 // ---------------------------------------------------------------------------
-const char* kUserClassPublicContainsRefused =
+const char* kUserClassPublicContainsAdmitted =
     "module M; "
     "public class Bag "
     "  private owned _items: Array<int>; "
@@ -530,15 +547,17 @@ BEZEL_TEST(codegen_in_over_interface_receiver_8260,
 }
 
 // ---------------------------------------------------------------------------
-// (D) user-class receivers stay refused; the base's diagnostic.
+// (D) USER-class receivers — the #8325 flip. The four rows below are the
+// ones #8325's §17.5 structural lookup moved: the first now COMPILES (an
+// accessible instance `Contains` on a non-null receiver), and the other three
+// are refused by the rule they break, NAMED at the `in` site — the backend's
+// "not yet implemented" message is gone from this receiver family.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_in_over_interface_receiver_8260,
-           user_class_receiver_stays_refused) {
-    JitResult r = runAotChecked(kUserClassPublicContainsRefused);
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasError(
-        r, "not yet implemented: codegen for this `in` expression form"));
+           user_class_receiver_is_admitted_p8325) {
+    JitResult r = runAot(kUserClassPublicContainsAdmitted);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
 BEZEL_TEST(codegen_in_over_interface_receiver_8260,
@@ -546,7 +565,12 @@ BEZEL_TEST(codegen_in_over_interface_receiver_8260,
     JitResult r = runAotChecked(kUserClassPrivateContains);
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasError(
+    // §13.1 — the structural lookup qualifies an ACCESSIBLE member only, and
+    // the rule is NAMED at the `in` site.
+    BEZEL_EXPECT_TRUE(hasError(r, "is not accessible here"));
+    BEZEL_EXPECT_TRUE(hasError(r, "13.1"));
+    // The backend's layer is gone.
+    BEZEL_EXPECT_FALSE(hasError(
         r, "not yet implemented: codegen for this `in` expression form"));
 }
 
@@ -555,7 +579,11 @@ BEZEL_TEST(codegen_in_over_interface_receiver_8260,
     JitResult r = runAotChecked(kUserClassNullableReceiverCrash);
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // §7.4 — the written call's refusal, at the `in` site.
     BEZEL_EXPECT_TRUE(hasError(
+        r, "member access `.Contains` on a nullable value requires "
+           "narrowing it to non-null first (§7.4)"));
+    BEZEL_EXPECT_FALSE(hasError(
         r, "not yet implemented: codegen for this `in` expression form"));
 }
 
@@ -565,6 +593,9 @@ BEZEL_TEST(codegen_in_over_interface_receiver_8260,
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasError(
+        r, "member access `.Contains` on a nullable value requires "
+           "narrowing it to non-null first (§7.4)"));
+    BEZEL_EXPECT_FALSE(hasError(
         r, "not yet implemented: codegen for this `in` expression form"));
 }
 
