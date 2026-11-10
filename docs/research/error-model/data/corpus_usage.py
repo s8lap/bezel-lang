@@ -78,20 +78,34 @@ def cpp_literals(src):
     return "\n".join(parts)
 
 # ---------------------------------------------------------------- patterns
-DEFECT = {
-    "ContractViolationException", "ArgumentException", "ArgumentNullException",
-    "ArgumentOutOfRangeException", "ArithmeticException", "OverflowException",
-    "DivideByZeroException", "InvalidOperationException", "DisposedAccessException",
+# Band lists.  FAILURE is exactly the set README §8.1 proposes for the failure marker (the
+# types the standard library declares today).  STRADDLER types are raised both for bugs and
+# for conditions a correct program can meet (README §10.2), so an arm naming one cannot be
+# assigned to a band by its type.  OperationCanceledException is its own column: design F
+# puts it in neither band.
+BUG = {
+    "ContractViolationException", "ArgumentNullException", "ArgumentOutOfRangeException",
+    "ArithmeticException", "DivideByZeroException", "DisposedAccessException",
     "NotImplementedException", "NullReferenceException", "IndexOutOfRangeException",
     "MatchFailureException", "KeyNotFoundException", "TypeInitializationException",
+    "StackOverflowException",
 }
-RECOVERABLE = {
-    "IOException", "FileNotFoundException", "DirectoryNotFoundException",
-    "EndOfStreamException", "TimeoutException", "OperationCanceledException",
-    "FormatException", "SerializationException", "ChannelClosedException",
-    "ChannelFullException", "DomainFaultedException", "JsonParseException",
-    "UnauthorizedAccessException", "PathTooLongException",
+STRADDLER = {"InvalidOperationException", "OverflowException", "ArgumentException"}
+FAILURE = {
+    "FormatException", "IOException", "FileNotFoundException", "DirectoryNotFoundException",
+    "EndOfStreamException", "PathTooLongException", "TimeoutException",
+    "SerializationException", "ChannelClosedException", "ChannelFullException",
 }
+CANCEL = {"OperationCanceledException"}
+BANDS = ("bug_only", "straddler", "failure_band", "cancellation", "base_Exception", "other_or_user")
+
+def band_of(t):
+    if t in BUG: return "bug_only"
+    if t in STRADDLER: return "straddler"
+    if t in FAILURE: return "failure_band"
+    if t in CANCEL: return "cancellation"
+    if t == "Exception": return "base_Exception"
+    return "other_or_user"
 
 P = {
     "throw_new":      re.compile(r"\bthrow\s+new\s+([A-Za-z_][\w.]*)"),
@@ -224,11 +238,10 @@ for name, files in corpora.items():
     allthrow.update(throw_types)
     allarms.update(arm_types)
     def band(counter):
-        d = sum(n for t, n in counter.items() if t in DEFECT)
-        r = sum(n for t, n in counter.items() if t in RECOVERABLE)
-        b = counter.get("Exception", 0)
-        o = sum(counter.values()) - d - r - b
-        return {"defect_band": d, "recoverable_band": r, "base_Exception": b, "other_or_user": o}
+        out = {k: 0 for k in BANDS}
+        for t, n in counter.items():
+            out[band_of(t)] += n
+        return out
     result[name] = {
         "files": len(files),
         "programs": programs,
@@ -254,15 +267,14 @@ with open(os.path.join(out, "corpus_usage.tsv"), "w") as f:
     for k in fkeys:
         vals = [result[c]["files_with"].get(k, 0) for c in result]
         f.write(f"files_with:{k}\t" + "\t".join(map(str, vals)) + f"\t{sum(vals)}\n")
-    for b in ("defect_band", "recoverable_band", "base_Exception", "other_or_user"):
+    for b in BANDS:
         vals = [result[c]["throw_new_by_band"][b] for c in result]
         f.write(f"throw_new:{b}\t" + "\t".join(map(str, vals)) + f"\t{sum(vals)}\n")
-    for b in ("defect_band", "recoverable_band", "base_Exception", "other_or_user"):
+    for b in BANDS:
         vals = [result[c]["catch_arm_by_band"][b] for c in result]
         f.write(f"catch_arm:{b}\t" + "\t".join(map(str, vals)) + f"\t{sum(vals)}\n")
 with open(os.path.join(out, "corpus_throw_types.tsv"), "w") as f:
     f.write("exception\tthrow_new_sites\tcatch_arms\tband\n")
     for t in sorted(set(allthrow) | set(allarms), key=lambda t: -(allthrow[t] + allarms[t])):
-        b = "defect" if t in DEFECT else "recoverable" if t in RECOVERABLE else "base" if t == "Exception" else "other/user"
-        f.write(f"{t}\t{allthrow[t]}\t{allarms[t]}\t{b}\n")
+        f.write(f"{t}\t{allthrow[t]}\t{allarms[t]}\t{band_of(t)}\n")
 print(open(os.path.join(out, "corpus_usage.tsv")).read())

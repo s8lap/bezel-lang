@@ -6,6 +6,12 @@ issue was filed. Pins: documents at **v0.355**, tree `a30bb11df`, compiler relea
 (`bezelc 0.0.0-a30bb11d`). Web access was not used; the prior-art section is written from
 memory and says so.*
 
+*Revised once after a non-author review of the first version (`ef4dcf78d`, accepted with
+notes). The changes: the recommendation is now staged (§8.2); the band table separates the
+exception types used in both bands (§2.3); the ownership-model claims are narrowed to what
+the model covers (§5.2); the atom is defined once, with its positions (§8.1); the protection
+it gives up is named (§3, §9.1).*
+
 *Evidence labels. **MEASURED**: produced by a script in `data/`, a program in `probes/` or
 `model/`, re-runnable. **QUOTED**: text of a repository document or source file, cited.
 **HYPOTHESIS**: a judgement or a prediction; not evidence.*
@@ -20,26 +26,42 @@ design protects?
 **The answer.** Not one *mechanism*. The languages that began with one grew a second:
 exception-only languages added value-returning duals, value-only languages kept a panic (§6).
 The designs that would force one on Bezel either give up cleanup on the bug path or make every
-caller mark errors it never handles (§4). But one *rule* is achievable, and it is smaller than
-the five-band rule it replaces. It needs one marker on exception types, one expression form,
-and no new ownership rule. `Result`-first stays declined: none of proposal 0076 §6's four
-conditions is met.
+caller mark errors it never handles (§4). One *rule* is achievable, smaller than the five-band
+rule it replaces, in two halves. The first half costs nothing the design protects and is
+recommended now. The second half gives up one recorded protection ("catch at boundaries") and
+is recommended only behind an evidence gate. `Result`-first stays declined: none of proposal
+0076 §6's four conditions is met.
 
 **The one rule** (two sentences, for the user):
 
 > A bug is a *fault* and an expected problem is a *failure*; both are thrown, both clean up,
 > and only failures are meant to be handled. At each call the caller decides what a failure
 > means: write nothing to pass it up, `catch` it to handle it, or write `(try call)` to get
-> `null` instead; `!` does the reverse for a value that must be there.
+> `null` instead (`false`, for an operation that returns nothing); `!` does the reverse for a
+> value that must be there.
+
+The first sentence is the half recommended now. The `(try call)` stance in the second is the
+deferred half; the other stances exist today.
 
 The API author's side of the same rule: *state each operation once.* A query whose answer may
 be "nothing there" returns `T?`. An operation that may be unable to do its job throws a
-failure. A broken promise by the caller is a `requires` or a fault. No duals.
+failure. A broken promise by the caller is a `requires` or a fault.
 
-**What is new** (design F, §8): a marker for the failure band (working name `IFailure`,
-implemented by the expected-failure exception types) and a paren atom `(try E)` that turns a
-failure into `null`. Probe p16 shows the band split already compiles and runs today as a
-library convention; `(try E)` is sugar for a `try`/`catch` the language already has.
+**Recommended now (stages 0–1, §8).** A marker for the failure band (working name `IFailure`),
+implemented by the expected-failure exception types. It gives the taught model its three
+kinds (fault, failure, absence) and gives `catch` a boundary arm, `IFailure => …`, that takes
+every expected failure and lets every bug through; today's `Exception => …` arm takes both,
+and the corpora have 641 of those. It works today as a library convention (probe p16). It
+reopens no decline and gives up none of the nine protections of §3.
+
+**Designed here, deferred (stage 2).** A paren atom `(try E)` that turns a failure into
+`null`. It is what would let the library state each operation once. It is deferred because
+(a) it is an interior catch-and-branch by construction, so it gives up protection 5 of §3,
+and it reopens decline D-0005, which proposal 0076 §7 records as "Untouched and *reinforced*
+— on both grounds"; (b) the evidence for it is library and test-corpus counts, not observed
+programs, the class of evidence the project's gates decline to act on; (c) the ownership
+model does not cover its result channel, and r40 leaks at one of the positions it would be
+used in (probe p19). The gate is in §8.5.
 
 **Headline numbers** (all MEASURED; scripts in `data/`, programs in `probes/`).
 
@@ -52,34 +74,46 @@ library convention; `(try E)` is sugar for a `try`/`catch` the language already 
 | Stdlib sections that document an expected failure / of those, with no value-shaped form | 33 of 82 / **15** (all of `System.IO`, serialization, `Encoding`) |
 | Corpus programs scanned (rule corpus, doc examples, lit, gtest-embedded) | 13,522 files, about 36,900 programs |
 | `throw new` sites / `catch` arms | 1,575 / 3,482 |
-| `catch` arms that name a bug-band type (`InvalidOperationException`, `OverflowException`, …) | **1,778 (51%)** |
+| `catch` arms that name a pure bug type (`IndexOutOfRangeException`, `ContractViolationException`, …) | **589 (17%)** |
+| `catch` arms that name a type used for bugs *and* for non-bug conditions (`InvalidOperationException` 529, `OverflowException` 434, `ArgumentException` 228) | **1,191 (34%)** |
+| `catch` arms that name bare `Exception` (take bugs and failures alike) | 641 (18%) |
 | Calls to a `Try` member / an `…OrNull` member / `Result<` mentions | 1,389 / 644 / 350 |
 | Cost of one expected failure on r40: `TryParse` vs `Parse` + `catch` | 7.5 ns vs 73 ns (success path: 8 ns both) |
 | Exceptions on r40 use unwind tables | no: a pending-exception slot checked after each call |
-| Ownership model, programs of the `(try E)` shape checked / accepted / unsound | 333,648 / 77,559 / **0** |
+| Ownership model (pinned at v0.345), existing `try` / empty catch-all fragment: checked / accepted / unsound | 333,648 / 77,559 / **0** |
+| Same model, an outer owned local assigned inside the protected block: checked / accepted / unsound | 19,565 / 4,497 / **0** |
 
-**What the rule removes.** For the user: the question "which of ten spellings does this
-operation use, and which of its three tiers exist?" (the count is in §2.4). For the standard
-library, behind a warn-first ramp: the Parse-family duals, 31 declarations as listed (`ParseOrNull` ×10,
-`ReadKeyOrNull`, `TryParse` ×15, `Convert.TryTo*` ×5; the `Int32` listing stands for eight
-integer types, stdlib §9.1), and every future dual of that kind: today 15 sections
-would each need new `TryX`/`XOrNull` members, by proposal, to give callers a value-shaped
-stance. The collection queries (`TryPop`, `TryGetValue`, `FirstOrNull`, …) stay: they are
-queries, not error handling.
+The two model rows are about constructs that exist. The model has no calls, values, `null` or
+exception types, so it does not model the atom (§5.2).
 
-**What it costs.** One built-in interface and one expression form; a rewrite of rationale
-§11.4, stdlib §1's rule and Guide 2; reopening decline D-0005 on new evidence (§9). Corpus
-breakage: **0** when the form is added; 436 call sites by name when the 31 duals are retired
-(mechanical rewrite). Run-time: `(try int.Parse(s))` costs what `Parse` + `catch` costs today,
-about 65 ns more per *failed* call than `TryParse` on r40, until the compiler lowers the form
-over known members to the entry point it already has.
+**What the rule removes.** Now, with the marker alone: nothing from the library; for the user,
+the bug-swallowing boundary arm and the five-band classification (three kinds replace it).
+With the atom, if it is adopted: the question "which of ten spellings does this operation use,
+and which of its three tiers exist?" (the count is in §2.4); behind a warn-first ramp, the
+Parse-family duals, 31 declarations as listed (`ParseOrNull` ×10, `ReadKeyOrNull`, `TryParse`
+×15, `Convert.TryTo*` ×5; the `Int32` listing stands for eight integer types, stdlib §9.1);
+and future duals of operations whose result is not nullable (today 15 sections would each
+need new `TryX`/`XOrNull` members, by proposal, to give callers a value-shaped stance). An
+operation whose success value may itself be `null` still needs a `Try` shape (a) or a
+`catch`. The collection queries (`TryPop`, `TryGetValue`, `FirstOrNull`, …) stay either way:
+they are queries, not error handling.
+
+**What it costs.** Now: one built-in interface; one derived class for out-of-range `Parse`
+input; a ruling on each place the library names a straddling type (48 type-and-section
+pairs, §8.1); Guide 2 and stdlib §1 restated around three kinds. Corpus breakage: **0**.
+With the atom: one expression form; protection 5; D-0005 reopened; rationale §11.4 rewritten;
+0 corpus sites at introduction and 436 call sites by name when the 31 duals are retired;
+about 65 ns more per *failed* `(try int.Parse(s))` than `TryParse` on r40 until the form is
+lowered over known members.
 
 **Proposal 0076 §6, the reopening bar for maximal `Result`.** 0 of 4 met (§9.2): (1) no
 propagation operator has landed and the `?` collision is unresolved; (2) there is no
 single-award async container, and v0.355 instead rejects `Task<Result<resource, E>>`
-(probe p07); (3) the governance rule is in stdlib §1 but governs zero payload types; (4) the
-decode-cluster pilot has not landed and there are no external users. The recommendation does
-not need any of the four.
+(probe p07); (3) the governance rule is in stdlib §1 but governs zero payload types; (4) no
+real program consumes a decode-cluster `Result` surface (the pilot has not landed and there
+are no external users), so whether branch-shaped consumption dominates boundary-shaped
+consumption there cannot be observed, and the migration analysis exists only as the site
+counts of §2.3. The recommendation does not need any of the four.
 
 ## 2. Inventory
 
@@ -159,18 +193,25 @@ files are scanned with the programs, so the gtest column carries a little noise.
 | files mixing two or more mechanisms | 10 | 13 | 1 | 62 | 86 |
 
 Which exception types (MEASURED; `data/corpus_throw_types.tsv`; the band lists are in the
-script):
+script). The failure band is exactly the set §8.1 proposes for the marker. A *straddling*
+type is one the library raises both for bugs and for conditions a correct program can meet
+(§10.2), so an arm that names it cannot be put in a band by its type.
 
-| | bug-band built-in | expected-failure built-in | bare `Exception` | user or other |
-|---|---|---|---|---|
-| `throw new` (1,575) | 844 (54%) | 27 (2%) | 225 (14%) | 479 (30%) |
-| `catch` arms (3,482) | 1,778 (51%) | 488 (14%) | 641 (18%) | 575 (17%) |
+| | pure bug type | straddling type | failure band | cancellation | bare `Exception` | user or other |
+|---|---|---|---|---|---|---|
+| `throw new` (1,575) | 34 (2%) | 810 (51%) | 27 (2%) | 0 | 225 (14%) | 479 (30%) |
+| `catch` arms (3,482) | 589 (17%) | 1,191 (34%) | 453 (13%) | 30 (1%) | 641 (18%) | 578 (17%) |
 
-Two readings. First, these are test corpora: half of all `catch` arms exist to observe a
-bug-band exception, as a test oracle. Any design in which bugs stop being catchable breaks
-those 1,778 arms. Second, `Result` is rare: 49 files of 13,522 mention `Result<`, and the
-library has no producer. The catch-arm matcher is a regular expression with a stated limit
-(a `case` arm nested in a catch arm can be miscounted; it lands in "user or other").
+The straddling arms are `InvalidOperationException` 529, `OverflowException` 434 and
+`ArgumentException` 228.
+
+Three readings. First, these are test corpora: at least 589 arms exist to observe a pure bug
+type as a test oracle, and some unknown share of the 1,191 straddling arms do the same. A
+design in which bugs stop being catchable breaks between 589 and 1,780 arms. Second, a third
+of all arms name a type whose band cannot be read from the type, which is the cost of any
+type-keyed split (§8.1 item 5). Third, `Result` is rare: 49 files of 13,522 mention `Result<`,
+and the library has no producer. The catch-arm matcher is a regular expression with a stated
+limit (a `case` arm nested in a catch arm can be miscounted; it lands in "user or other").
 
 Calls per member name (`data/stdlib_tier_shapes.tsv`, MEASURED): shape (a) 818, (b) 112,
 (c) 409, (d) 247, `…OrNull` 653 (the name `TryParse` is counted under both (a) and (c)).
@@ -213,7 +254,11 @@ Any candidate is judged against these. Each is QUOTED from the cited section, v0
    §1 band 1); contract clauses raise `ContractViolationException` and reject `throw` inside
    them (spec §22.16).
 5. **One mechanism per fault condition** (stdlib §1, the no-dual rule), and **catch at
-   boundaries** (Guide 2 §7).
+   boundaries**: "`catch` is a boundary-and-supervision tool — convert, log, retry, report,
+   re-raise. Branching program logic on caught exception types at an interior call site is
+   the signal to check the rule for a value-shaped tier" (Guide 2 §7; proposed by 0076 §6).
+   Design F's atom is an interior catch-and-branch, so it gives the second half of this up
+   wherever it is used. The marker alone does not.
 6. **A governed, small exception taxonomy**, producer-local (spec §31.4).
 7. **Domain isolation.** "no exception class is sendable"; a fault crosses as
    `DomainFaultedException` carrying strings (spec §30.14).
@@ -289,18 +334,19 @@ For each: the single thing a user learns, what it removes, what it costs, what i
   leaves locks held and shared objects half-written; "forcible domain teardown" is already
   rejected on that ground (decline-index row, rationale §12.4). Contracts are welded to a
   catchable `ContractViolationException` (spec §22.16, §31.4).
-- **Breaks.** 1,778 `catch` arms (51%) name a bug-band type (MEASURED).
+- **Breaks.** Between 589 `catch` arms (17%, those naming a pure bug type) and 1,780 (51%,
+  with the arms naming a straddling type) (MEASURED).
 - **Verdict.** Not as stated. Its useful half — bugs are never part of what a caller handles,
   and they keep their own band across every boundary — is adopted in F, with unwinding kept.
 
 ### E. D + B (bugs abandon; recoverable errors are typed throws with `try` marking)
 
 The sum of B and D: Midori's actual design. It inherits both costs: B's type-system work and
-D's 1,778 broken arms and lost cleanup. **Verdict:** not recommended; F takes the two-band
+D's 589 to 1,780 broken arms and lost cleanup. **Verdict:** not recommended; F takes the two-band
 model from D and the caller-chosen stance from Midori's `try … else` forms without either
-cost.
+of those costs (the atom has its own: §8.1).
 
-### F. Faults and failures; the caller chooses the stance (recommended; §8)
+### F. Faults and failures; the caller chooses the stance (§8: the marker now, the atom gated)
 
 - **Sketch.**
 
@@ -314,9 +360,13 @@ cost.
   ```
 
 - **One thing learned.** The rule in §1.
-- **Removes.** The band-3 / band-4 judgement ("where will this be consumed?") from API design:
-  the caller decides. Behind a warn-first ramp, 31 declared duals. Every future dual of the same kind.
-- **Costs.** One interface, one atom, three documents rewritten, one decline reopened.
+- **Removes.** With the marker: the bug-swallowing boundary arm. With the atom: the band-3 /
+  band-4 judgement ("where will this be consumed?") from API design, since the caller
+  decides; behind a warn-first ramp, 31 declared duals; and future duals of operations whose
+  result is not nullable.
+- **Costs.** The marker: one interface, one derived class, a ruling per straddling condition.
+  The atom: one expression form, three documents rewritten, one decline reopened, and
+  protection 5 of §3 (catch at boundaries) wherever it is used.
 - **Breaks.** 0 sites at introduction (MEASURED: no corpus program declares the name
   `IFailure` or contains `(` followed by `try`, and no existing form changes meaning). 436
   call sites by name when the duals go (`TryParse` 300, `Convert.TryTo*` 79, `ParseOrNull`
@@ -327,12 +377,13 @@ cost.
 | | A | B | C | D | E | F |
 |---|---|---|---|---|---|---|
 | New language surface | 1 form | clause, call mark, failure-typed functions and tasks | operator, async container, owning combinators | none | B's | 1 interface, 1 form |
-| New ownership rules | 0 | payload restriction; task and domain rules | owning-match propagation; container | 0 | B's | **0** (model: 0 violations in 77,559 accepted programs) |
-| Stdlib members made redundant | 104 | 120 | 0 (adds duals) | 0 | 120 | 31 now; no new duals later |
-| Corpus sites broken | 0 | ≥ 1,575 throws + 3,193 catch blocks to re-band; every failing call marked | the same sites rewritten as returns and matches; blocked (0 of 4 conditions) | 1,778 catch arms | B + D | 0, then 436 mechanical |
+| New ownership rules | 0 | payload restriction; task and domain rules | owning-match propagation; container | 0 | B's | none identified (§5.2); the atom's result channel is not modelled |
+| Stdlib members made redundant | 104 | 120 | 0 (adds duals) | 0 | 120 | marker: 0; atom: 31, and later duals over non-nullable results |
+| Corpus sites broken | 0 | ≥ 1,575 throws + 3,193 catch blocks to re-band; every failing call marked | the same sites rewritten as returns and matches; blocked (0 of 4 conditions) | 589 to 1,780 catch arms | B + D | 0, then 436 mechanical |
 | Hides bugs | yes (p12) | no | no | no | no | no (p16) |
 | Keeps cleanup on the bug path | yes | yes | yes | **no** | **no** | yes |
 | Failure type survives a domain seam | no | yes | value-like only | — | yes | band only (§8.4), type no |
+| Protections of §3 given up | 4, 5 | 9 | 5 (reversed: values everywhere), plus the unmet bar | 1, 4's catchable contracts | B's and D's | marker: none; atom: 5 |
 
 ### Design sheet
 
@@ -343,7 +394,7 @@ E is B and D together and has no column.
 | | A blanket `try?` | B typed throws | C `Result`-first | D abandonment | F |
 |---|---|---|---|---|---|
 | Syntax | `try? E` | `method M(): T throws E`; `try M()` at each call; `try? M()`; `try … catch` | `Result<T, E>` returns; a propagation operator spelled outside the `?` family | none added; `catch` of bug types removed | `(try E)`; a marker interface |
-| Typing | `T?`; any exception converts | the member's type carries `E`; the caller must handle or itself throw a superset; function types and generics need a failure parameter | ordinary generics; an instantiation with an owned payload is move-only | — | `T?` (or `bool`); a failure is an exception whose class implements the marker |
+| Typing | `T?`; any exception converts | the member's type carries `E`; the caller must handle or itself throw a superset; function types and generics need a failure parameter | ordinary generics; an instantiation with an owned payload is move-only | — | `T?` (or `bool` for a unit operand; a nullable operand is an error); a failure is an exception whose class implements the marker |
 | Error set | undeclared | declared on public members | declared in the return type | undeclared | undeclared per member; the band is per type |
 | Ownership on the error path | today's throw edge | the return edge, which disposes the same values (p02); payload must be value-like, no borrows | owning match; propagation is a consume of the payload | none: nothing is disposed | today's throw edge; no new rule |
 | Async | task faults, as today | the task must carry `E`: a second type parameter or an erased failure | no container for an owning `Result` (p07) | the domain or process ends | as today |
@@ -351,10 +402,10 @@ E is B and D together and has no column.
 | FFI boundary | abort (spec §32.8) | same; `extern` members cannot fail, wrappers convert `errno` (spec §32.9) | same | same | same |
 | Exhaustiveness | none | possible where `E` is a choice | yes (spec §35.6) | — | none; open, like `catch` |
 | Evolution of error sets | open | a new case breaks exhaustive handlers; a wider `throws` breaks callers | "every case addition breaks every exhaustive consumer" (QUOTED, stdlib §1) | — | a new failure type breaks nothing; moving a type between bands is a governed behaviour change |
-| New diagnostics | none | unmarked failing call; unhandled failure | non-exhaustive match (exists) | — | owned argument lost on failure; nullable collapse |
+| New diagnostics | none | unmarked failing call; unhandled failure | non-exhaustive match (exists) | — | owned argument lost on failure; nullable operand rejected |
 | Run-time cost | one exception object per failure (73 ns on r40) | a value return, no allocation | a value return, no allocation | lowest | as A; a lowering for known members removes it |
 | Binary size, compile time | unchanged | a check per failing call, which r40 already emits per call (13% of the call instructions in p02's object) | tag tests | smaller | unchanged; compile time not measured |
-| Removes | 104 stdlib members | 120 stdlib members; `Result` as a signal | nothing (bugs still throw) | catchability of about 15 types | 31 stdlib members; all future duals |
+| Removes | 104 stdlib members | 120 stdlib members; `Result` as a signal | nothing (bugs still throw) | catchability of about 15 types | with the atom: 31 stdlib members; future duals over non-nullable results |
 | Migration | none | re-band and mark every site, at an edition | blocked (§9.2) | tests and supervisors rewritten, at an edition | additive, then one warn-first removal |
 
 ## 5. Ownership interplay
@@ -366,7 +417,7 @@ E is B and D together and has no column.
   Probe p11 (MEASURED): an exception that owns a payload disposes it right after the arm.
 - **The throw edge and the return edge run the same cleanup in the same order.** Probe p02
   (MEASURED): `close c, close b, finally, close a` on both. Model (MEASURED,
-  `model/to_null_model.py`): 3,927 pairs of programs, one leaving a scope by `throw`, its twin
+  `model/to_null_model.py`, pinned at v0.345): 3,927 pairs of programs, one leaving a scope by `throw`, its twin
   by normal exit, have identical disposal traces; with K3.15 switched off, 1,386 differ.
 - **The implementation already propagates errors as values.** r40 stores the exception in a
   thread-local slot and returns; each call site that can see a throw then tests the slot
@@ -392,27 +443,42 @@ E is B and D together and has no column.
 
 ### 5.2 Design F on each point
 
-`(try E)` is defined as `try r := E; catch IFailure => () end` with `r` initially `null`.
-Everything follows from rules that exist.
+The marker changes nothing here: it is an interface on exception classes and an arm type the
+language already admits. The rest of this section is about the deferred atom, defined once in
+§8.1 item 3 as an expression form of its own. No new ownership rule was identified for it;
+that is an argument from the existing rules below, not a model result.
 
-| Question | Answer under F | Evidence |
+| Question | Answer under F's atom | Evidence |
 |---|---|---|
-| Disposal on the failure path | the callee's throw edge has already disposed its locals; the caller's exception is disposed as after a completed arm | spec §31.1; p11, p15 |
-| An owned result | `(try new Conn(h))` is a fresh producer of `owned Conn?`; it binds to `using var`, narrows, and is disposed on every path | p15 (MEASURED, no warning) |
-| `throw x` as a kill | unchanged; `(try E)` adds no consume | model: 0 violations |
+| Disposal on the failure path | the callee's throw edge has already disposed its locals; the exception is disposed at the atom as after a completed arm | spec §31.1; p11, p15 |
+| An owned result | `(try new Conn(h))` is a fresh producer of `owned Conn?`; it binds to `using var`, narrows, and is disposed on every path | p15 (MEASURED on the equivalent helper call, no warning) |
+| `throw x` as a kill | unchanged; the atom adds no consume | argued from spec §31.1; not modelled |
 | `using var` and `finally` ordering | unchanged; the atom adds no cleanup entry | p02 |
 | An owned *argument* to the failing call | consumed by the callee and disposed on its failure edge: the caller gets `null` and has lost the argument. This is the give-back problem of stdlib §6.9; it stays with proposal 0060. A warning at `(try F(move x))` is proposed | QUOTED, stdlib §4.9 `OwningDictionary.Add`: "the passed value was consumed at the call site and is disposed on that path" |
-| A failure carrying an owned payload | allowed as today; disposed with the exception when `(try E)` yields `null` | p11 |
-| A failure carrying a borrow | as today (residual trust); `(try E)` shortens the exposure, since the exception dies at the atom | spec §31.1 |
-| Async | `(try await F())` is a `try` around an `await`, which spec §30.9 admits anywhere in a body; the task-owned fault is not disposed by the arm (the §30.9 exemption) | spec §30.9; p03 |
-| Cancellation | `OperationCanceledException` is not a failure, so `(try …)` never swallows it | by construction |
+| A failure carrying an owned payload | allowed as today; disposed with the exception when the atom yields `null` | p11 |
+| A failure carrying a borrow | as today (residual trust); the atom shortens the exposure, since the exception dies at the atom | spec §31.1 |
+| Async | `(try await F())` behaves as a `try` around an `await`, which spec §30.9 admits anywhere in a body; the task-owned fault is not disposed by the arm (the §30.9 exemption) | spec §30.9; p03 |
+| Cancellation | `OperationCanceledException` is not a failure, so the atom never swallows it | by construction |
 | Task and domain seams | types still do not cross. The band can: §8.4 | p04 |
-| Nullable payloads | `(try E)` over an `E` of type `T?` collapses (spec §7.10), exactly as the `…OrNull` tier does; a warning is proposed | QUOTED, stdlib §1 |
+| A nullable operand | rejected: a failure and a legitimate `null` would be one value, the distinction stdlib §1's shape (a) exists to keep | stdlib §1 ("the only shape that distinguishes the outcomes a collapsed `T?` cannot") |
+| The result as an unbound temporary | under `??` it is disposed correctly today; as the receiver of `?.` or `!` r40 does not dispose it, where spec K8.1 says it must | p19 (MEASURED) |
 
-The model check (MEASURED; `model/out_vars3_len3_body2.txt`): of 333,648 enumerated programs
-of the shape *prefix; try { body } catch e { }; suffix* over the L1 kernel fragment (locals,
-pins, fields, temporaries, `throw`), the checker accepts 77,559, and none violates
-exactly-once disposal, use-after-kill or isolation.
+**What the model does and does not show** (MEASURED; `model/to_null_model.py`,
+`model/out_vars3_len3_body2.txt`). The model is bzcore-l1, pinned at spec **v0.345**, ten
+revisions behind the text this report reads. It has locals, pins, fields, temporaries and
+`throw`; it has no calls, no values, no `null`, and its catch arm catches everything.
+
+- *Existing `try` with an empty catch-all.* Of 333,648 programs of the shape *prefix; try
+  { body } catch e { }; suffix*, the checker accepts 77,559, and none violates exactly-once
+  disposal, use-after-kill or isolation.
+- *An outer owned local assigned inside the protected block* (the statement reading of the
+  atom's result, with a nondeterministic branch standing for an operand that either fails or
+  produces): of 19,565 programs *decl r; prefix; try { if \* { throw } else { r := new R } }
+  catch e { }; suffix*, the checker accepts 4,497 with 0 violations; a later read of `r` is
+  rejected (K1.3), which is where the real form's null test would go.
+- *Not modelled:* the null result as a value; the band filter; a call that fails after
+  consuming an owned argument; `await`; the temporary positions of p19. A model of the atom
+  proper is an entry condition of the gate in §8.5.
 
 ### 5.3 The other candidates on the hard points
 
@@ -510,16 +576,19 @@ revision than the spec by design.
 | p12 | a to-null helper written today: blanket vs named | blanket hides a bug; named does not |
 | p13 | throwing `finally` | later wins; `SupersededChain` not implemented |
 | p14 | contract violation, index fault, bad input | one `Exception` arm takes all three |
-| p15 | the `(try E)` desugaring over an owned result | runs, no warning, disposed on every path |
+| p15 | a helper standing for `(try new Conn(h))`, catching the marker, over an owned result | runs, no warning, disposed on every path |
 | p16 | the band marker as an interface, with an interface catch arm | runs: failures become null, the bug propagates, `catch OverflowException` still matches |
 | p17 | `ParseOrNull` on `bool`, `Guid`, `int`, `long`, `double` | the three numeric calls are rejected: the member does not exist on r40 |
 | p18 | what a marker-typed catch binding can read | runs; `ToString()` yes, `Message` no (two rejected variants recorded in the file) |
+| p19 | the atom's positions with today's forms: an outer owned local assigned in the protected block; the nullable owned temporary under `??`, `?.`, `!` | outer local and `??` dispose correctly; under `?.` and `!` the temporary is **not disposed** (a non-nullable receiver is) |
 
 ## 8. Recommendation
 
-**Adopt design F, staged.** If the owner prefers no new syntax, stages 0–1 (the marker without
-the atom) are a coherent stopping point: they give the band, a safe boundary arm and the
-three-kind teaching rule, and leave the duals in place.
+**Adopt the failure band now (stages 0–1). Hold the atom (stage 2) behind the gate in §8.5.**
+
+This is the staging the non-author review of this report advised, and it is now the
+recommendation. The first version of this section recommended F whole. §8.2 gives the two
+options side by side and the reasons for the change.
 
 ### 8.1 The design
 
@@ -532,49 +601,131 @@ three-kind teaching rule, and leave the duals in place.
    - *Fault*: a bug. `requires`, a run-time check, or a `throw` of any exception that does not
      implement the marker.
 2. **The failure marker** (working name `IFailure`): a built-in interface (its members, if
-   any, are open question 1 in §11), implemented by `FormatException`, the `IOException` family, `TimeoutException`,
-   `SerializationException`, `ChannelClosedException`, `ChannelFullException` and their
-   proposed peers. `OperationCanceledException` does not implement it. An exception type's
-   band changes only by recorded ruling, as taxonomy growth does today (spec §31.4). An
-   interface is chosen over a base class because spec §31.2.1 already admits interface-typed
-   catch arms (pinned by `tests/lit/sema/sema_catch_arm_type__interface_arm_admissible_31_2_1.bzl`)
-   and because a class can join the band without leaving its base (p16).
-3. **The to-null atom** `(try E)`.
+   any, are open question 1 in §11), implemented by `FormatException`, the `IOException`
+   family, `TimeoutException`, `SerializationException`, `ChannelClosedException`,
+   `ChannelFullException` and their proposed peers. `OperationCanceledException` does not
+   implement it. An exception type's band changes only by recorded ruling, as taxonomy growth
+   does today (spec §31.4). An interface is chosen over a base class because spec §31.2.1
+   already admits interface-typed catch arms (pinned by
+   `tests/lit/sema/sema_catch_arm_type__interface_arm_admissible_31_2_1.bzl`) and because a
+   class can join the band without leaving its base (p16).
+3. **The to-null atom** `(try E)` (stage 2, gated). Defined here once.
    - *Syntax.* A paren atom in the family of `(case …)`, `(if …)` and `(var x := E; body)`:
      `(` then `try` is a two-token signal no expression has today (Appendix A uses `"try"`
      only in `TryStmt`). It uses no `?` token, so the four-way collision recorded for a
      propagation operator (rationale §11.4, proposal 0076 §3) does not arise.
-   - *Type.* `T?` where `E: T`; `T?` where `E: T?` (collapse, with a warning); `bool` where
-     `E` has the unit type.
-   - *Meaning.* Evaluate `E`. If it raises an exception whose class implements the marker, the
-     exception is disposed as after a completed catch arm and the atom yields `null` (or
-     `false`). Any other exception propagates.
-   - *Ownership.* None of its own (§5.2).
+   - *Definition.* An expression form of its own. It cannot be defined by expansion: a
+     `try` statement cannot be written where statements are not allowed, and the binding atom
+     (spec §17.15) admits no statements. Evaluate `E`. If `E` completes normally, the atom's
+     value and ownership classification are `E`'s (as spec §17.15 says of a binding atom's
+     body), at the nullable type: where `E` is a fresh owned producer, so is the atom. If
+     evaluation of `E` raises an exception whose class implements the marker, handling of
+     that exception completes at the atom — it is disposed as after a completed catch arm
+     (spec §31.1, with §30.9's exemption for a task-owned fault) — and the atom's value is
+     `null`. Any other exception propagates.
+   - *Statement reading* (an explanation, not the definition). Where the atom is the whole
+     initializer of a local, it reads as
+
+     ```bezel
+     var r: T? := null;                  // plain `var`: a `using var` cannot be assigned later
+     try  r := E;  catch IFailure => ()  end try;
+     ```
+
+     which compiles and disposes correctly on r40 (p19 (1)), with the must-use warning the
+     plain `var` draws. p15's helper method is the same reading wrapped in a call.
+   - *Type.* `T?` where `E: T` and `T` is not nullable; `bool` where `E` has the unit type
+     (`true` on completion); a **compile error** where `E: T?`, because the failure and a
+     legitimate `null` would be one value.
+   - *Positions.*
+
+     | Position | Admitted | Note |
+     |---|---|---|
+     | initializer of `var` / `using var` | yes | p15, p19 (1) |
+     | operand of `??` | yes | the equivalent call disposes correctly today (p19 (2)) |
+     | receiver of `?.` or `!`, e.g. `(try new C(h))?.M()` | yes | an unbound owned temporary, disposed at the end of the full expression (spec K8.1); r40 does not dispose it today (p19 (3), (4)): a compiler gap to close first |
+     | argument; expression-bodied member (`=> (try int.Parse(s)) ?? 0`) | yes | an expression like any other |
+     | around `await` in an `async` body | yes | spec §30.9 admits `await` in a `try` body |
+     | contract clause | no | a clause states a proposition and already rejects `throw` (spec §22.16) |
+     | `pure` member body | open | §11 question 3 |
+
    - *Diagnostics.* A warning where the operand passes an `owned` argument (lost on failure);
-     a warning on nullable collapse; a hint for `(try E)!` (write `E`).
-4. **`catch` gains a safe boundary arm for free**: `IFailure => …` takes every expected
-   failure and lets bugs reach the supervisor, where `Exception => …` takes both (641 such
-   arms in the corpora).
-5. **The standard library.** Mark the failure types. Resolve the one straddler: `Parse` raises
-   `OverflowException` for out-of-range input (stdlib §9.1), a bug-band type; give that
-   condition a class that derives from `OverflowException` and implements the marker, so
-   existing arms keep matching (p16). Then stop adding duals for operations, and retire the 31
-   Parse-family duals behind a warn-first ramp (the Ratchet class of spec-change-process §2;
-   an edition, if proposal 0108 has landed by then — it is a draft today).
-6. **`Result<T, E>` stays, as data.** It is for outcomes a program stores, gathers or sends
-   (validation lists, fan-out results), which is where 0076 §3 found it better outright. It stops
-   being a third way to signal one operation's failure.
+     the error on a nullable operand; a hint for `(try E)!` (write `E`).
+   - *What it gives up.* It is a catch at an interior call site whose result the program
+     branches on. Guide 2 §7 calls that "the signal to check the rule for a value-shaped
+     tier". The atom reverses the sentence: it *is* the value-shaped tier. Protection 5 of §3
+     does not survive it.
+4. **`catch` gains a boundary arm** with the marker alone: `IFailure => …` takes every
+   expected failure and lets bugs reach the supervisor, where `Exception => …` takes both.
+5. **The straddling types, ruled.** Three types are raised for bugs and for conditions a
+   correct program can meet (§10.2). The library names them in 48 type-and-section pairs
+   (`ArgumentException` 19 sections, `OverflowException` 9, `InvalidOperationException` 20;
+   MEASURED). Each condition is ruled once:
+   - *Out-of-range input to `Parse` and `Convert.To*`* (`OverflowException`, stdlib §9.1,
+     §2.3): a failure. It gets a class that derives from `OverflowException` and implements
+     the marker, so existing `catch OverflowException` arms keep matching (p16).
+   - *"The collection is empty"* (`First`, `Single`, `Pop`, `Dequeue`, …:
+     `InvalidOperationException`), *duplicate key* (`Add`: `ArgumentException`), and with
+     them the missing key (`KeyNotFoundException`) and the bad index
+     (`IndexOutOfRangeException`): **stay faults**. Stdlib §1 already says the throwing form
+     "treats absence as a bug", and each has a query dual that is kept (`FirstOrNull`,
+     `TryPop`, `TryAdd`, `TryGetValue`, `ElementAtOrNull`). The consequence is stated plainly:
+     `(try list.First())` does **not** yield `null` on an empty list; the exception
+     propagates, and the value form is `list.FirstOrNull()`. The same holds for 63 of the 89
+     measured families and for the three dictionary indexers: each keeps its two forms.
+   - *Every other use* (state misuse, bad arguments, arithmetic overflow, the `DateTime`
+     range fault): a fault, unless a ruling says otherwise.
 
-### 8.2 Why this and not less
+   The price beyond `Parse`: 48 pairs to read once; no behaviour change where the ruling is
+   "fault"; one derived class per condition ruled a failure. Making the query conditions
+   failures instead would need a derived class for each of the 63 families' conditions and
+   would let the atom replace their duals; that is the `fails`-clause direction of §8.3, not
+   recommended.
+6. **The standard library, if the atom is adopted.** Stop adding duals for operations whose
+   result is not nullable, and retire the 31 Parse-family duals behind a warn-first ramp (the
+   Ratchet class of spec-change-process §2; an edition, if proposal 0108 has landed by then —
+   it is a draft today). An operation whose success value may be `null` keeps a shape-(a)
+   `Try` form or is handled with `catch`.
+7. **`Result<T, E>` stays, as data.** It is for outcomes a program stores, gathers or sends
+   (validation lists, fan-out results), which is where 0076 §3 found it better outright.
 
-Stages 0–1 without the atom give the band and the boundary arm but leave callers writing a
-four-line `try` to get a null, so the pressure for per-member duals stays. The atom is what
-makes "state each operation once" livable.
+### 8.2 The two options, and which is recommended
 
-### 8.3 Why this and not more
+**Option 1 — the band now, the atom gated (recommended).** Stages 0–1: the marker, the
+boundary arm, the straddler rulings, the three-kind teaching rule. The atom waits for the
+gate of §8.5.
+
+**Option 2 — F whole, now.** Stages 0–2 together: the atom lands with the marker, D-0005 is
+reopened, and the freeze on duals starts at once.
+
+Why option 1:
+
+- *The marker is useful alone and is a prerequisite either way.* It works as a library
+  convention today (p16). It gives boundaries an arm that does not take bugs; the corpora
+  have 641 bare-`Exception` arms, each of which takes bugs with failures. It reopens nothing
+  and gives up no protection of §3. The atom cannot be sound without it.
+- *The atom's evidence is the wrong class.* Everything measured in its favour is a count of
+  library declarations and test programs. No observed program needs it. Proposal 0061 §2's
+  gate asks for ceremony "observed, not predicted", and 0076 §0 classed its own authored
+  programs as "predicted evidence"; the same discipline applies here.
+- *The atom reopens a decline that was reaffirmed.* 0076 §7 records D-0005 as "Untouched and
+  *reinforced* — on both grounds", and the atom gives up the catch-at-boundary doctrine 0076
+  §6 made explicit. The case in §9.1 answers the grounds with a cost argument; it is not
+  evidence about use.
+- *The model does not reach it.* The result channel is unmodelled (§5.2), and one of the
+  atom's positions leaks on r40 (p19).
+- *Waiting costs little.* The duals stay; tier growth continues by proposal, as today. Each
+  new dual's proposal can record whether the atom would have made it redundant, which is the
+  evidence log the gate needs.
+
+Why not stop at option 1 forever: without the atom a caller still writes four lines to get a
+`null`, so "state each operation once" is not livable and the pressure for per-member duals
+stays. Option 1 is a first step with a stated next one, not the whole answer to the owner's
+question.
+
+### 8.3 Why not more
 
 A declared `fails(T, …)` contract clause per member (in the `requires` family) would be more
-precise and would let the query/assert pairs be derived too. It is not recommended now: it
+precise and would let the query/assert pairs be derived too. It is not recommended: it
 touches spec §31.3, needs conformance rules for overrides and interface members, gives lambdas
 and task variables no declaration to read, and leaves cancellation to each author's care. It
 is the natural next step if per-member precision or typed failure sets are wanted, and nothing
@@ -583,54 +734,76 @@ in F blocks it.
 ### 8.4 The domain seam
 
 Today a failure and a bug leave a domain as one type (p04). Under F the join can keep the band
-without sending the object: raise a `DomainFaultedException` that implements the marker when
-the original did. One bit crosses; no exception class becomes sendable, so the two declines on
-that point stand (decline-index rows *Sendability requirement on throwable types* and *Stating
+without sending the object. A class's interfaces are fixed, so one type cannot implement the
+marker "when the original did": the join raises a subclass, say `DomainFailedException:
+DomainFaultedException, IFailure`, when the original exception's class implemented the marker,
+and `DomainFaultedException` otherwise. Existing `catch DomainFaultedException` arms match
+both. One bit crosses; no exception class becomes sendable, so the two declines on that point
+stand (decline-index rows *Sendability requirement on throwable types* and *Stating
 `Exception`'s inherited state transfer-compatible*).
 
-### 8.5 Order of work
+### 8.5 Order of work, and the gate
 
 | Stage | Content | Class (spec-change-process §2) | Depends on |
 |---|---|---|---|
-| 0a | Compiler catch-up the probes exposed: numeric `ParseOrNull`, `SupersededChain`, `Exception.ToString()` message, `FaultStackTrace`, the p08 crash | implementation | — |
-| 0b | Freeze: no new `Try`/`…OrNull` dual for an operation with a throwing form until stage 1 is ruled | process ruling | — |
-| 1 | The failure marker; band governance sentence; the Parse-range class | design change (proposal) | owner |
-| 2 | The `(try E)` atom; D-0005 reopened; rationale §11.4, stdlib §1, Guide 2 rewritten around the three kinds | design change (proposal) | 1 |
-| 3 | `DomainFaultedException` keeps the band | ruling | 1 |
-| 4 | Retire the 31 Parse-family duals; lower `(try X.Parse(s))` to the existing non-throwing entry first | deletion-shaped proposal, warn-first ramp | 2, and the lowering |
+| 0 | Compiler catch-up the probes exposed: numeric `ParseOrNull`, `SupersededChain`, `Exception.ToString()` message, `FaultStackTrace`, the p08 crash, the undisposed nullable temporary of p19 | implementation | — |
+| 1 | The failure marker; the band governance sentence; the 48 straddler rulings and the Parse-range class; Guide 2 and stdlib §1 restated around three kinds; `IFailure => …` taught as the boundary arm | design change (proposal) | owner |
+| 1b | `DomainFaultedException` keeps the band (§8.4) | ruling | 1 |
+| **gate** | see below | | 1 |
+| 2 | The `(try E)` atom; D-0005 reopened; rationale §11.4 rewritten; no new duals over non-nullable results | design change (proposal) | the gate |
+| 3 | Retire the 31 Parse-family duals; lower `(try X.Parse(s))` to the existing non-throwing entry first | deletion-shaped proposal, warn-first ramp | 2, and the lowering |
 | later | A `fails` clause; value-like failure payloads for the decode cluster (0076's pilot) | evidence-gated | real programs written with stage 2 |
+
+**The gate for stage 2.** All of:
+
+1. *Observed use.* Programs not written to test the compiler (the sibling ergonomics study's
+   corpus counts; later, external users) show callers hand-writing the to-null shape — a
+   `try` whose arm only produces a fallback, or a helper like p15's — or asking for duals the
+   atom would derive, often enough to matter. The dual proposals filed after stage 1 are the
+   log.
+2. *A model of the result channel.* The ownership model, brought to the current revision,
+   covers a failing call, the null result, the band filter and an owned argument, with no
+   violation.
+3. *The temporary positions work.* The p19 gap is closed.
+4. *An owner ruling* that the atom's use is an accepted exception to "catch at boundaries",
+   with the evidence of §9.1 laid against D-0005's grounds.
 
 ### 8.6 Proposal outline (not filed)
 
 In the shape of recent graduated proposals (header block, then numbered sections).
 
-*Proposal X — The failure band and the to-null atom.*
+*Proposal X — The failure band* (stage 1).
 
-- **Header.** Status: draft. Tracking issue: none. Target: spec §17 (new atom), §31.1–§31.4,
-  §30.14 *Faults*, Appendix A/B; stdlib §1, §2.17, §7.5, §9.1; rationale §11.4; Guide 2;
+- **Header.** Status: draft. Tracking issue: none. Target: spec §31.1–§31.4, §30.14 *Faults*;
+  stdlib §1, §2.17, §7.5, §9.1 and the sections that name a straddling type; Guide 2;
   code-generation reference §5.1, §6. Written against: v0.355.
-- **0 Summary.** The rule of §1 above; one interface, one atom.
-- **1 The text today.** Stdlib §1's five bands and tiers; spec §31.3; D-0005.
-- **2 The problem, measured.** §2 of this report.
-- **3 Options.** A–F as in §4; the `fails` clause; a base class instead of an interface; a
-  throw-site band keyword.
-- **4 Evaluation.** Against the nine protections of §3; the ownership model run; probes.
-- **5 Reach, measured.** 0 sites at introduction; the 641 bare-`Exception` arms are unchanged;
-  the straddler.
-- **6 The case against the recorded decline (D-0005).** §9.1 below.
-- **7 Declined alternatives** (rows for the decline index): blanket `try?`; forced handling;
-  abandonment; a `fails` clause now; `(try E else v)` and `(try E catch …)` arm forms.
-- **8 Normative edits, changelog, migration, trackers.** One revision; spec-ahead trackers for
-  the atom and the marker; conformance cases for each rule sentence.
-- **9 Self-critique.** The open questions of §11.
+- **0 Summary.** The first sentence of the rule in §1; one interface; no syntax.
+- **1 The text today.** Stdlib §1's five bands; spec §31.2.1's interface arms; spec §31.3.
+- **2 The problem, measured.** §2.3's band table: 641 bare-`Exception` arms; 1,191 arms on
+  straddling types; p14.
+- **3 Options.** An interface, a base class, a throw-site band keyword, a `fails` clause.
+- **4 Evaluation.** Against the nine protections of §3 (none given up); p16, p18.
+- **5 Reach, measured.** 0 corpus sites; the 48 straddler pairs; the Parse-range class.
+- **6 The case against recorded declines.** None is reopened.
+- **7 Declined alternatives** (rows for the decline index): abandonment; forced handling;
+  re-typing the query conditions.
+- **8 Normative edits, changelog, migration, trackers.** One revision; spec-ahead trackers;
+  a conformance case per ruled condition.
+- **9 Self-critique.** Open questions 1 and 4 of §11.
 
-*Proposal Y — Retire the Parse-family duals* (deletion-shaped): the 31 declarations; the 436
-corpus call sites by name and the rule cases that pin them; the `IParsable<T>.TryParse`
+*Proposal Y — The to-null atom* (stage 2, only after the gate): the definition of §8.1 item
+3; the gate's evidence; §9.1 as its section 6; declined alternatives (blanket `try?`,
+`(try E else v)`, `(try E catch …)` arm forms, a nullable operand admitted with a warning).
+
+*Proposal Z — Retire the Parse-family duals* (stage 3, deletion-shaped): the 31 declarations;
+the 436 corpus call sites by name and the rule cases that pin them; the `IParsable<T>.TryParse`
 witness; the lowering precondition; the ramp, both ends stated.
 
 ## 9. Recorded declines and gates engaged
 
 ### 9.1 Decline D-0005, the value-form try expression
+
+This section applies to the deferred atom only. The marker reopens nothing.
 
 QUOTED (`docs/proposals/DECLINED.md`, D-0005): the form "fails test 3: it makes
 exception-based *expected* failure ergonomic, precisely the path Guide 2 §6 … routes to
@@ -638,25 +811,41 @@ exception-based *expected* failure ergonomic, precisely the path Guide 2 §6 …
 catch model (§31) offers no owned exception value to carry anyway. Revisiting requires new
 evidence against these reasons."
 
-`(try E)` is the smallest member of that family: no `catch` arms, no `else`. The evidence:
+The decline has been reaffirmed since. QUOTED (proposal 0076 §7): "Untouched and
+*reinforced* — on both grounds. Ground 1 (it would make exception-based expected failure
+ergonomic, against Guide 2 §6's routing) is now backed by a normative rule (§5) rather than a
+table; ground 2 … is engaged at §2(a) as a permanent structural fact both candidates must
+design around." And 0076 §6 made the doctrine behind ground 1 explicit: "`catch` is a
+*boundary and supervision* tool — convert, log, retry, report, re-raise — and … branching
+program logic on caught types at interior call sites is the signal to check the failure-signal
+rule for a band-2/3 tier" (QUOTED; landed as Guide 2 §7's sentence, §3 item 5).
 
-- *Against ground 1.* (a) The doctrine's cost was not measured when it was declined: 120
-  hand-written value-tier members, 89 duplicate families, 15 failure-documenting sections with
-  no value-shaped form, 71 changelog revisions and 17 proposals that touch tier spellings
-  (§2, MEASURED). (b) The declined form was band-blind, because no band marker existed; it
-  would have converted bugs (p12). `(try E)` converts the failure band only (p16). (c) The
-  doctrine's purpose — callers branch on values, `catch` stays a boundary tool — is kept at
-  every call site that uses the atom; what changes is who writes the value form, the caller
-  once instead of the library per member. (d) The project already accepts call-site
-  conversion in the other direction: enum name parsing shipped the value form only, with the
-  throwing tier declined pending "Measured `?? throw new …` boilerplate at scale in real
-  programs" (QUOTED, decline-index row *Enum name-parse tiers*).
+`(try E)` is the smallest member of the declined family: no `catch` arms, no `else`. What can
+be said for it, and what cannot:
+
+- *Against ground 1.* (a) The doctrine's cost was not measured when it was declined or when
+  it was reaffirmed: 120 hand-written value-tier members, 89 duplicate families, 15
+  failure-documenting sections with no value-shaped form, 71 changelog revisions and 17
+  proposals that touch tier spellings (§2, MEASURED). (b) The declined form was band-blind,
+  because no band marker existed; it would have converted bugs (p12). `(try E)` converts the
+  failure band only (p16). (c) The project already accepts call-site conversion in the other
+  direction: enum name parsing shipped the value form only, with the throwing tier declined
+  pending "Measured `?? throw new …` boilerplate at scale in real programs" (QUOTED,
+  decline-index row *Enum name-parse tiers*).
+- *What is not kept.* The atom is an interior catch whose result the program branches on. It
+  keeps half of the doctrine — the caller branches on a value, and writes no `catch` arm —
+  and gives up the other half: under it an interior catch is no longer the signal of a
+  missing value tier, because the atom is that tier. That is protection 5 of §3, given up
+  wherever the atom is used. An earlier draft of this section said the doctrine's purpose was
+  kept; that was wrong.
 - *Against ground 2.* The atom carries no exception value. The exception is disposed at the
-  atom, as after an arm.
-- *Honest limit.* Proposal 0061's admission test 3 asks that an atom "does not make a
-  doctrine-declined path more ergonomic"; this one does. It can land only if the owner changes the doctrine
-  from "expected failure is a value in the API" to "expected failure is a value at the call".
-  That is the decision this report asks for.
+  atom, as after an arm. This ground is answered.
+- *The honest limit.* Points (a)–(c) are a cost argument and a design difference. They are
+  not evidence about how programs consume failures, which is what "new evidence against these
+  reasons" asks for, and proposal 0061's admission test 3 ("does not make a doctrine-declined
+  path more ergonomic") is still failed. The atom can land only if the owner changes the
+  doctrine from "expected failure is a value in the API" to "expected failure is a value at
+  the call", on the evidence the gate of §8.5 collects.
 
 ### 9.2 Proposal 0076 §6, condition by condition
 
@@ -665,15 +854,16 @@ evidence against these reasons."
 | 1. A propagation operator landed through 0061 §2's gate, `?` collision resolved | **No** | 0061 §2 is still "evidence-gated"; decline-index row *`Result<T, E>` propagation in expression position* is `deferred` (QUOTED). `Result<` appears in 49 of 13,522 corpus files, all tests (MEASURED) | observed per-call ceremony in real `Result` code written with 0075 stages 1–2, and a spelling outside the `?` family (a prefix keyword) |
 | 2. A single-award async container for move-only value results | **No** | spec §35.4 (v0.355): a `Task<T>` "declared over an owning choice is a compile error" (QUOTED); probe p07 rejected (MEASURED) | its own proposal: the container, and spec §35.5's trigger list extended to `await` results |
 | 3. The payload governance rule has operated at stdlib scale | **No** | the rule is normative text in stdlib §1 (QUOTED), but the library declares 0 error-payload types and 0 `Result`-returning producers (MEASURED) | shipped payload types whose case sets have had to grow |
-| 4. Observed evidence from the hybrid's clusters, plus a migration analysis | **No** | the decode-cluster pilot has not landed (stdlib §2.15, QUOTED in §2.2); "There are no external users yet" (QUOTED, `CLAUDE.md`). §2.3 supplies site counts for a migration analysis, on test corpora only | the pilot, then programs that consume it |
+| 4. "real programs consuming the decode-cluster Result surfaces" show "branch-shaped consumption dominating boundary-shaped consumption on the frontier surfaces", "plus the migration/compatibility analysis" (QUOTED, 0076 §6) | **No** | there is no decode-cluster `Result` surface to consume: the pilot has not landed (stdlib §2.15, QUOTED in §2.2), and "There are no external users yet" (QUOTED, `CLAUDE.md`). So the branch-versus-boundary test cannot be applied to data. The corpora's catch arms are test oracles and say nothing about it. §2.3 supplies site counts towards a migration analysis, on test corpora only | the pilot; then programs that consume it, with their consumption sites classified branch or boundary; then the compatibility analysis |
 
-Design F does not depend on any of the four, and does not reopen the question.
+Neither the marker nor the atom depends on any of the four, and neither reopens the question.
 
 ### 9.3 Proposal 0061 §2
 
-The gate is for an operator that propagates a `Result` out of an expression. `(try E)` is not
-one: it removes an exit edge instead of adding one, so the "announced flow" objection does not
-apply, and it has no `?` token. The gate is untouched and stays closed.
+The gate is for an operator that propagates a `Result` out of an expression. The deferred
+atom is not one: it removes an exit edge instead of adding one, so the "announced flow"
+objection does not apply, and it has no `?` token. The gate is untouched and stays closed.
+Its discipline ("observed, not predicted") is the one §8.5 borrows for the atom.
 
 ### 9.4 Other rows touched
 
@@ -685,8 +875,9 @@ apply, and it has no `?` token. The gate is untouched and stays closed.
   state-fault catch arm does not silently swallow missing-key lookups"): the same reasoning,
   applied to bands, is the case for the marker.
 - *Forcible domain teardown* (rejected): the ground on which D and E are not recommended.
-- *Changing `TextReader.Read()` to return `char?`*: untouched; F re-rules no landed spelling
-  except the 31 duals, by their own proposal.
+- *Changing `TextReader.Read()` to return `char?`*: untouched. The marker re-rules one landed
+  condition's class (out-of-range `Parse` input gains a derived class, §8.1 item 5); the 31
+  duals move only by their own proposal, after the gate.
 - Rationale §11.3 (`catch` is `case` for exceptions), §11.7, §11.8, §11.10: unchanged.
 - Rationale §17.11 and §18: nothing deferred there is needed.
 
@@ -703,6 +894,8 @@ Not filed. Spec and stdlib items first.
    is state misuse and "the collection was empty"; `ArgumentException` is a caller bug and a
    duplicate key. The failure-signal rule classifies conditions, so the text is consistent,
    but nothing keyed on a type (a catch arm, a lint, a band marker) can tell them apart.
+   1,191 of the corpora's 3,482 catch arms (34%) name one of the three (MEASURED), and the
+   library names them in 48 type-and-section pairs. §8.1 item 5 rules on them.
 3. **Spec §31.3 versus the library's practice.** The spec names the `<exception>` tag as the
    convention; the standard library uses it nowhere and states fault contracts in prose.
 4. **Stdlib §1's tier vocabulary does not fit shape (b).** `TryAcquire`'s twin `Acquire`
@@ -720,7 +913,9 @@ does not resolve; `Exception.SupersededChain` is not a member; `DomainFaultedExc
 FaultStackTrace` is declared but not implemented (the diagnostic cites #2337);
 `Exception.ToString()` renders the type name only, where spec §31.4 requires the message when
 non-empty; `Domain.Spawn` with a record or choice result emits malformed IR (p08); `GetType()`
-is not implemented (the diagnostic cites #487).
+is not implemented (the diagnostic cites #487); an owned nullable call result used as the
+receiver of `?.` or `!` is never disposed, where a non-nullable one is (p19; spec K8.1
+disposes an unbound owned temporary at the end of its full expression).
 
 ## 11. Open questions and what could not be done
 
@@ -736,17 +931,25 @@ is not implemented (the diagnostic cites #487).
    this.
 2. **Unit operands.** `(try File.Delete(p))` yielding `bool` is convenient and a second result
    rule. The alternative is to reject unit operands.
-3. **`(try E)` in `pure` members and contract clauses.** Spec §22.15/§22.16 need a sentence.
+3. **`(try E)` in `pure` members.** §8.1 rejects it in contract clauses; whether a pure body
+   may contain one needs a sentence in spec §22.15.
 4. **User exception classes.** 543 exception class declarations in the corpora derive from an
    `Exception`-family type and would be faults until they opt in. Is "unmarked means fault"
    the right default for user code? (HYPOTHESIS: yes; it is the conservative reading.)
 5. **Should the query/assert pairs shrink too?** Under a `fails` clause they could; F keeps
    them on the ground that every surveyed language keeps both for collections.
-6. **The lowering.** Stage 4 assumes `(try int.Parse(s))` can reach the runtime's
+6. **The lowering.** Stage 3 assumes `(try int.Parse(s))` can reach the runtime's
    non-throwing parse entry. Not prototyped.
 7. **Real programs.** Every corpus here is a test corpus. The sibling lane
    `research/ergonomics-study` is gathering friction data and was not read; its findings
-   should be laid against §2 before any proposal is drafted.
+   should be laid against §2 before any proposal is drafted, and they are the first input to
+   the gate of §8.5.
+8. **A model of the atom.** bzcore-l1 is pinned at v0.345 and has no calls, values or `null`
+   (§5.2). The result channel was not added to it in this lane beyond the outer-local
+   fragment; a model with a failing call, the null result, the band filter and an owned
+   argument is gate condition 2.
+9. **The straddler rulings.** §8.1 item 5 rules three conditions and gives a default for the
+   rest; the 48 type-and-section pairs were counted, not read one by one.
 
 Could not do: measure compile-time cost of any candidate (nothing to build); count the call
 sites candidate B would mark (needs type information; a lower bound is given); probe an
@@ -762,8 +965,8 @@ cited instead); run the matrices or the full suite (out of a lane's scope).
 | `data/stance_gap.py` → `stdlib_stance_gap.tsv`, `.json` | sections documenting an expected failure, with and without a value-shaped form |
 | `data/corpus_usage.py` → `corpus_usage.tsv`, `.json`, `corpus_throw_types.tsv` | failure-signal usage in the four corpora |
 | `data/doc_cost.py` → `doc_cost.json` | words, changelog revisions, proposals and decline rows spent on the tiers |
-| `model/to_null_model.py`, `model/out_vars3_len3_body2.txt` | the two ownership-model checks |
-| `probes/p01…p18*.bzl`, `probes/run.sh`, `probes/run_all.sh`, `probes/RESULTS.txt` | r40 probes and their output |
+| `model/to_null_model.py`, `model/out_vars3_len3_body2.txt` | the three ownership-model checks (bzcore-l1, v0.345) |
+| `probes/p01…p19*.bzl`, `probes/run.sh`, `probes/run_all.sh`, `probes/RESULTS.txt` | r40 probes and their output |
 
 To regenerate the data (the doc-example corpus needs an exported copy):
 

@@ -1,17 +1,24 @@
-// Probe p15: the "to null" stance over an OWNED result, written by hand as the
-// desugaring a call-site form would produce: try { return Open() } catch
-// IOException => null. The nullable owned result binds to `using var`,
-// narrows, and is disposed on every path with today's rules — no new
-// ownership rule is involved (spec §28.10, §7.4, §31.1).
+// Probe p15: the "to null" stance over an OWNED result. `OpenOrNull(name)`
+// stands for `(try new Conn(name))`: a helper that returns null where the
+// constructor raises a failure (an exception whose class implements the
+// marker interface, as in p16) and lets anything else through. The nullable
+// owned result binds to `using var`, narrows, and is disposed on every path
+// with today's rules (spec §28.10, §7.4, §31.1). Other positions: p19.
 module P15;
 
-import System.IO;
+public interface IFailure
+end IFailure;
+
+public class ConnectFailure: Exception, IFailure
+  public constructor(msg: string) base(msg);
+  end constructor;
+end ConnectFailure;
 
 public class Conn
   private _name: string;
   public constructor(name: string)
     if name.Length = 0 then
-      throw new IOException("no such host");
+      throw new ConnectFailure("no such host");
     end if;
     _name := name;
     Console.WriteLine($"  open {name}");
@@ -28,7 +35,7 @@ public class Program
     try
       return new Conn(name);
     catch
-      IOException => return null;
+      IFailure => return null;
     end try;
   end OpenOrNull;
 

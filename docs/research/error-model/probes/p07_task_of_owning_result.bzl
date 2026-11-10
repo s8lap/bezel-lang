@@ -21,7 +21,7 @@ public class Program
 
   public static async method Main(): Task
     case await Program.Connect("db") of
-      Ok(var c)    => do using var conn := move c; Console.WriteLine("connected"); end,
+      Ok(_)        => Console.WriteLine("connected"),
       Error(var m) => Console.WriteLine(m)
     end case;
   end Main;
