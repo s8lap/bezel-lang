@@ -1,0 +1,13 @@
+# Candidate comparison — bounds: vars=3 len=4 features=p0212 [v0.355 base]
+baseline: 81174 programs, 26031 accepted; 13272 accepted programs contain a K4.3 store; VIOLATIONS 0; K4.3 race residuals 12
+baseline trust surface (accepted programs in which some run reads a dead or foreign object THROUGH A STORED BORROW): 36 = race 12 + fault on every run 24 + fault on some run 0
+baseline flag surface (accepted programs that fault on every / some run, any cause): 36 / 0   (1.3 s)
+
+| candidate | accepted | newly accepted | newly unsound | newly rejected | …race | …fault every run (holder/local) | …fault some run (holder/local) | …never fault: a dangling stored borrow exists, unread / no dangling borrow at all | left: race through a stored borrow | left: fault through a stored borrow (every/some) | left: accepted programs with an untracked K4.3 store | witness (clean rejection) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A  the candidate of the note (no erasure rule) | 25815 | 0 | 0 | 216 | 12 | 24/0 | 0/0 | 168 / 12 | 0 | 0/0 | 0 | `new a / newk b a / move c a / disp b` |
+| 0212  A + R5, the owned-erasure rule | 25689 | 0 | 0 | 342 | 12 | 24/0 | 0/0 | 192 / 114 | 0 | 0/0 | 0 | `new a / newk b a / erase c b` |
+| 0212-explicit  the same with a stored-arguments-only mint (oracle) | 25689 | 0 | 0 | 342 | 12 | 24/0 | 0/0 | 192 / 114 | 0 | 0/0 | 0 | `new a / newk b a / erase c b` |
+
+
+(5.3 s)

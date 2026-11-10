@@ -1,0 +1,162 @@
+corpus	unit	expect	class	member	parameter	verdict	detail	parameter_of	dispatched
+rules	tests/conformance/rules/cases/l2_16_1805.bzl	run	Cache	constructor	owned w: Weak<T>	keep-field	_w: Weak<T>	type-parameter	0
+rules	tests/conformance/rules/cases/l4_2_0001.bzl	accept	Helpers	FillOwning	owned item: T	forward	target . Add ( move item )	method-parameter	0
+rules	tests/conformance/rules/cases/s11_3_0006.bzl	reject	Registry	Store	owned item: T	unused		type-parameter	0
+rules	tests/conformance/rules/cases/s11_3_0007.bzl	reject	Registry	Store	owned item: T	unused		type-parameter	0
+rules	tests/conformance/rules/cases/s15_3_0021.bzl	reject	Holder	constructor	owned f: T	keep-field	F: T	type-parameter	0
+rules	tests/conformance/rules/cases/s15_3_0040.bzl	run	Holder3	constructor	owned f: T	keep-field	F: T	type-parameter	0
+rules	tests/conformance/rules/cases/s15_3_0050.bzl	run	Holder	constructor	owned f: T	keep-field	F: T	type-parameter	0
+rules	tests/conformance/rules/cases/s15_4_1_0006.bzl	run	Pool	constructor	owned items: OwningArray<T>	keep-field	_items: OwningArray<T>	type-parameter	0
+rules	tests/conformance/rules/cases/s15_4_1_0006.bzl	run	Pool	FromCollectionLiteral	owned elements: OwningArray<T>	forward	Pool < T > ( move elements )	type-parameter	0
+rules	tests/conformance/rules/cases/s22_6_0017.bzl	reject	Box	Put	owned item: T	unused		type-parameter	0
+rules	tests/conformance/rules/cases/s22_6_0018.bzl	reject	Box	Put	owned item: T	unused		type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0025.bzl	reject	Program	G	owned x: T	use		method-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0050.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0051.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0052.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0053.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0054.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0055.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0056.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0057.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0058.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0059.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0060.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0063.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0066.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0067.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0068.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0069.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0071.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0072.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_10_0073.bzl	run	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_12_0046.bzl	run	Program	Use	owned x: T	forward	await using var d := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_12_0047.bzl	run	Program	Use	owned x: T	forward	await using var d := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_1_0009.bzl	accept	Factory	Adopt	owned item: T	forward	using var i := move item ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_1_0010.bzl	reject	Factory	Adopt	owned item: T	unused		method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0204.bzl	run	OwningCache	Add	owned item: T	forward	_items . Add ( move item )	type-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0247.bzl	run	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0248.bzl	run	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0249.bzl	run	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0250.bzl	run	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0251.bzl	run	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0252.bzl	run	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0253.bzl	run	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0254.bzl	run	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0255.bzl	run	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0256.bzl	run	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0257.bzl	run	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0258.bzl	run	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0259.bzl	reject	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0260.bzl	reject	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0261.bzl	reject	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0262.bzl	reject	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0263.bzl	reject	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0264.bzl	reject	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0265.bzl	reject	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0266.bzl	reject	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0267.bzl	reject	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0268.bzl	reject	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0269.bzl	reject	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0270.bzl	reject	R	SinkT	owned x: T	forward	using var k := move x ;	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0270.bzl	reject	R	G2	owned x: T	forward	SinkT < T > ( move x )	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0271.bzl	reject	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0272.bzl	reject	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0273.bzl	reject	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0274.bzl	reject	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0275.bzl	reject	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0276.bzl	reject	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0277.bzl	reject	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0278.bzl	reject	Box	constructor	owned v: T	keep-field	V: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0301.bzl	run	Box	Id	owned x: T	keep-return	owned T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0301.bzl	run	Program	Gen	owned x: T	keep-return	owned T	method-parameter	0
+rules	tests/conformance/rules/cases/s28_3_0313.bzl	run	C	Id	owned x: T	use		method-parameter	0
+rules	tests/conformance/rules/cases/s28_5_0014.bzl	reject	Box	constructor	owned slot: T	keep-field	_slot: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_5_0015.bzl	accept	Box	constructor	owned slot: T	keep-field	_slot: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_5_0021.bzl	run	Box	constructor	owned slot: T	keep-field	_slot: T	type-parameter	0
+rules	tests/conformance/rules/cases/s28_5_0022.bzl	reject	Box	constructor	owned slot: T	keep-field	_slot: T	type-parameter	0
+rules	tests/conformance/rules/cases/s31_1_0012.bzl	run	Program	M	owned x: T	ERASE-throw		method-parameter	0
+rules	tests/conformance/rules/cases/s31_1_0013.bzl	run	Program	M	owned x: T	ERASE-throw		method-parameter	0
+rules	tests/conformance/rules/cases/s31_1_0014.bzl	run	Thrower	Go	owned x: T	ERASE-throw		type-parameter	0
+rules	tests/conformance/rules/cases/s31_1_0016.bzl	reject	Program	M	owned x: T	use		method-parameter	0
+rules	tests/conformance/rules/cases/s31_1_0017.bzl	reject	Program	M	owned x: T	ERASE-throw		method-parameter	0
+rules	tests/conformance/rules/cases/s31_1_0018.bzl	reject	Program	M	owned x: T	ERASE-throw		method-parameter	0
+rules	tests/conformance/rules/cases/s31_1_0019.bzl	reject	Program	M	owned x: T	ERASE-throw		method-parameter	0
+rules	tests/conformance/rules/cases/s31_1_0020.bzl	reject	Program	M	owned x: T?	ERASE-throw		method-parameter	0
+rules	tests/conformance/rules/cases/s35_3_0025.bzl	run	Box	Wrap	owned x: T	forward	return Ok ( move x )	method-parameter	0
+rules	tests/conformance/rules/cases/s35_8_0013.bzl	run	P	G	owned t: T	use		method-parameter	0
+rules	tests/conformance/rules/cases/s9_7_0017.bzl	reject	Fns	Pass	owned a: T	use		method-parameter	0
+docs	tests/conformance/cases/codegen_0019.bzl	skip/n/a	Shared	constructor	owned value: T	unused		type-parameter	0
+docs	tests/conformance/cases/codegen_0020.bzl	skip/n/a	IOwningCollection	Add	owned item: T	unused		type-parameter	0
+docs	tests/conformance/cases/codegen_0028.bzl	skip/n/a	FrozenArray	From	owned buffer: OwningBuffer<T>	unused		type-parameter	0
+docs	tests/conformance/cases/codegen_0030.bzl	fragment/compiles	Task	FromOwnedResult	owned value: T	unused		method-parameter	0
+docs	tests/conformance/cases/codegen_0030.bzl	fragment/compiles	Task	WhenAll	owned tasks: OwningArray<OwningTask<T>>	unused		method-parameter	0
+docs	tests/conformance/cases/codegen_0030.bzl	fragment/compiles	Task	WhenEach	owned tasks: OwningArray<OwningTask<T>>	unused		method-parameter	0
+docs	tests/conformance/cases/spec_0075.bzl	fragment/compiles	OwningCache	Add	owned item: T	forward	_items . Add ( move item )	type-parameter	0
+docs	tests/conformance/cases/stdlib_0031.bzl	skip/n/a	Shared	constructor	owned value: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0032.bzl	fragment/compiles	Shared	constructor	owned value: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0036.bzl	fragment/compiles	IOwningCollectionLiteralTarget	FromCollectionLiteral	owned elements: OwningArray<T>	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0047.bzl	skip/n/a	IOwningCollection	Add	owned item: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0047.bzl	skip/n/a	IOwningList	Insert	owned item: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0050.bzl	skip/n/a	OwningArray	FromCollectionLiteral	owned elements: OwningArray<T>	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0050.bzl	skip/n/a	OwningArray	Add	owned item: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0050.bzl	skip/n/a	OwningArray	AddRange	owned items: OwningArray<T>	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0050.bzl	skip/n/a	OwningArray	Insert	owned item: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0051.bzl	fragment/compiles	OwningArray	FromCollectionLiteral	owned elements: OwningArray<T>	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0051.bzl	fragment/compiles	OwningArray	Add	owned item: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0051.bzl	fragment/compiles	OwningArray	AddRange	owned items: OwningArray<T>	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0051.bzl	fragment/compiles	OwningArray	Insert	owned item: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0052.bzl	fragment/compiles	OwningArray	FromCollectionLiteral	owned elements: OwningArray<T>	keep-return	owned OwningArray<T>	type-parameter	0
+docs	tests/conformance/cases/stdlib_0052.bzl	fragment/compiles	OwningArray	Add	owned item: T	use		type-parameter	0
+docs	tests/conformance/cases/stdlib_0054.bzl	skip/n/a	OwningLinkedList	FromCollectionLiteral	owned elements: OwningArray<T>	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0059.bzl	skip/n/a	OwningDictionary	Add	owned value: V	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0059.bzl	skip/n/a	OwningDictionary	TryAdd	owned value: V	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0059.bzl	skip/n/a	DrainedEntry	constructor	owned value: V	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0060.bzl	fragment/compiles	OwningDictionary	Add	owned value: V	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0060.bzl	fragment/compiles	OwningDictionary	TryAdd	owned value: V	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0060.bzl	fragment/compiles	DrainedEntry	constructor	owned value: V	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0061.bzl	fragment/compiles	OwningDictionary	Add	owned value: V	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0061.bzl	fragment/compiles	OwningDictionary	TryAdd	owned value: V	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0061.bzl	fragment/compiles	DrainedEntry	constructor	owned value: V	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0062.bzl	fragment/compiles	Entry	constructor	owned value: V	keep-field	Value: V?	type-parameter	0
+docs	tests/conformance/cases/stdlib_0062.bzl	fragment/compiles	Entry	constructor	owned next: Entry<K,V>?	keep-field	Next: Entry<K,V>?	type-parameter	0
+docs	tests/conformance/cases/stdlib_0062.bzl	fragment/compiles	OwningDictionary	Add	owned value: V	forward	V > ( key , move value ,	type-parameter	0
+docs	tests/conformance/cases/stdlib_0063.bzl	skip/n/a	OwningSet	FromCollectionLiteral	owned elements: OwningArray<T>	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0065.bzl	skip/n/a	OwningStack	FromCollectionLiteral	owned elements: OwningArray<T>	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0065.bzl	skip/n/a	OwningQueue	FromCollectionLiteral	owned elements: OwningArray<T>	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0087.bzl	skip/n/a	FrozenArray	From	owned buffer: OwningBuffer<T>	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0088.bzl	fragment/compiles	FrozenArray	From	owned buffer: OwningBuffer<T>	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0117.bzl	skip/n/a	Task	FromOwnedResult	owned value: T	unused		method-parameter	0
+docs	tests/conformance/cases/stdlib_0117.bzl	skip/n/a	Task	WhenAll	owned tasks: OwningArray<OwningTask<T>>	unused		method-parameter	0
+docs	tests/conformance/cases/stdlib_0118.bzl	fragment/compiles	Task	FromOwnedResult	owned value: T	unused		method-parameter	0
+docs	tests/conformance/cases/stdlib_0118.bzl	fragment/compiles	Task	WhenAll	owned tasks: OwningArray<OwningTask<T>>	unused		method-parameter	0
+docs	tests/conformance/cases/stdlib_0127.bzl	skip/n/a	ChannelSender	Send	owned item: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0127.bzl	skip/n/a	ChannelSender	SendAsync	owned item: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0129.bzl	fragment/compiles	ChannelSender	Send	owned item: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0129.bzl	fragment/compiles	ChannelSender	SendAsync	owned item: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0131.bzl	skip/n/a	Locked	constructor	owned value: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0131.bzl	skip/n/a	RwLocked	constructor	owned value: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0132.bzl	fragment/compiles	Locked	constructor	owned value: T	unused		type-parameter	0
+docs	tests/conformance/cases/stdlib_0132.bzl	fragment/compiles	RwLocked	constructor	owned value: T	unused		type-parameter	0
+lit	tests/lit/owned_type_requirement_accept_1797.bzl	accept	R	A3	owned x: T	keep-return	owned T	method-parameter	0
+lit	tests/lit/owned_type_requirement_accept_1797.bzl	accept	R	A4	owned x: T	keep-return	owned T	method-parameter	0
+lit	tests/lit/owned_type_requirement_value_constraint_accept_1817.bzl	accept	R	A1	owned x: T	keep-return	owned T	method-parameter	0
+lit	tests/lit/owned_type_requirement_value_constraint_accept_1817.bzl	accept	R	A2	owned x: T	keep-return	owned T	method-parameter	0
+lit	tests/lit/owned_type_requirement_value_constraint_accept_1817.bzl	accept	R	A3	owned x: T	keep-return	owned T	method-parameter	0
+lit	tests/lit/owned_type_requirement_value_constraint_reject_1817.bzl	reject	R	P1	owned x: T	unused		method-parameter	0
+lit	tests/lit/sema/owned_iter_var_discharge_834__drain_and_await_generic_no_autodrop_warning.bzl	accept	C	WhenAllOwned	owned tasks: OwningArray<OwningTask<T>>	forward	using var taskArray := move tasks ;	method-parameter	0
+lit	tests/lit/sema/sema_overload__owned_generic_typeparam_collapse_1873.bzl	reject	Box	Store	owned x: T	unused		type-parameter	0
+lit	tests/lit/sema/sema_overload__owned_iface_typeparam_collapse_1873.bzl	reject	IStore	Put	owned x: T	unused		type-parameter	0
+gtest	tests/codegen/owned_param_owned_field_store_vtableless_5274_test.cpp	mixed	Box	constructor	owned x: T	keep-field	v: T	type-parameter	0
+gtest	tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp	mixed	Program	M	owned x: T	ERASE-throw		method-parameter	0
+gtest	tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp	mixed	Program	M	owned x: T	ERASE-throw		method-parameter	0
+gtest	tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp	mixed	Program	M	owned x: T	ERASE-throw		method-parameter	0
+gtest	tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp	mixed	Thrower	Go	owned x: T	ERASE-throw		type-parameter	0
+gtest	tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp	mixed	Program	M	owned x: T?	ERASE-throw		method-parameter	0
+gtest	tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp	mixed	Program	M	owned x: T	ERASE-throw		method-parameter	0
+gtest	tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp	mixed	Program	M	owned x: T	ERASE-throw		method-parameter	0
+gtest	tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp	mixed	Program	M	owned x: T	ERASE-throw		method-parameter	0
+gtest	tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp	mixed	Program	M	owned x: T	ERASE-throw		method-parameter	0
+gtest	tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp	mixed	Program	M	owned x: T	ERASE-throw		method-parameter	0
+gtest	tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp	mixed	Program	M	owned x: T?	ERASE-throw		method-parameter	0
+gtest	tests/parser/e2e_kitchen_sink_test.cpp	mixed	Service	Add	owned item: T	use		type-parameter	0

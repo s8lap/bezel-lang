@@ -1,0 +1,84 @@
+proposal 0212 corpus measurement — the note's scanner re-run (base/) plus the 0212 passes
+units: {'rules': 5902, 'docs': 802, 'lit': 2574, 'gtest': 243} (total 9521); parse errors 0
+
+== the note's numbers, reproduced at this base (base/summary.txt is byte-identical to ../../data/out/summary.txt when the tree is unchanged)
+K4.3 field/collection store sites: 157; by storing member kind: {'ctor': 93, 'method': 52, 'primary': 3, 'init': 7, 'setter': 2}
+construction sites of a borrow-bearing class: 312; by holder position: {'local': 129, 'usingvar': 57, 'arg-unknown': 5, 'returned': 81, 'reassign-local': 2, 'field-owned': 1, 'other': 1, 'field-init': 2, 'arg-plain': 30, 'temp-receiver': 4}
+borrow-bearing classes: 543 of 796 class rows in classes.tsv (the note's summary counts every class)
+  [accepted] 58 store sites under 0212 R4: {'admitted as written': 44, 'needs `scoped` on a member that is not a constructor': 12, 'rejected: a store that relates two parameters (rewrite: the storing object is the receiver, `scoped` on the stored one)': 1, 'rejected: a method keeps an `Object` parameter (rewrite: declare the parameter at the stored type)': 1}
+  [expected-reject] 29 store sites under 0212 R4: {'admitted as written': 19, 'rejected: a method keeps an `Object` parameter (rewrite: declare the parameter at the stored type)': 1, 'needs `scoped` on a member that is not a constructor': 9}
+  [gtest] 37 store sites under 0212 R4: {'rejected: a store that relates two parameters (rewrite: the storing object is the receiver, `scoped` on the stored one)': 8, 'admitted as written': 19, 'needs `scoped` on a member that is not a constructor': 10}
+
+== R1 interfaces
+interfaces declared in the corpora: 765; borrow-bearing by derivation: 11 (by a class- or interface-typed `scoped` parameter: 0; by a property of a class or interface type declared in the unit and not marked readonly: 11)
+    tests/codegen/set_owned_accessor_borrow_sink_5236_test.cpp [gtest/mixed] interface IHold: property Val: Item (not readonly)
+    tests/codegen/setter_fresh_temp_dispose_5209_test.cpp [gtest/mixed] interface IA: property Val: Item (not readonly)
+    tests/sema/type_param_identity_6316_test.cpp [gtest/mixed] interface N: property Val: Box<Exception>? (not readonly)
+    tests/sema/type_param_identity_6316_test.cpp [gtest/mixed] interface N: property Val: Box<Exception>? (not readonly)
+    tests/sema/type_param_identity_6316_test.cpp [gtest/mixed] interface N: property Val: Box<Exception>? (not readonly)
+    tests/sema/type_param_identity_6316_test.cpp [gtest/mixed] interface N: property Val: Box<Exception>? (not readonly)
+    tests/sema/type_param_identity_6316_test.cpp [gtest/mixed] interface N: property Val: Box<Exception>? (not readonly)
+    tests/sema/type_param_identity_6316_test.cpp [gtest/mixed] interface N: property Val: Box<Exception>? (not readonly)
+    tests/sema/type_param_identity_6316_test.cpp [gtest/mixed] interface N: property Val: Box<Exception>? (not readonly)
+    tests/sema/type_param_identity_6316_test.cpp [gtest/mixed] interface N: property Val: Box<Exception>? (not readonly)
+    tests/sema/type_param_identity_6316_test.cpp [gtest/mixed] interface N: property Val: Box<Exception>? (not readonly)
+borrow-bearing classes that list a base or interface that is not borrow-bearing: 71 (of which implement an interface declared in the same unit: 13)
+owned upcasts of a borrow-bearing instance to a type that is not borrow-bearing (the note's count, re-read): 0
+
+== R5 owned erasure in generic bodies
+`owned` parameters typed at a type parameter, in members of generic declarations: 161
+  by where the parameter goes: {'ERASE': 18, 'forward': 35, 'keep': 47, 'unused': 54, 'use': 7}
+  of which in a dispatched generic method (an interface, virtual, abstract or override method with its own type parameter): 0
+    ERASING: tests/conformance/rules/cases/s31_1_0012.bzl [rules/run] Program.M(owned x: T) -> ERASE-throw 
+    ERASING: tests/conformance/rules/cases/s31_1_0013.bzl [rules/run] Program.M(owned x: T) -> ERASE-throw 
+    ERASING: tests/conformance/rules/cases/s31_1_0014.bzl [rules/run] Thrower.Go(owned x: T) -> ERASE-throw 
+    ERASING: tests/conformance/rules/cases/s31_1_0017.bzl [rules/reject] Program.M(owned x: T) -> ERASE-throw 
+    ERASING: tests/conformance/rules/cases/s31_1_0018.bzl [rules/reject] Program.M(owned x: T) -> ERASE-throw 
+    ERASING: tests/conformance/rules/cases/s31_1_0019.bzl [rules/reject] Program.M(owned x: T) -> ERASE-throw 
+    ERASING: tests/conformance/rules/cases/s31_1_0020.bzl [rules/reject] Program.M(owned x: T?) -> ERASE-throw 
+    ERASING: tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp [gtest/mixed] Program.M(owned x: T) -> ERASE-throw 
+    ERASING: tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp [gtest/mixed] Program.M(owned x: T) -> ERASE-throw 
+    ERASING: tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp [gtest/mixed] Program.M(owned x: T) -> ERASE-throw 
+    ERASING: tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp [gtest/mixed] Thrower.Go(owned x: T) -> ERASE-throw 
+    ERASING: tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp [gtest/mixed] Program.M(owned x: T?) -> ERASE-throw 
+    ERASING: tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp [gtest/mixed] Program.M(owned x: T) -> ERASE-throw 
+    ERASING: tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp [gtest/mixed] Program.M(owned x: T) -> ERASE-throw 
+    ERASING: tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp [gtest/mixed] Program.M(owned x: T) -> ERASE-throw 
+    ERASING: tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp [gtest/mixed] Program.M(owned x: T) -> ERASE-throw 
+    ERASING: tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp [gtest/mixed] Program.M(owned x: T) -> ERASE-throw 
+    ERASING: tests/codegen/throw_bare_typeparam_exception_bound_6791_test.cpp [gtest/mixed] Program.M(owned x: T?) -> ERASE-throw 
+  instantiations of an erasing declaration named in its unit: 6; at a class or interface: 0; at a borrow-bearing class: 0
+generic instantiations whose type argument is a borrow-bearing class of the unit: 5 (user generic: 1, standard or unknown generic: 4)
+  by generic: {'Channel': 3, 'Array': 1, 'G': 1}
+`throw new C(...)` of a borrow-bearing class C: 0; with an identifier argument (a possible carried source): 0
+
+== R6 the destructor window
+borrow-bearing classes with a destructor: 8; whose destructor body names one of its borrow fields: 1; whose destructor calls an instance method of its class: 0
+    tests/conformance/rules/cases/s22_10_0019.bzl [rules/run] class Box: borrow fields src; named in destructor: -; instance methods called: -
+    tests/lit/dispose_elements_retired_2081.bzl [lit/accept] class BankAccount: borrow fields _transactions; named in destructor: _transactions; instance methods called: -
+    tests/lit/sema/readonly_field_narrowing_2085__non_final_segment_rejected.bzl [lit/accept] class Outer: borrow fields _inner; named in destructor: -; instance methods called: -
+    tests/lit/sema/sema_priv__internal_field_of_private_nested_type_rejected_956.bzl [lit/reject] class Outer: borrow fields _x; named in destructor: -; instance methods called: -
+    tests/lit/sema/send_1732_imported_class_sendability_lib.bzl [lit/accept] class Tree: borrow fields Parent; named in destructor: -; instance methods called: -
+    tests/lit/sema/send_600_class_types__closed_class_one_non_sendable_subclass_rejected_30_14.bzl [lit/reject] class BadRect: borrow fields Ref; named in destructor: -; instance methods called: -
+    tests/lit/sema/send_600_class_types__sealed_class_with_non_owned_class_field_rejected_30_14_rule2.bzl [lit/reject] class Tree: borrow fields Parent; named in destructor: -; instance methods called: -
+    tests/lit/sema/send_600_class_types__sealed_class_with_object_field_rejected_30_14_rule3.bzl [lit/reject] class Bag: borrow fields Payload; named in destructor: -; instance methods called: -
+constructions that carry `this` (self-sourced): 0; constructions held directly in a field: 3
+    tests/conformance/rules/cases/s28_3_0206.bzl [rules/run] line 25: new A in H.constructor held as field-owned _a; carries fresh:literal
+    tests/lit/sema/send_1732_imported_class_sendability_lib.bzl [lit/accept] line 45: new Tree in OwnsNonSendable.Bad held as field-init Bad; carries 
+    tests/ownership/accessor_set_owned_field_store_5252_test.cpp [gtest/mixed] line 24: new Reg in B._reg held as field-init _reg; carries 
+stores whose source is the receiver, one of its fields, or kind 1: 5
+
+== R7 async
+`async` methods: 1064; with a parameter of borrow-bearing class type: plain 0, owned 0; with a task result of borrow-bearing class type: 0
+a local instance of a borrow-bearing class, built in an `async` body, with an `await` between its declaration and a later use: 0 (over a parameter or `this`: 0; over frame-resident sources or none: 0)
+
+== R4 static-held stores
+a method that stores a plain parameter into a static field or a static-held collection: 2
+    tests/conformance/rules/cases/s28_3_0149.bzl [rules/reject] line 22 Gate.Install -> static _m
+    tests/conformance/rules/cases/s28_3_0150.bzl [rules/reject] line 27 Cache.Prime -> static _cfg
+
+== PER-PROGRAM ROLL-UP under 0212, accepted tier (rules, docs, lit units the spec expects to compile)
+5750 accepted-tier programs; 131 hold a K4.3 store, construct a borrow-bearing class, or meet a 0212 pass
+  unchanged 114; compile after a `scoped` marker 12; rejected, must be rewritten 5
+  newly rejected by the rules 0212 adds to the note's candidate (generic erasure, static store): 0 programs
+  the rejected programs: s22_6_2312.bzl, s28_11_0041.bzl, s28_3_0119.bzl, s28_3_0205.bzl, s28_3_0206.bzl

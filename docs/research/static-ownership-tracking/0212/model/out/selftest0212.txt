@@ -1,0 +1,62 @@
+--- R5 erasure: a holder converted to a type that announces nothing, its source disposed, then read
+    new a / newk b a / erase c b / disp a / euse c
+    v0.355: accept  runs: ['FAULT']  bad: []  OK
+    0212: reject:0212-owned-erasure  runs: None  bad: []  OK
+--- R5 erasure: the same with the source sent to another domain (no flag: a race at the baseline)
+    new a / newk b a / erase c b / send a / euse c
+    v0.355: accept  runs: ['RACE']  bad: ['RACE']  OK
+    0212: reject:0212-owned-erasure  runs: None  bad: []  OK
+--- R2 mint: a holder carries the argument its constructor only reads, so a transfer of that argument is frozen
+    new a / new c / newk2 b a c / send c / kuse b
+    v0.355: accept  runs: ['ok']  bad: []  OK
+    0212: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+--- R2 mint: the stored argument is frozen under either mint rule
+    new a / new c / newk2 b a c / send a / kuse b
+    v0.355: accept  runs: ['RACE']  bad: ['RACE']  OK
+    0212: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+--- destructor window, §28.12 (v0.355): a child destructor reads its owner in the cascade of its owner, on a live instance
+    new a / link a
+    v0.355: accept  runs: ['ok']  bad: []  OK
+    0212: accept  runs: ['ok']  bad: []  OK
+--- destructor window on r40: the flag is set when Dispose() begins, so the same read faults
+    new a / link a
+    v0.355: accept  runs: ['FAULT']  bad: []  OK
+    0212: accept  runs: ['FAULT']  bad: []  OK
+--- destructor window: a linked child moved out carries its owner; the owner disposed first makes the release of the child a certain fault
+    new a / link a / fmove c a / disp a
+    v0.355: accept  runs: ['FAULT']  bad: []  OK
+    0212: reject:0205-holder-release-after-dominating-kill  runs: None  bad: []  OK
+--- destructor window: a linked child moved out and released before its owner is clean
+    new a / link a / fmove c a
+    v0.355: accept  runs: ['ok']  bad: []  OK
+    0212: accept  runs: ['ok']  bad: []  OK
+--- R3 release: a drop-on-overwrite of a moved-out child is a release, so its owner may not be sent away before it
+    new a / link a / fmove b a / send a / asg b
+    v0.355: accept  runs: ['RACE']  bad: ['RACE']  OK
+    0212: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+--- R3 release: the same overwrite after the owner was disposed is a certain fault
+    new a / link a / fmove b a / disp a / asg b
+    v0.355: accept  runs: ['FAULT']  bad: []  OK
+    0212: reject:0205-holder-release-after-dominating-kill  runs: None  bad: []  OK
+--- R2: a reassigned binding takes a fresh value and carries nothing, so the old owner may then be sent away
+    new a / link a / fmove b a / asg b / send a
+    v0.355: accept  runs: ['ok']  bad: []  OK
+    0212: accept  runs: ['ok']  bad: []  OK
+--- R3 release: an instance already disposed explicitly is not live past that release, so its source may then be sent away
+    new a / newk b a / disp b / send a
+    v0.355: accept  runs: ['ok']  bad: []  OK
+    0212: accept  runs: ['ok']  bad: []  OK
+--- R2 clause 2: a linked child re-homed into another owner brings its old owner to the new one (declared-before)
+    new b / new a / link a / fmove c a / fstm b c
+    v0.355: accept  runs: ['FAULT']  bad: []  OK
+    0212: reject:A-declared-before  runs: None  bad: []  OK
+--- R2 clause 2: re-homed into an owner declared after the old one is clean
+    new a / link a / fmove c a / new b / fstm b c
+    v0.355: accept  runs: ['ok']  bad: []  OK
+    0212: accept  runs: ['ok']  bad: []  OK
+--- R2 clause 2: re-homed, then the old owner disposed: the release of the new owner is a certain fault
+    new a / link a / fmove c a / new b / fstm b c / disp a
+    v0.355: accept  runs: ['FAULT']  bad: []  OK
+    0212: reject:0205-holder-release-after-dominating-kill  runs: None  bad: []  OK
+
+selftest0212: 30 passed, 0 failed

@@ -1,0 +1,41 @@
+# Supporting research for proposal 0212 (borrow-bearing classes)
+
+Research lane, 2026-11-10. Base: `a77e4718a` (spec **v0.355**; the twelve documents, `src/` and `tests/` are identical to `a30bb11df`, the base of the note in the parent directory). Compiler for probes: the r40 prerelease `bezelc 0.0.0-a30bb11d`. Nothing under `src/`, `tests/` or the normative documents was edited.
+
+The proposal is [`docs/proposals/0212-borrow-bearing-classes.md`](../../../proposals/0212-borrow-bearing-classes.md). It states the conclusions; this directory holds what they were measured with. Labels are the note's: **MEASURED** (a script or probe here produced it), **QUOTED** (from the tree), **HYPOTHESIS**.
+
+## What is here
+
+| path | what it is | how to re-run |
+|---|---|---|
+| `probes/*.bzl`, `probes/run_all.sh`, `probes/results.md` | 33 programs, each compiled by r40 in three modes (checked with the trust report, checked, unchecked) and run. `d*`: the destructor window. `g*`: owned erasure, generic and concrete. `a*`: async. `q*`: the open questions. Each file's second line states what it tests, what the spec expects, and the verdict proposal 0212 gives. | `cd probes && ./run_all.sh . '[adgq]*.bzl' > results.md` |
+| `model/bzcore_0212.py` | A copy of `../model/bzcore_static.py` with the additions its docstring lists: a two-argument mint (`newk2`), owned erasure (`erase`, `euse`), the owned-argument clause at `fstm`, a child destructor that reads its back-pointer (`--qdtor`), and the r40 flag timing (`--r40-teardown`). | `python3 -I bzcore_0212.py selftest` (the note's 42 cases) and `selftest0212` (30 checks) |
+| `model/run_sweeps.sh`, `model/table.py`, `model/out/compare_*.txt` | The sweeps of the proposal's §5.2 (`table.py` renders them as its table): the v0.355 baseline against the note's candidate, 0212, and an oracle whose mint carries only stored arguments. | `./run_sweeps.sh` (about 20 minutes) |
+| `model/breakdown.py`, `model/out/breakdown_*.txt` | For one bound, the rule that rejects each baseline-accepted program and what that program did at the baseline. | `python3 -I breakdown.py [--kdtor] [--qdtor]` |
+| `data/scan_0212.py`, `data/out/` | Re-runs the note's scanner unmodified (`out/base/`, whose `summary.txt` is byte-identical to the note's) and adds one pass per rule 0212 adds. `out/summary_0212.txt` is the result the proposal's §6 quotes. | `python3 -I scan_0212.py --head <repo> --docs <exported docs corpus> --out out` |
+| `data/scan_collection_transfer.py`, `data/out/collection_transfer.txt` | One extra count: a local owned binding stored into a local borrowing collection and then moved (4 sites, 0 rejected under 0212). | `python3 -I scan_collection_transfer.py --head <repo> --docs <exported docs corpus> --out out/collection_transfer.txt` |
+| `check_anchors.py` | Verifies that each `old` anchor the proposal's §8 quotes occurs exactly once at the base, and that every section the proposed text links to exists. `--mentions` lists the consequential mentions of §8.13. | `python3 -I check_anchors.py --mentions` |
+
+The doc-example corpus the scanner reads is extracted from an exported copy of the documents with `scripts/extract_doc_examples.py`, as the note describes; the committed corpus is never regenerated (#1380).
+
+## Findings along the way (not filed)
+
+Compiler findings, all MEASURED on r40 against the v0.355 text.
+
+- **F1. §28.12's live-instance rule (#7506) is not implemented.** The disposed flag is set when `Dispose()` begins. A destructor body's call of its own instance method faults (d01; the rule-corpus case `s28_12_0014` states the spec's verdict), and so does a child's read of its owner in the cascade (d03, d11) or in the owner's destructor body (d02). This is the note's S2: an implementation divergence, not an open spec question.
+- **F2. An explicit `Dispose()` of a non-nullable owned field inside a destructor is rejected** as a double free (d02's first form), against §28.8.1 ("A destructor that wants the value of a field its class declares released before the rest of its body runs disposes it in place"). The `?.` spelling over a nullable field compiles.
+- **F3. The replacing `move` (`move f with e`) is not implemented** (g08's first form; the diagnostic says so).
+- **F4. A member access through a class-typed `scoped` parameter is rejected** with the callback rule's message, "it may not be read as a value" (q05). §28.14's scoped construction bars returning it and storing it elsewhere, and calls passing it on "an ordinary borrow argument".
+- **F4b. `scoped` is not admitted at a parameter declared at a type parameter, and a `scoped` parameter may only be forwarded to another `scoped` parameter** (q06): it cannot be passed to a standard collection's `Add`, which §28.14 calls an ordinary borrow argument. An identifier in an extension head's type-argument list is a type parameter (§26.4), so `extension Array<Item>` declares a generic extension.
+- **F5. Reads of freed memory return normally in an unchecked build**: g01–g08, a03, a04 and a07 exit 0 and print an empty line where the checked build raises `DisposedAccessException`; d04, d07, d08 and d10 segfault.
+- **F6. `Shared<T>` requires a proper class type** (g05's first form), so it never erases a borrow-bearing instance to an interface. `OwningArray<IShow>` does.
+
+Spec observations.
+
+- **O1.** §28.12's sentence on an already-disposed owned field names the one read in the teardown window that is not sound. It is reachable with no stored borrow (d08). The proposal names it as a K5.6-class residual (§3.2).
+- **O2.** §28.9 keys the trivial-dispose ceremony exemption on the declared type where no producer is known. That key is right for a lint and would be unsound as "the release runs no user code"; the proposal's release rule uses the produced type, or a `sealed` declared class.
+- **O3.** With a mint that carries every argument, §28.2's dominated-use rule ("every value in the holder's source set") does not fire when the stored one of two sources is disposed. MEASURED in the model: 24 programs at 3 variables and 4 statements with a holder destructor. The proposal's Q11.
+
+## What could not be done
+
+The compiler was not built or modified: no rule of proposal 0212 was run, and its checker cost is unmeasured. The model has one body and no calls, generics or frames. The generics matrix was not run against the erasure rule. `OwningSlotMap<T>` is not implemented in r40 (#4604), so the owning-registry rewrite was not probed.

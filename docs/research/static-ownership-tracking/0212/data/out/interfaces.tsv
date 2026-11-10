@@ -1,0 +1,12 @@
+corpus	unit	expect	interface	why
+gtest	tests/codegen/set_owned_accessor_borrow_sink_5236_test.cpp	mixed	IHold	property Val: Item (not readonly)
+gtest	tests/codegen/setter_fresh_temp_dispose_5209_test.cpp	mixed	IA	property Val: Item (not readonly)
+gtest	tests/sema/type_param_identity_6316_test.cpp	mixed	N	property Val: Box<Exception>? (not readonly)
+gtest	tests/sema/type_param_identity_6316_test.cpp	mixed	N	property Val: Box<Exception>? (not readonly)
+gtest	tests/sema/type_param_identity_6316_test.cpp	mixed	N	property Val: Box<Exception>? (not readonly)
+gtest	tests/sema/type_param_identity_6316_test.cpp	mixed	N	property Val: Box<Exception>? (not readonly)
+gtest	tests/sema/type_param_identity_6316_test.cpp	mixed	N	property Val: Box<Exception>? (not readonly)
+gtest	tests/sema/type_param_identity_6316_test.cpp	mixed	N	property Val: Box<Exception>? (not readonly)
+gtest	tests/sema/type_param_identity_6316_test.cpp	mixed	N	property Val: Box<Exception>? (not readonly)
+gtest	tests/sema/type_param_identity_6316_test.cpp	mixed	N	property Val: Box<Exception>? (not readonly)
+gtest	tests/sema/type_param_identity_6316_test.cpp	mixed	N	property Val: Box<Exception>? (not readonly)
