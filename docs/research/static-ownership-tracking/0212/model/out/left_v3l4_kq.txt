@@ -1,0 +1,6 @@
+# what 0212 leaves — vars=3 len=4 features=p0212 --kdtor --qdtor
+accepted under 0212: 23877; with a stale read through a stored borrow on some run: 48
+| cause | outcome | the read that meets the flag | programs | shortest witness |
+|---|---|---|---|---|
+| announced kill of one source of two (a two-argument mint, then disp): K4.2 | FAULT | kdtor | 24 | `new a / new b / newk2 c a b / disp a` |
+| slot kill (fst after fbrw): K5.6 | FAULT | kdtor | 24 | `new a / fbrw b a / fst a / newk c b` |
