@@ -29,6 +29,20 @@ model), extended with three statements, two rule knobs and two machine variants.
     to that release and not past it. The first version counted the scope end and Dispose() only; the 5-statement sweep
     then left 6 races (`new a / link a / fmove b a / send a / asg b`), which `selftest0212` now pins.
 
+  REVISION 2 (after the adversarial critique of the first draft, f72926c68). Three more statements, three rule knobs
+  and one machine variant, for the places the first draft let a source set be lost:
+    newko y x     Make(x, out var y);          an `out owned` recipient of a holder built over x (critic c02)
+    wrap y x      var y := Slot.Full(move x);  an owning choice whose owned payload is the holder x (critic c05)
+    wuse y        (case y of Full(a) => a.Show())   a member access through the wrapped holder's stored borrow
+    out_owned_mint        revised R2: an `out owned` recipient is a mint and carries the call's arguments
+    choice_carries        revised R1/R2: a move-only value that owns a holder carries the holder's set
+    fmove_carries_holder  revised R2: a value taken out by a replacing `move` carries the binding that holds the
+                          instance it was taken from AND that instance's set (critic c03) — whether or not a `link`
+                          is visible in this body
+    --hidden-link         MACHINE VARIANT: every R is built with its child already linked back to it (the constructor
+                          did `Kid := new Child(this)`), which the body's checker cannot see
+  The compare command now shows the note's candidate, 0212 as first drafted, 0212 revised, and the revised oracle.
+
   `selftest0212` runs the worked shapes of the 0212 additions.
 
   The static-ownership-tracking study's docstring follows.
@@ -178,6 +192,10 @@ RULES = dict(
     mint_stored_only=False,         # oracle (A-explicit): a mint carries only the arguments the constructor stores
     q_dtor_reads=False,             # MODEL VARIANT (not a rule): Q has a destructor that reads its back-pointer (the destructor window)
     teardown_live=True,             # MODEL VARIANT: §28.12 (v0.355) — the flag faults from the COMPLETION of Dispose(); False = at its beginning (r40)
+    out_owned_mint=False,           # 0212 rev 2, R2: an `out owned` recipient is a mint (carries the call's arguments)
+    choice_carries=False,           # 0212 rev 2: a move-only value that owns a holder carries the holder's set
+    fmove_carries_holder=False,     # 0212 rev 2, R2: a replacing move's result carries the holder's binding and its set
+    hidden_link=False,              # MODEL VARIANT: every R's child is linked back to it at construction (invisible to the checker)
 )
 # Overridable predicates for user-defined mutations (see `check --define`). Each receives the
 # checker's inputs and returns the clause's answer; None means "use the kernel's text".
@@ -186,9 +204,9 @@ HOOKS = dict(
     meet=None,       # meet(a, b) -> state | raise Reject      K7's cell for two states (default: the K7 table)
 )
 
-TYPES_R = 'R'; TYPES_Q = 'Q'; TYPES_K = 'K'; TYPES_P = 'P'; TYPES_E = 'E'    # E: a K held at a type that announces no borrow
+TYPES_R = 'R'; TYPES_Q = 'Q'; TYPES_K = 'K'; TYPES_P = 'P'; TYPES_E = 'E'; TYPES_W = 'W'    # E: a K held at a type that announces no borrow; W: an owning choice value that owns a K
 HOLDER_TYPES = (TYPES_K, TYPES_P)
-HOLDER_READS = ('kuse', 'puse', 'pkuse', 'kdtor', 'euse', 'qdtor')
+HOLDER_READS = ('kuse', 'puse', 'pkuse', 'kdtor', 'euse', 'qdtor', 'wuse')
 
 # ----------------------------------------------------------------------------- syntax
 # A program is a list of statements; a statement is a tuple:
@@ -200,7 +218,7 @@ HOLDER_READS = ('kuse', 'puse', 'pkuse', 'kdtor', 'euse', 'qdtor')
 # A statement's SITE is its position path in the program (a tuple), which also serves as
 # the allocation-site identity of the value a producer at that site mints.
 
-DECL_KINDS = ('new', 'decl', 'using', 'brw', 'move', 'usingm', 'usingb', 'fbrw', 'fmove', 'tbrw', 'newk', 'newp', 'newk2', 'erase')
+DECL_KINDS = ('new', 'decl', 'using', 'brw', 'move', 'usingm', 'usingb', 'fbrw', 'fmove', 'tbrw', 'newk', 'newp', 'newk2', 'erase', 'newko', 'wrap')
 PIN_KINDS = ('using', 'usingm', 'usingb')
 
 def show(prog, ind=''):
@@ -234,9 +252,9 @@ def key(prog):
 
 def reads(s):
     k = s[0]
-    if k in ('brw', 'move', 'usingm', 'usingb', 'fbrw', 'fmove', 'asgb', 'asgm', 'erase'):
+    if k in ('brw', 'move', 'usingm', 'usingb', 'fbrw', 'fmove', 'asgb', 'asgm', 'erase', 'wrap', 'newko'):
         return {s[2]}
-    if k in ('use', 'disp', 'send', 'throw', 'fst', 'kuse', 'link', 'puse', 'pkuse', 'euse'):
+    if k in ('use', 'disp', 'send', 'throw', 'fst', 'kuse', 'link', 'puse', 'pkuse', 'euse', 'wuse'):
         return {s[1]}
     if k == 'newk2':
         return {s[2], s[3]}
@@ -438,8 +456,9 @@ def check_body(prog, path, G, live_out, exc_live, ctx, pre_declared=(), depth=0)
     if RULES['k_dtor_reads'] and (RULES['bbc'] or RULES['derived_retention']):
         ty = dict(ctx.types)
         for s0 in prog:                                 # the owned holders this body declares: their scope-end release runs the destructor
-            if s0[0] in ('newk', 'newp', 'newk2'): ty[s0[1]] = TYPES_K; held.add(s0[1])
-            elif s0[0] in ('move', 'usingm') and ty.get(s0[2]) in HOLDER_TYPES: ty[s0[1]] = ty[s0[2]]; held.add(s0[1])
+            if s0[0] in ('newk', 'newp', 'newk2', 'newko'): ty[s0[1]] = TYPES_K; held.add(s0[1])
+            elif s0[0] == 'wrap': ty[s0[1]] = TYPES_W; held.add(s0[1])      # the choice's release disposes the K it owns
+            elif s0[0] in ('move', 'usingm') and ty.get(s0[2]) in HOLDER_TYPES + (TYPES_W,): ty[s0[1]] = ty[s0[2]]; held.add(s0[1])
             elif s0[0] in DECL_KINDS: ty[s0[1]] = TYPES_R
     if RULES['q_dtor_reads'] and RULES['bbc']:
         # 0212 R3: where a release may run user code that reads a stored borrow, the release is a use. With --qdtor that
@@ -450,7 +469,8 @@ def check_body(prog, path, G, live_out, exc_live, ctx, pre_declared=(), depth=0)
             if s0[0] in ('new', 'using'): ty2[s0[1]] = TYPES_R; held.add(s0[1])
             elif s0[0] == 'fmove': ty2[s0[1]] = TYPES_Q; held.add(s0[1])
             elif s0[0] in ('move', 'usingm') and ty2.get(s0[2]) in (TYPES_R, TYPES_Q): ty2[s0[1]] = ty2[s0[2]]; held.add(s0[1])
-            elif s0[0] in ('newk', 'newk2'): ty2[s0[1]] = TYPES_K
+            elif s0[0] in ('newk', 'newk2', 'newko'): ty2[s0[1]] = TYPES_K
+            elif s0[0] == 'wrap': ty2[s0[1]] = TYPES_W
             elif s0[0] == 'newp': ty2[s0[1]] = TYPES_P
             elif s0[0] == 'erase': ty2[s0[1]] = TYPES_E
             elif s0[0] in ('brw', 'usingb') : ty2[s0[1]] = ty2.get(s0[2])
@@ -607,6 +627,15 @@ def check_body(prog, path, G, live_out, exc_live, ctx, pre_declared=(), depth=0)
             if RULES['linked_fmove_carries'] and (ids_of(G[x]) & G['__linked']):
                 G['__carry'] = dict(G['__carry']); G['__carry'][y] = frozenset(ids_of(G[x]))
                 G['__carryb'] = dict(G['__carryb']); G['__carryb'][y] = (frozenset({x}) if G[x][0] != 'brw' else G[x][3])
+            if RULES['bbc'] and RULES['fmove_carries_holder']:
+                # 0212 rev 2, R2: a value taken out of an instance by a replacing move carries the binding that holds the
+                # instance and the instance's set — the body cannot see whether a member linked the child to its owner.
+                hx = ids_of(G[x]) if G[x][0] != 'brw' else G[x][1]
+                hb = frozenset({x}) if G[x][0] != 'brw' else G[x][3]
+                c = dict(G['__carry']); cb = dict(G['__carryb'])
+                c[y] = c.get(y, frozenset()) | frozenset(hx) | carried(x, G)
+                cb[y] = cb.get(y, frozenset()) | hb | frozenset(G['__carryb'].get(x, frozenset()))
+                G['__carry'] = c; G['__carryb'] = cb
             G[y] = ('own', frozenset({site})); ctx.types[y] = TYPES_Q; declared.append(y); ctx.depth[y] = depth
         elif k == 'newk':                               # K4.3 field-held admission through a callee: `var x := new K(y)` where K stores y in a plain field
             x, y = s[1], s[2]
@@ -619,6 +648,31 @@ def check_body(prog, path, G, live_out, exc_live, ctx, pre_declared=(), depth=0)
             if RULES['derived_retention'] or RULES['bbc']:
                 G['__carry'] = dict(G['__carry']); G['__carry'][x] = frozenset(srcs)
                 G['__carryb'] = dict(G['__carryb']); G['__carryb'][x] = frozenset(srcb)
+        elif k == 'newko':                              # `Make(y, out var x)`: an `out owned` recipient of a holder the callee builds over y
+            x, y = s[1], s[2]
+            read_check(y, G, site, ctx)
+            if RULES['strict_trust']:
+                raise Reject('E-strict-trust-admission')
+            srcs = ids_of(G[y]) if G[y][0] != 'brw' else G[y][1]
+            srcb = frozenset({y}) if G[y][0] != 'brw' else G[y][3]
+            G[x] = ('own', frozenset({site})); ctx.types[x] = TYPES_K; declared.append(x); ctx.depth[x] = depth
+            if RULES['bbc'] and RULES['out_owned_mint']:    # rev 2: the recipient is a mint, as an `owned` return is
+                G['__carry'] = dict(G['__carry']); G['__carry'][x] = frozenset(srcs)
+                G['__carryb'] = dict(G['__carryb']); G['__carryb'][x] = frozenset(srcb)
+        elif k == 'wrap':                               # `var y := Slot.Full(move x)`: an owning choice takes the holder as its owned payload
+            y, x = s[1], s[2]
+            cx = carried(x, G); cxb = frozenset(G['__carryb'].get(x, frozenset()))
+            ids = consume_check(x, G, site, ctx, live, True)
+            G[x] = ('moved',); G[y] = ('own', ids); ctx.types[y] = TYPES_W; declared.append(y); ctx.depth[y] = depth
+            if RULES['bbc'] and RULES['choice_carries'] and cx:   # rev 2: the case constructor is a mint; the value carries what it owns
+                c = dict(G['__carry']); cb = dict(G['__carryb']); c[y] = cx; cb[y] = cxb
+                G['__carry'] = c; G['__carryb'] = cb
+        elif k == 'wuse':                               # a member access through the wrapped holder's stored borrow
+            x = s[1]
+            read_check(x, G, site, ctx)
+            cs = carried(x, G)
+            if cs and cs <= G['__killed']:
+                raise Reject('0205-holder-use-after-dominating-kill')
         elif k == 'newk2':                              # `var x := new K2(y, z)`: the constructor stores y and only reads z; the mint is read from the signature
             x, y, z = s[1], s[2], s[3]
             read_check(y, G, site, ctx); read_check(z, G, site, ctx)
@@ -763,7 +817,7 @@ def check_body(prog, path, G, live_out, exc_live, ctx, pre_declared=(), depth=0)
     if G is not None:
         if RULES['k_dtor_reads'] and (RULES['bbc'] or RULES['derived_retention']):
             for v in declared:
-                if G[v][0] == 'own' and ctx.types.get(v) in HOLDER_TYPES:
+                if G[v][0] == 'own' and ctx.types.get(v) in HOLDER_TYPES + (TYPES_W,):
                     cs = carried(v, G)
                     if cs and cs <= G['__killed']:
                         raise Reject('0205-holder-release-after-dominating-kill')
@@ -857,6 +911,8 @@ class Run:
     def alloc(self, cls, borrow=None):
         slot = self.alloc(TYPES_Q) if cls == TYPES_R else None     # `new R(new Q())`: the argument first
         self.n += 1; self.heap[self.n] = ['live', slot if cls != TYPES_K else borrow, cls, None]; self.events.append(('new', self.n))
+        if RULES['hidden_link'] and slot is not None:
+            self.heap[slot][3] = self.n                             # the constructor linked the child back to its owner
         return self.n
 
     def dispose(self, loc, where):
@@ -1052,6 +1108,14 @@ class Run:
         elif k == 'newk':
             yl = self.binding(s[2])
             env[s[1]] = (self.alloc(TYPES_K, borrow=yl), 'own'); declared.append(s[1])
+        elif k == 'newko':
+            yl = self.binding(s[2])
+            env[s[1]] = (self.alloc(TYPES_K, borrow=yl), 'own'); declared.append(s[1])
+        elif k == 'wrap':
+            loc = self.binding(s[2])
+            env[s[2]] = (loc, 'moved'); env[s[1]] = (loc, 'own'); declared.append(s[1])
+        elif k == 'wuse':
+            loc = self.read(s[1]); self.through(heap[loc][1], ('wuse', s[1]))
         elif k == 'newk2':
             yl = self.binding(s[2]); self.binding(s[3])              # the constructor reads z and stores y
             env[s[1]] = (self.alloc(TYPES_K, borrow=yl), 'own'); declared.append(s[1])
@@ -1211,6 +1275,7 @@ FEATURE_SETS = {
     'p0212': {'locals', 'fields', 'holders', 'holders2', 'mint2', 'erase'},
     'p0212-erase': {'locals', 'fields', 'holders', 'holders2', 'erase'},
     'p0212-mint': {'locals', 'fields', 'holders', 'holders2', 'mint2'},
+    'p0212r': {'locals', 'fields', 'holders', 'holders2', 'mint2', 'erase', 'out', 'choice'},
 }
 
 def decl_type(decl, s):
@@ -1218,7 +1283,8 @@ def decl_type(decl, s):
     if k in ('new', 'decl', 'using'): return TYPES_R
     if k in ('brw', 'move', 'usingm', 'usingb'): return decl[s[2]]
     if k in ('fbrw', 'fmove', 'tbrw'): return TYPES_Q
-    if k in ('newk', 'newk2'): return TYPES_K
+    if k in ('newk', 'newk2', 'newko'): return TYPES_K
+    if k == 'wrap': return TYPES_W
     if k == 'newp': return TYPES_P
     if k == 'erase': return TYPES_E
     return None
@@ -1237,15 +1303,19 @@ def atoms(vs, decl, feats, last, allow_decl=True):
                     if 'locals' in feats: yield ('brw', x, y); yield ('move', x, y)
                     if 'pins' in feats: yield ('usingm', x, y); yield ('usingb', x, y)
                     if 'fields' in feats and decl[y] == TYPES_R: yield ('fbrw', x, y); yield ('fmove', x, y)
-                    if 'holders' in feats and decl[y] not in HOLDER_TYPES and decl[y] != TYPES_E: yield ('newk', x, y)
+                    if 'holders' in feats and decl[y] not in HOLDER_TYPES and decl[y] not in (TYPES_E, TYPES_W): yield ('newk', x, y)
                     if 'holders2' in feats and decl[y] == TYPES_R: yield ('newp', x, y)
                     if 'erase' in feats and decl[y] == TYPES_K: yield ('erase', x, y)
-                    if 'mint2' in feats and decl[y] not in HOLDER_TYPES and decl[y] != TYPES_E:
+                    if 'choice' in feats and decl[y] == TYPES_K: yield ('wrap', x, y)
+                    if 'out' in feats and decl[y] not in HOLDER_TYPES and decl[y] not in (TYPES_E, TYPES_W): yield ('newko', x, y)
+                    if 'mint2' in feats and decl[y] not in HOLDER_TYPES and decl[y] not in (TYPES_E, TYPES_W):
                         for z in vs:
-                            if z != y and z in decl and decl[z] not in HOLDER_TYPES and decl[z] != TYPES_E: yield ('newk2', x, y, z)
+                            if z != y and z in decl and decl[z] not in HOLDER_TYPES and decl[z] not in (TYPES_E, TYPES_W): yield ('newk2', x, y, z)
         else:
             if 'locals' in feats and decl[x] == TYPES_E:
                 yield ('disp', x); yield ('euse', x)       # an erased holder: its static type offers no reassignment and no send
+            elif 'locals' in feats and decl[x] == TYPES_W:
+                yield ('disp', x); yield ('wuse', x)       # an owning choice value: a discard (written disp), and a match that reads the payload
             elif 'locals' in feats and decl[x] in HOLDER_TYPES:
                 yield ('disp', x); yield ('use', x)        # a holder: no reassignment form in the grammar; not sendable (it holds a borrow)
             elif 'locals' in feats:
@@ -1258,8 +1328,8 @@ def atoms(vs, decl, feats, last, allow_decl=True):
             if 'throw' in feats and last and decl[x] == TYPES_R: yield ('throw', x)
             for y in vs:
                 if y != x and y in decl:
-                    if 'locals' in feats and decl[x] == decl[y] and decl[x] not in HOLDER_TYPES and decl[x] != TYPES_E: yield ('asgb', x, y)
-                    if 'asgm' in feats and decl[x] == decl[y] and decl[x] not in HOLDER_TYPES and decl[x] != TYPES_E: yield ('asgm', x, y)
+                    if 'locals' in feats and decl[x] == decl[y] and decl[x] not in HOLDER_TYPES and decl[x] not in (TYPES_E, TYPES_W): yield ('asgb', x, y)
+                    if 'asgm' in feats and decl[x] == decl[y] and decl[x] not in HOLDER_TYPES and decl[x] not in (TYPES_E, TYPES_W): yield ('asgm', x, y)
                     if 'holders2' in feats and decl[x] == TYPES_K and decl[y] == TYPES_R: yield ('kset', x, y)
                     if 'fields' in feats and decl[x] == TYPES_R and decl[y] == TYPES_Q: yield ('fstm', x, y)
     if 'temps' in feats:
@@ -1393,7 +1463,7 @@ def summarize(rows):
             if r.warns: st['accept-with-warning'] += 1
             if any(w.startswith('§28.2') for w in r.warns): st['§28.2-warned'] += 1
             if any(s[0] == 'kuse' for s in iter_stmts(r.prog)): st['programs-with-kuse'] += 1
-            if any(s[0] in ('newk', 'kset', 'newp', 'link', 'newk2') for s in iter_stmts(r.prog)): st['programs-with-a-trust-store'] += 1
+            if any(s[0] in ('newk', 'kset', 'newp', 'link', 'newk2', 'newko') for s in iter_stmts(r.prog)): st['programs-with-a-trust-store'] += 1
             if r.hold: st['stale-read-through-a-stored-borrow:' + r.hold] += 1
             if any(s[0] == 'puse' for s in iter_stmts(r.prog)): st['programs-with-puse'] += 1
             if r.bad == ('K4.3-trust-residual',): st['K4.3-trust-residual (T3 under the recorded clause)'] += 1
@@ -1409,7 +1479,7 @@ def minimal(rows_list, n=3):
 
 def bounds_str(a):
     s = f'vars={a.vars} len={a.len} features={a.features}'
-    s += ''.join(f' --{f}' for f in ('if', 'try', 'while') if getattr(a, 'with_' + f)) + (' --block' if WITH_BLOCK[0] else '') + (' [v0.355 base]' if getattr(a, 'v0355', False) else '') + (' [child destructor reads its back-pointer]' if RULES['q_dtor_reads'] else '') + ('' if RULES['teardown_live'] else ' [flag set when Dispose() begins: r40]') + (' [holder destructor reads its borrow]' if RULES['k_dtor_reads'] else '')
+    s += ''.join(f' --{f}' for f in ('if', 'try', 'while') if getattr(a, 'with_' + f)) + (' --block' if WITH_BLOCK[0] else '') + (' [v0.355 base]' if getattr(a, 'v0355', False) else '') + (' [child destructor reads its back-pointer]' if RULES['q_dtor_reads'] else '') + (' [every child is linked to its owner at construction]' if RULES['hidden_link'] else '') + ('' if RULES['teardown_live'] else ' [flag set when Dispose() begins: r40]') + (' [holder destructor reads its borrow]' if RULES['k_dtor_reads'] else '')
     if WITH_BLOCK[0] and not (a.with_try or a.with_while): s += f' --body {a.body}'
     if a.with_try or a.with_while: s += f' --body {a.body}'
     return s
@@ -1605,10 +1675,12 @@ def cmd_check(a, vs, feats):
 
 # ----------------------------------------------------------------------------- candidate comparison (this study)
 
+REV2 = dict(bbc=True, linked_fmove_carries=True, erasure_rule=True, out_owned_mint=True, choice_carries=True, fmove_carries_holder=True)
 CANDIDATES = [
     ('A  the candidate of the note (no erasure rule)', dict(bbc=True, linked_fmove_carries=True)),
-    ('0212  A + R5, the owned-erasure rule', dict(bbc=True, linked_fmove_carries=True, erasure_rule=True)),
-    ('0212-explicit  the same with a stored-arguments-only mint (oracle)', dict(bbc=True, linked_fmove_carries=True, erasure_rule=True, mint_stored_only=True)),
+    ('0212-draft1  0212 as first drafted (A + the owned-erasure rule)', dict(bbc=True, linked_fmove_carries=True, erasure_rule=True)),
+    ('0212  revised: out-owned mint, move-only carriers, replacing move carries its holder', dict(REV2)),
+    ('0212-explicit  revised, with a stored-arguments-only mint (oracle)', dict(REV2, mint_stored_only=True)),
 ]
 
 def base_class(r):
@@ -1658,7 +1730,7 @@ def cmd_compare(a, vs, feats):
                     pass                                    # every store is tracked by type
                 elif flips.get('derived_retention'):
                     if kinds & {'kset', 'newp'}: untracked += 1      # 0132's bit covers a constructor's direct store only
-                elif kinds & {'newk', 'kset', 'newp', 'link', 'newk2'}:
+                elif kinds & {'newk', 'kset', 'newp', 'link', 'newk2', 'newko'}:
                     untracked += 1
         cls = Counter(base_class(r) for r in new_rej)
         nv = [r for r in new_rej if base_class(r) == 'never(clean)']
@@ -1843,7 +1915,40 @@ def cmd_selftest():
     print(f'\nselftest: {len(SELFTEST) + 6 - fails} passed, {fails} failed')
     return fails
 
-P0212 = dict(K5_3b_borrow='error', K5_3b_samevar='error', K5_2_maybe_lhs=True, bbc=True, linked_fmove_carries=True, erasure_rule=True)
+P0212 = dict(K5_3b_borrow='error', K5_3b_samevar='error', K5_2_maybe_lhs=True, bbc=True, linked_fmove_carries=True, erasure_rule=True,
+             out_owned_mint=True, choice_carries=True, fmove_carries_holder=True)
+DRAFT1 = dict(K5_3b_borrow='error', K5_3b_samevar='error', K5_2_maybe_lhs=True, bbc=True, linked_fmove_carries=True, erasure_rule=True)
+# (title, program, variant flips, verdict and outcomes under 0212 as first drafted, verdict and outcomes under 0212 revised)
+SELFTEST_REV2 = [
+    ('critic c02 — `out owned`: the recipient outlives the argument its holder was built over',
+     [('decl', 'c'), ('block', [('new', 'a'), ('newko', 'b', 'a'), ('asgm', 'c', 'b')]), ('use', 'c')], {},
+     None, None, None, None),     # placeholder, replaced below (asgm is outside the enumerated feature set; kept as a hand case)
+    ('critic c02 — `out owned`: the argument is sent to another domain while the recipient is still used',
+     [('new', 'a'), ('newko', 'b', 'a'), ('send', 'a'), ('kuse', 'b')], {},
+     'accept', ['RACE'], 'reject:K5.1-frozen-transfer', None),
+    ('critic c02 — `out owned`: the argument is disposed, then the recipient is used',
+     [('new', 'a'), ('newko', 'b', 'a'), ('disp', 'a'), ('kuse', 'b')], {},
+     'accept', ['FAULT'], 'reject:0205-holder-use-after-dominating-kill', None),
+    ('critic c05 — an owning choice wraps a holder: the source is sent away, then the payload is read',
+     [('new', 'a'), ('newk', 'b', 'a'), ('wrap', 'c', 'b'), ('send', 'a'), ('wuse', 'c')], {},
+     'accept', ['RACE'], 'reject:K5.1-frozen-transfer', None),
+    ('critic c05 — an owning choice wraps a holder: the source is disposed, then the payload is read',
+     [('new', 'a'), ('newk', 'b', 'a'), ('wrap', 'c', 'b'), ('disp', 'a'), ('wuse', 'c')], {},
+     'accept', ['FAULT'], 'reject:0205-holder-use-after-dominating-kill', None),
+    ('critic c05 — wrapping is not an erasure: with the source alive the wrapped holder is used normally',
+     [('new', 'a'), ('newk', 'b', 'a'), ('wrap', 'c', 'b'), ('wuse', 'c')], {},
+     'accept', ['ok'], 'accept', ['ok']),
+    ('critic c03 — a child linked in its constructor is taken out by a replacing move; the owner is disposed; the child reads it',
+     [('new', 'a'), ('fmove', 'b', 'a'), ('disp', 'a'), ('puse', 'b')], dict(hidden_link=True),
+     'accept', ['FAULT'], 'reject:0205-holder-use-after-dominating-kill', None),
+    ('critic c03 — the same with the owner sent to another domain: a race no flag catches',
+     [('new', 'a'), ('fmove', 'b', 'a'), ('send', 'a'), ('puse', 'b')], dict(hidden_link=True),
+     'accept', ['RACE'], 'reject:K5.1-frozen-transfer', None),
+    ('critic c03 — the child is used while its owner lives: admitted and clean',
+     [('new', 'a'), ('fmove', 'b', 'a'), ('puse', 'b')], dict(hidden_link=True),
+     'accept', ['ok'], 'accept', ['ok']),
+]
+SELFTEST_REV2 = [t for t in SELFTEST_REV2 if t[3] is not None]
 BASE55 = dict(K5_3b_borrow='error', K5_3b_samevar='error', K5_2_maybe_lhs=True)
 SELFTEST_0212 = [
     # (title, program, variant flips, expected verdict at the v0.355 baseline, expected outcomes there, expected verdict under 0212, expected outcomes there)
@@ -1909,7 +2014,21 @@ def cmd_selftest0212():
             line += f'\n    {tag}: {v}  runs: {got}  bad: {bad}  ' + ('OK' if ok else f'MISMATCH (expected {expect} {outs})')
             if not ok: fails += 1
         print(line)
-    print(f'\nselftest0212: {2 * len(SELFTEST_0212) - fails} passed, {fails} failed')
+    for title, prog, variant, e_d1, o_d1, e_new, o_new in SELFTEST_REV2:
+        line = f'--- {title}\n    ' + oneline(prog)
+        for tag, flips, expect, outs in (('0212 first draft', DRAFT1, e_d1, o_d1), ('0212 revised', P0212, e_new, o_new)):
+            f2 = dict(flips); f2.update(variant)
+            with mutated(f2):
+                v, w, ctx = check(prog)
+                ok = (v == expect); got = None; bad = []
+                if v == 'accept':
+                    runs = run_all(prog, ctx); got = [r.outcome for r in runs]; bad = sorted(set(judge(runs)))
+                    if outs is not None and got != outs: ok = False
+            line += f'\n    {tag}: {v}  runs: {got}  bad: {bad}  ' + ('OK' if ok else f'MISMATCH (expected {expect} {outs})')
+            if not ok: fails += 1
+        print(line)
+    total = 2 * len(SELFTEST_0212) + 2 * len(SELFTEST_REV2)
+    print(f'\nselftest0212: {total - fails} passed, {fails} failed')
     return fails
 
 # ----------------------------------------------------------------------------- main
@@ -1918,6 +2037,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('cmd', choices=['selftest', 'selftest0212', 'enumerate', 'mutate', 'check', 'retention', 'mutations', 'compare'])
     ap.add_argument('--qdtor', action='store_true', help='model variant: the child class Q has a destructor that reads its back-pointer')
+    ap.add_argument('--hidden-link', dest='hidden_link', action='store_true', help='model variant: every R is built with its child linked back to it; the checker cannot see the link')
     ap.add_argument('--r40-teardown', dest='r40_teardown', action='store_true', help='model variant: the disposed flag is set when Dispose() begins (r40), not when it completes (spec §28.12, v0.355)')
     ap.add_argument('--block', dest='with_block', action='store_true', help='also enumerate prefix ; do … end ; suffix')
     ap.add_argument('--kdtor', action='store_true', help='model variant: the holder class K has a destructor that reads its borrowed field')
@@ -1943,6 +2063,8 @@ def main():
         RULES.update(q_dtor_reads=True)
     if a.r40_teardown:
         RULES.update(teardown_live=False)
+    if a.hidden_link:
+        RULES.update(hidden_link=True)
     if a.cmd == 'selftest0212':
         sys.exit(1 if cmd_selftest0212() else 0)
     if a.cmd == 'compare':

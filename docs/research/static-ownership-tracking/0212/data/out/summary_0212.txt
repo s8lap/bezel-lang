@@ -77,6 +77,35 @@ a method that stores a plain parameter into a static field or a static-held coll
     tests/conformance/rules/cases/s28_3_0149.bzl [rules/reject] line 22 Gate.Install -> static _m
     tests/conformance/rules/cases/s28_3_0150.bzl [rules/reject] line 27 Cache.Prime -> static _cfg
 
+== REVISION 2: one pass per critique finding (rev2_findings.tsv)
+  F1 out-owned parameter: 27 (accepted tier: 13; gtest: 7)
+  F2 Result<…> named: 108
+  F2 Result<…> named at a class of the unit that is not borrow-bearing: 5
+  F4 move of a field of an object other than `this`: 18 (accepted tier: 7; gtest: 3)
+  F6 comparer-retaining collection built with an argument: a local, parameter or field (class-typed instantiation): 2 (accepted tier: 0; gtest: 0)
+  F6 comparer-retaining collection built with an argument: a local, parameter or field (value instantiation): 3 (accepted tier: 0; gtest: 0)
+  N11 exception class that is borrow-bearing: 2 (accepted tier: 1; gtest: 0)
+    F6 comparer-retaining collection built with an argument: a local, parameter or field (value instantiation) | tests/conformance/rules/cases/s17_7_0015.bzl [rules/reject] line 14  Set<int>("")
+    F6 comparer-retaining collection built with an argument: a local, parameter or field (value instantiation) | tests/conformance/rules/cases/s17_7_0016.bzl [rules/reject] line 14  Dictionary<int, string>("")
+    F6 comparer-retaining collection built with an argument: a local, parameter or field (class-typed instantiation) | tests/conformance/rules/cases/s17_7_0017.bzl [rules/reject] line 19  OwningSet<Box>("")
+    F6 comparer-retaining collection built with an argument: a local, parameter or field (class-typed instantiation) | tests/conformance/rules/cases/s17_7_0018.bzl [rules/reject] line 19  OwningDictionary<int, Box>("")
+    N11 exception class that is borrow-bearing | tests/conformance/cases/codegen_0018.bzl [docs/skip/n/a] line 15 TypeInitializationException InnerException: Exception
+    N11 exception class that is borrow-bearing | tests/conformance/cases/stdlib_0033.bzl [docs/fragment/compiles] line 1 TypeInitializationException InnerException: Exception
+    F6 comparer-retaining collection built with an argument: a local, parameter or field (value instantiation) | tests/lit/sema/sema_new_expr_collection_literal_599__set_int_ctor_collection_literal_rejected_spec_15_4.bzl [lit/reject] line 9  Set<int>([ 1 , 2 , 3 ])
+
+== N11: doc-extracted code blocks that hold a store whose verdict changes at stage 3 (for the spec train's §8.13)
+    codegen_0040 (codegen, 6-Idioms) [fragment/compiles] Ledger.<init>: admitted as written; its comment cites the trust clause
+    codegen_0080 (codegen, 72-Ownership-shapes-that-look-fine) [error/diagnose] Holder.constructor: admitted as written; its comment cites the trust clause
+    guide1_0006 (guide1, 5-Owning-fields-objects-that-hold-other-objects) [fragment/compiles] BankAccount.<init>: admitted as written; its comment cites the trust clause
+    guide1_0007 (guide1, 5-Owning-fields-objects-that-hold-other-objects) [fragment/compiles] BankAccount.<init>: admitted as written; its comment cites the trust clause
+    spec_0226 (spec, 2831-The-ownership-kernel-K1K9) [fragment/compiles] Tag.constructor: admitted as written; its comment cites the trust clause
+    spec_0244 (spec, 2838-Borrow-lifetime-rules) [error/diagnose] Tag.Attach: needs `scoped`
+    spec_0251 (spec, 28311-Unbound-owned-temporaries) [error/diagnose] Holder.Hold: needs `scoped`
+    spec_0264 (spec, Trivial-dispose-for-generic-class-instantiations) [fragment/compiles] Box.<init>: admitted as written; its comment cites the trust clause
+    stdlib_0023 (stdlib, 214-Serialization-vocabulary) [fragment/compiles] Invoice.<init>: admitted as written; its comment cites the trust clause
+    tour_0011 (tour, Objects-that-own-objects) [fragment/compiles] Session.<init>: admitted as written; its comment cites the trust clause
+    tour_0012 (tour, Borrows-cannot-outlive-their-owners) [error/diagnose] Cache.Remember: needs `scoped`
+
 == PER-PROGRAM ROLL-UP under 0212, accepted tier (rules, docs, lit units the spec expects to compile)
 5750 accepted-tier programs; 131 hold a K4.3 store, construct a borrow-bearing class, or meet a 0212 pass
   unchanged 114; compile after a `scoped` marker 12; rejected, must be rewritten 5

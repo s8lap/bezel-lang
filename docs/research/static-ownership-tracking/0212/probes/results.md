@@ -85,6 +85,130 @@ Modes: report = --checked-disposal --report-trust-admissions; checked = --checke
 - **unchecked**: compile=accept; trust lines=0
   run exit=0; output: |
 
+## c01_bb_interface_generic_erasure
+> FROM THE ADVERSARIAL CRITIQUE of the first draft (f72926c68), probe c01: rule 2 of 0212 §3.1 fires only where the substituted value type is a borrow-bearing CLASS. Here T := IStore, a borrow-bearing INTERFACE (a scoped store member); the owned value is erased to IShow (not borrow-bearing). EXPECT today: compiles; checked = DisposedAccessException; unchecked = undefined. Under 0212 revision 2: `Hide<IStore>` is rejected where it is named — the per-instantiation requirement reads a borrow-bearing class OR INTERFACE (finding 5).
+- **report**: compile=accept-with-warning; trust lines=1
+      c01_bb_interface_generic_erasure.bzl:19:15: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source the call
+  run exit=70; output: Unhandled exception: System.DisposedAccessException|
+- **checked**: compile=accept; trust lines=0
+  run exit=70; output: Unhandled exception: System.DisposedAccessException|
+- **unchecked**: compile=accept; trust lines=0
+  run exit=0; output: |
+
+## c02_out_owned_factory
+> FROM THE ADVERSARIAL CRITIQUE of the first draft (f72926c68), probe c02: an `out owned` recipient of a borrow-bearing class. 0212's mint covers only a declared `owned` RETURN; the out-owned recipient's set is unspecified. EXPECT today: compiles; checked = DisposedAccessException; unchecked = undefined. Under 0212 revision 2: an `out owned` recipient is a mint and carries the call's arguments, so `keep := move a` is the K2.3 error (finding 1).
+- **report**: compile=accept-with-warning; trust lines=1
+      c02_out_owned_factory.bzl:13:15: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source the caller must kee
+      c02_out_owned_factory.bzl:26:7: warning: owned value in `keep` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop); declare it `using var` to make the scope-bound disposal explicit, or `move` / `return` / 
+  run exit=70; output: Unhandled exception: System.DisposedAccessException|
+- **checked**: compile=accept-with-warning; trust lines=0
+      c02_out_owned_factory.bzl:26:7: warning: owned value in `keep` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop); declare it `using var` to make the scope-bound disposal explicit, or `move` / `return` / 
+  run exit=70; output: Unhandled exception: System.DisposedAccessException|
+- **unchecked**: compile=accept-with-warning; trust lines=0
+      c02_out_owned_factory.bzl:26:7: warning: owned value in `keep` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop); declare it `using var` to make the scope-bound disposal explicit, or `move` / `return` / 
+  run exit=0; output: |
+
+## c03_replacing_move_from_outside
+> FROM THE ADVERSARIAL CRITIQUE of the first draft (f72926c68), probe c03: a back-pointing child taken out of its owner by a replacing move OUTSIDE a member. 0212 §8.2 source-set clause 3 gives it "the instance's set" (empty for the owner), not the owner's binding. EXPECT today: compiles; checked = DisposedAccessException; unchecked = undefined. Under 0212 revision 2: a value taken out by a replacing `move` carries the binding that holds the instance it left, so `k := move n.Kid with null` is the K2.3 error (finding 4). r40 does not implement the replacing `move`, so this one is argued.
+- **report**: compile=REJECT; trust lines=1
+      c03_replacing_move_from_outside.bzl:24:12: the replacing `move` (`move loc with e`, §28.8.1 *The replacing `move`*, v0.350) is not yet supported by this compiler: the `with` clause is recognized but the exchange of the field or s
+      c03_replacing_move_from_outside.bzl:15:16: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source the calle
+      c03_replacing_move_from_outside.bzl:24:7: warning: owned value in `k` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop); declare it `using var` to make the scope-bound disposal explicit, or `move` / `ret
+- **checked**: compile=REJECT; trust lines=0
+      c03_replacing_move_from_outside.bzl:24:12: the replacing `move` (`move loc with e`, §28.8.1 *The replacing `move`*, v0.350) is not yet supported by this compiler: the `with` clause is recognized but the exchange of the field or s
+      c03_replacing_move_from_outside.bzl:24:7: warning: owned value in `k` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop); declare it `using var` to make the scope-bound disposal explicit, or `move` / `ret
+- **unchecked**: compile=REJECT; trust lines=0
+      c03_replacing_move_from_outside.bzl:24:12: the replacing `move` (`move loc with e`, §28.8.1 *The replacing `move`*, v0.350) is not yet supported by this compiler: the `with` clause is recognized but the exchange of the field or s
+      c03_replacing_move_from_outside.bzl:24:7: warning: owned value in `k` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop); declare it `using var` to make the scope-bound disposal explicit, or `move` / `ret
+
+## c04_owned_param_static_stash
+> FROM THE ADVERSARIAL CRITIQUE of the first draft (f72926c68), probe c04: an owned borrow-bearing instance passed to a STATIC method (no receiver) that hands it into another parameter's object. 0212 adds an owned argument's sources "to the constructed object or the receiver": here there is neither. EXPECT today: compiles; checked = DisposedAccessException; unchecked = undefined. Under 0212 revision 2: an `owned` parameter of a borrow-bearing class carries an opaque caller source in the callee, so `b.Put(move a)` — a store into an object the body does not hold — is an error in `Give` (finding 3).
+- **report**: compile=accept-with-warning; trust lines=1
+      c04_owned_param_static_stash.bzl:13:15: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source the caller m
+  run exit=70; output: Unhandled exception: System.DisposedAccessException|
+- **checked**: compile=accept; trust lines=0
+  run exit=70; output: Unhandled exception: System.DisposedAccessException|
+- **unchecked**: compile=accept; trust lines=0
+  run exit=0; output: |
+
+## c05_owning_choice_wraps_holder
+> FROM THE ADVERSARIAL CRITIQUE of the first draft (f72926c68), probe c05: an owning choice whose payload is an `owned` borrow-bearing class. 0212's source set is defined for "an instance of a borrow-bearing class"; the choice value is not one, and a static field of the choice type is not an R5 owning position. EXPECT today: compiles; checked = DisposedAccessException; unchecked = undefined. Under 0212 revision 2: an owning choice with an `owned` payload of a borrow-bearing class is a carrier, `Slot.Full(...)` is a mint, and `Wrap` returns a value that carries `c`, so `s := Wrap(c)` is the K2.3 error (finding 2).
+- **report**: compile=accept-with-warning; trust lines=1
+      c05_owning_choice_wraps_holder.bzl:13:15: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source the caller
+  run exit=70; output: Unhandled exception: System.DisposedAccessException|
+- **checked**: compile=accept; trust lines=0
+  run exit=70; output: Unhandled exception: System.DisposedAccessException|
+- **unchecked**: compile=accept; trust lines=0
+  run exit=0; output: |
+
+## c06_comparer_local_at_value_instantiation
+> CRITIQUE FINDING 6 (sendability of comparer-retaining collections): a `Dictionary<string, int>` built over a LOCAL comparer, which is disposed while the dictionary is still used. `Dictionary<string, int>` is sendable and stays so under revision 2, so its type cannot announce a carried comparer. EXPECT today: compiles (the comparer-held trust clause); checked = DisposedAccessException at the lookup. Under 0212 revision 2: error at the construction — at an instantiation that is not borrow-bearing a `comparer` constructor takes only a comparer that contributes no source (static storage). c07 is the rewrite. RESULT on r40: not runnable — the `IEqualityComparer` constructors are not implemented (the compiler says so), so no program in the corpora can depend on a retained comparer today.
+- **report**: compile=REJECT; trust lines=0
+      c06_comparer_local_at_value_instantiation.bzl:12:20: stdlib §4.8: the 'Dictionary' IEqualityComparer constructor is not yet implemented — the comparer would be silently ignored and default equality used instead. Omit it and giv
+- **checked**: compile=REJECT; trust lines=0
+      c06_comparer_local_at_value_instantiation.bzl:12:20: stdlib §4.8: the 'Dictionary' IEqualityComparer constructor is not yet implemented — the comparer would be silently ignored and default equality used instead. Omit it and giv
+- **unchecked**: compile=REJECT; trust lines=0
+      c06_comparer_local_at_value_instantiation.bzl:12:20: stdlib §4.8: the 'Dictionary' IEqualityComparer constructor is not yet implemented — the comparer would be silently ignored and default equality used instead. Omit it and giv
+
+## c07_comparer_static_at_value_instantiation
+> CRITIQUE FINDING 6, the rewrite: the comparer is a `static readonly` singleton, so it is static-storage-sourced and contributes no source. EXPECT: compiles; no report line for the comparer; clean in both modes; prints True. Under 0212 revision 2: admitted, and the dictionary is still sendable. RESULT on r40: not runnable, as c06.
+- **report**: compile=REJECT; trust lines=0
+      c07_comparer_static_at_value_instantiation.bzl:4:3: warning: static readonly field `Instance` has class type `IgnoreCase` which is reachable from every domain — a warning: confine its use to one domain or ensure its own internal
+      c07_comparer_static_at_value_instantiation.bzl:12:20: stdlib §4.8: the 'Dictionary' IEqualityComparer constructor is not yet implemented — the comparer would be silently ignored and default equality used instead. Omit it and gi
+- **checked**: compile=REJECT; trust lines=0
+      c07_comparer_static_at_value_instantiation.bzl:4:3: warning: static readonly field `Instance` has class type `IgnoreCase` which is reachable from every domain — a warning: confine its use to one domain or ensure its own internal
+      c07_comparer_static_at_value_instantiation.bzl:12:20: stdlib §4.8: the 'Dictionary' IEqualityComparer constructor is not yet implemented — the comparer would be silently ignored and default equality used instead. Omit it and gi
+- **unchecked**: compile=REJECT; trust lines=0
+      c07_comparer_static_at_value_instantiation.bzl:4:3: warning: static readonly field `Instance` has class type `IgnoreCase` which is reachable from every domain — a warning: confine its use to one domain or ensure its own internal
+      c07_comparer_static_at_value_instantiation.bzl:12:20: stdlib §4.8: the 'Dictionary' IEqualityComparer constructor is not yet implemented — the comparer would be silently ignored and default equality used instead. Omit it and gi
+
+## c08_shared_clone_of_holder
+> CRITIQUE NOTE 7: `Shared<Account>.Clone()` at a borrow-bearing `Account`. The clone is an independent handle to the same value; read as an ordinary mint it would carry the ORIGINAL handle's binding, so moving the original away while the clone is used would be frozen — which defeats sharing. EXPECT today: compiles; clean in both modes (both handles are valid). Under 0212 revision 2: admitted — a clone carries the value's sources (`c`) and not the binding of the handle it was cloned from; the first draft would have rejected the `move first`.
+- **report**: compile=accept-with-warning; trust lines=1
+      c08_shared_clone_of_holder.bzl:13:15: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source the caller mus
+  run exit=0; output: ann|ann|
+- **checked**: compile=accept; trust lines=0
+  run exit=0; output: ann|ann|
+- **unchecked**: compile=accept; trust lines=0
+  run exit=0; output: ann|ann|
+
+## c09_observer_self_registration
+> CRITIQUE NOTE 10: observer self-registration. A constructor hands `this` to a longer-lived object that keeps it. EXPECT today: compiles; a report line at `Bus.Subscribe`'s store; checked = DisposedAccessException when the bus notifies after the observer died. RESULT on r40: compiles with NO report line (the note's k2a gap), faults in checked mode, segfaults unchecked. Under 0212: no static form — `bus.Subscribe(scoped this)` is a store into an object the constructor does not hold, and the bus is declared before the observer. c10 is what users write instead.
+- **report**: compile=accept; trust lines=0
+  run exit=70; output: notify o1|Unhandled exception: System.DisposedAccessException|
+- **checked**: compile=accept; trust lines=0
+  run exit=70; output: notify o1|Unhandled exception: System.DisposedAccessException|
+- **unchecked**: compile=accept; trust lines=0
+  run exit=139; output: notify o1|
+
+## c10_observer_event_subscription
+> CRITIQUE NOTE 10, what users write instead: the bus exposes an event (stdlib 6.5); the observer keeps the `Subscription` in an `owned` field, so its own disposal severs the registration (spec 28.14, bounding form 3). EXPECT: compiles; no report line; clean in both modes; the second Raise reaches no handler.
+- **report**: compile=accept; trust lines=0
+  run exit=0; output: o1 saw first|done|
+- **checked**: compile=accept; trust lines=0
+  run exit=0; output: o1 saw first|done|
+- **unchecked**: compile=accept; trust lines=0
+  run exit=0; output: o1 saw first|done|
+
+## c11_exception_with_stored_cause
+> CRITIQUE NOTE 11: an exception class that STORES its cause as a borrow, thrown from the catch arm that borrowed the cause. The caught exception is disposed after its arm (spec 31.1), so the stored cause is dead when the outer handler reads it. EXPECT today: compiles; a report line; checked = DisposedAccessException in the outer handler. RESULT on r40: compiles with NO report line, and prints an empty line with exit 0 in all three modes — the read of the dead cause is not caught even in checked mode. Under 0212: error at the `throw` — the operand carries the catch binding. c12 is the rewrite.
+- **report**: compile=accept; trust lines=0
+  run exit=0; output: |
+- **checked**: compile=accept; trust lines=0
+  run exit=0; output: |
+- **unchecked**: compile=accept; trust lines=0
+  run exit=0; output: |
+
+## c12_exception_with_owned_cause
+> CRITIQUE NOTE 11, the rewrite: the exception OWNS what it keeps. Here it keeps the cause's message, a string; a class that must keep the cause object declares the field `owned` and is given an owned exception. (The standard exceptions' `inner` constructor copies a snapshot into the cause chain and retains no reference, stdlib 2 and spec 31.4.) EXPECT: compiles; no report line; clean in both modes; prints boom.
+- **report**: compile=accept-with-warning; trust lines=1
+      c12_exception_with_owned_cause.bzl:6:15: warning: trust admission recorded (§28.3 borrowed-field store): the compiler is admitting a borrow of the receiver or a plain (non-`owned`, non-`scoped`) parameter whose source the caller 
+  run exit=0; output: boom|
+- **checked**: compile=accept; trust lines=0
+  run exit=0; output: boom|
+- **unchecked**: compile=accept; trust lines=0
+  run exit=0; output: boom|
+
 ## d01_dtor_body_uses_this
 > DESTRUCTOR WINDOW, flag timing: the owner's own destructor body (a) reads an expression-bodied property of `this`, (b) calls an instance method of `this`, (c) hands `this` to a static helper that reads a property. MEASURE which of the three faults in checked mode: it tells whether the disposed flag is set before the destructor body runs, and whether a member entry on `this` inside the body is flag-tested.
 - **report**: compile=accept; trust lines=0

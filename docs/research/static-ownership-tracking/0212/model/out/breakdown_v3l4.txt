@@ -1,13 +1,15 @@
-# 0212 rejections of baseline-accepted programs — vars=3 len=4 features=p0212
-programs 81174; baseline accepted 26031; rejected by 0212: 342
+# 0212 rejections of baseline-accepted programs — vars=3 len=4 features=p0212r [0212 revised]
+programs 95382; baseline accepted 31497; rejected by 0212: 786
 | rejecting rule | what the program did at the baseline | programs | shortest witness |
 |---|---|---|---|
-| 0205-holder-use-after-dominating-kill | never(dangling) | 24 | `new a / newk b a / disp a / use b` |
-| 0205-holder-use-after-dominating-kill | every(holder) | 12 | `new a / newk b a / disp a / kuse b` |
-| 0212-owned-erasure | never(clean) | 102 | `new a / newk b a / erase c b` |
-| 0212-owned-erasure | never(dangling) | 24 | `new a / newk b a / erase c b / asg a` |
-| K5.1-frozen-transfer | never(dangling) | 84 | `new a / newk b a / send a / use b` |
-| K5.1-frozen-transfer | race | 12 | `new a / newk b a / send a / kuse b` |
-| K5.1-frozen-transfer | never(clean) | 12 | `new a / newk b a / move c a / disp b` |
-| K5.2-frozen-overwrite | never(dangling) | 60 | `new a / newk b a / asg a / use b` |
-| K5.2-frozen-overwrite | every(holder) | 12 | `new a / newk b a / asg a / kuse b` |
+| 0205-holder-use-after-dominating-kill | never(dangling) | 36 | `new a / newk b a / disp a / use b` |
+| 0205-holder-use-after-dominating-kill | never(clean) | 30 | `new a / fmove b a / disp a / use b` |
+| 0205-holder-use-after-dominating-kill | every(holder) | 18 | `new a / newk b a / disp a / kuse b` |
+| 0212-owned-erasure | never(clean) | 204 | `new a / newk b a / erase c b` |
+| 0212-owned-erasure | never(dangling) | 48 | `new a / newk b a / erase c b / asg a` |
+| K5.1-frozen-transfer | never(dangling) | 144 | `new a / newk b a / send a / use b` |
+| K5.1-frozen-transfer | never(clean) | 96 | `new a / fmove b a / send a / use b` |
+| K5.1-frozen-transfer | race | 18 | `new a / newk b a / send a / kuse b` |
+| K5.2-frozen-overwrite | never(dangling) | 108 | `new a / newk b a / asg a / use b` |
+| K5.2-frozen-overwrite | never(clean) | 66 | `new a / fmove b a / asg a / use b` |
+| K5.2-frozen-overwrite | every(holder) | 18 | `new a / newk b a / asg a / kuse b` |

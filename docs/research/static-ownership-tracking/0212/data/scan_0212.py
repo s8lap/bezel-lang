@@ -18,6 +18,17 @@ adds or settles:
   R7  async: a local instance of a borrow-bearing class in an `async` body with an `await` between its declaration
       and a later use; `async` members with a parameter or a task result of borrow-bearing class type
 
+Revision 2 (after the adversarial critique of the first draft) adds one pass per finding:
+  F1  `out owned` parameters, and those declared at a borrow-bearing class
+  F2  owning choices and owning inline arrays that own a borrow-bearing class; `Result<…>` named at one
+  F3  `owned` parameters of borrow-bearing class type, by member kind, and whether the body hands the parameter to a
+      member of another parameter's object (the critic's c04)
+  F4  a `move` of a field of an object other than `this` (a replacing or bare take from outside a member)
+  F6  constructions of the comparer-retaining collections with an argument, by where the argument comes from
+  F7  `Clone()` / `Downgrade()` / `TryUpgrade()` calls in units that name `Shared<C>` or `Weak<C>` at a borrow-bearing C
+  N10 a constructor that hands `this` to a member of one of its parameters (observer self-registration)
+  N11 exception classes that are borrow-bearing; the doc-extracted code blocks holding a store whose verdict changes
+
 Outputs (in --out): base/ (the note's scanner, re-run), generic_owned_T.tsv, generic_inst_at_bb.tsv, throws.tsv,
 async.tsv, dtor.tsv, interfaces.tsv, rollup_0212.tsv, summary_0212.txt.
 
@@ -143,6 +154,7 @@ def main():
     rel = lambda p: os.path.relpath(p, a.head) if p.startswith(a.head) else os.path.relpath(p, a.docs)
 
     gen_rows = []; inst_rows = []; throw_rows = []; async_rows = []; dtor_rows = []; iface_rows = []
+    rev2_rows = []
     static_rows = []; stat = Counter(); new_reject = defaultdict(list)
     for corpus, path, text in units:
         expect = S.unit_expect(corpus, path, text)
@@ -302,6 +314,123 @@ def main():
                             if use_after:
                                 async_rows.append((corpus, u, expect, body[i].line, f"{c.name}.{m.name}", "local-across-await", f"{name} := new {bt[i+1]}({' '.join(args)})", src))
                                 stat["async_bb_local_live_across_await"] += 1; stat["async_bb_local_across_await:" + src] += 1
+        # ---- revision 2: one pass per critique finding
+        def R2(kind, line, where, detail):
+            rev2_rows.append((kind, corpus, u, expect, line, where, detail)); stat["rev2:" + kind] += 1
+        bt_all = [t.text for t in toks]; nall = len(bt_all)
+        for c in classes:
+            if c.kind == "choice":
+                for m in c.members:
+                    pass
+            for m in c.members:
+                if m.kind not in ("ctor", "method"): continue
+                body = m.body or []; bt = [t.text for t in body]
+                for p in m.params:
+                    ph = L.type_head(SS.strip_null(re.sub(r"^owned\s+", "", p.typ or "")))
+                    if "out" in p.mods and "owned" in p.mods:
+                        R2("F1 out-owned parameter", m.line, f"{c.name}.{m.name}", f"out owned {p.name}: {p.typ}")
+                        if ph in bbnames: R2("F1 out-owned parameter of a borrow-bearing class", m.line, f"{c.name}.{m.name}", f"out owned {p.name}: {p.typ}")
+                    if "owned" in p.mods and "out" not in p.mods and ph in bbnames:
+                        kind = "constructor" if m.kind == "ctor" else ("static method" if m.static else "instance method")
+                        R2("F3 owned parameter of a borrow-bearing class: " + kind, m.line, f"{c.name}.{m.name}", f"owned {p.name}: {p.typ}")
+                        others = {q.name for q in m.params if q.name != p.name and "owned" not in q.mods}
+                        for i in range(len(bt) - 4):
+                            if bt[i] in others and bt[i+1] == "." and bt[i+3] == "(":
+                                d = 0; e = i + 3; hit = False
+                                while e < len(bt):
+                                    if bt[e] == "(": d += 1
+                                    elif bt[e] == ")":
+                                        d -= 1
+                                        if d == 0: break
+                                    elif bt[e] == p.name and bt[e-1] in ("move", "(", ","): hit = True
+                                    e += 1
+                                if hit: R2("F3 owned parameter handed to a member of another parameter's object", body[i].line, f"{c.name}.{m.name}", f"{bt[i]}.{bt[i+2]}(… {p.name} …)")
+                # N10: a constructor hands `this` to a member of one of its parameters
+                if m.kind == "ctor":
+                    pn = {q.name for q in m.params}
+                    for i in range(len(bt) - 4):
+                        if bt[i] in pn and bt[i+1] == "." and body[i+2].kind == "id":
+                            k = i + 3
+                            while k < len(bt) and bt[k] in (".",) : k += 2
+                            if k < len(bt) and bt[k] == "(":
+                                d = 0; e = k; hit = False
+                                while e < len(bt):
+                                    if bt[e] == "(": d += 1
+                                    elif bt[e] == ")":
+                                        d -= 1
+                                        if d == 0: break
+                                    elif bt[e] == "this" and bt[e-1] in ("(", ",", "scoped") and bt[e+1] in (")", ","): hit = True
+                                    e += 1
+                                if hit: R2("N10 a constructor hands `this` to a member of a parameter", body[i].line, f"{c.name}.constructor", " ".join(bt[i:min(e+1, i+10)]))
+        # F2: owning choices / owning inline arrays / Result<…> over a borrow-bearing class
+        for i, t in enumerate(toks):
+            if t.text == "choice" and i + 1 < nall and toks[i+1].kind == "id":
+                j = i + 2; d = 0
+                while j < nall and not (bt_all[j] == "end" and j + 1 < nall and bt_all[j+1] == bt_all[i+1]):
+                    if bt_all[j] == "owned" and j + 3 < nall and bt_all[j+2] == ":" and L.type_head(SS.strip_null(bt_all[j+3])) in bbnames:
+                        R2("F2 owning choice with an owned payload of a borrow-bearing class", toks[j].line, bt_all[i+1], f"owned {bt_all[j+1]}: {bt_all[j+3]}")
+                    j += 1
+            if t.text == "[" and i + 4 < nall and bt_all[i+2] == "owned" and bt_all[i+3] == "]" and L.type_head(SS.strip_null(bt_all[i+4])) in bbnames:
+                R2("F2 owning inline array of a borrow-bearing class", t.line, "", "".join(bt_all[i:i+5]))
+            if t.text == "Result" and i + 1 < nall and bt_all[i+1] == "<":
+                d = 0; j = i + 1; parts = []
+                while j < nall and j - i < 30:
+                    if bt_all[j] == "<": d += 1
+                    elif bt_all[j] == ">":
+                        d -= 1
+                        if d == 0: break
+                    parts.append(bt_all[j]); j += 1
+                args = L.type_args("Result" + "".join(parts) + ">") if j < nall and bt_all[j] == ">" else []
+                stat["rev2:F2 Result<…> named"] += 1
+                if any(L.type_head(SS.strip_null(x)) in bbnames for x in args):
+                    R2("F2 Result<…> named at a borrow-bearing class", t.line, "", "Result<" + ", ".join(args) + ">")
+                elif any(kinds.get(L.type_head(SS.strip_null(x))) == "class" for x in args):
+                    stat["rev2:F2 Result<…> named at a class of the unit that is not borrow-bearing"] += 1
+        # F4: a `move` of a field of an object other than `this`
+        for i, t in enumerate(toks):
+            if t.text == "move" and i + 3 < nall and toks[i+1].kind == "id" and bt_all[i+1] != "this" and bt_all[i+2] == "." and toks[i+3].kind == "id":
+                fld = bt_all[i+3]
+                owners = [c2 for c2 in classes if c2.kind == "class" and c2.field(fld) is not None]
+                ft = [L.type_head(SS.strip_null(c2.field(fld).typ or "")) for c2 in owners]
+                R2("F4 move of a field of an object other than `this`", t.line, "", " ".join(bt_all[i:i+6]))
+                if any(x in bbnames for x in ft):
+                    R2("F4 … whose field type is a borrow-bearing class", t.line, "", " ".join(bt_all[i:i+6]))
+        # F6: constructions of the comparer-retaining collections with an argument
+        for i, t in enumerate(toks):
+            if t.text == "new" and i + 2 < nall and bt_all[i+1] in ("Dictionary", "OwningDictionary", "Set", "OwningSet") and bt_all[i+2] == "<":
+                d = 0; j = i + 2
+                while j < nall:
+                    if bt_all[j] == "<": d += 1
+                    elif bt_all[j] == ">":
+                        d -= 1
+                        if d == 0: break
+                    j += 1
+                targs = L.type_args(bt_all[i+1] + "".join(bt_all[i+2:j]) + ">")
+                if j + 1 < nall and bt_all[j+1] == "(" and j + 2 < nall and bt_all[j+2] != ")":
+                    d = 0; e = j + 1; arg = []
+                    while e < nall:
+                        if bt_all[e] == "(": d += 1
+                        elif bt_all[e] == ")":
+                            d -= 1
+                            if d == 0: break
+                        arg.append(bt_all[e]); e += 1
+                    arg = arg[1:]
+                    if all(re.fullmatch(r"[0-9_]+", x) or x in (",",) for x in arg): continue      # a capacity
+                    if len(arg) == 1 and re.fullmatch(r"[a-z_]\w*", arg[0]) and re.search(r"cap|size|count|^n$", arg[0], re.I): continue
+                    src = "a fresh `new`" if "new" in arg else ("a static member (`T.M`)" if (len(arg) >= 3 and arg[-2] == "." and arg[-3][:1].isupper()) else "a local, parameter or field")
+                    bbinst = any(L.type_head(SS.strip_null(x)) in bbnames or kinds.get(L.type_head(SS.strip_null(x))) in ("class", "interface") for x in targs)
+                    R2("F6 comparer-retaining collection built with an argument: " + src + (" (class-typed instantiation)" if bbinst else " (value instantiation)"), t.line, "", bt_all[i+1] + "<" + ", ".join(targs) + ">(" + " ".join(arg[:8]) + ")")
+        # F7: Clone / Downgrade / TryUpgrade in a unit that names Shared<C> or Weak<C> at a borrow-bearing C
+        shared_bb = any(r[1] == u and r[4] in ("Shared", "Weak") for r in inst_rows)
+        if shared_bb:
+            for i, t in enumerate(toks):
+                if t.text in ("Clone", "Downgrade", "TryUpgrade") and i > 0 and bt_all[i-1] == "." and i + 1 < nall and bt_all[i+1] == "(":
+                    R2("F7 Clone/Downgrade/TryUpgrade in a unit that names Shared<C>/Weak<C> at a borrow-bearing C", t.line, "", "." + t.text + "()")
+        # N11: borrow-bearing exception classes
+        for c in classes:
+            if c.kind == "class" and c.name in bbnames and (any(b.endswith("Exception") or b.endswith("Error") for b in c.bases)):
+                R2("N11 exception class that is borrow-bearing", c.line, c.name, ", ".join(f"{w[0]}: {w[2]}" for w in bb[c.name]))
+
         # ---- R4: static-held stores of a parameter
         for c in classes:
             if c.kind != "class": continue
@@ -327,6 +456,7 @@ def main():
     dump("dtor.tsv", ["corpus", "unit", "expect", "class", "borrow_fields", "named_in_destructor", "instance_methods_called"], dtor_rows)
     dump("interfaces.tsv", ["corpus", "unit", "expect", "interface", "why"], iface_rows)
     dump("static_stores.tsv", ["corpus", "unit", "expect", "line", "member", "static"], static_rows)
+    dump("rev2_findings.tsv", ["finding", "corpus", "unit", "expect", "line", "where", "detail"], rev2_rows)
 
     # ---- the note's tables, re-read
     def tsv(p):
@@ -404,6 +534,28 @@ def main():
     P("== R4 static-held stores")
     P(f"a method that stores a plain parameter into a static field or a static-held collection: {stat['static_held_store_of_a_parameter']}")
     for r in static_rows: P(f"    {r[1]} [{r[0]}/{r[2]}] line {r[3]} {r[4]} -> static {r[5]}")
+    P("")
+    P("== REVISION 2: one pass per critique finding (rev2_findings.tsv)")
+    for k in sorted(k for k in stat if k.startswith("rev2:")):
+        rows = [r for r in rev2_rows if r[0] == k[5:]]
+        acc_n = sum(1 for r in rows if r[1] != "gtest" and r[3] in ACC)
+        P(f"  {k[5:]}: {stat[k]}" + (f" (accepted tier: {acc_n}; gtest: {sum(1 for r in rows if r[1] == 'gtest')})" if rows else ""))
+    show = [r for r in rev2_rows if not r[0].startswith("F1 out-owned parameter") or "borrow-bearing" in r[0]]
+    show = [r for r in show if not r[0].startswith("F4 move of a field") and not r[0].startswith("F3 owned parameter of a borrow-bearing class")]
+    for r in show[:60]: P(f"    {r[0]} | {r[2]} [{r[1]}/{r[3]}] line {r[4]} {r[5]} {r[6]}")
+    P("")
+    P("== N11: doc-extracted code blocks that hold a store whose verdict changes at stage 3 (for the spec train's §8.13)")
+    doc_sec = {}
+    if os.path.exists(mp):
+        for line in open(mp):
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 3: doc_sec[parts[0]] = (parts[1], parts[2])
+    for srow in stores:
+        if srow["corpus"] == "docs" and srow["population"] == "T":
+            cid = os.path.basename(srow["unit"])[:-4]
+            d_, sec_ = doc_sec.get(cid, ("?", "?"))
+            v_ = srow["A0_store"]
+            P(f"    {cid} ({d_}, {sec_}) [{srow['expect']}] {srow['class']}.{srow['member']}: " + ("needs `scoped`" if v_.startswith("edit") else ("rejected" if v_.startswith("reject") else "admitted as written; its comment cites the trust clause")))
     P("")
     # ---- roll-up
     P("== PER-PROGRAM ROLL-UP under 0212, accepted tier (rules, docs, lit units the spec expects to compile)")

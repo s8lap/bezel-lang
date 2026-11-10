@@ -1,0 +1,53 @@
+finding	corpus	unit	expect	line	where	detail
+F1 out-owned parameter	rules	tests/conformance/rules/cases/s11_3_0008.bzl	reject	27	Cache.TryGet	out owned value: Widget?
+F6 comparer-retaining collection built with an argument: a local, parameter or field (value instantiation)	rules	tests/conformance/rules/cases/s17_7_0015.bzl	reject	14		Set<int>("")
+F6 comparer-retaining collection built with an argument: a local, parameter or field (value instantiation)	rules	tests/conformance/rules/cases/s17_7_0016.bzl	reject	14		Dictionary<int, string>("")
+F6 comparer-retaining collection built with an argument: a local, parameter or field (class-typed instantiation)	rules	tests/conformance/rules/cases/s17_7_0017.bzl	reject	19		OwningSet<Box>("")
+F6 comparer-retaining collection built with an argument: a local, parameter or field (class-typed instantiation)	rules	tests/conformance/rules/cases/s17_7_0018.bzl	reject	19		OwningDictionary<int, Box>("")
+F1 out-owned parameter	rules	tests/conformance/rules/cases/s22_4_0004.bzl	run	18	Factory.TryCreate	out owned c: Conn
+F1 out-owned parameter	rules	tests/conformance/rules/cases/s22_4_0009.bzl	accept	19	Factory.TryCreate	out owned c: Conn?
+F1 out-owned parameter	rules	tests/conformance/rules/cases/s22_6_0015.bzl	reject	26	Pool.TryGet	out owned c: Conn?
+F1 out-owned parameter	rules	tests/conformance/rules/cases/s27_1_0004.bzl	accept	17	Factory.Make	out owned w: Widget
+F1 out-owned parameter	rules	tests/conformance/rules/cases/s28_10_0027.bzl	reject	9	Program.Mk	out owned o: Res?
+F4 move of a field of an object other than `this`	rules	tests/conformance/rules/cases/s28_11_0043.bzl	reject	25		move h . Slots [ 0
+F4 move of a field of an object other than `this`	rules	tests/conformance/rules/cases/s28_11_0048.bzl	reject	24		move Registry . Pool [ 0
+F1 out-owned parameter	rules	tests/conformance/rules/cases/s28_1_0005.bzl	accept	16	Factory.TryAcquire	out owned c: Connection
+F4 move of a field of an object other than `this`	rules	tests/conformance/rules/cases/s28_8_1_0019.bzl	run	26		move h . _r with new
+F4 move of a field of an object other than `this`	rules	tests/conformance/rules/cases/s28_8_1_0029.bzl	reject	23		move Registry . Pool [ 0
+F4 move of a field of an object other than `this`	rules	tests/conformance/rules/cases/s35_5_0004.bzl	reject	31		move client . Fetch ( )
+F4 move of a field of an object other than `this`	docs	tests/conformance/cases/codegen_0009.bzl	skip/n/a	6		move obj . _field with e
+N11 exception class that is borrow-bearing	docs	tests/conformance/cases/codegen_0018.bzl	skip/n/a	15	TypeInitializationException	InnerException: Exception
+F1 out-owned parameter	docs	tests/conformance/cases/codegen_0036.bzl	fragment/compiles	35	ConnectionPool.TryPopCached	out owned conn: Connection?
+F4 move of a field of an object other than `this`	docs	tests/conformance/cases/codegen_0068.bzl	error/diagnose	18		move h . item ; return
+F4 move of a field of an object other than `this`	docs	tests/conformance/cases/codegen_0069.bzl	fragment/compiles	18		move h . item with new
+F4 move of a field of an object other than `this`	docs	tests/conformance/cases/codegen_0073.bzl	fragment/compiles	34		move p . _r with fresh
+F4 move of a field of an object other than `this`	docs	tests/conformance/cases/codegen_0096.bzl	error/diagnose	3		move h . Slots ; h
+F4 move of a field of an object other than `this`	docs	tests/conformance/cases/guide1_0005.bzl	fragment/compiles	8		move holder . slot with fresh
+F1 out-owned parameter	docs	tests/conformance/cases/spec_0155.bzl	fragment/compiles	6	ConnectionPool.TryPopCached	out owned conn: Connection?
+N11 exception class that is borrow-bearing	docs	tests/conformance/cases/stdlib_0033.bzl	fragment/compiles	1	TypeInitializationException	InnerException: Exception
+F4 move of a field of an object other than `this`	docs	tests/conformance/cases/stdlib_0062.bzl	fragment/compiles	36		move chain . Next with rebuilt
+F4 move of a field of an object other than `this`	docs	tests/conformance/cases/stdlib_0062.bzl	fragment/compiles	60		move chain . Next ; if
+F4 move of a field of an object other than `this`	docs	tests/conformance/cases/stdlib_0062.bzl	fragment/compiles	62		move chain . Value ; chain
+F1 out-owned parameter	lit	tests/lit/owned_type_requirement_reject_1797.bzl	reject	48	R.P5	out owned x: int
+F1 out-owned parameter	lit	tests/lit/owned_type_requirement_type_reject_4629.bzl	reject	51	R.P2	out owned t: Type
+F1 out-owned parameter	lit	tests/lit/ownership/auto_drop_remedy_7843__names_move.bzl	accept	39	Mk.TryGet	out owned it: Item?
+F1 out-owned parameter	lit	tests/lit/ownership/auto_drop_remedy_7843__names_move.bzl	accept	46	Mk.TryTask	out owned t: Task?
+F1 out-owned parameter	lit	tests/lit/sema/ctor_out_owned_var_dropped_2429__no_dispose_still_warned.bzl	accept	25	Widget.constructor	out owned n: Item
+F1 out-owned parameter	lit	tests/lit/sema/out_owned_transfer_860__user_out_owned_param_dispose_accepted.bzl	accept	12	Box.TakeIt	out owned r: Cell
+F1 out-owned parameter	lit	tests/lit/sema/out_owned_transfer_860__user_out_owned_param_dropped_rejected.bzl	accept	16	Box.TakeIt	out owned r: Cell
+F4 move of a field of an object other than `this`	lit	tests/lit/sema/replacing_move_with_clause_7567__field_parses_then_declined.bzl	reject	28		move h . F with new
+F6 comparer-retaining collection built with an argument: a local, parameter or field (value instantiation)	lit	tests/lit/sema/sema_new_expr_collection_literal_599__set_int_ctor_collection_literal_rejected_spec_15_4.bzl	reject	9		Set<int>([ 1 , 2 , 3 ])
+F1 out-owned parameter	lit	tests/lit/sema/sema_overload__distinct_names_out_vs_out_owned_ok.bzl	accept	9	C.TryTake	out owned c: T?
+F1 out-owned parameter	lit	tests/lit/sema/sema_overload__out_vs_out_owned_clashes.bzl	reject	6	C.F	out owned c: T
+F1 out-owned parameter	lit	tests/lit/sema/user_out_var_1597__out_owned_var_nonnullable_infers_nonnullable_accept_spec_22_4.bzl	accept	13	Pool.TryTakeNonNull	out owned conn: Cn
+F1 out-owned parameter	lit	tests/lit/sema/user_out_var_1597__out_owned_var_nullable_infers_nullable_reject_unguarded_spec_22_4.bzl	reject	10	Pool.TryTake	out owned conn: Cn?
+F1 out-owned parameter	gtest	tests/codegen/async_iterenum_arg_slot_frame_spill_5292_test.cpp	mixed	31	Base.MkOut	out owned r: Item
+F1 out-owned parameter	gtest	tests/codegen/discard_out_owned_var_recipient_3293_test.cpp	mixed	11	Widget.constructor	out owned n: Res
+F1 out-owned parameter	gtest	tests/codegen/discard_out_owned_var_recipient_3293_test.cpp	mixed	33	Widget.constructor	out owned n: Res
+F1 out-owned parameter	gtest	tests/codegen/full_expr_out_discard_dispose_5297_test.cpp	mixed	23	C.Make	out owned r: R?
+F1 out-owned parameter	gtest	tests/codegen/full_expr_out_discard_dispose_5297_test.cpp	mixed	24	C.MakeP	out owned r: PR?
+F1 out-owned parameter	gtest	tests/codegen/full_expr_out_discard_dispose_5297_test.cpp	mixed	25	C.MakeNone	out owned r: R?
+F1 out-owned parameter	gtest	tests/codegen/full_expr_out_discard_dispose_5297_test.cpp	mixed	64	C.Make	out owned r: R?
+F4 move of a field of an object other than `this`	gtest	tests/sema/replacing_move_with_clause_7567_test.cpp	mixed	19		move h . F with new
+F4 move of a field of an object other than `this`	gtest	tests/sema/replacing_move_with_clause_7567_test.cpp	mixed	26		move h . F with new
+F4 move of a field of an object other than `this`	gtest	tests/sema/replacing_move_with_clause_7567_test.cpp	mixed	33		move h . A [ 0

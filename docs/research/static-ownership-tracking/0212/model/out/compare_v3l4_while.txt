@@ -1,16 +1,18 @@
-# Candidate comparison — bounds: vars=3 len=4 features=p0212 --while [v0.355 base] --body 2
-baseline: 2350698 programs, 465942 accepted; 302562 accepted programs contain a K4.3 store; VIOLATIONS 0; K4.3 race residuals 60
-baseline trust surface (accepted programs in which some run reads a dead or foreign object THROUGH A STORED BORROW): 936 = race 24 + fault on every run 24 + fault on some run 888
-baseline flag surface (accepted programs that fault on every / some run, any cause): 36 / 2394   (63.7 s)
+# Candidate comparison — bounds: vars=3 len=4 features=p0212r --while [v0.355 base] --body 2
+baseline: 2921382 programs, 607872 accepted; 444492 accepted programs contain a K4.3 store; VIOLATIONS 0; K4.3 race residuals 78
+baseline trust surface (accepted programs in which some run reads a dead or foreign object THROUGH A STORED BORROW): 1518 = race 36 + fault on every run 36 + fault on some run 1446
+baseline flag surface (accepted programs that fault on every / some run, any cause): 48 / 3096   (82.3 s)
 
 | candidate | accepted | newly accepted | newly unsound | newly rejected | …race | …fault every run (holder/local) | …fault some run (holder/local) | …never fault: a dangling stored borrow exists, unread / no dangling borrow at all | left: race through a stored borrow | left: fault through a stored borrow (every/some) | left: accepted programs with an untracked K4.3 store | witness (clean rejection) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| A  the candidate of the note (no erasure rule) | 461892 | 0 | 0 | 4050 | 24 | 24/0 | 876/0 | 3114 / 12 | 0 | 0/12 | 0 | `new a / newk b a / move c a / disp b` |
-| 0212  A + R5, the owned-erasure rule | 459870 | 0 | 0 | 6072 | 24 | 24/0 | 876/0 | 3144 / 2004 | 0 | 0/12 | 0 | `new a / newk b a / erase c b` |
-| 0212-explicit  the same with a stored-arguments-only mint (oracle) | 459870 | 0 | 0 | 6072 | 24 | 24/0 | 876/0 | 3144 / 2004 | 0 | 0/12 | 0 | `new a / newk b a / erase c b` |
+| A  the candidate of the note (no erasure rule) | 602916 | 0 | 0 | 4956 | 24 | 24/0 | 948/0 | 3948 / 12 | 12 | 12/498 | 0 | `new a / newk b a / move c a / disp b` |
+| 0212-draft1  0212 as first drafted (A + the owned-erasure rule) | 600522 | 0 | 0 | 7350 | 24 | 24/0 | 948/0 | 3978 / 2376 | 12 | 12/498 | 0 | `new a / newk b a / erase c b` |
+| 0212  revised: out-owned mint, move-only carriers, replacing move carries its holder | 591768 | 0 | 0 | 16104 | 36 | 36/0 | 1428/0 | 6234 / 8370 | 0 | 0/18 | 0 | `new a / newk b a / erase c b` |
+| 0212-explicit  revised, with a stored-arguments-only mint (oracle) | 591768 | 0 | 0 | 16104 | 36 | 36/0 | 1428/0 | 6234 / 8370 | 0 | 0/18 | 0 | `new a / newk b a / erase c b` |
 
-- A: residual witnesses — some: `new a / newk b a / while { /   disp a /   asg a / } / kuse b`
+- A: residual witnesses — every: `new a / newko b a / asg a / kuse b`; race: `new a / newko b a / send a / kuse b`; some: `new a / newko b a / while { /   asg a / } / kuse b`
+- 0212-draft1: residual witnesses — every: `new a / newko b a / asg a / kuse b`; race: `new a / newko b a / send a / kuse b`; some: `new a / newko b a / while { /   asg a / } / kuse b`
 - 0212: residual witnesses — some: `new a / newk b a / while { /   disp a /   asg a / } / kuse b`
 - 0212-explicit: residual witnesses — some: `new a / newk b a / while { /   disp a /   asg a / } / kuse b`
 
-(256.8 s)
+(417.4 s)

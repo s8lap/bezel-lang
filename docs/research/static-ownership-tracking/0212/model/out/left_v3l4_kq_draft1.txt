@@ -1,0 +1,18 @@
+# what 0212 as first drafted leaves — vars=3 len=4 features=p0212r --kdtor --qdtor --hidden-link
+accepted: 29193; with a stale read through a stored borrow on some run: 1908
+| cause | outcome | the read that meets the flag | programs | shortest witness |
+|---|---|---|---|---|
+| FIRST DRAFT HOLE: an `out owned` recipient carries nothing (critic c02) | FAULT | kdtor | 672 | `new a / newko b a / asg a` |
+| FIRST DRAFT HOLE: a child taken out by a replacing move does not carry its owner (critic c03) | FAULT | qdtor | 606 | `new a / fmove b a / asg a` |
+| FIRST DRAFT HOLE: an `out owned` recipient carries nothing (critic c02) | RACE | kdtor | 246 | `new a / newko b a / send a` |
+| FIRST DRAFT HOLE: a child taken out by a replacing move does not carry its owner (critic c03) | RACE | qdtor | 210 | `new a / fmove b a / send a` |
+| FIRST DRAFT HOLE: an `out owned` recipient carries nothing (critic c02) | FAULT | qdtor | 42 | `new a / fmove b a / asg a / newko c a` |
+| slot kill (fst after fbrw): K5.6 | FAULT | kdtor | 36 | `new a / fbrw b a / fst a / newk c b` |
+| announced kill of one source of two (a two-argument mint, then disp): K4.2 | FAULT | kdtor | 24 | `new a / new b / newk2 c a b / disp a` |
+| FIRST DRAFT HOLE: an `out owned` recipient carries nothing (critic c02) | RACE | qdtor | 18 | `new a / fmove b a / send a / newko c b` |
+| FIRST DRAFT HOLE: a child taken out by a replacing move does not carry its owner (critic c03) | FAULT | puse | 12 | `new a / fmove b a / asg a / puse b` |
+| FIRST DRAFT HOLE: an owning choice over a holder carries nothing (critic c05) | FAULT | kdtor | 12 | `new a / newk b a / disp a / wrap c b` |
+| FIRST DRAFT HOLE: an `out owned` recipient carries nothing (critic c02) | FAULT | kuse | 12 | `new a / newko b a / asg a / kuse b` |
+| FIRST DRAFT HOLE: a child taken out by a replacing move does not carry its owner (critic c03) | RACE | puse | 6 | `new a / fmove b a / send a / puse b` |
+| announced kill of one source of two (a two-argument mint, then disp): K4.2 | FAULT | qdtor | 6 | `new a / fmove b a / newk2 c b a / disp a` |
+| FIRST DRAFT HOLE: an `out owned` recipient carries nothing (critic c02) | RACE | kuse | 6 | `new a / newko b a / send a / kuse b` |

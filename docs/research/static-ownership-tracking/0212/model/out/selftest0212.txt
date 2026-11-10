@@ -58,5 +58,37 @@
     new a / link a / fmove c a / new b / fstm b c / disp a
     v0.355: accept  runs: ['FAULT']  bad: []  OK
     0212: reject:0205-holder-release-after-dominating-kill  runs: None  bad: []  OK
+--- critic c02 — `out owned`: the argument is sent to another domain while the recipient is still used
+    new a / newko b a / send a / kuse b
+    0212 first draft: accept  runs: ['RACE']  bad: ['RACE']  OK
+    0212 revised: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+--- critic c02 — `out owned`: the argument is disposed, then the recipient is used
+    new a / newko b a / disp a / kuse b
+    0212 first draft: accept  runs: ['FAULT']  bad: []  OK
+    0212 revised: reject:0205-holder-use-after-dominating-kill  runs: None  bad: []  OK
+--- critic c05 — an owning choice wraps a holder: the source is sent away, then the payload is read
+    new a / newk b a / wrap c b / send a / wuse c
+    0212 first draft: accept  runs: ['RACE']  bad: ['RACE']  OK
+    0212 revised: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+--- critic c05 — an owning choice wraps a holder: the source is disposed, then the payload is read
+    new a / newk b a / wrap c b / disp a / wuse c
+    0212 first draft: accept  runs: ['FAULT']  bad: []  OK
+    0212 revised: reject:0205-holder-use-after-dominating-kill  runs: None  bad: []  OK
+--- critic c05 — wrapping is not an erasure: with the source alive the wrapped holder is used normally
+    new a / newk b a / wrap c b / wuse c
+    0212 first draft: accept  runs: ['ok']  bad: []  OK
+    0212 revised: accept  runs: ['ok']  bad: []  OK
+--- critic c03 — a child linked in its constructor is taken out by a replacing move; the owner is disposed; the child reads it
+    new a / fmove b a / disp a / puse b
+    0212 first draft: accept  runs: ['FAULT']  bad: []  OK
+    0212 revised: reject:0205-holder-use-after-dominating-kill  runs: None  bad: []  OK
+--- critic c03 — the same with the owner sent to another domain: a race no flag catches
+    new a / fmove b a / send a / puse b
+    0212 first draft: accept  runs: ['RACE']  bad: ['RACE']  OK
+    0212 revised: reject:K5.1-frozen-transfer  runs: None  bad: []  OK
+--- critic c03 — the child is used while its owner lives: admitted and clean
+    new a / fmove b a / puse b
+    0212 first draft: accept  runs: ['ok']  bad: []  OK
+    0212 revised: accept  runs: ['ok']  bad: []  OK
 
-selftest0212: 30 passed, 0 failed
+selftest0212: 46 passed, 0 failed

@@ -1,16 +1,20 @@
-# 0212 rejections of baseline-accepted programs — vars=3 len=4 features=p0212 --kdtor --qdtor
-programs 81174; baseline accepted 26031; rejected by 0212: 2154
+# 0212 rejections of baseline-accepted programs — vars=3 len=4 features=p0212r --kdtor --qdtor [0212 revised]
+programs 95382; baseline accepted 31497; rejected by 0212: 4368
 | rejecting rule | what the program did at the baseline | programs | shortest witness |
 |---|---|---|---|
-| 0205-holder-release-after-dominating-kill | every(holder) | 468 | `new a / newk b a / disp a` |
-| 0205-holder-use-after-dominating-kill | every(holder) | 36 | `new a / newk b a / disp a / use b` |
-| 0212-owned-erasure | never(clean) | 102 | `new a / newk b a / erase c b` |
-| 0212-owned-erasure | every(holder) | 18 | `new a / newk b a / erase c b / asg a` |
-| 0212-owned-erasure | race | 6 | `new a / newk b a / erase c b / send a` |
-| A-declared-before | every(holder) | 6 | `new a / newk b a / new c / kset b c` |
-| K5.1-frozen-transfer | race | 534 | `new a / newk b a / send a` |
-| K5.1-frozen-transfer | every(holder) | 246 | `new a / newk b a / move c a` |
-| K5.1-frozen-transfer | never(clean) | 54 | `new a / new b / newk2 c a b / send b` |
-| K5.2-frozen-overwrite | every(holder) | 654 | `new a / newk b a / asg a` |
-| K5.2-frozen-overwrite | never(clean) | 24 | `new a / new b / newk2 c a b / asg b` |
-| K5.2-frozen-overwrite | never(dangling) | 6 | `new a / newk b a / asg a / kset b a` |
+| 0205-holder-release-after-dominating-kill | every(holder) | 744 | `new a / newk b a / disp a` |
+| 0205-holder-release-after-dominating-kill | never(clean) | 210 | `new a / fmove b a / disp a` |
+| 0205-holder-use-after-dominating-kill | every(holder) | 54 | `new a / newk b a / disp a / use b` |
+| 0205-holder-use-after-dominating-kill | never(clean) | 30 | `new a / fmove b a / disp a / use b` |
+| 0212-owned-erasure | never(clean) | 204 | `new a / newk b a / erase c b` |
+| 0212-owned-erasure | every(holder) | 36 | `new a / newk b a / erase c b / asg a` |
+| 0212-owned-erasure | race | 12 | `new a / newk b a / erase c b / send a` |
+| A-declared-before | every(holder) | 12 | `new a / newk b a / new c / kset b c` |
+| A-declared-before | never(clean) | 6 | `new a / new b / fmove c b / fstm a c` |
+| K5.1-frozen-transfer | race | 828 | `new a / newk b a / send a` |
+| K5.1-frozen-transfer | never(clean) | 456 | `new a / fmove b a / send a` |
+| K5.1-frozen-transfer | every(holder) | 372 | `new a / newk b a / move c a` |
+| K5.1-frozen-transfer | never(dangling) | 6 | `new a / fmove b a / link a / send a` |
+| K5.2-frozen-overwrite | every(holder) | 1026 | `new a / newk b a / asg a` |
+| K5.2-frozen-overwrite | never(clean) | 360 | `new a / fmove b a / asg a` |
+| K5.2-frozen-overwrite | never(dangling) | 12 | `new a / newk b a / asg a / kset b a` |
