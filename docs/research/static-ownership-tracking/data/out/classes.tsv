@@ -40,59 +40,41 @@ rules	tests/conformance/rules/cases/s14_6_0001.bzl	accept	Node	bb	direct	_child:
 rules	tests/conformance/rules/cases/s14_6_0002.bzl	reject	Node	bb	direct	_child:Node<Pair<T,T>>		0	0
 rules	tests/conformance/rules/cases/s15_1_0007.bzl	reject	Box	generic				0	1
 rules	tests/conformance/rules/cases/s15_1_1_0003.bzl	reject	Holder	bb	direct	_p:Pool<string>		0	0
-rules	tests/conformance/rules/cases/s15_3_0019.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0020.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0021.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
+rules	tests/conformance/rules/cases/s15_3_0019.bzl	reject	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0020.bzl	reject	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0021.bzl	reject	Bx	bb	direct	Cls:Res		0	0
 rules	tests/conformance/rules/cases/s15_3_0021.bzl	reject	Holder	generic				0	1
-rules	tests/conformance/rules/cases/s15_3_0022.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0023.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0024.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0025.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0026.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0027.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0028.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0029.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0030.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0031.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0032.bzl	reject	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0033.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0034.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0035.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0036.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0037.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0038.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0039.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0040.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
+rules	tests/conformance/rules/cases/s15_3_0022.bzl	reject	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0023.bzl	reject	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0024.bzl	reject	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0025.bzl	reject	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0026.bzl	reject	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0027.bzl	reject	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0028.bzl	reject	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0029.bzl	reject	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0030.bzl	reject	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0031.bzl	reject	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0032.bzl	reject	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0033.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0034.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0035.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0036.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0037.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0038.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0039.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0040.bzl	run	Bx	bb	direct	Cls:Res		0	0
 rules	tests/conformance/rules/cases/s15_3_0040.bzl	run	Holder3	generic				0	1
-rules	tests/conformance/rules/cases/s15_3_0041.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0042.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0043.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0044.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0045.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0046.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0047.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0048.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0049.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
-rules	tests/conformance/rules/cases/s15_3_0050.bzl	run	Bx	bb	direct	Cls:Res; F:(int		0	0
+rules	tests/conformance/rules/cases/s15_3_0041.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0042.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0043.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0044.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0045.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0046.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0047.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0048.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0049.bzl	run	Bx	bb	direct	Cls:Res		0	0
+rules	tests/conformance/rules/cases/s15_3_0050.bzl	run	Bx	bb	direct	Cls:Res		0	0
 rules	tests/conformance/rules/cases/s15_3_0050.bzl	run	Holder	generic				0	1
-rules	tests/conformance/rules/cases/s15_3_0051.bzl	reject	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0052.bzl	reject	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0053.bzl	reject	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0054.bzl	reject	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0055.bzl	reject	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0056.bzl	reject	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0057.bzl	reject	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0058.bzl	reject	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0059.bzl	run	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0060.bzl	run	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0061.bzl	run	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0062.bzl	run	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0063.bzl	run	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0064.bzl	run	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0065.bzl	run	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0066.bzl	run	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0067.bzl	run	Bx	bb	direct	F:(int; FC:(VC		0	0
-rules	tests/conformance/rules/cases/s15_3_0068.bzl	run	Bx	bb	direct	F:(int; FC:(VC		0	0
 rules	tests/conformance/rules/cases/s15_4_1_0001.bzl	run	Bag	generic			ICollectionLiteralTarget,Bag,T,T	0	1
 rules	tests/conformance/rules/cases/s15_4_1_0002.bzl	reject	Bag	generic				0	1
 rules	tests/conformance/rules/cases/s15_4_1_0005.bzl	run	Bag	generic			ICollectionLiteralTarget,Bag,T,T	0	1
@@ -112,7 +94,6 @@ rules	tests/conformance/rules/cases/s22_10_0011.bzl	accept	Box	bb	direct	src:Sou
 rules	tests/conformance/rules/cases/s22_10_0016.bzl	reject	Box	bb	direct	src:Source (primary capture)		0	0
 rules	tests/conformance/rules/cases/s22_10_0019.bzl	run	Box	bb	direct	src:Source (primary capture)		1	0
 rules	tests/conformance/rules/cases/s22_12_0902.bzl	run	B	generic				0	1
-rules	tests/conformance/rules/cases/s22_3_0046.bzl	reject	C	bb	direct	_f:((ref		0	0
 rules	tests/conformance/rules/cases/s22_6_0100.bzl	reject	Box	generic			IBox,T	0	1
 rules	tests/conformance/rules/cases/s22_6_2312.bzl	run	Row	bb	direct	Items:Array<int>		0	0
 rules	tests/conformance/rules/cases/s26_4_0012.bzl	run	Box	bb	direct	_a:Array<T>		0	0
@@ -156,28 +137,22 @@ rules	tests/conformance/rules/cases/s26_7_1415.bzl	run	Box	bb	direct	child:Box		
 rules	tests/conformance/rules/cases/s26_7_1416.bzl	run	Holder	bb	direct	o:Object		0	0
 rules	tests/conformance/rules/cases/s26_7_1416.bzl	run	Box	bb	direct	child:Box		0	0
 rules	tests/conformance/rules/cases/s26_7_1417.bzl	run	Holder	bb	direct	s:Pt		0	0
-rules	tests/conformance/rules/cases/s26_7_1419.bzl	accept	Holder	bb	direct	o:Object; f:((		0	0
+rules	tests/conformance/rules/cases/s26_7_1419.bzl	accept	Holder	bb	direct	o:Object		0	0
 rules	tests/conformance/rules/cases/s26_7_1419.bzl	accept	Box	bb	direct	child:Box		0	0
-rules	tests/conformance/rules/cases/s26_7_1420.bzl	accept	Holder	bb	direct	o:Object; f:((		0	0
+rules	tests/conformance/rules/cases/s26_7_1420.bzl	accept	Holder	bb	direct	o:Object		0	0
 rules	tests/conformance/rules/cases/s26_7_1420.bzl	accept	Box	bb	direct	child:Box		0	0
-rules	tests/conformance/rules/cases/s26_7_1421.bzl	accept	Holder	bb	direct	o:Object; f:((		0	0
+rules	tests/conformance/rules/cases/s26_7_1421.bzl	accept	Holder	bb	direct	o:Object		0	0
 rules	tests/conformance/rules/cases/s26_7_1421.bzl	accept	Box	bb	direct	child:Box		0	0
-rules	tests/conformance/rules/cases/s26_7_1422.bzl	reject	Holder	bb	direct	o:Object; f:((		0	0
+rules	tests/conformance/rules/cases/s26_7_1422.bzl	reject	Holder	bb	direct	o:Object		0	0
 rules	tests/conformance/rules/cases/s26_7_1422.bzl	reject	Box	bb	direct	child:Box		0	0
-rules	tests/conformance/rules/cases/s26_7_1423.bzl	reject	Holder	bb	direct	o:Object; f:((		0	0
+rules	tests/conformance/rules/cases/s26_7_1423.bzl	reject	Holder	bb	direct	o:Object		0	0
 rules	tests/conformance/rules/cases/s26_7_1423.bzl	reject	Box	bb	direct	child:Box		0	0
-rules	tests/conformance/rules/cases/s26_7_1424.bzl	reject	Holder	bb	direct	o:Object; f:((		0	0
+rules	tests/conformance/rules/cases/s26_7_1424.bzl	reject	Holder	bb	direct	o:Object		0	0
 rules	tests/conformance/rules/cases/s26_7_1424.bzl	reject	Box	bb	direct	child:Box		0	0
-rules	tests/conformance/rules/cases/s27_1_0002.bzl	accept	Logger	bb	direct	_sink:(		0	0
-rules	tests/conformance/rules/cases/s27_1_0003.bzl	accept	Registry	bb	direct	_reclaim:(owned		0	0
-rules	tests/conformance/rules/cases/s27_1_0004.bzl	accept	Registry	bb	direct	_maker:(out		0	0
 rules	tests/conformance/rules/cases/s27_1_1_0003.bzl	accept	Kennel	bb	direct	_resident:Dog		0	0
 rules	tests/conformance/rules/cases/s27_1_1_0004.bzl	reject	Shelter	bb	direct	_resident:Animal		0	0
-rules	tests/conformance/rules/cases/s27_3_2010.bzl	reject	Holder	bb	direct	F:(int		0	0
-rules	tests/conformance/rules/cases/s27_5_0006.bzl	reject	Holder	bb	direct	_cb:(		0	0
 rules	tests/conformance/rules/cases/s27_6_0021.bzl	run	MyList	bb	direct	_a:Array<int>	IList,int	0	0
 rules	tests/conformance/rules/cases/s27_6_0022.bzl	reject	MyList	bb	direct	_a:Array<int>	IList,int	0	0
-rules	tests/conformance/rules/cases/s27_7_0005.bzl	run	Foo	bb	direct	f:(int		0	0
 rules	tests/conformance/rules/cases/s27_8_1409.bzl	run	Stack2	generic				0	1
 rules	tests/conformance/rules/cases/s27_8_1411.bzl	run	Box	generic				0	1
 rules	tests/conformance/rules/cases/s28_10_0050.bzl	run	Box	generic				0	1
@@ -228,22 +203,19 @@ rules	tests/conformance/rules/cases/s28_11_0020.bzl	accept	Index	bb	collection	_
 rules	tests/conformance/rules/cases/s28_11_0022.bzl	accept	Tally	bb	collection	_tally:Counter<Item>		0	0
 rules	tests/conformance/rules/cases/s28_11_0024.bzl	run	Bag	bb	collection	_items:Array<Item>		0	0
 rules	tests/conformance/rules/cases/s28_11_0031.bzl	reject	Keeper	bb	collection	_f:Array<Item>		0	0
-rules	tests/conformance/rules/cases/s28_14_0001.bzl	run	Registry	bb	direct	_cb:(		0	0
-rules	tests/conformance/rules/cases/s28_14_0002.bzl	reject	Registry	bb	direct	_cb:(		0	0
-rules	tests/conformance/rules/cases/s28_14_0004.bzl	run	Registry	bb	direct	_cb:(		0	0
-rules	tests/conformance/rules/cases/s28_14_0006.bzl	reject	Runner	bb	direct	_cb:(		0	0
-rules	tests/conformance/rules/cases/s28_14_0008.bzl	reject	Registry	bb	direct	_cb:(		0	0
+rules	tests/conformance/rules/cases/s28_14_0001.bzl	run	Registry	bb	scoped-callback	_cb:(		0	0
+rules	tests/conformance/rules/cases/s28_14_0004.bzl	run	Registry	bb	scoped-callback	_cb:(		0	0
+rules	tests/conformance/rules/cases/s28_14_0008.bzl	reject	Registry	bb	scoped-callback	_cb:(		0	0
 rules	tests/conformance/rules/cases/s28_14_0014.bzl	run	Reader	bb	direct	_stream:Stream		0	0
 rules	tests/conformance/rules/cases/s28_14_0015.bzl	reject	Reader	bb	direct	_stream:Stream		0	0
-rules	tests/conformance/rules/cases/s28_14_0017.bzl	run	Registry	bb	direct	_cb:(		0	0
+rules	tests/conformance/rules/cases/s28_14_0017.bzl	run	Registry	bb	scoped-callback	_cb:(		0	0
 rules	tests/conformance/rules/cases/s28_14_0019.bzl	reject	Reader	bb	direct	_stream:Stream		0	0
 rules	tests/conformance/rules/cases/s28_14_0022.bzl	reject	MyList	bb	direct	_items:Array<()->()>		0	0
-rules	tests/conformance/rules/cases/s28_14_0026.bzl	reject	Ticker	bb	direct	_cb:(int		0	0
-rules	tests/conformance/rules/cases/s28_14_0027.bzl	run	Ticker	bb	direct	_cb:(int		0	0
+rules	tests/conformance/rules/cases/s28_14_0026.bzl	reject	Ticker	bb	scoped-callback	_cb:(int		0	0
+rules	tests/conformance/rules/cases/s28_14_0027.bzl	run	Ticker	bb	scoped-callback	_cb:(int		0	0
 rules	tests/conformance/rules/cases/s28_14_0030.bzl	run	Reader	bb	direct	_src:Source		0	0
 rules	tests/conformance/rules/cases/s28_14_0031.bzl	run	Reader	bb	direct	_src:Source		0	0
 rules	tests/conformance/rules/cases/s28_14_0032.bzl	quiet	Reader	bb	direct	_src:Source		0	0
-rules	tests/conformance/rules/cases/s28_1_0006.bzl	accept	Registry	bb	direct	_consume:(owned		0	0
 rules	tests/conformance/rules/cases/s28_3_0026.bzl	accept	Account	bb	direct	_owner:Customer		0	0
 rules	tests/conformance/rules/cases/s28_3_0027.bzl	reject	Account	bb	direct	_owner:Customer		0	0
 rules	tests/conformance/rules/cases/s28_3_0028.bzl	reject	Account	bb	direct	_owner:Customer		0	0
@@ -258,16 +230,10 @@ rules	tests/conformance/rules/cases/s28_3_0094.bzl	quiet	Index	bb	collection	_it
 rules	tests/conformance/rules/cases/s28_3_0098.bzl	reject	MyList	bb	direct	_items:Array<()->()>		0	0
 rules	tests/conformance/rules/cases/s28_3_0099.bzl	reject	Holder	bb	direct	_v:Item		0	0
 rules	tests/conformance/rules/cases/s28_3_0100.bzl	accept	Holder	bb	direct	_v:Item		0	0
-rules	tests/conformance/rules/cases/s28_3_0110.bzl	accept	Sink	bb	direct	_g:(		0	0
 rules	tests/conformance/rules/cases/s28_3_0116.bzl	reject	Box	generic				0	1
 rules	tests/conformance/rules/cases/s28_3_0117.bzl	accept	Box	generic				0	1
 rules	tests/conformance/rules/cases/s28_3_0118.bzl	reject	Keeper	bb	direct	_o:Object		0	0
 rules	tests/conformance/rules/cases/s28_3_0119.bzl	accept	Keeper	bb	direct	_o:Object		0	0
-rules	tests/conformance/rules/cases/s28_3_0120.bzl	accept	Cache	bb	direct	_g:((		0	0
-rules	tests/conformance/rules/cases/s28_3_0141.bzl	reject	Holder	bb	direct	_f:((		0	0
-rules	tests/conformance/rules/cases/s28_3_0143.bzl	reject	Holder	bb	direct	_f:((		0	0
-rules	tests/conformance/rules/cases/s28_3_0145.bzl	reject	Holder	bb	direct	_f:((		0	0
-rules	tests/conformance/rules/cases/s28_3_0146.bzl	reject	Holder	bb	direct	_f:((		0	0
 rules	tests/conformance/rules/cases/s28_3_0161.bzl	reject	Keeper	bb	direct	_k:Item		0	0
 rules	tests/conformance/rules/cases/s28_3_0188.bzl	reject	Box	bb	direct	_o:Object		0	0
 rules	tests/conformance/rules/cases/s28_3_0190.bzl	reject	Keep	generic				0	1
@@ -294,20 +260,7 @@ rules	tests/conformance/rules/cases/s28_3_0278.bzl	reject	Box	generic				0	1
 rules	tests/conformance/rules/cases/s28_3_0278.bzl	reject	H	bb	direct	Bor:Res		0	0
 rules	tests/conformance/rules/cases/s28_3_0318.bzl	reject	H	bb	direct	_sb:StringBuilder		0	0
 rules	tests/conformance/rules/cases/s28_3_0322.bzl	reject	H	bb	direct	sb:StringBuilder		0	0
-rules	tests/conformance/rules/cases/s28_3_8_0002.bzl	reject	Keep	bb	direct	F:(		0	0
-rules	tests/conformance/rules/cases/s28_3_8_1202.bzl	run	Keep	bb	direct	F:(		0	0
-rules	tests/conformance/rules/cases/s28_3_8_1301.bzl	run	Holder	bb	direct	Fn:(int; Gn:(int		0	0
-rules	tests/conformance/rules/cases/s28_3_8_1302.bzl	run	Holder	bb	direct	Fn:(int; Opt:((int		0	0
-rules	tests/conformance/rules/cases/s28_3_8_1303.bzl	run	Holder	bb	direct	Fn:(int; Gn:(int		0	0
-rules	tests/conformance/rules/cases/s28_3_8_1303.bzl	run	Impl	bb	direct	Fn:(int	IGet	0	0
-rules	tests/conformance/rules/cases/s28_3_8_1304.bzl	run	Holder	bb	direct	Fn:(int; Gn:(int		0	0
-rules	tests/conformance/rules/cases/s28_3_8_1304.bzl	run	Sub	bb	base	<base>:Holder	Holder	0	0
 rules	tests/conformance/rules/cases/s28_3_8_1305.bzl	run	Box	generic				0	1
-rules	tests/conformance/rules/cases/s28_3_8_1306.bzl	run	Holder	bb	direct	Fn:(int; Gn:(int		0	0
-rules	tests/conformance/rules/cases/s28_3_8_1307.bzl	run	Holder	bb	direct	Fn:(int; Gn:(int		0	0
-rules	tests/conformance/rules/cases/s28_3_8_1308.bzl	run	Holder	bb	direct	Fn:(int; Gn:(int		0	0
-rules	tests/conformance/rules/cases/s28_3_8_1309.bzl	run	Holder	bb	direct	Fn:(int; Gn:(int		0	0
-rules	tests/conformance/rules/cases/s28_3_8_1310.bzl	run	Holder	bb	direct	Fn:(int; Gn:(int		0	0
 rules	tests/conformance/rules/cases/s28_5_0014.bzl	reject	Box	generic				0	1
 rules	tests/conformance/rules/cases/s28_5_0015.bzl	accept	Box	generic				0	1
 rules	tests/conformance/rules/cases/s28_5_0021.bzl	run	Box	generic				0	1
@@ -326,10 +279,6 @@ rules	tests/conformance/rules/cases/s28_6_0062.bzl	reject	Holder	bb	direct	_d:D	
 rules	tests/conformance/rules/cases/s28_6_0071.bzl	reject	H	bb	direct	sb:StringBuilder		0	0
 rules	tests/conformance/rules/cases/s28_8_0006.bzl	reject	H	bb	direct	sb:StringBuilder		0	0
 rules	tests/conformance/rules/cases/s28_8_0007.bzl	reject	H	bb	direct	r:Random		0	0
-rules	tests/conformance/rules/cases/s28_9_0901.bzl	run	Holder	bb	direct	Fn:(int; Fn2:(int		0	0
-rules	tests/conformance/rules/cases/s28_9_0901.bzl	run	Sub	bb	base	<base>:Holder	Holder	0	0
-rules	tests/conformance/rules/cases/s28_9_0902.bzl	run	Holder	bb	direct	Fn:(int; Fn2:(int		0	0
-rules	tests/conformance/rules/cases/s28_9_0903.bzl	run	Holder	bb	direct	Fn:(int; Fn2:(int		0	0
 rules	tests/conformance/rules/cases/s2_3_2201.bzl	run	Stack	generic				0	1
 rules	tests/conformance/rules/cases/s2_7_1101.bzl	run	A	generic				0	1
 rules	tests/conformance/rules/cases/s2_7_1102.bzl	run	A	generic				0	1
@@ -346,32 +295,11 @@ rules	tests/conformance/rules/cases/s7_10_0002.bzl	accept	Box	generic				0	1
 rules	tests/conformance/rules/cases/s7_10_0007.bzl	reject	Hold	generic				0	1
 rules	tests/conformance/rules/cases/s7_10_0008.bzl	accept	Hold	generic				0	1
 rules	tests/conformance/rules/cases/s7_1_2101.bzl	reject	Box	generic				0	1
-rules	tests/conformance/rules/cases/s7_4_0162.bzl	reject	D	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0163.bzl	run	D	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0164.bzl	run	K	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0165.bzl	reject	K	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0166.bzl	run	K	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0167.bzl	run	K	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0168.bzl	run	K	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0169.bzl	run	K	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0170.bzl	reject	K	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0171.bzl	reject	K	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0172.bzl	reject	K	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0173.bzl	reject	K	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0174.bzl	reject	K	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0175.bzl	run	K	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0176.bzl	run	K	bb	direct	_f:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0178.bzl	reject	H	bb	direct	F:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0179.bzl	run	H	bb	direct	F:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0180.bzl	reject	H	bb	direct	F:((int		0	0
-rules	tests/conformance/rules/cases/s7_4_0183.bzl	reject	K	bb	direct	_f:((int		0	0
 rules	tests/conformance/rules/cases/s7_4_2428.bzl	reject	H	bb	direct	l:IList<int>		0	0
 rules	tests/conformance/rules/cases/s7_5_0019.bzl	run	Node	bb	direct	sb:StringBuilder; next:Node		0	0
 rules	tests/conformance/rules/cases/s7_5_0020.bzl	run	Node	bb	direct	sb:StringBuilder; next:Node		0	0
 rules	tests/conformance/rules/cases/s7_5_0021.bzl	run	Node	bb	direct	sb:StringBuilder; next:Node		0	0
 rules	tests/conformance/rules/cases/s7_7_0011.bzl	reject	Box	generic				0	1
-rules	tests/conformance/rules/cases/s8_5_0009.bzl	run	Holder	bb	direct	Cb:((int		0	0
-rules	tests/conformance/rules/cases/s8_5_0010.bzl	run	Holder	bb	direct	Cb:((int		0	0
 rules	tests/conformance/rules/cases/s8_6_0004.bzl	reject	Holder	bb	direct	_boxed:Object		0	0
 rules	tests/conformance/rules/cases/s8_6_0010.bzl	reject	Keeper	bb	direct	_kept:IShow		0	0
 rules	tests/conformance/rules/cases/s8_6_0011.bzl	run	Keeper	bb	direct	_kept:IShow		0	0
@@ -380,7 +308,6 @@ rules	tests/conformance/rules/cases/s9_7_0024.bzl	reject	Bag	generic				0	1
 rules	tests/conformance/rules/cases/s9_7_0025.bzl	reject	Der	bb	direct	_o:Object	Base	0	0
 rules	tests/conformance/rules/cases/s9_7_0026.bzl	accept	Der	bb	direct	_o:Object	Base	0	0
 rules	tests/conformance/rules/cases/s9_7_0027.bzl	reject	Box	bb	direct	_f:Object		0	0
-rules	tests/conformance/rules/cases/s28_3_8_1311/lib.bzl	?	Holder	bb	direct	Fn:(int		0	0
 rules	tests/conformance/rules/cases/s2_8_2_0001/lib.bzl	?	Box	generic				0	1
 docs	tests/conformance/cases/codegen_0018.bzl	skip/n/a	TypeInitializationException	bb	direct	InnerException:Exception	Exception	0	0
 docs	tests/conformance/cases/codegen_0023.bzl	skip/n/a	LinkedListNode	generic				0	1
@@ -391,13 +318,13 @@ docs	tests/conformance/cases/codegen_0049.bzl	error/diagnose	Box	bb	direct	_o:Ob
 docs	tests/conformance/cases/codegen_0068.bzl	error/diagnose	Box	bb	direct	_o:Object		0	0
 docs	tests/conformance/cases/codegen_0069.bzl	fragment/compiles	Box	bb	direct	_o:Object		0	0
 docs	tests/conformance/cases/codegen_0080.bzl	error/diagnose	Holder	generic				0	1
-docs	tests/conformance/cases/codegen_0081.bzl	fragment/compiles	Runner	bb	direct	_job:(		0	0
+docs	tests/conformance/cases/codegen_0081.bzl	fragment/compiles	Runner	bb	scoped-callback	_job:(		0	0
 docs	tests/conformance/cases/codegen_0082.bzl	error/diagnose	Registry	bb	direct	_o:Object		0	0
 docs	tests/conformance/cases/codegen_0084.bzl	error/diagnose	Box	generic				0	1
 docs	tests/conformance/cases/guide1_0006.bzl	fragment/compiles	BankAccount	bb	collection,direct	_transactions:Array<Transaction>; _owner:Customer		0	0
 docs	tests/conformance/cases/guide1_0007.bzl	fragment/compiles	BankAccount	bb	collection,direct	_transactions:Array<Transaction>; _owner:Customer		0	0
 docs	tests/conformance/cases/guide1_0007.bzl	fragment/compiles	Statement	bb	direct	_account:BankAccount		0	0
-docs	tests/conformance/cases/guide1_0025.bzl	fragment/compiles	Timer	bb	direct	_onTick:((		0	0
+docs	tests/conformance/cases/guide1_0025.bzl	fragment/compiles	Timer	bb	scoped-callback	_onTick:((		0	0
 docs	tests/conformance/cases/spec_0070.bzl	error/diagnose	Outer	bb	direct	_x:NestedPrivate; _y:NestedPrivate		0	0
 docs	tests/conformance/cases/spec_0074.bzl	error/diagnose	Good	bb	direct	_m:Maker<W>		0	0
 docs	tests/conformance/cases/spec_0074.bzl	error/diagnose	Bad	bb	direct	_m:Maker<W>		0	0
@@ -406,13 +333,12 @@ docs	tests/conformance/cases/spec_0107.bzl	skip/n/a	Type	bb	direct	EnumNames:IRe
 docs	tests/conformance/cases/spec_0164.bzl	fragment/compiles	BankAccount	bb	collection	_transactions:Array<Transaction>		0	0
 docs	tests/conformance/cases/spec_0226.bzl	fragment/compiles	Tag	bb	direct	_owner:Widget		0	0
 docs	tests/conformance/cases/spec_0244.bzl	error/diagnose	Tag	bb	direct	_item:Item		0	0
-docs	tests/conformance/cases/spec_0247.bzl	error/diagnose	Panel	bb	direct	Render:((		0	0
 docs	tests/conformance/cases/spec_0251.bzl	error/diagnose	Holder	bb	direct	_last:Item		0	0
 docs	tests/conformance/cases/spec_0253.bzl	fragment/compiles	BankAccount	bb	collection,direct	_transactions:Array<Transaction>; _owner:Customer		0	0
 docs	tests/conformance/cases/spec_0255.bzl	error/diagnose	Handle	bb	direct	_c:Cell		0	0
 docs	tests/conformance/cases/spec_0264.bzl	fragment/compiles	Box	generic				0	1
 docs	tests/conformance/cases/spec_0264.bzl	fragment/compiles	OwningBox	generic				0	1
-docs	tests/conformance/cases/spec_0275.bzl	error/diagnose	Button	bb	direct	_onClick:(		0	0
+docs	tests/conformance/cases/spec_0275.bzl	error/diagnose	Button	bb	scoped-callback	_onClick:(		0	0
 docs	tests/conformance/cases/spec_0276.bzl	error/diagnose	Reader	bb	direct	_src:Item		0	0
 docs	tests/conformance/cases/spec_0298.bzl	skip/n/a	Task	generic			Task	0	1
 docs	tests/conformance/cases/spec_0298.bzl	skip/n/a	OwningTask	generic			Task	0	1
@@ -438,9 +364,6 @@ lit	tests/lit/index_positional_accept_2758.bzl	accept	Box	generic				0	1
 lit	tests/lit/ownership/borrow_into_bare_field_1082__bare_field_borrow_of_param_accepted.bzl	accept	Holder	bb	direct	_cfg:Cfg		0	0
 lit	tests/lit/ownership/borrow_into_bare_field_1082__bare_instance_field_borrow_rejected.bzl	reject	Holder	bb	direct	_cfg:Cfg		0	0
 lit	tests/lit/ownership/borrow_into_bare_field_1082__qualified_this_field_borrow_rejected.bzl	reject	Holder	bb	direct	_cfg:Cfg		0	0
-lit	tests/lit/ownership/captured_moved_from_binding_3755__nested_lambda_capture_rejected.bzl	reject	Box	bb	direct	h:((		0	0
-lit	tests/lit/ownership/captured_moved_from_binding_3755__owned_local_moved_before_literal_rejected.bzl	reject	Box	bb	direct	h:((		0	0
-lit	tests/lit/ownership/captured_moved_from_binding_3755__owned_param_moved_before_literal_rejected.bzl	reject	Box	bb	direct	h:((		0	0
 lit	tests/lit/ownership/fresh_owned_into_borrow_field_1020__borrow_local_into_borrow_field_accepted.bzl	accept	Wrap	bb	direct	_b:Inner		0	0
 lit	tests/lit/ownership/fresh_owned_into_borrow_field_1020__borrow_param_back_reference_accepted.bzl	accept	Wrap	bb	direct	_b:Inner		0	0
 lit	tests/lit/ownership/fresh_owned_into_borrow_field_1020__ctor_new_into_borrow_field_rejected.bzl	reject	Wrap	bb	direct	_b:Inner		0	0
@@ -456,24 +379,15 @@ lit	tests/lit/ownership/getter_returns_fresh_owned_926__block_getter_owned_call_
 lit	tests/lit/ownership/getter_returns_fresh_owned_926__expr_property_new_rejected.bzl	reject	Factory	bb	direct	_cell:Cell		0	0
 lit	tests/lit/ownership/getter_returns_fresh_owned_926__getter_bare_field_read_accepted.bzl	accept	Factory	bb	direct	_cell:Cell		0	0
 lit	tests/lit/ownership/getter_returns_fresh_owned_926__method_returning_owned_new_accepted.bzl	accept	Factory	bb	direct	_cell:Cell		0	0
-lit	tests/lit/ownership/lambda_body_escape_3743__enclosing_lambda_local_stored_into_field_rejected.bzl	accept	C	bb	direct	h:(		0	0
-lit	tests/lit/ownership/lambda_body_escape_3744__owned_local_closure_stored_into_field_rejected.bzl	accept	C	bb	direct	h:(		0	0
-lit	tests/lit/ownership/lambda_body_escape_3744__owned_param_closure_stored_into_field_rejected.bzl	accept	Box	bb	direct	h:(		0	0
 lit	tests/lit/ownership/lambda_body_escape_3744__plain_param_borrow_stored_into_field_accepted.bzl	accept	Box	bb	direct	back:R		0	0
 lit	tests/lit/ownership/lambda_body_escape_3744__receiver_sourced_field_store_accepted.bzl	accept	Box	bb	direct	back:R		0	0
 lit	tests/lit/ownership/owned_param_store_escape_3746__borrow_param_into_field_accepted.bzl	accept	Box	bb	direct	r:R		0	0
-lit	tests/lit/ownership/owned_param_store_escape_3746__closure_into_instance_field_rejected.bzl	accept	Box	bb	direct	h:((		0	0
 lit	tests/lit/ownership/owned_param_store_escape_3746__collection_add_on_field_receiver_rejected.bzl	accept	Box	bb	collection	items:Array<R>		0	0
 lit	tests/lit/ownership/owned_param_store_escape_3746__indexer_set_on_field_receiver_rejected.bzl	accept	Box	bb	collection	items:Array<R?>		0	0
 lit	tests/lit/ownership/owned_param_store_escape_3746__plain_store_into_borrow_field_rejected.bzl	accept	Box	bb	direct	r:R		0	0
-lit	tests/lit/ownership/owning_choice_call_through_function_typed_field_3575_rejected.bzl	reject	Box	bb	direct	_fetch:(		0	0
 lit	tests/lit/ownership/owning_match_value_select_escape_4818__expr_arm_conditional_selects_w_rejected.bzl	reject	Holder	bb	direct	_w:Widget; _i:Inner		0	0
-lit	tests/lit/ownership/record_closure_capture_escape_2144__collection_add_store_rejected.bzl	reject	C	bb	collection	cbs:Array<()->int>		0	0
-lit	tests/lit/ownership/record_closure_capture_escape_2144__field_store_rejected.bzl	reject	C	bb	direct	cb:(		0	0
 lit	tests/lit/ownership/span_field_store_1251__record_own_span_component_accepted.bzl	accept	BackRef	bb	direct	r:Res		0	0
 lit	tests/lit/ownership/task_family_borrow_return_1786__accept.bzl	accept	Svc	bb	direct	_c:Conn		0	0
-lit	tests/lit/ownership/task_family_borrow_return_lambda_positions_1926__accept.bzl	accept	C	bb	direct	fwd:(; asyncl:(; factory:(; id:(int		0	0
-lit	tests/lit/ownership/task_family_borrow_return_lambda_positions_1926__reject.bzl	reject	C	bb	direct	echo:(Task<int>		0	0
 lit	tests/lit/ownership/this_chain_3751__owned_marker_to_plain_primary_ctor_param_rejected.bzl	reject	PB	bb	direct	_k:Res		0	0
 lit	tests/lit/sema/class_generic_alias_two_sites_5285.bzl	accept	H	generic				0	1
 lit	tests/lit/sema/default_enum_zero_3719__extension_level_generic_value_instantiation_rejected.bzl	accept	Box	generic				0	1
@@ -497,8 +411,6 @@ lit	tests/lit/sema/generic_type_param_self_bound_1844__self_reject.bzl	reject	Bo
 lit	tests/lit/sema/method_constraint_callsite_746__constrained_t_iface_member_accepted_1078.bzl	accept	Holder	generic				0	1
 lit	tests/lit/sema/method_constraint_callsite_746__unconstrained_class_field_t_method_rejected_1078.bzl	reject	Holder	generic				0	1
 lit	tests/lit/sema/readonly_field_narrowing_2085__non_final_segment_rejected.bzl	accept	Outer	bb	direct	_inner:Inner		1	0
-lit	tests/lit/sema/readonly_field_single_assignment_2187__this_escape_stored_lambda_rejected.bzl	accept	C	bb	direct	_stash:((		1	0
-lit	tests/lit/sema/scoped_type_identity_2712__func_type_non_function_position_rejected.bzl	reject	C	bb	direct	_g:((scoped[3]		0	0
 lit	tests/lit/sema/sema_576_icomparable_iequatable__icomparable_as_field_type_resolves_2_8.bzl	accept	C	bb	direct	_comp:IComparable<int>		0	0
 lit	tests/lit/sema/sema_576_icomparable_iequatable__icomparable_wrong_arity_0_diagnoses_2_8.bzl	reject	C	bb	direct	_x:IComparable		0	0
 lit	tests/lit/sema/sema_576_icomparable_iequatable__icomparable_wrong_arity_2_diagnoses_2_8.bzl	reject	C	bb	direct	_x:IComparable<int,int>		0	0
@@ -619,7 +531,6 @@ lit	tests/lit/sema/sema_variance_position__spec_12_9_class_invariant_accepted.bz
 lit	tests/lit/sema/send_1732_imported_class_sendability_lib.bzl	accept	Tree	bb	direct	Parent:Node		1	0
 lit	tests/lit/sema/send_1732_imported_class_sendability_lib.bzl	accept	OwnsNonSendable	bb	owned-of-bb	Bad:Tree		0	0
 lit	tests/lit/sema/send_600_class_types__closed_class_one_non_sendable_subclass_rejected_30_14.bzl	reject	BadRect	bb	direct	Ref:ExternalRef	Shape	1	0
-lit	tests/lit/sema/send_600_class_types__sealed_class_with_function_field_rejected_30_14_rule3.bzl	reject	Handler	bb	direct	Callback:(		1	0
 lit	tests/lit/sema/send_600_class_types__sealed_class_with_non_owned_class_field_rejected_30_14_rule2.bzl	reject	Tree	bb	direct	Parent:Node		1	0
 lit	tests/lit/sema/send_600_class_types__sealed_class_with_object_field_rejected_30_14_rule3.bzl	reject	Bag	bb	direct	Payload:Object		1	0
 lit	tests/lit/sema/static_indexer_747__instance_indexer_ok.bzl	accept	C	bb	direct	_d:Array<int>		0	0
@@ -627,10 +538,6 @@ lit	tests/lit/sema/type_param_bound_1620__type_unsound_instantiation_rejected.bz
 lit	tests/lit/sema/type_param_bound_1620__type_valid_instantiation_accepted.bzl	accept	Box	generic				0	1
 lit	tests/lit/sema/type_param_bound_5906__class_to_object_accepted.bzl	accept	Rel	generic				0	1
 lit	tests/lit/sema/type_param_bound_5906__primitive_to_object_rejected.bzl	reject	Rel	generic				0	1
-gtest	tests/codegen/closure_cell_member_access_release_8058_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/codegen/closure_cell_member_access_release_8058_test.cpp	mixed	Sink	bb	direct	F:(int		0	0
-gtest	tests/codegen/closure_cell_member_access_release_8058_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/codegen/closure_cell_member_access_release_8058_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
 gtest	tests/codegen/direct_generic_iface_accessor_slot_5058_test.cpp	mixed	B	generic			I,T	0	1
 gtest	tests/codegen/direct_generic_iface_accessor_slot_5058_test.cpp	mixed	B	generic			I,T	0	1
 gtest	tests/codegen/direct_generic_iface_accessor_slot_5058_test.cpp	mixed	B	generic			I,T	0	1
@@ -714,12 +621,7 @@ gtest	tests/codegen/object_string_store_retain_8214_test.cpp	mixed	Holder	bb	dir
 gtest	tests/codegen/object_string_store_retain_8214_test.cpp	mixed	Holder	bb	direct	O:Object		0	0
 gtest	tests/codegen/object_string_store_retain_8214_test.cpp	mixed	Holder	bb	direct	O:Object		0	0
 gtest	tests/codegen/owned_param_owned_field_store_vtableless_5274_test.cpp	mixed	Box	generic				0	1
-gtest	tests/codegen/receiverless_inherited_static_lambda_generic_base_5226_test.cpp	mixed	D	bb	direct	_f:(	B,T	0	0
-gtest	tests/codegen/receiverless_inherited_static_lambda_generic_base_5226_test.cpp	mixed	D	bb	direct	_f:(	B,T	0	0
-gtest	tests/codegen/receiverless_inherited_static_lambda_generic_base_5226_test.cpp	mixed	D	bb	direct	_f:(	B,T	0	0
 gtest	tests/codegen/receiverless_inherited_static_lambda_generic_base_5226_test.cpp	mixed	Factory	generic				0	1
-gtest	tests/codegen/receiverless_inherited_static_lambda_generic_base_5226_test.cpp	mixed	D	bb	direct	_f:(	B,T	0	0
-gtest	tests/codegen/receiverless_inherited_static_lambda_generic_base_5226_test.cpp	mixed	D	bb	direct	_f:(	B,T	0	0
 gtest	tests/codegen/setter_fresh_temp_dispose_5119_test.cpp	mixed	B	bb	direct	_v:Item		0	1
 gtest	tests/codegen/setter_fresh_temp_dispose_5119_test.cpp	mixed	B	bb	direct	_v:Item		0	0
 gtest	tests/codegen/setter_fresh_temp_dispose_5119_test.cpp	mixed	B	bb	direct	_v:Item		0	1
@@ -738,31 +640,6 @@ gtest	tests/ownership/accessor_set_owned_field_store_5252_test.cpp	mixed	C	bb	di
 gtest	tests/ownership/accessor_set_owned_field_store_5252_test.cpp	mixed	Grid	bb	direct	_cells:Array<int>		0	0
 gtest	tests/ownership/accessor_set_owned_field_store_5252_test.cpp	mixed	Shelf	bb	direct	_last:Item		0	0
 gtest	tests/ownership/accessor_set_owned_field_store_5252_test.cpp	mixed	Shelf	bb	direct	_last:Item		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Sub	bb	base	<base>:Holder	Holder	0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Sub	bb	base	<base>:Holder	Holder	0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Sub	bb	base	<base>:Holder	Holder	0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Sub	bb	base	<base>:Holder	Holder	0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Sub	bb	base	<base>:Holder	Holder	0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int	IG	0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	Holder	bb	direct	Fn:(int		0	0
 gtest	tests/ownership/getter_return_binding_provenance_6404_test.cpp	mixed	Factory	bb	direct	_cell:Cell		0	0
 gtest	tests/ownership/owned_param_receiver_return_field_store_5225_test.cpp	mixed	B	bb	direct	_x:Item; _y:B		0	0
 gtest	tests/ownership/owned_param_receiver_return_field_store_5225_test.cpp	mixed	B	bb	direct	_x:Item; _y:B		0	0
@@ -918,4 +795,3 @@ gtest	tests/sema/type_param_identity_6316_test.cpp	mixed	B3	bb	direct	Val:Box<Ex
 gtest	tests/sema/type_param_identity_6316_test.cpp	mixed	E	bb	base	<base>:B3	B3	0	0
 gtest	tests/sema/type_param_identity_6316_test.cpp	mixed	E	bb	base	<base>:B3	D,P,Q	0	0
 gtest	tests/sema/type_param_identity_6316_test.cpp	mixed	E	bb	base	<base>:B3	D,P,Q	0	0
-gtest	tests/sema/type_resolution_test.cpp	mixed	Service	bb	direct	_factory:(int		0	0

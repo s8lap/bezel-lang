@@ -1,79 +1,79 @@
 units: {'rules': 5902, 'docs': 802, 'lit': 2574, 'gtest': 243}  (total 9521)
-stats: {'classes': 17348, 'generic_conditional_classes': 253, 'bb_classes': 667, 'bb_construction_sites': 430}
+stats: {'classes': 17348, 'generic_conditional_classes': 253, 'bb_classes': 543, 'bb_construction_sites': 312, 'bb_only_scoped_callback': 9}
 
-store sites the prior scanner finds, every corpus and tier: 312; not a trust store: 66 (V = value instantiation, N = static source), 46 (L = a store into a purely local collection, silent in the report since v0.350)
-K4.3 store sites (field-held + collection-held), every corpus and tier: 200
-  by shape: {'field-store': 166, 'coll-store': 15, 'primary-capture': 4, 'prop-store': 8, 'field-init': 7}
-  by storing member kind: {'ctor': 123, 'method': 62, 'primary': 4, 'init': 7, 'setter': 4}
-  by source kind: {'param': 180, 'ownedfield': 3, 'primary': 11, 'param-path': 4, 'this': 1, 'this-path': 1}
-  by prior-lane kind: {'1': 2, '2': 11, '3': 61, '4': 5, 'U': 121}
-  [accepted tier, rules/docs/lit] 79 sites
-     storing member: {'ctor': 49, 'method': 22, 'primary': 2, 'init': 6}
-     A0 at the store: {'ok:announced-by-type': 56, 'edit:scoped': 19, 'ok:self-or-sibling': 3, 'reject:store-into-an-object-the-member-does-not-hold': 1}
-     A1 at the store: {'edit:scoped': 75, 'ok:self-or-sibling': 3, 'reject:store-into-an-object-the-member-does-not-hold': 1}
-     A at the visible call sites: {'no-call-site': 52, 'bounded': 16, 'escaping-holder(hand-check)': 5, 'unknown-body': 4, 'bounded(self)': 2}
-     resolved (kind readable): 27; bounded as written (kinds 1, 3): 18; escaping holder, hand-checked (kind 2): 5; unknown body (kind 4): 4
-     B (derived retention) reaches: kind 3 with a constructor store = 11; kind 3 with a method store (0132 excludes a mutable field) = 5
-  [gtest, distinct sites] 46 sites
-     storing member: {'method': 20, 'ctor': 23, 'setter': 2, 'primary': 1}
-     A0 at the store: {'ok:announced-by-type': 24, 'edit:scoped': 11, 'reject:store-into-an-object-the-member-does-not-hold': 8, 'ok:property-store': 2, 'ok:self-or-sibling': 1}
-     A1 at the store: {'edit:scoped': 35, 'reject:store-into-an-object-the-member-does-not-hold': 8, 'ok:property-store': 2, 'ok:self-or-sibling': 1}
-     A at the visible call sites: {'no-call-site': 26, 'bounded': 15, 'escaping-holder(hand-check)': 5}
-     resolved (kind readable): 20; bounded as written (kinds 1, 3): 15; escaping holder, hand-checked (kind 2): 5; unknown body (kind 4): 0
-     B (derived retention) reaches: kind 3 with a constructor store = 14; kind 3 with a method store (0132 excludes a mutable field) = 1
-  [expected-reject tier, rules/docs/lit] 35 sites
-     storing member: {'ctor': 21, 'method': 13, 'init': 1}
-     A0 at the store: {'ok:announced-by-type': 22, 'edit:scoped': 13}
-     A1 at the store: {'edit:scoped': 35}
-     A at the visible call sites: {'no-call-site': 28, 'bounded': 5, 'unknown-body': 1, 'escaping-holder(hand-check)': 1}
+store sites the prior scanner finds, every corpus and tier: 312; not a trust store: 66 (V = value instantiation at the call site, N = static source), 42 (G = a bare-T parameter stored by a generic class the unit instantiates at no class type), 1 (F = a function-typed field: the closure rules' subject), 46 (L = a store into a purely local collection, silent in the report since v0.350)
+K4.3 store sites (field-held + collection-held), every corpus and tier: 157
+  by shape: {'field-store': 128, 'coll-store': 11, 'primary-capture': 3, 'prop-store': 8, 'field-init': 7}
+  by storing member kind: {'ctor': 93, 'method': 52, 'primary': 3, 'init': 7, 'setter': 2}
+  by source kind: {'param': 139, 'ownedfield': 3, 'primary': 10, 'param-path': 3, 'this': 1, 'this-path': 1}
+  by prior-lane kind: {'1': 2, '2': 7, '3': 57, '4': 2, 'U': 89}
+  [accepted tier, rules/docs/lit] 58 sites
+     storing member: {'ctor': 35, 'method': 16, 'primary': 1, 'init': 6}
+     A0 at the store: {'ok:announced-by-type': 41, 'edit:scoped': 12, 'ok:self-or-sibling': 3, 'reject:store-into-an-object-the-member-does-not-hold': 1, 'reject:no-scoped-at-Object': 1}
+     A1 at the store: {'edit:scoped': 53, 'ok:self-or-sibling': 3, 'reject:store-into-an-object-the-member-does-not-hold': 1, 'reject:no-scoped-at-Object': 1}
+     A at the visible call sites: {'no-call-site': 39, 'bounded': 15, 'bounded(self)': 2, 'escaping-holder(hand-check)': 1, 'unknown-body': 1}
+     resolved (kind readable): 19; bounded as written (kinds 1, 3): 17; escaping holder, hand-checked (kind 2): 1; unknown body (kind 4): 1
+     B (derived retention) reaches: kind 3 with a constructor store = 10; kind 3 with a method store (0132 excludes a mutable field) = 5
+  [gtest, distinct sites] 37 sites
+     storing member: {'method': 19, 'ctor': 16, 'primary': 1, 'setter': 1}
+     A0 at the store: {'ok:announced-by-type': 17, 'edit:scoped': 10, 'reject:store-into-an-object-the-member-does-not-hold': 8, 'ok:property-store': 1, 'ok:self-or-sibling': 1}
+     A1 at the store: {'edit:scoped': 26, 'reject:store-into-an-object-the-member-does-not-hold': 8, 'ok:property-store': 1, 'ok:self-or-sibling': 1, 'reject:no-scoped-at-Object': 1}
+     A at the visible call sites: {'no-call-site': 19, 'bounded': 13, 'escaping-holder(hand-check)': 5}
+     resolved (kind readable): 18; bounded as written (kinds 1, 3): 13; escaping holder, hand-checked (kind 2): 5; unknown body (kind 4): 0
+     B (derived retention) reaches: kind 3 with a constructor store = 12; kind 3 with a method store (0132 excludes a mutable field) = 1
+  [expected-reject tier, rules/docs/lit] 29 sites
+     storing member: {'ctor': 18, 'method': 10, 'init': 1}
+     A0 at the store: {'ok:announced-by-type': 19, 'edit:scoped': 9, 'reject:no-scoped-at-Object': 1}
+     A1 at the store: {'edit:scoped': 28, 'reject:no-scoped-at-Object': 1}
+     A at the visible call sites: {'no-call-site': 22, 'bounded': 5, 'unknown-body': 1, 'escaping-holder(hand-check)': 1}
      resolved (kind readable): 7; bounded as written (kinds 1, 3): 5; escaping holder, hand-checked (kind 2): 1; unknown body (kind 4): 1
      B (derived retention) reaches: kind 3 with a constructor store = 5; kind 3 with a method store (0132 excludes a mutable field) = 0
-  A0 `scoped` markers needed (method stores of a plain parameter): 19 signatures in the accepted tier, 8 visible call sites that would take the call-site marker; 24 signatures elsewhere
-  A1 `scoped` markers needed (every stored plain parameter): 75 signatures in the accepted tier; 68 elsewhere
+  A0 `scoped` markers needed (method stores of a plain parameter): 12 signatures in the accepted tier, 4 visible call sites that would take the call-site marker; 19 signatures elsewhere
+  A1 `scoped` markers needed (every stored plain parameter): 53 signatures in the accepted tier; 52 elsewhere
 other recorded clauses (not candidate A's subject): {'form3-registration': 3, 'scoped-field': 10, 'slot-displaced': 3, 'frame-fireandforget': 1, 'frame-store': 2, 'comparer': 2}
 
-classes: 17348; borrow-bearing under A: 667 (3.8 %); of which only a `scoped` callback field: 0; generic-conditional (a bare T field): 253
-  borrow-bearing classes by reason (a class may have several): {'direct': 586, 'collection': 20, 'owned-of-bb': 3, 'base': 62}
-  by corpus: {'rules': 301, 'docs': 33, 'lit': 122, 'gtest': 211}
-  with a base or interface list: 92; with a destructor: 10
+classes: 17348; borrow-bearing under A: 543 (3.1 %); of which only a `scoped` callback field: 9; generic-conditional (a bare T field): 253
+  borrow-bearing classes by reason (a class may have several): {'direct': 461, 'collection': 19, 'scoped-callback': 9, 'owned-of-bb': 3, 'base': 55}
+  by corpus: {'rules': 228, 'docs': 32, 'lit': 107, 'gtest': 176}
+  with a base or interface list: 78; with a destructor: 8
 
-construction sites of a borrow-bearing class: 430
-  by holder position: {'local': 162, 'usingvar': 142, 'returned': 81, 'arg-plain': 30, 'arg-unknown': 5, 'temp-receiver': 4, 'reassign-local': 2, 'field-init': 2, 'field-owned': 1, 'other': 1}
+construction sites of a borrow-bearing class: 312
+  by holder position: {'local': 129, 'returned': 81, 'usingvar': 57, 'arg-plain': 30, 'arg-unknown': 5, 'temp-receiver': 4, 'reassign-local': 2, 'field-init': 2, 'field-owned': 1, 'other': 1}
 
-[accepted tier: rules/docs/lit programs the spec expects to compile] sites: 193
-  A0: {'ok': 189, 'reject': 4}
+[accepted tier: rules/docs/lit programs the spec expects to compile] sites: 139
+  A0: {'ok': 135, 'reject': 4}
      reasons: {'temp-source': 4}
-  A1: {'edit': 11, 'ok': 178, 'reject': 4}
+  A1: {'edit': 11, 'ok': 124, 'reject': 4}
      reasons: {'edit:scoped': 13, 'temp-source': 4}
-  B: {'ok': 193}
+  B: {'ok': 139}
      reasons: {}
-  units with a site: 118; A0: {'ok': 115, 'reject': 3}; A1: {'edit': 8, 'ok': 107, 'reject': 3}; B: {'ok': 118}
+  units with a site: 74; A0: {'ok': 71, 'reject': 3}; A1: {'edit': 8, 'ok': 63, 'reject': 3}; B: {'ok': 74}
 
-[expected-reject tier (rules/docs/lit)] sites: 91
-  A0: {'ok': 89, 'reject': 2}
+[expected-reject tier (rules/docs/lit)] sites: 60
+  A0: {'ok': 58, 'reject': 2}
      reasons: {'temp-source': 2}
-  A1: {'ok': 84, 'reject': 2, 'edit': 5}
+  A1: {'ok': 53, 'reject': 2, 'edit': 5}
      reasons: {'edit:scoped': 5, 'temp-source': 2}
-  B: {'ok': 91}
+  B: {'ok': 60}
      reasons: {}
-  units with a site: 65; A0: {'ok': 63, 'reject': 2}; A1: {'ok': 58, 'reject': 2, 'edit': 5}; B: {'ok': 65}
+  units with a site: 41; A0: {'ok': 39, 'reject': 2}; A1: {'ok': 34, 'reject': 2, 'edit': 5}; B: {'ok': 41}
 
-[gtest (units are concatenated program variants; verdict tier unknown)] sites: 146
-  A0: {'ok': 127, 'reject': 19}
+[gtest (units are concatenated program variants; verdict tier unknown)] sites: 113
+  A0: {'reject': 19, 'ok': 94}
      reasons: {'temp-source': 18, 'K5.2-through-holder(dead holder)': 1}
-  A1: {'ok': 87, 'reject': 19, 'edit': 40}
+  A1: {'reject': 19, 'edit': 40, 'ok': 54}
      reasons: {'edit:scoped': 40, 'temp-source': 18, 'K5.2-through-holder(dead holder)': 1}
-  B: {'ok': 145, 'reject': 1}
+  B: {'ok': 112, 'reject': 1}
      reasons: {'K5.2-through-holder(dead holder)': 1}
-  units with a site: 20; A0: {'ok': 16, 'reject': 4}; A1: {'ok': 11, 'reject': 4, 'edit': 5}; B: {'ok': 19, 'reject': 1}
+  units with a site: 17; A0: {'reject': 4, 'ok': 13}; A1: {'reject': 4, 'edit': 5, 'ok': 8}; B: {'ok': 16, 'reject': 1}
 
-hand-checked accepted-tier programs (scanner reject or escaping holder): 8; missing from hand_check.tsv: []
-  hazard class of the hand-confirmed rejections under A: {'hazardous (accidental)': 1, 'hazardous (by design)': 2, 'inconvenient': 1}
+hand-checked accepted-tier programs (scanner reject or escaping holder, kind 2, in any population): 11; in hand_check.tsv: 11; missing from hand_check.tsv: []
+  hazard class of the hand-confirmed rejections under A: {'hazardous (accidental)': 1, 'hazardous (by design)': 2, 'inconvenient': 2}
 
-PER-PROGRAM ROLL-UP, accepted tier (rules/docs/lit units the spec expects to compile): 5750 programs; 176 hold a K4.3 store or construct a borrow-bearing class
-  A0: unchanged 155; compile after an edit (a `scoped` marker) 17; rejected, must be rewritten 4  (0.07 % of all accepted-tier programs)
-  A1: unchanged 106; compile after an edit (a `scoped` marker) 66; rejected, must be rewritten 4  (0.07 % of all accepted-tier programs)
-  B: unchanged 176; compile after an edit (a `scoped` marker) 0; rejected, must be rewritten 0  (0.00 % of all accepted-tier programs)
+PER-PROGRAM ROLL-UP, accepted tier (rules/docs/lit units the spec expects to compile): 5750 programs; 131 hold a K4.3 store or construct a borrow-bearing class
+  A0: unchanged 114; compile after an edit (a `scoped` marker) 12; rejected, must be rewritten 5  (0.09 % of all accepted-tier programs)
+  A1: unchanged 78; compile after an edit (a `scoped` marker) 48; rejected, must be rewritten 5  (0.09 % of all accepted-tier programs)
+  B: unchanged 131; compile after an edit (a `scoped` marker) 0; rejected, must be rewritten 0  (0.00 % of all accepted-tier programs)
 
 owned upcast of a borrow-bearing instance to a type that is not borrow-bearing: 0 sites (0 in the accepted tier): {}
 
