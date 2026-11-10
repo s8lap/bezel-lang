@@ -71,7 +71,7 @@ TEST_FILE = os.path.join(
 # The banked number of nullable-receiver rejection sites in src/sema.
 # Banked on the tree at 0af776433 (R35). Re-bank with --update ONLY after
 # reading every site that changed.
-BASELINE_REJECTION_SITES = 10
+BASELINE_REJECTION_SITES = 11
 
 # The source spells the citation two ways: `§7.4` and `§""7.4` (the C++
 # string literal is split so the section sign needs no encoding).
