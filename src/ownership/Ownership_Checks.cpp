@@ -81,6 +81,56 @@ static bool ownedFieldDeclaredNullable(const sema::SemaContext& ctx,
     return rt && rt->nullable;
 }
 
+// fix #8371 / fix #8373 (§28.3 producers table — the `a ?? b` row and the
+// collection-literal row; §7.7; §15.4; §28.3 K7.1–K7.3, K7.5): the §28.3
+// ownership classification of a `??` ARM.
+//
+// §28.3's producers table, the collection-literal row: "Collection literal
+// (`[1, 2, 3]`) targeting a reference type (`Array<T>`, `OwningArray<T>`,
+// `Set<T>`, `Dictionary<K, V>`, etc.) | Owned". A collection literal is
+// CONTEXT-TYPED (§15.4: "A collection literal has no standalone type. It is
+// well-typed only in a context that provides the target type"), so sema
+// records NO `exprType` for the literal node and `producerState`'s
+// collection-literal arm never fires for it — the literal classifies
+// BORROWED at every position.
+//
+// This predicate supplies the missing CONTEXT for the `??`-operand position:
+// the MEET's own type. §7.7: "for a left operand of type `T?`, the right
+// operand must be implicitly convertible (§5.1) to `T` or to `T?`" — so the
+// meet's type IS the target type the right operand's literal was written
+// against, exactly as a local's DECLARED type is the target type of the
+// literal in its initializer (the authority `isOwnedCollectionLiteralLocal`
+// reads, Ownership.cpp, fix #7073's) and the LHS's declared type is at an
+// assignment (fix #7092's).
+//
+// The membership test is `common::isPatternAResultCollectionHead` — the SAME
+// authority `producerState`'s collection-literal arm and both local-spelling
+// helpers use — so the four spellings of §28.3's collection-literal row
+// cannot skew: a literal targeting a heap-collection type is Owned in all of
+// them, and a literal targeting an inline-array type (which produces a VALUE
+// — §28.3's producers table's second literal row) is Owned in none.
+//
+// `meetType` is the MEET's own resolved type (null when it has none); the
+// literal's own recorded type wins when sema did record one.
+static bool collectionLiteralArmTargetsOwnedType(const sema::SemaContext& ctx,
+                                                 const ast::Expr& arm,
+                                                 const sema::TypeRef* meetType) {
+    if (!dynamic_cast<const ast::CollectionLiteralExpr*>(&arm)) return false;
+    const sema::TypeRef* rt = ctx.exprType(arm);
+    if (!rt) rt = meetType;
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    if (rt->headName().empty()) return false;
+    return common::isPatternAResultCollectionHead(rt->headName());
+}
+
+// fix #8373 (§28.3 producers table, the `a ?? b` row; K7.5): is this `??` ARM
+// an ABSORBING one — a `null` literal or a bottom-typed (`throw`) arm, which
+// "absorbs to the other arm's state"?
+static bool isAbsorbingCoalesceArm(const ast::Expr& arm) {
+    return dynamic_cast<const ast::NullLiteralExpr*>(&arm) != nullptr ||
+           dynamic_cast<const ast::ThrowExpr*>(&arm) != nullptr;
+}
+
 // §28.8.1 (#1125): the operand of a `move` may be a force-unwrap of a nullable
 // owned field/local — `move _slot!` / `move this._slot!`. The null-forgiving
 // `!` is a postfix PostfixBangExpr wrapping the field/local reference. The spec
@@ -3945,6 +3995,74 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         // return — the meet has no coherent owner wherever it is formed.
         if (be->op == "??") {
             checkCoalesceMeetMixed(*be);
+            // fix #8371 (§28.3 producers table, the `a ?? b` row AND the
+            // collection-literal row; §7.7; §15.4; K7.1–K7.3, K7.5): the
+            // meet's arms are classified per §28.3, and a COLLECTION-LITERAL
+            // arm is an OWNED producer — "Collection literal (`[1, 2, 3]`)
+            // targeting a reference type (`Array<T>`, `OwningArray<T>`,
+            // `Set<T>`, `Dictionary<K, V>`, etc.) | Owned" — so `a ?? [1]` is
+            // the meet of an OWNED arm with a BORROW arm and is REJECTED,
+            // exactly as `g ?? new W(1)` is.
+            //
+            // THE GAP. A collection literal is CONTEXT-TYPED (§15.4), so sema
+            // records NO `exprType` for the literal node and `producerState`'s
+            // collection-literal arm never fires for it: the literal arm
+            // classifies BORROWED, the meet reads as `borrowed ⊓ borrowed`,
+            // the mixed meet is NOT rejected, and the literal's fresh backing
+            // is never discharged. MEASURED on the base (r30-c1): `a ?? [1]`
+            // over a borrowed parameter compiled clean through an `: owned`
+            // return and DOUBLE-FREED at runtime (ASan: "attempting
+            // double-free").
+            //
+            // `checkCoalesceMeetMixed` (Ownership.cpp) reads the arms through
+            // `producerState` and therefore cannot see the literal's OWNED
+            // classification. This is the SAME §28.3 rule read with the
+            // collection-literal row applied, and it fires ONLY for a meet
+            // that mixes under THAT reading — a meet `checkCoalesceMeetMixed`
+            // already rejects is left to it, so one program is reported once
+            // (the `coalesceMeetReported_` dedupe is shared for the same
+            // reason).
+            {
+                const sema::TypeRef* meetType = ctx_.exprType(*be);
+                const ast::Expr* ownedArm = nullptr;
+                const ast::Expr* borrowArm = nullptr;
+                for (const ast::Expr* arm : {be->left.get(), be->right.get()}) {
+                    if (!arm) continue;
+                    // K7.5: a `null`-literal or bottom-typed (`throw`) arm
+                    // absorbs to the other arm's state.
+                    if (isAbsorbingCoalesceArm(*arm)) continue;
+                    const OwnershipState s = producerState(*arm);
+                    const bool owned =
+                        s == OwnershipState::Owned ||
+                        (s == OwnershipState::Borrowed &&
+                         collectionLiteralArmTargetsOwnedType(ctx_, *arm,
+                                                              meetType));
+                    if (owned) {
+                        if (!ownedArm) ownedArm = arm;
+                        continue;
+                    }
+                    if (s == OwnershipState::Borrowed &&
+                        isBorrowableOwnedSinkType(ctx_.exprType(*arm))) {
+                        if (!borrowArm) borrowArm = arm;
+                    }
+                }
+                if (ownedArm && borrowArm && !suppressDiag_ &&
+                    !coalesceMeetReported_.count(be)) {
+                    coalesceMeetReported_.insert(be);
+                    report(Severity::Error, borrowArm->span.begin,
+                           "the operands of this `??` mix an owned value with a "
+                           "borrowed arm — the ownership meet is rejected "
+                           "(§28.3 producer table, `a ?? b` row; K7.3, v0.307): "
+                           "owned⊓owned is owned and borrowed⊓borrowed is "
+                           "borrowed, but a mixed pair has no coherent owner (a "
+                           "parameter, field or property read is a borrow, and "
+                           "so is an UNMARKED named owned binding — K3.13; "
+                           "`move` is rejected in `??`-operand position, axiom "
+                           "A7). Equalize the arms: use `(if a <> null then "
+                           "move a! else new …)` (§28.3 K3.4), or equalize by "
+                           "statement");
+                }
+            }
         }
         // fix #5071: also check for mixed meets inside expression bodies
         // (the peel loop handles MemberAccessExpr/CallExpr chains).
@@ -18953,6 +19071,59 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(e)) {
         return (ce->thenValue && ownedArgSourceIsBorrow(*ce->thenValue)) ||
                (ce->elseValue && ownedArgSourceIsBorrow(*ce->elseValue));
+    }
+    // fix #8373 (§28.3 producers table, the `a ?? b` row; K7.1–K7.3, K7.5;
+    // §7.7; §28.3 *Borrow lifetime rules*): a `??` is the K7 MEET of its two
+    // arms' ownership states — "borrowed ⊓ borrowed = **borrowed** with the
+    // union of sources" — so the MEET is a BORROW exactly when both arms are
+    // borrows. The §28.3 *Borrow lifetime rules* bullet ("A borrowed local may
+    // not be returned from a method whose return type is `owned`") then
+    // rejects `return a ?? b;` through an `: owned` return, exactly as it
+    // rejects the direct `return a;` — the `??` spelling used to hide the
+    // borrow from this classifier entirely.
+    //
+    // MEASURED on the base (r30-c1): the direct form `return a;` is refused
+    // with the §28.3 *Borrow lifetime rules* diagnostic, while `return a ?? b;`
+    // over two borrowed parameters compiled clean and DOUBLE-FREED at runtime
+    // (ASan: "attempting double-free") — the caller's `owned` return slot
+    // disposes the value and the borrow's real owner disposes it too.
+    //
+    // BOTH arms, not either: a MIXED pair (one owned arm, one borrow arm) is
+    // rejected by the §28.3 K7.3 mixed-meet rule (`checkCoalesceMeetMixed`),
+    // which OWNS that diagnostic; answering "borrow" here as well would
+    // report the same program twice.
+    //
+    // The arms are read with the §28.3 producers table's COLLECTION-LITERAL
+    // row applied — "Collection literal (`[1, 2, 3]`) targeting a reference
+    // type (`Array<T>`, `OwningArray<T>`, `Set<T>`, `Dictionary<K, V>`, etc.)
+    // | Owned" — so `a ?? [1]` is an OWNED⊓BORROWED meet (rejected by the
+    // K7.3 rule), not a borrowed one.
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e);
+        be && be->op == "??") {
+        if (!be->left || !be->right) return false;
+        const sema::TypeRef* meetType = ctx_.exprType(*be);
+        OwnershipState left = producerState(*be->left);
+        OwnershipState right = producerState(*be->right);
+        if (left == OwnershipState::Borrowed &&
+            collectionLiteralArmTargetsOwnedType(ctx_, *be->left, meetType))
+            left = OwnershipState::Owned;
+        if (right == OwnershipState::Borrowed &&
+            collectionLiteralArmTargetsOwnedType(ctx_, *be->right, meetType))
+            right = OwnershipState::Owned;
+        // §28.3 K7.5: a `null`-literal or bottom-typed (`throw`) arm absorbs
+        // to the other arm's state, so the meet takes the other arm's state
+        // whole.
+        const bool leftAbsorbs = isAbsorbingCoalesceArm(*be->left);
+        const bool rightAbsorbs = isAbsorbingCoalesceArm(*be->right);
+        if (leftAbsorbs && rightAbsorbs) return false;
+        if (leftAbsorbs) left = right;
+        if (rightAbsorbs) right = left;
+        // An OWNED arm makes the meet owned (owned ⊓ owned) or MIXED (owned ⊓
+        // borrowed) — never a borrow. The mixed case is the K7.3 rule's.
+        if (left == OwnershipState::Owned || right == OwnershipState::Owned)
+            return false;
+        return left == OwnershipState::Borrowed &&
+               right == OwnershipState::Borrowed;
     }
     if (!id) return false;  // new / call / other member / literal: not flagged
     // §28.3 (issue #403): a bare `this` is Borrowed ("`this` | Borrowed (source:

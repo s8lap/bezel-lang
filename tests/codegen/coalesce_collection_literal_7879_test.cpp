@@ -61,11 +61,19 @@
 // NOTE (ownership). §28.3.4's producers table classifies a collection literal
 // targeting a reference type as OWNED, and a plain (unmarked) parameter as
 // BORROWED, so `a ?? [1]` is a MIXED meet — which §7.7 rejects wherever the
-// meet is formed. The ownership pass does not classify it (a collection
+// meet is formed. The ownership pass did not classify it (a collection
 // literal carries no `exprType` at any position, so its producer state cannot
-// be read off the type) and therefore reports nothing. That gap is a SEPARATE
-// defect, filed on its own; these rows assert the IR-validity and the join's
-// VALUE, which is what #7879 is about.
+// be read off the type) and therefore reported nothing; that gap is #8371, and
+// it is NOW CLOSED — a `??` whose arm is a collection literal over a BORROW is
+// refused with the §28.3 mixed-meet diagnostic, exactly as its `new` twin is.
+//
+// The consequence for THIS file: the rows below that formed such a meet over
+// a borrow (T1–T5) assert the IR-validity and the join's lowering, which the
+// ownership pass never reached, so they are unaffected. T6 — the one row that
+// RAN a program, and so reached the ownership pass — now spells the meet with
+// an OWNED left arm (`owned ⊓ owned` — the only legal spelling of a `??` whose
+// right operand is a collection literal), so it still measures the join's
+// VALUE end to end, on a shape that compiles on both arms.
 //
 //   T1 — the issue's own repro: `return a ?? [1]` through `: owned Array<int>`.
 //        RED before the fix: the module did not verify.
@@ -79,7 +87,10 @@
 //   T6 — the join's VALUE, end to end: the right operand is evaluated only
 //        when the left is null (§7.7's short-circuit), and the chosen arm is
 //        the result. Asserts the counts, so a green row cannot come from the
-//        join always taking one arm.
+//        join always taking one arm. The LEFT arm is an OWNED producer
+//        (`owned Array<int>?`), because §28.3's `a ?? b` row makes a
+//        collection-literal arm an OWNED arm and a mixed meet is rejected
+//        (the #8371 closure).
 //   T7 — CONTROL: a `??` whose right operand is a VARIABLE still compiles and
 //        still yields the left operand when it is non-null.
 //   T8 — CONTROL: the `if`-expression twin of the same mixed meet is still
@@ -212,9 +223,19 @@ BEZEL_TEST(codegen_coalesce_collection_literal_7879,
 // dispose-exactly-once: the null arm through the `owned` return (the caller
 // owns the fresh literal and disposes it), the non-null arm through a plain
 // local binding (the binding BORROWS the left operand, which its own scope
-// disposes). The ownership pass's separate gap over this meet — which leaves
-// the literal's backing undischarged on the BORROW side — is filed on its
-// own and is not what this row measures.
+// disposes).
+//
+// The LEFT arm is an OWNED producer (`owned Array<int>?`) rather than a
+// borrowed parameter. Section 28.3's `a ?? b` row makes the meet of the two
+// arms' ownership states, and its collection-literal row makes the literal
+// arm OWNED: a literal arm over a BORROW left is a MIXED meet, and section
+// 28.3 K7.3 rejects a mixed meet wherever it is formed. That is the #8371
+// closure — the gap this file's header NOTE recorded as "a SEPARATE defect,
+// filed on its own" — so the borrowed-left spelling of this meet no longer
+// compiles. The OWNED left keeps the row's claim intact (the join's VALUE,
+// end to end, on a shape that compiles on both arms) and keeps the
+// short-circuit under test: `Fresh(0)` is null (the literal arm is taken)
+// and `Fresh(3)` is not (the left arm is taken).
 // ===========================================================================
 BEZEL_TEST(codegen_coalesce_collection_literal_7879,
            coalesce_literal_yields_the_selected_arm_sec_7_7) {
@@ -222,16 +243,21 @@ BEZEL_TEST(codegen_coalesce_collection_literal_7879,
         "module M7879f; "
         "import System; "
         "public class C "
-        "  public static method Bad(a: Array<int>?): owned Array<int> "
-        "    return a ?? [1]; "
+        "  public static method Fresh(n: int): owned Array<int>? "
+        "    if n = 0 then return null; end if; "
+        "    var r: Array<int> := new Array<int>(); "
+        "    r.Add(7); r.Add(8); r.Add(9); "
+        "    return r; "
+        "  end Fresh; "
+        "  public static method Bad(): owned Array<int> "
+        "    return Fresh(0) ?? [1]; "
         "  end Bad; "
         "  public static method Main(): int "
         "    var acc := 0; "
-        "    var r1: Array<int> := C.Bad(null); "
+        "    var r1: Array<int> := C.Bad(); "
         "    acc := acc + r1.Count; "
         "    if r1[0] = 1 then acc := acc + 1; end; "
-        "    var y: Array<int> := [7, 8, 9]; "
-        "    var x: Array<int> := y ?? [1]; "
+        "    var x: Array<int> := C.Fresh(3) ?? [1]; "
         "    acc := acc + x.Count; "
         "    if x[0] = 7 then acc := acc + 2; end; "
         "    return acc; "

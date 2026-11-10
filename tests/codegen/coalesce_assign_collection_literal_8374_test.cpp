@@ -45,16 +45,28 @@
 // twin (row 11) stays fixed, and that a non-literal right-hand side, a string
 // literal, a scalar literal and an array local are all untouched.
 //
-// NOTE (ownership, DEFERRED — see the handback). §28.3.4's producers table
-// classifies a collection literal targeting a reference type as OWNED and a
-// plain (unmarked) parameter as BORROWED, so `a ??= [1]` is a MIXED meet that
-// §7.7 rejects wherever the meet is formed. The ownership pass does not
-// classify it (a collection literal carries no `exprType` at any position), so
-// it reports nothing and the fresh literal's backing is not discharged on a
-// BORROWED target — the same gap #8371 filed for the `??` non-compound form,
-// which leaks identically on THIS base (row 11 below leaks in both arms). These
-// rows assert the IR-validity and the ASSIGNED VALUE, which is what #8374 is
-// about; the ownership classification is a separate defect in a separate pass.
+// NOTE (ownership, #8371 — CLOSED). §28.3.4's producers table classifies a
+// collection literal targeting a reference type as OWNED and a plain
+// (unmarked) parameter as BORROWED, so `a ??= [1]` is a MIXED meet that §7.7
+// rejects wherever the meet is formed. The ownership pass did not classify it
+// (a collection literal carries no `exprType` at any position), so it reported
+// nothing and the fresh literal's backing was not discharged on a BORROWED
+// target — the same gap #8371 filed for the `??` non-compound form, which
+// leaked identically on THIS base (row 11 below leaked in both arms).
+//
+// #8371 is NOW CLOSED for the `??` (non-compound) meet: a `??` whose arm is a
+// collection literal over a BORROW is refused with the §28.3 mixed-meet
+// diagnostic, exactly as its `new` twin is. Row 11 below — the only row here
+// that spells the `??` (non-compound) twin — therefore spells its meet with an
+// OWNED left arm, and still measures what it measured before.
+//
+// The `??=` COMPOUND form (the rows above) is a DIFFERENT meet site and is
+// NOT touched by the #8371 closure: `a ??= [1];` still assigns the literal
+// into the borrowed target, and those rows still pass.
+//
+// These rows assert the IR-validity and the ASSIGNED VALUE, which is what
+// #8374 is about; the ownership classification of the `??` non-compound meet
+// was a separate defect in a separate pass, and that pass now rejects it.
 //
 //   T1 — the issue's own repro, VERBATIM: `a ??= [1];` over `Array<int>?`.
 //        RED on the base: the program returned 0 (the assignment was dropped).
@@ -74,7 +86,9 @@
 //         `??=` path, which is a DIFFERENT lowering site (and a different
 //         file). Its verdict is unchanged by this fix and is pinned here.
 //   T11 — CONTROL: the `??` (NON-COMPOUND) twin `var b := a ?? [1];` — #7879
-//         fixed this on this very base; it must STAY fixed.
+//         fixed this on this very base; it must STAY fixed. The LEFT arm is
+//         an OWNED producer (`owned Array<int>?`), because the #8371 closure
+//         makes a collection-literal arm over a BORROW a rejected mixed meet.
 //   T12 — the NULLABLE-ELEMENT target (`Array<int?>?`): the literal's element
 //         type follows the target's.
 //   T13 — the `internal:` WARNING must be GONE for the fixed shape: the
@@ -343,19 +357,37 @@ BEZEL_TEST(codegen_coalesce_assign_collection_literal_8374,
 // T11 — CONTROL: the `??` (NON-COMPOUND) twin `var b := a ?? [1];`. #7879
 // fixed this on this very base (`a638afa8`, on `r30-c1`) — it must STAY
 // fixed.
+//
+// The LEFT arm is an OWNED producer (`owned Array<int>?`) rather than a
+// borrowed parameter. Section 28.3's `a ?? b` row makes the meet of the two
+// arms' ownership states, and its collection-literal row makes the literal
+// arm OWNED: a literal arm over a BORROW left is a MIXED meet, and section
+// 28.3 K7.3 rejects a mixed meet wherever it is formed. That is the #8371
+// closure — the gap this file's header NOTE recorded as "the same gap #8371
+// filed for the `??` non-compound form" — so the borrowed-left spelling of
+// this meet no longer compiles. The OWNED left keeps the row's claim intact
+// (the `??` twin still lowers to a terminated join and still yields the
+// literal) on a shape that compiles on both arms.
+//
+// NOTE: the `??=` COMPOUND form is a different meet site and is NOT touched
+// by the #8371 closure — its rows above (T1–T5, T9, T12) still spell the
+// borrowed target `a ??= [1];` and still pass.
 // ===========================================================================
 BEZEL_TEST(codegen_coalesce_assign_collection_literal_8374,
            coalesce_twin_stays_fixed_sec_7_7) {
     auto r = runAot(
         "module M8374k; import System;\n"
         "public class C\n"
-        "  public static method Bad(a: Array<int>?): int\n"
-        "    var b := a ?? [1];\n"
+        "  public static method Fresh(): owned Array<int>?\n"
+        "    return null;\n"
+        "  end Fresh;\n"
+        "  public static method Bad(): int\n"
+        "    var b := Fresh() ?? [1];\n"
         "    if b = null then return -1; end if;\n"
         "    return b.Count;\n"
         "  end Bad;\n"
         "  public static method Main(): int\n"
-        "    return C.Bad(null);\n"
+        "    return C.Bad();\n"
         "  end Main;\n"
         "end C;\n");
     BEZEL_EXPECT_TRUE(r.ran);
