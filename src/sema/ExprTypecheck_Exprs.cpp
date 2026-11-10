@@ -571,6 +571,35 @@ bool ExprTC::defaultIllFormed(const TypeRef* t,
     return sema::typeHasNoDefault(t, ctx_, incoming);
 }
 
+// stdlib §4.4 / §4.5 (#8387, #8385): the comparer of `Array<T>.Sort(comparer)`,
+// `Array<T>.Sorted(comparer)` and `OwningArray<T>.Sort(comparer)` is the
+// formal `(T, T) -> int`, so a two-parameter lambda argument's parameters take
+// the receiver's element T (spec §14.5 phase 2, §27.4). The three methods are
+// compiler-provided (no `MethodSymbol` carries the formal), so the callee-formal
+// thread (#829) finds nothing; this is the same shape as the `Zip` / `Aggregate`
+// seeding. Empty for any other call.
+std::vector<TypeRef*> ExprTC::sortComparerLambdaParamTypes(const ast::CallExpr& ce) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma || ce.args.size() != 1) return {};
+    const bool isSort = ma->member == "Sort";
+    const bool isSorted = ma->member == "Sorted";
+    if (!isSort && !isSorted) return {};
+    TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || recvTy->declaration ||
+        recvTy->genericArgs.size() != 1 || !recvTy->genericArgs[0])
+        return {};
+    std::string_view head;
+    if (recvTy->astNode && recvTy->astNode->name &&
+        !recvTy->astNode->name->parts.empty())
+        head = recvTy->headName();
+    else if (!recvTy->importedName.empty())
+        head = recvTy->importedName;
+    // `Sorted(comparer)` is declared on Array<T> only (stdlib §4.4); an
+    // OwningArray<T> has no `Sorted` (stdlib §4.5).
+    if (!(head == "Array" || (isSort && head == "OwningArray"))) return {};
+    return { recvTy->genericArgs[0], recvTy->genericArgs[0] };
+}
+
 // per §27.4 (v0.183, #1408) / A.7 LambdaDestructure. See declaration
 // (ExprTypecheck_impl.hpp) for the contract. Mirrors the §19.3 case-pattern
 // DestructuringPattern desugar (ExprTypecheck.cpp CaseStmt / ExprTypecheck_
@@ -15253,6 +15282,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     else if (auto zipP = zipCombineLambdaParamTypes(*ce);
                              zipP.size() == 2 && lam->params.size() == 2)
                         pendingLambdaParamTypes_ = zipP;
+                    // stdlib §4.4 / §4.5 (#8387, #8385): an `Array<T>.Sort(cmp)` /
+                    // `.Sorted(cmp)` comparer is `(T, T) -> int` — seed BOTH params
+                    // with the receiver's element T so an un-annotated `(x, y)`
+                    // comparer resolves its body in sema (a `string` member's
+                    // `CompareTo`, a `DictionaryEntry` member) instead of leaving
+                    // the parameters untyped.
+                    else if (auto sortP = sortComparerLambdaParamTypes(*ce);
+                             sortP.size() == 2 && lam->params.size() == 2)
+                        pendingLambdaParamTypes_ = sortP;
                     // fix #829: a lambda bound to a function-typed parameter
                     // `(T1, …, Tn) -> R` — thread the positional Ti so an untyped
                     // lambda arg `(a, b) => …` gets its inferred param types (the

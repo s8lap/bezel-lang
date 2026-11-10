@@ -1525,6 +1525,13 @@ private:
     // `ret void` against the i32 accumulator return type). Empty when not such a call.
     std::vector<TypeRef*> aggregateFoldLambdaParamTypes(const ast::CallExpr& ce);
 
+    // stdlib §4.4 / §4.5 (#8387, #8385): for an `Array<T>.Sort(cmp)` /
+    // `.Sorted(cmp)` / `OwningArray<T>.Sort(cmp)` call whose argument is a
+    // two-parameter lambda, return the comparer's two parameter types {T, T}
+    // (the formal is `(T, T) -> int`) so an un-annotated `(x, y)` comparer gets
+    // its parameters typed in sema (spec §14.5, §27.4). Empty otherwise.
+    std::vector<TypeRef*> sortComparerLambdaParamTypes(const ast::CallExpr& ce);
+
     // §2.3: cache of synthetic TypeSymbol objects for always-available
     // built-in classes (Console, Math, Convert, Environment).
     std::unordered_map<std::string, TypeSymbol*> builtinClassCache_;
