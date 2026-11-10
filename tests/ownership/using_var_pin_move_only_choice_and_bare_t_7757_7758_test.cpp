@@ -64,3 +64,22 @@ BEZEL_TEST(ownership_using_var_pin_7757,
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "consume-site freeze"));
 }
+
+BEZEL_TEST(ownership_using_var_pin_7758,
+           spec_k8_4_using_var_over_field_of_temporary_at_bare_t_is_rejected) {
+    auto r = runAotChecked(
+        std::string("module M; ") + kDecls +
+        "public class GenP "
+        "  public static method G<T>(owned t: T): int where T: class "
+        "    using var x := new Box<T>(move t).V; "
+        "    return 1; "
+        "  end G; "
+        "end GenP; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    return GenP.G<Res>(new Res()) - 1; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "(K8.4"));
+}

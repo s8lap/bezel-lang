@@ -7956,7 +7956,10 @@ const ast::Expr* MethodOwnership::usingVarTemporaryRootedBorrowRead(
     const bool carriesBorrow =
         (rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
          isBorrowableType(rt)) ||
-        common::isMoveOnlyValueType(rt, ctx_, moKind);
+        common::isMoveOnlyValueType(rt, ctx_, moKind) ||
+        // fix #7758 (K8.4, §28.1 clause 3, v0.357): a bare type parameter
+        // admitting a class substitution is read as a class.
+        captureTypeIsBorrowBearing(rt);
     if (!carriesBorrow) return nullptr;
     // Walk the receiver chain `root.a.b!.c` / `root?.a`: every link must be a
     // field or borrow-property read.
