@@ -227,6 +227,35 @@ std::string noSelectorNotComparableMsg(std::string_view m, const TypeRef* elem) 
            "(selector: (T) -> U) instead.";
 }
 
+// fix #8240 (stdlib §5.1 / §2.8, spec §14.2 *Interface conformance* rule 6
+// / §3.6 rule 2, v0.355): the diagnostic for a no-selector `Min()`/`Max()`
+// whose element is a TYPE PARAMETER that does not GUARANTEE
+// `IComparable<T>`.
+//
+// THE WORDING. The clause is the #2770 backstop's own ("requires the element
+// type to satisfy `T: IComparable<T>`"), so the refusal reads as the SAME
+// constraint whichever half reports it — but the honest claim is the rule-6
+// one: the parameter's OWN declared constraints do not establish the
+// conformance, so the generic body cannot assume it (spec §3.6 rule 2: "A
+// generic body type-checks under the weakest assumption its constraints
+// establish"). The backstop's own clause ("its `CompareTo` could not be
+// resolved for dispatch") describes a CODEGEN symptom, not the rule.
+//
+// THE PARAMETER IS NAMED BY ITS SPELLING (§14.1 — "A type parameter has no
+// qualified spelling"), so the message says `T`, not `<element>`.
+std::string noSelectorTypeParamNotComparableMsg(std::string_view m,
+                                                std::string_view param) {
+    return std::string(m) +
+           "() without a selector requires the element type to satisfy "
+           "`T: IComparable<T>` (stdlib §5.1 / spec §14.2 / #8240); the type "
+           "parameter `" +
+           std::string(param) + "` does not GUARANTEE `IComparable<" +
+           std::string(param) +
+           ">` — its own declared constraints do not establish it (§14.2 "
+           "*Interface conformance* rule 6). Use " +
+           std::string(m) + "(selector: (T) -> U) instead.";
+}
+
 std::string typeNameForDiag(const TypeRef* t) {
     if (!t) return "<unresolved>";
     std::string s;
@@ -13822,6 +13851,32 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             Severity::Error, ce.span.begin,
                             noSelectorNotComparableMsg(m, srcElem));
                     }
+                    // fix #8240 (stdlib §5.1 / §2.8, spec §14.2 *Interface
+                    // conformance* rule 6 / §3.6 rule 2, v0.355): the LAZY
+                    // twin of the concrete-collection arm's type-parameter
+                    // gate — `xs.Where(...).Max()` over an `Array<T>` whose
+                    // `T` is the body's own parameter.
+                    //
+                    // The SAME verdict (`typeParamGuaranteesSelfInterface`),
+                    // so the two receivers cannot drift: a parameter whose
+                    // OWN constraints guarantee `IComparable<T>` is ADMITTED;
+                    // one that does not (an UNCONSTRAINED `T`, or one whose
+                    // clauses name a different interface) is REFUSED at the
+                    // DECLARATION, with the same wording the concrete arm
+                    // uses. The base refused this shape in CODEGEN (the
+                    // #2770 backstop), so no program that compiled before is
+                    // broken by the refusal.
+                    else if ((m == "Min" || m == "Max") && ce.args.empty() &&
+                             linqElemIsInScopeTypeParam(srcElem) &&
+                             typeParamGuaranteesSelfInterface(
+                                 srcElem->headName(), srcElem,
+                                 ctx_.builtinInterfaceSym("IComparable")) !=
+                                 SelfBoundVerdict::Guaranteed) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            noSelectorTypeParamNotComparableMsg(
+                                m, srcElem->headName()));
+                    }
                     else if (m == "Sum" || m == "Min" || m == "Max") {
                         bool elemIsDecimal =
                             srcElem &&
@@ -15698,6 +15753,70 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     noSelectorNotComparableMsg(m, elem));
                                 return;
                             }
+                            // fix #8240 (stdlib §5.1 / §2.8, spec §14.2
+                            // *Interface conformance* rule 6 / §3.6 rule 2,
+                            // v0.355): a TYPE-PARAMETER element is decided by
+                            // the parameter's OWN declared constraints, NOT by
+                            // the placeholder's shape.
+                            //
+                            // THE DEFECT. Inside a generic body the receiver's
+                            // element type is the body's own parameter
+                            // (`Array<T>`), and the arms above all read the
+                            // element's DECLARATION — which a type parameter
+                            // has none of — so the §5.1 candidate was KEPT and
+                            // the call reached CODEGEN, whose comparator probes
+                            // read a declaration too. There the call was
+                            // refused by the #2770 backstop: "Min() without a
+                            // selector requires the element type to satisfy `T:
+                            // IComparable<T>` (stdlib §5.1 / spec §14.2 /
+                            // #2770); `T` does not — its `CompareTo` could not
+                            // be resolved for dispatch."
+                            //
+                            // THE VERDICT. §14.2 *Interface conformance* rule
+                            // 6: "T is a type parameter whose constraints
+                            // guarantee conformance to I: a type-bound
+                            // constraint naming I or an interface extending I
+                            // …". Under `where T: IComparable<T>` the ordering
+                            // IS guaranteed, so the call MUST be admitted; and
+                            // spec §3.6 rule 2 ("A generic body type-checks
+                            // under the weakest assumption its constraints
+                            // establish") forbids assuming anything the
+                            // constraints do not establish.
+                            //
+                            // The verdict is read through
+                            // `typeParamGuaranteesSelfInterface` — the ONE
+                            // three-valued decision (`Guaranteed` /
+                            // `NotGuaranteed` / `Undecided`) that the §4.4
+                            // `Sort()`/`Sorted()` gate (#8262) and the §5.1
+                            // `Sum()` gate read too — so the three gates
+                            // cannot disagree about what a type parameter
+                            // guarantees.
+                            //
+                            // ⚠ ONLY `Guaranteed` ADMITS. `NotGuaranteed`
+                            // (an UNCONSTRAINED parameter, and one whose
+                            // clauses name a DIFFERENT interface) is REFUSED
+                            // here, at the DECLARATION — a located diagnostic
+                            // is strictly better than codegen's backstop, and
+                            // no program that compiled before is broken by it
+                            // (the base refused this shape in codegen too).
+                            // `Undecided` — a constraint set that cannot be
+                            // READ — is REFUSED as well: a constraint that
+                            // cannot be established cannot be assumed
+                            // (spec §3.6 rule 2), and §14.2's deferral to the
+                            // instantiation covers a constraint that is
+                            // UNDECIDABLE, not one that is unreadable.
+                            if ((m == "Min" || m == "Max") && ce.args.empty() &&
+                                linqElemIsInScopeTypeParam(elem) &&
+                                typeParamGuaranteesSelfInterface(
+                                    elem->headName(), elem,
+                                    ctx_.builtinInterfaceSym("IComparable")) !=
+                                    SelfBoundVerdict::Guaranteed) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    noSelectorTypeParamNotComparableMsg(
+                                        m, elem->headName()));
+                                return;
+                            }
                             const bool comparableElem =
                                 ptrComparableElem || builtinValueRecordElem ||
                                 userRecordComparable || builtinGuidElem;
@@ -16588,6 +16707,52 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // two sides.
                             if (!isComparableElem &&
                                 sema::isStdlibGuidType(elemTy472))
+                                isComparableElem = true;
+                            // fix #8262 (stdlib §4.4 / §2.8, spec §14.2
+                            // *Interface conformance* rule 6 / §3.6 rule 2,
+                            // v0.355): (f) a TYPE-PARAMETER element.
+                            //
+                            // Inside a GENERIC body the receiver's element type
+                            // is the body's own parameter (`Array<T>`), and
+                            // EVERY arm above reads the element's
+                            // DECLARATION — its base list — which a type
+                            // parameter has NONE of. So the gate could not
+                            // tell a parameter whose OWN declared constraints
+                            // GUARANTEE the conformance from one that
+                            // guarantees nothing, and it refused BOTH.
+                            //
+                            // §14.2 *Interface conformance* rule 6 is the
+                            // deciding sentence: "T is a type parameter whose
+                            // constraints guarantee conformance to I: a
+                            // type-bound constraint naming I or an interface
+                            // extending I …". The verdict is read through
+                            // `typeParamGuaranteesSelfInterface` — the ONE
+                            // three-valued decision (`Guaranteed` /
+                            // `NotGuaranteed` / `Undecided`) that the §5.1
+                            // `Min()`/`Max()` gate and the §5.1 `Sum()` gate
+                            // read too (§14.1, spec §3.6 rule 2: "A generic
+                            // body type-checks under the weakest assumption
+                            // its constraints establish"), so the gates
+                            // cannot disagree about what a type parameter
+                            // guarantees.
+                            //
+                            // ⚠ ONLY `Guaranteed` ADMITS. `NotGuaranteed`
+                            // keeps the base's refusal (the sound direction),
+                            // and `Undecided` — a constraint set that cannot
+                            // be READ — ALSO keeps it: §14.2's deferral is
+                            // for a constraint that is UNDECIDABLE at the
+                            // declaration, and an undecidable one cannot
+                            // establish the conformance either. (An
+                            // UNCONSTRAINED parameter is `NotGuaranteed`
+                            // here — `forEachConstraintBound` finds no bound
+                            // — so the unconstrained `T` is still refused,
+                            // byte-identically.)
+                            if (!isComparableElem &&
+                                linqElemIsInScopeTypeParam(elemTy472) &&
+                                typeParamGuaranteesSelfInterface(
+                                    elemTy472->headName(), elemTy472,
+                                    ctx_.builtinInterfaceSym("IComparable")) ==
+                                    SelfBoundVerdict::Guaranteed)
                                 isComparableElem = true;
                             if (!isComparableElem) {
                                 // fix #2790: name the form the user actually

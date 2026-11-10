@@ -10169,6 +10169,66 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
           common::isSyncIterFormatEnumerableHead(targetTy->headName())))
         return v;
     sema::TypeRef* actualTy = ctx_.exprType(*srcExpr);
+    // fix #8240 (stdlib §5.1, spec §14.1 / §14.2, v0.355): THE WRAPPER'S
+    // ELEMENT TYPE IS THE SOURCE'S, when the TARGET's declared element is a
+    // type parameter the active monomorphization cannot resolve.
+    //
+    // THE DEFECT. The §29.2 wrapper's machinery — its STRIDE and its
+    // `Current` function's RETURN TYPE — is derived from the TARGET's
+    // declared element (the callee's formal `IEnumerable<T>`'s `T`). At an
+    // ARGUMENT coercion the callee's substitution is NOT installed yet (the
+    // same fact `buildOrderedArgs`'s own bare-`T`-formal comment records:
+    // "the callee's substitution is not installed until after argument
+    // lowering"), so that `T` resolves to nothing and the machinery fell
+    // back to the `i32` PLACEHOLDER: a 4-BYTE stride and an `i32` `Current`
+    // over an array of 8-BYTE class pointers.
+    //
+    // MEASURED at the tip (ASan): `G.Lo<K>(a)` — `a: Array<K>`,
+    // `Lo<T>(xs: IEnumerable<T>) where T: IComparable<T>` — built the
+    // wrapper as `bz$arrenum$i32` (`store i64 4` — the ELEMENT SIZE) whose
+    // `Current` returns `i32`, while the §5.1 terminal that drained it read
+    // the CONCRETE element (`K`, a pointer) and called `K.CompareTo` with
+    // it. The `i32` return was then read as a pointer: the comparator was
+    // handed `0x7bcd` (the low half of a class pointer) and the program
+    // SEGFAULTED (rc=139). The base REFUSED that shape (the #2770
+    // backstop), so the crash would have been a REGRESSION introduced by
+    // admitting it.
+    //
+    // THE REPAIR. The wrapper WALKS THE SOURCE array, so its element type is
+    // the SOURCE's — and the source's element type IS concrete at the
+    // coercion site (`Array<K>`'s `K` is the argument expression's own
+    // type). So the target's declared element is replaced by the source's
+    // element exactly when the target's element is NOT a CONCRETE type (a
+    // bare type parameter with no active binding). A concrete target element
+    // (a declared class/interface/record, a primitive, or a parameter the
+    // active monomorphization binds) is left EXACTLY as it was, so every
+    // non-generic program keeps byte-identical machinery.
+    sema::TypeRef effTargetStorage;
+    const sema::TypeRef* effTargetTy = targetTy;
+    if (targetTy && targetTy->kind == sema::TypeRef::Kind::Named &&
+        targetTy->genericArgs.size() == 1 && targetTy->genericArgs[0]) {
+        const sema::TypeRef* tel = targetTy->genericArgs[0];
+        // A CONCRETE element: not a Named at all (a primitive / an inline
+        // array), a Named WITH a declaration (a user class/interface/record
+        // — the builtins carry none, hence the separate resolution arm), or
+        // a Named the active monomorphization BINDS.
+        const bool telConcrete =
+            tel->kind != sema::TypeRef::Kind::Named || tel->declaration ||
+            resolveTypeParamRef(tel) != tel;
+        if (!telConcrete && actualTy &&
+            actualTy->kind == sema::TypeRef::Kind::Named &&
+            !actualTy->genericArgs.empty() && actualTy->genericArgs[0]) {
+            sema::TypeRef* sel = actualTy->genericArgs[0];
+            const bool selConcrete =
+                sel->kind != sema::TypeRef::Kind::Named || sel->declaration ||
+                resolveTypeParamRef(sel) != sel;
+            if (selConcrete) {
+                effTargetStorage = *targetTy;
+                effTargetStorage.genericArgs[0] = sel;
+                effTargetTy = &effTargetStorage;
+            }
+        }
+    }
     // #1916 / stdlib §5 / §29.11: a lazy LINQ pipeline (Select/Where/… → a
     // bz_lazy_t* sentinel) widened to a pure `IEnumerable<T>` in a RETURN
     // position. The lazy vtable has only 4 slots (td/Dispose/MoveNext/Current)
@@ -10338,12 +10398,12 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         if (outWrapMade) *outWrapMade = true;
         if (srcOwnedByCallee) {
             if (an == "Stack" || an == "OwningStack")
-                return wrapOwnedStackAsIEnumerator(v, targetTy);
-            return wrapOwnedArrayAsIEnumerable(v, targetTy);
+                return wrapOwnedStackAsIEnumerator(v, effTargetTy);
+            return wrapOwnedArrayAsIEnumerable(v, effTargetTy);
         }
         if (an == "Stack" || an == "OwningStack")
-            return wrapStackAsIEnumerator(v, targetTy);
-        return wrapArrayAsIEnumerable(v, targetTy);
+            return wrapStackAsIEnumerator(v, effTargetTy);
+        return wrapArrayAsIEnumerable(v, effTargetTy);
     }
     // fix #1069 / stdlib §4.10 / §5: DICT-backed `Set<T>` — snapshot its element
     // keys into a fresh array and hand out an OWNING enumerator over the
@@ -11224,7 +11284,27 @@ llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
     // the cached vtable/struct from it, then we allocate + fill one instance.
     llvm::Type* elemTy = i32();
     if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
-        elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
+        // fix #8240 (stdlib §5.1, spec §14.2 / §14.1, v0.355): the element may
+        // be a TYPE PARAMETER, and the wrapper's element byte size must be
+        // read at THIS INSTANTIATION. `lowerTypeRef` alone cannot resolve it:
+        // the element TypeRef here is the TARGET's DECLARED element
+        // (`IEnumerable<T>`'s `T`), which carries no AST node of its own, so
+        // the placeholder `i32` was used — a 4-byte stride for an 8-byte
+        // pointer element.
+        //
+        // MEASURED on the tip without this line: the wrapper was built with
+        // `movq $0x4, 0x18(%rax)` (the wrapper's ELEMENT SIZE = 4) while the
+        // array it walks has an 8-byte stride, so a §5.1 terminal that reads
+        // EVERY element handed the comparator the high half of the previous
+        // pointer — a NULL `this` — and the program SEGFAULTED (rc=139). The
+        // base REFUSED that shape, so the crash would have been a REGRESSION
+        // introduced by admitting it.
+        //
+        // `resolveTypeParamRef` is the #567 mechanism — the ACTIVE
+        // MONOMORPHIZATION's binding for the parameter. The ERASED template
+        // body (§14.1's dead pass) has no binding and keeps the placeholder
+        // size; that body never runs.
+        elemTy = lowerTypeRef(resolveTypeParamRef(iEnumTy->genericArgs[0]));
     // fix #3385 (§29.1 / §29.2 / §29.11; stdlib §4.5 / §4.13, v0.282): at an
     // `IOwningEnumerable<T>` target the wrap must hand out the DRAINING
     // enumerator, not this borrowing one.

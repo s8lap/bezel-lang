@@ -2437,7 +2437,29 @@ llvm::Value* Emitter::materializeVtableIEnumerableToArray(
     auto* recvTy = ctx_.exprType(recvExpr);
     if (!isVtableBackedIEnumerableType(recvTy)) return nullptr;
     elemRef = recvTy->genericArgs[0];
-    llvm::Type* elemTy = lowerTypeRef(elemRef);
+    // fix #8240 (stdlib §5.1 / §2.8, spec §14.2 *Interface conformance* rule
+    // 6 / §14.1, v0.355): the element may be a TYPE PARAMETER, and the
+    // element byte size must be read at THIS INSTANTIATION. `lowerTypeRef`
+    // alone cannot resolve it: the element TypeRef here is the RECEIVER's
+    // DECLARED element (`IEnumerable<T>`'s `T`), which carries no AST node of
+    // its own, so the placeholder `i32` was used and the materialized array
+    // got a 4-BYTE stride while the element is a POINTER (8 bytes).
+    //
+    // MEASURED on the tip without this line: the materialized array was
+    // allocated `bz_array_alloc(4, 8)` — a 4-byte stride — so each element
+    // POINTER was truncated to 4 bytes on the way in, and the §5.1 terminal
+    // that walks the array with an 8-byte stride read the high half of the
+    // previous pointer: the comparator was handed a NULL `this` and the
+    // program SEGFAULTED (rc=139). The base REFUSED that shape (the #2770
+    // backstop), so the crash would have been a REGRESSION introduced by
+    // admitting the shape.
+    //
+    // `resolveTypeParamRef` is the #567 mechanism — the ACTIVE
+    // MONOMORPHIZATION's binding for the parameter — so at the instantiation
+    // the element's real size is read. The ERASED template body (§14.1's dead
+    // pass) has no binding and keeps the placeholder size; that body never
+    // runs.
+    llvm::Type* elemTy = lowerTypeRef(resolveTypeParamRef(elemRef));
     if (!elemTy) return nullptr;
 
     llvm::Value* srcObj = lowerExpr(recvExpr);
@@ -2675,7 +2697,15 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
         llvm::Value* matArr =
             materializeVtableIEnumerableToArray(recvExpr, elemRef);
         if (!matArr) return nullptr;
-        llvm::Type* et = elemRef ? lowerTypeRef(elemRef) : i32();
+        // fix #8240 (stdlib §5.1, spec §14.2 / §14.1, v0.355): the lazy
+        // source's element byte size must be read at THIS INSTANTIATION — the
+        // SAME resolution `materializeVtableIEnumerableToArray` above now
+        // reads, so the wrapper's stride and the materialized array's stride
+        // AGREE. A type-parameter element resolved to the placeholder `i32`
+        // (4 bytes) here while the array held 8-byte pointers, and the §5.1
+        // terminal that drained the lazy source walked it with a third size.
+        llvm::Type* et = elemRef ? lowerTypeRef(resolveTypeParamRef(elemRef))
+                                 : i32();
         int64_t esz = lazyElemSize(et, module_->getDataLayout());
         // The materialized array is a fresh temporary with no other owner — wrap
         // it as an OWNING lazy ARRAY source so bz_lazy_dispose frees it (leak-free

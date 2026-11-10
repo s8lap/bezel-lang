@@ -6619,7 +6619,59 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 sema::TypeRef* elemTypeRef =
                     (recvTy && !recvTy->genericArgs.empty())
                         ? recvTy->genericArgs[0] : nullptr;
-                bool isStrElem = isStringTypeRefNonNull(elemTypeRef);
+                // fix #8240 (stdlib §5.1 / §2.8, spec §14.2 *Interface
+                // conformance* rule 6 / §14.1, v0.355): THE ELEMENT MAY BE A
+                // TYPE PARAMETER. Inside a generic body the receiver's
+                // DECLARED element type is the body's own parameter
+                // (`Array<T>`), and every comparator probe below reads a
+                // DECLARATION — which a type parameter has none of. So the
+                // resolution found nothing and the #2770 guard refused the
+                // call ("`T` does not — its `CompareTo` could not be resolved
+                // for dispatch"), although `where T: IComparable<T>` GUARANTEES
+                // the ordering (spec §14.2 *Interface conformance* rule 6)
+                // and the body is lowered PER INSTANTIATION (spec §14.1).
+                //
+                // ⇒ THE RESOLUTION READS THE ELEMENT THROUGH THE ACTIVE
+                // MONOMORPHIZATION (`resolveTypeParamRef`, the #567
+                // mechanism): in the specialization the parameter is bound to
+                // its concrete type, so the order follows the element's OWN
+                // `CompareTo` — the member's for a class (§14.2's
+                // self-recurrence), the §13 itable's for an interface, the
+                // §9.6 relation for a `string`, the numeric one for a
+                // primitive. The ERASED template body (the dead pass every
+                // generic method also compiles, §14.1) has no binding, so
+                // its element stays a parameter and the #2770 guard stays
+                // SILENT there (the house pattern of the dead pass — see the
+                // guard's own comment).
+                // ⚠ THE VTABLE-BACKED `IEnumerable<T>` RECEIVER IS COVERED BY
+                // THIS RESOLUTION, and it needs the element-size REPAIR that
+                // goes with it. Its runtime value is the iterator-VTABLE
+                // object, not a `bz_array_t*`, so the §5 terminals MATERIALIZE
+                // it first — and that materialization computed the element
+                // byte size from the UNSUBSTITUTED type parameter
+                // (`materializeVtableIEnumerableToArray`,
+                // src/codegen/LlvmBackend_Calls3.cpp, and
+                // `wrapArrayAsIEnumerable`, src/codegen/LlvmBackend_Assign.cpp:
+                // `lowerTypeRef(elemRef)` with no `resolveTypeParamRef`). A
+                // class element therefore landed in a 4-BYTE-stride array
+                // while the comparison below walks it with an 8-byte stride,
+                // and the comparator was handed the high half of a pointer — a
+                // NULL `this` and a SIGSEGV.
+                //
+                // ⇒ THE REPAIR IS IN THOSE TWO SITES: they now read the
+                // element through the active monomorphization, exactly as
+                // this arm does, so the three strides AGREE. (This is the
+                // repair the non-author review of the earlier attempt at this
+                // fix named: "the two sites that compute an element size/type
+                // from a possibly-type-parameter element must read it through
+                // the active monomorphization".)
+                //
+                // ⚠ THE VTABLE RECEIVER IS IN NONE of this lane's issues'
+                // closure populations, so its behaviour is a REPORTED
+                // CONSEQUENCE of the repair, not a claim of a closure.
+                const sema::TypeRef* elemResolved =
+                    resolveTypeParamRef(elemTypeRef);
+                bool isStrElem = isStringTypeRefNonNull(elemResolved);
                 // fix #8049 (stdlib §2.5 / §5.1 / §2.8, spec §14.2, v0.353):
                 // a BUILT-IN VALUE RECORD element — `DateTime`, `TimeSpan`,
                 // `DateOnly`, `TimeOnly` — is stored INLINE in the array (ONE
@@ -6673,13 +6725,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 const bool elemIsGuid =
                     sema::isStdlibGuidType(resolveTypeParamRef(elemTypeRef));
                 sema::MethodSymbol* cmpMs = nullptr;
-                if (!isStrElem && elemTypeRef &&
-                    elemTypeRef->kind == sema::TypeRef::Kind::Named &&
-                    elemTypeRef->declaration &&
-                    (elemTypeRef->declaration->kind == ast::TypeDeclKind::Class ||
-                     elemTypeRef->declaration->kind == ast::TypeDeclKind::Interface)) {
+                if (!isStrElem && elemResolved &&
+                    elemResolved->kind == sema::TypeRef::Kind::Named &&
+                    elemResolved->declaration &&
+                    (elemResolved->declaration->kind == ast::TypeDeclKind::Class ||
+                     elemResolved->declaration->kind == ast::TypeDeclKind::Interface)) {
                     if (sema::MethodSymbol* cm =
-                            findMethodByName(elemTypeRef->declaration, "CompareTo"))
+                            findMethodByName(elemResolved->declaration, "CompareTo"))
                         if (cm->params.size() == 1) cmpMs = cm;
                 }
                 // fix #8272 (spec §14.2 rule 1 / §14.1, stdlib §5.1 / §2.8,
@@ -6698,7 +6750,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 if (cmpMs) {
                     bool applied = false;
                     genCmpFn =
-                        genericBaseCompareToFn(cmpMs, elemTypeRef, &applied);
+                        genericBaseCompareToFn(cmpMs, elemResolved, &applied);
                     if (applied && !genCmpFn) {
                         ctx_.diagnostics().report(
                             Severity::Error, call.span.begin,
@@ -6742,9 +6794,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 llvm::Function* ifaceCmpFn = nullptr;
                 if (!isStrElem && !cmpMs) {
                     if (sema::MethodSymbol* ifm =
-                            selfComparableIfaceCompareTo(elemTypeRef))
+                            selfComparableIfaceCompareTo(elemResolved))
                         ifaceCmpFn = ensureIfaceCmpThunk(
-                            elemTypeRef->declaration, ifm);
+                            elemResolved->declaration, ifm);
                 }
                 if (isStrElem || cmpMs || ifaceCmpFn) {
                     // Element is a pointer (string object / class or interface
@@ -7143,13 +7195,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // declined (which is the case for every generic record), so
                 // every shape that works today is bit-identical.
                 llvm::Function* recCmpThunk = nullptr;
-                if (!isStrElem && elemTypeRef && !elemTypeRef->nullable &&
-                    elemTypeRef->kind == sema::TypeRef::Kind::Named)
-                    recCmpThunk = buildRecordCompareToThunk(elemTypeRef);
-                if (!recCmpThunk && !isStrElem && elemTypeRef &&
-                    !elemTypeRef->nullable &&
-                    elemTypeRef->kind == sema::TypeRef::Kind::Named)
-                    recCmpThunk = buildGenericRecordCompareToThunk(elemTypeRef);
+                if (!isStrElem && elemResolved && !elemResolved->nullable &&
+                    elemResolved->kind == sema::TypeRef::Kind::Named)
+                    recCmpThunk = buildRecordCompareToThunk(elemResolved);
+                if (!recCmpThunk && !isStrElem && elemResolved &&
+                    !elemResolved->nullable &&
+                    elemResolved->kind == sema::TypeRef::Kind::Named)
+                    recCmpThunk = buildGenericRecordCompareToThunk(elemResolved);
                 if (recCmpThunk) {
                     auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
                     llvm::Value* len = builder_.CreateCall(lenFn, {recv});
@@ -7265,15 +7317,39 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // for a Named TypeRef WITHOUT a declaration (it falls back to
                 // the syntactic head, then to the metadata importedName) and
                 // it resolves through a type alias (#1462).
-                if (elemTypeRef &&
-                    elemTypeRef->kind == sema::TypeRef::Kind::Named &&
-                    (!elemTypeRef->declaration ||
-                     elemTypeRef->declaration->kind == ast::TypeDeclKind::Class ||
-                     elemTypeRef->declaration->kind ==
+                //
+                // fix #8240 (stdlib §5.1 / §2.8, spec §14.2 / §14.1, v0.355):
+                // the element is read through the ACTIVE MONOMORPHIZATION (the
+                // `elemResolved` above), so a TYPE-PARAMETER element is judged
+                // by its CONCRETE type at this instantiation — the class or
+                // interface whose `CompareTo` the arms above could not resolve
+                // — and a PRIMITIVE element (the numeric order) is not refused
+                // here at all.
+                //
+                // ⚠ THE ERASED TEMPLATE BODY (§14.1's dead pass — the body
+                // every generic method also compiles, which never runs: every
+                // call binds the substitution and routes to the
+                // specialization) has NO binding, so its element stays a type
+                // parameter and no comparator can be resolved there. The
+                // diagnostic is therefore SILENT in that pass — the house
+                // pattern of the dead pass (see #3922 / #3939's own notes:
+                // "in that dead pass this arm still bare-returns null exactly
+                // as before this fix; no operational change there, since that
+                // body never runs"). The null the guard returns is the dead
+                // body's placeholder; `emitReturn` neutralizes the
+                // placeholder-vs-concrete return-type mismatch in that pass
+                // (§14.1).
+                if (elemResolved &&
+                    elemResolved->kind == sema::TypeRef::Kind::Named &&
+                    (!elemResolved->declaration ||
+                     elemResolved->declaration->kind == ast::TypeDeclKind::Class ||
+                     elemResolved->declaration->kind ==
                          ast::TypeDeclKind::Interface)) {
-                    std::string_view en = elemTypeRef->declaration
-                                              ? elemTypeRef->declaration->name
-                                              : elemTypeRef->headName();
+                    if (emittingGenericTemplateBody_)
+                        return llvm::ConstantPointerNull::get(ptrTy());
+                    std::string_view en = elemResolved->declaration
+                                              ? elemResolved->declaration->name
+                                              : elemResolved->headName();
                     ctx_.diagnostics().report(
                         Severity::Error, call.span.begin,
                         std::string(m) +
@@ -7456,7 +7532,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // over `[200, 50]` come back INVERTED. That is the same
                 // unsigned-compare requirement #1836 recorded for `ulong`,
                 // one width family down.
-                sema::TypeRef* e = recvTy->genericArgs[0];
+                const sema::TypeRef* e = recvTy->genericArgs[0];
+                // fix #8240 (stdlib §5.1 / §2.8, spec §14.2 / §14.1, v0.355):
+                // the accumulator is keyed off the element's CONCRETE type at
+                // this instantiation — the same resolution the comparator
+                // probes above read (`elemResolved`). A type-parameter element
+                // keeps the placeholder here, so a `T = long` body would have
+                // accumulated an i32 and answered a TRUNCATED order (and
+                // returned an i32 where the body returns `T`).
+                if (const sema::TypeRef* er = resolveTypeParamRef(e)) e = er;
                 if (e->kind == sema::TypeRef::Kind::Primitive && !e->nullable) {
                     switch (e->primitive) {
                         case sema::PrimitiveType::Byte:
@@ -8790,12 +8874,28 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // per §14.2 / stdlib §2.8.
             const sema::TypeRef* elemTR = (recvTy && !recvTy->genericArgs.empty())
                 ? recvTy->genericArgs[0] : nullptr;
+            // fix #8240 / #8262 (stdlib §4.4 / §2.8 / §5.1, spec §14.2
+            // *Interface conformance* rule 6 / §14.1, v0.355): the element may
+            // be a TYPE PARAMETER (`Array<T>` in a generic body), and the
+            // comparator probes below read a DECLARATION — which a type
+            // parameter has none of. So the order fell through to the
+            // `bz$intcmp` fallback (or, for a ptr-typed element, to the STRING
+            // comparator — a silent WRONG order: the elements' addresses
+            // compared as `char*`). The element is therefore read through the
+            // ACTIVE MONOMORPHIZATION (`resolveTypeParamRef`, the #567
+            // mechanism), so the order follows the element's OWN `CompareTo` at
+            // this instantiation: the member's for a class, the §13 itable's
+            // for an interface. The ERASED template body (§14.1's dead pass)
+            // has no binding and keeps the placeholder element — its body
+            // never runs.
+            const sema::TypeRef* elemTRResolved = resolveTypeParamRef(elemTR);
             sema::MethodSymbol* classCompareMs = nullptr;
-            if (elemTR && elemTR->kind == sema::TypeRef::Kind::Named &&
-                elemTR->declaration &&
-                elemTR->declaration->kind == ast::TypeDeclKind::Class) {
+            if (elemTRResolved &&
+                elemTRResolved->kind == sema::TypeRef::Kind::Named &&
+                elemTRResolved->declaration &&
+                elemTRResolved->declaration->kind == ast::TypeDeclKind::Class) {
                 sema::MethodSymbol* cm =
-                    findMethodByName(elemTR->declaration, "CompareTo");
+                    findMethodByName(elemTRResolved->declaration, "CompareTo");
                 if (cm && cm->params.size() == 1) classCompareMs = cm;
             }
             // fix #2768 (stdlib §4.4/§2.8, spec §14.2, v0.240): an INTERFACE
@@ -8809,12 +8909,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // / ensureIfaceCmpThunk for why no other element category can be
             // routed here.
             sema::MethodSymbol* ifaceCompareMs =
-                classCompareMs ? nullptr : selfComparableIfaceCompareTo(elemTR);
+                classCompareMs ? nullptr
+                               : selfComparableIfaceCompareTo(elemTRResolved);
             // Null when the interface descriptor or itable index is missing;
             // the pre-fix comparator choice then stands unchanged.
             llvm::Function* ifaceCmpFn =
                 ifaceCompareMs
-                    ? ensureIfaceCmpThunk(elemTR->declaration, ifaceCompareMs)
+                    ? ensureIfaceCmpThunk(elemTRResolved->declaration,
+                                           ifaceCompareMs)
                     : nullptr;
             // Choose comparator: class IComparable → bz$classcmp$<M.Name>,
             // interface IComparable → bz$ifacecmp$<M.Name>,
@@ -8836,15 +8938,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // `Guid` is NOT here (a 128-bit struct — it gets its own
             // comparator, the #8237 arm below).
             llvm::Function* temporalCmpFn = nullptr;
-            if (elemTR && elemTR->kind == sema::TypeRef::Kind::Named &&
-                !elemTR->nullable) {
-                const sema::TypeRef* er7766 = resolveTypeParamRef(elemTR);
+            if (elemTRResolved &&
+                elemTRResolved->kind == sema::TypeRef::Kind::Named &&
+                !elemTRResolved->nullable) {
+                const sema::TypeRef* er7766 = elemTRResolved;
                 std::string_view h7766 =
                     (er7766 && !er7766->nullable) ? builtinTypeName(er7766)
                                                   : std::string_view{};
                 if (h7766 == "DateTime" || h7766 == "TimeSpan" ||
                     h7766 == "DateOnly" || h7766 == "TimeOnly")
-                    temporalCmpFn = buildSortedKeyComparator(elemTR);
+                    temporalCmpFn = buildSortedKeyComparator(elemTRResolved);
             }
             // fix #8237 (stdlib §2.6 / §4.4 / §2.8, spec §14.2, v0.355): a
             // `Guid` element is stored INLINE as a 16-byte `{i64,i64}` STRUCT
@@ -8920,7 +9023,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // ⚠ #3488's own commit body called this "the only such builder";
                 // that was wrong — `Sorted()` below carried a third, verbatim
                 // copy until `narrow #3488` deleted it.
-                cmpFn = buildObjectCompareToThunk(elemTR);
+                cmpFn = buildObjectCompareToThunk(elemTRResolved);
                 // Unreachable: `classCompareMs` came from the same
                 // findMethodByName probe the helper's class arm runs, so it
                 // builds. Guarded because a null here would be handed to
@@ -9167,12 +9270,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // the strcmp path and are sorted by pointer value.  per §14.2.
             const sema::TypeRef* elemTR2 = (recvTy && !recvTy->genericArgs.empty())
                 ? recvTy->genericArgs[0] : nullptr;
+            // fix #8240 / #8262 (stdlib §4.4 / §2.8 / §5.1, spec §14.2 /
+            // §14.1, v0.355): the SAME resolution the `Sort()` arm above
+            // reads — the element through the ACTIVE MONOMORPHIZATION, so a
+            // TYPE-PARAMETER element is ordered by its own `CompareTo` at this
+            // instantiation (the member's for a class, the §13 itable's for
+            // an interface) and never by the STRING comparator's address order.
+            const sema::TypeRef* elemTR2Resolved = resolveTypeParamRef(elemTR2);
             sema::MethodSymbol* classCompareMs2 = nullptr;
-            if (elemTR2 && elemTR2->kind == sema::TypeRef::Kind::Named &&
-                elemTR2->declaration &&
-                elemTR2->declaration->kind == ast::TypeDeclKind::Class) {
+            if (elemTR2Resolved &&
+                elemTR2Resolved->kind == sema::TypeRef::Kind::Named &&
+                elemTR2Resolved->declaration &&
+                elemTR2Resolved->declaration->kind == ast::TypeDeclKind::Class) {
                 sema::MethodSymbol* cm =
-                    findMethodByName(elemTR2->declaration, "CompareTo");
+                    findMethodByName(elemTR2Resolved->declaration, "CompareTo");
                 if (cm && cm->params.size() == 1) classCompareMs2 = cm;
             }
             // fix #2768: interface element — see the Sort() site above. The
@@ -9181,10 +9292,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // that gate accept or reject in lockstep.
             sema::MethodSymbol* ifaceCompareMs2 =
                 classCompareMs2 ? nullptr
-                                : selfComparableIfaceCompareTo(elemTR2);
+                                : selfComparableIfaceCompareTo(elemTR2Resolved);
             llvm::Function* ifaceCmpFn2 =
                 ifaceCompareMs2
-                    ? ensureIfaceCmpThunk(elemTR2->declaration, ifaceCompareMs2)
+                    ? ensureIfaceCmpThunk(elemTR2Resolved->declaration,
+                                           ifaceCompareMs2)
                     : nullptr;
             // fix #7766 (stdlib §2.5 / §4.4 / §2.8, spec §14.2, v0.355): a
             // BUILT-IN VALUE RECORD element (`DateTime`, `TimeSpan`,
@@ -9199,15 +9311,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // `Guid` is NOT here (a 128-bit struct — it gets its own
             // comparator, the #8237 arm below).
             llvm::Function* temporalCmpFn2 = nullptr;
-            if (elemTR2 && elemTR2->kind == sema::TypeRef::Kind::Named &&
-                !elemTR2->nullable) {
-                const sema::TypeRef* er7766 = resolveTypeParamRef(elemTR2);
+            if (elemTR2Resolved &&
+                elemTR2Resolved->kind == sema::TypeRef::Kind::Named &&
+                !elemTR2Resolved->nullable) {
+                const sema::TypeRef* er7766 = elemTR2Resolved;
                 std::string_view h7766 =
                     (er7766 && !er7766->nullable) ? builtinTypeName(er7766)
                                                   : std::string_view{};
                 if (h7766 == "DateTime" || h7766 == "TimeSpan" ||
                     h7766 == "DateOnly" || h7766 == "TimeOnly")
-                    temporalCmpFn2 = buildSortedKeyComparator(elemTR2);
+                    temporalCmpFn2 = buildSortedKeyComparator(elemTR2Resolved);
             }
             // fix #8237 (stdlib §2.6 / §4.4 / §2.8, spec §14.2, v0.355): the
             // `Sorted()` twin of the `Sort()` arm's #8237 block above — the
@@ -9264,7 +9377,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // Deleted rather than aligned, per the standing rule that a
                 // second spelling of an existing decision is this codebase's
                 // dominant defect generator.
-                cmpFn2 = buildObjectCompareToThunk(elemTR2);
+                cmpFn2 = buildObjectCompareToThunk(elemTR2Resolved);
                 // Unreachable, exactly as at the Sort() site: `classCompareMs2`
                 // came from the same `findMethodByName` probe the helper's class
                 // arm runs, and that helper demands `methodFns_.count(ms)` — so
@@ -17442,6 +17555,30 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         auto comparableCompareTo =
             [&](const ast::Expr* e) -> sema::MethodSymbol* {
             const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+            // fix #8312 (stdlib §2.2 / §2.8, spec §14.2 *Interface
+            // conformance* rule 6 / §14.1, v0.355): the argument may be a
+            // TYPE PARAMETER. Inside a generic body
+            // (`F<T>(a: T, b: T): T where T: IComparable<T> => Math.Max(a, b)`)
+            // the argument's STATIC type is the body's own parameter, and
+            // every probe below reads a DECLARATION — which a type parameter
+            // has none of. So no comparator was found, the comparison fell to
+            // the float fallback, and the #2786 guard refused the call:
+            // "`Math.Max` could not lower a comparison for this argument type
+            // (stdlib §2.2 requires `where T: IComparable<T>`): it is not a
+            // numeric primitive this intrinsic handles, not `string`, and
+            // exposes no `CompareTo` reachable from here. (#2786)".
+            //
+            // The argument is therefore read through the ACTIVE
+            // MONOMORPHIZATION (`resolveTypeParamRef`, the #567 mechanism), so
+            // at THIS instantiation the ordering is the CONCRETE type's own:
+            // the member's `CompareTo` for a class, the §13 itable's for an
+            // interface, the §9.6 ordinal relation for a `string` (see
+            // `isStringArg` below), the numeric one for a primitive.
+            //
+            // §2.2's constraint IS the body's own (`where T: IComparable<T>`),
+            // so the ordering the constraint GUARANTEES is exactly the one the
+            // comparison must use (spec §14.2 *Interface conformance* rule 6).
+            if (t) t = resolveTypeParamRef(t);
             // #1215 / §14.2: nullable types do not satisfy IComparable<T> —
             // sema already rejects them; guard here defensively so a nullable
             // pointer is never passed as a CompareTo receiver (null deref).
@@ -17511,6 +17648,12 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // (verified by measuring the narrowed shape end-to-end, not assumed).
         auto isStringArg = [&](const ast::Expr* e) -> bool {
             const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+            // fix #8312 (stdlib §2.2 / §9.6, spec §14.2 / §14.1, v0.355):
+            // the SAME resolution `comparableCompareTo` above reads — a
+            // TYPE-PARAMETER argument is read at its CONCRETE instantiation,
+            // so `T = string` takes the §9.6 ordinal relation instead of the
+            // float fallback (which the #2786 guard then refused).
+            if (t) t = resolveTypeParamRef(t);
             return t && t->kind == sema::TypeRef::Kind::Primitive &&
                    t->primitive == sema::PrimitiveType::String;
         };
