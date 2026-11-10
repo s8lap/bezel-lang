@@ -1,0 +1,131 @@
+{
+ "guide2_words_total": 4220,
+ "guide2_sections": {
+  "1. Non-nullable by default (familiar)": 557,
+  "2. Expected failure: absence \u2014 `T?`, the `*OrNull` tier, and the `Try`": 737,
+  "3. Expected failure: outcomes with information \u2014 `Result<T, E>` and do": 699,
+  "4. Exceptions: the familiar shape": 327,
+  "5. How Bezel does it: a caught exception is a *borrow*, not yours to k": 545,
+  "6. How Bezel does it: exceptions and cleanup \u2014 there is no leak, autom": 493,
+  "7. Choosing the right tool": 592
+ },
+ "guide2_choosing_table_rows": 10,
+ "stdlib_s1_try_and_failure_rule_words": 1540,
+ "codegen_s5_1_words": 448,
+ "rationale_s11_4_words": 432,
+ "spec_s31_words": 5740,
+ "mentions_spec": {
+  "TryX_names": 70,
+  "OrNull_names": 33,
+  "Result<": 18,
+  "Exception_type_names": 333,
+  "failure-signal rule": 1
+ },
+ "mentions_stdlib": {
+  "TryX_names": 236,
+  "OrNull_names": 101,
+  "Result<": 18,
+  "Exception_type_names": 288,
+  "failure-signal rule": 10
+ },
+ "mentions_rationale": {
+  "TryX_names": 20,
+  "OrNull_names": 7,
+  "Result<": 14,
+  "Exception_type_names": 62,
+  "failure-signal rule": 2
+ },
+ "mentions_codegen": {
+  "TryX_names": 119,
+  "OrNull_names": 66,
+  "Result<": 12,
+  "Exception_type_names": 128,
+  "failure-signal rule": 0
+ },
+ "mentions_guide2": {
+  "TryX_names": 7,
+  "OrNull_names": 12,
+  "Result<": 11,
+  "Exception_type_names": 23,
+  "failure-signal rule": 3
+ },
+ "declined_index_rows_total": 1096,
+ "declined_rows_subject_names_Try_or_OrNull": 11,
+ "declined_rows_subject_names_Exception": 41,
+ "declined_rows_subject_names_Result": 7,
+ "changelog_revisions": 353,
+ "changelog_revisions_touching_Try_shape_or_OrNull": 71,
+ "changelog_revisions_touching_exception_text": 113,
+ "proposals_total": 203,
+ "proposals_with_10_or_more_tier_mentions": 17,
+ "proposals_with_10_or_more_tier_mentions_list": [
+  [
+   "0009-base64-hex.md",
+   15
+  ],
+  [
+   "0012-datetimeoffset-timezoneinfo.md",
+   12
+  ],
+  [
+   "0019-json-dom.md",
+   17
+  ],
+  [
+   "0026-linq-additions.md",
+   13
+  ],
+  [
+   "0070-uri.md",
+   16
+  ],
+  [
+   "0071-file-metadata.md",
+   18
+  ],
+  [
+   "0072-nullable-return-convenience-tier.md",
+   92
+  ],
+  [
+   "0076-error-model-study.md",
+   20
+  ],
+  [
+   "0078-checked-enum-conversions.md",
+   23
+  ],
+  [
+   "0091-owned-overload-lift.md",
+   23
+  ],
+  [
+   "0098-stdlib-surface-program.md",
+   46
+  ],
+  [
+   "0109-bit-reader-writer.md",
+   16
+  ],
+  [
+   "0119-stdlib-symmetry-batch.md",
+   15
+  ],
+  [
+   "0123-stdlib-regularization-batch-2026-09.md",
+   17
+  ],
+  [
+   "0124-enum-name-parse.md",
+   57
+  ],
+  [
+   "0130-owning-slot-map.md",
+   27
+  ],
+  [
+   "0140-formation-bar-out-parameters.md",
+   20
+  ]
+ ]
+}

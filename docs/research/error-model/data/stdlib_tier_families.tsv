@@ -1,0 +1,90 @@
+type	stem	base_form	try_form	ornull_form
+BitReader	ReadBitLsbFirst	ReadBitLsbFirst	TryReadBitLsbFirst	
+BitReader	ReadBitMsbFirst	ReadBitMsbFirst	TryReadBitMsbFirst	
+BitReader	ReadBitsBigEndianMsbFirst	ReadBitsBigEndianMsbFirst	TryReadBitsBigEndianMsbFirst	
+BitReader	ReadBitsLittleEndianLsbFirst	ReadBitsLittleEndianLsbFirst	TryReadBitsLittleEndianLsbFirst	
+BitWriter	WriteBitLsbFirst	WriteBitLsbFirst	TryWriteBitLsbFirst	
+BitWriter	WriteBitMsbFirst	WriteBitMsbFirst	TryWriteBitMsbFirst	
+BitWriter	WriteBitsBigEndianMsbFirst	WriteBitsBigEndianMsbFirst	TryWriteBitsBigEndianMsbFirst	
+BitWriter	WriteBitsLittleEndianLsbFirst	WriteBitsLittleEndianLsbFirst	TryWriteBitsLittleEndianLsbFirst	
+Boolean	Parse	Parse	TryParse	ParseOrNull
+Channel<T>	Receive	Receive	TryReceive	
+Char	Parse	Parse	TryParse	ParseOrNull
+Console	ReadKey	ReadKey		ReadKeyOrNull
+Convert	ToBoolean	ToBoolean	TryToBoolean	
+Convert	ToDecimal	ToDecimal	TryToDecimal	
+Convert	ToDouble	ToDouble	TryToDouble	
+Convert	ToInt32	ToInt32	TryToInt32	
+Convert	ToInt64	ToInt64	TryToInt64	
+DateOnly	Parse	Parse	TryParse	ParseOrNull
+DateTime	Parse	Parse	TryParse	ParseOrNull
+Decimal	Parse	Parse	TryParse	ParseOrNull
+Dictionary<K, V>	Add	Add	TryAdd	
+Double	Parse	Parse	TryParse	ParseOrNull
+Float	Parse	Parse	TryParse	ParseOrNull
+Guid	Parse	Parse	TryParse	ParseOrNull
+IEnumerable<T>	ElementAt	ElementAt		ElementAtOrNull
+IEnumerable<T>	First	First		FirstOrNull
+IEnumerable<T>	Last	Last		LastOrNull
+IEnumerable<T>	Max	Max		MaxOrNull
+IEnumerable<T>	Min	Min		MinOrNull
+IEnumerable<T>	Single	Single		SingleOrNull
+IParsable<T>	Parse	Parse	TryParse	
+Int32	Parse	Parse	TryParse	ParseOrNull
+Locked<T>	Lock	Lock	TryLock	
+Locked<T>	LockAsync	LockAsync	TryLockAsync	
+Mutex	Acquire	Acquire	TryAcquire	
+Mutex	AcquireAsync	AcquireAsync	TryAcquireAsync	
+OwningArray<T>	PopFirst	PopFirst	TryPopFirst	
+OwningArray<T>	PopLast	PopLast	TryPopLast	
+OwningDictionary<K, V>	Add	Add	TryAdd	
+OwningDictionary<K, V>	PopValue	PopValue	TryPopValue	
+OwningLinkedList<T>	PopFirst	PopFirst	TryPopFirst	
+OwningLinkedList<T>	PopLast	PopLast	TryPopLast	
+OwningQueue<T>	Dequeue	Dequeue	TryDequeue	
+OwningQueue<T>	Peek	Peek	TryPeek	
+OwningSet<T>	Pop	Pop	TryPop	
+OwningSlotMap<T>	Get	Get		GetOrNull
+OwningSlotMap<T>	PopValue	PopValue	TryPopValue	
+OwningStack<T>	Peek	Peek	TryPeek	
+OwningStack<T>	Pop	Pop	TryPop	
+OwningTaskCompletionSource<T>	SetCancelled	SetCancelled	TrySetCancelled	
+OwningTaskCompletionSource<T>	SetException	SetException	TrySetException	
+OwningTaskCompletionSource<T>	SetResult	SetResult	TrySetResult	
+Queue<T>	Dequeue	Dequeue	TryDequeue	
+Queue<T>	Peek	Peek	TryPeek	
+ReadOnlySpan<byte>	ReadDoubleBigEndian	ReadDoubleBigEndian	TryReadDoubleBigEndian	
+ReadOnlySpan<byte>	ReadDoubleLittleEndian	ReadDoubleLittleEndian	TryReadDoubleLittleEndian	
+ReadOnlySpan<byte>	ReadFloatBigEndian	ReadFloatBigEndian	TryReadFloatBigEndian	
+ReadOnlySpan<byte>	ReadFloatLittleEndian	ReadFloatLittleEndian	TryReadFloatLittleEndian	
+ReadOnlySpan<byte>	ReadInt16BigEndian	ReadInt16BigEndian	TryReadInt16BigEndian	
+ReadOnlySpan<byte>	ReadInt16LittleEndian	ReadInt16LittleEndian	TryReadInt16LittleEndian	
+ReadOnlySpan<byte>	ReadInt32BigEndian	ReadInt32BigEndian	TryReadInt32BigEndian	
+ReadOnlySpan<byte>	ReadInt32LittleEndian	ReadInt32LittleEndian	TryReadInt32LittleEndian	
+ReadOnlySpan<byte>	ReadInt64BigEndian	ReadInt64BigEndian	TryReadInt64BigEndian	
+ReadOnlySpan<byte>	ReadInt64LittleEndian	ReadInt64LittleEndian	TryReadInt64LittleEndian	
+ReadOnlySpan<byte>	ReadUInt16BigEndian	ReadUInt16BigEndian	TryReadUInt16BigEndian	
+ReadOnlySpan<byte>	ReadUInt16LittleEndian	ReadUInt16LittleEndian	TryReadUInt16LittleEndian	
+ReadOnlySpan<byte>	ReadUInt32BigEndian	ReadUInt32BigEndian	TryReadUInt32BigEndian	
+ReadOnlySpan<byte>	ReadUInt32LittleEndian	ReadUInt32LittleEndian	TryReadUInt32LittleEndian	
+ReadOnlySpan<byte>	ReadUInt64BigEndian	ReadUInt64BigEndian	TryReadUInt64BigEndian	
+ReadOnlySpan<byte>	ReadUInt64LittleEndian	ReadUInt64LittleEndian	TryReadUInt64LittleEndian	
+RwLocked<T>	Read	Read	TryRead	
+RwLocked<T>	ReadAsync	ReadAsync	TryReadAsync	
+RwLocked<T>	Write	Write	TryWrite	
+RwLocked<T>	WriteAsync	WriteAsync	TryWriteAsync	
+Semaphore	Acquire	Acquire	TryAcquire	
+Semaphore	AcquireAsync	AcquireAsync	TryAcquireAsync	
+SortedDictionary<K, V>	Add	Add	TryAdd	
+SortedSet<T>	Add	Add	TryAdd	
+Span<byte>	WriteInt16BigEndian	WriteInt16BigEndian	TryWriteInt16BigEndian	
+Span<byte>	WriteInt16LittleEndian	WriteInt16LittleEndian	TryWriteInt16LittleEndian	
+Stack<T>	Peek	Peek	TryPeek	
+Stack<T>	Pop	Pop	TryPop	
+TaskCompletionSource	SetCancelled	SetCancelled	TrySetCancelled	
+TaskCompletionSource	SetException	SetException	TrySetException	
+TaskCompletionSource	SetResult	SetResult	TrySetResult	
+TaskCompletionSource<T>	SetCancelled	SetCancelled	TrySetCancelled	
+TaskCompletionSource<T>	SetException	SetException	TrySetException	
+TaskCompletionSource<T>	SetResult	SetResult	TrySetResult	
+TimeOnly	Parse	Parse	TryParse	ParseOrNull

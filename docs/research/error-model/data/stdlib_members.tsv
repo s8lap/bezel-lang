@@ -1,0 +1,1343 @@
+line	section	type	kind	name	tier	documented_throwing	exceptions	ret
+100	2.1	Console	method	Write	plain	0		
+101	2.1	Console	method	Write	plain	0		
+102	2.1	Console	method	WriteLine	plain	0		
+103	2.1	Console	method	WriteLine	plain	0		
+104	2.1	Console	method	WriteLine	plain	0		
+110	2.1	Console	method	ReadLine	nullable	0		string?
+111	2.1	Console	method	ReadKey	plain	1	EndOfStreamException	char
+112	2.1	Console	method	ReadKeyOrNull	ornull	0		char?
+115	2.1	Console	property	In	plain	0		TextReader
+116	2.1	Console	property	Out	plain	0		TextWriter
+117	2.1	Console	property	Error	plain	0		TextWriter
+138	2.2	Math	method	Abs	plain	0		int
+139	2.2	Math	method	Abs	plain	0		long
+140	2.2	Math	method	Abs	plain	0		double
+141	2.2	Math	method	Abs	plain	0		decimal
+143	2.2	Math	method	Min	plain	0		T
+144	2.2	Math	method	Max	plain	0		T
+145	2.2	Math	method	Clamp	plain	1	ArgumentException	T
+148	2.2	Math	method	Sqrt	plain	0		double
+149	2.2	Math	method	Pow	plain	0		double
+150	2.2	Math	method	DivRem	plain	0		int
+151	2.2	Math	method	DivRem	plain	1	DivideByZeroException	long
+157	2.2	Math	method	Floor	plain	0		double
+158	2.2	Math	method	Ceiling	plain	0		double
+159	2.2	Math	method	Round	plain	0		double
+160	2.2	Math	method	Truncate	plain	0		double
+162	2.2	Math	method	Floor	plain	0		decimal
+163	2.2	Math	method	Ceiling	plain	0		decimal
+164	2.2	Math	method	Truncate	plain	1		decimal
+169	2.2	Math	method	Sign	plain	0		int
+175	2.2	Math	method	Fmod	plain	0		double
+176	2.2	Math	method	IEEERemainder	plain	0		double
+197	2.3	Convert	method	ToInt32	plain	0		int
+198	2.3	Convert	method	ToInt64	plain	0		long
+199	2.3	Convert	method	ToDouble	plain	0		double
+200	2.3	Convert	method	ToDecimal	plain	0		decimal
+201	2.3	Convert	method	ToBoolean	plain	0		bool
+203	2.3	Convert	method	TryToInt32	try	0		bool
+204	2.3	Convert	method	TryToInt64	try	0		bool
+205	2.3	Convert	method	TryToDouble	try	0		bool
+206	2.3	Convert	method	TryToDecimal	try	0		bool
+207	2.3	Convert	method	TryToBoolean	try	0		bool
+209	2.3	Convert	method	ToString	plain	0		string
+210	2.3	Convert	method	ToString	plain	0		string
+211	2.3	Convert	method	ToString	plain	0		string
+212	2.3	Convert	method	ToString	plain	0		string
+213	2.3	Convert	method	ToString	plain	0		string
+214	2.3	Convert	method	ToString	plain	0		string
+215	2.3	Convert	method	ToString	plain	1	ArgumentException	string
+216	2.3	Convert	method	ToString	plain	0		string
+233	2.4	Environment	property	NewLine	plain	0		string
+234	2.4	Environment	property	MachineName	plain	0		string
+235	2.4	Environment	property	UserName	plain	0		string
+236	2.4	Environment	property	OSVersion	plain	0		string
+237	2.4	Environment	property	ProcessorCount	plain	0		int
+238	2.4	Environment	property	CommandLineArgs	plain	0		IReadOnlyList<string>
+240	2.4	Environment	method	Get	nullable	0		string?
+241	2.4	Environment	method	GetInt	nullable	0		int?
+242	2.4	Environment	method	GetBool	nullable	0		bool?
+247	2.4	Environment	method	Set	plain	1	ArgumentException	
+250	2.4	Environment	method	Variables	plain	0		owned Dictionary<string, string>
+252	2.4	Environment	method	Exit	plain	0		
+271	2.5	DateTime	constructor	constructor	plain	0		
+272	2.5	DateTime	constructor	constructor	plain	0		
+275	2.5	DateTime	method	CompareTo	plain	0		int
+276	2.5	DateTime	property	Ticks	plain	0		long
+277	2.5	DateTime	method	FromTicks	plain	0		DateTime
+278	2.5	DateTime	method	ToUnixTimeSeconds	plain	0		long
+279	2.5	DateTime	method	FromUnixTimeSeconds	plain	0		DateTime
+280	2.5	DateTime	property	Year	plain	0		int
+281	2.5	DateTime	property	Month	plain	0		int
+282	2.5	DateTime	property	Day	plain	0		int
+283	2.5	DateTime	property	Hour	plain	0		int
+284	2.5	DateTime	property	Minute	plain	0		int
+285	2.5	DateTime	property	Second	plain	0		int
+286	2.5	DateTime	property	Millisecond	plain	0		int
+287	2.5	DateTime	property	DayOfWeek	plain	0		DayOfWeek
+288	2.5	DateTime	property	DayOfYear	plain	0		int
+289	2.5	DateTime	property	Kind	plain	0		DateTimeKind
+290	2.5	DateTime	property	Date	plain	0		DateOnly
+291	2.5	DateTime	property	TimeOfDay	plain	0		TimeOnly
+296	2.5	DateTime	property	Now	plain	0		DateTime
+297	2.5	DateTime	property	UtcNow	plain	0		DateTime
+298	2.5	DateTime	property	Today	plain	0		DateTime
+299	2.5	DateTime	property	MinValue	plain	0		DateTime
+300	2.5	DateTime	property	MaxValue	plain	0		DateTime
+302	2.5	DateTime	method	AddYears	plain	0		DateTime
+303	2.5	DateTime	method	AddMonths	plain	0		DateTime
+304	2.5	DateTime	method	AddDays	plain	0		DateTime
+305	2.5	DateTime	method	AddHours	plain	0		DateTime
+306	2.5	DateTime	method	AddMinutes	plain	0		DateTime
+307	2.5	DateTime	method	AddSeconds	plain	0		DateTime
+308	2.5	DateTime	method	AddMilliseconds	plain	0		DateTime
+309	2.5	DateTime	method	Add	plain	0		DateTime
+311	2.5	DateTime	method	Subtract	plain	0		TimeSpan
+312	2.5	DateTime	method	Subtract	plain	0		DateTime
+314	2.5	DateTime	method	ToUtc	plain	0		DateTime
+315	2.5	DateTime	method	ToLocal	plain	0		DateTime
+316	2.5	DateTime	method	ToString	plain	0		string
+317	2.5	DateTime	method	ToString	plain	0		string
+319	2.5	DateTime	method	Parse	plain	0		DateTime
+320	2.5	DateTime	method	TryParse	try	0		bool
+321	2.5	DateTime	method	ParseOrNull	ornull	1		DateTime?
+325	2.5	DateTime	method	operator	plain	0		TimeSpan
+326	2.5	DateTime	method	operator	plain	0		DateTime
+327	2.5	DateTime	method	operator	plain	0		DateTime
+328	2.5	DateTime	method	operator	plain	0		DateTime
+346	2.5	TimeSpan	method	CompareTo	plain	0		int
+347	2.5	TimeSpan	property	Ticks	plain	0		long
+348	2.5	TimeSpan	method	FromTicks	plain	0		TimeSpan
+349	2.5	TimeSpan	property	Days	plain	0		int
+350	2.5	TimeSpan	property	Hours	plain	0		int
+351	2.5	TimeSpan	property	Minutes	plain	0		int
+352	2.5	TimeSpan	property	Seconds	plain	0		int
+353	2.5	TimeSpan	property	Milliseconds	plain	0		int
+354	2.5	TimeSpan	property	TotalDays	plain	0		double
+355	2.5	TimeSpan	property	TotalHours	plain	0		double
+356	2.5	TimeSpan	property	TotalMinutes	plain	0		double
+357	2.5	TimeSpan	property	TotalSeconds	plain	0		double
+358	2.5	TimeSpan	property	TotalMilliseconds	plain	0		double
+360	2.5	TimeSpan	method	FromDays	plain	0		TimeSpan
+361	2.5	TimeSpan	method	FromHours	plain	0		TimeSpan
+362	2.5	TimeSpan	method	FromMinutes	plain	0		TimeSpan
+363	2.5	TimeSpan	method	FromSeconds	plain	0		TimeSpan
+364	2.5	TimeSpan	method	FromMilliseconds	plain	0		TimeSpan
+366	2.5	TimeSpan	property	Zero	plain	0		TimeSpan
+367	2.5	TimeSpan	property	MinValue	plain	0		TimeSpan
+368	2.5	TimeSpan	property	MaxValue	plain	0		TimeSpan
+370	2.5	TimeSpan	method	ToString	plain	0		string
+371	2.5	TimeSpan	method	ToString	plain	0		string
+373	2.5	TimeSpan	method	operator	plain	0		TimeSpan
+374	2.5	TimeSpan	method	operator	plain	0		TimeSpan
+375	2.5	TimeSpan	method	operator	plain	1	OverflowException	TimeSpan
+383	2.5	TimeSpan	method	operator	plain	1	DivideByZeroException,OverflowException	TimeSpan
+387	2.5	TimeSpan	method	operator	plain	1	OverflowException	TimeSpan
+396	2.5	DateOnly	constructor	constructor	plain	1	ArgumentOutOfRangeException	
+397	2.5	DateOnly	property	Year	plain	0		int
+398	2.5	DateOnly	property	Month	plain	0		int
+399	2.5	DateOnly	property	Day	plain	0		int
+400	2.5	DateOnly	method	CompareTo	plain	0		int
+401	2.5	DateOnly	method	ToDateTime	plain	0		DateTime
+402	2.5	DateOnly	method	Parse	plain	1	FormatException	DateOnly
+403	2.5	DateOnly	method	TryParse	try	0		bool
+404	2.5	DateOnly	method	ParseOrNull	ornull	1		DateOnly?
+406	2.5	DateOnly	method	ToString	plain	0		string
+407	2.5	DateOnly	method	ToString	plain	0		string
+411	2.5	TimeOnly	constructor	constructor	plain	1	ArgumentOutOfRangeException	
+413	2.5	TimeOnly	property	Hour	plain	0		int
+414	2.5	TimeOnly	property	Minute	plain	0		int
+415	2.5	TimeOnly	property	Second	plain	0		int
+416	2.5	TimeOnly	property	Millisecond	plain	0		int
+417	2.5	TimeOnly	method	CompareTo	plain	0		int
+418	2.5	TimeOnly	method	Parse	plain	0		TimeOnly
+419	2.5	TimeOnly	method	TryParse	try	0		bool
+420	2.5	TimeOnly	method	ParseOrNull	ornull	1		TimeOnly?
+422	2.5	TimeOnly	method	ToString	plain	0		string
+423	2.5	TimeOnly	method	ToString	plain	0		string
+439	2.5	ArgumentOutOfRangeException	constructor	constructor	plain	0		
+440	2.5	ArgumentOutOfRangeException	constructor	constructor	plain	0		
+458	2.6	Guid	method	CompareTo	plain	0		int
+459	2.6	Guid	method	FromByteArray	plain	1	ArgumentException	Guid
+460	2.6	Guid	property	Empty	plain	0		Guid
+462	2.6	Guid	method	NewGuid	plain	0		Guid
+472	2.6	Guid	method	Parse	plain	1	FormatException	Guid
+473	2.6	Guid	method	TryParse	try	0		bool
+474	2.6	Guid	method	ParseOrNull	ornull	1		Guid?
+477	2.6	Guid	method	ToString	plain	0		string
+478	2.6	Guid	method	ToString	plain	1	FormatException	string
+479	2.6	Guid	method	ToByteArray	plain	0		owned Array<byte>
+494	2.7	Random	constructor	constructor	plain	0		
+495	2.7	Random	constructor	constructor	plain	0		
+497	2.7	Random	method	Next	plain	0		int
+498	2.7	Random	method	Next	plain	1	ArgumentOutOfRangeException	int
+499	2.7	Random	method	Next	plain	1	ArgumentOutOfRangeException	int
+500	2.7	Random	method	NextInt64	plain	0		long
+501	2.7	Random	method	NextDouble	plain	0		double
+502	2.7	Random	method	NextBytes	plain	0		
+503	2.7	Random	method	NextBoolean	plain	0		bool
+518	2.8	IComparable<T>	method	CompareTo	plain	0		int
+531	2.9	IEquatable<T>	method	Equals	plain	0		bool
+542	2.10	IDisposable	method	Dispose	plain	0		
+546	2.10	IAsyncDisposable	method	DisposeAsync	plain	0		Task
+586	2.12	BitConverter	method	FloatToInt32Bits	plain	0		int
+587	2.12	BitConverter	method	Int32BitsToFloat	plain	0		float
+590	2.12	BitConverter	method	DoubleToInt64Bits	plain	0		long
+591	2.12	BitConverter	method	Int64BitsToDouble	plain	0		double
+596	2.12	BitConverter	method	Reinterpret	plain	0		TTo
+624	2.13	Type	property	Name	plain	0		string
+625	2.13	Type	property	FullName	plain	0		string
+629	2.13	Type	property	IsClass	plain	0		bool
+630	2.13	Type	property	IsInterface	plain	0		bool
+631	2.13	Type	property	IsRecord	plain	0		bool
+632	2.13	Type	property	IsEnum	plain	0		bool
+633	2.13	Type	property	IsChoice	plain	0		bool
+635	2.13	Type	property	IsPrimitive	plain	0		bool
+636	2.13	Type	property	IsInlineArray	plain	0		bool
+637	2.13	Type	property	IsFunctionType	plain	0		bool
+638	2.13	Type	property	IsValueType	plain	0		bool
+643	2.13	Type	property	BaseType	nullable	0		Type?
+646	2.13	Type	method	IsAssignableFrom	plain	1	InvalidOperationException	bool
+652	2.13	Type	property	EnumNames	plain	0		IReadOnlyList<string>
+654	2.13	Type	property	EnumValues	plain	0		IReadOnlyList<long>
+683	2.13		method	DescribeEnum	plain	0		
+706	2.14	ISerializer	method	WriteInt	plain	0		
+707	2.14	ISerializer	method	WriteUInt	plain	0		
+708	2.14	ISerializer	method	WriteFloat	plain	0		
+709	2.14	ISerializer	method	WriteDecimal	plain	0		
+710	2.14	ISerializer	method	WriteBool	plain	0		
+711	2.14	ISerializer	method	WriteString	plain	0		
+712	2.14	ISerializer	method	WriteChar	plain	0		
+713	2.14	ISerializer	method	WriteNull	plain	0		
+714	2.14	ISerializer	method	BeginObject	plain	0		
+715	2.14	ISerializer	method	WriteFieldName	plain	0		
+716	2.14	ISerializer	method	EndObject	plain	0		
+717	2.14	ISerializer	method	BeginArray	plain	0		
+718	2.14	ISerializer	method	EndArray	plain	0		
+723	2.14	IDeserializer	method	ReadInt	plain	0		long
+724	2.14	IDeserializer	method	ReadUInt	plain	0		ulong
+725	2.14	IDeserializer	method	ReadFloat	plain	0		double
+726	2.14	IDeserializer	method	ReadDecimal	plain	0		decimal
+727	2.14	IDeserializer	method	ReadBool	plain	0		bool
+728	2.14	IDeserializer	method	ReadString	plain	0		string
+729	2.14	IDeserializer	method	ReadChar	plain	0		char
+730	2.14	IDeserializer	method	TryReadNull	try	0		bool
+731	2.14	IDeserializer	method	BeginObject	plain	0		int
+733	2.14	IDeserializer	method	ReadFieldName	plain	0		string
+734	2.14	IDeserializer	method	SkipValue	plain	1		
+742	2.14	IDeserializer	method	EndObject	plain	0		
+743	2.14	IDeserializer	method	BeginArray	plain	0		int
+744	2.14	IDeserializer	method	HasMoreElements	plain	0		bool
+745	2.14	IDeserializer	method	EndArray	plain	0		
+750	2.14	ISerializable	method	Serialize	plain	0		
+767	2.14	Point	method	Serialize	plain	0		
+781	2.14		method	Deserialize	plain	0		T
+785	2.14		method	Deserialize	plain	0		owned T
+787	2.14		method	Deserialize	plain	0		owned Shared<C>
+797	2.14	Point	method	Serialize	plain	0		
+804	2.14	Point	method	Deserialize	plain	0		Point
+847	2.14	Order	property	Id	plain	0		int
+864	2.14	Invoice	property	Number	plain	0		string
+878	2.14	Circle	property	Radius	plain	0		double
+891	2.14	Node	property	Label	plain	0		string
+908	2.15	JsonSerializer	constructor	constructor	plain	0		
+909	2.15	JsonSerializer	constructor	constructor	plain	0		
+911	2.15	JsonSerializer	method	ToBytes	plain	0		owned OwningBuffer<byte>
+912	2.15	JsonSerializer	method	ToString	plain	0		string
+916	2.15	JsonDeserializer	constructor	constructor	plain	0		
+917	2.15	JsonDeserializer	constructor	constructor	plain	0		
+919	2.15	JsonDeserializer	constructor	constructor	plain	0		
+920	2.15	JsonDeserializer	constructor	constructor	plain	0		
+921	2.15	JsonDeserializer	constructor	constructor	plain	0		
+922	2.15	JsonDeserializer	constructor	constructor	plain	0		
+940	2.15	BinarySerializer	constructor	constructor	plain	0		
+942	2.15	BinarySerializer	method	ToBytes	plain	0		owned OwningBuffer<byte>
+946	2.15	BinaryDeserializer	constructor	constructor	plain	0		
+947	2.15	BinaryDeserializer	constructor	constructor	plain	0		
+983	2.15	Json	method	ToText	plain	0		string
+984	2.15	Json	method	ToText	plain	0		string
+985	2.15	Json	method	ToBytes	plain	0		owned OwningBuffer<byte>
+986	2.15	Json	method	ToBytes	plain	0		owned OwningBuffer<byte>
+992	2.15	Json	method	Parse	plain	0		T
+993	2.15	Json	method	Parse	plain	0		T
+994	2.15	Json	method	Parse	plain	0		T
+995	2.15	Json	method	Parse	plain	0		T
+996	2.15	Json	method	Parse	plain	0		T
+997	2.15	Json	method	Parse	plain	0		T
+1001	2.15	Json	method	ParseOwned	plain	0		owned T
+1002	2.15	Json	method	ParseOwned	plain	0		owned T
+1003	2.15	Json	method	ParseOwned	plain	0		owned T
+1004	2.15	Json	method	ParseOwned	plain	0		owned T
+1005	2.15	Json	method	ParseOwned	plain	0		owned T
+1006	2.15	Json	method	ParseOwned	plain	0		owned T
+1012	2.15	Binary	method	ToBytes	plain	0		owned OwningBuffer<byte>
+1014	2.15	Binary	method	Parse	plain	0		T
+1015	2.15	Binary	method	Parse	plain	0		T
+1017	2.15	Binary	method	ParseOwned	plain	0		owned T
+1018	2.15	Binary	method	ParseOwned	plain	0		owned T
+1030	2.15		method	SavePoint	plain	0		owned OwningBuffer<byte>
+1034	2.15		method	LoadPoint	plain	0		Point
+1041	2.15		method	Reencode	plain	0		
+1059	2.15		method	SavePoint	plain	0		owned OwningBuffer<byte>
+1065	2.15		method	LoadPoint	plain	0		Point
+1077	2.15	SerializationException	property	Offset	nullable	1		long?
+1078	2.15	SerializationException	property	Line	nullable	1		int?
+1079	2.15	SerializationException	property	Column	nullable	1		int?
+1097	2.16	Shared<T>	constructor	constructor	plain	0		
+1099	2.16	Shared<T>	method	Clone	plain	0		owned Shared<T>
+1100	2.16	Shared<T>	method	Get	plain	0		T
+1102	2.16	Shared<T>	method	Downgrade	plain	0		owned Weak<T>
+1108	2.16	Weak<T>	method	TryUpgrade	try	0		owned Shared<T>?
+1140	2.17	TypeInitializationException	property	InnerException	nullable	1	InnerException	Exception?
+1153	2.18	IFormattable	method	ToString	plain	0		string
+1190	2.19	INumber<T>	method	Zero	plain	0		owned T
+1191	2.19	INumber<T>	method	One	plain	0		owned T
+1192	2.19	INumber<T>	operator		plain	0		owned T
+1193	2.19	INumber<T>	operator		plain	0		owned T
+1194	2.19	INumber<T>	operator		plain	0		owned T
+1195	2.19	INumber<T>	operator		plain	1		owned T
+1196	2.19	INumber<T>	operator		plain	0		bool
+1200	2.19	ISteppable<T>	method	Step	plain	0		owned T
+1202	2.19	ISteppable<T>	operator		plain	0		bool
+1206	2.19	IParsable<T>	method	Parse	plain	1	FormatException	owned T
+1207	2.19	IParsable<T>	method	TryParse	try	0		bool
+1222	2.19	ICollectionLiteralTarget<TSelf, T>	method	FromCollectionLiteral	plain	0		owned TSelf
+1228	2.19	IOwningCollectionLiteralTarget<TSelf, T>	method	FromCollectionLiteral	plain	0		owned TSelf
+1242	2.20	Result<T, E>	method	IsOk	plain	0		bool
+1246	2.20	Result<T, E>	method	IsError	plain	0		bool
+1253	2.20	Result<T, E>	method	Map	choice	0		Result<U, E>
+1254	2.20	Result<T, E>	method	MapError	choice	0		Result<T, F>
+1255	2.20	Result<T, E>	method	AndThen	choice	0		Result<U, E>
+1256	2.20	Result<T, E>	method	UnwrapOr	plain	0		T
+1275	2.20		method	ParsePort	choice	0		Result<int, string>
+1302	2.20	ConfigError	method	PortSetting	choice	0		Result<int, ConfigError>
+1308	2.20	ConfigError	method	WellKnownPort	choice	0		Result<int, string>
+1318	2.20		method	Connect	choice	0		Result<Connection, string>
+1346	2.21	ScopeGuard	constructor	constructor	plain	0		
+1347	2.21	ScopeGuard	method	Dismiss	plain	0		
+1348	2.21	ScopeGuard	property	IsDismissed	plain	0		bool
+1365	2.21		method	Register	plain	0		
+1388	3.1	StringBuilder	constructor	constructor	plain	0		
+1389	3.1	StringBuilder	constructor	constructor	plain	0		
+1390	3.1	StringBuilder	constructor	constructor	plain	0		
+1392	3.1	StringBuilder	property	Length	plain	0		int
+1393	3.1	StringBuilder	property	Capacity	plain	0		int
+1395	3.1	StringBuilder	method	Append	plain	0		StringBuilder
+1396	3.1	StringBuilder	method	Append	plain	0		StringBuilder
+1397	3.1	StringBuilder	method	Append	plain	0		StringBuilder
+1400	3.1	StringBuilder	method	Append	plain	0		StringBuilder
+1401	3.1	StringBuilder	method	Append	plain	0		StringBuilder
+1402	3.1	StringBuilder	method	Append	plain	0		StringBuilder
+1405	3.1	StringBuilder	method	AppendLine	plain	0		StringBuilder
+1406	3.1	StringBuilder	method	AppendLine	plain	0		StringBuilder
+1407	3.1	StringBuilder	method	AppendFormat	plain	0		StringBuilder
+1409	3.1	StringBuilder	method	Insert	plain	0		StringBuilder
+1410	3.1	StringBuilder	method	Remove	plain	0		StringBuilder
+1411	3.1	StringBuilder	method	Replace	plain	0		StringBuilder
+1412	3.1	StringBuilder	method	Clear	plain	0		StringBuilder
+1414	3.1	StringBuilder	method	ToString	plain	0		string
+1433	3.2	Encoding	method	GetBytes	plain	0		owned Array<byte>
+1434	3.2	Encoding	method	GetString	plain	0		string
+1435	3.2	Encoding	method	GetString	plain	0		string
+1436	3.2	Encoding	method	GetString	plain	0		string
+1437	3.2	Encoding	method	GetByteCount	plain	0		int
+1438	3.2	Encoding	method	GetBytes	plain	1	IndexOutOfRangeException	int
+1440	3.2	Encoding	method	GetByteCount	plain	0		int
+1441	3.2	Encoding	method	GetBytes	plain	0		
+1443	3.2	Encoding	method	GetBytes	plain	0		owned Array<byte>
+1444	3.2	Encoding	property	Name	plain	0		string
+1446	3.2	Encoding	property	UTF8	plain	0		Encoding
+1447	3.2	Encoding	property	UTF16	plain	0		Encoding
+1448	3.2	Encoding	property	UTF32	plain	0		Encoding
+1449	3.2	Encoding	property	ASCII	plain	0		Encoding
+1474	3.3	ReadOnlyStringSpan	property		plain	0		
+1483	3.3	ReadOnlyStringSpan	property	IsEmpty	plain	0		bool
+1486	3.3	ReadOnlyStringSpan	method	Slice	plain	0		ReadOnlyStringSpan
+1488	3.3	ReadOnlyStringSpan	method	Slice	plain	0		ReadOnlyStringSpan
+1490	3.3	ReadOnlyStringSpan	method	Slice	plain	0		ReadOnlyStringSpan
+1496	3.3	ReadOnlyStringSpan	method	IndexOf	plain	0		int
+1497	3.3	ReadOnlyStringSpan	method	Contains	plain	0		bool
+1500	3.3	ReadOnlyStringSpan	method	IndexOf	plain	0		int
+1501	3.3	ReadOnlyStringSpan	method	IndexOf	plain	0		int
+1502	3.3	ReadOnlyStringSpan	method	Contains	plain	0		bool
+1503	3.3	ReadOnlyStringSpan	method	Contains	plain	0		bool
+1506	3.3	ReadOnlyStringSpan	method	StartsWith	plain	0		bool
+1507	3.3	ReadOnlyStringSpan	method	StartsWith	plain	0		bool
+1508	3.3	ReadOnlyStringSpan	method	EndsWith	plain	0		bool
+1509	3.3	ReadOnlyStringSpan	method	EndsWith	plain	0		bool
+1512	3.3	ReadOnlyStringSpan	method	SequenceEqual	plain	0		bool
+1513	3.3	ReadOnlyStringSpan	method	SequenceEqual	plain	0		bool
+1514	3.3	ReadOnlyStringSpan	method	SequenceEqual	plain	0		bool
+1515	3.3	ReadOnlyStringSpan	method	SequenceEqual	plain	0		bool
+1518	3.3	ReadOnlyStringSpan	method	CopyTo	plain	1	ArgumentException	
+1523	3.3	ReadOnlyStringSpan	method	ToString	plain	0		string
+1585	4.1	IReadOnlyCollection<out T>	property	Count	plain	0		int
+1589	4.1	IReadOnlyList<out T>	property		plain	0		
+1593	4.1	ICollection<T>	property	IsReadOnly	plain	0		bool
+1594	4.1	ICollection<T>	method	Add	plain	0		
+1595	4.1	ICollection<T>	method	Clear	plain	0		
+1596	4.1	ICollection<T>	method	Contains	plain	0		bool
+1597	4.1	ICollection<T>	method	Remove	plain	0		bool
+1601	4.1	IList<T>	property		plain	0		
+1602	4.1	IList<T>	method	Insert	plain	0		
+1620	4.2	IOwningCollection<T>	property	IsReadOnly	plain	0		bool
+1621	4.2	IOwningCollection<T>	method	Add	plain	0		
+1622	4.2	IOwningCollection<T>	method	Clear	plain	0		
+1623	4.2	IOwningCollection<T>	method	Contains	plain	0		bool
+1624	4.2	IOwningCollection<T>	method	Remove	plain	0		bool
+1629	4.2	IOwningList<T>	property		plain	0		
+1633	4.2	IOwningList<T>	method	Insert	plain	0		
+1650	4.3		method	ReportEach	plain	0		
+1677	4.4	Array<T>	method	FromCollectionLiteral	plain	0		owned Array<T>
+1679	4.4	Array<T>	constructor	constructor	plain	0		
+1680	4.4	Array<T>	constructor	constructor	plain	1	ArgumentOutOfRangeException	
+1682	4.4	Array<T>	constructor	constructor	plain	1	ArgumentOutOfRangeException	
+1685	4.4	Array<T>	property	Count	plain	0		int
+1686	4.4	Array<T>	property	Capacity	plain	0		int
+1687	4.4	Array<T>	property		plain	0		
+1689	4.4	Array<T>	method	Add	plain	0		
+1690	4.4	Array<T>	method	AddRange	plain	0		
+1691	4.4	Array<T>	method	Insert	plain	0		
+1692	4.4	Array<T>	method	RemoveAt	plain	0		
+1693	4.4	Array<T>	method	Remove	plain	0		bool
+1694	4.4	Array<T>	method	Clear	plain	0		
+1695	4.4	Array<T>	method	Contains	plain	0		bool
+1696	4.4	Array<T>	method	IndexOf	plain	1	IndexOutOfRangeException	int
+1701	4.4	Array<T>	method	LastIndexOf	plain	0		int
+1704	4.4	Array<T>	method	Sort	plain	0		
+1705	4.4	Array<T>	method	Reverse	plain	0		
+1707	4.4	Array<T>	method	Sorted	plain	0		owned Array<T>
+1708	4.4	Array<T>	method	Reversed	plain	0		owned Array<T>
+1710	4.4	Array<T>	method	ToArray	plain	0		owned Array<T>
+1713	4.4	Array<T>	method	AsSpan	plain	0		ArraySpan<T>
+1714	4.4	Array<T>	method	AsSpan	plain	0		ArraySpan<T>
+1715	4.4	Array<T>	method	AsSpan	plain	0		ArraySpan<T>
+1716	4.4	Array<T>	method	AsSpan	plain	0		ArraySpan<T>
+1718	4.4	Array<T>	method	AsReadOnlySpan	plain	0		ReadOnlyArraySpan<T>
+1719	4.4	Array<T>	method	AsReadOnlySpan	plain	0		ReadOnlyArraySpan<T>
+1720	4.4	Array<T>	method	AsReadOnlySpan	plain	0		ReadOnlyArraySpan<T>
+1721	4.4	Array<T>	method	AsReadOnlySpan	plain	0		ReadOnlyArraySpan<T>
+1725	4.4	Array<T>	method	Slice	plain	0		owned Array<T>
+1729	4.4	Array<T>	method	Sort	plain	0		
+1730	4.4	Array<T>	method	Sorted	plain	0		owned Array<T>
+1764	4.5	OwningArray<T>	method	FromCollectionLiteral	plain	0		owned OwningArray<T>
+1766	4.5	OwningArray<T>	constructor	constructor	plain	0		
+1767	4.5	OwningArray<T>	constructor	constructor	plain	0		
+1769	4.5	OwningArray<T>	property	Count	plain	0		int
+1770	4.5	OwningArray<T>	property	Capacity	plain	0		int
+1772	4.5	OwningArray<T>	property		plain	0		
+1777	4.5	OwningArray<T>	method	Add	plain	0		
+1778	4.5	OwningArray<T>	method	AddRange	plain	0		
+1779	4.5	OwningArray<T>	method	Insert	plain	0		
+1780	4.5	OwningArray<T>	method	RemoveAt	plain	0		
+1781	4.5	OwningArray<T>	method	Remove	plain	0		bool
+1783	4.5	OwningArray<T>	method	Clear	plain	0		
+1785	4.5	OwningArray<T>	method	Contains	plain	0		bool
+1786	4.5	OwningArray<T>	method	IndexOf	plain	0		int
+1788	4.5	OwningArray<T>	method	Sort	plain	0		
+1789	4.5	OwningArray<T>	method	Sort	plain	0		
+1792	4.5	OwningArray<T>	method	Reverse	plain	0		
+1795	4.5	OwningArray<T>	method	PopAt	plain	0		owned T
+1796	4.5	OwningArray<T>	method	PopFirst	plain	1		owned T
+1797	4.5	OwningArray<T>	method	PopLast	plain	1		owned T
+1798	4.5	OwningArray<T>	method	TryPopFirst	try	0		bool
+1799	4.5	OwningArray<T>	method	TryPopLast	try	0		bool
+1800	4.5	OwningArray<T>	method	Drain	plain	0		IOwningEnumerable<T>
+1827	4.5		method	Build	plain	0		owned OwningArray<Connection>
+1847	4.5	OwningArray<T>	constructor	constructor	plain	0		
+1851	4.5	OwningArray<T>	method	FromCollectionLiteral	plain	0		owned OwningArray<T>
+1855	4.5	OwningArray<T>	constructor	constructor	plain	0		
+1862	4.5	OwningArray<T>	property	Count	plain	0		int
+1867	4.5	OwningArray<T>	property	Capacity	plain	0		int
+1874	4.5	OwningArray<T>	property		plain	0		
+1885	4.5	OwningArray<T>	method	Add	plain	0		
+1893	4.5	OwningArray<T>	method	PopAt	plain	0		owned T
+1904	4.5	OwningArray<T>	method	RemoveAt	plain	0		
+1908	4.5	OwningArray<T>	method	Clear	plain	0		
+1921	4.5	OwningArray<T>	method	BoundsCheck	plain	0		
+1927	4.5	OwningArray<T>	method	GrowTo	plain	0		
+1959	4.6	LinkedList<T>	method	FromCollectionLiteral	plain	0		owned LinkedList<T>
+1960	4.6	LinkedList<T>	constructor	constructor	plain	0		
+1961	4.6	LinkedList<T>	constructor	constructor	plain	0		
+1963	4.6	LinkedList<T>	property	Count	plain	0		int
+1964	4.6	LinkedList<T>	property	FirstNode	nullable	0		LinkedListNode<T>?
+1965	4.6	LinkedList<T>	property	LastNode	nullable	0		LinkedListNode<T>?
+1966	4.6	LinkedList<T>	property	First	nullable	0		T?
+1967	4.6	LinkedList<T>	property	Last	nullable	0		T?
+1969	4.6	LinkedList<T>	method	AddFirst	plain	0		LinkedListNode<T>
+1970	4.6	LinkedList<T>	method	AddLast	plain	0		LinkedListNode<T>
+1971	4.6	LinkedList<T>	method	AddBefore	plain	0		LinkedListNode<T>
+1972	4.6	LinkedList<T>	method	AddAfter	plain	0		LinkedListNode<T>
+1973	4.6	LinkedList<T>	method	RemoveFirst	plain	0		
+1974	4.6	LinkedList<T>	method	RemoveLast	plain	0		
+1975	4.6	LinkedList<T>	method	RemoveNode	plain	0		
+1976	4.6	LinkedList<T>	method	Find	nullable	0		LinkedListNode<T>?
+1982	4.6	LinkedListNode<T>	property	Value	plain	0		T
+1983	4.6	LinkedListNode<T>	property	Next	nullable	0		LinkedListNode<T>?
+1984	4.6	LinkedListNode<T>	property	Previous	nullable	0		LinkedListNode<T>?
+2001	4.7	OwningLinkedList<T>	method	FromCollectionLiteral	plain	0		owned OwningLinkedList<T>
+2002	4.7	OwningLinkedList<T>	constructor	constructor	plain	0		
+2004	4.7	OwningLinkedList<T>	property	Count	plain	0		int
+2005	4.7	OwningLinkedList<T>	property	FirstNode	nullable	0		LinkedListNode<T>?
+2006	4.7	OwningLinkedList<T>	property	LastNode	nullable	0		LinkedListNode<T>?
+2007	4.7	OwningLinkedList<T>	property	First	nullable	0		T?
+2008	4.7	OwningLinkedList<T>	property	Last	nullable	0		T?
+2010	4.7	OwningLinkedList<T>	method	AddFirst	plain	0		LinkedListNode<T>
+2011	4.7	OwningLinkedList<T>	method	AddLast	plain	0		LinkedListNode<T>
+2012	4.7	OwningLinkedList<T>	method	AddBefore	plain	0		LinkedListNode<T>
+2013	4.7	OwningLinkedList<T>	method	AddAfter	plain	0		LinkedListNode<T>
+2014	4.7	OwningLinkedList<T>	method	RemoveFirst	plain	0		
+2015	4.7	OwningLinkedList<T>	method	RemoveLast	plain	0		
+2016	4.7	OwningLinkedList<T>	method	RemoveNode	plain	0		
+2017	4.7	OwningLinkedList<T>	method	Clear	plain	0		
+2018	4.7	OwningLinkedList<T>	method	Contains	plain	0		bool
+2019	4.7	OwningLinkedList<T>	method	Find	nullable	0		LinkedListNode<T>?
+2020	4.7	OwningLinkedList<T>	method	Remove	plain	0		bool
+2023	4.7	OwningLinkedList<T>	method	PopFirst	plain	1		owned T
+2024	4.7	OwningLinkedList<T>	method	PopLast	plain	0		owned T
+2025	4.7	OwningLinkedList<T>	method	TryPopFirst	try	0		bool
+2026	4.7	OwningLinkedList<T>	method	TryPopLast	try	0		bool
+2027	4.7	OwningLinkedList<T>	method	Drain	plain	0		IOwningEnumerable<T>
+2049	4.8	Dictionary<K, V>	constructor	constructor	plain	0		
+2050	4.8	Dictionary<K, V>	constructor	constructor	plain	0		
+2051	4.8	Dictionary<K, V>	constructor	constructor	plain	0		
+2053	4.8	Dictionary<K, V>	constructor	constructor	plain	0		
+2055	4.8	Dictionary<K, V>	property	Count	plain	0		int
+2056	4.8	Dictionary<K, V>	property	Keys	plain	0		IReadOnlyCollection<K>
+2057	4.8	Dictionary<K, V>	property	Values	plain	0		IReadOnlyCollection<V>
+2059	4.8	Dictionary<K, V>	property		plain	0		
+2061	4.8	Dictionary<K, V>	method	Add	plain	0		
+2062	4.8	Dictionary<K, V>	method	TryAdd	try	0		bool
+2064	4.8	Dictionary<K, V>	method	ContainsKey	plain	0		bool
+2065	4.8	Dictionary<K, V>	method	Contains	plain	0		bool
+2067	4.8	Dictionary<K, V>	method	Remove	plain	0		bool
+2068	4.8	Dictionary<K, V>	method	TryGetValue	try	0		bool
+2069	4.8	Dictionary<K, V>	method	GetOrNull	ornull	0		V?
+2071	4.8	Dictionary<K, V>	method	GetOrAdd	plain	0		V
+2073	4.8	Dictionary<K, V>	method	Clear	plain	0		
+2080	4.8	IEqualityComparer<T>	method	Equals	plain	0		bool
+2081	4.8	IEqualityComparer<T>	method	GetHashCode	plain	0		int
+2089	4.8	KeyNotFoundException	constructor	constructor	plain	0		
+2090	4.8	KeyNotFoundException	constructor	constructor	plain	0		
+2129	4.9	OwningDictionary<K, V>	constructor	constructor	plain	0		
+2130	4.9	OwningDictionary<K, V>	constructor	constructor	plain	0		
+2131	4.9	OwningDictionary<K, V>	constructor	constructor	plain	0		
+2132	4.9	OwningDictionary<K, V>	constructor	constructor	plain	0		
+2134	4.9	OwningDictionary<K, V>	property	Count	plain	0		int
+2135	4.9	OwningDictionary<K, V>	property	Keys	plain	0		IReadOnlyCollection<K>
+2136	4.9	OwningDictionary<K, V>	property	Values	plain	0		IReadOnlyCollection<V>
+2138	4.9	OwningDictionary<K, V>	property		plain	0		
+2143	4.9	OwningDictionary<K, V>	method	Add	plain	1	ArgumentException	
+2148	4.9	OwningDictionary<K, V>	method	TryAdd	try	0		bool
+2151	4.9	OwningDictionary<K, V>	method	ContainsKey	plain	0		bool
+2152	4.9	OwningDictionary<K, V>	method	Contains	plain	0		bool
+2153	4.9	OwningDictionary<K, V>	method	Remove	plain	0		bool
+2154	4.9	OwningDictionary<K, V>	method	TryGetValue	try	0		bool
+2155	4.9	OwningDictionary<K, V>	method	GetOrNull	ornull	0		V?
+2166	4.9	OwningDictionary<K, V>	method	GetOrAdd	plain	0		V
+2169	4.9	OwningDictionary<K, V>	method	PopValue	plain	1		owned V
+2177	4.9	OwningDictionary<K, V>	method	TryPopValue	try	0		bool
+2178	4.9	OwningDictionary<K, V>	method	Drain	plain	0		IOwningEnumerable<DrainedEntry<K, V>>
+2182	4.9	OwningDictionary<K, V>	method	Clear	plain	0		
+2186	4.9	DrainedEntry<K, V>	constructor	constructor	plain	0		
+2187	4.9	DrainedEntry<K, V>	property	Key	plain	0		K
+2199	4.9		method	DrainAndProcess	plain	0		
+2212	4.9		method	DrainAndProcess2	plain	0		
+2256	4.9	Entry<K, V>	constructor	constructor	plain	0		
+2268	4.9	OwningDictionary<K, V>	method	Add	plain	0		
+2300	4.9	OwningDictionary<K, V>	method	PopValue	plain	0		owned V
+2358	4.10	Set<T>	method	FromCollectionLiteral	plain	0		owned Set<T>
+2360	4.10	Set<T>	constructor	constructor	plain	0		
+2361	4.10	Set<T>	constructor	constructor	plain	0		
+2362	4.10	Set<T>	constructor	constructor	plain	0		
+2363	4.10	Set<T>	constructor	constructor	plain	0		
+2366	4.10	Set<T>	method	TryAdd	try	0		bool
+2368	4.10	Set<T>	method	UnionWith	plain	0		
+2369	4.10	Set<T>	method	IntersectWith	plain	0		
+2370	4.10	Set<T>	method	ExceptWith	plain	0		
+2371	4.10	Set<T>	method	IsSubsetOf	plain	0		bool
+2372	4.10	Set<T>	method	IsSupersetOf	plain	0		bool
+2376	4.10	OwningSet<T>	method	FromCollectionLiteral	plain	0		owned OwningSet<T>
+2377	4.10	OwningSet<T>	constructor	constructor	plain	0		
+2378	4.10	OwningSet<T>	constructor	constructor	plain	0		
+2379	4.10	OwningSet<T>	constructor	constructor	plain	0		
+2380	4.10	OwningSet<T>	constructor	constructor	plain	0		
+2383	4.10	OwningSet<T>	method	TryAdd	try	0		bool
+2387	4.10	OwningSet<T>	method	Pop	plain	0		owned T
+2391	4.10	OwningSet<T>	method	TryPop	try	0		bool
+2392	4.10	OwningSet<T>	method	Drain	plain	0		IOwningEnumerable<T>
+2394	4.10	OwningSet<T>	method	UnionWith	plain	0		
+2396	4.10	OwningSet<T>	method	IntersectWith	plain	0		
+2397	4.10	OwningSet<T>	method	ExceptWith	plain	0		
+2398	4.10	OwningSet<T>	method	IsSubsetOf	plain	0		bool
+2399	4.10	OwningSet<T>	method	IsSupersetOf	plain	0		bool
+2426	4.11	Stack<T>	method	FromCollectionLiteral	plain	0		owned Stack<T>
+2428	4.11	Stack<T>	constructor	constructor	plain	0		
+2429	4.11	Stack<T>	method	Push	plain	0		
+2430	4.11	Stack<T>	method	Contains	plain	0		bool
+2431	4.11	Stack<T>	method	Pop	plain	1		T
+2432	4.11	Stack<T>	method	Peek	plain	0		T
+2433	4.11	Stack<T>	method	TryPop	try	0		bool
+2434	4.11	Stack<T>	method	TryPeek	try	0		bool
+2435	4.11	Stack<T>	method	Clear	plain	0		
+2439	4.11	OwningStack<T>	method	FromCollectionLiteral	plain	0		owned OwningStack<T>
+2440	4.11	OwningStack<T>	constructor	constructor	plain	0		
+2441	4.11	OwningStack<T>	method	Push	plain	0		
+2442	4.11	OwningStack<T>	method	Contains	plain	0		bool
+2443	4.11	OwningStack<T>	method	Pop	plain	1		owned T
+2444	4.11	OwningStack<T>	method	Peek	plain	0		T
+2445	4.11	OwningStack<T>	method	TryPop	try	0		bool
+2446	4.11	OwningStack<T>	method	TryPeek	try	0		bool
+2447	4.11	OwningStack<T>	method	Clear	plain	0		
+2448	4.11	OwningStack<T>	method	Drain	plain	0		IOwningEnumerable<T>
+2452	4.11	Queue<T>	method	FromCollectionLiteral	plain	0		owned Queue<T>
+2454	4.11	Queue<T>	constructor	constructor	plain	0		
+2455	4.11	Queue<T>	method	Enqueue	plain	0		
+2456	4.11	Queue<T>	method	Dequeue	plain	0		T
+2457	4.11	Queue<T>	method	Peek	plain	0		T
+2458	4.11	Queue<T>	method	Contains	plain	0		bool
+2459	4.11	Queue<T>	method	TryDequeue	try	0		bool
+2460	4.11	Queue<T>	method	TryPeek	try	0		bool
+2461	4.11	Queue<T>	method	Clear	plain	0		
+2465	4.11	OwningQueue<T>	method	FromCollectionLiteral	plain	0		owned OwningQueue<T>
+2466	4.11	OwningQueue<T>	constructor	constructor	plain	0		
+2467	4.11	OwningQueue<T>	method	Enqueue	plain	0		
+2468	4.11	OwningQueue<T>	method	Contains	plain	0		bool
+2469	4.11	OwningQueue<T>	method	Dequeue	plain	0		owned T
+2470	4.11	OwningQueue<T>	method	Peek	plain	0		T
+2471	4.11	OwningQueue<T>	method	TryDequeue	try	0		bool
+2472	4.11	OwningQueue<T>	method	TryPeek	try	0		bool
+2473	4.11	OwningQueue<T>	method	Clear	plain	0		
+2474	4.11	OwningQueue<T>	method	Drain	plain	0		IOwningEnumerable<T>
+2498	4.12	IEnumerable<out T>	method	GetEnumerator	plain	0		owned IEnumerator<T>
+2502	4.12	IEnumerator<out T>	property	Current	plain	0		T
+2503	4.12	IEnumerator<out T>	method	MoveNext	plain	0		bool
+2515	4.12	IAsyncEnumerable<out T>	method	GetAsyncEnumerator	plain	0		owned IAsyncEnumerator<T>
+2519	4.12	IAsyncEnumerator<out T>	property	Current	plain	0		T
+2520	4.12	IAsyncEnumerator<out T>	method	MoveNextAsync	plain	0		Task<bool>
+2529	4.13	IOwningEnumerable<T>	method	GetOwningEnumerator	plain	0		owned IOwningEnumerator<T>
+2533	4.13	IOwningEnumerator<T>	method	TakeCurrent	plain	0		owned T
+2534	4.13	IOwningEnumerator<T>	method	MoveNext	plain	0		bool
+2548	4.13	IOwningAsyncEnumerable<T>	method	GetOwningAsyncEnumerator	plain	0		owned IOwningAsyncEnumerator<T>
+2552	4.13	IOwningAsyncEnumerator<T>	method	TakeCurrent	plain	0		owned T
+2553	4.13	IOwningAsyncEnumerator<T>	method	MoveNextAsync	plain	0		Task<bool>
+2583	4.14	OwningBuffer<T>	constructor	constructor	plain	0		
+2584	4.14	OwningBuffer<T>	constructor	constructor	plain	0		
+2586	4.14	OwningBuffer<T>	property	Length	plain	0		int
+2590	4.14	OwningBuffer<T>	property		plain	0		
+2599	4.14	OwningBuffer<T>	method	AsSpan	plain	0		Span<T>
+2600	4.14	OwningBuffer<T>	method	AsSpan	plain	0		Span<T>
+2601	4.14	OwningBuffer<T>	method	AsSpan	plain	0		Span<T>
+2602	4.14	OwningBuffer<T>	method	AsSpan	plain	0		Span<T>
+2604	4.14	OwningBuffer<T>	method	AsReadOnlySpan	plain	0		ReadOnlySpan<T>
+2605	4.14	OwningBuffer<T>	method	AsReadOnlySpan	plain	0		ReadOnlySpan<T>
+2606	4.14	OwningBuffer<T>	method	AsReadOnlySpan	plain	0		ReadOnlySpan<T>
+2607	4.14	OwningBuffer<T>	method	AsReadOnlySpan	plain	0		ReadOnlySpan<T>
+2616	4.14	OwningBuffer<T>	constructor	constructor	plain	0		
+2618	4.14	OwningBuffer<T>	constructor	constructor	plain	0		
+2620	4.14	OwningBuffer<T>	property	Length	plain	0		int
+2624	4.14	OwningBuffer<T>	property		plain	0		
+2636	4.14	OwningBuffer<T>	method	DangerousPointer	plain	0		Ptr<T>
+2639	4.14	OwningBuffer<T>	method	AsSpan	plain	0		Span<T>
+2640	4.14	OwningBuffer<T>	method	AsSpan	plain	0		Span<T>
+2641	4.14	OwningBuffer<T>	method	AsSpan	plain	0		Span<T>
+2642	4.14	OwningBuffer<T>	method	AsSpan	plain	0		Span<T>
+2644	4.14	OwningBuffer<T>	method	AsReadOnlySpan	plain	0		ReadOnlySpan<T>
+2645	4.14	OwningBuffer<T>	method	AsReadOnlySpan	plain	0		ReadOnlySpan<T>
+2646	4.14	OwningBuffer<T>	method	AsReadOnlySpan	plain	0		ReadOnlySpan<T>
+2647	4.14	OwningBuffer<T>	method	AsReadOnlySpan	plain	0		ReadOnlySpan<T>
+2685	4.14	Span<T>	property		plain	0		
+2701	4.14	Span<T>	property	IsEmpty	plain	0		bool
+2704	4.14	Span<T>	method	IndexOf	plain	0		int
+2705	4.14	Span<T>	method	Contains	plain	0		bool
+2708	4.14	Span<T>	method	SequenceEqual	plain	0		bool
+2709	4.14	Span<T>	method	SequenceEqual	plain	0		bool
+2710	4.14	Span<T>	method	SequenceEqual	plain	0		bool
+2713	4.14	Span<T>	method	Slice	plain	0		Span<T>
+2715	4.14	Span<T>	method	Slice	plain	0		Span<T>
+2716	4.14	Span<T>	method	Slice	plain	0		Span<T>
+2720	4.14	Span<T>	method	AsReadOnly	plain	0		ReadOnlySpan<T>
+2724	4.14	Span<T>	method	Clear	plain	0		
+2726	4.14	Span<T>	method	MoveFrom	plain	0		
+2731	4.14	Span<T>	method	MoveTo	plain	0		
+2737	4.14	Span<T>	method	Reverse	plain	0		
+2749	4.14	Span<T>	property		plain	0		
+2765	4.14	Span<T>	property	IsEmpty	plain	0		bool
+2768	4.14	Span<T>	method	IndexOf	plain	0		int
+2769	4.14	Span<T>	method	Contains	plain	0		bool
+2772	4.14	Span<T>	method	SequenceEqual	plain	0		bool
+2773	4.14	Span<T>	method	SequenceEqual	plain	0		bool
+2774	4.14	Span<T>	method	SequenceEqual	plain	0		bool
+2777	4.14	Span<T>	method	Slice	plain	0		Span<T>
+2779	4.14	Span<T>	method	Slice	plain	0		Span<T>
+2780	4.14	Span<T>	method	Slice	plain	0		Span<T>
+2784	4.14	Span<T>	method	AsReadOnly	plain	0		ReadOnlySpan<T>
+2788	4.14	Span<T>	method	Fill	plain	0		
+2789	4.14	Span<T>	method	CopyFrom	plain	0		
+2791	4.14	Span<T>	method	CopyTo	plain	0		
+2793	4.14	Span<T>	method	Reverse	plain	0		
+2852	4.14	ReadOnlySpan<T>	property		plain	0		
+2861	4.14	ReadOnlySpan<T>	property	IsEmpty	plain	0		bool
+2863	4.14	ReadOnlySpan<T>	method	IndexOf	plain	0		int
+2864	4.14	ReadOnlySpan<T>	method	Contains	plain	0		bool
+2866	4.14	ReadOnlySpan<T>	method	SequenceEqual	plain	0		bool
+2867	4.14	ReadOnlySpan<T>	method	SequenceEqual	plain	0		bool
+2869	4.14	ReadOnlySpan<T>	method	Slice	plain	0		ReadOnlySpan<T>
+2871	4.14	ReadOnlySpan<T>	method	Slice	plain	0		ReadOnlySpan<T>
+2872	4.14	ReadOnlySpan<T>	method	Slice	plain	0		ReadOnlySpan<T>
+2884	4.14	ReadOnlySpan<T>	property		plain	0		
+2893	4.14	ReadOnlySpan<T>	property	IsEmpty	plain	0		bool
+2895	4.14	ReadOnlySpan<T>	method	IndexOf	plain	0		int
+2896	4.14	ReadOnlySpan<T>	method	Contains	plain	0		bool
+2898	4.14	ReadOnlySpan<T>	method	SequenceEqual	plain	0		bool
+2899	4.14	ReadOnlySpan<T>	method	SequenceEqual	plain	0		bool
+2901	4.14	ReadOnlySpan<T>	method	Slice	plain	0		ReadOnlySpan<T>
+2903	4.14	ReadOnlySpan<T>	method	Slice	plain	0		ReadOnlySpan<T>
+2904	4.14	ReadOnlySpan<T>	method	Slice	plain	0		ReadOnlySpan<T>
+2908	4.14	ReadOnlySpan<T>	method	CopyTo	plain	0		
+2934	4.14	FrameBuffer	method	ScanLineReadOnly	plain	0		ReadOnlySpan<Pixel>
+2937	4.14	FrameBuffer	method	ScanLine	plain	0		Span<Pixel>
+2954	4.14	ReadOnlySpan<byte>	method	ReadInt16LittleEndian	plain	0		short
+2955	4.14	ReadOnlySpan<byte>	method	ReadInt16BigEndian	plain	0		short
+2956	4.14	ReadOnlySpan<byte>	method	ReadUInt16LittleEndian	plain	0		ushort
+2957	4.14	ReadOnlySpan<byte>	method	ReadUInt16BigEndian	plain	0		ushort
+2960	4.14	ReadOnlySpan<byte>	method	ReadInt32LittleEndian	plain	0		int
+2961	4.14	ReadOnlySpan<byte>	method	ReadInt32BigEndian	plain	0		int
+2962	4.14	ReadOnlySpan<byte>	method	ReadUInt32LittleEndian	plain	0		uint
+2963	4.14	ReadOnlySpan<byte>	method	ReadUInt32BigEndian	plain	0		uint
+2966	4.14	ReadOnlySpan<byte>	method	ReadInt64LittleEndian	plain	0		long
+2967	4.14	ReadOnlySpan<byte>	method	ReadInt64BigEndian	plain	0		long
+2968	4.14	ReadOnlySpan<byte>	method	ReadUInt64LittleEndian	plain	0		ulong
+2969	4.14	ReadOnlySpan<byte>	method	ReadUInt64BigEndian	plain	0		ulong
+2972	4.14	ReadOnlySpan<byte>	method	ReadFloatLittleEndian	plain	0		float
+2973	4.14	ReadOnlySpan<byte>	method	ReadFloatBigEndian	plain	0		float
+2974	4.14	ReadOnlySpan<byte>	method	ReadDoubleLittleEndian	plain	0		double
+2975	4.14	ReadOnlySpan<byte>	method	ReadDoubleBigEndian	plain	0		double
+2978	4.14	ReadOnlySpan<byte>	method	TryReadInt16LittleEndian	try	0		bool
+2979	4.14	ReadOnlySpan<byte>	method	TryReadInt16BigEndian	try	0		bool
+2980	4.14	ReadOnlySpan<byte>	method	TryReadUInt16LittleEndian	try	0		bool
+2981	4.14	ReadOnlySpan<byte>	method	TryReadUInt16BigEndian	try	0		bool
+2982	4.14	ReadOnlySpan<byte>	method	TryReadInt32LittleEndian	try	0		bool
+2983	4.14	ReadOnlySpan<byte>	method	TryReadInt32BigEndian	try	0		bool
+2984	4.14	ReadOnlySpan<byte>	method	TryReadUInt32LittleEndian	try	0		bool
+2985	4.14	ReadOnlySpan<byte>	method	TryReadUInt32BigEndian	try	0		bool
+2986	4.14	ReadOnlySpan<byte>	method	TryReadInt64LittleEndian	try	0		bool
+2987	4.14	ReadOnlySpan<byte>	method	TryReadInt64BigEndian	try	0		bool
+2988	4.14	ReadOnlySpan<byte>	method	TryReadUInt64LittleEndian	try	0		bool
+2989	4.14	ReadOnlySpan<byte>	method	TryReadUInt64BigEndian	try	0		bool
+2990	4.14	ReadOnlySpan<byte>	method	TryReadFloatLittleEndian	try	0		bool
+2991	4.14	ReadOnlySpan<byte>	method	TryReadFloatBigEndian	try	0		bool
+2992	4.14	ReadOnlySpan<byte>	method	TryReadDoubleLittleEndian	try	0		bool
+2993	4.14	ReadOnlySpan<byte>	method	TryReadDoubleBigEndian	try	0		bool
+3001	4.14	Span<byte>	method	WriteInt16LittleEndian	plain	0		
+3002	4.14	Span<byte>	method	WriteInt16BigEndian	plain	0		
+3003	4.14	Span<byte>	method	WriteUInt16LittleEndian	plain	0		
+3004	4.14	Span<byte>	method	WriteUInt16BigEndian	plain	0		
+3005	4.14	Span<byte>	method	WriteInt32LittleEndian	plain	0		
+3006	4.14	Span<byte>	method	WriteInt32BigEndian	plain	0		
+3007	4.14	Span<byte>	method	WriteUInt32LittleEndian	plain	0		
+3008	4.14	Span<byte>	method	WriteUInt32BigEndian	plain	0		
+3009	4.14	Span<byte>	method	WriteInt64LittleEndian	plain	0		
+3010	4.14	Span<byte>	method	WriteInt64BigEndian	plain	0		
+3011	4.14	Span<byte>	method	WriteUInt64LittleEndian	plain	0		
+3012	4.14	Span<byte>	method	WriteUInt64BigEndian	plain	0		
+3013	4.14	Span<byte>	method	WriteFloatLittleEndian	plain	0		
+3014	4.14	Span<byte>	method	WriteFloatBigEndian	plain	0		
+3015	4.14	Span<byte>	method	WriteDoubleLittleEndian	plain	0		
+3016	4.14	Span<byte>	method	WriteDoubleBigEndian	plain	0		
+3019	4.14	Span<byte>	method	TryWriteInt16LittleEndian	try	0		bool
+3020	4.14	Span<byte>	method	TryWriteInt16BigEndian	try	0		bool
+3041	4.14	ReadOnlySpan<byte>	method	ReadInt32LittleEndian	plain	0		int
+3053	4.14	Span<byte>	method	WriteInt32BigEndian	plain	0		
+3077	4.14	BitReader	property	IsEmpty	plain	0		bool
+3078	4.14	BitReader	property	IsByteAligned	plain	0		bool
+3081	4.14	BitReader	method	ReadBitsBigEndianMsbFirst	plain	0		ulong
+3082	4.14	BitReader	method	ReadBitsLittleEndianLsbFirst	plain	0		ulong
+3083	4.14	BitReader	method	ReadBitMsbFirst	plain	0		bool
+3084	4.14	BitReader	method	ReadBitLsbFirst	plain	0		bool
+3087	4.14	BitReader	method	TryReadBitsBigEndianMsbFirst	try	0		bool
+3088	4.14	BitReader	method	TryReadBitsLittleEndianLsbFirst	try	0		bool
+3089	4.14	BitReader	method	TryReadBitMsbFirst	try	0		bool
+3090	4.14	BitReader	method	TryReadBitLsbFirst	try	0		bool
+3093	4.14	BitReader	method	Slice	plain	0		BitReader
+3094	4.14	BitReader	method	Slice	plain	0		BitReader
+3095	4.14	BitReader	method	Slice	plain	0		BitReader
+3098	4.14	BitReader	method	AlignToByte	plain	0		BitReader
+3101	4.14	BitReader	method	AlignedTail	plain	0		ReadOnlySpan<byte>
+3106	4.14	BitWriter	property	IsEmpty	plain	0		bool
+3107	4.14	BitWriter	property	IsByteAligned	plain	0		bool
+3109	4.14	BitWriter	method	WriteBitsBigEndianMsbFirst	plain	0		
+3110	4.14	BitWriter	method	WriteBitsLittleEndianLsbFirst	plain	0		
+3111	4.14	BitWriter	method	WriteBitMsbFirst	plain	0		
+3112	4.14	BitWriter	method	WriteBitLsbFirst	plain	0		
+3115	4.14	BitWriter	method	TryWriteBitsBigEndianMsbFirst	try	0		bool
+3116	4.14	BitWriter	method	TryWriteBitsLittleEndianLsbFirst	try	0		bool
+3117	4.14	BitWriter	method	TryWriteBitMsbFirst	try	0		bool
+3118	4.14	BitWriter	method	TryWriteBitLsbFirst	try	0		bool
+3120	4.14	BitWriter	method	Slice	plain	0		BitWriter
+3121	4.14	BitWriter	method	Slice	plain	0		BitWriter
+3122	4.14	BitWriter	method	Slice	plain	0		BitWriter
+3123	4.14	BitWriter	method	AlignToByte	plain	0		BitWriter
+3125	4.14	BitWriter	method	AlignedTail	plain	0		Span<byte>
+3126	4.14	BitWriter	method	AsReadOnly	plain	0		BitReader
+3131	4.14	ReadOnlySpan<byte>	method	AsBitReader	plain	0		BitReader
+3135	4.14	Span<byte>	method	AsBitReader	plain	0		BitReader
+3137	4.14	Span<byte>	method	AsBitWriter	plain	0		BitWriter
+3176	4.14	BitReader	method	ReadBitMsbFirst	plain	0		bool
+3203	4.15	ArraySpan<T>	property		plain	0		
+3218	4.15	ArraySpan<T>	property	IsEmpty	plain	0		bool
+3221	4.15	ArraySpan<T>	method	Slice	plain	0		ArraySpan<T>
+3223	4.15	ArraySpan<T>	method	Slice	plain	0		ArraySpan<T>
+3224	4.15	ArraySpan<T>	method	Slice	plain	0		ArraySpan<T>
+3228	4.15	ArraySpan<T>	method	AsReadOnly	plain	0		ReadOnlyArraySpan<T>
+3232	4.15	ArraySpan<T>	method	IndexOf	plain	0		int
+3233	4.15	ArraySpan<T>	method	Contains	plain	0		bool
+3236	4.15	ArraySpan<T>	method	SequenceEqual	plain	0		bool
+3237	4.15	ArraySpan<T>	method	SequenceEqual	plain	0		bool
+3238	4.15	ArraySpan<T>	method	SequenceEqual	plain	0		bool
+3241	4.15	ArraySpan<T>	method	Fill	plain	0		
+3242	4.15	ArraySpan<T>	method	CopyFrom	plain	0		
+3243	4.15	ArraySpan<T>	method	CopyTo	plain	0		
+3245	4.15	ArraySpan<T>	method	Reverse	plain	0		
+3279	4.15	ReadOnlyArraySpan<T>	property		plain	0		
+3288	4.15	ReadOnlyArraySpan<T>	property	IsEmpty	plain	0		bool
+3290	4.15	ReadOnlyArraySpan<T>	method	Slice	plain	0		ReadOnlyArraySpan<T>
+3292	4.15	ReadOnlyArraySpan<T>	method	Slice	plain	0		ReadOnlyArraySpan<T>
+3293	4.15	ReadOnlyArraySpan<T>	method	Slice	plain	0		ReadOnlyArraySpan<T>
+3297	4.15	ReadOnlyArraySpan<T>	method	IndexOf	plain	0		int
+3298	4.15	ReadOnlyArraySpan<T>	method	Contains	plain	0		bool
+3300	4.15	ReadOnlyArraySpan<T>	method	SequenceEqual	plain	0		bool
+3301	4.15	ReadOnlyArraySpan<T>	method	SequenceEqual	plain	0		bool
+3303	4.15	ReadOnlyArraySpan<T>	method	CopyTo	plain	0		
+3327	4.15	ArrayBitReader	property	IsEmpty	plain	0		bool
+3328	4.15	ArrayBitReader	property	IsByteAligned	plain	0		bool
+3330	4.15	ArrayBitReader	method	Slice	plain	0		ArrayBitReader
+3331	4.15	ArrayBitReader	method	ReadBitsBigEndianMsbFirst	plain	0		ulong
+3335	4.15	ArrayBitReader	method	AlignedTail	plain	0		ReadOnlyArraySpan<byte>
+3339	4.15	ArrayBitWriter	property	IsEmpty	plain	0		bool
+3340	4.15	ArrayBitWriter	property	IsByteAligned	plain	0		bool
+3342	4.15	ArrayBitWriter	method	Slice	plain	0		ArrayBitWriter
+3343	4.15	ArrayBitWriter	method	WriteBitsBigEndianMsbFirst	plain	0		
+3347	4.15	ArrayBitWriter	method	AlignedTail	plain	0		ArraySpan<byte>
+3348	4.15	ArrayBitWriter	method	AsReadOnly	plain	0		ArrayBitReader
+3352	4.15	ReadOnlyArraySpan<byte>	method	AsBitReader	plain	0		ArrayBitReader
+3356	4.15	ArraySpan<byte>	method	AsBitReader	plain	0		ArrayBitReader
+3358	4.15	ArraySpan<byte>	method	AsBitWriter	plain	0		ArrayBitWriter
+3375	4.17	SortedDictionary<K, V>	constructor	constructor	plain	0		
+3377	4.17	SortedDictionary<K, V>	property	Count	plain	0		int
+3379	4.17	SortedDictionary<K, V>	property		plain	1	KeyNotFoundException	
+3381	4.17	SortedDictionary<K, V>	method	Add	plain	1	ArgumentException	
+3385	4.17	SortedDictionary<K, V>	method	TryAdd	try	0		bool
+3386	4.17	SortedDictionary<K, V>	method	ContainsKey	plain	0		bool
+3387	4.17	SortedDictionary<K, V>	method	Contains	plain	0		bool
+3388	4.17	SortedDictionary<K, V>	method	TryGetValue	try	0		bool
+3389	4.17	SortedDictionary<K, V>	method	GetOrNull	ornull	0		V?
+3392	4.17	SortedDictionary<K, V>	method	Remove	plain	0		bool
+3393	4.17	SortedDictionary<K, V>	method	Clear	plain	0		
+3395	4.17	SortedDictionary<K, V>	property	FirstKey	plain	1	InvalidOperationException	K
+3396	4.17	SortedDictionary<K, V>	property	LastKey	plain	1	InvalidOperationException	K
+3411	4.18	SortedSet<T>	constructor	constructor	plain	0		
+3413	4.18	SortedSet<T>	property	Count	plain	0		int
+3415	4.18	SortedSet<T>	method	Add	plain	0		
+3416	4.18	SortedSet<T>	method	TryAdd	try	0		bool
+3417	4.18	SortedSet<T>	method	Contains	plain	0		bool
+3418	4.18	SortedSet<T>	method	Remove	plain	0		bool
+3419	4.18	SortedSet<T>	method	Clear	plain	0		
+3421	4.18	SortedSet<T>	property	First	plain	1	InvalidOperationException	T
+3422	4.18	SortedSet<T>	property	Last	plain	1	InvalidOperationException	T
+3446	4.19	FrozenArray<T>	method	From	plain	0		owned FrozenArray<T>
+3450	4.19	FrozenArray<T>	method	From	plain	0		owned FrozenArray<T>
+3453	4.19	FrozenArray<T>	property	Length	plain	0		int
+3455	4.19	FrozenArray<T>	property		plain	0		
+3459	4.19	FrozenArray<T>	method	ToArray	plain	0		owned Array<T>
+3532	4.20	Counter<K>	constructor	constructor	plain	0		
+3534	4.20	Counter<K>	method	Increment	plain	0		
+3535	4.20	Counter<K>	method	CountOf	plain	0		int
+3538	4.20	Counter<K>	method	Contains	plain	0		bool
+3540	4.20	Counter<K>	method	Remove	plain	0		bool
+3541	4.20	Counter<K>	method	Clear	plain	0		
+3543	4.20	Counter<K>	property	Count	plain	0		int
+3544	4.20	Counter<K>	property	Total	plain	0		int
+3574	4.21	SlotHandle	property	Index	plain	0		int
+3575	4.21	SlotHandle	property	Generation	plain	0		int
+3587	4.21	OwningSlotMap<T>	constructor	constructor	plain	0		
+3588	4.21	OwningSlotMap<T>	constructor	constructor	plain	1	ArgumentOutOfRangeException	
+3590	4.21	OwningSlotMap<T>	property	Count	plain	0		int
+3592	4.21	OwningSlotMap<T>	method	Insert	plain	0		SlotHandle
+3593	4.21	OwningSlotMap<T>	method	Contains	plain	0		bool
+3594	4.21	OwningSlotMap<T>	method	Get	plain	1	KeyNotFoundException	T
+3595	4.21	OwningSlotMap<T>	method	GetOrNull	ornull	0		T?
+3596	4.21	OwningSlotMap<T>	method	TryGetValue	try	0		bool
+3597	4.21	OwningSlotMap<T>	method	Remove	plain	0		bool
+3598	4.21	OwningSlotMap<T>	method	PopValue	plain	1	KeyNotFoundException	owned T
+3599	4.21	OwningSlotMap<T>	method	TryPopValue	try	0		bool
+3600	4.21	OwningSlotMap<T>	method	Handles	plain	0		owned Array<SlotHandle>
+3601	4.21	OwningSlotMap<T>	method	Drain	plain	0		IOwningEnumerable<T>
+3602	4.21	OwningSlotMap<T>	method	Clear	plain	0		
+3655	5	IEnumerable<T>	method	Where	plain	0		IEnumerable<T>
+3658	5	IEnumerable<T>	method	Select	plain	0		IEnumerable<U>
+3659	5	IEnumerable<T>	method	SelectMany	plain	0		IEnumerable<U>
+3662	5	IEnumerable<T>	method	Any	plain	0		bool
+3663	5	IEnumerable<T>	method	Any	plain	0		bool
+3664	5	IEnumerable<T>	method	All	plain	0		bool
+3665	5	IEnumerable<T>	method	Count	plain	0		int
+3666	5	IEnumerable<T>	method	Count	plain	0		int
+3669	5	IEnumerable<T>	method	First	plain	1		T
+3670	5	IEnumerable<T>	method	First	plain	0		T
+3671	5	IEnumerable<T>	method	FirstOrNull	ornull	0		T?
+3672	5	IEnumerable<T>	method	FirstOrNull	ornull	0		T?
+3673	5	IEnumerable<T>	method	Last	plain	0		T
+3674	5	IEnumerable<T>	method	Last	plain	0		T
+3675	5	IEnumerable<T>	method	LastOrNull	ornull	0		T?
+3676	5	IEnumerable<T>	method	LastOrNull	ornull	0		T?
+3677	5	IEnumerable<T>	method	Single	plain	1		T
+3678	5	IEnumerable<T>	method	Single	plain	1		T
+3679	5	IEnumerable<T>	method	SingleOrNull	ornull	0		T?
+3680	5	IEnumerable<T>	method	SingleOrNull	ornull	1		T?
+3681	5	IEnumerable<T>	method	ElementAt	plain	0		T
+3682	5	IEnumerable<T>	method	ElementAtOrNull	ornull	0		T?
+3685	5	IEnumerable<T>	method	Sum	plain	0		owned U
+3689	5	IEnumerable<T>	method	Min	plain	0		U
+3690	5	IEnumerable<T>	method	Max	plain	0		U
+3691	5	IEnumerable<T>	method	Average	plain	0		double
+3692	5	IEnumerable<T>	method	Average	plain	0		double
+3693	5	IEnumerable<T>	method	Average	plain	0		double
+3694	5	IEnumerable<T>	method	Average	plain	0		double
+3695	5	IEnumerable<T>	method	Average	plain	0		float
+3696	5	IEnumerable<T>	method	Average	plain	0		double
+3697	5	IEnumerable<T>	method	Average	plain	1	InvalidOperationException	decimal
+3701	5	IEnumerable<T>	method	Aggregate	plain	0		TAccum
+3704	5	IEnumerable<T>	method	OrderBy	plain	0		IOrderedEnumerable<T>
+3705	5	IEnumerable<T>	method	OrderByDescending	plain	0		IOrderedEnumerable<T>
+3706	5	IEnumerable<T>	method	Reverse	plain	0		IEnumerable<T>
+3709	5	IEnumerable<T>	method	Take	plain	0		IEnumerable<T>
+3710	5	IEnumerable<T>	method	TakeWhile	plain	0		IEnumerable<T>
+3711	5	IEnumerable<T>	method	Skip	plain	0		IEnumerable<T>
+3712	5	IEnumerable<T>	method	SkipWhile	plain	0		IEnumerable<T>
+3715	5	IEnumerable<T>	method	Concat	plain	0		IEnumerable<T>
+3716	5	IEnumerable<T>	method	Zip	plain	0		IEnumerable<R>
+3719	5	IEnumerable<T>	method	GroupBy	plain	0		IEnumerable<IGrouping<TKey, T>>
+3722	5	IEnumerable<T>	method	ToArray	plain	0		owned Array<T>
+3723	5	IEnumerable<T>	method	ToDictionary	plain	0		owned Dictionary<TKey, T>
+3724	5	IEnumerable<T>	method	ToDictionary	plain	0		owned Dictionary<TKey, TValue>
+3728	5	IGrouping<TKey, T>	property	Key	plain	0		TKey
+3735	5	IOrderedEnumerable<T>	method	ThenBy	plain	0		IOrderedEnumerable<T>
+3736	5	IOrderedEnumerable<T>	method	ThenByDescending	plain	0		IOrderedEnumerable<T>
+3745	5	IEnumerable<T>	method	Contains	plain	0		bool
+3748	5	IEnumerable<T>	method	Distinct	plain	0		IEnumerable<T>
+3749	5	IEnumerable<T>	method	Union	plain	0		IEnumerable<T>
+3750	5	IEnumerable<T>	method	Intersect	plain	0		IEnumerable<T>
+3751	5	IEnumerable<T>	method	Except	plain	0		IEnumerable<T>
+3754	5	IEnumerable<T>	method	ToSet	plain	0		owned Set<T>
+3781	5.1	IEnumerable<T>	method	Min	plain	1	InvalidOperationException	T
+3782	5.1	IEnumerable<T>	method	Max	plain	1	InvalidOperationException	T
+3783	5.1	IEnumerable<T>	method	MinOrNull	ornull	0		T?
+3784	5.1	IEnumerable<T>	method	MaxOrNull	ornull	0		T?
+3792	5.1	IEnumerable<T>	method	Sum	plain	0		owned T
+3800	5.1	IEnumerable<int>	method	Average	plain	1	InvalidOperationException	double
+3804	5.1	IEnumerable<long>	method	Average	plain	0		double
+3808	5.1	IEnumerable<double>	method	Average	plain	0		double
+3812	5.1	IEnumerable<decimal>	method	Average	plain	0		decimal
+3830	6.1	CancellationToken	property	None	plain	0		CancellationToken
+3831	6.1	CancellationToken	property	IsCancellationRequested	plain	0		bool
+3832	6.1	CancellationToken	method	ThrowIfCancellationRequested	plain	0		
+3833	6.1	CancellationToken	method	Register	plain	0		owned Subscription
+3837	6.1	CancellationTokenSource	constructor	constructor	plain	0		
+3839	6.1	CancellationTokenSource	method	WithCancelAfter	plain	0		owned CancellationTokenSource
+3844	6.1	CancellationTokenSource	method	CreateLinked	plain	0		owned CancellationTokenSource
+3845	6.1	CancellationTokenSource	method	CreateLinkedAll	plain	0		owned CancellationTokenSource
+3847	6.1	CancellationTokenSource	property	Token	plain	0		CancellationToken
+3848	6.1	CancellationTokenSource	property	IsCancellationRequested	plain	0		bool
+3850	6.1	CancellationTokenSource	method	Cancel	plain	0		
+3851	6.1	CancellationTokenSource	method	CancelAfter	plain	0		
+3911	6.1	TimeoutException	constructor	constructor	plain	0		
+3912	6.1	TimeoutException	constructor	constructor	plain	0		
+3913	6.1	TimeoutException	constructor	constructor	plain	0		
+3924	6.2	Mutex	constructor	constructor	plain	0		
+3925	6.2	Mutex	method	Acquire	plain	0		owned Lock
+3926	6.2	Mutex	method	TryAcquire	try	0		owned Lock?
+3927	6.2	Mutex	method	AcquireAsync	plain	0		OwningTask<Lock>
+3928	6.2	Mutex	method	TryAcquireAsync	try	0		OwningTask<Lock?>
+3985	6.3	Semaphore	constructor	constructor	plain	0		
+3986	6.3	Semaphore	constructor	constructor	plain	0		
+3988	6.3	Semaphore	method	Acquire	plain	0		owned SemaphoreToken
+3989	6.3	Semaphore	method	TryAcquire	try	0		owned SemaphoreToken?
+3990	6.3	Semaphore	method	AcquireAsync	plain	0		OwningTask<SemaphoreToken>
+3991	6.3	Semaphore	method	TryAcquireAsync	try	0		OwningTask<SemaphoreToken?>
+4032	6.4	Atomic<T>	constructor	constructor	plain	0		
+4034	6.4	Atomic<T>	property	Value	plain	0		T
+4039	6.4	Atomic<T>	method	Exchange	plain	0		T
+4040	6.4	Atomic<T>	method	CompareExchange	plain	0		T
+4056	6.4	AtomicInteger<T>	constructor	constructor	plain	0		
+4058	6.4	AtomicInteger<T>	property	Value	plain	0		T
+4063	6.4	AtomicInteger<T>	method	Exchange	plain	0		T
+4064	6.4	AtomicInteger<T>	method	CompareExchange	plain	0		T
+4066	6.4	AtomicInteger<T>	method	Increment	plain	0		T
+4067	6.4	AtomicInteger<T>	method	Decrement	plain	0		T
+4068	6.4	AtomicInteger<T>	method	Add	plain	0		T
+4094	6.5	Button	property	Clicked	plain	0		IEvent<ClickedEvent>
+4096	6.5	Button	method	OnPress	plain	0		
+4109	6.5	IEvent<out T>	method	Subscribe	plain	0		owned Subscription
+4113	6.5	IAsyncEvent<out T>	method	Subscribe	plain	0		owned Subscription
+4117	6.5	EventSource<T>	constructor	constructor	plain	0		
+4118	6.5	EventSource<T>	method	Subscribe	plain	0		owned Subscription
+4119	6.5	EventSource<T>	method	Raise	plain	0		
+4121	6.5	EventSource<T>	method	Add	plain	0		
+4122	6.5	EventSource<T>	method	Remove	plain	0		
+4128	6.5	AsyncEventSource<T>	constructor	constructor	plain	0		
+4129	6.5	AsyncEventSource<T>	method	Subscribe	plain	0		owned Subscription
+4130	6.5	AsyncEventSource<T>	method	RaiseAsync	plain	0		Task
+4133	6.5	AsyncEventSource<T>	method	Add	plain	0		
+4134	6.5	AsyncEventSource<T>	method	Remove	plain	0		
+4158	6.5	TickObserver	constructor	constructor	plain	0		
+4162	6.5	TickObserver	method	OnTick	plain	0		
+4197	6.5	ISharedEvent<out T>	method	Subscribe	plain	0		owned Subscription
+4205	6.5	SharedEventSource<T>	constructor	constructor	plain	0		
+4206	6.5	SharedEventSource<T>	method	Subscribe	plain	0		owned Subscription
+4207	6.5	SharedEventSource<T>	method	Raise	plain	1		
+4208	6.5	SharedEventSource<T>	method	Add	plain	0		
+4209	6.5	SharedEventSource<T>	method	Remove	plain	0		
+4226	6.5	TickBus	property	Feed	plain	0		ISharedEvent<PriceTick>
+4227	6.5	TickBus	method	Publish	plain	0		
+4230	6.5	TickBus	method	Forward	plain	0		
+4256	6.5	App	property	Exiting	plain	0		ISharedEvent<()>
+4258	6.5	App	method	NotifyExiting	plain	0		
+4280	6.6	TaskCompletionSource<T>	constructor	constructor	plain	0		
+4281	6.6	TaskCompletionSource<T>	property	Task	plain	0		Task<T>
+4283	6.6	TaskCompletionSource<T>	method	SetResult	plain	0		
+4284	6.6	TaskCompletionSource<T>	method	SetException	plain	1	SetException	
+4285	6.6	TaskCompletionSource<T>	method	SetCancelled	plain	0		
+4287	6.6	TaskCompletionSource<T>	method	TrySetResult	try	0		bool
+4288	6.6	TaskCompletionSource<T>	method	TrySetException	try	1	TrySetException	bool
+4289	6.6	TaskCompletionSource<T>	method	TrySetCancelled	try	0		bool
+4296	6.6	OwningTaskCompletionSource<T>	constructor	constructor	plain	0		
+4297	6.6	OwningTaskCompletionSource<T>	property	Task	plain	0		OwningTask<T>
+4299	6.6	OwningTaskCompletionSource<T>	method	SetResult	plain	0		
+4300	6.6	OwningTaskCompletionSource<T>	method	SetException	plain	1	SetException	
+4301	6.6	OwningTaskCompletionSource<T>	method	SetCancelled	plain	0		
+4303	6.6	OwningTaskCompletionSource<T>	method	TrySetResult	try	0		bool
+4304	6.6	OwningTaskCompletionSource<T>	method	TrySetException	try	1	TrySetException	bool
+4305	6.6	OwningTaskCompletionSource<T>	method	TrySetCancelled	try	0		bool
+4312	6.6	TaskCompletionSource	constructor	constructor	plain	0		
+4313	6.6	TaskCompletionSource	property	Task	plain	0		Task
+4314	6.6	TaskCompletionSource	method	SetResult	plain	0		
+4315	6.6	TaskCompletionSource	method	SetException	plain	1	SetException	
+4316	6.6	TaskCompletionSource	method	SetCancelled	plain	0		
+4317	6.6	TaskCompletionSource	method	TrySetResult	try	0		bool
+4318	6.6	TaskCompletionSource	method	TrySetException	try	1	TrySetException	bool
+4319	6.6	TaskCompletionSource	method	TrySetCancelled	try	0		bool
+4341	6.7	Task	method	FromResult	plain	0		Task<T>
+4344	6.7	Task	method	FromOwnedResult	plain	1	FromException	OwningTask<T>
+4351	6.7	Task	method	FromException	plain	1	FromException	Task<T>
+4352	6.7	Task	method	FromCancelled	plain	1	FromException	Task<T>
+4356	6.7	Task	method	FromException	plain	1	FromException	Task
+4357	6.7	Task	method	FromCancelled	plain	0		Task
+4359	6.7	Task	method	Delay	plain	0		Task
+4360	6.7	Task	method	Delay	plain	0		Task
+4362	6.7	Task	method	WhenAll	plain	0		Task
+4365	6.7	Task	method	WhenAll	plain	0		Task<Array<T>>
+4372	6.7	Task	method	WhenAll	plain	0		
+4376	6.7	Task	method	WhenAny	plain	1	ArgumentException	Task<int>
+4380	6.7	Task	method	FireAndForget	plain	0		
+4407	6.7		method	FailFast	plain	0		OwningTask<MyClass>
+4420	6.7		method	LoadAllConfigs	plain	0		OwningTask<OwningArray<Config>>
+4438	6.7		method	WhenAll	plain	0		
+4459	6.7		method	OpenFiles	plain	0		IOwningAsyncEnumerable<FileStream>
+4466	6.7		method	ProcessAll	plain	0		Task
+4484	6.7		method	WhenEach	plain	1		IAsyncEnumerable<Task>
+4488	6.7		method	WhenEach	plain	0		IAsyncEnumerable<Task<T>>
+4494	6.7		method	WhenEach	plain	0		
+4520	6.8	Domain	method	Spawn	plain	0		owned Task
+4521	6.8	Domain	method	Spawn	plain	0		owned Task
+4523	6.8	Domain	method	Spawn	plain	0		owned Task
+4529	6.8	Domain	method	Spawn	plain	0		owned OwningTask<R>
+4531	6.8	Domain	method	Spawn	plain	0		owned OwningTask<R>
+4533	6.8	Domain	method	Spawn	plain	0		owned OwningTask<R>
+4537	6.8	Domain	method	Spawn	plain	0		owned Task<R>
+4539	6.8	Domain	method	Spawn	plain	0		owned Task<R>
+4541	6.8	Domain	method	Spawn	plain	0		owned Task<R>
+4561	6.8	DomainFaultedException	property	FaultStackTrace	plain	0		string
+4583	6.9	Channel<T>	constructor	constructor	plain	0		
+4584	6.9	Channel<T>	constructor	constructor	plain	1	ArgumentException	
+4587	6.9	Channel<T>	property	Count	plain	0		int
+4588	6.9	Channel<T>	property	IsClosed	plain	0		bool
+4590	6.9	Channel<T>	method	NewSender	plain	0		owned ChannelSender<T>
+4591	6.9	Channel<T>	method	Close	plain	0		
+4596	6.9	Channel<T>	method	Receive	plain	0		OwningTask<T>
+4597	6.9	Channel<T>	method	TryReceive	try	0		bool
+4598	6.9	Channel<T>	method	ReceiveAll	plain	0		IOwningAsyncEnumerable<T>
+4604	6.9	ChannelSender<T>	method	Send	plain	1	ChannelClosedException,ChannelFullException	
+4608	6.9	ChannelSender<T>	method	SendAsync	plain	1	ChannelClosedException	Task
+4643	6.9	Job	constructor	constructor	plain	0		
+4651	6.9	WorkerCtx	constructor	constructor	plain	0		
+4657	6.9	Pool	method	WorkerMain	plain	0		Task
+4665	6.9	Pool	method	Main	plain	0		Task
+4702	6.10	TaskScope	constructor	constructor	plain	0		
+4703	6.10	TaskScope	property	Token	plain	0		CancellationToken
+4704	6.10	TaskScope	method	CancelAfter	plain	0		
+4705	6.10	TaskScope	method	Cancel	plain	0		
+4707	6.10	TaskScope	method	Spawn	plain	1	InvalidOperationException	
+4709	6.10	TaskScope	method	Join	plain	1		Task
+4749	6.11	Locked<T>	constructor	constructor	plain	0		
+4751	6.11	Locked<T>	method	Lock	plain	0		owned LockGuard<T>
+4752	6.11	Locked<T>	method	TryLock	try	0		owned LockGuard<T>?
+4753	6.11	Locked<T>	method	LockAsync	plain	0		OwningTask<LockGuard<T>>
+4754	6.11	Locked<T>	method	TryLockAsync	try	0		OwningTask<LockGuard<T>?>
+4761	6.11	LockGuard<T>	property	Value	plain	0		T
+4766	6.11	RwLocked<T>	constructor	constructor	plain	0		
+4768	6.11	RwLocked<T>	method	Read	plain	0		owned ReadGuard<T>
+4769	6.11	RwLocked<T>	method	TryRead	try	0		owned ReadGuard<T>?
+4770	6.11	RwLocked<T>	method	ReadAsync	plain	0		OwningTask<ReadGuard<T>>
+4771	6.11	RwLocked<T>	method	TryReadAsync	try	0		OwningTask<ReadGuard<T>?>
+4773	6.11	RwLocked<T>	method	Write	plain	0		owned WriteGuard<T>
+4774	6.11	RwLocked<T>	method	TryWrite	try	0		owned WriteGuard<T>?
+4775	6.11	RwLocked<T>	method	WriteAsync	plain	0		OwningTask<WriteGuard<T>>
+4776	6.11	RwLocked<T>	method	TryWriteAsync	try	0		OwningTask<WriteGuard<T>?>
+4782	6.11	ReadGuard<T>	property	Value	plain	0		T
+4787	6.11	WriteGuard<T>	property	Value	plain	0		T
+4802	6.11	Sessions	method	Touch	plain	0		Task
+4861	6.12	Parallel	property	DefaultDegree	plain	0		int
+4864	6.12	Parallel	method	Map	plain	0		
+4869	6.12	Parallel	method	Reduce	plain	0		
+4875	6.12	Parallel	method	ForEach	plain	0		
+4880	6.12	Parallel	method	Map	plain	0		
+4884	6.12	Parallel	method	ForEach	plain	0		
+4889	6.12	Parallel	method	Map	plain	0		
+4892	6.12	Parallel	method	Reduce	plain	0		
+4896	6.12	Parallel	method	ForEach	plain	0		
+4947	7.1	Stream	property	CanRead	plain	0		bool
+4948	7.1	Stream	property	CanWrite	plain	0		bool
+4949	7.1	Stream	property	CanSeek	plain	0		bool
+4951	7.1	Stream	method	Read	plain	0		int
+4952	7.1	Stream	method	Write	plain	0		
+4953	7.1	Stream	method	Read	plain	0		int
+4954	7.1	Stream	method	Write	plain	0		
+4955	7.1	Stream	method	Flush	plain	0		
+4957	7.1	Stream	method	Seek	plain	0		long
+4958	7.1	Stream	property	Length	plain	0		long
+4959	7.1	Stream	property	Position	plain	0		long
+4961	7.1	Stream	method	ReadAsync	plain	0		
+4963	7.1	Stream	method	WriteAsync	plain	0		
+4967	7.1	Stream	method	ReadAll	plain	0		owned Array<byte>
+4968	7.1	Stream	method	ReadAllAsync	plain	0		OwningTask<Array<byte>>
+4993	7.2	FileStream	constructor	constructor	plain	0		
+4995	7.2	FileStream	property	Path	plain	0		string
+5019	7.3	File	method	ReadAllText	plain	0		string
+5020	7.3	File	method	WriteAllText	plain	0		
+5021	7.3	File	method	ReadAllBytes	plain	0		owned Array<byte>
+5022	7.3	File	method	WriteAllBytes	plain	0		
+5023	7.3	File	method	WriteAllBytes	plain	0		
+5024	7.3	File	method	ReadAllLines	plain	0		owned Array<string>
+5025	7.3	File	method	WriteAllLines	plain	0		
+5027	7.3	File	method	ReadAllTextAsync	plain	0		
+5029	7.3	File	method	WriteAllTextAsync	plain	0		
+5032	7.3	File	method	Exists	plain	0		bool
+5033	7.3	File	method	Delete	plain	0		
+5034	7.3	File	method	Copy	plain	0		
+5035	7.3	File	method	Move	plain	0		
+5046	7.4	TextReader	method	Read	plain	0		int
+5051	7.4	TextReader	method	ReadLine	nullable	0		string?
+5052	7.4	TextReader	method	ReadToEnd	plain	0		string
+5057	7.4	TextWriter	method	Write	plain	0		
+5058	7.4	TextWriter	method	Write	plain	0		
+5059	7.4	TextWriter	method	Write	plain	0		
+5060	7.4	TextWriter	method	WriteLine	plain	0		
+5061	7.4	TextWriter	method	WriteLine	plain	0		
+5062	7.4	TextWriter	method	WriteLine	plain	0		
+5066	7.4	TextWriter	method	Flush	plain	0		
+5079	7.4	Directory	method	Exists	plain	0		bool
+5080	7.4	Directory	method	CreateDirectory	plain	0		
+5081	7.4	Directory	method	Delete	plain	1	IOException	
+5082	7.4	Directory	method	GetFiles	plain	0		owned Array<string>
+5083	7.4	Directory	method	GetDirectories	plain	0		owned Array<string>
+5087	7.4	Path	method	Combine	plain	0		string
+5088	7.4	Path	method	GetFileName	plain	0		string
+5089	7.4	Path	method	GetExtension	plain	0		string
+5090	7.4	Path	method	GetFileNameWithoutExtension	plain	0		string
+5091	7.4	Path	method	GetDirectoryName	plain	0		string
+5092	7.4	Path	method	GetFullPath	plain	0		string
+5113	8.1	Stopwatch	constructor	constructor	plain	0		
+5114	8.1	Stopwatch	method	StartNew	plain	0		owned Stopwatch
+5116	8.1	Stopwatch	property	IsRunning	plain	0		bool
+5117	8.1	Stopwatch	property	Elapsed	plain	0		TimeSpan
+5118	8.1	Stopwatch	property	ElapsedMilliseconds	plain	0		long
+5120	8.1	Stopwatch	method	Start	plain	0		
+5121	8.1	Stopwatch	method	Stop	plain	0		
+5122	8.1	Stopwatch	method	Reset	plain	0		
+5138	8.2	Debug	method	Assert	plain	0		
+5139	8.2	Debug	method	WriteLine	plain	0		
+5167	9.1	Int32	method	Parse	plain	0		int
+5168	9.1	Int32	method	TryParse	try	0		bool
+5169	9.1	Int32	method	ParseOrNull	ornull	1	FormatException,OverflowException	int?
+5176	9.1	Int32	method	Parse	plain	1	ArgumentException	int
+5179	9.1	Int32	method	TryParse	try	1	ArgumentException,FormatException,OverflowException	bool
+5185	9.1	Int32	method	Parse	plain	0		int
+5186	9.1	Int32	method	TryParse	try	0		bool
+5188	9.1	Int32	method	ToString	plain	0		string
+5189	9.1	Int32	method	ToString	plain	0		string
+5190	9.1	Int32	method	ToString	plain	0		string
+5192	9.1	Int32	method	CompareTo	plain	0		int
+5217	9.2	Double	method	IsNaN	plain	0		bool
+5218	9.2	Double	method	IsInfinity	plain	0		bool
+5219	9.2	Double	method	IsPositiveInfinity	plain	0		bool
+5220	9.2	Double	method	IsNegativeInfinity	plain	0		bool
+5221	9.2	Double	method	IsFinite	plain	0		bool
+5223	9.2	Double	method	Parse	plain	0		double
+5224	9.2	Double	method	TryParse	try	0		bool
+5225	9.2	Double	method	ParseOrNull	ornull	1		double?
+5227	9.2	Double	method	Parse	plain	0		double
+5228	9.2	Double	method	TryParse	try	0		bool
+5231	9.2	Double	method	IeeeEquals	plain	0		bool
+5232	9.2	Double	method	BitwiseEquals	plain	0		bool
+5234	9.2	Double	method	ToString	plain	0		string
+5235	9.2	Double	method	ToString	plain	0		string
+5236	9.2	Double	method	CompareTo	plain	0		int
+5256	9.2	Float	method	IsNaN	plain	0		bool
+5257	9.2	Float	method	IsInfinity	plain	0		bool
+5258	9.2	Float	method	IsPositiveInfinity	plain	0		bool
+5259	9.2	Float	method	IsNegativeInfinity	plain	0		bool
+5260	9.2	Float	method	IsFinite	plain	0		bool
+5262	9.2	Float	method	Parse	plain	0		float
+5263	9.2	Float	method	TryParse	try	0		bool
+5264	9.2	Float	method	ParseOrNull	ornull	1		float?
+5266	9.2	Float	method	Parse	plain	0		float
+5267	9.2	Float	method	TryParse	try	0		bool
+5270	9.2	Float	method	IeeeEquals	plain	0		bool
+5271	9.2	Float	method	BitwiseEquals	plain	0		bool
+5273	9.2	Float	method	ToString	plain	0		string
+5274	9.2	Float	method	ToString	plain	0		string
+5275	9.2	Float	method	CompareTo	plain	0		int
+5296	9.3	Decimal	method	Parse	plain	0		decimal
+5297	9.3	Decimal	method	TryParse	try	0		bool
+5298	9.3	Decimal	method	ParseOrNull	ornull	1		decimal?
+5300	9.3	Decimal	method	Parse	plain	0		decimal
+5301	9.3	Decimal	method	TryParse	try	0		bool
+5303	9.3	Decimal	method	ToString	plain	0		string
+5304	9.3	Decimal	method	ToString	plain	0		string
+5305	9.3	Decimal	method	CompareTo	plain	0		int
+5306	9.3	Decimal	method	Round	plain	1	ArgumentOutOfRangeException	decimal
+5322	9.4	Boolean	method	Parse	plain	0		bool
+5323	9.4	Boolean	method	TryParse	try	0		bool
+5324	9.4	Boolean	method	ParseOrNull	ornull	1		bool?
+5328	9.4	Boolean	method	ToString	plain	0		string
+5341	9.5	Char	method	IsDigit	plain	0		bool
+5342	9.5	Char	method	IsLetter	plain	0		bool
+5343	9.5	Char	method	IsLetterOrDigit	plain	0		bool
+5344	9.5	Char	method	IsWhiteSpace	plain	0		bool
+5345	9.5	Char	method	IsUpper	plain	0		bool
+5346	9.5	Char	method	IsLower	plain	0		bool
+5347	9.5	Char	method	IsControl	plain	0		bool
+5348	9.5	Char	method	IsPunctuation	plain	0		bool
+5350	9.5	Char	method	ToUpper	plain	0		char
+5351	9.5	Char	method	ToLower	plain	0		char
+5353	9.5	Char	method	Parse	plain	0		char
+5354	9.5	Char	method	TryParse	try	0		bool
+5355	9.5	Char	method	ParseOrNull	ornull	1		char?
+5358	9.5	Char	method	ToString	plain	0		string
+5359	9.5	Char	method	CompareTo	plain	0		int
+5374	9.6	String	property	Length	plain	0		int
+5375	9.6	String	property	IsEmpty	plain	0		bool
+5376	9.6	String	property	IsAscii	plain	0		bool
+5377	9.6	String	property		plain	0		
+5380	9.6	String	method	From	plain	0		string
+5381	9.6	String	method	From	plain	0		string
+5382	9.6	String	method	From	plain	0		string
+5383	9.6	String	method	From	plain	0		string
+5384	9.6	String	method	FromCStringPointer	plain	0		string
+5385	9.6	String	method	FromWStringPointer	plain	0		string
+5386	9.6	String	method	Repeat	plain	1	ArgumentOutOfRangeException	string
+5388	9.6	String	method	Repeat	plain	0		string
+5390	9.6	String	method	Join	plain	0		string
+5393	9.6	String	method	IsNullOrWhiteSpace	plain	0		bool
+5394	9.6	String	method	Contains	plain	0		bool
+5395	9.6	String	method	Contains	plain	0		bool
+5396	9.6	String	method	StartsWith	plain	0		bool
+5397	9.6	String	method	EndsWith	plain	0		bool
+5401	9.6	String	method	IndexOf	plain	0		int
+5402	9.6	String	method	IndexOf	plain	1	IndexOutOfRangeException	int
+5407	9.6	String	method	LastIndexOf	plain	0		int
+5408	9.6	String	method	LastIndexOf	plain	0		int
+5411	9.6	String	method	Substring	plain	0		string
+5412	9.6	String	method	Substring	plain	0		string
+5413	9.6	String	property		plain	0		
+5416	9.6	String	method	AsSpan	plain	0		ReadOnlyStringSpan
+5417	9.6	String	method	AsSpan	plain	0		ReadOnlyStringSpan
+5418	9.6	String	method	AsSpan	plain	0		ReadOnlyStringSpan
+5419	9.6	String	method	AsSpan	plain	0		ReadOnlyStringSpan
+5422	9.6	String	method	Trim	plain	0		string
+5423	9.6	String	method	Trim	plain	0		string
+5424	9.6	String	method	TrimStart	plain	0		string
+5425	9.6	String	method	TrimEnd	plain	0		string
+5426	9.6	String	method	ToUpper	plain	0		string
+5427	9.6	String	method	ToLower	plain	0		string
+5428	9.6	String	method	Replace	plain	0		string
+5429	9.6	String	method	Replace	plain	0		string
+5430	9.6	String	method	PadLeft	plain	0		string
+5431	9.6	String	method	PadRight	plain	0		string
+5432	9.6	String	method	PadCenter	plain	1	ArgumentOutOfRangeException	string
+5441	9.6	String	method	Insert	plain	0		string
+5442	9.6	String	method	Remove	plain	0		string
+5443	9.6	String	method	Remove	plain	0		string
+5446	9.6	String	method	Split	plain	0		owned Array<string>
+5447	9.6	String	method	Split	plain	0		owned Array<string>
+5448	9.6	String	method	Split	plain	0		owned Array<string>
+5456	9.6	String	method	CompareTo	plain	0		int
+5457	9.6	String	method	CompareTo	plain	0		int
+5460	9.6	String	method	Equals	plain	0		bool
+5465	9.6	String	method	Equals	plain	0		bool
+5468	9.6	String	method	GetHashCode	plain	0		int
+5469	9.6	String	method	ToString	plain	0		string
+5472	9.6	String	method	ToCharArray	plain	0		owned Array<char>
+5475	9.6	String	method	GetEnumerator	plain	0		owned IEnumerator<char>
+5478	9.6	String	method	operator	plain	0		string
+5511	9.8	Range<T>	property	Start	nullable	0		T?
+5512	9.8	Range<T>	property	End	nullable	0		T?
+5513	9.8	Range<T>	property	Step	plain	0		long
+5514	9.8	Range<T>	property	IsEndInclusive	plain	0		bool
+5515	9.8	Range<T>	property	IsOpenEnded	plain	0		bool
+5516	9.8	Range<T>	property	IsEmpty	plain	0		bool
+5518	9.8	Range<T>	method	Contains	plain	0		bool
+5519	9.8	Range<T>	method	GetEnumerator	plain	0		owned IEnumerator<T>
+5543	9.9		method	FromUnderlyingOrNull	ornull	0		E?
+5544	9.9		method	FromNameOrNull	ornull	0		E?
+5545	9.9		method	NameOf	plain	0		string
+5565	10.0	IntPtr	property	Zero	plain	0		IntPtr
+5577	10.0	IntPtr	method	Equals	plain	0		bool
+5578	10.0	IntPtr	method	GetHashCode	plain	0		int
+5580	10.0	IntPtr	method	operator	plain	0		bool
+5581	10.0	IntPtr	method	operator	plain	0		bool
+5586	10.0	UIntPtr	property	Zero	plain	0		UIntPtr
+5588	10.0	UIntPtr	method	Equals	plain	0		bool
+5589	10.0	UIntPtr	method	GetHashCode	plain	0		int
+5591	10.0	UIntPtr	method	operator	plain	0		bool
+5592	10.0	UIntPtr	method	operator	plain	0		bool
+5611	10.1	CString	method	From	plain	0		owned CString
+5612	10.1	CString	method	FromBytes	plain	0		owned CString
+5614	10.1	CString	property	Length	plain	0		int
+5615	10.1	CString	property	Pointer	plain	0		IntPtr
+5616	10.1	CString	method	ToBytes	plain	0		owned Array<byte>
+5642	10.2	WString	method	From	plain	0		owned WString
+5644	10.2	WString	property	Length	plain	0		int
+5645	10.2	WString	property	Pointer	plain	0		IntPtr
+5664	10.3	RawBytes	method	From	plain	0		owned RawBytes
+5665	10.3	RawBytes	method	FromForeign	plain	0		
+5668	10.3	RawBytes	property	Length	plain	0		int
+5669	10.3	RawBytes	property	Pointer	plain	0		IntPtr
+5671	10.3	RawBytes	method	CopyTo	plain	1	IndexOutOfRangeException	
+5716	10.5	Ptr<T>	property	Zero	plain	0		Ptr<T>
+5718	10.5	Ptr<T>	method	FromIntPtr	plain	0		Ptr<T>
+5719	10.5	Ptr<T>	method	ToIntPtr	plain	0		IntPtr
+5724	10.5	Ptr<T>	method	Load	plain	0		T
+5725	10.5	Ptr<T>	method	Store	plain	0		
+5726	10.5	Ptr<T>	method	LoadAt	plain	0		T
+5727	10.5	Ptr<T>	method	StoreAt	plain	0		
+5728	10.5	Ptr<T>	method	Add	plain	0		Ptr<T>
+5730	10.5	Ptr<T>	method	CopyToArray	plain	0		owned Array<T>
+5731	10.5	Ptr<T>	method	CopyFromArray	plain	0		
+5737	10.5	Ptr<T>	method	Equals	plain	0		bool
+5738	10.5	Ptr<T>	method	GetHashCode	plain	0		int
+5742	10.5	Ptr<T>	method	operator	plain	0		bool
+5743	10.5	Ptr<T>	method	operator	plain	0		bool
+5768	10.6	Interop	method	LastErrno	plain	0		int
+5773	10.6	Interop	method	CodeAddress	plain	0		IntPtr

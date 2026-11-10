@@ -1,0 +1,33 @@
+{
+ "a": {
+  "declarations": 21,
+  "with_throwing_twin": 20,
+  "distinct_names": 9,
+  "corpus_call_sites": 818
+ },
+ "b": {
+  "declarations": 11,
+  "with_throwing_twin": 10,
+  "distinct_names": 9,
+  "corpus_call_sites": 112
+ },
+ "c": {
+  "declarations": 40,
+  "with_throwing_twin": 40,
+  "distinct_names": 26,
+  "corpus_call_sites": 409
+ },
+ "d": {
+  "declarations": 22,
+  "with_throwing_twin": 19,
+  "distinct_names": 11,
+  "corpus_call_sites": 247
+ },
+ "ornull": {
+  "declarations": 26,
+  "with_throwing_twin": 24,
+  "distinct_names": 11,
+  "corpus_call_sites": 653
+ },
+ "corpus_calls_to_names_not_in_stdlib_listing": 182
+}
