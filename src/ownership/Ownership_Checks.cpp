@@ -30048,6 +30048,19 @@ void MethodOwnership::consumeMarkedArmTransfer(std::string_view name,
         (ls->declType->declaration->kind == ast::TypeDeclKind::Class ||
          ls->declType->declaration->kind == ast::TypeDeclKind::Interface) &&
         !ls->declType->declaration->isValueBuiltin;
+    // fix #7907 (§28.3.4 producers, §28.3 K3.4/K7.4, v0.357): a builtin
+    // collection CLASS (`Array<T>`, `Dictionary<K,V>`, `OwningArray<T>`, ...,
+    // stdlib §3.1) carries no `ast::TypeDecl`, so the `declaration` test above
+    // never admitted it, though K3.4 names "a named owned binding" and the
+    // spec's class-typed arm-meet makes no collection exception. Codegen
+    // reclaims such a local through the null-guarded collection disposal
+    // (LlvmBackend_Stmts.cpp, `dischargedByArmTransfer`).
+    const bool builtinCollectionValued =
+        ls && ls->declType &&
+        ls->declType->kind == sema::TypeRef::Kind::Named &&
+        !ls->declType->declaration &&
+        (common::isPlainBuiltinCollectionHead(ls->declType->headName()) ||
+         common::isOwningCollectionHead(ls->declType->headName()));
     // §28.10: a `using var` binding is scope-pinned — its disposal belongs
     // to scope exit; transferring it out is the same rejection the `move`
     // form draws (checked before the class gate so the message is precise).
@@ -30091,7 +30104,7 @@ void MethodOwnership::consumeMarkedArmTransfer(std::string_view name,
     // half of the gate, never the class-valued one. // per §35.5, §28.3
     // K3.4, v0.308
     const bool ownTransferBind = isOwningMatchTransferredArmBinding(sym);
-    if ((!ld && !ownTransferBind) || !classValued) {
+    if ((!ld && !ownTransferBind) || !(classValued || builtinCollectionValued)) {
         // Targeted first-landing bound: per-path scope-end disposal is wired
         // for plain class/interface LOCALS (null-guarded dynamicDispose);
         // owned parameters and collection-/task-valued bindings need their

@@ -445,6 +445,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // The ownership pass suppressed both the §28.3 discharge error and
         // the affine auto-drop for this local (everDischarged excludes it
         // from autoDropAtScopeEnd), so this is its sole scope-end path.
+        else if (ld->dischargedByArmTransfer &&
+                 (collectionTypeOfLocal(ld) || dictTypeOfLocal(ld) ||
+                  linkedListTypeOfLocal(ld))) {
+            // fix #7907 (§28.3 K3.4/K7.4, v0.357): a builtin-collection local
+            // consumed by a marked arm transfer. The marker's lowering nulls
+            // the slot on the selected path; the collection disposal
+            // registerUsingDisposal installs is null-safe, so the consumed
+            // path skips and a not-selected path frees exactly once. A
+            // class-vtable `dynamicDispose` would misread the collection
+            // handle as an object.
+            registerUsingDisposal(ld);
+        }
         else if (ld->dischargedByArmTransfer) {
             auto it = locals_.find(ld);
             if (it != locals_.end() && !disposeStack_.empty()) {
