@@ -27,24 +27,6 @@ rules	tests/conformance/rules/cases/s15_3_0046.bzl	run	44	Bx	Program.Body	local	
 rules	tests/conformance/rules/cases/s15_3_0047.bzl	run	144	Bx	Program.Body	local	bx							ok	ok	ok	
 rules	tests/conformance/rules/cases/s15_3_0048.bzl	run	44	Bx	Program.Body	local	bx							ok	ok	ok	
 rules	tests/conformance/rules/cases/s15_3_0049.bzl	run	44	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0051.bzl	reject	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0052.bzl	reject	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0054.bzl	reject	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0055.bzl	reject	59	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0056.bzl	reject	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0057.bzl	reject	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0058.bzl	reject	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0059.bzl	run	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0060.bzl	run	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0060.bzl	run	56	Bx	Program.Body	local	b2							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0061.bzl	run	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0062.bzl	run	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0063.bzl	run	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0064.bzl	run	59	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0065.bzl	run	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0066.bzl	run	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0067.bzl	run	56	Bx	Program.Body	local	bx							ok	ok	ok	
-rules	tests/conformance/rules/cases/s15_3_0068.bzl	run	56	Bx	Program.Body	local	bx							ok	ok	ok	
 rules	tests/conformance/rules/cases/s17_4_0901.bzl	run	36	Sink	Program.Main	usingvar	s							ok	ok	ok	
 rules	tests/conformance/rules/cases/s17_4_0902.bzl	run	35	Sink	Program.Main	usingvar	s							ok	ok	ok	
 rules	tests/conformance/rules/cases/s17_4_0903.bzl	run	35	Sink	Program.Main	usingvar	s							ok	ok	ok	
@@ -86,7 +68,6 @@ rules	tests/conformance/rules/cases/s26_7_1416.bzl	run	47	Box	Program.Main	using
 rules	tests/conformance/rules/cases/s26_7_1417.bzl	run	33	Holder	Program.Main	usingvar	h							ok	ok	ok	
 rules	tests/conformance/rules/cases/s27_6_0021.bzl	run	32	MyList	Program.Main	local	m							ok	ok	ok	
 rules	tests/conformance/rules/cases/s27_6_0022.bzl	reject	32	MyList	Program.Main	local	il	IList<int>						ok	ok	ok	
-rules	tests/conformance/rules/cases/s27_7_0005.bzl	run	19	Foo	Program.Main	local	o							ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_10_0050.bzl	run	38	H	H.CloneH	returned		H						ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_10_0050.bzl	run	42	H	Make.MkH	returned		H						ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_10_0050.bzl	run	43	H	Make.MkHN	returned		H?						ok	ok	ok	
@@ -160,16 +141,10 @@ rules	tests/conformance/rules/cases/s28_10_0073.bzl	run	39	H	H.CloneH	returned		
 rules	tests/conformance/rules/cases/s28_10_0073.bzl	run	43	H	Make.MkH	returned		H						ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_10_0073.bzl	run	44	H	Make.MkHN	returned		H?						ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_11_0024.bzl	run	45	Bag	Program.Main	usingvar	bag							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_14_0001.bzl	run	27	Registry	Program.Main	local	reg			lambda:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_14_0004.bzl	run	30	Registry	Program.Main	local	reg			lambda:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_14_0008.bzl	reject	23	Registry	Runner.Wire	local	reg			funcparam:cb				ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_14_0014.bzl	run	39	Reader	Program.Main	usingvar	r			usingvar:s[scoped]	usingvar:s	usingvar:s		ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_14_0015.bzl	reject	28	Reader	Program.Main	usingvar	r			fresh:Stream[scoped]	fresh:Stream	fresh:Stream		reject:temp-source	reject:temp-source	ok	
-rules	tests/conformance/rules/cases/s28_14_0017.bzl	run	20	Registry	Registry.Create	local	r							ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_14_0019.bzl	reject	37	Reader	Program.Demo	local	r			usingvar:s[scoped]	usingvar:s	usingvar:s		ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_14_0022.bzl	reject	31	MyList	C.Store	local	items	MyList						ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_14_0026.bzl	reject	29	Ticker	Program.Main	usingvar	t			lambda:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_14_0027.bzl	run	28	Ticker	Program.Main	usingvar	t			lambda:				ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_14_0030.bzl	run	39	Reader	Host.Pump	usingvar	r			ownedfield:_s[scoped]	ownedfield:_s	ownedfield:_s		ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_14_0031.bzl	run	52	Reader	Host.Pump	usingvar	r			ownedfield:_s[scoped]	ownedfield:_s	ownedfield:_s		ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_14_0032.bzl	quiet	38	Reader	Host.Pump	usingvar	r			ownedfield:_s[scoped]	ownedfield:_s	ownedfield:_s		ok	ok	ok	
@@ -205,88 +180,24 @@ rules	tests/conformance/rules/cases/s28_3_0278.bzl	reject	38	H	H.CloneH	returned
 rules	tests/conformance/rules/cases/s28_3_0278.bzl	reject	42	H	Make.MkH	returned		H						ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_3_0278.bzl	reject	43	H	Make.MkHN	returned		H?						ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_3_0278.bzl	reject	49	H	Program.Main	local	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_3_8_0002.bzl	reject	25	Keep	Program.Main	local	kp							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_3_8_1202.bzl	run	25	Keep	Program.Main	local	kp							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_3_8_1301.bzl	run	23	Holder	P.Main	usingvar	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_3_8_1302.bzl	run	23	Holder	P.Main	usingvar	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_3_8_1303.bzl	run	30	Impl	P.Main	usingvar	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_3_8_1304.bzl	run	29	Sub	P.Main	usingvar	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_3_8_1306.bzl	run	23	Holder	P.Main	usingvar	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_3_8_1307.bzl	run	23	Holder	P.Main	usingvar	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_3_8_1308.bzl	run	25	Holder	P.Main	usingvar	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_3_8_1309.bzl	run	25	Holder	P.Main	usingvar	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_3_8_1310.bzl	run	24	Holder	P.Main	usingvar	h							ok	ok	ok	
 rules	tests/conformance/rules/cases/s28_6_0028.bzl	accept	33	Logger	Pool.Attach	other				ownedfield:_w	ownedfield:_w	ownedfield:_w		ok	edit:scoped@Logger.constructor(target)	ok	
 rules	tests/conformance/rules/cases/s28_6_0051.bzl	reject	27	Holder	Program.Main	local	h			local:a	local:a	local:a		ok	edit:scoped@Holder.constructor(v)	ok	
 rules	tests/conformance/rules/cases/s28_6_0053.bzl	reject	32	Holder	Program.Main	local	h			local:a	local:a	local:a		ok	edit:scoped@Holder.constructor(v)	ok	
 rules	tests/conformance/rules/cases/s28_6_0054.bzl	reject	33	Holder	Program.Main	local	h			local:a	local:a	local:a		ok	edit:scoped@Holder.constructor(v)	ok	
 rules	tests/conformance/rules/cases/s28_6_0055.bzl	reject	39	Holder	Program.Main	local	h			local:a	local:a	local:a		ok	edit:scoped@Holder.constructor(v)	ok	
 rules	tests/conformance/rules/cases/s28_6_0062.bzl	reject	32	Holder	Program.Main	usingvar	h			usingvar:d	usingvar:d	usingvar:d		ok	edit:scoped@Holder.constructor(d)	ok	
-rules	tests/conformance/rules/cases/s28_9_0901.bzl	run	40	Sub	Program.Main	usingvar	h	Holder						ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_9_0901.bzl	run	41	Holder	Program.Main	usingvar	b							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_9_0902.bzl	run	36	Holder	Program.Main	usingvar	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s28_9_0903.bzl	run	32	Holder	Program.Main	usingvar	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0162.bzl	reject	27	D	Program.Main	usingvar	d							ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0163.bzl	run	26	D	Program.Main	usingvar	d							ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0164.bzl	run	36	K	Program.Main	usingvar	a			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0164.bzl	run	38	K	Program.Main	usingvar	b			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0165.bzl	reject	32	K	Program.Main	usingvar	a			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0165.bzl	reject	34	K	Program.Main	usingvar	b			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0166.bzl	run	36	K	Program.Main	usingvar	a			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0166.bzl	run	38	K	Program.Main	usingvar	b			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0167.bzl	run	35	K	Program.Main	usingvar	a			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0167.bzl	run	38	K	Program.Main	usingvar	b			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0168.bzl	run	37	K	Program.Main	usingvar	a			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0168.bzl	run	40	K	Program.Main	usingvar	b			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0169.bzl	run	37	K	Program.Main	usingvar	a			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0169.bzl	run	39	K	Program.Main	usingvar	b			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0170.bzl	reject	36	K	Program.Main	usingvar	a			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0170.bzl	reject	38	K	Program.Main	usingvar	b			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0171.bzl	reject	33	K	Program.Main	usingvar	a			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0171.bzl	reject	35	K	Program.Main	usingvar	b			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0172.bzl	reject	34	K	Program.Main	usingvar	a			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0172.bzl	reject	36	K	Program.Main	usingvar	b			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0173.bzl	reject	34	K	Program.Main	usingvar	a			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0173.bzl	reject	36	K	Program.Main	usingvar	b			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0174.bzl	reject	32	K	Program.Main	usingvar	a			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0174.bzl	reject	34	K	Program.Main	usingvar	b			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0175.bzl	run	36	K	Program.Main	usingvar	a			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0175.bzl	run	38	K	Program.Main	usingvar	b			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0176.bzl	run	36	K	Program.Main	usingvar	a			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0176.bzl	run	38	K	Program.Main	usingvar	b			value:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0178.bzl	reject	30	H	Program.Main	usingvar	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0179.bzl	run	30	H	Program.Main	usingvar	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0180.bzl	reject	30	H	Program.Main	usingvar	h							ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0180.bzl	reject	31	H	Program.Main	usingvar	w							ok	ok	ok	
-rules	tests/conformance/rules/cases/s7_4_0183.bzl	reject	26	K	Program.Main	usingvar	k							ok	ok	ok	
 rules	tests/conformance/rules/cases/s7_4_2428.bzl	reject	27	H	C.Main	local	h							ok	ok	ok	
 rules	tests/conformance/rules/cases/s7_5_0019.bzl	run	33	Node	C.Main	local	n2			usingvar:target | null:	usingvar:target,null:None	usingvar:target,null:None		ok	edit:scoped@Node.constructor(next)+scoped@Node.constructor(sb)	ok	
 rules	tests/conformance/rules/cases/s7_5_0019.bzl	run	34	Node	C.Main	local	n1			null: | local:n2	null:None,local:n2	null:None,local:n2		ok	edit:scoped@Node.constructor(next)+scoped@Node.constructor(sb)	ok	
-rules	tests/conformance/rules/cases/s8_5_0009.bzl	run	20	Holder	Program.Main	local	h			local:a				ok	ok	ok	
-rules	tests/conformance/rules/cases/s8_5_0009.bzl	run	21	Holder	Program.Main	local	h0			null:				ok	ok	ok	
-rules	tests/conformance/rules/cases/s8_5_0010.bzl	run	20	Holder	Program.Main	local	h			lambda:				ok	ok	ok	
 rules	tests/conformance/rules/cases/s8_6_0011.bzl	run	40	Keeper	Program.Main	usingvar	k							ok	ok	ok	
-lit	tests/lit/ownership/captured_moved_from_binding_3755__nested_lambda_capture_rejected.bzl	reject	13	Box	C.Main	usingvar	box							ok	ok	ok	
-lit	tests/lit/ownership/captured_moved_from_binding_3755__owned_local_moved_before_literal_rejected.bzl	reject	9	Box	C.Main	usingvar	box							ok	ok	ok	
-lit	tests/lit/ownership/captured_moved_from_binding_3755__owned_param_moved_before_literal_rejected.bzl	reject	18	Box	C.Main	usingvar	box							ok	ok	ok	
-lit	tests/lit/ownership/lambda_body_escape_3743__enclosing_lambda_local_stored_into_field_rejected.bzl	accept	33	C	C.Main	usingvar	c							ok	ok	ok	
-lit	tests/lit/ownership/lambda_body_escape_3744__owned_local_closure_stored_into_field_rejected.bzl	accept	41	C	C.Main	usingvar	c							ok	ok	ok	
-lit	tests/lit/ownership/lambda_body_escape_3744__owned_param_closure_stored_into_field_rejected.bzl	accept	39	Box	C.Main	usingvar	b							ok	ok	ok	
 lit	tests/lit/ownership/lambda_body_escape_3744__plain_param_borrow_stored_into_field_accepted.bzl	accept	38	Box	C.Main	usingvar	b							ok	ok	ok	
 lit	tests/lit/ownership/lambda_body_escape_3744__receiver_sourced_field_store_accepted.bzl	accept	35	Box	C.Main	usingvar	b							ok	ok	ok	
 lit	tests/lit/ownership/owned_param_store_escape_3746__borrow_param_into_field_accepted.bzl	accept	35	Box	C.Main	usingvar	b							ok	ok	ok	
-lit	tests/lit/ownership/owned_param_store_escape_3746__closure_into_instance_field_rejected.bzl	accept	42	Box	C.Main	usingvar	b							ok	ok	ok	
 lit	tests/lit/ownership/owned_param_store_escape_3746__collection_add_on_field_receiver_rejected.bzl	accept	40	Box	C.Main	usingvar	b							ok	ok	ok	
 lit	tests/lit/ownership/owned_param_store_escape_3746__indexer_set_on_field_receiver_rejected.bzl	accept	32	Box	C.Main	usingvar	b							ok	ok	ok	
 lit	tests/lit/ownership/owned_param_store_escape_3746__plain_store_into_borrow_field_rejected.bzl	accept	34	Box	C.Main	usingvar	b							ok	ok	ok	
-lit	tests/lit/ownership/owning_choice_call_through_function_typed_field_3575_rejected.bzl	reject	40	Box	C.Main	local	b							ok	ok	ok	
 lit	tests/lit/ownership/span_field_store_1251__record_own_span_component_accepted.bzl	accept	27	BackRef	C.Main	usingvar	br			usingvar:w	usingvar:w	usingvar:w		ok	edit:scoped@BackRef.constructor(x)	ok	
-lit	tests/lit/sema/readonly_field_single_assignment_2187__this_escape_stored_lambda_rejected.bzl	accept	25	C	Prog.Main	usingvar	c							ok	ok	ok	
 lit	tests/lit/sema/send_1732_imported_class_sendability_lib.bzl	accept	45	Tree	OwnsNonSendable.Bad	field-init	Bad	Tree						ok	ok	ok	
-gtest	tests/codegen/closure_cell_member_access_release_8058_test.cpp	mixed	54	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/codegen/closure_cell_member_access_release_8058_test.cpp	mixed	108	Sink	P.Main	usingvar	s			local:g				ok	ok	ok	
-gtest	tests/codegen/closure_cell_member_access_release_8058_test.cpp	mixed	295	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/codegen/closure_cell_member_access_release_8058_test.cpp	mixed	617	Holder	P.Main	usingvar	h							ok	ok	ok	
 gtest	tests/codegen/generic_iface_recursive_property_5343_test.cpp	mixed	16	BoxM	C.Main	local	bi			value: | fresh:BoxM	fresh:BoxM	fresh:BoxM		reject:temp-source	reject:temp-source	ok	
 gtest	tests/codegen/generic_iface_recursive_property_5343_test.cpp	mixed	16	BoxM	C.Main	arg-plain				value: | fresh:BoxM	fresh:BoxM	fresh:BoxM		ok	edit:scoped@BoxM.constructor(next)	ok	plain arg of new BoxM
 gtest	tests/codegen/generic_iface_recursive_property_5343_test.cpp	mixed	16	BoxM	C.Main	arg-plain				value: | null:	null:None	null:None		ok	edit:scoped@BoxM.constructor(next)	ok	plain arg of new BoxM
@@ -350,10 +261,6 @@ gtest	tests/codegen/object_string_store_retain_8214_test.cpp	mixed	384	Holder	Pr
 gtest	tests/codegen/object_string_store_retain_8214_test.cpp	mixed	418	Holder	Program.Main	local	h							ok	ok	ok	
 gtest	tests/codegen/object_string_store_retain_8214_test.cpp	mixed	452	Holder	Program.Main	local	h							ok	ok	ok	
 gtest	tests/codegen/object_string_store_retain_8214_test.cpp	mixed	480	Holder	Program.Main	local	h							ok	ok	ok	
-gtest	tests/codegen/receiverless_inherited_static_lambda_generic_base_5226_test.cpp	mixed	33	D	Program.Main	local	d							ok	ok	ok	
-gtest	tests/codegen/receiverless_inherited_static_lambda_generic_base_5226_test.cpp	mixed	77	D	Program.Main	local	d							ok	ok	ok	
-gtest	tests/codegen/receiverless_inherited_static_lambda_generic_base_5226_test.cpp	mixed	201	D	E.Run	local	d							ok	ok	ok	
-gtest	tests/codegen/receiverless_inherited_static_lambda_generic_base_5226_test.cpp	mixed	245	D	E.Run	local	d							ok	ok	ok	
 gtest	tests/codegen/setter_fresh_temp_dispose_5119_test.cpp	mixed	21	B	Program.Main	usingvar	b			fresh:Item	fresh:Item	fresh:Item		reject:temp-source	reject:temp-source	ok	
 gtest	tests/codegen/setter_fresh_temp_dispose_5119_test.cpp	mixed	53	B	Program.Main	usingvar	b							ok	ok	ok	
 gtest	tests/codegen/setter_fresh_temp_dispose_5119_test.cpp	mixed	91	B	Program.Main	usingvar	b			usingvar:it	usingvar:it	usingvar:it		ok	edit:scoped@B.constructor(v)	ok	
@@ -368,31 +275,6 @@ gtest	tests/ownership/accessor_set_owned_field_store_5252_test.cpp	mixed	105	She
 gtest	tests/ownership/accessor_set_owned_field_store_5252_test.cpp	mixed	125	B	Program.Main	usingvar	b							ok	ok	ok	
 gtest	tests/ownership/accessor_set_owned_field_store_5252_test.cpp	mixed	145	B	Program.Main	usingvar	b							ok	ok	ok	
 gtest	tests/ownership/accessor_set_owned_field_store_5252_test.cpp	mixed	179	Shelf	Program.Main	usingvar	sh							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	13	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	35	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	57	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	79	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	101	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	124	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	147	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	168	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	190	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	216	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	217	Sub	P.Main	usingvar	s							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	263	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	282	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	301	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	330	Holder	P.Main	usingvar	h	Holder						ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	331	Sub	P.Main	usingvar	s	Holder						ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	356	Holder	P.Main	usingvar	h	Holder						ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	357	Sub	P.Main	usingvar	s	Holder						ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	386	Holder	P.Main	usingvar	h	Holder						ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	387	Sub	P.Main	usingvar	s	Holder						ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	412	Holder	P.Main	usingvar	h	Holder						ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	413	Sub	P.Main	usingvar	s	Holder						ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	443	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	465	Holder	P.Main	usingvar	h							ok	ok	ok	
-gtest	tests/ownership/expr_body_getter_closure_cell_8141_test.cpp	mixed	482	Holder	P.Main	usingvar	h							ok	ok	ok	
 gtest	tests/ownership/owned_param_receiver_return_field_store_5225_test.cpp	mixed	52	B	Program.Main	usingvar	b							ok	ok	ok	
 gtest	tests/ownership/owned_return_builtin_class_borrow_7825_test.cpp	mixed	14	Holder	C.Main	usingvar	h			usingvar:s	usingvar:s	usingvar:s		ok	edit:scoped@Holder.constructor(s)	ok	
 gtest	tests/ownership/owned_return_builtin_class_borrow_7825_test.cpp	mixed	186	Holder	C.Main	usingvar	h			usingvar:s	usingvar:s	usingvar:s		ok	edit:scoped@Holder.constructor(s)	ok	

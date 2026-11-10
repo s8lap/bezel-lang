@@ -34,6 +34,48 @@ WRAPPERS = {"Shared", "Weak", "Locked", "RwLocked", "OwningTask", "Task"}
 def strip_null(t):
     return (t or "").strip().rstrip("?")
 
+def is_fn_type(t):
+    """A function type. bzlex records `_g: () -> int` with typ == '(' (its type reader stops at the parenthesis), so a
+    type spelled from '(' is a function type here, as is one whose head is '->'."""
+    t = (t or "").strip()
+    return t.startswith("(") or L.type_head(t) == "->"
+
+def generic_class_instantiations(toks, classes):
+    """name -> 'class' | 'value' | 'open' | None for each class declared in the unit: does the unit name an instantiation
+    `Name<args>` with a class- or interface-typed argument ('class'), only value / runtime-managed arguments ('value'),
+    only arguments that are themselves type parameters ('open'), or none at all (None)? The declaration header itself
+    (`class Name<T>`) and `end Name` are not instantiations."""
+    kinds = S.unit_kinds(classes)
+    names = {c.name for c in classes if c.kind == "class"}
+    out = {}
+    n = len(toks)
+    for i, t in enumerate(toks):
+        if t.kind != "id" or t.text not in names or i + 1 >= n or toks[i+1].text != "<":
+            continue
+        if i > 0 and toks[i-1].text in ("class", "end", "record", "interface", "extension"):
+            continue
+        d = 0; j = i + 1; parts = []
+        while j < n:
+            if toks[j].text == "<": d += 1
+            elif toks[j].text == ">":
+                d -= 1
+                if d == 0: break
+            parts.append(toks[j].text); j += 1
+        args = L.type_args(t.text + "".join(parts) + ">")
+        verdict = "value"
+        for a in args:
+            a = strip_null(a); h = L.type_head(a)
+            if is_fn_type(a) or h in L.VALUE_TYPES or kinds.get(h) in ("record", "enum", "choice"):
+                continue
+            if TYPE_PARAM.match(h) and h not in kinds:
+                if verdict == "value": verdict = "open"
+                continue
+            verdict = "class"; break
+        rank = {None: 0, "open": 1, "value": 2, "class": 3}
+        if rank[verdict] > rank[out.get(t.text)]:
+            out[t.text] = verdict
+    return out
+
 def field_borrow_kind(m, kinds, bb):
     """How a non-static field / auto-property contributes to its class holding borrows.
     Returns (kind, detail): direct | collection | scoped-callback | owned-of-bb | generic | None."""
@@ -42,7 +84,7 @@ def field_borrow_kind(m, kinds, bb):
         return None
     owned = "owned" in m.mods
     h = L.type_head(typ)
-    if h == "->":
+    if is_fn_type(typ):
         return ("scoped-callback", typ) if "scoped" in m.mods else None
     if h == "[]":
         mm = re.match(r"\[[^\]]*\](.*)", typ)
@@ -61,7 +103,7 @@ def field_borrow_kind(m, kinds, bb):
             return ("direct", typ)                      # a borrow of a collection object owned elsewhere
         el = strip_null(S.elem_type_of(typ) or ""); ky = strip_null(S.key_type_of(typ) or "")
         for e in (el, ky):
-            if not e: continue
+            if not e or is_fn_type(e): continue         # a collection of function values holds no object borrow
             eh = L.type_head(e)
             if TYPE_PARAM.match(eh) and eh not in kinds:
                 return ("generic", typ)
@@ -110,7 +152,7 @@ def classify_classes(classes, kinds):
         for p in c.primary:                             # §22.10: a body reference captures a primary-constructor parameter into a field
             if "owned" in p.mods: continue
             pt = strip_null(p.typ)
-            if p.name in names and S.is_class_typed(pt, kinds) is True and not TYPE_PARAM.match(L.type_head(pt)) and L.type_head(pt) != "->":
+            if p.name in names and not is_fn_type(pt) and S.is_class_typed(pt, kinds) is True and not TYPE_PARAM.match(L.type_head(pt)):
                 why.append((p.name, "direct", p.typ + " (primary capture)"))
         if why: bb[c.name] = why
         pending[c.name] = later
@@ -263,6 +305,7 @@ def scan_unit(corpus, path, text, stats, cls_rows, site_rows, kill_rows, store_h
     # the prior scanner's store sites for this unit
     hits = []
     S.scan_unit(corpus, path, text, hits, Counter())
+    inst = generic_class_instantiations(toks, classes)
     stored = defaultdict(set)                           # class -> ctor parameter names stored into a borrow field/collection
     for h in hits:
         cname = getattr(h, "class")
@@ -285,6 +328,16 @@ def scan_unit(corpus, path, text, stats, cls_rows, site_rows, kill_rows, store_h
             h.A_call = "bounded" if h.kind in ("2", "3") else ("no-call-site" if h.kind == "U" else "")
         elif h.shape in STORE and h.kind in ("V", "N"):
             h.pop = h.kind
+        elif h.shape in STORE and is_fn_type(h.target_type):
+            h.pop = "F"                                 # a function value stored in a function-typed field: §28.3's closure rules, not K4.3
+        elif h.shape in STORE and TYPE_PARAM.match(L.type_head(strip_null(h.source_type or ""))) and L.type_head(strip_null(h.source_type or "")) not in kinds \
+                and inst.get(cname) in ("value", "open"):
+            # a bare-T parameter stored by a generic class the unit names only at value (or still-open) type arguments: no
+            # borrow is stored at any instantiation the unit names (§3.6 rule 2: the requirement is read per instantiation).
+            # A class the unit never names with type arguments is not counted here: the parameter is then a generic
+            # METHOD's own (e.g. a dispatched `Keep<U>(x: U) where U: class`), which this scanner cannot instantiate.
+            h.pop = "G"
+            h.A0_store = h.A1_store = "ok:no-class-instantiation(" + str(inst.get(cname)) + ")"
         elif h.shape in STORE:
             h.pop = "T"
         else:
@@ -292,8 +345,13 @@ def scan_unit(corpus, path, text, stats, cls_rows, site_rows, kill_rows, store_h
         if h.pop == "T":
             src_param = h.source_kind.startswith("param") or h.source_kind.startswith("primary")
             foreign = "receiver=param" in (h.notes or "") or (h.shape == "prop-store" and "receiver=" in (h.notes or "") and "receiver=this" not in (h.notes or "") and "receiver=local" not in (h.notes or ""))
+            obj_param = L.type_head(strip_null(h.source_type or "")) == "Object"
             if foreign:
                 h.A0_store = h.A1_store = "reject:store-into-an-object-the-member-does-not-hold"
+            elif obj_param and mk not in ("ctor", "init", "primary", "setter"):
+                h.A0_store = h.A1_store = "reject:no-scoped-at-Object"      # §28.14 *Not at `Object`*: retype the parameter
+            elif obj_param and mk in ("ctor", "init", "primary"):
+                h.A0_store = "ok:announced-by-type"; h.A1_store = "reject:no-scoped-at-Object"
             elif not src_param:
                 h.A0_store = h.A1_store = "ok:self-or-sibling"
             elif mk in ("ctor", "init", "primary"):
@@ -629,7 +687,7 @@ def main():
     P(f"stats: {dict(stats)}")
     STORE = ("field-store", "field-init", "primary-capture", "prop-store", "coll-store", "indexer-set")
     allst = [h for h in stores if h.shape in STORE]
-    P(f"\nstore sites the prior scanner finds, every corpus and tier: {len(allst)}; not a trust store: {sum(1 for h in allst if h.pop in ('V', 'N'))} (V = value instantiation, N = static source), {sum(1 for h in allst if h.pop == 'L')} (L = a store into a purely local collection, silent in the report since v0.350)")
+    P(f"\nstore sites the prior scanner finds, every corpus and tier: {len(allst)}; not a trust store: {sum(1 for h in allst if h.pop in ('V', 'N'))} (V = value instantiation at the call site, N = static source), {sum(1 for h in allst if h.pop == 'G')} (G = a bare-T parameter stored by a generic class the unit instantiates at no class type), {sum(1 for h in allst if h.pop == 'F')} (F = a function-typed field: the closure rules' subject), {sum(1 for h in allst if h.pop == 'L')} (L = a store into a purely local collection, silent in the report since v0.350)")
     st = [h for h in allst if h.pop == "T"]
     P(f"K4.3 store sites (field-held + collection-held), every corpus and tier: {len(st)}")
     P("  by shape: " + str(dict(Counter(h.shape for h in st))))
@@ -710,7 +768,7 @@ def main():
     for s in acc_sites:
         touched.add(s.unit)
         for cand in ("A0", "A1", "B"): bump(s.unit, cand, getattr(s, cand).split(":")[0])
-    for h in [h for h in allst if h.pop in ("T", "L") and h.corpus != "gtest" and h.expect in ACC]:
+    for h in [h for h in allst if h.pop in ("T", "L", "G") and h.corpus != "gtest" and h.expect in ACC]:
         touched.add(h.unit)
         for cand, v in (("A0", h.A0_store), ("A1", h.A1_store)):
             bump(h.unit, cand, v.split(":")[0])
@@ -723,12 +781,13 @@ def main():
         for line in open(hp):
             parts = line.rstrip("\n").split("\t")
             if len(parts) >= 4 and parts[0] != "unit": hc[parts[0]] = parts
-    need = sorted(u for u in touched if roll[u]["A0"] == "reject" or any(h.unit == u and h.kind == "2" for h in accst))
+    k2units = {h.unit for h in allst if h.kind == "2" and h.pop in ("T", "L", "G") and h.corpus != "gtest" and h.expect in ACC}
+    need = sorted(u for u in touched if roll[u]["A0"] == "reject" or u in k2units)
     missing = [u for u in need if u not in hc]
     for u, parts in hc.items():
         if u in roll:
             roll[u]["A0"] = parts[1]; roll[u]["A1"] = parts[2]
-    P(f"\nhand-checked accepted-tier programs (scanner reject or escaping holder): {len(need)}; missing from hand_check.tsv: {missing}")
+    P(f"\nhand-checked accepted-tier programs (scanner reject or escaping holder, kind 2, in any population): {len(need)}; in hand_check.tsv: {len(hc)}; missing from hand_check.tsv: {missing}")
     P("  hazard class of the hand-confirmed rejections under A: " + str(dict(Counter(parts[3] for u, parts in hc.items() if parts[1] == "reject"))))
     n_acc_units = sum(1 for corpus, path, text in UNITS if corpus != "gtest" and S.unit_expect(corpus, path, text) in ACC)
     P(f"\nPER-PROGRAM ROLL-UP, accepted tier (rules/docs/lit units the spec expects to compile): {n_acc_units} programs; {len(touched)} hold a K4.3 store or construct a borrow-bearing class")
