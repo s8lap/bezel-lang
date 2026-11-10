@@ -1,0 +1,346 @@
+== compile t01-wc/final
+== compile rc=0
+== run
+4 9 45
+== exit 0
+== compile t02-wordfreq/final
+== compile rc=0
+== run
+it 4
+of 4
+the 4
+was 4
+age 2
+== exit 0
+== compile t03-csv/final
+== compile rc=0
+== run
+rows: 5
+Eng: 215000
+Ops: 165000
+Sales: 70000
+== exit 0
+== compile t04-grep/final
+== compile rc=0
+== run
+2:Beta
+4:betamax
+== exit 0
+== compile t04-grep/final
+== compile rc=0
+== run
+== exit 1
+== compile t04-grep/final
+== compile rc=0
+== run
+usage: grep [-i] [-v] PATTERN
+== exit 2
+== compile t05-ini/final
+== compile rc=0
+== run
+line 9: syntax error
+[server]
+  host=example.com
+  port=8080
+[client]
+  retries=3
+  name=bezel
+port=8080 timeout=30
+== exit 0
+== compile t06-logsummary/final
+== compile rc=0
+== run
+INFO 2
+ERROR 2
+WARN 1
+first=10:02:30 last=10:15:45 span=00:13:15
+== exit 0
+== compile t07-money/final
+== compile rc=0
+== run
+12.50 USD + 7.25 USD = 19.75 USD
+price with amount 3.00 -> 3.00 USD
+currency mismatch: USD vs EUR
+equal: True
+== exit 0
+== compile t08-shapes/final
+== compile rc=0
+== run
+Circle 3.14
+Rect 6.00
+Triangle 6.00
+total 15.14
+largest Rect
+== exit 0
+== compile t09-weekday/final
+== compile rc=0
+== run
+Monday weekend=False next=Tuesday
+Saturday weekend=True next=Sunday
+Funday: not a weekday
+Sunday next=Monday
+weekend days: 2
+== exit 0
+== compile t10-validate/final
+programs/t10-validate/final.bzl:35:7: warning: owned value in `errs` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop); declare it `using var` to make the scope-bound disposal explicit, or `move` / `return` / `.Dispose()` / `_ := …` to discharge it
+== compile rc=0
+== run
+ok: ann@example.com
+invalid: bob: email missing @; age out of range
+invalid: @x: email malformed; password too short; password needs a digit
+== exit 0
+== compile t11-groupby/final
+== compile rc=0
+== run
+cho 1 30.00
+ann 2 12.25
+bob 2 10.00
+== exit 0
+== compile t12-topn/final
+== compile rc=0
+== run
+1. dan 90
+2. amy 70
+3. bob 70
+avg 64.0
+== exit 0
+== compile t13-join/final
+== compile rc=0
+== run
+ann -> Eng
+bob -> Ops
+cho -> Eng
+dee -> (none)
+Eng 2
+Ops 1
+Legal 0
+== exit 0
+== compile t14-histogram/final
+== compile rc=0
+== run
+1 | ***
+2 | ***
+3 | **
+4 | *
+5 | *
+== exit 0
+== compile t15-sets/final
+== compile rc=0
+== run
+Unhandled exception: System.DisposedAccessException
+== exit 70
+== compile t16-inventory/final
+programs/t16-inventory/final.bzl:20:5: warning: owned value in `negative` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop); declare it `using var` to make the scope-bound disposal explicit, or `move` / `return` / `.Dispose()` / `_ := …` to discharge it
+== compile rc=0
+== run
+bolt -1
+nut -2
+washer 4
+negative: bolt, nut
+== exit 0
+== compile t17-parsesum/final
+== compile rc=0
+== run
+line 2: bad number 'x'
+line 4: missing '='
+sum=0
+good=3 bad=2
+== exit 0
+== compile t18-retry/final
+== compile rc=0
+== run
+attempt 1 failed: transient
+attempt 2 failed: transient
+result 42
+attempt 1 failed: transient
+gave up: transient
+== exit 0
+== compile t19-result/final
+== compile rc=0
+== run
+8 -> 4
+7 -> error: 7 is odd
+x -> error: not a number: x
+== exit 0
+== compile t20-exceptions/final
+== compile rc=0
+== run
+error: invalid port
+  caused by: System.FormatException
+cleanup
+== exit 0
+== compile t21-numberlines/final
+programs/t21-numberlines/final.bzl:22:5: warning: the result of this expression statement is unused — a non-`()` result is silently discarded, which may indicate a bug (a return value the programmer forgot to use); to suppress this warning bind it explicitly (`_ := expression;`) (§21.9)
+programs/t21-numberlines/final.bzl:23:5: warning: the result of this expression statement is unused — a non-`()` result is silently discarded, which may indicate a bug (a return value the programmer forgot to use); to suppress this warning bind it explicitly (`_ := expression;`) (§21.9)
+== compile rc=0
+== run
+  1: alpha
+  2: beta
+  3: gamma
+== exit 0
+== compile t22-binary/final
+programs/t22-binary/final.bzl:33:5: warning: the result of this expression statement is unused — a non-`()` result is silently discarded, which may indicate a bug (a return value the programmer forgot to use); to suppress this warning bind it explicitly (`_ := expression;`) (§21.9)
+== compile rc=0
+== run
+16 bytes
+1 256 -2 1000000
+sum 1000255
+== exit 0
+== compile t23-dirlist/final
+programs/t23-dirlist/final.bzl:12:5: warning: owned value in `files` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop); declare it `using var` to make the scope-bound disposal explicit, or `move` / `return` / `.Dispose()` / `_ := …` to discharge it
+== compile rc=0
+== run
+a.log 10
+b.txt 3
+c.txt 0
+txt files: 2
+exists: False
+== exit 0
+== compile t24-json-roundtrip/final
+== compile rc=0
+== run
+{"Name":"Ann","Age":34,"Tags":["admin","dev"]}
+roundtrip equal: True
+== exit 0
+== compile t25-json-read/final
+== compile rc=0
+== run
+items 2 total 6.5
+== exit 0
+== compile t26-plugins/final
+programs/t26-plugins/final.bzl:55:7: warning: the result of this expression statement is unused — a non-`()` result is silently discarded, which may indicate a bug (a return value the programmer forgot to use); to suppress this warning bind it explicitly (`_ := expression;`) (§21.9)
+== compile rc=0
+== run
+hello world
+3
+unknown command: nope
+registered: count, echo
+== exit 0
+== compile t27-lru/final
+== compile rc=0
+== run
+get a -> 1
+evicted b
+get b -> miss
+get c -> 3
+get a -> 10
+== exit 0
+== compile t28-comparer/final
+== compile rc=0
+== run
+Bergen 25 bob
+Bergen 25 eve
+Oslo 40 cho
+Oslo 30 ann
+Oslo 30 dee
+oldest: cho
+== exit 0
+== compile t29-partition/final
+programs/t29-partition/final.bzl:16:98: warning: internal: codegen cannot dispatch member 'ToString' on receiver of type 'T': permissive acceptance (spec #3 / issue #605) admits this site but no concrete member dispatch exists (lowerLocalDecl's zero-init fallback will degrade the slot — #2477)
+== compile rc=0
+== run
+even: 2 4 6 8 10
+odd: 1 3 5 7 9
+long: tree green
+short: a is sky
+== exit 0
+== compile t30-workers/final
+== compile rc=0
+== run
+sum of squares 333833500
+workers 4
+== exit 0
+== compile t31-pipeline/final
+programs/t31-pipeline/final.bzl:7:39: warning: owned parameter `sink` is implicitly disposed by the frame at teardown (§28.3/§29.8/§30.1 must-use / auto-drop); `move` / `return` / `.Dispose()` it, or adopt it with `using var _ := move sink;`, to discharge it explicitly
+programs/t31-pipeline/final.bzl:13:61: warning: owned parameter `output` is implicitly disposed by the frame at teardown (§28.3/§29.8/§30.1 must-use / auto-drop); `move` / `return` / `.Dispose()` it, or adopt it with `using var _ := move output;`, to discharge it explicitly
+== compile rc=0
+== run
+ALPHA
+BETA
+GAMMA
+done 3
+== exit 0
+== compile t32-timeout/final
+== compile rc=0
+== run
+timed out
+fast result 2
+== exit 0
+== compile t33-fanout/final
+== compile rc=0
+== run
+results 1 2 3
+sum 6
+concurrent: True
+== exit 0
+== compile t34-statemachine/final
+== compile rc=0
+== run
+Idle -> HasCoin(50)
+insufficient: 50 < 75
+HasCoin(50) -> HasCoin(50)
+HasCoin(50) -> HasCoin(100)
+HasCoin(100) -> Vending(25)
+vend, change 25
+nothing to refund
+Idle -> Idle
+== exit 0
+== compile t35-calc/final
+programs/t35-calc/final.bzl:104:5: warning: owned value in `left` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop); declare it `using var` to make the scope-bound disposal explicit, or `move` / `return` / `.Dispose()` / `_ := …` to discharge it
+programs/t35-calc/final.bzl:113:5: warning: owned value in `left` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop); declare it `using var` to make the scope-bound disposal explicit, or `move` / `return` / `.Dispose()` / `_ := …` to discharge it
+== compile rc=0
+== run
+(+ 1 (* 2 3))
+1 + 2 * 3 -> 7
+(1 + 2) * 3 -> 9
+-4 + 10 / 3 -> -1
+2 * (3 +  -> error: unexpected end at 9
+8 / (4 - 4) -> error: division by zero
+== exit 0
+== compile t36-pool/final
+== compile rc=0
+== run
+open 1
+conn 1: query
+open 2
+conn 1: a
+conn 2: b
+conn 2: will fail
+caught boom
+end of main
+close 2
+close 1
+== exit 0
+== compile t37-table/final
+== compile rc=0
+== run
+name       qty   price     total   share
+----------------------------------------
+widget       3    2.50      7.50    6.3%
+gadget      10    1.25     12.50   10.4%
+gizmo        1   99.99     99.99   83.3%
+----------------------------------------
+TOTAL                     119.99
+== exit 0
+== compile t38-dates/final
+== compile rc=0
+== run
+269 days
+2026-03-16
+Saturday
+Tuesday
+1d 01:01:01
+== exit 0
+== compile t39-ffi/final
+== compile rc=0
+== run
+strlen 5
+abs 7
+pid ok
+BEZEL
+== exit 0
+== compile t40-lockcounter/final
+== compile rc=0
+== run
+atomic 4000
+== exit 0

@@ -1,0 +1,31 @@
+task	construct	written	citation	note
+t04-grep	args parsing	case a of "-i" => ignoreCase := true, ... end;	§19 case statement with string patterns and assignment arms	compact
+t05-ini	nested null-conditional lookup	var sec := _sections.GetOrNull(section); return sec?.GetOrNull(key);	stdlib *OrNull tier + ?. (§7)	compact
+t06-logsummary	join tail of split	String.Join(" ", parts.Skip(2))	String.Join over IEnumerable; Skip	compact
+t06-logsummary	datetime parse/format/subtract	DateTime.Parse, {t:HH:mm:ss}, last - first -> TimeSpan rendered 00:13:15	stdlib §2.5	as short as C#
+t07-money	record with operator + and ToString override	first draft compiled and ran	§9, §25	equal to C# record, value equality 1.0m = 1.00m
+t08-shapes	choice with methods + case expression + binding atom	Heron in (var s := ...; expr)	§35, §17.15	compact
+t10-validate	collect-all-errors	Array<string> errors + String.Join("; ", errs); s.Age in 13..120; Password.Any(Char.IsDigit)	range `in`, LINQ over string	compact
+t12-topn	OrderByDescending(int).ThenBy(string).Take(3) + Average	first draft	stdlib §5	one line, same as LINQ
+t13-join	diagnostic for Count	-	diagnostic names §26.5 rule 1 and the arity mismatch precisely	clear
+t13-join	lookup with null-conditional chain	byId.GetOrNull(e.DeptId)?.Name ?? "(none)" over ToDictionary	*OrNull tier, ?., ??	one line
+t14-histogram	SortedDictionary + String.Repeat	first draft	stdlib §4.17, §9.6	compact
+t16-inventory	dictionary literal + += through indexer	var stock: Dictionary<string, int> := ["bolt": 10, ...]; stock[k] += d	§15.4	compact
+t17-parsesum	TryParse with out var + continue	first draft	§22.4 Try shape (c)	as C#
+t18-retry	generic async retry with filtered catch	catch var ex: IOException when attempt < maxAttempts => do ... end; return await op() inside try inside while true	§31 catch guards, §30	close to C#
+t19-result	AndThen chain with method references	Steps.ParseInt(s).AndThen(Steps.CheckEven).AndThen(Steps.Half) + exhaustive case	stdlib §2.20 Result combinators, §27.6 method refs	as Rust
+t20-exceptions	exception with cause; CauseChain; finally	first draft	§31.4	as C#
+t21-numberlines	alignment in interpolation	$"{n,3}: {line}"	§18.5 alignment	compact
+t25-json-read	synthesized Deserialize skipping unknown fields	record Item(...): IDeserializable; Item.Deserialize(d) in a HasMoreElements loop	§9.8 synthesis + IgnoreUnknownFields	reflection-free and short
+t26-plugins	interface + owning registry + slice args	OwningDictionary<string, ICommand>, cmd.Run(parts[1..]), GetOrNull + null check	§23, §16 ranges, stdlib §4.9	first draft ran
+t27-lru	generic class with hashable K and LinkedList	LruCache<K, V> where K: hashable; LinkedList Find/RemoveNode	§14.2	close to C#
+t30-workers	Domain.Spawn with a method group + value result	using var t0 := Domain.Spawn(SumSquares, new Slice(1, 250)); await t0 + await t1 ...	stdlib §6.8	real parallelism, no data races by construction
+t31-pipeline	await for over channels; ReceiveAll	await for var w in input.ReceiveAll() ... ; close by dropping the last sender	stdlib §6.9	close-on-last-sender gives end-of-stream for free
+t32-timeout	cancellation scope	using var cts := CancellationTokenSource.WithCancelAfter(...); catch OperationCanceledException	stdlib §6.1	cleaner than C# CancelAfter + linked tokens
+t34-statemachine	guarded payload arms	Select(var p) when a >= p => ...; Select(var p) => ...	§19.4 guards	reads like Kotlin when/Rust match
+t34-statemachine	choice ToString via case	override ToString(): string => (case this of ...)	§35	-
+t35-calc	throw as an expression inside a case arm	_ => throw new ParseError($"unexpected '{c}' at {i}") in an expression case	§17 throw expression	compact
+t36-pool	exception-safe lease with a callback	With(action: (Connection) -> ()) using try/finally Return(move c)	§28, §31 finally	destructors ran exactly once (close 2, close 1)
+t37-table	alignment + format in holes	$"{i.Name,-10}{i.Qty,4}{i.Price,8:F2}{total / grand,8:P1}"	§18.5	as C#
+t39-ffi	extern block, CString, int/char round-trip	first draft ran	§32	as short as C# P/Invoke, no attributes
+t40-lockcounter	atomic counter shared across domains	Shared<AtomicInteger<int>> + Clone() per domain + Increment()	stdlib §6.4, §2.16	correct 4000; no data race possible
