@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.356 — November 2026**
+**Companion to the Bezel Language Specification, v0.357 — November 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -15972,5 +15972,88 @@ Bezel raised exceptions for two different things — a bug in the program, and a
   *Rule corpus:* 48 new cases (proposal 0211 §9.3, each reject case with an accepting twin): `s31_4_0009`–`0025`, `s31_2_1_0010`–`0018`, `s31_2_3_0022`–`0023`, `s31_2_5_0002`, `s30_14_0017`–`0019`, `s30_9_0010`, `s31_2_0014`, `s22_16_0032`, `l1_0007`–`0008`, `l2_3_0033`, `l2_5_0061`, `l2_15_0039`, `l6_9_0014`–`0015`, `l6_12_0006`, `l7_5_0003`, `l9_1_0030`–`0031`, `l9_2_0020`, `l9_3_0022`; unbanked until the next classification. `s31_2_1_0007`'s program is rewritten with its rule and `run` verdict kept. Quotes refreshed, verdicts unchanged: `l1_0001`, `l2_3_0002`, `l2_3_0023`, `l6_12_0001`, `l9_1_0007`, `l9_2_0007`, `l9_2_0008`, `l9_3_0020`, `s31_2_1_0003`, `s31_2_1_0004`. `names.py` indexes the built-in interface the spec states in prose, so the marker is not reported as invented.
 
 **Checks.** `scripts/check_docs.sh` (all phases), `check_proposals.sh`, `build_book.py --check`, `check_src_citations.py` and `gen_editor_grammars.py --check` are clean on this branch; `corpus.py lint --strict` (5,829 cases), `corpus.py check` and the corpus harness's unit tests are clean. The one CITATION advisory (`[spec] §4.12`) predates this revision. This revision is composed with v0.357 (proposal 0212 stage 1, a sibling train) by the coordinator, whose composition gate runs over the union.
+
+---
+
+### v0.357 changelog (v0.356 → v0.357)
+
+**Proposal 0212, stage 1: borrow-bearing classes become the trust-admission report's classification. No verdict changes; stages 2 and 3 are scheduled.** On 2026-11-10 the owner directed: "Please resolve all open questions in these proposals, then adjust any proposal or write any new ones as needed. Then, graduate the two proposals." The direction delegated the rulings. [Proposal 0212](proposals/0212-borrow-bearing-classes.md) ([#8411](https://github.com/s8lap/bezel-lang/issues/8411)) is a design change. Its design ramps in three stages, each one revision: a report, then a default-build warning, then an error. The error stage is a Ratchet, since the decision behind it is the one recorded here. Graduation therefore means three things. The design is accepted. Stage 1 lands now. Stages 2 and 3 are recorded as scheduled ratchets with their gates, and their text lands in later revisions, after the compiler implements stage 1 and the report's data is in. The proposal's status is `accepted — staged`, not `graduated`, until its third stage lands.
+
+*Classification* (spec-change process §9). The kernel class is a derivation: the property is a derived type property; the source set and the bound derive from K2.3, K2.4, K5.5 and K8.4; the callee side from K2.4; owned erasure from K2.3, K2.4 and the K3 consume table; teardown from K9 and §28.4. Stage 1 adds no axiom. Axiom A11 is extended at stage 2, when the class-typed `scoped` argument is admitted against any traced location. Body locality: every rule is local, except owned erasure in a generic body, which is the generic-instantiation carve-out §9.7's generic paragraph already uses. The design passed two adversarial critiques. Round 1 rejected the first draft, finding five unsound routes and one sendability regression, and revision 2 closed each. Round 2 accepted revision 2 with three notes, which are folded in (proposal §12).
+
+**The rulings (owner-delegated, 2026-11-10; proposal §11 *Rulings*).** Each recommendation was adopted as written, with critique round 2's views folded in.
+- **Q1, the direction.** *Decided:* a class that stores a borrow is a borrow-bearing class, its instances carry their sources, and K4.3's field-held, collection-held and comparer-held clauses are retired through the three-stage ramp. The frame-held clause and §28.14's two residuals stay as recorded trust.
+- **Q2, a per-field trust opt-out.** *Decided, provisionally:* none. It would keep the clause, and the domain race no flag catches, under another name. *Re-ruled at the stage-3 gate*, on the stage-1 report's count of "no static form" stores in programs that are not tests; stages 1 and 2 are the same either way (`DECLINED.md` row D1, marked provisional).
+- **Q3, what a mint carries.** *Decided:* the mint reads the signature, so every argument of a constructor call is carried, stored or not, with no marker. *Declined:* a `scoped` marker on each stored constructor parameter. *Why:* it needs 53 markers in the accepted corpus where the signature reading needs 12, to gain one construction site in 312.
+- **Q4, interfaces.** *Decided:* an interface is borrow-bearing by derivation from its store members. *Declined:* a declared borrow-bearing interface (row D3).
+- **Q5, a store that relates two parameters.** *Decided:* no spelling of its own. The storing object becomes the receiver, or the store is made at the caller. *Declined:* `scoped(a) it` (row D2).
+- **Q6.** K5.7's freeze of a `scoped` argument's source is kept where it exists. The locations stage 2 newly admits take K4.2's unfrozen posture.
+- **Q7.** A member that is not a constructor has no spelling for keeping an `Object` parameter; it declares the parameter at the stored type.
+- **Q8.** `scoped` is admitted at a type parameter, at stage 2. The call-site asymmetry with a standard collection's `Add` is accepted, and its use will be measured.
+- **Q9, the gates.** Stage 1 lands with acceptance, in this revision. Stage 2 lands once the compiler implements stage 1 and its prerequisites and the report has been read over the in-tree programs. Stage 3 lands once the compiler implements the stage-2 warning, the in-tree corpora are migrated, and the report over the reference programs shows no "no static form" site without a rewrite, or once the owner has re-ruled Q2 with that count in hand.
+- **Q10, a weak reference over an ordinary owned object.** *Decided:* a separate proposal, written after the stage-1 report's data, and not now. Reordering, owning with keys, and `Weak<T>` over `Shared<T>` cover the measured cases. Recorded as a `deferred` row of `DECLINED.md`.
+- **Q11.** A dominated use fires when *every* carried source is disposed, as for a record.
+- **Q12.** Moot under 0212: a constructor call is a mint for a class-typed argument and resolves no bounding form.
+- **Q13, comparers and sendability.** *Decided:* at an instantiation that is not a carrier type, every sendable one among them, a retained comparer must be static-sourced. The decision is taken with its price stated. A comparer with per-instance state has no spelling there. The one admitted spelling, a `static readonly` instance, draws §22.12 rule 4's warning for a user class. And **forwarding is lost**: a class or a generic that takes a comparer in its constructor and passes it to such a collection is an error, whatever its callers pass. *Rewrite:* a key record that declares its own `Equals` and `GetHashCode`, the form `SortedDictionary` already requires for an ordering. *Declined:* keeping the four collections carriers everywhere with a value check at each domain transfer (row D7). The two widenings the proposal names (standard-library comparer instances, and rationale §12.13's comparer type parameter) are not proposed. The stdlib text lands at stage 3.
+- **Q14.** A move-only value that owns a borrow-bearing instance (an owning choice, an owning inline array, `Result<T, E>`) is a carrier type, by one rule.
+- **Q15.** The second order test is adopted: a holder that carries `this` and whose release may run user code is declared after every `owned` field of its class.
+- **Q16, the declared-reach refinement of the taken-out rule.** *Ruled at the stage-2 gate*, on stage 1's count (row D8, `deferred`). The unsealed form stays off the table, as unsound (probe e02).
+
+**The language specification.**
+- **§28.15 Borrow-bearing classes (new).** *The property*: a class with a borrow field, an `owned` field of a carrier type, or a store member is borrow-bearing, and so is an interface with a store member. *Carrier types* are those classes and interfaces, plus the owning choices and owning inline arrays that own one. *The source set*: mints, later stores, reads (including the taken-out rule), and a frame's results. *The bound*: scope, temporaries, returns, the freeze, release as a use, and `throw`. *The callee side*: a plain parameter is call-bounded, the `owned`-parameter rule applies, and so do the two order tests. Then *Owned erasure*, read per instantiation in a generic body; *Teardown*; and *Frames*. *Staging* says that in this revision the rules define the report's classification and change no verdict, and states the two later ends of the ramp.
+- **§28.3.12, the trust-admission report, clause 4 (new).** Each field-held, collection-held and comparer-held line also states its classification: **bounded**, **needs `scoped`** (naming the parameter), or **no static form** (naming the reason). The mode also emits one line at each site that is not a store and that §28.15 rejects. A unit with neither kind of line is one §28.15 admits unchanged.
+- **§3.6**: the derived-property table's **borrow-bearing** row gains its class-and-interface arm, the *borrow-bearing class* of §28.15. A rule that reads the property of a value type still reads the record, inline-array and choice arms only, and the class arm is distinguished from *holds-borrows*. **§28**: the chapter-at-a-glance table gains its row.
+
+**The standard library.** §1 *Borrow-bearing statements* (new). The carrier types are a borrowing collection at a class or interface element, key or value type; an owning collection, `Shared<T>` and `Weak<T>` at a carrier type argument; and `Result<T, E>` and the other library choices by the language's rule. The members whose `owned` result carries the receiver's set but not its binding are those that take an element out of a collection, `Shared<T>.Clone()`, `Downgrade()` and `Weak<T>.TryUpgrade()`.
+
+**The rationale.** §5.32 (new) records the decision and its ramp: the signature-read mint, the callee side and the reopened v0.329 decline (§4.2.6), the provisional no-opt-out ruling, erasure at owning positions only, the consume table as the list of owning positions, Q13's sendability rule and its price, and what was not done, Q10 and Q16 among it. §5.1's "planned work" sentences are brought current: the set's shrinking is now §28.15's ramp, and proposal 0132's derived retention is superseded.
+
+**Proposals and records.** Proposal 0212's status, its rulings section and its §7.5, which records what stage 1 landed, what is scheduled and every adaptation. The README row moves to *Accepted*. `DECLINED.md` gains rows D1–D7 (`declined-at-proposal`, D1 marked provisional) and two `deferred` rows: D8, and the Q10 follow-up. The six annotations of proposal §8.10 wait for stages 2 and 3.
+
+**The code-generation reference.** Its three pins move to v0.357, and §4.4's back-reference bullet gains a note on the scheduled ramp: keep the back-reference in a constructor. The guides are unchanged and their pins stay put, because stage 1 changes no idiom; Guide 01 §3 and §5 and Guide 05 §1 change at stage 3.
+
+**Adaptations of the [S1] text.** Each `old` anchor was re-verified at `156fdf9c9` (`check_anchors.py`: 41 anchors, 0 failures). Eight texts were adapted, as proposal §7.5 lists:
+- §28.15 holds back the two [S3] phrases: "K2 clause 5" and "No carrier type is sendable".
+- *Returns* writes `return a;` for `return move a;`, the drafted form being the redundant-marker error at a marker-free position.
+- *Staging* states the no-verdict rule positively and gives the ramp's two later ends.
+- The example is staged, and drops a block that §28.14 already rejects.
+- The stdlib paragraph holds back its stage-3 sentence and "which no carrier type is".
+- Rationale §5.32 is written in stage 1's tense.
+- §5.1's plan sentences are brought current.
+- §8.1's separate §3.6 row is merged into the existing **borrow-bearing** row. `check_docs.sh`'s TABLE check requires distinct first name components, because diagnostics quote the row names.
+
+These adaptations have not had an adversarial critique of their own; the composition gate over this revision and v0.356 is their first review.
+
+**Migration.**
+
+  *Newly rejected:* nothing.
+
+  *Newly warned:* nothing in the default build. Under `--report-trust-admissions` only:
+  - each field-held, collection-held and comparer-held line states its classification;
+  - one line is new at each site that is not a store and that §28.15 rejects: a value that would outlive a source, an `out owned` recipient and a move-only value included; a temporary source; a transfer or reassignment of a carried source under a live value; a use that a disposal of every carried source dominates; an owned value with a non-empty set at an owning position whose type is not a carrier type, including a failed generic instantiation; an `owned` parameter of a carrier type stored anywhere but `this`, the result or its end; a `throw` of a value that carries a source; a comparer that contributes a source at an instantiation that is not a carrier; a failed order test.
+
+  *Newly defined:* the borrow-bearing class property and the carrier types; the source set of a value of a carrier type, and what a mint, a later store, a taken-out value, an `out owned` recipient, an awaited result and an owning iteration's element carry; which standard-library types are carriers, and which library results carry the receiver's set alone.
+
+  *Doc-only:* rationale §5.32 and §5.1; the code-generation reference's pins and note; the proposal and `DECLINED.md` records.
+
+  *The ramp, both ends (scheduled; process §5 item 2).* Stage 2 lands in a later revision, v0.*W*, and stage 3 in a revision after it, v0.*E*.
+  - At v0.*W* each site this revision's report marks "needs `scoped`" or "no static form", and each non-store site, draws a default-build warning that names §28.15's rule and its rewrite. §28.14's class-typed `scoped` parameter is widened at the same revision, so that every warning has a rewrite that already compiles; a store only the widening admits is bounded by §28.15 in full from then on.
+  - At v0.*E* each warned site becomes a compile error, and K4.3's field-held, collection-held and comparer-held clauses are deleted.
+  - From v0.357 to v0.*W*, a program that compiles today compiles unchanged, and the report mode names each such site. From v0.*W* to v0.*E*, it compiles with the warning at each such site. A program with no such warning compiles unchanged at v0.*E*.
+  - The gates are Q9's. Q16 is ruled at the stage-2 gate and Q2 is re-ruled at the stage-3 gate.
+
+  *Spec-ahead-of-impl:* [#8419](https://github.com/s8lap/bezel-lang/issues/8419) (the property and carriers), [#8420](https://github.com/s8lap/bezel-lang/issues/8420) (the store-line classification; on r40 the `Object`-parameter store also draws no base line), [#8421](https://github.com/s8lap/bezel-lang/issues/8421) (source sets and the bound), [#8422](https://github.com/s8lap/bezel-lang/issues/8422) (owned erasure), [#8423](https://github.com/s8lap/bezel-lang/issues/8423) (the callee side, the order tests, the comparer). They rest on prerequisites already tracked: #7435 and #7441 (proposal 0205's legs), #5698 (K5.5's frame-local freeze), #7506 (§28.12's live instance), #5923 (the replacing `move`), #5932 (a destructor's `Dispose()` of its own field) and #7471 (the comparer constructors). Comments on #8395 and #7468 record the report's silent and false lines that the classification sits on. One v0.355 over-rejection the probes met is filed as [#8424](https://github.com/s8lap/bezel-lang/issues/8424): a class-typed `scoped` parameter is refused at a member access and as a plain argument. These deltas are measured on r40 (`bezelc 0.0.0-a30bb11d`). The compiler was not built for this revision, so the classification itself is unmeasured.
+
+  *Rule corpus:* 20 cases.
+  - `s28_3_0924`–`s28_3_0927` cover the store classifications.
+  - `s28_15_0001`–`s28_15_0016` cover the non-store lines and their `quiet` twins, all under `--report-trust-admissions`; `s28_15_0003` is *Staging* in the default build.
+  - The non-store `warn` cases mint through a constructor that does not store its argument, so they emit nothing on r40 until #8421–#8423 land, and their twins pass (MEASURED: all twenty compile on r40).
+  - `baseline.tsv` is untouched: the new cases are unclassified.
+  - The sweep re-read the twelve report-mode cases, and none states a rule this revision changes. The five `quiet` ones contain no site §28.15 rejects.
+  - Owed, listed in proposal §7.5: the S1 cases whose programs need a K4.3 store beside the line, or a construct r40 lacks — an `out owned` recipient, an owning choice, the replacing `move`, a comparer constructor (§7.4 cases 4, 12, 15, 21–23, 27, 30–32, 34, 36, 37, 40, 41, 44, 46, 47, 51, 53, 55–57, 62, 64). Also owed are those whose S1 column is a default-build verdict this revision does not change (cases 3, 6, 16, 24, 28, 29, 35, 38, 39, 42, 43, 45, 48–50, 52, 54, 58, 59, 63).
+
+  *Follow-ups recorded:* the Q10 weak-reference proposal, after stage-1 data; Q16 at the stage-2 gate; Q2 at the stage-3 gate.
+
+**Checks.** These ran clean on this train's tree, v0.355 plus this revision, before composition with v0.356: `scripts/check_docs.sh` (all phases), `check_proposals.sh`, `build_book.py --check`, `check_src_citations.py`, `gen_editor_grammars.py --check` (no keyword changes), `corpus.py lint --strict` (5,801 cases) and `corpus.py check`, the harness unit tests, and proposal 0212's `check_anchors.py`. The one CITATION advisory (`[spec] §4.12`) predates this revision. `check_docs.sh`'s TABLE check is what moved the §3.6 entry into the existing row.
 
 ---

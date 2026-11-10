@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.356. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.357. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.356 and `Bezel_Standard_Library.md` v0.356 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.357 and `Bezel_Standard_Library.md` v0.357 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -570,7 +570,7 @@ Choose by intent: `OwningTask<T>` for resource acquisition (one fresh single-con
 A borrow is valid only where **every** source in its source set is live; joins, `??` and arm meets take the **union** of source sets (§28.3).
 
 - A borrow may **not** be assigned to a local whose scope strictly encloses its source's scope — including flowing around a loop back edge. Rejected **at the assignment**, not at the later use.
-- A borrow of a **scope-bound local** may not be stored in a field or in a longer-lived collection. A borrow whose source *does* outlive the object **is** admissible: the **back-reference** idiom binds a constructor parameter into a plain (non-`owned`) class-typed field (`private _owner: Customer;`). The check is structural — sourced from a parameter that is not `owned` (plain or `scoped`) or from the receiver: admitted; locals, temporaries **and `owned` parameters**: rejected (an `owned` parameter is disposed at the method's end, so it is scope-bound — §28.3).
+- A borrow of a **scope-bound local** may not be stored in a field or in a longer-lived collection. A borrow whose source *does* outlive the object **is** admissible: the **back-reference** idiom binds a constructor parameter into a plain (non-`owned`) class-typed field (`private _owner: Customer;`). The check is structural — sourced from a parameter that is not `owned` (plain or `scoped`) or from the receiver: admitted; locals, temporaries **and `owned` parameters**: rejected (an `owned` parameter is disposed at the method's end, so it is scope-bound — §28.3). **Coming change (§28.15, a scheduled ramp):** a class with such a field is *borrow-bearing*, and a later revision rejects a member that is **not a constructor** keeping a plain parameter, and a source moved, reassigned or outlived while the object is in use. At v0.357 these compile and the trust-admission report classifies them; keep the back-reference in a constructor, as above.
   - The result of invoking a function-typed parameter counts as sourced from that parameter and from the call's arguments, a function-typed argument contributing what it captures and a span or other borrow-bearing value argument what it carries: `_v := make()` with `make: () -> Item` is admitted; `_v := pick(local)` and `_v := wrap(lambda() => local)` are not (§28.3).
   - Assigning a class- or interface-typed value to a class's or interface's property is that store whatever the property's accessor form: `obj.P := local` (a scope-bound local) and `obj.P := new T()` are rejected, a parameter- or receiver-sourced borrow is admitted, and a `set(owned)` property takes the value instead (§28.3).
   - A settable **static** property's assignment is the store into a mutable static field of its type: `Config.Current := new Settings()` is admitted only at a type a mutable static may have (a synchronized handle, `Task?`), where the value lives to process exit, and is rejected at any other; assigning a `static readonly` auto-property in its type's static constructor is the `static readonly` field store and is admitted (§28.3).
@@ -697,7 +697,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.356 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.357 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 

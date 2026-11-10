@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.356 — November 2026**
+**Companion to the Bezel Language Specification, v0.357 — November 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -84,6 +84,17 @@ The band-3/band-4 boundary, stated once: what distinguishes them is **where cons
 
 <a id="sec-sendability-statements"></a>
 **Sendability statements.** A compiler-known class type's sendability (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)) is stated in its own section — in a **Sendability** paragraph where the section has one — in one of the four forms §30.14 defines: **sendable**; **sendable iff** its element types meet the stated condition (the collections, `OwningBuffer<T>`, `OwningSlotMap<T>`); **sendable iff** its payload is in the `Shared`-payload synchronized set (`Shared<T>`); or **not sendable** (domain-local). The statements are the single normative carrier of these classifications; the spec states the forms and the rules for every other type, and lists no per-type memberships. A compiler-known class type whose section states no sendability (a type of this library, or a built-in exception type of language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)) is **not sendable**. Such a type becomes sendable only by a statement in its own section. A statement classifies every instance of its type, because a class of this library admits no user subclass unless its section opens it (*Extensibility* above; language spec §12.4). A user class deriving from an opened class is a declared class under §30.14's transfer-closed rules, whose rule 2 reads the base's inherited state as transfer-compatible only where the base's section states so; no section of this document states it, so such a class is not sendable. `string` and `Type`, runtime-managed (language spec §28.9) though this document lists them as classes, are classified by §30.14 directly, as the value types are, and their sections restate the verdict. The transfer-closed rules for declared classes do not classify a compiler-known class: they read instance fields, and this document is not normative for internal data structures (above), the fields of a reference implementation included. A statement is independent of the facts above: `CancellationTokenSource` is **synchronized** and not sendable ([§6.1](#sec-cancellationtoken-and-cancellationtokensource)), and `Channel<T>` carries none of the facts and is sendable ([§6.9](#sec-channel)).
+
+<a id="sec-borrow-bearing-statements"></a>
+**Borrow-bearing statements** (language spec [§28.15](Bezel_Language_Spec.md#sec-borrow-bearing-classes)). The standard-library types that are carrier types:
+
+- a **borrowing** collection, at an instantiation whose element type — for a map, its key or value type — is a class or interface type that is not runtime-managed;
+- an **owning** collection, `Shared<T>` and `Weak<T>`, at an instantiation whose owned type argument is a carrier type;
+- `Result<T, E>`, and every other standard-library choice or owning inline array, by the language's own rule: where an `owned` payload or slot is of a carrier type.
+
+No other standard-library type is a carrier type; `Locked<T>` and `RwLocked<T>` require a sendable interior. `Task<T>` and `OwningTask<T>` are frames: the value an `await` of one yields carries the frame's sources (language spec §28.15).
+
+**Results that carry the set alone.** The `owned` result of a member that takes an element out of a collection — `Drain()`, the `Pop*` family, the replacing `move` of a slot, an owning iteration's elements — and of `Shared<T>.Clone()`, `Shared<T>.Downgrade()` and `Weak<T>.TryUpgrade()` carries the receiver's source set and not the receiver's binding: a standard collection gives no element a borrow of itself, and the handles to one shared value do not borrow one another. The store positions are those of language spec §28.11's *Value-copy members*.
 
 ---
 
