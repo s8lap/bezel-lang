@@ -26169,6 +26169,37 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
     // instance, a §8.6 box, a `string` or a function value may all sit
     // there, and only the first carries the obligation). See
     // `emitObjectSlotDisposal` for the runtime discrimination.
+    // fix #7961 (§28.1 clause 1 / §28.3 / §28.6 / §29.7, v0.357): an `owned`
+    // parameter at a SYNC ITERATOR-FORMAT ENUMERATOR head (`IEnumerator<T>` /
+    // `IOwningEnumerator<T>`) is owned by the CALLEE (§28.1: "the callee owns
+    // an `owned` parameter"), and the enumerator's disposal is the iterator
+    // vtable's slot-1 Dispose (§29.7: it runs the pending `finally` blocks and
+    // frees the frame). The head is declaration-less, so none of the arms above
+    // recognised it and the parameter fell through to the class/interface test
+    // and was skipped: the frame leaked and its `finally` never ran. Register
+    // the same slot-1 disposal a local at this head gets (the `isSyncIterEnum`
+    // arm of registerUsingDisposal), with the parameter arms' own auto-drop /
+    // unwind-only split.
+    if (rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+        rt->astNode && rt->astNode->name &&
+        !rt->astNode->name->parts.empty() &&
+        common::isSyncIterFormatEnumeratorHead(rt->headName())) {
+        Disposal d{slot, nullptr};
+        // A user class may implement `IEnumerator<T>` and reach the slot as a
+        // RAW class instance (class vtable, Dispose at slot 2, §28.2), not an
+        // iterator frame (slot 1, §29.11). The static head cannot tell them
+        // apart, so the disposal asks the VALUE (slot-0 self-reference, §29.2)
+        // — the same discriminator the `for`-in loop-end entry uses. MEASURED:
+        // the plain slot-1 dispatch SEGV'd on a `new MyE()` argument.
+        d.iterEnumOrClassDispose = true;
+        if (ps->autoDropAtScopeEnd) {
+        } else {
+            if (unwindIneligible_.count(static_cast<const void*>(psym))) return;
+            d.unwindOnly = true;
+        }
+        disposeStack_.front().push_back(d);
+        return;
+    }
     if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
         rt->primitive == sema::PrimitiveType::Object) {
         Disposal d{slot, nullptr};
