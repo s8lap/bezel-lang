@@ -1,0 +1,135 @@
+section	condition	type_today	site	kind	action
+1	a negative `capacity`, `size` or `length` constructor argument (#1396)	ArgumentOutOfRangeException	raise	defect	none
+1	`Channel<T>(capacity)` with `capacity < 1` (restated at 6.9)	ArgumentException	raise	defect	none
+1	the failure-signal rule's band 1 names the type	InvalidOperationException	xref	defect	none
+1	the failure-signal rule's band 5 names the type	StackOverflowException	xref	fatal	none
+2.1	`Console.ReadKey()` at end of input	EndOfStreamException	raise	failure	marker
+2.2	`Math.Clamp` with `low > high`	ArgumentException	raise	defect	none
+2.2	`Math.DivRem(a, 0)`	DivideByZeroException	raise	defect	none
+2.3	`Convert.ToString(value, toBase)` with a base outside 2, 8, 10, 16	ArgumentException	raise	defect	none
+2.3	`Convert.To*`: the text is not a well-formed value	FormatException	raise	failure	marker
+2.3	`Convert.To*`: the value does not fit the target type	OverflowException	raise	failure	range-class
+2.4	`Environment.Set` with an empty name or one containing `=`	ArgumentException	raise	defect	none
+2.5	a `DateTime`/`DateOnly`/`TimeOnly` constructor component outside its range	ArgumentOutOfRangeException	raise	defect	none
+2.5	the declaration `ArgumentOutOfRangeException: ArgumentException`	ArgumentException	decl	defect	none
+2.5	`TimeSpan` `*`, `/`, unary `-` and the `From*` factories: a result outside the tick range, or a `NaN` operand	OverflowException	raise	defect	none
+2.5	`TimeSpan / 0.0`	DivideByZeroException	raise	defect	none
+2.5	`DateTime.Parse`, `DateOnly.Parse`, `TimeOnly.Parse`: any other input	FormatException	raise	failure	marker
+2.5	`DateTime.Add*`, `Add`, `Subtract(span)`, `FromTicks`: a result outside `MinValue..MaxValue`	OverflowException	raise	defect	relabel
+2.6	`Guid.FromByteArray` with `Count <> 16`	ArgumentException	raise	defect	none
+2.6	`Guid.Parse`: any other input	FormatException	raise	failure	marker
+2.6	`Guid.ToString(format)`: an unrecognized specifier	FormatException	raise	defect	misfit
+2.7	`Random.Next` with `maxValue < 0` or `minValue > maxValue`	ArgumentOutOfRangeException	raise	defect	none
+2.12	the checked cast `Reinterpret` is contrasted with (spec §5.2)	OverflowException	xref	defect	none
+2.13	`Type.EnumNames` / `EnumValues` on a non-enum `Type`	InvalidOperationException	raise	defect	none
+2.14	synthesized `Deserialize`: an unregistered discriminator, or malformed input	SerializationException	raise	failure	marker
+2.14	synthesized `Serialize`: an unregistered run-time type, or a `Weak` reference to a target never strongly reached	SerializationException	raise	defect	misfit
+2.15	read side: malformed input, a type mismatch, an out-of-range number, a depth-limit violation, an unknown field under the strict policy, trailing data	SerializationException	raise	failure	marker
+2.15	JSON write side: a non-finite float (the section already flags it)	SerializationException	raise	defect	misfit
+2.17	cross-reference to spec §31.4	ContractViolationException	xref	defect	none
+2.17	cross-reference to 4.8	KeyNotFoundException	xref	defect	none
+2.17	cross-reference to spec §31.4 (`ParamName`)	ArgumentException	xref	defect	none
+2.17	the declaration of `TypeInitializationException`	TypeInitializationException	decl	defect	none
+2.17	cross-reference to 2.15	SerializationException	xref	failure	marker
+2.17	cross-reference to 6.8	DomainFaultedException	xref	carrier	none
+2.18	`ToString(format)` and interpolation specs: an unrecognized specifier	FormatException	raise	defect	misfit
+2.19	`IParsable<T>.Parse`: bad input	FormatException	raise	failure	marker
+2.19	`ISteppable<T>.Step`: a result not representable in `T`	OverflowException	raise	defect	none
+3.1	`StringBuilder.AppendFormat`: a malformed format string, a hole index outside `args`, a spec on a type that accepts none	FormatException	raise	defect	misfit
+3.1	`StringBuilder.Insert` / `Remove`: an index or window outside `0..Length`	IndexOutOfRangeException	raise	defect	none
+3.1	`StringBuilder.Replace` with an empty `oldValue`	ArgumentException	raise	defect	none
+3.2	`Encoding.GetString`: ill-formed bytes; `GetBytes`: a code point the encoding cannot represent	FormatException	raise	failure	marker
+3.2	`GetBytes` into a destination span that is too short	IndexOutOfRangeException	raise	defect	none
+3.3	`ReadOnlyStringSpan` indexer and slices out of range	IndexOutOfRangeException	raise	defect	none
+3.3	`ReadOnlyStringSpan.CopyTo` with a length mismatch	ArgumentException	raise	defect	none
+4.1	a mutating member of a user-defined read-only collection	InvalidOperationException	raise	defect	none
+4.3	`Pop`, `PopFirst`, `PopLast`, `Dequeue`, `Peek` on an empty collection (query duals: the `Try*` forms)	InvalidOperationException	raise	defect	none
+4.3	`PopAt(index)` outside `0..<Count`	IndexOutOfRangeException	raise	defect	none
+4.4	`Array<T>` constructors with a negative capacity or size	ArgumentOutOfRangeException	raise	defect	none
+4.4	the indexer and the slice windows out of range	IndexOutOfRangeException	raise	defect	none
+4.4	a structural mutation from inside the collection's own sort comparer	InvalidOperationException	raise	defect	none
+4.5	`OwningArray<T>(capacity)` with a negative capacity	ArgumentOutOfRangeException	raise	defect	none
+4.5	the indexer out of range	IndexOutOfRangeException	raise	defect	none
+4.8	`dict[key]` on an absent key, compound assignment included (query duals: `GetOrNull`, `TryGetValue`)	KeyNotFoundException	raise	defect	none
+4.8	`Add(key, value)` / `Add(entry)` on a present key (query dual: `TryAdd`)	ArgumentException	raise	defect	none
+4.8	a structural mutation from inside `GetOrAdd`'s factory; the note on `KeyNotFoundException`'s base	InvalidOperationException	raise	defect	none
+4.9	`OwningDictionary.Add` on a present key	ArgumentException	raise	defect	none
+4.9	the indexer on an absent key	KeyNotFoundException	raise	defect	none
+4.13	`TakeCurrent()` out of protocol	InvalidOperationException	raise	defect	none
+4.14	indexers, slices, the `Read*`/`Write*` accessors and bit views out of range (query duals: `TryRead*`, `TryWrite*`)	IndexOutOfRangeException	raise	defect	none
+4.14	`MoveFrom` / `CopyFrom` with a length mismatch	ArgumentException	raise	defect	none
+4.14	a bit `count` outside 1..64	ArgumentOutOfRangeException	raise	defect	none
+4.14	`AlignedTail()` on a view that is not byte-aligned	InvalidOperationException	raise	defect	none
+4.14	`span[i]!` on a null slot	NullReferenceException	raise	defect	none
+4.14	a read through a span whose slot value was disposed (checked disposal mode)	DisposedAccessException	raise	defect	none
+4.15	indexers and slices out of range	IndexOutOfRangeException	raise	defect	none
+4.15	`CopyFrom` with a length mismatch	ArgumentException	raise	defect	none
+4.15	a bit `count` outside 1..64	ArgumentOutOfRangeException	raise	defect	none
+4.15	`AlignedTail()` on a view that is not byte-aligned	InvalidOperationException	raise	defect	none
+4.17	the indexer on an absent key	KeyNotFoundException	raise	defect	none
+4.17	`Add` on a present key	ArgumentException	raise	defect	none
+4.17	`FirstKey` / `LastKey` on an empty dictionary; a structural modification during iteration	InvalidOperationException	raise	defect	none
+4.18	`First` / `Last` on an empty set	InvalidOperationException	raise	defect	none
+4.19	the `FrozenArray<T>` indexer out of range	IndexOutOfRangeException	raise	defect	none
+4.21	`OwningSlotMap<T>(capacity)` with a negative capacity	ArgumentOutOfRangeException	raise	defect	none
+4.21	`Get` / `PopValue` on an absent handle (query duals: `GetOrNull`, `TryGetValue`, `TryPopValue`)	KeyNotFoundException	raise	defect	none
+4.21	a handle minted by another map	ArgumentException	raise	defect	none
+4.21	a mutation through a live view	InvalidOperationException	raise	defect	none
+5	a second enumeration of a single-consumption query; `First`/`Last`/`Single` (and predicate forms), `Min`/`Max`/`Average` with no element (query duals: the `*OrNull` forms)	InvalidOperationException	raise	defect	none
+5	`ElementAt` out of range (query dual: `ElementAtOrNull`)	IndexOutOfRangeException	raise	defect	none
+5	`ToDictionary` on a duplicate key	ArgumentException	raise	defect	none
+5	`Sum` past the element type's range	OverflowException	raise	defect	none
+5.1	`Min()` / `Max()` / `Average()` on an empty source	InvalidOperationException	raise	defect	none
+6.1	`Register` on a published source; publishing a source that holds registrations	InvalidOperationException	raise	defect	none
+6.1	`ThrowIfCancellationRequested()`	OperationCanceledException	raise	cancellation	none
+6.1	the declaration of `TimeoutException` (no producer in this library)	TimeoutException	decl	failure	marker
+6.2	a blocking acquire where a domain continuation would park	InvalidOperationException	raise	defect	none
+6.2	a cancelled `AcquireAsync` / `TryAcquireAsync`	OperationCanceledException	raise	cancellation	none
+6.3	a blocking acquire where a domain continuation would park	InvalidOperationException	raise	defect	none
+6.3	a cancelled async acquisition	OperationCanceledException	raise	cancellation	none
+6.3	`new Semaphore(initial, max)` with `max < 1` or `initial > max`	ArgumentException	raise	defect	none
+6.4	an `AtomicInteger<T>` operation whose result is not representable	OverflowException	raise	defect	none
+6.5	a cancelled handler task under `RaiseAsync`	OperationCanceledException	raise	cancellation	none
+6.7	`WhenAny` over an empty array	ArgumentException	raise	defect	none
+6.7	an abandoned continuation's fault (checked disposal mode)	DisposedAccessException	xref	defect	none
+6.7	a second `GetAsyncEnumerator` on a `WhenEach` sequence; the `FromException` example	InvalidOperationException	raise	defect	none
+6.7	`FromCancelled`, and a cancelled input at `WhenAll` / `WhenEach`	OperationCanceledException	raise	cancellation	none
+6.8	the join of an entry that raised	DomainFaultedException	raise	carrier	join-class
+6.9	`Channel<T>(capacity)` with `capacity < 1`	ArgumentException	raise	defect	none
+6.9	the synchronous `Send` on a full bounded channel	ChannelFullException	raise	failure	marker
+6.9	`Receive` after the drain of a closed channel; `Send`/`SendAsync` after close; a `SendAsync` pending at close	ChannelClosedException	raise	failure	marker
+6.9	a second concurrent consumption of the single-consumer end	InvalidOperationException	raise	defect	none
+6.9	the join in the worker example	DomainFaultedException	xref	carrier	join-class
+6.10	`TaskScope`: `DisposeAsync` without `Join`, `Spawn` after close	InvalidOperationException	raise	defect	none
+6.11	a blocking form where a domain continuation would park	InvalidOperationException	raise	defect	none
+6.11	a cancelled pending acquisition	OperationCanceledException	raise	cancellation	none
+6.12	`Parallel.*` with `degree < 0`	ArgumentException	raise	defect	none
+6.12	the first body fault, at the `await`	DomainFaultedException	raise	carrier	join-class
+7.1	a `Read`/`Write` window outside the buffer's `Count`	IndexOutOfRangeException	raise	defect	none
+7.1	the note that `Stream` never raises it (reserved for exact-read consumers)	EndOfStreamException	xref	failure	marker
+7.2	`FileStream` construction: the file does not exist under `FileMode.Open`	FileNotFoundException	raise	failure	marker
+7.2	`FileStream` construction: a directory component does not exist	DirectoryNotFoundException	raise	failure	marker
+7.2	`FileStream` construction: the OS reports a too-long path	PathTooLongException	raise	failure	marker
+7.2	`FileStream` construction: every other OS-level open failure	IOException	raise	failure	marker
+7.3	the `File` text members: ill-formed UTF-8 on read	FormatException	raise	failure	marker
+7.4	`Directory.Delete` of a non-empty directory without `recursive`; the other `Directory`/`Path` failures	IOException	raise	failure	marker
+7.4	the other `Directory`/`Path` failures	FileNotFoundException	raise	failure	marker
+7.5	the declaration of the IO family	IOException	decl	failure	marker
+7.5	the declaration of the IO family	FileNotFoundException	decl	failure	marker
+7.5	the declaration of the IO family	DirectoryNotFoundException	decl	failure	marker
+7.5	the declaration of the IO family	EndOfStreamException	decl	failure	marker
+7.5	the declaration of the IO family	PathTooLongException	decl	failure	marker
+9.1	integer `Parse` (string, radix and span forms): input outside the grammar	FormatException	raise	failure	marker
+9.1	integer `Parse`: a value outside the type's range	OverflowException	raise	failure	range-class
+9.1	`Parse` / `TryParse` / `ToString` with a radix outside 2, 8, 10, 16	ArgumentException	raise	defect	none
+9.2	`double.Parse` / `float.Parse`: input outside the grammar	FormatException	raise	failure	marker
+9.2	`double.Parse` / `float.Parse`: a value that is not finite once rounded	OverflowException	raise	failure	range-class
+9.3	`decimal.Parse`: input outside the grammar	FormatException	raise	failure	marker
+9.3	`decimal.Parse`: a value outside `decimal`'s range	OverflowException	raise	failure	range-class
+9.3	`Round(digits)` with `digits` outside 0..28	ArgumentOutOfRangeException	raise	defect	none
+9.5	`char.Parse`: any input but one code point	FormatException	raise	failure	marker
+9.6	`Repeat` with `count < 0`; `PadLeft`/`PadRight` with `totalWidth < 0`	ArgumentOutOfRangeException	raise	defect	none
+9.6	`IndexOf` start, and the window members, out of range	IndexOutOfRangeException	raise	defect	none
+9.8	`GetEnumerator` on an open-ended range	InvalidOperationException	raise	defect	none
+10.3	a copy window outside the destination's `Count`	IndexOutOfRangeException	raise	defect	none
+10.4	`string.FromCStringPointer(IntPtr.Zero)` / `FromWStringPointer(IntPtr.Zero)`	ArgumentNullException	raise	defect	none
