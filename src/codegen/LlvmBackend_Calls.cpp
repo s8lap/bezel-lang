@@ -19494,7 +19494,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             if (isLiteralTemp) freeTaskArrayArgTemp(arr);
             return result;
         }
-        // stdlib §6.7 (`WhenAllOwned`): Task.WhenAllOwned<T>(
+        // stdlib §6.7 (`WhenAll`, owning overload): Task.WhenAll<T>(
         //   owned tasks: OwningArray<OwningTask<T>>): OwningTask<OwningArray<T>>
         //   where T: class.
         //
