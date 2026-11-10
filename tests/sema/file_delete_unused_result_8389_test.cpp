@@ -24,6 +24,7 @@
 // successful compiles (runAot fills diagnostics only on reject).
 
 #include "support/sema_support.hpp"
+#include "support/test_data_paths.hpp"
 #include "test_harness.hpp"
 
 namespace {
@@ -49,17 +50,32 @@ bezel::test::SemaResult semaAll(const std::string& src) {
     return r;
 }
 
+// #5230: the paths these programs name must NOT be FIXED. `@DATA@` splices
+// to this process's data directory under wtScratchDir() (unique_stem: pid +
+// counter), removed at process exit and reaped if the process is SIGKILLed —
+// a fixed temp path would both break the scratch policy (CLAUDE.md: scratch
+// never lives in the tmpfs, which is RAM with a quota) and race with a
+// concurrent test process on a shared machine. The programs below are only
+// parsed and typechecked (they are never run), but the path they name is a
+// real per-process path either way, so the fixture stays honest if it ever
+// grows a run.
+std::string prog(const std::string& body) {
+    return bezel::test::spliceDataPaths(
+        std::string("module M; "
+                    "class C public static method Main(): int ") +
+            body +
+            "  return 0; "
+            "end Main; end C;",
+        "bzt8389");
+}
+
 }  // namespace
 
 // ── §21.9 / stdlib §7.3: the issue's repro compiles with NO unused-result warning ──
 
 BEZEL_TEST(file_delete_8389, delete_statement_no_unused_result_warning_spec_21_9) {
-    auto r = semaAll(
-        "module M; "
-        "class C public static method Main(): int "
-        "  File.Delete(\"/tmp/bzt8389.txt\"); "
-        "  return 0; "
-        "end Main; end C;");
+    const std::string src = prog("  File.Delete(\"@DATA@/bzt8389.txt\"); ");
+    auto r = semaAll(src);
     BEZEL_EXPECT_EQ(unusedResultWarnings(r), 0);
 }
 
@@ -68,12 +84,8 @@ BEZEL_TEST(file_delete_8389, delete_statement_no_unused_result_warning_spec_21_9
 //    silence the section. ──
 
 BEZEL_TEST(file_delete_8389, exists_statement_still_draws_the_unused_result_warning) {
-    auto r = semaAll(
-        "module M; "
-        "class C public static method Main(): int "
-        "  File.Exists(\"/tmp/bzt8389.txt\"); "
-        "  return 0; "
-        "end Main; end C;");
+    const std::string src = prog("  File.Exists(\"@DATA@/bzt8389.txt\"); ");
+    auto r = semaAll(src);
     BEZEL_EXPECT_EQ(unusedResultWarnings(r), 1);
 }
 
@@ -81,11 +93,7 @@ BEZEL_TEST(file_delete_8389, exists_statement_still_draws_the_unused_result_warn
 //    result and already drew no warning; it must be unchanged. ──
 
 BEZEL_TEST(file_delete_8389, directory_delete_statement_is_unchanged) {
-    auto r = semaAll(
-        "module M; "
-        "class C public static method Main(): int "
-        "  Directory.Delete(\"/tmp/bzt8389\"); "
-        "  return 0; "
-        "end Main; end C;");
+    const std::string src = prog("  Directory.Delete(\"@DATA@/bzt8389\"); ");
+    auto r = semaAll(src);
     BEZEL_EXPECT_EQ(unusedResultWarnings(r), 0);
 }
