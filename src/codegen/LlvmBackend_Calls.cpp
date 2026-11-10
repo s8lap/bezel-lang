@@ -5354,16 +5354,172 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     !rawElem->nullable && rawElem->declaration &&
                     rawElem->declaration->kind == ast::TypeDeclKind::Record) {
                     sema::MethodSymbol* zeroM = nullptr;
-                    sema::MethodSymbol* plusM = nullptr;
+                    // fix #8261 (stdlib §5.1, spec §11.8 / §22.6, v0.355):
+                    // the `+` is selected BY OPERAND TYPE, never by DECLARATION
+                    // ORDER. The pre-fix scan took the LAST declared `operator
+                    // +` of arity two, whatever its parameter types: a record
+                    // declaring `operator +(a: Money, b: Money)` and then
+                    // `operator +(a: Money, b: int)` folded through the
+                    // HETEROGENEOUS one, so `emitMethodCall(plusM, {acc, el})`
+                    // passed a `%record.Money` where an `i32` was expected
+                    // (`@llvm.sadd.with.overflow.i32(i32, %record.Money)` ->
+                    // "Call parameter type does not match function signature!"
+                    // -> "IR verification failed"), and the answer DEPENDED on
+                    // the declaration order.
+                    //
+                    // spec §11.8's model of the fold (`var total := T.Zero();
+                    // total := total + el`) makes BOTH operands the ELEMENT
+                    // type, so the fold is a `T + T` EXPRESSION and MUST use
+                    // the overload sema picks for it. The shape is sema's own
+                    // (`ExprTC::findBinaryOperator` in
+                    // src/sema/ExprTypecheck_Exprs.cpp): COLLECT every
+                    // `operator +` of the arity, grade EACH POSITION, then
+                    // take the candidate that is unambiguously better than all
+                    // the others.
+                    std::vector<sema::MethodSymbol*> plusCands;
                     for (sema::Symbol* sm : rawElem->declaration->members) {
                         auto* cand = dynamic_cast<sema::MethodSymbol*>(sm);
                         if (!cand) continue;
                         if (cand->isOperator && cand->operatorToken == "+" &&
                             cand->params.size() == 2)
-                            plusM = cand;
+                            plusCands.push_back(cand);
                         else if (!cand->isOperator && cand->name == "Zero" &&
                                  cand->params.empty())
                             zeroM = cand;
+                    }
+                    // The DECLARED type of a formal, resolved.
+                    auto paramTypeOf =
+                        [&](sema::Symbol* ps) -> const sema::TypeRef* {
+                        auto* p = dynamic_cast<sema::ParameterSymbol*>(ps);
+                        if (!p) return nullptr;
+                        if (p->declType)
+                            if (const sema::TypeRef* t =
+                                    ctx_.resolvedType(*p->declType))
+                                return t;
+                        return p->resolvedDeclType;
+                    };
+                    // How a formal is spelled in a diagnostic.
+                    auto spellFormal = [&](sema::Symbol* ps) -> std::string {
+                        const sema::TypeRef* t = paramTypeOf(ps);
+                        if (!t) return "?";
+                        if (t->kind == sema::TypeRef::Kind::Primitive)
+                            return "primitive";
+                        if (t->kind == sema::TypeRef::Kind::Named &&
+                            t->declaration)
+                            return std::string(t->declaration->name);
+                        return "?";
+                    };
+                    // Does a formal accept the ELEMENT type (the operand)?
+                    // §22.6 grades a POSITION, not the candidate as a whole:
+                    // Exact (the operand's type IS the parameter's) or
+                    // Converting (an ordinary §5.1 reference conversion to a
+                    // base or interface of the element's declaration). A formal
+                    // that is a bare type parameter, a primitive, a nullable,
+                    // or an unrelated declaration does not apply.
+                    enum class OperandQuality { Inapplicable, Exact, Converting };
+                    auto operandQuality = [&](const sema::TypeRef* pt)
+                        -> OperandQuality {
+                        if (!pt || pt->nullable) return OperandQuality::Inapplicable;
+                        if (pt->kind != sema::TypeRef::Kind::Named)
+                            return OperandQuality::Inapplicable;
+                        sema::TypeSymbol* pd = pt->declaration;
+                        if (!pd) return OperandQuality::Inapplicable;
+                        if (pd == rawElem->declaration)
+                            return OperandQuality::Exact;
+                        // §5.1 / §25.2: a derived-typed operand satisfies a
+                        // base-typed formal by the ordinary reference
+                        // conversion (the weaker tier).
+                        std::vector<sema::TypeSymbol*> work{rawElem->declaration};
+                        std::unordered_set<sema::TypeSymbol*> seen;
+                        while (!work.empty()) {
+                            sema::TypeSymbol* cur = work.back();
+                            work.pop_back();
+                            if (!cur || !seen.insert(cur).second) continue;
+                            for (sema::TypeSymbol* b : cur->baseTypes)
+                                if (b) {
+                                    if (b == pd) return OperandQuality::Converting;
+                                    work.push_back(b);
+                                }
+                        }
+                        return OperandQuality::Inapplicable;
+                    };
+                    // §22.6's "unambiguously better" relation, copied from sema's
+                    // own `ExprTC::findBinaryOperator` (`better()`): `a` is
+                    // better than `b` when it is better-or-equal at EVERY
+                    // position and strictly better at ONE. Grading the PAIR —
+                    // not the minimum of the two positions — is what makes
+                    // "exact beats convert" bite: `Money + Money` is exact at
+                    // BOTH positions while `Money + IBase` converts at the
+                    // second, so the exact one wins IN EITHER DECLARATION
+                    // ORDER. (Grading by the minimum of the two positions was
+                    // dead code: §25.2 forces at least one parameter to be the
+                    // declaring type, that parameter is always exact, so the
+                    // minimum was ALWAYS exact and never discriminated.)
+                    struct RankedPlus {
+                        sema::MethodSymbol* m;
+                        bool exact0;
+                        bool exact1;
+                    };
+                    auto better = [](const RankedPlus& a, const RankedPlus& b)
+                        -> bool {
+                        bool geq = (a.exact0 || !b.exact0) &&
+                                   (a.exact1 || !b.exact1);
+                        bool strict = (a.exact0 && !b.exact0) ||
+                                      (a.exact1 && !b.exact1);
+                        return geq && strict;
+                    };
+                    std::vector<RankedPlus> ranked;
+                    for (sema::MethodSymbol* cand : plusCands) {
+                        OperandQuality q0 =
+                            operandQuality(paramTypeOf(cand->params[0]));
+                        if (q0 == OperandQuality::Inapplicable) continue;
+                        OperandQuality q1 =
+                            operandQuality(paramTypeOf(cand->params[1]));
+                        if (q1 == OperandQuality::Inapplicable) continue;
+                        ranked.push_back({cand, q0 == OperandQuality::Exact,
+                                             q1 == OperandQuality::Exact});
+                    }
+                    // The unique candidate that is unambiguously better than
+                    // every other applicable one.
+                    sema::MethodSymbol* plusM = nullptr;
+                    for (const RankedPlus& c : ranked) {
+                        bool best = true;
+                        for (const RankedPlus& o : ranked)
+                            if (o.m != c.m && !better(c, o)) {
+                                best = false;
+                                break;
+                            }
+                        if (best) {
+                            plusM = c.m;
+                            break;
+                        }
+                    }
+                    if (zeroM && !plusM && !ranked.empty()) {
+                        // §22.6: two applicable candidates and NEITHER is
+                        // unambiguously better — the ambiguous overload set sema
+                        // rejects for a `T + T` expression. The fold must NOT
+                        // silently pick one (the DECLARATION ORDER would decide
+                        // the answer, and a silently wrong total is worse than
+                        // a rejected program), so the fold is REFUSED with a
+                        // diagnostic.
+                        std::string cands;
+                        for (const RankedPlus& r : ranked) {
+                            if (!cands.empty()) cands += ", ";
+                            cands += "`operator +(" +
+                                     spellFormal(r.m->params[0]) + ", " +
+                                     spellFormal(r.m->params[1]) + ")`";
+                        }
+                        ctx_.diagnostics().report(
+                            Severity::Error, call.span.begin,
+                            "ambiguous operator `+`: the `Sum()` fold is a "
+                            "`T + T` expression (spec \xC2\xA7""11.8) and no "
+                            "applicable `operator +` overload is unambiguously "
+                            "better than the others (candidates: " + cands +
+                            ") — \xC2\xA7""22.6 rejects an ambiguous overload "
+                            "set; declare exactly one `operator +` that takes "
+                            "the element type in BOTH positions");
+                        // The compile already failed; the fold is NOT lowered.
+                        return llvm::Constant::getNullValue(elemTy);
                     }
                     if (zeroM && plusM) {
                         auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
@@ -5525,21 +5681,49 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!call.args.empty() && call.args[0].value) {
                 if (auto* lamTy = ctx_.exprType(*call.args[0].value))
                     if (lamTy->kind == sema::TypeRef::Kind::Function &&
-                        lamTy->funcReturn &&
-                        lamTy->funcReturn->kind ==
-                            sema::TypeRef::Kind::Primitive &&
-                        !lamTy->funcReturn->nullable) {
-                        switch (lamTy->funcReturn->primitive) {
-                            case sema::PrimitiveType::Int:
-                            case sema::PrimitiveType::UInt:
-                            case sema::PrimitiveType::Long:
-                            case sema::PrimitiveType::ULong:
-                            case sema::PrimitiveType::Float:
-                            case sema::PrimitiveType::Double:
-                                retP = lamTy->funcReturn->primitive;
-                                break;
-                            default:
-                                break;  // keep Int (legacy) for anything else
+                        lamTy->funcReturn) {
+                        // fix #8338 (stdlib §5.1, spec §11.8 / §14.2,
+                        // v0.355): read the selector's RETURN type through
+                        // the generic substitution (`resolveTypeParamRef`) --
+                        // the SAME resolution the no-selector branch below
+                        // applies to the ELEMENT type. Inside a generic body
+                        // the selector's return type is still the PLACEHOLDER
+                        // `T` -- a `Kind::Named` type parameter, never a
+                        // `Kind::Primitive` -- so the `Primitive` test below
+                        // never matched, the accumulator fell back to `int`,
+                        // and the emitted IR mixed it with the INSTANTIATED
+                        // use site (`%sum.r = load i32` fed to
+                        // `bz_double_to_string_r(double)` -> "Call parameter
+                        // type does not match function signature!" -> "IR
+                        // verification failed"). stdlib §5.1's
+                        // `Sum<U>(selector: (T) -> U): owned U` accumulates in
+                        // U's OWN type, so the accumulator is typed from the
+                        // INSTANTIATED selector result type.
+                        //
+                        // A NULLABLE return (`(T) -> T?`) keeps the pre-fix
+                        // reading: `resolveTypeParamRef` strips the `?` (see
+                        // its own comment), and a nullable U is not a §2.19
+                        // `INumber<U>` conformer, so the sema gate owns that
+                        // shape -- the same nullability discipline the
+                        // no-selector branch uses for a nullable ELEMENT.
+                        const sema::TypeRef* rawRet = lamTy->funcReturn;
+                        const sema::TypeRef* rt = rawRet->nullable
+                            ? rawRet
+                            : resolveTypeParamRef(rawRet);
+                        if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                            !rt->nullable) {
+                            switch (rt->primitive) {
+                                case sema::PrimitiveType::Int:
+                                case sema::PrimitiveType::UInt:
+                                case sema::PrimitiveType::Long:
+                                case sema::PrimitiveType::ULong:
+                                case sema::PrimitiveType::Float:
+                                case sema::PrimitiveType::Double:
+                                    retP = rt->primitive;
+                                    break;
+                                default:
+                                    break;  // keep Int (legacy) for anything else
+                            }
                         }
                     }
             } else if (recvTy && !recvTy->genericArgs.empty() &&
