@@ -151,8 +151,36 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
            bogus_member_on_owningbuffer_rejected_stdlib_4_14) {
     // NOT in #2935's list — found by probing the whole built-in population for
     // this fix. A receiver-name enumeration would have left it accepting.
+    //
+    // THE CASE IS STILL IN THE POPULATION AND IS STILL REJECTED — but it needs
+    // its OWN expected string, and the reason is the KIND of head, not the
+    // behaviour. `OwningBuffer<T>` is a COLLECTION head (stdlib §4.14) whose
+    // surface is DOCUMENTED, not a closed-surface built-in. The chain's
+    // per-head collection-surface table (Issue #8349's row, landed by commit
+    // ae3f7d4d4) therefore refuses the member BY NAME, quoting the section
+    // that declares the head and the head's own surface:
+    //
+    //   no member `TotallyBogusMember` on `OwningBuffer` (stdlib §4.14) --
+    //   it is not part of this collection's documented surface
+    //   (AsReadOnlySpan/AsSpan/DangerousPointer/Length), a universal
+    //   `ToString`/`Equals`/`GetHashCode`/`GetType` member (language spec
+    //   §8.1), or a stdlib §5 LINQ extension operator
+    //
+    // — NOT codegen's generic "produced no value, and no dispatch arm emitted
+    // any code for this call" backstop, which is what the shared `kNoMember`
+    // needle ("on built-in type `") pins. The four CLOSED-SURFACE heads
+    // (Random §2.7, StringBuilder §3.1, Stopwatch §8.1,
+    // CancellationTokenSource §6.5) still say "on built-in type `", so
+    // `kNoMember` stays theirs, byte for byte.
+    //
+    // THE CHAIN'S OWN SIBLING TEST pins the SAME wording for the SAME head:
+    // `tests/sema/collection_undeclared_member_surface_8331_test.cpp`, row
+    // `owning_buffer_bogus_member_is_rejected`, expects "no member
+    // `BogusMember` on `OwningBuffer`" — this row is that sentence with THIS
+    // test's own member name.
     BEZEL_EXPECT_TRUE(
-        hasError(bogusInLocalDecl("new OwningBuffer<int>(4)"), kNoMember));
+        hasError(bogusInLocalDecl("new OwningBuffer<int>(4)"),
+                 "no member `TotallyBogusMember` on `OwningBuffer`"));
 }
 
 BEZEL_TEST(builtin_receiver_unlowered_member_2935,
