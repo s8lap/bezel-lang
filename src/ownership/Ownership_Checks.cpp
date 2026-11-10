@@ -1845,6 +1845,18 @@ void MethodOwnership::joinMarkerFreeArmEnds(std::vector<BlockState>&& ends,
                  /*unionKeys=*/false);
 }
 
+// fix #7859 (§15.3 *Parameter passing*, §25.2, v0.355) + fix #8380 (same
+// sections): FORWARD DECLARATION.
+// `moveOnlyArgIsConsumed` is defined further down this file, under its own
+// §15.3 / §22.3 / §25.2 comment header (#4803), but two of its callers sit
+// ABOVE that definition: `recordMovesInArgs` — the BOUND argument gate, whose
+// §25.2 `Equals(T)` borrow carve is fix #8380 — and `handleDischarge` — the
+// BARE-STATEMENT call/constructor argument path, whose carve is fix #7859.
+// The definition itself is UNCHANGED and remains the single one; this is only
+// a declaration, so the sites cannot drift.
+static bool moveOnlyArgIsConsumed(const ast::Expr* callee,
+                                  const ast::CallArgument& a);
+
 void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& args,
                        const ast::Expr* callee,
                        const sema::TypeRef* choiceInstTy) {
@@ -2107,7 +2119,28 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
             // primitive above (#4587), and no-ops for every non-choice /
             // non-bare-identifier argument, so widening the gate here is
             // narrow. // per §15.3 *Parameter passing*
-            if (pt) noteOwningChoiceWholeMoveRead(*a.value);
+            //
+            // fix #8380 (§15.3 *Parameter passing*, §25.2, v0.355): THE §25.2
+            // CARVE, on the BOUND argument gate. §15.3's own bullet EXCLUDES
+            // the comparison surface's `Equals(T)` parameter ("bind borrows —
+            // §25.2"), and §25.2: "`a.Equals(b)` consumes neither value." So
+            // an `Equals` argument is NOT a by-value-move and must NOT be
+            // marked moved-from. #5436 added the choice twin here WITHOUT the
+            // carve, while #7859 added it to the BARE-STATEMENT path's twin
+            // WITH the carve — so the same expression was admitted in one
+            // spelling and rejected in the other (issue #8380: the BOUND
+            // `var r := a.Equals(b);` was rejected with "cannot move out of
+            // `using var` `b`", and the later `var n := b;` with "owned
+            // value in `b` was already moved out"). `moveOnlyArgIsConsumed`
+            // is the repo's own predicate for exactly that question (#4803) —
+            // the SAME one the BARE-STATEMENT path consults (#7859) and the
+            // same one `rejectMoveOnlyFieldReadArg` consults — so the two
+            // spellings now answer it identically. The carve is
+            // `Equals`-SPECIFIC (§25.2): any OTHER method's move-only
+            // parameter still takes the by-value move. // per §15.3 *Parameter
+            // passing*, §25.2
+            if (pt && moveOnlyArgIsConsumed(callee, a))
+                noteOwningChoiceWholeMoveRead(*a.value);
         }
         // fix #5388 (§22.3, v0.314): a `move x` call-site marker is valid ONLY
         // on an argument to an `owned` parameter. At any other position the
@@ -2326,16 +2359,6 @@ void MethodOwnership::markCaseExprOwnedScrutineeInStmt(const ast::Stmt& s) {
     collectCaseArmBorrowSourcesStmt(s);
     markOnlyCaseWalk_ = saved;
 }
-
-// fix #7859 (§15.3 *Parameter passing*, §25.2, v0.355): FORWARD DECLARATION.
-// `moveOnlyArgIsConsumed` is defined further down this file, under its own
-// §15.3 / §22.3 / §25.2 comment header (#4803), but `handleDischarge` — the
-// BARE-STATEMENT call/constructor argument path — now consults it for the
-// §25.2 `Equals(T)` borrow carve, and it sits ABOVE that definition. The
-// definition itself is UNCHANGED and remains the single one; this is only a
-// declaration, so the two sites cannot drift.
-static bool moveOnlyArgIsConsumed(const ast::Expr* callee,
-                                  const ast::CallArgument& a);
 
 void MethodOwnership::handleDischarge(const ast::Expr& e) {
     // §31.1 / §28.8 / §17.12 (issue #406): a `throw` in EXPRESSION position
