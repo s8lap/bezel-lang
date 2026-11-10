@@ -170,3 +170,19 @@ case 2: FormatException arm
 case 3: FormatException arm
 -- run exit 0
 
+== f21_interface_members_in_the_arm
+-- compile exit 0
+(1) retry = True, message = server busy
+(2) retry = True
+-- run exit 0
+
+== f22_guard_narrowing_loses_exception
+f22_guard_narrowing_loses_exception.bzl:21:68: no member `Message` on interface `IRetryable` (§11.§11.3): a value of interface type `IRetryable` exposes only members declared on `IRetryable` itself or inherited from an interface it extends — even when the underlying object's concrete type declares more members, they are not reachable through this interface-typed reference (§11.2). Narrow to the concrete type first (`is`as`, §17.4) to reach `Message` there, or add `Message` to `IRetryable`'s own declaration (§11.2) if every conforming type should provide it
+-- compile exit 1
+
+== f23_marking_across_the_line
+-- compile exit 0
+a marker arm took a cancellation
+a state-defect arm took a class marked as a failure
+-- run exit 0
+

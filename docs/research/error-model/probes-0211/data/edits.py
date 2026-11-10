@@ -19,6 +19,9 @@ SPEC = "docs/Bezel_Language_Spec.md"
 LIB = "docs/Bezel_Standard_Library.md"
 RAT = "docs/Bezel_Design_Rationale.md"
 G2 = "docs/Bezel_Guide_02_Errors_and_Nullability.md"
+G4 = "docs/Bezel_Guide_04_Concurrency.md"
+G6 = "docs/Bezel_Guide_06_Contracts_and_Purity.md"
+TOUR = "docs/Bezel_Tour.md"
 CG = "docs/Bezel_For_Code_Generation.md"
 
 E = []
@@ -44,29 +47,25 @@ rep("S4", SPEC, "§31.2.1, the multi-type bullet",
 
 ins("S5", SPEC, "§31.2.1, a new paragraph after *Arm types are `Exception`-family*",
     "the remedy is to delete the arm or fix the type.",
-    "\n\n**Interface arm types.** An interface named in an arm is a filter: the arm takes exactly the throwables whose class implements it. It does not type a binding. Every throwable is an instance of an `Exception`-derived class ([§31.1](#sec-the-throw-operand)), and nothing narrower is known of one matched through an interface, so a binding arm over an interface binds `name` at `Exception`, and an interface listed in a binding alternative counts as `Exception` in the nearest-common-base computation: `var f: IFailure` and `var ex: IOException | IRetryable` each bind an `Exception`. The binding therefore reads `Message`, is an argument where an `Exception` is expected, and chains as a cause ([§31.4](#sec-standard-exception-types)), whatever interface selected it. The interface's own members are reached by a type test inside the arm — `ex as IRetryable`, or the guard form `var ex: Exception when ex is IRetryable`, whose arm sees `ex` narrowed to the interface ([§12.7](#sec-type-tests-is-is-not-as)). A type parameter used as an arm type keeps its class bound (below): `where TEx: Exception, IFailure`, never the interface alone. The failure marker `IFailure` ([§31.4](#sec-the-failure-marker)) is the interface this rule is written for.")
+    "\n\n**Interface arm types.** An interface named in an arm is a filter: the arm takes exactly the throwables whose class implements it. It does not type a binding. Every throwable is an instance of an `Exception`-derived class ([§31.1](#sec-the-throw-operand)), and nothing narrower is known of one matched through an interface, so a binding arm over an interface binds `name` at `Exception`, and an interface listed in a binding alternative counts as `Exception` in the nearest-common-base computation: `var f: IFailure` and `var ex: IOException | IRetryable` each bind an `Exception`. The binding therefore reads `Message`, is an argument where an `Exception` is expected, and chains as a cause ([§31.4](#sec-standard-exception-types)), whatever interface selected it. The interface's own members are reached by a type test inside the arm: `var r := ex as IRetryable;` gives a nullable borrow at the interface type and leaves `ex` an `Exception`. The guard form `var ex: Exception when ex is IRetryable` instead retypes the binding for the arm ([§12.7](#sec-type-tests-is-is-not-as)), which then sees the interface's members and no longer the `Exception` surface. This is a difference from `case`, where a type pattern's binding has the pattern's written type ([§19.3](#sec-patterns)): a `case` scrutinee may be of any type, while a caught value is always an `Exception`, and the arm's binding says so. A type parameter used as an arm type keeps its class bound (below): `where TEx: Exception, IFailure`, never the interface alone. The failure marker `IFailure` ([§31.4](#sec-the-failure-marker)) is the interface this rule is written for.")
 
-ins("S6", SPEC, "§31.2.3, a new paragraph after *An unreachable arm draws a warning*",
-    "and [§19.4](#sec-guards)'s first-match order is stated there as ordering advice.",
-    "\n\n**An undivided catch-all draws a warning.** An unguarded arm whose pattern names `Exception` alone — bare or binding, not in an alternative — takes defects, failures and cancellation alike ([§31.4](#sec-the-failure-marker)). The compiler emits a **warning** at such an arm unless one of three things shows that the division was considered: an earlier unguarded arm of the same `catch` block names `IFailure`; the arm's body contains a bare re-raise ([§31.2.4](#sec-bare-re-raise)); or the arm's body is the unit value `()` ([§31.2.5](#sec-deliberate-suppression)). The warning names the two remedies: handle `IFailure` in an earlier arm, which makes this arm the defect arm, or re-raise. An arm meant to take both kinds in one body lists both — `var ex: IFailure | Exception => …` — which is not an arm naming `Exception` alone and draws nothing. The rule reads the arm patterns of one `catch` block and one arm body; it models no raise and no arm selection ([§7.4](#sec-member-access-on-nullable-values) *Narrowing across `try`*). The diagnostic is a warning and not an error: a supervisor's last arm, a test's oracle arm and a logger of last resort are well-formed catch-alls, and each has a one-line spelling that says so.")
-
-rep("S7", SPEC, "§31.2.4, the last example's second arm",
+rep("S6", SPEC, "§31.2.4, the last example's second arm",
     "  var ex: Exception => Log(ex)\nend;",
     "  var f: IFailure => Log(f)                 // every other failure; `f` is an `Exception` (§31.2.1); defects pass\nend;")
 
-ins("S8", SPEC, "§31.2.5, end of the last paragraph",
+ins("S7", SPEC, "§31.2.5, end of the last paragraph",
     "Silent suppression of exceptions is a code smell, and the syntax does not hide it.",
     " To suppress expected failures only, name the marker — `IFailure => ()` — and defects and cancellation still propagate ([§31.4](#sec-the-failure-marker)).")
 
-rep("S9", SPEC, "§31.4, the first paragraph",
+rep("S8", SPEC, "§31.4, the first paragraph",
     "(and `ArgumentException`/`ArgumentOutOfRangeException`'s `(message, paramName)` forms) are **`pure`**",
-    "(and `ArgumentException`/`ArgumentOutOfRangeException`'s `(message, paramName)` forms, and the same two forms of `ParseRangeException`, stdlib [§9.1](Bezel_Standard_Library.md#sec-integer-types)) are **`pure`**")
+    "(and `ArgumentException`/`ArgumentOutOfRangeException`'s `(message, paramName)` forms, and the `()` and `(message)` forms of `ParseRangeException`, stdlib [§9.1](Bezel_Standard_Library.md#sec-integer-types)) are **`pure`**")
 
-rep("S10", SPEC, "§31.4, the hierarchy tree",
+rep("S9", SPEC, "§31.4, the hierarchy tree",
     "├─ FormatException                  — string does not conform to an expected format.",
     "├─ FormatException                  — string does not conform to an expected format. A failure: implements `IFailure`.")
 
-ins("S11", SPEC, "§31.4, new paragraphs after the tree's arm-ordering paragraph",
+ins("S10", SPEC, "§31.4, new paragraphs after the tree's arm-ordering paragraph",
     "and an arm pattern of `ArgumentException` matches `ArgumentNullException`.",
     """
 
@@ -78,31 +77,33 @@ public interface IFailure
 end IFailure;
 ```
 
-`IFailure` declares no members: it classifies, and the object it classifies is always reachable as an `Exception` ([§31.2.1](#sec-arm-patterns), *Interface arm types*). It is available without import, with the hierarchy above. A class implements it by listing it, and a class deriving from one that implements it implements it too ([§14.2](#sec-interface-conformance) rule 1), so a kind is inherited and cannot be shed. **Only an `Exception`-derived class may conform.** A record, an enum, a choice, or a class outside the `Exception` family that lists `IFailure`, or an interface extending it, is a compile error at the declaration: no value of such a type can be thrown ([§31.1](#sec-the-throw-operand)), so the conformance could never be observed — [§31.2.1](#sec-arm-patterns)'s ground for rejecting a dead arm type. An interface may extend `IFailure`; the restriction then binds its implementers.
+`IFailure` declares no members: it classifies, and the object it classifies is always reachable as an `Exception` ([§31.2.1](#sec-arm-patterns), *Interface arm types*). It is available without import, with the hierarchy above. A class implements it by listing it, and a class deriving from one that implements it implements it too ([§14.2](#sec-interface-conformance) rule 1), so a kind is inherited and cannot be shed.
+
+**Who may conform.** Only an `Exception`-derived class: a record, an enum, a choice, or a class outside the `Exception` family that lists `IFailure`, or an interface extending it, is a compile error at the declaration. No value of such a type can be thrown ([§31.1](#sec-the-throw-operand)), so the conformance could never be observed — [§31.2.1](#sec-arm-patterns)'s ground for rejecting a dead arm type. And a class does not contradict the kind of a class the documents declare: a class that does not inherit `IFailure` may list it only where no class in its base chain, other than `Exception` itself, is a built-in or standard-library exception class; listing it otherwise is a compile error at the declaration. So a class deriving from `OperationCanceledException` is cancellation in every subclass, and an arm naming `InvalidOperationException`, or any other defect class of the documents, never takes a failure that user code declared. A class whose base chain is user-declared down to `Exception` chooses freely at each level. The standard library declares the only two classes that derive across that line, each by recorded ruling (stdlib [§1](Bezel_Standard_Library.md#sec-failure-signal-rule)). An interface may extend `IFailure`; both restrictions then bind its implementers.
 
 Of the built-in types, `FormatException` implements `IFailure`. The standard library's failure types, and the rule by which a condition is raised as a failure or as a defect, are stated in stdlib [§1](Bezel_Standard_Library.md#sec-failure-signal-rule). A class that this specification or the standard library declares changes kind only by recorded ruling. User code chooses per class: `class ConfigError(message: string): Exception(message), IFailure` declares a failure, and a class that does not list the marker declares a defect report.
 
-The kind is what a handler at a boundary selects on: an `IFailure` arm takes every failure and lets defects and cancellation pass ([§31.2.3](#sec-catch-ordering-and-exhaustiveness)). Nothing else in the language reads it. The ownership of a thrown exception ([§31.1](#sec-exception-ownership)), the cleanup an exception edge runs ([K3.15](#sec-kernel-k3)), a task's fault ([§30.9](#sec-exception-handling-in-async-methods)), the purity carve-out ([§22.15](#sec-pure-throw)), supersession ([§31.2](#sec-try-catch-finally)), and the reports of [§32.8](#sec-callbacks) and [§33.3](#sec-exit-code) are the same for both kinds and for cancellation.""")
+The kind is read in two places. A catch arm that names the marker selects on it: an `IFailure` arm takes every failure and lets defects and cancellation pass ([§31.2.3](#sec-catch-ordering-and-exhaustiveness)). And a domain join carries it across the boundary ([§30.14](#sec-multiple-domains)). Nothing else reads it. The ownership of a thrown exception ([§31.1](#sec-exception-ownership)), the cleanup an exception edge runs ([K3.15](#sec-kernel-k3)), a task's fault ([§30.9](#sec-exception-handling-in-async-methods)), the purity carve-out ([§22.15](#sec-pure-throw)), supersession ([§31.2](#sec-try-catch-finally)), and the reports of [§32.8](#sec-callbacks) and [§33.3](#sec-exit-code) are the same for both kinds and for cancellation.""")
 
-rep("S12", SPEC, "§31.4, the last paragraph",
+rep("S11", SPEC, "§31.4, the last paragraph",
     "`FileNotFoundException`, `IOException`, and others. Outside the auto-imported modules",
     "`ParseRangeException` (deriving from `OverflowException` and implementing `IFailure`; raised by the `Parse` family for a value outside the type's range; declared in the auto-imported `System`, stdlib §9.1), `FileNotFoundException`, `IOException`, and others. Outside the auto-imported modules")
 
-rep("S13", SPEC, "§30.14 *Faults*",
+rep("S12", SPEC, "§30.14 *Faults*",
     "whose `Message` and `FaultStackTrace` carry copies of the original exception's message and stack-trace text (`string`s — sendable). Programs that need richer fault data",
     "whose `Message` and `FaultStackTrace` carry copies of the original exception's message and stack-trace text (`string`s — sendable). The exception's kind crosses with them: where the original exception's class implements `IFailure` ([§31.4](#sec-the-failure-marker)), the join raises `DomainFailedException`, which derives from `DomainFaultedException` and implements `IFailure` (stdlib [§6.8](Bezel_Standard_Library.md#sec-domain)). An arm naming `DomainFaultedException` takes both; an arm naming `IFailure` takes a failure raised in another domain as it takes one raised in its own. Programs that need richer fault data")
 
-rep("S14", SPEC, "§30.14 *Data-parallel combinators*, *Results and faults*",
+rep("S13", SPEC, "§30.14 *Data-parallel combinators*, *Results and faults*",
     "the returned task faults with `DomainFaultedException` — this section's fault vocabulary, with the no-aggregation",
     "the returned task faults with `DomainFaultedException` (`DomainFailedException` where that first fault is a failure) — this section's fault vocabulary, with the no-aggregation")
 
-rep("S15", SPEC, "Appendix C.7, the multi-type binding bullet",
+rep("S14", SPEC, "Appendix C.7, the multi-type binding bullet",
     "- A multi-type catch alternative in binding form types the binding as the listed types' **nearest common base** — with every listed type `Exception`-derived, always `Exception` or a class deriving from it ([§31.2.1](#sec-arm-patterns)).",
-    "- A multi-type catch alternative in binding form types the binding as the listed types' **nearest common base** — with every listed class type `Exception`-derived and an interface counting as `Exception`, always `Exception` or a class deriving from it; a binding arm over one interface type types the binding as `Exception` ([§31.2.1](#sec-arm-patterns)).\n- `IFailure` is listed only by a class deriving from `Exception`, or extended by an interface; a record, enum, choice, or class outside the `Exception` family that conforms to it is a compile error at the declaration ([§31.4](#sec-the-failure-marker)).")
+    "- A multi-type catch alternative in binding form types the binding as the listed types' **nearest common base** — with every listed class type `Exception`-derived and an interface counting as `Exception`, always `Exception` or a class deriving from it; a binding arm over one interface type types the binding as `Exception` ([§31.2.1](#sec-arm-patterns)).\n- `IFailure` is listed only by a class deriving from `Exception`, or extended by an interface; a record, enum, choice, or class outside the `Exception` family that conforms to it is a compile error at the declaration, and so is a class that does not inherit it and has a built-in or standard-library exception class other than `Exception` in its base chain — `OperationCanceledException` and every defect class among them ([§31.4](#sec-the-failure-marker)).")
 
-ins("S16", SPEC, "Appendix E, a new row after the *public type removed* row",
+ins("S15", SPEC, "Appendix E, a new row after the *public type removed* row",
     "| public type removed; base class changed; implemented interface removed | **breaking** | An interface *added* to a type: widening. |",
-    "\n| `IFailure` added to, or removed from, the interfaces of an exception class | **breaking** | The kind is what a consumer's boundary arm selects on ([§31.4](#sec-the-failure-marker)): adding the marker makes every `IFailure` arm take the class, removing it makes them pass it. The one exception to the row above. |")
+    "\n| `IFailure` added to the interfaces of an exception class | **breaking** | The one exception to *an interface added to a type: widening*. The kind is what a consumer's boundary arm selects on ([§31.4](#sec-the-failure-marker)): adding the marker makes every `IFailure` arm take the class. (Removing it is breaking by the row above.) |")
 
 # ------------------------------------------------------------------ standard library
 rep("L1", LIB, "§1, the failure-signal rule, band 1",
@@ -115,7 +116,7 @@ rep("L2", LIB, "§1, the failure-signal rule, band 4",
 
 ins("L3", LIB, "§1, a new paragraph after the band-3/band-4 paragraph",
     "and the no-dual rule below applies to whatever spelling that design fixes.",
-    "\n\n**Failures and defects.** The exceptions this library raises are of the kinds language spec [§31.4](Bezel_Language_Spec.md#sec-the-failure-marker) defines, and the band fixes the kind: a band-4 condition is raised with a class that implements `IFailure`, a band-1 condition with one that does not, and cancellation with `OperationCanceledException`. The test between bands 1 and 4 is whether a correct program can meet the condition. It can meet a missing file, malformed input, a closed channel and an elapsed deadline. It cannot meet an index out of range, a key it asserted present, an empty collection it asserted non-empty, or an arithmetic result outside its domain, except by being wrong; where a caller cannot know the answer in advance, the member's band-2 query stands beside the throwing form (the tiers of the no-dual rule, below), which is why the throwing form of a query is a defect and stays one. The failure types this document declares are `IOException` and the classes deriving from it ([§7.5](#sec-io-exception-types)), `SerializationException` ([§2.15](#sec-concrete-serialization-formats)), `TimeoutException` ([§6.1](#sec-cancellationtoken-and-cancellationtokensource)), `ChannelClosedException` and `ChannelFullException` ([§6.9](#sec-channel)), `ParseRangeException` ([§9.1](#sec-integer-types)) and `DomainFailedException` ([§6.8](#sec-domain)); with the built-in `FormatException` they are the library's whole failure band. One exception class is of one kind, and a member does not raise a failure with a defect class or a defect with a failure class. No class of this library that implements `IFailure` derives from one that does not, with two recorded exceptions, each keeping an established catch arm matching: `ParseRangeException` derives from `OverflowException`, and `DomainFailedException` from `DomainFaultedException`. A landed member that raises a failure class for a band-1 condition is a recorded misfit under this rule's scoping sentence, flagged where it stands: the unrecognized format specifier ([§2.18](#sec-iformattable), [§2.6](#sec-guid), [§3.1](#sec-stringbuilder)) and the write-side serialization conditions ([§2.14](#sec-serialization-vocabulary), [§2.15](#sec-concrete-serialization-formats)). A class's kind changes only by recorded ruling, as the taxonomy grows only by one (language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)).")
+    "\n\n**Failures and defects.** The exceptions this library raises are of the kinds language spec [§31.4](Bezel_Language_Spec.md#sec-the-failure-marker) defines, and the band fixes the kind: a band-4 condition is raised with a class that implements `IFailure`, a band-1 condition with one that does not, and cancellation with `OperationCanceledException`. The test between bands 1 and 4 is **where the condition comes from**. It comes from outside the program when the environment produces it (a missing file, a failed write, the end of an input stream), when it is found in data in an external form that a member is reading into program values (text that does not parse, bytes that do not decode, a document that does not deserialize), when a peer produces it (a closed channel, a failure in another domain), or when a limit does (a deadline, a full buffer). A correct program can meet every one of these, and the condition is a failure. It comes from the program itself when it is a fact about what the program passed (an index, a key, a count, a radix, a format specifier), about the state of an object or collection the program holds (an empty collection, an absent key, a closed scope, a live enumeration), or about its own arithmetic. The program owns that state and can know it before the call, so the condition is a defect, however the values in it were arrived at. The kind is the condition's and not the tier's (the no-dual rule, below): `Parse` and the `[key]` indexer are both throwing forms with a query beside them, and `Parse` raises a failure, because the text is the outside's, where the indexer raises a defect, because the dictionary is the program's. The failure types this document declares are `IOException` and the classes deriving from it ([§7.5](#sec-io-exception-types)), `SerializationException` ([§2.15](#sec-concrete-serialization-formats)), `TimeoutException` ([§6.1](#sec-cancellationtoken-and-cancellationtokensource)), `ChannelClosedException` and `ChannelFullException` ([§6.9](#sec-channel)), `ParseRangeException` ([§9.1](#sec-integer-types)) and `DomainFailedException` ([§6.8](#sec-domain)); with the built-in `FormatException` they are the library's whole failure band. One exception class is of one kind, and a member does not raise a failure with a defect class or a defect with a failure class. No class of this library that implements `IFailure` derives from one that does not, with two recorded exceptions, each keeping an established catch arm matching: `ParseRangeException` derives from `OverflowException`, and `DomainFailedException` from `DomainFaultedException`. A landed member that raises a failure class for a band-1 condition is a recorded misfit under this rule's scoping sentence, flagged where it stands: the unrecognized format specifier ([§2.18](#sec-iformattable), [§2.6](#sec-guid), [§3.1](#sec-stringbuilder)), the write-side serialization conditions ([§2.14](#sec-serialization-vocabulary), [§2.15](#sec-concrete-serialization-formats)) and the unrepresentable code point at `GetBytes` ([§3.2](#sec-encoding)). A kind is inherited and cannot be shed (language spec §31.4), so moving such a condition means raising it with a class outside the failure class's subtree, and the arms naming the failure class stop taking it. A class's kind changes only by recorded ruling, as the taxonomy grows only by one (language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)).")
 
 rep("L4", LIB, "§2.5 *Parse and range contracts*",
     "— a band-4 catchable fault, not a band-1 argument defect; the constructors' component validation keeps `ArgumentOutOfRangeException`.",
@@ -197,6 +198,22 @@ ins("L20", LIB, "§2.14, the registry paragraph",
     "raises `SerializationException` — the closed set enforced on both directions.",
     " (The write-side half is a band-1 defect raised with a failure class, a recorded misfit under [§1](#sec-failure-signal-rule)'s rule, as a `Weak` reference to a target never strongly reached is.)")
 
+rep("L21", LIB, "§1, the Try convention, *the three access tiers*",
+    "the **throwing form** (`Parse`, the `[key]` indexer) treats absence as a bug, the **`*OrNull` form** returns",
+    "the **throwing form** (`Parse`, the `[key]` indexer) asserts the value is there and raises where it is not (a failure or a defect by where the condition comes from — *Failures and defects*, below), the **`*OrNull` form** returns")
+
+rep("L22", LIB, "§1, the no-dual rule's gloss of the two tiers",
+    "the assert-shaped throwing access (\"failure is a bug at this call site\") beside the branch-shaped value access (\"failure is expected here\"), the [§9.1](#sec-integer-types) `Parse`/`TryParse` pair being the model — because tiers serve different call-site *stances* toward one operation, not the same problem twice.",
+    "the assert-shaped throwing access (\"this call site handles nothing: it asserts the operation succeeds, and an exception propagates if it does not\") beside the branch-shaped value access (\"this call site handles the outcome\"), the [§9.1](#sec-integer-types) `Parse`/`TryParse` pair being the model — because tiers serve different call-site *stances* toward one operation, not the same problem twice. A stance is the caller's. It does not make the exception a failure or a defect, which is the condition's (*Failures and defects*, above): the throwing `Parse` raises a failure and the throwing indexer a defect.")
+
+rep("L23", LIB, "§2.1 `Console`, the `ReadKey` paragraph",
+    "`ReadKey` remains the assert-shaped throwing tier — end of input is a bug at its call sites.",
+    "`ReadKey` remains the assert-shaped throwing tier: a caller that does not expect end of input handles nothing, and the `EndOfStreamException` then raised is a failure ([§1](#sec-failure-signal-rule)), end of input being the environment's and not the program's.")
+
+ins("L24", LIB, "§3.2 `Encoding`, the defined-fault paragraph",
+    "`GetBytes` raises `FormatException` when the string contains a code point the encoding cannot represent (possible only for `ASCII`).",
+    " (The `GetBytes` half is a band-1 defect raised with a failure class, a recorded misfit under [§1](#sec-failure-signal-rule)'s rule: the program chose an encoding that cannot represent its own text.)")
+
 # ------------------------------------------------------------------ rationale
 ins("R1", RAT, "§11, a new section §11.12 after §11.11 (before `## 12. Async`)",
     "<a id=\"sec-async\"></a>",
@@ -211,11 +228,13 @@ R1_TEXT = """<a id="sec-failures-and-defects"></a>
 
 **The cost of the interface, and the rule that pays it.** A binding of interface type exposes only the interface's members, so a boundary arm that bound the marker could not read `Message`, pass the exception to a logger, or chain it as a cause — the three things a boundary arm does. Declaring the reporting members on the marker fixes the first and not the other two. The rule taken is local to the catch arm and general: an interface in an arm selects, and the binding is the exception, typed at the most specific class the arm's class types determine (spec §31.2.1). It is the rule the multi-type alternative already had for classes, extended to the one case its text did not cover.
 
-**Why the marker has no members, and only exceptions may carry it.** With the binding an `Exception`, a member on the marker would be a second way to reach what the binding already has. Conformance is restricted to `Exception`-derived classes on the ground §11.7 used for arm types: a record or a non-exception class that lists the marker is a shape no program can observe, and Bezel rejects dead shapes rather than carrying them.
+**A recorded difference from `case`.** [§11.3](#sec-catch-is-case-for-exceptions) says that `catch` arms mirror `case` arms, and in a `case` a type pattern's binding has the pattern's written type (spec §19.3), so `case e of var f: IFailure` binds an `IFailure`. A `catch` arm over the same pattern binds an `Exception`. The two already differed for the multi-type alternative, whose binding is the nearest common base rather than any written type, and for the same reason: a `case` scrutinee may be anything, a caught value is known to be an `Exception`, and a handler's work is done on the exception. Keeping the mirror exact was weighed; it leaves the marker arm unable to log or wrap, which is what the arm is for.
+
+**Why the marker has no members, and who may carry it.** With the binding an `Exception`, a member on the marker would be a second way to reach what the binding already has. Conformance is restricted to `Exception`-derived classes on the ground §11.7 used for arm types: a record or a non-exception class that lists the marker is a shape no program can observe, and Bezel rejects dead shapes rather than carrying them. A second restriction keeps the documents' own classification true: a class under a built-in or standard-library class that is not a failure may not list the marker. Without it `class C: OperationCanceledException, IFailure` would make a failure arm take a cancellation, and a user's failure under `InvalidOperationException` would be taken by every state-defect arm — the swallowing stdlib §4.8 keeps `KeyNotFoundException` clear of. The library's two bridging classes are the only ones across that line, each recorded with its reason; a user hierarchy under a user base stays free to mix kinds, since no arm on a class of the documents is affected.
 
 **Unmarked means defect.** A user exception class is a defect report until it lists the marker. The other default would let a boundary arm swallow whatever a library author forgot to classify, which is the failure this entry exists to remove; the cost of the chosen default is one interface name on each class meant to be handled.
 
-**What the marker does not do.** It forces nothing: no `throws` clause, no obligation to handle (spec §31.3). It changes no ownership rule, and bugs still unwind and clean up (spec K3.15) — abandoning the process or the domain on a defect was weighed and declined on §12.4's ground. It leaves the query/assert tiers alone: a missing key and an empty collection stay defects in their throwing forms, because each has a query beside it.
+**What the marker does not do.** It forces nothing: no `throws` clause, no obligation to handle (spec §31.3). It changes no ownership rule, and bugs still unwind and clean up (spec K3.15). Abandoning the process or the domain on a defect was weighed and declined: it would skip the cleanup the exception edge guarantees, and it would make a contract violation uncatchable, where spec §22.16 makes it a catchable exception and the test oracle and the supervisor both depend on catching one. It leaves the query/assert tiers alone: a missing key and an empty collection stay defects in their throwing forms, because each has a query beside it.
 
 **Reopening bars.** For the base class: evidence that the catch-arm binding rule misleads readers, together with a migration for the two bridging classes. For re-typing a query's throwing form as a failure: a declared failure surface on members (a `fails` clause), which would let the pairs be derived rather than hand-written.
 
@@ -231,11 +250,15 @@ ins("R3", RAT, "§11.4, end of the last paragraph",
     " The line between the rule's first and fourth bands is visible in the exception's class ([§11.12](#sec-failures-and-defects)).")
 
 # ------------------------------------------------------------------ Guide 2
-rep("G1", G2, "the opening list",
+rep("G2-1", G2, "the opening list",
     "- A **caller bug** is a contract (`requires`, §7) or defect exception.\n- A **boundary fault** — I/O, network, anything logged or retried rather than branched on — is a typed exception (§4).",
     "- A **caller bug** is a contract (`requires`, §7) or a defect exception: a report, not something to handle.\n- A **failure** — I/O, network, bad input: anything a correct program can meet, logged or retried rather than branched on — is a typed exception whose class implements `IFailure` (§4).")
 
-ins("G2", G2, "§4, new paragraphs after the hierarchy paragraph",
+rep("G2-2", G2, "§4, the opening sentence",
+    "For everything the value shapes don't cover — the boundary fault, and the defect a `requires` contract (§7) cannot state — the exception machinery is the familiar one.",
+    "For everything the value shapes don't cover — the failure consumed at a boundary, and the defect a `requires` contract (§7) cannot state — the exception machinery is the familiar one.")
+
+ins("G2-3", G2, "§4, new paragraphs after the hierarchy paragraph",
     "Order arms most-specific first.",
     """
 
@@ -259,7 +282,7 @@ method Serve(request: Request): Response
 end Serve;
 ```
 
-The `IFailure` arm takes every failure and lets every bug through; `f` is an ordinary `Exception` inside the arm. The second arm is there only because this boundary is a supervisor that must keep serving. Most boundaries have no second arm: a bug then propagates, and an uncaught one ends the program with its report (spec §33.3). Where cancellation can reach a supervisor, give it its own arm ahead of the `Exception` arm — `OperationCanceledException => throw` — so that it is not reported as a bug. One arm on bare `Exception` that handles both draws a compiler warning (spec §31.2.3). An exception class of your own is a defect until you say otherwise:
+The `IFailure` arm takes every failure and lets every bug through; `f` is an ordinary `Exception` inside the arm. The second arm is there only because this boundary is a supervisor that must keep serving. Most boundaries have no second arm: a bug then propagates, and an uncaught one ends the program with its report (spec §33.3). Where cancellation can reach a supervisor, give it its own arm ahead of the `Exception` arm — `OperationCanceledException => throw` — so that it is not reported as a bug. One arm on bare `Exception` that handles both is the habit to drop: it answers a bug as if it were bad input. An exception class of your own is a defect until you say otherwise:
 
 ```bezel
 public class ConfigError(message: string): Exception(message), IFailure
@@ -268,38 +291,94 @@ end ConfigError;
 
 Two habits keep the kinds honest. Wrap a failure in a failure and never wrap a defect: re-raise it. And when out-of-range text matters, catch `FormatException` and `ParseRangeException` (or just `IFailure`); `ParseRangeException` is the failure `int.Parse("99999999999")` raises, distinct from the arithmetic `OverflowException` of `a * b`, which is a defect.""")
 
-rep("G3", G2, "§5, the `Handle` example",
+rep("G2-4", G2, "§5, the `Handle` example",
     "  catch\n    var ex: Exception => RecordError(ex)\n  end;",
     "  catch\n    var ex: IFailure => RecordError(ex)   // ex is an Exception here; a bug propagates\n  end;")
 
-rep("G4", G2, "§7, the boundary row of the table",
+rep("G2-5", G2, "§7, the boundary row of the table",
     "| a typed exception, producer-local (spec §31.4); read it in the `catch` and copy out what you keep (§5) |",
     "| a typed exception whose class implements `IFailure`, producer-local (spec §31.4); catch it at the boundary with an `IFailure` arm and copy out what you keep (§4, §5) |\n| Handling whatever goes wrong at a boundary | an `IFailure` arm; a separate `Exception` arm only in a supervisor that reports the bug, never one arm for both (§4) |")
 
-ins("G5", G2, "§7, the paragraph after the table",
+ins("G2-6", G2, "§7, the paragraph after the table",
     "Branching program logic on caught exception types at an interior call site is the signal to check the rule for a value-shaped tier.",
     " And at the boundary the arm names `IFailure`: an arm on bare `Exception` takes the bugs too.")
 
-# ------------------------------------------------------------------ code-generation reference
-rep("C1", CG, "§6, *Declaring, throwing and catching an exception type*",
-    "Derive from `Exception` (or any built-in exception type) and chain the message to the base; a caught exception is a **borrow** valid inside its arm only, so copy out what you keep.\n\n```bezel\npublic class ConfigError(message: string): Exception(message)\nend ConfigError;",
-    "Derive from `Exception` (or any built-in exception type) and chain the message to the base; list `IFailure` when the condition is one a correct program can meet, since an unmarked class is a defect report (§31.4); a caught exception is a **borrow** valid inside its arm only, so copy out what you keep.\n\n```bezel\npublic class ConfigError(message: string): Exception(message), IFailure\nend ConfigError;")
+# ------------------------------------------------------------------ Guide 4
+rep("G4-1", G4, "§4, the `Parallel` paragraph",
+    "First fault cancels remaining work and surfaces at the await as `DomainFaultedException` (stdlib §6.12).",
+    "First fault cancels remaining work and surfaces at the await as `DomainFaultedException` — as its subclass `DomainFailedException` when that fault was a failure, so that an `IFailure` arm takes it (stdlib §6.12).")
 
-ins("C2", CG, "§7.9, a new pair at the end of the section (before `## 8.`)",
-    "var port := ParsePort(raw).UnwrapOr(8080);          // a constant fallback is fine eagerly\n```",
+ins("G4-2", G4, "§5, the paragraph on joins",
+    "A fault in the entry surfaces at the join as `DomainFaultedException` carrying the original message and stack-trace *text* — exception objects themselves do not cross (spec §30.14).",
+    " Its kind does cross: a failure in the child is joined as `DomainFailedException`, a `DomainFaultedException` that an `IFailure` arm also takes, and a bug in the child is joined as the plain class, which that arm lets pass (Guide 2 §4).")
+
+# ------------------------------------------------------------------ Guide 6
+rep("G6-1", G6, "§2, the paragraph before the `Listen` example",
+    "the sanctioned signal is a typed exception (Guide 2 §4; the failure-signal rule's band 4, stdlib §1).",
+    "the sanctioned signal is a typed exception whose class implements `IFailure`: a failure (Guide 2 §4; the failure-signal rule's band 4, stdlib §1).")
+
+rep("G6-2", G6, "§2, the comment in the `Listen` example",
+    "    // Boundary-consumed expected failure: a typed exception, still never\n    // a requires. FormatException is the built-in format fault (spec §31.4).",
+    "    // Boundary-consumed expected failure: a typed exception, still never\n    // a requires. FormatException is the built-in input failure: its class\n    // implements IFailure (spec §31.4).")
+
+rep("G6-3", G6, "§2, the paragraph after the `Listen` example",
+    "Why not just call the throwing `int.Parse(rawPort)` and let its exception fly, if you were going to throw anyway? Two reasons. The throwing form is the *assert-shaped* tier — stdlib §1's words are that it \"treats absence as a bug\" — so calling it on boundary input re-asserts, in exception spelling, the same misclassification the bad `requires` made. And it splits the condition: `int.Parse` raises `FormatException` for a malformed numeral but `OverflowException` for an out-of-range one (stdlib §9.1, §2.3), while `Listen`'s condition is single — *not a port*. The explicit throw keeps one condition on one signal, in the domain's own words. The same reasoning rules out `ArgumentException`:",
+    "Why not just call the throwing `int.Parse(rawPort)` and let its exception fly, if you were going to throw anyway? You may. What it raises is a failure either way — `FormatException` for a malformed numeral, `ParseRangeException` for an out-of-range one (stdlib §9.1, §2.3) — because the text came from outside the program, and a boundary's `IFailure` arm takes both (Guide 2 §4). The explicit throw is for the wording: `int.Parse` reports two conditions in the numeral's terms, while `Listen`'s condition is single — *not a port*. The explicit throw keeps one condition on one signal, in the domain's own words. The kind is also what rules out `ArgumentException`:")
+
+ins("G6-4", G6, "§2, the two-question paragraph",
+    "a typed exception, as in the `Listen` rewrite (Guide 2 §4).",
+    " The kinds follow the answer: a broken `requires` raises `ContractViolationException`, a defect report that a boundary's `IFailure` arm lets pass, and the typed exception for bad input is a failure, which that arm takes (spec §31.4).")
+
+# ------------------------------------------------------------------ Tour
+rep("T1", TOUR, "§6 *Errors and nullability*, the exceptions paragraph",
+    "**Exceptions** are for the unexpected. A `catch` has comma-separated arms, matched in order:",
+    "**Exceptions** are for the unexpected, and are of two kinds: a *failure* (a missing file, bad input), whose class implements `IFailure`, and a *defect* report, which is a bug. `IFailure => …` is the arm that takes every failure and no bug. A `catch` has comma-separated arms, matched in order:")
+
+# ------------------------------------------------------------------ code-generation reference
+rep("C1", CG, "§5.1, *Three access tiers over one operation*",
+    "the **throwing** tier (absence is a bug) — `Parse`, `dict[key]`, `First()`, `PopAt`, `Pop`, `Dequeue`, `Console.ReadKey`;",
+    "the **throwing** tier (the call asserts the value is there and raises otherwise: a *failure* where the condition is the outside's — `Parse`, `Console.ReadKey` — and a *defect* where it is the program's own state — `dict[key]`, `First()`, `PopAt`, `Pop`, `Dequeue`);")
+
+rep("C2", CG, "§5.2, the `Convert` listing",
+    "end                                                    // faults: FormatException, OverflowException",
+    "end                                                    // failures: FormatException, ParseRangeException")
+
+ins("C3", CG, "§5.2, the exception hierarchy line",
+    "`FormatException`, `StackOverflowException` (uncatchable).",
+    " **Kinds (§31.4):** a class that implements the member-less interface `IFailure` is a *failure* — `FormatException`, the `IOException` family, `SerializationException`, `TimeoutException`, `ChannelClosedException`, `ChannelFullException`, `ParseRangeException` (an `OverflowException`: out-of-range `Parse`/`Convert.To*` input) and `DomainFailedException` (a `DomainFaultedException`: a failure joined from another domain); every other is a *defect* report; `OperationCanceledException` is neither. Only an `Exception`-derived class may list `IFailure`, and not one under a built-in or stdlib class that is not itself a failure.")
+
+rep("C4", CG, "§5.6, the `Domain` listing",
+    "end                                   // the entry MUST be capture-free; EXACTLY ONE argument",
+    "end                                   // the entry MUST be capture-free; EXACTLY ONE argument\n                                      // a fault in the entry is joined as DomainFaultedException; as\n                                      //   DomainFailedException (a subclass, IFailure) when it was a failure")
+
+rep("C5", CG, "§5.9, the integer `Parse` line",
+    "out of range `OverflowException`;",
+    "out of range `ParseRangeException` (an `OverflowException`; a failure);")
+
+rep("C6", CG, "§5.9, the `Double`/`Float` `Parse` line",
+    "raises `OverflowException` exactly where the same digits as a literal of that type are out of range",
+    "raises `ParseRangeException` exactly where the same digits as a literal of that type are out of range")
+
+rep("C7", CG, "§6, *Declaring, throwing and catching an exception type*",
+    "Derive from `Exception` (or any built-in exception type) and chain the message to the base; a caught exception is a **borrow** valid inside its arm only, so copy out what you keep.\n\n```bezel\npublic class ConfigError(message: string): Exception(message)\nend ConfigError;",
+    "Derive from `Exception` (or any built-in exception type) and chain the message to the base; list `IFailure` when the condition comes from outside the program, since an unmarked class is a defect report (§31.4); a caught exception is a **borrow** valid inside its arm only, so copy out what you keep.\n\n```bezel\npublic class ConfigError(message: string): Exception(message), IFailure\nend ConfigError;")
+
+ins("C8", CG, "§6, a new idiom after the exception-wrapping paragraph",
+    "never retained (§31.4); there is no user `InnerException`.",
     """
 
+**Catching at a boundary.** Name the marker, not `Exception`: an `IFailure` arm takes every failure and lets every bug through, and its binding is an ordinary `Exception` (§31.2.1).
+
 ```bezel
-try Serve(request); catch
-  var ex: Exception => Respond(500);         // WARNING: one arm for bugs and failures alike
-end;
-try Serve(request); catch
-  var f: IFailure => Respond(502, f.Message),                  // write: failures are answered
-  var ex: Exception => do ReportDefect(ex); Respond(500); end  //   and bugs are reported
+try
+  Serve(request);
+catch
+  var f: IFailure => Respond(502, f.Message),                  // failures: answered
+  var ex: Exception => do ReportDefect(ex); Respond(500); end  // a supervisor only: bugs reported
 end;
 ```
 
-> §31.4, §31.2.3: an exception whose class implements `IFailure` is a failure (`FormatException`, the `IOException` family, `SerializationException`, `TimeoutException`, `ChannelClosedException`, `ChannelFullException`, `ParseRangeException`, `DomainFailedException`); every other is a defect report. The boundary arm is `IFailure`; its binding is an `Exception`. Out-of-range text at `Parse` raises `ParseRangeException` (an `OverflowException`), not a bare `OverflowException`; a failure in a spawned domain arrives as `DomainFailedException` (a `DomainFaultedException`).""")
+Leave the second arm out unless the code is a supervisor: a bug should propagate. `IFailure => ()` suppresses failures only. To reach an interface's own members inside an arm, test in the body: `var r := ex as IRetryable;`.""")
 
 
 def load(root):
@@ -322,7 +401,7 @@ def new_text(e):
 
 def render():
     names = {SPEC: "Language specification", LIB: "Standard library", RAT: "Design rationale",
-             G2: "Guide 2", CG: "Code-generation reference"}
+             G2: "Guide 2", G4: "Guide 4", G6: "Guide 6", TOUR: "Tour", CG: "Code-generation reference"}
     cur = None
     for e in E:
         if e["doc"] != cur:

@@ -14,6 +14,10 @@ taxonomy.tsv columns:
   site        raise (the section states the member raises it), decl (it declares the
               type), xref (it only mentions the type)
   kind        the kind of the CONDITION: failure, defect, cancellation, carrier, fatal
+  origin      where the condition comes from (raise rows only). Outside the program:
+              environment, data (in an external form, being read in), peer, limit.
+              The program itself: argument, state, arithmetic. Also request (a
+              cancellation the program asked for) and carried (a domain join).
   action      none        the type's kind already matches
               marker      the type implements the marker (directly or by inheritance)
               range-class the condition is raised with the new derived class
@@ -48,10 +52,10 @@ if missing or extra:
 
 def vkey(s): return [int(x) for x in s.split(".")]
 if "--markdown" in sys.argv:
-    print("| Stdlib § | Condition | Type today | Kind | Action |")
-    print("|---|---|---|---|---|")
+    print("| Stdlib § | Condition | Type today | Origin | Kind | Action |")
+    print("|---|---|---|---|---|---|")
     for r in sorted((r for r in rows if r["site"] == "raise"), key=lambda r: vkey(r["section"])):
-        print(f"| {r['section']} | {r['condition']} | `{r['type_today']}` | {r['kind']} | {r['action']} |")
+        print(f"| {r['section']} | {r['condition']} | `{r['type_today']}` | {r['origin']} | {r['kind']} | {r['action']} |")
     sys.exit(0)
 
 print(f"mentions: {sum(pairs.values())}; (section, type) pairs: {len(pairs)}; sections: {len({s for s, _ in pairs})}; types: {len({t for _, t in pairs})}")
@@ -61,6 +65,11 @@ print("rows by site:", dict(site))
 raise_rows = [r for r in rows if r["site"] == "raise"]
 print("raise rows by kind:", dict(collections.Counter(r["kind"] for r in raise_rows)))
 print("raise rows by action:", dict(collections.Counter(r["action"] for r in raise_rows)))
+print("raise rows by kind and origin:", dict(collections.Counter((r["kind"], r["origin"]) for r in raise_rows)))
+OUT = {"environment", "data", "peer", "limit"}; PROG = {"argument", "state", "arithmetic"}
+bad = [r for r in raise_rows if (r["kind"] == "failure") != (r["origin"] in OUT) or (r["kind"] == "defect") != (r["origin"] in PROG)]
+print("rows whose kind does not follow from their origin:", len(bad))
+if bad: sys.exit(1)
 pk = collections.defaultdict(set)
 for r in raise_rows: pk[(r["section"], r["type_today"])].add(r["kind"])
 print("raise (section, type) pairs:", len(pk), "by kind:", dict(collections.Counter("+".join(sorted(v)) for v in pk.values())))
