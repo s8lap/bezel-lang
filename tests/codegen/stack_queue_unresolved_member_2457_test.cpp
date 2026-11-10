@@ -497,6 +497,23 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_minornull_maxornull_bare_re
 // (top=4), `Where(x > 2)` yields the elements > 2 and `First()` returns the
 // first of them — proving the call form's real LINQ dispatch survives the
 // fix (the control for the bare-form reject above). Mirrors the Array twin.
+//
+// THE STACK TWIN'S ANSWER IS NOT THE ARRAY TWIN'S. stdlib §4.11 "Iteration
+// order" (v0.355) gives a stack the TAKE order — top to bottom — so this
+// stack's sequence is 4,3,2,1, `Where(x > 2)` keeps that order (4,3), and
+// `First()` is the TOP-first match: 4. The Array twin's 3 is the ARRAY's
+// answer ([1,2,3,4] -> [3,4] -> 3), which is right for an array and is the
+// PUSH order for a stack.
+//
+// THIS ROW WAS A KNOWN-GAP ROW — it stated the CURRENT (push) order, so it
+// went RED the moment the stack's order became the take order. It was ALREADY
+// RED at the chain tip before this commit: MEASURED, the base arm
+// (`6c2683c4`) and this tip answer 4 identically, while this row expected 3
+// (the take order had already reached the §5 terminals; this expectation had
+// not been updated with it). It is flipped here, in the same commit that
+// fixes the #8265/#8361 family, and it is STRENGTHENED — the filtered
+// SEQUENCE is pinned by the companion row below, and the push order is
+// asserted ABSENT.
 BEZEL_TEST(stack_queue_unresolved_member_2457, legit_where_call_form_stack_value_correct_2492) {
     const std::string program =
         "module M; import System.Collections.Linq; "
@@ -506,7 +523,30 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_where_call_form_stack_value
         "  var e := s.Where(lambda(x) => x > 2); "
         "  return e.First(); "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 3);
+    BEZEL_EXPECT_EQ(run(program), 4);
+}
+
+// THE STRENGTHENED HALF — the filtered SEQUENCE, not merely the first
+// element. §4.11's take order makes it "4;3;" (the top first), and the push
+// order this row used to encode — "3;4;" — must be ABSENT. This is the
+// ordering claim stated in full, so a regression that happened to keep
+// `First()` at 4 while re-ordering the sequence behind it cannot pass.
+BEZEL_TEST(stack_queue_unresolved_member_2457,
+           legit_where_call_form_stack_where_sequence_is_take_order_2492) {
+    const std::string program =
+        "module M; import System.Collections.Linq; "
+        "class C public static method Main(): int "
+        "  var s := new Stack<int>(); "
+        "  s.Push(1); s.Push(2); s.Push(3); s.Push(4); "
+        "  var e := s.Where(lambda(x) => x > 2); "
+        "  var acc := \"\"; "
+        "  for var x in e do acc := acc + $\"{x};\"; end for; "
+        "  Console.WriteLine(acc); "
+        "  return 0; "
+        "end Main; end C;";
+    const std::string stdout = bezel::test::runAotOut(program);
+    BEZEL_EXPECT_TRUE(stdout.find("4;3;") != std::string::npos);
+    BEZEL_EXPECT_TRUE(stdout.find("3;4;") == std::string::npos);
 }
 
 // `.ToArray()` CALL form, VALUE-correct — proves the older #920/#1112
