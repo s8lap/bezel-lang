@@ -11009,12 +11009,41 @@ void MethodOwnership::moveOnlyArrayNoteWholeTransfer(std::string_view name) {
 }
 
 // §15.3 (#1899) bullet 1: mark the move-only inline-array local read by a bare
-// identifier at a transfer position as moved-from. See the header comment.
+// identifier (or its transparent `!` spelling) at a transfer position as
+// moved-from. See the header comment.
+//
+// THE NULL-FORGIVING READ (fix #8377 / #8375). §17.8 (spec :3662): "Over a
+// named owned binding, `x!` is therefore classified by its position exactly as
+// the bare read `x` is" — the `!` spelling is TRANSPARENT, so `a!` denotes the
+// same value as `a` and a consume of `a!` is a consume of `a`. §17.8
+// (spec :3660): "The null-forgiving operator preserves ownership: ... it does
+// not move, copy, or borrow beyond what reading `x` already does."
+//
+// Before this fix the OWNING-CHOICE twin (`noteOwningChoiceWholeMoveRead`,
+// below — the #7725 fix) peeled the `!` layers before its bare-identifier test
+// and this head did NOT, so the two move-only kinds of §15.3 disagreed on the
+// same spelling: `Sink.Take(o!)` moved the owning choice `o` and marked it
+// moved-from, while `ASink.Take(a!)` left the move-only inline array `a` fully
+// live — a use-after-move the compiler did not diagnose. §15.3's opening rule
+// is kind-independent ("Assignment transfers the value from source to
+// destination, leaving the source in moved-from state. Reading from a
+// moved-from location is a compile error."), so both heads must agree on both
+// the bare and the `!` spellings.
+//
+// The peel mirrors the twin's exactly: only the TOP-LEVEL `!` layers are
+// stripped, so `a![0]` (an element BORROW) and `a!.M()` (a receiver borrow)
+// keep their non-identifier shape and are still filtered out below, exactly as
+// the bare `a[0]` / `a.M()` are.
 void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
-    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&src);
+    const ast::Expr* core = &src;
+    while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core)) {
+        if (!pb->operand) return;
+        core = pb->operand.get();
+    }
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(core);
     if (!id) return;  // only a WHOLE-array read (a[i]/a.f/a.M() are borrows)
     long long size = 0;
-    if (!isMoveOnlyInlineArrayType(ctx_.exprType(src), size)) return;
+    if (!isMoveOnlyInlineArrayType(ctx_.exprType(*id), size)) return;
     auto* st = lookupStateFor(*id);
     if (!st) {
         // §15.3 (#1922) "Parameter passing": a move-only inline-array PARAMETER is
@@ -11022,7 +11051,8 @@ void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
         // no discharge obligation, so it is NOT seeded into `states_` at method
         // entry (an `owned`-modified move-only array IS seeded Owned and takes the
         // tracked-local path above; the `owned` modifier is redundant here per
-        // §15.3). A bare-identifier whole read of a plain move-only-array parameter
+        // §15.3). A whole read of a plain move-only-array parameter — a bare
+        // identifier, or its transparent `!` spelling (§17.8) —
         // in a transfer position is the same move #1899 tracks for a local —
         // "Local-to-local assignment" (bullet 1) applies to any move-only lvalue,
         // including a parameter. Seed the parameter into the flow state lazily AT
@@ -11033,7 +11063,7 @@ void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
         // array stays memory-safe (the transfer target keeps the storage alive, no
         // double-free) and codegen's whole-body transfer walk already skips
         // disposing the moved-from source; this only adds the missing rejection.
-        // Tight guards mirror the local path: bare-identifier whole read only
+        // Tight guards mirror the local path: whole-identifier read only
         // (index/member/call borrows are filtered above), move-only inline-array
         // type only (filtered above). // per §15.3 (#1922)
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*id));
