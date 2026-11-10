@@ -10266,6 +10266,227 @@ bool Emitter::thisStringMayEscapeProperty(
     return w.escaped;
 }
 
+namespace {
+
+// ===========================================================================
+// fix #8383 (stdlib §7.4 / §2.1, v0.355): `TextReader.ReadToEnd(): string`.
+//
+// THE GAP. stdlib §7.4 (v0.355) declares, on the abstract `TextReader`:
+//
+//   public method ReadToEnd(): string;
+//
+// and stdlib §2.1 declares `Console.In` as the class's ONE instance
+// ("`TextReader` has no concrete subclass in this library: its one instance
+// is `Console.In`"). The member was DOCUMENTED but had NO lowering arm at
+// all: the compiler accepted the call, sema typed nothing, codegen emitted
+// NOTHING for it, the local it initialised was zero-initialised behind
+// #2434's warning, and the program exited 0 having printed nothing — the
+// silent-wrong-code shape. MEASURED on this tree's base (issue #8383's own
+// repro):
+//
+//   var text := Console.In.ReadToEnd();
+//   Console.WriteLine(text.Length);
+//
+// printed nothing and exited 0.
+//
+// WHY FILE-LOCAL HELPERS AND NOT `Emitter` MEMBERS. The arm needs two new
+// emitter entry points (the classifier and the reader). An `Emitter` member
+// would have to be DECLARED in `src/codegen/LlvmBackend_impl.hpp`, which is
+// outside this lane's file set, so the arm is written as two FILE-LOCAL
+// functions that take the emitter's state explicitly. They sit next to their
+// only call site (`lowerCallDispatch`), so the arm reads as one unit.
+//
+// THE RECEIVER. stdlib §7.4 declares `ReadToEnd` on the abstract
+// `TextReader`, and §2.1 declares `Console.In` as its one instance. Two
+// spellings reach the member:
+//
+//   * `Console.In.ReadToEnd()` — the receiver is the built-in `Console`
+//     class's `In` PROPERTY read. The read itself is left UNTYPED by sema
+//     (§2.1's rule, of which `Console.In` is an instance — the same
+//     "syntactic receiver" treatment `Console.Out` / `Console.Error` get), so
+//     the receiver is recognised SYNTACTICALLY, exactly as `tryLowerConsoleCall`
+//     recognises `Console.Out.WriteLine(x)`.
+//
+//   * `r.ReadToEnd()` on a value of the built-in `TextReader` type — the
+//     receiver is recognised by its TYPE (a declaration-less Named ref whose
+//     head is `TextReader`), the same discriminator `isBuiltinTextWriterTypeRef`
+//     uses for the `TextWriter` family.
+//
+// ⇒ A USER class of the same name is excluded: `TextReader` is a built-in
+// class head, so a user declaration of that name has its OWN member surface
+// and its own dispatch.
+//
+// ⇒ `Console.In` is the only `TextReader` instance stdlib §7.4 admits, so
+// BOTH receivers denote the same reader — standard input.
+// ===========================================================================
+
+// Which receiver the built-in `TextReader.ReadToEnd()` call has.
+enum class TextReaderReceiverKind {
+    None,       // not the built-in member — the ordinary dispatch owns it
+    ConsoleIn,  // `Console.In.ReadToEnd()` — the syntactic receiver
+    TypedValue, // `r.ReadToEnd()` on a value of the built-in `TextReader` type
+};
+
+// Is `call` the built-in `TextReader.ReadToEnd()` member call? (§7.4)
+TextReaderReceiverKind classifyTextReaderReadToEnd(
+    const ast::CallExpr& call, const sema::SemaContext& ctx) {
+    if (!call.callee) return TextReaderReceiverKind::None;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return TextReaderReceiverKind::None;
+    // §7.4: `ReadToEnd()` takes no argument.
+    if (ma->member != "ReadToEnd" || !call.args.empty())
+        return TextReaderReceiverKind::None;
+    // A USER-declared `ReadToEnd` on a user receiver is the user's own
+    // member: the ordinary dispatch owns it, and this arm must not claim it.
+    if (dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*call.callee)))
+        return TextReaderReceiverKind::None;
+    // (1) `Console.In.ReadToEnd()` — the syntactic receiver.
+    if (auto* inner =
+            dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get())) {
+        if (inner->member == "In" && inner->target) {
+            if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
+                    inner->target.get())) {
+                // fix #8126 (§2.7 rule 1, v0.355): a VALUE named `Console` is
+                // member access, not the built-in class.
+                if (cid->name == "Console" &&
+                    sema::receiverMayReachBuiltinStaticArm(
+                        ctx.exprSymbol(*cid)))
+                    return TextReaderReceiverKind::ConsoleIn;
+            }
+        }
+    }
+    // (2) a value of the built-in `TextReader` type.
+    const sema::TypeRef* rt = ctx.exprType(*ma->target);
+    if (rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+        rt->headName() == "TextReader")
+        return TextReaderReceiverKind::TypedValue;
+    return TextReaderReceiverKind::None;
+}
+
+// THE READ. A `fgets` loop on `stdin` — the same `stdin` / `fgets` / `strlen`
+// setup `emitConsoleReadLine` makes — accumulating the bytes INCLUDING their
+// newlines into one heap buffer.
+//
+// WHY NOT A LOOP OF `ReadLine()` CALLS. `emitConsoleReadLine` strips the
+// trailing '\n' (stdlib §2.1's `Console.ReadLine` returns the line WITHOUT its
+// terminator), while §7.4's `ReadToEnd` returns the text AS READ — the
+// issue's own repro expects 12 for "hello\nworld\n", the newline included. A
+// `ReadLine` loop would answer 10.
+//
+// THE STRING. The same shape `emitConsoleReadLine` builds: {data, len,
+// width=1, rc=1} — the width-1 (Latin-1) storage §4.6's per-string width
+// model prescribes for byte input, and the producer's reference count
+// (§4.6 / #422). The width-1 convention is the console reader family's own
+// (`Console.ReadLine` stores its bytes the same way), so `ReadToEnd` and
+// `ReadLine` agree on what a byte of standard input is.
+//
+// THE LOOP. The accumulator and the byte count are carried in PHIs, so the
+// read needs no slot: the buffer is the only stack object (as in
+// `emitConsoleReadLine`).
+llvm::Value* emitTextReaderReadToEnd(llvm::IRBuilder<>& builder,
+                                     llvm::Module* module,
+                                     llvm::LLVMContext& llvmCtx,
+                                     llvm::Function* currentFn,
+                                     llvm::StructType* stringTy) {
+    auto* i8Ty = llvm::Type::getInt8Ty(llvmCtx);
+    auto* ptrT = llvm::PointerType::get(llvmCtx, 0);
+    auto* i64Ty = llvm::Type::getInt64Ty(llvmCtx);
+    const unsigned BUFSZ = 4096;
+    auto* bufTy = llvm::ArrayType::get(i8Ty, BUFSZ);
+    // The read buffer lives in the entry block, as `entryAlloca` does.
+    llvm::BasicBlock& entry = currentFn->getEntryBlock();
+    llvm::IRBuilder<> tmp(&entry, entry.begin());
+    llvm::AllocaInst* buf = tmp.CreateAlloca(bufTy);
+    llvm::Value* bufPtr = builder.CreateGEP(
+        bufTy, buf, {builder.getInt64(0), builder.getInt64(0)});
+    // fgets(buf, BUFSZ, stdin) — the same declarations `emitConsoleReadLine`
+    // makes. The module-level lookup means the SECOND declaration of `fgets` /
+    // `strlen` / `stdin` in the same module finds the first, so the emitted
+    // module carries one of each.
+    llvm::Function* fgetsFn = module->getFunction("fgets");
+    if (!fgetsFn) {
+        auto* ft = llvm::FunctionType::get(
+            ptrT, {ptrT, builder.getInt32Ty(), ptrT}, false);
+        fgetsFn = llvm::Function::Create(
+            ft, llvm::GlobalValue::ExternalLinkage, "fgets", module);
+    }
+    llvm::GlobalVariable* stdinGV = module->getGlobalVariable("stdin");
+    if (!stdinGV) {
+        stdinGV = new llvm::GlobalVariable(
+            *module, ptrT, false,
+            llvm::GlobalValue::ExternalLinkage, nullptr, "stdin");
+    }
+    llvm::Value* stdinVal = builder.CreateLoad(ptrT, stdinGV, "stdin");
+    llvm::Function* strlenFn = module->getFunction("strlen");
+    if (!strlenFn) {
+        auto* ft2 = llvm::FunctionType::get(i64Ty, {ptrT}, false);
+        strlenFn = llvm::Function::Create(
+            ft2, llvm::GlobalValue::ExternalLinkage, "strlen", module);
+    }
+    // `declareC`, spelled locally: this arm is a file-local function, so it
+    // cannot reach the emitter's member helper.
+    auto declareC = [&](const char* name, llvm::Type* ret,
+                        std::vector<llvm::Type*> args) -> llvm::Function* {
+        if (auto* f = module->getFunction(name)) return f;
+        auto* ft = llvm::FunctionType::get(ret, args, /*variadic=*/false);
+        return llvm::Function::Create(
+            ft, llvm::GlobalValue::ExternalLinkage, name, module);
+    };
+    llvm::Function* mallocFn = declareC("malloc", ptrT, {i64Ty});
+    llvm::Function* reallocFn = declareC("realloc", ptrT, {ptrT, i64Ty});
+    llvm::Function* memcpyFn = declareC("memcpy", ptrT, {ptrT, ptrT, i64Ty});
+    // The accumulator starts as an empty (NUL-terminated) one-byte buffer.
+    llvm::Value* acc0 =
+        builder.CreateCall(mallocFn, {builder.getInt64(1)}, "rte.acc0");
+    builder.CreateStore(llvm::ConstantInt::get(i8Ty, 0), acc0);
+    auto* loopBB = llvm::BasicBlock::Create(llvmCtx, "rte.loop", currentFn);
+    auto* bodyBB = llvm::BasicBlock::Create(llvmCtx, "rte.body", currentFn);
+    auto* endBB = llvm::BasicBlock::Create(llvmCtx, "rte.end", currentFn);
+    llvm::BasicBlock* predBB = builder.GetInsertBlock();
+    builder.CreateBr(loopBB);
+    builder.SetInsertPoint(loopBB);
+    llvm::PHINode* accPhi = builder.CreatePHI(ptrT, 2, "rte.acc");
+    accPhi->addIncoming(acc0, predBB);
+    llvm::PHINode* lenPhi = builder.CreatePHI(i64Ty, 2, "rte.len");
+    lenPhi->addIncoming(builder.getInt64(0), predBB);
+    llvm::Value* fgRet = builder.CreateCall(
+        fgetsFn, {bufPtr, builder.getInt32(BUFSZ), stdinVal}, "rte.fgets");
+    llvm::Value* isEOF = builder.CreateICmpEQ(
+        fgRet, llvm::ConstantPointerNull::get(ptrT), "rte.eof");
+    builder.CreateCondBr(isEOF, endBB, bodyBB);
+    builder.SetInsertPoint(bodyBB);
+    llvm::Value* n = builder.CreateCall(strlenFn, {bufPtr}, "rte.n");
+    // acc = realloc(acc, len + n + 1)
+    llvm::Value* need = builder.CreateAdd(lenPhi, n, "rte.need0");
+    need = builder.CreateAdd(need, builder.getInt64(1), "rte.need");
+    llvm::Value* acc1 = builder.CreateCall(reallocFn, {accPhi, need}, "rte.acc1");
+    // memcpy(acc + len, buf, n)
+    llvm::Value* dst = builder.CreateGEP(i8Ty, acc1, lenPhi, "rte.dst");
+    builder.CreateCall(memcpyFn, {dst, bufPtr, n});
+    // acc[len + n] = 0
+    llvm::Value* tailIdx = builder.CreateAdd(lenPhi, n, "rte.tailidx");
+    llvm::Value* tail = builder.CreateGEP(i8Ty, acc1, tailIdx, "rte.tail");
+    builder.CreateStore(llvm::ConstantInt::get(i8Ty, 0), tail);
+    accPhi->addIncoming(acc1, bodyBB);
+    lenPhi->addIncoming(tailIdx, bodyBB);
+    builder.CreateBr(loopBB);
+    builder.SetInsertPoint(endBB);
+    // The string: {data, len, width=1, rc=1}.
+    uint64_t strBytes = module->getDataLayout().getTypeAllocSize(stringTy);
+    llvm::Value* strObj =
+        builder.CreateCall(mallocFn, {builder.getInt64(strBytes)}, "rte.obj");
+    builder.CreateStore(accPhi, builder.CreateStructGEP(stringTy, strObj, 0));
+    builder.CreateStore(lenPhi, builder.CreateStructGEP(stringTy, strObj, 1));
+    builder.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+                        builder.CreateStructGEP(stringTy, strObj, 2));
+    // #422: the producer's reference, rc := 1.
+    builder.CreateStore(builder.getInt64(1),
+                        builder.CreateStructGEP(stringTy, strObj, 3));
+    return strObj;
+}
+
+}  // namespace
+
 llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     // fix #7600 (§22.5, v0.350): the written-order pre-pass runs BEFORE every
@@ -10375,6 +10596,52 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     }
     // CG-console: Console.Write / Console.WriteLine / Console.WriteLine()
     if (tryLowerConsoleCall(call)) return nullptr;  // unit result
+    // fix #8383 (stdlib §7.4, v0.355): `TextReader.ReadToEnd(): string` —
+    // the built-in reader's read-to-EOF member. The member is DOCUMENTED
+    // (§7.4) and `Console.In` is its one instance (§2.1), but there was NO
+    // lowering arm for it: the call lowered to NOTHING, the local it
+    // initialised was zero-initialised behind #2434's warning, and the
+    // program exited 0 having printed nothing. Intercepted HERE — before the
+    // ordinary member dispatch and before its "no dispatch arm emitted any
+    // code" refusal (#2935) — because the built-in `TextReader` carries no
+    // MethodSymbol for the ordinary path to find.
+    {
+        const TextReaderReceiverKind rteKind =
+            classifyTextReaderReadToEnd(call, ctx_);
+        if (rteKind != TextReaderReceiverKind::None) {
+            // The receiver of a member call is an EVALUATED OPERAND (§22.3).
+            // For the `Console.In` spelling the property read denotes the
+            // standard input and has NO run-time effect, so it is not lowered
+            // (the `Console.In` property read has no codegen arm, and
+            // lowering it would emit #2434) — the syntactic receiver is
+            // recognised, exactly as `tryLowerConsoleCall` recognises
+            // `Console.Out.WriteLine(x)`. For the typed spelling the value IS
+            // the reader: it is lowered for its effects, exactly once, before
+            // the read.
+            bool receiverOk = true;
+            if (rteKind == TextReaderReceiverKind::TypedValue) {
+                auto* rteMa = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call.callee.get());
+                receiverOk =
+                    rteMa && lowerExpr(*rteMa->target) != nullptr;
+            }
+            if (receiverOk) {
+                llvm::Value* text = emitTextReaderReadToEnd(
+                    builder_, module_.get(), llvm_, currentFn_, stringType());
+                if (text) {
+                    // fix #8383 (§7.4): the RESULT is a `string` — stamp it so
+                    // the call's type is the member's declared return type.
+                    // Sema leaves the call untyped (the built-in `TextReader`
+                    // has no member surface there), so the stamp is what lets
+                    // the enclosing store see a `string` value.
+                    ctx_.setExprType(
+                        &call,
+                        ctx_.primitiveTypeRef(sema::PrimitiveType::String));
+                    return text;
+                }
+            }
+        }
+    }
     // stdlib §5 (#755): the #1296 hand-rolled IGrouping terminal slot used to sit
     // here. It is gone: an IGrouping receiver is now restated as its element
     // `Array<T>` in tryLowerLazyLinqCall / tryLowerCollectionInstanceCall below,

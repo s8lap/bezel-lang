@@ -690,7 +690,7 @@ struct BuiltinParamRow {
     std::string_view sig;
 };
 
-constexpr std::array<BuiltinParamRow, 386> kBuiltinParams = {{
+constexpr std::array<BuiltinParamRow, 387> kBuiltinParams = {{
     // fix #7421 (stdlib §9.6, §5.1, §7.3, v0.345): the §9.6 `String` head's
     // DECLARED PARAMETER TYPES, transcribed from the standard library's own
     // listing.
@@ -1491,6 +1491,31 @@ constexpr std::array<BuiltinParamRow, 386> kBuiltinParams = {{
     {"TaskScope", "CancelAfter", 1, 1, 0x00, {"delay", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "CancelAfter(delay: TimeSpan)"},
     {"TextWriter", "Write", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {kBPTString | kBPTChar | kBPTObject | kBPTBool | kBPTInt | kBPTByte | kBPTSByte | kBPTShort | kBPTUShort | kBPTUInt | kBPTLong | kBPTULong | kBPTFloat | kBPTDouble | kBPTDecimal, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"TextWriter", "WriteLine", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {kBPTString | kBPTObject | kBPTBool | kBPTInt | kBPTByte | kBPTSByte | kBPTShort | kBPTUShort | kBPTUInt | kBPTLong | kBPTULong | kBPTFloat | kBPTDouble | kBPTDecimal, 0, 0, 0, 0, 0, 0, 0}, ""},
+    // fix #8383 (stdlib §7.4, v0.355): `TextReader`'s `ReadToEnd()` — the
+    // built-in reader's read-to-EOF member, declared by stdlib §7.4's own
+    // block ("public method ReadToEnd(): string;"). The row carries the
+    // DECLARED FORM: no parameter, so the `total` / `required` counts are 0,
+    // the §22.5 name surface is empty (the declaration names no parameter),
+    // the §5.1 type opinion is empty (no parameter), and the §7.3
+    // nullability mask is 0 (no position). The `sig` column carries the
+    // declaration as the standard library writes it.
+    //
+    // §7.4 declares `Read()` and `ReadLine()` on the same head and they are
+    // NOT transcribed here: neither has a lowering arm, so transcribing them
+    // would record a form the compiler cannot honour. `ReadToEnd` is
+    // transcribed because it IS honoured (the codegen arm in
+    // `src/codegen/LlvmBackend_Calls2.cpp`).
+    //
+    // THE ROW IS BEHAVIOURALLY INERT TODAY, and that is measured, not
+    // assumed: the §5.1 admission gate (`checkBuiltinCallAdmission`) reaches
+    // the VALUE built-ins only, `builtinParamNameCandidates` skips a row
+    // that carries no §22.5 name, `builtinParamIsNonNullable` asks a
+    // POSITION and this form has none, and the arity gates are keyed on the
+    // `Math` / `Convert` / `Path` / `Directory` / `File` / `Environment` /
+    // `string` / value-built-in heads. The row records the DECLARED FORM so
+    // the ONE table carries the built-in member the way it carries every
+    // other declared built-in form.
+    {"TextReader", "ReadToEnd", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ReadToEnd(): string"},
 }};
 
 
