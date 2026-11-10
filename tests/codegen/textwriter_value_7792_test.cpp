@@ -32,10 +32,15 @@
 // holds the object itself, so its object uses (`is` / `as` a user type,
 // `Object`, `=`, printing) run, and every use as a built-in `TextWriter` is
 // rejected; declared `TextWriter?`, only its `= null` / `<> null` reads are
-// admitted. A type test or cast into `TextWriter` (`as`, `is`, a typed `case`
-// binding), and one of a `TextWriter` value, is a located compile error. A
-// `TextWriter` never given a stream is a §7.9 / §17.11 compile error, as for
-// a user class. The rows after the first block pin all of that.
+// admitted. A type test or cast INTO `TextWriter` (`as`, a typed `case`
+// binding), and a CAST of a `TextWriter` value, is a located compile error;
+// the `is` / `is not` FORMS ANSWER instead (Issue #8256; spec §12.7, stdlib
+// §7.4, §17.4 / §19.3 -- a type test produces a `bool`, and the runtime can
+// now answer it; the sibling test
+// tests/sema/builtin_io_class_type_test_8256_cluster11_test.cpp pins the other
+// half of the same contract). A `TextWriter` never given a stream is a §7.9 /
+// §17.11 compile error, as for a user class. The rows after the first block
+// pin all of that.
 //
 // narrow #7792, third fix-forward: `TextWriter?` is a member of codegen's
 // nullable-VALUE family and a bare `Console.Out` / `Console.Error` operand of
@@ -603,12 +608,29 @@ BEZEL_TEST(textwriter_value_7792, assigned_textwriter_local_and_field_run_7_9) {
 // narrow #7792 second fix-forward (stdlib §7.4, spec §17.4, §19.3, v0.355): a
 // type test or cast INTO the built-in `TextWriter` cannot produce a stream
 // descriptor from an object, so every spelling is a located compile error.
-// MEASURED on 225833d4: the review's u05 (`(new W() as TextWriter)!`) and u08
-// (`(o as TextWriter)!` over an `Object`) compiled with only the #2434 degrade
-// warning and `t.WriteLine("hi")` wrote to descriptor 0 (stdin); `??`, a
-// conditional arm, an interface carrier, a generic `x as TextWriter` and the
-// inferred local did the same; `o is TextWriter` emitted nothing (not even
-// the line); a typed `case` binding ran no arm at all.
+// MEASURED on 225833d4 (BEFORE Issue #8256): the review's u05
+// (`(new W() as TextWriter)!`) and u08 (`(o as TextWriter)!` over an `Object`)
+// compiled with only the #2434 degrade warning and `t.WriteLine("hi")` wrote
+// to descriptor 0 (stdin); `??`, a conditional arm, an interface carrier, a
+// generic `x as TextWriter` and the inferred local did the same; `o is
+// TextWriter` emitted nothing (not even the line); a typed `case` binding ran
+// no arm at all.
+//
+// Issue #8256 SPLIT (the chain's own commit a37906fc6; spec §12.7, stdlib
+// §7.4, spec §17.4 / §19.3). The `is` / `is not` FORMS over a compiler-known
+// I/O class head are now ADMITTED, because a type test produces a `bool`
+// (§12.7) and the runtime can now answer it. The `as` forms and the typed
+// `case` binding keep the #7792 rejection: they must produce a VALUE of the
+// target type, and a `TextWriter` value (the i32 stream descriptor, §17.4 /
+// §19.3) has no representation for an object.
+//
+// ⇒ THE MUST-BE-REFUSED SET BELOW IS THE `as` / `case` ROWS ONLY. The two `is`
+// / `is not` rows leave it and are asserted in their own MUST-ANSWER loop at
+// the end of this case. The sibling test
+// tests/sema/builtin_io_class_type_test_8256_cluster11_test.cpp is the other
+// half of this same contract: it pins `Console.Out is TextWriter` -> `True`
+// and `Console.Out is not W` -> `True`, and keeps the `as TextWriter`
+// rejection green.
 BEZEL_TEST(textwriter_value_7792, type_test_into_textwriter_rejected_17_4) {
     const std::string pre = std::string("module M; interface I end I; ") +
         "class W: TextWriter, I "
@@ -637,9 +659,6 @@ BEZEL_TEST(textwriter_value_7792, type_test_into_textwriter_rejected_17_4) {
         "(o as TextWriter)!.WriteLine(\"hi\");",
         // `as TextWriter?` and a nullable local.
         "var t: TextWriter? := o as TextWriter?; Console.WriteLine(t = null);",
-        // `is` / `is not` (emitted nothing at all).
-        "Console.WriteLine(o is TextWriter);",
-        "Console.WriteLine(i is not TextWriter);",
         // A typed `case` binding (ran no arm).
         "case o of var t: TextWriter => t.WriteLine(\"hi\"), _ => Console.WriteLine(\"no\") end;",
         // Even from a built-in stream (lowered to null: a NullReferenceException).
@@ -664,18 +683,54 @@ BEZEL_TEST(textwriter_value_7792, type_test_into_textwriter_rejected_17_4) {
         BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
             r, "a type test or cast into the built-in `TextWriter`"));
     }
+    // Issue #8256: the `is` / `is not` FORMS are ANSWERED, not refused (spec
+    // §12.7: a type test produces a `bool`; stdlib §7.4: `TextWriter` is a
+    // user-extensible class, so a `W` IS a `TextWriter`; stdlib §1
+    // *Extensibility* names `TextWriter` among the heads that admit a
+    // user-declared subclass). MEASURED on the chain's tip (a37906fc6) with
+    // `bezelc`: `o is TextWriter` prints `True` (the `Object` carrier holds a
+    // `W`), and `i is not TextWriter` prints `False` (the interface carrier
+    // holds a `W` too, so it IS a `TextWriter` and the negated test is false).
+    {
+        struct Row { const char* body; const char* out; };
+        const Row rows[] = {
+            {"Console.WriteLine(o is TextWriter);", "True\nend\n"},
+            {"Console.WriteLine(i is not TextWriter);", "False\nend\n"},
+        };
+        for (const Row& row : rows) {
+            auto r = runAotChecked(pre + row.body + post);
+            BEZEL_EXPECT_TRUE(r.ran);
+            BEZEL_EXPECT_EQ(r.exitCode, 0);
+            BEZEL_EXPECT_EQ(r.stdoutText, std::string(row.out));
+        }
+    }
 }
 
 // narrow #7792 second fix-forward: the OPERAND side. A built-in `TextWriter`
-// value is a descriptor with no runtime type, so `tw is W` / `tw as W` is a
-// located compile error. MEASURED on 225833d4: `Console.WriteLine(tw is W)`
-// emitted nothing, `tw as W` degraded with the #2434 warning.
+// value is a descriptor with no runtime type, so `tw as W` is a located
+// compile error. MEASURED on 225833d4 (BEFORE Issue #8256):
+// `Console.WriteLine(tw is W)` emitted nothing, `tw as W` degraded with the
+// #2434 warning.
+//
+// Issue #8256 SPLIT (the chain's own commit a37906fc6; spec §12.7, stdlib
+// §7.4, spec §17.4 / §19.3). The `is` / `is not` FORMS over a compiler-known
+// I/O class head are now ADMITTED, because a type test produces a `bool`
+// (§12.7) and the runtime can now answer it. The `as` forms and the typed
+// `case` binding keep the #7792 rejection: they must produce a VALUE of the
+// target type, and a `TextWriter` value (the i32 stream descriptor, §17.4 /
+// §19.3) has no representation for an object.
+//
+// ⇒ THE MUST-BE-REFUSED SET BELOW IS THE `as` ROW ONLY. The `is` row leaves it
+// and is asserted in its own MUST-ANSWER loop at the end of this case. The
+// sibling test tests/sema/builtin_io_class_type_test_8256_cluster11_test.cpp
+// is the other half of this same contract: it pins `Console.Out is TextWriter`
+// -> `True` and `Console.Out is not W` -> `True`, and keeps the `as
+// TextWriter` rejection green.
 BEZEL_TEST(textwriter_value_7792, type_test_of_textwriter_value_rejected_17_4) {
     const std::string pre = std::string("module M; ") + kSub +
         "class P public static method H(tw: TextWriter) ";
     const char* post = " end H; public static method Main() H(Console.Out); end Main; end P;";
     const char* bodies[] = {
-        "Console.WriteLine(tw is W);",
         "var u := tw as W; Console.WriteLine(u = null);",
     };
     for (const char* b : bodies) {
@@ -684,6 +739,24 @@ BEZEL_TEST(textwriter_value_7792, type_test_of_textwriter_value_rejected_17_4) {
         BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
         BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
             r, "a type test or cast of a built-in `TextWriter` value"));
+    }
+    // Issue #8256: the `is` / `is not` FORMS over a `TextWriter` VALUE answer
+    // too (spec §12.7: a type test produces a `bool`; stdlib §7.4:
+    // `TextWriter` is a user-extensible class). The answer is a fact about the
+    // DECLARED type -- the standard stream is an instance of `TextWriter` and
+    // of `Object` (§8.1) and of no other class (§12.7) -- so `tw is W` is
+    // `False`. MEASURED on the chain's tip (a37906fc6) with `bezelc`.
+    {
+        struct Row { const char* body; const char* out; };
+        const Row rows[] = {
+            {"Console.WriteLine(tw is W);", "False\n"},
+        };
+        for (const Row& row : rows) {
+            auto r = runAotChecked(pre + row.body + post);
+            BEZEL_EXPECT_TRUE(r.ran);
+            BEZEL_EXPECT_EQ(r.exitCode, 0);
+            BEZEL_EXPECT_EQ(r.stdoutText, std::string(row.out));
+        }
     }
 }
 
