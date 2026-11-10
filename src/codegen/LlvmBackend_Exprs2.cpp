@@ -735,6 +735,40 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
         const ast::Expr* moveSrc = un.operand.get();
         while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(moveSrc))
             moveSrc = pb->operand.get();
+        // fix #7977 (§28.8.1, v0.357): the bare take over an `owned` field of
+        // ANY iterator-format head stores `null` — "`move x.f` at a nullable
+        // field stores `null`", and "a later read reads `null`". The
+        // field-slot nulling arms below gate on isOwnedIteratorInterfaceField,
+        // which is the owned-field DISPOSAL predicate and covers only the
+        // heads that predicate admits (isVtableBackedIteratorFrameType: the
+        // sync enumerables and the async enumerators). The other four heads —
+        // `IEnumerator<T>`, `IOwningEnumerator<T>`, `IAsyncEnumerable<T>`,
+        // `IOwningAsyncEnumerable<T>` — kept the moved-out frame in the field,
+        // so a second take (`var p := move h.En; var q := move h.En;`, or a
+        // lambda `=> move h.En` invoked twice) yielded the SAME frame to two
+        // owners: a heap-use-after-free at the second Dispose. Vacating is
+        // owed whatever the disposal predicate says, so it is read from the
+        // shared head classifiers here and the disposal predicate is NOT
+        // widened (its two missing heads are #7422's, a separate cascade).
+        auto isOwnedIterFormatFrameField =
+            [&](const sema::FieldSymbol* f) -> bool {
+            if (!f) return false;
+            if (isOwnedIteratorInterfaceField(f)) return true;
+            const sema::TypeRef* rt = nullptr;
+            if (f->posParam) {
+                rt = capturedOwnedPrimaryParamType(f);
+            } else {
+                if (!hasOwnedModifier(f)) return false;
+                rt = declaredFieldTypeRef(f);  // local or imported
+            }
+            if (!rt || rt->kind != sema::TypeRef::Kind::Named ||
+                rt->declaration)
+                return false;
+            if (rt->genericArgs.empty() || !rt->genericArgs[0]) return false;
+            std::string_view n = builtinTypeName(rt);
+            return !n.empty() && (common::isIterFormatEnumerableHead(n) ||
+                                  common::isIterFormatEnumeratorHead(n));
+        };
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(moveSrc)) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
             if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
@@ -958,7 +992,7 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // qualified-form fix, so inside a destructor the field is left
                 // non-null and the auto-dispose pass disposes it exactly once.
                 if ((isOwnedReferenceField(fs) ||
-                     isOwnedIteratorInterfaceField(fs) ||
+                     isOwnedIterFormatFrameField(fs) ||  // #7977
                      ownedCollectionFieldType(fs) != nullptr) &&
                     !emittingDisposerBody_) {
                     llvm::Type* fty = nullptr;
@@ -1078,7 +1112,7 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
             if (auto* fs = dynamic_cast<sema::FieldSymbol*>(
                     ctx_.exprSymbol(*ma));
                 fs && (isOwnedReferenceField(fs) ||
-                       isOwnedIteratorInterfaceField(fs) ||
+                       isOwnedIterFormatFrameField(fs) ||  // #7977
                        ownedCollectionFieldType(fs) != nullptr ||
                        // fix #5652 (§15.1.1 / §15.3, v0.328): the QUALIFIED
                        // twin of the bare-form arm added below, and the form
