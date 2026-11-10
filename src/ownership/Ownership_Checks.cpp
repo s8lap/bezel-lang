@@ -11064,6 +11064,19 @@ void MethodOwnership::reportIfBorrowOnlyMoveOnlyArmBindingConsume(
         const ast::Expr& e, const char* position) {
     if (suppressDiag_) return;
     if (borrowOnlyMoveOnlyArmBindings_.empty()) return;
+    // fix #7892: the null-forgiving spelling is TRANSPARENT (§17.8: "Over a
+    // named owned binding, `x!` is therefore classified by its position
+    // exactly as the bare read `x` is"; a borrow keeps its source), so a
+    // consume of `r!` is a consume of `r` and gets the same rejection, and the
+    // same holds for an arm-selecting `(if c then y else z)!`. The top-level
+    // `!` layers are peeled and the operand is re-examined as if bare,
+    // mirroring noteMoveOnlyArrayWholeMoveRead / noteOwningChoiceWholeMoveRead.
+    // per §17.8, §15.3, v0.357
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand)
+            reportIfBorrowOnlyMoveOnlyArmBindingConsume(*pb->operand, position);
+        return;
+    }
     // The value of an if-expression / expression-`case` IS its selected
     // arm's value, so an arm result sits in the same consuming position.
     if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
