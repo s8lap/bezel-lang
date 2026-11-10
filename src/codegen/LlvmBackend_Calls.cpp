@@ -4113,7 +4113,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             recvTy ? builtinTypeName(recvTy) : std::string_view();
         if (!headX.empty() && (m == "IndexOf" || m == "LastIndexOf") &&
             common::isConcreteCollectionSurfaceHead(headX) &&
-            !common::concreteCollectionHeadDeclares(headX, m)) {
+            !common::concreteCollectionHeadDeclares(headX, m) &&
+            // fix #8349 (stdlib §4.14, v0.355): the head's own row also
+            // lists the members the COMPILER dispatches for it although no
+            // stdlib section declares them (the fourth field). `IndexOf` on
+            // the §4.14 head is one of them — MEASURED on the base tree:
+            // `b.IndexOf(42)` returns the right answer (the buffer's
+            // array-backed storage answers it), so the gate must not refuse
+            // it: a member that compiles today must not stop compiling.
+            !common::concreteCollectionHeadDispatches(headX, m)) {
             auto* msIdx =
                 dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
             if (!isExtensionMethod(msIdx)) {

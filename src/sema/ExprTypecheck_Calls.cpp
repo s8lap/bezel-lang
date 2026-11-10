@@ -14901,7 +14901,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // spec-declared write surface. Emit a targeted hint
                     // before the generic "not in surface" reject so the
                     // user knows exactly what to use instead.
-                    if (m == "Set") {
+                    //
+                    // fix #8349 (stdlib §4.14, v0.355): the hint does NOT own
+                    // the §4.14 head's `Set` — the compiler REALLY dispatches
+                    // `Set(i, v)` for the buffer's array-backed storage
+                    // (MEASURED on the base tree: `Set(1, 42)` → `b[1]` = 42,
+                    // i.e. the indexer's setter), so the head's row lists it
+                    // among the compiler-dispatched members and the call must
+                    // keep compiling exactly as it does today. The hint stays
+                    // the authority for every other head.
+                    if (m == "Set" && surfaceHead != "OwningBuffer") {
                         ctx_.diagnostics().report(
                             Severity::Error, ce.span.begin,
                             "`.Set()` is not a method on any collection type "
@@ -35664,26 +35673,44 @@ concreteCollectionSurfaces() {
         //
         // THE FOURTH FIELD is the head's COMPILER-DISPATCHED members that
         // §4.14 does not declare — MEASURED on the base tree, each one
-        // really dispatched (not the #2457 backstop): `Clear` (the buffer's
-        // slots go to their defaults — MEASURED: `Length` 3 → 0), `Pop` /
-        // `PopFirst` / `PopLast` / `Dequeue` (each removes one slot —
-        // MEASURED: `Length` 3 → 2), `Peek` (reads the top slot), `Get`
-        // (the array-storage read, `Get(0)` → the stored element), and
-        // `Sort` (the ordering mutator). They are the same SHAPE as the
-        // `Array` row's `Get` accessor — a member the compiler dispatches
-        // although no stdlib section declares it — and they are listed here
-        // for the same reason the table's own comment gives: without them,
-        // the head's own dispatched members would start drawing the surface
-        // diagnostic, which would be a REGRESSION (a member that compiles
-        // today would stop compiling).
+        // really dispatched to a VALUE (not codegen's "no dispatch arm"
+        // backstop): `Clear` (the buffer's slots go to their defaults —
+        // MEASURED: `Length` 3 → 0), `Pop` / `PopFirst` / `PopLast` /
+        // `Dequeue` (each removes one slot — MEASURED: `Length` 3 → 2),
+        // `Peek` (reads the top slot — MEASURED: 9), `Get` (the
+        // array-storage read — MEASURED: `Get(0)` → 7), `Sort` (the
+        // ordering mutator), and the array-backed structural arms the
+        // buffer's `bz_array_t` storage answers — `Add` (MEASURED:
+        // `Add(7)` → `Length` 3 → 4), `AddRange`, `Insert` (MEASURED:
+        // `Insert(0, 5)` → `b[0]` = 5), `Remove`, `RemoveAt` (MEASURED:
+        // `Length` 5 → 4), `IndexOf` (MEASURED: `IndexOf(42)` → 1),
+        // `Push`, `Enqueue`, `PopAt` and `Set` (MEASURED: `Set(1, 42)` →
+        // `b[1]` = 42). They are the same SHAPE as the `Array` row's `Get`
+        // accessor — a member the compiler dispatches although no stdlib
+        // section declares it — and they are listed here for the reason the
+        // table's own comment gives: without them, the head's own dispatched
+        // members would start drawing the surface diagnostic, which would be
+        // a REGRESSION (a member that compiles today would stop compiling).
+        //
+        // ⇒ MEASURED ACROSS ARITIES, not only at arity 0: the compiler's
+        // dispatch is ARITY-DEPENDENT for this head (the arity-0 `Add()`
+        // reaches codegen's backstop, while the element-taking `Add(item)`
+        // is really dispatched), so the whole surface was probed at arities
+        // 0, 1 and 2 — with an `int`, with a `K` and with a `string`
+        // argument — for BOTH presentations (`OwningBuffer<int>` and
+        // `OwningBuffer<K>`), on the base arm and on this one: 80 member
+        // names × 4 argument forms × 2 presentations × 2 arms. The ADMITTED
+        // set is IDENTICAL on the two arms — no member that compiles today
+        // stops compiling.
         //
         // The §5 LINQ operator names (`First`, `Last`, `ToArray`, `Where`,
         // …), the universal `Object` members and `Dispose` are admitted by
         // the gate's own exemptions and are NOT repeated here.
         {"OwningBuffer", "4.14",
          {"AsReadOnlySpan", "AsSpan", "DangerousPointer", "Length"},
-         {"Clear", "Dequeue", "Get", "Peek", "Pop", "PopFirst", "PopLast",
-          "Sort"}},
+         {"Add", "AddRange", "Clear", "Dequeue", "Enqueue", "Get", "IndexOf",
+          "Insert", "Peek", "Pop", "PopAt", "PopFirst", "PopLast", "Push",
+          "Remove", "RemoveAt", "Set", "Sort"}},
         {"OwningDictionary", "4.9",
          {"Add", "Clear", "Contains", "ContainsKey", "Count", "Dispose", "Drain",
           "GetOrAdd", "GetOrNull", "Keys", "PopValue", "Remove", "TryAdd",
@@ -48228,6 +48255,17 @@ bool isConcreteCollectionSurfaceHead(std::string_view head) {
 bool concreteCollectionHeadDeclares(std::string_view head,
                                     std::string_view member) {
     return sema::isDocumentedConcreteCollectionMember(head, member);
+}
+// fix #8349 (stdlib §4.14, v0.355): the same export for the head's
+// COMPILER-DISPATCHED members — the members the compiler really lowers for
+// the head although no stdlib section declares them (the row's FOURTH field:
+// `Get`, `Clear`, `Add`, `IndexOf`, …). A gate that reads only the
+// DOCUMENTED surface must not refuse a name the head's own row lists as
+// dispatched — that would turn a member that compiles today into a
+// rejection.
+bool concreteCollectionHeadDispatches(std::string_view head,
+                                      std::string_view member) {
+    return sema::isCompilerDispatchedCollectionAccessor(head, member);
 }
 // fix #7990 (§26.5 rules 1-2, §22.6, v0.350; stdlib §4.1 / §4.2 / §4.12 /
 // §4.13): the same export for the collection INTERFACE heads. #7946's

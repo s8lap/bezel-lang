@@ -629,3 +629,30 @@ BEZEL_TEST(collection_undeclared_member_surface_8331,
         "end C;\n",
         "7\n9\n2\n0\n");
 }
+
+// fix #8349 (stdlib §4.14, v0.355): the ELEMENT-TAKING forms of the
+// members the compiler dispatches for the head although stdlib §4.14
+// declares no such member. The dispatch is ARITY-DEPENDENT for this head —
+// the arity-0 `Add()` reaches codegen's "no dispatch arm" backstop, while
+// the element-taking `Add(item)` is really dispatched (the buffer's
+// array-backed storage answers it) — so the row that measures the surface
+// has to probe the element-taking forms too.
+//
+// MEASURED on the base tree: `Add(11)` grows the buffer (3 → 4) and
+// `IndexOf(42)` finds the slot (1).
+BEZEL_TEST(collection_undeclared_member_surface_8331,
+           owning_buffer_element_taking_dispatched_members_still_work) {
+    expectOut(
+        "module M; import System; import System.Collections.Generic;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    using var buf := new OwningBuffer<int>(3);\n"
+        "    buf[0] := 7; buf[1] := 42; buf[2] := 9;\n"
+        "    buf.Add(11);\n"
+        "    Console.WriteLine(buf.Length);\n"
+        "    Console.WriteLine(buf.IndexOf(42));\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "4\n1\n");
+}

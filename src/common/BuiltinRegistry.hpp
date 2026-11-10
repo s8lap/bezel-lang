@@ -1062,6 +1062,14 @@ bool isConcreteCollectionSurfaceHead(std::string_view head);
 bool concreteCollectionHeadDeclares(std::string_view head,
                                     std::string_view member);
 
+// fix #8349 (stdlib §4.14, v0.355): the head's COMPILER-DISPATCHED members —
+// the members the compiler really lowers for the head although no stdlib
+// section declares them (the row's FOURTH field: `Get`, `Clear`, `Add`,
+// `IndexOf`, …). Codegen asks it so a gate that reads only the DOCUMENTED
+// surface does not refuse a name the head's own row lists as dispatched.
+bool concreteCollectionHeadDispatches(std::string_view head,
+                                      std::string_view member);
+
 // fix #7990 (§26.5 rules 1-2, §22.6, v0.350; stdlib §4.1 / §4.2 / §4.12 /
 // §4.13): the COLLECTION INTERFACE heads' declared instance surface, owned by
 // sema (`builtinCollectionInterfaceSurface` /
