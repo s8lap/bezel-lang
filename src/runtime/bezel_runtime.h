@@ -453,6 +453,25 @@ void bz_dict_values_str(void* d, void*** vals_out, int64_t* n_out);
 // the same shape: a malloc'd void** array of `n` slot values.
 void bz_dict_values_gen(void* d, void*** vals_out, int64_t* n_out);
 
+// fix #8279 / stdlib §4.8 / §29.2: release an ERASED `DictionaryEntry<K,V>`
+// SNAPSHOT — the array the erased `IReadOnlyCollection<DictionaryEntry<K,V>>`
+// view materializes a dictionary backing into.
+//
+// The snapshot's slots are `{K, V}` STRUCTS. For a STRING key, field 0 holds
+// the REBUILT `bz_string*` the snapshot OWNS (rc 1); `release_key` is that
+// per-slot disposer (`bz_string_release`), applied to field 0 of every slot.
+// `release_key` is NULL when the snapshot's keys are NOT owned by it — a
+// generic key is decoded BY VALUE and owns nothing.
+//
+// `bz_array_free`'s per-element disposer cannot express this: it is a
+// `void(*)(void*)` applied to the slot at STRIDE 8, which for the 16-byte
+// `{bz_string*, V}` entry struct reaches neither field — the same limitation
+// `wrapDictionaryEntryArrayAsIEnumerable`'s Dispose records. This is that
+// walk, lifted to the array side, and it runs BEFORE the array is freed (the
+// Keys are the array's CONTENTS, not the array's own buffer).
+void bz_dict_entry_snapshot_free(void* arrp, int64_t esz,
+                                 void (*release_key)(void*));
+
 // fix #1426 / stdlib §4.17–§4.18: SortedDictionary/SortedSet ordered-key
 // accessors.  O(n) scans over the hash-table representation.
 //

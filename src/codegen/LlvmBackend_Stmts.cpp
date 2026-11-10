@@ -10755,25 +10755,59 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         // scan a single loop (the body is emitted once) instead of forking the
         // loop per backing kind.
         //
-        // A DICTIONARY'S ENTRIES ARE NOT ITS KEYS. The erased
-        // `IReadOnlyCollection<DictionaryEntry<K,V>>` view over a
-        // `Dictionary<K,V>` / `SortedDictionary<K,V>` is a DIFFERENT shape —
-        // the element is the ENTRY, not the key — so materializing the table's
-        // keys for it would silently produce the wrong value. That shape is
-        // left exactly as it was (it keeps its own pre-existing behavior) and
-        // is reported separately; only the SET shape (whose element IS the
-        // table's key) is materialized here.
+        // A DICTIONARY'S ENTRIES ARE NOT ITS KEYS — fix #8279 (stdlib §4.8 /
+        // §29.2). The erased `IReadOnlyCollection<DictionaryEntry<K,V>>` view
+        // over a `Dictionary<K,V>` / `SortedDictionary<K,V>` is a DIFFERENT
+        // shape from the SET shape: the element is the ENTRY (a key/value
+        // PAIR), not the key, so materializing the table's KEYS for it would
+        // silently produce the wrong value. The DICT arm below therefore
+        // materializes the ENTRIES for that shape (the key/value pairs in the
+        // `DictionaryEntry` layout) and the table's KEYS for the SET shape
+        // (whose element IS the table's key).
         llvm::Value* scanObj = enumObj;
         llvm::AllocaInst* materializedSlot = nullptr;
+        // fix #8279 (stdlib §4.8 / §29.2): the erased receiver's ELEMENT
+        // SHAPE decides what a dict-backed collection must be MATERIALIZED
+        // INTO. `entryElem` is true when the element is a
+        // `DictionaryEntry<K,V>` — the ENTRY (a key/value PAIR), not the key
+        // — and the two shapes need DIFFERENT snapshots (the DICT arm below
+        // materializes the table's KEYS for the SET shape and the table's
+        // ENTRIES for the ENTRY shape).
+        bool entryElem = false;
+        bool entryStringKey = false;
+        bool entryPairLayout = false;
         {
             const sema::TypeRef* elemRef =
                 iterTy->genericArgs.empty() ? nullptr : iterTy->genericArgs[0];
-            bool entryElem = false;
             if (elemRef) {
                 const sema::TypeRef* e = resolveTypeParamRef(elemRef);
                 if (!e) e = elemRef;
                 entryElem = (e->kind == sema::TypeRef::Kind::Named) &&
                             (e->headName() == "DictionaryEntry");
+                if (entryElem && e->genericArgs.size() >= 2 && e->genericArgs[0] &&
+                    e->genericArgs[1]) {
+                    const sema::TypeRef* kt = e->genericArgs[0];
+                    entryStringKey =
+                        kt->kind == sema::TypeRef::Kind::Primitive &&
+                        kt->primitive == sema::PrimitiveType::String;
+                    // The ENTRY materialization applies ONLY when the scan's
+                    // element type IS the {K, V} pair layout — the NON-NULLABLE
+                    // `DictionaryEntry<K,V>`. The NULLABLE
+                    // `DictionaryEntry<K,V>?` lowers to {i8 hasValue; {K,V}}
+                    // (LlvmBackend_Layout.cpp's `isNullableDictEntryTy` arm),
+                    // a DIFFERENT layout the table's entries do not carry, so
+                    // that shape keeps the pre-existing behaviour.
+                    if (elemTy->isStructTy()) {
+                        llvm::StructType* st =
+                            llvm::cast<llvm::StructType>(elemTy);
+                        llvm::Type* kT = lowerTypeRef(e->genericArgs[0]);
+                        llvm::Type* vT = lowerTypeRef(e->genericArgs[1]);
+                        entryPairLayout =
+                            st->getNumElements() == 2 && kT && vT &&
+                            st->getElementType(0) == kT &&
+                            st->getElementType(1) == vT;
+                    }
+                }
             }
             auto* kindFn = declareC("bz_runtime_kind", i64(), {ptrTy()});
             llvm::Value* kind =
@@ -10782,9 +10816,25 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
                 kind, builder_.getInt64(-3), "ib.isdict");
             llvm::Value* isLlist = builder_.CreateICmpEQ(
                 kind, builder_.getInt64(-2), "ib.isllist");
-            llvm::Value* convDict = entryElem
+            // fix #8279 (stdlib §4.8 / §29.2): the DICT arm is NOT excluded
+            // for the ENTRY element shape any more. The exclusion
+            // (`convDict = false` when `entryElem`) was correct as long as
+            // the DICT arm materialized the table's KEYS — an entry is a
+            // key/value PAIR, so the table's keys would have been the wrong
+            // ELEMENTS (and, for a generic-key table, the array protocol
+            // read the dict header as an array header: the length came from
+            // the wrong word and the data pointer was garbage — a SIGSEGV at
+            // 0x8). The DICT arm now materializes the ENTRIES for that
+            // shape, so the exclusion is gone: the erased view is
+            // MATERIALIZED either way.
+            //
+            // THE ONE SHAPE THAT STAYS EXCLUDED is the entry element type
+            // whose lowering is NOT the {K, V} pair layout (the NULLABLE
+            // `DictionaryEntry<K,V>?`) — the table's entries do not carry
+            // that tag, so there is nothing to materialize into it.
+            llvm::Value* convDict = (entryElem && !entryPairLayout)
                 ? builder_.getFalse()
-                : builder_.CreateAnd(isDict, builder_.getTrue(), "ib.convdict");
+                : isDict;
             llvm::Value* needsConv =
                 builder_.CreateOr(convDict, isLlist, "ib.needconv");
             llvm::BasicBlock* preConvBB = builder_.GetInsertBlock();
@@ -10812,9 +10862,149 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
                 declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
             auto* freeFn =
                 declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            // --- DICT: the table's KEYS are the set's elements (§4.10) ---
+            // --- DICT: the table's ENTRIES are the elements (§4.8) when the
+            // erased receiver's element is a `DictionaryEntry<K,V>`; the
+            // table's KEYS are the elements (§4.10) for the SET shape, whose
+            // element IS the table's key. ---
             builder_.SetInsertPoint(dictConvBB);
-            {
+            if (entryPairLayout) {
+                // fix #8279 (stdlib §4.8 / §29.2): the erased
+                // `IReadOnlyCollection<DictionaryEntry<K,V>>` view over a
+                // dictionary backing MATERIALIZES THE ENTRIES — the
+                // key/value PAIRS in the `DictionaryEntry` layout — not the
+                // table's KEYS.
+                //
+                // THE LAYOUT IS THE SCAN'S OWN ELEMENT TYPE. `elemTy` is
+                // `unitStorageTy(lowerTypeRef(DictionaryEntry<K,V>))`, and
+                // `lowerTypeRef` of a `DictionaryEntry` is the two-field
+                // struct {lowerTypeRef(K), lowerTypeRef(V)}
+                // (LlvmBackend_Layout.cpp) — the SAME layout the CONCRETE
+                // `for var e in d` path builds (`lowerDictEntryFor`'s
+                // `entryStTy`), so the erased view and the concrete view
+                // agree element for element, and `e.Key` / `e.Value` read
+                // the same two fields in both.
+                //
+                // THE DECODE IS THE CONCRETE PATH'S DECODE. The key and the
+                // value are decoded through the SAME shared per-index
+                // decoders the concrete path uses (`decodeDictStringKeyAt` /
+                // `decodeDictGenericKeyAt` / `decodeDictValueAt` — see their
+                // declarations in LlvmBackend_impl.hpp), so the snapshot's
+                // elements are byte-for-byte what the concrete view yields.
+                llvm::StructType* entryStTy =
+                    llvm::cast<llvm::StructType>(elemTy);
+                llvm::Type* keyLlvm = entryStTy->getElementType(0);
+                llvm::Type* valLlvm = entryStTy->getElementType(1);
+                // --- the two snapshot spines: the table's KEYS and the
+                // table's VALUES, in the table's own iteration order
+                // (§4.8) ---
+                auto* keysOutSlot = entryAlloca(ptrTy());
+                auto* lensOutSlot = entryAlloca(ptrTy());
+                auto* widsOutSlot = entryAlloca(ptrTy());
+                auto* cntSlot     = entryAlloca(i64());
+                auto* valsOutSlot = entryAlloca(ptrTy());
+                if (entryStringKey) {
+                    // A string-keyed table (§4.8's `Dictionary<string,V>`)
+                    // snapshots its keys as raw byte copies with their
+                    // code-point lengths and storage widths.
+                    auto* kfn = declareC("bz_dict_keys_str",
+                        llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                    builder_.CreateCall(kfn, {enumObj, keysOutSlot, lensOutSlot,
+                                              widsOutSlot, cntSlot});
+                    auto* vfn = declareC("bz_dict_values_str",
+                        llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), ptrTy()});
+                    builder_.CreateCall(vfn, {enumObj, valsOutSlot,
+                                              entryAlloca(i64())});
+                } else {
+                    // A generic-keyed table (`Dictionary<int,V>` and every
+                    // other non-string key) snapshots its keys as raw key
+                    // bytes.
+                    auto* kfn = declareC("bz_dict_keys_gen",
+                        llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), ptrTy()});
+                    builder_.CreateCall(kfn, {enumObj, keysOutSlot, cntSlot});
+                    auto* vfn = declareC("bz_dict_values_gen",
+                        llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), ptrTy()});
+                    builder_.CreateCall(vfn, {enumObj, valsOutSlot,
+                                              entryAlloca(i64())});
+                }
+                llvm::Value* keysArr =
+                    builder_.CreateLoad(ptrTy(), keysOutSlot);
+                llvm::Value* lensArr = entryStringKey
+                    ? builder_.CreateLoad(ptrTy(), lensOutSlot) : nullptr;
+                llvm::Value* widsArr = entryStringKey
+                    ? builder_.CreateLoad(ptrTy(), widsOutSlot) : nullptr;
+                llvm::Value* valsArr =
+                    builder_.CreateLoad(ptrTy(), valsOutSlot);
+                llvm::Value* cnt = builder_.CreateLoad(i64(), cntSlot);
+                llvm::Value* arr = builder_.CreateCall(
+                    allocFn, {builder_.getInt64(esz), cnt});
+                // --- the per-entry decode loop ---
+                auto* entrySlot = entryAlloca(entryStTy);
+                auto* iSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), iSlot);
+                auto* fCond =
+                    llvm::BasicBlock::Create(llvm_, "ib.efcond", currentFn_);
+                auto* fBody =
+                    llvm::BasicBlock::Create(llvm_, "ib.efbody", currentFn_);
+                auto* fEnd =
+                    llvm::BasicBlock::Create(llvm_, "ib.efend", currentFn_);
+                builder_.CreateBr(fCond);
+                builder_.SetInsertPoint(fCond);
+                llvm::Value* fi = builder_.CreateLoad(i64(), iSlot);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(fi, cnt), fBody, fEnd);
+                builder_.SetInsertPoint(fBody);
+                // The KEY. A generic key is decoded BY VALUE out of the
+                // table's raw-key copy, and that copy is freed right here —
+                // the snapshot holds the VALUE, never the copy. A string key
+                // is REBUILT into an OWNED `bz_string*` (rc 1) that the
+                // snapshot HOLDS: the snapshot's own free gives it back (see
+                // `bz_dict_entry_snapshot_free`).
+                llvm::Value* keyDecoded;
+                {
+                    std::pair<llvm::Value*, llvm::Value*> kp =
+                        entryStringKey
+                            ? decodeDictStringKeyAt(keysArr, lensArr, widsArr,
+                                                    fi)
+                            : decodeDictGenericKeyAt(keyLlvm, keysArr, fi,
+                                                     "ib.kgen");
+                    keyDecoded = kp.first;
+                    // The raw key copy the key was decoded from — a distinct
+                    // allocation from the rebuilt string's own buffer.
+                    builder_.CreateCall(freeFn, {kp.second});
+                }
+                // The VALUE is a BORROW of the table's value slot (§28.11) —
+                // the same decode the concrete path uses, so the snapshot
+                // takes NO ownership of the table's values.
+                llvm::Value* valDecoded =
+                    decodeDictValueAt(valLlvm, valsArr, fi, "ib.v");
+                builder_.CreateStore(keyDecoded,
+                    builder_.CreateStructGEP(entryStTy, entrySlot, 0));
+                builder_.CreateStore(valDecoded,
+                    builder_.CreateStructGEP(entryStTy, entrySlot, 1));
+                llvm::Value* dst = builder_.CreateCall(
+                    ptrAtFn, {arr, fi, builder_.getInt64(esz)});
+                builder_.CreateCall(memcpyFn,
+                    {dst, builder_.CreateBitCast(entrySlot, ptrTy()),
+                     builder_.getInt64(esz)});
+                llvm::Value* fi2 = builder_.CreateLoad(i64(), iSlot);
+                builder_.CreateStore(builder_.CreateAdd(fi2, builder_.getInt64(1)),
+                                     iSlot);
+                builder_.CreateBr(fCond);
+                builder_.SetInsertPoint(fEnd);
+                builder_.CreateCall(freeFn, {keysArr});
+                if (entryStringKey) {
+                    builder_.CreateCall(freeFn, {lensArr});
+                    builder_.CreateCall(freeFn, {widsArr});
+                }
+                builder_.CreateCall(freeFn, {valsArr});
+                builder_.CreateStore(arr, materializedSlot);
+                builder_.CreateBr(convDoneBB);
+            } else {
+                // --- DICT: the table's KEYS are the set's elements (§4.10) ---
                 auto* keysOutSlot = entryAlloca(ptrTy());
                 auto* cntSlot = entryAlloca(i64());
                 auto* keysFn = declareC("bz_dict_keys_gen",
@@ -11068,14 +11258,38 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         // the snapshot's elements are the COLLECTION's elements (the table's
         // key copies / the list's node bytes), so the snapshot is freed with
         // a null disposer and the collection keeps owning its elements.
+        //
+        // fix #8279 (stdlib §4.8 / §29.2): the ENTRY snapshot is the one
+        // exception — its slots hold the REBUILT string Keys the snapshot
+        // OWNS (each an owned `bz_string*`), so its free gives them back
+        // before freeing the array (the same walk
+        // `wrapDictionaryEntryArrayAsIEnumerable`'s Dispose performs).
         if (materializedSlot) {
-            auto* arrFreeFn = declareC("bz_array_free",
-                                       llvm::Type::getVoidTy(llvm_),
-                                       {ptrTy(), ptrTy()});
-            builder_.CreateCall(
-                arrFreeFn,
-                {builder_.CreateLoad(ptrTy(), materializedSlot),
-                 llvm::ConstantPointerNull::get(ptrTy())});
+            llvm::Value* matArr = builder_.CreateLoad(ptrTy(), materializedSlot);
+            if (entryPairLayout && entryStringKey) {
+                auto* snapFreeFn = declareC("bz_dict_entry_snapshot_free",
+                                            llvm::Type::getVoidTy(llvm_),
+                                            {ptrTy(), i64(), ptrTy()});
+                // The CAPTURE GATE. An escaping closure may hold the loop
+                // var's Key pointer past the loop, so the Keys are NOT
+                // released then — a bounded leak is the safe direction, the
+                // same trade the CONCRETE `for var e in d` path makes (see
+                // `lowerDictEntryFor`'s `forVarCapturedEscaping`).
+                llvm::Value* relFn = llvm::ConstantPointerNull::get(ptrTy());
+                if (!forVarCapturedInBody(fs)) {
+                    relFn = declareC("bz_string_release",
+                                      llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                }
+                builder_.CreateCall(snapFreeFn,
+                                    {matArr, builder_.getInt64(esz), relFn});
+            } else {
+                auto* arrFreeFn = declareC("bz_array_free",
+                                           llvm::Type::getVoidTy(llvm_),
+                                           {ptrTy(), ptrTy()});
+                builder_.CreateCall(
+                    arrFreeFn,
+                    {matArr, llvm::ConstantPointerNull::get(ptrTy())});
+            }
         }
         return true;
     }
