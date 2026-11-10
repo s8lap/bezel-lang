@@ -621,7 +621,7 @@ BEZEL_TEST(frozenarray_upcast_8257,
     BEZEL_EXPECT_TRUE(hasNotImplicitlyConvertible(r));
 }
 
-// `Guid` — stdlib §2.4, a value type with no interface base.
+// `Guid` — stdlib §2.6, a value type with no interface base.
 BEZEL_TEST(frozenarray_upcast_8257,
            guid_to_ienumerable_object_rejected) {
     JitResult r = runAot(
@@ -638,7 +638,7 @@ BEZEL_TEST(frozenarray_upcast_8257,
     BEZEL_EXPECT_TRUE(hasNotImplicitlyConvertible(r));
 }
 
-// `Stopwatch` — stdlib §2.7 (`System.Diagnostics`), a value type with no
+// `Stopwatch` — stdlib §8.1 (`System.Diagnostics`), a value type with no
 // interface base.
 BEZEL_TEST(frozenarray_upcast_8257,
            stopwatch_to_ienumerable_object_rejected) {
@@ -674,7 +674,7 @@ BEZEL_TEST(frozenarray_upcast_8257,
     BEZEL_EXPECT_TRUE(hasNotImplicitlyConvertible(r));
 }
 
-// `CancellationToken` — stdlib §2.9, a value type with no interface base.
+// `CancellationToken` — stdlib §6.1, a value type with no interface base.
 BEZEL_TEST(frozenarray_upcast_8257,
            cancellationtoken_to_ienumerable_object_rejected) {
     JitResult r = runAot(

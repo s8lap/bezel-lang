@@ -266,7 +266,9 @@ BEZEL_TEST(collection_bare_reference_surface_8350_8351,
     BEZEL_EXPECT_FALSE(hasNoMemberDiagnostic(r, "ToArray", "FrozenArray"));
 }
 
-// `GetEnumerator` is declared by stdlib §4.19.
+// `GetEnumerator` is declared by stdlib §4.12's `IEnumerable<T>`; stdlib
+// §4.19's `FrozenArray<T>` implements that interface, so §4.19 declares
+// no `GetEnumerator` of its own.
 BEZEL_TEST(collection_bare_reference_surface_8350_8351,
            frozenarray_stub_bare_getenumerator_admitted_stdlib_4_19) {
     JitResult r = runAot(

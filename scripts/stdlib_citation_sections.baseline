@@ -16,14 +16,16 @@
 # -- and NO line number, because a line-numbered key would fail the
 # gate on every unrelated commit that moved a comment.
 #
-count: 451
+count: 470
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	IOwningEnumerable	4.5
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	Range	4.4
+site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	2.6
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	2.7
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	4.5
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	5
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	5.1
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	7.1
+site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	CompareTo	5.1
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Dictionary	2.4
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Guid	2.2
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	IComparable	2.2
@@ -47,11 +49,13 @@ site:	src/codegen/LlvmBackend_Calls3.cpp	wrong-section	Dictionary	5
 site:	src/codegen/LlvmBackend_Calls3.cpp	wrong-section	IComparable	4.18
 site:	src/codegen/LlvmBackend_Calls3.cpp	wrong-section	Set	5
 site:	src/codegen/LlvmBackend_Calls3.cpp	wrong-section	Split	5
+site:	src/codegen/LlvmBackend_Calls3.cpp	wrong-section	Where	4.11
 site:	src/codegen/LlvmBackend_Disposal.cpp	wrong-section	IOwningList	4.5
 site:	src/codegen/LlvmBackend_Disposal.cpp	wrong-section	OwningLinkedList	4.2
 site:	src/codegen/LlvmBackend_Exprs.cpp	wrong-section	Contains	4.1
 site:	src/codegen/LlvmBackend_Exprs2.cpp	wrong-section	OwningBuffer	1
 site:	src/codegen/LlvmBackend_Exprs2.cpp	wrong-section	Set	1
+site:	src/codegen/LlvmBackend_Iterators.cpp	wrong-section	Stack	4.1
 site:	src/codegen/LlvmBackend_Layout.cpp	wrong-section	IEnumerable	2.8
 site:	src/codegen/LlvmBackend_Layout.cpp	wrong-section	IEnumerable	9.6
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	Array	10
@@ -61,6 +65,7 @@ site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	CString	9.6
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	Equals	2.5
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	IEnumerable	2.1
 site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	IOwningList	4.5
+site:	src/codegen/LlvmBackend_Setup.cpp	wrong-section	TextWriter	1
 site:	src/codegen/LlvmBackend_Stmts.cpp	wrong-section	LinkedList	4.13
 site:	src/codegen/LlvmBackend_String.cpp	wrong-section	Array	9.6
 site:	src/codegen/LlvmBackend_String.cpp	wrong-section	IEnumerable	9.6
@@ -106,7 +111,6 @@ site:	src/sema/ExprTypecheck.cpp	wrong-section	Array	5
 site:	src/sema/ExprTypecheck.cpp	wrong-section	IDisposable	4.12
 site:	src/sema/ExprTypecheck.cpp	wrong-section	JsonOptions	3.3
 site:	src/sema/ExprTypecheck.cpp	wrong-section	MaxValue	1
-site:	src/sema/ExprTypecheck_Calls.cpp	no-such-section	22.5	22.5
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	Array	3.1
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	Array	5
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	Channel	6.5
@@ -120,6 +124,7 @@ site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	Empty	9.6
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	GetEnumerator	4.12
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	GetEnumerator	5
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	IComparable	2.2
+site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	IComparable	4.14
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	IComparable	5
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	IComparable	5.1
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	IEnumerable	9.6
@@ -133,7 +138,6 @@ site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	IntPtr	10.1
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	IntPtr	9.6
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	Key	5
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	OwningBuffer	2.15
-site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	OwningDictionary	4.1
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	Range	9.6
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	Set	5
 site:	src/sema/ExprTypecheck_Calls.cpp	wrong-section	SortedDictionary	4.12
@@ -149,6 +153,7 @@ site:	src/sema/SemaContext.hpp	wrong-section	TryParse	1
 site:	src/sema/TypeRef.hpp	wrong-section	IEquatable	9.1
 site:	src/sema/TypeResolution_Checks.cpp	wrong-section	CancellationTokenSource	4.19
 site:	src/sema/TypeResolution_Checks.cpp	wrong-section	FrozenArray	6.11
+site:	src/sema/TypeResolution_Checks.cpp	wrong-section	Task	2.10
 site:	src/sema/TypeResolution_Checks.cpp	wrong-section	User	2.10
 site:	src/sema/TypeResolution_Names.cpp	wrong-section	IDisposable	4.9
 site:	src/sema/TypeResolution_Names.cpp	wrong-section	Ptr	5
@@ -156,6 +161,7 @@ site:	tests/codegen/array_addrange_ienumerable_2721_test.cpp	wrong-section	IEnum
 site:	tests/codegen/array_char_min_returns_char_4731_test.cpp	wrong-section	Array	5
 site:	tests/codegen/array_lastindexof_7671_test.cpp	wrong-section	Equals	4.4
 site:	tests/codegen/array_local_bound_to_interface_and_object_no_leak_spec_28_2_4913_test.cpp	wrong-section	Array	4.1
+site:	tests/codegen/array_minmax_generic_base_compareto_8272_test.cpp	wrong-section	IComparable	5.1
 site:	tests/codegen/array_minmax_iface_elem_2770_test.cpp	wrong-section	CompareTo	2.8
 site:	tests/codegen/array_minmax_iface_elem_2770_test.cpp	wrong-section	IComparable	5.1
 site:	tests/codegen/array_minornull_maxornull_inferred_var_3784_test.cpp	wrong-section	Where	5.1
@@ -194,6 +200,9 @@ site:	tests/codegen/collection_method_group_signature_7098_test.cpp	wrong-sectio
 site:	tests/codegen/collection_task_add_appends_2999_test.cpp	wrong-section	Task	4.4
 site:	tests/codegen/concrete_is_as_decision_4858_test.cpp	wrong-section	IEquatable	9.6
 site:	tests/codegen/console_append_builtin_render_6753_test.cpp	wrong-section	StringBuilder	2.1
+site:	tests/codegen/constraint_family_typeparam_bounds_8240_8262_8312_test.cpp	wrong-section	IComparable	2.2
+site:	tests/codegen/constraint_family_typeparam_bounds_8240_8262_8312_test.cpp	wrong-section	IComparable	4.4
+site:	tests/codegen/constraint_family_typeparam_bounds_8240_8262_8312_test.cpp	wrong-section	IComparable	5.1
 site:	tests/codegen/cstring_tobytes_1000_test.cpp	wrong-section	Count	10.1
 site:	tests/codegen/ctor_type_class_defaulted_sibling_4790_test.cpp	wrong-section	IEquatable	9.4
 site:	tests/codegen/datetime_render_everywhere_6806_test.cpp	wrong-section	DateTime	3.1
@@ -323,6 +332,8 @@ site:	tests/codegen/string_trim_ienumerable_chars_7521_test.cpp	wrong-section	IE
 site:	tests/codegen/stringbuilder_negative_capacity_leak_4884_test.cpp	wrong-section	StringBuilder	1
 site:	tests/codegen/sum_constraint_rejects_non_inumber_4730_test.cpp	wrong-section	Array	5
 site:	tests/codegen/sum_constraint_rejects_non_inumber_4730_test.cpp	wrong-section	INumber	5
+site:	tests/codegen/textreader_readtoend_8383_test.cpp	wrong-section	ReadToEnd	1
+site:	tests/codegen/textreader_readtoend_8383_test.cpp	wrong-section	TextReader	1
 site:	tests/codegen/timespan_tostring_c_form_6720_stdlib_2_18_test.cpp	wrong-section	TimeSpan	2.18
 site:	tests/module/imported_builtin_property_typing_2374_test.cpp	wrong-section	Array	4.1
 site:	tests/module/math_imported_time_name_7900_test.cpp	wrong-section	IComparable	2.2
@@ -357,6 +368,7 @@ site:	tests/sema/builtin_named_kind_entity_8015_test.cpp	wrong-section	Range	9.6
 site:	tests/sema/builtin_named_kind_entity_8015_test.cpp	wrong-section	ReadOnlyStringSpan	9.1
 site:	tests/sema/builtin_out_var_untyped_recipient_5332_test.cpp	wrong-section	OwningSet	4.2
 site:	tests/sema/builtin_span_slice_nullable_arg_2601_test.cpp	wrong-section	Insert	3.3
+site:	tests/sema/collection_bare_reference_surface_8350_8351_test.cpp	wrong-section	ToString	5
 site:	tests/sema/collection_element_move_only_3775_test.cpp	wrong-section	SortedSet	4.12
 site:	tests/sema/compiler_known_base_closed_5636_test.cpp	wrong-section	Stream	1
 site:	tests/sema/constraint_collection_member_7086_test.cpp	wrong-section	Add	4.1
@@ -368,6 +380,10 @@ site:	tests/sema/disposal_interface_chain_7354_test.cpp	wrong-section	IDisposabl
 site:	tests/sema/extension_resolution_test.cpp	wrong-section	Count	4.12
 site:	tests/sema/extension_resolution_test.cpp	wrong-section	GetEnumerator	5
 site:	tests/sema/extension_where_clause_filter_3336_test.cpp	wrong-section	IComparable	5.1
+site:	tests/sema/frozenarray_interface_conformance_8258_test.cpp	wrong-section	IReadOnlyCollection	4.19
+site:	tests/sema/guid_icomparable_conformance_8288_8323_8264_8273_test.cpp	wrong-section	CompareTo	5.1
+site:	tests/sema/guid_icomparable_conformance_8288_8323_8264_8273_test.cpp	wrong-section	Guid	4.4
+site:	tests/sema/guid_icomparable_conformance_8288_8323_8264_8273_test.cpp	wrong-section	IComparable	1
 site:	tests/sema/hash_ctor_string_shared_position_8007_test.cpp	wrong-section	IEqualityComparer	4.10
 site:	tests/sema/imported_public_collides_with_always_available_5140_test.cpp	wrong-section	Counter	4.14
 site:	tests/sema/indexer_nullable_index_arg_2619_test.cpp	wrong-section	Range	4.6

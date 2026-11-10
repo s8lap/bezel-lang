@@ -12043,9 +12043,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         return false;
                     }
                     // (b) the bound is a USER interface that EXTENDS
-                    // `IFormattable` (stdlib §4.1's `interface MyFmt:
-                    // IFormattable`) — §14.2 rule 6's "or an interface
-                    // extending I".
+                    // `IFormattable` (stdlib §2.18 declares the interface)
+                    // — §14.2 rule 6's "or an interface extending I".
                     if (inheritsBuiltinInterface(ctr->declaration,
                                                  "IFormattable")) {
                         guaranteed = true;
