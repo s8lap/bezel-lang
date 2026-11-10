@@ -17318,8 +17318,15 @@ bool MethodOwnership::usingPinTypeHoldsBorrow(const sema::TypeRef* t) const {
             return true;
         case ast::TypeDeclKind::Record:
             return isBorrowBearingRecordOrSpan(t);
-        case ast::TypeDeclKind::Choice:
-            return isBorrowBearingChoice(t);
+        case ast::TypeDeclKind::Choice: {
+            // fix #7757 (§28.10, v0.357): a MOVE-ONLY choice (an `owned`
+            // payload slot, §15.3) read from a field is a borrow of that
+            // field's storage, so its pin freezes the holder like a class
+            // field's does, though the payload holds no borrow of its own.
+            const char* moKind = nullptr;
+            return isBorrowBearingChoice(t) ||
+                   common::isMoveOnlyValueType(t, ctx_, moKind);
+        }
         case ast::TypeDeclKind::Enum:
             return false;
     }
