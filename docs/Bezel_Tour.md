@@ -1,6 +1,6 @@
 # A Tour of Bezel
 
-*Validated against v0.338. An introduction for programmers who know C#, Java, Go, Rust, Swift or TypeScript; not a normative document — where it and the [specification](Bezel_Language_Spec.md) disagree, the specification wins.*
+*Validated against v0.357. An introduction for programmers who know C#, Java, Go, Rust, Swift or TypeScript; not a normative document — where it and the [specification](Bezel_Language_Spec.md) disagree, the specification wins.*
 
 Bezel is a compiled language for services and tools. It has no garbage collector. Instead, the compiler tracks who owns every heap object and inserts the code that frees it, at a point it knows statically. You get the predictable memory use of manual management without writing a single `free`, `Dispose` or `defer`.
 
@@ -302,7 +302,7 @@ end Greet;
 
 `?.` reads through a possibly-null value, `??` supplies a default, and a postfix `!` asserts non-null.
 
-**Exceptions** are for the unexpected, and are of two kinds: a *failure* (a missing file, bad input), whose class implements `IFailure`, and a *defect* report, which is a bug. `IFailure => …` is the arm that takes every failure and no bug. A `catch` has comma-separated arms, matched in order:
+**Exceptions** are for what the caller does not branch on, and are of two kinds: a *failure* (a missing file, bad input), whose class implements `IFailure`, and a *defect* report, which is a bug. `IFailure => …` is the arm that takes every failure and no bug. A `catch` has comma-separated arms, matched in order:
 
 ```bezel
 try
@@ -315,7 +315,7 @@ finally
 end;
 ```
 
-For failures a caller is expected to handle — bad input, a missing key — the standard library uses a `Try…` method or a `…OrNull` variant, or returns `Result<T, E>`, rather than throwing. The guide [Errors and Nullability](Bezel_Guide_02_Errors_and_Nullability.md) says when to use which.
+For outcomes a caller is expected to handle — bad input, a missing key — the standard library uses a `Try…` method or a `…OrNull` variant, or returns `Result<T, E>`, rather than throwing. The guide [Errors and Nullability](Bezel_Guide_02_Errors_and_Nullability.md) says when to use which.
 
 ## 7. Concurrency
 
@@ -335,7 +335,7 @@ public class Program
 end Program;
 ```
 
-Concurrent work is **structured**: a `TaskScope` owns the tasks it spawns; when one fails it cancels the others, and `await scope.Join()` waits for all of them and re-raises the first failure.
+Concurrent work is **structured**: a `TaskScope` owns the tasks it spawns; when one faults it cancels the others, and `await scope.Join()` waits for all of them and re-raises the first fault, whatever its kind.
 
 ```bezel
 import System.Threading;

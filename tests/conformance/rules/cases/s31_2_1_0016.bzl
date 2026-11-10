@@ -8,7 +8,6 @@
 //! cites: 31.2.1, 12.7
 //! expect: run
 //! stdout: True
-//! issue: 8415
 module Conf;
 
 public interface IRetryable

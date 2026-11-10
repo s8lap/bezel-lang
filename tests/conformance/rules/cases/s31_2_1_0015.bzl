@@ -8,7 +8,6 @@
 //! cites: 31.2.1, 12.7
 //! expect: reject
 //! diagnostic: no longer the exception surface
-//! issue: 8415
 module Conf;
 
 public interface IRetryable

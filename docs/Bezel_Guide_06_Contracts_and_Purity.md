@@ -1,6 +1,6 @@
 # Bezel Guide 6: Contracts and Purity
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.326.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.357.*
 
 Bezel lets a signature state obligations the compiler enforces: `requires(...)` for what the caller must guarantee, `ensures(...)` for what the member guarantees back, `invariant(...);` for what an object maintains at its public boundary (spec §22.16), and `pure` for members that promise no effects at all (spec §22.15). The syntax is small; the *postures* are what this guide teaches. Contracts are grammar, not a debug-mode assertion library: `requires` runs in every build, and a violation is a bug report, not an outcome (§1). Two postures will break habits you may bring along, and each is headed How Bezel does it. First: `requires` states only what a *correct caller already guarantees* — never validation of trust-boundary input, which is value-shape territory Guide 2 owns (§2). Second: `pure` is a promise you *declare* and the compiler verifies — never inferred from a body (§5). If you skim everything else, read those two and the table in §9.
 

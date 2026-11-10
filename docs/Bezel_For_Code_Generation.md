@@ -1734,7 +1734,7 @@ end SampleWindow;
 
 **Strings.** `var sb := new StringBuilder();` (trivial-dispose: plain `var`, no warning), `sb.Append(w).Append(' ');`, `sb.ToString().Trim()`. Casts are call syntax — `double(hits)` — and interpolation carries alignment then format: `$"|{line,-20}| {pct,6:F1}%"`.
 
-**Declaring, throwing and catching an exception type.** Derive from `Exception` (or any built-in exception type) and chain the message to the base; list `IFailure` when the condition comes from outside the program, since an unmarked class is a defect report (§31.4) — only where nothing in the base chain but `Exception` is a built-in or stdlib class, so a failure class derives from `Exception` directly (or from a failure type such as `IOException`, which needs no listing); a caught exception is a **borrow** valid inside its arm only, so copy out what you keep.
+**Declaring, throwing and catching an exception type.** Derive from `Exception` (or any built-in exception type) and chain the message to the base; list `IFailure` when the condition comes from outside the program, since an unmarked class is a defect report (§31.4) — only where nothing in the base chain but `Exception` is a built-in or stdlib class, so a failure class derives from `Exception` or from a user class deriving from it (or from a failure type such as `IOException`, which needs no listing); a caught exception is a **borrow** valid inside its arm only, so copy out what you keep.
 
 ```bezel
 public class ConfigError(message: string): Exception(message), IFailure
