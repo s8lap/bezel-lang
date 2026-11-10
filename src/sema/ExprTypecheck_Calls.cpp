@@ -12005,6 +12005,57 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
             }
         }
+        // fix #8247 (stdlib §2.18 / §8.1, spec §14.2 *Interface conformance*
+        // rule 6 / §3.6 rule 2, v0.355): does the type parameter `paramName`
+        // have a `where` clause that ESTABLISHES `IFormattable` conformance?
+        //
+        // THE AUTHORITY. spec §14.2 *Interface conformance* rule 6 — "T is a
+        // type parameter whose constraints guarantee conformance to I: a
+        // type-bound constraint naming I or an interface extending I …" — and
+        // spec §3.6 rule 2 — "A generic body type-checks under the weakest
+        // assumption its constraints establish." stdlib §2.18 / §8.1 give
+        // `IFormattable` the member `ToString(format: string): string`, so
+        // under `where T: IFormattable` that overload is GUARANTEED and the
+        // call must be admitted.
+        //
+        // WHY THE BOUND IS READ BY NAME. `IFormattable` is a DECLARATION-LESS
+        // builtin interface head (stdlib §2.18 / §8.1;
+        // `common::kBuiltinInterfaceHeads`), so the ordinary constraint walk
+        // (`forEachConstraintBound`, which hands its caller only
+        // DECLARATION-FUL bounds) cannot see it at all — the same gap #7086
+        // closed for the eight builtin COLLECTION heads, and the same one that
+        // made `x.ToString("F2")` bind to the universal `Object.ToString` and
+        // then fail on arity (§8.1).
+        auto typeParamGuaranteesFormattable =
+            [&](std::string_view paramName) -> bool {
+            bool guaranteed = false;
+            forEachConstraintBound(
+                paramName,
+                [&](TypeRef* ctr) -> bool {
+                    if (!ctr) return false;
+                    // (a) the bound IS the builtin `IFormattable` head — it
+                    // carries no declaration (stdlib §2.18 / §8.1).
+                    if (!ctr->declaration) {
+                        if (ctr->headName() == "IFormattable") {
+                            guaranteed = true;
+                            return true;
+                        }
+                        return false;
+                    }
+                    // (b) the bound is a USER interface that EXTENDS
+                    // `IFormattable` (stdlib §4.1's `interface MyFmt:
+                    // IFormattable`) — §14.2 rule 6's "or an interface
+                    // extending I".
+                    if (inheritsBuiltinInterface(ctr->declaration,
+                                                 "IFormattable")) {
+                        guaranteed = true;
+                        return true;
+                    }
+                    return false;
+                },
+                /*includeDeclarationless=*/true);
+            return guaranteed;
+        };
         // §8.1 / §8.7 / #2446: arity check for the universal `Object` members.
         // The universal members (`GetType`/`Equals`/`GetHashCode`/`ToString`
         // per §8.1, plus `Dispose` per §8.7) are present on EVERY type without
@@ -12201,6 +12252,36 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
                 }
             }
+            // fix #8247 (stdlib §2.18 / §8.1, spec §14.2 *Interface
+            // conformance* rule 6 / §3.6 rule 2, v0.355): the §8.1
+            // universal-surface arity check must not read a receiver whose
+            // type parameter's OWN `where` clause establishes `IFormattable`
+            // conformance as carrying the arity-0 `Object.ToString`.
+            //
+            // stdlib §2.18 / §8.1 give `IFormattable` the member
+            // `ToString(format: string): string`, so under `where T:
+            // IFormattable` the ONE-argument form is the overload the
+            // constraint GUARANTEES (spec §14.2 rule 6), and the arity-0
+            // universal surface is not the receiver's only `ToString`.
+            //
+            // ⚠ NARROW BY CONSTRUCTION. The flag is set for `ToString` alone
+            // (the only member `IFormattable` adds over the §8.1 universal
+            // surface), for a receiver that IS a bare in-scope type parameter
+            // (never a concrete class, never a value builtin), and only when
+            // the parameter's own clause names `IFormattable` (or an interface
+            // extending it). `Equals`/`GetHashCode`/`GetType`/`Dispose` keep
+            // the §8.1 universal arity exactly as before.
+            bool constraintFormattableToString = false;
+            if (umName == "ToString" && ce.args.size() == 1 && umTarget) {
+                const TypeRef* rty8247 = ctx_.exprType(*umTarget);
+                if (rty8247 && rty8247->kind == TypeRef::Kind::Named &&
+                    !rty8247->declaration && !rty8247->nullable &&
+                    rty8247->astNode && rty8247->astNode->name &&
+                    rty8247->astNode->name->parts.size() == 1 &&
+                    isInScopeTypeParam(rty8247->headName()) &&
+                    typeParamGuaranteesFormattable(rty8247->headName()))
+                    constraintFormattableToString = true;
+            }
             int expectedArity = -1;
             if (umName == "Equals")               expectedArity = 1;
             else if (umName == "ToString" ||
@@ -12209,7 +12290,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                      umName == "Dispose")         expectedArity = 0;
             else if (umName == "ReferenceEquals") expectedArity = 2;
             if (expectedArity >= 0 && !targetIsStaticReceiver &&
-                    !receiverHasTypeSpecificOverloads && !formatSpecRejected) {
+                    !receiverHasTypeSpecificOverloads && !formatSpecRejected &&
+                    !constraintFormattableToString) {
                 const std::size_t nargs = ce.args.size();
                 if (static_cast<int>(nargs) != expectedArity) {
                     ctx_.diagnostics().report(
@@ -13025,6 +13107,58 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
                         return;
                     }
+                }
+                // fix #8247 (stdlib §2.18 / §8.1, spec §14.2 *Interface
+                // conformance* rule 6 / §3.6 rule 2, v0.355): the
+                // ONE-argument `ToString(format: string)` on a receiver whose
+                // type is a TYPE PARAMETER whose OWN `where` clause
+                // establishes `IFormattable` conformance.
+                //
+                // THE DEFECT. stdlib §2.18 / §8.1 declare
+                // `IFormattable.ToString(format: string): string`. Inside a
+                // generic body bounded `where T: IFormattable`, the
+                // constraint GUARANTEES that overload (spec §14.2 *Interface
+                // conformance* rule 6 — "T is a type parameter whose
+                // constraints guarantee conformance to I: a type-bound
+                // constraint naming I or an interface extending I …"; spec
+                // §3.6 rule 2 — "A generic body type-checks under the weakest
+                // assumption its constraints establish"), but the compiler
+                // read the receiver's SHAPE, not its CONSTRAINTS: a bare type
+                // parameter has no declaration and therefore no member table,
+                // so the call fell back to the §8.1 universal
+                // `Object.ToString` (arity 0) and was refused with "the
+                // universal `Object.ToString` member takes 0 argument(s) but
+                // the call supplies 1 (§8.1)" — an arity complaint about a
+                // member the constraint PROMISES.
+                //
+                // The same walk (`typeParamGuaranteesFormattable`) reads the
+                // §8.1 arity gate above, so the two cannot disagree about
+                // what the constraint establishes.
+                //
+                // ⚠ NARROW BY CONSTRUCTION. The arm fires only for a receiver
+                // that IS a bare in-scope type parameter whose own clause
+                // names `IFormattable` (or an interface extending it). A
+                // concrete class, a value builtin, a primitive and an
+                // UNCONSTRAINED type parameter are all untouched — the last
+                // keeps the §8.1 universal arity refusal exactly as before.
+                if (m == "ToString" && ce.args.size() == 1 && recvTy &&
+                    !recvTy->declaration && !recvTy->nullable &&
+                    recvTy->astNode && recvTy->astNode->name &&
+                    recvTy->astNode->name->parts.size() == 1 &&
+                    isInScopeTypeParam(recvTy->headName()) &&
+                    typeParamGuaranteesFormattable(recvTy->headName())) {
+                    // the argument is stdlib §2.18's `format: string`.
+                    if (ce.args[0].value) {
+                        TypeRef* at8247 = ctx_.exprType(*ce.args[0].value);
+                        if (at8247)
+                            checkAssignable(
+                                at8247, ctx_.primitiveTypeRef(P::String),
+                                ce.args[0].value->span.begin,
+                                "argument to `ToString(format)`",
+                                ce.args[0].value.get());
+                    }
+                    ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                    return;
                 }
                 // §8.2 (#487): `v.GetType()` → Type.  GetType is a universal
                 // Object member (§8.1) present on every type, so it reaches here
