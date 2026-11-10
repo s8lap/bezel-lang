@@ -5167,11 +5167,17 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         }
         builder_.CreateBr(endBB);
         builder_.SetInsertPoint(endBB);
-        // fix #2938 / §22.3: flush any bracket on the normal-return edge.
-        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
+        // fix #8300 (§22.3): the result phi MUST be the FIRST instruction of
+        // this merge block — LLVM: "PHI nodes not grouped at top of basic
+        // block". The §22.3 copy-out flush below can SPLIT the block (the
+        // collection setter's own bounds check branches), so the phi is
+        // created HERE, at the top of the merge block whose predecessors are
+        // exactly the phi's two incoming edges, and the flush runs after it.
         auto* phi = builder_.CreatePHI(i1(), 2, "lltrypop.r");
         phi->addIncoming(builder_.getTrue(), foundBB);
         phi->addIncoming(builder_.getFalse(), preBB);
+        // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         // fix #5289 (§22.6 "out _", §28.3): the discarded `out owned` value is an
         // unbound owned temporary — dispose it (null-guarded) after the call.
         if (call.args[0].isDiscard)
@@ -6664,21 +6670,29 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                     auto* okBB   = llvm::BasicBlock::Create(llvm_, "bba.ok", currentFn_);
                     auto* failBB = llvm::BasicBlock::Create(llvm_, "bba.fail", currentFn_);
                     auto* endBB  = llvm::BasicBlock::Create(llvm_, "bba.end", currentFn_);
-                    llvm::Value* hasRoom =
-                        builder_.CreateICmpSGE(slen64, wid64, "bba.room");
-                    builder_.CreateCondBr(hasRoom, okBB, failBB);
-                    if (isRead) {
-                        // TryRead*(out value: T): bool
-                        // out parameter is call.args[0]
-                        if (call.args.empty() ||
-                            !(call.args[0].value || call.args[0].isDiscard)) {
-                            builder_.SetInsertPoint(okBB);
-                            builder_.CreateBr(endBB);
-                            builder_.SetInsertPoint(failBB);
-                            builder_.CreateBr(endBB);
-                            builder_.SetInsertPoint(endBB);
-                            return builder_.getFalse();
-                        }
+                    // fix #8300 (§22.3): the `out` argument is resolved BEFORE
+                    // the branch below. `resolveBuiltinOutArg` may run the
+                    // §22.3 copy-IN half of the accessor bracket, and that half
+                    // EMITS instructions — the slot's zero-init store, plus the
+                    // pinned receiver / index lowering — into the CURRENT
+                    // block. Resolving it after the conditional branch appended
+                    // them AFTER this block's terminator, so the block no
+                    // longer ended with a terminator ("Basic Block in function
+                    // 'main' does not have terminator!") and the malformed IR
+                    // masked the phi-ordering defect below. The other five
+                    // extraction-Try sites all resolve the out argument before
+                    // their branch for exactly this reason; this one now does
+                    // too. Only the accessor-mediated shape (`out a[0]`) emits
+                    // anything here — the `out` local and `out _` shapes
+                    // resolve to a true-alias slot / an entry-block scratch and
+                    // are byte-identical to before.
+                    llvm::Type* outTy = nullptr;
+                    std::vector<AccessorRefArg> outArgs;
+                    llvm::Value* outAddr = nullptr;
+                    const bool hasOutArg =
+                        isRead && !call.args.empty() &&
+                        (call.args[0].value || call.args[0].isDiscard);
+                    if (hasOutArg) {
                         // fix #2938 / §22.3: see TryGetValue in Calls.cpp.
                         // The pre-fix branch was `if (outAddr)` at both store
                         // sites, so a null lvalueAddr silently dropped the
@@ -6686,10 +6700,8 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                         // — only the writeback gating changes — so both stores
                         // run unconditionally and the bracket flushes at the
                         // merge block.
-                        llvm::Type* outTy = nullptr;
-                        std::vector<AccessorRefArg> outArgs;
                         // fix #5289 (§17.13 / §22.6): `out _` → scratch of T.
-                        llvm::Value* outAddr = resolveBuiltinOutArg(
+                        outAddr = resolveBuiltinOutArg(
                             call.args[0],
                             isFloat ? (byteWidth == 4
                                            ? llvm::Type::getFloatTy(llvm_)
@@ -6700,6 +6712,21 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                             emitAccessorRefArgWriteBacks(outArgs,
                                                          /*emit=*/false);
                             return nullptr;
+                        }
+                    }
+                    llvm::Value* hasRoom =
+                        builder_.CreateICmpSGE(slen64, wid64, "bba.room");
+                    builder_.CreateCondBr(hasRoom, okBB, failBB);
+                    if (isRead) {
+                        // TryRead*(out value: T): bool
+                        // out parameter is call.args[0]
+                        if (!hasOutArg) {
+                            builder_.SetInsertPoint(okBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(failBB);
+                            builder_.CreateBr(endBB);
+                            builder_.SetInsertPoint(endBB);
+                            return builder_.getFalse();
                         }
                         // okBB: load, bswap if BE, bitcast, store to out, jump end
                         builder_.SetInsertPoint(okBB);
@@ -6728,12 +6755,20 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                         }
                         builder_.CreateBr(endBB);
                         builder_.SetInsertPoint(endBB);
-                        // fix #2938 / §22.3: flush any bracket on the
-                        // normal-return edge.
-                        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
+                        // fix #8300 (§22.3): the result phi MUST be the FIRST
+                        // instruction of this merge block — LLVM: "PHI nodes not
+                        // grouped at top of basic block". The §22.3 copy-out
+                        // flush below can SPLIT the block (the recipient
+                        // setter's own bounds check branches), so the phi is
+                        // created HERE, at the top of the merge block whose
+                        // predecessors are exactly the phi's two incoming edges,
+                        // and the flush runs after it.
                         auto* phi = builder_.CreatePHI(i1(), 2, "bba.tryres");
                         phi->addIncoming(builder_.getTrue(),  okBB);
                         phi->addIncoming(builder_.getFalse(), failBB);
+                        // fix #2938 / §22.3: flush any bracket on the
+                        // normal-return edge.
+                        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
                         return phi;
                     } else {
                         // TryWrite*(value: T): bool

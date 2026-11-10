@@ -10339,11 +10339,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::BasicBlock* foundEnd = builder_.GetInsertBlock();
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
-            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
-            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
+            // fix #8300 (§22.3): the result phi MUST be the FIRST instruction of
+            // this merge block — LLVM: "PHI nodes not grouped at top of basic
+            // block". The §22.3 copy-out flush below can SPLIT the block (the
+            // collection setter's own bounds check branches), so the phi is
+            // created HERE, at the top of the merge block whose predecessors are
+            // exactly the phi's two incoming edges, and the flush runs after it.
             auto* phi2 = builder_.CreatePHI(i1(), 2, "tt.r");
             phi2->addIncoming(builder_.getTrue(), foundEnd);
             phi2->addIncoming(builder_.getFalse(), condBB);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             // fix #5289 (§22.6 "out _", §28.3): the discarded `out owned` value is an
             // unbound owned temporary — dispose it (null-guarded) after the call.
             if (call.args[1].isDiscard)
@@ -10464,10 +10470,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::BasicBlock* foundEnd = builder_.GetInsertBlock();
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
-            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
+            // fix #8300 (§22.3): the result phi MUST be the FIRST instruction of
+            // this merge block — LLVM: "PHI nodes not grouped at top of basic
+            // block". The §22.3 copy-out flush below can SPLIT the block (the
+            // collection setter's own bounds check branches), so the phi is
+            // created HERE, at the top of the merge block whose predecessors are
+            // exactly the phi's two incoming edges, and the flush runs after it.
             auto* phi2 = builder_.CreatePHI(i1(), 2, "tryp.r");
             phi2->addIncoming(builder_.getTrue(), foundEnd);
             phi2->addIncoming(builder_.getFalse(), condBB);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             // fix #5434 / §28.3 Unbound owned temporaries / stdlib §4.10 (v0.315):
             // `TryPop(query: T, out owned removed: T?)` takes its query as a
             // BORROW — stdlib §4.10 declares `Pop(query: T): owned T` with the
@@ -10912,11 +10925,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
-            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
-            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
+            // fix #8300 (§22.3): the result phi MUST be the FIRST instruction of
+            // this merge block — LLVM: "PHI nodes not grouped at top of basic
+            // block". The §22.3 copy-out flush below can SPLIT the block (the
+            // collection setter's own bounds check branches), so the phi is
+            // created HERE, at the top of the merge block whose predecessors are
+            // exactly the phi's two incoming edges, and the flush runs after it.
+            // Same ordering as `Dictionary.TryGetValue`'s `tg.end` block, whose
+            // copy-out flush is likewise the last thing emitted there.
             auto* phi = builder_.CreatePHI(i1(), 2, "trypop.r");
             phi->addIncoming(builder_.getTrue(), foundBB);
             phi->addIncoming(builder_.getFalse(), preBB);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             finishTryOutStringWrite(outAddr, tpStrOld,
                                     /*borrowed=*/m == "TryPeek");
             // fix #5289 (§22.6 "out _", §28.3): the discarded `out owned` value is an
@@ -11041,11 +11062,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
-            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
-            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
+            // fix #8300 (§22.3): the result phi MUST be the FIRST instruction of
+            // this merge block — LLVM: "PHI nodes not grouped at top of basic
+            // block". The §22.3 copy-out flush below can SPLIT the block (the
+            // collection setter's own bounds check branches), so the phi is
+            // created HERE, at the top of the merge block whose predecessors are
+            // exactly the phi's two incoming edges, and the flush runs after it.
             auto* phi = builder_.CreatePHI(i1(), 2, "trypopfl.r");
             phi->addIncoming(builder_.getTrue(), foundBB);
             phi->addIncoming(builder_.getFalse(), preBB);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             // fix #5289 (§22.6 "out _", §28.3): the discarded `out owned` value is an
             // unbound owned temporary — dispose it (null-guarded) after the call.
             if (call.args[0].isDiscard)
