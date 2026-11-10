@@ -5427,6 +5427,11 @@ static bool isArrayOrClassOrInterfaceForMeet(const sema::TypeRef* rt) {
         // alone -- `s ?? new StringBuilder(..)` is the same mixed meet.
         if (common::isBorrowBearingBuiltinClassHead(rt->headName()))
             return true;
+        // fix #7807 (§28.3 K7.3, K3.13, v0.357): a Task-family value is an
+        // owned class-like value too -- `t ?? W()` over a named owned `Task?`
+        // local is the same mixed meet, and the unmarked `t` is a borrow arm.
+        if (common::isTaskFamilyHead(rt->headName()))
+            return true;
     }
     return false;
 }
