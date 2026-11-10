@@ -3164,7 +3164,7 @@ bool builtinSurfaceDeclaresArity0Member(const TypeRef* recvTy,
 // `Console` static STREAM-property read, for the CALL-ARGUMENT position.
 //
 // stdlib §2.1 declares THREE static readonly properties on `Console`
-// (docs/Bezel_Standard_Library.md:115-117):
+// stdlib §2.1's three static readonly properties:
 //
 //   public static readonly property In: TextReader;
 //   public static readonly property Out: TextWriter;
@@ -6549,7 +6549,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // point of the viewed range). Non-generic, so its element
                     // type is the fixed `char` primitive (not genericArgs[0]).
                     else if (cn == "ReadOnlyStringSpan") {
-                        // §7 / stdlib §3.3 (#2613): stdlib §3.3 line 1321
+                        // §7 / stdlib §3.3 (#2613): stdlib §3.3
                         // declares the indexer `public property [i: int]: char`
                         // — a single NON-nullable `int` index, and the only
                         // indexer form the record declares (no Range overload).

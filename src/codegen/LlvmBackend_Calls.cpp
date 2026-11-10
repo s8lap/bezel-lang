@@ -3603,7 +3603,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         }
     }
     // stdlib §5 (#755, supersedes #1296): an `IGrouping<TKey, T>` receiver.
-    // `IGrouping : IEnumerable<T>` (stdlib §5:3076), so every §5 eager terminal
+    // `IGrouping : IEnumerable<T>` (stdlib §5's `IGrouping<TKey, T>`), so every
+    // §5 eager terminal
     // (Sum/Min/Max/Average/Any/All/Aggregate/Count(pred)/First/Last/Single/
     // ElementAt/*OrNull/Contains/IndexOf) resolves on it — but its runtime value
     // is a bz_grouping_t*, which none of the receiver shapes below recognized, so
@@ -7665,7 +7666,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!call.args.empty() && !closure) return nullptr;
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
-            // per stdlib §5.1 (lines 2528–2529): Min()/Max() throw
+            // per stdlib §5.1 (`Min`/`Max` without a selector): Min()/Max() throw
             // InvalidOperationException if the source is empty.
             llvm::Value* isEmpty = builder_.CreateICmpEQ(len, builder_.getInt64(0));
             emitGuardThrow(isEmpty, "InvalidOperationException");
@@ -7810,7 +7811,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 ? ctx_.primitiveTypeRef(sema::PrimitiveType::Char)
                 : (recvTy && !recvTy->genericArgs.empty())
                     ? recvTy->genericArgs[0] : nullptr;
-            // fix #4729 (spec §29.1, stdlib §5 line 3641-3645, v0.305): the
+            // fix #4729 (spec §29.1, stdlib §5.1's `MinOrNull`/`MaxOrNull`
+            // no-selector forms, v0.305): the
             // numeric-element comparison below must honor the element's
             // signedness — `byte`/`ushort`/`uint`/`ulong`/`char` order
             // UNSIGNED (the bit pattern), the signed family orders signed.
@@ -8182,7 +8184,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return resultV;
         }
         // per §5 LINQ: .First(pred: (T)->bool): T  (throws if empty/not found)
-        // stdlib §5 line 2446 + 2515: throws InvalidOperationException if no
+        // stdlib §5 (`First`): throws InvalidOperationException if no
         // element satisfies the predicate.
         if (m == "First" && call.args.size() == 1 && call.args[0].value) {
             const bool relCl = argIsInlineLambda(0);
@@ -8222,7 +8224,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
-            // per stdlib §5 line 2515: throw InvalidOperationException if no match.
+            // per stdlib §5 (`First`): throw InvalidOperationException if no match.
             llvm::Value* notFound = builder_.CreateNot(
                 builder_.CreateLoad(i1(), foundSlot));
             emitGuardThrow(notFound, "InvalidOperationException");
@@ -8432,11 +8434,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // return the first element; Last() returns the last; ElementAt(i)
         // returns the element at index i (stdlib §5 — each `: T`).
         //
-        // stdlib §5 line 2445: First() throws InvalidOperationException if empty.
-        // stdlib §5 line 2449: Last()  throws InvalidOperationException if empty.
-        // stdlib §5 line 2451: Single() throws InvalidOperationException if not
+        // stdlib §5 (`First`): throws InvalidOperationException if empty.
+        // stdlib §5 (`Last`):  throws InvalidOperationException if empty.
+        // stdlib §5 (`Single`): throws InvalidOperationException if not
         //   exactly one element (empty OR ≥2).
-        // stdlib §5 line 2515: "throw InvalidOperationException … on missing-element;
+        // stdlib §5: "throw InvalidOperationException … on missing-element;
         //   IndexOutOfRangeException for ElementAt."
         if ((m == "First" || m == "Single") && call.args.empty()) {
             llvm::Type* retTy = getElemTy();
@@ -8469,7 +8471,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Type* retTy = getElemTy();
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
-            // per stdlib §5 line 2449 + 2515: throw InvalidOperationException if empty.
+            // per stdlib §5 (`Last`): throw InvalidOperationException if empty.
             llvm::Value* isEmpty = builder_.CreateICmpEQ(len, builder_.getInt64(0));
             emitGuardThrow(isEmpty, "InvalidOperationException");
             llvm::Value* idx = builder_.CreateSub(len, builder_.getInt64(1));
@@ -8487,7 +8489,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!idx) return nullptr;
             idx = builder_.CreateSExt(idx, i64());
             llvm::Type* retTy = getElemTy();
-            // per stdlib §5 line 2515: ElementAt throws IndexOutOfRangeException
+            // per stdlib §5 (`ElementAt`): throws IndexOutOfRangeException
             // when the index is out of bounds (negative or >= length).
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
@@ -12243,7 +12245,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 dtCnt0 = builder_.CreateCall(cfn, {recv});
             }
 
-            // Compute/guard the target index (stdlib §5 line 3594: First/
+            // Compute/guard the target index (stdlib §5: First/
             // Last throw InvalidOperationException on empty; Single throws
             // InvalidOperationException when count != 1; ElementAt throws
             // IndexOutOfRangeException out of bounds) -- before any snapshot
@@ -12307,7 +12309,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     "InvalidOperationException");
                 dtIdx = builder_.CreateSub(dtCnt0, builder_.getInt64(1));
             } else if (m == "Single") {
-                // fix #3761 / stdlib §5 line 3594: Single throws
+                // fix #3761 / stdlib §5: Single throws
                 // InvalidOperationException if the source is empty OR has
                 // more than one entry — a single (dtCnt0 != 1) check covers
                 // both. Same "no allocation before reject" discipline as
@@ -19154,7 +19156,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // fires. The Delay(int) overload's arg is milliseconds; Delay(TimeSpan)'s arg
     // is an i64 tick count (100-ns units) converted to ms.
     //
-    // stdlib §6.7 (line 2868) / spec §30.8: Delay(ms, token) and Delay(span, token)
+    // stdlib §6.7 (`Delay`) / spec §30.8: Delay(ms, token) and Delay(span, token)
     // overloads now honor the CancellationToken: if the token is already cancelled
     // at call time OR becomes cancelled during the sleep, the returned task is
     // faulted with OperationCanceledException (bz_task_delay_cancelable, #451).
@@ -19203,7 +19205,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* delayFn = declareC("bz_task_delay", ptrTy(), {i64()});
             return builder_.CreateCall(delayFn, {ms}, "task.delay");
         }
-        // stdlib §6.7 (line 2855): Task.FromResult<T>(value: T): Task<T>.
+        // stdlib §6.7 (`FromResult`): Task.FromResult<T>(value: T): Task<T>.
         // Allocate a task and immediately complete it with the argument value.
         // The value is stored through a stack alloca so we have a pointer to pass
         // to bz_task_from_result. ptr-result types (class objects, task pointers)
@@ -19227,7 +19229,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                  builder_.getInt64(sz)},
                 "task.from_result");
         }
-        // stdlib §6.7 (line 2993) / §30.5 Pattern B:
+        // stdlib §6.7 (`FromOwnedResult`) / §30.5 Pattern B:
         // Task.FromOwnedResult<T>(owned value: T): OwningTask<T> where T: class.
         // Build an already-completed OWNED task carrying the owned class-pointer
         // result. The value is a ptr (a class object handle); store it into a
@@ -19258,7 +19260,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                  builder_.getInt64(sz)},
                 "task.from_owned_result");
         }
-        // stdlib §6.7 (line 2986) / §30.10 (#738): Task.FromException<T>(exc):
+        // stdlib §6.7 (`FromException`) / §30.10 (#738): Task.FromException<T>(exc):
         // Task<T> — an already-FAULTED task carrying the exception object.
         // Awaiting it re-raises the original exception (the await machinery reads
         // bz_task_error_obj). Allocate a task and fault it with the Exception.
@@ -19274,7 +19276,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             builder_.CreateCall(faultFn, {task, exc});
             return task;
         }
-        // stdlib §6.7 (line 2987) / §30.10 (#738): Task.FromCancelled<T>():
+        // stdlib §6.7 (`FromCancelled`) / §30.10 (#738): Task.FromCancelled<T>():
         // Task<T> — an already-faulted task carrying an
         // OperationCanceledException. Awaiting it re-raises the OCE. Construct
         // the OCE inline ({vtable, msg} — same layout as bz_task_make_oce / a
@@ -19297,8 +19299,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             builder_.CreateCall(faultFn, {task, oce});
             return task;
         }
-        // stdlib §6.7 (line 2872): Task.WhenAll(tasks: Array<Task>): Task.
-        // stdlib §6.7 (line 2875): Task.WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>.
+        // stdlib §6.7 (`WhenAll`): Task.WhenAll(tasks: Array<Task>): Task.
+        // stdlib §6.7 (`WhenAll`): Task.WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>.
         //
         // Dispatch: if the arg is Array<Task<T>> (the element type is Task<T>,
         // i.e. Task with a generic arg), call bz_task_when_all_results which
@@ -19349,7 +19351,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     isTyped = true;
                 }
             }
-            // fix #1830 / §6.7 / stdlib §6.7 (line 2875): typed Task.WhenAll<T>
+            // fix #1830 / §6.7 / stdlib §6.7 (`WhenAll`): typed Task.WhenAll<T>
             // over an INLINE collection literal. sema may have set the literal's
             // exprType to the bare Array<Task> shape (the arg has no MethodDecl
             // target type, so the argTy path above is null / falls through to
@@ -19443,7 +19445,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             if (isLiteralTemp) freeTaskArrayArgTemp(arr);
             return result;
         }
-        // stdlib §6.7 (line 2884): Task.WhenAny(tasks: Array<Task>): Task<int>
+        // stdlib §6.7 (`WhenAny`): Task.WhenAny(tasks: Array<Task>): Task<int>
         // (v0.162 / #1332). Returns a new task that completes with the i32 INDEX
         // of the first-done input task (not the task pointer — Task<Task> was
         // unconstructible under §30.5). sema types the result as Task<int>, so the
@@ -19492,7 +19494,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             if (isLiteralTemp) freeTaskArrayArgTemp(arr);
             return result;
         }
-        // stdlib §6.7 (line 2942): Task.WhenAllOwned<T>(
+        // stdlib §6.7 (`WhenAllOwned`): Task.WhenAllOwned<T>(
         //   owned tasks: OwningArray<OwningTask<T>>): OwningTask<OwningArray<T>>
         //   where T: class.
         //
@@ -19591,7 +19593,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return builder_.CreateCall(whenEachOwnedFn, {arr, resultDisposer},
                                        "task.when_each_owned");
         }
-        // stdlib §6.7 (line 2885): Task.FireAndForget(owned task: Task): void.
+        // stdlib §6.7 (`FireAndForget`): Task.FireAndForget(owned task: Task): void.
         // Registers a continuation that frees the task on completion; ownership
         // transfers. Returns unit (nullptr from codegen → discarded).
         if (m == "FireAndForget" && !call.args.empty() && call.args[0].value) {

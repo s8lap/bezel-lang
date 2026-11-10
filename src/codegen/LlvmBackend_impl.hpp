@@ -23416,7 +23416,7 @@ private:
     // lowerExpr's body; lowerExpr is the depth-tracking wrapper around it.
     llvm::Value* lowerExprInner(const ast::Expr& e);
 
-    // #1501 / stdlib §6.7 (line 2884) / §30.10: a synthesized, concrete
+    // #1501 / stdlib §6.7 (`WhenAny`/`WhenAll`) / §30.10: a synthesized, concrete
     // `Array<Task>` sema::TypeRef for the Task.WhenAny/WhenAll `tasks`
     // argument. Mirrors builtinByteArrayTypeRef's rationale: these intrinsic
     // call sites have no MethodDecl params, so a literal argument needs an
@@ -23424,7 +23424,7 @@ private:
     // (Named, no declaration, no generic args) — an opaque task handle.
     const sema::TypeRef* builtinTaskArrayTypeRef();
 
-    // #1501 / stdlib §6.7 (line 2884) / §30.10: lower the `tasks` argument of
+    // #1501 / stdlib §6.7 (`WhenAny`/`WhenAll`) / §30.10: lower the `tasks` argument of
     // Task.WhenAny/WhenAll. When the argument is an inline collection literal
     // `[t1, t2, …]`, materialize it into an owned Array<Task> temporary and
     // report it as such (second element = true) — the caller must free it

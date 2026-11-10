@@ -2540,7 +2540,7 @@ void* bz_task_make_oce(void* oce_vtable) {
     return obj;
 }
 
-// stdlib §6.7 (line 2868) / spec §30.8:
+// stdlib §6.7 (`Delay`) / spec §30.8:
 // Task.Delay(milliseconds: int, token: CancellationToken): Task.
 //
 // Token-aware Delay.  If the token is already cancelled at call time, returns

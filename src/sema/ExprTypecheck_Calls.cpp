@@ -13781,16 +13781,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     recvTy->declaration->moduleName.empty() &&
                     !recvTy->genericArgs.empty();
                 // stdlib §5 (#755): an `IGrouping<TKey, T>` receiver. `IGrouping :
-                // IEnumerable<T>` (stdlib §5:3076), so the whole §5 operator and
-                // terminal surface applies to a grouping — but its ELEMENT type is
+                // IEnumerable<T>` (stdlib §5's `IGrouping<TKey, T>`), so the
+                // whole §5 operator and terminal
+                // surface applies to a grouping — but its ELEMENT type is
                 // genericArgs[1] (genericArgs[0] is TKey), so it cannot share the
                 // lazy sentinel's shape test. Without this the results were left
                 // UNTYPED, and the damage was silent rather than diagnosed: `var a
                 // := g.ToArray()` produced a local with no `Array<T>` type, so
                 // `a.Count` lowered to 0 and no scope-end reclaim was registered
-                // (a wrong value plus a leak) — while stdlib §5:3099 names exactly
-                // `using var items := g.ToArray()` as the way to aggregate a group
-                // more than once.
+                // (a wrong value plus a leak) — while stdlib §5's `GroupBy`
+                // semantics paragraph names exactly
+                // `using var items := g.ToArray()` as the way to aggregate
+                // a group more than once.
                 bool isGroupingLinqRecv =
                     recvTy && recvTy->kind == TypeRef::Kind::Named &&
                     !recvTy->declaration && recvTy->astNode &&
@@ -15207,9 +15209,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // the initializer as a UNIT initializer, and the local's
                     // slot degraded to zero (#2434) with no diagnostic on the
                     // line itself. `SortedSet<T>: IReadOnlyCollection<T>`
-                    // (stdlib §4.18) and `IReadOnlyCollection<out T>:
-                    // IEnumerable<T>` (stdlib line 1467), so §5's `extension
-                    // IEnumerable<T>` block applies to it normatively; #3711
+                    // (stdlib §4.18) and `IReadOnlyCollection<out T>`
+                    // (stdlib §4.1) — the borrowing collection interface
+                    // over `IEnumerable<T>` (stdlib §4.12) — so §5's
+                    // `extension IEnumerable<T>` block applies to it
+                    // normatively; #3711
                     // (the codegen half, LlvmBackend_Calls3.cpp's
                     // lowerToLazyEnumerator SortedSet arm) already lowers the
                     // §5 lazy-operator surface in stdlib §4.18's required
@@ -19024,7 +19028,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (m == "Delay") {
                             ctx_.setExprType(&ce, makeTaskTypeRef());
                         }
-                        // stdlib §6.7 (line 2855): Task.FromResult<T>(value: T):
+                        // stdlib §6.7 (`FromResult`): Task.FromResult<T>(value: T):
                         // Task<T>. Returns an already-completed task carrying the
                         // argument value. The result type is Task<T> where T is
                         // inferred from the argument.
@@ -19065,7 +19069,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (argTy) tt->genericArgs.push_back(argTy);
                             ctx_.setExprType(&ce, tt);
                         }
-                        // stdlib §6.7 (line 2993) / §30.5 Pattern B:
+                        // stdlib §6.7 (`FromOwnedResult`) / §30.5 Pattern B:
                         // Task.FromOwnedResult<T>(owned value: T): OwningTask<T>
                         // where T: class. Returns an already-completed OWNED task
                         // carrying the owned value; awaiting it (Pattern B)
@@ -19086,7 +19090,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (T) tt->genericArgs.push_back(T);
                             ctx_.setExprType(&ce, tt);
                         }
-                        // stdlib §6.7 (line 2986-2987): Task.FromException<T>(exc):
+                        // stdlib §6.7 (`FromException`/`FromCancelled`):
+                        // Task.FromException<T>(exc):
                         // Task<T> and Task.FromCancelled<T>(): Task<T>. The result
                         // T comes from the EXPLICIT method type arg (the argument,
                         // if any, is the Exception — not T). A faulted/cancelled
@@ -19099,11 +19104,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     tt->genericArgs.push_back(T);
                             ctx_.setExprType(&ce, tt);
                         }
-                        // stdlib §6.7 (line 2872): Task.WhenAll(tasks: Array<Task>):
+                        // stdlib §6.7 (`WhenAll`): Task.WhenAll(tasks: Array<Task>):
                         // Task. Completes when all input tasks complete; no result
                         // value (bare Task).
                         //
-                        // stdlib §6.7 (line 2875):
+                        // stdlib §6.7 (`WhenAll`):
                         // Task.WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>.
                         // When the input is Array<Task<T>> (the element Task has a
                         // generic arg T), the result is Task<Array<T>>. Detect this
@@ -19154,7 +19159,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         resultTy->genericArgs.push_back(arrTy);
                                     }
                                 }
-                                // fix #1830 / §6.7 (v0.217) / stdlib §6.7 (line 2875):
+                                // fix #1830 / §6.7 (v0.217) / stdlib §6.7 (`WhenAll`):
                                 // typed Task.WhenAll<T> over an INLINE collection
                                 // literal. The intrinsic receives a bare
                                 // Array<Task> (no Task generic arg) — the
@@ -19248,7 +19253,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                             ctx_.setExprType(&ce, resultTy);
                         }
-                        // stdlib §6.7 (line 2884): Task.WhenAny(tasks: Array<Task>):
+                        // stdlib §6.7 (`WhenAny`): Task.WhenAny(tasks: Array<Task>):
                         // Task<int> (v0.162 / #1332). Completes with the INDEX of the
                         // first-done task (i32), not the task pointer. (Task<Task> was
                         // unconstructible under §30.5.) The codegen passes the array to
@@ -19260,7 +19265,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 ctx_.primitiveTypeRef(PrimitiveType::Int));
                             ctx_.setExprType(&ce, tt);
                         }
-                        // stdlib §6.7 (line 2942): Task.WhenAllOwned<T>(
+                        // stdlib §6.7 (`WhenAllOwned`): Task.WhenAllOwned<T>(
                         //   owned tasks: OwningArray<OwningTask<T>>
                         // ): OwningTask<OwningArray<T>> where T: class.
                         //
@@ -19375,7 +19380,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (elemTaskTy) oaeTy->genericArgs.push_back(elemTaskTy);
                             ctx_.setExprType(&ce, oaeTy);
                         }
-                        // stdlib §6.7 (line 2885): Task.FireAndForget(owned task):
+                        // stdlib §6.7 (`FireAndForget`): Task.FireAndForget(owned task):
                         // void/unit. Ownership of the task transfers; the caller
                         // does not need the return value. No TypeRef set → unit.
                         // (FireAndForget return type is untyped/unit in sema.)
@@ -19572,7 +19577,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                          "overloads (stdlib §6.8)",
                          "6.8"},
                         // §6.7 (v0.240 / #3024) — Task static helpers.
-                        // The full set per stdlib §6.7 (lines 2855-2993)
+                        // The full set per stdlib §6.7
                         // + the §30.5 Pattern B (FromOwnedResult) +
                         // §30.10 aggregators (WhenAll, WhenAny, WhenEach,
                         // and their <T>/Owned variants) + the
@@ -29993,10 +29998,10 @@ static void checkBuiltinPathCallArity(
 // admissible; `Array<int>` has `IndexOf(item: int)`, so an un-narrowed
 // `int?` is rejected. EXCEPTION (#2600): class-T `Span<T>`/`ReadOnlySpan<T>`
 // declare `IndexOf(value: T?)` / `Contains(value: T?)` — NULLABLE (stdlib
-// §4.14 line 2463/2611) — so the helper's spanBufferSkipClassT branch
+// §4.14) — so the helper's spanBufferSkipClassT branch
 // suppresses the check for that case (an un-narrowed `T?` is admissible);
 // ArraySpan<T>/ReadOnlyArraySpan<T> keep `value: T` for class T too (§4.15
-// line 2881 — Array<T> slots do not wrap class T in T?), so they are covered
+// — Array<T> slots do not wrap class T in T?), so they are covered
 // unconditionally. The atomic family needs NO class-T split: Atomic<T> is
 // compiler-restricted to cell-sized primitive VALUE types (§6.4 — bool/char/
 // byte/sbyte/short/ushort/int/uint/long/ulong/IntPtr/UIntPtr; AtomicInteger<T>
@@ -30114,7 +30119,8 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     // `astNode` is non-null. Without this term an imported class-`T`
     // `Span<T>`/`ReadOnlySpan<T>` receiver —
     // whose `Contains(value: T?)` / `IndexOf(value: T?)` are NULLABLE per
-    // stdlib §4.14 lines 2464/2612 — would be checked against a non-nullable
+    // stdlib §4.14 (`Contains(value: T?)` / `IndexOf(value: T?)`) — would be
+    // checked against a non-nullable
     // `genericArgs[0]` and REJECT LEGAL CODE, because the
     // `spanBufferSkipClassT` exemption below keys on a `colName` that is
     // empty for the imported form. Both sibling copies of this predicate
@@ -30216,14 +30222,15 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
 
     // §4.14 vs §4.15 parameter-nullability split for the span-buffer family.
     // ArraySpan<T>/ReadOnlyArraySpan<T> declare `value: T` for EVERY T (Array<T>
-    // slots do not wrap class T in T? — stdlib §4.15 line 2881), so the param
+    // slots do not wrap class T in T? — stdlib §4.15's `value: T`), so the param
     // type is exactly `genericArgs[0]` and the check below is correct unconditionally.
     // Span<T>/ReadOnlySpan<T> SPLIT by T's category: for VALUE T they declare
-    // `value: T` (non-nullable, §4.14 line 2522/2640 — check fires); for CLASS T
-    // they declare `value: T?` (NULLABLE, §4.14 line 2463/2611 — an un-narrowed
-    // `T?` is admissible, so the check must NOT fire). The class-T owning span
-    // also forbids Fill (the typeCall block at L6671 already rejects it). Mirror
-    // the typeCall block's elemIsClass computation (L6588-6602) to gate this.
+    // `value: T` (non-nullable, stdlib §4.14's `value: T` for VALUE T —
+    // check fires); for CLASS T they declare `value: T?` (NULLABLE, stdlib
+    // §4.14's `value: T?` — an un-narrowed `T?` is admissible, so the check
+    // must NOT fire). The class-T owning span also forbids Fill (the
+    // typeCall block at L6671 already rejects it). Mirror the typeCall
+    // block's elemIsClass computation (L6588-6602) to gate this.
     bool spanBufferSkipClassT = false;
     if (isSpanBuffer && (colName == "Span" || colName == "ReadOnlySpan")) {
         const TypeRef* spEl = recvTy->genericArgs[0];
@@ -30339,7 +30346,7 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         // below).
         // fix #3399 / stdlib §4.17 (v0.283): `SortedDictionary<K, V>` joins
         // them. It declares `public method Add(key: K, value: V);`
-        // (Bezel_Standard_Library.md:3322) — added at v0.282 by proposal 0119,
+        // (stdlib §4.17) — added at v0.282 by proposal 0119,
         // which restored the duplicate-is-a-bug tier to the sorted map. #2582
         // left the name out because §4.17 genuinely had no `Add` at the time
         // (its write surface was the indexer only), and #3372 added the sibling
@@ -30466,27 +30473,28 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
 
     // §7 / stdlib §4.8 (#2592): the parameters in this helper's surface whose
     // declared type is `V` rather than the `genericArgs[0]` element/key
-    // type — `Dictionary<K, V>.Add(key: K, value: V)` at pos 1 (stdlib §4.8
-    // line 1850). Gated to the two BORROWING maps deliberately:
+    // type — `Dictionary<K, V>.Add(key: K, value: V)` at pos 1 (stdlib §4.8's
+    // `Add(key: K, value: V)`). Gated to the two BORROWING maps deliberately:
     //   * fix #3399 / stdlib §4.17 (v0.283): `SortedDictionary<K, V>` DOES
-    //     declare `Add(key: K, value: V)` (Bezel_Standard_Library.md:3322),
+    //     declare `Add(key: K, value: V)` (stdlib §4.17),
     //     with the same two non-nullable slots, and is listed here now. The
-    //     previous text of this bullet — "`SortedDictionary<K, V>` (§4.17 line
-    //     2999-3017) declares NO `Add(key, value)` at all — its write surface
+    //     previous text of this bullet — "`SortedDictionary<K, V>` (§4.17)
+    //     declares NO `Add(key, value)` at all — its write surface
     //     is the indexer-set — which is also why #2582 left it out of the
     //     pos-0 `Add` name gate" — was TRUE when #2582 wrote it and became
     //     false at v0.282, when proposal 0119 restored the throwing `Add` to
     //     the sorted map. That stale claim is what kept BOTH slots unguarded
     //     through #3372, which added the sibling `TryAdd` to these two lambdas
     //     without re-reading it;
-    //   * `OwningDictionary<K, V>.Add(key: K, owned value: V)` (§4.9 line
-    //     1930) marks the value `owned`, so §22.3 governs that transfer, not
-    //     §7 — the modifier guard in the loop below skips it, and naming it
-    //     here would only produce a misleading diagnostic when a caller
-    //     forgets the marker;
+    //   * `OwningDictionary<K, V>.Add(key: K, owned value: V)` (stdlib §4.9)
+    //     marks the value `owned`, so §22.3 governs that transfer, not §7 —
+    //     the modifier guard in the loop below skips it, and naming it here
+    //     would only produce a misleading diagnostic when a caller forgets
+    //     the marker;
     //   * `GetOrAdd(key, factory)` takes a function, and the entry-shaped
     //     `Add(entry)`/`Contains(entry)`/`Remove(entry)` ICollection forms
-    //     (§4.8 line 1896) take a `DictionaryEntry<K, V>`, not a bare `V`.
+    //     (§4.8's entry-shaped forms) take a `DictionaryEntry<K, V>`, not a
+    //     bare `V`.
     // The OTHER write path, the indexer-set `dict[key] := value` (§4.8), is a
     // separate Expr kind (not a CallExpr) and out of this helper's reach — but
     // it needs nothing: it already rejects an un-narrowed `V?` through the

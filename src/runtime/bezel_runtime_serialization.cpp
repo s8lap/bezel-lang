@@ -1331,7 +1331,7 @@ static void* bz_jder_parse_string(bz_binder_t* d) {
 // THE JSON NUMBER GRAMMAR — stdlib §2.15 (v0.355).
 // ---------------------------------------------------------------------------
 //
-// stdlib §2.15, "JSON mapping" (docs/Bezel_Standard_Library.md:953):
+// stdlib §2.15, "JSON mapping":
 //
 //   "A *JSON number* is JSON's own number token (RFC 8259 §6): an optional
 //   `-`, an integer part that is `0` or a nonzero digit followed by zero or
@@ -1340,7 +1340,7 @@ static void* bz_jder_parse_string(bz_binder_t* d) {
 //   Any other spelling of a number — `.5`, `5.`, `1.e3`, `+5`, `007`, `1_000`,
 //   `0x1p3` — is malformed input (**Errors** below)."
 //
-// and stdlib §2.15, "Errors" (docs/Bezel_Standard_Library.md:1073):
+// and stdlib §2.15, "Errors":
 //
 //   "**Errors.** Malformed input, type mismatches (a `ReadInt` when the next
 //   token is a string), and depth-limit violations raise

@@ -13187,10 +13187,11 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     // here; iterator state machines and Array<T> go through other paths.
     //
     // stdlib §5 (#755, finding [17]) / spec §29.2: an `IGrouping<TKey, T>` source
-    // is also handled here. `IGrouping : IEnumerable<T>` (stdlib §5:3076), so
-    // `for var el in g do … end` — the inner loop of the canonical
-    // `for var g in xs.GroupBy(k) do … end` shape — is well-formed Bezel; it
-    // was rejected with "not yet implemented: codegen for this for statement"
+    // is also handled here. `IGrouping : IEnumerable<T>` (stdlib §5's
+    // `IGrouping<TKey, T>`), so `for var el in g do … end` — the inner loop
+    // of the canonical `for var g in xs.GroupBy(k) do … end` shape — is
+    // well-formed Bezel; it was rejected with "not yet implemented: codegen
+    // for this for statement"
     // because no for-handler recognized an IGrouping-typed source.
     // lowerToLazyEnumerator wraps the grouping's (grouping-owned) element array
     // as a BORROWING lazy array source, so the enumerator protocol below drives

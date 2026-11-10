@@ -960,7 +960,8 @@ constexpr std::array<BuiltinParamRow, 387> kBuiltinParams = {{
     // fix #7419 (stdlib §8.2, v0.345): the ONE-argument `Assert` row quoted
     // `Assert(condition: bool)` — a TRUNCATED declared signature. stdlib §8.2
     // declares ONE signature, `Assert(condition: bool, message: string := "")`
-    // (docs/Bezel_Standard_Library.md:5123, and stdlib §1's "Optional trailing
+    // (stdlib §8.2's `Assert(condition: bool, message: string := "")`, and
+    // stdlib §1's "Optional trailing
     // argument" rule: "an optional trailing argument with a nameable default
     // ... is one signature carrying a `:=` default, not an overload pair
     // (... `Debug.Assert(condition, message := "")`)"), so the diagnostic told

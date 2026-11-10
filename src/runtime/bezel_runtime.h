@@ -2054,7 +2054,7 @@ int32_t bz_ctoken_is_cancelled(void* token);
 //   if (bz_ctoken_throw_if_cancelled(token)) goto unwind;
 int32_t bz_ctoken_throw_if_cancelled(void* token);
 
-// stdlib §6.7 (line 2868) / spec §30.8: Task.Delay with cancellation.
+// stdlib §6.7 (`Delay`) / spec §30.8: Task.Delay with cancellation.
 // Token-aware Task.Delay: checks the token before and after the sleep.
 // If cancelled (before or after sleep), completes the task as faulted with
 // an OperationCanceledException constructed from oce_vtable. Otherwise,

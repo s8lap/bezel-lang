@@ -123,7 +123,8 @@ bool Emitter::isVtableBackedIEnumerableType(const sema::TypeRef* rt) {
 }
 
 // stdlib §5 (#755): the ELEMENT TypeRef of an `IGrouping<TKey, T>` receiver —
-// genericArgs[1]. `IGrouping<TKey, T> : IEnumerable<T>` (stdlib §5 line 3076),
+// genericArgs[1]. `IGrouping<TKey, T> : IEnumerable<T>` (stdlib §5's
+// `IGrouping<TKey, T>`),
 // so the §5 LINQ surface resolves on it by inheritance; but unlike every other
 // enumerable receiver the compiler recognises, its ELEMENT type is the SECOND
 // generic argument (the first is the key). Every consumer that reads
@@ -2718,8 +2719,9 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     llvm::Value* recv = lowerExpr(recvExpr);
     if (!recv) return nullptr;
     // stdlib §5 (#755): an `IGrouping<TKey, T>` source. `IGrouping : IEnumerable<T>`
-    // (stdlib §5 line 3076), so a grouping is a legal LINQ receiver and a legal
-    // `for` source (spec §29.2) — but its runtime value is a `bz_grouping_t*`,
+    // (stdlib §5's `IGrouping<TKey, T>`), so a grouping is a legal LINQ
+    // receiver and a legal `for` source (spec §29.2) — but its runtime value
+    // is a `bz_grouping_t*`,
     // not a bz_array_t*/bz_lazy_t*, so every enumerable consumer previously read
     // the grouping struct as whatever shape it expected and saw an EMPTY (or
     // garbage) sequence. Its members are a concrete, fully-materialized
@@ -3039,7 +3041,8 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     // fix #4207 (stdlib §5 / §12.9): an EXPLICITLY-NAMED
     // `IOrderedEnumerable<T>` receiver — a named local/param/field with explicit
     // type annotation, or a cross-module value. `IOrderedEnumerable<T> : IEnumerable<T>`
-    // (stdlib §5 line 3592) and the OrderBy/OrderByDescending result interface.
+    // (stdlib §5's `IOrderedEnumerable<T>`) and the OrderBy/OrderByDescending
+    // result interface.
     // Its runtime representation is the SAME `bz_lazy_t*` as the lazy sentinel
     // above — it IS a lazy enumerator, just named. Use it directly; element type
     // is at genericArgs[0].  Not isLazyEnumerableType: that predicate requires
@@ -3201,7 +3204,7 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     // fix #8370 (stdlib §4.11 / §5, v0.355): the STACK family's lazy source
     // must be built in TAKE order.
     //
-    // stdlib §4.11 "Iteration order" (v0.355, line 2489):
+    // stdlib §4.11 "Iteration order" (v0.355):
     //   "All four types iterate (via `IReadOnlyCollection<T>`) in take order —
     //    a stack top-to-bottom (pop order), a queue front-to-back (dequeue
     //    order); the owning forms iterate identically, yielding borrows."
@@ -3324,7 +3327,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // wraps its (grouping-owned) element array as a borrowing lazy ARRAY source,
     // so every operator below composes uniformly. In particular `g.ToArray()`
     // now takes the ordinary materialize path and returns a FRESH copy, as
-    // stdlib §5:3070 declares (`ToArray(): owned Array<T>`) — the #1296
+    // stdlib §5 declares (`ToArray(): owned Array<T>`) — the #1296
     // hand-rolled lowering returned the grouping's OWN array, which the caller's
     // `using var` then freed alongside bz_grouping_free (a double free, #2265).
     // Note recvTy is used ONLY in this gate; everything below reads the element
@@ -3334,7 +3337,8 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // fix #4207 (stdlib §5): an explicitly-named `IOrderedEnumerable<T>`
     // receiver (a named local/param/field with explicit type annotation, or a
     // cross-module value). `IOrderedEnumerable<T> : IEnumerable<T>` (stdlib
-    // §5 line 3592) — it is a LINQ source with the SAME `bz_lazy_t*` runtime
+    // §5's `IOrderedEnumerable<T>`) — it is a LINQ source with the SAME
+    // `bz_lazy_t*` runtime
     // representation as the lazy sentinel, and the element type is at
     // genericArgs[0].  lowerToLazyEnumerator handles it in its own arm (it is
     // NOT isLazyEnumerableType — that predicate requires declaration-less, which
@@ -3542,7 +3546,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
             llvm::Value* result = nullptr;
             if (m == "FirstOrNull" || m == "LastOrNull" ||
                 m == "ElementAtOrNull") {
-                // stdlib §5 (line 3758): "the `*OrNull` variants return
+                // stdlib §5: "the `*OrNull` variants return
                 // `null` instead" of the fault.  The result SHAPE is the
                 // array receiver's: a VALUE element type yields the tagged
                 // `{i8 hasValue; T value}` struct; a class or `string`
@@ -3593,7 +3597,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                     result = ptrPhi;
                 }
             } else {
-                // stdlib §5 (line 3758): "`First`/`Last`/`Single`/`ElementAt`
+                // stdlib §5: "`First`/`Last`/`Single`/`ElementAt`
                 // throw `InvalidOperationException` (or
                 // `IndexOutOfRangeException` for `ElementAt`) on
                 // missing-element".  The fault is emitted BEFORE the read, so
@@ -3625,11 +3629,11 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // the receiver's TAKE order — the order the `for ... in` over the very
     // same value visits it.
     //
-    // stdlib §4.11 "Iteration order" (v0.355, line 2489):
+    // stdlib §4.11 "Iteration order" (v0.355):
     //   "All four types iterate (via `IReadOnlyCollection<T>`) in take order —
     //    a stack top-to-bottom (pop order), a queue front-to-back (dequeue
     //    order); the owning forms iterate identically, yielding borrows."
-    // stdlib §5 (v0.355, line 3760) defines the predicate overloads as
+    // stdlib §5 (v0.355) defines the predicate overloads as
     //   "equivalent to the corresponding no-argument method applied after
     //    `Where(pred)` — `xs.First(pred)` is `xs.Where(pred).First()`",
     // and `First` / `Last` are defined over the receiver's ITERATION order.
@@ -3793,7 +3797,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
             llvm::Value* found = builder_.CreateLoad(i1(), foundSlot);
             llvm::Value* result = nullptr;
             if (m == "FirstOrNull" || m == "LastOrNull") {
-                // stdlib §5 (line 3758): "the `*OrNull` variants return
+                // stdlib §5: "the `*OrNull` variants return
                 // `null` instead" of the fault.  The result SHAPE is the
                 // array receiver's: a VALUE element type yields the tagged
                 // `{i8 hasValue; T value}` struct; a class or `string`
@@ -3844,7 +3848,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                     result = ptrPhi;
                 }
             } else {
-                // stdlib §5 (line 3760): "`First(pred)`/`Last(pred)` …
+                // stdlib §5: "`First(pred)`/`Last(pred)` …
                 // throw `InvalidOperationException` when no element matches".
                 // The fault is emitted AFTER the scan, so the match (or the
                 // absence of one) is known.

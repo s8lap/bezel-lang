@@ -73,7 +73,7 @@ struct StdlibLinqOverload {
 };
 
 inline constexpr StdlibLinqOverload kStdlibLinqOverloads[] = {
-    // Main `extension IEnumerable<T>` block (stdlib §5 line 3497)
+    // Main `extension IEnumerable<T>` block (stdlib §5)
     // Filtering
     // fix #3559: `OfType` was removed from stdlib §5 at v0.284, so it is no
     // longer a row of the table this list mirrors.
@@ -113,7 +113,7 @@ inline constexpr StdlibLinqOverload kStdlibLinqOverloads[] = {
     // Materialization
     {"ToArray", 0, ""}, {"ToDictionary", 1, ""}, {"ToDictionary", 2, ""},
 
-    // `extension IEnumerable<T> where T: hashable` block (stdlib §5 line 3585)
+    // `extension IEnumerable<T> where T: hashable` block (stdlib §5)
     {"Contains", 1, "where T: hashable"},
     {"Distinct", 0, "where T: hashable"},
     {"Union", 1, "where T: hashable"}, {"Intersect", 1, "where T: hashable"},

@@ -6806,7 +6806,7 @@ static bool isCapacityPrimitive(sema::PrimitiveType p) {
 // implementation of `OwningDictionary<K, V>` declares `private _comparer:
 // IEqualityComparer<K>;` — an unmarked, i.e. BORROWING, field held for exactly
 // that lifetime — and calls `_comparer.Equals(...)` from inside `Add`
-// (Bezel_Standard_Library.md:2040 and :2057/:2083), and spec §9.7 confirms a
+// (stdlib §4.9's `OwningDictionary<K, V>`), and spec §9.7 confirms a
 // direct class-typed borrow field is a supported, statically checked construct.
 // The borrow reading is therefore already modelled normatively; implement it
 // rather than seeking a new ruling or proposing a stdlib amendment.
