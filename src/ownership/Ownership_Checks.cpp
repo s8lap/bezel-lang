@@ -17283,9 +17283,12 @@ bool MethodOwnership::usingPinTypeHoldsBorrow(const sema::TypeRef* t) const {
         case sema::TypeRef::Kind::Function:
             return false;  // runtime-managed, §28.9
         case sema::TypeRef::Kind::InlineArray:
-            // `[N owned]T` owns its slots; `[N]T` holds a borrow per slot
-            // when a slot's type does (§15.1.2).
-            return !t->arrayOwned && usingPinTypeHoldsBorrow(t->arrayElement);
+            // `[N owned]T` owns its slots and is a move-only value (§15.3),
+            // so a field read of it is a borrow of the field's storage and
+            // pins like a class field (fix #8454, §28.10, v0.357);
+            // `[N]T` holds a borrow per slot when a slot's type does
+            // (§15.1.2).
+            return t->arrayOwned || usingPinTypeHoldsBorrow(t->arrayElement);
         case sema::TypeRef::Kind::Named:
             break;
     }
