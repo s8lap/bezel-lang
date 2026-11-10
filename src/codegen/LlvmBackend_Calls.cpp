@@ -5607,16 +5607,31 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                 isDecimalSum = true;
             }
             if (isDecimalSum) {
-                // fix #686: detect nullable-decimal elements (Array<decimal?>).
-                // elemTy for decimal? is {i8, bz.decimal} (not decTy itself).
-                // We must load the full {i8,decimal} struct from the element slot
-                // and pass it to the closure with the correct ABI, not truncate to
-                // decTy (which misreads the 17-byte slot as 16 bytes).
-                auto* nullDecTy = nullablePrimStructTy(sema::PrimitiveType::Decimal);
-                bool isNullableDecElem = (elemTy == nullDecTy);
-                // Actual load type for element: {i8,decimal} for decimal?, decimal for decimal.
-                llvm::Type* loadTy = isNullableDecElem ? static_cast<llvm::Type*>(nullDecTy)
-                                                       : static_cast<llvm::Type*>(decTy);
+                // fix #8388 (stdlib §5, v0.355): the element this fold
+                // accumulates is the RECEIVER'S element, at the ELEMENT's own
+                // LLVM type — NOT the selector's result type. The pre-fix code
+                // loaded the element as the DECIMAL struct (the no-selector
+                // form's shape) and called the closure with a decimal-shaped
+                // argument, so for any element that is not a `decimal` the
+                // callee received a TRUNCATED element where it expected the
+                // whole one (a record's `decimal` field read out of the
+                // element's first 16 bytes, the rest of the record read off
+                // the stack) and the projected value was garbage: over
+                // [Item(2, 1.50m), Item(1, 4.00m)] the fold
+                // `items.Sum(lambda(i) => i.Qty * i.Price)` returned 34 for the
+                // correct 7, and `items.Sum(lambda(i) => i.Price)` returned 0
+                // for the correct 5.5. The ELEMENT's own type is what both
+                // the load and the call need — the same discipline the
+                // `Min`/`Max` decimal-selector arm uses (fix #8108) and the
+                // same discipline the generic selector arm uses (`callClosure`,
+                // which derives the call's parameter type from the loaded
+                // element). For the two element types this arm was written for,
+                // `elemTy` IS the old `loadTy`: `decimal` -> `%bz.decimal`,
+                // `decimal?` -> `{i8,%bz.decimal}` — so fix #686's
+                // nullable-decimal width is kept (the element is loaded at the
+                // full {i8,decimal} width, never truncated to `decTy`), and the
+                // no-selector form (the element IS the decimal) is unchanged.
+                llvm::Type* loadTy = elemTy;
 
                 // Lower selector with decimal return TypeRef so unannotated lambdas
                 // get the right param hint.
@@ -5651,21 +5666,25 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.SetInsertPoint(bodyBB);
                 auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
                 llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
-                // fix #686: load element at the correct width.
-                // For decimal?: load full {i8,decimal} struct (NOT just decTy).
-                // For decimal:  load decTy directly (as before).
+                // fix #686 / #8388: load the element at its own width —
+                // `decimal?` -> the full {i8,decimal} struct (NOT just decTy),
+                // `decimal` -> decTy, any other element -> its own type.
                 llvm::Value* el = builder_.CreateLoad(loadTy, ep);
                 // Apply selector if present.
-                // fix #686: closure ABI uses loadTy (element's actual LLVM type)
-                // as the param type; return type is always decTy.
+                // fix #686 / #8388: closure ABI uses loadTy (the ELEMENT's
+                // actual LLVM type) as the param type; return type is always
+                // decTy.
                 llvm::Value* val = el;
                 if (closure) {
                     llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closure, "cl.fn");
                     llvm::Value* envSlot = builder_.CreateGEP(ptrTy(), closure,
                                                               {builder_.getInt32(1)});
                     llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "cl.env");
-                    // fix #686: param type is loadTy (decimal? → {i8,decimal};
-                    // decimal → decTy). The selector returns decimal (decTy).
+                    // fix #8388: param type is the ELEMENT (decimal? → {i8,decimal};
+                    // decimal → decTy; a record → its own struct type) — the type
+                    // the closure's parameter really has, so the call matches
+                    // the closure the lambda was lowered with. The selector
+                    // returns decimal (decTy).
                     auto* fnTy = llvm::FunctionType::get(decTy, {ptrTy(), loadTy}, false);
                     val = builder_.CreateCall(fnTy, fnPtr, {envPtr, el}, "cl.dec");
                 }
