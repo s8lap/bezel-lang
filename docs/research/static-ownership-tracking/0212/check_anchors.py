@@ -55,6 +55,7 @@ ANCHORS = [
     ("8.11 Guide 01 §5 bullet",       "S3", G1,   "- **Back-references are not `owned`.**", None),
     ("8.11 Guide 01 §5 paragraphs",   "S3", G1,   "**The back-reference's guarantee is yours — unless you say `scoped`.**", "never returned or stored in another object (spec §28.14)."),
     ("8.11 Guide 05 §1 insertion",    "S3", G5,   "**Dictionaries in practice.**", "checked against the dictionary at every call as `Add`'s arguments are (spec §28.11)."),
+    ("8.13 §31.1 thrown instance",    "S3", SPEC, "A borrowing (non-`owned`) class-typed field *inside* a thrown instance follows", None),
     ("8.12 code-gen §4.4",            "S3", CG,   "- A borrow of a **scope-bound local** may not be stored in a field or in a longer-lived collection.", "so it is scope-bound — §28.3)."),
 ]
 
