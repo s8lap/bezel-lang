@@ -15231,19 +15231,101 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
             }
         }
     }
-    if (!enumTs) return src;
+
+    // fix #8292 / §29.2 / §29.11 / §11.2 (v0.355): THE YIELD-GENERATOR
+    // ENUMERATOR — the enumerator class the structural scan CANNOT see.
+    //
+    // A `yield`-bearing `GetEnumerator` returns a COMPILER-GENERATED state
+    // machine object (LlvmBackend_Iterators.cpp's `emitIteratorMethod`): a
+    // heap frame whose word 0 is the §29.11 ITERATOR vtable ([0]=td (self-
+    // referencing), [1]=Dispose, [2]=MoveNext, [3]=Current, [4]=GetEnumerator).
+    // There is NO user TypeSymbol for it — it is declared nowhere — so the
+    // structural MoveNext+Current scan above (which walks `cand->members` and
+    // is gated on `methodFns_.count(ms)`) cannot find it, `enumTs` stays
+    // null, and the decline below handed the RAW user-class instance to the
+    // `IEnumerable<T>` consumer. That consumer dispatches vtable slot 4
+    // (`GetEnumerator`) on it — and a user class's own class vtable has NO
+    // slot 4 for it — so the call went to a NULL function pointer and the
+    // program SEGV'd on the zero page. MEASURED on the issue's repro
+    // (`Where(..).ToArray()` over a user yield-enumerator class viewed as
+    // `IEnumerable<string>`): `call ptr %27(ptr %24)` with `%27` = the null
+    // slot-4 word of the raw class's vtable; ASan: "SEGV on unknown address
+    // 0x000000000000 ... pc points to the zero page".
+    //
+    // THE REPAIR. The enumerator IS discoverable — by a different signal. The
+    // source's `GetEnumerator` is a YIELD GENERATOR, so the object it returns
+    // is in §29.11's iterator-vtable format BY CONSTRUCTION. The wrapper is
+    // then minted with the `$ad` family ONLY — the family #6343 introduced for
+    // the DELEGATING `GetEnumerator`, which drives the inner enumerator
+    // through ITS OWN vtable (slot 2 = MoveNext, slot 3 = Current, slot 1 =
+    // Dispose) and needs no enumerator CLASS at all.
+    //
+    // THE STATIC SIGNAL IS DELIBERATELY NARROW. Each clause below is a
+    // necessary condition of "the object this GetEnumerator returns is an
+    // §29.11 iterator-format value":
+    //   (a) the declared return type is the builtin, NON-owning
+    //       `IEnumerator<T>` — the only spelling §11.2/§12.1's member
+    //       matching admits for an `IEnumerable<T>` implementation, and the
+    //       non-owning one (the owning heads put `TakeCurrent` at slot 3
+    //       instead of `Current`, §29.1);
+    //   (b) the body is a BLOCK that YIELDS — the very predicate
+    //       `emitIteratorMethod` is routed by (LlvmBackend_Calls2.cpp's
+    //       `containsYield(*ci.stmts)`);
+    //   (c) the method is NOT `async` — an async iterator's runtime object
+    //       has a DIFFERENT vtable (§30.7);
+    //   (d) the method is not DISPATCHED (`virtual` / `override` without
+    //       `sealed`) — §12.1: a dispatched member's body is not the body
+    //       that runs, so the inspection below would not describe the
+    //       runtime object.
+    //
+    // The RUN-TIME half is §29.11's own identity test, the one the `$ad`
+    // family already uses (`isIterVtableSelfReferenced`: an iterator vtable
+    // self-references in slot 0, a class vtable carries its type descriptor
+    // there). If the inner object is NOT in that format the wrapper is not
+    // used and the raw source is returned — the pre-#8292 behaviour, no worse.
+    bool enumIsYieldGenerator = false;
+    if (!enumTs) {
+        enumIsYieldGenerator = [&]() -> bool {
+            if (!enumTyRef || enumTyRef->kind != sema::TypeRef::Kind::Named)
+                return false;
+            if (enumTyRef->headName() != "IEnumerator") return false;
+            auto* md = dynamic_cast<const ast::MethodDecl*>(getEnumSym->decl);
+            if (!md) return false;
+            if (md->bodyKind != ast::MethodBodyKind::Block) return false;
+            if (!containsYield(md->stmts)) return false;
+            if (isAsyncMethod(getEnumSym)) return false;
+            bool dispatched = false, sealedMod = false;
+            for (auto mod : md->modifiers) {
+                if (mod == "virtual" || mod == "override" || mod == "abstract")
+                    dispatched = true;
+                if (mod == "sealed") sealedMod = true;
+            }
+            if (dispatched && !sealedMod) return false;
+            return true;
+        }();
+    }
+    if (!enumTs && !enumIsYieldGenerator) return src;
 
     // 3. Find MoveNext, Current, and Dispose on the enumerator class.
-    sema::MethodSymbol* moveNextSym = findMethodByName(enumTs, "MoveNext");
-    if (!moveNextSym) return src;
-    auto mnIt = methodFns_.find(moveNextSym);
-    if (mnIt == methodFns_.end()) return src;
-    llvm::Function* moveNextFn = mnIt->second;
-
-    sema::MethodSymbol* currentMethodSym = findMethodByName(enumTs, "Current");
+    //
+    // fix #8292: in the YIELD-GENERATOR case there IS no enumerator class
+    // (the enumerator is the compiler-generated state machine), so there is
+    // nothing to look up: the `$ad` family below reads MoveNext / Current /
+    // Dispose off the inner object's own §29.11 vtable instead.
+    llvm::Function* moveNextFn = nullptr;
+    sema::MethodSymbol* currentMethodSym = nullptr;
     sema::PropertySymbol* currentPropSym = nullptr;
-    if (!currentMethodSym)
-        currentPropSym = classPropertyByName(enumTs, "Current");
+    if (enumTs) {
+        sema::MethodSymbol* moveNextSym = findMethodByName(enumTs, "MoveNext");
+        if (!moveNextSym) return src;
+        auto mnIt = methodFns_.find(moveNextSym);
+        if (mnIt == methodFns_.end()) return src;
+        moveNextFn = mnIt->second;
+
+        currentMethodSym = findMethodByName(enumTs, "Current");
+        if (!currentMethodSym)
+            currentPropSym = classPropertyByName(enumTs, "Current");
+    }
 
     // 4. Resolve element type.
     llvm::Type* elemTy = ptrTy();
@@ -15324,11 +15406,14 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
             if (curIt != importedPropGetterFns_.end()) currentFn = curIt->second;
         }
     }
-    if (!currentFn) return src;
+    // fix #8292: the yield-generator case has no `Current` METHOD/PROPERTY to
+    // resolve (the element is read off the inner object's own vtable, slot 3),
+    // so the decline below is not taken for it.
+    if (!currentFn && enumTs) return src;
 
     // 6. Resolve the Dispose function pointer (optional; use no-op if absent).
     llvm::Function* enumDisposeFn = nullptr;
-    {
+    if (enumTs) {
         auto dIt = disposerFns_.find(enumTs);
         if (dIt != disposerFns_.end()) enumDisposeFn = dIt->second;
     }
@@ -15360,7 +15445,15 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     // enumerator) pair its own generated functions, closing that hazard; the
     // common case (one source class per enumerator class) is unaffected since
     // the pair is still unique and the cache still hits on every repeat wrap.
-    std::string key = std::string(srcTs->name) + "$" + std::string(enumTs->name);
+    //
+    // fix #8292: the YIELD-GENERATOR case has no enumerator class to name, so
+    // the pair's second half is the fixed marker "yieldgen" — one per SOURCE
+    // class (a class has exactly one `GetEnumerator`, and its generator is
+    // that method's own state machine), so the key stays unique per source
+    // class exactly as the class-pair key does.
+    std::string key = std::string(srcTs->name) + "$" +
+                      (enumTs ? std::string(enumTs->name)
+                              : std::string("yieldgen"));
     std::string stName = "userenumenum." + key;
     auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
     if (!stTy)
@@ -15456,7 +15549,14 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     // distinct enumerator class instance.
     bool srcIsOwnEnumerator = (srcTs == enumTs);
 
-    llvm::Function* wrapDisposeFn = getOrCreate(prefix + "Dispose",
+    // fix #8292: the DIRECT family — the resolved enumerator class's OWN
+    // MoveNext / Current / Dispose — exists only when an enumerator CLASS was
+    // resolved. The YIELD-GENERATOR case has none (its enumerator is the
+    // compiler-generated state machine, driven through its own vtable), so
+    // only the `$ad` family below is built there and only the `$ad` vtable is
+    // created (step 8) and installed (step 10).
+    llvm::Function* wrapDisposeFn = nullptr;
+    if (enumTs) wrapDisposeFn = getOrCreate(prefix + "Dispose",
         llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
         [&](llvm::Function* f) {
             auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
@@ -15623,7 +15723,9 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
         });
 
     // MoveNext: call enum.MoveNext() and return bool.
-    llvm::Function* wrapMoveNextFn = getOrCreate(prefix + "MoveNext",
+    // fix #8292: DIRECT family only (see the note at `wrapDisposeFn`).
+    llvm::Function* wrapMoveNextFn = nullptr;
+    if (enumTs) wrapMoveNextFn = getOrCreate(prefix + "MoveNext",
         llvm::FunctionType::get(i1(), {ptrTy()}, false),
         [&](llvm::Function* f) {
             auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
@@ -15640,7 +15742,9 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
         });
 
     // Current: call enum.Current getter and return T.
-    llvm::Function* wrapCurrentFn = getOrCreate(prefix + "Current",
+    // fix #8292: DIRECT family only (see the note at `wrapDisposeFn`).
+    llvm::Function* wrapCurrentFn = nullptr;
+    if (enumTs) wrapCurrentFn = getOrCreate(prefix + "Current",
         llvm::FunctionType::get(elemTy, {ptrTy()}, false),
         [&](llvm::Function* f) {
             auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
@@ -15886,8 +15990,13 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     std::string vtName = prefix + "vtable";
     // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
     // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
-    auto* vtGV = module_->getNamedGlobal(vtName);
-    if (!vtGV) {
+    //
+    // fix #8292: the DIRECT family's vtable exists only when an enumerator
+    // class was resolved (see the note at `wrapDisposeFn`). In the
+    // YIELD-GENERATOR case it is not created at all — the `$ad` vtable below
+    // is the one the wrapper installs.
+    auto* vtGV = enumTs ? module_->getNamedGlobal(vtName) : nullptr;
+    if (enumTs && !vtGV) {
         auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
             llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: filled below
@@ -16034,13 +16143,28 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
     llvm::Value* wrap = builder_.CreateCall(callocFn2,
         {builder_.getInt64(1), builder_.getInt64(stSz)}, "userenumenum");
-    builder_.CreateStore(
-        useAdFamily
-            ? builder_.CreateSelect(useAdFamily,
-                                   static_cast<llvm::Value*>(vtAdGV),
-                                   static_cast<llvm::Value*>(vtGV))
-            : static_cast<llvm::Value*>(vtGV),
-        builder_.CreateStructGEP(stTy, wrap, 0));
+    // fix #8292: the vtable INSTALLED on the wrapper.
+    //
+    // With an enumerator class resolved, the choice is the per-instance
+    // identity test above: the `$ad` family when the fetched enumerator is
+    // already in §29.11 iterator-vtable format, the direct family otherwise.
+    //
+    // In the YIELD-GENERATOR case there is no direct family (no enumerator
+    // class, so no static MoveNext / Current to call): the fetched enumerator
+    // IS the compiler-generated state machine, whose vtable is the §29.11
+    // iterator vtable by construction — the identity test above reads TRUE
+    // for it — so the `$ad` family is the correct one, and it is installed
+    // unconditionally.
+    llvm::Value* wrapperVtable = nullptr;
+    if (vtGV) {
+        wrapperVtable = builder_.CreateSelect(useAdFamily,
+            static_cast<llvm::Value*>(vtAdGV),
+            static_cast<llvm::Value*>(vtGV));
+    } else {
+        wrapperVtable = static_cast<llvm::Value*>(vtAdGV);
+    }
+    builder_.CreateStore(wrapperVtable,
+                         builder_.CreateStructGEP(stTy, wrap, 0));
     builder_.CreateStore(enumPtr, builder_.CreateStructGEP(stTy, wrap, 1));
     builder_.CreateStore(src, builder_.CreateStructGEP(stTy, wrap, 2));
     // fix #2424: only THIS original instance's `ownsSrc` reflects the
@@ -16048,6 +16172,17 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     // later mints (wrapGetEnumFn) hardcodes `false` regardless (see above).
     builder_.CreateStore(ownsSrc ? builder_.getTrue() : builder_.getFalse(),
                           builder_.CreateStructGEP(stTy, wrap, 3));
+    // fix #8292: the `$ad` family is correct only for an inner value that
+    // really is in §29.11 iterator-vtable format, and the identity test above
+    // answers that at RUN time. When it says "no", the RAW SOURCE is returned
+    // instead — the pre-#8292 behaviour, in which the consumer's slot-4
+    // dispatch then faults — so a value that is somehow not in that format is
+    // never driven through a vtable that carries no MoveNext / Current. The
+    // select keeps the single-value contract of this function (no CFG change
+    // in the caller); the eagerly fetched enumerator and the wrapper struct
+    // are then unreachable, which is the price of that belt-and-braces arm.
+    if (!vtGV)
+        return builder_.CreateSelect(useAdFamily, wrap, src);
     return wrap;
 }
 
