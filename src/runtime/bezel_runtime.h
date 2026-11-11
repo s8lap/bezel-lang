@@ -1335,8 +1335,17 @@ void* bz_lazy_select(void* up, int64_t out_elem_size,
 void* bz_lazy_take(void* up, int64_t n);
 void* bz_lazy_skip(void* up, int64_t n);
 void* bz_lazy_distinct(void* up, void* eqfn);                        // eqfn: i32(a, b) (null = raw bytes)
-void* bz_lazy_orderby(void* up, void* closure, void* keyfn,
-                      int32_t descending);                           // keyfn: i64(closure, elem)
+// stdlib §5 Ordering (#8384): OrderBy / OrderByDescending, and ThenBy /
+// ThenByDescending on an ordered sequence. keysel: void(closure, elem, out)
+// writes the element's key (key_size bytes); cmp: i32(a, b) is the key type's
+// CompareTo over two key slots; drop: void(key) releases one key slot (null
+// when the key holds no reference).
+void* bz_lazy_orderby_key(void* up, void* closure, void* keysel,
+                          int64_t key_size, void* cmp, void* drop,
+                          int32_t descending);
+void* bz_lazy_thenby_key(void* up, void* closure, void* keysel,
+                         int64_t key_size, void* cmp, void* drop,
+                         int32_t descending);
 // stdlib §5 Combination: Concat appends `down` after `up` (both lazy enumerators).
 void* bz_lazy_concat(void* up, void* down);
 // stdlib §5 Slicing: TakeWhile/SkipWhile gate by a predicate trampoline.

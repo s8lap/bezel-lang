@@ -3124,7 +3124,27 @@ void* bz_array_enum_alloc(void* arr, int64_t elem_size) {
 
 typedef int32_t (*bz_pred_fn)(void* closure, const void* elem);
 typedef void    (*bz_sel_fn)(void* closure, const void* elem, void* out);
-typedef int64_t (*bz_key_fn)(void* closure, const void* elem);
+// stdlib §5 Ordering (#8384): the two trampolines an ordered sequence ranks a
+// key by. `bz_keycmp_fn` is the key type's own `IComparable<TKey>.CompareTo`
+// over two KEY SLOTS (negative / zero / positive, stdlib §2.8); `bz_keydrop_fn`
+// releases the reference one key slot holds (a `string` key — the key
+// function's result is a +1 the sort owns, §28.9), and is null for a key that
+// carries none.
+typedef int32_t (*bz_keycmp_fn)(const void* a, const void* b);
+typedef void    (*bz_keydrop_fn)(void* key);
+// One sort key of an ordered sequence (`OrderBy` contributes the first,
+// each `ThenBy` one more). The key function is the SELECTOR shape
+// (`bz_sel_fn`): it writes the key's own `ksz` bytes, so a key of any type
+// stdlib §5 admits (`where TKey: IComparable<TKey>`) is carried at its own
+// width instead of being squeezed through an `int64_t`.
+struct bz_order_level_t {
+    void*         closure;  // key closure (a BORROW: the node that introduced it owns it)
+    bz_sel_fn     keysel;   // void(closure, elem, out): writes the key's ksz bytes
+    int64_t       ksz;      // key size in bytes
+    bz_keycmp_fn  cmp;      // CompareTo over two key slots
+    bz_keydrop_fn drop;     // release one key slot (null = nothing to release)
+    int32_t       desc;     // OrderByDescending / ThenByDescending
+};
 // Element equality trampoline (Distinct): content-aware comparison the runtime
 // cannot do over type-erased bytes (e.g. string content equality vs. raw bytes).
 typedef int32_t (*bz_eq_fn)(const void* a, const void* b);
@@ -3181,12 +3201,10 @@ struct bz_lazy_t {
     void*   closure;
     bz_pred_fn pred;
     bz_sel_fn  sel;
-    bz_key_fn  keyfn;
     bz_eq_fn   eqfn;    // DISTINCT/UNION/INTERSECT/EXCEPT: element equality
     bz_hash_fn hashfn;  // UNION/INTERSECT/EXCEPT: element hash (membership dict)
     bz_flatsel_fn flatsel;  // SELECTMANY: element -> inner lazy enumerator
     bz_comb_fn comb;        // ZIP: (a, b) -> out
-    int32_t descending; // ORDERBY/THENBY primary direction
     int64_t up_esz;     // ZIP: byte stride of the `up`/left element
     int64_t down_esz;   // ZIP: byte stride of the `down`/right element
     // Scratch storage for the current element bytes (Current returns cur).
@@ -3209,11 +3227,16 @@ struct bz_lazy_t {
     // variable/field is a BORROW (own_closure stays 0 from calloc) and is never
     // freed here. Mirrors the GetOrAdd factoryIsInlineLambda guard.
     int32_t own_closure;
-    // THENBY secondary sort key:
-    void*      closure2;   // secondary key closure (THENBY)
-    bz_key_fn  keyfn2;    // secondary key trampoline (THENBY)
-    int32_t    descending2; // secondary descending flag (THENBY)
-    int32_t    own_closure2; // secondary closure ownership (THENBY)
+    // THENBY: the key closure this node introduced, and whether it owns it.
+    void*      closure2;   // this ThenBy's key closure
+    int32_t    own_closure2; // its ownership (same convention as own_closure)
+    // ORDERBY/THENBY (#8384): the sort keys, most significant first. An
+    // ORDERBY node has one; a THENBY node has its upstream's levels followed
+    // by its own. malloc'd, freed at dispose; the closures inside are borrows
+    // (each is owned by the node that introduced it, which this node keeps
+    // alive through `up`).
+    bz_order_level_t* levels;
+    int32_t           nlevels;
     // UNION phase-1 iteration: pointer to the `down`-side key array snapshot.
     // Built from the `sorted` (other_dict) when `up` is exhausted.
     void**  other_keys;   // malloc'd array of element pointers for UNION phase 1
@@ -3365,6 +3388,7 @@ static void    bz_lazy_dispose(bz_lazy_t* e) {
     if (e->own_closure && e->closure) bz_closure_release(e->closure);
     // THENBY secondary closure release (same ownership convention).
     if (e->own_closure2 && e->closure2) bz_closure_release(e->closure2);
+    free(e->levels);  // ORDERBY/THENBY sort keys (the closures are borrows)
     free(e);
 }
 
@@ -3479,7 +3503,7 @@ extern "C" void* bz_lazy_own_closure(void* lazy) {
 
 // stdlib §5 Ordering: ThenBy secondary-closure ownership. Mirrors
 // bz_lazy_own_closure for the secondary sort key closure stored in closure2.
-// Called by codegen immediately after bz_lazy_thenby when the secondary key
+// Called by codegen immediately after bz_lazy_thenby_key when the secondary key
 // argument was an inline lambda literal (own_closure2 := 1 → released at
 // bz_lazy_dispose). Returns the enumerator for inline threading. Null-safe.
 extern "C" void* bz_lazy_own_closure2(void* lazy) {
@@ -3735,14 +3759,25 @@ extern "C" void* bz_lazy_distinct(void* up, void* eqfn) {
     return e;
 }
 
-extern "C" void* bz_lazy_orderby(void* up, void* closure, void* keyfn,
-                                 int32_t descending) {
+// stdlib §5 Ordering (#8384): OrderBy / OrderByDescending. `keysel` writes the
+// element's key (`ksz` bytes) into a key slot, `cmp` is the key type's
+// `CompareTo` over two key slots and `drop` (nullable) releases one key slot.
+// The sort itself runs at the first MoveNext (bz_lazy_ordered_materialize).
+extern "C" void* bz_lazy_orderby_key(void* up, void* closure, void* keysel,
+                                     int64_t ksz, void* cmp, void* drop,
+                                     int32_t descending) {
     auto* u = (bz_lazy_t*)up;
     auto* e = bz_lazy_new(BZ_LAZY_ORDERBY, u->esz);
     e->up = u;
     e->closure = closure;
-    e->keyfn = (bz_key_fn)keyfn;
-    e->descending = descending;
+    e->levels = (bz_order_level_t*)calloc(1, sizeof(bz_order_level_t));
+    e->nlevels = 1;
+    e->levels[0].closure = closure;
+    e->levels[0].keysel = (bz_sel_fn)keysel;
+    e->levels[0].ksz = ksz;
+    e->levels[0].cmp = (bz_keycmp_fn)cmp;
+    e->levels[0].drop = (bz_keydrop_fn)drop;
+    e->levels[0].desc = descending;
     return e;
 }
 
@@ -3872,24 +3907,33 @@ extern "C" void* bz_lazy_except(void* up, void* down, void* hashfn, void* eqfn) 
     return e;
 }
 
-// stdlib §5 Ordering: ThenBy / ThenByDescending — secondary sort key applied
-// to the already-sorted output of an upstream OrderBy. On first MoveNext,
-// materializes all upstream elements and stable-sorts by (primary_key, secondary_key)
-// composite, accessing the primary key by reaching into the upstream ORDERBY node.
-extern "C" void* bz_lazy_thenby(void* up, void* closure2, void* keyfn2,
-                                int32_t descending2) {
+// stdlib §5 Ordering: ThenBy / ThenByDescending — one more sort key on an
+// ordered sequence. The node's keys are its upstream's (the OrderBy's, and
+// every earlier ThenBy's) followed by its own, so a chain of any length ranks
+// by ALL of its keys in the order they were written (#8384: the previous
+// two-slot form kept only the first and the last key of a three-key chain).
+// An upstream that is not an ordered node contributes no key.
+extern "C" void* bz_lazy_thenby_key(void* up, void* closure2, void* keysel2,
+                                    int64_t ksz2, void* cmp2, void* drop2,
+                                    int32_t descending2) {
     auto* u = (bz_lazy_t*)up;
     auto* e = bz_lazy_new(BZ_LAZY_THENBY, u->esz);
     e->up = u;
-    // Copy the primary key from the upstream ORDERBY/THENBY node so the
-    // composite sort can apply it without re-visiting the chain structure.
-    e->closure   = u->closure;    // primary closure (BORROW, not owned)
-    e->keyfn     = u->keyfn;      // primary key trampoline
-    e->descending = u->descending; // primary direction
-    // Secondary key:
-    e->closure2   = closure2;
-    e->keyfn2     = (bz_key_fn)keyfn2;
-    e->descending2 = descending2;
+    e->closure2 = closure2;
+    int32_t un = (u->kind == BZ_LAZY_ORDERBY || u->kind == BZ_LAZY_THENBY)
+                     ? u->nlevels : 0;
+    e->levels = (bz_order_level_t*)calloc((size_t)un + 1,
+                                          sizeof(bz_order_level_t));
+    if (un > 0)
+        memcpy(e->levels, u->levels, (size_t)un * sizeof(bz_order_level_t));
+    e->nlevels = un + 1;
+    bz_order_level_t* lv = &e->levels[un];
+    lv->closure = closure2;
+    lv->keysel = (bz_sel_fn)keysel2;
+    lv->ksz = ksz2;
+    lv->cmp = (bz_keycmp_fn)cmp2;
+    lv->drop = (bz_keydrop_fn)drop2;
+    lv->desc = descending2;
     return e;
 }
 
@@ -3902,34 +3946,127 @@ extern "C" void* bz_lazy_reverse(void* up) {
     return e;
 }
 
-// ORDERBY: drain upstream into a snapshot, then stable-sort by the int64 key.
-static void bz_lazy_orderby_materialize(bz_lazy_t* e) {
+// stdlib §5 Ordering (#8384): rank two elements (by index) of an ordered
+// sequence over ALL of its keys, most significant first. `keys[l]` is level
+// l's key buffer (one `ksz`-byte slot per element). A descending level
+// reverses the SIGN of its `CompareTo`, never the tie rule, so equal keys
+// stay in source order in both directions (stdlib §4.4 *Sorting contract*
+// (1)). Once an exception is pending (a key's `CompareTo` raised) no further
+// user code is called: every later pair ranks equal, the sort runs to its end
+// as an ordinary permutation, and the caller sees the exception.
+static int bz_lazy_order_compare(const bz_lazy_t* e, char* const* keys,
+                                 int64_t a, int64_t b) {
+    for (int32_t l = 0; l < e->nlevels; ++l) {
+        if (bz_exc) return 0;
+        const bz_order_level_t* lv = &e->levels[l];
+        int32_t c = lv->cmp(keys[l] + a * lv->ksz, keys[l] + b * lv->ksz);
+        if (c == 0) continue;
+        int sign = c < 0 ? -1 : 1;
+        return lv->desc ? -sign : sign;
+    }
+    return 0;
+}
+
+// ORDERBY / THENBY: drain the source into a snapshot, evaluate every key ONCE
+// per element, then stable-sort the snapshot by the keys' own `CompareTo`
+// (stdlib §5: `where TKey: IComparable<TKey>`; stdlib §4.4 *Sorting
+// contract* (1): the four ordering operators are stable).
+//
+// The sort is a bottom-up merge over an index permutation: bounded by
+// construction, so an inconsistent `CompareTo` yields "an unspecified
+// permutation of the original elements — memory-safe, no element lost or
+// duplicated" (*Sorting contract* (2)), which an unguarded insertion would
+// not.
+static void bz_lazy_ordered_materialize(bz_lazy_t* e) {
+    // A ThenBy chain sorts ONCE, from the sequence its OrderBy was given: a
+    // stable sort of that sequence by (k1, …, kn) is the order the chain
+    // denotes, so the chain's own upstream nodes — every earlier ThenBy and
+    // the OrderBy that started it, whose keys this node's `levels` already
+    // carry — need not each sort (and each key function runs once per
+    // element, not once per node). The walk stops AT that OrderBy's input:
+    // an ordered sequence feeding a fresh `OrderBy` (`xs.OrderBy(a).OrderBy(b)`)
+    // is an ordinary source whose order the new sort's ties must keep (stdlib
+    // §4.4 *Sorting contract* (1)), so an OrderBy node always drains its own
+    // upstream. An upstream that has already been enumerated is drained as it
+    // stands.
+    bz_lazy_t* src = e->up;
+    if (e->kind == BZ_LAZY_THENBY) {
+        while (src && (src->kind == BZ_LAZY_ORDERBY || src->kind == BZ_LAZY_THENBY) &&
+               src->levels && !src->materialized && src->up) {
+            const bool chainHead = src->kind == BZ_LAZY_ORDERBY;
+            src = src->up;
+            if (chainHead) break;
+        }
+    }
     e->sorted = bz_array_alloc(e->esz, 8);
     const void* p;
-    while ((p = bz_lazy_up_next(e->up)) != nullptr)
+    while ((p = bz_lazy_up_next(src)) != nullptr)
         bz_array_add(e->sorted, p, e->esz);
     auto* arr = (bz_array_t*)e->sorted;
     int64_t cnt = arr->count;
-    // Stable insertion sort by int64 key (matches the spec's stable-ordering
-    // guarantee for OrderBy; n is small in test scenarios).
-    void* tmp = malloc((size_t)e->esz);
-    for (int64_t i = 1; i < cnt; ++i) {
-        memcpy(tmp, (char*)arr->data + i * e->esz, (size_t)e->esz);
-        int64_t key_i = e->keyfn(e->closure, tmp);
-        int64_t j = i - 1;
-        while (j >= 0) {
-            int64_t key_j = e->keyfn(e->closure, (char*)arr->data + j * e->esz);
-            int shift = e->descending ? (key_j < key_i) : (key_j > key_i);
-            if (!shift) break;
-            memcpy((char*)arr->data + (j + 1) * e->esz,
-                   (char*)arr->data + j * e->esz, (size_t)e->esz);
-            --j;
-        }
-        memcpy((char*)arr->data + (j + 1) * e->esz, tmp, (size_t)e->esz);
-    }
-    free(tmp);
     e->idx = 0;
     e->materialized = 1;
+    if (cnt < 2 || e->nlevels <= 0 || bz_exc) return;
+
+    // Evaluate the keys. A key function that raises leaves its slot zeroed
+    // (never a half-written reference for `drop` to release) and ends the
+    // evaluation; the elements then stay in source order.
+    char** keys = (char**)calloc((size_t)e->nlevels, sizeof(char*));
+    bool ok = true;
+    for (int32_t l = 0; l < e->nlevels && ok; ++l) {
+        const bz_order_level_t* lv = &e->levels[l];
+        size_t ksz = (size_t)lv->ksz;
+        keys[l] = (char*)calloc((size_t)cnt, ksz ? ksz : 1);
+        for (int64_t i = 0; i < cnt; ++i) {
+            char* slot = keys[l] + i * lv->ksz;
+            lv->keysel(lv->closure, (char*)arr->data + i * e->esz, slot);
+            if (bz_exc) {
+                memset(slot, 0, ksz);
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    if (ok) {
+        auto* idx = (int64_t*)malloc((size_t)cnt * sizeof(int64_t));
+        auto* tmp = (int64_t*)malloc((size_t)cnt * sizeof(int64_t));
+        for (int64_t i = 0; i < cnt; ++i) idx[i] = i;
+        for (int64_t w = 1; w < cnt; w *= 2) {
+            for (int64_t lo = 0; lo < cnt; lo += 2 * w) {
+                int64_t mid = lo + w < cnt ? lo + w : cnt;
+                int64_t hi = lo + 2 * w < cnt ? lo + 2 * w : cnt;
+                int64_t i = lo, j = mid, k = lo;
+                // Take the RIGHT run's head only when it ranks strictly
+                // before the left's: equal keys keep their source order.
+                while (i < mid && j < hi)
+                    tmp[k++] = bz_lazy_order_compare(e, keys, idx[j], idx[i]) < 0
+                                   ? idx[j++] : idx[i++];
+                while (i < mid) tmp[k++] = idx[i++];
+                while (j < hi) tmp[k++] = idx[j++];
+            }
+            memcpy(idx, tmp, (size_t)cnt * sizeof(int64_t));
+        }
+        // Apply the permutation to the snapshot.
+        char* out = (char*)malloc((size_t)cnt * (size_t)e->esz);
+        for (int64_t i = 0; i < cnt; ++i)
+            memcpy(out + i * e->esz, (char*)arr->data + idx[i] * e->esz,
+                   (size_t)e->esz);
+        memcpy(arr->data, out, (size_t)cnt * (size_t)e->esz);
+        free(out);
+        free(tmp);
+        free(idx);
+    }
+
+    // The keys are the sort's own: release what each slot holds, then the
+    // buffers. A zeroed slot (never evaluated) releases nothing.
+    for (int32_t l = 0; l < e->nlevels; ++l) {
+        const bz_order_level_t* lv = &e->levels[l];
+        if (keys[l] && lv->drop)
+            for (int64_t i = 0; i < cnt; ++i) lv->drop(keys[l] + i * lv->ksz);
+        free(keys[l]);
+    }
+    free(keys);
 }
 
 // §16.3 (v0.183, #1586): the runtime-side mirror of codegen's
@@ -4027,7 +4164,7 @@ static int32_t bz_lazy_movenext(bz_lazy_t* e) {
         return 0;
     }
     case BZ_LAZY_ORDERBY: {
-        if (!e->materialized) bz_lazy_orderby_materialize(e);
+        if (!e->materialized) bz_lazy_ordered_materialize(e);
         auto* arr = (bz_array_t*)e->sorted;
         if (e->idx >= arr->count) return 0;
         memcpy(e->cur, bz_array_ptr_at(e->sorted, e->idx, e->esz), (size_t)e->esz);
@@ -4167,44 +4304,9 @@ static int32_t bz_lazy_movenext(bz_lazy_t* e) {
         return 0;
     }
     case BZ_LAZY_THENBY: {
-        // §5 Ordering: composite (primary, secondary) sort. On first MoveNext,
-        // drain upstream, sort by (primary_key, secondary_key) stably, then
-        // iterate from index 0.
-        if (!e->materialized) {
-            e->sorted = bz_array_alloc(e->esz, 8);
-            const void* p;
-            while ((p = bz_lazy_up_next(e->up)) != nullptr)
-                bz_array_add(e->sorted, p, e->esz);
-            auto* arr = (bz_array_t*)e->sorted;
-            int64_t cnt = arr->count;
-            void* tmp = malloc((size_t)e->esz);
-            // Stable insertion sort by (primary_key, secondary_key) composite.
-            for (int64_t i = 1; i < cnt; ++i) {
-                memcpy(tmp, (char*)arr->data + i * e->esz, (size_t)e->esz);
-                int64_t pk_i = e->keyfn  ? e->keyfn(e->closure, tmp)   : 0;
-                int64_t sk_i = e->keyfn2 ? e->keyfn2(e->closure2, tmp) : 0;
-                int64_t j = i - 1;
-                while (j >= 0) {
-                    void* jptr = (char*)arr->data + j * e->esz;
-                    int64_t pk_j = e->keyfn  ? e->keyfn(e->closure, jptr)   : 0;
-                    int64_t sk_j = e->keyfn2 ? e->keyfn2(e->closure2, jptr) : 0;
-                    // Compare primary first, then secondary on ties.
-                    int shift;
-                    if (pk_j != pk_i) {
-                        shift = e->descending ? (pk_j < pk_i) : (pk_j > pk_i);
-                    } else {
-                        shift = e->descending2 ? (sk_j < sk_i) : (sk_j > sk_i);
-                    }
-                    if (!shift) break;
-                    memcpy((char*)arr->data + (j + 1) * e->esz, jptr, (size_t)e->esz);
-                    --j;
-                }
-                memcpy((char*)arr->data + (j + 1) * e->esz, tmp, (size_t)e->esz);
-            }
-            free(tmp);
-            e->idx = 0;
-            e->materialized = 1;
-        }
+        // §5 Ordering: the composite sort over every key of the chain, on
+        // the first MoveNext (bz_lazy_ordered_materialize).
+        if (!e->materialized) bz_lazy_ordered_materialize(e);
         auto* arr = (bz_array_t*)e->sorted;
         if (e->idx >= arr->count) return 0;
         memcpy(e->cur, bz_array_ptr_at(e->sorted, e->idx, e->esz), (size_t)e->esz);

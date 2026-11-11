@@ -2091,10 +2091,10 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
         builder_.CreateRet(builder_.CreateZExt(ok, i32()));
     } else {
         // Key: closure returns keyRetTy — defaults to `int` when the caller
-        // passes no outTy (the OrderBy/ThenBy sort-key path, which coerces its
-        // key lambda to `int` via lowerLinqLambda before reaching here); widen/
-        // convert to i64 for the runtime's key-bytes ABI (bz_lazy_to_dict /
-        // bz_lazy_orderby / bz_lazy_thenby all read an int64_t key).
+        // passes no outTy; widen/convert to i64 for the runtime's key-bytes
+        // ABI (bz_lazy_to_dict reads an int64_t key). The OrderBy/ThenBy sort
+        // keys do NOT come through here (#8384): they use the kind-1 selector
+        // shape, which carries a key at its own type and width.
         //
         // #1692 / stdlib §5: ToDictionary's TKey is not restricted to `int` —
         // it can be any hashable type (e.g. `string`), so the caller
@@ -4591,18 +4591,370 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         auto* distFn = declareC("bz_lazy_distinct", ptrTy(), {ptrTy(), ptrTy()});
         return builder_.CreateCall(distFn, {src, eqTramp}, "linq.distinct");
     }
+    // fix #8384 (stdlib §5 Ordering / §2.8, spec §14.2, v0.357): the comparator
+    // an ordered sequence ranks ONE sort key by — `i32 cmp(ptr a, ptr b)`, `a` and
+    // `b` pointing at two KEY SLOTS (each holds one key value at its own lowered
+    // type), negative / zero / positive as stdlib §2.8's `CompareTo` returns.
+    //
+    // WHAT THE DOCUMENTS REQUIRE. stdlib §5 (v0.357) declares
+    //     public method OrderBy<TKey>(key: (T) -> TKey): IOrderedEnumerable<T>
+    //         where TKey: IComparable<TKey>;
+    // and the same bound on `OrderByDescending`, `ThenBy` and `ThenByDescending`,
+    // so the ordering is the KEY TYPE's own `IComparable<TKey>.CompareTo`, for
+    // every key type that has one. Before this builder existed the four operators
+    // lowered the key function as if it returned `int` whatever it returned, and
+    // called it through an `i32` signature: only an `int` key was ranked. A
+    // `string` key was ranked by the low half of its pointer and a `double` key by
+    // whatever the integer return register held (both: the input order, silently),
+    // a `long` / `DateTime` key by its low 32 bits, and a `decimal` key — a struct
+    // return read as an `i32` — crashed.
+    //
+    // The dispatch is on the key's SEMA type, resolved through the active
+    // monomorphization (`resolveTypeParamRef`) so a key of type `T` ranks by the
+    // type `T` is bound to at this instantiation (spec §14.2 *Interface
+    // conformance* rule 6):
+    //   * a numeric primitive or `char` — its numeric order, SIGNED or UNSIGNED as
+    //     the type is (an unsigned key compared signed ranks its upper half first),
+    //     floating-point by the ordered `<` / `>` pair (a NaN ranks equal to
+    //     everything, exactly as the primitive box's `CompareTo` does);
+    //   * `decimal` — `bz_decimal_cmp`, the runtime relation `decimal`'s `=` and
+    //     `<` lower to (`Decimal.CompareTo`, stdlib §9.3);
+    //   * `string` — `bz_str_compare_cp`, the ordinal relation `string.CompareTo`
+    //     is (stdlib §9.6), the same one `Array<string>.Sort()` calls;
+    //   * `Guid` / `DateTime` / `TimeSpan` / `DateOnly` / `TimeOnly` — the shared
+    //     value comparator the sorted collections use (`buildSortedKeyComparator`:
+    //     `Guid` by its 16 canonical bytes, `DateTime` by ticks with the Kind bits
+    //     masked off);
+    //   * a class or interface — its `CompareTo`, through the vtable / itable
+    //     (`buildObjectCompareToThunk`);
+    //   * a record — its `CompareTo` (`buildRecordCompareToThunk`, or the
+    //     monomorphized one for a generic record);
+    //   * an enum that declares `CompareTo` — that member (spec §10.5: "An enum has
+    //     no intrinsic ordering", so one that declares none is not orderable).
+    //
+    // Null for a key type with no `IComparable<TKey>` ordering this lowering can
+    // reach: `bool` (the one primitive that declares none), a NULLABLE key (spec
+    // §14.2: a type bound implies a non-null type argument), a function, a choice,
+    // and a class / record / enum with no single-parameter `CompareTo`. The caller
+    // rejects the call with a spec-cited diagnostic rather than rank by something
+    // that is not the key's order.
+    auto buildOrderKeyComparator =
+        [&](const sema::TypeRef* keyTy) -> llvm::Function* {
+        const sema::TypeRef* kt = keyTy ? resolveTypeParamRef(keyTy) : nullptr;
+        if (!kt || kt->nullable) return nullptr;
+
+        // A key type that is STILL a bare type parameter after resolution: a
+        // DEAD generic body. Every generic body is also emitted with its type
+        // parameters erased to a placeholder (#490) — the unspecialized
+        // template (no substitution active), and an instantiation made FROM
+        // such a template (`ByKey<T, T>(…)` inside `Outer<T>`'s template binds
+        // `K` to the still-bare `T`). Only a monomorphization whose parameters
+        // are all bound to concrete types is ever called, and that body is
+        // lowered again with the key type concrete, taking a real arm below.
+        // A dead body has no type to rank by and needs none — it only has to
+        // be well-formed IR — so the comparator is a stub.
+        if (isBareTypeParamRef(kt)) {
+            const char* name = "bz$orderkey$unbound";
+            if (llvm::Function* existing = module_->getFunction(name))
+                return existing;
+            auto* fnTy =
+                llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::InternalLinkage, name, module_.get());
+            llvm::IRBuilder<> b(
+                llvm::BasicBlock::Create(llvm_, "entry", fn));
+            b.CreateRet(b.getInt32(0));
+            return fn;
+        }
+
+        if (kt->kind == sema::TypeRef::Kind::Primitive) {
+            using P = sema::PrimitiveType;
+            enum class Rank { Signed, Unsigned, Floating, String, Decimal };
+            Rank rank = Rank::Signed;
+            const char* tag = nullptr;
+            switch (kt->primitive) {
+                case P::SByte:   rank = Rank::Signed;   tag = "sbyte";   break;
+                case P::Short:   rank = Rank::Signed;   tag = "short";   break;
+                case P::Int:     rank = Rank::Signed;   tag = "int";     break;
+                case P::Long:    rank = Rank::Signed;   tag = "long";    break;
+                case P::Byte:    rank = Rank::Unsigned; tag = "byte";    break;
+                case P::UShort:  rank = Rank::Unsigned; tag = "ushort";  break;
+                case P::UInt:    rank = Rank::Unsigned; tag = "uint";    break;
+                case P::ULong:   rank = Rank::Unsigned; tag = "ulong";   break;
+                case P::Char:    rank = Rank::Unsigned; tag = "char";    break;
+                case P::Float:   rank = Rank::Floating; tag = "float";   break;
+                case P::Double:  rank = Rank::Floating; tag = "double";  break;
+                case P::Decimal: rank = Rank::Decimal;  tag = "decimal"; break;
+                case P::String:  rank = Rank::String;   tag = "string";  break;
+                default: return nullptr;  // bool, Object: no IComparable<Self>
+            }
+            llvm::Type* kllvm = lowerTypeRef(kt);
+            if (!kllvm) return nullptr;
+            if (rank == Rank::String && !kllvm->isPointerTy()) return nullptr;
+            if ((rank == Rank::Signed || rank == Rank::Unsigned) &&
+                !kllvm->isIntegerTy())
+                return nullptr;
+            if (rank == Rank::Floating && !kllvm->isFloatingPointTy()) return nullptr;
+
+            std::string name = std::string("bz$orderkey$") + tag;
+            if (llvm::Function* existing = module_->getFunction(name)) return existing;
+            auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+            auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                              name, module_.get());
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+            // A LOCAL IRBuilder, not `builder_`: this thunk is emitted in the
+            // middle of another function's lowering (the hazard
+            // `buildObjectCompareToThunk` records).
+            llvm::IRBuilder<> kb(bb);
+            llvm::Value* aSlot = fn->getArg(0);
+            llvm::Value* bSlot = fn->getArg(1);
+            if (rank == Rank::String) {
+                auto* cmpCp = declareC("bz_str_compare_cp", i32(),
+                                       {ptrTy(), ptrTy(), i32()});
+                kb.CreateRet(kb.CreateCall(
+                    cmpCp, {kb.CreateLoad(ptrTy(), aSlot, "ka"),
+                            kb.CreateLoad(ptrTy(), bSlot, "kb"), kb.getInt32(0)}));
+                return fn;
+            }
+            if (rank == Rank::Decimal) {
+                // The slot bytes ARE the decimal (the key function wrote it
+                // there), which is `bz_decimal_cmp`'s by-pointer ABI.
+                auto* decCmp = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
+                kb.CreateRet(kb.CreateCall(decCmp, {aSlot, bSlot}));
+                return fn;
+            }
+            llvm::Value* av = kb.CreateLoad(kllvm, aSlot, "ka");
+            llvm::Value* bv = kb.CreateLoad(kllvm, bSlot, "kb");
+            llvm::Value* gt = nullptr;
+            llvm::Value* lt = nullptr;
+            if (rank == Rank::Floating) {
+                gt = kb.CreateFCmpOGT(av, bv, "gt");
+                lt = kb.CreateFCmpOLT(av, bv, "lt");
+            } else if (rank == Rank::Unsigned) {
+                gt = kb.CreateICmpUGT(av, bv, "gt");
+                lt = kb.CreateICmpULT(av, bv, "lt");
+            } else {
+                gt = kb.CreateICmpSGT(av, bv, "gt");
+                lt = kb.CreateICmpSLT(av, bv, "lt");
+            }
+            kb.CreateRet(kb.CreateSub(kb.CreateZExt(gt, i32()),
+                                      kb.CreateZExt(lt, i32())));
+            return fn;
+        }
+
+        if (kt->kind != sema::TypeRef::Kind::Named) return nullptr;
+
+        // The built-in value records (stdlib §2.5 / §2.6): one authority with the
+        // sorted collections and `Array<T>.Sort()`.
+        if (sema::isStdlibGuidType(kt)) return buildSortedKeyComparator(kt);
+        {
+            std::string_view head = builtinTypeName(kt);
+            if (head == "DateTime" || head == "TimeSpan" || head == "DateOnly" ||
+                head == "TimeOnly")
+                return buildSortedKeyComparator(kt);
+        }
+
+        if (!kt->declaration) return nullptr;
+        switch (kt->declaration->kind) {
+            case ast::TypeDeclKind::Class:
+            case ast::TypeDeclKind::Interface:
+                return buildObjectCompareToThunk(kt);
+            case ast::TypeDeclKind::Record:
+                if (llvm::Function* f = buildRecordCompareToThunk(kt)) return f;
+                return buildGenericRecordCompareToThunk(kt);
+            case ast::TypeDeclKind::Enum: {
+                // spec §10.5 (v0.357): an enum is ordered only by a `CompareTo` it
+                // declares. Its members are dispatched statically and take the
+                // enum VALUE as `this` (its underlying integer), so the thunk
+                // loads both operands from their slots and calls the compiled
+                // body directly.
+                const sema::TypeSymbol* en = kt->declaration;
+                sema::MethodSymbol* cmpMs = findMethodByName(en, "CompareTo");
+                if (!cmpMs || cmpMs->params.size() != 1) return nullptr;
+                auto fnIt = methodFns_.find(cmpMs);
+                if (fnIt == methodFns_.end() || !fnIt->second) return nullptr;
+                llvm::Type* et = enumLlvmType(en);
+                llvm::FunctionType* cft = fnIt->second->getFunctionType();
+                if (!et || cft->getNumParams() != 2 || cft->getParamType(0) != et ||
+                    cft->getParamType(1) != et || !cft->getReturnType()->isIntegerTy(32))
+                    return nullptr;
+                std::string name = std::string("bz$enumcmp$") + mangledTypeName(en);
+                if (llvm::Function* existing = module_->getFunction(name))
+                    return existing;
+                auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                auto* fn = llvm::Function::Create(
+                    fnTy, llvm::Function::InternalLinkage, name, module_.get());
+                auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+                llvm::IRBuilder<> eb(bb);
+                llvm::Value* av = eb.CreateLoad(et, fn->getArg(0), "ka");
+                llvm::Value* bv = eb.CreateLoad(et, fn->getArg(1), "kb");
+                eb.CreateRet(eb.CreateCall(fnIt->second, {av, bv}, "cmp.result"));
+                return fn;
+            }
+            default:
+                return nullptr;  // a choice: no CompareTo dispatch yet (#8462)
+        }
+    };
+
+    // fix #8384 (stdlib §5 Ordering, spec §28.9, v0.357): the release of ONE sort
+    // key — `void drop(ptr slot)` — or null when the key carries no reference the
+    // sort owns. A function value whose DECLARED result type is `string` hands
+    // its result over at +1 (§28.9: a string is runtime-managed; a lambda body
+    // and a method both mint it, and the caller of the function value releases
+    // it), and the caller here is the sort: it evaluates each key once into a
+    // key slot, ranks by the slots, and then releases every slot through this
+    // function. No other orderable key type is reference-counted (a class key
+    // is a borrow of the element's own reference; the value types own nothing).
+    //
+    // The test is on the callback's result type AS DECLARED — deliberately NOT
+    // resolved through the active monomorphization. A result typed by a type
+    // parameter that is bound to `string` here is not minted consistently: a
+    // lambda whose body is typed `T` (`lambda(x) => x` inside a generic body)
+    // returns a +0 borrow, while a `(T) -> K` parameter may hold a concretely
+    // typed lambda that minted. A generic body does not release such a result
+    // on an ordinary call either, so the sort does not: releasing a borrow
+    // frees the element's own string (the over-release this guards against),
+    // while not releasing a minted one keeps what an ordinary call keeps.
+    auto buildOrderKeyDrop = [&](const sema::TypeRef* kt) -> llvm::Function* {
+        if (!kt || kt->nullable || kt->kind != sema::TypeRef::Kind::Primitive ||
+            kt->primitive != sema::PrimitiveType::String)
+            return nullptr;
+        const char* name = "bz$orderkey$drop$string";
+        if (llvm::Function* existing = module_->getFunction(name)) return existing;
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                             {ptrTy()}, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                          name, module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+        llvm::IRBuilder<> db(bb);
+        auto* rel = declareC("bz_string_release", llvm::Type::getVoidTy(llvm_),
+                             {ptrTy()});
+        db.CreateCall(rel, {db.CreateLoad(ptrTy(), fn->getArg(0), "key")});
+        db.CreateRetVoid();
+        return fn;
+    };
+
+    // fix #8384 (stdlib §5 Ordering / §4.4 *Sorting contract*, v0.357): ONE
+    // sort key of `OrderBy` / `OrderByDescending` / `ThenBy` /
+    // `ThenByDescending`, lowered at the key's OWN type.
+    //
+    // stdlib §5 declares all four as `<TKey>(key: (T) -> TKey) … where TKey:
+    // IComparable<TKey>`. The key function was lowered as `(T) -> int` whatever
+    // it returned, and called through an `i32` signature, so only an `int` key
+    // was ranked (see `buildOrderKeyComparator` for what each other key type
+    // did instead — input order for `string` / `double`, a crash for
+    // `decimal`). The key now travels as the SELECTOR shape `Select` uses: the
+    // trampoline writes the key's own bytes into a key slot of the key's own
+    // size, and the runtime ranks two slots by the key type's `CompareTo`
+    // (`buildOrderKeyComparator`) and releases what a slot holds
+    // (`buildOrderKeyDrop`, a `string` key).
+    //
+    // The key TYPE is recovered exactly as `Select` recovers its result type:
+    // the callback's Function TypeRef, then the method reference / local-held
+    // spelling (#7160 / #7214).
+    //
+    // A key type with no ordering is REJECTED here, citing the bound. Sema
+    // does not check a built-in generic's `where` clause, so this is the one
+    // place the violation is visible, and ranking such a key by something
+    // other than its `CompareTo` is the defect this fix removes.
+    struct OrderKey {
+        llvm::Value* closure = nullptr;
+        llvm::Function* keysel = nullptr;
+        int64_t ksz = 0;
+        llvm::Function* cmp = nullptr;
+        llvm::Value* drop = nullptr;
+    };
+    // Result: Ok (the key is lowered), Rejected (the diagnostic above was
+    // reported: the arm yields poison, as the `ToDictionary` arm does, so the
+    // one message is the only one), NotLowered (the callback itself could not
+    // be lowered: decline the call as before).
+    enum class OrderKeyResult { Ok, Rejected, NotLowered };
+    auto lowerOrderKey = [&](OrderKey& out) -> OrderKeyResult {
+        const ast::Expr* arg = call.args[0].value.get();
+        sema::TypeRef* keyRef = linqSelectorResultType(ctx_, arg);
+        if (!keyRef) keyRef = localHeldCallbackResultType(0);
+        llvm::Function* cmp = keyRef ? buildOrderKeyComparator(keyRef) : nullptr;
+        llvm::Type* keyTy = cmp ? lowerTypeRef(keyRef) : nullptr;
+        if (!cmp || !keyTy) {
+            // Three different facts, three different messages: a diagnostic
+            // that says "this key is not comparable" about a key that IS —
+            // only not lowered yet — would send its reader to fix the wrong
+            // thing.
+            const sema::TypeRef* kt = keyRef ? resolveTypeParamRef(keyRef) : nullptr;
+            const sema::TypeSymbol* keyDecl =
+                (kt && !kt->nullable && kt->kind == sema::TypeRef::Kind::Named)
+                    ? kt->declaration : nullptr;
+            sema::MethodSymbol* ownCmp =
+                keyDecl ? findMethodByName(keyDecl, "CompareTo") : nullptr;
+            const std::string op = "`." + std::string(m) + "` (stdlib \xC2\xA7""5)";
+            if (!keyRef) {
+                // No key type recovered from the key function at all.
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    op + " ranks its sequence by the key type's "
+                    "`IComparable<TKey>` order, and the key type of this key "
+                    "function could not be determined here. Write the key as "
+                    "a lambda with an annotated result type, `lambda(x: T): "
+                    "TKey => \xE2\x80\xA6`.");
+            } else if (ownCmp && ownCmp->params.size() == 1) {
+                // The key type declares a `CompareTo` no comparator above can
+                // dispatch: a choice (spec \xC2\xA7""14.2 *Interface conformance*
+                // rule 7 admits it; tracked as #8462). Declined, not denied.
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    op + " over a key of type `" + std::string(keyDecl->name) +
+                    "` is not supported yet (issue #8462): `" +
+                    std::string(keyDecl->name) + "` declares `CompareTo`, but "
+                    "this compiler cannot yet call it to order a sequence by a "
+                    "key of this kind. Order by a key of a supported type "
+                    "derived from the value instead: a numeric primitive, "
+                    "`char`, `decimal`, `string`, `DateTime`, `TimeSpan`, "
+                    "`DateOnly`, `TimeOnly`, `Guid`, or a class, record, "
+                    "interface or enum that implements `IComparable<Self>`.");
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    op + " requires its key "
+                    "type to implement `IComparable<TKey>` (`where TKey: "
+                    "IComparable<TKey>`); the key this function returns does not, "
+                    "so the sequence has no order to be put in. A numeric "
+                    "primitive, `char`, `decimal`, `string`, `DateTime`, "
+                    "`TimeSpan`, `DateOnly`, `TimeOnly`, `Guid`, and a class, "
+                    "record, interface or enum that implements "
+                    "`IComparable<Self>` are orderable; `bool`, a nullable type "
+                    "(spec \xC2\xA7""14.2: a type bound implies a non-null type "
+                    "argument) and a type that declares no `CompareTo` are not. "
+                    "Return an orderable key (for example `int(flag)` for a "
+                    "`bool`, or `value ?? fallback` for a nullable).");
+            }
+            return OrderKeyResult::Rejected;
+        }
+        out.closure = lowerLinqLambda(arg, keyRef);
+        if (!out.closure) return OrderKeyResult::NotLowered;
+        out.keysel = buildLinqTrampoline(1, elemTy, keyTy);
+        out.ksz = lazyElemSize(keyTy, module_->getDataLayout());
+        out.cmp = cmp;
+        if (llvm::Function* dropFn = buildOrderKeyDrop(keyRef))
+            out.drop = dropFn;
+        else
+            out.drop = llvm::ConstantPointerNull::get(ptrTy());
+        return OrderKeyResult::Ok;
+    };
     if ((m == "OrderBy" || m == "OrderByDescending") &&
         call.args.size() == 1 && call.args[0].value) {
         int32_t desc = (m == "OrderByDescending") ? 1 : 0;
-        llvm::Value* closure = lowerLinqLambda(
-            call.args[0].value.get(),
-            ctx_.primitiveTypeRef(sema::PrimitiveType::Int));
-        if (!closure) return nullptr;
-        llvm::Function* tramp = buildLinqTrampoline(2, elemTy, nullptr);
-        auto* obFn = declareC("bz_lazy_orderby", ptrTy(),
-                              {ptrTy(), ptrTy(), ptrTy(), i32()});
+        OrderKey k;
+        switch (lowerOrderKey(k)) {
+        case OrderKeyResult::Ok: break;
+        case OrderKeyResult::Rejected: return llvm::PoisonValue::get(ptrTy());
+        case OrderKeyResult::NotLowered: return nullptr;
+        }
+        auto* obFn = declareC("bz_lazy_orderby_key", ptrTy(),
+                              {ptrTy(), ptrTy(), ptrTy(), i64(), ptrTy(),
+                               ptrTy(), i32()});
         llvm::Value* e = builder_.CreateCall(obFn,
-            {src, closure, tramp, builder_.getInt32(desc)}, "linq.orderby");
+            {src, k.closure, k.keysel, builder_.getInt64(k.ksz), k.cmp, k.drop,
+             builder_.getInt32(desc)}, "linq.orderby");
         return ownClosureIf(e, argIsFreshClosureCell(0));  // #422: release on dispose
     }
     // stdlib §5 Combination: Concat(other) — yield all of self, then all of
@@ -4787,22 +5139,27 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                                                         : m == "Intersect" ? "intersect"
                                                                            : "except"));
     }
-    // stdlib §5 Ordering: ThenBy / ThenByDescending(key: (T)->TKey) secondary sort.
-    // The receiver is an IOrderedEnumerable<T> (lazy sentinel carrying T at [0]).
-    // The primary key is already baked into the upstream ORDERBY node; ThenBy
-    // reaches into it via the runtime (bz_lazy_thenby reads up->keyfn/closure).
+    // stdlib §5 Ordering: ThenBy / ThenByDescending(key: (T)->TKey) — one more
+    // sort key. The receiver is an IOrderedEnumerable<T> (lazy sentinel
+    // carrying T at [0]). The earlier keys are already in the upstream ordered
+    // node; the runtime appends this one to them (bz_lazy_thenby_key copies
+    // the upstream's key levels), so a chain of any length ranks by every key
+    // (#8384).
     if ((m == "ThenBy" || m == "ThenByDescending") &&
         call.args.size() == 1 && call.args[0].value) {
         int32_t desc2 = (m == "ThenByDescending") ? 1 : 0;
-        llvm::Value* closure2 = lowerLinqLambda(
-            call.args[0].value.get(),
-            ctx_.primitiveTypeRef(sema::PrimitiveType::Int));
-        if (!closure2) return nullptr;
-        llvm::Function* tramp2 = buildLinqTrampoline(2, elemTy, nullptr);
-        auto* tbFn = declareC("bz_lazy_thenby", ptrTy(),
-                              {ptrTy(), ptrTy(), ptrTy(), i32()});
+        OrderKey k2;
+        switch (lowerOrderKey(k2)) {
+        case OrderKeyResult::Ok: break;
+        case OrderKeyResult::Rejected: return llvm::PoisonValue::get(ptrTy());
+        case OrderKeyResult::NotLowered: return nullptr;
+        }
+        auto* tbFn = declareC("bz_lazy_thenby_key", ptrTy(),
+                              {ptrTy(), ptrTy(), ptrTy(), i64(), ptrTy(),
+                               ptrTy(), i32()});
         llvm::Value* e = builder_.CreateCall(tbFn,
-            {src, closure2, tramp2, builder_.getInt32(desc2)}, "linq.thenby");
+            {src, k2.closure, k2.keysel, builder_.getInt64(k2.ksz), k2.cmp,
+             k2.drop, builder_.getInt32(desc2)}, "linq.thenby");
         // Mark closure2 as owned by the THENBY enumerator if it was a fresh
         // +1 closure cell (an inline lambda or a method reference) — disposed
         // via own_closure2 at bz_lazy_dispose.
