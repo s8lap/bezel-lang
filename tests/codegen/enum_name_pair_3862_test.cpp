@@ -41,11 +41,15 @@
 // enforced separately by Resolver::checkEnumRestrictions — see
 // tests/sema/enum_reserved_name_override_3862_test.cpp.
 //
-// ORACLE: `runAot` only (the in-process JIT harness is deprecated).
+// ORACLE: `runAot` only (the in-process JIT harness is deprecated); the
+// §28.9 ownership rows below additionally use the two memory oracles —
+// `runAotChecked` (generated-code ASan/LSan) and `runUnderAsan` (object-level
+// ASan/LSan).
 
 #include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
+#include "support/run_under_asan.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::diagnosticMessageContains;
@@ -496,4 +500,171 @@ BEZEL_TEST(enum_name_pair_3862, long_backed_enum_names_the_same_spec_10_3) {
         "  return (if a = \"Huge\" then 1 else 0) "
         "       + (if b = null then 0 else 2); "
         "end Main; end C;"), 3);
+}
+
+// ---------------------------------------------------------------------------
+// §10.4 / §28.3 / §28.9 — the ARGUMENT's reference is the CALLER's
+// ---------------------------------------------------------------------------
+
+// §10.4 declares `FromNameOrNull(name: string): E?` with NO `owned` marker,
+// so `name` is a BORROW: the callee reads the argument and the CALLER keeps
+// the reference (§28.3.4's "Parameter `p` (no modifier)" row — "Borrowed
+// (source: caller)"; §28.6 — "the callee owns NO reference and must not
+// release it").
+//
+// The reviewer's d2 shape: an OWNED LOCAL whose value is a heap string (a
+// concatenation), passed to the member 200 times (the review's 100-500x
+// amplification band; 200 also fits a process exit status, which is masked
+// to 0..255). Before the fix the ownership walk saw an unmappable callee
+// (the member has no MethodSymbol) and treated the argument as CONSUMING,
+// which suppressed the local's scope-end release — so every iteration leaked
+// the string. MEASURED on the pre-fix tip (ASan/LSan, 300 iterations):
+// "SUMMARY: AddressSanitizer: 11400 byte(s) leaked in 600 allocation(s)".
+//
+// The VALUE row first (the program must still answer right), then the two
+// memory oracles:
+//
+//   * `runAotChecked` — the GENERATED-CODE AddressSanitizer/LeakSanitizer net
+//     (the harness compiles the program with `opts.sanitizeAddress = true`,
+//     so a leak / double-free / use-after-free in the EMITTED code flips
+//     `r.ran` to false). This is the leg a leak row must be on: `runAot`
+//     does NOT leak-check (tests/README.md, #4638), so a leak-amplifying row
+//     on `runAot` passes on both sides of its fix.
+//   * `runUnderAsan` — the object-level ASan/LSan net (the #3653 shared
+//     helper). `BEZEL_EXPECT_TRUE(asan >= 0)` is the house rule (#3682): the
+//     row FAILS if the ASan leg did not run — a missing runtime must not read
+//     as a clean pass.
+BEZEL_TEST(enum_name_pair_3862, from_name_or_null_does_not_leak_an_owned_local) {
+    const std::string program =
+        "module M; enum Color Red, Green, Blue; end Color; "
+        "class C public static method Main(): int "
+        "  var total := 0; "
+        "  for var i in 0..<200 do "
+        "    var k := \"Gr\" + \"een\"; "
+        "    var f := Color.FromNameOrNull(k); "
+        "    total += (if f = null then 0 else 1); "
+        "  end; "
+        "  return total; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(program), 200);
+    auto checked = bezel::test::runAotChecked(program);
+    BEZEL_EXPECT_TRUE(checked.ran);
+    int asan = bezel::test::runUnderAsan(program, "enum_name_pair_3862_owned");
+    BEZEL_EXPECT_TRUE(asan >= 0);
+    BEZEL_EXPECT_EQ(asan, 0);
+}
+
+// The reviewer's c7 shape: a FRESH TEMPORARY passed DIRECTLY as the
+// argument. A `+` producer holds an independent rc=1 reference that no local
+// owns, so the ordinary call path's post-call discharge (the #429
+// ARGUMENT-PASS block) is the one that reclaims it — and this member is not
+// lowered through that path, so the discharge belongs to the member's own
+// lowering.
+//
+// MEASURED on the pre-fix tip (ASan/LSan): "Direct leak of 9600 byte(s) in
+// 300 object(s)" + indirect 1800/300.
+BEZEL_TEST(enum_name_pair_3862, from_name_or_null_does_not_leak_a_fresh_temporary) {
+    const std::string program =
+        "module M; enum Color Red, Green, Blue; end Color; "
+        "class C public static method Main(): int "
+        "  var total := 0; "
+        "  for var i in 0..<200 do "
+        "    var f := Color.FromNameOrNull(\"Gr\" + \"een\"); "
+        "    total += (if f = null then 0 else 1); "
+        "  end; "
+        "  return total; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(program), 200);
+    auto checked = bezel::test::runAotChecked(program);
+    BEZEL_EXPECT_TRUE(checked.ran);
+    int asan = bezel::test::runUnderAsan(program, "enum_name_pair_3862_temp");
+    BEZEL_EXPECT_TRUE(asan >= 0);
+    BEZEL_EXPECT_EQ(asan, 0);
+}
+
+// The reviewer's d6 shape: a METHOD-PRODUCED heap string passed directly
+// (`k.Substring(0)`). A `Substring` result is a fresh +1 with no local
+// owner, so it is discharged by the member's own lowering after the
+// comparison chain — the same arm the concatenation temporary takes.
+//
+// MEASURED on the pre-fix tip (ASan/LSan): the same "9600 byte(s) in 300
+// object(s)" + indirect 1800/300.
+BEZEL_TEST(enum_name_pair_3862, from_name_or_null_does_not_leak_a_method_produced_argument) {
+    const std::string program =
+        "module M; enum Color Red, Green, Blue; end Color; "
+        "class C public static method Main(): int "
+        "  var total := 0; "
+        "  for var i in 0..<200 do "
+        "    var k := \"Gr\" + \"een\"; "
+        "    var f := Color.FromNameOrNull(k.Substring(0)); "
+        "    total += (if f = null then 0 else 1); "
+        "  end; "
+        "  return total; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(program), 200);
+    auto checked = bezel::test::runAotChecked(program);
+    BEZEL_EXPECT_TRUE(checked.ran);
+    int asan = bezel::test::runUnderAsan(program, "enum_name_pair_3862_substr");
+    BEZEL_EXPECT_TRUE(asan >= 0);
+    BEZEL_EXPECT_EQ(asan, 0);
+}
+
+// The borrow also has to survive the call being a STATEMENT (the value is
+// discarded) — the reviewer's e2 shape. A discarded producer argument is
+// still a producer: the member's own lowering discharges it.
+BEZEL_TEST(enum_name_pair_3862, from_name_or_null_does_not_leak_a_discarded_owned_local) {
+    const std::string program =
+        "module M; enum Color Red, Green, Blue; end Color; "
+        "class C public static method Main(): int "
+        "  var total := 0; "
+        "  for var i in 0..<200 do "
+        "    var k := \"Gr\" + \"een\"; "
+        "    Color.FromNameOrNull(k); "
+        "    total += 1; "
+        "  end; "
+        "  return total; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(program), 200);
+    auto checked = bezel::test::runAotChecked(program);
+    BEZEL_EXPECT_TRUE(checked.ran);
+    int asan = bezel::test::runUnderAsan(program, "enum_name_pair_3862_stmt");
+    BEZEL_EXPECT_TRUE(asan >= 0);
+    BEZEL_EXPECT_EQ(asan, 0);
+}
+
+// ---------------------------------------------------------------------------
+// §10.4 — the members are STATIC: the receiver must NAME the type
+// ---------------------------------------------------------------------------
+
+// §10.4 declares the tier as `public static method …`, so the receiver is
+// the enum's TYPE NAME. An INSTANCE receiver is not a member access the
+// language admits, and the base rejected it with the ordinary "no member"
+// reject; the fix must not turn that clean reject into a silently-accepted
+// call that lowers to nothing.
+BEZEL_TEST(enum_name_pair_3862, name_of_rejects_an_instance_receiver) {
+    auto r = runAot(
+        "module M; enum Color Red, Green; end Color; "
+        "class C public static method Main(): int "
+        "  var c := Color.Red; "
+        "  var s := c.NameOf(c); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "no member `NameOf`"));
+}
+
+// The same for the other member of the pair.
+BEZEL_TEST(enum_name_pair_3862, from_name_or_null_rejects_an_instance_receiver) {
+    auto r = runAot(
+        "module M; enum Color Red, Green; end Color; "
+        "class C public static method Main(): int "
+        "  var c := Color.Red; "
+        "  var p := c.FromNameOrNull(\"Red\"); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "no member `FromNameOrNull`"));
 }

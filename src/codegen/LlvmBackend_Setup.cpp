@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "codegen/LlvmBackend_EnumMembers.hpp"  // fix #3862 (§10.4, v0.357): the ONE enum-member gate (lowering + ownership walk)
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 #include "common/DisposalKind.hpp"   // §28.9/§28.12: the shared disposal anchor
@@ -26547,7 +26548,12 @@ inline bool markedOwnedSourceEligible(const sema::SemaContext& ctx,
 }
 
 struct UnwindIneligibleWalker {
-    const sema::SemaContext& ctx;
+    // fix-forward #3862 (review r42-rev-m10-3862, FINDING 1): NOT const —
+    // `isCompilerProvidedEnumMemberCall` resolves a `type`-ALIAS of the enum
+    // (fix #4072's arm), and `sema::resolveAliasToTypeSymbol` takes a
+    // non-const `SemaContext&`. The walker's only construction site passes
+    // the Emitter's own `ctx_` (non-const), so nothing else changes.
+    sema::SemaContext& ctx;
     std::unordered_set<const void*>& out;
     // fix #5243 / §28.3 (v0.313): does the `:=` lowering NULL an `owned`
     // parameter source stored into this target? True iff the target is an
@@ -26589,6 +26595,16 @@ struct UnwindIneligibleWalker {
                       const std::vector<ast::CallArgument>& args,
                       bool untaintOwnedLocalTransfer = false) {
         const std::vector<sema::Symbol*>* params = calleeParamList(ctx, callee);
+        // fix-forward #3862 (review r42-rev-m10-3862, FINDING 1): is this a
+        // call to a compiler-provided per-enum static member
+        // (`E.FromNameOrNull` / `E.NameOf`)? Those have no MethodSymbol, so
+        // `params` is null and the argument cannot be mapped — but §10.4
+        // declares their parameters with NO `owned` marker, so the argument
+        // is a BORROW and the caller keeps the reference. The ONE gate is
+        // shared with the lowering (LlvmBackend_EnumMembers.hpp), so the two
+        // cannot drift.
+        const bool compilerProvidedEnumMember =
+            isCompilerProvidedEnumMemberCall(ctx, callee);
         std::size_t pos = 0;
         for (const auto& a : args) {
             std::size_t positionalIdx = a.name.empty() ? pos++ : 0;
@@ -26617,6 +26633,26 @@ struct UnwindIneligibleWalker {
                 consuming = false;  // output, not consumed
             } else if (a.modifier == "owned") {
                 consuming = true;   // explicit caller-side transfer
+            } else if (!mapped && compilerProvidedEnumMember) {
+                // fix-forward #3862 (review r42-rev-m10-3862, FINDING 1):
+                // §10.4 declares the compiler-provided per-enum members'
+                // parameters with NO `owned` marker —
+                // `FromNameOrNull(name: string): E?` and `NameOf(value: E):
+                // string` — so BOTH are BORROWS: the callee reads the
+                // argument and the CALLER keeps the reference (§28.3.4's
+                // "Parameter `p` (no modifier)" row — "Borrowed (source:
+                // caller)"; §28.6 — "the callee owns NO reference and must
+                // not release it").
+                //
+                // These members have no MethodSymbol, so `calleeParamList`
+                // cannot map the argument and the walk's default for an
+                // unmappable callee is CONSUMING — which suppressed the
+                // owned local's scope-end release and LEAKED the string on
+                // every call (MEASURED: 300 calls → "11400 byte(s) leaked
+                // in 600 allocation(s)" under ASan/LSan). The callee here
+                // is known, so the answer is a borrow, not the
+                // conservative default.
+                consuming = false;
             } else if (!mapped) {
                 consuming = true;   // unknown callee/unmappable arg → conservative
             } else {
@@ -31554,7 +31590,13 @@ bool isSequenceEqualSpanNonRetainingArg(const ast::Expr* callee, size_t i,
 }
 
 struct StringEscapeWalker {
-    const sema::SemaContext& ctx;
+    // fix-forward #3862 (review r42-rev-m10-3862, FINDING 1): NOT const —
+    // `compilerProvidedEnumMemberKind` resolves a `type`-ALIAS of the enum
+    // (fix #4072's arm), and `sema::resolveAliasToTypeSymbol` takes a
+    // non-const `SemaContext&`. Every construction site passes the
+    // Emitter's own `ctx_` (non-const) or this walker's own member, so
+    // nothing else changes.
+    sema::SemaContext& ctx;
     const void* target;   // the LocalDecl node we are testing
     // fix #5253 (§22.3 / §28.9, v0.313): when set, the tracked binding is this
     // PARAMETER symbol (a ParameterSymbol has no LocalDecl to key on), and
@@ -33066,6 +33108,57 @@ struct StringEscapeWalker {
             if (!safeArg && stringReleaseMode && a.modifier.empty() &&
                 isTargetIdent(a.value.get()) &&
                 isBuiltinReaderStringArg(callee, i, a.name, a.value.get(), ctx))
+                safeArg = true;
+            // fix-forward #3862 (review r42-rev-m10-3862, FINDING 1): a string
+            // local passed at the `name: string` parameter of the
+            // COMPILER-PROVIDED per-enum static member `E.FromNameOrNull` is a
+            // CALL-BOUNDED borrow, not an escape.
+            //
+            // §10.4 declares `FromNameOrNull(name: string): E?` with NO
+            // `owned` marker, so the parameter is a BORROW: the callee READS
+            // the identifier table and stores nothing (§28.3.4's "Parameter `p`
+            // (no modifier)" row — "Borrowed (source: caller)"; §28.6 — "the
+            // callee owns NO reference and must not release it"). The lowering
+            // (LlvmBackend_Exprs2.cpp's `tryLowerEnumFromNameOrNull`) only
+            // COMPARES the argument against the table's identifiers, so the
+            // local's own scope-end release is safe.
+            //
+            // WHY THE RELAXATION IS NEEDED. These two members have no
+            // MethodSymbol (§10.4 declares them; no declaration is written),
+            // so the #1430 plain-parameter relaxation — which fires off a
+            // RESOLVED callee's parameter list — never applies, and this
+            // walk's default for an unmappable argument is ESCAPE. The
+            // escape marked the tracked local, so its scope-end release was
+            // never armed and its +1 LEAKED on every call.
+            //
+            // MEASURED before this fix (ASan/LSan, 300 iterations): `var k :=
+            // "Gr" + "een"; var f := Color.FromNameOrNull(k);` → "Direct leak
+            // of 9600 byte(s) in 300 object(s)" + "indirect leak of 1800
+            // byte(s) in 300 object(s)" — one concat result per iteration,
+            // i.e. the local's own +1, never discharged.
+            //
+            // The gate is the ONE shared with the lowering
+            // (LlvmBackend_EnumMembers.hpp), so the escape decision and the
+            // lowering can never drift — a USER class declaring its own
+            // `static FromNameOrNull(x): E?` is NOT hijacked (the receiver
+            // must NAME an enum type).
+            //
+            // The NAMED-argument spelling `FromNameOrNull(name := k)` is the
+            // same call (§10.4's parameter is named `name`, and sema accepts
+            // that spelling), so it is admitted too — with the parameter name
+            // checked, so a differently-named argument (which sema refuses)
+            // stays conservative.
+            //
+            // String-release analysis ONLY (stringReleaseMode), so the shared
+            // dict-materializer / grouping / borrowing-Array walks keep their
+            // conservative ESCAPE (the #1997 narrowing): their release targets
+            // are collection backings, and no test asserts a string-argument
+            // relaxation for them.
+            if (!safeArg && stringReleaseMode && a.modifier.empty() &&
+                isTargetIdent(a.value.get()) &&
+                (a.name.empty() || a.name == "name") &&
+                compilerProvidedEnumMemberKind(ctx, callee) ==
+                    CompilerProvidedEnumMember::FromNameOrNull)
                 safeArg = true;
             // fix #7804 (stdlib §2.1, §8.5, §15.1.2, v0.353): an INLINE ARRAY
             // passed at the CONSOLE's NON-RETAINING argument position

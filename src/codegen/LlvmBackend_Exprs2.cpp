@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "codegen/LlvmBackend_EnumMembers.hpp"  // fix #3862 (§10.4, v0.357): the ONE enum-member gate (lowering + ownership walk)
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 #include "common/OwnershipFacts.hpp"  // #2098: bindClauseNeedsAtomDisposal (§17.15/K8.5)
@@ -12712,59 +12713,24 @@ llvm::Value* Emitter::enumDeclaredValueTest(const sema::TypeSymbol* ts,
 
 // fix #3862 (§10.4, v0.293): the ENUM TypeSymbol an expression NAMES as a
 // type — the receiver gate every compiler-provided per-enum static member
-// (`FromUnderlyingOrNull`, `FromNameOrNull`, `NameOf`) dispatches on. This
-// is codegen's twin of sema's `ExprTC::enumTypeNamedBy` (ExprTypecheck_
-// Calls.cpp) and applies exactly the same gate, so the two agree.
+// (`FromUnderlyingOrNull`, `FromNameOrNull`, `NameOf`) dispatches on.
 //
-// The receiver must NAME an enum type — these are STATIC members. Without
-// this gate a user class declaring its own
-// `static FromUnderlyingOrNull(x): SomeEnum?` would be hijacked: the member
-// name and the `E?` result type alone do not identify the compiler-provided
-// member.
-//
-// fix #4072 (§10.4 / §27.8, v0.294; family of
-// #4038/#4048/#4050/#4051/#4070): a `type` alias of the enum
-// resolves `tsym` to a `TypeAliasSymbol`, not a TypeSymbol or
-// NestedTypeSymbol — the same missing-arm shape #4050's
-// DestructuringPattern arm discovered (sema fix alone is NOT
-// enough; codegen independently re-resolves here, with its OWN
-// matching gap). Without this arm `AliasColor.FromUnderlyingOrNull
-// (value)` reached this gate with `named` still null, the
-// recognition fell through, the call's result type was empty
-// for codegen to dispatch on, and the slot silently degraded to
-// zero (#2434 backstop) — a SILENT WRONG VALUE, not a crash and
-// not a diagnosed rejection. Resolve through the SAME shared
-// `sema::resolveAliasToTypeSymbol` (TypeResolution.hpp,
-// #4050/#4051) ExprTC::enumTypeNamedBy now calls, so sema and
-// codegen agree on the alias-qualified spelling exactly like the
-// direct-name spelling.
-static const sema::TypeSymbol* enumTypeNamedByCodegen(
-        sema::SemaContext& ctx, const ast::Expr& e) {
-    const sema::TypeSymbol* named = nullptr;
-    if (sema::Symbol* tsym = ctx.exprSymbol(e)) {
-        if (auto* ts = dynamic_cast<sema::TypeSymbol*>(tsym)) {
-            if (ts->kind == ast::TypeDeclKind::Enum) named = ts;
-        } else if (auto* nts = dynamic_cast<sema::NestedTypeSymbol*>(tsym)) {
-            if (nts->type && nts->type->kind == ast::TypeDeclKind::Enum)
-                named = nts->type;
-        } else if (auto* aliasSym =
-                       dynamic_cast<sema::TypeAliasSymbol*>(tsym)) {
-            if (auto* ts = sema::resolveAliasToTypeSymbol(ctx, aliasSym))
-                if (ts->kind == ast::TypeDeclKind::Enum) named = ts;
-        }
-    }
-    return named;
-}
+// The gate and its history (fix #4072's alias arm, the "the receiver must
+// NAME an enum type" rule, sema's twin `ExprTC::enumTypeNamedBy`) now live
+// in `codegen/LlvmBackend_EnumMembers.hpp` — the ONE place the LOWERING
+// and the OWNERSHIP WALK (LlvmBackend_Setup.cpp) both read, so the two
+// cannot drift.
 
 llvm::Value* Emitter::tryLowerEnumFromUnderlyingOrNull(
         const ast::CallExpr& call) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
     if (!ma || ma->member != "FromUnderlyingOrNull" || !ma->target)
         return nullptr;
-    // The receiver must NAME an enum type — see enumTypeNamedByCodegen above
-    // for the gate and its history (sema applies exactly this gate too, so
-    // the two agree).
-    const sema::TypeSymbol* named = enumTypeNamedByCodegen(ctx_, *ma->target);
+    // The receiver must NAME an enum type — see codegenEnumTypeNamedBy
+    // (LlvmBackend_EnumMembers.hpp) for the gate and its history (sema
+    // applies exactly this gate too, so the two agree).
+    const sema::TypeSymbol* named =
+        codegenEnumTypeNamedBy(ctx_, *ma->target);
     if (!named) return nullptr;
     // Sema types the whole call as `E?` (a nullable Named enum).
     const sema::TypeRef* rt = ctx_.exprType(call);
@@ -12870,7 +12836,7 @@ llvm::Value* Emitter::tryLowerEnumFromNameOrNull(
         const ast::CallExpr& call) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
     if (!ma || ma->member != "FromNameOrNull" || !ma->target) return nullptr;
-    const sema::TypeSymbol* named = enumTypeNamedByCodegen(ctx_, *ma->target);
+    const sema::TypeSymbol* named = codegenEnumTypeNamedBy(ctx_, *ma->target);
     if (!named) return nullptr;
     // Sema types the whole call as `E?` (a nullable Named enum).
     const sema::TypeRef* rt = ctx_.exprType(call);
@@ -12923,6 +12889,34 @@ llvm::Value* Emitter::tryLowerEnumFromNameOrNull(
         result = builder_.CreateSelect(it->first, present, result,
                                        "enum.fno.opt");
     }
+    // fix-forward #3862 (review r42-rev-m10-3862, FINDING 1): the ARGUMENT's
+    // reference is the CALLER's to discharge (§28.3.4's "Parameter `p` (no
+    // modifier)" row — "Borrowed (source: caller)"; §28.6 — "the callee owns
+    // NO reference and must not release it"). §10.4 declares
+    // `FromNameOrNull(name: string): E?` with NO `owned` marker, so the
+    // callee only READS the name.
+    //
+    // A +1 string PRODUCER passed directly as the argument (a concatenation,
+    // an interpolation) holds an independent rc=1 reference that nothing
+    // else owns: a NAMED local's own scope-end release covers the named
+    // case, and a LITERAL is an rc sentinel with no reference to drop — but
+    // an UNBOUND producer has neither. The ordinary call path discharges it
+    // after the call (the #429 ARGUMENT-PASS block, LlvmBackend_Calls2.cpp);
+    // this arm is not that path, so the discharge belongs HERE.
+    //
+    // MEASURED before this fix (ASan/LSan, 300 iterations):
+    // `Color.FromNameOrNull("Gr" + "een")` → "Direct leak of 9600 byte(s) in
+    // 300 object(s)" + indirect 1800/300; `Color.FromNameOrNull(k)` with an
+    // owned local `k` → the same per-call leak, because the OWNERSHIP WALK
+    // saw an unmappable callee (no MethodSymbol) and treated the argument
+    // as CONSUMING, which suppressed `k`'s scope-end release — that half is
+    // fixed in the walk (LlvmBackend_Setup.cpp's `walkCallArgs`), and the
+    // UNBOUND-producer half is fixed here.
+    //
+    // The release runs AFTER the comparison chain: the chain is the
+    // argument's LAST use, and the result (an `E?`) never aliases it.
+    if (!diverged_ && isPlusOneStringProducer(call.args[0].value.get()))
+        emitStringRelease(nameVal);
     return result;
 }
 
@@ -12948,7 +12942,7 @@ llvm::Value* Emitter::tryLowerEnumFromNameOrNull(
 llvm::Value* Emitter::tryLowerEnumNameOf(const ast::CallExpr& call) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
     if (!ma || ma->member != "NameOf" || !ma->target) return nullptr;
-    const sema::TypeSymbol* named = enumTypeNamedByCodegen(ctx_, *ma->target);
+    const sema::TypeSymbol* named = codegenEnumTypeNamedBy(ctx_, *ma->target);
     if (!named) return nullptr;
     // Sema types the whole call as `string` (stdlib §9.9: `NameOf(value: E):
     // string`).

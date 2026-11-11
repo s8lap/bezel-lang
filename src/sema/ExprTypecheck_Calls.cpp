@@ -45388,9 +45388,32 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // the members only as callable statics; the §27.6 method-reference
         // posture stays inherited/unspecified, and accepting one here
         // would leave codegen with nothing to lower).
+        //
+        // fix-forward (review r42-rev-m10-3862, FINDING 2): the exemption
+        // must ALSO require the RECEIVER TO NAME THE TYPE. §10.4 declares
+        // these members `static` ("public static method …"), so the
+        // receiver is the enum's TYPE NAME, never an instance of it — and
+        // codegen's own gate (`enumTypeNamedByCodegen`) says exactly that.
+        // The exemption's own gate (`targetType->kind == Enum`) is satisfied
+        // by an INSTANCE receiver too (an instance's TypeRef names the same
+        // declaration), so `c.NameOf(c)` / `c.FromNameOrNull("Red")` were
+        // admitted by sema and then declined by codegen — which has no
+        // lowering for that shape and fell back to the #2434 zero-init
+        // slot (a Warning, not an Error): a SILENT WRONG PROGRAM where the
+        // base REJECTED with "no member `NameOf` on type `Color`". The
+        // receiver must now NAME the type (`enumTypeNamedBy` — sema's twin
+        // of codegen's gate, so the two agree), so the instance form is
+        // rejected exactly as the base rejected it.
+        //
+        // The PRE-EXISTING instance-receiver hole for the SIBLING member
+        // `E.FromUnderlyingOrNull` (its own arm above, which does not carry
+        // this gate) is NOT fixed here — it predates this lane and is filed
+        // separately; this arm only stops this lane's two members from
+        // widening it.
         if (targetType->kind == ast::TypeDeclKind::Enum &&
             (ma.member == "FromNameOrNull" || ma.member == "NameOf") &&
-            calleeOfCallCtx_ == &ma)
+            calleeOfCallCtx_ == &ma &&
+            ma.target && enumTypeNamedBy(*ma.target))
             return;
         if (isResultCombinator) {
             // Do NOT stamp a Function TypeRef on the MemberAccessExpr: the
