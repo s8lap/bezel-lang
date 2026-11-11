@@ -8272,15 +8272,29 @@ bool MethodOwnership::trustCollectionElementIsSourceBinding(
 // member access read a BORROW — a class-typed reference whose source the caller
 // must keep alive — or a value that carries none?
 //
-// The three exclusions are each load-bearing:
+// The exclusions are POSITIVE — each names a symbol that is known not to be a
+// borrow of the member — and each is load-bearing:
 //   * a METHOD reference (`Demo.Twice`, `this.Foo`) forms a FUNCTION VALUE
 //     (§27.6): a capture-free one carries the empty source set (§28.3
 //     *Provenance* clause 5) and a capture-bearing one is a set-erasing
 //     position — neither is a trust clause, and neither is a borrow of the
 //     member;
-//   * an ENUM CONSTANT is a value;
+//   * an ENUM CONSTANT, a `const` member and a CHOICE CASE named through its
+//     type (`Shape.Empty`, or a payload case as a constructor value) are
+//     per-type values: none reads an instance's storage;
 //   * a `static` member's read has [K2]'s always-live source, so it is
 //     statically bounded (§28.3's *Static field access `T.f`* producers row).
+//
+// Every OTHER read goes to the type test — a field or property symbol, and
+// equally a read with NO symbol. Sema's accessor arms for the declaration-less
+// builtins (`LinkedListNode<T>.Value` / `.Next` / `.Previous`,
+// `LinkedList<T>.First` / `.Last`, `DictionaryEntry<K,V>.Value`,
+// `DrainedEntry<K,V>.Value`) type the read and record no symbol, so a null
+// symbol is not evidence of a value: `_kept := n.Value;` stores a borrow of an
+// `Item` exactly as the user-class twin `_kept := b.V;` does, and "the
+// trust-admission report … names every such store" (§28.3 *Borrow lifetime
+// rules* clause 3). A static read of a builtin VALUE (`Guid.Empty`,
+// `DateTime.MinValue`) stays quiet through the type test's value list.
 //
 // The type test is `trustReadTypeCarriesBorrow` (below), whose default is
 // CARRIER: a read is excluded only when its type is positively a value (a
@@ -8294,17 +8308,16 @@ bool MethodOwnership::trustCollectionElementIsSourceBinding(
 bool MethodOwnership::trustMemberReadIsBorrowCarrier(
     const ast::MemberAccessExpr& ma) {
     sema::Symbol* sym = ctx_.exprSymbol(ma);
-    if (!sym) return false;
-    // A method reference and an enum constant are not borrows of the member.
+    // Only what is POSITIVELY not a borrow of the member is excluded; a null
+    // symbol (a builtin accessor arm) and any other symbol kind fall through
+    // to the type test.
     if (dynamic_cast<sema::MethodSymbol*>(sym)) return false;
     if (dynamic_cast<sema::EnumConstantSymbol*>(sym)) return false;
-    // The member must be storage: a field, a property or an indexer.
-    if (!dynamic_cast<sema::FieldSymbol*>(sym) &&
-        !dynamic_cast<sema::PropertySymbol*>(sym))
-        return false;
+    if (dynamic_cast<sema::ConstMemberSymbol*>(sym)) return false;
+    if (dynamic_cast<sema::ChoiceCaseSymbol*>(sym)) return false;
     // A static member's read is statically bounded ([K2]'s always-live source).
     if (trustMemberIsStatic(sym)) return false;
-    // The read's type must be a class-typed borrow.
+    // Otherwise the read's TYPE decides: CARRIER unless positively a value.
     return trustReadTypeCarriesBorrow(ctx_.exprType(ma));
 }
 
@@ -8446,12 +8459,14 @@ bool MethodOwnership::trustReadTypeCarriesBorrow(const sema::TypeRef* rt) {
 //   * a STATIC member's read has [K2]'s always-live source, so it is
 //     statically bounded and rests on no clause.
 //
-// The arm therefore admits a member access only when the resolved symbol is
-// a FIELD, PROPERTY or INDEXER (never a method, never an enum constant),
-// the member is not `static`, and the read's TYPE is a class-typed borrow —
-// `isBorrowableOwnedSinkType`, the file's settled test, which reaches a
-// user class or interface and a declaration-less builtin class head
-// (`Array<T>`, `StringBuilder`, `Random`, the owning collections) alike.
+// The arm therefore defers to `trustMemberReadIsBorrowCarrier`, which excludes
+// only what is positively not a borrow of the member (a method reference, an
+// enum constant, a `const`, a choice case, a `static` member) and otherwise
+// asks `trustReadTypeCarriesBorrow` whether the read's TYPE carries a borrow.
+// That test's default is CARRIER: a user class or interface, every
+// declaration-less builtin its closed value list does not name, a bare type
+// parameter, a borrow-bearing record or choice, and a read with no resolved
+// type or symbol (sema's builtin accessor arms record none) all stay reported.
 // // per §28.3, §28.11
 bool MethodOwnership::trustFieldStoreCarrier(const ast::Expr& e) {
     if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))

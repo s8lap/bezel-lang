@@ -74,6 +74,7 @@
 // pass order, with `setReportTrustAdmissions(true)` set before any pass runs
 // (the driver's own ordering — `src/driver/Driver.cpp`).
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -490,6 +491,88 @@ BEZEL_TEST(trust_admission_report_7468,
     auto r = checkWithTrustReport(fieldReadIntoField("String"));
     EXPECT_COMPILES(r);
     BEZEL_EXPECT_EQ(trustAdmissionCount(r), 0u);
+}
+
+// ── The builtin accessor reads: the line is KEPT, the value line dropped ──
+//
+// Sema's accessor arms for the declaration-less builtins
+// (`LinkedListNode<T>.Value`, `LinkedList<T>.First`, `DictionaryEntry<K,V>.
+// Value`, …) type the read and record NO symbol. A member-read test that
+// treated a missing symbol as "not storage" dropped every such read from the
+// report, though `_kept := n.Value;` with `n: LinkedListNode<Item>` stores a
+// borrow of an `Item` exactly as a user-class property read does. §28.3
+// *Borrow lifetime rules* clause 3 (v0.357): "the trust-admission report …
+// names every such store", and §28.11: the report "names a parameter-,
+// receiver- or field-path-sourced element at its store".
+//
+// Each row pairs the builtin read with a VALUE store the base over-reports,
+// and pins exactly ONE line at the builtin read's own source line: the base
+// draws two (RED), a fix that drops the builtin read draws none (RED).
+
+// The single trust line's source line, or 0 when there is not exactly one.
+std::uint32_t onlyTrustAdmissionLine(const OwnershipResult& r) {
+    std::uint32_t line = 0;
+    std::size_t n = 0;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Warning) continue;
+        if (d.message.find("trust admission recorded") == std::string::npos)
+            continue;
+        ++n;
+        line = d.location.line;
+    }
+    return n == 1 ? line : 0;
+}
+
+// fix #7468 (§28.3 *Borrow lifetime rules* clause 3; §28.3 *Diagnostics*,
+// v0.357): `n.Value` on a `LinkedListNode<Item>` parameter is a field-path
+// borrow of an `Item` stored into a plain field — reported (line 13); the
+// `DateTime` read beside it is a value — not reported (line 12).
+BEZEL_TEST(trust_admission_report_7468,
+           linked_list_node_value_into_field_reports_only_the_borrow) {
+    auto r = checkWithTrustReport(
+        "module Conf;\n"
+        "public class Item\n"
+        "  public constructor() end constructor;\n"
+        "end Item;\n"
+        "public class Stamp\n"
+        "  public _at: DateTime;\n"
+        "end Stamp;\n"
+        "public class Prog\n"
+        "  private _kept: Item?;\n"
+        "  private _when: DateTime;\n"
+        "  public method Take(n: LinkedListNode<Item>, s: Stamp)\n"
+        "    _when := s._at;\n"
+        "    _kept := n.Value;\n"
+        "  end Take;\n"
+        "end Prog;\n");
+    EXPECT_COMPILES(r);
+    BEZEL_EXPECT_EQ(trustAdmissionCount(r), 1u);
+    BEZEL_EXPECT_EQ(onlyTrustAdmissionLine(r), 13u);
+}
+
+// fix #7468 (§28.11 *Borrowing collections* → *Storing a borrow*; §28.3
+// *Diagnostics*, v0.357): `_items.Add(n.Value)` stores a field-path-sourced
+// `Item` into a field's borrowing collection — reported (line 11); the enum
+// constant stored beside it is a value — not reported (line 10).
+BEZEL_TEST(trust_admission_report_7468,
+           linked_list_node_value_into_collection_reports_only_the_borrow) {
+    auto r = checkWithTrustReport(
+        "module Conf;\n"
+        "public enum Kind A, B; end Kind;\n"
+        "public class Item\n"
+        "  public constructor() end constructor;\n"
+        "end Item;\n"
+        "public class Prog\n"
+        "  private owned _items: Array<Item> := new Array<Item>();\n"
+        "  private owned _kinds: Array<Kind> := new Array<Kind>();\n"
+        "  public method Take(n: LinkedListNode<Item>)\n"
+        "    _kinds.Add(Kind.A);\n"
+        "    _items.Add(n.Value);\n"
+        "  end Take;\n"
+        "end Prog;\n");
+    EXPECT_COMPILES(r);
+    BEZEL_EXPECT_EQ(trustAdmissionCount(r), 1u);
+    BEZEL_EXPECT_EQ(onlyTrustAdmissionLine(r), 11u);
 }
 
 // ── The two control rows: the trust line IS still drawn ──────────────────
