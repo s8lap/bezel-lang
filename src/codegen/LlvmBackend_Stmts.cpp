@@ -3602,6 +3602,42 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // the unwrapped result value. (await-in-try / return-through-finally in
         // async bodies is deferred; finallyStack_ is empty for the minimal cut.)
         if (smKind_ == SuspendKind::Await && smStateStruct_) {
+            // fix #7867 (§29.2, §30.1, v0.357): the §29.2 coercion on the
+            // ASYNC return edge. §30.1 makes `return expression;` in an
+            // async body complete the task with a value of the task's result
+            // type T, so for `Task<IEnumerable<T>>` the completing value is
+            // an `IEnumerable<T>` and must have that type's representation:
+            // the vtable-backed enumerable every consumer drives through
+            // slot 4 (`GetEnumerator`). The SYNC edge performs this coercion
+            // further down (the `returnReprTypeNode()` arm, #1916 / #2703),
+            // but this branch completes the task and returns before reaching
+            // it, so `return s.Where(f);` completed the task with the RAW
+            // `bz_lazy_t*` pipeline handle, whose 4-slot vtable has no
+            // slot 4 — MEASURED on the base: the awaiter's `for` loaded slot
+            // 4 of the handle and called it (SEGV, pc=0x2), whatever the
+            // argument was. Same call, same flags as the sync edge: a lazy
+            // pipeline is drained into an OWNING enumerator
+            // (`ownLazyPipeline`), a collection the body owns is handed to
+            // the wrapper. Done before the finally split below, so a return
+            // routed through a `finally` stashes the coerced value too.
+            //
+            // The key is `asyncResultSemaType_` (the task's T), not the
+            // declared `Task<...>` node the sync arm reads. The
+            // `currentFn_ == asyncResumeFn_` conjunct is #1289's: a nested
+            // non-async lambda lowered mid-body does not save the sm*_
+            // fields, and its own `return` must not be coerced to the
+            // enclosing task's result type. An unannotated async lambda may
+            // carry the wrapped `Task<T>` here (see the note at the
+            // result-decision site below); its head is not an enumerable
+            // one, so the callee declines and `v` is unchanged.
+            if (v && rs->value && asyncResumeFn_ &&
+                currentFn_ == asyncResumeFn_ && asyncResultSemaType_)
+                v = wrapAsIEnumerableForTarget(
+                    v, asyncResultSemaType_, rs->value.get(),
+                    /*ownLazyPipeline=*/true,
+                    /*outWrapMade=*/nullptr,
+                    /*srcOwnedByCallee=*/
+                    returnSourceIsCalleeOwnedCollection(rs->value.get()));
             // #776 / §30.5: when the async result is a bare local `Task`/`Task<T>`
             // being TRANSFERRED out (e.g. `return t;` in a `Task<Task<T>>` method),
             // null its slot before scope-end disposal. `v` already holds the task
