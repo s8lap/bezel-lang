@@ -44042,8 +44042,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             // uninitialized-stack-read hole for them without
                             // implementing the getters (#2337's job, kept out of
                             // this fix's scope per its issue text).
-                            // fix #8399 (stdlib §6.8, v0.357): the OTHER member
-                            // stdlib §2.17 names — `DomainFaultedException.
+                            // fix #8399 (stdlib §6.8, v0.357): the OTHER member the
+                            // built-in exception cross-reference lists — `DomainFaultedException.
                             // FaultStackTrace` (stdlib §6.8) — IS implemented
                             // now (the copied stack-trace text of the original
                             // exception, spec §30.14): the §31.4 block above
