@@ -17,18 +17,20 @@
 // and `argOrder2`) types the call's other arguments first (phase 1, wherever
 // they sit) and substitutes their bindings into the lambda's formal.
 //
-// NARROW: the issue's own MaxBy / MinBy / OrderBy rows are NOT fixed here.
-// Their `K` occurs only in the lambda's return slot, and codegen's
-// monomorphization (`applyMethodGenericSubst` / `unifyMethodReturnTypeArg`,
-// LlvmBackend_Calls2.cpp) has no function-typed arm, so `K` stays unbound in
-// the specialization and the method returns the first element. The sema half
-// therefore types the lambda only at a call site where codegen binds EVERY
-// type parameter of the callee — from an argument whose static type carries
-// it, or from the declared return type. The `*_right_or_rejected` rows pin
-// that guard: each is a §14.5-valid call whose only right answer is `dan`,
-// which is rejected today, and which must never compile to a program that
-// prints another element (the first cut of this fix printed `ann` for the
-// `null` / `[]` / omitted-optional rows).
+// fix #8617 (§14.5, v0.357; owner ruling on #8617, reading A): a callee
+// type parameter that occurs only in the lambda's RETURN slot (`key: (T) ->
+// K`, the issue's own MaxBy) is bound in phase 2 — "the lambda's inferred
+// return type then unifies against the function type's return position,
+// binding type parameters still free" — and codegen's monomorphization binds
+// it the same way (the #8527 function-typed arm of `applyMethodGenericSubst`,
+// LlvmBackend_Calls2.cpp). A later argument at a `K`-bearing position that
+// binds nothing — a bare `null`, an empty `[]`, an omitted optional — is then
+// checked "at the §22.6 applicability check against the substituted
+// signature" (phase 1), so the call is admitted. #8394's narrow guard had
+// kept these calls rejected because codegen once had no function-typed arm;
+// the `*_admitted_8617` rows pin the ruled answer (`dan` / `cho`), and the
+// int / record rows pin that the specialization really binds `K` (before the
+// fix they compiled and printed the FIRST element, `ann`).
 //
 // The int rows build `xs` with `Add` rather than a literal: a literal-built
 // local `Array<int>` passed to a generic static method leaks (#7701), which
@@ -354,28 +356,201 @@ public class Program
 end Program;
 )";
 
-bool hasDiag8394(const bezel::test::JitResult& r, std::string_view needle) {
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find(needle) != std::string::npos) return true;
-    return false;
-}
+const char kIntKeyOnlyInFnSlot[] = R"(
+module P;
+public class Box
+  public Name: string;
+  public Age: int;
+  public constructor(n: string, a: int) Name := n; Age := a; end constructor;
+end Box;
+public static class Seq
+  public static method MaxBy<T, K>(xs: Array<T>, key: (T) -> K): T where K: IComparable<K>
+    var best := xs[0];
+    var bk := key(xs[0]);
+    for var x in xs do
+      var k := key(x);
+      if k.CompareTo(bk) > 0 then best := x; bk := k; end;
+    end;
+    return best;
+  end MaxBy;
+end Seq;
+public class Program
+  public static method Main()
+    var xs: Array<Box> := [new Box("ann", 30), new Box("cho", 40), new Box("bob", 25), new Box("dan", 35)];
+    Console.WriteLine(Seq.MaxBy(xs, lambda(p) => p.Age).Name);
+    Console.WriteLine(Seq.MaxBy<Box, int>(xs, lambda(p) => p.Age).Name);
+  end Main;
+end Program;
+)";
+const char kIntKeyFormalGetsEmptyLiteral[] = R"(
+module P;
+public class Box
+  public Name: string;
+  public Age: int;
+  public constructor(n: string, a: int) Name := n; Age := a; end constructor;
+end Box;
+public static class Seq
+  public static method M<T, K>(xs: Array<T>, key: (T) -> K, extra: Array<K>): T where K: IComparable<K>
+    var best := xs[0];
+    var bk := key(xs[0]);
+    for var x in xs do
+      var k := key(x);
+      if k.CompareTo(bk) > 0 then best := x; bk := k; end;
+    end;
+    return best;
+  end M;
+end Seq;
+public class Program
+  public static method Main()
+    var xs: Array<Box> := [new Box("ann", 30), new Box("cho", 40), new Box("bob", 25), new Box("dan", 35)];
+    Console.WriteLine(Seq.M(xs, lambda(v) => v.Age, []).Name);
+  end Main;
+end Program;
+)";
+const char kIntKeyFormalOmitted[] = R"(
+module P;
+public class Box
+  public Name: string;
+  public Age: int;
+  public constructor(n: string, a: int) Name := n; Age := a; end constructor;
+end Box;
+public static class Seq
+  public static method M<T, K>(xs: Array<T>, key: (T) -> K, seed: K? := null): T where K: IComparable<K>
+    var best := xs[0];
+    var bk := key(xs[0]);
+    for var x in xs do
+      var k := key(x);
+      if k.CompareTo(bk) > 0 then best := x; bk := k; end;
+    end;
+    return best;
+  end M;
+end Seq;
+public class Program
+  public static method Main()
+    var xs: Array<Box> := [new Box("ann", 30), new Box("cho", 40), new Box("bob", 25), new Box("dan", 35)];
+    Console.WriteLine(Seq.M(xs, lambda(v) => v.Age).Name);
+  end Main;
+end Program;
+)";
+const char kRecordKeyFormalGetsNull[] = R"(
+module P;
+public class Box
+  public Name: string;
+  public Age: int;
+  public constructor(n: string, a: int) Name := n; Age := a; end constructor;
+end Box;
+public record RK: IComparable<RK>
+  public v: int;
+  public method CompareTo(other: RK): int
+    return this.v - other.v;
+  end CompareTo;
+end RK;
+public static class Seq
+  public static method M<T, K>(xs: Array<T>, key: (T) -> K, seed: K?): T where K: IComparable<K>
+    var best := xs[0];
+    var bk := key(xs[0]);
+    for var x in xs do
+      var k := key(x);
+      if k.CompareTo(bk) > 0 then best := x; bk := k; end;
+    end;
+    return best;
+  end M;
+end Seq;
+public class Program
+  public static method Main()
+    var xs: Array<Box> := [new Box("ann", 30), new Box("cho", 40), new Box("bob", 25), new Box("dan", 35)];
+    Console.WriteLine(Seq.M(xs, lambda(v) => new RK(v.Age), null).Name);
+  end Main;
+end Program;
+)";
+const char kInstanceKeyFormalGetsEmptyLiteral[] = R"(
+module P;
+public class Box
+  public Name: string;
+  public Age: int;
+  public constructor(n: string, a: int) Name := n; Age := a; end constructor;
+end Box;
+public class H
+  public constructor() end constructor;
+  public method M<T, K>(xs: Array<T>, key: (T) -> K, extra: Array<K>): T where K: IComparable<K>
+    var best := xs[0];
+    var bk := key(xs[0]);
+    for var x in xs do
+      var k := key(x);
+      if k.CompareTo(bk) > 0 then best := x; bk := k; end;
+    end;
+    return best;
+  end M;
+end H;
+public class Program
+  public static method Main()
+    var xs: Array<Box> := [new Box("ann", 30), new Box("cho", 40), new Box("bob", 25), new Box("dan", 35)];
+    var h := new H();
+    Console.WriteLine(h.M(xs, lambda(v) => v.Name + "!", []).Name);
+  end Main;
+end Program;
+)";
+const char kUnqualifiedNullBeforeLambda[] = R"(
+module P;
+public class Box
+  public Name: string;
+  public Age: int;
+  public constructor(n: string, a: int) Name := n; Age := a; end constructor;
+end Box;
+public class Program
+  public static method M<T, K>(xs: Array<T>, seed: K?, key: (T) -> K): T where K: IComparable<K>
+    var best := xs[0];
+    var bk := key(xs[0]);
+    for var x in xs do
+      var k := key(x);
+      if k.CompareTo(bk) > 0 then best := x; bk := k; end;
+    end;
+    return best;
+  end M;
+  public static method Main()
+    var xs: Array<Box> := [new Box("ann", 30), new Box("cho", 40), new Box("bob", 25), new Box("dan", 35)];
+    Console.WriteLine(M(xs, null, lambda(v) => v.Name + "!").Name);
+  end Main;
+end Program;
+)";
+const char kNullConditionalIntKeyOmitted[] = R"(
+module P;
+public class Box
+  public Name: string;
+  public Age: int;
+  public constructor(n: string, a: int) Name := n; Age := a; end constructor;
+end Box;
+public class H
+  public constructor() end constructor;
+  public method M<T, K>(xs: Array<T>, key: (T) -> K, seed: K? := null): T where K: IComparable<K>
+    var best := xs[0];
+    var bk := key(xs[0]);
+    for var x in xs do
+      var k := key(x);
+      if k.CompareTo(bk) > 0 then best := x; bk := k; end;
+    end;
+    return best;
+  end M;
+end H;
+public class Program
+  public static method Main()
+    var xs: Array<Box> := [new Box("ann", 30), new Box("cho", 40), new Box("bob", 25), new Box("dan", 35)];
+    var h: H? := new H();
+    Console.WriteLine(h?.M(xs, lambda(v) => v.Age)?.Name ?? "none");
+  end Main;
+end Program;
+)";
 
 // A §14.5-valid call whose one right answer is `dan` (the greatest of
 // `ann!` / `cho!` / `bob!` / `dan!`; the same call with a full explicit
-// `<Box, string>` list and `lambda(v: Box)` prints `dan`). Printing `dan` is
-// right; the pre-#8394 rejection of the untyped lambda body is the known gap;
-// a program that RUNS and prints anything else is the miscompile this row
-// exists to catch. (Once these run, a string key returned through `K` leaks
-// in the callee under the ASan oracle — #8469.)
-void expectDanOrTheKnownRejection8394(const char* src) {
+// `<Box, string>` list and `lambda(v: Box)` prints `dan`). (A string key
+// returned through `K` leaks in the callee — #8469 — which `runAot` does not
+// leak-check; the explicit twin leaks the same bytes.)
+void expectAdmittedWithAnswer8617(const char* src, const char* answer) {
     auto r = runAot(src);
-    if (r.ran) {
-        BEZEL_EXPECT_EQ(r.exitCode, 0);
-        BEZEL_EXPECT_EQ(r.stdoutText, "dan\n");
-    } else {
-        BEZEL_EXPECT_TRUE(
-            hasDiag8394(r, "requires both operands to be `string`"));
-    }
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, answer);
 }
 }  // namespace
 
@@ -443,28 +618,80 @@ BEZEL_TEST(sema_lambda_body_generic_inference_8394,
     BEZEL_EXPECT_EQ(r.stdoutText, "cho\n112\n");
 }
 
-// Guard rows (see the header): `K` reaches codegen from no argument.
+// fix #8617: `K` occurs only in the lambda's return slot and is bound by
+// phase 2 alone. Rejected before the fix (the #8394 guard declined to type
+// the lambda: "`+` requires both operands to be `string`").
 BEZEL_TEST(sema_lambda_body_generic_inference_8394,
-           spec_14_5_key_only_in_function_slot_right_or_rejected) {
-    expectDanOrTheKnownRejection8394(kKeyOnlyInFnSlot);
+           spec_14_5_phase2_key_bound_only_by_the_lambda_return_admitted_8617) {
+    expectAdmittedWithAnswer8617(kKeyOnlyInFnSlot, "dan\n");
 }
 
 // `seed: K?` receives a bare `null`: "a bare `null` literal argument is not
-// self-determined and contributes no binding" (§14.5 phase 1).
+// self-determined and contributes no binding" (§14.5 phase 1) — it binds
+// nothing, and converts to the substituted `string?` at the §22.6 check.
 BEZEL_TEST(sema_lambda_body_generic_inference_8394,
-           spec_14_5_key_formal_given_null_right_or_rejected) {
-    expectDanOrTheKnownRejection8394(kKeyFormalGetsNull);
+           spec_14_5_key_formal_given_null_admitted_8617) {
+    expectAdmittedWithAnswer8617(kKeyFormalGetsNull, "dan\n");
 }
 
-// `extra: Array<K>` receives `[]`, which has no element to bind `K` from.
+// `extra: Array<K>` receives `[]`, which is typed against the substituted
+// `Array<string>` (§15.4 *Empty literals*).
 BEZEL_TEST(sema_lambda_body_generic_inference_8394,
-           spec_14_5_key_formal_given_empty_literal_right_or_rejected) {
-    expectDanOrTheKnownRejection8394(kKeyFormalGetsEmptyLiteral);
+           spec_14_5_key_formal_given_empty_literal_admitted_8617) {
+    expectAdmittedWithAnswer8617(kKeyFormalGetsEmptyLiteral, "dan\n");
 }
 
 // `seed: K? := null` is omitted: "omitted optional parameters contribute
 // nothing" (§14.5 *Inputs and phases*).
 BEZEL_TEST(sema_lambda_body_generic_inference_8394,
-           spec_14_5_key_formal_omitted_right_or_rejected) {
-    expectDanOrTheKnownRejection8394(kKeyFormalOmitted);
+           spec_14_5_key_formal_omitted_admitted_8617) {
+    expectAdmittedWithAnswer8617(kKeyFormalOmitted, "dan\n");
+}
+
+// The int / record key rows: before the fix each compiled against an untyped
+// lambda, left `K` at the placeholder in the specialization and printed the
+// FIRST element (`ann`); the greatest `Age` is `cho` (40).
+
+// The issue's own #8394 repro: `MaxBy(people, lambda(p) => p.Age)`.
+BEZEL_TEST(sema_lambda_body_generic_inference_8394,
+           spec_14_5_phase2_int_key_bound_only_by_the_lambda_return_8617) {
+    expectAdmittedWithAnswer8617(kIntKeyOnlyInFnSlot, "cho\ncho\n");
+}
+
+BEZEL_TEST(sema_lambda_body_generic_inference_8394,
+           spec_14_5_int_key_formal_given_empty_literal_admitted_8617) {
+    expectAdmittedWithAnswer8617(kIntKeyFormalGetsEmptyLiteral, "cho\n");
+}
+
+BEZEL_TEST(sema_lambda_body_generic_inference_8394,
+           spec_14_5_int_key_formal_omitted_admitted_8617) {
+    expectAdmittedWithAnswer8617(kIntKeyFormalOmitted, "cho\n");
+}
+
+// A record key (`RK: IComparable<RK>`) with `seed: K?` given `null`.
+BEZEL_TEST(sema_lambda_body_generic_inference_8394,
+           spec_14_5_record_key_formal_given_null_admitted_8617) {
+    expectAdmittedWithAnswer8617(kRecordKeyFormalGetsNull, "cho\n");
+}
+
+// The instance-method spelling (`h.M(xs, lambda(v) => …, [])`). Rejected
+// before the fix.
+BEZEL_TEST(sema_lambda_body_generic_inference_8394,
+           spec_14_5_instance_method_key_formal_given_empty_literal_admitted_8617) {
+    expectAdmittedWithAnswer8617(kInstanceKeyFormalGetsEmptyLiteral, "dan\n");
+}
+
+// The unqualified spelling with the `null` BEFORE the lambda (`M(xs, null,
+// lambda(v) => …)`): phase 1 runs over every argument wherever it sits, and
+// the `null` still binds nothing. Rejected before the fix.
+BEZEL_TEST(sema_lambda_body_generic_inference_8394,
+           spec_14_5_unqualified_null_before_the_lambda_admitted_8617) {
+    expectAdmittedWithAnswer8617(kUnqualifiedNullBeforeLambda, "dan\n");
+}
+
+// The null-conditional spelling (`h?.M(xs, lambda(v) => v.Age)?.Name`) with
+// the optional `seed` omitted. Printed `ann` before the fix.
+BEZEL_TEST(sema_lambda_body_generic_inference_8394,
+           spec_14_5_null_conditional_int_key_formal_omitted_admitted_8617) {
+    expectAdmittedWithAnswer8617(kNullConditionalIntKeyOmitted, "cho\n");
 }

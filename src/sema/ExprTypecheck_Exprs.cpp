@@ -14633,20 +14633,32 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // (LlvmBackend_Calls2.cpp) arm for arm, because sema's `unifyArgSubst`
         // binds strictly MORE: through an implemented interface
         // (`IEnumerable<T>` against an `Array<int>`), and through a
-        // function-typed slot, which codegen has no arm for. A parameter sema
-        // binds and codegen does not is specialized at the placeholder type —
-        // `K.CompareTo` then emits nothing and `MaxBy` returns the first
-        // element. Codegen walks: a bare type parameter (bound unless the
-        // argument's type is `null`'s Object or is itself open); a built-in
-        // generic of the SAME name, component-wise; a declared generic of the
-        // SAME declaration, component-wise. Nothing else.
+        // function-typed slot's PARAMETER positions, which codegen has no arm
+        // for. A parameter sema binds and codegen does not is specialized at
+        // the placeholder type — `K.CompareTo` then emits nothing and `MaxBy`
+        // returns the first element. Codegen walks: a bare type parameter
+        // (bound unless the argument's type is `null`'s Object or is itself
+        // open); a built-in generic of the SAME name, component-wise; a
+        // declared generic of the SAME declaration, component-wise; a
+        // function-typed formal's RETURN slot against the argument's (#8527).
+        // Nothing else.
         const std::unordered_set<std::string_view> scopeTpNames2 =
             currentScopeGenericParamNames();
         std::function<void(const TypeRef*, const TypeRef*,
                            std::unordered_set<std::string_view>&)>
             codegenBinds2 = [&](const TypeRef* decl, const TypeRef* actual,
                                 std::unordered_set<std::string_view>& bound) {
-            if (!decl || !actual || decl->kind != TypeRef::Kind::Named) return;
+            if (!decl || !actual) return;
+            // fix #8617: codegen's #8527 arm binds through a function-typed
+            // formal's RETURN slot from the argument's own function type
+            // (`applyMethodGenericSubst`), and through nothing else of it.
+            if (decl->kind == TypeRef::Kind::Function) {
+                if (actual->kind == TypeRef::Kind::Function &&
+                    decl->funcReturn && actual->funcReturn)
+                    codegenBinds2(decl->funcReturn, actual->funcReturn, bound);
+                return;
+            }
+            if (decl->kind != TypeRef::Kind::Named) return;
             if (!decl->declaration) {
                 const std::string_view nm = decl->headName();
                 if (calleeOwnGenericNames.count(nm)) {
@@ -14742,19 +14754,33 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // it is taken only where the accepted program is also compiled
             // right: EVERY type parameter of the callee must be one codegen
             // binds at this call site — from an argument typed above whose
-            // static type carries it, or from the declared return type. A
-            // parameter that occurs only in a function-typed slot (MaxBy's
-            // `K` in `key: (T) -> K`), or elsewhere only in a formal whose
-            // argument is `null`, an empty collection literal or an omitted
-            // optional, is bound by sema from the lambda's return and by
-            // codegen from nothing; such a call stays on the old path until
-            // codegen binds through a function-typed slot (narrow #8394).
+            // static type carries it, from the declared return type, or from
+            // this lambda's own return slot. A parameter reached only through
+            // an implemented interface (`xs: IEnumerable<T>`) or a
+            // function-typed formal's parameter slot is bound by sema and by
+            // codegen from nothing; such a call stays on the old path.
             const TypeRef* declRet2 =
                 calleeMd2->returnType
                     ? ctx_.resolvedType(*calleeMd2->returnType) : nullptr;
+            // fix #8617 (§14.5 phase 2, v0.357; owner ruling on #8617): "the
+            // lambda's inferred return type then unifies against the function
+            // type's return position, binding type parameters still free".
+            // Codegen now binds that position too (#8527's arm in
+            // `applyMethodGenericSubst`), so a parameter reached by THIS
+            // lambda's return slot is bound — from the body typed below — and
+            // a `null`, an empty literal or an omitted optional at another
+            // `K`-bearing formal no longer leaves it unbound: such an argument
+            // "contributes no binding" and is checked against the substituted
+            // signature afterwards ("Conversions get their say afterward,
+            // argument by argument, at the §22.6 applicability check against
+            // the substituted signature", phase 1). Whether the body's return
+            // type really binds it is phase 3's question (an unbound `K` is
+            // still "cannot infer").
+            const TypeRef* lamRet2 = pt->funcReturn;
             for (const std::string_view nm : calleeOwnGenericNames)
                 if (!codegenBound.count(nm) &&
-                    !codegenReturnReaches2(declRet2, nm))
+                    !codegenReturnReaches2(declRet2, nm) &&
+                    !codegenReturnReaches2(lamRet2, nm))
                     return nullptr;
             TypeRef* substPt = substituteReturnType(pt, inferred);
             if (!substPt || substPt->kind != TypeRef::Kind::Function ||
