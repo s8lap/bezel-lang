@@ -2,6 +2,7 @@
 #include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #4901 shared-event gate)
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 #include "sema/ConstFold.hpp"  // fix #7285: §17.14 constant folding for the radix argument (§5.1)
+#include "sema/LinqStdlibOverloads.hpp"  // fix #8445: stdlib §5's operator overload table (§5 / §4.1)
 
 #include <cerrno>  // ERANGE — stdlib §9.1's 64-bit parse range failure (fix #8540)
 
@@ -26154,6 +26155,167 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     // `.` form's own lowering over a synthetic `.` call whose target is a pinned
     // placeholder carrying the already-lowered receiver (the #6512 pattern), the
     // call's own argument nodes lent to it, then wrap the result as `T?`.
+    //
+    // fix #8445 (stdlib §5 / §4.1, §7.5, v0.357): the `?.` spelling of a
+    // stdlib §5 LINQ OPERATOR on a POLYMORPHIC collection interface
+    // (`ICollection<T>` / `IReadOnlyCollection<T>` / `IOwningCollection<T>`).
+    //
+    // THE DEFECT (issue #8445). §7.5 (spec §7.5, v0.357): "`x?.M` returns
+    // null if `x` is null; otherwise it PERFORMS THE ACCESS" — the access is
+    // the member the `.` spelling resolves, so the two spellings of ONE member
+    // may not disagree. The `.` spelling of `c.Sum()` on an `ICollection<int>`
+    // is REFUSED by codegen's #2457
+    // backstop (lowerCallDispatch's "produced no value" gate): the
+    // polymorphic collection interfaces ERASE the concrete backing
+    // (array / linked-list / hash-table — stdlib §4.1), so no §5 operator is
+    // sound on them and this compiler has no lowering arm for one. The `?.`
+    // spelling of the SAME call was SILENTLY DROPPED instead. WHY: sema's
+    // §7.5 twin types a `?.` call by re-entering the `.` typing on a
+    // placeholder receiver, and stdlib §5's operator arm deliberately
+    // EXCLUDES `ICollection<T>` / `IReadOnlyCollection<T>` (the #7544 note:
+    // "their runtime representation is erased (codegen rejects §5 operators
+    // on them loudly, #853), and typing the call would turn that loud
+    // rejection into a silent drop"). So the `?.` call stayed UNTYPED, and
+    // `lowerNullCondBuiltinCall` — which needs a TYPED call to know what to
+    // lift the result to (`T?`, §7.5) — declined it. The enclosing store was
+    // degraded to a zero value behind the #2434 note and the program exited 0
+    // having printed NOTHING (#3079's warning). MEASURED (issue #8445):
+    // `Console.WriteLine(c?.Sum() ?? -1)` printed no line at all, at exit 0.
+    //
+    // THE FIX. Route the `?.` spelling through the `.` spelling's OWN
+    // dispatch, so the two spellings of ONE member CANNOT disagree: lower the
+    // receiver once (§7.5), null-check it, and on the non-null path lower a
+    // synthetic `.` call whose target is a pinned placeholder carrying the
+    // receiver's NON-nullable type. The twin carries NO sema type — that is
+    // exactly what makes the `.` spelling's own #2457 backstop fire (SEMA
+    // MUST BE AS IGNORANT AS CODEGEN: the backstop's "sema never typed this
+    // call" conjunct is satisfied because sema typed NEITHER spelling — the
+    // `?.` twin it builds is the same untype-able shape). The refusal is then
+    // BYTE-IDENTICAL to the `.` spelling's, produced by the SAME code, not a
+    // copy of its text.
+    //
+    // This is #7557's treatment (the `?.Count` / `?.Contains` members of the
+    // same family) carried over to the stdlib §5 operator shapes, which reach
+    // the refusal through the #2457 backstop rather than through #7557's #853
+    // fence.
+    //
+    // SCOPE — the population is the stdlib §5 operator NAMES
+    // (`sema::stdlibLinqLookup(name, -1)`, the ONE table stdlib §5's listing is
+    // mirrored in — the NAME-ONLY form, so a §5 operator called with an arity
+    // §5 does not declare is in the population too: the `.` spelling refuses
+    // it with the same #2457 backstop) MINUS the members the interface head
+    // itself DECLARES
+    // (`common::interfaceCollectionHeadDeclares` — `Count`, `Contains`,
+    // `GetEnumerator`, `Add`, `Clear`, `Remove`, `IsReadOnly`): those are
+    // §4.1's OWN members, and the `?.` spelling of them already reaches the
+    // `.` spelling's own fence (#7557's fix for `Count`/`Contains`, #853's
+    // fence for the mutators). A call sema TYPED is excluded too: a typed
+    // `?.` call lowers through #6529's `lowerNullCondBuiltinCall` and is not
+    // this population — and an UNTYPED one is exactly the population whose
+    // `.` twin sema could not type either.
+    if (!ms && nm.target && nm.typeArgs.empty() && !nm.member.empty() &&
+        !ctx_.exprType(call)) {
+        const sema::TypeRef* pcRcvTy = ctx_.exprType(*nm.target);
+        if (pcRcvTy && isCollectionInterfaceName(pcRcvTy)) {
+            const std::string_view pcHead = builtinTypeName(pcRcvTy);
+            if (!common::interfaceCollectionHeadDeclares(pcHead, nm.member) &&
+                sema::stdlibLinqLookup(nm.member, -1) != nullptr) {
+                // The receiver is evaluated ONCE (§7.5: "the receiver is
+                // evaluated first; if it is null the access does not occur").
+                llvm::Value* pcRcv = lowerExpr(*nm.target);
+                if (!pcRcv || !pcRcv->getType()->isPointerTy()) return nullptr;
+                auto* pcEntryBB = builder_.GetInsertBlock();
+                auto* pcAccessBB = llvm::BasicBlock::Create(
+                    llvm_, "nclinq.access", currentFn_);
+                auto* pcEndBB = llvm::BasicBlock::Create(
+                    llvm_, "nclinq.end", currentFn_);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpEQ(
+                        pcRcv, llvm::ConstantPointerNull::get(ptrTy())),
+                    pcEndBB, pcAccessBB);
+                builder_.SetInsertPoint(pcAccessBB);
+                // The `.` twin: a placeholder carrying the receiver's
+                // NON-nullable type (the `?.` twin sees the PRESENT value,
+                // exactly as the `.` spelling's receiver is typed), with the
+                // already-lowered receiver pinned in it so the receiver is
+                // not evaluated twice.
+                auto pcPlaceholder = std::make_unique<ast::IdentifierExpr>();
+                pcPlaceholder->name = "<nullcond-receiver>";  // unspellable
+                sema::TypeRef* pcPlaceholderTy = ctx_.makeTypeRef(*pcRcvTy);
+                pcPlaceholderTy->nullable = false;
+                ctx_.setExprType(pcPlaceholder.get(), pcPlaceholderTy);
+                if (sema::Symbol* pcTargetSym = ctx_.exprSymbol(*nm.target))
+                    ctx_.setExprSymbol(pcPlaceholder.get(), pcTargetSym);
+                exprValueOverride_[pcPlaceholder.get()] = pcRcv;
+                const ast::Expr* pcPlaceholderKey = pcPlaceholder.get();
+                auto pcDotted = std::make_unique<ast::MemberAccessExpr>();
+                pcDotted->span = nm.span;
+                pcDotted->member = nm.member;
+                pcDotted->target = std::move(pcPlaceholder);
+                auto pcSynth = std::make_unique<ast::CallExpr>();
+                pcSynth->span = call.span;
+                pcSynth->callee = std::move(pcDotted);
+                // ⚠ NO sema type on the twin, and NO type on its callee: the
+                // `.` spelling's #2457 backstop refuses a call SEMa left
+                // untyped (SEMA MUST BE AS IGNORANT AS CODEGEN). Typing the
+                // twin here would skip the backstop and RE-CREATE the silent
+                // drop this fix removes.
+                if (const auto* pcBnd = ctx_.builtinCallBinding(call))
+                    ctx_.setBuiltinCallBinding(pcSynth.get(), *pcBnd);
+                auto& pcMutCall = const_cast<ast::CallExpr&>(call);
+                pcSynth->args = std::move(pcMutCall.args);
+                llvm::Value* pcInner = lowerExpr(*pcSynth);
+                pcMutCall.args = std::move(pcSynth->args);
+                exprValueOverride_.erase(pcPlaceholderKey);
+                nullCondGroupingCallSynth_.push_back(std::move(pcSynth));
+                if (!pcInner) {
+                    // The `.` spelling refused this call and its refusal is
+                    // already reported. The `?.` spelling therefore produced
+                    // no value either — but LOUDLY, with the SAME diagnostic,
+                    // instead of degrading to a zero value behind an
+                    // `internal:` note. Close the CFG validly and report
+                    // "nothing lowered" to the enclosing site, whose own
+                    // #2434 / #3079 note is suppressed by the Error above.
+                    builder_.CreateBr(pcEndBB);
+                    builder_.SetInsertPoint(pcEndBB);
+                    return nullptr;
+                }
+                // The `.` spelling DID lower the call after all: lift the
+                // result to `T?` (§7.5: "the result type is always
+                // nullable") and return it.
+                const bool pcIsPtr = pcInner->getType()->isPointerTy();
+                llvm::Type* pcNullTy = nullptr;
+                llvm::Value* pcWrapped = pcInner;
+                if (pcIsPtr) {
+                    pcNullTy = ptrTy();
+                } else {
+                    auto* pcNst = llvm::StructType::get(
+                        llvm_, {nullablePrimHasValTy(), pcInner->getType()});
+                    pcWrapped = builder_.CreateInsertValue(
+                        builder_.CreateInsertValue(
+                            llvm::UndefValue::get(pcNst),
+                            llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                            {0u}),
+                        pcInner, {1u});
+                    pcNullTy = pcNst;
+                }
+                auto* pcAccessEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(pcEndBB);
+                builder_.SetInsertPoint(pcEndBB);
+                auto* pcPhi = builder_.CreatePHI(pcNullTy, 2);
+                pcPhi->addIncoming(
+                    pcIsPtr
+                        ? static_cast<llvm::Value*>(
+                              llvm::ConstantPointerNull::get(ptrTy()))
+                        : static_cast<llvm::Value*>(
+                              llvm::ConstantAggregateZero::get(
+                                  llvm::cast<llvm::StructType>(pcNullTy))),
+                    pcEntryBB);
+                pcPhi->addIncoming(pcWrapped, pcAccessEnd);
+                return pcPhi;
+            }
+        }
+    }
     if (!ms && nm.target && nm.typeArgs.empty() && !nm.member.empty()) {
         if (llvm::Value* r = lowerNullCondBuiltinCall(call, nm)) return r;
         // fix #8583 (§7.5, stdlib §4.1 / §4.2, v0.357): the `?.` spelling of a
