@@ -17338,6 +17338,40 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             break;
                         }
                     }
+                    // fix #8393 (§14.5 phase 1, stdlib §9.8, v0.357): the
+                    // `IEnumerable<T>` formal at a `Range<X>` argument binds
+                    // `T` to `X` — the §14.5 phase-1 "the unique
+                    // instantiation of `G` that the argument's type
+                    // implements" rule, whose codegen-side twin is
+                    // `bindRangeElemToEnumerableParam`.
+                    //
+                    // It runs HERE — before `buildOrderedArgs` — because a
+                    // LAMBDA argument's own parameter type is resolved from
+                    // the formal's expected function type (`(T) -> …`) through
+                    // the ACTIVE substitution (`lowerLambda`). Without the
+                    // binding the lambda's parameter stayed at the i32
+                    // placeholder while the callee (specialized by the same
+                    // rule) read the range's elements at their own width —
+                    // the two halves of one call disagreeing on the width.
+                    for (std::size_t pi = 0;
+                         pi < md->params.size() && pi < call.args.size();
+                         ++pi) {
+                        const ast::Type* pt = md->params[pi].type.get();
+                        if (!pt || !call.args[pi].value) continue;
+                        // Only a CONCRETE argument carries the element type.
+                        if (dynamic_cast<const ast::LambdaExpr*>(
+                                call.args[pi].value.get()))
+                            continue;
+                        const sema::TypeRef* declPt =
+                            ctx_.resolvedType(*pt);
+                        sema::TypeRef* at =
+                            ctx_.exprType(*call.args[pi].value);
+                        if (!declPt || !at) continue;
+                        if (bindRangeElemToEnumerableParam(
+                                declPt, at, md->genericParams,
+                                preSubst, preSema))
+                            break;
+                    }
                     if (preSubst != genericSubst_ ||
                         preSema != genericSubstSemaTy_) {
                         preSavedSubst = genericSubst_;
@@ -19912,6 +19946,24 @@ void Emitter::applyMethodGenericSubst(
                                          added);
             });
         }
+        // fix #8393 (§14.5 phase 1, stdlib §4.12, v0.357): an `IEnumerable<T>`
+        // formal at a `Range<X>` argument (stdlib §9.8 — `Range<T>` implements
+        // `IEnumerable<T>`) binds `T` to `X` — the §14.5
+        // phase-1 rule that a constructed parameter type unifies against
+        // "the unique instantiation of `G` that the argument's type
+        // implements or extends". `unifyMethodReturnTypeArg` above unifies
+        // only SAME-SHAPED generics (same head / same declaration), so it
+        // cannot see the `Range<X>` → `IEnumerable<X>` relation and left `T`
+        // at §14.1's i32 placeholder. The placeholder is not a harmless
+        // stand-in here: it is the width the callee's for-in reads the
+        // enumerator's `Current` at, so the monomorphized body read a
+        // `Range<byte>`'s elements as i32 (and drained the frame at i32,
+        // which the runtime refuses to widen — an EMPTY snapshot, i.e. a
+        // printed 0).
+        underCallerSubst([&] {
+            bindRangeElemToEnumerableParam(declPt, atCaller, md->genericParams,
+                                           newSubst, newSema);
+        });
     }
     // fix #4813 (§14.1 / §15.4, v0.307): a sequence collection literal
     // (`C([11, 22])` against `xs: Array<T>`) has no expression type of its

@@ -26245,6 +26245,70 @@ private:
         return !isBuiltinTypeRefName(t->headName());
     }
 
+    // fix #8393 (§14.5 phase 1, stdlib §9.8, v0.357): the §14.5 phase-1
+    // rule that a constructed parameter type `G<P1, …, Pn>` unifies against
+    // "the unique instantiation of `G` that the argument's type implements
+    // or extends" — the CODEGEN-side twin of sema's
+    // `collectBuiltinAncestorInstantiationsOf`, whose `Range` row #8393 added
+    // to the §26.5 builtin-conformance table. Codegen carries no §26.5
+    // ancestor table, so the ONE builtin family this fix models is spelled
+    // here: stdlib §9.8 declares `public record Range<T>: IEnumerable<T>`, so
+    // a `Range<X>` argument at an `IEnumerable<T>` parameter binds `T` to
+    // `X`.
+    //
+    // WHY THE BINDING IS LOAD-BEARING (MEASURED on the #8393 tip): without
+    // it the callee's monomorphization leaves `T` at §14.1's i32
+    // placeholder, and then BOTH widths the call depends on are wrong:
+    // the callee's for-in reads the enumerator's `Current` at `T`'s width,
+    // and the call site's own wrap drains the range's lazy frame at `T`'s
+    // stride. A `Range<byte>` argument drained at i32 (4 bytes) against the
+    // frame's 1-byte elements is REFUSED by the runtime (`bz_lazy_to_array`
+    // widens only downwards), so the snapshot came back EMPTY and the call
+    // printed 0 — where the SAME call with the type argument WRITTEN
+    // (`Sum<byte>(b..e, …)`) printed 15. The mirror case (a `Range<long>`
+    // drained at i32) did not refuse but TRUNCATED: `Sum(5000000000..5000000002)`
+    // printed 2115098115 instead of 15000000003.
+    //
+    // The binding is deliberately narrow: the formal must be the builtin
+    // `IEnumerable<T>` (the ONLY interface stdlib §9.8's `Range<T>`
+    // implements — `IList<T>` / `ICollection<T>` / `IReadOnlyList<T>` stay
+    // rejected by sema), the element must be a BARE type parameter of THIS
+    // method, and the source must be a `Range<X>`. An already-bound
+    // parameter keeps its binding (§14.5: "Explicit lists are
+    // all-or-nothing … no inference runs").
+    bool bindRangeElemToEnumerableParam(
+            const sema::TypeRef* formalTy, const sema::TypeRef* argTy,
+            const std::vector<ast::GenericParam>& genericParams,
+            std::unordered_map<std::string_view, llvm::Type*>& subst,
+            std::unordered_map<std::string_view, const sema::TypeRef*>& semaTy) {
+        if (!formalTy || !argTy) return false;
+        if (formalTy->kind != sema::TypeRef::Kind::Named ||
+            formalTy->declaration ||
+            builtinTypeName(formalTy) != "IEnumerable")
+            return false;
+        if (formalTy->genericArgs.size() != 1 || !formalTy->genericArgs[0])
+            return false;
+        const sema::TypeRef* tel = formalTy->genericArgs[0];
+        if (!isBareTypeParamRef(tel)) return false;
+        std::string_view tn = tel->headName();
+        bool isParam = false;
+        for (const auto& gp : genericParams)
+            if (gp.name == tn) { isParam = true; break; }
+        if (!isParam) return false;
+        if (subst.count(tn)) return false;
+        if (!isRangeType(argTy)) return false;
+        if (argTy->genericArgs.size() != 1 || !argTy->genericArgs[0])
+            return false;
+        // The element is written in the CALLER's scope: resolve it there,
+        // exactly as the argument-driven inference resolves its argument.
+        const sema::TypeRef* elem = substituteTypeRefLocal(
+            argTy->genericArgs[0], genericSubstSemaTy_);
+        if (!elem) return false;
+        subst[tn] = lowerTypeRef(elem);
+        semaTy[tn] = elem;
+        return true;
+    }
+
     // fix #5300 / #5301: the bare-type-parameter-RETURN predicate is the free
     // `methodReturnsBareTypeParam(ctx, ms)` above (it must also be readable from
     // `StringEscapeWalker`, which holds no Emitter).

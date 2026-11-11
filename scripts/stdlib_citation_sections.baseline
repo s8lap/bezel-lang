@@ -16,7 +16,7 @@
 # -- and NO line number, because a line-numbered key would fail the
 # gate on every unrelated commit that moved a comment.
 #
-count: 470
+count: 469
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	IOwningEnumerable	4.5
 site:	src/codegen/LlvmBackend_Assign.cpp	wrong-section	Range	4.4
 site:	src/codegen/LlvmBackend_Calls.cpp	wrong-section	Array	2.6
@@ -104,7 +104,6 @@ site:	src/runtime/bezel_runtime_fileio.cpp	wrong-section	File	3.2
 site:	src/runtime/bezel_runtime_strings.cpp	wrong-section	Array	9.6
 site:	src/runtime/bezel_runtime_strings.cpp	wrong-section	IEnumerable	9.6
 site:	src/runtime/bezel_runtime_strings.cpp	wrong-section	ToString	2.18
-site:	src/runtime/bezel_runtime_time.cpp	wrong-section	DateTime	2.18
 site:	src/runtime/bezel_runtime_time.cpp	wrong-section	Guid	2.18
 site:	src/runtime/bezel_runtime_time.cpp	wrong-section	TimeSpan	2.18
 site:	src/sema/ExprTypecheck.cpp	wrong-section	Array	5

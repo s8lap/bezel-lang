@@ -19,7 +19,8 @@
 //     `Range<int>` is the `Range<T>` twin of the spec's own `Array<int>`
 //     example.
 //
-// THE DEFECT. Three gaps, all in `src/sema/ExprTypecheck.cpp`:
+// THE DEFECT. Four gaps in `src/sema/ExprTypecheck.cpp` — and a FIFTH, in
+// `src/codegen`:
 //
 //   1. The §26.5 builtin-conformance table (`builtinInterfaceAncestors`) had
 //      no `Range` row, so the walk never reached `IEnumerable<T>` for a
@@ -42,6 +43,29 @@
 //      (`variantGenericAssignable`'s per-argument loop) has always skipped a
 //      FREE type variable on either side, which is why the `Array<int>` twin
 //      of this very call was admitted all along.
+//   4. The §26.5 table is ALSO read by the §26.5 extension-resolution walk,
+//      and §16.3/#7029 do NOT admit the `Range<T>`→`IEnumerable<T>`
+//      conversion at an extension RECEIVER position. MEASURED: with (1)
+//      alone, `(1..10).UserExt()` (a user `extension IEnumerable<T>` block)
+//      COMPILED, printed NOTHING, and emitted only an internal "failed to
+//      lower to a value" warning — a silent wrong answer where the
+//      pre-fix compiler gave a clean refusal. `extensionFindMatchingAncestor`
+//      therefore keeps a built-in `Range` receiver out of the
+//      extension-candidate set.
+//   5. (CODEGEN) The callee's monomorphization never learned the INFERRED
+//      `T` — codegen's own inference unifies only SAME-SHAPED generics, so
+//      it could not see the `Range<X>` → `IEnumerable<X>` relation — and `T`
+//      stayed at §14.1's i32 PLACEHOLDER. The placeholder is not a neutral
+//      stand-in here: it is the WIDTH the callee's for-in reads the
+//      enumerator's `Current` at, and the width the call site's own wrap
+//      drains the range's lazy frame at. A `Range<byte>` argument drained at
+//      i32 (4 bytes) against the frame's 1-byte elements is REFUSED by the
+//      runtime (`bz_lazy_to_array` widens only downwards), so the snapshot
+//      came back EMPTY and the call printed 0 where the SAME call with the
+//      type argument WRITTEN (`Sum<byte>(b..e, …)`) printed 15. A
+//      `Range<long>` drained at i32 did not refuse but TRUNCATED:
+//      `Sum(5000000000..5000000002)` printed 2115098115 instead of
+//      15000000003.
 //
 // MEASURED on the pre-fix base (r30-c1, 71317e6c9): the issue's own repro
 // was REJECTED with
@@ -54,11 +78,11 @@
 // compiled, which is the asymmetry the issue names.
 //
 // The rows below pin the repaired verdicts and the MUST-STAY-REJECTED /
-// MUST-STAY-GREEN controls around them: a `Range<int>` implements ONLY
-// `IEnumerable<T>` (stdlib §9.8), so it must still be rejected at
-// `IReadOnlyList<T>`, at `IList<T>`, at `ICollection<T>`, and at an
-// `IEnumerable<string>` — and an explicitly written `IEnumerable<string>`
-// type argument must still beat the inference.
+// MUST-STAY-GREEN controls around them: a `Range<int>` (stdlib §9.8)
+// implements ONLY `IEnumerable<T>` (stdlib §4.12), so it must still be
+// rejected at `IReadOnlyList<T>`, at `IList<T>`, at `ICollection<T>`, and
+// at an `IEnumerable<string>` — and an explicitly written
+// `IEnumerable<string>` type argument must still beat the inference.
 //
 // All rows are on the `runAot` oracle (the in-process JIT harness is
 // deprecated).
@@ -241,6 +265,40 @@ std::string userExtensionOnRange() {
            "end Program;\n";
 }
 
+// A program that sums a range of `elemType` through an INFERRED `T` and
+// prints the sum and then the element count.
+//
+// The type argument is NOT written: the whole point of these rows is that
+// §14.5 phase 1 infers it from the range's ELEMENT — and that the inferred
+// `T` carries the range's element WIDTH all the way into the callee's
+// monomorphization (`Sum`/`Cnt` are generic over `T`, so their bodies are
+// emitted per instantiation) and into the call site's own wrap of the range
+// (the lazy frame's element stride).
+std::string inferredSumAndCount(const std::string& elemType,
+                                const std::string& lo,
+                                const std::string& hi) {
+    return "module P;\n"
+           "public class Program\n"
+           "  private static method Sum<T>(xs: IEnumerable<T>, "
+           "f: (T) -> long): long\n"
+           "    var n: long := 0;\n"
+           "    for var x in xs do n := n + f(x); end;\n"
+           "    return n;\n"
+           "  end Sum;\n"
+           "  private static method Cnt<T>(xs: IEnumerable<T>): int\n"
+           "    var n := 0;\n"
+           "    for var x in xs do n++; end;\n"
+           "    return n;\n"
+           "  end Cnt;\n"
+           "  public static method Main()\n"
+           "    var lo: " + elemType + " := " + lo + ";\n"
+           "    var hi: " + elemType + " := " + hi + ";\n"
+           "    Console.WriteLine(Sum(lo..hi, lambda(v) => long(v)));\n"
+           "    Console.WriteLine(Cnt(lo..hi));\n"
+           "  end Main;\n"
+           "end Program;\n";
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -389,4 +447,76 @@ BEZEL_TEST(sema_generic_inference_range_ienumerable_8393,
     // The program must not have been accepted silently: no "produced no
     // value" degradation may have let it through as a compile.
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "failed to lower"));
+}
+
+// ===========================================================================
+// T6 — the inferred `T` carries the RANGE'S ELEMENT WIDTH.
+// ===========================================================================
+
+// §14.5 phase 1 / stdlib §9.8 (v0.357): the inference binds `T` to the
+// range's ELEMENT, and that element's WIDTH must reach BOTH halves of the
+// call — the callee's monomorphization (whose for-in reads the enumerator's
+// `Current` at `T`'s width) and the call site's own wrap of the range (the
+// lazy frame's element stride).
+//
+// MEASURED on the #8393 tip, where the semantics admitted the call but the
+// codegen still carried §14.1's i32 placeholder: `Sum(b..e)` over a
+// `Range<byte>` printed 0 (not 15) and `Cnt(b..e)` printed 0 (not 5) — the
+// wrap drained the range's 1-byte frame at the placeholder's 4 bytes, and
+// the runtime REFUSES to widen (`bz_lazy_to_array`), so the snapshot came
+// back EMPTY. The `ulong` row below is the mirror case at the other end: a
+// 64-bit frame drained at i32 does not refuse but TRUNCATES.
+//
+// The `byte` row: 1 + 2 + 3 + 4 + 5 = 15 over five elements.
+BEZEL_TEST(sema_generic_inference_range_ienumerable_8393,
+           t6_inferred_t_carries_the_byte_element_width_spec_14_5) {
+    BEZEL_EXPECT_EQ(runAotOut(inferredSumAndCount("byte", "1", "5")),
+                    std::string("15\n5"));
+}
+
+// The `sbyte` twin — the SIGNED 8-bit element. The width is the same, so the
+// row is about the SIGN: a byte element read at the wrong width (or signed
+// at the wrong width) changes the sum.
+BEZEL_TEST(sema_generic_inference_range_ienumerable_8393,
+           t6_inferred_t_carries_the_sbyte_element_width_spec_14_5) {
+    BEZEL_EXPECT_EQ(runAotOut(inferredSumAndCount("sbyte", "1", "5")),
+                    std::string("15\n5"));
+}
+
+// The `short` twin — the 16-bit element.
+BEZEL_TEST(sema_generic_inference_range_ienumerable_8393,
+           t6_inferred_t_carries_the_short_element_width_spec_14_5) {
+    BEZEL_EXPECT_EQ(runAotOut(inferredSumAndCount("short", "1", "5")),
+                    std::string("15\n5"));
+}
+
+// The `ushort` twin — the UNSIGNED 16-bit element.
+BEZEL_TEST(sema_generic_inference_range_ienumerable_8393,
+           t6_inferred_t_carries_the_ushort_element_width_spec_14_5) {
+    BEZEL_EXPECT_EQ(runAotOut(inferredSumAndCount("ushort", "1", "5")),
+                    std::string("15\n5"));
+}
+
+// The `char` twin — stdlib §9.8 admits `char` as a `Range<T>` element, and
+// `char` is a 32-BIT code point (§5), so its width is the placeholder's own:
+// this row is a MUST-STAY-GREEN control (it printed 255/5 before the width
+// repair too) that the repair must not disturb. The sum is the sum of the
+// code points '1' … '5' = 49 + 50 + 51 + 52 + 53 = 255.
+BEZEL_TEST(sema_generic_inference_range_ienumerable_8393,
+           t6_inferred_t_carries_the_char_element_width_spec_9_8) {
+    BEZEL_EXPECT_EQ(runAotOut(inferredSumAndCount("char", "'1'", "'5'")),
+                    std::string("255\n5"));
+}
+
+// The `ulong` twin — the 64-bit element, and the row that pins the TRUNCATION
+// the width repair removes. 5000000000 + 5000000001 + 5000000002 =
+// 15000000003, which does NOT fit in 32 bits: read at the i32 placeholder
+// the sum was 2115098115 (the low half of each element). The reviewer
+// measured only small values, so this row is the one that catches the
+// truncation.
+BEZEL_TEST(sema_generic_inference_range_ienumerable_8393,
+           t6_inferred_t_carries_the_ulong_element_width_spec_14_5) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(inferredSumAndCount("ulong", "5000000000", "5000000002")),
+        std::string("15000000003\n3"));
 }

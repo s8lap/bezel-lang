@@ -11918,7 +11918,7 @@ llvm::Value* Emitter::drainLazyPipelineToOwnedIEnumerable(
 llvm::Value* Emitter::wrapRangeAsOwnedIEnumerable(
         llvm::Value* rangeVal, const sema::TypeRef* rangeTy,
         const sema::TypeRef* iEnumTy) {
-    const sema::TypeRef* elemRef =
+    sema::TypeRef* elemRef =
         (rangeTy && !rangeTy->genericArgs.empty()) ? rangeTy->genericArgs[0]
                                                    : nullptr;
     llvm::Type* et = elemRef ? lowerTypeRef(elemRef) : i32();
@@ -11943,7 +11943,34 @@ llvm::Value* Emitter::wrapRangeAsOwnedIEnumerable(
         {i64(), i64(), i64(), llvm::Type::getInt8Ty(llvm_), i64()});
     llvm::Value* lazy = builder_.CreateCall(
         fn, {start, end, step, flags, builder_.getInt64(esz)}, "lazy.range");
-    return drainLazyPipelineToOwnedIEnumerable(lazy, iEnumTy);
+    // fix #8393 (§14.5 phase 1, stdlib §9.8, v0.357): the drain's element
+    // STRIDE must be the RANGE'S OWN element width — the very width the lazy
+    // frame above was built with. The TARGET's element is not a substitute:
+    // at an `IEnumerable<T>` parameter whose `T` is not yet known it is
+    // §14.1's i32 PLACEHOLDER, and the runtime REFUSES to widen the
+    // snapshot (`bz_lazy_to_array`: `esz > e->esz` → an EMPTY snapshot) and
+    // TRUNCATES it when narrowing. So the drain read the range's elements at
+    // the WRONG width: a `Range<byte>`'s 1-byte frame drained at i32 (4
+    // bytes) produced an EMPTY array — the call printed 0 where the same
+    // call with the type argument WRITTEN printed 15 — and a `Range<long>`'s
+    // 8-byte frame drained at i32 produced a TRUNCATED one (15000000003 read
+    // as 2115098115).
+    //
+    // The range's element IS the target's element wherever the conversion is
+    // admitted (stdlib §9.8's `Range<T>: IEnumerable<T>` plus §5.1's
+    // element-type IDENTITY), so this is the target's element with the
+    // placeholder replaced — and the enumerator's vtable (built from the
+    // same type below) then matches the callee's monomorphized read.
+    sema::TypeRef drainStorage;
+    const sema::TypeRef* drainTy = iEnumTy;
+    if (elemRef && iEnumTy && iEnumTy->kind == sema::TypeRef::Kind::Named &&
+        iEnumTy->genericArgs.size() == 1 && iEnumTy->genericArgs[0] &&
+        iEnumTy->genericArgs[0] != elemRef) {
+        drainStorage = *iEnumTy;
+        drainStorage.genericArgs[0] = elemRef;
+        drainTy = &drainStorage;
+    }
+    return drainLazyPipelineToOwnedIEnumerable(lazy, drainTy);
 }
 
 // fix #5612 / §29.11 item 3 (v0.333): the ARGUMENT-position counterpart of
