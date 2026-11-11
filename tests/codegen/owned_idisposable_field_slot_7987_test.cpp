@@ -57,10 +57,21 @@
 // =======
 // `isOwnedReferenceField` now admits the declaration-less disposal heads
 // (`isDisposableInterfaceHeadType`), and `elementPolicyFor`'s class/interface
-// row admits them as an element type.  The discharge is the class-vtable
-// slot-2 dynamic dispatch — the SAME path the `owned d: IDisposable`
-// PARAMETER case takes (#4328 / #7554) and the same path the
-// `using var`-bound LOCAL case takes.
+// row admits them as an element type.  The discharge is the vtable slot-2
+// dynamic dispatch — the SAME path the `owned d: IDisposable` PARAMETER case
+// takes (#4328 / #7554) and the same path the `using var`-bound LOCAL case
+// takes.
+//
+// That dispatch presumes the slot's value opens with a vtable.  It is NOT
+// true that such a value is always a user class: the stdlib's classes
+// implement `IDisposable` too (stdlib §2.10) and several had no dispatch
+// header when this fix was written — `Shared<T>` / `Weak<T>`, `LinkedList`,
+// the hash-backed `Dictionary` / `Set` families, the event sources, the
+// atomic cells, the serializers, `Subscription`, `Channel<T>`, the
+// completion sources — so for those this fix turned a leak into a wild
+// dispatch (#8533).  Fix #8533 gave each of them except `Channel<T>` and the
+// completion sources (#7532) a word-0 vtable; its rows are in
+// tests/codegen/idisposable_slot_headerless_handle_8533_test.cpp.
 //
 // THE BORROWING FAMILY IS NOT TOUCHED
 // ===================================

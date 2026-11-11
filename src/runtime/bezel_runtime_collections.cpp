@@ -34,21 +34,11 @@ void* bz_ioe_vtable = nullptr;
 // dispose_elem is a no-op for Set<T> where bz_dict_free does not dispose
 // values).
 //
-// PROBE ORDER. bz_array_t and bz_llist_t both carry their kind at the same
-// offset 48 (bz_llist_t's struct has an 8-byte padding slot for this
-// reason — see the comment on the struct). bz_dict_t's struct is larger and
-// carries its kind at offset 88 (its order_count field occupies offset 56,
-// a non-negative count that cannot collide with the negative sentinels).
-// The probes walk offset 48 first, then offset 88.
-//
-// SENTINEL VALUES. The kind sentinels are negative int64 values (-1 / -2 /
-// -3). order_count (the bz_dict_t field at offset 56) is a non-negative
-// count of valid insertions — it cannot equal a negative sentinel — so the
-// first probe can never false-positive a dict as an array or llist. A
-// positive sentinel would not have this property (a freshly constructed
-// dict has order_count == 0, but a populated dict's order_count grows
-// without a natural upper bound and could in principle collide with a
-// small positive sentinel).
+// PROBE. Every backing opens with its vtable word (bz_array_vtable /
+// bz_sb_vtable since #6776; bz_llist_vtable / bz_dict_vtable since #8533), so
+// the dispatch is three word-0 compares and reads nothing else. (Before #8533
+// the list and the table were told apart by negative `kind` sentinels at
+// offsets 48 and 88, which read past the end of any smaller block.)
 //
 // UNTAGGED POINTER. An untagged pointer (BZ_RUNTIME_KIND_NONE = 0, or any
 // other value the probes do not match) is treated as a bounded leak —
@@ -60,16 +50,24 @@ void* bz_ioe_vtable = nullptr;
 // ---------------------------------------------------------------------------
 // fix #6776 (§8.2, v0.340): a bz_array_t now opens with its vtable word
 // (bz_array_vtable, or bz_sb_vtable for a StringBuilder's parts array), so
-// the array probe is a word-0 compare; the `kind` field moved to offset 64
-// and is no longer what identifies an array. bz_llist_t still carries its
-// kind at offset 48 and bz_dict_t at 88; neither can alias the array probe
-// (a list's word 0 is its head pointer, a dict's its bucket pointer) and an
-// array's offset 48 is now `mod_count`, a non-negative counter that can
-// never equal the negative LLIST sentinel.
+// the array probe is a word-0 compare; the `kind` field is no longer what
+// identifies an array.
 static inline bool bz_word0_is_array(void* p) {
     void* word0;
     memcpy(&word0, p, sizeof(void*));
     return word0 == (void*)bz_array_vtable || word0 == (void*)bz_sb_vtable;
+}
+// fix #8533 (§8.2 / §28.5, v0.357): bz_llist_t and bz_dict_t open with a
+// vtable word too (bz_llist_vtable / bz_dict_vtable), so ALL THREE backings
+// are identified by a word-0 compare and the offset-48 / offset-88 `kind`
+// probes described above are gone: nothing is read past word 0 of a block
+// whose size this helper does not know. The `kind` fields are still set by
+// the allocators (they are what `bz_runtime_kind` reports) but no longer
+// identify anything.
+static inline bool bz_word0_is(void* p, void* vtable) {
+    void* word0;
+    memcpy(&word0, p, sizeof(void*));
+    return word0 == vtable;
 }
 
 // fix #8118 (§28.1 / §8.1 / §15.2, v0.355): the EXPORTED form of the array
@@ -85,9 +83,9 @@ static inline bool bz_word0_is_array(void* p) {
 // helper also answers 1 for the Mutex / CancellationTokenSource handles, and
 // those must NOT take the class protocol — their vtable Dispose slot
 // (`bz_mutex_obj_dispose` / `bz_cts_obj_dispose`) frees the handle ITSELF, so
-// a Dispose-then-reclaim discharge would free it twice. The runtime's kind-tag
-// dispatcher (`bz_runtime_dispose`) is no help either: it probes offset 48 and
-// offset 88, and those handles' structs are 32 bytes.
+// a Dispose-then-reclaim discharge would free it twice. The runtime's kind
+// dispatcher (`bz_runtime_dispose`) is no help either: it answers only for
+// the three collection backings.
 extern "C" int32_t bz_obj_is_array(void* obj) {
     if (!obj) return 0;
     return bz_word0_is_array(obj) ? 1 : 0;
@@ -96,29 +94,22 @@ extern "C" int32_t bz_obj_is_array(void* obj) {
 extern "C" void bz_runtime_dispose(void* p, void (*dispose_elem)(void*)) {
     if (!p) return;
     if (bz_word0_is_array(p)) { bz_array_free(p, dispose_elem); return; }
-    // Probe offset 48 — bz_llist_t carries the kind here. The negative
-    // sentinel value rules out a bz_dict_t false-positive (its `order`
-    // pointer sits at offset 48).
-    int64_t k48 = 0;
-    memcpy(&k48, (uint8_t*)p + 48, sizeof(int64_t));
-    if (k48 == BZ_RUNTIME_KIND_LLIST) { bz_llist_free(p, dispose_elem); return; }
-    // bz_dict_t's kind lives at offset 88 (struct ends at 96). Reading
-    // there is safe — the alloc sized the struct for it.
-    int64_t k88 = 0;
-    memcpy(&k88, (uint8_t*)p + 88, sizeof(int64_t));
-    if (k88 == BZ_RUNTIME_KIND_DICT) { bz_dict_free(p, dispose_elem); return; }
+    if (bz_word0_is(p, (void*)bz_llist_vtable)) {
+        bz_llist_free(p, dispose_elem);
+        return;
+    }
+    if (bz_word0_is(p, (void*)bz_dict_vtable)) {
+        bz_dict_free(p, dispose_elem);
+        return;
+    }
     // untagged — bounded leak (see header).
 }
 
 extern "C" int64_t bz_runtime_kind(void* p) {
     if (!p) return BZ_RUNTIME_KIND_NONE;
     if (bz_word0_is_array(p)) return BZ_RUNTIME_KIND_ARRAY;
-    int64_t k48 = 0;
-    memcpy(&k48, (uint8_t*)p + 48, sizeof(int64_t));
-    if (k48 == BZ_RUNTIME_KIND_LLIST) return k48;
-    int64_t k88 = 0;
-    memcpy(&k88, (uint8_t*)p + 88, sizeof(int64_t));
-    if (k88 == BZ_RUNTIME_KIND_DICT) return k88;
+    if (bz_word0_is(p, (void*)bz_llist_vtable)) return BZ_RUNTIME_KIND_LLIST;
+    if (bz_word0_is(p, (void*)bz_dict_vtable)) return BZ_RUNTIME_KIND_DICT;
     return BZ_RUNTIME_KIND_NONE;
 }
 
@@ -1186,6 +1177,12 @@ struct bz_entry_t {
 };
 
 struct bz_dict_t {
+    // fix #8533 (§8.2 / §28.5, v0.357): word 0 is the runtime-owned
+    // `bz_dict_vtable` (bezel_runtime_refcounting.cpp), set by both
+    // allocators, so a table at an `IDisposable` slot is disposed through the
+    // ordinary class dispatch. Codegen never reads this struct (every access
+    // is a `bz_dict_*` call), so the word is runtime-internal.
+    void*       vtable;
     bz_entry_t* buckets;
     int64_t     count;
     int64_t     capacity;  // always a power of 2
@@ -1214,11 +1211,29 @@ struct bz_dict_t {
     // checked on each iteration — mismatch → InvalidOperationException.
     int64_t     mod_count;
     // fix #3026: kind tag (BZ_RUNTIME_KIND_DICT) set by bz_dict_alloc /
-    // bz_dict_alloc_generic. APPENDED last so prior offsets (buckets@0,
-    // count@8, capacity@16, key_size@24, hash_fn@32, eq_fn@40, order@48,
-    // order_count@56, order_cap@64, disposed@72, mod_count@80) are
-    // preserved — existing codegen reads them at fixed offsets.
+    // bz_dict_alloc_generic; reported by bz_runtime_kind. Since #8533 the
+    // table is IDENTIFIED by its word-0 vtable, not by this field.
     int64_t     kind;
+    // fix #8533 (§28.5 / §28.11, v0.357): what disposing this table through
+    // an ERASED slot must run, recorded at CONSTRUCTION
+    // (bz_dict_set_dyn_disposers) for exactly the reason #2608 records an
+    // array's element disposer — the concrete type is known only there, and an
+    // `IDisposable` slot cannot name it. The three are the typed free's own
+    // three steps (the scope-end `dict` arm of LlvmBackend_Disposal.cpp):
+    // release a string-element Set's co-owned keys, dispose an owning Set's
+    // collection keys, dispose each live value. All null/zero (calloc) for a
+    // table the runtime itself produced: nothing extra is run, which is the
+    // pre-#8533 typed behaviour of a value-typed table and the leak direction
+    // otherwise. Consulted ONLY by bz_dict_obj_dispose — the typed frees keep
+    // taking their disposer from the static type.
+    void      (*dyn_value_disposer)(void*);
+    void      (*dyn_key_disposer)(void*);
+    int8_t      dyn_string_keys;
+    int8_t      dyn_stamped;   // the three above (and type_name) were recorded
+    // The §8.5 default rendering (the qualified instantiation name) as the
+    // string LITERAL codegen emitted (rc sentinel, never freed); null for a
+    // runtime-produced table.
+    void*       type_name;
 };
 
 // fix #4499 (spec §4.6 / §8.3, v0.306): read one code point out of a stored
@@ -1449,6 +1464,7 @@ static void dict_rehash(bz_dict_t* d) {
 void* bz_dict_alloc(void) {
     auto* d = (bz_dict_t*)calloc(1, sizeof(bz_dict_t));
     if (!d) bz_alloc_fail("Dictionary<K,V> header");
+    d->vtable = (void*)bz_dict_vtable;  // fix #8533
     d->kind = BZ_RUNTIME_KIND_DICT;  // fix #3026
     d->capacity = 8;
     d->buckets = (bz_entry_t*)calloc(8, sizeof(bz_entry_t));
@@ -1509,6 +1525,57 @@ void bz_dict_mark_disposed(void* dp, void (*dispose_val)(void*)) {
 int8_t bz_dict_is_disposed(void* dp) {
     if (!dp) return 0;
     return ((bz_dict_t*)dp)->disposed;
+}
+
+// fix #8533 (§28.5 / §28.11, v0.357): record what an erased disposal of this
+// table must run (see the `dyn_*` fields) and its §8.5 name. Codegen emits
+// one call per `new` / literal of a dict-backed built-in, where the concrete
+// type is known, and — with `only_if_unset` — one after a CALL whose static
+// result type is such a built-in, so a table the RUNTIME allocated
+// (Environment.Variables, a lazy pipeline's ToDictionary, …) is recorded too
+// while one already recorded at its construction is never overwritten (the
+// #6891 shape, bz_array_stamp_if_unset). Null-safe, and a no-op on anything
+// that is not a bz_dict_t (an array-backed Set).
+extern "C" void bz_dict_set_dyn_disposers(void* dp,
+                                          void (*dispose_val)(void*),
+                                          void (*dispose_key)(void*),
+                                          int8_t string_keys,
+                                          void* type_name,
+                                          int32_t only_if_unset) {
+    if (!dp || !bz_word0_is(dp, (void*)bz_dict_vtable)) return;
+    auto* d = (bz_dict_t*)dp;
+    if (only_if_unset && d->dyn_stamped) return;
+    d->dyn_value_disposer = dispose_val;
+    d->dyn_key_disposer = dispose_key;
+    d->dyn_string_keys = string_keys;
+    d->type_name = type_name;
+    d->dyn_stamped = 1;
+}
+
+// fix #8533 (§28.4 step 2 / §28.5, v0.357): bz_dict_vtable's Dispose slot —
+// the CLASS-protocol Dispose of a dict-backed built-in, reached when the
+// table is discharged through an `IDisposable` (or other erased) slot. It
+// runs the typed free's own steps with the disposers recorded in the header
+// and leaves the header for the caller's reclaim step (bz_dict_mark_disposed
+// frees the buckets and the order array and keeps the block), exactly as
+// bz_array_obj_dispose does for an array. Idempotent (§28.4): a second call
+// finds `disposed` set.
+extern "C" void bz_dict_obj_dispose(void* dp) {
+    if (!dp) return;
+    auto* d = (bz_dict_t*)dp;
+    if (d->disposed) return;
+    if (d->dyn_string_keys) bz_set_string_keys_release(dp);
+    if (d->dyn_key_disposer) bz_set_coll_keys_dispose(dp, d->dyn_key_disposer);
+    bz_dict_mark_disposed(dp, d->dyn_value_disposer);
+}
+
+// bz_dict_vtable's ToString slot: §8.5's default, the qualified type name —
+// the instantiation name stamped at construction, else the head alone (a
+// table the runtime produced), as bz_array_obj_tostring does.
+extern "C" void* bz_dict_obj_tostring(void* dp) {
+    if (dp && ((bz_dict_t*)dp)->type_name) return ((bz_dict_t*)dp)->type_name;
+    static const char name[] = "System.Collections.Generic.Dictionary";
+    return bz_make_string(name, (int64_t)(sizeof(name) - 1));
 }
 
 bool bz_dict_try_get_str(void* dp, const char* k, int64_t k_len, int8_t k_w,
@@ -1695,6 +1762,7 @@ void* bz_dict_alloc_generic(int64_t key_size,
                               bool     (*eq)(const void* a, const void* b)) {
     auto* d = (bz_dict_t*)calloc(1, sizeof(bz_dict_t));
     if (!d) bz_alloc_fail("Dictionary<K,V> header");
+    d->vtable = (void*)bz_dict_vtable;  // fix #8533
     d->kind = BZ_RUNTIME_KIND_DICT;  // fix #3026
     d->capacity = 8;
     d->buckets = (bz_entry_t*)calloc(8, sizeof(bz_entry_t));
@@ -2517,6 +2585,12 @@ struct bz_llist_node_t {
 };
 
 struct bz_llist_t {
+    // fix #8533 (§8.2 / §28.5, v0.357): word 0 is the runtime-owned
+    // `bz_llist_vtable` (bezel_runtime_refcounting.cpp), set by
+    // bz_llist_alloc, so a list at an `IDisposable` slot is disposed through
+    // the ordinary class dispatch. Codegen never reads this struct (every
+    // access is a `bz_llist_*` call), so the word is runtime-internal.
+    void*            vtable;
     bz_llist_node_t* head;
     bz_llist_node_t* tail;
     int64_t          count;
@@ -2526,30 +2600,36 @@ struct bz_llist_t {
     // mutation (AddFirst/Last/Before/After, Remove*, Pop*). Captured by
     // lowerLinkedListFor at loop start; checked per iteration.
     int64_t          mod_count;
-    // fix #3026: kind tag (BZ_RUNTIME_KIND_LLIST) set by bz_llist_alloc at
-    // offset 48 — the same offset bz_array_t's kind uses, so the runtime
-    // helper bz_runtime_dispose can probe ONE offset (48) for both array-
-    // and llist-backed polymorphic collection interfaces. Sized to keep
-    // the prior offsets (head@0, tail@8, count@16, elem_size@24,
-    // next_seq@32, mod_count@40) unchanged — existing codegen and
-    // runtime read those at fixed offsets.
+    // fix #3026: kind tag (BZ_RUNTIME_KIND_LLIST) set by bz_llist_alloc;
+    // reported by bz_runtime_kind. Since #8533 the list is IDENTIFIED by its
+    // word-0 vtable, not by this field.
     int64_t          kind;
     // fix #6519 (§28.11 / stdlib §4.7, v0.338): the element disposer of an
     // OWNING list, recorded at CONSTRUCTION (bz_llist_set_elem_disposer) for
     // exactly the reason #2608 records it on bz_array_t — the concrete type is
     // known only at construction, and an erased free site (the owning
     // enumerable wrap, `bz_llist_free(list, NULL)`) cannot recover it from the
-    // static type it was handed. APPENDED AFTER `kind`, so kind STAYS at
-    // offset 48 and bz_runtime_dispose's single-offset probe is undisturbed
-    // (this field lands at 56, inside the struct's new 64-byte size, and the
-    // dict probe at 88 is past the end of an llist header but is only reached
-    // when the offset-48 probe already failed — a live llist always tags
-    // itself in bz_llist_alloc).
+    // static type it was handed.
     //
     // NULL (calloc-zeroed) means "borrowing / no element disposal", i.e.
     // exactly the pre-#6519 behaviour, so an untagged list can never be
     // over-disposed by the consulting path.
     void (*elem_disposer)(void*);
+    // fix #8533 (§28.5 / §28.11, v0.357): what disposing this list through an
+    // ERASED slot (an `IDisposable`) must run per element, recorded at
+    // CONSTRUCTION (bz_llist_set_dyn_disposer). It is a SEPARATE field from
+    // `elem_disposer` on purpose: that one is set for an OWNING list only and
+    // its NULL is read as "borrowing" by the owning-enumerable wrap
+    // (bz_llist_free_owning_wrap), whereas this one also carries a BORROWING
+    // list's own element release — `LinkedList<string>` co-owns a +1 per
+    // element (§28.11) — which the typed free takes from the static type.
+    // Consulted ONLY by bz_llist_obj_dispose. Null (calloc) for a list the
+    // runtime itself produced.
+    void (*dyn_disposer)(void*);
+    // The §8.5 default rendering as the string LITERAL codegen emitted (rc
+    // sentinel, never freed); null for a runtime-produced list.
+    void* type_name;
+    int8_t dyn_stamped;   // the two above were recorded
 };
 
 // Allocate a node with elem_size bytes of value storage, stamping it with the
@@ -2568,6 +2648,7 @@ static bz_llist_node_t* llist_node_alloc(bz_llist_t* l, int64_t elem_size,
 void* bz_llist_alloc(int64_t elem_size) {
     auto* l = (bz_llist_t*)calloc(1, sizeof(bz_llist_t));
     if (!l) bz_alloc_fail("LinkedList<T> header");
+    l->vtable = (void*)bz_llist_vtable;  // fix #8533
     l->kind = BZ_RUNTIME_KIND_LLIST;  // fix #3026
     l->elem_size = elem_size;
     return l;
@@ -2779,9 +2860,12 @@ void bz_llist_free_owning_wrap(void* listp, void (*fallback)(void*),
     bz_llist_free(listp, disp);
 }
 
-void bz_llist_free(void* listp, void (*dispose_elem)(void*)) {
-    auto* l = (bz_llist_t*)listp;
-    if (!l) return;
+// The CONTENTS half of bz_llist_free: dispose the elements, free the nodes
+// and leave an EMPTY list — the header stays. Split out by fix #8533 so the
+// class-protocol Dispose (bz_llist_obj_dispose) can run it without freeing a
+// header its caller's reclaim step frees.
+static void bz_llist_release_contents(bz_llist_t* l,
+                                      void (*dispose_elem)(void*)) {
     // §28.11 (#869): dispose elements in REVERSE-INSERTION order — last-inserted
     // first. The positional tail→head walk only equals reverse-insertion when
     // every element was AddLast'd; once AddFirst/AddBefore are mixed in, the
@@ -2816,14 +2900,61 @@ void bz_llist_free(void* listp, void (*dispose_elem)(void*)) {
             }
         }
     }
-    // Free all nodes (order irrelevant now) and the list header.
+    // Free all nodes (order irrelevant now).
     bz_llist_node_t* n = l->head;
     while (n) {
         bz_llist_node_t* nx = n->next;
         free(n);
         n = nx;
     }
-    free(l);
+    l->head = nullptr;
+    l->tail = nullptr;
+    l->count = 0;
+}
+
+void bz_llist_free(void* listp, void (*dispose_elem)(void*)) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l) return;
+    bz_llist_release_contents(l, dispose_elem);
+    free(l);  // … and the list header.
+}
+
+// fix #8533 (§28.5 / §28.11, v0.357): record the element disposer an erased
+// disposal of this list must run (see `dyn_disposer`) and its §8.5 name — at
+// construction, and with `only_if_unset` after a call whose static result
+// type is a linked list (see bz_dict_set_dyn_disposers). Null-safe.
+extern "C" void bz_llist_set_dyn_disposer(void* listp,
+                                          void (*dispose_elem)(void*),
+                                          void* type_name,
+                                          int32_t only_if_unset) {
+    if (!listp || !bz_word0_is(listp, (void*)bz_llist_vtable)) return;
+    auto* l = (bz_llist_t*)listp;
+    if (only_if_unset && l->dyn_stamped) return;
+    l->dyn_disposer = dispose_elem;
+    l->type_name = type_name;
+    l->dyn_stamped = 1;
+}
+
+// fix #8533 (§28.4 step 2 / §28.5, v0.357): bz_llist_vtable's Dispose slot —
+// the CLASS-protocol Dispose of LinkedList / OwningLinkedList, reached when
+// the list is discharged through an `IDisposable` (or other erased) slot:
+// the elements are disposed (reverse-insertion, §28.11) with the disposer
+// recorded in the header, the nodes freed, and the header left for the
+// caller's reclaim step. Idempotent (§28.4): a second call finds it empty.
+extern "C" void bz_llist_obj_dispose(void* listp) {
+    auto* l = (bz_llist_t*)listp;
+    if (!l) return;
+    bz_llist_release_contents(l, l->dyn_disposer);
+    l->mod_count++;  // §29.12: a structural mutation, as Clear is
+}
+
+// bz_llist_vtable's ToString slot: §8.5's default, the qualified type name —
+// the instantiation name stamped at construction, else the head alone.
+extern "C" void* bz_llist_obj_tostring(void* listp) {
+    if (listp && ((bz_llist_t*)listp)->type_name)
+        return ((bz_llist_t*)listp)->type_name;
+    static const char name[] = "System.Collections.Generic.LinkedList";
+    return bz_make_string(name, (int64_t)(sizeof(name) - 1));
 }
 
 // #639 / stdlib §4.7 v0.135: OwningLinkedList<T>.Drain() per-element pop.

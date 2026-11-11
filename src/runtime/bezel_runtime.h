@@ -333,6 +333,17 @@ void bz_llist_set_elem_disposer(void* list, void (*dispose_elem)(void*));
 void bz_llist_free_owning_wrap(void* list, void (*fallback)(void*),
                                int32_t consult_header);
 
+// fix #8533 (§28.5 / §28.11, v0.357): record, at construction, the element
+// disposer that disposing the list through an ERASED slot (an `IDisposable`)
+// must run, and the list's §8.5 name (a string literal, or null). Unlike
+// bz_llist_set_elem_disposer this is recorded for a BORROWING list too (the
+// `LinkedList<string>` +1 release); only the list's vtable Dispose slot reads
+// it. See `dyn_disposer` on bz_llist_t. `only_if_unset` leaves a list that
+// already carries a record untouched (the post-call stamp of a
+// runtime-produced list).
+void bz_llist_set_dyn_disposer(void* list, void (*dispose_elem)(void*),
+                               void* type_name, int32_t only_if_unset);
+
 // ---------------------------------------------------------------------------
 // bz_dict_t — open-addressing hash table used by Dictionary<K,V>.
 // Two variants: string keys (most common) and generic keys (via fn pointers).
@@ -351,6 +362,19 @@ void    bz_dict_mark_disposed(void* d, void (*dispose_val)(void*));
 // §28.2 v0.135 / issue #627: return non-zero if the dict has been disposed
 // via bz_dict_mark_disposed (checked mode only).
 int8_t  bz_dict_is_disposed(void* d);
+
+// fix #8533 (§28.5 / §28.11, v0.357): record, at construction, what disposing
+// the table through an ERASED slot (an `IDisposable`) must run — the typed
+// free's three steps: `string_keys` (release a string-element Set's co-owned
+// keys), `dispose_key` (dispose an owning Set's collection keys) and
+// `dispose_val` (dispose each live value) — and the table's §8.5 name (a
+// string literal, or null). Only the table's vtable Dispose slot reads them.
+// `only_if_unset` leaves a table that already carries a record untouched (the
+// post-call stamp of a runtime-produced table).
+void    bz_dict_set_dyn_disposers(void* d, void (*dispose_val)(void*),
+                                  void (*dispose_key)(void*),
+                                  int8_t string_keys, void* type_name,
+                                  int32_t only_if_unset);
 
 // fix #4499 (spec §4.6 / §8.3, v0.306): every string-key entry point takes the
 // key as (raw data, CODE-POINT count, storage width). The width is load-bearing
@@ -1450,6 +1474,18 @@ void bz_subscription_dispose(void* sub);
 // Free an EventSource and its handler list.
 void bz_event_source_free(void* src);
 
+// fix #8533 (§28.5, v0.357): an event source opens with a runtime vtable
+// (word 0), so one held in an `IDisposable` slot is disposed by the class
+// protocol: the vtable's Dispose slot releases the handler list and the
+// caller reclaims the struct. This records the §8.5 name (a string literal)
+// the vtable's ToString slot renders; a no-op on null and on anything that
+// is not an event source.
+void bz_event_source_set_type_name(void* src, void* type_name);
+// The same for an `Atomic<T>` / `AtomicInteger<T>` cell (stdlib §6.4), whose
+// vtable Dispose slot only records the disposal: the cell owns nothing but
+// its own block.
+void bz_atomic_set_type_name(void* atomic, void* type_name);
+
 // ---------------------------------------------------------------------------
 // Shared event sources (stdlib §6.5, v0.187, fix #1832): the cross-domain
 // publication-point pair SharedEventSource<T> / ISharedEvent<T>. The runtime
@@ -2127,9 +2163,12 @@ extern void* bz_current_domain_ptr();
 // Shared<T> / Weak<T> — domain-local shared ownership (§28.13 / stdlib §2.16)
 //
 // A bz_shared_t control block owns one underlying value and tracks strong +
-// weak reference counts (unsynchronised — domain-local per spec §28.13).
-// Shared handles (bz_shared_t*) and Weak handles (bz_weak_t*, which is the
-// same struct) are opaque to Bezel code; codegen stores them as plain ptr.
+// weak reference counts. A HANDLE — strong or weak — is its own small cell
+// (vtable word, control-block pointer, flags), one per `Shared<T>` /
+// `Weak<T>` value, since fix #8533 (§28.13 / stdlib §2.16, v0.357: "Handles
+// are ordinary owned class instances"; `Clone()` is "a new independent
+// handle"). Handles are opaque to Bezel code; codegen stores them as plain
+// ptr and never reads the cell. See bezel_runtime_shared_weak.cpp.
 // ---------------------------------------------------------------------------
 
 // Allocate a control block wrapping `value`.  The block's strong count is 1
@@ -2139,8 +2178,9 @@ extern void* bz_current_domain_ptr();
 // handle (bz_shared_t*).
 void* bz_shared_new(void* value, void (*dispose_value)(void*));
 
-// Increment the strong count and return a new handle pointing to the same
-// control block.  The caller becomes an additional owner. per §28.13 Clone().
+// Increment the strong count and return a NEW handle (its own cell) on the
+// same control block.  The caller becomes an additional owner. per §28.13
+// Clone().
 void* bz_shared_clone(void* handle);
 
 // Return the underlying value pointer (a borrow; the handle's lifetime gates
@@ -2148,7 +2188,7 @@ void* bz_shared_clone(void* handle);
 void* bz_shared_get(void* handle);
 
 // Mint a Weak<T> handle (increments the weak count; does not affect the strong
-// count). per §28.13 Downgrade().  Returns a bz_weak_t*.
+// count). per §28.13 Downgrade().  Returns the new weak handle's cell.
 void* bz_shared_downgrade(void* handle);
 
 // TryUpgrade: if strong count > 0, increment it and write a new strong handle
@@ -2156,20 +2196,23 @@ void* bz_shared_downgrade(void* handle);
 // disposed), write null to *out_handle and return 0 (false). per §28.13.
 int   bz_weak_try_upgrade(void* weak_handle, void** out_handle);
 
-// Decrement the strong count.  When it reaches 0: run dispose_value on the
-// value (disposing via vtable + freeing the block if the weak count is also
-// 0).  Idempotent via the disposed-flag convention. per §28.13 Dispose().
+// Release a strong handle: decrement the strong count and free the handle's
+// cell.  When the count reaches 0: run dispose_value on the value (disposing
+// via vtable + freeing the control block if the weak count is also 0).
+// per §28.13 Dispose().
 void  bz_shared_release(void* handle);
 
-// Decrement the weak count.  When the strong count is already 0 and the weak
-// count also reaches 0, free the control block. per §28.13 Weak.Dispose().
+// Release a weak handle: decrement the weak count and free the handle's cell.
+// When the strong count is already 0 and the weak count also reaches 0, free
+// the control block. per §28.13 Weak.Dispose().
 void  bz_weak_release(void* weak_handle);
 
 // §28.2 v0.135 / issue #627: checked-disposal-mode quarantine for Shared<T>.
 // Called instead of bz_shared_release for the explicit handle.Dispose() in
-// checked builds. Marks handle_disposed=1 and disposes the value, but does NOT
-// free the control block (deliberate quarantine). bz_shared_release becomes a
-// no-op when handle_disposed is set, so the scope-end auto-dispose is safe.
+// checked builds. Marks handle_disposed=1 and gives the handle's count back
+// (disposing the value if it was the last), but does NOT free the handle's
+// cell (deliberate quarantine). bz_shared_release becomes a no-op when
+// handle_disposed is set, so the scope-end auto-dispose is safe.
 void bz_shared_mark_disposed(void* handle);
 
 // §28.2 v0.135 / issue #627: return non-zero if the Shared<T> handle has been

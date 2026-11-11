@@ -304,6 +304,10 @@ BZ_BUILTIN_TYPENAME_TOSTRING(bz_lock_obj_tostring, "System.Threading.Lock")
 BZ_BUILTIN_TYPENAME_TOSTRING(bz_semaphore_obj_tostring, "System.Threading.Semaphore")
 BZ_BUILTIN_TYPENAME_TOSTRING(bz_semtoken_obj_tostring, "System.Threading.SemaphoreToken")
 BZ_BUILTIN_TYPENAME_TOSTRING(bz_task_scope_obj_tostring, "System.Threading.TaskScope")
+// fix #8533: the two shared-ownership handles (stdlib §2.16), see below.
+BZ_BUILTIN_TYPENAME_TOSTRING(bz_shared_obj_tostring, "System.Shared")
+BZ_BUILTIN_TYPENAME_TOSTRING(bz_weak_obj_tostring, "System.Weak")
+BZ_BUILTIN_TYPENAME_TOSTRING(bz_subscription_obj_tostring, "System.Subscription")
 #undef BZ_BUILTIN_TYPENAME_TOSTRING
 
 // Stopwatch and Random hold no resource: their class-protocol Dispose has
@@ -324,6 +328,66 @@ BZ_BUILTIN_TAG(bz_lock, bz_lock_obj_dispose, bz_lock_obj_tostring)
 BZ_BUILTIN_TAG(bz_semaphore, bz_semaphore_obj_dispose, bz_semaphore_obj_tostring)
 BZ_BUILTIN_TAG(bz_semtoken, bz_semtoken_obj_dispose, bz_semtoken_obj_tostring)
 BZ_BUILTIN_TAG(bz_task_scope, bz_task_scope_obj_dispose, bz_task_scope_obj_tostring)
+
+// fix #8533 (§28.4 step 2 / §28.5 / §28.11 / §28.13, stdlib §2.10 / §2.16 /
+// §4.6-§4.10, v0.357): the built-in classes that reach an `IDisposable` slot
+// and still had NO vtable word — the `Shared<T>` / `Weak<T>` handles and the
+// two remaining collection backings, `bz_dict_t` (Dictionary,
+// OwningDictionary, SortedDictionary and the dict-backed Set / SortedSet) and
+// `bz_llist_t` (LinkedList, OwningLinkedList).
+//
+// Every one of them is a class, hence `IDisposable` (stdlib §2.10: "Every
+// class implicitly implements `IDisposable`"), so §5.1 admits
+// it at an `IDisposable` slot representation-preservingly, and an OWNED such
+// slot — an `owned d: IDisposable` parameter (§28.1), an `owned F:
+// IDisposable?` field (§28.4 step 2), an `OwningArray<IDisposable>` element
+// (§28.11) — discharges its value by the class protocol: "runtime dispatch
+// resolves disposal to the underlying class's `Dispose()`" (§28.5), i.e. the
+// word-0 vtable's slot 2, then a reclaim that frees the block. On these four
+// that read a control block's `value`, a bucket pointer or a list head as a
+// vtable (MEASURED under ASan: heap-buffer-overflow for the two handles, SEGV
+// for the two backings). The remedy is #6776's and #8000's: the block opens
+// with a runtime-owned vtable in the class slot layout, so the existing
+// dispatch reaches the value's real disposal.
+//
+// Slot 2 follows the CLASS protocol (see above): it releases the contents and
+// leaves the block for the caller's reclaim step.
+//   * a handle gives its count back (bz_shared_obj_dispose /
+//     bz_weak_obj_dispose, bezel_runtime_shared_weak.cpp);
+//   * a backing runs the element / value / key disposers RECORDED IN ITS
+//     HEADER at construction (bz_dict_set_dyn_disposers /
+//     bz_llist_set_dyn_disposer, bezel_runtime_collections.cpp) — the erased
+//     slot cannot name them, exactly the reason #2608 records an array's.
+// Slot 3 is §8.5's default, the type's qualified name: the head alone for a
+// handle, the full instantiation name codegen stamps at construction for a
+// backing (the head alone for one the runtime itself produced).
+// The typed release paths (bz_shared_release, bz_weak_release, bz_dict_free,
+// bz_llist_free) free the block themselves and are unchanged.
+BZ_BUILTIN_TAG(bz_shared, bz_shared_obj_dispose, bz_shared_obj_tostring)
+BZ_BUILTIN_TAG(bz_weak, bz_weak_obj_dispose, bz_weak_obj_tostring)
+BZ_BUILTIN_TAG(bz_dict, bz_dict_obj_dispose, bz_dict_obj_tostring)
+BZ_BUILTIN_TAG(bz_llist, bz_llist_obj_dispose, bz_llist_obj_tostring)
+// ... and the event source (`EventSource<T>` / `AsyncEventSource<T>` /
+// `SharedEventSource<T>`, stdlib §6.5 — classes, so `IDisposable` by stdlib
+// §2.10 — one runtime representation): slot 2 releases the handler list
+// (bezel_runtime_events.cpp), slot 3 is the name stamped at the `new`.
+BZ_BUILTIN_TAG(bz_event_source, bz_event_source_obj_dispose,
+               bz_event_source_obj_tostring)
+// ... and the atomic cell (`Atomic<T>` / `AtomicInteger<T>`, stdlib §6.4 —
+// classes likewise — one runtime representation): a cell owns only its
+// block, so slot 2 just records the disposal (bezel_runtime_sync.cpp).
+BZ_BUILTIN_TAG(bz_atomic, bz_atomic_obj_dispose, bz_atomic_obj_tostring)
+// ... and the serializers and deserializers (stdlib §2.15: `BinarySerializer`
+// / `JsonSerializer` share bz_binser_t, `BinaryDeserializer` /
+// `JsonDeserializer` share bz_binder_t): slot 2 releases the buffers and
+// tables (bezel_runtime_serialization.cpp).
+BZ_BUILTIN_TAG(bz_binser, bz_binser_obj_dispose, bz_binser_obj_tostring)
+BZ_BUILTIN_TAG(bz_binder, bz_binder_obj_dispose, bz_binder_obj_tostring)
+// ... and the `Subscription` (stdlib §2.11) an event `Subscribe` or a
+// `CancellationToken.Register` returns: slot 2 unsubscribes
+// (bezel_runtime_events.cpp).
+BZ_BUILTIN_TAG(bz_subscription, bz_subscription_obj_dispose,
+               bz_subscription_obj_tostring)
 #undef BZ_BUILTIN_TAG
 
 static inline bool bz_word0_is_builtin_vtable(void* word0) {
@@ -336,7 +400,17 @@ static inline bool bz_word0_is_builtin_vtable(void* word0) {
            word0 == (void*)bz_lock_vtable ||
            word0 == (void*)bz_semaphore_vtable ||
            word0 == (void*)bz_semtoken_vtable ||
-           word0 == (void*)bz_task_scope_vtable;
+           word0 == (void*)bz_task_scope_vtable ||
+           // fix #8533: the nine tags above.
+           word0 == (void*)bz_shared_vtable ||
+           word0 == (void*)bz_weak_vtable ||
+           word0 == (void*)bz_dict_vtable ||
+           word0 == (void*)bz_llist_vtable ||
+           word0 == (void*)bz_event_source_vtable ||
+           word0 == (void*)bz_atomic_vtable ||
+           word0 == (void*)bz_binser_vtable ||
+           word0 == (void*)bz_binder_vtable ||
+           word0 == (void*)bz_subscription_vtable;
 }
 
 // fix #6776: codegen's hooks onto the tags above. `bz_sb_tag` retags the
@@ -379,12 +453,13 @@ extern "C" void* bz_array_inst_desc(void* o) {
 // / built-in exception has a vtable pointer at word 0. `vtable_table` is the
 // null-terminated array codegen emits listing every vtable/box-vtable global.
 // `obj` is a string iff it is non-null and its first word is NOT one of those
-// vtables, nor one of the runtime's own (bz_fnval_vtable and, since #6776, the
-// three built-in vtables above). (Runtime-internal vtables — IEnumerator state
-// machines — are never stored in a plain Object slot, so omitting them from the
-// table is sound. The vtable-less built-ins NOT yet tagged — LinkedList,
-// Dictionary, the dict-backed sets, Semaphore, Random, … — still fall through
-// to "string" here; that residual is tracked separately.)
+// vtables, nor one of the runtime's own (bz_fnval_vtable and the built-in
+// vtables bz_word0_is_builtin_vtable lists — #6776's three, and since #8533
+// the Shared / Weak handle, LinkedList and hash-table ones). (Runtime-internal
+// vtables — IEnumerator state machines — are never stored in a plain Object
+// slot, so omitting them from the table is sound. A built-in that still has
+// NO word-0 vtable falls through to "string" here; that residual is tracked
+// separately.)
 extern "C" int32_t bz_obj_is_string(void* obj, void** vtable_table) {
     if (!obj) return 0;
     void* word0;

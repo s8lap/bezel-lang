@@ -288,6 +288,44 @@ extern "C" void bz_lock_obj_dispose(void* lock);
 extern "C" void bz_semaphore_obj_dispose(void* sem);
 extern "C" void bz_semtoken_obj_dispose(void* token);
 extern "C" void bz_task_scope_obj_dispose(void* scope);
+// fix #8533 (§28.4 step 2 / §28.5 / §28.13, v0.357): the tags of the
+// `Shared<T>` / `Weak<T>` handle cells (bezel_runtime_shared_weak.cpp) and of
+// the two collection backings that had none, `bz_dict_t` and `bz_llist_t`
+// (bezel_runtime_collections.cpp) — word 0 of each at allocation — with their
+// class-protocol Dispose and ToString slots.
+extern "C" void* bz_shared_desc[2];
+extern "C" void* bz_shared_vtable[6];
+extern "C" void* bz_weak_desc[2];
+extern "C" void* bz_weak_vtable[6];
+extern "C" void* bz_dict_desc[2];
+extern "C" void* bz_dict_vtable[6];
+extern "C" void* bz_llist_desc[2];
+extern "C" void* bz_llist_vtable[6];
+extern "C" void bz_shared_obj_dispose(void* handle);
+extern "C" void bz_weak_obj_dispose(void* weak_handle);
+extern "C" void bz_dict_obj_dispose(void* dict);
+extern "C" void bz_llist_obj_dispose(void* list);
+extern "C" void* bz_dict_obj_tostring(void* dict);
+extern "C" void* bz_llist_obj_tostring(void* list);
+extern "C" void* bz_event_source_desc[2];
+extern "C" void* bz_event_source_vtable[6];
+extern "C" void bz_event_source_obj_dispose(void* src);
+extern "C" void* bz_event_source_obj_tostring(void* src);
+extern "C" void* bz_atomic_desc[2];
+extern "C" void* bz_atomic_vtable[6];
+extern "C" void bz_atomic_obj_dispose(void* atomic);
+extern "C" void* bz_atomic_obj_tostring(void* atomic);
+extern "C" void* bz_binser_desc[2];
+extern "C" void* bz_binser_vtable[6];
+extern "C" void bz_binser_obj_dispose(void* ser);
+extern "C" void* bz_binser_obj_tostring(void* ser);
+extern "C" void* bz_binder_desc[2];
+extern "C" void* bz_binder_vtable[6];
+extern "C" void bz_binder_obj_dispose(void* der);
+extern "C" void* bz_binder_obj_tostring(void* der);
+extern "C" void* bz_subscription_desc[2];
+extern "C" void* bz_subscription_vtable[6];
+extern "C" void bz_subscription_obj_dispose(void* sub);
 // Either view of a function value -> the cell base. A cell base's word 0 is a
 // code pointer and can never equal the vtable's address.
 static inline void* bz_closure_base(void* c) {
@@ -700,6 +738,12 @@ struct bz_cancel_state_t {
     std::atomic<uint64_t> timer_gen{0};
 };
 struct bz_subscription_t {
+    // fix #8533 (§28.5, v0.357): the runtime type tag — word 0 is
+    // bz_subscription_vtable, so a `Subscription` held in an `IDisposable`
+    // slot is disposed by the class protocol (slot 2 =
+    // bz_subscription_obj_dispose, then the caller reclaims the node) instead
+    // of having its source pointer called as a vtable.
+    void*              vtable;
     bz_event_source_t* src;          // event source (null for a Register callback sub)
     int64_t            token;
     bool               disposed;

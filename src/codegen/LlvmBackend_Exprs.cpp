@@ -536,8 +536,12 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         freshVtablelessBuiltinRoots_.erase(claimedVtablelessBuiltinRecv);
     // fix #6891 (§8.5, §12.7, v0.340): see stampRuntimeProducedArray.
     if (v && v->getType()->isPointerTy())
-        if (dynamic_cast<const ast::CallExpr*>(&e))
+        if (dynamic_cast<const ast::CallExpr*>(&e)) {
             stampRuntimeProducedArray(v, ctx_.exprType(e));
+            // fix #8533 (§28.5 / §28.11, v0.357): the list / table twin.
+            stampErasedDisposalRecord(v, ctx_.exprType(e),
+                                      /*onlyIfUnset=*/true);
+        }
     // fix #6674 (§7.4 / §22.6, v0.339): "a read of a binding §7.4 has
     // narrowed non-null is of its non-nullable type". Sema admitted this read
     // of a nullable value-type binding at a non-nullable target and recorded
@@ -4572,6 +4576,14 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     }
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
         llvm::Value* made = lowerNew(*ne);
+        // fix #8533 (§28.5 / §28.11, v0.357): `new` of a LinkedList / a
+        // Dictionary / a hash-backed Set — every construction form of each
+        // (no-arg, capacity, source) returns through here, so one stamp
+        // covers them all. See stampErasedDisposalRecord.
+        stampErasedDisposalRecord(
+            made,
+            ne->type ? ctx_.resolvedType(*ne->type) : ctx_.exprType(*ne),
+            /*onlyIfUnset=*/false);
         // fix #6182 (§15.3 *Parameter passing*, v0.338): a constructor call is
         // a parameter passing like any other — "for a move-only V, it is by
         // value-move (transfer ownership). The caller's argument expression is

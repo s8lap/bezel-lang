@@ -12825,6 +12825,12 @@ private:
     llvm::GlobalVariable* builtinInstanceDescriptorFor(const sema::TypeRef* rt);
     void stampBuiltinTypeDesc(llvm::Value* arr, const sema::TypeRef* rt);
     void stampRuntimeProducedArray(llvm::Value* arr, const sema::TypeRef* rt);  // fix #6891
+    // fix #8533 (§28.5 / §28.11 / §28.13, v0.357): record in a LinkedList /
+    // Dictionary / hash-backed Set header what disposing it through an ERASED
+    // slot (an `IDisposable`) must run, and in an event source's its §8.5
+    // name. See the definition.
+    void stampErasedDisposalRecord(llvm::Value* h, const sema::TypeRef* rt,
+                                   bool onlyIfUnset);
     // Whether `t` names a runtime-concrete type: no bare type parameter at any
     // depth (generic arguments, inline-array element, function parameters and
     // return). A type with a bare parameter has no single descriptor.
@@ -15994,14 +16000,32 @@ private:
     // "auto-disposes the field when the containing object is disposed"; §28.4
     // step 2 says the generated `Dispose()` "disposes all owned-bearing
     // fields ... fields marked `owned` (class- or interface-typed; the field's
-    // value's `Dispose()` is called)". The runtime value of such a slot is
-    // ALWAYS a vtable-bearing class instance (§8.1 / stdlib §2.10: every class
-    // implicitly implements `IDisposable`; a class may explicitly implement
-    // `IAsyncDisposable`), so the discharge is the class-vtable slot-2 dynamic
-    // dispatch — the SAME path the `owned d: IDisposable` PARAMETER case
-    // takes (#4328 / #7554: `emitOwnedParamCaptureDispose` case (4)) and the
-    // same path the `using var` LOCAL case takes (the `dynamicDispose` arm of
+    // value's `Dispose()` is called)". The runtime value of such a slot is a
+    // class instance (§8.1 / stdlib §2.10: every class implicitly implements
+    // `IDisposable`; a class may explicitly implement `IAsyncDisposable`), so
+    // the discharge is the vtable slot-2 dynamic dispatch — the SAME path the
+    // `owned d: IDisposable` PARAMETER case takes (#4328 / #7554:
+    // `emitOwnedParamCaptureDispose` case (4)) and the same path the
+    // `using var` LOCAL case takes (the `dynamicDispose` arm of
     // `registerUsingDisposal`).
+    //
+    // "A class instance" is NOT "a user class": the stdlib's built-in classes
+    // implement `IDisposable` too (stdlib §2.10), so the slot may hold any of
+    // them. That dispatch is sound only for a value that opens with a word-0
+    // vtable whose slot 2 is its real disposal. A user class does; so do the
+    // runtime types `bz_word0_is_builtin_vtable` lists (bezel_runtime_
+    // refcounting.cpp): the array family and `StringBuilder`, `Mutex`,
+    // `CancellationTokenSource`, `Stopwatch`, `Random`, `FileStream`, `Lock`,
+    // `Semaphore`, `SemaphoreToken`, `TaskScope` (#6776 / #7554 / #8000), and
+    // since fix #8533 the `Shared<T>` / `Weak<T>` handles, `LinkedList`, the
+    // hash-backed `Dictionary` / `Set` families, the event sources, the
+    // atomic cells, the serializers / deserializers and `Subscription` (they
+    // had none, and this arm read a count, a bucket pointer or a handler
+    // array as a vtable — #8533's crash).
+    //
+    // STILL WITHOUT ONE, and still a wild dispatch from this slot (#7532):
+    // `Channel<T>`, `TaskCompletionSource<T>`, `OwningTaskCompletionSource<T>`.
+    // A NEW built-in without a vtable word must not become reachable here.
     //
     // WHY A HEAD-NAME PREDICATE AND NOT A DECLARATION TEST. `IDisposable` /
     // `IAsyncDisposable` have no `TypeDecl` — that is the whole defect: every

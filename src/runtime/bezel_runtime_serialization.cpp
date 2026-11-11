@@ -36,6 +36,12 @@ struct bz_jser_state_t {
 };
 
 struct bz_binser_t {
+    // fix #8533 (§28.5, v0.357): the runtime type tag — word 0 is
+    // bz_binser_vtable, so a serializer held in an `IDisposable` slot is
+    // disposed by the class protocol (slot 2 = bz_binser_obj_dispose, then
+    // the caller reclaims the struct) instead of having its output buffer
+    // called as a vtable.
+    void*    vtable;
     uint8_t* buf;
     int64_t  used;   // bytes written so far
     int64_t  cap;    // allocated capacity
@@ -112,6 +118,7 @@ extern "C" {
 
 void* bz_binser_alloc(void) {
     auto* s = static_cast<bz_binser_t*>(calloc(1, sizeof(bz_binser_t)));
+    s->vtable = (void*)bz_binser_vtable;
     s->kind      = 0;  // binary
     return s;
 }
@@ -119,6 +126,7 @@ void* bz_binser_alloc(void) {
 // JSON serializer: same bz_binser_t, kind = 1.
 void* bz_jser_alloc(void) {
     auto* s = static_cast<bz_binser_t*>(calloc(1, sizeof(bz_binser_t)));
+    s->vtable = (void*)bz_binser_vtable;
     s->kind = 1;  // JSON
     // Defaults per stdlib §2.15: Indented=false, IndentWidth=2, MaxDepth=64.
     s->json.indented     = false;
@@ -130,6 +138,7 @@ void* bz_jser_alloc(void) {
 // fix #687 / stdlib §2.15 JsonOptions: allocate with explicit options.
 void* bz_jser_alloc_opts(int8_t indented, int32_t indent_width, int32_t max_depth) {
     auto* s = static_cast<bz_binser_t*>(calloc(1, sizeof(bz_binser_t)));
+    s->vtable = (void*)bz_binser_vtable;
     s->kind = 1;  // JSON
     s->json.indented     = (indented != 0);
     s->json.indent_width = (indent_width > 0) ? indent_width : 2;
@@ -137,12 +146,44 @@ void* bz_jser_alloc_opts(int8_t indented, int32_t indent_width, int32_t max_dept
     return s;
 }
 
+// The serializer's buffers, shared by the typed free below and the vtable
+// Dispose slot (fix #8533). Idempotent: it leaves an empty serializer.
+static void bz_binser_release_contents(bz_binser_t* s) {
+    free(s->buf);
+    free(s->tag_ptrs);
+    s->buf = nullptr;
+    s->used = 0;
+    s->cap = 0;
+    s->tag_ptrs = nullptr;
+    s->tag_count = 0;
+    s->tag_cap = 0;
+}
+
 void bz_binser_free(void* serp) {
     if (!serp) return;
     auto* s = static_cast<bz_binser_t*>(serp);
-    free(s->buf);
-    free(s->tag_ptrs);
+    bz_binser_release_contents(s);
     free(s);
+}
+
+// fix #8533 (§28.4 step 2 / §28.5 / §28.11, v0.357): bz_binser_vtable's
+// Dispose slot — the class-protocol disposal of a `BinarySerializer` /
+// `JsonSerializer` held in an `IDisposable` slot. It does what
+// bz_binser_free does EXCEPT free the struct, which the caller's reclaim
+// step owns.
+void bz_binser_obj_dispose(void* serp) {
+    if (serp) bz_binser_release_contents(static_cast<bz_binser_t*>(serp));
+}
+
+// The ToString slot. One struct serves both serializers; `kind` tells them
+// apart. `JsonSerializer` OVERRIDES ToString (stdlib §2.15: "convenience:
+// UTF-8 -> string"), so the dynamic call is that override; a
+// `BinarySerializer` has §8.5's default, the qualified type name.
+void* bz_binser_obj_tostring(void* serp) {
+    if (serp && static_cast<bz_binser_t*>(serp)->kind == 1)
+        return bz_jser_to_string(serp);
+    static const char bin[] = "System.BinarySerializer";
+    return bz_make_string(bin, (int64_t)(sizeof(bin) - 1));
 }
 
 // Transfer accumulated bytes as a fresh OwningBuffer<byte> (bz_array_t* with
@@ -768,6 +809,9 @@ void bz_binser_write_ref_tag(void* serp, int32_t tag_id) {
 #define BZ_JDER_MAX_DEPTH 64
 
 struct bz_binder_t {
+    // fix #8533 (§28.5, v0.357): the runtime type tag — word 0 is
+    // bz_binder_vtable (see bz_binser_t).
+    void*          vtable;
     const uint8_t* data;
     int64_t        len;
     int64_t        pos;
@@ -1768,6 +1812,7 @@ extern "C" {
 
 void* bz_binder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown) {
     auto* d = static_cast<bz_binder_t*>(calloc(1, sizeof(bz_binder_t)));
+    d->vtable = (void*)bz_binder_vtable;
     d->data             = data;
     d->len              = len;
     d->pos              = 0;
@@ -1779,6 +1824,7 @@ void* bz_binder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown) {
 // JSON deserializer: data is a UTF-8 JSON byte span (borrowed from caller).
 void* bz_jder_alloc(const uint8_t* data, int64_t len, int8_t ignore_unknown) {
     auto* d = static_cast<bz_binder_t*>(calloc(1, sizeof(bz_binder_t)));
+    d->vtable = (void*)bz_binder_vtable;
     d->data                  = data;
     d->len                   = len;
     d->pos                   = 0;
@@ -1796,6 +1842,7 @@ void* bz_jder_alloc_opts(const uint8_t* data, int64_t len,
                           int8_t ignore_unknown, int8_t allow_trailing_commas,
                           int32_t max_depth) {
     auto* d = static_cast<bz_binder_t*>(calloc(1, sizeof(bz_binder_t)));
+    d->vtable = (void*)bz_binder_vtable;
     d->data                  = data;
     d->len                   = len;
     d->pos                   = 0;
@@ -1813,6 +1860,7 @@ void* bz_jder_alloc_opts(const uint8_t* data, int64_t len,
 // Used by new JsonDeserializer(string) codegen path.
 void* bz_jder_alloc_str(char* utf8z, int64_t len, int8_t ignore_unknown) {
     auto* d = static_cast<bz_binder_t*>(calloc(1, sizeof(bz_binder_t)));
+    d->vtable = (void*)bz_binder_vtable;
     d->data                  = reinterpret_cast<const uint8_t*>(utf8z);
     d->len                   = len;
     d->pos                   = 0;
@@ -1830,6 +1878,7 @@ void* bz_jder_alloc_str_opts(char* utf8z, int64_t len,
                               int8_t ignore_unknown, int8_t allow_trailing_commas,
                               int32_t max_depth) {
     auto* d = static_cast<bz_binder_t*>(calloc(1, sizeof(bz_binder_t)));
+    d->vtable = (void*)bz_binder_vtable;
     d->data                  = reinterpret_cast<const uint8_t*>(utf8z);
     d->len                   = len;
     d->pos                   = 0;
@@ -1842,16 +1891,44 @@ void* bz_jder_alloc_str_opts(char* utf8z, int64_t len,
     return d;
 }
 
-void bz_binder_free(void* derp) {
-    if (!derp) return;
-    auto* d = static_cast<bz_binder_t*>(derp);
+// The deserializer's tables and owned input, shared by the typed free below
+// and the vtable Dispose slot (fix #8533). Idempotent.
+static void bz_binder_release_contents(bz_binder_t* d) {
     free(d->tag_ptrs);
     free(d->tag_in_progress);
+    d->tag_ptrs = nullptr;
+    d->tag_in_progress = nullptr;
     if (d->kind == 2) {
         // Owns the UTF-8 string buffer (allocated by bz_string_to_utf8z).
         free(const_cast<uint8_t*>(d->data));
+        d->data = nullptr;
+        d->len = 0;
+        d->pos = 0;
     }
+}
+
+void bz_binder_free(void* derp) {
+    if (!derp) return;
+    auto* d = static_cast<bz_binder_t*>(derp);
+    bz_binder_release_contents(d);
     free(d);
+}
+
+// fix #8533 (§28.4 step 2 / §28.5 / §28.11, v0.357): bz_binder_vtable's
+// Dispose slot — bz_binder_free minus the struct's own free, which the
+// caller's reclaim step owns.
+void bz_binder_obj_dispose(void* derp) {
+    if (derp) bz_binder_release_contents(static_cast<bz_binder_t*>(derp));
+}
+
+// The ToString slot: §8.5's default, the qualified type name (`kind` 0 is
+// the binary deserializer, 1 and 2 the JSON one).
+void* bz_binder_obj_tostring(void* derp) {
+    static const char bin[] = "System.BinaryDeserializer";
+    static const char json[] = "System.JsonDeserializer";
+    if (derp && static_cast<bz_binder_t*>(derp)->kind >= 1)
+        return bz_make_string(json, (int64_t)(sizeof(json) - 1));
+    return bz_make_string(bin, (int64_t)(sizeof(bin) - 1));
 }
 
 int64_t bz_binder_read_int(void* derp) {

@@ -2590,6 +2590,7 @@ void bz_ctoken_unregister(bz_cancel_state_t* s, int64_t tok) {
 // Subscription whose Dispose() is a no-op").
 static void* bz_make_cancel_subscription(bz_cancel_state_t* s, int64_t tok) {
     auto* sub = (bz_subscription_t*)calloc(1, sizeof(bz_subscription_t));
+    sub->vtable = (void*)bz_subscription_vtable;
     sub->src = nullptr;
     sub->token = tok;
     sub->disposed = false;

@@ -15,10 +15,22 @@ struct bz_event_handler_t {
 };
 
 struct bz_event_source_t {
+    // fix #8533 (§28.5, v0.357): the runtime type tag — word 0 is
+    // bz_event_source_vtable, so an event source held in an `IDisposable`
+    // slot is disposed by the class protocol (slot 2 =
+    // bz_event_source_obj_dispose, then the caller reclaims the struct)
+    // instead of having its handler array called as a vtable. One tag serves
+    // EventSource / AsyncEventSource / SharedEventSource: they share this
+    // representation and this disposal.
+    void*               vtable;
     bz_event_handler_t* handlers;
     int64_t             count;     // number of slots in use (incl. tombstones)
     int64_t             capacity;
     int64_t             next_token;
+    // The §8.5 default rendering as the string LITERAL codegen emitted at a
+    // `new` (rc sentinel, never freed); null for a keyword-form event's
+    // backing source, which is never a first-class value.
+    void*               type_name;
 };
 
 // #1413 (stdlib §6.1): CancellationToken.Register installs a `() -> ()` callback
@@ -33,6 +45,7 @@ struct bz_cancel_state_t;
 
 extern "C" void* bz_event_source_new(void) {
     auto* s = (bz_event_source_t*)calloc(1, sizeof(bz_event_source_t));
+    s->vtable = (void*)bz_event_source_vtable;
     s->next_token = 1;  // tokens are >0 so 0 can mean "none"
     return s;
 }
@@ -57,6 +70,7 @@ static void bz_free_static_event_sources(void) {
 
 extern "C" void* bz_static_event_source_new(void) {
     auto* s = (bz_event_source_t*)calloc(1, sizeof(bz_event_source_t));
+    s->vtable = (void*)bz_event_source_vtable;
     s->next_token = 1;
     if (!g_static_event_sources) {
         g_static_event_sources = new std::vector<bz_event_source_t*>();
@@ -318,6 +332,7 @@ extern "C" void* bz_event_subscribe(void* srcp, void* closure) {
     auto* s = (bz_event_source_t*)srcp;
     int64_t tok = bz_event_add(s, closure);
     auto* sub = (bz_subscription_t*)calloc(1, sizeof(bz_subscription_t));
+    sub->vtable = (void*)bz_subscription_vtable;
     sub->src = s;
     sub->token = tok;
     sub->disposed = false;
@@ -328,14 +343,18 @@ extern "C" void* bz_event_subscribe(void* srcp, void* closure) {
     return sub;
 }
 
-extern "C" void bz_subscription_dispose(void* subp) {
-    if (!subp) return;
+// The unsubscribe itself, shared by the typed dispose below and the vtable
+// Dispose slot (fix #8533): everything bz_subscription_dispose does EXCEPT
+// free the node. Returns false when `subp` is not a live subscription (null,
+// or already disposed), in which case nothing was touched.
+static bool bz_subscription_release(void* subp) {
+    if (!subp) return false;
     {
         // §2.11: Dispose is idempotent. Only a live (registered) node is acted
         // on; a second call finds the pointer absent and returns without ever
         // dereferencing the freed node (no double-free, no use-after-free).
         std::lock_guard<std::mutex> lk(bz_sub_live_mutex());
-        if (bz_sub_live_set().erase(subp) == 0) return;
+        if (bz_sub_live_set().erase(subp) == 0) return false;
     }
     auto* sub = (bz_subscription_t*)subp;
     sub->disposed = true;
@@ -352,8 +371,7 @@ extern "C" void bz_subscription_dispose(void* subp) {
         sub->cancel_state = nullptr;
         bz_ctoken_unregister(cs, sub->token);
         bz_cancel_state_release(cs);
-        free(sub);
-        return;
+        return true;
     }
     if (sub->src) {
         // §24 / §27.5 / #841: the handler closure is a transferred +1 — codegen
@@ -380,12 +398,26 @@ extern "C" void bz_subscription_dispose(void* subp) {
         // calling it here would be redundant — skip it.
     }
     sub->src = nullptr;  // null the back-pointer before freeing
-    free(sub);           // fixes #372: the node was previously never freed
+    return true;
 }
 
-extern "C" void bz_event_source_free(void* srcp) {
-    auto* s = (bz_event_source_t*)srcp;
-    if (!s) return;
+extern "C" void bz_subscription_dispose(void* subp) {
+    if (bz_subscription_release(subp))
+        free(subp);      // fixes #372: the node was previously never freed
+}
+
+// fix #8533 (§28.4 step 2 / §28.5 / §28.11, v0.357; stdlib §2.11):
+// bz_subscription_vtable's Dispose slot — the class-protocol disposal of a
+// `Subscription` held in an `IDisposable` slot. It unsubscribes exactly as
+// bz_subscription_dispose does and leaves the node for the caller's reclaim
+// step. Idempotent like the typed call (the live-set guard).
+extern "C" void bz_subscription_obj_dispose(void* subp) {
+    (void)bz_subscription_release(subp);
+}
+
+// The handler list's release, shared by the typed free below and the vtable
+// Dispose slot (fix #8533). Idempotent: it leaves an empty source behind.
+static void bz_event_source_release_handlers(bz_event_source_t* s) {
     // fix #4976 (stdlib §6.5 v0.315): per §24 / §27.5 / #841, the source OWNS
     // exactly one reference on every registered handler closure — codegen's
     // bz_event_add / bz_event_subscribe hand it a transferred +1 the source
@@ -405,7 +437,43 @@ extern "C" void bz_event_source_free(void* srcp) {
         }
     }
     free(s->handlers);
+    s->handlers = nullptr;
+    s->count = 0;
+    s->capacity = 0;
+}
+
+extern "C" void bz_event_source_free(void* srcp) {
+    auto* s = (bz_event_source_t*)srcp;
+    if (!s) return;
+    bz_event_source_release_handlers(s);
     free(s);
+}
+
+// fix #8533 (§28.4 step 2 / §28.5 / §28.11, v0.357): bz_event_source_vtable's
+// Dispose slot — the class-protocol disposal of an event source held in an
+// `IDisposable` slot. It does what bz_event_source_free does EXCEPT free the
+// struct, which the caller's reclaim step owns.
+extern "C" void bz_event_source_obj_dispose(void* srcp) {
+    if (srcp) bz_event_source_release_handlers((bz_event_source_t*)srcp);
+}
+
+// The ToString slot: §8.5's default, the qualified type name — the name
+// stamped at the `new`, else the bare head.
+extern "C" void* bz_event_source_obj_tostring(void* srcp) {
+    if (srcp && ((bz_event_source_t*)srcp)->type_name)
+        return ((bz_event_source_t*)srcp)->type_name;
+    static const char name[] = "System.EventSource";
+    return bz_make_string(name, (int64_t)(sizeof(name) - 1));
+}
+
+// Record the §8.5 name of a source built by `new` (a string literal). A
+// no-op on null and on anything that is not an event source.
+extern "C" void bz_event_source_set_type_name(void* srcp, void* type_name) {
+    if (!srcp) return;
+    void* word0;
+    memcpy(&word0, srcp, sizeof(void*));
+    if (word0 != (void*)bz_event_source_vtable) return;
+    ((bz_event_source_t*)srcp)->type_name = type_name;
 }
 
 // fix #1832 / stdlib §6.5 (v0.187): the cross-domain publication-point pair

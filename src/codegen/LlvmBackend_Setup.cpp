@@ -52133,6 +52133,8 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         stampOwningLlistElemDisposer(ll, er,
                                      common::isOwningPrefixedName(
                                          collTy->headName()));
+        // fix #8533 (§28.5 / §28.11, v0.357): the erased-disposal record.
+        stampErasedDisposalRecord(ll, collTy, /*onlyIfUnset=*/false);
         auto* addFn = declareC("bz_llist_add_last", ptrTy(),
                                {ptrTy(), ptrTy(), i64()});
         for (const auto& elemPtr : cl->elements) {
@@ -53117,7 +53119,9 @@ llvm::Value* Emitter::lowerByteArrayFactoryArg(const ast::Expr& argExpr) {
 // callee, so the caller registers no disposal (§28.3).
 Emitter::Disposal Emitter::buildCollectionTempDisposal(
         llvm::Value* slot, const sema::TypeRef* collTy) {
-    auto* alloca = llvm::cast<llvm::AllocaInst>(slot);
+    // `slot` is null for the one caller that wants the POLICY alone
+    // (stampErasedDisposalRecord, fix #8533), which never emits the Disposal.
+    auto* alloca = llvm::cast_or_null<llvm::AllocaInst>(slot);
     // fix #2957 (§15.4.1, v0.240): a USER-DEFINED class type (a FCL factory's
     // `owned C<U>` result) — dispose via the class's vtable slot-2 Dispose,
     // NOT via bz_array_free (the previous fall-through treated every
@@ -53394,6 +53398,8 @@ llvm::Value* Emitter::materializeHeapSetLiteral(
                              {i64(), ptrTy(), ptrTy()});
     llvm::Value* tbl = builder_.CreateCall(
         allocFn, {builder_.getInt64((int64_t)ksz), hashT, eqT}, "slit.tbl");
+    // fix #8533 (§28.5 / §28.11, v0.357): the erased-disposal record.
+    stampErasedDisposalRecord(tbl, setTy, /*onlyIfUnset=*/false);
 
     // Sentinel non-null value stored for present elements (same as Set.Add).
     llvm::Value* sentinel = builder_.CreateIntToPtr(builder_.getInt64(1), ptrTy());
@@ -53552,6 +53558,8 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
         dict = builder_.CreateCall(allocFn, {}, "dlit.tbl");
     }
     if (!dict) return nullptr;
+    // fix #8533 (§28.5 / §28.11, v0.357): the erased-disposal record.
+    stampErasedDisposalRecord(dict, dictTy, /*onlyIfUnset=*/false);
 
     // --- 2. Insert each (key, value) pair (same as .Add(k, v)). -----------
 

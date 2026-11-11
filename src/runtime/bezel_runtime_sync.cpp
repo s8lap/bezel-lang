@@ -928,6 +928,17 @@ void* bz_semaphore_try_acquire_async(void* sp, int64_t timeout_ms,
 // ---------------------------------------------------------------------------
 
 struct bz_atomic_t {
+    // fix #8533 (§28.5, v0.357): the runtime type tag — word 0 is
+    // bz_atomic_vtable, so an atomic cell held in an `IDisposable` slot is
+    // disposed by the class protocol (slot 2 = bz_atomic_obj_dispose, then
+    // the caller's reclaim `free`s the block) instead of having its
+    // refcount word called as a vtable. The block is therefore malloc'd
+    // (bz_atomic_new), not `new`'d.
+    void*             vtable = nullptr;
+    // The §8.5 default rendering as the string LITERAL codegen emitted at the
+    // `new` (rc sentinel, never freed) — `Atomic<T>` and `AtomicInteger<T>`
+    // share this representation, so only the construction site can name it.
+    void*             type_name = nullptr;
     std::atomic<int>  core_refs{1};
     // fix #706: atomic so concurrent Dispose from two domains cannot both
     // reach atomic_core_release (exchange(true) ensures exactly one caller).
@@ -938,8 +949,10 @@ struct bz_atomic_t {
 };
 
 static void atomic_core_release(bz_atomic_t* a) {
-    if (a->core_refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
-        delete a;
+    if (a->core_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        a->~bz_atomic_t();
+        free(a);
+    }
 }
 
 extern "C" {
@@ -948,7 +961,12 @@ extern "C" {
 // core_refs = 1.
 void* bz_atomic_new(int cell_size, uint64_t initial) {
     if (cell_size <= 0 || cell_size > 8) cell_size = 4;  // defensive
-    auto* a = new bz_atomic_t();
+    // malloc + placement-new: the erased (`IDisposable`-slot) disposal
+    // reclaims the block with `free` (fix #8533).
+    void* mem = calloc(1, sizeof(bz_atomic_t));
+    if (!mem) abort();
+    auto* a = new (mem) bz_atomic_t();
+    a->vtable = (void*)bz_atomic_vtable;
     a->cell_size = cell_size;
     memset(a->cell, 0, 8);
     // Store initial value (seq-cst) into the cell.
@@ -974,6 +992,34 @@ void bz_atomic_dispose(void* ptr) {
     auto* a = static_cast<bz_atomic_t*>(ptr);
     if (a->disposed.exchange(true)) return;  // already disposed → no-op (fix #706)
     atomic_core_release(a);
+}
+
+// fix #8533 (§28.4 step 2 / §28.5 / §28.11, v0.357): bz_atomic_vtable's
+// Dispose slot — the class-protocol disposal of an atomic cell held in an
+// `IDisposable` slot. A cell owns nothing but its own block, which the
+// caller's reclaim step frees, so the slot only records the disposal.
+void bz_atomic_obj_dispose(void* ptr) {
+    if (!ptr) return;
+    static_cast<bz_atomic_t*>(ptr)->disposed.store(true);
+}
+
+// The ToString slot: §8.5's default, the qualified type name — the name
+// stamped at the `new`, else the bare head.
+void* bz_atomic_obj_tostring(void* ptr) {
+    if (ptr && static_cast<bz_atomic_t*>(ptr)->type_name)
+        return static_cast<bz_atomic_t*>(ptr)->type_name;
+    static const char name[] = "System.Threading.Atomic";
+    return bz_make_string(name, (int64_t)(sizeof(name) - 1));
+}
+
+// Record the §8.5 name of a cell built by `new` (a string literal). A no-op
+// on null and on anything that is not an atomic cell.
+void bz_atomic_set_type_name(void* ptr, void* type_name) {
+    if (!ptr) return;
+    void* word0;
+    memcpy(&word0, ptr, sizeof(void*));
+    if (word0 != (void*)bz_atomic_vtable) return;
+    static_cast<bz_atomic_t*>(ptr)->type_name = type_name;
 }
 
 // bz_atomic_load — seq-cst load; returns value zero-extended to uint64_t.

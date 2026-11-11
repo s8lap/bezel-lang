@@ -5553,6 +5553,126 @@ void Emitter::stampRuntimeProducedArray(llvm::Value* arr,
         {arr, d});
 }
 
+// fix #8533 (§28.4 step 2 / §28.5 / §28.11, v0.357): a LinkedList, a
+// Dictionary and a hash-backed Set are disposed through an `IDisposable` slot
+// (an `owned F: IDisposable?` field, an `OwningArray<IDisposable>` element, an
+// `owned d: IDisposable` parameter) by their runtime vtable's Dispose slot,
+// which knows the backing but not the ELEMENT TYPE — and the element type is
+// what decides whether disposing the collection disposes its elements
+// (§28.11: an owning collection's `Dispose()` "disposes every live element";
+// a borrowing one's slots "are never disposed"). The static type is known
+// where the value is constructed, so record there, in the header, exactly
+// what the TYPED scope-end free of that type runs:
+//
+//   list   the element disposer `bz_llist_free` is handed;
+//   table  the value disposer `bz_dict_free` is handed, plus the two key
+//          steps a set's free runs before it (`bz_set_string_keys_release`
+//          for a string element, `bz_set_coll_keys_dispose` for an owning
+//          set of borrowing collections — #4091).
+//
+// The policy is `buildCollectionTempDisposal`'s, read rather than restated,
+// so the erased and the typed disposal of one type cannot drift apart. The
+// record is read ONLY by the vtable Dispose slot; every typed path keeps the
+// disposer its own static type derives.
+//
+// `onlyIfUnset` is the post-CALL form (the #6891 shape): a table or list the
+// runtime allocated (`Environment.Variables()`, a pipeline's `ToDictionary`)
+// has no record, the call site knows its static result type, and a value that
+// was recorded at its own construction is left alone. The runtime setters
+// ignore null and anything whose word 0 is not the matching vtable, so a
+// Set the static type mis-predicts as hash-backed is untouched.
+//
+// The name is the §8.5 default rendering `emitVtablelessBuiltinToString`
+// produces statically, for the through-`Object` `ToString()` the vtable now
+// also answers; null (the runtime renders the bare head) when a type argument
+// is still a type parameter.
+//
+// An event source (`EventSource<T>` / `AsyncEventSource<T>` /
+// `SharedEventSource<T>`, stdlib §6.5) and an atomic cell (`Atomic<T>` /
+// `AtomicInteger<T>`, stdlib §6.4) need no disposal policy — the first's
+// vtable Dispose slot releases the handler closures it owns, the second owns
+// nothing but its block — so their record is the name alone, written at a
+// `new`.
+void Emitter::stampErasedDisposalRecord(llvm::Value* h,
+                                        const sema::TypeRef* rt,
+                                        bool onlyIfUnset) {
+    if (!h || !h->getType()->isPointerTy()) return;
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return;
+    if (!genericSubstSemaTy_.empty())
+        rt = substituteTypeRefLocal(rt, genericSubstSemaTy_);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return;
+    const std::string_view bn = builtinTypeName(rt);
+    llvm::Constant* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
+    // §8.5's default rendering of the instantiation, as a string literal;
+    // null when `rt` still mentions a type parameter (the runtime then
+    // renders the bare head).
+    auto nameLiteral = [&]() -> llvm::Value* {
+        if (!typeRefIsRuntimeConcrete(rt)) return nullPtr;
+        sema::TypeRef bare = *rt;
+        bare.nullable = false;
+        std::string lexeme = "\"";
+        for (char c : vtablelessBuiltinQualifiedName(bn, &bare)) {
+            if (c == '"' || c == '\\') lexeme += '\\';
+            lexeme += c;
+        }
+        lexeme += "\"";
+        return lowerStringLiteral(lexeme, false);
+    };
+    // An event source's / atomic cell's disposal needs no policy; the record
+    // is the name only, and only a `new` writes it.
+    const bool isEvent =
+        isEventSourceTypeName(rt) || isSharedEventSourceTypeName(rt);
+    if (isEvent || bn == "Atomic" || bn == "AtomicInteger") {
+        if (onlyIfUnset) return;
+        llvm::Value* name = nameLiteral();
+        if (name == nullPtr) return;
+        builder_.CreateCall(
+            declareC(isEvent ? "bz_event_source_set_type_name"
+                             : "bz_atomic_set_type_name",
+                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}),
+            {h, name});
+        return;
+    }
+    const bool isList = isLinkedListTypeName(rt);
+    const bool isSet = bn == "Set" || bn == "OwningSet" || bn == "SortedSet";
+    if (!isList && !isDictTypeName(rt) &&
+        !(isSet && genericBackingType(rt, 0, /*isSet=*/true, nullptr)))
+        return;
+    Disposal d = buildCollectionTempDisposal(nullptr, rt);
+    if (!d.linkedList && !d.dict) return;
+    auto orNull = [&](llvm::Value* f) -> llvm::Value* {
+        return f ? f : nullPtr;
+    };
+    llvm::Value* name = nameLiteral();
+    llvm::Value* unset = builder_.getInt32(onlyIfUnset ? 1 : 0);
+    if (d.linkedList) {
+        builder_.CreateCall(
+            declareC("bz_llist_set_dyn_disposer", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy(), ptrTy(), ptrTy(), builder_.getInt32Ty()}),
+            {h, orNull(d.collectionElemDisposer), name, unset});
+        return;
+    }
+    // #4091: an OWNING set of borrowing built-in collections disposes its
+    // keys. `buildCollectionTempDisposal` does not derive this one (the typed
+    // local registration does, inline), so derive it the same way here.
+    llvm::Function* keyDisposer = nullptr;
+    if (isSet && common::isOwningPrefixedName(bn) &&
+        rt->genericArgs.size() == 1) {
+        ElementPolicy kp =
+            elementPolicyFor(rt->genericArgs[0], /*owningFamily=*/true);
+        if (kp.disposerThunk && kp.cat == ElementPolicy::Category::ClassOwned)
+            keyDisposer = kp.disposerThunk;
+    }
+    builder_.CreateCall(
+        declareC("bz_dict_set_dyn_disposers", llvm::Type::getVoidTy(llvm_),
+                 {ptrTy(), ptrTy(), ptrTy(), builder_.getInt8Ty(), ptrTy(),
+                  builder_.getInt32Ty()}),
+        {h, orNull(d.dictValueDisposer), orNull(keyDisposer),
+         builder_.getInt8(d.dictStringKeys ? 1 : 0), name, unset});
+}
+
 // §8.6: box an already-lowered value `value` (static type `srcTy`) into a heap
 // wrapper `{ boxVtable*, i64 rc, value-bytes }` and return the box pointer. The
 // leading vtable word lets `emitIsA` and virtual dispatch recognize the box
