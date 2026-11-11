@@ -100,6 +100,14 @@ BEZEL_TEST(owned_return_literal_local_5278, move_variant_reports_only_redundant_
 }
 
 // A literal local that is REASSIGNED may hold a borrow: still rejected.
+//
+// fix #7980 (§28.3.3 / §28.3.4, v0.357): the collection-literal local is now
+// in the OWNED state -- §28.3.4's producers table classifies a collection
+// literal targeting a reference type as **Owned**, and §28.3.3 says
+// "`var x := expr;` takes the ownership state of `expr`" -- so the
+// REASSIGNMENT is the site that rejects the program: §28.3.3's state match
+// ("an owned-state LHS requires an owned RHS"). The borrow never enters `d`,
+// so the return-position borrow diagnostic is no longer reached.
 BEZEL_TEST(owned_return_literal_local_5278, reassigned_literal_local_still_rejected_spec_28_3) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
@@ -110,7 +118,10 @@ BEZEL_TEST(owned_return_literal_local_5278, reassigned_literal_local_still_rejec
         "  end Make; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "a borrow cannot be returned as an `owned` value"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "`d` is in the OWNED state"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "§28.3's state match on reassignment"));
+    BEZEL_EXPECT_FALSE(
+        hasErrorMessage(r, "a borrow cannot be returned as an `owned` value"));
 }
 
 // Control: a literal local returned through a PLAIN instance return is handled
