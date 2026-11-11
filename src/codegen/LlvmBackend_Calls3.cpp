@@ -4594,7 +4594,8 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // fix #8384 (stdlib §5 Ordering / §2.8, spec §14.2, v0.357): the comparator
     // an ordered sequence ranks ONE sort key by — `i32 cmp(ptr a, ptr b)`, `a` and
     // `b` pointing at two KEY SLOTS (each holds one key value at its own lowered
-    // type), negative / zero / positive as stdlib §2.8's `CompareTo` returns.
+    // type), negative / zero / positive: the result convention stdlib §2.8
+    // gives the `IComparable<T>` comparison.
     //
     // WHAT THE DOCUMENTS REQUIRE. stdlib §5 (v0.357) declares
     //     public method OrderBy<TKey>(key: (T) -> TKey): IOrderedEnumerable<T>
@@ -4834,6 +4835,58 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         return fn;
     };
 
+    // narrow #7213 (stdlib §5 Ordering, spec §27.5 / §28.9, v0.357; the
+    // underlying defect is #8553): does the key LAMBDA LITERAL `arg` capture a
+    // local of the enclosing function whose capture cell the lambda's env
+    // destructor releases — a non-null `string` local or a function-typed
+    // local? For such a key the sort declines the key drop above.
+    //
+    // WHY. The key itself is not the problem: a lambda mints its `string`
+    // result (+1) whatever its body reads, a captured local included, so one
+    // release per key is balanced. The problem is the CAPTURE. The first lambda
+    // that captures a `string` (or closure) local takes over the local's own
+    // reference: the local's scope-end release is suppressed and the env
+    // destructor releases the cell's content instead. A lambda literal passed
+    // to a lazy stdlib §5 operator is owned by the lazy node, so that destructor
+    // runs when the query is disposed — INSIDE the local's scope — and every later
+    // read of the local reads a freed string. That is #8553, and it is not
+    // specific to ordering: `a.Where(lambda(x) => cap.Length > 0)` followed by
+    // a read of `cap` crashes the same way, before and after #8384.
+    //
+    // Before #8384 one shape did NOT crash: a key that IS the captured string
+    // (`OrderBy(lambda(x) => cap)`, or a key reached through a captured
+    // closure). The sort leaked every key (#7213), and the leaked reference
+    // per key kept the string alive past the env destructor's release.
+    // Releasing the keys removes that accident and turns a leak into a
+    // use-after-free in the declaring scope, which is the wrong direction to
+    // move in. So until #8553 gives the capture cell a shared owner, a key
+    // lambda that captures such a local keeps the pre-#8384 accounting exactly:
+    // its keys are not released. Every other key function — one that captures
+    // nothing, a parameter (retained at capture), a value-typed local, an
+    // object, or a held function value the lazy node does not own — is
+    // released once per key as §28.9 requires.
+    //
+    // The predicate mirrors `lowerLambda`'s own classification of a captured
+    // local (a `LocalSymbol` whose declaration is a local of this function,
+    // with the declared type the env destructor keys its content release on),
+    // so the guard and the release it guards against cannot disagree. REMOVE
+    // this when #8553 is fixed.
+    auto orderKeyLambdaCapturesEnvReleasedLocal = [&](const ast::Expr* arg) -> bool {
+        auto* lam = dynamic_cast<const ast::LambdaExpr*>(arg);
+        if (!lam) return false;
+        std::unordered_set<const sema::Symbol*> captured;
+        collectCapturedSyms(*lam, captured);
+        for (const sema::Symbol* s : captured) {
+            auto* loc = dynamic_cast<const sema::LocalSymbol*>(s);
+            if (!loc || !loc->decl || !locals_.count(loc->decl)) continue;
+            const sema::TypeRef* t = loc->declType;
+            if (isStringTypeRefNonNull(t) ||
+                (t && t->kind == sema::TypeRef::Kind::Function))
+                return true;
+        }
+        return false;
+    };
+
     // fix #8384 (stdlib §5 Ordering / §4.4 *Sorting contract*, v0.357): ONE
     // sort key of `OrderBy` / `OrderByDescending` / `ThenBy` /
     // `ThenByDescending`, lowered at the key's OWN type.
@@ -4929,12 +4982,16 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
             }
             return OrderKeyResult::Rejected;
         }
+        // Classified BEFORE the lambda is lowered: lowering it boxes the
+        // captured locals, and the question is about the locals as declared.
+        const bool keepKeys = orderKeyLambdaCapturesEnvReleasedLocal(arg);
         out.closure = lowerLinqLambda(arg, keyRef);
         if (!out.closure) return OrderKeyResult::NotLowered;
         out.keysel = buildLinqTrampoline(1, elemTy, keyTy);
         out.ksz = lazyElemSize(keyTy, module_->getDataLayout());
         out.cmp = cmp;
-        if (llvm::Function* dropFn = buildOrderKeyDrop(keyRef))
+        // narrow #7213 / #8553: see orderKeyLambdaCapturesEnvReleasedLocal.
+        if (llvm::Function* dropFn = keepKeys ? nullptr : buildOrderKeyDrop(keyRef))
             out.drop = dropFn;
         else
             out.drop = llvm::ConstantPointerNull::get(ptrTy());

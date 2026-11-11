@@ -3135,8 +3135,9 @@ typedef void    (*bz_keydrop_fn)(void* key);
 // One sort key of an ordered sequence (`OrderBy` contributes the first,
 // each `ThenBy` one more). The key function is the SELECTOR shape
 // (`bz_sel_fn`): it writes the key's own `ksz` bytes, so a key of any type
-// stdlib §5 admits (`where TKey: IComparable<TKey>`) is carried at its own
-// width instead of being squeezed through an `int64_t`.
+// the stdlib §5 ordering operators admit is carried at its own width instead
+// of being squeezed through an `int64_t`. Their bound is
+// `where TKey: IComparable<TKey>`, the stdlib §2.8 interface.
 struct bz_order_level_t {
     void*         closure;  // key closure (a BORROW: the node that introduced it owns it)
     bz_sel_fn     keysel;   // void(closure, elem, out): writes the key's ksz bytes
