@@ -701,6 +701,16 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // borrow-store escape check can tell whether a closure assigned to a plain
     // local outlives the owned local it captures.
     collectLocalDepths(body);
+    // fix-forward #7468 (§28.11 *Borrowing collections* → *Storing a borrow*,
+    // v0.357): the ESCAPE half of §28.11's exemption — "a collection that is a
+    // local of the body and DOES NOT ESCAPE IT". The scan records the locals
+    // of this frame that leave it (a `move`, a closure capture, a store into a
+    // member slot, a returned value), so the collection-store report can tell
+    // a body-local collection that stays in the body (exempt) from one that
+    // outlives it (reported). Runs after `collectLocalDepths`, whose depths
+    // answer "a local of THIS frame" — the scan's own membership test.
+    // Only the report mode consults the result, so the scan is gated on it.
+    if (ctx_.reportTrustAdmissions()) collectEscapingLocals(body);
     // §28.3 (v0.180) consume-site freeze: precompute per-local read-use offsets
     // and loop-body extents so the transfer functions can query borrow liveness
     // at each consume site (`move` / `owned`-arg / drop-on-overwrite). Runs once,
