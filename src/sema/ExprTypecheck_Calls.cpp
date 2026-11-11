@@ -11026,6 +11026,84 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                         }
                     }
+                    // fix #8625 (§14.5 phase 1 + phase 2 + §22.6 + §15.4,
+                    // v0.357): the applicability check runs "against the
+                    // SUBSTITUTED signature" — a type argument INFERRED here
+                    // must be substituted into the parameter's declared type
+                    // before the per-argument checks read it.
+                    // `checkArgsAgainstParams` substitutes only the EXPLICIT
+                    // type-argument list (fix #4325's `explicitSubst` map),
+                    // so an INFERRED type argument left the parameter type
+                    // carrying a FREE type parameter, and every check that
+                    // reads such a type DEFERS: `checkAssignable` skips a
+                    // free-type-parameter target, and so does the §15.4
+                    // collection-literal element check
+                    // (`checkCollectionLiteralElementAssignability`).
+                    //
+                    // MEASURED (#8625): `Seq.M(xs, lambda(v: Box) => v.Name +
+                    // "!", [1, 2])` against `M<T, K>(xs: Array<T>, key: (T) ->
+                    // K, extra: Array<K>)` binds `K := string` from the
+                    // lambda's return (§14.5 phase 2), so the substituted
+                    // signature's third parameter is `Array<string>`; the
+                    // literal was never checked against it, codegen emitted
+                    // it as `Array<int>`, and the IR failed the verifier
+                    // ("Call parameter type does not match function
+                    // signature! i32 1 / ptr call void
+                    // @bz_string_retain(i32 1)" — a malformed IR, the worst
+                    // failure mode). The same call with the explicit list
+                    // `M<Box, string>(...)` gets the §5.1 element rejection
+                    // (#8625's control).
+                    //
+                    // The check below is that §15.4 element check, against the
+                    // SUBSTITUTED parameter type, for the positions whose
+                    // argument is a collection literal and whose declared
+                    // parameter type mentions a type parameter this call
+                    // INFERRED. The general §5.1 per-argument check keeps its
+                    // own path (`checkArgsAgainstParams`), whose map carries
+                    // the explicit list only.
+                    {
+                        std::unordered_set<std::string_view> inferredNames;
+                        for (const auto& [nm, ty] : argSubst)
+                            if (ty && ty->kind != TypeRef::Kind::Error)
+                                inferredNames.insert(nm);
+                        if (!inferredNames.empty() && md) {
+                            // The callee's STILL-free names (#4915's subset):
+                            // a name this call INFERRED is bound, not free, so
+                            // the element check judges the element against the
+                            // CONCRETE type it was bound to; every other name
+                            // of the callee's keeps deferring as before.
+                            std::unordered_set<std::string_view> freeNames;
+                            for (const auto& gp : md->genericParams)
+                                if (!inferredNames.count(gp.name))
+                                    freeNames.insert(gp.name);
+                            for (std::size_t pi = 0;
+                                 pi < md->params.size() && pi < ce.args.size();
+                                 ++pi) {
+                                const ast::Param& p = md->params[pi];
+                                if (!p.type || !ce.args[pi].value) continue;
+                                auto* cl = dynamic_cast<
+                                    const ast::CollectionLiteralExpr*>(
+                                    ce.args[pi].value.get());
+                                if (!cl) continue;
+                                TypeRef* pty = ctx_.resolvedType(*p.type);
+                                if (!pty) continue;
+                                bool mentionsInferred = false;
+                                for (const auto& nm : inferredNames) {
+                                    std::unordered_set<std::string_view> one{nm};
+                                    if (refOutParamTypeMentionsTypeParam(pty, one)) {
+                                        mentionsInferred = true;
+                                        break;
+                                    }
+                                }
+                                if (!mentionsInferred) continue;
+                                TypeRef* substTy =
+                                    substituteReturnType(pty, argSubst);
+                                if (!substTy) continue;
+                                checkCollectionLiteralElementAssignability(
+                                    *cl, substTy, &freeNames);
+                            }
+                        }
+                    }
                 }
                 ctx_.setExprType(&ce, rt);
             }
