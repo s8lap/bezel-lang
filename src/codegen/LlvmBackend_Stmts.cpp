@@ -2144,8 +2144,50 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // isOwnedClassFieldLvalue check excludes Task-family because the
                 // builtin types have no user TypeDecl / no vtable) and BEFORE the
                 // local helper (which only fires for plain locals).
-                if (!handled)
+                if (!handled) {
                     handled = lowerOwnedTaskFieldStore(*as->target, addr, rhs);
+                    // fix #7881 (§28.3 K3.1, §17.8, v0.357): the unmarked
+                    // store `h.T := t;` of a named owned Task binding into an
+                    // `owned` field is K3.1's marker-free transfer — "the
+                    // declared slot announces", and the binding is left
+                    // **moved-from**. The field now owns the frame (its
+                    // holder disposes it), but nothing vacated the SOURCE: a
+                    // plain-`var` Task local's `d.task` scope-end disposal
+                    // (registered under taskLocalOwnsFrame) reloaded the same
+                    // bz_task_t* and fired it a second time (MEASURED: hang
+                    // after the first iteration of the issue's loop). Vacate
+                    // the source exactly as the `move` lowering does for a
+                    // marked transfer (#7790): gated on the SAME predicate
+                    // that registered the disposal, so a binding that
+                    // registered none is untouched. An `owned` parameter
+                    // source is vacated through nullTransferredOwnedLocalSlot
+                    // (its state-machine frame capture included). §17.8:
+                    // "`sink._f := x!;` consumes `x` exactly as
+                    // `sink._f := x;` does", so the `!` layers are peeled to
+                    // the identifier first. // per §28.3, §17.8
+                    if (handled && as->op == ":=") {
+                        const ast::Expr* src = as->value.get();
+                        while (auto* pb =
+                                   dynamic_cast<const ast::PostfixBangExpr*>(src)) {
+                            if (!pb->operand) break;
+                            src = pb->operand.get();
+                        }
+                        if (auto* sid =
+                                dynamic_cast<const ast::IdentifierExpr*>(src)) {
+                            sema::Symbol* ssym = ctx_.exprSymbol(*sid);
+                            bool vacate = false;
+                            if (auto* sl = dynamic_cast<sema::LocalSymbol*>(ssym)) {
+                                if (auto* sld = dynamic_cast<const ast::LocalDecl*>(
+                                        sl->decl))
+                                    vacate = !sld->isUsing && taskLocalOwnsFrame(sld);
+                            } else if (auto* sp =
+                                           dynamic_cast<sema::ParameterSymbol*>(ssym)) {
+                                vacate = sp->modifier == "owned";
+                            }
+                            if (vacate) nullTransferredOwnedLocalSlot(sid);
+                        }
+                    }
+                }
                 // fix #5440 (identity guard) / §35.4 (v0.315): drop-on-overwrite for an owning
                 // CHOICE FIELD — the field analog of disposeDisplacedOwningChoiceLocal.
                 // None of the field helpers above handle a choice-typed field
