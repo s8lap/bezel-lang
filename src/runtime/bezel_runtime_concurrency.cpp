@@ -4013,7 +4013,23 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
                 // dispose_class_obj is the one place that exemption is
                 // honoured. The DomainFaultedException is still built and
                 // completed below; only the reclaim of the ORIGINAL is skipped.
-                bz_dispose_class_obj(fault_exc);
+                //
+                // fix #8470 (§30.9 / §30.14, v0.357): the fault "does not
+                // cross the boundary as an object", so its handling ENDS here
+                // — and the end of a handling disposes only an instance that
+                // nothing else owns (bz_exc_end_handling). An entry that
+                // faulted with ANOTHER task's fault (a `Result` / `await` of a
+                // bound or cached task re-raised it) raised a borrow; §30.9:
+                // "The exception is disposed exactly once, by the task that
+                // owns it". The unconditional dispose freed such an instance
+                // under its owner — the next reader of that task re-raised
+                // freed heap — or, when the owner had been disposed in the
+                // entry's unwind and deferred to the end of this handling,
+                // disposed it with the hold and the deferral still on record
+                // for whichever instance the allocator placed at that address
+                // next.
+                if (bz_exc_end_handling(fault_exc))
+                    bz_dispose_class_obj(fault_exc);
             }
             // fix-forward #8400 (§30.14, v0.357): with result_size > 0 the
             // adapter heap-copies the entry's aggregate result into a block
