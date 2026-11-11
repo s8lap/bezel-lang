@@ -35,8 +35,8 @@ BEZEL_TEST(codegen_guid_boxed_icomparable_8288,
     BEZEL_EXPECT_EQ(r.stdoutText, "0\n");
 }
 
-// Order (stdlib §2.6: lexicographic over the 16 canonical bytes) and equality
-// through both interfaces.
+// Ordering is `CompareTo` (stdlib §2.6: lexicographic over the 16 canonical
+// bytes), and equality goes through both interfaces.
 BEZEL_TEST(codegen_guid_boxed_icomparable_8288,
            boxed_guid_dispatches_compare_to_and_equals) {
     JitResult r = runAotChecked(
@@ -74,4 +74,7 @@ BEZEL_TEST(codegen_guid_boxed_icomparable_8288,
         "  end Main;\n"
         "end C;\n");
     BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "is not implicitly convertible to the target type (§5.1)"));
 }
