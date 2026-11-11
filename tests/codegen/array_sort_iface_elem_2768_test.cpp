@@ -287,7 +287,9 @@ BEZEL_TEST(array_sort_iface_elem_2768, control_class_element_still_compareto) {
         "end C; "), 18);
 }
 
-// CONTROL — an `int` element keeps bz$intcmp.  3,1,2 -> 18.
+// CONTROL — an `int` element keeps the numeric comparator (fix #8467 replaced
+// the `bz$intcmp` fallback with the per-primitive `bz$sortcmp$int` thunk; the
+// ORDER is unchanged).  3,1,2 -> 18.
 BEZEL_TEST(array_sort_iface_elem_2768, control_int_element_still_ascending) {
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "

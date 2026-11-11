@@ -118,6 +118,62 @@ bool isNoSelectorAggregationElem(PrimitiveType p) {
     return bezel::sema::linqInumberConformerPrimitive(p);
 }
 
+// fix #8467 (stdlib §9.1 / §9.2 / §9.3 / §9.5 / §9.6, spec §14.2 *Interface
+// conformance* rule 5, v0.357): the primitives that CONFORM to
+// `IComparable<Self>` — the element types a `where T: IComparable<T>` bound
+// admits (stdlib §4.4's `Array<T>.Sort()` / `Array<T>.Sorted()`, stdlib §4.5's
+// `OwningArray<T>.Sort()`).
+//
+// THE DECIDING SENTENCE — spec §14.2 *Interface conformance* rule 5: "T is a
+// primitive. A primitive conforms to the interfaces its standard-library
+// declaration lists: the keyword and PascalCase forms name one type (§3.4), and
+// stdlib §9 declares that type in record syntax, so `int` conforms to
+// `IComparable<int>`/`IEquatable<int>` through the `Int32` declaration exactly
+// as clause 2 reads for records."
+//
+// stdlib §9 declares, in record syntax:
+//   * §9.1 `SByte`, `Byte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`,
+//     `UInt64` — "The example below shows `Int32`; the others have analogous
+//     shapes", the example being `public record Int32: IComparable<int>,
+//     IEquatable<int>`;
+//   * §9.2 `public record Double: IComparable<double>, IEquatable<double>` and
+//     `public record Float: IComparable<float>, IEquatable<float>`;
+//   * §9.3 `public record Decimal: IComparable<decimal>, IEquatable<decimal>`;
+//   * §9.5 `public record Char: IComparable<char>, IEquatable<char>`;
+//   * §9.6 `public class String: IEnumerable<char>, IComparable<string>,
+//     IEquatable<string>` (the `string` keyword).
+//
+// §9.4 declares `public record Boolean: IEquatable<bool>` — NO `IComparable` —
+// so `bool` is NOT in the set, and `Object` (§8.1) lists no interface at all,
+// so it is not either.
+//
+// The Sort()/Sorted() gate (below) carried its OWN list of seven primitives
+// (int, string, long, byte, double, float, char) and so REFUSED six — `sbyte`,
+// `short`, `ushort`, `uint`, `ulong`, `decimal` — that stdlib §2.8 / §9.1 /
+// §9.3 declare `IComparable<Self>` of, with a diagnostic whose claim
+// ("`uint` does not implement `IComparable<uint>`") was FALSE. This helper is
+// the ONE list, and the gate reads it.
+bool primitiveIsSelfComparable(PrimitiveType p) {
+    switch (p) {
+        case PrimitiveType::SByte:
+        case PrimitiveType::Byte:
+        case PrimitiveType::Short:
+        case PrimitiveType::UShort:
+        case PrimitiveType::Int:
+        case PrimitiveType::UInt:
+        case PrimitiveType::Long:
+        case PrimitiveType::ULong:
+        case PrimitiveType::Float:
+        case PrimitiveType::Double:
+        case PrimitiveType::Decimal:
+        case PrimitiveType::Char:
+        case PrimitiveType::String:
+            return true;
+        default:
+            return false;  // None, Bool (§9.4), Object (§8.1)
+    }
+}
+
 // fix #8180 (stdlib §5.1, spec §14.2 rule 2, v0.355): does the USER RECORD
 // `rs` conform to `IComparable<rs>`? Extracted VERBATIM from the §5.1
 // `Min()`/`Max()` gate (#8092 F4 / #8139), so the gate and the §26.5.1
@@ -16896,22 +16952,68 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // reason `Sorted()` is absent on the owning side is
                             // ownership (§28.3), not element comparability.
                             // Constraint check: T must be IComparable<T>.  Accepts:
-                            // (a) built-in primitive comparable types (int, string,
-                            //     long, byte, double, float, char — §9.x);
+                            // (a) a PRIMITIVE that conforms to `IComparable<Self>`
+                            //     (stdlib §9.1 / §9.2 / §9.3 / §9.5 / §9.6, read
+                            //     through spec §14.2 *Interface conformance* rule 5
+                            //     — `primitiveIsSelfComparable`);
                             // (b) a class that declares `: IComparable<T>` in its
                             //     base-type list, satisfying §14.2 / #1195.
                             // Any other T requires the explicit-comparer form.
                             // per §3 / #472.
+                            //
+                            // fix #8467 (stdlib §9.1 / §9.3, spec §14.2 *Interface
+                            // conformance* rule 5, v0.357): the primitive arm
+                            // listed SEVEN of the thirteen primitives stdlib §9
+                            // declares `IComparable<Self>` — it named int,
+                            // string, long, byte, double, float and char, and
+                            // OMITTED `sbyte`, `short`, `ushort`, `uint`,
+                            // `ulong` and `decimal`. So `Array<uint>.Sort()` (and
+                            // the `sbyte`/`short`/`ushort`/`ulong`/`decimal`
+                            // twins, and the `Sorted()` copy-forms of all of
+                            // them) was REFUSED with a diagnostic whose claim
+                            // was FALSE — "uint does not implement
+                            // IComparable<uint>", where stdlib §2.8 / §9.1 declares
+                            // `UInt32` as `IComparable<uint>` and §9.3 declares
+                            // `Decimal` as `IComparable<decimal>`. The gate now
+                            // reads the ONE list (`primitiveIsSelfComparable`),
+                            // so it cannot disagree with spec §14.2 rule 5.
+                            //
+                            // ⚠ THE ADMISSION IS ONLY HALF THE FIX: an admitted
+                            // element must then be ORDERED by its own
+                            // `CompareTo` (stdlib §4.4 / §9.1: "for a concrete element
+                            // type the natural-order comparer is that type's own
+                            // `CompareTo`"), which is codegen's
+                            // `buildPrimitiveSortComparator` — the pre-fix
+                            // comparator read an i32 out of the element slot, so
+                            // a `double` was ranked by its mantissa's low half
+                            // and a `byte` by three bytes PAST its slot.
+                            //
+                            // ⚠ AND A NULLABLE ELEMENT IS NOT ADMITTED. spec
+                            // §14.2's constraint table reads `where T: IFoo` as
+                            // "NON-NULLABLE types conforming to `IFoo`", and the
+                            // conformance clause the primitive answers through
+                            // is the §9 declaration of the NON-NULLABLE type
+                            // (`Int32: IComparable<int>`) — `int?` is not
+                            // `int`, so `int?` does not conform to
+                            // `IComparable<int?>`. The CLASS arm below already
+                            // refuses a nullable element on exactly this ground
+                            // (the corpus case `s14_2_1901` pins
+                            // `Array<Guid?>.Sort()` as rejected), and the §5.1
+                            // `Min()`/`Max()` gate refuses a nullable primitive
+                            // too — so the primitive arm's silence on
+                            // nullability was the ONE place the §4.4 gate let a
+                            // non-conforming element through. It admitted
+                            // `Array<int?>.Sort()`, which then compared each
+                            // element's NULLABILITY FLAG rather than its value
+                            // (the pre-fix comparator read an i32 out of the
+                            // nullable carrier), and — after the widening above
+                            // — would have admitted `Array<uint?>.Sort()` and
+                            // its five siblings the same way.
                             const TypeRef* elemTy472 = recvTy->genericArgs[0];
                             bool isComparableElem =
                                 (elemTy472 && elemTy472->kind == TypeRef::Kind::Primitive &&
-                                 (elemTy472->primitive == P::Int ||
-                                  elemTy472->primitive == P::String ||
-                                  elemTy472->primitive == P::Long ||
-                                  elemTy472->primitive == P::Byte ||
-                                  elemTy472->primitive == P::Double ||
-                                  elemTy472->primitive == P::Float ||
-                                  elemTy472->primitive == P::Char));
+                                 !elemTy472->nullable &&
+                                 primitiveIsSelfComparable(elemTy472->primitive));
                             // #1195 / §14.2: also accept a class implementing
                             // IComparable<T>.
                             //

@@ -56,7 +56,7 @@
 //
 // CONTROLS.  The three control cases pin the halves the fix must not disturb:
 // a NON-generic class element (the pre-#3530 path, byte-identical mangling), an
-// int element (the `bz$intcmp` arm), and a generic class whose `CompareTo` is
+// int element (the numeric-comparator arm), and a generic class whose `CompareTo` is
 // VIRTUAL — that arm dispatched through the per-instantiation `vt$<C>$specN`
 // and was already correct, which is why only a non-virtual `CompareTo` was
 // affected.
@@ -308,7 +308,9 @@ BEZEL_TEST(array_sort_generic_class_elem_3530, control_non_generic_class_element
         std::string("123"));
 }
 
-// CONTROL / stdlib §4.4: an `int` element still routes to the `bz$intcmp` arm.
+// CONTROL / stdlib §4.4: an `int` element still routes to the numeric
+// comparator arm (fix #8467 replaced the `bz$intcmp` fallback with the
+// per-primitive `bz$sortcmp$int` thunk; the ORDER is unchanged).
 // The fix must not pull a value element into the object-comparator path.
 BEZEL_TEST(array_sort_generic_class_elem_3530, control_int_element_still_sorts) {
     BEZEL_EXPECT_EQ(runAotOut(

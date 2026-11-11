@@ -8946,6 +8946,166 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         }
         // per §5 LINQ: .Skip / .Take are LAZY — see tryLowerLazyLinqCall.
 
+        // fix #8467 (stdlib §4.4 / §9.1 / §9.2 / §9.3 / §9.5, spec §14.2
+        // *Interface conformance* rule 5, v0.357): the comparator a PRIMITIVE
+        // element of `Array<T>.Sort()` / `Array<T>.Sorted()` is ranked by —
+        // the element type's OWN numeric order.
+        //
+        // WHAT THE DOCUMENTS REQUIRE. stdlib §4.4 declares
+        //     public method Sort() where T: IComparable<T>;
+        //     public method Sorted(): owned Array<T> where T: IComparable<T>;
+        // and states, of the parameterless natural-order form, that "for a
+        // concrete element type the natural-order comparer is that type's own
+        // `CompareTo` (for example `int.CompareTo`)". stdlib §9.1 / §9.2 /
+        // §9.3 / §9.5 declare that member on every numeric primitive
+        // (`public pure method CompareTo(other: int): int;` and its
+        // analogous shapes), and stdlib §2.8 / §9.1 says what it means:
+        // "a negative number if `a < b`, zero if equal, a positive
+        // number if `a > b`". So the comparator must read the element at ITS
+        // OWN width and compare it with ITS OWN signedness.
+        //
+        // WHAT WENT WRONG. The pre-fix comparator (`bz$intcmp`) read an i32 out
+        // of the element slot and returned the difference. So:
+        //   * a `double` (an 8-byte slot) was ranked by the LOW 32 BITS of the
+        //     slot — the tail of its mantissa, which is 0 for every "round"
+        //     value, so the sort was a NO-OP on `1.0, 6.0, 0.25, -3.5, 2.0`;
+        //   * a `long` (an 8-byte slot) was ranked by its low half, so
+        //     `3000000000L` and `-7000000000L` sorted by their low 32 bits;
+        //   * a `byte` / `sbyte` element (a ONE-byte slot) was ranked by an i32
+        //     load that read THREE BYTES PAST the element, and a `short` /
+        //     `ushort` (a 2-byte slot) TWO BYTES PAST — an out-of-bounds read
+        //     of the array's backing buffer;
+        //   * the i32 difference itself could overflow, so even an `int` array
+        //     holding `int.MinValue` against `int.MaxValue` was mis-ordered.
+        //
+        // ONE thunk per primitive type (`bz$sortcmp$<tag>`), so `byte`
+        // (unsigned) and `sbyte` (signed) — both an i8 slot — never share one,
+        // and `int` (signed) and `char` (unsigned) — both an i32 slot — never
+        // share one. The cache key is the internal name, exactly as the sibling
+        // comparators' is (`bz$strcmp`, `bz$guidcmp`, `bz$sdcmp$<width>`), so a
+        // module that sorts an `Array<int>` and an `Array<long>` emits ONE
+        // thunk per element type, and the two arms (the in-place `Sort()` and
+        // the copy-form `Sorted()`) share theirs.
+        //
+        // ⚠ NOT `buildSortedKeyComparator`. That builder serves the SORTED
+        // COLLECTIONS' key path (`SortedSet<T>` / `SortedDictionary<K,V>`),
+        // whose key bytes live in a key table and whose thunk is named by the
+        // key's LLVM WIDTH (`bz$sdcmp$i8` serves both `byte` and `sbyte`), so
+        // it cannot express the signedness this path needs — its own compare
+        // is signed at every integer width. The two builders answer different
+        // questions and are not merged here; the unsigned-key ordering of the
+        // sorted collections is a separate defect (filed alongside this fix).
+        //
+        // The thunk is a LOCAL lambda rather than an `Emitter` member: it is
+        // used by exactly the two arms below, and `LlvmBackend_impl.hpp` is
+        // included by every `LlvmBackend_*` translation unit — a declaration
+        // added there rebuilds the whole codegen backend (CLAUDE.md, *Style and
+        // conventions*: "Avoid gratuitous edits to widely-included headers").
+        auto buildPrimitiveSortComparator =
+            [&](const sema::TypeRef* elemTy) -> llvm::Function* {
+            if (!elemTy || elemTy->kind != sema::TypeRef::Kind::Primitive)
+                return nullptr;
+            // A NULLABLE primitive is NOT this builder's business: its slot
+            // holds the §19.3 nullable CARRIER (`{i8 hasValue; T value}`), not
+            // the value, so there is no single-width value to compare — and an
+            // `ICmp` on that struct would be invalid IR. spec §14.2's
+            // constraint table admits only NON-NULLABLE types, so sema refuses
+            // `Array<int?>.Sort()` before codegen; the guard here is the
+            // belt-and-braces answer for a shape that reaches this builder
+            // another way (a monomorphized type parameter), and it keeps the
+            // pre-fix fallback for such a shape rather than emitting a
+            // malformed comparison.
+            if (elemTy->nullable)
+                return nullptr;
+            using P = sema::PrimitiveType;
+            const char* tag = nullptr;
+            bool floating = false;      // stdlib §9.2's Float / Double
+            bool decimal = false;       // stdlib §9.3's Decimal
+            switch (elemTy->primitive) {
+                case P::SByte:   tag = "sbyte";   break;
+                case P::Byte:    tag = "byte";    break;
+                case P::Short:   tag = "short";   break;
+                case P::UShort:  tag = "ushort";  break;
+                case P::Int:     tag = "int";     break;
+                case P::UInt:    tag = "uint";    break;
+                case P::Long:    tag = "long";    break;
+                case P::ULong:   tag = "ulong";   break;
+                case P::Float:   tag = "float";   floating = true; break;
+                case P::Double:  tag = "double";  floating = true; break;
+                case P::Decimal: tag = "decimal"; decimal = true; break;
+                case P::Char:    tag = "char";    break;
+                default:
+                    // `bool` (stdlib §9.4 declares no `IComparable` at all),
+                    // `string` (stdlib §9.6 — the CALLER's own `bz$strcmp` arm
+                    // owns it) and `Object` (stdlib §8.1): none of them is this
+                    // builder's business.
+                    return nullptr;
+            }
+
+            const std::string name = std::string("bz$sortcmp$") + tag;
+            if (llvm::Function* existing = module_->getFunction(name))
+                return existing;
+
+            auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+            auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                              name, module_.get());
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+            // A LOCAL IRBuilder, not `builder_`: the thunk is emitted in the
+            // middle of another function's lowering, and touching `builder_` /
+            // `currentFn_` here would drag `propagateBB_` / `unwindTarget_`
+            // with it (the hazard `buildObjectCompareToThunk`'s own comment
+            // records).
+            llvm::IRBuilder<> cmpB(bb);
+            llvm::Value* aSlot = &*fn->arg_begin();
+            llvm::Value* bSlot = &*std::next(fn->arg_begin());
+
+            if (decimal) {
+                // stdlib §9.3: a `decimal` is a 128-bit VALUE TYPE
+                // (`%bz.decimal` = `{i32×4}`), stored INLINE in the array
+                // slot — so the slot pointer IS the decimal's address, which is
+                // `bz_decimal_cmp`'s by-pointer ABI (the same relation
+                // `decimal`'s `<` and `=` lower to, and the one
+                // `Array<decimal>.Min()` / `Max()` already use).
+                auto* decCmp = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
+                cmpB.CreateRet(cmpB.CreateCall(decCmp, {aSlot, bSlot}));
+                return fn;
+            }
+
+            llvm::Type* elemLlvm = lowerTypeRef(elemTy);
+            if (!elemLlvm) {
+                fn->eraseFromParent();
+                return nullptr;
+            }
+            llvm::Value* av = cmpB.CreateLoad(elemLlvm, aSlot, "ka");
+            llvm::Value* bv = cmpB.CreateLoad(elemLlvm, bSlot, "kb");
+            llvm::Value* isLess, *isGreater;
+            if (floating) {
+                // stdlib §9.2's `Float` / `Double` order is the IEEE 754
+                // ORDERED one (`<` / `>`), so a NaN ranks EQUAL to everything —
+                // exactly what the primitive's own `CompareTo` gives.
+                isLess    = cmpB.CreateFCmpOLT(av, bv, "lt");
+                isGreater = cmpB.CreateFCmpOGT(av, bv, "gt");
+            } else if (isUnsignedPrim(elemTy->primitive)) {
+                // The signedness is the HOUSE predicate, not a second list:
+                // `isUnsignedPrim` (stdlib §9.1's Byte / UInt16 / UInt32 /
+                // UInt64 and §9.5's Char) is the set every other unsigned
+                // comparison in the backend consults, so this path cannot
+                // drift from the rest of the compiler's signedness.
+                isLess    = cmpB.CreateICmpULT(av, bv, "lt");
+                isGreater = cmpB.CreateICmpUGT(av, bv, "gt");
+            } else {
+                isLess    = cmpB.CreateICmpSLT(av, bv, "lt");
+                isGreater = cmpB.CreateICmpSGT(av, bv, "gt");
+            }
+            // -1 / 0 / +1 — the SIGN is what the runtime's sort reads. (The
+            // pre-fix thunk returned the DIFFERENCE, which can overflow.)
+            llvm::Value* res = cmpB.CreateSelect(
+                isLess, cmpB.getInt32(-1),
+                cmpB.CreateSelect(isGreater, cmpB.getInt32(1), cmpB.getInt32(0)));
+            cmpB.CreateRet(res);
+            return fn;
+        };
+
         // per §3: .Sort() — in-place ascending sort for int arrays.
         // Uses bz_array_sort with a built-in i32 comparator thunk.
         // fix #3345: the static-call form `Array.Sort(a)` re-binds the
@@ -9149,20 +9309,49 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         cmpCpFn2, {aStr, bStr, cmpB2.getInt32(0)}));
                 }
             } else {
-                // Integer comparator
-                auto* cmpName = "bz$intcmp";
-                cmpFn = module_->getFunction(cmpName);
-                if (!cmpFn) {
-                    auto* cmpTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                    cmpFn = llvm::Function::Create(cmpTy, llvm::Function::InternalLinkage,
-                                                   cmpName, module_.get());
-                    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
-                    llvm::IRBuilder<> cmpB(bb);
-                    llvm::Value* a = &*cmpFn->arg_begin();
-                    llvm::Value* b = &*std::next(cmpFn->arg_begin());
-                    llvm::Value* av = cmpB.CreateLoad(i32(), a);
-                    llvm::Value* bv = cmpB.CreateLoad(i32(), b);
-                    cmpB.CreateRet(cmpB.CreateSub(av, bv));
+                // fix #8467 (stdlib §4.4 / §9.1 / §9.2 / §9.3 / §9.5, spec
+                // §14.2 *Interface conformance* rule 5, v0.357): a PRIMITIVE
+                // element is ranked by its OWN numeric order (stdlib §4.4 / §9.1:
+                // "for a concrete element type the natural-order comparer is
+                // that type's own `CompareTo`" — stdlib §2.8 / §9.1 defines it
+                // as "a negative number if `a < b`, zero if equal, a positive
+                // number if `a > b`") — read at the element's own width and
+                // signedness.
+                //
+                // The pre-fix comparator read an i32 out of the element SLOT and
+                // returned the difference, so a `double` / `long` was ranked by
+                // the low 32 bits of its slot (a `double`'s low half is its
+                // mantissa's tail — 0 for every "round" value, so the sort was
+                // a NO-OP), a `byte` / `sbyte` (a ONE-byte slot) was ranked by
+                // an i32 load that read THREE BYTES PAST the element, and a
+                // `short` / `ushort` TWO BYTES PAST.
+                //
+                // The comparator lives in ONE builder
+                // (`buildPrimitiveSortComparator`) so this arm and the
+                // `Sorted()` arm below cannot disagree — the house pattern the
+                // sibling `bz$strcmp` pair follows.
+                if (llvm::Function* primCmp =
+                        buildPrimitiveSortComparator(elemTRResolved)) {
+                    cmpFn = primCmp;
+                } else {
+                    // Not a primitive this builder orders (a user RECORD
+                    // or an ENUM element): the pre-fix integer comparator
+                    // stands, so those shapes keep the order they had.
+                    // Integer comparator
+                    auto* cmpName = "bz$intcmp";
+                    cmpFn = module_->getFunction(cmpName);
+                    if (!cmpFn) {
+                        auto* cmpTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                        cmpFn = llvm::Function::Create(cmpTy, llvm::Function::InternalLinkage,
+                                                       cmpName, module_.get());
+                        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
+                        llvm::IRBuilder<> cmpB(bb);
+                        llvm::Value* a = &*cmpFn->arg_begin();
+                        llvm::Value* b = &*std::next(cmpFn->arg_begin());
+                        llvm::Value* av = cmpB.CreateLoad(i32(), a);
+                        llvm::Value* bv = cmpB.CreateLoad(i32(), b);
+                        cmpB.CreateRet(cmpB.CreateSub(av, bv));
+                    }
                 }
             }
             auto* sortFn = declareC("bz_array_sort", llvm::Type::getVoidTy(llvm_),
@@ -9499,19 +9688,32 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         cmpCpFn, {aStr, bStr, cmpB2.getInt32(0)}));
                 }
             } else {
-                auto* cmpName = "bz$intcmp";
-                cmpFn2 = module_->getFunction(cmpName);
-                if (!cmpFn2) {
-                    auto* cmpTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                    cmpFn2 = llvm::Function::Create(cmpTy, llvm::Function::InternalLinkage,
-                                                    cmpName, module_.get());
-                    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", cmpFn2);
-                    llvm::IRBuilder<> cmpB(bb);
-                    llvm::Value* a = &*cmpFn2->arg_begin();
-                    llvm::Value* b = &*std::next(cmpFn2->arg_begin());
-                    llvm::Value* av = cmpB.CreateLoad(i32(), a);
-                    llvm::Value* bv = cmpB.CreateLoad(i32(), b);
-                    cmpB.CreateRet(cmpB.CreateSub(av, bv));
+                // fix #8467 (stdlib §4.4 / §9.1 / §9.2 / §9.3 / §9.5, spec
+                // §14.2 *Interface conformance* rule 5, v0.357): the `Sorted()`
+                // twin of the `Sort()` arm's comparator block above — the SAME
+                // builder, so the copy-form's order is the in-place form's order
+                // (the `bz$strcmp` pair's house pattern).
+                if (llvm::Function* primCmp2 =
+                        buildPrimitiveSortComparator(elemTR2Resolved)) {
+                    cmpFn2 = primCmp2;
+                } else {
+                    // Not a primitive this builder orders (a user RECORD or an
+                    // ENUM element): the pre-fix integer comparator stands, so
+                    // those shapes keep the order they had.
+                    auto* cmpName = "bz$intcmp";
+                    cmpFn2 = module_->getFunction(cmpName);
+                    if (!cmpFn2) {
+                        auto* cmpTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                        cmpFn2 = llvm::Function::Create(cmpTy, llvm::Function::InternalLinkage,
+                                                        cmpName, module_.get());
+                        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", cmpFn2);
+                        llvm::IRBuilder<> cmpB(bb);
+                        llvm::Value* a = &*cmpFn2->arg_begin();
+                        llvm::Value* b = &*std::next(cmpFn2->arg_begin());
+                        llvm::Value* av = cmpB.CreateLoad(i32(), a);
+                        llvm::Value* bv = cmpB.CreateLoad(i32(), b);
+                        cmpB.CreateRet(cmpB.CreateSub(av, bv));
+                    }
                 }
             }
             auto* sortFn2 = declareC("bz_array_sort", llvm::Type::getVoidTy(llvm_),
