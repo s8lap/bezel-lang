@@ -50,6 +50,11 @@
 # inside gate.sh (where it ran once per oracle: ~547 s per cycle, no reader).
 
 set -u
+# The harness RESULTS cache (scripts/results_cache.sh) never serves this run:
+# forced OFF and no key file, whatever the caller exported. Pinned by
+# scripts/gate/tests/test_results_cache_gate_off.py.
+export BEZEL_RESULTS_CACHE=0
+unset BEZEL_RESULTS_CACHE_KEYS
 
 # ── WHICH TREE DOES THIS GATE VALIDATE? (fix #3413) ─────────────────────────
 #

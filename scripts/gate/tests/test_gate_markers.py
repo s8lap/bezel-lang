@@ -386,6 +386,10 @@ class SelfTestSuiteIsolationTest(_MarkerAssertions):
         # Runs a COPY of gate_and_push.sh in a temp repo to pin the #5265
         # untracked-file refusal; markers redirected via isolated_markers.
         "test_untracked_guard.py": "isolated",
+        # Reads gate_and_push.sh's source and runs ONLY its `set`/`export`/
+        # `unset BEZEL_RESULTS_CACHE*` prologue lines under bash; never spawns
+        # the script.
+        "test_results_cache_gate_off.py": "source-only",
         # This file.
         "test_gate_markers.py": "isolated",
     }

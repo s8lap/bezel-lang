@@ -90,6 +90,11 @@
 #   GATE_CANARY_MAX_PCT=<n>  skip when the selection exceeds n% of the suite
 #                            (default 50 — the full pass then does the work anyway)
 set -u
+# The harness RESULTS cache (scripts/results_cache.sh) never serves this run:
+# forced OFF and no key file, whatever the caller exported. Pinned by
+# scripts/gate/tests/test_results_cache_gate_off.py.
+export BEZEL_RESULTS_CACHE=0
+unset BEZEL_RESULTS_CACHE_KEYS
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate: not in a git repo" >&2; exit 2; }
 # fix #3413: the tree this gate validates, recorded so its verdict names its own
 # subject. gate.sh already follows the caller's tree (the cd above) — it was

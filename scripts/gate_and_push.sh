@@ -37,6 +37,11 @@
 # REFUSED: --quick (shard-only). It is a diagnosis mode that skips coverage by
 # design, so it can never be the basis of a push. Run it via scripts/gate.sh.
 set -u
+# The harness RESULTS cache (scripts/results_cache.sh) never serves this run:
+# forced OFF and no key file, whatever the caller exported. Pinned by
+# scripts/gate/tests/test_results_cache_gate_off.py.
+export BEZEL_RESULTS_CACHE=0
+unset BEZEL_RESULTS_CACHE_KEYS
 
 # --- completion signalling (2026-08-12) -------------------------------------
 # WHY: twice in the 2026-08-12 run the coordinator lost hours waiting on a gate

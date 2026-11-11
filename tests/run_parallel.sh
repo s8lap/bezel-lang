@@ -28,6 +28,11 @@
 #
 # Exit status is 0 only if every shard exited 0 and no test failed.
 set -u
+# The harness RESULTS cache (scripts/results_cache.sh) never serves this run:
+# forced OFF and no key file, whatever the caller exported. Pinned by
+# scripts/gate/tests/test_results_cache_gate_off.py.
+export BEZEL_RESULTS_CACHE=0
+unset BEZEL_RESULTS_CACHE_KEYS
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 manifest="$repo_root/build/tests/test_binaries.txt"

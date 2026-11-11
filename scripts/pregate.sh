@@ -35,6 +35,11 @@
 # refuses to run while a gate is live, because the self-test phase must not
 # race a running cycle.
 set -uo pipefail
+# The harness RESULTS cache (scripts/results_cache.sh) never serves this run:
+# forced OFF and no key file, whatever the caller exported. Pinned by
+# scripts/gate/tests/test_results_cache_gate_off.py.
+export BEZEL_RESULTS_CACHE=0
+unset BEZEL_RESULTS_CACHE_KEYS
 
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO" || exit 1
