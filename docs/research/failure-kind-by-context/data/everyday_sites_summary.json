@@ -1,0 +1,37 @@
+{
+ "programs": 40,
+ "sites": 43,
+ "sites_by_group_and_form": {
+  "decode/throwing": 4,
+  "io/query": 1,
+  "io/throwing": 18,
+  "parse/query": 3,
+  "parse/throwing": 5,
+  "state/query": 8,
+  "state/throwing": 4
+ },
+ "throwing_sites_in_a_try": 1,
+ "throwing_sites_outside_any_try": 30,
+ "failure_typed_throwing_sites": 27,
+ "failure_typed_throwing_sites_by_what_a_raise_means": {
+  "stop": 26,
+  "expected": 1
+ },
+ "failure_typed_throwing_sites_by_operand": {
+  "embedded-constant": 4,
+  "input-data": 1,
+  "own-file": 18,
+  "own-output": 2,
+  "literal": 2
+ },
+ "parse_sites_by_form_and_operand": {
+  "query/input-data": 3,
+  "throwing/embedded-constant": 2,
+  "throwing/input-data": 1,
+  "throwing/literal": 2
+ },
+ "state_sites_by_form": {
+  "query": 8,
+  "throwing": 4
+ }
+}

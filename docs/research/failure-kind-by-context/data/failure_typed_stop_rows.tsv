@@ -1,0 +1,46 @@
+id	where_raised	separable_by	note
+T02a	top	-	start of a one-shot tool
+T02b	top	-	start of a one-shot tool
+T02c	top	-	start of a one-shot tool
+T03b	under-unit	cause-value	inside the per-file loop whose handler skips an unreadable file (T03a, T03c, T03d); the same copy raises both, with one class
+T06e	top	-	start-up check
+T08b	top	-	start-up
+T09d	top	-	start-up
+T12e	top	-	the output is opened once, before the loop
+T13e	top	-	start of a one-shot tool
+T13f	top	-	a one-shot report has no per-row boundary
+T14a	top	-	a one-shot migration stops on any anomaly by design
+T14b	top	-	start of a one-shot script
+T14e	top	-	a one-shot migration stops on any anomaly by design
+T16a	top	-	application start-up
+T16b	top	-	application start-up
+T16c	top	-	application start-up
+T20f	under-unit	call-site	the library's caller may be serving a request; the class is also what a bad request body raises, at another call
+T23d	under-unit	call-site	the literal is parsed inside the form handler; the class is also what a bad form field raises, at another call
+T24a	top	-	start-up
+T24b	top	-	start-up
+T24c	top	-	start-up
+T24d	top	-	start-up
+T24f	top	-	start-up
+T25a	top	-	start-up
+T25b	top	-	start-up
+T25c	top	-	start-up
+T25d	top	-	start-up
+T25e	top	-	start-up
+T25f	top	-	start-up
+T27a	top	-	start-up
+T28e	under-unit	call-site	inside a request; the class is also what a bad request body raises, at another call
+T29f	top	-	start-up
+T30b	under-unit	class	found during a transaction, where a lock time-out (T30e) is retried; a class of its own
+T30c	under-unit	class	found during a transaction; a class of its own
+T32d	top	-	start-up
+T33c	under-unit	cause-value	inside the pipeline, whose handler reports a dead downstream stage (T33b); the same send raises both, with one class
+T37a	top	-	the test itself; its runner records it as an error either way
+T37b	top	-	the test itself; its runner records it as an error either way
+T37c	top	-	test set-up
+T38g	under-unit	call-site	inside the loop whose handler retries a bus time-out (T38a); same class, another call
+T39e	top	-	boot
+T40e	under-unit	class	inside the publish loop whose handler backs off on a refused connection (T40a); proposal 0001 gives it a class of its own
+T41a	top	-	start-up
+T41b	top	-	start-up
+T41c	top	-	start-up

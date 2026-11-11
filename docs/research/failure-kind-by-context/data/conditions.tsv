@@ -1,0 +1,36 @@
+condition	bezel_type	kind_0211	query_form	note
+file-not-found	FileNotFoundException	failure	tester	`File.Exists` is a tester, not a query: the file can vanish between the test and the open
+dir-not-found	DirectoryNotFoundException	failure	tester	`Directory.Exists`
+path-too-long	PathTooLongException	failure	no	
+permission-denied	IOException	failure	no	stdlib 7.2: every other OS-level open failure
+disk-full	IOException	failure	no	
+io-error	IOException	failure	no	lock held, port in use, device error, an illegal path name (stdlib 7.2: every other OS-level open failure)
+end-of-stream	EndOfStreamException	failure	yes	`ReadKeyOrNull`; `Stream.Read` returns 0
+net-refused	(network; not landed)	failure*	no	proposal 0001 (under review): `HttpConnectException`; a failure by 0211's origin test
+net-reset	(network; not landed)	failure*	no	same
+dns	(network; not landed)	failure*	no	proposal 0001: `NameResolutionException`
+tls	(network; not landed)	failure*	no	proposal 0001: `TlsException`
+timeout	TimeoutException	failure	no	stdlib 6.1; no producer in the landed library
+parse-format	FormatException	failure	yes	`TryParse`, `ParseOrNull`
+text-decode	FormatException	failure	no	stdlib 7.3: ill-formed UTF-8 on a `File` text read
+format-spec	FormatException	failure	no	a band-1 condition raised with a failure class: recorded misfit (stdlib 2.18)
+parse-range	ParseRangeException	failure	yes	`TryParse`, `ParseOrNull`
+decode	SerializationException	failure	no	read side
+encode	SerializationException	failure	no	write side: a band-1 condition raised with a failure class: recorded misfit (stdlib 2.14, 2.15)
+channel-closed	ChannelClosedException	failure	partial	`ReceiveAll` ends at close; `Send` has no query form
+channel-full	ChannelFullException	failure	partial	`SendAsync` waits instead; `TrySend` is deferred (proposal 0060)
+key-missing	KeyNotFoundException	defect	yes	`GetOrNull`, `TryGetValue`
+index-out-of-range	IndexOutOfRangeException	defect	yes	`ElementAtOrNull`, a length test
+empty-collection	InvalidOperationException	defect	yes	`FirstOrNull`, the `Try*` forms
+invalid-state	InvalidOperationException	defect	no	
+invalid-argument	ArgumentException	defect	no	includes `ArgumentOutOfRangeException` (the `DateTime` constructors, stdlib 2.5)
+duplicate-key	ArgumentException	defect	yes	`ToDictionary` on a duplicate key (stdlib 5); `TryAdd` is the query form (stdlib 4.8)
+overflow	OverflowException	defect	no	no checked-arithmetic query in the stdlib (0211 section 4.1)
+div-zero	DivideByZeroException	defect	tester	test the divisor
+null-deref	NullReferenceException	defect	yes	`?.`, `??`, a null test
+contract	ContractViolationException	defect	no	also stands for a test framework's assertion class (none is landed)
+match-failure	MatchFailureException	defect	no	
+disposed-access	DisposedAccessException	defect	no	
+cancellation	OperationCanceledException	cancellation	-	neither kind
+out-of-memory	(allocation failure)	fatal	no	terminates; not catchable (stdlib 1, band 5)
+domain-fault	DomainFaultedException / DomainFailedException	carrier	-	the join carries the child's kind (spec 30.14)
