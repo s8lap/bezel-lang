@@ -13440,6 +13440,15 @@ private:
     // returned, captured, or stored — the same conservative shape BoxEscapeWalker
     // uses for the local-binding case. Imported callees ⇒ false.
     bool isCalleeParamNonEscaping(const ast::Member* callee, size_t paramIdx);
+    // fix #8307 (§28.9, v0.357): may a `string` argument be released by the
+    // caller after passing it to the `Object`/interface formal at `pos` of a
+    // MethodSymbol or ConstructorSymbol? True
+    // only when the #2952 summary proves the formal does not outlive the call.
+    bool objectFormalArgNonEscaping(const sema::Symbol* callee,
+                                    std::size_t pos);
+    // fix #8307: is the formal at `pos` declared `Object`/interface-typed?
+    bool formalIsObjectOrInterface(const sema::Symbol* callee,
+                                   std::size_t pos);
 
     // fix #2865 (§8.6 "Boxing" / §28.9 "Runtime-managed types" / §28.3, v0.240):
     // the LAST box `boxValue` minted, as an SSA value. Written on every mint;

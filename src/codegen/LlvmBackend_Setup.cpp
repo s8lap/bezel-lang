@@ -11753,6 +11753,19 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         // a borrow.
         collectObjectStringReleaseEligible(*ci.stmts);
         collectStringReleaseEligible(*ci.stmts);
+        // fix #8307 (§17.4 / §28.9, v0.357): the `Object`-alias walk above
+        // consults `stringBorrowAll_` (its `borrowRetainedAliases`) to read
+        // `var b := o as string;` as a copy into a retained-at-bind local,
+        // but that set belongs to THIS body only now that
+        // collectStringReleaseEligible has run (it still held the previous
+        // body's declarations during the first walk, so the bind fell to the
+        // conservative escape and the alias `o` kept its reference: a leak
+        // per bind). Walk the aliases again with the set in place. The
+        // candidate scan is a function of the body alone, so
+        // `objectStringBorrowAll_` — the half the string walk needed first —
+        // is recomputed unchanged, and the verdicts can only move from
+        // escape to release (the walker reads the set only to RELAX).
+        collectObjectStringReleaseEligible(*ci.stmts);
         collectRecordCallResultReleaseEligible(*ci.stmts);  // fix #1747
         collectInlineArrayStringCallResultReleaseEligible(*ci.stmts);  // fix #4296
         collectValueLikeChoiceCallResultReleaseEligible(*ci.stmts);  // fix #2428
@@ -31841,6 +31854,19 @@ struct StringEscapeWalker {
     // `stringReleaseMode`; when null every such store stays a conservative
     // escape, matching the pre-#8214 behaviour.
     const std::unordered_set<const void*>* objectStringStorageFields = nullptr;
+    // fix #8307 (§28.9 / §8.6 / §28.3, v0.357): the CALLEE-SIDE answer for a
+    // `string` argument handed to an `Object`/interface formal — a store of
+    // that formal in the callee (`this.O := o`) is raw (its source type is
+    // `Object`, so `lowerObjectStringFieldStore` cannot retain it), so the
+    // #1430 call-bounded-borrow relaxation in walkCallArgs is sound for such a
+    // formal ONLY when the callee provably does not let it outlive the call.
+    // Set by the string-release walks to `Emitter::objectFormalArgNonEscaping`
+    // (the SAME predicate the post-call producer release in
+    // LlvmBackend_Calls2.cpp consults, so the two halves are one fact);
+    // `formalIsObjectOrInterface` (below) names the formals it governs. When
+    // null, such a formal is a conservative ESCAPE (leak, never UAF).
+    const std::function<bool(const sema::Symbol*, size_t)>*
+        objectFormalNonEscaping = nullptr;
     // fix #2641 / §22.4: the `out var x` ARGUMENT occurrence that INTRODUCES the
     // tracked recipient. For an inline out-var the "decl node" IS an
     // `ast::IdentifierExpr` in an argument list (ExprTypecheck_Exprs.cpp sets
@@ -31904,6 +31930,152 @@ struct StringEscapeWalker {
         auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id));
         return loc && loc->decl &&
                static_cast<const void*>(loc->decl) == target;
+    }
+
+    // fix #8307 (§17.4 / §28.9, v0.357): `<target> as T` with `T` an `Object`
+    // or interface type — the conversion whose result IS the operand (a string
+    // is a reference, so `as` neither boxes nor copies it: §17.4 "For `as`,
+    // the result is additionally a *borrow* of `x` (more precisely, a borrow
+    // with the same source as `x`)"). Such a result ALIASES the tracked local,
+    // so wherever it goes the local goes too.
+    bool isTargetIdentThroughAs(const ast::Expr* e) {
+        auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e);
+        if (!tt || tt->op != "as" || !tt->testType) return false;
+        if (!isTargetIdent(tt->operand.get())) return false;
+        const sema::TypeRef* t = ctx.resolvedType(*tt->testType);
+        if (!t) return false;
+        if (t->kind == sema::TypeRef::Kind::Primitive)
+            return t->primitive == sema::PrimitiveType::Object;
+        return t->kind == sema::TypeRef::Kind::Named && t->declaration &&
+               t->declaration->kind == ast::TypeDeclKind::Interface;
+    }
+
+    // fix #8307 (§17.4 / §28.9, v0.357): `<target> as string`, optionally
+    // under `!` — the cast BACK to `string` from the tracked local (an
+    // `Object`-typed holder of a string, or a string local itself). The result
+    // is the tracked local's own pointer, like `isTargetIdentThroughAs`'s, but
+    // STATICALLY TYPED `string`, and that type is what the callers below rely
+    // on: each of them is a position whose consumer treats a borrowed
+    // `string` exactly as it treats the bare string local the neighbouring
+    // `isTargetIdent` test admits (a retained-at-bind local, a retaining
+    // store, a callee compiled under the string discipline, a builtin that
+    // keeps nothing), so the cast is a READ of the tracked local there.
+    // Everywhere else the `TypeTestExpr` arm of `expr` gives the operand its
+    // PARENT's position, because an `Object`-typed consumer of the same
+    // pointer (`h.Put((o as string)!)` at an `Object` formal, a `return` from
+    // an `Object`-returning method, `p := (o as string)!` into an `Object`
+    // local, a re-cast `as Object`) takes NO reference: each was a measured
+    // heap-use-after-free while the operand of every `as` was read as safe.
+    // String-release walk only.
+    bool isTargetThroughAsString(const ast::Expr* e) {
+        if (!stringReleaseMode) return false;
+        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+            e = pb->operand.get();
+        auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e);
+        if (!tt || tt->op != "as" || !tt->testType) return false;
+        const sema::TypeRef* t = ctx.resolvedType(*tt->testType);
+        if (!t || t->kind != sema::TypeRef::Kind::Primitive ||
+            t->primitive != sema::PrimitiveType::String)
+            return false;
+        return isTargetIdent(tt->operand.get());
+    }
+
+    // fix #8307 (§17.4 / §28.9, v0.357): is `e` the tracked local under any
+    // run of `!` and pointer-preserving `as` (to `Object`, an interface, or
+    // `string`)? For a consumer that keeps NOTHING of its argument whatever
+    // its static type — `Console.Write`/`WriteLine`
+    // (`isConsoleNonRetainingArg`). String-release walk only.
+    bool isTargetThroughAliasWrappers(const ast::Expr* e) {
+        if (!stringReleaseMode) return false;
+        bool wrapped = false;
+        for (;;) {
+            if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+                e = pb->operand.get();
+                wrapped = true;
+                continue;
+            }
+            auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e);
+            if (!tt || tt->op != "as" || !tt->testType) break;
+            const sema::TypeRef* t = ctx.resolvedType(*tt->testType);
+            if (!t) return false;
+            bool keepsPointer =
+                (t->kind == sema::TypeRef::Kind::Primitive &&
+                 (t->primitive == sema::PrimitiveType::Object ||
+                  t->primitive == sema::PrimitiveType::String)) ||
+                (t->kind == sema::TypeRef::Kind::Named && t->declaration &&
+                 t->declaration->kind == ast::TypeDeclKind::Interface);
+            if (!keepsPointer) return false;
+            e = tt->operand.get();
+            wrapped = true;
+        }
+        return wrapped && isTargetIdent(e);
+    }
+
+    // fix #8307 (§28.9, v0.357): is `target` a `string`-typed instance FIELD
+    // of a class, spelled `<receiver>.<field>` or as the implicit `<field>` —
+    // a location `lowerStringFieldStore` gives an INDEPENDENT reference on
+    // store (it retains every value that is not a +1 producer, and an `as` is
+    // never one)? The walker-side twin of `Emitter::isStringFieldLvalue`,
+    // narrowed to a declared field (an identifier that resolves to a
+    // `FieldSymbol` is neither a local nor a parameter).
+    bool isClassStringFieldTarget(const ast::Expr* target) const {
+        if (!dynamic_cast<const ast::MemberAccessExpr*>(target) &&
+            !dynamic_cast<const ast::IdentifierExpr*>(target))
+            return false;
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx.exprSymbol(*target));
+        if (!fs || !fs->parent ||
+            fs->parent->kind != ast::TypeDeclKind::Class)
+            return false;
+        for (std::string_view m : fs->modifiers)
+            if (m == "static") return false;
+        const sema::TypeRef* t = ctx.exprType(*target);
+        return t && t->kind == sema::TypeRef::Kind::Primitive &&
+               t->primitive == sema::PrimitiveType::String;
+    }
+
+    // fix #8307 (§28.9 / §8.6, v0.357): the walker-side twin of
+    // `Emitter::formalIsObjectOrInterface` — is the formal at `pos` of `callee` (method or constructor)
+    // declared `Object` or interface-typed?
+    bool formalIsObjectOrInterface(const sema::Symbol* callee,
+                                   size_t pos) const {
+        const sema::TypeRef* t = nullptr;
+        const ast::Type* dt = nullptr;
+        if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(callee)) {
+            if (pos >= ms->params.size()) return false;
+            t = sema::formalParamResolvedType(*ms, pos);
+            if (!t) dt = sema::formalParamDeclType(*ms, pos);
+        } else if (auto* cs =
+                       dynamic_cast<const sema::ConstructorSymbol*>(callee)) {
+            if (pos >= cs->params.size()) return false;
+            t = sema::formalParamResolvedType(*cs, pos);
+            if (!t) dt = sema::formalParamDeclType(*cs, pos);
+        } else {
+            return false;
+        }
+        if (!t && dt) t = ctx.resolvedType(*dt);
+        if (!t) return false;
+        if (t->kind == sema::TypeRef::Kind::Primitive)
+            return t->primitive == sema::PrimitiveType::Object;
+        return t->kind == sema::TypeRef::Kind::Named && t->declaration &&
+               t->declaration->kind == ast::TypeDeclKind::Interface;
+    }
+
+    // fix #8307 (§28.9, v0.357): the walker-side twin of
+    // `Emitter::objectStringSourceIsString` — is the value stored statically a
+    // STRING (its own type, or the operand of an `as`)? Only such a store into
+    // an object-string storage field is RETAINED by
+    // `lowerObjectStringFieldStore`; an `Object`-typed source is stored raw.
+    bool storedValueIsStaticString(const ast::Expr* e) const {
+        if (!e) return false;
+        auto isStr = [](const sema::TypeRef* t) {
+            return t && t->kind == sema::TypeRef::Kind::Primitive &&
+                   t->primitive == sema::PrimitiveType::String;
+        };
+        if (isStr(ctx.exprType(*e))) return true;
+        if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e))
+            return tt->op == "as" && tt->operand &&
+                   isStr(ctx.exprType(*tt->operand));
+        return false;
     }
 
     // fix-forward #8162 (stdlib §3.3, v0.355): the DERIVED-SPAN mode. Raised ONLY
@@ -32556,13 +32728,47 @@ struct StringEscapeWalker {
             // — they remain conservative ESCAPE here (their call-bounded-borrow
             // soundness is not asserted by any test, and the conservative
             // direction is leak-over-UAF, the safe default).
+            //
+            // fix #8307 (§28.9 / §8.6 / §28.3, v0.357): the relaxation's
+            // premise — "a field store in the callee retains" — is FALSE for
+            // an `Object`/interface formal. A string reaches such a formal as
+            // its bare pointer, and the callee's store of it (`this.O := o`)
+            // is raw: its source type is `Object`, so
+            // `lowerObjectStringFieldStore` cannot retain it. Releasing the
+            // tracked local at scope end then frees the string under the field
+            // (`var x := Make.Str(i); h.Put(x);` with `Put(o: Object) this.O
+            // := o;` — measured heap-use-after-free). In the string-release
+            // walk such a formal is therefore a borrow ONLY when the callee
+            // provably does not let it outlive the call
+            // (`objectFormalNonEscaping`, the #2952 summary); otherwise the
+            // argument is an escape and the local keeps its +1. The same rule
+            // admits `<local> as Object` / `<local> as I` passed to that
+            // formal (the conversion's result IS the local — see the
+            // TypeTestExpr arm), which before this fix was read as a pure
+            // type test and so as a safe read. The borrowing-Array walk is
+            // unchanged.
             if ((stringReleaseMode || borrowingArrayMode) && ms &&
                 !calleeReturnMayAliasArgUnretained &&
                 a.modifier.empty() && a.name.empty() &&
-                i < ms->params.size() && isTargetIdent(a.value.get())) {
+                i < ms->params.size() &&
+                (isTargetIdent(a.value.get()) ||
+                 (stringReleaseMode &&
+                  isTargetIdentThroughAs(a.value.get())) ||
+                 isTargetThroughAsString(a.value.get()))) {
                 auto* ps =
                     dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
-                if (ps && ps->modifier.empty()) safeArg = true;
+                if (ps && ps->modifier.empty()) {
+                    if (stringReleaseMode &&
+                        formalIsObjectOrInterface(ms, i))
+                        safeArg = objectFormalNonEscaping &&
+                                  (*objectFormalNonEscaping)(ms, i);
+                    // `<target> as string` (fix #8307) at a plain formal that
+                    // is not `Object`/interface-typed is the bare string
+                    // local's case: the callee holds the string discipline.
+                    else if (isTargetIdent(a.value.get()) ||
+                             isTargetThroughAsString(a.value.get()))
+                        safeArg = true;
+                }
             }
             // fix #5853 (§8.6 "Boxing of borrow-bearing records", §28.3,
             // v0.334) — the BOXED twin of the #1430 relaxation above, for the
@@ -32800,16 +33006,26 @@ struct StringEscapeWalker {
             // string slot is non-escaping (the retaining builder owns a +1).
             if (!safeArg && a.modifier.empty() && a.name.empty() &&
                 isStringBuilderRetainingStringArg(callee, i) &&
-                isTargetIdent(a.value.get()))
+                (isTargetIdent(a.value.get()) ||
+                 isTargetThroughAsString(a.value.get())))  // fix #8307
                 safeArg = true;
             // #1994: a string local passed to Console.Write/WriteLine (or the
             // Console.Out/Console.Error facets) is a CALL-BOUNDED borrow — the
             // builtin does not retain it. String-release analysis ONLY
             // (stringReleaseMode) so the shared dict/grouping/borrowing-Array walks
             // keep their conservative ESCAPE (#1997 narrowing).
+            //
+            // fix #8307 (§17.4 / §28.9, v0.357): the builtin keeps nothing of
+            // its argument WHATEVER its static type, so the tracked local
+            // under `!` / a pointer-preserving `as` (`Console.WriteLine((x as
+            // Object)!)`, `Console.WriteLine((o as string)!)`) is the same
+            // call-bounded borrow. Since the `TypeTestExpr` arm gives an
+            // `as` operand its parent's position, the bare-identifier test
+            // alone left those spellings an escape (a leak per call).
             if (!safeArg && stringReleaseMode && a.modifier.empty() &&
                 a.name.empty() && isConsoleNonRetainingStringArg(callee, i) &&
-                isTargetIdent(a.value.get()))
+                (isTargetIdent(a.value.get()) ||
+                 isTargetThroughAliasWrappers(a.value.get())))
                 safeArg = true;
             // fix #7741 (stdlib §9.6, v0.353; spec §28.3.4 *Producers*,
             // v0.353): a string local passed at a PLAIN (borrow)
@@ -33478,12 +33694,25 @@ struct StringEscapeWalker {
             // — with
             // borrowingArrayMode's parallel relaxation now sharing the
             // function body, gate explicitly here.
+            // fix #8307 (§28.9 / §8.6 / §28.3, v0.357): the constructor twin
+            // of walkCallArgs' `Object`/interface-formal gate. A string handed
+            // to an `Object`/interface constructor formal that the body stores
+            // (`constructor(o: Object) this.O := o;`) is stored raw — the
+            // source type is `Object` — so the local's scope-end release freed
+            // it under the field (measured heap-use-after-free). Such a formal
+            // is a borrow only when the constructor provably does not keep it.
             if (!safeArg && stringReleaseMode &&
                 a.modifier.empty() && a.name.empty() &&
                 i < chosen->params.size()) {
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     chosen->params[i]);
-                if (ps && ps->modifier.empty()) safeArg = true;
+                if (ps && ps->modifier.empty()) {
+                    if (formalIsObjectOrInterface(chosen, i))
+                        safeArg = objectFormalNonEscaping &&
+                                  (*objectFormalNonEscaping)(chosen, i);
+                    else
+                        safeArg = true;
+                }
             }
             // fix #3321 / §22.3 / §22.7 / §28.9: pre-declared `out n: string`
             // recipient at a constructor call site (constructor-call sibling
@@ -33870,8 +34099,50 @@ struct StringEscapeWalker {
             return;
         }
         // `s is T` reads only.
+        //
+        // fix #8307 (§17.4 / §28.9, v0.357): `s as T` does NOT only read.
+        // §17.4: "For `as`, the result is additionally a *borrow* of `x`
+        // (more precisely, a borrow with the same source as `x`)", and a
+        // string is a reference (§28.9), so the result is the tracked local's
+        // own pointer with no retain — `var o := x as Object; h.O := o;` stored `x` into the field
+        // while this arm told the walk `x` was merely tested, and `x`'s
+        // scope-end release freed it under the field (measured
+        // heap-use-after-free). In the string-release walk the operand of an
+        // `as` therefore takes the PARENT's position, like `s!` above: a
+        // conversion in a read position (`(x as I) = null`, a receiver) stays
+        // a read, one whose result is bound, stored, passed or returned is
+        // judged by that position. `is` / `is not` yield a `bool` and stay
+        // reads, and so does an `as` whose target can never hold a string (a
+        // value primitive, a class / record / enum / choice: the result is
+        // always `null`). Other walk modes are unchanged.
+        //
+        // `as string` is INCLUDED, although its result is statically a
+        // string: the result still reaches `Object`-typed consumers raw
+        // (`h.Put((o as string)!)` at an `Object` formal, `return (o as
+        // string)!` from an `Object`-returning method, `p := (o as string)!`
+        // into an `Object` local, `h.O := ((o as string) as Object)!` — each a
+        // measured heap-use-after-free when the operand was read as safe).
+        // The positions whose `string`-typed consumer takes its own reference
+        // or keeps nothing are relaxed where they are decided, through
+        // `isTargetThroughAsString` (a retained-at-bind declaration or
+        // reassignment, a class string-field store, a plain non-`Object`
+        // formal, `StringBuilder.Append`, `Console.Write`).
         if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
-            expr(t->operand.get(), /*safeRead=*/true);
+            bool aliases = stringReleaseMode && t->op == "as";
+            if (aliases && t->testType) {
+                if (const sema::TypeRef* tt = ctx.resolvedType(*t->testType)) {
+                    using K = sema::TypeRef::Kind;
+                    using P = sema::PrimitiveType;
+                    if (tt->kind == K::Primitive && tt->primitive != P::Object &&
+                        tt->primitive != P::String)
+                        aliases = false;
+                    else if (tt->kind == K::Named && tt->declaration &&
+                             tt->declaration->kind !=
+                                 ast::TypeDeclKind::Interface)
+                        aliases = false;
+                }
+            }
+            expr(t->operand.get(), aliases ? safeRead : true);
             return;
         }
         // Conditional: condition is a read; each branch forwards the value on
@@ -34154,9 +34425,18 @@ struct StringEscapeWalker {
             // `!safeRead || inLambda` test) — a copy written inside a lambda
             // body reads the CAPTURED outer local, whose env cell is an
             // un-retained alias (§27.5), and must stay conservative.
+            //
+            // fix #8307 (§17.4 / §28.9, v0.357): `var b: string? := (o as
+            // string);` is the same copy through a cast — the declared local
+            // is retained at bind (same set), so the holder `o` is only READ.
+            // Once the `TypeTestExpr` arm gave an `as` operand its parent's
+            // position, the bare-identifier test alone made this bind an
+            // escape of `o` and its reference leaked (the
+            // `string_optional_hole_producer_5290` `cast_as_string` row).
             if (stringReleaseMode && !inLambda && borrowRetainedAliases &&
                 borrowRetainedAliases->count(static_cast<const void*>(ld)) &&
-                isTargetIdent(ld->initializer.get())) {
+                (isTargetIdent(ld->initializer.get()) ||
+                 isTargetThroughAsString(ld->initializer.get()))) {
                 expr(ld->initializer.get(), /*safeRead=*/true);
                 return;
             }
@@ -34184,10 +34464,14 @@ struct StringEscapeWalker {
             // the walker taints `s` on the alias, the producer's release is
             // suppressed, and one heap string leaks per bind (#2900: unbounded
             // in a service loop).
+            // fix #8307 (§17.4, v0.357): the `var o := s as Object;` spelling
+            // is admitted to the same set (collectObjectStringReleaseEligible)
+            // and is the same borrow.
             if (stringReleaseMode && !inLambda && objectStringBorrowAliases &&
                 !borrowRetainedAliases->count(static_cast<const void*>(ld)) &&
                 objectStringBorrowAliases->count(static_cast<const void*>(ld)) &&
-                isTargetIdent(ld->initializer.get())) {
+                (isTargetIdent(ld->initializer.get()) ||
+                 isTargetIdentThroughAs(ld->initializer.get()))) {
                 expr(ld->initializer.get(), /*safeRead=*/true);
                 return;
             }
@@ -34319,7 +34603,8 @@ struct StringEscapeWalker {
             // release would free a string an un-retained alias still names.
             if (stringReleaseMode && !inLambda && borrowRetainedAliases &&
                 borrowRetainedAliases->count(static_cast<const void*>(lc)) &&
-                isTargetIdent(lc->value.get())) {
+                (isTargetIdent(lc->value.get()) ||
+                 isTargetThroughAsString(lc->value.get()))) {  // fix #8307
                 expr(lc->value.get(), /*safeRead=*/true);
                 return;
             }
@@ -34354,7 +34639,8 @@ struct StringEscapeWalker {
                 borrowRetainedAliases &&
                 !borrowRetainedAliases->count(static_cast<const void*>(lc)) &&
                 objectStringBorrowAliases->count(static_cast<const void*>(lc)) &&
-                isTargetIdent(lc->value.get())) {
+                (isTargetIdent(lc->value.get()) ||
+                 isTargetIdentThroughAs(lc->value.get()))) {  // fix #8307
                 expr(lc->value.get(), /*safeRead=*/true);
                 return;
             }
@@ -34818,9 +35104,14 @@ struct StringEscapeWalker {
                 // exactly, with the predicate flipped from "target is the
                 // declaration being walked" to "value is the tracked
                 // local AND target's LocalDecl is in stringBorrowAll_".
+                //
+                // fix #8307 (§17.4 / §28.9, v0.357): `b := o as string;` is
+                // the same reassignment through a cast (the local `b` is
+                // retained on assignment exactly as for a bare source).
                 if (borrowRetainedAliases &&
                     !inLambda &&
-                    isTargetIdent(as->value.get())) {
+                    (isTargetIdent(as->value.get()) ||
+                     isTargetThroughAsString(as->value.get()))) {
                     auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                         as->target.get());
                     if (tid) {
@@ -34868,8 +35159,33 @@ struct StringEscapeWalker {
                 // lambda body outlives the scope (the env holds the value),
                 // so it stays a conservative escape, the same `inLambda`
                 // clause the #1997 / #2764 relaxations use.
+                //
+                // fix #8307 (§28.9, v0.357): keyed on the TARGET alone this
+                // arm also read an `Object`-typed source as safe — `var o:
+                // Object := Make.Str(i); h.O := o;` — whose store is NOT
+                // retained (see above), so `o`'s scope-end release freed the
+                // string under the field (measured heap-use-after-free). The
+                // relaxation now fires only when the stored value is
+                // statically a string (`storedValueIsStaticString`, the walker
+                // twin of the store site's `objectStringSourceIsString`), i.e.
+                // exactly the stores that retain; every other store into such
+                // a field is the conservative escape below.
+                // fix #8307 (§17.4 / §28.9, v0.357): `h.S := (o as string)!;`
+                // into a `string`-typed CLASS FIELD. `lowerStringFieldStore`
+                // retains every stored value that is not a +1 producer (an
+                // `as` never is), so the field owns its own reference and the
+                // holder `o` is only READ — the verdict this store had while
+                // the operand of every `as` was read as safe. `:=` only, and
+                // not in a lambda body (the #1997 / #2764 clause).
+                if (stringReleaseMode && !inLambda && as->op == ":=" &&
+                    isTargetThroughAsString(as->value.get()) &&
+                    isClassStringFieldTarget(as->target.get())) {
+                    expr(as->target.get(), /*safeRead=*/false);
+                    expr(as->value.get(), /*safeRead=*/true);
+                    return;
+                }
                 if (objectStringStorageFields && stringReleaseMode &&
-                    !inLambda) {
+                    !inLambda && storedValueIsStaticString(as->value.get())) {
                     sema::Symbol* tsym = ctx.exprSymbol(*as->target);
                     if (tsym && objectStringStorageFields->count(
                                     static_cast<const void*>(tsym))) {
@@ -40076,6 +40392,14 @@ void Emitter::collectStringReleaseEligible(
     }
     for (const void* a : retainedCtorArgs)
         valueLikeChoiceStrReleaseEligible_.insert(a);
+    // fix #8307 (§28.9 / §8.6, v0.357): the callee-side summary for a string
+    // handed to an `Object`/interface formal — see the walker member
+    // `objectFormalNonEscaping`. One object for every walk below.
+    const std::function<bool(const sema::Symbol*, size_t)>
+        objectFormalNonEscaping =
+            [this](const sema::Symbol* callee, size_t i) {
+                return objectFormalArgNonEscaping(callee, i);
+            };
     for (const ast::Node* ld : producerCandidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         w.stringReleaseMode = true;  // #1997: OPT-IN the plain-`:=` relaxation
@@ -40105,6 +40429,7 @@ void Emitter::collectStringReleaseEligible(
         // own +1 stays and its scope-end release must fire: the walker's
         // AssignmentStmt arm reads such a store's RHS as a SAFE READ.
         w.objectStringStorageFields = &objectStringStorageFields_;
+        w.objectFormalNonEscaping = &objectFormalNonEscaping;  // fix #8307
         w.retainedCtorArgs = &retainedCtorArgs;  // fix #6170
         // fix #8162 (stdlib §3.3, v0.355): consult the CONSTRUCTOR-BORROW
         // MAP — a `new ReadOnlyStringSpan(source, start, length)` in the map
@@ -40149,6 +40474,7 @@ void Emitter::collectStringReleaseEligible(
         // own +1 stays and its scope-end release must fire: the walker's
         // AssignmentStmt arm reads such a store's RHS as a SAFE READ.
         w.objectStringStorageFields = &objectStringStorageFields_;
+        w.objectFormalNonEscaping = &objectFormalNonEscaping;  // fix #8307
         w.retainedCtorArgs = &retainedCtorArgs;  // fix #6170
         // fix #8162 (stdlib §3.3, v0.355): consult the CONSTRUCTOR-BORROW
         // MAP — a `new ReadOnlyStringSpan(source, start, length)` in the map
@@ -40222,6 +40548,13 @@ bool Emitter::outVarStringReleaseEligible(const ast::IdentifierExpr* id) {
     w.borrowRetainedAliases = &stringBorrowAll_;          // fix #2764
     w.objectStringBorrowAliases = &objectStringBorrowAll_;  // fix #2900
     w.outVarIntroSite = static_cast<const void*>(id);
+    // fix #8307 (§28.9, v0.357): see collectStringReleaseEligible.
+    const std::function<bool(const sema::Symbol*, size_t)>
+        objectFormalNonEscaping =
+            [this](const sema::Symbol* callee, size_t i) {
+                return objectFormalArgNonEscaping(callee, i);
+            };
+    w.objectFormalNonEscaping = &objectFormalNonEscaping;
     if (stringReleaseAnalyzedExpr_) {
         w.expr(stringReleaseAnalyzedExpr_, /*safeRead=*/false);
     } else {
@@ -46324,10 +46657,28 @@ void Emitter::collectObjectStringReleaseEligible(
         [&] {
             LocalDeclInitView v = localDeclInitView(s);   // fix #3417
             if (v.isUsing || !v.init) return;
-            if (!isObjectOrInterfaceTarget(
-                    v.type ? ctx_.resolvedType(*v.type) : nullptr))
-                return;
-            auto* id = dynamic_cast<const ast::IdentifierExpr*>(v.init);
+            // fix #8307 (§17.4 / §28.9, v0.357): `var o := x as Object;` (or
+            // `as I`, or with an explicit `Object`/interface annotation) is
+            // the SAME string-aliased slot as `var o: Object := x;` — §17.4:
+            // "For `as`, the result is additionally a *borrow* of `x`", and a
+            // string is a reference, so the slot holds `x`'s own pointer (or `null`, which
+            // the null-safe retain/release ignore). Admitting it here gives the
+            // alias its own +1 at bind, exactly as for the bare-identifier
+            // spelling. Without this, the `as` alias took no reference while
+            // the walk read `x` as merely tested, and `x`'s scope-end release
+            // freed the string under any field the alias was stored into.
+            const ast::Expr* srcInit = v.init;
+            const sema::TypeRef* slotTy =
+                v.type ? ctx_.resolvedType(*v.type) : nullptr;
+            if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(v.init)) {
+                if (tt->op != "as" || !tt->testType || !tt->operand) return;
+                const sema::TypeRef* asTy = ctx_.resolvedType(*tt->testType);
+                if (!isObjectOrInterfaceTarget(asTy)) return;
+                if (!v.type) slotTy = asTy;
+                srcInit = tt->operand.get();
+            }
+            if (!isObjectOrInterfaceTarget(slotTy)) return;
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(srcInit);
             if (!id) return;
             auto* loc = dynamic_cast<const sema::LocalSymbol*>(
                 ctx_.exprSymbol(*id));
@@ -46403,12 +46754,21 @@ void Emitter::collectObjectStringReleaseEligible(
     // left as the SHARED `stringBorrowAll_` so a copy-of-an-alias (`var p
     // := o;` with `o: Object := s`) is also a borrow, exactly as a
     // copy-of-a-string is.
+    // fix #8307 (§28.9, v0.357): see collectStringReleaseEligible — an alias
+    // handed to an `Object`/interface formal is a borrow only when the callee
+    // provably does not keep it.
+    const std::function<bool(const sema::Symbol*, size_t)>
+        objectFormalNonEscaping =
+            [this](const sema::Symbol* callee, size_t i) {
+                return objectFormalArgNonEscaping(callee, i);
+            };
     for (const ast::Node* ld : candidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         w.stringReleaseMode = true;
         w.scrutineeBorrowMode = true;
         w.borrowRetainedAliases = &stringBorrowAll_;
         w.objectStringBorrowAliases = &objectStringBorrowAll_;
+        w.objectFormalNonEscaping = &objectFormalNonEscaping;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             objectStringReleaseEligible_.insert(static_cast<const void*>(ld));

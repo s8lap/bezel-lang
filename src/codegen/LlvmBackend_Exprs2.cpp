@@ -10264,9 +10264,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (!diverged_) {
                     for (std::size_t ai = 1;
                          ai < args.size() && ai < ctorArgExprs.size() + 1; ++ai) {
-                        if (ctorArgExprs[ai - 1] &&
-                            isPlusOneStringProducer(ctorArgExprs[ai - 1]))
-                            emitStringRelease(args[ai]);
+                        if (!ctorArgExprs[ai - 1] ||
+                            !isPlusOneStringProducer(ctorArgExprs[ai - 1]))
+                            continue;
+                        // fix #8307 (§28.9 / §8.6, v0.357): a field store of
+                        // an `Object`/interface formal does NOT retain (its
+                        // source type is `Object`), so the producer is left
+                        // with the constructor unless it provably does not
+                        // keep the formal — see objectFormalArgNonEscaping.
+                        if (formalIsObjectOrInterface(cs, ai - 1) &&
+                            !objectFormalArgNonEscaping(cs, ai - 1))
+                            continue;
+                        emitStringRelease(args[ai]);
                     }
                 }
             } else {
@@ -11617,9 +11626,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (!diverged_) {
                     for (std::size_t ai = 1;
                          ai < args.size() && ai < ctorArgExprs.size() + 1; ++ai) {
-                        if (ctorArgExprs[ai - 1] &&
-                            isPlusOneStringProducer(ctorArgExprs[ai - 1]))
-                            emitStringRelease(args[ai]);
+                        if (!ctorArgExprs[ai - 1] ||
+                            !isPlusOneStringProducer(ctorArgExprs[ai - 1]))
+                            continue;
+                        // fix #8307 (§28.9 / §8.6, v0.357): a field store of
+                        // an `Object`/interface formal does NOT retain (its
+                        // source type is `Object`), so the producer is left
+                        // with the constructor unless it provably does not
+                        // keep the formal — see objectFormalArgNonEscaping.
+                        if (formalIsObjectOrInterface(cs, ai - 1) &&
+                            !objectFormalArgNonEscaping(cs, ai - 1))
+                            continue;
+                        emitStringRelease(args[ai]);
                     }
                 }
             } else {

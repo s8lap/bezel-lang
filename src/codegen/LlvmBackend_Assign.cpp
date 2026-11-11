@@ -19143,6 +19143,69 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
     return result;
 }
 
+// fix #8307 (§28.9 / §8.6 / §28.3, v0.357): is the `Object`/interface-typed
+// formal at `pos` of `callee` (a MethodSymbol or a ConstructorSymbol) one a
+// `string` argument may be handed to as a CALL-BOUNDED BORROW? A string
+// reaches such a formal as its bare pointer (§8.6: a reference type is not
+// boxed), and a store of that formal inside the callee (`this.O := o`) cannot
+// retain it: the source's static type is `Object`, which may as well be a
+// class instance or a box, so `lowerObjectStringFieldStore` stores it raw
+// (`objectStringSourceIsString` is false). The caller's release of the string
+// — a scope-end release of a named local, or the post-call release of an
+// unbound +1 producer — then frees it under the field (#8307, measured
+// heap-use-after-free). So the caller may release only when the callee
+// provably does not let the formal outlive the call: the #2952 summary
+// `isCalleeParamNonEscaping`, gated exactly as the #8011 `argNonEscaping`
+// handoff is (not imported, not an operator, an extension or an interface
+// member, no modifier on the formal). Every other answer is "escapes", which
+// keeps the string's +1 (a leak, never a UAF).
+bool Emitter::objectFormalArgNonEscaping(const sema::Symbol* callee,
+                                         std::size_t pos) {
+    if (!callee || ctx_.isImported(callee)) return false;
+    const std::vector<sema::Symbol*>* params = nullptr;
+    if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(callee)) {
+        if (ms->isOperator || ms->extensionDecl) return false;
+        if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Interface)
+            return false;
+        params = &ms->params;
+    } else if (auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(callee)) {
+        if (cs->isStatic) return false;
+        params = &cs->params;
+    } else {
+        return false;
+    }
+    if (pos >= params->size()) return false;
+    auto* ps = dynamic_cast<const sema::ParameterSymbol*>((*params)[pos]);
+    if (!ps || !ps->modifier.empty()) return false;
+    return isCalleeParamNonEscaping(
+        dynamic_cast<const ast::Member*>(callee->decl), pos);
+}
+
+// fix #8307 (§28.9 / §8.6, v0.357): is the formal at `pos` of `callee` (a
+// MethodSymbol or a ConstructorSymbol) declared `Object` or interface-typed —
+// the formals a `string` argument reaches with no retain on the callee's store
+// side (see `objectFormalArgNonEscaping`). The local formal's type is its
+// `ast::Type` resolved here; an imported one carries its resolved type on the
+// symbol.
+bool Emitter::formalIsObjectOrInterface(const sema::Symbol* callee,
+                                        std::size_t pos) {
+    const sema::TypeRef* pt = nullptr;
+    const ast::Type* dt = nullptr;
+    if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(callee)) {
+        if (pos >= ms->params.size()) return false;
+        pt = sema::formalParamResolvedType(*ms, pos);
+        if (!pt) dt = sema::formalParamDeclType(*ms, pos);
+    } else if (auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(callee)) {
+        if (pos >= cs->params.size()) return false;
+        pt = sema::formalParamResolvedType(*cs, pos);
+        if (!pt) dt = sema::formalParamDeclType(*cs, pos);
+    } else {
+        return false;
+    }
+    if (!pt && dt) pt = ctx_.resolvedType(*dt);
+    return isObjectOrInterfaceTarget(pt);
+}
+
 
 // #1955 / §28.3: null the caller's slot for a bare owned LOCAL / owned PARAMETER
 // argument whose ownership just transferred at an owning-collection element-

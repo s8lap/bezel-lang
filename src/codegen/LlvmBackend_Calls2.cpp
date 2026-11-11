@@ -19234,9 +19234,28 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             (wasRecordCallResultInitOutermost ||
              recordCallResultInitOutermostClassWithRecordField_);
         for (std::size_t ai = argOffset; ai < args.size() && ai < argExprs.size(); ++ai) {
-            if (argExprs[ai] && isPlusOneStringProducer(argExprs[ai]) &&
-                !suppressForCallResultClaim)
-                emitStringRelease(args[ai]);
+            if (!argExprs[ai] || !isPlusOneStringProducer(argExprs[ai]) ||
+                suppressForCallResultClaim)
+                continue;
+            // fix #8307 (§28.9 / §8.6 / §28.3, v0.357): the "the callee's
+            // field store retains" premise above is FALSE for an
+            // `Object`/interface formal: the string arrives as its bare
+            // pointer and the callee's store of it (`this.O := o`) is raw —
+            // its source type is `Object`, so `lowerObjectStringFieldStore`
+            // cannot retain it. Releasing the producer here then freed the
+            // string under the field (`h.Put(Make.Str(i))` with `Put(o:
+            // Object) this.O := o;` — measured heap-use-after-free). Release
+            // into such a formal only when the callee provably does not let it
+            // outlive the call — `objectFormalArgNonEscaping`, the SAME
+            // predicate StringEscapeWalker's #1430 relaxation consults for a
+            // named local, so the bound and unbound spellings agree. Otherwise
+            // the producer's +1 is left with the callee's store (a leak, never
+            // a UAF).
+            const std::size_t pos = ai - argOffset;
+            if (formalIsObjectOrInterface(ms, pos) &&
+                !objectFormalArgNonEscaping(ms, pos))
+                continue;
+            emitStringRelease(args[ai]);
         }
     }
 
