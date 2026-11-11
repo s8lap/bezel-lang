@@ -432,9 +432,23 @@ struct bz_array_t {
     // APPENDED last so every prior field's offset is preserved. Since fix
     // #6776 (§8.2, v0.340) the layout is {vtable@0, type_desc@8, data@16,
     // count@24, capacity@32, disposed@40, mod_count@48, elem_disposer@56,
-    // kind@64, str_key_esz@72} (80 B); codegen reads no field at a fixed
-    // offset (it goes through bz_array_len / bz_array_ptr_at / bz_array_get).
+    // kind@64, str_key_esz@72, …} (see the two #8386 fields below for the
+    // tail); codegen reads no field at a fixed offset (it goes through
+    // bz_array_len / bz_array_ptr_at / bz_array_get).
     int64_t str_key_esz;
+    // fix #8386 (§28.9 / §28.3.1 K1.6, v0.357): the GENERAL form of the stamp
+    // above. When both are non-null, the references this array co-owns per
+    // slot are not "the string at field 0" but "every string the element
+    // carries", and these two compiler-generated thunks are the walk: each is
+    // applied to the ADDRESS of one element (stride `str_key_esz`) and
+    // retains / releases every embedded string of a record element (nested
+    // records and choice payloads included). Set only by
+    // `bz_array_own_embedded_strings`, together with `str_key_esz`, and
+    // cleared with it. NULL (the calloc default) with `str_key_esz > 0` is
+    // exactly the #6550 Key stamp. APPENDED last: {…, str_key_esz@72,
+    // emb_retain@80, emb_release@88} (96 B).
+    void (*emb_retain)(void*);
+    void (*emb_release)(void*);
 };
 typedef struct { char* data; int64_t len; uint8_t width; int64_t rc; } bz_string_hdr;
 struct bz_string_struct {

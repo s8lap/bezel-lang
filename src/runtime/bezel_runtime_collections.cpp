@@ -183,11 +183,35 @@ static inline bool bz_array_str_key_slot(const bz_array_t* arr, int64_t esz) {
 }
 
 // Take the co-owned reference on slot `idx` (a slot this array has just gained).
+// fix #8386 (§28.9 / §28.3.1 K1.6 / §28.11, v0.357): WHAT "the references a
+// slot carries" means is a property of the stamp. The #6550 stamp co-owns one
+// string at struct field 0 (a `DictionaryEntry<string, V>` Key). The #8386
+// stamp generalizes it to an element whose embedded strings sit anywhere in
+// the value — a user record with one or more `string` components, nested
+// records, a choice payload — by carrying two per-element-type thunks the
+// compiler generated from the record's own layout (`emb_retain` /
+// `emb_release`, each applied to the ADDRESS of one element). Every take and
+// every give-back in this file goes through these two helpers, so the two
+// stamps share one discipline and cannot drift.
+//
+// `emb_release` NULLS the string fields it releases (it is the same field walk
+// a record local's scope-end release uses), so it must only ever be applied to
+// bytes that are about to be discarded — a removed slot, a cleared slot, a
+// displaced element's private copy — never to a live slot.
+static inline void bz_array_take_slot_refs(const bz_array_t* arr, const void* slot) {
+    if (arr->emb_retain) arr->emb_retain((void*)slot);
+    else bz_string_retain(*(void* const*)slot);
+}
+static inline void bz_array_drop_slot_refs(const bz_array_t* arr, void* slot) {
+    if (arr->emb_release) arr->emb_release(slot);
+    else bz_string_release(*(void**)slot);
+}
+
 static void bz_array_take_str_dict_key(void* arrp, int64_t idx, int64_t esz) {
     auto* arr = (bz_array_t*)arrp;
     if (!bz_array_str_key_slot(arr, esz) || idx < 0 || idx >= arr->count) return;
     char* slot = (char*)bz_array_ptr_at(arr, idx, esz);
-    bz_string_retain(*(void**)slot);
+    bz_array_take_slot_refs(arr, slot);
 }
 
 // Give back the co-owned reference on slot `idx` (a slot this array is losing).
@@ -196,7 +220,7 @@ static void bz_array_drop_str_dict_key(void* arrp, int64_t idx, int64_t esz) {
     auto* arr = (bz_array_t*)arrp;
     if (!bz_array_str_key_slot(arr, esz) || idx < 0 || idx >= arr->count) return;
     char* slot = (char*)bz_array_ptr_at(arr, idx, esz);
-    bz_string_release(*(void**)slot);
+    bz_array_drop_slot_refs(arr, slot);
 }
 
 // Give back the co-owned reference on the POINTER VALUE `key` itself rather
@@ -270,9 +294,34 @@ static void bz_array_drop_all_str_dict_keys(void* arrp, bool keep_stamp = false)
     int64_t esz = arr->str_key_esz;
     for (int64_t i = 0; i < arr->count; i++) {
         char* slot = (char*)bz_array_ptr_at(arr, i, esz);
-        bz_string_release(*(void**)slot);
+        bz_array_drop_slot_refs(arr, slot);
     }
-    if (!keep_stamp) arr->str_key_esz = 0;
+    if (!keep_stamp) {
+        arr->str_key_esz = 0;
+        arr->emb_retain = nullptr;   // fix #8386: the thunks go with the stamp
+        arr->emb_release = nullptr;
+    }
+}
+
+// fix #8386: the REPLACE half for a thunk-stamped array, shared by the two
+// indexer stores. Same ordering as the Key stamp's replace, for the same
+// reason (see the take-then-release note above): the incoming element's
+// references are taken BEFORE the displaced element's are given back, so a
+// self-store nets to nothing instead of freeing a string the slot still
+// holds. The displaced element is copied out WHOLE first — its strings can be
+// at any offset, and `emb_release` nulls what it releases, which must not
+// happen to the bytes just stored.
+static void bz_array_replace_emb_slot(bz_array_t* arr, int64_t idx,
+                                      const void* elem, int64_t esz) {
+    char* slot = (char*)arr->data + idx * esz;
+    char small[256];
+    char* displaced = (size_t)esz <= sizeof small ? small : (char*)malloc((size_t)esz);
+    if (!displaced) bz_alloc_fail("Array<T> displaced element");
+    memcpy(displaced, slot, (size_t)esz);
+    arr->emb_retain((void*)elem);
+    memcpy(slot, elem, (size_t)esz);
+    arr->emb_release(displaced);
+    if (displaced != small) free(displaced);
 }
 
 void* bz_array_alloc(int64_t elem_size, int64_t initial_cap) {
@@ -389,6 +438,10 @@ void bz_array_set(void* arrp, int64_t idx, const void* elem, int64_t elem_size) 
         // an index outside [0, count), is not a slot this array co-owns, so no
         // Key is taken or given back — only the bytes move.
         if (bz_array_str_key_slot(arr, elem_size) && idx >= 0 && idx < arr->count) {
+            if (arr->emb_retain) {  // fix #8386: a thunk-stamped record array
+                bz_array_replace_emb_slot(arr, idx, elem, elem_size);
+                return;
+            }
             void* displaced = *(void**)bz_array_ptr_at(arr, idx, elem_size);
             // The incoming Key comes from `elem`, NOT from the slot: after the
             // memcpy the slot holds it, but reading it there would retain the
@@ -427,6 +480,10 @@ void bz_array_set_disposing(void* arrp, int64_t idx, const void* elem,
     // the `((void**)arr->data)[idx]` disposer read above is a stride-8 reach.
     if (arr->str_key_esz > 0 &&
         bz_array_str_key_slot(arr, elem_size) && idx >= 0 && idx < arr->count) {
+        if (arr->emb_retain) {  // fix #8386: a thunk-stamped record array
+            bz_array_replace_emb_slot(arr, idx, elem, elem_size);
+            return;
+        }
         void* displaced = *(void**)bz_array_ptr_at(arr, idx, elem_size);
         bz_take_str_dict_key_ptr(*(void**)elem);
         memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
@@ -756,6 +813,55 @@ extern "C" void bz_array_own_str_dict_keys(void* arrp, int64_t esz) {
         }
     }
     arr->str_key_esz = esz;
+}
+
+// fix #8386 (§28.9 / §28.3.1 K1.6 / §28.11, v0.357): stamp an array whose
+// elements are VALUE AGGREGATES WITH EMBEDDED STRINGS — a record with `string`
+// components — as the co-owner of every string its slots carry.
+//
+// THE RULE. `string` is runtime-managed (§28.9) and a runtime-managed value
+// "carries no classification and no obligation" (K1.6): the program neither
+// disposes a string nor keeps its source alive, so a string STORED somewhere
+// has to stay valid for as long as it is stored. The runtime realizes that by
+// refcount, which means the store has to HOLD a reference. `Array<string>`
+// does (it retains at `Add` and releases at free); `Array<E>` for a record `E`
+// did not — §28.11's value row makes `Add` a byte copy, and a record's string
+// component carries whatever reference state it had at construction, which for
+// `new E(f[0])` is a BORROW of the element of `f`. So
+//     rows.Add(new E(f[0]));        // f a loop-local Array<string>
+// stored a pointer that died with `f` at the end of the iteration, and a later
+// `rows[i].Name` read freed memory (#8386: it printed whatever reused the
+// block).
+//
+// THE MECHANISM is #6550's, generalized: the array is stamped (by `lowerNew`,
+// at construction, while empty — or after a `(size, fill)` fill, in which case
+// the walk below takes one reference set per pre-populated slot), and from
+// then on every mutator in this file keeps "this array holds one reference on
+// every string of every slot in [0, count)" true: add / insert take, the
+// indexer store takes-then-releases, remove / clear / the frees give back.
+// What differs from the Key stamp is only WHERE the strings are: at arbitrary
+// offsets, so the walk is the two compiler-generated thunks rather than
+// "field 0".
+//
+// PAIRED BY CONSTRUCTION. Each take has exactly one give-back, so a stored
+// string's lifetime becomes max(its source's, its slot's) — never shorter than
+// before, never unbounded. No program that was clean before the stamp can
+// leak or over-release because of it.
+extern "C" void bz_array_own_embedded_strings(void* arrp, int64_t esz,
+                                              void (*retain)(void*),
+                                              void (*release)(void*)) {
+    if (!arrp || esz <= 0 || !retain || !release) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (arr->disposed || arr->str_key_esz > 0) return;  // never re-stamp
+    if (arr->data) {
+        for (int64_t i = 0; i < arr->count; ++i) {
+            char* slot = (char*)bz_array_ptr_at(arr, i, esz);
+            if (slot) retain(slot);
+        }
+    }
+    arr->str_key_esz = esz;
+    arr->emb_retain = retain;
+    arr->emb_release = release;
 }
 
 void bz_array_free(void* arrp, void (*dispose_elem)(void*)) {

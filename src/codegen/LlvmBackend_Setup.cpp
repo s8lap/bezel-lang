@@ -56663,7 +56663,7 @@ llvm::Value* Emitter::builtinExcDescTablePtr() {
 // `bz_array_ptr_at(src, 0, 1)`, then GEP into that buffer. Never read a
 // bz_array_t field at a fixed offset: since fix #6776 (§8.2, v0.340) the
 // header is {vtable@0, type_desc@8, data@16, count@24, capacity@32, ...}
-// (80 B), and word 0 is the runtime type tag, not `data`. Length/IsEmpty use
+// (96 B), and word 0 is the runtime type tag, not `data`. Length/IsEmpty use
 // `len` directly from the span struct (pre-computed by AsReadOnlySpan/AsSpan).
 llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy,
                                                    std::string_view head) {

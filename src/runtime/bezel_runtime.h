@@ -220,6 +220,10 @@ void bz_array_retain_strings(void* arr);
 // released without ever having been retained.  The stamp is calloc-zeroed, so an
 // unstamped array is byte-for-byte unaffected by the discharge.
 void bz_array_own_str_dict_keys(void* arr, int64_t elem_size);
+// fix #8386 (§28.9, v0.357): stamp `arr` as the co-owner of every string its
+// record elements embed; `retain` / `release` are applied to an element address.
+void bz_array_own_embedded_strings(void* arr, int64_t elem_size,
+                                   void (*retain)(void*), void (*release)(void*));
 
 // Return a pointer directly into the array's internal buffer at element `idx`.
 // Only valid until the next mutation; used for zero-copy access in codegen.

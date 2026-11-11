@@ -5977,8 +5977,11 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
     // the same byte copy the raw store was. The span's own indexer setter
     // already stores through `bz_array_set`; `Reverse` is a permutation and
     // moves no reference.
+    // fix #8386 (§28.9, v0.357): likewise an array of records with string
+    // components, which `lowerNew` stamps with the embedded-string thunks.
     const bool spanSlotMayBeCoOwned =
-        isDictEntryStringKeyTypeRef(resolveTypeParamRef(spanElemRef));
+        isDictEntryStringKeyTypeRef(resolveTypeParamRef(spanElemRef)) ||
+        isRecordWithStringFieldsTypeRef(resolveTypeParamRef(spanElemRef));
     auto storeSpanSlot = [&](llvm::Value* arr, llvm::Value* absIdx,
                              llvm::Value* slotPtr, llvm::Value* valPtr,
                              llvm::Type* valTy, int64_t esz) {

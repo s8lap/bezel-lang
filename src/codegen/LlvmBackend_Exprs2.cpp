@@ -8233,18 +8233,93 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // `Array` only: Stack / Queue / Set share this allocation path,
                 // but their element reads are moves out of the collection
                 // (`Pop`, `Dequeue`), which is a different ownership question.
+                //
+                // fix #8386 (§28.9 / §28.3.1 K1.6 / §28.11, v0.357): the same
+                // rule for an `Array<E>` whose `E` is a RECORD WITH STRING
+                // COMPONENTS. A record value's string component carries
+                // whatever reference state it had at construction (see
+                // `emitRecordStringFieldReleases_impl`): for `new E(f[0])` that
+                // is a BORROW of `f`'s element, so
+                //     rows.Add(new E(f[0]));     // f a loop-local Array<string>
+                // byte-copied into `rows` a pointer that died with `f` at the
+                // end of the iteration, and `rows[i].Name` then read freed
+                // memory (the issue's repro printed `junkjunkjunk1`). The array
+                // has to hold its own reference on every string its slots
+                // embed, as `Array<string>` does on its elements.
+                //
+                // The strings of a record sit at arbitrary offsets (several
+                // components, nested records, a choice payload), so the stamp
+                // carries two thunks generated here from the record's own
+                // layout — `retain(elemAddr)` / `release(elemAddr)`, the very
+                // walks a record local uses — and the runtime mutators call
+                // them where the Key stamp touches field 0. One pair per
+                // concrete element type per module, found again by name.
+                //
+                // Gated on a CONCRETE element type: inside an unspecialized
+                // generic body the element layout is not known here, and the
+                // array is left exactly as it was before this fix.
+                auto embeddedStringThunk = [&](const sema::TypeRef* et,
+                                               bool retain) -> llvm::Function* {
+                    std::string name =
+                        std::string(retain ? "bz$arrEmbRetain$"
+                                           : "bz$arrEmbRelease$") +
+                        mangleTypeRefForSymbol(et);
+                    if (llvm::Function* have = module_->getFunction(name))
+                        return have;
+                    auto* fnTy = llvm::FunctionType::get(
+                        llvm::Type::getVoidTy(llvm_), {ptrTy()},
+                        /*isVarArg=*/false);
+                    auto* fn = llvm::Function::Create(
+                        fnTy, llvm::Function::InternalLinkage, name,
+                        module_.get());
+                    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+                    // The two walkers emit through builder_/currentFn_ — point
+                    // both at the thunk, then restore (the
+                    // boxedRecordValueFreer pattern).
+                    llvm::Function* savedFn = currentFn_;
+                    auto* savedBB = builder_.GetInsertBlock();
+                    auto savedIP = savedBB ? builder_.GetInsertPoint()
+                                           : decltype(savedBB->begin()){};
+                    currentFn_ = fn;
+                    builder_.SetInsertPoint(entry);
+                    llvm::Value* elemAddr = &*fn->args().begin();
+                    if (retain)
+                        emitRecordStringFieldRetains_impl(elemAddr, et);
+                    else
+                        emitRecordStringFieldReleases_impl(elemAddr, et);
+                    if (!builder_.GetInsertBlock()->getTerminator())
+                        builder_.CreateRetVoid();
+                    currentFn_ = savedFn;
+                    if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
+                    return fn;
+                };
                 auto stampStrDictKeyCoOwner = [&](llvm::Value* arr) {
                     if (colName != "Array" || rt->genericArgs.empty() ||
                         !rt->genericArgs[0])
                         return;
-                    if (!isDictEntryStringKeyTypeRef(
-                            resolveTypeParamRef(rt->genericArgs[0])))
+                    const sema::TypeRef* et =
+                        resolveTypeParamRef(rt->genericArgs[0]);
+                    if (isDictEntryStringKeyTypeRef(et)) {
+                        auto* ownFn = declareC("bz_array_own_str_dict_keys",
+                                               llvm::Type::getVoidTy(llvm_),
+                                               {ptrTy(), i64()});
+                        builder_.CreateCall(
+                            ownFn, {arr, builder_.getInt64(elemSize)});
                         return;
-                    auto* ownFn = declareC("bz_array_own_str_dict_keys",
-                                           llvm::Type::getVoidTy(llvm_),
-                                           {ptrTy(), i64()});
+                    }
+                    // fix #8386: a record element with string components.
+                    if (!isRecordWithStringFieldsTypeRef(et) ||
+                        !typeRefIsRuntimeConcrete(et))
+                        return;
+                    llvm::Function* retainFn = embeddedStringThunk(et, true);
+                    llvm::Function* releaseFn = embeddedStringThunk(et, false);
+                    auto* ownFn = declareC(
+                        "bz_array_own_embedded_strings",
+                        llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), i64(), ptrTy(), ptrTy()});
                     builder_.CreateCall(ownFn,
-                                        {arr, builder_.getInt64(elemSize)});
+                                        {arr, builder_.getInt64(elemSize),
+                                         retainFn, releaseFn});
                 };
                 if (colName == "Array" && ne.args.size() == 2 &&
                     ne.args[0].value && ne.args[1].value) {
