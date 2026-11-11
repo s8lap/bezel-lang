@@ -2767,10 +2767,35 @@ void scanLazyConsumptionExpr(const ast::Expr* e, sema::SemaContext& ctx,
         // same false positive the statement form did.
         scanLazyConsumptionExpr(ce->scrutinee.get(), ctx, out);
         for (const auto& arm : ce->arms) scanLazyConsumptionArm(arm, ctx, out);
+    } else if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        // fix #8308 (§29.11, v0.357): a string-interpolation HOLE is an
+        // ordinary expression position, so a consumption inside a hole spends
+        // the enumeration right exactly as the same expression outside the
+        // hole does. §29.11's consumption-point list is not restricted to
+        // statement positions: item 1 is "a terminal operator (`Count`,
+        // `First`, `ToArray`, …)" wherever it is written, and item 3 is "an
+        // `IEnumerable<T>` argument" wherever it is written.
+        //
+        // The interpolation form was the ONE composite expression this scan
+        // had no arm for (its closing comment named it as deliberately not
+        // scanned, together with WithExpr / LambdaExpr — but a hole is an
+        // EXPRESSION, not a scope: only the LAMBDA body is a scope of its
+        // own, so the "an enumeration cannot cross into it" reasoning does
+        // not apply to a hole). The consequence was a FALSE must-use warning
+        // at the binding's auto-drop: the query's enumeration right WAS spent
+        // (in the hole), §28.3.10's suppression 4 applies, and the warning
+        // fired anyway because the scan never saw the spending.
+        //
+        // The DA walker in `src/sema/DefiniteAssignment.cpp` has the twin
+        // gap for the same reason — the hole is not walked there either, so
+        // a SECOND consumption after a hole is not rejected statically.
+        // // per §29.11
+        for (const auto& part : is->parts)
+            scanLazyConsumptionExpr(part.expr.get(), ctx, out);
     }
-    // InterpolatedString / WithExpr / LambdaExpr, as in scanReassignExpr: a
-    // lambda body carries its own ownership scope, and an enumeration cannot
-    // cross into it from here.
+    // WithExpr / LambdaExpr, as in scanReassignExpr: a lambda body carries
+    // its own ownership scope, and an enumeration cannot cross into it from
+    // here.
 }
 
 // One `case` arm, shared by the statement and expression forms: the `when`

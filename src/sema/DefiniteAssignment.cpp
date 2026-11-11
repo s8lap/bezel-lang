@@ -2221,12 +2221,42 @@ private:
             }
             return;
         }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+            // fix #8308 (§29.11, v0.357): a string-interpolation HOLE is an
+            // ordinary expression position, and this walker is where §29.11's
+            // single-consumption check lives: `visitExpr`'s CallExpr arm
+            // spends the bound query's enumeration right at a terminal
+            // operator / a further deferred operator (§29.11 consumption
+            // points 1 and 2), and `visitCallArg` spends it when the query is
+            // passed as an `IEnumerable<T>` argument (point 3). With the hole
+            // not walked, a consumption INSIDE a hole was invisible: the
+            // second consumption of the same query was not the located §29.11
+            // rejection, the program compiled, and it raised
+            // `InvalidOperationException` at run time instead — the loud
+            // failure §29.11 reserves for a re-enumeration the flow analysis
+            // CANNOT see.
+            //
+            // The hole is walked, so the consumption is counted where it is
+            // written. The walk is the ordinary one, so a hole that reads an
+            // unassigned local is now a §7.9 definite-assignment violation
+            // too — the same reading the same expression outside a hole
+            // gets, which is what "a hole is an ordinary expression position"
+            // means.
+            // // per §29.11
+            for (const auto& part : is->parts) {
+                if (part.expr) visitExpr(*part.expr);
+            }
+            return;
+        }
         // Everything above either returned or is a genuinely childless leaf.
         // Anything ELSE reaching here is a composite form this walker has no
-        // arm for and therefore cannot see into. As of v0.236 that is
-        // `InterpolatedStringExpr` (its holes), `RangeExpr` (lo/hi/step), and
-        // `CaseExpr` (scrutinee, guards, arm bodies) — each can contain a call,
-        // hence an `out` argument that DISCHARGES the §22.3 obligation.
+        // arm for and therefore cannot see into. As of v0.357 that is
+        // `RangeExpr` (lo/hi/step) and `CaseExpr` (scrutinee, guards, arm
+        // bodies) — each can contain a call, hence an `out` argument that
+        // DISCHARGES the §22.3 obligation. (`InterpolatedStringExpr` (its
+        // holes) left this list with fix #8308: a hole is an ordinary
+        // expression position, and §29.11's single-consumption check lives in
+        // this walker, so a consumption inside a hole had to be visible here.)
         //
         // Record it so `runExpressionBody` can decline to report rather than
         // emit a false reject (fix #2595 follow-up). Deliberately a leaf
