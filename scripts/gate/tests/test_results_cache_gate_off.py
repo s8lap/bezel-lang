@@ -186,12 +186,26 @@ class ResultsCacheKeyRules(unittest.TestCase):
         rc, lines, err = self._keys()
         self.assertEqual((rc, lines), (1, []), err)
 
+    def test_byte_identical_relink_keeps_the_key_with_a_fresh_stat(self):
+        _, first, _ = self._keys()
+        self.keys.unlink()
+        st = self.bin.stat()
+        os.utime(self.bin, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+        _, second, _ = self._keys()
+        self.assertNotEqual(first[0].split("\t")[1], second[0].split("\t")[1])  # stat id moved
+        self.assertEqual(first[0].split("\t")[2], second[0].split("\t")[2])     # content key did not
+
     def test_any_artefact_change_changes_the_key(self):
         _, first, _ = self._keys()
         self.keys.unlink()
         (self.d / "rt.a").write_text("runtime rebuilt\n")
         _, second, _ = self._keys()
         self.assertNotEqual(first[0].split("\t")[2], second[0].split("\t")[2])
+        self.keys.unlink()
+        with open(self.bin, "a") as f:  # the test binary's own bytes change
+            f.write("# relinked with a change\n")
+        _, third, _ = self._keys()
+        self.assertNotIn(third[0].split("\t")[2], {first[0].split("\t")[2], second[0].split("\t")[2]})
 
 
 if __name__ == "__main__":

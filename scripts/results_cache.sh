@@ -14,7 +14,9 @@
 #     and the whole in-process compiler), tied to its exact stat identity
 #     (dev:ino:size:mtime_ns, read before AND after hashing), which the harness
 #     re-checks against /proc/self/exe, so a key is never applied to a binary
-#     rebuilt since;
+#     rebuilt since. The stat id lives in the key-file LINE, not in the hashed
+#     components: a byte-identical relink (same sha256, new mtime) gets a fresh
+#     line but the SAME key, so it keeps its recorded passes;
 #   * the sha256 of the artefacts it embeds the ABSOLUTE paths of (asked of the
 #     binary itself: BEZEL_RESULTS_CACHE_DESCRIBE): bezelc, libbezel_runtime.a,
 #     libbezel_core.a — a bezelc-only or runtime-only rebuild is a miss;
@@ -137,6 +139,11 @@ components() {
   return 0
 }
 
+# The key of a component listing: its sha256 WITHOUT the binary_stat line. The
+# content (binary_sha256) identifies the binary; the stat id only binds a key
+# LINE to the file the harness will run (checked against /proc/self/exe).
+keyof() { printf '%s\n' "$1" | grep -v '^binary_stat=' | sha256sum | cut -d' ' -f1; }
+
 free_gb() {
   local p="$DIR"
   while [ ! -d "$p" ] && [ "$p" != "/" ]; do p="$(dirname "$p")"; done
@@ -167,7 +174,7 @@ cmd_keys() {
       echo "results_cache: off for $(basename "$bin"): $c" >&2
       rc=1; continue
     fi
-    key="$(printf '%s\n' "$c" | sha256sum | cut -d' ' -f1)"
+    key="$(keyof "$c")"
     tmp="$DIR/artifacts/.$key.$$.tmp"
     printf '%s\n' "$c" > "$tmp" && mv -f "$tmp" "$DIR/artifacts/$key.txt"
     printf '%s\t%s\t%s\t%s\n' "$SCHEMA" "$(printf '%s\n' "$c" | sed -n 's/^binary_stat=//p')" "$key" "$bin" >> "$out"
@@ -207,7 +214,7 @@ case "${1:-}" in
   keys) shift; cmd_keys "$@" ;;
   describe) shift; [ -n "${1:-}" ] || die "describe needs a BIN"
             TOOLCHAIN="$(toolchain)"
-            if c="$(components "$1")"; then printf '%s\n' "$c"; echo "key=$(printf '%s\n' "$c" | sha256sum | cut -d' ' -f1)"
+            if c="$(components "$1")"; then printf '%s\n' "$c"; echo "key=$(keyof "$c")"
             else echo "off: $c"; exit 1; fi ;;
   prune) shift; cmd_prune "$@" ;;
   stats) cmd_stats ;;
