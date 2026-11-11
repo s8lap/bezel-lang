@@ -7861,6 +7861,8 @@ bool MethodOwnership::isOwnedStateCollectionLiteralLocal(
     const sema::Symbol* sym) const {
     const auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym);
     if (!ls) return false;
+    // LOCALDECL-ONLY: a `const` local binds values and borrows that carry no
+    // obligation (§21.1, v0.357), so it is never an OWNED-state literal local.
     const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
     if (!ld) return false;
     const auto* lit =
