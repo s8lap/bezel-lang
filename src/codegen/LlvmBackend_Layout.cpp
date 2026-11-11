@@ -5575,6 +5575,49 @@ llvm::Value* Emitter::boxValue(llvm::Value* value, const sema::TypeRef* srcTy) {
     bool nullableValue = isNullableValueTy(srcTy);
     if (!nullableValue && !isBoxableValueType(srcTy)) return value;  // ref: no box
     llvm::GlobalVariable* vt = boxVtableFor(srcTy);
+    // fix #8476 (§8.6 "Nullable value-type boxing" / §5.1, v0.357): "When a
+    // nullable value type `T?` is boxed: ... If the value is non-null, the
+    // result is a boxed `T` (the non-nullable form). The nullable wrapper is
+    // stripped during boxing." The box therefore holds the BARE `T`, and the
+    // vtable it carries is T's — the lookup above asks for `srcTy` as it
+    // stands, which for a nullable source is `T?`, and a nullable
+    // VALUE-BUILTIN (`Guid?`, `DateTime?`, `TimeSpan?`, `DateOnly?`,
+    // `TimeOnly?`) has no vtable of its own: `valueBuiltinBoxName` excludes a
+    // nullable source (the wrapper is a different shape).
+    //
+    // So NO box was minted for those sources: the `{i8 hasValue; T}` CARRIER
+    // was stored in the Object/interface slot where a box POINTER belongs, and
+    // three defects followed from that one. (1) The local's slot was sized
+    // from the carrier rather than from the declared pointer type (the
+    // local-decl path sizes the slot from the value), so every interface
+    // member call on it failed to lower — #3079's "the argument of this
+    // `Console.WriteLine` failed to lower to a value, so the whole statement
+    // emits nothing". (2) The §8.6 scope-end `bz_box_release` (armed because
+    // the DECLARED type is an interface) then released the carrier's first
+    // word as a pointer — a garbage pointer: a SIGSEGV, or "refcount
+    // over-release (box) — two releases for one reference". (3) At a call
+    // argument the carrier was passed where the formal's `ptr` parameter type
+    // was expected — an IR verification failure ("Call parameter type does not
+    // match function signature").
+    //
+    // The fallback asks for the NON-NULLABLE type's vtable, which is the box's
+    // payload type's vtable by construction (the payload is `extractvalue
+    // value, 1` below). It fires ONLY where the lookup above found nothing —
+    // i.e. where NO box was minted at all — so every shape that already boxed
+    // (a nullable primitive, a nullable user record: both keyed by a
+    // nullability-independent vtable) is byte-identical.
+    //
+    // The wrapper is stripped only when the value IS the tagged carrier, so a
+    // site that hands this function a bare payload keeps its old answer.
+    if (!vt && nullableValue) {
+        auto* st = llvm::dyn_cast<llvm::StructType>(value->getType());
+        if (st && st->getNumElements() == 2 &&
+            st->getElementType(0) == nullablePrimHasValTy()) {
+            sema::TypeRef present = *srcTy;
+            present.nullable = false;
+            vt = boxVtableFor(&present);
+        }
+    }
     if (!vt) return value;  // no descriptor (e.g. unsupported value kind)
 
     llvm::Value* hasValue = nullptr;
@@ -5612,11 +5655,19 @@ llvm::Value* Emitter::boxValue(llvm::Value* value, const sema::TypeRef* srcTy) {
     // (§2.8.3 rule 4: program-wide type identity). Eager minting puts the
     // replacement in EVERY module's table.
     //
-    // ⚠ NOT COVERED HERE: the NULLABLE value-builtin box (`DateTime?` → `Object`).
-    // `valueBuiltinBoxName` excludes a nullable source (a nullable value type has
-    // its own tagged layout and its own vtable path), so that shape keeps the
-    // OLD vtable and the OLD answers. It is broken INDEPENDENTLY of this fix —
-    // this commit does not make it worse and does not make it better.
+    // ⚠ COVERED BY THE #8476 FALLBACK ABOVE: the NULLABLE value-builtin box
+    // (`DateTime?` → `Object`). `valueBuiltinBoxName` excludes a nullable
+    // source (a nullable value type has its own tagged layout and its own
+    // vtable path), so `boxVtableFor` finds NOTHING for `DateTime?` — and
+    // BEFORE fix #8476 that shape therefore minted NO BOX AT ALL: the tagged
+    // `{i8 hasValue; T}` CARRIER was stored where a box pointer belongs (the
+    // member call failed to lower, and the scope-end release freed the
+    // carrier's first word as a pointer). The fallback above now looks the
+    // vtable up for the source's NON-NULLABLE form, so the nullable
+    // value-builtin box carries the SAME replacement vtable (`pvtvb$<nm>`) as
+    // the non-nullable one, and its payload is the bare `T` (§8.6: "the
+    // nullable wrapper is stripped during boxing") — so `o.ToString()` renders
+    // the VALUE, exactly like the non-nullable box does.
 
 
     // The box struct { vtable*, i64 rc, payload }. The rc word (#422) sits at a
