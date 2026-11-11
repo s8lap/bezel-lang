@@ -21829,6 +21829,27 @@ private:
     // still emitted) but NOT in `closureBorrowRetainEligible_`, so its +1
     // simply leaks — the safe direction.
     std::unordered_set<const void*> closureBorrowRetainEligible_;
+    // fix #8440 (§27.5 / §28.9, v0.357): every closure local that is bound
+    // from a BORROWED read of another function value (`var cmp := g;` — a
+    // local, a parameter, a field, an array element) AND is assigned to
+    // somewhere in its body, a nested lambda body included. Its slot is
+    // overwritten later, and every overwrite path
+    // (`lowerClosureLocalReassign`, `lowerCapturedClosureLocalReassign`, the
+    // call-site release in `emitClosureCall`) releases the DISPLACED value as
+    // a reference the slot owns. A borrow-bound slot owned nothing, so that
+    // release dropped the SOURCE's reference and freed a function value the
+    // source still names (a heap-use-after-free on its next call).
+    // `lowerLocalDecl` therefore takes the slot its OWN reference at the
+    // bind (`bz_closure_retain`), and `collectClosureReleaseEligible` then
+    // classifies the local exactly like a producer-initialized one.
+    //
+    // Keyed by the declaration node and INSERT-ONLY: membership is a fact
+    // about the AST (the node's initializer shape and whether the body
+    // assigns to it), not about the function being lowered, so a nested
+    // lambda's own `collectClosureReleaseEligible` re-scan must not erase
+    // the enclosing body's entries (`closureBorrowAll_` above is cleared by
+    // that re-scan and is not restored).
+    std::unordered_set<const void*> closureAliasOwned_;
     // fix #2714 (§27.5 / §28.9, v0.286): bind-time retain + scope-end release
     // registrar for a BORROW-initialized closure local. Mirrors
     // `armStringLocalRefcount` line-for-line — see that helper's comment for

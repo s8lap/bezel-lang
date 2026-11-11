@@ -20222,6 +20222,19 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     if (dynamic_cast<const ast::LambdaExpr*>(init) &&
         closureReleaseEligible_.count(static_cast<const void*>(declNode)))
         closureReleaseEligible_.insert(static_cast<const void*>(declNode));
+    // fix #8440 (§27.5 / §28.9, v0.357): a closure local bound from a borrowed
+    // read of another function value (`var cmp := g;`) that the body later
+    // assigns to takes its OWN reference here, so the overwrite's release of
+    // the displaced value (`lowerClosureLocalReassign` and its siblings)
+    // spends this reference and not the source's. `closureAliasOwned_` is the
+    // classification `collectClosureReleaseEligible` made; the same call put
+    // the local on the producer walk, which is what releases this reference.
+    // Deliberately NOT gated on `currentFn_ == closureReleaseEligibleFn_`:
+    // the captured-cell overwrite has no such gate, and a reference taken in
+    // a body whose release sites are off can only leak.
+    if (v && v->getType()->isPointerTy() &&
+        closureAliasOwned_.count(static_cast<const void*>(declNode)))
+        emitClosureRetain(v);
     // #422 / #429 / §27.5 / §28.9: if this `var` closure (function-typed) local
     // was proven non-escaping and initialized by a +1 closure producer (a lambda
     // expression, a method reference, or a call to a user-defined closure-
@@ -35630,6 +35643,19 @@ bool Emitter::returnedClosureLocalOwnsPlusOne(const ast::Expr* e) const {
     // retain's twin (a UAF once the envdtor reads through the now-dangling
     // cell). Mirrors the producer arm directly above.
     if (closureBorrowRetainEligible_.count(declNode)) return true;
+    // fix #8440 (§27.5 / §28.9, v0.357): an assigned-to alias
+    // (`closureAliasOwned_`) is DELIBERATELY not answered here, although its
+    // slot holds a +1 after the declaration. A reassigned local that is
+    // called exactly once has its slot's reference released at that call
+    // (the call-site discipline in emitClosureCall); if it is returned
+    // afterwards it no longer owns what it returns. Answering "owns +1"
+    // would skip the return-site mint there, and on the path where the alias
+    // still names its source the caller would be handed a reference the
+    // source's own scope-end release then drops. Declining keeps the mint.
+    // The cost is the alias's own reference when it is returned WITHOUT
+    // having been called (MEASURED: 64 B per call, the amount the pre-fix
+    // compiler leaks for the same program; tracked as #8483, which waits
+    // on the call-site release itself, #8480).
     return false;
 }
 
@@ -37660,6 +37686,13 @@ struct ClosureEscapeWalker {
     // below (line ~28060); read by the post-walk override in
     // collectClosureReleaseEligible.
     bool escapedDueToAssignIntoClosureLocal_ = false;
+    // fix #8440 (§27.5 / §28.9, v0.357): the closure locals that take their
+    // OWN reference at the bind (Emitter::closureAliasOwned_), or null.
+    // Binding `target` into such a local (`var cmp := target;`) is not an
+    // escape of target's reference: `lowerLocalDecl` retains the function
+    // value for the new local, so two references exist from then on and each
+    // local releases its own. See the LocalDecl arm of stmt().
+    const std::unordered_set<const void*>* ownedAliasDecls = nullptr;
 
     bool isTargetIdent(const ast::Expr* e) const {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -38455,6 +38488,26 @@ struct ClosureEscapeWalker {
         // reassign-only escape sources.
         if (escaped && !escapedDueToReassign) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            // fix #8440 (§27.5 / §28.9, v0.357): EXCEPT a bind into a local
+            // that takes its own reference (ownedAliasDecls). The new local
+            // then holds a second, independent reference to the function
+            // value, so whatever it does with it — an overwrite, a return, a
+            // store — spends that reference and never target's. Without
+            // this, target stayed "escaped" and its own reference was never
+            // released: the leak the alias's unowned slot used to mask by
+            // releasing the source's reference in its place. NOT inside a
+            // lambda body: there the read of `target` is a CAPTURE, which
+            // must reach expr() below and be recorded as one. An owned
+            // alias's initializer is a borrowed read by construction (an
+            // identifier, a field, a collection element, or an if-expression
+            // over those), so walking it as a SAFE read covers the
+            // `(if c then target else other)` arm too, and still walks the
+            // condition.
+            if (!inLambda && ownedAliasDecls &&
+                ownedAliasDecls->count(static_cast<const void*>(ld))) {
+                expr(ld->initializer.get(), /*safeRead=*/true);
+                return;
+            }
             // Binding the target into ANOTHER local escapes it (the new local
             // may itself be returned/stored).
             expr(ld->initializer.get(), /*safeRead=*/false);
@@ -38675,6 +38728,158 @@ struct ClosureEscapeWalker {
         }
         // BreakStmt / ContinueStmt: no sub-expressions. The enumeration mirrors
         // the complete set walked by UnwindIneligibleWalker / StringEscapeWalker.
+    }
+};
+
+// fix #8440 (§27.5 / §28.9, v0.357): every LOCAL a body ASSIGNS TO, keyed by
+// the local's declaration node. The scan is DEEP: it descends into every
+// sub-expression, so an assignment inside a nested lambda body (§27.5:
+// "Modifications to a captured variable inside the lambda are visible
+// outside, and vice versa") or inside a block arm of a `case` expression is
+// found as well as one in the body's own statements. That completeness is the
+// point — `collectClosureReleaseEligible` uses the result to decide which
+// borrow-bound closure locals take their own reference at the bind, and a
+// missed assignment leaves the slot owning nothing while the assignment's
+// lowering releases the displaced value (the #8440 use-after-free). An
+// over-inclusion is the safe direction: the slot takes a reference it may
+// never release.
+struct ClosureLocalAssignScan {
+    const sema::SemaContext& ctx;
+    std::unordered_set<const void*>& assigned;
+
+    void target(const ast::Expr* e) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return;
+        auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id));
+        if (loc && loc->decl)
+            assigned.insert(static_cast<const void*>(loc->decl));
+    }
+
+    void args(const std::vector<ast::CallArgument>& as) {
+        for (auto& a : as) expr(a.value.get());
+    }
+
+    void arms(const std::vector<ast::CaseArm>& as) {
+        for (auto& arm : as) {
+            expr(arm.guard.get());
+            expr(arm.exprBody.get());
+            for (auto& s : arm.stmts) stmt(s.get());
+        }
+    }
+
+    void expr(const ast::Expr* e) {
+        if (!e) return;
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            expr(lam->exprBody.get());
+            for (auto& s : lam->stmts) stmt(s.get());
+            return; }
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+            expr(ce->scrutinee.get());
+            arms(ce->arms);
+            return; }
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+            for (auto& c : bx->clauses) stmt(c.get());
+            expr(bx->body.get());
+            return; }
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            expr(m->target.get()); return; }
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(m->target.get()); return; }
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            expr(c->callee.get()); args(c->args); return; }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            expr(c->callee.get()); args(c->args); return; }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get()); args(ix->indices); return; }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            expr(b->left.get()); expr(b->right.get()); return; }
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(u->operand.get()); return; }
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(pb->operand.get()); return; }
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(t->operand.get()); return; }
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(c->condition.get()); expr(c->thenValue.get());
+            expr(c->elseValue.get()); return; }
+        if (auto* t = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(t->operand.get()); return; }
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(r->lo.get()); expr(r->hi.get()); expr(r->step.get());
+            return; }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            args(n->args); return; }
+        if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(w->source.get());
+            for (auto& a : w->assigns) expr(a.value.get());
+            return; }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& el : cl->elements) expr(el.get());
+            for (auto& k : cl->keys) expr(k.get());
+            return; }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : is->parts) expr(part.expr.get());
+            return; }
+        // Identifiers, literals and the other leaf expressions hold no
+        // statement.
+    }
+
+    void stmt(const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // `x := e` and every compound form are one AssignmentStmt node.
+            target(as->target.get());
+            expr(as->target.get()); expr(as->value.get()); return; }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            target(inc->target.get());
+            expr(inc->target.get()); return; }
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            expr(ld->initializer.get()); return; }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get()); return; }
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            expr(r->value.get()); return; }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            expr(es->expr.get()); return; }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(ts->value.get()); return; }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(ds->value.get()); return; }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            expr(ys->value.get()); return; }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get());
+            for (auto& b : is->ifBranch.body) stmt(b.get());
+            for (auto& br : is->elifBranches) {
+                expr(br.condition.get());
+                for (auto& b : br.body) stmt(b.get());
+            }
+            for (auto& b : is->elseBody) stmt(b.get());
+            return; }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get());
+            for (auto& b : ws->body) stmt(b.get());
+            return; }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            expr(fs->iterable.get()); expr(fs->withExpr.get());
+            for (auto& b : fs->body) stmt(b.get());
+            return; }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) stmt(b.get());
+            return; }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) stmt(b.get());
+            for (auto& c : ts->catches) {
+                expr(c.guard.get());
+                stmt(c.body.get());
+            }
+            for (auto& b : ts->finallyBody) stmt(b.get());
+            return; }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            expr(cs->scrutinee.get());
+            arms(cs->arms);
+            return; }
+        // BreakStmt / ContinueStmt / LocalTypeDecl: no sub-expressions.
     }
 };
 }  // namespace
@@ -38902,6 +39107,74 @@ void Emitter::collectClosureReleaseEligible(
     // scan's borrowCandidates / stringBorrowAll_ arms exactly.
     std::vector<const ast::Node*> candidates;
     std::vector<const ast::Node*> borrowCandidates;
+    // fix #8440 (§27.5 / §28.9, v0.357): a closure local bound from a
+    // BORROWED read of another function value and later ASSIGNED TO.
+    //
+    // §28.9: "the type's lifetime is managed by the runtime without user
+    // involvement" — `var cmp := g;` makes `cmp` a second name for the
+    // function value `g` names, and assigning to `cmp` afterwards must leave
+    // that value alive for `g`. It did not: the bind stored the pointer with
+    // no retain (the slot owned nothing), and every path that overwrites a
+    // closure local releases the DISPLACED value as a reference the slot
+    // owns — `lowerClosureLocalReassign`, its captured-cell twin
+    // `lowerCapturedClosureLocalReassign`, and the call-site release in
+    // `emitClosureCall`. The release therefore dropped the source's ONLY
+    // reference, the cell and its captured environment were freed, and the
+    // source's next call read freed memory (MEASURED on the parent commit,
+    // `bezelc --sanitize=address`, the issue's repro: heap-use-after-free in
+    // `main`, one line printed of 201).
+    //
+    // The remedy is the one `retainAssignedClosureParams` (#4174 follow-up)
+    // applies to a by-value closure PARAMETER the body assigns to, which has
+    // the same shape (a borrowed bind followed by an owning overwrite): the
+    // slot takes its own reference at the bind (`lowerLocalDecl`). From then
+    // on the local is indistinguishable from one initialized by a +1
+    // producer — its slot owns exactly one reference to whatever it holds —
+    // so it joins `candidates` and takes the producer walk, the #4422 /
+    // #4425 override and the same release sites as `var cmp := lambda …;`.
+    // No release site is added or changed.
+    //
+    // WHICH initializers: only the forms that are known to yield a BORROWED
+    // pointer — a local, a parameter, a field, an array element, and an
+    // if-expression over those. A CALL that reaches the borrow arm below
+    // (one no producer predicate recognizes) is left as it was: a callee
+    // mints the caller's reference on return, so such a slot already owns
+    // one, and a second would only leak. A property or user-indexer read is
+    // a call too, and is left out for a different reason: what its getter
+    // hands over is not uniform today (MEASURED: a getter returning a field
+    // yields a borrowed pointer, one returning a fresh lambda a +1), so
+    // neither answer is right for both — tracked as #8481.
+    //
+    // WHICH locals: only those the body assigns to. A never-assigned alias
+    // has no overwrite to release through, so its slot is never treated as
+    // an owner by the three paths above and it is left on the borrow arm.
+    // (Two other ways such an alias can outlive its value — it is captured
+    // by a lambda, or its SOURCE is overwritten — are not this defect's
+    // paths and are tracked as #8478 and #8479.)
+    std::unordered_set<const void*> assignedLocals;
+    {
+        ClosureLocalAssignScan as{ctx_, assignedLocals};
+        for (auto& s : body) as.stmt(s.get());
+    }
+    std::function<bool(const ast::Expr*)> isBorrowedClosureRead =
+            [&](const ast::Expr* e) -> bool {
+        if (!e) return false;
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e))
+            return isBorrowedClosureRead(c->thenValue.get()) &&
+                   isBorrowedClosureRead(c->elseValue.get());
+        if (dynamic_cast<const ast::IndexExpr*>(e)) {
+            // An element of a built-in collection; a user indexer is a call.
+            return ctx_.exprSymbol(*e) == nullptr;
+        }
+        if (dynamic_cast<const ast::IdentifierExpr*>(e) ||
+            dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            sema::Symbol* sym = ctx_.exprSymbol(*e);
+            return dynamic_cast<sema::LocalSymbol*>(sym) ||
+                   dynamic_cast<sema::ParameterSymbol*>(sym) ||
+                   dynamic_cast<sema::FieldSymbol*>(sym);
+        }
+        return false;
+    };
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         {
@@ -38950,6 +39223,17 @@ void Emitter::collectClosureReleaseEligible(
                 if (v.type) lt = ctx_.resolvedType(*v.type);
                 if (!lt) lt = ctx_.exprType(*v.init);
                 if (lt && !lt->nullable &&
+                    lt->kind == sema::TypeRef::Kind::Function &&
+                    assignedLocals.count(static_cast<const void*>(s)) &&
+                    isBorrowedClosureRead(v.init)) {
+                    // fix #8440: an assigned-to alias owns its reference
+                    // from the bind (see the header comment above) and is
+                    // walked as a producer-initialized local.
+                    closureAliasOwned_.insert(static_cast<const void*>(s));
+                    candidates.push_back(s);
+                    closureLocalCandidates_.insert(
+                        static_cast<const void*>(s));
+                } else if (lt && !lt->nullable &&
                     lt->kind == sema::TypeRef::Kind::Function) {
                     borrowCandidates.push_back(s);
                     closureBorrowAll_.insert(static_cast<const void*>(s));
@@ -39063,6 +39347,9 @@ void Emitter::collectClosureReleaseEligible(
     for (const ast::Node* ld : candidates) {
         ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         w.coalesceReturnTransfers = coalesceReturnTransfers;  // #6176
+        // fix #8440: a bind into an alias that takes its own reference does
+        // not spend this candidate's reference (see ownedAliasDecls).
+        w.ownedAliasDecls = &closureAliasOwned_;
         // fix #2481 (consumer 3/3): OPT-IN the case-scrutinee relaxation —
         // see the scrutineeBorrowMode flag comment (struct ClosureEscapeWalker,
         // above) for the full soundness argument. A closure-typed producer
