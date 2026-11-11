@@ -11134,7 +11134,32 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // struct would read the tag word as an object pointer. Let such an
         // entry fall through to the `owningChoice` arm below, which carries
         // its own `unwindOnly` gate.
-        if (it->unwindOnly && !it->owningChoice) {
+        //
+        // fix #8436 (§28.3 / §29.7, v0.357): `!it->iterEnumDispose &&
+        // !it->iterEnumOrClassDispose` — an `unwindOnly` entry at an
+        // ITERATOR-FORMAT ENUMERATOR head is NOT a class instance and must
+        // not be disposed by this arm. This arm's dispatch is the CLASS
+        // convention (§28.2: Dispose at vtable slot 2, then reclaim the
+        // block); for an iterator-format enumerator (§29.7) slot 2 is
+        // MoveNext, not Dispose — so this arm RESUMED the generator and
+        // then freed its frame, and the generator's pending `finally` never
+        // ran (§29.7). MEASURED (#8436): the `owned e: IEnumerator<int>`
+        // parameter of a method that throws was disposed on the unwind edge
+        // by exactly this arm — `bz_wait_for_borrows(e)`, a call through
+        // `e->vtable + 0x10` (slot 2), then `free(e)` — while the SAME
+        // parameter on the NORMAL edge went through the
+        // `iterEnumOrClassDispose` arm below and ran the `finally`. The
+        // `unwindOnly` flag is what separated the two: the #7961 parameter
+        // arm registers `iterEnumOrClassDispose` AND `unwindOnly` when the
+        // §28.3 auto-drop is not armed (the ownership pass drops a value
+        // that reaches the method exit only via a throw from `endState`,
+        // so the normal-exit disposal is not scheduled and the unwind edge
+        // is the only one). An `unwindOnly` entry at an iterator head must
+        // therefore be disposed by the ITERATOR routine, on the unwind edge
+        // only — the `iterEnumDispose` / `iterEnumOrClassDispose` arms
+        // below carry that gate.
+        if (it->unwindOnly && !it->owningChoice &&
+            !it->iterEnumDispose && !it->iterEnumOrClassDispose) {
             if (!dropUndischarged) continue;   // fix #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
@@ -12695,6 +12720,15 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // Call Dispose(self) via slot 1 (which runs pending finally blocks inside
         // the state machine and sets state=-1) then free the heap frame.
         if (it->iterEnumDispose) {
+            // fix #8436 (§28.3 / §29.7, v0.357): an `unwindOnly` entry here is
+            // the `owned e: IEnumerator<T>` PARAMETER of #7961 on the edge
+            // where the §28.3 auto-drop is not armed — the disposal belongs to
+            // the UNWIND edge only, exactly as the generic `unwindOnly` arm
+            // above was (the parameter's normal-edge disposal is scheduled
+            // elsewhere). Keep that gate here so the entry is not disposed
+            // twice: the iterator routine runs slot-1 Dispose, which frees the
+            // frame itself.
+            if (it->unwindOnly && !dropUndischarged) continue;
             // fix #3603 / #3539 (§29.7 / §27.5 / §28.9, v0.286): ask
             // `boxedStorage` for the address that actually HOLDS the object,
             // exactly as the `dynamicDispose` / class / `asyncDispose` arms
@@ -12773,6 +12807,15 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // INCLUDING a subclass — which is precisely what #6361's rejected
         // "not vt$(enumTs)" identity test could not exclude.
         if (it->iterEnumOrClassDispose) {
+            // fix #8436 (§28.3 / §29.7, v0.357): an `unwindOnly` entry here is
+            // the `owned e: IEnumerator<T>` PARAMETER of #7961 on the edge
+            // where the §28.3 auto-drop is not armed — the disposal belongs to
+            // the UNWIND edge only, exactly as the generic `unwindOnly` arm
+            // above was. Keep that gate here so the entry is disposed exactly
+            // once, and so the unwind edge runs the SAME iterator routine the
+            // normal edge runs (§29.7: slot-1 Dispose runs the generator's
+            // pending `finally` and frees the frame).
+            if (it->unwindOnly && !dropUndischarged) continue;
             // §27.5: a captured ("boxed") local lives inside a shared heap
             // cell — ask `boxedStorage`, the single authority for "given a
             // disposal slot, where does the object live?", exactly as the
