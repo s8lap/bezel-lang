@@ -20697,6 +20697,30 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
 }
 
 
+// fix #7960 (§28.8.1 / §28.3 / §28.6, v0.357): a `move X` initializer is an
+// OWNERSHIP SOURCE for the iterator-format binding it initialises. §28.8.1: a
+// `move` transfers the obligation to the destination, and the SOURCE is left
+// moved-from (its own scope-end disposal is skipped), so the destination is the
+// single remaining disposer. Without this arm the destination registered no
+// disposal and the transferred enumerator frame leaked. The operand may carry a
+// postfix `!` (`move h.En!`); the test reads only the outer `move`.
+//
+// A move source is NOT necessarily an iterator frame. §8.1 lets a user class
+// implement `IEnumerator<T>` / `IEnumerable<T>`, and such a value reaches an
+// interface-typed slot RAW (class vtable, Dispose at slot 2, §28.2) — the
+// decl-site guard `rawUserClassInBuiltinInterfaceSlot` cannot see it, because
+// the `move` operand's static type is the interface, not the class. The
+// iterator format's blind slot-1 dispatch on such a value jumps into the class's
+// `itmap$` global (MEASURED: SEGV in `itmap$M.MyE` for `using var m := move e;`,
+// `var m := move e;` and `using var m := move h.En!;` over a `new MyE()`). So a
+// move-sourced binding registers the RUNTIME class-or-iterator discriminator
+// (`iterEnumOrClassDispose`, §29.2 slot-0 self-reference), as the #7961
+// `owned` parameter arm does, unless the decl-site coercion minted a frame.
+static bool initIsMoveOfOwned(const ast::Expr* init) {
+    auto* ue = dynamic_cast<const ast::UnaryExpr*>(init);
+    return ue && ue->op == "move" && ue->operand;
+}
+
 bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
     // fix #3640 (§21.1 / §29.11 / §27.5 / §29.2): widened from
     // `const ast::LocalDecl*` to `const ast::Node*` so a §21.1 runtime `const`
@@ -20844,7 +20868,9 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
     bool wrappedHere = iterFormatWrappedDecls_.count(declNode) != 0;
     bool isCall = dynamic_cast<const ast::CallExpr*>(init) != nullptr;
     bool isNew = dynamic_cast<const ast::NewExpr*>(init) != nullptr;
-    bool ownsSource = isCall || isNew || wrappedHere;
+    // fix #7960 (§28.8.1, v0.357): `move X` transfers the obligation here.
+    bool ownsSource =
+        isCall || isNew || wrappedHere || initIsMoveOfOwned(init);
     // fix #2769 / §29.2 / §23.3 / §28.9: a BLOCK-BODIED property read of an
     // iterator-format interface (IEnumerable<T>/IOwningEnumerable<T>/
     // IAsyncEnumerable<T>/IOwningAsyncEnumerable<T>) MINTING a fresh WRAPPER
@@ -21212,7 +21238,12 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
     // The source value is the IEnumerABLE: dispose it once at scope end (the
     // for-in clones a fresh enumerator per loop and never disposes the source).
     Disposal d{it->second, nullptr};
-    d.iterEnumDispose = true;
+    // fix #7960 (§28.2 / §28.8.1 / §29.2, v0.357): a `move X` source carries
+    // whatever representation X held — see `initIsMoveOfOwned`.
+    if (!wrappedHere && initIsMoveOfOwned(init))
+        d.iterEnumOrClassDispose = true;
+    else
+        d.iterEnumDispose = true;
     disposeStack_.back().push_back(d);
     // fix #4794: record the claim so a later `move` of this local hands it to
     // the new owner (see iterableSourceClaimedDecls_). // per §28.8.1, v0.307
@@ -22389,11 +22420,15 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             bool wrappedHere = iterFormatWrappedDecls_.count(ld) != 0;
             // fix #7594 (§17.8, v0.350): `using var e := h.Mk()!;` is the bare
             // `using var e := h.Mk();` — the producer is the operand of `!`.
+            // fix #7960 (§28.8.1, v0.357): `move X` transfers the obligation
+            // to this binding (the source is left moved-from), so the move is
+            // an ownership source exactly as a producer call is.
             bool ownsSource =
                 dynamic_cast<const ast::CallExpr*>(
                     peelForInSourceBang(ld->initializer.get())) ||
                 dynamic_cast<const ast::NewExpr*>(
                     peelForInSourceBang(ld->initializer.get())) ||
+                initIsMoveOfOwned(ld->initializer.get()) ||
                 wrappedHere;
             // fix #2769 / §29.11 / §23.3 / §28.9: the `using var` twin of
             // registerIterableSourceDisposal's MemberAccessExpr+blockGetterOf
@@ -22491,7 +22526,13 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             }
             if (ownsSource) {
                 Disposal d{it->second, nullptr};
-                d.iterEnumDispose = true;
+                // fix #7960 (§28.2 / §28.8.1 / §29.2, v0.357): a `move X`
+                // source carries whatever representation X held — see
+                // `initIsMoveOfOwned`.
+                if (!wrappedHere && initIsMoveOfOwned(ld->initializer.get()))
+                    d.iterEnumOrClassDispose = true;
+                else
+                    d.iterEnumDispose = true;
                 disposeStack_.back().push_back(d);
                 return;
             }
