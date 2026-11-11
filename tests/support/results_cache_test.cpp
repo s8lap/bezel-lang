@@ -137,6 +137,9 @@ struct Fixture {
             {"BEZEL_RESULTS_CACHE_DIR", cacheDir},
             {"BEZEL_RESULTS_CACHE_KEYS", keys ? keyFile : ""},
             {"BEZEL_RESULTS_CACHE", mode ? mode : ""},
+            // agent_check.sh hands THIS run a stage; a child must not write
+            // into it (only the row that pins staging passes its own).
+            {"BEZEL_RESULTS_CACHE_STAGE", ""},
         };
         for (auto& kv : extra) env.push_back(kv);
         bool timedOut = false;
