@@ -5307,6 +5307,56 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
                     member);
         }
     }
+    // fix #6933 (§14.1 / §14.2 / §8.1 / §8.5, v0.357): `x.ToString()` on a bare
+    // `T` receiver inside the UNSPECIALIZED template body — the #6907 shape for
+    // the THIRD §8.1 member (#6907 did GetHashCode; §8.1 declares ToString,
+    // GetHashCode and Equals as the universal Object instance surface, and
+    // every `T` carries it, §14.2).
+    //
+    // WHY THE TEMPLATE IS LIVE. Every generic declaration is emitted ONCE
+    // unspecialized, with its type parameters erased to the `int` (i32)
+    // placeholder (§11.8 leaves the realization strategy open; the erased
+    // template is an implementation choice). That template is not dead: the
+    // importing module binds `Gen<int>` to it — `int` being the only binding
+    // the #1943 / #6779 / #6818 gates let cross the module boundary — so the
+    // i32 placeholder IS the `int` the template carries there, and the
+    // template's `x.ToString()` must render it as the `int` it is. The
+    // #6907 comment states this for GetHashCode; the same reasoning holds
+    // for ToString, whose §8.5 default for a primitive is its decimal
+    // rendering (the `int` member the placeholder stands for).
+    //
+    // WITHOUT IT the call had NO lowering at all: `tryLowerValueSemanticsCall`
+    // needs an active substitution for its ToString arms (#1091 / #2469), the
+    // template has none (`genericSubstSemaTy_` is empty), and the `if (!ms)`
+    // fallback's own ToString redirect needs a substitution too — so the call
+    // fell through to the end-of-chain, reported "internal: codegen cannot
+    // dispatch member 'ToString' on receiver of type 'T'" (§8.1's member
+    // exists; the compiler had no dispatch for it) and returned null. At a
+    // CALL-ARGUMENT position that null became the #1386 internal ERROR and
+    // STOPPED the compile of a legal program; at a return / local-initializer /
+    // interpolation position it degraded the slot to zero/null (#2491 /
+    // #2434) and, in the cross-module `int` binding, returned 0 where the
+    // value was 1.
+    //
+    // THE PLACEHOLDER, NOT THE SUBSTITUTION. `emitPrimitiveToString` with
+    // `P::Int` is the SAME lowering the `T = int` specialization takes (the
+    // `if (!ms)` fallback's primitive-substitution branch calls it with the
+    // concrete primitive), so the template and the specialization agree on the
+    // rendering. The `isIntegerTy(32)` guard is what keeps the arm to the
+    // int-placeholder erasure: a type parameter whose constraint confines it to
+    // reference types erases to a POINTER in the template (fix #6870's
+    // reference-constrained erasure, §14.2 / §11.8), and a pointer receiver
+    // has no `int` rendering — it must dispatch through the runtime itable,
+    // which is #6870's own family and is deliberately NOT reached here.
+    if (isToString && emittingGenericTemplateBody_ &&
+        genericSubstSemaTy_.empty() &&
+        recvTy->kind == sema::TypeRef::Kind::Named && !recvTy->declaration &&
+        !recvTy->nullable && templateGenericParamNames_.count(recvTy->headName())) {
+        if (llvm::Value* recv = lowerExpr(*ma->target)) {
+            if (recv->getType()->isIntegerTy(32))
+                return emitPrimitiveToString(recv, sema::PrimitiveType::Int);
+        }
+    }
     // #2469 (§8.5/§14.1/§14.2): ToString on a bare unconstrained generic type
     // parameter `T` substituted with a RECORD or ENUM at this instantiation.
     // #1091 above deliberately left ToString out of the genericSubstSemaTy_

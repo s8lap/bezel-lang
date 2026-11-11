@@ -28248,6 +28248,52 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // fix #6933 (§14.1 / §14.2 / §8.5 / §28.9, v0.357): the ERASED TEMPLATE's
+    // bare-`T` `ToString()`. The #2475 arm above resolves the bare type
+    // parameter through the ACTIVE MONOMORPHIZATION (`genericSubstSemaTy_`),
+    // and the erased template — the body every generic declaration is ALSO
+    // emitted once with, its type parameters erased to the `int` (i32)
+    // placeholder — has none. So the template's own `x.ToString()` was
+    // classified as a BORROW by every consumer: a `.Length` read did not
+    // release it (the receiver-release arm in LlvmBackend_Exprs.cpp asks this
+    // predicate first), and a `return` of it retained it on top of the
+    // producer's own +1. MEASURED with the template LIVE (an importing module
+    // binds `Gen<int>` to it — `int` being the only binding the #1943 /
+    // #6779 / #6818 gates let cross the module boundary): 1 390 bytes in 80
+    // allocations over 40 iterations (LSan).
+    //
+    // The template's `x.ToString()` mints a fresh rc=1 heap string — the
+    // `emitPrimitiveToString(recv, P::Int)` dispatch #6933 added beside
+    // #6907's GetHashCode arm (LlvmBackend_Calls2.cpp) — so it IS a +1
+    // producer, and the consumer must TRANSFER that +1 (release it, or take it
+    // into the slot) rather than retain a borrow of it. Without this the
+    // producer's original +1 is never dropped: the same defect #2475 measured
+    // for the MONOMORPHIZED copy of the same call, one layer out.
+    //
+    // The gate is the SAME shape that dispatch gates on: a bare, single-part
+    // named, declaration-less Named receiver whose name is one of the
+    // declaration's own type parameters, read inside the erased template body
+    // (no active substitution). A receiver of any other type is left to the
+    // arms above — a concrete primitive, a record, an enum, a class — each of
+    // which already has its own recognizer.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->args.empty() && call->callee && genericSubstSemaTy_.empty() &&
+            emittingGenericTemplateBody_) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->member == "ToString" && ma->target) {
+                    auto* tt = ctx_.exprType(*ma->target);
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                        !tt->declaration && tt->astNode && tt->astNode->name &&
+                        tt->astNode->name->parts.size() == 1 &&
+                        templateGenericParamNames_.count(
+                            tt->astNode->name->parts.back()))
+                        return true;  // the erased template's int-placeholder
+                                     // ToString → emitPrimitiveToString → rc=1
+                }
+            }
+        }
+    }
     // #1982 / stdlib §2.6 / §4.6 / §28.9: the no-arg `guid.ToString()` is a BUILTIN
     // lowered in lowerCall's Guid block (LlvmBackend_Calls.cpp) to bz_guid_to_string,
     // which mints a fresh heap `bz.string` at rc := 1 (BZ_GUID_STRING_RC_INIT) —
