@@ -605,6 +605,24 @@ struct bz_task_t {
     std::vector<Cont> continuations;
 };
 struct bz_event_source_t;  // full def in bezel_runtime_events.cpp
+// #7956 (stdlib §6.7 / spec §30.8): one PENDING cancellable delay — a
+// `Task.Delay(ms, token)` that has not reached its deadline yet.  The waiter
+// is registered on the token's state cell (see `delay_waits` below) so the
+// cancellation path can complete the delay at the CANCELLATION instead of at
+// the delay's own deadline.
+//
+// The deadline timer entry and the cancel path race to complete the same
+// task; `done` elects exactly one of them (a task is completed once, and the
+// loser must not touch the task — the winner may already have let the awaiting
+// frame free it).  `refs` keeps the record alive while EITHER holder (the
+// state's waiter list, the timer entry) still refers to it.
+struct bz_delay_wait_t {
+    bz_task_t* task;              // the pending delay task (owned by the caller)
+    void* oce_vtable;             // OperationCanceledException vtable (codegen-supplied)
+    std::atomic<int32_t> done;    // 0 = pending, 1 = completed (exactly-once latch)
+    std::atomic<int32_t> refs;    // refcount: the waiter list + the deadline timer entry
+    bool cancel_claimed;          // the cancel path claimed this waiter (under g_cancel_link_mu)
+};
 struct bz_cancel_state_t {
     std::atomic<int32_t> cancelled;  // 0 = live, 1 = cancelled; one-way latch
     std::atomic<int32_t> rc;         // reference count (source + outstanding tokens)
@@ -633,6 +651,15 @@ struct bz_cancel_state_t {
     struct callback_t { void* closure; int64_t token; };
     std::vector<callback_t> callbacks;
     int64_t next_cb_token{0};        // monotonic Subscription token (>0)
+    // #7956 (stdlib §6.7 / spec §30.8): pending cancellable delays waiting on
+    // this token.  A `Task.Delay(ms, token)` registers one waiter here; the
+    // cancellation path (bz_cancel_state_signal) drains the list and completes
+    // each waiter with OperationCanceledException, so the delay OBSERVES the
+    // cancellation at the cancellation (spec §30.8: the inner call observes the
+    // request and completes with OperationCanceledException) rather than at its
+    // own deadline.  Guarded by the same file-global g_cancel_link_mu as
+    // `callbacks`, and drained by the same snapshot-and-drain discipline.
+    std::vector<bz_delay_wait_t*> delay_waits;
     // #1413: CancelAfter / WithCancelAfter reschedule + cancel-on-dispose generation.
     // Each CancelAfter bumps this and captures the new value in its BzTimer entry; at
     // fire time only the entry whose captured generation still matches actually

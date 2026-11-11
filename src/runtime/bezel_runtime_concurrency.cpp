@@ -2159,6 +2159,74 @@ static void bz_cancel_invoke_closure(void* closure) {
     ((action_fn_t)fn)(env);
 }
 
+// ---------------------------------------------------------------------------
+// #7956 (stdlib §6.7 / spec §30.8): a cancellable delay that OBSERVES the
+// token while it waits.
+//
+// The delay used to consult the token only at its own deadline, so a token
+// cancelled AFTER the delay started left the delay running to the deadline:
+// `Task.Delay(5000, token)` under a 1 ms `WithCancelAfter` finished after 5 s
+// instead of faulting at the cancellation (the issue's repro).  Spec §30.8
+// makes the convention explicit — "cancellation typically happens at await
+// points: the inner call observes the request and completes with
+// OperationCanceledException" — and stdlib §6.7 gives `Task.Delay` a
+// `CancellationToken` parameter, so the pending delay must be COMPLETED by the
+// cancellation, not merely re-checked at its deadline.
+//
+// A pending delay is a WAITER on the token's state cell: the cell keeps the
+// waiters in `delay_waits` (guarded by g_cancel_link_mu, like `callbacks`),
+// and bz_cancel_state_signal drains that list when the cell is cancelled and
+// completes each waiter with OperationCanceledException.  The deadline timer
+// entry and the cancel path race to complete the same task; the waiter's
+// `done` latch elects exactly one completer (a task is completed once), and
+// the waiter's refcount keeps the record alive until both holders are done
+// with it.
+// ---------------------------------------------------------------------------
+
+// Retain / release a waiter record.  Two holders refer to it: the token
+// state's waiter list and the deadline timer entry; the record dies when the
+// last holder releases it.
+static void bz_delay_wait_retain(bz_delay_wait_t* w) {
+    if (w) w->refs.fetch_add(1, std::memory_order_relaxed);
+}
+static void bz_delay_wait_release(bz_delay_wait_t* w) {
+    if (!w) return;
+    // acq_rel: the decrement must acquire the prior stores (the completion
+    // wrote the task's outcome) before the last holder frees the record.
+    if (w->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) delete w;
+}
+
+// Remove `w` from the token state's waiter list.  Returns true when THIS call
+// removed it — the caller then owns the list's reference and must release it
+// (the cancel path and the deadline timer both release what they took, and
+// only what they took).  `claimed` reports whether the CANCEL path already
+// took the waiter: the cancel path sets `cancel_claimed` under the SAME lock,
+// so reading it here is ordered against that write.
+static bool bz_delay_wait_detach(bz_cancel_state_t* s, bz_delay_wait_t* w,
+                                  bool* claimed) {
+    *claimed = false;
+    if (!s || !w) return false;
+    bool removed = false;
+    std::lock_guard<std::mutex> g(g_cancel_link_mu);
+    for (auto it = s->delay_waits.begin(); it != s->delay_waits.end(); ++it) {
+        if (*it == w) { s->delay_waits.erase(it); removed = true; break; }
+    }
+    *claimed = w->cancel_claimed;
+    return removed;
+}
+
+// The cancel path's half of the completion: the token is cancelled, so the
+// pending delay completes with OperationCanceledException (spec §30.8).  The
+// `done` latch elects one completer between this path and the deadline timer;
+// the loser must not touch the task (the winner may already have let the
+// awaiting frame free it).
+static void bz_delay_wait_cancel(bz_delay_wait_t* w) {
+    if (!w) return;
+    if (w->done.exchange(1, std::memory_order_acq_rel) != 0) return;  // the timer won
+    void* excObj = bz_task_make_oce(w->oce_vtable);
+    bz_task_complete_error_obj(w->task, excObj);
+}
+
 // Set the one-way cancelled latch on `s`, FIRE every registered Register callback,
 // and cascade to every child linked to it (spec §30.8: a child cancels when its
 // parent cancels).  UAF-safe firing: under the lock we SNAPSHOT-and-CLEAR both
@@ -2174,19 +2242,38 @@ static void bz_cancel_invoke_closure(void* closure) {
 // timer, or double-Cancel, fires each callback at most once — no double effects).
 static void bz_cancel_state_signal(bz_cancel_state_t* s) {
     if (!s) return;
-    // #716: release-store so acquire-loaders (workers, bz_ctoken_is_cancelled)
-    // observe the flag.  Idempotent — storing 1 when already 1 is harmless.
-    s->cancelled.store(1, std::memory_order_release);
     std::vector<bz_cancel_state_t*> kids;
     std::vector<void*> cbs;              // #1413: snapshot of callback closures to fire
+    std::vector<bz_delay_wait_t*> waits; // #7956: snapshot of pending cancellable delays
     {
         std::lock_guard<std::mutex> g(g_cancel_link_mu);
+        // #716: release-store so acquire-loaders (workers, bz_ctoken_is_cancelled)
+        // observe the flag.  Idempotent — storing 1 when already 1 is harmless.
+        // #7956: the latch is set INSIDE the lock, together with the drain of
+        // the waiter lists.  A delay that REGISTERS (or a deadline timer that
+        // claims) under this same lock therefore sees one consistent view:
+        // either the latch is set — and the pending delays are taken in the
+        // same critical section — or the waiter is still pending and the
+        // cancel path will find it.  Setting the latch outside the lock
+        // (as this used to) left a window in which a registering delay saw a
+        // live token and then missed the cancellation.
+        s->cancelled.store(1, std::memory_order_release);
         kids.swap(s->children);          // take the parent's retained child refs
         cbs.reserve(s->callbacks.size());
         for (auto& cb : s->callbacks) cbs.push_back(cb.closure);
         s->callbacks.clear();            // take exclusive ownership of each closure's +1
+        waits.swap(s->delay_waits);      // #7956: take the pending cancellable delays
+        for (auto* w : waits) w->cancel_claimed = true;   // under the lock
     }
-    // Fire callbacks first (on THIS thread — the cancelling thread per §6.1), then
+    // #7956: complete the pending cancellable delays FIRST — the delay must
+    // observe the cancellation AT the cancellation, so its OperationCanceled-
+    // Exception is raised before any user callback runs on this thread (a user
+    // callback may take its own time; the delay must not wait for it).
+    for (auto* w : waits) {
+        bz_delay_wait_cancel(w);         // faults the delay task with OCE
+        bz_delay_wait_release(w);        // the list's reference (the timer holds its own)
+    }
+    // Fire callbacks (on THIS thread — the cancelling thread per §6.1), then
     // cascade to linked children (whose own callbacks fire the same way — piece 3).
     for (void* cl : cbs) {
         bz_cancel_invoke_closure(cl);    // call fn(env) exactly once
@@ -2544,12 +2631,18 @@ void* bz_task_make_oce(void* oce_vtable) {
 // Task.Delay(milliseconds: int, token: CancellationToken): Task.
 //
 // Token-aware Delay.  If the token is already cancelled at call time, returns
-// an immediately-faulted task (OperationCanceledException).  Otherwise,
-// schedules a timer entry and polls the token when the deadline fires: if the
-// token is still live, complete normally; if cancelled, complete with OCE.
-// Mid-deadline early cancellation (pre-deadline token check) is deferred —
-// only the pre-call and post-deadline checks are performed, matching the prior
-// pool-worker implementation.
+// an immediately-faulted task (OperationCanceledException).  Otherwise the
+// delay WAITS on the token: it registers a waiter on the token's state cell
+// (#7956) and schedules a timer entry for its deadline.  A cancellation
+// completes the pending delay at the cancellation (OperationCanceledException,
+// per spec §30.8's convention that the inner call observes the request); the
+// deadline completes it normally when no cancellation arrived.
+//
+// The two completers race (the cancel path and the deadline timer), so the
+// waiter's `done` latch elects exactly one of them and the loser never touches
+// the task — the winner may already have resumed the awaiting frame and freed
+// it.  The waiter's refcount keeps the record alive until both holders (the
+// state's waiter list, the timer entry) are done with it.
 //
 // Fix #1378: migrated from pool-worker sleep_for to g_timer (BzTimer).
 // oce_vtable is the vtable pointer for OperationCanceledException, supplied
@@ -2571,6 +2664,47 @@ void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtab
           task->done = true; }
         return task;
     }
+    // #7956: the waiter record for this pending delay.  It starts with ONE
+    // reference (the deadline timer entry below); registering it on the
+    // token's state cell adds the second (the list's).
+    auto* rec = new bz_delay_wait_t();
+    rec->task = task;
+    rec->oce_vtable = oce_vtable;
+    rec->done.store(0, std::memory_order_relaxed);
+    rec->refs.store(1, std::memory_order_relaxed);
+    rec->cancel_claimed = false;
+    // Register on the token's state cell.  The registration happens under
+    // g_cancel_link_mu and RE-CHECKS the latch under the SAME lock the cancel
+    // path uses, so there is no lost-wakeup window: either the waiter is in
+    // the list (the cancel path finds it and completes the delay) or the latch
+    // is already set (this call faults at once).  CancellationToken.None
+    // (a null handle) never cancels, so it registers nothing.
+    // The list's reference is taken UNDER THE LOCK, before the waiter becomes
+    // visible in the list: the cancel path can only take the waiter under the
+    // same lock, so it can never release the list's share before this thread
+    // has taken it.
+    bool cancelled_now = false;
+    if (s) {
+        std::lock_guard<std::mutex> g(g_cancel_link_mu);
+        // #716: acquire load — synchronizes-with the release-store in
+        // bz_cancel_state_signal (which now stores it under this same lock).
+        if (s->cancelled.load(std::memory_order_acquire)) cancelled_now = true;
+        else {
+            bz_delay_wait_retain(rec);        // the state list's reference
+            s->delay_waits.push_back(rec);
+        }
+    }
+    if (cancelled_now) {
+        // A cancellation landed between the pre-check and the registration:
+        // fault at once, exactly like the pre-check above.
+        bz_delay_wait_release(rec);       // no timer entry was scheduled
+        void* excObj = bz_task_make_oce(oce_vtable);
+        { std::lock_guard<std::mutex> lk(task->mtx);
+          task->error_obj = excObj;
+          task->is_error = true;
+          task->done = true; }
+        return task;
+    }
     // Not cancelled: schedule on the dedicated timer thread (fix #1378).
     if (!g_scheduler) bz_scheduler_init(4);
     bz_timer_ensure();
@@ -2580,17 +2714,31 @@ void* bz_task_delay_cancelable(int64_t milliseconds, void* token, void* oce_vtab
     // Retain the token for the timer callback so the bz_cancel_state_t stays
     // alive even if the CTS is disposed before the deadline fires (#647 / §6.1).
     bz_cancel_state_retain(s);
-    g_timer->schedule(deadline, [task, s, oce_vtable]() {
-        // Post-deadline check: if token was cancelled while waiting, fault.
-        // #716: acquire load — synchronizes-with the release-store in bz_cts_cancel.
-        if (s && s->cancelled.load(std::memory_order_acquire)) {
-            void* excObj = bz_task_make_oce(oce_vtable);
-            bz_cancel_state_release(s);  // release the timer's token ref
-            bz_task_complete_error_obj(task, excObj);
-        } else {
-            bz_cancel_state_release(s);  // release the timer's token ref
-            bz_task_complete(task, nullptr, 0);
+    g_timer->schedule(deadline, [task, s, oce_vtable, rec]() {
+        // #7956: the deadline reached.  Take the waiter off the token's list
+        // (unless the cancel path already took it) and complete the task —
+        // unless the cancel path already completed it: the `done` latch elects
+        // exactly one completer, and the loser must not touch the task (the
+        // winner may already have let the awaiting frame free it).
+        bool claimed = false;
+        bool took_list_ref = bz_delay_wait_detach(s, rec, &claimed);
+        if (rec->done.exchange(1, std::memory_order_acq_rel) == 0) {
+            // We are the completer.  Fault when the token was cancelled: the
+            // cancel path claims the waiter before it faults the task (so
+            // `claimed` is true), or the latch was already set when this
+            // deadline timer took the waiter.
+            bool cancelled = claimed ||
+                (s && s->cancelled.load(std::memory_order_acquire));
+            if (cancelled) {
+                void* excObj = bz_task_make_oce(oce_vtable);
+                bz_task_complete_error_obj(task, excObj);
+            } else {
+                bz_task_complete(task, nullptr, 0);
+            }
         }
+        if (took_list_ref) bz_delay_wait_release(rec);  // the state list's reference
+        bz_cancel_state_release(s);        // release the timer's token ref
+        bz_delay_wait_release(rec);        // the timer's reference
     });
     return task;
 }
