@@ -21969,6 +21969,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "transfer-closed/sealed owned) "
                                 "(\xC2\xA7""30.14, #600)");
                         }
+                        // fix-forward #8400 (stdlib §6.8 / §14.2, v0.357):
+                        // every result-bearing Spawn row binds R under
+                        // `where R: sendable, notnull` (the plain rows) or
+                        // `where R: sendable, class` (the owned rows), and
+                        // §14.2 excludes every nullable type, value or
+                        // reference, from both constraints. No row
+                        // therefore admits an entry whose result is
+                        // nullable (`Make(): Pt?`, `() -> string?`,
+                        // `() -> owned Report?`). Before this the call was
+                        // admitted, and a nullable record joined through a
+                        // pointer-sized result buffer the await site read
+                        // as the 12-byte `Pt?` (wrong value + heap-buffer-
+                        // overflow). (An async entry's `Task<R?>` is not
+                        // reached here: a Task-family result is rejected as
+                        // not sendable just above.)
+                        if (entryReturnTy->nullable) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                "Domain.Spawn entry result type is nullable: "
+                                "every Spawn row requires `R: notnull` or "
+                                "`R: class`, which exclude a nullable type "
+                                "(stdlib \xC2\xA7""6.8, \xC2\xA7""14.2) — "
+                                "return a non-nullable type, or a choice "
+                                "that models absence");
+                        }
                     }
 
                     // Type the Spawn call:

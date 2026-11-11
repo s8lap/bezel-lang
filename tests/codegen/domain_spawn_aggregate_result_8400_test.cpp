@@ -435,3 +435,128 @@ BEZEL_TEST(domain_spawn_aggregate_result_8400,
     expectCleanFaultLoop(src);
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// fix-forward #8400 — a NULLABLE result is not a Spawn instantiation.
+// stdlib §6.8 (v0.357) binds every result-bearing row's R under
+// `where R: sendable, notnull` (the plain `Task<R>` rows) or
+// `where R: sendable, class` (the `OwningTask<R>` rows), and §14.2 (v0.357)
+// excludes "a nullable type, value or reference" from both. So an entry
+// returning `Pt?` (the review's t9b_nullable_value) is a compile error.
+// Before this the call was admitted, and on #8400's tip it compiled to a
+// program that printed garbage for `3` / `null` and read 12 bytes out of an
+// 8-byte join buffer (heap-buffer-overflow).
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+
+void expectNullableResultRejected(const std::string& src) {
+    JitResult r = runAot(src);
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "Domain.Spawn entry result type is nullable"));
+}
+
+}  // namespace
+
+// The review's t9b_nullable_value: a static-method entry `Make(k): Pt?`.
+BEZEL_TEST(domain_spawn_aggregate_result_8400,
+           nullable_record_result_entry_is_rejected) {
+    std::string src =
+        "module P; "
+        "import System.Threading; "
+        "public record Pt(X: int, Y: int); "
+        "public class Program "
+        "  public static method Make(k: int): Pt? "
+        "    if k > 0 then return new Pt(1, 2); end if; "
+        "    return null; "
+        "  end Make; "
+        "  public static async method Main(): Task "
+        "    using var t := Domain.Spawn(Program.Make, 1); "
+        "    var p := await t; "
+        "    if p <> null then Console.WriteLine(p.X + p.Y); "
+        "    else Console.WriteLine(\"null\"); end if; "
+        "    using var u := Domain.Spawn(Program.Make, 0); "
+        "    var q := await u; "
+        "    if q <> null then Console.WriteLine(q.X + q.Y); "
+        "    else Console.WriteLine(\"null\"); end if; "
+        "  end Main; "
+        "end Program;";
+    expectNullableResultRejected(src);
+}
+
+// The nullable SCALAR twin: §14.2's exclusion is not about the record shape
+// (`int?` is excluded from `notnull` exactly as `Pt?` is).
+BEZEL_TEST(domain_spawn_aggregate_result_8400,
+           nullable_int_result_entry_is_rejected) {
+    std::string src =
+        "module P; "
+        "import System.Threading; "
+        "public class Program "
+        "  public static method Make(): int? => null; "
+        "  public static async method Main(): Task "
+        "    using var t := Domain.Spawn(Program.Make); "
+        "    var p := await t; "
+        "    if p <> null then Console.WriteLine(p); "
+        "    else Console.WriteLine(\"null\"); end if; "
+        "  end Main; "
+        "end Program;";
+    expectNullableResultRejected(src);
+}
+
+// The nullable REFERENCE twin through the LAMBDA spelling: `string?` is
+// excluded from `notnull` ("value or reference", §14.2).
+BEZEL_TEST(domain_spawn_aggregate_result_8400,
+           nullable_string_lambda_result_entry_is_rejected) {
+    std::string src =
+        "module P; "
+        "import System.Threading; "
+        "public class Program "
+        "  public static method Find(): string? => null; "
+        "  public static async method Main(): Task "
+        "    using var t := Domain.Spawn(lambda() => Program.Find()); "
+        "    var s := await t; "
+        "    if s <> null then Console.WriteLine(s); "
+        "    else Console.WriteLine(\"null\"); end if; "
+        "  end Main; "
+        "end Program;";
+    expectNullableResultRejected(src);
+}
+
+// The OWNED-row twin: `() -> owned Report?` binds R = `Report?` in
+// `Spawn<R>(entry: () -> owned R) where R: sendable, class`, and §14.2's
+// `class` accepts "Non-nullable reference types only". (Its non-nullable
+// twin, `() -> owned Report`, is admitted and runs.)
+BEZEL_TEST(domain_spawn_aggregate_result_8400,
+           nullable_owned_class_result_entry_is_rejected) {
+    std::string src =
+        "module P; "
+        "import System.Threading; "
+        "public sealed class Report end Report; "
+        "public class Program "
+        "  public static method Make(): owned Report? => null; "
+        "  public static async method Main(): Task "
+        "    using var t := Domain.Spawn(Program.Make); "
+        "    Console.WriteLine(\"ran\"); "
+        "  end Main; "
+        "end Program;";
+    expectNullableResultRejected(src);
+}
+
+// The admitting twin of the row above: the non-nullable owned class result
+// is a legal `OwningTask<Report>` instantiation, so the nullability check
+// must not fire on it.
+BEZEL_TEST(domain_spawn_aggregate_result_8400,
+           non_nullable_owned_class_result_entry_still_runs) {
+    std::string src =
+        "module P; "
+        "import System.Threading; "
+        "public sealed class Report end Report; "
+        "public class Program "
+        "  public static method Make(): owned Report => new Report(); "
+        "  public static async method Main(): Task "
+        "    using var t := Domain.Spawn(Program.Make); "
+        "    using var r := await t; "
+        "    Console.WriteLine(\"ran\"); "
+        "  end Main; "
+        "end Program;";
+    expectPrintedChecked(src, "ran");
+}
