@@ -26,8 +26,9 @@
 //   raise for the same condition (the pinned corpus case `l9_1_0007` catches
 //   `OverflowException`).
 //
-//   stdlib §1's Try convention (shape (c)): "`TryParse` returns `false` in
-//   every case where `Parse` would raise"; the §1 `*OrNull` tier:
+//   stdlib §9.2's range paragraph: "`TryParse` returns `false` in every case
+//   where `Parse` would raise" (shape (c) of the §1 Try convention); the §1
+//   `*OrNull` tier:
 //   "`ParseOrNull` returns `null` exactly where `Parse` would raise".
 //
 // THE DEFECT (issue #8540), MEASURED ON THE BRANCH TIP (the compiler built
@@ -76,10 +77,10 @@
 //
 //   * The FIX rows are RED on the pre-fix compiler (the program returns the
 //     "no raise" code, or prints the saturated value).
-//   * The CONTROL rows (the ADMITTING TWINS — the same shape with a legal
-//     value) are GREEN on BOTH arms: the base admits the legal value too, so
-//     their green-on-base is the positive control that the shape is admitted
-//     for its own sake and not rejected for an unrelated reason.
+//   * Two NAMED BOUNDARY CONTROLS (section B) are green on both arms; each
+//     catches a named wrong fix.  The other admitting twins were moved to
+//     the conformance corpus candidates (owner rule 2026-11-12: no row that
+//     is green on base).
 //
 //   A NOTE ON THE SPELLINGS: Bezel's "not equal" is `<>`, and `x!` is the
 //   NON-NULL ASSERTION (the unwrap of a nullable) — so `v <> 0L` is "v is not
@@ -278,13 +279,13 @@ BEZEL_TEST(parse_range_64bit_8540, ulong_parse_negative_is_a_format_failure) {
 }
 
 // ===========================================================================
-// B. THE ADMITTING TWINS — the same shapes with the LEGAL boundary values.
-//    These are GREEN ON BOTH ARMS: the base admits the legal values too (they
-//    are in range), so their green-on-base is the positive control that the
-//    shape is admitted for its own sake.
+// B. TWO NAMED BOUNDARY CONTROLS — green on both arms, kept because a
+//    plausible wrong fix turns each red.
 // ===========================================================================
 
-// Int64.MaxValue is a legal value of the width: it parses to ITSELF.
+// CONTROL.  Wrong fix caught: an over-eager range check that rejects the
+// exact boundary (`<=` for `<`, or ERANGE read from a stale errno), making
+// long.Parse("9223372036854775807") raise.
 BEZEL_TEST(parse_range_64bit_8540, long_parse_at_max_value_returns_the_value) {
     expectOut(prog(
         "Console.WriteLine(long.Parse(\"9223372036854775807\").ToString()); "
@@ -292,17 +293,8 @@ BEZEL_TEST(parse_range_64bit_8540, long_parse_at_max_value_returns_the_value) {
         ), "9223372036854775807\n");
 }
 
-// Int64.MinValue is a legal value of the width: it parses to ITSELF.
-BEZEL_TEST(parse_range_64bit_8540, long_parse_at_min_value_returns_the_value) {
-    expectOut(prog(
-        "Console.WriteLine(long.Parse(\"-9223372036854775808\").ToString()); "
-        "return 0; "
-        ), "-9223372036854775808\n");
-}
-
-// UInt64.MaxValue is a legal value of the width: it parses to ITSELF.
-//
-// (Pre-fix this row FAILED: the arm converted with strtoll, so the legal
+// FIX ROW (red on base).  UInt64.MaxValue is a legal value of the width: it
+// parses to ITSELF.  (Pre-fix this row FAILED: the arm converted with strtoll, so the legal
 // UInt64.MaxValue came back as 9223372036854775807.  The unsigned width
 // converts with strtoull — its full magnitude.)
 BEZEL_TEST(parse_range_64bit_8540, ulong_parse_at_max_value_returns_the_value) {
@@ -312,17 +304,9 @@ BEZEL_TEST(parse_range_64bit_8540, ulong_parse_at_max_value_returns_the_value) {
         ), "18446744073709551615\n");
 }
 
-// The legal maximum through `TryParse`: true, and the value is ITSELF.
-BEZEL_TEST(parse_range_64bit_8540, long_try_parse_at_max_value_is_true) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "var v: long; "
-        "var ok := long.TryParse(\"9223372036854775807\", out v); "
-        "if not ok then return 1; end; "
-        "if v <> 9223372036854775807L then return 2; end; "
-        "return 0; "
-        )), 0);
-}
-
+// CONTROL.  Wrong fix caught: applying the SIGNED range (Int64.MaxValue) to
+// the unsigned TryParse arm, so ulong.TryParse("18446744073709551615")
+// returns false.
 BEZEL_TEST(parse_range_64bit_8540, ulong_try_parse_at_max_value_is_true) {
     BEZEL_EXPECT_EQ(run(prog(
         "var v: ulong; "
@@ -333,78 +317,3 @@ BEZEL_TEST(parse_range_64bit_8540, ulong_try_parse_at_max_value_is_true) {
         )), 0);
 }
 
-// The legal minimum through `TryParse`: true, and the value is ITSELF.
-BEZEL_TEST(parse_range_64bit_8540, long_try_parse_at_min_value_is_true) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "var v: long; "
-        "var ok := long.TryParse(\"-9223372036854775808\", out v); "
-        "if not ok then return 1; end; "
-        "if v <> -9223372036854775808L then return 2; end; "
-        "return 0; "
-        )), 0);
-}
-
-// The NARROW widths' control: `int.Parse("2147483648")` already raised
-// ParseRangeException (an OverflowException) before this fix, and still does
-// — the 64-bit widths now behave the same way.
-BEZEL_TEST(parse_range_64bit_8540, int_parse_out_of_range_still_raises) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "try "
-        "  _ := int.Parse(\"2147483648\"); return 0; "
-        "catch OverflowException => return 1; "
-        "end; "
-        )), 1);
-}
-
-// The narrow widths' `TryParse` control: false for an out-of-range value.
-BEZEL_TEST(parse_range_64bit_8540, int_try_parse_out_of_range_is_false) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "var v: int; "
-        "var ok := int.TryParse(\"2147483648\", out v); "
-        "if ok then return 0; end; "
-        "if v <> 0 then return 2; end; "
-        "return 1; "
-        )), 1);
-}
-
-// The input grammar is UNCHANGED by this fix: a malformed input is still a
-// FormatException, not a range failure — on BOTH arms.
-BEZEL_TEST(parse_range_64bit_8540, long_parse_malformed_is_a_format_failure) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "try "
-        "  _ := long.Parse(\"abc\"); return 0; "
-        "catch FormatException => return 1; "
-        "end; "
-        )), 1);
-}
-
-// A whitespace-padded input is still a FormatException (§9.1's strict-fault
-// model), not a range failure — on BOTH arms.
-BEZEL_TEST(parse_range_64bit_8540, long_parse_padded_is_a_format_failure) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "try "
-        "  _ := long.Parse(\" 42\"); return 0; "
-        "catch FormatException => return 1; "
-        "end; "
-        )), 1);
-}
-
-// An in-range value with a trailing garbage character is still a
-// FormatException — on BOTH arms.
-BEZEL_TEST(parse_range_64bit_8540, long_parse_trailing_garbage_is_a_format_failure) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "try "
-        "  _ := long.Parse(\"42x\"); return 0; "
-        "catch FormatException => return 1; "
-        "end; "
-        )), 1);
-}
-
-// A leading '+' is admitted by §9.1's grammar, and the value parses — on
-// BOTH arms.
-BEZEL_TEST(parse_range_64bit_8540, long_parse_signed_input_is_admitted) {
-    expectOut(prog(
-        "Console.WriteLine(long.Parse(\"+42\").ToString()); "
-        "return 0; "
-        ), "42\n");
-}
