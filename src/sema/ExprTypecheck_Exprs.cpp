@@ -14511,12 +14511,124 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                    t->genericArgs.empty() &&
                    calleeOwnGenericNames.count(t->headName());
         };
+        // narrow #8394 (§14.5 phase 2, v0.357): "For each lambda-literal
+        // argument in argument order: the bindings established so far are
+        // substituted into its parameter's function type; if every parameter
+        // position of the lambda is then closed, the lambda's parameters take
+        // those types … and the body is typed". The bare-own-generic bail
+        // below left `lambda(v) => v.Name + "!"` against `f: (T) -> R` with NO
+        // parameter type even when `T` was already bound by an earlier
+        // argument (`xs: Array<T>` ← `Array<Person>`), so the body was typed
+        // against an untyped `v`: `+` was rejected ("requires both operands
+        // to be `string`") and `R` / a `GroupBy` key `K` could not be
+        // inferred at all. Build the bindings the arguments BEFORE
+        // `pos` establish (phase 1's structural unification, the same
+        // `unifyArgSubst` typeCall's inference uses; an earlier lambda's
+        // already-typed function type contributes too, "A later
+        // function-typed argument may use bindings an earlier one produced")
+        // and return the substituted function type when every parameter
+        // position is closed by them.
+        //
+        // Deliberately narrow — each exclusion keeps the pre-#8394 path,
+        // which is no worse than before:
+        //   * an explicit type-argument list (`methodSubst`): no inference
+        //     runs (§14.5 *Explicit lists are all-or-nothing*), and the
+        //     #5117 fix-forward's bare-`T` bail stays exactly as it is;
+        //   * a callee with no AST decl (imported) or an extension method
+        //     (the receiver is not a positional `ce->args` entry), a named
+        //     argument before `pos`, or an overloaded name (the formal is one
+        //     candidate's, not resolution's pick — #6161's hazard);
+        //   * a binding that is still open (mentions a type parameter in
+        //     scope, the callee's own, or is an Error type), or a bare-`T`
+        //     parameter position whose binding is NULLABLE — the `int?` shape
+        //     the #5117 fix-forward measured (`y.ToString()` on a threaded
+        //     `int?` trips the §7.4 narrowing gate), left on its old path.
+        auto inferredFnParamType2 =
+            [&](std::size_t pos, TypeRef* pt) -> TypeRef* {
+            if (!calleeMd2 || !calleeMs2 || !methodSubst.empty()) return nullptr;
+            if (calleeMs2->extensionDecl) return nullptr;
+            if (!isSoleNamedCandidate(calleeMs2)) return nullptr;
+            if (pos > ce->args.size() || pos > calleeMd2->params.size())
+                return nullptr;
+            std::unordered_map<std::string_view, TypeRef*> inferred;
+            for (std::size_t i = 0; i < pos; ++i) {
+                const auto& ea = ce->args[i];
+                if (!ea.name.empty()) return nullptr;
+                if (ea.modifier == "out var" || ea.modifier == "out using var" ||
+                    ea.modifier == "out owned var")
+                    continue;
+                if (!ea.value || !calleeMd2->params[i].type) continue;
+                TypeRef* at = ctx_.exprType(*ea.value);
+                if (!at || at->kind == TypeRef::Kind::Error) continue;
+                // A bare `null` argument is not self-determined (§14.5 phase 1).
+                if (at->kind == TypeRef::Kind::Primitive &&
+                    at->primitive == PrimitiveType::Object && at->nullable)
+                    continue;
+                unifyArgSubst(calleeMd2->params[i].type.get(), at,
+                              calleeOwnGenericNames, inferred);
+            }
+            if (inferred.empty()) return nullptr;
+            for (const auto& [nm, b] : inferred)
+                if (!b || b->kind == TypeRef::Kind::Error ||
+                    mentionsOwnGeneric(b) || mentionsUnsubstitutedTypeParam(b))
+                    return nullptr;
+            // A type parameter still free here is bound later from the typed
+            // lambda's return. Sema does that (typeCall's unifyArgSubst has a
+            // function-typed arm), but codegen's monomorphization
+            // (`applyMethodGenericSubst`) recovers a parameter only from a
+            // NON-function position of a formal or from the declared return
+            // type — a parameter mentioned only in a function-typed formal's
+            // slots (MaxBy's `K` in `key: (T) -> K`) stays unbound there and
+            // the specialized body miscompiles (the `K.CompareTo` returns
+            // nothing). Typing the lambda for such a callee would turn a
+            // program rejected today (`lambda(p) => p.Name + "!"` against
+            // an untyped `p`) into a silently wrong one, so decline it until
+            // codegen binds through a function-typed slot (narrow #8394).
+            std::function<bool(const TypeRef*, std::string_view)> mentionsOutsideFn =
+                [&](const TypeRef* t, std::string_view nm) -> bool {
+                if (!t) return false;
+                if (t->kind == TypeRef::Kind::Named) {
+                    if (t->genericArgs.empty() && t->headName() == nm) return true;
+                    for (const TypeRef* ga : t->genericArgs)
+                        if (mentionsOutsideFn(ga, nm)) return true;
+                } else if (t->kind == TypeRef::Kind::InlineArray) {
+                    return mentionsOutsideFn(t->arrayElement, nm);
+                }
+                return false;
+            };
+            for (const std::string_view nm : calleeOwnGenericNames) {
+                if (inferred.count(nm)) continue;
+                bool recoverable = false;
+                if (calleeMd2->returnType)
+                    recoverable = mentionsOutsideFn(
+                        ctx_.resolvedType(*calleeMd2->returnType), nm);
+                for (std::size_t j = 0;
+                     !recoverable && j < calleeMd2->params.size(); ++j)
+                    if (calleeMd2->params[j].type)
+                        recoverable = mentionsOutsideFn(
+                            ctx_.resolvedType(*calleeMd2->params[j].type), nm);
+                if (!recoverable) return nullptr;
+            }
+            TypeRef* substPt = substituteReturnType(pt, inferred);
+            if (!substPt || substPt->kind != TypeRef::Kind::Function ||
+                substPt->funcParams.size() != pt->funcParams.size())
+                return nullptr;
+            for (std::size_t i = 0; i < substPt->funcParams.size(); ++i) {
+                const TypeRef* st = substPt->funcParams[i].type;
+                if (!st || mentionsOwnGeneric(st)) return nullptr;
+                if (isBareOwnGenericRef(pt->funcParams[i].type) && st->nullable)
+                    return nullptr;
+            }
+            return substPt;
+        };
         auto formalFnParamType2 =
             [&](std::size_t pos) -> TypeRef* {
             if (!calleeMd2 && !calleeMs2) return nullptr;
             TypeRef* pt = formalOutParamType2(pos);
             if (!calleeOwnGenericNames.empty() && pt &&
                 pt->kind == TypeRef::Kind::Function) {
+                if (TypeRef* inferredPt = inferredFnParamType2(pos, pt))
+                    return inferredPt;
                 for (const auto& fp : pt->funcParams)
                     if (isBareOwnGenericRef(fp.type)) return nullptr;
                 // fix #5117: apply methodSubst BEFORE mentionsOwnGeneric check.
