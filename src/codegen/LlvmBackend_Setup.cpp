@@ -35025,6 +35025,27 @@ struct StringEscapeWalker {
                              k == ast::TypeDeclKind::Interface);
                     }
                 }
+                // fix #8515 (§28.9 / §8.6, v0.357): the paragraph above is
+                // about a setter that RETAINS — true of a `string`-typed
+                // property (the auto-property's `lowerStringFieldStore`, or a
+                // user setter's `_f := value` into a string field). A
+                // property typed `Object` or an interface has no such
+                // setter: its `value` formal is an `Object`, which is stored
+                // RAW (§8.6: a reference is not boxed, and an `Object` slot
+                // has no runtime discriminator to retain through). Reading
+                // the stored value as safe there released the tracked local
+                // at its scope end with the property still naming the
+                // string — the measured heap-use-after-free of #8515
+                // (`var o: Object := Make.Str(i); h.P := o;`, `h.P := (x as
+                // Object)!;`). So an `Object`/interface-typed property-SET
+                // falls through to the arms below, which read the value as
+                // safe ONLY for the store that provably retains — an
+                // object-string storage member (#8214: an auto-property is
+                // one) receiving a STATICALLY `string` value — and treat
+                // every other one as the escape it is.
+                if (classOrIfacePropSet &&
+                    isObjectOrInterfaceTypeRef(ctx.exprType(*as->target)))
+                    classOrIfacePropSet = false;
                 if (classOrIfacePropSet) {
                     expr(as->target.get(), /*safeRead=*/false);
                     expr(as->value.get(), /*safeRead=*/true);
@@ -35112,6 +35133,13 @@ struct StringEscapeWalker {
                              k == ast::TypeDeclKind::Interface);
                     }
                 }
+                // fix #8515 (§28.9 / §8.6, v0.357): the indexer twin of the
+                // property gate above — an `Object`/interface-typed indexer's
+                // setter stores its `value` raw, so `h[i] := o;` is an escape
+                // of the tracked local, not a retaining store.
+                if (classOrIfaceIdxSet &&
+                    isObjectOrInterfaceTypeRef(ctx.exprType(*as->target)))
+                    classOrIfaceIdxSet = false;
                 if (classOrIfaceIdxSet) {
                     expr(as->target.get(), /*safeRead=*/false);
                     expr(as->value.get(), /*safeRead=*/true);
