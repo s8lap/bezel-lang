@@ -52425,6 +52425,20 @@ bool Emitter::isChannelReceiveInitializer(const ast::LocalDecl* ld) {
 bool Emitter::taskLocalInitializerIsBorrowSource(const ast::LocalDecl* ld) {
     const ast::Expr* init = ld->initializer.get();
     if (!init) return false;
+    // fix #7808 (§17.8, §28.3, v0.357): peel the null-forgiving `!` before the
+    // shape test. §17.8: "The null-forgiving operator preserves ownership ...
+    // if `x` is borrowed, `x!` is borrowed with the same source." So
+    // `var t := h.F!;` over an `owned F: Task?` field is the same storage-read
+    // borrow as `var t := h.F;`. Without the peel the PostfixBangExpr looked
+    // like a mint, a second `d.task` was registered for the field's frame, and
+    // the local's scope end and the holder's owned-field disposal both
+    // disposed one bz_task_t* (MEASURED: hang after the first iteration). A
+    // mint under `!` (`Producer()!`) still peels to a CallExpr and stays a
+    // mint. // per §17.8, §28.3
+    while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(init)) {
+        if (!pb->operand) break;
+        init = pb->operand.get();
+    }
     return dynamic_cast<const ast::IdentifierExpr*>(init) != nullptr ||
            dynamic_cast<const ast::MemberAccessExpr*>(init) != nullptr ||
            dynamic_cast<const ast::NullCondMemberExpr*>(init) != nullptr ||
