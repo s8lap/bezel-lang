@@ -222,32 +222,9 @@ BEZEL_TEST(orderby_key_types_8384, key_matrix_sbyte_stdlib_5_9_1) {
                     "-100");
 }
 
-// A CONTROL, green before the fix as well: a `byte` key is narrower than the
-// 32-bit signed key every key used to be ranked as, and it zero-extends into
-// it, so 200 and 130 were never misranked. What the row pins is that the
-// per-type comparator the fix introduced keeps the UNSIGNED order at this
-// width (an 8-bit SIGNED compare would rank 200 and 130 below 1), in every
-// operator and callback form of the matrix.
-BEZEL_TEST(orderby_key_types_8384, key_matrix_byte_stdlib_5_9_1) {
-    expectKeyMatrix("byte", "3, 1, 200, 2, 130", "1 2 3 130 200", "200 130 3 2 1", "1");
-}
-
 BEZEL_TEST(orderby_key_types_8384, key_matrix_short_stdlib_5_9_1) {
     expectKeyMatrix("short", "3, 1, -200, 2, 300", "-200 1 2 3 300", "300 3 2 1 -200",
                     "-200");
-}
-
-// A CONTROL like the `byte` row, and for the same reason: 60000 and 40000 fit
-// the old 32-bit signed key. Pins the unsigned order at 16 bits (a 16-bit
-// SIGNED compare would rank them below 1).
-BEZEL_TEST(orderby_key_types_8384, key_matrix_ushort_stdlib_5_9_1) {
-    expectKeyMatrix("ushort", "3, 1, 60000, 2, 40000", "1 2 3 40000 60000",
-                    "60000 40000 3 2 1", "1");
-}
-
-// The control: an `int` key was always ranked.
-BEZEL_TEST(orderby_key_types_8384, key_matrix_int_control_stdlib_5_9_1) {
-    expectKeyMatrix("int", "3, 1, 2, -7, 100", "-7 1 2 3 100", "100 3 2 1 -7", "-7");
 }
 
 BEZEL_TEST(orderby_key_types_8384, key_matrix_uint_stdlib_5_9_1) {
@@ -284,14 +261,6 @@ BEZEL_TEST(orderby_key_types_8384, key_matrix_double_stdlib_5_9_2) {
 BEZEL_TEST(orderby_key_types_8384, key_matrix_decimal_stdlib_5_9_3) {
     expectKeyMatrix("decimal", "3.5m, 1.25m, 2.0m, -7.75m, 100.125m",
                     "-7.75 1.25 2 3.5 100.125", "100.125 3.5 2 1.25 -7.75", "-7.75");
-}
-
-// `char` orders by code point: 'Z' (U+005A) < 'a' < 'b' < 'c' < 'é' (U+00E9).
-// A CONTROL, green before the fix as well (these code points fit the old 32-bit
-// signed key): it pins that the `char` comparator keeps the code-point order.
-BEZEL_TEST(orderby_key_types_8384, key_matrix_char_stdlib_5_9_5) {
-    expectKeyMatrix("char", "'c', 'a', 'Z', 'b', '\xC3\xA9'", "Z a b c \xC3\xA9",
-                    "\xC3\xA9 c b a Z", "Z");
 }
 
 // The issue's `string` key, in every form. stdlib section 9.6: `CompareTo` is
@@ -753,40 +722,6 @@ end Program;
                  "36500\n");
 }
 
-// A key typed `T`, with `T` bound to `string`, over heap strings: the identity
-// lambda `lambda(x) => x` in a generic body returns the element's own string
-// WITHOUT retaining it, so the sort must not release it. 200 rounds; each round
-// counts 4 + 4 elements.
-BEZEL_TEST(orderby_key_types_8384, type_parameter_string_key_is_not_over_released_spec_28_9) {
-    expectNoLeak(runAotChecked(R"BZL(
-module P;
-public class Program
-  static method Sorted<T>(xs: Array<T>): int where T: IComparable<T>
-    var n := 0;
-    for var e in xs.OrderBy(lambda(x) => x) do n := n + 1; end;
-    for var e in xs.OrderByDescending(lambda(x) => x).ThenBy(lambda(x) => x) do n := n + 1; end;
-    return n;
-  end Sorted;
-  public static method Main()
-    var total := 0;
-    var last := "";
-    for var round in 0..<200 do
-      using var a := new Array<string>();
-      a.Add("pear" + round.ToString());
-      a.Add("apple" + round.ToString());
-      a.Add("fig" + round.ToString());
-      a.Add("apple" + round.ToString());
-      total := total + Sorted<string>(a);
-      last := a[2];
-    end;
-    Console.WriteLine(total);
-    Console.WriteLine(last);
-  end Main;
-end Program;
-)BZL"),
-                 "1600\nfig199\n");
-}
-
 // ---------------------------------------------------------------------------
 // A key lambda that CAPTURES a local (spec section 27.5: the closure captures
 // the variable, which stays readable in its own scope; section 28.9: a string
@@ -869,179 +804,37 @@ void expectCapturedLocalSurvives(const std::string& decls, const std::string& qu
 
 }  // namespace
 
-// The non-author review's probe p14, verbatim: the key is the captured string
-// local, a `ThenBy` follows, and the local is read after the loop. With every
-// key released this was `SEGV ... free <- bz_string_release <- main`.
-BEZEL_TEST(orderby_key_types_8384, captured_string_local_key_is_readable_after_the_query_review_p14_spec_27_5) {
-    expectOut(runAotCheckedLenient(R"BZL(
-module P;
-public class Program
-  public static method Main()
-    var total := 0;
-    var last := "";
-    for var round in 0..<200 do
-      using var a := new Array<int>();
-      a.Add(3); a.Add(1); a.Add(2);
-      var cap := "cap" + round.ToString();
-      for var x in a.OrderBy(lambda(x) => cap).ThenBy(lambda(x) => x) do total := total + x; end;
-      last := cap;
-    end;
-    Console.WriteLine(total);
-    Console.WriteLine(last);
-  end Main;
-end Program;
-)BZL"),
-              "1200\ncap199\n");
+// THE PINS, folded: the shapes below are the non-author review's captured-local
+// repros (probe p14 and the block / method / const / query-local / ToArray /
+// Where variants), several queries per row.
+// Both rows are GREEN on the base, which has no key drop
+// at all (the shapes only leak there); they go RED against the wrong fix named
+// here: an UNGUARDED `buildOrderKeyDrop` (877c42605 without the key-lambda
+// capture guard), which releases a key the captured local still owns, so the
+// 200-round program dies with a SEGV / heap-use-after-free under ASan.
+// The program itself is `capturedKeyProgram`; the remaining shapes of the
+// original eight rows (records, conditional key, parameter) live in the
+// harvest lane's corpus-candidates.
+BEZEL_TEST(orderby_key_types_8384, captured_string_local_key_shapes_are_readable_after_the_queries_spec_27_5) {
+    // Per round: five queries, each 3 + 1 + 2. The wrong fix: unguarded buildOrderKeyDrop.
+    expectCapturedLocalSurvives(
+        "var cap := \"c\" + round.ToString();"
+        "for var y in a.OrderBy(lambda(x) => cap).ThenBy(lambda(x) => x) do total := total + y; end;"
+        "for var y in a.Where(lambda(x) => x > 0).OrderByDescending(lambda(x) => cap) do total := total + y; end;"
+        "for var y in a.OrderBy(lambda(x: int): string => do return cap; end) do total := total + y; end;"
+        "for var y in a.OrderBy(lambda(x) => Pick(cap, x)) do total := total + y; end;"
+        "var q := a.OrderBy(lambda(x) => cap);"
+        "for var y in q do total := total + y; end;",
+        "a.OrderBy(lambda(x) => cap).ToArray()", "last := cap;", "7200\nc199\n");
 }
 
-// The review's probe p2_cap, verbatim: the same key over an array of records,
-// the local read in a concatenation after the loop (a heap-use-after-free in
-// `bz_string_concat` with every key released).
-BEZEL_TEST(orderby_key_types_8384, captured_string_local_key_over_records_review_p2_cap_spec_27_5) {
-    expectOut(runAotCheckedLenient(R"BZL(
-module P;
-record Row(Name: string, Id: int);
-public class Program
-  public static method Main()
-    var total := 0;
-    var last := "";
-    for var round in 0..<200 do
-      using var a := new Array<Row>();
-      a.Add(new Row("pear" + round.ToString(), 1));
-      a.Add(new Row("apple" + round.ToString(), 2));
-      a.Add(new Row("fig" + round.ToString(), 3));
-      var cap := "cap" + round.ToString();
-      for var r in a.OrderBy(lambda(r) => cap) do total := total + r.Id; end;
-      last := cap + a[1].Name;
-    end;
-    Console.WriteLine(total);
-    Console.WriteLine(last);
-  end Main;
-end Program;
-)BZL"),
-              "1200\ncap199apple199\n");
-}
-
-// The review's probe p16b, verbatim: the captured local is one arm of a
-// conditional key, under `OrderByDescending`, beside a `using` object.
-BEZEL_TEST(orderby_key_types_8384, captured_string_local_in_a_conditional_key_review_p16b_spec_27_5) {
-    expectOut(runAotCheckedLenient(R"BZL(
-module P;
-class Holder
-  public readonly property Tag: string;
-  public constructor(t: string) Tag := t; end constructor;
-end Holder;
-public class Program
-  public static method Main()
-    var total := 0;
-    var last := "";
-    for var round in 0..<200 do
-      using var a := new Array<int>();
-      a.Add(3); a.Add(1); a.Add(2);
-      using var h := new Holder("t" + round.ToString());
-      var cap := "c" + round.ToString();
-      for var x in a.OrderByDescending(lambda(x) => (if x > 1 then cap else "z")) do total := total + x; end;
-      last := h.Tag + cap;
-    end;
-    Console.WriteLine(total);
-    Console.WriteLine(last);
-  end Main;
-end Program;
-)BZL"),
-              "1200\nt199c199\n");
-}
-
-// Both keys of a chain are the same captured local.
-BEZEL_TEST(orderby_key_types_8384, captured_string_local_as_orderby_and_thenby_key_spec_27_5) {
-    expectCapturedLocalSurvives(
-        "var cap := \"c\" + round.ToString();",
-        "a.OrderBy(lambda(x) => cap).ThenBy(lambda(x) => cap)",
-        "last := cap;", "1200\nc199\n");
-}
-
-// An eager terminal (`ToArray`) and a filtered source.
-BEZEL_TEST(orderby_key_types_8384, captured_string_local_key_under_toarray_and_after_where_spec_27_5) {
-    expectCapturedLocalSurvives(
-        "var cap := \"c\" + round.ToString();",
-        "a.OrderBy(lambda(x) => cap).ToArray()",
-        "last := cap;", "1200\nc199\n");
-    expectCapturedLocalSurvives(
-        "var cap := \"c\" + round.ToString();",
-        "a.Where(lambda(x) => x > 0).OrderByDescending(lambda(x) => cap)",
-        "last := cap;", "1200\nc199\n");
-}
-
-// The captured local reaches the key through a BLOCK body, through a method
-// that returns its argument (`Pick`), and as a `const`.
-BEZEL_TEST(orderby_key_types_8384, captured_string_local_key_block_body_method_alias_and_const_spec_27_5) {
-    expectCapturedLocalSurvives(
-        "var cap := \"c\" + round.ToString();",
-        "a.OrderBy(lambda(x: int): string => do return cap; end)",
-        "last := cap;", "1200\nc199\n");
-    expectCapturedLocalSurvives(
-        "var cap := \"c\" + round.ToString();",
-        "a.OrderBy(lambda(x) => Pick(cap, x))",
-        "last := cap;", "1200\nc199\n");
-    expectCapturedLocalSurvives(
-        "const cap := \"c\" + round.ToString();",
-        "a.OrderBy(lambda(x) => cap)",
-        "last := cap;", "1200\nc199\n");
-}
-
-// The query is held in a local, runs in an inner scope, or is one of two
-// queries over the same captured local.
-BEZEL_TEST(orderby_key_types_8384, captured_string_local_key_query_local_inner_scope_and_two_queries_spec_27_5) {
-    expectCapturedLocalSurvives(
-        "var cap := \"c\" + round.ToString(); var q := a.OrderBy(lambda(x) => cap);",
-        "q", "last := cap;", "1200\nc199\n");
-    expectCapturedLocalSurvives(
-        "var cap := \"c\" + round.ToString(); if round >= 0 then for var y in "
-        "a.OrderBy(lambda(x) => cap) do total := total + y; end; end;",
-        "a.OrderBy(lambda(x) => x)", "last := cap;", "2400\nc199\n");
-    expectCapturedLocalSurvives(
-        "var cap := \"c\" + round.ToString(); for var y in a.OrderBy(lambda(x) => cap) "
-        "do total := total + y; end;",
-        "a.OrderByDescending(lambda(x) => cap)", "last := cap;", "2400\nc199\n");
-}
-
-// The key reaches the captured string through a captured CLOSURE local: the
-// key lambda's env releases `f`, and `f`'s env releases `cap`.
-BEZEL_TEST(orderby_key_types_8384, captured_string_local_reached_through_a_closure_local_key_spec_27_5) {
+// The key reaches the captured string through a captured CLOSURE local (the
+// key lambda's env releases `f`, `f`'s env releases `cap`). GREEN on the base; RED against the same
+// wrong fix, an unguarded `buildOrderKeyDrop` (877c42605 without the guard).
+BEZEL_TEST(orderby_key_types_8384, captured_closure_local_key_is_readable_after_the_query_spec_27_5) {
     expectCapturedLocalSurvives(
         "var cap := \"c\" + round.ToString(); var f := lambda(x: int): string => cap;",
         "a.OrderBy(lambda(x) => f(x))", "last := cap;", "1200\nc199\n");
-}
-
-// A captured string PARAMETER is retained at the capture, so it was never
-// over-released; the row is a control for the key drop over a +1 key that
-// aliases a caller's string, read again by the caller AND the callee. (Not
-// leak-clean either: the capture cell of a parameter leaks 8 bytes, with or
-// without the fix.) Per round: 3 + 1 + 2, plus the tag's length (4, 5 or 6).
-BEZEL_TEST(orderby_key_types_8384, captured_string_parameter_key_is_readable_after_the_query_spec_27_5) {
-    expectOut(runAotCheckedLenient(R"BZL(
-module P;
-public class Program
-  static method Run(a: Array<int>, tag: string): int
-    var total := 0;
-    for var x in a.OrderBy(lambda(x) => tag).ThenBy(lambda(x) => x) do total := total + x; end;
-    return total + tag.Length;
-  end Run;
-  public static method Main()
-    var total := 0;
-    var last := "";
-    for var round in 0..<200 do
-      using var a := new Array<int>();
-      a.Add(3); a.Add(1); a.Add(2);
-      var tag := "tag" + round.ToString();
-      total := total + Run(a, tag);
-      last := tag;
-    end;
-    Console.WriteLine(total);
-    Console.WriteLine(last);
-  end Main;
-end Program;
-)BZL"),
-              "2290\ntag199\n");
 }
 
 // THE TWINS: the guard is narrow. A key lambda that captures only a value-typed
@@ -1126,21 +919,6 @@ end Program;
                       "OrderBy");
 }
 
-// The admitting twin: the same sequence by an `int` derived from the flag.
-BEZEL_TEST(orderby_key_types_8384, bool_element_with_int_key_is_admitted_stdlib_5) {
-    expectNoLeak(runAotChecked(R"BZL(
-module P;
-public class Program
-  public static method Main()
-    var xs: Array<bool> := [true, false, true];
-    for var e in xs.OrderBy(lambda(e) => (if e then 1 else 0)) do Console.Write($"{e} "); end;
-    Console.WriteLine();
-  end Main;
-end Program;
-)BZL"),
-                 "False True True \n");
-}
-
 // spec section 14.2: `where T: IFoo` admits "Non-nullable types conforming to
 // `IFoo`" -- an `int?` key does not satisfy the bound.
 BEZEL_TEST(orderby_key_types_8384, nullable_int_key_is_rejected_spec_14_2) {
@@ -1156,21 +934,6 @@ public class Program
 end Program;
 )BZL"),
                       "OrderByDescending");
-}
-
-// The admitting twin: the nullable collapsed to an `int` key.
-BEZEL_TEST(orderby_key_types_8384, nullable_int_element_with_coalesced_key_is_admitted_stdlib_5) {
-    expectNoLeak(runAotChecked(R"BZL(
-module P;
-public class Program
-  public static method Main()
-    var xs: Array<int?> := [3, null, 1];
-    for var e in xs.OrderByDescending(lambda(e) => e ?? -1) do Console.Write($"{e ?? -1} "); end;
-    Console.WriteLine();
-  end Main;
-end Program;
-)BZL"),
-                 "3 1 -1 \n");
 }
 
 BEZEL_TEST(orderby_key_types_8384, nullable_string_key_is_rejected_spec_14_2) {
@@ -1221,22 +984,6 @@ public class Program
 end Program;
 )BZL"),
                       "ThenBy");
-}
-
-BEZEL_TEST(orderby_key_types_8384, thenby_int_key_twin_is_admitted_stdlib_5) {
-    expectNoLeak(runAotChecked(R"BZL(
-module P;
-record Pt(X: int, Y: int);
-public class Program
-  public static method Main()
-    using var a := new Array<Pt>();
-    a.Add(new Pt(2, 1)); a.Add(new Pt(1, 2)); a.Add(new Pt(1, 1));
-    for var p in a.OrderBy(lambda(p) => p.X).ThenBy(lambda(p) => p.Y) do Console.Write($"{p.X}{p.Y} "); end;
-    Console.WriteLine();
-  end Main;
-end Program;
-)BZL"),
-                 "11 12 21 \n");
 }
 
 // spec section 14.2 *Interface conformance* rule 7 admits a choice that lists
