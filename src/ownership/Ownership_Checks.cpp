@@ -3800,6 +3800,77 @@ void MethodOwnership::bindHeldBorrows(sema::Symbol* holder,
         // A copy of a record holder is a record holder.
         if (auto sit = states_.find(ctx_.exprSymbol(*id)); sit != states_.end())
             inRecord = sit->second.heldBorrowsInRecord;
+    } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                   peelTopCastBang(init))) {
+        // A COMPONENT read of a tracked record holder (`var x := p.Item;`,
+        // `p.Item!`): the component is one of the borrows the record carries,
+        // so the new alias borrows what the record borrows. The whole source
+        // set is taken — the pass does not track which component holds which
+        // source, and "every value in the holder's source set" (§28.2) over a
+        // superset only ever rejects less. Positional components only: a
+        // declared member could compute a value the record does not carry.
+        auto* rid = ma->target
+            ? dynamic_cast<const ast::IdentifierExpr*>(
+                  peelTopCastBang(ma->target.get()))
+            : nullptr;
+        if (!rid) return;
+        sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+        auto rit = rsym ? states_.find(rsym) : states_.end();
+        if (rit == states_.end() || rsym == holder ||
+            !rit->second.heldBorrowsInRecord ||
+            rit->second.heldBorrows.empty())
+            return;
+        // Positional-ness is read off the SYMBOL (`recordPositionalFieldSymbols`),
+        // not the `ast::TypeDecl`, so an imported record — which has no AST
+        // here — answers the same as a local one.
+        const sema::TypeRef* rt = ctx_.exprType(*rid);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+            return;
+        bool positional = false;
+        for (const sema::Symbol* pf :
+             sema::recordPositionalFieldSymbols(rt->declaration))
+            if (pf && pf->name == ma->member) { positional = true; break; }
+        if (!positional) return;
+        if (!usingPinTypeHoldsBorrow(ctx_.exprType(*ma)))
+            return;  // a value component: the alias borrows nothing
+        out = rit->second.heldBorrows;
+    } else if (auto* ne = dynamic_cast<const ast::NewExpr*>(init)) {
+        // The borrow-bearing record (§9.7): `new R(args…)` of a POSITIONAL
+        // record with no declared constructor, so the value's components are
+        // exactly the arguments (a declared constructor could bind a component
+        // to something other than its argument, and the pass would then name a
+        // source set the value does not have).
+        if (heldBorrowMemberStoreRoots_.count(holder)) return;
+        const sema::TypeRef* rt = ctx_.exprType(*ne);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration ||
+            rt->declaration->kind != ast::TypeDeclKind::Record)
+            return;
+        if (!isBorrowBearingRecordOrSpan(rt)) return;
+        // Both facts are read off the SYMBOL, so an imported record — which
+        // has no `ast::TypeDecl` here — answers the same as a local one: the
+        // positional fields through `recordPositionalFieldSymbols`, a declared
+        // constructor as a `ConstructorSymbol` member.
+        const auto posFields =
+            sema::recordPositionalFieldSymbols(rt->declaration);
+        if (posFields.empty() || posFields.size() != ne->args.size()) return;
+        for (const sema::Symbol* m : rt->declaration->members)
+            if (dynamic_cast<const sema::ConstructorSymbol*>(m)) return;
+        for (const auto& a : ne->args) {
+            if (!a.value || a.isDiscard || !a.modifier.empty()) return;
+            if (dynamic_cast<const ast::NullLiteralExpr*>(a.value.get()))
+                continue;  // carries no borrow
+            if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(
+                    peelTopCastBang(a.value.get()))) {
+                // A tracked local read — an owner or a holder. A local the
+                // pass does not track at all (a number, a string) carries no
+                // borrow when its type cannot hold one.
+                if (collectHeldBorrowsOfLocalRead(*aid, out)) continue;
+            }
+            if (!usingPinTypeHoldsBorrow(ctx_.exprType(*a.value)))
+                continue;  // a value component (`3`, `"x"`): no borrow
+            return;        // a borrow the pass cannot name: untracked
+        }
+        inRecord = true;
     } else {
         return;
     }
