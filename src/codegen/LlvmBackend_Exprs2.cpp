@@ -12710,46 +12710,61 @@ llvm::Value* Emitter::enumDeclaredValueTest(const sema::TypeSymbol* ts,
     return acc;
 }
 
-llvm::Value* Emitter::tryLowerEnumFromUnderlyingOrNull(
-        const ast::CallExpr& call) {
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
-    if (!ma || ma->member != "FromUnderlyingOrNull" || !ma->target)
-        return nullptr;
-    // The receiver must NAME an enum type — this is a STATIC member. Without
-    // this gate a user class declaring its own
-    // `static FromUnderlyingOrNull(x): SomeEnum?` would be hijacked here: the
-    // member name and the `E?` result type alone do not identify the
-    // compiler-provided member. (Sema's own recognition, ExprTC::
-    // enumTypeNamedBy, applies exactly this gate, so the two agree.)
+// fix #3862 (§10.4, v0.293): the ENUM TypeSymbol an expression NAMES as a
+// type — the receiver gate every compiler-provided per-enum static member
+// (`FromUnderlyingOrNull`, `FromNameOrNull`, `NameOf`) dispatches on. This
+// is codegen's twin of sema's `ExprTC::enumTypeNamedBy` (ExprTypecheck_
+// Calls.cpp) and applies exactly the same gate, so the two agree.
+//
+// The receiver must NAME an enum type — these are STATIC members. Without
+// this gate a user class declaring its own
+// `static FromUnderlyingOrNull(x): SomeEnum?` would be hijacked: the member
+// name and the `E?` result type alone do not identify the compiler-provided
+// member.
+//
+// fix #4072 (§10.4 / §27.8, v0.294; family of
+// #4038/#4048/#4050/#4051/#4070): a `type` alias of the enum
+// resolves `tsym` to a `TypeAliasSymbol`, not a TypeSymbol or
+// NestedTypeSymbol — the same missing-arm shape #4050's
+// DestructuringPattern arm discovered (sema fix alone is NOT
+// enough; codegen independently re-resolves here, with its OWN
+// matching gap). Without this arm `AliasColor.FromUnderlyingOrNull
+// (value)` reached this gate with `named` still null, the
+// recognition fell through, the call's result type was empty
+// for codegen to dispatch on, and the slot silently degraded to
+// zero (#2434 backstop) — a SILENT WRONG VALUE, not a crash and
+// not a diagnosed rejection. Resolve through the SAME shared
+// `sema::resolveAliasToTypeSymbol` (TypeResolution.hpp,
+// #4050/#4051) ExprTC::enumTypeNamedBy now calls, so sema and
+// codegen agree on the alias-qualified spelling exactly like the
+// direct-name spelling.
+static const sema::TypeSymbol* enumTypeNamedByCodegen(
+        sema::SemaContext& ctx, const ast::Expr& e) {
     const sema::TypeSymbol* named = nullptr;
-    if (sema::Symbol* tsym = ctx_.exprSymbol(*ma->target)) {
+    if (sema::Symbol* tsym = ctx.exprSymbol(e)) {
         if (auto* ts = dynamic_cast<sema::TypeSymbol*>(tsym)) {
             if (ts->kind == ast::TypeDeclKind::Enum) named = ts;
         } else if (auto* nts = dynamic_cast<sema::NestedTypeSymbol*>(tsym)) {
             if (nts->type && nts->type->kind == ast::TypeDeclKind::Enum)
                 named = nts->type;
-        }
-        // fix #4072 (§10.4 / §27.8, v0.294; family of
-        // #4038/#4048/#4050/#4051/#4070): a `type` alias of the enum
-        // resolves `tsym` to a `TypeAliasSymbol`, not a TypeSymbol or
-        // NestedTypeSymbol — the same missing-arm shape #4050's
-        // DestructuringPattern arm discovered (sema fix alone is NOT
-        // enough; codegen independently re-resolves here, with its OWN
-        // matching gap). Without this arm `AliasColor.FromUnderlyingOrNull
-        // (value)` reached this gate with `named` still null, the
-        // recognition fell through, the call's result type was empty
-        // for codegen to dispatch on, and the slot silently degraded to
-        // zero (#2434 backstop) — a SILENT WRONG VALUE, not a crash and
-        // not a diagnosed rejection. Resolve through the SAME shared
-        // `sema::resolveAliasToTypeSymbol` (TypeResolution.hpp,
-        // #4050/#4051) ExprTC::enumTypeNamedBy now calls, so sema and
-        // codegen agree on the alias-qualified spelling exactly like the
-        // direct-name spelling.
-        else if (auto* aliasSym =
-                     dynamic_cast<sema::TypeAliasSymbol*>(tsym))
-            if (auto* ts = sema::resolveAliasToTypeSymbol(ctx_, aliasSym))
+        } else if (auto* aliasSym =
+                       dynamic_cast<sema::TypeAliasSymbol*>(tsym)) {
+            if (auto* ts = sema::resolveAliasToTypeSymbol(ctx, aliasSym))
                 if (ts->kind == ast::TypeDeclKind::Enum) named = ts;
+        }
     }
+    return named;
+}
+
+llvm::Value* Emitter::tryLowerEnumFromUnderlyingOrNull(
+        const ast::CallExpr& call) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || ma->member != "FromUnderlyingOrNull" || !ma->target)
+        return nullptr;
+    // The receiver must NAME an enum type — see enumTypeNamedByCodegen above
+    // for the gate and its history (sema applies exactly this gate too, so
+    // the two agree).
+    const sema::TypeSymbol* named = enumTypeNamedByCodegen(ctx_, *ma->target);
     if (!named) return nullptr;
     // Sema types the whole call as `E?` (a nullable Named enum).
     const sema::TypeRef* rt = ctx_.exprType(call);
@@ -12792,6 +12807,191 @@ llvm::Value* Emitter::tryLowerEnumFromUnderlyingOrNull(
     return builder_.CreateSelect(declared, present,
                                  llvm::Constant::getNullValue(nt),
                                  "enum.fu.opt");
+}
+
+// fix #3862 (§10.4 "Methods, properties, static members", v0.293; stdlib
+// §9.9, v0.293): the enum's DECLARED-IDENTIFIER table — the one table the
+// pair `E.FromNameOrNull(name: string): E?` / `E.NameOf(value: E): string`
+// reads.
+//
+// §10.4 (v0.357): "**The name pair.** `FromNameOrNull` and `NameOf` are the
+// two directions of one table, the enum's **declared-identifier table**: each
+// constant's own identifier — the bare name as written, never a qualified
+// `E.A` spelling — the table §17.9's `nameof` reads at compile time and
+// stdlib §2.13's `Type.EnumNames` lists."
+//
+// So the table is over the IDENTIFIERS, not over the §9.8 wire names: a
+// `serialized "<name>"` rename changes the ENCODED form only and "NameOf /
+// FromNameOrNull — like `nameof` and `EnumNames` — never see a rename".
+// `EnumConstantSymbol::name` is the bare declared identifier (the §9.8
+// rename lives on the separate `serializedName` field), so the table reads
+// `ec->name` and NOT `sema::enumConstantWireName(ec)`.
+//
+// The values come from `enumValue_` (computeEnumValues), the same map the
+// enum cast and the §9.8 serializer read: it covers local and imported
+// enums alike and folds §10.2's explicit-value + auto-increment rule with
+// the qualified-reference form (#5402) that sema's own
+// `sema::enumDeclaredValues` does not fold.
+//
+// Returns false when the table cannot be built — a declared constant with no
+// known underlying value. §10.2 requires every value to be a compile-time
+// constant (§17.14), so a program that reaches codegen has a complete value
+// set; the refusal is a decline, not a judgement.
+bool Emitter::enumDeclaredIdentifierTable(
+        const sema::TypeSymbol* ts,
+        std::vector<std::pair<std::string_view, std::int64_t>>& out) {
+    out.clear();
+    if (!ts) return false;
+    // DECLARATION order — §10.2's shared-value rule wants the FIRST-declared
+    // name for a duplicated value, and a first-match chain over this order
+    // delivers exactly that.
+    for (const auto& [ec, wireName] : sema::enumConstantWireNames(*ts)) {
+        auto it = enumValue_.find(ec);
+        if (it == enumValue_.end()) return false;  // unknown value set
+        out.emplace_back(ec->name, it->second);
+    }
+    return !out.empty();
+}
+
+// fix #3862 (§10.4, v0.293): `E.FromNameOrNull(name: string): E?` — the
+// name→value direction of the declared-identifier table.
+//
+// §10.4: "`FromNameOrNull(name)` returns the declared constant whose
+// identifier equals `name`, or `null` when there is none; the comparison is
+// exact — ordinal code-point equality (stdlib §9.6), case-sensitive, nothing
+// trimmed — and a digit string names no constant … It is **total** — it never
+// raises."
+//
+// The comparison is `emitStringEq` — the compiler's §4.6 / stdlib §9.6
+// ordinal, code-point-wise, case-sensitive string equality (the same helper
+// the `==` operator and the `case` pattern use), so "case-sensitive, nothing
+// trimmed" is the equality's own semantics and needs no extra guard.
+llvm::Value* Emitter::tryLowerEnumFromNameOrNull(
+        const ast::CallExpr& call) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || ma->member != "FromNameOrNull" || !ma->target) return nullptr;
+    const sema::TypeSymbol* named = enumTypeNamedByCodegen(ctx_, *ma->target);
+    if (!named) return nullptr;
+    // Sema types the whole call as `E?` (a nullable Named enum).
+    const sema::TypeRef* rt = ctx_.exprType(call);
+    if (!rt || !rt->nullable || rt->kind != sema::TypeRef::Kind::Named ||
+        rt->declaration != named)
+        return nullptr;
+    if (call.args.size() != 1 || !call.args[0].value) return nullptr;
+    const sema::TypeSymbol* enumTy = rt->declaration;
+
+    std::vector<std::pair<std::string_view, std::int64_t>> table;
+    if (!enumDeclaredIdentifierTable(enumTy, table)) return nullptr;
+
+    llvm::Value* nameVal = lowerExpr(*call.args[0].value);
+    if (!nameVal) return nullptr;
+
+    llvm::StructType* nt = nullableValueStructTy(rt);
+    llvm::Type* payloadTy = nt->getElementType(1);
+    llvm::Type* uTy = enumLlvmType(enumTy);
+
+    // The first match wins — the table is in declaration order, so a
+    // duplicated VALUE (§10.2) resolves to the FIRST-declared identifier,
+    // while a duplicated IDENTIFIER is impossible (§10.2 forbids two
+    // constants of one name).
+    llvm::Value* result = llvm::Constant::getNullValue(nt);
+    // Build the chain BACKWARDS so each `select` nests the LATER match
+    // outside the earlier one: the first match in declaration order must
+    // win, so the chain is `match_N ? present_N : (match_{N-1} ? … : null)`.
+    // The comparison values are gathered first (each `emitStringEq` opens
+    // its own basic blocks and returns a PHI that dominates the blocks it
+    // is used in, so the chain can be assembled afterwards).
+    std::vector<std::pair<llvm::Value*, llvm::Value*>> matches;
+    for (const auto& [ident, val] : table) {
+        // The identifier as a string literal — the same lowering §17.9's
+        // `nameof` uses (`lowerStringLiteral` of the quoted lexeme).
+        std::string quoted = "\"";
+        quoted += ident;
+        quoted += "\"";
+        llvm::Value* idStr = lowerStringLiteral(quoted, /*verbatim=*/false);
+        llvm::Value* eq = emitStringEq(nameVal, idStr);
+        llvm::Value* cval = llvm::ConstantInt::get(
+            uTy, static_cast<std::uint64_t>(val), /*isSigned=*/true);
+        matches.emplace_back(eq, cval);
+    }
+    for (auto it = matches.rbegin(); it != matches.rend(); ++it) {
+        llvm::Value* present = builder_.CreateInsertValue(
+            llvm::UndefValue::get(nt),
+            llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+        present = builder_.CreateInsertValue(
+            present, reinterpretToType(it->second, payloadTy), {1u});
+        result = builder_.CreateSelect(it->first, present, result,
+                                       "enum.fno.opt");
+    }
+    return result;
+}
+
+// fix #3862 (§10.4, v0.293): `E.NameOf(value: E): string` — the value→name
+// direction of the declared-identifier table.
+//
+// §10.4: "`NameOf(value)` returns the identifier of the constant `value`
+// denotes; it is total because every value of an enum type is a declared
+// value (§5.4), and for a written constant `E.NameOf(E.A) = nameof(E.A)`."
+// Under duplicate constant values (§10.2) "`NameOf` yields the first-declared
+// constant's identifier for a shared value" — so the chain is over the
+// DECLARATION-ordered table and the FIRST match wins.
+//
+// §5.4: "There is no value of an enum type that is not equal to a declared
+// constant", so the chain's fall-through arm is unreachable in a program the
+// language admits (the checked cast `E(n)` raises OverflowException for an
+// undeclared value, and a constant undeclared value is a compile error).
+// The fall-through therefore yields the EMPTY STRING — "no declared constant
+// denotes this value, so it has no identifier" — rather than a neighbouring
+// constant's name; this is the one place the spec does not spell the answer
+// out (the spec's own reason for totality is §5.4's invariant), and the
+// choice is recorded in the commit body.
+llvm::Value* Emitter::tryLowerEnumNameOf(const ast::CallExpr& call) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || ma->member != "NameOf" || !ma->target) return nullptr;
+    const sema::TypeSymbol* named = enumTypeNamedByCodegen(ctx_, *ma->target);
+    if (!named) return nullptr;
+    // Sema types the whole call as `string` (stdlib §9.9: `NameOf(value: E):
+    // string`).
+    const sema::TypeRef* rt = ctx_.exprType(call);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Primitive ||
+        rt->primitive != sema::PrimitiveType::String)
+        return nullptr;
+    if (call.args.size() != 1 || !call.args[0].value) return nullptr;
+    const sema::TypeSymbol* enumTy = named;
+
+    std::vector<std::pair<std::string_view, std::int64_t>> table;
+    if (!enumDeclaredIdentifierTable(enumTy, table)) return nullptr;
+
+    llvm::Value* v = lowerExpr(*call.args[0].value);
+    if (!v || !v->getType()->isIntegerTy()) return nullptr;
+    // §10.3 (#740): compare at the enum's UNDERLYING width — truncating a
+    // `: long` enum to i32 would mis-match a member whose value differs only
+    // above bit 31. This is the same width adjustment the §9.8 serializer's
+    // first-match chain performs (`emitEnumSerialize`).
+    llvm::Type* uTy = enumLlvmType(enumTy);
+    llvm::Value* ev = v;
+    if (ev->getType() != uTy)
+        ev = builder_.CreateSExtOrTrunc(ev, uTy, "enum.ev");
+
+    // The first match wins — §10.2's shared-value rule wants the
+    // FIRST-declared identifier for a duplicated value.
+    llvm::Value* result = lowerStringLiteral("\"\"", /*verbatim=*/false);
+    std::vector<std::pair<llvm::Value*, llvm::Value*>> matches;
+    for (const auto& [ident, val] : table) {
+        llvm::Value* cmpVal = llvm::ConstantInt::get(
+            uTy, static_cast<std::uint64_t>(val), /*isSigned=*/true);
+        llvm::Value* eq = builder_.CreateICmpEQ(ev, cmpVal, "enum.eq");
+        std::string quoted = "\"";
+        quoted += ident;
+        quoted += "\"";
+        llvm::Value* idStr = lowerStringLiteral(quoted, /*verbatim=*/false);
+        matches.emplace_back(eq, idStr);
+    }
+    for (auto it = matches.rbegin(); it != matches.rend(); ++it) {
+        result = builder_.CreateSelect(it->first, it->second, result,
+                                       "enum.nameof.opt");
+    }
+    return result;
 }
 
 llvm::Value* Emitter::lowerEnumCast(const ast::CallExpr& call) {

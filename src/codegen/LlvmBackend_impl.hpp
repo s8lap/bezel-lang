@@ -25096,6 +25096,29 @@ private:
     // never raises. Returns nullptr when `call` is not that shape.
     llvm::Value* tryLowerEnumFromUnderlyingOrNull(const ast::CallExpr& call);
 
+    // fix #3862 (§10.4 / stdlib §9.9, v0.293): the enum's DECLARED-IDENTIFIER
+    // table — each constant's bare declared identifier (never the §9.8 wire
+    // name) paired with its underlying value, in DECLARATION order. Fills
+    // `out` and returns true; returns false when the table cannot be built
+    // (no declared constant, or a constant with no known underlying value —
+    // §10.2 requires every value to be a compile-time constant, so a program
+    // that reaches codegen has a complete value set).
+    bool enumDeclaredIdentifierTable(
+        const sema::TypeSymbol* ts,
+        std::vector<std::pair<std::string_view, std::int64_t>>& out);
+
+    // fix #3862 (§10.4 / stdlib §9.9, v0.293): lower the compiler-provided
+    // `E.FromNameOrNull(name: string): E?` — the declared constant whose
+    // IDENTIFIER equals `name`, or null when there is none. Total: it never
+    // raises. Returns nullptr when `call` is not that shape.
+    llvm::Value* tryLowerEnumFromNameOrNull(const ast::CallExpr& call);
+
+    // fix #3862 (§10.4 / stdlib §9.9, v0.293): lower the compiler-provided
+    // `E.NameOf(value: E): string` — the identifier of the constant `value`
+    // denotes. Total: it never raises. Returns nullptr when `call` is not
+    // that shape.
+    llvm::Value* tryLowerEnumNameOf(const ast::CallExpr& call);
+
     // §22.4/§22.7: can the given call arguments fill the parameter list?
     // (named arguments matched by name, positionals by position, every
     // remaining parameter defaulted). Pure check — no IR emitted — used to

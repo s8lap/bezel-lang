@@ -10900,6 +10900,14 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // dispatch because no MethodSymbol exists for it (sema types the call
     // directly), so the ordinary path would find no callee.
     if (llvm::Value* fu = tryLowerEnumFromUnderlyingOrNull(call)) return fu;
+    // fix #3862 (§10.4 / stdlib §9.9, v0.293): the other two members of the
+    // compiler-provided per-enum tier — `E.FromNameOrNull(name: string): E?`
+    // and `E.NameOf(value: E): string`. Same dispatch position and the same
+    // reason as the `FromUnderlyingOrNull` arm above: no MethodSymbol exists
+    // for a compiler-provided member (sema types the call directly), so the
+    // ordinary path would find no callee.
+    if (llvm::Value* fno = tryLowerEnumFromNameOrNull(call)) return fno;
+    if (llvm::Value* nmo = tryLowerEnumNameOf(call)) return nmo;
     // §8/§9/§10: compiler-synthesized value-semantics members (ToString,
     // GetHashCode, Equals) on a record/enum receiver. Checked before the
     // ordinary dispatch so a record with no user ToString gets the §9.1 form

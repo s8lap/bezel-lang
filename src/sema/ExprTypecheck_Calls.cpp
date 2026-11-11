@@ -7683,6 +7683,160 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             }
         }
     }
+    // fix #3862 (§10.4 "Methods, properties, static members", v0.293; stdlib
+    // §9.9, v0.293): the OTHER TWO members of the compiler-provided tier —
+    // `E.FromNameOrNull(name: string): E?` and `E.NameOf(value: E): string`.
+    //
+    // §10.4 (v0.357) declares them verbatim:
+    //
+    //   public static method FromUnderlyingOrNull(value: U): E?;
+    //   public static method FromNameOrNull(name: string): E?;
+    //   public static method NameOf(value: E): string;
+    //
+    // and §10.4's "The name pair" paragraph fixes their behaviour: the pair
+    // reads the enum's DECLARED-IDENTIFIER table ("each constant's own
+    // identifier — the bare name as written, never a qualified `E.A`
+    // spelling"); `FromNameOrNull(name)` "returns the declared constant whose
+    // identifier equals `name`, or `null` when there is none; the comparison
+    // is exact — ordinal code-point equality (stdlib §9.6), case-sensitive,
+    // nothing trimmed — and a digit string names no constant"; it "is
+    // **total** — it never raises". `NameOf(value)` "returns the identifier
+    // of the constant `value` denotes; it is total because every value of an
+    // enum type is a declared value (§5.4), and for a written constant
+    // `E.NameOf(E.A) = nameof(E.A)`".
+    //
+    // The declaration-site half of §10.4's sentence ("no user declaration, a
+    // member or a declared constant, may override or overload any of them")
+    // is already enforced by Resolver::checkEnumRestrictions (fix #3862's
+    // narrow slice, `6aab53680`); this arm is the CALL half. Both members
+    // are STATIC, so the receiver must NAME the enum type — the same
+    // `enumTypeNamedBy` gate `FromUnderlyingOrNull` uses (which also admits a
+    // `type` alias of the enum, §27.8 / #4072).
+    if (auto* fma =
+            dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+        if ((fma->member == "FromNameOrNull" || fma->member == "NameOf") &&
+            fma->target) {
+            if (const TypeSymbol* ets = enumTypeNamedBy(*fma->target)) {
+                const std::string ename(ets->name);
+                const bool isFromName = fma->member == "FromNameOrNull";
+                // §10.4's declared parameter names, verbatim: `name` for
+                // `FromNameOrNull`, `value` for `NameOf`.
+                const char* paramName = isFromName ? "name" : "value";
+                const std::string member(fma->member);
+                if (ce.args.size() != 1 || !ce.args[0].value) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        "`" + ename + "." + member +
+                        "` takes exactly one argument — " +
+                        (isFromName
+                             ? "the declared identifier to look up (§10.4)"
+                             : "the enum value to name (§10.4)"));
+                } else {
+                    if (!ce.args[0].name.empty() &&
+                        ce.args[0].name != paramName)
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "`" + ename + "." + member +
+                            "` has one parameter, named `" + paramName +
+                            "` — there is no parameter `" +
+                            std::string(ce.args[0].name) + "` (§10.4)");
+                    // §7 FIRST (the house pattern — fix #7957's order,
+                    // load-bearing): a nullable argument is refused as
+                    // nullable, whatever its type; only a NON-nullable
+                    // argument reaches the type check below. §7.1: "The
+                    // compiler enforces the distinction at every assignment,
+                    // parameter pass, and return" — and both parameters are
+                    // NON-NULLABLE (`string` and `E`), so an un-narrowed
+                    // nullable argument reaches no parameter here. stdlib
+                    // §9.9 states it for `FromNameOrNull` verbatim: "the
+                    // parameter is non-nullable, so a `string?` in hand is
+                    // narrowed first (`s!`, or a null test)"; §10.4's
+                    // `string` / `E` parameter types say the same for
+                    // `NameOf`.
+                    //
+                    // `reportBuiltinArgIfNullable` is the ONE nullability
+                    // gate for a declared non-nullable parameter position
+                    // (§7, and the §7.4 narrowing exemption it reads — a
+                    // §7.4-narrowed read IS its non-nullable type at the
+                    // call); `publishNarrowedBuiltinArg` publishes that
+                    // narrowed read so the codegen extracts the carrier
+                    // payload once (#7621, #7692).
+                    //
+                    // ONE diagnostic per call: when this gate refuses the
+                    // argument, the type check below stands down (the house
+                    // pattern at `builtinNullabilityAlreadyRefused`).
+                    bool skipTypeCheck = false;
+                    {
+                        const std::size_t diagsBefore =
+                            ctx_.diagnostics().diagnostics().size();
+                        reportBuiltinArgIfNullable(
+                            ce.args[0].value.get(),
+                            "argument to `" + ename + "." + member + "`");
+                        skipTypeCheck =
+                            ctx_.diagnostics().diagnostics().size() !=
+                            diagsBefore;
+                        if (!skipTypeCheck)
+                            publishNarrowedBuiltinArg(ce.args[0].value.get());
+                    }
+                    TypeRef* at = ctx_.exprType(*ce.args[0].value);
+                    if (at && at->nullable && !skipTypeCheck) {
+                        // §7.4: "a read of a binding §7.4 has narrowed
+                        // non-null is of its non-nullable type" — so a
+                        // narrowed read is checked against the NON-NULLABLE
+                        // type, and an un-narrowed one (already refused
+                        // above) is not type-checked again.
+                        if (isNarrowedNonNullRead(ce.args[0].value.get()))
+                            at = scrutineeTypeAfterNarrowing(
+                                ce.args[0].value.get(), at);
+                        else
+                            skipTypeCheck = true;
+                    }
+                    if (at && !skipTypeCheck) {
+                        if (isFromName) {
+                            // §10.4: `FromNameOrNull(name: string): E?` —
+                            // the parameter is `string` (NOT `string?`).
+                            checkAssignable(at,
+                                            ctx_.primitiveTypeRef(
+                                                PrimitiveType::String),
+                                            ce.span.begin,
+                                            "argument to `" + ename +
+                                            ".FromNameOrNull`",
+                                            ce.args[0].value.get());
+                        } else {
+                            // §10.4: `NameOf(value: E): string` — the
+                            // parameter is the ENUM TYPE itself, not its
+                            // underlying integer (that is
+                            // `FromUnderlyingOrNull`'s parameter, §10.4's
+                            // "The parameter type is the underlying type `U`
+                            // exactly").
+                            TypeRef* et = ctx_.makeTypeRef();
+                            et->kind = TypeRef::Kind::Named;
+                            et->declaration =
+                                const_cast<TypeSymbol*>(ets);
+                            checkAssignable(at, et, ce.span.begin,
+                                            "argument to `" + ename +
+                                            ".NameOf`",
+                                            ce.args[0].value.get());
+                        }
+                    }
+                }
+                // The result type is stamped on the ERROR path too, so a
+                // downstream `?? E.Low` still types (§10.4's `E?` result for
+                // `FromNameOrNull`; `string` for `NameOf`).
+                TypeRef* rt = nullptr;
+                if (isFromName) {
+                    rt = ctx_.makeTypeRef();
+                    rt->kind = TypeRef::Kind::Named;
+                    rt->declaration = const_cast<TypeSymbol*>(ets);
+                    rt->nullable = true;
+                } else {
+                    rt = ctx_.primitiveTypeRef(PrimitiveType::String);
+                }
+                ctx_.setExprType(&ce, rt);
+                return;
+            }
+        }
+    }
     // stdlib §2.12 (#753): BitConverter.Reinterpret<TTo>(value) well-formedness.
     // The target type (explicit type arg) and the source value must be primitive
     // numeric types of EQUAL bit width; a width mismatch — or a non-numeric type
@@ -45217,6 +45371,25 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // to lower.
         if (targetType->kind == ast::TypeDeclKind::Enum &&
             ma.member == "FromUnderlyingOrNull" &&
+            calleeOfCallCtx_ == &ma)
+            return;
+        // fix #3862 (§10.4, v0.293; stdlib §9.9, v0.293): the OTHER TWO
+        // members of the compiler-provided tier — `E.FromNameOrNull(name:
+        // string): E?` and `E.NameOf(value: E): string` — are compiler-
+        // provided static members too ("no declaration is written, and no
+        // user declaration may override or overload any of them", §10.4), so
+        // they have no MethodSymbol either and the "no member" reject below
+        // would fire before `typeCall` could type the call. Exempt the
+        // access exactly as the `FromUnderlyingOrNull` arm above does:
+        // typeCall stamps the `E?` / `string` result and validates the
+        // argument. The same callee-position gate applies — a BARE
+        // `E.FromNameOrNull` / `E.NameOf` reference is not exempted and
+        // falls through to the ordinary no-member reject (§10.4 declares
+        // the members only as callable statics; the §27.6 method-reference
+        // posture stays inherited/unspecified, and accepting one here
+        // would leave codegen with nothing to lower).
+        if (targetType->kind == ast::TypeDeclKind::Enum &&
+            (ma.member == "FromNameOrNull" || ma.member == "NameOf") &&
             calleeOfCallCtx_ == &ma)
             return;
         if (isResultCombinator) {
