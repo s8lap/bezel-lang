@@ -5,6 +5,8 @@
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 #include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #7299/#7300 shared parse guard)
 
+#include <cerrno>  // ERANGE — stdlib §2.3's 64-bit conversion range failure (fix #8576)
+
 // §4.4 fix #521: decimal compile-time literal parser (defined in bezel_runtime.cpp).
 extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
                                        void* ove_vtable, void* fe_vtable);
@@ -15139,6 +15141,38 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
     if (!ma || !ma->target) return nullptr;
 
+    // stdlib §2.3 (v0.357, fix #8576): the 64-bit CONVERSION's range
+    // failure.
+    //
+    // `long` is strtoll's full width, so the conversion SATURATES at the
+    // 64-bit boundary instead of reporting a failure — and the saturated
+    // value (Int64.MaxValue) is ITSELF in range, so the returned value cannot
+    // tell a saturating conversion from a legal one.  errno can: strtoll
+    // reports the failure as ERANGE.  errno is cleared BEFORE the conversion
+    // (it is only meaningful right after a call that sets it) and read
+    // IMMEDIATELY after it (nothing between the conversion and the read can
+    // set it).
+    //
+    // `endSlot` receives the conversion's end pointer (as strtoll writes it —
+    // the input-grammar check reads it).  The returned boolean is the RANGE
+    // FAILURE: true exactly when the input spells a value the 64-bit width
+    // cannot represent.
+    auto emitI64Convert = [&](llvm::Value* strData, llvm::Value* endSlot,
+                               llvm::Value*& outVal) -> llvm::Value* {
+        auto* strtollFn = declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+        // `errno` is a macro in C; the function it expands to is the portable
+        // way to reach it.  It is a per-thread int.
+        auto* errnoLocFn = declareC("__errno_location", ptrTy(), {});
+        llvm::Value* errnoPtr =
+            builder_.CreateCall(errnoLocFn, {}, "cvt.errno");
+        builder_.CreateStore(builder_.getInt32(0), errnoPtr, "cvt.err0");
+        outVal = builder_.CreateCall(
+            strtollFn, {strData, endSlot, builder_.getInt32(10)}, "cvt.v64");
+        llvm::Value* errCode = builder_.CreateLoad(i32(), errnoPtr, "cvt.err");
+        return builder_.CreateICmpEQ(
+            errCode, llvm::ConstantInt::get(i32(), ERANGE), "cvt.sat");
+    };
+
     // ---------------------------------------------------------------------------
     // stdlib §9.3 / §4.4 fix #521: Decimal instance methods.
     // ---------------------------------------------------------------------------
@@ -16600,14 +16634,25 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // Convert.ToInt64(s: string): long — §2.3 / #1238
             // #1238: replaced atoll (silent 0 on bad input) with strtoll +
             // endptr validation → FormatException on invalid input.
+            //
+            // stdlib §2.3 (v0.357, fix #8576): the RANGE failure too — "the
+            // `To*` methods raise `FormatException` when the string is not a
+            // well-formed representation of the target type and
+            // `ParseRangeException` (§9.1; an `OverflowException`) when the
+            // value does not fit".  `long` is strtoll's full width, so the
+            // conversion SATURATES at the boundary and the saturated value is
+            // ITSELF in range — the failure is visible only in errno
+            // (ERANGE), which the helper reads.  The narrower `ToInt32` arm
+            // range-checks the VALUE against the 32-bit bounds, which is why
+            // it was already right.
             if (m == "ToInt64") {
                 llvm::Value* arg = lowerExpr(*call.args[0].value);
                 if (!arg) return nullptr;
                 llvm::Value* data = loadStringData(arg);
-                auto* strtollC64 = declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
                 auto* endSlotC64 = entryAlloca(ptrTy());
-                llvm::Value* v64C64 = builder_.CreateCall(
-                    strtollC64, {data, endSlotC64, builder_.getInt32(10)}, "cvt64.v");
+                llvm::Value* v64C64 = nullptr;
+                llvm::Value* rangeFailC64 =
+                    emitI64Convert(data, endSlotC64, v64C64);
                 auto* i8C64 = llvm::Type::getInt8Ty(llvm_);
                 llvm::Value* fcC64 = builder_.CreateLoad(i8C64, data, "cvt64.fc");
                 llvm::Value* fcWsC64 = builder_.CreateICmpULE(
@@ -16622,6 +16667,17 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     builder_.CreateAnd(advC64, nulC64), "cvt64.vfmt");
                 emitGuardThrow(builder_.CreateNot(validC64, "cvt64.fmtbad"),
                                "FormatException");
+                // §2.3's range failure: a WELL-FORMED input that spells a
+                // value the type cannot represent raises ParseRangeException —
+                // an OverflowException (stdlib §9.1: "ParseRangeException
+                // derives from OverflowException"; the compiler's builtin
+                // exception set has no ParseRangeException, so the conversion
+                // family raises OverflowException, as the 32-bit arm does).
+                //
+                // The guard sits AFTER the FormatException guard: §2.3's
+                // range failure is for a well-formed representation, so a
+                // malformed input keeps raising FormatException.
+                emitGuardThrow(rangeFailC64, "OverflowException");
                 return v64C64;
             }
             // Convert.ToDouble(s: string): double — §2.3 / #1238
@@ -16918,10 +16974,16 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
             }
-            auto* strtollT64 = declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
             auto* endSlotT64 = entryAlloca(ptrTy());
-            llvm::Value* val64_t = builder_.CreateCall(
-                strtollT64, {strData, endSlotT64, builder_.getInt32(10)}, "tryc64.val");
+            llvm::Value* val64_t = nullptr;
+            // stdlib §2.3 (v0.357, fix #8576): the 64-bit CONVERSION's range
+            // failure — `Try` forms return false in exactly the cases the
+            // throwing forms would raise (§2.3), so `TryToInt64` returns
+            // false where `ToInt64` raises the range failure.  The saturated
+            // value is ITSELF in range, so the failure is visible only in
+            // errno (ERANGE), which the helper reads.
+            llvm::Value* rangeFailT64 =
+                emitI64Convert(strData, endSlotT64, val64_t);
             llvm::Value* endPtr64 = builder_.CreateLoad(ptrTy(), endSlotT64, "tryc64.ep");
             auto* i8t64 = llvm::Type::getInt8Ty(llvm_);
             llvm::Value* fc64 = builder_.CreateLoad(i8t64, strData, "tryc64.fc");
@@ -16934,6 +16996,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* ok64 = builder_.CreateAnd(
                 builder_.CreateNot(fcWs64),
                 builder_.CreateAnd(adv64, atNul64), "tryc64.ok");
+            ok64 = builder_.CreateAnd(
+                ok64, builder_.CreateNot(rangeFailT64), "tryc64.okR");
             llvm::Value* sel64 = builder_.CreateSelect(
                 ok64, val64_t, builder_.getInt64(0), "tryc64.sel");
             builder_.CreateStore(sel64, outAddr64);
