@@ -23,6 +23,7 @@
 #include "support/asan_infra_failure.hpp"  // asanInfraFailures() (#4563)
 #include "support/aot_support.hpp"
 #include "support/force_sanitize.hpp"
+#include "support/results_cache.hpp"
 #include "support/scratch_dir.hpp"
 #include "test_harness.hpp"
 
@@ -62,6 +63,18 @@
 //                                 per-shard partitions have no overlap and no
 //                                 gap (concatenate every binary's enumeration
 //                                 and compare against the whole registry).
+//   BEZEL_RESULTS_CACHE_KEYS=<path> — consult the content-keyed RESULTS cache
+//                                 (tests/support/results_cache.hpp): serve a
+//                                 recorded PASS instead of re-running a test
+//                                 whose inputs are byte-identical, and record
+//                                 new passes. Only scripts/agent_check.sh
+//                                 writes a key file; BEZEL_RESULTS_CACHE=0 (set
+//                                 by every gate script and run_parallel.sh)
+//                                 turns it off regardless. Unset → behaviour
+//                                 is byte-identical to before.
+//   BEZEL_RESULTS_CACHE_DESCRIBE=1 — print this binary's cache identity (its
+//                                 schema, its stat id and the absolute build
+//                                 paths it embeds) and exit, running nothing.
 //   BEZEL_SHARD_SUMMARY=<path>  — ALSO write a structured JSON shard summary to
 //                                 <path> (#3012 Phase 2a; additive, off by
 //                                 default). The legacy summary line above is
@@ -271,6 +284,27 @@ static void holdTestToken() {
 }
 
 int main(int argc, char** argv) {
+    // ── Results-cache identity probe (tests/support/results_cache.hpp) ──
+    // scripts/results_cache.sh asks the binary which artefacts it embeds the
+    // paths of, so the key it computes hashes exactly the files this binary
+    // will use. It sets BEZEL_TEST_ENUMERATE=1 and a filter that matches
+    // nothing as well, so a binary that predates this probe prints nothing and
+    // runs nothing (and the cache stays off for it).
+    if (const char* d = std::getenv("BEZEL_RESULTS_CACHE_DESCRIBE");
+        d && *d && std::string(d) != "0") {
+        namespace bp = ::bezel::test::build_paths;
+        std::cout << "schema=" << ::bezel::test::results_cache::kSchema << "\n"
+                  << "exe_stat="
+                  << ::bezel::test::results_cache::statId("/proc/self/exe")
+                  << "\n"
+                  << "repo_root=" << bp::kRepoRootDir << "\n"
+                  << "bezelc=" << bp::kBezelcPath << "\n"
+                  << "runtime_lib=" << bp::kRuntimeLibPath << "\n"
+                  << "core_lib=" << bp::kCoreLibPath << "\n"
+                  << "runtime_src=" << bp::kRuntimeSrcDir << "\n";
+        return 0;
+    }
+
     // ── Point TMPDIR at the disk-backed scratch base, before any test runs ──
     // 247 test TUs place their temp files with std::filesystem::temp_directory_path(),
     // which is TMPDIR-or-/tmp — and /tmp here is a 16 GB tmpfs (RAM) with a
@@ -340,6 +374,30 @@ int main(int argc, char** argv) {
     if (shardIndex < 0 || shardIndex >= shardCount) shardIndex = 0;
     const bool sharded = shardCount > 1;
 
+    // Inert (and silent) unless a key file is given; see results_cache.hpp.
+    ::bezel::test::results_cache::Cache rcache;
+    if (!enumerateOnly)
+        rcache.configure(std::getenv("BEZEL_RESULTS_CACHE_KEYS"),
+                         std::getenv("BEZEL_RESULTS_CACHE"),
+                         std::getenv("BEZEL_RESULTS_CACHE_DIR"),
+                         "/proc/self/exe", environ,
+                         ::bezel::test::forceSanitizeAddress());
+    // Every loudness counter a PASS must leave untouched to be recorded: a
+    // pass that skipped its sanitizer leg, hit an [ INFRA ] failure, a timeout
+    // or a fork failure, or printed a [ LEAK ] marker is not a clean verdict
+    // and must re-run (and re-print) every time.
+    auto loudness = [] {
+        return ::bezel::test::results_cache::Counters{
+            ::bezel::native_test::nativeSanitizerUnavailableSkips().load(),
+            ::bezel::test::asanInfraFailures().load(),
+            ::bezel::test::checkedToolchainSkips().load(),
+            ::bezel::test::aot_detail::infraFailureCount().load(),
+            ::bezel::test::aot_detail::timeoutFailureCount().load(),
+            ::bezel::test::aot_detail::forkFailureCount().load(),
+            ::bezel::test::aotLeakDetections().load(),
+            0};
+    };
+
     std::size_t passed = 0;
     std::size_t failed = 0;
     std::size_t skipped = 0;
@@ -373,6 +431,22 @@ int main(int argc, char** argv) {
         if (enumerateOnly) {
             std::cout << test.suite << "." << test.name << "\n";
             continue;
+        }
+
+        const std::string full = test.suite + "." + test.name;
+        // A recorded PASS under an identical key: serve it, run nothing. The
+        // RUN/OK pair is printed exactly as for an executed pass (so every
+        // reader's per-test accounting is unchanged), with a [ CACHED ] line
+        // between them naming the record.
+        if (rcache.active()) {
+            std::string info;
+            if (rcache.tryServe(full, info)) {
+                std::cout << "[ RUN  ] " << full << "\n"
+                          << "[ CACHED ] " << full << " (" << info << ")\n"
+                          << "[  OK  ] " << full << "\n";
+                ++passed;
+                continue;
+            }
         }
 
         // One token for this process's lifetime, taken before the first test
@@ -418,8 +492,38 @@ int main(int argc, char** argv) {
                          test.suite.c_str(), test.name.c_str());
             std::fflush(stderr);
         }
-        test.body();
+        // Results cache: tee the body's std::cout/std::cerr into the record
+        // (the streams' own buffering is untouched) and time it.
+        const auto loud0 = loudness();
+        const auto tBody = std::chrono::steady_clock::now();
+        std::string captured;
+        ::bezel::test::results_cache::TeeBuf teeOut(std::cout.rdbuf(), captured);
+        ::bezel::test::results_cache::TeeBuf teeErr(std::cerr.rdbuf(), captured);
+        auto& aotStats = ::bezel::test::aot_detail::cacheStats();
+        const std::uint64_t aotHit0 = aotStats.hits.load(), aotMiss0 = aotStats.misses.load(),
+                            aotObj0 = aotStats.objHits.load();
+        {
+            // Restores the streams even if the body throws.
+            struct StreamRestore {
+                std::streambuf* out = std::cout.rdbuf();
+                std::streambuf* err = std::cerr.rdbuf();
+                ~StreamRestore() { std::cout.rdbuf(out); std::cerr.rdbuf(err); }
+            } restore;
+            if (rcache.active()) {
+                std::cout.rdbuf(&teeOut);
+                std::cerr.rdbuf(&teeErr);
+            }
+            test.body();
+        }
         const bool testFailed = ::bezel::test::currentTestFailed();
+        rcache.record(full, testFailed, loudness() == loud0,
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - tBody).count(),
+                      captured,
+                      "aot_hits=" + std::to_string(aotStats.hits.load() - aotHit0) +
+                          "\naot_misses=" + std::to_string(aotStats.misses.load() - aotMiss0) +
+                          "\naot_obj_hits=" + std::to_string(aotStats.objHits.load() - aotObj0) +
+                          "\n");
         if (sanScope) {
             std::fprintf(stderr, "[san-scope] leave %s.%s %s\n",
                          test.suite.c_str(), test.name.c_str(),
@@ -460,6 +564,12 @@ int main(int argc, char** argv) {
     if (sharded)
         std::cout << " (shard " << shardIndex << "/" << shardCount << ")";
     std::cout << ", " << ::bezel::test::registry().size() << " total\n";
+
+    // The results-cache tally: only when a key file was given, so a run
+    // without one (the gate, run_parallel.sh, a hand run) is byte-identical.
+    // A separate line, like its neighbours, so the legacy summary regex is
+    // untouched; scripts/agent_check.sh sums it across shards.
+    if (rcache.requested()) std::cout << rcache.summaryLine();
 
     // fix #3626: loud, not silent. Every one of the ~122 test files that need
     // the native ASan/TSan runtime object funnels through
