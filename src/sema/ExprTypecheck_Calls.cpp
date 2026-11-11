@@ -47948,10 +47948,10 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         // `Remove` on the heads that DECLARE it — the same refusal the `.`
         // spelling gets.
         //
-        // stdlib §4.1 declares `method Remove(item: T): bool;` on
-        // `ICollection<T>`; stdlib §4.2 declares `method Remove(item: T):
-        // bool;` on `IOwningCollection<T>` (which disposes the removed
-        // element), and `IOwningList<T>` inherits it. The `.` spelling of
+        // On `ICollection<T>`, stdlib §4.1 declares `method Remove(item:
+        // T): bool;`. The owning pair redeclares it: `IOwningCollection<T>`
+        // (which disposes the removed element) carries the same `Remove`
+        // per stdlib §4.2, and `IOwningList<T>` inherits it. The `.` spelling of
         // that call through those heads is REFUSED by codegen's #853 fence
         // (the polymorphic collection interfaces erase the concrete backing:
         // array / linked-list / hash-table, so no single runtime dispatch is

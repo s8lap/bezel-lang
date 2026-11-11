@@ -144,7 +144,7 @@ BEZEL_TEST(null_cond_collection_iface_mutators_8583,
         fenceNeedle("Clear")));
 }
 
-// stdlib §4.1 / §7.5: and for `?.Remove(8)`. `Remove` returns `bool`, so the
+// §7.5: and for `?.Remove(8)`. `Remove` returns `bool`, so the
 // `?.` access is typed `bool?` in sema and the `?.` lowering reaches the
 // fence through its own synthetic `.` node — the same route the `?.Contains`
 // spelling takes since #7557.
