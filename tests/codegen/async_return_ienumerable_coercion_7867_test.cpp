@@ -4,9 +4,9 @@
 // result of type T", and its `return expression;` completes the task with that
 // result. For `Task<IEnumerable<T>>` the result is an `IEnumerable<T>`, the
 // type §29.2 (v0.357) desugars a `for` over as
-// `using var __enumerator := __source.GetEnumerator();`. stdlib §5 (v0.357)
-// declares `Where(predicate: (T) -> bool): IEnumerable<T>`, so
-// `return s.Where(f);` in such a method is a well-typed result.
+// `using var __enumerator := __source.GetEnumerator();`.
+// stdlib §5 (v0.357) declares `Where(predicate: (T) -> bool): IEnumerable<T>`,
+// so `return s.Where(f);` in such a method is a well-typed result.
 //
 // THE DEFECT. The sync `return` edge converts the returned value to the
 // declared `IEnumerable<T>` representation (a lazy LINQ pipeline is drained
@@ -27,6 +27,35 @@
 // The same edge carried every other source family: an `Array`, `Stack` or
 // `Set` the body built, an `Array` parameter, a lazy pipeline over one — all
 // SEGV on the base, all clean in the non-async twin.
+//
+// THE RESULT STAYS LAZY (fix-forward #7867). stdlib §5 (v0.357): the query
+// operators "are lazy unless documented otherwise", and a callback passed to
+// a lazy operator is "retained by the returned query value until
+// enumeration". So the value the task completes with is the UN-RUN query: the
+// predicate first runs when the awaiter enumerates, never runs if it does
+// not, an exception it throws surfaces at the enumeration and not at the
+// `await`, and a second enumeration of the result raises
+// InvalidOperationException (§29.11, v0.357). The first cut of this fix
+// drained the pipeline at the `return`, which ran every callback before the
+// task completed; the `lazy_*` rows below pin the deferred behaviour, each
+// looped 200 times under generated-code ASan. The rows that say what the
+// eager drain printed are red on that first cut; all but the never-enumerated
+// one are red on the base (SEGV — the base never ran that row's predicate
+// either, it leaked the raw handle instead). The
+// `lazy_result_consumed_in_await_expression_*` row is the strict-oracle
+// (LeakSanitizer) leg: red on the base, green on the first cut.
+//
+// THE ONE CASE THAT IS STILL MATERIALIZED. §28.3 (v0.357), "Returning a
+// deferred-activation frame": every borrow a returned frame carries must be
+// "sourced from the method's own parameters or receiver"; one that reaches a
+// scope-bound local is to be materialized instead. Where the returned
+// pipeline reaches a local of the returning activation that the ownership
+// checker did not reject (#8565) — a typed collection-literal local as the
+// source, an owned local captured by the callback — or an `owned` parameter, the edge
+// keeps the eager drain: MEASURED, deferring those is a heap-use-after-free
+// (or, for the captured local, silently enumerates nothing). The
+// `materialized_*` rows pin them under the strict oracle. The same fallback
+// covers a pipeline first bound to a local (`var q := ...; return q;`).
 //
 // THE ORACLE. Every row is `runAotChecked` (generated-code ASan + LSan) unless
 // it says otherwise, loops 200 times, and reads its counts off stdout (exit
@@ -210,6 +239,61 @@ public class Program
 end Program;
 )";
 
+// The laziness rows. `Tr.Pred` counts predicate runs and `Tr.Bad` counts
+// ordering violations the body observes; `AW` drops 'x', `AT` throws on 'b',
+// `AX` filters an Array parameter with a predicate that captures a scalar
+// local. `Count2` enumerates its parameter twice. Prints
+// "<t> <Tr.Pred> <Tr.Bad>".
+std::string lazyProgram(const std::string& members, const std::string& body) {
+    return std::string(R"(
+module M;
+public class Tr
+  public static Pred: int := 0;
+  public static Bad: int := 0;
+end Tr;
+public class Program
+  public static async method AW(s: string): Task<IEnumerable<char>> return s.Where(lambda(c) => do Tr.Pred := Tr.Pred + 1; return c <> 'x'; end); end AW;
+  public static async method AT(s: string): Task<IEnumerable<char>> return s.Where(lambda(c) => do Tr.Pred := Tr.Pred + 1; if c = 'b' then throw new InvalidOperationException("boom"); end; return true; end); end AT;
+  public static async method AX(s: string, xs: Array<int>): Task<IEnumerable<int>> var k := s.Length; return xs.Where(lambda(x) => do Tr.Pred := Tr.Pred + 1; return x + k > 0; end); end AX;
+  public static method Count2(e: IEnumerable<char>): int
+    var n := 0;
+    for var c in e do n := n + 1; end;
+    for var c in e do n := n + 1; end;
+    return n;
+  end Count2;
+)") + members + R"(
+  public static async method Main(): Task<int>
+    var t := 0;
+    var loc := "local-" + t.ToString() + "-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+    var shared: Array<int> := [1, 2, 3];
+    for var i in 0..<200 do
+      )" + body + R"(
+    end;
+    Console.WriteLine($"{t} {Tr.Pred} {Tr.Bad}");
+    return 0;
+  end Main;
+end Program;
+)";
+}
+
+void expectLazyStrict(const std::string& members, const std::string& body,
+                      const std::string& expected) {
+    bezel::test::JitResult r = runAotChecked(lazyProgram(members, body));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, expected);
+}
+
+// LeakSanitizer off, generated-code ASan on: the result is BOUND, or handed to
+// a callee as an argument, and has no owner either way (#8528).
+void expectLazyLenient(const std::string& members, const std::string& body,
+                       const std::string& expected) {
+    bezel::test::JitResult r = runAotCheckedLenient(lazyProgram(members, body));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, expected);
+}
+
 }  // namespace
 
 // fix #7867 (§29.2, §30.1, v0.357): the issue's repro. Base: ASan SEGV, no
@@ -298,8 +382,9 @@ BEZEL_TEST(async_return_ienumerable_coercion_7867,
 
 // The result awaited and NEVER enumerated. This row is green on the base too
 // (the base printed the same and leaked the raw pipeline: 1400 allocations
-// over the 200 iterations; the drained result is 600), so it is a control for
-// the mirror, not a pin of the fix. LeakSanitizer off (#8528).
+// over the 200 iterations), so it is a control for the mirror, not a pin of
+// the fix. That no predicate runs here is pinned by
+// `lazy_never_enumerated_runs_no_predicate_*` below. LeakSanitizer off (#8528).
 BEZEL_TEST(async_return_ienumerable_coercion_7867,
            bound_result_never_enumerated_control_spec_30_1) {
     expectBoundLenient(kMembers, "var it := await AW(Make.MkH(i).S); t := t + 1;",
@@ -333,7 +418,7 @@ BEZEL_TEST(async_return_ienumerable_coercion_7867,
 }
 
 // A capturing predicate, a two-stage pipeline, and a pipeline bound to a local
-// first.
+// first (that last one is materialized at the return: see the file header).
 BEZEL_TEST(async_return_ienumerable_coercion_7867,
            capturing_chained_and_local_pipelines_spec_29_2_30_1) {
     expectShape("var k := s.Length; return s.Where(lambda(c) => k > 0 and c <> 'x'); end AW;",
@@ -391,6 +476,122 @@ BEZEL_TEST(async_return_ienumerable_coercion_7867,
                  "9690 200\n");
     expectFamily("return xs;", "1200 200\n");
     expectFamily("return xs.Where(lambda(x) => x > 0);", "1200 200\n");
+}
+
+// fix-forward #7867 (stdlib §5, v0.357): "All are lazy unless documented
+// otherwise" — the predicate's side effects are DEFERRED to the enumeration.
+// Nothing has run when the `await` completes (`Tr.Pred` still equals `t`), and
+// during the `for` the predicate has run exactly once per item delivered so
+// far (`pred a, item a, pred b, item b`). 200 x 46 characters, no violation.
+// The eager drain ran all 46 predicates before the `await` completed: Bad was
+// 9200. LeakSanitizer off (#8528).
+BEZEL_TEST(async_return_ienumerable_coercion_7867,
+           lazy_predicate_runs_at_enumeration_not_at_return_stdlib_5) {
+    expectLazyLenient("",
+                      "var it := await AW(loc); "
+                      "if Tr.Pred <> t then Tr.Bad := Tr.Bad + 1; end; "
+                      "for var c in it do t := t + 1; "
+                      "if Tr.Pred <> t then Tr.Bad := Tr.Bad + 1; end; end;",
+                      "9200 9200 0\n");
+    // The same over an Array parameter, with a predicate capturing a scalar
+    // local of the returning activation (200 x 3).
+    expectLazyLenient("",
+                      "var it := await AX(loc, shared); "
+                      "if Tr.Pred <> t then Tr.Bad := Tr.Bad + 1; end; "
+                      "for var x in it do t := t + 1; "
+                      "if Tr.Pred <> t then Tr.Bad := Tr.Bad + 1; end; end;",
+                      "600 600 0\n");
+}
+
+// The deferred result under the STRICT oracle (ASan + LSan): consumed in the
+// await's own expression, the frame, its closure and the wrapper are all
+// reclaimed.
+BEZEL_TEST(async_return_ienumerable_coercion_7867,
+           lazy_result_consumed_in_await_expression_is_reclaimed_stdlib_5) {
+    expectLazyStrict("", "t := t + (await AW(loc)).Count();", "9200 9200 0\n");
+    expectLazyStrict("", "var arr := (await AW(loc)).ToArray(); t := t + arr.Count;",
+                     "9200 9200 0\n");
+    expectLazyStrict("", "t := t + (await AX(loc, shared)).Count();", "600 600 0\n");
+}
+
+// stdlib §5 (v0.357): the callback is "retained by the returned query value
+// until enumeration" — a result that is never enumerated runs NO predicate.
+// The eager drain ran 200 x 46 = 9200 of them. LeakSanitizer off (#8528).
+BEZEL_TEST(async_return_ienumerable_coercion_7867,
+           lazy_never_enumerated_runs_no_predicate_stdlib_5) {
+    expectLazyLenient("", "var it := await AW(loc); t := t + 1;", "200 0 0\n");
+}
+
+// An exception the predicate throws is raised AT THE ENUMERATION, not at the
+// `await`: the `await` completes (`stage = 1`), the first item is delivered
+// (`n = 1`), and the throw on 'b' surfaces from the `for`. Two predicate runs
+// per iteration. The eager drain faulted the task instead (`stage = 0`), so
+// every iteration counted a violation. LeakSanitizer off (#8528).
+BEZEL_TEST(async_return_ienumerable_coercion_7867,
+           lazy_predicate_exception_is_raised_at_enumeration_stdlib_5) {
+    expectLazyLenient("",
+                      "var stage := 0; var n := 0; "
+                      "try var it := await AT(\"ab\"); stage := 1; "
+                      "for var c in it do n := n + 1; end; "
+                      "catch InvalidOperationException => do "
+                      "if stage = 1 and n = 1 then t := t + 1; "
+                      "else Tr.Bad := Tr.Bad + 1; end; end; end;",
+                      "200 400 0\n");
+}
+
+// §29.11 (v0.357): a lazy query carries ONE enumeration right; a second
+// enumeration raises InvalidOperationException. A callee that walks its
+// `IEnumerable<char>` parameter twice (the first walk runs the 46 predicates,
+// the second raises), and the bound result walked twice by the awaiter (the
+// first `for` counts 46, the second raises before its body runs). The eager
+// drain handed out a re-enumerable snapshot: no raise, `t` in the millions.
+// LeakSanitizer off (#8528).
+BEZEL_TEST(async_return_ienumerable_coercion_7867,
+           lazy_result_second_enumeration_raises_spec_29_11) {
+    expectLazyLenient("",
+                      "try t := t + 1000 * Program.Count2(await AW(loc)); "
+                      "catch InvalidOperationException => t := t + 1; end;",
+                      "200 9200 0\n");
+    expectLazyLenient("",
+                      "var it := await AW(loc); var n := 0; "
+                      "for var c in it do n := n + 1; end; "
+                      "try for var c in it do n := n + 1000; end; t := t + 100000; "
+                      "catch InvalidOperationException => do "
+                      "if n = 46 then t := t + 1; else Tr.Bad := Tr.Bad + 1; end; end; end;",
+                      "200 9200 0\n");
+}
+
+// §28.3 (v0.357), "Returning a deferred-activation frame": a frame that
+// reaches storage the returning activation releases is materialized, not
+// deferred. The ownership checker admits these three, so the return edge has
+// to decide: a typed collection-literal local as the source (2 + 3 = 5 per
+// iteration), an owned local captured by the predicate (`a` holds 1: 1 per
+// iteration), and an `owned` parameter (5 per iteration). STRICT oracle.
+// MEASURED with the pipeline deferred unconditionally: heap-use-after-free,
+// "0" (the captured local is gone when the predicate finally runs), and
+// heap-use-after-free.
+BEZEL_TEST(async_return_ienumerable_coercion_7867,
+           materialized_when_the_frame_reaches_activation_owned_storage_spec_28_3) {
+    const std::string af =
+        "  public static async method AF(s: string, xs: Array<int>): "
+        "Task<IEnumerable<int>> ";
+    expectLazyStrict(af + "var a: Array<int> := [1, 2, 3]; "
+                          "return a.Where(lambda(x) => x > 1); end AF;\n",
+                     "t := t + (await AF(loc, shared)).Sum();", "1000 0 0\n");
+    expectLazyStrict(af + "var a := new Array<int>(); a.Add(1); "
+                          "return xs.Where(lambda(x) => a.Contains(x)); end AF;\n",
+                     "t := t + (await AF(loc, shared)).Sum();", "200 0 0\n");
+    expectLazyStrict(
+        "  public static method Mk(): owned Array<int> var a := new Array<int>(); "
+        "a.Add(1); a.Add(2); a.Add(3); return a; end Mk;\n"
+        "  public static async method AO(owned xs: Array<int>): "
+        "Task<IEnumerable<int>> return xs.Where(lambda(x) => x > 1); end AO;\n",
+        "t := t + (await AO(Program.Mk())).Sum();", "1000 0 0\n");
+    // The literal-local source with the result BOUND (LeakSanitizer off, #8528).
+    expectLazyLenient(af + "var a: Array<int> := [1, 2, 3]; "
+                           "return a.Where(lambda(x) => x > 1); end AF;\n",
+                      "var it := await AF(loc, shared); for var x in it do t := t + x; end;",
+                      "1000 0 0\n");
 }
 
 // THE CONTROL: the non-async twin. The sync `return` edge has always performed

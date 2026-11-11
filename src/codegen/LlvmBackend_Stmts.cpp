@@ -1,8 +1,89 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "common/AwaitScan.hpp"  // #7867: forEachSyncSubExpr — the returned-frame provenance walk (§28.3)
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 #include "sema/Sendability.hpp"  // #5305: isAggregateChannelElement — §30.14 aggregate channel element
 
 namespace bezel::codegen {
+
+// fix-forward #7867 (stdlib §5, §28.3, §29.11, v0.357): may the lazy pipeline an
+// async `return` completes its task with stay DEFERRED, or must the return edge
+// materialize it?
+//
+// stdlib §5: the query operators "are lazy unless documented otherwise", and a
+// callback is "retained by the returned query value until enumeration" — so
+// the value an async `return s.Where(f);` completes its task with is the
+// un-run frame, and `f` first runs when the awaiter enumerates. That frame
+// outlives the returning activation, which is exactly the case §28.3
+// ("Returning a deferred-activation frame") rules on: every borrow a returned
+// frame carries must be "sourced from the method's own parameters or
+// receiver", and one carrying a borrow of "a scope-bound local, a `using
+// var`, a temporary" is to be materialized instead (as is a capture-set
+// contribution reaching one). The ownership checker enforces that for most
+// shapes but not all of them (#8565) — MEASURED on the lane base, a frame over a
+// typed collection-literal local, a callback capturing an owned local, and a
+// frame over an `owned` parameter all reach codegen — and for those a deferred
+// frame reads storage the activation's own scope exit has already released
+// (heap-use-after-free under ASan; one shape silently enumerates nothing).
+//
+// So the answer is computed here, on the returned expression, and it is
+// FAIL-CLOSED: true only when everything the frame can reach is provably not
+// owned by this activation. Walked: every sub-expression of `e` (lambda bodies
+// excluded, their CAPTURE SETS included through `capturesOf`). Refused:
+//   * an `await` inside the expression (its result is a temporary of this
+//     activation);
+//   * a parameter that is not a plain borrowed one (an `owned` parameter is
+//     released at this activation's exit; `ref`/`out` alias a caller slot);
+//   * a local, unless its type is a scalar primitive — a collection, string,
+//     closure or lazy-frame local is scope-bound storage. (A captured scalar
+//     lives in the closure's own cell.)
+// Anything else an identifier can name — a field, a type, a method group, the
+// receiver — is not this activation's to release. A `false` answer costs
+// laziness, never safety: the caller falls back to the eager drain, which is
+// what §28.3 prescribes for a frame that cannot leave the scope.
+static bool asyncReturnedLazyFrameMayStayDeferred(
+    const sema::SemaContext& ctx, const ast::Expr* e,
+    const std::function<void(const ast::LambdaExpr&,
+                             std::unordered_set<const sema::Symbol*>&)>&
+        capturesOf) {
+    if (!e) return false;
+    auto symbolOutlivesActivation = [](const sema::Symbol* s) {
+        if (!s) return true;
+        if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(s))
+            return ps->modifier.empty();
+        if (auto* ls = dynamic_cast<const sema::LocalSymbol*>(s)) {
+            using P = sema::PrimitiveType;
+            if (!ls->declType ||
+                ls->declType->kind != sema::TypeRef::Kind::Primitive)
+                return false;
+            switch (ls->declType->primitive) {
+            case P::Bool: case P::Char:
+            case P::Byte: case P::SByte: case P::Short: case P::UShort:
+            case P::Int: case P::UInt: case P::Long: case P::ULong:
+            case P::Float: case P::Double:
+                return true;
+            default:  // string, decimal, Object: not a plain scalar
+                return false;
+            }
+        }
+        return true;
+    };
+    bool deferrable = true;
+    common::forEachSyncSubExpr(e, [&](const ast::Expr& n) {
+        if (!deferrable) return;
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&n)) {
+            if (ue->op == "await") deferrable = false;
+        } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&n)) {
+            if (!symbolOutlivesActivation(ctx.exprSymbol(*id)))
+                deferrable = false;
+        } else if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&n)) {
+            std::unordered_set<const sema::Symbol*> caps;
+            capturesOf(*lam, caps);
+            for (const sema::Symbol* s : caps)
+                if (!symbolOutlivesActivation(s)) deferrable = false;
+        }
+    });
+    return deferrable;
+}
 
 // fix #2858 (§17.6 / §12.1 / §12.3 / §11.2, v0.240): `P++` / `P--` on a
 // VIRTUAL, OVERRIDE, ABSTRACT or INTERFACE property.
@@ -3615,11 +3696,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // `bz_lazy_t*` pipeline handle, whose 4-slot vtable has no
             // slot 4 — MEASURED on the base: the awaiter's `for` loaded slot
             // 4 of the handle and called it (SEGV, pc=0x2), whatever the
-            // argument was. Same call, same flags as the sync edge: a lazy
-            // pipeline is drained into an OWNING enumerator
-            // (`ownLazyPipeline`), a collection the body owns is handed to
-            // the wrapper. Done before the finally split below, so a return
-            // routed through a `finally` stashes the coerced value too.
+            // argument was. A collection the body owns is handed to the
+            // wrapper, as on the sync edge. Done before the finally split
+            // below, so a return routed through a `finally` stashes the
+            // coerced value too.
+            //
+            // fix-forward #7867 (stdlib §5, §29.11, §28.3, v0.357): a LAZY
+            // pipeline is NOT drained here. stdlib §5 makes the operators
+            // lazy and has the callback "retained by the returned query
+            // value until enumeration", so the task completes with the
+            // un-run frame inside the single-use owning wrapper
+            // (`lazyArgDeferred`, #5612): the predicate first runs when the
+            // awaiter enumerates, never if it does not, and a second
+            // enumeration raises InvalidOperationException (§29.11). The
+            // one exception is a frame that reaches storage this activation
+            // releases (asyncReturnedLazyFrameMayStayDeferred above):
+            // §28.3 has that one materialized, so it keeps the eager drain.
             //
             // The key is `asyncResultSemaType_` (the task's T), not the
             // declared `Task<...>` node the sync arm reads. The
@@ -3637,7 +3729,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     /*ownLazyPipeline=*/true,
                     /*outWrapMade=*/nullptr,
                     /*srcOwnedByCallee=*/
-                    returnSourceIsCalleeOwnedCollection(rs->value.get()));
+                    returnSourceIsCalleeOwnedCollection(rs->value.get()),
+                    /*lazyArgDeferred=*/
+                    asyncReturnedLazyFrameMayStayDeferred(
+                        ctx_, rs->value.get(),
+                        [this](const ast::LambdaExpr& lam,
+                               std::unordered_set<const sema::Symbol*>& out) {
+                            collectCapturedSyms(lam, out);
+                        }));
             // #776 / §30.5: when the async result is a bare local `Task`/`Task<T>`
             // being TRANSFERRED out (e.g. `return t;` in a `Task<Task<T>>` method),
             // null its slot before scope-end disposal. `v` already holds the task
