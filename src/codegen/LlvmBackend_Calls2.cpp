@@ -1686,6 +1686,49 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return okDec;
     }
 
+    // stdlib §9.3 / §1 *OrNull tier (v0.357, fix #7318):
+    // `decimal.ParseOrNull(s: string): decimal?` — the *OrNull convenience
+    // form of `decimal.Parse(s)`: null exactly where `Parse(s)` raises (the
+    // FormatException of the §9.3 input grammar and the ParseRangeException
+    // of the range paragraph), and the parsed value otherwise.
+    //
+    // The parse is the SAME runtime entry the Try form uses
+    // (`bz_decimal_try_parse`, which swallows the parser's FormatException /
+    // OverflowException into its 0 return — §9.3's "TryParse returns false in
+    // every case where Parse would raise"), so the two forms agree on every
+    // input by construction.
+    //
+    // The operand is a `string` and NOTHING else: §9.3 declares no span form
+    // of `ParseOrNull` (only `Parse`/`TryParse` carry the span overload).
+    if (pt == P::Decimal && m == "ParseOrNull" && call.args.size() == 1 &&
+        call.args[0].value) {
+        llvm::Value* strVal = lowerExpr(*call.args[0].value);
+        if (!strVal) return nullptr;
+        if (!isParseableOperand(*call.args[0].value, strVal, false))
+            return nullptr;
+        auto win = parseWindow(strVal);
+        auto* fn = declareC("bz_decimal_try_parse", i32(), {ptrTy(), ptrTy()});
+        // The runtime writes the parsed decimal through the pointer it is
+        // given (the Try form's out slot); a scratch slot plays that role
+        // here, and the value it holds becomes the *OrNull tier's present arm.
+        llvm::AllocaInst* slot = entryAlloca(decimalStructType());
+        llvm::Value* r = builder_.CreateCall(fn, {win.str, slot}, "decpon.r");
+        llvm::Value* ok = builder_.CreateICmpNE(
+            r, builder_.getInt32(0), "decpon.ok");
+        llvm::Value* dv = builder_.CreateLoad(
+            decimalStructType(), slot, "decpon.v");
+        // The nullable primitive companion struct {i8 hasVal, decimal value}
+        // (stdlib §17.11 / §9.3): the null arm is {0, 0} and the present arm
+        // is {1, the parsed decimal}.
+        llvm::StructType* st = nullablePrimStructTy(P::Decimal);
+        llvm::Value* nullV = llvm::ConstantAggregateZero::get(st);
+        llvm::Value* wrapV = wrapNullablePrim(P::Decimal, dv);
+        llvm::Value* res = builder_.CreateSelect(ok, wrapV, nullV, "decpon.sel");
+        // #5296: drop the window materialization (see the integer arm).
+        if (win.owned) emitStringRelease(win.owned);
+        return res;
+    }
+
     // §8.1 / §8.4 / §8.6 (#1119; updated v0.182 / #1579): Object.ReferenceEquals
     // (a, b): bool — compares object identity by boxing composition (§8.6).
     // Classes / interfaces / Object? / a `null` literal all lower to a raw
@@ -2321,36 +2364,27 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     // parse value (e.g. 1.5 for "1.5abc"). Per §9.2: "TryParse returns false
     // in every case where Parse would raise"; the out param gets default(T)
     // = 0.0 (stdlib §1 shape (c) and spec §17.11).
-    if (m == "TryParse" && call.args.size() == 2 &&
-        call.args[0].value && (call.args[1].value || call.args[1].isDiscard) &&
-        (pt == P::Double || pt == P::Float)) {
-        llvm::Value* strVal = lowerExpr(*call.args[0].value);
-        if (!strVal) return nullptr;
-        // fix #7293 (stdlib §9.2, v0.344): the declared operand is a `string`
-        // (or the span overload's `ReadOnlyStringSpan`). This arm used to
-        // lower whatever it was handed into a string operand, so
-        // `double.TryParse(1.5, out d)` emitted
-        //   %str.data = load ptr, double 1.500000e+00, align 8
-        // — malformed IR, and the compiler ABORTED with "IR verification
-        // failed (malformed IR emitted)". A class instance (a pointer, like a
-        // `string`) was read as TEXT out of the object's own bytes. A
-        // non-parseable operand is DROPPED, the way the integer tower's
-        // `TryParse` arm drops one.
-        if (!isParseableOperand(*call.args[0].value, strVal, true)) return nullptr;
-        // #5296 / stdlib §9.2 (v0.313, #1810): the span overload — see the
-        // integer tower arm above for the full rationale.
-        auto win = parseWindow(strVal);
-        llvm::Value* strData = win.data;
-        // fix #2938 / §22.3: see char.TryParse above.
-        llvm::Type* et = nullptr;
-        std::vector<AccessorRefArg> outArgs;
-        llvm::Value* outAddr = resolveBuiltinOutArg(
-            call.args[1], lowerPrimitive(pt), et, outArgs);
-        if (!outAddr) {
-            if (win.owned) emitStringRelease(win.owned);
-            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
-            return nullptr;
-        }
+    // stdlib §9.2 (v0.357, fix #7318): the floating-point PARSE CHECK, in the
+    // ONE spelling the `TryParse` and `ParseOrNull` arms share.
+    //
+    // §9.2's input grammar — an optional sign (`+`/`-`), then one or more of
+    // the digits 0-9, then optionally a `.` followed by one or more digits,
+    // then optionally an exponent, and nothing else (no whitespace, no digit
+    // separators, no hexadecimal form, no bare point) — together with the
+    // range rule (a finite spelling that rounds to a non-finite value is a
+    // ParseRangeException) and §9.2's three exact non-finite spellings
+    // ("NaN", "Infinity", "-Infinity"). It is computed as a BOOLEAN ("is this
+    // input admissible?") rather than as a throw, so the same value serves the
+    // Try form ("false exactly where Parse raises" — stdlib §1 shape (c)) and
+    // the *OrNull tier ("null exactly where Parse raises").
+    //
+    // `strData` is the NUL-terminated input text (a `string`'s bytes, or the
+    // materialized window of a span operand — parseWindow). `outVal` receives
+    // the parsed value on success and the default on failure; the *OrNull
+    // tier's null arm ignores the failure value, and the Try form stores it
+    // as the out-parameter's default (stdlib §1 shape (c), spec §17.11).
+    auto emitFpParse = [&](llvm::Value* strData,
+                           llvm::Value*& outVal) -> llvm::Value* {
         // strtod / strtof(data, &endptr). float uses the correctly rounded
         // strtof, never (float)strtod (§4.3 v0.312 rounds a float literal once;
         // #5198 / stdlib §9.2 v0.313).
@@ -2508,15 +2542,174 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // out = default(T) on false, spec §17.11).
         llvm::Value* zeroD = llvm::ConstantFP::get(fpTyT, 0.0);
         llvm::Value* selD = builder_.CreateSelect(okD, valD, zeroD, "tryp.sel");
+        outVal = selD;
+        return okD;
+    };
+    if (m == "TryParse" && call.args.size() == 2 &&
+        call.args[0].value && (call.args[1].value || call.args[1].isDiscard) &&
+        (pt == P::Double || pt == P::Float)) {
+        llvm::Value* strVal = lowerExpr(*call.args[0].value);
+        if (!strVal) return nullptr;
+        // fix #7293 (stdlib §9.2, v0.344): the declared operand is a `string`
+        // (or the span overload's `ReadOnlyStringSpan`). This arm used to
+        // lower whatever it was handed into a string operand, so
+        // `double.TryParse(1.5, out d)` emitted
+        //   %str.data = load ptr, double 1.500000e+00, align 8
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED, the way the integer tower's
+        // `TryParse` arm drops one.
+        if (!isParseableOperand(*call.args[0].value, strVal, true)) return nullptr;
+        // #5296 / stdlib §9.2 (v0.313, #1810): the span overload — see the
+        // integer tower arm above for the full rationale.
+        auto win = parseWindow(strVal);
+        llvm::Value* strData = win.data;
+        // fix #2938 / §22.3: see char.TryParse above.
+        llvm::Type* et = nullptr;
+        std::vector<AccessorRefArg> outArgs;
+        llvm::Value* outAddr = resolveBuiltinOutArg(
+            call.args[1], lowerPrimitive(pt), et, outArgs);
+        if (!outAddr) {
+            if (win.owned) emitStringRelease(win.owned);
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+            return nullptr;
+        }
+        llvm::Value* parsedVal = nullptr;
+        llvm::Value* okD = emitFpParse(strData, parsedVal);
         // §11.8 / §2.19 (#1470): nullable-companion aware store (generic
         // IParsable<double>/<float> dispatch into a `out T?`); bare otherwise.
-        storeTryParseOut(outAddr, et, selD, okD);
+        storeTryParseOut(outAddr, et, parsedVal, okD);
         // #5296: drop the window materialization (see the integer arm).
         if (win.owned) emitStringRelease(win.owned);
         // fix #2938 / §22.3: flush any bracket on the normal-return edge.
         emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         return okD;
     }
+
+    // stdlib §9.2 / §1 *OrNull tier (v0.357, fix #7318):
+    // `double.ParseOrNull(s: string): double?` and
+    // `float.ParseOrNull(s: string): float?` — the *OrNull convenience form
+    // of `Parse(s)`: null exactly where `Parse(s)` raises (the
+    // FormatException of the §9.2 input grammar and the ParseRangeException
+    // of the range paragraph), and the parsed value otherwise. §9.2 declares
+    // the member on Double and says Float "has the analogous shape"; §5.9 of
+    // docs/Bezel_For_Code_Generation.md lists `ParseOrNull` for both.
+    //
+    // The check is the SAME one `TryParse` uses (the shared `emitFpParse`
+    // above), so the two forms agree on every input by construction — the
+    // *OrNull tier's "null exactly where Parse raises" is the Try form's
+    // "false exactly where Parse raises" (stdlib §1 shape (c)) with the
+    // failure carried by the null instead of an out-parameter.
+    //
+    // The operand is a `string` and NOTHING else: §9.2 declares no span form
+    // of `ParseOrNull` (only `Parse`/`TryParse` carry the span overload).
+    if (m == "ParseOrNull" && call.args.size() == 1 && call.args[0].value &&
+        (pt == P::Double || pt == P::Float)) {
+        llvm::Value* strVal = lowerExpr(*call.args[0].value);
+        if (!strVal) return nullptr;
+        if (!isParseableOperand(*call.args[0].value, strVal, false))
+            return nullptr;
+        auto win = parseWindow(strVal);
+        llvm::Value* parsedVal = nullptr;
+        llvm::Value* ok = emitFpParse(win.data, parsedVal);
+        // The nullable primitive companion struct {i8 hasVal, T value}
+        // (stdlib §17.11 / §9.2): the null arm is {0, 0.0} and the present
+        // arm is {1, the parsed value}.
+        llvm::StructType* st = nullablePrimStructTy(pt);
+        llvm::Value* nullV = llvm::ConstantAggregateZero::get(st);
+        llvm::Value* wrapV = wrapNullablePrim(pt, parsedVal);
+        llvm::Value* res = builder_.CreateSelect(ok, wrapV, nullV, "fpon.sel");
+        // #5296: drop the window materialization (see the integer arm).
+        if (win.owned) emitStringRelease(win.owned);
+        return res;
+    }
+
+    // stdlib §9.1 (v0.357, fix #7318): the integer tower's PARSE CHECK, in
+    // the ONE spelling the `TryParse` and `ParseOrNull` arms share.
+    //
+    // The check is §9.1's input grammar — "an optional leading `+` or `-`,
+    // then one or more of the digits 0-9, and nothing else" (no whitespace,
+    // no digit separators, no `0x` prefix) — together with the range rule
+    // (a value outside the type's range is a ParseRangeException, an
+    // OverflowException). It is computed as a BOOLEAN ("is this input
+    // admissible?") rather than as a throw, so the same value serves the
+    // Try form ("false exactly where Parse raises" — stdlib §1 shape (c))
+    // and the *OrNull tier ("null exactly where Parse raises").
+    //
+    // `strData` is the NUL-terminated input text (a `string`'s bytes, or the
+    // materialized window of a span operand — parseWindow). `outVal` receives
+    // the parsed value on success and the default on failure; the *OrNull
+    // tier's null arm ignores the failure value, and the Try form stores it
+    // as the out-parameter's default (stdlib §1 shape (c), spec §17.11).
+    auto emitIntTowerParse = [&](llvm::Value* strData,
+                                  llvm::Value*& outVal) -> llvm::Value* {
+        // strtoll/strtoull(data, &endptr, 10) for validation.
+        auto* strtoFnT = (pt == P::ULong)
+            ? declareC("strtoull", i64(), {ptrTy(), ptrTy(), i32()})
+            : declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+        auto* endSlotI = entryAlloca(ptrTy());
+        llvm::Value* val64 = builder_.CreateCall(
+            strtoFnT, {strData, endSlotI, builder_.getInt32(10)}, "tryp.val");
+        llvm::Value* endPtrI = builder_.CreateLoad(ptrTy(), endSlotI);
+        // ok = first-char not whitespace AND (endPtr != strData) AND (*endPtr == '\0')
+        // #5296: for a span operand `strData` is the materialized window, whose
+        // buffer is NUL-terminated at the WINDOW's end (see parseWindow), so
+        // this test means "the window, and only the window, was valid input".
+        auto* i8TyI = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* fcI = builder_.CreateLoad(i8TyI, strData, "tryp.fc");
+        llvm::Value* fcWsI = builder_.CreateICmpULE(
+            fcI, llvm::ConstantInt::get(i8TyI, ' '), "tryp.fws");
+        llvm::Value* advI = builder_.CreateICmpNE(endPtrI, strData, "tryp.adv");
+        llvm::Value* endChI = builder_.CreateLoad(i8TyI, endPtrI, "tryp.end");
+        llvm::Value* atNulI = builder_.CreateICmpEQ(
+            endChI, llvm::ConstantInt::get(i8TyI, 0), "tryp.nul");
+        llvm::Value* ok = builder_.CreateAnd(
+            builder_.CreateNot(fcWsI),
+            builder_.CreateAnd(advI, atNulI), "tryp.ok");
+        // Store result: 0 on failure, parsed value on success.
+        if (pt == P::Long || pt == P::ULong) {
+            // ulong additionally rejects a leading '-' (strtoull silently
+            // negates it); long is the full strtoll width — no range check.
+            if (pt == P::ULong) {
+                llvm::Value* fcNeg = builder_.CreateICmpEQ(
+                    fcI, llvm::ConstantInt::get(i8TyI, '-'), "tryp.neg");
+                ok = builder_.CreateAnd(ok, builder_.CreateNot(fcNeg),
+                                        "tryp.okU");
+            }
+            llvm::Value* zero64 = builder_.getInt64(0);
+            llvm::Value* sel64 = builder_.CreateSelect(ok, val64, zero64, "tryp.sel");
+            outVal = sel64;
+        } else {
+            // #1134 / stdlib §9.1: TryParse must return FALSE for an
+            // out-of-range value, not silently wrap the low bits. strtoll on a
+            // 64-bit platform returns the full magnitude, so range-check it
+            // against the target type's bounds.
+            int64_t rlo, rhi;
+            switch (pt) {
+                case P::Int:    rlo = INT32_MIN; rhi = INT32_MAX;  break;
+                case P::UInt:   rlo = 0;         rhi = UINT32_MAX; break;
+                case P::Short:  rlo = INT16_MIN; rhi = INT16_MAX;  break;
+                case P::UShort: rlo = 0;         rhi = UINT16_MAX; break;
+                case P::Byte:   rlo = 0;         rhi = UINT8_MAX;  break;
+                default:        rlo = INT8_MIN;  rhi = INT8_MAX;   break; // SByte
+            }
+            llvm::Value* inRange = builder_.CreateAnd(
+                builder_.CreateICmpSGE(
+                    val64, llvm::ConstantInt::getSigned(i64(), rlo)),
+                builder_.CreateICmpSLE(
+                    val64, llvm::ConstantInt::getSigned(i64(), rhi)),
+                "tryp.inrange");
+            ok = builder_.CreateAnd(ok, inRange, "tryp.ok2");
+            // On failure, store 0; on success store the truncated value.
+            llvm::Type* tt = lowerPrimitive(pt);
+            llvm::Value* truncV = builder_.CreateTrunc(val64, tt);
+            llvm::Value* zeroV = llvm::ConstantInt::get(tt, 0);
+            llvm::Value* selV = builder_.CreateSelect(ok, truncV, zeroV, "tryp.sel");
+            outVal = selV;
+        }
+        return ok;
+    };
 
     // Integer TryParse(s, out result): bool — stdlib §9.1. Returns true and
     // sets result if s is a valid integer in the target type's range; false
@@ -2587,72 +2780,11 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             return nullptr;
         }
         // strtoll/strtoull(data, &endptr, 10) for validation.
-        auto* strtoFnT = (pt == P::ULong)
-            ? declareC("strtoull", i64(), {ptrTy(), ptrTy(), i32()})
-            : declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
-        auto* endSlotI = entryAlloca(ptrTy());
-        llvm::Value* val64 = builder_.CreateCall(
-            strtoFnT, {strData, endSlotI, builder_.getInt32(10)}, "tryp.val");
-        llvm::Value* endPtrI = builder_.CreateLoad(ptrTy(), endSlotI);
-        // ok = first-char not whitespace AND (endPtr != strData) AND (*endPtr == '\0')
-        // #5296: for a span operand `strData` is the materialized window, whose
-        // buffer is NUL-terminated at the WINDOW's end (see parseWindow), so
-        // this test means "the window, and only the window, was valid input".
-        auto* i8TyI = llvm::Type::getInt8Ty(llvm_);
-        llvm::Value* fcI = builder_.CreateLoad(i8TyI, strData, "tryp.fc");
-        llvm::Value* fcWsI = builder_.CreateICmpULE(
-            fcI, llvm::ConstantInt::get(i8TyI, ' '), "tryp.fws");
-        llvm::Value* advI = builder_.CreateICmpNE(endPtrI, strData, "tryp.adv");
-        llvm::Value* endChI = builder_.CreateLoad(i8TyI, endPtrI, "tryp.end");
-        llvm::Value* atNulI = builder_.CreateICmpEQ(
-            endChI, llvm::ConstantInt::get(i8TyI, 0), "tryp.nul");
-        llvm::Value* ok = builder_.CreateAnd(
-            builder_.CreateNot(fcWsI),
-            builder_.CreateAnd(advI, atNulI), "tryp.ok");
-        // Store result: 0 on failure, parsed value on success.
-        if (pt == P::Long || pt == P::ULong) {
-            // ulong additionally rejects a leading '-' (strtoull silently
-            // negates it); long is the full strtoll width — no range check.
-            if (pt == P::ULong) {
-                llvm::Value* fcNeg = builder_.CreateICmpEQ(
-                    fcI, llvm::ConstantInt::get(i8TyI, '-'), "tryp.neg");
-                ok = builder_.CreateAnd(ok, builder_.CreateNot(fcNeg),
-                                        "tryp.okU");
-            }
-            llvm::Value* zero64 = builder_.getInt64(0);
-            llvm::Value* sel64 = builder_.CreateSelect(ok, val64, zero64, "tryp.sel");
-            // §11.8 / §2.19 (#1470): marshal into a nullable companion when the
-            // out slot is `T?` (generic IParsable dispatch); bare store otherwise.
-            storeTryParseOut(outAddr, et, sel64, ok);
-        } else {
-            // #1134 / stdlib §9.1: TryParse must return FALSE for an
-            // out-of-range value, not silently wrap the low bits. strtoll on a
-            // 64-bit platform returns the full magnitude, so range-check it
-            // against the target type's bounds.
-            int64_t rlo, rhi;
-            switch (pt) {
-                case P::Int:    rlo = INT32_MIN; rhi = INT32_MAX;  break;
-                case P::UInt:   rlo = 0;         rhi = UINT32_MAX; break;
-                case P::Short:  rlo = INT16_MIN; rhi = INT16_MAX;  break;
-                case P::UShort: rlo = 0;         rhi = UINT16_MAX; break;
-                case P::Byte:   rlo = 0;         rhi = UINT8_MAX;  break;
-                default:        rlo = INT8_MIN;  rhi = INT8_MAX;   break; // SByte
-            }
-            llvm::Value* inRange = builder_.CreateAnd(
-                builder_.CreateICmpSGE(
-                    val64, llvm::ConstantInt::getSigned(i64(), rlo)),
-                builder_.CreateICmpSLE(
-                    val64, llvm::ConstantInt::getSigned(i64(), rhi)),
-                "tryp.inrange");
-            ok = builder_.CreateAnd(ok, inRange, "tryp.ok2");
-            // On failure, store 0; on success store the truncated value.
-            llvm::Type* tt = lowerPrimitive(pt);
-            llvm::Value* truncV = builder_.CreateTrunc(val64, tt);
-            llvm::Value* zeroV = llvm::ConstantInt::get(tt, 0);
-            llvm::Value* selV = builder_.CreateSelect(ok, truncV, zeroV, "tryp.sel");
-            // §11.8 / §2.19 (#1470): nullable-companion aware store (see above).
-            storeTryParseOut(outAddr, et, selV, ok);
-        }
+        llvm::Value* parsedVal = nullptr;
+        llvm::Value* ok = emitIntTowerParse(strData, parsedVal);
+        // §11.8 / §2.19 (#1470): marshal into a nullable companion when the
+        // out slot is `T?` (generic IParsable dispatch); bare store otherwise.
+        storeTryParseOut(outAddr, et, parsedVal, ok);
         // #5296: drop the window materialization (the fresh +1 string
         // parseWindow made for a span operand). Every read of strData is above
         // and this path never throws (TryParse is shape (c) of the §1 Try
@@ -2663,6 +2795,52 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // The TryParse path never throws, so emit is always true.
         emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         return ok;
+    }
+
+    // stdlib §9.1 / §1 *OrNull tier (v0.357, fix #7318):
+    // `T.ParseOrNull(s: string): T?` for the WHOLE integer tower
+    // (SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64 — §9.1's
+    // "the others have analogous shapes", and §5.9 of
+    // docs/Bezel_For_Code_Generation.md lists the member for every one of
+    // them).  The *OrNull tier is the CONVENIENCE form of `T.Parse(s)`:
+    // null exactly where `Parse(s)` raises (the FormatException of the §9.1
+    // input grammar and the ParseRangeException of the range paragraph),
+    // and the parsed value otherwise.
+    //
+    // The check is the SAME one `T.TryParse` uses — the grammar ("an optional
+    // `+` or `-`, then one or more of the digits 0-9, and nothing else"; no
+    // whitespace, no digit separators, no `0x` prefix) and the range rule
+    // (`ParseRangeException` for a value outside the type's range) — so the
+    // two forms agree on every input by construction: the *OrNull tier's
+    // "null exactly where Parse raises" is the Try form's "false exactly
+    // where Parse raises" (stdlib §1 shape (c)) with the failure carried by
+    // the null instead of an out-parameter.
+    //
+    // The operand is a `string` and NOTHING else: §9.1 declares no span form
+    // of `ParseOrNull` ("string input only, no radix or span duals"), so the
+    // shared guard drops a non-string operand (the §5.1 argument gate has
+    // already refused it in sema).
+    if (m == "ParseOrNull" && call.args.size() == 1 && call.args[0].value &&
+        (pt == P::Int || pt == P::Long || pt == P::UInt || pt == P::ULong ||
+         pt == P::Short || pt == P::UShort || pt == P::Byte ||
+         pt == P::SByte)) {
+        llvm::Value* strVal = lowerExpr(*call.args[0].value);
+        if (!strVal) return nullptr;
+        if (!isParseableOperand(*call.args[0].value, strVal, false))
+            return nullptr;
+        auto win = parseWindow(strVal);
+        llvm::Value* parsedVal = nullptr;
+        llvm::Value* ok = emitIntTowerParse(win.data, parsedVal);
+        // The nullable primitive companion struct {i8 hasVal, T value}
+        // (stdlib §17.11 / §9.1): the null arm is {0, 0} and the present
+        // arm is {1, the parsed value}.
+        llvm::StructType* st = nullablePrimStructTy(pt);
+        llvm::Value* nullV = llvm::ConstantAggregateZero::get(st);
+        llvm::Value* wrapV = wrapNullablePrim(pt, parsedVal);
+        llvm::Value* res = builder_.CreateSelect(ok, wrapV, nullV, "pon.sel");
+        // #5296: drop the window materialization (see the TryParse arm).
+        if (win.owned) emitStringRelease(win.owned);
+        return res;
     }
 
     // stdlib §9.1: `TryParse(s: string, radix: int, out result: int): bool`

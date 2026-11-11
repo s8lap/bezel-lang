@@ -38969,6 +38969,25 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
                         return;
                     }
+                    // fix #7318 (stdlib §9.1, §1 *OrNull tier, v0.357):
+                    // `T.ParseOrNull(s: string): T?` — the *OrNull convenience
+                    // form of `T.Parse(s)`, null exactly where `Parse(s)`
+                    // raises (the FormatException/OverflowException contract),
+                    // otherwise the parsed value. stdlib §9.1 declares it on
+                    // Int32 and says "the others have analogous shapes", and
+                    // docs/Bezel_For_Code_Generation.md §5.9 lists
+                    // `static pure ParseOrNull(s: string): T?` for the WHOLE
+                    // integer tower (Int32, Int64, Byte, SByte, Int16, UInt16,
+                    // UInt32, UInt64) — so the whole tower is admitted here.
+                    // The member is STRING-ONLY (§9.1: "string input only, no
+                    // radix or span duals"); the §5.1 argument gate owns the
+                    // argument's type (the registry's row for every one of
+                    // these heads declares exactly `ParseOrNull(s: string)`).
+                    if (mbr == "ParseOrNull") {
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(
+                            pt, /*nullable=*/true));
+                        return;
+                    }
                 }
                 if (pt == PrimitiveType::Double || pt == PrimitiveType::Float) {
                     if (mbr == "Parse") {
@@ -38979,6 +38998,21 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                         return;
                     }
+                    // fix #7318 (stdlib §9.2, §1 *OrNull tier, v0.357):
+                    // `double.ParseOrNull(s: string): double?` /
+                    // `float.ParseOrNull(s: string): float?` — null exactly
+                    // where `Parse(s)` raises (the FormatException of the §9.2
+                    // input grammar and the ParseRangeException of the range
+                    // paragraph), otherwise the parsed value. §9.2 declares
+                    // the member on Double and says Float "has the analogous
+                    // shape"; §5.9 of the codegen document lists
+                    // `ParseOrNull` for both. String input only (§9.2
+                    // declares no span form of it).
+                    if (mbr == "ParseOrNull") {
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(
+                            pt, /*nullable=*/true));
+                        return;
+                    }
                 }
                 // §9.3 / #884: Decimal (now Primitive) static members.
                 // TryParse(string, out decimal): bool; Parse(string): decimal;
@@ -38987,6 +39021,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (pt == PrimitiveType::Decimal) {
                     if (mbr == "TryParse") {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                        return;
+                    }
+                    // fix #7318 (stdlib §9.3, §1 *OrNull tier, v0.357):
+                    // `decimal.ParseOrNull(s: string): decimal?` — null exactly
+                    // where `decimal.Parse(s)` raises (FormatException for the
+                    // §9.3 grammar, ParseRangeException for the range), and
+                    // the parsed value otherwise. String input only.
+                    if (mbr == "ParseOrNull") {
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(
+                            pt, /*nullable=*/true));
                         return;
                     }
                 }
