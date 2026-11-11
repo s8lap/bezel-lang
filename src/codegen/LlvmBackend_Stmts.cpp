@@ -2468,6 +2468,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     if (boxState)
                         builder_.CreateStore(
                             builder_.getInt1(newBoxKind > 0), boxState);
+                    // fix #8444 (§28.9 / §8.6, v0.357): the local's
+                    // box-borrow pin follows the value it now holds.
+                    if (as->op == ":=")
+                        rebindBoxBorrowPin(*as->target, as->value.get(), rhs);
                     if (ostrState && newOstrKind >= 0)
                         builder_.CreateStore(
                             builder_.getInt1(newOstrKind > 0), ostrState);

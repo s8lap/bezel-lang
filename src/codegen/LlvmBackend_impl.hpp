@@ -13439,6 +13439,11 @@ private:
     // first word) a SILENTLY WRONG VALUE.
     struct PendingArgBoxCall {
         std::vector<llvm::Value*> boxes;
+        // fix #8444 (§28.9, v0.357): the box-borrow pin slots of this call's
+        // arguments (pinBoxBorrowArgument). The discharge releases each and
+        // nulls it; a call that unwinds instead leaves the release to the
+        // slot's scope-end Disposal.
+        std::vector<llvm::AllocaInst*> pinSlots;
     };
     std::vector<PendingArgBoxCall> pendingArgBoxReleases_;
 
@@ -22821,7 +22826,67 @@ private:
     // string, not a function value, not a tagged built-in, not a class
     // instance (including the `Object` root). The discriminator is the one
     // emitObjectSlotDisposal (#8118) uses.
-    void emitObjectSlotBoxOp(llvm::Value* obj, bool retain);
+    //
+    // fix #8444: `pinOut`, when given, receives `obj` on the arm that
+    // performed the operation (the value IS a box) and is left untouched on
+    // every other arm, so a caller that stored null into it first reads back
+    // "the box this call retained, or null".
+    void emitObjectSlotBoxOp(llvm::Value* obj, bool retain,
+                             llvm::AllocaInst* pinOut = nullptr);
+
+    // fix #8444 (§28.9 / §8.6, v0.357): THE BOX-BORROW PIN.
+    //
+    // §28.9: "a boxed value is an immutable shared reference". An
+    // `Object`/interface local (or argument) bound from a value of UNKNOWN
+    // box provenance -- a field read, a call result, a copy -- is such a
+    // shared reference, but it took no count of its own: the box-storage
+    // field it was read from releases the box when the field is overwritten
+    // or its holder is disposed, and the local then reads a freed block
+    // (issue #8444; ASan-silent, the freed box is read only inside the
+    // uninstrumented runtime helpers).
+    //
+    // The pin is the local's OWN reference: at the bind, the value is tested
+    // with the #8215 run-time discriminator and, iff it is a box, retained
+    // and remembered in a hidden entry-block slot; the slot is released at
+    // the local's scope end (a rebind releases the previous pin first). The
+    // test runs ONCE, at the bind, while the value is certainly alive; the
+    // scope-end release reads only the pin slot, never the value. A retain
+    // and its release are a balanced pair on a live box, so the pin is sound
+    // whatever discipline the source has (counted field, uncounted field,
+    // imported field) and can add neither a leak nor a double release.
+    //
+    // `isBoxBorrowPinSource`: is `e` a source of unknown box provenance
+    // (boxLocalAssignmentSourceKind == -1) that can hold a box? A null
+    // literal, a `new`, a lambda, a `default`, a `throw` and a `move` are
+    // not. With `forArgument`, a bare local/parameter identifier is not
+    // either: the binding it names is already pinned for longer than the
+    // call (by its own pin, or by its caller's argument pin).
+    bool isBoxBorrowPinSource(const ast::Expr* e, bool forArgument);
+    // lowerLocalDecl's arm: create the pin for `declNode` when its
+    // initializer is a pin source or a later statement-level `:=` binds one
+    // (boxBorrowPinAssigned_), bind `v`, and register the scope-end release.
+    void armBoxBorrowPin(const ast::Node* declNode, const ast::Type* declType,
+                         const ast::Expr* init, llvm::Value* v);
+    // The plain-`:=` arm: release the pin's previous box and pin `rhs`.
+    void rebindBoxBorrowPin(const ast::Expr& target, const ast::Expr* value,
+                            llvm::Value* rhs);
+    // buildOrderedArgs' arm: retain `v` iff it is a box, in a pin slot of
+    // the CURRENT scope (so an unwind out of the call releases it), and
+    // return the slot for the call's own post-call release
+    // (PendingArgBoxCall::pinSlots); null when no pin is emitted.
+    llvm::AllocaInst* pinBoxBorrowArgument(llvm::Value* v);
+    // The pin slot of each pinned local, with the function that owns it (a
+    // declaration can be lowered into more than one function).
+    struct BoxBorrowPin {
+        llvm::AllocaInst* slot = nullptr;
+        llvm::Function* fn = nullptr;
+    };
+    std::unordered_map<const ast::Node*, BoxBorrowPin> boxBorrowPins_;
+    // Locals that a statement-level `:=` binds from a pin source. Populated
+    // by collectBoxReleaseEligible's statement scan; keyed by AST node and
+    // membership-tested only, so it is never cleared (a nested body's scan
+    // must not drop the enclosing body's entries).
+    std::unordered_set<const ast::LocalDecl*> boxBorrowPinAssigned_;
 
     // fix #8215: the store of a NON-box source (class instance, `Object`
     // parameter, null, ...) into a dynamic box-storage field: retain-new

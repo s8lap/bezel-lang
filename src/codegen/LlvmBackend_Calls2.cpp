@@ -21209,6 +21209,15 @@ void Emitter::dischargeArgBoxCall(std::size_t idx) {
             }
             emitBoxRelease(b);
         }
+        // fix #8444 (§28.9 / §8.6, v0.357): the call is over, so its
+        // argument pins are released and their slots nulled (the slot's
+        // scope-end Disposal then releases nothing). Same cross-function
+        // guard as the boxes above.
+        for (llvm::AllocaInst* pin : pendingArgBoxReleases_[i].pinSlots) {
+            if (!pin || (scope && pin->getFunction() != scope)) continue;
+            emitBoxRelease(builder_.CreateLoad(ptrTy(), pin, "boxpin.arg.rel"));
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pin);
+        }
     }
     pendingArgBoxReleases_.resize(idx);
 }

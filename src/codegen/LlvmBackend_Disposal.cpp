@@ -4084,7 +4084,8 @@ void Emitter::emitObjectSlotDisposal(llvm::Value* obj) {
 // never a release of a non-box (the direction the box machinery has always
 // preferred). The store sites pair this with a +1 on every box they store
 // (lowerBoxFieldStore / lowerDynBoxFieldStore), so the release is balanced.
-void Emitter::emitObjectSlotBoxOp(llvm::Value* obj, bool retain) {
+void Emitter::emitObjectSlotBoxOp(llvm::Value* obj, bool retain,
+                                  llvm::AllocaInst* pinOut) {
     if (!obj) return;
     auto* fn = declareC(retain ? "bz_box_retain" : "bz_box_release",
                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
@@ -4145,6 +4146,8 @@ void Emitter::emitObjectSlotBoxOp(llvm::Value* obj, bool retain) {
     builder_.CreateCondBr(isBox, opBB, contBB);
     builder_.SetInsertPoint(opBB);
     builder_.CreateCall(fn, {obj});
+    // fix #8444: report the box this call operated on (see the header).
+    if (pinOut) builder_.CreateStore(obj, pinOut);
     builder_.CreateBr(contBB);
     builder_.SetInsertPoint(contBB);
 }
@@ -10674,6 +10677,14 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 llvm::Value* b =
                     builder_.CreateLoad(ptrTy(), it->slot, "box.rel");
                 emitBoxRelease(b);
+                // fix #8444 (§28.9, v0.357): a box-borrow PIN slot outlives
+                // one activation of its scope (a loop body re-enters it), and
+                // a later exit may run this release on a path that never
+                // re-bound the pin. Nulling makes the release exactly-once
+                // (bz_box_release is null-safe).
+                if (it->nullSlotAfterRelease)
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), it->slot);
                 continue;
             }
             llvm::Value* armed = builder_.CreateLoad(

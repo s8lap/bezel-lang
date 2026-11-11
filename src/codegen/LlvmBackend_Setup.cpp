@@ -20398,6 +20398,9 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         d.boxReleaseState = state;
         disposeStack_.back().push_back(d);
     }
+    // fix #8444 (§28.9 / §8.6, v0.357): the local's own reference to a box of
+    // unknown provenance (a box-storage field read, a call result, a copy).
+    armBoxBorrowPin(declNode, declType, init, v);
     // #1003 / stdlib §5 / §28: if this `var` borrowing-`Array<T>` local was bound
     // to a fresh materializer (ToArray/Sorted/Reversed) and the escape walk proved
     // it never escapes its scope, register a scope-end bz_array_free of its single
@@ -45353,6 +45356,112 @@ int Emitter::boxLocalAssignmentSourceKind(const ast::Expr* valueExpr) {
 }
 
 
+// fix #8444 (§28.9 / §8.6, v0.357): the box-borrow pin (see the header for
+// the contract). The source test is the NEGATION of the two static answers
+// boxLocalAssignmentSourceKind can give: a fresh box (+1) is the binding's
+// own reference already, a definitely-non-box (0) needs none; what is left is
+// an `Object`/interface value whose provenance the static type cannot tell.
+bool Emitter::isBoxBorrowPinSource(const ast::Expr* e, bool forArgument) {
+    if (!e) return false;
+    if (dynamic_cast<const ast::NullLiteralExpr*>(e) ||
+        dynamic_cast<const ast::NewExpr*>(e) ||
+        dynamic_cast<const ast::LambdaExpr*>(e) ||
+        dynamic_cast<const ast::DefaultExpr*>(e) ||
+        dynamic_cast<const ast::ThrowExpr*>(e) ||
+        dynamic_cast<const ast::MarkedTransferExpr*>(e))
+        return false;
+    const sema::TypeRef* ty = ctx_.exprType(*e);
+    if (!ty || !isObjectOrInterfaceTarget(ty)) return false;
+    if (boxLocalAssignmentSourceKind(e) != -1) return false;
+    if (forArgument) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            if (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                dynamic_cast<sema::ParameterSymbol*>(sym))
+                return false;
+        }
+    }
+    return true;
+}
+
+void Emitter::armBoxBorrowPin(const ast::Node* declNode,
+                              const ast::Type* declType,
+                              const ast::Expr* init, llvm::Value* v) {
+    if (!declNode || !currentFn_ || disposeStack_.empty()) return;
+    // A sidecar alloca does not survive an async / iterator suspension (the
+    // same reason collectBoxReleaseEligible declines a suspend-live managed
+    // local): a state-machine body keeps the pre-#8444 borrow.
+    if (smStateStruct_) return;
+    LocalDeclInitView view = localDeclInitView(declNode);
+    if (view.isUsing) return;
+    const sema::TypeRef* targetTy =
+        declType ? ctx_.resolvedType(*declType)
+                 : (init ? ctx_.exprType(*init) : nullptr);
+    if (!isObjectOrInterfaceTarget(targetTy)) return;
+    const bool bindNow = init && v && v->getType()->isPointerTy() &&
+                         isBoxBorrowPinSource(init, /*forArgument=*/false);
+    // LOCALDECL-ONLY: `boundLater` asks whether a later `:=` rebinds the
+    // local; a §21.1 `const` local is never an assignment target, so it is
+    // pinned by `bindNow` (which reads `declNode` itself) or not at all.
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(declNode);
+    const bool boundLater = ld && boxBorrowPinAssigned_.count(ld) != 0;
+    if (!bindNow && !boundLater) return;
+    llvm::AllocaInst* pin = entryAllocaNullPtr();
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pin);
+    if (bindNow) emitObjectSlotBoxOp(v, /*retain=*/true, pin);
+    boxBorrowPins_[declNode] = BoxBorrowPin{pin, currentFn_};
+    Disposal d{pin, nullptr};
+    d.boxRelease = true;
+    d.nullSlotAfterRelease = true;
+    disposeStack_.back().push_back(d);
+}
+
+void Emitter::rebindBoxBorrowPin(const ast::Expr& target,
+                                 const ast::Expr* value, llvm::Value* rhs) {
+    if (boxBorrowPins_.empty() || !currentFn_) return;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target);
+    if (!id) return;
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!loc || !loc->decl) return;
+    auto it = boxBorrowPins_.find(loc->decl);
+    // The pin belongs to the function that lowered the declaration; a store
+    // lowered into another function (a lambda body writing a captured local)
+    // leaves it alone -- the pin then simply keeps its last box until the
+    // local's scope ends.
+    if (it == boxBorrowPins_.end() || it->second.fn != currentFn_) return;
+    llvm::AllocaInst* pin = it->second.slot;
+    llvm::Value* oldPin = builder_.CreateLoad(ptrTy(), pin, "boxpin.old");
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pin);
+    // Retain the new value BEFORE releasing the old pin: they may be the
+    // same box.
+    if (rhs && rhs->getType()->isPointerTy() &&
+        isBoxBorrowPinSource(value, /*forArgument=*/false))
+        emitObjectSlotBoxOp(rhs, /*retain=*/true, pin);
+    emitBoxRelease(oldPin);
+}
+
+llvm::AllocaInst* Emitter::pinBoxBorrowArgument(llvm::Value* v) {
+    if (!v || !v->getType()->isPointerTy() || !currentFn_) return nullptr;
+    // No sidecar slot in a state machine (see armBoxBorrowPin); no pin
+    // without a scope to own its unwind-path release.
+    if (smStateStruct_ || disposeStack_.empty()) return nullptr;
+    llvm::AllocaInst* pin = entryAllocaNullPtr();
+    // The call site can run more than once per activation of its scope (a
+    // loop condition), and its post-call release is skipped by an unwind:
+    // whatever the slot still holds is released here, AFTER the new retain
+    // (the two may be the same box).
+    llvm::Value* oldPin = builder_.CreateLoad(ptrTy(), pin, "boxpin.arg.old");
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pin);
+    emitObjectSlotBoxOp(v, /*retain=*/true, pin);
+    emitBoxRelease(oldPin);
+    Disposal d{pin, nullptr};
+    d.boxRelease = true;
+    d.nullSlotAfterRelease = true;
+    disposeStack_.back().push_back(d);
+    return pin;
+}
+
+
 // fix #2900 / §28.9 / §28.3 (v0.240): is `valueExpr` a bare string-typed
 // IDENTIFIER (the only shape the `Object`-slot / string-borrow relaxation
 // admits at the LocalDecl level)? A `+1` producer (`"x" + y` /
@@ -46353,8 +46462,16 @@ void Emitter::collectBoxReleaseEligible(
                     // TARGET; reassigning a §21.1 `const` is a compile error
                     // (verified: a const is "not an assignable location"), so
                     // this cast is never null for a program reaching codegen.
-                    if (auto* tld = dynamic_cast<const ast::LocalDecl*>(tsym->decl))
+                    if (auto* tld = dynamic_cast<const ast::LocalDecl*>(tsym->decl)) {
                         reassignedOpaqueLocals_.insert(tld);
+                        // fix #8444 (§28.9, v0.357): a plain `:=` that binds
+                        // a value of unknown box provenance -- lowerLocalDecl
+                        // must have created the local's pin by then.
+                        if (as->op == ":=" &&
+                            isBoxBorrowPinSource(as->value.get(),
+                                                 /*forArgument=*/false))
+                            boxBorrowPinAssigned_.insert(tld);
+                    }
             }
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {

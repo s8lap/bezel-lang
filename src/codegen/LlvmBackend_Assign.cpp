@@ -18096,6 +18096,25 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                     pendingArgBoxReleases_.back().boxes.push_back(v);
                 }
             }
+            // fix #8444 (§28.9 / §8.6, v0.357): the PARAMETER shape of the
+            // box-borrow pin. An argument read from a box-storage field (or
+            // any other source of unknown box provenance) is a borrow of a
+            // refcounted box the callee can displace -- `Use(h.o, h)` whose
+            // body overwrites `h.o` released the box its own parameter still
+            // names. The call holds a reference across itself: retained here
+            // iff the value is a box, in a pin slot the enclosing scope owns
+            // (so an unwind out of the call still releases it), and released
+            // by this call's own post-call discharge when it has a #7998
+            // record. No box was minted for this argument (`v` is not
+            // lastBoxMint_), so nothing is released twice.
+            if (v && !(lastBoxMint_ && v == lastBoxMint_) &&
+                params[idx].modifier.empty() && a.modifier.empty() &&
+                isObjectOrInterfaceTarget(formalTy) &&
+                isBoxBorrowPinSource(a.value.get(), /*forArgument=*/true)) {
+                llvm::AllocaInst* pin = pinBoxBorrowArgument(v);
+                if (pin && !pendingArgBoxReleases_.empty())
+                    pendingArgBoxReleases_.back().pinSlots.push_back(pin);
+            }
             lastBoxMint_ = savedBoxMint;
             // §29.2 (#437/#1067/#1068/#552): when an Array<T> / (Owned)LinkedList
             // / user class is passed to a formal `IEnumerable<T>` parameter, wrap
