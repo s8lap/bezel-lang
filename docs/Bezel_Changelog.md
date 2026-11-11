@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.357 — November 2026**
+**Companion to the Bezel Language Specification, v0.358 — November 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -16081,5 +16081,98 @@ These adaptations have not had an adversarial critique of their own; the composi
 - *The v0.356 critique.* Its corrections are recorded in the v0.356 entry (*Corrections at the meaning gate*), and its two spec questions are #8425 and #8426.
 - *Records.* `DECLINED.md`'s index now counts both trains: 1121 rows (566 · 140 · 358 · 7 · 50 · 0). The proposals README lists 0211 as graduated, 0212 as accepted and 0213 as pending. The rule-corpus manifest was regenerated.
 - *Checks on the composed tree:* `check_docs.sh` (all phases; the one CITATION advisory as above), `check_proposals.sh`, `build_book.py --check`, `check_src_citations.py`, `gen_editor_grammars.py --check`, `corpus.py lint --strict` and `check`, the harness unit tests, `check_anchors.py`, and `check_commit_trailers.py`.
+
+---
+
+### v0.358 changelog (v0.357 → v0.358)
+
+**The narrowed failure marker: origin on the class, disposition in the handler (proposal [0214](proposals/0214-narrowed-failure-marker.md) graduates; revises proposal [0211](proposals/0211-failure-marker-and-boundary-arm.md); [#8407](https://github.com/s8lap/bezel-lang/issues/8407)).** The owner objected to v0.356 that whether a condition is expected depends on the use — a file the user chose against the database file a service cannot run without — so the library should not prescribe it. The research note `docs/research/failure-kind-by-context/` measured the objection on 47 tasks and 272 task–operation pairs, and an independent blind re-rating of 100 pairs (seed 20261111; three-band κ 0.66, bug-or-not κ 0.89) reproduced every headline. The environment and peer classes were a bug in 3 of 106 rows; `FormatException` and `SerializationException` in 8 of 66, most of the bugs v0.356 raised with a failure class; the classes v0.356 called defects in 37 of 89. On 2026-11-11 the owner decided ("Narrowed marker"). The change class is design change ([`spec-change-process.md`](proposals/spec-change-process.md) §2): it reopens rulings of proposal 0211 §16 and rows of `DECLINED.md`, each with the new evidence (proposal 0214 §5). Kernel classification: no K rule, axiom or register row is touched. Body-locality (proposal 0105 §1): the one remaining conformance restriction is **local**.
+
+**The language specification.**
+- **§31.4 *The failure marker* and *Who may conform*; §31.1; §31.2.4's comment; §31.2.5; §30.14 *Faults*; Appendix C.7; Appendix E's row (design change).**
+  - *Decided.* A class that implements `IFailure` is a **failure**: the outside world disagreed — the environment or a peer produced the condition, or the outside did not answer in time. That is a statement of origin and a default for handlers, never a disposition: whether a program carries on, reports, retries or stops is the handler's decision, and a failure the program cannot do without is still a failure, which the program answers by stopping. A class that does not implement `IFailure` makes **no statement**. No built-in type implements it (`FormatException` loses it). The one conformance restriction beside the `Exception`-family rule is the cancellation exclusion: a class with `OperationCanceledException` in its base chain may not implement `IFailure`, directly or through an interface extending it. Every other `Exception`-derived class may list it, whatever its base: `class StaleOrder: InvalidOperationException, IFailure` is a failure, and an arm on `InvalidOperationException` still takes it.
+  - *Declined.* No library class marked, so that only the application marks (the research note's option B): the environment and peer classes are the part the data supports, and a tool's top-level arm would have to list them by name. Keeping `FormatException` and `SerializationException` marked: their condition's origin is whoever supplied the text, which the library cannot see. Lifting the cancellation exclusion: a failure arm is a retry loop or `IFailure => ()`, and a marked cancellation would be retried or swallowed against the program's own request to stop; a boundary that wants cancellation names `OperationCanceledException`. A word for an unmarked class (*defect*, *unclassified*): a category word invites the reading the data refutes.
+  - *Why.* The class can state the one fact its author knows. Stance belongs to the call and disposition to the handler (proposal 0214 §3.1).
+- **§31.4's first and last paragraphs.** `ParseRangeException` leaves the `pure`-constructor list and the list of stdlib exception types (below).
+- **The word *defect* leaves the normative text** (proposal 0214 §3.7). Its other uses ("a defect in this specification") are ordinary English and stay. *Fault* keeps meaning "an exception was raised".
+
+**The standard library.**
+- **§1, the failure-signal rule: bands 1 and 4, *The failure marker* (replacing *Failures and defects*), the access tiers' gloss and the no-dual rule's stance sentence (design change).**
+  - *Decided.* The library marks a class by origin, exactly when its condition is the environment's or a peer's, or a deadline. The failure types are the `IOException` family, `TimeoutException`, `ChannelClosedException`, `ChannelFullException` and `DomainFailedException`. A class whose condition can be the program's, or comes from data whose supplier the library cannot see, is unmarked and makes no statement: `FormatException`, `SerializationException`, `ArgumentException`, `InvalidOperationException`, `KeyNotFoundException`, `OverflowException`. An unmarked exception a handler expects is handled by naming its class. Band 4's class implements `IFailure` where the environment or a peer produces the condition, and band 4 is again separated from band 1 by band 1's own test (v0.355's sentence: environmental origin describes the band, it is not a conjunct of the test). A later class states its marker by the same test, the network family among them.
+  - *Band 1's over-claim removed.* "A defect surface is never a recovery surface: its exception exists to report a bug, not to be branched on" contradicted spec §31.2.2's example (`ArgumentException`, `InvalidOperationException` handled as expected input) and Guide 2 §4's `InvalidOperationException => Log(…)` arm. Band 1 now says what the library offers — a caller that expects the condition tests first, with the query or tester form where one exists — and that a handler that catches one of these exceptions decides what it means. The examples stand as written and are now consistent with every sentence.
+  - *Declined.* The v0.355 glosses of the throwing tier ("failure is a bug at this call site"): they state a disposition, which v0.358 leaves to the handler. The stance gloss of v0.356 stays.
+- **§9.1 *The range failure* removed; §9.1's radix paragraph, §9.2, §9.3, §2.3 (design change: a class retired).**
+  - *Decided.* `ParseRangeException` is **retired**. Well-formed input spelling a value the type cannot hold raises `OverflowException`, as it did at v0.355. With `FormatException` unmarked, a marked range class would put the two halves of one `Parse` contract on opposite sides of the marker; and kept as a plain subclass, no handler would select on it — the bar of the decline row *Checked enum conversion — a dedicated fault subclass*, which the class met only through the boundary arm.
+  - *Declined.* Keeping the class, marked or plain.
+- **§6.8 (ruling: wording).** `DomainFailedException` is kept unchanged in shape: the join raises it where the original's class implements `IFailure`, now including user classes marked under any base. The join raises `DomainFaultedException` itself "for every other exception, cancellation included". *Declined:* marking `DomainFaultedException` for every child fault, because a child's bug is the same program's.
+- **§2.15 (classification).** `SerializationException` no longer implements `IFailure`.
+- **§2.6, §2.14, §2.18, §3.1, §3.2 (doc-only).** The six recorded misfit flags are removed. Each flagged a band-1 condition raised with `FormatException` or `SerializationException`, and both classes are unmarked, so no misfit remains. This dissolves [#8426](https://github.com/s8lap/bezel-lang/issues/8426): the `Weak` never-strongly-reached condition is no longer a misfit either way.
+- **§2.5 (wording).** The `DateTime` range fault is "a band-1 condition of the arithmetic domain". The band label is unchanged; it is reconsidered with the checked-arithmetic follow-up (below).
+
+**The design rationale.** §11.12 becomes *The failure marker: origin on the class, disposition in the handler*. It gains *Origin, not disposition*, with the measured grounds. Its base-class paragraph names the domain join's bridge and user classes marked under a base of the documents as what a subtree cannot hold, and its Java precedent is `UncheckedIOException`. Its second conformance restriction is the cancellation exclusion, with the broader one recorded as declined. *Unmarked makes no statement* replaces *Unmarked means defect*. *What the marker does not do* gains the deferred conversion. Its reopening bars gain one for re-marking a data class. §11.4's closing sentence no longer says the band-1/band-4 line is visible in the class. The anchor `sec-failures-and-defects` is kept for its links.
+
+**The guides, the Tour and the code-generation reference.** Guide 2 §4's *Failures and defects* becomes *The failure marker*. It teaches the three-sentence rule (the class says who could have caused it; the call says whether you expected it; the handler says what happens next), and its `Serve` boundary names `FormatException` for bad client input beside `IFailure` for the environment and peers. It adds that a required file is opened at start-up or caught by name. Marking a user class is admitted under any base but `OperationCanceledException`, so the C# re-basing advice is gone, and the wrapping habit is restated. §2, §5 and §7 follow. Guide 6 §2's `Listen` no longer calls `FormatException` a failure, and the throwing `int.Parse` "splits the condition" (`FormatException` and `OverflowException`). Guide 4 §5's join sentence follows. Guide 4 was re-traced in full against v0.358 ([#8427](https://github.com/s8lap/bezel-lang/issues/8427)), and the re-trace found one stale passage outside this subject: §8 still listed §22.12's mutable-static form (iv), retired at v0.334, as an admitted form. The Tour §6 and the code-generation reference (§5.1's access tiers, §5.2's `Convert` comment and *The failure marker* line, §5.9's two `Parse` lines, §6's two exception idioms) follow. Pins: Guide 2 v0.356 → v0.358, Guide 4 v0.331 → v0.358, Guide 6 and the Tour v0.357 → v0.358, after each was re-traced; the code-generation reference's three pins move to v0.358.
+
+**The call-site `(try E)` form is withdrawn (owner, 2026-11-11, "Withdraw; OrNull is doctrine"; proposal 0214 §6).** The error-model note's gated stage 2 was described by proposal 0211 §7 as reading the marker.
+- *Decided.* The direction is **withdrawn**, not deferred. The `*OrNull` and `Try` tiers are the doctrine for value-shaped results. The author of a member, who knows its expected-absence condition, states it by providing the dual, which is more precise than a type-keyed set (refuted by the failure-kind study) or a caller-named type list.
+- *Declined.* `(try E)` over a default set (every `IFailure`, or any fixed set): it swallows conditions the caller never meant to tolerate, and after the narrowing it would not even cover `FormatException`. Swift's `try?` and Kotlin's `runCatching`, which swallows cancellation, are the precedents. `(try E on X)`, naming the types at the call: it is longer and less precise than the dual, and a list right today is wrong when a member gains a condition. The owner: "It's a lot easier to type a method with *OrNull than it is to remember which exact exception type or types you want to swallow."
+- *Reopening bar* (`DECLINED.md`). A **declared-absence** form: each throwing member declares once which exception means "no result", and a call-site form reads that declaration, so it is exactly as precise as the dual. It must answer §31.3's *No `throws` clause* decision and show that it removes enough duals to pay for the declaration syntax (the error-model note counted about 31 `Parse`-family duals).
+- *A missing dual is a library gap.* 15 of the 33 stdlib sections that document an expected failure offer no value-shaped form, among them all of `System.IO`, serialization and `Encoding` (the error-model note's scan). One issue covers them: [#8516](https://github.com/s8lap/bezel-lang/issues/8516).
+
+**Deferred, and follow-ups.**
+- *The caller-side conversion* ("a failure at this call is a bug") is **deferred** (proposal 0214 §7.1). Reopening trigger: evidence from real programs written against a compiler that implements the marker, showing boundaries whose `IFailure` arm answers a required resource's absence, or another bug, as routine often enough that the hand-written wrap is a measurable cost. Its need is smaller than the note measured: the data classes left the marked set, so only 3 of the 11 bugs raised with a failure class remain.
+- *Checked arithmetic* is a separate follow-up proposal, not written here (proposal 0214 §7.2). It would add nullable-returning checked members on the integer types, starting from proposal 0008's `Checked*` design, and a validity query for date components, and it decides stdlib §2.5's band label.
+
+**Recorded decisions reopened** (proposal 0214 §5, each with its evidence).
+- 0211 Q1 (*defect* as the bug band's word): overtaken.
+- Q5 (b) (no marker under a non-failure class of the documents): reversed in part, leaving the cancellation leg as the whole rule.
+- Q6 (the kind is the condition's, not the tier's): ground restated, because `Parse` raises the unmarked `FormatException`.
+- Q7 (arithmetic over external data): ground restated, outcome kept.
+- Q8 (a): restated as unmarked.
+- Q9 (the two bridges): `ParseRangeException` retired, `DomainFailedException` kept.
+- Q10 (the six misfits): moot.
+- Q12 ("unmarked means failure" declined): kept, reworded.
+- Untouched: Q2, Q3, Q4, Q11 (proposal 0213, whose exemption for an earlier `IFailure` arm is re-read at its own graduation), Q13, Q14.
+
+**Decline index.** `DECLINED.md` gains ten rows: seven `declined-at-proposal` (no library class marked; keeping the data classes marked; lifting the cancellation exclusion; marking every domain-join fault; a word for unmarked classes; `(try E)` over a default set; `(try E on X)`), two `deferred` (the caller-side conversion; checked arithmetic) and one `retired` (`ParseRangeException`). Eleven rows are annotated in place, none moving group:
+- reversed in part: the who-may-conform row;
+- moot: the misfits row, and in part the clean-cut row;
+- ground restated: the kind-following-the-tier row, the arithmetic row, the base-class row and the unmarked-means-failure row;
+- overtaken: the *fault*-for-the-bug-band row;
+- the D-0005 row gains the withdrawal and its bar;
+- proposal 0213's row and the `DateTime` range-fault row gain a v0.358 note.
+
+**Migration.**
+
+  *Newly rejected:* nothing.
+
+  *No longer rejected:* a class that lists `IFailure`, or an interface extending it, with a built-in or standard-library exception class other than `Exception` in its base chain, unless `OperationCanceledException` is among them (`class StaleOrder: InvalidOperationException, IFailure`).
+
+  *No longer defined:* `ParseRangeException`; `IFailure` on `FormatException` and `SerializationException`; the six misfit flags.
+
+  *Behaviour changes, every arm still matching:* out-of-range `Parse`/`Convert.To*` input raises `OverflowException` (an `OverflowException` arm took the retired subclass and takes this). An `IFailure` arm no longer takes `FormatException`, `SerializationException` or out-of-range input. Appendix E classifies removing a marker as breaking; no program outside the rule corpus observes it, since no compiler implements the marker (`git grep` over `src/` and `tests/`, outside the rule corpus, finds none of the three names; r40 raises `OverflowException`).
+
+  *Newly warned:* nothing. An arm on `FormatException` after an `IFailure` arm, unreachable under v0.356, is reachable again.
+
+  *Doc-only:* every restatement of the marker's meaning; band 1's sentence; the misfit flags; stdlib §2.5's word; the rationale, guides, Tour and reference text.
+
+  *Spec-ahead-of-impl:* none new. Each v0.358 delta changes a requirement an existing tracker carries, and each tracker is commented:
+  - [#8414](https://github.com/s8lap/bezel-lang/issues/8414): the conformance list shrinks by `FormatException` and `SerializationException`.
+  - [#8416](https://github.com/s8lap/bezel-lang/issues/8416): the base-chain rejection narrows to `OperationCanceledException`.
+  - [#8417](https://github.com/s8lap/bezel-lang/issues/8417): void, the class retired; to close as not planned when this revision lands.
+  - [#8418](https://github.com/s8lap/bezel-lang/issues/8418): unchanged in requirement, wider in population.
+  - [#8415](https://github.com/s8lap/bezel-lang/issues/8415): unchanged.
+  - Filed: [#8516](https://github.com/s8lap/bezel-lang/issues/8516) (the missing value-shaped forms; `stdlib`, `parking-lot`).
+
+  *Rule corpus* (5,849 → 5,857 cases):
+  - Verdict changes (8): `s31_4_0021` and `s31_4_0023` go from reject to accept. In `s31_4_0012`, `l2_15_0039`, `l2_3_0033`, `l9_1_0030`, `l9_2_0020` and `l9_3_0022`, an `IFailure` arm took the exception; it now passes it, and the class's own arm takes it.
+  - Programs rewritten, verdicts kept (4): `s31_2_3_0022` (warn) and `s31_2_3_0023` (quiet) move to `EndOfStreamException`, and `l2_5_0061` and `l9_1_0031` drop `is ParseRangeException`.
+  - Rule quotes or titles refreshed, verdicts kept (24): `l1_0007`, `l1_0008`, `l2_3_0002`, `l2_3_0023`, `l6_9_0014`, `l6_9_0015`, `l9_1_0007`, `l9_2_0007`, `l9_2_0008`, `l9_3_0020`, `s22_16_0032`, `s30_9_0010`, `s30_14_0018`, `s31_2_0014`, `s31_2_5_0002`, `s31_4_0009`–`0011`, `s31_4_0013`, `s31_4_0019`, `s31_4_0020`, `s31_4_0022`, `s31_4_0024`, `s31_4_0025`.
+  - New (8): `s31_2_3_0024` (a `FormatException` arm after an `IFailure` arm is reachable); `s31_4_0026` (a marked subclass of `InvalidOperationException` is taken by both arms); `s31_4_0027`–`0030` (two reject/accept twins for the cancellation exclusion, directly and through an interface extending `IFailure`); `l6_1_0011` (`TimeoutException` is taken by an `IFailure` arm); `s30_14_0020` (a marked subclass of `InvalidOperationException` is joined as `DomainFailedException`).
+  - None is deleted, and no banked case changes verdict; `baseline.tsv` is untouched.
+
+  *Research note:* the re-rating is added under `data/rerating/`, with an *Outcome* paragraph pointing here, and the error-model note's §8.5 records the `(try E)` withdrawal.
+
+**Checks.** `scripts/check_docs.sh` (all phases; the one CITATION advisory `[spec] §4.12` predates this revision), `check_proposals.sh`, `build_book.py --check`, `check_src_citations.py`, `gen_editor_grammars.py --check` (no keyword changes), `corpus.py lint --strict` (5,857 cases) and `corpus.py check`, the harness unit tests (170), proposal 0214's `edits_0214.py check` against v0.357 (78 edits over 9 documents, 0 anchor failures; `apply` reproduces the landed documents byte for byte) and `check_commit_trailers.py --strict`. The meaning gate (an adversarial critique) runs on this branch before it is pushed.
 
 ---
