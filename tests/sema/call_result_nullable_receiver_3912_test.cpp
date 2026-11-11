@@ -267,14 +267,56 @@ BEZEL_TEST(sema_call_result_nullable_receiver_3912,
 // acceptance and the `string?` result.
 BEZEL_TEST(sema_call_result_nullable_receiver_3912,
            null_cond_member_further_plain_access_accepted_7_5) {
+    // The VALUE: `N()` is null, so the chain is `null` — the `??` default is
+    // what prints, and `w = null` is `True`. (Asserted on stdout: a program
+    // that ran carries no diagnostics to inspect.)
     auto r = runAot(prog(
         "public static method Main(): int "
         "  const w := N()?.Length.ToString(); "
+        "  Console.WriteLine(w ?? \"null\"); "
+        "  Console.WriteLine(w = null); "
         "  return 0; "
         "end Main;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.diagnostics().empty());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("null\nTrue\n"));
+}
+
+// The RESULT TYPE of the admitted chain is `string?` (§7.5: "the chain is a
+// `string?`"), pinned from both sides: a NON-nullable `string` annotation is
+// refused by §7's nullability gate — the specific diagnostic, not the §7.4
+// narrowing refusal the chain itself used to draw — and a plain `.Length` on
+// the inferred binding is §7.4's error on a nullable VALUE (`w`), which it
+// could not be were `w` a `string`.
+BEZEL_TEST(sema_call_result_nullable_receiver_3912,
+           null_cond_member_further_plain_access_result_is_nullable_string_7_5) {
+    auto annotated = runAot(prog(
+        "public static method Main(): int "
+        "  const w: string := N()?.Length.ToString(); "
+        "  return 0; "
+        "end Main;"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        annotated, "the initializer for `w` is nullable but the target type "
+                   "is non-nullable"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(
+        annotated, "member access `.ToString` on a nullable expression "
+                   "result"));
+    BEZEL_EXPECT_FALSE(annotated.ran);
+
+    auto accessed = runAot(prog(
+        "public static method Main(): int "
+        "  const w := N()?.Length.ToString(); "
+        "  Console.WriteLine(w.Length); "
+        "  return 0; "
+        "end Main;"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        accessed, "member access `.Length` on a nullable value requires "
+                  "narrowing it to non-null first"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(
+        accessed, "member access `.ToString` on a nullable expression "
+                  "result"));
+    BEZEL_EXPECT_FALSE(accessed.ran);
 }
 
 // ACCEPT control — the `?.` access ALONE (no further plain member access)

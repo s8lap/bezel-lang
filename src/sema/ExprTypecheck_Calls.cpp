@@ -7,6 +7,7 @@
 #include <cstdlib>    // std::strtod, std::free — fix #4724
 #include <limits>     // std::numeric_limits — fix #4801 wrapper constants
 
+#include "common/AwaitScan.hpp"  // forEachSyncSubExpr — the chain-continuation transfer scan (#6070)
 #include "common/BuiltinRegistry.hpp"  // isArrayBackedCollectionName/isDictionaryName/isLinkedListName (#2465)
 #include "common/OwnershipFacts.hpp"  // isBorrowBearingRecordOrSpan (§30.1, #1595)
 #include "sema/BuiltinValueTypes.hpp"  // isStdlibGuidType — §2.6's built-in Guid
@@ -48323,7 +48324,7 @@ TypeRef* ExprTC::nullCondSegmentOwnType(const ast::NullCondMemberExpr& nm) {
         const ast::Expr* savedCallee = calleeOfCallCtx_;
         const std::ptrdiff_t savedArity = currentCallArity_;
         calleeOfCallCtx_ = nullptr;
-        currentCallArity_ = -1;  // no call context (§2328's marker)
+        currentCallArity_ = -1;  // no call context (the member's default)
         resolveMemberAccess(*dotPtr);
         calleeOfCallCtx_ = savedCallee;
         currentCallArity_ = savedArity;
@@ -48413,15 +48414,29 @@ bool ExprTC::resolveNullCondChainContinuation(const ast::MemberAccessExpr& ma) {
     ctx_.diagnostics().rollbackTo(mark);
     nullCondChainSynth_.push_back(std::move(dot));
     if (!clean) return false;
-    if (contSym) ctx_.setExprSymbol(&ma, contSym);
     if (!contTy) return false;  // no value member: nothing to continue at
-    if (contTy->kind == TypeRef::Kind::Function) {
-        // §27.6: a bare method reference — a FUNCTION value. The chain's
-        // result is that function value; §7.5's nullable lift does not
-        // apply to a function type (there is no `null` function value).
-        ctx_.setExprType(&ma, contTy);
-        return true;
-    }
+    // fix #6070 (§7.5, §27.6, §7.6, v0.357): a bare METHOD REFERENCE as the
+    // continuation (`x?.Y.M`, no call) is NOT admitted here — it keeps
+    // §7.4's refusal, as on the base.
+    //
+    // The chain's result is `null` when the segment is null (§7.5: "the
+    // whole chain's result is `null`"), so a method-reference continuation
+    // would have to be a NULLABLE function value (§7.6: "A function value of
+    // nullable function type" exists — `((int) -> ())?`). The first cut of
+    // this fix typed it as the NON-nullable function type instead ("there is
+    // no `null` function value"), so `var g := n?.In.Twice; g(1);` over a
+    // null `n` was ADMITTED and called a null function value (MEASURED:
+    // SIGSEGV, rc=139; the base rejected the program). The bound-method
+    // formation through the chain's short-circuit is not implemented (the
+    // direct `x?.M` method reference is not either), so the shape is declined
+    // rather than admitted unsoundly; #8441 tracks the remaining suffix forms.
+    //
+    // A FUNCTION-TYPED FIELD or PROPERTY read (`x?.Y.Handler`) is an
+    // ordinary value read: it falls through to the nullable lift below.
+    if (contTy->kind == TypeRef::Kind::Function &&
+        (!contSym || dynamic_cast<MethodSymbol*>(contSym)))
+        return false;
+    if (contSym) ctx_.setExprSymbol(&ma, contSym);
     // §7.5: the chain's result is nullable — it is `null` when the segment
     // is null.
     TypeRef* lifted = contTy;
@@ -48457,6 +48472,92 @@ bool ExprTC::resolveNullCondChainCall(const ast::CallExpr& ce) {
     // (or a `!`) before the next suffix, under §7.4."
     TypeRef* own = nullCondSegmentOwnType(*ncm);
     if (!own || own->nullable) return false;
+    // fix #6070 (§7.5, §22.3, §22.4, v0.357): an `out` argument on a
+    // continuation call is NOT admitted. The callee never runs when the `?.`
+    // segment is null, so `out`'s every-normal-path assignment obligation
+    // (§22.4) is not discharged on that path. The direct `recv?.M(out x)`
+    // form admits two shapes only because three passes were taught its
+    // short-circuit (#2345: the per-path definite-assignment split, the
+    // hoisted `out var` slot, the `out owned` refusal of #2393); none of that
+    // reaches a chain continuation, whose call is `.`-spelled. MEASURED
+    // before this refusal: `n?.In.TryGet(out var v)` over a null `n` read an
+    // UNINITIALIZED `v` (it printed 92523904), and `n?.In.Make(out using var
+    // r)` — the shape #2393 keeps rejected on the direct form — compiled.
+    // The twin is still typed below, so an inline `out var` recipient is
+    // declared and the refusal is the only diagnostic.
+    for (const auto& a : ce.args) {
+        if (a.modifier.rfind("out", 0) != 0) continue;
+        ctx_.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            "an `out` argument is not admitted on a call that continues a "
+            "null-conditional chain (`x?.Y." + std::string(ma->member) +
+            "(out ..)`) — the callee never runs when the `?.` segment is "
+            "null, so `out`'s every-normal-path assignment obligation cannot "
+            "be discharged on that path (§22.3, §22.4, §7.5); guard the call "
+            "explicitly instead: `if x <> null then x.Y." +
+            std::string(ma->member) + "(out v); end;` (#6070, #2345)");
+        break;
+    }
+    // fix #6070 (§7.5, §28.3, v0.357): a `move` argument is NOT admitted
+    // either, for the same reason. §7.5: "the argument and index expressions
+    // of the skipped suffixes are not evaluated", so on the null path the
+    // binding is not moved and still owes its disposal — a CONDITIONAL
+    // transfer, which the ownership pass refuses in its explicit `if`
+    // spelling ("would be dropped here without disposal") and does not see
+    // through a chain: it reads the `.`-spelled call as an unconditional
+    // consume. MEASURED before this refusal: `n?.In.Take(move r)` over a null
+    // `n` leaked `r` (LeakSanitizer, 16 bytes; its destructor never ran).
+    // The `move` is refused wherever it sits in the argument, not only as the
+    // whole argument: `n?.In.Take(Wrap(move r))` leaked `r` on the null path
+    // exactly as `n?.In.Take(move r)` did (MEASURED, the same 16 bytes). The
+    // scan is the shared synchronous sub-expression walk; a lambda body is
+    // its own scope and is not searched. A.7's `owned r` marker in an
+    // if-expression branch of an argument is NOT refused: it is the
+    // consume-if-selected form, which keeps a runtime record of whether the
+    // transfer happened (MEASURED: `n?.In.Take((if c then owned r else new
+    // Res()))` over a null `n` disposes `r` once at scope exit, no leak).
+    // Recorded, conservative: a `move` of a binding the argument itself
+    // declares (a `(var t := ..; ..)` binding atom) is refused too.
+    const ast::Expr* moveSite = nullptr;
+    for (const auto& a : ce.args) {
+        common::forEachSyncSubExpr(a.value.get(), [&](const ast::Expr& n) {
+            if (moveSite) return;
+            if (auto* mv = dynamic_cast<const ast::UnaryExpr*>(&n))
+                if (mv->op == "move") moveSite = &n;
+        });
+        if (moveSite) break;
+    }
+    if (moveSite) {
+        ctx_.diagnostics().report(
+            Severity::Error, moveSite->span.begin,
+            "a `move` argument is not admitted on a call that continues a "
+            "null-conditional chain (`x?.Y." + std::string(ma->member) +
+            "(move v)`) — the callee never runs when the `?.` segment is "
+            "null, so on that path the binding is neither transferred nor "
+            "disposed (§7.5, §28.3); transfer it under an explicit "
+            "`if x <> null then .. else .. end;` that disposes the binding "
+            "on the other path (#6070)");
+    }
+    // fix #6070 (§7.5, §28.6, v0.357): `x?.F.Dispose()` is NOT admitted. The
+    // `?.` segment is a field or property READ, and §28.6 ("Who may call
+    // Dispose()") makes that a borrow the caller does not own — "an `owned`
+    // field is disposable only through `this`". The ownership pass enforces
+    // it on the `.` spelling by the receiver's AST shape (an identifier or a
+    // member access resolving to a field or a getter), which a `?.` segment
+    // does not have, so the chain slipped past it. MEASURED before this
+    // refusal: `a?.R.Dispose();` over an `owned R: Res` field compiled and
+    // ran `R`'s destructor from outside its declaring type, where the `.`
+    // spelling `a.R.Dispose();` is §28.6's error.
+    if (ma->member == "Dispose" && ce.args.empty()) {
+        ctx_.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            "cannot call `Dispose()` on the `?.` segment of a "
+            "null-conditional chain (§28.6 \"Who may call Dispose()\", "
+            "§7.5) — the segment is a field or property read, which is a "
+            "borrow the caller does not own, and an `owned` field is "
+            "disposable only through `this` (code of its declaring type); "
+            "the value's actual owner disposes it (#6070)");
+    }
     // The `.`-spelled TWIN of the whole call.
     auto ph = std::make_unique<ast::IdentifierExpr>();
     ph->name = "<nullcond-chain-receiver>";  // unspellable (#6681)
@@ -48494,14 +48595,37 @@ bool ExprTC::resolveNullCondChainCall(const ast::CallExpr& ce) {
         ctx_.setExprType(ma, calleeTy);
     if (Symbol* calleeSym = ctx_.exprSymbol(*dotPtr))
         ctx_.setExprSymbol(ma, calleeSym);
+    // fix #6070 (§7.5, §22.5, §26.5, v0.357): everything ELSE the twin's
+    // typing published is keyed on the TWIN's nodes, and codegen lowers the
+    // REAL call — so it is re-published on the real nodes, exactly as the
+    // callee's type and symbol are above. Without this the §22.5 binding of
+    // a NAMED argument on a built-in continuation was lost and the arguments
+    // were lowered in parameter order against swapped slots (MEASURED:
+    // `a?.Name.Substring(length := 2, startIndex := 1)` over "Hello" printed
+    // `l`; the `.` spelling prints `el`).
+    if (const auto* bnd = ctx_.builtinCallBinding(*synth))
+        ctx_.setBuiltinCallBinding(&ce, *bnd);
+    if (const auto* extBnd = ctx_.exprExtBinding(*dotPtr))
+        ctx_.setExprExtBinding(ma, *extBnd);
+    if (Symbol* callSym = ctx_.exprSymbol(*synth))
+        ctx_.setExprSymbol(&ce, callSym);
     mutCe.args = std::move(synth->args);
     nullCondChainCallSynth_.push_back(std::move(synth));
-    if (!twinTy) return true;  // the twin reported the diagnostic
+    // An UNTYPED twin is either a call the twin already rejected (its
+    // diagnostic is the call's own) or a call with NO VALUE — a built-in
+    // procedure such as `Array<T>.Add`, `Sort`, `Clear`, which the `.`
+    // spelling leaves untyped too. The chain is then a statement-level
+    // effect (§7.5's own `user?.Log("Accessed");`): codegen runs the
+    // continuation on the non-null path and yields no value.
+    if (!twinTy) return true;
     // §7.5: the whole chain's result is `null` when the segment is null, so
-    // the chain's result is the twin's result, lifted to nullable.
+    // the chain's result is the twin's result, lifted to nullable. A
+    // FUNCTION-typed result is lifted like any other (§7.6: a nullable
+    // function type exists): leaving it non-nullable admitted a direct call
+    // of the null result (MEASURED: `var g := n?.In.GetH(); g(1);` over a
+    // null `n` — SIGSEGV, rc=139).
     TypeRef* lifted = twinTy;
-    if (!twinTy->nullable && twinTy->kind != TypeRef::Kind::Function &&
-        twinTy->kind != TypeRef::Kind::Unit) {
+    if (!twinTy->nullable && twinTy->kind != TypeRef::Kind::Unit) {
         lifted = ctx_.makeTypeRef(*twinTy);
         lifted->nullable = true;
     }

@@ -11896,17 +11896,45 @@ llvm::Value* Emitter::lowerNullCondChain(const ast::Expr& e) {
     const sema::TypeRef* segTy = ctx_.exprType(*nm);
     const sema::TypeRef* contTy =
         call ? ctx_.exprType(*call) : ctx_.exprType(*cont);
-    if (!recvTy || !segTy || !contTy) return nullptr;
+    // fix #6070 (§7.5, v0.357): a continuation CALL with NO VALUE — a
+    // built-in procedure (`x?.Items.Add(v)`, `.Sort()`, `.Clear()`,
+    // `Dictionary.Add`, `Queue.Enqueue`, …: sema leaves the call untyped,
+    // exactly as it leaves the `.` spelling) or a unit-returning user method
+    // (`x?.Y.Log(..)`, typed `()`).
+    //
+    // §7.5 admits it — "**The chain is the whole postfix sequence** …, its
+    // plain `.`, `[ ]` and `( )` suffixes included", and its own example
+    // `user?.Log("Accessed");` is a call with no value — and fixes what it
+    // does: on the null path "no member is read, no call is performed, and
+    // the argument and index expressions of the skipped suffixes are not
+    // evaluated either"; otherwise the call is performed.
+    //
+    // THE DEFECT this arm closes. The first cut of this lowering returned
+    // here whenever the call carried no sema type, BEFORE lowering anything,
+    // so the admitted statement `x?.Items.Add(5);` emitted NO code at all:
+    // the element was never added, no diagnostic, exit 0 (MEASURED:
+    // `after add: 0`; the `.` spelling prints 1; the base REJECTED the
+    // program under §7.4). There is nothing to lift for such a call, so it
+    // takes the same short-circuit as a value continuation and simply yields
+    // no value — the result the `.` spelling of a procedure call yields.
+    const bool voidCont =
+        call && (!contTy || contTy->kind == sema::TypeRef::Kind::Unit);
+    if (!recvTy || !segTy || (!contTy && !voidCont)) return nullptr;
     // The SEGMENT's own type — the value the continuation runs on (§7.5: the
     // suffix is typed at "the preceding segment's own declared type").
     sema::TypeRef* segOwnTy = ctx_.makeTypeRef(*segTy);
     segOwnTy->nullable = false;
     // The CONTINUATION's own type, and the chain's RESULT type (§7.5: the
-    // chain's result is `null` when the segment is null).
-    sema::TypeRef* contOwnTy = ctx_.makeTypeRef(*contTy);
-    contOwnTy->nullable = false;
-    sema::TypeRef* resTy = ctx_.makeTypeRef(*contTy);
-    resTy->nullable = true;
+    // chain's result is `null` when the segment is null). A continuation
+    // with no value has neither.
+    sema::TypeRef* contOwnTy = nullptr;
+    sema::TypeRef* resTy = nullptr;
+    if (!voidCont) {
+        contOwnTy = ctx_.makeTypeRef(*contTy);
+        contOwnTy->nullable = false;
+        resTy = ctx_.makeTypeRef(*contTy);
+        resTy->nullable = true;
+    }
 
     llvm::Value* rcv = lowerExpr(*nm->target);
     if (!rcv) return nullptr;
@@ -11977,18 +12005,31 @@ llvm::Value* Emitter::lowerNullCondChain(const ast::Expr& e) {
     contDot->span = cont->span;
     contDot->member = cont->member;
     contDot->target = std::move(segDot);
-    ctx_.setExprType(contDot.get(), contOwnTy);
+    if (contOwnTy) ctx_.setExprType(contDot.get(), contOwnTy);
     // The twin stands for the CONTINUATION access, so it carries the
     // continuation's SYMBOL — the `.` lowering of a user method / property
     // keys on it.
     if (sema::Symbol* contSym = ctx_.exprSymbol(*cont))
         ctx_.setExprSymbol(contDot.get(), contSym);
+    // … and the §26.5 type-variable binding a generic EXTENSION method
+    // matched with (sema re-publishes it on the real callee; the `.`
+    // lowering reads it off the callee node to set up its substitution).
+    if (const auto* extBnd = ctx_.exprExtBinding(*cont))
+        ctx_.setExprExtBinding(contDot.get(), *extBnd);
     llvm::Value* inner = nullptr;
     if (call) {
         auto synth = std::make_unique<ast::CallExpr>();
         synth->span = call->span;
         synth->callee = std::move(contDot);
-        ctx_.setExprType(synth.get(), contOwnTy);
+        // A continuation with no value keeps the type sema gave the call —
+        // none for a built-in procedure, `()` for a unit-returning method —
+        // which is what the `.` spelling of the same call carries.
+        if (contOwnTy)
+            ctx_.setExprType(synth.get(), contOwnTy);
+        else if (contTy)
+            ctx_.setExprType(synth.get(), ctx_.makeTypeRef(*contTy));
+        if (sema::Symbol* callSym = ctx_.exprSymbol(*call))
+            ctx_.setExprSymbol(synth.get(), callSym);
         // fix #7730 (§22.5, v0.350): sema publishes a named-argument binding
         // keyed on the CallExpr it checked — the `.` twin is a fresh node, so
         // without this the built-in arms read no binding and lowered the
@@ -12005,6 +12046,14 @@ llvm::Value* Emitter::lowerNullCondChain(const ast::Expr& e) {
         nullCondChainSynth_.push_back(std::move(contDot));
     }
     exprValueOverride_.erase(segKey);
+    if (voidCont) {
+        // No value to lift (see `voidCont` above): the continuation ran on
+        // the non-null path — or reported its own diagnostic, as the `.`
+        // spelling would — and the chain yields no value, on either path.
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        return nullptr;
+    }
     // The chain's result: the continuation's own type, nullable (§7.5).
     const bool valueResult = isNullableValueTy(resTy);
     llvm::Type* nullTy = valueResult
@@ -12015,8 +12064,26 @@ llvm::Value* Emitter::lowerNullCondChain(const ast::Expr& e) {
                                   !inner->getType()->isVoidTy())
                               : inner->getType()->isPointerTy());
     if (!shapeOk) {
-        // Unrecognised shape: close the CFG validly and keep the old
-        // "lowered to nothing" result (the #3079 backstop reports it).
+        // fix #6070 (§7.5, v0.357): the continuation is TYPED — sema promised
+        // a value — and this lowering has none to lift to the chain's
+        // nullable result: either the `.` twin lowered to nothing (MEASURED:
+        // a built-in method named without a call, `a?.Name.ToUpper`, which
+        // sema types as the method's result), or it lowered to a value of a
+        // shape the lift does not cover (its code is already in the access
+        // block). Returning "no value" would let the enclosing store degrade
+        // to a zero value behind an `internal:` note — `var f :=
+        // a?.Name.ToUpper;` over a non-null `a` then reads `null` — a
+        // silently wrong program in a shape the base rejected. Refuse it.
+        ctx_.diagnostics().report(
+            Severity::Error, e.span.begin,
+            "the continuation `." + std::string(cont->member) +
+            "` of this null-conditional chain " +
+            (inner ? "yields a value the compiler cannot yet lift to the "
+                     "chain's nullable result"
+                   : "does not lower to a value (a method named without a "
+                     "call is not one the compiler can produce here)") +
+            " (\xC2\xA7""7.5, #6070): bind the `?.` segment to a local, "
+            "guard it with `<> null`, and continue from the local");
         builder_.CreateBr(endBB);
         builder_.SetInsertPoint(endBB);
         return nullptr;

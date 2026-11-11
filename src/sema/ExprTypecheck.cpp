@@ -28389,9 +28389,33 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // see the stamp beside the `reject` diagnostic for why this
                 // must be a separate flag rather than plain `!reject`.
                 bool trivialDisposeProducer = false;
+                // fix #6070 (§7.5, §21.9, v0.357): the continuation call of a
+                // §7.5 chain (`x?.Y.Make();`) is typed NULLABLE only because
+                // the chain lifts it — on the path where the call runs it
+                // produces exactly the owned value its `.` spelling
+                // (`x.Y.Make();`) produces, and that spelling is inspected
+                // below. So the `!t->nullable` gate does not stand for it:
+                // the nullable result is `null` on the skipped path and the
+                // callee's own owned value on the other. MEASURED before this:
+                // `a?.In.Make();` over a destructor-bearing class compiled
+                // and leaked every result (LeakSanitizer, 300 objects in a
+                // 300-iteration loop; no destructor ran), where `a.In.Make();`
+                // is this section's hard error. Only the chain's call is
+                // widened: a `.`-spelled producer that is nullable by its own
+                // declaration (`owned T?`) keeps the gate, as before.
+                bool chainContinuationCall = false;
+                if (auto* chainCe = dynamic_cast<const ast::CallExpr*>(
+                        es->expr.get()))
+                    if (auto* chainMa =
+                            dynamic_cast<const ast::MemberAccessExpr*>(
+                                chainCe->callee.get()))
+                        if (auto* chainSeg =
+                                dynamic_cast<const ast::NullCondMemberExpr*>(
+                                    chainMa->target.get()))
+                            chainContinuationCall = !chainSeg->parenthesized;
                 if (t && t->kind == TypeRef::Kind::InlineArray && t->arrayOwned) {
                     reject = true;
-                } else if (t && !t->nullable &&
+                } else if (t && (!t->nullable || chainContinuationCall) &&
                            t->kind == TypeRef::Kind::Named && t->declaration &&
                            t->declaration->kind == ast::TypeDeclKind::Class &&
                            !t->declaration->isValueBuiltin) {

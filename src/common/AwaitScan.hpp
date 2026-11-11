@@ -68,6 +68,7 @@ struct CaseArm;
 namespace bezel::common {
 
 using AwaitSiteFn = const std::function<void(const ast::UnaryExpr*)>&;
+using SubExprFn = const std::function<void(const ast::Expr&)>&;
 
 // Calls `onAwait(ue)` once for every explicit `await` UnaryExpr reachable
 // from `e` (including `e` itself, when it is one) along a synchronous
@@ -89,5 +90,14 @@ void forEachAwaitSiteInPattern(const ast::Pattern* p, AwaitSiteFn onAwait);
 // statement-level `Emitter::containsAwait` / `countAwaits` CaseStmt handling
 // (LlvmBackend_Async.cpp) instead.
 void forEachAwaitSiteInCaseArm(const ast::CaseArm& arm, AwaitSiteFn onAwait);
+
+// The same walk without the `await` filter (fix #6070): calls `onNode(n)` once
+// for every expression node reachable from `e` along a synchronous
+// sub-expression edge, `e` itself first (pre-order). Same LambdaExpr
+// exclusion and same exhaustiveness contract as forEachAwaitSite, which is
+// now a filter over this walk — so a caller that must find some OTHER
+// marker in an expression tree (a `move`) does not grow
+// a fifth hand-written copy. `e` may be null (no-op).
+void forEachSyncSubExpr(const ast::Expr* e, SubExprFn onNode);
 
 }  // namespace bezel::common

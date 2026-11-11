@@ -41,84 +41,91 @@ namespace {
 
 }  // namespace
 
-void forEachAwaitSite(const ast::Expr* e, AwaitSiteFn onAwait) {
+// The ONE walk (see AwaitScan.hpp): `onNode` is called once for every
+// expression node reachable from `e` along a synchronous sub-expression edge,
+// `e` itself first (pre-order), a nested LambdaExpr's body excluded. The
+// public entry points below are filters over it.
+static void walkPattern(const ast::Pattern* p, SubExprFn onNode);
+static void walkCaseArm(const ast::CaseArm& arm, SubExprFn onNode);
+
+static void walkExpr(const ast::Expr* e, SubExprFn onNode) {
     if (!e) return;
+    onNode(*e);
 
     // --- Kinds with Expr children: recurse, mirroring the four original
     // copies' shape exactly (order preserved for a mechanical diff). ---
     if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
-        if (ue->op == "await") onAwait(ue);
-        forEachAwaitSite(ue->operand.get(), onAwait);
+        walkExpr(ue->operand.get(), onNode);
         return;
     }
     if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(e)) {
-        forEachAwaitSite(bin->left.get(), onAwait);
-        forEachAwaitSite(bin->right.get(), onAwait);
+        walkExpr(bin->left.get(), onNode);
+        walkExpr(bin->right.get(), onNode);
         return;
     }
     if (auto* me = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
-        forEachAwaitSite(me->target.get(), onAwait);
+        walkExpr(me->target.get(), onNode);
         return;
     }
     if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
-        forEachAwaitSite(nm->target.get(), onAwait);
+        walkExpr(nm->target.get(), onNode);
         return;
     }
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
-        forEachAwaitSite(ce->callee.get(), onAwait);
-        for (const auto& a : ce->args) forEachAwaitSite(a.value.get(), onAwait);
+        walkExpr(ce->callee.get(), onNode);
+        for (const auto& a : ce->args) walkExpr(a.value.get(), onNode);
         return;
     }
     if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
-        forEachAwaitSite(nc->callee.get(), onAwait);
-        for (const auto& a : nc->args) forEachAwaitSite(a.value.get(), onAwait);
+        walkExpr(nc->callee.get(), onNode);
+        for (const auto& a : nc->args) walkExpr(a.value.get(), onNode);
         return;
     }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
-        forEachAwaitSite(ix->target.get(), onAwait);
-        for (const auto& a : ix->indices) forEachAwaitSite(a.value.get(), onAwait);
+        walkExpr(ix->target.get(), onNode);
+        for (const auto& a : ix->indices) walkExpr(a.value.get(), onNode);
         return;
     }
     if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
-        forEachAwaitSite(bg->operand.get(), onAwait);
+        walkExpr(bg->operand.get(), onNode);
         return;
     }
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
-        for (const auto& a : ne->args) forEachAwaitSite(a.value.get(), onAwait);
+        for (const auto& a : ne->args) walkExpr(a.value.get(), onNode);
         return;
     }
     if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
-        forEachAwaitSite(cd->condition.get(), onAwait);
-        forEachAwaitSite(cd->thenValue.get(), onAwait);
-        forEachAwaitSite(cd->elseValue.get(), onAwait);
+        walkExpr(cd->condition.get(), onNode);
+        walkExpr(cd->thenValue.get(), onNode);
+        walkExpr(cd->elseValue.get(), onNode);
         return;
     }
     if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e)) {
-        forEachAwaitSite(te->operand.get(), onAwait);
+        walkExpr(te->operand.get(), onNode);
         return;
     }
     if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
-        forEachAwaitSite(th->operand.get(), onAwait);
+        walkExpr(th->operand.get(), onNode);
         return;
     }
     if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
-        forEachAwaitSite(we->source.get(), onAwait);
-        for (const auto& ia : we->assigns) forEachAwaitSite(ia.value.get(), onAwait);
+        walkExpr(we->source.get(), onNode);
+        for (const auto& ia : we->assigns) walkExpr(ia.value.get(), onNode);
         return;
     }
     if (auto* re = dynamic_cast<const ast::RangeExpr*>(e)) {
-        forEachAwaitSite(re->lo.get(), onAwait);
-        forEachAwaitSite(re->hi.get(), onAwait);
-        forEachAwaitSite(re->step.get(), onAwait);
+        walkExpr(re->lo.get(), onNode);
+        walkExpr(re->hi.get(), onNode);
+        walkExpr(re->step.get(), onNode);
         return;
     }
     if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
-        for (const auto& k : cl->keys) forEachAwaitSite(k.get(), onAwait);
-        for (const auto& v : cl->elements) forEachAwaitSite(v.get(), onAwait);
+        for (const auto& k : cl->keys) walkExpr(k.get(), onNode);
+        for (const auto& v : cl->elements) walkExpr(v.get(), onNode);
         return;
     }
     if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
-        for (const auto& p : is->parts) forEachAwaitSite(p.expr.get(), onAwait);
+        for (const auto& p : is->parts) walkExpr(p.expr.get(), onNode);
         return;
     }
 
@@ -126,9 +133,9 @@ void forEachAwaitSite(const ast::Expr* e, AwaitSiteFn onAwait) {
     // original copies (none of them even looked at `scrutinee` or `arms`) —
     // MEASURED LIVE, not latent (see the header). ---
     if (auto* cse = dynamic_cast<const ast::CaseExpr*>(e)) {
-        forEachAwaitSite(cse->scrutinee.get(), onAwait);
+        walkExpr(cse->scrutinee.get(), onNode);
         for (const auto& arm : cse->arms)
-            forEachAwaitSiteInCaseArm(arm, onAwait);
+            walkCaseArm(arm, onNode);
         return;
     }
 
@@ -137,8 +144,8 @@ void forEachAwaitSite(const ast::Expr* e, AwaitSiteFn onAwait) {
     // (§17.15/A.7); their `initializer` is the clause's Expr.
     if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
         for (const auto& cl : bx->clauses)
-            if (cl) forEachAwaitSite(cl->initializer.get(), onAwait);
-        forEachAwaitSite(bx->body.get(), onAwait);
+            if (cl) walkExpr(cl->initializer.get(), onNode);
+        walkExpr(bx->body.get(), onNode);
         return;
     }
 
@@ -170,28 +177,28 @@ void forEachAwaitSite(const ast::Expr* e, AwaitSiteFn onAwait) {
     unhandledAwaitScanExprKind(*e);
 }
 
-void forEachAwaitSiteInPattern(const ast::Pattern* p, AwaitSiteFn onAwait) {
+static void walkPattern(const ast::Pattern* p, SubExprFn onNode) {
     if (!p) return;
     if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p)) {
-        for (const auto& c : cp->constants) forEachAwaitSite(c.get(), onAwait);
+        for (const auto& c : cp->constants) walkExpr(c.get(), onNode);
         return;
     }
     if (auto* rp = dynamic_cast<const ast::RangePattern*>(p)) {
-        forEachAwaitSite(rp->rangeExpr.get(), onAwait);
+        walkExpr(rp->rangeExpr.get(), onNode);
         return;
     }
     if (auto* rop = dynamic_cast<const ast::RelOpPattern*>(p)) {
-        forEachAwaitSite(rop->expr.get(), onAwait);
+        walkExpr(rop->expr.get(), onNode);
         return;
     }
     if (auto* ap = dynamic_cast<const ast::AltPattern*>(p)) {
         for (const auto& m : ap->members)
-            forEachAwaitSiteInPattern(m.get(), onAwait);
+            walkPattern(m.get(), onNode);
         return;
     }
     if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p)) {
         for (const auto& sub : dp->subPatterns)
-            forEachAwaitSiteInPattern(sub.pattern.get(), onAwait);
+            walkPattern(sub.pattern.get(), onNode);
         return;
     }
     // Leaves: no embedded Expr. BindingPattern/TypePattern's `type` field is
@@ -206,13 +213,39 @@ void forEachAwaitSiteInPattern(const ast::Pattern* p, AwaitSiteFn onAwait) {
     unhandledAwaitScanPatternKind(*p);
 }
 
-void forEachAwaitSiteInCaseArm(const ast::CaseArm& arm, AwaitSiteFn onAwait) {
-    forEachAwaitSiteInPattern(arm.pattern.get(), onAwait);
-    forEachAwaitSite(arm.guard.get(), onAwait);
+static void walkCaseArm(const ast::CaseArm& arm, SubExprFn onNode) {
+    walkPattern(arm.pattern.get(), onNode);
+    walkExpr(arm.guard.get(), onNode);
     if (arm.bodyKind == ast::CaseArmBodyKind::Expression)
-        forEachAwaitSite(arm.exprBody.get(), onAwait);
+        walkExpr(arm.exprBody.get(), onNode);
     // Block-form body: `arm.stmts` are Stmt-level, out of this Expr-level
     // walk's scope (see the header).
+}
+
+// Adapts an await callback to the node walk: an explicit `await` is a
+// UnaryExpr whose `op` is "await". Pre-order, so an outer `await` is reported
+// before the awaits inside its operand, as before.
+static std::function<void(const ast::Expr&)> awaitFilter(AwaitSiteFn onAwait) {
+    return [&onAwait](const ast::Expr& n) {
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&n))
+            if (ue->op == "await") onAwait(ue);
+    };
+}
+
+void forEachAwaitSite(const ast::Expr* e, AwaitSiteFn onAwait) {
+    walkExpr(e, awaitFilter(onAwait));
+}
+
+void forEachAwaitSiteInPattern(const ast::Pattern* p, AwaitSiteFn onAwait) {
+    walkPattern(p, awaitFilter(onAwait));
+}
+
+void forEachAwaitSiteInCaseArm(const ast::CaseArm& arm, AwaitSiteFn onAwait) {
+    walkCaseArm(arm, awaitFilter(onAwait));
+}
+
+void forEachSyncSubExpr(const ast::Expr* e, SubExprFn onNode) {
+    walkExpr(e, onNode);
 }
 
 }  // namespace bezel::common
