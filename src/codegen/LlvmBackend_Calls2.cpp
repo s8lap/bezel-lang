@@ -3,6 +3,8 @@
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 #include "sema/ConstFold.hpp"  // fix #7285: §17.14 constant folding for the radix argument (§5.1)
 
+#include <cerrno>  // ERANGE — stdlib §9.1's 64-bit parse range failure (fix #8540)
+
 namespace bezel::codegen {
 
 namespace {
@@ -2625,6 +2627,44 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return res;
     }
 
+    // stdlib §9.1 (v0.357, fix #8540): the 64-bit widths' RANGE rule.
+    //
+    // `long` is strtoll's full width and `ulong` is strtoull's, so the
+    // conversion SATURATES at the 64-bit boundary instead of reporting a
+    // failure — and the saturated value (Int64.MaxValue / UInt64.MaxValue) is
+    // ITSELF in range, so the returned value cannot tell a saturating
+    // conversion from a legal one.  errno can: strtoll/strtoull report the
+    // failure as ERANGE.  errno is cleared BEFORE the conversion (it is only
+    // meaningful right after a call that sets it) and read IMMEDIATELY after
+    // it (nothing between the conversion and the read can set it).
+    //
+    // `ulong` converts with strtoull — its full magnitude: strtoll cannot
+    // represent a legal UInt64 value above Int64.MaxValue and saturates it to
+    // Int64.MaxValue.
+    //
+    // `endSlot` receives the conversion's end pointer (as strtoll/strtoull
+    // write it — the input-grammar check reads it).  The returned boolean is
+    // the RANGE FAILURE: true exactly when the input spells a value the
+    // 64-bit width cannot represent.
+    auto emitI64TowerParse = [&](llvm::Value* strData, llvm::Value* radix,
+                                  llvm::Value* endSlot,
+                                  llvm::Value*& outVal) -> llvm::Value* {
+        auto* strtoFn64 = (pt == P::ULong)
+            ? declareC("strtoull", i64(), {ptrTy(), ptrTy(), i32()})
+            : declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+        // `errno` is a macro in C; the function it expands to is the portable
+        // way to reach it.  It is a per-thread int.
+        auto* errnoLocFn = declareC("__errno_location", ptrTy(), {});
+        llvm::Value* errnoPtr =
+            builder_.CreateCall(errnoLocFn, {}, "parse.errno");
+        builder_.CreateStore(builder_.getInt32(0), errnoPtr, "parse.err0");
+        outVal = builder_.CreateCall(
+            strtoFn64, {strData, endSlot, radix}, "parse.v64");
+        llvm::Value* errCode = builder_.CreateLoad(i32(), errnoPtr, "parse.err");
+        return builder_.CreateICmpEQ(
+            errCode, llvm::ConstantInt::get(i32(), ERANGE), "parse.sat");
+    };
+
     // stdlib §9.1 (v0.357, fix #7318): the integer tower's PARSE CHECK, in
     // the ONE spelling the `TryParse` and `ParseOrNull` arms share.
     //
@@ -2649,8 +2689,19 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             ? declareC("strtoull", i64(), {ptrTy(), ptrTy(), i32()})
             : declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
         auto* endSlotI = entryAlloca(ptrTy());
-        llvm::Value* val64 = builder_.CreateCall(
-            strtoFnT, {strData, endSlotI, builder_.getInt32(10)}, "tryp.val");
+        // stdlib §9.1 (v0.357, fix #8540): the 64-bit widths need the
+        // CONVERSION'S range failure, which only errno carries (the helper
+        // above); the narrower widths range-check the VALUE (the branch
+        // below), which is why `int` was always right.
+        llvm::Value* val64 = nullptr;
+        llvm::Value* rangeFail = nullptr;
+        if (pt == P::Long || pt == P::ULong) {
+            rangeFail = emitI64TowerParse(
+                strData, builder_.getInt32(10), endSlotI, val64);
+        } else {
+            val64 = builder_.CreateCall(
+                strtoFnT, {strData, endSlotI, builder_.getInt32(10)}, "tryp.val");
+        }
         llvm::Value* endPtrI = builder_.CreateLoad(ptrTy(), endSlotI);
         // ok = first-char not whitespace AND (endPtr != strData) AND (*endPtr == '\0')
         // #5296: for a span operand `strData` is the materialized window, whose
@@ -2670,13 +2721,20 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // Store result: 0 on failure, parsed value on success.
         if (pt == P::Long || pt == P::ULong) {
             // ulong additionally rejects a leading '-' (strtoull silently
-            // negates it); long is the full strtoll width — no range check.
+            // negates it).
             if (pt == P::ULong) {
                 llvm::Value* fcNeg = builder_.CreateICmpEQ(
                     fcI, llvm::ConstantInt::get(i8TyI, '-'), "tryp.neg");
                 ok = builder_.CreateAnd(ok, builder_.CreateNot(fcNeg),
                                         "tryp.okU");
             }
+            // stdlib §9.1 (v0.357, fix #8540): the 64-bit widths' range rule —
+            // a well-formed input that spells a value the type cannot
+            // represent is NOT admitted: `TryParse` returns false (stdlib §1
+            // shape (c): false exactly where `Parse` raises) and the *OrNull
+            // tier returns null (null exactly where `Parse` raises).
+            ok = builder_.CreateAnd(ok, builder_.CreateNot(rangeFail),
+                                    "tryp.okR");
             llvm::Value* zero64 = builder_.getInt64(0);
             llvm::Value* sel64 = builder_.CreateSelect(ok, val64, zero64, "tryp.sel");
             outVal = sel64;
@@ -3465,14 +3523,24 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                            : builder_.CreateTrunc(v64, lowerPrimitive(pt));
             }
             if (pt == P::Long || pt == P::ULong) {
-                // #1227 / §9.1: use strtoll (not atoll) so we can validate the
-                // input.  Reject empty, non-numeric leading chars, trailing
-                // garbage, and leading whitespace → FormatException.
-                auto* strtollFnL =
-                    declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+                // #1227 / §9.1: use strtoll/strtoull (not atoll/atoull) so we
+                // can validate the input.  Reject empty, non-numeric leading
+                // chars, trailing garbage, and leading whitespace →
+                // FormatException.
+                //
+                // stdlib §9.1 (v0.357, fix #8540): the 64-bit widths' RANGE
+                // rule.  `long` is strtoll's full width and `ulong` is
+                // strtoull's, so the conversion SATURATES at the boundary
+                // instead of reporting a failure, and the saturated value is
+                // ITSELF in range — the failure is visible only in errno
+                // (ERANGE), which the helper reads.  `ulong` converts with
+                // strtoull (its full magnitude): strtoll cannot represent a
+                // legal UInt64 value above Int64.MaxValue and saturates it to
+                // Int64.MaxValue.
                 auto* endSlotL = entryAlloca(ptrTy());
-                llvm::Value* v64L = builder_.CreateCall(
-                    strtollFnL, {data, endSlotL, builder_.getInt32(10)}, "parse.vL");
+                llvm::Value* v64L = nullptr;
+                llvm::Value* rangeFailL =
+                    emitI64TowerParse(data, builder_.getInt32(10), endSlotL, v64L);
                 auto* i8TyL = llvm::Type::getInt8Ty(llvm_);
                 llvm::Value* fcL = builder_.CreateLoad(i8TyL, data, "parse.fcL");
                 llvm::Value* fcWsL = builder_.CreateICmpULE(
@@ -3485,8 +3553,24 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 llvm::Value* validL = builder_.CreateAnd(
                     builder_.CreateNot(fcWsL),
                     builder_.CreateAnd(advL, atNulL), "parse.vfmtL");
+                if (pt == P::ULong) {
+                    // strtoull silently negates a leading '-': the unsigned
+                    // width's input grammar rejects it — the same reject the
+                    // TryParse branch and the radix form make → FormatException.
+                    llvm::Value* fcNegL = builder_.CreateICmpEQ(
+                        fcL, llvm::ConstantInt::get(i8TyL, '-'), "parse.negL");
+                    validL = builder_.CreateAnd(
+                        validL, builder_.CreateNot(fcNegL), "parse.vfmtLu");
+                }
                 emitGuardThrow(builder_.CreateNot(validL, "parse.fmtbadL"),
                                "FormatException");
+                // §9.1's range failure: a well-formed input that spells a
+                // value the type cannot represent raises ParseRangeException —
+                // an OverflowException (stdlib §9.1: "ParseRangeException
+                // derives from OverflowException"; the compiler's builtin
+                // exception set has no ParseRangeException, so the parse
+                // family raises OverflowException, as the narrower widths do).
+                emitGuardThrow(rangeFailL, "OverflowException");
                 return v64L;
             }
             if (pt == P::Double || pt == P::Float) {
@@ -3710,11 +3794,14 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                            : builder_.CreateTrunc(v64, lowerPrimitive(pt));
             }
             if (pt == P::Long || pt == P::ULong) {
-                auto* strtollFnL =
-                    declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+                // The span overload (stdlib §9.1, #1810) carries the string
+                // form's contract — the same FormatException/ParseRangeException
+                // contract — so the 64-bit widths' range failure applies here
+                // too (fix #8540).
                 auto* endSlotL = entryAlloca(ptrTy());
-                llvm::Value* v64L = builder_.CreateCall(
-                    strtollFnL, {win.data, endSlotL, builder_.getInt32(10)}, "parse.vL");
+                llvm::Value* v64L = nullptr;
+                llvm::Value* rangeFailL = emitI64TowerParse(
+                    win.data, builder_.getInt32(10), endSlotL, v64L);
                 auto* i8TyL = llvm::Type::getInt8Ty(llvm_);
                 llvm::Value* fcL = builder_.CreateLoad(i8TyL, win.data, "parse.fcL");
                 llvm::Value* fcWsL = builder_.CreateICmpULE(
@@ -3727,8 +3814,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 llvm::Value* validL = builder_.CreateAnd(
                     builder_.CreateNot(fcWsL),
                     builder_.CreateAnd(advL, atNulL), "parse.vfmtL");
+                if (pt == P::ULong) {
+                    // strtoull silently negates a leading '-' (see the string
+                    // form above).
+                    llvm::Value* fcNegL = builder_.CreateICmpEQ(
+                        fcL, llvm::ConstantInt::get(i8TyL, '-'), "parse.negL");
+                    validL = builder_.CreateAnd(
+                        validL, builder_.CreateNot(fcNegL), "parse.vfmtLu");
+                }
                 emitGuardThrow(builder_.CreateNot(validL, "parse.fmtbadL"),
                                "FormatException");
+                // §9.1's range failure (see the string form above).
+                emitGuardThrow(rangeFailL, "OverflowException");
                 if (win.owned) emitStringRelease(win.owned);
                 return v64L;
             }
