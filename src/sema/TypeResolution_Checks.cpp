@@ -8840,6 +8840,21 @@ void Resolver::checkHidingAndOverride() {
                     // marker 19 lines above; the base-side read is the
                     // second half of the same pair (override rejection +
                     // base-copy).
+                    // fix #8259 (§14.2, §12.1, v0.357): remember WHICH base
+                    // method this override overrides, so a later reader of
+                    // the inherited `where` set (`ExprTC::
+                    // currentMethodTypeParamMayInherit`) follows the
+                    // overridden declaration rather than every same-shape
+                    // sibling. An override is the witness of the base method
+                    // it overrides, so the pair is recorded in the same
+                    // pair-keyed table as the #8184 §11.2 interface
+                    // witnesses, keyed (override method, overridden method);
+                    // a real witness is keyed (type, interface method), so
+                    // the key spaces never meet. (No new `SemaContext`
+                    // member: that header is in every test TU's PCH.)
+                    if (dynamic_cast<MethodSymbol*>(ms) &&
+                        dynamic_cast<MethodSymbol*>(base))
+                        ctx_.recordInterfaceWitness(ms, base, ms);
                     if (auto* bMD = dynamic_cast<const ast::MethodDecl*>(base->decl)) {
                         ms->inheritedRequiresClauses.reserve(
                             ms->inheritedRequiresClauses.size() +

@@ -1114,6 +1114,57 @@ bool ExprTC::currentMethodTypeParamMayInherit(std::string_view n) const {
     const bool mayOverride =
         !self || std::find(self->modifiers.begin(), self->modifiers.end(),
                            "override") != self->modifiers.end();
+    // fix #8259 (spec §14.2, §12.1, v0.357): an `override` inherits the
+    // constraints of the declaration it OVERRIDES — not those of a same-name,
+    // same-arity base SIBLING (an overload at another parameter list). The
+    // Resolver recorded each override's target (`checkHidingAndOverride`);
+    // follow the chain of targets (the overridden declaration, the one IT overrides, ...)
+    // and let only those class members count below. A link that is not known
+    // — an override with no recorded target, or an imported override — makes
+    // the chain unknown, and the shape walk answers (over-approximating).
+    std::unordered_set<const Symbol*> overrideChain;
+    bool chainKnown = false;
+    auto overrideTargetOf = [this](const Symbol* over) -> const Symbol* {
+        const auto* om = dynamic_cast<const MethodSymbol*>(over);
+        const TypeSymbol* owner = om ? om->parent : nullptr;
+        if (!om || !owner) return nullptr;
+        std::vector<const TypeSymbol*> q;
+        std::unordered_set<const TypeSymbol*> sn{owner};
+        for (const TypeSymbol* b : owner->baseTypes)
+            if (b && sn.insert(b).second) q.push_back(b);
+        for (std::size_t i = 0; i < q.size(); ++i) {
+            if (q[i]->kind != ast::TypeDeclKind::Class) continue;
+            for (const Symbol* mem : q[i]->members)
+                if (auto* bm = dynamic_cast<const MethodSymbol*>(mem))
+                    if (bm->name == om->name && ctx_.interfaceWitnesses(over, bm))
+                        return bm;
+            for (const TypeSymbol* b : q[i]->baseTypes)
+                if (b && sn.insert(b).second) q.push_back(b);
+        }
+        return nullptr;
+    };
+    if (self && mayOverride) {
+        chainKnown = true;
+        const Symbol* cur = self;
+        for (;;) {
+            // The target is the base class method `cur` is recorded as the
+            // witness of (see `overrideTargetOf`).
+            const Symbol* tgt = overrideTargetOf(cur);
+            if (!tgt) {
+                // The chain ends legitimately only at a non-override
+                // declaration (`virtual` / `abstract`); an `override` with no
+                // recorded target is an unknown link.
+                if (auto* cm = dynamic_cast<const MethodSymbol*>(cur);
+                    !cm || std::find(cm->modifiers.begin(),
+                                     cm->modifiers.end(),
+                                     "override") != cm->modifiers.end())
+                    chainKnown = false;
+                break;
+            }
+            if (!overrideChain.insert(tgt).second) break;  // cycle guard
+            cur = tgt;
+        }
+    }
     // 2./3. The base closure, cycle-guarded like `inheritsBuiltinInterface`.
     std::vector<const TypeSymbol*> queue;
     std::unordered_set<const TypeSymbol*> seen{currentType_};
@@ -1129,6 +1180,7 @@ bool ExprTC::currentMethodTypeParamMayInherit(std::string_view n) const {
                 ms->genericParams.size() != md->genericParams.size())
                 continue;
             if (!curIsIface && !mayOverride) continue;
+            if (!curIsIface && chainKnown && !overrideChain.count(ms)) continue;
             // fix #8184: an interface method inherits its set only to the
             // method that IMPLEMENTS it (§14.2) — the §11.2 witness
             // `checkAbstractImplementations` chose by full signature for
