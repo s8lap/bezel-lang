@@ -8282,29 +8282,14 @@ bool MethodOwnership::trustCollectionElementIsSourceBinding(
 //   * a `static` member's read has [K2]'s always-live source, so it is
 //     statically bounded (§28.3's *Static field access `T.f`* producers row).
 //
-// The type test is `trustReadTypeCarriesBorrow` (below): a class-typed
-// reference — a user class or interface, a declaration-less builtin CLASS
-// head, or a bare type parameter. A value-typed read (`bool`, an enum, a
-// record, a choice, a primitive, a value builtin) and a function-typed read
-// are excluded.
-//
-// fix-forward #7468 (review r42-rev-m32-7468, finding 1): the type test was
-// `isBorrowableOwnedSinkType`, which reaches a user class or interface and
-// the DECLARATION-LESS builtin class heads `isBorrowBearingBuiltinClassHead`
-// lists (`Array<T>`, `StringBuilder`, `Random`, the owning collections) — and
-// NOTHING else. Every OTHER declaration-less builtin class (`Mutex`,
-// `Semaphore`, `Atomic<T>`, `Channel<T>`, `CancellationTokenSource`, `Lock`,
-// `Shared<T>`, `Weak<T>`, `Task<T>`, `IEnumerable<T>`, `FrozenArray<T>`) and
-// every BARE TYPE PARAMETER fell out of it, so the narrowing DELETED the
-// report lines for genuine borrow carriers: a field read of one of them stored
-// into a non-owned field or a collection IS the field-held / collection-held
-// [K4.3] clause, and §28.3's closing sentence — "A compilation unit that
-// emits no report under the mode carries no recorded trust clause" — no
-// longer held for those programs. The `isBorrowableOwnedSinkType` call is
-// kept as the FIRST half of the test (it is the file's settled statement of
-// "a class-typed reference" for every type that HAS a declaration, and it
-// reaches the collection/StringBuilder/Random heads); the second half
-// (below) reaches the rest.
+// The type test is `trustReadTypeCarriesBorrow` (below), whose default is
+// CARRIER: a read is excluded only when its type is positively a value (a
+// primitive, a function type, a record or choice that holds no borrow, an
+// enum, or a declaration-less builtin its closed value list names). A
+// declaration-less builtin CLASS (`Mutex`, `Shared<T>`, `Weak<T>`, `Stream`,
+// `TextReader`, `Encoding`, `OwningSlotMap<T>`, …) and a bare type parameter
+// stay reported: a field read of one stored into a non-owned field or a
+// borrowing collection IS the field-held / collection-held [K4.3] clause.
 // // per §28.3, §27.6
 bool MethodOwnership::trustMemberReadIsBorrowCarrier(
     const ast::MemberAccessExpr& ma) {
@@ -8323,65 +8308,93 @@ bool MethodOwnership::trustMemberReadIsBorrowCarrier(
     return trustReadTypeCarriesBorrow(ctx_.exprType(ma));
 }
 
-// fix-forward #7468 (§28.3 *Diagnostics* "The trust-admission report";
-// §28.3 *Borrow lifetime rules*; §28.11 *Storing a borrow*, v0.357): does this
-// read's TYPE carry a BORROW — a reference the holder must keep alive — or is
-// it a value that carries none?
+// fix #7468 (§28.3 *Diagnostics* "The trust-admission report"; §28.3 *Borrow
+// lifetime rules*; §28.11 *Storing a borrow*, v0.357): is this name a
+// declaration-less builtin that is a VALUE — a type whose values carry no
+// borrow? The list is CLOSED and POSITIVE: every declaration-less builtin NOT
+// named here is read as a borrow carrier (see `trustReadTypeCarriesBorrow`), so
+// a builtin class the compiler gains later is reported until someone decides
+// it is a value, rather than silently dropped from the report.
 //
-// The test is the compiler's own class-vs-value classification of a Named
-// type reference, read in the same order the rest of the compiler reads it
-// (`ExprTypecheck_Calls.cpp`'s owned-marker erasure test):
+//   * `sema::isValueBuiltinByName` — the compiler's own value-builtin set
+//     (`DateTime`, `TimeSpan`, `DateOnly`, `TimeOnly`, `Guid`,
+//     `CancellationToken`, `Range`, `__Buffer`, `IntPtr`, `UIntPtr`,
+//     `ReadOnlyStringSpan`, `Boolean`, and the span views, which
+//     `isBorrowBearingRecordOrSpan` reports as borrow-bearing before this
+//     list is consulted);
+//   * the PascalCase aliases of the primitive value types and `String`
+//     (§3.4: "Each names a compiler-known primitive (or `string`)");
+//   * `Type`, a runtime-managed type (§28.9 lists `string`, `Type`, boxed
+//     value types and function-typed values; "None of them is a class");
+//   * the stdlib RECORDS whose components are all values or runtime-managed:
+//     `ExceptionInfo` (§31.4), `JsonOptions` (stdlib §2.15), `SlotHandle`
+//     (stdlib §4.21);
+//   * the stdlib ENUMS: `DayOfWeek`, `DateTimeKind` (stdlib §2.5),
+//     `SeekOrigin` (stdlib §7.1), `FileMode`, `FileAccess` (stdlib §7.2).
+// // per §28.3, §28.9, §3.4, §31.4
+static bool trustIsDeclarationlessValueBuiltin(std::string_view n) {
+    if (sema::isValueBuiltinByName(n)) return true;
+    static constexpr std::string_view kValues[] = {
+        // §3.4 PascalCase primitive aliases, and `String`.
+        "Boolean", "Byte", "SByte", "Int16", "UInt16", "Int32", "UInt32",
+        "Int64", "UInt64", "Float", "Double", "Decimal", "Char", "String",
+        // §28.9 runtime-managed.
+        "Type",
+        // Value records.
+        "ExceptionInfo", "JsonOptions", "SlotHandle",
+        // Enums.
+        "DayOfWeek", "DateTimeKind", "SeekOrigin", "FileMode", "FileAccess",
+    };
+    for (std::string_view v : kValues)
+        if (v == n) return true;
+    return false;
+}
+
+// fix #7468 (§28.3 *Diagnostics* "The trust-admission report"; §28.3 *Borrow
+// lifetime rules*; §28.11 *Storing a borrow*, v0.357): does this read's TYPE
+// carry a BORROW — a reference the holder must keep alive — or is it a value
+// that carries none?
 //
-//   * a type WITH a declaration: a user class or interface is a borrow
-//     (`isBorrowableOwnedSinkType`); a user record, a choice and an enum are
-//     values — §9.7's records carry borrows inside, but the record ITSELF is
-//     a value, and §28.3's report names the store of a BORROW, not of a
-//     value-shaped holder;
-//   * a type WITHOUT a declaration: a BARE TYPE PARAMETER (the compiler's
-//     own shape for it — `Kind::Named`, null `declaration`, no generic args)
-//     or a BUILTIN. A builtin is class-kinded iff the BuiltinRegistry
-//     snapshot says its runtime value is a HEAP REFERENCE
-//     (`common::isHeapPointerReferenceBuiltin`), and not otherwise.
+// The default is CARRIER. §28.3's closing sentence — "A compilation unit that
+// emits no report under the mode carries no recorded trust clause" — makes a
+// missing line a false claim of static boundedness, so a type is excluded
+// only when it is POSITIVELY a value:
 //
-// The builtin half is the compiler's own authority, not a hand-list: the
-// BuiltinRegistry's `kHeapPointerReferenceBuiltins` is the set of builtin
-// heads whose runtime value is a heap pointer (`Array`, `Mutex`, `Shared`,
-// `Weak`, `Atomic`, `Channel`, `Lock`, `Semaphore`,
-// `CancellationTokenSource`, `Task`, `FrozenArray`, the enumerable and
-// collection interfaces, …), and `Ownership_Extension.cpp`'s
-// `isBuiltinClassReceiver` already reads it as "is this declaration-less
-// builtin a CLASS receiver" — the same question this predicate asks.
-// `sema::isValueBuiltinByName` is consulted FIRST, because two names in the
-// heap table are nevertheless VALUE types (`CancellationToken`, stdlib §6.1's
-// `public record`; `__Buffer`, §4.14) and a value carries no reference.
-//
-// The type-parameter test comes BEFORE the builtin test: a type parameter may
-// be spelled like a value builtin (`class Box<Guid>`), and the compiler
-// records which one the resolver chose (`TypeRef::isResolvedTypeParam`,
-// #6530/#8213), so the NAME alone cannot decide it.
-//
-// A value-shaped builtin RECORD that is neither a value builtin by name nor
-// in the heap table (`ExceptionInfo`, §31.4; `JsonOptions`, §2.15) stays
-// QUIET: it is a record — a value — so §28.3's report, which names the
-// store of a BORROW, does not name it.
-// // per §28.3, §28.11, §9.7, §14.1, §31.4
+//   * a class or interface, a declaration-less builtin class head the file
+//     already knows (`isBorrowableOwnedSinkType`), and an unresolved type:
+//     CARRIER;
+//   * a borrow-bearing record, span, inline array or choice (§9.7, §35.4):
+//     CARRIER — its value holds a borrow;
+//   * `Object` — a class, though the compiler keys it as a primitive:
+//     CARRIER;
+//   * a primitive (and `string`), a function type (§28.3 *Provenance*
+//     clause 5: a function value read from storage carries the empty set),
+//     `()`: VALUE;
+//   * a Named type WITH a declaration that reached here — a record or a
+//     choice that holds no borrow, an enum, a synthetic value builtin: VALUE;
+//   * a Named type WITHOUT one: a BARE TYPE PARAMETER is a CARRIER (asked
+//     first, since a type parameter may be spelled like a value builtin —
+//     `class Box<Guid>` — and only the resolver's record,
+//     `TypeRef::isResolvedTypeParam`, tells them apart); a builtin is a VALUE
+//     only when `trustIsDeclarationlessValueBuiltin` lists it, and a CARRIER
+//     otherwise (`Mutex`, `Shared<T>`, `Stream`, `TextReader`, `Encoding`,
+//     `OwningSlotMap<T>`, `CString`, …).
+// // per §28.3, §28.11, §9.7, §35.4
 bool MethodOwnership::trustReadTypeCarriesBorrow(const sema::TypeRef* rt) {
+    if (!rt) return true;
     if (isBorrowableOwnedSinkType(rt)) return true;
-    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
-    // A type with a declaration that reached here is a user RECORD, a CHOICE
-    // or an ENUM — a value.
+    if (isBorrowBearingRecordOrSpan(rt) || isBorrowBearingChoice(rt))
+        return true;
+    // `Object` is a CLASS (§8) the compiler keys as a primitive; "A field
+    // declared `Object` or an interface type ... is borrow-carrying" (§9.7).
+    if (rt->kind == sema::TypeRef::Kind::Primitive)
+        return rt->primitive == sema::PrimitiveType::Object;
+    if (rt->kind != sema::TypeRef::Kind::Named) return false;
     if (rt->declaration) return false;
-    // A bare type parameter: the compiler's own unresolved-generic shape.
-    // §28.3's field-held clause admits a store of one (the structural check
-    // leaves it unclassified), so the mode must name it: a compilation unit
-    // that draws no report carries no recorded trust clause.
     if (rt->isResolvedTypeParam()) return true;
-    // A declaration-less builtin: class-kinded iff the BuiltinRegistry
-    // snapshot says its runtime value is a heap reference.
-    std::string_view n = rt->headName();
-    if (n.empty()) return false;
-    if (sema::isValueBuiltinByName(n)) return false;
-    return common::isHeapPointerReferenceBuiltin(n);
+    const std::string_view n = rt->headName();
+    if (n.empty()) return true;
+    return !trustIsDeclarationlessValueBuiltin(n);
 }
 
 // §28.3 *Diagnostics* "The trust-admission report" (v0.307, #4605): is this
@@ -14254,6 +14267,433 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
     return true;
 }
 
+// fix #7468 (§28.11 *Borrowing collections* → *Storing a borrow*; §28.3
+// *Diagnostics* "The trust-admission report", v0.357): the ESCAPE half of
+// §28.11's exemption.
+//
+// §28.11: "A store into a collection that is a local of the body and does not
+// escape it, of a parameter that is not `owned` or of `this` — the binding
+// itself, not a value read through it — is not reported: the scope comparison
+// bounds the element (K2.3), and the body holds no obligation for the object
+// such a binding names, so no kill in it can transfer that object."
+//
+// §28.3's closing sentence — "A compilation unit that emits no report under
+// the mode carries no recorded trust clause" — makes a MISSED line a false
+// claim of static boundedness, while an extra line is only a line the reader
+// checks by hand. So this scan is a POSITIVE one: a local is "does not escape"
+// only when EVERY occurrence of it in the body sits in a position the scan
+// positively follows and knows to keep the value in the frame. Every other
+// occurrence — and every flow the scan cannot follow — counts as an ESCAPE:
+//
+//   * the SAFE positions of a data local are a READ in place (the receiver /
+//     target of a member access or an indexer, an operand of an operator that
+//     yields a new value, a condition, a guard, a `for` iterable, an
+//     interpolation part, an expression statement or a discard) and a PLAIN
+//     (or `scoped`) argument of a call that is not a collection store — the
+//     callee receives a borrow, which §28.3's borrowed-field rule names at the
+//     callee's own store if it keeps one;
+//   * the SAFE positions of a closure-holding local (a local bound to a
+//     lambda, or one of function type) are only the CALLEE of a call and a
+//     read in place: a function value passed to another call can be kept by
+//     it;
+//   * EVERYTHING ELSE is an escape: an initializer or an assignment value (an
+//     alias: `var g := f;`, `_held ??= tmp;`), a `return` / `throw` /
+//     `yield return` value, a `move`, a `ref` / `out` argument, an argument
+//     of a collection store (`_cbs.Add(f)`), a constructor argument, a
+//     collection-literal element, a `case` scrutinee, a branch of an
+//     if-expression or a `??` operand whose result itself escapes, and a
+//     rebinding of the local (`tmp := …`, which ends "the binding owns a fresh
+//     collection").
+//
+// A LAMBDA is followed only when it is bound directly as the initializer of a
+// local of THIS frame (its HOLDER) or is called on the spot; in any other
+// position (an assignment value, an argument, a returned value, a conditional
+// branch, the initializer of a local of a nested frame) its value escapes. A
+// local of this frame named inside a lambda body is a CAPTURE of every lambda
+// on the stack, and leaves the frame when one of them does; a lambda leaves
+// the frame when it escapes directly or when its holder does, which the
+// fixpoint below closes over (a closure captured by an escaping closure
+// carries its own captures out too).
+//
+// An expression or statement form the walk does not know sets
+// `escapeScanIncomplete_`, which withdraws the exemption from the whole body
+// (the line is drawn, as the base drew it). // per §28.11, §28.3
+void MethodOwnership::collectEscapingLocals(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    escapingLocalDecls_.clear();
+    lambdaHolderLocal_.clear();
+    lambdaCaptureLocals_.clear();
+    lambdaEscapesDirectly_.clear();
+    closureStack_.clear();
+    escapeScanIncomplete_ = false;
+    escapeScanFrame_.clear();
+    for (const auto& entry : localDepth_) escapeScanFrame_.insert(entry.first);
+    for (const auto& s : body)
+        if (s) collectEscapingLocalsStmt(*s);
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& entry : lambdaCaptureLocals_) {
+            const ast::LambdaExpr* lam = entry.first;
+            bool escapes = lambdaEscapesDirectly_.count(lam) != 0;
+            if (!escapes) {
+                // A lambda with no holder and no direct escape is one called
+                // on the spot; a held one escapes with its holder.
+                auto holder = lambdaHolderLocal_.find(lam);
+                escapes = holder != lambdaHolderLocal_.end() &&
+                          escapingLocalDecls_.count(holder->second) != 0;
+            }
+            if (!escapes) continue;
+            for (const ast::Node* captured : entry.second)
+                if (escapingLocalDecls_.insert(captured).second) changed = true;
+        }
+    }
+}
+
+// fix #7468 (§28.11, v0.357): the `LocalDecl` of this identifier when it names
+// a local of THIS frame, else null. `localDepth_` holds exactly this frame's
+// locals (`collectLocalDepths` does not descend into lambda bodies, so a local
+// of a nested frame has no entry).
+const ast::Node* MethodOwnership::localOfThisFrameDecl(
+    const ast::IdentifierExpr& id) const {
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(id));
+    if (!ls || !ls->decl) return nullptr;
+    if (localDepth_.find(ls->decl) == localDepth_.end()) return nullptr;
+    return ls->decl;
+}
+
+// fix #7468 (§28.11, v0.357): does this local hold a closure — is it bound to
+// a lambda, or declared of function type? Its value is a function value, which
+// a call that receives it can keep, so a plain argument position is an escape
+// for it (see `collectEscapingLocals`).
+bool MethodOwnership::escapeScanLocalHoldsClosure(
+    const ast::IdentifierExpr& id, const ast::Node* decl) const {
+    if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(decl))
+        if (dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get()))
+            return true;
+    const sema::TypeRef* t = ctx_.exprType(id);
+    return !t || t->kind == sema::TypeRef::Kind::Function ||
+           t->kind == sema::TypeRef::Kind::Error;
+}
+
+// fix #7468 (§28.11, v0.357): a storing method of a collection (the same names
+// `checkCollectionBorrowStoreEscape` treats as stores, `AddRange` included).
+// An argument of one is kept by the receiver, so it is an escape.
+static bool escapeScanIsCollectionStoreCall(const ast::Expr* callee) {
+    std::string_view m;
+    if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+        m = ma->member;
+    else if (const auto* nm =
+                 dynamic_cast<const ast::NullCondMemberExpr*>(callee))
+        m = nm->member;
+    else
+        return false;
+    return m == "Add" || m == "Insert" || m == "TryAdd" || m == "AddFirst" ||
+           m == "AddLast" || m == "AddBefore" || m == "AddAfter" ||
+           m == "Push" || m == "Enqueue" || m == "GetOrAdd" ||
+           m == "AddRange";
+}
+
+// fix #7468 (§28.11, v0.357): one occurrence of a local, in a position.
+void MethodOwnership::noteEscapeScanOccurrence(const ast::IdentifierExpr& id,
+                                               EscapePos pos) {
+    const ast::Node* decl = localOfThisFrameDecl(id);
+    if (!decl) return;
+    // A mention inside a lambda body is a capture of every lambda on the
+    // stack (a nested closure's captures are carried by the outer one).
+    for (const ast::LambdaExpr* lam : closureStack_)
+        lambdaCaptureLocals_[lam].push_back(decl);
+    bool safe = false;
+    switch (pos) {
+        case EscapePos::Read:
+        case EscapePos::Callee:
+            safe = true;
+            break;
+        case EscapePos::Arg:
+            safe = !escapeScanLocalHoldsClosure(id, decl);
+            break;
+        case EscapePos::Escape:
+            safe = false;
+            break;
+    }
+    if (!safe) escapingLocalDecls_.insert(decl);
+}
+
+// fix #7468 (§28.11, v0.357): a lambda in a position. Bound as the
+// initializer of a local of this frame (`holder`) or called on the spot, it is
+// followed; anywhere else its value escapes.
+void MethodOwnership::collectEscapingLocalsLambda(const ast::LambdaExpr& lam,
+                                                  EscapePos pos,
+                                                  const ast::Node* holder) {
+    lambdaCaptureLocals_[&lam];  // every lambda takes part in the fixpoint
+    if (holder)
+        lambdaHolderLocal_[&lam] = holder;
+    else if (pos != EscapePos::Callee)
+        lambdaEscapesDirectly_.insert(&lam);
+    closureStack_.push_back(&lam);
+    // The body's value is the closure's RESULT, which leaves to its caller.
+    if (lam.exprBody) collectEscapingLocalsExpr(lam.exprBody.get(), EscapePos::Escape);
+    for (const auto& s : lam.stmts)
+        if (s) collectEscapingLocalsStmt(*s);
+    closureStack_.pop_back();
+}
+
+// fix #7468 (§28.11, v0.357): the expression walk. `pos` is the position the
+// expression's VALUE sits in; a form whose value is one of its operands (`!`,
+// `as`, `??`, an if-expression branch, a `case` arm, a bind atom's body)
+// passes `pos` through, and every other form gives its operands their own.
+void MethodOwnership::collectEscapingLocalsExpr(const ast::Expr* e,
+                                                EscapePos pos) {
+    if (!e) return;
+    using P = EscapePos;
+    auto args = [&](const std::vector<ast::CallArgument>& as, P plain) {
+        for (const auto& a : as) {
+            if (!a.value) continue;
+            const bool borrowArg = a.modifier.empty() || a.modifier == "scoped";
+            collectEscapingLocalsExpr(a.value.get(), borrowArg ? plain : P::Escape);
+        }
+    };
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+        noteEscapeScanOccurrence(*id, pos);
+        return;
+    }
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+        collectEscapingLocalsLambda(*lam, pos, nullptr);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        collectEscapingLocalsExpr(ma->target.get(), P::Read);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+        collectEscapingLocalsExpr(nm->target.get(), P::Read);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+        collectEscapingLocalsExpr(ce->callee.get(), P::Callee);
+        args(ce->args, escapeScanIsCollectionStoreCall(ce->callee.get())
+                           ? P::Escape : P::Arg);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        collectEscapingLocalsExpr(nc->callee.get(), P::Callee);
+        args(nc->args, escapeScanIsCollectionStoreCall(nc->callee.get())
+                           ? P::Escape : P::Arg);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        collectEscapingLocalsExpr(ix->target.get(), P::Read);
+        args(ix->indices, P::Escape);
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        // A `move` is a §28.8 transfer out of the binding.
+        collectEscapingLocalsExpr(un->operand.get(),
+                                  un->op == "move" ? P::Escape : P::Read);
+        collectEscapingLocalsExpr(un->replacement.get(), P::Escape);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        const P operand = be->op == "??" ? pos : P::Read;
+        collectEscapingLocalsExpr(be->left.get(), operand);
+        collectEscapingLocalsExpr(be->right.get(), operand);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        collectEscapingLocalsExpr(pb->operand.get(), pos);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+        collectEscapingLocalsExpr(tt->operand.get(),
+                                  tt->op == "as" ? pos : P::Read);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        collectEscapingLocalsExpr(cd->condition.get(), P::Read);
+        collectEscapingLocalsExpr(cd->thenValue.get(), pos);
+        collectEscapingLocalsExpr(cd->elseValue.get(), pos);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+        // A constructor commonly keeps what it is given.
+        args(ne->args, P::Escape);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+        collectEscapingLocalsExpr(th->operand.get(), P::Escape);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+        collectEscapingLocalsExpr(we->source.get(), P::Escape);
+        for (const auto& ia : we->assigns)
+            collectEscapingLocalsExpr(ia.value.get(), P::Escape);
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& k : cl->keys) collectEscapingLocalsExpr(k.get(), P::Escape);
+        for (const auto& v : cl->elements)
+            collectEscapingLocalsExpr(v.get(), P::Escape);
+        return;
+    }
+    if (auto* cse = dynamic_cast<const ast::CaseExpr*>(e)) {
+        // A pattern may bind the scrutinee's value under a new name.
+        collectEscapingLocalsExpr(cse->scrutinee.get(), P::Escape);
+        for (const auto& arm : cse->arms) {
+            collectEscapingLocalsExpr(arm.guard.get(), P::Read);
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression)
+                collectEscapingLocalsExpr(arm.exprBody.get(), pos);
+            else
+                for (const auto& st : arm.stmts)
+                    if (st) collectEscapingLocalsStmt(*st);
+        }
+        return;
+    }
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+        for (const auto& c : bx->clauses)
+            if (c) collectEscapingLocalsExpr(c->initializer.get(), P::Escape);
+        collectEscapingLocalsExpr(bx->body.get(), pos);
+        return;
+    }
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e)) {
+        collectEscapingLocalsExpr(re->lo.get(), P::Read);
+        collectEscapingLocalsExpr(re->hi.get(), P::Read);
+        collectEscapingLocalsExpr(re->step.get(), P::Read);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        for (const auto& part : is->parts)
+            if (part.expr) collectEscapingLocalsExpr(part.expr.get(), P::Read);
+        return;
+    }
+    if (auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(e)) {
+        // `owned x` (K3.4) names its local by spelling only: every local of
+        // this frame of that name is transferred out.
+        for (const auto& entry : localDepth_)
+            if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(entry.first))
+                if (ld->name == mt->name) escapingLocalDecls_.insert(ld);
+        return;
+    }
+    if (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+        dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+        dynamic_cast<const ast::CharLiteralExpr*>(e) ||
+        dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+        dynamic_cast<const ast::VerbatimStringExpr*>(e) ||
+        dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+        dynamic_cast<const ast::NullLiteralExpr*>(e) ||
+        dynamic_cast<const ast::TypeOfExpr*>(e) ||
+        dynamic_cast<const ast::NameOfExpr*>(e) ||
+        dynamic_cast<const ast::DefaultExpr*>(e) ||
+        dynamic_cast<const ast::UnitExpr*>(e))
+        return;
+    // A form this walk does not know: the exemption is withdrawn.
+    escapeScanIncomplete_ = true;
+}
+
+// fix #7468 (§28.11, v0.357): the statement walk. The statement GRAMMAR is
+// `forEachNestedStmt`'s (the single source of truth for it); this adds each
+// statement's own expressions, in their positions.
+void MethodOwnership::collectEscapingLocalsStmt(const ast::Stmt& s) {
+    using P = EscapePos;
+    forEachNestedStmt(s, [&](const ast::Stmt& cur) {
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
+            // A bare-identifier target REBINDS the local (or writes a field):
+            // the binding no longer names the collection it was created with.
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+                noteEscapeScanOccurrence(*tid, P::Escape);
+            else
+                collectEscapingLocalsExpr(as->target.get(), P::Read);
+            collectEscapingLocalsExpr(as->value.get(), P::Escape);
+            return;
+        }
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
+            const bool ofThisFrame = localDepth_.find(ld) != localDepth_.end();
+            if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get()))
+                collectEscapingLocalsLambda(*lam, P::Escape, ofThisFrame ? ld : nullptr);
+            else
+                collectEscapingLocalsExpr(ld->initializer.get(), P::Escape);
+            return;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&cur)) {
+            collectEscapingLocalsExpr(lc->value.get(), P::Escape);
+            return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&cur)) {
+            collectEscapingLocalsExpr(es->expr.get(), P::Read);
+            return;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&cur)) {
+            collectEscapingLocalsExpr(rs->value.get(), P::Escape);
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&cur)) {
+            collectEscapingLocalsExpr(ts->value.get(), P::Escape);
+            return;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&cur)) {
+            collectEscapingLocalsExpr(ys->value.get(), P::Escape);
+            return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&cur)) {
+            collectEscapingLocalsExpr(ds->value.get(), P::Read);
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&cur)) {
+            collectEscapingLocalsExpr(is->target.get(), P::Read);
+            return;
+        }
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&cur)) {
+            collectEscapingLocalsExpr(ifs->ifBranch.condition.get(), P::Read);
+            for (const auto& el : ifs->elifBranches)
+                collectEscapingLocalsExpr(el.condition.get(), P::Read);
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&cur)) {
+            collectEscapingLocalsExpr(ws->condition.get(), P::Read);
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(&cur)) {
+            collectEscapingLocalsExpr(fs->iterable.get(), P::Read);
+            collectEscapingLocalsExpr(fs->withExpr.get(), P::Escape);
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(&cur)) {
+            for (const auto& arm : ts->catches)
+                collectEscapingLocalsExpr(arm.guard.get(), P::Read);
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&cur)) {
+            collectEscapingLocalsExpr(cs->scrutinee.get(), P::Escape);
+            for (const auto& arm : cs->arms) {
+                collectEscapingLocalsExpr(arm.guard.get(), P::Read);
+                if (arm.bodyKind == ast::CaseArmBodyKind::Expression)
+                    collectEscapingLocalsExpr(arm.exprBody.get(), P::Read);
+            }
+            return;
+        }
+        if (dynamic_cast<const ast::DoEndBlock*>(&cur) ||
+            dynamic_cast<const ast::BreakStmt*>(&cur) ||
+            dynamic_cast<const ast::ContinueStmt*>(&cur) ||
+            dynamic_cast<const ast::LocalTypeDecl*>(&cur))
+            return;
+        // A statement form this walk does not know: the exemption is withdrawn.
+        escapeScanIncomplete_ = true;
+    });
+}
+
+// fix #7468 (§28.11, v0.357): does this local's binding OWN A FRESH
+// COLLECTION — is "the collection" §28.11 speaks of a local of the body, and
+// not a field's, a parameter's or a callee's collection that only a local
+// BORROW alias names (K3.13: "`var b := a;` is always a borrow for
+// class-typed `a`")? Yes only when the declaration's initializer CREATES the
+// collection (a `new` construction or a collection literal); the rebinding
+// half (`tmp := …` later) is the escape scan's.
+static bool trustLocalOwnsFreshCollection(const ast::Node* decl) {
+    const auto* ld = dynamic_cast<const ast::LocalDecl*>(decl);
+    if (!ld || !ld->initializer) return false;
+    return dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) ||
+           dynamic_cast<const ast::CollectionLiteralExpr*>(ld->initializer.get());
+}
+
 // §28.11 "Storing a borrow" (v0.180, #1539). See the declaration comment
 // (Ownership_impl.hpp) for the rule; this implementation mirrors
 // checkBorrowStoreEscape's Dest classification but for the collection
@@ -14277,419 +14717,6 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
 // obligation facts into `states_` and re-asks the same authority, so a
 // captured owned local is correctly identified as the borrow source. See
 // `enclosingFrameOwnedLocalBorrowSource` for the helper's own declaration.
-// fix-forward #7468 (§28.11, v0.357): the ESCAPE half of §28.11's exemption.
-//
-// §28.11: "A store into a collection that is a local of the body AND DOES NOT
-// ESCAPE IT, of a parameter that is not `owned` or of `this` — the binding
-// itself, not a value read through it — is not reported: the scope comparison
-// bounds the element (K2.3), and the body holds no obligation for the object
-// such a binding names, so no kill in it can transfer that object."
-//
-// The exemption has THREE conditions, and the narrowing that introduced it
-// (fix #7468, commit 176097b47) checked only the first and the third. The
-// second — the collection must NOT escape the body — is what makes the
-// exemption sound: a collection that LEAVES the body outlives it, so the
-// borrow it holds of a plain parameter outlives the body too, and the scope
-// comparison no longer bounds it.
-//
-// The escape routes recognised below are the ones the compiler ACCEPTS
-// (measured on the review's probes `l_escape1` / `l_escape2` / `l_escape3`,
-// all of which compile with zero errors and each of which drew exactly one
-// report line on the base and none on the narrowed tip):
-//
-//   (E1) a `move` of the local — `move tmp` as a call argument, `return move
-//        tmp`, `y := move tmp;`. A move is a §28.8 transfer: the value leaves
-//        the binding and the frame.
-//   (E2) a CAPTURE of the local by a closure that OUTLIVES the frame. A
-//        closure that dies with the frame does NOT take the local with it,
-//        so the capture is an escape only when the closure itself escapes
-//        (it is stored into a member slot, returned, or captured by an
-//        escaping closure).
-//   (E3) a store of the local into a MEMBER SLOT — `_held := tmp;`. The
-//        holder is longer-lived than the frame.
-//   (E4) the local's own VALUE leaving the frame — `return tmp;`,
-//        `throw tmp;`, `yield return tmp;`.
-//
-// A plain READ is NOT an escape: the receiver of a call (`tmp.Add(x)`), a
-// plain (non-`move`) argument (`Use(tmp)` — the callee receives a borrow that
-// §28.3's borrowed-field rule forbids it from keeping), a member-access
-// target (`tmp.Count`), an operand of an operator, and an assignment target
-// all leave the collection in the frame.
-//
-// The scan is deliberately CONSERVATIVE in the direction that costs a report
-// line: an occurrence of the local in a position this scan does not
-// recognise as a plain read is treated as an escape. That direction is the
-// safe one — §28.3's closing sentence ("A compilation unit that emits no
-// report under the mode carries no recorded trust clause") means a MISSED
-// report line is a false claim of static boundedness, while an extra line is
-// only a line the reader must check by hand.
-// // per §28.11, §28.3
-void MethodOwnership::collectEscapingLocals(
-    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
-    escapingLocalDecls_.clear();
-    lambdaHolderLocal_.clear();
-    lambdaCaptureLocals_.clear();
-    lambdaEscapesDirectly_.clear();
-    closureStack_.clear();
-    for (const auto& s : body)
-        if (s) collectEscapingLocalsStmt(*s);
-    // The closure relation, closed by a fixpoint: a closure escapes when it
-    // escapes directly or when the local holding it escapes, and then the
-    // locals it captured leave the frame with it. The loop repeats because a
-    // closure captured by an escaping closure carries its own captures out
-    // in the next round.
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (const auto& entry : lambdaCaptureLocals_) {
-            const ast::LambdaExpr* lam = entry.first;
-            bool escapes = lambdaEscapesDirectly_.count(lam) != 0;
-            if (!escapes) {
-                auto holder = lambdaHolderLocal_.find(lam);
-                if (holder != lambdaHolderLocal_.end() &&
-                    escapingLocalDecls_.count(holder->second) != 0)
-                    escapes = true;
-            }
-            if (!escapes) continue;
-            for (const ast::Node* captured : entry.second)
-                if (escapingLocalDecls_.insert(captured).second) changed = true;
-        }
-    }
-}
-
-// fix-forward #7468 (§28.11, v0.357): is this identifier a LOCAL OF THIS
-// FRAME? `localDepth_` holds this frame's `LocalDecl` depths (a local
-// declared inside a NESTED lambda body has no entry, because
-// `collectLocalDepths` does not descend into lambda bodies), so an entry is
-// exactly "a local of the frame being analysed".
-bool MethodOwnership::isLocalOfThisFrame(const ast::IdentifierExpr& id) const {
-    sema::Symbol* sym = ctx_.exprSymbol(id);
-    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
-    if (!ls || !ls->decl) return false;
-    return localDepth_.find(ls->decl) != localDepth_.end();
-}
-
-// fix-forward #7468 (§28.11, v0.357): record that this local leaves the
-// frame.
-void MethodOwnership::markLocalEscaping(const ast::IdentifierExpr& id) {
-    if (!isLocalOfThisFrame(id)) return;
-    sema::Symbol* sym = ctx_.exprSymbol(id);
-    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
-    if (!ls || !ls->decl) return;
-    escapingLocalDecls_.insert(ls->decl);
-}
-
-// fix-forward #7468 (§28.11, v0.357): record that this identifier — named
-// inside a CLOSURE body — is a CAPTURE of it. The capture does not by itself
-// take the local out of the frame: the closure may die with the frame. The
-// capture set is therefore COLLECTED here and applied by the fixpoint in
-// `collectEscapingLocals`, once the closure's own escape is known.
-//
-// The capture is recorded for EVERY closure on the stack, because a nested
-// closure's captures are TRANSITIVE — the outer closure carries them.
-void MethodOwnership::noteClosureCapture(const ast::IdentifierExpr& id) {
-    if (closureStack_.empty()) return;
-    sema::Symbol* sym = ctx_.exprSymbol(id);
-    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
-    if (!ls || !ls->decl) return;
-    // Only a local of THIS frame is captured by the closure; the closure's
-    // own locals and parameters are different symbols and are not in
-    // `localDepth_`.
-    if (localDepth_.find(ls->decl) == localDepth_.end()) return;
-    for (const ast::LambdaExpr* lam : closureStack_)
-        lambdaCaptureLocals_[lam].push_back(ls->decl);
-}
-
-// fix-forward #7468 (§28.11, v0.357): this closure's own VALUE leaves the
-// frame (it is stored into a member slot, or returned), so whatever it
-// captured leaves the frame with it.
-void MethodOwnership::noteLambdaEscapesDirectly(const ast::LambdaExpr& lam) {
-    lambdaEscapesDirectly_.insert(&lam);
-}
-
-// fix-forward #7468 (§28.11, v0.357): is this assignment's TARGET a MEMBER
-// SLOT — a field, a property or an indexer — i.e. a holder that outlives the
-// frame? The bare-identifier spelling of a field write is included, as
-// §28.3's field-store rule admits it.
-bool MethodOwnership::trustStoreTargetIsMemberSlot(const ast::Expr* target) {
-    if (!target) return false;
-    if (dynamic_cast<const ast::MemberAccessExpr*>(target)) return true;
-    if (dynamic_cast<const ast::IndexExpr*>(target)) return true;
-    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(target)) {
-        sema::Symbol* sym = ctx_.exprSymbol(*id);
-        return sym && dynamic_cast<sema::FieldSymbol*>(sym) != nullptr;
-    }
-    return false;
-}
-
-// fix-forward #7468 (§28.11, v0.357): the expression walk of the escape
-// scan. Each arm names the POSITION the expression sits in, because the
-// position decides whether the local's value leaves the frame:
-//
-//   * a member-access TARGET, an index TARGET, a call CALLEE, a call
-//     ARGUMENT (a plain one — a `move` argument is a UnaryExpr and is
-//     handled by the `move` arm), an operator OPERAND and an assignment
-//     TARGET are plain READS of the frame's storage: the value stays in the
-//     frame;
-//   * the operand of a `move` is a TRANSFER (E1);
-//   * the body of a LAMBDA is a CAPTURE (E2) — every local of this frame the
-//     closure names is captured by it.
-//
-// The scan is intentionally incomplete in the SAFE direction only: an
-// expression form this walk does not know is scanned by its children, and an
-// identifier it reaches in a position it does not classify is treated as a
-// plain read. That is why the four escape routes above are recognised
-// STRUCTURALLY (a `move` marker, a lambda body, a member-slot store, a
-// returned value) rather than by enumerating every expression form.
-// // per §28.11
-void MethodOwnership::collectEscapingLocalsExpr(const ast::Expr* e) {
-    if (!e) return;
-    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
-        // Inside a CLOSURE BODY, a mention of a local of this frame is a
-        // CAPTURE (E2). Outside one, a mention is a plain read.
-        if (!closureStack_.empty()) noteClosureCapture(*id);
-        return;
-    }
-    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(e)) {
-        if (un->op == "move") {
-            // (E1) a `move` of a local of this frame — a §28.8 transfer.
-            const ast::Expr* operand = lookThroughForceUnwrap(un->operand.get());
-            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(operand))
-                markLocalEscaping(*id);
-            // A `move` of a closure value is a transfer of the closure too.
-            if (auto* lam =
-                    dynamic_cast<const ast::LambdaExpr*>(lookThroughForceUnwrap(
-                        un->operand.get())))
-                noteLambdaEscapesDirectly(*lam);
-        }
-        collectEscapingLocalsExpr(un->operand.get());
-        collectEscapingLocalsExpr(un->replacement.get());
-        return;
-    }
-    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
-        // (E2) a capture: every local of THIS frame the closure names. The
-        // closure's OWN locals and parameters are different symbols and are
-        // not in `localDepth_`, so they are not captured.
-        closureStack_.push_back(lam);
-        if (lam->exprBody) collectEscapingLocalsExpr(lam->exprBody.get());
-        for (const auto& s : lam->stmts)
-            if (s) collectEscapingLocalsStmt(*s);
-        closureStack_.pop_back();
-        return;
-    }
-    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
-        collectEscapingLocalsExpr(ma->target.get());
-        return;
-    }
-    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
-        collectEscapingLocalsExpr(nm->target.get());
-        return;
-    }
-    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
-        collectEscapingLocalsExpr(ce->callee.get());
-        for (const auto& a : ce->args)
-            collectEscapingLocalsExpr(a.value.get());
-        return;
-    }
-    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
-        collectEscapingLocalsExpr(nc->callee.get());
-        for (const auto& a : nc->args)
-            collectEscapingLocalsExpr(a.value.get());
-        return;
-    }
-    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
-        collectEscapingLocalsExpr(ix->target.get());
-        for (const auto& a : ix->indices)
-            collectEscapingLocalsExpr(a.value.get());
-        return;
-    }
-    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
-        collectEscapingLocalsExpr(be->left.get());
-        collectEscapingLocalsExpr(be->right.get());
-        return;
-    }
-    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
-        collectEscapingLocalsExpr(pb->operand.get());
-        return;
-    }
-    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
-        collectEscapingLocalsExpr(cd->condition.get());
-        collectEscapingLocalsExpr(cd->thenValue.get());
-        collectEscapingLocalsExpr(cd->elseValue.get());
-        return;
-    }
-    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
-        for (const auto& a : ne->args)
-            collectEscapingLocalsExpr(a.value.get());
-        return;
-    }
-    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
-        collectEscapingLocalsExpr(th->operand.get());
-        return;
-    }
-    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
-        collectEscapingLocalsExpr(tt->operand.get());
-        return;
-    }
-    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
-        collectEscapingLocalsExpr(we->source.get());
-        for (const auto& ia : we->assigns)
-            collectEscapingLocalsExpr(ia.value.get());
-        return;
-    }
-    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
-        for (const auto& k : cl->keys)
-            if (k) collectEscapingLocalsExpr(k.get());
-        for (const auto& v : cl->elements)
-            if (v) collectEscapingLocalsExpr(v.get());
-        return;
-    }
-    if (auto* cse = dynamic_cast<const ast::CaseExpr*>(e)) {
-        collectEscapingLocalsExpr(cse->scrutinee.get());
-        for (const auto& arm : cse->arms) {
-            collectEscapingLocalsExpr(arm.guard.get());
-            if (arm.bodyKind == ast::CaseArmBodyKind::Expression)
-                collectEscapingLocalsExpr(arm.exprBody.get());
-            else
-                for (const auto& st : arm.stmts)
-                    if (st) collectEscapingLocalsStmt(*st);
-        }
-        return;
-    }
-    if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
-        for (const auto& c : bx->clauses)
-            if (c && c->initializer) collectEscapingLocalsExpr(c->initializer.get());
-        collectEscapingLocalsExpr(bx->body.get());
-        return;
-    }
-    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e)) {
-        collectEscapingLocalsExpr(re->lo.get());
-        collectEscapingLocalsExpr(re->hi.get());
-        collectEscapingLocalsExpr(re->step.get());
-        return;
-    }
-    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
-        for (const auto& part : is->parts)
-            if (part.expr) collectEscapingLocalsExpr(part.expr.get());
-        return;
-    }
-}
-
-// fix-forward #7468 (§28.11, v0.357): the statement walk of the escape scan.
-// The statement GRAMMAR is `forEachNestedStmt`'s (the single source of truth
-// for it, §28.3 / §28.8.1 / §30.5 / §35.5); this function adds the
-// per-statement action.
-void MethodOwnership::collectEscapingLocalsStmt(const ast::Stmt& s) {
-    forEachNestedStmt(s, [&](const ast::Stmt& cur) {
-        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
-            // (E3) a store of a local of this frame into a MEMBER SLOT — the
-            // holder outlives the frame. A store into a LOCAL of this frame
-            // does not: the value stays in the frame (and a `move` there is
-            // (E1), recognised by the expression walk).
-            if (as->op == ":=" && as->target && as->value &&
-                trustStoreTargetIsMemberSlot(as->target.get())) {
-                if (auto* id =
-                        dynamic_cast<const ast::IdentifierExpr*>(as->value.get()))
-                    markLocalEscaping(*id);
-                // A CLOSURE stored into a member slot leaves the frame, and
-                // whatever it captured leaves with it.
-                if (auto* lam =
-                        dynamic_cast<const ast::LambdaExpr*>(as->value.get()))
-                    noteLambdaEscapesDirectly(*lam);
-            }
-            collectEscapingLocalsExpr(as->target.get());
-            collectEscapingLocalsExpr(as->value.get());
-            return;
-        }
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&cur)) {
-            // A closure bound to a local of this frame: the local is its
-            // HOLDER, and the closure escapes exactly when the holder does.
-            if (auto* lam =
-                    dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get()))
-                lambdaHolderLocal_[lam] = ld;
-            collectEscapingLocalsExpr(ld->initializer.get());
-            return;
-        }
-        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&cur)) {
-            collectEscapingLocalsExpr(lc->value.get());
-            return;
-        }
-        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&cur)) {
-            collectEscapingLocalsExpr(es->expr.get());
-            return;
-        }
-        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&cur)) {
-            // (E4) the local's own VALUE leaves the frame.
-            if (rs->value) {
-                const ast::Expr* v = lookThroughForceUnwrap(rs->value.get());
-                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(v))
-                    markLocalEscaping(*id);
-                // A RETURNED closure leaves the frame, and whatever it
-                // captured leaves with it.
-                if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(v))
-                    noteLambdaEscapesDirectly(*lam);
-                collectEscapingLocalsExpr(rs->value.get());
-            }
-            return;
-        }
-        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&cur)) {
-            if (ts->value) {
-                const ast::Expr* v = lookThroughForceUnwrap(ts->value.get());
-                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(v))
-                    markLocalEscaping(*id);
-                collectEscapingLocalsExpr(ts->value.get());
-            }
-            return;
-        }
-        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&cur)) {
-            if (ys->value) {
-                const ast::Expr* v = lookThroughForceUnwrap(ys->value.get());
-                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(v))
-                    markLocalEscaping(*id);
-                collectEscapingLocalsExpr(ys->value.get());
-            }
-            return;
-        }
-        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&cur)) {
-            collectEscapingLocalsExpr(ds->value.get());
-            return;
-        }
-        if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&cur)) {
-            collectEscapingLocalsExpr(is->target.get());
-            return;
-        }
-        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&cur)) {
-            collectEscapingLocalsExpr(ifs->ifBranch.condition.get());
-            for (const auto& el : ifs->elifBranches)
-                collectEscapingLocalsExpr(el.condition.get());
-            return;
-        }
-        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&cur)) {
-            collectEscapingLocalsExpr(ws->condition.get());
-            return;
-        }
-        if (auto* fs = dynamic_cast<const ast::ForStmt*>(&cur)) {
-            collectEscapingLocalsExpr(fs->iterable.get());
-            collectEscapingLocalsExpr(fs->withExpr.get());
-            return;
-        }
-        if (auto* ts = dynamic_cast<const ast::TryStmt*>(&cur)) {
-            for (const auto& arm : ts->catches)
-                collectEscapingLocalsExpr(arm.guard.get());
-            return;
-        }
-        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&cur)) {
-            collectEscapingLocalsExpr(cs->scrutinee.get());
-            for (const auto& arm : cs->arms) {
-                collectEscapingLocalsExpr(arm.guard.get());
-                if (arm.bodyKind == ast::CaseArmBodyKind::Expression)
-                    collectEscapingLocalsExpr(arm.exprBody.get());
-            }
-            return;
-        }
-    });
-}
-
 void MethodOwnership::checkCollectionBorrowStoreEscape(
     const ast::CallExpr& call, bool fromLambdaBody) {
     if (!call.callee) return;
@@ -15130,38 +15157,38 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
             // too, since the body's own replacing `move` can take the field's
             // value out and transfer it (§28.3.9 *Scope* clause 1)."
             //
-            // The receiver is "purely local" when it is a LOCAL of the frame
-            // being checked: `RecvKind::Local` says the receiver resolves to a
-            // local, and the depth map says the local is declared in THIS
-            // frame (`depthOf` >= 0). A local of an ENCLOSING frame — a wider
-            // scope — has no entry in this frame's map and is one of §28.11
-            // clause 2's "provably outlives" holders, so it stays reported.
-            //
-            // fix-forward #7468 (§28.11, v0.357): the ESCAPE half of §28.11's
-            // phrase is now MEASURED rather than assumed. The narrowing that
-            // introduced this exemption (fix #7468, commit 176097b47) read
-            // "a local of the body" as "and does not escape it", which is
-            // FALSE for a collection that leaves the body: three such routes
-            // are ACCEPTED programs and each of them drew exactly one report
-            // line on the base and none on the narrowed tip (the review's
-            // `l_escape1` / `l_escape2` / `l_escape3` probes — a `move` into a
-            // storing callee, a `return move tmp`, and a stored lambda
-            // capture). Each leaves a collection that outlives the body
-            // holding a borrow of the plain parameter, which is precisely the
-            // collection-held [K4.3] clause the mode must name: "A compilation
+            // The COLLECTION — not merely the binding — must be a local of
+            // the body. `RecvKind::Local` says only that the receiver resolves
+            // to a local, which a borrow ALIAS of a field's, a parameter's or
+            // a callee's collection satisfies too (`var tmp := _items;`,
+            // K3.13: "`var b := a;` is always a borrow for class-typed `a`"),
+            // and the element then goes into a collection that outlives the
+            // body. So the exemption needs all of:
+            //   * the local is declared in THIS frame (`depthOf` >= 0) — a
+            //     local of an enclosing frame is one of §28.11 clause 2's
+            //     "provably outlives" holders — and the escape scan ran over
+            //     it (`escapeScanFrame_`: a local of a lambda body checked
+            //     from the enclosing method's run is not one);
+            //   * its binding OWNS A FRESH COLLECTION: the declaration's
+            //     initializer creates it (`trustLocalOwnsFreshCollection`);
+            //   * the collection does NOT ESCAPE the body: the positive scan
+            //     (`collectEscapingLocals`) followed every occurrence of the
+            //     local and found none that can carry it out — no alias, no
+            //     rebinding, no `move`, no return, no store, no capture by a
+            //     closure that itself leaves — and met no form it does not
+            //     know (`escapeScanIncomplete_`).
+            // Any doubt keeps the line, as the base drew it: "A compilation
             // unit that emits no report under the mode carries no recorded
             // trust clause" (§28.3).
-            //
-            // `escapingLocalDecls_` is the scan's answer — the locals of THIS
-            // frame that leave it (a `move`, a closure capture, a store into a
-            // member slot, a returned value). A local in that set does not get
-            // the exemption, so its store is reported.
+            const ast::Node* recvDecl = recvLocal ? recvLocal->decl : nullptr;
             const bool purelyLocalCollection =
-                kind == RecvKind::Local && recvLocal &&
-                depthOf(recvLocal->decl) >= 0;
+                kind == RecvKind::Local && recvDecl &&
+                depthOf(recvDecl) >= 0 &&
+                escapeScanFrame_.count(recvDecl) != 0 &&
+                trustLocalOwnsFreshCollection(recvDecl);
             const bool collectionEscapes =
-                purelyLocalCollection && recvLocal->decl &&
-                escapingLocalDecls_.count(recvLocal->decl) != 0;
+                escapeScanIncomplete_ ||
+                (recvDecl && escapingLocalDecls_.count(recvDecl) != 0);
             const bool purelyLocalQuietStore =
                 purelyLocalCollection && !collectionEscapes &&
                 trustCollectionElementIsSourceBinding(*a.value);

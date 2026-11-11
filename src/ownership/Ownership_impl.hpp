@@ -1392,39 +1392,32 @@ private:
     // shallower (smaller depth) — sound because both are in scope at the
     // assignment, so their blocks lie on a single nesting path.
     std::unordered_map<const ast::Node*, int> localDepth_;
-    // fix-forward #7468 (§28.11 *Borrowing collections* → *Storing a borrow*,
-    // v0.357): the ESCAPE half of §28.11's exemption. The `LocalDecl` nodes of
-    // the locals of THIS frame that leave the frame — a `move` of them, a
-    // closure capture of them, a store of them into a member slot, a return
-    // of them. A collection local in this set does NOT get §28.11's
-    // "a local of the body and does not escape it" exemption, so the store of
-    // a borrow into it is reported (the collection outlives the body, so the
-    // scope comparison no longer bounds the element). Keyed by the same
+    // fix #7468 (§28.11 *Borrowing collections* → *Storing a borrow*,
+    // v0.357): the ESCAPE half of §28.11's exemption ("a collection that is a
+    // local of the body and does not escape it"), as `collectEscapingLocals`
+    // computes it once per body under the report mode. All keyed by the
     // `LocalDecl` node `localDepth_` uses.
+    //   * `escapeScanFrame_` — the locals the scan ran over (this frame's);
+    //   * `escapingLocalDecls_` — those with an occurrence the scan cannot
+    //     positively follow as staying in the frame (an alias, a rebinding, a
+    //     `move`, a return, a store, a capture by an escaping closure, …);
+    //   * `escapeScanIncomplete_` — the scan met a form it does not know, so
+    //     no local of the body gets the exemption;
+    //   * the CLOSURE side: per lambda, its holder local (when it is bound
+    //     directly as the initializer of a local of this frame), the locals
+    //     of this frame it captures, and whether its value escapes directly;
+    //     a fixpoint closes "a lambda escapes when it escapes directly or its
+    //     holder escapes, and then its captures escape with it";
+    //   * `closureStack_` — the lambdas whose body the walk is inside (a
+    //     nested closure's captures are carried by the outer one too).
+    std::unordered_set<const ast::Node*> escapeScanFrame_;
     std::unordered_set<const ast::Node*> escapingLocalDecls_;
-    // fix-forward #7468 (§28.11, v0.357): the CLOSURE side of the escape
-    // scan. A capture of a local by a closure does not by itself take the
-    // local out of the frame — the CLOSURE may die with the frame. So the
-    // scan records, per closure in this body:
-    //   * `lambdaHolderLocal_` — the local the closure is bound to (its
-    //     `LocalDecl`), if it is one;
-    //   * `lambdaCaptureLocals_` — the locals of THIS frame the closure
-    //     names (its capture set);
-    //   * `lambdaEscapesDirectly_` — the closures whose own value leaves the
-    //     frame (stored into a member slot, returned).
-    // The closure escapes when it escapes directly or when its holder local
-    // escapes, and then its capture set leaves the frame with it. The
-    // relation is closed by a fixpoint, so a closure captured by an escaping
-    // closure carries its own captures out too.
+    bool escapeScanIncomplete_ = false;
     std::unordered_map<const ast::LambdaExpr*, const ast::Node*>
         lambdaHolderLocal_;
     std::unordered_map<const ast::LambdaExpr*, std::vector<const ast::Node*>>
         lambdaCaptureLocals_;
     std::unordered_set<const ast::LambdaExpr*> lambdaEscapesDirectly_;
-    // fix-forward #7468 (§28.11, v0.357): the closures whose body the escape
-    // scan is inside — an identifier of this frame named there is a CAPTURE
-    // of it, not a plain read. The stack (not a flag) because a nested
-    // closure's captures are TRANSITIVE: the outer closure carries them.
     std::vector<const ast::LambdaExpr*> closureStack_;
     // fix #3727 (§28.3 *Borrow lifetime rules* / §28.9, v0.286): the depths
     // above, SEALED as they stood the FIRST time `collectLocalDepths` ran on
@@ -4853,29 +4846,29 @@ private:
     // of such an element into a purely local collection is not reported; a
     // field-path-sourced element stays reported.
     bool trustCollectionElementIsSourceBinding(const ast::Expr& e);
-    // fix-forward #7468 (§28.3 *Diagnostics* "The trust-admission report";
-    // §28.11 *Storing a borrow*, v0.357): does this read's TYPE carry a
-    // borrow — a user class or interface, a declaration-less builtin CLASS
-    // head, or a bare type parameter — as opposed to a value (a record, a
-    // choice, an enum, a primitive, a value builtin)?
+    // fix #7468 (§28.3 *Diagnostics* "The trust-admission report"; §28.11
+    // *Storing a borrow*, v0.357): does this read's TYPE carry a borrow? The
+    // default is YES; only a type that is positively a value (a primitive, a
+    // function type, a record or choice holding no borrow, an enum, a
+    // declaration-less builtin on the closed value list) answers NO.
     bool trustReadTypeCarriesBorrow(const sema::TypeRef* rt);
-    // fix-forward #7468 (§28.11 *Storing a borrow*, v0.357): the ESCAPE half
-    // of §28.11's exemption — "a collection that is a local of the body and
-    // does not escape it". `collectEscapingLocals` records the locals of this
-    // frame that leave it (a `move`, a closure capture, a store into a member
-    // slot, a returned value); `isLocalOfThisFrame` answers "is this
-    // identifier a local of the frame being analysed"; `markLocalEscaping`
-    // records one; `trustStoreTargetIsMemberSlot` answers "is this
-    // assignment's target a holder that outlives the frame".
+    // fix #7468 (§28.11 *Storing a borrow*, v0.357): the positive escape
+    // scan behind §28.11's local-collection exemption (see
+    // `collectEscapingLocals` in Ownership_Checks.cpp). `EscapePos` is the
+    // position an expression's value sits in: `Read` (read in place),
+    // `Callee` (called), `Arg` (a plain or `scoped` argument of a call that
+    // is not a collection store) or `Escape` (anything else).
+    enum class EscapePos { Read, Callee, Arg, Escape };
     void collectEscapingLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void collectEscapingLocalsStmt(const ast::Stmt& s);
-    void collectEscapingLocalsExpr(const ast::Expr* e);
-    bool isLocalOfThisFrame(const ast::IdentifierExpr& id) const;
-    void markLocalEscaping(const ast::IdentifierExpr& id);
-    void noteClosureCapture(const ast::IdentifierExpr& id);
-    void noteLambdaEscapesDirectly(const ast::LambdaExpr& lam);
-    bool trustStoreTargetIsMemberSlot(const ast::Expr* target);
+    void collectEscapingLocalsExpr(const ast::Expr* e, EscapePos pos);
+    void collectEscapingLocalsLambda(const ast::LambdaExpr& lam, EscapePos pos,
+                                     const ast::Node* holder);
+    void noteEscapeScanOccurrence(const ast::IdentifierExpr& id, EscapePos pos);
+    const ast::Node* localOfThisFrameDecl(const ast::IdentifierExpr& id) const;
+    bool escapeScanLocalHoldsClosure(const ast::IdentifierExpr& id,
+                                     const ast::Node* decl) const;
     void reportTrustAdmission(Severity sev, SourceLocation loc,
                               const char* clause, const std::string& carrier);
 
