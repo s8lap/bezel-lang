@@ -47064,17 +47064,18 @@ bool Emitter::opaqueLocalProvablyUnwritten(const ast::LocalDecl* ld) {
 // future "Object slot can hold a string OR a box" can compose both bits
 // without re-deriving the state.
 //
-// NARROW SCOPE (per the issue's prescription). Only the EXACT `var <name>: T
-// := <string-identifier>` shape is admitted; any sub-expression initializer
-// (`var o := s + "x"`, `var o := s.ToString()`, `var o := s!`) walks the
-// initializer as the existing escape position — the issue's option (a) is
-// about the bare alias, not a re-derived reference. A `string?`-declared source
-// is excluded (the null/sentinel handling already differs and a retain on a
-// possibly-null slot is the wrong shape). A parameter-typed source is excluded
-// (§28.1 makes a `string` parameter the caller's borrow; a callee-side
-// retain+release would over-release the caller's reference — separate
-// concern). A `using var` target is excluded (its disposal comes from
-// registerUsingDisposal). A reassigned target is admitted with the state-bit
+// SCOPE (as widened by #8514, v0.357). The shapes admitted are the bare
+// string-typed identifier AND the `!` / pointer-preserving `as` runs with a
+// statically `string` layer, plus any non-nullable-`string`, non-producer
+// initializer whose source is not a var/const local (a parameter, a field or
+// property read, an if-expression, an element read). Every admitted member is
+// retained at bind and released at scope end when it never escapes, so a
+// parameter source is balanced too (retain at bind, release at scope end; the
+// caller's reference is untouched, per §28.1). A `string?`-declared bare
+// source is still excluded (the null/sentinel handling differs). Other
+// sub-expression initializers (`var o := s + "x"`, `var o := s.ToString()`)
+// are walked as the existing escape position. A `using var` target is
+// excluded (its disposal comes from registerUsingDisposal). A reassigned target is admitted with the state-bit
 // path; an escaping target stays an conservative escape and is left to leak
 // (the safe direction, mirroring every other eligibility set's overflow).
 void Emitter::collectObjectStringReleaseEligible(
@@ -47084,10 +47085,11 @@ void Emitter::collectObjectStringReleaseEligible(
     objectStringReassignedLocals_.clear();
     // Candidate scan: an Object/interface-typed `var` local (non-using, with
     // an initializer) whose initializer is a bare string-typed IdentifierExpr
-    // referring to a NON-PARAMETER string local. The identifier must be a
-    // LocalSymbol with a non-null `decl` (a `string` LocalDecl); a parameter
-    // is excluded by construction (a `string` parameter's reference belongs to
-    // the caller). The source local's declared type must be a NON-NULLABLE
+    // referring to a string local. The identifier must be a LocalSymbol with a
+    // non-null `decl` (a `string` LocalDecl) for the bare-identifier shape; a
+    // parameter or field source is admitted by the #8514 widening below (the
+    // bind retains and the scope end releases, so the caller's reference is
+    // untouched). The source local's declared type must be a NON-NULLABLE
     // `string` primitive — the nullable case has different null-handling and
     // a retain on a possibly-null slot is the wrong shape.
     // (fix #8514 widens both halves — the `!`-wrapped spellings, and a source

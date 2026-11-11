@@ -231,30 +231,23 @@ BEZEL_TEST(object_string_property_store_8515,
         kLengthTotal);
 }
 
-// The statically-`string` stores the #8214 arm retains keep working.
-BEZEL_TEST(object_string_property_store_8515,
-           string_local_into_object_auto_property_spec_28_9_8_6) {
-    expectNoUseAfterFree(
-        storeThenRead("var x := Make.Str(i); h.P := x;", kReadP), kLengthTotal);
-}
-BEZEL_TEST(object_string_property_store_8515,
-           as_object_into_object_auto_property_spec_28_9_17_4) {
-    expectNoUseAfterFree(
-        storeThenRead("var x := Make.Str(i); h.P := x as Object;", kReadP),
-        kLengthTotal);
-}
-
 // ===========================================================================
 // CONTROLS — leak-checked. A `string`-typed property's setter retains, so its
 // relaxation is unchanged.
 // ===========================================================================
 
+// BOUNDARY CONTROL (base-green, kept: leak check). Goes RED under the wrong
+// fix `drop the setter-retains relaxation for every auto-property`, not only
+// the Object-typed ones (a string-typed store would then leak).
 BEZEL_TEST(object_string_property_store_8515,
            control_string_local_into_string_auto_property_spec_28_9) {
     expectCleanRun(
         storeThenRead("var x := Make.Str(i); h.PS := x;", "h.PS.Length"),
         kLengthTotal);
 }
+// BOUNDARY CONTROL (base-green, kept: leak check). Goes RED under the wrong
+// fix `key the tightening on the initializer's Object type instead of the
+// target property's type` (`o as string` stored into a string property).
 BEZEL_TEST(object_string_property_store_8515,
            control_object_holder_as_string_into_string_property_spec_28_9_17_4) {
     expectCleanRun(

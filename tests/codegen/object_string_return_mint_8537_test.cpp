@@ -293,6 +293,9 @@ BEZEL_TEST(object_string_return_mint_8537,
 
 // A literal through the same `Object` return (an rc sentinel: retain is a
 // no-op).
+// BOUNDARY CONTROL (base-green, kept: leak check). Goes RED under the wrong
+// fix `mint at the return without the literal/+1-producer exclusion` that
+// copies instead of retaining (a leaked copy per call).
 BEZEL_TEST(object_string_return_mint_8537,
            control_object_return_of_literal_spec_28_9) {
     expectCleanRun(
@@ -302,6 +305,8 @@ BEZEL_TEST(object_string_return_mint_8537,
 }
 
 // The `string`-typed return of the same parameter is unchanged.
+// BOUNDARY CONTROL (base-green, kept: leak check). Goes RED under the wrong
+// fix `mint at every string-typed return`, not only the Object-typed ones.
 BEZEL_TEST(object_string_return_mint_8537,
            control_string_return_of_string_param_spec_28_9) {
     expectCleanRun(

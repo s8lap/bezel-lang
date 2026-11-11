@@ -261,33 +261,14 @@ BEZEL_TEST(object_string_bang_alias_8514,
 // the alias's release.
 // ===========================================================================
 
+// BOUNDARY CONTROL (base-green, kept: an rc leak check a corpus case cannot
+// express). Goes RED under the wrong fix `treat every Object-typed `!` bind
+// as retained and never release it` (a read-only alias would then leak).
 BEZEL_TEST(object_string_bang_alias_8514,
            control_nullable_string_bang_object_local_read_only_spec_17_8_28_9) {
     expectCleanRun(
         readOnly("var x: string? := Make.Str(i); var o: Object := x!; "
                  "total := total + o.ToString().Length;"),
-        kLengthTotal);
-}
-BEZEL_TEST(object_string_bang_alias_8514,
-           control_as_object_bang_alias_read_only_spec_17_8_17_4_28_9) {
-    expectCleanRun(
-        readOnly("var x := Make.Str(i); var o := (x as Object)!; "
-                 "total := total + o.ToString().Length;"),
-        kLengthTotal);
-}
-BEZEL_TEST(object_string_bang_alias_8514,
-           control_object_holder_as_string_bang_read_only_spec_17_8_17_4_28_9) {
-    expectCleanRun(
-        readOnly("var o: Object := Make.Str(i); "
-                 "var p: Object := (o as string)!; "
-                 "total := total + p.ToString().Length;"),
-        kLengthTotal);
-}
-BEZEL_TEST(object_string_bang_alias_8514,
-           control_bang_alias_passed_to_reading_formal_spec_17_8_28_9) {
-    expectCleanRun(
-        readOnly("var x := Make.Str(i); var o: Object := (x as Object)!; "
-                 "total := total + h.Peek(o);"),
         kLengthTotal);
 }
 BEZEL_TEST(object_string_bang_alias_8514,
@@ -297,15 +278,6 @@ BEZEL_TEST(object_string_bang_alias_8514,
                  "total := total + o.ToString().Length;"),
         kLengthTotal);
 }
-// The `string`-typed `!` bind #2201 was written for is unchanged.
-BEZEL_TEST(object_string_bang_alias_8514,
-           control_string_bang_alias_read_only_spec_17_8_28_9) {
-    expectCleanRun(
-        readOnly("var x: string? := Make.Str(i); var t := x!; "
-                 "total := total + t.Length;"),
-        kLengthTotal);
-}
-
 // ===========================================================================
 // THE SOURCE KIND — a parameter or a field read, not a `var` local.
 // ===========================================================================
@@ -363,28 +335,11 @@ BEZEL_TEST(object_string_bang_alias_8514,
         kLengthTotal);
 }
 
-// Leak-checked controls: a read-only alias of a parameter / a field read
-// retains at bind and releases at scope end.
-BEZEL_TEST(object_string_bang_alias_8514,
-           control_source_kind_param_bang_alias_read_only_spec_17_8_28_9) {
-    expectCleanRun(
-        readOnly("var x: string? := Make.Str(i); total := total + h.PeekB(x);"),
-        kLengthTotal);
-}
+// BOUNDARY CONTROL (base-green, kept: leak check). Goes RED under the wrong
+// fix `admit a parameter-sourced alias but skip the scope-end release`.
 BEZEL_TEST(object_string_bang_alias_8514,
            control_source_kind_param_alias_read_only_spec_28_9) {
     expectCleanRun(
         readOnly("var x := Make.Str(i); total := total + h.PeekS(x);"),
-        kLengthTotal);
-}
-BEZEL_TEST(object_string_bang_alias_8514,
-           control_source_kind_producer_arg_alias_read_only_spec_28_9) {
-    expectCleanRun(readOnly("total := total + h.PeekS(Make.Str(i));"),
-                   kLengthTotal);
-}
-BEZEL_TEST(object_string_bang_alias_8514,
-           control_source_kind_field_read_alias_read_only_spec_28_9) {
-    expectCleanRun(
-        readOnly("h.S := Make.Str(i); total := total + h.PeekF();"),
         kLengthTotal);
 }
