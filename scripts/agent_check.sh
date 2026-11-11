@@ -63,6 +63,19 @@
 #   scripts/agent_check.sh --probe --asan FILE.bzl    compile+RUN one .bzl under
 #                                                     ASan/LSan with a hang timeout
 #                                                     (for memory/disposal fixes)
+#   scripts/agent_check.sh --results-cache ...         serve recorded PASSES from the
+#                                                     harness RESULTS cache (see
+#                                                     scripts/results_cache.sh):
+#                                                     a test whose binary, bezelc,
+#                                                     runtime, clean source tree,
+#                                                     toolchain and behaviour env
+#                                                     are byte-identical to a run
+#                                                     that PASSED is not re-run.
+#   scripts/agent_check.sh --no-results-cache ...      execute every test (still
+#                                                     records passes and poisons a
+#                                                     contradicted record).
+#                                                     BEZEL_RESULTS_CACHE=0: the
+#                                                     cache is not touched at all.
 #   scripts/agent_check.sh --use-shared REF|auto ...  any of the above, but with NO
 #                                                     build: run the binaries that
 #                                                     scripts/shared_build.sh
@@ -358,7 +371,7 @@ run_sharded() {  # $1 filter $2 bin $3 shards $4 merged-log
   for (( i=0; i<n; i++ )); do
     sl[i]="$SCRATCH/shard_${i}.$(basename "$bin").log"
     mkdir -p "$SCRATCH/shard_tmp/$i"
-    ( "$DH" suite timeout "$BEZEL_GTEST_TIMEOUT" env TMPDIR="$SCRATCH/shard_tmp/$i" \
+    ( "$DH" suite timeout "$BEZEL_GTEST_TIMEOUT" env TMPDIR="$SCRATCH/shard_tmp/$i" "${RC_ENV[@]}" \
         BEZEL_TEST_FILTER="$f" BEZEL_SHARD_COUNT="$n" BEZEL_SHARD_INDEX="$i" "$bin" \
         > "${sl[i]}" 2>&1 ) &
     pids+=($!)
@@ -368,7 +381,7 @@ run_sharded() {  # $1 filter $2 bin $3 shards $4 merged-log
     if [ "$r" -eq 124 ]; then rc=124; elif [ "$r" -ne 0 ] && [ "$rc" -ne 124 ]; then rc=1; fi
   done
   {
-    cat "${sl[@]}" | grep -a -vE '^[0-9]+ passed, [0-9]+ failed|^(NATIVE SANITIZER( INFRA)?|CHECKED TOOLCHAIN|INFRA|SELF-CONTAINED LINK): [0-9]+ '
+    cat "${sl[@]}" | grep -a -vE '^[0-9]+ passed, [0-9]+ failed|^(NATIVE SANITIZER( INFRA)?|CHECKED TOOLCHAIN|INFRA|SELF-CONTAINED LINK|RESULTS CACHE): [0-9]+ '
     cat "${sl[@]}" | awk '
       /^[0-9]+ passed, [0-9]+ failed/ { p += $1; fl += $3
         for (j = 2; j <= NF; j++) if ($j == "total") tot = $(j-1) }
@@ -379,6 +392,10 @@ run_sharded() {  # $1 filter $2 bin $3 shards $4 merged-log
       # #6706: this line carries THREE counts; sum each one positionally.
       /^SELF-CONTAINED LINK: [0-9]+ / { scl = $0; nsc = 0
         for (j = 1; j <= NF; j++) if ($j ~ /^[0-9]+$/) sc[++nsc] += $j }
+      # The results cache: six counts in fixed positions, then the first
+      # shard tail "(key ..., mode ...)" / "(off: ...)" tail.
+      /^RESULTS CACHE: [0-9]+ reused/ { for (j = 1; j <= 6; j++) rcn[j] += $(2 * j + 1)
+        if (rct == "") { rct = $0; sub(/^[^(]*/, "", rct) } }
       END {
         filt = tot - p - fl
         printf "\n%d passed, %d failed", p, fl
@@ -389,9 +406,78 @@ run_sharded() {  # $1 filter $2 bin $3 shards $4 merged-log
         if (scl != "") { n = split(scl, w, " "); m = 0; o = ""
           for (j = 1; j <= n; j++) { if (w[j] ~ /^[0-9]+$/) w[j] = sc[++m]
             o = o (j > 1 ? " " : "") w[j] }
-          print o } }'
+          print o }
+        if (rct != "")
+          printf "RESULTS CACHE: %d reused, %d executed, %d stored, %d poisoned, %d unstored, %d poisoned-reruns %s\n",
+            rcn[1], rcn[2], rcn[3], rcn[4], rcn[5], rcn[6], rct }'
   } | tee "$out"
   return "$rc"
+}
+
+# --- the harness RESULTS cache (tests/support/results_cache.hpp) ------------
+# A test binary consults the cache only when it is handed a key file
+# (BEZEL_RESULTS_CACHE_KEYS), and only this script writes one, through
+# scripts/results_cache.sh, which emits a key only for a binary built from a
+# CLEAN committed tree (so WIP and a reviewer's fail-without arm are never
+# cached). Only PASSES are served; a FAIL, crash, timeout, [ INFRA ] or
+# sanitizer skip always re-runs; BEZEL_AOT_FORCE_SANITIZE turns it off. The gate
+# never runs through here, and every gate script plus tests/run_parallel.sh
+# export BEZEL_RESULTS_CACHE=0 regardless.
+#   default            RC_DEFAULT below (on = serve + record)
+#   --results-cache    serve + record
+#   --no-results-cache execute everything; still record passes, and poison a
+#                      record a FAIL contradicts (the flake guard)
+#   BEZEL_RESULTS_CACHE=0  do not touch the cache at all (wins over the flags)
+RC_DEFAULT=off
+RC_SH="$ROOT/scripts/results_cache.sh"
+RC_STATE=off; RC_WHY=""; RC_KEYS=""; RC_ENV=()
+RC_REUSED=0; RC_EXECUTED=0; RC_KEYSEEN=""
+rc_init() {
+  case "${BEZEL_RESULTS_CACHE-}" in
+    0|off|no|false) RC_STATE=off; RC_WHY="BEZEL_RESULTS_CACHE=${BEZEL_RESULTS_CACHE}"; return ;;
+  esac
+  if [ "$RC_FLAG" = verify ]; then RC_STATE=verify
+  elif [ "$RC_FLAG" = on ]; then RC_STATE=rw
+  else
+    case "${BEZEL_RESULTS_CACHE-}" in
+      verify) RC_STATE=verify ;;
+      1|on|rw|yes|true) RC_STATE=rw ;;
+      "") if [ "$RC_DEFAULT" = on ]; then RC_STATE=rw; else RC_STATE=off; RC_WHY="opt-in: pass --results-cache"; return; fi ;;
+      *) RC_STATE=off; RC_WHY="unrecognised BEZEL_RESULTS_CACHE='${BEZEL_RESULTS_CACHE}'"; return ;;
+    esac
+  fi
+  [ -x "$RC_SH" ] || { RC_STATE=off; RC_WHY="$RC_SH missing"; return; }
+  RC_KEYS="$SCRATCH/results_cache.$$.keys"
+  : > "$RC_KEYS" || { RC_STATE=off; RC_WHY="cannot write $RC_KEYS"; return; }
+  trap 'rm -f "$RC_KEYS"' EXIT
+  # Tidy the cache at most once every 6 hours (key dirs untouched for 5 days).
+  local d="${BEZEL_RESULTS_CACHE_DIR:-/mnt/fast/test-results-cache}"
+  if [ -d "$d" ] && [ -z "$(find "$d/.last_prune" -mmin -360 2>/dev/null)" ]; then
+    touch "$d/.last_prune" 2>/dev/null && "$RC_SH" prune >/dev/null 2>&1
+  fi
+}
+# The env a test run gets for binary $1 (empty when the cache is off for it).
+rc_env_for() {
+  RC_ENV=()
+  [ "$RC_STATE" != off ] || return 0
+  "$RC_SH" keys "$RC_KEYS" "$1" || true
+  RC_ENV=(BEZEL_RESULTS_CACHE_KEYS="$RC_KEYS" BEZEL_RESULTS_CACHE="$RC_STATE")
+}
+# Fold one binary's merged `RESULTS CACHE:` line (from log $1) into the totals.
+rc_tally() {
+  local l; l="$(grep -a -E '^RESULTS CACHE: [0-9]+ reused' "$1" | tail -1)"
+  [ -n "$l" ] || return 0
+  RC_REUSED=$(( RC_REUSED + $(printf '%s' "$l" | awk '{print $3}') ))
+  RC_EXECUTED=$(( RC_EXECUTED + $(printf '%s' "$l" | awk '{print $5}') ))
+  local k; k="$(printf '%s' "$l" | sed -n 's/.*(key \([0-9a-f]*\),.*/\1/p')"
+  [ -n "$k" ] && case " $RC_KEYSEEN " in *" $k "*) ;; *) RC_KEYSEEN="${RC_KEYSEEN:+$RC_KEYSEEN }$k" ;; esac
+}
+rc_report() {
+  if [ "$RC_STATE" = off ]; then
+    echo "RESULTS CACHE: off ($RC_WHY) — every test executed"
+  else
+    echo "RESULTS CACHE: $RC_REUSED reused, $RC_EXECUTED executed (mode $RC_STATE; key ${RC_KEYSEEN:-none: see the 'results_cache: off for' lines above})"
+  fi
 }
 
 # --- probe mode: compile (and optionally run under ASan) ONE .bzl -------------
@@ -444,11 +530,16 @@ RUN_LIT=0
 _ncpu="$(nproc 2>/dev/null || echo 4)"
 SHARDS="${AGENT_CHECK_JOBS:-$(( _ncpu / 4 < 4 ? _ncpu / 4 : 4 ))}"
 [ "$SHARDS" != 0 ] || SHARDS=1   # nproc < 4
+# --results-cache / --no-results-cache: see rc_init below. Stripped here for the
+# same compose-in-any-order reason.
+RC_FLAG=""
 _ac_args=()
 _next_jobs=0
 for _a in "$@"; do
   if [ "$_next_jobs" = 1 ]; then SHARDS="$_a"; _next_jobs=0; continue; fi
   case "$_a" in
+    --results-cache) RC_FLAG=on ;;
+    --no-results-cache) RC_FLAG=verify ;;
     --no-lit) NO_LIT=1 ;;
     --lit) RUN_LIT=1 ;;
     --jobs) _next_jobs=1 ;;
@@ -567,6 +658,7 @@ for f in "$@"; do
 done
 
 build_tests
+rc_init
 
 rc_all=0
 for f in "$@"; do
@@ -618,8 +710,9 @@ for f in "$@"; do
     # Exit 124 = timeout fired; the n<want check below also catches this case
     # but the explicit 124 check gives a clearer message (#5450).
     nsh=$SHARDS; [ "$nsh" -le "$want" ] || nsh=$want
+    rc_env_for "$bin"
     if [ "$nsh" -le 1 ]; then
-      "$DH" suite timeout "$BEZEL_GTEST_TIMEOUT" env BEZEL_TEST_FILTER="$f" "$bin" 2>&1 | tee "$blog"
+      "$DH" suite timeout "$BEZEL_GTEST_TIMEOUT" env "${RC_ENV[@]}" BEZEL_TEST_FILTER="$f" "$bin" 2>&1 | tee "$blog"
       rc=${PIPESTATUS[0]}
     else
       run_sharded "$f" "$bin" "$nsh" "$blog"; rc=$?
@@ -631,6 +724,7 @@ for f in "$@"; do
       f_rc=1
     fi
     cat "$blog" >> "$log"
+    rc_tally "$blog"
     summ="$(grep -a -oE '[0-9]+ passed, [0-9]+ failed' "$blog" | tail -1)"
     n="$(printf '%s' "$summ" | awk '{print $1 + $3}')"   # passed + failed
     f_ran=$(( f_ran + ${n:-0} ))
@@ -675,6 +769,8 @@ if [ "${RUN_LIT:-0}" = 1 ] && [ "${NO_LIT:-0}" != 1 ]; then
 else
   echo "agent_check: lit diagnostic track NOT RUN (opt-in) — before committing a change that touches src/ or tests/lit, run once with --lit and quote its 'Passed:' line"
 fi
+
+rc_report
 
 [ "$rc_all" -eq 0 ] && echo "== agent_check: ALL requested filters green ==" \
                     || echo "== agent_check: some filters FAILED (see above) =="
