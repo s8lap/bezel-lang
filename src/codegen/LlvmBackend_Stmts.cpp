@@ -6598,11 +6598,9 @@ bool Emitter::lowerOwningInlineArrayReassign(const ast::Expr& target,
             prevExc, llvm::ConstantPointerNull::get(ptrTy()));
         builder_.CreateCondBr(prevIsNull, setInFlightBB, disposePrevBB);
         builder_.SetInsertPoint(disposePrevBB);
-        builder_.CreateCall(
-            declareC("bz_clear_exc_deferred", llvm::Type::getVoidTy(llvm_),
-                     {ptrTy()}),
-            {prevExc});
-        emitDisposeAndReclaim(prevExc);
+        // fix #7940 (§31.2 / §30.9, v0.357): end its handling — a task-owned
+        // instance whose owner is alive is dropped undisposed.
+        emitEndExcHandling(prevExc);
         builder_.CreateBr(setInFlightBB);
         // setInFlightBB: store newExc (the latest throw) into inFlightSlot,
         // clear bz$exc so the next iter's dispose sees a clean context,
@@ -6649,11 +6647,8 @@ bool Emitter::lowerOwningInlineArrayReassign(const ast::Expr& target,
         parkedExc, llvm::ConstantPointerNull::get(ptrTy()));
     builder_.CreateCondBr(hadParked, supersedeParkedBB, finalBB);
     builder_.SetInsertPoint(supersedeParkedBB);
-    builder_.CreateCall(
-        declareC("bz_clear_exc_deferred", llvm::Type::getVoidTy(llvm_),
-                 {ptrTy()}),
-        {parkedExc});
-    emitDisposeAndReclaim(parkedExc);
+    // fix #7940 (§31.2 / §30.9, v0.357): as above.
+    emitEndExcHandling(parkedExc);
     builder_.CreateBr(finalBB);
     builder_.SetInsertPoint(finalBB);
     llvm::Value* restoredExc = builder_.CreateSelect(
@@ -7131,12 +7126,9 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 // it captures whatever is in `bz$exc` on entry, which on this
                 // edge is the guard's exception (the in-flight E1 was cleared
                 // just above, #720 B2), and restores it after the finally body.
-                // E1's single dispose is unchanged too: it is performed at the
-                // guard's own throw/pending-check site by the #1108/#1216 path
-                // set up immediately below, which fires iff `caughtExcArmTarget_`
-                // equals the throw's resolved unwind target — both are computed
-                // from `unwindTarget_`, so they still compare equal once both are
-                // finUnwindBB.
+                // E1's single end of handling is unchanged too: the guard's own
+                // leave block (fix #7940, set up immediately below) performs it
+                // on the way to finUnwindBB.
                 //
                 // DISPOSAL IS RELOCATED, NOT DUPLICATED. With `unwindScopeDepth_`
                 // raised to this try's depth for the guard, the guard's throw site
@@ -7155,31 +7147,38 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                     unwindTarget_ = finUnwindBB;
                     unwindScopeDepth_ = disposeStack_.size();
                 }
-                // #1108: a `when` guard that THROWS supersedes the in-flight
-                // exception (E1); E1 must be freed exactly once. Expose E1 as
-                // the caught object LEAVING this arm for the duration of the
-                // guard so a guard `throw` routes through emitThrowValue's
-                // existing #397/#866 caught-exception free (LlvmBackend_Setup
-                // ~2142) — emitted at a LIVE insert point (before the throw's
-                // own branch) and already guarded against double-free by
-                // `isDirectRethrow` (a guard re-raising the SAME bound object
-                // keeps it in flight) and `throwLeavesArm`. This adds NO new
-                // free; it reuses the battle-tested path. Without it E1 leaked
-                // (the arm's `caughtException` disposal is registered only in
-                // armBB below, which is unreachable on the guard-throw edge).
-                // Restored immediately after the guard so armBB re-establishes
-                // its own caught-exception context from the correct outer state.
+                // #1108 / fix #7940 (§31.2, v0.357): a `when` guard that THROWS
+                // supersedes the in-flight exception (E1), whose handling ends
+                // there. The guard is a handled region like the arm body: its
+                // unwind target is a leave block (emitExcLeaveBlock, emitted
+                // below once the enclosing unwind context is restored) that
+                // ends E1's handling on EVERY edge that leaves the guard with a
+                // new exception — a `throw` expression, a propagating call, a
+                // constructor, an awaited task's fault — and then continues to
+                // the target the guard had (finUnwindBB, or the enclosing
+                // handler after discharging the scopes in between). E1 is
+                // exposed as the caught object for the duration of the guard,
+                // as before, and restored immediately after so armBB
+                // re-establishes its own caught-exception context from the
+                // correct outer state.
+                llvm::AllocaInst* guardExcSlot = entryAlloca(ptrTy());
+                builder_.CreateStore(exc, guardExcSlot);
+                // §30.9 / §31.2 (#438): a guard that awaits reaches its leave
+                // block after a resume — frame-back the slot.
+                if (armAwaits) asyncHandlerSpillSlots_.push_back(guardExcSlot);
+                auto* guardLeaveBB = llvm::BasicBlock::Create(
+                    llvm_, "catch.guard.leave", currentFn_);
+                llvm::BasicBlock* guardLeaveDest = unwindBB();
+                unwindTarget_ = guardLeaveBB;
+                unwindScopeDepth_ = disposeStack_.size();
                 llvm::Value* savedGuardCaught = currentCaughtExc_;
                 std::string_view savedGuardCaughtName = currentCaughtName_;
-                llvm::BasicBlock* savedGuardArmTarget = caughtExcArmTarget_;
                 currentCaughtExc_ = exc;
                 currentCaughtName_ =
                     arm.hasBinding ? arm.varName : std::string_view{};
-                caughtExcArmTarget_ = unwindBB();
                 llvm::Value* g = lowerExpr(*arm.guard);
                 currentCaughtExc_ = savedGuardCaught;
                 currentCaughtName_ = savedGuardCaughtName;
-                caughtExcArmTarget_ = savedGuardArmTarget;
                 // fix #2881: the guard is lowered; restore the enclosing unwind
                 // context. armBB re-establishes its own redirect below, and the
                 // not-thrown continuation (armBB/nextBB) is reached by an explicit
@@ -7207,6 +7206,13 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                     builder_.CreateStore(exc, emitExcSlot());
                     builder_.CreateCondBr(g, armBB, nextBB);
                 }
+                // fix #7940: the guard's leave block. With a finally the scopes
+                // between this try and its enclosing handler are finUnwindBB's
+                // to discharge (after the finally body, #2881); without one
+                // they are discharged here, as the no-arm-matched tail does.
+                emitExcLeaveBlock(guardLeaveBB, guardExcSlot,
+                                  hasFin ? thisTryDepth : savedDepth,
+                                  thisTryDepth, guardLeaveDest);
             } else {
                 builder_.CreateBr(armBB);
             }
@@ -7219,7 +7225,6 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
         llvm::Value* savedCaught = currentCaughtExc_;
         std::string_view savedCaughtName = currentCaughtName_;
-        llvm::BasicBlock* savedArmTarget = caughtExcArmTarget_;
         currentCaughtExc_ = exc;
         // #387 / §31.1: the name (if any) this arm binds the caught exception
         // to, so a `throw <newExpr>` from the body can tell whether the new
@@ -7238,8 +7243,10 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         // (§31.1) that may not escape; disposal runs after the body's last
         // use (return values are evaluated before disposal — §28.3).
         disposeStack_.emplace_back();
+        llvm::AllocaInst* armExcSlot = nullptr;
         {
             llvm::AllocaInst* excSlot = entryAlloca(ptrTy());
+            armExcSlot = excSlot;
             builder_.CreateStore(exc, excSlot);
             Disposal d{excSlot, nullptr};
             d.caughtException = true;
@@ -7249,23 +7256,53 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             // resume. emitDisposeAndReclaim reads the object pointer from excSlot,
             // so the slot must survive the cross-thread hop: frame-back it.
             if (armAwaits) asyncHandlerSpillSlots_.push_back(excSlot);
+            // fix #7940 (§31.2, v0.357): in an async state machine the slot
+            // is frame-backed even when the arm has no `await` expression.
+            // The arm's leave block (emitExcLeaveBlock) reads it after the
+            // arm's inner scopes have unwound, and an `await using` binding
+            // among them awaits its DisposeAsync on that edge (§28.12) — a
+            // suspension stmtContainsAwait does not report.
+            else if (asyncSM) asyncHandlerSpillSlots_.push_back(excSlot);
         }
-        // An exception thrown by the arm body must still run finally.
-        if (hasFin) { unwindTarget_ = finUnwindBB; unwindScopeDepth_ =
-                          disposeStack_.size(); }
-        // #866: record the target a throw uses to LEAVE this arm. emitThrowValue
-        // frees the caught exception (the #397 optimization) only when a throw's
-        // unwind target equals this; a throw caught by an INNER try within the arm
-        // targets that inner dispatch instead and must NOT free it (the arm
-        // continues; the caught exception stays in flight for the arm's own exit).
-        // Use the RESOLVED block (unwindBB() maps a null target to the function's
-        // propagate boundary) so a single try with no enclosing handler still
-        // compares correctly against a throw's resolved target.
-        caughtExcArmTarget_ = unwindBB();
+        // fix #7940 (§31.2 / §31.1, v0.357): the arm body is a HANDLED REGION.
+        // An exception that leaves it — a fresh `throw`, a propagating call, a
+        // constructor, an awaited task's fault, a disposal that throws, and
+        // any of those arriving through an inner `try` whose arms did not
+        // match or through an inner finally — ends the handling of the caught
+        // instance (§31.1: disposed after the arm completes "by a fresh
+        // `throw` from it"; §31.2: a superseded task-owned fault instance is
+        // "dropped from the in-flight slot undisposed"). The region's unwind
+        // target is therefore its own LEAVE block (emitExcLeaveBlock, emitted
+        // below once the enclosing unwind context is restored), which ends
+        // that handling and continues to where the arm's unwind went before:
+        // finUnwindBB (an exception thrown by the arm body must still run
+        // finally), or the enclosing handler after discharging the scopes
+        // between this try and it. A throw caught by an INNER try within the
+        // arm targets that inner dispatch and never reaches the leave block:
+        // the arm continues and the caught exception stays handled by it.
+        // (The #866 per-throw-site test this replaces compared a throw's
+        // unwind target with the arm's and so missed every edge that crosses
+        // another block on its way out.)
+        auto* armLeaveBB =
+            llvm::BasicBlock::Create(llvm_, "catch.arm.leave", currentFn_);
+        llvm::BasicBlock* armLeaveDest = hasFin ? finUnwindBB : unwindBB();
+        llvm::BasicBlock* savedArmUnwind = unwindTarget_;
+        std::size_t savedArmUnwindDepth = unwindScopeDepth_;
+        unwindTarget_ = armLeaveBB;
+        unwindScopeDepth_ = disposeStack_.size();
         bool armTerm = false;
         if (arm.body) armTerm = lowerStmt(*arm.body);
-        if (hasFin) { unwindTarget_ = savedUnwind;
-                      unwindScopeDepth_ = savedDepth; }
+        unwindTarget_ = savedArmUnwind;
+        unwindScopeDepth_ = savedArmUnwindDepth;
+        // The scopes the leave block discharges are the ones a throw site in
+        // the arm discharged below the region before: none with a finally
+        // (finUnwindBB's, after the finally body), else the arm's own scope
+        // (its caught-exception entry is skipped on an unwind pass) down to
+        // the enclosing handler's depth.
+        emitExcLeaveBlock(armLeaveBB, armExcSlot,
+                          hasFin ? thisTryDepth : savedDepth,
+                          hasFin ? thisTryDepth : thisTryDepth + 1,
+                          armLeaveDest);
         // On a normal handled fall-through, dispose (free) the caught
         // exception via the scope, then continue to the normal exit. A
         // terminating arm body (return/break/continue) already freed it via
@@ -7274,7 +7311,6 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         disposeStack_.pop_back();
         currentCaughtExc_ = savedCaught;
         currentCaughtName_ = savedCaughtName;
-        caughtExcArmTarget_ = savedArmTarget;
         if (!armTerm) {
             // fix #2892 / §28.10 (v0.241): this arm HANDLED the exception and is
             // falling through to the finally — the same destination AND the same
@@ -7686,31 +7722,34 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             asyncHandlerSpillSlots_.push_back(pendingExcSlot);
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
-            // #1149 (sibling of #1108): a `throw` inside the finally body
-            // SUPERSEDES the captured in-flight exception E1 (§31.2). E1 is then
-            // abandoned and must be freed exactly once — otherwise it leaks (the
-            // direct-throw path terminates the body and bypasses the supersede
-            // check below; the finThrew edge only catches a fall-through-with-
-            // bz$exc-set, which a direct throw never produces). Expose E1 as the
-            // caught object for the duration of the finally body so a `throw`
-            // routes through emitThrowValue's existing #397/#866 caught-exception
-            // free — emitted at a live insert point before the throw's branch and
-            // guarded against double-free by isDirectRethrow/throwLeavesArm. A
-            // finally has no exception binding, so currentCaughtName_ stays empty
-            // (never a direct-rethrow); caughtExcArmTarget_ = unwindBB() (= the
-            // outer unwind target a finally throw branches to) makes throwLeavesArm
-            // true. Restored immediately after so the supersede/restore logic and
-            // outer scopes see the correct caught context. Mirrors the #1108 fix.
+            // #1149 / fix #7940 (§31.2, v0.357): an exception that leaves the
+            // finally body SUPERSEDES the captured in-flight exception E1,
+            // whose handling ends there. The finally body entered on an
+            // exception edge is a handled region: its unwind target is a leave
+            // block (emitExcLeaveBlock) that ends E1's handling on every edge
+            // that leaves the body with a new exception, discharges the scopes
+            // between this try and its enclosing handler (the range the
+            // normal completion below discharges, #467), and continues to
+            // outerUnwind. E1 stays exposed as the caught object for the
+            // duration of the body; a finally has no exception binding, so
+            // currentCaughtName_ stays empty.
+            auto* finLeaveBB = llvm::BasicBlock::Create(
+                llvm_, "finally.leave", currentFn_);
+            llvm::BasicBlock* savedFinUnwind = unwindTarget_;
+            std::size_t savedFinUnwindDepth = unwindScopeDepth_;
+            unwindTarget_ = finLeaveBB;
+            unwindScopeDepth_ = thisTryDepth;
             llvm::Value* savedFinCaught = currentCaughtExc_;
             std::string_view savedFinCaughtName = currentCaughtName_;
-            llvm::BasicBlock* savedFinArmTarget = caughtExcArmTarget_;
             currentCaughtExc_ = builder_.CreateLoad(ptrTy(), pendingExcSlot);
             currentCaughtName_ = std::string_view{};
-            caughtExcArmTarget_ = unwindBB();
             bool finUTerm = lowerScopedBlock(trys.finallyBody);
             currentCaughtExc_ = savedFinCaught;
             currentCaughtName_ = savedFinCaughtName;
-            caughtExcArmTarget_ = savedFinArmTarget;
+            unwindTarget_ = savedFinUnwind;
+            unwindScopeDepth_ = savedFinUnwindDepth;
+            emitExcLeaveBlock(finLeaveBB, pendingExcSlot, savedDepth,
+                              thisTryDepth, outerUnwind);
             if (!finUTerm) {
                 // Restore the captured in-flight exception and re-propagate. If
                 // the finally itself threw (set bz$exc non-null), that NEW
@@ -7750,22 +7789,35 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             llvm::AllocaInst* pendingExcSlot = entryAlloca(ptrTy());
             builder_.CreateStore(builder_.CreateLoad(ptrTy(), emitExcSlot()),
                                  pendingExcSlot);
+            // fix #7940 (§31.2, v0.357): this branch is also taken in an
+            // async state machine whose finally body has no `await`
+            // expression but still suspends — an `await using` binding in it
+            // awaits its DisposeAsync at its scope end and on its unwind
+            // (§28.12). The leave block below reads the slot after that
+            // suspension: frame-back it.
+            if (asyncSM) asyncHandlerSpillSlots_.push_back(pendingExcSlot);
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
-            // #1149: expose the captured in-flight E1 as the caught object for
-            // the finally body so a `throw` inside frees E1 exactly once via
-            // emitThrowValue's #397/#866 path (§31.2 supersede). See the async
-            // branch above for the full rationale + double-free guards.
+            // #1149 / fix #7940 (§31.2, v0.357): the finally body is a handled
+            // region whose leave block ends the superseded E1's handling. See
+            // the async branch above for the full rationale.
+            auto* finLeaveBB = llvm::BasicBlock::Create(
+                llvm_, "finally.leave", currentFn_);
+            llvm::BasicBlock* savedFinUnwind = unwindTarget_;
+            std::size_t savedFinUnwindDepth = unwindScopeDepth_;
+            unwindTarget_ = finLeaveBB;
+            unwindScopeDepth_ = thisTryDepth;
             llvm::Value* savedFinCaught = currentCaughtExc_;
             std::string_view savedFinCaughtName = currentCaughtName_;
-            llvm::BasicBlock* savedFinArmTarget = caughtExcArmTarget_;
             currentCaughtExc_ = builder_.CreateLoad(ptrTy(), pendingExcSlot);
             currentCaughtName_ = std::string_view{};
-            caughtExcArmTarget_ = unwindBB();
             bool finBodyTerm = lowerScopedBlock(trys.finallyBody);
             currentCaughtExc_ = savedFinCaught;
             currentCaughtName_ = savedFinCaughtName;
-            caughtExcArmTarget_ = savedFinArmTarget;
+            unwindTarget_ = savedFinUnwind;
+            unwindScopeDepth_ = savedFinUnwindDepth;
+            emitExcLeaveBlock(finLeaveBB, pendingExcSlot, savedDepth,
+                              thisTryDepth, outerUnwind);
             if (!finBodyTerm) {
                 llvm::Value* afterFin =
                     builder_.CreateLoad(ptrTy(), emitExcSlot());

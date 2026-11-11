@@ -8651,26 +8651,15 @@ void Emitter::emitThrowValue(llvm::Value* excVal, const ast::Expr* excAst) {
                 }
             }
         }
-        // #866: free the caught exception ONLY when this throw actually LEAVES
-        // the enclosing catch arm — i.e. its unwind target is the arm-leaving
-        // target. A throw caught by an INNER try/catch within the arm targets
-        // that inner dispatch instead; the arm continues afterwards and the
-        // caught exception is still in flight, so freeing it here would
-        // double-free it at the arm's own exit (crash).
-        bool throwLeavesArm =
-            caughtExcArmTarget_ && unwindBB() == caughtExcArmTarget_;
-        if (currentCaughtExc_ && excVal != currentCaughtExc_ &&
-            !isDirectRethrow && throwLeavesArm) {
-            // #397 / §28.2 / §31.1: the caught object's lifetime is ending
-            // here with nothing retaining it — dispatch its idempotent
-            // Dispose and reclaim its block once. This is the sole free on
-            // this throw path: the caught-exception scope disposal is SKIPPED
-            // on unwind (isUnwind). The new exception's expression (excVal)
-            // has already been fully evaluated by lowerExpr before this call,
-            // so the caught borrow is no longer needed; freeing it here is
-            // safe and fixes the #387 / #397 residual leak.
-            emitDisposeAndReclaim(currentCaughtExc_);
-        }
+        // fix #7940 (§31.2 / §31.1, v0.357): a `throw <new>` that leaves a
+        // catch arm supersedes the arm's caught exception. That used to be
+        // decided HERE (#397 / #866: dispose it when this throw's unwind target
+        // is the arm's own), which disposed a task-owned instance its bound
+        // task still owned, and missed every throw that reaches the arm's
+        // boundary through another block. The arm's leave block
+        // (emitExcLeaveBlock) now ends the caught instance's handling on every
+        // edge that actually leaves the arm; a throw caught by an inner `try`
+        // inside the arm never reaches it.
         builder_.CreateStore(excVal, emitExcSlot());
     } else if (currentCaughtExc_) {
         // Bare `throw` re-raises the arm's caught exception (the global

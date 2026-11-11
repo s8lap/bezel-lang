@@ -3661,14 +3661,6 @@ private:
     // emitThrowValue to detect a direct re-throw `throw ex;` (the one case
     // that must not free the caught exception when throwing from the arm).
     std::string_view currentCaughtName_;
-    // #866 / §31.2: the unwind target that LEAVES the enclosing catch arm (the
-    // arm's `unwindTarget_` at entry — the enclosing handler / finally / propagate
-    // boundary). emitThrowValue's #397 free of the caught exception is sound ONLY
-    // when the throw actually exits the arm (unwindBB() == this). When the throw
-    // is caught by an INNER try/catch within the arm, unwindBB() is that inner
-    // dispatch instead, the arm continues, and the caught exception must NOT be
-    // freed (it stays in flight for the arm's own exit) — else a double-free.
-    llvm::BasicBlock* caughtExcArmTarget_ = nullptr;
     // CG40: set true by lowering a `throw` expression (§31.2) — the
     // expression diverges (branches to the unwind target), leaving the
     // current block terminated. Phi-building consumers (conditional, `??`)
@@ -3719,20 +3711,17 @@ private:
         llvm::BasicBlock* unwindTarget;
         llvm::BasicBlock* propagateBB;
         llvm::Value* currentCaughtExc;
-        llvm::BasicBlock* caughtExcArmTarget;
         std::size_t unwindScopeDepth;
         bool diverged;
         explicit ThunkUnwindIsolation(Emitter& em)
             : e(em), disposeStack(std::move(em.disposeStack_)),
               unwindTarget(em.unwindTarget_), propagateBB(em.propagateBB_),
               currentCaughtExc(em.currentCaughtExc_),
-              caughtExcArmTarget(em.caughtExcArmTarget_),
               unwindScopeDepth(em.unwindScopeDepth_), diverged(em.diverged_) {
             em.disposeStack_.clear();
             em.unwindTarget_ = nullptr;
             em.propagateBB_ = nullptr;
             em.currentCaughtExc_ = nullptr;
-            em.caughtExcArmTarget_ = nullptr;
             em.unwindScopeDepth_ = 0;
             em.diverged_ = false;
         }
@@ -3741,7 +3730,6 @@ private:
             e.unwindTarget_ = unwindTarget;
             e.propagateBB_ = propagateBB;
             e.currentCaughtExc_ = currentCaughtExc;
-            e.caughtExcArmTarget_ = caughtExcArmTarget;
             e.unwindScopeDepth_ = unwindScopeDepth;
             e.diverged_ = diverged;
         }
@@ -14941,13 +14929,32 @@ private:
     void emitPendingCheckIf(llvm::Value* cond,
                             std::size_t unwindDisposeHi = kAllLiveScopes);
 
-    // #1216 / fix #7629 (§31.2, v0.350): dispose the caught exception E1
-    // (`currentCaughtExc_`) that a NEW exception supersedes on an edge leaving a
-    // catch arm / exception-entered finally — "exactly once". emitPendingCheckIf
-    // shares it; `newExc` non-null adds a runtime `newExc != E1` guard (the
-    // await-using fault edges, where the new exception may be a task's shared
-    // error object).
-    void emitSupersedeCaughtExc(llvm::Value* newExc = nullptr);
+    // fix #7940 (§31.2 / §30.9 / §31.1, v0.357): END ONE HANDLING of the
+    // exception instance `exc` — the one question every handling-end asks
+    // (bz_exc_end_handling): dispose it iff it is handler-owned or its owning
+    // task deferred the disposal to this moment; a task-owned instance whose
+    // owner is alive is "dropped [...] undisposed" (§31.2). Null-safe.
+    void emitEndExcHandling(llvm::Value* exc);
+
+    // fix #7940 (§31.2, v0.357): the LEAVE block of a handled region — a catch
+    // arm's body, a `when` guard, a finally entered on an exception edge. While
+    // the region is lowered it is the region's unwind target, so EVERY edge on
+    // which an exception leaves the region passes through it exactly once,
+    // whatever raised it (a `throw`, a propagating call, a constructor, an
+    // awaited task's fault, a disposal) and whatever it crossed on the way (an
+    // inner `try` whose arms did not match, an inner finally, an argument
+    // cleanup block). The block ends the handling of the region's instance,
+    // discharges the scopes [lo, hi) that lie between the region and `dest`,
+    // and branches to `dest`. `excSlot` holds the instance (frame-backed when
+    // the region suspends); it is nulled once the handling has ended.
+    //
+    // It replaces the per-site supersede (#397 / #866 / #1216 / #7629), which
+    // disposed the instance at the raise site when the site's unwind target was
+    // the arm's own: that test missed every edge listed above that crosses
+    // another block first, and each such edge leaked a handler-owned instance.
+    void emitExcLeaveBlock(llvm::BasicBlock* leaveBB, llvm::AllocaInst* excSlot,
+                           std::size_t lo, std::size_t hi,
+                           llvm::BasicBlock* dest);
 
     // fix #7629 + #7630 (§31.2 / §28.4 / §28.2, v0.350): the tail of an `await
     // using` fault edge (the `await.fault` block and the synchronous-throw
@@ -19081,7 +19088,6 @@ private:
         llvm::Value*         disposerEntryExc_;
         // --- catch/guard-arm context ---
         std::string_view     currentCaughtName_;
-        llvm::BasicBlock*    caughtExcArmTarget_;
         // --- narrow per-call channels ---
         const sema::TypeRef* expectedFunctionType_;
         std::unordered_map<std::string_view, llvm::Type*> lastCallGenericSubst_;

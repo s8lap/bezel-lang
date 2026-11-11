@@ -6467,10 +6467,10 @@ bool Emitter::blockGetterReturnsFieldLend(sema::Symbol* sym) {
 //     (LlvmBackend_Disposal.cpp ~126); `emitPendingCheck` (~1312) compares
 //     against it after any call, so a getter body containing a call would
 //     reference a value defined in another function.
-//   * currentCaughtName_ / caughtExcArmTarget_ — the caller's catch-arm
-//     binding. Benign today only because `currentCaughtExc_` is already nulled
-//     by each emitter; resetting these makes that non-accidental rather than
-//     a coincidence two guards apart.
+//   * currentCaughtName_ — the caller's catch-arm binding. Benign today
+//     only because `currentCaughtExc_` is already nulled by each emitter;
+//     resetting it makes that non-accidental rather than a coincidence two
+//     guards apart.
 //   * expectedFunctionType_ — describes an ARGUMENT POSITION in the caller;
 //     `lowerLambda` reads it to infer a lambda's parameter/return types.
 //   * lastCallGenericSubst_ — a transient `lowerExpr` → `lowerStmt` channel
@@ -6615,7 +6615,6 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
       emittingDisposerBody_(e.emittingDisposerBody_),
       disposerEntryExc_(e.disposerEntryExc_),
       currentCaughtName_(e.currentCaughtName_),
-      caughtExcArmTarget_(e.caughtExcArmTarget_),
       expectedFunctionType_(e.expectedFunctionType_),
       lastCallGenericSubst_(e.lastCallGenericSubst_),
       inlinedAccessorEnd_(e.inlinedAccessorEnd_),
@@ -6635,7 +6634,6 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
     e.emittingDisposerBody_      = false;
     e.disposerEntryExc_          = nullptr;
     e.currentCaughtName_         = {};
-    e.caughtExcArmTarget_        = nullptr;
     e.expectedFunctionType_      = nullptr;
     e.lastCallGenericSubst_.clear();
     e.inlinedAccessorEnd_        = nullptr;
@@ -6681,7 +6679,6 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
     e_.emittingDisposerBody_      = emittingDisposerBody_;
     e_.disposerEntryExc_          = disposerEntryExc_;
     e_.currentCaughtName_         = currentCaughtName_;
-    e_.caughtExcArmTarget_        = caughtExcArmTarget_;
     e_.expectedFunctionType_      = expectedFunctionType_;
     e_.lastCallGenericSubst_      = std::move(lastCallGenericSubst_);
     e_.inlinedAccessorEnd_        = inlinedAccessorEnd_;

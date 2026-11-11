@@ -429,11 +429,10 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
                 llvm::BasicBlock::Create(llvm_, "dtor.restore", currentFn_);
             builder_.CreateCondBr(supersedes, supersedeBB, restoreBB);
             builder_.SetInsertPoint(supersedeBB);
-            builder_.CreateCall(
-                declareC("bz_clear_exc_deferred", llvm::Type::getVoidTy(llvm_),
-                         {ptrTy()}),
-                {parkedDtorExc});
-            emitDisposeAndReclaim(parkedDtorExc);
+            // fix #7940 (§31.2 / §30.9, v0.357): "as if its handling had
+            // completed" — which for a task-owned instance whose owner is
+            // alive disposes nothing (emitEndExcHandling).
+            emitEndExcHandling(parkedDtorExc);
             builder_.CreateBr(restoreBB);
             builder_.SetInsertPoint(restoreBB);
             llvm::Value* restored =
@@ -3363,49 +3362,59 @@ void Emitter::emitPendingCheck(std::size_t unwindDisposeHi) {
     emitPendingCheckIf(pending, unwindDisposeHi);
 }
 
-// #1216 / fix #7629 (§31.2, v0.350): the caught-exception SUPERSEDE, shared by
-// every edge that leaves a catch arm or an exception-entered finally with a NEW
-// exception. §31.2: "the superseded exception is disposed by the runtime exactly
-// once". The caller is on the unwind block of the edge, E2 is in flight, and E1
-// is `currentCaughtExc_`: dispose it here, because the arm's own caught-exception
-// disposal is skipped on an unwind. `throwLeavesArm` (the #397/#866 logic of
-// emitThrowValue) restricts it to an unwind target that is the arm's own outer
-// boundary: a throw caught by an INNER try inside the arm leaves E1 in flight.
-//
-// `newExc`, when given, is the new exception's object. A call-propagated
-// exception is never the same heap object as E1 (emitPendingCheckIf passes
-// null), but an awaited task's fault is RE-RAISED with the task's own error
-// object, which a bound task shares with every other awaiter; so the
-// await-using fault edges guard on `newExc != E1` rather than assume it.
-void Emitter::emitSupersedeCaughtExc(llvm::Value* newExc) {
-    bool throwLeavesArm =
-        caughtExcArmTarget_ && unwindBB() == caughtExcArmTarget_;
-    if (!currentCaughtExc_ || !throwLeavesArm) return;
-    llvm::BasicBlock* contBB = nullptr;
-    if (newExc) {
-        auto* supBB =
-            llvm::BasicBlock::Create(llvm_, "supersede.dispose", currentFn_);
-        contBB = llvm::BasicBlock::Create(llvm_, "supersede.cont", currentFn_);
-        builder_.CreateCondBr(
-            builder_.CreateICmpNE(newExc, currentCaughtExc_), supBB, contBB);
-        builder_.SetInsertPoint(supBB);
-    }
-    // §30.9 (v0.179): if E1 is a task-owned fault whose disposal was deferred
-    // (its owning task was disposed while E1 was in flight, #1288), its
-    // handling ends HERE via the supersede — the catch-arm's handling-
-    // completion drain will not fire on this unwind edge — so clear the
-    // deferred record before disposing to keep the single dispose here and
-    // leave no stale pointer in the deferred set. A no-op for a handler-owned
-    // E1 (the common #1216 case).
-    builder_.CreateCall(
-        declareC("bz_clear_exc_deferred", llvm::Type::getVoidTy(llvm_),
-                 {ptrTy()}),
-        {currentCaughtExc_});
-    emitDisposeAndReclaim(currentCaughtExc_);
-    if (contBB) {
-        builder_.CreateBr(contBB);
-        builder_.SetInsertPoint(contBB);
-    }
+// fix #7940 (§31.2 / §30.9 / §31.1, v0.357): END ONE HANDLING of `exc`. See the
+// declaration and bz_exc_end_handling: the runtime answers, under one lock,
+// whether this end of handling is also the end of the instance's life (a
+// handler-owned instance, or a task-owned one whose owner deferred its disposal
+// to this moment) — only then is it disposed here. A null `exc` is a no-op.
+void Emitter::emitEndExcHandling(llvm::Value* exc) {
+    llvm::Value* disposeIt = builder_.CreateICmpNE(
+        builder_.CreateCall(
+            declareC("bz_exc_end_handling", llvm::Type::getInt8Ty(llvm_),
+                     {ptrTy()}),
+            {exc}, "exc.endhandling"),
+        llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+    auto* dispBB =
+        llvm::BasicBlock::Create(llvm_, "exc.end.dispose", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "exc.end.cont", currentFn_);
+    builder_.CreateCondBr(disposeIt, dispBB, contBB);
+    builder_.SetInsertPoint(dispBB);
+    emitDisposeAndReclaim(exc);
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+}
+
+
+// fix #7940 (§31.2, v0.357): see the declaration. The caller has already
+// restored the ENCLOSING unwind context (`unwindTarget_` / `unwindScopeDepth_`),
+// so a disposal of [lo, hi) that itself throws routes outward, not back here.
+void Emitter::emitExcLeaveBlock(llvm::BasicBlock* leaveBB,
+                                llvm::AllocaInst* excSlot, std::size_t lo,
+                                std::size_t hi, llvm::BasicBlock* dest) {
+    llvm::IRBuilderBase::InsertPointGuard ipGuard(builder_);
+    builder_.SetInsertPoint(leaveBB);
+    llvm::Value* handled =
+        builder_.CreateLoad(ptrTy(), excSlot, "leave.handled");
+    // The instance that is LEAVING is in the in-flight slot. When it is the
+    // handled instance itself — a bare `throw;` (§31.2.4), or the same bound
+    // task awaited again from inside the region (§30.4: every awaiter re-raises
+    // the same live instance) — its handling is not over: it stays in flight
+    // for the next handler, mark and all.
+    llvm::Value* leaving =
+        builder_.CreateLoad(ptrTy(), emitExcSlot(), "leave.inflight");
+    auto* endBB = llvm::BasicBlock::Create(llvm_, "leave.end", currentFn_);
+    auto* outBB = llvm::BasicBlock::Create(llvm_, "leave.out", currentFn_);
+    builder_.CreateCondBr(builder_.CreateICmpNE(handled, leaving), endBB,
+                          outBB);
+    builder_.SetInsertPoint(endBB);
+    emitEndExcHandling(handled);
+    builder_.CreateBr(outBB);
+    builder_.SetInsertPoint(outBB);
+    // The handling has ended (or moved on with the instance): a second pass
+    // through this region's end must find nothing to end.
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), excSlot);
+    if (lo < hi) emitUnwindDisposalsInRange(lo, hi);
+    builder_.CreateBr(dest);
 }
 
 
@@ -3431,7 +3440,12 @@ void Emitter::emitSupersedeCaughtExc(llvm::Value* newExc) {
 void Emitter::emitAsyncDisposeFaultTail(llvm::Value* newExc,
                                         const std::vector<Disposal>& pending,
                                         std::size_t hi) {
-    emitSupersedeCaughtExc(newExc);
+    // fix #7940 (§31.2, v0.357): no supersede here any more. If this edge
+    // leaves a catch arm or an exception-entered finally, the branch below
+    // reaches that region's leave block (emitExcLeaveBlock), which ends the
+    // superseded instance's handling — `newExc` is the in-flight slot's value
+    // by then, which is what that block compares against.
+    (void)newExc;
     // fix #6052 (§28.3 *The return slot*, v0.338): see emitPendingCheckIf.
     if (asyncReturnEdgeSlot_ &&
         asyncReturnEdgeSlot_->getFunction() == currentFn_)
@@ -3446,9 +3460,8 @@ void Emitter::emitAsyncDisposeFaultTail(llvm::Value* newExc,
 
 
 // #792 / §22.13: the shared route block for a conditional pending check. Branch
-// to the unwind target (disposing unwound using-vars first, with the #1216
-// supersede of a captured in-flight exception) iff `cond` is true, else
-// continue. emitPendingCheck computes its condition (bz_exc != null, ANDed with
+// to the unwind target (disposing unwound using-vars first) iff `cond` is true,
+// else continue. emitPendingCheck computes its condition (bz_exc != null, ANDed with
 // the #1468 disposer "is-new" gate) and delegates here; emitEnsureStaticInit
 // passes a "the static-init guard RAISED a new exception" condition so a
 // pre-existing in-flight exception is not misrouted at the static-access site.
@@ -3459,19 +3472,10 @@ void Emitter::emitPendingCheckIf(llvm::Value* cond,
     auto* cont = llvm::BasicBlock::Create(llvm_, "call.cont", currentFn_);
     builder_.CreateCondBr(cond, unwind, cont);
     builder_.SetInsertPoint(unwind);
-    // #1216 (sibling of #1149 / §31.2): if a call inside a finally body (or
-    // catch arm) propagates an exception E2 via this pending-check, and there
-    // is a captured in-flight exception E1 exposed as currentCaughtExc_ (set by
-    // the #1149 / #1108 finally / catch-guard supersede fix), E1 is SUPERSEDED
-    // by E2 and must be freed exactly once HERE — the #1149 emitThrowValue path
-    // handles direct `throw` but is never reached on a call-propagation edge.
-    // Guard mirrors emitThrowValue's #397/#866 logic: throwLeavesArm ensures we
-    // only free when this unwind target is the arm/finally's own outer boundary
-    // (a throw caught by an INNER try within the finally must not free E1 —
-    // the finally continues and E1 stays in flight). No isDirectRethrow guard
-    // is needed: a call-propagated exception (bz$exc set by the callee) is
-    // never the same object as currentCaughtExc_; they are distinct heap objects.
-    emitSupersedeCaughtExc();
+    // fix #7940 (§31.2, v0.357): a call inside a catch arm (or a finally entered
+    // on an exception edge) that propagates E2 supersedes the region's E1. That
+    // is no longer decided here: the branch below reaches the region's leave
+    // block (emitExcLeaveBlock) on every such edge, which ends E1's handling.
     // fix #1882 (§28.4, v0.306): kAllLiveScopes is every pre-existing caller's
     // meaning and keeps emitUnwindDisposals' behaviour bit-for-bit. A SCOPE-END
     // disposal pass passes its own scope's index instead: that scope's entries
@@ -3515,20 +3519,9 @@ void Emitter::emitNewPendingCheck(llvm::Value* obj) {
     builder_.CreateCondBr(pending, unwind, cont);
     builder_.SetInsertPoint(unwind);
     builder_.CreateCall(freeFn(), {obj});  // reclaim the instance block once
-    // #1216: same as emitPendingCheck — if a constructor inside a finally body
-    // (or catch arm) throws and supersedes E1, free E1 exactly once here.
-    // See emitPendingCheck for the full rationale and double-free guards.
-    bool throwLeavesArm =
-        caughtExcArmTarget_ && unwindBB() == caughtExcArmTarget_;
-    if (currentCaughtExc_ && throwLeavesArm) {
-        // §30.9 (v0.179): see emitPendingCheck — clear any deferred-dispose
-        // record for a superseded task-owned fault before its single dispose.
-        builder_.CreateCall(
-            declareC("bz_clear_exc_deferred", llvm::Type::getVoidTy(llvm_),
-                     {ptrTy()}),
-            {currentCaughtExc_});
-        emitDisposeAndReclaim(currentCaughtExc_);
-    }
+    // fix #7940 (§31.2, v0.357): a constructor that throws inside a catch arm
+    // (or an exception-entered finally) supersedes the region's E1; the
+    // region's leave block ends E1's handling — see emitPendingCheckIf.
     emitUnwindDisposals();
     builder_.CreateBr(unwindBB());
     builder_.SetInsertPoint(cont);
@@ -10967,55 +10960,23 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // §30.4 / §30.9 (#854): a task-fault exception re-raised by `await t`
             // of a BOUND task is BORROWED from the task (codegen marked it via
             // bz_mark_exc_borrowed) — the awaiter does NOT own it, so a SECOND
-            // `await t` of the same faulted task must still find a LIVE error_obj.
-            // Skip the reclaim + unmark for a borrowed object; a normal (owned)
-            // caught exception is reclaimed as before (§28.2/#380: idempotent
-            // Dispose + base chain + block reclaim). Branch at runtime on the
-            // per-object borrowed-set membership.
-            llvm::Function* fn = builder_.GetInsertBlock()->getParent();
-            auto* isBorrowedFn = declareC("bz_is_exc_borrowed",
-                                          llvm::Type::getInt8Ty(llvm_), {ptrTy()});
-            llvm::Value* bv =
-                builder_.CreateCall(isBorrowedFn, {obj}, "exc.borrowed");
-            llvm::Value* isB = builder_.CreateICmpNE(
-                bv, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
-            auto* borrowBB = llvm::BasicBlock::Create(llvm_, "exc.borrow", fn);
-            auto* ownedBB  = llvm::BasicBlock::Create(llvm_, "exc.owned", fn);
-            auto* contBB   = llvm::BasicBlock::Create(llvm_, "exc.dispcont", fn);
-            auto* drainBB = llvm::BasicBlock::Create(llvm_, "exc.eo.drain", fn);
-            builder_.CreateCondBr(isB, borrowBB, ownedBB);
-            // Borrowed: the fault is owned by the task, not this awaiter — the
-            // awaiter must NOT reclaim it (a SECOND `await t` re-raises the same
-            // live instance, §30.4). Unmark it; handling has now completed.
+            // `await t` of the same faulted task must still find a LIVE
+            // error_obj; a normal (handler-owned) caught exception is reclaimed
+            // (§28.2/#380: idempotent Dispose + base chain + block reclaim).
             // §30.9 in-flight-deferral (v0.179) terminal act: if the owning task
-            // was disposed WHILE this fault was in flight (a faulted task bound
-            // inside this `try`, unwound by its own fault — #1288 / #1197), its
-            // scope-end recorded the exception for deferred disposal instead of
-            // freeing it mid-dispatch. Perform that deferred dispose now, as the
-            // terminal act of handling; otherwise leave the live instance to its
-            // still-owning task's own scope-end.
-            builder_.SetInsertPoint(borrowBB);
-            auto* unmarkFn = declareC("bz_unmark_exc_borrowed",
-                                      llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(unmarkFn, {obj});
-            auto* isDeferredFn = declareC("bz_is_exc_deferred",
-                                          llvm::Type::getInt8Ty(llvm_), {ptrTy()});
-            llvm::Value* dv = builder_.CreateCall(isDeferredFn, {obj},
-                                                  "exc.deferred");
-            llvm::Value* isD = builder_.CreateICmpNE(
-                dv, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
-            builder_.CreateCondBr(isD, drainBB, contBB);
-            builder_.SetInsertPoint(drainBB);
-            auto* clearFn = declareC("bz_clear_exc_deferred",
-                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(clearFn, {obj});
-            emitDisposeAndReclaim(obj);
-            builder_.CreateBr(contBB);
-            // Owned: normal reclaim.
-            builder_.SetInsertPoint(ownedBB);
-            emitDisposeAndReclaim(obj);
-            builder_.CreateBr(contBB);
-            builder_.SetInsertPoint(contBB);
+            // was disposed WHILE this fault was in flight (#1288 / #1197), its
+            // scope-end recorded the exception for deferred disposal; that
+            // dispose is performed now. emitEndExcHandling asks the runtime
+            // which of the three it is (fix #7940: the same question every
+            // other end of a handling asks).
+            emitEndExcHandling(obj);
+            // fix #7940 (§31.1, v0.357): the handling has ended on this edge
+            // (the arm's normal exit, or a `return` / `break` / `continue`
+            // leaving it). Empty the slot so the arm's leave block
+            // (emitExcLeaveBlock) finds nothing to end if a LATER cleanup of
+            // the same edge throws.
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 it->slot);
             continue;
         }
         // §15.3 / §15.1.1 (#747): a move-only owning inline-array local. Dispose
@@ -12590,58 +12551,20 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                             builder_.CreateICmpNE(parked, newExc);
                         auto* supBB = llvm::BasicBlock::Create(
                             llvm_, "unwind.supersede", currentFn_);
-                        auto* borrowedBB = llvm::BasicBlock::Create(
-                            llvm_, "unwind.supersede.borrowed", currentFn_);
-                        auto* ownedBB = llvm::BasicBlock::Create(
-                            llvm_, "unwind.supersede.owned", currentFn_);
-                        auto* drainBB = llvm::BasicBlock::Create(
-                            llvm_, "unwind.supersede.drain", currentFn_);
                         builder_.CreateCondBr(
                             builder_.CreateAnd(hadParked, differs), supBB,
                             joinBB);
                         builder_.SetInsertPoint(supBB);
-                        auto* isBorrowedFn = declareC(
-                            "bz_is_exc_borrowed", llvm::Type::getInt8Ty(llvm_),
-                            {ptrTy()});
-                        llvm::Value* borrowed = builder_.CreateICmpNE(
-                            builder_.CreateCall(isBorrowedFn, {parked}),
-                            llvm::ConstantInt::get(
-                                llvm::Type::getInt8Ty(llvm_), 0));
-                        builder_.CreateCondBr(borrowed, borrowedBB, ownedBB);
-                        // §30.9: a BORROWED parked exception is a bound
-                        // task's fault whose handling ends here. Unmark it;
-                        // if its owner was disposed meanwhile and deferred
-                        // the disposal to the end of handling, that is now
-                        // (the catch arm's own drain will not run on this
-                        // edge); otherwise the owning task still disposes it
-                        // at its scope end (§31.2's exception for a
-                        // task-owned fault instance) and may re-raise it to
-                        // another awaiter first (§30.4).
-                        builder_.SetInsertPoint(borrowedBB);
-                        builder_.CreateCall(
-                            declareC("bz_unmark_exc_borrowed",
-                                     llvm::Type::getVoidTy(llvm_), {ptrTy()}),
-                            {parked});
-                        auto* isDeferredFn = declareC(
-                            "bz_is_exc_deferred", llvm::Type::getInt8Ty(llvm_),
-                            {ptrTy()});
-                        llvm::Value* deferred = builder_.CreateICmpNE(
-                            builder_.CreateCall(isDeferredFn, {parked}),
-                            llvm::ConstantInt::get(
-                                llvm::Type::getInt8Ty(llvm_), 0));
-                        builder_.CreateCondBr(deferred, drainBB, joinBB);
-                        // An OWNED parked exception has no other owner now:
-                        // dispose it here, exactly once (§31.2). The deferred
-                        // clear is a no-op for it and keeps the one spelling
-                        // emitSupersedeCaughtExc uses.
-                        builder_.SetInsertPoint(ownedBB);
-                        builder_.CreateBr(drainBB);
-                        builder_.SetInsertPoint(drainBB);
-                        builder_.CreateCall(
-                            declareC("bz_clear_exc_deferred",
-                                     llvm::Type::getVoidTy(llvm_), {ptrTy()}),
-                            {parked});
-                        emitDisposeAndReclaim(parked);
+                        // §30.9 / §31.2: the parked exception's handling ends
+                        // here (the catch arm's own exit will not run on this
+                        // edge). A bound task's fault whose owner is alive is
+                        // dropped undisposed — the owning task still disposes
+                        // it at its scope end and may re-raise it to another
+                        // awaiter first (§30.4); one whose owner deferred the
+                        // disposal to the end of handling, and a handler-owned
+                        // one, are disposed now, exactly once
+                        // (emitEndExcHandling, fix #7940).
+                        emitEndExcHandling(parked);
                         builder_.CreateBr(joinBB);
                     };
                     emitAsyncDisposeAwaitAndFree(

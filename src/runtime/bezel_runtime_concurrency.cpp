@@ -958,6 +958,31 @@ extern "C" void bz_clear_exc_deferred(void* obj) {
     g_deferred_exc_dispose.erase(obj);
 }
 
+// fix #7940 (§31.2 / §30.9 / §31.1, v0.357): END ONE HANDLING of `obj`, and
+// say whether the caller must dispose it. Every way a handling ends — the catch
+// arm's exit, and every supersession (§31.2: a new exception leaving the arm, a
+// throwing finally / destructor / cleanup pass / `when` guard) — asks this ONE
+// question instead of deciding for itself:
+//   * returns 1 for a HANDLER-OWNED instance (§31.1: no task owns it, so the
+//     end of its handling is the end of its life), and for a task-owned one
+//     whose owner was disposed while it was in flight and deferred the disposal
+//     to this moment (§30.9 refinement (a)) — the record is consumed here, so
+//     the caller's dispose is the single one;
+//   * returns 0 for a task-owned instance whose owner is still alive. §31.2:
+//     "a superseded task-owned fault instance (§30.9) [...] is dropped from the
+//     in-flight slot undisposed, its owner's disposal rules unchanged —
+//     supersession ends the instance's handling, never its life".
+// The supersede paths used to dispose unconditionally, which freed an instance
+// its bound task still owned (and re-raises to its next awaiter, §30.4).
+// One lock for the whole decision: the mark and the deferral are read together
+// or a concurrent owner disposal can slip between them.
+extern "C" int8_t bz_exc_end_handling(void* obj) {
+    if (!obj) return 0;
+    std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
+    if (!g_borrowed_exc.erase(obj)) return 1;
+    return g_deferred_exc_dispose.erase(obj) ? 1 : 0;
+}
+
 bool bz_task_is_done(void* tp) {
     auto* task = (bz_task_t*)tp;
     std::lock_guard<std::mutex> lk(task->mtx);
