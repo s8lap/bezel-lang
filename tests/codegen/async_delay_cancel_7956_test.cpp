@@ -325,6 +325,6 @@ BEZEL_TEST(delay_cancel_7956_asan, cancelled_delays_no_leak_no_uaf) {
         "  end; "
         "end for; "
         "return n; "), 20);
-    if (a == -1) return;   // toolchain unavailable: SKIP
+    BEZEL_EXPECT_TRUE(a >= 0);   // -1 = ASan runtime missing: a FAIL, never a SKIP (#3682)
     BEZEL_EXPECT_EQ(a, 0);
 }
