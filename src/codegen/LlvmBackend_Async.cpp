@@ -2041,7 +2041,10 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             llvm::Value* outerTask = builder_.CreateLoad(ptrTy(), otField);
             llvm::Value* excObj =
                 builder_.CreateLoad(ptrTy(), emitExcSlot(), "async.fault.exc");
-            auto* completeErrObjFn = declareC("bz_task_complete_error_obj",
+            // fix #7943 (§30.9, v0.357): the escape boundary. The runtime
+            // decides whether the task OWNS the instance or carries it as a
+            // borrow of the task that owns it (bz_task_complete_escaped_fault).
+            auto* completeErrObjFn = declareC("bz_task_complete_escaped_fault",
                                               llvm::Type::getVoidTy(llvm_),
                                               {ptrTy(), ptrTy()});
             builder_.CreateCall(completeErrObjFn, {outerTask, excObj});
@@ -2839,7 +2842,10 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             llvm::Value* outerTask = builder_.CreateLoad(ptrTy(), otField);
             llvm::Value* excObj =
                 builder_.CreateLoad(ptrTy(), emitExcSlot(), "asynclam.fault.exc");
-            auto* completeErrObjFn = declareC("bz_task_complete_error_obj",
+            // fix #7943 (§30.9, v0.357): the escape boundary. The runtime
+            // decides whether the task OWNS the instance or carries it as a
+            // borrow of the task that owns it (bz_task_complete_escaped_fault).
+            auto* completeErrObjFn = declareC("bz_task_complete_escaped_fault",
                                               llvm::Type::getVoidTy(llvm_),
                                               {ptrTy(), ptrTy()});
             builder_.CreateCall(completeErrObjFn, {outerTask, excObj});
@@ -4390,8 +4396,10 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             llvm::Value* task = builder_.CreateLoad(ptrTy(), taskField);
             llvm::Value* excObj = builder_.CreateLoad(
                 ptrTy(), emitExcSlot(), "asynciter.fault.exc");
+            // fix #7943 (§30.9, v0.357): the escape boundary, as in
+            // emitAsyncMethod (bz_task_complete_escaped_fault).
             auto* completeErrObjFn = declareC(
-                "bz_task_complete_error_obj", llvm::Type::getVoidTy(llvm_),
+                "bz_task_complete_escaped_fault", llvm::Type::getVoidTy(llvm_),
                 {ptrTy(), ptrTy()});
             builder_.CreateCall(completeErrObjFn, {task, excObj});
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
@@ -5474,7 +5482,16 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
         // runtime check without changing behavior there.
         {
             llvm::Value* shouldMark;
-            if (!freeTaskAfter) {
+            // fix #7943 (§30.9 / §30.5, v0.357): a chained return's anonymous
+            // source (`return await Producer()`, freeOnFault) is reclaimed on
+            // this very edge although freeTaskAfter is false — only the
+            // success path chains it. It is consumed here exactly as a
+            // freeTaskAfter task is, so its instance is handler-owned unless
+            // the task itself carried it as a borrow. Marked unconditionally,
+            // the instance read as task-owned with no task left to own it:
+            // the frame's faulted task carried it as a borrow and nothing
+            // ever disposed it.
+            if (!freeTaskAfter && !freeOnFault) {
                 shouldMark = builder_.getTrue();
             } else {
                 auto* fbFn = declareC("bz_task_fault_borrowed",

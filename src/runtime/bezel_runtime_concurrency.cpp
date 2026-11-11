@@ -983,6 +983,35 @@ extern "C" int8_t bz_exc_end_handling(void* obj) {
     return g_deferred_exc_dispose.erase(obj) ? 1 : 0;
 }
 
+// fix #7943 (§30.9, v0.357): complete `tp` with the fault that ESCAPED its
+// async frame — the three codegen fault boundaries (an async method's, an
+// async lambda's, an async iterator's per-advance task), and only those: every
+// other completion faults a task with a FRESH or transferred-in instance.
+// §30.9 "A fault that escapes into a task is retained through its operand
+// task": when the escaping instance is another task's fault that an `await` /
+// `Result` re-raised into this frame, "the instance stays owned by the task
+// that owned it, the faulted task carries it as a borrow [...] it does not
+// become its owner". An instance that is marked borrowed at the capture is
+// exactly such an instance (the re-raise marked it), so the faulted task is
+// flagged `fault_borrowed`, the flag every disposal decision already honors
+// for a WhenAll aggregate: this task's own disposal never reclaims the
+// instance, and an awaiter that consumes this task re-raises it as a borrow.
+// Without the flag the faulted task was a SECOND nominal owner of an instance
+// whose real owner had already disposed-or-deferred it, and the instance was
+// disposed twice — once as the deferred disposal drained by the handler, once
+// by this task's scope end (heap-use-after-free, #7943 / #7886).
+// An unmarked escaping instance (a handler-owned one, §31.1: thrown in the
+// frame, or re-raised from a task the await consumed) is owned by the faulted
+// task as before.
+extern "C" void bz_task_complete_escaped_fault(void* tp, void* error_obj) {
+    if (error_obj) {
+        std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
+        if (g_borrowed_exc.count(error_obj))
+            ((bz_task_t*)tp)->fault_borrowed = true;
+    }
+    bz_task_complete_error_obj(tp, error_obj);
+}
+
 bool bz_task_is_done(void* tp) {
     auto* task = (bz_task_t*)tp;
     std::lock_guard<std::mutex> lk(task->mtx);
@@ -2021,6 +2050,11 @@ static void bz_task_faf_report_disposed_access(bz_task_t* task,
     // terminal act of the swallow (bz_dispose_class_obj, defined above:
     // generic virtual Dispose() + reclaim, the same helper WhenAllOwned uses
     // for its own input faults).
+    // fix #7943 (§30.9, v0.357): unless the task only CARRIES the instance —
+    // a DisposedAccessException that another task owns and an `await` re-raised
+    // into this frame ("it does not become its owner"). The report is still
+    // made; the disposal stays its owner's.
+    if (task->fault_borrowed) return;
     bz_dispose_class_obj(task->error_obj);
     task->error_obj = nullptr;
 }
