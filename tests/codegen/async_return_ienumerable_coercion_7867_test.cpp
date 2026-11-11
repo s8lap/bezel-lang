@@ -39,8 +39,8 @@
 // drained the pipeline at the `return`, which ran every callback before the
 // task completed; the `lazy_*` rows below pin the deferred behaviour, each
 // looped 200 times under generated-code ASan. The rows that say what the
-// eager drain printed are red on that first cut; all but the never-enumerated
-// one are red on the base (SEGV — the base never ran that row's predicate
+// eager drain printed are red on that first cut; all of them
+// are red on the base (SEGV — the base never ran that row's predicate
 // either, it leaked the raw handle instead). The
 // `lazy_result_consumed_in_await_expression_*` row is the strict-oracle
 // (LeakSanitizer) leg: red on the base, green on the first cut.
@@ -50,9 +50,8 @@
 // "sourced from the method's own parameters or receiver"; one that reaches a
 // scope-bound local is to be materialized instead. Where the returned
 // pipeline reaches a local of the returning activation that the ownership
-// checker did not reject (#8565) — a typed collection-literal local as the
-// source, an owned local captured by the callback — or an `owned` parameter, the edge
-// keeps the eager drain: MEASURED, deferring those is a heap-use-after-free
+// checker did not reject (#8565) — an owned local captured by the callback —
+// or an `owned` parameter, the edge keeps the eager drain: MEASURED, deferring those is a heap-use-after-free
 // (or, for the captured local, silently enumerates nothing). The
 // `materialized_*` rows pin them under the strict oracle. The same fallback
 // covers a pipeline first bound to a local (`var q := ...; return q;`).
@@ -380,11 +379,11 @@ BEZEL_TEST(async_return_ienumerable_coercion_7867,
                        "1690 200\n");
 }
 
-// The result awaited and NEVER enumerated. This row is green on the base too
-// (the base printed the same and leaked the raw pipeline: 1400 allocations
-// over the 200 iterations), so it is a control for the mirror, not a pin of
-// the fix. That no predicate runs here is pinned by
-// `lazy_never_enumerated_runs_no_predicate_*` below. LeakSanitizer off (#8528).
+// DECLARED CONTROL 1 of 2 (green on the base too: the base printed the same
+// and leaked the raw pipeline, 1400 allocations over the 200 iterations).
+// The WRONG FIX it catches: a return edge that wraps the result so that
+// merely awaiting without enumerating faults or changes the count. A gtest
+// row because it needs the 200-iteration ASan loop. LeakSanitizer off (#8528).
 BEZEL_TEST(async_return_ienumerable_coercion_7867,
            bound_result_never_enumerated_control_spec_30_1) {
     expectBoundLenient(kMembers, "var it := await AW(Make.MkH(i).S); t := t + 1;",
@@ -514,14 +513,6 @@ BEZEL_TEST(async_return_ienumerable_coercion_7867,
     expectLazyStrict("", "t := t + (await AX(loc, shared)).Count();", "600 600 0\n");
 }
 
-// stdlib §5 (v0.357): the callback is "retained by the returned query value
-// until enumeration" — a result that is never enumerated runs NO predicate.
-// The eager drain ran 200 x 46 = 9200 of them. LeakSanitizer off (#8528).
-BEZEL_TEST(async_return_ienumerable_coercion_7867,
-           lazy_never_enumerated_runs_no_predicate_stdlib_5) {
-    expectLazyLenient("", "var it := await AW(loc); t := t + 1;", "200 0 0\n");
-}
-
 // An exception the predicate throws is raised AT THE ENUMERATION, not at the
 // `await`: the `await` completes (`stage = 1`), the first item is delivered
 // (`n = 1`), and the throw on 'b' surfaces from the `for`. Two predicate runs
@@ -563,10 +554,13 @@ BEZEL_TEST(async_return_ienumerable_coercion_7867,
 
 // §28.3 (v0.357), "Returning a deferred-activation frame": a frame that
 // reaches storage the returning activation releases is materialized, not
-// deferred. The ownership checker admits these three, so the return edge has
-// to decide: a typed collection-literal local as the source (2 + 3 = 5 per
-// iteration), an owned local captured by the predicate (`a` holds 1: 1 per
-// iteration), and an `owned` parameter (5 per iteration). STRICT oracle.
+// deferred. The ownership checker admits these shapes, so the return edge has
+// to decide: an owned local captured by the predicate (`a` holds 2 and 3: 5
+// per iteration; `a` holds 1: 1 per iteration, also with the result bound), and
+// an `owned` parameter (5 per iteration). STRICT oracle. (A typed
+// collection-literal local, `var a: Array<int> := [1, 2, 3]`, is NOT among
+// them: since #7980 the checker rejects it, §28.3 borrow-lifetime rule; that
+// program is a conformance-corpus reject candidate.)
 // MEASURED with the pipeline deferred unconditionally: heap-use-after-free,
 // "0" (the captured local is gone when the predicate finally runs), and
 // heap-use-after-free.
@@ -575,8 +569,8 @@ BEZEL_TEST(async_return_ienumerable_coercion_7867,
     const std::string af =
         "  public static async method AF(s: string, xs: Array<int>): "
         "Task<IEnumerable<int>> ";
-    expectLazyStrict(af + "var a: Array<int> := [1, 2, 3]; "
-                          "return a.Where(lambda(x) => x > 1); end AF;\n",
+    expectLazyStrict(af + "var a := new Array<int>(); a.Add(2); a.Add(3); "
+                          "return xs.Where(lambda(x) => a.Contains(x)); end AF;\n",
                      "t := t + (await AF(loc, shared)).Sum();", "1000 0 0\n");
     expectLazyStrict(af + "var a := new Array<int>(); a.Add(1); "
                           "return xs.Where(lambda(x) => a.Contains(x)); end AF;\n",
@@ -587,15 +581,18 @@ BEZEL_TEST(async_return_ienumerable_coercion_7867,
         "  public static async method AO(owned xs: Array<int>): "
         "Task<IEnumerable<int>> return xs.Where(lambda(x) => x > 1); end AO;\n",
         "t := t + (await AO(Program.Mk())).Sum();", "1000 0 0\n");
-    // The literal-local source with the result BOUND (LeakSanitizer off, #8528).
-    expectLazyLenient(af + "var a: Array<int> := [1, 2, 3]; "
-                           "return a.Where(lambda(x) => x > 1); end AF;\n",
+    // A captured `new` local with the result BOUND (LeakSanitizer off, #8528).
+    expectLazyLenient(af + "var a := new Array<int>(); a.Add(1); "
+                           "return xs.Where(lambda(x) => a.Contains(x)); end AF;\n",
                       "var it := await AF(loc, shared); for var x in it do t := t + x; end;",
-                      "1000 0 0\n");
+                      "200 0 0\n");
 }
 
-// THE CONTROL: the non-async twin. The sync `return` edge has always performed
-// the §29.2 coercion, so this row is green on the base and stays green.
+// DECLARED CONTROL 2 of 2: the non-async twin. The sync `return` edge has
+// always performed the §29.2 coercion, so this row is green on the base and
+// stays green. The WRONG FIX it catches: moving the conversion out of the
+// shared return-edge helper into the async path only, breaking the sync
+// `Where` -> `IEnumerable` coercion.
 BEZEL_TEST(async_return_ienumerable_coercion_7867,
            sync_twin_where_for_in_control_spec_29_2) {
     expectStrict(kMembers,
