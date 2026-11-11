@@ -4057,6 +4057,72 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         }
     }
 
+    // fix #8582 / stdlib §5, §4.1–§4.3 (v0.357): the stdlib §5 zero-argument
+    // `Count()` on a POLYMORPHIC collection interface (IReadOnlyCollection<T> /
+    // ICollection<T> / IOwningCollection<T>).
+    //
+    // THE MEMBER. stdlib §4.1 declares `pure readonly property Count: int` on
+    // `IReadOnlyCollection<out T>`, and `ICollection<T>` inherits it from
+    // there; stdlib §4.2's `IOwningCollection<T>` inherits it the same way.
+    // stdlib §5's `extension IEnumerable<T>` declares `public method
+    // Count(): int` — the zero-argument count operator — and the stdlib §1
+    // "Block-by-name" row says an instance member blocks a same-named
+    // extension, so on these heads `c.Count()` is THAT member reached through
+    // the call spelling (the same member the `.Count` property read reaches),
+    // and not the §5 operator.
+    //
+    // THE DEFECT (issue #8582, MEASURED on this base). The PROPERTY read on
+    // these three heads is REFUSED by the #853 fence above's sibling in
+    // LlvmBackend_Exprs.cpp (`isCollectionInterfaceName`), because the
+    // interface-typed receiver erases the concrete backing: `ICollection<T>`
+    // is implemented by Array<T> (bz_array_t*), LinkedList<T> (bz_llist_t*),
+    // Set<T> and Dictionary<K,V> (bz_dict_t*) — incompatible runtime
+    // representations with no shared kind tag and no collection itable, so no
+    // single runtime dispatch is sound. The CALL spelling of the same member
+    // reached NO arm and NO fence: the call lowered to nothing, the enclosing
+    // store degraded to a zero-initialised value behind the `internal:`
+    // #2434 warning, and the program exited 0 with a WRONG answer (a
+    // three-element `ICollection<int>` printed 0). §7.5 says the `?.` spelling
+    // resolves the member exactly as the `.` spelling does, so the two
+    // spellings must AGREE — and the `.` spelling's own answer for this
+    // member is a refusal. The same soundness argument #853 rests on applies
+    // to the call form: it is REFUSED here, never degraded to a silent zero.
+    //
+    // Only the three POLYMORPHIC heads are refused. `IOwningList<T>` is NOT
+    // one of them: stdlib §4.5's `OwningArray<T>` is its only implementer, so
+    // it is array-backed and its count IS obtainable — the `.Count` property
+    // read on it already answers the real count. Its call form is a narrower,
+    // separate gap (the OWNING list interface has no call-form array bridge),
+    // and is filed separately rather than refused here.
+    {
+        if (m == "Count" && call.args.empty() &&
+            isCollectionInterfaceName(recvTy)) {
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "`Count()` through a polymorphic collection interface "
+                "(IReadOnlyCollection<T> / ICollection<T> / "
+                "IOwningCollection<T>) is not yet supported in codegen "
+                "(stdlib \xC2\xA7""5, \xC2\xA7""4.1\xE2\x80\x93\xC2\xA7""4.3, "
+                "#8582): these interfaces are implemented by collections with "
+                "incompatible runtime representations (array / linked-list / "
+                "hash-table) and the concrete backing is erased at the "
+                "interface, so no single runtime dispatch is sound. Call "
+                "`.Count` on the concrete collection, or pass a borrowing list "
+                "interface (IReadOnlyList<T> / IList<T>) which is "
+                "array-backed.");
+            // A poison of the call's RESULT type (`int` -> i32) so the
+            // enclosing expression still emits well-formed IR — the diagnostic
+            // above already failed the compile, so this placeholder is never
+            // executed, but it must type-match to avoid a spurious
+            // IR-verification error masking the real (clean) diagnostic.
+            llvm::Type* resTy = static_cast<llvm::Type*>(i32());
+            if (sema::TypeRef* rt = ctx_.exprType(call))
+                if (llvm::Type* lt = lowerTypeRef(rt))
+                    resTy = lt;
+            return llvm::PoisonValue::get(resTy);
+        }
+    }
+
     // fix #7831 (stdlib §1 Block-by-name, §4.4, §4.5, §4.17, §4.19, v0.355):
     // the POSITIONAL-INDEX members on a CONCRETE stdlib collection head.
     //
