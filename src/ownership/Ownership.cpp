@@ -75,12 +75,14 @@ bool isAsyncObjectResultTaskType(const sema::TypeRef* rt) {
 // otherwise (the caller's ordinary `ctx_.exprType(initializer)` path
 // applies).
 //
-// ONE authority, four call sites (all in this file): the binding's ownership
-// STATE (`handleLocalDecl`), the §28.7 drop-on-overwrite coverage
-// (`localDropOnOverwriteCovered`), the §28.9 trivial-dispose must-use
-// exemption (the scope-exit lint in `run`), and fix #7073's
-// `isOwnedCollectionLiteralLocal` (the §28.6 alias-source gate). They cannot
-// disagree, because they read the same produced type.
+// ONE produced-type authority (all in this file): fix #7073's
+// `isOwnedCollectionLiteralLocal` (the §28.6 alias-source gate) reads it
+// directly, and `MethodOwnership::isOwnedStateCollectionLiteralLocal` — the
+// ONE predicate behind the binding's ownership STATE (`handleLocalDecl`), the
+// §28.7 drop-on-overwrite coverage (`localDropOnOverwriteCovered`) and the
+// scope-exit obligation arms in `run` — narrows it to the literals the
+// Owned state is recorded for. Those three sites cannot disagree, because
+// they ask the same predicate.
 //
 // The (initializer, declared type) form is the CORE test; the LocalSymbol
 // form resolves the initializer from whichever decl node kind the local
@@ -110,61 +112,117 @@ const sema::TypeRef* ownedCollectionLiteralProducedType(
     return ownedCollectionLiteralProducedType(init, ls->declType);
 }
 
-// fix #7980 (§28.3.3 / §28.3.4 / §15.4, v0.355): is this symbol a LOCAL bound
-// to a COLLECTION LITERAL over a heap-collection target — the shape whose
-// initializer's PRODUCED TYPE the ownership pass reads off the declared type
-// (`ownedCollectionLiteralProducedType`, above)?
+// narrow #7980 (§15.4 literal-tree ownership rule, §28.3.4, v0.357): is this
+// collection literal PROVABLY FLAT — no element or key of it can be a fresh
+// node of the literal's aggregate, a boxed value, or an owned value consumed
+// into an owning slot?
 //
-// The scope-exit obligation arm (`MethodOwnership::run`) consults it: a
-// collection-literal local's RELEASE POINT is the literal tree's aggregate
-// owner (§15.4's literal-tree ownership rule / §28.9's "the aggregate owner's
-// release point for literal-tree nodes"), which codegen reclaims — not the
-// ownership pass's scope-end auto-drop. See that arm's own comment.
-bool isCollectionLiteralLocalSymbol(sema::Symbol* sym) {
-    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
-    if (!ls) return false;
-    return ownedCollectionLiteralProducedType(ls) != nullptr;
+// §15.4: "The fresh nodes of a collection literal — nested literal nodes,
+// fresh producer elements (`new` expressions and `owned`-returning calls in
+// element position), and any element expression whose arm-meet classification
+// is owned ... — form an aggregate per maximal borrowing-family subtree. Each
+// aggregate is owned by whatever owns its subtree's root: ... an `owned`
+// parameter or return through which the container transfers". That transfer
+// is #2699's unfinished stage-2 work: `Take([new Pt(3)])` (the literal passed
+// straight into an `owned Array<…>` parameter) compiles today and leaks every
+// interior node. A literal LOCAL that may carry such a node must therefore
+// not become movable ahead of #2699, and neither may its displaced tree be
+// treated as covered by §28.7's drop-on-overwrite.
+//
+// A WHITELIST, deny by default. (The first cut was a blacklist of fresh
+// element FORMS; it missed `x!`, `move x`, a range slice, `a ?? b` and a bind
+// atom with a `new` body, each of which §28.3.4 classifies Owned.) The test is
+// keyed on the SLOT TYPE first, because a slot of value type cannot hold a
+// heap node whatever expression fills it:
+//
+//   * VALUE slot — a primitive other than `Object` (the numerics, `bool`,
+//     `char`, and `string`, which is runtime-managed, §28.9) or an enum. Any
+//     element expression is admitted.
+//   * BORROWED-REFERENCE slot — a class or interface type. The element must
+//     be `null` or an unmarked NAMED BINDING (a local or a parameter) whose
+//     own static type is a class or interface: §28.3.4 classifies that read
+//     Borrowed, and §15.4 says "borrowed elements ... are never members and
+//     are never freed with it". Every other form (member, indexer and call
+//     results, `new`, `move`, `!`, `??`, conditionals, bind atoms, slices,
+//     nested literals, a record boxed into an interface slot) is declined.
+//   * every other slot type (`Object`, records, choices, inline arrays,
+//     function types, builtin collections, spans, bare type parameters) is
+//     declined, whether the literal is empty or not.
+//
+// An OWNING-family head (`OwningArray<T>` …) consumes its elements (§15.4:
+// "the literal's element expressions must produce owned values"), so it
+// qualifies only when the literal is EMPTY.
+// per §15.4, §28.3.4, §28.9, v0.357, #7980, #2699
+enum class LiteralSlotKind { Value, BorrowedReference, Declined };
+
+bool isDeclaredClassOrInterfaceType(const sema::TypeRef* t) {
+    if (!t || t->kind != sema::TypeRef::Kind::Named || !t->declaration)
+        return false;
+    const sema::TypeSymbol* d = t->declaration;
+    // A synthetic builtin TypeSymbol (`Range`, materialised on demand) leaves
+    // `kind` at its default `Class` and has no declaring module; only a type
+    // with a declaring module is a declared class / interface.
+    if (d->moduleName.empty()) return false;
+    return d->kind == ast::TypeDeclKind::Class ||
+           d->kind == ast::TypeDeclKind::Interface;
 }
 
-// fix #7980 (§15.4 literal-tree ownership rule, v0.357): could this literal
-// carry a FRESH node beyond its root — a member of the §15.4 aggregate that
-// "is owned by whatever owns its subtree's root", including "an `owned`
-// parameter or return through which the container transfers"? §15.4 names
-// the members: nested literal nodes, fresh producer elements (`new`
-// expressions and `owned`-returning calls) and owned arm-meets. Conservative
-// on purpose: any nested literal, `new`, conditional / `case` element, and
-// any call whose result is not a primitive value counts.
-//
-// Why the promotion in `handleLocalDecl` reads it: the aggregate's transfer
-// through an `owned` sink is #2699's unfinished stage-2 work. MEASURED on
-// 8bcd74929: `Take([new Pt(3)])` and `Take([[1], [2]])` (the literal passed
-// straight into an `owned Array<…>` parameter) already compile and leak
-// every interior node (3200 B / 200 allocations, 57600 B / 800 allocations
-// over 200 iterations). Promoting the named-local twin to Owned would admit
-// `Take(move a)` with the identical leak, so such a local keeps its prior
-// classification until #2699 frees the aggregate at the receiver.
-// per §15.4, §28.3, v0.357, #7980, #2699
-bool literalMayCarryFreshInteriorNode(const ast::CollectionLiteralExpr& lit,
-                                      const sema::SemaContext& ctx) {
-    auto fresh = [&](const ast::Expr* x) -> bool {
-        if (!x) return false;
-        if (dynamic_cast<const ast::CollectionLiteralExpr*>(x) ||
-            dynamic_cast<const ast::NewExpr*>(x) ||
-            dynamic_cast<const ast::ConditionalExpr*>(x) ||
-            dynamic_cast<const ast::CaseExpr*>(x))
-            return true;
-        if (dynamic_cast<const ast::CallExpr*>(x)) {
-            const sema::TypeRef* t = ctx.exprType(*x);
-            return !(t && t->kind == sema::TypeRef::Kind::Primitive &&
-                     t->primitive != sema::PrimitiveType::Object);
-        }
-        return false;
+LiteralSlotKind classifyLiteralSlot(const sema::TypeRef* t) {
+    if (!t) return LiteralSlotKind::Declined;
+    if (t->kind == sema::TypeRef::Kind::Primitive)
+        return (t->primitive != sema::PrimitiveType::Object &&
+                t->primitive != sema::PrimitiveType::None)
+                   ? LiteralSlotKind::Value
+                   : LiteralSlotKind::Declined;
+    if (t->kind != sema::TypeRef::Kind::Named || !t->declaration)
+        return LiteralSlotKind::Declined;
+    if (t->declaration->kind == ast::TypeDeclKind::Enum)
+        return LiteralSlotKind::Value;
+    if (isDeclaredClassOrInterfaceType(t))
+        return LiteralSlotKind::BorrowedReference;
+    return LiteralSlotKind::Declined;
+}
+
+bool collectionLiteralIsProvablyFlat(const ast::CollectionLiteralExpr& lit,
+                                     const sema::TypeRef& produced,
+                                     const sema::SemaContext& ctx) {
+    // The slot types: a `["k": v]` literal fills K from `keys` and V from
+    // `elements`; an element-list literal fills its head's one element type.
+    // An EMPTY literal (`[]`, never `isDict`) fills neither, whatever the
+    // head's arity — only its slot types are vetted, just below.
+    const sema::TypeRef* keySlot = nullptr;
+    const sema::TypeRef* elementSlot = nullptr;
+    if (produced.genericArgs.empty()) return false;
+    if (lit.isDict) {
+        if (produced.genericArgs.size() != 2) return false;
+        keySlot = produced.genericArgs[0];
+        elementSlot = produced.genericArgs[1];
+    } else if (!lit.elements.empty() || !lit.keys.empty()) {
+        if (produced.genericArgs.size() != 1) return false;
+        elementSlot = produced.genericArgs[0];
+    }
+    for (const sema::TypeRef* slot : produced.genericArgs)
+        if (classifyLiteralSlot(slot) == LiteralSlotKind::Declined)
+            return false;
+    if (common::isOwningPrefixedName(produced.headName()))
+        return lit.elements.empty() && lit.keys.empty();
+    auto admitted = [&](const ast::Expr* x, const sema::TypeRef* slot) -> bool {
+        if (!x || !slot) return false;
+        if (classifyLiteralSlot(slot) == LiteralSlotKind::Value) return true;
+        if (dynamic_cast<const ast::NullLiteralExpr*>(x)) return true;
+        const auto* id = dynamic_cast<const ast::IdentifierExpr*>(x);
+        if (!id) return false;
+        const sema::Symbol* sym = ctx.exprSymbol(*id);
+        if (!dynamic_cast<const sema::LocalSymbol*>(sym) &&
+            !dynamic_cast<const sema::ParameterSymbol*>(sym))
+            return false;
+        return isDeclaredClassOrInterfaceType(ctx.exprType(*id));
     };
     for (const auto& e : lit.elements)
-        if (fresh(e.get())) return true;
+        if (!admitted(e.get(), elementSlot)) return false;
     for (const auto& k : lit.keys)
-        if (fresh(k.get())) return true;
-    return false;
+        if (!admitted(k.get(), keySlot)) return false;
+    return true;
 }
 }  // namespace
 
@@ -1043,60 +1101,50 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             reassignedDropCovered_.insert(sym);
     for (const auto& [sym, st] : endState) {
         if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
-            // fix #7980 (§28.3.3 / §28.3.4 / §15.4 / §28.9, v0.355): a
-            // COLLECTION-LITERAL local is not an undischarged obligation here.
+            // narrow #7980 (§28.3.3 / §28.3.4 / §15.4, v0.357): an OWNED-STATE
+            // COLLECTION-LITERAL local (`isOwnedStateCollectionLiteralLocal`)
+            // that is neither moved on any path nor reassigned is not an
+            // undischarged obligation here.
             //
             // §28.3.3: "`var x := expr;` takes the ownership state of `expr`",
             // and §28.3.4's producers table classifies a collection literal
             // targeting a reference type as **Owned** — so the local IS in the
-            // Owned state (the state `handleLocalDecl` now records, through the
-            // one produced-type authority `ownedCollectionLiteralProducedType`).
+            // Owned state (the state `handleLocalDecl` records). What this fix
+            // changes is the STATE, not the release mechanism: codegen handles
+            // an un-moved, un-reassigned literal local on its literal path
+            // (`collectBorrowingArrayFreeEligible` and the Dictionary / Set
+            // `…LiteralFreeEligible_` sets) exactly as it did while the state
+            // was Borrowed and this arm never saw the local. Skipping the
+            // local here keeps it that way — no auto-drop flag, no must-use
+            // warning, no §28.3 discharge error — so a program that only
+            // reads its literal local compiles to what it compiled to before.
             //
-            // But the local's RELEASE POINT is not this scope end. §15.4's
-            // literal-tree ownership rule makes the literal's AGGREGATE OWNER
-            // (the collection) the holder of the literal tree, and §28.9 names
-            // that release point explicitly: "the aggregate owner's release
-            // point for literal-tree nodes (§15.4)". Codegen reclaims the
-            // literal tree on that path (`collectBorrowingArrayFreeEligible` /
-            // `disposeDisplacedCollectionLocal`); the ownership pass's
-            // scope-end auto-drop is a SECOND disposer for the same value, and
-            // arming it both leaks the tree's non-aggregate nodes (the boxed
-            // elements of `var arr: Array<IRank> := [new Pt(3)]` — a MEASURED
-            // 24-byte LeakSanitizer report at the Owned state) and demands a
-            // discharge the language does not require.
-            //
-            // ⇒ A collection-literal local is exempt from this arm: no
-            // auto-drop flag, no must-use warning, and no §28.3 discharge
-            // error. That is the pre-#7980 behaviour of this local (the state
-            // was Borrowed, so this arm never saw it) and it is the behaviour
-            // the §28.9 trivial-dispose exemption describes for a
-            // trivial-dispose value: "the compiler frees the undischarged
-            // value at its holder's release point" — the holder here being
-            // the literal tree's aggregate owner.
-            //
-            // A REASSIGNED literal local is NOT exempt: after the store it
-            // holds a fresh owned value (not the literal tree), and THAT value
-            // is the one this arm disposes. §28.3's state match admits the
+            // A REASSIGNED literal local is NOT skipped: after the store it
+            // holds a fresh owned value (not the literal), and THAT value is
+            // the one this arm disposes. §28.3.3's state match admits the
             // store (the local is owned-state and the RHS is an owned
             // producer), and §28.7's drop-on-overwrite disposes the displaced
-            // literal tree at the store (`localDropOnOverwriteCovered`), so
-            // the scope end disposes the fresh value — one disposer each.
+            // literal at the store (`localDropOnOverwriteCovered`, which asks
+            // the same predicate).
             //
-            // The TRANSFER path is unaffected: a collection-literal local
-            // moved into an `owned` sink is discharged by the sink (§28.8),
-            // and the local's slot is marked moved-from, so codegen's literal
-            // reclamation skips it — one disposer, whichever it is.
+            // The TRANSFER path is unaffected: a literal local moved into an
+            // `owned` sink on every path is discharged by the sink (§28.8)
+            // and is no longer Owned when it reaches this arm.
             //
             // A MAYBE-CONSUMED literal local (moved on some paths only) is
-            // NOT exempt: it takes the verdict its `new`-form twin takes
+            // NOT skipped: it takes the verdict its `new`-form twin takes
             // (`var a := new Array<int>(); if c then Take(move a); end if;`
             // is rejected below). MEASURED: exempting it admitted a
             // conditional `Take(move d)` of a Dictionary literal whose
             // un-moved path codegen never reclaims (the Dictionary-literal
             // escape walk is path-insensitive), leaking every table.
-            // per §28.3.3, §28.3.4, §15.4, §28.9, v0.357, #7980
+            //
+            // A literal local the predicate DECLINES (one that may carry a
+            // fresh interior node, a borrow-bearing holder) is not put in the
+            // Owned state by this fix, so nothing here applies to it.
+            // per §28.3.3, §28.3.4, §15.4, v0.357, #7980
             if (!st.maybeConsumed && reassignedLocals.count(sym) == 0 &&
-                isCollectionLiteralLocalSymbol(sym))
+                isOwnedStateCollectionLiteralLocal(sym))
                 continue;
             // fix #5252 (§23.3 / §28.3, v0.313): a `set(owned)` accessor's
             // `value` that reaches the setter's normal exit still Owned (on
@@ -1498,17 +1546,19 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // suppressed. (Suppressing the free instead would leak
                         // the instance's memory, which §28.9 still requires be
                         // reclaimed.)
-                        // fix #7980 (§28.3.3 / §28.3.4 / §15.4 / §28.9,
-                        // v0.355): a COLLECTION-LITERAL local never reaches
-                        // this arm — the scope-exit obligation arm skips it
-                        // above (`isCollectionLiteralLocalSymbol`), because
-                        // the literal tree's aggregate owner is the holder
-                        // whose release point reclaims it (§15.4 / §28.9). So
-                        // the §28.9 trivial-dispose exemption needs no
-                        // collection-literal arm here: the local is exempt
-                        // from the OBLIGATION altogether, and the `new`-form
-                        // twin's arm below is unchanged.
-                        // per §28.9, §28.3, §15.4, v0.355, #7980
+                        // narrow #7980 (§28.3.3 / §28.3.4 / §15.4, v0.357): an
+                        // Owned-state COLLECTION-LITERAL local that is
+                        // neither moved nor reassigned never reaches this
+                        // arm — the scope-exit obligation arm skips it above
+                        // (`isOwnedStateCollectionLiteralLocal`), so it needs
+                        // no trivial-dispose arm of its own here. A
+                        // REASSIGNED one does reach it, holding the value
+                        // the store put there; its initializer is the
+                        // literal, not a `new`, so
+                        // `localIsTrivialDisposeNewBinding` below does not
+                        // silence the must-use warning for it (the `new`-form
+                        // twin's arm is unchanged).
+                        // per §28.9, §28.3.3, §15.4, v0.357, #7980
                         if (!localIsTrivialDisposeNewBinding(*ld) &&
                             // §29.11 (v0.334): a bound lazy query whose
                             // enumeration right is spent at a statically
@@ -2007,20 +2057,17 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 reassignedDropCovered_.count(sym) == 0) continue;
             auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
             if (!ls) continue;
-            // fix #7980 (§28.3.3 / §28.3.4 / §15.4 / §28.9, v0.355): the
-            // nested-scope mirror of the function-exit arm's collection-literal
-            // skip (see that arm's comment). A collection-literal local's
-            // release point is the literal tree's aggregate owner — codegen's
-            // literal path reclaims it, and the ownership pass's scope-end
-            // auto-drop would be a SECOND disposer for the same tree (a
-            // MEASURED 24-byte LeakSanitizer leak of the literal's boxed
-            // element, `var arr: Array<IRank> := [new Pt(3)]`). So the local is
-            // exempt from this arm as well: no auto-drop flag, no must-use
-            // warning. A REASSIGNED literal local is not exempt (it holds a
-            // fresh owned value after the store) — see the function-exit arm.
-            // per §28.3.3, §28.3.4, §15.4, §28.9, v0.355, #7980
+            // narrow #7980 (§28.3.3 / §28.3.4 / §15.4, v0.357): the
+            // nested-scope mirror of the function-exit arm's skip (see that
+            // arm's comment). An Owned-state collection-literal local that is
+            // not reassigned keeps the literal path codegen already gives it —
+            // no auto-drop flag, no must-use warning. A REASSIGNED one is not
+            // skipped (it holds a fresh owned value after the store), and a
+            // literal local the predicate declines is not Owned through this
+            // fix at all.
+            // per §28.3.3, §28.3.4, §15.4, v0.357, #7980
             if (reassignedLocals.count(sym) == 0 &&
-                isCollectionLiteralLocalSymbol(sym))
+                isOwnedStateCollectionLiteralLocal(sym))
                 continue;
             // LOCALDECL-ONLY: `sym` is drawn from `everOwnedPlainLocals_`, which has
             // TWO populators -- `handleLocalDecl` (var arm, this file) and the inline
@@ -4120,11 +4167,13 @@ bool MethodOwnership::iterableIsOwningEnumerable(const ast::ForStmt& fs) {
 // compared by pointer identity, so admitting a second node kind changes
 // nothing downstream.
 //
-// fix #7980 (§28.3 / §15.4, v0.350): the classifier is now the ONE produced-
-// type authority (`ownedCollectionLiteralProducedType`, above) — the same
-// predicate the ownership STATE, the §28.7 drop-on-overwrite coverage and
-// the §28.9 must-use exemption read — so the §28.6 alias-source gate and
-// the §28.8 owned-sink gate cannot skew on what a literal local owns.
+// fix #7980 (§28.3 / §15.4, v0.350): the classifier reads the ONE produced-
+// type authority (`ownedCollectionLiteralProducedType`, above). It covers
+// EVERY collection-literal local, exactly as before #7980; the ownership
+// STATE, the §28.7 drop-on-overwrite coverage and the scope-exit arms read
+// the NARROWER `isOwnedStateCollectionLiteralLocal`, which is built on the
+// same authority, so a literal local in the Owned state is always one this
+// §28.6 alias-source gate also sees.
 // // per §21.1, §28.3, §15.4, §28.6, v0.340, #7073, #7980
 static bool isOwnedCollectionLiteralLocal(sema::Symbol* sym) {
     auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
@@ -7795,6 +7844,41 @@ void MethodOwnership::checkCoalesceMeetMixed(const ast::BinaryExpr& be) {
            "equalize by statement");
 }
 
+// narrow #7980 (§28.3.3 / §28.3.4 / §15.4, v0.357): is `sym` a `var` local
+// whose collection-literal initializer this pass records as an OWNED producer
+// (§28.3.4: "Collection literal ... targeting a reference type ... | Owned")?
+//
+// ONE predicate, three readers — the binding's STATE (`handleLocalDecl`), the
+// scope-exit obligation arms (`run`) and §28.7's drop-on-overwrite coverage
+// (`localDropOnOverwriteCovered`) — so no reader can treat as Owned a literal
+// local another reader left Borrowed. It holds when the declared type is a
+// heap-collection head (`ownedCollectionLiteralProducedType`), the literal is
+// provably flat (`collectionLiteralIsProvablyFlat`), and no element / key /
+// value type is borrow-bearing at any depth (the #5847 holders; see
+// `handleLocalDecl`).
+// per §28.3.3, §28.3.4, §15.4, §9.7, v0.357, #7980
+bool MethodOwnership::isOwnedStateCollectionLiteralLocal(
+    const sema::Symbol* sym) const {
+    const auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym);
+    if (!ls) return false;
+    const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    if (!ld) return false;
+    const auto* lit =
+        dynamic_cast<const ast::CollectionLiteralExpr*>(ld->initializer.get());
+    const sema::TypeRef* produced =
+        ownedCollectionLiteralProducedType(ld->initializer.get(), ls->declType);
+    if (!lit || !produced) return false;
+    if (!collectionLiteralIsProvablyFlat(*lit, *produced, ctx_)) return false;
+    std::function<bool(const sema::TypeRef*)> holdsBorrow =
+        [&](const sema::TypeRef* t) -> bool {
+        if (!t) return false;
+        for (const sema::TypeRef* ga : t->genericArgs)
+            if (isBorrowBearingRecordOrSpan(ga) || holdsBorrow(ga)) return true;
+        return false;
+    };
+    return !holdsBorrow(produced);
+}
+
 bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
     // §28.3 / §28.7 (v0.180, #1465): true when reassigning `sym` is a drop-on-
     // overwrite that codegen actually implements — so the FINAL value is exactly-
@@ -7874,8 +7958,21 @@ bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
     // `producerState`'s collection-literal arm (fix #4338's) uses. The
     // `new`-form twin `var a := new Array<int>();` reaches the same verdict
     // through the ordinary `ctx_.exprType` path.
+    //
+    // narrow #7980 (§15.4 resolution 4, §28.7, v0.357): ONLY for an
+    // Owned-state literal local (`isOwnedStateCollectionLiteralLocal`, the
+    // predicate the state itself is recorded by). §15.4: "drop-on-overwrite
+    // (§28.7) frees the whole displaced aggregate after RHS evaluation" — and
+    // codegen's displaced-collection disposal frees the displaced CONTAINER,
+    // not the interior nodes of a literal tree. MEASURED: admitting
+    // `var a: Array<Array<int>> := [[1]]; a := new Array<Array<int>>();`
+    // here leaked the nested literal on every iteration, where the store is
+    // otherwise rejected ("owned value in `a` would be dropped here without
+    // disposal"). A literal the predicate declines keeps that verdict.
     const sema::TypeRef* literalProduced =
-        ownedCollectionLiteralProducedType(ls);
+        isOwnedStateCollectionLiteralLocal(sym)
+            ? ownedCollectionLiteralProducedType(ls)
+            : nullptr;
     if (literalProduced) t = literalProduced;
     // fix-forward #3575 (§35.4 / §15.3 / §28.7, v0.334): a MOVE-ONLY VALUE TYPE
     // initializer — an owning-classified choice or an owning inline array
@@ -9008,18 +9105,21 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
         // classified exactly as the `new Array<int>()` twin already is.
         //
         // The two §28.3 consequences of an Owned state are handled with it,
-        // in the same file and from the same produced-type authority: the
-        // §28.7 drop-on-overwrite coverage (`localDropOnOverwriteCovered`)
-        // and the §28.9 trivial-dispose must-use exemption (the scope-exit
-        // lint in `run`).
+        // in the same file and by the same predicate
+        // (`isOwnedStateCollectionLiteralLocal`): the §28.7 drop-on-overwrite
+        // coverage (`localDropOnOverwriteCovered`) and the scope-exit
+        // obligation arms in `run`.
         // per §28.3, §15.4, §28.8, v0.350, #7980
         //
-        // Two shapes keep their prior classification (recorded
+        // narrow #7980 (§15.4, §28.3.4, v0.357): the promotion is NARROWER
+        // than §28.3.4's row, which has no element condition. It is applied
+        // only where `isOwnedStateCollectionLiteralLocal` holds (recorded
         // interpretation, the simplest one that admits no new unsound
-        // program):
-        //   * a literal that may carry a FRESH interior node — its
-        //     aggregate's transfer through an `owned` sink is #2699's
-        //     (`literalMayCarryFreshInteriorNode`, above);
+        // program); every other literal local keeps its prior
+        // classification:
+        //   * a literal that is not PROVABLY FLAT
+        //     (`collectionLiteralIsProvablyFlat`, above) — its aggregate's
+        //     transfer through an `owned` sink is #2699's;
         //   * a BORROW-BEARING HOLDER (`var spans: Array<Span<byte>> := [];`,
         //     an element / key / value type that is a span or a
         //     borrow-bearing record, at any depth). §9.7 decides a span read
@@ -9028,27 +9128,11 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
         //     span's backing storage instead — MEASURED: promoting it turned
         //     `collection_holder_span_escape_5847`'s parameter-sourced rows
         //     red (the `new Array<Span<byte>>()` twin is already rejected
-        //     that way on 8bcd74929, a pre-existing defect filed separately).
-        // per §15.4, §9.7, v0.357, #2699
-        if (lo.state == OwnershipState::Borrowed) {
-            const sema::TypeRef* produced =
-                ownedCollectionLiteralProducedType(lsym);
-            const auto* litInit =
-                dynamic_cast<const ast::CollectionLiteralExpr*>(
-                    ld.initializer.get());
-            std::function<bool(const sema::TypeRef*)> holdsBorrow =
-                [&](const sema::TypeRef* t) -> bool {
-                if (!t) return false;
-                for (const sema::TypeRef* ga : t->genericArgs)
-                    if (isBorrowBearingRecordOrSpan(ga) || holdsBorrow(ga))
-                        return true;
-                return false;
-            };
-            if (produced && litInit &&
-                !literalMayCarryFreshInteriorNode(*litInit, ctx_) &&
-                !holdsBorrow(produced))
-                lo.state = OwnershipState::Owned;
-        }
+        //     that way, a pre-existing defect filed as #8452).
+        // per §15.4, §9.7, §28.3.4, v0.357, #2699
+        if (lo.state == OwnershipState::Borrowed &&
+            isOwnedStateCollectionLiteralLocal(lsym))
+            lo.state = OwnershipState::Owned;
         // §28.3 arm-meet (v0.184, #1661): reject a mixed owned/borrowed arm set in
         // an if-expression / expression-position `case`/`when` initializer — for
         // BOTH `var` and `using var` (the diagnosis is binding-form-independent).

@@ -4212,6 +4212,12 @@ private:
     // is a plain owned class/interface local whose drop-on-overwrite codegen
     // implements — so its FINAL value is safely auto-droppable at scope end.
     bool localDropOnOverwriteCovered(const sema::Symbol* sym);
+    // narrow #7980 (§28.3.3 / §28.3.4 / §15.4, v0.357): true when `sym` is a
+    // `var` local whose collection-literal initializer is recorded as an Owned
+    // producer — the ONE predicate behind the binding's state, the scope-exit
+    // obligation arms and the drop-on-overwrite coverage above. Definition
+    // and rationale: Ownership.cpp.
+    bool isOwnedStateCollectionLiteralLocal(const sema::Symbol* sym) const;
 
     // True when `sym` is a tracked local currently in the Owned state — the
     // scope-bound discharge obligation that a borrow may not outlive. Used by
