@@ -1931,6 +1931,21 @@ private:
     void checkUseThroughDisposedBorrowHolder(const ast::IdentifierExpr& id,
                                              sema::Symbol* sym);
 
+    // fix #7107 (§28.3.8, §28.2, v0.357): `sym` is a plain owned LOCAL (one
+    // recorded in `everOwnedPlainLocals_`) that an explicit `Dispose()` /
+    // `DisposeAsync()` / discard has killed on every path to this point
+    // (state `Disposed`, or `Poisoned` after an already-reported read, with
+    // `explicitlyDisposed`). §28.2: the explicit disposal is logical only and
+    // "the receiver's block stays live until the holder's release point" —
+    // the local's scope end — so such a local is still SCOPE-BOUND, and a
+    // borrow rooted at it may no more leave the method than a borrow of a
+    // still-owned local may (§28.3.8). A conditional disposal never gets
+    // here: the join leaves the local `Owned` with `disposedOnSomePath`,
+    // which the still-owned arm of each caller already covers.
+    // // per §28.3.8, §28.2
+    bool isExplicitlyDisposedPlainOwnedLocal(sema::Symbol* sym,
+                                             const LocalOwnership& st) const;
+
     // §28.2 (v0.357) holder rule, #7435 / #7441 — the four writers of
     // `LocalOwnership::heldBorrows`.
     //

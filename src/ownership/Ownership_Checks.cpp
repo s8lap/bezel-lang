@@ -5109,7 +5109,29 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
         const bool usingVar = st.implicitDischarge;
         const bool plainOwnedLocal = st.state == OwnershipState::Owned &&
                                      everOwnedPlainLocals_.count(sym) != 0;
-        if (!usingVar && !plainOwnedLocal) continue;
+        // fix #7107 (§28.3.8, §28.2, v0.357): an EXPLICITLY DISPOSED plain
+        // owned local is scope-bound exactly as a still-owned one is. §28.2:
+        // an explicit `Dispose()` "performs logical disposal only … and does
+        // not reclaim its receiver: the receiver's block stays live until the
+        // holder's release point" — and the holder's release point is this
+        // local's scope end, so a borrow rooted at it (`return d.M;`, a bound
+        // method reference whose "source set is `obj`'s" — §28.3.8; `d.Field`;
+        // `d.Self()`) dangles in the caller just as it does without the
+        // `Dispose()`. The gate above read `state == Owned` only, so the
+        // disposal SUPPRESSED the rule: `d.Dispose(); return d.M;` compiled
+        // with the §28.2 warning alone and the caller's invocation read the
+        // released block (ASan heap-use-after-free).
+        const bool disposedPlainOwnedLocal =
+            !usingVar && isExplicitlyDisposedPlainOwnedLocal(sym, st);
+        if (!usingVar && !plainOwnedLocal && !disposedPlainOwnedLocal) continue;
+        // What happens to the source at scope end, for the two diagnostics
+        // below: the auto-drop of a still-owned local, or the release of an
+        // explicitly disposed one's block.
+        const char* const plainLocalFate =
+            disposedPlainOwnedLocal
+                ? "` was explicitly disposed and its block is released at "
+                  "scope end"
+                : "` is auto-dropped at scope end";
         // fix #4948: a `??` operand that is the bare local (or `y!` over it)
         // is the local's own value, not a borrow derived from it. For a
         // `using var` that is illegal on either reading (§28.3/§28.10: never
@@ -5136,7 +5158,7 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
                 "` is a named owned binding, so it is a borrow arm and the "
                 "`??` result borrows `" + std::string(root->name) +
                 "` — owned local `" + std::string(root->name) +
-                "` is auto-dropped at scope end, so returning the result "
+                plainLocalFate + ", so returning the result "
                 "lets the borrow outlive its source (§28.3 producer table, "
                 "`a ?? b` row: an unmarked named owned binding is a borrow "
                 "arm and `??` consumes neither binding; K7.2; §28.3 "
@@ -5157,15 +5179,30 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
                  : "` would outlive its source — owned local `") +
             std::string(root->name) +
             (usingVar
-                 ? "` is disposed at scope end (§28.3 borrow-lifetime "
-                   "rule; bind the source in the caller's scope and "
-                   "return the borrow from there instead)"
-                 : "` is auto-dropped at scope end (§28.3 borrow-lifetime "
-                   "rule; bind the source in the caller's scope and "
-                   "return the borrow from there instead)"));
+                 ? std::string(
+                       "` is disposed at scope end (§28.3 borrow-lifetime "
+                       "rule; bind the source in the caller's scope and "
+                       "return the borrow from there instead)")
+                 : std::string(plainLocalFate) +
+                       " (§28.3 borrow-lifetime "
+                       "rule; bind the source in the caller's scope and "
+                       "return the borrow from there instead)"));
         break;
     }
     }
+}
+
+// fix #7107 (§28.3.8, §28.2, v0.357): see the declaration.
+bool MethodOwnership::isExplicitlyDisposedPlainOwnedLocal(
+        sema::Symbol* sym, const LocalOwnership& st) const {
+    // `Poisoned` stands beside `Disposed` for the reason
+    // `checkUseThroughDisposedBorrowHolder` gives: it is the state
+    // `checkRead`'s use-after-dispose arm leaves the binding in once it has
+    // reported an earlier read, and the disposal still dominates.
+    if (st.state != OwnershipState::Disposed &&
+        st.state != OwnershipState::Poisoned)
+        return false;
+    return st.explicitlyDisposed && everOwnedPlainLocals_.count(sym) != 0;
 }
 
 // fix #4948 (§17.4, §17.8, §28.3 producer table and K7.2/K2.2, v0.307): see
