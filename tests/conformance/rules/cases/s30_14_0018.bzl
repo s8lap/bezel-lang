@@ -1,7 +1,7 @@
 //! case: s30_14_0018
 //! doc: spec
 //! section: 30.14
-//! title: a defect raised in a child passes an IFailure arm at the join
+//! title: an unmarked exception raised in a child passes an IFailure arm at the join
 //! rule: where the original exception's class implements `IFailure` (§31.4), the
 //!   join raises `DomainFailedException`, which derives from
 //!   `DomainFaultedException` and implements `IFailure` (stdlib §6.8). An arm
@@ -9,7 +9,7 @@
 //!   a failure raised in another domain as it takes one raised in its own.
 //! cites: 30.14, 31.4
 //! expect: run
-//! stdout: defect joined
+//! stdout: unmarked joined
 //! issue: 8418
 module Conf;
 
@@ -29,7 +29,7 @@ public class Program
         IFailure => Console.WriteLine("taken as a failure")
       end;
     catch
-      DomainFaultedException => Console.WriteLine("defect joined")
+      DomainFaultedException => Console.WriteLine("unmarked joined")
     end;
   end Main;
 end Program;

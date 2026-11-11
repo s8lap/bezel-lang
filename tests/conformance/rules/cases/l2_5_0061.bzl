@@ -1,12 +1,19 @@
 //! case: l2_5_0061
 //! doc: stdlib
 //! section: 2.5
-//! title: a DateTime range overflow is a defect: it passes an IFailure arm
-//! rule: a band-1 defect of the arithmetic domain (§1), raised with the arithmetic
-//!   class and not with an argument-blaming one
+//! title: a DateTime range overflow passes an IFailure arm
+//! rule: a band-1 condition of the arithmetic domain (§1), raised with the
+//!   arithmetic class and not with an argument-blaming one … A class whose
+//!   condition can come from the program itself, or from data whose supplier
+//!   the library cannot see, is not marked, and makes no statement: text that
+//!   does not parse and a document that does not deserialize may be a user's
+//!   typing or the program's own constant (`FormatException`,
+//!   `SerializationException`); an argument, the state of an object the program
+//!   holds and the program's arithmetic are the program's (`ArgumentException`,
+//!   `InvalidOperationException`, `KeyNotFoundException`, `OverflowException`).
 //! cites: 2.5, 1
 //! expect: run
-//! stdout: False
+//! stdout: overflow passed
 //! issue: 8414
 module Conf;
 
@@ -19,7 +26,7 @@ public class Program
         IFailure => Console.WriteLine("taken as a failure")
       end;
     catch
-      var ex: OverflowException => Console.WriteLine(ex is ParseRangeException)
+      OverflowException => Console.WriteLine("overflow passed")
     end;
   end Main;
 end Program;

@@ -1,14 +1,13 @@
 //! case: s31_4_0023
 //! doc: spec
 //! section: 31.4
-//! title: IFailure is rejected on a class whose user base derives from ArgumentException
-//! rule: a class that does not inherit `IFailure` may list it only where no class
-//!   in its base chain, other than `Exception` itself, is a built-in or
-//!   standard-library exception class; listing it otherwise is a compile error
-//!   at the declaration.
+//! title: IFailure is admitted on a class whose user base derives from ArgumentException
+//! rule: Every other `Exception`-derived class may list it, whatever its base:
+//!   a class deriving from `InvalidOperationException`, from `FormatException`
+//!   or from a class of the program's own is a failure where its author says
+//!   so, and an arm naming its base still takes it.
 //! cites: 31.4
-//! expect: reject
-//! diagnostic: base chain
+//! expect: accept
 //! issue: 8416
 module Conf;
 

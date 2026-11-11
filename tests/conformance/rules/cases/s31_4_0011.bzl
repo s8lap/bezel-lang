@@ -2,9 +2,9 @@
 //! doc: spec
 //! section: 31.4
 //! title: OperationCanceledException passes an IFailure arm
-//! rule: `OperationCanceledException` reports cancellation, the answer to a request
-//!   the program itself made; it does not implement `IFailure`, and a handler
-//!   of failures never takes it.
+//! rule: `OperationCanceledException` reports cancellation, the answer to a
+//!   request the program itself made; no class in its tree implements
+//!   `IFailure`, and a handler of failures never takes it.
 //! cites: 31.4, 31.2.1
 //! expect: run
 //! stdout: cancellation passed

@@ -2,11 +2,17 @@
 //! doc: stdlib
 //! section: 9.1
 //! title: an arithmetic overflow passes an IFailure arm
-//! rule: the arithmetic `OverflowException` of language spec §6.1 is a defect, and
-//!   no arm on `IFailure` takes it.
+//! rule: A class whose condition can come from the program itself, or from data
+//!   whose supplier the library cannot see, is not marked, and makes no
+//!   statement: text that does not parse and a document that does not
+//!   deserialize may be a user's typing or the program's own constant
+//!   (`FormatException`, `SerializationException`); an argument, the state of
+//!   an object the program holds and the program's arithmetic are the program's
+//!   (`ArgumentException`, `InvalidOperationException`, `KeyNotFoundException`,
+//!   `OverflowException`).
 //! cites: 9.1, 1
 //! expect: run
-//! stdout: False
+//! stdout: overflow passed
 //! issue: 8414
 module Conf;
 
@@ -21,7 +27,7 @@ public class Program
         IFailure => Console.WriteLine("taken as a failure")
       end;
     catch
-      var ex: OverflowException => Console.WriteLine(ex is ParseRangeException)
+      OverflowException => Console.WriteLine("overflow passed")
     end;
   end Main;
 end Program;

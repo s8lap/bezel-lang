@@ -2,9 +2,10 @@
 //! doc: stdlib
 //! section: 6.9
 //! title: Send on a closed channel raises a failure an IFailure arm takes
-//! rule: The failure types this document declares are … `ChannelClosedException`
-//!   and `ChannelFullException` (§6.9) … with the built-in `FormatException`
-//!   they are the library's whole failure band.
+//! rule: The failure types this document declares are `IOException` and the
+//!   classes deriving from it (§7.5), `TimeoutException` (§6.1),
+//!   `ChannelClosedException` and `ChannelFullException` (§6.9), and
+//!   `DomainFailedException` (§6.8) … no built-in class is one.
 //! cites: 6.9, 1
 //! expect: run
 //! stdout: True

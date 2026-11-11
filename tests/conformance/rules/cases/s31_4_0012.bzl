@@ -1,20 +1,26 @@
 //! case: s31_4_0012
 //! doc: spec
 //! section: 31.4
-//! title: the FormatException int.Parse raises is taken by an IFailure arm
-//! rule: Of the built-in types, `FormatException` implements `IFailure`.
+//! title: the FormatException int.Parse raises passes an IFailure arm
+//! rule: No built-in type implements `IFailure`. … The marker is read in two
+//!   places. A catch arm that names it selects on it: an `IFailure` arm takes
+//!   every failure and lets every other exception, cancellation included, pass
 //! cites: 31.4, 31.2.1
 //! expect: run
-//! stdout: failure
+//! stdout: format passed
 //! issue: 8414
 module Conf;
 
 public class Program
   public static method Main()
     try
-      _ := int.Parse("12x");
+      try
+        _ := int.Parse("12x");
+      catch
+        IFailure => Console.WriteLine("taken as a failure")
+      end;
     catch
-      IFailure => Console.WriteLine("failure")
+      FormatException => Console.WriteLine("format passed")
     end;
   end Main;
 end Program;

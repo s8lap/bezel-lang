@@ -1,9 +1,10 @@
 //! case: l9_3_0020
 //! doc: stdlib
 //! section: 9.3
-//! title: a value whose rounding does not fit at scale 0 raises an OverflowException (ParseRangeException)
-//! rule: stdlib §9.3 (v0.356): "`"79228162514264337593543950335.5"` raises — raises
-//!   `ParseRangeException` (§9.1)".
+//! title: a value whose rounding does not fit at scale 0 raises an OverflowException
+//! rule: a value outside `decimal`'s range — one whose rounding does not fit at
+//!   scale 0 … `"79228162514264337593543950335.5"` raises — raises
+//!   `OverflowException`.
 //! cites: 9.3
 //! expect: run
 //! stdout: OVERFLOW

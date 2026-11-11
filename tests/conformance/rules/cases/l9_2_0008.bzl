@@ -1,10 +1,10 @@
 //! case: l9_2_0008
 //! doc: stdlib
 //! section: 9.2
-//! title: an inadmissible input spelling a number raises FormatException, not ParseRangeException
+//! title: an inadmissible input spelling a number raises FormatException, not OverflowException
 //! rule: An input the grammar does not admit raises `FormatException` whatever
 //!   number a part of it spells: `"1_000e999"` raises `FormatException`, not
-//!   the `ParseRangeException` below.
+//!   the `OverflowException` below.
 //! cites: 9.2
 //! expect: run
 //! output: [1_000e999] -> FMT
