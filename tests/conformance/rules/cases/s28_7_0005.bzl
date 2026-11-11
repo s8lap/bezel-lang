@@ -1,13 +1,21 @@
 //! case: s28_7_0005
 //! doc: spec
 //! section: 28.7
-//! title: reassigning an owned field while a live borrow of the displaced value exists is admitted
-//! rule: Reassigning an owned field or collection slot is not statically
-//!   frozen — a borrow of the displaced value is invalidated at the
-//!   overwrite, caught as DisposedAccessException in checked disposal mode
-//!   and undefined unchecked, not rejected at compile time.
+//! title: a use of a local borrow of an owned field, dominated by a write to that field, is rejected
+//! rule: "Use after a dominating field write." A local initialized from a
+//!   direct read of an owned field — `var b := r.f;` — borrows the field's
+//!   current value. A disposing write of the same path — a reassignment
+//!   `r.f := e;` — that follows the borrow with no invalidating operation
+//!   between them on any path from the borrow to the write. A use of the
+//!   local — a read, a member access, an argument, a re-borrow — that such a
+//!   write dominates on every path, the local a stable local (§7.4 *Stable
+//!   locals*) not assigned between the borrow and the use, is a compile
+//!   error, and so is a read of `r.f` itself after an explicit
+//!   `r.f.Dispose()` or `r.f.DisposeAsync()` that dominates it in the same
+//!   window; the diagnostic names the use, the borrow and the write.
 //! cites: 28.7, 28.3
-//! expect: accept
+//! expect: reject
+//! diagnostic: use after a dominating field write
 module Conf;
 
 public class Widget
