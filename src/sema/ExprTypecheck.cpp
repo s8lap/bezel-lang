@@ -9333,7 +9333,33 @@ void ExprTC::checkAssignable(
             to->headName() == "IEnumerable") {
             if (from->genericArgs.size() == 1 && to->genericArgs.size() == 1 &&
                 from->genericArgs[0] && to->genericArgs[0] &&
-                typeRefEqual(from->genericArgs[0], to->genericArgs[0])) {
+                (typeRefEqual(from->genericArgs[0], to->genericArgs[0]) ||
+                 // fix #8393 (§14.5 phase 1, §5.1, §12.9, v0.357): a FREE
+                 // type variable at the target's element position is the
+                 // §14.5 phase-1 INFERENCE slot — `CountIf(1..10, …)` against
+                 // `xs: IEnumerable<T>` binds `T` to `int` through the
+                 // implemented interface, and the §5.1 conversion is then
+                 // judged against the SUBSTITUTED signature (§14.5's "the
+                 // §22.6 applicability check against the substituted
+                 // signature"). This special case demanded element-type
+                 // IDENTITY, so the unsubstituted `IEnumerable<T>` (the shape
+                 // the per-argument check sees, since it substitutes the
+                 // callee's EXPLICIT type arguments but not the inferred
+                 // ones) failed the identity test and the call was rejected
+                 // with the generic §5.1 wording. The general machinery
+                 // already answers this shape correctly:
+                 // `variantGenericAssignable`'s per-argument loop skips a free
+                 // type variable on either side (`isFreeGenericTypeVarRef` —
+                 // the one house definition of "a free generic type-parameter
+                 // reference"), so an `Array<int>` argument at
+                 // `IEnumerable<T>` was admitted.
+                 // This arm now answers the same way, so the `Range<T>` twin
+                 // of the `Array<T>` shape is admitted too. The free set is
+                 // the caller's GROUND TRUTH (the callee's own generic
+                 // parameters), so the escape applies only where a §14.5
+                 // inference is actually running.
+                 isFreeGenericTypeVarRef(to->genericArgs[0],
+                                         freeTypeParamNames))) {
                 // fix #6998 review (§16.3, §5.1, v0.340; #7029): admitted only
                 // where codegen's owning enumerator frame has a disposal edge
                 // (`rangeIEnumSiteExpr_`). An assignment, a field, a
@@ -13749,6 +13775,8 @@ static bool extensionTargetMatchesReceiver(
 // The hierarchy (per stdlib §4.1–§4.12):
 //   Array<T>      : IList<T>
 //   OwningArray<T> : IOwningList<T>
+//   FrozenArray<T> : IEnumerable<T>
+//   Range<T>       : IEnumerable<T>
 //   Set<T>        : ICollection<T>            // mutating borrowing collection
 //   LinkedList<T> : ICollection<T>            // mutating borrowing collection
 //   Stack<T>      : IReadOnlyCollection<T>    // read-only chain only (v0.165)
@@ -13806,6 +13834,12 @@ static std::vector<const TypeRef*> builtinInterfaceAncestors(
         // fix #8103 (§26.5 rule 2, stdlib §4.19, v0.355): `FrozenArray<T>`
         // is declared `public class FrozenArray<T>: IEnumerable<T>`, so
         // `IEnumerable<T>` is its (only) implemented interface.
+        ancestors.push_back(makeBuiltin("IEnumerable", {T}));
+    else if (name == "Range")
+        // fix #8393 (§26.5 rule 2, stdlib §9.8, v0.357): `Range<T>` is
+        // declared `public record Range<T>: IEnumerable<T>` (stdlib §9.8),
+        // so `IEnumerable<T>` is its (only) implemented interface — the
+        // same shape as the #8103 `FrozenArray<T>` row.
         ancestors.push_back(makeBuiltin("IEnumerable", {T}));
     else if (name == "Set" || name == "LinkedList")
         // #1851: Set<T> and LinkedList<T> implement ICollection<T> (mutating
@@ -13898,7 +13932,25 @@ void ExprTC::collectBuiltinAncestorInstantiationsOf(
     const TypeRef* classTy, std::string_view ifaceName,
     std::vector<TypeRef*>& out, std::vector<std::unique_ptr<TypeRef>>& owned) {
     if (!classTy || classTy->kind != TypeRef::Kind::Named ||
-        classTy->declaration || ifaceName.empty())
+        ifaceName.empty())
+        return;
+    // fix #8393 (§14.5 phase 1, §26.5 rule 2, stdlib §9.8, v0.357): a
+    // BUILTIN STUB — a TypeRef whose `declaration` is the compiler-intrinsic
+    // `builtinClassSym(name)` symbol (`Range<int>` from a range expression:
+    // `TypeResolution_Names.cpp` stamps `declaration =
+    // ctx_.builtinClassSym("Range")`) — is the SAME built-in type as the
+    // declaration-less annotation shape, and its interface set is the one
+    // `builtinInterfaceAncestors` models. The house discriminator for "is
+    // this a USER type?" is `isUserDeclaredTypeSym` (Symbol.hpp), and the
+    // stub answers false to it (no TypeDecl, no module) — the #8103
+    // discriminator, applied here. Rejecting the stub outright made the
+    // §14.5 phase-1 unification reach NO instantiation of `IEnumerable` for a
+    // `Range<int>` argument, so `T` was never bound.
+    //
+    // A USER-declared class is still refused here: it needs
+    // `collectAncestorInstantiationsOf` (a TypeSymbol on BOTH sides), which
+    // `unifyArgSubst` runs for that shape.
+    if (classTy->declaration && isUserDeclaredTypeSym(classTy->declaration))
         return;
     // `classTy` itself may already BE the target (`Array<T>` queried for
     // `"Array"`) — mirrors collectAncestorInstantiationsOf's own
@@ -15712,10 +15764,41 @@ static const TypeRef* extensionFindMatchingAncestor(
     // Walk builtin (null-declaration) receiver's conceptual interface chain.
     if (recv->kind == TypeRef::Kind::Named &&
         (!recv->declaration || !isUserDeclaredTypeSym(recv->declaration))) {
-        auto builtinAncs = builtinInterfaceAncestorsOf(recv, owned);
-        for (const TypeRef* anc : builtinAncs)
-            if (extensionTargetMatchesReceiver(target, anc, freeVars))
-                return anc;
+        // fix #8393 (§16.3 / §26.5 rule 2 / §5.1, v0.357): a `Range<T>` is
+        // NOT a candidate receiver for an EXTENSION block, even though
+        // stdlib §9.8 declares it `public record Range<T>: IEnumerable<T>`
+        // (the §26.5 builtin-conformance table carries that row, so the
+        // table walk below would find `IEnumerable<int>`).
+        //
+        // WHY. §16.3 / #7029 admit the `Range<T>` → `IEnumerable<T>`
+        // conversion only where codegen's owning enumerator frame has a
+        // disposal edge — a local declaration's initializer, a method or
+        // constructor ARGUMENT, or a returned value. An extension RECEIVER
+        // is none of those, and no check converts the receiver: so a matched
+        // block would reach codegen and lower to NOTHING. MEASURED on the
+        // pre-fix base: `(1..10).UserExt()` was REFUSED ("`UserExt` on
+        // built-in type `Range` produced no value … (#2457)"); with the
+        // `Range` row in the table and no gate here, the same program
+        // COMPILED, printed nothing, and emitted only an internal
+        // "failed to lower to a value" warning — a silent wrong answer where
+        // the base gave a clean refusal.
+        //
+        // The stdlib §5 LINQ operators over a range are unaffected: they have
+        // their OWN dedicated route (`isRangeLinqRecv`, issue #775), which
+        // does not consult this walk.
+        //
+        // The gate is the #3022 discriminator (a BUILT-IN `Range`, not a user
+        // class that happens to be named `Range`): the compiler-intrinsic
+        // symbol answers `moduleName.empty()`.
+        const bool isBuiltinRangeReceiver =
+            recv->declaration && recv->declaration->name == "Range" &&
+            recv->declaration->moduleName.empty();
+        if (!isBuiltinRangeReceiver) {
+            auto builtinAncs = builtinInterfaceAncestorsOf(recv, owned);
+            for (const TypeRef* anc : builtinAncs)
+                if (extensionTargetMatchesReceiver(target, anc, freeVars))
+                    return anc;
+        }
     }
     return nullptr;
 }
