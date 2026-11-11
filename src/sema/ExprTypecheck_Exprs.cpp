@@ -14511,53 +14511,203 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                    t->genericArgs.empty() &&
                    calleeOwnGenericNames.count(t->headName());
         };
-        // narrow #8394 (§14.5 phase 2, v0.357): "For each lambda-literal
-        // argument in argument order: the bindings established so far are
-        // substituted into its parameter's function type; if every parameter
-        // position of the lambda is then closed, the lambda's parameters take
-        // those types … and the body is typed". The bare-own-generic bail
-        // below left `lambda(v) => v.Name + "!"` against `f: (T) -> R` with NO
-        // parameter type even when `T` was already bound by an earlier
-        // argument (`xs: Array<T>` ← `Array<Person>`), so the body was typed
+        // narrow #8394 (§14.5 *Inputs and phases*, v0.357). Phase 1 unifies
+        // "each argument whose type is self-determined — every
+        // non-function-typed argument, a function-typed *value*, and a
+        // lambda's **annotated** parameter types", wherever the argument
+        // sits; phase 2 then runs "for each lambda-literal argument in
+        // argument order: the bindings established so far are substituted
+        // into its parameter's function type; if every parameter position of
+        // the lambda is then closed, the lambda's parameters take those types
+        // … and the body is typed". The bare-own-generic bail below left
+        // `lambda(v) => v.Name + "!"` against `f: (T) -> R` with NO parameter
+        // type even when `xs: Array<T>` had bound `T`, so the body was typed
         // against an untyped `v`: `+` was rejected ("requires both operands
         // to be `string`") and `R` / a `GroupBy` key `K` could not be
-        // inferred at all. Build the bindings the arguments BEFORE
-        // `pos` establish (phase 1's structural unification, the same
-        // `unifyArgSubst` typeCall's inference uses; an earlier lambda's
-        // already-typed function type contributes too, "A later
-        // function-typed argument may use bindings an earlier one produced")
-        // and return the substituted function type when every parameter
-        // position is closed by them.
+        // inferred at all.
+        //
+        // Two pieces. (1) ORDER: a lambda literal with an un-annotated
+        // parameter whose formal mentions the callee's own type parameter is
+        // visited AFTER the call's other arguments (`argOrder2`), which is
+        // phase 1 before phase 2 — `Sel(lambda(v) => v.Name, xs)` binds `T`
+        // from the `xs` that follows the lambda. (2) TYPING:
+        // `inferredFnParamType2` unifies the arguments already typed (the
+        // same `unifyArgSubst` typeCall's inference uses; an EARLIER lambda's
+        // function type contributes too, "A later function-typed argument
+        // may use bindings an earlier one produced" — a LATER lambda never
+        // does, phase 2 being in argument order) and returns the substituted
+        // function type when every parameter position is closed.
         //
         // Deliberately narrow — each exclusion keeps the pre-#8394 path,
         // which is no worse than before:
-        //   * an explicit type-argument list (`methodSubst`): no inference
-        //     runs (§14.5 *Explicit lists are all-or-nothing*), and the
-        //     #5117 fix-forward's bare-`T` bail stays exactly as it is;
+        //   * an explicit type-argument list on any callee spelling: no
+        //     inference runs (§14.5 *Explicit lists are all-or-nothing*), and
+        //     the #5117 fix-forward's bare-`T` bail stays exactly as it is;
         //   * a callee with no AST decl (imported) or an extension method
         //     (the receiver is not a positional `ce->args` entry), a named
-        //     argument before `pos`, or an overloaded name (the formal is one
-        //     candidate's, not resolution's pick — #6161's hazard);
+        //     argument written away from its own formal's position (codegen
+        //     pairs arguments with formals by position), or an overloaded
+        //     name (the formal is one candidate's, not resolution's pick —
+        //     #6161's hazard);
         //   * a binding that is still open (mentions a type parameter in
         //     scope, the callee's own, or is an Error type), or a bare-`T`
         //     parameter position whose binding is NULLABLE — the `int?` shape
         //     the #5117 fix-forward measured (`y.ToString()` on a threaded
-        //     `int?` trips the §7.4 narrowing gate), left on its old path.
+        //     `int?` trips the §7.4 narrowing gate), left on its old path;
+        //   * a call site at which codegen's monomorphization would leave one
+        //     of the callee's type parameters UNBOUND (`codegenBinds2` below).
+        const bool phase2Eligible2 = [&]() -> bool {
+            if (!calleeMd2 || !calleeMs2 || calleeOwnGenericNames.empty())
+                return false;
+            if (!methodSubst.empty() || calleeMs2->extensionDecl) return false;
+            // `methodSubst` reads a member-access callee only; an explicit
+            // list on the other two spellings is an explicit list too.
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                    ce->callee.get());
+                id && !id->typeArgs.empty())
+                return false;
+            if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                    ce->callee.get());
+                ncm && !ncm->typeArgs.empty())
+                return false;
+            if (!isSoleNamedCandidate(calleeMs2)) return false;
+            // A named argument is fine only where it already sits at its
+            // own formal's position (textual index == formal index).
+            for (std::size_t i = 0; i < ce->args.size(); ++i) {
+                const auto& ea = ce->args[i];
+                if (ea.name.empty()) continue;
+                if (i >= calleeMd2->params.size() ||
+                    calleeMd2->params[i].name != ea.name)
+                    return false;
+            }
+            return true;
+        }();
+        auto isOutDeclModifier2 = [](std::string_view m) {
+            return m == "out var" || m == "out using var" ||
+                   m == "out owned var";
+        };
+        // (1) ORDER. `deferredLam2[i]`: argument `i` is a lambda literal that
+        // phase 2 types. An inline `out` declaration anywhere in the call
+        // keeps the textual order — it puts a name in scope, and visiting it
+        // before an earlier lambda would let that lambda's body see it.
+        std::vector<char> deferredLam2(ce->args.size(), 0);
+        std::vector<std::size_t> argOrder2;
+        argOrder2.reserve(ce->args.size());
+        {
+            bool mayDefer = phase2Eligible2;
+            for (const auto& ea : ce->args)
+                if (isOutDeclModifier2(ea.modifier) || !ea.value)
+                    mayDefer = false;
+            for (std::size_t i = 0; mayDefer && i < ce->args.size() &&
+                                    i < calleeMd2->params.size(); ++i) {
+                auto* lam = dynamic_cast<const ast::LambdaExpr*>(
+                    ce->args[i].value.get());
+                if (!lam || !calleeMd2->params[i].type) continue;
+                bool unannotated = false;
+                for (const auto& lp : lam->params)
+                    if (!lp.type) unannotated = true;
+                if (!unannotated) continue;
+                const TypeRef* ft =
+                    ctx_.resolvedType(*calleeMd2->params[i].type);
+                if (!ft || ft->kind != TypeRef::Kind::Function) continue;
+                for (const auto& fp : ft->funcParams)
+                    if (mentionsOwnGeneric(fp.type)) deferredLam2[i] = 1;
+            }
+            for (std::size_t i = 0; i < ce->args.size(); ++i)
+                if (!deferredLam2[i]) argOrder2.push_back(i);
+            for (std::size_t i = 0; i < ce->args.size(); ++i)
+                if (deferredLam2[i]) argOrder2.push_back(i);
+        }
+        // Does codegen's monomorphization bind a callee type parameter from
+        // `decl` (a formal's declared type) against `actual` (the argument's
+        // static type)? This mirrors `Emitter::unifyMethodReturnTypeArg`
+        // (LlvmBackend_Calls2.cpp) arm for arm, because sema's `unifyArgSubst`
+        // binds strictly MORE: through an implemented interface
+        // (`IEnumerable<T>` against an `Array<int>`), and through a
+        // function-typed slot, which codegen has no arm for. A parameter sema
+        // binds and codegen does not is specialized at the placeholder type —
+        // `K.CompareTo` then emits nothing and `MaxBy` returns the first
+        // element. Codegen walks: a bare type parameter (bound unless the
+        // argument's type is `null`'s Object or is itself open); a built-in
+        // generic of the SAME name, component-wise; a declared generic of the
+        // SAME declaration, component-wise. Nothing else.
+        const std::unordered_set<std::string_view> scopeTpNames2 =
+            currentScopeGenericParamNames();
+        std::function<void(const TypeRef*, const TypeRef*,
+                           std::unordered_set<std::string_view>&)>
+            codegenBinds2 = [&](const TypeRef* decl, const TypeRef* actual,
+                                std::unordered_set<std::string_view>& bound) {
+            if (!decl || !actual || decl->kind != TypeRef::Kind::Named) return;
+            if (!decl->declaration) {
+                const std::string_view nm = decl->headName();
+                if (calleeOwnGenericNames.count(nm)) {
+                    if (actual->kind == TypeRef::Kind::Error ||
+                        actual->kind == TypeRef::Kind::Unit)
+                        return;
+                    if (actual->kind == TypeRef::Kind::Primitive &&
+                        actual->primitive == PrimitiveType::Object)
+                        return;
+                    if (mentionsOwnGeneric(actual) ||
+                        refOutParamTypeMentionsTypeParam(actual, scopeTpNames2))
+                        return;
+                    bound.insert(nm);
+                    return;
+                }
+                if (!decl->genericArgs.empty() &&
+                    actual->kind == TypeRef::Kind::Named &&
+                    !actual->declaration && actual->headName() == nm &&
+                    decl->genericArgs.size() == actual->genericArgs.size())
+                    for (std::size_t i = 0; i < decl->genericArgs.size(); ++i)
+                        codegenBinds2(decl->genericArgs[i],
+                                      actual->genericArgs[i], bound);
+                return;
+            }
+            if (actual->kind == TypeRef::Kind::Named &&
+                decl->declaration == actual->declaration &&
+                decl->genericArgs.size() == actual->genericArgs.size())
+                for (std::size_t i = 0; i < decl->genericArgs.size(); ++i)
+                    codegenBinds2(decl->genericArgs[i], actual->genericArgs[i],
+                                  bound);
+        };
+        // The same walk over the DECLARED RETURN type alone: codegen unifies
+        // it against the call's result type, which is this very type under
+        // sema's bindings, so the shapes agree by construction and only the
+        // positions the walk reaches matter (a function-typed or inline-array
+        // return position is not one).
+        std::function<bool(const TypeRef*, std::string_view)>
+            codegenReturnReaches2 =
+                [&](const TypeRef* t, std::string_view nm) -> bool {
+            if (!t || t->kind != TypeRef::Kind::Named) return false;
+            if (!t->declaration && t->genericArgs.empty())
+                return t->headName() == nm;
+            for (const TypeRef* ga : t->genericArgs)
+                if (codegenReturnReaches2(ga, nm)) return true;
+            return false;
+        };
+        // (2) TYPING.
         auto inferredFnParamType2 =
             [&](std::size_t pos, TypeRef* pt) -> TypeRef* {
-            if (!calleeMd2 || !calleeMs2 || !methodSubst.empty()) return nullptr;
-            if (calleeMs2->extensionDecl) return nullptr;
-            if (!isSoleNamedCandidate(calleeMs2)) return nullptr;
-            if (pos > ce->args.size() || pos > calleeMd2->params.size())
+            if (!phase2Eligible2) return nullptr;
+            if (pos >= ce->args.size() || pos >= calleeMd2->params.size())
                 return nullptr;
+            // Arguments after `pos` have been visited only when this lambda
+            // was deferred to phase 2; reading a later argument's type
+            // otherwise would read whatever an earlier visit left behind.
+            const bool phase1Done = deferredLam2[pos];
             std::unordered_map<std::string_view, TypeRef*> inferred;
-            for (std::size_t i = 0; i < pos; ++i) {
+            std::unordered_set<std::string_view> codegenBound;
+            for (std::size_t i = 0; i < ce->args.size() &&
+                                    i < calleeMd2->params.size(); ++i) {
+                if (i == pos) continue;
+                if (i > pos && !phase1Done) break;
                 const auto& ea = ce->args[i];
-                if (!ea.name.empty()) return nullptr;
-                if (ea.modifier == "out var" || ea.modifier == "out using var" ||
-                    ea.modifier == "out owned var")
-                    continue;
+                if (isOutDeclModifier2(ea.modifier)) continue;
                 if (!ea.value || !calleeMd2->params[i].type) continue;
+                // Phase 2 is in argument order: a lambda literal after this
+                // one has produced no binding yet.
+                if (i > pos &&
+                    dynamic_cast<const ast::LambdaExpr*>(ea.value.get()))
+                    continue;
                 TypeRef* at = ctx_.exprType(*ea.value);
                 if (!at || at->kind == TypeRef::Kind::Error) continue;
                 // A bare `null` argument is not self-determined (§14.5 phase 1).
@@ -14566,49 +14716,37 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     continue;
                 unifyArgSubst(calleeMd2->params[i].type.get(), at,
                               calleeOwnGenericNames, inferred);
+                // Codegen skips a `null` literal argument outright (#885).
+                if (!dynamic_cast<const ast::NullLiteralExpr*>(ea.value.get()))
+                    codegenBinds2(
+                        ctx_.resolvedType(*calleeMd2->params[i].type), at,
+                        codegenBound);
             }
             if (inferred.empty()) return nullptr;
             for (const auto& [nm, b] : inferred)
                 if (!b || b->kind == TypeRef::Kind::Error ||
-                    mentionsOwnGeneric(b) || mentionsUnsubstitutedTypeParam(b))
+                    mentionsOwnGeneric(b) ||
+                    refOutParamTypeMentionsTypeParam(b, scopeTpNames2))
                     return nullptr;
-            // A type parameter still free here is bound later from the typed
-            // lambda's return. Sema does that (typeCall's unifyArgSubst has a
-            // function-typed arm), but codegen's monomorphization
-            // (`applyMethodGenericSubst`) recovers a parameter only from a
-            // NON-function position of a formal or from the declared return
-            // type — a parameter mentioned only in a function-typed formal's
-            // slots (MaxBy's `K` in `key: (T) -> K`) stays unbound there and
-            // the specialized body miscompiles (the `K.CompareTo` returns
-            // nothing). Typing the lambda for such a callee would turn a
-            // program rejected today (`lambda(p) => p.Name + "!"` against
-            // an untyped `p`) into a silently wrong one, so decline it until
+            // Typing the lambda turns a call rejected today (`lambda(p) =>
+            // p.Name + "!"` against an untyped `p`) into an accepted one, so
+            // it is taken only where the accepted program is also compiled
+            // right: EVERY type parameter of the callee must be one codegen
+            // binds at this call site — from an argument typed above whose
+            // static type carries it, or from the declared return type. A
+            // parameter that occurs only in a function-typed slot (MaxBy's
+            // `K` in `key: (T) -> K`), or elsewhere only in a formal whose
+            // argument is `null`, an empty collection literal or an omitted
+            // optional, is bound by sema from the lambda's return and by
+            // codegen from nothing; such a call stays on the old path until
             // codegen binds through a function-typed slot (narrow #8394).
-            std::function<bool(const TypeRef*, std::string_view)> mentionsOutsideFn =
-                [&](const TypeRef* t, std::string_view nm) -> bool {
-                if (!t) return false;
-                if (t->kind == TypeRef::Kind::Named) {
-                    if (t->genericArgs.empty() && t->headName() == nm) return true;
-                    for (const TypeRef* ga : t->genericArgs)
-                        if (mentionsOutsideFn(ga, nm)) return true;
-                } else if (t->kind == TypeRef::Kind::InlineArray) {
-                    return mentionsOutsideFn(t->arrayElement, nm);
-                }
-                return false;
-            };
-            for (const std::string_view nm : calleeOwnGenericNames) {
-                if (inferred.count(nm)) continue;
-                bool recoverable = false;
-                if (calleeMd2->returnType)
-                    recoverable = mentionsOutsideFn(
-                        ctx_.resolvedType(*calleeMd2->returnType), nm);
-                for (std::size_t j = 0;
-                     !recoverable && j < calleeMd2->params.size(); ++j)
-                    if (calleeMd2->params[j].type)
-                        recoverable = mentionsOutsideFn(
-                            ctx_.resolvedType(*calleeMd2->params[j].type), nm);
-                if (!recoverable) return nullptr;
-            }
+            const TypeRef* declRet2 =
+                calleeMd2->returnType
+                    ? ctx_.resolvedType(*calleeMd2->returnType) : nullptr;
+            for (const std::string_view nm : calleeOwnGenericNames)
+                if (!codegenBound.count(nm) &&
+                    !codegenReturnReaches2(declRet2, nm))
+                    return nullptr;
             TypeRef* substPt = substituteReturnType(pt, inferred);
             if (!substPt || substPt->kind != TypeRef::Kind::Function ||
                 substPt->funcParams.size() != pt->funcParams.size())
@@ -14644,7 +14782,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             return pt;
         };
         std::size_t pos2 = 0;
-        for (const auto& a : ce->args) {
+        for (const std::size_t argIdx2 : argOrder2) {
+            const auto& a = ce->args[argIdx2];
+            // `pos2` is the argument's POSITION (it selects the formal), not
+            // the iteration count: §14.5 phase 2 lambdas are visited last.
+            pos2 = argIdx2;
             // §22.4: `out var x` declares x in the current scope.
             // Register the symbol BEFORE visiting the IdentifierExpr so
             // lookup finds it. Infer type from the callee's parameter.
@@ -15872,7 +16014,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 }
                 checkRefOutOperandCategory(a, formalMod);
             }
-            ++pos2;
         }
     } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
         if (nc->callee) visitExpr(*nc->callee);
