@@ -3956,6 +3956,16 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
                 // completed below; only the reclaim of the ORIGINAL is skipped.
                 bz_dispose_class_obj(fault_exc);
             }
+            // fix-forward #8400 (§30.14, v0.357): with result_size > 0 the
+            // adapter heap-copies the entry's aggregate result into a block
+            // UNCONDITIONALLY after the entry returns -- it does not test
+            // bz_exc -- so the block reaches this fault branch too, holding
+            // the faulted entry's indeterminate value. The block is the
+            // runtime's on EVERY path (the success branch below frees it as
+            // well), so free it here; its bytes are never read, so nothing
+            // inside them is released. A faulting spawn of a record- or
+            // choice-returning entry leaked sizeof(R) per call without this.
+            if (sc->result_size > 0) free(result);
             bz_task_complete_error_obj(sc->join_task, dfe_obj);
         } else if (sc->result_size > 0) {
             // fix #8400 (§35.12 / §30.14 / stdlib §6.8, v0.357): an

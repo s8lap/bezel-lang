@@ -6916,7 +6916,7 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
 //   ChannelSender<T>:
 //     Send(owned item)          → bz_channel_sender_send(tx, item) → void
 //     Dispose()                 → bz_channel_sender_release(tx, cce_vtable) → void
-//   Domain.Spawn(entry, arg?)   → bz_domain_spawn(fn, arg, dfe_vtable) → OwningTask<R>
+//   Domain.Spawn(entry, arg?)   → bz_domain_spawn(fn, arg, dfe_vtable, result_size) → OwningTask<R>
 // ---------------------------------------------------------------------------
 // #5305 / §30.14 (v0.313) / §30.15: the channel ITEM-WORD codec.
 //

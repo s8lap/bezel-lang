@@ -317,3 +317,121 @@ BEZEL_TEST(domain_spawn_aggregate_result_8400,
         "end Program;";
     expectPrinted(src, "5");
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// fix-forward #8400 — the FAULT path. §30.14 (v0.357): a fault in the entry
+// "surfaces at the join as `DomainFaultedException`" (stdlib §6.8), and the
+// program must stay leak-free on that path too. The aggregate arm's adapter
+// heap-copies the entry's result into a block after the entry returns
+// WITHOUT testing `bz_exc`, so a faulting entry still hands the runtime a
+// block; `bz_domain_spawn`'s fault branch did not free it, leaking sizeof(R)
+// per faulting spawn (measured by the rejecting review: 800 B in 100
+// allocations for the static-method loop below).
+//
+// Each row spawns a faulting entry 100 times (a one-shot leak hides in the
+// sanitizer's noise), catches every `DomainFaultedException`, PRINTS the
+// count, and runs under the driver ASan/LSan leg (`runAotChecked`), whose
+// LeakSanitizer report turns `ran` false.
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+
+void expectCleanFaultLoop(const std::string& src) {
+    JitResult r = runAotChecked(src);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    if (bezel::test::checkedToolchainSkipped(r)) return;
+    // ran == false: a compile rejection OR a sanitizer report (the leak).
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
+
+}  // namespace
+
+// The review's t5_throw / t13_throw_loop: a static-method entry returning the
+// record `Pt` that throws, spawned 100 times.
+BEZEL_TEST(domain_spawn_aggregate_result_8400,
+           faulting_record_entry_frees_its_result_block_100x) {
+    std::string src =
+        "module P; "
+        "import System.Threading; "
+        "public record Pt(X: int, Y: int); "
+        "public class Program "
+        "  public static method Make(): Pt "
+        "    throw new Exception(\"boom\"); "
+        "  end Make; "
+        "  public static async method Main(): Task "
+        "    var n := 0; "
+        "    for var i in 0..<100 do "
+        "      using var t := Domain.Spawn(Program.Make); "
+        "      try "
+        "        var p := await t; "
+        "        n := n + p.X; "
+        "      catch var e: DomainFaultedException => "
+        "        n := n + 1; "
+        "      end; "
+        "    end; "
+        "    Console.WriteLine(n); "
+        "  end Main; "
+        "end Program;";
+    expectCleanFaultLoop(src);
+}
+
+// The choice twin (the review's t12): a static-method entry returning the
+// value-like choice `Result<int, LoadError>` that throws, spawned 100 times.
+BEZEL_TEST(domain_spawn_aggregate_result_8400,
+           faulting_choice_entry_frees_its_result_block_100x) {
+    std::string src =
+        "module P; "
+        "import System.Threading; "
+        "public record LoadError(Code: int, Path: string); "
+        "public class Program "
+        "  public static method Load(): Result<int, LoadError> "
+        "    throw new Exception(\"boom\"); "
+        "  end Load; "
+        "  public static async method Main(): Task "
+        "    var n := 0; "
+        "    for var i in 0..<100 do "
+        "      using var t := Domain.Spawn(Program.Load); "
+        "      try "
+        "        case await t of "
+        "          Ok(var k)    => n := n + k, "
+        "          Error(var e) => n := n + e.Code "
+        "        end case; "
+        "      catch var e: DomainFaultedException => "
+        "        n := n + 1; "
+        "      end; "
+        "    end; "
+        "    Console.WriteLine(n); "
+        "  end Main; "
+        "end Program;";
+    expectCleanFaultLoop(src);
+}
+
+// The LAMBDA adapter arm (the review's t5b): a lambda entry whose body calls
+// a throwing method returning the record `Named`, spawned 100 times.
+BEZEL_TEST(domain_spawn_aggregate_result_8400,
+           faulting_lambda_record_entry_frees_its_result_block_100x) {
+    std::string src =
+        "module P; "
+        "import System.Threading; "
+        "public record Named(Tag: string, N: int); "
+        "public class Program "
+        "  public static method Boom(): Named "
+        "    throw new Exception(\"boom\"); "
+        "  end Boom; "
+        "  public static async method Main(): Task "
+        "    var n := 0; "
+        "    for var i in 0..<100 do "
+        "      using var t := Domain.Spawn(lambda() => Program.Boom()); "
+        "      try "
+        "        var p := await t; "
+        "        n := n + p.N; "
+        "      catch var e: DomainFaultedException => "
+        "        n := n + 1; "
+        "      end; "
+        "    end; "
+        "    Console.WriteLine(n); "
+        "  end Main; "
+        "end Program;";
+    expectCleanFaultLoop(src);
+}
+
