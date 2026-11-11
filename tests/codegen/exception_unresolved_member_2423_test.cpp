@@ -26,19 +26,25 @@
 //
 // language spec §31.4 "Standard exception types" (v0.235) declares the
 // closed `Exception`/`ArgumentException` surface; stdlib §2.17 "Built-in
-// exception types (cross-reference)" (v0.235) names the three exception
-// types whose documented surface goes beyond `Exception`'s:
+// exception types (cross-reference)" (v0.235) names the exception types
+// whose documented surface goes beyond `Exception`'s:
 // `SerializationException.{Offset,Line,Column}` (stdlib §2.15) and
-// `DomainFaultedException.FaultStackTrace` (stdlib §6.8) are genuinely
-// DECLARED but have NO implementation at any layer (confirmed: no sema case,
-// no codegen lowering, no runtime field) — tracked separately by #2337/#2408,
-// which this fix does not implement. Rejecting them with the ordinary
-// "no member" wording would misstate a documented fact, so they get a
+// `DomainFaultedException.FaultStackTrace` (stdlib §6.8) are declared
+// members. Rejecting them with the ordinary "no member" wording would
+// misstate a documented fact (they ARE declared members), so they got a
 // distinct, accurate diagnostic instead ("declared ... but not yet
 // implemented"), which still closes the same uninitialized-stack-read hole
 // for them without implementing the getters.
+//
+// fix #8399 (stdlib §6.8, v0.357) IMPLEMENTED `DomainFaultedException.
+// FaultStackTrace` — the copied stack-trace text of the original exception
+// (spec §30.14) — so it is no longer in that set and no longer rejected;
+// Group 4's row is flipped to expect the program to compile and run. What
+// remains declared-but-unimplemented is `SerializationException.{Offset,
+// Line,Column}` (stdlib §2.15), tracked by #2337 — which is what the
+// remaining diagnostic cites.
 // `TypeInitializationException.InnerException` is the fourth type §2.17
-// names — but unlike the other three it IS fully implemented in codegen
+// names — but unlike the others it IS fully implemented in codegen
 // (LlvmBackend_Exprs.cpp reads byte offset 16 by matching
 // `ma->member == "InnerException"` structurally, independent of sema ever
 // setting `ma`'s exprType) and is exercised by
@@ -278,9 +284,16 @@ BEZEL_TEST(codegen_exception_unresolved_member_2423,
 }
 
 // ── Group 4: DomainFaultedException.FaultStackTrace — stdlib §6.8 ──────────
-// Same category as Group 3: declared, unimplemented, distinct diagnostic.
+// FLIPPED by fix #8399 (stdlib §6.8, v0.357): the member WAS declared and
+// unimplemented (this file's row used to expect the distinct "declared …
+// but is not yet implemented" diagnostic, citing #2337 — wrongly, for this
+// member: #2337 tracks `SerializationException`'s Offset/Line/Column). It
+// IS implemented now: `FaultStackTrace` is the copied stack-trace text of the
+// original exception (spec §30.14), so the program COMPILES and RUNS, and
+// the read yields the original's stack-trace text — the §31.4 `""` stub (the
+// compiler formats no stack traces).
 BEZEL_TEST(codegen_exception_unresolved_member_2423,
-           domainfaultedexception_faultstacktrace_declared_not_implemented_stdlib_6_8) {
+           domainfaultedexception_faultstacktrace_implemented_stdlib_6_8) {
     const std::string program =
         "module M; import System.Threading; "
         "class Worker public static method Fail() "
@@ -293,14 +306,13 @@ BEZEL_TEST(codegen_exception_unresolved_member_2423,
         "    return -1; "
         "  catch var e: DomainFaultedException => do "
         "    var fst := e.FaultStackTrace; "
+        "    if fst.Length = 0 then return 7; else return -2; end; "
         "  end end; "
         "  return 0; "
         "end Main; end Program;";
-    BEZEL_EXPECT_TRUE(
-        hasError(program,
-                 "member `FaultStackTrace` on `DomainFaultedException` is "
-                 "declared (stdlib \xC2\xA7""6.8) but is not yet implemented"));
-    BEZEL_EXPECT_TRUE(hasError(program, "#2337"));
+    // stdlib §6.8: the member is accepted and reads the original exception's
+    // stack-trace text (the §31.4 `""` stub — no stack traces are formatted).
+    BEZEL_EXPECT_EQ(run(program), 7);
 }
 
 // ── Group 5: TypeInitializationException.InnerException keeps working ─────

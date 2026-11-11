@@ -5660,7 +5660,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // null-pointer-as-null representation FINDING [3] uses for a
         // reference-typed storage member.
         if (nm->member == "Message" || nm->member == "StackTrace" ||
-            nm->member == "CauseChain" || nm->member == "ParamName") {
+            nm->member == "CauseChain" || nm->member == "ParamName" ||
+            nm->member == "FaultStackTrace") {
             const sema::TypeRef* ncRtt = ctx_.exprType(*nm->target);
             bool ncExcReceiver = false;
             if (ncRtt && ncRtt->kind == sema::TypeRef::Kind::Named &&
@@ -5688,7 +5689,12 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // in a user subclass — Message@8, CauseChain@24, ParamName@32).
                 auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
                 llvm::Value* ncAccessVal = nullptr;
-                if (nm->member == "StackTrace") {
+                if (nm->member == "StackTrace" ||
+                    // fix #8399 (stdlib §6.8, v0.357): the DFE's own member —
+                    // the copied stack-trace text of the original exception.
+                    // The compiler formats no stack traces, so the copy is the
+                    // same `""` stub, exactly as the `.` form produces.
+                    nm->member == "FaultStackTrace") {
                     // §31.4 `StackTrace: string` — "" stub (no debug info yet),
                     // matching the `.` form. The receiver was loaded for the
                     // null check above; its bytes are not read.
@@ -9853,6 +9859,19 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // lowered, matching the pre-#2971 behaviour for built-ins.)
                 return lowerStringLiteral("\"\"", false);
             }
+            // fix #8399 (stdlib §6.8, v0.357): `DomainFaultedException.
+            // FaultStackTrace` — "stack trace text of the original exception",
+            // a COPIED string (spec §30.14). The compiler formats no stack
+            // traces (§31.4: "formatted; "" when unavailable"; design
+            // rationale §11.10: "the stack trace is out, deliberately"), so
+            // the ORIGINAL exception's stack-trace text — and therefore the
+            // copy the stdlib mandates — is the same `""` stub that
+            // `Exception.StackTrace` lowers to above. The receiver is not
+            // lowered, for the same reason.
+            if (ma->member == "FaultStackTrace" &&
+                isInheritedExcSurfaceAccess(ma)) {
+                return lowerStringLiteral("\"\"", false);
+            }
             if (ma->member == "CauseChain" && isInheritedExcSurfaceAccess(ma)) {
                 llvm::Value* excObj = lowerExpr(*ma->target);
                 if (!excObj) return nullptr;
@@ -11268,12 +11287,19 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
             const bool bareExcSurface =
                 id2->name == "Message" || id2->name == "StackTrace" ||
-                id2->name == "CauseChain" || id2->name == "ParamName";
+                id2->name == "CauseChain" || id2->name == "ParamName" ||
+                // fix #8399 (stdlib §6.8, v0.357): the DFE's own member —
+                // the copied stack-trace text of the original exception. It
+                // reaches here through the same sema arm as the four §31.4
+                // members (the bare spelling inside a class that derives from
+                // the DFE), and lowers to the same `""` stub.
+                id2->name == "FaultStackTrace";
             if (bareExcSurface && !ctx_.exprSymbol(e) && currentThis_) {
                 auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
                 // §31.4 `StackTrace: string` — the "" stub (no debug info yet),
                 // the same value the qualified spellings produce.
-                if (id2->name == "StackTrace")
+                if (id2->name == "StackTrace" ||
+                    id2->name == "FaultStackTrace")
                     return lowerStringLiteral("\"\"", false);
                 if (id2->name == "CauseChain") {
                     // §31.4 `CauseChain: Array<ExceptionInfo>` @24 — null reads

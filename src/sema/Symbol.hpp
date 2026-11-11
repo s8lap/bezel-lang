@@ -744,10 +744,16 @@ const std::vector<TypeRef*>& nonSymbolBaseRefsOf(const TypeSymbol* t);
 // them and admitting a member sema cannot lower is worse than rejecting it
 // (#2972's shape — sema accepts, codegen degrades to a null, the caller
 // faults): `TypeInitializationException.InnerException` (§31.4; implemented
-// only for a receiver statically typed as that built-in),
-// `SerializationException.{Offset,Line,Column}` (stdlib §2.15) and
-// `DomainFaultedException.FaultStackTrace` (stdlib §6.8) — the last four are
-// declared-but-never-implemented at any layer, tracked by #2337/#2408.
+// only for a receiver statically typed as that built-in) and
+// `SerializationException.{Offset,Line,Column}` (stdlib §2.15) — those three
+// are declared-but-never-implemented at any layer, tracked by #2337/#2408.
+//
+// fix #8399 (stdlib §6.8, v0.357) ADMITTED `DomainFaultedException.
+// FaultStackTrace` — the copied stack-trace text of the original exception
+// (spec §30.14). It is not a §31.4 header member (the DFE declares it alone),
+// and it lowers to the same `""` stub as `Exception.StackTrace` (the compiler
+// formats no stack traces), so the walk answers it as the `StackTrace` member
+// — see `builtinExceptionSurfaceMemberOf`.
 enum class BuiltinExcMember {
     None,
     Message,     // Exception.Message      : string

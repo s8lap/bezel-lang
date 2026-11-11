@@ -182,6 +182,84 @@ BEZEL_TEST(send_600_runtime,
 }
 
 // ---------------------------------------------------------------------------
+// stdlib §6.8: `DomainFaultedException.FaultStackTrace` — the copied
+// stack-trace text of the original exception (fix #8399).
+// ---------------------------------------------------------------------------
+
+// fix #8399 (stdlib §6.8, v0.357; spec §30.14): the ISSUE'S OWN REPRO —
+// reading `FaultStackTrace` on a caught `DomainFaultedException`.
+//
+// stdlib §6.8 declares it on the DFE:
+//     public readonly property FaultStackTrace: string;   // stack trace text
+//                                                            // of the original
+//                                                            // exception
+// and says "`Message` and `FaultStackTrace` are copied strings"; spec §30.14
+// says the join raises a DFE "whose `Message` and `FaultStackTrace` carry
+// copies of the original exception's message and stack-trace text (`string`s
+// — sendable)".
+//
+// The VALUE: the compiler formats no stack traces (§31.4: `StackTrace` is
+// "formatted; \"\" when unavailable"; design rationale §11.10: "the stack
+// trace is out, deliberately"), so the ORIGINAL exception's stack-trace text
+// — and therefore the copy the stdlib mandates — is the empty string. (The
+// premise is pinned by `codegen_exc_surface.stacktrace_stub_empty_spec_31_4`:
+// `e.StackTrace.Length` is 0 pre-debug-info.) The original exception
+// (`FormatException("bad")`) is the one the spawned domain throws; its own
+// `StackTrace` reads the same empty string, which is what makes this the
+// copy of "the original exception's stack-trace text".
+BEZEL_TEST(send_600_runtime,
+           domain_faulted_exception_fault_stack_trace_stdlib_6_8_8399) {
+    auto r = runAot(
+        "module P; "
+        "import System.Threading; "
+        "public class Program "
+        "  public static method Fail(): int "
+        "    throw new FormatException(\"bad\"); "
+        "  end Fail; "
+        "  public static async method Main(): Task "
+        "    using var t := Domain.Spawn(Program.Fail); "
+        "    try "
+        "      Console.WriteLine(await t); "
+        "    catch "
+        "      var ex: DomainFaultedException => "
+        "        Console.WriteLine(ex.FaultStackTrace), "
+        "    end try; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // The copied stack-trace text is the empty string, so the program prints
+    // exactly one (empty) line — and NOTHING else: the join raised the DFE, so
+    // the `Console.WriteLine(await t)` arm never ran.
+    BEZEL_EXPECT_EQ(r.stdoutText, "\n");
+}
+
+// fix #8399 (stdlib §6.8, v0.357): the member is the DFE's OWN, so a class
+// deriving from the DFE inherits it (§12.1: a base class's members are
+// available on a derived class) — and the read yields the same copied text.
+BEZEL_TEST(send_600_runtime,
+           domain_faulted_exception_fault_stack_trace_inherited_6_8_8399) {
+    auto r = runAot(
+        "module P; "
+        "import System.Threading; "
+        "public class MyFault: DomainFaultedException "
+        "end MyFault; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    try "
+        "      throw new MyFault(); "
+        "    catch "
+        "      var ex: MyFault => Console.WriteLine(ex.FaultStackTrace), "
+        "    end try; "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "\n");
+}
+
+// ---------------------------------------------------------------------------
 // §30.14 / fix #1228: Domain.Spawn with a non-capturing lambda entry.
 //
 // The spec (§30.14) lists non-capturing lambdas as valid spawn entries:

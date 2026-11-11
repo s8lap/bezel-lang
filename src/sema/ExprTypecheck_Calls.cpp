@@ -40075,6 +40075,27 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 ctx_.setExprType(&ma, excCauseChainTypeRef());
                 return;
             }
+            // fix #8399 (stdlib §6.8, v0.357): `DomainFaultedException.
+            // FaultStackTrace` — "stack trace text of the original exception",
+            // a COPIED string (spec §30.14: "whose `Message` and
+            // `FaultStackTrace` carry copies of the original exception's
+            // message and stack-trace text"). The DFE declares it ALONE (it is
+            // not one of `Exception`'s members), so it is asked of the ONE walk
+            // that states a built-in exception's surface
+            // (`sema::builtinExceptionSurfaceMemberOf`, SymbolCollection.cpp) —
+            // the same walk the user-subclass path asks — so a DFE receiver
+            // and a subclass of one answer identically. The member is a
+            // `string`; the value is the §31.4 `""` stub (the compiler formats
+            // no stack traces), which is exactly the original exception's own
+            // stack-trace text — the copy the stdlib mandates.
+            if (ma.member == "FaultStackTrace" && isExcType(rtt) &&
+                builtinExceptionSurfaceMemberOf(excBuiltinName(rtt),
+                                                ma.member) !=
+                    BuiltinExcMember::None) {
+                ctx_.setExprType(
+                    &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                return;
+            }
         }
         // issue #494 / §29.2 / §29.3: `e.Current` property access where `e` is
         // typed as the builtin IEnumerator<T> (no sema TypeDecl). Current returns
@@ -44010,26 +44031,34 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             // exception types whose documented surface goes beyond
                             // Exception's: SerializationException.{Offset,Line,
                             // Column} (stdlib §2.15) and DomainFaultedException.
-                            // FaultStackTrace (stdlib §6.8). #2337/#2408 already
-                            // track these as genuinely-declared-but-NEVER-
-                            // implemented at any layer (confirmed: no sema case, no
-                            // codegen lowering, no runtime field). Rejecting them
-                            // with the ordinary "no member" text would misstate a
-                            // documented fact (they ARE declared members); reject
-                            // with distinct, accurate wording instead — this closes
-                            // the same uninitialized-stack-read hole for them
-                            // without implementing the getters (#2337's job, kept
-                            // out of this fix's scope per its issue text).
+                            // FaultStackTrace (stdlib §6.8). #2337 tracks the
+                            // SerializationException members as genuinely-
+                            // declared-but-NEVER-implemented at any layer
+                            // (confirmed: no sema case, no codegen lowering, no
+                            // runtime field). Rejecting them with the ordinary
+                            // "no member" text would misstate a documented fact
+                            // (they ARE declared members); reject with distinct,
+                            // accurate wording instead — this closes the same
+                            // uninitialized-stack-read hole for them without
+                            // implementing the getters (#2337's job, kept out of
+                            // this fix's scope per its issue text).
+                            // fix #8399 (stdlib §6.8, v0.357): the OTHER member
+                            // stdlib §2.17 names — `DomainFaultedException.
+                            // FaultStackTrace` (stdlib §6.8) — IS implemented
+                            // now (the copied stack-trace text of the original
+                            // exception, spec §30.14): the §31.4 block above
+                            // types it, so it no longer reaches this reject.
+                            // #2337's citation below therefore names the
+                            // SerializationException members only — which is
+                            // exactly what #2337 tracks (the diagnostic used to
+                            // cite it for this member too, wrongly: issue
+                            // #8399).
                             bool isDeclaredButUnimplemented =
                                 (rn == "SerializationException" &&
                                  (mbr == "Offset" || mbr == "Line" ||
-                                  mbr == "Column")) ||
-                                (rn == "DomainFaultedException" &&
-                                 mbr == "FaultStackTrace");
+                                  mbr == "Column"));
                             if (isDeclaredButUnimplemented) {
-                                std::string_view stdlibSec =
-                                    rn == "SerializationException" ? "2.15"
-                                                                    : "6.8";
+                                std::string_view stdlibSec = "2.15";
                                 ctx_.diagnostics().report(
                                     Severity::Error, loc,
                                     std::string("member `") +
@@ -44049,7 +44078,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                                rn == "ArgumentOutOfRangeException"
                                            ? "Message, StackTrace, CauseChain, "
                                              "ParamName"
-                                           : "Message, StackTrace, CauseChain");
+                                           : (rn == "DomainFaultedException"
+                                                  ? "Message, StackTrace, "
+                                                    "CauseChain, FaultStackTrace"
+                                                  : "Message, StackTrace, "
+                                                    "CauseChain"));
                             ctx_.diagnostics().report(
                                 Severity::Error, loc,
                                 std::string("no member `") +

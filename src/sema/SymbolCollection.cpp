@@ -1217,6 +1217,22 @@ BuiltinExcMember builtinExceptionSurfaceMemberOf(std::string_view builtinBase,
         // §31.4 `public class ArgumentException: Exception … ParamName: string?`
         if (cur == "ArgumentException" && member == "ParamName")
             return found(BuiltinExcMember::ParamName);
+        // stdlib §6.8 `public class DomainFaultedException: Exception …
+        // public readonly property FaultStackTrace: string` — the copied
+        // stack-trace text of the ORIGINAL exception (spec §30.14: "whose
+        // `Message` and `FaultStackTrace` carry copies of the original
+        // exception's message and stack-trace text").
+        //
+        // The member is declared by the DFE ALONE (not by `Exception`), and it
+        // is not one of the §31.4 uniform header's slots: it lowers to the
+        // same `""` stub as `Exception.StackTrace` (the compiler formats no
+        // stack traces — §31.4: "formatted; \"\" when unavailable"; design
+        // rationale §11.10: "the stack trace is out, deliberately"), so for
+        // the walk's question — which member of the surface is this, and how
+        // is it typed — it IS the `StackTrace` member: a `string`, read the
+        // same way. fix #8399 (stdlib §6.8, v0.357).
+        if (cur == "DomainFaultedException" && member == "FaultStackTrace")
+            return found(BuiltinExcMember::StackTrace);
         // §31.4 `public class Exception … Message / StackTrace / CauseChain`
         if (cur == "Exception") {
             if (member == "Message")    return found(BuiltinExcMember::Message);
@@ -1239,7 +1255,8 @@ std::string builtinExceptionSurfaceList(std::string_view builtinBase) {
     // reject is the #2983 defect over again (a message whose factual claim is
     // false), so the two must share one source of truth.
     static constexpr std::string_view kNames[] = {"Message", "StackTrace",
-                                                  "CauseChain", "ParamName"};
+                                                  "CauseChain", "ParamName",
+                                                  "FaultStackTrace"};
     std::string out;
     for (std::string_view n : kNames) {
         if (builtinExceptionSurfaceMemberOf(builtinBase, n) ==
