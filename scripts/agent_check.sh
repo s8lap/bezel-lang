@@ -63,17 +63,20 @@
 #   scripts/agent_check.sh --probe --asan FILE.bzl    compile+RUN one .bzl under
 #                                                     ASan/LSan with a hang timeout
 #                                                     (for memory/disposal fixes)
-#   scripts/agent_check.sh --results-cache ...         serve recorded PASSES from the
-#                                                     harness RESULTS cache (see
-#                                                     scripts/results_cache.sh):
-#                                                     a test whose binary, bezelc,
-#                                                     runtime, clean source tree,
-#                                                     toolchain and behaviour env
-#                                                     are byte-identical to a run
-#                                                     that PASSED is not re-run.
+#   (default) the harness RESULTS cache (see scripts/results_cache.sh) serves
+#                                                     recorded PASSES: a test whose
+#                                                     binary, bezelc, runtime,
+#                                                     clean source tree, toolchain
+#                                                     and behaviour env are
+#                                                     byte-identical to a run that
+#                                                     PASSED is not re-run. Read the
+#                                                     `RESULTS CACHE:` summary line.
+#   scripts/agent_check.sh --results-cache ...         the same, stated explicitly
 #   scripts/agent_check.sh --no-results-cache ...      execute every test (still
 #                                                     records passes and poisons a
-#                                                     contradicted record).
+#                                                     contradicted record): the
+#                                                     fail-without / pass-with arms,
+#                                                     a flake check, a suspect.
 #                                                     BEZEL_RESULTS_CACHE=0: the
 #                                                     cache is not touched at all.
 #   scripts/agent_check.sh --use-shared REF|auto ...  any of the above, but with NO
@@ -428,7 +431,9 @@ run_sharded() {  # $1 filter $2 bin $3 shards $4 merged-log
 #   --no-results-cache execute everything; still record passes, and poison a
 #                      record a FAIL contradicts (the flake guard)
 #   BEZEL_RESULTS_CACHE=0  do not touch the cache at all (wins over the flags)
-RC_DEFAULT=off
+# On by default since the r42-infra-rcache rollout (owner-approved 2026-11-12;
+# measured: whole ownership area 1760 s cold -> 15 s on an unchanged build).
+RC_DEFAULT=on
 RC_SH="$ROOT/scripts/results_cache.sh"
 RC_STATE=off; RC_WHY=""; RC_KEYS=""; RC_ENV=()
 RC_REUSED=0; RC_EXECUTED=0; RC_KEYSEEN=""

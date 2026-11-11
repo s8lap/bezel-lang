@@ -117,6 +117,10 @@ class AgentCheckHonoursTheOffSwitch(unittest.TestCase):
         self.assertIn("state=[verify]", self._state("verify", None))
         self.assertIn("state=[off] why=[unrecognised", self._state('""', "bogus"))
 
+    def test_default_is_on_for_a_lane_run(self):
+        # The rollout: no flag and no BEZEL_RESULTS_CACHE serves + records.
+        self.assertIn("state=[rw]", self._state('""', None))
+
 
 class ResultsCacheKeyRules(unittest.TestCase):
     SCHEMA = "bezel.results-cache.v1"

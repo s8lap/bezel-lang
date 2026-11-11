@@ -479,6 +479,77 @@ removes one a reader holds.
   binary keeps using the tree that built it, so each sha is built in its own
   worktree at its final path, and the MANIFEST-last rename is the atomic step.
 
+### Test results cache (a PASS on identical inputs is not re-run)
+
+The box is saturated by test EXECUTION. The same tests also run repeatedly on identical
+inputs: a producer's whole-area run and then the reviewer's run on the same tip, or many
+lanes' base arms on one staging build. ccache, `shared_build.sh` and the AOT bincache share
+compiles, builds and programs. The **results cache** shares RESULTS. It lives in the harness
+(`tests/support/results_cache.hpp`, wired into `tests/test_main.cpp`), and only
+`scripts/agent_check.sh` turns it on, by handing each binary a key file from
+`scripts/results_cache.sh`.
+
+- **The key** (coarse on purpose; no cross-commit reuse). It covers the sha256 of the test
+  binary and of the `bezelc`, `libbezel_runtime.a` and `libbezel_core.a` it embeds the paths
+  of. The source tree it reads at run time must be CLEAN, keyed by its `HEAD^{tree}`. The
+  toolchain is `clang --version` plus the identity of the linkers, the binary's shared
+  libraries and clang's runtimes. The key also takes every `BEZEL_*` / sanitizer / loader /
+  locale variable that is not on a short volatile list (`envAffectsKey`; filter, shard,
+  jobserver and timeout knobs only), so it fails closed for a new knob. Last come the schema
+  and the full test name. The key file binds each key to the binary's
+  `dev:ino:size:mtime`, so a binary rebuilt since the key was computed runs uncached.
+- **What is served.** PASSES only, and only clean ones: a pass that moved a loudness counter
+  (native-sanitizer skip, `[ INFRA ]`, timeout, fork failure, checked-toolchain skip, ASan
+  infra, `[ LEAK ]`) is not stored. A FAIL, crash or timeout never records. Off entirely
+  under `BEZEL_AOT_FORCE_SANITIZE` (a sanitizer report in a passing child has no counter), and
+  for a dirty tree (WIP; the reviewer's fail-without revert). Entries live under
+  `/mnt/fast/test-results-cache/v1/<key>/`, written tmp + rename. A torn entry lacks its end
+  marker and is a miss. `results_cache.sh prune` (run by agent_check at most every 6 h)
+  removes keys untouched for 5 days. `results_cache.sh stats` shows the size.
+- **Flake guard.** A FAIL under a key that holds a PASS for that test writes `<entry>.poison`.
+  It also appends to `/mnt/fast/test-results-cache/poison.log` and prints `[ POISON ]`. A
+  poisoned test is never served again under that key.
+- **Never in the gate.** `gate.sh`, `gate_full_cycle.sh`, `gate_and_push.sh`, `pregate.sh`
+  (its `--filters` too) and `tests/run_parallel.sh` export `BEZEL_RESULTS_CACHE=0` and unset
+  `BEZEL_RESULTS_CACHE_KEYS` at top level. A binary given no key file never consults the
+  cache and prints exactly what it printed before. Pinned by
+  `scripts/gate/tests/test_results_cache_gate_off.py` (gate-selftest phase) and
+  `tests/support/results_cache_test.cpp` (the harness honours `=0` with a valid key present).
+- **Reading a run.** A served test prints `[ CACHED ] suite.name (pass recorded <utc> in <ms>
+  ms)` and counts in `N passed`. Each binary (summed over shards) ends with
+  `RESULTS CACHE: R reused, E executed, S stored, P poisoned, U unstored, Q poisoned-reruns
+  (key K, mode rw|verify)`. agent_check's last lines add the total
+  `RESULTS CACHE: R reused, E executed (mode …; key K)`, or `off (<why>)`, and one
+  `results_cache: off for <binary>: <why>` line per binary it could not key.
+- **When it hits.** Only on the SAME build, because the binaries embed absolute paths. So
+  it hits on a re-run in one worktree, and across lanes on one `--use-shared` build. For a
+  reviewer to reuse a producer's whole-area passes, both must run the same published build
+  of the tip (`shared_build.sh publish --ref <lane-branch>`, then `--use-shared`).
+- **Default.** `agent_check.sh` turns it on unless told otherwise: `--no-results-cache` executes
+  everything and still records, and `BEZEL_RESULTS_CACHE=0` leaves the cache untouched. Nothing
+  else turns it on.
+- **The env must match to hit.** Every `BEZEL_*` variable outside the short volatile list is
+  keyed, and so are the diagnostic knobs (`BEZEL_AOT_CACHE_STATS=1` included). It fails closed:
+  a run with one extra export misses. To explain a 0-hit run, diff the two key dirs' `KEY` files
+  (`/mnt/fast/test-results-cache/v1/<key>/KEY`; each lists the env it was minted under). A
+  byte-identical relink keeps its key: the stat id binds only the key-file line.
+- **Measured** (r42-infra-rcache, whole ownership area, one build, saturated box; details in
+  `/var/tmp/bezel-scratch/r42-infra-rcache/study.md`):
+  - cold: 1759.7 s, 4693 executed;
+  - warm: **15.1 s, 4693 reused, 0 executed**;
+  - `--no-results-cache` on a warm bincache: 607.1 s.
+
+  Correctness on the real build:
+  - after a runtime change, 0 reused (new binary, bezelc, runtime and tree hashes);
+  - under `BEZEL_AOT_FORCE_SANITIZE=address`, off and 0 reused;
+  - with `BEZEL_AOT_DETECT_LEAKS=report` flipped, 0 reused under a new key, and a row that printed
+    `[ LEAK ]` was not stored;
+  - under `BEZEL_RESULTS_CACHE=0`, off;
+  - with an untracked file in the tree, no key.
+
+  The harness rows (`support_results_cache.*`) each fail under a mutant that removes the property
+  they pin.
+
 ## Dual-coordinator runs (two sessions, one repo)
 
 A run may be driven by **two coordinator sessions** sharing one repo, one machine

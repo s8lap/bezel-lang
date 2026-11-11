@@ -32,6 +32,7 @@ you mid-run and was not reachable from here, add a line.
 ## Before you write a test row
 - Lane contract §7: every gtest row is red on the base; a spec-decided control goes to
   `corpus-candidates/` for the corpus, at most two named gtest controls per suite.
+- A fail-without, pass-with or flake run → `--no-results-cache` (lane contract 3a).
 
 ## Before you pick
 - `scripts/handback_check.sh <branch> --base <staging>`; verify the REF, not the SHA you

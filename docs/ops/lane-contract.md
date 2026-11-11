@@ -25,6 +25,20 @@ SPECIFIC to its assignment.*
    `--lit` **once per commit** before committing any change to `src/` or `tests/lit`, quoting its
    `Passed:` line. `agent_check.sh` rebuilds the area's test binary, which is what the tests
    run; a `bezelc`-only rebuild tests the old compiler.
+3a. **The results cache** (`scripts/results_cache.sh`; runbook, *Test results cache*). By default
+   `agent_check.sh` does not re-run a test whose recorded PASS came from byte-identical inputs: the
+   same test binary, `bezelc`, runtime and core archives, a CLEAN committed source tree, toolchain
+   and behaviour-changing environment. Only passes are served. A FAIL, crash, timeout, `[ INFRA ]`
+   or sanitizer skip always re-runs. A dirty tree (work in progress, a fail-without revert) and
+   `BEZEL_AOT_FORCE_SANITIZE` are never cached. Read the run's last lines: a served test prints
+   `[ CACHED ] <suite.name> (pass recorded <utc> in <ms> ms)` between its `[ RUN ]` and `[  OK  ]`,
+   and the summary is `RESULTS CACHE: N reused, M executed (mode rw; key K)`. `N` is the passes
+   served, not executed; `off (<why>)` means everything executed. The gtest `N passed` line counts
+   served passes as passed. **Run uncached (`--no-results-cache`) whenever the point is that the
+   test EXECUTED**: the fail-without and pass-with arms of a new row, a flake check, or a re-run of
+   a suspect. `--no-results-cache` still records passes, and it poisons a record that a FAIL
+   contradicts (`[ POISON ]`). That record is never served again. `BEZEL_RESULTS_CACHE=0` leaves
+   the cache untouched.
 4. **NEVER** run the full suite / `tests/run_parallel.sh` / the `check` target. That is the
    coordinator's gate; a lane running it burns the shared budget on ~100 redundant fork+link+exec tasks.
    Running one whole `--area` with named filters is allowed, and item 19b requires it for some fixes.

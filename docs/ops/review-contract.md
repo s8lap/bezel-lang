@@ -68,6 +68,17 @@ Run every check that applies, and quote what each one printed.
    conformance corpus*).
 9. **Areas.** Run the full `--area` of every area whose `src/` the fix touches, and quote the gtest
    `N passed, 0 failed, N total` line (not the lit discovered-tests count).
+   **Whole-area passes may come from the results cache** (lane contract item 3a). The cache
+   serves a PASS only when the binary, `bezelc`, runtime, clean source tree, toolchain and env
+   are byte-identical, so it hits only on the SAME build: a `--use-shared` build of the tip,
+   or a re-run in the same worktree. It also needs the same exported `BEZEL_*` env (runbook,
+   *Test results cache*). A whole-area run whose passes are already cached for
+   this tip need not re-execute them. Quote its `RESULTS CACHE: N reused, M executed (… key K)`
+   line next to the gtest line, and say the passes were reused. Still EXECUTE the following
+   with `--no-results-cache`: the fail-without and pass-with arms (check 2), the targeted suites
+   the fix names, and your own probes. An `off (…)` summary means everything executed. A
+   `[ POISON ]` line is a flake: report it. The cache never serves a FAIL, so every failing
+   row in the area was executed.
 10. **ASan,** when the fix touches allocation, layout, retain/release or disposal:
     `BEZEL_AOT_FORCE_SANITIZE=address scripts/agent_check.sh …` must print
     `NATIVE SANITIZER: 0 check(s) skipped`, and `grep -c 'LeakSanitizer: detected'` on its log must
