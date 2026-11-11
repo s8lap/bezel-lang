@@ -2629,6 +2629,10 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         }
         if (call->callee && !skipCalleeReadForDispose)
             checkRead(*call->callee, /*selfTarget=*/true);
+        // §28.2 (v0.357), #7441: the discharge walk's twin of the read walk's
+        // invocation check — a call that is a statement, a `return` operand
+        // or a discard's value comes through here, not through `checkRead`.
+        checkInvokedBorrowHolder(*call);
         // Slice O14 + §28.8: argument-mode handling.
         // fix #4677 (§15.3 "Parameter passing", v0.307): resolved once,
         // outside the loop — the bare-statement-call twin of
@@ -3639,6 +3643,10 @@ void MethodOwnership::checkUseThroughDisposedBorrowHolder(
                 : "is a borrow-bearing record that holds borrows of those "
                   "values (§9.7), and every one of them is disposed on every "
                   "path to this use";
+        else if (heldBorrowMethodRefHolders_.count(sym))
+            msg += "is a bound method reference that captured that value as "
+                   "its receiver when it was formed (§27.6), before the "
+                   "disposal, and the disposal reaches this use on every path";
         else
             msg += "is a local borrow of that value, taken before the "
                    "disposal, and the disposal reaches this use on every path";
@@ -3792,6 +3800,7 @@ void MethodOwnership::bindHeldBorrows(sema::Symbol* holder,
         return;
     std::vector<LocalOwnership::HeldBorrow> out;
     bool inRecord = false;
+    bool inMethodRef = false;
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
             peelTopCastBang(init))) {
         // The alias: `var b := a;`, `const b := a;`, `a!`, `a as T`.
@@ -3800,6 +3809,23 @@ void MethodOwnership::bindHeldBorrows(sema::Symbol* holder,
         // A copy of a record holder is a record holder.
         if (auto sit = states_.find(ctx_.exprSymbol(*id)); sit != states_.end())
             inRecord = sit->second.heldBorrowsInRecord;
+    } else if (const auto* mref = boundMethodReferenceOverLocal(init)) {
+        // The BOUND METHOD REFERENCE (§27.6): `var f := d.M;`. §27.6: "the
+        // instance is captured at formation — by reference for class- or
+        // interface-typed receivers", and §28.3.8 provenance clause 2: "A
+        // method reference contributes its bound receiver's source, as a
+        // capture". So `f` is a value that holds a borrow of the value `d`
+        // held when the reference was formed — §28.2's "a value that holds
+        // the borrow" — and NOT a closure over the variable `d`: a store into
+        // `d` after the formation does not re-point it (MEASURED: `var f :=
+        // d.M; d.Dispose(); d := new D(); f();` invokes `M` on the first,
+        // released instance — ASan heap-use-after-free). The receiver is a
+        // plain local read of an OWNER variable or of a tracked holder, as
+        // the alias arm above requires; an owner is always class- or
+        // interface-typed, so the by-copy receivers of §27.6 never get here.
+        if (ctx_.exprSymbol(*mref) == holder) return;
+        if (!collectHeldBorrowsOfLocalRead(*mref, out)) return;
+        inMethodRef = true;
     } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                    peelTopCastBang(init))) {
         // A COMPONENT read of a tracked record holder (`var x := p.Item;`,
@@ -3881,7 +3907,30 @@ void MethodOwnership::bindHeldBorrows(sema::Symbol* holder,
     // valid here.
     hit->second.heldBorrows = std::move(out);
     hit->second.heldBorrowsInRecord = inRecord;
+    if (inMethodRef) heldBorrowMethodRefHolders_.insert(holder);
     anyHeldBorrows_ = true;
+}
+
+// §28.2 / §27.6 (v0.357), #7441: see the declaration.
+const ast::IdentifierExpr* MethodOwnership::boundMethodReferenceOverLocal(
+        const ast::Expr* init) {
+    const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(init);
+    if (!ma || !ma->target) return nullptr;
+    // A reference to a declared METHOD: sema binds the member access to its
+    // MethodSymbol. A reference to `Dispose` / `DisposeAsync` is left out by
+    // name — invoking one after the receiver's disposal is a REPEATED
+    // disposal, which §28.2 exempts from this error ("One use is exempt: a
+    // second `Dispose()` or `DisposeAsync()` …"), and §27.6 rejects the
+    // formation itself ("No method reference to `Dispose` or
+    // `DisposeAsync`").
+    if (!dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*ma))) return nullptr;
+    if (ma->member == "Dispose" || ma->member == "DisposeAsync") return nullptr;
+    // The value is a function value, i.e. this is a reference and not a
+    // property or field read that happens to resolve to a method.
+    const sema::TypeRef* ty = ctx_.exprType(*ma);
+    if (!ty || ty->kind != sema::TypeRef::Kind::Function) return nullptr;
+    return dynamic_cast<const ast::IdentifierExpr*>(
+        peelTopCastBang(ma->target.get()));
 }
 
 void MethodOwnership::markExplicitlyDisposed(const ast::IdentifierExpr& id) {
@@ -3945,6 +3994,27 @@ void MethodOwnership::dropHeldBorrowsOnSourceStore(
             lo.heldBorrows.clear();
             lo.heldBorrowsInRecord = false;
         }
+    }
+}
+
+void MethodOwnership::checkInvokedBorrowHolder(const ast::CallExpr& call) {
+    // §28.2 (v0.357), #7441: INVOKING a function-valued holder is a use of
+    // it ("a use of the holder — a read or member access through it, passing
+    // it, re-borrowing it, invoking the closure"). A call's callee is read as
+    // a self-target, which the identifier arm of `checkRead` returns from
+    // before it reaches the holder check, so the invocation asks here. Only
+    // a tracked holder is asked about — the `using var` pin half of the
+    // check is the identifier arm's. The tracked local is found as that arm
+    // finds it (`refersTo`): a callee identifier carries no expression
+    // symbol of its own. // per §28.2
+    const auto* calleeId =
+        dynamic_cast<const ast::IdentifierExpr*>(call.callee.get());
+    if (!calleeId) return;
+    for (auto& [csym, clo] : states_) {
+        if (!refersTo(csym, *calleeId)) continue;
+        if (!clo.heldBorrows.empty())
+            checkUseThroughDisposedBorrowHolder(*calleeId, csym);
+        return;
     }
 }
 
@@ -4383,6 +4453,9 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         // Treat the callee as a member-access-target for discharge
         // tolerance (so `x.M(x)` doesn't flag x).
         if (call->callee) checkRead(*call->callee, true);
+        // §28.2 (v0.357), #7441: INVOKING a function-valued holder is a use
+        // of it; the self-target callee read just above does not ask.
+        checkInvokedBorrowHolder(*call);
         std::size_t pos = 0;
         for (const auto& a : call->args) {
             if (!a.value) { ++pos; continue; }

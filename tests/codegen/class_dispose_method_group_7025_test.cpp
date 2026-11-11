@@ -287,6 +287,17 @@ BEZEL_TEST(class_dispose_method_group_7025,
 // build's reclaim made the read a use-after-free — "heap-use-after-free …
 // READ of size 8". The review's control was clean only because its method
 // returned a constant and never dereferenced the receiver.
+//
+// Re-cut for #7441 (§28.2, v0.357): with a DOMINATING `d.Dispose();` the
+// invocation `f()` is now §28.2's use-after-dispose compile error (a bound
+// method reference holds a borrow of its receiver — pinned in
+// tests/ownership/method_reference_use_after_dominating_dispose_7441_test.cpp),
+// so the program could no longer reach the code generator. The kill is
+// therefore made NON-dominating (`if x > 0 then d.Dispose(); end;`, the shape
+// the `if`-branch row below already uses), which §28.2 leaves to the runtime:
+// the disposal still happens before the invocation on the path that runs, so
+// the row still pins what it was written to pin — the receiver's block is
+// live at an invocation that follows an explicit disposal.
 BEZEL_TEST(class_dispose_method_group_7025,
            spec_28_2_method_reference_after_an_explicit_dispose_is_memory_clean) {
     auto r = runAotChecked(
@@ -300,7 +311,8 @@ BEZEL_TEST(class_dispose_method_group_7025,
         "class C public static method Main(): int "
         "  var d := new D(); "
         "  var f := d.Hi; "
-        "  d.Dispose(); "
+        "  var x := 1; "
+        "  if x > 0 then d.Dispose(); end; "
         "  Console.WriteLine(f()); "
         "  return 0; "
         "end Main; end C;");

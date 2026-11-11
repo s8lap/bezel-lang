@@ -1962,6 +1962,17 @@ private:
     //     plain local read (§9.7: a record's reference fields are borrows).
     // Anything else leaves the holder untracked. // per §28.2, §9.7
     void bindHeldBorrows(sema::Symbol* holder, const ast::Expr* init);
+    // #7441 (§28.2, §27.6, §28.3.8, v0.357): the third shape `bindHeldBorrows`
+    // names — a BOUND METHOD REFERENCE over a plain local read, `d.M` /
+    // `d!.M` / `(d as T).M`. Returns the receiver's identifier, or null when
+    // `init` is not such a reference (a call, a property or field read, a
+    // reference over anything but a plain local read, or a reference to
+    // `Dispose` / `DisposeAsync`, which §28.2's repeated-disposal exemption
+    // and §27.6's formation rule own). // per §28.2, §27.6
+    const ast::IdentifierExpr* boundMethodReferenceOverLocal(
+        const ast::Expr* init);
+    // Invoking a function-valued holder is a use of it. // per §28.2
+    void checkInvokedBorrowHolder(const ast::CallExpr& call);
     // The entries a plain local read contributes; false when the read names
     // nothing the pass can track (the whole holder is then untracked).
     bool collectHeldBorrowsOfLocalRead(
@@ -6773,6 +6784,11 @@ private:
     // node the pre-scan is at. // per §28.2, §9.7
     std::unordered_set<const sema::Symbol*> heldBorrowOpaqueSyms_;
     std::unordered_set<const sema::Symbol*> heldBorrowMemberStoreRoots_;
+    // The holders `bindHeldBorrows` tracked as a BOUND METHOD REFERENCE
+    // (§27.6) — the diagnostic's wording only. A holder is never re-bound
+    // (it would not be tracked), so the fact is the declaration's.
+    // // per §28.2, §27.6
+    std::unordered_set<const sema::Symbol*> heldBorrowMethodRefHolders_;
     int heldBorrowPreScanLambdaDepth_ = 0;
     // Set once any holder is bound in this method (`bindHeldBorrows`): the
     // `catch`-dispatch edge transform runs only for a method that binds one.
