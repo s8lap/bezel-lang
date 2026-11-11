@@ -2540,6 +2540,17 @@ bool sameState(const BlockState& a, const BlockState& b) {
         if (it == b.end()) return false;
         if (la.state != it->second.state) return false;
         if (la.implicitDischarge != it->second.implicitDischarge) return false;
+        // §28.2 (#7435): the holder facts DO feed a later decision (the use
+        // check), and a "not disposed" arriving round a back edge can need a
+        // pass more than the states do — so they take part in convergence.
+        // Sources and the flag only: the kill sites are not compared.
+        const auto& ha = la.heldBorrows;
+        const auto& hb = it->second.heldBorrows;
+        if (ha.size() != hb.size()) return false;
+        for (std::size_t i = 0; i < ha.size(); ++i)
+            if (ha[i].source != hb[i].source ||
+                ha[i].disposed != hb[i].disposed)
+                return false;
     }
     return true;
 }
@@ -3227,6 +3238,33 @@ BlockState dischargeOnExceptionEdge(
     return out;
 }
 
+// §28.2 (v0.357), #7435: "…dominates the use site on every path". Control
+// reaches a `catch` dispatch because the `try` body threw, and it may have
+// thrown BEFORE a `Dispose()` written in it ran — the CFG draws the exception
+// edge from the END of the body (or from a `throw` / `return` in it), so the
+// predecessor's exit state carries a kill the handler cannot rely on. Forget,
+// in a copy of the state bound for the dispatch of `ts`, every holder kill
+// written inside `ts` (`LocalOwnership::HeldBorrow::killLo` / `killHi`): a
+// use in a `catch` arm, and one after the `try`, are then left to the runtime
+// backstop unless a kill BEFORE the `try` dominates them. // per §28.2
+void clearHeldBorrowKillsInside(BlockState& st, const ast::TryStmt& ts) {
+    const std::uint32_t lo = ts.span.begin.offset;
+    std::uint32_t hi = ts.span.end.offset;
+    auto widen = [&](const ast::Stmt* s) {
+        if (s && s->span.end.offset > hi) hi = s->span.end.offset;
+    };
+    for (const auto& s : ts.body) widen(s.get());
+    for (const auto& arm : ts.catches) widen(arm.body.get());
+    for (const auto& s : ts.finallyBody) widen(s.get());
+    for (auto& [sym, lo_] : st)
+        for (auto& hb : lo_.heldBorrows)
+            if (hb.disposed && hb.killHi >= lo && hb.killLo < hi) {
+                hb.disposed = false;
+                hb.disposeLoc = SourceLocation{};
+                hb.killLo = hb.killHi = 0;
+            }
+}
+
 } // namespace
 
 // fix #3842 (§22.3 / §22.4 / §28.3, v0.289): `out owned var` is RETIRED.
@@ -3465,7 +3503,21 @@ FlowState MethodOwnership::runDataflow(
             if (dischargeEdge)
                 peDischarged =
                     dischargeOnExceptionEdge(peRaw, unwoundDeclsFor(b));
-            const BlockState& peBase = dischargeEdge ? peDischarged : peRaw;
+            // §28.2 (#7435): every edge into a `catch` dispatch is an
+            // exceptional path out of that `try` — see
+            // `clearHeldBorrowKillsInside`. A `try … finally` with no `catch`
+            // is left alone: its dispatch only passes through to the
+            // `finally`, whose uses `heldBorrowKillPrecedesFinally` guards,
+            // and the statement completes normally only when its body did.
+            const bool handlerEdge =
+                anyHeldBorrows_ && b->tryForDispatch &&
+                !b->tryForDispatch->catches.empty();
+            if (handlerEdge) {
+                if (!dischargeEdge) peDischarged = peRaw;
+                clearHeldBorrowKillsInside(peDischarged, *b->tryForDispatch);
+            }
+            const BlockState& peBase =
+                (dischargeEdge || handlerEdge) ? peDischarged : peRaw;
             // §28.3/§28.7 (#764): on the edge where x is provably null, x carries
             // no disposal obligation ("disposal of null is a no-op"). Feed x as
             // PolyNull into THIS edge's contribution only — the other (non-null)
@@ -4326,6 +4378,12 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     if (!suppressDiag_) checkCapturedOwnedConsumeInStmt(s);
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         handleLocalDecl(*ld);
+        // §28.2 (v0.357) holder rule, #7435 / #7441: record what a plain
+        // `var` alias / borrow-bearing record local borrows. A `using var` is
+        // the pin holder (#7893) or an owner; an `owned`-marked initializer
+        // makes an owner. // per §28.2
+        if (!ld->isUsing && !ld->initializerHasOwnedMarker && ld->initializer)
+            bindHeldBorrows(findLocalSymbol(*ld), ld->initializer.get());
         return;
     }
     // §21.1 v0.201 (#2049): a `const` LOCAL is NEVER-OWNED — the binding takes
@@ -4753,6 +4811,10 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     states_[lsym] = lo;
                 }
             }
+            // §28.2 (v0.357) holder rule, #7435 / #7441: the `const` twin of
+            // the `var` arm's bind above — §28.2 names both spellings ("an
+            // alias (`var b := a;`, `const b := a;`)"). // per §28.2, §21.1
+            bindHeldBorrows(findLocalSymbol(*lc), lc->value.get());
         }
         return;
     }
@@ -5044,7 +5106,10 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                                 if (ld->isUsing && ld->usingVarSourceIsBorrow)
                                     aliasIsBorrowPin = true;
                         if (!aliasIsBorrowPin) {
-                            markDisposedByName(id->name, id->span.begin, id);
+                            // §28.2 (v0.357): "or a discard of the binding" is
+                            // an explicit disposal — the holder kill of
+                            // #7435 / #7441 runs with it. // per §28.2
+                            markExplicitlyDisposed(*id);
                             const_cast<ast::DiscardStmt*>(ds)->discardOutOwnedVar =
                                 true;
                             // fix #1892 / §17.13 / §28.5: when the discarded named
@@ -10512,6 +10577,13 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // `checkRead` reports ONLY for a local already in an error state, so a live
     // `i += 1` never triggers it.
     // // per §6.6, §28.3 K1.3, §17.6, v0.294, #3969
+    // §28.2 (v0.357) holder rule, #7435 / #7441: a store into a variable ends
+    // the tracking of every holder that borrows the value it held and has not
+    // seen that value disposed — see `dropHeldBorrowsOnSourceStore`. Any
+    // operator: a compound assignment stores too (§6.6). // per §28.2, §6.6
+    if (auto* heldTid =
+            dynamic_cast<const ast::IdentifierExpr*>(as.target.get()))
+        dropHeldBorrowsOnSourceStore(*heldTid);
     if (as.op != ":=") {
         if (!as.target || !as.value) return;
         // §6.6: "every constituent of the left-hand side's lvalue chain

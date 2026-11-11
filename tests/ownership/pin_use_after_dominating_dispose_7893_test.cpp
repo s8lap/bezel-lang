@@ -40,11 +40,11 @@
 //     "on the same variable" -- so the runtime backstop stands behind the
 //     use (the spec's own rule corpus, case `s28_10_0012`, expects that
 //     program to COMPILE and to fault at runtime in checked disposal mode);
-//   * a plain ALIAS holder (`var b := a;`) is the other §28.2 list entry, but
-//     the spec's own rule corpus admits that program too (cases
-//     `s28_2_0011` / `s28_2_0012`: compile, then fault at runtime in checked
-//     mode / be undefined behaviour unchecked), so it stays with the
-//     runtime backstop as well.
+//   * a plain ALIAS holder (`var b := a;`) is the other §28.2 list entry.
+//     This file first left it to the runtime backstop, because two rule-corpus
+//     cases (`s28_2_0011` / `s28_2_0012`) still carried the pre-v0.346
+//     expectation; #7435 implements the holder sentence for the alias, and
+//     the row below now pins the REJECTION (§28.2, v0.357).
 //
 // The rows are COMPILE-TIME only (`parseAndCheckOwnership`): the defect is a
 // compile-time over-acceptance, and the direct-shape control is a WARNING
@@ -335,22 +335,22 @@ BEZEL_TEST(ownership_pin_use_after_dominating_dispose_7893,
     BEZEL_EXPECT_FALSE(hasError(r, kHolderUse));
 }
 
-// ACCEPT: the plain-ALIAS holder -- §28.2's list names it first ("an alias
-// (`var b := a;`, `const b := a;`)"), but the spec's own rule corpus admits
-// that program and expects the RUNTIME backstop to fault it (cases
-// `s28_2_0011` -- "the default build is checked: a read through a surviving
-// borrow after Dispose faults" -- and `s28_2_0012`, the same program under
-// `--unchecked-disposal`, which the corpus expects to COMPILE). So the alias
-// holder is left to §28.2's checked-mode backstop, not to a compile error.
+// REJECT (flipped by #7435): the plain-ALIAS holder -- §28.2's list names it
+// first ("an alias (`var b := a;`, `const b := a;`)"), and "a use of the
+// holder ... is the same compile error" (§28.2, v0.357). This row used to pin
+// the alias as ADMITTED (`plain_alias_left_to_the_runtime_backstop_spec_28_2`)
+// on the strength of two rule-corpus cases (`s28_2_0011` / `s28_2_0012`) that
+// predate the holder sentence (v0.346); the spec text is the authority, and
+// #7441's own body lists those cases for re-heading.
 BEZEL_TEST(ownership_pin_use_after_dominating_dispose_7893,
-           plain_alias_left_to_the_runtime_backstop_spec_28_2) {
+           plain_alias_rejected_spec_28_2) {
     OwnershipResult r = parseAndCheckOwnership(prog(
         "    var a := new R(1);\n"
         "    var b := a;\n"
         "    a.Dispose();\n"
         "    var s := b.Use();\n"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(hasError(r, kHolderUse));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasError(r, kHolderUse));
 }
 
 // CONTROL: the DIRECT shape keeps its own diagnostic AND its own severity --

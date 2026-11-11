@@ -3111,7 +3111,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         lookThroughForceUnwrap(ma->target.get()))) {
                     markExplicitDisposeReclaimIfReassignedBorrow(*id);
-                    markDisposedByName(id->name, id->span.begin, id);
+                    markExplicitlyDisposed(*id);  // §28.2 kill (#7435)
                 }
             } else if (ma->member == "RemoveAt" || ma->member == "Clear" ||
                        ma->member == "Remove") {
@@ -3159,7 +3159,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         nm->target.get())) {
                     markExplicitDisposeReclaimIfReassignedBorrow(*id);
-                    markDisposedByName(id->name, id->span.begin, id);
+                    markExplicitlyDisposed(*id);  // §28.2 kill (#7435)
                 }
             }
         }
@@ -3596,6 +3596,64 @@ static bool isOwnedRelevantLocal(sema::Symbol* sym) {
 // disposed on only some paths to the use … is not rejected").
 void MethodOwnership::checkUseThroughDisposedBorrowHolder(
         const ast::IdentifierExpr& id, sema::Symbol* sym) {
+    // #7435 / #7441 (§28.2, v0.357): the ALIAS holder and the borrow-bearing
+    // RECORD holder. Their source set is the holder's own `heldBorrows`
+    // (LocalOwnership), and the rule is §28.2's, verbatim: "every value in the
+    // holder's source set (K2.2) has been so disposed on every path to the
+    // use". One live source is enough to leave the use to the runtime backstop
+    // ("A holder whose source was disposed on only some paths to the use … is
+    // not rejected"). The use is not a state transition: the holder stays as
+    // it is, so every later use of it is reported at its own site.
+    if (auto hit = states_.find(sym);
+        hit != states_.end() && !hit->second.heldBorrows.empty()) {
+        const LocalOwnership& hs = hit->second;
+        for (const auto& hb : hs.heldBorrows) {
+            if (!hb.disposed) return;
+            // A use in a `finally` whose `try` body or `catch` arm holds the
+            // kill: the `finally` also runs when the exception left before
+            // the kill, so the kill is not on every path to this use.
+            if (heldBorrowKillPrecedesFinally(hb, id.span.begin.offset)) return;
+        }
+        // Name each disposed source once, in the order the holder took them.
+        std::vector<const LocalOwnership::HeldBorrow*> named;
+        for (const auto& hb : hs.heldBorrows) {
+            bool dup = false;
+            for (const auto* n : named)
+                if (n->source == hb.source) { dup = true; break; }
+            if (!dup) named.push_back(&hb);
+        }
+        std::string sources;
+        for (std::size_t i = 0; i < named.size(); ++i) {
+            if (i != 0) sources += (i + 1 == named.size()) ? " and " : ", ";
+            sources += "`" + std::string(named[i]->source->name) + "`";
+        }
+        const std::string holder = std::string(id.name);
+        std::string msg =
+            "use of `" + holder + "` after a dominating explicit Dispose() of " +
+            sources + " — `" + holder + "` ";
+        if (hs.heldBorrowsInRecord)
+            msg += named.size() == 1
+                ? "is a borrow-bearing record that holds a borrow of that "
+                  "value (§9.7), and the disposal reaches this use on every "
+                  "path"
+                : "is a borrow-bearing record that holds borrows of those "
+                  "values (§9.7), and every one of them is disposed on every "
+                  "path to this use";
+        else
+            msg += "is a local borrow of that value, taken before the "
+                   "disposal, and the disposal reaches this use on every path";
+        msg += ", so this use reads freed memory: a use through a local "
+               "borrow of a disposed variable is §28.2's use-after-dispose "
+               "compile error (§28.2 — move the disposal after the last use "
+               "of `" + holder + "`, or re-take the borrow from a live value)";
+        reportOnce(Severity::Error, id.span.begin, msg);
+        for (const auto* n : named)
+            if (n->disposeLoc.line != 0)
+                report(Severity::Note, n->disposeLoc,
+                       std::string("explicit Dispose() of `") +
+                           std::string(n->source->name) + "` was here");
+        return;
+    }
     // The holder: a `using var` borrow-pin over a borrow.
     const ast::LocalDecl* pld = nullptr;
     if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
@@ -3672,6 +3730,151 @@ void MethodOwnership::checkUseThroughDisposedBorrowHolder(
         report(Severity::Note, os.explicitDisposeLoc,
                std::string("explicit Dispose() of `") +
                    std::string(owner->name) + "` was here");
+}
+
+// §28.2 (v0.357) holder rule, #7435 / #7441 — see the declarations'
+// comments (Ownership_impl.hpp) and `LocalOwnership::heldBorrows`.
+bool MethodOwnership::collectHeldBorrowsOfLocalRead(
+        const ast::IdentifierExpr& id,
+        std::vector<LocalOwnership::HeldBorrow>& out) {
+    sema::Symbol* src = ctx_.exprSymbol(id);
+    if (!src) return false;
+    auto it = states_.find(src);
+    if (it == states_.end()) return false;
+    const LocalOwnership& so = it->second;
+    auto add = [&out](const LocalOwnership::HeldBorrow& hb) {
+        for (const auto& e : out)
+            if (e.source == hb.source && e.disposed == hb.disposed) return;
+        out.push_back(hb);
+    };
+    // A tracked holder: the new holder borrows what it borrows (an alias of an
+    // alias, a record built over an alias, a copy of a record value). Its
+    // entries are inherited as they stand — `disposed` included, so a holder
+    // taken from an already-dead holder is dead too.
+    if (!so.heldBorrows.empty()) {
+        for (const auto& hb : so.heldBorrows) add(hb);
+        return true;
+    }
+    // An OWNER variable that holds its value on every path here: plainly
+    // Owned, with no conditional consume or disposal behind it.
+    if (so.state != OwnershipState::Owned || so.maybeConsumed ||
+        so.disposedOnSomePath || so.awaitSpent)
+        return false;
+    if (heldBorrowOpaqueSyms_.count(src)) return false;
+    // A `using var` borrow-PIN is Owned-state bookkeeping over a value another
+    // binding owns (§28.10); it is a holder itself (#7893), never a source.
+    if (auto* ls = dynamic_cast<sema::LocalSymbol*>(src))
+    // LOCALDECL-ONLY: only a `using var` can be a borrow-pin, and `using` is a
+    // LocalDecl form — a §21.1 `const` local is never `using`, so it has no arm.
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
+            if (ld->isUsing && ld->usingVarSourceIsBorrow) return false;
+    LocalOwnership::HeldBorrow hb;
+    hb.source = src;
+    add(hb);
+    return true;
+}
+
+void MethodOwnership::bindHeldBorrows(sema::Symbol* holder,
+                                      const ast::Expr* init) {
+    if (!holder || !init) return;
+    auto hit = states_.find(holder);
+    if (hit == states_.end()) return;
+    hit->second.heldBorrows.clear();
+    hit->second.heldBorrowsInRecord = false;
+    // The holder borrows; it does not own. (An Owned-state local — a `new`,
+    // a marked transfer — is a source, not a holder.)
+    if (hit->second.state != OwnershipState::Borrowed) return;
+    // §28.2: "a holder re-bound to the variable's new value (`b := a;` after
+    // `a := new …;`) takes a fresh borrow". A holder that is an assignment
+    // target ANYWHERE in the body (an `out` / `ref` argument and a lambda body
+    // included — `scopedAssignedSyms_`) is not tracked at all.
+    if (scopedAssignedSyms_.count(holder) || heldBorrowOpaqueSyms_.count(holder))
+        return;
+    std::vector<LocalOwnership::HeldBorrow> out;
+    bool inRecord = false;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+            peelTopCastBang(init))) {
+        // The alias: `var b := a;`, `const b := a;`, `a!`, `a as T`.
+        if (ctx_.exprSymbol(*id) == holder) return;
+        if (!collectHeldBorrowsOfLocalRead(*id, out)) return;
+        // A copy of a record holder is a record holder.
+        if (auto sit = states_.find(ctx_.exprSymbol(*id)); sit != states_.end())
+            inRecord = sit->second.heldBorrowsInRecord;
+    } else {
+        return;
+    }
+    if (out.empty()) return;
+    for (const auto& hb : out)
+        if (hb.source == holder) return;
+    // `collectHeldBorrowsOfLocalRead` only reads `states_`, so `hit` is still
+    // valid here.
+    hit->second.heldBorrows = std::move(out);
+    hit->second.heldBorrowsInRecord = inRecord;
+    anyHeldBorrows_ = true;
+}
+
+void MethodOwnership::markExplicitlyDisposed(const ast::IdentifierExpr& id) {
+    sema::Symbol* src = ctx_.exprSymbol(id);
+    bool wasOwner = false;
+    if (src) {
+        auto it = states_.find(src);
+        wasOwner = it != states_.end() &&
+                   it->second.state == OwnershipState::Owned;
+    }
+    markDisposedByName(id.name, id.span.begin, &id);
+    if (!wasOwner) return;
+    // Only a disposal that actually took effect kills: `markDisposedByName`
+    // leaves a maybe-consumed / frozen source as it was (and reports).
+    auto it = states_.find(src);
+    if (it == states_.end() ||
+        it->second.state != OwnershipState::Disposed ||
+        !it->second.explicitlyDisposed)
+        return;
+    for (auto& [s, lo] : states_)
+        for (auto& hb : lo.heldBorrows)
+            if (hb.source == src && !hb.disposed) {
+                hb.disposed = true;
+                hb.disposeLoc = id.span.begin;
+                hb.killLo = hb.killHi = id.span.begin.offset;
+            }
+}
+
+// §28.2 (v0.357), #7435: "…dominates the use site on every path". A `finally`
+// body runs on the exceptional paths out of its `try` too, and on those the
+// `try` body (or the `catch` arm) may have been left BEFORE a `Dispose()` in
+// it ran. The CFG gives a `finally` one block per way of reaching it (and
+// models no edge for an exception no arm catches), so the question is asked
+// lexically: a use inside a `finally` never counts a kill written in that
+// same `try`'s body or arms. A kill before the `try`, or earlier in the
+// `finally` itself, still dominates the use. // per §28.2
+bool MethodOwnership::heldBorrowKillPrecedesFinally(
+        const LocalOwnership::HeldBorrow& hb, std::uint32_t useOffset) const {
+    for (const HeldBorrowFinallySpan& f : heldBorrowFinallySpans_)
+        if (useOffset >= f.finallyBegin && useOffset < f.finallyEnd &&
+            hb.killHi >= f.tryBegin && hb.killLo < f.finallyBegin)
+            return true;
+    return false;
+}
+
+void MethodOwnership::dropHeldBorrowsOnSourceStore(
+        const ast::IdentifierExpr& target) {
+    const sema::Symbol* tsym = ctx_.exprSymbol(target);
+    for (auto& [s, lo] : states_) {
+        if (lo.heldBorrows.empty()) continue;
+        bool live = false;
+        for (const auto& hb : lo.heldBorrows) {
+            if (hb.disposed) continue;
+            if (tsym ? hb.source == tsym
+                     : (hb.source && hb.source->name == target.name)) {
+                live = true;
+                break;
+            }
+        }
+        if (live) {
+            lo.heldBorrows.clear();
+            lo.heldBorrowsInRecord = false;
+        }
+    }
 }
 
 void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
@@ -14992,6 +15195,49 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
         auto it = other.find(sym);
         if (it == other.end()) continue;
         const LocalOwnership& o = it->second;
+        // §28.2 (v0.357) holder rule, #7435 / #7441: "every value in the
+        // holder's source set (K2.2) has been so disposed ON EVERY PATH to the
+        // use". The two incoming paths must agree on WHAT the holder borrows
+        // (the same sources, in the same order — both were bound at the same
+        // declaration); an entry is `disposed` after the join only when it is
+        // on both. Paths that disagree leave the holder untracked. The merge
+        // is computed from the two incoming records up front and applied when
+        // this iteration ends, whichever arm below decides `st` (several of
+        // them replace it with `o` wholesale). // per §28.2
+        struct HeldBorrowJoin {
+            LocalOwnership& st;
+            std::vector<LocalOwnership::HeldBorrow> merged;
+            bool inRecord = false;
+            ~HeldBorrowJoin() {
+                st.heldBorrowsInRecord = !merged.empty() && inRecord;
+                st.heldBorrows = std::move(merged);
+            }
+        } heldBorrowJoin{st, {}, false};
+        if (!st.heldBorrows.empty() &&
+            st.heldBorrows.size() == o.heldBorrows.size()) {
+            bool same = true;
+            for (std::size_t i = 0; i < st.heldBorrows.size(); ++i)
+                if (st.heldBorrows[i].source != o.heldBorrows[i].source) {
+                    same = false;
+                    break;
+                }
+            if (same) {
+                heldBorrowJoin.merged = st.heldBorrows;
+                for (std::size_t i = 0; i < heldBorrowJoin.merged.size(); ++i) {
+                    heldBorrowJoin.merged[i].disposed =
+                        st.heldBorrows[i].disposed && o.heldBorrows[i].disposed;
+                    // Both paths killed: the fact stands for both kills.
+                    if (heldBorrowJoin.merged[i].disposed) {
+                        heldBorrowJoin.merged[i].killLo = std::min(
+                            st.heldBorrows[i].killLo, o.heldBorrows[i].killLo);
+                        heldBorrowJoin.merged[i].killHi = std::max(
+                            st.heldBorrows[i].killHi, o.heldBorrows[i].killHi);
+                    }
+                }
+                heldBorrowJoin.inRecord =
+                    st.heldBorrowsInRecord && o.heldBorrowsInRecord;
+            }
+        }
         if (st.state == o.state) {
             // §28.3 (#1626): preserve the maybe-consumed marker across a
             // same-state Owned ⊓ Owned merge (OR it). The marker was only
@@ -26051,6 +26297,7 @@ void MethodOwnership::scopedPreScan(
     usingPinLambdaSpans_.clear();
     usingPinLoopSpans_.clear();
     usingPinArmGroups_.clear();
+    heldBorrowFinallySpans_.clear();
     stampUsingPinScopeEnds(body, usingPinScopeEnd_,
                            &usingPinBlockSpans_);  // per §28.10 (#7406)
     SourceLocation methodBodyEnd{};
@@ -26211,6 +26458,10 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
                 dynamic_cast<const ast::IdentifierExpr*>(as->target.get())) {
             if (sema::Symbol* tsym = ctx_.exprSymbol(*tid)) {
                 scopedAssignedSyms_.insert(tsym);
+                // §28.2 holder rule (#7435): a store made inside a lambda body
+                // is not at a program point of this body's dataflow.
+                if (heldBorrowPreScanLambdaDepth_ > 0)
+                    heldBorrowOpaqueSyms_.insert(tsym);
                 // #7406: every rebind of a local, with the root of an
                 // alias-producing right-hand side (`b := a`, `a!`, `a.F`,
                 // `a[i]`), for the pin loop's untracked-rebind fallback —
@@ -26221,6 +26472,14 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
                 usingPinAliasRebinds_[tsym].push_back(
                     {tid->span.begin.offset, rhsRoot});
             }
+        }
+        else if (as->target) {
+            // §28.2 holder rule (#7441) / §9.7 *Member stores*: a store through
+            // a member or index chain — its root local, were it a record
+            // value, gains the stored borrow's sources. // per §9.7
+            if (auto* rid = identifierRootThroughCastBang(*as->target))
+                if (const sema::Symbol* rsym = ctx_.exprSymbol(*rid))
+                    heldBorrowMemberStoreRoots_.insert(rsym);
         }
         // §28.14 form 3 (v0.180, #1541): an owned-return scoped call directly
         // assigned to an `owned` field of `this` (`_sub := ticks.Subscribe(h)`)
@@ -26345,6 +26604,23 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
                                &usingPinBlockSpans_);
         stampUsingPinScopeEnds(trys->finallyBody, usingPinScopeEnd_,
                                &usingPinBlockSpans_);
+        // §28.2 (#7435): the `finally` body's extent, for
+        // `heldBorrowKillPrecedesFinally`.
+        if (trys->hasFinally) {
+            HeldBorrowFinallySpan f;
+            f.tryBegin = trys->span.begin.offset;
+            f.finallyEnd = trys->span.end.offset;
+            bool any = false;
+            for (const auto& fs : trys->finallyBody) {
+                if (!fs) continue;
+                if (!any || fs->span.begin.offset < f.finallyBegin)
+                    f.finallyBegin = fs->span.begin.offset;
+                if (fs->span.end.offset > f.finallyEnd)
+                    f.finallyEnd = fs->span.end.offset;
+                any = true;
+            }
+            if (any) heldBorrowFinallySpans_.push_back(f);
+        }
         for (const auto& arm : trys->catches) {
             if (auto* ald = dynamic_cast<const ast::LocalDecl*>(arm.body.get());
                 ald && ald->isUsing)
@@ -26505,6 +26781,26 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
                     if (sema::Symbol* osym = ctx_.exprSymbol(*oid))
                         scopedAssignedSyms_.insert(osym);
             }
+            // §28.2 holder rule (#7435 / #7441): an `out` / `ref` argument
+            // stores into its location during or after the call, not at a
+            // program point `handleAssignment` sees — the named local is
+            // opaque as a source, and the root local of a member / index
+            // chain is stored into as a member store (§9.7). // per §9.7
+            if (!a.modifier.empty() &&
+                (a.modifier.find("out") != std::string_view::npos ||
+                 a.modifier == "ref")) {
+                if (auto* oid = dynamic_cast<const ast::IdentifierExpr*>(
+                        a.value.get())) {
+                    if (const sema::Symbol* osym = ctx_.exprSymbol(*oid))
+                        heldBorrowOpaqueSyms_.insert(osym);
+                } else if (auto* rid =
+                               identifierRootThroughCastBang(*a.value)) {
+                    if (const sema::Symbol* rsym = ctx_.exprSymbol(*rid)) {
+                        heldBorrowOpaqueSyms_.insert(rsym);
+                        heldBorrowMemberStoreRoots_.insert(rsym);
+                    }
+                }
+            }
             if (scopedFormalAt(callee, ne, args, i))
                 scopedAdmissionQueue_.push_back(
                     {&e, callee, ne, a.value.get()});
@@ -26627,6 +26923,13 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
         // Walk lambda bodies too: a Spawn call inside a lambda still needs
         // admission, and lambda-internal locals need declaration indices so
         // an inner `using var` scope can be a bounding object.
+        // §28.2 holder rule (#7435): assignments found below are inside a
+        // lambda body — see heldBorrowOpaqueSyms_.
+        struct HeldBorrowLambdaDepth {
+            int& d;
+            explicit HeldBorrowLambdaDepth(int& depth) : d(depth) { ++d; }
+            ~HeldBorrowLambdaDepth() { --d; }
+        } heldBorrowLambdaDepth(heldBorrowPreScanLambdaDepth_);
         if (lam->exprBody) scopedPreScanExpr(*lam->exprBody);
         stampUsingPinScopeEnds(lam->stmts, usingPinScopeEnd_,
                                &usingPinBlockSpans_);  // #7406

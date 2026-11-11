@@ -1915,15 +1915,64 @@ private:
     // sentence. A pin over a MEMBER read or a CALL is not admitted — the
     // value it borrows is not the disposed binding, so §28.2's "on the same
     // variable" clause is not met and the runtime backstop stands behind the
-    // use (the spec's own rule corpus, case `s28_10_0012`). A plain ALIAS
-    // holder (`var b := a;`) is not admitted either: the spec's own rule
-    // corpus admits that program and expects the runtime backstop to fault
-    // it (cases `s28_2_0011` / `s28_2_0012`), so the alias form stays with
-    // §28.2's checked-mode backstop.
+    // use (the spec's own rule corpus, case `s28_10_0012`).
+    //
+    // #7435 / #7441 (§28.2, v0.357): the plain ALIAS holder (`var b := a;`,
+    // `const b := a;`) and the borrow-bearing RECORD holder (`var p := new
+    // Pair(a);`, §9.7) are admitted too, through the holder's own
+    // `LocalOwnership::heldBorrows` facts (see that field's comment for why
+    // they live on the holder): every entry `disposed` at the use is §28.2's
+    // "every value in the holder's source set (K2.2) has been so disposed on
+    // every path to the use". (#7893 left the alias to the runtime backstop
+    // because the rule corpus still carried the pre-v0.346 expectation —
+    // cases `s28_2_0011` / `s28_2_0012`; the §28.2 text is the authority.)
     //
     // `id` is the read identifier, `sym` the tracked local it names.
     void checkUseThroughDisposedBorrowHolder(const ast::IdentifierExpr& id,
                                              sema::Symbol* sym);
+
+    // §28.2 (v0.357) holder rule, #7435 / #7441 — the four writers of
+    // `LocalOwnership::heldBorrows`.
+    //
+    // bindHeldBorrows: called once a `var` / `const` local declaration has
+    // registered `holder` in `states_`. Records the holder's source set when
+    // (a) the holder is never re-bound anywhere in the body (§28.2: "a holder
+    // re-bound to the variable's new value … takes a fresh borrow" — a
+    // re-bound holder is simply not tracked), and (b) the initializer is one
+    // of the two shapes whose source set the pass can name exactly:
+    //   - a plain local read (`a`, `a!`, `a as T`) of an OWNER variable, or of
+    //     another tracked holder (whose entries are inherited);
+    //   - `new R(args…)` of a positional borrow-bearing record with no
+    //     declared constructor, each borrow-capable argument being such a
+    //     plain local read (§9.7: a record's reference fields are borrows).
+    // Anything else leaves the holder untracked. // per §28.2, §9.7
+    void bindHeldBorrows(sema::Symbol* holder, const ast::Expr* init);
+    // The entries a plain local read contributes; false when the read names
+    // nothing the pass can track (the whole holder is then untracked).
+    bool collectHeldBorrowsOfLocalRead(
+        const ast::IdentifierExpr& id,
+        std::vector<LocalOwnership::HeldBorrow>& out);
+    // markExplicitlyDisposed: the three EXPLICIT-disposal sites — `x.Dispose()`
+    // / `x!.Dispose()` / a direct `DisposeAsync()`, `x?.Dispose()`, and the
+    // discard `_ := x;` (§28.2: "an explicit `Dispose()` or direct
+    // `DisposeAsync()` call — or a discard of the binding"). Runs
+    // `markDisposedByName` and, when that turned a still-Owned variable
+    // Disposed, marks every holder's not-yet-disposed entry for the variable.
+    // `markDisposedByName` itself is NOT the place: it is also the transfer
+    // function of `throw x`, an owning `yield return x` and `return x`, none
+    // of which is an explicit disposal. // per §28.2
+    void markExplicitlyDisposed(const ast::IdentifierExpr& id);
+    // dropHeldBorrowsOnSourceStore: a store into `target` (any assignment).
+    // A holder with a NOT-yet-disposed entry for `target` stops being tracked
+    // — the variable no longer holds the value the holder borrowed, so a later
+    // disposal of the variable is not a disposal of that value. An entry
+    // already `disposed` is kept: "A reassignment of the variable between the
+    // kill and the use does not lift the error". // per §28.2
+    void dropHeldBorrowsOnSourceStore(const ast::IdentifierExpr& target);
+    // heldBorrowKillPrecedesFinally: `useOffset` is inside a `finally` body
+    // and the kill `hb` stands for was written in that `try`'s body or arms.
+    bool heldBorrowKillPrecedesFinally(const LocalOwnership::HeldBorrow& hb,
+                                       std::uint32_t useOffset) const;
 
     void handleAssignment(const ast::AssignmentStmt& as);
 
@@ -6729,6 +6778,36 @@ private:
     // local among them is NOT verifiable (the binding may have been swapped
     // before the call site — the pre-scan is flow-insensitive).
     std::unordered_set<sema::Symbol*> scopedAssignedSyms_;
+    // §28.2 (v0.357) holder rule, #7435 / #7441 — two flow-insensitive sets
+    // the same pre-scan fills, both consulted by `bindHeldBorrows`:
+    //   heldBorrowOpaqueSyms_   a symbol stored into where the dataflow's
+    //     `handleAssignment` does not see the store at its program point — an
+    //     assignment inside a lambda body, or an `out` / `ref` argument. Such
+    //     a variable is never a tracked SOURCE (the pass cannot say which value
+    //     it holds when it is disposed).
+    //   heldBorrowMemberStoreRoots_   the root local of a member / index chain
+    //     that is an assignment target or an `out` / `ref` argument
+    //     (`p.Item := e`, `M(ref p.Item)`). A record VALUE stored into that way
+    //     gains sources (§9.7 *Member stores*: a member store "adds the
+    //     sources of the borrows `e` carries to that set"), so it is never a
+    //     tracked record HOLDER.
+    // heldBorrowPreScanLambdaDepth_ counts the enclosing lambda literals of the
+    // node the pre-scan is at. // per §28.2, §9.7
+    std::unordered_set<const sema::Symbol*> heldBorrowOpaqueSyms_;
+    std::unordered_set<const sema::Symbol*> heldBorrowMemberStoreRoots_;
+    int heldBorrowPreScanLambdaDepth_ = 0;
+    // Set once any holder is bound in this method (`bindHeldBorrows`): the
+    // `catch`-dispatch edge transform runs only for a method that binds one.
+    bool anyHeldBorrows_ = false;
+    // Every `try … finally` of the body: the statement's start and its
+    // `finally` body's extent (source offsets), recorded by the pre-scan for
+    // `heldBorrowKillPrecedesFinally`. // per §28.2
+    struct HeldBorrowFinallySpan {
+        std::uint32_t tryBegin = 0;
+        std::uint32_t finallyBegin = 0;
+        std::uint32_t finallyEnd = 0;
+    };
+    std::vector<HeldBorrowFinallySpan> heldBorrowFinallySpans_;
     // Deferred §28.14 admission work items: the walk indexes declarations and
     // records the maps above; the admission checks run AFTER the full walk so
     // scopedLambdaLocalInit_ / scopedAssignedSyms_ are complete. (Declaration-

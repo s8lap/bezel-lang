@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 #include "ast/Node.hpp"
 #include "sema/Symbol.hpp"
@@ -340,6 +341,57 @@ struct LocalOwnership {
     // element the index names". Set when such a call is seen on
     // elementBorrowSourceColl after this borrow was taken.
     bool elementBorrowIndexInvalidatedByStructuralOp = false;
+
+    // §28.2 (v0.357) "Use after a dominating explicit disposal", the HOLDER
+    // sentence (#7435 the alias, #7441 the borrow-bearing record): "where a
+    // local holds a borrow of that value — an alias (`var b := a;`,
+    // `const b := a;`), … a value that holds the borrow (… a borrow-bearing
+    // record …, §9.7) … — taken while the variable held that value, and every
+    // value in the holder's source set (K2.2) has been so disposed on every
+    // path to the use, a use of the holder … is the same compile error".
+    //
+    // The fact lives on the HOLDER, not on the source variable, because the
+    // rule is about the VALUE the holder borrowed, not about the variable's
+    // current state: "A reassignment of the variable between the kill and the
+    // use does not lift the error — the holder still borrows the disposed
+    // value". A lookup of the source's state at the use would lose the kill at
+    // the reassignment (the variable is Owned again), and would also blame a
+    // holder for the disposal of a value it never borrowed.
+    //
+    // One entry per value the holder borrows:
+    //   - `source`     the owner variable that held the value when the borrow
+    //                  was taken;
+    //   - `disposed`   an explicit disposal of that variable, made while it
+    //                  still held that value, reaches this point on EVERY path
+    //                  (set at the kill, AND-merged at a join — §28.2's "on
+    //                  every path to the use");
+    //   - `disposeLoc` the disposing site, for the diagnostic's note;
+    //   - `killLo` / `killHi`  see the members.
+    // EMPTY means the holder's source set is not tracked, and a use of it is
+    // never this error (the runtime backstop stands behind it): a holder that
+    // is ever re-bound, a source the pass cannot name, a store into the source
+    // variable before its disposal, a join of paths that disagree.
+    // Written by `bindHeldBorrows`, `markExplicitlyDisposed`,
+    // `dropHeldBorrowsOnSourceStore` and `joinInto`; read by
+    // `checkUseThroughDisposedBorrowHolder`. // per §28.2
+    struct HeldBorrow {
+        sema::Symbol* source = nullptr;
+        bool disposed = false;
+        SourceLocation disposeLoc;
+        // The source-offset hull of the kills `disposed` stands for (one kill:
+        // `killLo == killHi`; a join of two disposed paths widens it). Read
+        // where a `try` makes a kill uncertain although the dataflow carries
+        // it — an exception can leave a `try` body before the `Dispose()` in
+        // it ran: `clearHeldBorrowKillsInside` (the edge into a `catch`
+        // dispatch) and `heldBorrowKillPrecedesFinally` (a use in a
+        // `finally`). Meaningful only while `disposed` is set.
+        std::uint32_t killLo = 0;
+        std::uint32_t killHi = 0;
+    };
+    std::vector<HeldBorrow> heldBorrows;
+    // The holder is a borrow-bearing record VALUE (§9.7) rather than an alias
+    // of the source — the diagnostic's wording only. // per §28.2, §9.7
+    bool heldBorrowsInRecord = false;
 };
 
 // Spelled state for diagnostics + tests.

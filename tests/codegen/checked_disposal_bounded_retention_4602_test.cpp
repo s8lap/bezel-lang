@@ -387,6 +387,15 @@ BEZEL_TEST(codegen_checked_disposal_bounded_retention_4602,
            spec_28_2_explicit_dispose_surviving_alias_still_faults) {
     // Conformance s28_2_0011's shape (§28.2: Dispose is logical disposal; the
     // block stays live until the holder's release point).
+    //
+    // Re-cut by #7435 (§28.2, v0.357): the kill is CONDITIONAL. The original
+    // row disposed `w` on every path to the read through `view`, which is now
+    // §28.2's compile error ("a use of the holder ... is the same compile
+    // error"); "a holder whose source was disposed on only some paths to the
+    // use ... is not rejected: a use through it raises
+    // `DisposedAccessException` in checked disposal mode" -- the runtime
+    // backstop this row exists to pin. The oracle is unchanged: the read
+    // through the surviving alias faults.
     const std::string src =
         "module M;\n"
         "public class Widget\n"
@@ -398,15 +407,20 @@ BEZEL_TEST(codegen_checked_disposal_bounded_retention_4602,
         "  end destructor;\n"
         "end Widget;\n"
         "public class Program\n"
-        "  public static method Main()\n"
+        "  public static method Run(kill: bool)\n"
         "    var w := new Widget();\n"
         "    var view := w;\n"
-        "    w.Dispose();\n"
+        "    if kill then\n"
+        "      w.Dispose();\n"
+        "    end;\n"
         "    try\n"
         "      Console.WriteLine(view.Label);\n"
         "    catch\n"
         "      DisposedAccessException => Console.WriteLine(\"faulted\"),\n"
         "    end try;\n"
+        "  end Run;\n"
+        "  public static method Main()\n"
+        "    Run(true);\n"
         "  end Main;\n"
         "end Program;\n";
     expectEscapedFaults(src);
