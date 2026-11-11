@@ -29,7 +29,7 @@
 //   tests/codegen/int_parse_radix_2024_test.cpp: `int.Parse("80000000", 16)`
 //   raises OverflowException).  #8417 retires the class in v0.358.
 //
-//   stdlib §1's Try convention, shape (c): `TryParse` returns `false` in
+//   stdlib §9.1 declares `TryParse` as shape (c) of the Try convention: it returns `false` in
 //   every case where `Parse` would raise, and the `out` parameter receives
 //   the default value.
 //
