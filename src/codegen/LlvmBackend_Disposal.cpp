@@ -5818,6 +5818,28 @@ bool Emitter::freshNewReceiverTempEligible(const ast::Expr* recvExpr,
     // extracted, when the receiver is a fresh `new`/`owned`-returning producer
     // (#1039/#1053-case-2) and the result cannot alias into it.
     if (!recvExpr || !recvPtr || !resultTy) return false;
+    // fix #8398 (§17.12 / §28.3.1 K8.1 / §28.3.11, v0.357): the receiver may be
+    // the NULL-FORGING `!` over a fresh owned producer — `OpenOrNull(n)!.Send(x)`.
+    // §17.12: `x!` "raises NullReferenceException if the operand is null,
+    // otherwise yields it" — a PASS-THROUGH, so the PRODUCER is the bang's
+    // OPERAND, not the wrapper. Without this unwrap the consumer's
+    // `isFreshOwnedClassProducer(ma->target.get())` saw the `PostfixBangExpr`
+    // (never a producer) and every `!` receiver leaked — MEASURED on the base:
+    // `OpenOrNull(n)!.Send(x)` printed no `close`, while the `.` twin
+    // `Open(n).Send(x)` printed one. The unwrap is HERE — in the ONE shared
+    // eligibility predicate every consumer consults (`registerFreshNewReceiver-
+    // TempUnwind` / `disposeFreshNewReceiverTemp`) — so the registration and the
+    // reclaim cannot disagree about the shape (they share this predicate), and
+    // every `!` receiver shape is covered at once: the `.`-form member read, the
+    // `.`-form call, and the `?.`-form member read alike.
+    //
+    // IT IS THE OPERAND, NOT THE WRAPPER, BECAUSE §17.12's `!` neither
+    // produces nor transfers: the wrapper only null-checks and yields the
+    // operand's value. So the operand keeps the +1 it produced and the
+    // temporary's disposal obligation is unchanged — the unwrap re-identifies
+    // the producer, it does not create a second owner.
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(recvExpr))
+        recvExpr = pb->operand.get();
     if (!isFreshOwnedClassProducer(recvExpr)) return false;
     return freshReceiverResultIsValueLike(resultTy, calleeReturnsOwned);
 }

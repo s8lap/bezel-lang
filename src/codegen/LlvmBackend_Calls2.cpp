@@ -26001,6 +26001,45 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     llvm::Value* recv = lowerExpr(*nm.target);
     if (!recv) return nullptr;
 
+    // fix #8398 (§28.3.1 K8.1 / §28.3.11, v0.357): the `?.` RECEIVER is an
+    // unbound owned temporary when it is a fresh owned producer — `f()?.M(x)`,
+    // where `f()` returns `owned T?`. §28.3.11 lists "the receiver of a further
+    // call" among the BORROWING USES that leave a fresh owned producer
+    // "owned by nobody", and K8.1 disposes such a temporary "at their full
+    // expression's end, after their uses".
+    //
+    // THE DEFECT. The `.` spelling (`lowerCallDispatch`) registers the receiver
+    // temporary BEFORE the call — `registerFreshNewReceiverTempUnwind` — and
+    // reclaims it after it (`disposeFreshNewReceiverTemp`). The `?.` spelling
+    // registered NEITHER: the receiver's +1 was owned by nobody, so the object
+    // leaked and its destructor never ran. MEASURED on the base: the issue's
+    // repro printed `a <- x` with no `close a`, while the non-nullable control
+    // `Open("c").Send("z")` printed `close c`.
+    //
+    // THE FIX is the `.` path's own two-channel mechanism, verbatim:
+    //   * the EXCEPTION edge — `registerFreshNewReceiverTempUnwind` pushes an
+    //     unwind-only entry on the current scope, so a throw out of an argument
+    //     evaluation or out of the callee discharges the receiver while
+    //     unwinding (§28.3.11's *Exception-path discharge*);
+    //   * the NORMAL edge — `disposeFreshNewReceiverTemp` reclaims it right
+    //     after the call, INSIDE `callBB` (the non-null arm), so the disposal
+    //     runs after the call's last use of the receiver and before the
+    //     statement's next output — and it discharges the unwind entry at
+    //     runtime (the slot is nulled), so the two edges cannot both fire.
+    //
+    // §7.5's null arm needs no special case: a null receiver means there is no
+    // object to dispose, and the reclaim is null-guarded.
+    //
+    // THE ELIGIBILITY PREDICATE is the `.` path's own
+    // (`freshNewReceiverTempEligible`): a fresh owned CLASS producer whose call
+    // RESULT cannot alias the receiver. A `?.` call whose result may alias the
+    // receiver keeps the pre-fix leak — the sound direction (a leak, never a
+    // wrong free).
+    llvm::AllocaInst* ncRecvUnwindSlot = nullptr;
+    const bool ncCalleeReturnsOwned = sema::methodReturnsOwned(*ms, ctx_);
+    ncRecvUnwindSlot = registerFreshNewReceiverTempUnwind(
+        nm.target.get(), recv, ctx_.exprType(call), ncCalleeReturnsOwned);
+
     // §7.5 / #458: handle a NULLABLE VALUE type receiver (`int?`, `bool?`,
     // `enum?`, `record?`). These lower to a tagged {i8 hasValue; T value}
     // struct, NOT a pointer. Nullness is `hasValue == 0`.
@@ -26504,6 +26543,20 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
         callVal = builder_.CreateInsertValue(callVal, r, {1u});
     }
+    // fix #8398 (§28.3.1 K8.1 / §28.3.11, v0.357): the NORMAL edge of the
+    // `?.` receiver temporary's disposal — the `.` path's own reclaim, at the
+    // `.` path's own position (right after the call, inside `callBB`, i.e. only
+    // on the non-null arm). It disposes the receiver's class destructor and
+    // reclaims its block, and discharges the unwind-only entry registered
+    // above at RUNTIME (the slot is nulled), so the normal edge and the
+    // exception edge can never both fire — exactly once on every path.
+    //
+    // `!diverged_` mirrors the `.` path's guard: a `throw` out of the callee
+    // branched to the unwind block, where the receiver is already discharged by
+    // the unwind-only entry and emitting a reclaim there would be invalid IR.
+    if (!diverged_)
+        disposeFreshNewReceiverTemp(nm.target.get(), recv, ctx_.exprType(call),
+                                    ncCalleeReturnsOwned, ncRecvUnwindSlot);
     auto* callEnd = builder_.GetInsertBlock();
     builder_.CreateBr(endBB);
 

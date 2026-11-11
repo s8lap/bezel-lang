@@ -6053,6 +6053,25 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         obj, llvm::ConstantPointerNull::get(ptrTy()));
                     builder_.CreateCondBr(ncIsNull, ncEndBB, ncAccessBB);
                     builder_.SetInsertPoint(ncAccessBB);
+                    // fix #8398 (§28.3.1 K8.1 / §28.3.11, v0.357): the `?.`
+                    // RECEIVER of a computed-property read is an unbound owned
+                    // temporary when it is a fresh owned producer — `f()?.P`.
+                    // §28.3.11 lists "a member or index access" among the
+                    // BORROWING USES that leave a fresh owned producer owned by
+                    // nobody, and K8.1 disposes it at the end of the full
+                    // expression. The IMPORTED-getter sibling below already
+                    // registers the same way (the #2751/#2816 shape); the
+                    // local computed-getter path did not, so `f()?.P` leaked and
+                    // the destructor never ran — MEASURED on the base.
+                    //
+                    // The registration sits INSIDE the non-null arm (as in the
+                    // imported sibling): §7.5 evaluates the member only when the
+                    // receiver is non-null, and the slot is null-initialised, so
+                    // the null arm owns nothing and the unwind pass skips it.
+                    llvm::AllocaInst* ncRecvUnwind =
+                        registerFreshNewReceiverTempUnwind(
+                            nm->target.get(), obj, ctx_.exprType(e),
+                            /*calleeReturnsOwned=*/false);
                     // Evaluate the getter on the (now known non-null) receiver.
                     auto* ncPd = dynamic_cast<const ast::PropertyDecl*>(
                         ncPropSym->decl);
@@ -6190,6 +6209,18 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         ncAccessVal =
                             builder_.CreateInsertValue(ncAccessVal, ncRaw, {1u});
                     }
+                    // fix #8398 (§28.3.1 K8.1 / §28.3.11, v0.357): the NORMAL
+                    // edge of the `?.` receiver temporary's disposal — the same
+                    // reclaim the `.` form's member read performs, right after
+                    // the access (the access is the receiver's last use). It
+                    // disposes the receiver's destructor and reclaims its block,
+                    // and discharges the unwind-only entry at RUNTIME (the slot
+                    // is nulled), so the normal edge and the exception edge can
+                    // never both fire — exactly once on every path.
+                    if (!diverged_)
+                        disposeFreshNewReceiverTemp(
+                            nm->target.get(), obj, ctx_.exprType(e),
+                            /*calleeReturnsOwned=*/false, ncRecvUnwind);
                     auto* ncAccessEnd = builder_.GetInsertBlock();
                     builder_.CreateBr(ncEndBB);
                     builder_.SetInsertPoint(ncEndBB);
@@ -6421,6 +6452,16 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             obj, llvm::ConstantPointerNull::get(ptrTy()));
                         builder_.CreateCondBr(ncVIsNull, ncVEndBB, ncVAccessBB);
                         builder_.SetInsertPoint(ncVAccessBB);
+                        // fix #8398 (§28.3.1 K8.1 / §28.3.11, v0.357): the `?.`
+                        // RECEIVER of a virtual / interface property read is an
+                        // unbound owned temporary when it is a fresh owned
+                        // producer — `f()?.VProp`. Same obligation, same two
+                        // channels, as the computed-getter and storage-member
+                        // siblings above.
+                        llvm::AllocaInst* ncVRecvUnwind =
+                            registerFreshNewReceiverTempUnwind(
+                                nm->target.get(), obj, ctx_.exprType(e),
+                                /*calleeReturnsOwned=*/false);
                         // Dispatch through the vtable/itable slot — SAME logic
                         // as lowerVirtualPropertyGet's core dispatch.
                         auto* ncVFnTy = llvm::FunctionType::get(
@@ -6494,6 +6535,17 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             ncVAccessVal = builder_.CreateInsertValue(
                                 ncVAccessVal, ncVRaw, {1u});
                         }
+                        // fix #8398 (§28.3.1 K8.1 / §28.3.11, v0.357): the
+                        // NORMAL edge of the `?.` receiver temporary's disposal
+                        // — the same reclaim the `.` form's member read
+                        // performs, right after the access (the access is the
+                        // receiver's last use), with the unwind-only entry
+                        // discharged at RUNTIME so the two edges cannot both
+                        // fire.
+                        if (!diverged_)
+                            disposeFreshNewReceiverTemp(
+                                nm->target.get(), obj, ctx_.exprType(e),
+                                /*calleeReturnsOwned=*/false, ncVRecvUnwind);
                         auto* ncVAccessEnd = builder_.GetInsertBlock();
                         builder_.CreateBr(ncVEndBB);
                         builder_.SetInsertPoint(ncVEndBB);
@@ -6609,6 +6661,26 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             obj, llvm::ConstantPointerNull::get(ptrTy()));
         builder_.CreateCondBr(isNull, endBB, accessBB);
         builder_.SetInsertPoint(accessBB);
+        // fix #8398 (§28.3.1 K8.1 / §28.3.11, v0.357): the `?.` RECEIVER of a
+        // storage-member read is an unbound owned temporary when it is a fresh
+        // owned producer — `f()?.Field`. §28.3.11 lists "a member or index
+        // access" among the BORROWING USES that leave a fresh owned producer
+        // owned by nobody, and K8.1 disposes it at the end of the full
+        // expression. MEASURED on the base: `f()?.Field` printed no `close`
+        // while the `.` twin `f().Field` printed one.
+        //
+        // The registration sits INSIDE the non-null arm (as in the imported-
+        // getter sibling above): §7.5 evaluates the member only when the
+        // receiver is non-null, and the slot is null-initialised, so the null
+        // arm owns nothing and the unwind pass skips it.
+        //
+        // A STRING receiver is unaffected: the shared predicate requires a heap
+        // CLASS producer, and a `string` producer is not one (the `?.Length` /
+        // `?.IsEmpty` / `?.IsAscii` arms below keep their own #5290 string
+        // release).
+        llvm::AllocaInst* ncRecvUnwind = registerFreshNewReceiverTempUnwind(
+            nm->target.get(), obj, ctx_.exprType(e),
+            /*calleeReturnsOwned=*/false);
         llvm::Value* val;
         if (stringLength) {
             llvm::Value* len64 = loadStringLen(obj);
@@ -6662,6 +6734,17 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
             accessVal = builder_.CreateInsertValue(accessVal, val, {1u});
         }
+        // fix #8398 (§28.3.1 K8.1 / §28.3.11, v0.357): the NORMAL edge of the
+        // `?.` receiver temporary's disposal — the same reclaim the `.` form's
+        // member read performs, right after the access (the access is the
+        // receiver's last use). It disposes the receiver's destructor and
+        // reclaims its block, and discharges the unwind-only entry at RUNTIME
+        // (the slot is nulled), so the normal edge and the exception edge can
+        // never both fire — exactly once on every path.
+        if (!diverged_)
+            disposeFreshNewReceiverTemp(nm->target.get(), obj, ctx_.exprType(e),
+                                        /*calleeReturnsOwned=*/false,
+                                        ncRecvUnwind);
         auto* accessEnd = builder_.GetInsertBlock();
         builder_.CreateBr(endBB);
         builder_.SetInsertPoint(endBB);
