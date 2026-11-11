@@ -1718,8 +1718,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* dv = builder_.CreateLoad(
             decimalStructType(), slot, "decpon.v");
         // The nullable primitive companion struct {i8 hasVal, decimal value}
-        // (stdlib §17.11 / §9.3): the null arm is {0, 0} and the present arm
-        // is {1, the parsed decimal}.
+        // (spec §7.2 / stdlib §9.3): the null arm is {0, 0} and the present
+        // arm is {1, the parsed decimal}.
         llvm::StructType* st = nullablePrimStructTy(P::Decimal);
         llvm::Value* nullV = llvm::ConstantAggregateZero::get(st);
         llvm::Value* wrapV = wrapNullablePrim(P::Decimal, dv);
@@ -2614,7 +2614,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* parsedVal = nullptr;
         llvm::Value* ok = emitFpParse(win.data, parsedVal);
         // The nullable primitive companion struct {i8 hasVal, T value}
-        // (stdlib §17.11 / §9.2): the null arm is {0, 0.0} and the present
+        // (spec §7.2 / stdlib §9.2): the null arm is {0, 0.0} and the present
         // arm is {1, the parsed value}.
         llvm::StructType* st = nullablePrimStructTy(pt);
         llvm::Value* nullV = llvm::ConstantAggregateZero::get(st);
@@ -2832,7 +2832,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* parsedVal = nullptr;
         llvm::Value* ok = emitIntTowerParse(win.data, parsedVal);
         // The nullable primitive companion struct {i8 hasVal, T value}
-        // (stdlib §17.11 / §9.1): the null arm is {0, 0} and the present
+        // (spec §7.2 / stdlib §9.1): the null arm is {0, 0} and the present
         // arm is {1, the parsed value}.
         llvm::StructType* st = nullablePrimStructTy(pt);
         llvm::Value* nullV = llvm::ConstantAggregateZero::get(st);

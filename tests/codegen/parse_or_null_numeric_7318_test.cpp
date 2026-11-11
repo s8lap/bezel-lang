@@ -180,11 +180,14 @@ std::string wantSplit(const std::vector<std::string>& admitted,
 //                                 whitespace tolerance"; the strict-fault model)
 //   5. an OUT-OF-RANGE one     -> null (Parse would raise ParseRangeException,
 //                                 an OverflowException)
+//
+// The `long` list is the ONE exception: it carries the first FOUR shapes
+// only.  Its out-of-range cell belongs to #8540 (see the row below).
 // ---------------------------------------------------------------------------
 const std::vector<std::string> kIntInputs = {
     "42", "abc", "", " 42", "2147483648"};
 const std::vector<std::string> kLongInputs = {
-    "42", "abc", "", " 42", "9223372036854775808"};
+    "42", "abc", "", " 42"};
 const std::vector<std::string> kDoubleInputs = {
     "1.5", "abc", "", " 1.5", "1e999"};
 const std::vector<std::string> kFloatInputs = {
@@ -312,24 +315,32 @@ BEZEL_TEST(parse_or_null_7318, int_matrix) {
                              "null/False", "null/False"}));
 }
 
-// stdlib §9.1 — long.  The fifth cell is the 64-bit width's OUT-OF-RANGE
-// input, and it is "some/True" — NOT "null/False" — because the 64-bit
-// widths' `Parse`/`TryParse` arms SATURATE there instead of raising
-// (MEASURED on the base compiler: `long.Parse("9223372036854775808")` returns
-// 9223372036854775807 and does not raise, and `long.TryParse` of the same
-// input returns true).  The *OrNull tier's rule is stdlib §1's "null exactly
-// where its `Parse` would raise", so on this input `Parse` does NOT raise
-// and `ParseOrNull` therefore agrees with it (the *OrNull tier and the Try
-// form agree on EVERY input by construction — that is the point of sharing
-// one parse check).  The saturation itself is a pre-existing gap in the
-// 64-bit `Parse`/`TryParse` arms (stdlib §9.1 says an out-of-range value
-// raises ParseRangeException); it is NOT this issue's scope and is reported
-// in the handback rather than changed here.
+// stdlib §9.1 — long.  The FOUR cells here are the valid / invalid / empty /
+// whitespace shapes.
+//
+// The 64-bit width's OUT-OF-RANGE shape is NOT pinned here, and that is
+// deliberate.  stdlib §9.1 says an out-of-range value raises
+// ParseRangeException, so the §1 `*OrNull` tier's rule ("null exactly where
+// its `Parse` would raise") makes `ParseOrNull` NULL on an out-of-range
+// 64-bit input.  But the 64-bit widths' `Parse`/`TryParse` arms SATURATE
+// there instead of raising (MEASURED on the base compiler:
+// `long.Parse("9223372036854775808")` returns 9223372036854775807 and does
+// not raise, and `long.TryParse` of the same input returns true), so the
+// *OrNull tier — which shares the ONE parse check with its Try sibling —
+// currently returns the SATURATED value there, NOT null.
+//
+// That saturation is a pre-existing defect in the 64-bit `Parse`/`TryParse`
+// arms, filed as #8540 and OUT of this issue's scope: the case belongs to
+// #8540's fix.  Pinning the saturated value here would freeze the wrong
+// answer as if it were the specified one, and pinning null would fail
+// against the compiler as it stands — so the out-of-range cell is left
+// out of this row until #8540 makes the 64-bit arms raise, at which point
+// #8540's own fix re-adds it (as "null/False") with the rest.
 BEZEL_TEST(parse_or_null_7318, long_matrix) {
     expectOutput(matrixProg("long", kLongInputs),
                  wantMatrix(kLongInputs,
                             {"some/True", "null/False", "null/False",
-                             "null/False", "some/True"}));
+                             "null/False"}));
 }
 
 // stdlib §9.2 — double: "1e999" spells a finite number that is not
