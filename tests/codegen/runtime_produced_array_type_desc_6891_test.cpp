@@ -80,7 +80,8 @@ BEZEL_TEST(codegen_runtime_produced_array_type_desc_6891, distinct_toarray_8_5_1
 BEZEL_TEST(codegen_runtime_produced_array_type_desc_6891, readalllines_8_5_12_7) {
     BEZEL_EXPECT_EQ(out(runAot(prog(
         "var p := \"/var/tmp/bezel-scratch/r34-6891/rows_readalllines.txt\"; "
-        "File.WriteAllLines(p, [\"p\", \"q\"]); "
+        "var lines: Array<string> := [\"p\", \"q\"]; "
+        "File.WriteAllLines(p, lines); "
         "var a := File.ReadAllLines(p); Show(a); File.Delete(p);"))),
         std::string(kStr));
 }

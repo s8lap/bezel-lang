@@ -8145,6 +8145,37 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             }
         }
     }
+    // fix #8390 (§15.4, v0.357; stdlib §7.3): the same refusal for the
+    // built-in `File.WriteAllLines(path, lines)`, whose declared parameter is
+    // `IEnumerable<string>` and which carries no MethodSymbol. A collection
+    // literal has no standalone type and §15.4's target list names no
+    // interface, so a literal there is ill-formed; before this it was accepted
+    // and the call created no file. (The `IEnumerable<T>` extension members
+    // Concat/Union/Intersect/Except/Zip are not covered here: #8450.)
+    // A typed binding (`var xs: Array<string> := [...]`) is unaffected.
+    if (!ctx_.exprSymbol(*ce.callee)) {
+        if (auto* bma =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+            const auto& mm = bma->member;
+            if (mm == "WriteAllLines" && ce.args.size() == 2 &&
+                ce.args[1].value && bma->target) {
+                auto* tid =
+                    dynamic_cast<const ast::IdentifierExpr*>(bma->target.get());
+                // `File` names the built-in class (a TypeSymbol with no
+                // AST declaration), not a user type that shadows it.
+                Symbol* headSym = tid ? ctx_.exprSymbol(*bma->target) : nullptr;
+                auto* headTy = dynamic_cast<TypeSymbol*>(headSym);
+                if (tid && tid->name == "File" &&
+                    (!headSym || (headTy && !headTy->decl)) &&
+                    dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        ce.args[1].value.get())) {
+                    reportCollectionLiteralInterfaceTarget(
+                        ctx_.diagnostics(), ce.args[1].value->span.begin,
+                        "IEnumerable<string>");
+                }
+            }
+        }
+    }
     // §5.2: an explicit conversion `int(x)` — the callee is a primitive
     // type name with no symbol. The call's type is that primitive type.
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get())) {
