@@ -297,6 +297,30 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
                      r->getType()->isFloatingPointTy()))
                     r = coerceNumericToType(r, primVal->getType(),
                                             isUnsignedTargetExpr(*bin.right));
+                // fix #6677 (§7.7 / §5.1 "Nullable conversions", v0.357): a
+                // NULLABLE right operand of a different payload type
+                // (`long? ?? int?`). §7.7, verbatim: "the right operand must
+                // be implicitly convertible (§5.1) to `T` or to `T?`; the
+                // result type is `T` when the right operand is non-nullable
+                // and `T?` when it is nullable"; §5.1, verbatim: "`S?`
+                // implicitly converts to `T?` whenever `S` implicitly
+                // converts to `T` — a present value converts by the
+                // underlying conversion, `null` converts to `null`". The
+                // three coercions above convert only a BARE right operand,
+                // so an `{i8, i32}` carrier reached the `i64`-payload PHI
+                // below as it was: the #1104 test (`r` IS the left's carrier
+                // type) failed, the PHI was built at the bare payload type
+                // with a struct incoming, and bezelc died (SIGSEGV, or "PHI
+                // node operands are not the same type as the result!").
+                // liftNullableValueToSlot is §5.1's lift — the same
+                // unwrap/convert/rewrap `:=` and `??=` use (#5017, #5078):
+                // the payload converts by the source's own signedness and
+                // hasValue is carried through. It returns `r` unchanged for
+                // a bare scalar, a pointer and a carrier already of the
+                // left's type, so the arms around it are unaffected.
+                if (!rhsDiv)
+                    r = liftNullableValueToSlot(
+                        r, coalNullableTy, isUnsignedTargetExpr(*bin.right));
                 // #6676 (§7.7, v0.339): a `null` right operand is a nullable
                 // right operand, so the result is `T?`. The literal lowers to
                 // a null pointer; give it the null form of the `{i8, T}`
