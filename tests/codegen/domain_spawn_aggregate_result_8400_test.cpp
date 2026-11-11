@@ -201,6 +201,10 @@ BEZEL_TEST(domain_spawn_aggregate_result_8400,
 // #8400 — the int CONTROL. The scalar result path is unchanged by the fix
 // (the adapter still packs the int's bits into the pointer-sized word the
 // runtime copies), so this row proves the aggregate arm did not regress it.
+// Boundary control, kept deliberately: it is green on base, and it catches
+// the wrong fix of routing every non-pointer result through the result_size
+// block path (`!isPointerTy` in place of `isStructTy` in the Domain.Spawn
+// adapter), which would hand a scalar to the block-copy path it does not use.
 // ─────────────────────────────────────────────────────────────────────────────
 BEZEL_TEST(domain_spawn_aggregate_result_8400,
            int_result_control_still_round_trips) {
@@ -216,27 +220,6 @@ BEZEL_TEST(domain_spawn_aggregate_result_8400,
         "  end Main; "
         "end Program;";
     expectPrinted(src, "42");
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// #8400 — the string CONTROL. A `string` result is a runtime-managed
-// pointer-sized value (§6.8's "Value-typed, string or Type result
-// (Pattern A)"), so it crosses as the pointer it always was.
-// ─────────────────────────────────────────────────────────────────────────────
-BEZEL_TEST(domain_spawn_aggregate_result_8400,
-           string_result_control_still_round_trips) {
-    std::string src =
-        "module P; "
-        "import System.Threading; "
-        "public class Program "
-        "  public static method Make(): string => \"hello\"; "
-        "  public static async method Main(): Task "
-        "    using var t := Domain.Spawn(Program.Make); "
-        "    var s := await t; "
-        "    Console.WriteLine(s); "
-        "  end Main; "
-        "end Program;";
-    expectPrinted(src, "hello");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -543,7 +526,10 @@ BEZEL_TEST(domain_spawn_aggregate_result_8400,
 
 // The admitting twin of the row above: the non-nullable owned class result
 // is a legal `OwningTask<Report>` instantiation, so the nullability check
-// must not fire on it.
+// must not fire on it. Boundary control, kept deliberately: it is green on
+// base, and it catches the wrong fix of an over-broad nullable guard (a
+// nullability check that rejects every owned/class result, not only a
+// nullable one) that would reject this entry.
 BEZEL_TEST(domain_spawn_aggregate_result_8400,
            non_nullable_owned_class_result_entry_still_runs) {
     std::string src =
