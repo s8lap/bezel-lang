@@ -240,7 +240,14 @@ BEZEL_TEST(runtime_current_domain_713, domain_spawn_join_task_routes_correctly) 
                 return nullptr;
             },
             nullptr,
-            nullptr  // no DomainFaultedException vtable
+            nullptr,  // no DomainFaultedException vtable
+            // fix #8400 (§35.12 / §30.14 / stdlib §6.8, v0.357): the result
+            // SIZE the runtime copies into the join task's result buffer.
+            // 0 = the long-standing ptr-sized contract — the entry's void*
+            // return IS the result (null here). A non-zero size is the
+            // AGGREGATE-result contract: the entry's void* return is the
+            // address of a block holding the result's bytes.
+            0
         );
         // Synchronously wait for the child domain to finish.
         bz_task_await_sync(join);

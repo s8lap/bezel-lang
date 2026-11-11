@@ -7942,6 +7942,31 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                                 wide = builder_.CreateZExt(wide, i64());
                             builder_.CreateRet(
                                 builder_.CreateIntToPtr(wide, ptrTy()));
+                        } else if (lamRet->getType()->isStructTy()) {
+                            // fix #8400 (§35.12 / §30.14 / stdlib §6.8,
+                            // v0.357): an AGGREGATE result — a sendable record
+                            // or a value-like choice — crosses as a COPY of
+                            // the value itself. The pre-fix code bitcast it
+                            // (`Invalid bitcast` on `%record.Pt`), so a
+                            // lambda entry returning a record did not compile.
+                            // Same shape as the static-method adapter's
+                            // aggregate arm below: heap-copy the value into a
+                            // block, return the block's ADDRESS, and let
+                            // `bz_domain_spawn`'s `result_size` copy the
+                            // value's bytes into the join task's result
+                            // buffer.
+                            uint64_t aggBytes = module_->getDataLayout()
+                                                    .getTypeAllocSize(
+                                                        lamRet->getType());
+                            auto* aggMalloc =
+                                declareC("malloc", ptrTy(), {i64()});
+                            llvm::Value* aggCell = builder_.CreateCall(
+                                aggMalloc,
+                                {builder_.getInt64((int64_t)aggBytes)},
+                                "spawn.lam.ret.cell");
+                            builder_.CreateStore(lamRet, builder_.CreateBitCast(
+                                aggCell, lamRet->getType()->getPointerTo()));
+                            builder_.CreateRet(aggCell);
                         } else {
                             // Floating-point / other value result: reinterpret
                             // the bits as i64, then inttoptr (the join reads the
@@ -8023,12 +8048,22 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                         spawnArg = arr;
                     }
 
-                    // 5. bz_domain_spawn(adapter, spawnArg, dfe_vtable).
+                    // 5. bz_domain_spawn(adapter, spawnArg, dfe_vtable,
+                    //    result_size).
                     auto* spawnFn = declareC("bz_domain_spawn", ptrTy(),
-                                             {ptrTy(), ptrTy(), ptrTy()});
+                                             {ptrTy(), ptrTy(), ptrTy(), i64()});
+                    // fix #8400 (§35.12 / §30.14 / stdlib §6.8, v0.357): the
+                    // aggregate result's byte size (0 = the ptr-sized
+                    // contract) — see the static-method call site below.
+                    llvm::Value* spawnResultSize = builder_.getInt64(0);
+                    if (lamRetTy->isStructTy()) {
+                        spawnResultSize = builder_.getInt64((int64_t)
+                            module_->getDataLayout().getTypeAllocSize(
+                                lamRetTy));
+                    }
                     return builder_.CreateCall(
                         spawnFn,
-                        {adapter, spawnArg, getDFEVtable()},
+                        {adapter, spawnArg, getDFEVtable(), spawnResultSize},
                         "domain.spawn");
                 }
                 return nullptr;
@@ -8161,6 +8196,34 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                     builder_.CreateRet(llvm::ConstantPointerNull::get(ptrTy()));
                 } else if (origFn->getReturnType()->isPointerTy()) {
                     builder_.CreateRet(ret);
+                } else if (ret->getType()->isStructTy()) {
+                    // fix #8400 (§35.12 / §30.14 / stdlib §6.8, v0.357): an
+                    // AGGREGATE result — a sendable record or a value-like
+                    // choice (`Result<T, E>`) — crosses as a COPY of the
+                    // value itself (§30.14: "A sendable value crosses as a
+                    // copy"). The pre-fix code zext'd it
+                    // (`ZExt only operates on integer` — an IR-verification
+                    // abort on `%record.Pt` / `%"choice.Result$spec0"`), so
+                    // such an entry did not compile at all.
+                    //
+                    // The adapter heap-copies the value into a block and
+                    // returns the block's ADDRESS; `bz_domain_spawn`'s
+                    // `result_size` (the byte size of the value) tells the
+                    // runtime to copy the block's BYTES into the join task's
+                    // result buffer (and free the block), so the await site
+                    // reads the aggregate back as the type it is — the same
+                    // shape an ordinary async method's result takes
+                    // (`emitAsyncComplete` spills the value and completes
+                    // the task with `getTypeAllocSize`), not as a pointer.
+                    uint64_t aggBytes = module_->getDataLayout()
+                                            .getTypeAllocSize(ret->getType());
+                    auto* aggMalloc = declareC("malloc", ptrTy(), {i64()});
+                    llvm::Value* aggCell = builder_.CreateCall(
+                        aggMalloc, {builder_.getInt64((int64_t)aggBytes)},
+                        "spawn.ret.cell");
+                    builder_.CreateStore(ret, builder_.CreateBitCast(
+                        aggCell, ret->getType()->getPointerTo()));
+                    builder_.CreateRet(aggCell);
                 } else {
                     // Value result: inttoptr. fix #3239: the pre-fix code
                     // did `ZExt(ret, i64)` unconditionally for any non-
@@ -8281,9 +8344,23 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             }
 
             auto* spawnFn = declareC("bz_domain_spawn", ptrTy(),
-                                     {ptrTy(), ptrTy(), ptrTy()});
+                                     {ptrTy(), ptrTy(), ptrTy(), i64()});
+            // fix #8400 (§35.12 / §30.14 / stdlib §6.8, v0.357): the result
+            // SIZE the runtime must copy into the join task's result buffer.
+            // 0 = the long-standing ptr-sized contract (a class pointer or the
+            // scalar bits ride in the adapter's void* return). A non-zero
+            // size = the adapter returned the ADDRESS of a block holding the
+            // value's bytes (the aggregate case above), and the runtime
+            // copies those bytes — so the await site reads the aggregate back
+            // as the type it is.
+            llvm::Value* spawnResultSize = builder_.getInt64(0);
+            if (origFn->getReturnType()->isStructTy()) {
+                spawnResultSize = builder_.getInt64((int64_t)
+                    module_->getDataLayout().getTypeAllocSize(
+                        origFn->getReturnType()));
+            }
             return builder_.CreateCall(spawnFn,
-                {adapter, argVal, getDFEVtable()},
+                {adapter, argVal, getDFEVtable(), spawnResultSize},
                 "domain.spawn");
         }
     }

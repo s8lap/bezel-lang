@@ -2265,8 +2265,19 @@ void* bz_channel_recv_all_init(void* ch, void* ioe_vtable, int32_t is_owning);
 // Returns an OwningTask bz_task_t* that completes (with the result pointer)
 // when the spawned domain finishes, or faults with DomainFaultedException.
 // dfe_vtable is the DomainFaultedException vtable global.
+//
+// result_size (fix #8400, §35.12 / §30.14 / stdlib §6.8, v0.357): the byte
+// size of the entry's RESULT.
+//   0 -- the entry's void* return IS the result (a class pointer, or the
+//        scalar bits the adapter packed into the pointer); sizeof(void*) of
+//        it is copied into the task's result buffer.
+//   >0 -- the entry's void* return is the ADDRESS of a block holding the
+//        RESULT's BYTES (an AGGREGATE result -- a sendable record or a
+//        value-like choice -- which §30.14 sends "as a copy"). Those bytes
+//        are copied into the task's result buffer and the block is freed, so
+//        the awaiting domain reads the value back as the type it is.
 void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
-                      void* dfe_vtable);
+                      void* dfe_vtable, int64_t result_size);
 // §2.15 (issue #550): BinarySerializer / BinaryDeserializer — compact binary
 // format for ISerializer / IDeserializer.
 //

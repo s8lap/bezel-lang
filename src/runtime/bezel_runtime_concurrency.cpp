@@ -3851,8 +3851,9 @@ void* bz_channel_recv_all_init(void* chp, void* ioe_vtable, int32_t is_owning) {
 // ---------------------------------------------------------------------------
 // §30.14 (#600 phase c): Domain.Spawn
 //
-// bz_domain_spawn(entry_fn, arg_ptr, dfe_vtable) -- spawn a new domain that
-// runs entry_fn(arg_ptr) and returns an already-allocated join task.
+// bz_domain_spawn(entry_fn, arg_ptr, dfe_vtable, result_size) -- spawn a new
+// domain that runs entry_fn(arg_ptr) and returns an already-allocated join
+// task.
 //
 // entry_fn signature: void* (*)(void*) -- takes the arg pointer, returns
 //   the result pointer (or null for void entry).  The codegen wraps the
@@ -3865,13 +3866,24 @@ void* bz_channel_recv_all_init(void* chp, void* ioe_vtable, int32_t is_owning) {
 // dfe_vtable: DomainFaultedException vtable (injected by codegen; null if
 //   the exception vtable is not available).
 //
+// result_size: the byte size of the entry's RESULT.
+//   0 -- the long-standing ptr-sized contract: the entry's void* return IS
+//        the result (a class pointer, or the scalar bits the adapter packed
+//        into the pointer), and the runtime copies sizeof(void*) of it.
+//   >0 -- fix #8400 (§35.12 / §30.14 / stdlib §6.8, v0.357): the entry's
+//        void* return is the ADDRESS of a block holding the RESULT's BYTES
+//        (an AGGREGATE result -- a sendable record or a value-like choice
+//        -- which §30.14 sends "as a copy").  The runtime copies those bytes
+//        into the join task's result buffer and frees the block, so the
+//        awaiting domain reads the value back as the type it is.
+//
 // Returns: a bz_task_t* join task (OwningTask<R> or OwningTask) that completes
 //   when the spawned domain finishes (or faults).
 // ---------------------------------------------------------------------------
 
 extern "C"
 void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
-                      void* dfe_vtable) {
+                      void* dfe_vtable, int64_t result_size) {
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     if (!g_scheduler) bz_scheduler_init(4);
 
@@ -3892,8 +3904,10 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
         void* (*entry_fn)(void*);
         void*          arg_ptr;
         void*          dfe_vtable;
+        int64_t        result_size;
     };
-    auto* ctx = new SpawnCtx{child_domain, join_task, entry_fn, arg_ptr, dfe_vtable};
+    auto* ctx = new SpawnCtx{child_domain, join_task, entry_fn, arg_ptr,
+                              dfe_vtable, result_size};
     domain_ref(child_domain);  // per fix #632: SpawnCtx holds a ref on child_domain
 
     // Schedule the entry as a continuation on the child domain.
@@ -3943,6 +3957,20 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
                 bz_dispose_class_obj(fault_exc);
             }
             bz_task_complete_error_obj(sc->join_task, dfe_obj);
+        } else if (sc->result_size > 0) {
+            // fix #8400 (§35.12 / §30.14 / stdlib §6.8, v0.357): an
+            // AGGREGATE result (a sendable record or a value-like choice).
+            // The adapter heap-copied the value into a block and returned the
+            // block's ADDRESS; copy the value's BYTES into the join task's
+            // result buffer so the awaiting domain reads the aggregate back
+            // as the type it is (the await site's `CreateLoad(resultTy,
+            // resPtr)`), then free the block. The value's own ownership (a
+            // record's string field) crossed with it: the producing domain
+            // does not release it (§30.14's copy), and the receiving domain
+            // owns it -- the same hand-over the channel's aggregate item
+            // codec performs.
+            bz_task_complete(sc->join_task, result, sc->result_size);
+            free(result);
         } else {
             // Normal completion. result is the ptr-sized result (class ptr or
             // null for void entry).
