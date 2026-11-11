@@ -34,8 +34,10 @@ using bezel::test::runJit;   // retained ONLY for tcs_task_property_bound (see #
 namespace {
 
 // Async TCS value tests — the stricter AOT oracle (real subprocess + ownership
-// pass). Owned locals in an async body must be `using var` (§28.3; #1772 tracks
-// the compiler rejecting the plain-`var` auto-drop the JIT harness let slide).
+// pass). These programs bind their owned locals with `using var`; since fix
+// #1772 a plain `var` owned local in an async body is auto-dropped at scope end
+// as in a synchronous body (§28.3.10, v0.357), so `using var` here is explicit
+// scope-bound disposal, not a requirement.
 int run(const std::string& prog) {
     auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;

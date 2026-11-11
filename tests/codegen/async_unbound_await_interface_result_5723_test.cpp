@@ -44,9 +44,6 @@ constexpr const char* kShapes =
 constexpr const char* kPatternAOwningLocation =
     "awaiting a class-typed `Task<T>` (Pattern A) requires the awaited task to "
     "occupy a syntactically-visible owning location";
-// §28.3: an owned Pattern B result bound to a plain local with no discharge.
-constexpr const char* kDroppedWithoutDisposal =
-    "owned value in `r` would be dropped here without disposal";
 
 std::string program(const std::string& members, const std::string& loopBody) {
     return std::string(kShapes) +
@@ -131,15 +128,19 @@ BEZEL_TEST(async_unbound_await_interface_result_5723,
         "task expression to occupy a syntactically-visible owning location"));
 }
 
-// Pattern B: the unbound `var` must discharge an owned local, as for a class.
+// fix #1772 (FLIPPED from `reject_unbound_var_await_owningtask_iface_30_5`,
+// which asserted the §28.3 "would be dropped here without disposal" reject):
+// Pattern B's plain `var` binding is an owned local that, undischarged,
+// auto-drops at scope exit — §30.5 (v0.357): "A bare `var x := await
+// someTask;` compiles ... an `x` never discharged auto-drops at scope exit with
+// the must-use warning". Looped 60x under runAotChecked (no leak, no UAF of
+// the interface-typed result); 60 * Area() == 240. // per §30.5, §28.3.10 (v0.357)
 BEZEL_TEST(async_unbound_await_interface_result_5723,
-          reject_unbound_var_await_owningtask_iface_30_5) {
-    auto r = runAot(rejectProgram(
+          accept_unbound_var_await_owningtask_iface_auto_dropped_looped_1772) {
+    expectAcceptsAndPrints240(program(
         "public static async method Make(): OwningTask<IShape> "
         "return new Sq(); end Make; ",
-        "var r := await Make(); return r.Area();"));
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kDroppedWithoutDisposal));
+        "var r := await Make(); sum := sum + r.Area();"));
 }
 
 // ---- ACCEPT + RUN: the forms the spec admits stay clean ------------------

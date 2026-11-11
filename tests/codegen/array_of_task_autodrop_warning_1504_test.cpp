@@ -215,36 +215,35 @@ BEZEL_TEST(codegen_array_of_task_autodrop_1504,
     BEZEL_EXPECT_EQ(r.exitCode, 1); // a.Count == 1 (the one Add'd task)
 }
 
-// §28.3 / §28.9 / #1504 (negative control) — a GENUINELY disposable class
-// (a destructor — real cleanup to lose) as a suspend-local crossing an
-// `await` must STAY the hard §28.3 reject: the fix is scoped to §28.9
-// TRIVIAL-dispose suspend-locals (rhsIsDisposableClassType == false); a
-// non-trivial-dispose class suspend-local's frame-teardown gap is a genuine
-// residual leak risk (documented at the SB01-C1/D2 comment site in
-// Ownership.cpp) that this fix must not silently paper over.
+// §28.3 / §28.9 / #1504 / fix #1772 (FLIPPED from
+// `async_suspend_crossing_disposable_class_still_hard_rejected`, which asserted
+// !ran plus a hard "would be dropped here without disposal" error on `r`): a
+// GENUINELY disposable class (a destructor — real cleanup) as a plain-`var`
+// suspend-local crossing an `await` is AUTO-DROPPED at scope end, as it is in
+// a synchronous body — §28.3.10 (v0.357): "The rule is uniform across body
+// kinds". The disposal rides the `using var` scope path (registerUsingDisposal),
+// so it runs on every exit edge. The row now pins that it RUNS, ASan/LSan-clean,
+// and that the destructor ran exactly once (the static counter reads 1 after
+// Work returns). // per §28.3.10, §28.9 (v0.357)
 BEZEL_TEST(codegen_array_of_task_autodrop_1504,
-           async_suspend_crossing_disposable_class_still_hard_rejected) {
-    auto run = runAot(
+           async_suspend_crossing_disposable_class_auto_dropped_1772) {
+    auto run = runAotChecked(
         "module M; "
         "class Resource "
-        "  destructor end destructor; "
+        "  public static n: int := 0; "
+        "  destructor Resource.n := Resource.n + 1; end destructor; "
         "end Resource; "
         "class Program "
-        "  public static async method Main(): Task "
+        "  public static async method Work(): Task "
         "    using var t := Task.Delay(1); "
         "    var r := new Resource(); "
         "    await t; "
+        "  end Work; "
+        "  public static async method Main(): Task<int> "
+        "    await Program.Work(); "
+        "    return Resource.n; "
         "  end Main; "
         "end Program;");
-    bool hardErrorOnR = false;
-    for (const auto& d : run.diagnostics.diagnostics()) {
-        if (d.severity == bezel::Severity::Error &&
-            d.message.find("would be dropped here without disposal") !=
-                std::string::npos &&
-            d.message.find("`r`") != std::string::npos) {
-            hardErrorOnR = true;
-        }
-    }
-    BEZEL_EXPECT_FALSE(run.ran);   // still rejected — no binary
-    BEZEL_EXPECT_TRUE(hardErrorOnR);
+    BEZEL_EXPECT_TRUE(run.ran);        // compiles, ASan/LSan-clean
+    BEZEL_EXPECT_EQ(run.exitCode, 1);  // destructor ran exactly once
 }

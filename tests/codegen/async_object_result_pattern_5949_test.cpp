@@ -30,8 +30,6 @@ constexpr const char* kPatternAOwningLocation =
 constexpr const char* kPatternAResultOwningLocation =
     "reading `.Result` on a class-typed `Task<T>` (Pattern A) requires the "
     "task expression to occupy a syntactically-visible owning location";
-constexpr const char* kDroppedWithoutDisposal =
-    "owned value in `r` would be dropped here without disposal";
 constexpr const char* kPatternBConsumingContext =
     "awaiting an `OwningTask<T>` (Pattern B) must appear in an owned-consuming "
     "context";
@@ -69,12 +67,29 @@ BEZEL_TEST(async_object_result_pattern_5949,
         diagnosticMessageContains(r, kPatternAResultOwningLocation));
 }
 
+// fix #1772 (FLIPPED from `reject_unbound_var_await_owningtask_object_30_5`,
+// which asserted the §28.3 "would be dropped here without disposal" reject):
+// a Pattern B await into a plain `var` is an owned-consuming binding, and §30.5
+// (v0.357) says so directly: "A bare `var x := await someTask;` compiles: `x` is
+// an owned local under the standard §28.3 discharge rules; an `x` never
+// discharged auto-drops at scope exit with the must-use warning". The reject
+// was the async-body-only hard error #1772 removed. Pinned LOOPED (60x) under
+// runAotChecked so a missed drop of the `new Object()` result is an
+// unmissable leak. // per §30.5, §28.3.10 (v0.357)
 BEZEL_TEST(async_object_result_pattern_5949,
-          reject_unbound_var_await_owningtask_object_30_5) {
-    auto r = runAot(src(kOwningMake, "async method Main(): Task<int>",
-                        "var r := await Make(); return 4;"));
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kDroppedWithoutDisposal));
+          accept_unbound_var_await_owningtask_object_auto_dropped_looped_1772) {
+    const std::string s = src(
+        kOwningMake, "async method Main(): Task<int>",
+        "var i: int := 0; var n: int := 0; "
+        "while i < 60 do "
+        "  do var r := await Make(); n := n + 4; end; "
+        "  i := i + 1; "
+        "end while; "
+        "Console.WriteLine(n); return 0;");
+    JitResult r = runAotChecked(s);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("240\n"));
 }
 
 BEZEL_TEST(async_object_result_pattern_5949,

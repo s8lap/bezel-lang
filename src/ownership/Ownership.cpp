@@ -991,11 +991,6 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     if (isAsync_) {
         annotateSuspendLocals(*cfg);
         addCompletionEdges(*cfg);
-        // SB01-C1 (§30.5, v0.190, #1786): record the plain owned task
-        // locals that are borrow-awaited, so the endState gate below auto-drops
-        // them (their ordinary §28.3 scope-end discharge) rather than the
-        // suspend-local hard reject. // per §30.5, §28.3
-        collectBorrowAwaitedOwnedTaskLocals(*cfg);
     }
     FlowState endFlow = runDataflow(*cfg, entry);
     const BlockState& endState = endFlow.locals;
@@ -1679,133 +1674,79 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     }
                 }
             }
-            // §28.12/§30.5 (#1663, v0.184): affine auto-drop for a plain `var`
-            // owned LOCAL in a NON-ITERATOR `async` body whose live range never
-            // crosses an `await`. §28.12's "implicit discharge is synchronous"
-            // settlement makes the auto-drop uniform across body kinds: an owned
-            // local that never reaches a suspension point is created-and-disposed
-            // within a single resume activation — no suspend occurs during its
-            // live range, so task abandonment can never catch it live — and its
-            // scope-end disposal takes the synchronous `Dispose()` path exactly as
-            // the sync case above (registerUsingDisposal → emitDisposals; a plain
-            // `var` is never `await using`, so DisposeAsync is never dispatched,
-            // and the async frame free disposes no locals, so this never doubles
-            // with the §30.5 completion edges). GATED to a local NOT flagged a
-            // suspend-local (suspendLocalDecls_ — a sound over-approximation of
-            // "crosses an await", computed by annotateSuspendLocals): a local that
-            // DOES cross an await stays the §28.3 reject, its frame-teardown
-            // disposal on the §30.5 abandonment edges being a separate piece.
-            // `!sawYield_` keeps async ITERATORS (whose locals are captured into
-            // the iterator frame and disposed at iterator-Dispose) on the reject.
-            // Restricted to the LocalDecl form; an inline `out owned var` in an
-            // async body (ls->decl is an IdentifierExpr, which annotateSuspendLocals
-            // never marks) has no suspend-local signal to gate on, so it keeps the
-            // reject. // per §28.12/§30.5
+            // §28.3 *Auto-drop (affine)* / *Must-use warning*, K3.14, §28.9
+            // (v0.357), fix #1772: affine auto-drop for a plain `var` owned
+            // LOCAL in a NON-ITERATOR `async` body — every such local, whether
+            // or not its live range crosses an `await`. §28.3.10 states the rule
+            // with no body-kind condition ("The rule is uniform across body
+            // kinds"), and §30.5's consumer-side rules say an owned local "keeps
+            // its ordinary §28.3 discharge (auto-drop at scope end)". So an
+            // undischarged plain-`var` owned local here is disposed at its scope
+            // end with the must-use WARNING, exactly as in a synchronous body —
+            // never the hard "would be dropped here without disposal" reject.
             //
-            // SB01-C1/D2 (§30.5, §28.12, v0.190, #1786/#1868): a
-            // plain owned TASK local is exempted from the suspend-local reject
-            // even when it crosses a suspend point — §30.5 admits it
-            // and says it "keeps its ordinary §28.3 discharge (auto-drop at scope
-            // end)", exactly like an admitted `using var` task
-            // suspend-local. Codegen disposes it at scope end via the task path
-            // (bz_task_fire_and_forget, LlvmBackend_Stmts #445), which fires on
-            // EVERY reachable terminal edge: the normal fall-off/return
-            // (emitDisposals), a synchronous throw or faulted-await re-raise
-            // (emitUnwindDisposals), and cancellation — delivered by the runtime
-            // as a FAULT on the awaited task that resumes the frame and unwinds
-            // through emitUnwindDisposals. The frame is only ever freed from
-            // inside its own resume function (emitAsyncComplete / async.fault),
-            // AFTER those disposals, so an owned task suspend-local never needs a
-            // separate frame-teardown "completion edge" disposal — its await-ness
-            // was never the soundness criterion. Two admitting signals:
-            //   • SB01-C1 (#1786): BORROW-AWAITED (borrowAwaitedOwnedTaskDecls_,
-            //     resolving the #1800 alias chain to the minting root).
-            //   • SB01-D2 (#1868): the minting decl ITSELF is an owned task frame
-            //     (declInitializerIsOwnedTaskMint) — this admits the NEVER-awaited
-            //     case too (a dangling owned task held live across a suspend),
-            //     which C1 alone left rejected. Both auto-drop with the must-use
-            //     nudge to `using var`.
-            // A plain owned CLASS suspend-local matches NEITHER and stays the
-            // §28.3 reject (its only disposal is the normal/unwind scope path,
-            // with the genuine frame-teardown gap; remedy: discharge it, or use a
-            // task/`using var`). The only unaddressed leak is a frame ABANDONED
-            // FOREVER (awaited task never completes → resume never re-enters);
-            // that leaks the whole frame and is a pre-existing gap shared by every
-            // suspend-local kind, not one D2 closes from here. // per §30.5, §28.12, §28.3 (v0.190)
+            // Pre-#1772 this arm admitted only a local NOT flagged a
+            // suspend-local (#1663), a task-family local (SB01-C1/D2, #1786 /
+            // #1868) and a borrowing collection of tasks (#1504); a plain owned
+            // CLASS local live across an `await` stayed the reject, on the
+            // ground that its only disposal was the normal / unwind scope path.
+            // That is the same path an admitted `using var` suspend-local takes
+            // (codegen routes `autoDropAtScopeEnd` through registerUsingDisposal,
+            // LlvmBackend_Stmts.cpp), and it covers every edge on which the frame
+            // terminates: the normal fall-off / `return` (emitDisposals), a
+            // synchronous throw or a faulted await's re-raise
+            // (emitUnwindDisposals), and cancellation, which the runtime delivers
+            // as a fault on the awaited task that resumes the frame and unwinds
+            // through the same disposals. The frame is freed only from inside its
+            // own resume function, after those disposals. The owner's ruling on
+            // #1772 (2026-07-24) settles that the task-only admission was a
+            // pre-affine fossil, not a §30.5 carve-out.
+            //
+            // Scope kept as before: `!sawYield_` leaves async ITERATORS (whose
+            // locals are frame-captured and disposed at iterator-Dispose) on the
+            // reject; the `!st.maybeConsumed` and reassignment gates are
+            // unchanged; and only the LocalDecl form is admitted — an inline
+            // `out owned var` in an async body (ls->decl is an IdentifierExpr)
+            // keeps the reject. // per §28.3, §30.5, §28.9
             if (isAsync_ && !sawYield_ && !isDestructor_ &&
                 !st.maybeConsumed &&
                 (reassignedLocals.count(sym) == 0 ||
                  reassignedDropCovered_.count(sym) != 0)) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
-                    // LOCALDECL-ONLY: the async suspend-local twin of the sync gate at :759 --
-                    // same reasoning: this arm only fires for a symbol whose `states_` entry ended
-                    // Owned, and a runtime `const` local's state is never Owned (§21.1's "never-
-                    // owned" binding -- no state transition is ever recorded for LocalConstDecl,
-                    // see visitStmt's LocalConstDecl arm). `ls->decl` here is always a var
-                    // LocalDecl. // per §21.1, #3591
+                    // LOCALDECL-ONLY: the async twin of the sync gate above --
+                    // same reasoning: this arm only fires for a symbol whose
+                    // `states_` entry ended Owned, and a runtime `const` local's
+                    // state is never Owned (§21.1's "never-owned" binding -- no
+                    // state transition is ever recorded for LocalConstDecl, see
+                    // visitStmt's LocalConstDecl arm). `ls->decl` here is always
+                    // a var LocalDecl. // per §21.1, #3591
                     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
-                        // §28.3/§28.11 (#1504): a suspend-local of a
-                        // BORROWING-COLLECTION type (isBorrowingCollectionName-
-                        // Head — Array<T>/Stack<T>/Queue<T>/Set<T>/
-                        // Dictionary<K,V>/LinkedList<T>, §28.11) whose element
-                        // type is Task-family (Task/Task<T>/OwningTask<T>) is
-                        // exempted from the suspend-local reject on the same
-                        // footing as SB01-C1/D2's bare-Task carve above: per
-                        // §28.11 the collection holds its elements as BORROWS
-                        // and never owns them, so dropping it — crossed-await
-                        // or not — abandons no task obligation, exactly the
-                        // issue's own argument for `Array<Task>`. Narrower
-                        // than a general "any trivial-dispose class" carve on
-                        // purpose: a plain non-collection class with no
-                        // destructor (`class T end T;`) stays the reject (see
-                        // tests/ownership/async_ownership_test.cpp's
-                        // suspend_local_dropped_on_normal_path_diagnosed,
-                        // #1504's negative control in
-                        // array_of_task_autodrop_warning_1504_test.cpp) —
-                        // whether §28.9's "implementation-defined reclaim"
-                        // genuinely carries zero leak risk on a permanently-
-                        // abandoned frame for an arbitrary trivial-dispose
-                        // class, the way it is accepted for Task specifically,
-                        // is a separate, NOT-YET-DECIDED design question this
-                        // fix declines to resolve silently (tracked #2332).
-                        // // per §28.3, §28.11, #1504
-                        bool taskElementBorrowingCollectionSuspendLocal = false;
-                        if (ld->initializer) {
-                            const sema::TypeRef* initTy =
-                                ctx_.exprType(*ld->initializer);
-                            if (initTy &&
-                                initTy->kind == sema::TypeRef::Kind::Named &&
-                                isBorrowingCollectionNameHead(initTy->headName()) &&
-                                !initTy->genericArgs.empty() &&
-                                initTy->genericArgs.back()) {
-                                taskElementBorrowingCollectionSuspendLocal =
-                                    common::isTaskFamilyHead(
-                                        initTy->genericArgs.back()->headName());
-                            }
-                        }
-                        if (suspendLocalDecls_.count(ld) == 0 ||
-                            borrowAwaitedOwnedTaskDecls_.count(ld) != 0 ||
-                            declInitializerIsOwnedTaskMint(ld) ||
-                            taskElementBorrowingCollectionSuspendLocal) {
-                            const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd =
-                                true;
-                            // §29.11 (v0.334): the async twin of the sync
-                            // site's suppression — the body kind does not
-                            // move §29.11's closed suppression set. The
-                            // auto-drop set just above still runs. // per §29.11
-                            if (spentLazyQueryRights.count(sym) != 0) continue;
-                                ctx_.diagnostics().report(
-                                Severity::Warning,
-                                st.obligationOrigin ? st.obligationOrigin->span.begin
-                                                    : SourceLocation{},
-                                std::string("owned value in `") +
-                                std::string(sym->name) +
-                                "` is implicitly disposed at the end of its scope "
-                                "(§28.3 must-use / auto-drop); declare it `using var` to make "
-                                "the scope-bound disposal explicit, or `move` / "
-                                "`return` / `.Dispose()` / `_ := …` to discharge it");
-                            continue;
-                        }
+                        const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd =
+                            true;
+                        // §29.11 (v0.334): the async twin of the sync
+                        // site's suppression — the body kind does not
+                        // move §29.11's closed suppression set. The
+                        // auto-drop set just above still runs. // per §29.11
+                        if (spentLazyQueryRights.count(sym) != 0) continue;
+                        // §28.9 (v0.357) ceremony exemption, the async
+                        // twin of the sync site's `localIsTrivialDispose
+                        // NewBinding` gate: "The §28.3 must-use warning is
+                        // not emitted at the implicit-drop site of a
+                        // plain-`var` owned local ... whose type is
+                        // trivial-dispose". WARNING ONLY — the scope-end
+                        // free armed just above still runs. // per §28.9
+                        if (localIsTrivialDisposeNewBinding(*ld)) continue;
+                            ctx_.diagnostics().report(
+                            Severity::Warning,
+                            st.obligationOrigin ? st.obligationOrigin->span.begin
+                                                : SourceLocation{},
+                            std::string("owned value in `") +
+                            std::string(sym->name) +
+                            "` is implicitly disposed at the end of its scope "
+                            "(§28.3 must-use / auto-drop); declare it `using var` to make "
+                            "the scope-bound disposal explicit, or `move` / "
+                            "`return` / `.Dispose()` / `_ := …` to discharge it");
+                        continue;
                     }
                 }
             }

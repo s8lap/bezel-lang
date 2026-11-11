@@ -15,7 +15,8 @@
 // FIX: the ownership pass (Ownership.cpp endState auto-drop) now flags such a local
 // `autoDropAtScopeEnd` in an async NON-ITERATOR body, gated on it NOT being a
 // suspend-local (annotateSuspendLocals — a sound over-approximation of "crosses an
-// await"). Codegen already routes `autoDropAtScopeEnd` through registerUsingDisposal
+// await"). Fix #1772 (§28.3.10, v0.357) later lifted that gate: a suspend-local
+// is auto-dropped too, on the same path. Codegen already routes `autoDropAtScopeEnd` through registerUsingDisposal
 // (plain `var` ⇒ never `await using` ⇒ synchronous Dispose, never DisposeAsync).
 //
 // FAILS WITHOUT / PASSES WITH: without the fix the R-11 programs below are REJECTED
@@ -117,7 +118,8 @@ BEZEL_TEST(async_auto_drop_sync_dispose_1663, plain_var_after_post_await_branch_
 // the state-machine disposal path and is disposed EXACTLY ONCE — the fix must not
 // perturb it. A `using var` live across an await is frame-spilled and disposed on
 // the final fall-off; net Cell.n == 0, ASan/LSan-clean. (Works with and without the
-// fix — a guard that the auto-drop change is confined to non-suspend locals.)
+// fix. Since fix #1772 the plain-`var` twin below is auto-dropped on this same
+// path.)
 BEZEL_TEST(async_auto_drop_sync_dispose_1663, owned_local_crossing_await_still_disposed_once) {
     auto r = runAotChecked(
         std::string("module M; ") + kCell +
@@ -135,12 +137,16 @@ BEZEL_TEST(async_auto_drop_sync_dispose_1663, owned_local_crossing_await_still_d
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// SOUNDNESS BOUNDARY (§28.3, #1663): a plain undischarged owned local that DOES
-// cross an await is NOT auto-dropped — it stays the hard §28.3 discharge error (its
-// frame-teardown disposal on the §30.5 abandonment edges is a separate piece;
-// auto-dropping it would leak on abandonment). The fix must keep this reject.
-BEZEL_TEST(async_auto_drop_sync_dispose_1663, undischarged_local_crossing_await_still_rejected) {
-    auto r = runAot(
+// fix #1772 (FLIPPED from `undischarged_local_crossing_await_still_rejected`,
+// which asserted hasErrors()): a plain undischarged owned local that DOES cross
+// an await is auto-dropped at scope end like the non-crossing local above —
+// §28.3.10 (v0.357): "The rule is uniform across body kinds"; §30.5: an owned
+// local "keeps its ordinary §28.3 discharge (auto-drop at scope end)". The drop
+// rides the `using var` scope path (the row above, live across the same await),
+// so it covers the same edges. Cell.n == 0 after Work returns: disposed exactly
+// once, ASan/LSan-clean. // per §28.3.10, §30.5 (v0.357)
+BEZEL_TEST(async_auto_drop_sync_dispose_1663, undischarged_local_crossing_await_auto_dropped_1772) {
+    auto r = runAotChecked(
         std::string("module M; ") + kCell +
         "class C "
         "  public static async method Work(): Task "
@@ -149,8 +155,9 @@ BEZEL_TEST(async_auto_drop_sync_dispose_1663, undischarged_local_crossing_await_
         "  end Work; "
         "  public static async method Main(): Task<int> "
         "    await C.Work(); "
-        "    return Cell.n; "
+        "    return Cell.n; "                    // 0 = disposed exactly once
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

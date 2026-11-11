@@ -27,7 +27,8 @@
 // / the async.fault boundary), AFTER those disposals run — there is no runtime
 // path that frees the frame without re-entering the resume function. So an owned
 // task suspend-local needs no separate frame-teardown "completion edge" disposal
-// (unlike a plain owned CLASS suspend-local, which stays the §28.3 reject); its
+// (a plain owned CLASS suspend-local, once the §28.3 reject, is auto-dropped on the
+// same scope path since fix #1772); its
 // await-ness was never the soundness criterion.
 //
 // fail-without/pass-with. Pre-D2 every program below was REJECTED at compile

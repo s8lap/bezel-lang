@@ -15,7 +15,10 @@
 //      NORMAL completion path is the author's obligation and is the same
 //      §28.3 discharge requirement as for a synchronous owned local. So a
 //      suspend-local dropped without discharge on the normal path is
-//      diagnosed; one discharged on every path is clean. An activation-local
+//      auto-dropped at scope end with the §28.3 must-use warning (fix #1772,
+//      §28.3.10 v0.357: "The rule is uniform across body kinds"; no warning
+//      for a §28.9 trivial-dispose `new`); one discharged on every path is
+//      clean. An activation-local
 //      (no await in its live range) behaves exactly as a synchronous owned
 //      local — dropped without discharge it is auto-dropped at scope end with
 //      the §28.3 must-use warning (§28.12 synchronous implicit discharge, v0.184,
@@ -85,15 +88,57 @@ std::string wrap(const std::string& body, const std::string& sig = "M(): Task") 
 // (1) Across-suspend disposal (§30.5 / §30.9).
 // ---------------------------------------------------------------------------
 
-// An owned local whose live range crosses an `await` (a suspend-local) and is
-// dropped on the normal-completion path without discharge is diagnosed — the
-// same §28.3 obligation as a synchronous owned local, now confirmed to apply
-// to async bodies. // per §30.5, §30.9, §28.3
-BEZEL_TEST(async_own_suspend, suspend_local_dropped_on_normal_path_diagnosed) {
+// fix #1772 (FLIPPED from `suspend_local_dropped_on_normal_path_diagnosed`,
+// which asserted hasErrors()): an owned local whose live range crosses an
+// `await` (a suspend-local) and reaches the normal-completion scope end
+// without discharge is AUTO-DROPPED there, exactly as a synchronous owned
+// local — §28.3.10: "The rule is uniform across body kinds" (v0.357). `T` is
+// trivial-dispose (no destructor, no owned fields), so §28.9 also suppresses
+// the must-use warning: no diagnostic at all. The non-trivial twin below
+// carries the warning. // per §28.3.10, §28.9, §30.5 (v0.357)
+BEZEL_TEST(async_own_suspend, suspend_local_dropped_on_normal_path_auto_dropped_1772) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); "
         "await p.MakeUnit(); "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasAutoDropWarning(r, "x"));
+}
+
+// fix #1772: the NON-trivial-dispose twin (a destructor) — no error, and the
+// §28.3 must-use WARNING names the local. Positive control for the row above:
+// the drop site is reached and the lint fires when §28.9 does not exempt it.
+// // per §28.3.10, §28.9 (v0.357)
+BEZEL_TEST(async_own_suspend, nontrivial_suspend_local_dropped_warns_1772) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class D destructor end destructor; end D; "
+        "class C "
+        "  public async method M(): Task "
+        "    var x := new D(); "
+        "    await Task.Delay(1); "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "x"));
+}
+
+// fix #1772: the §28.9 exemption reads the PRODUCED type of a `new` (the
+// sync arm's `localIsTrivialDisposeNewBinding` key), not the declared one: a
+// trivial `Base` declared over a destructor-bearing `Derived` still warns.
+// // per §28.9 (v0.357)
+BEZEL_TEST(async_own_suspend, declared_trivial_over_nontrivial_new_still_warns_1772) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Base end Base; "
+        "class Derived : Base destructor end destructor; end Derived; "
+        "class C "
+        "  public async method M(): Task "
+        "    var b: Base := new Derived(); "
+        "    await Task.Delay(1); "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "b"));
 }
 
 // The same suspend-local discharged on every path (explicit Dispose after the
@@ -124,8 +169,9 @@ BEZEL_TEST(async_own_suspend, using_var_suspend_local_clean) {
 // is synchronous", v0.184, #1663). It never reaches a suspend point, so it is
 // created-and-disposed within one resume activation and is exactly-once-safe;
 // the across-suspend machinery must not convert this into a hard reject (its
-// pre-#1663 behavior). A local that DOES cross an await stays the reject — see
-// suspend_local_dropped_on_normal_path_diagnosed above. // per §28.12, §28.3
+// pre-#1663 behavior). Since fix #1772 a local that DOES cross an await is
+// auto-dropped too — see suspend_local_dropped_on_normal_path_auto_dropped_1772
+// above. // per §28.12, §28.3
 BEZEL_TEST(async_own_suspend, activation_local_drop_auto_dropped_1663) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); "));
@@ -155,20 +201,27 @@ BEZEL_TEST(async_own_suspend, owned_at_await_discharged_in_later_block_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// A suspend-local owned at an await and dropped on the normal path even though
-// control flows through a later block (an if whose arms do not discharge x) is
-// still diagnosed — the completion edges must not MASK the real normal-path
-// leak. The if's branches contain only an unrelated statement, so x is never
-// discharged. // per §30.5, §30.9, §28.3
-BEZEL_TEST(async_own_suspend, owned_at_await_dropped_through_later_block_diagnosed) {
-    auto r = parseAndCheckOwnership(wrap(
-        "var x := new T(); "
-        "await p.MakeUnit(); "
-        "if true then var z := 1; else var z := 2; end; "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(
-        r, "would be dropped here without disposal") ||
-        hasErrorMessage(r, "is implicitly disposed"));
+// fix #1772 (FLIPPED from `owned_at_await_dropped_through_later_block_diagnosed`,
+// which asserted a hard error): a suspend-local owned at an await and never
+// discharged on the normal path, with control flowing through a later block
+// whose arms do not discharge it, reaches the scope end Owned — the completion
+// edges must not MASK that drop site. It is now the §28.3 auto-drop with the
+// must-use warning (a destructor class, so §28.9 does not exempt it), not the
+// reject. The warning assertion is what keeps this row's original purpose: the
+// normal-path drop site is still SEEN. // per §28.3.10, §30.5 (v0.357)
+BEZEL_TEST(async_own_suspend, owned_at_await_dropped_through_later_block_warns_1772) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class D destructor end destructor; end D; "
+        "class C "
+        "  public async method M(): Task "
+        "    var x := new D(); "
+        "    await Task.Delay(1); "
+        "    if true then var z := 1; else var z := 2; end; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "x"));
 }
 
 // ---------------------------------------------------------------------------
@@ -380,8 +433,9 @@ BEZEL_TEST(async_own_patternA, await_value_typed_task_any_position_clean) {
 // borrow-await was one admitting signal; the minting decl itself is the other).
 // This FLIPS the pre-D2 KEEP-REJECT — verified leak-clean under ASan/LSan on the
 // normal, throw, and cancellation edges (async_own_task_across_suspend_1868
-// codegen suite). A plain owned CLASS local across a suspend stays rejected
-// (activation_local_drop / suspend_local_dropped tests). // per §28.3, §30.5, §28.12 (v0.190)
+// codegen suite). Since fix #1772 a plain owned CLASS local across a suspend is
+// auto-dropped as well (plain_owned_class_never_used_across_suspend_auto_dropped_1772
+// below). // per §28.3, §30.5, §28.12 (v0.190)
 BEZEL_TEST(async_own_patternA, plain_owned_task_never_awaited_across_suspend_admitted_1868) {
     auto r = parseAndCheckOwnership(wrap(
         "var t := p.MakeShared(); "
@@ -389,20 +443,20 @@ BEZEL_TEST(async_own_patternA, plain_owned_task_never_awaited_across_suspend_adm
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// SB01-D2 (#1868) companion: a plain owned CLASS local held live across a suspend
-// point is STILL REJECTED — its only disposal is the normal/unwind scope path
-// (the genuine frame-teardown gap a task's fire-and-forget disposal sidesteps),
-// so admitting it would leak on the abandonment edge. Pins that D2 is scoped to
-// TASK-family locals and did not weaken the class-local obligation
-// (declInitializerIsOwnedTaskMint's type gate). // per §28.3, §30.5 (v0.190)
-BEZEL_TEST(async_own_patternA, plain_owned_class_never_used_across_suspend_still_rejected_1868) {
+// fix #1772 (FLIPPED from `plain_owned_class_never_used_across_suspend_still_rejected_1868`,
+// which asserted the hard reject): a plain owned CLASS local held live across a
+// suspend point is auto-dropped at scope end like the task-family local of the
+// row above. Its disposal is the same normal/unwind scope path an admitted
+// `using var` suspend-local takes, so it covers the same edges; the #1772
+// ruling (2026-07-24) settles that the task-only admission was not a §30.5
+// carve-out. `T` is trivial-dispose (§28.9): no warning either.
+// // per §28.3.10, §28.9, §30.5 (v0.357)
+BEZEL_TEST(async_own_patternA, plain_owned_class_never_used_across_suspend_auto_dropped_1772) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); "
         "await p.MakeUnit(); "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(
-        r, "would be dropped here without disposal") ||
-        hasErrorMessage(r, "is implicitly disposed"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasAutoDropWarning(r, "x"));
 }
 
 // SB01-D2 (#1868): a plain owned `OwningTask<T>` (Pattern B) local never awaited
@@ -416,15 +470,18 @@ BEZEL_TEST(async_own_patternA, plain_owned_owningtask_never_awaited_across_suspe
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// SB01-D2 (#1868) IDENTITY GUARD: a USER class literally NAMED `OwningTask` (not
-// a reserved name — §3.4 only reserves primitive aliases) held live across a
-// suspend is STILL REJECTED. The D2 admission keys on builtin-task IDENTITY
-// (declInitializerIsOwnedTaskMint: no user TypeDecl), not on the name-head string
-// alone, so a user type that happens to share the name is an ordinary owned CLASS
-// local and keeps the §28.3 suspend-local reject. Without the identity gate the
-// name-head match would wrongly admit it and leak on the abandonment edge (it has
-// no task fire-and-forget disposal). // per §30.5, §28.3 (v0.190), #1868
-BEZEL_TEST(async_own_patternA, user_class_named_task_across_suspend_still_rejected_1868) {
+// fix #1772 (FLIPPED from `user_class_named_task_across_suspend_still_rejected_1868`,
+// which asserted hasErrors()): a USER class literally NAMED `OwningTask` (not a
+// reserved name — §3.4 only reserves primitive aliases) held live across a
+// suspend is an ordinary owned CLASS local. Pre-#1772 that kept it on the §28.3
+// suspend-local reject, while a builtin task was admitted; since #1772 every
+// plain owned class local is auto-dropped at scope end on the class disposal
+// path, so it compiles. Whether codegen then disposes the user class as a
+// CLASS (and not by the builtin-task path its name collides with) is a
+// separate, pre-existing codegen identity question — it fails the same way for
+// a `using var` and in a synchronous body — #8568.
+// // per §28.3.10, §30.5 (v0.357)
+BEZEL_TEST(async_own_patternA, user_class_named_task_across_suspend_auto_dropped_1772) {
     auto r = parseAndCheckOwnership(
         "module M; import System.Threading; "
         "class OwningTask public method Ping(): int return 1; end Ping; end OwningTask; "
@@ -436,7 +493,7 @@ BEZEL_TEST(async_own_patternA, user_class_named_task_across_suspend_still_reject
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // v0.190 SB-01 GENERIC GUARD (#1801 keying): a call whose DECLARED (pre-
@@ -592,15 +649,19 @@ BEZEL_TEST(async_own_patternB, await_in_bare_expr_position_diagnosed) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// Pattern B: awaiting into a plain `var` binding IS an owned-consuming
-// context (§30.5: `var x := await ...` introduces an owned local), so the
-// await itself is admitted — but the owned local `x` then carries the
-// standard §28.3 discharge obligation and, undischarged, is diagnosed at
-// scope exit. // per §30.5, §28.3
-BEZEL_TEST(async_own_patternB, await_into_plain_var_undischarged_diagnosed) {
+// fix #1772 (FLIPPED from `await_into_plain_var_undischarged_diagnosed`, which
+// asserted hasErrors()): awaiting into a plain `var` binding IS an
+// owned-consuming context, and the owned local `x` then carries the standard
+// §28.3 discharge obligation — which, undischarged, is the scope-end AUTO-DROP,
+// not an error. §30.5 says so in so many words: "A bare `var x := await
+// someTask;` compiles ... auto-drops at scope exit with the must-use warning".
+// (Only the absence of an error is pinned: `Conn` is trivial-dispose, and
+// whether §28.9's produced-type key reaches an await producer is not this
+// row's subject.) // per §30.5, §28.3.10 (v0.357)
+BEZEL_TEST(async_own_patternB, await_into_plain_var_undischarged_auto_dropped_1772) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := await p.MakeOwned(); "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // Pattern B: awaiting into a plain `var` that IS discharged is clean — the
