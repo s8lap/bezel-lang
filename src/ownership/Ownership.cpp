@@ -16,6 +16,7 @@
 #include "common/OwnershipFacts.hpp"   // #1414 stage 4: shared ownership-facts core
 #include "common/PatternAResultCollection.hpp"  // fix #4338: isPatternAResultCollectionHead
 #include "flow/CFG.hpp"
+#include "ownership/FieldWriteUse.hpp"  // fix #7976: the §28.7 dominated-use check
 #include "ownership/OwnershipState.hpp"
 #include "ownership/StmtWalker.hpp"  // fix #3565: forEachNestedStmt — the
                                      // single statement grammar (#3656)
@@ -19301,6 +19302,33 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
 static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
                             const ast::TypeDecl* enclosingType,
                             const ast::ExtensionDecl* enclosingExtension) {
+    // fix #7976 (§28.7 *Use after a dominating field write*, v0.357): a use
+    // of a local borrow of an owned field's value that a disposing write of
+    // the field dominates. A standalone pass over each block body (a
+    // block-bodied lambda inside one included) — see
+    // Ownership_FieldWriteUse.cpp. An operator's operands and an
+    // `Equals(T)` parameter may bind the caller's storage (§7.4 *Stable
+    // locals*), so a parameter is not a path root in those bodies.
+    if (auto* fmd = dynamic_cast<const ast::MethodDecl*>(&m)) {
+        if (fmd->bodyKind == ast::MethodBodyKind::Block)
+            checkUseAfterDominatingFieldWrite(
+                fmd->stmts, ctx, /*allowParamRoots=*/fmd->name != "Equals");
+    } else if (auto* fcd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
+        checkUseAfterDominatingFieldWrite(fcd->body, ctx,
+                                          /*allowParamRoots=*/true);
+    } else if (auto* fdd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
+        checkUseAfterDominatingFieldWrite(fdd->body, ctx,
+                                          /*allowParamRoots=*/true);
+    } else if (auto* fod = dynamic_cast<const ast::OperatorDecl*>(&m)) {
+        if (fod->bodyKind == ast::MethodBodyKind::Block)
+            checkUseAfterDominatingFieldWrite(fod->stmts, ctx,
+                                              /*allowParamRoots=*/false);
+    } else if (auto* fpd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
+        for (const auto& acc : fpd->accessors)
+            if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block)
+                checkUseAfterDominatingFieldWrite(acc.stmts, ctx,
+                                                  /*allowParamRoots=*/true);
+    }
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
         // fix #7968 (§26.7 / §28.3 / §28.9, v0.355): an EXTENSION body may
         // not store its receiver. §26.7: "The receiver is always a borrow;

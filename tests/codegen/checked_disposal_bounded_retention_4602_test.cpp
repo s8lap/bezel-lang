@@ -334,6 +334,17 @@ BEZEL_TEST(codegen_checked_disposal_bounded_retention_4602,
     // §28.7 / K5.6: fields are not frozen; the displaced value is disposed at
     // the overwrite and a surviving borrow of it faults. A field release keeps
     // the quarantine in layer 1.
+    //
+    // fix #7976 (§28.7 *Use after a dominating field write*, v0.357): the
+    // write is CONDITIONAL here. The unconditional form this row used to
+    // carry (`var b := _w; _w := new Widget(); … b.Ping()`) is now the
+    // compile error that paragraph states — the write dominates the use with
+    // nothing between the borrow and the write — so it can no longer reach
+    // the backstop. "A write on only some paths to the use" is the first
+    // entry of the paragraph's residual list, which "stay[s] under the
+    // runtime-checked posture": with `swap` true the overwrite runs and the
+    // surviving borrow faults exactly as before. The assertions are
+    // unchanged.
     const std::string src =
         "module M;\n"
         "public class Widget\n"
@@ -348,9 +359,11 @@ BEZEL_TEST(codegen_checked_disposal_bounded_retention_4602,
         "  public constructor()\n"
         "    _w := new Widget();\n"
         "  end constructor;\n"
-        "  public method Replace()\n"
+        "  public method Replace(swap: bool)\n"
         "    var b := _w;\n"
-        "    _w := new Widget();\n"
+        "    if swap then\n"
+        "      _w := new Widget();\n"
+        "    end if;\n"
         "    try\n"
         "      Console.WriteLine(b.Ping());\n"
         "    catch\n"
@@ -361,7 +374,7 @@ BEZEL_TEST(codegen_checked_disposal_bounded_retention_4602,
         "public class Program\n"
         "  public static method Main()\n"
         "    using var h := new Holder();\n"
-        "    h.Replace();\n"
+        "    h.Replace(true);\n"
         "  end Main;\n"
         "end Program;\n";
     expectEscapedFaults(src);

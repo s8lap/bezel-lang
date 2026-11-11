@@ -484,6 +484,7 @@ add_library(bezel_core STATIC
     src/ownership/Ownership.cpp
     src/ownership/Ownership_Checks.cpp
     src/ownership/Ownership_Extension.cpp
+    src/ownership/Ownership_FieldWriteUse.cpp
     src/codegen/CodeGen.cpp
     src/codegen/LlvmBackend.cpp
     src/codegen/LlvmBackend_Setup.cpp
