@@ -50,15 +50,18 @@
 // the sanitizer is a real net for it and not a formality: with the fix the
 // comparator reads the element at its own width, and the read is in bounds.
 //
-// THE CONTROLS pin what the fix must NOT disturb: an `int` element (whose
-// order the pre-fix comparator already got right — for every pair whose
-// i32 DIFFERENCE does not overflow; the extremes are pinned as a wrong-order
-// row of their own), a `string` element (the
-// ordinal `bz$strcmp` arm — stdlib §9.6), a `char` element (stdlib §9.5) and a
-// `float` element (stdlib §9.2).  `bool` (stdlib §9.4 declares
-// `public record Boolean: IEquatable<bool>` — NO `IComparable`) and `Object`
-// (stdlib §8.1) stay REFUSED: they are the admitting twins of the six newly
+// THE CONTROLS pin what the fix must NOT disturb.  Only two are gtest rows
+// (owner rule, 2026-11-12: a base-green row is a gtest row only where a corpus
+// case cannot express the check; at most two per suite, each named with the
+// wrong fix it would catch).  An `int` element, whose order the pre-fix
+// comparator already got right for every pair whose i32 DIFFERENCE does not
+// overflow (the extremes are pinned as a wrong-order row of their own).  `bool`
+// (stdlib §9.4 declares `public record Boolean: IEquatable<bool>` — NO
+// `IComparable`) stays REFUSED: it is the admitting twin of the six newly
 // admitted primitives, and the family must agree on which primitives conform.
+// The `string`, `char`, `float` and `Object` controls are decided by spec
+// §14.2 clause 5 and the stdlib declarations, and are corpus candidates (R42
+// harvest), not gtest rows here.
 //
 // ONE ROW IS A BEHAVIOUR FLIP, not a fix row: `Array<int?>.Sort()` was
 // ADMITTED before this fix (the primitive arm of the gate ignored
@@ -250,10 +253,12 @@ BEZEL_TEST(array_sort_primitive_order_8467, sorted_copy_form_uint_is_admitted_an
         std::string("1 2 3 7 4000000000 \n"));
 }
 
-// ── CONTROLS: the shapes the fix must NOT disturb ────────────────────────────
+// ── CONTROLS: the shapes the fix must NOT disturb (two gtest rows) ───────────
 // An `int` element: the pre-fix comparator already ordered it correctly (for
 // every pair whose difference does not overflow — the extremes are pinned as a
-// wrong-order row of their own), and the new one must agree.
+// wrong-order row of their own), and the new one must agree.  It catches a fix
+// that reorders the 32-bit path: a comparator whose sign is inverted sorts
+// [3, 1, 2] to `3 2 1` and goes RED here.
 BEZEL_TEST(array_sort_primitive_order_8467, control_int_sort_still_ordered) {
     BEZEL_EXPECT_EQ(
         outChecked(prog(
@@ -262,51 +267,16 @@ BEZEL_TEST(array_sort_primitive_order_8467, control_int_sort_still_ordered) {
         std::string("1 2 3 \n"));
 }
 
-// A `string` element: stdlib §9.6's ordinal order (the `bz$strcmp` arm).
-BEZEL_TEST(array_sort_primitive_order_8467, control_string_sort_still_ordered) {
-    BEZEL_EXPECT_EQ(
-        outChecked(prog(
-            "var a: Array<string> := [\"pear\", \"apple\", \"fig\", \"Banana\"]; "
-            "a.Sort(); " + printAll("a"))),
-        std::string("Banana apple fig pear \n"));
-}
-
-// A `char` element: stdlib §9.5, an UNSIGNED code point order.
-BEZEL_TEST(array_sort_primitive_order_8467, control_char_sort_still_ordered) {
-    BEZEL_EXPECT_EQ(
-        outChecked(prog(
-            "var a: Array<char> := ['c', 'a', 'Z']; "
-            "a.Sort(); " + printAll("a"))),
-        std::string("Z a c \n"));
-}
-
-// A `float` element: stdlib §9.2 — the IEEE 754 ordered compare, which the
-// pre-fix comparator got right by accident (an i32 read of a float's bit
-// pattern orders a positive float correctly).
-BEZEL_TEST(array_sort_primitive_order_8467, control_float_sort_still_ordered) {
-    BEZEL_EXPECT_EQ(
-        outChecked(prog(
-            "var a: Array<float> := [1.5f, 6.0f, 0.25f, -3.5f]; "
-            "a.Sort(); " + printAll("a"))),
-        std::string("-3.5 0.25 1.5 6 \n"));
-}
-
 // `bool` (stdlib §9.4 declares `public record Boolean: IEquatable<bool>` — NO
 // `IComparable`) stays REFUSED: it is the admitting twin of the six newly
 // admitted primitives, and the family must agree on which primitives conform.
+// It catches a fix that drops the spec §14.2 constraint gate: with the gate
+// gone `bool` is admitted, compiles, and this rejection row goes RED.
 BEZEL_TEST(array_sort_primitive_order_8467, control_bool_sort_is_still_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         prog("var a: Array<bool> := [true, false]; a.Sort(); "),
         "Array<bool>.Sort() requires T: IComparable<T> (spec §14.2, stdlib §4.4, "
         "v0.355); bool does not implement IComparable<bool>"));
-}
-
-// `Object` (stdlib §8.1 lists no interface at all) stays REFUSED.
-BEZEL_TEST(array_sort_primitive_order_8467, control_object_sort_is_still_rejected) {
-    BEZEL_EXPECT_TRUE(rejectsWith(
-        prog("var a: Array<Object> := []; a.Sort(); "),
-        "Array<Object>.Sort() requires T: IComparable<T> (spec §14.2, stdlib §4.4, "
-        "v0.355); Object does not implement IComparable<Object>"));
 }
 
 // THE FLIP: a NULLABLE primitive element is refused, as spec §14.2's
