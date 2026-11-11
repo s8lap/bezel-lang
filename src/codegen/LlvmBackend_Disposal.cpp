@@ -5818,7 +5818,7 @@ bool Emitter::freshNewReceiverTempEligible(const ast::Expr* recvExpr,
     // extracted, when the receiver is a fresh `new`/`owned`-returning producer
     // (#1039/#1053-case-2) and the result cannot alias into it.
     if (!recvExpr || !recvPtr || !resultTy) return false;
-    // fix #8398 (§17.12 / §28.3.1 K8.1 / §28.3.11, v0.357): the receiver may be
+    // fix #8398 (§17.8 / §28.3.1 K8.1 / §28.3.11, v0.357): the receiver may be
     // the NULL-FORGING `!` over a fresh owned producer — `OpenOrNull(n)!.Send(x)`.
     // §17.12: `x!` "raises NullReferenceException if the operand is null,
     // otherwise yields it" — a PASS-THROUGH, so the PRODUCER is the bang's

@@ -18,7 +18,7 @@
 //    after their uses, in reverse production order — on the normal edge as on
 //    the exception edge, where the pass runs during unwinding."
 //
-// §17.12 — the postfix `!` (null-forgiving) is a PASS-THROUGH: it raises
+// §17.8 — the postfix `!` (null-forgiving) is a PASS-THROUGH: it raises
 // `NullReferenceException` when the operand is null and otherwise yields the
 // operand's value. So `f()!.M(x)` PRODUCES the temporary `f()` and USES it as
 // the receiver.
@@ -61,7 +61,7 @@
 //     edges can never both fire: exactly once on every path.
 //
 // The shared eligibility predicate (`Emitter::freshNewReceiverTempEligible`)
-// gained the §17.12 unwrap, so every consumer — the `.`-form call, the
+// gained the §17.8 unwrap, so every consumer — the `.`-form call, the
 // `.`-form member read, the `?.`-form member read — recognises the producer
 // under a `!` at ONE definition, and the `?.`-form call/member-read paths
 // gained the registration/reclaim the `.` form already had.
@@ -175,7 +175,6 @@ BEZEL_TEST(owned_nullcond_receiver_disposal_8398, issue_repro_disposes_both) {
     // The ASan leg: a leak would make the run fail (ran=false). A double
     // dispose would fault here instead.
     JitResult c = bezel::test::runAotChecked(kIssueRepro);
-    if (wasSkipped(c)) return;
     BEZEL_EXPECT_TRUE(c.ran);
     BEZEL_EXPECT_EQ(c.stdoutText, kIssueExpected);
 }
