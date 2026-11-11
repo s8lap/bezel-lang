@@ -826,6 +826,23 @@ private:
                                     std::string_view name) const;
     // §11.8: the cached marker symbol for an in-scope type-parameter name.
     GenericParamSymbol* typeParamMarker(std::string_view name);
+    // fix #8596 (§7.7, §6.6, §7.10, v0.357; owner ruling on #8596): is `t`, the
+    // declared type of a `??` / `??=` left operand, PROVABLY non-nullable? A
+    // nullable type is not; a type parameter counts as possibly nullable
+    // (§7.10: "treated conservatively as possibly nullable") unless a `where`
+    // clause on it (`notnull`, `class`, `value`, or a type bound -- §14.2,
+    // §7.10) makes it non-nullable; every other type, and an unresolved one
+    // (`Kind::Error`), is decided by its own `nullable` flag / skipped.
+    bool coalesceLeftIsNonNullable(const TypeRef* t) const;
+    // fix #8596: the typing and the warning a `??` / `??=` draws for a left
+    // operand of non-nullable (or possibly-nullable type-parameter) type `lt`:
+    // the right operand `rt` (the expression `rhs`) must convert to `lt` or to
+    // `lt?` (§7.7 *Typing*, "types exactly as it would for a left operand of
+    // type `T?`"), and a PROVABLY non-nullable left operand draws a warning
+    // (§7.7 *Evaluation*: the right operand is never evaluated). `isAssign`
+    // selects the `??=` wording.
+    void checkCoalesceNonNullableLeft(TypeRef* lt, const ast::Expr* rhs,
+                                      SourceLocation leftLoc, bool isAssign);
     // §11.8: search the enclosing method's constraints (then the enclosing
     // type's) for a `where <paramName>: I<...>` bound whose interface declares
     // a static OPERATOR member matching `op` with two parameters of the

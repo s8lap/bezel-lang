@@ -6213,6 +6213,93 @@ void ExprTC::collectExtensionTargetTypeParamNames(
     }
 }
 
+// fix #8596 (§7.7, §6.6, §7.10, §14.2, v0.357; owner ruling on #8596): see the
+// declaration in ExprTypecheck_impl.hpp.
+bool ExprTC::coalesceLeftIsNonNullable(const TypeRef* t) const {
+    if (!t || t->nullable || t->kind == TypeRef::Kind::Error) return false;
+    // A bare type parameter in scope. The shape (a declaration-less Named
+    // TypeRef with no arguments) is shared with ~50 builtins, so the SCOPE test
+    // and #6530's origin test both have to agree (`linqElemIsInScopeTypeParam`).
+    if (t->kind == TypeRef::Kind::Named && !t->declaration &&
+        t->genericArgs.empty()) {
+        const std::string_view n = t->headName();
+        if (!n.empty() && isInScopeTypeParam(n) && isInScopeTypeParamRef(t)) {
+            // §7.10 / §14.2: non-nullable inside the body under `notnull`,
+            // `class`, `value` and any type bound; `new()`, `sendable` and
+            // `hashable` say nothing about nullability. A constraint inherited
+            // by an override that omits its `where` clause is not visible here
+            // and leaves the parameter "possibly nullable" -- the silent side.
+            auto nonNull = [](std::string_view kind) {
+                return kind == "class" || kind == "value" ||
+                       kind == "notnull" || kind == "type";
+            };
+            auto inAny = [&](const auto* owner) -> bool {
+                if (!owner) return false;
+                for (const auto& gc : owner->genericConstraints) {
+                    if (gc.typeParam != n) continue;
+                    for (const auto& it : gc.items)
+                        if (nonNull(it.kind)) return true;
+                }
+                return false;
+            };
+            if (inAny(currentMethodDecl_)) return true;
+            if (currentType_)
+                for (const Symbol* gs : currentType_->genericParams)
+                    if (gs && gs->name == n)
+                        if (auto* gp =
+                                dynamic_cast<const GenericParamSymbol*>(gs))
+                            for (const auto& c : gp->constraints)
+                                if (nonNull(c.kind)) return true;
+            if (currentExtension_ && currentExtension_->decl)
+                if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                        currentExtension_->decl))
+                    if (inAny(ed)) return true;
+            return false;
+        }
+    }
+    return true;
+}
+
+// fix #8596 (§7.7, §6.6, v0.357; owner ruling on #8596): see the declaration in
+// ExprTypecheck_impl.hpp. §7.7 states its typing "for a left operand of type
+// `T?`"; the ruling extends it: for a left operand of non-nullable type `T`,
+// `a ?? b` types exactly as it would for `T?` -- the right operand must convert
+// (§5.1) to `T` or to `T?` -- and `x ??= e` follows through §6.6. A target `T?`
+// admits both alternatives, so the check is against the nullable form of `lt`.
+// The program is still well-defined (the right operand just never runs), so
+// the dead operand draws a warning, not an error (cf. §31.2.3's covered
+// `catch` arm).
+void ExprTC::checkCoalesceNonNullableLeft(TypeRef* lt, const ast::Expr* rhs,
+                                          SourceLocation leftLoc,
+                                          bool isAssign) {
+    if (!lt || lt->nullable || lt->kind == TypeRef::Kind::Error || !rhs) return;
+    // A `null` right operand converts to any `T?` and a `throw`/`return` one
+    // carries no value type (§17.12); an untyped operand is skipped by
+    // checkAssignable itself.
+    if (!dynamic_cast<const ast::NullLiteralExpr*>(rhs)) {
+        if (TypeRef* rt = ctx_.exprType(*rhs)) {
+            TypeRef* nullableLt = ctx_.makeTypeRef(*lt);
+            nullableLt->nullable = true;
+            checkAssignable(rt, nullableLt,
+                            rhs->span.begin.line != 0 ? rhs->span.begin
+                                                      : leftLoc,
+                            isAssign ? "right operand of `??=`"
+                                     : "right operand of `??`",
+                            rhs);
+        }
+    }
+    if (!coalesceLeftIsNonNullable(lt)) return;
+    ctx_.diagnostics().report(
+        Severity::Warning, leftLoc,
+        isAssign
+            ? "the target of `??=` has a non-nullable type, so its current "
+              "value is never null: the right operand is never evaluated and "
+              "the assignment never happens (\xC2\xA7""7.7, \xC2\xA7""6.6)"
+            : "the left operand of `??` has a non-nullable type, so it is "
+              "never null: the right operand is never evaluated "
+              "(\xC2\xA7""7.7)");
+}
+
 // fix #4810 (§14.2): see the declaration comment on the impl header. Walks
 // the in-scope `where`-clauses on the enclosing type/method/extension and
 // answers whether the named type parameter appears as the `typeParam` of
@@ -30873,6 +30960,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                         ? as->value->span.begin
                                         : as->span.begin,
                                     "right operand of `??=`", as->value.get());
+            }
+            // fix #8596 (§7.7 / §6.6, v0.357; owner ruling on #8596): a
+            // NON-nullable target types exactly as `T?` would (the operand
+            // must convert to `T` or `T?`) and, being never null, draws the
+            // dead-assignment warning; a `null` operand is still dead code.
+            // The target's DECLARED type decides: a §7.4-narrowed `string?`
+            // binding keeps its declared type here and stays silent.
+            if (as->op == "??=" && as->target && as->value) {
+                TypeRef* toTy = ctx_.exprType(*as->target);
+                if (toTy && !toTy->nullable)
+                    checkCoalesceNonNullableLeft(
+                        toTy, as->value.get(),
+                        as->target->span.begin.line != 0
+                            ? as->target->span.begin
+                            : as->span.begin,
+                        /*isAssign=*/true);
             }
             // §25.1 (#851): a compound assignment `lhs <op>= rhs` desugars to
             // `lhs := lhs <op> rhs` using the binary operator's overload. When

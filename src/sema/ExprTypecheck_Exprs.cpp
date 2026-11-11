@@ -12635,6 +12635,15 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                                 "right operand of `??`", be.right.get());
             }
         }
+        // fix #8596 (§7.7, v0.357; owner ruling on #8596): a NON-nullable left
+        // operand types exactly as `T?` would, and draws a warning (its right
+        // operand never runs).
+        if (lt && !lt->nullable && !lhsIsNullLiteral)
+            checkCoalesceNonNullableLeft(
+                lt, be.right.get(),
+                be.left->span.begin.line != 0 ? be.left->span.begin
+                                              : be.span.begin,
+                /*isAssign=*/false);
         if (lt && !lhsIsNullLiteral) {
             if (lt->nullable && !rhsNullable) {
                 TypeRef* nn = ctx_.makeTypeRef(*lt);
