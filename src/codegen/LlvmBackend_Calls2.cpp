@@ -3022,12 +3022,22 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // strtoll/strtoull(data, &endptr, radix) — the value and the end
         // pointer, for the format guard below.
         const bool isULongR = (pt == P::ULong);
-        auto* strtoFnR = isULongR
-            ? declareC("strtoull", i64(), {ptrTy(), ptrTy(), i32()})
-            : declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
         auto* endSlotR = entryAlloca(ptrTy());
-        llvm::Value* val64 = builder_.CreateCall(
-            strtoFnR, {strData, endSlotR, radix}, "tryp.val");
+        // stdlib §9.1 (v0.357, fix #8575): the 64-bit widths need the
+        // CONVERSION'S range failure, which only errno carries (the shared
+        // helper #8540 added); the narrower widths range-check the VALUE
+        // (the branch below), which is why `int` was always right.
+        llvm::Value* val64 = nullptr;
+        llvm::Value* rangeFailR = nullptr;
+        if (pt == P::Long || pt == P::ULong) {
+            rangeFailR = emitI64TowerParse(strData, radix, endSlotR, val64);
+        } else {
+            auto* strtoFnR = isULongR
+                ? declareC("strtoull", i64(), {ptrTy(), ptrTy(), i32()})
+                : declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+            val64 = builder_.CreateCall(
+                strtoFnR, {strData, endSlotR, radix}, "tryp.val");
+        }
         llvm::Value* endPtrR = builder_.CreateLoad(ptrTy(), endSlotR);
         // ok = first-char not whitespace AND (endPtr != data) AND
         // (*endPtr == '\0') — the §9.3 strict input grammar, the same guard
@@ -3054,6 +3064,15 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             llvm::Value* fcNeg = builder_.CreateICmpEQ(
                 fcR, llvm::ConstantInt::get(i8TyR, '-'), "tryp.neg");
             ok = builder_.CreateAnd(ok, builder_.CreateNot(fcNeg), "tryp.okU");
+        }
+        // stdlib §9.1 (v0.357, fix #8575): the 64-bit widths' range rule —
+        // a well-formed input that spells a value the type cannot represent
+        // is NOT admitted: `TryParse` returns false (stdlib §1 shape (c):
+        // false exactly where `Parse` raises) and the `out` parameter
+        // receives the default value.
+        if (rangeFailR) {
+            ok = builder_.CreateAnd(ok, builder_.CreateNot(rangeFailR),
+                                    "tryp.okR");
         }
         // Store result: 0 on failure, the parsed value on success.
         if (pt == P::Long || pt == P::ULong) {
@@ -3350,12 +3369,22 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             // strtoull for the unsigned 64-bit width (so the full magnitude is
             // captured); strtoll for everything else, range-checked below.
             bool isULongR = (pt == P::ULong);
-            auto* strtoFnR = isULongR
-                ? declareC("strtoull", i64(), {ptrTy(), ptrTy(), i32()})
-                : declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
             auto* endSlotR = entryAlloca(ptrTy());
-            llvm::Value* v64R = builder_.CreateCall(
-                strtoFnR, {data, endSlotR, radix}, "parse.rx");
+            // stdlib §9.1 (v0.357, fix #8575): the 64-bit widths need the
+            // CONVERSION'S range failure, which only errno carries (the
+            // shared helper #8540 added); the narrower widths range-check the
+            // VALUE (the branch below), which is why `int` was always right.
+            llvm::Value* v64R = nullptr;
+            llvm::Value* rangeFailR = nullptr;
+            if (pt == P::Long || pt == P::ULong) {
+                rangeFailR = emitI64TowerParse(data, radix, endSlotR, v64R);
+            } else {
+                auto* strtoFnR = isULongR
+                    ? declareC("strtoull", i64(), {ptrTy(), ptrTy(), i32()})
+                    : declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+                v64R = builder_.CreateCall(
+                    strtoFnR, {data, endSlotR, radix}, "parse.rx");
+            }
             // FormatException guard (mirrors the 1-arg branch): first char
             // must not be whitespace, the conversion must have advanced the
             // pointer (rejects leading-invalid-digit like "2" in base 2 / "g"
@@ -3391,7 +3420,28 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             }
             emitGuardThrow(builder_.CreateNot(validFmtR, "parse.fmtbadR"),
                            "FormatException");
-            // long/ulong are the full strtoll/strtoull width — no range check.
+            // stdlib §9.1 (v0.357, fix #8575): the 64-bit widths' range rule.
+            // `long` is strtoll's full width and `ulong` is strtoull's, so the
+            // conversion SATURATES at the boundary instead of reporting a
+            // failure, and the saturated value is ITSELF in range — the
+            // failure is visible only in errno (ERANGE), which the helper
+            // reads.  A well-formed input that spells a value the type
+            // cannot represent raises ParseRangeException — an
+            // OverflowException (stdlib §9.1: "ParseRangeException derives
+            // from OverflowException"; the compiler's builtin exception set
+            // has no ParseRangeException, so the parse family raises
+            // OverflowException, as the narrower widths do).
+            //
+            // The guard sits AFTER the FormatException guard: §9.1's range
+            // failure is for a WELL-FORMED input ("whose input is well-formed
+            // and spells a value the type cannot represent"), so a malformed
+            // input keeps raising FormatException.
+            if (rangeFailR) {
+                emitGuardThrow(rangeFailR, "OverflowException");
+            }
+            // long/ulong are the full strtoll/strtoull width — the range
+            // check is the CONVERSION'S (errno), above; the narrower widths
+            // range-check the VALUE, below.
             if (pt == P::Long || pt == P::ULong) return v64R;
             // Range check → OverflowException for the narrower widths (mirrors
             // the 1-arg branch + the TryParse branch above): strtoll returns
