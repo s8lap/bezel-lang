@@ -37,25 +37,24 @@
 //
 // BOUNDARY CONTROL (the ONE base-green row). The owner's 2026-11-12 rule
 // caps a suite at TWO base-green gtest rows and asks that each kept one be
-// named with the wrong fix it catches. Only ONE of this issue's base-green
-// rows has such an argument (the review says so too): the reject row below,
-// which catches a fix made in the WRONG LAYER. The other two base-green
-// controls (the non-nullable `Guid` source twin and the `int?` twin) are
-// green with AND without the fix and their verdicts are fixed by a spec
-// sentence, so they are CORPUS CANDIDATES, not gtest rows — they live at
+// named with the wrong fix it catches. This suite keeps TWO base-green rows:
+//
+//   * `nonnullable_guid_to_icomparable_control_stdlib_2_6` catches a fix that
+//     changes the NON-nullable box path: a fix that rewrites `boxValue`'s
+//     ordinary `Guid` box (or its vtable choice) while adding the nullable
+//     fallback would break a box that already worked, and this row goes RED.
+//   * `unnarrowed_guid_to_icomparable_is_rejected_spec_5_1` catches THE
+//     WRONG-LAYER FIX: a fix that admits `T?` -> `IComparable<T>` in SEMA
+//     (dropping §5.1's nullable lifting) instead of fixing the §8.6 box would
+//     make the un-narrowed program compile, and this row goes RED. It is the
+//     soundness precondition the fix's unwrap rests on.
+//
+// The `int?` twin (`narrowed_int_to_icomparable_still_boxes_spec_5_1`) is a
+// primitive whose nullable form already had a box vtable, so it boxed
+// correctly before the fix; its verdict is fixed by §5.1 and it lives as a
+// CORPUS CANDIDATE, not a gtest row, at
 //   /var/tmp/bezel-scratch/r42-m29-8476/corpus-candidates/
-//       nonnullable_guid_to_icomparable_still_boxes_spec_8_6.bzl
 //       narrowed_int_to_icomparable_still_boxes_spec_5_1.bzl
-//
-// The kept control, `unnarrowed_guid_to_icomparable_is_rejected_spec_5_1`,
-// catches THE WRONG-LAYER FIX: a fix that admits `T?` → `IComparable<T>` in
-// SEMa (dropping §5.1's nullable lifting) instead of fixing the §8.6 box
-// would make the un-narrowed program compile — this row goes RED. It is the
-// soundness precondition the fix's unwrap rests on.
-//
-// The `int?` twin of the issue's title is the admitting control (a primitive's
-// nullable form DOES have a box vtable, so it boxed correctly all along); it
-// is a corpus candidate for the reason above.
 
 #include <string>
 
@@ -143,6 +142,22 @@ std::string guidNotNarrowed() {
            "end C;";
 }
 
+// The NON-nullable twin of the issue's Guid repro (stdlib §2.6): the source is
+// a plain `Guid`, so there is no narrowing and no nullable carrier. It already
+// boxed correctly before the fix; it is the control for a fix that disturbs
+// the ordinary box path.
+std::string guidNonNullableRepro() {
+    return "module M; "
+           "class C "
+           "  public static method Main(): int "
+           "    var n: Guid := Guid.Empty; "
+           "    var g: IComparable<Guid> := n; "
+           "    Console.WriteLine(g.CompareTo(Guid.Empty)); "
+           "    return 0; "
+           "  end Main; "
+           "end C;";
+}
+
 void expectStdout(const std::string& src, const char* expected) {
     JitResult r = runAotChecked(src);
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
@@ -179,7 +194,16 @@ BEZEL_TEST(codegen_boxed_value_builtin_nullable_narrowed_8476,
     expectStdout(guidCallArgument(), "0\n");
 }
 
-// THE BOUNDARY CONTROL (the suite's one base-green row). §5.1's nullable
+// BOUNDARY CONTROL 1 of 2 (base-green by design). The non-nullable `Guid`
+// box already worked on base. It catches a fix that disturbs the ordinary box
+// path (a rewritten `boxValue` vtable choice that also changes a non-nullable
+// box) — that fix would turn this row RED.
+BEZEL_TEST(codegen_boxed_value_builtin_nullable_narrowed_8476,
+           nonnullable_guid_to_icomparable_control_stdlib_2_6) {
+    expectStdout(guidNonNullableRepro(), "0\n");
+}
+
+// BOUNDARY CONTROL 2 of 2 (base-green by design). §5.1's nullable
 // lift admits `T?` at most at `T?`, so an un-narrowed `Guid?` stays a
 // compile error at a non-nullable interface slot. This is the sema gate the
 // fix's unwrap depends on — it catches THE WRONG-LAYER FIX: a fix that
