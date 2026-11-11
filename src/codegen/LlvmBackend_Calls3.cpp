@@ -5964,6 +5964,35 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
     bool spanElemIsClass =
         spanElemPol.cat == ElementPolicy::Category::ClassOwned ||
         spanElemPol.cat == ElementPolicy::Category::ClassBorrow;
+    // fix #6557 (§28.9 / §28.11, v0.357): a span is a view over an `Array<T>`,
+    // and since #6557 an `Array<DictionaryEntry<string, V>>` may be STAMPED — it
+    // co-owns one reference on the Key of every slot (`str_key_esz`). A span
+    // write that replaces a whole slot (`Fill`, `CopyTo`, `CopyFrom`) is then an
+    // indexer store in all but name, and it has to keep that count exact: a raw
+    // store through `bz_array_ptr_at` would leave the array releasing, at free,
+    // a Key it never took (MEASURED before this arm existed: `refcount
+    // over-release (string)` on `es.AsSpan().Fill(e)`). For such an element the
+    // write goes through `bz_array_set`, whose stamped path is
+    // take(incoming) -> copy -> release(displaced) and whose unstamped path is
+    // the same byte copy the raw store was. The span's own indexer setter
+    // already stores through `bz_array_set`; `Reverse` is a permutation and
+    // moves no reference.
+    const bool spanSlotMayBeCoOwned =
+        isDictEntryStringKeyTypeRef(resolveTypeParamRef(spanElemRef));
+    auto storeSpanSlot = [&](llvm::Value* arr, llvm::Value* absIdx,
+                             llvm::Value* slotPtr, llvm::Value* valPtr,
+                             llvm::Type* valTy, int64_t esz) {
+        // `valPtr` addresses the incoming element (never the destination slot
+        // itself: callers pass a private temporary).
+        if (spanSlotMayBeCoOwned) {
+            auto* setFn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), i64(), ptrTy(), i64()});
+            builder_.CreateCall(setFn,
+                {arr, absIdx, valPtr, builder_.getInt64(esz)});
+            return;
+        }
+        builder_.CreateStore(builder_.CreateLoad(valTy, valPtr), slotPtr);
+    };
 
     // -- ToString ---------------------------------------------------------------
     // fix #2661 (spec §8.5, v0.252): the §8.5 positional-record default, which
@@ -6204,6 +6233,8 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
         auto* idxSlot = entryAlloca(i32());
         builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        llvm::AllocaInst* fillValSlot = entryAlloca(v->getType());  // fix #6557
+        builder_.CreateStore(v, fillValSlot);
         auto* condBB = llvm::BasicBlock::Create(llvm_, "fill.c", currentFn_);
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "fill.b", currentFn_);
         auto* endBB  = llvm::BasicBlock::Create(llvm_, "fill.e", currentFn_);
@@ -6218,7 +6249,9 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
             builder_.CreateSExt(idx32, i64()));
         llvm::Value* ep = builder_.CreateCall(ptrAtFn,
             {src, absIdx, builder_.getInt64(esz)});
-        builder_.CreateStore(v, ep);  // opaque ptr; store writes ety bytes
+        // opaque ptr; store writes ety bytes (fix #6557: through bz_array_set
+        // when the backing array may co-own the slot's Key)
+        storeSpanSlot(src, absIdx, ep, fillValSlot, v->getType(), esz);
         builder_.CreateStore(
             builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
         builder_.CreateBr(condBB);
@@ -6264,6 +6297,7 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
         auto* idxSlot = entryAlloca(i32());
         builder_.CreateStore(builder_.getInt32(0), idxSlot);
+        llvm::AllocaInst* cpyValSlot = entryAlloca(ety);  // fix #6557
         auto* condBB = llvm::BasicBlock::Create(llvm_, "cpy.c", currentFn_);
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "cpy.b", currentFn_);
         auto* endBB  = llvm::BasicBlock::Create(llvm_, "cpy.e", currentFn_);
@@ -6284,7 +6318,11 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         llvm::Value* dp = builder_.CreateCall(ptrAtFn,
             {dstSrc, di, builder_.getInt64(esz)});
         llvm::Value* val = builder_.CreateLoad(ety, sp);
-        builder_.CreateStore(val, dp);  // opaque ptr
+        // fix #6557: the incoming element is read out into a private
+        // temporary first — source and destination may be the same slot of the
+        // same array — and stored through `storeSpanSlot`.
+        builder_.CreateStore(val, cpyValSlot);
+        storeSpanSlot(dstSrc, di, dp, cpyValSlot, ety, esz);
         builder_.CreateStore(
             builder_.CreateAdd(idx32, builder_.getInt32(1)), idxSlot);
         builder_.CreateBr(condBB);

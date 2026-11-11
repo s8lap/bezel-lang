@@ -251,10 +251,20 @@ static inline void bz_drop_str_dict_key_ptr(void* key) {
     bz_string_release(key);
 }
 
-// Give back every slot the array currently holds, and clear the stamp so the
-// array no longer claims ownership of anything. Shared by `bz_array_clear` and
-// by the two frees, so all three discharge exactly the slots they empty.
-static void bz_array_drop_all_str_dict_keys(void* arrp) {
+// Give back every slot the array currently holds. Shared by the two clears and
+// by the two frees, so all four discharge exactly the slots they empty.
+//
+// `keep_stamp` is the one difference between them. A FREE clears the stamp, so
+// the array no longer claims ownership of anything and a second discharge (the
+// checked `bz_array_mark_disposed` followed by `bz_array_free`) visits nothing.
+// A CLEAR keeps it (fix #6557, §28.9 / §28.11, v0.357): the array lives on, its
+// caller sets `count` to 0 right after this walk, so the invariant "co-owns one
+// reference on every slot in [0, count)" holds vacuously — and the DISCIPLINE
+// has to survive, or every element added after the `Clear` would be stored
+// without its reference and the re-filled array would be back on the borrowed
+// footing whose Keys die with their source (the #6557 use-after-free, one
+// `Clear` later).
+static void bz_array_drop_all_str_dict_keys(void* arrp, bool keep_stamp = false) {
     auto* arr = (bz_array_t*)arrp;
     if (!arr || !arr->data || arr->str_key_esz <= 0) return;
     int64_t esz = arr->str_key_esz;
@@ -262,7 +272,7 @@ static void bz_array_drop_all_str_dict_keys(void* arrp) {
         char* slot = (char*)bz_array_ptr_at(arr, i, esz);
         bz_string_release(*(void**)slot);
     }
-    arr->str_key_esz = 0;
+    if (!keep_stamp) arr->str_key_esz = 0;
 }
 
 void* bz_array_alloc(int64_t elem_size, int64_t initial_cap) {
@@ -493,26 +503,19 @@ void bz_array_clear(void* arrp) {
         // a stamped array is the one place the invariant cannot survive as a
         // free-time property.
         //
-        // THE STAMP DOES NOT COME BACK, and that is deliberate rather than an
-        // oversight — an earlier version of this comment claimed the opposite
-        // ("a later `Add` re-establishes it, because `bz_array_add` takes on
-        // every append"). MEASURED FALSE: `bz_array_add`'s take is gated on
-        // `if (arr->str_key_esz > 0)` (below), and `bz_array_drop_all_str_dict_keys`
-        // zeroes `str_key_esz` as it walks, so an emptied stamped array is
-        // PERMANENTLY unstamped and every later `Add` takes nothing. The stated
-        // reason it is still correct: after `Clear` the array holds nothing, so
-        // the invariant "co-owns one reference on every slot in [0, count)" is
-        // vacuously true at `count == 0`, and the only thing lost is the
-        // DISCIPLINE for slots added afterwards — which puts a re-filled array
-        // back on the ordinary unstamped value-row footing (§28.11 gives a
-        // user-built `Array<DictionaryEntry<string,V>>` no Key obligation either),
-        // i.e. the pre-#6550 shape. That is a leak-or-borrow question about
-        // re-filling, NOT an over-release: an unstamped array neither takes nor
-        // gives back, so it can never release a reference it never took. Making
-        // the stamp survive `Clear` would instead have every post-`Clear` `Add`
-        // retain, which is a behaviour change to the re-fill path and is filed
-        // rather than smuggled in here.
-        bz_array_drop_all_str_dict_keys(arrp);
+        // THE STAMP SURVIVES (fix #6557, §28.9 / §28.11, v0.357). Until #6557
+        // `bz_array_drop_all_str_dict_keys` zeroed `str_key_esz` as it walked, so
+        // an emptied stamped array was PERMANENTLY unstamped and every later
+        // `Add` took nothing — recorded here at the time as "a behaviour change
+        // to the re-fill path ... filed rather than smuggled in". #6557 is that
+        // change: a user-built `Array<DictionaryEntry<string,V>>` is now stamped
+        // at construction, so its `Add` takes the Key reference the for-in entry
+        // snapshot is about to release, and a `Clear` in the middle must not
+        // switch that off — the re-filled array would store its next Keys
+        // borrowed and read them freed. The walk discharges exactly the slots
+        // `count` is about to forget; the stamp stays, and `bz_array_add`'s
+        // take keeps every later slot owned.
+        bz_array_drop_all_str_dict_keys(arrp, /*keep_stamp=*/true);
         arr->count = 0;
         arr->mod_count++;  // §29.12 / #1232: structural mutation
     }
@@ -538,7 +541,7 @@ void bz_array_clear_disposing(void* arrp, void (*dispose_elem)(void*)) {
     // fix #6560: same reason as bz_array_clear — the stride-8 disposer above is NULL
     // for a value-row entry element, so the strided walk is what discharges the
     // Keys, and it has to run before `count` is erased.
-    bz_array_drop_all_str_dict_keys(arrp);
+    bz_array_drop_all_str_dict_keys(arrp, /*keep_stamp=*/true);  // fix #6557: see bz_array_clear
     arr->count = 0;
     arr->mod_count++;  // §29.12 / #1232: structural mutation
     if (bz_sort_in_progress_arr == arr && bz_sort_jmp_buf) {
@@ -729,17 +732,28 @@ static void bz_array_release_str_dict_keys(bz_array_t* arr) {
 // `First()`, `Count()`, the `for var e in d` loop), whose Keys never escape.
 //
 // PROVENANCE, NOT ELEMENT TYPE. This is stamped only by a producer that
-// actually took the reference, never inferred from the element type alone, so
-// an `Array<DictionaryEntry<string,V>>` a user builds with `new
-// DictionaryEntry(...)` or `Add` — which §28.11's value row gives no Key
-// obligation — leaves `str_key_esz` zero and is byte-for-byte unaffected.
+// actually took the reference, never inferred from the element type alone: the
+// runtime never looks at a slot and guesses. Since fix #6557 (§28.9 / §28.11,
+// v0.357) there are two such producers — the `ToArray()` snapshot below, and
+// the construction site of a user-built `Array<DictionaryEntry<string,V>>`
+// (`lowerNew`), which stamps the array while it is still EMPTY so that every
+// later `Add` / `Insert` / indexer store takes the reference as it stores. An
+// array that reaches the runtime any other way leaves `str_key_esz` zero and
+// is byte-for-byte unaffected.
 extern "C" void bz_array_own_str_dict_keys(void* arrp, int64_t esz) {
     if (!arrp || esz <= 0) return;
     auto* arr = (bz_array_t*)arrp;
-    if (!arr->data) return;
-    for (int64_t i = 0; i < arr->count; ++i) {
-        char* slot = (char*)bz_array_ptr_at(arr, i, esz);
-        if (slot) bz_string_retain(*(void**)slot);
+    // fix #6557 (§28.9 / §28.11, v0.357): an array with NO backing store yet is
+    // still stamped — it holds nothing, so there is nothing to retain, and the
+    // stamp is what makes the first `Add` take. Returning early here (the
+    // pre-#6557 shape) left a zero-length `new Array<...>(0, fill)` unstamped
+    // for life. A disposed array is the one header that must stay unstamped.
+    if (arr->disposed) return;
+    if (arr->data) {
+        for (int64_t i = 0; i < arr->count; ++i) {
+            char* slot = (char*)bz_array_ptr_at(arr, i, esz);
+            if (slot) bz_string_retain(*(void**)slot);
+        }
     }
     arr->str_key_esz = esz;
 }

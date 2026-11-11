@@ -8202,6 +8202,50 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // a borrowing collection — §4.4 — so aliasing is fine).
                 // fix #3423 (§22.5, v0.283): apply the binding permutation so
                 // reordered named args are lowered correctly.
+                // fix #6557 (§28.9 / §28.3.1 K1.6 / §28.11, v0.357): a user-built
+                // `Array<DictionaryEntry<string, V>>` CO-OWNS the Key of every
+                // slot it holds, exactly as the `ToArray()` snapshot has since
+                // #6550. §28.9 makes `string` runtime-managed and K1.6 gives a
+                // runtime-managed value no obligation — "the stored copy stays
+                // live" is the runtime's job, and it is realized by refcount, so
+                // the reference has to be HELD by whatever stores the copy. The
+                // array did not hold one: `Add` is a byte copy of the
+                // `{bz_string*, V}` entry (the §28.11 value row), and the entry a
+                // `for var e in d` loop yields carries a Key REBUILT for that
+                // iteration and released at its end. So
+                //     for var e in d do es.Add(e); end for;
+                // left `es` holding Keys the loop had already freed, and
+                // `es[0].Key` read a dead `bz_string` (heap-use-after-free;
+                // unchecked it printed whatever reused the block).
+                //
+                // The array is stamped HERE, while it is still empty, rather
+                // than at `Add`: the stamp (`str_key_esz`) is the header's record
+                // that "this array holds one reference per slot", and every
+                // runtime mutator already keeps that true once it is set —
+                // `bz_array_add` / `bz_array_insert_at` take, `bz_array_set`
+                // takes-then-releases, `bz_array_remove_at` / `bz_array_clear` /
+                // the two frees give back (#6560). Retains and releases are
+                // therefore paired per slot by construction: a Key's lifetime
+                // becomes max(its source's, its slot's), never shorter and never
+                // unbounded, so no row that was clean before can leak or
+                // over-release now.
+                //
+                // `Array` only: Stack / Queue / Set share this allocation path,
+                // but their element reads are moves out of the collection
+                // (`Pop`, `Dequeue`), which is a different ownership question.
+                auto stampStrDictKeyCoOwner = [&](llvm::Value* arr) {
+                    if (colName != "Array" || rt->genericArgs.empty() ||
+                        !rt->genericArgs[0])
+                        return;
+                    if (!isDictEntryStringKeyTypeRef(
+                            resolveTypeParamRef(rt->genericArgs[0])))
+                        return;
+                    auto* ownFn = declareC("bz_array_own_str_dict_keys",
+                                           llvm::Type::getVoidTy(llvm_),
+                                           {ptrTy(), i64()});
+                    builder_.CreateCall(ownFn,
+                                        {arr, builder_.getInt64(elemSize)});
+                };
                 if (colName == "Array" && ne.args.size() == 2 &&
                     ne.args[0].value && ne.args[1].value) {
                     const auto* bnd = ctx_.builtinCallBinding(ne);
@@ -8289,6 +8333,9 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         builder_.CreateBr(hdrBB);
                         builder_.SetInsertPoint(doneBB);
                     }
+                    // fix #6557: stamped AFTER the fill, so the stamp's walk
+                    // takes one Key reference per pre-populated slot.
+                    stampStrDictKeyCoOwner(buf);
                     stampBuiltinTypeDesc(buf, rt);  // fix #6776 (§8.2)
                     return buf;
                 }
@@ -8323,6 +8370,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         arr,
                         rt->genericArgs.empty() ? nullptr : rt->genericArgs[0],
                         common::isOwningPrefixedName(colName));
+                    stampStrDictKeyCoOwner(arr);  // fix #6557: while still empty
                     // fix #6776 (§8.2): the per-instantiation type tag, read back by
                     // `o is Array<T>` and the through-`Object` ToString.
                     stampBuiltinTypeDesc(arr, rt);

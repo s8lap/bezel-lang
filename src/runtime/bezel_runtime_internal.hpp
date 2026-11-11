@@ -421,12 +421,13 @@ struct bz_array_t {
     // PROVENANCE, NOT ELEMENT TYPE. The flag is set only by a producer that
     // actually took a reference (`bz_array_own_str_dict_keys` retains field 0
     // of every slot), never from the element TYPE alone. That is what makes the
-    // discharge at free safe: an `Array<DictionaryEntry<string,V>>` built by the
-    // user from `new DictionaryEntry(...)` or by `Add` leaves this zero, because
-    // §28.11's value-copy row gives such an array no Key obligation — the flag
-    // can only ever mean "this array holds a +1 per slot that this array's free
-    // must give back". Zero (the calloc default) is byte-for-byte today's
-    // behaviour on every other array in the runtime.
+    // discharge at free safe: the flag can only ever mean "this array holds a
+    // +1 per slot that this array's free must give back". Since fix #6557
+    // (§28.9, v0.357) a user-built `Array<DictionaryEntry<string,V>>` carries it
+    // too — stamped at construction, while EMPTY, so each `Add` takes the
+    // reference it later gives back (the Key must outlive the for-in entry
+    // snapshot it was read from). Zero (the calloc default) is byte-for-byte
+    // the unstamped behaviour on every other array in the runtime.
     //
     // APPENDED last so every prior field's offset is preserved. Since fix
     // #6776 (§8.2, v0.340) the layout is {vtable@0, type_desc@8, data@16,
