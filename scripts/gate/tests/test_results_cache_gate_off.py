@@ -19,7 +19,10 @@ tests/support/results_cache_test.cpp
      scripts/results_cache.sh refuses to emit a key;
   plus the clean-tree rule that keeps a fail-without arm (a reverted fix in
   the working tree) and work in progress uncached: results_cache.sh emits no
-  key for a binary whose source tree has any uncommitted or untracked path.
+  key for a binary whose source tree has any uncommitted or untracked path,
+  re-keys every run (an earlier key line is never reused), and `commit` drops
+  a run's staged passes when, AFTER the run, the tree is dirty, an artefact
+  changed, or a tracked path changed during it (review r42-rev-infra-rcache F2).
 
 Runs no build and no test binary: the "binary" is a stub script that answers
 the identity probe, over a throwaway git repository.
@@ -29,6 +32,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -211,6 +215,92 @@ class ResultsCacheKeyRules(unittest.TestCase):
         _, third, _ = self._keys()
         self.assertNotIn(third[0].split("\t")[2], {first[0].split("\t")[2], second[0].split("\t")[2]})
 
+
+    def _rc(self, *args, **extra):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("BEZEL_RESULTS_CACHE")}
+        env["BEZEL_RESULTS_CACHE_DIR"] = str(self.d / "cache")
+        env["BEZEL_RESULTS_CACHE_MIN_FREE_GB"] = "0"
+        env.update(extra)
+        return subprocess.run([str(RC_SH), *map(str, args)], env=env, capture_output=True, text=True)
+
+    def _staged_run(self, during=None):
+        """stage -> keys -> (the 'run': one staged pass, then `during`) -> commit."""
+        (self.d / "cache" / "v1" / ("a" * 64) / "e.pass").unlink(missing_ok=True)
+        stage = Path(self._rc("stage").stdout.strip())
+        self.assertTrue((stage / ".started").exists())
+        self._rc("keys", self.keys, self.bin)
+        hk = stage / ("a" * 64)
+        hk.mkdir()
+        (hk / "e.pass").write_text("staged pass\n")
+        if during:
+            time.sleep(0.05)  # file times are jiffy-grained
+            during()
+        r = self._rc("commit", stage, self.keys, self.bin)
+        self.assertFalse(stage.exists(), "the stage is removed either way")
+        promoted = (self.d / "cache" / "v1" / ("a" * 64) / "e.pass").exists()
+        return r, promoted
+
+    def test_commit_promotes_the_stage_of_a_run_on_an_unchanged_tree(self):
+        r, promoted = self._staged_run()
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "promoted 1"), r.stderr)
+        self.assertTrue(promoted)
+
+    def test_commit_drops_the_stage_when_the_tree_went_dirty_during_the_run(self):
+        cases = {
+            "untracked": lambda: (self.repo / "new_probe.bzl").write_text("x\n"),
+            "modified": lambda: (self.repo / "f.txt").write_text("reverted fix\n"),
+            # Edited and restored before the run ended: git status is clean
+            # again, but the path changed during the run.
+            "edit-and-revert": lambda: (self.repo / "f.txt").write_text("x\n"),
+            "artefact-rebuilt": lambda: (self.d / "rt.a").write_text("runtime rebuilt\n"),
+        }
+        for name, during in cases.items():
+            with self.subTest(case=name):
+                r, promoted = self._staged_run(during)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertTrue(r.stdout.startswith("dropped 1 ("), r.stdout)
+                self.assertIn("DROPPED 1 new pass(es)", r.stderr)
+                self.assertFalse(promoted, name)
+                # Restore for the next case.
+                subprocess.run(["git", "checkout", "-q", "--", "f.txt"], cwd=self.repo, check=True)
+                (self.repo / "new_probe.bzl").unlink(missing_ok=True)
+                (self.d / "rt.a").write_text("rt.a")
+        # Control on the restored tree: promoted again.
+        r, promoted = self._staged_run()
+        self.assertEqual(r.stdout.strip(), "promoted 1", r.stderr)
+        self.assertTrue(promoted)
+
+    def test_a_tree_dirtied_after_the_first_key_loses_its_key_line(self):
+        rc, lines, err = self._keys()
+        self.assertEqual((rc, len(lines)), (0, 1), err)
+        (self.repo / "new_probe.bzl").write_text("x\n")
+        rc, lines, err = self._keys()  # the same OUT, as agent_check's next filter
+        self.assertEqual((rc, lines), (1, []), err)
+
+    def test_agent_check_commits_or_drops_each_runs_stage(self):
+        block = AgentCheckHonoursTheOffSwitch._rc_block(None)
+        for dirty, want in ((False, "promoted"), (True, "dropped")):
+            with self.subTest(dirty=dirty):
+                env = {k: v for k, v in os.environ.items() if not k.startswith("BEZEL_RESULTS_CACHE")}
+                env["BEZEL_RESULTS_CACHE_DIR"] = str(self.d / "cache")
+                env["BEZEL_RESULTS_CACHE_MIN_FREE_GB"] = "0"
+                (self.d / "cache" / "v1" / ("b" * 64) / "e.pass").unlink(missing_ok=True)
+                touch = f'sleep 0.05; : > "{self.repo}/new_probe.bzl"\n' if dirty else ""
+                script = (f"ROOT={ROOT}\nSCRATCH={self.d}\nRC_FLAG=on\n" + block +
+                          f'\nrc_init\nrc_env_for "{self.bin}"\n'
+                          'printf "%s\\n" "${RC_ENV[@]}"\n'
+                          'mkdir -p "$RC_STAGE/' + "b" * 64 + '" && echo p > "$RC_STAGE/' + "b" * 64 + '/e.pass"\n'
+                          + touch +
+                          f'rc_commit "{self.bin}"\nrc_report\n')
+                out = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True).stdout
+                self.assertIn("BEZEL_RESULTS_CACHE_STAGE=" + str(self.d / "cache" / "stage" / "run."), out)
+                landed = (self.d / "cache" / "v1" / ("b" * 64) / "e.pass").exists()
+                self.assertEqual(landed, not dirty, out)
+                if dirty:
+                    self.assertIn("1 new pass(es) DROPPED", out)
+                else:
+                    self.assertNotIn("DROPPED", out)
+                (self.repo / "new_probe.bzl").unlink(missing_ok=True)
 
 if __name__ == "__main__":
     unittest.main()

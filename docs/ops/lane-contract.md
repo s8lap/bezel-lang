@@ -36,9 +36,10 @@ SPECIFIC to its assignment.*
    served, not executed; `off (<why>)` means everything executed. The gtest `N passed` line counts
    served passes as passed. **Run uncached (`--no-results-cache`) whenever the point is that the
    test EXECUTED**: the fail-without and pass-with arms of a new row, a flake check, or a re-run of
-   a suspect. `--no-results-cache` still records passes, and it poisons a record that a FAIL
-   contradicts (`[ POISON ]`). That record is never served again. `BEZEL_RESULTS_CACHE=0` leaves
-   the cache untouched.
+   a suspect. `--no-results-cache` still records passes. Any FAIL poisons its test for the key
+   (`[ POISON ]`), so a test that failed once is never served there again. New passes are staged
+   and kept only if the tree is unchanged when the run ends; editing the tree during a run drops
+   them (`DROPPED` in the summary). `BEZEL_RESULTS_CACHE=0` leaves the cache untouched.
 4. **NEVER** run the full suite / `tests/run_parallel.sh` / the `check` target. That is the
    coordinator's gate; a lane running it burns the shared budget on ~100 redundant fork+link+exec tasks.
    Running one whole `--area` with named filters is allowed, and item 19b requires it for some fixes.

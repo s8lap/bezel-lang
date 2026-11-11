@@ -494,7 +494,8 @@ compiles, builds and programs. The **results cache** shares RESULTS. It lives in
   of. The source tree it reads at run time must be CLEAN, keyed by its `HEAD^{tree}`. The
   toolchain is `clang --version` plus the identity of the linkers, the binary's shared
   libraries and clang's runtimes. The key also takes every `BEZEL_*` / sanitizer / loader /
-  locale variable that is not on a short volatile list (`envAffectsKey`; filter, shard,
+  locale variable, plus the clang/gcc driver (`CCC_*`, `GCC_*`, `COMPILER_PATH`, `SDKROOT`,
+  `OBJC_INCLUDE_PATH`) and glibc `MALLOC_*` knobs, that is not on a short volatile list (`envAffectsKey`; filter, shard,
   jobserver and timeout knobs only), so it fails closed for a new knob. Last come the schema
   and the full test name. The key file binds each key to the binary's
   `dev:ino:size:mtime`, so a binary rebuilt since the key was computed runs uncached.
@@ -502,13 +503,19 @@ compiles, builds and programs. The **results cache** shares RESULTS. It lives in
   (native-sanitizer skip, `[ INFRA ]`, timeout, fork failure, checked-toolchain skip, ASan
   infra, `[ LEAK ]`) is not stored. A FAIL, crash or timeout never records. Off entirely
   under `BEZEL_AOT_FORCE_SANITIZE` (a sanitizer report in a passing child has no counter), and
-  for a dirty tree (WIP; the reviewer's fail-without revert). Entries live under
+  for a dirty tree (WIP; the reviewer's fail-without revert). Each binary run is keyed afresh,
+  and its new passes go to a private stage (`results_cache.sh stage`). `results_cache.sh
+  commit` promotes them only if, AFTER the run, the tree is still clean, every artefact still
+  hashes to the key and no tracked path or its directory has a ctime newer than the stage.
+  Otherwise it drops them, and agent_check's total line ends `N new pass(es) DROPPED`. Entries live under
   `/mnt/fast/test-results-cache/v1/<key>/`, written tmp + rename. A torn entry lacks its end
   marker and is a miss. `results_cache.sh prune` (run by agent_check at most every 6 h)
-  removes keys untouched for 5 days. `results_cache.sh stats` shows the size.
-- **Flake guard.** A FAIL under a key that holds a PASS for that test writes `<entry>.poison`.
-  It also appends to `/mnt/fast/test-results-cache/poison.log` and prints `[ POISON ]`. A
-  poisoned test is never served again under that key.
+  removes keys unused for 5 days (serving touches the key dir) and stages older than a day.
+  `results_cache.sh stats` shows the size.
+- **Flake guard.** ANY FAIL writes `<entry>.poison`, whether or not a PASS is recorded, so
+  "failed once, passed once" is never served as a PASS. It also appends to
+  `/mnt/fast/test-results-cache/poison.log` and prints `[ POISON ]`. A poisoned test is never
+  stored or served again under that key.
 - **Never in the gate.** `gate.sh`, `gate_full_cycle.sh`, `gate_and_push.sh`, `pregate.sh`
   (its `--filters` too) and `tests/run_parallel.sh` export `BEZEL_RESULTS_CACHE=0` and unset
   `BEZEL_RESULTS_CACHE_KEYS` at top level. A binary given no key file never consults the

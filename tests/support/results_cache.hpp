@@ -35,9 +35,16 @@
 //   * Under BEZEL_AOT_FORCE_SANITIZE the cache is OFF: a sanitizer report
 //     fired in a PASSING row is itself the ASan oracle's verdict (the gate's
 //     san-scope attribution), and a served PASS cannot replay that report.
-//   * Flake guard: a test whose recorded PASS is contradicted (the same key
-//     executed again and FAILED) is POISONED for that key: never served again,
-//     logged to <dir>/poison.log.
+//   * Flake guard: ANY FAIL poisons the test for that key, whether or not a
+//     PASS is already recorded: never served again, logged to
+//     <dir>/poison.log. "Failed once, passed once" under one key is a flake,
+//     and a later PASS must not turn it into a served PASS.
+//   * Staging (BEZEL_RESULTS_CACHE_STAGE): agent_check.sh hands each run a
+//     private stage directory. New passes are written THERE, not into the key
+//     directory, and scripts/results_cache.sh `commit` promotes them only
+//     after re-checking, AFTER the run, that the tree is still clean and every
+//     artefact still hashes to the key; otherwise it drops them. A pass
+//     computed while the tree went dirty is never stored under the clean key.
 //
 // Everything is per process and lock-free: entries are written to a unique
 // temp name in the entry's own directory and rename()d into place, so many
@@ -127,14 +134,18 @@ inline bool envAffectsKey(std::string_view name) {
     static constexpr std::string_view kPrefixes[] = {
         "ASAN_", "LSAN_", "UBSAN_", "TSAN_", "MSAN_", "LD_", "LLVM_",
         "CCACHE_", "LC_",
+        // clang driver rewriting (CCC_OVERRIDE_OPTIONS, ...), gcc-style
+        // driver search paths, and glibc malloc tuning (MALLOC_ARENA_MAX,
+        // MALLOC_*_THRESHOLD_, MALLOC_CHECK_, MALLOC_PERTURB_, ...)
+        "CCC_", "GCC_", "MALLOC_",
     };
     for (std::string_view p : kPrefixes)
         if (name.rfind(p, 0) == 0) return true;
     static constexpr std::string_view kExact[] = {
         "PATH", "HOME", "LANG", "TZ", "CC", "CXX", "CFLAGS", "CXXFLAGS",
         "CPPFLAGS", "LDFLAGS", "LIBRARY_PATH", "CPATH", "C_INCLUDE_PATH",
-        "CPLUS_INCLUDE_PATH", "MALLOC_CHECK_", "MALLOC_PERTURB_",
-        "GLIBC_TUNABLES",
+        "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH", "COMPILER_PATH",
+        "SDKROOT", "GLIBC_TUNABLES",
     };
     for (std::string_view e : kExact)
         if (name == e) return true;
@@ -325,6 +336,11 @@ public:
         root_ = (dirEnv && *dirEnv) ? dirEnv : kDefaultDir;
         keyDir_ = root_ + "/v1/" + key_;
         if (!mkdirP(keyDir_)) return off("cannot create " + keyDir_);
+        if (const char* st = std::getenv("BEZEL_RESULTS_CACHE_STAGE");
+            st && *st) {
+            stageDir_ = std::string(st) + "/" + key_;
+            if (!mkdirP(stageDir_)) return off("cannot create " + stageDir_);
+        }
         const std::string desc = keyDir_ + "/KEY";
         if (!fileExists(desc))
             atomicWrite(desc, std::string(kSchema) + "\nartifact=" + artifact +
@@ -355,6 +371,9 @@ public:
         std::string when = field(body, "recorded_utc");
         info = "pass recorded " + when + " in " + dur + " ms";
         ++reused_;
+        // Prune keys on the key directory's mtime: a served key is in use.
+        if (!touchedKeyDir_)
+            touchedKeyDir_ = ::utimensat(AT_FDCWD, keyDir_.c_str(), nullptr, 0) == 0;
         return true;
     }
 
@@ -370,10 +389,11 @@ public:
         const std::string passPath = entryPath(full, ".pass");
         const std::string poisonPath = entryPath(full, ".poison");
         if (failed) {
-            // Flake guard: a FAIL under a key that holds a PASS for this test
-            // contradicts the record. Poison it: never served again.
-            if (validPass(readFile(passPath), full) && !fileExists(poisonPath))
-                poison(full, poisonPath, durationMs);
+            // Flake guard: a FAIL poisons the test under this key, recorded
+            // PASS or not, so a later PASS is never stored or served.
+            if (!fileExists(poisonPath))
+                poison(full, poisonPath, durationMs,
+                       validPass(readFile(passPath), full));
             return;
         }
         if (!clean) {
@@ -394,7 +414,13 @@ public:
         e += captured;
         if (!captured.empty() && captured.back() != '\n') e += '\n';
         e += "--- end ---\n";
-        if (atomicWrite(passPath, e)) ++stored_;
+        // Staged when agent_check gave a stage: promoted only by
+        // `results_cache.sh commit` after the run re-checks the tree.
+        const std::string target =
+            stageDir_.empty()
+                ? passPath
+                : stageDir_ + "/" + sha256Hex(full).substr(0, 40) + ".pass";
+        if (atomicWrite(target, e)) ++stored_;
     }
 
     // RESULTS CACHE: R reused, E executed, S stored, P poisoned, U unstored,
@@ -439,7 +465,7 @@ private:
     }
 
     void poison(const std::string& full, const std::string& poisonPath,
-                long long durationMs) {
+                long long durationMs, bool contradicted) {
         const std::string line = utcNow() + "\tPOISON\t" + key_ + "\t" + full +
                                  "\tpid=" + std::to_string(::getpid()) +
                                  "\tfail_ms=" + std::to_string(durationMs) +
@@ -454,10 +480,14 @@ private:
             ::close(fd);
         }
         std::fprintf(stderr,
-                     "[ POISON ] %s: a recorded PASS was contradicted by this "
-                     "FAIL; the results cache will never serve it again under "
-                     "key %s (logged to %s/poison.log)\n",
-                     full.c_str(), key_.substr(0, 12).c_str(), root_.c_str());
+                     "[ POISON ] %s: %s; the results cache will never store or "
+                     "serve a PASS for it under key %s (logged to "
+                     "%s/poison.log)\n",
+                     full.c_str(),
+                     contradicted
+                         ? "a recorded PASS was contradicted by this FAIL"
+                         : "this FAIL poisons the test",
+                     key_.substr(0, 12).c_str(), root_.c_str());
         ++poisoned_;
     }
 
@@ -474,6 +504,8 @@ private:
     Mode mode_ = Mode::Off;
     std::string offReason_;
     std::string env_, key_, root_, keyDir_;
+    std::string stageDir_;
+    bool touchedKeyDir_ = false;
     std::size_t reused_ = 0, executed_ = 0, stored_ = 0, poisoned_ = 0,
                 uncacheable_ = 0, poisonedSkips_ = 0;
 };

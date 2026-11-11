@@ -77,7 +77,7 @@ Run every check that applies, and quote what each one printed.
    line next to the gtest line, and say the passes were reused. Still EXECUTE the following
    with `--no-results-cache`: the fail-without and pass-with arms (check 2), the targeted suites
    the fix names, and your own probes. An `off (…)` summary means everything executed. A
-   `[ POISON ]` line is a flake: report it. The cache never serves a FAIL, so every failing
+   `[ POISON ]` line on a row that passes is a flake: report it. The cache never serves a FAIL, so every failing
    row in the area was executed.
 10. **ASan,** when the fix touches allocation, layout, retain/release or disposal:
     `BEZEL_AOT_FORCE_SANITIZE=address scripts/agent_check.sh …` must print

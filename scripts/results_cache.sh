@@ -35,14 +35,29 @@
 #
 # Usage:
 #   results_cache.sh keys OUT BIN [BIN...]
-#       Append one key line per cacheable BIN to OUT (created if missing; a BIN
-#       already in OUT is skipped). One status line per BIN on stderr. Exit 0
-#       when every BIN got a key, 1 when at least one did not (the reason is on
-#       stderr; the harness then runs that binary uncached).
+#       (Re)compute one key line per BIN in OUT (created if missing). A BIN's
+#       earlier line is REPLACED, never reused: the tree may have gone dirty or
+#       an artefact may have been rebuilt since, so every run is keyed afresh
+#       (a dirty BIN loses its line and runs uncached). One status line per BIN
+#       on stderr. Exit 0 when every BIN got a key, 1 when at least one did not
+#       (the reason is on stderr; the harness then runs that binary uncached).
+#   results_cache.sh stage
+#       Create and print a fresh STAGE directory (on the cache's filesystem,
+#       marked with its start time). agent_check.sh passes it to the run as
+#       BEZEL_RESULTS_CACHE_STAGE; the harness writes new passes there.
+#   results_cache.sh commit STAGE OUT BIN
+#       AFTER the run: re-check BIN's key (the tree still clean, every artefact
+#       still hashing to OUT's key) and that no tracked path or its directory
+#       changed during the run (ctime newer than the stage), then promote the
+#       staged passes into the cache. On any difference DROP them all instead
+#       (stderr names the reason). Prints `promoted N` or `dropped N (why)`;
+#       exit 0 / 1. The stage is removed either way.
 #   results_cache.sh describe BIN     print BIN's key components (for debugging)
 #   results_cache.sh prune [--max-age-days N]
-#       Remove key directories untouched for N days (default 5). Run by
-#       agent_check.sh at most once every 6 hours.
+#       Remove key directories untouched for N days (default 5; serving a pass
+#       touches its key directory, so this is days since last USE) and stage
+#       directories older than a day (a killed run's). Run by agent_check.sh at
+#       most once every 6 hours.
 #   results_cache.sh stats            entry counts and size of the cache
 #
 # Env: BEZEL_RESULTS_CACHE (0/off: emit no key), BEZEL_RESULTS_CACHE_DIR
@@ -168,8 +183,8 @@ cmd_keys() {
   TOOLCHAIN="$(toolchain)"   # once, before the per-binary subshells
   touch "$out" || die "cannot write $out"
   for bin in "$@"; do
-    s="$(statid "$bin")"
-    if [ -n "$s" ] && awk -F'\t' -v s="$s" '$2==s {f=1} END {exit !f}' "$out"; then continue; fi
+    # Never reuse an earlier line for BIN: drop it, then key afresh.
+    awk -F'\t' -v b="$bin" '$4 != b' "$out" > "$out.tmp.$$" && mv -f "$out.tmp.$$" "$out"
     if ! c="$(components "$bin")"; then
       echo "results_cache: off for $(basename "$bin"): $c" >&2
       rc=1; continue
@@ -181,6 +196,65 @@ cmd_keys() {
     echo "results_cache: key for $(basename "$bin"): ${key:0:12} (components: $DIR/artifacts/$key.txt)" >&2
   done
   return "$rc"
+}
+
+cmd_stage() {
+  mkdir -p "$DIR/stage" || die "cannot create $DIR/stage"
+  local d; d="$(mktemp -d "$DIR/stage/run.XXXXXXXX")" || die "cannot create a stage under $DIR/stage"
+  touch "$d/.started" || die "cannot write $d/.started"
+  printf '%s\n' "$d"
+}
+
+# Tracked paths of repo $1, and their directories, whose ctime is newer than
+# file $2: the run's start. ctime cannot be set back by `touch -d`, and an edit
+# that is reverted before the run ends still moves it.
+changed_since() {
+  local rroot="$1" ref="$2"
+  ( cd "$rroot" 2>/dev/null || exit 0
+    git ls-files -z 2>/dev/null \
+      | { tr '\0' '\n' | awk '{print} {while (sub(/\/[^\/]*$/, "")) if (!seen[$0]++) print}'; echo .; } \
+      | tr '\n' '\0' \
+      | xargs -0 -r sh -c 'find "$@" -maxdepth 0 -cnewer "$0" -print 2>/dev/null; exit 0' "$ref" )
+}
+
+cmd_commit() {
+  local stage="${1:-}" out="${2:-}" bin="${3:-}"
+  [ -n "$stage" ] && [ -n "$out" ] && [ -n "$bin" ] || die "commit needs STAGE OUT BIN"
+  case "$stage" in "$DIR"/stage/run.*) ;; *) die "commit: $stage is not a stage under $DIR/stage" ;; esac
+  [ -d "$stage" ] || { echo "promoted 0"; return 0; }
+  local n why="" line key c rroot ch p hk dest promoted=0
+  n="$(find "$stage" -mindepth 2 -maxdepth 2 -name '*.pass' | wc -l)"
+  if [ "$n" -eq 0 ]; then rm -rf -- "$stage"; echo "promoted 0"; return 0; fi
+  line="$(awk -F'\t' -v b="$bin" '$4 == b' "$out" 2>/dev/null | tail -1)"
+  key="$(printf '%s' "$line" | cut -f3)"
+  if [ -z "$key" ]; then
+    why="no key line for $bin"
+  elif [ "$(statid "$bin")" != "$(printf '%s' "$line" | cut -f2)" ]; then
+    why="the test binary was replaced during the run"
+  elif ! c="$(TOOLCHAIN="$(toolchain)"; components "$bin")"; then
+    why="after the run: $c"
+  elif [ "$(keyof "$c")" != "$key" ]; then
+    why="an artefact changed during the run (key ${key:0:12} -> $(keyof "$c" | cut -c1-12))"
+  else
+    rroot="$(printf '%s\n' "$c" | sed -n 's/^path.repo_root=//p')"
+    ch="$(changed_since "$rroot" "$stage/.started")"
+    [ -z "$ch" ] || why="$(printf '%s\n' "$ch" | wc -l) tracked path(s) changed during the run (first: $(printf '%s\n' "$ch" | head -1))"
+  fi
+  if [ -n "$why" ]; then
+    rm -rf -- "$stage"
+    echo "results_cache: DROPPED $n new pass(es) for $(basename "$bin"): $why" >&2
+    echo "dropped $n ($why)"
+    return 1
+  fi
+  for p in "$stage"/*/*.pass; do
+    hk="$(basename "$(dirname "$p")")"
+    [[ "$hk" =~ ^[0-9a-f]{64}$ ]] || continue
+    dest="$DIR/v1/$hk/$(basename "$p")"
+    [ -e "${dest%.pass}.poison" ] && continue   # poisoned stays poisoned
+    mkdir -p "$DIR/v1/$hk" && mv -f -- "$p" "$dest" && promoted=$((promoted + 1))
+  done
+  rm -rf -- "$stage"
+  echo "promoted $promoted"
 }
 
 cmd_prune() {
@@ -198,6 +272,8 @@ cmd_prune() {
   done < <(find "$DIR/v1" -mindepth 1 -maxdepth 1 -type d -mtime "+$days" 2>/dev/null)
   find "$DIR/artifacts" -maxdepth 1 -type f -name '*.txt' -mtime "+$days" -delete 2>/dev/null
   find "$DIR/artifacts" -maxdepth 1 -type f -name '.*.tmp' -mmin +60 -delete 2>/dev/null
+  [ -d "$DIR/stage" ] && find "$DIR/stage" -mindepth 1 -maxdepth 1 -type d -name 'run.*' -mmin +1440 \
+    -exec rm -rf -- {} + 2>/dev/null
   echo "results_cache: pruned $n key dir(s) older than ${days}d under $DIR/v1" >&2
 }
 
@@ -216,8 +292,10 @@ case "${1:-}" in
             TOOLCHAIN="$(toolchain)"
             if c="$(components "$1")"; then printf '%s\n' "$c"; echo "key=$(keyof "$c")"
             else echo "off: $c"; exit 1; fi ;;
+  stage) cmd_stage ;;
+  commit) shift; cmd_commit "$@" ;;
   prune) shift; cmd_prune "$@" ;;
   stats) cmd_stats ;;
-  -h|--help|"") sed -n '2,52p' "$0"; [ -n "${1:-}" ] ;;
+  -h|--help|"") sed -n '2,66p' "$0"; [ -n "${1:-}" ] ;;
   *) die "unknown command '$1' (see --help)" ;;
 esac

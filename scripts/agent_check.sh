@@ -422,7 +422,11 @@ run_sharded() {  # $1 filter $2 bin $3 shards $4 merged-log
 # (BEZEL_RESULTS_CACHE_KEYS), and only this script writes one, through
 # scripts/results_cache.sh, which emits a key only for a binary built from a
 # CLEAN committed tree (so WIP and a reviewer's fail-without arm are never
-# cached). Only PASSES are served; a FAIL, crash, timeout, [ INFRA ] or
+# cached). Each binary run is keyed afresh and gets a private STAGE: the
+# harness writes new passes there, and rc_commit promotes them only if, AFTER
+# the run, the tree is still clean, every artefact still hashes to the key and
+# no tracked path changed during the run; otherwise they are dropped. Any FAIL
+# poisons its test for the key. Only PASSES are served; a FAIL, crash, timeout, [ INFRA ] or
 # sanitizer skip always re-runs; BEZEL_AOT_FORCE_SANITIZE turns it off. The gate
 # never runs through here, and every gate script plus tests/run_parallel.sh
 # export BEZEL_RESULTS_CACHE=0 regardless.
@@ -435,8 +439,8 @@ run_sharded() {  # $1 filter $2 bin $3 shards $4 merged-log
 # measured: whole ownership area 1760 s cold -> 15 s on an unchanged build).
 RC_DEFAULT=on
 RC_SH="$ROOT/scripts/results_cache.sh"
-RC_STATE=off; RC_WHY=""; RC_KEYS=""; RC_ENV=()
-RC_REUSED=0; RC_EXECUTED=0; RC_KEYSEEN=""
+RC_STATE=off; RC_WHY=""; RC_KEYS=""; RC_ENV=(); RC_STAGE=""
+RC_REUSED=0; RC_EXECUTED=0; RC_KEYSEEN=""; RC_DROPPED=0
 rc_init() {
   case "${BEZEL_RESULTS_CACHE-}" in
     0|off|no|false) RC_STATE=off; RC_WHY="BEZEL_RESULTS_CACHE=${BEZEL_RESULTS_CACHE}"; return ;;
@@ -454,7 +458,7 @@ rc_init() {
   [ -x "$RC_SH" ] || { RC_STATE=off; RC_WHY="$RC_SH missing"; return; }
   RC_KEYS="$SCRATCH/results_cache.$$.keys"
   : > "$RC_KEYS" || { RC_STATE=off; RC_WHY="cannot write $RC_KEYS"; return; }
-  trap 'rm -f "$RC_KEYS"' EXIT
+  trap 'rm -f "$RC_KEYS"; case "$RC_STAGE" in */stage/run.*) rm -rf -- "$RC_STAGE" ;; esac' EXIT
   # Tidy the cache at most once every 6 hours (key dirs untouched for 5 days).
   local d="${BEZEL_RESULTS_CACHE_DIR:-/mnt/fast/test-results-cache}"
   if [ -d "$d" ] && [ -z "$(find "$d/.last_prune" -mmin -360 2>/dev/null)" ]; then
@@ -462,11 +466,24 @@ rc_init() {
   fi
 }
 # The env a test run gets for binary $1 (empty when the cache is off for it).
+# The stage is made BEFORE the key, so a change racing the key computation is
+# still newer than the stage's start.
 rc_env_for() {
-  RC_ENV=()
+  RC_ENV=(); RC_STAGE=""
   [ "$RC_STATE" != off ] || return 0
+  if ! RC_STAGE="$("$RC_SH" stage)"; then
+    RC_STAGE=""; echo "results_cache: off for $(basename "$1"): cannot create a stage" >&2; return 0
+  fi
   "$RC_SH" keys "$RC_KEYS" "$1" || true
-  RC_ENV=(BEZEL_RESULTS_CACHE_KEYS="$RC_KEYS" BEZEL_RESULTS_CACHE="$RC_STATE")
+  RC_ENV=(BEZEL_RESULTS_CACHE_KEYS="$RC_KEYS" BEZEL_RESULTS_CACHE="$RC_STATE" BEZEL_RESULTS_CACHE_STAGE="$RC_STAGE")
+}
+# After binary $1's run: promote its staged passes, or drop them all when the
+# tree or an artefact changed during the run (results_cache.sh commit).
+rc_commit() {
+  [ -n "$RC_STAGE" ] || return 0
+  local r; r="$("$RC_SH" commit "$RC_STAGE" "$RC_KEYS" "$1")"
+  case "$r" in "dropped "*) RC_DROPPED=$(( RC_DROPPED + $(printf '%s' "$r" | awk '{print $2}') )) ;; esac
+  RC_STAGE=""
 }
 # Fold one binary's merged `RESULTS CACHE:` line (from log $1) into the totals.
 rc_tally() {
@@ -481,7 +498,7 @@ rc_report() {
   if [ "$RC_STATE" = off ]; then
     echo "RESULTS CACHE: off ($RC_WHY) — every test executed"
   else
-    echo "RESULTS CACHE: $RC_REUSED reused, $RC_EXECUTED executed (mode $RC_STATE; key ${RC_KEYSEEN:-none: see the 'results_cache: off for' lines above})"
+    echo "RESULTS CACHE: $RC_REUSED reused, $RC_EXECUTED executed (mode $RC_STATE; key ${RC_KEYSEEN:-none: see the 'results_cache: off for' lines above})$( [ "$RC_DROPPED" -eq 0 ] || echo "; $RC_DROPPED new pass(es) DROPPED, not stored: the tree or an artefact changed during the run")"
   fi
 }
 
@@ -728,6 +745,7 @@ for f in "$@"; do
     elif [ "$rc" -ne 0 ]; then
       f_rc=1
     fi
+    rc_commit "$bin"
     cat "$blog" >> "$log"
     rc_tally "$blog"
     summ="$(grep -a -oE '[0-9]+ passed, [0-9]+ failed' "$blog" | tail -1)"

@@ -16,8 +16,16 @@
 //     export — executes the body even with a valid key file present, and a run
 //     with NO key file (the gate, a hand run) prints no cache line at all;
 //   * a FAIL is never stored, so it re-runs every time;
-//   * a recorded PASS contradicted by a later FAIL under the same key is
-//     POISONED and never served again, even after the test passes again;
+//   * ANY FAIL poisons the test for its key: a recorded PASS contradicted by a
+//     later FAIL, and equally a FAIL with no PASS yet (FAIL, then PASS, then
+//     a re-run must EXECUTE, not serve the PASS: review r42-rev-infra-rcache
+//     F1); a poisoned test is never served again, even after it passes again;
+//   * with a stage (BEZEL_RESULTS_CACHE_STAGE, what agent_check.sh passes) a
+//     new PASS goes to the stage, not the key directory, so nothing is served
+//     before scripts/results_cache.sh `commit` re-checks the tree (F2);
+//   * the env key covers the clang driver's CCC_* rewriting, gcc-style driver
+//     search paths and glibc MALLOC_* tuning (F3);
+//   * serving a PASS touches the key directory, so prune measures last use;
 //   * the key is bound to this binary's identity (a key file for a different
 //     stat id is ignored), to the behaviour-changing environment (a BEZEL_*
 //     knob flipped is a miss), and the cache is off under
@@ -28,6 +36,7 @@
 //     stat id and runs nothing.
 
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -36,7 +45,9 @@
 #include <utility>
 #include <vector>
 
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <utime.h>
 #include <unistd.h>
 
 #include "native_test_harness.hpp"
@@ -138,10 +149,11 @@ struct Fixture {
         BEZEL_EXPECT_EQ(execErrno, 0);
         return l;
     }
-    std::size_t passEntries() const {
+    std::size_t passEntries() const { return passEntriesUnder(cacheDir); }
+    static std::size_t passEntriesUnder(const std::string& root) {
         std::size_t n = 0;
         std::error_code ec;
-        for (auto it = fs::recursive_directory_iterator(cacheDir, ec);
+        for (auto it = fs::recursive_directory_iterator(root, ec);
              !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
             if (it->path().extension() == ".pass") ++n;
         return n;
@@ -234,7 +246,10 @@ BEZEL_TEST(support_results_cache, failing_test_is_never_stored) {
         Leg l = f.run(kCanaryRow, "1");
         BEZEL_EXPECT_FALSE(l.exitedZero());
         BEZEL_EXPECT_TRUE(has(l.out, "canary body executed"));
-        BEZEL_EXPECT_TRUE(has(l.out, "RESULTS CACHE: 0 reused, 1 executed, 0 stored, 0 poisoned"));
+        // The first FAIL poisons the key (F1); later runs see the poison.
+        BEZEL_EXPECT_TRUE(has(l.out, i == 0
+            ? "RESULTS CACHE: 0 reused, 1 executed, 0 stored, 1 poisoned, 0 unstored, 0 poisoned-reruns"
+            : "RESULTS CACHE: 0 reused, 1 executed, 0 stored, 0 poisoned, 0 unstored, 1 poisoned-reruns"));
         dumpOnFailure(l, "armed");
     }
     BEZEL_EXPECT_EQ(f.passEntries(), std::size_t{0});
@@ -278,6 +293,108 @@ BEZEL_TEST(support_results_cache, contradicted_pass_is_poisoned_for_good) {
         BEZEL_EXPECT_TRUE(has(again.out, "RESULTS CACHE: 0 reused, 1 executed, 0 stored, 0 poisoned"));
         dumpOnFailure(again, "re-pass");
     }
+}
+
+// ---------------------------------------------------------------------------
+// F1 (review r42-rev-infra-rcache), the reviewer's canary sequence: FAIL with
+// no PASS recorded, then PASS, then the failing body again. The FAIL must
+// poison the key, so the PASS is not stored and the third run EXECUTES (and
+// fails) instead of serving a PASS that would hide the flake for 5 days.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(support_results_cache, fail_then_pass_is_never_served) {
+    if (const char* c = std::getenv(kChildGuard); c && *c) return;
+    Fixture f("rcache-flake");
+
+    f.arm(true);
+    Leg fail = f.run(kCanaryRow, "1");
+    BEZEL_EXPECT_FALSE(fail.exitedZero());
+    BEZEL_EXPECT_TRUE(has(fail.out, "canary body executed"));
+    BEZEL_EXPECT_TRUE(has(fail.out, std::string("[ POISON ] ") + kCanary));
+    BEZEL_EXPECT_TRUE(has(fail.out, "RESULTS CACHE: 0 reused, 1 executed, 0 stored, 1 poisoned"));
+    BEZEL_EXPECT_TRUE(has(readAll(f.cacheDir + "/poison.log"), kCanary));
+    dumpOnFailure(fail, "first-fail");
+
+    f.arm(false);
+    Leg pass = f.run(kCanaryRow, "1");
+    BEZEL_EXPECT_TRUE(pass.exitedZero());
+    BEZEL_EXPECT_TRUE(has(pass.out, "canary body executed"));
+    BEZEL_EXPECT_TRUE(has(pass.out, "RESULTS CACHE: 0 reused, 1 executed, 0 stored"));
+    BEZEL_EXPECT_EQ(f.passEntries(), std::size_t{0});
+    dumpOnFailure(pass, "then-pass");
+
+    f.arm(true);
+    Leg rerun = f.run(kCanaryRow, "1");
+    BEZEL_EXPECT_FALSE(rerun.exitedZero());
+    BEZEL_EXPECT_TRUE(has(rerun.out, "canary body executed"));
+    BEZEL_EXPECT_TRUE(has(rerun.out, std::string("[ FAIL ] ") + kCanary));
+    BEZEL_EXPECT_FALSE(has(rerun.out, "[ CACHED ]"));
+    dumpOnFailure(rerun, "rerun");
+}
+
+// ---------------------------------------------------------------------------
+// F2: with a stage, a new PASS is written to the stage and NOT to the key
+// directory, so it cannot be served until results_cache.sh `commit` has
+// re-checked the tree after the run (pinned in scripts/gate/tests/
+// test_results_cache_gate_off.py) and promoted it.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(support_results_cache, stage_holds_new_passes_out_of_the_key_dir) {
+    if (const char* c = std::getenv(kChildGuard); c && *c) return;
+    Fixture f("rcache-stage");
+    const std::string stage = (f.dir / "stage").string();
+
+    Leg first = f.run(kCanaryRow, "1", true, {{"BEZEL_RESULTS_CACHE_STAGE", stage}});
+    BEZEL_EXPECT_TRUE(first.exitedZero());
+    BEZEL_EXPECT_TRUE(has(first.out, "RESULTS CACHE: 0 reused, 1 executed, 1 stored"));
+    BEZEL_EXPECT_EQ(Fixture::passEntriesUnder(stage), std::size_t{1});
+    BEZEL_EXPECT_EQ(f.passEntries(), std::size_t{0});
+    dumpOnFailure(first, "staged");
+
+    // Not promoted, so not served: the body executes again.
+    Leg second = f.run(kCanaryRow, "1", true, {{"BEZEL_RESULTS_CACHE_STAGE", stage}});
+    BEZEL_EXPECT_TRUE(second.exitedZero());
+    BEZEL_EXPECT_TRUE(has(second.out, "canary body executed"));
+    BEZEL_EXPECT_FALSE(has(second.out, "[ CACHED ]"));
+    BEZEL_EXPECT_TRUE(has(second.out, "RESULTS CACHE: 0 reused, 1 executed"));
+    dumpOnFailure(second, "not-served");
+}
+
+// ---------------------------------------------------------------------------
+// F3: driver and allocator knobs that can change a verdict are keyed.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(support_results_cache, env_key_covers_driver_and_malloc_knobs) {
+    if (const char* c = std::getenv(kChildGuard); c && *c) return;
+    for (const char* name :
+         {"CCC_OVERRIDE_OPTIONS", "COMPILER_PATH", "GCC_EXEC_PREFIX", "SDKROOT",
+          "OBJC_INCLUDE_PATH", "MALLOC_ARENA_MAX", "MALLOC_MMAP_THRESHOLD_",
+          "MALLOC_TOP_PAD_"}) {
+        BEZEL_EXPECT_TRUE(rc::envAffectsKey(name));
+        if (currentTestFailed()) std::cout << "not keyed: " << name << "\n";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F6: serving a PASS touches its key directory, so `results_cache.sh prune`
+// (which ages key directories by mtime) measures last USE, not last write.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(support_results_cache, serving_touches_the_key_dir_for_prune) {
+    if (const char* c = std::getenv(kChildGuard); c && *c) return;
+    Fixture f("rcache-touch");
+    Leg seed = f.run(kCanaryRow, "1");
+    BEZEL_EXPECT_TRUE(has(seed.out, "1 stored"));
+    std::vector<std::string> keyDirs;
+    for (const auto& e : fs::directory_iterator(f.cacheDir + "/v1"))
+        if (e.is_directory()) keyDirs.push_back(e.path().string());
+    BEZEL_EXPECT_EQ(keyDirs.size(), std::size_t{1});
+    if (keyDirs.size() != 1) return;
+    const struct utimbuf old {978307200, 978307200};  // 2001-01-01
+    BEZEL_EXPECT_EQ(::utime(keyDirs[0].c_str(), &old), 0);
+
+    Leg warm = f.run(kCanaryRow, "1");
+    BEZEL_EXPECT_TRUE(has(warm.out, std::string("[ CACHED ] ") + kCanary));
+    struct stat st {};
+    BEZEL_EXPECT_EQ(::stat(keyDirs[0].c_str(), &st), 0);
+    BEZEL_EXPECT_TRUE(st.st_mtime > ::time(nullptr) - 3600);
+    dumpOnFailure(warm, "warm");
 }
 
 // ---------------------------------------------------------------------------
