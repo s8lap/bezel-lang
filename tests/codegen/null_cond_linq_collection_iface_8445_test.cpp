@@ -130,10 +130,10 @@ void expectStdout(const std::string& program, const char* expected) {
 // THE ISSUE'S OWN REPRO — `?.Sum()` on `ICollection<T>?`.
 // ---------------------------------------------------------------------------
 
-// stdlib §5 / §7.5: `ICollection<int>?.Sum()` is REFUSED, exactly as the `.`
-// spelling `ICollection<int>.Sum()` is. Before the fix it was dropped: the
-// program compiled with the #3079 "failed to lower" warning, printed NOTHING
-// (not even a line terminator) and exited 0.
+// stdlib §4.1 (`ICollection`) and §5 (`Sum`) / §7.5: `ICollection<int>?.Sum()`
+// is REFUSED, exactly as the `.` spelling `ICollection<int>.Sum()` is. Before
+// the fix it was dropped: the program compiled with the #3079 "failed to lower"
+// warning, printed NOTHING (not even a line terminator) and exited 0.
 BEZEL_TEST(null_cond_linq_collection_iface_8445,
            icol_sum_rejected_spec_7_5) {
     BEZEL_EXPECT_TRUE(rejectedWith(
@@ -264,37 +264,14 @@ BEZEL_TEST(null_cond_linq_collection_iface_8445,
 }
 
 // ---------------------------------------------------------------------------
-// NO REGRESSION — the heads that DO lower keep lowering, and the #7557 / #853
-// fences keep their own diagnostics.
+// BOUNDARY CONTROLS — the #7557 / #853 fences keep their OWN diagnostics.
+// Each row is base-green by design; each is kept as a named control (cap: two
+// per suite). The list-interface no-regression and null-receiver rows were
+// moved to the corpus (see the probe dir corpus-candidates/).
 // ---------------------------------------------------------------------------
-
-// stdlib §5 / §4.1: the array-backed LIST interfaces are NOT polymorphic —
-// the concrete backing is erased nowhere — so `?.Sum()` on them PERFORMS and
-// answers the sum. (This is #7544's fix; the #8445 arm must not swallow it.)
-BEZEL_TEST(null_cond_linq_collection_iface_8445,
-           ilist_sum_no_regression_spec_7_5) {
-    expectStdout(
-        prog("  var a: Array<int> := [7, 8, 9]; "
-             "  var il: IList<int>? := a; "
-             "  var rol: IReadOnlyList<int>? := a; "
-             "  var e: IEnumerable<int>? := a; "
-             "  Console.WriteLine(il?.Sum() ?? -1); "
-             "  Console.WriteLine(rol?.Sum() ?? -1); "
-             "  Console.WriteLine(e?.Sum() ?? -1); "),
-        "24\n24\n24\n");
-}
-
-// §7.5 Evaluation: a null receiver yields null — the access does not occur.
-// The list interfaces keep that behaviour under the `?.` spelling.
-BEZEL_TEST(null_cond_linq_collection_iface_8445,
-           ilist_sum_null_receiver_spec_7_5) {
-    expectStdout(
-        prog("  var a: Array<int> := [7, 8, 9]; "
-             "  var nl: IList<int>? := null; "
-             "  Console.WriteLine(nl?.Sum() ?? -1); "),
-        "-1\n");
-}
-
+// CONTROL. Wrong fix caught: a `?.` arm that routes `?.Count` / `?.Contains`
+// past the #853 name-based fence into the #2457 backstop (a generic "produced
+// no value" text) fails the fence needles below.
 // stdlib §4.1 / §7.5: `?.Count` and `?.Contains(x)` on the polymorphic heads
 // are #7557's population and keep the #853 fence's OWN diagnostic (not the
 // #2457 backstop's): the fence is name-based and runs before the backstop.
@@ -312,6 +289,9 @@ BEZEL_TEST(null_cond_linq_collection_iface_8445,
         "`.Contains` through a polymorphic collection interface"));
 }
 
+// CONTROL. Wrong fix caught: a `?.` arm that emits its OWN diagnostic (a
+// nullable-receiver text, or the backstop wording) instead of the `.`
+// spelling's message fails the EXPECT_EQ on the two messages.
 // stdlib §4.1 / §7.5: `?.Contains(x)` on the READ-ONLY polymorphic head is
 // the §5 `IEnumerable<T>` operator (the head declares no `Contains`), and the
 // `.` spelling of it is refused by the #853 fence — the `?.` spelling must
