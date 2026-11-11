@@ -4328,6 +4328,9 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     !isPlusOneStringProducer(rs->value.get()) &&
                     !returnedStringLocalOwnsPlusOne(rs->value.get()))
                     emitStringRetain(v);
+                // fix #8537 (§28.9 / §8.6, v0.357): the block getter of an
+                // `Object`/interface-typed property returning a `string`.
+                mintObjectReturnStringRef(v, rs->value.get(), accRetTy6449);
             }
         // #429 (RETURN-escape category) / §4.6 / §28.9 / §28.3: a method whose
         // declared return type is (non-nullable) `string` mints EXACTLY +1 for
@@ -4375,6 +4378,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             !isPlusOneStringProducer(rs->value.get()) &&
             !returnedStringLocalOwnsPlusOne(rs->value.get()))
             emitStringRetain(v);
+        // fix #8537 (§28.9 / §8.6, v0.357): a block-bodied lambda whose
+        // result type is `Object`/an interface, returning a `string`.
+        if (rs->value && !currentReturnTypeNode_ && lamRet)
+            mintObjectReturnStringRef(v, rs->value.get(), lamRet);
         // fix #2691 / §27.3 / §27.5 / §28.9 (v0.240): the CLOSURE sibling of the
         // string mint immediately above — the category #2688 did not cover. The
         // closure branch further down keys on currentReturnTypeNode_, which
@@ -4454,6 +4461,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 !isPlusOneStringProducer(rs->value.get()) &&
                 !returnedStringLocalOwnsPlusOne(rs->value.get()))
                 emitStringRetain(v);
+            // fix #8537 (§28.9 / §8.6, v0.357): the method whose DECLARED
+            // return type is `Object`/an interface, returning a `string`
+            // (`F(x: string): Object  return x;`) — see
+            // mintObjectReturnStringRef.
+            mintObjectReturnStringRef(v, rs->value.get(), declRet);
         }
         // #429 (closure RETURN category) / §27.5 / §28.9 / §28.3: a method
         // whose declared return type is a function type (Kind::Function) mints

@@ -4395,6 +4395,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                     !isPlusOneStringProducer(lam.exprBody.get()) &&
                     !returnedStringLocalOwnsPlusOne(lam.exprBody.get()))
                     emitStringRetain(v);
+                // fix #8537 (§28.9 / §8.6, v0.357): an expression-bodied
+                // lambda whose result type is `Object`/an interface,
+                // returning a `string` (`lambda(s: string): Object => s`).
+                mintObjectReturnStringRef(v, lam.exprBody.get(), retSemaTy);
                 // Closure: retain unless the body is a +1 closure producer
                 //   (lambda / method-ref / user-method-closure-return) or is an
                 //   identifier naming a closure local that owns +1.

@@ -12146,6 +12146,10 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                     !isPlusOneStringProducer(ci.exprBody) &&
                     !returnedStringLocalOwnsPlusOne(ci.exprBody))
                     emitStringRetain(v);
+                // fix #8537 (§28.9 / §8.6, v0.357): the expression-bodied
+                // `Object`/interface-returning twin (`F(x: string): Object
+                // => x;`).
+                mintObjectReturnStringRef(v, ci.exprBody, declRet);
             }
             // fix #8141 (§22.2 / §28.9 / §21.7, v0.355): the CLOSURE twin of
             // the string mint just above, which this face never had. §22.2:
@@ -50302,6 +50306,88 @@ bool Emitter::objectStringSourceIsString(const ast::Expr* valueExpr) {
 // says it is a string), so every such store retains and the field's +1 leaks.
 // The slot type `Object` has no owner that could release it soundly until a
 // runtime discriminator exists (#8215 / #5059).
+// fix #8537 (§28.9 / §8.6, v0.357): a `string` leaving a method, lambda or
+// block getter through an `Object`- or interface-typed RETURN.
+//
+// §28.9 makes a string's lifetime the runtime's: it must stay valid for as
+// long as anything can still reach it. A `string`-typed return honours that
+// by MINTING — the callee retains a borrowed value (a parameter, a field, a
+// retained-and-released local) so the caller receives a reference of its
+// own. The same value returned through `Object` (§8.6: a reference type is
+// not boxed, so the result IS the string's pointer) minted nothing: the
+// caller got a +0 alias of a string whose only references belonged to
+// someone else, and stored it raw (an `Object` slot has no runtime
+// discriminator to retain through). `h.O := Conv.F(x);` then dangled as soon
+// as `x`'s scope-end release ran — the heap-use-after-free of #8537, in the
+// block-bodied, expression-bodied, virtual and lambda spellings alike, and
+// for a field source as much as a parameter.
+//
+// So the `Object`/interface return takes the reference the `string` return
+// takes, under the same two exclusions: a +1 PRODUCER's own reference
+// transfers, and so does that of a local which owns one it will not release
+// (`returnedStringLocalOwnsPlusOne`, plus its `Object`-typed twins below). The
+// value qualifies when some layer under a run of `!` and pointer-preserving
+// `as` is STATICALLY `string`; an `Object`-typed value with no such layer may
+// be a class instance and is left alone.
+//
+// The caller of an `Object`-returning method cannot release the result (it
+// does not know it is a string), so this reference is never dropped: the
+// trade is the bounded leak for the dangling read, as #8214 and #8307 made it
+// for the `Object` field store.
+void Emitter::mintObjectReturnStringRef(llvm::Value* v, const ast::Expr* value,
+                                        const sema::TypeRef* declRet) {
+    if (!v || !value || !v->getType()->isPointerTy()) return;
+    if (!isObjectOrInterfaceTarget(declRet)) return;
+    auto isStr = [](const sema::TypeRef* t) {
+        return t && t->kind == sema::TypeRef::Kind::Primitive &&
+               t->primitive == sema::PrimitiveType::String;
+    };
+    const ast::Expr* e = value;
+    bool stringLayer = false;
+    for (;;) {
+        if (!e) return;
+        if (isStr(ctx_.exprType(*e))) stringLayer = true;
+        if (isPlusOneStringProducer(e)) return;  // its own +1 transfers
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            e = pb->operand.get();
+            continue;
+        }
+        auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e);
+        if (!tt || tt->op != "as" || !tt->testType || !tt->operand) break;
+        const sema::TypeRef* asTy = ctx_.resolvedType(*tt->testType);
+        if (!isStr(asTy) && !isObjectOrInterfaceTarget(asTy)) break;
+        e = tt->operand.get();
+    }
+    if (!stringLayer) return;
+    if (returnedStringLocalOwnsPlusOne(e)) return;
+    // The `Object`-typed locals that own a reference the return transfers:
+    // a string-aliased slot retained at bind and not released at scope end
+    // (#2900), and a +1-producer-initialized local the escape walk left
+    // unreleased (`returnedStringLocalOwnsPlusOne` answers only for a
+    // `string`-typed one).
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+        auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+        if (loc && loc->decl) {
+            const void* declNode = static_cast<const void*>(loc->decl);
+            if (currentFn_ == objectStringReleaseEligibleFn_ &&
+                objectStringBorrowAll_.count(declNode) &&
+                !objectStringReleaseEligible_.count(declNode))
+                return;
+            if (currentFn_ == stringReleaseEligibleFn_ &&
+                stringLocalCandidates_.count(declNode) &&
+                !stringBorrowAll_.count(declNode) &&
+                !stringReleaseEligible_.count(declNode)) {
+                LocalDeclInitView view = localDeclInitView(loc->decl);
+                if (view.init && !view.isUsing &&
+                    isPlusOneStringProducer(view.init))
+                    return;
+            }
+        }
+    }
+    emitStringRetain(v);
+}
+
+
 void Emitter::collectObjectStringStorageFields() {
     if (objectStringStorageFieldsScanDone_) return;
     objectStringStorageFieldsScanDone_ = true;

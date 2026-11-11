@@ -23058,6 +23058,15 @@ private:
     // be a class instance, so retaining it as a string would be unsound).
     bool objectStringSourceIsString(const ast::Expr* valueExpr);
 
+    // fix #8537 (§28.9 / §8.6, v0.357): the `Object`/interface-return twin of
+    // the `string`-return mint. A return whose DECLARED type is `Object` or
+    // an interface and whose value is statically a `string` (under any run of
+    // `!` and pointer-preserving `as`) hands the caller the string's bare
+    // pointer; this retains `v` unless the value is a +1 producer or a local
+    // that already owns the reference it transfers. No-op otherwise.
+    void mintObjectReturnStringRef(llvm::Value* v, const ast::Expr* value,
+                                   const sema::TypeRef* declRet);
+
     // fix #8214 (§28.9 / §4.6 / §8.6, v0.355): is `target` an
     // OBJECT-STRING STORAGE FIELD lvalue — an Object/interface-typed CLASS
     // instance field / auto-property — stored from a string-typed source? Such
