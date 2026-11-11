@@ -15983,6 +15983,46 @@ private:
         return ctx_.resolvedType(*fd->type);
     }
 
+    // fix #7987 (§28.1 / §28.4 step 2 / §28.5, v0.357): the DECLARATION-LESS
+    // built-in interface heads `IDisposable` / `IAsyncDisposable` — the §28.5
+    // "class type or an interface type" heads that carry NO user TypeDecl
+    // (they are in `kBuiltinInterfaceHeads`, src/common/BuiltinRegistry.cpp,
+    // deliberately kept OUT of the vtable-less set by #4326).
+    //
+    // §28.1's type requirement admits `owned` on "an interface type"; §28.5
+    // admits the marker on an interface-typed field and says the modifier
+    // "auto-disposes the field when the containing object is disposed"; §28.4
+    // step 2 says the generated `Dispose()` "disposes all owned-bearing
+    // fields ... fields marked `owned` (class- or interface-typed; the field's
+    // value's `Dispose()` is called)". The runtime value of such a slot is
+    // ALWAYS a vtable-bearing class instance (§8.1 / stdlib §2.10: every class
+    // implicitly implements `IDisposable`; a class may explicitly implement
+    // `IAsyncDisposable`), so the discharge is the class-vtable slot-2 dynamic
+    // dispatch — the SAME path the `owned d: IDisposable` PARAMETER case
+    // takes (#4328 / #7554: `emitOwnedParamCaptureDispose` case (4)) and the
+    // same path the `using var` LOCAL case takes (the `dynamicDispose` arm of
+    // `registerUsingDisposal`).
+    //
+    // WHY A HEAD-NAME PREDICATE AND NOT A DECLARATION TEST. `IDisposable` /
+    // `IAsyncDisposable` have no `TypeDecl` — that is the whole defect: every
+    // declaration-keyed classifier (`isOwnedReferenceField` here,
+    // `elementPolicyFor`'s class/interface row in
+    // src/codegen/LlvmBackend_ElementPolicy.cpp) skipped the slot, so the
+    // value was never disposed and its destructor never ran (#7987: 25 600 B /
+    // 400 allocations for 200 CancellationTokenSources).
+    //
+    // The NAME is read through `builtinTypeName`, which sees BOTH the
+    // syntax-backed spelling (the local `astNode`) and the IMPORTED spelling
+    // (#662 foundation B: an imported field's TypeRef has no astNode; the
+    // loader records the raw name in `importedName`) — the same both-sources
+    // read every sibling builtin-field predicate uses.
+    static bool isDisposableInterfaceHeadType(const sema::TypeRef* t) {
+        if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+        if (t->declaration) return false;
+        std::string_view n = builtinTypeName(t);
+        return n == "IDisposable" || n == "IAsyncDisposable";
+    }
+
     bool isOwnedReferenceField(const sema::FieldSymbol* fs) {
         // §22.10 (v0.180): a captured `owned` primary-ctor parameter. Its type
         // rides `posParam->type` (fs->decl is the owning TypeDecl, not a
@@ -15991,10 +16031,18 @@ private:
             if (!isCapturedOwnedPrimaryParam(fs) || !fs->posParam->type)
                 return false;
             const sema::TypeRef* pt = ctx_.resolvedType(*fs->posParam->type);
-            if (!pt || pt->kind != sema::TypeRef::Kind::Named || !pt->declaration)
-                return false;  // (generic-param / Shared / collection params: a
-                               // narrower obligation left to a follow-up — never
-                               // a double-free, at worst the pre-v0.180 leak)
+            if (!pt || pt->kind != sema::TypeRef::Kind::Named)
+                return false;
+            // fix #7987 (§28.1 / §28.4 step 2 / §28.5, v0.357): the captured
+            // `owned` primary-ctor parameter typed at a declaration-less
+            // disposal head (`class H(owned d: IDisposable)`) — the capture
+            // field is an owned field of the class, so §28.4 step 2 disposes
+            // it exactly like a declared one. Before this arm the capture slot
+            // was skipped (the `!pt->declaration` test below rejected it) and
+            // the value leaked. The OTHER declaration-less params (a generic
+            // param / Shared / a collection) keep the pre-existing narrower
+            // obligation — never a double-free, at worst the pre-v0.180 leak.
+            if (!pt->declaration) return isDisposableInterfaceHeadType(pt);
             auto pk = pt->declaration->kind;
             return pk == ast::TypeDeclKind::Class ||
                    pk == ast::TypeDeclKind::Interface;
@@ -16002,6 +16050,16 @@ private:
         if (!hasOwnedModifier(fs)) return false;
         const sema::TypeRef* rt = declaredFieldTypeRef(fs);
         if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+        // fix #7987 (§28.1 / §28.4 step 2 / §28.5, v0.357): an `owned` field
+        // whose declared type is the declaration-less built-in interface head
+        // `IDisposable` / `IAsyncDisposable`. §28.5 admits the marker on an
+        // interface-typed field and §28.4 step 2 disposes it; the head has no
+        // TypeDecl, so the `rt->declaration` test below rejected it and the
+        // field was SKIPPED by `emitOwnedFieldDisposals` — the value leaked and
+        // its destructor never ran (#7987). The discharge is the class-vtable
+        // slot-2 dynamic dispatch, the same path a user-class-typed owned field
+        // takes (see isDisposableInterfaceHeadType's comment).
+        if (!rt->declaration && isDisposableInterfaceHeadType(rt)) return true;
         // (b) §28.5: a generic type-parameter field — classify by the concrete
         // substituted type of the current instantiation.
         if (!rt->declaration) {
@@ -16015,7 +16073,10 @@ private:
             if (isCollectionTypeName(concr) || isLinkedListTypeName(concr) ||
                 isDictTypeName(concr))
                 return false;
-            if (!concr->declaration) return false;
+            // fix #7987: the substitution may itself be a declaration-less
+            // disposal head (`owned _f: T` instantiated at `T = IDisposable`),
+            // which §28.5's per-instantiation rule classifies the same way.
+            if (!concr->declaration) return isDisposableInterfaceHeadType(concr);
             auto ck = concr->declaration->kind;
             return ck == ast::TypeDeclKind::Class ||
                    ck == ast::TypeDeclKind::Interface;

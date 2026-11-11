@@ -427,7 +427,36 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         (elemTy && elemTy->kind == sema::TypeRef::Kind::Named &&
          elemTy->declaration &&
          (elemTy->declaration->kind == ast::TypeDeclKind::Class ||
-          elemTy->declaration->kind == ast::TypeDeclKind::Interface))) {
+          elemTy->declaration->kind == ast::TypeDeclKind::Interface)) ||
+        // fix #7987 (§28.11 / §28.1 / §28.3, v0.357): the DECLARATION-LESS
+        // built-in interface head `IDisposable` / `IAsyncDisposable` as the
+        // ELEMENT type of an owning collection. §28.11's element-slot policy
+        // table classifies a "class / interface type" element in the OWNING
+        // family as an **owned** slot ("class / interface type | borrows |
+        // owned"), and the collection's `Dispose()` "disposes every live
+        // element" — so `OwningArray<IDisposable>` OWNS its elements and must
+        // dispose each of them.
+        //
+        // The head carries no user TypeDecl (`kBuiltinInterfaceHeads`,
+        // src/common/BuiltinRegistry.cpp), so the declaration-keyed class/­
+        // interface row above could not match it and the element fell to the
+        // Value row (a null disposer) — `bz_array_free` was called with a NULL
+        // element disposer and every element leaked (#7987: 25 600 B / 400
+        // allocations for 200 CancellationTokenSources in an
+        // `OwningArray<IDisposable>`; the destructor never ran).
+        //
+        // The discharge is the class-vtable slot-2 dynamic dispatch
+        // (`elementDisposerThunk` — the same thunk the user-class row uses):
+        // the runtime value of an `IDisposable` slot is always a vtable-bearing
+        // class instance (§8.1 / stdlib §2.10), so the thunk's slot-2 call
+        // reaches the value's own `Dispose()` and the block is then reclaimed.
+        //
+        // The BORROWING family keeps the borrow row (a null disposer): per
+        // §28.11 a borrowing collection's slots are borrows and "are never
+        // disposed — nor disposable through the collection", and §15.4's
+        // fresh-store rule rejects storing an unbound owned temporary into
+        // one. So `Array<IDisposable>` is unchanged by this arm.
+        isDisposableInterfaceHeadType(elemTy)) {
         if (owningFamily) {
             // per §28.11 v0.135: owned slot — disposal cascades via vtable
             // for class/interface; via bz_shared_release / bz_weak_release for
