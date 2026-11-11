@@ -9307,7 +9307,18 @@ void Resolver::checkAbstractImplementations() {
         // join the skip or every `closed` class with an abstract member would
         // be rejected.
         const bool isAbstract = typeIsAbstractOrClosed(t);
-        if (isAbstract) continue;  // abstract / `closed` classes need not impl.
+        // fix #8259 (spec §14.2 *Constraints on overrides and interface
+        // implementations*, §11.2, v0.357): an abstract / `closed` class
+        // still IMPLEMENTS the interface members it provides, so the
+        // witness side table (`recordInterfaceWitness`, #8184) must hold its
+        // witnesses too -- `ExprTC::currentMethodTypeParamMayInherit` reads
+        // it and, finding none, falls back to a same-name/same-arity shape
+        // walk that keeps a sibling interface's `where` clause. The
+        // obligations below are therefore still collected and matched for
+        // such a type, but NOTHING is REPORTED for it: abstract / `closed`
+        // classes need not implement every obligation (§12.5, §11.7), and
+        // the concrete subclass is checked on its own.
+        const bool witnessOnly = isAbstract;
 
         std::unordered_set<std::string_view> abstractNames;
         std::unordered_set<std::string_view> concreteNames;
@@ -9844,7 +9855,7 @@ void Resolver::checkAbstractImplementations() {
             concreteArities["Equals"].insert(1);  // Equals(T): 1 param
         }
         for (auto name : abstractNames) {
-            if (!concreteNames.count(name)) {
+            if (!witnessOnly && !concreteNames.count(name)) {
                 ctx_.diagnostics().report(
                     Severity::Error, t->declLoc,
                     std::string("concrete ") + kindWord + " `" +
@@ -9860,7 +9871,7 @@ void Resolver::checkAbstractImplementations() {
         // (§23.4 extends the same participation to indexers, #3641's already-
         // fixed sibling).
         for (auto name : abstractPropertyNames) {
-            if (!concretePropertyNames.count(name)) {
+            if (!witnessOnly && !concretePropertyNames.count(name)) {
                 ctx_.diagnostics().report(
                     Severity::Error, t->declLoc,
                     std::string("concrete ") + kindWord + " `" +
@@ -9876,6 +9887,7 @@ void Resolver::checkAbstractImplementations() {
         // function and dispatch reads/writes the wrong stack/register layout
         // (ABI corruption, garbage results). Report it as a conformance error.
         for (auto& [name, arities] : abstractArities) {
+            if (witnessOnly) break;  // fix #8259: abstract / `closed`: no report
             if (!concreteNames.count(name)) continue;  // missing name reported above
             auto cit = concreteArities.find(name);
             for (std::size_t arity : arities) {
@@ -10074,6 +10086,7 @@ void Resolver::checkAbstractImplementations() {
                 // constraint comparison below against out-of-bounds access when
                 // impl->genericParams.size() < gpCount.
                 if (impl->genericParams.size() != im->genericParams.size()) {
+                    if (witnessOnly) break;  // fix #8259: record, never report
                     // §11.2 (v0.314, #5392): a method that declares a different
                     // number of type parameters than the interface member has no
                     // positional correspondence — there is nothing to map the
@@ -10102,6 +10115,7 @@ void Resolver::checkAbstractImplementations() {
                 // is followed by a §11.2 diagnostic, and an unrecorded
                 // obligation leaves the reader on its shape-based answer.
                 if (implMatchesExactly) ctx_.recordInterfaceWitness(t, im, impl);
+                if (witnessOnly) continue;  // fix #8259: nothing below reports
                 std::unordered_map<std::string_view, const TypeRef*> implSubst;
                 auto csIt = classSubst.find(implClass);
                 if (csIt != classSubst.end()) implSubst = csIt->second;
@@ -10620,6 +10634,9 @@ void Resolver::checkAbstractImplementations() {
                 }
             }
         }
+        // fix #8259: an abstract / `closed` type was visited for its method
+        // witnesses only; the property / indexer checks below all report.
+        if (witnessOnly) continue;
         // §11.2 / §23 (#489): for each interface property, the implementing
         // class must provide a property (auto-property or block-form), NOT a
         // field. A FieldSymbol has no getter/setter function and cannot be
