@@ -29,6 +29,10 @@ you mid-run and was not reachable from here, add a line.
   never rules.
 - **A producer handed back** → its slot goes to **its reviewer first**.
 
+## Before you write a test row
+- Lane contract §7: every gtest row is red on the base; a spec-decided control goes to
+  `corpus-candidates/` for the corpus, at most two named gtest controls per suite.
+
 ## Before you pick
 - `scripts/handback_check.sh <branch> --base <staging>`; verify the REF, not the SHA you
   were handed. Pick only with `scripts/pick_stage.sh`, in authored order (the ancestor

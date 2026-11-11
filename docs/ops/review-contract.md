@@ -36,7 +36,11 @@ Run every check that applies, and quote what each one printed.
    rebuild would not. Then restore with `git checkout <sha> -- <those src files>`, run again, and
    confirm `git status --short` is clean. Never `git stash`. Report each row: the fix rows must
    fail on the base, and any control rows pass in both legs. An aggregate like "4/4 PASS" hides
-   a row that never failed. A control row that stays green on the base is doing its job: an
+   a row that never failed. **Count the base-green rows** (owner, 2026-11-12): at most two per
+   suite, each named in the commit body with the wrong fix it would catch. Every other base-green
+   gtest row is a finding: it moves to the corpus (list it in your report for the harvest lane).
+   Two or fewer unnamed is ACCEPT-W-NOTES; more is REJECT. A control row that stays green on the
+   base is otherwise doing its job: an
    **admitting twin** — the same shape with a legal value — is meant to be green on BOTH arms,
    because the base admitting the legal value is correct behaviour. If a brief told the lane that
    both rows must be red on base, the brief is what is wrong; say so rather than rejecting a

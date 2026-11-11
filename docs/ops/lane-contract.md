@@ -43,6 +43,13 @@ SPECIFIC to its assignment.*
    <base> -- <those files>`, run the filter (red), restore the copies, run again (green), and
    confirm `git status --short` is clean. Never `git stash`. New tests use `runAot` /
    `runAotChecked`; the in-process JIT harness is deprecated, so port a JIT row when you touch one.
+   **Every new gtest row is red on the base.** A program that is green on both arms is not a
+   gtest row. If a spec sentence decides its verdict (an admitting twin, a must-still-admit
+   shape, a live-source variant), put it with that sentence under `corpus-candidates/` in your
+   probe directory and name it in the handback; the harvest lane makes it a corpus case. At most
+   **two** gtest boundary controls per suite, only for a check a corpus case cannot express
+   (`assertNoLeak` over a loop, an ASan leg), each red under a plausible wrong fix that the commit
+   body names (owner, 2026-11-12).
 8. **A test that cannot fail is worse than no test.** Two known traps: `runAot` fills
    `JitResult::diagnostics` only on a *reject*, so asserting the absence of a Warning on a program
    that COMPILES is vacuous (#3138 — run `scripts/check_vacuous_tests.py`); and a hand-rolled
@@ -120,7 +127,9 @@ SPECIFIC to its assignment.*
     BASE arm and on your tip, and only the raise row is red on base. The twin's green-on-base is a
     positive control: it shows the shape is genuinely admitted rather than rejected for an unrelated
     reason. Do not "fix" the twin to be red; if your brief told you both rows must be red on base,
-    say so in the handback — the brief is what is wrong.
+    say so in the handback — the brief is what is wrong. The twin belongs in the matrix and in
+    `corpus-candidates/`, not as a gtest row, unless it is one of the suite's two named controls
+    (§7).
 19b. **A fix that adds a rejection, removes one, or renames a diagnostic sweeps embedded test
     programs too.** Most test programs are C++ string literals inside `tests/**/*.cpp`, often
     split across lines, so a sweep over tracked `.bzl` files and a line grep both miss them. List

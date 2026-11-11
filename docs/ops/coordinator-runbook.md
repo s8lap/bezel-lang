@@ -834,6 +834,15 @@ must be the issue's actual repro — assert termination for a hang, no-crash for
 crash, the corrected value for wrong-code, acceptance for an over-rejection,
 dispose-count/ASan-clean for a double-free.
 
+**A base-green row is not a regression test** (owner, 2026-11-12). Measured over R42's
+reviews, many suites carried rows that passed with AND without the fix: admitting twins,
+live-source variants, "still works" shapes. With the suite at ~45 000 tests, the owner asked
+whether such rows are needed. They are not, as gtest rows: each costs suite and review time
+and pins nothing about the fix. Where a spec sentence decides the program's verdict it is a
+conformance case, so it is routed to the corpus through `corpus-candidates/` and the harvest
+lane instead of being dropped. A suite keeps at most two gtest boundary controls, each red
+under a named wrong fix. Rows already landed are not pruned retroactively.
+
 ### Oracles that pass vacuously
 
 - **One-shot leak repros.** LSan reports *unreachable* allocations; a single run

@@ -13,7 +13,9 @@ per-case discipline.
 
 - **Harvest lane:** `h<N>` — branch `r<run>-h<N>-harvest`, worktree `/mnt/fast/worktrees/r<run>-h<N>`.
 - **Source directories:** the probe directories from the picks in `harvest.tsv` (the reviewer's
-  harvest list and the producer's handback name them).
+  harvest list and the producer's handback name them), including each one's `corpus-candidates/`
+  directory and the base-green controls a review moved out of gtest. These are where the
+  admitting twins live; each still needs the eight-point self-check.
 - **Scope:** `tests/conformance/rules/cases/` plus the derived `manifest.tsv`. Baseline rows are
   the integrator's, after the pick — do not edit `baseline.tsv`.
 - **Dispatch:** Sonnet, effort **HIGH**. **Size: ordinarily 60 cases or fewer.** The coordinator may
