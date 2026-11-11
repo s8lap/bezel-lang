@@ -53634,15 +53634,38 @@ bool Emitter::usingVarRhsIsPlainParameterBorrow(const ast::LocalDecl* ld) const 
 bool Emitter::usingVarRhsIsStoredTaskPropertyBorrow(
     const ast::LocalDecl* ld) const {
     if (!ld || !ld->initializer) return false;
-    auto* ma =
-        dynamic_cast<const ast::MemberAccessExpr*>(ld->initializer.get());
-    if (!ma || ma->member != "Task" || !ma->target) return false;
+    // fix #7423 (§7.5 / §30.11 / §28.10, v0.357): the `?.` SPELLING of the
+    // same read. `tcs?.Task` is a NullCondMemberExpr, not a MemberAccessExpr,
+    // so the plain spelling's test below never matched it and the `using var`
+    // over it was NOT recognised as the §28.10 borrow-pin — it registered a
+    // scope-end `d.task` disposal for a task the SOURCE owns, which is the
+    // double-free #6194 measured (a use-after-free on the source's own
+    // release of the SAME inner task).
+    //
+    // §7.5: "`x?.M` returns null if `x` is null; otherwise it performs the
+    // access" — the access IS the property read, so §30.11's rule applies to
+    // it unchanged: "The **source owns the task object** its `Task` property
+    // exposes. A read of the property is a **borrow** of the task ... there is
+    // no first-read ownership transfer." §28.10: over a borrow "the `using
+    // var` does **not** assume a disposal obligation ... at scope end, no
+    // `Dispose()` is called, because the value is not owned by this scope."
+    const ast::Expr* init = ld->initializer.get();
+    const ast::Expr* maTarget = nullptr;
+    std::string_view maMember;
+    if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(init)) {
+        maTarget = m->target.get();
+        maMember = m->member;
+    } else if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(init)) {
+        maTarget = m->target.get();
+        maMember = m->member;
+    }
+    if (!maTarget || maMember != "Task") return false;
     // The receiver's type is the discriminator: the stored-task sources and
     // nothing else. `builtinTypeName` is the same authority the TCS call
     // lowering (`tryLowerTcsCall`) and the TCS scope-end release
     // (`emitTcsRelease`) read, so the three cannot disagree about what a
     // TaskCompletionSource is.
-    std::string_view rcn = builtinTypeName(ctx_.exprType(*ma->target));
+    std::string_view rcn = builtinTypeName(ctx_.exprType(*maTarget));
     return rcn == "TaskCompletionSource" || rcn == "OwningTaskCompletionSource";
 }
 

@@ -47253,6 +47253,76 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             }
         }
     }
+    // fix #7423 (§7.5 / §30.11, v0.357): `tcs?.Task` — the `?.` twin of the
+    // `.` form's §30.11 STORED-TASK property arm (fix #974, the `ma.member ==
+    // "Task"` block in `resolveMemberAccess`).
+    //
+    // THE DEFECT. A `TaskCompletionSource<T>` / `OwningTaskCompletionSource<T>`
+    // is a BUILTIN class: it has no user TypeSymbol, so `lookupMember` finds
+    // no member and the `.` spelling's dedicated arm (which builds the
+    // `Task<T>` / `OwningTask<T>` TypeRef by hand) has no `?.` twin. The
+    // `?.` node was therefore left UNTYPED — no diagnostic, no type — and
+    // codegen's `NullCondMemberExpr` arm had no twin of the `.` form's
+    // `bz_tcs_task` read either, so the access lowered to NOTHING. The
+    // enclosing local kept a ZERO-INITIALISED slot (codegen's #2434
+    // "lowerLocalDecl's initializer expression failed to lower to a value"
+    // warning), and the `await` then loaded that i32 and passed it to
+    // `bz_task_is_done` / `bz_task_then`, which take a POINTER — MALFORMED
+    // IR, and the compiler ABORTS (issue #7423).
+    //
+    // THE RULE. §7.5: "`x?.M` returns null if `x` is null; otherwise it
+    // performs the access. **The result type is always nullable**." §30.11:
+    // "The **source owns the task object** its `Task` property exposes. A
+    // read of the property is a **borrow** of the task ... there is no
+    // first-read ownership transfer" — so the `?.` spelling of the read is
+    // the SAME borrow, taken of the same source's storage, and its result
+    // is the NULLABLE of the member type (`Task<T>?` / `OwningTask<T>?` /
+    // `Task?`).
+    //
+    // This arm builds the SAME TypeRef the `.` spelling builds (the same
+    // `Task` / `OwningTask` head, the same generic argument propagated from
+    // the source), lifted to nullable per §7.5 — so the two spellings of ONE
+    // member cannot disagree about its type.
+    //
+    // GUARDED by `!member`: a USER class that declares its own `Task`
+    // property is resolved by the ordinary member walk below and keeps the
+    // ordinary §28.6 receiver-sourced accessor rule (the `.` spelling's arm
+    // is guarded the same way — the receiver's TYPE is the discriminator, and
+    // a user class's `TaskCompletionSource` head has a `declaration`).
+    // GUARDED by `&nm != calleeOfCallCtx_`: a CALL spelling of a property is
+    // a different shape (§27.1 / §27.7), and the `.` spelling does not
+    // admit it either; it is left to the gates below.
+    if (!member && nm.member == "Task" && &nm != calleeOfCallCtx_) {
+        const TypeRef* tt = ctx_.exprType(*nm.target);
+        std::string_view tcsn;
+        if (tt && tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+            tt->astNode && tt->astNode->name &&
+            !tt->astNode->name->parts.empty())
+            tcsn = tt->headName();
+        if (tcsn == "TaskCompletionSource" ||
+            tcsn == "OwningTaskCompletionSource") {
+            // The `.` spelling's TypeRef, lifted to nullable per §7.5.
+            const char* taskName =
+                (tcsn == "OwningTaskCompletionSource") ? "OwningTask" : "Task";
+            auto* ann = new ast::Type();
+            ann->kind = ast::TypeKind::Named;
+            auto* nmName = new ast::QualifiedName();
+            nmName->parts.push_back(taskName);
+            ann->name.reset(nmName);
+            auto* tr = ctx_.makeTypeRef();
+            tr->kind = TypeRef::Kind::Named;
+            // §7.5: "The result type is always nullable."
+            tr->nullable = true;
+            tr->declaration = nullptr;
+            tr->astNode = ann;
+            // Propagate the generic arg: TaskCompletionSource<T>.Task → Task<T>.
+            if (tt && !tt->genericArgs.empty() && tt->genericArgs[0])
+                tr->genericArgs.push_back(
+                    const_cast<TypeRef*>(tt->genericArgs[0]));
+            ctx_.setExprType(&nm, tr);
+            return;
+        }
+    }
     // §7.5 / §26.5 / #458: for a NULLABLE VALUE type receiver (e.g. `int?`,
     // `bool?`, `enum?`, `record?`) memberTargetType returns null (because the
     // type is Primitive or Named-record, not a class TypeSymbol). Also fall
