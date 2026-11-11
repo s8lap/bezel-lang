@@ -14934,7 +14934,13 @@ private:
     // (bz_exc_end_handling): dispose it iff it is handler-owned or its owning
     // task deferred the disposal to this moment; a task-owned instance whose
     // owner is alive is "dropped [...] undisposed" (§31.2). Null-safe.
-    void emitEndExcHandling(llvm::Value* exc);
+    //
+    // fix #7954 (§30.4 / §31.2, v0.357): `leaving`, when given, is the
+    // instance in the in-flight slot on the exception edge that ends this
+    // handling. If it is `exc` itself the edge is not a supersession: the
+    // handling's hold is released and nothing is disposed
+    // (bz_exc_leave_handling).
+    void emitEndExcHandling(llvm::Value* exc, llvm::Value* leaving = nullptr);
 
     // fix #7940 (§31.2, v0.357): the LEAVE block of a handled region — a catch
     // arm's body, a `when` guard, a finally entered on an exception edge. While

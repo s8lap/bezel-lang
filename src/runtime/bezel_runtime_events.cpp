@@ -504,9 +504,13 @@ static void bz_raise_chain_step(void* completed_task, void* state) {
     auto* ctx = (BzRaiseChainCtx*)state;
     if (bz_task_is_error(completed_task)) {
         // §24 first-error-wins: fault outer, skip remaining handlers.
-        void* errObj = bz_task_error_obj(completed_task);
+        // fix #7954 (§30.9, v0.357): the handler task may only CARRY the
+        // instance (a fault that escaped into it from a task its body
+        // awaited); the outer task then carries it the same way.
+        uint8_t how = 0;
+        void* errObj = bz_task_take_fault(completed_task, &how);
         bz_task_free(completed_task);
-        bz_task_complete_error_obj(ctx->outer, errObj);
+        bz_task_complete_taken_fault(ctx->outer, errObj, how);
         free(ctx->payload_buf);
         delete ctx;
         return;

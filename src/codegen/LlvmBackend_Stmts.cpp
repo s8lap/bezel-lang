@@ -6592,7 +6592,8 @@ bool Emitter::lowerOwningInlineArrayReassign(const ast::Expr& target,
         // including the #1288/§30.9 deferred-fault clear so a superseded
         // task-owned fault's single-dispose invariant still holds. The
         // disposal itself is `emitDisposeAndReclaim` (idempotent Dispose +
-        // reclaim — bz_clear_exc_deferred resets the deferred flag first).
+        // reclaim), and only when the runtime says this end of handling is
+        // the end of the instance's life (emitEndExcHandling).
         llvm::Value* prevExc = loadInFlight();
         llvm::Value* prevIsNull = builder_.CreateICmpEQ(
             prevExc, llvm::ConstantPointerNull::get(ptrTy()));
@@ -6600,7 +6601,7 @@ bool Emitter::lowerOwningInlineArrayReassign(const ast::Expr& target,
         builder_.SetInsertPoint(disposePrevBB);
         // fix #7940 (§31.2 / §30.9, v0.357): end its handling — a task-owned
         // instance whose owner is alive is dropped undisposed.
-        emitEndExcHandling(prevExc);
+        emitEndExcHandling(prevExc, newExc);
         builder_.CreateBr(setInFlightBB);
         // setInFlightBB: store newExc (the latest throw) into inFlightSlot,
         // clear bz$exc so the next iter's dispose sees a clean context,
@@ -6648,7 +6649,7 @@ bool Emitter::lowerOwningInlineArrayReassign(const ast::Expr& target,
     builder_.CreateCondBr(hadParked, supersedeParkedBB, finalBB);
     builder_.SetInsertPoint(supersedeParkedBB);
     // fix #7940 (§31.2 / §30.9, v0.357): as above.
-    emitEndExcHandling(parkedExc);
+    emitEndExcHandling(parkedExc, finalInFlight);
     builder_.CreateBr(finalBB);
     builder_.SetInsertPoint(finalBB);
     llvm::Value* restoredExc = builder_.CreateSelect(

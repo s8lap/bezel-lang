@@ -561,6 +561,14 @@ struct bz_task_t {
     // consumption, per the same section). Always false for an ordinarily-
     // faulted task, which does own its exception (§30.9).
     bool fault_borrowed = false;
+    // fix #7954 (§30.9, v0.357): true when this task's fault is another task's
+    // instance that ESCAPED an async frame into it ("the faulted task carries
+    // it as a borrow"), and the hold of the raise that was in flight moved
+    // into this task with it (bz_task_complete_escaped_fault). Implies
+    // `fault_borrowed`. The task releases the hold exactly once, at its
+    // teardown (bz_task_destroy) — or hands it on with the instance when a
+    // runtime combinator takes the fault out of it (bz_task_take_fault).
+    bool fault_hold = false;
     char* error_msg = nullptr;
     // §30.9: the ORIGINAL exception object that faulted this task (a Bezel heap
     // object with a leading vtable word). Preserved across the task boundary so
@@ -619,6 +627,13 @@ struct bz_task_t {
     struct Cont { void (*fn)(void*, void*); void* state; };
     std::vector<Cont> continuations;
 };
+// fix #7954 (§30.9, v0.357): moving a fault out of a settled task into another
+// task, or swallowing it, WITH how the task held it (owner / borrower /
+// borrower carrying the escape's hold). Defined in
+// bezel_runtime_concurrency.cpp next to bz_task_complete_escaped_fault.
+void* bz_task_take_fault(void* task, uint8_t* how);
+void  bz_task_complete_taken_fault(void* task, void* error_obj, uint8_t how);
+void  bz_drop_taken_fault(void* error_obj, uint8_t how);
 struct bz_event_source_t;  // full def in bezel_runtime_events.cpp
 // #7956 (stdlib §6.7 / spec §30.8): one PENDING cancellable delay — a
 // `Task.Delay(ms, token)` that has not reached its deadline yet.  The waiter

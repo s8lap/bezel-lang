@@ -876,7 +876,7 @@ int8_t bz_task_fault_borrowed(void* tp) {
     return ((bz_task_t*)tp)->fault_borrowed ? 1 : 0;
 }
 
-// §30.4 / §30.9 (#854): borrowed-exception set. When an `await` of a BOUND
+// §30.4 / §30.9 (#854): borrowed-exception holds. When an `await` of a BOUND
 // (multi-awaitable) faulted task re-raises the task's stored error_obj into the
 // in-flight exception slot, the catch arm that handles it must NOT reclaim the
 // object (it is BORROWED from the task, not owned by the awaiter) — otherwise a
@@ -885,11 +885,10 @@ int8_t bz_task_fault_borrowed(void* tp) {
 // caught-exception disposal skips a borrowed object. A PER-OBJECT set (not a
 // single flag) is required: an arm body may throw/catch a nested NORMAL exception
 // between the mark and the borrowed object's own disposal, so membership must be
-// keyed by the object pointer. Idempotent: mark/unmark of a pointer already
-// in/absent from the set is a no-op.
+// keyed by the object pointer.
 //
 // fix #7795 / #7705 (§30.9 / §31.2, v0.350): PROCESS-WIDE, not thread-local.
-// Both this set and g_deferred_exc_dispose below were thread-local "because the
+// Both this table and g_deferred_exc_dispose below were thread-local "because the
 // in-flight exception slot (bz_exc) is thread-local". But a mark is a fact about
 // the INSTANCE — it is task-owned and in flight; its owner was disposed while it
 // was in flight — and the activation that marks it and the one that reads it
@@ -904,23 +903,44 @@ int8_t bz_task_fault_borrowed(void* tp) {
 // Pointers are unique process-wide, so one set keyed by them has exactly the
 // thread-local semantics minus the loss. Mutex-guarded (the paths are exception
 // paths: a re-raise, a catch arm's exit, a faulted task's scope end).
+//
+// fix #7954 (§30.9 / §30.4, v0.357): a COUNT of holds per instance, not a set.
+// The mark was idempotent, and that was the defect: several handlings of one
+// task-owned instance coexist — a nested catch arm that awaits the same bound
+// task again, a second awaiter of a multi-awaited task (§30.4; §30.9: "every
+// awaiter of a multi-awaited faulted task re-raises the same live instance"),
+// a faulted task that carries the instance as a borrow (§30.9) — and the
+// FIRST of them to end erased the one
+// mark all of them relied on. The instance then read as handler-owned: the
+// next end of handling, or the owner's own disposal, freed it under a handler
+// still reading it. The rule is now arithmetic:
+//   * every RAISE of a task-owned instance takes one hold (the await / Result
+//     hand-off: bz_mark_exc_borrowed; a bare `throw;`: bz_exc_reraise);
+//   * every END OF A HANDLING releases exactly one (bz_exc_end_handling,
+//     bz_exc_leave_handling) and disposes only what no task owns, or what the
+//     owner deferred to this very release (g_deferred_exc_dispose);
+//   * a fault that escapes into a task MOVES the in-flight hold into the
+//     faulted task (bz_task_complete_escaped_fault, bz_task_t::fault_hold),
+//     which releases it at its teardown (bz_task_destroy);
+//   * the owner's disposal defers while any hold is out (bz_is_exc_borrowed →
+//     bz_defer_exc_dispose).
+// An instance with no entry is handler-owned (§31.1): one handling, which
+// disposes it when it ends.
 static std::mutex g_exc_marks_mtx;
-static std::unordered_set<void*> g_borrowed_exc;
+static std::unordered_map<void*, uint32_t> g_exc_holds;
 
+// Take one hold: `obj` was re-raised from a task that still owns or carries it.
 extern "C" void bz_mark_exc_borrowed(void* obj) {
     if (!obj) return;
     std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
-    g_borrowed_exc.insert(obj);
+    ++g_exc_holds[obj];
 }
+// Is any hold out on `obj` — i.e. is it in flight, being handled, or carried
+// by a faulted task?
 extern "C" int8_t bz_is_exc_borrowed(void* obj) {
     if (!obj) return 0;
     std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
-    return g_borrowed_exc.count(obj) ? 1 : 0;
-}
-extern "C" void bz_unmark_exc_borrowed(void* obj) {
-    if (!obj) return;
-    std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
-    g_borrowed_exc.erase(obj);
+    return g_exc_holds.count(obj) ? 1 : 0;
 }
 
 // §30.9 fault ownership (v0.179), in-flight-deferral refinement (a). A faulted
@@ -935,27 +955,59 @@ extern "C" void bz_unmark_exc_borrowed(void* obj) {
 // the task's scope-end disposal (the exception is marked BORROWED —
 // bz_is_exc_borrowed — because an `await`/`.Result` re-raise put it in flight)
 // and, instead of disposing it there, records it here; the disposal is then
-// performed as the TERMINAL ACT of exception handling, at the catch arm's normal
-// exit (bz_is_exc_deferred → codegen emits the real Dispose + reclaim, then
-// bz_clear_exc_deferred). Process-wide like g_borrowed_exc, for the same reason
-// (fix #7795 / #7705): the recording scope end and the draining arm exit may
+// performed as the TERMINAL ACT of exception handling: the release of the last
+// hold consumes the record and tells its caller to dispose
+// (bz_exc_end_handling). Process-wide like g_exc_holds, for the same reason
+// (fix #7795 / #7705): the recording scope end and the draining release may
 // run on different workers.
 static std::unordered_set<void*> g_deferred_exc_dispose;
 
+extern "C" void bz_dispose_class_obj(void* obj);
+
+// The owner's disposal of `obj` found it held (bz_is_exc_borrowed) and hands
+// the disposal to the release of the last hold. fix #7954: re-checked under
+// the lock — if the last hold was released between the caller's test and this
+// call (another worker ended the handling), nobody is left to drain a record,
+// so the owner's disposal happens here after all instead of being recorded
+// for ever (a leak, and a stale record a later instance at the same address
+// would be disposed by).
 extern "C" void bz_defer_exc_dispose(void* obj) {
     if (!obj) return;
-    std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
-    g_deferred_exc_dispose.insert(obj);
+    {
+        std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
+        if (g_exc_holds.count(obj)) {
+            g_deferred_exc_dispose.insert(obj);
+            return;
+        }
+    }
+    bz_dispose_class_obj(obj);
 }
-extern "C" int8_t bz_is_exc_deferred(void* obj) {
-    if (!obj) return 0;
-    std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
-    return g_deferred_exc_dispose.count(obj) ? 1 : 0;
-}
-extern "C" void bz_clear_exc_deferred(void* obj) {
+
+// fix #7954 (§31.2 / §31.1, v0.357): a bare `throw;` raises the caught
+// instance AGAIN, and a raise is a hold.
+//   * A task-owned instance (it has holds) takes one more: the arm's own hold
+//     is released when the rethrow leaves the arm (bz_exc_leave_handling), or
+//     the nested arm that catches the rethrow releases the new one, and the
+//     instance is held through whatever the unwind crosses — its owner, if a
+//     scope on the way disposes it, still defers.
+//   * A handler-owned instance (§31.1; no entry) stops having a single
+//     handling: the arm that owns it and the new raise both hold it now, and
+//     a nested arm inside the first may catch the rethrow and end before the
+//     first does. Its disposal therefore becomes what a task-owned one's is
+//     after its owner deferred — the act of the LAST release: two holds, and
+//     the disposal on record. Whichever of the two handlings ends last
+//     disposes it; if the rethrow escapes into a task, the task carries the
+//     remaining hold and its teardown is that last release.
+extern "C" void bz_exc_reraise(void* obj) {
     if (!obj) return;
     std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
-    g_deferred_exc_dispose.erase(obj);
+    auto it = g_exc_holds.find(obj);
+    if (it != g_exc_holds.end()) {
+        ++it->second;
+        return;
+    }
+    g_exc_holds[obj] = 2;
+    g_deferred_exc_dispose.insert(obj);
 }
 
 // fix #7940 (§31.2 / §30.9 / §31.1, v0.357): END ONE HANDLING of `obj`, and
@@ -976,11 +1028,46 @@ extern "C" void bz_clear_exc_deferred(void* obj) {
 // its bound task still owned (and re-raises to its next awaiter, §30.4).
 // One lock for the whole decision: the mark and the deferral are read together
 // or a concurrent owner disposal can slip between them.
+//
+// fix #7954: releases ONE hold. Only the release of the LAST hold can be the
+// end of a task-owned instance's life; while another handling, or a faulted
+// task carrying the instance, still holds it, the answer is 0.
+static int8_t exc_end_handling_locked(void* obj) {
+    auto it = g_exc_holds.find(obj);
+    if (it == g_exc_holds.end()) {
+        // Handler-owned. No record can be pending for it: one left behind by
+        // an earlier instance at this address must not outlive this one.
+        g_deferred_exc_dispose.erase(obj);
+        return 1;
+    }
+    if (--it->second > 0) return 0;
+    g_exc_holds.erase(it);
+    return g_deferred_exc_dispose.erase(obj) ? 1 : 0;
+}
 extern "C" int8_t bz_exc_end_handling(void* obj) {
     if (!obj) return 0;
     std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
-    if (!g_borrowed_exc.erase(obj)) return 1;
-    return g_deferred_exc_dispose.erase(obj) ? 1 : 0;
+    return exc_end_handling_locked(obj);
+}
+
+// fix #7954 (§31.2 / §30.4, v0.357): an exception edge LEAVES a handled region
+// (a catch arm, a `when` guard, a finally entered on an exception edge) whose
+// instance is `handled`; `leaving` is the instance in the in-flight slot.
+//   * A different instance supersedes `handled` (§31.2): its handling ends
+//     (bz_exc_end_handling — returns 1 when the caller must dispose it).
+//   * The SAME instance leaves — a bare `throw;`, or the task that owns it
+//     awaited again inside the region. That raise took its own hold
+//     (bz_exc_reraise, bz_mark_exc_borrowed); the region's hold is released
+//     here, so the instance travels on with exactly the one hold of the raise
+//     that is in flight. It is never disposed here (returns 0), and the last
+//     hold is never released here: an instance in flight stays held.
+extern "C" int8_t bz_exc_leave_handling(void* handled, void* leaving) {
+    if (!handled) return 0;
+    std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
+    if (handled != leaving) return exc_end_handling_locked(handled);
+    auto it = g_exc_holds.find(handled);
+    if (it != g_exc_holds.end() && it->second > 1) --it->second;
+    return 0;
 }
 
 // fix #7943 (§30.9, v0.357): complete `tp` with the fault that ESCAPED its
@@ -1003,13 +1090,63 @@ extern "C" int8_t bz_exc_end_handling(void* obj) {
 // An unmarked escaping instance (a handler-owned one, §31.1: thrown in the
 // frame, or re-raised from a task the await consumed) is owned by the faulted
 // task as before.
+//
+// fix #7954 (§30.9, v0.357): "The capture ends the frame's handling of the
+// instance", and the faulted task now CARRIES it: the hold of the raise that
+// was in flight is not released at the capture but moves into the task
+// (`fault_hold`), which releases it at its teardown (bz_task_destroy). That one
+// move is every retention row of the paragraph. An operand the frame owned —
+// a plain local, a `using var`, an `owned` parameter — is disposed while the
+// hold is out, so its disposal of the instance is deferred "to the faulted
+// task's teardown"; a borrowed operand outlives that teardown, so the release
+// disposes nothing; and every awaiter of the faulted task in between takes and
+// releases a hold of its own on an instance that stays live under them.
 extern "C" void bz_task_complete_escaped_fault(void* tp, void* error_obj) {
     if (error_obj) {
         std::lock_guard<std::mutex> lk(g_exc_marks_mtx);
-        if (g_borrowed_exc.count(error_obj))
+        if (g_exc_holds.count(error_obj)) {
             ((bz_task_t*)tp)->fault_borrowed = true;
+            ((bz_task_t*)tp)->fault_hold = true;
+        }
     }
     bz_task_complete_error_obj(tp, error_obj);
+}
+
+// fix #7954 (§30.9, v0.357): a runtime combinator takes the fault OUT of a
+// settled task it is about to free — a TaskScope child, a WhenAllOwned input,
+// an async event handler — to re-raise it through another task (or to swallow
+// it). The pointer alone is not the fault: how the task held it travels with
+// it. bz_task_take_fault returns the instance and, in `*how`, whether the task
+// carried it as a borrow and whether it held the escape's hold; the hold
+// leaves the task with the instance, so the task's teardown does not release
+// what the combinator now carries. The combinator ends in exactly one of:
+//   * bz_task_complete_taken_fault — the receiving task carries the instance
+//     exactly as the source did (owner, borrower, or borrower with the hold);
+//   * bz_drop_taken_fault — the fault is swallowed: an owned instance is
+//     disposed, a carried one releases its hold (which disposes it only if its
+//     owner deferred to that release), a plainly borrowed one is left to its
+//     owner.
+enum : uint8_t { BZ_FAULT_BORROWED = 1, BZ_FAULT_HOLD = 2 };
+void* bz_task_take_fault(void* tp, uint8_t* how) {
+    auto* t = (bz_task_t*)tp;
+    *how = (uint8_t)((t->fault_borrowed ? BZ_FAULT_BORROWED : 0) |
+                     (t->fault_hold ? BZ_FAULT_HOLD : 0));
+    t->fault_hold = false;
+    return t->error_obj;
+}
+void bz_task_complete_taken_fault(void* tp, void* error_obj, uint8_t how) {
+    auto* t = (bz_task_t*)tp;
+    t->fault_borrowed = (how & BZ_FAULT_BORROWED) != 0;
+    t->fault_hold = (how & BZ_FAULT_HOLD) != 0;
+    bz_task_complete_error_obj(tp, error_obj);
+}
+void bz_drop_taken_fault(void* error_obj, uint8_t how) {
+    if (!error_obj) return;
+    if (how & BZ_FAULT_HOLD) {
+        if (bz_exc_end_handling(error_obj)) bz_dispose_class_obj(error_obj);
+    } else if (!(how & BZ_FAULT_BORROWED)) {
+        bz_dispose_class_obj(error_obj);
+    }
 }
 
 bool bz_task_is_done(void* tp) {
@@ -1312,6 +1449,20 @@ static void bz_task_destroy(bz_task_t* task) {
     // before this task's own bz_task_complete runs) — the same "no other
     // thread still touches the struct" invariant this function's own top
     // comment already relies on extends transitively to it.
+    // fix #7954 (§30.9, v0.357): a fault this task CARRIED (an instance that
+    // escaped an async frame into it while another task owns it) came with the
+    // hold of the raise that was in flight (bz_task_complete_escaped_fault).
+    // The task's teardown is where that hold is released — "the retained task
+    // is disposed with the faulted task, and the instance with it": if the
+    // owner's disposal was deferred to this release, the instance is disposed
+    // here; if the owner is still alive, or another handling still holds the
+    // instance, nothing is. This is not the owner's disposal the paragraph
+    // above keeps out of this function: an owning task still never disposes
+    // its fault here.
+    if (task->fault_hold && task->error_obj) {
+        if (bz_exc_end_handling(task->error_obj))
+            bz_dispose_class_obj(task->error_obj);
+    }
     bool chainedSourceOwnsResult =
         task->chained_source &&
         static_cast<bz_task_t*>(task->chained_source)->result != nullptr;
@@ -1681,7 +1832,7 @@ static void bz_dispose_class_obj_impl(void* obj) {
 // EXPERIMENT (#5872): process-wide registry of RUNTIME-OWNED exceptions —
 // objects the spec declares live for the life of the process and that no
 // handler may ever reclaim. The §22.7 cached TypeInitializationException is
-// the motivating case. Unlike g_borrowed_exc this must NOT be thread-local:
+// the motivating case. Unlike the borrowed-exception table (g_exc_holds) once was, this must NOT be thread-local:
 // the cached instance is process-global, so a mark made on the domain that
 // ran the failing initializer has to be visible to every other domain that
 // later catches it. Mutex-guarded (a cross-domain insert/read).
@@ -1794,8 +1945,14 @@ void* bz_task_when_all_owned(void* task_arr) {
                 delete slot;
 
                 if (bz_task_is_error(completedTask)) {
-                    c->is_fault[i] = 1;
-                    c->fault_objs[i] = bz_task_error_obj(completedTask);
+                    // fix #7954 (§30.9, v0.357): take the fault WITH how the
+                    // input held it — an input whose fault escaped into it
+                    // from a task its body awaited carries a borrow and a
+                    // hold, not an instance it owns. is_fault[i] keeps the
+                    // "faulted" bit and, above it, that record.
+                    uint8_t how = 0;
+                    c->fault_objs[i] = bz_task_take_fault(completedTask, &how);
+                    c->is_fault[i] = (int8_t)(1 | (how << 1));
                 } else {
                     // Capture the result pointer (T*) from the OwningTask<T>.
                     // The result is a pointer-sized value stored as void*.
@@ -1832,10 +1989,13 @@ void* bz_task_when_all_owned(void* task_arr) {
                         // Dispose every OTHER faulted input's exception —
                         // same reasoning; only firstFault's is re-raised.
                         for (int64_t j = 0; j < c->n; ++j) {
-                            if (c->is_fault[j] && j != firstFault && c->fault_objs[j])
-                                bz_dispose_class_obj(c->fault_objs[j]);
+                            if (c->is_fault[j] && j != firstFault)
+                                bz_drop_taken_fault(
+                                    c->fault_objs[j],
+                                    (uint8_t)(c->is_fault[j] >> 1));
                         }
                         void* errObj = c->fault_objs[firstFault];
+                        uint8_t errHow = (uint8_t)(c->is_fault[firstFault] >> 1);
                         free(c->results);
                         free(c->is_fault);
                         free(c->fault_objs);
@@ -1844,8 +2004,11 @@ void* bz_task_when_all_owned(void* task_arr) {
                             // so (unlike the borrowing WhenAll/WhenAll<T>) no
                             // other reference survives — the aggregate is the
                             // sole owner and disposes this exception itself
-                            // (fault_borrowed stays false, its default).
-                            bz_task_complete_error_obj(c->aggregate, errObj);
+                            // (fault_borrowed stays false, its default) —
+                            // unless the INPUT only carried it (fix #7954):
+                            // the aggregate then carries it the same way.
+                            bz_task_complete_taken_fault(c->aggregate, errObj,
+                                                         errHow);
                         } else {
                             // Defensive fallback: a message-only fault (no
                             // captured object). Not expected in practice for a
@@ -1975,8 +2138,13 @@ void  bz_task_fire_and_forget(void* tp) {
         // remains the sole owner). No-lock read: by the time this runs the
         // task has settled — the same invariant bz_task_free's lock-free
         // reads below already rely on.
+        // fix #7954 (§30.9, v0.357): the owner's disposal defers while the
+        // instance is held — an explicit `Task.FireAndForget(move t)` inside
+        // the arm that is handling t's fault is "a task disposed while its
+        // own fault exception is in flight" (bz_defer_exc_dispose disposes
+        // now when nothing holds it).
         if (task->error_obj && !task->fault_borrowed) {
-            bz_dispose_class_obj(task->error_obj);
+            bz_defer_exc_dispose(task->error_obj);
             task->error_obj = nullptr;
         }
         bz_task_free(tp);
@@ -2005,7 +2173,7 @@ void  bz_task_fire_and_forget(void* tp) {
                 // aggregate that BORROWED its fault from an input task
                 // (§30.10 / #1529: the input remains the sole owner).
                 if (t->error_obj && !t->fault_borrowed) {
-                    bz_dispose_class_obj(t->error_obj);
+                    bz_defer_exc_dispose(t->error_obj);   // fix #7954
                     t->error_obj = nullptr;
                 }
                 bz_task_free(completedTask);
@@ -2053,9 +2221,10 @@ static void bz_task_faf_report_disposed_access(bz_task_t* task,
     // fix #7943 (§30.9, v0.357): unless the task only CARRIES the instance —
     // a DisposedAccessException that another task owns and an `await` re-raised
     // into this frame ("it does not become its owner"). The report is still
-    // made; the disposal stays its owner's.
+    // made; the disposal stays its owner's, and the hold this task carries is
+    // released at its teardown (bz_task_destroy).
     if (task->fault_borrowed) return;
-    bz_dispose_class_obj(task->error_obj);
+    bz_defer_exc_dispose(task->error_obj);   // fix #7954: hold-aware
     task->error_obj = nullptr;
 }
 
@@ -2103,7 +2272,7 @@ void  bz_task_fire_and_forget_checked(void* tp, void* disposedAccessVtable) {
                 auto* t = (bz_task_t*)completedTask;
                 bz_task_faf_report_disposed_access(t, state);
                 if (t->error_obj && !t->fault_borrowed) {
-                    bz_dispose_class_obj(t->error_obj);
+                    bz_defer_exc_dispose(t->error_obj);   // fix #7954
                     t->error_obj = nullptr;
                 }
                 bz_task_free(completedTask);
@@ -4290,6 +4459,8 @@ struct bz_task_scope_t {
     bool disposed = false;         // a dispose path ran (idempotence guard)
     bool any_fault = false;        // first-fault latch
     void* first_error_obj = nullptr;   // owned here until re-raised via Join
+    uint8_t first_error_how = 0;       // fix #7954: how the child held it
+                                       // (bz_task_take_fault)
     char* first_error_msg = nullptr;   // strdup'd when the fault carried only
                                        // a message; owned here
     std::vector<bz_task_t*> join_waiters;   // pending Join() aggregates
@@ -4314,8 +4485,13 @@ static void* bz_scope_invoke_task_closure(void* closure) {
 
 // Dispose a swallowed Bezel exception object: dynamic dispatch through vtable
 // slot 2 (Dispose) then free — the bz_domain_spawn fault-wrap pattern.
-static void bz_scope_dispose_exc(void* exc) {
+//
+// fix #7954 (§30.9, v0.357): `how` is how the child task held the instance
+// (bz_task_take_fault). Only an instance the child OWNED is disposed here; one
+// it carried for another task is released, not disposed (bz_drop_taken_fault).
+static void bz_scope_dispose_exc(void* exc, uint8_t how) {
     if (!exc) return;
+    if (how) { bz_drop_taken_fault(exc, how); return; }
     // #5872 fix-forward: a scope.Spawn child whose entry touches a type in the
     // §22.7 failed state faults with the CACHED TypeInitializationException.
     // On the first-fault-wins path every LATER faulting child's errObj is
@@ -4357,6 +4533,8 @@ struct BzScopeFinalActions {
     std::vector<bz_task_t*> join_ok;      // complete with success
     bz_task_t* join_fault = nullptr;      // complete with first_error_obj/msg
     void* fault_obj = nullptr;
+    uint8_t fault_how = 0;                // of fault_obj / swallow_obj (one
+                                          // settle moves the fault to one)
     char* fault_msg = nullptr;            // ownership moves to this struct
     bz_task_t* dispose_task = nullptr;    // complete (or IOE-fault) this
     void* dispose_ioe = nullptr;          // non-null → fault dispose_task
@@ -4377,6 +4555,7 @@ BzScopeFinalActions bz_scope_settle_locked(bz_task_scope_t* sc) {
         act.join_fault = sc->join_waiters.front();
         if (sc->any_fault) {
             act.fault_obj = sc->first_error_obj;
+            act.fault_how = sc->first_error_how;
             act.fault_msg = sc->first_error_msg;
             sc->first_error_obj = nullptr;
             sc->first_error_msg = nullptr;
@@ -4390,6 +4569,7 @@ BzScopeFinalActions bz_scope_settle_locked(bz_task_scope_t* sc) {
         // Dispose path: swallow any un-re-raised fault (dispose it), then
         // complete — or IOE-fault when Join was provably skipped at runtime.
         act.swallow_obj = sc->first_error_obj;
+        if (act.swallow_obj) act.fault_how = sc->first_error_how;
         sc->first_error_obj = nullptr;
         free(sc->first_error_msg);
         sc->first_error_msg = nullptr;
@@ -4405,6 +4585,7 @@ BzScopeFinalActions bz_scope_settle_locked(bz_task_scope_t* sc) {
     } else if (sc->zombie) {
         // Unwind edge: swallow the fault and free at last completion.
         act.swallow_obj = sc->first_error_obj;
+        if (act.swallow_obj) act.fault_how = sc->first_error_how;
         sc->first_error_obj = nullptr;
         free(sc->first_error_msg);
         sc->first_error_msg = nullptr;
@@ -4417,7 +4598,8 @@ BzScopeFinalActions bz_scope_settle_locked(bz_task_scope_t* sc) {
 void bz_scope_perform(BzScopeFinalActions& act) {
     if (act.join_fault) {
         if (act.fault_obj)
-            bz_task_complete_error_obj(act.join_fault, act.fault_obj);
+            bz_task_complete_taken_fault(act.join_fault, act.fault_obj,
+                                         act.fault_how);
         else if (act.fault_msg)
             bz_task_complete_error(act.join_fault, act.fault_msg);
         else
@@ -4426,7 +4608,7 @@ void bz_scope_perform(BzScopeFinalActions& act) {
         act.fault_msg = nullptr;
     }
     for (bz_task_t* t : act.join_ok) bz_task_complete(t, nullptr, 0);
-    if (act.swallow_obj) bz_scope_dispose_exc(act.swallow_obj);
+    if (act.swallow_obj) bz_scope_dispose_exc(act.swallow_obj, act.fault_how);
     if (act.dispose_task) {
         if (act.dispose_ioe)
             bz_task_complete_error_obj(act.dispose_task, act.dispose_ioe);
@@ -4569,13 +4751,15 @@ void bz_task_scope_spawn(void* scp, void* closure, void* ioe_vtable) {
             // and their exception objects disposed (§6.10 no-aggregation).
             bool cancelSiblings = false;
             void* swallow = nullptr;
+            uint8_t how = 0;
             if (bz_task_is_error(completedTask)) {
-                void* errObj = bz_task_error_obj(completedTask);
+                void* errObj = bz_task_take_fault(completedTask, &how);
                 const char* errMsg = bz_task_error(completedTask);
                 std::lock_guard<std::mutex> lk(sc->mtx);
                 if (!sc->any_fault) {
                     sc->any_fault = true;
                     sc->first_error_obj = errObj;
+                    sc->first_error_how = how;
                     if (!errObj && errMsg)
                         sc->first_error_msg = strdup(errMsg);
                     cancelSiblings = true;
@@ -4584,7 +4768,7 @@ void bz_task_scope_spawn(void* scp, void* closure, void* ioe_vtable) {
                 }
             }
             if (cancelSiblings) bz_cancel_state_signal(sc->state);
-            if (swallow) bz_scope_dispose_exc(swallow);
+            if (swallow) bz_scope_dispose_exc(swallow, how);
             // The scope owned the child task; it is complete and its fault
             // (if any) has been taken/disposed — reclaim it. error_obj
             // ownership was transferred above, so clear it first (bz_task_
@@ -4617,6 +4801,7 @@ void* bz_task_scope_join(void* scp) {
     BzScopeFinalActions act;
     bool completeNow = false;
     void* faultObj = nullptr;
+    uint8_t faultHow = 0;   // fix #7954: how the child held it
     char* faultMsg = nullptr;
     {
         std::lock_guard<std::mutex> lk(sc->mtx);
@@ -4627,6 +4812,7 @@ void* bz_task_scope_join(void* scp) {
             completeNow = true;
             if (sc->any_fault) {
                 faultObj = sc->first_error_obj;
+                faultHow = sc->first_error_how;
                 faultMsg = sc->first_error_msg;
                 sc->first_error_obj = nullptr;
                 sc->first_error_msg = nullptr;
@@ -4637,7 +4823,7 @@ void* bz_task_scope_join(void* scp) {
         }
     }
     if (completeNow) {
-        if (faultObj) bz_task_complete_error_obj(task, faultObj);
+        if (faultObj) bz_task_complete_taken_fault(task, faultObj, faultHow);
         else if (faultMsg) { bz_task_complete_error(task, faultMsg);
                              free(faultMsg); }
         else bz_task_complete(task, nullptr, 0);
@@ -4968,7 +5154,7 @@ static void bz_we_free_owned_task(void* tp) {
     if (!tp) return;
     auto* t = (bz_task_t*)tp;
     if (t->error_obj && !t->fault_borrowed) {
-        bz_dispose_class_obj(t->error_obj);
+        bz_defer_exc_dispose(t->error_obj);   // fix #7954: defers while held
         t->error_obj = nullptr;
     }
     bz_task_free(t);

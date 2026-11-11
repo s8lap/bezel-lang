@@ -8664,6 +8664,18 @@ void Emitter::emitThrowValue(llvm::Value* excVal, const ast::Expr* excAst) {
     } else if (currentCaughtExc_) {
         // Bare `throw` re-raises the arm's caught exception (the global
         // was cleared when the arm was entered).
+        //
+        // fix #7954 (§30.9 / §31.2, v0.357): a re-raise is one more raise of
+        // the instance, so it takes one more hold (bz_exc_reraise). The arm's
+        // own hold is released when this edge leaves the arm
+        // (emitExcLeaveBlock) — or the new one is, by a nested arm that
+        // catches the rethrow inside this one — so the instance stays held
+        // for as long as either handling reads it, and its owner, if a scope
+        // this unwind crosses disposes it, still defers.
+        builder_.CreateCall(
+            declareC("bz_exc_reraise", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy()}),
+            {currentCaughtExc_});
         builder_.CreateStore(currentCaughtExc_, emitExcSlot());
     }
     emitUnwindDisposals();  // CG21: dispose unwound using-vars
@@ -13146,14 +13158,14 @@ void Emitter::emitEnsureInitFns() {
         // #5872: the cached TIE must NOT be reclaimed by any handler that catches
         // it, or the next access re-reads a freed block (heap-use-after-free,
         // measured). It is marked RUNTIME-OWNED via bz_exc_mark_runtime_owned —
-        // a process-wide registry, NOT the thread-local g_borrowed_exc that
+        // a process-wide registry, NOT the hold table (g_exc_holds) that
         // bz_is_exc_borrowed consults — so every disposal site that calls
         // bz_exc_is_runtime_owned skips it: emitReclaimBlock's terminal free
         // here in codegen, plus bz_dispose_class_obj, bz_domain_spawn's
         // fault-wrap and bz_scope_dispose_exc in the runtime. It is deliberately
-        // NOT bz_mark_exc_borrowed, for two reasons: that mark is erased when
-        // the caught arm exits, and g_borrowed_exc is thread-local while this
-        // instance is process-global. The mark is permanent by design: the
+        // NOT bz_mark_exc_borrowed: that is a hold, released by the handling
+        // that took it, while this instance is process-global. The
+        // runtime-owned mark is permanent by design: the
         // instance is process-lifetime by §31.4 (the runtime-owned exemption
         // from §31.1's dispose-after-arm rule), so it is never unmarked and
         // never becomes reclaimable.

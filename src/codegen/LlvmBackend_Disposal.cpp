@@ -432,7 +432,7 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
             // fix #7940 (§31.2 / §30.9, v0.357): "as if its handling had
             // completed" — which for a task-owned instance whose owner is
             // alive disposes nothing (emitEndExcHandling).
-            emitEndExcHandling(parkedDtorExc);
+            emitEndExcHandling(parkedDtorExc, excNow);
             builder_.CreateBr(restoreBB);
             builder_.SetInsertPoint(restoreBB);
             llvm::Value* restored =
@@ -747,9 +747,9 @@ void Emitter::emitTaskDisposal(const sema::TypeRef* taskTy,
         builder_.CreateCall(deferFn, {eo});
         // §30.9 / #3030: null the task's error_obj field even on the
         // DEFER path. The exception is in flight (the await/`.Result`
-        // re-raise marked it borrowed) and the catch arm's terminal act
-        // is the disposer of record (it disposes via bz_is_exc_deferred →
-        // emitDisposeAndReclaim + bz_clear_exc_deferred, the §30.9
+        // re-raise took a hold on it) and the end of its last handling
+        // is the disposer of record (bz_exc_end_handling answers "dispose
+        // it" to the release of the last hold, the §30.9
         // in-flight-deferral contract). The task's error_obj field, if
         // left non-null after the defer, would be re-disposed by
         // bz_task_fire_and_forget's FAST path below (the #3030 fix's
@@ -3367,13 +3367,26 @@ void Emitter::emitPendingCheck(std::size_t unwindDisposeHi) {
 // whether this end of handling is also the end of the instance's life (a
 // handler-owned instance, or a task-owned one whose owner deferred its disposal
 // to this moment) — only then is it disposed here. A null `exc` is a no-op.
-void Emitter::emitEndExcHandling(llvm::Value* exc) {
+//
+// fix #7954 (§30.4 / §31.2, v0.357): with `leaving` — the instance in the
+// in-flight slot on an exception edge that ends this handling — the runtime
+// also sees the one case that is not a supersession: `exc` itself is what is
+// leaving (a bare `throw;`, or its owning task awaited again). Then the
+// handling's hold is released and nothing is disposed
+// (bz_exc_leave_handling).
+void Emitter::emitEndExcHandling(llvm::Value* exc, llvm::Value* leaving) {
+    llvm::Value* verdict =
+        leaving ? builder_.CreateCall(
+                      declareC("bz_exc_leave_handling",
+                               llvm::Type::getInt8Ty(llvm_),
+                               {ptrTy(), ptrTy()}),
+                      {exc, leaving}, "exc.leavehandling")
+                : builder_.CreateCall(
+                      declareC("bz_exc_end_handling",
+                               llvm::Type::getInt8Ty(llvm_), {ptrTy()}),
+                      {exc}, "exc.endhandling");
     llvm::Value* disposeIt = builder_.CreateICmpNE(
-        builder_.CreateCall(
-            declareC("bz_exc_end_handling", llvm::Type::getInt8Ty(llvm_),
-                     {ptrTy()}),
-            {exc}, "exc.endhandling"),
-        llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+        verdict, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
     auto* dispBB =
         llvm::BasicBlock::Create(llvm_, "exc.end.dispose", currentFn_);
     auto* contBB = llvm::BasicBlock::Create(llvm_, "exc.end.cont", currentFn_);
@@ -3398,18 +3411,12 @@ void Emitter::emitExcLeaveBlock(llvm::BasicBlock* leaveBB,
     // The instance that is LEAVING is in the in-flight slot. When it is the
     // handled instance itself — a bare `throw;` (§31.2.4), or the same bound
     // task awaited again from inside the region (§30.4: every awaiter re-raises
-    // the same live instance) — its handling is not over: it stays in flight
-    // for the next handler, mark and all.
+    // the same live instance) — it is not superseded: it stays in flight for
+    // the next handler, and only this region's hold on it is released
+    // (fix #7954: the raise that is leaving took its own).
     llvm::Value* leaving =
         builder_.CreateLoad(ptrTy(), emitExcSlot(), "leave.inflight");
-    auto* endBB = llvm::BasicBlock::Create(llvm_, "leave.end", currentFn_);
-    auto* outBB = llvm::BasicBlock::Create(llvm_, "leave.out", currentFn_);
-    builder_.CreateCondBr(builder_.CreateICmpNE(handled, leaving), endBB,
-                          outBB);
-    builder_.SetInsertPoint(endBB);
-    emitEndExcHandling(handled);
-    builder_.CreateBr(outBB);
-    builder_.SetInsertPoint(outBB);
+    emitEndExcHandling(handled, leaving);
     // The handling has ended (or moved on with the instance): a second pass
     // through this region's end must find nothing to end.
     builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), excSlot);
@@ -4389,9 +4396,9 @@ void Emitter::emitTcsRelease(llvm::Value* tcs) {
         builder_.CreateCall(deferFn, {eo});
         // §30.9 / #3030: null the task's error_obj field even on the
         // DEFER path. The exception is in flight (the await/`.Result`
-        // re-raise marked it borrowed) and the catch arm's terminal act
-        // is the disposer of record (it disposes via bz_is_exc_deferred →
-        // emitDisposeAndReclaim + bz_clear_exc_deferred, the §30.9
+        // re-raise took a hold on it) and the end of its last handling
+        // is the disposer of record (bz_exc_end_handling answers "dispose
+        // it" to the release of the last hold, the §30.9
         // in-flight-deferral contract). The task's error_obj field, if
         // left non-null after the defer, would be re-disposed by
         // bz_task_fire_and_forget's FAST path below (the #3030 fix's
@@ -11769,9 +11776,9 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             //     the exception is still routing to the enclosing catch (#1288 /
             //     #1197). Disposing it here would free an object the catch arm's
             //     type-test / binding still reads (UAF / double-free). Instead
-            //     record it for deferred disposal (bz_defer_exc_dispose); the catch
-            //     arm's normal exit performs the dispose as its terminal act (the
-            //     borrowed branch above drains bz_is_exc_deferred). Refinement (a).
+            //     record it for deferred disposal (bz_defer_exc_dispose); the end
+            //     of the instance's last handling performs the dispose as its
+            //     terminal act (emitEndExcHandling). Refinement (a).
             // (A still-running async task is not yet errored here → skipped; its
             // unobserved-fault error_obj is a separate residual, #1021.) A
             // non-faulted task has a null error_obj → skipped. bz_task_free below
@@ -12547,13 +12554,9 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                             ptrTy(), excSlot, "unwind.parkedexc");
                         llvm::Value* hadParked = builder_.CreateICmpNE(
                             parked, llvm::ConstantPointerNull::get(ptrTy()));
-                        llvm::Value* differs =
-                            builder_.CreateICmpNE(parked, newExc);
                         auto* supBB = llvm::BasicBlock::Create(
                             llvm_, "unwind.supersede", currentFn_);
-                        builder_.CreateCondBr(
-                            builder_.CreateAnd(hadParked, differs), supBB,
-                            joinBB);
+                        builder_.CreateCondBr(hadParked, supBB, joinBB);
                         builder_.SetInsertPoint(supBB);
                         // §30.9 / §31.2: the parked exception's handling ends
                         // here (the catch arm's own exit will not run on this
@@ -12563,8 +12566,12 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                         // awaiter first (§30.4); one whose owner deferred the
                         // disposal to the end of handling, and a handler-owned
                         // one, are disposed now, exactly once
-                        // (emitEndExcHandling, fix #7940).
-                        emitEndExcHandling(parked);
+                        // (emitEndExcHandling, fix #7940). fix #7954: when
+                        // the fault IS the parked instance, that second raise
+                        // took a hold of its own and the parked one's is
+                        // released (bz_exc_leave_handling) — one flight, one
+                        // hold.
+                        emitEndExcHandling(parked, newExc);
                         builder_.CreateBr(joinBB);
                     };
                     emitAsyncDisposeAwaitAndFree(
