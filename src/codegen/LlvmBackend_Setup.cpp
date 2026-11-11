@@ -32127,6 +32127,28 @@ struct StringEscapeWalker {
         return false;
     }
 
+    // fix #8514 / #8515 (§28.9 / §8.6, v0.357): is `t` `Object` or an
+    // interface type — a slot type that holds a string as its bare pointer
+    // (§8.6: a reference type is not boxed) and whose consumers therefore take
+    // NO reference of their own unless they can see the value is a string?
+    static bool isObjectOrInterfaceTypeRef(const sema::TypeRef* t) {
+        if (!t) return false;
+        if (t->kind == sema::TypeRef::Kind::Primitive)
+            return t->primitive == sema::PrimitiveType::Object;
+        return t->kind == sema::TypeRef::Kind::Named && t->declaration &&
+               t->declaration->kind == ast::TypeDeclKind::Interface;
+    }
+
+    // fix #8514 (§17.8 / §28.9, v0.357): does a local declared with
+    // annotation `declTy` (null when inferred) and initializer `init` have an
+    // `Object`/interface-typed slot?
+    bool declaresObjectOrInterfaceSlot(const ast::Type* declTy,
+                                       const ast::Expr* init) const {
+        const sema::TypeRef* t = declTy ? ctx.resolvedType(*declTy) : nullptr;
+        if (!t && init) t = ctx.exprType(*init);
+        return isObjectOrInterfaceTypeRef(t);
+    }
+
     // fix-forward #8162 (stdlib §3.3, v0.355): the DERIVED-SPAN mode. Raised ONLY
     // by collectCtorSpanBorrowEligible — the pass that decides whether a
     // constructor-built `ReadOnlyStringSpan` may be admitted as a CALL-BOUNDED
@@ -34455,6 +34477,30 @@ struct StringEscapeWalker {
             // local's name collides with the source).
             if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(
                     ld->initializer.get())) {
+                // fix #8514 (§17.8 / §28.9 / §8.6, v0.357): the paragraph
+                // above holds for a `string`-typed new local — the only kind
+                // `armStringLocalRefcount` retains. An `Object`/interface-
+                // typed one (`var o: Object := x!;`, `var o := (x as
+                // Object)!;`, `var p: Object := (o as string)!;`) holds the
+                // SAME pointer (§17.8: `x!` "preserves ownership"; §8.6: a
+                // reference is not boxed) and takes a reference of its own
+                // ONLY when `collectObjectStringReleaseEligible` admitted it
+                // (`objectStringBorrowAliases`, retained at bind). Reading
+                // the operand as safe for an UNADMITTED one released the
+                // source at its scope end while the alias — and any field it
+                // had been stored into — still named the string: the
+                // measured heap-use-after-free of #8514. So such a bind is
+                // an escape of the source (the leak, never the dangling
+                // read), exactly as the same bind without the `!` is.
+                if (stringReleaseMode &&
+                    declaresObjectOrInterfaceSlot(ld->type.get(),
+                                                  ld->initializer.get()) &&
+                    !(objectStringBorrowAliases &&
+                      objectStringBorrowAliases->count(
+                          static_cast<const void*>(ld)))) {
+                    expr(ld->initializer.get(), /*safeRead=*/false);
+                    return;
+                }
                 expr(pb->operand.get(), /*safeRead=*/true);
                 return;
             }
@@ -34740,7 +34786,11 @@ struct StringEscapeWalker {
                 !borrowRetainedAliases->count(static_cast<const void*>(lc)) &&
                 objectStringBorrowAliases->count(static_cast<const void*>(lc)) &&
                 (isTargetIdent(lc->value.get()) ||
-                 isTargetIdentThroughAs(lc->value.get()))) {  // fix #8307
+                 isTargetIdentThroughAs(lc->value.get()) ||    // fix #8307
+                 // fix #8514 (§17.8, v0.357): the `const o: Object := x!;`
+                 // spellings the same collector admits (a `var`'s take the
+                 // #2201 arm above; a `const` has no such arm).
+                 isTargetThroughAliasWrappers(lc->value.get()))) {
                 expr(lc->value.get(), /*safeRead=*/true);
                 return;
             }
@@ -47008,6 +47058,8 @@ void Emitter::collectObjectStringReleaseEligible(
     // the caller). The source local's declared type must be a NON-NULLABLE
     // `string` primitive — the nullable case has different null-handling and
     // a retain on a possibly-null slot is the wrong shape.
+    // (fix #8514 widens both halves — the `!`-wrapped spellings, and a source
+    // that is not a `var` / `const` local; see the notes in the scan below.)
     //
     // fix #3417 (§21.1 / §28.9 / §8.6, v0.283): BOTH ends of the alias are read
     // through the shared `Emitter::localDeclInitView`, so a §21.1 runtime
@@ -47056,12 +47108,108 @@ void Emitter::collectObjectStringReleaseEligible(
                 if (!v.type) slotTy = asTy;
                 srcInit = tt->operand.get();
             }
+            // fix #8514 (§17.8 / §17.4 / §28.9, v0.357): the same slot bound
+            // THROUGH `!` — `var o: Object := x!;` (`x: string?`), `var o :=
+            // (x as Object)!;`, `var p: Object := (o as string)!;`. §17.8:
+            // `x!` "preserves ownership", and §17.4 makes each `as` a borrow
+            // of its operand, so under any run of `!` and pointer-preserving
+            // `as` the slot still holds the named local's own pointer — and
+            // the alias took NO reference while the escape walk's `!` arm
+            // read the source as merely tested, so the source's scope-end
+            // release freed the string under any field the alias had been
+            // stored into (heap-use-after-free, #8514). It is admitted here
+            // when some layer of the run is STATICALLY `string` — the type
+            // that makes the bind-time retain sound; a run with no such
+            // layer (`var p: Object := o!;` over an `Object?`) may hold a
+            // class instance, is not admitted, and the walk's `!` arm now
+            // treats it as an escape of the source instead.
+            // A +1 producer under any layer is the producer path's
+            // (collectStringReleaseEligible): its slot already owns the
+            // producer's reference, so it is never an alias candidate.
+            for (const ast::Expr* e = v.init; e;) {
+                if (isPlusOneStringProducer(e)) return;
+                if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+                    e = pb->operand.get();
+                else if (auto* tt =
+                             dynamic_cast<const ast::TypeTestExpr*>(e))
+                    e = tt->op == "as" ? tt->operand.get() : nullptr;
+                else
+                    break;
+            }
+            bool throughBang = false;
+            if (dynamic_cast<const ast::PostfixBangExpr*>(v.init)) {
+                auto isStr = [&](const ast::Expr* x) {
+                    const sema::TypeRef* t = ctx_.exprType(*x);
+                    return t && t->kind == sema::TypeRef::Kind::Primitive &&
+                           t->primitive == sema::PrimitiveType::String;
+                };
+                if (!v.type) slotTy = ctx_.exprType(*v.init);
+                const ast::Expr* e = v.init;
+                bool stringLayer = false;
+                for (;;) {
+                    if (!e) return;
+                    if (isStr(e)) stringLayer = true;
+                    if (auto* pb =
+                            dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+                        e = pb->operand.get();
+                        continue;
+                    }
+                    auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e);
+                    if (!tt) break;
+                    if (tt->op != "as" || !tt->testType || !tt->operand)
+                        return;
+                    const sema::TypeRef* asTy =
+                        ctx_.resolvedType(*tt->testType);
+                    const bool asString =
+                        asTy && asTy->kind == sema::TypeRef::Kind::Primitive &&
+                        asTy->primitive == sema::PrimitiveType::String;
+                    if (!asString && !isObjectOrInterfaceTarget(asTy)) return;
+                    e = tt->operand.get();
+                }
+                if (!stringLayer) return;
+                srcInit = e;
+                throughBang = true;
+            }
             if (!isObjectOrInterfaceTarget(slotTy)) return;
             auto* id = dynamic_cast<const ast::IdentifierExpr*>(srcInit);
-            if (!id) return;
-            auto* loc = dynamic_cast<const sema::LocalSymbol*>(
-                ctx_.exprSymbol(*id));
-            if (!loc || !loc->decl) return;  // not a local → parameter/field
+            auto* loc = id ? dynamic_cast<const sema::LocalSymbol*>(
+                                 ctx_.exprSymbol(*id))
+                           : nullptr;
+            if (throughBang) {
+                // fix #8514: the `string` layer was established above (the
+                // source may itself be a `string?` — `!` asserted it
+                // non-null — or an `Object`-typed holder cast back through
+                // `as string`), so the non-nullable-`string` source test
+                // below, which belongs to the unwrapped spellings, does not
+                // apply.
+                candidates.push_back(s);
+                objectStringBorrowAll_.insert(static_cast<const void*>(s));
+                return;
+            }
+            // fix #8514 (§28.9 / §8.6, v0.357): the alias's reference is
+            // owed by the SLOT, whatever names the string. A source that is
+            // not a `var` / `const` local — a `string` PARAMETER (whose
+            // reference the caller releases after the call), a `string`
+            // FIELD read (released when the field is stored over) — left
+            // the slot with NO reference, exactly as the `!` spelling did:
+            // `method M(x: string) var o: Object := x; this.O := o; end`
+            // dangled as soon as the caller released its argument. Any
+            // statically non-nullable-`string`, non-producer initializer is
+            // admitted, mirroring the `string`-typed borrow local (#429),
+            // which retains every borrow initializer.
+            LocalDeclInitView nlv =
+                (loc && loc->decl) ? localDeclInitView(loc->decl)
+                                   : LocalDeclInitView{};
+            if (!nlv.init && !nlv.type) {
+                const sema::TypeRef* st = ctx_.exprType(*srcInit);
+                if (!st || st->nullable ||
+                    st->kind != sema::TypeRef::Kind::Primitive ||
+                    st->primitive != sema::PrimitiveType::String)
+                    return;
+                candidates.push_back(s);
+                objectStringBorrowAll_.insert(static_cast<const void*>(s));
+                return;
+            }
             // fix #3417: the SOURCE may be a `var` or a §21.1 `const`; a
             // parameter or capture is still excluded (its `decl` is neither
             // local-declaration node, so the view is all-null and both `init`
