@@ -1683,16 +1683,37 @@ constexpr std::array<std::string_view, 39> kBuiltinCollectionLinqOperatorNames =
 };
 
 // fix #3670 (stdlib §5): see the header — the lambda-parameter-seeding gate.
-// 20 names; a DIFFERENT question from the two tables above (shape, not name
+// 21 names; a DIFFERENT question from the two tables above (shape, not name
 // existence) — deliberately not merged with either. Extracted unchanged from
 // `linqLambdaElementType`'s `elemLambda` (no name added or removed).
-constexpr std::array<std::string_view, 20> kLinqElementLambdaOperatorNames = {
+//
+// fix #6627 (stdlib §5 / spec §27.4 / §14.5, v0.357): `GroupBy` joins the
+// table — the 21st name. Its key selector is declared
+// `GroupBy<TKey>(key: (T) -> TKey)` (stdlib §5), so it is a source-element
+// lambda EXACTLY like `ToDictionary`'s (the other `(T) -> TKey` key selector
+// in the table): the parameter is the receiver's element type T. §27.4 says
+// a parameter annotation may be omitted "when the lambda's target type is
+// known from context", and §5's signature supplies that context — so
+// `ps.GroupBy(lambda(q) => q.name)` must type `q` as `Person`.
+//
+// #6627 MEASURED at the base: `GroupBy` was ABSENT, so an un-annotated
+// selector parameter stayed UNTYPED, the selector's body could not be typed,
+// the selector's inferred function type had no `funcReturn`, and BOTH
+// GroupBy typing arms fell back to `TypeRef* keyTy = srcElem` ("default:
+// identity key") — so `g.Key` was typed as the ELEMENT type and the key
+// trampoline was emitted with the element's return type (the malformed-IR
+// variant: `ret i32 %str.len.i32` against a `ptr` return). The header of
+// `isLinqElementLambdaOperatorName` (BuiltinRegistry.hpp) documented the
+// asymmetry as an open question; this is the answer — it is a genuine
+// pre-existing gap, and this table is where it is closed.
+constexpr std::array<std::string_view, 21> kLinqElementLambdaOperatorNames = {
     "Where",     "Select",     "Count",      "Any",
     "All",       "First",      "Last",       "Single",
     "OrderBy",   "OrderByDescending",        "Min",
     "Max",       "Sum",        "TakeWhile",  "SkipWhile",
     "SelectMany", "Average",   "ToDictionary",
     "ThenBy",    "ThenByDescending",
+    "GroupBy",
 };
 
 // fix #3670 (stdlib §5): see the header — the lazy-passthrough-typing gate.

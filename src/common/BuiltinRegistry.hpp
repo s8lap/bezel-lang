@@ -1132,11 +1132,17 @@ bool interfaceCollectionHeadDeclares(std::string_view head,
 //     receiver before that gate runs, see that table's header — while it IS
 //     present in `isStringLinqOperatorMemberName` (no such property handler
 //     exists for a `string` receiver, per that table's header).
-//   * `GroupBy(key: (T) -> TKey)` also takes a source-element-typed lambda
-//     but is NOT in this table — an asymmetry inherited unchanged from the
-//     pre-#3670 `elemLambda` list this table replaces verbatim; whether that
-//     is a genuine pre-existing gap is a separate question this pure-routing
-//     extraction does not resolve (see fix #3670's commit body).
+//   * `GroupBy(key: (T) -> TKey)` also takes a source-element-typed lambda.
+//     It WAS absent here — the asymmetry fix #3670's extraction carried over
+//     verbatim from the pre-#3670 inline list, and this header documented it
+//     as an open question ("whether that is a genuine pre-existing gap is a
+//     separate question this pure-routing extraction does not resolve"). MEASURED
+//     and ANSWERED by fix #6627 (stdlib §5 / spec §27.4 / §14.5, v0.357): it
+//     IS a genuine gap, and `GroupBy` now JOINS this table (21 names). Its key
+//     selector is declared `GroupBy<TKey>(key: (T) -> TKey)` (stdlib §5) — the
+//     same source-element shape as `ToDictionary`'s key selector above — so
+//     §27.4's "parameter type annotations may be omitted" applies: an
+//     un-annotated selector parameter takes the receiver's element type T.
 // Folding this table into either existing one would silently make every name
 // in the union answer BOTH questions, which is false for most of them —
 // declined per fix #3589's own precedent (its commit left this exact list,

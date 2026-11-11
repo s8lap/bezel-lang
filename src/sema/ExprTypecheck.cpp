@@ -26944,6 +26944,48 @@ void ExprTC::checkEventHandlerArgument(const ast::Expr* value,
         "#4968)");
 }
 
+// stdlib §5 / fix #6627 (spec §27.4 / §14.5, v0.357): the ELEMENT TypeRef of
+// an `IGrouping<TKey, T>` receiver — genericArgs[1].
+//
+// `IGrouping<TKey, T> : IEnumerable<T>` (stdlib §5), so a grouping's element is
+// T, the SECOND generic argument; the FIRST is the key type. Every other
+// enumerable the compiler recognises exposes its element at genericArgs[0], so
+// a reader that takes genericArgs[0] blindly reads TKey.
+//
+// MEASURED at the base commit (r30-c1): the `for var q in g` path (the
+// loop-variable element inference in `visitStmt`) took genericArgs[0] for
+// every Named receiver, so a group's elements were typed as the KEY — the
+// issue's own second symptom, and it happened even with a FULLY TYPED
+// selector (`lambda(q: Person) => q.name`), so it is a defect of its own and
+// not a consequence of the un-annotated selector. The LINQ surface over a
+// grouping already read the element correctly (`typeLinqOperator`'s
+// `isGroupingLinqRecv` arm, and `builtinNullableOrNullTypeArgIndex`'s
+// `IGrouping` row); the for-in path did not.
+//
+// The three shapes an `IGrouping` TypeRef reaches sema in mirror codegen's
+// `Emitter::iGroupingElemTypeRef` (LlvmBackend_Calls3.cpp): a declaration-less
+// astNode (the synthetic node the GroupBy typing arms build), a builtin
+// TypeSymbol whose `decl` is null (a user-written `IGrouping<K, V>`
+// annotation), or an `importedName` set by ModuleLoader.
+static TypeRef* iGroupingElemTypeRef(TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::Named) return nullptr;
+    std::string_view hn;
+    if (rt->declaration) {
+        if (rt->declaration->decl) return nullptr;  // a real user type
+        hn = rt->declaration->name;
+    } else if (rt->astNode && rt->astNode->name &&
+               !rt->astNode->name->parts.empty()) {
+        hn = rt->headName();
+    } else if (!rt->importedName.empty()) {
+        hn = rt->importedName;
+    } else {
+        return nullptr;
+    }
+    if (hn != "IGrouping") return nullptr;
+    if (rt->genericArgs.size() < 2 || !rt->genericArgs[1]) return nullptr;
+    return rt->genericArgs[1];
+}
+
 void ExprTC::visitStmt(const ast::Stmt& s) {
     factUseLoc_ = s.span.begin;   // #6114
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
@@ -31542,6 +31584,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 "(stdlib \xC2\xA7""4.9); use `d.Drain()` "
                                 "(ownership-transfer) instead of "
                                 "`for var e in d`");
+                        } else if (TypeRef* grpElem =
+                                       iGroupingElemTypeRef(tt)) {
+                            // stdlib §5 / fix #6627: `IGrouping<TKey, T> :
+                            // IEnumerable<T>` — the loop variable takes the
+                            // ELEMENT type T (genericArgs[1]); genericArgs[0] is
+                            // the KEY type. Taken before the genericArgs[0]
+                            // fallback below, which would type the loop
+                            // variable as the key (the issue's own symptom:
+                            // `for var q in g do … q.age …` reported "string
+                            // member `.age`" because `q` was the string key).
+                            lsym->declType = grpElem;
                         } else {
                             // Covers Array<T>, Stack<T>, Queue<T>, Set<T>,
                             // LinkedList<T>, and other IEnumerable<T> types that
