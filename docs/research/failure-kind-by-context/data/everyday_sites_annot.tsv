@@ -1,0 +1,44 @@
+program	line	group	operand	a_raise_here_means	text
+t02-wordfreq	21	state	input-data	expected	counts[w] := (counts.GetOrNull(w) ?? 0) + 1;
+t02-wordfreq	27	state	input-data	expected	counts[w] := (counts.GetOrNull(w) ?? 0) + 1;
+t03-csv	35	parse	embedded-constant	stop	rows.Add(new Employee(name, dept, int.Parse(f[2])));
+t05-ini	34	state	input-data	expected	var sec := _sections.GetOrNull(section);
+t05-ini	35	state	input-data	expected	return sec?.GetOrNull(key);
+t05-ini	42	parse	input-data	expected	if int.TryParse(s, out n) then return n; end;
+t06-logsummary	11	parse	embedded-constant	stop	var at := DateTime.Parse(parts[0]);
+t06-logsummary	18	state	input-data	expected	counts[e.Level] := (counts.GetOrNull(e.Level) ?? 0) + 1;
+t06-logsummary	24	state	own-state	stop	var first := errors.First().At;
+t06-logsummary	25	state	own-state	stop	var last := errors.Last().At;
+t12-topn	17	state	own-state	stop	Console.WriteLine($"avg {players.Average(lambda(p) => p.Score):F1}");
+t13-join	12	state	input-data	expected	var name := byId.GetOrNull(e.DeptId)?.Name ?? "(none)";
+t14-histogram	8	state	input-data	expected	hist[w.Length] := (hist.GetOrNull(w.Length) ?? 0) + 1;
+t17-parsesum	18	parse	input-data	expected	if int.TryParse(text, out var v) then
+t19-result	6	parse	input-data	expected	if not int.TryParse(s, out n) then
+t20-exceptions	12	parse	input-data	expected	return int.Parse(text);
+t21-numberlines	8	io	own-file	stop	Directory.CreateDirectory(dir);
+t21-numberlines	13	io	own-file	stop	File.WriteAllLines(input, lines);
+t21-numberlines	16	io	own-file	stop	for var line in File.ReadAllLines(input) do
+t21-numberlines	20	io	own-file	stop	File.WriteAllLines(output, numbered);
+t21-numberlines	21	io	own-file	stop	Console.Write(File.ReadAllText(output));
+t21-numberlines	22	io	own-file	stop	File.Delete(input);
+t21-numberlines	23	io	own-file	stop	File.Delete(output);
+t21-numberlines	24	io	own-file	stop	Directory.Delete(dir);
+t22-binary	10	io	own-file	stop	using var fs := new FileStream(path, FileMode.Create, FileAccess.Write);
+t22-binary	21	io	own-file	stop	using var rs := new FileStream(path, FileMode.Open, FileAccess.Read);
+t22-binary	33	io	own-file	stop	File.Delete(path);
+t23-dirlist	8	io	own-file	stop	Directory.CreateDirectory(dir);
+t23-dirlist	9	io	own-file	stop	File.WriteAllText(Path.Combine(dir, "b.txt"), "abc");
+t23-dirlist	10	io	own-file	stop	File.WriteAllText(Path.Combine(dir, "a.log"), "0123456789");
+t23-dirlist	11	io	own-file	stop	File.WriteAllText(Path.Combine(dir, "c.txt"), "");
+t23-dirlist	12	io	own-file	stop	var files := Directory.GetFiles(dir);
+t23-dirlist	15	io	own-file	stop	using var fs := new FileStream(f, FileMode.Open, FileAccess.Read);
+t23-dirlist	20	io	own-file	stop	Directory.Delete(dir, recursive := true);
+t23-dirlist	21	io	own-file	expected	Console.WriteLine($"exists: {Directory.Exists(dir)}");
+t24-json-roundtrip	18	decode	own-output	stop	using var d := new JsonDeserializer(text);
+t24-json-roundtrip	19	decode	own-output	stop	var back := Person.Deserialize(d);
+t25-json-read	12	decode	embedded-constant	stop	using var d := new JsonDeserializer(text, new JsonOptions(false, 2, false, true, 64));
+t25-json-read	17	decode	embedded-constant	stop	var item := Item.Deserialize(d);
+t26-plugins	33	state	input-data	expected	var cmd := _commands.GetOrNull(parts[0]);
+t36-pool	19	state	own-state	stop	return _idle.Pop();
+t38-dates	12	parse	literal	stop	var a := DateTime.Parse("2026-02-14");
+t38-dates	13	parse	literal	stop	var b := DateTime.Parse("2026-11-10");

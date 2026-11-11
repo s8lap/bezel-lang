@@ -1,0 +1,76 @@
+{
+ "arms": 3394,
+ "type_mentions_by_kind": {
+  "defect": 1751,
+  "failure": 454,
+  "cancellation": 32,
+  "catch-all": 625,
+  "marker": 36,
+  "user class or interface": 530
+ },
+ "body_class_by_kind": {
+  "defect": {
+   "handles": 1727,
+   "convert": 11,
+   "reraise": 13
+  },
+  "failure": {
+   "handles": 453,
+   "reraise": 1
+  },
+  "cancellation": {
+   "handles": 32
+  },
+  "catch-all": {
+   "handles": 576,
+   "convert": 21,
+   "reraise": 22,
+   "suppress": 6
+  },
+  "marker": {
+   "handles": 34,
+   "convert": 1,
+   "suppress": 1
+  },
+  "user class or interface": {
+   "handles": 506,
+   "convert": 7,
+   "reraise": 15,
+   "suppress": 2
+  }
+ },
+ "by_corpus_and_kind": {
+  "rules": {
+   "defect": 502,
+   "failure": 97,
+   "cancellation": 15,
+   "catch-all": 66,
+   "marker": 32,
+   "user class or interface": 42
+  },
+  "docex": {
+   "defect": 6,
+   "failure": 6,
+   "catch-all": 12,
+   "marker": 4,
+   "user class or interface": 4
+  },
+  "lit": {
+   "defect": 8,
+   "failure": 2,
+   "catch-all": 34,
+   "user class or interface": 17
+  },
+  "gtest": {
+   "defect": 1235,
+   "failure": 349,
+   "cancellation": 17,
+   "catch-all": 513,
+   "user class or interface": 467
+  }
+ },
+ "share_of_named_stdlib_type_mentions_that_are_defect_types": 0.794,
+ "defect_type_arms_that_complete_handling": 1727,
+ "defect_type_arms_that_convert_or_reraise": 24,
+ "docex_defect_type_arms_that_complete_handling": 6
+}
