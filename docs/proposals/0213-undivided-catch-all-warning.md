@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — draft (deferred from 0211 Q11, 2026-11-10) |
+| **Status** | under-review — draft (deferred from 0211 Q11, 2026-11-10); its exemption is to be re-read against v0.358's narrowed marker at graduation ([proposal 0214](0214-narrowed-failure-marker.md) §5) |
 | **Tracking issue** | [#8407](https://github.com/s8lap/bezel-lang/issues/8407) (proposal 0211's tracker; this proposal takes its own issue if its trigger is met) |
 | **Target documents** | **spec** — §31.2.3 (one paragraph: the warning), §31.2.5 (one sentence: the suppression idiom's divided spellings), Appendix C.7 (one bullet). **code-generation reference** — §6 (one sentence). No grammar change, no new keyword. |
 | **Written against** | spec, stdlib and rationale **v0.356** (proposal 0211 graduated); measurements carried from proposal 0211 §12, taken on the v0.355 corpora |
@@ -13,11 +13,13 @@
 
 ## 0. Summary
 
-Since v0.356 an exception is a *failure* (its class implements `IFailure`) or a *defect* report (spec §31.4, *The failure marker*), and the documents teach that a boundary names `IFailure` and lets bugs propagate, with an `Exception` arm after it only in a supervisor that reports the bug (Guide 2 §4). An arm on bare `Exception` that handles both kinds in one body is "the habit to drop: it answers a bug as if it were bad input" (QUOTED, Guide 2 §4). This proposal would make that habit visible at compile time: a warning on an unguarded `Exception` arm that no earlier arm of its `catch` divides from the failures.
+Since v0.358 an exception whose class implements `IFailure` is a *failure* — the environment or a peer produced it — and a class without the marker makes no statement (spec §31.4, *The failure marker*). The documents teach that a boundary names the classes it expects and `IFailure` for the outside world's, with an `Exception` arm after them only in a supervisor that reports the rest (Guide 2 §4). An arm on bare `Exception` that handles both kinds in one body is "the habit to drop: it answers a bug as if it were bad input" (QUOTED, Guide 2 §4). This proposal would make that habit visible at compile time: a warning on an unguarded `Exception` arm that no earlier arm of its `catch` divides from the failures.
 
 The design was drafted in proposal 0211, corrected after that proposal's critique, and deferred by its Q11 ruling. **This proposal is parked until its trigger is met (§4).** It is recorded now so that the corrected design and its measurements are not lost.
 
 ## 1. Why it was deferred
+
+*Note, v0.358 ([proposal 0214](0214-narrowed-failure-marker.md) §5).* The marker now covers only the environment and peer classes, so the exemption below covers less. `IFailure => …, Exception => …` passes the exemption and still takes bad input (`FormatException`, `SerializationException`) and bugs in the same `Exception` arm. The substance is left to this proposal's graduation, which re-reads the exemption against that.
 
 From 0211 §5.4, adopted as the Q11 ruling:
 
@@ -65,7 +67,7 @@ Document sites it would touch (MEASURED, the *catchall* group of 0211's `data/do
 
 ## 5. Proposed text (draft, to be re-anchored when the trigger is met)
 
-- **§31.2.3**, a new paragraph after the unreachable-arm warning: *An unguarded arm whose pattern names `Exception` alone, bare or in binding form, is a warning unless an earlier unguarded arm of the same `catch` lists `IFailure` ([§31.4](Bezel_Language_Spec.md#sec-the-failure-marker)) or the arm's body contains a bare re-raise. Such an arm takes failures and defects in one body; name `IFailure` ahead of it, or list both kinds in one alternative (`IFailure | Exception`), to state the division.*
+- **§31.2.3**, a new paragraph after the unreachable-arm warning: *An unguarded arm whose pattern names `Exception` alone, bare or in binding form, is a warning unless an earlier unguarded arm of the same `catch` lists `IFailure` ([§31.4](Bezel_Language_Spec.md#sec-the-failure-marker)) or the arm's body contains a bare re-raise. Such an arm takes, in one body, what the environment or a peer raised and every other exception; name `IFailure` ahead of it, or list both in one alternative (`IFailure | Exception`), to state the division.*
 - **§31.2.5**, end of the last paragraph: *To suppress everything, with the division written out: `IFailure => (), Exception => ()`.*
 - **Appendix C.7**, one bullet stating the warning.
 - **Code-generation reference §6**: one sentence under *Catching at a boundary*.

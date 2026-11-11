@@ -16115,13 +16115,18 @@ These adaptations have not had an adversarial critique of their own; the composi
 
 **The call-site `(try E)` form is withdrawn (owner, 2026-11-11, "Withdraw; OrNull is doctrine"; proposal 0214 §6).** The error-model note's gated stage 2 was described by proposal 0211 §7 as reading the marker.
 - *Decided.* The direction is **withdrawn**, not deferred. The `*OrNull` and `Try` tiers are the doctrine for value-shaped results. The author of a member, who knows its expected-absence condition, states it by providing the dual, which is more precise than a type-keyed set (refuted by the failure-kind study) or a caller-named type list.
-- *Declined.* `(try E)` over a default set (every `IFailure`, or any fixed set): it swallows conditions the caller never meant to tolerate, and after the narrowing it would not even cover `FormatException`. Swift's `try?` and Kotlin's `runCatching`, which swallows cancellation, are the precedents. `(try E on X)`, naming the types at the call: it is longer and less precise than the dual, and a list right today is wrong when a member gains a condition. The owner: "It's a lot easier to type a method with *OrNull than it is to remember which exact exception type or types you want to swallow."
+- *Declined.* `(try E)` over a default set (every `IFailure`, or any fixed set): it swallows conditions the caller never meant to tolerate, and after the narrowing it would not even cover `FormatException`. Swift's `try?` and Kotlin's `runCatching` (reported to swallow cancellation; prior art from memory, not checked against a source) are the precedents. `(try E on X)`, naming the types at the call: it is longer and less precise than the dual, and a list right today is wrong when a member gains a condition. The owner: "It's a lot easier to type a method with *OrNull than it is to remember which exact exception type or types you want to swallow."
 - *Reopening bar* (`DECLINED.md`). A **declared-absence** form: each throwing member declares once which exception means "no result", and a call-site form reads that declaration, so it is exactly as precise as the dual. It must answer §31.3's *No `throws` clause* decision and show that it removes enough duals to pay for the declaration syntax (the error-model note counted about 31 `Parse`-family duals).
 - *A missing dual is a library gap.* 15 of the 33 stdlib sections that document an expected failure offer no value-shaped form, among them all of `System.IO`, serialization and `Encoding` (the error-model note's scan). One issue covers them: [#8516](https://github.com/s8lap/bezel-lang/issues/8516).
 
 **Deferred, and follow-ups.**
 - *The caller-side conversion* ("a failure at this call is a bug") is **deferred** (proposal 0214 §7.1). Reopening trigger: evidence from real programs written against a compiler that implements the marker, showing boundaries whose `IFailure` arm answers a required resource's absence, or another bug, as routine often enough that the hand-written wrap is a measurable cost. Its need is smaller than the note measured: the data classes left the marked set, so only 3 of the 11 bugs raised with a failure class remain.
 - *Checked arithmetic* is a separate follow-up proposal, not written here (proposal 0214 §7.2). It would add nullable-returning checked members on the integer types, starting from proposal 0008's `Checked*` design, and a validity query for date components, and it decides stdlib §2.5's band label.
+
+**Owner questions, ruled as recommended under the delegation** (proposal 0214 §10).
+- *Q1:* stdlib §2.5's `DateTime` range fault stays band 1. Only the word changes, and the label is decided with the checked-arithmetic follow-up.
+- *Q2:* `ChannelClosedException` stays marked where the program's own code closed the channel. Stdlib §1 now says it is marked by default because the class cannot tell which party closed it.
+- *Q3:* proposal 0069's `InvalidDataException` and `DecompressionLimitException`, both under `IOException`, are decided at 0069's graduation under the environment/peer/deadline test. Corrupt data and a decompression bomb are the data's, often an attacker's, so both are likely unmarked.
 
 **Recorded decisions reopened** (proposal 0214 §5, each with its evidence).
 - 0211 Q1 (*defect* as the bug band's word): overtaken.
@@ -16150,7 +16155,7 @@ These adaptations have not had an adversarial critique of their own; the composi
 
   *No longer defined:* `ParseRangeException`; `IFailure` on `FormatException` and `SerializationException`; the six misfit flags.
 
-  *Behaviour changes, every arm still matching:* out-of-range `Parse`/`Convert.To*` input raises `OverflowException` (an `OverflowException` arm took the retired subclass and takes this). An `IFailure` arm no longer takes `FormatException`, `SerializationException` or out-of-range input. Appendix E classifies removing a marker as breaking; no program outside the rule corpus observes it, since no compiler implements the marker (`git grep` over `src/` and `tests/`, outside the rule corpus, finds none of the three names; r40 raises `OverflowException`).
+  *Behaviour changes, every class-named arm still matching:* out-of-range `Parse`/`Convert.To*` input raises `OverflowException` (an `OverflowException` arm took the retired subclass and takes this). An `IFailure` arm no longer takes `FormatException`, `SerializationException` or out-of-range input: those arms stop matching them, which is the change. Appendix E classifies removing a marker as breaking; no program outside the rule corpus observes it, since no compiler implements the marker (`git grep` over `src/` and `tests/`, outside the rule corpus, finds none of the three names; r40 raises `OverflowException`).
 
   *Newly warned:* nothing. An arm on `FormatException` after an `IFailure` arm, unreachable under v0.356, is reachable again.
 
@@ -16161,7 +16166,7 @@ These adaptations have not had an adversarial critique of their own; the composi
   - [#8416](https://github.com/s8lap/bezel-lang/issues/8416): the base-chain rejection narrows to `OperationCanceledException`.
   - [#8417](https://github.com/s8lap/bezel-lang/issues/8417): void, the class retired; to close as not planned when this revision lands.
   - [#8418](https://github.com/s8lap/bezel-lang/issues/8418): unchanged in requirement, wider in population.
-  - [#8415](https://github.com/s8lap/bezel-lang/issues/8415): unchanged.
+  - [#8415](https://github.com/s8lap/bezel-lang/issues/8415): unchanged in requirement; its pinned cases were re-read.
   - Filed: [#8516](https://github.com/s8lap/bezel-lang/issues/8516) (the missing value-shaped forms; `stdlib`, `parking-lot`).
 
   *Rule corpus* (5,849 → 5,857 cases):
@@ -16173,6 +16178,16 @@ These adaptations have not had an adversarial critique of their own; the composi
 
   *Research note:* the re-rating is added under `data/rerating/`, with an *Outcome* paragraph pointing here, and the error-model note's §8.5 records the `(try E)` withdrawal.
 
-**Checks.** `scripts/check_docs.sh` (all phases; the one CITATION advisory `[spec] §4.12` predates this revision), `check_proposals.sh`, `build_book.py --check`, `check_src_citations.py`, `gen_editor_grammars.py --check` (no keyword changes), `corpus.py lint --strict` (5,857 cases) and `corpus.py check`, the harness unit tests (170), proposal 0214's `edits_0214.py check` against v0.357 (78 edits over 9 documents, 0 anchor failures; `apply` reproduces the landed documents byte for byte) and `check_commit_trailers.py --strict`. The meaning gate (an adversarial critique) runs on this branch before it is pushed.
+**Corrections at the meaning gate** (the v0.358 critique, ACCEPT-W-NOTES, applied before publication).
+- *Stdlib §1 The failure marker:* "… and the program's arithmetic are the program's" contradicted "makes no statement". It now reads "can be the program's", and the nine corpus quotes citing it are refreshed.
+- *Stdlib §1:* `ChannelClosedException`'s marking is stated as a default the class cannot refine (Q2).
+- *Spec §31.4:* the program "may answer" a failure it cannot do without by stopping, not "answers" it.
+- *Rationale §11.12:* "about half" is now "fewer than half" (37 of 89; 42%, 49% in the blind re-rating).
+- *Stdlib §6.1:* `TimeoutException`'s gloss is aligned with the marker's deadline.
+- *Proposal 0214:* §10 Q3 is restated under the environment/peer/deadline test, and §8.1's and this entry's behaviour note now say "every class-named arm".
+- *Records:* #8415 is commented. The `DECLINED.md` citations name the proposal section, not the changelog. The Kotlin precedent is labelled as unchecked. Proposal 0213 points at 0214 §5 and drops the withdrawn vocabulary.
+- *Corpus quotes:* `l9_1_0007` quotes stdlib §9.1 verbatim, and `s31_4_0029` and `s31_2_3_0022` mark their joins with an ellipsis.
+
+**Checks.** `scripts/check_docs.sh` (all phases; the one CITATION advisory `[spec] §4.12` predates this revision), `check_proposals.sh`, `build_book.py --check`, `check_src_citations.py`, `gen_editor_grammars.py --check` (no keyword changes), `corpus.py lint --strict` (5,857 cases) and `corpus.py check`, the harness unit tests (170), proposal 0214's `edits_0214.py check` against v0.357 (79 edits over 9 documents, 0 anchor failures; `apply` reproduces the landed documents byte for byte) and `check_commit_trailers.py --strict`. The meaning gate (an adversarial critique) runs on this branch before it is pushed.
 
 ---
