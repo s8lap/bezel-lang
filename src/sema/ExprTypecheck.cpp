@@ -30759,6 +30759,38 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     as->value->span.begin, "assigned value",
                     as->value.get());  // §27.6 #756 property-ref
             }
+            // fix #6678 (§6.6 / §7.7 / §5.1, v0.357): the right operand of
+            // `??=` is typed by §7.7's rule. §6.6, verbatim: "`x ??= e`
+            // assigns `e` only when `x`'s current value is null, with the
+            // typing and ownership rules of §7.7"; §7.7, verbatim: "for a
+            // left operand of type `T?`, the right operand must be implicitly
+            // convertible (§5.1) to `T` or to `T?`". #6214 added that check
+            // to the binary `??` (visitExpr's BinaryExpr arm); this statement
+            // arm ran no check at all on the operand, so `s ??= 5` on a
+            // `string?` compiled and the binary stored the `int` into the
+            // string slot (SIGSEGV), `i ??= "s"` on an `int?` stored a
+            // pointer's low bits, and so on for every unrelated pair.
+            // Convertibility to the target's own `T?` covers both of the
+            // sentence's alternatives (`T` converts to `T?`, and `S?` lifts
+            // to `T?`), exactly as in the `??` arm, and passing the operand
+            // expression gives an in-range constant §5.1's "Constant
+            // narrowing" re-type, as at `:=`. A `null` literal converts to
+            // any `T?`; an operand sema leaves untyped (a `throw` expression,
+            // §17.12; a collection literal, which is checked against its
+            // target elsewhere) is skipped by checkAssignable itself. A
+            // NON-nullable target is left as it was: §7.7's sentence types
+            // the operand only "for a left operand of type `T?`".
+            if (as->op == "??=" && as->target && as->value &&
+                !dynamic_cast<const ast::NullLiteralExpr*>(as->value.get())) {
+                TypeRef* toTy = ctx_.exprType(*as->target);
+                TypeRef* fromTy = ctx_.exprType(*as->value);
+                if (toTy && toTy->nullable && fromTy)
+                    checkAssignable(fromTy, toTy,
+                                    as->value->span.begin.line != 0
+                                        ? as->value->span.begin
+                                        : as->span.begin,
+                                    "right operand of `??=`", as->value.get());
+            }
             // §25.1 (#851): a compound assignment `lhs <op>= rhs` desugars to
             // `lhs := lhs <op> rhs` using the binary operator's overload. When
             // `lhs` is a user type (record/class) whose `operator <op>` returns
