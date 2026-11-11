@@ -5,7 +5,7 @@
 //! rule: And a class with `OperationCanceledException` in its base chain may
 //!   not implement it: listing `IFailure`, or an interface extending it, on
 //!   such a class is a compile error at the declaration, so cancellation is
-//!   cancellation in every subclass. An interface may extend `IFailure`; both
+//!   cancellation in every subclass. … An interface may extend `IFailure`; both
 //!   restrictions then bind its implementers.
 //! cites: 31.4
 //! expect: reject

@@ -9,10 +9,10 @@
 //!   the program itself, or from data whose supplier the library cannot see, is
 //!   not marked, and makes no statement: text that does not parse and a
 //!   document that does not deserialize may be a user's typing or the program's
-//!   own constant (`FormatException`, `SerializationException`); an argument,
-//!   the state of an object the program holds and the program's arithmetic are
-//!   the program's (`ArgumentException`, `InvalidOperationException`,
-//!   `KeyNotFoundException`, `OverflowException`).
+//!   own constant (`FormatException`, `SerializationException`); a condition
+//!   about an argument, the state of an object the program holds or the
+//!   program's arithmetic can be the program's (`ArgumentException`,
+//!   `InvalidOperationException`, `KeyNotFoundException`, `OverflowException`).
 //! cites: 2.3, 1
 //! expect: run
 //! stdout: out of range passed

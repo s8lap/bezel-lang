@@ -8,9 +8,10 @@
 //!   the library cannot see, is not marked, and makes no statement: text that
 //!   does not parse and a document that does not deserialize may be a user's
 //!   typing or the program's own constant (`FormatException`,
-//!   `SerializationException`); an argument, the state of an object the program
-//!   holds and the program's arithmetic are the program's (`ArgumentException`,
-//!   `InvalidOperationException`, `KeyNotFoundException`, `OverflowException`).
+//!   `SerializationException`); a condition about an argument, the state of an
+//!   object the program holds or the program's arithmetic can be the program's
+//!   (`ArgumentException`, `InvalidOperationException`, `KeyNotFoundException`,
+//!   `OverflowException`).
 //! cites: 2.5, 1
 //! expect: run
 //! stdout: overflow passed
