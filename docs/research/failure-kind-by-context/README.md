@@ -13,6 +13,20 @@ a published source recalled, not consulted; wording may be inexact. **HYPOTHESIS
 judgement or a prediction; not evidence. The scenario table of §3 is a set of judgements;
 its counts are MEASURED over those judgements, and §2 says what that is worth.*
 
+**Outcome (2026-11-11).** The owner chose a narrower design than this note recommends:
+*the narrowed marker*. `IFailure` stays only on the environment and peer classes (the
+`IOException` family, `TimeoutException`, the channel exceptions, and `DomainFailedException`
+across a join) and means origin and a default — "the outside world disagreed" — never a
+disposition. `FormatException` and `SerializationException` lose it, `ParseRangeException` is
+retired, an unmarked class makes no statement, the word *defect* leaves the normative text,
+and users may mark their own classes under any base except `OperationCanceledException`. The
+caller-side conversion of §7's part 2 is deferred, checked arithmetic (part 3) is a separate
+follow-up, and the call-site `(try E)` form is withdrawn in favour of the `*OrNull`/`Try`
+tiers. The independent re-rating this note's §2 asked for is in
+[`data/rerating/`](data/rerating/README.md) (100 pairs, three-band κ 0.66, bug-or-not κ 0.89;
+every headline reproduces in direction). The decision is [proposal
+0214](../../proposals/0214-narrowed-failure-marker.md), landed as spec **v0.358**.
+
 ## 1. One page for the owner
 
 **The question.** Proposal 0211 (v0.356) gives every standard-library exception class a fixed
@@ -798,6 +812,7 @@ Sections:
 | `data/landing_reach.py` → `landing_reach.json` | the costs of §6 |
 | `snippets/demo.go`, `demo.rs`, `Demo.java`, `demo.py`, `CheckedForcesHandler.java`, `run.sh` → `RESULTS.txt` | the four samples that were built and run |
 | `snippets/Demo.cs`, `demo.swift`, `demo.kt` | the three samples that were not compiled |
+| `data/rerating/` | the independent blind re-rating of 100 pairs (2026-11-11): the blind sheet, the sampler, the ratings, the comparison and its output |
 
 To regenerate (scratch under `/var/tmp/bezel-scratch/fk`, never the repository):
 

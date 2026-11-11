@@ -744,6 +744,20 @@ stand (decline-index rows *Sendability requirement on throwable types* and *Stat
 
 ### 8.5 Order of work, and the gate
 
+> **Withdrawn (2026-11-11, owner decision "Withdraw; OrNull is doctrine"; proposal
+> [0214](../../proposals/0214-narrowed-failure-marker.md) §6, v0.358).** Stages 2 and 3 below
+> are withdrawn as a direction, not deferred. The owner observed that a call-site form naming
+> the exception types it turns into `null` (`(try int.Parse(s) on FormatException)`) is longer
+> and less precise than the `*OrNull` member it was meant to replace, and a form over a default
+> set (every `IFailure`) swallows conditions the caller never meant to tolerate — after v0.358's
+> narrowing it would not even cover `FormatException`. The `*OrNull`/`Try` tiers are the
+> doctrine for value-shaped results: the member's author, who knows its expected-absence
+> condition, states it by providing the dual. The one shape a future proposal may bring back is
+> a *declared-absence* form (each throwing member declares once which exception means "no
+> result", and a call-site form reads that declaration); its bar is recorded in `DECLINED.md`.
+> A member with an expected failure and no value-shaped form is a standard-library gap, filed
+> as its own issue. The table and the gate below are kept as the record of what was proposed.
+
 | Stage | Content | Class (spec-change-process §2) | Depends on |
 |---|---|---|---|
 | 0 | Compiler catch-up the probes exposed: numeric `ParseOrNull`, `SupersededChain`, `Exception.ToString()` message, `FaultStackTrace`, the p08 crash, the undisposed nullable temporary of p19 | implementation | — |
