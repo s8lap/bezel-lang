@@ -14,10 +14,12 @@ public class Widget
 end Widget;
 
 public class Program
-  public method Demo()
+  public method Demo(kill: bool)
     var w := new Widget();
     var b := w;
-    w.Dispose();
+    if kill then
+      w.Dispose();
+    end;
     var alias := b;
   end Demo;
 end Program;

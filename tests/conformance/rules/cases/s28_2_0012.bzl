@@ -25,10 +25,12 @@ public class Widget
 end Widget;
 
 public class Program
-  public method Demo()
+  public method Demo(kill: bool)
     var w := new Widget();
     var view := w;
-    w.Dispose();
+    if kill then
+      w.Dispose();
+    end;
     try
       Console.WriteLine(view.Label);
     catch

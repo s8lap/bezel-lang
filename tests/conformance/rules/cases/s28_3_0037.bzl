@@ -13,10 +13,12 @@ public class Widget
 end Widget;
 
 public class Program
-  public method Demo()
+  public method Demo(kill: bool)
     var w := new Widget();
     var b := w;
-    _ := w;
+    if kill then
+      _ := w;
+    end;
     var name := b.ToString();
   end Demo;
 end Program;
