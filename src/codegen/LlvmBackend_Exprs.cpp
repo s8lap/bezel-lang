@@ -505,7 +505,21 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 claimedExtStringRecvCall = c;
         }
     }
-    llvm::Value* v = lowerExprInner(e);
+    // fix #6070 (§7.5, v0.357): the §7.5 CHAIN CONTINUATION — a plain `.`
+    // suffix to the right of a `?.` segment (`x?.Y.Z`, `x?.Y.Z(..)`). The
+    // chain is lowered as ONE unit (the receiver once, the null check, the
+    // segment's `.` twin, the continuation), so it is dispatched here rather
+    // than in `lowerExprInner`'s per-shape arms — the member-read arm and
+    // the call arm would otherwise each lower the continuation on the
+    // chain's NULLABLE result, which is exactly what §7.5 forbids ("a suffix
+    // to the right of a `?.` is typed at the value it meets on the path where
+    // it runs — the preceding segment's own declared type, never the nullable
+    // type the `?.` gives the chain's result").
+    llvm::Value* v = nullptr;
+    if (isNullCondChain(e))
+        v = lowerNullCondChain(e);
+    else
+        v = lowerExprInner(e);
     if (claimedExtStringRecvCall)
         k8ExtStringRecvCalls_.erase(claimedExtStringRecvCall);
     // fix #7906: the receiver's OWN lowering consumed the claim above and
@@ -11824,6 +11838,210 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             return lowerBuiltinCollMemberRef(*ma);
     }
     return nullptr;
+}
+
+// fix #6070 (§7.5, v0.357): the CHAIN CONTINUATION — a plain `.` suffix to
+// the right of a `?.` segment (`x?.Y.Z`, `x?.Y.Z(..)`). See the declaration
+// comment in LlvmBackend_impl.hpp for the §7.5 sentence this implements.
+//
+// §7.5 (v0.357): "**The chain is the whole postfix sequence** (grammar A.7's
+// `PrimaryExpr`), its plain `.`, `[ ]` and `( )` suffixes included, and a
+// suffix to the right of a `?.` is typed at the value it meets on the path
+// where it runs — the preceding segment's own declared type, never the
+// nullable type the `?.` gives the chain's result: `s?.Length.ToString()`
+// over `s: string?` calls `ToString()` on an `int`, and the chain is a
+// `string?`. ... If any segment of a chain is null, the remainder of the
+// chain is skipped on the same terms and the whole chain's result is
+// `null`."
+//
+// The lowering is the `?.` lowering extended over the chain: the RECEIVER is
+// lowered ONCE (§7.5: "The receiver is evaluated first") and null-checked;
+// the null edge yields the chain's null result and nothing to the right of
+// the segment runs; the non-null edge reads the SEGMENT through its `.`
+// twin — the same access spelled with `.`, over a pinned placeholder
+// carrying the lowered receiver — and runs the CONTINUATION on that value.
+//
+// The twins are synthetic nodes built here, exactly as the `?.` count/length
+// arm (#6024) and the `?.` task arm (#7896/#7981) build theirs, so the `.`
+// lowerings the twins reach are the ordinary ones — the two spellings of an
+// access cannot drift apart.
+bool Emitter::isNullCondChain(const ast::Expr& e) {
+    const ast::MemberAccessExpr* cont = nullptr;
+    if (auto* c = dynamic_cast<const ast::CallExpr*>(&e))
+        cont = dynamic_cast<const ast::MemberAccessExpr*>(c->callee.get());
+    else
+        cont = dynamic_cast<const ast::MemberAccessExpr*>(&e);
+    if (!cont) return false;
+    const auto* nm =
+        dynamic_cast<const ast::NullCondMemberExpr*>(cont->target.get());
+    if (!nm) return false;
+    // §7.5: "parentheses end the chain: `(s?.Length).ToString()` is a member
+    // access on an `int?`, §7.4's error." The parser stamps a `(`...`)`
+    // group on the grouped expression (ast::Expr::parenthesized), so the
+    // parenthesised spelling is told from the bare one here.
+    if (nm->parenthesized) return false;
+    return true;
+}
+
+llvm::Value* Emitter::lowerNullCondChain(const ast::Expr& e) {
+    const ast::CallExpr* call = dynamic_cast<const ast::CallExpr*>(&e);
+    const ast::MemberAccessExpr* cont =
+        call ? dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())
+             : dynamic_cast<const ast::MemberAccessExpr*>(&e);
+    if (!cont) return nullptr;
+    const ast::NullCondMemberExpr* nm =
+        dynamic_cast<const ast::NullCondMemberExpr*>(cont->target.get());
+    if (!nm || !nm->target) return nullptr;
+    const sema::TypeRef* recvTy = ctx_.exprType(*nm->target);
+    const sema::TypeRef* segTy = ctx_.exprType(*nm);
+    const sema::TypeRef* contTy =
+        call ? ctx_.exprType(*call) : ctx_.exprType(*cont);
+    if (!recvTy || !segTy || !contTy) return nullptr;
+    // The SEGMENT's own type — the value the continuation runs on (§7.5: the
+    // suffix is typed at "the preceding segment's own declared type").
+    sema::TypeRef* segOwnTy = ctx_.makeTypeRef(*segTy);
+    segOwnTy->nullable = false;
+    // The CONTINUATION's own type, and the chain's RESULT type (§7.5: the
+    // chain's result is `null` when the segment is null).
+    sema::TypeRef* contOwnTy = ctx_.makeTypeRef(*contTy);
+    contOwnTy->nullable = false;
+    sema::TypeRef* resTy = ctx_.makeTypeRef(*contTy);
+    resTy->nullable = true;
+
+    llvm::Value* rcv = lowerExpr(*nm->target);
+    if (!rcv) return nullptr;
+    const bool nullableValueRcv = isNullableValueTy(recvTy);
+    // A REFERENCE receiver is null-checked on the pointer; a nullable VALUE
+    // receiver on its tag; a receiver of neither kind cannot be null at all,
+    // so the chain never short-circuits (the `?.` call lowering's own
+    // three-way shape, LlvmBackend_Calls2.cpp).
+    const bool rcvIsPtr = rcv->getType()->isPointerTy();
+    auto* entryBB = builder_.GetInsertBlock();
+    auto* accessBB = llvm::BasicBlock::Create(llvm_, "ncha.access", currentFn_);
+    auto* endBB = llvm::BasicBlock::Create(llvm_, "ncha.end", currentFn_);
+    llvm::Value* rcvPayload = nullptr;
+    if (rcvIsPtr) {
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(rcv, llvm::ConstantPointerNull::get(ptrTy())),
+            endBB, accessBB);
+    } else if (nullableValueRcv) {
+        rcvPayload = nullablePrimValue(rcv);
+        builder_.CreateCondBr(nullablePrimHasValue(rcv), accessBB, endBB);
+    } else {
+        builder_.CreateBr(accessBB);
+    }
+    builder_.SetInsertPoint(accessBB);
+
+    // The SEGMENT, read through its `.` twin: the same access spelled with
+    // `.`, over a placeholder carrying the lowered receiver (typed as the
+    // receiver's NON-nullable type — the path where the chain runs).
+    sema::TypeRef* rcvOwnTy = ctx_.makeTypeRef(*recvTy);
+    rcvOwnTy->nullable = false;
+    auto ph = std::make_unique<ast::IdentifierExpr>();
+    ph->name = "<nullcond-chain-receiver>";  // unspellable (#6681)
+    ph->span = nm->target->span;
+    ctx_.setExprType(ph.get(), rcvOwnTy);
+    // fix #7458 (§7.5, §28.2, v0.350): the placeholder STANDS FOR the real
+    // `?.` target, so it carries the target's symbol — the `.` twin's
+    // ownership classifiers key on it (the same reason the `?.` call's
+    // placeholder carries it).
+    if (sema::Symbol* targetSym = ctx_.exprSymbol(*nm->target))
+        ctx_.setExprSymbol(ph.get(), targetSym);
+    exprValueOverride_[ph.get()] = rcvPayload ? rcvPayload : rcv;
+    const ast::Expr* phKey = ph.get();
+    auto segDot = std::make_unique<ast::MemberAccessExpr>();
+    segDot->span = nm->span;
+    segDot->member = nm->member;
+    segDot->target = std::move(ph);
+    const ast::Expr* segKey = segDot.get();
+    ctx_.setExprType(segDot.get(), segOwnTy);
+    // The twin stands for the `?.` SEGMENT, so it carries the segment's
+    // SYMBOL — the `.` lowering of a USER property keys on it (the same
+    // reason the `?.` call's placeholder carries its target's symbol).
+    if (sema::Symbol* segSym = ctx_.exprSymbol(*nm))
+        ctx_.setExprSymbol(segDot.get(), segSym);
+    llvm::Value* segVal = lowerExpr(*segDot);
+    exprValueOverride_.erase(phKey);
+    if (!segVal) {
+        // Unrecognised shape: close the CFG validly and keep the old
+        // "lowered to nothing" result (the #3079 backstop reports it).
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        nullCondChainSynth_.push_back(std::move(segDot));
+        return nullptr;
+    }
+    // The CONTINUATION, over the segment's value (pinned, so the segment is
+    // read exactly once).
+    exprValueOverride_[segKey] = segVal;
+    auto contDot = std::make_unique<ast::MemberAccessExpr>();
+    contDot->span = cont->span;
+    contDot->member = cont->member;
+    contDot->target = std::move(segDot);
+    ctx_.setExprType(contDot.get(), contOwnTy);
+    // The twin stands for the CONTINUATION access, so it carries the
+    // continuation's SYMBOL — the `.` lowering of a user method / property
+    // keys on it.
+    if (sema::Symbol* contSym = ctx_.exprSymbol(*cont))
+        ctx_.setExprSymbol(contDot.get(), contSym);
+    llvm::Value* inner = nullptr;
+    if (call) {
+        auto synth = std::make_unique<ast::CallExpr>();
+        synth->span = call->span;
+        synth->callee = std::move(contDot);
+        ctx_.setExprType(synth.get(), contOwnTy);
+        // fix #7730 (§22.5, v0.350): sema publishes a named-argument binding
+        // keyed on the CallExpr it checked — the `.` twin is a fresh node, so
+        // without this the built-in arms read no binding and lowered the
+        // arguments in parameter order against swapped slots.
+        if (const auto* bnd = ctx_.builtinCallBinding(*call))
+            ctx_.setBuiltinCallBinding(synth.get(), *bnd);
+        auto& mutCall = const_cast<ast::CallExpr&>(*call);
+        synth->args = std::move(mutCall.args);
+        inner = lowerExpr(*synth);
+        mutCall.args = std::move(synth->args);
+        nullCondChainCallSynth_.push_back(std::move(synth));
+    } else {
+        inner = lowerExpr(*contDot);
+        nullCondChainSynth_.push_back(std::move(contDot));
+    }
+    exprValueOverride_.erase(segKey);
+    // The chain's result: the continuation's own type, nullable (§7.5).
+    const bool valueResult = isNullableValueTy(resTy);
+    llvm::Type* nullTy = valueResult
+        ? static_cast<llvm::Type*>(nullableValueStructTy(resTy))
+        : static_cast<llvm::Type*>(ptrTy());
+    const bool shapeOk =
+        inner && (valueResult ? (!inner->getType()->isPointerTy() &&
+                                  !inner->getType()->isVoidTy())
+                              : inner->getType()->isPointerTy());
+    if (!shapeOk) {
+        // Unrecognised shape: close the CFG validly and keep the old
+        // "lowered to nothing" result (the #3079 backstop reports it).
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        return nullptr;
+    }
+    llvm::Value* wrapped = inner;
+    if (valueResult && inner->getType() != nullTy)
+        wrapped = wrapNullableValue(resTy, inner);
+    auto* accessEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(endBB);
+    builder_.SetInsertPoint(endBB);
+    // A receiver of neither a reference nor a nullable-value kind cannot be
+    // null, so the chain never short-circuits: the result is the PRESENT
+    // value, wrapped (the `?.` call lowering's own shape). Without this the
+    // phi would name a predecessor that does not branch to it (invalid IR).
+    if (!rcvIsPtr && !nullableValueRcv) return wrapped;
+    auto* phi = builder_.CreatePHI(nullTy, 2);
+    phi->addIncoming(
+        valueResult
+            ? static_cast<llvm::Value*>(llvm::ConstantAggregateZero::get(
+                  llvm::cast<llvm::StructType>(nullTy)))
+            : static_cast<llvm::Value*>(
+                  llvm::ConstantPointerNull::get(ptrTy())),
+        entryBB);
+    phi->addIncoming(wrapped, accessEnd);
+    return phi;
 }
 
 

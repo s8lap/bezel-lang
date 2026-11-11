@@ -7604,6 +7604,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             return;
         }
     }
+    // fix #6070 (§7.5, v0.357): the §7.5 CHAIN CONTINUATION — a plain `.`
+    // suffix to the right of a `?.` segment, in the CALL spelling
+    // (`x?.Y.Z(..)`).
+    //
+    // §7.5 (v0.357), verbatim: "**The chain is the whole postfix sequence**
+    // (grammar A.7's `PrimaryExpr`), its plain `.`, `[ ]` and `( )` suffixes
+    // included, and a suffix to the right of a `?.` is typed at the value it
+    // meets on the path where it runs — the preceding segment's own declared
+    // type, never the nullable type the `?.` gives the chain's result:
+    // `s?.Length.ToString()` over `s: string?` calls `ToString()` on an
+    // `int`, and the chain is a `string?`."
+    //
+    // So the call is typed by its `.`-spelled TWIN — the same access spelled
+    // with `.`, over the SEGMENT's own declared type — and the chain's
+    // RESULT is that call's result, lifted to nullable (§7.5: "If any
+    // segment of a chain is null … the whole chain's result is `null`").
+    //
+    // This is the FIRST thing `typeCall` does for the shape, because the
+    // ordinary path would type the call at the `?.` node's NULLABLE type —
+    // the very type §7.5 forbids.
+    if (resolveNullCondChainCall(ce)) return;
     // fix #3044 (§10.4 / stdlib §9.9, v0.242): `E.FromUnderlyingOrNull(value)`
     // — the COMPILER-PROVIDED per-enum static member. "Every enum `E` with
     // underlying type `U` carries one compiler-provided static member … no
@@ -37878,12 +37899,40 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // always nullable") — even when the member itself is
             // non-nullable — so `x?.Y.Z` (a further plain `.Z` on a `?.Y`
             // target whose own member `Y` is non-nullable) DOES reach here
-            // with `tgt->nullable == true` and IS correctly rejected below,
-            // exactly like the sibling shapes above. See
+            // with `tgt->nullable == true`. §7.5 (v0.357) has since ruled
+            // that shape a CHAIN CONTINUATION — "The chain is the whole
+            // postfix sequence ... a suffix to the right of a `?.` is typed
+            // at the value it meets on the path where it runs — the
+            // preceding segment's own declared type" — so it is NOT rejected
+            // here any more: `resolveNullCondChainContinuation` types it at
+            // the segment's own type and lifts the chain's result to
+            // nullable (#6070). A segment whose own declared type is NULLABLE
+            // still needs its own `?.` (or a `!`) before the next suffix
+            // (§7.5/§7.4), and a parenthesised segment ends the chain
+            // (§7.5) — both keep the rejection below. See
             // tests/sema/call_result_nullable_receiver_3912_test.cpp's
             // `null_cond_member_*` cases for the regression coverage.
             TypeRef* tgt = ctx_.exprType(*ma.target);
             if (tgt && tgt->nullable) {
+                // fix #6070 (§7.5, v0.357): the CHAIN CONTINUATION. A plain
+                // `.` suffix to the right of a `?.` segment CONTINUES the
+                // chain: §7.5 "The chain is the whole postfix sequence ...
+                // a suffix to the right of a `?.` is typed at the value it
+                // meets on the path where it runs — the preceding segment's
+                // own declared type, never the nullable type the `?.` gives
+                // the chain's result: `s?.Length.ToString()` over `s: string?`
+                // calls `ToString()` on an `int`, and the chain is a `string?`".
+                //
+                // So the `?.` node's LIFTED type (always nullable, §7.5) is
+                // NOT the type the suffix is typed at: the continuation is
+                // typed at the SEGMENT's own declared type, and the chain's
+                // RESULT is nullable. `resolveNullCondChainContinuation`
+                // answers false for every shape §7.5 does not admit as a
+                // continuation (a parenthesised segment, a segment whose own
+                // declared type is nullable — §7.4's error — and a segment
+                // that names no value member), and the rejection below then
+                // stands.
+                if (resolveNullCondChainContinuation(ma)) return;
                 ctx_.diagnostics().report(
                     Severity::Error, ma.span.begin,
                     std::string("member access `.") +
@@ -48225,6 +48274,239 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         nn->nullable = true;
         ctx_.setExprType(&nm, nn);
     }
+}
+
+// fix #6070 (§7.5, v0.357): the `?.` SEGMENT's own declared type — the type
+// a suffix to the right of a `?.` is typed at. See the declaration comment in
+// ExprTypecheck_impl.hpp for the §7.5 sentence this answers.
+//
+// The answer is the type of the SAME access spelled with `.`: `x?.Y` and
+// `x.Y` name the same member, and §7.5's lift ("The result type is always
+// nullable") is the ONLY difference between the two spellings. So the `.`
+// twin is resolved — through the SAME resolver (`resolveMemberAccess`), so
+// the two spellings cannot drift apart — over a placeholder carrying the
+// receiver's NON-nullable type (the path where the chain runs).
+//
+// Speculative, exactly as the #6529 twin is: anything the twin reports is
+// discarded, and a twin that reports an error (or that names no value
+// member) answers "no own type", which leaves the caller on §7.4's
+// rejection.
+TypeRef* ExprTC::nullCondSegmentOwnType(const ast::NullCondMemberExpr& nm) {
+    if (!nm.target) return nullptr;
+    auto cached = nullCondSegmentOwnTypes_.find(&nm);
+    if (cached != nullCondSegmentOwnTypes_.end()) return cached->second;
+    const TypeRef* recvTy = ctx_.exprType(*nm.target);
+    if (!recvTy) return nullptr;
+    TypeRef* rcvTy = ctx_.makeTypeRef(*recvTy);
+    rcvTy->nullable = false;  // the path where the chain runs
+    auto ph = std::make_unique<ast::IdentifierExpr>();
+    ph->name = "<nullcond-segment-receiver>";  // unspellable (#6681)
+    ph->span = nm.target->span;
+    ctx_.setExprType(ph.get(), rcvTy);
+    // fix #7458 (§7.5, §28.2, v0.350): the placeholder STANDS FOR the real
+    // `?.` target, so it carries the target's symbol — the `.` twin's
+    // ownership classifiers key on it.
+    if (Symbol* targetSym = ctx_.exprSymbol(*nm.target))
+        ctx_.setExprSymbol(ph.get(), targetSym);
+    auto dot = std::make_unique<ast::MemberAccessExpr>();
+    dot->span = nm.span;
+    dot->member = nm.member;
+    dot->target = std::move(ph);
+    const ast::MemberAccessExpr* dotPtr = dot.get();
+    const std::size_t mark = ctx_.diagnostics().diagnostics().size();
+    const std::size_t errsBefore = ctx_.diagnostics().errorCount();
+    {
+        // The twin is a BARE member read: the segment is not the call's
+        // callee (a call's callee is the CONTINUATION), so the callee
+        // context is cleared for the twin's own resolution — the same
+        // discipline the `.` form uses to tell a bare read from a call.
+        const ast::Expr* savedCallee = calleeOfCallCtx_;
+        const std::ptrdiff_t savedArity = currentCallArity_;
+        calleeOfCallCtx_ = nullptr;
+        currentCallArity_ = -1;  // no call context (§2328's marker)
+        resolveMemberAccess(*dotPtr);
+        calleeOfCallCtx_ = savedCallee;
+        currentCallArity_ = savedArity;
+    }
+    TypeRef* own = ctx_.exprType(*dot);
+    const bool clean = ctx_.diagnostics().errorCount() == errsBefore;
+    ctx_.diagnostics().rollbackTo(mark);
+    nullCondChainSynth_.push_back(std::move(dot));
+    if (!clean || !own) {
+        nullCondSegmentOwnTypes_[&nm] = nullptr;
+        return nullptr;
+    }
+    nullCondSegmentOwnTypes_[&nm] = own;
+    return own;
+}
+
+// fix #6070 (§7.5, v0.357): the CHAIN CONTINUATION — a plain `.` suffix to
+// the right of a `?.` segment (`x?.Y.Z`). See the declaration comment in
+// ExprTypecheck_impl.hpp for the §7.5 sentence this implements.
+//
+// §7.5 (v0.357), verbatim: "**The chain is the whole postfix sequence**
+// (grammar A.7's `PrimaryExpr`), its plain `.`, `[ ]` and `( )` suffixes
+// included, and a suffix to the right of a `?.` is typed at the value it
+// meets on the path where it runs — the preceding segment's own declared
+// type, never the nullable type the `?.` gives the chain's result:
+// `s?.Length.ToString()` over `s: string?` calls `ToString()` on an `int`,
+// and the chain is a `string?`. A segment whose own declared type is
+// nullable needs its own `?.` (or a `!`) before the next suffix, under §7.4
+// — `user?.Name?.Length` where `Name` is a `string?` — and parentheses end
+// the chain: `(s?.Length).ToString()` is a member access on an `int?`,
+// §7.4's error."
+//
+// So the continuation is typed at the SEGMENT's own declared type, and the
+// chain's result is nullable. The continuation itself is typed by a `.`
+// TWIN over a placeholder carrying that own type (the same discipline as the
+// segment's own twin above), so the continuation resolves exactly as the
+// `.` spelling of the same access would.
+bool ExprTC::resolveNullCondChainContinuation(const ast::MemberAccessExpr& ma) {
+    auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(ma.target.get());
+    if (!ncm) return false;
+    // §7.5: "parentheses end the chain: `(s?.Length).ToString()` is a member
+    // access on an `int?`, §7.4's error." The parser stamps a `(`...`)`
+    // group on the grouped expression (ast::Expr::parenthesized), so the
+    // parenthesised spelling is told from the bare one here.
+    if (ncm->parenthesized) return false;
+    // §7.5: "A segment whose own declared type is nullable needs its own `?.`
+    // (or a `!`) before the next suffix, under §7.4."
+    TypeRef* own = nullCondSegmentOwnType(*ncm);
+    if (!own || own->nullable) return false;
+    // The CALL spelling (`x?.Y.Z(..)`) is typed by `resolveNullCondChainCall`
+    // (called from `typeCall`), which runs AFTER the arguments are visited —
+    // the twin call's argument checks need the arguments' types, and the
+    // arguments are visited after the callee. Here the shape is only
+    // ADMITTED: the §7.4 rejection must not fire.
+    if (calleeOfCallCtx_ == &ma) return true;
+    // The READ spelling (`x?.Y.Z`): the continuation is typed by its `.`
+    // TWIN over a placeholder carrying the SEGMENT's own declared type (the
+    // same discipline as the segment's own twin above), so the continuation
+    // resolves exactly as the `.` spelling of the same access would.
+    auto ph = std::make_unique<ast::IdentifierExpr>();
+    ph->name = "<nullcond-chain-receiver>";  // unspellable (#6681)
+    ph->span = ma.target->span;
+    ctx_.setExprType(ph.get(), own);
+    auto dot = std::make_unique<ast::MemberAccessExpr>();
+    dot->span = ma.span;
+    dot->member = ma.member;
+    dot->target = std::move(ph);
+    const ast::MemberAccessExpr* dotPtr = dot.get();
+    const std::size_t mark = ctx_.diagnostics().diagnostics().size();
+    const std::size_t errsBefore = ctx_.diagnostics().errorCount();
+    {
+        // The continuation inherits the CALLEE context of the access it
+        // continues: in `x?.Y.Z(..)` the `Z` access IS the call's callee, so
+        // the twin is resolved as the callee too (the #6529 discipline).
+        // A bare read keeps the outer context, which is not this twin's.
+        const ast::Expr* savedCallee = calleeOfCallCtx_;
+        const std::ptrdiff_t savedArity = currentCallArity_;
+        if (savedCallee == &ma)
+            calleeOfCallCtx_ = dotPtr;
+        resolveMemberAccess(*dotPtr);
+        calleeOfCallCtx_ = savedCallee;
+        currentCallArity_ = savedArity;
+    }
+    TypeRef* contTy = ctx_.exprType(*dot);
+    Symbol* contSym = ctx_.exprSymbol(*dot);
+    const bool clean = ctx_.diagnostics().errorCount() == errsBefore;
+    ctx_.diagnostics().rollbackTo(mark);
+    nullCondChainSynth_.push_back(std::move(dot));
+    if (!clean) return false;
+    if (contSym) ctx_.setExprSymbol(&ma, contSym);
+    if (!contTy) return false;  // no value member: nothing to continue at
+    if (contTy->kind == TypeRef::Kind::Function) {
+        // §27.6: a bare method reference — a FUNCTION value. The chain's
+        // result is that function value; §7.5's nullable lift does not
+        // apply to a function type (there is no `null` function value).
+        ctx_.setExprType(&ma, contTy);
+        return true;
+    }
+    // §7.5: the chain's result is nullable — it is `null` when the segment
+    // is null.
+    TypeRef* lifted = contTy;
+    if (!contTy->nullable) {
+        lifted = ctx_.makeTypeRef(*contTy);
+        lifted->nullable = true;
+    }
+    ctx_.setExprType(&ma, lifted);
+    return true;
+}
+
+// fix #6070 (§7.5, v0.357): type a CHAIN CONTINUATION CALL — the
+// `x?.Y.Z(..)` spelling. See the declaration comment in
+// ExprTypecheck_impl.hpp for the §7.5 sentence this implements.
+//
+// The call is typed by its `.`-spelled TWIN: a synthetic call whose callee
+// is the SAME access spelled with `.`, over a placeholder carrying the
+// SEGMENT's own declared type. So the call is typed exactly as the `.`
+// spelling of the same access over the same value would be — the twin is
+// resolved and typed through the SAME `resolveMemberAccess` / `typeCall`
+// pair, so the two spellings of one access cannot drift apart.
+//
+// The twin's diagnostics ARE the call's diagnostics (there is no second
+// typing of the same call), so they are NOT rolled back.
+bool ExprTC::resolveNullCondChainCall(const ast::CallExpr& ce) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma) return false;
+    auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(ma->target.get());
+    if (!ncm) return false;
+    // §7.5: "parentheses end the chain."
+    if (ncm->parenthesized) return false;
+    // §7.5: "A segment whose own declared type is nullable needs its own `?.`
+    // (or a `!`) before the next suffix, under §7.4."
+    TypeRef* own = nullCondSegmentOwnType(*ncm);
+    if (!own || own->nullable) return false;
+    // The `.`-spelled TWIN of the whole call.
+    auto ph = std::make_unique<ast::IdentifierExpr>();
+    ph->name = "<nullcond-chain-receiver>";  // unspellable (#6681)
+    ph->span = ma->target->span;
+    ctx_.setExprType(ph.get(), own);
+    auto dot = std::make_unique<ast::MemberAccessExpr>();
+    dot->span = ma->span;
+    dot->member = ma->member;
+    dot->target = std::move(ph);
+    const ast::MemberAccessExpr* dotPtr = dot.get();
+    auto synth = std::make_unique<ast::CallExpr>();
+    synth->span = ce.span;
+    synth->callee = std::move(dot);
+    auto& mutCe = const_cast<ast::CallExpr&>(ce);
+    synth->args = std::move(mutCe.args);
+    {
+        // The twin carries the call's own context: it IS the call, spelled
+        // with `.` — the same discipline the `?.` call's twin uses (#7778).
+        const ast::Expr* savedCallee = calleeOfCallCtx_;
+        const std::ptrdiff_t savedArity = currentCallArity_;
+        const ast::CallExpr* savedCallExpr = currentCallExpr_;
+        calleeOfCallCtx_ = dotPtr;
+        currentCallArity_ = static_cast<std::ptrdiff_t>(synth->args.size());
+        currentCallExpr_ = synth.get();
+        resolveMemberAccess(*dotPtr);
+        typeCall(*synth);
+        calleeOfCallCtx_ = savedCallee;
+        currentCallArity_ = savedArity;
+        currentCallExpr_ = savedCallExpr;
+    }
+    TypeRef* twinTy = ctx_.exprType(*synth);
+    // The callee's own type and symbol, as the ordinary `.` spelling
+    // publishes them — codegen's dispatch reads the symbol.
+    if (TypeRef* calleeTy = ctx_.exprType(*dotPtr))
+        ctx_.setExprType(ma, calleeTy);
+    if (Symbol* calleeSym = ctx_.exprSymbol(*dotPtr))
+        ctx_.setExprSymbol(ma, calleeSym);
+    mutCe.args = std::move(synth->args);
+    nullCondChainCallSynth_.push_back(std::move(synth));
+    if (!twinTy) return true;  // the twin reported the diagnostic
+    // §7.5: the whole chain's result is `null` when the segment is null, so
+    // the chain's result is the twin's result, lifted to nullable.
+    TypeRef* lifted = twinTy;
+    if (!twinTy->nullable && twinTy->kind != TypeRef::Kind::Function &&
+        twinTy->kind != TypeRef::Kind::Unit) {
+        lifted = ctx_.makeTypeRef(*twinTy);
+        lifted->nullable = true;
+    }
+    ctx_.setExprType(&ce, lifted);
+    return true;
 }
 
 // ===========================================================================

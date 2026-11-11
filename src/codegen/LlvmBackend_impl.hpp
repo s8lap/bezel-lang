@@ -27394,6 +27394,35 @@ private:
     llvm::Value* lowerNullCondCall(const ast::CallExpr& call,
                                    const ast::NullCondMemberExpr& nm);
 
+    // fix #6070 (§7.5, v0.357): the CHAIN CONTINUATION — a plain `.` suffix
+    // to the right of a `?.` segment (`x?.Y.Z`, `x?.Y.Z(..)`).
+    //
+    // §7.5 (v0.357): "**The chain is the whole postfix sequence** ... a
+    // suffix to the right of a `?.` is typed at the value it meets on the
+    // path where it runs — the preceding segment's own declared type, never
+    // the nullable type the `?.` gives the chain's result ... If any segment
+    // of a chain is null, the remainder of the chain is skipped on the same
+    // terms and the whole chain's result is `null`".
+    //
+    // So the lowering is the `?.` lowering extended over the chain: the
+    // RECEIVER is lowered once and null-checked; on the null edge the whole
+    // chain's result is null and nothing to the right of the segment runs;
+    // on the non-null edge the SEGMENT is read through its `.` twin and the
+    // CONTINUATION runs on that value.
+    //
+    // `isNullCondChain(e)` — is `e` a chain continuation at all (a `.`
+    // suffix whose receiver is a `?.` segment)? A parenthesised segment ends
+    // the chain (§7.5), so it is not one.
+    bool isNullCondChain(const ast::Expr& e);
+    llvm::Value* lowerNullCondChain(const ast::Expr& e);
+    // fix #6070 (§7.5, v0.357): keep-alive for the synthetic `.`-spelled
+    // nodes the chain continuation builds — the segment's twin and the
+    // continuation's twin (the latter inside the synthetic call). Their
+    // exprType entries are keyed on the node addresses, which must outlive
+    // the pass (the #6024 discipline).
+    std::vector<std::unique_ptr<ast::MemberAccessExpr>> nullCondChainSynth_;
+    std::vector<std::unique_ptr<ast::CallExpr>> nullCondChainCallSynth_;
+
     // CG18: the LLVM function type of an instance/static method — leading
     // `this` for instance methods, then the declared parameters. Used for
     // indirect (vtable) calls, including to abstract methods that have no

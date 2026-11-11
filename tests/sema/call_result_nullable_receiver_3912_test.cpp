@@ -230,15 +230,15 @@ BEZEL_TEST(sema_call_result_nullable_receiver_3912,
 // with `ma.target` a NullCondMemberExpr. `NullCondMemberExpr` is NOT a
 // subtype of `MemberAccessExpr` (a sibling `Expr` node, ast/Node.hpp), so
 // this does not match the MemberAccessExpr arm above — it falls to the
-// #3912 catch-all `else` arm, whose `tgt->nullable` check DOES fire here
-// (`tgt` is the lifted `int?`), correctly rejecting the access. This is
-// the CORRECT #3912-class rejection (same class of bug #3912 fixes: a
-// nullable-typed, non-narrowable expression result reaching a further
-// plain `.member` unguarded) — it was a SILENT side effect of 0468fc2's
-// fix, with no dedicated test and a commit-message/in-code comment that
-// INCORRECTLY claimed NullCondMemberExpr targets "are already non-nullable
-// at this point ... and never trip the check below" (fixed by this commit,
-// see the corrected comment at the #3912 catch-all `else` arm above).
+// #3912 catch-all `else` arm.
+//
+// fix #6070 (§7.5, v0.357): the catch-all no longer REJECTS that shape —
+// §7.5 has since ruled that a plain `.` suffix to the right of a `?.`
+// CONTINUES the chain (see the row below, which this file's row was FLIPPED
+// to). The catch-all still rejects the two shapes §7.5 does NOT admit as a
+// continuation: a segment whose OWN declared type is nullable (it needs its
+// own `?.` or a `!` first, §7.4) and a PARENTHESISED segment (parentheses
+// end the chain, §7.5).
 //
 // TEST-GAP issue, not a behavior fix (LANE_RULES §3 applies with no
 // "without" side in src/ — the rejection already exists on HEAD, verified
@@ -247,18 +247,34 @@ BEZEL_TEST(sema_call_result_nullable_receiver_3912,
 // `runAot`-based accept-side controls above.
 
 // #3932's own measured repro, verbatim: `N()?.Length.ToString()` where
-// `N(): string?` and `string.Length: int` (non-nullable) — the `?.`
-// lifts `Length`'s access to `int?`, and the further unguarded `.ToString`
-// must be rejected exactly like the #3912 sibling shapes.
+// `N(): string?` and `string.Length: int` (non-nullable).
+//
+// FLIPPED by fix #6070 (§7.5, v0.357). The row asserted the #3912-class
+// rejection of this shape; §7.5 (v0.357) now rules the opposite, and the
+// owner's ruling (v0.355, in the issue) is the same reading:
+//
+//   "**The chain is the whole postfix sequence** (grammar A.7's
+//   `PrimaryExpr`), its plain `.`, `[ ]` and `( )` suffixes included, and a
+//   suffix to the right of a `?.` is typed at the value it meets on the path
+//   where it runs — the preceding segment's own declared type, never the
+//   nullable type the `?.` gives the chain's result: `s?.Length.ToString()`
+//   over `s: string?` calls `ToString()` on an `int`, and the chain is a
+//   `string?`."
+//
+// So the chain CONTINUES: the `ToString()` runs on the `int` the `Length`
+// segment yields, and the chain's RESULT is `string?` — `null` when `N()` is
+// null. The old expectation (the §7.4 narrowing refusal) is REPLACED by the
+// acceptance and the `string?` result.
 BEZEL_TEST(sema_call_result_nullable_receiver_3912,
-           null_cond_member_further_plain_access_rejected_7_4_7_5) {
+           null_cond_member_further_plain_access_accepted_7_5) {
     auto r = runAot(prog(
         "public static method Main(): int "
         "  const w := N()?.Length.ToString(); "
         "  return 0; "
         "end Main;"));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kNullableResultDiag));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kSec74));
+    BEZEL_EXPECT_TRUE(r.diagnostics.diagnostics().empty());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
 // ACCEPT control — the `?.` access ALONE (no further plain member access)

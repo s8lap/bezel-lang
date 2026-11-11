@@ -793,6 +793,20 @@ private:
     // resolveNullCondMember builds to type a bare `?.` property read on a
     // builtin time value record (`DateTime?`.Year, ...).
     std::vector<std::unique_ptr<ast::MemberAccessExpr>> nullCondBuiltinMemberSynth_;
+    // fix #6070 (§7.5, v0.357): keep-alive for the synthetic `.`-spelled
+    // TWINS the §7.5 CHAIN CONTINUATION builds — the `.` form of the `?.`
+    // segment (which answers the segment's OWN declared type), the `.` form
+    // of the continuation itself, and the synthetic CALL that carries the
+    // continuation's arguments. Their exprType entries are keyed on the node
+    // addresses, which must outlive the pass (the #6529 discipline).
+    std::vector<std::unique_ptr<ast::MemberAccessExpr>> nullCondChainSynth_;
+    std::vector<std::unique_ptr<ast::CallExpr>> nullCondChainCallSynth_;
+    // fix #6070 (§7.5, v0.357): the `?.` SEGMENT's own declared type, keyed
+    // on the `?.` node. The member-access site and the call site both ask
+    // for it (the call site's twin call needs the same answer), so it is
+    // computed ONCE.
+    std::unordered_map<const ast::NullCondMemberExpr*, TypeRef*>
+        nullCondSegmentOwnTypes_;
     // §11.8: one synthesized GenericParamSymbol marker per type-parameter
     // name, attached as the exprSymbol of a `T` member-access receiver so
     // resolveMemberAccess (and codegen) can identify the receiver kind.
@@ -5901,6 +5915,62 @@ private:
     // null). The member's own type is looked up; its nullable form is the
     // expression's type, so member access chains (`a?.b?.c`) resolve.
     void resolveNullCondMember(const ast::NullCondMemberExpr& nm);
+
+    // fix #6070 (§7.5, v0.357): the `?.` SEGMENT's own declared type — the
+    // type a suffix to the right of a `?.` is typed at.
+    //
+    // §7.5 *Evaluation* (v0.357), verbatim: "**The chain is the whole
+    // postfix sequence** (grammar A.7's `PrimaryExpr`), its plain `.`, `[ ]`
+    // and `( )` suffixes included, and a suffix to the right of a `?.` is
+    // typed at the value it meets on the path where it runs — the preceding
+    // segment's own declared type, never the nullable type the `?.` gives the
+    // chain's result: `s?.Length.ToString()` over `s: string?` calls
+    // `ToString()` on an `int`, and the chain is a `string?`."
+    //
+    // So the segment's own type is NOT the `?.` node's type (which §7.5
+    // lifts to nullable unconditionally: "The result type is always
+    // nullable") but the DECLARED type of the member the segment names. The
+    // answer is therefore the type of the SAME access spelled with `.`:
+    // `x?.Y` and `x.Y` name the same member, and §7.5's lift is the only
+    // difference between them. This helper resolves that `.` twin — through
+    // the SAME resolver (`resolveMemberAccess`), so the two spellings cannot
+    // drift apart — over a placeholder carrying the receiver's NON-nullable
+    // type (the path where the chain runs).
+    //
+    // Returns null when the segment names no VALUE member (a method, an
+    // unknown name, an untyped receiver): the chain then has no value to
+    // continue at, and §7.5's continuation does not apply.
+    TypeRef* nullCondSegmentOwnType(const ast::NullCondMemberExpr& nm);
+
+    // fix #6070 (§7.5, v0.357): the CHAIN CONTINUATION — a plain `.` suffix
+    // to the right of a `?.` segment (`x?.Y.Z`). §7.5 types that suffix at
+    // the segment's own declared type and makes the chain's result `null`
+    // when the segment is null.
+    //
+    // Returns true when the shape IS an admitted §7.5 chain continuation —
+    // the caller must then NOT report §7.4's rejection. Returns false for
+    // every shape §7.5 does not admit: a parenthesised segment
+    // (`(x?.Y).Z` — §7.5: "parentheses end the chain"), a segment whose own
+    // declared type is NULLABLE (§7.5: "A segment whose own declared type is
+    // nullable needs its own `?.` (or a `!`) before the next suffix, under
+    // §7.4"), or a segment that names no value member at all. In the false
+    // case the caller keeps §7.4's rejection.
+    bool resolveNullCondChainContinuation(const ast::MemberAccessExpr& ma);
+
+    // fix #6070 (§7.5, v0.357): type a CHAIN CONTINUATION CALL — the
+    // `x?.Y.Z(..)` spelling. The call is typed by its `.`-spelled TWIN: a
+    // synthetic call whose callee is the SAME access spelled with `.`, over a
+    // placeholder carrying the SEGMENT's own declared type. So the call is
+    // typed exactly as the `.` spelling of the same access over the same
+    // value would be (§7.5: "a suffix to the right of a `?.` is typed at the
+    // value it meets on the path where it runs — the preceding segment's own
+    // declared type"), and the chain's RESULT is the twin's result, lifted
+    // to nullable (§7.5: "the whole chain's result is `null`" when the
+    // segment is null).
+    //
+    // Returns true when the call was typed as a chain continuation (the
+    // twin's diagnostics, if any, are the call's own).
+    bool resolveNullCondChainCall(const ast::CallExpr& ce);
 
     // #3019 (§9.2/§9.3/§35.7): the use-site gate for a direct
     // `.Equals(...)`/`.GetHashCode()` (or `?.Equals(...)`/`?.GetHashCode()`)
