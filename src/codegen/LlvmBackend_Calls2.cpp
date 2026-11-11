@@ -19516,6 +19516,33 @@ void Emitter::applyMethodGenericSubst(
             unifyMethodReturnTypeArg(declPt, atCaller, md->genericParams,
                                      newSubst, newSema, added);
         });
+        // fix #8527 (§14.5 phase 2 / §7.5, v0.357): a function-typed formal
+        // `f: (T) -> R` takes `R` from the ARGUMENT's own function type —
+        // "the lambda's inferred return type then unifies against the
+        // function type's return position, binding type parameters still
+        // free" (§14.5 phase 2, *Function-typed arguments, left to right*).
+        // Codegen had NO arm for a function-typed parameter (sema's own
+        // `unifyArgSubst` has one — ExprTypecheck_Calls.cpp, the #4089 arm),
+        // so `R` stayed unbound here and was recovered from the call's RESULT
+        // type instead. At a `?.` call (§7.5) the result type carries the
+        // operator's extra nullable, so `R` was bound to `int?` where the
+        // lambda returns `int`: the monomorphized callee returned a nullable
+        // carrier while the lambda returned a plain `int`, and the call read
+        // the two as one value — the garbage #8527 prints. In the `.`-form
+        // the result type IS the substituted declared return, so the binding
+        // is the same value there and this changes only the `?.` call.
+        if (declPt->kind == sema::TypeRef::Kind::Function &&
+            atCaller->kind == sema::TypeRef::Kind::Function &&
+            declPt->funcReturn && atCaller->funcReturn) {
+            // The lambda's inferred return type is a caller-side type.
+            const sema::TypeRef* argRet =
+                inCallerScope(atCaller->funcReturn);
+            underCallerSubst([&] {
+                unifyMethodReturnTypeArg(declPt->funcReturn, argRet,
+                                         md->genericParams, newSubst, newSema,
+                                         added);
+            });
+        }
     }
     // fix #4813 (§14.1 / §15.4, v0.307): a sequence collection literal
     // (`C([11, 22])` against `xs: Array<T>`) has no expression type of its
@@ -25836,6 +25863,32 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         // below (success, early bail-out, post-CreateCall release emission).
         currentCallee_ = md;
         argBoxCallIdx = beginArgBoxCall();
+        // fix #8527 (§14.1 / §14.5, v0.357): the `?.` twin of the `.` form's
+        // #505 lambda pre-pass. The callee's method-level type parameters
+        // must be BOUND before the arguments are lowered: `lowerLambda` types
+        // an un-annotated lambda's parameter from the formal's function type,
+        // and `lowerTypeRef(T)` on an unbound `T` is the int placeholder — so
+        // `h?.Ap<Box, int>(xs[1], lambda(v) => v.Age * 2)` read `v.Age` off an
+        // int and printed 0, where the `.` form of the same call prints 80.
+        // The `.` form's pre-pass infers the substitution from the call's own
+        // argument types (SEMANTIC types, never lowered) and installs it for
+        // the duration of the argument lowering only; this is the same
+        // discipline and the same restore.
+        auto savedNcArgSubst = genericSubst_;
+        auto savedNcArgSemaTy = genericSubstSemaTy_;
+        struct NcArgSubstRestore {
+            Emitter& e;
+            std::unordered_map<std::string_view, llvm::Type*> savedSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*>
+                savedSemaTy;
+            ~NcArgSubstRestore() {
+                e.genericSubst_ = std::move(savedSubst);
+                e.genericSubstSemaTy_ = std::move(savedSemaTy);
+            }
+        } ncArgSubstRestore{*this, std::move(savedNcArgSubst),
+                            std::move(savedNcArgSemaTy)};
+        if (!md->genericParams.empty())
+            applyMethodGenericSubst(call, ms);
         if (!buildOrderedArgs(md->params, call.args, args, &argExprs,
                               /*nullTransferredOwned=*/true,
                               &accessorRefArgs)) {
