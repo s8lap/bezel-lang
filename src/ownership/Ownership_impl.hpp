@@ -4802,6 +4802,23 @@ private:
     // unless `--report-trust-admissions` is set, which is what leaves the
     // default build's diagnostics unchanged.
     bool trustFieldStoreCarrier(const ast::Expr& e);
+    // fix #7468 (§28.3 *Diagnostics* "The trust-admission report", v0.357):
+    // the member-access arm of `trustFieldStoreCarrier` — does this member
+    // read a class-typed BORROW (and not a method reference, an enum
+    // constant, a value-typed read or a `static` member's always-live read)?
+    bool trustMemberReadIsBorrowCarrier(const ast::MemberAccessExpr& ma);
+    // fix #7468 (§28.3 *Diagnostics* "The trust-admission report", v0.357):
+    // is this store's TARGET static storage (a static field or a static
+    // property)? [K4.3] records no clause for a static-held borrow, so such a
+    // store rests on no trust clause and the mode does not name it.
+    bool trustStoreTargetIsStatic(const ast::Expr& target);
+    // fix #7468 (§28.3 *Diagnostics* "The trust-admission report"; §28.11
+    // *Borrowing collections* → *Storing a borrow*, v0.357): is this
+    // collection element the source binding ITSELF (a plain parameter of this
+    // body, or `this`/`base`) rather than a value read through one? A store
+    // of such an element into a purely local collection is not reported; a
+    // field-path-sourced element stays reported.
+    bool trustCollectionElementIsSourceBinding(const ast::Expr& e);
     void reportTrustAdmission(Severity sev, SourceLocation loc,
                               const char* clause, const std::string& carrier);
 

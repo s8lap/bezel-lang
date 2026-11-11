@@ -8204,6 +8204,118 @@ bool MethodOwnership::isPlainBorrowParam(sema::Symbol* sym) {
     return isBorrowableType(declTy);
 }
 
+// fix #7468 (§28.3 *Diagnostics* "The trust-admission report", v0.357): is this
+// MEMBER a `static` one (per-type storage)? Read off `MemberSymbol::modifiers`,
+// which `SymbolCollection` fills from the AST declaration for a local member and
+// `ModuleLoader` from `MetaMember::modifiers` for an import — the same channel
+// fix #3149 settled for methods. A static member's read has [K2]'s always-live
+// source, so the borrow it names is statically bounded and rests on no clause.
+// // per §28.3
+static bool trustMemberIsStatic(const sema::Symbol* sym) {
+    const auto* ms = dynamic_cast<const sema::MemberSymbol*>(sym);
+    if (!ms) return false;
+    for (std::string_view mod : ms->modifiers)
+        if (mod == "static") return true;
+    return false;
+}
+
+// fix #7468 (§28.3 *Diagnostics* "The trust-admission report", v0.357): is this
+// store's TARGET static storage — a static field or a static property? [K4.3]
+// clause 3 records no clause for a static-held borrow ("No clause covers a
+// static-held borrow, and none is needed"), so a store into one rests on no
+// trust clause and the mode does not name it.
+//
+// The two spellings of a field store are the qualified member access
+// (`Gate.M := …`) and the bare field name (§28.3 #1082's arm), so both are
+// answered here; `trustMemberIsStatic` reads the `static` modifier off the
+// member's own symbol, which is `SymbolCollection`'s local channel and
+// `ModuleLoader`'s import channel alike.
+// // per §28.3
+bool MethodOwnership::trustStoreTargetIsStatic(const ast::Expr& target) {
+    if (dynamic_cast<const ast::MemberAccessExpr*>(&target))
+        return trustMemberIsStatic(ctx_.exprSymbol(target));
+    if (dynamic_cast<const ast::IdentifierExpr*>(&target))
+        return trustMemberIsStatic(ctx_.exprSymbol(target));
+    return false;
+}
+
+// fix #7468 (§28.3 *Diagnostics* "The trust-admission report"; §28.11
+// *Borrowing collections* → *Storing a borrow*, v0.357): is this collection
+// ELEMENT the source binding ITSELF — a plain parameter of this body, or
+// `this`/`base` — rather than a value read through one?
+//
+// §28.11: "A store into a collection that is a local of the body and does not
+// escape it, of a parameter that is not `owned` or of `this` — the binding
+// itself, not a value read through it — is not reported … An element read
+// through a field path stays reported at its store into such a collection
+// too, since the body's own replacing `move` can take the field's value out
+// and transfer it (§28.3.9 *Scope* clause 1)."
+//
+// So the answer is YES only for the two spellings of a binding — an
+// identifier that is `this`/`base`, and an identifier that resolves to a
+// plain (non-`owned`, non-`scoped`, non-`ref`/`out`) parameter of this body.
+// A field path (`h._child`), a call result, a local, a literal: NO.
+// `isPlainBorrowParam` is the file's settled "a plain reference-typed
+// parameter of THIS body" test, and it already excludes `owned` (a transfer,
+// not a borrow), `scoped` (§28.14's static bound, no residual trust) and
+// `ref`/`out` (not a borrow at all).
+// // per §28.3, §28.11, §28.14
+bool MethodOwnership::trustCollectionElementIsSourceBinding(
+    const ast::Expr& e) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return false;
+    if (id->name == "this" || id->name == "base") return true;
+    return isPlainBorrowParam(ctx_.exprSymbol(*id));
+}
+
+// fix #7468 (§28.3 *Diagnostics* "The trust-admission report", v0.357): does this
+// member access read a BORROW — a class-typed reference whose source the caller
+// must keep alive — or a value that carries none?
+//
+// The three exclusions are each load-bearing:
+//   * a METHOD reference (`Demo.Twice`, `this.Foo`) forms a FUNCTION VALUE
+//     (§27.6): a capture-free one carries the empty source set (§28.3
+//     *Provenance* clause 5) and a capture-bearing one is a set-erasing
+//     position — neither is a trust clause, and neither is a borrow of the
+//     member;
+//   * an ENUM CONSTANT is a value;
+//   * a `static` member's read has [K2]'s always-live source, so it is
+//     statically bounded (§28.3's *Static field access `T.f`* producers row).
+//
+// The type test is `isBorrowableOwnedSinkType` — the file's settled statement
+// of "a class-typed reference": a user class or interface, or a
+// declaration-less builtin class head (`Array<T>`, `StringBuilder`, `Random`,
+// the owning collections) alike. A value-typed read (`bool`, an enum, a
+// record, a choice, a primitive) and a function-typed read are excluded.
+//
+// The builtin HANDLE heads (`Mutex`, `Semaphore`, `Atomic<T>`,
+// `ChannelSender<T>`, the Task family) are declaration-less builtins too, and
+// `isBorrowableOwnedSinkType` does not list them: the compiler models them as
+// carrying no borrow anywhere else either — the identifier arm below reports
+// no `Mutex`-parameter store, and §28.3's *Static stores* rule does not fire
+// on one (that gap is proposal 0151's `spec-tracking` tracker, a REJECT-side
+// rule this lane does not touch). The narrowing here therefore follows the
+// compiler's own model rather than re-deciding it; the static-HOLDER
+// exclusion (`trustStoreTargetIsStatic`) is what silences the `s28_3_0151`
+// shape, and it is reached on a class-typed operand regardless.
+// // per §28.3, §27.6
+bool MethodOwnership::trustMemberReadIsBorrowCarrier(
+    const ast::MemberAccessExpr& ma) {
+    sema::Symbol* sym = ctx_.exprSymbol(ma);
+    if (!sym) return false;
+    // A method reference and an enum constant are not borrows of the member.
+    if (dynamic_cast<sema::MethodSymbol*>(sym)) return false;
+    if (dynamic_cast<sema::EnumConstantSymbol*>(sym)) return false;
+    // The member must be storage: a field, a property or an indexer.
+    if (!dynamic_cast<sema::FieldSymbol*>(sym) &&
+        !dynamic_cast<sema::PropertySymbol*>(sym))
+        return false;
+    // A static member's read is statically bounded ([K2]'s always-live source).
+    if (trustMemberIsStatic(sym)) return false;
+    // The read's type must be a class-typed borrow.
+    return isBorrowableOwnedSinkType(ctx_.exprType(ma));
+}
+
 // §28.3 *Diagnostics* "The trust-admission report" (v0.307, #4605): is this
 // expression's borrow carrier one the mode REPORTS — the implicit receiver, or
 // a plain (non-`owned`, non-`scoped`, non-`ref`/`out`) reference-typed
@@ -8216,11 +8328,6 @@ bool MethodOwnership::isPlainBorrowParam(sema::Symbol* sym) {
 // `owned` parameter is a transfer, not a borrow, and §28.14's `scoped` twin is
 // a static bound with no residual trust) and the #4757 `methodParamSet_` gate
 // (a lambda's own parameter is re-bound per invocation, not a carry).
-//
-// A member-access receiver (`this.x`, `base.f`, `obj.g`) is the "receiver" arm
-// of the spec's rule; it is admitted here on the AST shape alone, because at
-// this point the check has already established the store is one §28.3/§28.11
-// admits (a source that would die in this frame was rejected above).
 //
 // The parameter arm adds the CLASS/INTERFACE-typed requirement on top of
 // `isPlainBorrowParam`, and it is load-bearing rather than decorative. The
@@ -8238,8 +8345,36 @@ bool MethodOwnership::isPlainBorrowParam(sema::Symbol* sym) {
 // `scopedArgIsClassBorrow` is the file's settled class/interface-typed test
 // (Named + a real declaration + not a value builtin + Class or Interface), so
 // reuse it rather than re-deriving. // per §28.3, §28.11, §28.14
+//
+// fix #7468 (§28.3 *Diagnostics* "The trust-admission report", v0.357): the
+// MEMBER-ACCESS arm is type-tested the way the identifier arm always was.
+// It used to answer `true` for EVERY `MemberAccessExpr`, so an enum
+// constant, a static method reference, a function-typed property read and a
+// value-typed member read were all reported as trust admissions — seven of
+// the fifty lines the mode drew over the rule corpus were of that shape
+// (`s10_5_0012` ×3, `s27_7_1_0004`, `s3_6_0007`, `s28_3_0117`, `s28_3_0110`,
+// `s7_4_0075`, the `choice_borrow_field_2209` lit program). §28.3's report
+// reaches only "an admission that rests on a [K4.3]-recorded trust clause",
+// and a value carries no borrow at all:
+//   * a FUNCTION VALUE (a method reference, §27.6) carries the empty source
+//     set when it is capture-free (§28.3 *Provenance* clause 5) and is a
+//     set-erasing position when it is capture-bearing — neither is a trust
+//     clause;
+//   * an ENUM CONSTANT and every VALUE-typed read (a `bool`, a record, a
+//     choice, a primitive) carry no borrow;
+//   * a STATIC member's read has [K2]'s always-live source, so it is
+//     statically bounded and rests on no clause.
+//
+// The arm therefore admits a member access only when the resolved symbol is
+// a FIELD, PROPERTY or INDEXER (never a method, never an enum constant),
+// the member is not `static`, and the read's TYPE is a class-typed borrow —
+// `isBorrowableOwnedSinkType`, the file's settled test, which reaches a
+// user class or interface and a declaration-less builtin class head
+// (`Array<T>`, `StringBuilder`, `Random`, the owning collections) alike.
+// // per §28.3, §28.11
 bool MethodOwnership::trustFieldStoreCarrier(const ast::Expr& e) {
-    if (dynamic_cast<const ast::MemberAccessExpr*>(&e)) return true;
+    if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        return trustMemberReadIsBorrowCarrier(*ma);
     // The implicit receiver as a bare `this`/`base` identifier, if the AST
     // spells it that way.
     if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
@@ -13611,7 +13746,19 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
         // body being analysed (a lambda's own parameter resolves inside its
         // own body and is re-bound per invocation — the #4757 gate the same
         // file's `isPlainBorrowParam` uses).
-        if (dest == Dest::Field && trustFieldStoreCarrier(*as.value))
+        //
+        // fix #7468 (§28.3 *Diagnostics* "The trust-admission report", v0.357):
+        // a STATIC holder records NO clause. [K4.3] clause 3: "No clause
+        // covers a **static-held** borrow, and none is needed: a borrow of
+        // anything but static storage is stored into no static field or
+        // static property (§28.3's *Static stores*) — across domains the flag
+        // is no backstop, so the always-live holder admits only what lives as
+        // long as it does." A store into a static field or a static property
+        // therefore rests on no trust clause and is not reported — the
+        // `s28_3_0151` shape (`Gate.M := this._mine;`), whose line was one of
+        // the seven false ones over the corpus.
+        if (dest == Dest::Field && !trustStoreTargetIsStatic(*as.target) &&
+            trustFieldStoreCarrier(*as.value))
             reportTrustAdmission(Severity::Warning, as.value->span.begin,
                                  "§28.3 borrowed-field store",
                                  "the receiver or a plain (non-`owned`, "
@@ -14486,7 +14633,40 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
             // §28.14's `scoped` twin stays silent: the `scoped` parameter's
             // admission is upgraded to a static bound, leaving no residual
             // trust to record.
-            if (trustFieldStoreCarrier(*a.value))
+            //
+            // fix #7468 (§28.3 *Diagnostics* "The trust-admission report";
+            // §28.11 *Borrowing collections* → *Storing a borrow*, v0.357): a
+            // store into a PURELY LOCAL collection is not reported. §28.11:
+            // "A store into a collection that is a local of the body and does
+            // not escape it, of a parameter that is not `owned` or of `this` —
+            // the binding itself, not a value read through it — is not
+            // reported: the scope comparison bounds the element (K2.3), and
+            // the body holds no obligation for the object such a binding
+            // names, so no kill in it can transfer that object." The element
+            // must be the SOURCE BINDING ITSELF — a plain parameter or `this`
+            // — and not a value read through it; "An element read through a
+            // field path stays reported at its store into such a collection
+            // too, since the body's own replacing `move` can take the field's
+            // value out and transfer it (§28.3.9 *Scope* clause 1)."
+            //
+            // The receiver is "purely local" when it is a LOCAL of the frame
+            // being checked: `RecvKind::Local` says the receiver resolves to a
+            // local, and the depth map says the local is declared in THIS
+            // frame (`depthOf` >= 0). A local of an ENCLOSING frame — a wider
+            // scope — has no entry in this frame's map and is one of §28.11
+            // clause 2's "provably outlives" holders, so it stays reported.
+            // The escape half of §28.11's phrase is met by construction: a
+            // body-local collection cannot reach a longer-lived holder
+            // through any admitted route (a store of a scope-bound local into
+            // a field is rejected by §28.3's borrowed-field rule, and a
+            // `using var` cannot be moved out — §28.10).
+            const bool purelyLocalCollection =
+                kind == RecvKind::Local && recvLocal &&
+                depthOf(recvLocal->decl) >= 0;
+            const bool purelyLocalQuietStore =
+                purelyLocalCollection &&
+                trustCollectionElementIsSourceBinding(*a.value);
+            if (!purelyLocalQuietStore && trustFieldStoreCarrier(*a.value))
                 reportTrustAdmission(Severity::Warning, a.value->span.begin,
                                      "§28.11 borrowing-collection store",
                                      "the receiver or a plain (non-`owned`, "
