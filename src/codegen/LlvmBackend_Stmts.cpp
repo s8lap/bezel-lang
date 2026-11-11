@@ -2391,6 +2391,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         rhs = coerceInitializerToSlot(
                             rhs, elemTy, isUnsignedTargetExpr(*as->value));
                     llvm::StoreInst* si = builder_.CreateStore(rhs, addr);
+                    // fix #6566 (§28.11 *The element slot policy*, v0.357):
+                    // `t := rows[i]` re-binds a local that holds its own
+                    // reference on the strings of the element it copied out
+                    // (see bindCoOwnedArrayCopyOut). The hand-off from the
+                    // indexer-get is consumed here whether or not it matches.
+                    {
+                        const ast::Node* tgtDecl = nullptr;
+                        if (as->op == ":=" && as->value)
+                            if (auto* tid =
+                                    dynamic_cast<const ast::IdentifierExpr*>(
+                                        as->target.get()))
+                                if (auto* tloc =
+                                        dynamic_cast<sema::LocalSymbol*>(
+                                            ctx_.exprSymbol(*tid)))
+                                    tgtDecl = tloc->decl;
+                        bindCoOwnedArrayCopyOut(tgtDecl, as->value.get(), rhs,
+                                                /*isDecl=*/false);
+                    }
                     // fix #4566 / §15.3 *Local-to-local assignment* + §28.7
                     // *Moved-from and null* (v0.306): the MOVE half of the
                     // drop-on-overwrite pass above. An owning choice is a

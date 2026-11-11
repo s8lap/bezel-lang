@@ -864,6 +864,40 @@ extern "C" void bz_array_own_embedded_strings(void* arrp, int64_t esz,
     arr->emb_release = release;
 }
 
+// fix #6566 (§28.11 *The element slot policy*, §28.9, v0.357): the COPY-OUT
+// half of the co-ownership the two stamps above record.
+//
+// THE RULE. §28.11's operations table, copy-slot column, indexer-get row:
+// "copy out (a runtime-managed reference the copy holds — a
+// `DictionaryEntry<string, V>`'s `Key` — keeps §28.9's unbounded lifetime
+// through every later mutation or disposal of the collection)". A stamped
+// array holds exactly one reference per string per slot and gives it back when
+// the slot is overwritten, removed or cleared, so a bare byte copy of the
+// element — `var t := rows[0];` — dangled as soon as
+//     rows[0] := rows[1];          // the array's reference on t's strings: gone
+// ran, and `rows[1] := t;` then took a reference on freed memory (#6566's
+// swap; `RemoveAt(0)` + `Add(t)` and `Clear()` + `Add(t)` are the same shape).
+//
+// THE MECHANISM. `copy` is the address of a private byte copy of an element
+// the caller has JUST read out of `arrp` (nothing ran in between, so the slot
+// still holds the same bytes and the array still holds its references — which
+// is what makes taking another one safe). When `arrp` is a co-owner of its
+// slots' strings, one reference per embedded string is taken on behalf of the
+// copy; the caller releases them when the copy's binding ends. When `arrp` is
+// NOT a co-owner (an unstamped array: the strings' liveness is whatever the
+// producer left, and may already be gone) the copy is ZEROED instead, so the
+// caller's unconditional scope-end release is a no-op — no reference is ever
+// taken through a pointer this array does not vouch for.
+extern "C" void bz_array_coown_copy_out(void* arrp, void* copy, int64_t esz) {
+    if (!copy || esz <= 0) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (arr && !arr->disposed && bz_array_str_key_slot(arr, esz)) {
+        bz_array_take_slot_refs(arr, copy);
+        return;
+    }
+    memset(copy, 0, (size_t)esz);
+}
+
 void bz_array_free(void* arrp, void (*dispose_elem)(void*)) {
     if (!arrp) return;
     auto* arr = (bz_array_t*)arrp;

@@ -224,6 +224,10 @@ void bz_array_own_str_dict_keys(void* arr, int64_t elem_size);
 // record elements embed; `retain` / `release` are applied to an element address.
 void bz_array_own_embedded_strings(void* arr, int64_t elem_size,
                                    void (*retain)(void*), void (*release)(void*));
+// fix #6566 (§28.11, v0.357): `copy` is a private byte copy of an element just
+// read out of `arr`. Takes one reference per embedded string for the copy when
+// `arr` co-owns its slots' strings; zeroes `copy` otherwise.
+void bz_array_coown_copy_out(void* arr, void* copy, int64_t elem_size);
 
 // Return a pointer directly into the array's internal buffer at element `idx`.
 // Only valid until the next mutation; used for zero-copy access in codegen.

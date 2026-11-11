@@ -17106,6 +17106,36 @@ private:
                kt->primitive == sema::PrimitiveType::String && !kt->nullable;
     }
 
+    // fix #6566 (§28.11 *The element slot policy*, §28.9, v0.357): a local
+    // bound from an array indexer-get of an element that EMBEDS strings — a
+    // record with string components, a `DictionaryEntry<string, V>` — holds
+    // its own reference on those strings for as long as the binding lives
+    // (§28.11's indexer-get row: the copy's runtime-managed reference "keeps
+    // §28.9's unbounded lifetime through every later mutation or disposal of
+    // the collection"). See `bindCoOwnedArrayCopyOut` (LlvmBackend_Assign.cpp).
+    //
+    // `lastArrayElemRead*_` is the hand-off from `lowerCollectionIndexerGet`
+    // to the binding site: the IndexExpr just lowered, the array it read, and
+    // the (substitution-resolved) element type. It is recorded only for a
+    // qualifying element type and is consumed — or discarded — by the next
+    // binding site, which matches it against its own initializer by node
+    // identity.
+    const ast::Expr* lastArrayElemReadExpr_ = nullptr;
+    llvm::Value* lastArrayElemReadRecv_ = nullptr;
+    const sema::TypeRef* lastArrayElemReadElemTy_ = nullptr;
+    int64_t lastArrayElemReadEsz_ = 0;
+    // The local's SHADOW: a second copy of the element, in which the
+    // references taken for the binding are held and from which they are
+    // released at the end of the local's scope. Keyed by the declaration
+    // node; an entry is only honoured inside the function that created it.
+    std::unordered_map<const void*, llvm::AllocaInst*> coOwnedCopyOutShadow_;
+    bool arrayElemEmbedsCoOwnedStrings(const sema::TypeRef* et);
+    void noteArrayElemRead(const ast::Expr& ix, llvm::Value* recv,
+                           const sema::TypeRef* recvTy, int64_t esz);
+    void bindCoOwnedArrayCopyOut(const ast::Node* declNode,
+                                 const ast::Expr* src, llvm::Value* v,
+                                 bool isDecl);
+
     // fix #4135 (§27.5 / §28.9, stdlib §4.9, v0.295): is `rt` a
     // DrainedEntry<K,V> type from lowerDictDrainFor (the for-loop-variable
     // capture shape)? Mirrors isDictEntryStringKeyTypeRef for the DrainedEntry

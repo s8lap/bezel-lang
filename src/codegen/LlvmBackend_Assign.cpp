@@ -544,6 +544,173 @@ llvm::Value* Emitter::lowerArrayRangeSlice(llvm::Value* recv,
 // issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer read `a[i]` /
 // `dict[key]` against the runtime backing. Mirrors the `.Get(i)` (§4.5) and
 // `.TryGetValue` (§4.8) lowering in LlvmBackend_Calls.cpp.
+// fix #6566 (§28.11 *The element slot policy*, §28.9, v0.357): does an array
+// element of type `et` embed strings a stamped array co-owns — the two element
+// shapes `lowerNew` stamps a `new Array<T>` for (#6557: a
+// `DictionaryEntry<string, V>` Key; #8386: a record with string components,
+// at a runtime-concrete type)?
+bool Emitter::arrayElemEmbedsCoOwnedStrings(const sema::TypeRef* et) {
+    if (!et || et->nullable) return false;
+    if (isDictEntryStringKeyTypeRef(et)) return true;
+    return isRecordWithStringFieldsTypeRef(et) && typeRefIsRuntimeConcrete(et);
+}
+
+// fix #6566: record "the IndexExpr `ix` just read one element out of the array
+// `recv`" for the binding site that may be about to store it into a local.
+// Recorded only when the element embeds co-owned strings; any earlier,
+// unconsumed record is dropped either way.
+void Emitter::noteArrayElemRead(const ast::Expr& ix, llvm::Value* recv,
+                                const sema::TypeRef* recvTy, int64_t esz) {
+    lastArrayElemReadExpr_ = nullptr;
+    lastArrayElemReadRecv_ = nullptr;
+    lastArrayElemReadElemTy_ = nullptr;
+    lastArrayElemReadEsz_ = 0;
+    if (!recv || !recvTy || esz <= 0 || recvTy->genericArgs.empty() ||
+        !recvTy->genericArgs[0])
+        return;
+    const sema::TypeRef* et = resolveTypeParamRef(recvTy->genericArgs[0]);
+    if (!arrayElemEmbedsCoOwnedStrings(et)) return;
+    lastArrayElemReadExpr_ = &ix;
+    lastArrayElemReadRecv_ = recv;
+    lastArrayElemReadElemTy_ = et;
+    lastArrayElemReadEsz_ = esz;
+}
+
+// fix #6566 (§28.11 *The element slot policy*, §28.9, v0.357): a local bound
+// from an array indexer-get of a string-embedding element takes its own
+// reference on the strings it copied out.
+//
+// THE RULE. §28.11's operations table, copy-slot column, "indexer-get /
+// default iteration": "copy out (a runtime-managed reference the copy holds —
+// a `DictionaryEntry<string, V>`'s `Key` — keeps §28.9's unbounded lifetime
+// through every later mutation or disposal of the collection)".
+//
+// THE DEFECT. The copy was a bare byte copy. A stamped array (#6550 / #6557 /
+// #8386) holds one reference per string per slot and gives it back when the
+// slot is overwritten, removed or cleared — correctly — so
+//     var t := rows[0]; rows[0] := rows[1]; rows[1] := t;
+// freed `t`'s strings at the first store whenever the array was their last
+// owner, and the second store then took a reference on freed memory:
+// `bezel: fatal: refcount over-release (string)` at the array's free, or
+// `free(): invalid pointer` (MEASURED, the #8386 review's F1 probes: the swap,
+// `RemoveAt(0)` + `Add(t)`, `Clear()` + `Add(t)`, on `Array<E>` and on
+// `Array<DictionaryEntry<string, int>>`). Reading `t.Name` after the first
+// store was a use-after-free for the same reason (#6566's own table).
+//
+// THE MECHANISM. The binding gets a SHADOW — a second copy of the element in
+// its own entry-block slot — and `bz_array_coown_copy_out(recv, shadow, esz)`
+// takes one reference per embedded string into it when `recv` is, at run
+// time, a co-owner of its slots (the stamp), and zeroes it when it is not.
+// The shadow's strings are released at the end of the local's scope by the
+// record-local release walk (`recordStringFields`) or the entry Key release
+// (`dictEntryKeyRelease`), both of which are null-safe and null what they
+// release, on the normal and the unwind exit alike. The reference is held in
+// the shadow rather than in the local's own slot so that nothing the program
+// does to the local (a field store into `t`, a reassignment from another
+// producer) can change which strings the scope-end release gives back.
+//
+// WHY THE RUN-TIME STAMP IS THE GATE. Taking a reference is only safe on a
+// string known to be alive. A stamped array vouches for every string in its
+// slots; an unstamped one (a `ToArray()` copy of a record array, a
+// literal-built array — #8484) vouches for nothing, and its elements may
+// carry pointers that died with their producer. Retaining through those would
+// turn a program that never reads the strings into a use-after-free, so for
+// an unstamped receiver this is a no-op by construction.
+//
+// PAIRED. One take at the bind, one release at scope end (or at the next
+// re-bind of the same local, below), so a string's lifetime becomes
+// max(what it was, the binding's) — never shorter, never unbounded.
+//
+// A REASSIGNMENT `t := rows[i]` of a local that already has a shadow re-binds
+// it: the previous references are released and the new element's taken. A
+// reassignment from any other producer leaves the shadow alone (it keeps the
+// old strings alive to scope end, which is the safe direction).
+//
+// NOT COVERED, deliberately: a state-machine body (async / iterator — the
+// shadow is not a frame field, so it would not survive a suspend), and a copy
+// that does not come straight from an indexer-get (a for-in variable copied to
+// an outer local, a value returned by a method). Those keep the pre-fix
+// behaviour and stay tracked by #6566.
+void Emitter::bindCoOwnedArrayCopyOut(const ast::Node* declNode,
+                                      const ast::Expr* src, llvm::Value* v,
+                                      bool isDecl) {
+    const ast::Expr* readExpr = lastArrayElemReadExpr_;
+    llvm::Value* recv = lastArrayElemReadRecv_;
+    const sema::TypeRef* et = lastArrayElemReadElemTy_;
+    const int64_t esz = lastArrayElemReadEsz_;
+    lastArrayElemReadExpr_ = nullptr;
+    lastArrayElemReadRecv_ = nullptr;
+    lastArrayElemReadElemTy_ = nullptr;
+    lastArrayElemReadEsz_ = 0;
+    if (!declNode || !src || !v || !recv || !et || src != readExpr) return;
+    if (smStateStruct_ || disposeStack_.empty() || emittingDisposerBody_ ||
+        !currentFn_)
+        return;
+    // The array pointer must be a value of THIS function (the same AST node is
+    // lowered once per instantiation; a stale hand-off must not cross).
+    if (auto* ri = llvm::dyn_cast<llvm::Instruction>(recv)) {
+        if (ri->getFunction() != currentFn_) return;
+    } else if (auto* ra = llvm::dyn_cast<llvm::Argument>(recv)) {
+        if (ra->getParent() != currentFn_) return;
+    } else {
+        return;
+    }
+    llvm::Type* ety = lowerTypeRef(et);
+    auto* est = llvm::dyn_cast_or_null<llvm::StructType>(ety);
+    if (!est || v->getType() != ety) return;
+    // The shadow is `esz` bytes to the runtime (the stride the array was
+    // stamped with); it must be exactly the element's own allocation size.
+    if (esz != static_cast<int64_t>(
+                   module_->getDataLayout().getTypeAllocSize(ety)))
+        return;
+    const bool isEntry = isDictEntryStringKeyTypeRef(et);
+    if (isEntry && (est->getNumElements() == 0 ||
+                    !est->getElementType(0)->isPointerTy()))
+        return;
+
+    llvm::AllocaInst* shadow = nullptr;
+    auto it = coOwnedCopyOutShadow_.find(static_cast<const void*>(declNode));
+    if (it != coOwnedCopyOutShadow_.end() && it->second &&
+        it->second->getFunction() == currentFn_ &&
+        it->second->getAllocatedType() == ety)
+        shadow = it->second;
+    if (isDecl) {
+        // Zeroed in the entry block: a disposal pass can be reached on a path
+        // that never ran the bind below (#2733), and must release nothing.
+        llvm::BasicBlock& entry = currentFn_->getEntryBlock();
+        llvm::IRBuilder<> tmp(&entry, entry.begin());
+        shadow = tmp.CreateAlloca(ety, nullptr, "coown.copy");
+        tmp.CreateStore(llvm::Constant::getNullValue(ety), shadow);
+        coOwnedCopyOutShadow_[static_cast<const void*>(declNode)] = shadow;
+        if (isEntry) {
+            Disposal d{shadow, nullptr};
+            d.dictEntryKeyRelease = true;
+            disposeStack_.back().push_back(d);
+        } else {
+            Disposal d{shadow, et->declaration};
+            d.recordStringFields = true;
+            d.clsRef = et;
+            disposeStack_.back().push_back(d);
+        }
+    } else {
+        if (!shadow) return;  // not a local this fix bound: leave it alone
+        // Re-bind: give back what the previous copy-out took.
+        if (isEntry) {
+            llvm::Value* keyAddr =
+                builder_.CreateStructGEP(est, shadow, 0, "coown.key.addr");
+            emitStringRelease(
+                builder_.CreateLoad(ptrTy(), keyAddr, "coown.key.old"));
+        } else {
+            emitRecordStringFieldReleases(shadow, et);
+        }
+    }
+    builder_.CreateStore(v, shadow);
+    auto* fn = declareC("bz_array_coown_copy_out",
+                        llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), i64()});
+    builder_.CreateCall(fn, {recv, shadow, builder_.getInt64(esz)});
+}
+
 llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return nullptr;
@@ -679,6 +846,7 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
                                {ptrTy(), i64(), ptrTy(), i64()});
         builder_.CreateCall(getFn, {src, absIdx, out, builder_.getInt64(esz)});
+        noteArrayElemRead(ix, src, recvTy, esz);  // fix #6566
         return builder_.CreateLoad(retTy, out, "sp.elem");
     }
 
@@ -961,6 +1129,7 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         auto* getFn = declareC("bz_array_get", llvm::Type::getVoidTy(llvm_),
                                {ptrTy(), i64(), ptrTy(), i64()});
         builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
+        noteArrayElemRead(ix, recv, recvTy, esz);  // fix #6566
         return builder_.CreateLoad(retTy, out, "ix.elem");
     }
 

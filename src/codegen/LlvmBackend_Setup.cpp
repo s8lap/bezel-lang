@@ -19779,6 +19779,10 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     }
     if (v) {
         builder_.CreateStore(v, slot);
+        // fix #6566 (§28.11 *The element slot policy*, v0.357): a local bound
+        // from an array indexer-get of a string-embedding element holds its
+        // own reference on the strings it copied out.
+        bindCoOwnedArrayCopyOut(declNode, init, v, /*isDecl=*/true);
     } else if (slotTy->isPointerTy() && declType &&
                isStringTypeRefNonNull(ctx_.resolvedType(*declType))) {
         // #429 / §4.6: a `var s: string;` (no initializer) lowers to a `ptr`
