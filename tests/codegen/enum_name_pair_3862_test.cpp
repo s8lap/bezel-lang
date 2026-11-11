@@ -264,6 +264,8 @@ BEZEL_TEST(enum_name_pair_3862, out_of_range_value_is_unreachable_spec_5_4) {
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r,
+        "is not the underlying value of any declared constant of `Priority` (§5.4)"));
 }
 
 // The run-time half of the same boundary: a non-constant undeclared value
