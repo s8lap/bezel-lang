@@ -26156,6 +26156,89 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     // call's own argument nodes lent to it, then wrap the result as `T?`.
     if (!ms && nm.target && nm.typeArgs.empty() && !nm.member.empty()) {
         if (llvm::Value* r = lowerNullCondBuiltinCall(call, nm)) return r;
+        // fix #8583 (§7.5, stdlib §4.1 / §4.2, v0.357): the `?.` spelling of a
+        // MUTATING member of a POLYMORPHIC collection interface must reach the
+        // `.` spelling's own #853 fence.
+        //
+        // THE DEFECT (issue #8583). `c?.Add(x)` / `c?.Clear()` /
+        // `c?.Remove(x)` / `c?.Insert(i, x)` through `ICollection<T>` /
+        // `IOwningCollection<T>` / `IOwningList<T>` were SILENTLY DROPPED:
+        // the `?.` spelling reached no typing arm in sema, so the call stayed
+        // UNTYPED, `lowerNullCondBuiltinCall` bailed on the untyped call
+        // (above), and the whole statement emitted NOTHING — exit 0, no
+        // diagnostic at all (not even the `internal:` #2434 note: a bare
+        // statement degrades no local slot). The `.` spelling of the SAME
+        // member is REFUSED loudly by codegen's #853 fence, so the two
+        // spellings of ONE member disagreed. §7.5 (v0.357): "`x?.M` returns
+        // null if `x` is null; otherwise it performs the access." — the `?.`
+        // spelling performs the SAME access the `.` spelling does, so the two
+        // may not disagree.
+        //
+        // WHY AN ARM HERE AND NOT IN SEMA. `Add` / `Clear` / `Insert` return
+        // UNIT (stdlib §4.1 / §4.2), and §7.5 lifts the `?.` result to its
+        // NULLABLE form — a unit result has no nullable form to lift to, so
+        // the `?.` lowering (which needs a TYPED call to know what to lift)
+        // cannot carry these members, and sema typing them changes nothing
+        // here. (`Remove` returns `bool` and IS carried: #8583's sema arm
+        // types the `?.` access `bool?`, so the twin below refuses it.)
+        //
+        // THE ROUTE. Build the `.` spelling's OWN call — a synthetic `.`
+        // MemberAccessExpr over a placeholder carrying the RECEIVER'S TYPE
+        // (the #7014 `lowerBuiltinCollMemberRef` pattern) — and run the `.`
+        // spelling's own fence over it. The fence reads only the member NAME
+        // and the RECEIVER'S TYPE and returns BEFORE the receiver is lowered,
+        // so nothing is emitted into the caller; it reports the diagnostic and
+        // returns a poison, which the failed compile never executes. The
+        // diagnostic is therefore BYTE-IDENTICAL to the `.` spelling's — the
+        // same text, and the same source location (the synthetic call carries
+        // the `?.` call's own span, exactly as the `.` spelling's fence
+        // reports at the `.` call's span).
+        {
+            const sema::TypeRef* polyRcvTy = ctx_.exprType(*nm.target);
+            bool owningList = false;
+            // The SAME receiver classification the fence uses: the non-list
+            // collection interfaces (ICollection / IReadOnlyCollection /
+            // IOwningCollection) plus the OWNING list interface
+            // (IOwningList). The array-backed BORROWING list interfaces
+            // (IList / IReadOnlyList) are NOT here: their `.` spelling
+            // PERFORMS the member (the bz_array_* bridge), so refusing the
+            // `?.` spelling would make the two spellings disagree the other
+            // way — and lowering it is #8501's unit-result `?.` family.
+            const bool polyColl =
+                isCollectionInterfaceName(polyRcvTy) ||
+                (isListInterfaceName(polyRcvTy, &owningList) && owningList);
+            const std::string_view m = nm.member;
+            // stdlib §4.1 / §4.2: the MUTATORS the polymorphic heads declare
+            // — `Add` / `Clear` / `Remove` on ICollection<T> /
+            // IOwningCollection<T>, plus `Insert` on IOwningList<T>. (`Contains`
+            // is a query, and its `?.` spelling is #7557's; `IndexOf` is named
+            // by the fence but no polymorphic head declares it, so sema
+            // rejects it before codegen.)
+            const bool mutator = m == "Add" || m == "Clear" || m == "Remove" ||
+                                 m == "Insert";
+            if (polyColl && mutator) {
+                auto synthCall = std::make_unique<ast::CallExpr>();
+                auto synthCallee = std::make_unique<ast::MemberAccessExpr>();
+                auto placeholder = std::make_unique<ast::IdentifierExpr>();
+                placeholder->name = "<nullcond-receiver>";  // unspellable (#6681)
+                placeholder->span = nm.target->span;
+                ctx_.setExprType(placeholder.get(),
+                                 const_cast<sema::TypeRef*>(polyRcvTy));
+                synthCallee->target = std::move(placeholder);
+                synthCallee->member = std::string_view(nm.member);
+                synthCallee->span = nm.span;
+                synthCall->callee = std::move(synthCallee);
+                synthCall->span = call.span;
+                const ast::CallExpr* synthCallPtr = synthCall.get();
+                // The tree must outlive the exprType entry set on its receiver
+                // placeholder — park it for the whole compilation (the #7014
+                // discipline).
+                builtinCollMemberSynthCalls_.push_back(std::move(synthCall));
+                // The fence reports the diagnostic and returns a poison; the
+                // value is never used (the compile failed).
+                return tryLowerCollectionInstanceCall(*synthCallPtr);
+            }
+        }
         return nullptr;
     }
     if (!ms || isStaticMethod(ms) || !nm.target) return nullptr;

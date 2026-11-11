@@ -47944,6 +47944,52 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                                           /*nullable=*/true));
             return;
         }
+        // fix #8583 (§7.5, stdlib §4.1 / §4.2, v0.357): the `?.` spelling of
+        // `Remove` on the heads that DECLARE it — the same refusal the `.`
+        // spelling gets.
+        //
+        // stdlib §4.1 declares `method Remove(item: T): bool;` on
+        // `ICollection<T>`; stdlib §4.2 declares `method Remove(item: T):
+        // bool;` on `IOwningCollection<T>` (which disposes the removed
+        // element), and `IOwningList<T>` inherits it. The `.` spelling of
+        // that call through those heads is REFUSED by codegen's #853 fence
+        // (the polymorphic collection interfaces erase the concrete backing:
+        // array / linked-list / hash-table, so no single runtime dispatch is
+        // sound). The `?.` spelling reached NO typing arm, so the call stayed
+        // UNTYPED and codegen DROPPED the enclosing statement behind the
+        // #3079 warning — exit 0, no diagnostic at all (issue #8583:
+        // "silently dropped"). §7.5 (v0.357): "`x?.M` returns null if `x` is
+        // null; otherwise it performs the access." — the `?.` spelling performs
+        // the SAME access the `.` spelling does, so the two spellings of ONE
+        // member may not disagree.
+        //
+        // So type the access `bool?` here, exactly as the `Contains` arm
+        // above does: the `?.` lowering then builds its own synthetic `.`
+        // node, which reaches `tryLowerCollectionInstanceCall` — where the
+        // `.` spelling's fence lives — and the two spellings fail with the
+        // SAME diagnostic, at the SAME source location.
+        //
+        // `IReadOnlyCollection<T>` is NOT listed: it declares no `Remove`
+        // (stdlib §4.1), so that call is rejected by the #6997 arm ("no
+        // member `Remove` on `IReadOnlyCollection`") before this arm.
+        // `IList<T>` is NOT listed either: the borrowing LIST interface is
+        // array-backed, so the `.` spelling of `Remove` PERFORMS it (the
+        // bz_array_* bridge) rather than refusing it — the `?.` spelling of
+        // that member is #8501's unit/void-result `?.` family, not this
+        // refusal.
+        if (!member && recvTy && &nm == calleeOfCallCtx_ &&
+            currentCallArity_ == 1 && nm.member == "Remove" &&
+            recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration &&
+            recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            (recvTy->headName() == "ICollection" ||
+             recvTy->headName() == "IOwningCollection" ||
+             recvTy->headName() == "IOwningList")) {
+            ctx_.setExprType(
+                &nm, ctx_.primitiveTypeRef(PrimitiveType::Bool,
+                                          /*nullable=*/true));
+            return;
+        }
         // fix #7670 (§26.5 rule 1, v0.350; stdlib §1 "Block-by-name", §4.4):
         // the `?.` twin of #3342's / #7597's refusal. The receiver's declared
         // type declares `Count` as an arity-0 property, so instance resolution
