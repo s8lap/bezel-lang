@@ -199,9 +199,11 @@ end Program;
               "boom=0 fboom=0 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=1 xgone=0\n");
 }
 
-// The owner is the entry's local, disposed in the entry's unwind: its
-// deferred disposal is performed by the wrap, once. (Clean on base while
-// ASan quarantines the freed block; see the header.)
+// Kept control (review r42-rev-f1-7943 F2; green on the parent while ASan
+// quarantines the freed block, see the header). The owner is the entry's
+// local: the wrap performs its deferred disposal once. Wrong fix it catches:
+// the wrap disposing the instance unconditionally -> a double dispose
+// (xgone > xmade).
 BEZEL_TEST(domain_fault_wrap_borrowed_instance_8470,
            spec_30_9_entry_faults_with_local_task_owned_instance_then_bound_reawait) {
     expectOut(R"BZ(  public static async method R(i: int): Task
@@ -230,51 +232,10 @@ end Program;
               "boom=200 fboom=0 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=200 xgone=200\n");
 }
 
-// Control (clean on base): the entry catches a handler-owned exception and
-// re-raises it with a bare `throw;` (§31.2.4).
-BEZEL_TEST(domain_fault_wrap_borrowed_instance_8470,
-           spec_31_2_4_entry_bare_rethrows_handler_owned_instance) {
-    expectOut(R"BZ(  public static method SBoom(): int
-    throw new MyEx("boom");
-  end SBoom;
-  public static method EntryRethrow(): int
-    try
-      return Program.SBoom();
-    catch var e: MyEx =>
-      do
-        Program.Tally(e.Message);
-        throw;
-      end;
-    end;
-  end EntryRethrow;
-  public static async method R(i: int): Task
-    using var j := Domain.Spawn(Program.EntryRethrow);
-    try
-      var x := await j;
-    catch var e: DomainFaultedException =>
-      K.mark := K.mark + 1;
-    end;
-    var t := Program.BoomAsync();
-    try await t; catch var e2: MyEx => Program.Tally(e2.Message); end;
-    try await t; catch var e3: MyEx => Program.Tally(e3.Message); end;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=300 fboom=0 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=200 xgone=200\n");
-}
-
-// Control (clean on base): a fresh handler-owned fault is disposed by the
-// wrap exactly once.
+// Kept control (review r42-rev-f1-7943 F2; green on the parent). A fresh
+// handler-owned fault is disposed by the wrap exactly once. Wrong fix it
+// catches: the wrap ending the handling WITHOUT disposing (the cure for
+// the borrowed-instance UAF applied to every instance) -> xgone=0, a leak.
 BEZEL_TEST(domain_fault_wrap_borrowed_instance_8470,
            spec_30_14_entry_faults_with_fresh_instance) {
     expectOut(R"BZ(  public static method EntryFresh(): int

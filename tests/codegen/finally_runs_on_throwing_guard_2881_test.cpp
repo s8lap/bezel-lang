@@ -57,9 +57,10 @@
 // the finally and was disposed at the ORIGINAL throw site, before the guard even
 // ran (#2892).  The superseded exception's single free is unchanged
 // too: it is performed at the guard's own throw / pending-check site by the
-// #1108 / #1216 path, which fires iff `caughtExcArmTarget_` equals the throw's
-// resolved unwind target — both are derived from `unwindTarget_`, so they still
-// compare equal once both are `finUnwindBB`.
+// #1108 / #1216 path.  Since #7940 that path no longer compares a
+// `caughtExcArmTarget_` field (it was deleted): the handled region's single
+// leave block ends the caught instance's handling on every exception edge, so
+// the single free does not depend on the throw's resolved unwind target.
 //
 // THE ORACLE IS A LIVE-OBJECT COUNTER, NOT "NO LEAK".  The direction this fix
 // can break is a DOUBLE dispose (the relocated range disposed at both the throw

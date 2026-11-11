@@ -155,7 +155,6 @@ CANONICAL_FIELDS = [
     'disposerEntryExc_',
     # catch/guard-arm context
     'currentCaughtName_',
-    'caughtExcArmTarget_',
     # narrow per-call channels
     'expectedFunctionType_',
     'lastCallGenericSubst_',

@@ -312,30 +312,11 @@ end Program;
               "boom=300 fboom=0 inner=0 other=0 mark=0 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
 }
 
-// Control (clean on base): the faulted task is awaited anonymously.
-BEZEL_TEST(escaped_borrowed_fault_7943,
-           spec_30_9_borrowed_parameter_operand_escape_anonymous_awaiter) {
-    expectOut(R"BZ(  public static async method V(t: Task): Task
-    await t;
-  end V;
-  public static async method R(i: int): Task
-    await Task.Delay(0);
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      var t := Program.BoomAsync();
-      try await Program.V(t); catch var e: Exception => Program.Tally(e.Message); end;
-      try await t; catch var e: Exception => Program.Tally(e.Message); end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=200 fboom=0 inner=0 other=0 mark=0 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// Control (clean on base): an anonymous operand — the await consumed it,
-// so the faulted task retains it (§30.9).
+// Kept control (review r42-rev-f1-7943 F2; green on the parent). An anonymous
+// operand: the await consumed it, so the faulted task RETAINS it and the
+// frame's anonymous awaiter owns the fault. Wrong fix it catches: marking
+// every escaping instance a borrow whose owner is the operand's binding ->
+// nobody owns it (xgone=0, a leak).
 BEZEL_TEST(escaped_borrowed_fault_7943,
            spec_30_9_anonymous_operand_escape_anonymous_awaiter) {
     expectOut(R"BZ(  public static async method R(i: int): Task
@@ -348,52 +329,6 @@ BEZEL_TEST(escaped_borrowed_fault_7943,
       catch var e: Exception =>
         Program.Tally(e.Message);
       end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=100 fboom=0 inner=0 other=0 mark=0 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// Control (clean on base): bound operand, anonymous awaiter of the frame.
-BEZEL_TEST(escaped_borrowed_fault_7943,
-           spec_30_9_bound_operand_escape_anonymous_awaiter) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    var t := Program.BoomAsync();
-    await t;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=100 fboom=0 inner=0 other=0 mark=0 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// Control (clean on base): anonymous operands, four concurrent frames.
-BEZEL_TEST(escaped_borrowed_fault_7943,
-           spec_30_9_anonymous_operand_escape_four_bound_awaiters) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    await Program.BoomAsync();
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<25 do
-      var t1 := Program.R(i);
-      var t2 := Program.R(i + 1);
-      var t3 := Program.R(i + 2);
-      var t4 := Program.R(i + 3);
-      try await t1; catch var e: Exception => Program.Tally(e.Message); end;
-      try await t2; catch var e: Exception => Program.Tally(e.Message); end;
-      try await t3; catch var e: Exception => Program.Tally(e.Message); end;
-      try await t4; catch var e: Exception => Program.Tally(e.Message); end;
     end for;
     Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
   end Main;
@@ -438,158 +373,11 @@ end Program;
               "boom=100 fboom=0 inner=0 other=0 mark=0 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
 }
 
-// Control (clean on base): #2750's own shape — a synchronous fault in the
-// chained source, the frame's task `using var`-bound and awaited in a try.
-BEZEL_TEST(escaped_borrowed_fault_7943,
-           spec_30_9_chained_return_issue_2750_shape_using_var_awaiter) {
-    expectOut(R"BZ(  public static async method BoomCellAsync(): Task<Cell>
-    await Task.Delay(1);
-    throw new MyEx("boom");
-  end BoomCellAsync;
-  public static async method BoomCellNowAsync(): Task<Cell>
-    throw new MyEx("boom");
-  end BoomCellNowAsync;
-  public static method Use(c: Cell)
-    K.mark := K.mark + 1;
-  end Use;
-  public static async method Q(): Task<Cell>
-    return await Program.BoomCellNowAsync();
-  end Q;
-  public static async method R(i: int): Task
-    await Task.Delay(1);
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        using var t := Program.Q();
-        var c := await t;
-      catch var e: Exception => Program.Tally(e.Message); end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=100 fboom=0 inner=0 other=0 mark=0 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// Control (clean on base): the chained frame's task is awaited twice (§30.4).
-BEZEL_TEST(escaped_borrowed_fault_7943,
-           spec_30_9_chained_return_bound_frame_task_awaited_twice) {
-    expectOut(R"BZ(  public static async method BoomCellAsync(): Task<Cell>
-    await Task.Delay(1);
-    throw new MyEx("boom");
-  end BoomCellAsync;
-  public static async method BoomCellNowAsync(): Task<Cell>
-    throw new MyEx("boom");
-  end BoomCellNowAsync;
-  public static method Use(c: Cell)
-    K.mark := K.mark + 1;
-  end Use;
-  public static async method Q(): Task<Cell>
-    return await Program.BoomCellAsync();
-  end Q;
-  public static async method R(i: int): Task
-    var t := Program.Q();
-    try
-      var a := await t;
-    catch var e: Exception =>
-      K.mark := K.mark + 1;
-    end;
-    var b := await t;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=100 fboom=0 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// Control (clean on base): four concurrent frames each awaiting a chained
-// faulted task anonymously.
-BEZEL_TEST(escaped_borrowed_fault_7943,
-           spec_30_9_chained_return_four_concurrent_bound_frames) {
-    expectOut(R"BZ(  public static async method BoomCellAsync(): Task<Cell>
-    await Task.Delay(1);
-    throw new MyEx("boom");
-  end BoomCellAsync;
-  public static async method BoomCellNowAsync(): Task<Cell>
-    throw new MyEx("boom");
-  end BoomCellNowAsync;
-  public static method Use(c: Cell)
-    K.mark := K.mark + 1;
-  end Use;
-  public static async method Q(): Task<Cell>
-    return await Program.BoomCellAsync();
-  end Q;
-  public static async method R(i: int): Task
-    Program.Use(await Program.Q());
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<25 do
-      var t1 := Program.R(i);
-      var t2 := Program.R(i + 1);
-      var t3 := Program.R(i + 2);
-      var t4 := Program.R(i + 3);
-      try await t1; catch var e: Exception => Program.Tally(e.Message); end;
-      try await t2; catch var e: Exception => Program.Tally(e.Message); end;
-      try await t3; catch var e: Exception => Program.Tally(e.Message); end;
-      try await t4; catch var e: Exception => Program.Tally(e.Message); end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=100 fboom=0 inner=0 other=0 mark=0 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// Control (clean on base): the instance crosses two chained returns.
-BEZEL_TEST(escaped_borrowed_fault_7943,
-           spec_30_9_chained_return_through_two_chained_frames) {
-    expectOut(R"BZ(  public static async method BoomCellAsync(): Task<Cell>
-    await Task.Delay(1);
-    throw new MyEx("boom");
-  end BoomCellAsync;
-  public static async method BoomCellNowAsync(): Task<Cell>
-    throw new MyEx("boom");
-  end BoomCellNowAsync;
-  public static method Use(c: Cell)
-    K.mark := K.mark + 1;
-  end Use;
-  public static async method Q(): Task<Cell>
-    return await Program.BoomCellAsync();
-  end Q;
-  public static async method Q2(): Task<Cell>
-    return await Program.Q();
-  end Q2;
-  public static async method R(i: int): Task
-    var t := Program.Q2();
-    var x := await t;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=100 fboom=0 inner=0 other=0 mark=0 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// Control (clean on base): the same chained return faults and succeeds on
-// alternate calls — the success path's chain is undisturbed.
+// Kept control (review r42-rev-f1-7943 F2; green on the parent). The same
+// chained return faults and succeeds on alternate calls. Wrong fix it
+// catches: reclaiming/transferring the chained source on the return path
+// unconditionally rather than on the fault edge -> the success iterations
+// double-free or leak the source.
 BEZEL_TEST(escaped_borrowed_fault_7943,
            spec_30_9_chained_return_fault_and_success_alternate) {
     expectOut(R"BZ(  public static async method BoomCellAsync(): Task<Cell>
@@ -630,52 +418,4 @@ BEZEL_TEST(escaped_borrowed_fault_7943,
 end Program;
 )BZ",
               "boom=50 fboom=0 inner=0 other=0 mark=50 oda=0 odt=0 cells=0 xmade=50 xgone=50\n");
-}
-
-// Control (clean since the #7940 fix): the chained frame's fault is
-// superseded in a catch arm, then the frame's task is awaited again.
-BEZEL_TEST(escaped_borrowed_fault_7943,
-           spec_30_9_chained_return_bound_supersede_then_reawait) {
-    expectOut(R"BZ(  public static async method BoomCellAsync(): Task<Cell>
-    await Task.Delay(1);
-    throw new MyEx("boom");
-  end BoomCellAsync;
-  public static async method BoomCellNowAsync(): Task<Cell>
-    throw new MyEx("boom");
-  end BoomCellNowAsync;
-  public static method Use(c: Cell)
-    K.mark := K.mark + 1;
-  end Use;
-  public static async method Q(): Task<Cell>
-    return await Program.BoomCellAsync();
-  end Q;
-  public static async method R(i: int): Task
-    using var t := Program.Q();
-    try
-      try
-        var a := await t;
-      catch var e: Exception =>
-        do
-          K.mark := K.mark + 1;
-          throw new ArgumentException("inner");
-        end;
-      end;
-    catch var e3: ArgumentException =>
-      Program.Tally(e3.Message);
-    end;
-    var b := await t;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=100 fboom=0 inner=100 other=0 mark=100 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
 }

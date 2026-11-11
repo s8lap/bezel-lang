@@ -20,13 +20,19 @@
 // Every supersede site (`throw <new>` from an arm, the destructor-parked
 // supersede, the cleanup-pass supersede) disposed the superseded instance
 // unconditionally, so a bound task's instance was freed while the task still
-// owned it: the next `await t` re-raised freed memory (MEASURED on r30-c1
-// 4a6919f1: every "_then_reawait" row below is an ASan heap-use-after-free).
+// owned it: the next `await t` re-raised freed memory.
 // And the site-specific test for "this throw leaves the arm" only recognised a
 // direct `throw` statement whose unwind target was the arm's own: an exception
 // leaving the arm through an inner `try` whose arms do not match, or raised by
-// an awaited task, never ended the handler-owned instance's handling at all
-// (MEASURED: `xgone=0`, a LeakSanitizer report).
+// an awaited task, never ended the handler-owned instance's handling at all.
+//
+// MEASURED (review r42-rev-f1-7943 fix-forward, generated-code ASan, on this
+// commit's direct parent d0ddadadc): the rows below FAIL there (UAF or a
+// LeakSanitizer report, `xgone != 100`) except the two kept controls, which
+// are marked. Rows that were green on the parent were moved to the conformance
+// corpus (RUN.md: base-green rows go to the corpus). The earlier claim that
+// every "_then_reawait" row is a UAF on r30-c1 4a6919f1 was not true of all of
+// them and is withdrawn.
 //
 // Now each handled region (an arm body, a `when` guard, a finally body entered
 // on an exception edge) has ONE leave block that every exception edge out of
@@ -400,70 +406,6 @@ end Program;
               "boom=100 fboom=0 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
 }
 
-// §28.12: an `await using` head whose DisposeAsync faults on the exception
-// edge supersedes the task-owned instance (clean on base; pinned so the
-// rewritten unwind tail keeps it).
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_31_2_await_using_faulting_dispose_async_supersedes_borrowed_then_reawait) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    var t := Program.BoomAsync();
-    try
-      await using var o := new NFAULT();
-      await t;
-    catch var e: ArgumentException =>
-      K.mark := K.mark + 1;
-    end;
-    await t;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=100 fboom=0 inner=0 other=0 mark=100 oda=100 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// §30.9 refinement: the owner was disposed while its fault was being
-// handled, so the END of that handling — here by a fresh throw — performs
-// the deferred disposal, exactly once.
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_30_9_deferred_owner_disposal_runs_when_arm_throws_new) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    try
-      try
-        var t := Program.BoomAsync();
-        await t;
-      catch var e: MyEx =>
-        do
-          throw new ArgumentException("inner");
-        end;
-      end;
-    catch var e: ArgumentException =>
-      K.mark := K.mark + 1;
-    end;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=0 fboom=0 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
 // The issue's "also unmeasured" case, MEASURED a leak on base: an awaited
 // task's fault leaves the arm of a HANDLER-OWNED instance (§31.1: disposed
 // after the arm completes "by a fresh `throw` from it").
@@ -493,44 +435,10 @@ end Program;
               "boom=0 fboom=0 inner=100 other=0 mark=0 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
 }
 
-// The same edge with a task-owned caught instance: dropped undisposed, the
-// owner disposes it once.
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_31_2_other_bound_fault_leaving_arm_drops_borrowed_instance) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    var t := Program.BoomAsync();
-    var t2 := Program.InnerAsync();
-    try
-      try
-        await t;
-      catch var e: MyEx =>
-        do
-          await t2;
-        end;
-      end;
-    catch var e: ArgumentException =>
-      K.mark := K.mark + 1;
-    end;
-    try await t2; catch var e: ArgumentException => K.mark := K.mark + 1; end;
-    await t;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=100 fboom=0 inner=0 other=0 mark=200 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// Control: a handler-owned instance superseded by a fresh `throw` is still
-// disposed exactly once.
+// Kept control (review r42-rev-f1-7943 F2; green on the parent). A fresh
+// `throw` from an arm over a HANDLER-owned instance must still dispose it
+// exactly once. Wrong fix it catches: "never dispose a superseded instance"
+// (the cure for the task-owned UAF applied to every owner) -> xgone=0, a leak.
 BEZEL_TEST(superseded_task_owned_fault_7940,
            spec_31_1_control_handler_owned_instance_arm_throws_new) {
     expectOut(R"BZ(  public static async method R(i: int): Task
@@ -598,43 +506,6 @@ end Program;
               "boom=0 fboom=0 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
 }
 
-// Its task-owned twin: dropped undisposed, disposed once by the owner.
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_31_2_throw_through_nonmatching_inner_try_drops_borrowed_instance) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    var t := Program.BoomAsync();
-    try
-      try
-        await t;
-      catch var e: MyEx =>
-        do
-          try
-            throw new ArgumentException("inner");
-          catch var z: InvalidOperationException =>
-            K.other := K.other + 1;
-          end;
-        end;
-      end;
-    catch var e9: ArgumentException =>
-      K.mark := K.mark + 1;
-    end;
-    await t;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=100 fboom=0 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
 // ... through an inner try/finally whose finally throws (a leak on base).
 BEZEL_TEST(superseded_task_owned_fault_7940,
            spec_31_1_throw_through_inner_finally_disposes_handler_owned_instance) {
@@ -670,43 +541,6 @@ end Program;
               "boom=0 fboom=100 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
 }
 
-// Its task-owned twin.
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_31_2_throw_through_inner_finally_drops_borrowed_instance) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    var t := Program.BoomAsync();
-    try
-      try
-        await t;
-      catch var e: MyEx =>
-        do
-          try
-            throw new ArgumentException("inner");
-          finally
-            K.fboom := K.fboom + 1;
-          end;
-        end;
-      end;
-    catch var e9: ArgumentException =>
-      K.mark := K.mark + 1;
-    end;
-    await t;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=100 fboom=100 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
 // ... whose finally makes a propagating call (a leak on base).
 BEZEL_TEST(superseded_task_owned_fault_7940,
            spec_31_1_call_through_inner_finally_disposes_handler_owned_instance) {
@@ -740,76 +574,6 @@ BEZEL_TEST(superseded_task_owned_fault_7940,
 end Program;
 )BZ",
               "boom=0 fboom=100 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// Its task-owned twin.
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_31_2_call_through_inner_finally_drops_borrowed_instance) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    var t := Program.BoomAsync();
-    try
-      try
-        await t;
-      catch var e: MyEx =>
-        do
-          try
-            var k := Program.Boom();
-          finally
-            K.fboom := K.fboom + 1;
-          end;
-        end;
-      end;
-    catch var e9: ArgumentException =>
-      K.mark := K.mark + 1;
-    end;
-    await t;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=100 fboom=100 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// A `using var` local inside the arm is discharged at the throw site,
-// before the leave block ends the caught instance's handling.
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_31_1_arm_throw_with_using_local_disposes_handler_owned_instance) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    try
-      try
-        await Program.BoomAsync();
-      catch var e: MyEx =>
-        do
-          using var c := new Cell();
-          throw new ArgumentException("inner");
-        end;
-      end;
-    catch var e9: ArgumentException =>
-      K.mark := K.mark + 1;
-    end;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=0 fboom=0 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
 }
 
 // Its task-owned twin, then a re-await (a UAF on base).
@@ -882,73 +646,11 @@ end Program;
               "boom=100 fboom=100 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
 }
 
-// Control: a handler-owned instance, arm throw, finally on the same try.
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_31_1_arm_throw_with_outer_finally_disposes_handler_owned_instance) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    try
-      try
-        await Program.BoomAsync();
-      catch var e: MyEx =>
-        do
-          throw new ArgumentException("inner");
-        end;
-      finally
-        K.fboom := K.fboom + 1;
-      end;
-    catch var e9: ArgumentException =>
-      K.mark := K.mark + 1;
-    end;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=0 fboom=100 inner=0 other=0 mark=100 oda=0 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// An `await using` binding inside the arm: the throw's unwind awaits its
-// DisposeAsync (§28.12) BEFORE the arm's leave block ends the caught
-// instance's handling, so the leave block reads its slot after a suspension
-// no `await` expression announces. The slot is frame-backed in every async
-// state machine. (Clean on base, whose supersede ran at the throw site; a
-// SEGV in the Resume function with a stack-only slot.)
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_28_12_arm_await_using_then_fresh_throw_disposes_handler_owned_instance) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    try
-      throw new MyEx("boom");
-    catch var e: MyEx =>
-      do
-        await using var o := new NOK();
-        throw new ArgumentException("inner");
-      end;
-    end;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=0 fboom=0 inner=100 other=0 mark=0 oda=100 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// ... a bare `throw;` leaves the arm: the same instance re-raised, live.
+// Kept control (review r42-rev-f1-7943 F2; green on the parent). A bare
+// `throw;` LEAVES the arm with the same instance re-raised and live. Wrong
+// fix it catches: ending the handling (and disposing a handler-owned
+// instance) at every leave edge including the bare rethrow -> the outer
+// arm reads a freed instance (UAF) or xgone > xmade.
 BEZEL_TEST(superseded_task_owned_fault_7940,
            spec_28_12_arm_await_using_then_bare_rethrow_keeps_handler_owned_instance) {
     expectOut(R"BZ(  public static async method R(i: int): Task
@@ -974,96 +676,6 @@ BEZEL_TEST(superseded_task_owned_fault_7940,
 end Program;
 )BZ",
               "boom=100 fboom=0 inner=0 other=0 mark=0 oda=100 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// ... a propagating call leaves the arm.
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_28_12_arm_await_using_then_call_throws_disposes_handler_owned_instance) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    try
-      throw new MyEx("boom");
-    catch var e: MyEx =>
-      do
-        await using var o := new NOK();
-        var k := Program.Boom();
-      end;
-    end;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=0 fboom=0 inner=100 other=0 mark=0 oda=100 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// ... the binding sits in an inner finally body the arm ran to completion
-// before its fresh throw.
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_28_12_arm_inner_finally_await_using_then_fresh_throw_disposes_handler_owned_instance) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    try
-      throw new MyEx("boom");
-    catch var e: MyEx =>
-      do
-        try
-          K.mark := K.mark + 1;
-        finally
-          await using var o := new NOK();
-        end;
-        throw new ArgumentException("inner");
-      end;
-    end;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=0 fboom=0 inner=100 other=0 mark=100 oda=100 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// ... the binding's DisposeAsync itself faults on that edge and supersedes
-// the arm's fresh throw (§28.12, §31.2).
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_28_12_arm_await_using_faulting_dispose_async_supersedes_handler_owned_instance) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    try
-      throw new MyEx("boom");
-    catch var e: MyEx =>
-      do
-        await using var o := new NFAULT();
-        throw new ArgumentException("inner");
-      end;
-    end;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=0 fboom=100 inner=0 other=0 mark=0 oda=100 odt=0 cells=0 xmade=100 xgone=100\n");
 }
 
 // The task-owned twin, then a re-await (a UAF on base).
@@ -1098,36 +710,6 @@ BEZEL_TEST(superseded_task_owned_fault_7940,
 end Program;
 )BZ",
               "boom=100 fboom=0 inner=0 other=0 mark=100 oda=100 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// The arm re-awaits the bound task whose fault it is handling, with an
-// `await using` binding in scope: the same instance leaves the arm live.
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_30_4_arm_await_using_then_reawait_same_bound_task) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    var t := Program.BoomAsync();
-    try
-      await t;
-    catch var e: MyEx =>
-      do
-        await using var o := new NOK();
-        await t;
-      end;
-    end;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=100 fboom=0 inner=0 other=0 mark=0 oda=100 odt=0 cells=0 xmade=100 xgone=100\n");
 }
 
 // The arm completes normally: its fall-through disposal reads the same
@@ -1190,34 +772,6 @@ BEZEL_TEST(superseded_task_owned_fault_7940,
 end Program;
 )BZ",
               "boom=100 fboom=0 inner=0 other=0 mark=100 oda=100 odt=0 cells=0 xmade=100 xgone=100\n");
-}
-
-// The same binding in a finally body entered on the exception edge: the
-// finally's fresh throw supersedes the in-flight instance (§31.2) after the
-// binding's DisposeAsync await.
-BEZEL_TEST(superseded_task_owned_fault_7940,
-           spec_28_12_finally_await_using_then_fresh_throw_on_exception_edge) {
-    expectOut(R"BZ(  public static async method R(i: int): Task
-    try
-      throw new MyEx("boom");
-    finally
-      await using var o := new NOK();
-      throw new ArgumentException("inner");
-    end;
-  end R;
-  public static async method Main(): Task
-    for var i in 0..<100 do
-      try
-        await Program.R(i);
-      catch var e: Exception =>
-        Program.Tally(e.Message);
-      end;
-    end for;
-    Console.WriteLine($"boom={K.boom} fboom={K.fboom} inner={K.inner} other={K.other} mark={K.mark} oda={K.oda} odt={K.odt} cells={Cell.n} xmade={XC.made} xgone={XC.gone}");
-  end Main;
-end Program;
-)BZ",
-              "boom=0 fboom=0 inner=100 other=0 mark=0 oda=100 odt=0 cells=0 xmade=100 xgone=100\n");
 }
 
 // ... the finally completes normally and the in-flight instance resumes
