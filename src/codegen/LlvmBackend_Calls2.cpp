@@ -3193,17 +3193,33 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     // to the low bits). The single-arg branch already does this right; mirror
     // it here: strtoll/strtoull with an endptr slot, endptr-based FormatException
     // guard, per-width range-check for OverflowException.
-    if (m == "Parse" && call.args.size() == 2 && call.args[0].value &&
-        call.args[1].value) {
+    // fix #7602 (§22.5, v0.357): the §22.5 BINDING of the member's
+    // arguments — the SOURCE argument index each PARAMETER takes. stdlib §9.1
+    // declares `Parse(s: string, radix: int): int`, and §22.5 (v0.357) says
+    // "Named arguments may appear in any order after positional arguments", so
+    // `int.Parse(radix := 16, s := "ff")` binds the `s` parameter to the
+    // SECOND argument and the `radix` parameter to the first. The arm reads
+    // the parameter's SOURCE argument instead of the argument at the
+    // parameter's own position. The published binding is the IDENTITY for a
+    // positional or an in-order call, so the reads below are byte for byte
+    // the ones they always were — and `CallArgPins` (fix #7600) has already
+    // pre-evaluated the arguments in TEXTUAL order, so §22.5's evaluation
+    // order survives the permutation.
+    const auto* parseBnd = ctx_.builtinCallBinding(call);
+    const std::size_t pS = builtinParamSourceArg(parseBnd, 0, call.args.size());
+    const std::size_t pRadix =
+        builtinParamSourceArg(parseBnd, 1, call.args.size());
+    if (m == "Parse" && call.args.size() == 2 && call.args[pS].value &&
+        call.args[pRadix].value) {
         if ((pt == P::Int || pt == P::UInt || pt == P::Short ||
              pt == P::UShort || pt == P::Byte || pt == P::SByte ||
              pt == P::Long || pt == P::ULong)) {
             // fix #7315 (stdlib §9.1, v0.357): the first-argument guard is
             // the ONE shared spelling (no span overload of the radix form
             // is declared; an unknown static type is admitted on its SHAPE).
-            llvm::Value* sArg = lowerExpr(*call.args[0].value);
+            llvm::Value* sArg = lowerExpr(*call.args[pS].value);
             if (!sArg) return nullptr;
-            if (!isParseableOperand(*call.args[0].value, sArg, false))
+            if (!isParseableOperand(*call.args[pS].value, sArg, false))
                 return nullptr;
             // fix #7285 (spec §5.1 / §22.6, v0.344): the `radix: int`
             // parameter (stdlib §9.1) admits the argument by IDENTITY, by
@@ -3222,12 +3238,12 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             // radix produced `trunc {i8, i32} to i32`, equally malformed; and
             // a `long`/`ulong` radix was silently truncated to 32 bits.
             const ParseRadixBinding rb =
-                parseRadixBinding(ctx_, *call.args[1].value);
+                parseRadixBinding(ctx_, *call.args[pRadix].value);
             if (!rb.binds) {
                 if (!rb.unknown)
                     ctx_.diagnostics().report(
                         Severity::Error,
-                        call.args[1].value->span.begin,
+                        call.args[pRadix].value->span.begin,
                         "no matching overload of `" +
                             std::string(parseRadixTypeName(pt)) +
                             ".Parse` — stdlib §9.1 declares "
@@ -3247,7 +3263,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             if (rb.value) {
                 radix = builder_.getInt32(static_cast<int32_t>(*rb.value));
             } else {
-                radix = lowerExpr(*call.args[1].value);
+                radix = lowerExpr(*call.args[pRadix].value);
                 if (!radix) return nullptr;
                 if (radix->getType()->isIntegerTy() &&
                     radix->getType()->getIntegerBitWidth() < 32)

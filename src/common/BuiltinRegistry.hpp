@@ -988,6 +988,28 @@ bool isBuiltinNamedArgTableHead(std::string_view head);
 // NORMALISED, so the keyword spelling and the PascalCase alias are one head.
 bool isBuiltinValueParamHead(std::string_view head);
 
+// fix #7602 (§22.5, v0.357): does the CODEGEN arm of this value built-in
+// member lower its arguments BY BINDING — the §22.5 binding sema publishes
+// (`SemaContext::setBuiltinCallBinding`) — rather than by POSITION?
+//
+// §22.5 (v0.357): "Named arguments may appear in any order after positional
+// arguments. Each supplied argument binds exactly one parameter and each
+// parameter is bound by at most one supplied argument" — so a named argument
+// binds the parameter it NAMES, in any order. A value built-in whose arm
+// lowers by position cannot lower such a call, so the shared resolver
+// REFUSES it (#3398's limitation: "a named argument that binds to a
+// parameter other than its own position is not supported on this built-in
+// member"). This predicate is the list of members whose arm READS the
+// published binding (`builtinParamSourceArg`, src/codegen/LlvmBackend_Calls.cpp):
+// the integer heads' `Parse(s: string, radix: int)` (stdlib §9.1) and
+// `Debug.Assert(condition: bool, message: string)` (stdlib §8.2).
+//
+// A member NOT on the list keeps the #3398 refusal — the refusal is the
+// compiler's LIMITATION, and it names the §22.5 rule. The head is
+// NORMALISED, so `int.Parse` and `Int32.Parse` are one head (§3.4).
+bool builtinValueMemberBindsByName(std::string_view head,
+                                    std::string_view member);
+
 // fix #3589 (stdlib §5 / §9.6, v0.286): is `n` one of the member names the
 // STRING-receiver gate exempts from its "not yet supported in codegen"
 // catch-all, so `typeCall()` can resolve the call via the `IEnumerable<char>`

@@ -15065,47 +15065,9 @@ void Emitter::flushFfiExprTemps() {
 }
 
 // fix #7199 (§22.5, v0.343): the SOURCE argument index bound to PARAMETER `p`
-// of a built-in member call.
-//
-// §22.5 (v0.343): "named arguments may appear in any order after positional
-// arguments. Each supplied argument binds exactly one parameter", and "naming
-// an argument changes which parameter it binds to, never when it runs".
-//
-// Sema binds a built-in member's named arguments correctly and PUBLISHES that
-// binding — the `paramToArg` vector, PARAMETER index -> SOURCE argument index
-// (`ExprTC::checkBuiltinNamedArgs` -> `SemaContext::setBuiltinCallBinding`;
-// src/sema/ExprTypecheck_Calls.cpp, src/sema/SemaContext.hpp). An arm that
-// reads `call.args[p]` POSITIONALLY ignores that binding, so a reordered
-// named call hands each parameter the value of a DIFFERENT parameter:
-// `Math.Pow(y := 2, x := 3)` computed 2^3 = 8 where §22.5 and stdlib §2.2
-// (`Pow(x: double, y: double)`) require 3^2 = 9 (#7199).
-//
-// The registry's parameter order for a member (`kMathParamNames` /
-// `kConvertParamNames`, src/common/BuiltinRegistry.cpp) is the order these
-// arms already assumed positionally — `Pow/2` is {x, y}, `Fmod/2` and
-// `IEEERemainder/2` are {x, y}, `Round/2` is {x, digits}, `Min/2` and `Max/2`
-// are {a, b}, `Clamp/3` is {value, low, high}, `Convert.ToString/2` is
-// {value, toBase} — so PARAMETER p's source argument is `(*bnd)[p]`.
-//
-// A POSITIONAL call, and a named call already in DECLARATION order (the
-// identity permutation), publish NOTHING — for those the positional read is
-// the correct one, and the fallback below keeps it byte for byte.
-//
-// `nArgs` is the call's argument count: a binding that names an argument
-// index the call does not have is IGNORED and the positional read stands —
-// the same guard #7180's `srcArgIdx` applies in
-// src/codegen/LlvmBackend_String.cpp.
-static std::size_t builtinParamSourceArg(const std::vector<int>* bnd,
-                                          std::size_t p,
-                                          std::size_t nArgs) {
-    if (bnd && p < bnd->size()) {
-        const int ai = (*bnd)[p];
-        if (ai >= 0 && static_cast<std::size_t>(ai) < nArgs)
-            return static_cast<std::size_t>(ai);
-    }
-    return p;
-}
-
+// of a built-in member call — `builtinParamSourceArg`, in the SHARED header
+// (src/codegen/LlvmBackend_impl.hpp), because the value built-ins' arms that
+// lower by binding live in more than one translation unit (fix #7602).
 llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -19092,8 +19054,24 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // Assert(condition) / Assert(condition, message): no-op if true; abort if false.
     // WriteLine(message): write to stderr.
     if (cls == "Debug") {
-        if (m == "Assert" && call.args.size() >= 1 && call.args[0].value) {
-            llvm::Value* cond = lowerExpr(*call.args[0].value);
+        // fix #7602 (§22.5, v0.357): the §22.5 BINDING of the member's
+        // arguments — the SOURCE argument index each PARAMETER takes. stdlib
+        // §8.2 declares `Assert(condition: bool, message: string := "")`, and
+        // §22.5 (v0.357) says "Named arguments may appear in any order after
+        // positional arguments", so `Debug.Assert(message := "m", condition :=
+        // true)` binds the `condition` parameter to the SECOND argument and
+        // the `message` parameter to the first. The arm reads the parameter's
+        // SOURCE argument instead of the argument at the parameter's own
+        // position. The published binding is the IDENTITY for a positional
+        // or an in-order call, so the reads below are byte for byte the ones
+        // they always were.
+        const auto* dbnd = ctx_.builtinCallBinding(call);
+        const std::size_t dCond =
+            builtinParamSourceArg(dbnd, 0, call.args.size());
+        const std::size_t dMsg =
+            builtinParamSourceArg(dbnd, 1, call.args.size());
+        if (m == "Assert" && call.args.size() >= 1 && call.args[dCond].value) {
+            llvm::Value* cond = lowerExpr(*call.args[dCond].value);
             if (!cond) return nullptr;
             // Normalize condition to i1.
             if (!cond->getType()->isIntegerTy(1)) {
@@ -19105,8 +19083,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             builder_.SetInsertPoint(failBB);
             // Determine the message argument (string ptr or null).
             llvm::Value* msgPtr = llvm::ConstantPointerNull::get(ptrTy());
-            if (call.args.size() >= 2 && call.args[1].value) {
-                llvm::Value* mv = lowerExpr(*call.args[1].value);
+            if (call.args.size() >= 2 && call.args[dMsg].value) {
+                llvm::Value* mv = lowerExpr(*call.args[dMsg].value);
                 if (mv && mv->getType()->isPointerTy()) msgPtr = mv;
             }
             auto* failFn = declareC("bz_debug_assert_fail",

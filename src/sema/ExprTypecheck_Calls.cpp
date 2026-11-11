@@ -28970,6 +28970,94 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
     }
 }
 
+// fix #7602 (§22.5, v0.357): the §22.5 BINDING of a VALUE built-in member's
+// arguments — PARAMETER index -> SOURCE argument index, and the inverse.
+//
+// §22.5 (v0.357): "Named arguments may appear in any order after positional
+// arguments. Each supplied argument binds exactly one parameter and each
+// parameter is bound by at most one supplied argument". A NAMED argument
+// binds the parameter it NAMES, in any order; a POSITIONAL argument binds
+// the next parameter no earlier argument has bound.
+//
+// The value built-ins' `out` slot is POSITIONAL-ONLY (§22.5: "A ref/out/
+// scoped argument is positional-only"; stdlib §9.1 declares `TryParse(s:
+// string, out result: int): bool`), so a positional argument that follows a
+// named one binds that slot — the shape the standard library's own surface
+// uses (`int.TryParse(s := "42", out var v)`). A positional argument that
+// follows a named one and would bind a NAMED parameter is refused: §22.5's
+// "named arguments come after all positional arguments" (the same rule the
+// shared binder `ExprTC::bindArgsToParams` applies on the user path).
+//
+// Every refusal's wording is the shared binder's own, so the same mistake
+// draws the same sentence on a built-in and on a user-declared callee. The
+// caller prefixes the callee description, exactly as `bindArgsToParams` does.
+static bool builtinValueFormBinding(const common::BuiltinParamForm& form,
+                                    const std::vector<ast::CallArgument>& args,
+                                    std::vector<int>& paramToArg,
+                                    std::vector<std::size_t>& argToParam,
+                                    std::string* err) {
+    paramToArg.assign(form.total, -1);
+    argToParam.assign(args.size(), form.total);
+    bool sawNamed = false;
+    for (std::size_t ai = 0; ai < args.size(); ++ai) {
+        const ast::CallArgument& a = args[ai];
+        if (a.name.empty()) {
+            // The next parameter no earlier argument has bound.
+            std::size_t j = form.total;
+            for (std::size_t k = 0; k < form.total; ++k)
+                if (paramToArg[k] < 0) { j = k; break; }
+            if (j >= form.total) {
+                if (err)
+                    *err = "supplies " + std::to_string(args.size()) +
+                        " argument(s) but the parameter list has " +
+                        std::to_string(form.total) + " (§22.5)";
+                return false;
+            }
+            // A positional argument after a named one may bind ONLY the
+            // POSITIONAL-ONLY slot (the `out` slot, which carries no name).
+            if (sawNamed && !form.names[j].empty()) {
+                if (err)
+                    *err = "a positional argument may not follow a named "
+                        "argument (§22.5 — named arguments come after all "
+                        "positional arguments)";
+                return false;
+            }
+            paramToArg[j] = static_cast<int>(ai);
+            argToParam[ai] = j;
+            continue;
+        }
+        sawNamed = true;
+        std::size_t j = form.total;
+        for (std::size_t k = 0; k < form.total; ++k)
+            if (form.names[k] == a.name) { j = k; break; }
+        if (j >= form.total) {
+            if (err)
+                *err = "has no parameter named `" + std::string(a.name) +
+                    "` (§22.5)";
+            return false;
+        }
+        if (paramToArg[j] >= 0) {
+            if (err)
+                *err = "parameter `" + std::string(a.name) +
+                    "` is bound more than once (§22.5)";
+            return false;
+        }
+        paramToArg[j] = static_cast<int>(ai);
+        argToParam[ai] = j;
+    }
+    for (std::size_t k = 0; k < form.total; ++k) {
+        if (paramToArg[k] >= 0) continue;
+        if (err)
+            *err = "required parameter `" +
+                (form.names[k].empty()
+                     ? std::string("at position ") + std::to_string(k)
+                     : std::string(form.names[k])) +
+                "` is not supplied (§22.5)";
+        return false;
+    }
+    return true;
+}
+
 void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
     // ONE diagnostic per call: a check that already spoke about THIS call has
     // the first word. The §7.3 nullability gate, the §5.1 type gate and the
@@ -29190,12 +29278,12 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
         }
         if (!nameForms.empty()) forms = nameForms;
     }
-    // fix #7419 (spec §22.5 "Optional parameters and named arguments",
-    // v0.345): THE §22.5 BINDING. A named argument binds to the parameter it
-    // NAMES — "Named arguments may appear in any order after positional
-    // arguments. Each supplied argument binds exactly one parameter and each
-    // parameter is bound by at most one supplied argument" — and this
-    // resolver reads its arguments POSITIONALLY.
+    // fix #7419 / #7602 (spec §22.5 "Optional parameters and named
+    // arguments", v0.345 / v0.357): THE §22.5 BINDING. A named argument binds
+    // to the parameter it NAMES — "Named arguments may appear in any order
+    // after positional arguments. Each supplied argument binds exactly one
+    // parameter and each parameter is bound by at most one supplied
+    // argument" — and this resolver reads its arguments POSITIONALLY.
     //
     // The heads this resolver owns are NOT among the heads
     // `checkBuiltinNamedArgs` claims (the `string` / `StringBuilder` /
@@ -29216,50 +29304,114 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
     //
     // A call that binds IN ORDER is unaffected: there the positional
     // reading and the named reading are the same argument.
-    std::string reorderArg, reorderParam;
-    for (const auto& f : forms) {
-        for (std::size_t p = 0; p < ce.args.size() && p < f.total; ++p) {
-            const std::string_view an = ce.args[p].name;
-            if (an.empty()) continue;
-            std::size_t q = f.total;
-            for (std::size_t k = 0; k < f.total; ++k)
-                if (f.names[k] == an) { q = k; break; }
-            // A name this form does not declare is not this form's business:
-            // another form may declare it, and the §22.5 binder reports the
-            // names no form declares.
-            if (q == f.total) continue;
-            if (q == p) continue;  // in declaration order
-            reorderArg = std::string(an);
-            reorderParam = std::string(f.names[q]);
-            break;
-        }
-        if (!reorderArg.empty()) break;
-    }
-    // fix #7419 (§22.5, v0.345): the §22.5 refusal. The call binds a named
-    // argument to a parameter other than the one at its own position, and
-    // this built-in's arguments are lowered by POSITION, so the compiler
-    // cannot lower the call. The diagnostic names BOTH parameters — the one
-    // the argument NAMES and the one it is written at — which the old
-    // diagnostic conflated (it named only the latter, and blamed the
-    // argument for a type mismatch it does not have).
-    if (!reorderArg.empty()) {
-        std::string rdecls;
+    //
+    // fix #7602 (§22.5, v0.357): the members whose CODEGEN arm lowers its
+    // arguments BY BINDING — the published `paramToArg` table
+    // (`ctx_.setBuiltinCallBinding`), read by `builtinParamSourceArg`
+    // (src/codegen/LlvmBackend_Calls.cpp) — are NOT refused any more. Their
+    // binding is computed here, PUBLISHED, and the applicability loop below
+    // asks the §5.1 question of every argument at the parameter it BINDS —
+    // the argument at the call's own position is not the parameter at that
+    // position any more. `CallArgPins` (fix #7600) pre-evaluates the
+    // arguments in TEXTUAL order before the arm runs, so §22.5's evaluation
+    // order ("naming an argument changes which parameter it binds to, never
+    // when it runs") survives the permutation.
+    //
+    // The members NOT on that list keep the refusal: their arm still lowers
+    // by POSITION, so a reordered named call is a call this compiler cannot
+    // lower, and the refusal names the §22.5 rule.
+    const bool bindsByName =
+        common::builtinValueMemberBindsByName(head, member);
+    // THE CANDIDATES, and for each the §22.5 BINDING it carries: PARAMETER
+    // index -> SOURCE argument index (`candBindings`) and the inverse
+    // (`candArgToParam`).
+    std::vector<const common::BuiltinParamForm*> cands;
+    std::vector<std::vector<int>> candBindings;
+    std::vector<std::vector<std::size_t>> candArgToParam;
+    if (bindsByName) {
+        std::string bindErr;
         for (const auto& f : forms) {
-            if (!rdecls.empty()) rdecls += " / ";
-            rdecls += builtinParamFormDecl(member, f);
+            std::vector<int> p2a;
+            std::vector<std::size_t> a2p;
+            std::string err;
+            if (!builtinValueFormBinding(f, ce.args, p2a, a2p, &err)) {
+                // A form whose §22.5 binding FAILS is not a candidate
+                // (§22.6). Every candidate declares every named argument
+                // (the `nameForms` filter above), so the violation is the
+                // CALL's and is reported once, below.
+                if (bindErr.empty()) bindErr = err;
+                continue;
+            }
+            cands.push_back(&f);
+            candBindings.push_back(std::move(p2a));
+            candArgToParam.push_back(std::move(a2p));
         }
-        ctx_.diagnostics().report(
-            Severity::Error, ce.span.begin,
-            "no matching overload of `" + callee + "` — " + sec + " declares " +
-                rdecls + ", and the argument named `" + reorderArg +
-                "` binds by §22.5 to the `" + reorderParam +
-                "` parameter of that form, not to the parameter it is written "
-                "at — a named argument that binds to a parameter other than "
-                "its own position is not supported on this built-in member "
-                "(§22.5, #3398); pass the arguments in declaration order, or "
-                "positionally — the call is a compile error with no "
-                "candidates cited (§22.6)");
-        return;
+        if (cands.empty()) {
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                "call to built-in `" + callee + "`: " + bindErr);
+            return;
+        }
+    } else {
+        std::string reorderArg, reorderParam;
+        for (const auto& f : forms) {
+            for (std::size_t p = 0; p < ce.args.size() && p < f.total; ++p) {
+                const std::string_view an = ce.args[p].name;
+                if (an.empty()) continue;
+                std::size_t q = f.total;
+                for (std::size_t k = 0; k < f.total; ++k)
+                    if (f.names[k] == an) { q = k; break; }
+                // A name this form does not declare is not this form's
+                // business: another form may declare it, and the §22.5
+                // binder reports the names no form declares.
+                if (q == f.total) continue;
+                if (q == p) continue;  // in declaration order
+                reorderArg = std::string(an);
+                reorderParam = std::string(f.names[q]);
+                break;
+            }
+            if (!reorderArg.empty()) break;
+        }
+        // fix #7419 (§22.5, v0.345): the §22.5 refusal. The call binds a
+        // named argument to a parameter other than the one at its own
+        // position, and this built-in's arguments are lowered by POSITION, so
+        // the compiler cannot lower the call. The diagnostic names BOTH
+        // parameters — the one the argument NAMES and the one it is written
+        // at — which the old diagnostic conflated (it named only the latter,
+        // and blamed the argument for a type mismatch it does not have).
+        if (!reorderArg.empty()) {
+            std::string rdecls;
+            for (const auto& f : forms) {
+                if (!rdecls.empty()) rdecls += " / ";
+                rdecls += builtinParamFormDecl(member, f);
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                "no matching overload of `" + callee + "` — " + sec +
+                    " declares " + rdecls + ", and the argument named `" +
+                    reorderArg +
+                    "` binds by §22.5 to the `" + reorderParam +
+                    "` parameter of that form, not to the parameter it is "
+                    "written at — a named argument that binds to a parameter "
+                    "other than its own position is not supported on this "
+                    "built-in member (§22.5, #3398); pass the arguments in "
+                    "declaration order, or positionally — the call is a "
+                    "compile error with no candidates cited (§22.6)");
+            return;
+        }
+        // NO REORDER: the positional reading IS the named reading, so the
+        // candidates carry the IDENTITY binding.
+        for (const auto& f : forms) {
+            cands.push_back(&f);
+            std::vector<int> p2a(f.total);
+            std::vector<std::size_t> a2p(f.total);
+            for (std::size_t j = 0; j < f.total; ++j) {
+                p2a[j] = static_cast<int>(j);
+                a2p[j] = j;
+            }
+            candBindings.push_back(std::move(p2a));
+            candArgToParam.push_back(std::move(a2p));
+        }
     }
     // fix #7304 (spec §12.3, §5.1, §22.6, v0.355): the STATIC TYPE of a
     // `this` / `base` ARGUMENT, which the resolver leaves untyped ("Slice 3b
@@ -29301,21 +29453,34 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
     // §5.1 question is the radix's. The seven rows of
     // `uint_radix_rejected_7271` pin the precise wording (the base's).
     const common::BuiltinParamForm* best = nullptr;
+    std::size_t bestIdx = 0;
     std::size_t bestAdmits = 0;
     std::size_t bestFail = 0;
     bool bestFails = true;
     int bestDistance = 0;
-    for (const auto& f : forms) {
+    for (std::size_t fi = 0; fi < cands.size(); ++fi) {
+        const common::BuiltinParamForm& f = *cands[fi];
+        // fix #7602 (§22.5, v0.357): the §22.5 BINDING of this candidate —
+        // the PARAMETER each argument at the call's own position binds to.
+        // For a call that binds IN ORDER this is the identity, and every
+        // read below is the positional one it always was.
+        const std::vector<std::size_t>& a2p = candArgToParam[fi];
         std::size_t admits = 0;
         std::size_t fail = 0;
         bool fails = false;
         for (std::size_t p = 0; p < f.total && p < ce.args.size(); ++p) {
+            // fix #7602 (§22.5, v0.357): the parameter the argument at the
+            // call's own position BINDS (§22.5) — the parameter whose
+            // DECLARED TYPE the §5.1 question is asked of. A named argument
+            // binds the parameter it NAMES, in any order, so this is not the
+            // position the argument is written at.
+            const std::size_t q = a2p[p];
             // fix #8012 (stdlib §2.5, §5.1, v0.350): the DECLARED TYPE at
             // this position, where the ONE table's `kinds` bit set cannot
             // spell it — the standard library's own RECORD types.
             auto admitted = builtinArgAdmittedAt(
-                ce, p, f.kinds[p],
-                builtinMemberDeclaredTypeAt(head, member, p),
+                ce, p, q < f.kinds.size() ? f.kinds[q] : 0,
+                builtinMemberDeclaredTypeAt(head, member, q),
                 (p < recoveredArgTypes.size() && recoveredArgTypes[p])
                     ? &*recoveredArgTypes[p]
                     : nullptr);
@@ -29325,41 +29490,64 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
         }
         int distance = 0;
         if (fails) {
+            const std::size_t q = a2p[fail];
             TypeRef* argTy = ctx_.exprType(*ce.args[fail].value);
             if (!argTy && fail < recoveredArgTypes.size() &&
                 recoveredArgTypes[fail])
                 argTy = const_cast<TypeRef*>(&*recoveredArgTypes[fail]);
-            distance = builtinCandidateDistance(f.kinds[fail], argTy);
+            distance = builtinCandidateDistance(
+                q < f.kinds.size() ? f.kinds[q] : 0, argTy);
         }
         if (!best || admits > bestAdmits ||
             (admits == bestAdmits && distance < bestDistance)) {
-            best = &f;
+            best = cands[fi];
+            bestIdx = fi;
             bestAdmits = admits;
             bestFail = fail;
             bestFails = fails;
             bestDistance = distance;
         }
     }
-    if (!bestFails) return;  // some candidate is applicable: the call resolves
+    if (!bestFails) {
+        // fix #7602 (§22.5, v0.357): PUBLISH the §22.5 binding, so codegen
+        // lowers a reordered named call BY BINDING: the arm reads the
+        // parameter's SOURCE argument through `builtinParamSourceArg`
+        // (src/codegen/LlvmBackend_Calls.cpp) instead of `call.args[p]`.
+        // An IDENTITY binding publishes nothing: the positional read is
+        // then the correct one, byte for byte.
+        const std::vector<int>& bind = candBindings[bestIdx];
+        bool nonIdentity = false;
+        for (std::size_t j = 0; j < bind.size(); ++j) {
+            if (bind[j] != static_cast<int>(j)) { nonIdentity = true; break; }
+        }
+        if (nonIdentity) ctx_.setBuiltinCallBinding(&ce, bind);
+        return;  // some candidate is applicable: the call resolves
+    }
     // THE DECLARED FORMS, quoted.
     std::string decls;
     for (const auto& f : forms) {
         if (!decls.empty()) decls += " / ";
         decls += builtinParamFormDecl(member, f);
     }
+    // fix #7602 (§22.5, v0.357): the PARAMETER the failing argument binds
+    // to — not the position it is written at.
+    const std::size_t bestQ =
+        bestIdx < candArgToParam.size() && bestFail < candArgToParam[bestIdx].size()
+            ? candArgToParam[bestIdx][bestFail]
+            : bestFail;
     const std::uint32_t kind =
-        best && bestFail < best->kinds.size() ? best->kinds[bestFail] : 0;
+        best && bestQ < best->kinds.size() ? best->kinds[bestQ] : 0;
     // fix #8012 (stdlib §2.5, §5.1, v0.350): the NAMED DECLARED TYPE at
     // the failing position — the RECORD type stdlib §2.5 declares there,
     // which the ONE table's `kinds` bit set cannot spell.
     const BuiltinDeclaredType declaredAt =
-        builtinMemberDeclaredTypeAt(head, member, bestFail);
+        builtinMemberDeclaredTypeAt(head, member, bestQ);
     // THE PARAMETER the best candidate misses, by its DECLARED NAME (§22.5) —
     // "`radix`", not "position 1": the standard library names its parameters,
     // and the diagnostic that cites the declaration names them too.
     const std::string param =
-        (best && bestFail < best->names.size() && !best->names[bestFail].empty())
-            ? "the `" + std::string(best->names[bestFail]) + "` argument"
+        (best && bestQ < best->names.size() && !best->names[bestQ].empty())
+            ? "the `" + std::string(best->names[bestQ]) + "` argument"
             : "the argument at position " + std::to_string(bestFail);
     // WHY the argument reaches it: §5.1's conversion rule, or §7.3's
     // nullability. The type read is the type AT THE CALL — a §7.4-narrowed

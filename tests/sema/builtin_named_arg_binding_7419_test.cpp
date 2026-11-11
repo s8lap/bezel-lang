@@ -28,12 +28,14 @@
 //     `int.Parse(radix := "x", s := 5)`, whose named binding is invalid on
 //     both parameters.
 //
-// THE RESOLVER'S HEADS CANNOT HONOUR A REORDERED NAMED CALL, and the
-// diagnostic says so: the built-in arms lower their arguments by POSITION
-// (§22.5, #3423), so a call whose named argument binds to a parameter other
-// than the one at its own position is refused with the §22.5 rule named —
-// not with a type mismatch the argument does not have. The refusal is the
-// compiler's LIMITATION, not a §5.1 verdict.
+// fix #7602 (§22.5, v0.357): the resolver's heads now BIND a named argument
+// to the parameter it NAMES, for the members whose codegen arm reads the
+// published §22.5 binding (`SemaContext::setBuiltinCallBinding`), so the
+// two reordered calls above COMPILE and RUN and the two refusal rows became
+// admitting rows. The members whose arm still lowers its arguments by
+// POSITION keep the §22.5 refusal — that refusal is the compiler's
+// LIMITATION, not a §5.1 verdict — and it is pinned by
+// `builtin_named_arg_reorder_7602_test.cpp`.
 //
 // The CONTROL rows pin the safety property: every call that binds IN ORDER
 // keeps working — `Debug.Assert(condition := true, message := "a message")`,
@@ -53,15 +55,13 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// The §22.5 refusal the shared resolver draws for a reordered named call.
-std::string reorderNeedle(const std::string& argName,
-                          const std::string& paramName) {
-    return "the argument named `" + argName + "` binds by §22.5 to the `" +
-           paramName + "` parameter of that form, not to the parameter it is "
-           "written at — a named argument that binds to a parameter other "
-           "than its own position is not supported on this built-in member "
-           "(§22.5, #3398)";
-}
+// fix #7602 (§22.5, v0.357): the shared resolver's heads now BIND a named
+// argument to the parameter it NAMES, for the members whose codegen arm reads
+// the published binding — so the §22.5 REFUSAL this file used to pin is
+// gone for those members, and the rows below are ADMITTING rows. The
+// members whose arm still lowers its arguments by POSITION keep the
+// refusal, and that refusal is pinned by
+// `builtin_named_arg_reorder_7602_test.cpp` (the `int.TryParse` row).
 
 // #6807's own located diagnostic, for a non-`string` value.
 const char kInsertValueType[] =
@@ -145,17 +145,18 @@ BEZEL_TEST(builtin_named_arg_binding_7419,
 // The issue's own repro: both arguments are correctly typed, and the old
 // diagnostic blamed the `condition` parameter for the MESSAGE.
 BEZEL_TEST(builtin_named_arg_binding_7419,
-           debug_assert_named_reordered_is_refused_with_the_section_22_5_rule) {
-    expectRejected(prog(kDiagImport,
-                        "Debug.Assert(message := \"a message\", condition := true);"),
-                   reorderNeedle("message", "message"));
+           debug_assert_named_reordered_is_admitted) {
+    expectStdout(prog(kDiagImport,
+                      "Debug.Assert(message := \"a message\", condition := true); "
+                      "Console.WriteLine(\"OK\");"),
+                 "OK\n");
 }
 
 // The `int.Parse` instance of the same class.
 BEZEL_TEST(builtin_named_arg_binding_7419,
-           int_parse_named_reordered_is_refused_with_the_section_22_5_rule) {
-    expectRejected(prog("", "var v := int.Parse(radix := 16, s := \"255\");"),
-                   reorderNeedle("radix", "radix"));
+           int_parse_named_reordered_is_admitted) {
+    expectStdout(prog("", "Console.WriteLine(int.Parse(radix := 16, s := \"ff\"));"),
+                 "255\n");
 }
 
 // The same class's SILENT-ACCEPTANCE instance: the positional reading
@@ -164,7 +165,7 @@ BEZEL_TEST(builtin_named_arg_binding_7419,
 BEZEL_TEST(builtin_named_arg_binding_7419,
            int_parse_named_reordered_with_mismatched_types_is_refused) {
     expectRejected(prog("", "var v := int.Parse(radix := \"x\", s := 5);"),
-                   reorderNeedle("radix", "radix"));
+                   "so the `radix` argument must be an `int`");
 }
 
 // The §22.5 CANDIDATE SET: a named argument binds to the parameter it

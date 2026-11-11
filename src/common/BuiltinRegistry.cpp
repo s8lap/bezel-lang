@@ -2832,6 +2832,33 @@ bool isBuiltinValueParamHead(std::string_view head) {
     return contains(kBuiltinValueParamHeads, normaliseBuiltinParamHead(head));
 }  // per §22.5 / §5.1 / §22.6, fix #6780 + fix #8045
 
+// fix #7602 (§22.5, v0.357): the value built-in members whose CODEGEN arm
+// lowers its arguments BY BINDING — the §22.5 binding sema publishes — so a
+// reordered named call can be lowered. See the header.
+//
+//   * `Parse(s: string, radix: int)` on the INTEGER heads (stdlib §9.1) —
+//     the arm is `Emitter::tryLowerPrimitiveStaticCall`'s radix branch
+//     (src/codegen/LlvmBackend_Calls2.cpp), which reads the `s` and the
+//     `radix` through the published binding.
+//   * `Assert(condition: bool, message: string)` on `Debug` (stdlib §8.2) —
+//     the arm is `Emitter::tryLowerBuiltinClassCall`'s `Debug` branch
+//     (src/codegen/LlvmBackend_Calls.cpp), which reads the `condition` and
+//     the `message` through the published binding.
+//
+// Every OTHER value built-in member keeps the #3398 refusal: its arm still
+// lowers by POSITION, so a reordered named call is a call this compiler
+// cannot lower.
+bool builtinValueMemberBindsByName(std::string_view head,
+                                    std::string_view member) {
+    const std::string_view h = normaliseBuiltinParamHead(head);
+    if (h == "Debug") return member == "Assert";
+    if (member != "Parse") return false;
+    // The integer heads of `kBuiltinValueParamHeads`: `Parse/2` declares
+    // `Parse(s: string, radix: int)` (stdlib §9.1) on each of them.
+    return h == "SByte" || h == "Byte" || h == "Int16" || h == "UInt16" ||
+           h == "Int32" || h == "UInt32" || h == "Int64" || h == "UInt64";
+}  // per §22.5, fix #7602
+
 bool isStringLinqOperatorMemberName(std::string_view n) {
     return contains(kStringLinqOperatorMemberNames, n);
 }  // per §5 / §9.6, fix #3589

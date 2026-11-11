@@ -246,6 +246,55 @@ inline llvm::Value* radixAdmittedIR(llvm::IRBuilder<>& b, llvm::Value* radix) {
     return admitted;
 }
 
+// fix #7199 (§22.5, v0.343): the SOURCE argument index bound to PARAMETER `p`
+// of a built-in member call.
+//
+// §22.5 (v0.343): "named arguments may appear in any order after positional
+// arguments. Each supplied argument binds exactly one parameter", and "naming
+// an argument changes which parameter it binds to, never when it runs".
+//
+// Sema binds a built-in member's named arguments correctly and PUBLISHES that
+// binding — the `paramToArg` vector, PARAMETER index -> SOURCE argument index
+// (`ExprTC::checkBuiltinNamedArgs` / `ExprTC::checkBuiltinCallAdmission` ->
+// `SemaContext::setBuiltinCallBinding`; src/sema/ExprTypecheck_Calls.cpp,
+// src/sema/SemaContext.hpp). An arm that reads `call.args[p]` POSITIONALLY
+// ignores that binding, so a reordered named call hands each parameter the
+// value of a DIFFERENT parameter: `Math.Pow(y := 2, x := 3)` computed 2^3 = 8
+// where §22.5 and stdlib §2.2 (`Pow(x: double, y: double)`) require 3^2 = 9
+// (#7199).
+//
+// The registry's parameter order for a member (`kMathParamNames` /
+// `kConvertParamNames`, src/common/BuiltinRegistry.cpp) is the order these
+// arms already assumed positionally — `Pow/2` is {x, y}, `Fmod/2` and
+// `IEEERemainder/2` are {x, y}, `Round/2` is {x, digits}, `Min/2` and `Max/2`
+// are {a, b}, `Clamp/3` is {value, low, high}, `Convert.ToString/2` is
+// {value, toBase} — so PARAMETER p's source argument is `(*bnd)[p]`.
+//
+// A POSITIONAL call, and a named call already in DECLARATION order (the
+// identity permutation), publish NOTHING — for those the positional read is
+// the correct one, and the fallback below keeps it byte for byte.
+//
+// `nArgs` is the call's argument count: a binding that names an argument
+// index the call does not have is IGNORED and the positional read stands —
+// the same guard #7180's `srcArgIdx` applies in
+// src/codegen/LlvmBackend_String.cpp.
+//
+// fix #7602 (§22.5, v0.357): the helper lives HERE, in the shared header,
+// because the VALUE built-ins' arms that lower by binding live in more than
+// one translation unit (`LlvmBackend_Calls.cpp`'s `Debug.Assert` arm and
+// `LlvmBackend_Calls2.cpp`'s integer `Parse` arm): the §22.5 binding is ONE
+// rule and it has ONE reading.
+inline std::size_t builtinParamSourceArg(const std::vector<int>* bnd,
+                                          std::size_t p,
+                                          std::size_t nArgs) {
+    if (bnd && p < bnd->size()) {
+        const int ai = (*bnd)[p];
+        if (ai >= 0 && static_cast<std::size_t>(ai) < nArgs)
+            return static_cast<std::size_t>(ai);
+    }
+    return p;
+}
+
 // fix #3897 / §4.8 / §4.17: is `rt` the builtin `bz_dict_t*`-backed
 // Dictionary/OwningDictionary/SortedDictionary family (the #1414 stage-3
 // registry, `common::isDictionaryName`)?
