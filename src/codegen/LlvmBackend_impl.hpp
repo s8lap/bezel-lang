@@ -1196,6 +1196,11 @@ public:
         // non-virtual public properties WITH a setter (exporter side). Same
         // ordering requirement as the getter call above (propSetSlot_ populated).
         emitExportedPropertySetters();
+        // fix #8438 (§28.9 / §2.4, v0.357): the store thunks of the dynamic
+        // box-storage fields an importer can write. After
+        // collectBoxStorageFields (the classification) and the vtable setup
+        // (the run-time box test reads the shared box Dispose slot).
+        emitExportedBoxFieldStoreThunks();
         // fix #2885 (§22.12/§22.13/§23, v0.240): the STATIC-property accessor
         // stubs — the shape the two calls above skip entirely. Same ordering
         // requirement and same reason (ensurePropertyAccessorFn builds the
@@ -22894,6 +22899,43 @@ private:
     bool lowerDynBoxFieldStore(const ast::Expr& target, llvm::Value* fieldAddr,
                                llvm::Value* newVal,
                                const ast::Expr* valueExpr);
+
+    // fix #8438 (§28.9 / §8.6 / §2.4, v0.357): THE BOX-STORAGE DISCIPLINE OF A
+    // FIELD IS ONE FACT, AND EVERY MODULE THAT WRITES THE FIELD MUST FOLLOW IT.
+    //
+    // collectBoxStorageFields classifies a field from the writes THIS module
+    // makes. A non-private field of a library class is also written by the
+    // modules that import it, which the pre-pass cannot see, and which in turn
+    // could not see the classification: an importer stored into such a field
+    // as into an uncounted slot. MEASURED (two-module build): `b.o := a.o`
+    // gave the field a reference it never retained, and the library's
+    // disposer released it -- "refcount over-release (box)"; an importer
+    // store that displaced a box never released it.
+    //
+    // Two halves:
+    //  * THE LIBRARY (isExternallyWritableBoxField / collectBoxStorageFields
+    //    PHASE 5): a field an importer can write is never box-ONLY -- the
+    //    static, unguarded release of a box-only field would release whatever
+    //    an importer stored (a class instance) as a box. It is DYNAMIC instead
+    //    (when the library's own writes allow the dynamic discipline at all).
+    //  * THE STORE THUNK (emitExportedBoxFieldStoreThunks): for every such
+    //    dynamic field the library exports `bz$<Class>$<field>$boxfieldset
+    //    (ptr slot, ptr value)` -- the #8215 dynamic store (retain-new iff a
+    //    box, store, release-old iff a box) with the LIBRARY's discriminator.
+    //    An importer (lowerImportedBoxFieldStore) references it WEAKLY: a
+    //    present thunk means "this field is counted" and performs the store;
+    //    an absent one (the library gave the field no discipline, or was built
+    //    before this fix) leaves the plain store the importer always made.
+    //    The symbol IS the exported classification, so the two modules cannot
+    //    disagree about it.
+    bool isExternallyWritableBoxField(const sema::Symbol* m) const;
+    std::string boxFieldStoreThunkName(const sema::TypeSymbol* ts,
+                                       const sema::Symbol* field);
+    void emitExportedBoxFieldStoreThunks();
+    bool lowerImportedBoxFieldStore(const ast::Expr& target,
+                                    llvm::Value* fieldAddr,
+                                    llvm::Value* newVal,
+                                    const ast::Expr* valueExpr);
 
     // fix #8214 (§28.9 / §4.6 / §8.6, v0.355): the OBJECT-STRING STORAGE
     // fields — every Object/interface-typed instance field / auto-property of

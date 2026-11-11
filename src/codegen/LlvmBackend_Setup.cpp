@@ -36642,6 +36642,171 @@ bool Emitter::lowerDynBoxFieldStore(const ast::Expr& target,
 }
 
 
+// fix #8438 (§28.9 / §8.6 / §2.4, v0.357): can a module that IMPORTS this one
+// store into the field directly? Only a library build has importers
+// (§33.6), and only a field (an auto-property is written through its exported
+// setter, which runs this module's own store) that is not `private`.
+bool Emitter::isExternallyWritableBoxField(const sema::Symbol* m) const {
+    if (isMainModule_) return false;
+    auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+    return fs && fs->visibility != ast::Visibility::Private;
+}
+
+std::string Emitter::boxFieldStoreThunkName(const sema::TypeSymbol* ts,
+                                            const sema::Symbol* field) {
+    return "bz$" + mangledTypeName(ts) + "$" + std::string(field->name) +
+           "$boxfieldset";
+}
+
+// fix #8438 (§28.9 / §8.6 / §2.4, v0.357): the exporter half -- see the
+// declaration. One `void (ptr slot, ptr value)` per dynamic box-storage field
+// an importer can write; the body is lowerDynBoxFieldStore's sequence.
+void Emitter::emitExportedBoxFieldStoreThunks() {
+    if (isMainModule_ || dynBoxStorageFields_.empty()) return;
+    for (const auto& sym : ctx_.symbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        // A generic class is instantiated by its importer (§2.8.3 rule 4):
+        // there is no one field symbol to export a thunk for.
+        if (!ts->genericParams.empty()) continue;
+        for (const sema::Symbol* m : ts->members) {
+            if (!isExternallyWritableBoxField(m)) continue;
+            if (!isDynBoxStorageMember(m)) continue;
+            const std::string mangled = boxFieldStoreThunkName(ts, m);
+            if (module_->getNamedValue(mangled)) continue;
+            auto* fnTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::GlobalValue::ExternalLinkage, mangled, *module_);
+            auto* savedFn = currentFn_;
+            auto* savedInsert = builder_.GetInsertBlock();
+            currentFn_ = fn;
+            builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
+            auto argIt = fn->args().begin();
+            llvm::Value* slot = &*argIt++;
+            llvm::Value* value = &*argIt;
+            llvm::Value* oldVal =
+                builder_.CreateLoad(ptrTy(), slot, "boxfs.old");
+            emitObjectSlotBoxOp(value, /*retain=*/true);
+            builder_.CreateStore(value, slot);
+            emitObjectSlotBoxOp(oldVal, /*retain=*/false);
+            builder_.CreateRetVoid();
+            currentFn_ = savedFn;
+            if (savedInsert) builder_.SetInsertPoint(savedInsert);
+        }
+    }
+}
+
+// fix #8438 (§28.9 / §8.6 / §2.4, v0.357): the importer half -- a `:=` store
+// into an Object/interface-typed instance field of an IMPORTED class.
+//
+// The sources taken are the ones the library's own two store sites take for a
+// dynamic field: a box producer (lowerBoxFieldStore: the +1 the store minted
+// is released after the thunk has taken the field's own), `null`, a class
+// instance, and an Object/interface-typed value of unknown provenance
+// (lowerDynBoxFieldStore -- the issue's `b.o := a.o`). Anything else (a
+// string source, a `new`, a lambda, a `move`, an `owned` field) keeps the
+// store it had.
+//
+// The thunk is referenced WEAKLY and tested at run time: absent, the field has
+// no box discipline in its library and the plain store is what both modules
+// agree on.
+bool Emitter::lowerImportedBoxFieldStore(const ast::Expr& target,
+                                         llvm::Value* fieldAddr,
+                                         llvm::Value* newVal,
+                                         const ast::Expr* valueExpr) {
+    if (!fieldAddr || !newVal || !valueExpr || !currentFn_) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    const sema::TypeRef* rt = ctx_.exprType(target);
+    if (!rt || !isObjectOrInterfaceTarget(rt)) return false;
+    if (localSlot(target)) return false;
+    {
+        llvm::Type* dummy = nullptr;
+        if (refParamAddr(target, dummy)) return false;
+    }
+    if (staticFieldGlobal(target)) return false;
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(target));
+    if (!fs || !ctx_.isImported(fs)) return false;
+    const sema::TypeSymbol* ts = fs->parent;
+    if (!ts || ts->kind != ast::TypeDeclKind::Class) return false;
+    if (!ts->genericParams.empty()) return false;
+    for (auto mod : fs->modifiers)
+        if (mod == "owned" || mod == "static") return false;
+    const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
+    const bool producer =
+        (srcTy && (isBoxableValueType(srcTy) || isNullableValueTy(srcTy))) ||
+        isUserMethodBoxReturnCall(valueExpr);
+    if (!producer) {
+        if (dynamic_cast<const ast::NewExpr*>(valueExpr) ||
+            dynamic_cast<const ast::LambdaExpr*>(valueExpr) ||
+            dynamic_cast<const ast::MarkedTransferExpr*>(valueExpr))
+            return false;
+        const bool isNull =
+            dynamic_cast<const ast::NullLiteralExpr*>(valueExpr) != nullptr;
+        using K = sema::TypeRef::Kind;
+        const bool classSrc =
+            srcTy && srcTy->kind == K::Named && srcTy->declaration &&
+            srcTy->declaration->kind == ast::TypeDeclKind::Class;
+        if (!isNull && !classSrc &&
+            (!srcTy || !isObjectOrInterfaceTarget(srcTy)))
+            return false;
+        if (isObjectStringFieldLvalue(target, valueExpr)) return false;
+        // A bare LOCAL as the source: the field may take a reference of its
+        // own only when the local keeps and releases its own -- a
+        // box-release-managed local (collectBoxReleaseEligible) or one that
+        // holds a #8444 box-borrow pin. Any other local reached this store
+        // because the store itself made it ESCAPE the box-release pre-pass:
+        // the reference its box was minted with has no other owner, and the
+        // plain store below is what hands it to the field. Retaining here
+        // would strand that reference (MEASURED: 24 B per local).
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(valueExpr)) {
+            auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+            if (loc) {
+                bool holdsOwnRef = false;
+                auto pinIt = loc->decl ? boxBorrowPins_.find(loc->decl)
+                                       : boxBorrowPins_.end();
+                if (pinIt != boxBorrowPins_.end() &&
+                    pinIt->second.fn == currentFn_)
+                    holdsOwnRef = true;
+                llvm::AllocaInst* srcSlot = localSlot(*valueExpr);
+                for (auto scopeIt = disposeStack_.rbegin();
+                     srcSlot && !holdsOwnRef && scopeIt != disposeStack_.rend();
+                     ++scopeIt)
+                    for (const Disposal& d : *scopeIt)
+                        if (d.slot == srcSlot && d.boxRelease) {
+                            holdsOwnRef = true;
+                            break;
+                        }
+                if (!holdsOwnRef) return false;
+            }
+        }
+    }
+    const std::string mangled = boxFieldStoreThunkName(ts, fs);
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy(), ptrTy()}, false);
+    llvm::Function* thunk = module_->getFunction(mangled);
+    if (!thunk)
+        thunk = llvm::Function::Create(
+            fnTy, llvm::GlobalValue::ExternalWeakLinkage, mangled, *module_);
+    auto* countedBB = llvm::BasicBlock::Create(llvm_, "xboxfs.counted", currentFn_);
+    auto* plainBB = llvm::BasicBlock::Create(llvm_, "xboxfs.plain", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "xboxfs.cont", currentFn_);
+    builder_.CreateCondBr(builder_.CreateIsNotNull(thunk, "xboxfs.have"),
+                          countedBB, plainBB);
+    builder_.SetInsertPoint(countedBB);
+    builder_.CreateCall(fnTy, thunk, {fieldAddr, newVal});
+    // The thunk took the field's own reference; the +1 a producer minted for
+    // this store is this store's to drop.
+    if (producer) emitBoxRelease(newVal);
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(plainBB);
+    builder_.CreateStore(newVal, fieldAddr);
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+    return true;
+}
+
+
 // #824 / §28.5 / §28.9: is `target` an `owned` heap-collection CLASS instance
 // field lvalue (OwningArray<T>/OwningStack<T>/OwningQueue<T>/OwningSet<T>/
 // OwningLinkedList<T>/OwningBuffer<T>/OwningDictionary<T> etc.)? Classification
@@ -49785,14 +49950,25 @@ void Emitter::collectBoxStorageFields() {
 
     // PHASE 5 — add the fields that survived as box-only to boxStorageFields_.
     for (auto& [m, isOk] : ok) {
-        if (isOk) boxStorageFields_.insert(static_cast<const void*>(m));
+        // fix #8438 (§28.9 / §8.6, v0.357): a field an IMPORTER can write is
+        // not box-ONLY when the dynamic discipline is available for it. The
+        // join above is over this module's writes; an importing module's
+        // store of a class instance is one it cannot see, and the box-only
+        // field's static release would hand that value to `bz_box_release`.
+        // The field is DYNAMIC instead, and its store thunk is exported
+        // (emitExportedBoxFieldStoreThunks). A field the dynamic discipline
+        // is blocked for keeps the classification it had.
+        const bool extDyn =
+            isOk && !dynBlocked[m] && isExternallyWritableBoxField(m);
+        if (isOk && !extDyn)
+            boxStorageFields_.insert(static_cast<const void*>(m));
         // fix #8215 (§28.9 / §8.6, v0.357): a field the box-only join
         // excluded that nevertheless holds boxes (some store or the
         // initializer puts one in the slot) gets the DYNAMIC discipline
         // (dynBoxStorageFields_), provided every one of its writes is one the
         // store sites handle. Before this the field's boxes were never
         // released: every Holder leaked its last box.
-        else if (sawBox[m] && !dynBlocked[m])
+        else if ((sawBox[m] || extDyn) && !dynBlocked[m])
             dynBoxStorageFields_.insert(static_cast<const void*>(m));
     }
 }

@@ -2077,6 +2077,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // checks both the target type (Object/interface class field) and
                 // the source type (boxable value or box-return call), so a
                 // class-reference store to an Object field never reaches here.
+                // fix #8438 (§28.9 / §2.4, v0.357): a store into an IMPORTED
+                // class's Object/interface field follows the discipline its
+                // library exports for it (the weak `$boxfieldset` thunk).
+                if (!handled && as->op == ":=")
+                    handled = lowerImportedBoxFieldStore(*as->target, addr,
+                                                         rhs, as->value.get());
                 if (!handled)
                     handled = lowerBoxFieldStore(*as->target, addr, rhs,
                                                  as->value.get());
