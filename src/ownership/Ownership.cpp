@@ -1757,6 +1757,55 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // via their own machinery; routing them here would double-dispose).
     if (!isAsync_ && !sawYield_ && !isDestructor_) {
         for (sema::Symbol* sym : everOwnedPlainLocals_) {
+            // fix #8392 (§28.3.10 / K3.14, v0.357): the local is DISCHARGED
+            // at the function exit on every path that reaches it, so no
+            // implicit drop occurs there and the must-use lint's premise
+            // ("an owned value that reaches its scope's end undischarged")
+            // is false. The dataflow says so: the symbol is in `endState`
+            // with state Disposed (explicitly disposed, or RETURNED —
+            // §28.3.10's suppression 3: "it is moved or returned (no
+            // implicit drop occurs)") or MovedFrom (transferred out — the
+            // same suppression 3, and the auto-drop's own "not in
+            // moved-from state" condition). The `endState` auto-drop loop
+            // above only fires on the Owned state, so it is silent for such
+            // a local; this syntactic fallback must be silent with it.
+            //
+            // The gate is EXACTLY those two states: §28.3.10's set of
+            // suppressions is closed, so no other state may be silenced by
+            // it. In particular a BORROWED local still warns — a borrow is
+            // not a discharge ("a mere read is not a discharge"), the local
+            // still owns the value, and the implicit drop does occur at its
+            // scope end. An earlier, BROADER gate (any state != Owned)
+            // silenced that as well and regressed the accepted lit row
+            // tests/lit/sema/owning_choice_moved_from_read_4587__read_after_reassignment_accepted.bzl
+            // (its `c` is Borrowed and §35.4 requires its warning).
+            //
+            // The gate is NOT the `everDischarged_` / `definitelyRestored_`
+            // pair below: that pair is a PATH-HISTORY approximation, and
+            // `definitelyRestoredLocals_` is a NON-MONOTONE, visit-order-
+            // dependent set — a `for` loop's back edge makes the RPO visit
+            // the loop BODY after the block that discharges the local, so
+            // the body's unconditional reassignment re-inserts the symbol
+            // AFTER the discharge erased it. Measured (the issue's own
+            // repro): `var cur := new Node(); for … do cur := new Node();
+            // end; return cur;` — the dataflow's endState says `cur` is
+            // Disposed (returned on every path), yet the fallback fired
+            // the lint on it. The `if` twin of the same shape (no back
+            // edge) never fired, which is the measured difference.
+            //
+            // The scope-end DISPOSAL registration this loop performs is
+            // skipped with the warning: a local that is discharged at the
+            // exit has no implicit drop to perform, so codegen's
+            // `registerUsingDisposal` (a normal-exit + unwind disposal)
+            // is the wrong registration for it — the unwind-only
+            // `registerUnwindOwnedLocal` path (codegen's `else` arm) is
+            // the right one, and it is what the local gets when
+            // `autoDropAtScopeEnd` is NOT set. // per §28.3, v0.357
+            if (const auto es = endState.find(sym);
+                es != endState.end() &&
+                (es->second.state == OwnershipState::Disposed ||
+                 es->second.state == OwnershipState::MovedFrom))
+                continue;
             // §28.3 (#1883, #1900): the nested-scope mirror of the function-
             // exit gate — the `!st.maybeConsumed` filter the function-exit
             // gate relies on isn't computed here (this loop iterates
