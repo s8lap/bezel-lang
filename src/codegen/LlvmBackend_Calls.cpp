@@ -21875,6 +21875,42 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(), {i64(), ptrTy()});
                         return builder_.CreateCall(fn, {dticks, fmtStr}, "do.tostr");
                     }
+                    // fix #2240 (stdlib §2.5 / §2.18, v0.357): the DIRECT
+                    // spelling `d.ToString(format)` — stdlib §2.5 declares
+                    // `DateOnly.ToString(format: string): string` ("format
+                    // vocabulary: §2.18"), and §18.5's "Format dispatch" says
+                    // the temporal types provide that member INTRINSICALLY. The
+                    // member existed in the builtin's declaration table (so
+                    // sema admitted the call) but had NO codegen arm, so the
+                    // call fell through every arm to codegen's §8.1 gate and
+                    // was rejected with "member `ToString` on `DateOnly` is
+                    // declared via the universal Object contract … not yet
+                    // implemented … (tracked #2457)".
+                    //
+                    // THE SAME RUNTIME, THE SAME WIDENING. This is the
+                    // interpolation hole's `bz_datetime_to_string_fmt` call
+                    // (LlvmBackend_String.cpp's emitWithFormatSpec), reached
+                    // with the DateOnly day-number widened to ticks exactly as
+                    // that path widens it — so the two spellings of ONE rule
+                    // (§2.18's vocabulary) cannot disagree, which is this
+                    // repo's standing lesson. A malformed specifier run
+                    // ("yyy", "MMM", a lone "s", …) makes the runtime return
+                    // nullptr, and the call site raises FormatException
+                    // (§2.18 strict-fault; §18.5).
+                    if (mname == "ToString" && call.args.size() == 1 &&
+                        call.args[0].value) {
+                        llvm::Value* fmtStr = lowerExpr(*call.args[0].value);
+                        if (!fmtStr) return nullptr;
+                        llvm::Value* dn64 = builder_.CreateSExt(dayNum, i64(), "do.fmt.dn64");
+                        llvm::Value* tpd = builder_.getInt64(864000000000LL);
+                        llvm::Value* dticks = builder_.CreateMul(dn64, tpd, "do.fmt.ticks");
+                        auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(), {i64(), ptrTy()});
+                        llvm::Value* res = builder_.CreateCall(fn, {dticks, fmtStr}, "do.tostr.fmt");
+                        llvm::Value* isNull = builder_.CreateICmpEQ(
+                            res, llvm::Constant::getNullValue(ptrTy()), "do.fmt.null");
+                        emitGuardThrow(isNull, "FormatException");
+                        return res;
+                    }
                     // ToDateTime(time: TimeOnly): DateTime — merge day number and ms.
                     if (mname == "ToDateTime" && call.args.size() == 1 && call.args[0].value) {
                         llvm::Value* ms = lowerExpr(*call.args[0].value);
@@ -22052,6 +22088,38 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     if (mname == "ToString" && call.args.empty()) {
                         auto* fn = declareC("bz_timeonly_to_string", ptrTy(), {i32()});
                         return builder_.CreateCall(fn, {ms}, "to.tostr");
+                    }
+                    // fix #2240 (stdlib §2.5 / §2.18, v0.357): the DIRECT
+                    // spelling `t.ToString(format)` — stdlib §2.5 declares
+                    // `TimeOnly.ToString(format: string): string` ("format
+                    // vocabulary: §2.18"), and §18.5's "Format dispatch" says
+                    // the temporal types provide that member INTRINSICALLY. The
+                    // member existed in the builtin's declaration table (so
+                    // sema admitted the call) but had NO codegen arm, so the
+                    // call fell through every arm to codegen's §8.1 gate and
+                    // was rejected with "member `ToString` on `TimeOnly` is
+                    // declared via the universal Object contract … not yet
+                    // implemented … (tracked #2457)".
+                    //
+                    // THE SAME RUNTIME AS THE HOLE. §18.5 makes the
+                    // interpolation hole a `ToString(format)` call, so the two
+                    // spellings must render the same string: this calls
+                    // bz_timeonly_to_string_fmt, the same function the hole's
+                    // dispatch calls (LlvmBackend_String.cpp's
+                    // emitWithFormatSpec). A malformed specifier run makes the
+                    // runtime return nullptr and the call site raises
+                    // FormatException (§2.18 strict-fault; §18.5).
+                    if (mname == "ToString" && call.args.size() == 1 &&
+                        call.args[0].value) {
+                        llvm::Value* fmtStr = lowerExpr(*call.args[0].value);
+                        if (!fmtStr) return nullptr;
+                        auto* fn = declareC("bz_timeonly_to_string_fmt", ptrTy(),
+                                            {i32(), ptrTy()});
+                        llvm::Value* res = builder_.CreateCall(fn, {ms, fmtStr}, "to.tostr.fmt");
+                        llvm::Value* isNull = builder_.CreateICmpEQ(
+                            res, llvm::Constant::getNullValue(ptrTy()), "to.fmt.null");
+                        emitGuardThrow(isNull, "FormatException");
+                        return res;
                     }
                 }
             }

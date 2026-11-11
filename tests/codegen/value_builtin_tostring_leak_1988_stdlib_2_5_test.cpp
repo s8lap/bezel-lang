@@ -156,3 +156,39 @@ BEZEL_TEST(value_builtin_tostring_leak_1988,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
+
+// =====================================================================
+// (G) DateOnly.ToString(format) — fix #2240 (stdlib §2.5 / §2.18, v0.357).
+// The v0.227 stdlib clarification DECLARED `DateOnly.ToString(format: string):
+// string`; the compiler lowered it to a runtime that mints a fresh rc := 1 heap
+// string (bz_datetime_to_string_fmt), so `isPlusOneStringProducer` must
+// recognize the ONE-argument spelling too — otherwise the consumer reads the
+// result as a BORROW (retain at bind, release at scope end) and the producer's
+// original +1 leaks, exactly as the no-arg form did in #1988.
+// =====================================================================
+BEZEL_TEST(value_builtin_tostring_leak_1988,
+           dateonly_tostring_format_lsan_clean_stdlib_2_5) {
+    JitResult r = runAotChecked(loopCount(
+        "var v := new DateOnly(2024, 3, 15); ",
+        "v.ToString(\"yyyy-MM-dd\")", "2024-03-15"));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 40);
+}
+
+// =====================================================================
+// (H) TimeOnly.ToString(format) — fix #2240 (stdlib §2.5 / §2.18, v0.357).
+// The SAME rc := 1 producer shape as (G), through bz_timeonly_to_string_fmt.
+// The millisecond component is non-zero on purpose: the pattern renders the
+// value's own time-of-day components (§2.18's "Temporal field widths"), so the
+// expected text also pins the rendering, not only the leak-freedom.
+// =====================================================================
+BEZEL_TEST(value_builtin_tostring_leak_1988,
+           timeonly_tostring_format_lsan_clean_stdlib_2_5) {
+    JitResult r = runAotChecked(loopCount(
+        "var v := new TimeOnly(13, 45, 30, 125); ",
+        "v.ToString(\"HH:mm:ss.fff\")", "13:45:30.125"));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 40);
+}

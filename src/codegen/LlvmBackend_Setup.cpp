@@ -27842,8 +27842,9 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
         // receiver this arm admits is exactly a receiver the `.` arm already
         // calls a +1 producer. The ARITY follows the `.` arms too: no argument
         // for every head in the family, one argument (the format specifier)
-        // only for the three heads that declare a `ToString(format)` overload
-        // (Guid / DateTime / TimeSpan).
+        // only for the heads that declare a `ToString(format)` overload
+        // (Guid / DateTime / TimeSpan / DateOnly / TimeOnly — the last two
+        // since fix #2240, stdlib §2.5 v0.357).
         if (call->callee) {
             if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
                     call->callee.get())) {
@@ -27859,7 +27860,8 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                             return true;
                         if (call->args.size() == 1 &&
                             (bn == "Guid" || bn == "DateTime" ||
-                             bn == "TimeSpan"))
+                             bn == "TimeSpan" || bn == "DateOnly" ||
+                             bn == "TimeOnly"))
                             return true;
                     }
                 }
@@ -28286,9 +28288,12 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // non-escaping) drops it exactly once. No double-free: each runtime mints
     // exactly rc = 1, no extra retain is emitted, and an escaping local is excluded
     // from the scope-end release (its +1 then leaks — the safe direction). Only the
-    // no-arg overload (all four) and DateTime's ToString(format) are recognized:
-    // those are the ONLY ToString forms lowerCall lowers to a +1 producer for these
-    // types (TimeSpan: bz_timespan_to_string_fmt, #6720; DateOnly/TimeOnly have none).
+    // no-arg overload (all four) and the format overloads are recognized:
+    // those are the ONLY ToString forms lowerCall lowers to a +1 producer for
+    // these types (TimeSpan: bz_timespan_to_string_fmt, #6720; DateTime /
+    // DateOnly: bz_datetime_to_string_fmt; TimeOnly: bz_timeonly_to_string /
+    // bz_timeonly_to_string_fmt — the format overloads since fix #2240,
+    // stdlib §2.5 v0.357).
     if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
         if (call->callee) {
             if (auto* ma =
@@ -28303,10 +28308,19 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                              bn == "DateOnly" || bn == "TimeOnly"))
                             return true;
                         // DateTime.ToString(format): the SAME rc=1
-                        // bz_datetime_to_string_fmt runtime; TimeSpan/DateOnly/
-                        // TimeOnly have no format overload.
+                        // bz_datetime_to_string_fmt runtime; TimeSpan/
+                        // DateOnly/TimeOnly now have their format overload too
+                        // (fix #2240, stdlib §2.5 v0.357: DateOnly's format
+                        // overload lowers to bz_datetime_to_string_fmt,
+                        // TimeOnly's to bz_timeonly_to_string_fmt — both mint a
+                        // fresh rc=1 heap string exactly like their no-arg
+                        // forms). Without this the 1-argument spelling was
+                        // read as a BORROW: the bind retained the string
+                        // (rc 1 -> 2), the scope-end release dropped the borrow
+                        // (rc 2 -> 1), and the producer's original +1 leaked.
                         if (call->args.size() == 1 &&
-                            (bn == "DateTime" || bn == "TimeSpan"))
+                            (bn == "DateTime" || bn == "TimeSpan" ||
+                             bn == "DateOnly" || bn == "TimeOnly"))
                             return true;  // TimeSpan: #6720 bz_timespan_to_string_fmt
                         // #1989 / stdlib §2.6/§2.18: Guid.ToString(format) — the
                         // format overload lowers (LlvmBackend_Calls.cpp Guid block)

@@ -330,13 +330,20 @@ end Main; end C;
 }
 
 // ── DATEONLY / TIMEONLY COVERAGE (§2.18 v0.230) ──────────────────────────────
-// DateOnly / TimeOnly share the same bz_datetime_to_string_fmt runtime path
-// after day-number / ms-of-day are widened to ticks (via the interpolation
-// format spec dispatcher in LlvmBackend_String.cpp). The fix must apply
-// identically. (DateOnly/TimeOnly do not have a `ToString(format)` member
-// declared in stdlib §2.5 — only `ToString()` no-arg — so we exercise the
-// runtime through the §18.5 string-interpolation format spec, which is the
-// same dispatcher.)
+// DateOnly / TimeOnly share the same §2.18 temporal-pattern vocabulary as
+// DateTime, through the runtime's pattern formatter (the DateOnly's day-number
+// and the TimeOnly's time of day are the components it renders). The fix must
+// apply identically.
+//
+// (STALE COMMENT CORRECTED by #2240, stdlib §2.5 v0.357: this file used to
+// read "DateOnly/TimeOnly do not have a `ToString(format)` member declared in
+// stdlib §2.5 — only `ToString()` no-arg". That was true of the DOC as it
+// stood before the v0.227 clarification, which added
+// `DateOnly.ToString(format: string): string` and
+// `TimeOnly.ToString(format: string): string` to §2.5. The compiler now
+// implements both; the direct member call is pinned by
+// tests/codegen/temporal_tostring_format_2240_stdlib_2_5_test.cpp. The rows
+// below stay on the interpolation spelling, which §18.5 makes the same call.)
 BEZEL_TEST(datetime_format_malformed_run_3292, dateonly_interpolation_malformed_M_faults) {
     // DateOnly's valid month specifier is "MM" (length 2). "M" (length 1) is
     // a malformed run on DateOnly exactly as on DateTime.

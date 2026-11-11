@@ -324,10 +324,37 @@ static void fmt_int(char* buf, int* pos, int32_t val, int width) {
     for (int i = 0; i < n; ++i) buf[(*pos)++] = tmp[i];
 }
 
-// per §2.5 / §2.18 (v0.230) / #648: ToString(format: string): string — format
-// a DateTime tick value using a temporal pattern. Per stdlib §2.18's
-// "Temporal patterns: non-specifier characters are literals" paragraph, the
-// ONLY well-formed specifier runs in the Bezel vocabulary are:
+// fix #2240 (stdlib §2.18, v0.357): the FORMAT STRING of a temporal pattern,
+// read the ONE way, for every temporal type that renders a pattern.
+//
+// A pattern argument is a Bezel `string` (a `bz_string_hdr`: data / len /
+// width / rc). The pattern is read only when the header is usable — `data`
+// non-null and `width == 1` (every `bz_string` the runtime mints has
+// `width == 1`; the only other width in the runtime is the JSON serializer's
+// own buffer, which is not a Bezel string). Otherwise the pattern is the EMPTY
+// pattern.
+//
+// WHY THIS IS A HELPER AND NOT INLINE CODE: the previous form read
+// `fh->len` while pointing `fmt` at "" whenever the header was unusable, so a
+// non-usable header with a non-zero `len` made the pattern loop read past
+// the one-byte "" literal — an out-of-bounds read. Unreachable from Bezel
+// code (every Bezel `string` is width 1 with non-null data), but the two
+// callers must not each spell the guard differently.
+static void temporal_pattern_of(const void* fmt_p, const char*& fmt,
+                                int64_t& flen) {
+    const bz_string_hdr* fh = (const bz_string_hdr*)fmt_p;
+    if (fh && fh->data && fh->width == 1) {
+        fmt = fh->data;
+        flen = fh->len;
+    } else {
+        fmt = "";
+        flen = 0;
+    }
+}
+
+// Per stdlib §2.18's "Temporal patterns: non-specifier characters are
+// literals" paragraph (v0.230 / #648 / #3292), the ONLY well-formed specifier
+// runs in the Bezel vocabulary are:
 //   yyyy  → 4-digit year
 //   MM    → 2-digit month (01-12)
 //   dd    → 2-digit day (01-31)
@@ -342,22 +369,27 @@ static void fmt_int(char* buf, int* pos, int32_t val, int width) {
 // must match exactly. A malformed run is a strict-fault (return nullptr →
 // FormatException via caller; §2.18 strict-fault, §18.5 hole parsing). This
 // is the v0.230 catch-up for #3292.
-// Returns a fresh heap-allocated bz_string (rc=1), or nullptr on a malformed
-// specifier run.
-extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
-    int32_t yr, mo, dy, hr, mn, sc, ms;
-    bz_datetime_ticks_to_parts(ticks, &yr, &mo, &dy, &hr, &mn, &sc, &ms);
-
-    const bz_string_hdr* fh = (const bz_string_hdr*)fmt_p;
-    const char* fmt = (fh && fh->data && fh->width == 1) ? fh->data : "";
-    int64_t flen = fh ? fh->len : (int64_t)strlen(fmt);
-
-    // Max output: every char can expand to at most 4 digits (yyyy) + separators.
-    int outCap = (int)(flen * 4 + 4);
-    if (outCap < 32) outCap = 32;
-    char* out = (char*)malloc((size_t)outCap + 1);
+//
+// fix #2240 (stdlib §2.18, v0.357): the TEMPORAL PATTERN VOCABULARY, in ONE
+// implementation, shared by every temporal type that renders a pattern.
+//
+// The vocabulary itself (which runs are well-formed, which characters are
+// literals, what each field renders) is §2.18's, and it must not be spelled
+// twice: `DateTime`/`DateOnly` and `TimeOnly` share it, and the DIRECT member
+// call `x.ToString(format)` and the INTERPOLATION hole `$"{x:format}"` must
+// render the same string (spec §18.5's "Format dispatch" makes the hole a
+// `ToString(format)` call). Before this helper existed the pattern loop lived
+// inside `bz_datetime_to_string_fmt` alone, so a `TimeOnly` had to be widened
+// to an absolute DateTime tick value to reach it — and that widening LOST the
+// value's own sub-second component (see `bz_timeonly_to_string_fmt` below).
+//
+// Returns the number of bytes written, or -1 on a MALFORMED SPECIFIER RUN
+// (§2.18's strict-fault: the caller raises FormatException).
+static int fmt_temporal_pattern(char* out, int64_t flen, const char* fmt,
+                                int32_t yr, int32_t mo, int32_t dy,
+                                int32_t hr, int32_t mn, int32_t sc,
+                                int32_t ms) {
     int pos = 0;
-
     for (int64_t i = 0; i < flen; ) {
         char ch = fmt[i];
         // Expected run length per specifier letter; -1 means "not a specifier".
@@ -385,10 +417,9 @@ extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
         int64_t runLen = j - i;
         if (runLen != (int64_t)expected) {
             // Malformed specifier run (per §2.18 v0.230, #3292): e.g. "yyy",
-            // "MMM", "s". Signal the fault by returning nullptr; the caller
+            // "MMM", "s". Signal the fault by returning -1; the caller
             // raises FormatException (§2.18 strict-fault, §18.5 hole parsing).
-            free(out);
-            return nullptr;
+            return -1;
         }
         switch (ch) {
             case 'y': fmt_int(out, &pos, yr, 4); break;
@@ -402,7 +433,11 @@ extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
         }
         i = j;
     }
+    return pos;
+}
 
+// Build a fresh bz_string (rc=1, §4.6 layout) from `out`/`pos`.
+static void* bz_make_temporal_string(char* out, int pos) {
     // fix #6806: NUL-terminate. The aligned-hole path (`$"{dt,21}"`) hands
     // `data` to a `%s` snprintf, which read past the unterminated buffer.
     out[pos] = '\0';
@@ -413,6 +448,84 @@ extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
     sh->width = 1;
     sh->rc    = 1;  // producer's reference (§4.6)
     return sh;
+}
+
+// per §2.5 / §2.18 (v0.230) / #648: ToString(format: string): string — format
+// a DateTime tick value using a temporal pattern (the vocabulary is §2.18's,
+// spelled once in `fmt_temporal_pattern` below).
+// Returns a fresh heap-allocated bz_string (rc=1), or nullptr on a malformed
+// specifier run.
+extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
+    int32_t yr, mo, dy, hr, mn, sc, ms;
+    bz_datetime_ticks_to_parts(ticks, &yr, &mo, &dy, &hr, &mn, &sc, &ms);
+
+    const char* fmt;
+    int64_t flen;
+    temporal_pattern_of(fmt_p, fmt, flen);
+
+    // Max output: every char can expand to at most 4 digits (yyyy) + separators.
+    int outCap = (int)(flen * 4 + 4);
+    if (outCap < 32) outCap = 32;
+    char* out = (char*)malloc((size_t)outCap + 1);
+
+    int pos = fmt_temporal_pattern(out, flen, fmt, yr, mo, dy, hr, mn, sc, ms);
+    if (pos < 0) {
+        free(out);
+        return nullptr;
+    }
+    return bz_make_temporal_string(out, pos);
+}
+
+// fix #2240 (stdlib §2.5 / §2.18, v0.357): ToString(format) for a `TimeOnly`.
+//
+// A `TimeOnly` is a TIME OF DAY (stdlib §2.5: "HH:mm:ss"), not an instant, so
+// its pattern fields are its own components: `HH` the hour, `mm` the minute,
+// `ss` the second, `fff` the millisecond — each the value §2.18's "Temporal
+// field widths" paragraph names. The DATE fields (`yyyy`, `MM`, `dd`) have no
+// source in a `TimeOnly`; they render the library's epoch day (0001-01-01),
+// which is the reading the day-number widening produced before this function
+// existed (recorded in the #2240 commit body).
+//
+// WHY THIS IS NOT THE OLD WIDENING. The previous implementation widened a
+// `TimeOnly`'s ms-of-midnight to an absolute DateTime tick value
+// (`ms * 10000`) and called `bz_datetime_to_string_fmt` on it. That tick
+// value is BELOW the runtime's POSIX origin, and `bz_datetime_ticks_to_parts`
+// divides the difference with C's truncation-toward-zero, so a value with a
+// non-zero millisecond component came back with a NEGATIVE sub-second
+// remainder and a second that had borrowed from the next minute: MEASURED,
+// `new TimeOnly(13, 5, 9, 7)` rendered "13:05:10.-993" through BOTH the
+// interpolation hole and the direct member call, while the type's own
+// no-format `ToString()` rendered "13:05:09" (§2.5's "HH:mm:ss"). The
+// decomposition of a time-of-day is a decomposition of the time-of-day, so it
+// is done here, in the time-of-day's own units.
+//
+// Returns a fresh heap-allocated bz_string (rc=1), or nullptr on a malformed
+// specifier run (§2.18 strict-fault).
+extern "C" void* bz_timeonly_to_string_fmt(int32_t ms_from_midnight,
+                                            const void* fmt_p) {
+    const char* fmt;
+    int64_t flen;
+    temporal_pattern_of(fmt_p, fmt, flen);
+
+    int32_t rest = ms_from_midnight;
+    if (rest < 0) rest = 0;
+    int32_t hr  = rest / 3600000; rest %= 3600000;
+    int32_t mn  = rest / 60000;    rest %= 60000;
+    int32_t sc  = rest / 1000;
+    int32_t ms  = rest % 1000;
+
+    int outCap = (int)(flen * 4 + 4);
+    if (outCap < 32) outCap = 32;
+    char* out = (char*)malloc((size_t)outCap + 1);
+
+    int pos = fmt_temporal_pattern(out, flen, fmt,
+                                   /*yr=*/1, /*mo=*/1, /*dy=*/1,
+                                   hr, mn, sc, ms);
+    if (pos < 0) {
+        free(out);
+        return nullptr;
+    }
+    return bz_make_temporal_string(out, pos);
 }
 
 // Write the decimal digits of the unsigned mantissa `m` into `buf`, most

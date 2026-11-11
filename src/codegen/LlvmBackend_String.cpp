@@ -745,14 +745,26 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
                 return res;
             }
             if (bn == "TimeOnly" && val->getType()->isIntegerTy()) {
+                // fix #2240 (stdlib §2.5 / §2.18, v0.357): a `TimeOnly` is a
+                // TIME OF DAY, so its pattern fields are its own components.
+                // This used to widen the ms-of-midnight to an absolute
+                // DateTime tick value and format THAT; the runtime's
+                // decomposition of a pre-POSIX tick value truncates toward
+                // zero, so a value with a non-zero millisecond component came
+                // back with a negative sub-second remainder and a borrowed
+                // second — MEASURED, `new TimeOnly(13, 5, 9, 7)` rendered
+                // "13:05:10.-993" here while the type's own no-format
+                // `ToString()` rendered "13:05:09" (§2.5's "HH:mm:ss").
+                // bz_timeonly_to_string_fmt decomposes the time of day in the
+                // time of day's own units; the DIRECT member call
+                // `t.ToString(format)` (LlvmBackend_Calls.cpp) calls the SAME
+                // function, so the two spellings of §18.5's one rule cannot
+                // disagree.
                 llvm::Value* ms = val->getType()->isIntegerTy(32)
                     ? val : builder_.CreateTrunc(val, i32());
-                llvm::Value* ticks = builder_.CreateMul(
-                    builder_.CreateSExt(ms, i64()),
-                    builder_.getInt64(10000LL));          // TICKS_PER_MS
-                auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
-                                    {i64(), ptrTy()});
-                llvm::Value* res = builder_.CreateCall(fn, {ticks, fmtStr}, "to.fmt");
+                auto* fn = declareC("bz_timeonly_to_string_fmt", ptrTy(),
+                                    {i32(), ptrTy()});
+                llvm::Value* res = builder_.CreateCall(fn, {ms, fmtStr}, "to.fmt");
                 llvm::Value* isNull = builder_.CreateICmpEQ(
                     res, llvm::Constant::getNullValue(ptrTy()), "to.fmt.null");
                 emitGuardThrow(isNull, "FormatException");

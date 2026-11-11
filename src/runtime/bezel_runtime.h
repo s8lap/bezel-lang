@@ -860,6 +860,10 @@ double bz_timespan_total_milliseconds(int64_t ticks);
 
 // Format ms_from_midnight as "HH:mm:ss" → fresh heap bz_string* (rc=1).
 void* bz_timeonly_to_string(int32_t ms_from_midnight);
+// fix #2240 (stdlib §2.5 / §2.18, v0.357): format a `TimeOnly`'s time of day
+// with a §2.18 temporal pattern → fresh heap bz_string* (rc=1), or nullptr on
+// a malformed specifier run (§2.18 strict-fault → FormatException).
+void* bz_timeonly_to_string_fmt(int32_t ms_from_midnight, const void* fmt_p);
 // Parse "HH:mm:ss" or "HH:mm:ss.fff" from a bz_string*. Returns 1 on success
 // (writes *out_ms in [0..86399999]), 0 on failure.
 int32_t bz_timeonly_try_parse(const void* str, int32_t* out_ms);
