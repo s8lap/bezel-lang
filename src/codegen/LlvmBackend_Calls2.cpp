@@ -25129,9 +25129,107 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
     const ast::CallExpr& call, const ast::NullCondMemberExpr& nm) {
     const sema::TypeRef* callTy = ctx_.exprType(call);
     const sema::TypeRef* rcvTy = ctx_.exprType(*nm.target);
+    // fix #8455 (spec §7.5, stdlib §4.4, v0.357): the `?.` spelling of an
+    // IN-PLACE collection mutator — `a?.Sort(cmp)`, `a?.Sort()`, `a?.Reverse()`,
+    // `a?.Clear()`, `a?.Add(x)` on an `Array<T>?` — lowered to NOTHING, so the
+    // mutator never ran. MEASURED (issue #8455's repro): `n?.Sort(lambda(x: W,
+    // y: W): int => x.K.CompareTo(y.K));` on a NON-NULL `Array<W>?` printed
+    // `b c a` where §7.5 requires `a b c` — the array was never sorted, and the
+    // program exited 0 with no diagnostic.
+    //
+    // WHY. Sema types the `?.` call by LIFTING the `.` twin's type to nullable
+    // (§7.5: "the result type is always nullable"). A mutator that returns
+    // NOTHING has no type to lift — §4.7 makes the unit type non-nullable, and
+    // the twin's type IS the unit type — so the `?.` call stays UNTYPED:
+    // `ctx_.exprType(call)` is null, and the guard below declined the whole
+    // call. The `.` spelling is unaffected: its result is the unit marker the
+    // collection arms return (`ConstantInt::get(i32(), 0)`), which no consumer
+    // reads. The value-returning `?.` builtins are unaffected too: sema types
+    // them (`a?.Count()` is `int?`), so they take the path below.
+    //
+    // THE FIX. §7.5: "`x?.M` resolves `M` as `x.M` does", and "the receiver is
+    // evaluated first; if it is null the access does not occur". So: lower the
+    // receiver ONCE, test it for null, and on the present edge run the `.`
+    // spelling's OWN lowering over a synthetic `.` call whose receiver is a
+    // placeholder PINNED to the already-lowered receiver — the same shape the
+    // value-returning `?.` builtins use below (#6529). The mutator then acts
+    // on the receiver ITSELF (the pinned value IS the array), so the sort is
+    // IN PLACE.
+    //
+    // The result is the unit result the `.` spelling returns — the collection
+    // arms' marker — on BOTH edges: §4.7 gives the unit type exactly one
+    // value, so the null edge (no call) and the present edge (the call) agree.
+    if (!callTy) {
+        // The stdlib §4.4 mutators that return nothing ("the imperative-verb
+        // form mutates the receiver in place and returns nothing"). `Drain` is
+        // NOT here: sema leaves it untyped on purpose (the §21.1 `const`
+        // rejection is keyed on an untyped call — #2767), and its `.` spelling
+        // has its own `?.` handling (LlvmBackend_Calls2.cpp's Drain arms).
+        const std::string_view m = nm.member;
+        const bool unitMutator =
+            m == "Sort" || m == "Reverse" || m == "Clear" ||
+            m == "Add" || m == "AddRange" || m == "Insert" || m == "RemoveAt";
+        // The receiver must be a COLLECTION (stdlib §4.4 `Array<T>` and the
+        // other array-backed heads, or a dict-backed one); a user class keeps
+        // the old behaviour.
+        const bool collRcv =
+            rcvTy && (isCollectionTypeName(rcvTy) || isDictTypeName(rcvTy));
+        if (!unitMutator || !collRcv || !nm.target) return nullptr;
+        llvm::Value* rcv = lowerExpr(*nm.target);
+        if (!rcv || !rcv->getType()->isPointerTy()) return nullptr;
+        auto* accessBB = llvm::BasicBlock::Create(llvm_, "ncum.access", currentFn_);
+        auto* endBB = llvm::BasicBlock::Create(llvm_, "ncum.end", currentFn_);
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(rcv, llvm::ConstantPointerNull::get(ptrTy())),
+            endBB, accessBB);
+        builder_.SetInsertPoint(accessBB);
+        // The placeholder stands for the PRESENT receiver: the NON-nullable
+        // receiver type (the `?.` twin sees the value, not the null — the same
+        // typing sema's own twin uses) and the already-lowered receiver value
+        // PINNED into it, so the receiver is evaluated exactly once (§7.5).
+        auto placeholder = std::make_unique<ast::IdentifierExpr>();
+        placeholder->name = "<nullcond-receiver>";  // unspellable (#6681)
+        placeholder->span = nm.target->span;
+        sema::TypeRef* placeholderTy = ctx_.makeTypeRef(*rcvTy);
+        placeholderTy->nullable = false;
+        ctx_.setExprType(placeholder.get(), placeholderTy);
+        // fix #7458 (§7.5, §28.2): the placeholder stands for the real `?.`
+        // target, so it carries the target's symbol (the `.` twin's ownership
+        // classifiers key on the receiver node's symbol).
+        if (sema::Symbol* targetSym = ctx_.exprSymbol(*nm.target))
+            ctx_.setExprSymbol(placeholder.get(), targetSym);
+        exprValueOverride_[placeholder.get()] = rcv;
+        const ast::Expr* placeholderKey = placeholder.get();
+        auto dotted = std::make_unique<ast::MemberAccessExpr>();
+        dotted->span = nm.span;
+        dotted->member = nm.member;
+        dotted->target = std::move(placeholder);
+        auto synth = std::make_unique<ast::CallExpr>();
+        synth->span = call.span;
+        synth->callee = std::move(dotted);
+        // fix #7730 (§22.5): sema publishes the named-argument binding keyed on
+        // the CallExpr it checked (the `?.` call); the `.` twin is a fresh node
+        // and needs its own copy.
+        if (const auto* bnd = ctx_.builtinCallBinding(call))
+            ctx_.setBuiltinCallBinding(synth.get(), *bnd);
+        auto& mutCall = const_cast<ast::CallExpr&>(call);
+        synth->args = std::move(mutCall.args);
+        llvm::Value* inner = lowerExpr(*synth);
+        mutCall.args = std::move(synth->args);
+        exprValueOverride_.erase(placeholderKey);
+        nullCondGroupingCallSynth_.push_back(std::move(synth));
+        if (!diverged_) builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        // The unit result: the `.` spelling's own unit marker. A twin that
+        // did not recognise the shape (no marker) leaves the old
+        // "lowered to nothing" result standing.
+        if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(inner))
+            if (ci->isZero() && ci->getBitWidth() == 32) return inner;
+        return nullptr;
+    }
     // sema must have typed the call as a present-able `T?`; otherwise there is
     // nothing to lift to (void / untyped) and the old nullptr result stands.
-    if (!callTy || !callTy->nullable || !rcvTy) return nullptr;
+    if (!callTy->nullable || !rcvTy) return nullptr;
     // A nullable VALUE receiver (`int?`, record?) is a tagged struct and is not
     // this fix's population -- except the builtin time/Guid value records.
     //
