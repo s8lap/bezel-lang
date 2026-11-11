@@ -3370,6 +3370,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
             }
             if (!v) v = lowerExpr(*rs->value);
+            // fix #6557 follow-up (§28.11, §28.9, v0.357): `return arr[i];`
+            // out of a co-owning array that dies at this return gives the
+            // returned copy its own references on the strings it embeds,
+            // before the disposals below free the array (see
+            // retainCoOwnedArrayCopyOutForReturn).
+            if (v) retainCoOwnedArrayCopyOutForReturn(rs->value.get(), v);
             // fix #6452 (§28.3 *Returning a deferred-activation frame* / §29.2 /
             // §29.1 / §28.6; stdlib §4.5 / §4.13, v0.338): the RETURN face of
             // the builtin `recv.Drain()` view. #4750 / #4772 gave the

@@ -17292,6 +17292,10 @@ private:
     void bindCoOwnedArrayCopyOut(const ast::Node* declNode,
                                  const ast::Expr* src, llvm::Value* v,
                                  bool isDecl);
+    // fix #6557 follow-up: the RETURN face of the same copy-out — see
+    // `retainCoOwnedArrayCopyOutForReturn` (LlvmBackend_Assign.cpp).
+    void retainCoOwnedArrayCopyOutForReturn(const ast::Expr* src,
+                                            llvm::Value* v);
 
     // fix #4135 (§27.5 / §28.9, stdlib §4.9, v0.295): is `rt` a
     // DrainedEntry<K,V> type from lowerDictDrainFor (the for-loop-variable

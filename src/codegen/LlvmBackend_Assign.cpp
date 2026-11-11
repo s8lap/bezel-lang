@@ -711,6 +711,94 @@ void Emitter::bindCoOwnedArrayCopyOut(const ast::Node* declNode,
     builder_.CreateCall(fn, {recv, shadow, builder_.getInt64(esz)});
 }
 
+// fix #6557 follow-up (§28.11 *The element slot policy*, §28.9, v0.357): the
+// RETURN face of the copy-out above — `return arr[i];` where `arr` is a LOCAL
+// (or a temporary) of the returning method.
+//
+// THE RULE is the one `bindCoOwnedArrayCopyOut` cites: §28.11's indexer-get
+// row "copy out (a runtime-managed reference the copy holds — a
+// `DictionaryEntry<string, V>`'s `Key` — keeps §28.9's unbounded lifetime
+// through every later mutation or disposal of the collection)".
+//
+// THE DEFECT. A by-value return is a bit copy that touches no refcount, so
+//     var arr := MakeDict().ToArray();  return arr[0];
+// handed the caller the bytes of a slot whose strings the co-owning `arr`
+// gave back when it was disposed at that same return: the caller received a
+// DANGLING Key. Reading it was a use-after-free on every revision; since #6557
+// (the stamp survives `Clear`, and a user-built array is stamped at `new`) a
+// caller that merely STORES it — `arr.Clear(); arr.Add(P.MakeEntry());
+// arr.Clear();` — has the array retain and then release freed memory
+// (`free(): invalid pointer`; ASan: SEGV in `bz_string_release` <-
+// `bz_array_clear`).
+//
+// THE MECHANISM. Before the return's scope-end disposals run (they are emitted
+// after the value is lowered), one reference per embedded string is taken on
+// behalf of the returned copy, through `bz_array_coown_copy_out` on a scratch
+// copy of the value: the scratch holds the same string pointers, so the
+// references are the returned value's; the runtime takes them only when the
+// array is, at run time, a co-owner of its slots (the stamp — an unstamped
+// array vouches for nothing), and otherwise zeroes the scratch, which is then
+// simply dropped. The returned value itself is never modified.
+//
+// SCOPE, deliberately narrow (recorded interpretation). Only a receiver that
+// dies at this return — a local of the method, or a temporary such as
+// `MakeDict().ToArray()` — is covered: there the slot's reference is gone the
+// moment the method returns, so the copy MUST hold its own. A receiver that
+// outlives the call (a parameter, a field, `this.items`) still returns the
+// pre-fix borrow: retaining there would add a reference no caller releases to
+// every getter call, and the remaining hazard (the caller mutating the array
+// while it holds the copy) is #6566's. No caller releases the reference taken
+// here — a by-value result has no caller-side string release (the same
+// safe-direction leak as an unbound `d.First()` entry, #8267) — so the cost of
+// the fix is one retained string per such call, in exchange for a live Key.
+// A state-machine body is excluded for the same reason `bindCoOwnedArrayCopyOut`
+// excludes it.
+void Emitter::retainCoOwnedArrayCopyOutForReturn(const ast::Expr* src,
+                                                 llvm::Value* v) {
+    const ast::Expr* readExpr = lastArrayElemReadExpr_;
+    llvm::Value* recv = lastArrayElemReadRecv_;
+    const sema::TypeRef* et = lastArrayElemReadElemTy_;
+    const int64_t esz = lastArrayElemReadEsz_;
+    lastArrayElemReadExpr_ = nullptr;
+    lastArrayElemReadRecv_ = nullptr;
+    lastArrayElemReadElemTy_ = nullptr;
+    lastArrayElemReadEsz_ = 0;
+    if (!src || !v || !recv || !et || src != readExpr) return;
+    if (smStateStruct_ || !currentFn_ || !builder_.GetInsertBlock()) return;
+    auto* ix = dynamic_cast<const ast::IndexExpr*>(src);
+    if (!ix || !ix->target) return;
+    const ast::Expr* tgt = ix->target.get();
+    bool receiverDiesHere = false;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt))
+        receiverDiesHere =
+            dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)) != nullptr;
+    else if (dynamic_cast<const ast::CallExpr*>(tgt))
+        receiverDiesHere = true;
+    if (!receiverDiesHere) return;
+    if (auto* ri = llvm::dyn_cast<llvm::Instruction>(recv)) {
+        if (ri->getFunction() != currentFn_) return;
+    } else if (auto* ra = llvm::dyn_cast<llvm::Argument>(recv)) {
+        if (ra->getParent() != currentFn_) return;
+    } else {
+        return;
+    }
+    llvm::Type* ety = lowerTypeRef(et);
+    auto* est = llvm::dyn_cast_or_null<llvm::StructType>(ety);
+    if (!est || v->getType() != ety) return;
+    if (esz != static_cast<int64_t>(
+                   module_->getDataLayout().getTypeAllocSize(ety)))
+        return;
+    if (isDictEntryStringKeyTypeRef(et) &&
+        (est->getNumElements() == 0 || !est->getElementType(0)->isPointerTy()))
+        return;
+    llvm::AllocaInst* scratch = entryAlloca(ety);
+    builder_.CreateStore(v, scratch);
+    auto* fn = declareC("bz_array_coown_copy_out",
+                        llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), i64()});
+    builder_.CreateCall(fn, {recv, scratch, builder_.getInt64(esz)});
+}
+
 llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return nullptr;
