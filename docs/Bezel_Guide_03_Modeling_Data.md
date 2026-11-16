@@ -1,8 +1,8 @@
 # Bezel Guide 3: Modeling Data
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.326.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.359.*
 
-Bezel gives you five ways to declare a data shape and two ways to select over one. This guide is the picking rule for each. The definitions live in the spec (§9 records, §10 enums, §11 classes, §19 selection, §35 choices), and the *why* behind the design is rationale §9.6. For choosing a failure signal (`T?` vs `Try` vs `Result` vs `requires`/exceptions), see Guide 2 §7 — that table is the home; this guide does not repeat it.
+Bezel gives you five ways to declare a data shape and two ways to select over one. This guide is the picking rule for each. The definitions live in the spec (§9 records, §10 enums, §11 classes, §19 selection, §35 choices), and the *why* behind the design is rationale §9.6. For choosing how an operation reports what goes wrong — a value-shaped form (`T?`, a `Try` shape), a `Result<T, E>` or domain choice, a `requires` contract, or the throwing form — see [Guide 2](Bezel_Guide_02_Errors_and_Nullability.md); its form-choice table (§7) is the home, and this guide does not repeat it.
 
 ## 1. The five data kinds — which one?
 
@@ -86,4 +86,4 @@ end;
 
 ## 3. Where the failure signal fits
 
-One line, since Guide 2 §7 owns this: model the *result* with §1's kinds (`T?` for absence, `Result<T, E>` or a domain choice when the caller branches on the failure and its payload is a plain value shape), model the *contract* with `requires(…)` — remembering that on a record constructor that clause is also a modeling decision, making the record constructor-only (§1) — and keep exceptions for what neither models. The full table with the habits is Guide 2 §7.
+One paragraph, since [Guide 2](Bezel_Guide_02_Errors_and_Nullability.md) §7 owns this and the form follows how the caller consumes the outcome. Some outcomes are data, and §1's kinds model them. An expected absence is `T?` (or a `Try` shape) — which is why a choice with one empty case is `T?` already (§1). An error the caller gathers or decodes and then branches on, whose payload is a plain value, is a `Result<T, E>` with a record or enum as its `E`, or a domain choice whose cases name the outcomes — §1's `FetchOutcome`, whose `Failed(code)` the caller reads off a status, is one. A guarantee the caller owes is a `requires(…)` contract, breaking it a bug — remembering that on a record constructor that clause is also a modeling decision, making the record constructor-only (§1). Everything else, an outcome whose payload would own a resource among it (spec §35.4), is the throwing form, handled at a boundary that can act on it. The full table with the habits is Guide 2 §7.
