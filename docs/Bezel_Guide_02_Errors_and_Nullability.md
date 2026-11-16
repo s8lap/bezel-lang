@@ -215,13 +215,13 @@ end WellKnownPort;
 
 One trap the `??` of §1 does not prepare you for: a combinator's argument is an ordinary argument, evaluated at the call site before the call — on the success path exactly as on the error path (stdlib §2.20). `??` is conditional, so `a ?? Expensive()` never runs `Expensive()` when `a` is non-null (spec §7.7); `.UnwrapOr($"bad port: {raw}")` builds that string on the `Ok` path as well. There is no lazy `UnwrapOrElse`. Where the fallback must be computed only on error, compute it in the `Error` arm of a `case`.
 
-Note the `AndThen` lambda's return-type ascription: it makes the lambda's own returns declared-result positions, so the bare `Ok`/`Error` spelling works inside it too. The combinators exist only at **value-like** instantiations — payloads of values and strings, the common case. A `Result` carrying an owned resource (`Result<Connection, string>`) has none of them, deliberately. Extraction there is consumption, and consumption is the owning match's job — for owning results, the exhaustive `case` *is* the pipeline. The three non-throwing idioms compose: `T?` for plain absence, the `Try` form for value extraction with a boring false path, the choice return where the error is branched on and its payload is a value.
+Note the `AndThen` lambda's return-type ascription: it makes the lambda's own returns declared-result positions, so the bare `Ok`/`Error` spelling works inside it too. The combinators exist only at **value-like** instantiations — payloads of values and strings, the common case. A `Result` carrying an owned resource (`Result<Connection, string>`) has none of them, deliberately. Extraction there is consumption, and consumption is the owning match's job — for owning results, the exhaustive `case` *is* the pipeline. The three idioms compose: the two non-throwing forms — `T?` for plain absence, the `Try` form for value extraction with a boring false path — and the `Result` or choice return where the error is branched on and its payload is a value.
 
 ---
 
 ## 4. The throwing form: handling exceptions
 
-Everything the non-throwing forms don't cover throws: the condition the caller does not branch on, consumed where the program can do something about it, and the check a `requires` contract cannot state. Most code never catches. An exception propagates through it, and its owned values are cleaned up on the way (§6), until it reaches code that can act. The syntax is the familiar one: `catch` arms look like `case` arms (pattern + optional `when` guard + body), tried top to bottom:
+Everything the non-throwing forms and `Result` don't cover throws: the condition the caller does not branch on, consumed where the program can do something about it, and the check a `requires` contract cannot state. Most code never catches. An exception propagates through it, and its owned values are cleaned up on the way (§6), until it reaches code that can act. The syntax is the familiar one: `catch` arms look like `case` arms (pattern + optional `when` guard + body), tried top to bottom:
 
 ```bezel
 method ImportAll(paths: Array<string>)
