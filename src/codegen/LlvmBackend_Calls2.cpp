@@ -25240,107 +25240,37 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
     const ast::CallExpr& call, const ast::NullCondMemberExpr& nm) {
     const sema::TypeRef* callTy = ctx_.exprType(call);
     const sema::TypeRef* rcvTy = ctx_.exprType(*nm.target);
-    // fix #8455 (spec §7.5, stdlib §4.4, v0.357): the `?.` spelling of an
-    // IN-PLACE collection mutator — `a?.Sort(cmp)`, `a?.Sort()`, `a?.Reverse()`,
-    // `a?.Clear()`, `a?.Add(x)` on an `Array<T>?` — lowered to NOTHING, so the
-    // mutator never ran. MEASURED (issue #8455's repro): `n?.Sort(lambda(x: W,
-    // y: W): int => x.K.CompareTo(y.K));` on a NON-NULL `Array<W>?` printed
-    // `b c a` where §7.5 requires `a b c` — the array was never sorted, and the
-    // program exited 0 with no diagnostic.
+    if (!rcvTy) return nullptr;
+    // fix #8501 (§7.5, v0.357): a UNIT-returning built-in procedure reached
+    // through `?.` -- `arr?.Add(5)`, `arr?.Sort()`, `arr?.Clear()`,
+    // `d?.Add(k, v)`, `s?.Add(x)`, `q?.Enqueue(x)`, `k?.Push(x)`.
     //
-    // WHY. Sema types the `?.` call by LIFTING the `.` twin's type to nullable
-    // (§7.5: "the result type is always nullable"). A mutator that returns
-    // NOTHING has no type to lift — §4.7 makes the unit type non-nullable, and
-    // the twin's type IS the unit type — so the `?.` call stays UNTYPED:
-    // `ctx_.exprType(call)` is null, and the guard below declined the whole
-    // call. The `.` spelling is unaffected: its result is the unit marker the
-    // collection arms return (`ConstantInt::get(i32(), 0)`), which no consumer
-    // reads. The value-returning `?.` builtins are unaffected too: sema types
-    // them (`a?.Count()` is `int?`), so they take the path below.
+    // THE DEFECT. sema leaves a built-in instance call reached through `?.`
+    // UNTYPED (a built-in instance member carries no MethodSymbol, and the
+    // `.` twin the `?.` typing builds is untyped too -- #2756), so the call's
+    // type is neither a nullable `T?` nor a value, and the guard below
+    // declined the WHOLE `?.` call: it lowered to NOTHING. MEASURED (issue
+    // #8501's repro, on the base): `count after add: 3` / `sorted first: 3` /
+    // `count after clear: 3`, where §7.5 requires 4 / 1 / 0 -- the `.`
+    // spelling of the same three calls prints 4 / 1 / 0. No diagnostic, exit
+    // 0: the silent wrong-answer shape.
     //
-    // THE FIX. §7.5: "`x?.M` resolves `M` as `x.M` does", and "the receiver is
-    // evaluated first; if it is null the access does not occur". So: lower the
-    // receiver ONCE, test it for null, and on the present edge run the `.`
-    // spelling's OWN lowering over a synthetic `.` call whose receiver is a
-    // placeholder PINNED to the already-lowered receiver — the same shape the
-    // value-returning `?.` builtins use below (#6529). The mutator then acts
-    // on the receiver ITSELF (the pinned value IS the array), so the sort is
-    // IN PLACE.
+    // §7.5 (v0.357): "`?.` short-circuits. The receiver is evaluated first;
+    // if it is null the access does not occur and nothing to its right in the
+    // chain is evaluated -- no member is read, no call is performed"; over a
+    // NON-null receiver the member is resolved as `x.M` is and THE CALL IS
+    // PERFORMED. §7.5's own example is a call with no value --
+    // `user?.Log("Accessed");` -- so a procedure IS a §7.5 population, and
+    // its result is "no value" (the `.` spelling of a procedure call yields
+    // none either).
     //
-    // The result is the unit result the `.` spelling returns — the collection
-    // arms' marker — on BOTH edges: §4.7 gives the unit type exactly one
-    // value, so the null edge (no call) and the present edge (the call) agree.
-    if (!callTy) {
-        // The stdlib §4.4 mutators that return nothing ("the imperative-verb
-        // form mutates the receiver in place and returns nothing"). `Drain` is
-        // NOT here: sema leaves it untyped on purpose (the §21.1 `const`
-        // rejection is keyed on an untyped call — #2767), and its `.` spelling
-        // has its own `?.` handling (LlvmBackend_Calls2.cpp's Drain arms).
-        const std::string_view m = nm.member;
-        const bool unitMutator =
-            m == "Sort" || m == "Reverse" || m == "Clear" ||
-            m == "Add" || m == "AddRange" || m == "Insert" || m == "RemoveAt";
-        // The receiver must be a COLLECTION (stdlib §4.4 `Array<T>` and the
-        // other array-backed heads, or a dict-backed one); a user class keeps
-        // the old behaviour.
-        const bool collRcv =
-            rcvTy && (isCollectionTypeName(rcvTy) || isDictTypeName(rcvTy));
-        if (!unitMutator || !collRcv || !nm.target) return nullptr;
-        llvm::Value* rcv = lowerExpr(*nm.target);
-        if (!rcv || !rcv->getType()->isPointerTy()) return nullptr;
-        auto* accessBB = llvm::BasicBlock::Create(llvm_, "ncum.access", currentFn_);
-        auto* endBB = llvm::BasicBlock::Create(llvm_, "ncum.end", currentFn_);
-        builder_.CreateCondBr(
-            builder_.CreateICmpEQ(rcv, llvm::ConstantPointerNull::get(ptrTy())),
-            endBB, accessBB);
-        builder_.SetInsertPoint(accessBB);
-        // The placeholder stands for the PRESENT receiver: the NON-nullable
-        // receiver type (the `?.` twin sees the value, not the null — the same
-        // typing sema's own twin uses) and the already-lowered receiver value
-        // PINNED into it, so the receiver is evaluated exactly once (§7.5).
-        auto placeholder = std::make_unique<ast::IdentifierExpr>();
-        placeholder->name = "<nullcond-receiver>";  // unspellable (#6681)
-        placeholder->span = nm.target->span;
-        sema::TypeRef* placeholderTy = ctx_.makeTypeRef(*rcvTy);
-        placeholderTy->nullable = false;
-        ctx_.setExprType(placeholder.get(), placeholderTy);
-        // fix #7458 (§7.5, §28.2): the placeholder stands for the real `?.`
-        // target, so it carries the target's symbol (the `.` twin's ownership
-        // classifiers key on the receiver node's symbol).
-        if (sema::Symbol* targetSym = ctx_.exprSymbol(*nm.target))
-            ctx_.setExprSymbol(placeholder.get(), targetSym);
-        exprValueOverride_[placeholder.get()] = rcv;
-        const ast::Expr* placeholderKey = placeholder.get();
-        auto dotted = std::make_unique<ast::MemberAccessExpr>();
-        dotted->span = nm.span;
-        dotted->member = nm.member;
-        dotted->target = std::move(placeholder);
-        auto synth = std::make_unique<ast::CallExpr>();
-        synth->span = call.span;
-        synth->callee = std::move(dotted);
-        // fix #7730 (§22.5): sema publishes the named-argument binding keyed on
-        // the CallExpr it checked (the `?.` call); the `.` twin is a fresh node
-        // and needs its own copy.
-        if (const auto* bnd = ctx_.builtinCallBinding(call))
-            ctx_.setBuiltinCallBinding(synth.get(), *bnd);
-        auto& mutCall = const_cast<ast::CallExpr&>(call);
-        synth->args = std::move(mutCall.args);
-        llvm::Value* inner = lowerExpr(*synth);
-        mutCall.args = std::move(synth->args);
-        exprValueOverride_.erase(placeholderKey);
-        nullCondGroupingCallSynth_.push_back(std::move(synth));
-        if (!diverged_) builder_.CreateBr(endBB);
-        builder_.SetInsertPoint(endBB);
-        // The unit result: the `.` spelling's own unit marker. A twin that
-        // did not recognise the shape (no marker) leaves the old
-        // "lowered to nothing" result standing.
-        if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(inner))
-            if (ci->isZero() && ci->getBitWidth() == 32) return inner;
-        return nullptr;
-    }
+    // So a unit result is NOT a reason to drop the call: it is the reason to
+    // RUN it and lift nothing.
+    const bool unitResult =
+        !callTy || callTy->kind == sema::TypeRef::Kind::Unit;
     // sema must have typed the call as a present-able `T?`; otherwise there is
     // nothing to lift to (void / untyped) and the old nullptr result stands.
-    if (!callTy->nullable || !rcvTy) return nullptr;
+    if (!unitResult && !callTy->nullable) return nullptr;
     // A nullable VALUE receiver (`int?`, record?) is a tagged struct and is not
     // this fix's population -- except the builtin time/Guid value records.
     //
@@ -25361,9 +25291,17 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
               rh == "TimeOnly" || rh == "Guid"))
             return nullptr;
     }
-    const bool valueResult = isNullableValueTy(callTy);
-    sema::TypeRef* innerTy = ctx_.makeTypeRef(*callTy);
-    innerTy->nullable = false;
+    const bool valueResult = !unitResult && isNullableValueTy(callTy);
+    // The twin's OWN type: the `.` spelling's type for this call. A unit
+    // procedure has NONE (the `.` spelling's own call is untyped too --
+    // #2756), so the twin stays untyped: the twin must be
+    // INDISTINGUISHABLE from the `.` spelling, or the two spellings of ONE
+    // member could drift apart (§7.5).
+    sema::TypeRef* innerTy = nullptr;
+    if (!unitResult) {
+        innerTy = ctx_.makeTypeRef(*callTy);
+        innerTy->nullable = false;
+    }
     // fix #6664 (stdlib §5, #752, §7.5): a bare `src.GroupBy(f)` receiver cannot
     // be lowered to a value on its own (only the consumer's structural
     // interception materializes it: lowerGroupByMaterialize), so the placeholder
@@ -25468,11 +25406,14 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
         dotted->target = std::move(placeholder);
     }
     ast::MemberAccessExpr* dottedRaw = dotted.get();
-    ctx_.setExprType(dotted.get(), innerTy);
+    // fix #8501 (§7.5, v0.357): a UNIT twin carries NO type -- the `.`
+    // spelling's own procedure call is untyped (#2756), and the twin must
+    // look exactly like it.
+    if (innerTy) ctx_.setExprType(dotted.get(), innerTy);
     auto synth = std::make_unique<ast::CallExpr>();
     synth->span = call.span;
     synth->callee = std::move(dotted);
-    ctx_.setExprType(synth.get(), innerTy);
+    if (innerTy) ctx_.setExprType(synth.get(), innerTy);
     // fix #7730 (§22.5, v0.350): sema publishes a named-argument binding
     // (`checkBuiltinNamedArgs` -> setBuiltinCallBinding) keyed on the CallExpr
     // it checked, i.e. `call`. The `.` twin is a fresh node, so without this the
@@ -25482,7 +25423,31 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
         ctx_.setBuiltinCallBinding(synth.get(), *bnd);
     auto& mutCall = const_cast<ast::CallExpr&>(call);
     synth->args = std::move(mutCall.args);
+    // fix #8501 (§7.5, v0.357): the twin is lowered SPECULATIVELY, and the
+    // diagnostics it reports are the twin's own -- rolled back when the twin
+    // produced NO value, i.e. when the `.` spelling has no arm for this
+    // member (the #2457 "produced no value" backstop).
+    //
+    // WHY. The `?.` spelling of such a member COMPILES today: sema leaves the
+    // call untyped (a built-in instance member carries no MethodSymbol, and
+    // the `.` twin sema types is untyped too -- #2756), and the untyped call
+    // lowers to NOTHING -- no rejection, no effect. Before this fix the twin
+    // was never lowered, so the `.` spelling's own refusal never reached the
+    // `?.` program. Lowering it now would turn a COMPILING program into a
+    // REJECTED one -- a behaviour flip this fix does not own: `a?.Drain()` on
+    // an `OwningArray` (the #2767 / #4795 population, whose `.` spelling the
+    // compiler refuses with "produced no value") compiles clean today, and
+    // tests/ownership/nullcond_drain_alias_2767_test.cpp pins that.
+    //
+    // So a twin that lowers to NOTHING keeps the `?.` spelling's own verdict
+    // (compile clean, no effect) and its diagnostics are discarded, exactly as
+    // sema's speculative twin typing discards its own (rollbackTo, #6529). A
+    // twin that DID lower keeps its diagnostics -- the same rule the value
+    // path above has always had.
+    const std::size_t twinDiagMark = ctx_.diagnostics().diagnostics().size();
     llvm::Value* inner = lowerExpr(*synth);
+    if (unitResult && !inner)
+        ctx_.diagnostics().rollbackTo(twinDiagMark);
     mutCall.args = std::move(synth->args);
     if (groupByRcv) mutNm.target = std::move(dottedRaw->target);
     else if (rcvIsStringProducer) {
@@ -25492,6 +25457,26 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
     else exprValueOverride_.erase(placeholderKey);
     nullCondGroupingCallSynth_.push_back(std::move(synth));
 
+    // fix #8501 (§7.5, v0.357): the UNIT result -- the procedure RAN.
+    //
+    // The twin IS the `.` spelling's own lowering (the same placeholder, the
+    // same argument nodes, the same dispatch), so on the non-null path the
+    // procedure ran exactly as `arr.Add(5)` runs. Its result is the `.`
+    // spelling's unit marker -- an i32 zero -- or nothing at all, when the
+    // `.` spelling has no arm for this member. A procedure's result is
+    // NOTHING to lift (§4.7: a method declared without a return type returns
+    // the unit type; §7.5's own example `user?.Log("Accessed");` is such a
+    // call), so the `?.` call yields no value on EITHER path.
+    //
+    // A twin that produced a POINTER is not a procedure: it is a member the
+    // `?.` spelling does not type (sema left the call untyped) whose value
+    // the `.` spelling does produce -- §7.5's result is that value, lifted to
+    // the nullable result below, so it is NOT dropped here.
+    if (unitResult && (!inner || !inner->getType()->isPointerTy())) {
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        return nullptr;
+    }
     llvm::Type* nullTy = valueResult
         ? static_cast<llvm::Type*>(nullableValueStructTy(callTy))
         : static_cast<llvm::Type*>(ptrTy());
