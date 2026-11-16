@@ -1,10 +1,10 @@
 # Bezel Guide 6: Contracts and Purity
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.358.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.359.*
 
-Bezel lets a signature state obligations the compiler enforces: `requires(...)` for what the caller must guarantee, `ensures(...)` for what the member guarantees back, `invariant(...);` for what an object maintains at its public boundary (spec §22.16), and `pure` for members that promise no effects at all (spec §22.15). The syntax is small; the *postures* are what this guide teaches. Contracts are grammar, not a debug-mode assertion library: `requires` runs in every build, and a violation is a bug report, not an outcome (§1). Two postures will break habits you may bring along, and each is headed How Bezel does it. First: `requires` states only what a *correct caller already guarantees* — never validation of trust-boundary input, which is value-shape territory Guide 2 owns (§2). Second: `pure` is a promise you *declare* and the compiler verifies — never inferred from a body (§5). If you skim everything else, read those two and the table in §9.
+Bezel lets a signature state obligations the compiler enforces: `requires(...)` for what the caller must guarantee, `ensures(...)` for what the member guarantees back, `invariant(...);` for what an object maintains at its public boundary (spec §22.16), and `pure` for members that promise no effects at all (spec §22.15). The syntax is small; the *postures* are what this guide teaches. Contracts are grammar, not a debug-mode assertion library: `requires` runs in every build, and a violation is a bug report, not an outcome (§1). Two postures will break habits you may bring along, and each is headed How Bezel does it. First: `requires` states only what a *correct caller already guarantees* — never validation of input from outside the program, which takes a value-shaped form or the throwing form, both of which Guide 2 teaches (§2). Second: `pure` is a promise you *declare* and the compiler verifies — never inferred from a body (§5). If you skim everything else, read those two and the table in §9.
 
-**Contents:** §1 contracts are grammar · §2 `requires` is for caller bugs, never input validation · §3 `ensures` and `old` · §4 class invariants: where they are checked · §5 `pure` is declared, not inferred · §6 the pure signature and body · §7 what `pure` buys · §8 `Debug.Assert`: the landed assertion surface · §9 choosing the right tool.
+**Contents:** §1 contracts are grammar · §2 `requires` states a caller guarantee, never input validation · §3 `ensures` and `old` · §4 class invariants: where they are checked · §5 `pure` is declared, not inferred · §6 the pure signature and body · §7 what `pure` buys · §8 `Debug.Assert`: the landed assertion surface · §9 choosing the right tool.
 
 ---
 
@@ -45,9 +45,9 @@ Two practical notes. First, write one condition per clause: the clause is the un
 
 ---
 
-## 2. How Bezel does it: `requires` is for caller bugs — never trust-boundary input
+## 2. How Bezel does it: `requires` states a caller guarantee — never input from outside
 
-This is the boundary that matters most, and it mirrors Guide 2 §7's table exactly. The failure-signal rule (stdlib §1) puts every fault condition in one band. Band 1 is the caller bug — a condition a correct caller already guarantees. That is `requires` territory, with residual exceptions like `ArgumentException` at a pre-contract boundary. Bands 2–3 are expected outcomes: absence, bad input, a failure the caller branches on. Those are returned as values — `T?`, a Try shape, `Result<T, E>`, a domain choice. A contract on an expected outcome misclassifies it as a bug.
+This is the line that matters most, and it mirrors Guide 2 §7's table exactly. The failure-signal rule (stdlib §1) gives each condition one form, chosen by how the caller consumes it. A *precondition* — something a correct caller already guarantees — is `requires` territory, and breaking it is a bug; `ArgumentException` or `InvalidOperationException` is thrown in its place only where no contract is possible. An *expected absence*, and an outcome the caller branches on — bad input, a declined operation, an error it decodes — are returned as values: `T?`, a Try shape, `Result<T, E>`, a domain choice. A contract on an expected outcome misclassifies it as a bug.
 
 A good `requires` — an index precondition. No correct caller ever passes an out-of-range index, so an out-of-range index is a bug, and the clause says so in the signature. (Where the bound is a literal range rather than a live `Count`, the `in` spelling is clause material too: `Range<T>.Contains`, `IsEmpty`, and `IsOpenEnded` carry `pure`, so `requires(port in 0..65535)` compiles — stdlib §9.8, spec §16.3 and §17.5.)
 
@@ -68,13 +68,13 @@ public class SampleWindow
 end SampleWindow;
 ```
 
-A bad `requires` — the same syntax, on user input. This *compiles*: `int.ParseOrNull` is `pure`, so it is legal clause material. That is exactly why the trap is worth naming — the compiler enforces the clause's purity, not your trust-boundary judgment:
+A bad `requires` — the same syntax, on user input. This *compiles*: `int.ParseOrNull` is `pure`, so it is legal clause material. That is exactly why the trap is worth naming — the compiler enforces the clause's purity, not your judgment of where the input came from:
 
 ```bezel
 // WRONG: rawPort arrives from outside the program. Its invalidity is an
-// expected outcome, not a caller bug — no caller of Listen can guarantee it.
+// expected outcome, not a bug — no caller of Listen can guarantee it.
 public method Listen(rawPort: string)
-  requires(int.ParseOrNull(rawPort) <> null)   // misclassified: band 2 dressed as band 1
+  requires(int.ParseOrNull(rawPort) <> null)   // misclassified: an expected outcome dressed as a precondition
 
   Bind(int.ParseOrNull(rawPort)!);
 end Listen;
@@ -101,23 +101,23 @@ if not registry.TryAdd(move session) then    // declined: an equal element is al
 end;                                         //   and on this path also disposed (stdlib §4.10)
 ```
 
-When no caller will branch — the consumer sits above the method, at a *supervision boundary*: a catch site that logs, retries, or converts failures into protocol answers — the sanctioned signal is a typed exception (Guide 2 §4; the failure-signal rule's band 4, stdlib §1). It is still never a caller bug: the input remains an expected outcome, and only the signal changes from the misclassified `requires`. Here the plain name keeps its plain contract — `Listen` returns having bound, or it throws:
+When no caller will branch — the consumer sits above the method, at a *boundary*: a catch site that logs, retries, or converts errors into protocol answers — the signal is the throwing form, a typed exception (Guide 2 §4; stdlib §1's failure-signal rule). It is still never a precondition: the input remains an expected outcome, and only the signal changes from the misclassified `requires`. Here the plain name keeps its plain contract — `Listen` returns having bound, or it throws:
 
 ```bezel
 public method Listen(rawPort: string)
   var port := int.ParseOrNull(rawPort);
   if port = null then
-    // Boundary-consumed expected failure: a typed exception, still never
-    // a requires. FormatException is the built-in format fault (spec §31.4).
+    // Handled at a boundary: the throwing form, still never a requires.
+    // FormatException is the built-in class for text that does not parse (spec §31.4).
     throw new FormatException($"not a port: {rawPort}");
   end;
   Bind(port);                                     // narrowed by the early exit
 end Listen;
 ```
 
-Why not just call the throwing `int.Parse(rawPort)` and let its exception fly, if you were going to throw anyway? You may, and the boundary sees an exception either way. But `int.Parse` splits the condition: it raises `FormatException` for a malformed numeral and `OverflowException` for an out-of-range one (stdlib §9.1, §2.3), while `Listen`'s condition is single — *not a port*. The explicit throw keeps one condition on one signal, in the domain's own words, so a boundary that expects bad ports names one class. What rules out `ArgumentException` is what it says: the `Argument*` family is band 1's pre-contract residual (stdlib §1) — the exception that blames the *calling code* — and no caller is at fault here. Throwing it would plant a report in the boundary's log telling whoever triages it that the calling code needs fixing, when it does not; `FormatException` blames the input's shape, which is what actually failed. Neither class implements `IFailure`: whether bad text is expected depends on who supplied it, which only the boundary knows (spec §31.4), so the boundary that expects it names `FormatException`. (The consuming side of this signal is Guide 2 §4's catch example, which handles exactly this fault.)
+Why not just call the throwing `int.Parse(rawPort)` and let its exception fly, if you were going to throw anyway? You may, and the boundary sees an exception either way. But `int.Parse` splits the condition: it raises `FormatException` for a malformed numeral and `OverflowException` for an out-of-range one (stdlib §9.1, §2.3), while `Listen`'s condition is single — *not a port*. The explicit throw keeps one condition on one signal, in the domain's own words, so a boundary that expects bad ports names one class. What rules out `ArgumentException` is what it says: that the caller passed an argument this call does not accept — a condition a correct caller avoids, and the one a `requires` states where a contract is possible (stdlib §1). No correct caller of `Listen` can avoid a bad port, so the statement would be false; for text from outside, `FormatException` says what actually failed: the input's shape. Neither class implements `IFailure`: whether bad text is expected depends on who supplied it, which only the boundary knows (spec §31.4), so the boundary that expects it names `FormatException`. (The consuming side of this signal is Guide 2 §4's catch example, which handles exactly this exception.)
 
-The two-question test before writing `requires(E)`: *could a correct caller always guarantee E?* and *is a false E a bug in the calling code?* Two yeses: contract. Either no: a value shape — or, at a boundary consumed by logging/retry, a typed exception, as in the `Listen` rewrite (Guide 2 §4). The exceptions follow the answer: a broken `requires` raises `ContractViolationException`, which reports the calling code, and the typed exception for bad input blames the input; the boundary names the one it expects (Guide 2 §4).
+The two-question test before writing `requires(E)`: *could a correct caller always guarantee E?* and *is a false E a bug in the calling code?* Two yeses: contract. Either no: a value-shaped form — or, where a boundary handles it by logging or retrying, the throwing form, as in the `Listen` rewrite (Guide 2 §4). The exceptions follow the answer: a broken `requires` raises `ContractViolationException`, a bug report about the calling code, while the typed exception for bad input says what was wrong with the input. A boundary names the class it expects (Guide 2 §4); a bug is not caught to carry on, only reported by a supervisor's last arm.
 
 When it does run, `requires` evaluates after argument binding and before anything else — before a constructor's chain, before field initializers, before the first body statement. Clauses run in declaration order, stopping at the first `false` (spec §22.16). A constructor's `requires` may not observe `this`, since no field is assigned yet; it reads parameters and statics only.
 
@@ -152,7 +152,7 @@ public pure method Headroom(): decimal
 end Headroom;
 ```
 
-Two more rules worth knowing. First, a clause that *faults* — overflow, an indexer fault, a pure callee's own validation throw — propagates that exception as itself, never converted to `ContractViolationException`. The clause did not evaluate `false`; it failed to evaluate, which is a defect in the contract, and the original exception is its diagnosis. Second, every clause occupies one recorded **tier**: **proven** (discharged statically, zero cost) or **checked** (a runtime evaluation). The `static` qualifier demands the proven tier: an undischargeable `static` clause is a compile error, never a silent runtime check. The shipped prover floor is deliberately small — constant folds, plus the `when true`/`when false` `out`-nullability postconditions (spec §22.4 — the Try shapes' familiar carrier), whose meaning is a `static ensures` clause (the `when` clause is their only spelling, spec §22.16). So essentially every clause you author today is checked. The extended fragment (linear integer arithmetic, null-test flow, closed-set case analysis) is fixed in Appendix D.2 so `static`'s meaning never drifts (spec §22.16).
+Two more rules worth knowing. First, a clause that *raises* — overflow, an out-of-range index, a pure callee's own validation throw — propagates that exception as itself, never converted to `ContractViolationException`. The clause did not evaluate `false`; it failed to evaluate, which is a bug in the contract, and the original exception is its diagnosis. Second, every clause occupies one recorded **tier**: **proven** (discharged statically, zero cost) or **checked** (a runtime evaluation). The `static` qualifier demands the proven tier: an undischargeable `static` clause is a compile error, never a silent runtime check. The shipped prover floor is deliberately small — constant folds, plus the `when true`/`when false` `out`-nullability postconditions (spec §22.4 — the Try shapes' familiar carrier), whose meaning is a `static ensures` clause (the `when` clause is their only spelling, spec §22.16). So essentially every clause you author today is checked. The extended fragment (linear integer arithmetic, null-test flow, closed-set case analysis) is fixed in Appendix D.2 so `static`'s meaning never drifts (spec §22.16).
 
 ---
 
@@ -276,7 +276,7 @@ end Rebalance;
 `Debug.Assert` differs from a contract on every axis, and the differences are the choosing rule:
 
 - **Elision**: `Debug.*` calls may be elided in release builds, depending on the compiler's `--debug` flag. Side effects in `Assert` arguments are therefore unspecified; keep the arguments effect-free. A `requires` is never elided (§1).
-- **Failure**: a failed assertion reports the condition's source location and message and terminates the process — it never throws (stdlib §8.2; the failure-signal rule's band 5, *fatal*). A violated contract raises the catchable `ContractViolationException`, so a supervision boundary can log it and shed the request.
+- **Failure**: a failed assertion reports the condition's source location and message and terminates the process — it never throws (stdlib §8.2; *fatal* in stdlib §1's failure-signal rule). A violated contract raises the catchable `ContractViolationException`, so a supervisor can report it and shed the request.
 - **Placement**: a contract is a signature-level obligation, visible to callers and carried by the interface; `Debug.Assert` is a mid-body check on your own algorithm's intermediate state — a claim no caller could see or rely on.
 
 So: obligations between caller and callee go in clauses; sanity checks inside an algorithm — states you believe unreachable, bookkeeping you want verified during development — go in `Debug.Assert`.
@@ -285,14 +285,14 @@ So: obligations between caller and callee go in clauses; sanity checks inside an
 
 ## 9. Choosing the right tool
 
-This table covers the tools this guide teaches. Every other condition — an expected outcome at a trust boundary, a boundary-consumed fault, an invalid argument at a pre-contract boundary — takes no clause, and Guide 2 §7's table, the home for failure signals, classifies it; §2 above is where the two tables meet.
+This table covers the tools this guide teaches. Every other condition — an expected absence or outcome in input from outside, an exception handled at a boundary, an invalid argument where no contract is possible — takes no clause, and Guide 2 §7's table, the home for failure signals, classifies it; §2 above is where the two tables meet.
 
 | The condition is… | Reach for |
 |---|---|
-| Something a correct caller already guarantees (argument range, index bounds, protocol order) | `requires(...)` — always-on, faults `ContractViolationException` (spec §22.16; stdlib §1 band 1) |
+| Something a correct caller already guarantees (argument range, index bounds, protocol order) | `requires(...)` — always-on, raises `ContractViolationException` (spec §22.16; a *precondition* in stdlib §1's failure-signal rule) |
 | A guarantee your implementation makes back to its callers | `ensures(...)` — checked-contracts mode, or proven where the prover reaches (§3) |
 | A consistency property of a class instance's state at its public boundary | `invariant(...);` — checked at construction exit and public entry/exit only (§4); the member is class-only (spec §22.16 *Scope*) |
 | The same property on a record | a clause on the record's constructor — which makes the record constructor-only: not defaultable, no `with` (spec §9.9) — or, where that property is unwanted, the condition on a static factory method |
 | A mid-body sanity check on your own algorithm's intermediate state | `Debug.Assert` — maybe elided, terminates on failure, never throws (stdlib §8.2) |
 
-A few habits carry most of it. Before writing `requires`, ask whether a correct caller could always guarantee the condition — if not, it is an outcome, and Guide 2's shapes apply. Put the obligations callers must know in clauses, where the compiler carries and enforces them; keep `Debug.Assert` for interior claims. Mark every effect-free predicate and getter `pure` at declaration time — purity is the admission ticket to clause-land, and it cannot be retrofitted by inference. And when the purity checker or a contract violation pushes back, treat it as §1 treats it: not friction, but a misclassified condition or a real bug, found early.
+A few habits carry most of it. Before writing `requires`, ask whether a correct caller could always guarantee the condition — if not, it is an outcome, and Guide 2's forms apply. Put the obligations callers must know in clauses, where the compiler carries and enforces them; keep `Debug.Assert` for interior claims. Mark every effect-free predicate and getter `pure` at declaration time — purity is the admission ticket to clause-land, and it cannot be retrofitted by inference. And when the purity checker or a contract violation pushes back, treat it as §1 treats it: not friction, but a misclassified condition or a real bug, found early.
