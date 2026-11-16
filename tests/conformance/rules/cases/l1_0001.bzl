@@ -2,10 +2,10 @@
 //! doc: stdlib
 //! section: 1
 //! title: ReadKey is the assert-shaped throwing tier at end of input, and raises a failure
-//! rule: `ReadKey` remains the assert-shaped throwing tier: a caller that does not
-//!   expect end of input handles nothing, and the `EndOfStreamException` then
-//!   raised is a failure (§1), end of input being the environment's and not the
-//!   program's.
+//! rule: `ReadKey` remains the throwing form: a caller that does not expect end of
+//!   input handles nothing at the call. … raises `EndOfStreamException` (§7.5)
+//!   when input has ended … The class is `IFailure`-marked (§1), end of input
+//!   being the environment's and not the program's.
 //! cites: 2.1
 //! expect: run
 //! stdout: threw

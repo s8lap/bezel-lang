@@ -2,9 +2,9 @@
 //! doc: stdlib
 //! section: 4.14
 //! title: TryReadInt16LittleEndian returns false and leaves value default on a short span
-//! rule: Read methods throw IndexOutOfRangeException if the span is shorter
-//!   than the type being read; TryRead* variants return false instead of
-//!   throwing and assign the out parameter to default(T) on the false path.
+//! rule: Read methods raise IndexOutOfRangeException when the span is shorter than
+//!   the type being read; TryRead* variants return false instead of raising and
+//!   assign the out parameter to default(T) on the false path.
 //! cites: 4.14
 //! expect: run
 //! stdout: False 0

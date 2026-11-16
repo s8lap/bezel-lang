@@ -3,7 +3,8 @@
 //! section: 6.12
 //! title: a failure in a Parallel.Map body surfaces as DomainFailedException
 //! rule: first fault wins, surfaced at the `await` as `DomainFaultedException`, or
-//!   as `DomainFailedException` where that fault is a failure (§6.8)
+//!   as `DomainFailedException` where that fault's class is `IFailure`-marked
+//!   (§6.8)
 //! cites: 6.12, 6.8
 //! expect: run
 //! stdout: True

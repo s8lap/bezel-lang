@@ -2,9 +2,9 @@
 //! doc: stdlib
 //! section: 5
 //! title: ToDictionary raises ArgumentException on a duplicate key
-//! rule: ToDictionary (both overloads) raises ArgumentException on a
-//!   duplicate key -- Dictionary.Add semantics; silent last-wins would
-//!   mask a defective key selector.
+//! rule: ToDictionary (both overloads) raises ArgumentException when two elements
+//!   yield the same key — Dictionary.Add semantics; silent last-wins would hide
+//!   a wrong key selector.
 //! cites: 5
 //! expect: run
 //! stdout: caught

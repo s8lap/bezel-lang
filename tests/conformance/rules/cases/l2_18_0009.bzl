@@ -2,9 +2,9 @@
 //! doc: stdlib
 //! section: 2.18
 //! title: an unrecognized specifier raises FormatException
-//! rule: The specifier vocabulary is invariant-culture only; an
-//!   unrecognized specifier raises FormatException (strict-fault, as
-//!   everywhere).
+//! rule: The specifier vocabulary is invariant-culture only; `ToString(format)`
+//!   raises FormatException when the specifier is unrecognized, rather than
+//!   returning a substitute rendering, as everywhere in this document.
 //! cites: 2.18
 //! expect: run
 //! stdout: caught

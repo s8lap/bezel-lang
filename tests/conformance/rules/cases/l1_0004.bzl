@@ -2,9 +2,10 @@
 //! doc: stdlib
 //! section: 1
 //! title: a zero constructor magnitude is valid, not a fault
-//! rule: Negative magnitudes fault; zero is valid -- a magnitude-taking
-//!   constructor such as StringBuilder(capacity) constructs successfully at
-//!   capacity zero, and the instance is fully usable afterward.
+//! rule: Negative magnitudes raise … Zero is valid (an empty container or
+//!   zero-length buffer): a magnitude-taking constructor such as
+//!   StringBuilder(capacity) constructs successfully at capacity zero, and the
+//!   instance is fully usable afterward.
 //! cites: 2.1
 //! expect: run
 //! stdout: x
