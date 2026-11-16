@@ -811,6 +811,12 @@ private:
     // name, attached as the exprSymbol of a `T` member-access receiver so
     // resolveMemberAccess (and codegen) can identify the receiver kind.
     std::unordered_map<std::string_view, GenericParamSymbol*> typeParamMarkers_;
+    // fix #8618 (spec §14.2, v0.357): one synthesized TypeRef per
+    // type-parameter NAME, for the parameter a bare-parameter TypeRef is
+    // identified by when no AST site in this scope spells it. Keyed on the
+    // name; the TypeRefs are owned by the SemaContext (whole-compilation
+    // lifetime), like every other ref here.
+    std::unordered_map<std::string_view, TypeRef*> typeParamTypeRefs_;
     // §11.8: is `name` a declared generic type parameter of the enclosing
     // method, type, or (fix #3617-family drain, R10) extension block?
     bool isInScopeTypeParam(std::string_view name) const;
@@ -865,6 +871,45 @@ private:
     bool forEachConstraintBound(std::string_view paramName,
                                 const std::function<bool(TypeRef*)>& fn,
                                 bool includeDeclarationless = false);
+    // fix #8618 (spec §14.2 *Constraints on overrides and interface
+    // implementations*, v0.357): the INHERITED constraint set of the current
+    // METHOD's own type parameter — the set an `override` or an interface
+    // implementation takes when it OMITS its `where` clause.
+    //
+    // §14.2: "An `override` of a generic method, and a method implementing a
+    // generic interface method ..., inherits the overridden or implemented
+    // declaration's constraints. Omitting the `where` clauses is the
+    // recommended spelling and means exactly the inherited set"; and "the
+    // inherited set is read under the implemented interface's or overridden
+    // base's substitution, its method type parameters renamed positionally".
+    //
+    // `forEachConstraintBound` above reads the AST-WRITTEN clauses only, so
+    // for the recommended spelling it yields nothing — the inherited set was
+    // invisible to every consumer of that walk. This walk yields the
+    // inherited set instead: the overridden base method's or the implemented
+    // interface method's own clause at the SAME POSITION of the method's
+    // type-parameter list, with the inherited declaration's method type
+    // parameter RENAMED to the current method's.
+    //
+    // The declaration it inherits from is found through the RESOLVER's own
+    // witness tables (the relation the compiler recorded), never by a
+    // name-and-arity guess: an `override` through
+    // `SemaContext::interfaceWitnesses(overridingMethod, baseMethod)`, an
+    // interface IMPLEMENTATION through
+    // `SemaContext::interfaceWitnesses(type, interfaceMember)`. Defined in
+    // ExprTypecheck.cpp beside `forEachConstraintBound`.
+    bool forEachInheritedConstraintBound(
+        std::string_view paramName,
+        const std::function<bool(TypeRef*)>& fn);
+    // fix #8618 (spec §14.2, v0.357): a TypeRef for a type parameter that no
+    // AST site in this scope spells — the inherited clause names the BASE's
+    // method type parameter, and the current method's own parameter is
+    // renamed onto it. The synthetic node carries the NAME (the one thing a
+    // bare-parameter TypeRef is identified by — `TypeRef::headName`) and the
+    // `Param` binding record, exactly as the resolver's own type-parameter
+    // TypeRef does. Defined in ExprTypecheck.cpp beside
+    // `forEachConstraintBound`.
+    TypeRef* typeParamTypeRef(std::string_view name);
     // fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12, §4.13: the
     // constraint-derived BUILTIN COLLECTION view of the bare type parameter
     // `paramName` — the declaration-less TypeRef of the builtin collection

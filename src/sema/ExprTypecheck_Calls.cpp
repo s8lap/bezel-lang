@@ -40391,6 +40391,34 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         member = cm;
                         return true;
                     });
+                // fix #8618 (spec §14.2 *Constraints on overrides and
+                // interface implementations*, v0.357): an `override` or an
+                // interface implementation that OMITS its `where` clause
+                // INHERITS the overridden/implemented declaration's
+                // constraint set — "Omitting the `where` clauses is the
+                // recommended spelling and means exactly the inherited set".
+                // The walk above reads the AST-WRITTEN clauses only, so for
+                // that recommended spelling it found nothing and the §11.8
+                // diagnostic below fired on a program the spec admits. The
+                // INHERITED set is consulted here, and only here: the
+                // inherited declaration is the one the RESOLVER recorded this
+                // method as overriding / implementing, so a plain member or a
+                // sibling overload contributes nothing.
+                if (!member) {
+                    forEachInheritedConstraintBound(
+                        gps->name, [&](TypeRef* ctr) -> bool {
+                            if (!ctr->declaration ||
+                                ctr->declaration->kind !=
+                                    ast::TypeDeclKind::Interface)
+                                return false;
+                            Symbol* cm =
+                                lookupMember(ctr->declaration, ma.member);
+                            if (!cm) return false;
+                            boundWithMember = ctr;
+                            member = cm;
+                            return true;
+                        });
+                }
                 if (!member) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
