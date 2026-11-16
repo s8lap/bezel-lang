@@ -2,7 +2,7 @@
 
 *A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.359.*
 
-Bezel gives you five ways to declare a data shape and two ways to select over one. This guide is the picking rule for each. The definitions live in the spec (§9 records, §10 enums, §11 classes, §19 selection, §35 choices), and the *why* behind the design is rationale §9.6. For choosing how an operation reports what goes wrong — a value-shaped form (`T?`, a `Try` shape), a `Result<T, E>` or domain choice, a `requires` contract, or the throwing form — see [Guide 2](Bezel_Guide_02_Errors_and_Nullability.md); its form-choice table (§7) is the home, and this guide does not repeat it.
+Bezel gives you five ways to declare a data shape and two ways to select over one. This guide is the picking rule for each. The definitions live in the spec (§9 records, §10 enums, §11 classes, §19 selection, §35 choices), and the *why* behind the design is rationale §9.6. For choosing how an operation reports what goes wrong — a non-throwing form (`T?`, a `Try` shape), a `Result<T, E>` or domain choice, a `requires` contract, or the throwing form — see [Guide 2](Bezel_Guide_02_Errors_and_Nullability.md); its form-choice table (§7) is the home, and this guide does not repeat it.
 
 ## 1. The five data kinds — which one?
 

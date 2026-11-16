@@ -302,7 +302,7 @@ end Greet;
 
 `?.` reads through a possibly-null value, `??` supplies a default, and a postfix `!` asserts non-null.
 
-**Choose the form by how the caller consumes the outcome.** When the caller branches on it — a missing key, text that may not parse — the standard library offers a value-shaped form instead of an exception: an `…OrNull` method that composes with `??` (`int.ParseOrNull(text) ?? 8080`), a `Try…` method, or a `Result<T, E>` when the error carries a value (§3). A guarantee the caller must provide is a contract (§8).
+**Choose the form by how the caller consumes the outcome.** When the caller branches on it — a missing key, text that may not parse — the standard library offers a non-throwing form instead of an exception: an `…OrNull` method that composes with `??` (`int.ParseOrNull(text) ?? 8080`), a `Try…` method, or a `Result<T, E>` when the error carries a value (§3). A guarantee the caller must provide is a contract (§8).
 
 **Exceptions** are for everything else. Most code does not catch them: an exception propagates to where the program can do something about it, usually a boundary such as a request loop or `Main`, and owned values on the way are disposed (§4), so there is no cleanup to write. A `catch` has comma-separated arms, matched in order; it names the classes it can answer, and anything unmatched keeps propagating. A class that implements `IFailure` says the outside world disagreed (a missing file, a closed channel), and an `IFailure` arm takes all of them; what to do about one is the handler's call.
 
