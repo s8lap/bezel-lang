@@ -3724,7 +3724,8 @@ void ExprTC::unifyArgSubst(
     const ast::Type* pt, TypeRef* argTy,
     const std::unordered_set<std::string_view>& paramNames,
     std::unordered_map<std::string_view, TypeRef*>& argSubst,
-    std::unordered_set<std::string_view>* conflicts) {
+    std::unordered_set<std::string_view>* conflicts,
+    bool bindFunctionReturnSlot) {
     if (!pt || !argTy) return;
     if (pt->kind == ast::TypeKind::Named && pt->name &&
         pt->name->parts.size() == 1 && paramNames.count(pt->name->parts[0])) {
@@ -3867,10 +3868,45 @@ void ExprTC::unifyArgSubst(
                 unifyArgSubst(pt->funcParams[i].type.get(), argParamTy,
                               paramNames, argSubst, conflicts);
         }
-        if (pt->funcReturn && argTy->funcReturn)
+        // fix #8626 (§14.5 phase 1 + phase 2, v0.357): the return slot binds
+        // only when the argument carries a return binding of its own. A
+        // lambda literal whose body is a bare `null` has no self-determined
+        // return type, so it contributes none — the parameter slots still
+        // bind (a lambda's ANNOTATED parameter types are self-determined,
+        // §14.5 phase 1).
+        if (bindFunctionReturnSlot && pt->funcReturn && argTy->funcReturn)
             unifyArgSubst(pt->funcReturn.get(), argTy->funcReturn, paramNames,
                           argSubst, conflicts);
     }
+}
+
+// fix #8626 (§14.5 phase 1 + phase 2, v0.357): true iff the argument is a
+// lambda literal whose body is a BARE `null` — so the lambda has no
+// self-determined return type and contributes NO return binding.
+//
+//   * the expression-body spelling: the body IS a null literal;
+//   * the block-body spelling: the lambda's INFERRED return type is the
+//     uncontexted-null sentinel (`Object?`), which is what a block body
+//     whose value-carrying returns are bare nulls infers to (§27.3:
+//     "Expression-bodied lambdas need no inference rule: the body
+//     expression's type is the return type"; the null literal's type is
+//     the nullable Object sentinel).
+//
+// The null sentinel is the codebase's own reading of "a bare `null`" for an
+// ARGUMENT (the phase-1 skip in `typeCall`'s inference loop and in the
+// §14.5 phase-2 guard both test exactly this shape), so the block-body
+// spelling is read the same way.
+static bool lambdaBodyIsBareNull(const ast::Expr* arg, const TypeRef* lamTy) {
+    auto* lam = dynamic_cast<const ast::LambdaExpr*>(arg);
+    if (!lam) return false;
+    if (lam->exprBody)
+        return dynamic_cast<const ast::NullLiteralExpr*>(lam->exprBody.get()) !=
+               nullptr;
+    if (!lamTy || lamTy->kind != TypeRef::Kind::Function || !lamTy->funcReturn)
+        return false;
+    const TypeRef* r = lamTy->funcReturn;
+    return r->kind == TypeRef::Kind::Primitive &&
+           r->primitive == PrimitiveType::Object && r->nullable;
 }
 
 // §22.3 / §14.5 (#2266): true when `t` mentions one of `tpNames` ANYWHERE in its
@@ -10668,8 +10704,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             argTy->primitive == PrimitiveType::Object &&
                             argTy->nullable)
                             continue;
+                        // fix #8626 (§14.5 phase 1 + phase 2, v0.357): a
+                        // lambda literal whose body is a BARE `null` has no
+                        // self-determined return type and contributes NO
+                        // return binding — phase 1's own rule for a bare
+                        // `null` ("a bare `null` literal argument is not
+                        // self-determined and contributes no binding") read
+                        // on the lambda's BODY, and phase 2 binds "the
+                        // lambda's inferred return type", which such a body
+                        // does not have. Its ANNOTATED parameter types still
+                        // bind (phase 1's last bullet).
+                        const bool nullBodyLambda =
+                            lambdaBodyIsBareNull(ce.args[pi].value.get(), argTy);
                         unifyArgSubst(md->params[pi].type.get(), argTy,
-                                      paramNames, argSubst, &inferConflicts);
+                                      paramNames, argSubst, &inferConflicts,
+                                      /*bindFunctionReturnSlot=*/!nullBodyLambda);
                     }
                     // §14.1 / #896: if any type parameter was bound to two
                     // incompatible types across the arguments, emit a compile
@@ -10848,6 +10897,86 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // inferReturnTargetTypeArgs/reportNoTargetInferenceIfNeeded
                     // already own, unchanged, elsewhere.
                     if (!hadExplicitTypeArgs && !paramNames.empty()) {
+                        // fix #8626 (§14.5 phase 1 + phase 2 + phase 3,
+                        // v0.357): a lambda literal whose body is a BARE
+                        // `null` contributes NO return binding (see the
+                        // inference loop above), so the type parameter its
+                        // formal's return slot was to bind stays UNBOUND —
+                        // and phase 3 makes that "a compile error naming the
+                        // parameter".
+                        //
+                        // MEASURED (#8626): `Seq.M(xs, lambda(v) => null)`
+                        // against `M<T, K>(xs: Array<T>, key: (T) -> K): T`
+                        // compiled clean and printed the FIRST element:
+                        // `K` was bound to the null literal's `Object?`
+                        // (the uncontexted-null sentinel — a binding that
+                        // carries no type information), `k.CompareTo(bk)`
+                        // compared against a null and never selected
+                        // anything, and the `where K: IComparable<K>`
+                        // constraint was not enforced either (a nullable
+                        // Object satisfies no interface constraint, but the
+                        // constraint check has no verdict for it).
+                        //
+                        // The check below fires for the positions whose
+                        // argument is a bare-null lambda and whose declared
+                        // parameter type mentions a type parameter this call
+                        // did NOT bind: that parameter is the one the null
+                        // body was to bind, and nothing else did. A parameter
+                        // the call DID bind elsewhere keeps that binding (the
+                        // null body simply contributes nothing) — the
+                        // §22.6 applicability check then judges the null
+                        // against the SUBSTITUTED return slot, as
+                        // §14.5 phase 1 says ("Conversions get their say
+                        // afterward, argument by argument, at the §22.6
+                        // applicability check against the substituted
+                        // signature").
+                        {
+                            std::unordered_set<std::string_view> unbound;
+                            for (std::size_t pi = 0;
+                                 pi < md->params.size() && pi < ce.args.size();
+                                 ++pi) {
+                                const ast::Param& p = md->params[pi];
+                                if (!p.type || !ce.args[pi].value) continue;
+                                TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
+                                if (!lambdaBodyIsBareNull(ce.args[pi].value.get(),
+                                                          argTy))
+                                    continue;
+                                TypeRef* pty = ctx_.resolvedType(*p.type);
+                                if (!pty) continue;
+                                for (const auto& gp : md->genericParams) {
+                                    if (argSubst.count(gp.name)) continue;
+                                    std::unordered_set<std::string_view> single{
+                                        gp.name};
+                                    if (!refOutParamTypeMentionsTypeParam(
+                                            pty, single))
+                                        continue;
+                                    unbound.insert(gp.name);
+                                }
+                            }
+                            if (!unbound.empty()) {
+                                for (std::string_view nm : unbound) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "cannot infer the type argument `" +
+                                        std::string(nm) + "` of `" +
+                                        std::string(md->name) + "`'s call "
+                                        "— a lambda argument whose body is a "
+                                        "bare `null` contributes no binding "
+                                        "(§14.5 phase 1: \"a bare `null` "
+                                        "literal argument is not "
+                                        "self-determined and contributes no "
+                                        "binding\"; phase 2 binds the "
+                                        "lambda's inferred return type, and "
+                                        "a bare `null` body has none), so `" +
+                                        std::string(nm) +
+                                        "` remains unbound; supply an "
+                                        "explicit type argument, or give the "
+                                        "lambda a body of a determinate type "
+                                        "(§14.5 phase 3, v0.357)");
+                                }
+                                return;
+                            }
+                        }
                         std::unordered_set<std::string_view> stillUnbound;
                         for (const auto& gp : ms->genericParams) {
                             if (argSubst.count(gp->name)) continue;

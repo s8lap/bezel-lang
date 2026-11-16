@@ -2205,11 +2205,20 @@ private:
     // (optional) receives the name of any type parameter whose second-
     // occurrence inferred binding is DIFFERENT from the first-occurrence
     // binding.
+    //
+    // fix #8626 (§14.5 phase 1 + phase 2, v0.357): `bindFunctionReturnSlot`
+    // is false for an argument that carries NO return binding of its own —
+    // a lambda literal whose body is a bare `null` (§14.5 phase 1: "a bare
+    // `null` literal argument is not self-determined and contributes no
+    // binding"; phase 2 binds "the lambda's inferred return type", which a
+    // bare `null` body does not have). The function-typed formal's RETURN
+    // slot then binds nothing; its PARAMETER slots still bind as usual.
     void unifyArgSubst(
         const ast::Type* pt, TypeRef* argTy,
         const std::unordered_set<std::string_view>& paramNames,
         std::unordered_map<std::string_view, TypeRef*>& argSubst,
-        std::unordered_set<std::string_view>* conflicts = nullptr);
+        std::unordered_set<std::string_view>* conflicts = nullptr,
+        bool bindFunctionReturnSlot = true);
 
     // §19.3/§19.5/§5.1/§12.9 (v0.197, #1920): the INTERFACE-scrutinee
     // counterpart of typeTestGenericInstantiationImpossible. Is the typed
