@@ -134,7 +134,7 @@ method LoadSettings(path: string): Settings
 end LoadSettings;
 ```
 
-Write the helper once, name it as the library would, and the rest of the program composes with `??` and narrowing. The arm names `FileNotFoundException` and nothing else (stdlib §7.2): a missing directory or a refused permission is not "no settings yet", and it propagates.
+Write the helper once, name it as the library would, and the rest of the program composes with `??` and narrowing. The arm names `FileNotFoundException` and nothing else (stdlib §7.2): a missing directory or a refused permission is not "no settings yet", and it propagates. A whole-file read such as `File.ReadAllText` raises the same classes when it cannot open its file (stdlib §7.3), and takes the same arm.
 
 **The `Try` form** when the failure path and success path differ, and especially when the value is *owned*. A `bool` return plus an `out owned` parameter, with a `when true` postcondition that lets the caller skip the `!`:
 

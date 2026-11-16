@@ -1428,7 +1428,7 @@ public static class Path                  // exactly six members
 end
 ```
 
-`IOException` ← `FileNotFoundException`, `DirectoryNotFoundException`, `EndOfStreamException`, `PathTooLongException`. `Stream.Read` signals end-of-stream with a **`0` return, never `EndOfStreamException`**, and may return **fewer than `count`** — a short read is not EOF. `File`'s text methods are UTF-8 and strict (ill-formed bytes on read raise `FormatException`, never a substitute), with no BOM. A `FileStream` that cannot open raises `FileNotFoundException`, `DirectoryNotFoundException` or `IOException` (stdlib §7.3). **`System.IO` has no non-throwing form** — no `ReadAllTextOrNull`, no `TryOpen` (a library gap, #8516) — and `File.Exists` is a pre-check, not a guarantee: the file can go between the test and the open. A program that answers a missing file catches the `IOException` family by name, at the call or at its boundary. The **only** concrete `TextReader`/`TextWriter` instances are what `Console.In`/`Out`/`Error` return.
+`IOException` ← `FileNotFoundException`, `DirectoryNotFoundException`, `EndOfStreamException`, `PathTooLongException`. `Stream.Read` signals end-of-stream with a **`0` return, never `EndOfStreamException`**, and may return **fewer than `count`** — a short read is not EOF. `File`'s text methods are UTF-8 and strict (ill-formed bytes on read raise `FormatException`, never a substitute), with no BOM. A `FileStream` that cannot open, and a whole-file `File.Read*` that cannot open its file, raise `FileNotFoundException`, `DirectoryNotFoundException` or `IOException`, never a substitute value (stdlib §7.2, §7.3; ⚠ the runtime does not raise for the whole-file reads yet, #7057). **`System.IO` has no non-throwing form** — no `ReadAllTextOrNull`, no `TryOpen` (a library gap, #8516) — and `File.Exists` is a pre-check, not a guarantee: the file can go between the test and the open. A program that answers a missing file catches `FileNotFoundException` by name at the call; the rest of the `IOException` family goes to its boundary. The **only** concrete `TextReader`/`TextWriter` instances are what `Console.In`/`Out`/`Error` return.
 
 ### 5.8 `System.Diagnostics`
 
@@ -1551,22 +1551,25 @@ import System.IO;
 public class Program
   public static method Main(args: Array<string>): int
     var path := args[0];
-    if not File.Exists(path) then
-      Console.Error.WriteLine($"not found: {path}");
-      return 1;
-    end;
-    var lines := File.ReadAllLines(path);        // owned Array<string>
-    var words := 0;
-    for var line in lines do
-      words := words + line.Split(' ').Count;    // Split: owned Array<string>, empty segments kept
-    end;
-    Console.WriteLine($"{lines.Count} lines, {words} words");
+    try
+      var lines := File.ReadAllLines(path);      // owned Array<string>; a missing file raises FileNotFoundException
+      var words := 0;
+      for var line in lines do
+        words := words + line.Split(' ').Count;  // Split: owned Array<string>, empty segments kept
+      end;
+      Console.WriteLine($"{lines.Count} lines, {words} words");
+    catch
+      FileNotFoundException => do                // expected here: answered at the call, by name
+        Console.Error.WriteLine($"not found: {path}");
+        return 1;
+      end
+    end try;
     return 0;
   end Main;
 end Program;
 ```
 
-`File.Exists` here buys a friendly message, not a guarantee: the file can go before the read, and there is no `ReadAllLinesOrNull` (section 5.7). A tool that must answer that case too catches the class by name around the read, not `Exception`. For a stream, `using var` is the workhorse and covers the exception path: `using var fs := new FileStream(path, FileMode.Open, FileAccess.Read);`, then `fs.ReadAll()` for an `owned Array<byte>`. Owned locals are disposed in reverse declaration order.
+There is no `ReadAllLinesOrNull` (section 5.7), so the read is the test: a missing file raises `FileNotFoundException` (stdlib §7.3), caught by name at the call; every other `IOException` propagates. Do not test `File.Exists` first: the file can go between the test and the read, which must handle its absence anyway. For a stream, `using var` is the workhorse and covers the exception path: `using var fs := new FileStream(path, FileMode.Open, FileAccess.Read);`, then `fs.ReadAll()` for an `owned Array<byte>`. Owned locals are disposed in reverse declaration order.
 
 **Owning collections: build, iterate, drain.**
 
