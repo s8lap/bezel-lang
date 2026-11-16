@@ -1,6 +1,6 @@
 # A Tour of Bezel
 
-*Validated against v0.358. An introduction for programmers who know C#, Java, Go, Rust, Swift or TypeScript; not a normative document — where it and the [specification](Bezel_Language_Spec.md) disagree, the specification wins.*
+*Validated against v0.359. An introduction for programmers who know C#, Java, Go, Rust, Swift or TypeScript; not a normative document — where it and the [specification](Bezel_Language_Spec.md) disagree, the specification wins.*
 
 Bezel is a compiled language for services and tools. It has no garbage collector. Instead, the compiler tracks who owns every heap object and inserts the code that frees it, at a point it knows statically. You get the predictable memory use of manual management without writing a single `free`, `Dispose` or `defer`.
 
@@ -124,7 +124,7 @@ public static method Area(s: Shape): double
 end Area;
 ```
 
-The standard library's `Result<T, E>` is a choice too, and is how a function reports an expected failure without throwing:
+The standard library's `Result<T, E>` is a choice too, and is how a function reports an error its caller branches on, without throwing:
 
 ```bezel
 public static method ParsePort(text: string): Result<int, string>
@@ -302,20 +302,26 @@ end Greet;
 
 `?.` reads through a possibly-null value, `??` supplies a default, and a postfix `!` asserts non-null.
 
-**Exceptions** are for what the caller does not branch on. A class that implements `IFailure` is a *failure*: the outside world disagreed (a missing file, a closed channel), and `IFailure => …` is the arm that takes all of them. What to do about one is the handler's call. A `catch` has comma-separated arms, matched in order:
+**Choose the form by how the caller consumes the outcome.** When the caller branches on it — a missing key, text that may not parse — the standard library offers a value-shaped form instead of an exception: an `…OrNull` method that composes with `??` (`int.ParseOrNull(text) ?? 8080`), a `Try…` method, or a `Result<T, E>` when the error carries a value (§3). A guarantee the caller must provide is a contract (§8).
+
+**Exceptions** are for everything else. Most code does not catch them: an exception propagates to where the program can do something about it, usually a boundary such as a request loop or `Main`, and owned values on the way are disposed (§4), so there is no cleanup to write. A `catch` has comma-separated arms, matched in order; it names the classes it can answer, and anything unmatched keeps propagating. A class that implements `IFailure` says the outside world disagreed (a missing file, a closed channel), and an `IFailure` arm takes all of them; what to do about one is the handler's call.
 
 ```bezel
-try
-  Process(path);
-catch
-  var ex: FileNotFoundException => Console.WriteLine($"missing: {ex.Message}"),
-  var ex: IOException           => Console.WriteLine($"I/O failed: {ex.Message}")
-finally
-  Console.WriteLine("done");
-end;
+import System.IO;
+
+public static method ProcessAll(paths: Array<string>)
+  for var path in paths do
+    try
+      Process(path);
+    catch
+      FileNotFoundException => Console.Error.WriteLine($"skipped, missing: {path}"),
+      var f: IFailure       => Console.Error.WriteLine($"skipped {path}: {f.Message}")
+    end;
+  end;
+end ProcessAll;
 ```
 
-For outcomes a caller is expected to handle — bad input, a missing key — the standard library uses a `Try…` method or a `…OrNull` variant, or returns `Result<T, E>`, rather than throwing. The guide [Errors and Nullability](Bezel_Guide_02_Errors_and_Nullability.md) says when to use which.
+A bug in `Process` or a cancellation is not this loop's to answer, so it propagates, and an uncaught exception ends the program with its report. The guide [Errors and Nullability](Bezel_Guide_02_Errors_and_Nullability.md) teaches the whole story, boundaries included.
 
 ## 7. Concurrency
 
@@ -335,7 +341,7 @@ public class Program
 end Program;
 ```
 
-Concurrent work is **structured**: a `TaskScope` owns the tasks it spawns; when one faults it cancels the others, and `await scope.Join()` waits for all of them and re-raises the first fault, whatever its kind.
+Concurrent work is **structured**: a `TaskScope` owns the tasks it spawns; when one faults it cancels the others, and `await scope.Join()` waits for all of them and re-raises that one exception — never an aggregate.
 
 ```bezel
 import System.Threading;
@@ -375,7 +381,7 @@ public class Account
 end Account;
 ```
 
-`requires` is checked in every build; `ensures` and class `invariant`s are checked in the checked-contracts build. A violation raises `ContractViolationException`. Contracts may call only `pure` members — methods that the compiler verifies have no side effects. See [Contracts and Purity](Bezel_Guide_06_Contracts_and_Purity.md).
+`requires` is checked in every build; `ensures` and class `invariant`s are checked in the checked-contracts build. A violation raises `ContractViolationException`: a bug in the calling code, fixed there rather than caught. Contracts may call only `pure` members — methods that the compiler verifies have no side effects. See [Contracts and Purity](Bezel_Guide_06_Contracts_and_Purity.md).
 
 ## 9. Where to go next
 
