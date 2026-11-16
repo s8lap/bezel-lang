@@ -3572,6 +3572,18 @@ extern "C" void* bz_lazy_from_llist(void* llist, int64_t esz) {
 // Open-ended ranges have no bounded enumeration: the receiver lowering raises
 // InvalidOperationException before calling this, and as a safe fallback for any
 // other path the enumerator is marked empty (movenext yields nothing).
+//
+// fix #8637 (§16.3, v0.357): flags bit4 = the element type T is
+// UNSIGNED (byte / ushort / uint / ulong). §16.3's `Start: T?` / `End: T?` are
+// T values and the enumeration compares them in T's ORDERING, so the source
+// has to know T's signedness to read the bounds: the %bz.range slot holds each
+// endpoint SIGN-EXTENDED (the struct's uniform convention), so an unsigned T
+// above the signed midpoint of its width (`byte 200`, `ulong` above 2^63) is
+// stored as a negative i64 and a signed reading of it orders the range wrongly
+// (`byte 0..200` read signed is `0 .. -56` — an EMPTY range). The bit is set
+// by the range's CONSTRUCTION (the RangeExpr lowering), so every consumer of
+// the struct — the range->IEnumerable wrap, the LINQ receiver path and the
+// SelectMany trampoline — reads the same signedness.
 extern "C" void* bz_lazy_from_range(int64_t start, int64_t end, int64_t step,
                                     int8_t flags, int64_t esz) {
     auto* e = bz_lazy_new(BZ_LAZY_RANGE, esz);
@@ -3581,6 +3593,47 @@ extern "C" void* bz_lazy_from_range(int64_t start, int64_t end, int64_t step,
     e->phase = (int32_t)(uint8_t)flags;
     if (((uint8_t)flags & 0x6u) != 0) e->stopped = 1;  // open-ended → empty
     return e;
+}
+
+// fix #8637 (§16.3, v0.357): restore the element type T's MATHEMATICAL
+// value from a %bz.range endpoint slot. The slot holds the endpoint
+// SIGN-EXTENDED (the struct's uniform convention), so the value is truncated to
+// T's own width and re-widened by T's signedness: an unsigned `byte 200` is
+// 200 (not -56) and an unsigned `ulong` above 2^63 keeps its 64 bits.
+static int64_t bz_range_widen(int64_t v, int64_t esz, bool uns) {
+    if (esz <= 0 || esz >= 8) return v;   // 64-bit T: the bits ARE the value
+    int bits = (int)(esz * 8);
+    uint64_t mask = ((uint64_t)1 << bits) - 1;
+    uint64_t b = (uint64_t)v & mask;
+    if (uns) return (int64_t)b;           // zero-extended
+    uint64_t sign = (uint64_t)1 << (bits - 1);
+    if (b & sign) b |= ~mask;             // sign-extended
+    return (int64_t)b;
+}
+
+// fix #8637 (§16.3, v0.357): "Iteration stops silently, raising no
+// OverflowException, before the first value that would pass the range's
+// endpoint or fall outside T's representable range, whichever comes first."
+// This is the runtime mirror of the counted-loop lowering's `emitRangeAdvance`
+// (LlvmBackend_Stmts.cpp), so the lazy enumeration and the `for`-loop
+// optimization of §16.5 cannot disagree. Without it a range whose advance
+// leaves T's range WRAPS (a `long` range stepping past long.MaxValue wrapped
+// to a negative value and the enumeration never ended).
+static bool bz_range_next_fits(int64_t cur, int64_t step, int64_t esz, bool uns) {
+    __int128 base = uns ? (__int128)(uint64_t)cur : (__int128)cur;
+    __int128 next = base + (__int128)step;
+    if (esz >= 8) {
+        if (uns) return next >= 0 && next <= (__int128)UINT64_MAX;
+        return next >= (__int128)INT64_MIN && next <= (__int128)INT64_MAX;
+    }
+    int bits = (int)(esz * 8);
+    if (uns) {
+        __int128 hi = (((__int128)1) << bits) - 1;
+        return next >= 0 && next <= hi;
+    }
+    __int128 hi = (((__int128)1) << (bits - 1)) - 1;
+    __int128 lo = -(((__int128)1) << (bits - 1));
+    return next >= lo && next <= hi;
 }
 
 // ---------------------------------------------------------------------------
@@ -4094,19 +4147,52 @@ static int32_t bz_lazy_movenext(bz_lazy_t* e) {
     // sign of the step; inclusive/exclusive of the upper bound is phase bit0.
     // This mirrors the for-in counted-loop semantics (a zero step yields nothing
     // rather than looping forever; open-ended ranges were marked e->stopped).
+    //
+    // fix #8637 (§16.3, §16.5, v0.357): the bounds are read in the ELEMENT
+    // TYPE's ordering, and the advance stops before the first value that
+    // would leave T's representable range:
+    //   * the bounds arrive in the %bz.range slot's SIGN-EXTENDED convention,
+    //     so they are restored to T's mathematical value (bz_range_widen);
+    //   * the comparison uses T's signedness (phase bit4 = unsigned T): an
+    //     unsigned T compares UNSIGNED, so `byte 0..200` is 201 values and a
+    //     `ulong` range above 2^63 is not empty (the signed reading of it
+    //     ordered the range backwards);
+    //   * the advance is range-checked (bz_range_next_fits), so a range whose
+    //     step leaves T's range stops instead of wrapping and repeating.
     case BZ_LAZY_RANGE: {
         if (e->stopped) return 0;
-        int64_t cur = e->idx, end = e->n, step = e->up_esz;
+        int64_t step = e->up_esz;
         if (step == 0) return 0;
         bool incl = (e->phase & 1) != 0;
-        bool inRange = (step < 0) ? (incl ? cur >= end : cur > end)
-                                  : (incl ? cur <= end : cur < end);
+        bool isChar = (e->phase & 0x8) != 0;
+        bool uns = (e->phase & 0x10) != 0;
+        int64_t esz = e->esz;
+        int64_t cur = bz_range_widen(e->idx, esz, uns);
+        int64_t end = bz_range_widen(e->n, esz, uns);
+        bool inRange;
+        if (uns) {
+            uint64_t ucur = (uint64_t)cur, uend = (uint64_t)end;
+            inRange = (step < 0) ? (incl ? ucur >= uend : ucur > uend)
+                                 : (incl ? ucur <= uend : ucur < uend);
+        } else {
+            inRange = (step < 0) ? (incl ? cur >= end : cur > end)
+                                 : (incl ? cur <= end : cur < end);
+        }
         if (!inRange) return 0;
         memcpy(e->cur, &cur, (size_t)e->esz);  // low esz bytes = truncation to T
         // §16.3 (v0.183, #1586): phase bit3 flags a Range<char> — step across
         // the UTF-16 surrogate gap instead of plain arithmetic.
-        bool isChar = (e->phase & 0x8) != 0;
-        e->idx = isChar ? bz_char_range_step(cur, step) : cur + step;
+        if (isChar) {
+            e->idx = bz_char_range_step(cur, step);
+            return 1;
+        }
+        // §16.3: the next value must still lie in T's representable range;
+        // otherwise the enumeration stops here (silently, no OverflowException).
+        if (!bz_range_next_fits(cur, step, esz, uns)) {
+            e->stopped = 1;
+            return 1;
+        }
+        e->idx = (int64_t)((uint64_t)cur + (uint64_t)step);
         return 1;
     }
     case BZ_LAZY_WHERE: {

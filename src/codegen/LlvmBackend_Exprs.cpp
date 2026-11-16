@@ -2300,6 +2300,35 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (re->inclusive) flags |= 1u;
         if (!re->lo)       flags |= 2u;
         if (!re->hi)       flags |= 4u;
+        // fix #8637 (§16.3, v0.357): bit 4 = the element type T is
+        // UNSIGNED (byte / ushort / uint / ulong). §16.3's `Start: T?` and
+        // `End: T?` are T values and its `GetEnumerator` yields them "from
+        // `Start` to `End` ... incrementing by `Step`" — in T's ORDERING — so
+        // a consumer of this struct must know T's signedness:
+        // the struct's uniform i64 slot holds each endpoint SIGN-EXTENDED (the
+        // convention `emitRangeContains` (#6749/#6752) and `emitRangeToString`
+        // (#6800) already undo), so an unsigned T above the signed midpoint of
+        // its width (`byte 200`, a `ulong` above 2^63) reads as a NEGATIVE
+        // value and the range orders backwards — `byte 0..200` drained through
+        // `IEnumerable<byte>` yielded ZERO elements. The bit is recorded HERE,
+        // at the range's CONSTRUCTION, so every consumer of the struct — the
+        // range->`IEnumerable<T>` wrap, the LINQ receiver path and the
+        // SelectMany trampoline — reads the same signedness. `char` is NOT
+        // flagged: §16.3's Range<char> steps across the UTF-16 surrogate gap
+        // (a separate mechanism, marked by bit 3 at the wrap sites) and its
+        // code points are always non-negative, so the signed reading is right.
+        {
+            const sema::TypeRef* rngTy = ctx_.exprType(e);
+            if (isRangeType(rngTy) && !rngTy->genericArgs.empty() &&
+                rngTy->genericArgs[0]) {
+                const sema::TypeRef* elemTy =
+                    resolveTypeParamRef(rngTy->genericArgs[0]);
+                if (elemTy && elemTy->kind == sema::TypeRef::Kind::Primitive &&
+                    elemTy->primitive != sema::PrimitiveType::Char &&
+                    isUnsignedPrim(elemTy->primitive))
+                    flags |= 0x10u;
+            }
+        }
         llvm::Value* flagsV =
             llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), flags);
         // Assemble the struct via insertvalue.
