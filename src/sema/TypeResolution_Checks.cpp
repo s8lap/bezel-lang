@@ -12097,6 +12097,16 @@ void Resolver::checkStaticInterfaceConformance() {
                         if (!typesMatch(subIrt, crt)) continue;
                     }
                     matched = true;
+                    // fix #8649 (spec §14.2, v0.357): record the STATIC
+                    // witness too. §14.2's "a method implementing a generic
+                    // interface method" names an interface STATIC generic
+                    // method as well, and its implementation that omits
+                    // `where` inherits that member's set; the inherited-set
+                    // lookup (`ExprTC::inheritedConstraintSets`) follows this
+                    // recorded relation, exactly as for an instance member
+                    // (`checkAbstractImplementations`, #8184). Operators are
+                    // not generic methods and are not recorded.
+                    if (!im->isOperator) ctx_.recordInterfaceWitness(t, im, cms);
                     break;
                 }
                 if (matched) continue;

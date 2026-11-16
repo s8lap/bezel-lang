@@ -9803,6 +9803,61 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
                 methodGenericConstraints.push_back(std::move(mgc));
             }
+            // fix #8649 (spec §14.2 / §14.1, v0.357): an `override` or an
+            // interface implementation that OMITS its `where` clause for a
+            // type parameter has "exactly the inherited set" (§14.2) — the
+            // method's OWN constraint set, so it holds at every instantiation
+            // of the method (§14.1). The AST-written clauses above are empty
+            // for that recommended spelling, so the inherited set was never
+            // checked here and `new D().Z("x")` was admitted against
+            // `where S: INum<S>`. Read it through the SAME inherited-set
+            // lookup the body's §11.8 view uses (#8618), and enforce EVERY
+            // inherited declaration's set: a method implementing two
+            // interfaces' members satisfies both of their callers only if
+            // every set holds. The bounds come back read under the base's or
+            // interface's substitution and renamed onto this method's own
+            // parameters, so the loop below checks them exactly as a written
+            // clause.
+            if (ms)
+                for (std::size_t gi = 0; gi < md->genericParams.size(); ++gi) {
+                    for (const auto& set : inheritedConstraintSets(ms, md, gi)) {
+                        MethodGenericConstraint mgc;
+                        mgc.typeParam = md->genericParams[gi].name;
+                        auto typeItem = [&](TypeRef* raw) {
+                            MethodConstraintItem mi;
+                            mi.kind = "type";
+                            mi.bound = inheritedBound(set, raw);
+                            if (mi.bound && !mi.bound->declaration &&
+                                mi.bound->genericArgs.empty())
+                                mi.boundParamName = mi.bound->headName();
+                            mgc.items.push_back(mi);
+                        };
+                        if (set.clause) {
+                            for (const auto& item : set.clause->items) {
+                                if (item.kind == "type") {
+                                    if (item.typeArg)
+                                        typeItem(
+                                            ctx_.resolvedType(*item.typeArg));
+                                    continue;
+                                }
+                                MethodConstraintItem mi;
+                                mi.kind = item.kind;
+                                mgc.items.push_back(mi);
+                            }
+                        } else if (set.imported) {
+                            for (std::string_view k :
+                                 set.imported->specialConstraints) {
+                                MethodConstraintItem mi;
+                                mi.kind = k;
+                                mgc.items.push_back(mi);
+                            }
+                            for (TypeRef* ctr : set.imported->constraintTypes)
+                                if (ctr) typeItem(ctr);
+                        }
+                        if (!mgc.items.empty())
+                            methodGenericConstraints.push_back(std::move(mgc));
+                    }
+                }
         } else if (ms) {
             for (Symbol* gp : ms->genericParams) {
                 auto* gps = dynamic_cast<GenericParamSymbol*>(gp);

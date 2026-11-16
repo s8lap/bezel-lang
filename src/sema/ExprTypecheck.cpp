@@ -18107,9 +18107,9 @@ TypeRef* ExprTC::typeParamTypeRef(std::string_view name) {
     return tr;
 }
 
-// fix #8618 (spec §14.2 *Constraints on overrides and interface
-// implementations*, v0.357): the INHERITED constraint set of the current
-// METHOD's own type parameter.
+// fix #8618, fix #8649 (spec §14.2 *Constraints on overrides and interface
+// implementations*, v0.357): the INHERITED constraint sets of method `self`'s
+// type parameter at position `gi`.
 //
 // §14.2, quoted: "An `override` of a generic method, and a method implementing
 // a generic interface method (an interface member declaring type parameters of
@@ -18121,68 +18121,48 @@ TypeRef* ExprTC::typeParamTypeRef(std::string_view name) {
 // or overridden base's substitution, its method type parameters renamed
 // positionally".
 //
-// `forEachConstraintBound` above reads the AST-WRITTEN clauses only — the
-// method's, the enclosing type's, the enclosing extension's — so for the
-// RECOMMENDED spelling (the clause omitted) it yields nothing and the
-// inherited set was invisible to every consumer of that walk. This walk
-// yields the inherited set instead: the overridden base method's or the
-// implemented interface method's own clause at the SAME POSITION of the
-// method's type-parameter list, with the inherited declaration's method type
-// parameter RENAMED to the current method's.
-//
-// The declaration it inherits from is found through the RESOLVER's own witness
-// tables — the relation the compiler recorded — never by a name-and-arity
-// guess:
+// The declarations a method inherits from are found through the RESOLVER's own
+// witness tables — the relation the compiler recorded — never by a
+// name-and-arity guess:
 //   * an `override` — `SemaContext::interfaceWitnesses(overridingMethod,
 //     baseMethod)` is the pair `recordInterfaceWitness(ms, base, ms)` writes
-//     (TypeResolution_Checks.cpp), so the base member is the one the current
-//     method is recorded as the witness of;
+//     (TypeResolution_Checks.cpp), so the base member is the one the method is
+//     recorded as the witness of. A same-shape SIBLING is a distinct member
+//     (§12.2) and is not recorded — it inherits nothing;
 //   * an interface IMPLEMENTATION — `SemaContext::interfaceWitnesses(type,
 //     interfaceMember)` lists the implementing methods the §11.2 conformance
-//     check chose, so the interface member is the one this method is
-//     recorded among.
-// A member that is neither — a plain member, a sibling overload, a base
-// member this method does not override (§12.2's "distinct member") — inherits
-// nothing, and contributes no bound here.
-bool ExprTC::forEachInheritedConstraintBound(
-    std::string_view paramName,
-    const std::function<bool(TypeRef*)>& fn) {
-    const ast::MethodDecl* md = currentMethodDecl_;
-    if (!md || !currentType_) return false;
-    // (1) The parameter must be the CURRENT METHOD's own type parameter: a
-    // class's or an extension block's parameter inherits nothing (its
-    // constraint set is the type's own).
-    std::size_t gi = md->genericParams.size();
-    for (std::size_t i = 0; i < md->genericParams.size(); ++i)
-        if (md->genericParams[i].name == paramName) { gi = i; break; }
-    if (gi == md->genericParams.size()) return false;
-    // (2) A WRITTEN clause is the method's own set — §14.2 admits only an
-    // EQUIVALENT restatement of the inherited one — so nothing is inherited
-    // and the ordinary walk already saw it.
+//     check chose (the instance check `checkAbstractImplementations`, and —
+//     fix #8649 — the static check `checkStaticInterfaceConformance` for an
+//     interface STATIC generic method, which §14.2's sentence names too), so
+//     the interface member is one this method is recorded among.
+// A member that is neither — a plain member, a sibling overload, a base member
+// this method does not override — inherits nothing.
+//
+// EVERY inherited declaration is returned, not only the first one found
+// (fix #8649): a method implementing two interfaces' same-shape members
+// inherits from both. A CHAINED omission — the inherited declaration omits its
+// clause too, which §14.2 admits at any level — is climbed to the declaration
+// THAT one inherits from, composing the class substitution hop by hop
+// (`class D: B<Num>`, `class B<W>: A<W>` reads A's `X` as `Num`). A chain that
+// ends with no clause at all yields an EMPTY set (`clause` and `imported` both
+// null): the declaration it reaches constrains the parameter by nothing.
+std::vector<ExprTC::InheritedConstraintSet> ExprTC::inheritedConstraintSets(
+    const MethodSymbol* self, const ast::MethodDecl* md, std::size_t gi) {
+    std::vector<InheritedConstraintSet> out;
+    if (!self || !md || gi >= md->genericParams.size() || !self->parent) return out;
+    // A WRITTEN clause is the method's own set — §14.2 admits only an
+    // EQUIVALENT restatement of the inherited one — so nothing is inherited.
     for (const auto& gc : md->genericConstraints)
-        if (gc.typeParam == paramName) return false;
-    // (3) The current method's own symbol: the witness the tables key on.
-    const MethodSymbol* self = nullptr;
-    for (const Symbol* mem : currentType_->members)
-        if (auto* ms = dynamic_cast<const MethodSymbol*>(mem))
-            if (ms->decl == md) { self = ms; break; }
-    if (!self) return false;
-    // (4) The declaration a method inherits from, in its owner's BASE CLOSURE
-    // (classes AND interfaces — the interface-implementation case is not
-    // materialized onto the symbol by #5039, which runs for `override` only).
-    // The relation is the RESOLVER's own, never a name-and-arity guess:
-    //   * an `override` — `SemaContext::interfaceWitnesses(overridingMethod,
-    //     baseMethod)` is the pair `recordInterfaceWitness(ms, base, ms)`
-    //     writes (TypeResolution_Checks.cpp), so the base member is the one
-    //     the method is recorded as the witness of. A same-shape SIBLING is a
-    //     distinct member (§12.2) and is not recorded — it inherits nothing;
-    //   * an interface IMPLEMENTATION —
-    //     `SemaContext::interfaceWitnesses(type, interfaceMember)` lists the
-    //     implementing methods the §11.2 conformance check chose, so the
-    //     interface member is the one this method is recorded among.
-    auto findInherited = [&](const MethodSymbol* from) -> const MethodSymbol* {
+        if (gc.typeParam == md->genericParams[gi].name) return out;
+    // The declarations `from` (owned by `fromOwner`) directly inherits from,
+    // in its owner's BASE CLOSURE (classes AND interfaces — the
+    // interface-implementation case is not materialized onto the symbol by
+    // #5039, which runs for `override` only).
+    auto directInherited =
+        [&](const MethodSymbol* from) -> std::vector<const MethodSymbol*> {
+        std::vector<const MethodSymbol*> found;
         const TypeSymbol* owner = from->parent;
-        if (!owner) return nullptr;
+        if (!owner) return found;
         std::vector<const TypeSymbol*> queue;
         std::unordered_set<const TypeSymbol*> seen{owner};
         for (const TypeSymbol* b : owner->baseTypes)
@@ -18193,9 +18173,9 @@ bool ExprTC::forEachInheritedConstraintBound(
                 cur->kind == ast::TypeDeclKind::Interface;
             for (const Symbol* mem : cur->members) {
                 auto* ms = dynamic_cast<const MethodSymbol*>(mem);
-                if (!ms || ms->isOperator || ms->name != md->name ||
-                    ms->params.size() != md->params.size() ||
-                    ms->genericParams.size() != md->genericParams.size())
+                if (!ms || ms->isOperator || ms->name != from->name ||
+                    ms->params.size() != from->params.size() ||
+                    ms->genericParams.size() != from->genericParams.size())
                     continue;
                 if (curIsIface) {
                     const auto* wit = ctx_.interfaceWitnesses(owner, ms);
@@ -18205,121 +18185,200 @@ bool ExprTC::forEachInheritedConstraintBound(
                 } else {
                     if (!ctx_.interfaceWitnesses(from, ms)) continue;
                 }
-                return ms;
+                if (std::find(found.begin(), found.end(), ms) == found.end())
+                    found.push_back(ms);
             }
             for (const TypeSymbol* b : cur->baseTypes)
                 if (b && seen.insert(b).second) queue.push_back(b);
         }
-        return nullptr;
+        return found;
     };
-    // (5) The inherited declaration's own clause, at the SAME POSITION of its
-    // method type-parameter list (§14.2's positional correspondence). A
-    // CHAINED omission — the inherited declaration omits its clause too, which
-    // §14.2 admits at any level — is climbed: the set is inherited from the
-    // declaration THAT one inherits from.
-    //
-    // The inherited declaration's METHOD type-parameter NAMES are collected as
-    // the climb proceeds: §14.2 reads the inherited set "under the implemented
-    // interface's or overridden base's substitution, its method type parameters
-    // renamed positionally", so every one of them is renamed, not only the one
-    // the clause is about.
-    std::vector<std::string_view> inhParamNames;
-    const ast::GenericConstraint* inhClause = nullptr;
-    const std::vector<ImportedGenericConstraint>* inhImported = nullptr;
-    const TypeSymbol* inhOwner = nullptr;   // the base / interface declaring it
-    const TypeSymbol* inhDerived = nullptr;  // the type that inherits from it
-    const MethodSymbol* inh = findInherited(self);
-    inhDerived = self->parent;
-    for (std::size_t depth = 0; inh && depth < 64; ++depth) {
-        inhOwner = inh->parent;
-        inhParamNames.clear();
-        if (auto* inhDecl =
-                dynamic_cast<const ast::MethodDecl*>(inh->decl)) {
-            if (gi >= inhDecl->genericParams.size()) return false;
-            for (const auto& gp : inhDecl->genericParams)
-                inhParamNames.push_back(gp.name);
-            inhClause = nullptr;
-            for (const auto& gc : inhDecl->genericConstraints)
-                if (gc.typeParam == inhParamNames[gi]) {
-                    inhClause = &gc;
-                    break;
-                }
-            if (inhClause) break;
-        } else {
-            // An IMPORTED base/interface member carries no AST; its
-            // constraint set comes from the module side table (ModuleLoader,
-            // #2391). An absent side table is the climb boundary — the
-            // pre-#5091 behaviour, the safe direction.
-            inhImported = ctx_.importedGenericConstraints(inh);
-            if (!inhImported || gi >= inhImported->size()) return false;
-            for (const auto& ig : *inhImported)
-                inhParamNames.push_back(ig.typeParam);
-            break;
-        }
-        inhDerived = inhOwner;
-        inh = findInherited(inh);
-    }
-    if (!inh || (!inhClause && !inhImported)) return false;
-    // (6) The bound, read UNDER the base's (or the interface's) substitution
-    // and with the inherited declaration's method type parameters RENAMED
-    // positionally — §14.2's rule, quoted above. Two NAME substitutions
-    // compose, and the shared walker (`sema::substituteGenericArgs`) is the
-    // one that performs them:
-    //   * the CLASS/INTERFACE substitution — the base's or the interface's own
-    //     type parameters, read at the INHERITING type's base clause (or
-    //     interface list): `class D: B<Num>` fixes B's `X` to `Num`. A
-    //     parameter name the inherited METHOD declares SHADOWS the enclosing
-    //     type's parameter of the same name (§2.7's scope rule), so such a
-    //     name is not substituted by the class substitution;
-    //   * the METHOD-level rename — the inherited declaration's method type
-    //     parameter at position i becomes the current method's parameter at
-    //     position i. It is applied LAST, so it wins over the class
-    //     substitution for a name the two share.
-    std::unordered_map<std::string_view, TypeRef*> subst;
-    if (inhOwner && inhDerived) {
-        const TypeRef* bref = nullptr;
-        for (std::size_t i = 0;
-             i < inhDerived->baseTypes.size() &&
-             i < inhDerived->baseTypeRefs.size(); ++i)
-            if (inhDerived->baseTypes[i] == inhOwner) {
-                bref = inhDerived->baseTypeRefs[i];
-                break;
+    // The CLASS/INTERFACE substitution of `inhOwner`'s own type parameters,
+    // read from `derived` along the base-clause path that reaches it and
+    // re-expressed hop by hop: `prior` is the substitution of `derived`'s own
+    // parameters (empty at the method's own type), and each hop maps a base's
+    // parameters to the base clause's arguments under the hop before it —
+    // `class D: B<Num>`, `class B<W>: A<W>` reads A's `X` as `Num`, and
+    // `class D: B` over `class B: I<Num>` reads I's `T` as `Num`. An owner the
+    // base graph does not reach keeps its parameters unsubstituted.
+    auto pathSubst =
+        [&](const TypeSymbol* derived, const TypeSymbol* inhOwner,
+            const std::unordered_map<std::string_view, TypeRef*>& prior)
+        -> std::unordered_map<std::string_view, TypeRef*> {
+        using Map = std::unordered_map<std::string_view, TypeRef*>;
+        std::unordered_map<const TypeSymbol*, Map> substOf;
+        if (!derived || !inhOwner) return {};
+        substOf[derived] = prior;
+        std::vector<const TypeSymbol*> queue{derived};
+        for (std::size_t qi = 0; qi < queue.size(); ++qi) {
+            const TypeSymbol* cur = queue[qi];
+            if (cur == inhOwner) return substOf[cur];
+            const Map curMap = substOf[cur];
+            for (std::size_t i = 0; i < cur->baseTypes.size(); ++i) {
+                const TypeSymbol* b = cur->baseTypes[i];
+                if (!b || substOf.count(b)) continue;
+                const TypeRef* bref = i < cur->baseTypeRefs.size()
+                                          ? cur->baseTypeRefs[i]
+                                          : nullptr;
+                Map m;
+                if (bref)
+                    for (std::size_t k = 0; k < b->genericParams.size() &&
+                                             k < bref->genericArgs.size(); ++k) {
+                        if (!b->genericParams[k] || !bref->genericArgs[k])
+                            continue;
+                        TypeRef* a = bref->genericArgs[k];
+                        if (!curMap.empty())
+                            a = sema::substituteGenericArgs(
+                                a, sema::SubstArgs{ctx_, curMap});
+                        m[b->genericParams[k]->name] = a;
+                    }
+                substOf[b] = std::move(m);
+                queue.push_back(b);
             }
-        if (bref)
-            for (std::size_t i = 0; i < inhOwner->genericParams.size() &&
-                                     i < bref->genericArgs.size(); ++i) {
-                if (!inhOwner->genericParams[i] || !bref->genericArgs[i])
+        }
+        return {};
+    };
+    struct Work {
+        const MethodSymbol* from;
+        std::unordered_map<std::string_view, TypeRef*> classSubst;
+    };
+    std::vector<Work> work{{self, {}}};
+    std::unordered_set<const MethodSymbol*> visited{self};
+    for (std::size_t wi = 0; wi < work.size() && wi < 256; ++wi) {
+        const MethodSymbol* from = work[wi].from;
+        const auto fromSubst = work[wi].classSubst;
+        for (const MethodSymbol* inh : directInherited(from)) {
+            if (!visited.insert(inh).second) continue;
+            auto cls = pathSubst(from->parent, inh->parent, fromSubst);
+            InheritedConstraintSet set;
+            std::vector<std::string_view> inhParamNames;
+            // SEAM-ACCESSOR: the both-sources read of an inherited method's
+            // constraint set — the AST arm here, the imported side table
+            // (`importedGenericConstraints`) in the `else` arm below.
+            auto* inhDecl = dynamic_cast<const ast::MethodDecl*>(inh->decl);
+            if (inhDecl) {
+                if (gi >= inhDecl->genericParams.size()) continue;
+                for (const auto& gp : inhDecl->genericParams)
+                    inhParamNames.push_back(gp.name);
+                for (const auto& gc : inhDecl->genericConstraints)
+                    if (gc.typeParam == inhParamNames[gi]) {
+                        set.clause = &gc;
+                        break;
+                    }
+                if (!set.clause) {
+                    // Omitted at this level too: climb to what IT inherits.
+                    // A declaration that inherits nothing is the chain's end
+                    // and constrains the parameter by nothing.
+                    if (directInherited(inh).empty()) out.push_back(set);
+                    else work.push_back({inh, std::move(cls)});
                     continue;
-                std::string_view pn = inhOwner->genericParams[i]->name;
-                if (std::find(inhParamNames.begin(), inhParamNames.end(), pn) !=
-                    inhParamNames.end())
-                    continue;  // shadowed by a method parameter
-                subst[pn] = bref->genericArgs[i];
+                }
+            } else {
+                // An IMPORTED base/interface member carries no AST; its
+                // constraint set comes from the module side table
+                // (ModuleLoader, #2391). An absent side table is the climb
+                // boundary — nothing is known, so nothing is inherited.
+                const auto* imp = ctx_.importedGenericConstraints(inh);
+                if (!imp || gi >= imp->size()) continue;
+                set.imported = &(*imp)[gi];
+                for (const auto& ig : *imp)
+                    inhParamNames.push_back(ig.typeParam);
             }
-    }
-    for (std::size_t i = 0; i < inhParamNames.size() &&
-                             i < md->genericParams.size(); ++i) {
-        std::string_view from = inhParamNames[i];
-        std::string_view to = md->genericParams[i].name;
-        if (from.empty() || to.empty() || from == to) continue;
-        subst[from] = typeParamTypeRef(to);
-    }
-    auto renamed = [&](TypeRef* ctr) -> TypeRef* {
-        if (!ctr || subst.empty()) return ctr;
-        return sema::substituteGenericArgs(ctr,
-                                            sema::SubstArgs{ctx_, subst});
-    };
-    if (inhClause) {
-        for (const ast::ConstraintItem& item : inhClause->items) {
-            if (item.kind != "type" || !item.typeArg) continue;
-            TypeRef* ctr = ctx_.resolvedType(*item.typeArg);
-            if (!ctr || ctr->kind != TypeRef::Kind::Named) continue;
-            if (fn(renamed(ctr))) return true;
+            // The CLASS substitution, then the METHOD-level rename: the
+            // inherited declaration's method type parameter at position i
+            // becomes `self`'s parameter at position i. A class parameter
+            // name the inherited METHOD declares is SHADOWED by it (§2.7's
+            // scope rule), so the rename replaces it.
+            set.subst = std::move(cls);
+            for (std::size_t i = 0; i < inhParamNames.size() &&
+                                     i < md->genericParams.size(); ++i) {
+                std::string_view fromName = inhParamNames[i];
+                std::string_view to = md->genericParams[i].name;
+                if (fromName.empty() || to.empty()) continue;
+                if (fromName == to) {
+                    set.subst.erase(fromName);
+                    continue;
+                }
+                set.subst[fromName] = typeParamTypeRef(to);
+            }
+            out.push_back(std::move(set));
         }
-        return false;
     }
-    for (TypeRef* ctr : (*inhImported)[gi].constraintTypes)
-        if (ctr && fn(renamed(ctr))) return true;
+    return out;
+}
+
+// fix #8649: an inherited bound read under its set's substitution (above).
+TypeRef* ExprTC::inheritedBound(const InheritedConstraintSet& set,
+                                TypeRef* ctr) {
+    if (!ctr || set.subst.empty()) return ctr;
+    return sema::substituteGenericArgs(ctr, sema::SubstArgs{ctx_, set.subst});
+}
+
+// fix #8618 (spec §14.2, v0.357): the `type`-kind bounds of the CURRENT
+// METHOD's own type parameter `paramName` that its INHERITED set guarantees —
+// what the body of an `override` / interface implementation that OMITS its
+// `where` clause may rely on (`T.Zero()`, and — fix #8649 — `a + a` through
+// `findConstraintStaticOperator`).
+//
+// `forEachConstraintBound` reads the AST-WRITTEN clauses only — the method's,
+// the enclosing type's, the enclosing extension's — so for the RECOMMENDED
+// spelling (the clause omitted) it yields nothing.
+//
+// fix #8649: when the method inherits from SEVERAL declarations (two
+// interfaces' same-shape members), only a bound EVERY one of them requires is
+// yielded. Each declaration's own callers are checked against that
+// declaration's set alone (a call through an `I2` reference checks `I2`'s
+// clause), so the body may rely only on what every dispatch path guarantees;
+// a bound only ONE declaration names would let a call through the other
+// dispatch a static member the type argument does not have. The instantiation
+// site of a direct call enforces the UNION (ExprTypecheck_Calls.cpp's
+// `checkMethodGenericConstraints`).
+bool ExprTC::forEachInheritedConstraintBound(
+    std::string_view paramName,
+    const std::function<bool(TypeRef*)>& fn) {
+    const ast::MethodDecl* md = currentMethodDecl_;
+    if (!md || !currentType_) return false;
+    // The parameter must be the CURRENT METHOD's own type parameter: a
+    // class's or an extension block's parameter inherits nothing (its
+    // constraint set is the type's own).
+    std::size_t gi = md->genericParams.size();
+    for (std::size_t i = 0; i < md->genericParams.size(); ++i)
+        if (md->genericParams[i].name == paramName) { gi = i; break; }
+    if (gi == md->genericParams.size()) return false;
+    const MethodSymbol* self = nullptr;
+    for (const Symbol* mem : currentType_->members)
+        if (auto* ms = dynamic_cast<const MethodSymbol*>(mem))
+            if (ms->decl == md) { self = ms; break; }
+    if (!self) return false;
+    const auto sets = inheritedConstraintSets(self, md, gi);
+    if (sets.empty()) return false;
+    auto boundsOf = [&](const InheritedConstraintSet& s) {
+        std::vector<TypeRef*> bs;
+        if (s.clause) {
+            for (const ast::ConstraintItem& item : s.clause->items) {
+                if (item.kind != "type" || !item.typeArg) continue;
+                TypeRef* ctr = ctx_.resolvedType(*item.typeArg);
+                if (!ctr || ctr->kind != TypeRef::Kind::Named) continue;
+                bs.push_back(inheritedBound(s, ctr));
+            }
+        } else if (s.imported) {
+            for (TypeRef* ctr : s.imported->constraintTypes)
+                if (ctr) bs.push_back(inheritedBound(s, ctr));
+        }
+        return bs;
+    };
+    std::vector<std::vector<TypeRef*>> all;
+    for (const auto& s : sets) all.push_back(boundsOf(s));
+    for (TypeRef* b : all[0]) {
+        bool everywhere = true;
+        for (std::size_t k = 1; k < all.size() && everywhere; ++k)
+            everywhere = std::any_of(
+                all[k].begin(), all[k].end(),
+                [&](const TypeRef* o) {
+                    return Resolver::typeRefEqualSameScope(b, o);
+                });
+        if (everywhere && fn(b)) return true;
+    }
     return false;
 }
 
@@ -18434,11 +18493,19 @@ MethodSymbol* ExprTC::findConstraintStaticOperator(std::string_view paramName,
         }
         return false;
     };
-    forEachConstraintBound(paramName, [&](TypeRef* ctr) -> bool {
+    auto scanBound = [&](TypeRef* ctr) -> bool {
         TypeSymbol* iface = ctr->declaration;
         if (!iface || iface->kind != ast::TypeDeclKind::Interface) return false;
         return scanClosure(iface, ctr);
-    });
+    };
+    forEachConstraintBound(paramName, scanBound);
+    // fix #8649 (spec §14.2, v0.357): an `override` / interface implementation
+    // that OMITS its `where` clause has "exactly the inherited set", so its
+    // operators resolve through the INHERITED bounds as well — the same
+    // inherited-set walk the §11.8 static-member lookup reads (#8618). It
+    // yields nothing when the method writes its own clause (already walked).
+    if (!found && !groupWitness)
+        forEachInheritedConstraintBound(paramName, scanBound);
     if (found) return found;
     if (groupWitness && outBound) *outBound = groupBound;
     return groupWitness;

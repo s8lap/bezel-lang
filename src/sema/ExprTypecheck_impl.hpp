@@ -901,6 +901,33 @@ private:
     bool forEachInheritedConstraintBound(
         std::string_view paramName,
         const std::function<bool(TypeRef*)>& fn);
+    // fix #8649 (spec §14.2 / §14.1, v0.357): ONE inherited constraint set of
+    // a method's type parameter — the clause of one declaration the method
+    // overrides or implements (directly, or through a chained omission), read
+    // under `subst`: the class/interface substitution along the base path,
+    // then the positional rename of that declaration's method type parameters
+    // to the inheriting method's. `clause` (a local declaration) or `imported`
+    // (an imported one's side-table entry) is set; neither means the chain
+    // reached a declaration that constrains the parameter by nothing.
+    struct InheritedConstraintSet {
+        const ast::GenericConstraint* clause = nullptr;
+        const ImportedGenericConstraint* imported = nullptr;
+        std::unordered_map<std::string_view, TypeRef*> subst;
+    };
+    // fix #8649: EVERY inherited set of `self`'s type parameter at position
+    // `gi` (empty when `self` writes its own clause for it, or inherits
+    // nothing). The ONE lookup both consumers read: the body's view
+    // (`forEachInheritedConstraintBound`, the bounds common to every set) and
+    // the instantiation-site check (ExprTypecheck_Calls.cpp's
+    // `checkMethodGenericConstraints`, every set). Defined in
+    // ExprTypecheck.cpp beside `forEachInheritedConstraintBound`.
+    // `md` is `self`'s own (local) declaration, which both callers already
+    // hold — `self` is always a method whose body or call this module
+    // type-checks.
+    std::vector<InheritedConstraintSet> inheritedConstraintSets(
+        const MethodSymbol* self, const ast::MethodDecl* md, std::size_t gi);
+    // fix #8649: `ctr` read under `set.subst`.
+    TypeRef* inheritedBound(const InheritedConstraintSet& set, TypeRef* ctr);
     // fix #8618 (spec §14.2, v0.357): a TypeRef for a type parameter that no
     // AST site in this scope spells — the inherited clause names the BASE's
     // method type parameter, and the current method's own parameter is
