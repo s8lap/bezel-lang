@@ -1,6 +1,6 @@
 # Bezel Guide 7: Style
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.326.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.359.*
 
 Nothing in this guide is enforced. The compiler checks none of the naming conventions — spec §1.3 states them and says in the same breath that it does not enforce them — no formatter ships with the toolchain, and every layout rule below compiles identically when it is ignored. What the conventions buy is that a reader recognizes a declaration's shape before reading its words, and that a diff shows the change rather than the reflow. Where a rule of style touches a rule of the language — the closers of §1.6, `_` as the reserved discard (§17.13), the no-hiding rule (§12.2), the field order that §28.4's reverse-order disposal makes load-bearing (§4) — the language rule is cited and never bent. The worked reference is the tour in `docs/proposals/0002-http-server.md` §2; the sections below generalize from it, and a formatter, when one exists, should encode them.
 
@@ -37,7 +37,7 @@ end IPostingRule;
 
 **Constants split by kind.** A class-level `const` and a compile-time `const` local are PascalCase — `const MaxUsers := 1000;` is spec §21.1's own example. A runtime `const` local (§21.1) is an ordinary local that happens not to be reassignable, and takes camelCase: `const openingBalance := account.Balance;`, matching §21.1's `const n := items.Count + 1;`.
 
-**The three access tiers have three names** — plain (`Parse`), `XOrNull` (`ParseOrNull`), `TryX` (`TryParse`) — and stdlib §1 defines what each name promises (taught in Guide 2 §2). Invent no fourth spelling — `GetSafe`, `MaybeGet`, `Get2` say nothing the tier names do not. Domain methods borrow the same vocabulary: the tour's store is `Find`/`Add`/`Update`/`Remove`, verbs a reader already knows from the collections.
+**The three access forms have three names** — the throwing form plain (`Parse`), and the two value-shaped forms `XOrNull` (`ParseOrNull`) and `TryX` (`TryParse`) — and stdlib §1 defines what each name promises (taught in [Guide 2](Bezel_Guide_02_Errors_and_Nullability.md) §2). An operation whose `bool` result reports a declined attempt takes the `Try` name as well — `TryAdd`, and `TryPost` below (stdlib §1's bool-only Try shape) — so a reader sees that `false` is an expected outcome to branch on, not an error code. Invent no fourth spelling — `GetSafe`, `MaybeGet`, `Get2` say nothing the form names do not. (Some stdlib names return a value-shaped result under a plain name where no throwing form exists — `Environment.Get(name): string?`, stdlib §2.4, and the collections' `Remove(item): bool` — so read the signature there.) Domain methods borrow the same vocabulary: the tour's store is `Find`/`Add`/`Update`/`Remove`, verbs a reader already knows from the collections.
 
 **`Async` marks a pair, not a signature.** The rule the stdlib actually follows (stdlib §1) is narrower than the habit: the suffix marks the asynchronous half of a **sync/async pair** — `Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`. An operation that exists only asynchronously carries no suffix at all: `Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`. `Receive` beside `SendAsync` on one endpoint pair is the rule working, not an inconsistency. So an `async method Post` with no synchronous sibling is named `Post`, and adding a synchronous sibling later is what renames it.
 
@@ -55,7 +55,7 @@ using var settled := postings.Where(                              // anything mo
 
 **A name is never reused down an inheritance chain**, and here the language agrees: §12.2 forbids hiding, so a derived member whose name a visible inherited member already has is a compile error unless it is an `override`. The one exception is `Object`'s `Equals`, `GetHashCode` and `ToString` at another parameter list (`Equals(a: K, b: K)` for `IEqualityComparer<K>`, `ToString(format: string)` for `IFormattable`), which overload the inherited member rather than hide it; a class's `Equals(other: Point)` for `IEquatable<Point>` is not an overload but the `Object` slot's own-typed spelling, an override written with or without the word (§8.3). The style rule is only ever "pick the different name early".
 
-**Test names state the behavior asserted.** `CreateReturnsTheStoredTodo`, `GetByIdRejectsANonNumericId`, `PostRejectsAnUnknownAccount` — subject, verb, object, in ordinary member PascalCase. Never a status code (`Test404`), never "works" (`CreateWorks`), never a number (`PostTest3`). A test whose name cannot be written this way is usually asserting more than one thing.
+**Test names state the behavior asserted.** `CreateReturnsTheStoredTodo`, `GetByIdRejectsANonNumericId`, `TryPostDeclinesAnUnknownAccount` — subject, verb, object, in ordinary member PascalCase. Never a status code (`Test404`), never "works" (`CreateWorks`), never a number (`PostTest3`). A test whose name cannot be written this way is usually asserting more than one thing.
 
 ---
 
@@ -63,7 +63,7 @@ using var settled := postings.Where(                              // anything mo
 
 **Two spaces per level, no tabs.** A member body is one level in from its declaration, a nested block one more.
 
-**Close a declaration with its name.** `end Ledger;`, `end Post;`, `end constructor;`. Spec §1.6 admits a bare `end;` everywhere and §11.4 recommends the named form; this guide requires it on every *declaration* — class, interface, record, enum, choice, method, block property, constructor, destructor, operator — because after a long body the name is the reader's anchor, and the compiler verifies it matches. Inside a body, close statement blocks with the bare `end;`: `if`, `for`, `while`, `do`, `try`, `case`. Two closers are not a choice: an indexer block closes `end;` (an indexer has no name), and a labeled loop closes `end scan;` — the keyword closer is rejected once the loop is labeled (§1.6).
+**Close a declaration with its name.** `end Ledger;`, `end TryPost;`, `end constructor;`. Spec §1.6 admits a bare `end;` everywhere and §11.4 recommends the named form; this guide requires it on every *declaration* — class, interface, record, enum, choice, method, block property, constructor, destructor, operator — because after a long body the name is the reader's anchor, and the compiler verifies it matches. Inside a body, close statement blocks with the bare `end;`: `if`, `for`, `while`, `do`, `try`, `case`. Two closers follow from the language rather than from taste: an indexer block closes `end;` (an indexer has no name, so there is nothing to repeat), and a labeled loop closes `end scan;` — its label is its name, and the keyword closer `end for;` is rejected once the loop is labeled (§1.6).
 
 **One statement per line, and every `if` in block form** — the condition on its own line, the body indented, `end;` on the last, as §21.2's own examples are written. Never `if account = null then return false; end;`. The grammar admits it — every statement ends in `;`, so a block can be typed on one line — but a one-line conditional hides its own branch from a scan and from a diff. Brevity has its own form: the §20 `if` expression, `(if a > b then a else b)`, whose `else` is mandatory and which is an expression, not a squeezed statement.
 
@@ -75,13 +75,13 @@ import Ledger.Accounts;             // the module under test
 import System.Diagnostics;          // Debug.Assert (stdlib §8.2)
 
 public static class LedgerTests
-  public static method PostRejectsAnUnknownAccount()
+  public static method TryPostDeclinesAnUnknownAccount()
     using var ledger := new Ledger(["ada"]);                     // arrange
 
-    var posted := ledger.Post(new Posting("bob", 25m));          // act
+    var posted := ledger.TryPost(new Posting("bob", 25m));       // act
 
     Debug.Assert(not posted, "an unknown account is declined");  // assert
-  end PostRejectsAnUnknownAccount;
+  end TryPostDeclinesAnUnknownAccount;
 end LedgerTests;
 ```
 
@@ -124,7 +124,7 @@ Do not align `:=` across ordinary, unrelated statements: the alignment is not in
 ```bezel
 var account := _accounts.GetOrNull(posting.Account);   // a borrow, not a take (stdlib §4.9)
 if account = null then
-  return false;                                        // an outcome, not a fault (stdlib §1 band 2)
+  return false;                                        // declined: an expected outcome (stdlib §1, bool-only Try)
 end;
 ```
 
@@ -203,7 +203,7 @@ public class ledger                                          // 1 — a type is 
   public constructor(Owners: Array<string>)                  // 4 — a parameter is camelCase
     for var o in Owners do _accounts.Add(o, new Account(o)); end;
   end constructor;
-  public method post(P: Posting): bool                       // 5 — one-line blocks, no blank lines
+  public method tryPost(P: Posting): bool                    // 5 — one-line blocks, no blank lines
     var a := _accounts.GetOrNull(P.Account);
     if a = null then return false; end;
     a.Credit(P.Amount);                                      // add the amount to the account  ← §3
@@ -229,19 +229,19 @@ public sealed class Ledger
 
   public property Count: int => _accounts.Count;
 
-  public method Post(posting: Posting): bool
+  public method TryPost(posting: Posting): bool
     requires(posting.Amount > 0m)
 
     var account := _accounts.GetOrNull(posting.Account);   // a borrow, not a take (stdlib §4.9)
     if account = null then
-      return false;                                        // an outcome, not a fault (stdlib §1 band 2)
+      return false;                                        // declined: an expected outcome (stdlib §1, bool-only Try)
     end;
 
     account.Credit(posting.Amount);                        // narrowed by the early return (§7.4)
     Remember(account);
 
     return true;
-  end Post;
+  end TryPost;
 
   private method Remember(account: Account)
     if _recent.Count = MaxRecent then

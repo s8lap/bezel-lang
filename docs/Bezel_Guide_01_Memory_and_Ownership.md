@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.336.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.359.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope, with a must-use warning (§2's trivial-dispose classes excepted). A use after disposal is caught in layers: a borrow that would outlive its local source is rejected, a use of a variable, or of a borrow of its value, after an explicit disposal that always precedes it is a compile error, and so is a use of the variable after a conditional one, and in the default, checked build any member access through a disposed reference faults deterministically (spec §28.2). This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -29,7 +29,9 @@ method Import(path: string)
 end Import;
 ```
 
-You do not write cleanup code. If `ReadAll` throws, both are disposed, innermost first. If the `Parser` constructor itself throws, `file` is still disposed; `parser`, never bound, is not. A `using var` covers everything bound before the failure point.
+You do not write cleanup code. If `ReadAll` throws, both are disposed, innermost first. If the `Parser` constructor itself throws, `file` is still disposed; `parser`, never bound, is not. A `using var` covers everything bound before the point where the exception was raised.
+
+**Cleanup is not error handling.** Nothing above catches anything, and nothing needs to: disposal runs on every exit, normal or exceptional, so `Import` handles no error and leaks nothing. A `catch` is for deciding what an exception means, at a place that can act on it ([Guide 2](Bezel_Guide_02_Errors_and_Nullability.md) teaches that); cleanup belongs to owners — `using var`, owned fields, destructors — and an undo that must run only when the rest of a method does not succeed belongs to `ScopeGuard` (§10). Never write a `catch` or a `finally` where a `using var` fits; `finally` is left for the rare cleanup that is not a resource and has no owner (§10).
 
 ---
 
@@ -39,11 +41,11 @@ There is really only one disposal mechanism. At the end of a scope, every owned 
 
 `using var` is the default: *lives and dies here.* Plain `var` is for a value whose ownership will move on — a factory result you return, an accumulator, the best-so-far in a loop. The must-use warning then marks any path where it silently *doesn't* move on, so a leak is never quiet. An explicit `.Dispose()` is for an early or conditional release inside a longer scope. `_ := x;` disposes an unwanted owned value immediately (§9).
 
-**One owned kind takes neither discard form: a `Task`-family value** (`Task`, `Task<T>` or `OwningTask<T>`). `_ := SomeAsync();` is a compile error, and so is the anonymous binding `using var _ := SomeAsync();` — nothing can await an unnamed binding, so it is the same abandonment one scope later. Disposing a task abandons a running operation, which is a decision about the *operation*, not cleanup of a value, so the language makes you announce which decision you mean: `Task.FireAndForget(SomeAsync())` lets it run to completion and logs any failure, and a named `using var t := SomeAsync();` is the unsupervised scope-end drop (spec §17.13; stdlib §6.7). Every other owned value takes all four spellings above.
+**One owned kind takes neither discard form: a `Task`-family value** (`Task`, `Task<T>` or `OwningTask<T>`). `_ := SomeAsync();` is a compile error, and so is the anonymous binding `using var _ := SomeAsync();` — nothing can await an unnamed binding, so it is the same abandonment one scope later. Disposing a task abandons a running operation, which is a decision about the *operation*, not cleanup of a value, so the language makes you announce which decision you mean: `Task.FireAndForget(SomeAsync())` lets it run to completion and logs any exception it raises, and a named `using var t := SomeAsync();` is the unsupervised scope-end drop (spec §17.13; stdlib §6.7). Every other owned value takes all four spellings above.
 
 **The habit to unlearn.** Elsewhere, a trailing `foo.Dispose()` at the end of a block is the anti-pattern `using` blocks exist to kill, because a thrown exception skips the trailing call. In Bezel the unwinding edge *always* disposes live owned values, so a trailing `Dispose()` is exception-safe by construction. It therefore never means "cleanup plumbing." It means one thing only: *release this early.* Auto-drop is the safety net underneath all four forms. You are choosing *when* and *how loudly*, never *whether*. And *loudly* has a meaning: disposing a resource is an effect — a file closes, a lock releases, a subscription unhooks — and the spellings say where effects fire, the warning firing exactly where none says so.
 
-**When there is nothing to dispose: trivial-dispose classes — a ceremony exemption, never a lifetime one.** A class with no destructor, no `owned` field of non-trivial-dispose type and no owning-inline-array field, on a trivial-dispose base, has a disposal that runs no user code, so the compiler drops the ceremony — no `using var` owed, no must-use warning — but never the tracking: the instance still has one owner, is freed at that owner's release point, and every borrow rule in §3 applies to it (spec §28.9). The everyday sighting is the accumulator, `var sb := new StringBuilder(); … return sb.ToString();`, with no `using var` and no warning. Where the exemption reaches, why the classification is part of a public class's contract, and why a fresh trivial-dispose value handed to a borrowing collection is still rejected are spec §28.9 and the code-generation reference's §4.1 and §4.5.
+**When there is nothing to dispose: trivial-dispose classes — a ceremony exemption, never a lifetime one.** A class with no destructor, no `owned` field of non-trivial-dispose type and no field of move-only value type (an owning inline array or an owning choice), on a trivial-dispose base, has a disposal that runs no user code, so the compiler drops the ceremony — no `using var` owed, no must-use warning — but never the tracking: the instance still has one owner, is freed at that owner's release point, and every borrow rule in §3 applies to it (spec §28.9). The everyday sighting is the accumulator, `var sb := new StringBuilder(); … return sb.ToString();`, with no `using var` and no warning. Where the exemption reaches, why the classification is part of a public class's contract, and why a fresh trivial-dispose value handed to a borrowing collection is still rejected are spec §28.9 and the code-generation reference's §4.1 and §4.5.
 
 ---
 
@@ -314,7 +316,7 @@ end Write;
 var displayName: string := user?.Name ?? "Anonymous";   // both sides are string
 ```
 
-`a ?? b` returns `a` when non-null, else `b`. The right side may be `T` or `T?`, and the result is nullable exactly when the right side is: `user?.Name ?? "Anonymous"` is a plain `string`, while `primary ?? fallback` over two `string?`s stays `string?`. It works whenever `a` and `b` agree on ownership: two `string`s, two borrows (their sources need not match; the result is a borrow you use while both stay live), or two owned values *freshly produced in the arms*. Writing two *named* owned locals as the arms makes it a borrow merge instead — a named owned binding read as an arm is a borrow, never a silent consume; so to coalesce two owned locals into one owned result, use the marked arms — `(if a <> null then move a else move b)` — or an explicit `if`/`else` with `move` transfers (Pattern B below). `??` is rejected only when the two sides disagree on ownership (and the marker is never written in a `??` operand — spec §28.3) — the same single rule §8 is about. The `?.` (null-conditional) and `??=` (assign-if-null) operators follow the same principle.
+`a ?? b` returns `a` when non-null, else `b`. The right side may be `T` or `T?`, and the result is nullable exactly when the right side is: `user?.Name ?? "Anonymous"` is a plain `string`, while `primary ?? fallback` over two `string?`s stays `string?`. A left side declared non-nullable types the same way — the right side must still convert to `T` or `T?`, and the result is `T` — but since it is never null the right side never runs, and the compiler warns (spec §7.7; for `??=`, the warning is that the assignment never happens, spec §6.6). A binding's declared type decides, so a `string?` that flow narrowing has made non-null stays silent, and so does an operand whose type is an unconstrained type parameter. It works whenever `a` and `b` agree on ownership: two `string`s, two borrows (their sources need not match; the result is a borrow you use while both stay live), or two owned values *freshly produced in the arms*. Writing two *named* owned locals as the arms makes it a borrow merge instead — a named owned binding read as an arm is a borrow, never a silent consume; so to coalesce two owned locals into one owned result, use the marked arms — `(if a <> null then move a else move b)` — or an explicit `if`/`else` with `move` transfers (Pattern B below). `??` is rejected only when the two sides disagree on ownership (and the marker is never written in a `??` operand — spec §28.3) — the same single rule §8 is about. The `?.` (null-conditional) and `??=` (assign-if-null) operators follow the same principle.
 
 **Fixing it inside the method, with no field.** The earlier `ResponseWriter` used an object-scoped field so the fallback outlived the method. You do not need a field — you need the owned fallback to be live *at the point of use*. The cleanest way is to stop trying to make one `target` span the merge. Instead, put the write where the fallback is in scope, using the nested-block tool the language provides for exactly this:
 
@@ -428,7 +430,7 @@ end;
 
 ```bezel
 class Timer
-  private scoped _onTick: (() -> ())?;               // a scoped field: invoke, overwrite, clear — never read out
+  private scoped _onTick: (() -> ())?;               // a scoped field: invoke (from this class), overwrite, clear — never read out
   public method OnTick(scoped handler: () -> ())
     _onTick := handler;                               // OK: a scoped field of the object being subscribed to
   end OnTick;
@@ -463,7 +465,9 @@ try
   DoWork();
   committed := true;
 finally
-  if not committed then Unregister(id); end;
+  if not committed then
+    Unregister(id);
+  end;
 end;
 ```
 
@@ -504,7 +508,7 @@ end Open;
 
 One sentence on why the freeze is the price: a stored callback that could observe a moved-from or disposed source is exactly what the rule exists to prevent — the freeze is what makes the capture sound. (Two further remedies, both idiomatic: express the action as a method reference on `this` — `new ScopeGuard(this.RollbackPending)` — which captures the receiver and leaves locals unfrozen; or keep the resource in a field, where the freeze does not reach — trading the static bound for spec §28.3's field-held residual-trust regime, with checked disposal (spec §28.2) as the backstop.)
 
-When *not* to reach for it: if the thing to undo is a value, it has an owner and the owner's disposal is the answer — `ScopeGuard` is for effects: registrations, foreign handles, transactions, counters. And if you arrive from a language with `defer`/`errdefer` and wonder where the keyword went: the value half is redundant under this guide's whole model, and the failure half would need an "are we unwinding?" primitive Bezel deliberately lacks — the decline, with its grounds and reopening bar, is rationale §17.11.
+When *not* to reach for it: if the thing to undo is a value, it has an owner and the owner's disposal is the answer — `ScopeGuard` is for effects: registrations, foreign handles, transactions, counters. And an effect undone on *every* exit, success included — a batch ended, a flag restored — needs no flag and no guard to dismiss: that is `try … finally`'s remaining job, or, where the bracket recurs, a small class whose destructor ends it, held in a `using var`. None of these catches anything; what an exception *means* is decided where it is handled (Guide 2). And if you arrive from a language with `defer`/`errdefer` and wonder where the keyword went: the value half is redundant under this guide's whole model, and the failure half would need an "are we unwinding?" primitive Bezel deliberately lacks — the decline, with its grounds and reopening bar, is rationale §17.11.
 
 ---
 
@@ -523,7 +527,7 @@ When *not* to reach for it: if the thing to undo is a value, it has an owner and
 | Take over an owned local or parameter for scope-end disposal | `using var y := move x;` — the unmarked `using var y := x;` over an owned `x` is an error; to look at `x` without taking it, `var y := x;` or `const y := x;` |
 | Move an owned field's contents out | `move _f with fresh` — or a bare `move _f` on a nullable field, which leaves `null` |
 | Dispose an unwanted owned value now | `_ := x;` (or `x.Dispose();` for an early release) — never a `Task`-family value (§2) |
-| Make a resource-free helper (no destructor, no `owned`/inline-owned fields) | just `new` it — trivial-dispose, no `using var` needed (§2) |
+| Make a resource-free helper (no destructor, no `owned` fields of non-trivial-dispose type, no owning inline-array or owning-choice fields) | just `new` it — trivial-dispose, no `using var` needed (§2) |
 | Drain an owning collection | `for var e in coll.Drain() do using var x := move e; … end;` |
 | Merge branches with mixed ownership | equalize first (Pattern A or B, §8) |
 

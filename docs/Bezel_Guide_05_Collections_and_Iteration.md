@@ -1,8 +1,8 @@
 # Bezel Guide 5: Collections, Queries, and Iteration
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.336.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.359.*
 
-The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5). Neither needs an `import`: both modules are on spec §2.3's always-available list, and the `System.Collections.Generic` row puts every stdlib §4 name in every file's bare-name space. What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed How Bezel does it. Every standard collection comes in two families — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a bound lazy query is single-consumption — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `move` marker) are Guide 1's job; the `Try` shapes and the `*OrNull` tier are Guide 2 §2. If you skim everything else, read the three How Bezel does it sections and the table in §8.
+The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5). Neither needs an `import`: both modules are on spec §2.3's always-available list, and the `System.Collections.Generic` row puts every stdlib §4 name in every file's bare-name space. What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed How Bezel does it. Every standard collection comes in two families — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a bound lazy query is single-consumption — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `move` marker) are Guide 1's job; the value-shaped forms — the `*OrNull` form and the `Try` shapes — are Guide 2 §2. If you skim everything else, read the three How Bezel does it sections and the table in §8.
 
 **Contents:** §1 the two families · §2 what the loop variable is · §3 consuming iteration: `Drain()` and the take-forms · §4 affine queries · §5 `GroupBy` · §6 `First` at class elements · §7 spans and buffers · §8 choosing, and the five traps.
 
@@ -53,7 +53,7 @@ end;
 
 (`TryAdd(owned item): bool` reports the outcome instead; the duplicate is still disposed.)
 
-**Dictionaries in practice.** The lookup tiers are Guide 2 §2's: the indexer throws `KeyNotFoundException` (absence is a bug here), `GetOrNull` composes with `??`, `TryGetValue` distinguishes what a collapsed `T?` cannot (stdlib §4.8). At *class-typed* values `GetOrNull` returns a borrow of the stored value — a look, not a take. A borrow never meets an *owned* fallback through `??` (Guide 1 §8's meet rule): null-test instead, and use `PopValue`/`TryPopValue` when you mean take. Two adjacent habits are worth noting. `dict[key] += 1` updates but never inserts — it throws on an absent key — so tallying is `Counter<K>`'s job (`tally.Increment(word);`, stdlib §4.20; not yet implemented, [#3848](https://github.com/s8lap/bezel-lang/issues/3848)). And `GetOrAdd(key, factory)` is a read path whose factory, on the owning map, produces an `owned V` the dictionary keeps — the call still returns a borrow; at a value-typed `V` it returns a copy of the stored value, so incrementing through its result mutates nothing (stdlib §4.8). Its key and its factory's result are stores, checked against the dictionary at every call as `Add`'s arguments are (spec §28.11).
+**Dictionaries in practice.** The lookup forms are Guide 2 §2's: the indexer is the throwing form — the call site expects the key to be there, and `KeyNotFoundException` propagates if it is not — while `GetOrNull` is the value-shaped form for an expected absence and composes with `??`, and `TryGetValue` distinguishes what a collapsed `T?` cannot (stdlib §4.8). At *class-typed* values `GetOrNull` returns a borrow of the stored value — a look, not a take. A borrow never meets an *owned* fallback through `??` (Guide 1 §8's meet rule): null-test instead, and use `PopValue`/`TryPopValue` when you mean take. Two adjacent habits are worth noting. `dict[key] += 1` updates but never inserts — it throws on an absent key — so tallying is `Counter<K>`'s job (`tally.Increment(word);`, stdlib §4.20; not yet implemented, [#3848](https://github.com/s8lap/bezel-lang/issues/3848)). And `GetOrAdd(key, factory)` is a read path whose factory, on the owning map, produces an `owned V` the dictionary keeps — the call still returns a borrow; at a value-typed `V` it returns a copy of the stored value, so incrementing through its result mutates nothing (stdlib §4.8). Its key and its factory's result are stores, checked against the dictionary at every call as `Add`'s arguments are (spec §28.11).
 
 Two conventions are worth absorbing in passing (stdlib §1). `Count` counts membership that grows and shrinks (`Array<T>.Count`); `Length` measures a fixed extent (buffers, spans, `FrozenArray<T>`, `string`). And the imperative form mutates in place (`Sort`, `Reverse`) while the participle returns a fresh owned copy (`Sorted()`, `Reversed()`) — *declared* on the borrowing family only, because an owning copy would double-own every element: `OwningArray<T>` declares no `Sorted`, no `Reversed`, no `ToArray` (stdlib §4.5). That is its declared surface, not what resolves on it. Stdlib §5's `ToArray()`/`ToSet()`/`ToDictionary(…)` are extensions on `IEnumerable<T>`, which the owning family implements, so `pool.ToArray()` does resolve — and is sound, because what it returns is a borrowing snapshot: a fresh `Array<T>` whose slots borrow the elements `pool` still owns. No second owner is minted; the obligation is a lifetime one, `pool` must outlive every use of the snapshot, and `Clear`, `Remove`, `RemoveAt`, or an indexer-set kills the slot a snapshot entry points at (stdlib §4.5). To reorder in place use `Reverse()`/`Sort()`; to move the elements into a new owning collection, `Drain()`.
 
@@ -122,7 +122,9 @@ Two smaller rules complete the picture. Structurally modifying a collection whil
 ```bezel
 using var expired := new Array<Transaction>();
 for var t in ledger do
-  if t.IsExpired then expired.Add(t); end;   // collect borrows; mutate nothing yet
+  if t.IsExpired then
+    expired.Add(t);                          // collect borrows; mutate nothing yet
+  end;
 end;
 for var t in expired do
   _ := ledger.Remove(t);                     // structural changes outside the first loop;
@@ -227,7 +229,7 @@ var mean := hot.Average(lambda(r) => r.Celsius);  // as many passes as you like
                                               //   the frame is disposed at statement end
    ```
 
-   Inside the callee a plain `IEnumerable<T>` parameter is statically untracked — the affine tracking follows provenance, not the type, so a violation there is caught by the runtime guard instead: `InvalidOperationException`, the same loud failure as mutation during iteration. Write callees to enumerate a sequence parameter once; a callee that needs two passes materializes.
+   Inside the callee a plain `IEnumerable<T>` parameter is statically untracked — the affine tracking follows provenance, not the type, so a violation there is caught by the runtime guard instead: `InvalidOperationException`, the same exception mutation during iteration raises. Write callees to enumerate a sequence parameter once; a callee that needs two passes materializes.
 
 **Which operators are lazy, and what they retain** (stdlib §5):
 
@@ -237,7 +239,7 @@ var mean := hot.Average(lambda(r) => r.Celsius);  // as many passes as you like
 
 (On an `Array<T>` receiver, `Reverse()` resolves to the in-place instance method before extensions are consulted — the lazy operator applies only where the receiver has no instance `Reverse`; stdlib §5.)
 
-**Empty sources, while we are near the aggregations** (stdlib §5/§5.1): `Sum` returns the zero of its type and `Aggregate` returns its seed, but `Min`, `Max`, and `Average` throw `InvalidOperationException` — the assert-shaped tier. The branch-shaped tier is `MinOrNull()`/`MaxOrNull()` — no-selector forms only; compose `Select(sel).MinOrNull()` for a keyed one. And `First(pred)` is exactly `Where(pred).First()`, with `FirstOrNull(pred)` as its null-signaled twin.
+**Empty sources, while we are near the aggregations** (stdlib §5/§5.1): `Sum` returns the zero of its type and `Aggregate` returns its seed, but `Min`, `Max`, and `Average` throw `InvalidOperationException` — the throwing form. The value-shaped form is `MinOrNull()`/`MaxOrNull()` — no-selector forms only; compose `Select(sel).MinOrNull()` for a keyed one. And `First(pred)` is exactly `Where(pred).First()`, with `FirstOrNull(pred)` as its value-shaped twin.
 
 Retention has one practical consequence: keep captured sources alive until the consumption point.
 
@@ -314,7 +316,7 @@ One shape is over-warned, a recorded imprecision (spec §29.11). An adopting yie
 
 The remedy is the one the stdlib states (§5), and `ToArray()` is not it: materializing hands you a fresh `Array<T>` whose slots are *borrows* of the same dead elements (stdlib §5, §4.4) — §4's materialize-first remedy answers re-enumeration, not liveness. Two things work. Use each element inside the loop body that borrows it, before the next advance. Or give the elements an owner: run the producer through the owning path (an `IOwningEnumerable<T>` iterator consumed with §3's owning iteration, where you genuinely own each element) and build them into an owning collection — the plainest form, and then `probes.FirstOrNull(...)` over an `OwningArray<Probe>` is collection-backed and sound. If the producer is a borrowing minting iterator you cannot change, there is no way to keep an element past the next advance; consume it in the body.
 
-Three footnotes close the story. First, the tiers are the usual ones (stdlib §1): `First` throws `InvalidOperationException` on no match — absence is a bug at that call site — while `FirstOrNull` returns `null` for the expected-absence stance (Guide 2 §2). Second, `Aggregate(seed, fold)` at a class-typed accumulator additionally carries `seed` as a source: the result is usable only while receiver *and* seed live (stdlib §5). An empty source returns the seed itself (stdlib §5). Third, these accessors are *compiler-known* at class elements, because no in-language body over arbitrary `IEnumerable<T>` could hand an element borrow out of its loop (§2's escape rule). A first-element helper of your own takes an indexable receiver and returns `this[i]` — the receiver-sourced spelling the rule admits (spec §28.3).
+Three footnotes close the story. First, the forms are the usual ones (stdlib §1): `First` is the throwing form — the call site expects a match, and `InvalidOperationException` propagates if there is none — while `FirstOrNull` is the value-shaped form for an expected absence, returning `null` (Guide 2 §2). Second, `Aggregate(seed, fold)` at a class-typed accumulator additionally carries `seed` as a source: the result is usable only while receiver *and* seed live (stdlib §5). An empty source returns the seed itself (stdlib §5). Third, these accessors are *compiler-known* at class elements, because no in-language body over arbitrary `IEnumerable<T>` could hand an element borrow out of its loop (§2's escape rule). A first-element helper of your own takes an indexable receiver and returns `this[i]` — the receiver-sourced spelling the rule admits (spec §28.3).
 
 ---
 
@@ -333,7 +335,9 @@ header.Fill(0);                                  // bulk write through the view
 
 var s := "Content-Type: text/plain";
 var kind := s.AsSpan(14);                        // ReadOnlyStringSpan — no allocation
-if kind.StartsWith("text/") then Accept(); end;
+if kind.StartsWith("text/") then
+  Accept();
+end;
 ```
 
 **A span is a borrow of its buffer.** `Span<T>` is a borrow-bearing record (spec §9.7): it cannot outlive the buffer it views, cannot sit in a class's instance fields or in any static field, or escape into async frames, and cannot be returned over a buffer that dies with the method:
