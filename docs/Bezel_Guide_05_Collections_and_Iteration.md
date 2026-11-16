@@ -28,13 +28,13 @@ c.Ping();                                        // use it; you may not dispose 
 // scope end: pool disposed → both connections disposed with it, no destructor written
 ```
 
-The `Owning` prefix names the element axis, not the container axis: `owned OwningArray<Dog>` is an owning array *you* own, while a bare `OwningArray<Dog>` parameter is a borrow of someone else's owning array (stdlib §4). One classification drives every element operation — the **element slot policy** (spec §28.11). A slot's behavior follows from the family and the element's kind, never from per-collection quirks: in the borrowing family copyable value elements are copies (a *borrow-bearing* record — §7, spec §9.7 — additionally requires every source it carries to outlive the collection), `string` and function values are shared references, and class or interface slots hold borrows; in the owning family class or interface slots are owned and every other element kind is rejected. The operation-by-operation table is the code-generation reference's §4.5 (*The two families*), over spec §28.11's slot-policy table.
+The `Owning` prefix names the element axis, not the container axis: `owned OwningArray<Dog>` is an owning array *you* own, while a bare `OwningArray<Dog>` parameter is a borrow of someone else's owning array (stdlib §4). One classification drives every element operation — the element slot policy (spec §28.11). A slot's behavior follows from the family and the element's kind, never from per-collection quirks: in the borrowing family copyable value elements are copies (a *borrow-bearing* record — §7, spec §9.7 — additionally requires every source it carries to outlive the collection), `string` and function values are shared references, and class or interface slots hold borrows; in the owning family class or interface slots are owned and every other element kind is rejected. The operation-by-operation table is the code-generation reference's §4.5 (*The two families*), over spec §28.11's slot-policy table.
 
 So an owning collection admits only class or interface elements (`where T: class` — a value has no disposal obligation to take). For `OwningDictionary<K, V>` the split is per-axis: values owned, keys value-like (stdlib §4.9). Reading is uniform across both families — the indexer-get and default iteration produce a borrow (or a copy, for value elements). Reading never transfers ownership.
 
 **Picking one is stating intent.** A holder that must dispose its elements says so in the type — `private owned _sessions: OwningArray<Session>;` — and the cascade replaces any destructor (Guide 1 §5). A collection that merely *indexes* objects owned elsewhere is the borrowing form, and storing a borrow carries the usual obligation: the element's owner must outlive the collection's use of it (spec §28.11).
 
-**The names tell you whether you now owe a disposal** (stdlib §1; spec §22.6). `Get`, `Peek`, `GetOrNull`, and the indexer are borrows: no obligation. On the owning family, `Pop`, `Dequeue`, `PopValue`, and `Drain` are transfers: you discharge the result. (The borrowing `Stack<T>`/`Queue<T>` at class elements hand back the same borrow they dropped — `Pop` and `Dequeue` there produce borrows sourced at the collection, stdlib §4.11.)
+The names tell you whether you now owe a disposal (stdlib §1; spec §22.6). `Get`, `Peek`, `GetOrNull`, and the indexer are borrows: no obligation. On the owning family, `Pop`, `Dequeue`, `PopValue`, and `Drain` are transfers: you discharge the result. (The borrowing `Stack<T>`/`Queue<T>` at class elements hand back the same borrow they dropped — `Pop` and `Dequeue` there produce borrows sourced at the collection, stdlib §4.11.)
 
 ```bezel
 // jobs: OwningStack<Job>
@@ -53,11 +53,11 @@ end;
 
 (`TryAdd(owned item): bool` reports the outcome instead; the duplicate is still disposed.)
 
-**Dictionaries in practice.** The lookup forms are Guide 2 §2's: the indexer is the throwing form — the call site expects the key to be there, and `KeyNotFoundException` propagates if it is not — while `GetOrNull` is the non-throwing form for an expected absence and composes with `??`, and `TryGetValue` distinguishes what a collapsed `T?` cannot (stdlib §4.8). At *class-typed* values `GetOrNull` returns a borrow of the stored value — a look, not a take. A borrow never meets an *owned* fallback through `??` (Guide 1 §8's meet rule): null-test instead, and use `PopValue`/`TryPopValue` when you mean take. Two adjacent habits are worth noting. `dict[key] += 1` updates but never inserts — it throws on an absent key — so tallying is `Counter<K>`'s job (`tally.Increment(word);`, stdlib §4.20; not yet implemented, [#3848](https://github.com/s8lap/bezel-lang/issues/3848)). And `GetOrAdd(key, factory)` is a read path whose factory, on the owning map, produces an `owned V` the dictionary keeps — the call still returns a borrow; at a value-typed `V` it returns a copy of the stored value, so incrementing through its result mutates nothing (stdlib §4.8). Its key and its factory's result are stores, checked against the dictionary at every call as `Add`'s arguments are (spec §28.11).
+Dictionaries in practice. The lookup forms are Guide 2 §2's: the indexer is the throwing form — the call site expects the key to be there, and `KeyNotFoundException` propagates if it is not — while `GetOrNull` is the non-throwing form for an expected absence and composes with `??`, and `TryGetValue` distinguishes what a collapsed `T?` cannot (stdlib §4.8). At *class-typed* values `GetOrNull` returns a borrow of the stored value — a look, not a take. A borrow never meets an *owned* fallback through `??` (Guide 1 §8's meet rule): null-test instead, and use `PopValue`/`TryPopValue` when you mean take. Two adjacent habits are worth noting. `dict[key] += 1` updates but never inserts — it throws on an absent key — so tallying is `Counter<K>`'s job (`tally.Increment(word);`, stdlib §4.20; not yet implemented, [#3848](https://github.com/s8lap/bezel-lang/issues/3848)). And `GetOrAdd(key, factory)` is a read path whose factory, on the owning map, produces an `owned V` the dictionary keeps — the call still returns a borrow; at a value-typed `V` it returns a copy of the stored value, so incrementing through its result mutates nothing (stdlib §4.8). Its key and its factory's result are stores, checked against the dictionary at every call as `Add`'s arguments are (spec §28.11).
 
 Two conventions are worth absorbing in passing (stdlib §1). `Count` counts membership that grows and shrinks (`Array<T>.Count`); `Length` measures a fixed extent (buffers, spans, `FrozenArray<T>`, `string`). And the imperative form mutates in place (`Sort`, `Reverse`) while the participle returns a fresh owned copy (`Sorted()`, `Reversed()`) — *declared* on the borrowing family only, because an owning copy would double-own every element: `OwningArray<T>` declares no `Sorted`, no `Reversed`, no `ToArray` (stdlib §4.5). That is its declared surface, not what resolves on it. Stdlib §5's `ToArray()`/`ToSet()`/`ToDictionary(…)` are extensions on `IEnumerable<T>`, which the owning family implements, so `pool.ToArray()` does resolve — and is sound, because what it returns is a borrowing snapshot: a fresh `Array<T>` whose slots borrow the elements `pool` still owns. No second owner is minted; the obligation is a lifetime one, `pool` must outlive every use of the snapshot, and `Clear`, `Remove`, `RemoveAt`, or an indexer-set kills the slot a snapshot entry points at (stdlib §4.5). To reorder in place use `Reverse()`/`Sort()`; to move the elements into a new owning collection, `Drain()`.
 
-**Reading code doesn't need to care which family.** The two families never interconvert: an `OwningArray<Connection>` *is not* an `Array<Connection>`. But both implement the read-only interfaces `IEnumerable<T>`, `IReadOnlyCollection<T>`, `IReadOnlyList<T>`, because reading produces borrows either way (spec §28.11; stdlib §4.3). So a consumer that only reads declares one of those and accepts either source:
+Reading code doesn't need to care which family. The two families never interconvert: an `OwningArray<Connection>` *is not* an `Array<Connection>`. But both implement the read-only interfaces `IEnumerable<T>`, `IReadOnlyCollection<T>`, `IReadOnlyList<T>`, because reading produces borrows either way (spec §28.11; stdlib §4.3). So a consumer that only reads declares one of those and accepts either source:
 
 ```bezel
 method ReportEach(items: IEnumerable<Connection>)
@@ -109,7 +109,7 @@ end Report;
 
 When you are handed an interface over a collection-backed sequence, materializing first (`.ToArray()`, §4) gives you such a concrete backing to loop over. When the source *mints* its elements (an iterator yielding `new …`), the elements need an owner that outlives the loop: the owning path of §3, or an owning collection built up front. (This is also why you cannot write your own `First()` over arbitrary `IEnumerable<T>` at class elements — see §6.)
 
-**You never dispose a borrowed element.** Only owners dispose (spec §28.6; Guide 1 §9), and a default-iteration variable, an indexer-get, and `entry.Value` are all borrows:
+You never dispose a borrowed element. Only owners dispose (spec §28.6; Guide 1 §9), and a default-iteration variable, an indexer-get, and `entry.Value` are all borrows:
 
 ```bezel
 for var conn in pool do          // default iteration over an OwningArray: borrows
@@ -211,8 +211,8 @@ var mean := hot.Average(lambda(r) => r.Celsius);  // as many passes as you like
 
 `ToArray()` returns an owned `Array<T>` — a collection, enumerable any number of times. Only the bound lazy value is affine. The `owned` is the container axis: at class or interface elements the fresh array is a *borrowing* collection whose slots hold borrows of the elements it enumerated (stdlib §5, §4.4; spec §28.11), so materializing answers *re-enumeration* over a live backing and answers nothing about the elements' own lifetimes — that is §6's problem, with §6's remedies. Exactly three uses spend a bound query's enumeration right (spec §29.11):
 
-1. **Enumeration or a terminal operator** — a `for` loop, `Count()`, `First()`, `ToArray()`, ….
-2. **Composing a further operator** — the right transfers into the composed query:
+1. Enumeration or a terminal operator — a `for` loop, `Count()`, `First()`, `ToArray()`, ….
+2. Composing a further operator — the right transfers into the composed query:
 
    ```bezel
    using var warm  := readings.Where(IsWarm);   // bound
@@ -220,7 +220,7 @@ var mean := hot.Average(lambda(r) => r.Celsius);  // as many passes as you like
    var n     := warm.Count();             // ERROR: `warm` was consumed by the Select
    ```
 
-3. **Passing it as an `IEnumerable<T>` argument** — the right transfers to the callee:
+3. Passing it as an `IEnumerable<T>` argument — the right transfers to the callee:
 
    ```bezel
    method Mean(xs: IEnumerable<double>): double
@@ -241,7 +241,7 @@ var mean := hot.Average(lambda(r) => r.Celsius);  // as many passes as you like
 
 (On an `Array<T>` receiver, `Reverse()` resolves to the in-place instance method before extensions are consulted — the lazy operator applies only where the receiver has no instance `Reverse`; stdlib §5.)
 
-**Empty sources, while we are near the aggregations** (stdlib §5/§5.1): `Sum` returns the zero of its type and `Aggregate` returns its seed, but `Min`, `Max`, and `Average` throw `InvalidOperationException` — the throwing form. The non-throwing form is `MinOrNull()`/`MaxOrNull()` — no-selector forms only; compose `Select(sel).MinOrNull()` for a keyed one. And `First(pred)` is exactly `Where(pred).First()`, with `FirstOrNull(pred)` as its non-throwing twin.
+Empty sources, while we are near the aggregations (stdlib §5/§5.1): `Sum` returns the zero of its type and `Aggregate` returns its seed, but `Min`, `Max`, and `Average` throw `InvalidOperationException` — the throwing form. The non-throwing form is `MinOrNull()`/`MaxOrNull()` — no-selector forms only; compose `Select(sel).MinOrNull()` for a keyed one. And `First(pred)` is exactly `Where(pred).First()`, with `FirstOrNull(pred)` as its non-throwing twin.
 
 Retention has one practical consequence: keep captured sources alive until the consumption point.
 
@@ -342,7 +342,7 @@ if kind.StartsWith("text/") then
 end;
 ```
 
-**A span is a borrow of its buffer.** `Span<T>` is a borrow-bearing record (spec §9.7): it cannot outlive the buffer it views, cannot sit in a class's instance fields or in any static field, or escape into async frames, and cannot be returned over a buffer that dies with the method:
+A span is a borrow of its buffer. `Span<T>` is a borrow-bearing record (spec §9.7): it cannot outlive the buffer it views, cannot sit in a class's instance fields or in any static field, or escape into async frames, and cannot be returned over a buffer that dies with the method:
 
 ```bezel
 method Header(): Span<byte>

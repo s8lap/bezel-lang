@@ -2,11 +2,11 @@
 
 *A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.359.*
 
-Most of the syntax here is mainstream: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`. The *emphasis* is not. Bezel has one rule for how an operation reports what went wrong, and the rule asks one question: **how will the caller consume the outcome?** (The normative statement is the failure-signal rule, stdlib §1; this guide teaches it by example.)
+Most of the syntax here is mainstream: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`. The *emphasis* is not. Bezel has one rule for how an operation reports what went wrong, and the rule asks one question: how will the caller consume the outcome? (The normative statement is the failure-signal rule, stdlib §1; this guide teaches it by example.)
 
-- **The caller branches on an expected absence** — nothing under the key, text that may not parse: the **non-throwing form**, an `…OrNull` member returning `T?` or a `Try…(out x): bool` member (§2). It is built on nullability, which is why the guide starts there (§1).
+- **The caller branches on an expected absence** — nothing under the key, text that may not parse: the non-throwing form, an `…OrNull` member returning `T?` or a `Try…(out x): bool` member (§2). It is built on nullability, which is why the guide starts there (§1).
 - **The caller branches on an error it gathers or decodes**, and the error's payload is a value: a `Result<T, E>` or a domain choice (§3).
-- **Everything else throws** — the **throwing form** — and is handled where the program can do something about it, usually a **boundary**: a request loop, a job runner, `Main` or a supervisor (§4). Code in between names the classes it can answer and lets the rest propagate. A class that implements `IFailure` says the outside world disagreed; it never says what to do.
+- **Everything else throws** — the throwing form — and is handled where the program can do something about it, usually a boundary: a request loop, a job runner, `Main` or a supervisor (§4). Code in between names the classes it can answer and lets the rest propagate. A class that implements `IFailure` says the outside world disagreed; it never says what to do.
 - **A guarantee the caller must provide** is a contract: `requires(...)`. A broken one is a bug in the calling code, raised as `ContractViolationException` and fixed there, not handled (Guide 6 §2).
 - A handful of fatal conditions simply terminate (§4).
 
@@ -78,7 +78,7 @@ end;
 
 The exception is `readonly` fields. A nullable `readonly` field — instance or static — narrows like a local: nothing can rewrite it after construction, so no call, closure, or `await` can invalidate the fact. The tracked shape is one field directly off a tracked root (`this._f`, `TypeName._s`, or `v._f` off a tracked local or non-`ref` parameter `v`). The rule does not apply inside the declaring type's constructors and initializers, where the field is still being assigned (spec §7.4).
 
-Locals can lose their narrowing too. A local that is **mutably captured** — assigned, or passed by `ref`/`out`, inside any lambda in the method — is re-widened at the next call, function-value invocation, or `await` in the controlled block, because a closure could run and rewrite it in between (spec §7.4). Copy such a value into a plain, uncaptured local and test *that* — the same remedy as for a mutable field.
+Locals can lose their narrowing too. A local that is mutably captured — assigned, or passed by `ref`/`out`, inside any lambda in the method — is re-widened at the next call, function-value invocation, or `await` in the controlled block, because a closure could run and rewrite it in between (spec §7.4). Copy such a value into a plain, uncaptured local and test *that* — the same remedy as for a mutable field.
 
 ---
 
@@ -112,7 +112,7 @@ var greeting := config.GetOrNull("greeting") ?? "hello";
 
 `ParseOrNull` returns null exactly where `Parse` would throw, so one `??` covers every way the parse can fail. (For `int`/`bool` environment variables specifically, `Environment.GetInt`/`GetBool` are the dedicated one-call spelling.) When you must *distinguish* absence from a present null — a dictionary whose value type is itself nullable, say — `T?` collapses the two (the conflation caveat, stdlib §1/§4.8). Use `ContainsKey` or the `Try` form below instead.
 
-**When the library has no non-throwing form.** A missing `OrNull`/`Try` form is a gap in the library ([#8516](https://github.com/s8lap/bezel-lang/issues/8516)), not a reason for a broader catch. Opening a file is one today: there is no `OpenOrNull` and no `ReadAllTextOrNull`. Do not test `File.Exists` and then open — the file can vanish in between, so the open must handle its absence anyway. Open, and catch the one class that means "not there" at the call:
+When the library has no non-throwing form. A missing `OrNull`/`Try` form is a gap in the library ([#8516](https://github.com/s8lap/bezel-lang/issues/8516)), not a reason for a broader catch. Opening a file is one today: there is no `OpenOrNull` and no `ReadAllTextOrNull`. Do not test `File.Exists` and then open — the file can vanish in between, so the open must handle its absence anyway. Open, and catch the one class that means "not there" at the call:
 
 ```bezel
 import System.IO;
@@ -165,7 +165,7 @@ end;                               // c disposed at the end of the enclosing blo
 
 ## 3. Errors the caller branches on: `Result<T, E>` and domain choices
 
-When the caller needs to know *which* error — at *which* position, of *which* sort — absence is not enough. **The `choice` return** is the tool when the error is expected, branched on at or near the call site, and its payload is a plain value (spec §35; stdlib §1). Where the nullable return says only "absent" and the `Try` form carries its result in out-parameters, a `choice` names every outcome and carries each one's data. And a `case` over it is proven exhaustive with no `_` arm (spec §19.6). In expression position, a `case` that misses an outcome draws the compiler's missing-arm warning, so adding an outcome flags every such consumer at compile time instead of silently falling through a null check; a statement-position `case`, like the one below, draws no warning and does nothing when no arm matches:
+When the caller needs to know *which* error — at *which* position, of *which* sort — absence is not enough. The `choice` return is the tool when the error is expected, branched on at or near the call site, and its payload is a plain value (spec §35; stdlib §1). Where the nullable return says only "absent" and the `Try` form carries its result in out-parameters, a `choice` names every outcome and carries each one's data. And a `case` over it is proven exhaustive with no `_` arm (spec §19.6). In expression position, a `case` that misses an outcome draws the compiler's missing-arm warning, so adding an outcome flags every such consumer at compile time instead of silently falling through a null check; a statement-position `case`, like the one below, draws no warning and does nothing when no arm matches:
 
 ```bezel
 public method ParsePort(text: string): Result<int, string>
@@ -184,11 +184,11 @@ case ParsePort(arg) of
 end;                                  // exhaustive; no _ arm needed
 ```
 
-The bare `Ok(value)` / `Error(msg)` spelling is **declared-result target-typing** (spec §35.3). In a `return` statement — or an expression body, or a lambda with a return-type ascription — whose declared result type is a choice, a bare case name constructs that choice's case; the declared type supplies the type arguments whole. The qualified `Result<int, string>.Ok(value)` remains valid everywhere. The bare form exists for exactly these positions, and if a case name shadows something in scope the compiler warns.
+The bare `Ok(value)` / `Error(msg)` spelling is declared-result target-typing (spec §35.3). In a `return` statement — or an expression body, or a lambda with a return-type ascription — whose declared result type is a choice, a bare case name constructs that choice's case; the declared type supplies the type arguments whole. The qualified `Result<int, string>.Ok(value)` remains valid everywhere. The bare form exists for exactly these positions, and if a case name shadows something in scope the compiler warns.
 
 `Result<T, E>` (stdlib §2.20) is the stdlib's ready-made shape; a domain-specific choice with named cases (`Fetched`/`NotModified`/`Failed`) is often better still. When a case's payload is an owned resource, the `case` over a fresh call is an *owning match*: bind the payload and adopt it (`using var conn := move c;`) — see Guide 1 §9.
 
-**Pipelining a `Result`.** For value-payload results, four compiler-provided members fold and chain outcomes without writing a `case` (stdlib §2.20): `UnwrapOr(fallback)` folds to a plain value, `Map(f)` transforms the success, `MapError(f)` re-codes the error at a boundary, and `AndThen(f)` sequences a second fallible step:
+Pipelining a `Result`. For value-payload results, four compiler-provided members fold and chain outcomes without writing a `case` (stdlib §2.20): `UnwrapOr(fallback)` folds to a plain value, `Map(f)` transforms the success, `MapError(f)` re-codes the error at a boundary, and `AndThen(f)` sequences a second fallible step:
 
 ```bezel
 var port := ParsePort(raw).UnwrapOr(8080);           // fold: the value, or the fallback
@@ -215,7 +215,7 @@ end WellKnownPort;
 
 One trap the `??` of §1 does not prepare you for: a combinator's argument is an ordinary argument, evaluated at the call site before the call — on the success path exactly as on the error path (stdlib §2.20). `??` is conditional, so `a ?? Expensive()` never runs `Expensive()` when `a` is non-null (spec §7.7); `.UnwrapOr($"bad port: {raw}")` builds that string on the `Ok` path as well. There is no lazy `UnwrapOrElse`. Where the fallback must be computed only on error, compute it in the `Error` arm of a `case`.
 
-Note the `AndThen` lambda's return-type ascription: it makes the lambda's own returns declared-result positions, so the bare `Ok`/`Error` spelling works inside it too. The combinators exist only at **value-like** instantiations — payloads of values and strings, the common case. A `Result` carrying an owned resource (`Result<Connection, string>`) has none of them, deliberately. Extraction there is consumption, and consumption is the owning match's job — for owning results, the exhaustive `case` *is* the pipeline. The three idioms compose: the two non-throwing forms — `T?` for plain absence, the `Try` form for value extraction with a boring false path — and the `Result` or choice return where the error is branched on and its payload is a value.
+Note the `AndThen` lambda's return-type ascription: it makes the lambda's own returns declared-result positions, so the bare `Ok`/`Error` spelling works inside it too. The combinators exist only at value-like instantiations — payloads of values and strings, the common case. A `Result` carrying an owned resource (`Result<Connection, string>`) has none of them, deliberately. Extraction there is consumption, and consumption is the owning match's job — for owning results, the exhaustive `case` *is* the pipeline. The three idioms compose: the two non-throwing forms — `T?` for plain absence, the `Try` form for value extraction with a boring false path — and the `Result` or choice return where the error is branched on and its payload is a value.
 
 ---
 
@@ -378,7 +378,7 @@ An undo that must run only when the method *fails* — unregister what you regis
 
 Even a half-constructed object is safe: if a constructor throws after some `owned` fields are set, those fields are disposed before the exception propagates. The same holds for a half-built *expression*: if one argument throws while an earlier argument has already produced an owned temporary, that temporary is disposed during the unwind — an exception never leaks a half-built argument list. You do not write code for any of this.
 
-One edge worth knowing: what if cleanup itself throws *while an exception is already propagating*? A throw escaping a `finally` (or a disposer that throws during unwinding) **supersedes** the in-flight exception — the new one propagates, the old one is disposed (spec §31.2/§28.4). The buried exception is not lost: before the drop, the runtime snapshots its type, message, and stack trace into the escaping exception's `SupersededChain` (spec §31.4) — the same three-string snapshot machinery as `CauseChain`, chronological, earliest lost first — and the uncaught-exception report prints it. So the exception you see at the top is always the *last* one thrown, and `SupersededChain` is where the *first* one — usually the real one — went. Read it like `CauseChain`: copy the strings out in the arm if you need them past it.
+One edge worth knowing: what if cleanup itself throws *while an exception is already propagating*? A throw escaping a `finally` (or a disposer that throws during unwinding) supersedes the in-flight exception — the new one propagates, the old one is disposed (spec §31.2/§28.4). The buried exception is not lost: before the drop, the runtime snapshots its type, message, and stack trace into the escaping exception's `SupersededChain` (spec §31.4) — the same three-string snapshot machinery as `CauseChain`, chronological, earliest lost first — and the uncaught-exception report prints it. So the exception you see at the top is always the *last* one thrown, and `SupersededChain` is where the *first* one — usually the real one — went. Read it like `CauseChain`: copy the strings out in the arm if you need them past it.
 
 One diagnostic worth recognizing in this area: disposing a value and then using it. A *straight-line* dispose-then-use — through the variable, or through a borrow of its value — is a compile error (spec §28.2); a use after a *conditional* dispose — disposed on one branch, still live on another — is a compile error at the merge (the value is "maybe-consumed", spec §28.3), while a borrow of that value is left to the run time, where its use is a deterministic fault in the default, checked build. All three are the compiler catching a use-after-free before it can happen.
 

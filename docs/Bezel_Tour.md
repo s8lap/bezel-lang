@@ -146,8 +146,8 @@ This is the part of Bezel that is new. Read it slowly once; after that it is mos
 
 Every class-typed value is either **owned** or **borrowed** at every point in the program:
 
-- an **owned** value is yours to dispose — exactly once, on every path;
-- a **borrowed** value is someone else's; you may use it while its owner keeps it alive, and you may not dispose it.
+- an owned value is yours to dispose — exactly once, on every path;
+- a borrowed value is someone else's; you may use it while its owner keeps it alive, and you may not dispose it.
 
 You almost never dispose anything by hand. An owned value that reaches the end of its scope is disposed there automatically — on the normal path *and* when an exception passes through. The one question to ask of every object is: *am I responsible for this one?*
 
@@ -302,7 +302,7 @@ end Greet;
 
 `?.` reads through a possibly-null value, `??` supplies a default, and a postfix `!` asserts non-null.
 
-**Choose the form by how the caller consumes the outcome.** When the caller branches on it — a missing key, text that may not parse — the standard library offers a non-throwing form instead of an exception — an `…OrNull` method that composes with `??` (`int.ParseOrNull(text) ?? 8080`) or a `Try…` method — and an error that carries a value comes back as a `Result<T, E>` (§3). A guarantee the caller must provide is a contract (§8).
+Choose the form by how the caller consumes the outcome. When the caller branches on it — a missing key, text that may not parse — the standard library offers a non-throwing form instead of an exception — an `…OrNull` method that composes with `??` (`int.ParseOrNull(text) ?? 8080`) or a `Try…` method — and an error that carries a value comes back as a `Result<T, E>` (§3). A guarantee the caller must provide is a contract (§8).
 
 **Exceptions** are for everything else. Most code does not catch them: an exception propagates to where the program can do something about it, usually a boundary — a request loop, a job runner, `Main` or a supervisor — and owned values on the way are disposed (§4), so there is no cleanup to write. A `catch` has comma-separated arms, matched in order; it names the classes it can answer, and anything unmatched keeps propagating. A class that implements `IFailure` says the outside world disagreed (a missing file, a closed channel), and an `IFailure` arm takes all of them; what to do about one is the handler's call.
 
@@ -341,7 +341,7 @@ public class Program
 end Program;
 ```
 
-Concurrent work is **structured**: a `TaskScope` owns the tasks it spawns; when one faults it cancels the others, and `await scope.Join()` waits for all of them and re-raises that one exception — never an aggregate.
+Concurrent work is structured: a `TaskScope` owns the tasks it spawns; when one faults it cancels the others, and `await scope.Join()` waits for all of them and re-raises that one exception — never an aggregate.
 
 ```bezel
 import System.Threading;
@@ -361,7 +361,7 @@ public class Refresher
 end Refresher;
 ```
 
-Code runs on **domains**. A domain runs one piece of work at a time; different domains run in parallel on different threads. Values cross between domains — as spawn arguments, results or channel messages — only if their type is *sendable*, which the compiler checks, so mutable state is never reachable from two domains at once. The guide [Concurrency](Bezel_Guide_04_Concurrency.md) covers domains, channels and cancellation.
+Code runs on domains. A domain runs one piece of work at a time; different domains run in parallel on different threads. Values cross between domains — as spawn arguments, results or channel messages — only if their type is *sendable*, which the compiler checks, so mutable state is never reachable from two domains at once. The guide [Concurrency](Bezel_Guide_04_Concurrency.md) covers domains, channels and cancellation.
 
 ## 8. Contracts
 

@@ -39,7 +39,7 @@ end IPostingRule;
 
 **The three access forms have three names** — the throwing form plain (`Parse`), and the two non-throwing forms `XOrNull` (`ParseOrNull`) and `TryX` (`TryParse`) — and stdlib §1 defines what each name promises (taught in [Guide 2](Bezel_Guide_02_Errors_and_Nullability.md) §2). An operation whose `bool` result reports a declined attempt takes the `Try` name as well — `TryAdd`, and `TryPost` below (stdlib §1's bool-only Try shape) — so a reader sees that `false` is an expected outcome to branch on, not an error code. Invent no fourth spelling — `GetSafe`, `MaybeGet`, `Get2` say nothing the form names do not. (Some stdlib members are non-throwing forms under a plain name where no throwing form exists — `Environment.Get(name): string?`, stdlib §2.4, and the collections' `Remove(item): bool` — so read the signature there.) Domain methods borrow the same vocabulary: the tour's store is `Find`/`Add`/`Update`/`Remove`, verbs a reader already knows from the collections.
 
-**`Async` marks a pair, not a signature.** The rule the stdlib actually follows (stdlib §1) is narrower than the habit: the suffix marks the asynchronous half of a **sync/async pair** — `Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`. An operation that exists only asynchronously carries no suffix at all: `Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`. `Receive` beside `SendAsync` on one endpoint pair is the rule working, not an inconsistency. So an `async method Post` with no synchronous sibling is named `Post`, and adding a synchronous sibling later is what renames it.
+**`Async` marks a pair, not a signature.** The rule the stdlib actually follows (stdlib §1) is narrower than the habit: the suffix marks the asynchronous half of a sync/async pair — `Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`. An operation that exists only asynchronously carries no suffix at all: `Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`. `Receive` beside `SendAsync` on one endpoint pair is the rule working, not an inconsistency. So an `async method Post` with no synchronous sibling is named `Post`, and adding a synchronous sibling later is what renames it.
 
 **Booleans read as predicates.** `IsEmpty`, `HasEntries`, `CanPost`, `Done` — or a verb the caller can read as a question: `Contains`, `TryAdd`, `Admits`. Never a noun that reads as data (`Status`, `Flag`).
 
@@ -61,13 +61,13 @@ using var settled := postings.Where(                              // anything mo
 
 ## 2. Layout
 
-**Two spaces per level, no tabs.** A member body is one level in from its declaration, a nested block one more.
+Two spaces per level, no tabs. A member body is one level in from its declaration, a nested block one more.
 
-**Close a declaration with its name.** `end Ledger;`, `end TryPost;`, `end constructor;`. Spec §1.6 admits a bare `end;` everywhere and §11.4 recommends the named form; this guide requires it on every *declaration* — class, interface, record, enum, choice, method, block property, constructor, destructor, operator — because after a long body the name is the reader's anchor, and the compiler verifies it matches. Inside a body, close statement blocks with the bare `end;`: `if`, `for`, `while`, `do`, `try`, `case`. Two closers follow from the language rather than from taste: an indexer block closes `end;` (an indexer has no name, so there is nothing to repeat), and a labeled loop closes `end scan;` — its label is its name, and the keyword closer `end for;` is rejected once the loop is labeled (§1.6).
+Close a declaration with its name. `end Ledger;`, `end TryPost;`, `end constructor;`. Spec §1.6 admits a bare `end;` everywhere and §11.4 recommends the named form; this guide requires it on every *declaration* — class, interface, record, enum, choice, method, block property, constructor, destructor, operator — because after a long body the name is the reader's anchor, and the compiler verifies it matches. Inside a body, close statement blocks with the bare `end;`: `if`, `for`, `while`, `do`, `try`, `case`. Two closers follow from the language rather than from taste: an indexer block closes `end;` (an indexer has no name, so there is nothing to repeat), and a labeled loop closes `end scan;` — its label is its name, and the keyword closer `end for;` is rejected once the loop is labeled (§1.6).
 
-**One statement per line, and every `if` in block form** — the condition on its own line, the body indented, `end;` on the last, as §21.2's own examples are written. Never `if account = null then return false; end;`. The grammar admits it — every statement ends in `;`, so a block can be typed on one line — but a one-line conditional hides its own branch from a scan and from a diff. Brevity has its own form: the §20 `if` expression, `(if a > b then a else b)`, whose `else` is mandatory and which is an expression, not a squeezed statement.
+One statement per line, and every `if` in block form — the condition on its own line, the body indented, `end;` on the last, as §21.2's own examples are written. Never `if account = null then return false; end;`. The grammar admits it — every statement ends in `;`, so a block can be typed on one line — but a one-line conditional hides its own branch from a scan and from a diff. Brevity has its own form: the §20 `if` expression, `(if a > b then a else b)`, whose `else` is mandatory and which is an expression, not a squeezed statement.
 
-**A blank line between the logical steps of a body.** Acquire, compute, store, return; in a test, arrange, act, assert. A two-line body gets none.
+A blank line between the logical steps of a body. Acquire, compute, store, return; in a test, arrange, act, assert. A two-line body gets none.
 
 ```bezel
 module Ledger.Accounts.Tests;
@@ -87,7 +87,7 @@ end LedgerTests;
 
 Blank lines separate members too, and separate a clause region from the body it guards — spec §22.16's own recommended style: the promises above the gap, the doing below it.
 
-**Continuations are indented past the statement they continue** — four columns (two levels), or aligned to the opening parenthesis when a parameter list wraps. One level is the column a nested block's body occupies, which is exactly the ambiguity the indent is there to remove.
+Continuations are indented past the statement they continue — four columns (two levels), or aligned to the opening parenthesis when a parameter list wraps. One level is the column a nested block's body occupies, which is exactly the ambiguity the indent is there to remove.
 
 ```bezel
 _accounts.Add(posting.Account,
@@ -99,9 +99,9 @@ public constructor(owners: Array<string>,
 end constructor;
 ```
 
-**Keep code within 110 columns.** The tour's longest code line is 103. A trailing-comment block picks one column for the whole block and may carry a line past the ceiling — the tour's comment blocks start at columns 76 and 77 and its longest line is 133. Align the comments; do not reflow working code to hide them.
+Keep code within 110 columns. The tour's longest code line is 103. A trailing-comment block picks one column for the whole block and may carry a line past the ceiling — the tour's comment blocks start at columns 76 and 77 and its longest line is 133. Align the comments; do not reflow working code to hide them.
 
-**Align a run, never a body.** Where consecutive lines have the same shape — a table of registrations, a run of `case` arms, a wrapped named-argument list — align the columns, so a wrong entry shows up as the ragged one:
+Align a run, never a body. Where consecutive lines have the same shape — a table of registrations, a run of `case` arms, a wrapped named-argument list — align the columns, so a wrong entry shows up as the ragged one:
 
 ```bezel
 public method Describe(outcome: PostOutcome): string =>
@@ -113,13 +113,13 @@ public method Describe(outcome: PostOutcome): string =>
 
 Do not align `:=` across ordinary, unrelated statements: the alignment is not information, and the next edit reflows every line in the group into the diff.
 
-**Expression bodies for one-expression members, block bodies otherwise.** `public property Balance: decimal => _balance;` and `public method Credit(amount: decimal) => _balance := _balance + amount;` are the right shape; an `=>` whose expression needs more than one continuation line is a block body written sideways.
+Expression bodies for one-expression members, block bodies otherwise. `public property Balance: decimal => _balance;` and `public method Credit(amount: decimal) => _balance := _balance + amount;` are the right shape; an `=>` whose expression needs more than one continuation line is a block body written sideways.
 
 ---
 
 ## 3. Comments
 
-**Trailing comments say what the reader cannot see.** The ownership fact, the spec section, the status a shape answers, the reason a line is where it is — not a paraphrase of the statement. `// increment the count` above `count++;` costs a line and earns nothing.
+Trailing comments say what the reader cannot see. The ownership fact, the spec section, the status a shape answers, the reason a line is where it is — not a paraphrase of the statement. `// increment the count` above `count++;` costs a line and earns nothing.
 
 ```bezel
 var account := _accounts.GetOrNull(posting.Account);   // a borrow, not a take (stdlib §4.9)
@@ -128,11 +128,11 @@ if account = null then
 end;
 ```
 
-**One comment column per block.** Pick a column past the longest code line in the run and hold it for that block; a continuation of a trailing comment indents under its own text, as the stdlib's own listings do. When the next block's code is wider, that block picks its own column — the alignment is local, and a single file-wide column would drag every comment right.
+One comment column per block. Pick a column past the longest code line in the run and hold it for that block; a continuation of a trailing comment indents under its own text, as the stdlib's own listings do. When the next block's code is wider, that block picks its own column — the alignment is local, and a single file-wide column would drag every comment right.
 
-**Cite the spec where the code derives from a rule** — `// per §28.3` in code, `(§28.3)` inside a sentence. Give the revision when the citation is load-bearing outside the file (a PR, a test name, an issue).
+Cite the spec where the code derives from a rule — `// per §28.3` in code, `(§28.3)` inside a sentence. Give the revision when the citation is load-bearing outside the file (a PR, a test name, an issue).
 
-**Banner comments only between top-level declarations.** `// ── Wire shapes ──────────` separates the sections of a file; inside a body it is decoration, and a body long enough to need one wants a private method instead.
+Banner comments only between top-level declarations. `// ── Wire shapes ──────────` separates the sections of a file; inside a body it is decoration, and a body long enough to need one wants a private method instead.
 
 ---
 
@@ -257,4 +257,4 @@ end Ledger;
 
 ## 7. What this guide does not decide
 
-A **formatter**: none exists, and until one does, the rules above are applied by hand and reviewed like any other part of a change; when one lands, this document is its specification and its output settles the cases this text leaves open. **Display**: the file contains two-space indents and no tabs, and how an editor renders them is not a project matter. And **anything the specification decides** — which closers are admitted (§1.6), modifier order (§11.5), where `_` may appear (§17.13), visibility (§13), the disposal order §4 leans on (§28.4) — is a rule, not a convention, and this guide only cites it. Where this guide and the spec appear to disagree, the spec wins and the disagreement is a defect worth reporting.
+A formatter: none exists, and until one does, the rules above are applied by hand and reviewed like any other part of a change; when one lands, this document is its specification and its output settles the cases this text leaves open. Display: the file contains two-space indents and no tabs, and how an editor renders them is not a project matter. And anything the specification decides — which closers are admitted (§1.6), modifier order (§11.5), where `_` may appear (§17.13), visibility (§13), the disposal order §4 leans on (§28.4) — is a rule, not a convention, and this guide only cites it. Where this guide and the spec appear to disagree, the spec wins and the disagreement is a defect worth reporting.
