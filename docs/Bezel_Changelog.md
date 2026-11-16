@@ -16217,7 +16217,7 @@ These adaptations have not had an adversarial critique of their own; the composi
 
 **R1 — `??` and `??=` over a non-nullable left operand (ruling on [#8596](https://github.com/s8lap/bezel-lang/issues/8596); spec §7.7 after *Typing*, pointer in §6.6's `??=` paragraph).**
 - *Decided.* A non-nullable left operand of type `T` types exactly as a `T?` one would.
-  - The right operand must convert to `T` or `T?`, and the result is `T`. So `i ?? "s"` and `i ??= "s"` over `i: int` are compile errors, while `s ?? "b"` over `s: string` is well-typed.
+  - For `??`, the right operand must convert to `T` or `T?`, and the result is `T`. For `??=`, §6.6 requires `e` to convert to the target's type, so over `i: int` both `i ??= "s"` and `i ??= n` with `n: int?` are rejected. So `i ?? "s"` and `i ??= "s"` are compile errors, while `s ?? "b"` over `s: string` is well-typed.
   - Such an expression draws a warning that the right operand is never evaluated; for `??=`, that the assignment never happens.
   - Where the left operand reads a binding, the **declared** type decides, so a §7.4-narrowed `string?` is silent.
   - A type-parameter operand counts as possibly nullable (§7.10) unless its constraints make it non-nullable. The constraints are `notnull`, `value`, `class` or a type bound. The ruling named the first three; the text adds the bound, because §7.10 already makes `T` non-nullable under any type-bound constraint.
@@ -16229,7 +16229,7 @@ These adaptations have not had an adversarial critique of their own; the composi
   - A failed open raises the same §7.5 classes: `FileNotFoundException` for a missing file, `DirectoryNotFoundException` for a missing directory component, and `IOException` otherwise.
   - A read never returns a substitute value. The async form raises through its task.
   - The classes are `IFailure`-marked. Non-throwing form: none, a gap ([#8516](https://github.com/s8lap/bezel-lang/issues/8516)).
-- *Declined.* Leaving §7.3 silent. v0.358 stated "Failures raise the §7.5 IO exception types" once, at the end of §7.4, and this train's stdlib pass narrowed that sentence to `Directory.Delete`. Silence would have left `File` the one `System.IO` surface with no stated failure. Returning `""` or an empty array, as the runtime does today, was also declined: it is the substitute value the story forbids, and it makes a missing file read as an empty one.
+- *Declined.* Leaving §7.3 silent. v0.358's one general statement, at the end of §7.4, is that failures raise the §7.5 IO exception types (this train's stdlib pass joined it to the `Directory.Delete` sentence, still general). It does not say what a whole-file read does with a file it cannot open, or that it never returns a substitute. Silence would have left the runtime's empty result looking like a reading of the text. Returning `""` or an empty array, as the runtime does today, was also declined: it is the substitute value the story forbids, and it makes a missing file read as an empty one.
 - *Why.* The rest of `System.IO` and the reference already treated a missing file as `FileNotFoundException`. The open tracker [#7057](https://github.com/s8lap/bezel-lang/issues/7057) already read v0.340's text that way.
 - The rule leads the implementation (ledger below).
 
@@ -16260,13 +16260,14 @@ These adaptations have not had an adversarial critique of their own; the composi
 - Stdlib §2.17 gains a four-row table: `IFailure`-marked, makes no statement, cancellation, fatal.
 
 **Vocabulary.**
-- **throwing form** / **non-throwing form** name the access forms. The non-throwing forms are `OrNull`, `Try` and, for gathered or decoded errors, `Result`. They replace "assert-shaped" / "branch-shaped" and the "*OrNull*/Try tier" gloss in teaching text. The stdlib's recorded-tier concept in its no-dual rule keeps its word.
+- **throwing form** / **non-throwing form** name the access forms. The non-throwing forms are `OrNull` and `Try`, exactly stdlib §1's scope; `Result<T, E>` and a domain choice keep their own names. They replace "assert-shaped" / "branch-shaped" and the "*OrNull*/Try tier" gloss in teaching text. The stdlib's recorded-tier concept in its no-dual rule keeps its word.
   - The lanes drafted "value-shaped form", and the coordinator chose "non-throwing form" before publication. The spec's existing "value-shaped" receiver/storage sense and the rationale's "value-shaped sum" are a different word and are untouched.
 - **bug**: a broken guarantee the program owed. It replaces *defect*, which now leaves the guides and the reference as v0.358 removed it from the normative text, and "fault" used as a kind.
+- **`IFailure`-marked** replaces "a failure" as the name of a kind of exception everywhere, the spec included. Spec §31.4's defined term is now **`IFailure`-marked**; its heading *The failure marker* and its anchor stay. *Failure* stays plain English ("the operation failed").
   - *Fault*/*raise* stay as verbs, with the existing technical noun ("a task's fault", "first-fault").
   - "A bug at its call sites" and "absence is a bug here" are retired.
 - **expected absence** is stdlib §1's band-2 name. The bands keep their numbers in stdlib §1, gain anchors and are cited by name elsewhere. Band 4 is renamed ***Boundary-consumed condition*** (was *fault*), with the same membership.
-- **boundary** names the place a broad handler belongs. "Trust boundary" leaves the guides and the spec's §22.16.
+- **boundary** names the place a broad handler belongs, listed everywhere in spec §31.2.3's words: "a request loop, a job runner, `Main` or a supervisor". "Trust boundary" leaves the guides and the spec's §22.16.
 - **Retired.** "defined fault", "strict fault", "loud-failure discipline" (spec §18.5 and §29.6; stdlib §2.18, §3.2, §4.4, §4.8 and §9.2–§9.5; the reference's §5.7; rationale §14.9). Also "a failure" for the marker: say "`IFailure`-marked".
 - **Raises, not substitutes.** "Raises (rather than returning a substitute)" is the plain form.
 
@@ -16280,13 +16281,17 @@ These adaptations have not had an adversarial critique of their own; the composi
   - §29's lazy-query wording;
   - §30.8's note (R4) and §30.14 (R3);
   - §31.2.3's boundary sentence and §31.4's one-home sentence;
-  - §18.5 and §29.6 vocabulary.
+  - §18.5 and §29.6 vocabulary;
+  - §31.4's defined term (`IFailure`-marked) and its echoes in §30.14 and the `Parallel` bullet;
+  - meaning-gate corrections in §28.3.13 (`ScopeGuard` runs at scope exit unless dismissed), §31.2.5's lead-in (every exception but cancellation) and §30.9's citation.
 - **Standard library** (about 60 changes):
   - §1: the failure-signal rule gains a lead stating the form choice as its normative home; band anchors and names; band 4's title; *The failure marker* reworded; the library's-job sentence (R4); a raise-statement template (`sec-raises-statements`);
   - the template applied across §2–§10, each member's raise stated with its non-throwing form or *none* and why (a precondition, or a gap with #8516);
   - §2.17's marker table (R6);
   - §6.5's example (R5) and §6.8's cancellation sentence;
-  - §7.3 (R2);
+  - §7.3 (R2) and a §7.2 spec-ahead marker for the `FileStream` open (#2286);
+  - §2.15's decode conditions point at their *Boundary-consumed condition* record (§2.14), not a gap;
+  - §1's summary names band 1's residual classes beside `requires`;
   - §8.2's `Debug.Assert` (the *Fatal* band, never an exception).
 - **Rationale** (28 changes):
   - §11 is retitled *Pattern matching and error handling*, with an intro that reads its error entries as one argument (anchors kept);
@@ -16300,7 +16305,7 @@ These adaptations have not had an adversarial critique of their own; the composi
   - §5.2, §5.6, §5.7 (R2; `System.IO` has no non-throwing form) and §5.11;
   - §6's `Settings`/`Main` boundary, the boundary idiom's cancellation arm, and the word-count example (a `FileNotFoundException` arm, not an `Exists` guard);
   - §7.1, §7.2, §7.7, and §7.8's R1 trap;
-  - §8 gains eight retired-form rows.
+  - §8 gains ten retired-form rows, two of them for this revision's teaching reversals (`File.Exists`-then-open, and whole-file reads read as empty).
 - **Guide 02** (restructured, sections 1–7 kept by number and subject):
   - §1 echoes R1;
   - §2 *Expected absence: the non-throwing form* drops the `File.Exists`-then-open example and adds the library-gap paragraph with `OpenSettingsOrNull`;
@@ -16320,7 +16325,7 @@ These adaptations have not had an adversarial critique of their own; the composi
 
 **Migration.**
 
-  *Newly rejected:* a right operand of `??` or `??=` that converts neither to `T` nor to `T?` over a non-nullable left operand of type `T` (`i ?? "s"`, `i ??= "s"` over `i: int`). The documents did not decide the case before (#8596), and the compiler accepts it today.
+  *Newly rejected:* over a non-nullable left operand of type `T`, a right operand of `??` that converts neither to `T` nor to `T?` (`i ?? "s"` over `i: int`), and a right operand of `??=` that does not convert to the target's type (`i ??= "s"`, and `i ??= n` with `n: int?`). The documents did not decide the case before (#8596), and the compiler accepts it today.
 
   *Newly warned:* a non-nullable left operand of `??` (the right operand is never evaluated) or a non-nullable target of `??=` (the assignment never happens), by declared type, with a type parameter possibly nullable unless constrained non-nullable.
 
@@ -16334,11 +16339,14 @@ These adaptations have not had an adversarial critique of their own; the composi
   - [#8596](https://github.com/s8lap/bezel-lang/issues/8596): sema type-checks neither operand form's right side over a non-nullable left and emits no warning (`campaign:nullable-carrier`).
   - [#7057](https://github.com/s8lap/bezel-lang/issues/7057): the runtime returns `""`, an empty array or a null array instead of raising. It is now labelled `spec-tracking` and carried in a stdlib §7.3 marker and the reference's §5.7 line. When it is fixed, `file_read_all_text_console_write_loop_100_spec_28_9` (`tests/codegen/file_builtin_leak_8016_test.cpp`) must change its expectation, since it pins the blank output.
   - [#8418](https://github.com/s8lap/bezel-lang/issues/8418): unchanged in requirement. R3's sentence is a case of the join it already tracks.
+  - [#2286](https://github.com/s8lap/bezel-lang/issues/2286): not new. A failed `FileStream` open yields a degenerate handle instead of raising (stdlib §7.2). It is now marked in §7.2, caveated where Guide 02 and the reference teach the idiom, and labelled `spec-tracking`.
   - Taught but already tracked: `ScopeGuard` ([#4669](https://github.com/s8lap/bezel-lang/issues/4669)).
 
   *Rule corpus* (5,857 → 5,865 cases):
-  - Rule quotes refreshed, verdicts kept (23): `s5_4_0004`, `s18_5_0015`, `l1_0001`, `l1_0004`, `l2_5_0061`, `l2_18_0009`, `l2_18_0010`, `l2_18_0017`, `l2_18_0027`, `l3_1_0004`, `l3_2_0011`, `l4_4_0010`, `l4_8_0005`, `l4_14_0012`, `l5_0010`, `l5_0805`, `l5_0806`, `l6_1_0011`, `l6_9_0014`, `l6_9_0015`, `l6_12_0001`, `l6_12_0006`, `l7_5_0003`.
-  - Retitled (1): `s30_9_0009`, whose example the train rewrote.
+  - Rule quotes refreshed, verdicts kept (45):
+    - stdlib: `l1_0001`, `l1_0004`, `l2_5_0061`, `l2_18_0009`, `l2_18_0010`, `l2_18_0017`, `l2_18_0027`, `l3_1_0004`, `l3_2_0003`, `l3_2_0011`, `l3_3_0004`, `l4_4_0010`, `l4_8_0005`, `l4_14_0012`, `l4_21_0011`, `l5_0010`, `l5_0805`, `l5_0806`, `l6_1_0011`, `l6_9_0014`, `l6_9_0015`, `l6_12_0001`, `l6_12_0006`, `l7_5_0003`;
+    - spec: `s5_4_0004`, `s18_5_0015`, `s22_16_0032`, `s30_9_0010`, `s30_14_0017`–`0020`, `s31_2_0014`, `s31_2_5_0002`, `s31_4_0009`–`0012`, `s31_4_0021`–`0026`, `s31_4_0030`.
+  - Retitled (12), dropping retired words or a rewritten example's name: `s30_9_0009` (title only), `s31_4_0013` (title only), `l1_0001`, `l1_0004`, `l3_2_0011`, `l6_1_0011`, `s30_9_0010`, `s30_14_0017`, `s30_14_0019`, `s31_2_0014`, `s31_2_5_0002`, `s31_4_0009`.
   - New (8):
     - R1 (#8596): `s7_7_0021` reject and its twin `s7_7_0026` warn (`i ??= "s"` / `i ??= 2`), `s7_7_0022` warn (`s ??= "b"`), `s7_7_0023` quiet (a narrowed `string?`), `s7_7_0024` quiet (unconstrained `T`) and `s7_7_0025` warn (`where T: notnull`).
     - R2 (#7057): `l7_3_0002` run (a missing file taken by a `FileNotFoundException` arm).
@@ -16351,12 +16359,31 @@ These adaptations have not had an adversarial critique of their own; the composi
 - [#8668](https://github.com/s8lap/bezel-lang/issues/8668) (spec-question): what `TaskScope.Join` re-raises when the scope is cancelled and no child faulted. Stdlib §6.10 is silent; spec §30.10 states it only for `WhenAll`.
 - [#8669](https://github.com/s8lap/bezel-lang/issues/8669) (design): whether a cancelled child domain should join as `OperationCanceledException`.
 - [#8667](https://github.com/s8lap/bezel-lang/issues/8667) (filed by this train's stdlib pass): `Environment.Get`/`GetInt`/`GetBool` return null under plain names. It is now commented with the other plain names in the same question: the tour store's `Find`/`Update`/`Remove`, the collections' `Remove: bool`, and `LinkedList<T>.Find`.
+- [#8670](https://github.com/s8lap/bezel-lang/issues/8670) (`ownership`, `campaign:using-heads`): an `out using var` in an `if` condition is disposed after the `if`, not at the end of the enclosing block (spec §22.4). The meaning gate's teaching critic measured it on r40 while re-tracing Guide 02 §2.
 - New non-throwing duals stay on #8516.
 
 **Recorded, not changed.**
 - Rationale §11.12's anchor `sec-failures-and-defects` keeps its old slug, because links use it.
 - Stdlib §4.20's `Counter<K>` marker cites [#3848](https://github.com/s8lap/bezel-lang/issues/3848), which a 2026-10-13 sweep closed. `src/` has only name tables for `Counter`, and seven of the eight `l4_20_*` rule cases are banked `fail`. The type is not implemented, and the marker and Guide 05's sentence stand.
 - The canonical brief's "`TaskScope` re-raises the first fault in input order" was wrong. Every document follows stdlib §6.10 (first in real time) and spec §30.10 (`WhenAll`, input order).
+
+**Corrections at the meaning gate** (two critics, both ACCEPT-W-NOTES on the first composition, applied before publication).
+- *Coordinator decisions:* one boundary list (spec §31.2.3's); "non-throwing form" is `OrNull` and `Try` only; "failure" as a kind is retired in the spec too; stdlib §2.15's decode conditions point at their band-4 record.
+- *Normative (critic A):*
+  - spec §28.3.13 had `ScopeGuard` running "only on an exceptional exit";
+  - spec §31.2.5's lead-in now reads "every exception but cancellation";
+  - stdlib §1's summary of band 1 gains its residual classes;
+  - the changelog's R1 now splits the `??=` conversion and R2's *Declined* is corrected;
+  - smaller wording and citation fixes in spec §22.16 and §30.9, stdlib §6.5, and rationale §5 and §12.4;
+  - #8596 gained `spec-tracking`.
+- *Teaching (critic B):*
+  - the file idiom carries the #2286/#7057 caveat;
+  - the Tour's contract sentence names the member for `ensures`/`invariant`;
+  - Guide 02 §1, Guide 01 §8 and the reference carry the type-bound clause, the split conversion and the not-yet-checked caveat (#8596);
+  - the reference's §3.4 `finally`, §5.1 helper advice, §6 `using var lines` and cancellation citations are fixed;
+  - Guide 01 §10 orders its remedies as Guide 02 §6 does;
+  - Guide 02 drops a duplicate `ConfigError` name and is trimmed by about 500 words (6,101 → 5,592; v0.358: 4,899);
+  - Guide 05's `ReportEach` is in block form.
 
 **Checks.** `scripts/check_docs.sh` (all phases), `check_proposals.sh`, `build_book.py --check`, `check_src_citations.py`, `gen_editor_grammars.py --check`, `corpus.py lint --strict` (5,865 cases) and `corpus.py check`, the harness unit tests (170) and `check_commit_trailers.py --strict`. The meaning gate (an adversarial critique) runs on this branch before it is pushed.
 
