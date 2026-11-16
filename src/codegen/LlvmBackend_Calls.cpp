@@ -9106,6 +9106,100 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return fn;
         };
 
+        // fix #8584 (stdlib §4.4 / §2.8, spec §14.2 *Interface conformance*
+        // rule 2, v0.357): the comparator a RECORD element of `Array<T>.Sort()`
+        // / `Array<T>.Sorted()` is ranked by — the element type's OWN
+        // `CompareTo`.
+        //
+        // WHAT THE DOCUMENTS REQUIRE. stdlib §4.4 declares
+        //     public method Sort() where T: IComparable<T>;
+        //     public method Sorted(): owned Array<T> where T: IComparable<T>;
+        // and states of the parameterless natural-order form: "for a concrete
+        // element type the natural-order comparer is that type's own `CompareTo`
+        // (for example `int.CompareTo`)". stdlib §2.8 gives that member's
+        // meaning: "`a.CompareTo(b)` returns a negative number if `a < b`, zero
+        // if equal, a positive number if `a > b`". spec §14.2 *Interface
+        // conformance* rule 2 is what admits the record at all: "T is a record
+        // that lists I (or any interface extending I) in its inheritance clause
+        // and declares matching members" — so a
+        // `public record Pair … : IComparable<Pair>` with a
+        // `CompareTo(other: Pair): int` IS ordered by that member.
+        //
+        // WHAT WENT WRONG. The comparator selection in the two arms below had
+        // NO arm for a record: the class probe requires
+        // `TypeDeclKind::Class`, the interface probe requires an interface,
+        // the `string` probe needs a `ptrTy()` element — and a record is a
+        // VALUE type stored INLINE in the array slot, so none of them matched
+        // and the order fell through to the `bz$intcmp` fallback, which loads
+        // an i32 out of the element SLOT. For a record that slot IS the
+        // record's first `int`-shaped field, so the elements were ranked by
+        // THAT FIELD — a silent wrong order whenever the record's `CompareTo`
+        // orders by anything else (MEASURED on the base: a
+        // `record Pair(tag: int, cents: int)` whose `CompareTo` orders by
+        // `cents` sorted `7:30 8:10 9:20` — the `tag` order).
+        //
+        // THE THUNK. The record analogue of `buildObjectCompareToThunk` is
+        // `buildRecordCompareToThunk` (a record's stored bytes ARE its own
+        // inline struct value, so `a`/`b` are DIRECT pointers to the record:
+        // no vtable dispatch applies — records are not polymorphic, CG29), and
+        // a GENERIC record's is the monomorphized
+        // `buildGenericRecordCompareToThunk` (§14.1: the `CompareTo` that
+        // orders `R<int>` is the one monomorphized at `R<int>`). That is the
+        // SAME pair the LINQ `OrderBy` key path uses
+        // (`buildOrderKeyComparator`, LlvmBackend_Calls3.cpp), and both are
+        // cached per module, so the in-place `Sort()` arm and the copy-form
+        // `Sorted()` arm below share ONE thunk — the `bz$strcmp` pair's house
+        // pattern.
+        //
+        // It is a LOCAL lambda rather than an `Emitter` member, exactly like
+        // the sibling `buildPrimitiveSortComparator` above: the two record
+        // thunks it names are already `Emitter` members, and
+        // `LlvmBackend_impl.hpp` is included by every `LlvmBackend_*`
+        // translation unit (CLAUDE.md, *Style and conventions*: "Avoid
+        // gratuitous edits to widely-included headers").
+        auto buildRecordSortComparator =
+            [&](const sema::TypeRef* elemTy) -> llvm::Function* {
+            if (!elemTy || elemTy->kind != sema::TypeRef::Kind::Named ||
+                !elemTy->declaration || elemTy->nullable)
+                return nullptr;
+            if (elemTy->declaration->kind != ast::TypeDeclKind::Record)
+                return nullptr;
+            // The §2.8 `IComparable<T>` shape: the single parameter must BE
+            // the record (`CompareTo(other: Pair)`), because the thunk's
+            // second operand is the record's own bytes, passed BY VALUE
+            // (§9.4/CG29). A `CompareTo` whose parameter is some OTHER type
+            // does not match the interface's member (spec §14.2 rule 2: the
+            // record must "declare matching members"), and lowering it
+            // through this ABI would type the callee's parameter wrongly — so
+            // it is declined here, exactly as
+            // `buildGenericRecordCompareToThunk` declines it. (The class arm
+            // needs no such check: a class's `CompareTo` takes its operand
+            // BY REFERENCE, so the thunk's pointer ABI is the same whatever
+            // the declared parameter type is.)
+            sema::MethodSymbol* cmpMs =
+                findMethodByName(elemTy->declaration, "CompareTo");
+            if (!cmpMs || cmpMs->params.size() != 1) return nullptr;
+            const auto* ps =
+                dynamic_cast<const sema::ParameterSymbol*>(cmpMs->params[0]);
+            if (!ps) return nullptr;
+            const sema::TypeRef* formal =
+                ps->declType ? ctx_.resolvedType(*ps->declType)
+                             : ps->resolvedDeclType;
+            if (!formal || formal->nullable ||
+                formal->kind != sema::TypeRef::Kind::Named ||
+                formal->declaration != elemTy->declaration)
+                return nullptr;
+            // A GENERIC record's `CompareTo` in `methodFns_` is the ERASED
+            // template (its `T`-typed fields sit at the placeholder offsets),
+            // so it must be MONOMORPHIZED at the element's own instantiation
+            // — the `buildGenericRecordCompareToThunk` path, exactly as the
+            // LINQ `OrderBy` key path and the no-selector `Min()`/`Max()`
+            // path use it.
+            if (llvm::Function* f = buildRecordCompareToThunk(elemTy))
+                return f;
+            return buildGenericRecordCompareToThunk(elemTy);
+        };
+
         // per §3: .Sort() — in-place ascending sort for int arrays.
         // Uses bz_array_sort with a built-in i32 comparator thunk.
         // fix #3345: the static-call form `Array.Sort(a)` re-binds the
@@ -9146,6 +9240,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     findMethodByName(elemTRResolved->declaration, "CompareTo");
                 if (cm && cm->params.size() == 1) classCompareMs = cm;
             }
+            // fix #8584 (stdlib §4.4 / §2.8, spec §14.2 *Interface conformance*
+            // rule 2, v0.357): a RECORD element that declares a dispatchable
+            // `CompareTo` is ranked by THAT member — the record analogue of the
+            // class arm above, which a record never reaches (the probe above
+            // requires `TypeDeclKind::Class`). Null for every other element
+            // kind, so the arms below keep their pre-#8584 choices.
+            llvm::Function* recordCmpFn =
+                buildRecordSortComparator(elemTRResolved);
             // fix #2768 (stdlib §4.4/§2.8, spec §14.2, v0.240): an INTERFACE
             // element `IFoo: IComparable<IFoo>` is neither a Class (so
             // classCompareMs stays null) nor a string, yet it lowers to
@@ -9277,6 +9379,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // builds. Guarded because a null here would be handed to
                 // bz_array_sort as the comparator and called through.
                 if (!cmpFn) return nullptr;
+            } else if (recordCmpFn) {
+                // fix #8584 (stdlib §4.4 / §2.8, spec §14.2 *Interface
+                // conformance* rule 2, v0.357): a RECORD element is ranked by
+                // its OWN `CompareTo` — the record analogue of the class arm
+                // above. The thunk's `a`/`b` are DIRECT pointers to the
+                // element slot (a record is stored INLINE and is not
+                // polymorphic — CG29), so `this` is the record's own address
+                // and `other` is the other element's bytes.
+                //
+                // Without this arm the order fell through to `bz$intcmp`,
+                // which loads an i32 out of the element slot — the record's
+                // FIRST `int`-shaped field — so the elements were ranked by
+                // that field instead of by `CompareTo`.
+                cmpFn = recordCmpFn;
             } else if (isStringElem) {
                 // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): this thunk used
                 // to extract each element's raw `.data` pointer and call plain
@@ -9563,6 +9679,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     findMethodByName(elemTR2Resolved->declaration, "CompareTo");
                 if (cm && cm->params.size() == 1) classCompareMs2 = cm;
             }
+            // fix #8584 (stdlib §4.4 / §2.8, spec §14.2 *Interface conformance*
+            // rule 2, v0.357): the `Sorted()` twin of the `Sort()` arm's
+            // #8584 block above — the SAME builder (`buildRecordSortComparator`
+            // → the record's own `CompareTo`), so the copy-form's order is the
+            // in-place form's order (the `bz$strcmp` pair's house pattern).
+            // Null for every other element kind.
+            llvm::Function* recordCmpFn2 =
+                buildRecordSortComparator(elemTR2Resolved);
             // fix #2768: interface element — see the Sort() site above. The
             // sema gate on the comparerless Sorted() (ExprTypecheck_Calls.cpp)
             // admits exactly the same self-referential shape, so this arm and
@@ -9662,6 +9786,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // behaviour this arm relied on. Guarded because a null here
                 // would reach bz_array_sort as the comparator and be called.
                 if (!cmpFn2) return nullptr;
+            } else if (recordCmpFn2) {
+                // fix #8584 (stdlib §4.4 / §2.8, spec §14.2 *Interface
+                // conformance* rule 2, v0.357): the `Sorted()` twin of the
+                // `Sort()` arm's record arm above — the SAME builder, so the
+                // copy-form's order is the in-place form's order. Without it
+                // the copy-form fell through to `bz$intcmp` exactly as the
+                // in-place form did, and ranked a record element by its first
+                // `int`-shaped field.
+                cmpFn2 = recordCmpFn2;
             } else if (isStringElem2) {
                 // fix #4495 (stdlib §9.6 + spec §4.6, v0.306): the `.Sorted()`
                 // twin of the `Sort()` thunk above — both build the SAME
