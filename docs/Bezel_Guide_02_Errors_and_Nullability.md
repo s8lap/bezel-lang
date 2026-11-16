@@ -6,7 +6,7 @@ Most of the syntax here is mainstream: non-nullable by default, `?` for nullable
 
 - **The caller branches on an expected absence** — nothing under the key, text that may not parse: the **non-throwing form**, an `…OrNull` member returning `T?` or a `Try…(out x): bool` member (§2). It is built on nullability, which is why the guide starts there (§1).
 - **The caller branches on an error it gathers or decodes**, and the error's payload is a value: a `Result<T, E>` or a domain choice (§3).
-- **Everything else throws** — the **throwing form** — and is handled where the program can do something about it, usually a **boundary**: a request loop, a job runner, `Main`, a supervisor (§4). Code in between names the classes it can answer and lets the rest propagate. A class that implements `IFailure` says the outside world disagreed; it never says what to do.
+- **Everything else throws** — the **throwing form** — and is handled where the program can do something about it, usually a **boundary**: a request loop, a job runner, `Main` or a supervisor (§4). Code in between names the classes it can answer and lets the rest propagate. A class that implements `IFailure` says the outside world disagreed; it never says what to do.
 - **A guarantee the caller must provide** is a contract: `requires(...)`. A broken one is a bug in the calling code, raised as `ContractViolationException` and fixed there, not handled (Guide 6 §2).
 - A handful of fatal conditions simply terminate (§4).
 
@@ -260,7 +260,7 @@ method Serve(request: Request): Response
     var f: IFailure => do                    // the environment or an upstream peer
       return Response.BadGateway(f.Message);
     end,
-    var ex: Exception => do                  // a supervisor only: the rest is reported
+    var ex: Exception => do                  // a boundary only: the rest is reported
       ReportBug(ex);
       return Response.InternalError();
     end
@@ -268,7 +268,7 @@ method Serve(request: Request): Response
 end Serve;
 ```
 
-The `FormatException` arm is this service's statement that malformed input from a client is expected here; nothing in the class says so, because the same class reports a malformed constant in your own code. The `IFailure` arm takes what the environment or an upstream peer did; `f` is an ordinary `Exception` inside the arm. The `Exception` arm is there only because this boundary is a supervisor that must keep serving. Most boundaries have no such arm: anything else then propagates, and an uncaught exception ends the program with its report (spec §33.3). A supervisor's catch-all would also take cancellation — a request to stop, answered as a bug — so the first arm re-raises it; that is the one arm whose only job is to re-raise, because a later arm would otherwise take the exception. One arm on bare `Exception` that answers everything the same way is the habit to drop: it answers a bug as if it were bad input.
+The `FormatException` arm is this service's statement that malformed input from a client is expected here; nothing in the class says so, because the same class reports a malformed constant in your own code. The `IFailure` arm takes what the environment or an upstream peer did; `f` is an ordinary `Exception` inside the arm. The `Exception` arm is there only because this boundary is a request loop that must keep serving. Most boundaries have no such arm: anything else then propagates, and an uncaught exception ends the program with its report (spec §33.3). A boundary's catch-all would also take cancellation — a request to stop, answered as a bug — so the first arm re-raises it; that is the one arm whose only job is to re-raise, because a later arm would otherwise take the exception. One arm on bare `Exception` that answers everything the same way is the habit to drop: it answers a bug as if it were bad input.
 
 The marker is a default, not a verdict. If the service cannot run without a file, an `IFailure` arm above a lazy open of it answers its absence as routine. Open such a file at start-up, where no arm is above it, or catch `FileNotFoundException` there and stop.
 
@@ -399,7 +399,7 @@ One diagnostic worth recognizing in this area: disposing a value and then using 
 | An expected absence the library has no non-throwing form for (opening a file that may not be there) | catch the one class that means "not there" at the call, in a small `…OrNull` helper — never an `Exists` test before the operation; the missing form is a library gap (#8516) (§2) |
 | The caller branches on an error it gathers or decodes, at or near the call, and the error payload is a plain value | `choice` return (`Result<T, E>` or a domain choice, spec §35); consume with an exhaustive `case`, or — where both payloads are value-like — pipeline with the combinators (`Map`/`MapError`/`AndThen`/`UnwrapOr`, stdlib §2.20) |
 | Nobody branches: the condition is handled at a *boundary* — logged, retried, converted to a protocol answer, reported — or its payload cannot be a plain value (it owns a resource, or carries a borrow; spec §35.4) | throw a typed exception, producer-local (spec §31.4), listing `IFailure` when the environment or a peer produced it; let it propagate to where the program can act, catch it there by name or with an `IFailure` arm, and copy out what you keep (§4, §5) |
-| Handling what reaches a boundary | an arm for each class this boundary can answer (`FormatException` for bad client input) and an `IFailure` arm for what the environment and peers do; in a supervisor only, `OperationCanceledException => throw` first and one `Exception` arm last that reports the rest (§4) |
+| Handling what reaches a boundary | an arm for each class this boundary can answer (`FormatException` for bad client input) and an `IFailure` arm for what the environment and peers do; at a boundary only — a request loop, a job runner, `Main` or a supervisor — `OperationCanceledException => throw` first and one `Exception` arm last that reports the rest (§4) |
 | Code between the operation and the boundary | no `catch`, or arms only for the classes it can act on; never an arm that only re-raises, never one that catches a bug to carry on (§4) |
 | A guarantee a correct caller always provides (a broken one is a bug, not an outcome) | a `requires(...)` clause (spec §22.16; Guide 6 §2) — always on, raises `ContractViolationException`; never for input from outside the program, whose invalidity is a normal outcome (the rows above) |
 | Invalid argument where no contract is possible (interop, pre-contract code) | `throw new ArgumentException(...)` |
