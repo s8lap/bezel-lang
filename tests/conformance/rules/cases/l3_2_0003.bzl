@@ -2,9 +2,9 @@
 //! doc: stdlib
 //! section: 3.2
 //! title: UTF8.GetString raises FormatException on malformed bytes
-//! rule: Malformed or unrepresentable input is a defined fault — GetString
-//!   raises FormatException when the input bytes are not a well-formed
-//!   sequence; no replacement characters are produced.
+//! rule: Malformed or unrepresentable input raises, never yielding a silent
+//!   substitution — GetString raises FormatException when the input bytes are
+//!   not a well-formed sequence; no replacement characters are produced.
 //! cites: 3.2
 //! expect: run
 //! stdout: caught

@@ -1,7 +1,7 @@
 //! case: l1_0001
 //! doc: stdlib
 //! section: 1
-//! title: ReadKey is the assert-shaped throwing tier at end of input, and raises a failure
+//! title: ReadKey is the throwing form at end of input, and raises an IFailure-marked exception
 //! rule: `ReadKey` remains the throwing form: a caller that does not expect end of
 //!   input handles nothing at the call. … raises `EndOfStreamException` (§7.5)
 //!   when input has ended … The class is `IFailure`-marked (§1), end of input

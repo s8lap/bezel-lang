@@ -6,7 +6,8 @@
 //!   join raises `DomainFailedException`, which derives from
 //!   `DomainFaultedException` and implements `IFailure` (stdlib §6.8). An arm
 //!   naming `DomainFaultedException` takes both; an arm naming `IFailure` takes
-//!   a failure raised in another domain as it takes one raised in its own.
+//!   an `IFailure`-marked exception raised in another domain as it takes one
+//!   raised in its own.
 //! cites: 30.14, 31.4
 //! expect: run
 //! stdout: unmarked joined

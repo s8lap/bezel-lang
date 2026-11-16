@@ -2,12 +2,13 @@
 //! doc: spec
 //! section: 31.4
 //! title: a user hierarchy under a user base: the IFailure arm takes only the marked class
-//! rule: Every other `Exception`-derived class may list it, whatever its base:
-//!   a class deriving from `InvalidOperationException`, from `FormatException`
-//!   or from a class of the program's own is a failure where its author says
-//!   so, and an arm naming its base still takes it. … The marker is read in two
-//!   places. A catch arm that names it selects on it: an `IFailure` arm takes
-//!   every failure and lets every other exception, cancellation included, pass
+//! rule: Every other `Exception`-derived class may list it, whatever its base: a
+//!   class deriving from `InvalidOperationException`, from `FormatException` or
+//!   from a class of the program's own is `IFailure`-marked where its author
+//!   says so, and an arm naming its base still takes it. … The marker is read
+//!   in two places. A catch arm that names it selects on it: an `IFailure` arm
+//!   takes every `IFailure`-marked exception and lets every other exception,
+//!   cancellation included, pass
 //! cites: 31.4, 31.2.1
 //! expect: run
 //! output: failure

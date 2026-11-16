@@ -1,7 +1,7 @@
 //! case: l1_0004
 //! doc: stdlib
 //! section: 1
-//! title: a zero constructor magnitude is valid, not a fault
+//! title: a zero constructor magnitude is valid and raises nothing
 //! rule: Negative magnitudes raise … Zero is valid (an empty container or
 //!   zero-length buffer): a magnitude-taking constructor such as
 //!   StringBuilder(capacity) constructs successfully at capacity zero, and the

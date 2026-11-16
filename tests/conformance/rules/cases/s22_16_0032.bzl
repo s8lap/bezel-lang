@@ -6,8 +6,8 @@
 //!   condition may come from the program, from data the program was given, or
 //!   from anywhere else, and only the code that handles it knows which. … The
 //!   marker is read in two places. A catch arm that names it selects on it: an
-//!   `IFailure` arm takes every failure and lets every other exception,
-//!   cancellation included, pass
+//!   `IFailure` arm takes every `IFailure`-marked exception and lets every
+//!   other exception, cancellation included, pass
 //! cites: 22.16, 31.4
 //! expect: run
 //! stdout: violation passed

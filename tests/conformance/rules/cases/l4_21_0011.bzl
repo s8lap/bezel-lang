@@ -2,8 +2,8 @@
 //! doc: stdlib
 //! section: 4.21
 //! title: default(SlotHandle) denotes a slot of no map and raises ArgumentException
-//! rule: A default(SlotHandle) (spec §17.11) denotes a slot of no map and
-//!   takes the same fault as a handle minted by a different OwningSlotMap<T>
+//! rule: A default(SlotHandle) (spec §17.11) denotes a slot of no map and takes the
+//!   same exception as a handle minted by a different OwningSlotMap<T>
 //!   instance: every handle-taking member raises ArgumentException — no map
 //!   ever mints it.
 //! cites: 4.21, 1

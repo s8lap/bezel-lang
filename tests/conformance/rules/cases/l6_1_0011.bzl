@@ -1,7 +1,7 @@
 //! case: l6_1_0011
 //! doc: stdlib
 //! section: 6.1
-//! title: TimeoutException is a failure an IFailure arm takes
+//! title: TimeoutException is IFailure-marked and an IFailure arm takes it
 //! rule: The `IFailure`-marked classes this document declares are `IOException` and
 //!   the classes deriving from it (§7.5), `TimeoutException` (§6.1),
 //!   `ChannelClosedException` and `ChannelFullException` (§6.9), and
