@@ -61,7 +61,9 @@ Two conventions are worth absorbing in passing (stdlib §1). `Count` counts memb
 
 ```bezel
 method ReportEach(items: IEnumerable<Connection>)
-  for var c in items do Console.WriteLine(c.Name); end;
+  for var c in items do
+    Console.WriteLine(c.Name);
+  end;
 end ReportEach;
 
 ReportEach(index);     // Array<Connection>: fine

@@ -43,7 +43,7 @@ Read this page first. Every row is a habit that produces broken Bezel.
 | 13 | `if (x is Dog d)` | `is` **does not bind**. `var d := x as Dog; if d <> null then …` or a `case` arm `var d: Dog`. Over a **value**-typed `x`, a test against a reference type or another value type is rejected (section 7.1) | §12.7, §19.3 |
 | 14 | `if (count)` truthiness | Conditions are `bool`. Write `count <> 0` | §4.1 |
 | 15 | `i++` as an expression, `++i` | `++`/`--` are **postfix-only statements**: `i++;` on its own line, over an integer, floating-point, `decimal` or `char` operand only (§6.6's set — `char++` works). They are not overloadable: declare `operator +(c: Counter, n: int)` and write `c := c + 1;`, or use a named method. Assignments are statements too and produce no value | §17.6, §17.2, §6.6 |
-| 16 | `int? + int?` lifts | **Not lifted.** Arithmetic, bitwise, shift, relational, compound and `++`/`--` over a nullable operand are a compile error — a §7.4-narrowed local counts as non-nullable at every one of them (`if n <> null then n += 1; end;` is fine). `=`/`<>`/`??`/`?.`/`?(args)`/`??=` still work — and over a **non-nullable** left, `??`/`??=` still type the right operand (it must convert, as for `T?`) and warn that it never runs (section 7.8) | §7.11, §6.6, §7.7 |
+| 16 | `int? + int?` lifts | **Not lifted.** Arithmetic, bitwise, shift, relational, compound and `++`/`--` over a nullable operand are a compile error — a §7.4-narrowed local counts as non-nullable at every one of them (`if n <> null then n += 1; end;` is fine). `=`/`<>`/`??`/`?.`/`?(args)`/`??=` still work — and over a **non-nullable** left, `??`/`??=` still type the right operand (for `??` it must convert to `T` or `T?`, for `??=` to the target's type) and warn that it never runs (section 7.8) | §7.11, §6.6, §7.7 |
 | 17 | `if (_field != null) Use(_field);` | Mutable fields, properties and **`ref` parameters never narrow** (an `out` parameter does, after assignment). Copy to a local first | §7.4 |
 | 18 | `var y = x;` moves (Rust) or aliases-and-GCs (C#) | `var y := x;` is **always a borrow**; nothing is consumed silently. Transfer is written `move x` — at use sites only | §28.3, §22.3 |
 | 19 | `new Foo()` returned from an unmarked method | A plain class-typed **instance** return means "a borrow of the receiver". A method that creates must declare `: owned T`; a **static** method returning a class type without `owned` is rejected at its declaration | §28.3 |
@@ -291,7 +291,7 @@ catch
   FileNotFoundException => UseDefaults(),                              // bare type, no binding
   var f: IFailure when attempts < 3 => Retry(f),                       // interface arm with a guard; `f` is an `Exception` (§31.2.1)
 finally
-  Log("done");                              // cleanup that is not a resource; a resource is `using var`
+  _importing := false;                      // undo an effect on every exit — not a resource (a resource is `using var`)
 end try;
 ```
 
@@ -1428,7 +1428,7 @@ public static class Path                  // exactly six members
 end
 ```
 
-`IOException` ← `FileNotFoundException`, `DirectoryNotFoundException`, `EndOfStreamException`, `PathTooLongException`. `Stream.Read` signals end-of-stream with a **`0` return, never `EndOfStreamException`**, and may return **fewer than `count`** — a short read is not EOF. `File`'s text methods are UTF-8 and strict (ill-formed bytes on read raise `FormatException`, never a substitute), with no BOM. A `FileStream` that cannot open, and a whole-file `File.Read*` that cannot open its file, raise `FileNotFoundException`, `DirectoryNotFoundException` or `IOException`, never a substitute value (stdlib §7.2, §7.3; ⚠ the runtime does not raise for the whole-file reads yet, #7057). **`System.IO` has no non-throwing form** — no `ReadAllTextOrNull`, no `TryOpen` (a library gap, #8516) — and `File.Exists` is a pre-check, not a guarantee: the file can go between the test and the open. A program that answers a missing file catches `FileNotFoundException` by name at the call; the rest of the `IOException` family goes to its boundary. The **only** concrete `TextReader`/`TextWriter` instances are what `Console.In`/`Out`/`Error` return.
+`IOException` ← `FileNotFoundException`, `DirectoryNotFoundException`, `EndOfStreamException`, `PathTooLongException`. `Stream.Read` signals end-of-stream with a **`0` return, never `EndOfStreamException`**, and may return **fewer than `count`** — a short read is not EOF. `File`'s text methods are UTF-8 and strict (ill-formed bytes on read raise `FormatException`, never a substitute), with no BOM. A `FileStream` that cannot open, and a whole-file `File.Read*` that cannot open its file, raise `FileNotFoundException`, `DirectoryNotFoundException` or `IOException`, never a substitute value (stdlib §7.2, §7.3; ⚠ the compiler's runtime raises for neither yet: a failed `FileStream` open yields a null handle, #2286, and a whole-file read returns an empty result, #7057). **`System.IO` has no non-throwing form** — no `ReadAllTextOrNull`, no `TryOpen` (a library gap, #8516) — and `File.Exists` is a pre-check, not a guarantee: the file can go between the test and the open. A program that answers a missing file catches `FileNotFoundException` by name at the call; the rest of the `IOException` family goes to its boundary. The **only** concrete `TextReader`/`TextWriter` instances are what `Console.In`/`Out`/`Error` return.
 
 ### 5.8 `System.Diagnostics`
 
@@ -1541,7 +1541,7 @@ end Program;
 
 The eight are `Main()`, `Main(args: Array<string>)`, either with `: int`, and the four `async` forms of those returning `Task` or `Task<int>` — all `public static`.
 
-**Reading a file.** `Array<T>` is trivial-dispose, so a plain `var` carries no must-use warning; `using var` is also accepted and states the owner explicitly.
+**Reading a file.** `Array<T>` is trivial-dispose, so a plain `var` carries no must-use warning (§28.9); the example writes `using var`, which is always accepted and states the owner explicitly.
 
 ```bezel
 module Tools.WordCount;
@@ -1552,7 +1552,7 @@ public class Program
   public static method Main(args: Array<string>): int
     var path := args[0];
     try
-      var lines := File.ReadAllLines(path);      // owned Array<string>; a missing file raises FileNotFoundException
+      using var lines := File.ReadAllLines(path);  // owned Array<string>; a missing file raises FileNotFoundException
       var words := 0;
       for var line in lines do
         words := words + line.Split(' ').Count;  // Split: owned Array<string>, empty segments kept
@@ -1569,7 +1569,7 @@ public class Program
 end Program;
 ```
 
-There is no `ReadAllLinesOrNull` (section 5.7), so the read is the test: a missing file raises `FileNotFoundException` (stdlib §7.3), caught by name at the call; every other `IOException` propagates. Do not test `File.Exists` first: the file can go between the test and the read, which must handle its absence anyway. For a stream, `using var` is the workhorse and covers the exception path: `using var fs := new FileStream(path, FileMode.Open, FileAccess.Read);`, then `fs.ReadAll()` for an `owned Array<byte>`. Owned locals are disposed in reverse declaration order.
+There is no `ReadAllLinesOrNull` (section 5.7), so the read is the test: a missing file raises `FileNotFoundException` (stdlib §7.3), caught by name at the call; every other `IOException` propagates. Do not test `File.Exists` first: the file can go between the test and the read, which must handle its absence anyway. (⚠ The compiler does not implement the raise yet, #7057: today a missing file reads as an empty one, so this program prints `0 lines, 0 words`. The arm is the code the spec requires; write it.) For a stream, `using var` is the workhorse and covers the exception path: `using var fs := new FileStream(path, FileMode.Open, FileAccess.Read);`, then `fs.ReadAll()` for an `owned Array<byte>`. Owned locals are disposed in reverse declaration order.
 
 **Owning collections: build, iterate, drain.**
 
@@ -1793,7 +1793,7 @@ catch
 end;
 ```
 
-Leave the last two arms out unless the code is a boundary — a request loop, a job runner, `Main` or a supervisor: a bug should propagate, and so does every exception no arm names — an arm that only re-raises is never needed, except the cancellation arm ahead of a catch-all, which keeps the request to stop from being swallowed (§31.4). `IFailure => ()` suppresses only `IFailure`-marked exceptions; `FormatException` and `SerializationException` are not marked, so a boundary that expects bad input names them. To reach an interface's own members inside an arm, test in the body: `var r := ex as IRetryable;`.
+Leave the last two arms out unless the code is a boundary — a request loop, a job runner, `Main` or a supervisor: a bug should propagate, and so does every exception no arm names — an arm that only re-raises is never needed, except the cancellation arm ahead of a catch-all, which keeps the request to stop from being swallowed (§31.2.5, §30.8). `IFailure => ()` suppresses only `IFailure`-marked exceptions; `FormatException` and `SerializationException` are not marked, so a boundary that expects bad input names them. To reach an interface's own members inside an arm, test in the body: `var r := ex as IRetryable;`.
 
 **A class hierarchy.** Members are non-virtual unless marked; an override restates the signature exactly and says `override` (§12.1, §12.5).
 
@@ -2907,7 +2907,7 @@ s ??= "b";                             // warning: `s` is non-nullable — the a
 var n := i ?? 0;                       // warning: the right operand is never evaluated; `n` is `int`
 ```
 
-> §7.7, §6.6 (#8596): over a non-nullable left operand of type `T`, `??` and `??=` type the right operand exactly as for `T?` — it must convert to `T` or `T?`, and the result is `T` — and warn that the right operand never runs (for `??=`, that the assignment never happens). The left's **declared** type decides: a §7.4-narrowed nullable stays silent, and so does an unconstrained type parameter, which counts as possibly nullable (§7.10); a `where T: notnull`/`value`/`class` `T` warns. The compiler does not check this yet (#8596). Delete the dead fallback, or declare the binding nullable if the value can really be absent.
+> §7.7, §6.6 (#8596): over a non-nullable left operand of type `T`, `??` types the right operand exactly as for `T?` — it must convert to `T` or `T?`, and the result is `T` — and `??=`'s must convert to the target's type (§6.6); both warn that the right operand never runs (for `??=`, that the assignment never happens). The left's **declared** type decides: a §7.4-narrowed nullable stays silent, and so does an unconstrained type parameter, which counts as possibly nullable (§7.10); a `T` constrained `notnull`, `value`, `class` or by a type bound warns. The compiler does not check this yet (#8596). Delete the dead fallback, or declare the binding nullable if the value can really be absent.
 
 ```bezel
 var s: string? := "a";
@@ -3007,7 +3007,9 @@ Text that teaches a left-column spelling predates the change — older guides, p
 | `var r: IRetryable => r.ShouldRetry()` — a catch binding typed at the interface | an interface arm binds an `Exception`; reach the interface with `var r := ex as IRetryable;` inside the arm | §31.2.1 |
 | a call-site `(try E)` / `(try E on X)` form, planned | withdrawn: call the `*OrNull`/`Try` dual; a member with no dual is a library gap (#8516) | stdlib §1 |
 | "assert-shaped" / "branch-shaped" tier | the **throwing form** / the **non-throwing form** | stdlib §1 |
-| `x ?? d` / `x ??= d` over a non-nullable `x`, right operand unchecked | the right operand must convert as for `T?`, and a warning says it never runs; a narrowed nullable or an unconstrained `T` stays silent | §7.7, §6.6 |
+| `x ?? d` / `x ??= d` over a non-nullable `x`, right operand unchecked | the right operand must convert (`??`: to `T` or `T?`; `??=`: to the target's type), and a warning says it never runs; a narrowed nullable or an unconstrained `T` stays silent | §7.7, §6.6 |
+| `if not File.Exists(path) then … end;` before opening or reading (taught by Guide 2 at v0.358) | open or read, and catch `FileNotFoundException` by name at the call: the file can vanish between the test and the open (section 6) | stdlib §7.2, §7.3 |
+| a whole-file `File.Read*` on a missing file read as empty (`""`, no lines) | it raises `FileNotFoundException`, `DirectoryNotFoundException` or `IOException`, never a substitute (v0.359; ⚠ the runtime still returns an empty result, #7057) | stdlib §7.3 |
 
 ---
 

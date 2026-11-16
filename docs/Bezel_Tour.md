@@ -381,7 +381,7 @@ public class Account
 end Account;
 ```
 
-`requires` is checked in every build; `ensures` and class `invariant`s are checked in the checked-contracts build. A violation raises `ContractViolationException`: a bug in the calling code, fixed there rather than caught. Contracts may call only `pure` members — methods that the compiler verifies have no side effects. See [Contracts and Purity](Bezel_Guide_06_Contracts_and_Purity.md).
+`requires` is checked in every build; `ensures` and class `invariant`s are checked in the checked-contracts build. A violation raises `ContractViolationException`: a bug — in the caller for `requires`, in the member for `ensures` and `invariant` — fixed there rather than caught. Contracts may call only `pure` members — methods that the compiler verifies have no side effects. See [Contracts and Purity](Bezel_Guide_06_Contracts_and_Purity.md).
 
 ## 9. Where to go next
 

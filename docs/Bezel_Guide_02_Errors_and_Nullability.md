@@ -37,7 +37,7 @@ var forced := maybe!;                           // assert non-null (throws if wr
 
 `?.` short-circuits to null; `??` supplies a fallback; `!` asserts non-null and raises `NullReferenceException` at runtime if you were wrong. `??=` assigns only if currently null.
 
-Over a left operand that cannot be null, `??` and `??=` are not errors, but they do nothing, and the compiler says so. The right operand is still checked as if the left were nullable — it must convert to the left's type — and then a warning tells you it never runs (for `??=`, that the assignment never happens):
+Over a left operand that cannot be null, `??` and `??=` are not errors, but they do nothing, and the compiler says so. The right operand is still checked as if the left were nullable — for `??` it must convert to `T` or `T?`, and for `??=` to the target's type — and then a warning tells you it never runs (for `??=`, that the assignment never happens). The compiler does not check this yet ([#8596](https://github.com/s8lap/bezel-lang/issues/8596)); write to the rule:
 
 ```bezel
 var shown := name ?? "Anonymous";  // warning: name is non-nullable; "Anonymous" never runs
@@ -46,7 +46,7 @@ var count := 0;
 count ??= "none";                  // ERROR: "none" does not convert to int
 ```
 
-The *declared* type decides, not the flow: `maybe ?? "x"` stays silent even where a check has narrowed `maybe`, and an operand whose type is a type parameter counts as possibly null unless the parameter is constrained `notnull`, `value` or `class` (spec §7.7). Narrowing works by flow analysis on locals:
+The *declared* type decides, not the flow: `maybe ?? "x"` stays silent even where a check has narrowed `maybe`, and an operand whose type is a type parameter counts as possibly null unless its constraints make it non-nullable — `notnull`, `value`, `class` or a type bound (spec §7.7). Narrowing works by flow analysis on locals:
 
 ```bezel
 if maybe <> null then
@@ -134,7 +134,7 @@ method LoadSettings(path: string): Settings
 end LoadSettings;
 ```
 
-Write the helper once, name it as the library would, and the rest of the program composes with `??` and narrowing. The arm names `FileNotFoundException` and nothing else (stdlib §7.2): a missing directory or a refused permission is not "no settings yet", and it propagates. A whole-file read such as `File.ReadAllText` raises the same classes when it cannot open its file (stdlib §7.3), and takes the same arm.
+Write the helper once, name it as the library would, and the rest of the program composes with `??` and narrowing. The arm names `FileNotFoundException` and nothing else (stdlib §7.2): a missing directory or a refused permission is not "no settings yet", and it propagates. A whole-file read such as `File.ReadAllText` raises the same classes when it cannot open its file (stdlib §7.3), and takes the same arm. The compiler does not raise either yet: a failed `FileStream` open yields a null handle ([#2286](https://github.com/s8lap/bezel-lang/issues/2286)) and a whole-file read of a missing file returns an empty result ([#7057](https://github.com/s8lap/bezel-lang/issues/7057)). Write the arm anyway; it is the code the spec requires, and it starts working when they are fixed.
 
 **The `Try` form** when the failure path and success path differ, and especially when the value is *owned*. A `bool` return plus an `out owned` parameter, with a `when true` postcondition that lets the caller skip the `!`:
 
@@ -275,11 +275,11 @@ The marker is a default, not a verdict. If the service cannot run without a file
 **Marking your own classes.** An exception class of your own makes no statement until you say otherwise:
 
 ```bezel
-public class ConfigError(message: string): Exception(message), IFailure
-end ConfigError;
+public class ConfigFileError(message: string): Exception(message), IFailure
+end ConfigFileError;
 ```
 
-A class may list `IFailure` under any base except `OperationCanceledException` (spec §31.4). A hierarchy carried over from C# keeps its base: `class StaleOrder(message: string): InvalidOperationException(message), IFailure` is taken both by an `IFailure` arm and by an arm on `InvalidOperationException`. A class that derives from an `IFailure`-marked type (`IOException`) is marked already and needs no listing. Mark a class when its condition is the outside world's, or when your application wants its boundary's `IFailure` arm to take it — a `ConfigError` for a configuration file the operator wrote, say.
+A class may list `IFailure` under any base except `OperationCanceledException` (spec §31.4). A hierarchy carried over from C# keeps its base: `class StaleOrder(message: string): InvalidOperationException(message), IFailure` is taken both by an `IFailure` arm and by an arm on `InvalidOperationException`. A class that derives from an `IFailure`-marked type (`IOException`) is marked already and needs no listing. Mark a class when its condition is the outside world's, or when your application wants its boundary's `IFailure` arm to take it — a `ConfigFileError` for a configuration file the operator wrote, say.
 
 Two habits keep the marker honest. When you wrap, the wrapper's class is what the handler above will read: wrap an `IFailure`-marked exception in a marked class, and let an exception you cannot vouch for propagate as it is rather than wrapping it in a class that lists `IFailure`. And where bad text is expected, name what `int.Parse` raises — `FormatException` for a malformed numeral, `OverflowException` for an out-of-range one — or, better, take `ParseOrNull` and decide at the call (§2).
 

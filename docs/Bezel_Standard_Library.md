@@ -5052,6 +5052,8 @@ end FileAccess;
 
 **Constructor contract.** `access` defaults to **`FileAccess.ReadWrite`** (spec §22.5): `new FileStream(path, mode)` is `new FileStream(path, mode, FileAccess.ReadWrite)`. A construction that cannot open the file raises the [§7.5](#sec-io-exception-types) types: `FileNotFoundException` when `FileMode.Open` names a file that does not exist, `DirectoryNotFoundException` when a directory component of `path` does not exist, and `IOException` otherwise (an existing file under `FileMode.CreateNew`, a permission failure, and every other OS-level open failure — where the OS reports a too-long path, as [§7.5](#sec-io-exception-types)'s `IOException`-derived `PathTooLongException`). Each class is `IFailure`-marked ([§2.17](#sec-built-in-exceptions-cross-reference)). Non-throwing form: none — gap ([#8516](https://github.com/s8lap/bezel-lang/issues/8516)).
 
+⚠ **Spec-ahead-of-implementation ([#2286](https://github.com/s8lap/bezel-lang/issues/2286)):** a construction that cannot open the file does not raise: the runtime yields a degenerate handle (`Read` returns `0`, `Write` and disposal do nothing).
+
 **Disposal (flush-on-dispose).** Disposing a `FileStream` — at `using var` scope exit or an explicit `Dispose()` — flushes any buffered writes and releases the OS file handle. A `FileStream` opened for writing must be disposed (or explicitly `Flush()`ed) for buffered data to reach the file; the `using var` idiom guarantees this on every exit edge, including exceptions. `FileStream` overrides `ReadAsync`/`WriteAsync` ([§7.1](#sec-stream)) with genuinely asynchronous OS I/O — not the blocking base default.
 
 <a id="sec-file"></a>
