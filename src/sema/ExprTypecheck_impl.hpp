@@ -1226,6 +1226,30 @@ private:
     // throw / discard / owned-slot store), so the operand rule is not
     // extended to them here.
     const ast::Expr* localDeclInitSlot_ = nullptr;
+    // fix #8626 (§14.5 phase 3, v0.357): the CALL that is, as a whole, the
+    // operand of a §14.5 phase-3 target context this checker completes
+    // inference at — the initializer of a typed local, or a `return` operand
+    // under a declared return type (the two sites that call
+    // `inferReturnTargetTypeArgs`). Saved/restored around that operand's
+    // visit. `typeCall` consults it to tell a call whose type parameter a
+    // bare-`null` lambda body left unbound — which a target may still
+    // complete — from one with no target, which is the phase-3 error at once.
+    const ast::CallExpr* phase3TargetCall_ = nullptr;
+    // fix #8626: a call `typeCall` left with a type parameter unbound
+    // because the only position that would have bound it is a lambda whose
+    // body is a bare `null`, and that sits in a phase-3 target context. The
+    // target site resolves (and erases) it via
+    // `completeBareNullLambdaFromTarget` right after the operand's visit.
+    struct BareNullTargetPending {
+        std::string methodName;
+        std::vector<std::string_view> unbound;  // declaration order
+        std::unordered_map<std::string_view, TypeRef*> argSubst;
+        // The RETURN slot of each function-typed formal whose argument is a
+        // bare-`null` lambda (raw, pre-substitution).
+        std::vector<TypeRef*> nullBodyReturnSlots;
+    };
+    std::unordered_map<const ast::CallExpr*, BareNullTargetPending>
+        bareNullTargetPending_;
     // #721/§29.5: true while visiting an iterator method body (sync or async,
     // i.e. it contains `yield`). A plain `return;` in an iterator is forbidden
     // (use `yield break`); for an ASYNC iterator §21.7 does not catch it (it is
@@ -5927,6 +5951,18 @@ private:
     // parameter cannot be solved because the call sits in a no-target context
     // (a bare expression/discard statement, or a `var` without annotation).
     void reportNoTargetInferenceIfNeeded(const ast::CallExpr& ce);
+
+    // fix #8626 (§14.5 phase 3, v0.357): complete the inference `typeCall`
+    // deferred for `ce` (see `bareNullTargetPending_`) from the target type
+    // `target` of the phase-3 target context `ce` sits in: unify the call's
+    // return type — current bindings applied — against the target, require
+    // every deferred parameter to be solved, require each bare-`null` body's
+    // substituted return slot to admit `null` (§22.6 / §5.1), and re-type the
+    // call. Any failure is the phase-3 "cannot infer" error (no target
+    // context supplies the parameter) or the §5.1 null-admission error. A
+    // no-op for a call with nothing deferred.
+    void completeBareNullLambdaFromTarget(const ast::CallExpr* ce,
+                                          TypeRef* target);
 
     // §24: the event visibility fence. Outside the declaring class, an
     // event member's static type is `IEvent<T>` / `IAsyncEvent<T>`, which

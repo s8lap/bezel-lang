@@ -3909,6 +3909,29 @@ static bool lambdaBodyIsBareNull(const ast::Expr* arg, const TypeRef* lamTy) {
            r->primitive == PrimitiveType::Object && r->nullable;
 }
 
+// fix #8626 (§14.5 phase 1 + phase 2 + phase 3, v0.357): the phase-3
+// "cannot infer" diagnostic for a type parameter that only a bare-`null`
+// lambda body was to bind. It names the parameter and the remedies, the
+// target one among them — phase 3 names it: "supply explicit type
+// arguments, or give the call a target (assign to a typed local, or return
+// it from a method with a declared return type)".
+static std::string bareNullLambdaCannotInferMessage(std::string_view tp,
+                                                    std::string_view method) {
+    return "cannot infer the type argument `" + std::string(tp) + "` of `" +
+           std::string(method) +
+           "`'s call — a lambda argument whose body is a bare `null` "
+           "contributes no binding (§14.5 phase 1: \"a bare `null` literal "
+           "argument is not self-determined and contributes no binding\"; "
+           "phase 2 binds the lambda's inferred return type, and a bare "
+           "`null` body has none), and no target context supplies it, so `" +
+           std::string(tp) +
+           "` remains unbound; supply an explicit type argument, give the "
+           "lambda a body of a determinate type, or give the call a target "
+           "that binds `" + std::string(tp) +
+           "` (assign it to a typed local, or return it from a method with a "
+           "declared return type) (§14.5 phase 3, v0.357)";
+}
+
 // §22.3 / §14.5 (#2266): true when `t` mentions one of `tpNames` ANYWHERE in its
 // structure. It additionally walks function parameter/return slots beyond
 // containsMethodTypeParam's generic arguments and inline-array element.
@@ -10919,8 +10942,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         //
                         // The check below fires for the positions whose
                         // argument is a bare-null lambda and whose declared
-                        // parameter type mentions a type parameter this call
-                        // did NOT bind: that parameter is the one the null
+                        // function type's RETURN slot mentions a type
+                        // parameter this call did NOT bind: that parameter
+                        // is the one the null
                         // body was to bind, and nothing else did. A parameter
                         // the call DID bind elsewhere keeps that binding (the
                         // null body simply contributes nothing) — the
@@ -10930,8 +10954,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // afterward, argument by argument, at the §22.6
                         // applicability check against the substituted
                         // signature").
+                        //
+                        // fix-forward #8626 (§14.5 phase 3, v0.357): the
+                        // phase-3 error is for a parameter that "remains
+                        // unbound — it appears in no self-determined argument
+                        // position AND NO TARGET CONTEXT SUPPLIES IT". So when
+                        // this call is the operand of a phase-3 target
+                        // context (`phase3TargetCall_`: a typed local's
+                        // initializer, a `return` under a declared return
+                        // type), the decision is DEFERRED to that site's
+                        // `completeBareNullLambdaFromTarget`, which binds the
+                        // parameter from the target ("A type parameter still
+                        // unbound is bound from the call's target type")
+                        // and reports this error only if the target does not
+                        // supply it. The first version reported here
+                        // unconditionally and so rejected
+                        // `var r: Object? := Q.F(xs, lambda(v) => null)`,
+                        // which phase 3 makes legal (K := Object).
+                        std::unordered_set<std::string_view> deferredToTarget;
                         {
                             std::unordered_set<std::string_view> unbound;
+                            std::vector<TypeRef*> nullBodyReturnSlots;
                             for (std::size_t pi = 0;
                                  pi < md->params.size() && pi < ce.args.size();
                                  ++pi) {
@@ -10942,37 +10985,47 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                                           argTy))
                                     continue;
                                 TypeRef* pty = ctx_.resolvedType(*p.type);
-                                if (!pty) continue;
+                                // Only the formal's RETURN slot is the one the
+                                // null body fails to bind: a parameter still
+                                // free in a PARAMETER slot is phase 2's own
+                                // "parameter positions still open" failure,
+                                // not this one (fix-forward #8626).
+                                if (!pty || pty->kind != TypeRef::Kind::Function ||
+                                    !pty->funcReturn)
+                                    continue;
+                                bool slotLeavesUnbound = false;
                                 for (const auto& gp : md->genericParams) {
                                     if (argSubst.count(gp.name)) continue;
                                     std::unordered_set<std::string_view> single{
                                         gp.name};
                                     if (!refOutParamTypeMentionsTypeParam(
-                                            pty, single))
+                                            pty->funcReturn, single))
                                         continue;
                                     unbound.insert(gp.name);
+                                    slotLeavesUnbound = true;
                                 }
+                                if (slotLeavesUnbound)
+                                    nullBodyReturnSlots.push_back(
+                                        pty->funcReturn);
                             }
-                            if (!unbound.empty()) {
-                                for (std::string_view nm : unbound) {
+                            if (!unbound.empty() && &ce == phase3TargetCall_) {
+                                BareNullTargetPending pend;
+                                pend.methodName = std::string(md->name);
+                                for (const auto& gp : md->genericParams)
+                                    if (unbound.count(gp.name))
+                                        pend.unbound.push_back(gp.name);
+                                pend.argSubst = argSubst;
+                                pend.nullBodyReturnSlots =
+                                    std::move(nullBodyReturnSlots);
+                                bareNullTargetPending_[&ce] = std::move(pend);
+                                deferredToTarget = std::move(unbound);
+                            } else if (!unbound.empty()) {
+                                for (const auto& gp : md->genericParams) {
+                                    if (!unbound.count(gp.name)) continue;
                                     ctx_.diagnostics().report(
                                         Severity::Error, ce.span.begin,
-                                        "cannot infer the type argument `" +
-                                        std::string(nm) + "` of `" +
-                                        std::string(md->name) + "`'s call "
-                                        "— a lambda argument whose body is a "
-                                        "bare `null` contributes no binding "
-                                        "(§14.5 phase 1: \"a bare `null` "
-                                        "literal argument is not "
-                                        "self-determined and contributes no "
-                                        "binding\"; phase 2 binds the "
-                                        "lambda's inferred return type, and "
-                                        "a bare `null` body has none), so `" +
-                                        std::string(nm) +
-                                        "` remains unbound; supply an "
-                                        "explicit type argument, or give the "
-                                        "lambda a body of a determinate type "
-                                        "(§14.5 phase 3, v0.357)");
+                                        bareNullLambdaCannotInferMessage(
+                                            gp.name, md->name));
                                 }
                                 return;
                             }
@@ -10980,6 +11033,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         std::unordered_set<std::string_view> stillUnbound;
                         for (const auto& gp : ms->genericParams) {
                             if (argSubst.count(gp->name)) continue;
+                            // fix-forward #8626: a parameter deferred to the
+                            // phase-3 target above is that site's to decide.
+                            if (deferredToTarget.count(gp->name)) continue;
                             std::unordered_set<std::string_view> single{gp->name};
                             // per §22.3/§14.5 #2266: `containsMethodTypeParam`
                             // does NOT walk function-type param/return slots
@@ -35583,6 +35639,68 @@ void ExprTC::reportNoTargetInferenceIfNeeded(const ast::CallExpr& ce) {
             "target type is required — assign the result to a typed local "
             "(`var x: T := ...`) or return it from a method with a declared "
             "return type (§14.1, §A.7)");
+}
+
+// fix-forward #8626 (§14.5 phase 3, v0.357) — see the header comment.
+// §14.5 phase 3: "A type parameter still unbound is bound from the call's
+// target type, where the call site has one, by unifying the method's
+// declared return type — current bindings applied — against the target
+// ... The target never overrides an argument-derived binding; it only
+// completes. A type parameter that remains unbound — it appears in no
+// self-determined argument position and no target context supplies it — is
+// a compile error naming the parameter".
+void ExprTC::completeBareNullLambdaFromTarget(const ast::CallExpr* ce,
+                                              TypeRef* target) {
+    if (!ce) return;
+    auto it = bareNullTargetPending_.find(ce);
+    if (it == bareNullTargetPending_.end()) return;
+    BareNullTargetPending pend = std::move(it->second);
+    bareNullTargetPending_.erase(it);
+
+    auto reportUnbound = [&](std::string_view nm) {
+        ctx_.diagnostics().report(
+            Severity::Error, ce->span.begin,
+            bareNullLambdaCannotInferMessage(nm, pend.methodName));
+    };
+    // The call's type as `typeCall` left it: the declared return type with
+    // the argument-derived bindings ("current bindings") applied, the
+    // deferred parameters still free.
+    TypeRef* cur = ctx_.exprType(*ce);
+    std::unordered_set<std::string_view> free(pend.unbound.begin(),
+                                              pend.unbound.end());
+    std::unordered_map<std::string_view, TypeRef*> solved;
+    const bool unified = target && cur &&
+                         unifyReturnAgainstTarget(cur, target, free, solved);
+    bool allSolved = unified;
+    for (std::string_view nm : pend.unbound) {
+        if (unified && solved.count(nm) && solved[nm]) continue;
+        allSolved = false;
+        reportUnbound(nm);
+    }
+    if (!allSolved) return;
+
+    // §14.5 phase 1: "Conversions get their say afterward, argument by
+    // argument, at the §22.6 applicability check against the substituted
+    // signature" — the bare `null` body must be admissible at the
+    // substituted return slot, which §5.1 admits only when it is nullable.
+    std::unordered_map<std::string_view, TypeRef*> full = pend.argSubst;
+    for (const auto& [nm, ty] : solved) full[nm] = ty;
+    for (TypeRef* slot : pend.nullBodyReturnSlots) {
+        TypeRef* sub = substituteReturnType(slot, full);
+        if (sub && !sub->nullable) {
+            ctx_.diagnostics().report(
+                Severity::Error, ce->span.begin,
+                "the lambda argument of `" + pend.methodName +
+                    "`'s call returns a bare `null`, but its parameter's "
+                    "return type, once the target binds the type arguments, "
+                    "is the non-nullable `" + spellTypeRefForDiag(sub) +
+                    "` — `null` converts only to a nullable type (§5.1, "
+                    "§14.5 phase 3, §22.6)");
+            return;
+        }
+    }
+    if (TypeRef* substituted = substituteReturnType(cur, solved))
+        ctx_.setExprType(ce, substituted);
 }
 
 void ExprTC::resolveExtensionMember(const ast::MemberAccessExpr& ma,

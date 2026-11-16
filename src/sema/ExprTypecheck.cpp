@@ -27585,7 +27585,20 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // `markedArmSlot_` / `caseScrutineeSlot_`.
         const ast::Expr* savedLocalDeclInit = localDeclInitSlot_;
         localDeclInitSlot_ = ld->initializer.get();
+        // fix-forward #8626 (§14.5 phase 3, v0.357): "the initializer of a
+        // typed declaration (field or local)" is a target context, so a
+        // bare-`null` lambda's unbound type parameter is completed from the
+        // written type below rather than rejected inside `typeCall`.
+        const ast::CallExpr* savedPhase3Call = phase3TargetCall_;
+        const auto* phase3InitCall =
+            ld->type ? dynamic_cast<const ast::CallExpr*>(ld->initializer.get())
+                     : nullptr;
+        phase3TargetCall_ = phase3InitCall;
         if (ld->initializer) visitExpr(*ld->initializer);
+        phase3TargetCall_ = savedPhase3Call;
+        if (phase3InitCall)
+            completeBareNullLambdaFromTarget(phase3InitCall,
+                                             ctx_.resolvedType(*ld->type));
         localDeclInitSlot_ = savedLocalDeclInit;
         pendingLambdaReturnType_ = savedLamRet;
         pendingLambdaParamTypes_ = savedLamParams;
@@ -28430,7 +28443,23 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (rs->value)
             applyDeclaredResultCaseReading(
                 const_cast<ast::ReturnStmt*>(rs)->value);
-        if (rs->value) visitExpr(*rs->value);
+        {
+            // fix-forward #8626 (§14.5 phase 3, v0.357): "a `return`
+            // statement against a declared return type" is a target context
+            // — the same condition the return-target inference below uses.
+            const ast::CallExpr* savedPhase3Call = phase3TargetCall_;
+            const auto* phase3RetCall =
+                (rs->value && returnCtx_ == ReturnCtx::ValueMethod &&
+                 currentReturnType_)
+                    ? dynamic_cast<const ast::CallExpr*>(rs->value.get())
+                    : nullptr;
+            phase3TargetCall_ = phase3RetCall;
+            if (rs->value) visitExpr(*rs->value);
+            phase3TargetCall_ = savedPhase3Call;
+            if (phase3RetCall)
+                completeBareNullLambdaFromTarget(phase3RetCall,
+                                                 currentReturnType_);
+        }
         // fix #8347 (§28.8.1 / Appendix A.7 MoveExpr / §28.3 K3.13, v0.355):
         // a `move` marker written on a FRESH PRODUCER at this `return`
         // operand — the `owned` return position — is a compile error. The
