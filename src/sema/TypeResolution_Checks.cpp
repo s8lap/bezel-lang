@@ -12324,12 +12324,118 @@ static bool interfaceDeclaresOrInheritsStatics(const TypeSymbol* iface) {
     return false;
 }
 
+// fix #5948 (§14.2 *Type-parameter bounds*, v0.338): an argument or `U`
+// substitution that is an instantiation over a type parameter of an enclosing
+// declaration (`Box<A>` in `class H<A>`) is compared structurally, with the
+// parameter read as the same name on both sides. typeRefEqual compares a
+// parameter marker by declaration alone (both nullptr), so `A` and `B` would
+// compare equal; this comparison compares the spelled name instead.
+//
+// These two are file-wide helpers, not local to the block they used to sit
+// in: the §14.2 conformance walk below reads them too.
+namespace {
+
+// The spelled name of a Named TypeRef (its last path segment, or the imported
+// name for a metadata-reconstructed reference).
+std::string_view namedLeafName(const TypeRef* t) {
+    if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
+        return t->astNode->name->parts.back();
+    return t->importedName;
+}
+
+// A type-parameter marker: a Named TypeRef with no declaration that is not a
+// built-in type name.
+bool isOpenParamLeaf(const TypeRef* t) {
+    return t && t->kind == TypeRef::Kind::Named && !t->declaration &&
+           !Resolver::isBuiltinTypeName(namedLeafName(t));
+}
+
+}  // namespace
+
+// fix #8578 (spec §14.2 *Interface conformance* rule 2, stdlib §2.5/§2.6,
+// v0.357): the stdlib VALUE BUILTINS whose standard-library declaration lists
+// `: IComparable<Self>, IEquatable<Self>` — DateTime, TimeSpan, DateOnly and
+// TimeOnly (stdlib §2.5) and Guid (stdlib §2.6).
+//
+// §14.2 rule 2 admits a RECORD that lists the interface in its inheritance
+// clause, and rule 5 reads the SAME standard-library declaration for a
+// primitive ("stdlib §9 declares that type in record syntax, so `int`
+// conforms to `IComparable<int>` … exactly as clause 2 reads for records").
+// The stdlib value builtins are records in that same sense, so each of them
+// CONFORMS to `IComparable<Self>` and `IEquatable<Self>` by declaration —
+// and a generic constraint `where T: IComparable<T>` must admit it.
+//
+// The compiler-intrinsic symbol these names carry
+// (SemaContext::builtinClassSym) is NOT a reification of the stdlib
+// declaration: it has `isValueBuiltin = true`, `decl == nullptr`, an empty
+// `moduleName` and NO `baseTypes` — the declared bases the §14.2 walk reads
+// are simply not there, so the walk reaches an empty closure and refuses.
+// This is the §14.2 CONSTRAINT twin of the §5.1 CONVERSION path's #8288 arm
+// (src/sema/ExprTypecheck.cpp).
+//
+// The discriminator is that intrinsic shape, exactly as #8288's arm uses it:
+// a USER type of the same name is excluded — a module-local one by its real
+// `decl`, an IMPORTED one by its populated `moduleName` (the same
+// discriminator `mathOrderedTimeValueHead` documents).
+static bool isStdlibComparableValueBuiltin(const TypeSymbol* d) {
+    if (!d || !d->isValueBuiltin) return false;
+    if (d->decl) return false;                  // a module-local user type
+    if (!d->moduleName.empty()) return false;   // an IMPORTED user type
+    return d->name == "DateTime" || d->name == "TimeSpan" ||
+           d->name == "DateOnly" || d->name == "TimeOnly" ||
+           d->name == "Guid";
+}
+
 bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
                            SemaContext* ctx) {
     if (!arg || !bound) return false;
     if (arg->kind != TypeRef::Kind::Named || !arg->declaration) return false;
     if (bound->kind != TypeRef::Kind::Named || !bound->declaration) {
         return false;
+    }
+    // fix #8578 (spec §14.2 *Interface conformance* rule 2, stdlib §2.5/§2.6,
+    // v0.357): a stdlib value builtin CONFORMS to `IComparable<Self>` and
+    // `IEquatable<Self>` by the standard library's own declaration (see
+    // `isStdlibComparableValueBuiltin` above), so the constraint admits it —
+    // exactly as it admits a user record that declares the same interface.
+    //
+    // The bound's type argument must name the CANDIDATE itself, because the
+    // stdlib declaration is `X: IComparable<X>` — the SELF instantiation.
+    // Two spellings name it: the constraint's OWN type parameter (a
+    // bare-parameter marker — §14.2 substitutes the candidate for it, and a
+    // marker is a declaration-less name that is NOT a built-in type name), or
+    // the candidate's own type spelled out. Any OTHER instantiation is one
+    // the candidate does not conform to — `TimeSpan` conforms to
+    // `IComparable<TimeSpan>`, not to `IComparable<DateTime>` — and stays
+    // refused. Reading a built-in name as a bare-parameter marker (which the
+    // walk below does for ANY declaration-less name) would admit the wrong
+    // instantiation and let the body's `a.Equals(o)` be called with an
+    // `Other`-typed argument against a `Self`-typed `Equals` — the type
+    // confusion fix #4863 closed.
+    if (isStdlibComparableValueBuiltin(arg->declaration)) {
+        if (!arg->nullable &&
+            bound->declaration->isSynthesizedBuiltinInterface &&
+            (bound->declaration->name == "IComparable" ||
+             bound->declaration->name == "IEquatable") &&
+            bound->genericArgs.size() == 1 && bound->genericArgs[0]) {
+            const TypeRef* bArg = bound->genericArgs[0];
+            if (isOpenParamLeaf(bArg)) return true;  // the constraint's param
+            // The candidate spelled out. A built-in name resolves WITHOUT a
+            // declaration, so the spelling is compared by NAME; a bound that
+            // names a USER type (which HAS a declaration) is compared by
+            // identity — an IMPORTED `record TimeSpan` is a different type
+            // from the built-in `TimeSpan`, and the built-in does not conform
+            // to `IComparable<ImportedTimeSpan>`.
+            if (!bArg->nullable &&
+                (bArg->declaration == arg->declaration ||
+                 (!bArg->declaration &&
+                  namedLeafName(bArg) == arg->declaration->name)))
+                return true;  // the candidate, spelled out
+        }
+        // Any other bound is one the standard library does NOT declare for
+        // this type, so the candidate does not conform to it: fall through
+        // to the walk below, which reaches an empty closure for an
+        // intrinsic symbol and returns false.
     }
     // §14.2 rule 3 (v0.338, #5817): an interface argument conforms to a bound
     // interface only through the extension chain, and an interface that
@@ -13791,22 +13897,11 @@ static const char* primitiveKeyword(PrimitiveType p);
 // parameter read as the same name on both sides. typeRefEqual compares a
 // parameter marker by declaration alone (both nullptr), so `A` and `B` would
 // compare equal; this comparison compares the spelled name instead.
+//
+// `namedLeafName` and `isOpenParamLeaf` are defined ABOVE, next to the §14.2
+// conformance walk that reads them — they are file-wide helpers, not local to
+// the block below.
 namespace {
-
-// The spelled name of a Named TypeRef (its last path segment, or the imported
-// name for a metadata-reconstructed reference).
-std::string_view namedLeafName(const TypeRef* t) {
-    if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
-        return t->astNode->name->parts.back();
-    return t->importedName;
-}
-
-// A type-parameter marker: a Named TypeRef with no declaration that is not a
-// built-in type name.
-bool isOpenParamLeaf(const TypeRef* t) {
-    return t && t->kind == TypeRef::Kind::Named && !t->declaration &&
-           !Resolver::isBuiltinTypeName(namedLeafName(t));
-}
 
 // True when `t` mentions a type parameter anywhere in its generic arguments.
 bool mentionsOpenParam(const TypeRef* t) {
