@@ -15654,7 +15654,22 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // Guid.Empty.ToString()) whose target is not a bare identifier.
     // ---------------------------------------------------------------------------
     {
-        auto* recvTy = ctx_.exprType(*ma->target);
+        // fix #8578 (spec §14.2, stdlib §2.6, v0.357): the receiver may be a
+        // BARE TYPE PARAMETER (`a.CompareTo(b)` / `a.Equals(b)` in a
+        // `where T: IComparable<T>` / `IEquatable<T>`-constrained body) whose
+        // active substitution is `Guid`, which conforms to both through its
+        // stdlib declaration. Read the receiver's type through the SAME
+        // `resolveTypeParamRef` the DateTime/TimeSpan/DateOnly/TimeOnly arms
+        // use (#7765), or the arm does not fire and the body's return
+        // degrades to a zero (`0` / `False`). A `T?` receiver is resolved
+        // to the NULLABLE form of its substitution, so the #7342 unwrap below
+        // still sees the `{i8 hasValue; Guid}` carrier it loads.
+        const sema::TypeRef* recvTySpelled = ctx_.exprType(*ma->target);
+        sema::TypeRef recvTyNullableParam;
+        const sema::TypeRef* recvTy = resolveTypeParamRef(recvTySpelled);
+        if (recvTySpelled && recvTySpelled->nullable && recvTy != recvTySpelled &&
+            nullableTypeParamConcrete(recvTySpelled, recvTyNullableParam))
+            recvTy = &recvTyNullableParam;
         bool isGuid = recvTy &&
             recvTy->kind == sema::TypeRef::Kind::Named &&
             builtinTypeName(recvTy) == "Guid";

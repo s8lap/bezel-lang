@@ -5544,7 +5544,28 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
                     recRecv = sit->second->declaration;
             }
         }
-        if (!isSynthesizedIEquatableEquals(callee, recRecv)) return nullptr;
+        // fix #8578 (spec §14.2, stdlib §2.5, v0.357): the same abstract
+        // `IEquatable<T>.Equals` is what a `where T: IEquatable<T>` body
+        // resolves `a.Equals(b)` to when T is bound to the built-in value
+        // record `TimeSpan` / `DateOnly` / `TimeOnly`. Those carry no record
+        // declaration (their symbol is the intrinsic `builtinClassSym`), so
+        // the record test above cannot see them; their builtin equality IS
+        // the witness, and the #1091 arm below routes them to it.
+        bool valueBuiltinIEquatable = false;
+        if (isEquals && callee->params.size() == 1 &&
+            callee->parent ==
+                ctx_.builtinInterfaceSymIfCached("IEquatable")) {
+            const sema::TypeRef* rr = resolveTypeParamRef(recvTy);
+            valueBuiltinIEquatable =
+                rr && rr != recvTy && rr->kind == sema::TypeRef::Kind::Named &&
+                !rr->nullable &&
+                (builtinTypeName(rr) == "TimeSpan" ||
+                 builtinTypeName(rr) == "DateOnly" ||
+                 builtinTypeName(rr) == "TimeOnly");
+        }
+        if (!valueBuiltinIEquatable &&
+            !isSynthesizedIEquatableEquals(callee, recRecv))
+            return nullptr;
     }
 
     if (!recvTy) return nullptr;
@@ -5595,7 +5616,24 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
                    (dynamic_cast<const ast::NullLiteralExpr*>(
                         call.args[0].value.get()) != nullptr ||
                     isRangeType(resolveTypeParamRef(
-                        ctx_.exprType(*call.args[0].value)))))));
+                        ctx_.exprType(*call.args[0].value))))))) ||
+                // fix #8578 (spec §14.2 / §8.3, stdlib §2.5, v0.357): T bound
+                // to one of the built-in VALUE RECORDs `TimeSpan` / `DateOnly`
+                // / `TimeOnly` (each declares `IEquatable<Self>`, so a
+                // `where T: IEquatable<T>` body may call `a.Equals(b)`). The
+                // builtin symbol is stamped `Class`, so without this the
+                // substitution fell to `concreteRefSem` below, whose dispatch
+                // needs a POINTER receiver while these lower to a SCALAR word:
+                // the call degraded to `False` behind an `internal:` warning.
+                // `lowerValueSemMethodOn`'s #7937 arm is the one the concrete
+                // receiver already takes, so the generic and the direct answer
+                // cannot disagree. (`DateTime` and `Guid` never reach here:
+                // their own arms in `tryLowerBuiltinClassCall` resolve the
+                // substitution first.)
+                (concrete->kind == K::Named && !concrete->nullable &&
+                 (builtinTypeName(concrete) == "TimeSpan" ||
+                  builtinTypeName(concrete) == "DateOnly" ||
+                  builtinTypeName(concrete) == "TimeOnly"));
             bool concreteRefSem =
                 (concrete->kind == K::Named && concrete->declaration &&
                  (concrete->declaration->kind == ast::TypeDeclKind::Class ||
