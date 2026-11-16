@@ -4998,7 +4998,29 @@ bool MethodOwnership::isBorrowableOwnedSinkType(const sema::TypeRef* rt) {
 // aliases into its identifier root. A *value-typed* return (the spec's
 // "value-typed returns") is a copy and can never outlive its source, so
 // it is never a borrow escape and is reported here as may-borrow = false.
+bool MethodOwnership::isCompletionSourceTaskRead(const ast::Expr& e) const {
+    const ast::Expr* target = nullptr;
+    std::string_view member;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        target = ma->target.get();
+        member = ma->member;
+    } else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        target = nm->target.get();
+        member = nm->member;
+    }
+    if (!target || member != "Task") return false;
+    const sema::TypeRef* tt = ctx_.exprType(*target);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
+        return false;
+    const std::string_view head = tt->headName();
+    return head == "TaskCompletionSource" ||
+           head == "OwningTaskCompletionSource";
+}
+
 bool MethodOwnership::returnedExprMayBorrow(const ast::Expr& e) const {
+    // fix #8616 (§30.11, §28.3, v0.357): `tcs.Task` / `tcs?.Task` is a borrow
+    // of the task its source owns, whatever its `Task`-family type reads as.
+    if (isCompletionSourceTaskRead(e)) return true;
     // #791 / §28.3 / §27.6: a method/property REFERENCE `recv.M` (a member access
     // resolving to a method or property, used as a function value) captures `recv`
     // as a BORROW in its closure cell — `recv.GetN` ≡ `() => recv.GetN()`. It is

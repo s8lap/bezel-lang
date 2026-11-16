@@ -2746,6 +2746,15 @@ private:
     // value-typed projection by member name (still a copy, never a borrow).
     bool returnedExprMayBorrow(const ast::Expr& e) const;
 
+    // fix #8616 (§30.11 *Task-object ownership*, §28.3, v0.357): `e` is a
+    // read of the `Task` property of a `TaskCompletionSource<T>` /
+    // `OwningTaskCompletionSource<T>` / non-generic `TaskCompletionSource`
+    // source, in either the `.` or the `?.` spelling. The result is a BORROW
+    // of the task the source owns ("the task never outlives its source"),
+    // although its builtin `Task`-family type has no declaration and so reads
+    // as non-borrowable to `isBorrowableType`.
+    bool isCompletionSourceTaskRead(const ast::Expr& e) const;
+
     // fix #7103 (§28.3 *Producers* "Local-variable read `x` where `x` is
     // owned", §28.3 K1.5, §28.7 *Overwrite while borrowed*, v0.343): the
     // borrow source of an `Object`-typed read of an OWNED local.
