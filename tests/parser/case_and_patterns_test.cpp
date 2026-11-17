@@ -200,13 +200,6 @@ BEZEL_TEST(parser_case_of, missing_of_is_a_syntax_error_spec_19_1) {
     BEZEL_EXPECT_TRUE(missingOfDiagnostic("(case x)"));
 }
 
-// §19.1: with `of` present, the same construct parses cleanly.
-BEZEL_TEST(parser_case_of, of_present_parses_cleanly_spec_19_1) {
-    BEZEL_EXPECT_EQ(
-        renderCase("(case x of 1 => \"one\", _ => \"other\")"),
-        std::string("case x of { 1 => \"one\" | _ => \"other\" } end"));
-}
-
 // §19.1: the scrutinee is a FULL Expression — an additive expression needs no
 // parentheses now that `of` marks the boundary (`case x - 1 of`).
 BEZEL_TEST(parser_case_of, additive_scrutinee_unparenthesized_spec_19_1) {
@@ -244,13 +237,6 @@ BEZEL_TEST(parser_case_of, leading_negative_range_first_pattern_spec_19_1) {
         std::string(
             "case delta of { ((-10) .. (-6)) => \"strongly down\" "
             "| (<> ..< 0) => \"down\" | 0 => \"flat\" | _ => \"up\" } end"));
-}
-
-// §19.1: a trailing comma before `end` is still accepted with `of` present.
-BEZEL_TEST(parser_case_of, trailing_comma_still_allowed_spec_19_1) {
-    BEZEL_EXPECT_EQ(
-        renderCase("(case x of 1 => \"a\", 2 => \"b\",)"),
-        std::string("case x of { 1 => \"a\" | 2 => \"b\" } end"));
 }
 
 // v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led

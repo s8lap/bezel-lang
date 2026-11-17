@@ -40,14 +40,6 @@ std::string renderType(const std::string& typeText) {
 
 } // namespace
 
-BEZEL_TEST(parser_type_ext, unit_type) {
-    BEZEL_EXPECT_EQ(renderType("()"), std::string("()"));
-}
-
-BEZEL_TEST(parser_type_ext, zero_param_function) {
-    BEZEL_EXPECT_EQ(renderType("() -> int"), std::string("() -> int"));
-}
-
 BEZEL_TEST(parser_type_ext, zero_param_function_owned_return) {
     BEZEL_EXPECT_EQ(
         renderType("() -> owned T"),

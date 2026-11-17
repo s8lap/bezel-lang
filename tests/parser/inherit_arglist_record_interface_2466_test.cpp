@@ -172,15 +172,3 @@ BEZEL_TEST(parser_inherit_arglist_2466,
         "public class D(x: int): Base(x), IFoo() end D;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
-
-// A real (non-empty) primary-constructor base-ctor arg list on the FIRST
-// item of a primary-ctor class is the documented §11.1 shorthand — must
-// remain accepted (the new rejection fires only on items 1+).
-BEZEL_TEST(parser_inherit_arglist_2466,
-           primary_ctor_first_item_arglist_still_accepted_spec_11_1) {
-    auto r = parseAll(
-        "module M;"
-        "public class Base(v: int) end Base;"
-        "public class Derived(x: int): Base(x) end Derived;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}

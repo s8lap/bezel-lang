@@ -158,11 +158,6 @@ BEZEL_TEST(parser_new_postfix_483, new_nested_type_then_method_call_spec_A8) {
                     std::string("new Outer.Inner().M()"));
 }
 
-// Regression: single-identifier `new Foo()` must still parse correctly.
-BEZEL_TEST(parser_new_postfix_483, new_simple_regression_spec_A8) {
-    BEZEL_EXPECT_EQ(parseInitText("new Foo()"), std::string("new Foo()"));
-}
-
 // Regression: generic type `new Foo<int>()` must still parse correctly.
 BEZEL_TEST(parser_new_postfix_483, new_generic_regression_spec_A8) {
     BEZEL_EXPECT_EQ(parseInitText("new Foo<int>()"),

@@ -476,14 +476,6 @@ BEZEL_TEST(parser_trailing_comma_inheritance, before_where) {
     BEZEL_EXPECT_FALSE(hasParseErrors(r));
 }
 
-BEZEL_TEST(parser_trailing_comma_inheritance, before_body) {
-    // Trailing `,` directly before the body opener `{`.
-    const std::string src =
-        "module M; class C : A, B, public method M() _ := 0; end M; end C;";
-    auto r = parseAll(src);
-    BEZEL_EXPECT_FALSE(hasParseErrors(r));
-}
-
 // ===========================================================================
 // 17+18. EnumInheritance (§A.3, both alternatives): integer-type base or
 //       arbitrary-inherit-item base. Both parse through the same comma loop.

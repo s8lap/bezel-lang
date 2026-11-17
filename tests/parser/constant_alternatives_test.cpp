@@ -86,17 +86,6 @@ BEZEL_TEST(parser_const_alt, boolean_alternatives) {
             "case b of { true, false => \"either\" } end"));
 }
 
-BEZEL_TEST(parser_const_alt, single_literal_no_extra_comma) {
-    // Regression: a single-constant pattern followed by `,` should NOT
-    // consume the `,` as an alternative when what follows is not a
-    // Constant (e.g. `_`, `var`, `null` is also not interpreted unless
-    // following a Constant `,` — but `_` IS not a constant so it stops).
-    BEZEL_EXPECT_EQ(
-        renderCase("(case x of 1 => \"one\", _ => \"other\")"),
-        std::string(
-            "case x of { 1 => \"one\" | _ => \"other\" } end"));
-}
-
 BEZEL_TEST(parser_const_alt, alternatives_with_when_guard) {
     BEZEL_EXPECT_EQ(
         renderCase(

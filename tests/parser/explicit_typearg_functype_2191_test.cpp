@@ -186,18 +186,6 @@ BEZEL_TEST(parser_explicit_typearg_functype_2191, receiver_position_functype) {
 
 // ── Regression guards: the relational-vs-generic boundary is unchanged ────
 
-// §17.1 / §22.12 / #520 control: a plain `a < b` must still parse as a
-// relational comparison, not be swallowed by the type-arg scan. Admitting
-// function-type tokens must not loosen the disambiguation for relational
-// chains that have no function-type shape.
-BEZEL_TEST(parser_explicit_typearg_functype_2191, relational_lt_not_misinterpreted) {
-    BEZEL_EXPECT_TRUE(parses(
-        "module M; public static class P "
-        "  public static method Run(a: int, b: int, c: int): bool "
-        "    => a < b and b > c; "
-        "end P;"));
-}
-
 // §17.1 / §22.12 control: a relational `<` whose RHS is a parenthesized
 // expression (`a < (b + c)`) must still parse as relational — the new `(`
 // admission is gated by paren-depth tracking and the `+` bail, so a

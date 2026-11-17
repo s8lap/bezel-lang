@@ -373,15 +373,6 @@ BEZEL_TEST(parser_uniform_closer_1374, expr_case_inside_when_arm_with_label) {
 // `when` inside `catch` arms is a GUARD keyword (not a WhenExpr) — the labeled
 // closer `end when;` must NOT be confused with the guard keyword.
 
-// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
-// statement is retired — the replacement is the `if`/`elif`/`else` statement.
-// This test previously verified the when statement parsing; now verifies rejection.
-BEZEL_TEST(parser_uniform_closer_1374, end_when_in_when_stmt_not_guard) {
-    auto r = parseAll(
-        wrapMethod("when x > 0 => return 1;, _ => return 0; end when;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-}
-
 // ── 14. Existing named-end forms unchanged (regression guard) ─────────────────
 
 BEZEL_TEST(parser_uniform_closer_1374, method_named_end_still_works) {

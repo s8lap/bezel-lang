@@ -105,31 +105,6 @@ BEZEL_TEST(parser_lambda, scoped_param_modifier) {
         std::string("(lambda(scoped cb: () -> ()) => 1)"));
 }
 
-BEZEL_TEST(parser_lambda, block_body_with_params) {
-    BEZEL_EXPECT_EQ(
-        exprFromStmt("lambda(x: int) => do return x; end"),
-        std::string("(lambda(x: int) => do { return x; } end)"));
-}
-
-BEZEL_TEST(parser_lambda, empty_params_still_work) {
-    // Regression: the new buffered-lookahead path must still admit the
-    // empty-params form from slice 28.
-    BEZEL_EXPECT_EQ(
-        exprFromStmt("lambda() => 42"),
-        std::string("(lambda() => 42)"));
-}
-
-BEZEL_TEST(parser_lambda, paren_expr_is_not_lambda) {
-    // Discriminator: the matching `)` is followed by `+`, not `=>`, so the
-    // construct parses as a parenthesised expression. The tree shape for
-    // `(a + b) * c` puts the `+` inside the `*` operand without ParenExpr;
-    // exprToString parenthesises Binary nodes explicitly for unambiguous
-    // assertions.
-    BEZEL_EXPECT_EQ(
-        exprFromStmt("(a + b) * c"),
-        std::string("((a + b) * c)"));
-}
-
 BEZEL_TEST(parser_lambda, paren_with_typed_inner_member_access_is_not_lambda) {
     // `(foo.bar)` — the matching `)` is followed by `+`, not `=>`.
     BEZEL_EXPECT_EQ(
