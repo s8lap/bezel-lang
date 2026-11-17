@@ -2323,6 +2323,8 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // set that does not mix Owned with Borrowed-class-typed. Also handles
     // `=> (_w ?? new W()).Name()` — the MemberAccessExpr peel finds the `??`.
     // // per §28.3, K7.3, v0.307
+    // fix #7727: an expression body is its member's `return` (§20).
+    checkMoveOnlyChoiceMeetMixed(exprBody, /*consumingPosition=*/true);
     checkArmMeetMixed(exprBody);
     // #1530 (§30.3 / §30.5): the expression-body sibling of `checkResultSites`
     // — an expression-bodied method's `=>` body can read `.Result` on a
@@ -7728,6 +7730,8 @@ void MethodOwnership::checkArmMeetMixed(const ast::Expr& e) {
     // during the suppressDiag_ fixpoint phase), mirroring the
     // coalesceMeetReported_ pattern in checkCoalesceMeetMixed.
     if (armMeetReported_.count(&e)) return;
+    // fix #7727: the owning-choice meet (storage read ⊓ fresh owned arm).
+    if (checkMoveOnlyChoiceMeetMixed(e, /*consumingPosition=*/false)) return;
     std::vector<const ast::Expr*> arms;
     // fix #4964: the built-in `??` is the same K7 meet (§28.3 `a ?? b` row).
     // Peel `!` — `(a ?? b)!` has the meet's classification (§17.8).
@@ -7831,6 +7835,119 @@ void MethodOwnership::checkArmMeetMixed(const ast::Expr& e) {
     }
 }
 
+// fix #7727 (§28.3 K7.3, §28.3.4, §20 *Ownership*, §15.3, v0.357). See the
+// header declaration. The class-typed drivers below count a borrow arm only
+// when it is class/interface/array-typed, so an owning-CHOICE meet had no
+// borrow arm at all: `using var x := (if c then h.F else C.Text(new R()))`
+// was accepted, `x` took the field's bits on one path and the scope-end
+// active-case pass disposed a payload `h` still owns (MEASURED at r30-c1
+// 46219d9ba: heap-use-after-free; same for a `case` arm, for `h.G ?? o` and
+// for the move-only LOCAL arm `(if c then h.F else o)`).
+//
+// The verdict does not depend on how the storage arm alone would be read
+// (#7612): if it lends, the set is K7.3's "mixed = rejected"; if it could
+// not be bound at all, the expression is rejected on that ground. An
+// all-storage meet is left to that question and is not reported here.
+bool MethodOwnership::checkMoveOnlyChoiceMeetMixed(const ast::Expr& e,
+                                                   bool consumingPosition,
+                                                   bool coalesceChecked) {
+    const ast::Expr* top = &e;
+    while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(top)) {
+        if (!pb->operand) return false;
+        top = pb->operand.get();
+    }
+    // The `??` driver's own mixed test goes first, so a `??` it already
+    // rejects keeps that diagnostic (it calls back here when it finds no mix).
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(top)) {
+        if (!coalesceChecked && be->op == "??") checkCoalesceMeetMixed(*be);
+        if (coalesceMeetReported_.count(be)) return false;
+    }
+    auto isMeet = [&](const ast::Expr* x) {
+        if (dynamic_cast<const ast::ConditionalExpr*>(x)) return true;
+        if (dynamic_cast<const ast::CaseExpr*>(x)) return true;
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(x)) {
+            if (be->op != "??") return false;
+            // A user-defined `operator ??` is an ordinary call, not a meet.
+            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*be)))
+                if (ms->isOperator) return false;
+            return true;
+        }
+        return false;
+    };
+    if (!isMeet(top)) return false;
+    if (armMeetReported_.count(top)) return false;
+    auto verdict = common::classifyChoiceType(ctx_.exprType(*top), ctx_);
+    if (!verdict || *verdict != common::ChoiceClassification::Owning)
+        return false;
+    // Flatten nested meets: `(if a then h.F else (if b then o else C.Empty))`
+    // is one arm set (§28.10: "a nested `??`, `if` or `case` arm examined by
+    // its own arms").
+    std::vector<const ast::Expr*> arms;
+    std::function<void(const ast::Expr*)> flatten = [&](const ast::Expr* x) {
+        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(x)) {
+            if (!pb->operand) return;
+            x = pb->operand.get();
+        }
+        if (!x) return;
+        if (!isMeet(x)) { arms.push_back(x); return; }
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(x)) {
+            flatten(c->thenValue.get());
+            flatten(c->elseValue.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseExpr*>(x)) {
+            for (const ast::CaseArm& arm : cs->arms)
+                if (arm.bodyKind == ast::CaseArmBodyKind::Expression)
+                    flatten(arm.exprBody.get());
+        } else if (auto* be = dynamic_cast<const ast::BinaryExpr*>(x)) {
+            flatten(be->left.get());
+            flatten(be->right.get());
+        }
+    };
+    flatten(top);
+    const ast::Expr* storageArm = nullptr;
+    bool ownedArm = false;
+    for (const ast::Expr* arm : arms) {
+        if (dynamic_cast<const ast::ThrowExpr*>(arm)) continue;        // K7.5
+        if (dynamic_cast<const ast::NullLiteralExpr*>(arm)) continue;  // K7.5
+        sema::Symbol* sym = ctx_.exprSymbol(*arm);
+        if (dynamic_cast<const ast::IdentifierExpr*>(arm) &&
+            (dynamic_cast<sema::LocalSymbol*>(sym) ||
+             dynamic_cast<sema::ParameterSymbol*>(sym))) {
+            // A bare move-only binding: owned (it moves) only at an
+            // owned-consuming position; a borrow of the binding elsewhere.
+            if (consumingPosition) ownedArm = true;
+            continue;
+        }
+        // A bare identifier that reaches here names no local or parameter:
+        // with a field or property symbol it is the implicit `this.F` read.
+        const bool memberRead =
+            dynamic_cast<const ast::MemberAccessExpr*>(arm) ||
+            dynamic_cast<const ast::NullCondMemberExpr*>(arm) ||
+            dynamic_cast<const ast::IdentifierExpr*>(arm);
+        if (memberRead && (dynamic_cast<sema::FieldSymbol*>(sym) ||
+                           dynamic_cast<sema::PropertySymbol*>(sym))) {
+            if (!storageArm) storageArm = arm;
+            continue;
+        }
+        if (dynamic_cast<sema::ChoiceCaseSymbol*>(sym)) {
+            ownedArm = true;  // a payload-free case (`C.Empty`): a fresh value
+            continue;
+        }
+        if (producerState(*arm) == OwnershipState::Owned) ownedArm = true;
+    }
+    if (!storageArm || !ownedArm || suppressDiag_) return false;
+    armMeetReported_.insert(top);
+    report(Severity::Error, storageArm->span.begin,
+           "the arms of this expression mix an owned move-only value with a "
+           "read of storage — the ownership meet is rejected (§28.3 K7.3; "
+           "§20, v0.357: a move-only value is never bound by a borrow "
+           "arm-meet). A field or property read lends its location (§28.3 "
+           "producers table) and cannot hand its value to the new holder, "
+           "while another arm does hand one over. Take the stored value with "
+           "the replacing `move o.f with e` (§28.8.1), or select with a "
+           "statement");
+    return true;
+}
+
 // fix #4964 (§28.3 producer table `a ?? b` row, K7.1–K7.3, K7.5, K3.13,
 // v0.307): "`a ?? b` — the meet of the ownership states of `a` and `b` per K7
 // … owned ⊓ owned = owned …; borrowed ⊓ borrowed = borrowed with the union of
@@ -7855,6 +7972,7 @@ void MethodOwnership::checkCoalesceMeetMixed(const ast::BinaryExpr& be) {
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
             if (ms->isOperator) return;
     if (coalesceMeetReported_.count(&be)) return;
+    if (armMeetReported_.count(&be)) return;  // fix #7727: already reported
     bool ownedArm = false;
     bool borrowArm = false;
     const ast::Expr* borrowAt = nullptr;
@@ -7892,7 +8010,16 @@ void MethodOwnership::checkCoalesceMeetMixed(const ast::BinaryExpr& be) {
             if (!borrowAt) borrowAt = arm;
         }
     }
-    if (!ownedArm || !borrowArm || suppressDiag_) return;
+    if (suppressDiag_) return;
+    if (!ownedArm || !borrowArm) {
+        // fix #7727 (§28.3 K7.3, v0.357): the owning-choice meet this
+        // function's arm tests do not see (a storage read ⊓ a payload-free
+        // case such as `h.G ?? C.Empty`). Runs only when the test above
+        // found no mix, so an existing rejection keeps its text.
+        checkMoveOnlyChoiceMeetMixed(be, /*consumingPosition=*/false,
+                                     /*coalesceChecked=*/true);
+        return;
+    }
     coalesceMeetReported_.insert(&be);
     report(Severity::Error, borrowAt->span.begin,
            "the operands of this `??` mix an owned value with a borrowed arm "
@@ -9200,6 +9327,8 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
         // §28.3 arm-meet (v0.184, #1661): reject a mixed owned/borrowed arm set in
         // an if-expression / expression-position `case`/`when` initializer — for
         // BOTH `var` and `using var` (the diagnosis is binding-form-independent).
+        // fix #7727: a binding is an owned-consuming position (§20).
+        checkMoveOnlyChoiceMeetMixed(*ld.initializer, /*consumingPosition=*/true);
         if (dynamic_cast<const ast::ConditionalExpr*>(ld.initializer.get()) ||
             dynamic_cast<const ast::CaseExpr*>(ld.initializer.get()))
             checkArmMeetMixed(*ld.initializer);
@@ -12410,6 +12539,10 @@ void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
 // it was accepted, and codegen's twin (`markOwningChoiceMovedFromCore`) left
 // both slots holding the one payload (heap-use-after-free). // per §17.8
 void MethodOwnership::noteOwningChoiceWholeMoveRead(const ast::Expr& src) {
+    // fix #7727 (§20 *Ownership*, §28.3 K7.3, v0.357): this IS an
+    // owned-consuming position, so a bare move-only binding arm moves and a
+    // storage-read arm beside it makes the meet mixed.
+    checkMoveOnlyChoiceMeetMixed(src, /*consumingPosition=*/true);
     const ast::Expr* core = &src;
     while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core)) {
         if (!pb->operand) return;
@@ -13014,6 +13147,8 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // before handleDischarge silently marks anything moved-from. A no-op for
     // a non-ConditionalExpr / non-CaseExpr `e` and for any arm set that does
     // not mix Owned with Borrowed-class-typed. // per §28.3, K7.3, v0.307
+    // fix #7727: a `return` is an owned-consuming position (§20).
+    checkMoveOnlyChoiceMeetMixed(e, /*consumingPosition=*/true);
     checkArmMeetMixed(e);
     // fix #4948 (§17.8, §28.3, §28.10, v0.307): `return x!;` — §17.8: "if `x`
     // has ownership state owned …, `x!` is owned", i.e. the bare `x` itself,

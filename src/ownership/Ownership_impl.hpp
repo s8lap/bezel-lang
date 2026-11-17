@@ -1686,6 +1686,21 @@ private:
     // (checkRead's BinaryExpr arm) as well as from the binding / return
     // drivers, so one node can be reached more than once on the emit pass.
     void checkCoalesceMeetMixed(const ast::BinaryExpr& be);
+
+    // fix #7727 (§28.3 K7.3, §28.3.4 field-access rows, §20 *Ownership*,
+    // v0.357): the K7 meet over an OWNING-CHOICE-typed `if` / expression-`case`
+    // / `??` whose arms mix a read of STORAGE (a field or property read — the
+    // producers table's "Borrowed (source: `obj`)" rows) with an owned arm.
+    // `consumingPosition` false: only a FRESH owned arm (an owned production,
+    // or a payload-free case such as `C.Empty`) makes the set mixed — true in
+    // every position. `consumingPosition` true (the caller is a binding,
+    // assignment, argument or `return`): a bare move-only BINDING arm is an
+    // owned arm as well, because §20 has it move there ("in an
+    // owned-consuming position ... the selected branch's value moves"); in a
+    // borrowing position the same arm is a borrow and the set is not mixed.
+    // Reports once per node (armMeetReported_). Returns true when it reported.
+    bool checkMoveOnlyChoiceMeetMixed(const ast::Expr& e, bool consumingPosition,
+                                      bool coalesceChecked = false);
     std::unordered_set<const ast::Expr*> coalesceMeetReported_;
 
     // fix #4286 (§28.3 / §28.6, v0.298): `fromLambdaBody` mirrors the

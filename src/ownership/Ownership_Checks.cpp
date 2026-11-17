@@ -2010,6 +2010,9 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
         // classification is exactly the pre-v0.169 one; the call-site `owned`
         // marker (§22.3, v0.169) is layered on top of the SAME classification.
         if (ownedSink) {
+            // fix #7727 (§20 *Ownership*, §28.3 K7.3, v0.357): an `owned`
+            // argument is an owned-consuming position.
+            checkMoveOnlyChoiceMeetMixed(*a.value, /*consumingPosition=*/true);
             // fix #5144 / §17.8 (v0.309): the value may be a null-forgiving
             // `x!` over a named owned binding — peel the `!` so the named-
             // binding / source-classification logic sees `x` and the missing-
