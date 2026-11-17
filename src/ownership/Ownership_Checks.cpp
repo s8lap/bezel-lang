@@ -14411,6 +14411,10 @@ const ast::Node* MethodOwnership::localOfThisFrameDecl(
 // for it (see `collectEscapingLocals`).
 bool MethodOwnership::escapeScanLocalHoldsClosure(
     const ast::IdentifierExpr& id, const ast::Node* decl) const {
+    // LOCALDECL-ONLY: this is a shortcut for the lambda-initializer case, not
+    // the only way to answer true. A §21.1 `const f := lambda…` is a
+    // `LocalConstDecl`, skips the cast, and reaches the function-type test
+    // below, where the lambda's type (Kind::Function) answers true as well.
     if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(decl))
         if (dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get()))
             return true;
@@ -14612,6 +14616,11 @@ void MethodOwnership::collectEscapingLocalsExpr(const ast::Expr* e,
         // `owned x` (K3.4) names its local by spelling only: every local of
         // this frame of that name is transferred out.
         for (const auto& entry : localDepth_)
+            // LOCALDECL-ONLY: `escapingLocalDecls_` is read only beside
+            // `trustLocalOwnsFreshCollection`, which is false for a `const`
+            // (a `const` takes no owned production, §21.1 / §28.3: `const t :=
+            // new Array<Item>()` is a compile error, verified), so a `const`
+            // never needs an entry here.
             if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(entry.first))
                 if (ld->name == mt->name) escapingLocalDecls_.insert(ld);
         return;
@@ -14731,6 +14740,9 @@ void MethodOwnership::collectEscapingLocalsStmt(const ast::Stmt& s) {
 // collection (a `new` construction or a collection literal); the rebinding
 // half (`tmp := …` later) is the escape scan's.
 static bool trustLocalOwnsFreshCollection(const ast::Node* decl) {
+    // LOCALDECL-ONLY: a §21.1 `const` cannot bind a fresh collection: `const
+    // t: Array<Item> := new Array<Item>();` is rejected ("a `const` local must
+    // not take an owned production", verified), so a `const` never owns one.
     const auto* ld = dynamic_cast<const ast::LocalDecl*>(decl);
     if (!ld || !ld->initializer) return false;
     return dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) ||
