@@ -13596,7 +13596,7 @@ private:
     // fix #5855 (v0.357): RecordParamEscapeWalker over a caller's record
     // LOCAL (see LlvmBackend_Assign.cpp).
     bool recordLocalStrictlyCallBounded(
-        const ast::LocalDecl* ld,
+        const ast::Node* ld,
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // fix #8307 (§28.9, v0.357): may a `string` argument be released by the
     // caller after passing it to the `Object`/interface formal at `pos` of a
@@ -22448,7 +22448,7 @@ private:
     bool opaqueLocalProvablyUnwritten(const ast::LocalDecl* ld);
     // fix #5855 (v0.357): the same proof over an explicit body, unmemoized.
     bool localProvablyUnwrittenIn(
-        const ast::LocalDecl* ld,
+        const ast::Node* ld,
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void setOpaqueSlotScanRoot(
         const std::vector<std::unique_ptr<ast::Stmt>>* stmts,

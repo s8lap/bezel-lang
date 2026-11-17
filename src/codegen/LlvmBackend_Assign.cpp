@@ -20394,7 +20394,7 @@ bool Emitter::boxedRecordArgNonEscaping(
 // stores the borrowed string RAW — would keep the string alive past its
 // owner.
 bool Emitter::recordLocalStrictlyCallBounded(
-        const ast::LocalDecl* ld,
+        const ast::Node* ld,
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     if (!ld) return false;
     auto captures = [this](const ast::LambdaExpr& lam,

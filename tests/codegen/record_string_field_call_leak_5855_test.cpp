@@ -132,3 +132,34 @@ BEZEL_TEST(record_string_field_call_leak_5855,
                     "return TakeI(n);"),
         "100\n");
 }
+
+// §21.1 / §9.1 / §28.9: the `const` spellings of the constructor-borrow shape.
+// A §21.1 runtime `const` is a different AST node (`LocalConstDecl`) from a
+// `var`, and `collectCtorRecordBorrowEligible` read only `LocalDecl`, so the
+// `var` twin above was clean while each of these leaked the string per call.
+BEZEL_TEST(record_string_field_call_leak_5855,
+           const_string_local_into_positional_ctor_released_spec_21_1_s28_9) {
+    expectCleanRun(loopProgram("",
+                               "const t := \"x\" + i.ToString(); "
+                               "var n := new Name(t, 1); "
+                               "return n.n;"),
+                   "100\n");
+}
+
+BEZEL_TEST(record_string_field_call_leak_5855,
+           string_local_into_const_record_released_spec_21_1_s28_9) {
+    expectCleanRun(loopProgram("",
+                               "var t := \"x\" + i.ToString(); "
+                               "const n := new Name(t, 1); "
+                               "return n.n;"),
+                   "100\n");
+}
+
+BEZEL_TEST(record_string_field_call_leak_5855,
+           const_string_local_into_const_record_released_spec_21_1_s28_9) {
+    expectCleanRun(loopProgram("",
+                               "const t := \"x\" + i.ToString(); "
+                               "const n := new Name(t, 1); "
+                               "return n.n;"),
+                   "100\n");
+}

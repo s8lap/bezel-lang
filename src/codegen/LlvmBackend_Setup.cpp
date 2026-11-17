@@ -42021,14 +42021,20 @@ void Emitter::collectCtorSpanBorrowEligible(
 void Emitter::collectCtorRecordBorrowEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     ctorRecordBorrowDecl_.clear();
-    std::vector<std::pair<const ast::LocalDecl*, const ast::NewExpr*>> cands;
+    // fix-forward #5855 (§21.1, v0.357): `const ast::Node*` and the shared
+    // `localDeclInitView` authority, so a §21.1 runtime `const` record local
+    // (`ast::LocalConstDecl`) is a candidate like its `var` twin. The scan was
+    // `dynamic_cast<const ast::LocalDecl*>(s)`, which silently skipped every
+    // `const` local: `const n := new Name(t, 1)` never borrowed `t`, so the
+    // NewExpr escape disarmed `t`'s release and the string leaked per call.
+    std::vector<std::pair<const ast::Node*, const ast::NewExpr*>> cands;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            if (!ld->isUsing && ld->initializer)
-                if (auto* ne =
-                        dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                    cands.emplace_back(ld, ne);
+        {
+            const LocalDeclInitView v = localDeclInitView(s);
+            if (!v.isUsing && v.init)
+                if (auto* ne = dynamic_cast<const ast::NewExpr*>(v.init))
+                    cands.emplace_back(s, ne);
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
             for (auto& b : is->ifBranch.body) scan(b.get());
@@ -42057,8 +42063,8 @@ void Emitter::collectCtorRecordBorrowEligible(
         return t && !t->nullable && t->kind == sema::TypeRef::Kind::Primitive &&
                t->primitive == sema::PrimitiveType::String;
     };
-    std::unordered_map<const ast::LocalDecl*, bool> unwritten;
-    auto provablyUnwritten = [&](const ast::LocalDecl* src) {
+    std::unordered_map<const ast::Node*, bool> unwritten;
+    auto provablyUnwritten = [&](const ast::Node* src) {
         auto it = unwritten.find(src);
         if (it != unwritten.end()) return it->second;
         const bool proven = localProvablyUnwrittenIn(src, body);
@@ -42095,9 +42101,18 @@ void Emitter::collectCtorRecordBorrowEligible(
             auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
             if (!id) continue;
             auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
-            auto* src = loc ? dynamic_cast<const ast::LocalDecl*>(loc->decl)
-                            : nullptr;
-            if (!src || src->isUsing) continue;
+            // A source is a `var` local or a §21.1 runtime `const` local
+            // (`ast::LocalConstDecl`, never `using`), read by node identity.
+            const ast::Node* src = nullptr;
+            if (loc) {
+                if (auto* sd = dynamic_cast<const ast::LocalDecl*>(loc->decl)) {
+                    if (!sd->isUsing) src = sd;
+                } else if (auto* sc = dynamic_cast<const ast::LocalConstDecl*>(
+                               loc->decl)) {
+                    src = sc;
+                }
+            }
+            if (!src) continue;
             const ast::Param& field = td->positionalFields[k];
             if (!field.type || !isPlainString(ctx_.resolvedType(*field.type)) ||
                 !isPlainString(ctx_.exprType(*id)))
@@ -42111,7 +42126,7 @@ void Emitter::collectCtorRecordBorrowEligible(
         // (c): no source is written while the record holds it.
         std::unordered_set<const void*> admitted;
         for (const void* src : sources)
-            if (provablyUnwritten(static_cast<const ast::LocalDecl*>(src)))
+            if (provablyUnwritten(static_cast<const ast::Node*>(src)))
                 admitted.insert(src);
         if (!admitted.empty())
             ctorRecordBorrowDecl_.emplace(static_cast<const void*>(ne),
@@ -43002,11 +43017,14 @@ void Emitter::collectRecordCallResultReleaseEligible(
         // fix #5855: a record whose construction BORROWS a string local
         // (ctorRecordBorrowDecl_) must not release the fields that local
         // still owns.
-        if (auto* lde = dynamic_cast<const ast::LocalDecl*>(ld))
-            if (lde->initializer &&
-                ctorRecordBorrowDecl_.count(
-                    static_cast<const void*>(lde->initializer.get())))
+        {
+            // fix-forward #5855 (§21.1, v0.357): read through the shared
+            // `localDeclInitView` so a `const` record local is covered too.
+            const LocalDeclInitView v = localDeclInitView(ld);
+            if (v.init &&
+                ctorRecordBorrowDecl_.count(static_cast<const void*>(v.init)))
                 continue;
+        }
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         w.synthesizedRecordValueCall = &synthValue;  // fix #5855
         w.recordArgNonEscaping = &recordArg;         // fix #5855
@@ -47590,6 +47608,11 @@ struct BoxEscapeWalker {
             return;
         }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            // fix-forward #5855 (§21.1, v0.357): the slot-write question also
+            // asks about a `const` target (`collectCtorRecordBorrowEligible`'s
+            // source local); the scanned root declares it here.
+            if (slotWriteMode && static_cast<const void*>(lc) == target)
+                declSeen = true;
             // fix #6309 / §5.1 / §8.6 / §21.1 / §28.9 (v0.338): the §21.1
             // `const` SPELLING of the box alias relaxation added to the
             // LocalDecl arm above — the same mirror #3417 made when it admitted
@@ -48051,7 +48074,7 @@ bool Emitter::opaqueLocalProvablyUnwritten(const ast::LocalDecl* ld) {
 // `ref`/`out` argument, including inside a lambda body), did not stop early
 // and met no node kind it does not enumerate.
 bool Emitter::localProvablyUnwrittenIn(
-        const ast::LocalDecl* ld,
+        const ast::Node* ld,
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     if (!ld) return false;
     BoxEscapeWalker w{ctx_, static_cast<const void*>(ld),
