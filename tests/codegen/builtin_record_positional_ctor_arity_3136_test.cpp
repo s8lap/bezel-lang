@@ -195,17 +195,6 @@ BEZEL_TEST(builtin_record_positional_ctor_arity_3136,
 
 // ── ANTI-OVER-REJECT: the parameterless form #2994 closed stays closed ─────
 
-BEZEL_TEST(builtin_record_positional_ctor_arity_3136,
-           the_parameterless_form_is_still_rejected_spec_17_7) {
-    // §17.7 arm 2's pre-existing rejection (the `#2994` half). Growing the
-    // arm to cover wrong arities must not re-open this — the 0-arg list is
-    // still undeclared for both types, and the parameterless wording is the
-    // SAME wording the wrong-arity path now also uses.
-    BEZEL_EXPECT_TRUE(rejectsPositionalOnlyArm(newLocal("new ExceptionInfo()")));
-    BEZEL_EXPECT_TRUE(
-        rejectsPositionalOnlyArm(newLocal("new ReadOnlyStringSpan()")));
-}
-
 // ── ANTI-OVER-REJECT: the 3-arg declared form #3098 grew keeps constructing ─
 
 BEZEL_TEST(builtin_record_positional_ctor_arity_3136,

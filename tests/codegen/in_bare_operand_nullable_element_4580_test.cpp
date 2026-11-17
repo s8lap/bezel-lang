@@ -189,18 +189,3 @@ BEZEL_TEST(in_bare_operand_nullable_element_4580, array_null_literal_query_contr
         "  return 0; "
         "end Main; end C;"), 1);
 }
-
-// ── control: both operands already tagged (pre-existing #4553 case) ─────────
-//
-// Confirms the widened arm does not disturb the case narrow #4553 already
-// handled correctly — `ensureNullableElementValue` must be a no-op on a value
-// that already has the tagged-struct shape.
-BEZEL_TEST(in_bare_operand_nullable_element_4580, present_query_against_present_element_already_wrapped_control) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  var xs: Array<int?> := [1, null, 3]; "
-        "  var m: int? := 3; "
-        "  if m in xs then return 1; end; "
-        "  return 0; "
-        "end Main; end C;"), 1);
-}

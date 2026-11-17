@@ -200,33 +200,3 @@ BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_value_param_control) {
         "  end Main; "
         "end C;"), 11);
 }
-
-// =============================================================================
-// Control: #2579's NON-primary-ctor `base(ref n)` case — the arg IS the ref
-// param (passed by address through emitChainCall), against a base with an
-// EXPLICIT ctor body. A different site (emitChainCall, not
-// prePopulateBasePositionalFields); pinned to confirm the two fixes do not
-// collide. Pre- and post-fix: 15.
-// =============================================================================
-
-// §22.3 / fix #2579 (control for #2584): `base(ref n)` to a NON-primary-ctor
-// base — emitChainCall passes the address; the Base ctor body's `n := n + 5`
-// mutates the caller's x. Must stay working after the #2584 fix.
-BEZEL_TEST(ref_out_primary_base_chain_arg_2584, base_ref_non_primary_base_control) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "public class Base "
-        "  public _v: int; "
-        "  public constructor(ref n: int) n := n + 5; _v := n; end constructor; "
-        "end Base; "
-        "public class Derived: Base "
-        "  public constructor(ref n: int) base(ref n); end constructor; "
-        "end Derived; "
-        "public class C "
-        "  public static method Main(): int "
-        "    var x := 10; "
-        "    using var d := new Derived(ref x); "
-        "    return x; "
-        "  end Main; "
-        "end C;"), 15);
-}

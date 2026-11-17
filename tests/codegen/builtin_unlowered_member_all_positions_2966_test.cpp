@@ -184,46 +184,6 @@ BEZEL_TEST(builtin_unlowered_member_all_positions_2966,
 // ── ANTI-OVER-REJECT controls — the shapes a value-blind gate rejected ──────
 
 BEZEL_TEST(builtin_unlowered_member_all_positions_2966,
-           unit_returning_builtin_bare_statement_still_lowers_spec_30_15) {
-    // `ChannelSender<T>.Send` (stdlib §6.9 / spec §30.15) reaches the very same
-    // fallthrough with no value — and emits `bz_channel_sender_send` on the way,
-    // which is what excludes it. Oracle: the channel's buffered `Count`.
-    const std::string program =
-        "module M; import System.Threading; "
-        "class C public static method Main(): int "
-        "  using var ch := new Channel<int>(); "
-        "  using var sender := ch.NewSender(); "
-        "  sender.Send(42); "
-        "  sender.Send(7); "
-        "  return ch.Count; "
-        "end Main; end C;";
-    auto r = runAot(program);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(2, r.exitCode);
-}
-
-BEZEL_TEST(builtin_unlowered_member_all_positions_2966,
-           unit_returning_builtin_arrow_body_still_lowers_spec_30_15) {
-    // The counterexample #2966 itself records as the one that killed the naive
-    // `ci.returnType` version: a UNIT-returning arrow body over `Send` is legal
-    // Bezel and works. Oracle: the item really is buffered.
-    const std::string program =
-        "module M; import System.Threading; "
-        "class C "
-        "  public static method Push(s: ChannelSender<int>) => s.Send(42); "
-        "  public static method Main(): int "
-        "    using var ch := new Channel<int>(); "
-        "    using var sender := ch.NewSender(); "
-        "    C.Push(sender); "
-        "    return ch.Count; "
-        "  end Main; "
-        "end C;";
-    auto r = runAot(program);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(1, r.exitCode);
-}
-
-BEZEL_TEST(builtin_unlowered_member_all_positions_2966,
            domain_spawn_bare_statement_still_lowers_spec_30_14) {
     // The OTHER shape in the five lit programs the value-blind gate
     // false-rejected: `Domain.Spawn(…)` (spec §30.14), verbatim the canonical

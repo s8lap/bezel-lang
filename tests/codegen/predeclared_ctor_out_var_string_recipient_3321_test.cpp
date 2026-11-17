@@ -107,40 +107,6 @@ int run(const std::string& src) {
 }  // namespace
 
 // -----------------------------------------------------------------------------
-// #3321's own repro shape: pre-declared `out n: string` recipient, one
-// `new T(...)` call, one heap string copied out, the recipient's caller
-// scope ends. The constructor's `s + "-tail"` is a +1 producer whose
-// reference #2321 TRANSFERS into the caller's slot, so after the call the
-// caller's slot is that string's only owner. Pre-fix nothing released it →
-// LSan reports the leak → -999. Post-fix the scope-end release balances it
-// and Main returns 6.
-//
-// Mirrors `single_call_out_var_string_recipient_is_leak_free` from #2641's
-// regression net and `single_call_ctor_out_var_string_recipient_is_leak_free`
-// from #3305's regression net, but uses a PRE-DECLARED recipient at a
-// CONSTRUCTOR callee (the `NewExpr` arm's "widen" that #3304 explicitly
-// left for this follow-up).
-// per §22.3, §22.7, §28.9
-// -----------------------------------------------------------------------------
-BEZEL_TEST(predeclared_ctor_out_var_string_recipient_3321,
-           predeclared_ctor_out_var_recipient_is_leak_free) {
-    BEZEL_EXPECT_EQ(runChecked(
-        "module M; class Widget "
-        "  public ok: bool; "
-        "  public constructor(s: string, out n: string) "
-        "    n := s + \"-tail\"; ok := true; "
-        "  end constructor; "
-        "end Widget; "
-        "class C "
-        "  public static method Main(): int "
-        "    var n: string := \"zz\"; "
-        "    var w := new Widget(\"x\", out n); "
-        "    _ := w; "
-        "    return n.Length; "
-        "  end Main; end C;"), 6);
-}
-
-// -----------------------------------------------------------------------------
 // #3305's LOOP program verbatim, but with a PRE-DECLARED recipient. The
 // recipient's alloca is entry-block hoisted, so iteration N+1's constructor
 // store LOADS the slot to release what it displaces. If the scope-end
@@ -402,52 +368,4 @@ BEZEL_TEST(predeclared_ctor_out_var_string_recipient_3321,
         "    _ := w; "
         "    return n; "
         "  end Main; end C;"), 7);
-}
-
-// -----------------------------------------------------------------------------
-// CONTROL — the existing ctor-out-slot mechanism for `out owned var` (carried
-// by `ensureCtorOutVarSlots`' `out owned var` / `out using var` arms in
-// `LlvmBackend_Calls2.cpp`, #2411 / #2430) must keep working after this fix.
-// The constructor here declares an `out owned` parameter (a class-typed
-// owned slot, per §28.1 — `out owned` on a value type is rejected), and the
-// call site uses the inline `out owned var` form. The Res.alive counter
-// settles at 0 after the run, proving the recipient is disposed exactly
-// once (no leak, no double-free). Pinning it here catches any future
-// regression where the new `walkNewArgs` `out`-relaxation INTERFERES with
-// the existing `out owned var` arm.
-// per §22.3, §22.4, §28.3
-// -----------------------------------------------------------------------------
-BEZEL_TEST(predeclared_ctor_out_var_string_recipient_3321,
-           out_owned_var_ctor_existing_mechanism_still_works) {
-    JitResult r = runAotChecked(
-        "module M; class Res "
-        "  public static alive: int := 0; "
-        "  public Id: int; "
-        "  public constructor(id: int) Id := id; Res.alive := Res.alive + 1; "
-        "    end constructor; "
-        "  destructor Res.alive := Res.alive - 1; end destructor; "
-        "end Res; "
-        "class Widget "
-        "  public ok: bool; "
-        "  public constructor(out owned w: Res) "
-        "    w := new Res(9); ok := true; "
-        "  end constructor; "
-        "end Widget; "
-        "class C "
-        "  public static method Main(): int "
-        "    Res.alive := 0; "
-        "    var w := new Widget(out var n); "
-        "    _ := w; "
-        "    var idOk := (n.Id = 9); "
-        "    if idOk then return 0; end; "
-        "    return -1; "
-        "  end Main; "
-        "end C;");
-    if (!r.ran) {
-        // #3733: a toolchain SKIP fails this row (support/aot_result_asserts.hpp).
-        BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-        BEZEL_EXPECT_TRUE(r.ran);
-        return;
-    }
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

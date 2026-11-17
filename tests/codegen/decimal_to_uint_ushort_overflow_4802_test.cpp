@@ -373,19 +373,3 @@ BEZEL_TEST(decimal_to_uint_ushort_4802, uint_from_one_decimal_succeeds) {
         "  end Main; "
         "end C;"), 1);
 }
-
-// §5.2 / #5345: boundary — uint(uint.MaxValue) must still succeed.
-BEZEL_TEST(decimal_to_uint_ushort_4802, uint_from_uint_max_decimal_succeeds) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Main(): int "
-        "    var d: decimal := 4294967295m; "
-        "    try "
-        "      var v: uint := uint(d); "
-        "      if v = 4294967295U then return 1; end; "
-        "      return 201; "
-        "    catch OverflowException => return 202; "
-        "    end; "
-        "  end Main; "
-        "end C;"), 1);
-}

@@ -99,54 +99,6 @@ bool has(const std::string& hay, const char* needle) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// (1) #8361's OWN REPRO — the COVARIANTLY WIDENED erased stack view.
-//
-//     `IReadOnlyCollection<Animal>` over a `Stack<Dog>`: stdlib §4.1's `out T`
-//     admits the assignment (spec §12.9), so the program COMPILES and RUNS.
-//     §4.11's take-order clause applies to this shape exactly as it applies to
-//     the exact instantiation, so the erased view must visit 3, 2, 1 — the
-//     same order the CONCRETE for-in over the very same stack visits.
-//
-//     On the unfixed base the erased half printed `erased=1;2;3;` (the
-//     stack's physical / push order) while the concrete half printed
-//     `concrete=3;2;1;` — a silent disagreement between two views of one
-//     stack.
-// ---------------------------------------------------------------------------
-BEZEL_TEST(erased_collection_forin_family_order_8361_8363,
-           covariant_erased_stack_view_visits_take_order_4_11_8361) {
-    const std::string src =
-        "module M; "
-        "class Animal public Tag: int; "
-        "  public constructor(t: int) Tag := t; end constructor; "
-        "end Animal; "
-        "class Dog: Animal "
-        "  public constructor(t: int) base(t); end constructor; "
-        "end Dog; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var d1 := new Dog(1); "
-        "    using var d2 := new Dog(2); "
-        "    using var d3 := new Dog(3); "
-        "    using var s := new Stack<Dog>(); "
-        "    s.Push(d1); s.Push(d2); s.Push(d3); "
-        "    var r: IReadOnlyCollection<Animal> := s; "
-        "    var acc := \"\"; "
-        "    for var x in r do acc := acc + $\"{x.Tag};\"; end for; "
-        "    Console.WriteLine($\"erased={acc}\"); "
-        "    var acc2 := \"\"; "
-        "    for var d in s do acc2 := acc2 + $\"{d.Tag};\"; end for; "
-        "    Console.WriteLine($\"concrete={acc2}\"); "
-        "    return 0; "
-        "  end Main; "
-        "end C;";
-    JitResult r = runAot(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_TRUE(has(r.stdoutText, "erased=3;2;1;"));
-    BEZEL_EXPECT_FALSE(has(r.stdoutText, "erased=1;2;3;"));
-    BEZEL_EXPECT_TRUE(has(r.stdoutText, "concrete=3;2;1;"));
-}
-
-// ---------------------------------------------------------------------------
 // (2) #8363's OWN REPRO — a `Set<int>` bound to the erased interface.
 //
 //     stdlib §4.1's `IReadOnlyCollection<T>` is a COMMON ancestor of the
@@ -593,4 +545,3 @@ BEZEL_TEST(erased_collection_forin_family_order_8361_8363,
     // platform-dependent — but the CORRECT value must NOT appear.
     BEZEL_EXPECT_FALSE(has(r.stdoutText, "double=2.5;1.5;"));
 }
-

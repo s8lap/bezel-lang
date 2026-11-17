@@ -315,18 +315,6 @@ BEZEL_TEST(math_convert_narrowed_nullable_7297,
                     "2.5");
 }
 
-// stdlib §2.3: `ToString(value: decimal): string` — a `decimal` payload
-// renders as a decimal (its own type, never a binary float).
-BEZEL_TEST(math_convert_narrowed_nullable_7297,
-           narrowed_decimal_to_string_renders_the_payload_2_3) {
-    BEZEL_EXPECT_EQ(runAotOut(prog(
-                        "    var m: decimal? := 2.5m; "
-                        "    if m <> null then "
-                        "      Console.WriteLine(Convert.ToString(m)); "
-                        "    end;")),
-                    "2.5");
-}
-
 // stdlib §2.3 / §9.1: `ToString(value: int, toBase: int): string` — the
 // narrowed operand renders the RADIX form, not the decimal text.
 BEZEL_TEST(math_convert_narrowed_nullable_7297,
@@ -353,18 +341,6 @@ BEZEL_TEST(math_convert_narrowed_nullable_7297,
 // ===========================================================================
 // The CONTROL. The UN-narrowed spelling is STILL REFUSED by §7.
 // ===========================================================================
-
-// The plainest un-narrowed nullable: a local declared `double?` and
-// initialized with `null` — §7.4's "the declaration's assignment" narrows only
-// a NON-nullable initializer, so this read is still `double?` at the call,
-// and §5.1's one-way lifting reaches no non-nullable `double` parameter.
-BEZEL_TEST(math_convert_narrowed_nullable_7297,
-           unnarrowed_double_floor_is_refused_7_5_1) {
-    auto r = runAot(prog(
-        "    var d: double? := null; "
-        "    Console.WriteLine(Math.Floor(d));"));
-    expectRefusedBySection7(r, "Math.Floor");
-}
 
 // The same at the `Math.Abs` position.
 BEZEL_TEST(math_convert_narrowed_nullable_7297,

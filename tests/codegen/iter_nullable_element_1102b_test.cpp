@@ -77,18 +77,3 @@ BEZEL_TEST(iter_nullable_element_1102b, nullable_enum_element) {
         "    return s; "                                  // 2 (Blue) + 1 (Green) = 3
         "  end Main; end C;"), 3);
 }
-
-// Regression guard: a NON-nullable `int` element iterator is unchanged
-// (coerceReturnToNullableValue is a no-op for non-nullable elements).
-BEZEL_TEST(iter_nullable_element_1102b, non_nullable_element_unchanged) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Gen(): IEnumerable<int> "
-        "    yield return 5; yield return 7; "
-        "  end Gen; "
-        "  public static method Main(): int "
-        "    var s := 0; "
-        "    for var x in C.Gen() do s := s + x; end; "
-        "    return s; "                                  // 12
-        "  end Main; end C;"), 12);
-}

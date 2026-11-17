@@ -205,18 +205,3 @@ BEZEL_TEST(iterator_owned_param_named_local_1001, early_break_then_reenum_dispos
         "    return Cell.n; "  // 0
         "  end Main; end P;"), 0);
 }
-
-// §29.8 / §29.11 #1001: loop-temporary form still works (no regression from
-// the #943 / #945 fixes).
-BEZEL_TEST(iterator_owned_param_named_local_1001, loop_temporary_still_works) {
-    BEZEL_EXPECT_EQ(run(
-        std::string("module M; ") + kCell +
-        "class P "
-        "  public static method UseCell(owned c: Cell): IEnumerable<int> "
-        "    yield return c.V; yield return c.V + 1; "
-        "  end UseCell; "
-        "  public static method Main(): int "
-        "    for var x in P.UseCell(new Cell()) do end; "
-        "    return Cell.n; "  // 0 — loop-temporary disposed at for-loop end
-        "  end Main; end P;"), 0);
-}

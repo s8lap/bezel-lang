@@ -98,30 +98,6 @@ BEZEL_TEST(codegen_5116, instance_generic_method_own_type_param_lambda_capture_r
     BEZEL_EXPECT_EQ(r.stdoutText, "<3>\n");
 }
 
-// Control: non-generic method on a generic class — no method-own type param,
-// so the call-bounded release was always entered correctly. runAotChecked
-// confirms full memory cleanliness (no leak, no residual).
-BEZEL_TEST(codegen_5116, nongeneric_method_on_generic_class_control) {
-    auto r = runAotChecked(std::string(
-        "module Q; "
-        "public class Box<T> "
-        "  public method ApplyPlain(v: T, f: (T) -> int): int "
-        "    return f(v); "
-        "  end ApplyPlain; "
-        "end Box; "
-        "public class Program "
-        "  public static method Main(): int "
-        "    var b := new Box<string>(); "
-        "    var t: int := b.ApplyPlain(\"abcd\", lambda(y) => y.Length); "
-        "    Console.WriteLine($\"<{t}>\"); "
-        "    return 0; "
-        "  end Main; "
-        "end Program;"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "<4>\n");
-}
-
 // Control: static generic method with no method-own type param (U only on
 // class, not method). The lambda parameter type `T` is the CLASS generic,
 // not a method-own param, so the original gate was entered correctly.

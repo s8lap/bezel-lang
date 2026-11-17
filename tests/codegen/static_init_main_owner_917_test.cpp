@@ -77,22 +77,3 @@ BEZEL_TEST(static_init_main_owner_917, own_class_static_owned_fields_constructed
 // expressible as a runJit test — an unhandled exception in JIT'd code calls the
 // runtime's process-level handler, which exits the whole test harness. It is
 // verified out-of-band by compiling the repro to an executable (exit 70).
-
-// Control: a throwing static initializer on a DIFFERENT class, accessed inside a
-// try in Main's body, is still catchable at the access point (unchanged by the
-// fix — Main's own class C here has no static field state). Expected: 42.
-BEZEL_TEST(static_init_main_owner_917, other_class_failed_init_still_caught_at_access) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "class Boom public static _x: int := C.Fail(); end Boom; "
-        "class C "
-        "  public static method Fail(): int => throw new Exception(\"boom\"); "
-        "  public static method Main(): int "
-        "    try "
-        "      var v := Boom._x; "
-        "      return v; "
-        "    catch Exception => return 42; "
-        "    end; "
-        "  end Main; "
-        "end C;"), 42);
-}

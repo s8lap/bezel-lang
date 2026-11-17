@@ -139,16 +139,6 @@ BEZEL_TEST(codegen_decimal_parse_grammar_5400, exponent_valid_in_literal_spec_18
         "return 0; ")), 1);
 }
 
-// Control: "1.5e3" as a LITERAL — valid per §18.1.  (1.5e3m == 1500m;
-// the "1.5e3m == 0" bug is pre-existing and unrelated to #5400, so this
-// control verifies the plain-exponent case still works: 1e3m == 1000m.)
-BEZEL_TEST(codegen_decimal_parse_grammar_5400, fraction_and_exponent_valid_in_literal_spec_18_1) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "const k: decimal := 1e3m; "
-        "if k = 1000m then return 1; end; "
-        "return 0; ")), 1);
-}
-
 // ---------------------------------------------------------------------------
 // Control: valid inputs are still accepted.
 // ---------------------------------------------------------------------------

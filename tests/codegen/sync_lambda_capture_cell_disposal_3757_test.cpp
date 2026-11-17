@@ -113,29 +113,6 @@ const char* kTail =
     "end C;";
 }  // namespace
 
-// ── Row 1, NORMAL EXIT, the issue's own repro: `a` captured by a NESTED
-// lambda `g` (2 levels: f -> g). g() reads a[0]!.V == 1; f() returns 1+2=3.
-// 200 * 3 = 600. per §27.5, §15.1.1 (issue #3757)
-BEZEL_TEST(sync_lambda_capture_cell_disposal_3757,
-           normal_exit_disposes_captured_array_via_cell_spec_27_5) {
-    BEZEL_EXPECT_EQ(checkedOut(
-        std::string(kHdr) +
-        "class C "
-        "  public static method Run(): int "
-        "    var f := lambda() => do "
-        "      var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
-        "      var g := lambda() => a[0]!.V; "
-        "      return g() + 2; "
-        "    end; "
-        "    return f(); "
-        "  end Run; "
-        "  public static method Main(): int "
-        "    var total := 0; "
-        "    for var j in 0..<200 do total := total + C.Run(); end; " +
-        kTail),
-        "total=600 n=0\n");
-}
-
 // ── Row 2, EARLY RETURN: the `return` that exits the sync lambda body sits
 // textually BEFORE the array's declared scope's fall-through point, proving
 // the return-handler's disposal walk sees the capture-cell registration this

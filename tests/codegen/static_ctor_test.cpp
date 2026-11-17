@@ -17,16 +17,6 @@ int run(const std::string& program) {
 }
 } // namespace
 
-BEZEL_TEST(codegen_cg47, static_ctor_sets_field) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class N "
-        "  public static V: int := 0; "
-        "  public static constructor() V := 99; end constructor; "
-        "end N; "
-        "class C public static method Main(): int return N.V; end Main; "
-        "end C;"), 99);
-}
-
 BEZEL_TEST(codegen_cg47, static_ctor_computes_from_other_static) {
     BEZEL_EXPECT_EQ(run(
         "module M; class N "

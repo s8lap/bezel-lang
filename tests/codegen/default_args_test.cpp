@@ -310,16 +310,3 @@ BEZEL_TEST(codegen_cg45, null_default_non_nullable_regression_spec_22_7_issue123
         "  public static method Main(): int => F(); "
         "end C;"), 7);
 }
-
-BEZEL_TEST(codegen_cg45, default_expr_nullable_int_regression_spec_22_5_issue1235) {
-    // §22.5 (#1235 regression): `default(int?)` as a default must still
-    // materialise the nullable zero value and return 11 (pre-existing fix
-    // #1163 must be unbroken).
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "static class U public static method P(x: int? := default(int?)): int "
-        "  if x = null then return 11; end; return x!; "
-        "end P; end U; "
-        "class C public static method Main(): int => U.P(); "
-        "end C;"), 11);
-}

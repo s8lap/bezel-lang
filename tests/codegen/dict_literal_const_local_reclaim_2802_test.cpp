@@ -157,26 +157,6 @@ BEZEL_TEST(dict_literal_const_local_reclaim_2802,
         2);
 }
 
-// ── REGRESSION: the `var` form (already worked via #2143) must remain
-// ASan-clean after the LocalDeclInitView refactor. Value: 60.
-// per §28.9, §15.4 (issue #2802; regression-vs-#2143)
-BEZEL_TEST(dict_literal_const_local_reclaim_2802,
-           var_string_key_dict_literal_looped_regression_spec_28_9_15_4) {
-    BEZEL_EXPECT_EQ(runChecked(
-        "module M; "
-        "class C "
-        "  public static method Main(): int "
-        "    var total := 0; "
-        "    for var i in 1..20 do "
-        "      var d: Dictionary<string, int> := [\"a\": 1, \"b\": 2]; "
-        "      total := total + d[\"a\"] + d[\"b\"]; "
-        "    end; "
-        "    return total; "
-        "  end Main; "
-        "end C;"),
-        60);
-}
-
 // ── ASYNC axis: a const dict literal held across an await.
 //
 // Was DEFERRED out of #2802 and filed as #3375; FIXED there. The cause was

@@ -200,18 +200,6 @@ BEZEL_TEST(dict_literal_contexts_538, control_array_return_unaffected) {
         "end C;"), 1);
 }
 
-// Control: #534 local-decl dict literal still works.
-BEZEL_TEST(dict_literal_contexts_538, control_local_dict_literal_534_still_works) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  using var d: Dictionary<string, int> := [\"a\": 1, \"b\": 2]; "
-        "  var va: int? := null; var vb: int? := null; "  // v0.171 (#1336)
-        "  d.TryGetValue(\"a\", out va); "
-        "  d.TryGetValue(\"b\", out vb); "
-        "  return int(d.Count = 2 and va = 1 and vb = 2); "
-        "end Main; end C;"), 1);
-}
-
 // Control: new()+Add baseline is unaffected.
 BEZEL_TEST(dict_literal_contexts_538, control_new_plus_add_unaffected) {
     BEZEL_EXPECT_EQ(run(

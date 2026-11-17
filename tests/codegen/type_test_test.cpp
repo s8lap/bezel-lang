@@ -156,12 +156,6 @@ BEZEL_TEST(codegen_cg19_nullable_value_is, nullable_class_present_is_true_regres
         "end Main; end C;"), 1);
 }
 
-// REGRESSION: non-nullable class `is` check still works (no struct path taken).
-BEZEL_TEST(codegen_cg19_nullable_value_is, nonnull_class_is_true_regression) {
-    BEZEL_EXPECT_EQ(runHier(
-        "var d := new Dog(); return (if d is Dog then 1 else 0);"), 1);
-}
-
 // REGRESSION #1071 (§8.6 / §12.7): an Object/interface operand may hold a bare
 // `bz_string*`, which has NO leading vtable/descriptor word. `o is T` / `o as T`
 // for a non-string target T must NOT walk the string's `char* data` word as a

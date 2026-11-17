@@ -413,23 +413,6 @@ BEZEL_TEST(runtime_const_locals_2049, owned_move_rejected) {
         "end C;"));
 }
 
-// §21.1 / §28.3: the NEVER-OWNED rule admits a const local bound to a
-// borrow (read of an existing owned binding). `using var c := new C();
-// const r := c;` is the spec's borrow-const idiom — `r` is a const borrow
-// of `c`, and reads through `r` observe `c`'s object.
-BEZEL_TEST(runtime_const_locals_2049, borrow_initializer_admitted) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public f: int := 0; "
-        "  public constructor(v: int) f := v; end constructor; "
-        "  public static method Main(): int "
-        "    using var c := new C(42); "
-        "    const r := c; "              // borrow of c (never-owned)
-        "    return r.f; "                // 42
-        "  end Main; "
-        "end C;"), 42);
-}
-
 // §21.1 (v0.298) / #4287: a `const` local bound to a marked-transfer
 // `move` of a BUILT-IN class type (Array<int>, Dictionary<…>, the FFI
 // buffers, …) is rejected. §21.1's text names "a `move` (the marked

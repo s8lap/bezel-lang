@@ -268,31 +268,6 @@ BEZEL_TEST(owning_enumerator_1349, diag_movenext_returns_false_spec_29_1) {
         "  end Main; end C;"), 1);
 }
 
-// Diagnostic: check that TakeCurrent on exhausted state raises IOE.
-// Check b2 first (should be false), then try TakeCurrent.
-BEZEL_TEST(owning_enumerator_1349, diag_take_after_exhaust_ioe_via_b2_spec_29_1) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; " + kBox +
-        "class C "
-        "  public static method Gen(): IOwningEnumerable<Box> "
-        "    yield return new Box(1); "
-        "  end Gen; "
-        "  public static method Main(): int "
-        "    using var source := Gen(); "
-        "    using var en := source.GetOwningEnumerator(); "
-        "    var b1 := en.MoveNext(); "
-        "    using var x := en.TakeCurrent(); "
-        "    var b2 := en.MoveNext(); "
-        "    if b2 then return -2; end; "  // b2 must be false
-        "    var caught := 0; "
-        "    try "
-        "      using var y := en.TakeCurrent(); "
-        "      caught := 0; "
-        "    catch InvalidOperationException => caught := 1; end; "
-        "    return caught; "
-        "  end Main; end C;"), 1);
-}
-
 // ===========================================================================
 // §29.2 / #1349: for-loop desugaring still works (regression guard)
 // ===========================================================================

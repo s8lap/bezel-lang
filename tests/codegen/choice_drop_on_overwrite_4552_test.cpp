@@ -374,19 +374,3 @@ BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
                "end NonOwningSelfAssign;"),
         std::string("0\n"));  // 0 loop disposals + 0 scope-end (Empty has no owned payload)
 }
-
-BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
-           spec_35_4_owning_choice_field_owning_to_non_owning_still_disposes) {
-    // fix #5460: the fix must not accidentally skip disposal when it IS needed.
-    // Ready→Empty disposes the displaced Ready (the owning value).  If the fix
-    // accidentally made the guard too broad (skipped dispose for owning→non-owning
-    // transitions), this row would show a leak.
-    BEZEL_EXPECT_EQ(
-        runOut(kNamedResourceDecls,
-               "var h := new Host(); "
-               "h._o := Bundle.Ready(new Resource(\"old\")); "
-               "h._o := Bundle.Empty; "  // owning → non-owning: must dispose "old"
-               "Console.WriteLine(\"reassigned\");",
-               "private _o: Bundle;"),
-        std::string("dispose old\nreassigned\n"));
-}

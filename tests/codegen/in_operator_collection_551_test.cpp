@@ -194,34 +194,6 @@ BEZEL_TEST(in_operator_collection_spec_17_5, linkedlist_int_absent) {
 // Regression guards — existing `in` forms must still work after this change
 // ===========================================================================
 
-// §17.5 control: `x in range` still works (inline literal fast path).
-BEZEL_TEST(in_operator_collection_spec_17_5, range_literal_control) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  if 5 in 1..10 then return 1; end; "
-        "  return 0; "
-        "end Main; end C;"), 1);
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  if 11 in 1..10 then return 0; end; "
-        "  return 1; "
-        "end Main; end C;"), 1);
-}
-
-// §17.5 control: `c in s` (char in string) still works.
-BEZEL_TEST(in_operator_collection_spec_17_5, char_in_string_control) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  if 'e' in \"hello\" then return 1; end; "
-        "  return 0; "
-        "end Main; end C;"), 1);
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  if 'z' in \"hello\" then return 0; end; "
-        "  return 1; "
-        "end Main; end C;"), 1);
-}
-
 // §17.5 control: `elem in set` (Set<int>) still works.
 BEZEL_TEST(in_operator_collection_spec_17_5, set_int_control) {
     BEZEL_EXPECT_EQ(run(

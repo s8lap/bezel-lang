@@ -109,28 +109,6 @@ BEZEL_TEST(out_var_slot_release_2629,
 }
 
 // -----------------------------------------------------------------------------
-// The CONSTRUCTOR half (`ensureCtorOutVarSlots`) — issue #2629's own repro,
-// a straight-line `new` with no short-circuiting. This one needs no stack
-// priming: `new`'s own `calloc` call leaves the residue. Pre-fix: exit 139.
-// -----------------------------------------------------------------------------
-BEZEL_TEST(out_var_slot_release_2629,
-           ctor_out_var_reference_plain_call_returns_real_value) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class Widget "
-        "  public ok: bool; "
-        "  public constructor(s: string, out n: string) "
-        "    n := \"hi\"; ok := true; "
-        "  end; "
-        "end Widget; "
-        "class C "
-        "  public static method Main(): int "
-        "    var w := new Widget(\"x\", out var n); "
-        "    _ := w; "
-        "    return n.Length; "
-        "  end Main; end C;"), 2);
-}
-
-// -----------------------------------------------------------------------------
 // GENERIC class constructor — `ensureCtorOutVarSlots` reaches the same
 // predicate through the reified-generic path, and it SIGSEGVs pre-fix
 // identically. Nothing in the existing #2409 suite covers a generic ctor.

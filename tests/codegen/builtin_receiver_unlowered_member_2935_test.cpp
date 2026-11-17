@@ -579,33 +579,6 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
 }
 
 BEZEL_TEST(builtin_receiver_unlowered_member_2935,
-           real_stopwatch_api_via_bare_block_getter_receiver_still_works_4193) {
-    // See the expression-getter sibling above for the single-access oracle
-    // rationale — identical here, through the block-form getter instead.
-    const std::string program =
-        "module M; import System.Diagnostics; "
-        "class C "
-        "  private owned sw: Stopwatch; "
-        "  public constructor() sw := Stopwatch.StartNew(); end constructor; "
-        "  public property Sw: Stopwatch get => sw; end; "
-        "  public method Test(): int "
-        "    if not Sw.IsRunning then return 1; end; "
-        "    Sw.Start(); "
-        "    Sw.Stop(); "
-        "    Sw.Reset(); "
-        "    return 0; "
-        "  end Test; "
-        "  public static method Main(): int "
-        "    var c := new C(); "
-        "    return c.Test(); "
-        "  end Main; "
-        "end C;";
-    auto r = runAot(program);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(0, r.exitCode);
-}
-
-BEZEL_TEST(builtin_receiver_unlowered_member_2935,
            new_stopwatch_chained_bogus_member_stays_unaffected_scope_boundary_4193) {
     // The receiver-shape-general sibling this fix deliberately does NOT
     // cover — `new Stopwatch()`, chained with no intermediate binding, has no

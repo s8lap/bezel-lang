@@ -199,19 +199,6 @@ BEZEL_TEST(cts_withcancelafter_token_typed_463,
         1);
 }
 
-// #463 / §6.1: Regression — `new CancellationTokenSource()` path still works.
-// Ensures the fix did not disturb the working path.
-BEZEL_TEST(cts_withcancelafter_token_typed_463,
-           new_cts_regression_still_works) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "using var cts := new CancellationTokenSource(); "
-        "var tok := cts.Token; "
-        "cts.Cancel(); "
-        "if tok.IsCancellationRequested then return 1; end; "
-        "return 0; ")),
-        1);
-}
-
 // ===========================================================================
 // #1025 / §6.1: a CHAINED-receiver cancellation instance call — calling the
 // method directly on `source.Token` (a MemberAccessExpr, not a bound

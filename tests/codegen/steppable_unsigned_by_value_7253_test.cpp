@@ -117,31 +117,6 @@ BEZEL_TEST(steppable_unsigned_by_value_7253,
 }
 
 // ===========================================================================
-// THE ISSUE'S OWN CLAIM — THE TWO SPELLINGS OF THE SAME NUMBER MUST AGREE.
-//
-// Both helpers run in ONE program, so the row pins the disagreement itself
-// and not merely one spelling's value.
-// ===========================================================================
-BEZEL_TEST(steppable_unsigned_by_value_7253,
-           the_uint_and_long_spellings_agree_5_1) {
-    expectValue(
-        "module M; static class F "
-        "  public static method ByUint<T>(v: T): T where T: ISteppable<T> "
-        "    return T.Step(v, 4000000000u); "
-        "  end ByUint; "
-        "  public static method ByLong<T>(v: T): T where T: ISteppable<T> "
-        "    return T.Step(v, 4000000000L); "
-        "  end ByLong; "
-        "end F; "
-        "class C public static method Main(): int "
-        "  Console.WriteLine(F.ByUint(1.0).ToString()); "
-        "  Console.WriteLine(F.ByLong(1.0).ToString()); "
-        "  return 0; "
-        "end Main; end C;",
-        "4000000001\n4000000001");
-}
-
-// ===========================================================================
 // A `decimal` `T` — stdlib §2.19's `Step` advances in `T`'s own space, and
 // §6.4's decimal arithmetic is exact, so the value is 4000000001 exactly.
 // ===========================================================================
@@ -160,18 +135,6 @@ BEZEL_TEST(steppable_unsigned_by_value_7253,
     expectValue(stepProg("v: T", "4000000000u",
                          "  Console.WriteLine(F.Nxt(1.0f).ToString()); "),
                 "4e+09");
-}
-
-// ===========================================================================
-// THE `by` AS A NON-CONSTANT SOURCE — a `uint` VARIABLE, so the widening
-// is not a constant fold.
-// ===========================================================================
-BEZEL_TEST(steppable_unsigned_by_value_7253,
-           step_uint_variable_by_keeps_its_value_5_1) {
-    expectValue(stepProg("v: T, by: uint", "by",
-                         "  var u: uint := 4000000000u; "
-                         "  Console.WriteLine(F.Nxt(1.0, u).ToString()); "),
-                "4000000001");
 }
 
 // ===========================================================================

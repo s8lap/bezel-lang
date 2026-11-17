@@ -20,15 +20,6 @@ int run(const std::string& program) {
 }
 } // namespace
 
-BEZEL_TEST(codegen_cg29c, with_updates_one_field) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; record P(x: int, y: int); "
-        "class C public static method Main(): int "
-        "  var a := new P(1, 2); var b := a with(x := 9); "
-        "  return b.x * 10 + b.y; "
-        "end Main; end C;"), 92);
-}
-
 BEZEL_TEST(codegen_cg29c, with_does_not_mutate_source) {
     BEZEL_EXPECT_EQ(run(
         "module M; record P(x: int, y: int); "

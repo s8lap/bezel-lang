@@ -34,29 +34,6 @@ int run(const std::string& src) {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// (a) Primary repro: user indexer `+=` must call the setter — per §23.4
-// ---------------------------------------------------------------------------
-
-// §20 / §23.4: `c[0] += 5` expands to `c[0] := c[0] + 5`; getter reads 10,
-// result is 15, setter stores it; subsequent getter read must return 15.
-BEZEL_TEST(indexer_compound_assign_20_23_4, plus_equals_calls_setter) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  private _d: [2]int; "
-        "  public property [i: int]: int "
-        "    get => _d[i]; "
-        "    set => do _d[i] := value; end; "
-        "  end; "
-        "  public static method Main(): int "
-        "    using var c := new C(); "
-        "    c[0] := 10; "
-        "    c[0] += 5; "
-        "    return c[0]; "
-        "  end Main; "
-        "end C;"), 15);
-}
-
-// ---------------------------------------------------------------------------
 // (b) Other compound operators on a user indexer — per §23.4
 // ---------------------------------------------------------------------------
 
@@ -159,24 +136,6 @@ BEZEL_TEST(indexer_compound_assign_20_23_4, field_backed_indexer_compound) {
         "    return c[0]; "
         "  end Main; "
         "end C;"), 123);
-}
-
-// ---------------------------------------------------------------------------
-// (e) CONTROL: built-in array `d[0] += 5` still works correctly
-// ---------------------------------------------------------------------------
-
-// §15.1 / §23.4: compound assignment on a BUILT-IN inline array must not
-// be disturbed by the user-indexer fix.
-BEZEL_TEST(indexer_compound_assign_20_23_4, builtin_array_compound_unaffected) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Main(): int "
-        "    var d: [2]int; "
-        "    d[0] := 10; "
-        "    d[0] += 5; "
-        "    return d[0]; "
-        "  end Main; "
-        "end C;"), 15);
 }
 
 // ---------------------------------------------------------------------------

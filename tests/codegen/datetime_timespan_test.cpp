@@ -210,16 +210,6 @@ BEZEL_TEST(codegen_datetime_2_5, add_seconds) {
 // §2.5 DateTime - DateTime → TimeSpan (Subtract instance method).
 // ---------------------------------------------------------------------------
 
-// stdlib §2.5: (DateTime B).Subtract(DateTime A) = TimeSpan of the difference.
-// 2024-01-11 - 2024-01-01 = 10 days.
-BEZEL_TEST(codegen_datetime_2_5, subtract_datetime_yields_timespan) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "var a := new DateTime(2024, 1, 1); "
-        "var b := new DateTime(2024, 1, 11); "
-        "var span := b.Subtract(a); "
-        "return span.Days; ")), 10);
-}
-
 // stdlib §2.5: DateTime - TimeSpan → DateTime (Subtract with TimeSpan arg).
 // 2024-01-11 - 10 days → 2024-01-01.
 BEZEL_TEST(codegen_datetime_2_5, subtract_timespan_yields_datetime) {

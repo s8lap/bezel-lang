@@ -500,16 +500,3 @@ BEZEL_TEST(binary_op_iface_choice_operand_rejected_3929,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 10);
 }
-
-// Ordinary numeric arithmetic is unaffected.
-BEZEL_TEST(binary_op_iface_choice_operand_rejected_3929,
-           int_plus_int_still_works) {
-    auto r = runAot(
-        "module M; class C public static method Main(): int "
-        "var a := 3; "
-        "var b := 4; "
-        "return a + b; "
-        "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 7);
-}

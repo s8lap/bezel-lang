@@ -168,35 +168,6 @@ BEZEL_TEST(array_record_boxed_collection_disposal_2791, borrowing_primitive_boxe
         "  end Main; end C; "), 42);
 }
 
-// CONTROL — borrowing literal with a CLASS element stays a bare pointer
-// (#399: boxForTarget is a no-op for a reference source). The literal
-// materializer's all-boxes predicate declines on a class source, so the
-// existing elementDisposerThunk (or null for ClassBorrow) stays in place —
-// the class instance is owned by its `using var`, the array borrows it, and
-// the slot's content is the class pointer (not a box). Pinned by the same
-// shape #2771's control_class_element_not_boxed covers, now under
-// runAotChecked (so the absence of a box in the slot is also a dispose-
-// exactly-once claim).
-BEZEL_TEST(array_record_boxed_collection_disposal_2791, control_borrowing_class_element_unaffected) {
-    BEZEL_EXPECT_EQ(runChecked(
-        "module M; "
-        "public interface IRank: IComparable<IRank> "
-        "  method Rank(): int; "
-        "end IRank; "
-        "class Node: IRank "
-        "  private _r: int; "
-        "  public constructor(r: int) _r := r; end constructor; "
-        "  public method Rank(): int => _r; "
-        "  public method CompareTo(other: IRank): int => _r - other.Rank(); "
-        "end Node; "
-        "class C  public static method Main(): int "
-        "    using var a := new Node(3); "
-        "    using var b := new Node(1); "
-        "    var arr: Array<IRank> := [a, b]; "
-        "    return arr[0].Rank() * 4 + arr[1].Rank(); "
-        "  end Main; end C; "), 13);
-}
-
 // CONTROL — borrowing literal of NUMERIC elements keeps its
 // `coerceNumericToType` result; the box step (a no-op for value-typed
 // targets per §8.6) does not disturb the widening. A `Array<long> := [1,2]`

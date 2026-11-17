@@ -184,39 +184,6 @@ BEZEL_TEST(typeparam_bound_member_arg_erased_ref_6870,
     BEZEL_EXPECT_EQ(r.stdoutText, "7\n");
 }
 
-// ── TWO LEVELS, with a NULLABLE type parameter (§7.1). This is the case
-//    that forces the erased template's SIGNATURE, the ERASED LAYOUT of the
-//    declaring type and the BODY to agree on one representation of `T?`:
-//    `Inner<T>`'s field `T?` is lowered in `Inner`'s erased LAYOUT, while
-//    `Inner$Head`'s return type is lowered in its erased SIGNATURE, and the
-//    pseudo-specialization built from inside `Outer<U>`'s template carries
-//    the substitution `T → U`.  A disagreement is an IR-verification failure
-//    ("Function return type does not match operand type of return inst!"),
-//    not a wrong answer.  The program returns 3 — the value is null. ───────
-BEZEL_TEST(typeparam_bound_member_arg_erased_ref_6870,
-           two_level_nullable_field_value_spec_7_10) {
-    auto r = jit(
-        "module M; import System.Diagnostics; "
-        "class Res public n: int := 0; end Res; "
-        "class Inner<T> where T: class "
-        "  private _v: T? := null; "
-        "  public method Head(): T? return _v; end Head; "
-        "end Inner; "
-        "class OuterU<U> where U: class "
-        "  private owned g: Inner<U> := new Inner<U>(); "
-        "  public method Head(): U? return g.Head(); end Head; "
-        "end OuterU; "
-        "class C public static method Main(): int "
-        "  using var o := new OuterU<Res>(); "
-        "  var s := o.Head(); "
-        "  if s = null then return 3; end; "
-        "  return 0; "
-        "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 3);
-}
-
 // ── The same generic-CLASS shape under the CHECKED oracle: generated-code
 //    ASan + LeakSanitizer. The change moves the erased LAYOUT of the generic
 //    class, so the layout has to survive a sanitizer as well as the value

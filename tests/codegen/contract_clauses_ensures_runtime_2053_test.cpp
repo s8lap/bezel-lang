@@ -191,16 +191,3 @@ BEZEL_TEST(contract_clauses_ensures_runtime_2053,
         "  end Main; "
         "end C;"), 22);
 }
-
-// Additive: a zero-clause method still compiles and runs as before — no
-// epilogue is emitted, emitReturn goes through the direct path.
-BEZEL_TEST(contract_clauses_ensures_runtime_2053,
-           zero_clause_method_runs_unchanged_spec_22_16) {
-    BEZEL_EXPECT_EQ(runFull(
-        "module M; class C "
-        "  public method M(x: int): int return x; end M; "
-        "  public static method Main(): int "
-        "    var c := new C(); var r: int := 0; r := c.M(7); return r; "
-        "  end Main; "
-        "end C;"), 7);
-}

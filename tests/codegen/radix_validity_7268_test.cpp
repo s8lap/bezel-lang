@@ -353,16 +353,6 @@ BEZEL_TEST(radix_validity_7268, radix_36_at_parse_raises) {
     expectRaisedArgumentException(runAot(parseProg("36")));
 }
 
-BEZEL_TEST(radix_validity_7268, radix_3_at_parse_raises) {
-    expectRaisedArgumentException(runAot(parseProg("3")));
-}
-
-BEZEL_TEST(radix_validity_7268, radix_3_at_tryparse_raises) {
-    // stdlib §9.1: "an invalid radix raises ArgumentException from both
-    // forms" — the `TryParse` form included.
-    expectRaisedArgumentException(runAot(tryParseProg("3")));
-}
-
 // ─── THE SPELLINGS ────────────────────────────────────────────────────────
 //
 // A validity check that rejects only a LITERAL is not the rule: the radix

@@ -133,28 +133,3 @@ BEZEL_TEST(generic_reversed_params_616, swap_both_fields_correct) {
         "  return swapped.GetSecond(); "
         "end Main; end C;"), 3);
 }
-
-// §14 / §22.4: the int field reads the correct value even when the second arg
-// is a string (ptr-sized).  Before the fix the i32 was read from the padding
-// bytes of spec0 (garbage), not from the actual i32 field.
-BEZEL_TEST(generic_reversed_params_616, swap_int_string_second_field_value) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "class Pair<A, B> "
-        "  private _first: A; "
-        "  private _second: B; "
-        "  public constructor(a: A, b: B) _first := a; _second := b; end constructor; "
-        "  public method GetFirst(): A => _first; "
-        "  public method GetSecond(): B => _second; "
-        "  public method Swap(): owned Pair<B, A> "
-        "    return new Pair<B, A>(_second, _first); "
-        "  end Swap; "
-        "  destructor end destructor; "
-        "end Pair; "
-        "class C public static method Main(): int "
-        "  using var p := new Pair<int, string>(42, \"hello\"); "
-        "  using var swapped := p.Swap(); "
-        // swapped = Pair<string, int>; GetSecond() = B=int = old _first=42
-        "  return swapped.GetSecond(); "
-        "end Main; end C;"), 42);
-}

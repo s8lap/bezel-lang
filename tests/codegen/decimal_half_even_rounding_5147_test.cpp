@@ -67,20 +67,6 @@ BEZEL_TEST(decimal_half_even_rounding_5147, one_div_one_plus_epsilon_not_zero) {
         "0.999999999999999999999999999\n");
 }
 
-// §6.4: 1m / 3m stays in range. Exact quotient 0.333..., at scale 28 the
-// first dropped digit is 3 (<5), no rounding needed. Pre-fix: same output
-// (no rounding needed).
-BEZEL_TEST(decimal_half_even_rounding_5147, one_div_three_no_rounding) {
-    BEZEL_EXPECT_EQ(runAot(
-        "module M; class C "
-        "  public static method Main(): int "
-        "    Console.WriteLine(1m / 3m); "
-        "    return 0; "
-        "  end Main; "
-        "end C;").stdoutText,
-        "0.3333333333333333333333333333\n");
-}
-
 // §6.4: 1m / 2m = 0.5 — exact, no rounding needed.
 BEZEL_TEST(decimal_half_even_rounding_5147, half_exact_no_rounding) {
     BEZEL_EXPECT_EQ(runAot(

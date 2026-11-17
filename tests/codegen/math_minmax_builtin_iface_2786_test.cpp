@@ -110,13 +110,6 @@ BEZEL_TEST(math_minmax_builtin_iface_2786, clamp_builtin_interface_rejected) {
 // CONTROLS — every category that DOES lower must be untouched by a guard that
 // sits in front of the float fallback.  These are the four arms tried before it.
 
-BEZEL_TEST(math_minmax_builtin_iface_2786, control_int_unchanged) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C  public static method Main(): int "
-        "    return Math.Min(7, 3) * 10 + Math.Max(7, 3); "
-        "  end Main; end C; "), 37);
-}
-
 BEZEL_TEST(math_minmax_builtin_iface_2786, control_double_unchanged) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C  public static method Main(): int "

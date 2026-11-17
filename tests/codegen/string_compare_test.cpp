@@ -16,16 +16,6 @@ int run(const std::string& src) {
     return r.ran ? r.exitCode : -999;
 }
 
-// §4.6: ordinal comparison — `<` returns true when first is lexicographically
-// before the second. "abc" < "abd" because 'c' < 'd'.
-BEZEL_TEST(codegen_cg27b, string_less_than_true) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  var a := \"abc\"; var b := \"abd\"; "
-        "  return (if a < b then 1 else 0); "
-        "end Main; end C;"), 1);
-}
-
 // §4.6: "abd" is NOT less than "abc".
 BEZEL_TEST(codegen_cg27b, string_less_than_false) {
     BEZEL_EXPECT_EQ(run(

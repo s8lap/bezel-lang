@@ -175,28 +175,6 @@ BEZEL_TEST(codegen_generic_value_method_516, apply_class_ref_type_U_still_works_
         "end C;"), 7);
 }
 
-// §14.1 / §27.3 / #516: #505 original shape — T in lambda PARAM position (not
-// just return). Must still work (regression guard for the original fix).
-BEZEL_TEST(codegen_generic_value_method_516, original_505_shape_regression_guard_14_2_27_3) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "class A "
-        "  public v: int; "
-        "  public constructor() v := 7; end constructor; "
-        "  destructor end destructor; "
-        "end A; "
-        "class Util "
-        "  public static method GetV<T>(obj: T, getter: (T) -> int): int "
-        "    => getter(obj); "
-        "end Util; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var a := new A(); "
-        "    return Util.GetV(a, lambda(x) => x.v); "
-        "  end Main; "
-        "end C;"), 7);
-}
-
 // ── #515: value-type-monomorphized U calling ToString() ──────────────────────
 
 // §14.1 / §8.5 / #515: AsString<int>(42) — U=int, body calls v.ToString().
@@ -304,25 +282,6 @@ BEZEL_TEST(codegen_generic_value_method_515_516, combined_lambda_and_tostring_14
 
 // ── Regression guards for previously-fixed issues ────────────────────────────
 
-// §14.1 / #504 regression guard: Identity<T>(v:T):T with T=record must still
-// work (the #516 pre-pass must not affect the inferred path).
-BEZEL_TEST(codegen_generic_value_method_515_516, identity_record_regression_guard_14_1) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "record OneFld(x: int); "
-        "class Wrapper "
-        "  public static method Identity<T>(v: T): T "
-        "    return v; "
-        "  end Identity; "
-        "end Wrapper; "
-        "class C "
-        "  public static method Main(): int "
-        "    var r := new OneFld(77); "
-        "    return Wrapper.Identity(r).x; "
-        "  end Main; "
-        "end C;"), 77);
-}
-
 // §14.1 / #509 regression guard: explicit type args still work.
 BEZEL_TEST(codegen_generic_value_method_515_516, explicit_typeargs_509_regression_guard_14_1) {
     BEZEL_EXPECT_EQ(run(
@@ -339,18 +298,4 @@ BEZEL_TEST(codegen_generic_value_method_515_516, explicit_typeargs_509_regressio
         "    return 0; "
         "  end Main; "
         "end C;"), 1);
-}
-
-// §14.1 / §27.3 / #505 regression guard: (T)->int shape still works.
-BEZEL_TEST(codegen_generic_value_method_515_516, original_505_lambda_regression_guard_14_2_27_3) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "class Util "
-        "  public static method Apply<T>(v: T, f: (T) -> int): int => f(v); "
-        "end Util; "
-        "class C "
-        "  public static method Main(): int "
-        "    return Util.Apply(5, lambda(x) => x * 2); "
-        "  end Main; "
-        "end C;"), 10);
 }

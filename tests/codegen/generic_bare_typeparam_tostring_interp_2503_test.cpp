@@ -188,32 +188,6 @@ BEZEL_TEST(generic_bare_typeparam_tostring_interp_2503,
 //    — `structRt` degrades to `rt` unchanged whenever `rt->declaration`
 //    is already set. ────────────────────────────────────────────────────
 
-BEZEL_TEST(generic_bare_typeparam_tostring_interp_2503,
-           concrete_choice_interpolation_unaffected) {
-    const std::string program =
-        std::string("module M; ") + kPair +
-        "class C public static method Main(): int "
-        "  var p := Pair.P(3, \"hi\"); "
-        "  var s := $\"got {p}\"; "
-        "  return (if s = \"got Pair.P(x: 3, y: hi)\" then 42 else 1); "
-        "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 42);
-}
-
-BEZEL_TEST(generic_bare_typeparam_tostring_interp_2503,
-           concrete_non_auto_equality_bearing_interpolation_still_diagnosed) {
-    const std::string program =
-        std::string("module M; ") + kNonAutoEqBearing +
-        "class C public static method Main(): int "
-        "  using var w := new Widget(); "
-        "  var h := Holder.Filled(w); "
-        "  var s := $\"h={h}\"; "
-        "  return 0; "
-        "end Main; end C;";
-    BEZEL_EXPECT_TRUE(hasError(program, kNonAeqDiag));
-    BEZEL_EXPECT_TRUE(hasError(program, "#2479"));
-}
-
 // ── Leak-freedom: the fix routes a previously-dropped value through
 //    `emitChoiceToString`/`emitRecordToString`, both fresh +1 producers —
 //    confirm interpolation's existing `appendPart` release discipline

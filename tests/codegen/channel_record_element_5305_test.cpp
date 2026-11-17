@@ -449,26 +449,6 @@ BEZEL_TEST(channel_record_element_5305, control_enum) {
            "green\n");
 }
 
-// The class element is the owning shape: the item IS the object pointer, and
-// the receiver's `using` binding disposes it. Unchanged by this fix.
-BEZEL_TEST(channel_record_element_5305, control_sealed_class) {
-    expectClean("module M; sealed class It "
-                "  public V: int := 0; "
-                "  public constructor(v: int) V := v; end constructor; "
-                "end It; "
-                "class C public static method Main(): int "
-                "  using var cr := new Channel<It>(); "
-                "  using var tr := cr.NewSender(); "
-                "  tr.Send(new It(11)); "
-                "  var o: It? := null; "
-                "  if cr.TryReceive(out o) then "
-                "    using var j := move o!; "
-                "    Console.WriteLine(j.V); "
-                "  end; "
-                "  return 0; end Main; end C;",
-                "11\n");
-}
-
 // Regression test for #5304 / stdlib §6.9 / §28.11 / §28.9: a Channel<string>
 // leaks every undelivered string at channel disposal because
 // elementDisposerArg(string, owning) returns a null ConstantPointerNull

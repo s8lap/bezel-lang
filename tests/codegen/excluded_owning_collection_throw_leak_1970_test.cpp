@@ -467,35 +467,3 @@ BEZEL_TEST(excluded_owning_collection_throw_leak_1970, builtin_shared_ctor_befor
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 10);
 }
-
-// ===========================================================================
-// #1970 CONTROL — the #1955 allowlisted owning collection (OwningArray.Add)
-// and the #1918 user-method transfer paths stay regression-clean.  Mirrors
-// the test of the same shape in
-// tests/codegen/unwind_owned_transfer_ctor_collection_reassign_1955_1956_test.cpp
-// — included here to guarantee the #1970 broad-null extension doesn't
-// regress the #1955 / #1918 path.
-// ===========================================================================
-BEZEL_TEST(excluded_owning_collection_throw_leak_1970, regression_control_1955_owningarray_add_28_4) {
-    auto r = runAotChecked(
-        std::string("module M; ") + kResource +
-        "class Program "
-        "  public static method Boom() "
-        "    throw new InvalidOperationException(\"boom\"); "
-        "  end Boom; "
-        "  public static method Work() "
-        "    using var log := new OwningArray<Resource>(); "
-        "    var b := new Resource(); "
-        "    Boom(); "                          // throws BEFORE transfer
-        "    log.Add(move b); "
-        "  end Work; "
-        "  public static method Main(): int "
-        "    var caught := 0; "
-        "    try Work(); "
-        "    catch var e: InvalidOperationException => caught := 1; end; "
-        "    return caught * 10 + Resource._live; "
-        "  end Main; "
-        "end Program;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 10);
-}

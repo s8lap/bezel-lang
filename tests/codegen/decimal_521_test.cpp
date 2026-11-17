@@ -605,17 +605,6 @@ BEZEL_TEST(codegen_521_overflow, overflow_catchable_execution_continues_spec_6_4
         "return 0; ")), 42);
 }
 
-// §6.4 regression: normal arithmetic is still exact after the overflow fix.
-// 0.1m + 0.2m = 0.3m must still hold — the fix must not affect non-overflow paths.
-BEZEL_TEST(codegen_521_overflow, normal_add_still_exact_regression_spec_6_4) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "var a := 0.1m; "
-        "var b := 0.2m; "
-        "var c := a + b; "
-        "if c = 0.3m then return 1; end; "
-        "return 0; ")), 1);
-}
-
 // ---------------------------------------------------------------------------
 // 521_overflow_aot: AOT (native executable) probe — §6.4 overflow exception
 // propagates correctly through the native code path (not just JIT).

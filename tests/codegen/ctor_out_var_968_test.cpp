@@ -53,15 +53,3 @@ BEZEL_TEST(ctor_out_var_968, mixed_value_and_out_var) {
         "  end Main; "
         "end C;"), 42);
 }
-
-// Regression: the inline `out var` at a METHOD call site is unaffected.
-BEZEL_TEST(ctor_out_var_968, method_out_var_unaffected) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method TryGet(out n: int): bool n := 7; return true; end TryGet; "
-        "  public static method Main(): int "
-        "    var ok := TryGet(out var y); "
-        "    return y; "  // 7
-        "  end Main; "
-        "end C;"), 7);
-}

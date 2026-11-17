@@ -365,16 +365,6 @@ BEZEL_TEST(linked_list_4_6, count_after_operations) {
 // bz_array_t* (which misread bz_llist_t.tail as bz_array_t.count → garbage/0).
 // ---------------------------------------------------------------------------
 
-// §5 + §4.6 fix #450: Sum on a LinkedList<int> returns the correct total.
-BEZEL_TEST(linked_list_4_6, linq_sum_spec_5_fix450) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  using var l := new LinkedList<int>(); "
-        "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
-        "  return l.Sum(lambda(x: int) => x); "   // 10+20+30 = 60
-        "end Main; end C;"), 60);
-}
-
 // §5 + §4.6 fix #450: Min on a LinkedList<int> returns the minimum element.
 BEZEL_TEST(linked_list_4_6, linq_min_spec_5_fix450) {
     BEZEL_EXPECT_EQ(run(

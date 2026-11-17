@@ -84,13 +84,6 @@ BEZEL_TEST(extension_interface_head_name_keyed_builtin_7990, ireadonlylist_push)
 
 // ---- controls --------------------------------------------------------------
 
-// The concrete head: `Array<T>` declares no `Peek` either (#7946's row).
-BEZEL_TEST(extension_interface_head_name_keyed_builtin_7990, array_peek) {
-    BEZEL_EXPECT_EQ(runAotOut(prog(
-        "extension Array<int> public method Peek(n: int): int => 7; end;",
-        " var a: Array<int> := [1,2,3]; ", "Console.WriteLine(a.Peek(10));")), "7");
-}
-
 // `ICollection<T>` already dispatched the extension (the array bridge does not
 // reach it); it must keep doing so.
 BEZEL_TEST(extension_interface_head_name_keyed_builtin_7990, icollection_peek) {

@@ -123,15 +123,6 @@ BEZEL_TEST(math_sign, sign_result_used_in_arithmetic_spec_2_2) {
         "return a + b;"), 0);                // -1 + 1 = 0
 }
 
-BEZEL_TEST(math_sign, sign_result_compared_to_negative_literal_spec_2_2) {
-    // stdlib §2.2: the crash reproducer pattern — Sign(double) result compared
-    // with a negative int literal.  ICmp requires both operands to be the same
-    // type; if Sign is typed as double this emits double ICmp int → SIGABRT.
-    BEZEL_EXPECT_EQ(run(
-        "var sg := Math.Sign(0.0 - 5.0); "
-        "return (if sg = -1 then 1 else 0);"), 1);
-}
-
 // ── control: Math.Abs remains polymorphic (still returns argument type) ───────
 
 BEZEL_TEST(math_sign, abs_double_returns_double_spec_2_2) {

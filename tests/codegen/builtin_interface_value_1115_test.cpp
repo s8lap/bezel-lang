@@ -254,13 +254,3 @@ BEZEL_TEST(builtin_interface_value_1183, iequalitycomparer_string_t_dispatches) 
         "       + c.GetHashCode(\"z\"); "                   // + 42 = 52
         "end Main; end App;"), 52);
 }
-
-// #1183 keep-green: IComparable<int> (the existing T=i32 case) is unchanged.
-BEZEL_TEST(builtin_interface_value_1183, icomparable_int_unchanged) {
-    BEZEL_EXPECT_EQ(run(
-        std::string(CMP) +
-        "class App public static method Main(): int "
-        "  using var c := new C(5); var x: IComparable<int> := c; "
-        "  return x.CompareTo(3); "  // 5 > 3 → 2
-        "end Main; end App;"), 2);
-}

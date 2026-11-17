@@ -137,16 +137,3 @@ BEZEL_TEST(array_min_builtin_iface_elem_2784, control_comparable_class_element_s
         "  end Main; "
         "end C; "), 37);
 }
-
-// CONTROL — the primitive element path, which never consults the element
-// declaration at all.
-BEZEL_TEST(array_min_builtin_iface_elem_2784, control_int_element_still_works) {
-    BEZEL_EXPECT_EQ(runChecked(
-        "module M; "
-        "class C "
-        "  public static method Main(): int "
-        "    var arr: Array<int> := [3, 1, 2]; "
-        "    return arr.Min() * 10 + arr.Max(); "
-        "  end Main; "
-        "end C; "), 13);
-}

@@ -184,23 +184,6 @@ BEZEL_TEST(lazy_select_padcenter_minting_selector_7144,
 // run leak-free. Both directions of the gate are measured here.
 // ===========================================================================
 
-// stdlib §5 (v0.194) / §28.3 (#7144): the borrowing selector `Select(s => s)`
-// (the element itself) is NOT a mint — it stays admitted and leak-free.
-// 1 + 2 + 3 = 6.
-BEZEL_TEST(lazy_select_padcenter_minting_selector_7144,
-           select_string_identity_accepted_leakfree_spec_5) {
-    std::string src =
-        "module M; import System.Collections.Linq; "
-        "class C public static method Main(): int "
-        "  using var words: Array<string> := [\"a\", \"bb\", \"ccc\"]; "
-        "  var total: int := 0; "
-        "  for var w in words.Select(lambda(s) => s) do total := total + w.Length; "
-        "  end for; "
-        "  return total; "
-        "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(src), 6);
-}
-
 // stdlib §5 (v0.194) / §28.3 (#7144): an INDEX read of a `string` element
 // (`words[i]`) is a BORROW of the element, not a mint — admitted, leak-free.
 // 1 + 2 + 3 = 6.

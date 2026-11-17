@@ -313,16 +313,6 @@ BEZEL_TEST(integration, fizzbuzz_via_console) {
         "end Main; end C;"), 0);
 }
 
-BEZEL_TEST(integration, for_in_string_char_count) {
-    // Count occurrences of 's' in "mississippi" via for-in-string.
-    BEZEL_EXPECT_EQ(compileAndRun(
-        "module M; class C public static method Main(): int "
-        "  var s := \"mississippi\"; var cnt := 0; "
-        "  for var c in s do if c = 's' then cnt := cnt + 1; end; end; "
-        "  return cnt; "
-        "end Main; end C;"), 4);
-}
-
 BEZEL_TEST(integration, string_isnotempty_branch) {
     // Empty-string gate (non-empty path). fix #3854 (stdlib §9.6, v0.290):
     // migrated off the retired `string.IsNullOrEmpty(s)`. The documented

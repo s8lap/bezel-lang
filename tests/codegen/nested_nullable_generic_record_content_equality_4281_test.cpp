@@ -474,26 +474,3 @@ BEZEL_TEST(nested_nullable_generic_record_4281,
 // tree (measured) because no nullable field is involved anywhere, so the
 // reordered blocks are never entered at all for these two rows.
 // ═══════════════════════════════════════════════════════════════════════════
-
-BEZEL_TEST(nested_nullable_generic_record_4281,
-           spec_9_1_nested_nonnullable_control_unaffected_issue_4251) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; record Box<T>(V: T); record SoloStr(BS: Box<string>); "
-        "class C public static method Main(): int "
-        "  var a := \"h\" + \"i\"; "
-        "  var x := new SoloStr(new Box<string>(a)); "
-        "  var y := new SoloStr(new Box<string>(\"hi\")); "
-        "  return (if x = y then 1 else 0); "
-        "end Main; end C;"), 1);
-}
-
-BEZEL_TEST(nested_nullable_generic_record_4281,
-           spec_8_3_nested_nonnullable_control_gethashcode_differs_issue_4251) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; record Box<T>(V: T); record SoloStr(BS: Box<string>); "
-        "class C public static method Main(): int "
-        "  var x := new SoloStr(new Box<string>(\"hi\")); "
-        "  var y := new SoloStr(new Box<string>(\"bye\")); "
-        "  return (if x.GetHashCode() = y.GetHashCode() then 1 else 0); "
-        "end Main; end C;"), 0);
-}

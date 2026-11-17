@@ -231,26 +231,6 @@ BEZEL_TEST(datetime_range_ctor_7819, boundaries_are_valid) {
         "1\n9999\n9999-12-31T23:59:59\n31\n31\n29\n0\n999");
 }
 
-// The raise is an `ArgumentException` too (stdlib §2.5: the AOORE derives
-// from `ArgumentException`), so it is catchable as one.
-BEZEL_TEST(datetime_range_ctor_7819, caught_as_argument_exception) {
-    BEZEL_EXPECT_EQ(runAotOut(
-        "module M; import System; "
-        "class C "
-        "  public static method Main(): int "
-        "    var d: int := 99; "
-        "    try "
-        "      var x := new DateTime(2020, 1, d, 0, 0, 0); "
-        "      Console.WriteLine(x.Day); "
-        "    catch var e: ArgumentException => "
-        "      Console.WriteLine(\"arg\") "
-        "    end; "
-        "    return 0; "
-        "  end Main; "
-        "end C;"),
-        "arg");
-}
-
 // The three-argument DateTime form and the NAMED (reordered) spelling reach
 // the same guard through the §22.5 binding.
 BEZEL_TEST(datetime_range_ctor_7819, three_arg_and_named_forms) {

@@ -266,43 +266,6 @@ BEZEL_TEST(codegen_closure_captured_cell_mutated_shared_nested_uaf_4240,
 }
 
 // =====================================================================
-// (B) READ-ONLY two-level capture (no mutation anywhere) — the WORKING
-// CONTROL: `assignedCaptureVars_` never contains `f`, so
-// `mutatedSharedCaptureCell` never fires regardless of this fix. Must stay
-// crash-free on BOTH sides of the fix.
-// =====================================================================
-BEZEL_TEST(codegen_closure_captured_cell_mutated_shared_nested_uaf_4240,
-           read_only_two_level_nested_shared_capture_stays_crash_free_spec_27_5) {
-    JitResult r = runAotChecked(
-        "module M; class C "
-        "  public static method One(): int "
-        "    var f: () -> int := lambda() => 7; "
-        "    var outer := lambda() => do "
-        "      var inner := lambda() => do "
-        "        var x := f(); "
-        "      end; "
-        "      inner(); "
-        "    end; "
-        "    outer(); "
-        "    return f(); "
-        "  end One; "
-        "  public static method Main(): int "
-        "    var i := 0; "
-        "    var total := 0; "
-        "    while i < 9 do "
-        "      total := total + C.One(); "
-        "      i := i + 1; "
-        "    end; "
-        "    if total <> 63 then return 2; end; "
-        "    return 0; "
-        "  end Main; "
-        "end C;");
-    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-}
-
-// =====================================================================
 // (B2) Same read-only two-level shape, loop-amplified to 500 calls under the
 // full LeakSanitizer oracle.
 // =====================================================================

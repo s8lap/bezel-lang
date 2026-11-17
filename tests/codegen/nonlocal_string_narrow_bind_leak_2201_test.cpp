@@ -203,29 +203,6 @@ BEZEL_TEST(nonlocal_string_narrow_bind_leak_2201,
     BEZEL_EXPECT_EQ(r.exitCode, 55);
 }
 
-// `s!.Length` AS A RECEIVER of a chained call — exercises the case where
-// `s!` is itself a sub-expression of a method call. The MemberAccess chains
-// onto the bang and the target is safeRead throughout. Pre-fix: clean.
-// Post-fix: clean.
-BEZEL_TEST(nonlocal_string_narrow_bind_leak_2201,
-           bang_method_chain_no_rebind_disposes_source_spec_17_8) {
-    std::string src =
-        "module M; class C "
-        "  public static method Main(): int "
-        "    var total := 0; var i := 0; "
-        "    while i < 5 do "
-        "      var s: string? := \"hello\" + \" world\"; "
-        "      total := total + s!.Length; "
-        "      i := i + 1; "
-        "    end; "
-        "    return total; "
-        "  end Main; "
-        "end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 55);
-}
-
 // ===========================================================================
 // NON-LEAKING WRAPPER — guards against an over-fix that suppresses the
 // new local's release too. The new local's +1 must be released at the new

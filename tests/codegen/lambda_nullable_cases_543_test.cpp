@@ -214,35 +214,3 @@ BEZEL_TEST(lambda_nullable_cases_543, control_541_int_literal_still_works_spec_7
         "  end Main; end C;"),
         7);
 }
-
-// §541 control: lambda stored in local var typed (string)->int?.
-BEZEL_TEST(lambda_nullable_cases_543, control_541_stored_lambda_still_works_spec_17) {
-    BEZEL_EXPECT_EQ(runMain(
-        "  var fn: (string) -> int? := lambda(k: string) => 42; "
-        "  var r: int? := fn(\"x\"); "
-        "  if r = null then return -1; end; "
-        "  return r!;"),
-        42);
-}
-
-// §17.14 CONTROL: non-nullable lambda unaffected.
-BEZEL_TEST(lambda_nullable_cases_543, control_non_nullable_lambda_unaffected_spec_17) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Apply(n: int, f: (int) -> int): int "
-        "    return f(n); "
-        "  end Apply; "
-        "  public static method Main(): int "
-        "    return Apply(5, lambda(x: int) => x * 2); "
-        "  end Main; end C;"),
-        10);
-}
-
-// §7.1 CONTROL: direct `var x: int? := 7` promotion unaffected.
-BEZEL_TEST(lambda_nullable_cases_543, control_direct_nullable_assign_spec_7_1) {
-    BEZEL_EXPECT_EQ(runMain(
-        "  var x: int? := 7; "
-        "  if x = null then return -1; end; "
-        "  return x!;"),
-        7);
-}

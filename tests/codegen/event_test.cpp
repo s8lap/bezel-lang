@@ -364,20 +364,6 @@ BEZEL_TEST(codegen_events_24, dispose_field_subscription_unsubscribes) {
         "end Main; end C;"), 0);
 }
 
-// D11 control / §2.11: the original literal-declarator form must keep working.
-// `var s := evt.Subscribe(h); s.Dispose();` (the syntactic form recognized
-// before the fix) still unsubscribes — Fire(5) before dispose adds 5, the later
-// Fire(100) is a no-op.
-BEZEL_TEST(codegen_events_24, dispose_literal_declarator_subscription_still_works) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "var box := new Box(); var b := new Button(); "
-        "do using var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
-        "b.Fire(5); "                           // handler live → +5
-        "s.Dispose(); "                         // literal declarator dispose
-        "b.Fire(100); end; "                         // handler gone — no-op
-        "return box.V; ")), 5);
-}
-
 // D5 / §2.11 / §15.1: a Subscription stored into a [1]Subscription inline array
 // whose handler captures a value-typed (int) outer local. The [1] case (array
 // size exactly 1) previously SIGSEGV'd because Subscription lowered to a

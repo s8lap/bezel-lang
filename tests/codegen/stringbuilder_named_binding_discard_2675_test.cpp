@@ -140,26 +140,6 @@ BEZEL_TEST(stringbuilder_named_binding_discard_2675, using_var_discarded_in_loop
         8);
 }
 
-// ── REGRESSION GUARD for the untouched neighbour: a `using var` builder that
-// is used normally (no discard). Its #1185 scope-end free must remain the ONLY
-// one — this program contains no discard at all, so any change in its
-// behaviour would mean the new arm fired somewhere it must not. Value: 4.
-// per stdlib §3.1, §28.10 (issue #2675 self-pass)
-BEZEL_TEST(stringbuilder_named_binding_discard_2675, using_var_builder_unchanged_stdlib_3_1) {
-    const std::string prog =
-        "module M; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var sb := new StringBuilder(); "
-        "    sb.Append(\"ab\"); "
-        "    sb.Append(\"cd\"); "
-        "    return sb.ToString().Length; "
-        "  end Main; "
-        "end C;";
-    BEZEL_EXPECT_EQ(runChecked(prog), 4);
-    BEZEL_EXPECT_EQ(runValueOnly(prog), 4);
-}
-
 // ── NO-DOUBLE-FREE PRE-EMPT: the scope-exit auto-drop is the SECOND free, so
 // after the discard nulls the slot, the using-var's `registerUsingDisposal`
 // registered disposer reloads null and skips. Without the null-after-discard

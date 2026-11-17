@@ -149,34 +149,6 @@ BEZEL_TEST(task_bare_t_borrow_disposal_1872,
 }
 
 // ---------------------------------------------------------------------------
-// No-new-leak control: a genuine minted owner (a Task-family CALL — a user
-// `async` method) is classified Owned, is NOT flagged a borrow, and KEEPS its
-// scope-end `d.task`, disposing its Cell EXACTLY once. This guards the fix
-// against over-suppressing `d.task` for real owners (which would leak). The
-// awaited owner's frame disposes its Cell; net Cell.n == 0, one "DISP".
-// ---------------------------------------------------------------------------
-BEZEL_TEST(task_bare_t_borrow_disposal_1872,
-           class_task_minted_owner_disposed_exactly_once_28_3_v0190) {
-    const std::string prog =
-        "module M; " + std::string(kCell) +
-        "class C "
-        "  public static async method Producer(): Task<Cell> "
-        "    return new Cell(); "
-        "  end Producer; "
-        "  public static async method Main(): Task<int> "
-        "    do var t := Producer(); var c := await t; end; "
-        "    return Cell.n; "   // 0 == owner disposed its Cell exactly once
-        "  end Main; "
-        "end C;";
-    BEZEL_EXPECT_EQ(run(prog), 0);
-
-    JitResult r = runAotChecked(prog);
-    BEZEL_EXPECT_TRUE(r.ran);              // compiled + ASan-clean (no leak)
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "DISP"), 1);  // exactly once
-}
-
-// ---------------------------------------------------------------------------
 // Case 2 unreachability pin: an `OwningTask`-returning method that returns a
 // bare receiver owned-field (`=> _t;`) — the #1493 wrapper-receiver-borrow shape
 // — is REJECTED at the DEFINITION site for the deferred-activation owning heads

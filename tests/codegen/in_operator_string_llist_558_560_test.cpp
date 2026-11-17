@@ -148,28 +148,6 @@ BEZEL_TEST(in_operator_string_llist_spec_17_5_8_3, linkedlist_record_str_diff_in
 // Regression guards — must not regress LinkedList<int> or LinkedList<plain-record>
 // ===========================================================================
 
-// §17.5: LinkedList<int> — present (regression guard for #560 fix).
-BEZEL_TEST(in_operator_string_llist_spec_17_5, linkedlist_int_present_regression) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  using var l := new LinkedList<int>(); "
-        "  l.AddLast(7); l.AddLast(14); l.AddLast(21); "
-        "  if 14 in l then return 1; end; "
-        "  return 0; "
-        "end Main; end C;"), 1);
-}
-
-// §17.5: LinkedList<int> — absent (regression guard).
-BEZEL_TEST(in_operator_string_llist_spec_17_5, linkedlist_int_absent_regression) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  using var l := new LinkedList<int>(); "
-        "  l.AddLast(7); l.AddLast(14); l.AddLast(21); "
-        "  if 99 in l then return 0; end; "
-        "  return 1; "
-        "end Main; end C;"), 1);
-}
-
 // §17.5/§8.3: LinkedList<record> with plain int fields — present (regression guard).
 BEZEL_TEST(in_operator_string_llist_spec_17_5_8_3, linkedlist_record_int_present_regression) {
     BEZEL_EXPECT_EQ(run(

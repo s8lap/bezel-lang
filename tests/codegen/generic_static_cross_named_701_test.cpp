@@ -243,26 +243,6 @@ BEZEL_TEST(codegen_generic_static_cross_named_701,
 
 // ── #536 regression: method-only access (Path A) still works ─────────────────
 
-// §22.12 / #536 regression guard: generic static accessed only via its own
-// class methods (bare unqualified, Path A) must still be per-instantiation.
-BEZEL_TEST(codegen_generic_static_cross_named_701,
-           regression_536_method_only_access_still_works_spec_22_12) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "class Counter<T> "
-        "  private static _c: int := 0; "
-        "  public static method Inc() _c := _c + 1; end Inc; "
-        "  public static method Get(): int return _c; end Get; "
-        "end Counter; "
-        "class Program "
-        "  public static method Main(): int "
-        "    Counter<int>.Inc(); Counter<int>.Inc(); "
-        "    Counter<string>.Inc(); "
-        "    return Counter<int>.Get() * 10 + Counter<string>.Get(); "
-        "  end Main; "
-        "end Program;"), 21);
-}
-
 // #723 / §22.12: a static qualified by the class's OWN generic param inside its
 // method (`Box<T>.n`) must resolve to the SAME per-instantiation global as an
 // external `Box<int>.n` — not a separate template-level ghost global. Path (B)

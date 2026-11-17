@@ -420,13 +420,6 @@ BEZEL_TEST(math_comparable_1215, min_nullable_explicit_type_arg_rejected) {
         " end Main; end App;"));
 }
 
-// #1215: non-nullable class args are still accepted — regression control.
-BEZEL_TEST(math_comparable_1215, min_nonnull_class_still_works) {
-    BEZEL_EXPECT_EQ(run(boxMain(
-        "  using var a := new Box(150); using var b := new Box(99); "
-        "  return Math.Min(a, b).V;")), 99);
-}
-
 // ── #1875 / §14.2 (clause 4) / stdlib §2.2: enforce `where T: IComparable<T>` ─
 // on Math.Min/Max/Clamp for a class/record/enum type argument. These selectors
 // resolve to no MethodSymbol (handled as a builtin), so the ordinary

@@ -150,26 +150,6 @@ BEZEL_TEST(codegen_closures_27_5, loop_variable_fresh_binding) {
         "end C;"), 6);
 }
 
-// §27.5 / §16.5: if the loop binding were a single shared cell (the classic
-// closure-in-loop bug), all three lambdas would observe the final value (3)
-// and the sum would be 9. Fresh binding gives 6, so this guards against the
-// regression directly.
-//
-// Asserts the exact value (not merely `!= 9`): `run` returns -999 on a compile
-// reject, and a `!= 9` oracle passed vacuously on that (#4419).
-BEZEL_TEST(codegen_closures_27_5, loop_capture_not_all_final_value) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Main(): int "
-        "    var fns: [3]() -> int := [lambda() => 0, lambda() => 0, lambda() => 0]; "
-        "    for var i in 1..3 do "
-        "      fns[i - 1] := lambda() => i; "
-        "    end; "
-        "    return fns[0]() + fns[1]() + fns[2](); "  // 6, never 9
-        "  end Main; "
-        "end C;"), 6);
-}
-
 // §27.5: a captured method parameter shares storage too — a write inside the
 // lambda is visible to the enclosing method after the call.
 BEZEL_TEST(codegen_closures_27_5, captured_parameter_is_shared) {

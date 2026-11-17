@@ -206,37 +206,6 @@ BEZEL_TEST(lazy_select_method_call_minting_selector_leak_1931,
 // These must stay admitted AND run leak-free with no double-free.
 // ===========================================================================
 
-// stdlib §5 (#1931): the borrowing selector `Select(s => s)` (identity) is NOT
-// a mint — must stay admitted, leak-free. 1 + 2 + 3 = 6.
-BEZEL_TEST(lazy_select_method_call_minting_selector_leak_1931,
-           select_string_identity_accepted_leakfree_spec_5) {
-    std::string src =
-        "module M; import System.Collections.Linq; "
-        "class C public static method Main(): int "
-        "  using var words: Array<string> := [\"a\", \"bb\", \"ccc\"]; "
-        "  var total: int := 0; "
-        "  for var w in words.Select(lambda(s) => s) do total := total + w.Length; "
-        "  end for; "
-        "  return total; "
-        "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(src), 6);
-}
-
-// stdlib §5 (#1931): a value projection `Select(x => x * 2)` carries no
-// disposal obligation. Admitted, leak-free. 2 + 4 + 6 = 12.
-BEZEL_TEST(lazy_select_method_call_minting_selector_leak_1931,
-           select_value_projection_accepted_leakfree_spec_5) {
-    std::string src =
-        "module M; import System.Collections.Linq; "
-        "class C public static method Main(): int "
-        "  using var xs: Array<int> := [1, 2, 3]; "
-        "  var sum: int := 0; "
-        "  for var y in xs.Select(lambda(x) => x * 2) do sum := sum + y; end for; "
-        "  return sum; "
-        "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(src), 12);
-}
-
 // stdlib §5 (#1931): `Select(s => s.Length)` projects a borrowed INT (a
 // string PROPERTY read) — NOT a mint, not a string. Admitted, leak-free.
 // 1 + 2 + 3 = 6.

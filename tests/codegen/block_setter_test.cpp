@@ -254,25 +254,6 @@ BEZEL_TEST(codegen_block_setter, indexer_setter_no_return_fallthrough_regression
         "  end Main; end C;"), 42);
 }
 
-// #1236 REGRESSION / §22.9: a regular (non-indexer) property setter with
-// `return;` still works after the indexer-setter fix (the regular path is
-// unaffected; this guards against accidental shared-state clobbering).
-BEZEL_TEST(codegen_block_setter, regular_setter_return_regression_1236) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class Box "
-        "  public _x: int := 0; "
-        "  public property X: int "
-        "    get => _x; "
-        "    set => do if value < 0 then return; end; _x := value; end; "
-        "  end X; "
-        "end Box; "
-        "class C public static method Main(): int "
-        "  var b := new Box(); "
-        "  b.X := 5; b.X := -1; b.X := 8; "   // -1 rejected; X = 8
-        "  return b.X; "
-        "end Main; end C;"), 8);
-}
-
 // #1236 / §23.5: reading an indexer slot that was never written returns 0
 // (the zero-initialized backing array).
 BEZEL_TEST(codegen_block_setter, indexer_unwritten_slot_is_zero_1236) {

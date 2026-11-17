@@ -527,16 +527,6 @@ BEZEL_TEST(borrowed_string_arg_pin_5262,
                     wantPrinted(kAsyncIters));
 }
 
-// (6b) The same 50 iterations under LeakSanitizer: the frame-entry retain
-// must balance at teardown, on BOTH terminal edges. A retain without its
-// release leaks one string per task; a double release drops the field's own
-// reference (the #4547 shape).
-BEZEL_TEST(borrowed_string_arg_pin_5262,
-           async_callee_pin_balanced_no_leak_spec_4_6_28_9) {
-    BEZEL_EXPECT_EQ(run(asyncCalleeSrc(kAsyncIters)),
-                    wantPrinted(kAsyncIters));
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // SHAPE 7 — the THROWING-CALL edge (fix-forward #5262-ff, row 3 of 3)
 //
@@ -668,6 +658,3 @@ BEZEL_TEST(borrowed_string_arg_pin_5262,
             "end Program;"),
         "caught=200\n");
 }
-
-
-

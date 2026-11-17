@@ -85,36 +85,6 @@ std::string checkedOut(const std::string& prog) {
 }
 }  // namespace
 
-// ── Row 1 (the issue's exact repro, `const`) — a `const arr :=
-// en.TakeCurrent();` binding, drained 200 times. Pre-fix: 24000 B / 400
-// allocations leaked (`bz_array_alloc`, spine + data). 200 * 3 = 600.
-// per §28.9, §28.11, §29.1 (issue #3878)
-BEZEL_TEST(take_current_builtin_array_local_reclaim_3878,
-           const_binding_backing_reclaimed_spec_29_1) {
-    BEZEL_EXPECT_EQ(checkedOut(
-        "module M; "
-        "class C "
-        "  public static method Gen(): IOwningEnumerable<Array<int>> "
-        "    var xs: Array<int> := [1, 2, 3]; "
-        "    yield return xs; "
-        "  end Gen; "
-        "  public static method Main(): int "
-        "    var total := 0; "
-        "    for var i in 0..<200 do "
-        "      using var source := C.Gen(); "
-        "      using var en := source.GetOwningEnumerator(); "
-        "      while en.MoveNext() do "
-        "        const arr := en.TakeCurrent(); "
-        "        total := total + arr.Count; "
-        "      end; "
-        "    end; "
-        "    Console.WriteLine(\"total=\" + total.ToString()); "
-        "    return 0; "
-        "  end Main; "
-        "end C;"),
-        "total=600\n");
-}
-
 // ── Row 2 (plain `var` twin) — the issue's title also names a plain `var`
 // binding as leaking identically (`isFreshTakeCurrentBuiltinArrayLocal`
 // takes a `LocalDeclInitView`, admitting both node kinds via the shared

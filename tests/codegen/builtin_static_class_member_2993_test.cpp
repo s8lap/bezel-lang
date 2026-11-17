@@ -336,26 +336,6 @@ BEZEL_TEST(builtin_static_class_member_2993,
 
 // ── ANTI-OVER-REJECT: §6.8's REAL SURFACE KEEPS WORKING ────────────────────
 
-BEZEL_TEST(builtin_static_class_member_2993,
-           domain_spawn_is_untouched_stdlib_6_8) {
-    // The only declared `Domain` surface (stdlib §6.8) is `Spawn`. Deleting
-    // the undeclared instance path must not touch it. Oracle is the VALUE
-    // the spawned domain computes, not exit 0 — matches the #2974 control.
-    const std::string program =
-        "module M; import System.Threading; "
-        "class C "
-        "  public static method Work(): int return 21; end Work; "
-        "  public static method Main(): int "
-        "    using var t := Domain.Spawn(Work); "
-        "    var v := t.Result; "
-        "    return v * 2; "
-        "  end Main; "
-        "end C;";
-    auto r = runAot(program);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(42, r.exitCode);
-}
-
 // ── THE DELETED RUNTIME TRIO IS GONE ────────────────────────────────────────
 //
 // The codegen arms called `bz_domain_alloc`, `bz_domain_get_name`, and

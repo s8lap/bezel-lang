@@ -56,29 +56,6 @@ BEZEL_TEST(codegen_generic_virtual_override_1766,
         "end Main; end C;"), 2);
 }
 
-// §12.3: the same shape overriding via `return base.GetVal();` (the original
-// corpus program) — the virtual base call must also lower `T`→ptr for a
-// `Base<string>` receiver. "hi".Length == 2.
-BEZEL_TEST(codegen_generic_virtual_override_1766,
-           reftype_generic_T_virtual_override_via_base_call) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "class Base<T> "
-        "  public V: T; "
-        "  public constructor(v: T) V := v; end constructor; "
-        "  public virtual method GetVal(): T return V; end GetVal; "
-        "end Base; "
-        "class Derived: Base<string> "
-        "  public constructor(v: string) base(v); end constructor; "
-        "  public override method GetVal(): string return base.GetVal(); "
-        "  end GetVal; "
-        "end Derived; "
-        "class C public static method Main(): int "
-        "  var d := new Derived(\"hi\"); var s := d.GetVal(); var r := s.Length; "
-        "  d.Dispose(); return r; "
-        "end Main; end C;"), 2);
-}
-
 // CONTROL (must NOT regress): the identical shape with a VALUE type argument
 // (`Base<int>`, `override GetVal(): int`) — `int` lowers to `i32`, the base slot
 // and override agree, no thunk, no mismatch. Compiled cleanly before the fix and

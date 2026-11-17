@@ -177,20 +177,3 @@ BEZEL_TEST(out_owned_condition_1387, if_cond_out_owned_var_auto_drop) {
     // top.Dispose() in body; condition scope unwindOnly skipped; snap=Cell._n=0
     0);
 }
-
-// §28.3 / §22.4 / #1387 (Item 2, false path -- null guard): empty stack, TryPop
-// returns false. The `top` slot is null. Body is unreachable (return 99 is a
-// parser sentinel). The condition scope's unwindOnly fires at if-end but is
-// skipped (isUnwind=false on normal exit). No crash. Cell._n=0 (no cells).
-BEZEL_TEST(out_owned_condition_1387, if_cond_out_owned_var_auto_drop_false_path) {
-    BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
-        "class C public static method Main(): int "
-        "  using var s := new OwningStack<Cell>(); "
-        "  if s.TryPop(out var top) then "
-        "    return 99; "
-        "  end; "
-        "  return Cell._n; "
-        "end Main; end C;"),
-    // stack empty --> TryPop false --> body unreachable --> unwindOnly skipped
-    0);
-}

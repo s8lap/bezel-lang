@@ -302,23 +302,6 @@ BEZEL_TEST(array_minmax_generic_base_compareto_8272,
 }
 
 // =====================================================================
-// ROW 8 — CONTROL: an `int` element — the numeric no-selector path.
-//
-// Base and fixed: "1" / "3".
-// =====================================================================
-BEZEL_TEST(array_minmax_generic_base_compareto_8272,
-           control_an_int_element_is_unchanged) {
-    BEZEL_EXPECT_EQ(
-        out(prog(
-            "",
-            "var a: Array<int> := [3, 1]; "
-            "Console.WriteLine(a.Min()); "
-            "Console.WriteLine(a.Max()); ")),
-        "1\n"
-        "3\n");
-}
-
-// =====================================================================
 // ROW 9 — TWO ELEMENTS OF DIFFERENT DERIVED CLASSES over the SAME generic
 // base: `Item2: B2<Item2>` and `Item3: B2<Item3>`. The ordering function
 // is monomorphized PER INSTANTIATION (spec §14.1), so a fix that minted

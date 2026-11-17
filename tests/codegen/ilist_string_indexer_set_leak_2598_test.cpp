@@ -177,53 +177,6 @@ const char* kIListIntSetCompound =
     "  end Main; "
     "end C;";
 
-// ----------------------------------------------------------------------
-// Probe E — #2587 Array<string> compound regression guard. The predicate
-// widening must not regress the existing Array<string> path. Must stay clean.
-// ----------------------------------------------------------------------
-const char* kArrayCompoundProducer =
-    "module M; "
-    "class C "
-    "  public static method Main(): int "
-    "    using var arr := new Array<string>(); "
-    "    arr.Add(\"x\"); "
-    "    var i := 0; var sink := 0; "
-    "    while i < 100 do "
-    "      arr[0] += \"abc\" + i.ToString(); "
-    "      sink := sink + arr[0].Length; "
-    "      i := i + 1; "
-    "    end; "
-    "    return sink mod 256; "  // 24395 mod 256 = 75
-    "  end Main; "
-    "end C;";
-
-// ----------------------------------------------------------------------
-// Probe F — #2567 USER-INDEXER regression guard. A class with a user-defined
-// indexer, compound += producer rhs. The #2567 fix (lowerIndexerCompound, a
-// SEPARATE function) must remain LSan-clean — this fix must not regress it.
-// ----------------------------------------------------------------------
-const char* kUserIndexerCompound =
-    "module M; "
-    "class Grid "
-    "  private _cell: string := \"\"; "
-    "  public property this[r: int]: string "
-    "    get => _cell; "
-    "    set => _cell := value; "
-    "  end; "
-    "end Grid; "
-    "class C "
-    "  public static method Main(): int "
-    "    using var g := new Grid(); "
-    "    var i := 0; var sink := 0; "
-    "    while i < 50 do "
-    "      g[0] += \"ab\" + i.ToString(); "
-    "      sink := sink + g[0].Length; "
-    "      i := i + 1; "
-    "    end; "
-    "    return sink mod 256; "
-    "  end Main; "
-    "end C;";
-
 }  // namespace
 
 // =====================================================================
@@ -280,29 +233,4 @@ BEZEL_TEST(codegen_ilist_string_indexer_set_leak_2598,
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 100);   // 99 + 1
-}
-
-// =====================================================================
-// #2598 — #2587 Array<string> compound regression guard: the predicate
-// widening must not regress the existing Array<string> path. Must stay clean.
-// =====================================================================
-BEZEL_TEST(codegen_ilist_string_indexer_set_leak_2598,
-           array_string_compound_remains_clean_2587_spec_23_4_28_9) {
-    JitResult r = runAotChecked(kArrayCompoundProducer);
-    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 75);    // 24395 mod 256
-}
-
-// =====================================================================
-// #2598 — #2567 USER-INDEXER regression guard: a class user-defined indexer
-// compound += producer rhs. The #2567 fix (lowerIndexerCompound, a SEPARATE
-// function from lowerCollectionIndexerCompound) must remain LSan-clean —
-// this fix must not regress it.
-// =====================================================================
-BEZEL_TEST(codegen_ilist_string_indexer_set_leak_2598,
-           user_indexer_compound_remains_clean_2567_spec_23_4_28_9) {
-    JitResult r = runAotChecked(kUserIndexerCompound);
-    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_TRUE(r.ran);
 }

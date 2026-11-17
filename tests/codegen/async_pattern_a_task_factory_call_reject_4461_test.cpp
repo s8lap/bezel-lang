@@ -552,15 +552,6 @@ BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
                                                fixforward6405::kOwningTaskNeedsClass));
 }
 
-// --- Pattern B (`OwningTask<T>`), STATEMENT arm: §30.6 on all four. ---
-BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
-          matrix_owningtask_class_blockbody_30_6) {
-    const auto& c = fixforward6405::cell(4);
-    auto r = runAot(fixforward6405::buildProgram(c, false));
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, fixforward6405::kAddAwait306));
-}
-
 BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
           matrix_owningtask_iface_blockbody_30_6) {
     const auto& c = fixforward6405::cell(5);

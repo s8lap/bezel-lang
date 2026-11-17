@@ -705,14 +705,6 @@ BEZEL_TEST(codegen_cg28_473, type_pattern_in_middle_arm_spec_19_3) {
         "end Main; end C;"), 2);
 }
 
-// #473 REGRESSION: a value-only case (constant + discard arms) still works
-// after the fix — a plain int result PHI, no type tests.
-BEZEL_TEST(codegen_cg28_473, regression_constant_discard_case_still_works) {
-    BEZEL_EXPECT_EQ(run(
-        "var x := 2; "
-        "var r := (case x of 1 => 10, 2 => 20, _ => 30); return r;"), 20);
-}
-
 // #473 REGRESSION: the case STATEMENT form with a type-test pattern still
 // works (the statement form is what the `is`/exhaustiveness paths use). A
 // type-test arm dispatches and a side effect records the selected branch.

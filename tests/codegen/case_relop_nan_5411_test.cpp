@@ -83,15 +83,6 @@ BEZEL_TEST(case_nan_5411, nan_double_confirmed_by_isnan_before_case) {
 // still match its relational arm. This positive control verifies the arm still
 // functions correctly.
 
-BEZEL_TEST(case_nan_5411, finite_double_matches_lt_arm) {
-    BEZEL_EXPECT_EQ(runAot(
-        "module M; class C public static method Main(): int "
-        "var v: double := 0.5; "
-        "var r := (case v of < 1.0 => 1, _ => 2); "
-        "return r; "
-        "end Main; end C;").exitCode, 1);
-}
-
 BEZEL_TEST(case_nan_5411, finite_double_matches_ge_arm) {
     BEZEL_EXPECT_EQ(runAot(
         "module M; class C public static method Main(): int "

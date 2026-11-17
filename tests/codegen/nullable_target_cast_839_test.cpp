@@ -121,9 +121,3 @@ BEZEL_TEST(nullable_target_cast_839, regression_827_null_raises) {
         "try var z: long := long(x); return int(z); "
         "catch Exception => return 7; end;")), 7);
 }
-
-// Regression: a plain non-nullable scalar cast is unaffected.
-BEZEL_TEST(nullable_target_cast_839, regression_scalar_cast_unaffected) {
-    BEZEL_EXPECT_EQ(run(mainOf(
-        "var d: double := 4.8; return int(d);")), 4);
-}

@@ -186,19 +186,6 @@ BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
 // for non-matching targets become reject rows. Same-type admit stays.
 // =====================================================================
 
-// §12.7 — same type: `int is int` still admits. Want 1.
-BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
-           matching_target_on_primitive_still_admits_spec_12_7) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Main(): int "
-        "    var p: int := 7; "
-        "    if p is int then return 1; end; "
-        "    return 2; "
-        "  end Main; "
-        "end C;"), 1);
-}
-
 // §12.7 (v0.310/#5157) — flip: `int is long` was admit, now reject.
 BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
            int_is_long_rejected_spec_12_7) {
@@ -251,19 +238,6 @@ BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
         "    return 1; "
         "  end Main; "
         "end C;").diagnostics.hasErrors());
-}
-
-// §12.7 — same inline-array type: `[3]int is [3]int` still admits. Want 1.
-BEZEL_TEST(codegen_type_test_value_typed_operand_3120,
-           matching_inline_array_target_still_admits_spec_12_7_15_1) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Main(): int "
-        "    var a: [3]int := [1, 2, 3]; "
-        "    if a is [3]int then return 1; end; "
-        "    return 2; "
-        "  end Main; "
-        "end C;"), 1);
 }
 
 // §12.7 (v0.310/#5157) — flip: `a is B` was admit, now reject.

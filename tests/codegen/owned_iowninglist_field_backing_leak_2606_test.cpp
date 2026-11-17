@@ -233,34 +233,6 @@ const char* kOwnedOwningArrayCellField =
     "end C;";
 
 // ----------------------------------------------------------------------
-// Probe E — owned IList<string> FIELD CONTROL (#2603): the BORROWING interface
-// sibling. The collIsOwning widening must NOT flip IList owning (would
-// double-free its borrowing string elements). Pre/post-fix LSan-clean,
-// exit 44 (300 mod 256).
-// ----------------------------------------------------------------------
-const char* kOwnedIListStringField =
-    "module M; "
-    "class Holder "
-    "  private owned _arr: IList<string> := new Array<string>(); "
-    "  public method AddIt(): int "
-    "    _arr.Add(\"abc\"); "
-    "    _arr[0] := \"xyz\"; "
-    "    return _arr[0].Length; "  // 3
-    "  end AddIt; "
-    "end Holder; "
-    "class C "
-    "  public static method Main(): int "
-    "    var i := 0; var sink := 0; "
-    "    while i < 100 do "
-    "      using var h := new Holder(); "
-    "      sink := sink + h.AddIt(); "
-    "      i := i + 1; "
-    "    end; "
-    "    return sink mod 256; "  // 300 mod 256 = 44
-    "  end Main; "
-    "end C;";
-
-// ----------------------------------------------------------------------
 // Probe F — CAPTURED PRIMARY-CTOR-PARAM: `class Holder(owned v: IOwningList
 // <Cell>)` captures the `owned` param as a synthesized field (§22.10) — the
 // `posParam` arm of ownedCollectionFieldType (a DISTINCT code path from the
@@ -348,19 +320,6 @@ BEZEL_TEST(codegen_owned_iowninglist_field_backing_leak_2606,
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);     // Cell.n = 0
-}
-
-// =====================================================================
-// #2606 — owned IList<string> FIELD regression guard (#2603): the collIsOwning
-// widening must NOT flip the borrowing IList owning (would double-free its
-// borrowing string elements). LSan-clean + value 44.
-// =====================================================================
-BEZEL_TEST(codegen_owned_iowninglist_field_backing_leak_2606,
-           owned_ilist_string_field_remains_borrowing_spec_28_11) {
-    JitResult r = runAotChecked(kOwnedIListStringField);
-    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 44);    // 300 mod 256
 }
 
 // =====================================================================

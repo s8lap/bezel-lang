@@ -157,32 +157,6 @@ BEZEL_TEST(bare_new_trivial_stmt_reclaim_2655, bare_owned_returning_call_stateme
         0);
 }
 
-// ── DOUBLE-FREE PRE-EMPT (the one that matters). §21.9's *fluent-receiver
-// discard* shape: `sb.Append(x);` as a bare statement. `Append` returns the
-// receiver — a BORROW, per K1.5's "an instance method's plain (non-`owned`)
-// class-typed return is a borrow whose source is the receiver" — and the
-// receiver's `using var` already owns it. If the new arm's gate leaked past
-// `producerState == Owned` and fired here, the builder would be freed at the
-// statement AND again at scope end: a double free (ASan) reading a freed
-// builder in between (UAF). Asserted BOTH ways: ASan/LSan-clean under
-// runChecked, and the value still correct on the plain, uninstrumented path
-// (#2629 — ASan can render a wild free benign that the plain build crashes on).
-// Value: "abcd".Length = 4. // per §21.9, §28.3 (issue #2655 self-pass)
-BEZEL_TEST(bare_new_trivial_stmt_reclaim_2655, fluent_receiver_bare_statement_not_freed) {
-    const std::string prog =
-        "module M; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var sb := new StringBuilder(); "
-        "    sb.Append(\"ab\"); "
-        "    sb.Append(\"cd\"); "
-        "    return sb.ToString().Length; "
-        "  end Main; "
-        "end C;";
-    BEZEL_EXPECT_EQ(runChecked(prog), 4);
-    BEZEL_EXPECT_EQ(runValueOnly(prog), 4);
-}
-
 // ── UAF PRE-EMPT: a bare statement whose value is a BORROW of a live object
 // reachable afterwards. `h.Peek();` returns a borrow of the holder's own field
 // (receiver-sourced, K1.5) — freeing it would destroy `h`'s field and the

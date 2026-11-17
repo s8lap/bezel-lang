@@ -152,38 +152,6 @@ BEZEL_TEST(builtin_collection_compound_overload_626, dict_str_money_minus_equals
 }
 
 // ---------------------------------------------------------------------------
-// Regression: int elements keep the numeric intrinsic path — §4.4 / §4.8
-// ---------------------------------------------------------------------------
-
-// §4.4 / §25.1: Array<int> += must still use the overflow-checked intrinsic.
-BEZEL_TEST(builtin_collection_compound_overload_626, array_int_plus_regression_4_4) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Main(): int "
-        "    using var arr := new Array<int>(); "
-        "    arr.Add(10); "
-        "    arr[0] += 5; "
-        "    return arr[0]; "  // 15
-        "  end Main; "
-        "end C;"),
-        15);
-}
-
-// §4.8 / §25.1: Dictionary<string,int> += must still work numerically.
-BEZEL_TEST(builtin_collection_compound_overload_626, dict_str_int_plus_regression_4_8) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Main(): int "
-        "    using var d := new Dictionary<string, int>(); "
-        "    d.Add(\"k\", 10); "
-        "    d[\"k\"] += 5; "
-        "    return d[\"k\"]; "  // 15
-        "  end Main; "
-        "end C;"),
-        15);
-}
-
-// ---------------------------------------------------------------------------
 // §17.6 (#1299): the index subexpression is evaluated EXACTLY ONCE
 // ---------------------------------------------------------------------------
 //

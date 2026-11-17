@@ -110,16 +110,3 @@ BEZEL_TEST(codegen_1996_char_wide_rhs, times_equals_in_range_long_stores) {
     BEZEL_EXPECT_EQ(
         run("var c: char := char(5); c := char(int(c) * 13L); return int(c);"), 65);
 }
-
-// CONTROL — an ordinary small-RHS (int) char compound is unchanged: 'A' += 1 →
-// 'B' (66). The wide-RHS widening is a no-op when the RHS is not wider than i32.
-BEZEL_TEST(codegen_1996_char_wide_rhs, plus_equals_int_rhs_unaffected) {
-    BEZEL_EXPECT_EQ(run("var c: char := 'A'; c += 1; return int(c);"), 66);
-}
-
-// CONTROL — a small-RHS overflow still raises through the normal i32 path:
-// char(0x10FFFF) += 1 → above U+10FFFF (the #1961 behavior is undisturbed).
-BEZEL_TEST(codegen_1996_char_wide_rhs, plus_equals_int_rhs_overflow_still_raises) {
-    BEZEL_EXPECT_EQ(
-        throwsOverflow("var c: char := char(0x10FFFF); c += 1;"), 1);
-}

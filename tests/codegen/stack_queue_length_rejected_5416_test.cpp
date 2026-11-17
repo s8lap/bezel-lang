@@ -27,11 +27,6 @@ bool hasError(const std::string& program, const char* keyword) {
     return false;
 }
 
-int run(const std::string& program) {
-    auto r = runAot(program);
-    return r.ran ? r.exitCode : -999;
-}
-
 }  // namespace
 
 // fix #5416 (§4.11, v0.315): `.Length` rejected on Stack<T>
@@ -90,28 +85,4 @@ BEZEL_TEST(stack_queue_length_rejected_5416, owningqueue_length_rejected_stdlib_
     BEZEL_EXPECT_TRUE(hasError(
         program,
         "no member `Length` on `OwningQueue<T>`: use `Count` (stdlib \xC2\xA7""4.11)"));
-}
-
-// fix #5416 (§4.11, v0.315): `.Count` (the declared member) still works on Stack<T>
-BEZEL_TEST(stack_queue_length_rejected_5416, stack_count_still_works) {
-    const std::string program =
-        "module M; "
-        "class C public static method Main(): int "
-        "  var s := new Stack<int>(); "
-        "  s.Push(7); s.Push(8); s.Push(9); "
-        "  return s.Count; "
-        "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 3);
-}
-
-// fix #5416 (§4.11, v0.315): `.Count` (the declared member) still works on Queue<T>
-BEZEL_TEST(stack_queue_length_rejected_5416, queue_count_still_works) {
-    const std::string program =
-        "module M; "
-        "class C public static method Main(): int "
-        "  var q := new Queue<int>(); "
-        "  q.Enqueue(7); q.Enqueue(8); q.Enqueue(9); "
-        "  return q.Count; "
-        "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 3);
 }

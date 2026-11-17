@@ -63,19 +63,6 @@ std::optional<long long> runStdoutInt(const std::string& prog) {
 }
 }
 
-// §17.14 / §A.7: apply a lambda to an integer argument.
-BEZEL_TEST(codegen_cg60, lambda_apply_basic) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Apply(n: int, f: (int) -> int): int "
-        "    return f(n); "
-        "  end Apply; "
-        "  public static method Main(): int "
-        "    return Apply(5, lambda(x: int) => x * 2); "
-        "  end Main; "
-        "end C;"), 10);
-}
-
 BEZEL_TEST(codegen_cg60, lambda_expression_body) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "

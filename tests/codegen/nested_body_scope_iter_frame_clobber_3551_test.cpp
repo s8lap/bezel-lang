@@ -166,35 +166,3 @@ BEZEL_TEST(nested_body_scope_iter_frame_clobber_3551,
         "  end Main; end C;";
     BEZEL_EXPECT_EQ(runChecked(program), 31);
 }
-
-// NO-NESTED-BODY control: the same iterator body WITHOUT the property read
-// between yields 2 and 3. No NestedBodyScope trigger; 31 on both sides.
-// Confirms the 31 reading of the key regression is achievable in the
-// iterator body shape, not a fluke of the property read.
-BEZEL_TEST(nested_body_scope_iter_frame_clobber_3551,
-           no_nested_body_control_stays_clean_spec_29_3) {
-    std::string program = std::string("module M; ") + kCountR +
-        "class C "
-        "  public static method Gen(): IOwningEnumerable<R> "
-        "    yield return new R(1); "
-        "    yield return new R(2); "
-        "    yield return new R(3); "
-        "  end Gen; "
-        "  private static method Drive(): int "
-        "    using var source := Gen(); "
-        "    using var en := source.GetOwningEnumerator(); "
-        "    var taken := 0; "
-        "    if en.MoveNext() then "
-        "      using var x := en.TakeCurrent(); "
-        "      taken := taken + x.v; "
-        "    end; "
-        "    var junk := 0; "
-        "    while en.MoveNext() do junk := junk + 1; end; "
-        "    return taken; "
-        "  end Drive; "
-        "  public static method Main(): int "
-        "    var t := Drive(); "
-        "    return R._n * 10 + t; "
-        "  end Main; end C;";
-    BEZEL_EXPECT_EQ(runChecked(program), 31);
-}

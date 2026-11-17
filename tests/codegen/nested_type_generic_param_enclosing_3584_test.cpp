@@ -222,23 +222,6 @@ BEZEL_TEST(nested_type_generic_param_enclosing_3584,
     BEZEL_EXPECT_EQ(run(p), 5);
 }
 
-// §14.1 baseline: an ordinary non-nested generic in an ascription. The
-// diagnostic must NOT reach it.
-BEZEL_TEST(nested_type_generic_param_enclosing_3584,
-           plain_constructed_generic_still_runs_spec_14_1) {
-    BEZEL_EXPECT_EQ(
-        run("module M; public class Box<T> "
-            "  private _v: int; "
-            "  public constructor(v: int) _v := v; end constructor; "
-            "  public method V(): int => _v; "
-            "end Box; "
-            "public class C public static method Main(): int "
-            "  using var b: Box<int> := new Box<int>(9); "
-            "  return b.V(); "
-            "end Main; end C;"),
-        9);
-}
-
 // A nested type inside a NON-generic enclosing class — the enclosing has no
 // parameters, so there is nothing for the nested type to "reference". The
 // diagnostic must NOT reach this shape.

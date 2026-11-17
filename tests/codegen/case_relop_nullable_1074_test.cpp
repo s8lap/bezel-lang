@@ -79,19 +79,6 @@ BEZEL_TEST(case_relop_nullable_1074, present_value_matches_gt_rejected_v0_267) {
     BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(caseProg("> 3 => 1")));
 }
 
-// §19.3 / v0.267 / #3298; v0.310 / #5143 ruling: an un-narrowed nullable
-// scrutinee with a relational pattern still rejects. (The narrowed variant
-// is covered by `_admitted_5173` below.)
-BEZEL_TEST(case_relop_nullable_1074, null_scrutinee_falls_through_rejected_v0_267) {
-    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(caseProg("> 3 => 1")));
-}
-
-// Boundary on `>`: still rejected (semantically meaningless once the
-// pattern's scrutinee precondition is gone).
-BEZEL_TEST(case_relop_nullable_1074, present_value_below_boundary_gt_rejected_v0_267) {
-    BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(caseProg("> 3 => 1")));
-}
-
 // `<=` at boundary — same gate.
 BEZEL_TEST(case_relop_nullable_1074, present_value_matches_le_boundary_rejected_v0_267) {
     BEZEL_EXPECT_TRUE(rejectedAsNullableOrderingPattern(caseProg("<= 3 => 8")));

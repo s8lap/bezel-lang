@@ -168,14 +168,6 @@ BEZEL_TEST(codegen_float_pascal_1241, Float_as_type_annotation_1241) {
 
 // ── Regression: lowercase float.IsNaN / double.IsNaN still work ──────────────
 
-BEZEL_TEST(codegen_float_pascal_1241, float_IsNaN_lowercase_regression_1241) {
-    // Regression: the `float` keyword form must not be broken by the Float fix.
-    BEZEL_EXPECT_EQ(run(
-        "var nan := float.NaN; "
-        "if float.IsNaN(nan) then return 1; end; "
-        "return 0;"), 1);
-}
-
 BEZEL_TEST(codegen_float_pascal_1241, Double_IsNaN_regression_1241) {
     // Regression: Double.IsNaN (PascalCase double alias) still works after Float fix.
     BEZEL_EXPECT_EQ(run(

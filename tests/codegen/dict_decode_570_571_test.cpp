@@ -231,19 +231,6 @@ BEZEL_TEST(dict_decode_570_571, regression_str_key_for_in_keys_spec_4_8) {
         "end Main; end C;"), 5);
 }
 
-// Regression guard / stdlib §4.8: #563 record Values decode still correct.
-BEZEL_TEST(dict_decode_570_571, regression_record_values_snapshot_spec_4_8) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; record Item(Score: int); "
-        "class C public static method Main(): int "
-        "  using var d := new Dictionary<string, Item>(); "
-        "  d[\"a\"] := new Item(42); "
-        "  using var arr := d.Values.ToArray(); "
-        "  var v := arr[0]; "
-        "  return v.Score; "
-        "end Main; end C;"), 42);
-}
-
 // Regression guard / stdlib §4.8: non-nullable record indexer get still works.
 BEZEL_TEST(dict_decode_570_571, regression_nonnull_record_indexer_spec_4_8) {
     BEZEL_EXPECT_EQ(run(

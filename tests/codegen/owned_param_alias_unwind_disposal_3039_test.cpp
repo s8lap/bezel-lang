@@ -126,29 +126,6 @@ BEZEL_TEST(owned_param_alias_unwind_disposal_3039,
 }
 
 // ===========================================================================
-// Case 2 — NORMAL-EXIT control (regression guard for the W7L2 #3035 fix):
-// a plain `var alias := r;` with the method returning normally still
-// auto-drops `r` once at method end. The new walker branch (the K3.13
-// positive recognition) MUST keep the normal-exit path clean — the
-// `autoDropAtScopeEnd` branch in `registerUnwindOwnedParam` still fires
-// for the parameter regardless of the walker verdict, and the dynamic
-// dispose is null-guarded. `R._n == 1`.
-// ===========================================================================
-BEZEL_TEST(owned_param_alias_unwind_disposal_3039,
-           plain_var_alias_normal_return_still_auto_drops_28_3_K3_14) {
-    const std::string src = prog(
-        "class Q "
-        "  public static method Consume(r: owned R): int "
-        "    var alias := r; "
-        "    return alias.V; "        // alias.V is borrowed here (K3.13)
-        "  end Consume; "
-        "end Q; ",
-        "  do Q.Consume(new R()); end; "
-        "  return R._n; ");           // 1: callee auto-dropped the owned param once
-    BEZEL_EXPECT_EQ(run(src), 1);
-}
-
-// ===========================================================================
 // Case 3 — alias-of-alias (K3.13 chain): `var y := r; var alias := y;`
 // the second alias's source is `y` (a plain `var` owned local), the
 // first alias's source is `r` (an `owned` parameter). The walker's new

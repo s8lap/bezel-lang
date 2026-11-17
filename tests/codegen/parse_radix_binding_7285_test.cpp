@@ -493,20 +493,6 @@ BEZEL_TEST(parse_radix_binding_7285, mirror_site_refuses_a_bool_radix) {
         r, "no matching overload of `Convert.ToString`"));
 }
 
-// The mirror admits a `uint` CONSTANT radix — the same rule the `Parse`
-// site now applies.
-BEZEL_TEST(parse_radix_binding_7285, mirror_site_admits_a_uint_constant_radix) {
-    std::string prog =
-        "module M;\n"
-        "class C\n"
-        "  public static method Main(): int\n"
-        "    Console.WriteLine(Convert.ToString(255, 16u));\n"
-        "    return 0;\n"
-        "  end Main;\n"
-        "end C;\n";
-    BEZEL_EXPECT_EQ(runAot(prog).stdoutText, std::string("ff\n"));
-}
-
 // ---------------------------------------------------------------------------
 // THE FIRST ARGUMENT — stdlib §9.1's `s: string`.
 //

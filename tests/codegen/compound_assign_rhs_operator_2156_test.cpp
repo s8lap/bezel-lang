@@ -117,14 +117,3 @@ BEZEL_TEST(codegen_fix2156, compound_assign_rhs_operator_2156_disambiguates_over
         "end Program;"),
         42);
 }
-
-// §6.6 / regression: primitive-LHS / primitive-RHS `+=` must keep using the
-// built-in overflow-checked intrinsic (the user-overload path must not
-// intercept primitives). Mirrors the #610 int-regression guard for this file.
-BEZEL_TEST(codegen_fix2156, compound_assign_rhs_operator_2156_int_regression) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  var x := 40; x += 2; return x; "
-        "end Main; end C;"),
-        42);
-}

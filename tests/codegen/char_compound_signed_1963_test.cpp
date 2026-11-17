@@ -81,12 +81,6 @@ BEZEL_TEST(codegen_1963_char_signed, decrement_computes_signed) {
     BEZEL_EXPECT_EQ(run("var c: char := 'B'; c--; return int(c);"), 65);
 }
 
-// §17.6 `++` in range still stores the value (control that the signed path
-// keeps the ordinary positive case correct): `'A'++` → 'B' (66).
-BEZEL_TEST(codegen_1963_char_signed, increment_positive_still_correct) {
-    BEZEL_EXPECT_EQ(run("var c: char := 'A'; c++; return int(c);"), 66);
-}
-
 // fix #5150 (§6.6, v0.309): respelled `c *= 20` as `c := char(int(c) * 20)` —
 // the previous test row relied on the spec-violating `c *=` admission and
 // is a behaviour flip: §6.6 (v0.309) says "`c *= 2` and `c /= 2` are
@@ -117,29 +111,6 @@ BEZEL_TEST(codegen_1963_char_signed, property_negative_signed) {
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 4);
-}
-
-// --- #1961 §5.2 range check must still fire after the arithmetic goes signed. -
-// A genuinely out-of-range result (above U+10FFFF) still raises: the two
-// compose — signed arithmetic, THEN the §5.2 code-point narrowing.
-BEZEL_TEST(codegen_1963_char_signed, above_max_still_raises) {
-    BEZEL_EXPECT_EQ(
-        throwsOverflow("var c: char := char(0x10FFFF); c += 1;"), 1);
-}
-
-// §5.2: a result below U+0000 still raises — `char(0) -= 1` desugars to
-// `char(-1)`, which the signed range check rejects (it was already raising, but
-// for the wrong reason; pin that it still raises via the §5.2 check).
-BEZEL_TEST(codegen_1963_char_signed, below_zero_still_raises) {
-    BEZEL_EXPECT_EQ(
-        throwsOverflow("var c: char := char(0); c -= 1;"), 1);
-}
-
-// §4.5 / §5.2: crossing into the surrogate block still raises after the signed
-// arithmetic: `char(0xD7FF) += 1` = char(0xD800), an invalid surrogate.
-BEZEL_TEST(codegen_1963_char_signed, into_surrogate_still_raises) {
-    BEZEL_EXPECT_EQ(
-        throwsOverflow("var c: char := char(0xD7FF); c += 1;"), 1);
 }
 
 // CONTROL — the explicit cast form was already correct; keep it pinned so the

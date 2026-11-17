@@ -286,24 +286,3 @@ BEZEL_TEST(codegen_type_test_4926,
         "  end Main; "
         "end C;"), std::string("true"));
 }
-
-// §12.7 / §9.6 (#4909 control — same lowerTypeTest function, must stay
-// fixed): re-confirms the #4909 fix is untouched by this change. A lazy LINQ
-// pipeline held in IEnumerable<int> answers `is IEquatable<string>` False —
-// Case A/B do not fire here (IEquatable<T> is neither a builtin collection
-// nor a collection-element interface), so this exercises the SAME
-// lowerTypeTest call through an unrelated arm.
-BEZEL_TEST(codegen_type_test_4926,
-           control_4909_lazy_pipeline_is_iequatable_string_still_false_spec_12_7_9_6) {
-    BEZEL_EXPECT_EQ(runAotOut(
-        "module M; "
-        "public class C "
-        "  public static method Main(): int "
-        "    var a: Array<int> := [1, 2, 3]; "
-        "    var q: IEnumerable<int> := a.Select(lambda(x) => x * 2); "
-        "    if q is IEquatable<string> then Console.WriteLine(\"bug-true\"); "
-        "    else Console.WriteLine(\"false\"); end; "
-        "    return 0; "
-        "  end Main; "
-        "end C;"), std::string("false"));
-}

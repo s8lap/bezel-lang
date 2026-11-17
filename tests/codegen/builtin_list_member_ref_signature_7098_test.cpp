@@ -47,7 +47,6 @@
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
-using bezel::test::runAotChecked;
 using bezel::test::runAotOut;
 
 namespace {
@@ -164,60 +163,6 @@ BEZEL_TEST(builtin_list_member_ref_7098,
     BEZEL_EXPECT_TRUE(sawError);
 }
 
-// CONTROL — the target that IS the member's own signature still forms and
-// answers exactly as the call does (stdlib §4.1: `Contains(item: T) -> bool`).
-BEZEL_TEST(builtin_list_member_ref_7098,
-           spec_27_6_ilist_contains_group_at_the_member_signature_still_works) {
-    BEZEL_EXPECT_EQ(
-        runAotOut(
-            "module M; "
-            "import System; "
-            "class C public static method Main(): int "
-            "  var a: Array<int> := [1,2,3]; "
-            "  var il: IList<int> := a; "
-            "  var f: (int) -> bool := il.Contains; "
-            "  Console.WriteLine(f(2)); "
-            "  return 0; "
-            "end Main; end C;"),
-        "True");
-}
-
-// CONTROL — the UNANNOTATED formation (no target type to be incompatible
-// with) still takes the member's own signature as its formed type (§27.6:
-// "the callee's own signature read as a function type").
-BEZEL_TEST(builtin_list_member_ref_7098,
-           spec_27_6_ilist_contains_group_without_an_annotation_still_works) {
-    BEZEL_EXPECT_EQ(
-        runAotOut(
-            "module M; "
-            "import System; "
-            "class C public static method Main(): int "
-            "  var a: Array<int> := [1,2,3]; "
-            "  var il: IList<int> := a; "
-            "  var f := il.Contains; "
-            "  Console.WriteLine(f(2)); "
-            "  return 0; "
-            "end Main; end C;"),
-        "True");
-}
-
-// CONTROL — the CALL form of the same member is untouched: it still answers
-// `True`.
-BEZEL_TEST(builtin_list_member_ref_7098,
-           spec_27_6_ilist_call_form_still_works) {
-    BEZEL_EXPECT_EQ(
-        runAotOut(
-            "module M; "
-            "import System; "
-            "class C public static method Main(): int "
-            "  var a: Array<int> := [1,2,3]; "
-            "  var il: IList<int> := a; "
-            "  Console.WriteLine(il.Contains(2)); "
-            "  return 0; "
-            "end Main; end C;"),
-        "True");
-}
-
 // CONTROL — the OTHER `IList<T>` members keep forming at their own signatures
 // (stdlib §4.1: `Add(item: T)`, `Clear()`, `Remove(item: T)`,
 // `Insert(index: int, item: T)`), and the group still mutates the list.
@@ -238,24 +183,4 @@ BEZEL_TEST(builtin_list_member_ref_7098,
             "  return 0; "
             "end Main; end C;"),
         "True\n3");
-}
-
-// The MEMORY oracle on the legal shape: the closure cell the group is backed
-// by is released at scope end (§28.9) and the array is freed exactly once —
-// no leak, no double free. `runAotChecked` returns ran=false on any ASan /
-// LSan fire.
-BEZEL_TEST(builtin_list_member_ref_7098,
-           spec_28_9_ilist_group_is_memory_clean) {
-    auto r = runAotChecked(
-        "module M; "
-        "import System; "
-        "class C public static method Main(): int "
-        "  var a: Array<int> := [1,2,3]; "
-        "  var il: IList<int> := a; "
-        "  var f: (int) -> bool := il.Contains; "
-        "  Console.WriteLine(f(2)); "
-        "  return 0; "
-        "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

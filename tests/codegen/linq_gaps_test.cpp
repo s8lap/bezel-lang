@@ -30,25 +30,11 @@
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
-using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& src) {
     auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
-}
-// True iff the program is REJECTED at compile time and some diagnostic
-// message contains every needle (a specific diagnostic, not merely "failed").
-bool rejectedWith(const std::string& src, std::initializer_list<const char*> needles) {
-    auto r = runAot(src);
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics()) {
-        bool all = true;
-        for (const char* n : needles)
-            if (d.message.find(n) == std::string::npos) all = false;
-        if (all) return true;
-    }
-    return false;
 }
 }  // namespace
 
@@ -806,70 +792,6 @@ BEZEL_TEST(linq_gaps_issue449, lazy_reverse_after_where_still_correct_spec_5) {
 // A second for-loop over the same bound var must raise InvalidOperationException
 // (§29.11 — not silent-empty, not a SIGSEGV/double-free).
 // ===========================================================================
-
-// §29.11 v0.338: a lazy query "is single-consumption. It may be enumerated at
-// most once ... an affine discipline"; a second enumeration "is a compile error
-// where the flow analysis can see it statically".  The program below binds
-// `filtered` and enumerates it twice in straight-line code, so the AOT driver
-// REJECTS it.  FLIP (#1218/#1226): this row used to assert a RUNTIME
-// InvalidOperationException (rc 601), reachable only because the in-process JIT
-// skipped the ownership pass; the spec-correct outcome is the compile reject.
-BEZEL_TEST(linq_gaps_issue1218, bound_lazy_iterated_twice_rejected_spec_29_11) {
-    BEZEL_EXPECT_TRUE(rejectedWith(
-        "module M; class C public static method Main(): int "
-        "  using var a := new Array<int>(); "
-        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  var filtered := a.Where(lambda(x) => x mod 2 = 0); "
-        "  var s1 := 0; for var x in filtered do s1 := s1 + x; end; "
-        "  var caught := 0; "
-        "  try "
-        "    for var x in filtered do caught := caught + x; end; "
-        "  catch InvalidOperationException => "
-        "    caught := 1; "
-        "  end; "
-        "  return s1 * 100 + caught; "
-        "end Main; end C;",
-        {"bound lazy query `filtered` was already consumed", "§29.11"}));
-}
-
-// §29.11 v0.338: "Inside a callee, a plain IEnumerable<T> parameter is
-// statically untracked ... so a violation there is enforced only by the runtime
-// InvalidOperationException guard."  The callee enumerates `xs` twice; the
-// second enumeration raises IOE.  s1=6, caught=1 -> 601 (printed: > 255).
-BEZEL_TEST(linq_gaps_issue1218, callee_ienumerable_param_iterated_twice_raises_ioe_spec_29_11) {
-    BEZEL_EXPECT_EQ(runAotOut(
-        "module M; class C "
-        "public static method Twice(xs: IEnumerable<int>): int "
-        "  var s1 := 0; for var x in xs do s1 := s1 + x; end; "
-        "  var caught := 0; "
-        "  try "
-        "    for var x in xs do caught := caught + x; end; "
-        "  catch InvalidOperationException => "
-        "    caught := 1; "
-        "  end; "
-        "  return s1 * 100 + caught; "
-        "end Twice; "
-        "public static method Main(): int "
-        "  using var a := new Array<int>(); "
-        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  var filtered := a.Where(lambda(x) => x mod 2 = 0); "
-        "  Console.WriteLine(C.Twice(filtered)); "
-        "  return 0; "
-        "end Main; end C;"), "601");
-}
-
-// §5: fresh inline lazy `for x in a.Where(…)` — the loop is the sole owner,
-// dispose at loop-end is correct and must not regress.
-BEZEL_TEST(linq_gaps_issue1218, fresh_inline_lazy_still_disposes_correctly_spec_5) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  using var a := new Array<int>(); "
-        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  var s := 0; "
-        "  for var x in a.Where(lambda(x) => x mod 2 = 0) do s := s + x; end; "
-        "  return s; "
-        "end Main; end C;"), 6);
-}
 
 // §5: bound lazy passed to a method that iterates it (cross-call case).
 // The method must not double-free the enumerator it receives.

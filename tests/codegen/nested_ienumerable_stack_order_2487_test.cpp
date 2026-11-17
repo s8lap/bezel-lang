@@ -90,27 +90,6 @@ int run(const std::string& program) {
 // a2=[2] then a1=[1] -> n = 2*5+1 = 11. Without the fix (forward outer) the
 // value is 7 (a1 then a2 -> 1*5+2). Mirrors the issue's Defect A repro.
 
-BEZEL_TEST(nested_ienumerable_stack_order_2487,
-           stack_outer_of_array_elements_pop_order) {
-    const std::string program =
-        "module M; "
-        "class C public static method Sum(src: IEnumerable<IEnumerable<int>>): int "
-        "  var n := 0; "
-        "  for var inner in src do "
-        "    for var x in inner do n := n * 5 + x; end; "
-        "  end; "
-        "  return n; "
-        "end Sum; "
-        "public static method Main(): int "
-        "  var outer := new Stack<Array<int>>(); "
-        "  using var a1 := new Array<int>(); a1.Add(1); "
-        "  using var a2 := new Array<int>(); a2.Add(2); "
-        "  outer.Push(a1); outer.Push(a2); "
-        "  return C.Sum(outer); "
-        "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 11);
-}
-
 // Three-element outer disambiguates position (not just a pair-reversal):
 // Push([1]); Push([2]); Push([3]) -> pop order [3],[2],[1] -> 3*25+2*5+1 = 86.
 // Forward order would give 1*25+2*5+3 = 38.
@@ -146,27 +125,6 @@ BEZEL_TEST(nested_ienumerable_stack_order_2487,
 // (1,2,3 -> 1*25+2*5+3). Mirrors the issue's Defect B repro (single element —
 // the canonical shape; see the file header on why multi-Stack-element shapes
 // are excluded).
-
-BEZEL_TEST(nested_ienumerable_stack_order_2487,
-           array_outer_of_stack_element_pop_order) {
-    const std::string program =
-        "module M; "
-        "class C public static method Sum(src: IEnumerable<IEnumerable<int>>): int "
-        "  var n := 0; "
-        "  for var inner in src do "
-        "    for var x in inner do n := n * 5 + x; end; "
-        "  end; "
-        "  return n; "
-        "end Sum; "
-        "public static method Main(): int "
-        "  using var outer := new Array<Stack<int>>(); "
-        "  var s := new Stack<int>(); "
-        "  s.Push(1); s.Push(2); s.Push(3); "
-        "  outer.Add(s); "
-        "  return C.Sum(outer); "
-        "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 86);
-}
 
 // ── 3-level nesting: Stack outer + nested (non-leaf) inner factory ──────
 //

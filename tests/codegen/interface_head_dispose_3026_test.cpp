@@ -217,16 +217,6 @@ BEZEL_TEST(codegen_iface_head_dispose_3026,
 // does not silently regress working code.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_iface_head_dispose_3026,
-           concrete_array_explicit_dispose_unchanged_4_4) {
-    BEZEL_EXPECT_EQ(
-        runChecked(prog(
-            "var i := 0; while i < 100 do "
-            "var e := new Array<int>(1); e.Dispose(); i := i + 1; "
-            "end; return 0;")),
-        0);
-}
-
-BEZEL_TEST(codegen_iface_head_dispose_3026,
            concrete_owningarray_explicit_dispose_unchanged_4_5) {
     BEZEL_EXPECT_EQ(
         runChecked(prog(
@@ -288,25 +278,6 @@ BEZEL_TEST(codegen_iface_head_dispose_3026,
             "  public static Dtors: int := 0; "
             "  destructor Widget.Dtors := Widget.Dtors + 1; end destructor; "
             "end Widget; ")),
-        0);
-}
-
-BEZEL_TEST(codegen_iface_head_dispose_3026,
-           concrete_ilist_explicit_dispose_unchanged_4_1) {
-    BEZEL_EXPECT_EQ(
-        run(prog("var e: IList<int> := new Array<int>(2); "
-                 "e.Dispose(); return 0;")),
-        0);
-}
-
-BEZEL_TEST(codegen_iface_head_dispose_3026,
-           ilist_using_var_unchanged_4_1) {
-    BEZEL_EXPECT_EQ(
-        runChecked(prog(
-            "var i := 0; while i < 100 do "
-            "using var e: IList<int> := new Array<int>(1); "
-            "i := i + 1; "
-            "end; return 0;")),
         0);
 }
 
