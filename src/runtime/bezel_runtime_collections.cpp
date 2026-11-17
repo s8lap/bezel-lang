@@ -2458,6 +2458,10 @@ int32_t bz_set_algebra_gen(void* selfp, void** keys, int64_t n, int32_t op) {
 void bz_set_string_keys_release(void* dp) {
     if (!dp) return;
     auto* d = (bz_dict_t*)dp;
+    // narrow #6314 (§28.2, v0.357): a header quarantined by
+    // bz_dict_mark_disposed has no bucket array left (and no keys to release);
+    // the scope-end release of a set already disposed explicitly reaches here.
+    if (d->disposed) return;
     if (d->key_size != (int64_t)sizeof(void*)) return;  // not a pointer-key set
     for (int64_t i = 0; i < d->capacity; i++) {
         bz_entry_t& e = d->buckets[i];
@@ -2491,6 +2495,9 @@ void bz_set_string_keys_release(void* dp) {
 void bz_set_coll_keys_dispose(void* dp, void (*dispose_coll)(void*)) {
     if (!dp || !dispose_coll) return;
     auto* d = (bz_dict_t*)dp;
+    // narrow #6314 (§28.2, v0.357): a quarantined header has no bucket array —
+    // same reason as bz_set_string_keys_release above.
+    if (d->disposed) return;
     if (d->key_size != (int64_t)sizeof(void*)) return;  // not a pointer-key set
     for (int64_t i = 0; i < d->capacity; i++) {
         bz_entry_t& e = d->buckets[i];

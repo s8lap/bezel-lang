@@ -8741,7 +8741,20 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
         genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)
             != nullptr;
     if (dictBackedSet) {
-        auto* fn = declareC("bz_dict_free",
+        // narrow #6314 (§28.2, v0.357): in checked disposal mode an explicit
+        // `Dispose()` on a dict-backed set quarantines, exactly as the
+        // dictionary arm below does (#627): the table is released, the flag
+        // is set and the header stays, so a later member access — through
+        // this binding or through a borrow of it stored elsewhere — raises
+        // DisposedAccessException instead of reading a freed table. The slot
+        // is therefore NOT nulled in checked mode
+        // (nullExplicitlyDisposedBuiltinSlot); the scope-end release of the
+        // same slot is a no-op on a disposed header. The escape mark keeps
+        // the retained header reachable. Unchecked mode keeps the immediate
+        // free.
+        if (checkedDisposal_) emitCdMarkEscaped(recv);
+        auto* fn = declareC(checkedDisposal_ ? "bz_dict_mark_disposed"
+                                             : "bz_dict_free",
             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
         builder_.CreateCall(fn, {recv,
             llvm::ConstantPointerNull::get(ptrTy())});

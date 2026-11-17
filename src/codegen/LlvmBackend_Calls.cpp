@@ -4677,9 +4677,31 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // bz_array_t header (set by bz_array_mark_disposed at Dispose time in
         // checked builds). Skip for lazy-materialized temporaries (those are
         // freshly-allocated by bz_lazy_to_array — they cannot be disposed).
-        if (checkedDisposal_ && !lazyTempArr && isCollectionTypeName(recvTy)) {
+        //
+        // narrow #6314 (§28.2, v0.357): a dict-backed Set<T> / OwningSet<T> /
+        // SortedSet<T> receiver is a `bz_dict_t`, not a `bz_array_t` (issues
+        // #343 / D8), so the ARRAY flag read is a read of the wrong struct:
+        // `bz_array_t::disposed` sits at offset 40, which in a `bz_dict_t` is
+        // the low byte of `eq_fn`. The guard then raised
+        // DisposedAccessException on a LIVE set whenever the element equality
+        // function's address was not a multiple of 256 — by link layout, not
+        // by anything the program did. §28.2: "The two modes give identical
+        // observable behavior for every program that never uses a disposed
+        // instance." Ask the header that is actually there.
+        //
+        // A set's own `Dispose()` is not guarded: §28.2, "A further
+        // `Dispose()` call remains a no-op, not an error, in both modes", and
+        // the explicit-Dispose arm quarantines a set in checked mode
+        // (emitExplicitDisposeChain), so a second `Dispose()` does reach a
+        // header whose flag is set. bz_dict_mark_disposed is idempotent.
+        const bool setOwnDispose =
+            isDictBackedSetRecv && m == "Dispose" && call.args.empty();
+        if (checkedDisposal_ && !lazyTempArr && !setOwnDispose &&
+            isCollectionTypeName(recvTy)) {
             llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
-            auto* isFn = declareC("bz_array_is_disposed", i8Ty, {ptrTy()});
+            auto* isFn = declareC(isDictBackedSetRecv ? "bz_dict_is_disposed"
+                                                      : "bz_array_is_disposed",
+                                  i8Ty, {ptrTy()});
             llvm::Value* flag = builder_.CreateCall(isFn, {recv}, "cd.arrdis");
             llvm::Value* disposed = builder_.CreateICmpNE(
                 flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");

@@ -4786,13 +4786,14 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
 //   * CHECKED disposal mode (§28.2 v0.135), for a receiver whose release
 //     QUARANTINES instead of freeing: the disposed-flag guard reads THROUGH
 //     the slot at the next member entry, so the pointer must stay readable.
-//     narrow #6314 (§28.2 / §28.3, v0.357): that is a property of four arms
+//     narrow #6314 (§28.2 / §28.3, v0.357): that is a property of five arms
 //     only — the list-interface and array-header collection arms
-//     (`bz_array_mark_disposed`), the dictionary arm (`bz_dict_mark_disposed`)
-//     and the closure arm (`bz_closure_mark_disposed`) — and the silence used
+//     (`bz_array_mark_disposed`), the dict-backed set and dictionary arms
+//     (`bz_dict_mark_disposed`) and the closure arm
+//     (`bz_closure_mark_disposed`) — and the silence used
 //     to cover EVERY receiver. Every other arm that reaches here performs a
-//     REAL release in checked mode too (`bz_llist_free`, `bz_dict_free` for a
-//     dict-backed set, `bz_runtime_dispose`, `bz_random_free`,
+//     REAL release in checked mode too (`bz_llist_free`,
+//     `bz_runtime_dispose`, `bz_random_free`,
 //     `bz_stopwatch_free`, `bz_weak_release`, the task disposal protocol, …),
 //     so keeping the slot left §28.3's scope-end auto-drop to release the same
 //     object a second time: a double free in exactly the mode that exists to
@@ -4859,8 +4860,10 @@ void Emitter::nullExplicitlyDisposedBuiltinSlot(const ast::Expr& recvExpr,
         bool dictBackedSet = isSetName &&
             genericBackingType(recvTy, 0, /*isSet=*/true, nullptr) != nullptr;
         bool quarantined = false;
-        if (dictBackedSet || isLinkedListTypeName(recvTy)) {
-            quarantined = false;          // bz_dict_free / bz_llist_free
+        if (dictBackedSet) {
+            quarantined = true;           // bz_dict_mark_disposed
+        } else if (isLinkedListTypeName(recvTy)) {
+            quarantined = false;          // bz_llist_free
         } else if (isListInterfaceName(recvTy)) {
             quarantined = true;           // bz_array_mark_disposed
         } else if (isCollectionInterfaceName(recvTy)) {
