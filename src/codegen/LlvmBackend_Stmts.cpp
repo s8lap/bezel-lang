@@ -2380,14 +2380,56 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         builder_.SetInsertPoint(contBB);
                     }
                     // The new source kind for the object-string state bit.
-                    // A bare string-typed identifier (the only shape admitted
-                    // at the LocalDecl level) ⇒ true; everything else ⇒ false.
-                    // This is the SAME test `isObjectStringSource` (declared
-                    // below) runs; reusing it is the only way the bit update
-                    // and the bind site can stay in lockstep.
-                    int newOstrKind = ostrState
+                    // A string-typed source the slot owns a reference to ⇒
+                    // true; everything else ⇒ false. This is the SAME test
+                    // `isObjectStringSource` (declared below) runs; reusing it
+                    // is the only way the bit update and the bind site can
+                    // stay in lockstep.
+                    //
+                    // fix #8598 (§28.9, v0.357): the target's slot kind.
+                    // An `Object`/interface-typed LOCAL is a slot that holds a
+                    // reference as its bare pointer (§8.6: a reference type
+                    // is not boxed), so a string stored into it is a string
+                    // the slot must hold a reference to (§28.9 leaves the
+                    // string's lifetime to the runtime).
+                    bool ostrTarget = false;
+                    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                            as->target.get())) {
+                        auto* tsym = dynamic_cast<sema::LocalSymbol*>(
+                            ctx_.exprSymbol(*tid));
+                        if (tsym && tsym->decl) {
+                            const sema::TypeRef* tTy = ctx_.exprType(*as->target);
+                            ostrTarget = isObjectOrInterfaceTarget(tTy);
+                        }
+                    }
+                    int newOstrKind = (ostrState || ostrTarget)
                         ? isObjectStringSource(as->value.get())
                         : -1;
+                    // fix #8598 (§28.9, v0.357): the slot takes its OWN
+                    // reference to the string it now holds — the same
+                    // reference the bind-time path takes for
+                    // `var o: Object := s;`. §28.9 leaves a string's lifetime
+                    // to the runtime, so a slot that can outlive the source
+                    // must hold a reference; without it the reassignment
+                    // stored the source's raw pointer, and the source's own
+                    // release (the CALLER's, after the call; the FIELD's, on
+                    // the next store) freed the string under the slot — the
+                    // measured heap-use-after-free of #8598.
+                    //
+                    // The reference is dropped again only where the slot's own
+                    // scope-end release is armed (the escape walk proved the
+                    // alias never escapes); an escaping alias keeps its
+                    // reference, which is the documented residual leak of a
+                    // string behind an `Object` erasure (#5059, #8459) and
+                    // never a dangling read.
+                    //
+                    // Emitted BEFORE the displaced release below, so the slot
+                    // never dips the count to zero on the way (retain-before-
+                    // release, the order `lowerStringLocalReassign` uses for
+                    // the `string`-typed twin).
+                    if (ostrTarget && newOstrKind == 1 && rhs &&
+                        rhs->getType()->isPointerTy())
+                        emitStringRetain(rhs);
                     if (ostrState && newOstrKind >= 0) {
                         llvm::Value* oldIsStr = builder_.CreateLoad(
                             llvm::Type::getInt1Ty(llvm_), ostrState,

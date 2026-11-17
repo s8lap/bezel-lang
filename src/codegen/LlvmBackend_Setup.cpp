@@ -35309,6 +35309,64 @@ struct StringEscapeWalker {
                         }
                     }
                 }
+                // fix #8598 (§28.9, v0.357): the OBJECT-ALIAS twin of the
+                // #2806 arm above. `o := s;` where `o` is an `Object`-typed
+                // local is a BORROW of `s`, not an ESCAPE: the reassignment
+                // site now RETAINS the string into the slot (the slot owes a
+                // reference whatever names the string — §28.9), so `s` keeps
+                // its own `+1` and its own scope-end release, and the slot's
+                // own `+1` is released with the slot.
+                //
+                // WITHOUT this arm the source was tainted: the walker's
+                // general `:=` handling reads the RHS with safeRead=false, so
+                // `s`'s scope-end release was suppressed while the slot's
+                // release (the state bit says "the slot holds a string") ran
+                // in its place — the two balanced by accident, and a fix that
+                // added the slot's own retain turned that accident into a
+                // leak. Reading the source as a safe read is the sound
+                // verdict now that the slot really does hold its own
+                // reference.
+                //
+                // The retain really happens wherever this arm fires: the
+                // VALUE's own static type is the test (a non-nullable
+                // `string` is what `isObjectStringSource` admits), and the
+                // TARGET's own static type is the other half (an
+                // `Object`/interface-typed local is the slot that takes the
+                // reference). The value's static type also keeps this arm
+                // from firing in the OBJECT-alias walk, where the tracked
+                // local is an `Object` and a reassignment into a slot of an
+                // `Object`-typed value retains NOTHING — reading the source
+                // as safe there would free the string under the alias.
+                //
+                // Gated on `stringReleaseMode` (the string-release walk
+                // family only — the dict-materializer, grouping and
+                // borrowing-Array walks share this walker but emit no
+                // assignment-side retain, so for them the copy genuinely
+                // aliases a single reference) and on `!inLambda` (a
+                // captured-from outer-local read always escapes — the env
+                // outlives the scope), the same `inLambda` clause the #1997 /
+                // #2764 / #2806 / #8214 relaxations use.
+                if (stringReleaseMode && !inLambda &&
+                    isTargetIdent(as->value.get())) {
+                    const sema::TypeRef* vTy = ctx.exprType(*as->value.get());
+                    const bool valueIsString =
+                        vTy && !vTy->nullable &&
+                        vTy->kind == sema::TypeRef::Kind::Primitive &&
+                        vTy->primitive == sema::PrimitiveType::String;
+                    auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get());
+                    if (valueIsString && tid) {
+                        auto* tls = dynamic_cast<sema::LocalSymbol*>(
+                            ctx.exprSymbol(*tid));
+                        if (tls && tls->decl &&
+                            isObjectOrInterfaceTypeRef(
+                                ctx.exprType(*as->target))) {
+                            expr(as->target.get(), /*safeRead=*/false);
+                            expr(as->value.get(), /*safeRead=*/true);
+                            return;
+                        }
+                    }
+                }
                 // fix #8214 / §28.9 / §4.6 / §8.6 (v0.355): the
                 // OBJECT-STRING STORAGE FIELD twin of the property-set
                 // relaxation above. `h.O := s;` where `h.O` is an
@@ -45803,41 +45861,68 @@ llvm::AllocaInst* Emitter::pinBoxBorrowArgument(llvm::Value* v) {
 }
 
 
-// fix #2900 / §28.9 / §28.3 (v0.240): is `valueExpr` a bare string-typed
-// IDENTIFIER (the only shape the `Object`-slot / string-borrow relaxation
-// admits at the LocalDecl level)? A `+1` producer (`"x" + y` /
-// interpolation) is NOT admitted — a producer's `+1` is in its own slot,
+// fix #2900 / §28.9 / §28.3 (v0.240): is `valueExpr` a string the
+// `Object`-slot / string-borrow relaxation admits? A `+1` producer (`"x" + y`
+// / interpolation) is NOT admitted — a producer's `+1` is in its own slot,
 // and reusing it in an Object-aliased retain would alias the same heap
 // string with two releases from one producer. A boxed value, a class
 // reference, a null literal, a `s!` rebind, a `s.Length` call, anything
-// other than a bare string LocalIdentifier ⇒ false (a non-string source
-// flips the state bit to false, so scope-end skips the string release).
+// other than a string-typed source ⇒ false (a non-string source flips the
+// state bit to false, so scope-end skips the string release).
 // Mirrors the gate collectObjectStringReleaseEligible applies at the
 // LocalDecl level; reusing it is the only way the bind site, the
 // reassignment site, and the eligibility collector stay in lockstep.
+//
+// fix #8598 (§28.9, v0.357): the SOURCE KIND is widened. The shape this
+// predicate gates is the REASSIGNMENT of an `Object`-typed local
+// (`o := <string>`), and §28.9 leaves a string's lifetime to the runtime,
+// so the slot owes a reference WHATEVER names the string. A source that is
+// not a local — a `string` PARAMETER (whose reference the CALLER releases
+// after the call) or a `string` FIELD read (whose reference the field
+// releases on the next store) — was admitted neither here nor by the
+// LocalDecl gate (which wanted a bare string LOCAL identifier), so the
+// reassignment stored the source's raw pointer with no reference of its own
+// and the source's release freed the string under the slot (measured
+// heap-use-after-free, #8598). The `string`-typed local's own shape (#2900)
+// and the `!` / `as` wrapper runs (fix #8514, at the LocalDecl level) are
+// unchanged.
 int Emitter::isObjectStringSource(const ast::Expr* valueExpr) {
     if (!valueExpr) return -1;
+    // fix #8598: a +1 producer is not a borrow — its `+1` is in the
+    // producer's own slot, and the Object-aliased retain/release pair would
+    // alias one heap string with two releases from one producer.
+    if (isPlusOneStringProducer(valueExpr)) return 0;
     const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
     if (!srcTy || srcTy->nullable) return 0;
     if (srcTy->kind != sema::TypeRef::Kind::Primitive ||
         srcTy->primitive != sema::PrimitiveType::String) return 0;
-    auto* id = dynamic_cast<const ast::IdentifierExpr*>(valueExpr);
-    if (!id) return 0;
-    auto* loc = dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*id));
-    if (!loc || !loc->decl) return 0;
-    // fix #3591 (§21.1 / §28.9 / §28.3, v0.286): read through the shared
-    // `localDeclInitView` (the #3417 pattern this file's bind-time collector
-    // already applies to the same SOURCE question) instead of casting
-    // straight to `ast::LocalDecl*`. It was that bare cast, always null for a
-    // §21.1 `const` source — so `o := s;` reassigning an Object-typed target
-    // `o` from a `const s := "…";` string source got newOstrKind=0 ("not a
-    // string"), silently disarming the release-tracking state bit for a
-    // value that genuinely is a string (the `var s` twin sets the bit
-    // correctly). Parameter / capture sources still excluded: they yield an
-    // all-null view (localDeclInitView's contract), same "not ours" verdict.
-    LocalDeclInitView srcView = localDeclInitView(loc->decl);
-    if (!srcView.init && !srcView.type) return 0;
-    return 1;
+    // A bare string-typed IDENTIFIER. The source may be a `var` / `const`
+    // local (the #2900 shape) or — fix #8598 — a source that is not a local
+    // at all: a `string` PARAMETER, or a CAPTURED binding.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(valueExpr)) {
+        auto* loc =
+            dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+        if (loc && loc->decl) {
+            // fix #3591 (§21.1 / §28.9 / §28.3, v0.286): read through the
+            // shared `localDeclInitView` (the #3417 pattern this file's
+            // bind-time collector already applies to the same SOURCE
+            // question) instead of casting straight to `ast::LocalDecl*`. It
+            // was that bare cast, always null for a §21.1 `const` source —
+            // so `o := s;` reassigning an Object-typed target `o` from a
+            // `const s := "…";` string source got newOstrKind=0 ("not a
+            // string"), silently disarming the release-tracking state bit
+            // for a value that genuinely is a string (the `var s` twin sets
+            // the bit correctly).
+            LocalDeclInitView srcView = localDeclInitView(loc->decl);
+            if (!srcView.init && !srcView.type) return 0;
+        }
+        return 1;
+    }
+    // fix #8598 (§28.9, v0.357): a string-typed FIELD read (`k.S`) — the
+    // field's own reference, lent to the reader. A read of a TEMPORARY's
+    // field is a +1 producer and was excluded above.
+    if (dynamic_cast<const ast::MemberAccessExpr*>(valueExpr)) return 1;
+    return 0;
 }
 
 
