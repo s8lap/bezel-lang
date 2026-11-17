@@ -4094,6 +4094,40 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // above and by emitAsyncLambda's expression-body completion.
             if (chainedReturn && rs->value)
                 deferChainedAsyncReturnSource(rs->value.get());
+            // fix #8717 (§28.9 / §7.7 / §27.5, v0.357): the block-bodied
+            // async closure-result mint of fix #3788 (its predicate and
+            // derivation are in the comment below this edge's
+            // `emitAllDisposals`, unchanged) runs HERE, before the scope-end
+            // releases, not after them. The value can be one a local of this
+            // body holds (`return n ?? g;`: §7.7, "`a ?? b` returns `a` if
+            // non-null, else `b`"), and that local's scope-end
+            // `bz_closure_release` is one of the disposals: run first, it
+            // drops the last reference and the mint then retains freed
+            // memory (MEASURED on r30-c1, `--sanitize=address`: `var g :=
+            // lambda …; var n: F? := null; return n ?? g;` in an `async`
+            // method, heap-use-after-free). Retaining earlier changes no
+            // count, only the order.
+            if (v && rs->value && v->getType()->isPointerTy() &&
+                !builder_.GetInsertBlock()->getTerminator()) {
+                const sema::TypeRef* bodySemaTy =
+                    ctx_.exprType(*rs->value);
+                bool arrivesFromCallee =
+                    dynamic_cast<const ast::CallExpr*>(rs->value.get()) !=
+                        nullptr;
+                if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
+                        rs->value.get()))
+                    if (un->op == "await")
+                        arrivesFromCallee = true;
+                if (bodySemaTy &&
+                    bodySemaTy->kind == sema::TypeRef::Kind::Function &&
+                    !bodySemaTy->nullable &&
+                    !arrivesFromCallee &&
+                    !isPlusOneClosureProducer(rs->value.get()) &&
+                    !isUserMethodClosureReturnCall(rs->value.get()) &&
+                    !armedClosureLocalReturnMinted &&  // fix-forward #8479
+                    !returnedClosureLocalOwnsPlusOne(rs->value.get()))
+                    emitClosureRetain(v);
+            }
             // fix #6052: `v` already holds the result; see asyncKind1LocalSlot.
             // No enclosing finally: dispose all live scopes, then complete.
             if (asyncKind1LocalSlot) {
@@ -4178,27 +4212,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // awaited task's `emitAsyncComplete` already produced the +1.
             // An Identifier (named local of this scope) is answerable
             // here as `returnedClosureLocalOwnsPlusOne`.
-            if (v && rs->value && v->getType()->isPointerTy() &&
-                !builder_.GetInsertBlock()->getTerminator()) {
-                const sema::TypeRef* bodySemaTy =
-                    ctx_.exprType(*rs->value);
-                bool arrivesFromCallee =
-                    dynamic_cast<const ast::CallExpr*>(rs->value.get()) !=
-                        nullptr;
-                if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
-                        rs->value.get()))
-                    if (un->op == "await")
-                        arrivesFromCallee = true;
-                if (bodySemaTy &&
-                    bodySemaTy->kind == sema::TypeRef::Kind::Function &&
-                    !bodySemaTy->nullable &&
-                    !arrivesFromCallee &&
-                    !isPlusOneClosureProducer(rs->value.get()) &&
-                    !isUserMethodClosureReturnCall(rs->value.get()) &&
-                    !armedClosureLocalReturnMinted &&  // fix-forward #8479
-                    !returnedClosureLocalOwnsPlusOne(rs->value.get()))
-                    emitClosureRetain(v);
-            }
+            //
+            // fix #8717 (§28.9 / §7.7, v0.357): the mint itself is emitted
+            // ABOVE, before this edge's `emitAllDisposals`: a mint that runs
+            // after the scope-end releases retains a function value those
+            // releases may already have freed.
             emitAsyncComplete(v);
             builder_.CreateRetVoid();
             return true;

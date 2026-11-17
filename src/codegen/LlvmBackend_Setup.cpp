@@ -38623,6 +38623,24 @@ struct ClosureEscapeWalker {
     // True while the walk is inside one of the two reference-taking escape
     // sites named above.
     bool inReferenceTakingSite_ = false;
+    // fix-forward #8479 (§7.7 / §28.9, v0.357): set by the #6176 arm of
+    // stmt(): a `return nn ?? e;` where NOTHING mints the caller's
+    // reference, so the slot's own reference is the one the caller
+    // receives. Such a local must not have a scope-end release armed.
+    bool returnedByTransfer_ = false;
+    // fix #8717 (§7.7 / §17.4 / §28.9, v0.357): set when the value of a `??`
+    // or `as` that yields target is handed to a position that takes a
+    // reference of its own: returned where the `return` mints the caller's
+    // reference (`!coalesceReturnTransfers`), or stored into a class
+    // instance field (`storeTargetTakesReference`). §7.7: "`a ?? b` returns
+    // `a` if non-null, else `b`"; §17.4: the result of `as` is a borrow of
+    // its operand. Either result can BE target's function value, which may
+    // then outlive this scope through that position. Target's own reference
+    // is still released at scope end (the reference counts at the site are
+    // the ones they were), but its capture cells are no longer freed there:
+    // collectClosureReleaseEligible files it under
+    // `closureEscapingScopeEndRelease_`, not `closureReleaseEligible_`.
+    bool mayOutliveScope_ = false;
     // fix #4473 (§27.5 / §28.9, v0.301): true when target is the RHS of an
     // AssignmentStmt whose LHS is a same-scope closure-typed local/parameter
     // (a `lambdaRef := y` shape where `y` is the walked target and
@@ -38709,6 +38727,35 @@ struct ClosureEscapeWalker {
             return b->op == "??" && (coalesceYieldsTarget(b->left.get()) ||
                                      coalesceYieldsTarget(b->right.get()));
         return isTargetIdent(e);
+    }
+
+    // fix #8717 (§7.7 / §17.4 / §17.8, v0.357): can the VALUE of `e` be
+    // target's own function value, reached through at least one `??` or
+    // `as`? Postfix `!` is looked through (§17.8: it "preserves
+    // ownership"), and so is an if-expression's branches below a `??` /
+    // `as`. A bare `target`, `target!` and `(if c then target else x)` are
+    // NOT matched from the top (`sawWrap` false): they keep the verdicts
+    // their own arms have always given them.
+    bool forwardsTarget(const ast::Expr* e, bool sawWrap) const {
+        if (!e) return false;
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+            return forwardsTarget(pb->operand.get(), sawWrap);
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e))
+            return b->op == "??" && (forwardsTarget(b->left.get(), true) ||
+                                     forwardsTarget(b->right.get(), true));
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e))
+            return t->op == "as" && forwardsTarget(t->operand.get(), true);
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e))
+            return sawWrap && (forwardsTarget(c->thenValue.get(), true) ||
+                               forwardsTarget(c->elseValue.get(), true));
+        return sawWrap && isTargetIdent(e);
+    }
+    // fix #8717: a call argument that is target or yields it through `??` /
+    // `as`. The argument reliefs of the CallExpr arm are premises about the
+    // CALLEE (it only invokes the value, it keeps nothing), so they hold for
+    // either spelling of the argument.
+    bool argIsTarget(const ast::Expr* e) const {
+        return isTargetIdent(e) || forwardsTarget(e, /*sawWrap=*/false);
     }
 
     // fix #4473 (§27.5 / §28.9, v0.301): true when `target_expr` is the LHS
@@ -39142,9 +39189,21 @@ struct ClosureEscapeWalker {
         // valid, but a contained occurrence is still treated as a read here —
         // harmless, since the only ops the grammar admits on function values are
         // `=`/`<>`.)
+        //
+        // fix #8717 (§7.7 / §17.4 / §28.9, v0.357): EXCEPT `??`, whose result
+        // IS one of its operands (§7.7: "`a ?? b` returns `a` if non-null,
+        // else `b`"). Its operands are read as the position the `??` sits
+        // in reads a value, exactly like the branches of an if-expression
+        // below. Read as non-consuming everywhere, `fs.Add(n ?? g)` was never
+        // an escape of `g`: `g` was released at scope end with its capture
+        // cells freed, and the collection called freed memory (MEASURED on
+        // r30-c1, `--sanitize=address`: heap-use-after-free, the issue's
+        // repro). The positions that take a reference of their own are
+        // answered where they are walked (see mayOutliveScope_).
         if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
-            expr(b->left.get(), /*safeRead=*/true);
-            expr(b->right.get(), /*safeRead=*/true);
+            const bool forwards = b->op == "??";
+            expr(b->left.get(), /*safeRead=*/forwards ? safeRead : true);
+            expr(b->right.get(), /*safeRead=*/forwards ? safeRead : true);
             return;
         }
         // Call: the callee `f(...)` is a non-consuming read (invocation); every
@@ -39203,7 +39262,7 @@ struct ClosureEscapeWalker {
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
             bool getOrAddFactoryTargetSafe = false;
             if (c->args.size() == 2 && c->args[1].value &&
-                isTargetIdent(c->args[1].value.get())) {
+                argIsTarget(c->args[1].value.get())) {  // fix #8717
                 if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                         c->callee.get())) {
                     if (ma->member == "GetOrAdd" && ma->target) {
@@ -39234,7 +39293,9 @@ struct ClosureEscapeWalker {
                 // closureArgBindsMethodOwnTypeParamBorrow above); the
                 // caller keeps its +1 and releases it at scope end if
                 // nothing else escapes it.
-                if (!safeArg && isTargetIdent(c->args[ai].value.get()) &&
+                // fix #8717: each relief below also admits target reached
+                // through `??` / `as` (argIsTarget).
+                if (!safeArg && argIsTarget(c->args[ai].value.get()) &&
                     closureArgBindsMethodOwnTypeParamBorrow(ctx, *c, ai))
                     safeArg = true;
                 // fix #7803 (stdlib §2.1 / §8.5 / §22.3 / §28.3 / §28.9,
@@ -39294,7 +39355,7 @@ struct ClosureEscapeWalker {
                 // nothing, so no scope-end release may fire for it.
                 if (!safeArg && ai == 0 && c->args.size() == 1 &&
                     c->args[ai].modifier.empty() &&
-                    isTargetIdent(c->args[ai].value.get()) &&
+                    argIsTarget(c->args[ai].value.get()) &&
                     isConsoleNonRetainingArg(c->callee.get(), ai, &ctx))
                     safeArg = true;
                 // fix #8382 (stdlib §4.4 / §22.3 / §28.9, v0.357): the SAME
@@ -39308,7 +39369,7 @@ struct ClosureEscapeWalker {
                 // console relief above.
                 if (!safeArg && ai == 0 && c->args.size() == 1 &&
                     c->args[ai].modifier.empty() &&
-                    isTargetIdent(c->args[ai].value.get()) &&
+                    argIsTarget(c->args[ai].value.get()) &&
                     isBuiltinArrayComparerArg(c->callee.get(), ai, ctx))
                     safeArg = true;
                 expr(c->args[ai].value.get(), /*safeRead=*/safeArg);
@@ -39337,7 +39398,12 @@ struct ClosureEscapeWalker {
         }
         // `f is T` reads only.
         if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
-            expr(t->operand.get(), /*safeRead=*/true);
+            // fix #8717 (§17.4, v0.357): `is` / `is not` only inspect the
+            // operand; the result of `as` is a borrow of it ("`var maybeDog
+            // := thing as Dog;` — borrow; thing still owned"), so `as` is
+            // read as its own position reads a value, like `??` above.
+            expr(t->operand.get(),
+                 /*safeRead=*/t->op == "as" ? safeRead : true);
             return;
         }
         // A member access NOT in callee position, an indexing, and an
@@ -39501,6 +39567,18 @@ struct ClosureEscapeWalker {
                 expr(ld->initializer.get(), /*safeRead=*/true);
                 return;
             }
+            // fix #8717 (§7.7 / §17.4, v0.357): `var b := n ?? target;` /
+            // `var t := target as F;` binds a local that holds NO reference
+            // of its own (a borrow-initialized closure local is neither
+            // retained nor released: armClosureLocalRefcount is not
+            // invoked). The bind itself keeps the verdict it has always had,
+            // a read; whether the BOUND local's value then outlives the
+            // scope is decided once every local's verdict is known
+            // (collectClosureReleaseEligible, the forwarded-bind pass).
+            if (!inLambda && forwardsTarget(ld->initializer.get(), false)) {
+                expr(ld->initializer.get(), /*safeRead=*/true);
+                return;
+            }
             // Binding the target into ANOTHER local escapes it (the new local
             // may itself be returned/stored).
             expr(ld->initializer.get(), /*safeRead=*/false);
@@ -39514,6 +39592,10 @@ struct ClosureEscapeWalker {
             if (!inLambda && ownedAliasDecls &&
                 ownedAliasDecls->count(static_cast<const void*>(lc))) {
                 expr(lc->value.get(), /*safeRead=*/true);
+                return;
+            }
+            if (!inLambda && forwardsTarget(lc->value.get(), false)) {
+                expr(lc->value.get(), /*safeRead=*/true);  // fix #8717
                 return;
             }
             expr(lc->value.get(), /*safeRead=*/false); return;
@@ -39557,6 +39639,7 @@ struct ClosureEscapeWalker {
                 dynamic_cast<const ast::BinaryExpr*>(r->value.get()) &&
                 coalesceYieldsTarget(r->value.get())) {
                 isReturned_ = true;
+                if (!inLambda) returnedByTransfer_ = true;
                 escaped = true;
                 return;
             }
@@ -39565,6 +39648,21 @@ struct ClosureEscapeWalker {
             // transferred, `returnedClosureLocalOwnsPlusOne`); see
             // keptWithoutReference_. A returned expression that merely
             // contains the target is not recognised and stays "kept".
+            // fix #8717 (§7.7 / §17.4 / §28.9, v0.357): `return n ?? target;`
+            // / `return (target as F)!;` where the `return` mints the
+            // caller's reference (a function-typed result; the other venues
+            // are the #6176 arm above, or an escape below). The counts at
+            // the site are unchanged (a read; the mint balances target's
+            // own scope-end release), but the returned value can be
+            // target's, so its capture cells must not be freed with this
+            // scope (MEASURED on r30-c1, `--sanitize=address`: `return n ??
+            // g;` with a capturing `g`, heap-use-after-free in the caller).
+            if (!inLambda && !coalesceReturnTransfers && r->value &&
+                forwardsTarget(r->value.get(), false)) {
+                mayOutliveScope_ = true;
+                expr(r->value.get(), /*safeRead=*/true);
+                return;
+            }
             {
                 const bool savedSite = inReferenceTakingSite_;
                 if (r->value && isTargetIdent(r->value.get()))
@@ -39692,6 +39790,20 @@ struct ClosureEscapeWalker {
             // (storeTargetTakesReference); see keptWithoutReference_. Any
             // other store of the target — `xs[i] := target;`, a static or
             // record field, a compound operator — takes no reference.
+            // fix #8717 (§7.7 / §17.4 / §28.9, v0.357): `h.F := n ?? target;`
+            // into a class instance field, which takes a reference of its own
+            // (storeTargetTakesReference): the counts are unchanged (a read),
+            // but the stored value can be target's, so its capture cells
+            // must not be freed with this scope (MEASURED on r30-c1,
+            // `--sanitize=address`: heap-use-after-free when the field is
+            // called after the storing method returned).
+            if (as->op == ":=" && as->target && !inLambda &&
+                forwardsTarget(as->value.get(), false) &&
+                storeTargetTakesReference(*as->target)) {
+                mayOutliveScope_ = true;
+                expr(as->value.get(), /*safeRead=*/true);
+                return;
+            }
             {
                 const bool savedSite = inReferenceTakingSite_;
                 if (as->op == ":=" && as->target && as->value &&
@@ -40671,14 +40783,25 @@ void Emitter::collectClosureReleaseEligible(
                 const bool leavesFrame = w.isReturned_ ||
                                          w.escapeBeforeReassign_ ||
                                          w.escapeAfterReassign_;
+                // fix-forward #8479: a `return nn ?? e;` that hands the
+                // caller the slot's own reference (#6176) is a transfer: a
+                // scope-end release armed beside it frees the caller's
+                // value, so the local keeps its pre-#8479 verdict.
                 if (w.escapedDueToReassign && !leavesFrame)
                     w.escaped = false;
-                else
+                else if (!w.returnedByTransfer_)
                     closureEscapingScopeEndRelease_.insert(ldKey);
             }
         }
-        if (!w.escaped)
-            closureReleaseEligible_.insert(ldKey);
+        // fix #8717: a local whose value can be handed on through `??` /
+        // `as` to a reference-taking position (mayOutliveScope_) keeps its
+        // scope-end release but not the capture-cell free.
+        if (!w.escaped) {
+            if (w.mayOutliveScope_)
+                closureEscapingScopeEndRelease_.insert(ldKey);
+            else
+                closureReleaseEligible_.insert(ldKey);
+        }
         if (w.isReturned_) returnedByName.insert(ldKey);
     }
     // fix #8479 (§27.5 / §28.9, v0.357): a local that an owned alias was
@@ -40699,6 +40822,8 @@ void Emitter::collectClosureReleaseEligible(
     // `closureEscapingScopeEndRelease_`: its release stays armed, its
     // capture cells are no longer freed with the scope. A chain
     // (`a := g; b := a; return b;`) needs the fixpoint.
+    auto demoteSourcesOfUnconfinedAliases = [&]() {
+    bool demotedAny = false;
     for (bool changed = true; changed;) {
         changed = false;
         for (const ast::Node* alias : candidates) {
@@ -40718,9 +40843,13 @@ void Emitter::collectClosureReleaseEligible(
                 closureReleaseEligible_.erase(srcKey);
                 closureEscapingScopeEndRelease_.insert(srcKey);
                 changed = true;
+                demotedAny = true;
             }
         }
     }
+    return demotedAny;
+    };
+    demoteSourcesOfUnconfinedAliases();
     // fix #2714 (§27.5 / §28.9, v0.286): same conservative escape walk for the
     // BORROW side. A non-escaping borrow local releases its retained +1 at
     // scope end exactly-once (no UAF — no escaping alias; no double-free —
@@ -40743,6 +40872,114 @@ void Emitter::collectClosureReleaseEligible(
         if (!w.escaped)
             closureBorrowRetainEligible_.insert(
                 static_cast<const void*>(ld));
+    }
+    // fix #8717 (§7.7 / §17.4 / §28.9, v0.357): the forwarded-bind pass. A
+    // local bound through `??` / `as` (`var b := n ?? g;`, `var t := g as
+    // F;`) can hold `g`'s own function value (§7.7: "`a ?? b` returns `a` if
+    // non-null, else `b`"; §17.4: the result of `as` is a borrow of its
+    // operand), and it holds NO reference of its own: such a local is
+    // neither retained at the bind nor released (armClosureLocalRefcount is
+    // not invoked). The walker reads the bind as a read of `g` (the verdict
+    // it always had), so `g` was released at scope end with its capture
+    // cells freed even when `b` went on into a collection, and the
+    // collection called freed memory (MEASURED on r30-c1,
+    // `--sanitize=address`: `var b := n ?? g; fs.Add(b);`,
+    // heap-use-after-free). What `g` may do is decided by what `b` does:
+    //   - `b` confined to the scope: nothing changes;
+    //   - `b` escapes only into positions that take a reference of their
+    //     own (a `return` that mints, an instance-field store): `g`'s release
+    //     stays armed, its capture cells are left to the env destructor
+    //     (`closureEscapingScopeEndRelease_`);
+    //   - any other escape of `b` (a collection, a capture, an onward
+    //     assignment, a transferring `return`): nothing else holds a
+    //     reference for `b`, so `g`'s own must survive — `g` is not released.
+    // A chain (`b := n ?? g; c := n ?? b;`) propagates, hence the fixpoint;
+    // a demoted owned alias demotes its own source as above.
+    {
+        std::vector<const ast::Node*> fwdSources(candidates);
+        fwdSources.insert(fwdSources.end(), borrowCandidates.begin(),
+                          borrowCandidates.end());
+        struct ForwardedBind {
+            const void* bound;
+            std::vector<const void*> sources;
+            int ownLevel;  // 0 confined, 1 reference-taking, 2 kept
+        };
+        std::vector<ForwardedBind> binds;
+        std::function<void(const ast::Stmt*)> scanFwd =
+                [&](const ast::Stmt* s) {
+            if (!s) return;
+            LocalDeclInitView v = localDeclInitView(s);
+            if (v.init) {
+                ForwardedBind fb{static_cast<const void*>(s), {}, 0};
+                for (const ast::Node* x : fwdSources) {
+                    if (x == s) continue;
+                    ClosureEscapeWalker xw{ctx_, static_cast<const void*>(x)};
+                    if (xw.forwardsTarget(v.init, /*sawWrap=*/false))
+                        fb.sources.push_back(static_cast<const void*>(x));
+                }
+                if (!fb.sources.empty()) binds.push_back(std::move(fb));
+            }
+            if (auto* is2 = dynamic_cast<const ast::IfStmt*>(s)) {
+                for (auto& b : is2->ifBranch.body) scanFwd(b.get());
+                for (auto& br : is2->elifBranches)
+                    for (auto& b : br.body) scanFwd(b.get());
+                for (auto& b : is2->elseBody) scanFwd(b.get());
+            } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                for (auto& b : ws->body) scanFwd(b.get());
+            } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                for (auto& b : fs->body) scanFwd(b.get());
+            } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                for (auto& b : d->body) scanFwd(b.get());
+            } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+                for (auto& b : ts->body) scanFwd(b.get());
+                for (auto& c : ts->catches) scanFwd(c.body.get());
+                for (auto& b : ts->finallyBody) scanFwd(b.get());
+            } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                for (auto& arm : cs->arms)
+                    for (auto& a : arm.stmts) scanFwd(a.get());
+            }
+        };
+        for (auto& s : body) scanFwd(s.get());
+        for (ForwardedBind& fb : binds) {
+            ClosureEscapeWalker bw{ctx_, fb.bound};
+            bw.coalesceReturnTransfers = coalesceReturnTransfers;  // #6176
+            bw.scrutineeBorrowMode = true;
+            bw.walkWholeBody = true;
+            for (auto& s : body) bw.stmt(s.get());
+            if (bw.escaped || bw.mayOutliveScope_) {
+                const bool kept =
+                    bw.keptWithoutReference_ || bw.isCapturedCellSlot_ ||
+                    bw.escapedDueToReassign || bw.returnedByTransfer_ ||
+                    bw.escapedDueToAssignIntoClosureLocal_ ||
+                    (bw.isReturned_ && coalesceReturnTransfers);
+                fb.ownLevel = kept ? 2 : 1;
+            }
+        }
+        std::unordered_map<const void*, int> level;
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (const ForwardedBind& fb : binds) {
+                auto it = level.find(fb.bound);
+                const int lv = std::max(fb.ownLevel,
+                                        it == level.end() ? 0 : it->second);
+                if (!lv) continue;
+                for (const void* x : fb.sources) {
+                    int& xl = level[x];
+                    if (xl < lv) { xl = lv; changed = true; }
+                }
+            }
+        }
+        bool anyDemoted = false;
+        for (const auto& [x, lv] : level) {
+            if (lv >= 2) {
+                anyDemoted |= closureReleaseEligible_.erase(x) != 0;
+                anyDemoted |= closureEscapingScopeEndRelease_.erase(x) != 0;
+            } else if (lv == 1 && closureReleaseEligible_.erase(x)) {
+                closureEscapingScopeEndRelease_.insert(x);
+                anyDemoted = true;
+            }
+        }
+        if (anyDemoted) demoteSourcesOfUnconfinedAliases();
     }
 }
 

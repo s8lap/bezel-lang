@@ -875,3 +875,143 @@ public class C
 end C;
 )BZL"), e);
 }
+
+// ===========================================================================
+// FIX-FORWARD round 3, family 2 (narrow #8717): a value that leaves the
+// frame through `??` or `as`.
+//
+// §7.7 (v0.357): "`a ?? b` returns `a` if non-null, else `b`"; §17.4: the
+// result of `as` is a borrow of its operand. Either way the value that
+// reaches the store IS the local's closure. ClosureEscapeWalker read both
+// operands of every binary operator and the operand of `as` as non-escaping
+// reads, so a local whose closure a collection keeps (taking no reference,
+// #5866) was still released at scope end. The fix treats `??` / `as` as
+// forwarding the value to the enclosing position, as a bare read of the
+// local there would be.
+//
+// MEASURED (`--sanitize=address`, ASAN_OPTIONS=detect_leaks=1, 200 calls):
+//   row                                                     r30-c1        a4abadac6      with the fix
+//   producer_coalesce_rhs_added_to_callers_array_spec_7_7     UAF, 0 lines  UAF, 0 lines   leak 15200
+//   producer_as_cast_added_to_callers_array_spec_17_4         UAF, 0 lines  UAF, 0 lines   leak 15200
+//   alias_coalesce_rhs_added_to_callers_array_spec_7_7        leak 15200    UAF, 0 lines   leak 15200
+//   alias_as_cast_added_to_callers_array_spec_17_4            leak 15200    UAF, 0 lines   leak 15200
+// The remaining leak is `fs.Add(g)`'s own (#5866), so the oracle is
+// runNoMemoryErrorOut. The first two rows are red on r30-c1, the last two
+// on a4abadac6 (and on this suite's family-1 commit). The assignment
+// spelling `b := n ?? g; fs.Add(b);` stays a use-after-free for a reason
+// that predates both: `b := g; fs.Add(b);` fails the same way (#8723).
+// (1 - 2 + i) + (4 - 1 + i) = 2 + 2i.
+// ===========================================================================
+
+// #8717's repro: the producer `g` reaches `fs.Add` as the right operand of
+// `??` (§7.7).
+BEZEL_TEST(closure_local_alias_source_overwrite_8479,
+           producer_coalesce_rhs_added_to_callers_array_spec_7_7) {
+    std::string e;
+    for (int i = 0; i < 200; ++i) line(e, 2 + 2 * i);
+    e += "DONE\n";
+    BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(
+module M;
+public class C
+  public static method Fill(fs: Array<(int, int) -> int>, k: int)
+    var g: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
+    var n: ((int, int) -> int)? := null;
+    fs.Add(n ?? g);
+  end Fill;
+  public static method Main(): int
+    for var i in 0..<200 do
+      var fs: Array<(int, int) -> int> := new Array<(int, int) -> int>();
+      Fill(fs, i);
+      Console.WriteLine(fs[0](1, 2) + fs[0](4, 1));
+    end for;
+    Console.WriteLine("DONE");
+    return 0;
+  end Main;
+end C;
+)BZL"), e);
+}
+
+// The producer `g` reaches `fs.Add` through `(g as Fn)!` (§17.4: the result
+// of `as` is a borrow of `g`; §17.8: `!` neither moves nor copies).
+BEZEL_TEST(closure_local_alias_source_overwrite_8479,
+           producer_as_cast_added_to_callers_array_spec_17_4) {
+    std::string e;
+    for (int i = 0; i < 200; ++i) line(e, 2 + 2 * i);
+    e += "DONE\n";
+    BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(
+module M;
+type Fn := (int, int) -> int;
+public class C
+  public static method Fill(fs: Array<(int, int) -> int>, k: int)
+    var g: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
+    fs.Add((g as Fn)!);
+  end Fill;
+  public static method Main(): int
+    for var i in 0..<200 do
+      var fs: Array<(int, int) -> int> := new Array<(int, int) -> int>();
+      Fill(fs, i);
+      Console.WriteLine(fs[0](1, 2) + fs[0](4, 1));
+    end for;
+    Console.WriteLine("DONE");
+    return 0;
+  end Main;
+end C;
+)BZL"), e);
+}
+
+// An owned alias `a` of the producer reaches `fs.Add` as the right operand of
+// `??`.
+BEZEL_TEST(closure_local_alias_source_overwrite_8479,
+           alias_coalesce_rhs_added_to_callers_array_spec_7_7) {
+    std::string e;
+    for (int i = 0; i < 200; ++i) line(e, 2 + 2 * i);
+    e += "DONE\n";
+    BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(
+module M;
+public class C
+  public static method Fill(fs: Array<(int, int) -> int>, k: int)
+    var g: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
+    var a: (int, int) -> int := g;
+    var n: ((int, int) -> int)? := null;
+    fs.Add(n ?? a);
+  end Fill;
+  public static method Main(): int
+    for var i in 0..<200 do
+      var fs: Array<(int, int) -> int> := new Array<(int, int) -> int>();
+      Fill(fs, i);
+      Console.WriteLine(fs[0](1, 2) + fs[0](4, 1));
+    end for;
+    Console.WriteLine("DONE");
+    return 0;
+  end Main;
+end C;
+)BZL"), e);
+}
+
+// An owned alias `a` of the producer reaches `fs.Add` through `(a as Fn)!`.
+BEZEL_TEST(closure_local_alias_source_overwrite_8479,
+           alias_as_cast_added_to_callers_array_spec_17_4) {
+    std::string e;
+    for (int i = 0; i < 200; ++i) line(e, 2 + 2 * i);
+    e += "DONE\n";
+    BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(
+module M;
+type Fn := (int, int) -> int;
+public class C
+  public static method Fill(fs: Array<(int, int) -> int>, k: int)
+    var g: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
+    var a: (int, int) -> int := g;
+    fs.Add((a as Fn)!);
+  end Fill;
+  public static method Main(): int
+    for var i in 0..<200 do
+      var fs: Array<(int, int) -> int> := new Array<(int, int) -> int>();
+      Fill(fs, i);
+      Console.WriteLine(fs[0](1, 2) + fs[0](4, 1));
+    end for;
+    Console.WriteLine("DONE");
+    return 0;
+  end Main;
+end C;
+)BZL"), e);
+}
