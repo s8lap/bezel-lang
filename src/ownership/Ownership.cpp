@@ -10439,10 +10439,16 @@ bool MethodOwnership::movedSourceIsTrivialDispose(
         return false;
     const sema::Symbol* s = ctx_.exprSymbol(operand);
     if (!s) return false;
-    if (const auto* ps = dynamic_cast<const sema::ParameterSymbol*>(s))
+    if (const auto* ps = dynamic_cast<const sema::ParameterSymbol*>(s)) {
+        // A reassigned parameter (`p := new Derived();`) holds a produced
+        // value, not its declared type's, so its declared type cannot key the
+        // transfer: keep the warning, as the local arm below does.
+        if (reassigned.count(ps) != 0) return false;
         return ps->modifier == "owned" && ownedParamIsTrivialDispose(*ps);
+    }
     const auto* src = dynamic_cast<const sema::LocalSymbol*>(s);
     if (!src || src->isUsing) return false;
+    // LOCALDECL-ONLY: a `const` local is never Owned (§21.1), so it never carries the obligation a `move` transfers; a null cast returns false, which keeps the warning
     const auto* sd = dynamic_cast<const ast::LocalDecl*>(src->decl);
     if (!sd || sd->isUsing || !sd->initializer) return false;
     if (reassigned.count(src) != 0 || sd->becomesOwnedViaReassign) return false;
