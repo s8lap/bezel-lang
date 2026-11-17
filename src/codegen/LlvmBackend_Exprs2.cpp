@@ -8287,68 +8287,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // Gated on a CONCRETE element type: inside an unspecialized
                 // generic body the element layout is not known here, and the
                 // array is left exactly as it was before this fix.
-                auto embeddedStringThunk = [&](const sema::TypeRef* et,
-                                               bool retain) -> llvm::Function* {
-                    std::string name =
-                        std::string(retain ? "bz$arrEmbRetain$"
-                                           : "bz$arrEmbRelease$") +
-                        mangleTypeRefForSymbol(et);
-                    if (llvm::Function* have = module_->getFunction(name))
-                        return have;
-                    auto* fnTy = llvm::FunctionType::get(
-                        llvm::Type::getVoidTy(llvm_), {ptrTy()},
-                        /*isVarArg=*/false);
-                    auto* fn = llvm::Function::Create(
-                        fnTy, llvm::Function::InternalLinkage, name,
-                        module_.get());
-                    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
-                    // The two walkers emit through builder_/currentFn_ — point
-                    // both at the thunk, then restore (the
-                    // boxedRecordValueFreer pattern).
-                    llvm::Function* savedFn = currentFn_;
-                    auto* savedBB = builder_.GetInsertBlock();
-                    auto savedIP = savedBB ? builder_.GetInsertPoint()
-                                           : decltype(savedBB->begin()){};
-                    currentFn_ = fn;
-                    builder_.SetInsertPoint(entry);
-                    llvm::Value* elemAddr = &*fn->args().begin();
-                    if (retain)
-                        emitRecordStringFieldRetains_impl(elemAddr, et);
-                    else
-                        emitRecordStringFieldReleases_impl(elemAddr, et);
-                    if (!builder_.GetInsertBlock()->getTerminator())
-                        builder_.CreateRetVoid();
-                    currentFn_ = savedFn;
-                    if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
-                    return fn;
-                };
+                // The two thunks and the stamp live in
+                // `stampArrayStringCoOwner` (LlvmBackend_Layout.cpp), shared
+                // with the §9.8 deserialize arm (fix #8391).
                 auto stampStrDictKeyCoOwner = [&](llvm::Value* arr) {
-                    if (colName != "Array" || rt->genericArgs.empty() ||
-                        !rt->genericArgs[0])
-                        return;
-                    const sema::TypeRef* et =
-                        resolveTypeParamRef(rt->genericArgs[0]);
-                    if (isDictEntryStringKeyTypeRef(et)) {
-                        auto* ownFn = declareC("bz_array_own_str_dict_keys",
-                                               llvm::Type::getVoidTy(llvm_),
-                                               {ptrTy(), i64()});
-                        builder_.CreateCall(
-                            ownFn, {arr, builder_.getInt64(elemSize)});
-                        return;
-                    }
-                    // fix #8386: a record element with string components.
-                    if (!isRecordWithStringFieldsTypeRef(et) ||
-                        !typeRefIsRuntimeConcrete(et))
-                        return;
-                    llvm::Function* retainFn = embeddedStringThunk(et, true);
-                    llvm::Function* releaseFn = embeddedStringThunk(et, false);
-                    auto* ownFn = declareC(
-                        "bz_array_own_embedded_strings",
-                        llvm::Type::getVoidTy(llvm_),
-                        {ptrTy(), i64(), ptrTy(), ptrTy()});
-                    builder_.CreateCall(ownFn,
-                                        {arr, builder_.getInt64(elemSize),
-                                         retainFn, releaseFn});
+                    stampArrayStringCoOwner(arr, rt, elemSize);
                 };
                 if (colName == "Array" && ne.args.size() == 2 &&
                     ne.args[0].value && ne.args[1].value) {

@@ -1080,3 +1080,192 @@ end C;
 )BZL"),
                 "200\n");
 }
+
+// ===========================================================================
+// N1 of the third review (#8391): a DESERIALIZED `Array<E>` of a record with a
+// string component must CO-OWN the strings its slots embed.
+//
+// §28.9 (v0.357): `string` is runtime-managed; §28.3.1 K1.6: a runtime-managed
+// value carries no obligation, so "the stored copy stays live" is the
+// runtime's job, realized by refcount held by whatever stores the copy; §28.11
+// (*The element slot policy*): the borrowing `Array<T>` holds a reference on
+// every runtime-managed string its slots embed. Staging's #8386 realizes that
+// for `new Array<E>` by stamping the array with `bz_array_own_embedded_strings`;
+// the §9.8 deserialize arm built its array with `bz_array_alloc` and did not,
+// so
+//     b2.Items.Add(new E(f[0], i));      // f a loop-local Array<string>
+//     r.Name                             // read freed memory
+// was a use-after-free on a shape the #8391 fix newly admits.
+//
+// Every row runs under `runAotChecked` (AddressSanitizer over the generated
+// module + LeakSanitizer at exit), 100 deserialize rounds per program, and is
+// RED on the pre-fix tip. The programs that are green with and without the
+// stamp (the `new Array<E>` control; nullable and generic components) are
+// conformance-corpus candidates, not rows here (owner rule 2026-11-12).
+// ===========================================================================
+
+namespace {
+
+// `<ser>` / `<des>` name the format pair (Binary / Json).
+std::string formatPair(std::string text, const char* fmt) {
+    const std::string f = fmt;
+    for (const char* tok : {"<Ser>", "<Des>"}) {
+        const std::string t = tok;
+        const std::string repl =
+            f + (t == "<Ser>" ? "Serializer" : "Deserializer");
+        for (std::size_t p; (p = text.find(t)) != std::string::npos;)
+            text.replace(p, t.size(), repl);
+    }
+    return text;
+}
+
+// The review's probe n7: an EMPTY `Bag` round-trips, then three elements built
+// from a loop-local `Split` temporary are added to the DESERIALIZED array.
+const char* kAddTempStringProgram = R"BZL(
+record E(Name: string, N: int): ISerializable, IDeserializable;
+class Bag(id: int, owned items: Array<E>): ISerializable, IDeserializable
+  public owned Items: Array<E> := items;
+  public property Id: int => id;
+end Bag;
+class C
+  public static method Main(): int
+    var total := 0;
+    for var k in 1..100 do
+      using var b := new Bag(1, new Array<E>());
+      using var s := new <Ser>();
+      b.Serialize(s);
+      using var bytes := s.ToBytes();
+      using var d := new <Des>(bytes.AsReadOnlySpan());
+      using var b2 := Bag.Deserialize(d);
+      for var i in 1..3 do
+        var f := $"name{i},z".Split(',');
+        b2.Items.Add(new E(f[0], i));
+      end;
+      var junk := new Array<string>();
+      for var i in 1..100 do junk.Add($"junkjunkjunk{i}"); end;
+      for var r in b2.Items do total := total + r.Name.Length + r.N; end;
+    end;
+    Console.WriteLine(total);
+    return 42;
+  end Main;
+end C;
+)BZL";
+
+}  // namespace
+
+// 100 rounds x ("name1".."name3" = 5 chars each, + N 1..3) = 100 x 21.
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           deserialized_array_of_record_add_temp_string_binary_100x_spec_28_9_v0357) {
+    expectClean(runAotChecked(std::string(kHead) +
+                              formatPair(kAddTempStringProgram, "Binary")),
+                "2100\n");
+}
+
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           deserialized_array_of_record_add_temp_string_json_100x_spec_28_9_v0357) {
+    expectClean(runAotChecked(std::string(kHead) +
+                              formatPair(kAddTempStringProgram, "Json")),
+                "2100\n");
+}
+
+namespace {
+
+// The mutators over a NON-EMPTY deserialized array whose element nests a
+// record and carries two strings: a temporary-built element added, an indexer
+// store, a RemoveAt, a copy-out that outlives a Clear, and a re-Add — every
+// path that gives a slot's string references back or takes them (§28.11
+// *The element slot policy*). The same statements run against a
+// `new Array<E>` (the #8386 stamp) print the same total.
+const char* kMutatorsProgram = R"BZL(
+record In(S: string): ISerializable, IDeserializable;
+record E(A: string, N: int, I: In, B: string): ISerializable, IDeserializable;
+class Bag(id: int, owned items: Array<E>): ISerializable, IDeserializable
+  public owned Items: Array<E> := items;
+  public property Id: int => id;
+end Bag;
+class C
+  public static method Main(): int
+    var total := 0;
+    for var k in 1..100 do
+      using var b := new Bag(1, new Array<E>());
+      b.Items.Add(new E("a0", 0, new In("s0"), "b0"));
+      using var s := new <Ser>();
+      b.Serialize(s);
+      using var bytes := s.ToBytes();
+      using var d := new <Des>(bytes.AsReadOnlySpan());
+      using var b2 := Bag.Deserialize(d);
+      for var i in 1..3 do
+        var f := $"a{i},s{i},b{i}".Split(',');
+        b2.Items.Add(new E(f[0], i, new In(f[1]), f[2]));
+      end;
+      var junk := new Array<string>();
+      for var i in 1..100 do junk.Add($"junkjunkjunk{i}"); end;
+      for var r in b2.Items do
+        total := total + r.A.Length + r.I.S.Length + r.B.Length;
+      end;
+      b2.Items[0] := b2.Items[2];
+      b2.Items.RemoveAt(1);
+      var t := b2.Items[0];
+      b2.Items.Clear();
+      b2.Items.Add(t);
+      total := total + b2.Items[0].B.Length;
+    end;
+    Console.WriteLine(total);
+    return 42;
+  end Main;
+end C;
+)BZL";
+
+// Every cut of a one-element payload (two strings in the element), 100
+// rounds: the half-built array is discharged on the unwind edge, and the
+// strings a stamped array co-owns are given back exactly once.
+const char* kTruncationProgram = R"BZL(
+record E(A: string, N: int, B: string): ISerializable, IDeserializable;
+class Bag(id: int, owned items: Array<E>): ISerializable, IDeserializable
+  public owned Items: Array<E> := items;
+  public property Id: int => id;
+end Bag;
+class C
+  public static method Main(): int
+    var caught := 0;
+    var expected := 0;
+    for var k in 1..100 do
+      using var b := new Bag(1, new Array<E>());
+      for var i in 1..3 do
+        var f := $"alpha{i},beta{i}".Split(',');
+        b.Items.Add(new E(f[0], i, f[1]));
+      end;
+      using var s := new <Ser>();
+      b.Serialize(s);
+      using var bytes := s.ToBytes();
+      for var cut in 1..(bytes.Length - 1) do
+        expected := expected + 1;
+        using var d := new <Des>(bytes.AsReadOnlySpan(0, cut));
+        try
+          using var b2 := Bag.Deserialize(d);
+        catch SerializationException => caught := caught + 1;
+        end;
+      end;
+    end;
+    Console.WriteLine(caught = expected);
+    return 42;
+  end Main;
+end C;
+)BZL";
+
+}  // namespace
+
+// 100 rounds x 26 (see the program: 24 summed in the loop + 2 re-read).
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           deserialized_array_of_record_mutators_json_100x_spec_28_11_v0357) {
+    expectClean(runAotChecked(std::string(kHead) +
+                              formatPair(kMutatorsProgram, "Json")),
+                "2600\n");
+}
+
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           deserialized_array_of_record_every_cut_binary_100x_no_leak_spec_28_3_v0357) {
+    expectClean(runAotChecked(std::string(kHead) +
+                              formatPair(kTruncationProgram, "Binary")),
+                "True\n");
+}

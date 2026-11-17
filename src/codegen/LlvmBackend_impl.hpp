@@ -12857,6 +12857,12 @@ private:
     // runtime's kind-level tag).
     llvm::GlobalVariable* builtinInstanceDescriptorFor(const sema::TypeRef* rt);
     void stampBuiltinTypeDesc(llvm::Value* arr, const sema::TypeRef* rt);
+    // fix #6557 / #8386 / #8391: the string co-ownership stamp of a borrowing
+    // `Array<E>` and its element thunks (LlvmBackend_Layout.cpp).
+    llvm::Function* arrayEmbeddedStringThunk(const sema::TypeRef* et, bool retain);
+    llvm::Function* stampArrayStringCoOwner(llvm::Value* arr,
+                                            const sema::TypeRef* arrTy,
+                                            int64_t elemSize);
     void stampRuntimeProducedArray(llvm::Value* arr, const sema::TypeRef* rt);  // fix #6891
     // fix #8533 (§28.5 / §28.11 / §28.13, v0.357): record in a LinkedList /
     // Dictionary / hash-backed Set header what disposing it through an ERASED

@@ -5533,6 +5533,77 @@ void Emitter::stampBuiltinTypeDesc(llvm::Value* arr, const sema::TypeRef* rt) {
         {arr, d});
 }
 
+// fix #8386 (§28.9 / §28.3.1 K1.6 / §28.11, v0.357): the retain / release
+// thunk of a record element's embedded strings, applied to the ADDRESS of one
+// element. One pair per concrete element type per module, found again by name.
+// (Moved out of `lowerNew`'s `Array` arm by fix #8391 so the §9.8 deserialize
+// arm builds the SAME stamp; the construction is unchanged.)
+llvm::Function* Emitter::arrayEmbeddedStringThunk(const sema::TypeRef* et,
+                                                  bool retain) {
+    std::string name =
+        std::string(retain ? "bz$arrEmbRetain$" : "bz$arrEmbRelease$") +
+        mangleTypeRefForSymbol(et);
+    if (llvm::Function* have = module_->getFunction(name)) return have;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      name, module_.get());
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    // The two walkers emit through builder_/currentFn_ — point both at the
+    // thunk, then restore (the boxedRecordValueFreer pattern).
+    llvm::Function* savedFn = currentFn_;
+    auto* savedBB = builder_.GetInsertBlock();
+    auto savedIP =
+        savedBB ? builder_.GetInsertPoint() : decltype(savedBB->begin()){};
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entry);
+    llvm::Value* elemAddr = &*fn->args().begin();
+    if (retain)
+        emitRecordStringFieldRetains_impl(elemAddr, et);
+    else
+        emitRecordStringFieldReleases_impl(elemAddr, et);
+    if (!builder_.GetInsertBlock()->getTerminator()) builder_.CreateRetVoid();
+    currentFn_ = savedFn;
+    if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
+    return fn;
+}
+
+// fix #6557 / #8386 (§28.9 / §28.3.1 K1.6 / §28.11, v0.357): stamp a fresh,
+// still-EMPTY (or just-filled) borrowing `Array<E>` so it co-owns the strings
+// its slots embed — see the long note at `lowerNew`'s Array arm. `arrTy` is
+// the array's static type (`Array<E>`), `elemSize` its element stride.
+// Returns the element RELEASE thunk when the embedded-string stamp was applied
+// (a caller that built each element with its own +1 per string must give that
+// +1 back once the array has taken its own), else nullptr.
+llvm::Function* Emitter::stampArrayStringCoOwner(llvm::Value* arr,
+                                                 const sema::TypeRef* arrTy,
+                                                 int64_t elemSize) {
+    if (!arrTy || arrTy->headName() != "Array" || arrTy->genericArgs.empty() ||
+        !arrTy->genericArgs[0])
+        return nullptr;
+    const sema::TypeRef* et = resolveTypeParamRef(arrTy->genericArgs[0]);
+    if (isDictEntryStringKeyTypeRef(et)) {
+        auto* ownFn = declareC("bz_array_own_str_dict_keys",
+                               llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), i64()});
+        builder_.CreateCall(ownFn, {arr, builder_.getInt64(elemSize)});
+        return nullptr;
+    }
+    // fix #8386: a record element with string components. Gated on a CONCRETE
+    // element type: inside an unspecialized generic body the element layout is
+    // not known here, and the array is left exactly as it was.
+    if (!isRecordWithStringFieldsTypeRef(et) || !typeRefIsRuntimeConcrete(et))
+        return nullptr;
+    llvm::Function* retainFn = arrayEmbeddedStringThunk(et, true);
+    llvm::Function* releaseFn = arrayEmbeddedStringThunk(et, false);
+    auto* ownFn = declareC("bz_array_own_embedded_strings",
+                           llvm::Type::getVoidTy(llvm_),
+                           {ptrTy(), i64(), ptrTy(), ptrTy()});
+    builder_.CreateCall(
+        ownFn, {arr, builder_.getInt64(elemSize), retainFn, releaseFn});
+    return releaseFn;
+}
+
 
 // fix #6891 (§8.5, §12.7, v0.340): an Array<T> a RUNTIME producer allocated
 // (String.Split, a lazy pipeline's ToArray, File.ReadAllLines, GroupBy,

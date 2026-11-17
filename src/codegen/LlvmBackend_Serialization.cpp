@@ -1975,6 +1975,17 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
             // `Array<T>` (stdlib §4.4) does not.
             stampOwningElemDisposer(arr, seqElem,
                                      fieldTy->headName() == "OwningArray");
+            // fix #8391 (§28.9 / §28.3.1 K1.6 / §28.11, v0.357): a borrowing
+            // `Array<E>` of a record with string components CO-OWNS the
+            // strings its slots embed (fix #8386) — the very stamp
+            // `new Array<E>` carries. Stamped here, while the array is still
+            // empty: without it the deserialized array's `Add` / indexer store
+            // / `Clear` keep no reference of their own, and
+            // `items.Add(new E(<temp string>))` then `r.Name` read freed
+            // memory. `elemReleaseFn` is the element release thunk when the
+            // stamp applies (see the per-element give-back below).
+            llvm::Function* elemReleaseFn = stampArrayStringCoOwner(
+                arr, fieldTy, collectionElemSize(fieldTy));
             // fix #8391 (F1) / §28.3 / §28.9 / §28.11: the fresh array is
             // owned by NOBODY until the enclosing class takes it into the
             // constructed object — and a truncated wire makes the element
@@ -2075,6 +2086,12 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
             if (elem) {
                 builder_.CreateStore(elem, elemSlot);
                 builder_.CreateCall(addFn, {arr, elemSlot, esz});
+                // A stamped array took its OWN reference on every embedded
+                // string of the slot it just gained (bz_array_add); the +1 the
+                // reader gave the element is now surplus and is given back,
+                // so the strings are held exactly once, by the array.
+                if (elemReleaseFn)
+                    builder_.CreateCall(elemReleaseFn, {elemSlot});
                 builder_.CreateStore(
                     builder_.CreateAdd(i, builder_.getInt64(1)), idxSlot);
                 builder_.CreateBr(hdrBB);
