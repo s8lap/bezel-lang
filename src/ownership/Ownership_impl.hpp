@@ -921,15 +921,19 @@ public:
     bool rhsIsVacuousBorrowPin(const ast::Expr& e) const;
     bool rhsIsDisposableClassType(const sema::TypeRef* rt);
     // §28.9 (v0.237) trivial-dispose discharge-warning exemption (#2654):
-    // is `ld` a plain `var` bound to `new T(...)` where T is a trivial-dispose
-    // CLASS? Consulted ONLY to suppress the §28.3 auto-drop WARNING — the
+    // is `ld` a plain `var` whose drop-site value is a trivial-dispose CLASS?
+    // The key is the PRODUCED type for a `new` / call initializer and the
+    // local's declared type otherwise (fix #4418, §28.9 v0.357; the name keeps
+    // its `new` history). Consulted ONLY to suppress the §28.3 auto-drop WARNING — the
     // `autoDropAtScopeEnd` flag and the emitted scope-end free are unaffected.
     // fix #2666: the inline-array-field arm of the trivial-dispose predicate
     // is now tested INSIDE `common::isNonTrivialDisposeClass` itself, so the
     // `classChainHasOwningInlineArrayField` companion walk this method used
     // to consult (#2654) is removed — see `localIsTrivialDisposeNewBinding`'s
     // header comment for the rationale and the #2666 walk-through.
-    bool localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld);
+    bool localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld,
+                                         const sema::LocalSymbol* ls,
+                                         bool reassigned);
 
     // narrow #4743: the TYPE-classification half of `localIsTrivialDisposeNewBinding`,
     // factored out so the owned-PARAMETER must-use gate reads the same
@@ -952,6 +956,11 @@ public:
     // (noisy) warning rather than a hidden obligation, the same direction
     // `localIsTrivialDisposeNewBinding`'s header commits to. // per §28.9
     bool typeIsProvablyTrivialDisposeClass(const sema::TypeRef* t);
+    // fix #4418 (§28.9, v0.357): the declared-type arm at the two holder forms
+    // with no producer. WARNING-suppression only.
+    bool ownedParamIsTrivialDispose(const sema::ParameterSymbol& ps);
+    bool iterVarIsTrivialDispose(const ast::ForStmt& fs,
+                                 const sema::LocalSymbol& ls);
 
     // §28.8.1 / fix #3586 — test-only accessor: true when `s` was recorded
     // as lexically inside a `try` by collectStmtsInsideTry. Exposed so the

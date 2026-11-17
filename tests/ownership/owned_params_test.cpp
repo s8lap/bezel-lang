@@ -293,7 +293,7 @@ BEZEL_TEST(own_param_3037, second_owned_param_auto_drop_at_its_own_decl) {
 BEZEL_TEST(own_param_3037, iterator_param_auto_drop_warning_at_decl_not_zero) {
     const std::string src =
         "module M;\n"
-        "class R end R;\n"
+        "class R destructor end destructor; end R;\n"
         "class C\n"
         "  public static method Gen(owned a: R): IOwningEnumerable<int>\n"
         "    yield return 0;\n"

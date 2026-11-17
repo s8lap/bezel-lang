@@ -21,7 +21,7 @@ std::string mod(const std::string& body) {
 
 BEZEL_TEST(own_return, owned_return_into_plain_var_undischarged_diagnoses) {
     auto r = parseAndCheckOwnership(mod(
-        "class T end T; "
+        "class T destructor end destructor; end T; "
         "class C "
         "  public method Make(): owned T => new T(); "
         "  public method M() "
@@ -71,7 +71,7 @@ BEZEL_TEST(own_return, borrowed_return_into_plain_var_clean) {
 
 BEZEL_TEST(own_return, owned_return_dispatched_on_param) {
     auto r = parseAndCheckOwnership(mod(
-        "class T end T; "
+        "class T destructor end destructor; end T; "
         "class Source public method Read(): owned T => new T(); end Source; "
         "class C "
         "  public method M(src: Source) "

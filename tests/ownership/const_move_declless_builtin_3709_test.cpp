@@ -213,17 +213,22 @@ BEZEL_TEST(const_move_declless_builtin_3709,
 
 // =============================================================================
 // ACCEPT CONTROL — `var y := move sb;` (not `const`) stays accepted: the
-// `move` now correctly classifies Owned (this fix), so `y` carries a
-// disposal obligation like any other owned local — proven by the standard
-// §28.3 auto-drop warning appearing on an undischarged `y`, and by a clean
-// compile once `y` is discharged (`_ := y;`).
+// `move` classifies Owned (this fix), so `y` is an owned local like any other.
+// §28.9 (v0.357, #4418) then exempts it from the §28.3 must-use warning: its
+// type (`StringBuilder`) is trivial-dispose and the `move` has no statically-
+// known producer, so the DECLARED type keys the exemption -- "No must-use /
+// auto-drop diagnostic attaches to a trivial-dispose value" at the implicit-
+// drop site of a plain-`var` owned local. (Pre-#4418 this row pinned the
+// warning; the spec flip is the reason the expectation changed. The Owned
+// classification itself stays pinned by the const-rejection rows above and by
+// the discharged control below.)
 // =============================================================================
 BEZEL_TEST(const_move_declless_builtin_3709,
-           var_move_of_stringbuilder_undischarged_autodrop_warns_control) {
+           var_move_of_stringbuilder_undischarged_silent_trivial_dispose_28_9) {
     auto r = parseAndCheckOwnership(
         builtinProg("new StringBuilder()", "var y := move v;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "y"));
+    BEZEL_EXPECT_FALSE(hasAutoDropWarning(r, "y"));
 }
 
 BEZEL_TEST(const_move_declless_builtin_3709,

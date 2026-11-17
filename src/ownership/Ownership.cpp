@@ -1272,6 +1272,12 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // adoption idiom `using var … := owned …` is the
                         // warning-free spelling. Diagnostic-only: the frame
                         // disposal itself is unchanged. // per §28.3/§29.8/§30.1
+                        // fix #4418 (§28.9, v0.357): the exemption names "an
+                        // undischarged `owned` parameter — a method's, an
+                        // iterator's (§29.8), or an async method's (§30.1)".
+                        // WARNING ONLY: `iteratorAutoDispose` above still arms
+                        // the frame's disposal.
+                        if (ownedParamIsTrivialDispose(*ps)) continue;
                             ctx_.diagnostics().report(
                             Severity::Warning,
                             obligationDiagLoc(sym, st),
@@ -1314,6 +1320,11 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // The same §28.3 must-use warning the never-discharged
                         // branch above emits: on the branch that does NOT adopt,
                         // the frame's teardown is an implicit drop.
+                        // fix #4418 (§28.9, v0.357): the conditionally-adopted
+                        // twin of the never-discharged arm above; the same
+                        // exemption (the flag above still arms the frame
+                        // disposal).
+                        if (ownedParamIsTrivialDispose(*ps)) continue;
                             ctx_.diagnostics().report(
                             Severity::Warning,
                             obligationDiagLoc(sym, st),
@@ -1359,7 +1370,12 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // still needs the body-end task disposal (the flag above), but
                         // NOT the must-use warning — the await IS the discharge, exactly
                         // as for a warning-free plain-local await. // per §30.5
-                        if (awaitDischargedIterVars_.count(sym) == 0)
+                        // fix #4418 (§28.9, v0.357): the exemption names "an
+                        // owning iteration variable (§29.2) whose type is
+                        // trivial-dispose". WARNING ONLY: the body-end disposal
+                        // flag above stays set.
+                        if (awaitDischargedIterVars_.count(sym) == 0 &&
+                            !iterVarIsTrivialDispose(*fs, *ls))
                                 ctx_.diagnostics().report(
                                 Severity::Warning,
                                 st.obligationOrigin ? st.obligationOrigin->span.begin
@@ -1565,7 +1581,8 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // silence the must-use warning for it (the `new`-form
                         // twin's arm is unchanged).
                         // per §28.9, §28.3.3, §15.4, v0.357, #7980
-                        if (!localIsTrivialDisposeNewBinding(*ld) &&
+                        if (!localIsTrivialDisposeNewBinding(
+                                *ld, ls, reassignedLocals.count(sym) != 0) &&
                             // §29.11 (v0.334): a bound lazy query whose
                             // enumeration right is spent at a statically
                             // visible consumption point is silent — the
@@ -1649,10 +1666,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // trivial-dispose". Read the declared type here: a
                         // parameter has no statically-known producer, which is
                         // the arm §28.9's classification key selects.
-                        const sema::TypeRef* pt = ps->declType
-                            ? ctx_.resolvedType(*ps->declType)
-                            : ps->resolvedDeclType;
-                        if (!typeIsProvablyTrivialDisposeClass(pt)) {
+                        if (!ownedParamIsTrivialDispose(*ps)) {
                             // fix #3033 / §28.10 (v0.240, restated at v0.350, issue
                             // #7481): the fourth remedy used to read "rebind it with
                             // `using var`", naming a spelling that is NOT a discharge.
@@ -1746,7 +1760,9 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // plain-`var` owned local ... whose type is
                         // trivial-dispose". WARNING ONLY — the scope-end
                         // free armed just above still runs. // per §28.9
-                        if (localIsTrivialDisposeNewBinding(*ld)) continue;
+                        if (localIsTrivialDisposeNewBinding(
+                                *ld, ls, reassignedLocals.count(sym) != 0))
+                            continue;
                             ctx_.diagnostics().report(
                             Severity::Warning,
                             st.obligationOrigin ? st.obligationOrigin->span.begin
@@ -1874,7 +1890,10 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
         // above (the frame is freed by codegen's body-end fire-and-forget, never by
         // the await), but suppress the spurious must-use warning, matching the
         // warning-free plain-local await. // per §30.5
-        if (awaitDischargedIterVars_.count(sym) == 0)
+        // fix #4418 (§28.9, v0.357): the break-only-body twin of the
+        // exemption at the endState arm above.
+        if (awaitDischargedIterVars_.count(sym) == 0 &&
+            !iterVarIsTrivialDispose(*fs, *ls))
             ctx_.diagnostics().report(
                 Severity::Warning, fs->span.begin,
                 std::string("owned value in `") + std::string(ls->name) +
@@ -1915,6 +1934,9 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // frame-disposed on the fault edge (§30.1 "on every completion path
             // (success, fault, and cancellation)"), and the lint fires there
             // too, attached at the parameter declaration. Diagnostic-only.
+            // fix #4418 (§28.9, v0.357): the throw-only-exit twin; the flag
+            // above still arms the frame disposal.
+            if (ownedParamIsTrivialDispose(*ps)) continue;
             ctx_.diagnostics().report(
                 Severity::Warning,
                 ps->decl ? ps->decl->span.begin : SourceLocation{},
@@ -2034,6 +2056,15 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 // would duplicate.
                 if (ld->autoDropAtScopeEnd) continue;
                 const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd = true;
+                // fix #4418 (§28.9, v0.357): the nested-scope mirror of the
+                // function-exit arm's ceremony exemption. WARNING ONLY -- the
+                // scope-end free armed just above still runs.
+                // A REASSIGNED local is left alone: the value dropped here is
+                // a later store's, which its initializer's type says nothing
+                // about (`var o: Object := new Res(1); o := 42;`).
+                if (reassignedLocals.count(sym) == 0 &&
+                    localIsTrivialDisposeNewBinding(*ld, ls, false))
+                    continue;
                 ctx_.diagnostics().report(
                     Severity::Warning, ld->span.begin,
                     std::string("owned value in `") + std::string(sym->name) +
@@ -10269,22 +10300,52 @@ bool MethodOwnership::rhsIsVacuousBorrowPin(const ast::Expr& e) const {
 // structural: `ld.isUsing` is excluded below, and an `owned` LOCATION (field,
 // `owned` parameter) is not an `ast::LocalDecl` at all, so it cannot reach
 // this arm.  // per §28.9, §28.3, v0.268, #2654 + #2666 + #2667
-bool MethodOwnership::localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld) {
+bool MethodOwnership::localIsTrivialDisposeNewBinding(
+        const ast::LocalDecl& ld, const sema::LocalSymbol* ls, bool reassigned) {
     if (ld.isUsing) return false;                      // "…or `using var`"
     if (!ld.initializer) return false;
-    const auto* ne = dynamic_cast<const ast::NewExpr*>(ld.initializer.get());
-    if (!ne) return false;                             // "A `new` expression…"
-    // Classify the `new` EXPRESSION's own type, never the local's DECLARED
-    // type. The spec sentence is "A `new` expression OF A TRIVIAL-DISPOSE
-    // CLASS TYPE …", and the two differ exactly where it matters:
-    // `var b: Base := new Derived();` with a trivial `Base` and a
-    // destructor-bearing `Derived` allocates a NON-trivial instance carrying a
-    // real §28.3 obligation. Keying on the declared `Base` there would suppress
-    // a warning that is genuinely due — the dangerous direction. Falls back to
-    // the written `new T` type node when the expression type is unavailable
-    // (error recovery).  // per §28.9, v0.237, #2654
-    const sema::TypeRef* t = ctx_.exprType(*ne);
-    if (!t && ne->type) t = ctx_.resolvedType(*ne->type);
+    // fix #4418 (§28.9, v0.357): the exemption's classification key is "read
+    // from the PRODUCED type where the drop site's value has a statically-known
+    // producer (a `new` expression, an `owned`-returning call), and from the
+    // DECLARED type otherwise". So the `new` form (the only form this
+    // predicate used to admit) is now one of three arms:
+    //   * a `new` expression or a CALL -- the produced type is the
+    //     expression's own type (for a call, the callee's declared `owned T`
+    //     return after substitution). Never the local's declared type: the
+    //     two differ exactly where it matters, e.g. `var b: Base := new
+    //     Derived();` with a trivial `Base` and a destructor-bearing
+    //     `Derived` allocates a NON-trivial instance carrying a real §28.3
+    //     obligation, and keying on the declared `Base` would suppress a
+    //     warning that is genuinely due -- the dangerous direction.
+    //   * any other initializer (a `move` transfer, an `if`/`??` join, an
+    //     index/slice read) -- no statically-known producer, so the local's
+    //     declared (or inferred) type decides.
+    // An interface-typed key is never trivial-dispose
+    // (`typeIsProvablyTrivialDisposeClass` rejects every non-`Class`
+    // declaration), so an `owned IThing`-returning call keeps its warning.
+    // A CollectionLiteralExpr has no recorded exprType (§15.4 context-typing),
+    // so it falls to the declared-type arm, which is the literal's target.
+    // Falls back to the written `new T` type node when the expression type is
+    // unavailable (error recovery).  // per §28.9, v0.357, #2654, #4418
+    const sema::TypeRef* t = nullptr;
+    if (const auto* ne = dynamic_cast<const ast::NewExpr*>(ld.initializer.get())) {
+        t = ctx_.exprType(*ne);
+        if (!t && ne->type) t = ctx_.resolvedType(*ne->type);
+    } else {
+        // The CALL and declared-type arms key on the INITIALIZER's value, so
+        // they hold only while the local still holds it: a reassigned local
+        // (`var x: Base? := null; x := new Derived();`) or a null-initialized
+        // one that becomes owned through reassignment drops a value this
+        // initializer says nothing about. Those keep the warning -- a retained
+        // (noisy) lint, never a hidden obligation.
+        if (reassigned || ld.becomesOwnedViaReassign) return false;
+        if (dynamic_cast<const ast::NullLiteralExpr*>(ld.initializer.get()))
+            return false;
+        if (dynamic_cast<const ast::CallExpr*>(ld.initializer.get()))
+            t = ctx_.exprType(*ld.initializer);
+        else if (ls)
+            t = ls->declType;
+    }
     return typeIsProvablyTrivialDisposeClass(t);
 }
 
@@ -10331,6 +10392,30 @@ bool MethodOwnership::typeIsProvablyTrivialDisposeClass(
     // picking up the §28.9 recursive clause here too.
     if (common::isNonTrivialDisposeClass(t, ctx_)) return false;
     return true;
+}
+
+// fix #4418 (§28.9, v0.357): the declared-type arm of the exemption's key for
+// the two holder forms with no producer. An `owned` parameter's type is its
+// declared type (the arm §28.9 selects: "a parameter has no producer"); read
+// through the same POSITIVE predicate as the owned-local arm, so an interface,
+// a bare type parameter, a frame and an `Owning*` head all keep the warning.
+bool MethodOwnership::ownedParamIsTrivialDispose(
+        const sema::ParameterSymbol& ps) {
+    const sema::TypeRef* pt = ps.declType ? ctx_.resolvedType(*ps.declType)
+                                          : ps.resolvedDeclType;
+    return typeIsProvablyTrivialDisposeClass(pt);
+}
+
+// An owning iteration variable's type (§29.2) is the element type of the owning
+// enumerable: its written `: T` annotation when present, else the local
+// symbol's resolved type. No statically-known producer, so the declared-type
+// arm of §28.9's key. // per §28.9, §29.2, v0.357, #4418
+bool MethodOwnership::iterVarIsTrivialDispose(const ast::ForStmt& fs,
+                                              const sema::LocalSymbol& ls) {
+    const sema::TypeRef* t = fs.varType ? ctx_.resolvedType(*fs.varType)
+                                        : nullptr;
+    if (!t) t = ls.declType;
+    return typeIsProvablyTrivialDisposeClass(t);
 }
 
 bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {

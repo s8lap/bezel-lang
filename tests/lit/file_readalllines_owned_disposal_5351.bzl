@@ -7,19 +7,26 @@
 // Directory.GetFiles, Directory.GetDirectories, FrozenArray<T>.From,
 // Stopwatch.StartNew, CancellationTokenSource factories).
 //
-// This file verifies that the warning fires correctly when a File.ReadAllLines
-// result is stored in a plain `var` local (implicit scope-end disposal), and
-// that the using var form also triggers disposal.
+// This file verifies that a File.ReadAllLines result stored in a plain `var`
+// local (implicit scope-end disposal) compiles, and that the using var form
+// does too.
 //
-// RUN: %bezelc -c %s 2>&1 | FileCheck %s
+// §28.9 (v0.357, fix #4418): `Array<string>` is trivial-dispose, so the
+// ceremony exemption silences the §28.3 must-use warning at the implicit-drop
+// site of a plain-`var` local bound to this `owned`-returning call (the
+// produced type keys the exemption). This row pinned that warning as its
+// proof the obligation was registered; the spec flip reverses it, and the
+// scope-end free itself is covered by the leak tests for #5351.
+//
+// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 // RUN: %bezelc -c -o %t.o %s
 
 module M5351;
 
 class C5351
   public static method TestPlainVar(): int
-    // With the fix, `lines` is Owned and triggers §28.3 auto-drop warning.
-    // The warning confirms the ownership obligation is registered.
+    // `lines` is Owned and auto-dropped at scope end; the trivial-dispose
+    // ceremony exemption (§28.9) draws no warning.
     var lines := File.ReadAllLines("/tmp/test.txt");
     return lines.Count;
   end TestPlainVar;
@@ -35,4 +42,4 @@ class C5351
   end Main;
 end C5351;
 
-// CHECK: warning: owned value in `lines` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop)
+// NODIAG-NOT: warning:

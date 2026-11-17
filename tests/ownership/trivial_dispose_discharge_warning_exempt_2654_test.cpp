@@ -243,18 +243,20 @@ BEZEL_TEST(own_trivial_dispose_2654, declared_trivial_base_with_trivial_new_is_e
     BEZEL_EXPECT_FALSE(hasAutoDropWarning(r, "b"));
 }
 
-// §28.9's exemption names the `new` EXPRESSION form specifically. A call to a
-// factory returning `owned T` is not that shape, so it keeps today's warning
-// even when T is trivial-dispose. Recorded deliberately (CLAUDE.md rule 4):
-// the narrow reading is the spec-verbatim one, and a retained warning is noise
-// where a wrongly-suppressed one would hide an obligation. Widening this is a
-// spec question, not an implementation choice.
-BEZEL_TEST(own_trivial_dispose_2654, owned_returning_factory_call_still_warns) {
+// §28.9 (v0.357, #4418): the exemption's key is read from the PRODUCED type
+// where the drop site's value has a statically-known producer -- "a `new`
+// expression, an `owned`-returning call" -- so a plain `var` bound to a call of
+// a factory returning `owned T` with a trivial-dispose `T` is exempt exactly as
+// the `new` form is. (Through v0.298 the exemption named the `new` expression
+// only and this row pinned the retained warning; the spec flip at v0.299, and
+// the compiler's catch-up at #4418, reverse it. The destructor-bearing factory
+// control lives in trivial_dispose_every_holder_form_4418_test.cpp.)
+BEZEL_TEST(own_trivial_dispose_2654, owned_returning_factory_call_is_exempt_spec_28_9_v0357) {
     auto r = parseAndCheckOwnership(wrap(
         "class Box public constructor() end constructor; "
         "  public Value: int := 7; end Box; "
         "class F public static method MakeBox(): owned Box "
         "  return new Box(); end MakeBox; end F; ",
         "var b := F.MakeBox(); return b.Value;"));
-    BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "b"));
+    BEZEL_EXPECT_FALSE(hasAutoDropWarning(r, "b"));
 }
