@@ -764,6 +764,15 @@ private:
     // `Max(): T` over such an element returns that parameter, not `int`.
     // Defined beside `linqElemIsUnconstrainedTypeParam`.
     bool linqElemIsInScopeTypeParam(const TypeRef* elem) const;
+    // fix #8688 (stdlib §5, spec §3.6 rule 2 / §14.2, v0.357): the result
+    // type `U` of the SELECTOR form `Sum<U>(selector: (T) -> U): owned U`,
+    // read off the typed selector lambda -- a bare type parameter in scope,
+    // or a non-nullable numeric primitive the selector returns exactly. Null
+    // for any other shape (the caller keeps its own handling). Read by the
+    // concrete-collection, lazy, vtable-backed and `string` receiver arms of
+    // typeCall so they cannot drift. Defined beside
+    // `linqElemIsInScopeTypeParam`.
+    TypeRef* linqSelectorSumResult(const ast::CallExpr& ce);
     // fix #8198 (spec §14.2 *A type parameter as the type argument* /
     // *Interface conformance* rule 6, §26.5.1, v0.355): is the §5 block's
     // `where` clause PROVABLY unsatisfied at the element type `elem` — a type

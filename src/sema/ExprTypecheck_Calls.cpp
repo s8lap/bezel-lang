@@ -1115,6 +1115,37 @@ bool ExprTC::linqElemIsInScopeTypeParam(const TypeRef* elem) const {
     return !n.empty() && isInScopeTypeParam(n) && isInScopeTypeParamRef(elem);
 }
 
+// fix #8688 (stdlib §5, spec §3.6 rule 2 / §5.1 / §14.2, v0.357): see the
+// declaration in ExprTypecheck_impl.hpp. stdlib §5 declares the selector form
+//     public method Sum<U>(selector: (T) -> U): owned U where U: INumber<U>;
+// so the call's type is the selector's return type `U`. This reads `U` off the
+// (already typed) selector lambda for the two shapes every receiver arm can
+// key: a bare type parameter in scope (`a.Sum(lambda(x) => x)` in
+// `H<T>(a: Array<T>) where T: INumber<T>` is `T`, and spec §3.6 rule 2 then
+// confines it to `Object` and its bounds), and a non-nullable numeric
+// primitive the selector returns EXACTLY (`int`, `long`, `uint`, `ulong`,
+// `float`, `double`, `decimal`). Anything else returns null and the caller
+// keeps its own handling.
+TypeRef* ExprTC::linqSelectorSumResult(const ast::CallExpr& ce) {
+    if (ce.args.empty() || !ce.args[0].value) return nullptr;
+    TypeRef* lt = ctx_.exprType(*ce.args[0].value);
+    if (!lt || lt->kind != TypeRef::Kind::Function || !lt->funcReturn)
+        return nullptr;
+    TypeRef* u = lt->funcReturn;
+    if (linqElemIsInScopeTypeParam(u)) return u;
+    if (u->kind == TypeRef::Kind::Primitive && !u->nullable) {
+        using P = PrimitiveType;
+        switch (u->primitive) {
+            case P::Int: case P::Long: case P::UInt: case P::ULong:
+            case P::Float: case P::Double: case P::Decimal:
+                return ctx_.primitiveTypeRef(u->primitive);
+            default:
+                break;
+        }
+    }
+    return nullptr;
+}
+
 // fix-forward #8181: may the CURRENT method's type parameter `n` carry a
 // constraint it inherits rather than writes (spec §14.2, quoted above)? `true`
 // means "it may" and the caller KEEPS the §5 candidate (the sound direction);
@@ -14781,6 +14812,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 noSelectorKeyed = true;
                             }
                         }
+                        // fix #8688 (stdlib §5, spec §3.6 rule 2 / §14.2,
+                        // v0.357): the SELECTOR `Sum<U>(selector: (T) -> U):
+                        // owned U` is typed `U`. This arm used to type every
+                        // selector Sum `int` (or `decimal`), so MEASURED on
+                        // the base `a.Where(…).Sum(lambda(x) => x)` over
+                        // `Array<long>` printed 410065408 (9e9 truncated to 32
+                        // bits) and over `Array<double>` printed 5 for
+                        // 1.5 + 2.25, and in a generic body `: int =>
+                        // a.Where(…).Sum(lambda(x) => x)` was accepted.
+                        if (!noSelectorKeyed && m == "Sum")
+                            if (TypeRef* uTy = linqSelectorSumResult(ce)) {
+                                ctx_.setExprType(&ce, uTy);
+                                noSelectorKeyed = true;
+                            }
                         if (!noSelectorKeyed)
                             ctx_.setExprType(&ce,
                                 elemIsDecimal
@@ -15366,6 +15411,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         else if (ce.args.empty() &&
                                  linqElemIsInScopeTypeParam(srcElem2))
                             sumTy = srcElem2;
+                        // fix #8688 (stdlib §5, spec §3.6 rule 2 / §14.2,
+                        // v0.357): the SELECTOR form `Sum<U>(selector: (T) ->
+                        // U): owned U` is `U`. MEASURED on the base: typed
+                        // `int` here, so `e.Sum(lambda(x) => x)` over an
+                        // `IEnumerable<long>` printed 410065408 and over an
+                        // `IEnumerable<double>` printed 5 for 1.5 + 2.25.
+                        else if (!ce.args.empty())
+                            sumTy = linqSelectorSumResult(ce);
                         ctx_.setExprType(
                             &ce, sumTy ? sumTy : ctx_.primitiveTypeRef(P::Int));
                     }
@@ -15451,8 +15504,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(
                             &ce, uTy ? uTy : ctx_.primitiveTypeRef(P::Int));
                     }
-                    else if (m == "Sum")
-                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                    // fix #8688 (stdlib §5, spec §3.6 rule 2 / §14.2,
+                    // v0.357): `Sum<U>(selector: (char) -> U): owned U` is
+                    // `U`. MEASURED on the base: always typed `int`, so
+                    // `"ab".Sum(lambda(c) => 3000000000L)` printed 1705032704
+                    // (6e9 truncated to 32 bits).
+                    else if (m == "Sum") {
+                        TypeRef* uTy = linqSelectorSumResult(ce);
+                        ctx_.setExprType(
+                            &ce, uTy ? uTy : ctx_.primitiveTypeRef(P::Int));
+                    }
                     else if (m == "Average")
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
                     else typeLinqOperator(charTy);
@@ -16830,6 +16891,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         // to the element/decimal default below.
                                     }
                             }
+                            // fix #8688 (stdlib §5, spec §3.6 rule 2 / §5.1 /
+                            // §14.2, v0.357): a selector returning a TYPE
+                            // PARAMETER in scope (`H<T>(a: Array<T>) where T:
+                            // INumber<T> => a.Sum(lambda(x) => x)`) is not a
+                            // Primitive, so the classification above did not
+                            // see it and the call fell to the `int` default
+                            // below. stdlib §5's `Sum<U>(selector: (T) -> U):
+                            // owned U` makes it `U` = `T`. MEASURED on the
+                            // base: `: int => a.Sum(lambda(x) => x)` at T =
+                            // double was accepted and printed 3 for
+                            // 1.5 + 2.25.
+                            if (m == "Sum" && !sumSelectorClassified &&
+                                !ce.args.empty())
+                                if (TypeRef* uTy = linqSelectorSumResult(ce))
+                                    if (uTy->kind != TypeRef::Kind::Primitive) {
+                                        ctx_.setExprType(&ce, uTy);
+                                        sumSelectorClassified = true;
+                                    }
                             if (!sumSelectorClassified) {
                             // fix #1836 / stdlib §5.1 (v0.226): the no-selector
                             // Sum()/Min()/Max() result is the element's OWN
