@@ -4737,18 +4737,37 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // `return move p;` and an if-expression whose selected branch is
             // `p` (§20 *Ownership*: the selected branch moves, under the
             // selection flag `lowerConditional` recorded).
-            auto namesParam = [&](auto&& self, const ast::Expr* e) -> bool {
+            //
+            // fix #7890 (§15.3 *Return*, §17.8, §20 *Ownership*, v0.357): a
+            // LOCAL named by an if-expression branch — `return (if c then o
+            // else C.Empty);`, `o!` included — is the same selected-branch
+            // move. `retSlot` above covers only the bare `return o;` (it
+            // erases the local's disposal outright, which is right when the
+            // local is returned on every path through this statement); under
+            // an if-expression the local leaves only on the selected path, so
+            // it takes the core's guarded zero-store instead. MEASURED at
+            // r30-c1 46219d9ba: heap-use-after-free on
+            // `return (if c then o! else OC.Empty);` over a local `o`.
+            auto namesParam = [&](auto&& self, const ast::Expr* e,
+                                  bool underConditional) -> bool {
                 if (!e) return false;
+                if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+                    return underConditional &&
+                           self(self, pb->operand.get(), underConditional);
                 if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e))
-                    return u->op == "move" && self(self, u->operand.get());
+                    return u->op == "move" &&
+                           self(self, u->operand.get(), underConditional);
                 if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(e))
-                    return self(self, ce->thenValue.get()) ||
-                           self(self, ce->elseValue.get());
+                    return self(self, ce->thenValue.get(), true) ||
+                           self(self, ce->elseValue.get(), true);
                 auto* pid = dynamic_cast<const ast::IdentifierExpr*>(e);
-                return pid && dynamic_cast<sema::ParameterSymbol*>(
-                                  ctx_.exprSymbol(*pid)) != nullptr;
+                if (!pid) return false;
+                sema::Symbol* psym = ctx_.exprSymbol(*pid);
+                if (dynamic_cast<sema::ParameterSymbol*>(psym)) return true;
+                return underConditional &&
+                       dynamic_cast<sema::LocalSymbol*>(psym) != nullptr;
             };
-            if (namesParam(namesParam, retCore))
+            if (namesParam(namesParam, retCore, false))
                 markOwningChoiceArgMovedFrom(retCore);
         }
         if (retSlot) {

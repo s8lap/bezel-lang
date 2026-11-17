@@ -1733,8 +1733,22 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // unchanged; and only the LocalDecl form is admitted — an inline
             // `out owned var` in an async body (ls->decl is an IdentifierExpr)
             // keeps the reject. // per §28.3, §30.5, §28.9
+            // fix #7890 (§28.3 state 4, §28.3.10, v0.357): a maybe-consumed
+            // MOVE-ONLY VALUE local is per-path here too. §28.3: "maybe-consumed
+            // ... scope-end disposal is per-path"; §28.3.10: "The rule is
+            // uniform across body kinds". The synchronous arm above already
+            // admits it (`moveOnlyValuePerPathAutoDrop`, same reasoning: every
+            // discharge of such a value is a slot-zeroing move); this arm asked
+            // `!st.maybeConsumed` alone, so `if c then x := o; end if;` in an
+            // `async` body was the hard reject below. The if-EXPRESSION form
+            // `var x: C := (if c then o else C.Empty);` joins `o`
+            // maybe-consumed since #7890 and would have inherited that reject
+            // (it compiled and ran clean before). MEASURED under ASan, 100
+            // iterations, with an `await` before, between and after the move,
+            // in a loop and under `try`: clean, every payload disposed once.
+            // A class local keeps the reject (not a move-only value type).
             if (isAsync_ && !sawYield_ && !isDestructor_ &&
-                !st.maybeConsumed &&
+                (!st.maybeConsumed || moveOnlyValuePerPathAutoDrop) &&
                 (reassignedLocals.count(sym) == 0 ||
                  reassignedDropCovered_.count(sym) != 0)) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
@@ -12400,6 +12414,47 @@ void MethodOwnership::noteOwningChoiceWholeMoveRead(const ast::Expr& src) {
     while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core)) {
         if (!pb->operand) return;
         core = pb->operand.get();
+    }
+    // fix #7890 (§20 *Ownership*, §17.8, §28.3 K7.4, v0.357): an
+    // if-expression at this owned-consuming position. §20: "a branch naming
+    // such a binding classifies by the position the whole expression
+    // occupies, exactly as a bare read of the binding does ... the selected
+    // branch's value moves ..., the binding joining per-path consumed after
+    // the construct (K7.4)". Each branch is walked from the entry states and
+    // the two ends are met with the ordinary branch join, so a binding named
+    // by ONE branch comes out maybe-consumed (a later read is the same
+    // "may have already been consumed on another branch" error the
+    // if-STATEMENT spelling of the move draws) and a binding named by BOTH
+    // comes out moved-from. Before this the walk stopped at the if-expression
+    // and `var x: C := (if c then o else C.Empty); var y := o;` was accepted
+    // with `o` still readable (MEASURED at r30-c1 46219d9ba; the `o!` branch
+    // spelling was additionally a heap-use-after-free in codegen's twin).
+    if (const auto* ce = dynamic_cast<const ast::ConditionalExpr*>(core)) {
+        if (!ce->thenValue || !ce->elseValue) return;
+        auto cv = common::classifyChoiceType(ctx_.exprType(*ce), ctx_);
+        if (!cv || *cv != common::ChoiceClassification::Owning) return;
+        auto entry = states_;
+        noteOwningChoiceWholeMoveRead(*ce->thenValue);
+        auto thenEnd = std::move(states_);
+        states_ = entry;
+        noteOwningChoiceWholeMoveRead(*ce->elseValue);
+        // A PARAMETER source is seeded into `states_` at its move site (see
+        // below), so it can be present in one end only; the join meets only
+        // keys both ends carry. Give the other end the same LIVE seed so the
+        // parameter joins per-path consumed like a local.
+        auto seedMissing = [&](auto& into, const auto& other) {
+            for (const auto& [sym, st] : other) {
+                if (into.count(sym) || entry.count(sym)) continue;
+                if (!dynamic_cast<sema::ParameterSymbol*>(sym)) continue;
+                LocalOwnership lo;
+                lo.state = OwnershipState::Borrowed;
+                into[sym] = lo;
+            }
+        };
+        seedMissing(states_, thenEnd);
+        seedMissing(thenEnd, states_);
+        joinInto(states_, thenEnd, ce->span.begin, /*emitClash=*/false);
+        return;
     }
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(core);
     if (!id) return;  // only a WHOLE bare-identifier read is a move; `.f` /

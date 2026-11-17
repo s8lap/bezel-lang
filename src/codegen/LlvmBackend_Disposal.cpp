@@ -8973,7 +8973,12 @@ void Emitter::markOwningChoiceLocalMovedFrom(const ast::LocalDecl* targetLd,
             }
         break;
     }
-    if (peeledBang && dynamic_cast<const ast::IdentifierExpr*>(core))
+    // fix #7890 (§17.8 / §20 *Ownership*, v0.357): `(if c then o else E)!`
+    // — the `!` over the whole if-expression is as transparent as the one
+    // over a bare binding, so the peeled if-expression reaches the core's
+    // per-branch marking.
+    if (peeledBang && (dynamic_cast<const ast::IdentifierExpr*>(core) ||
+                       dynamic_cast<const ast::ConditionalExpr*>(core)))
         srcExpr = core;
     markOwningChoiceMovedFromCore(targetLd, srcExpr);
 }
@@ -9039,8 +9044,44 @@ void Emitter::markOwningChoiceMovedFromCore(const ast::LocalDecl* targetLd,
             guard ? builder_.CreateAnd(guard, sel, "ocmv.then") : sel;
         llvm::Value* elseGuard =
             guard ? builder_.CreateAnd(guard, notSel, "ocmv.else") : notSel;
-        markOwningChoiceMovedFromCore(targetLd, ce->thenValue.get(), thenGuard);
-        markOwningChoiceMovedFromCore(targetLd, ce->elseValue.get(), elseGuard);
+        // fix #7890 (§17.8 / §20 *Ownership*, v0.357): a branch spelled
+        // `o!`. §17.8: "Over a named owned binding, `x!` is therefore
+        // classified by its position exactly as the bare read `x` is", and
+        // §20's rule is stated over "a branch naming such a binding" — so
+        // `(if c then o! else C.Empty)` moves `o` on the selected path
+        // exactly as `(if c then o else C.Empty)` does. The local-target
+        // entry peels `!` / `move` only at the TOP of the initializer, so a
+        // branch-level `!` reached the bare-identifier test below, was
+        // declined, and `o` kept its scope-end active-case disposal beside
+        // the taker's (MEASURED at r30-c1 46219d9ba: heap-use-after-free on
+        // `var x: OC := (if c then o! else OC.Empty);`, clean on the bare
+        // spelling). Only a peel that ends at an identifier or at a nested
+        // if-expression is substituted, so every other branch shape reaches
+        // the core as it did before.
+        auto peelBranch = [](const ast::Expr* b) -> const ast::Expr* {
+            const ast::Expr* core = b;
+            while (core) {
+                if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core)) {
+                    core = pb->operand.get();
+                    continue;
+                }
+                if (auto* u = dynamic_cast<const ast::UnaryExpr*>(core))
+                    if (u->op == "move") {
+                        core = u->operand.get();
+                        continue;
+                    }
+                break;
+            }
+            if (core && core != b &&
+                (dynamic_cast<const ast::IdentifierExpr*>(core) ||
+                 dynamic_cast<const ast::ConditionalExpr*>(core)))
+                return core;
+            return b;
+        };
+        markOwningChoiceMovedFromCore(targetLd, peelBranch(ce->thenValue.get()),
+                                      thenGuard);
+        markOwningChoiceMovedFromCore(targetLd, peelBranch(ce->elseValue.get()),
+                                      elseGuard);
         return;
     }
     // THE SOURCE must be a bare identifier naming a DIFFERENT local. A bare
