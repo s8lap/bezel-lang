@@ -1989,6 +1989,19 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     auto savedValueLikeChoiceStrReleaseEligible =
         valueLikeChoiceStrReleaseEligible_;
     llvm::Function* savedStringReleaseEligibleFn = stringReleaseEligibleFn_;
+    // fix #8599 (§28.9, v0.357): the OBJECT-STRING alias sets travel with the
+    // string ones above. The lambda's own `collectObjectStringReleaseEligible`
+    // (called below, in the same block as `collectStringReleaseEligible`)
+    // CLEARS and refills them for the LAMBDA's body, so the ENCLOSING body's
+    // sets must be put back before the enclosing body continues — the same
+    // save/restore shape #2807 / #2641 gave the string sets, for the same
+    // reason (a later `var o: Object := s;` in the enclosing body would
+    // otherwise lose its bind-time retain and its scope-end release).
+    auto savedObjectStringBorrowAll = objectStringBorrowAll_;
+    auto savedObjectStringReleaseEligible = objectStringReleaseEligible_;
+    auto savedObjectStringReassignedLocals = objectStringReassignedLocals_;
+    llvm::Function* savedObjectStringReleaseEligibleFn =
+        objectStringReleaseEligibleFn_;
     // fix #2641: the analyzed-body pointer travels with the eligibility sets
     // above — a nested lambda's own collectStringReleaseEligible repoints it, and
     // without this restore the enclosing body's later inline `out var` recipients
@@ -3639,8 +3652,30 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // `returnedStringLocalOwnsPlusOne` verdict bit-for-bit as it was). The async
     // branch below is handled inside emitAsyncLambda, against its RESUME fn.
     if (!lam.isAsync && !lam.exprBody) {
+        // fix #8599 (§28.9, v0.357): the OBJECT-STRING alias collector runs
+        // on the LAMBDA's own body, the way it runs on a function body
+        // (LlvmBackend_Setup.cpp's function-entry block). It never did: a
+        // lambda body's `var o: Object := x;` — an `Object` local bound to a
+        // CAPTURED `string` — was therefore not a string-aliased slot at all,
+        // so it took NO reference of its own, and the caller's release of the
+        // captured string freed it under any field the alias was stored into
+        // (measured heap-use-after-free, #8599).
+        //
+        // The order mirrors the function-entry block exactly: the object
+        // collector runs BEFORE the string one (the string walk reads the
+        // object alias set), and again AFTER it (fix #8307: the object walk
+        // reads `stringBorrowAll_`, which the string walk fills).
+        collectObjectStringReleaseEligible(lam.stmts);
         collectStringReleaseEligible(lam.stmts);
+        collectObjectStringReleaseEligible(lam.stmts);
         stringReleaseEligibleFn_ = fn;
+        // fix #8599: the object collector's token — the pin that says "these
+        // sets belong to THIS function" — is the lambda's own fn, exactly as
+        // `stringReleaseEligibleFn_` is pinned to the lambda's fn above. The
+        // bind-time retain in `lowerLocalDecl` is gated on
+        // `currentFn_ == objectStringReleaseEligibleFn_`, so without this pin
+        // the lambda's `Object` alias would never retain.
+        objectStringReleaseEligibleFn_ = fn;
         // fix #2696 / §28.1 / §28.9 (v0.240): CO-GATE the parameter retain with
         // the parameter release the pin above just turned on. The drop-on-
         // overwrite release admits ANY slot localSlot() resolves — including a
@@ -4490,6 +4525,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     valueLikeChoiceStrReleaseEligible_ =
         std::move(savedValueLikeChoiceStrReleaseEligible);
     stringReleaseEligibleFn_ = savedStringReleaseEligibleFn;
+    // fix #8599 (§28.9, v0.357): restore the enclosing body's object-string
+    // alias sets (the lambda's own collector refilled them for the lambda).
+    objectStringBorrowAll_ = std::move(savedObjectStringBorrowAll);
+    objectStringReleaseEligible_ =
+        std::move(savedObjectStringReleaseEligible);
+    objectStringReassignedLocals_ =
+        std::move(savedObjectStringReassignedLocals);
+    objectStringReleaseEligibleFn_ = savedObjectStringReleaseEligibleFn;
     stringReleaseAnalyzedBody_ = savedStringReleaseBody;   // fix #2641
     stringReleaseAnalyzedExpr_ = savedStringReleaseAnalyzedExpr;  // fix #4044
     currentReturnTypeNode_ = savedCurrentReturnTypeNode;  // #2515
