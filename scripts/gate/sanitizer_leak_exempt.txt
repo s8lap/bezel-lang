@@ -190,7 +190,6 @@ using_var_discard_vtableless_builtin_4224.sharedeventsource_using_var_discard_lo
 plain_var_vtableless_builtin_discard_leak_4185.shared_uncovered_builtin_still_leaks_not_crashes  # status:trade #4185: a discarded plain-var Shared<Widget> builtin outside emitVtablelessBuiltinRelease's coverage leaks (not crashes); the control row #4224's review round 1 asked for. tests/codegen/plain_var_vtableless_builtin_discard_leak_4185_test.cpp:244
 
 # ── pattern (e): diagnosticMessageContains(r, "LSan/ASan at exit") — 2 rows, 2 files ──
-codegen_narrowed_value_op_arg_release_3116.unnarrowed_object_call_argument_still_leaks_as_expected  # status:trade #3892/#3895: an unnarrowed Object-typed call argument still leaks, as expected — not a compiler crash or unrelated signal. tests/codegen/narrowed_value_op_arg_release_3116_test.cpp:290
 dict_sorted_key_local_release_3887_3888.value_position_arg_still_leaks_control_28_9  # status:trade spec §28.9: the dict VALUE-position argument is deliberately NOT claimed by the #3887/#3888 fix, so it must still trip LeakSanitizer on both sides of that commit — the inverse control of the rows above it in the same file. tests/codegen/dict_sorted_key_local_release_3887_3888_test.cpp:388
 
 # ── pattern (f): BEZEL_EXPECT_FALSE(r.ran) + an allocation-COUNT assertion — 1 row ──

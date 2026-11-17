@@ -205,7 +205,7 @@ BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
 }
 
 // =====================================================================
-// CONTROL — a non-narrowed binary operator on an `Object` is now a CLEAN
+// A non-narrowed binary operator on an `Object` is now a CLEAN
 // SEMA REJECTION, not a leak. Outside a §12.7 narrowed block the resolved
 // type of `o` stays `Object`, so this row never reaches the box-escape/
 // release path this file otherwise exercises — there is no box to leak.
@@ -254,19 +254,24 @@ BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
 }
 
 // =====================================================================
-// CONTROL — a non-narrowed call argument MUST still leak the box. Same
-// gating story as the binary-op control above: outside the narrowed block
-// `isNarrowedRead` declines, `walkArgs` keeps its conservative escape
-// verdict, and LSan flags the leak.
-// =====================================================================
+// A non-narrowed call argument is RELEASED (behavior flip, #6149). Outside
+// the narrowed block `isNarrowedRead` declines, so the walker used to keep
+// its conservative escape verdict for `Take(o)` and the box leaked (24 B per
+// iteration; this row originally pinned that leak as a CONTROL). Staging
+// commit 5e14cf2c6 (`narrow #6149`) lets `BoxEscapeWalker` consult the
+// #2952 callee summary: `Take`'s Object parameter provably does not outlive
+// the call, so the scope-end `bz_box_release` arms (spec §28.3 at v0.357:
+// every heap object is disposed exactly once; §8.6 boxes). The program now
+// runs, exits 0 and is leak-clean under the checked oracle. The loop runs
+// 200 iterations so a one-shot leak could not hide.
 BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
-           unnarrowed_object_call_argument_still_leaks_as_expected) {
+           unnarrowed_object_call_argument_released_after_6149) {
     JitResult r = runAotChecked(
         "module M; class C "
         "  public static method Take(n: Object): int => 0; "
         "  public static method Main(): int "
         "    var i := 0; "
-        "    while i < 20 do "
+        "    while i < 200 do "
         "      var o: Object := i; "
         "      var dummy := Take(o); "
         "      i := i + 1; "
@@ -274,8 +279,7 @@ BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
         "    return 0; "
         "  end Main; "
         "end C;");
-    // fix #3895 (issue #3892): pin that the failure is SPECIFICALLY the
-    // expected leak report, not a compiler crash / unrelated runtime signal
-    // that a bare `!ran` cannot tell apart from the leak this row wants.
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "LSan/ASan at exit"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "LSan/ASan at exit"));
 }
