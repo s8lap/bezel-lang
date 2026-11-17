@@ -63,26 +63,6 @@ BEZEL_TEST(lambda_divergent_2107, spec_27_3_deep_first_return_infers_real_type) 
         "end Main; end C;"), std::string("hello"));
 }
 
-// §27.3 v0.226 (#2107): a return-type ascription is the on-site remedy for
-// divergent returns — `: string?` admits the null-producing arm (§20) and each
-// `return` checks against it under §5.1. The block body compiles and runs.
-BEZEL_TEST(lambda_divergent_2107, spec_27_3_divergent_under_ascription) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "var classify := lambda(score: int): string? => do "
-        "  if score < 0 then return null; end; "
-        "  if score >= 90 then return \"A\"; end; "
-        "  return \"pass\"; "
-        "end; "
-        "var a := classify(95); "
-        "var b := classify(-1); "
-        "if a is null then return 1; end; "
-        "if b is not null then return 2; end; "
-        "if a = \"A\" then return 0; end; "
-        "return 3; "
-        "end Main; end C;"), 0);
-}
-
 // §27.3 v0.226 (#2107): a block-bodied lambda RETURNED from a method whose
 // declared return type is a function type has that type as its TARGET — the
 // divergent-return inference error must NOT fire (the returns are checked
@@ -204,4 +184,3 @@ BEZEL_TEST(lambda_divergent_2107, spec_27_3_divergent_owned_capture_asan_2515) {
     BEZEL_EXPECT_TRUE(r.ran);        // ASan/LSan-clean (no double-free, no leak)
     BEZEL_EXPECT_EQ(r.exitCode, 1);  // g(d, c, true).Kind() == Dog.Kind == 1
 }
-

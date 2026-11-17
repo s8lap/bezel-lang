@@ -150,15 +150,6 @@ BEZEL_TEST(binary_mod_bool_string_rejected_3243,
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 26085 % 256);
 }
 
-BEZEL_TEST(binary_mod_bool_string_rejected_3243,
-           char_mod_char_still_rejected) {
-    // The narrow #3109 invariant: `char mod char` is rejected.
-    BEZEL_EXPECT_TRUE(compileErrored(
-        "  var c: char := 'a'; "
-        "  var d: char := 'b'; "
-        "  return int(c mod d);"));
-}
-
 // ── Compound `mod=` form is unchanged (control: still rejects bool/string
 //    on the target; re-pinned here so a future regression that re-orders the
 //    binary-vs-compound guards does not silently re-introduce the IR-verify

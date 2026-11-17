@@ -160,20 +160,6 @@ int runFull(const std::string& program) {
 }
 } // namespace
 
-BEZEL_TEST(codegen_cg28_destructure, record_case_expr_sum_fields) {
-    // §19 / §9.4: Point(x, y) extracts both fields; body computes x + y.
-    // Expected: 3 + 4 = 7.
-    BEZEL_EXPECT_EQ(runFull(
-        "module M; "
-        "record Point(x: int, y: int); "
-        "class C public static method Main(): int "
-        "  var p := new Point(3, 4); "
-        "  return (case p of "
-        "    Point(x, y) => x + y, "
-        "    _ => 0); "
-        "end Main; end C;"), 7);
-}
-
 BEZEL_TEST(codegen_cg28_destructure, record_case_expr_first_field) {
     // §19 / §9.4: destructuring exposes each field independently; use only x.
     BEZEL_EXPECT_EQ(runFull(

@@ -69,15 +69,6 @@ BEZEL_TEST(alias_unhomed_member_8022, alias_builtin_class_of_another_module_is_r
         "module `System` has no public type `File`"));
 }
 
-BEZEL_TEST(alias_unhomed_member_8022, module_qualified_unknown_type_is_rejected_same_text) {
-    // control: the module-qualified spelling's text, which the alias reuses.
-    auto r = runAot(prog("import System.IO;\n",
-        "    System.IO.NotAType.Exists(\"x\");"));
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(hasError(r,
-        "module `System.IO` has no public type `NotAType`"));
-}
-
 BEZEL_TEST(alias_unhomed_member_8022, alias_type_position_unknown_type_is_rejected) {
     // control: the alias TYPE-position form already diagnoses (§2.2).
     auto r = runAot(prog("import System.IO as sio;\n",

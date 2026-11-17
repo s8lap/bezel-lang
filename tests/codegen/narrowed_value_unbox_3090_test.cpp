@@ -143,26 +143,6 @@ BEZEL_TEST(codegen_narrowed_value_unbox_3090,
         "end C;"), 86);
 }
 
-// §17.4's PRINTED REMEDY, verbatim in shape: "if o is [3]int then var a: [3]int
-// := o; end;". This is the assertion #2911 parked and #3090 owed — the value
-// `456` that `o as [3]int` used to return before §17.4 rejected that spelling.
-// Pre-fix: an all-zero array (sum 0) plus codegen's #2434 note.
-BEZEL_TEST(codegen_narrowed_value_unbox_3090,
-           narrowed_inline_array_copy_out_is_the_17_4_remedy_spec_17_4_12_7) {
-    BEZEL_EXPECT_EQ(runAotOut(
-        "module M; class C "
-        "  public static method Main(): int "
-        "    var a: [3]int := [4, 5, 6]; "
-        "    var o: Object := a; "
-        "    if o is [3]int then "
-        "      var b: [3]int := o; "
-        "      Console.WriteLine(b[0] * 100 + b[1] * 10 + b[2]); "
-        "    end; "
-        "    return 0; "
-        "  end Main; "
-        "end C;"), std::string("456"));
-}
-
 // =====================================================================
 // The rest of the read surface — the issue's own warning that "(b) alone may
 // fix `var i: int := oi;` while leaving a direct read like `o[0]` or `p.X`

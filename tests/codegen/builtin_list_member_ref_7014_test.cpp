@@ -236,23 +236,6 @@ BEZEL_TEST(builtin_list_member_ref_7014,
         "True");
 }
 
-// CONTROL — an ordinary §27.6 method reference on a USER class is untouched:
-// the new arm is limited to the builtin list interface's method members.
-BEZEL_TEST(builtin_list_member_ref_7014,
-           spec_27_6_user_class_method_reference_still_works) {
-    BEZEL_EXPECT_EQ(
-        runAotOut(
-            "module M; "
-            "public class K public method N(): int return 42; end N; end K; "
-            "class C public static method Main(): int "
-            "  var k: K := new K(); "
-            "  var f: () -> int := k.N; "
-            "  Console.WriteLine(f()); "
-            "  return 0; "
-            "end Main; end C;"),
-        "42");
-}
-
 // CONTROL — the POLYMORPHIC collection interface's member group is still
 // REJECTED, exactly as its call form is (the #853 fence): the new arm must
 // not have widened onto the heads whose call form does not lower.

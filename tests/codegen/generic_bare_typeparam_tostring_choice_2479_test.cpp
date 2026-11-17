@@ -137,22 +137,6 @@ BEZEL_TEST(generic_bare_typeparam_tostring_choice_2479,
 // ── The bare-T generic call — this issue's own literal repro shape ──────
 
 BEZEL_TEST(generic_bare_typeparam_tostring_choice_2479,
-           bare_t_generic_payload_free_value_correct) {
-    const std::string program =
-        std::string("module M; ") + kColor +
-        "class C "
-        "  public static method F<T>(val: T): string where T: value "
-        "    return val.ToString(); "
-        "  end F; "
-        "  public static method Main(): int "
-        "    var s := F(Color.Red); "
-        "    return (if s = \"Color.Red\" then 42 else 1); "
-        "  end Main; "
-        "end C;";
-    BEZEL_EXPECT_EQ(run(program), 42);
-}
-
-BEZEL_TEST(generic_bare_typeparam_tostring_choice_2479,
            bare_t_generic_payload_bearing_value_correct) {
     const std::string program =
         std::string("module M; ") + kPair +

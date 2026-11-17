@@ -56,7 +56,7 @@
 // fails the pre-existing `methodReturnsOnlyReceiverSourcedBorrows` structural
 // scan on its own (a `new` producer is not receiver-sourced), so it was never
 // wrongly recognized as a borrow to begin with — this fix's carve is a no-op
-// there (see `two_class_idiom_manual_getenumerator_unaffected` below).
+// there (pinned by `iter_wrapdispose_reclaim_2389.single_manual_call_no_leak`).
 //
 // FAILS WITHOUT / PASSES WITH: `named_receiver_disposed_exactly_once` and
 // `temporary_receiver_disposed_exactly_once` reproduce the issue's own repro
@@ -193,28 +193,6 @@ BEZEL_TEST(iter_selfreturning_manual_getenumerator_leak_2443, temporary_receiver
         "    return sum; "  // 1+2+3+4 = 10
         "  end Main; "
         "end C;"), 10);
-}
-
-// REGRESSION GUARD (must NOT be affected by this fix): the TWO-CLASS idiom's
-// manual `.GetEnumerator()` (§2388/#2424) over a NAMED receiver — a genuinely
-// fresh, distinct enumerator object every call — must still dispose exactly
-// once and must not be double-freed by this carve (its body already fails
-// the receiver-sourced-borrow structural scan on its own, so the fix's new
-// `isManualGetEnumeratorWrap` gate is unreachable for it in a way that would
-// change behavior; this test proves that empirically, not just by code
-// inspection).
-BEZEL_TEST(iter_selfreturning_manual_getenumerator_leak_2443, two_class_idiom_manual_getenumerator_unaffected) {
-    BEZEL_EXPECT_EQ(runLeakChecked(
-        std::string("module M; ") + kIntRangeTwoClass +
-        "class C "
-        "  public static method Main(): int "
-        "    using var s := new IntRange(1, 3); "
-        "    using var e := s.GetEnumerator(); "
-        "    var a := 0; "
-        "    if e.MoveNext() then a := e.Current; end; "
-        "    return a; "  // 1
-        "  end Main; "
-        "end C;"), 1);
 }
 
 // Value-correctness sanity (non-ASan) for the issue's exact repro shape — a

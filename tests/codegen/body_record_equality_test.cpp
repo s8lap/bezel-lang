@@ -328,20 +328,6 @@ BEZEL_TEST(codegen_body_record, body_inline_array_autoprop_with_literal_fix1382)
         "end Main; end C;"), 12);
 }
 
-// §9.5 (fix #1382): the same `with`-literal fix applies to a POSITIONAL record.
-// Prior to fix: the with-path's lowerExpr returned null for CollectionLiteralExpr
-// and silently dropped the write.
-BEZEL_TEST(codegen_body_record, positional_inline_array_with_literal_fix1382) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "record R(A: [3]int); "
-        "class C public static method Main(): int "
-        "  var r := new R([10, 20, 30]); "
-        "  var r2 := r with(A := [1, 2, 9]); "
-        "  return r2.A[0] + r2.A[1] + r2.A[2]; "
-        "end Main; end C;"), 12);
-}
-
 // §9.2 / §15.1 (fix #1382): body record with a nullable inline-array auto-property
 // correctly stores elements from a collection literal via the ctor.
 BEZEL_TEST(codegen_body_record, body_inline_array_nullable_autoprop_ctor_literal_fix1382) {

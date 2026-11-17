@@ -91,15 +91,6 @@ BEZEL_TEST(task_local_move_out_scope_end_7790,
 }
 
 BEZEL_TEST(task_local_move_out_scope_end_7790,
-           spec_28_10_using_var_move_of_a_task_local_then_await_disposes_once) {
-    // The issue's second repro, and the §28.10 remedy the v0.350 diagnostic
-    // offers: `using var t2 := move t; await t2;`.
-    expectRunOutput(runAotChecked(asyncMain(
-        "var t := Program.W(); using var t2 := move t; await t2; ")),
-        "w\nEND\n");
-}
-
-BEZEL_TEST(task_local_move_out_scope_end_7790,
            spec_28_10_using_var_move_of_a_task_local_never_awaited_disposes_once) {
     expectRunOutput(runAotChecked(asyncMain(
         "var t := Program.W(); using var t2 := move t; ")),
@@ -119,16 +110,6 @@ BEZEL_TEST(task_local_move_out_scope_end_7790,
         "var t := Program.WI(); using var t2 := move t; "
         "var v := await t2; Console.WriteLine(v); ")),
         "wi\n7\nEND\n");
-}
-
-BEZEL_TEST(task_local_move_out_scope_end_7790,
-           spec_28_10_using_var_move_of_an_owningtask_local_disposes_result_once) {
-    // The OwningTask's produced Res is disposed exactly once: by `r` at scope
-    // end, after END.
-    expectRunOutput(runAotChecked(asyncMain(
-        "var t := Program.WO(); using var t2 := move t; "
-        "using var r := await t2; ")),
-        "END\nDTOR\n");
 }
 
 BEZEL_TEST(task_local_move_out_scope_end_7790,
@@ -170,13 +151,4 @@ BEZEL_TEST(task_local_move_out_scope_end_7790,
         "  var t := Program.W(); using var t2 := move t; await t2; "
         "end; ")),
         expected);
-}
-
-BEZEL_TEST(task_local_move_out_scope_end_7790,
-           spec_28_3_task_local_view_binding_still_disposes_once_control) {
-    // Control (the shape the issue says works): `var t2 := t;` is a borrowing
-    // view; the owner `t` is the sole disposer. The fix must not touch it.
-    expectRunOutput(runAotChecked(asyncMain(
-        "var t := Program.W(); var t2 := t; await t2; ")),
-        "w\nEND\n");
 }

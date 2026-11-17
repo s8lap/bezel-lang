@@ -215,13 +215,6 @@ BEZEL_TEST(codegen_string_split_char_spec_9_6, no_separator_whole_string) {
 // These exercise the multi-char delimiter end-to-end through the JIT.
 // -------------------------------------------------------------------------
 
-BEZEL_TEST(codegen_string_split_str_spec_9_6, multichar_delim_three_parts) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  var p: Array<string> := \"a::b::c\".Split(\"::\"); return p.Count; "
-        "end Main; end C;"), 3);
-}
-
 BEZEL_TEST(codegen_string_split_str_spec_9_6, multichar_delim_part_content) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "

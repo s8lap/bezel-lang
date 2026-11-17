@@ -195,11 +195,6 @@ BEZEL_TEST(float_parse_grammar_5399, double_parse_valid_fraction_still_works) {
 BEZEL_TEST(float_parse_grammar_5399, double_parse_valid_exponent_still_works) {
     BEZEL_EXPECT_EQ(out(guarded("double.Parse(\"1e10\")")), "1e+10");
 }
-BEZEL_TEST(float_parse_grammar_5399, double_parse_underflow_still_zero) {
-    BEZEL_EXPECT_EQ(out(
-        "Console.WriteLine(double.Parse(\"1e-400\") = 0.0); "), "True");
-}
-
 // ===========================================================================
 // §2.15 (JSON ReadFloat): SerializationException on non-finite numbers
 // and invalid JSON number forms

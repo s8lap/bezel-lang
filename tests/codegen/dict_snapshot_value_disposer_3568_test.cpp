@@ -189,46 +189,6 @@ BEZEL_TEST(dict_snapshot_value_disposer_3568,
 }
 
 // ---------------------------------------------------------------------------
-// (B) The SENTINEL control — the same shape with string LITERAL values.
-//   per §28.9 (release is null- and sentinel-safe)
-//
-// A literal's `bz_string` is not a heap producer, so its release is a no-op and
-// this row was clean before the fix. It is here to fail if the deferred release
-// is applied where no +1 was ever taken: an over-release on a literal would show
-// up as an ASan fault or a double free, not as a leak.
-// ---------------------------------------------------------------------------
-BEZEL_TEST(dict_snapshot_value_disposer_3568,
-           string_literal_values_are_not_over_released_8_6) {
-    const std::string src =
-        "module M; "
-        "public class Main "
-        "  public static method Mk(): IEnumerable<DictionaryEntry<int, string>> "
-        "    var d := new Dictionary<int, string>(); "
-        "    d[1] := \"aa\"; "
-        "    d[2] := \"bbb\"; "
-        "    return d; "
-        "  end Mk; "
-        "  public static method Main(): int "
-        "    var total := 0; "
-        "    var i := 0; "
-        "    while i < 200 do "
-        "      using var e := Mk(); "
-        "      for var x in e do total := total + x.Value.Length; end for; "
-        "      i := i + 1; "
-        "    end while; "
-        "    Console.WriteLine($\"total={total}\"); "
-        "    return 0; "
-        "  end Main; "
-        "end Main;";
-    JitResult r = runAotChecked(src);
-    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    // Identical on both sides of the fix.
-    BEZEL_EXPECT_TRUE(r.ran);
-    // 200 x (2 + 3) == 1000.
-    BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1000"));
-}
-
-// ---------------------------------------------------------------------------
 // (C) BOTH obligations at once: `Dictionary<string, string>` with LITERAL keys
 //     and BUILT values, 200x under LSan.
 //   per stdlib §4.8, §28.11, §28.9

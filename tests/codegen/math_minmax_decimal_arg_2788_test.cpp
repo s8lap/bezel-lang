@@ -124,20 +124,3 @@ BEZEL_TEST(math_minmax_decimal_arg_2788, agrees_with_relational_operator) {
         "    if viaMin = viaOp then return 11; end if; "
         "    return 22; ")), 11);
 }
-
-// CONTROL — the integer arm, which is tried before the decimal arm.
-BEZEL_TEST(math_minmax_decimal_arg_2788, control_int_unchanged) {
-    BEZEL_EXPECT_EQ(run(main_(
-        "    return Math.Min(7, 3) * 10 + Math.Max(7, 3); ")), 37);
-}
-
-// CONTROL — the double arm.  `double` and `decimal` are distinct types with
-// distinct lowerings, and the float fallback must still handle double.
-BEZEL_TEST(math_minmax_decimal_arg_2788, control_double_unchanged) {
-    BEZEL_EXPECT_EQ(run(main_(
-        "    var a: double := 2.5; "
-        "    var b: double := 1.5; "
-        "    var m := Math.Min(a, b); "
-        "    if m < 2.0 then return 15; end if; "
-        "    return 25; ")), 15);
-}

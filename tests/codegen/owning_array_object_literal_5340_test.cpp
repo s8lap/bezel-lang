@@ -50,23 +50,6 @@ BEZEL_TEST(owning_array_object_literal_5340, new_object_in_owning_array_literal)
         "end Pgm;"), 1);
 }
 
-// §2.8.3 / §8.5 / #5340: plain local `new Object()` also works, and its
-// ToString returns the correct qualified type name per §8.5 class default.
-BEZEL_TEST(owning_array_object_literal_5340, plain_new_object_local_tostring) {
-    // A bare `new Object()` local — verifies the guard in lowerNew fires
-    // in non-collection-literal positions too, and that ToString returns
-    // "System.Object" (the §8.5 class-default qualified name, not "Exception").
-    BEZEL_EXPECT_EQ(run(
-        "module M;"
-        "class Pgm"
-        "    public static method Main(): int"
-        "        var o := new Object();"
-        "        Console.WriteLine(o.ToString());"
-        "        return 0;"
-        "    end Main;"
-        "end Pgm;"), 0);
-}
-
 // §2.8.3 / §8.5 / #5340: multiple Object elements in OwningArray.
 BEZEL_TEST(owning_array_object_literal_5340, multiple_object_elements) {
     BEZEL_EXPECT_EQ(run(

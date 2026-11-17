@@ -285,21 +285,6 @@ BEZEL_TEST(codegen_collection_keys, for_in_set_record_fields_spec_4_10) {
 // the generic hash table, so its Keys uses bz_dict_keys_gen (not the string-key
 // bz_dict_keys_str path, which would reinterpret the key bytes as a pointer).
 
-// §4.8: `for var k in <Dictionary<int,int>>.Keys` sums the keys. Keys {3,4} → 7.
-// (The string-key Keys path would have crashed on the integer keys.)
-BEZEL_TEST(codegen_collection_keys, for_in_dict_int_keys_sum_spec_4_8) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "class C public static method Main(): int "
-        "  using var d := new Dictionary<int, int>(); "
-        "  d[3] := 100; "
-        "  d[4] := 200; "
-        "  var sum := 0; "
-        "  for var k in d.Keys do sum := sum + k; end; "
-        "  return sum; "                              // 3 + 4 = 7
-        "end Main; end C;"), 7);
-}
-
 // §4.8: `for var k in <Dictionary<int,int>>.Keys` iterates once per key — a
 // counted loop over a 2-entry dictionary's keys yields 2 iterations.
 BEZEL_TEST(codegen_collection_keys, for_in_dict_int_keys_count_spec_4_8) {

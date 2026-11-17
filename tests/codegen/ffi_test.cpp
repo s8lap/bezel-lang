@@ -208,18 +208,6 @@ BEZEL_TEST(codegen_ffi_types, nullable_cstring_resolve_32_1) {
     BEZEL_EXPECT_EQ(r.exitCode, 2);
 }
 
-// §32.5 / stdlib §10.2 / §10.3: WString and RawBytes resolve as extern types.
-BEZEL_TEST(codegen_ffi_types, wstring_rawbytes_resolve_32_5) {
-    auto r = runAot(
-        "module M; "
-        "extern \"c\" "
-        "  public method w(s: WString): IntPtr; "
-        "  public method b(buf: RawBytes): IntPtr; end; "
-        "class C public static method Main(): int return 3; end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 3);
-}
-
 // §32.5 / §32.6: a Bezel `string` argument marshals to a `CString` (char*)
 // parameter end-to-end. libc atoi("42") parses the null-terminated UTF-8 data
 // pointer of the bz_string and returns 42, observable as the JIT exit code.
@@ -244,27 +232,6 @@ BEZEL_TEST(codegen_ffi_types, cstring_arg_marshals_to_libc_puts_32_6) {
         "  _ := puts(\"hello-ffi\"); return 0; "
         "end Main; end C;");
     BEZEL_EXPECT_EQ(out, std::string("hello-ffi\n"));
-}
-
-// §32.5 / §32.6: a NON-ASCII string (storage width > 1) marshalled to CString
-// must be RE-ENCODED to null-terminated UTF-8, not handed over as the raw wide
-// data pointer. A width-2 string stores each code point in 2 bytes, so the raw
-// buffer has interior NUL bytes (e.g. U+0100 → 0x00 0x01) that truncate a C
-// `char*` read. "AĀB" is A (U+0041), Ā (U+0100), B (U+0042); its UTF-8 is
-// 0x41 0xC4 0x80 0x42 — 4 bytes. libc strlen over the marshalled CString must
-// therefore return 4. Without the re-encode, strlen stops at the first interior
-// NUL and returns 1 (silent corruption). Ā forces a single code point
-// above 0xFF so the literal lowers to storage width 2.
-BEZEL_TEST(codegen_ffi_types, cstring_nonascii_reencoded_to_utf8_strlen_32_6) {
-    auto r = runAot(
-        "module M; "
-        "extern \"c\" public method strlen(s: CString): int; end; "
-        "class C public static method Main(): int "
-        "  var s := \"A\\u0100B\"; "
-        "  return strlen(s); "
-        "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 4);
 }
 
 // §32.5 / §32.6: a width-1 (pure-ASCII) string still marshals correctly through

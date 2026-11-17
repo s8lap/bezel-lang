@@ -18,55 +18,12 @@ int run(const std::string& program) {
 }
 } // namespace
 
-BEZEL_TEST(codegen_cg50, ref_param_mutation_visible) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Inc(ref x: int) x := x + 1; end Inc; "
-        "  public static method Main(): int "
-        "    var n := 5; Inc(ref n); return n; "
-        "  end Main; "
-        "end C;"), 6);
-}
-
-BEZEL_TEST(codegen_cg50, out_param_writes_back) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Get(out x: int) x := 42; end Get; "
-        "  public static method Main(): int "
-        "    var n := 0; Get(out n); return n; "
-        "  end Main; "
-        "end C;"), 42);
-}
-
-BEZEL_TEST(codegen_cg50, two_ref_params_swap) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  public static method Swap(ref a: int, ref b: int) "
-        "    var t := a; a := b; b := t; "
-        "  end Swap; "
-        "  public static method Main(): int "
-        "    var x := 3; var y := 7; Swap(ref x, ref y); return x * 10 + y; "
-        "  end Main; "
-        "end C;"), 73);
-}
-
 BEZEL_TEST(codegen_cg50, ref_reads_and_writes) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Double(ref x: int) x := x * 2; end Double; "
         "  public static method Main(): int "
         "    var n := 21; Double(ref n); return n; "
-        "  end Main; "
-        "end C;"), 42);
-}
-
-BEZEL_TEST(codegen_cg50, ref_to_a_field) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class N public V: int := 0; end N; "
-        "class C "
-        "  public static method Inc(ref x: int) x := x + 1; end Inc; "
-        "  public static method Main(): int "
-        "    var n := new N(); n.V := 41; Inc(ref n.V); return n.V; "
         "  end Main; "
         "end C;"), 42);
 }

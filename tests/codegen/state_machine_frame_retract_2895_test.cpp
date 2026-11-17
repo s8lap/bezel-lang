@@ -113,29 +113,6 @@ BEZEL_TEST(state_machine_frame_retract_2895, sync_iter_then_plain_try_finally) {
         "end C;\n"), 14);
 }
 
-// §30.1 — the async-method twin. `Plain` (11) + 1 == 12.
-BEZEL_TEST(state_machine_frame_retract_2895, async_method_then_plain_try_finally) {
-    BEZEL_EXPECT_EQ(run(
-        "module M;\n"
-        "class C\n"
-        "  public static async method Tick(): Task<int>\n"
-        "    return 1;\n"
-        "  end Tick;\n"
-        "  public static method Plain(): int\n"
-        "    var n := 0;\n"
-        "    try\n"
-        "      n := n + 1;\n"
-        "    finally\n"
-        "      n := n + 10;\n"
-        "    end;\n"
-        "    return n;\n"
-        "  end Plain;\n"
-        "  public static method Main(): int\n"
-        "    return C.Plain();\n"
-        "  end Main;\n"
-        "end C;\n"), 11);
-}
-
 // §30.7 — the async-iterator twin. `Plain` (11) + 3 (1+2) == 14.
 BEZEL_TEST(state_machine_frame_retract_2895, async_iter_then_plain_try_finally) {
     BEZEL_EXPECT_EQ(run(

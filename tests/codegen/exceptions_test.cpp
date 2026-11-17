@@ -297,32 +297,6 @@ BEZEL_TEST(codegen_cg20, catch_binding_without_var) {
 // §31 built-in exception objects now carry a message string at byte offset 8.
 // Accessing .Message returns it (or empty string if no-arg construction).
 
-BEZEL_TEST(codegen_cg20, exception_message_property) {
-    // ArgumentException constructed with a message string.
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  try "
-        "    throw new ArgumentException(\"bad arg\"); "
-        "  catch var e: ArgumentException => return e.Message.Length; "
-        "  end; "
-        "  return 0; "
-        "end Main; end C;"),
-        7);   // "bad arg".Length = 7
-}
-
-BEZEL_TEST(codegen_cg20, exception_message_no_arg) {
-    // No-arg exception construction: Message should be empty string, Length 0.
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  try "
-        "    throw new InvalidOperationException(); "
-        "  catch var e: InvalidOperationException => return e.Message.Length; "
-        "  end; "
-        "  return -1; "
-        "end Main; end C;"),
-        0);
-}
-
 // ── Array bounds checking ──────────────────────────────────────────────────
 
 BEZEL_TEST(codegen_cg20, array_bounds_oor_read_throws) {

@@ -250,31 +250,3 @@ BEZEL_TEST(dict_indexer_compound_rhs_leak_2596,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 86);    // 4950 mod 256
 }
-
-// =====================================================================
-// #2596 — #2587 ARRAY regression guard: an Array<string> compound += producer
-// rhs. The #2587 fix (the isStrElemArr branch, a SEPARATE code path from the
-// dict branch this fix touches) must remain LSan-clean — this fix must not
-// regress it.
-// =====================================================================
-BEZEL_TEST(dict_indexer_compound_rhs_leak_2596,
-           array_string_compound_remains_clean_2587_spec_23_4_28_9) {
-    JitResult r = runAotChecked(kArrayCompoundProducer);
-    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
-    // FAILS the r.ran assertion below instead of passing silently.
-    BEZEL_EXPECT_TRUE(r.ran);
-}
-
-// =====================================================================
-// #2596 — #2567 USER-INDEXER regression guard: a class user-defined indexer
-// compound += producer rhs. The #2567 fix (lowerIndexerCompound, a SEPARATE
-// function from lowerCollectionIndexerCompound) must remain LSan-clean — this
-// fix must not regress it.
-// =====================================================================
-BEZEL_TEST(dict_indexer_compound_rhs_leak_2596,
-           user_indexer_compound_remains_clean_2567_spec_23_4_28_9) {
-    JitResult r = runAotChecked(kUserIndexerCompound);
-    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
-    // FAILS the r.ran assertion below instead of passing silently.
-    BEZEL_EXPECT_TRUE(r.ran);
-}

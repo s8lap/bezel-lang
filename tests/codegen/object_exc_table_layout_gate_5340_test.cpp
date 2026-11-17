@@ -26,7 +26,8 @@
 // types / function values, and `Object` is on none of them), which routes every
 // `Object` disposal through emitReclaimBlock and so through this table.
 // MEASURED consequence, gate shard codegen/0 at 2ca2b689:
-// `owning_array_object_literal_5340.plain_new_object_local_tostring` SEGVs.
+// `owning_array_object_literal_5340.plain_new_object_local_tostring` SEGVs (that
+// program is now pinned here, by `plain_new_object_local_reclaim_reads_no_exc_fields`).
 //
 // WHY THE ORACLE IS `runAot` AND NOT THE SANITIZED ONE. This is the point of
 // the file, and it is why the defect survived #5437's own six rows. Those rows

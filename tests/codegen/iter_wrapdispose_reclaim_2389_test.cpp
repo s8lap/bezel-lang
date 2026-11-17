@@ -213,27 +213,3 @@ BEZEL_TEST(iter_wrapdispose_reclaim_2389, self_returning_no_double_free) {
         "  end Main; "
         "end C;"), 1);
 }
-
-// Regression guard: `for` over a concrete-typed source (lowerIEnumerableFor,
-// a completely different codegen path, #2384) is untouched by this fix — a
-// plain VALUE-correctness regression guard, `run()` not `runLeakChecked()`.
-// (Adversarial-pass discovery, filed separately, NOT fixed here: this exact
-// program DOES leak 24 bytes under LSan — `lowerIEnumerableFor`,
-// LlvmBackend_Stmts.cpp, disposes only the ENUMERATOR it constructs and
-// never the temporary SOURCE object `new IntRange(1, 4)` produces, when the
-// `for`-loop's iterable is an unnamed temporary rather than a named local —
-// the same family of "retained temporary never reclaimed" defect as the
-// src-retention gap noted above, but in a third, different function. Using
-// `runLeakChecked` here would make this test fail regardless of this
-// commit's fix, for a reason unrelated to `wrapDisposeFn`.)
-BEZEL_TEST(iter_wrapdispose_reclaim_2389, for_loop_over_concrete_source_value_unaffected) {
-    BEZEL_EXPECT_EQ(run(
-        std::string("module M; ") + kIntRangeTwoClass +
-        "class C "
-        "  public static method Main(): int "
-        "    var sum := 0; "
-        "    for var x in new IntRange(1, 4) do sum := sum + x; end; "
-        "    return sum; "
-        "  end Main; "
-        "end C;"), 10);
-}

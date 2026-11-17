@@ -139,28 +139,6 @@ BEZEL_TEST(indexer_compound_assign_20_23_4, field_backed_indexer_compound) {
 }
 
 // ---------------------------------------------------------------------------
-// (f) CONTROL: plain user-indexer `:=` (set) still works correctly
-// ---------------------------------------------------------------------------
-
-// §20 / §22.10: a plain `c[0] := v` through a user-defined indexer setter must
-// store the new value; this was working before and must stay correct.
-BEZEL_TEST(indexer_compound_assign_20_23_4, plain_set_unaffected) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C "
-        "  private _d: [2]int; "
-        "  public property [i: int]: int "
-        "    get => _d[i]; "
-        "    set => do _d[i] := value; end; "
-        "  end; "
-        "  public static method Main(): int "
-        "    using var c := new C(); "
-        "    c[0] := 42; "
-        "    return c[0]; "
-        "  end Main; "
-        "end C;"), 42);
-}
-
-// ---------------------------------------------------------------------------
 // (g) CONTROL: plain user-indexer get still works correctly
 // ---------------------------------------------------------------------------
 

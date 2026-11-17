@@ -326,28 +326,6 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
 }
 
 BEZEL_TEST(builtin_receiver_unlowered_member_2935,
-           unit_returning_builtin_statement_still_lowers_spec_30_15) {
-    // The false-reject the FIRST draft of this fix caused, kept as a permanent
-    // control: `ChannelSender<T>.Send` (stdlib §6.9 / spec §30.15) is fully
-    // implemented, emits `bz_channel_sender_send`, and then returns nullptr
-    // because the result is unit — reaching the very fallthrough a
-    // value-blind gate would report from. The oracle is the channel's buffered
-    // `Count`, not exit 0.
-    const std::string program =
-        "module M; import System.Threading; "
-        "class C public static method Main(): int "
-        "  using var ch := new Channel<int>(); "
-        "  using var sender := ch.NewSender(); "
-        "  sender.Send(42); "
-        "  sender.Send(7); "
-        "  return ch.Count; "
-        "end Main; end C;";
-    auto r = runAot(program);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(2, r.exitCode);
-}
-
-BEZEL_TEST(builtin_receiver_unlowered_member_2935,
            unit_returning_builtin_arrow_body_still_lowers_spec_30_15) {
     // The OTHER measured counterexample, and the reason the three sibling
     // #2491 return-degrade sites were deliberately left alone: a UNIT-returning

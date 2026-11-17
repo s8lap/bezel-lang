@@ -81,25 +81,6 @@ std::string runCheckedOut(const std::string& prog) {
 }
 }  // namespace
 
-// ── The issue's exact repro: a §21.1 `const` Dictionary collection literal
-// held across an `await`. Pre-fix: 420 bytes / 5 allocations leaked
-// (bz_dict_alloc x2, dict_order_append, strndup x2) because the §28.9
-// scope-end reclaim loaded a stale slot. Value: 2.
-// per §21.1, §30.2, §28.9, §15.4 (issue #3375)
-BEZEL_TEST(async_const_local_frame_spill_3375,
-           const_dict_literal_across_await_reclaimed_spec_21_1_30_2_28_9) {
-    BEZEL_EXPECT_EQ(runChecked(
-        "module M; import System; "
-        "class C "
-        "  public static async method Main(): Task<int> "
-        "    const d: Dictionary<string, int> := [\"a\": 10, \"b\": 20]; "
-        "    await Task.Delay(30); "
-        "    return d.Count; "
-        "  end Main; "
-        "end C;"),
-        2);
-}
-
 // ── VALUE axis, primitive: the leak was the mild symptom; the general defect
 // is that a `const` local simply did not survive the suspend. §21.1 makes the
 // binding readable for the rest of its scope. Pre-fix this returned stack

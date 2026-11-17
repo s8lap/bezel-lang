@@ -325,8 +325,8 @@ BEZEL_TEST(iter_temp_source_reclaim_2424, a5_field_source_not_double_freed) {
 
 // B1 — THE ISSUE'S EXACT REPRO (trivial-dispose classes, LSan proof of no
 // leak). Reproduces #2424's manifestation B verbatim; also the exact program
-// iter_wrapdispose_reclaim_2389_test.cpp's
-// `for_loop_over_concrete_source_value_unaffected` documents as leaking
+// iter_concrete_manual_getenumerator_2388_test.cpp's
+// `for_loop_over_concrete_source_unaffected` documents as leaking
 // (that test intentionally uses the non-leak-checking `run()` because this
 // fix did not exist yet — this test is the positive leak-free counterpart).
 BEZEL_TEST(iter_temp_source_reclaim_2424, b1_forin_temp_two_class_no_leak) {

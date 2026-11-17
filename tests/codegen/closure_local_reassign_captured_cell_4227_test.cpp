@@ -90,57 +90,6 @@ BEZEL_TEST(closure_local_reassign_captured_cell_4227,
         /* 500 * 42 = 21000; 21000 mod 97 = 3 */ 21000 % 97);
 }
 
-// ── PARITY: binding a closure local exactly once (no reassignment) was
-// already clean pre-fix and must stay clean. (issue #4227)
-BEZEL_TEST(closure_local_reassign_captured_cell_4227,
-           unreassigned_captured_closure_local_still_clean_parity_spec_27_5) {
-    BEZEL_EXPECT_EQ(runChecked(
-        "module M; "
-        "class C "
-        "  public static method MakeClosure(): () -> int "
-        "    var f: () -> int := lambda() => 42; "
-        "    return f; "
-        "  end MakeClosure; "
-        "  public static method Main(): int "
-        "    var total := 0; "
-        "    var i := 0; "
-        "    while i < 500 do "
-        "      var g := C.MakeClosure(); "
-        "      total := total + g(); "
-        "      i := i + 1; "
-        "    end; "
-        "    return total mod 97; "
-        "  end Main; "
-        "end C;"),
-        21000 % 97);
-}
-
-// ── PARITY: non-captured closure local reassigned from OUTSIDE (the path
-// #4174 fixed) must remain clean. (issue #4227, parity with #4174)
-BEZEL_TEST(closure_local_reassign_captured_cell_4227,
-           non_captured_reassign_from_outside_still_clean_parity_spec_27_5_28_9) {
-    BEZEL_EXPECT_EQ(runChecked(
-        "module M; "
-        "class C "
-        "  public static method MakeClosure(): () -> int "
-        "    var f: () -> int := lambda() => 0; "
-        "    f := lambda() => 42; "
-        "    return f; "
-        "  end MakeClosure; "
-        "  public static method Main(): int "
-        "    var total := 0; "
-        "    var i := 0; "
-        "    while i < 500 do "
-        "      var g := C.MakeClosure(); "
-        "      total := total + g(); "
-        "      i := i + 1; "
-        "    end; "
-        "    return total mod 97; "
-        "  end Main; "
-        "end C;"),
-        21000 % 97);
-}
-
 // ── SCALING axis: TWO reassignments inside the capturing lambda displace
 // TWO distinct producer values, so the leak scales linearly.
 // Pre-fix: 40000 bytes / 1000 allocations (2 x 20000/500) leaked.

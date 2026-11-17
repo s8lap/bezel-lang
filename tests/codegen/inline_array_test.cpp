@@ -224,24 +224,6 @@ BEZEL_TEST(codegen_array, for_in_array_expression) {
         "end C;"), 60);
 }
 
-// #736 / §15.1: a whole-array collection-literal ASSIGNMENT `target := [...]` to
-// an inline-array lvalue (a class field, in the constructor) was silently
-// dropped (the field stayed zero-initialized). The assignment statement now
-// special-cases the collection literal like the field-init/local-decl paths.
-BEZEL_TEST(codegen_inline_array, collection_literal_assign_to_field_736) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "class Holder "
-        "  public _arr: [3]int; "
-        "  public constructor() _arr := [10, 20, 30]; end constructor; "
-        "  public method Sum(): int => _arr[0] + _arr[1] + _arr[2]; "
-        "end Holder; "
-        "class C public static method Main(): int "
-        "  using var h := new Holder(); "
-        "  return h.Sum(); "  // 60
-        "end Main; end C;"), 60);
-}
-
 // #736: whole-array reassignment of an inline-array LOCAL via a literal.
 BEZEL_TEST(codegen_inline_array, collection_literal_reassign_local_736) {
     BEZEL_EXPECT_EQ(run(

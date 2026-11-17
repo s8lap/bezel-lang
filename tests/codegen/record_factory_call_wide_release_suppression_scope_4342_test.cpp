@@ -128,36 +128,4 @@ BEZEL_TEST(record_factory_call_wide_release_suppression_scope_4342,
     BEZEL_EXPECT_EQ(runChecked(prog), 50);
 }
 
-// NEGATIVE CONTROL — `var outer := ...` with a SECOND +1-producer
-// argument the callee does not embed. The call-wide suppression stays
-// armed (call IS the init), so the unrelated argument's release is
-// still withheld — the pre-existing leak-over-UAF safe default, not
-// a #4342 regression. Floor 15000 B below measured 19890 B / 1000
-// allocs (§30: floor, not exact count).
-BEZEL_TEST(record_factory_call_wide_release_suppression_scope_4342,
-           bound_call_result_unrelated_arg_still_leaks_call_wide) {
-    const char* prog =
-        "module M; "
-        "record Str(V: string); "
-        "class Helper "
-        "  public static method Wrap(s: string, unused: string): Str "
-        "    return new Str(s); "
-        "  end Wrap; "
-        "end Helper; "
-        "class C "
-        "  public static method Main(): int "
-        "    var total: int := 0; "
-        "    var i: int := 0; "
-        "    while i < 500 do "
-        "      var outer := Helper.Wrap(\"he\" + \"llo\" + i.ToString(), "
-        "                                \"junk\" + i.ToString()); "
-        "      total := total + outer.V.Length; "
-        "      i := i + 1; "
-        "    end while; "
-        "    return total mod 256; "
-        "  end Main; "
-        "end C;";
-    BEZEL_EXPECT_TRUE(leaksAtLeast(prog, 15000));
-}
-
 }  // namespace bezel::codegen

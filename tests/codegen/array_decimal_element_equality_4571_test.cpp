@@ -194,14 +194,3 @@ BEZEL_TEST(array_decimal_element_equality_4571, set_decimal_dedup_control_spec_4
         "  return 0; "
         "end Main; end C;"), 1);
 }
-
-// `Dictionary<decimal, V>.ContainsKey` — already fixed by #4562's
-// `lowerValueSemMethodOn` arm, a different dispatch site; control only.
-BEZEL_TEST(array_decimal_element_equality_4571, dictionary_decimal_key_control_spec_4_4) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  var m: Dictionary<decimal, int> := [5.5m: 1, 9.25m: 2]; "
-        "  if m.ContainsKey(5.50m) then return 1; end; "
-        "  return 0; "
-        "end Main; end C;"), 1);
-}

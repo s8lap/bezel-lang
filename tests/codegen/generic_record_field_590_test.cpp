@@ -478,49 +478,6 @@ BEZEL_TEST(generic_record_field_590, multi_field_record_all_members_constrained)
         "end Main; end C;"), "432");
 }
 
-// ── §14 regression: the #585 int/string-T cases stay correct ──
-
-// T = int via inherited method: still 42. These read `_val` ITSELF (not a
-// nested member of it), so they were never in #590's broken set and are
-// unaffected by both the #590 fix and the #5449 rejection.
-BEZEL_TEST(generic_record_field_590, regression_585_int_T) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "class Container<T> "
-        "  protected _val: T; "
-        "  public constructor(v: T) _val := v; end constructor; "
-        "  public method BaseGet(): T return _val; end BaseGet; "
-        "  destructor end destructor; "
-        "end Container; "
-        "class Wrapper<T>: Container<T> "
-        "  public constructor(v: T) base(v); end constructor; "
-        "  public method DerivedGet(): T return _val; end DerivedGet; "
-        "  destructor end destructor; "
-        "end Wrapper; "
-        "class C public static method Main(): int "
-        "  using var w := new Wrapper<int>(42); "
-        "  return w.DerivedGet(); "
-        "end Main; end C;"), 42);
-}
-
-// T = string via inherited method: "hello".Length == 5 (the #585 pointer-field
-// case stays correct). The `.Length` here is read OUTSIDE the generic body —
-// on a concrete `Wrapper<string>` — so it is an ordinary member read.
-BEZEL_TEST(generic_record_field_590, regression_585_string_T) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "class Container<T> "
-        "  protected _val: T; "
-        "  public constructor(v: T) _val := v; end constructor; "
-        "  public method BaseGet(): T return _val; end BaseGet; "
-        "  destructor end destructor; "
-        "end Container; "
-        "class Wrapper<T>: Container<T> "
-        "  public constructor(v: T) base(v); end constructor; "
-        "  destructor end destructor; "
-        "end Wrapper; "
-        "class C public static method Main(): int "
-        "  using var w := new Wrapper<string>(\"hello\"); "
-        "  return w.BaseGet().Length; "
-        "end Main; end C;"), 5);
-}
+// ── §14 regression: the #585 int/string-T cases are pinned (same programs, same
+// assertions) in generic_base_field_585_test.cpp: generic_base_field_via_derived_method
+// and generic_base_string_field.

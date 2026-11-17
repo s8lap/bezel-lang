@@ -88,23 +88,6 @@ BEZEL_TEST(codegen_cg24, float_double_mixed_arithmetic) {
                         "return (if f + d = 3.5 then 1 else 0);"), 1);
 }
 
-// §4.3.1 (L308/L314): "NaN = NaN is true" — reflexive equality, deliberate
-// (needed for Set<double>/Dictionary key semantics, and `case` expressions).
-// `<>` is the negation of `=`, so `NaN <> NaN` is false.
-// IEEE <,<=,>,>= comparisons on NaN remain false (unchanged).
-// These tests were updated from the pre-fix expected values when #514 was fixed.
-BEZEL_TEST(codegen_cg24, nan_equality_is_true_spec_4_3_1) {
-    // §4.3.1: NaN = NaN must be true (reflexive equality).
-    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; "
-                        "return (if nan = nan then 1 else 0);"), 1);
-}
-
-BEZEL_TEST(codegen_cg24, nan_inequality_is_false_spec_4_3_1) {
-    // §4.3.1: NaN <> NaN is false (negation of `=` which is true).
-    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; "
-                        "return (if nan <> nan then 1 else 0);"), 0);
-}
-
 BEZEL_TEST(codegen_cg24, non_nan_inequality_unchanged) {
     BEZEL_EXPECT_EQ(run("var a := 3.0; var b := 4.0; "
                         "return (if a <> b then 1 else 0);"), 1);

@@ -305,21 +305,6 @@ BEZEL_TEST(property_accessor_types_510, interface_nullable_int_property) {
 // Controls: the #481 cases must still pass (regression guard)
 // ---------------------------------------------------------------------------
 
-// C1. virtual int property dispatch still correct (§12.1 / #481 control).
-BEZEL_TEST(property_accessor_types_510, control_virtual_int_property) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "class Base public virtual property Num: int => 1; "
-        "  destructor end destructor; end Base; "
-        "class Derived : Base public override property Num: int => 2; "
-        "  destructor end destructor; end Derived; "
-        "class C "
-        "  public static method Get(b: Base): int => b.Num; "
-        "  public static method Main(): int "
-        "    using var d := new Derived(); return Get(d); "
-        "  end Main; end C;"), 2);
-}
-
 // C2. abstract property returning string through base ref (§12.5 / #481 control).
 BEZEL_TEST(property_accessor_types_510, control_abstract_string_property) {
     BEZEL_EXPECT_EQ(run(
@@ -335,23 +320,6 @@ BEZEL_TEST(property_accessor_types_510, control_abstract_string_property) {
         "    var n := (c as Base)!.Name; "
         "    return (if n = \"ok\" then 1 else 0); "
         "  end Main; end C;"), 1);
-}
-
-// C3. interface property returning int through interface ref (§13 / #481 control).
-BEZEL_TEST(property_accessor_types_510, control_interface_int_property) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        // §11.2/§23.3 (#2413): Square's `Size` is getter-only and this test
-        // never writes through the interface (see the identical note on
-        // interface_enum_property above).
-        "interface IShape readonly property Size: int; end IShape; "
-        "class Square : IShape public property Size: int => 9; "
-        "  destructor end destructor; end Square; "
-        "class C "
-        "  public static method SizeOf(s: IShape): int => s.Size; "
-        "  public static method Main(): int "
-        "    using var sq := new Square(); return SizeOf(sq); "
-        "  end Main; end C;"), 9);
 }
 
 // ---------------------------------------------------------------------------

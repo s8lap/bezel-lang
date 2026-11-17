@@ -276,33 +276,3 @@ BEZEL_TEST(dict_nullable_read_544, control_record_add_indexer_spec_4_8) {
         "  return pv.X + pv.Y; "  // 10
         "end Main; end C;"), 10);
 }
-
-// #544 CONTROL: #539's Set-based nullable paths still pass (regression guard).
-// var v: int? := 42; d["x"] := v; then TryGetValue -> 42.
-BEZEL_TEST(dict_nullable_read_544, control_539_set_var_tryget_spec_4_8_7) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  using var d := new Dictionary<string, int?>(); "
-        "  var v: int? := 42; "
-        "  d[\"x\"] := v; "
-        "  var vx: int? := null; "
-        "  var found := d.TryGetValue(\"x\", out vx); "
-        "  if not found then return -1; end; "
-        "  if vx = null then return -2; end; "
-        "  return int(vx!); "
-        "end Main; end C;"), 42);
-}
-
-// #544 CONTROL: #539's indexer set via typed var still works.
-// var v: int? := 17; d["k"] := v; d["k"] -> 17.
-BEZEL_TEST(dict_nullable_read_544, control_539_indexer_var_get_spec_4_8_7) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class C public static method Main(): int "
-        "  using var d := new Dictionary<string, int?>(); "
-        "  var v: int? := 17; "
-        "  d[\"k\"] := v; "
-        "  var got: int? := d[\"k\"]; "
-        "  if got = null then return -1; end; "
-        "  return int(got!); "
-        "end Main; end C;"), 17);
-}

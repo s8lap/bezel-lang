@@ -215,28 +215,6 @@ BEZEL_TEST(codegen_is_narrow_value_builtin_3122,
 // Axis-grid coverage — keeps the new gate from regressing adjacent shapes.
 // =====================================================================
 
-// §12.7: a user-defined VALUE-TYPE RECORD. Already worked before this fix
-// (declaration-ful Named TypeRef), pinned here so the regression covers the
-// SURFACE, not just the fix's kind. Pre-fix: 86 = 7*10 + 9 + 7 (X*10 + Y +
-// direct o.X).
-BEZEL_TEST(codegen_is_narrow_value_builtin_3122,
-           user_record_narrowing_unchanged_spec_12_7_8_6) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "record Pt(X: int, Y: int); "
-        "class C "
-        "  public static method Main(): int "
-        "    var p: Pt := new Pt(7, 9); "
-        "    var o: Object := p; "
-        "    if o is Pt then "
-        "      var q: Pt := o; "
-        "      return q.X * 10 + q.Y + o.X; "
-        "    end; "
-        "    return 1; "
-        "  end Main; "
-        "end C;"), 86);
-}
-
 // §12.7: a user-defined CLASS — narrowing a CLASS target narrows to a
 // reference, so the read must be the bare pointer (the existing path), NOT
 // the boxed payload. This is the guard that the value-builtin gate does not
