@@ -5769,14 +5769,24 @@ void Emitter::stampErasedDisposalRecord(llvm::Value* h,
     // is the name only, and only a `new` writes it.
     const bool isEvent =
         isEventSourceTypeName(rt) || isSharedEventSourceTypeName(rt);
-    if (isEvent || bn == "Atomic" || bn == "AtomicInteger") {
+    // fix #8608 (§8.5, v0.357): a Channel<T> and a completion source likewise
+    // (their vtable Dispose slot needs no policy: the channel recorded its
+    // element disposer at `new` already, and the completion source's owned-
+    // result disposer is registered by `bz_tcs_set_owned_disposer`).
+    const bool isChannel = bn == "Channel";
+    const bool isTcs = bn == "TaskCompletionSource" ||
+                       bn == "OwningTaskCompletionSource";
+    if (isEvent || bn == "Atomic" || bn == "AtomicInteger" || isChannel ||
+        isTcs) {
         if (onlyIfUnset) return;
         llvm::Value* name = nameLiteral();
         if (name == nullPtr) return;
+        const char* setter = isEvent     ? "bz_event_source_set_type_name"
+                             : isChannel ? "bz_channel_set_type_name"
+                             : isTcs     ? "bz_tcs_set_type_name"
+                                         : "bz_atomic_set_type_name";
         builder_.CreateCall(
-            declareC(isEvent ? "bz_event_source_set_type_name"
-                             : "bz_atomic_set_type_name",
-                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}),
+            declareC(setter, llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}),
             {h, name});
         return;
     }

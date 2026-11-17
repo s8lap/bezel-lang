@@ -3096,7 +3096,45 @@ struct bz_channel_t {
     // Send arrival, bz_channel_send writes the item pointer through this slot
     // before completing the parked task. Void** to allow direct write.
     void** recv_all_waiter_item_slot;
+    // fix #8608 (§28.5 / §30.15, v0.357): the Channel<T> HANDLE this core was
+    // minted with (see bz_channel_handle_t). The core frees it at its last
+    // release — exactly when the pre-#8608 core block itself went away, so a
+    // typed disposal keeps the old lifetime. The class-protocol Dispose
+    // (bz_channel_obj_dispose) nulls it first: there the caller's reclaim
+    // step frees the handle instead.
+    struct bz_channel_handle_t* handle = nullptr;
 };
+
+// fix #8608 (§28.5 / §28.11 / §30.15, v0.357): the Channel<T> object the
+// program holds. Every class is `IDisposable` (stdlib §2.10), so a channel may
+// sit in an owned `IDisposable` slot (an `owned d: IDisposable` parameter, an
+// `owned F: IDisposable?` field, an `OwningArray<IDisposable>` element), and
+// that slot discharges it by the class protocol: word 0 is read as a vtable,
+// slot 2 is called, and the block is reclaimed with `free`. The core cannot be
+// that block — senders, parked Receive tasks and a ReceiveAll enumerator keep
+// it alive past the channel's own disposal (fix #634's refcount) — so, as
+// #8000 did for Semaphore, the program holds a small malloc'd handle (vtable
+// word, core pointer, a disposed flag) and only the core is refcounted. Every
+// exported entry point that codegen hands a Channel<T> value unwraps it with
+// channel_core_of; everything inside the runtime keeps holding the core.
+struct bz_channel_handle_t {
+    void*         vtable;    // bz_channel_vtable
+    bz_channel_t* core;      // holds one core ref until the handle's disposal
+    int32_t       disposed;  // exactly-once gate for the two disposal forms
+    void*         type_name; // §8.5 name stamped at `new`, or null
+};
+
+static inline bz_channel_t* channel_core_of(void* chp) {
+    return chp ? static_cast<bz_channel_handle_t*>(chp)->core : nullptr;
+}
+
+// fix #8608: the ChannelClosedException vtable the class-protocol Dispose
+// faults pending receivers with (the typed paths are handed it per call).
+// Registered at startup by bz_channel_cce_vtable_init, as bz_ioe_vtable is.
+static void* g_channel_cce_vtable = nullptr;
+extern "C" void bz_channel_cce_vtable_init(void* vtable) {
+    g_channel_cce_vtable = vtable;
+}
 
 // Forward declaration
 static void channel_close_and_drain_pending(bz_channel_t* ch,
@@ -3114,8 +3152,10 @@ static void channel_core_ref(bz_channel_t* ch) {
 // Release a reference.  per fix #634.
 // When the count reaches 0, delete the channel core.
 static void channel_core_release(bz_channel_t* ch) {
-    if (ch->core_refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+    if (ch->core_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        free(ch->handle);  // fix #8608: null after a class-protocol Dispose
         delete ch;
+    }
 }
 
 extern "C"
@@ -3135,25 +3175,42 @@ void* bz_channel_new(void (*dispose_elem)(void*), int64_t capacity) {
     ch->pending_recv_task     = 0;
     ch->recv_all_waiter_task  = nullptr;
     ch->recv_all_waiter_item_slot = nullptr;
-    // core_refs starts at 1 (the Channel object's ref); per fix #634.
-    return ch;
+    // core_refs starts at 1 (the Channel object's ref); per fix #634. Since
+    // fix #8608 that ref is the handle's.
+    auto* h = static_cast<bz_channel_handle_t*>(
+        calloc(1, sizeof(bz_channel_handle_t)));
+    h->vtable = (void*)bz_channel_vtable;
+    h->core = ch;
+    ch->handle = h;
+    return h;
 }
 
 // bz_channel_sender_t -- a minted sender handle (§30.15 NewSender).
 // Each handle increments the channel's sender_count; releasing the last one
 // closes the channel.
+//
+// fix #8608 (§28.5 / §30.15, v0.357): the handle opens with a runtime-owned
+// vtable (bz_channel_sender_vtable) so an owned `IDisposable` slot holding a
+// sender reaches its real release through slot 2 (bz_channel_sender_obj_
+// dispose), and it is malloc'd because that slot's reclaim step frees it with
+// `free`. `released` makes the release exactly-once across the two forms.
 struct bz_channel_sender_t {
+    void*         vtable;   // bz_channel_sender_vtable
     bz_channel_t* ch;
+    int32_t       released;
 };
 
 extern "C"
 void* bz_channel_new_sender(void* chp) {
-    auto* ch = (bz_channel_t*)chp;
+    auto* ch = channel_core_of(chp);
     {   std::lock_guard<std::mutex> lk(ch->mtx);
         ch->sender_count++;
     }
     channel_core_ref(ch);  // per fix #634: sender holds a core ref
-    auto* tx = new bz_channel_sender_t{ch};
+    auto* tx = static_cast<bz_channel_sender_t*>(
+        calloc(1, sizeof(bz_channel_sender_t)));
+    tx->vtable = (void*)bz_channel_sender_vtable;
+    tx->ch = ch;
     return tx;
 }
 
@@ -3163,9 +3220,10 @@ void* bz_channel_new_sender(void* chp) {
 // Per fix #634 / §30.15: if the channel is closed or disposed, dispose the
 // item, build a ChannelClosedException object into bz_exc, and return.
 // The codegen caller must call emitPendingCheck() after every Send call.
-extern "C"
-void bz_channel_send(void* chp, void* item, void* cce_vtable, void* cfe_vtable) {
-    auto* ch = (bz_channel_t*)chp;
+// fix #8608: the body takes the CORE (a sender holds the core, not a
+// handle); the exported bz_channel_send below unwraps the Channel<T> handle.
+static void channel_send_core(bz_channel_t* ch, void* item, void* cce_vtable,
+                              void* cfe_vtable) {
     bz_pending_receiver_t recv{nullptr, nullptr};
     // §30.15 / stdlib §6.9 v0.186 (#1724): a ReceiveAll drain waiter parked in
     // MoveNextAsync. If set, the new item is delivered straight to it
@@ -3254,7 +3312,7 @@ extern "C"
 void bz_channel_sender_send(void* txp, void* item, void* cce_vtable,
                             void* cfe_vtable) {
     auto* tx = (bz_channel_sender_t*)txp;
-    bz_channel_send(tx->ch, item, cce_vtable, cfe_vtable);
+    channel_send_core(tx->ch, item, cce_vtable, cfe_vtable);
 }
 
 // bz_channel_send_async: §6.9 / §30.15 v0.174 (#809). Returns a Task that
@@ -3271,9 +3329,9 @@ void bz_channel_sender_send(void* txp, void* item, void* cce_vtable,
 //                                buffered-undelivered-items rule).
 // cce_vtable is the ChannelClosedException vtable (from codegen). The mirror of
 // the receiver-parking machinery in bz_channel_receive.
-extern "C"
-void* bz_channel_send_async(void* chp, void* item, void* cce_vtable) {
-    auto* ch = (bz_channel_t*)chp;
+// fix #8608: core-taking body; bz_channel_send_async unwraps the handle.
+static void* channel_send_async_core(bz_channel_t* ch, void* item,
+                                     void* cce_vtable) {
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* task = new bz_task_t();
     // fix #713: route completion to the caller's domain (as bz_channel_receive).
@@ -3334,7 +3392,7 @@ void* bz_channel_send_async(void* chp, void* item, void* cce_vtable) {
 extern "C"
 void* bz_channel_sender_send_async(void* txp, void* item, void* cce_vtable) {
     auto* tx = (bz_channel_sender_t*)txp;
-    return bz_channel_send_async(tx->ch, item, cce_vtable);
+    return channel_send_async_core(tx->ch, item, cce_vtable);
 }
 
 // bz_channel_receive: return a task that will complete with the next item.
@@ -3343,9 +3401,19 @@ void* bz_channel_sender_send_async(void* txp, void* item, void* cce_vtable) {
 // If empty + open, the task is parked in the pending-receiver FIFO.
 //
 // The codegen-supplied cce_vtable is the ChannelClosedException vtable global.
+// fix #8608: the exported Channel<T>-handle forms of Send / SendAsync.
+extern "C"
+void bz_channel_send(void* chp, void* item, void* cce_vtable, void* cfe_vtable) {
+    channel_send_core(channel_core_of(chp), item, cce_vtable, cfe_vtable);
+}
+extern "C"
+void* bz_channel_send_async(void* chp, void* item, void* cce_vtable) {
+    return channel_send_async_core(channel_core_of(chp), item, cce_vtable);
+}
+
 extern "C"
 void* bz_channel_receive(void* chp, void* cce_vtable) {
-    auto* ch = (bz_channel_t*)chp;
+    auto* ch = channel_core_of(chp);
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* task = new bz_task_t();
     // fix #713: route to the caller's domain.
@@ -3552,7 +3620,7 @@ void bz_channel_receive_abandon(void* tp) {
 extern "C"
 int32_t bz_channel_try_receive(void* chp, void** out_item) {
     if (!chp) { *out_item = nullptr; return 0; }  // fix #667: null = disposed = empty
-    auto* ch = (bz_channel_t*)chp;
+    auto* ch = channel_core_of(chp);
     // v0.174 (#809): like bz_channel_receive, a successful drain frees a slot and
     // admits the oldest parked sender (FIFO) whose SendAsync task we wake below.
     bz_pending_sender_t woken{nullptr, nullptr, nullptr};
@@ -3574,7 +3642,7 @@ int32_t bz_channel_try_receive(void* chp, void** out_item) {
 // bz_channel_count: number of buffered (not-yet-received) items.
 extern "C"
 int64_t bz_channel_count(void* chp) {
-    auto* ch = (bz_channel_t*)chp;
+    auto* ch = channel_core_of(chp);
     std::lock_guard<std::mutex> lk(ch->mtx);
     return (int64_t)ch->items.size();
 }
@@ -3588,7 +3656,7 @@ int64_t bz_channel_count(void* chp) {
 extern "C"
 int32_t bz_channel_is_closed(void* chp) {
     if (!chp) return 1;  // fix #667: null = disposed = closed
-    auto* ch = (bz_channel_t*)chp;
+    auto* ch = channel_core_of(chp);
     std::lock_guard<std::mutex> lk(ch->mtx);
     return ch->closed ? 1 : 0;
 }
@@ -3695,7 +3763,7 @@ static void channel_close_and_drain_pending(bz_channel_t* ch,
 extern "C"
 void bz_channel_close(void* chp, void* cce_vtable) {
     if (!chp) return;  // disposed + slot-nulled = already closed (§30.15)
-    auto* ch = (bz_channel_t*)chp;
+    auto* ch = channel_core_of(chp);
     {   std::lock_guard<std::mutex> lk(ch->mtx);
         if (ch->closed) return;  // idempotent no-op (see above)
     }
@@ -3706,13 +3774,39 @@ void bz_channel_close(void* chp, void* cce_vtable) {
 // sender, close the channel. cce_vtable is the ChannelClosedException vtable.
 // per fix #634: also drops the sender's core_refs reference so the channel
 // core can be freed when Channel.Dispose has already run.
+//
+// fix #8608: the release proper is channel_sender_give_back, shared by the
+// typed release (which also frees the handle, as before) and the class-
+// protocol Dispose bz_channel_sender_obj_dispose (which leaves the handle to
+// the caller's reclaim). The `released` exchange makes the pair exactly-once.
+static void channel_sender_give_back(bz_channel_t* ch, void* cce_vtable);
+
 extern "C"
 void bz_channel_sender_release(void* txp, void* cce_vtable) {
     if (!txp) return;
     auto* tx = (bz_channel_sender_t*)txp;
     bz_channel_t* ch = tx->ch;
-    delete tx;
+    const bool already = __atomic_exchange_n(&tx->released, 1,
+                                             __ATOMIC_ACQ_REL) != 0;
+    free(tx);
+    if (!already) channel_sender_give_back(ch, cce_vtable);
+}
 
+// fix #8608 (§28.5, v0.357): slot 2 of bz_channel_sender_vtable — the class-
+// protocol Dispose an owned `IDisposable` slot dispatches. It gives the
+// sender's count and core ref back exactly as the typed release does (the
+// last sender closes the channel, §30.15) and leaves the handle for the
+// caller's reclaim step. Idempotent: an explicit `Dispose()` through the
+// interface followed by the slot's own discharge releases once.
+extern "C"
+void bz_channel_sender_obj_dispose(void* txp) {
+    if (!txp) return;
+    auto* tx = (bz_channel_sender_t*)txp;
+    if (__atomic_exchange_n(&tx->released, 1, __ATOMIC_ACQ_REL) != 0) return;
+    channel_sender_give_back(tx->ch, g_channel_cce_vtable);
+}
+
+static void channel_sender_give_back(bz_channel_t* ch, void* cce_vtable) {
     bool last_sender = false;
     {   std::lock_guard<std::mutex> lk(ch->mtx);
         ch->sender_count--;
@@ -3733,10 +3827,73 @@ void bz_channel_sender_release(void* txp, void* cce_vtable) {
 // is freed by channel_core_release when the last ref drops, which may be
 // here or when the last ChannelSender releases).
 // cce_vtable is passed to close pending receivers.
+//
+// fix #8608: the body (channel_dispose_core) is shared by this typed form and
+// the class-protocol Dispose bz_channel_obj_dispose. The handle's `disposed`
+// exchange makes the pair exactly-once; the core's own flag below still gates
+// the body (fix #4357).
+static void channel_dispose_core(bz_channel_t* ch, void* cce_vtable);
+
 extern "C"
 void bz_channel_dispose(void* chp, void* cce_vtable) {
     if (!chp) return;
-    auto* ch = (bz_channel_t*)chp;
+    auto* h = static_cast<bz_channel_handle_t*>(chp);
+    if (__atomic_exchange_n(&h->disposed, 1, __ATOMIC_ACQ_REL) != 0) return;
+    // The core still owns the handle (h == core->handle) and frees it at its
+    // last release — here when no sender is alive, else when the last one
+    // gives its ref back: the lifetime the pre-#8608 core block had.
+    channel_dispose_core(h->core, cce_vtable);
+}
+
+// fix #8608 (§28.5 / §28.11 / §30.15, v0.357): slot 2 of bz_channel_vtable —
+// the class-protocol Dispose an owned `IDisposable` slot dispatches. It runs
+// the typed disposal's body ("Disposing the Channel<T> itself closes it
+// immediately", stdlib §6.9; undelivered items are disposed in reverse,
+// §28.11) and drops the handle's core ref, but leaves the HANDLE for the
+// caller's reclaim step: the core forgets it first, so a sender that keeps
+// the core alive never frees it. Idempotent (an explicit `Dispose()` through
+// the interface, then the slot's discharge, runs the body once).
+extern "C"
+void bz_channel_obj_dispose(void* chp) {
+    if (!chp) return;
+    auto* h = static_cast<bz_channel_handle_t*>(chp);
+    if (__atomic_exchange_n(&h->disposed, 1, __ATOMIC_ACQ_REL) != 0) return;
+    bz_channel_t* ch = h->core;
+    // Still holding the handle's core ref, so no concurrent last release can
+    // read `handle` before this store; channel_core_release's acq_rel
+    // decrement orders it before the free there.
+    ch->handle = nullptr;
+    channel_dispose_core(ch, g_channel_cce_vtable);
+}
+
+// fix #8608: slot 3 — §8.5's default, the qualified type name: the
+// instantiation name stamped at `new`, else the bare head.
+extern "C"
+void* bz_channel_obj_tostring(void* chp) {
+    if (chp && static_cast<bz_channel_handle_t*>(chp)->type_name)
+        return static_cast<bz_channel_handle_t*>(chp)->type_name;
+    static const char name[] = "System.Threading.Channel";
+    return bz_make_string(name, (int64_t)(sizeof(name) - 1));
+}
+
+// Record the §8.5 name of a channel built by `new` (a string literal). A
+// no-op on null and on anything that is not a Channel<T> handle.
+extern "C"
+void bz_channel_set_type_name(void* chp, void* type_name) {
+    if (!chp) return;
+    void* word0;
+    memcpy(&word0, chp, sizeof(void*));
+    if (word0 != (void*)bz_channel_vtable) return;
+    static_cast<bz_channel_handle_t*>(chp)->type_name = type_name;
+}
+
+extern "C"
+void* bz_channel_sender_obj_tostring(void*) {
+    static const char name[] = "System.Threading.ChannelSender";
+    return bz_make_string(name, (int64_t)(sizeof(name) - 1));
+}
+
+static void channel_dispose_core(bz_channel_t* ch, void* cce_vtable) {
     if (ch->disposed.exchange(true)) return;  // already disposed → no-op (fix #4357)
     // Drain pending receivers with closed error.
     channel_close_and_drain_pending(ch, cce_vtable);
@@ -4038,7 +4195,7 @@ static void* bz_chrecvall_self_enumerator(void* self, void* /*token*/) {
 // surface the IOE.
 extern "C"
 void* bz_channel_recv_all_init(void* chp, void* ioe_vtable, int32_t is_owning) {
-    auto* ch = (bz_channel_t*)chp;
+    auto* ch = channel_core_of(chp);
     if (!ch) return nullptr;
     bz_main_domain_get();
 
@@ -4249,7 +4406,22 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
 // bz_tcs_t: holds a pre-allocated inner task and an atomic completion flag.
 // ---------------------------------------------------------------------------
 
+//
+// The InvalidOperationException vtable codegen registers at startup
+// (bz_ioe_vtable_init, bezel_runtime_collections.cpp).
+extern void* bz_ioe_vtable;
+
+// fix #8608 (§28.5 / §28.11, v0.357): a completion source is a class, so it may
+// sit in an owned `IDisposable` slot (an `owned d: IDisposable` parameter, an
+// `owned F: IDisposable?` field, an `OwningArray<IDisposable>` element), whose
+// discharge reads word 0 as a vtable, calls slot 2 and then frees the block.
+// So the struct opens with a runtime-owned vtable (bz_tcs_vtable, shared by
+// the three spellings — one representation), is malloc'd rather than `new`'d
+// (that reclaim uses `free`), and slot 2 (bz_tcs_obj_dispose) runs the release
+// the typed paths emit inline (Emitter::emitTcsRelease) short of freeing the
+// struct. `released` makes the release exactly-once across the two forms.
 struct bz_tcs_t {
+    void*                vtable = nullptr; // bz_tcs_vtable
     void*                inner_task; // bz_task_t* owned by this TCS
     std::atomic<int32_t> completed;  // 0 = pending, 1 = terminal state set
     // §28.3 / #1250: disposer for the owned result stored inside the inner task.
@@ -4257,6 +4429,8 @@ struct bz_tcs_t {
     // bz_tcs_dispose_owned_result when the TCS is disposed with a completed,
     // unconsumed owned result (the inner task's result buffer holds the class ptr).
     void (*owned_result_disposer)(void*) = nullptr;
+    std::atomic<int32_t> released{0};     // fix #8608: slot 2 ran
+    void*                type_name = nullptr; // §8.5 name stamped at `new`
     bz_tcs_t() : inner_task(nullptr), completed(0), owned_result_disposer(nullptr) {}
 };
 
@@ -4264,7 +4438,10 @@ extern "C" {
 
 // Allocate a new TCS struct and its inner task.
 void* bz_tcs_new(void) {
-    auto* tcs = new bz_tcs_t();
+    // fix #8608: malloc'd (the class-protocol reclaim frees it with `free`).
+    void* mem = calloc(1, sizeof(bz_tcs_t));
+    auto* tcs = new (mem) bz_tcs_t();
+    tcs->vtable = (void*)bz_tcs_vtable;
     tcs->inner_task = bz_task_alloc();
     return tcs;
 }
@@ -4346,7 +4523,8 @@ void bz_tcs_fault_if_pending(void* t, void* ioe_vtable) {
 // dealt with (fire-and-forget'd) before this call.
 void bz_tcs_free(void* t) {
     if (!t) return;
-    delete static_cast<bz_tcs_t*>(t);
+    static_cast<bz_tcs_t*>(t)->~bz_tcs_t();
+    free(t);  // fix #8608: allocated with calloc + placement new
 }
 
 // §28.3 / #1250: register the owned-result disposer for OwningTaskCompletionSource<T:class>.
@@ -4393,6 +4571,66 @@ void bz_tcs_dispose_owned_result(void* t) {
     free(buf_to_free);
     if (result_to_dispose)
         tcs->owned_result_disposer(result_to_dispose);
+}
+
+// fix #8608 (§28.5 / §28.11 / §28.3, v0.357): slot 2 of bz_tcs_vtable — the
+// class-protocol Dispose an owned `IDisposable` slot dispatches. It runs the
+// release Emitter::emitTcsRelease emits for a typed completion source, step for
+// step, WITHOUT step 4 (freeing the struct), which the slot's own reclaim does:
+//   1. fault a still-pending task with InvalidOperationException (stdlib §6.6:
+//      disposing a source whose task is pending faults it), so an awaiter of
+//      the task wakes instead of hanging;
+//   2. dispose a faulted task's exception exactly once — deferred to the last
+//      hold while it is in flight (§30.9), else wait out cross-task borrows,
+//      reap its identity hash and reclaim it (the emitDisposeAndReclaim
+//      sequence) — then clear the task's field so step 3 cannot re-dispose it;
+//  2.5 dispose an OwningTaskCompletionSource<T>'s unconsumed owned result;
+//   3. fire-and-forget the inner task (freed now if settled, else when it is).
+// The InvalidOperationException vtable is the one codegen registers at startup
+// (bz_ioe_vtable_init), the vtable emitTcsRelease passes. Idempotent: an
+// explicit `Dispose()` through the interface and the slot's discharge release
+// once.
+void bz_tcs_obj_dispose(void* t) {
+    if (!t) return;
+    auto* tcs = static_cast<bz_tcs_t*>(t);
+    if (tcs->released.exchange(1, std::memory_order_acq_rel) != 0) return;
+    bz_tcs_fault_if_pending(t, bz_ioe_vtable);                  // step 1
+    void* task = tcs->inner_task;
+    if (task && bz_task_is_error(task)) {                        // step 2
+        void* eo = bz_task_error_obj(task);
+        if (eo) {
+            if (bz_is_exc_borrowed(eo)) {
+                bz_defer_exc_dispose(eo);
+            } else {
+                bz_wait_for_borrows(eo);
+                bz_obj_identity_hash_forget(eo);
+                bz_dispose_class_obj(eo);
+            }
+            bz_task_clear_error_obj(task);
+        }
+    }
+    bz_tcs_dispose_owned_result(t);                              // step 2.5
+    bz_task_fire_and_forget(task);                               // step 3
+    tcs->inner_task = nullptr;
+}
+
+// fix #8608: slot 3 — §8.5's default: the name stamped at `new`, else the
+// bare head of the non-generic spelling.
+void* bz_tcs_obj_tostring(void* t) {
+    if (t && static_cast<bz_tcs_t*>(t)->type_name)
+        return static_cast<bz_tcs_t*>(t)->type_name;
+    static const char name[] = "System.Threading.TaskCompletionSource";
+    return bz_make_string(name, (int64_t)(sizeof(name) - 1));
+}
+
+// Record the §8.5 name of a completion source built by `new` (a string
+// literal). A no-op on null and on anything that is not a bz_tcs_t.
+void bz_tcs_set_type_name(void* t, void* type_name) {
+    if (!t) return;
+    void* word0;
+    memcpy(&word0, t, sizeof(void*));
+    if (word0 != (void*)bz_tcs_vtable) return;
+    static_cast<bz_tcs_t*>(t)->type_name = type_name;
 }
 
 } // extern "C" (TCS)

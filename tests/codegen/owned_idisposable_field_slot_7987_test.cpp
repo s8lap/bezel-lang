@@ -70,8 +70,10 @@
 // atomic cells, the serializers, `Subscription`, `Channel<T>`, the
 // completion sources — so for those this fix turned a leak into a wild
 // dispatch (#8533).  Fix #8533 gave each of them except `Channel<T>` and the
-// completion sources (#7532) a word-0 vtable; its rows are in
-// tests/codegen/idisposable_slot_headerless_handle_8533_test.cpp.
+// completion sources a word-0 vtable; its rows are in
+// tests/codegen/idisposable_slot_headerless_handle_8533_test.cpp.  Fix #8608
+// gave `Channel<T>`, `ChannelSender<T>` and the completion sources theirs;
+// its rows are in tests/codegen/idisposable_slot_channel_tcs_8608_test.cpp.
 //
 // THE BORROWING FAMILY IS NOT TOUCHED
 // ===================================

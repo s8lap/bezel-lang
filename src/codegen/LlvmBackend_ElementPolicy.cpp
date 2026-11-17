@@ -451,9 +451,9 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         // (§8.1 / stdlib §2.10) — a user class OR a stdlib built-in. For a
         // value that opens with a word-0 vtable the thunk's slot-2 call
         // reaches the value's own `Dispose()` and the block is then
-        // reclaimed. NOT every built-in does: see
-        // `isDisposableInterfaceHeadType` for which do (fix #8533) and which
-        // still do not (#7532).
+        // reclaimed. Every built-in class does since fix #8608 (Channel<T>,
+        // ChannelSender<T> and the completion sources were the last; see
+        // `isDisposableInterfaceHeadType`).
         //
         // The BORROWING family keeps the borrow row (a null disposer): per
         // §28.11 a borrowing collection's slots are borrows and "are never

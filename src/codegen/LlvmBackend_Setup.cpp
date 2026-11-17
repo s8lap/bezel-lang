@@ -11321,6 +11321,19 @@ void Emitter::emitMainStaticInitPrologue() {
             builder_.CreateCall(initFn, {vit->second});
         }
     }
+    // fix #8608 (§28.5 / §30.15, v0.357): likewise the ChannelClosedException
+    // vtable, for the class-protocol Dispose of a Channel<T> /
+    // ChannelSender<T> reached through an owned `IDisposable` slot (vtable
+    // slot 2, which no call site can hand the vtable to): it faults the
+    // channel's pending receivers as the typed disposal does.
+    {
+        auto vit = builtinVtable_.find("ChannelClosedException");
+        if (vit != builtinVtable_.end()) {
+            auto* initFn = declareC("bz_channel_cce_vtable_init",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(initFn, {vit->second});
+        }
+    }
     // issue 2330 / §31.4 / §30.9: hand the built-in exception vtable and
     // type-descriptor tables to the runtime, for the same reason and by the
     // same mechanism as the SerializationException vtable just above. The

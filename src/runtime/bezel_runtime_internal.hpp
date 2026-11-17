@@ -326,6 +326,22 @@ extern "C" void* bz_binder_obj_tostring(void* der);
 extern "C" void* bz_subscription_desc[2];
 extern "C" void* bz_subscription_vtable[6];
 extern "C" void bz_subscription_obj_dispose(void* sub);
+// fix #8608 (§28.5 / §28.11 / §30.15, v0.357): the Channel<T> handle, the
+// ChannelSender<T> handle and the completion source (all three spellings),
+// bezel_runtime_concurrency.cpp. Slot 2 is each one's class-protocol Dispose
+// (it releases the contents and leaves the block for the caller's reclaim).
+extern "C" void* bz_channel_desc[2];
+extern "C" void* bz_channel_vtable[6];
+extern "C" void* bz_channel_sender_desc[2];
+extern "C" void* bz_channel_sender_vtable[6];
+extern "C" void* bz_tcs_desc[2];
+extern "C" void* bz_tcs_vtable[6];
+extern "C" void bz_channel_obj_dispose(void* ch);
+extern "C" void* bz_channel_obj_tostring(void* ch);
+extern "C" void bz_channel_sender_obj_dispose(void* tx);
+extern "C" void* bz_channel_sender_obj_tostring(void* tx);
+extern "C" void bz_tcs_obj_dispose(void* tcs);
+extern "C" void* bz_tcs_obj_tostring(void* tcs);
 // Either view of a function value -> the cell base. A cell base's word 0 is a
 // code pointer and can never equal the vtable's address.
 static inline void* bz_closure_base(void* c) {

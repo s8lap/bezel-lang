@@ -2297,7 +2297,19 @@ void bz_channel_sender_release(void* tx, void* cce_vtable);
 
 // Dispose the Channel<T>: close it, fault pending receivers, dispose any
 // undelivered items in REVERSE insertion order (§28.11), and free the struct.
+// fix #8608: `ch` is the Channel<T> HANDLE (bz_channel_new's result), which
+// the refcounted core frees at its last release.
 void bz_channel_dispose(void* ch, void* cce_vtable);
+
+// fix #8608 (§28.5 / §30.15, v0.357): register the ChannelClosedException
+// vtable the class-protocol Dispose of a Channel<T> / ChannelSender<T> (vtable
+// slot 2, reached from an owned `IDisposable` slot) faults pending receivers
+// with. Called once from emitMainStaticInitPrologue, as bz_ioe_vtable_init.
+void bz_channel_cce_vtable_init(void* vtable);
+
+// fix #8608: record the §8.5 name of a Channel<T> built by `new` (a string
+// literal) for the through-`Object` `ToString()`; a no-op on anything else.
+void bz_channel_set_type_name(void* ch, void* type_name);
 
 // §30.15 / stdlib §6.9 v0.186 (#1724): Channel<T>.ReceiveAll() — build a
 // fresh drain-enumerable frame over the channel and return it as
@@ -2772,6 +2784,11 @@ void bz_tcs_fault_if_pending(void* tcs, void* ioe_vtable);
 // on the inner task, then call bz_tcs_free.
 // This just frees the bz_tcs_t struct itself.
 void bz_tcs_free(void* tcs);
+
+// fix #8608: record the §8.5 name of a completion source built by `new` (a
+// string literal) for the through-`Object` `ToString()`; a no-op on anything
+// that is not a bz_tcs_t.
+void bz_tcs_set_type_name(void* tcs, void* type_name);
 
 // fix #4748 / stdlib §4.4 (v0.307): register the InvalidOperationException
 // vtable with the runtime so bz_array_add and other structural mutators can

@@ -16060,10 +16060,10 @@ private:
     // hash-backed `Dictionary` / `Set` families, the event sources, the
     // atomic cells, the serializers / deserializers and `Subscription` (they
     // had none, and this arm read a count, a bucket pointer or a handler
-    // array as a vtable — #8533's crash).
+    // array as a vtable — #8533's crash), and since fix #8608 `Channel<T>`
+    // (now a handle in front of its refcounted core), `ChannelSender<T>` and
+    // the completion sources, the last ones that had none.
     //
-    // STILL WITHOUT ONE, and still a wild dispatch from this slot (#7532):
-    // `Channel<T>`, `TaskCompletionSource<T>`, `OwningTaskCompletionSource<T>`.
     // A NEW built-in without a vtable word must not become reachable here.
     //
     // WHY A HEAD-NAME PREDICATE AND NOT A DECLARATION TEST. `IDisposable` /

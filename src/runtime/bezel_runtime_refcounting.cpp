@@ -388,6 +388,18 @@ BZ_BUILTIN_TAG(bz_binder, bz_binder_obj_dispose, bz_binder_obj_tostring)
 // (bezel_runtime_events.cpp).
 BZ_BUILTIN_TAG(bz_subscription, bz_subscription_obj_dispose,
                bz_subscription_obj_tostring)
+// fix #8608 (§28.5 / §28.11 / §30.15, v0.357): the last header-less classes
+// #8533 left — `Channel<T>`, `ChannelSender<T>` (stdlib §6.9) and the
+// completion sources `TaskCompletionSource` / `TaskCompletionSource<T>` /
+// `OwningTaskCompletionSource<T>` (stdlib §6.6, one representation). A
+// channel's refcounted core outlives its handle while a sender holds it, so
+// the Channel<T> value is now a handle in front of the core (the #8000
+// Semaphore split); slot 2 of each runs the typed release short of freeing
+// the block (bezel_runtime_concurrency.cpp).
+BZ_BUILTIN_TAG(bz_channel, bz_channel_obj_dispose, bz_channel_obj_tostring)
+BZ_BUILTIN_TAG(bz_channel_sender, bz_channel_sender_obj_dispose,
+               bz_channel_sender_obj_tostring)
+BZ_BUILTIN_TAG(bz_tcs, bz_tcs_obj_dispose, bz_tcs_obj_tostring)
 #undef BZ_BUILTIN_TAG
 
 static inline bool bz_word0_is_builtin_vtable(void* word0) {
@@ -410,7 +422,11 @@ static inline bool bz_word0_is_builtin_vtable(void* word0) {
            word0 == (void*)bz_atomic_vtable ||
            word0 == (void*)bz_binser_vtable ||
            word0 == (void*)bz_binder_vtable ||
-           word0 == (void*)bz_subscription_vtable;
+           word0 == (void*)bz_subscription_vtable ||
+           // fix #8608: the three tags above.
+           word0 == (void*)bz_channel_vtable ||
+           word0 == (void*)bz_channel_sender_vtable ||
+           word0 == (void*)bz_tcs_vtable;
 }
 
 // fix #6776: codegen's hooks onto the tags above. `bz_sb_tag` retags the
