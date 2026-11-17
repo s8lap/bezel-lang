@@ -333,48 +333,14 @@ BEZEL_TEST(codegen_serialization_class_collection_8391,
 }
 
 // ===========================================================================
-// The RECORD half is unchanged — §9.8's record clause keeps the heap
-// collections out of a record's serialized set.
+// The REASON the shapes §9.8 does NOT admit are rejected. The bare
+// "still rejected" programs (the record heap-collection component, the nested
+// collection element, the nullable-string element, the class element in a
+// borrowing array, the collection auto-property, the non-owned field, and the
+// unaffected no-conformance class) are green on the pre-fix base as well, so
+// they are conformance-corpus cases, not gtest rows (owner rule 2026-11-12;
+// the programs are kept as corpus candidates for the harvest lane).
 // ===========================================================================
-
-// §9.8's record clause: "A record with a class-, interface-, `Shared<T>`-,
-// `Weak<T>`-, or heap-collection-typed serialized component is not
-// serialization-eligible — a compile error at the conformance declaration,
-// naming the field." This is the admitting twin of the class rows above: the
-// same collection type, in the position §9.8 says is NOT admitted. It is
-// green on the base and must stay green on the fix's tip.
-BEZEL_TEST(codegen_serialization_class_collection_8391,
-           record_heap_collection_component_still_rejected_spec_9_8_v0357) {
-    BEZEL_EXPECT_TRUE(compileFails(
-        std::string("module M; ") + kImport +
-        "public record Bag(Items: Array<int>): ISerializable, IDeserializable; "));
-}
-
-// ===========================================================================
-// The shapes §9.8 does NOT admit stay rejected — the fix widens the
-// eligible set by exactly the class clause's "owned collections of eligible
-// elements", not beyond it.
-// ===========================================================================
-
-// A NON-owned collection field. §9.8's class clause admits "owned
-// collections of eligible elements"; the synthesized `Deserialize` constructs
-// the collection fresh, so a borrowing collection field would have no owner
-// to free it (measured on the pre-rule build: 330 bytes in 6 allocations
-// leaked per round-trip under ASan/LSan).
-//
-// The rejection is asserted as a REJECTION only (the specific reason is
-// pinned by the `..._diagnostic_names_the_owned_rule_...` row below), so this
-// row is green on the pre-fix base as well — the base rejected EVERY
-// collection component — and stays green on the fix's tip.
-BEZEL_TEST(codegen_serialization_class_collection_8391,
-           non_owned_collection_field_still_rejected_spec_9_8_v0357) {
-    BEZEL_EXPECT_TRUE(compileFails(
-        std::string("module M; ") + kImport +
-        "class Bag(id: int, tags: Array<string>): ISerializable, IDeserializable "
-        "  public Tags: Array<string> := tags; "
-        "  public property Id: int => id; "
-        "end Bag; "));
-}
 
 // The REASON the non-owned collection field is rejected: §9.8's class clause
 // admits "owned collections of eligible elements". This row is RED on the
@@ -391,18 +357,6 @@ BEZEL_TEST(codegen_serialization_class_collection_8391,
         "is a collection-typed field that is not `owned`"));
 }
 
-// A collection AUTO-PROPERTY. Appendix A.4's `PropertyDecl` production has
-// no `owned` slot, so an auto-property's backing field is never owned and
-// cannot be an "owned collection of eligible elements".
-BEZEL_TEST(codegen_serialization_class_collection_8391,
-           collection_auto_property_still_rejected_spec_9_8_v0357) {
-    BEZEL_EXPECT_TRUE(compileFails(
-        std::string("module M; ") + kImport +
-        "class Bag: ISerializable, IDeserializable "
-        "  public property Tags: Array<string>; "
-        "end Bag; "));
-}
-
 // The REASON the collection auto-property is rejected — the same row pair as
 // the non-owned field above.
 BEZEL_TEST(codegen_serialization_class_collection_8391,
@@ -413,72 +367,6 @@ BEZEL_TEST(codegen_serialization_class_collection_8391,
         "  public property Tags: Array<string>; "
         "end Bag; ",
         "is a collection-typed auto-property"));
-}
-
-// A NESTED collection element. The borrowing outer array borrows the inner
-// one, which the reader constructs fresh — so the inner collection would
-// have no owner.
-BEZEL_TEST(codegen_serialization_class_collection_8391,
-           nested_collection_element_still_rejected_spec_9_8_v0357) {
-    BEZEL_EXPECT_TRUE(compileFails(
-        std::string("module M; ") + kImport +
-        "class Bag(id: int, owned tags: Array<Array<int>>): ISerializable, IDeserializable "
-        "  public owned Tags: Array<Array<int>> := tags; "
-        "  public property Id: int => id; "
-        "end Bag; "));
-}
-
-// A NULLABLE-`string` element. The collection's element slot does not
-// co-own the nullable form of a runtime-managed string, so the string the
-// reader produces would have no owner.
-BEZEL_TEST(codegen_serialization_class_collection_8391,
-           nullable_string_element_still_rejected_spec_9_8_v0357) {
-    BEZEL_EXPECT_TRUE(compileFails(
-        std::string("module M; ") + kImport +
-        "class Bag(id: int, owned tags: Array<string?>): ISerializable, IDeserializable "
-        "  public owned Tags: Array<string?> := tags; "
-        "  public property Id: int => id; "
-        "end Bag; "));
-}
-
-// A CLASS element in a BORROWING array. The array's element slot borrows a
-// class-typed element, so the instance the reader constructs would have no
-// owner (the OWNING family, `OwningArray<T>`, is the one that owns it — the
-// admitted twin is the `owning_array_class_element_roundtrip_binary` row
-// above).
-BEZEL_TEST(codegen_serialization_class_collection_8391,
-           class_element_in_borrowing_array_still_rejected_spec_9_8_v0357) {
-    BEZEL_EXPECT_TRUE(compileFails(
-        std::string("module M; ") + kImport +
-        "class Node(label: string): ISerializable, IDeserializable "
-        "  public Label: string := label; "
-        "end Node; "
-        "class Bag(id: int, owned tags: Array<Node>): ISerializable, IDeserializable "
-        "  public owned Tags: Array<Node> := tags; "
-        "  public property Id: int => id; "
-        "end Bag; "));
-}
-
-// ===========================================================================
-// The fix touches only the CONFORMANCE path — a class that owns a
-// collection field and declares no serialization interface is unaffected.
-// ===========================================================================
-
-BEZEL_TEST(codegen_serialization_class_collection_8391,
-           class_collection_field_without_conformance_unaffected_spec_9_8_v0357) {
-    BEZEL_EXPECT_EQ(runStdout(
-        "module M; "
-        "public class Person "
-        "  public property Name: string := \"\"; "
-        "  public owned Tags: Array<string> := new Array<string>(); "
-        "end Person; "
-        "public class Program "
-        "  public static method Main() "
-        "    using var p := new Person(); "
-        "    Console.WriteLine(p.Tags.Count); "
-        "  end Main; "
-        "end Program;"),
-        "0\n");
 }
 
 // ===========================================================================
