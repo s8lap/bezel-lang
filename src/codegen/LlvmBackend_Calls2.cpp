@@ -14773,9 +14773,9 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         // AUTO-property — is disposed at its own lifetime end
                         // (registerUsingDisposal's iterEnumDispose path / the
                         // field-owner cascade), never here. A COMPUTED property
-                        // getter returns a fresh value the receiver expression
-                        // itself owns, exactly like a plain call, so it is treated
-                        // as a temporary. An UNBOUND TEMPORARY receiver
+                        // read is a lend too (§28.9) unless the read itself
+                        // minted a §29.2 frame — see the fix #6387 note at the
+                        // PropertySymbol arm below. An UNBOUND TEMPORARY receiver
                         // (`C.Gen().GetEnumerator()`) has no other owner, and
                         // slot 4 always returns a genuine clone (never `self`, per
                         // the comment above), so the source frame must be
@@ -14798,9 +14798,41 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             } else if (auto* ps =
                                            dynamic_cast<sema::PropertySymbol*>(
                                                sym)) {
+                                // fix #6387 (§28.9, §28.2, §29.11, v0.357):
+                                // this arm asked only "is it an auto-property?"
+                                // and read every COMPUTED property as a fresh
+                                // value the receiver expression owns. §28.9
+                                // makes a property read a lend for every
+                                // declared type, so a getter handing back the
+                                // holder's own `IEnumerable<T>` field had that
+                                // field disposed here — a heap-use-after-free
+                                // at the holder's release point (§28.2), and
+                                // on the second `GetEnumerator()` over the same
+                                // read (§29.11). The verdict is the one rule
+                                // the two for-in consumers ask,
+                                // `propertyReadIsLend`: the receiver stays a
+                                // temporary only when the read MINTED a §29.2
+                                // frame (a widening getter) or the getter is
+                                // not a proven lend. `ma->target` was lowered
+                                // just above, so a read-keyed mint is already
+                                // recorded.
+                                //
+                                // A `virtual` computed property keeps the
+                                // verdict it had: the read runs whichever
+                                // override the object carries, and one that
+                                // widens mints a frame this consumer must
+                                // dispose. MEASURED without this term: a base
+                                // `virtual … get => _f` overridden by a
+                                // widening `get => _arr`, read through a
+                                // base-typed receiver, went from clean to
+                                // 6400 byte(s) leaked in 200 allocation(s).
+                                // That face needs a verdict the accessor
+                                // publishes at run time (issue #6490).
                                 sourceIsNamed =
                                     sema::isAutoPropertyStorageSymbol(
-                                        ps, ctx_);
+                                        ps, ctx_) ||
+                                    (!isVirtualProperty(ps) &&
+                                     propertyReadIsLend(ps, ma->target.get()));
                             }
                         }
                         // fix #2376 adversarial self-pass (a): do NOT dispose
