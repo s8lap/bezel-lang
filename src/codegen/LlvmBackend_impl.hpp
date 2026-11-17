@@ -12022,6 +12022,12 @@ private:
     static constexpr int64_t kExcParamOffset    = 32;
     static constexpr int64_t kExcSupersededOffset = 40;
 
+    // fix-forward #3261 (§31.2 / §31.4, v0.357): the one reader of
+    // `Exception.SupersededChain`. A runtime call, not a load of the slot at
+    // kExcSupersededOffset: the array is lent to the reader and the runtime
+    // must know (LlvmBackend_Exprs.cpp).
+    llvm::Value* emitExcSupersededChainBorrow(llvm::Value* excObj);
+
     // §31.4 / #811: build the CauseChain snapshot for `new Exception(msg, cause)`
     // from the (already-lowered) borrowed `cause` object. Reads the cause's type
     // name (virtual ToString, vtable slot 3), its Message (offset 8) and — for a

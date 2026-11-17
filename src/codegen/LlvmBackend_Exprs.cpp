@@ -926,6 +926,24 @@ static llvm::Function* makeStringReceiverEnvdtor(llvm::Module& mod,
     return fn;
 }
 
+// fix-forward #3261 (§31.2 / §31.4 / §31.1, v0.357): THE read of
+// `Exception.SupersededChain` — every spelling (`e.SupersededChain`,
+// `e?.SupersededChain`, the bare identifier inside a subclass) lowers to this
+// one call. The result is a BORROW of the chain array, and unlike the
+// CauseChain that array does not stay the exception's chain: a later
+// supersession installs a new one and an owner's re-raise clears it (§31.2),
+// both possibly while the handler that read it still holds the borrow (§31.1:
+// the arm binding's lifetime is the arm body's). So the read is a runtime
+// call rather than a load of the slot at kExcSupersededOffset: the runtime
+// marks the array lent and from then on retires it instead of freeing it
+// (bz_exc_superseded_borrow). A raw load here would hand out an array the
+// runtime believes nobody holds.
+llvm::Value* Emitter::emitExcSupersededChainBorrow(llvm::Value* excObj) {
+    return builder_.CreateCall(
+        declareC("bz_exc_superseded_borrow", ptrTy(), {ptrTy()}), {excObj},
+        "exc.superseded");
+}
+
 llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     diverged_ = false;  // CG40: cleared per expression; a `throw` sets it
     // §27.6 (v0.184, #1758): inside a primitive-intrinsic thunk body, a synthetic
@@ -5837,11 +5855,14 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     // matching the `.` form. The receiver was loaded for the
                     // null check above; its bytes are not read.
                     ncAccessVal = lowerStringLiteral("\"\"", false);
+                } else if (nm->member == "SupersededChain") {
+                    // fix-forward #3261 (§31.2 / §31.4, v0.357): read through
+                    // the runtime, never as a raw slot load, exactly as the
+                    // `.` form is (emitExcSupersededChainBorrow).
+                    ncAccessVal = emitExcSupersededChainBorrow(excObj);
                 } else {
                     int64_t ncOff = nm->member == "Message"    ? kExcMsgOffset
                                   : nm->member == "CauseChain" ? kExcCauseOffset
-                                  : nm->member == "SupersededChain"
-                                        ? kExcSupersededOffset
                                   : /*ParamName*/              kExcParamOffset;
                     llvm::Value* ncSlot = builder_.CreateGEP(
                         i8Ty, excObj, builder_.getInt64(ncOff));
@@ -10123,17 +10144,18 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // fix #3261 (§31.2 / §31.4, v0.357): `SupersededChain:
             // Array<ExceptionInfo>` — the runtime-populated record of every
             // exception this one SUPERSEDED (earliest first). The slot is at
-            // byte 40; null reads as the empty chain (bz_array_len(null) == 0),
+            // byte 40; an empty chain reads as null (bz_array_len(null) == 0),
             // which is §31.4's "it starts empty and shares the empty-array
             // representation, so an exception that supersedes nothing
             // allocates nothing".
+            //
+            // The read goes through the runtime, not a raw slot load
+            // (emitExcSupersededChainBorrow).
             if (ma->member == "SupersededChain" &&
                 isInheritedExcSurfaceAccess(ma)) {
                 llvm::Value* excObj = lowerExpr(*ma->target);
                 if (!excObj) return nullptr;
-                llvm::Value* scSlot = builder_.CreateGEP(
-                    i8Ty, excObj, builder_.getInt64(kExcSupersededOffset));
-                return builder_.CreateLoad(ptrTy(), scSlot, "exc.superseded");
+                return emitExcSupersededChainBorrow(excObj);
             }
             if (ma->member == "ParamName" && isInheritedExcSurfaceAccess(ma)) {
                 llvm::Value* excObj = lowerExpr(*ma->target);
@@ -11570,10 +11592,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     // fix #3261 (§31.2 / §31.4, v0.357): `SupersededChain:
                     // Array<ExceptionInfo>` @40 — null reads as the empty
                     // chain, exactly as CauseChain's does.
-                    llvm::Value* scSlot = builder_.CreateGEP(
-                        i8Ty, currentThis_,
-                        builder_.getInt64(kExcSupersededOffset), "sc.slot");
-                    return builder_.CreateLoad(ptrTy(), scSlot, "sc.val");
+                    // A borrow, read through the runtime (see the qualified
+                    // form in lowerExprInner's MemberAccessExpr arm).
+                    return emitExcSupersededChainBorrow(currentThis_);
                 }
                 if (id2->name == "ParamName") {
                     // §31.4 `ParamName: string?` @32 — null when not supplied,

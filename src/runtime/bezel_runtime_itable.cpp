@@ -104,6 +104,119 @@ extern "C" void* bz_exc_causechain_link(void* causeTypeName, void* causeMessage,
     return arr;
 }
 
+// fix-forward #3261 (§31.2 / §31.4 / §28.3, v0.357): THE SUPERSEDEDCHAIN CARRIER
+// AND THE LIFETIME OF A BORROWED CHAIN.
+//
+// `e.SupersededChain` is a `readonly property` of type `Array<ExceptionInfo>`
+// (§31.4), so reading it hands user code a BORROW of the chain array (§28.3:
+// a property read is a borrow, not an owned result), exactly as
+// `e.CauseChain` does. Unlike the CauseChain, which is written once at
+// construction, this chain CHANGES during the exception's life: §31.2's
+// record-before-drop rule appends to it whenever the exception supersedes
+// another, and §31.2's "The chain is per raise, not per instance" clause
+// clears it when an owner (a task, §30.9; the failed type, §22.7) re-raises
+// the instance. Both happen while a handler may still hold a borrow it read
+// earlier — a local, or a `for` loop over the chain. §31.1 gives the catch
+// arm's binding "the arm body's" lifetime, a borrow read through it lives as
+// long, and neither clause of §31.2 says a re-raise ends it: "cleared first"
+// states what the NEXT raise reports. So an array that was lent out is NEVER
+// freed or rewritten at an append or a clear. It is RETIRED, and freed with
+// the exception at its terminal reclaim (bz_exc_reclaim_causechain, the site
+// that reclaims the CauseChain "strictly after every live borrow/read has
+// concluded").
+//
+// A borrow therefore keeps reading the chain of the raise it was read in
+// (the snapshot it borrowed), and a fresh `e.SupersededChain` read returns the
+// current chain. The spec does not spell out what an outstanding borrow reads
+// after a re-raise; this is the simplest reading that keeps every borrow valid.
+//
+// THE REPRESENTATION. The slot at byte 40 holds a `bz_exc_supchain_t*`, or
+// null for the empty chain. The carrier's FIRST member is the `bz_array_t`
+// user code borrows, so the pointer the reader returns is an ordinary
+// `Array<ExceptionInfo>`. Behind it:
+//   - `retired`: the carriers this one replaced that may still be borrowed.
+//     Every carrier behind the head has `cleared` set.
+//   - `lent`: set by the reader (bz_exc_superseded_borrow) the moment a borrow
+//     of the array is handed out. An array nobody ever read cannot be
+//     borrowed, so an append or a clear frees it at once — which is why a
+//     supersession chain that the program never reads retains nothing.
+//   - `cleared`: the carrier is no longer the exception's chain. A cleared
+//     head reads as the empty chain; it stays in the slot only to keep its
+//     array (and the retired ones behind it) alive for their borrowers.
+// A live carrier always holds at least one entry, and its array is immutable
+// from the moment it is installed.
+//
+// THE COST, RECORDED. A lent array lives as long as its exception. For a
+// task-owned fault that is the task's life. For the cached
+// `TypeInitializationException`, which its type keeps for the rest of the
+// process (§22.7) and which is never reclaimed (see bz_exc_reclaim_causechain),
+// a program that reads a NON-EMPTY chain and then makes the failed type
+// re-raise retains one small array per such re-raise until exit (#8715).
+// Freeing earlier needs to know that no handler still holds the instance,
+// which the runtime does not track for an instance no task owns.
+//
+// THE LOCK. One process-wide mutex guards every slot read and write here. The
+// two owner-owned instances are shared between threads: every domain that
+// touches a failed type re-raises the SAME cached exception (§22.7), and a
+// multi-awaited task re-raises one fault to awaiters on different workers
+// (§30.4). Without the lock two concurrent clears of an unlent head free it
+// twice. Supersession is a rare, diagnostic event, so one lock is enough. No
+// user code runs under it: the virtual `ToString` the append calls runs first.
+extern "C" int8_t bz_exc_is_runtime_owned(void* obj);   // bezel_runtime_concurrency.cpp
+
+struct bz_exc_supchain_t {
+    bz_array_t arr;               // MUST stay first: `&arr` is what is lent
+    bz_exc_supchain_t* retired;   // replaced carriers that may still be lent
+    bool lent;                    // a borrow of `arr` was handed to user code
+    bool cleared;                 // no longer the chain (kept for borrowers)
+};
+
+static std::mutex g_bz_exc_supchain_mtx;
+
+// The slot's carrier, whatever its state. Caller holds the lock.
+static bz_exc_supchain_t* bz_exc_supchain_head(void* exc) {
+    void* head = nullptr;
+    memcpy(&head, (uint8_t*)exc + BZ_EXC_SUPERSEDED_OFFSET, sizeof(void*));
+    return (bz_exc_supchain_t*)head;
+}
+
+static void bz_exc_supchain_set_head(void* exc, bz_exc_supchain_t* head) {
+    memcpy((uint8_t*)exc + BZ_EXC_SUPERSEDED_OFFSET, &head, sizeof(void*));
+}
+
+// The exception's CURRENT chain: the head unless it was cleared. Null is the
+// empty chain. Caller holds the lock.
+static bz_exc_supchain_t* bz_exc_supchain_live(void* exc) {
+    bz_exc_supchain_t* head = bz_exc_supchain_head(exc);
+    return head && !head->cleared ? head : nullptr;
+}
+
+// Release one carrier's strings and free it. Caller holds the lock (or owns
+// the carrier outright, as the terminal reclaim does).
+static void bz_exc_supchain_free(bz_exc_supchain_t* c) {
+    auto* elems = (bz_excinfo_t*)c->arr.data;
+    for (int64_t i = 0; i < c->arr.count; i++) {
+        bz_string_release(elems[i].typeName);
+        bz_string_release(elems[i].message);
+        bz_string_release(elems[i].stackTrace);
+    }
+    free(c->arr.data);
+    free(c);
+}
+
+// The reader behind `e.SupersededChain` (the qualified, the `?.` and the bare
+// identifier spellings all lower to this call). Returns the current chain's
+// array, or null for the empty chain, and marks the array LENT: from here on
+// it is retired, never freed, when the chain changes.
+extern "C" void* bz_exc_superseded_borrow(void* exc) {
+    if (!exc) return nullptr;
+    std::lock_guard<std::mutex> lk(g_bz_exc_supchain_mtx);
+    bz_exc_supchain_t* c = bz_exc_supchain_live(exc);
+    if (!c) return nullptr;
+    c->lent = true;
+    return &c->arr;
+}
+
 // fix #3261 (§31.2 / §31.4, v0.357): the SUPERSEDEDCHAIN record-before-drop
 // append.
 //
@@ -151,61 +264,9 @@ extern "C" void bz_exc_superseded_append(void* superseding, void* superseded) {
     if (!superseding || !superseded) return;
     // §31.2 "Self-supersession records nothing".
     if (superseding == superseded) return;
-    // The superseded exception's own chain (its earlier losses) — carried over
-    // FIRST, then the superseded exception's own snapshot.
-    void* ownChain = nullptr;
-    memcpy(&ownChain, (uint8_t*)superseded + BZ_EXC_SUPERSEDED_OFFSET,
-           sizeof(void*));
-    int64_t ownCount = ownChain ? ((bz_array_t*)ownChain)->count : 0;
-    // The superseding exception's chain so far — the new entries go AFTER it.
-    void* curChain = nullptr;
-    memcpy(&curChain, (uint8_t*)superseding + BZ_EXC_SUPERSEDED_OFFSET,
-           sizeof(void*));
-    int64_t curCount = curChain ? ((bz_array_t*)curChain)->count : 0;
-    int64_t total = curCount + ownCount + 1;
-    // Best-effort allocation (§31.2): a failure drops the entry, silently.
-    auto* arr = (bz_array_t*)calloc(1, sizeof(bz_array_t));
-    if (!arr) return;
-    arr->vtable = (void*)bz_array_vtable;   // §8.2: runtime type identity
-    arr->kind   = BZ_RUNTIME_KIND_ARRAY;
-    arr->data   = calloc((size_t)total, sizeof(bz_excinfo_t));
-    if (!arr->data) { free(arr); return; }
-    arr->capacity = total;
-    arr->count    = total;
-    auto* elems = (bz_excinfo_t*)arr->data;
-    void* empty = bz_rt_empty_string();
-    int64_t w = 0;
-    // 1. the superseding exception's own entries (unchanged, in order);
-    if (curChain) {
-        auto* src = (bz_excinfo_t*)((bz_array_t*)curChain)->data;
-        for (int64_t i = 0; i < curCount; i++) {
-            void* st = src[i].stackTrace ? src[i].stackTrace : empty;
-            bz_string_retain(src[i].typeName);
-            bz_string_retain(src[i].message);
-            bz_string_retain(st);
-            elems[w].typeName   = src[i].typeName;
-            elems[w].message    = src[i].message;
-            elems[w].stackTrace = st;
-            w++;
-        }
-    }
-    // 2. the superseded exception's OWN SupersededChain entries (§31.2:
-    //    "first, in order, every entry of the superseded exception's own
-    //    SupersededChain");
-    if (ownChain) {
-        auto* src = (bz_excinfo_t*)((bz_array_t*)ownChain)->data;
-        for (int64_t i = 0; i < ownCount; i++) {
-            void* st = src[i].stackTrace ? src[i].stackTrace : empty;
-            bz_string_retain(src[i].typeName);
-            bz_string_retain(src[i].message);
-            bz_string_retain(st);
-            elems[w].typeName   = src[i].typeName;
-            elems[w].message    = src[i].message;
-            elems[w].stackTrace = st;
-            w++;
-        }
-    }
-    // 3. and LAST, the snapshot of the superseded exception itself.
+    // The snapshot of the superseded exception itself is taken FIRST, before
+    // the lock: the virtual `ToString` may be a user override, and no user
+    // code runs under the chain lock.
     void* typeName = nullptr;
     void* vtable = nullptr;
     memcpy(&vtable, superseded, sizeof(void*));
@@ -219,6 +280,7 @@ extern "C" void bz_exc_superseded_append(void* superseding, void* superseded) {
     }
     void* message = nullptr;
     memcpy(&message, (uint8_t*)superseded + BZ_EXC_MSG_OFFSET, sizeof(void*));
+    void* empty = bz_rt_empty_string();
     // The `ToString` result is the CALLER's: a `string` return is an owned
     // result (+1), so the snapshot ADOPTS it rather than retaining it a second
     // time. Retaining it leaked one reference per supersession whenever the
@@ -226,28 +288,75 @@ extern "C" void bz_exc_superseded_append(void* superseding, void* superseded) {
     // (review r42-rev-m13-3261 F2: 400 allocations over 200 loops). A
     // type-name literal (the §8.5 default, every built-in thunk) carries the
     // sentinel refcount, so adopting it is the no-op it always was. `Message`
-    // is a borrowed field read, so it IS retained.
+    // is a borrowed field read, so it IS retained (below, once the entry has a
+    // slot to live in).
     void* tn = typeName ? typeName : empty;
     void* mg = message ? message : empty;
+
+    std::lock_guard<std::mutex> lk(g_bz_exc_supchain_mtx);
+    // The superseded exception's own chain (its earlier losses) — carried over
+    // FIRST, then the superseded exception's own snapshot.
+    bz_exc_supchain_t* own = bz_exc_supchain_live(superseded);
+    int64_t ownCount = own ? own->arr.count : 0;
+    // The superseding exception's chain so far — the new entries go AFTER it.
+    bz_exc_supchain_t* head = bz_exc_supchain_head(superseding);
+    bz_exc_supchain_t* cur = head && !head->cleared ? head : nullptr;
+    int64_t curCount = cur ? cur->arr.count : 0;
+    int64_t total = curCount + ownCount + 1;
+    // Best-effort allocation (§31.2): a failure drops the entry, silently. The
+    // adopted `ToString` result has no entry to live in then, so it is
+    // released here.
+    auto* next = (bz_exc_supchain_t*)calloc(1, sizeof(bz_exc_supchain_t));
+    if (next)
+        next->arr.data = calloc((size_t)total, sizeof(bz_excinfo_t));
+    if (!next || !next->arr.data) {
+        free(next);
+        bz_string_release(tn);
+        return;
+    }
+    next->arr.vtable   = (void*)bz_array_vtable;   // §8.2: runtime type identity
+    next->arr.kind     = BZ_RUNTIME_KIND_ARRAY;
+    next->arr.capacity = total;
+    next->arr.count    = total;
+    auto* elems = (bz_excinfo_t*)next->arr.data;
+    int64_t w = 0;
+    // 1. the superseding exception's own entries (unchanged, in order), then
+    // 2. the superseded exception's OWN SupersededChain entries (§31.2:
+    //    "first, in order, every entry of the superseded exception's own
+    //    SupersededChain"). Each copy takes its own reference to the strings,
+    //    so the source carrier keeps its own whatever becomes of it.
+    for (bz_exc_supchain_t* from : {cur, own}) {
+        if (!from) continue;
+        auto* src = (bz_excinfo_t*)from->arr.data;
+        for (int64_t i = 0; i < from->arr.count; i++) {
+            void* st = src[i].stackTrace ? src[i].stackTrace : empty;
+            bz_string_retain(src[i].typeName);
+            bz_string_retain(src[i].message);
+            bz_string_retain(st);
+            elems[w].typeName   = src[i].typeName;
+            elems[w].message    = src[i].message;
+            elems[w].stackTrace = st;
+            w++;
+        }
+    }
+    // 3. and LAST, the snapshot of the superseded exception itself.
     bz_string_retain(mg);
     elems[w].typeName   = tn;
     elems[w].message    = mg;
     elems[w].stackTrace = empty;   // §31.4 stub — "" pre-debug-info
-    // Install the new chain, then release the old one. The old array's strings
-    // were retained by the copy above, so releasing them here leaves exactly
-    // one reference per string in the NEW array.
-    memcpy((uint8_t*)superseding + BZ_EXC_SUPERSEDED_OFFSET, &arr,
-           sizeof(void*));
-    if (curChain) {
-        auto* old = (bz_array_t*)curChain;
-        auto* oldElems = (bz_excinfo_t*)old->data;
-        for (int64_t i = 0; i < old->count; i++) {
-            bz_string_release(oldElems[i].typeName);
-            bz_string_release(oldElems[i].message);
-            bz_string_release(oldElems[i].stackTrace);
-        }
-        free(old->data);
-        free(old);
+    // Install the new carrier. The one it replaces is freed only if no borrow
+    // of its array was ever handed out; a lent one — and a head that an
+    // owner's re-raise already cleared — is retired behind the new carrier
+    // and lives until the exception's terminal reclaim (see the carrier's
+    // comment above: a borrow held across this append stays valid).
+    if (cur && !cur->lent) {
+        next->retired = cur->retired;
+        bz_exc_supchain_set_head(superseding, next);
+        bz_exc_supchain_free(cur);
+    } else {
+        if (head) head->cleared = true;
+        next->retired = head;
+        bz_exc_supchain_set_head(superseding, next);
     }
 }
 
@@ -260,25 +369,26 @@ extern "C" void bz_exc_superseded_append(void* superseding, void* superseded) {
 // bz_task_fault_reraise_clear at a task's LATER `await` / `.Result` re-raise
 // of its fault (the first one keeps the async body's own record; #8640).
 // Not called for a bare `throw;` (§31.2: "is not such a raise ... and
-// preserves the chain"). The cleared state is the empty-array representation
-// the slot starts in (null).
+// preserves the chain").
+//
+// THE OLD ARRAY IS NOT FREED WHILE IT CAN BE BORROWED. A handler that read
+// `e.SupersededChain` before this re-raise may still hold that borrow (a
+// local, a `for` loop over the chain), and the re-raise does not end it. So a
+// lent head is only MARKED cleared: it reads as the empty chain from here on,
+// and its array stays alive until the exception's terminal reclaim. A head
+// nobody read is freed now, and the slot falls back to the carriers retired
+// behind it (all cleared), or to null.
 extern "C" void bz_exc_superseded_clear(void* exc) {
     if (!exc) return;
-    void* chain = nullptr;
-    memcpy(&chain, (uint8_t*)exc + BZ_EXC_SUPERSEDED_OFFSET, sizeof(void*));
-    if (!chain) return;
-    void* null_chain = nullptr;
-    memcpy((uint8_t*)exc + BZ_EXC_SUPERSEDED_OFFSET, &null_chain,
-           sizeof(void*));
-    auto* arr = (bz_array_t*)chain;
-    auto* elems = (bz_excinfo_t*)arr->data;
-    for (int64_t i = 0; i < arr->count; i++) {
-        bz_string_release(elems[i].typeName);
-        bz_string_release(elems[i].message);
-        bz_string_release(elems[i].stackTrace);
+    std::lock_guard<std::mutex> lk(g_bz_exc_supchain_mtx);
+    bz_exc_supchain_t* head = bz_exc_supchain_head(exc);
+    if (!head || head->cleared) return;
+    if (head->lent) {
+        head->cleared = true;
+        return;
     }
-    free(arr->data);
-    free(arr);
+    bz_exc_supchain_set_head(exc, head->retired);
+    bz_exc_supchain_free(head);
 }
 
 // §31.4/#811/#1389: reclaim a CauseChain snapshot at the exception object's
@@ -354,24 +464,37 @@ extern "C" void bz_exc_reclaim_causechain(void* obj, void** excVtableTable,
     if (!builtinExc) return;
     // fix #3261 (§31.2 / §31.4, v0.357): the SupersededChain slot @40 is
     // reclaimed HERE too, by the same discipline and at the same site: it is a
-    // heap array of retained strings owned by the exception object, and this
-    // site runs exactly once per object, strictly after every live
-    // borrow/read has concluded.
-    void* supChain;
-    memcpy(&supChain, (uint8_t*)obj + BZ_EXC_SUPERSEDED_OFFSET, sizeof(void*));
-    if (supChain) {
-        auto* sarr = (bz_array_t*)supChain;
-        auto* selems = (bz_excinfo_t*)sarr->data;
-        for (int64_t i = 0; i < sarr->count; i++) {
-            bz_string_release(selems[i].typeName);
-            bz_string_release(selems[i].message);
-            bz_string_release(selems[i].stackTrace);
+    // heap array of retained strings owned by the exception object, and for
+    // every instance that IS reclaimed this site runs exactly once, strictly
+    // after every live borrow/read has concluded. That is what makes it the
+    // one place a LENT array may be freed: the current carrier and every
+    // carrier retired behind it (the arrays a borrow may have been reading
+    // across an append or an owner's re-raise) go together.
+    //
+    // NOT for a RUNTIME-OWNED instance (the §22.7 cached
+    // TypeInitializationException). That one is never reclaimed, yet it
+    // reaches this site at the end of EVERY handling of it: it has no hold
+    // entry, so bz_exc_end_handling answers "dispose" each time and only the
+    // block's free is skipped (emitReclaimBlock). A handling that ends is not
+    // the last one — a catch arm that touches the failed type again inside its
+    // body nests a second handling of the same instance, and the outer arm may
+    // hold a borrow of the chain across it. Freeing here freed that borrow
+    // (MEASURED: heap-use-after-free, freed by this function, in the
+    // cached-TIE row of the #3261 suite). So its carriers stay with it: an
+    // unlent one is freed by the next re-raise's clear or the next append, a
+    // lent one is kept for the life of the process.
+    if (!bz_exc_is_runtime_owned(obj)) {
+        bz_exc_supchain_t* supChain = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_bz_exc_supchain_mtx);
+            supChain = bz_exc_supchain_head(obj);
+            bz_exc_supchain_set_head(obj, nullptr);
         }
-        free(sarr->data);
-        free(sarr);
-        void* null_sup = nullptr;
-        memcpy((uint8_t*)obj + BZ_EXC_SUPERSEDED_OFFSET, &null_sup,
-               sizeof(void*));
+        while (supChain) {
+            bz_exc_supchain_t* older = supChain->retired;
+            bz_exc_supchain_free(supChain);
+            supChain = older;
+        }
     }
     void* chain;
     memcpy(&chain, (uint8_t*)obj + BZ_EXC_CAUSE_OFFSET, sizeof(void*));
@@ -527,11 +650,13 @@ extern "C" void bz_unhandled_exception(void* exc, void** excVtableTable) {
     // chain was always empty, so the report's omission was vacuous; it is not
     // vacuous now.
     if (builtinExc) {
-        void* chain;
-        memcpy(&chain, (uint8_t*)exc + BZ_EXC_SUPERSEDED_OFFSET,
-               sizeof(void*));
-        if (chain) {
-            auto* arr = (bz_array_t*)chain;
+        // The CURRENT chain only: a head an owner's re-raise cleared is the
+        // empty chain (it stays in the slot for its borrowers, see the
+        // carrier). The lock is held across the print: this is the process's
+        // last act, and another thread must not retire-and-free under it.
+        std::lock_guard<std::mutex> lk(g_bz_exc_supchain_mtx);
+        if (bz_exc_supchain_t* chain = bz_exc_supchain_live(exc)) {
+            auto* arr = &chain->arr;
             auto* elems = (bz_excinfo_t*)arr->data;
             for (int64_t i = 0; i < arr->count; i++) {
                 fputs("Superseded: ", f);

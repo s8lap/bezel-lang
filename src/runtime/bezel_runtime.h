@@ -2535,15 +2535,31 @@ void bz_exc_reclaim_causechain_registered(void* obj);
 // The append is BEST-EFFORT by §31.2's explicit exception to §17.7's fatal
 // allocation rule: a failed allocation silently drops the entry and the
 // supersession proceeds exactly as without the record.
+//
+// The append installs a NEW array. The one it replaces is freed only when no
+// borrow of it was ever handed out (`bz_exc_superseded_borrow`); a lent one is
+// retired to the exception's terminal reclaim.
 void bz_exc_superseded_append(void* superseding, void* superseded);
 
 // §31.2 (v0.357) "The chain is per raise, not per instance": an OWNER's
 // re-raise of a task-owned fault (`await t`, `t.Result`) or of the cached
 // `TypeInitializationException` clears the instance's `SupersededChain` first,
-// so it records only the supersessions of the raise being reported. Releases
-// the chain's strings, frees the array and nulls the slot (the empty chain).
-// A no-op for a null argument or an empty chain.
+// so it records only the supersessions of the raise being reported. The chain
+// reads as empty afterwards. An array that `bz_exc_superseded_borrow` lent out
+// is not freed here: a handler may still hold the borrow, so it is retired and
+// freed at the exception's terminal reclaim. A no-op for a null argument or an
+// empty chain.
 void bz_exc_superseded_clear(void* exc);
+
+// §31.4 (v0.357) `Exception.SupersededChain: Array<ExceptionInfo>` — the
+// reader. Returns a borrow of the exception's current chain array, or null
+// for the empty chain (the empty-array representation), and marks the array
+// lent: a later append (`bz_exc_superseded_append`) or owner re-raise
+// (`bz_exc_superseded_clear`) then leaves it intact for the borrower, who
+// keeps reading the chain of the raise it was read in (§31.1: the borrow
+// lives as long as the catch arm's binding). `exc` is an exception object
+// (built-in or a user subclass of one), or null.
+void* bz_exc_superseded_borrow(void* exc);
 
 // OwningBuffer<byte> helpers used by BinarySerializer/BinaryDeserializer.
 // bz_owned_buffer_alloc: allocate an OwningBuffer<byte> with the given bytes,
