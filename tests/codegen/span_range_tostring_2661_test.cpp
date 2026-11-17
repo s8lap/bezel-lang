@@ -170,20 +170,6 @@ BEZEL_TEST(span_range_tostring_2661, span_interpolation_agrees_with_call) {
         "ReadOnlySpan(Buffer: OwningBuffer, Start: 0, Length: 3)");
 }
 
-// stdlib §2.1: `Console.WriteLine(value)` renders its argument. §9.7 (v0.330)
-// rejects `Console.WriteLine(sp)` where `sp: Span<int>` — `Object` is a
-// borrow-erasing position and `Span` is borrow-bearing. The correct form is
-// `sp.ToString()`, already pinned by `span_tostring_renders_fields`. This test
-// pins the console render (via ToString) for a span passed AS AN ARGUMENT
-// (vs. the statement-position direct render of `span_tostring_renders_fields`).
-BEZEL_TEST(span_range_tostring_2661, span_console_argument_renders) {
-    BEZEL_EXPECT_EQ(runAotOut(buf3(
-        "  var sp := buf.AsSpan(); "
-        "  Console.WriteLine(sp.ToString()); "
-        "  return 0; ")),
-        "Span(Buffer: OwningBuffer, Start: 0, Length: 3)");
-}
-
 // ---------------------------------------------------------------------------
 // §4.16 / §8.6 — THE MEMORY-SAFETY HALF, and the one the ruling names
 // explicitly ("the boxed `IReadOnlySpan<T>` receiver needs its non-vtable

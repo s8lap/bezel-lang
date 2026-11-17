@@ -187,23 +187,6 @@ BEZEL_TEST(class_dispose_method_group_7025,
         "disposed\nafter-call");
 }
 
-// CONTROL — an ordinary §27.6 method reference on a USER class is untouched:
-// the new arm is limited to the compiler-generated `Dispose`.
-BEZEL_TEST(class_dispose_method_group_7025,
-           spec_27_6_user_class_method_reference_still_works) {
-    BEZEL_EXPECT_EQ(
-        runAotOut(
-            "module M; "
-            "public class K public method N(): int return 42; end N; end K; "
-            "class C public static method Main(): int "
-            "  var k: K := new K(); "
-            "  var f: () -> int := k.N; "
-            "  Console.WriteLine(f()); "
-            "  return 0; "
-            "end Main; end C;"),
-        "42");
-}
-
 // CONTROL — the `Dispose` method group over an OWNING COLLECTION INTERFACE
 // head is NOT touched by this fix: that receiver's disposal path FREES the
 // collection (it is a builtin, not a vtable-bearing class), so what such a

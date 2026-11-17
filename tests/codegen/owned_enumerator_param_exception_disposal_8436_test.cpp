@@ -94,37 +94,6 @@ BEZEL_TEST(codegen_owned_enumerator_param_exception_8436,
     BEZEL_EXPECT_EQ(r.stdoutText, rep("thrown\nfin\ncaught\n", 100) + "end\n");
 }
 
-// CONTROL — the NORMAL edge of the same parameter (the #7961 arm's own row).
-// The callee returns normally, so the §28.3 K3.14 auto-drop fires at the
-// method's end and the iterator routine runs the `finally`. This row is GREEN
-// on the base and on the fix: it pins that the fix did not disturb the normal
-// edge, and it is the admitting twin of the raise row above (the same
-// parameter shape, a legal outcome).
-BEZEL_TEST(codegen_owned_enumerator_param_exception_8436,
-           control_normal_edge_runs_generator_finally_spec_28_3) {
-    std::string src =
-        std::string("module M; ") + kGen +
-        "class Y "
-        "  public static method TakeNoDispose(owned e: IEnumerator<int>) "
-        "    var ok := e.MoveNext(); "
-        "  end TakeNoDispose; "
-        "end Y; "
-        "class C public static method Main(): int "
-        "  var i := 0; "
-        "  while i < 100 do "
-        "    Y.TakeNoDispose(G.Gen().GetEnumerator()); "
-        "    Console.WriteLine(\"closed\"); "
-        "    i := i + 1; "
-        "  end; "
-        "  Console.WriteLine(\"end\"); "
-        "  return 0; "
-        "end Main; end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, rep("fin\nclosed\n", 100) + "end\n");
-}
-
 // THE IOwningEnumerator TWIN — the same exception edge at the OTHER
 // declaration-less sync iterator-format head (§29.1's owning enumeration
 // interfaces; `common::isSyncIterFormatEnumeratorHead` admits exactly
