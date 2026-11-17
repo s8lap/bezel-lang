@@ -656,18 +656,12 @@ end C;
 // before the process ended; "UAF" = AddressSanitizer heap-use-after-free):
 //
 //   row                                                           r30-c1 (before #8479)   first #8479 fix   with the fix-forward
-//   alias_added_to_array_outliving_block_spec_28_9                leak, 201 lines         UAF, 0 lines      leak, 201 lines
-//   alias_added_to_callers_array_spec_27_5                        leak, 201 lines         UAF, 0 lines      leak, 201 lines
+//   (alias added to an array outliving its block / to a caller's array:
+//   leak, 201 lines before; UAF, 0 lines with the first fix; leak, 201 lines now)
 //
-// These two are the suite's named controls for the fix-forward (lane
-// contract §7: green on r30-c1, red only under the plausible wrong fix, the
-// first #8479 fix). The fifteen other shapes the round-1 review measured
-// (a `const` alias, an array held by an object, the indexer and `Insert`
-// stores, a `Dictionary` value, an alias of an alias / of a call result /
-// of a method reference, an alias assigned onward, a returned collection
-// literal, an add inside a lambda body, a helper that stores its argument,
-// a nullable local, a returned record, a `case` binding) are green on r30-c1
-// too and went to the conformance corpus instead.
+// Both of these programs, and the other fifteen shapes the round-1 review
+// measured, are green on r30-c1 and went to the conformance corpus; the
+// two base-green rows this suite keeps are the consolidated ones below.
 // ===========================================================================
 namespace {
 // The program's stdout when it compiled, ran to exit code 0 and no memory
@@ -681,125 +675,47 @@ std::string runNoMemoryErrorOut(const std::string& prog) {
 }
 }  // namespace
 
-// Reviewer's a01. The alias is added to an array that OUTLIVES the block both
-// names are declared in; the array is called after the block.
-// fs[0](1, 2) + fs[0](4, 1) = -1 + 3 = 2.
-BEZEL_TEST(closure_local_alias_source_overwrite_8479,
-           alias_added_to_array_outliving_block_spec_28_9) {
-    std::string e;
-    for (int i = 0; i < 200; ++i) line(e, 2);
-    e += "DONE\n";
-    BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(
-module M;
-public class C
-  public static method Main(): int
-    for var i in 0..<200 do
-      var fs: Array<(int, int) -> int> := new Array<(int, int) -> int>();
-      do
-        var g: (int, int) -> int := lambda(x: int, y: int) => x - y;
-        var a: (int, int) -> int := g;
-        fs.Add(a);
-      end;
-      Console.WriteLine(fs[0](1, 2) + fs[0](4, 1));
-    end for;
-    Console.WriteLine("DONE");
-    return 0;
-  end Main;
-end C;
-)BZL"), e);
-}
-
-// Reviewer's a02. A helper adds the alias to the CALLER's array; the lambda
-// captures the helper's parameter. (1 - 2 + i) + (4 - 1 + i) = 2 + 2i.
-BEZEL_TEST(closure_local_alias_source_overwrite_8479,
-           alias_added_to_callers_array_spec_27_5) {
-    std::string e;
-    for (int i = 0; i < 200; ++i) line(e, 2 + 2 * i);
-    e += "DONE\n";
-    BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(
-module M;
-public class C
-  public static method Fill(fs: Array<(int, int) -> int>, k: int)
-    var g: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
-    var a: (int, int) -> int := g;
-    fs.Add(a);
-  end Fill;
-  public static method Main(): int
-    for var i in 0..<200 do
-      var fs: Array<(int, int) -> int> := new Array<(int, int) -> int>();
-      Fill(fs, i);
-      Console.WriteLine(fs[0](1, 2) + fs[0](4, 1));
-    end for;
-    Console.WriteLine("DONE");
-    return 0;
-  end Main;
-end C;
-)BZL"), e);
-}
 
 // ===========================================================================
-// FIX-FORWARD round 3 (review REJECT 2), family 1: a `return` of an owned
-// alias at a venue no mint arm covered.
-//
-// An owned alias (`var a := g;`) keeps its scope-end release armed across a
-// `return a;` (`closureEscapingScopeEndRelease_`), so the value the caller
-// receives needs a reference of its own, taken before that release runs
-// (§28.9, v0.357: "the type's lifetime is managed by the runtime without
-// user involvement"). The return lowering minted it only at a
-// function-typed result of a sync method or block lambda; the four venues
-// below received a value whose last reference the scope end had just
-// dropped. The fix takes that mint once, right after the returned value is
-// evaluated and before any disposal or finally routing, at every venue.
-//
-// MEASURED (`--sanitize=address`, ASAN_OPTIONS=detect_leaks=1, 200 calls):
-//   row                                               r30-c1        a4abadac6 (round 2)   with the fix
-//   alias_returned_from_async_method_spec_28_9          leak 15200    UAF, 0 lines          leak 800 (the `k` cell)
-//   alias_returned_from_async_block_lambda_spec_28_9    leak 15200    UAF, 0 lines          leak 800 (the `k` cell)
-//   alias_returned_at_object_result_spec_28_9           leak 15200    UAF, 0 lines          leak 15200 (the box, as r30-c1)
-//   alias_returned_at_nullable_object_result_spec_28_9  leak 15200    UAF, 0 lines          leak 15200 (the box, as r30-c1)
-// The leaks are r30-c1's or smaller, so the oracle is runNoMemoryErrorOut
-// (THE ORACLE above). Each row is red on round 2's tip (a4abadac6).
-// (1 - 2 + i) + (4 - 1 + i) = 2 + 2i.
+// BASE-GREEN CONTROL 1 of 2 (lane contract §7: green on r30-c1, red under the
+// plausible wrong fix a4abadac6, the REJECTED round-2 tip). `return a;` of an
+// owned alias keeps its scope-end release armed, so the value the caller
+// receives needs a reference of its own, minted before that release, at EVERY
+// return venue (§28.9, v0.357: "the type's lifetime is managed by the runtime
+// without user involvement"). a4abadac6 minted only at a function-typed result
+// of a sync method or block lambda: the four venues below (an `async` method
+// §30.1, an `async` block lambda, an `Object` result §8.6, an `Object?`
+// result) received a freed value (UAF, 0 lines). One program, all four
+// venues, because the corpus runner has no ASan leg. Leaks are r30-c1's or
+// smaller, so the oracle is runNoMemoryErrorOut. The four per-venue rows were
+// moved to the corpus candidates. (1 - 2 + i) + (4 - 1 + i) = 2 + 2i, four
+// times per iteration.
 // ===========================================================================
-
-// The alias is returned from an `async` method (§30.1): the async return
-// arm minted only AFTER the
-// scope-end disposals had released the alias's reference.
 BEZEL_TEST(closure_local_alias_source_overwrite_8479,
-           alias_returned_from_async_method_spec_28_9) {
+           control_alias_returned_at_all_four_venues_spec_28_9) {
     std::string e;
-    for (int i = 0; i < 200; ++i) line(e, 2 + 2 * i);
+    for (int i = 0; i < 200; ++i)
+        for (int v = 0; v < 4; ++v) line(e, 2 + 2 * i);
     e += "DONE\n";
     BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(
 module M;
+type Fn := (int, int) -> int;
 public class C
   public static async method Mk(k: int): Task<(int, int) -> int>
     var g: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
     var a: (int, int) -> int := g;
     return a;
   end Mk;
-  public static async method Main(): Task<int>
-    for var i in 0..<200 do
-      var f := await Mk(i);
-      Console.WriteLine(f(1, 2) + f(4, 1));
-    end for;
-    Console.WriteLine("DONE");
-    return 0;
-  end Main;
-end C;
-)BZL"), e);
-}
-
-// The alias is returned from an `async` block lambda: the same async arm,
-// reached from a lambda body.
-BEZEL_TEST(closure_local_alias_source_overwrite_8479,
-           alias_returned_from_async_block_lambda_spec_28_9) {
-    std::string e;
-    for (int i = 0; i < 200; ++i) line(e, 2 + 2 * i);
-    e += "DONE\n";
-    BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(
-module M;
-public class C
+  public static method MkObj(k: int): Object
+    var g: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
+    var a: (int, int) -> int := g;
+    return a;
+  end MkObj;
+  public static method MkObjN(k: int): Object?
+    var g: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
+    var a: (int, int) -> int := g;
+    return a;
+  end MkObjN;
   public static async method Main(): Task<int>
     var mk: (int) -> Task<(int, int) -> int> := async lambda(k: int) => do
       var g: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
@@ -807,67 +723,16 @@ public class C
       return a;
     end;
     for var i in 0..<200 do
-      var f := await mk(i);
-      Console.WriteLine(f(1, 2) + f(4, 1));
-    end for;
-    Console.WriteLine("DONE");
-    return 0;
-  end Main;
-end C;
-)BZL"), e);
-}
-
-// The alias is returned from a method whose result is `Object` (§8.6): no
-// venue-keyed arm mints at a
-// non-function result type.
-BEZEL_TEST(closure_local_alias_source_overwrite_8479,
-           alias_returned_at_object_result_spec_28_9) {
-    std::string e;
-    for (int i = 0; i < 200; ++i) line(e, 2 + 2 * i);
-    e += "DONE\n";
-    BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(
-module M;
-type Fn := (int, int) -> int;
-public class C
-  public static method Mk(k: int): Object
-    var g: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
-    var a: (int, int) -> int := g;
-    return a;
-  end Mk;
-  public static method Main(): int
-    for var i in 0..<200 do
-      var o := Mk(i);
-      var f := o as Fn;
-      Console.WriteLine(f!(1, 2) + f!(4, 1));
-    end for;
-    Console.WriteLine("DONE");
-    return 0;
-  end Main;
-end C;
-)BZL"), e);
-}
-
-// The alias is returned from a method whose result is `Object?`: as above,
-// at the nullable spelling.
-BEZEL_TEST(closure_local_alias_source_overwrite_8479,
-           alias_returned_at_nullable_object_result_spec_28_9) {
-    std::string e;
-    for (int i = 0; i < 200; ++i) line(e, 2 + 2 * i);
-    e += "DONE\n";
-    BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(
-module M;
-type Fn := (int, int) -> int;
-public class C
-  public static method Mk(k: int): Object?
-    var g: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
-    var a: (int, int) -> int := g;
-    return a;
-  end Mk;
-  public static method Main(): int
-    for var i in 0..<200 do
-      var o := Mk(i);
-      var f := o as Fn;
-      Console.WriteLine(f!(1, 2) + f!(4, 1));
+      var f1 := await Mk(i);
+      Console.WriteLine(f1(1, 2) + f1(4, 1));
+      var f2 := await mk(i);
+      Console.WriteLine(f2(1, 2) + f2(4, 1));
+      var o3 := MkObj(i);
+      var f3 := o3 as Fn;
+      Console.WriteLine(f3!(1, 2) + f3!(4, 1));
+      var o4 := MkObjN(i);
+      var f4 := o4 as Fn;
+      Console.WriteLine(f4!(1, 2) + f4!(4, 1));
     end for;
     Console.WriteLine("DONE");
     return 0;
@@ -893,11 +758,10 @@ end C;
 //   row                                                     r30-c1        a4abadac6      with the fix
 //   producer_coalesce_rhs_added_to_callers_array_spec_7_7     UAF, 0 lines  UAF, 0 lines   leak 15200
 //   producer_as_cast_added_to_callers_array_spec_17_4         UAF, 0 lines  UAF, 0 lines   leak 15200
-//   alias_coalesce_rhs_added_to_callers_array_spec_7_7        leak 15200    UAF, 0 lines   leak 15200
-//   alias_as_cast_added_to_callers_array_spec_17_4            leak 15200    UAF, 0 lines   leak 15200
+//   control_alias_coalesce_and_as_added_to_callers_array       leak 15200    UAF, 0 lines   leak 15200
 // The remaining leak is `fs.Add(g)`'s own (#5866), so the oracle is
-// runNoMemoryErrorOut. The first two rows are red on r30-c1, the last two
-// on a4abadac6 (and on this suite's family-1 commit). The assignment
+// runNoMemoryErrorOut. The first two rows are red on r30-c1; the last one is
+// the suite's second base-green control, red only on a4abadac6. The assignment
 // spelling `b := n ?? g; fs.Add(b);` stays a use-after-free for a reason
 // that predates both: `b := g; fs.Add(b);` fails the same way (#8723).
 // (1 - 2 + i) + (4 - 1 + i) = 2 + 2i.
@@ -960,39 +824,15 @@ end C;
 }
 
 // An owned alias `a` of the producer reaches `fs.Add` as the right operand of
-// `??`.
-BEZEL_TEST(closure_local_alias_source_overwrite_8479,
-           alias_coalesce_rhs_added_to_callers_array_spec_7_7) {
-    std::string e;
-    for (int i = 0; i < 200; ++i) line(e, 2 + 2 * i);
-    e += "DONE\n";
-    BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(
-module M;
-public class C
-  public static method Fill(fs: Array<(int, int) -> int>, k: int)
-    var g: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
-    var a: (int, int) -> int := g;
-    var n: ((int, int) -> int)? := null;
-    fs.Add(n ?? a);
-  end Fill;
-  public static method Main(): int
-    for var i in 0..<200 do
-      var fs: Array<(int, int) -> int> := new Array<(int, int) -> int>();
-      Fill(fs, i);
-      Console.WriteLine(fs[0](1, 2) + fs[0](4, 1));
-    end for;
-    Console.WriteLine("DONE");
-    return 0;
-  end Main;
-end C;
-)BZL"), e);
-}
 
-// An owned alias `a` of the producer reaches `fs.Add` through `(a as Fn)!`.
+// BASE-GREEN CONTROL 2 of 2 (green on r30-c1, red on the wrong fix
+// a4abadac6): an owned alias `a` of the producer reaches `fs.Add` as the right
+// operand of `??` (§7.7) and through `(a as Fn)!` (§17.4). One program for both
+// spellings; the two per-spelling rows were moved to the corpus candidates.
 BEZEL_TEST(closure_local_alias_source_overwrite_8479,
-           alias_as_cast_added_to_callers_array_spec_17_4) {
+           control_alias_coalesce_and_as_added_to_callers_array_spec_7_7_17_4) {
     std::string e;
-    for (int i = 0; i < 200; ++i) line(e, 2 + 2 * i);
+    for (int i = 0; i < 200; ++i) line(e, 2 + 2 * i), line(e, 2 + 2 * i);
     e += "DONE\n";
     BEZEL_EXPECT_EQ(runNoMemoryErrorOut(R"BZL(
 module M;
@@ -1001,13 +841,18 @@ public class C
   public static method Fill(fs: Array<(int, int) -> int>, k: int)
     var g: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
     var a: (int, int) -> int := g;
-    fs.Add((a as Fn)!);
+    var n: ((int, int) -> int)? := null;
+    fs.Add(n ?? a);
+    var h: (int, int) -> int := lambda(x: int, y: int) => x - y + k;
+    var b: (int, int) -> int := h;
+    fs.Add((b as Fn)!);
   end Fill;
   public static method Main(): int
     for var i in 0..<200 do
       var fs: Array<(int, int) -> int> := new Array<(int, int) -> int>();
       Fill(fs, i);
       Console.WriteLine(fs[0](1, 2) + fs[0](4, 1));
+      Console.WriteLine(fs[1](1, 2) + fs[1](4, 1));
     end for;
     Console.WriteLine("DONE");
     return 0;
