@@ -31756,6 +31756,34 @@ struct StringEscapeWalker {
     // below is unreachable for them.
     const std::function<bool(const ast::Member*, size_t)>* paramNonEscaping =
         nullptr;
+    // fix #5855 (§9.1 / §9.2 / §9.7 / §28.3, v0.357): two more OPT-IN hooks
+    // of the record-call-result walk (`recordFieldReleaseMode`), set beside
+    // `paramNonEscaping` and null for every other walk.
+    //   * `synthesizedRecordValueCall` — the Emitter's
+    //     `isSynthesizedRecordValueMemberCall`: the tracked record as the
+    //     receiver, or the same-typed argument, of its SYNTHESIZED `Equals` /
+    //     `GetHashCode`. That lowering compares and hashes fields and keeps
+    //     neither operand, so the occurrence is a read. (The general receiver
+    //     rule — a member that runs user code may copy `this` — does not
+    //     apply: no user code runs.)
+    //   * `recordArgNonEscaping` — the Emitter's
+    //     `recordArgToUserCallNonEscaping`: the tracked record passed BY
+    //     VALUE to a locally compiled, non-dispatched method whose record
+    //     parameter provably does not outlive the call. The callee's copy
+    //     shares the record's field strings (a by-value pass retains nothing,
+    //     §9.7), and since nothing it leaves behind still points at them, the
+    //     caller's scope-end release of the fields stays sound.
+    const std::function<bool(const ast::CallExpr&)>* synthesizedRecordValueCall =
+        nullptr;
+    const std::function<bool(const ast::Expr*,
+                             const std::vector<ast::CallArgument>&,
+                             std::size_t)>* recordArgNonEscaping = nullptr;
+    // fix #5855 (§9.1 / §9.7 / §28.9, v0.357): the string walk's view of
+    // `Emitter::ctorRecordBorrowDecl_` — a bare positional argument of a
+    // record construction in the map BORROWS the tracked string local (see
+    // walkNewArgs). Null for every other walk.
+    const std::unordered_map<const void*, std::unordered_set<const void*>>*
+        ctorRecordBorrowDecl = nullptr;
     // fix #2450 / §35.5 / §28.9 / §35.4: OPT-IN gate for the case-scrutinee
     // relaxation below. §35.5's "borrowing match" makes every payload binding
     // a BORROW of the scrutinee's source — for a value-like choice, a
@@ -32954,6 +32982,12 @@ struct StringEscapeWalker {
                     }
                 }
             }
+            // fix #5855 (§9.7 / §28.3, v0.357): the BY-VALUE twin of the
+            // boxed relaxation above — see `recordArgNonEscaping`.
+            if (recordFieldReleaseMode && recordArgNonEscaping && !safeArg &&
+                a.value && isTargetIdent(a.value.get()) &&
+                (*recordArgNonEscaping)(callee, args, i))
+                safeArg = true;
             // fix #5441 (§28.3 "Plain parameters are borrows" / §28.9, v0.330):
             // the #1430 relaxation's CLOSURE-CALLEE twin. The block above is
             // `ms`-gated, and a lambda / function-typed-local callee has NO
@@ -33711,6 +33745,23 @@ struct StringEscapeWalker {
             walkAllEscape();  // builtin/unresolved type — no relaxation
             return;
         }
+        // fix #5855 (§9.1 / §9.7 / §28.9, v0.357): a positional record
+        // construction in `ctorRecordBorrowDecl` BORROWS each string local it
+        // receives as a bare positional argument (the synthesized primary
+        // constructor stores the reference raw, and the collector proved the
+        // record cannot outlive the local, nor the local be overwritten while
+        // the record holds it). Such an argument is a read; the local keeps
+        // its own +1 and its own scope-end release.
+        if (stringReleaseMode && ctorRecordBorrowDecl && target &&
+            rt->declaration->kind == ast::TypeDeclKind::Record) {
+            auto it = ctorRecordBorrowDecl->find(static_cast<const void*>(ne));
+            if (it != ctorRecordBorrowDecl->end() && it->second.count(target)) {
+                for (auto& a : ne->args)
+                    expr(a.value.get(),
+                         /*safeRead=*/isTargetIdent(a.value.get()));
+                return;
+            }
+        }
         // fix #4350 (round 2, walkNewArgs-RECORD): when borrowingArrayMode is
         // active and the target is a RECORD declaration (or any other type
         // whose auto-generated positional constructor is NOT in the
@@ -34032,6 +34083,21 @@ struct StringEscapeWalker {
             // local, a discarded expression) is an ESCAPE here.
             if (isDerivedSpanCall(c)) {
                 escaped = true;
+                return;
+            }
+            // fix #5855 (§9.1 / §9.2, v0.357): the tracked record as an
+            // operand of its own SYNTHESIZED `Equals` / `GetHashCode` (see
+            // `synthesizedRecordValueCall`) is a read, as receiver or as the
+            // argument. Every other operand is walked as before.
+            if (recordFieldReleaseMode && synthesizedRecordValueCall &&
+                !inLambda && (*synthesizedRecordValueCall)(*c)) {
+                auto* ma =
+                    static_cast<const ast::MemberAccessExpr*>(c->callee.get());
+                if (!isTargetIdent(ma->target.get()))
+                    expr(ma->target.get(), /*safeRead=*/true);
+                for (auto& a : c->args)
+                    if (!isTargetIdent(a.value.get()))
+                        expr(a.value.get(), /*safeRead=*/false);
                 return;
             }
             expr(c->callee.get(), /*safeRead=*/true);
@@ -40378,6 +40444,9 @@ void Emitter::collectStringReleaseEligible(
     // constructor body, an iterator body, a `do` block, a `finally` block),
     // and each such call re-populates the map for that body.
     collectCtorSpanBorrowEligible(body);
+    // fix #5855 (§9.1 / §9.7, v0.357): the record twin of the span map — the
+    // positional record constructions that borrow a string local.
+    collectCtorRecordBorrowEligible(body);
     // fix #6170 step 3: the field-owner scan feeds the const predicate
     // valueLikeChoiceLocalMintsStringPayload below, so it runs first.
     collectValueLikeChoiceFieldOwners();
@@ -40875,6 +40944,7 @@ void Emitter::collectStringReleaseEligible(
         // NOT in the map (a span built in a return value, an argument or an
         // assignment, or a span that escapes) keeps the conservative escape.
         w.ctorSpanBorrowDecl = &ctorSpanBorrowDecl_;
+        w.ctorRecordBorrowDecl = &ctorRecordBorrowDecl_;  // fix #5855
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringReleaseEligible_.insert(static_cast<const void*>(ld));
@@ -40921,6 +40991,7 @@ void Emitter::collectStringReleaseEligible(
         // NOT in the map (a span built in a return value, an argument or an
         // assignment, or a span that escapes) keeps the conservative escape.
         w.ctorSpanBorrowDecl = &ctorSpanBorrowDecl_;
+        w.ctorRecordBorrowDecl = &ctorRecordBorrowDecl_;  // fix #5855
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringBorrowRetainEligible_.insert(static_cast<const void*>(ld));
@@ -41287,6 +41358,141 @@ void Emitter::collectCtorSpanBorrowEligible(
                  static_cast<const void*>(c.first)});
     }
 }
+// fix #5855 (§9.1 / §9.7 / §28.3 / §28.9, v0.357): populate
+// ctorRecordBorrowDecl_ for `body` (see the map's comment in
+// LlvmBackend_impl.hpp).
+//
+// THE LEAK. `var t := s + "y"; var n := new Named(t, 1);` — the synthesized
+// primary constructor stores `t`'s reference into the field RAW (no retain:
+// the #4254 fast path), so after the construction the local and the field
+// share ONE +1. Neither side released it: the string walk read the
+// construction argument as an ESCAPE (walkNewArgs), so `t`'s own scope-end
+// release never armed, and the record is not a fresh construction
+// (`isFreshRecordConstructionOfExactType` admits only +1 producers as
+// arguments, because the record's own release would otherwise free a string
+// `t` still owns), so no field release armed either. MEASURED: 35 B per call
+// leaked (#8630's `h2_local_into_record` probe, 100 of 100 iterations).
+//
+// THE FIX: the record BORROWS `t`, and `t`'s own release discharges the one
+// +1. That is sound exactly when nothing can still read the field after `t`
+// is released, which the three conditions below establish:
+//   (a) the construction is the synthesized positional constructor of a
+//       local, non-generic record with no declared constructor, and the
+//       argument at that position is a bare `string` local passed to a
+//       `string` field (a user constructor could store the argument
+//       anywhere; a generic field may not be a string at all);
+//   (b) the record local is used only in the call-bounded ways
+//       `recordLocalStrictlyCallBounded` admits (no copy of the record and
+//       no raw alias of a field string survives it), and the record local,
+//       declared inside `t`'s scope, dies no later than `t`;
+//   (c) `t` is provably never written after its declaration (a reassignment
+//       releases the old reference — `lowerStringLocalReassign` — which the
+//       record would still hold).
+// A record so admitted never takes a field release of its own:
+// `collectRecordCallResultReleaseEligible` refuses a candidate whose
+// initializer is in the map (and such a construction is not fresh anyway).
+void Emitter::collectCtorRecordBorrowEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    ctorRecordBorrowDecl_.clear();
+    std::vector<std::pair<const ast::LocalDecl*, const ast::NewExpr*>> cands;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            if (!ld->isUsing && ld->initializer)
+                if (auto* ne =
+                        dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                    cands.emplace_back(ld, ne);
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+    if (cands.empty()) return;
+
+    auto isPlainString = [](const sema::TypeRef* t) {
+        return t && !t->nullable && t->kind == sema::TypeRef::Kind::Primitive &&
+               t->primitive == sema::PrimitiveType::String;
+    };
+    std::unordered_map<const ast::LocalDecl*, bool> unwritten;
+    auto provablyUnwritten = [&](const ast::LocalDecl* src) {
+        auto it = unwritten.find(src);
+        if (it != unwritten.end()) return it->second;
+        const bool proven = localProvablyUnwrittenIn(src, body);
+        unwritten.emplace(src, proven);
+        return proven;
+    };
+
+    for (auto& [ld, ne] : cands) {
+        const sema::TypeRef* rt =
+            ne->type ? ctx_.resolvedType(*ne->type) : ctx_.exprType(*ne);
+        if (!rt || rt->nullable || rt->kind != sema::TypeRef::Kind::Named ||
+            !rt->declaration || !rt->genericArgs.empty())
+            continue;
+        const sema::TypeSymbol* ts = rt->declaration;
+        if (ts->kind != ast::TypeDeclKind::Record || ctx_.isImported(ts) ||
+            !ts->genericParams.empty() || !recordIsPositional(ts))
+            continue;
+        auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+        if (!td || td->positionalFields.size() != ne->args.size()) continue;
+        bool declaredCtor = false;
+        for (const sema::Symbol* m : ts->members)
+            if (dynamic_cast<const sema::ConstructorSymbol*>(m))
+                declaredCtor = true;
+        if (declaredCtor) continue;
+        std::unordered_set<const void*> sources;
+        bool plain = true;
+        for (std::size_t k = 0; k < ne->args.size(); ++k) {
+            const ast::CallArgument& a = ne->args[k];
+            if (!a.modifier.empty() || !a.name.empty() || a.isDiscard ||
+                !a.value) {
+                plain = false;
+                break;
+            }
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+            if (!id) continue;
+            auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+            auto* src = loc ? dynamic_cast<const ast::LocalDecl*>(loc->decl)
+                            : nullptr;
+            if (!src || src->isUsing) continue;
+            const ast::Param& field = td->positionalFields[k];
+            if (!field.type || !isPlainString(ctx_.resolvedType(*field.type)) ||
+                !isPlainString(ctx_.exprType(*id)))
+                continue;
+            sources.insert(static_cast<const void*>(src));
+        }
+        if (!plain || sources.empty()) continue;
+        // (b): no copy of the record, and no raw alias of a field string,
+        // outlives the record local (RecordParamEscapeWalker's rules).
+        if (!recordLocalStrictlyCallBounded(ld, body)) continue;
+        // (c): no source is written while the record holds it.
+        std::unordered_set<const void*> admitted;
+        for (const void* src : sources)
+            if (provablyUnwritten(static_cast<const ast::LocalDecl*>(src)))
+                admitted.insert(src);
+        if (!admitted.empty())
+            ctorRecordBorrowDecl_.emplace(static_cast<const void*>(ne),
+                                          std::move(admitted));
+    }
+}
+
+
 void Emitter::collectRecordCallResultReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     recordCallResultReleaseEligible_.clear();
@@ -42150,8 +42356,33 @@ void Emitter::collectRecordCallResultReleaseEligible(
             return isCalleeParamNonEscaping(callee, idx);
         };
 
+    // fix #5855 (§9.1 / §9.2 / §9.7, v0.357): see the walker's
+    // `synthesizedRecordValueCall` / `recordArgNonEscaping` members.
+    const std::function<bool(const ast::CallExpr&)> synthValue =
+        [this](const ast::CallExpr& c) {
+            return isSynthesizedRecordValueMemberCall(c);
+        };
+    const std::function<bool(const ast::Expr*,
+                             const std::vector<ast::CallArgument>&,
+                             std::size_t)>
+        recordArg = [this](const ast::Expr* callee,
+                           const std::vector<ast::CallArgument>& args,
+                           std::size_t i) {
+            return recordArgToUserCallNonEscaping(callee, args, i);
+        };
+
     for (const ast::Node* ld : candidates) {
+        // fix #5855: a record whose construction BORROWS a string local
+        // (ctorRecordBorrowDecl_) must not release the fields that local
+        // still owns.
+        if (auto* lde = dynamic_cast<const ast::LocalDecl*>(ld))
+            if (lde->initializer &&
+                ctorRecordBorrowDecl_.count(
+                    static_cast<const void*>(lde->initializer.get())))
+                continue;
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.synthesizedRecordValueCall = &synthValue;  // fix #5855
+        w.recordArgNonEscaping = &recordArg;         // fix #5855
         // recordFieldReleaseMode = true (the gate above); the other modes
         // stay false so the string-release / borrowing-Array / value-like-
         // choice relaxation never affects this pass.
@@ -47163,6 +47394,26 @@ bool Emitter::opaqueLocalProvablyUnwritten(const ast::LocalDecl* ld) {
     return proven;
 }
 
+
+// fix #5855 (§9.7 / §28.9, v0.357): `opaqueLocalProvablyUnwritten`'s walk
+// over an EXPLICIT body (the one `collectCtorRecordBorrowEligible` is
+// analysing), with no memo: true only when the #3447 slot-write walk reached
+// `ld`'s own declaration, found no write (an assignment, an increment, a
+// `ref`/`out` argument, including inside a lambda body), did not stop early
+// and met no node kind it does not enumerate.
+bool Emitter::localProvablyUnwrittenIn(
+        const ast::LocalDecl* ld,
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    if (!ld) return false;
+    BoxEscapeWalker w{ctx_, static_cast<const void*>(ld),
+                      /*assignmentSourceKind=*/{}, /*isKnownBoxReceiver=*/{}};
+    w.slotWriteMode = true;
+    for (auto& s : body) {
+        w.stmt(s.get());
+        if (w.slotWritten || w.escaped || w.unknownNode) return false;
+    }
+    return w.declSeen;
+}
 
 // fix #2900 / §28.9 / §28.3 (v0.240): `var o: Object := s;` and the same shape
 // over an interface-typed alias — an Object/interface local whose initializer

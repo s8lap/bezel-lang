@@ -19823,6 +19823,539 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
     return result;
 }
 
+namespace {
+// fix #5855 (§9.7 / §28.3 / §28.9, v0.357): walk a callee's body to decide
+// whether its by-value RECORD parameter can outlive the call. A record is a
+// value struct whose `string` fields are bit-copied, never retained, when it
+// is passed by value (§9.7: "no disposer"), so the callee's parameter shares
+// the caller's field strings. The caller may release those strings at its
+// local's scope end only if nothing the callee leaves behind still points at
+// them.
+//
+// STRICTER THAN THE CALLER-SIDE RECORD WALK, on purpose. The parameter's
+// value may be used in exactly these ways, and every other occurrence is an
+// ESCAPE (the leak direction):
+//   * a storage read `p.F` (a field or an auto-property: no user code runs)
+//     whose type is a scalar (a non-`string`, non-`Object` primitive, or an
+//     enum) — the read COPIES the value out;
+//   * a storage read `p.F` of `string` type, but only as an operand of a
+//     comparison or concatenation, as the receiver of `.Length`, or as an
+//     interpolation part — the positions that read the string and produce a
+//     NEW value. Any other position (a return, a field store, an argument, a
+//     record or collection element) could alias the field string with no +1
+//     of its own, so it escapes;
+//   * the receiver or the same-typed argument of the record's SYNTHESIZED
+//     `Equals` / `GetHashCode` (§9.1 / §9.2), which compare and hash fields
+//     and keep nothing;
+//   * a plain argument to another locally compiled, non-dispatched method
+//     whose by-value record parameter at that position is non-escaping by
+//     this same walk (recursion; a cycle answers "escapes");
+//   * a plain argument to such a method's `Object`/interface parameter that
+//     the #2952 summary (`isCalleeParamNonEscaping`) proves non-escaping —
+//     the boxed pass the record-call-result walk already admits (#5853).
+// Inside a lambda every occurrence escapes (the closure env may outlive the
+// call). A node kind this walker does not model escapes.
+struct RecordParamEscapeWalker {
+    const sema::SemaContext& ctx;
+    const ast::Type* paramDeclType;
+    std::function<void(const ast::LambdaExpr&,
+                       std::unordered_set<const sema::Symbol*>&)>
+        lambdaCaptures;
+    std::function<bool(const ast::CallExpr&)> synthesizedValueCall;
+    std::function<bool(const ast::CallExpr&, size_t)> argNonEscaping;
+    bool escaped = false;
+    int lambdaDepth = 0;
+    // When set, the walk tracks this LOCAL declaration (a record local of
+    // the caller, `collectCtorRecordBorrowEligible`) instead of the
+    // parameter `paramDeclType` names.
+    const ast::Node* targetLocalDecl = nullptr;
+
+    bool isTargetSym(const sema::Symbol* sym) const {
+        if (targetLocalDecl) {
+            auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym);
+            return ls && ls->decl == targetLocalDecl;
+        }
+        auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym);
+        return ps && ps->declType == paramDeclType;
+    }
+    bool isTarget(const ast::Expr* e) const {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        return id && isTargetSym(ctx.exprSymbol(*id));
+    }
+
+    // The storage read `p.F`'s type, or null when `e` is not one.
+    const sema::TypeRef* storageReadType(const ast::Expr* e) const {
+        if (lambdaDepth != 0) return nullptr;
+        auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e);
+        if (!m || !isTarget(m->target.get())) return nullptr;
+        sema::Symbol* sym = ctx.exprSymbol(*m);
+        bool storage = dynamic_cast<sema::FieldSymbol*>(sym) != nullptr ||
+                       (sym && sema::isAutoPropertyStorageSymbol(sym, ctx));
+        return storage ? ctx.exprType(*m) : nullptr;
+    }
+    static bool isScalar(const sema::TypeRef* t) {
+        if (!t) return false;
+        using K = sema::TypeRef::Kind;
+        using P = sema::PrimitiveType;
+        if (t->kind == K::Primitive)
+            return t->primitive != P::None && t->primitive != P::Object &&
+                   t->primitive != P::String;
+        return t->kind == K::Named && t->declaration &&
+               t->declaration->kind == ast::TypeDeclKind::Enum;
+    }
+    static bool isString(const sema::TypeRef* t) {
+        return t && t->kind == sema::TypeRef::Kind::Primitive &&
+               t->primitive == sema::PrimitiveType::String;
+    }
+    // `e` in a position that reads a string and produces a new value.
+    void stringReadPos(const ast::Expr* e) {
+        if (const sema::TypeRef* t = storageReadType(e))
+            if (isString(t) || isScalar(t)) return;
+        expr(e);
+    }
+
+    void args(const std::vector<ast::CallArgument>& as) {
+        for (auto& a : as) expr(a.value.get());
+    }
+
+    void expr(const ast::Expr* e) {
+        if (!e || escaped) return;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            if (isTarget(id)) escaped = true;
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            if (const sema::TypeRef* t = storageReadType(m)) {
+                if (isScalar(t)) return;
+                escaped = true;
+                return;
+            }
+            // `p.F.Length` on a string storage read reads the string.
+            if (m->member == "Length")
+                if (const sema::TypeRef* t = storageReadType(m->target.get()))
+                    if (isString(t)) return;
+            expr(m->target.get());
+            return;
+        }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            const bool reads = b->op == "+" || b->op == "=" || b->op == "<>" ||
+                               b->op == "<" || b->op == "<=" ||
+                               b->op == ">" || b->op == ">=";
+            bool userOperator = false;
+            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*b)))
+                userOperator = ms->isOperator;
+            if (reads && !userOperator) {
+                stringReadPos(b->left.get());
+                stringReadPos(b->right.get());
+            } else {
+                expr(b->left.get());
+                expr(b->right.get());
+            }
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : is->parts) stringReadPos(part.expr.get());
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            if (lambdaDepth == 0 && synthesizedValueCall &&
+                synthesizedValueCall(*c)) {
+                auto* m = static_cast<const ast::MemberAccessExpr*>(
+                    c->callee.get());
+                if (!isTarget(m->target.get())) expr(m->target.get());
+                for (auto& a : c->args)
+                    if (!isTarget(a.value.get())) expr(a.value.get());
+                return;
+            }
+            if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(
+                    c->callee.get())) {
+                // A member call on the parameter runs user code with `this`
+                // pointing at the value: an escape (the generic arm below).
+                expr(m->target.get());
+            } else {
+                expr(c->callee.get());
+            }
+            for (size_t i = 0; i < c->args.size(); ++i) {
+                const ast::CallArgument& a = c->args[i];
+                if (lambdaDepth == 0 && argNonEscaping && a.modifier.empty() &&
+                    a.name.empty() && !a.isDiscard && isTarget(a.value.get()) &&
+                    argNonEscaping(*c, i))
+                    continue;
+                expr(a.value.get());
+            }
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            expr(m->target.get());
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            expr(c->callee.get());
+            args(c->args);
+            return;
+        }
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(p->operand.get());
+            return;
+        }
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(u->operand.get());
+            return;
+        }
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(t->operand.get());
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(c->condition.get());
+            expr(c->thenValue.get());
+            expr(c->elseValue.get());
+            return;
+        }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            args(n->args);
+            return;
+        }
+        if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(w->source.get());
+            for (auto& a : w->assigns) expr(a.value.get());
+            return;
+        }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& el : cl->elements) expr(el.get());
+            for (auto& k : cl->keys) expr(k.get());
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get());
+            for (auto& ind : ix->indices) expr(ind.value.get());
+            return;
+        }
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            if (lambdaCaptures) {
+                std::unordered_set<const sema::Symbol*> caps;
+                lambdaCaptures(*lam, caps);
+                for (const sema::Symbol* sym : caps) {
+                    if (isTargetSym(sym)) {
+                        escaped = true;
+                        return;
+                    }
+                }
+            }
+            ++lambdaDepth;
+            expr(lam->exprBody.get());
+            for (auto& s : lam->stmts) stmt(s.get());
+            --lambdaDepth;
+            return;
+        }
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+            expr(ce->scrutinee.get());
+            for (auto& arm : ce->arms) {
+                expr(arm.guard.get());
+                expr(arm.exprBody.get());
+                for (auto& s : arm.stmts) stmt(s.get());
+            }
+            return;
+        }
+        if (auto* b = dynamic_cast<const ast::BindExpr*>(e)) {
+            for (auto& cl : b->clauses) stmt(cl.get());
+            expr(b->body.get());
+            return;
+        }
+        if (auto* t = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(t->operand.get());
+            return;
+        }
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(r->lo.get());
+            expr(r->hi.get());
+            expr(r->step.get());
+            return;
+        }
+        if (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+            dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+            dynamic_cast<const ast::CharLiteralExpr*>(e) ||
+            dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+            dynamic_cast<const ast::VerbatimStringExpr*>(e) ||
+            dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+            dynamic_cast<const ast::NullLiteralExpr*>(e) ||
+            dynamic_cast<const ast::TypeOfExpr*>(e) ||
+            dynamic_cast<const ast::NameOfExpr*>(e) ||
+            dynamic_cast<const ast::DefaultExpr*>(e) ||
+            dynamic_cast<const ast::UnitExpr*>(e))
+            return;
+        escaped = true;  // a kind this walker does not model
+    }
+
+    void stmt(const ast::Stmt* s) {
+        if (!s || escaped) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            expr(ld->initializer.get()); return;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get()); return;
+        }
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            expr(r->value.get()); return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            expr(es->expr.get()); return;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(ts->value.get()); return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            expr(as->target.get());
+            expr(as->value.get());
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get());
+            for (auto& b : is->ifBranch.body) stmt(b.get());
+            for (auto& br : is->elifBranches) {
+                expr(br.condition.get());
+                for (auto& b : br.body) stmt(b.get());
+            }
+            for (auto& b : is->elseBody) stmt(b.get());
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get());
+            for (auto& b : ws->body) stmt(b.get());
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            expr(fs->iterable.get());
+            expr(fs->withExpr.get());
+            for (auto& b : fs->body) stmt(b.get());
+            return;
+        }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) stmt(b.get());
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) stmt(b.get());
+            for (auto& c : ts->catches) {
+                expr(c.guard.get());
+                stmt(c.body.get());
+            }
+            for (auto& b : ts->finallyBody) stmt(b.get());
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            expr(cs->scrutinee.get());
+            for (auto& arm : cs->arms) {
+                expr(arm.guard.get());
+                expr(arm.exprBody.get());
+                for (auto& a : arm.stmts) stmt(a.get());
+            }
+            return;
+        }
+        if (auto* d = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(d->value.get()); return;
+        }
+        if (auto* y = dynamic_cast<const ast::YieldStmt*>(s)) {
+            expr(y->value.get()); return;
+        }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            expr(inc->target.get()); return;
+        }
+        if (dynamic_cast<const ast::BreakStmt*>(s) ||
+            dynamic_cast<const ast::ContinueStmt*>(s) ||
+            dynamic_cast<const ast::LocalTypeDecl*>(s))
+            return;
+        escaped = true;
+    }
+};
+}  // namespace
+
+
+// fix #5855 (§9.1 / §9.2 / §9.7, v0.357): is `c` a call of a record's
+// SYNTHESIZED value-semantics `Equals(other)` or `GetHashCode()` on a
+// non-nullable, non-generic record value (the lowering
+// `tryLowerValueSemanticsCall` routes to field comparison / hashing, which
+// stores neither operand)? `Equals` additionally needs a plain argument of
+// the SAME record type, so neither operand is boxed. A user-declared member
+// of that name resolves to its own symbol and is excluded; the one resolved
+// symbol admitted is `IEquatable<T>.Equals` whose witness on this record is
+// the synthesized one (fix #5068's `isSynthesizedIEquatableEquals`).
+bool Emitter::isSynthesizedRecordValueMemberCall(const ast::CallExpr& c) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(c.callee.get());
+    if (!ma || !ma->target || !ma->typeArgs.empty()) return false;
+    const bool isEquals = ma->member == "Equals" && c.args.size() == 1;
+    const bool isHash = ma->member == "GetHashCode" && c.args.empty();
+    if (!isEquals && !isHash) return false;
+    auto valueRecord = [this](const sema::TypeRef* t) -> const sema::TypeSymbol* {
+        if (!t || t->nullable || t->kind != sema::TypeRef::Kind::Named ||
+            !t->declaration || !t->genericArgs.empty() ||
+            t->declaration->kind != ast::TypeDeclKind::Record ||
+            !t->declaration->genericParams.empty())
+            return nullptr;
+        return recordIsAutoBearing(t->declaration) ? t->declaration : nullptr;
+    };
+    const sema::TypeSymbol* rec = valueRecord(ctx_.exprType(*ma->target));
+    if (!rec) return false;
+    if (sema::Symbol* sym = ctx_.exprSymbol(*c.callee)) {
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+        if (!isEquals || !ms || !isSynthesizedIEquatableEquals(ms, rec))
+            return false;
+    }
+    if (isEquals) {
+        const ast::CallArgument& a = c.args[0];
+        if (!a.modifier.empty() || !a.name.empty() || a.isDiscard || !a.value)
+            return false;
+        if (valueRecord(ctx_.exprType(*a.value)) != rec) return false;
+    }
+    return true;
+}
+
+
+// fix #5855 (§9.7 / §28.3 / §28.9, v0.357): may the by-value RECORD
+// parameter at `paramIdx` of `callee` outlive the call? See
+// RecordParamEscapeWalker. Only a locally compiled MethodDecl is answered;
+// a dispatched (`virtual` / `abstract` / unsealed `override`) body, an
+// `async` method and an iterator answer "escapes" (the body that runs is not
+// this one, or the parameter is copied into a frame that outlives the call —
+// the same refusals as `isCalleeParamNonEscaping`). Cached per callee; a
+// cycle back to a callee still being analysed answers "escapes".
+bool Emitter::isCalleeRecordParamNonEscaping(const ast::Member* callee,
+                                             size_t paramIdx) {
+    auto* md = dynamic_cast<const ast::MethodDecl*>(callee);
+    if (!md) return false;
+    auto it = calleeRecordParamNonEscape_.find(callee);
+    if (it != calleeRecordParamNonEscape_.end())
+        return it->second.count(paramIdx) != 0;
+    calleeRecordParamNonEscape_[callee];  // seed: every parameter escapes
+    bool refused = containsYield(md->stmts);
+    bool dispatched = false, sealedMod = false;
+    for (auto mod : md->modifiers) {
+        if (mod == "async") refused = true;
+        if (mod == "virtual" || mod == "override" || mod == "abstract")
+            dispatched = true;
+        if (mod == "sealed") sealedMod = true;
+    }
+    if (refused || (dispatched && !sealedMod)) return false;
+    auto captures = [this](const ast::LambdaExpr& lam,
+                           std::unordered_set<const sema::Symbol*>& out) {
+        collectCapturedSyms(lam, out);
+    };
+    auto synth = [this](const ast::CallExpr& c) {
+        return isSynthesizedRecordValueMemberCall(c);
+    };
+    auto onward = [this](const ast::CallExpr& c, size_t i) {
+        return recordArgToUserCallNonEscaping(c.callee.get(), c.args, i) ||
+               boxedRecordArgNonEscaping(c.callee.get(), c.args, i);
+    };
+    std::unordered_set<size_t> nonEscape;
+    for (size_t i = 0; i < md->params.size(); ++i) {
+        const ast::Param& p = md->params[i];
+        if (!p.type || !p.modifier.empty()) continue;
+        const sema::TypeRef* pt = ctx_.resolvedType(*p.type);
+        if (!pt || pt->nullable || pt->kind != sema::TypeRef::Kind::Named ||
+            !pt->declaration ||
+            pt->declaration->kind != ast::TypeDeclKind::Record)
+            continue;
+        RecordParamEscapeWalker w{ctx_, p.type.get(), captures, synth, onward};
+        if (md->bodyKind == ast::MethodBodyKind::Expression)
+            w.expr(md->exprBody.get());
+        else if (md->bodyKind == ast::MethodBodyKind::Block)
+            for (auto& s : md->stmts) w.stmt(s.get());
+        else
+            continue;  // no body here: nothing proves it
+        if (!w.escaped) nonEscape.insert(i);
+    }
+    const bool result = nonEscape.count(paramIdx) != 0;
+    calleeRecordParamNonEscape_[callee] = std::move(nonEscape);
+    return result;
+}
+
+
+// fix #5855 (§8.6 / §9.7 / §28.3, v0.357): the callee-side facts
+// shared by the two call-argument relaxations below — the resolved
+// MethodSymbol of a plain call to a LOCALLY compiled user method that is not
+// an operator, an extension or an interface member, with every argument
+// plain, and a plain parameter at `i`. Null otherwise.
+const sema::MethodSymbol* Emitter::plainLocalUserCallee(
+        const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+        std::size_t i) {
+    if (!callee) return nullptr;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*callee));
+    if (!ms || ms->isOperator || ms->extensionDecl || ctx_.isImported(ms) ||
+        !ms->decl)
+        return nullptr;
+    if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Interface)
+        return nullptr;
+    for (const ast::CallArgument& a : args)
+        if (!a.name.empty() || a.isDiscard || !a.modifier.empty())
+            return nullptr;
+    if (i >= ms->params.size() || i >= args.size()) return nullptr;
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
+    if (!ps || !ps->modifier.empty()) return nullptr;
+    return ms;
+}
+
+
+// fix #5855 (§9.7 / §28.3, v0.357): is the argument at `i` a by-value record
+// handed to a parameter the callee provably does not let outlive the call?
+bool Emitter::recordArgToUserCallNonEscaping(
+        const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+        std::size_t i) {
+    const sema::MethodSymbol* ms = plainLocalUserCallee(callee, args, i);
+    if (!ms || !ms->genericParams.empty()) return false;
+    return isCalleeRecordParamNonEscaping(
+        dynamic_cast<const ast::Member*>(ms->decl), i);
+}
+
+
+// fix #5855 (§8.6 / §9.7 / §28.3, v0.357): a record argument BOXED into a
+// non-generic callee's `Object`/interface parameter that the #2952 summary
+// proves non-escaping (the relaxation #5853 gave the record-call-result
+// walk, offered here to RecordParamEscapeWalker).
+bool Emitter::boxedRecordArgNonEscaping(
+        const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+        std::size_t i) {
+    const sema::MethodSymbol* ms = plainLocalUserCallee(callee, args, i);
+    if (!ms || !ms->genericParams.empty()) return false;
+    return isCalleeParamNonEscaping(dynamic_cast<const ast::Member*>(ms->decl),
+                                    i);
+}
+
+
+// fix #5855 (§9.1 / §9.7 / §28.3, v0.357): is the record LOCAL `ld` used in
+// `body` only in the ways RecordParamEscapeWalker admits for a parameter —
+// scalar field reads, string field reads that produce a new value, its
+// synthesized `Equals` / `GetHashCode`, and plain passes to callees that
+// keep nothing? `collectCtorRecordBorrowEligible` needs this stricter walk
+// rather than the record-call-result walk: that walk reads every storage
+// field read as safe, so `new Other(n.Name)` — whose synthesized constructor
+// stores the borrowed string RAW — would keep the string alive past its
+// owner.
+bool Emitter::recordLocalStrictlyCallBounded(
+        const ast::LocalDecl* ld,
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    if (!ld) return false;
+    auto captures = [this](const ast::LambdaExpr& lam,
+                           std::unordered_set<const sema::Symbol*>& out) {
+        collectCapturedSyms(lam, out);
+    };
+    auto synth = [this](const ast::CallExpr& c) {
+        return isSynthesizedRecordValueMemberCall(c);
+    };
+    auto onward = [this](const ast::CallExpr& c, size_t i) {
+        return recordArgToUserCallNonEscaping(c.callee.get(), c.args, i) ||
+               boxedRecordArgNonEscaping(c.callee.get(), c.args, i);
+    };
+    RecordParamEscapeWalker w{ctx_, nullptr, captures, synth, onward};
+    w.targetLocalDecl = ld;
+    for (auto& s : body) {
+        w.stmt(s.get());
+        if (w.escaped) return false;
+    }
+    return true;
+}
+
+
 // fix #8307 (§28.9 / §8.6 / §28.3, v0.357): is the `Object`/interface-typed
 // formal at `pos` of `callee` (a MethodSymbol or a ConstructorSymbol) one a
 // `string` argument may be handed to as a CALL-BOUNDED BORROW? A string

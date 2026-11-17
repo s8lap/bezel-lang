@@ -13532,6 +13532,39 @@ private:
     // returned, captured, or stored — the same conservative shape BoxEscapeWalker
     // uses for the local-binding case. Imported callees ⇒ false.
     bool isCalleeParamNonEscaping(const ast::Member* callee, size_t paramIdx);
+    // fix #5855 (§9.7 / §28.3 / §28.9, v0.357): may the by-value RECORD
+    // parameter at `paramIdx` of `callee` outlive the call? (See
+    // RecordParamEscapeWalker, LlvmBackend_Assign.cpp.) Cached per callee in
+    // `calleeRecordParamNonEscape_`.
+    bool isCalleeRecordParamNonEscaping(const ast::Member* callee,
+                                        size_t paramIdx);
+    std::unordered_map<const ast::Member*, std::unordered_set<size_t>>
+        calleeRecordParamNonEscape_;
+    // fix #5855 (§9.1 / §9.2, v0.357): a record's SYNTHESIZED `Equals(other)`
+    // / `GetHashCode()` on a non-nullable, non-generic record value, with a
+    // same-typed plain argument — neither operand is kept or boxed.
+    bool isSynthesizedRecordValueMemberCall(const ast::CallExpr& c);
+    // fix #5855 (v0.357): the resolved MethodSymbol of a plain call to
+    // a locally compiled user method (no operator, extension or interface
+    // member; every argument plain; a plain parameter at `i`), else null.
+    const sema::MethodSymbol* plainLocalUserCallee(
+        const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+        std::size_t i);
+    // fix #5855 (§9.7 / §28.3, v0.357): a by-value record argument the callee
+    // provably does not let outlive the call.
+    bool recordArgToUserCallNonEscaping(
+        const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+        std::size_t i);
+    // fix #5855 (v0.357): a record argument boxed into a non-generic callee's
+    // non-escaping `Object`/interface parameter.
+    bool boxedRecordArgNonEscaping(
+        const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+        std::size_t i);
+    // fix #5855 (v0.357): RecordParamEscapeWalker over a caller's record
+    // LOCAL (see LlvmBackend_Assign.cpp).
+    bool recordLocalStrictlyCallBounded(
+        const ast::LocalDecl* ld,
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // fix #8307 (§28.9, v0.357): may a `string` argument be released by the
     // caller after passing it to the `Object`/interface formal at `pos` of a
     // MethodSymbol or ConstructorSymbol? True
@@ -17015,6 +17048,23 @@ private:
     // LocalDecl node pointer, exactly like `recordCallResultReleaseEligible_`
     // above.
     std::unordered_map<const void*, const void*> ctorSpanBorrowDecl_;
+
+    // fix #5855 (§9.1 / §9.7 / §28.9, v0.357): the MAP from a positional
+    // record construction `new R(..., s, ...)` that initializes a local
+    // declaration to the `string` LOCALS it receives as bare positional
+    // arguments — populated ONLY when (a) the record's construction is the
+    // synthesized primary constructor (it stores each positional argument
+    // RAW into its field, with no retain — the fast path #4254 describes), so
+    // the record BORROWS each such local's reference; (b) the record local
+    // provably never outlives the call-bounded uses the record-release walk
+    // admits; and (c) each source local is provably never written after its
+    // declaration (a reassignment releases the reference the record still
+    // holds). A source local in the map keeps its own +1 and its own
+    // scope-end release, which can never free a string a live record still
+    // points at: the record is declared inside the source's scope. See
+    // collectCtorRecordBorrowEligible.
+    std::unordered_map<const void*, std::unordered_set<const void*>>
+        ctorRecordBorrowDecl_;
 
     // fix #4266 (§9.7 / §28.9): the "declare, then assign" twin of the set
     // above — a plain `var outer: P;` (NO initializer) whose SOLE
@@ -20819,6 +20869,11 @@ private:
     // describe the SAME body.
     void collectCtorSpanBorrowEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // fix #5855 (§9.1 / §9.7 / §28.9, v0.357): compute ctorRecordBorrowDecl_
+    // for a block body (see the map's own comment). Called from INSIDE
+    // collectStringReleaseEligible, next to collectCtorSpanBorrowEligible.
+    void collectCtorRecordBorrowEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // fix #6170 step 2/3 (§28.9 / §35.4, v0.338): the #2115 armed set of
     // value-like choice owner locals among `cands` (all declared in `body`):
     // the greatest fixpoint of the choice escape walk, where a copy into or an
@@ -22327,6 +22382,10 @@ private:
     // the narrowing declines — the pre-#6753 behaviour, correct for a string.
     // Memoized per LocalDecl; the memo is dropped on every root change.
     bool opaqueLocalProvablyUnwritten(const ast::LocalDecl* ld);
+    // fix #5855 (v0.357): the same proof over an explicit body, unmemoized.
+    bool localProvablyUnwrittenIn(
+        const ast::LocalDecl* ld,
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void setOpaqueSlotScanRoot(
         const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
         const ast::Expr* exprBody);
