@@ -11806,48 +11806,20 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             // `PropertySymbol*` — see `propBlockGetterReturnKinds_` in
             // LlvmBackend_impl.hpp, which also records that this sub-case
             // has no oracle.)
-            unsigned gk6397 = 0u;
-            if (ps6397 && propBlockGetterReturnKinds_.count(ps6397))
-                gk6397 = propBlockGetterReturnKinds_.at(ps6397);
-            bool minted6397 =
-                // fix #7594 (§17.8, v0.350): the wrap-creator keys its mint
-                // on the property READ node, which under `f.E!` is the
-                // operand of the bang.
-                propReadIterWrappedExprs_.count(
-                    peelForInSourceBang(fs.iterable.get())) > 0 ||
-                (gk6397 & kPropGetterReturnMint) != 0 ||
-                // fix #6397 follow-up (§28.9 / §29.2, v0.338): the accessor
-                // BODY's own mint, for the face on which the getter is a
-                // separate slot function (`virtual` / interface dispatch) rather
-                // than inlined at this read. Without this term the consumer saw
-                // "no mint" on a frame the accessor really minted, took the
-                // field-lend branch and withdrew the loop's reclamation.
-                (gk6397 & kPropGetterBodyMint) != 0;
-            // The BLOCK-bodied getter reports its own return edges through the
-            // map; the EXPRESSION-bodied getter is inlined at the read site, so
-            // the same question is asked of its body expression directly. Both
-            // ask one thing: does the getter hand back a FIELD read?
-            bool fieldLend6397 = (gk6397 & kPropGetterReturnField) != 0;
-            if (!fieldLend6397)
-                if (const ast::Expr* eg6397 = computedGetterOf(ps6397))
-                    fieldLend6397 =
-                        dynamic_cast<sema::FieldSymbol*>(
-                            ctx_.exprSymbol(*eg6397)) != nullptr;
-            // fix #6447 (§28.2, §28.9, v0.338): the map above answers only on
-            // the face that published it, so its `false` is not evidence of a
-            // claim — it is the ABSENCE of one, and it is absence on the
-            // vtable/itable face for EVERY block-bodied getter, plus absence
-            // for a laundering one (`get do var t := _a; return t; end`) on
-            // every face, because `lowerReturn`'s own test is one hop and
-            // stops at the local. `computedGetterOf` is null for a block body,
-            // so nothing above could see either case. Ask the BODY instead;
-            // see `blockGetterReturnsFieldLend` for the rule and for why a
-            // wrong `true` can only cost a leak.
-            if (!fieldLend6397)
-                fieldLend6397 = blockGetterReturnsFieldLend(ps6397);
-            sourceIsNamedLocal =
-                sema::isAutoPropertyStorageSymbol(ps6397, ctx_) ||
-                (fieldLend6397 && !minted6397);
+            //
+            // fix #6447 (§28.2, §28.9, §29.2, v0.357): the verdict itself —
+            // `isAuto || (lend && !minted)` — is `propertyReadIsLend`'s, one
+            // rule shared by this arm and its user-class twin in
+            // `lowerIEnumerableFor`, so the two cannot drift. Its two halves are the
+            // ones described above: `minted` is the wrap creators' own
+            // published verdict (the read node, plus the property-keyed
+            // `kPropGetterReturnMint` / `kPropGetterBodyMint` bits), and
+            // `lend` asks the getter's BODY, with any number of hops.
+            // fix #7594 (§17.8, v0.350): the wrap-creator keys its mint on
+            // the property READ node, which under `f.E!` is the operand of
+            // the bang.
+            sourceIsNamedLocal = propertyReadIsLend(
+                ps6397, peelForInSourceBang(fs.iterable.get()));
         }
     }
     // fix #2779 / §29.2 / §29.11 / §23.3 / §28.3 K3 / §28.9 (v0.240): an
@@ -12366,37 +12338,15 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
             // The USER-CLASS arm's twin of the sibling above: the map is
             // keyed on the `sema::PropertySymbol`, so the read needs no
             // `ps6397b->decl` recovery — same reasoning, same answer.
-            unsigned gk6397b = 0u;
-            if (ps6397b && propBlockGetterReturnKinds_.count(ps6397b))
-                gk6397b = propBlockGetterReturnKinds_.at(ps6397b);
-            bool minted6397b =
-                propReadIterWrappedExprs_.count(fs.iterable.get()) > 0 ||
-                (gk6397b & kPropGetterReturnMint) != 0 ||
-                // fix #6397 follow-up (§28.9 / §29.2, v0.338): the accessor
-                // BODY's own mint — the same third term as the sibling arm
-                // above, and for the same reason.
-                (gk6397b & kPropGetterBodyMint) != 0;
-            // Same two verdicts as the sibling above, and the same reason for
-            // the field bit: §28.2 makes a getter's field read storage its
-            // holder already keeps alive, while a getter that PRODUCES a value
-            // (`=> C.Gen()`, #1840) hands the reader one nobody else owns.
-            bool fieldLend6397b = (gk6397b & kPropGetterReturnField) != 0;
-            if (!fieldLend6397b)
-                if (const ast::Expr* eg6397b = computedGetterOf(ps6397b))
-                    fieldLend6397b =
-                        dynamic_cast<sema::FieldSymbol*>(
-                            ctx_.exprSymbol(*eg6397b)) != nullptr;
-            // fix #6447 (§28.2, §28.9, v0.338): the TWIN of the term in
-            // `lowerIEnumerableBuiltinFor`. Both `for`-in consumers derive
-            // `fieldLend` from the same two places and MUST agree — one arm
-            // answering `true` where its twin answers `false` gives the same
-            // program two reclamation verdicts depending on which overload
-            // its source type selects.
-            if (!fieldLend6397b)
-                fieldLend6397b = blockGetterReturnsFieldLend(ps6397b);
+            //
+            // fix #6447 (§28.2, §28.9, §29.2, v0.357): the TWIN of the arm in
+            // `lowerIEnumerableBuiltinFor`, and the same call. Both `for`-in
+            // consumers MUST agree — one arm answering `true` where its twin
+            // answers `false` gives the same program two reclamation verdicts
+            // depending on which overload its source type selects — so the
+            // verdict lives in one place, `propertyReadIsLend`.
             sourceIsNamedOwner =
-                sema::isAutoPropertyStorageSymbol(ps6397b, ctx_) ||
-                (fieldLend6397b && !minted6397b);
+                propertyReadIsLend(ps6397b, fs.iterable.get());
         }
     }
     // fix #6376 (§28.9, §29.1, §29.11, v0.338): could the enumerator BE the

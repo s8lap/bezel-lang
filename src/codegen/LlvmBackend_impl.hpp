@@ -8670,29 +8670,47 @@ private:
     // computedGetterOf above.
     const ast::PropertyAccessor* blockGetterOf(sema::Symbol* sym);
 
-    // fix #6447 (§28.2, §28.9, §29.2, v0.338): does this property's BLOCK-form
-    // getter hand back storage some holder already keeps alive — i.e. does
-    // EVERY `return` in its body denote a FIELD read, possibly reached through
-    // locals bound to field reads?
+    // fix #6447 (§28.2, §28.9, §29.2, v0.357): does this property's getter
+    // hand back storage some holder already keeps alive — is EVERY value it
+    // can return a PROVEN LEND (a field read, a local every one of whose
+    // definitions is a proven lend, a read of another property that lends, a
+    // call of a method whose plain class return §28.3 makes a receiver-sourced
+    // borrow), reached without any edge that can mint a §29.2 frame?
     //
-    // This is the block-bodied counterpart of the question `computedGetterOf`
-    // already answers for the expression-bodied spelling, and it is asked of
-    // the accessor's AST DIRECTLY rather than read out of
+    // One rule for both accessor spellings of §23.3 and for any number of
+    // hops, asked of the accessor's AST DIRECTLY rather than read out of
     // `propBlockGetterReturnKinds_`. Directness is the point: the map is
-    // written by whichever lowering face emitted the accessor, and the
-    // vtable/itable face (`ensurePropertyAccessorFn`) publishes no per-return
-    // verdict at all, so a map-keyed answer is structurally absent on the
-    // `virtual` / interface-dispatch spelling. Provenance through a body is a
-    // syntactic property of the body, so it has no reason to depend on the
-    // face that happened to lower it.
+    // written by whichever lowering face emitted the accessor, `lowerReturn`'s
+    // own test is one hop, and the vtable/itable face
+    // (`ensurePropertyAccessorFn`) publishes no per-return verdict at all.
+    // Provenance through a body is a syntactic property of the body, so it
+    // has no reason to depend on the face that happened to lower it.
     //
-    // FALSE IS ALWAYS THE SAFE ANSWER. Every caller feeds the verdict into
-    // `fieldLend && !minted` → `sourceIsNamedLocal`, whose FALSE branch
-    // registers the loop-end reclamation. So a wrong `true` can only cost a
-    // leak, never a use-after-free. It also declines outright on any face
-    // where §29.2's mint is never published, so `!minted` cannot veto — see
+    // `readTy` is the static type of the property READ. `hop` is false for
+    // the for-in source itself — whose return edge the consumer judges with
+    // the wrap creators' own published verdict (`minted`) — and true for a
+    // property reached from inside another getter, whose edges are judged
+    // from the types alone.
+    //
+    // FALSE IS ALWAYS THE SAFE ANSWER, in the sense that it changes nothing:
+    // every caller feeds the verdict into `fieldLend && !minted` →
+    // `sourceIsNamedLocal`, whose FALSE branch keeps the loop-end reclamation
+    // the consumer registered before this rule existed. A wrong `true` can
+    // only cost a leak, never a use-after-free. It declines where §29.2's
+    // mint is never published and cannot be ruled out from the types — see
     // the face guard at the definition.
-    bool blockGetterReturnsFieldLend(sema::Symbol* sym);
+    bool propertyGetterIsProvenLend(sema::PropertySymbol* ps,
+                                    const sema::TypeRef* readTy,
+                                    bool hop, unsigned depth);
+
+    // fix #6447 (§28.2, §28.9, §29.2, v0.357): the consumer's whole verdict
+    // on a property READ used as an iteration source — does the value in
+    // hand stay the holder's (a lend the consumer must NOT reclaim), or is it
+    // a frame §29.2 minted at the read, which the consumer owns? One rule,
+    // `isAuto || (lend && !minted)`, for every consumer that has to choose.
+    // `readNode` is the property read expression, already lowered.
+    bool propertyReadIsLend(sema::PropertySymbol* ps,
+                            const ast::Expr* readNode);
 
     // Emit (or retrieve cached) a standalone LLVM function for a block-form
     // property getter body (`get => do…end;`).  Calling it with `this` as the

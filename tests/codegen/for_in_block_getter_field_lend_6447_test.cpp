@@ -43,7 +43,7 @@
 // an answer, not an answer of "not a field". MEASURED: the DIRECT block
 // spelling — the shape #6397 did close — still UAF'd on both arms as soon as
 // the property was declared `virtual`, which no per-return-edge publisher can
-// ever reach. `blockGetterReturnsFieldLend` (LlvmBackend_Assign.cpp) therefore
+// ever reach. `propertyGetterIsProvenLend` (LlvmBackend_Assign.cpp) therefore
 // asks the accessor's own `stmts`, face-independently, the same way
 // `computedGetterOf` asks the expression body's face-independently.
 //
@@ -159,7 +159,7 @@ const char* kIfaceGetterTwoHops =
 //
 // Note this shape is the issue reporter's objection #2 verbatim, and it is
 // what the "every definition is a field read" rule in
-// `blockGetterReturnsFieldLend` exists to answer.
+// `propertyGetterIsProvenLend` exists to answer.
 const char* kSelfAGetterReassigned =
     "public class HolderH "
     "  private owned _a: SelfA; "
@@ -182,7 +182,7 @@ const char* kSelfAGetterExpression =
 // returns a value that is not the property's declared type, so §29.2's
 // wrap-creator mints a FRAME the reader owns and the holder must not. This is
 // the row that caught this fix's own first draft: an earlier version of
-// `blockGetterReturnsFieldLend` claimed the lend here, and because the
+// `propertyGetterIsProvenLend` claimed the lend here, and because the
 // vtable face publishes no mint at all (`gk == 0` measured) the `!minted`
 // term could not override it, so the loop withdrew its reclamation of a frame
 // it owns — MEASURED on that draft:
@@ -250,7 +250,13 @@ BEZEL_TEST(for_in_block_getter_field_lend_6447,
 // §29.2's mint on that face, which `kPropGetterReturnMint`'s second reader
 // (the #6405 arm of `registerIterableSourceDisposal`) makes a separate change
 // with its own oracle. Tracked on issue #6487; see the face guard at
-// `blockGetterReturnsFieldLend` for the measurement.
+// `propertyGetterIsProvenLend` for the measurement.
+//
+// What remains open is the BUILTIN-headed `virtual` property (`IEnumerable<T>`,
+// `Array<T>`): an override may widen there, so no static claim about the body
+// holds. A `virtual` property declared at a USER class cannot widen (§29.2's
+// mint needs a builtin-headed declared type), and its rows are pinned in
+// `for_in_getter_proven_lend_hops_6447`.
 // ===========================================================================
 
 // ===========================================================================
