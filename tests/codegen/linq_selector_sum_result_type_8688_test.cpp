@@ -253,7 +253,7 @@ BEZEL_TEST(codegen_linq_selector_sum_result_type_8688,
     expectPrints(r, "10000000000000000001\n");
 }
 
-// The `string` receiver (stdlib §9.6, `IEnumerable<char>`), `long` selector.
+// The `string` receiver (stdlib §9.6; `IEnumerable<char>`, §4.12), `long` selector.
 // PARENT: 1705032704.
 BEZEL_TEST(codegen_linq_selector_sum_result_type_8688,
            string_receiver_long_selector_is_not_truncated_stdlib_5) {

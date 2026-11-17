@@ -3581,9 +3581,9 @@ void ExprTC::resolveMemberAccessWithRule1(const ast::MemberAccessExpr& ma) {
         // flag, which left the six collection INTERFACE heads' inherited
         // `Count` PROPERTY unrefused: `c.Count()` on an `IList<int>` was
         // typed `int` and answered the element count, where the same call on
-        // the concrete `Array<int>` is refused. stdlib §1's "Block-by-name"
-        // row commits the lookup to instance members BY NAME — "inherited
-        // ones included" — so the `Count` PROPERTY `IList<T>` inherits from
+        // the concrete `Array<int>` is refused. The
+        // stdlib §1 "Block-by-name" row commits the lookup to instance
+        // members BY NAME — "inherited ones included" — so the `Count` PROPERTY `IList<T>` inherits from
         // `IReadOnlyCollection<T>` (stdlib §4.1) blocks the §5 `Count()`
         // operator exactly as `Array<T>`'s own `Count` does.
         TypeRef* recvTy = currentCallArity_ == 0 ? ctx_.exprType(*ma.target)

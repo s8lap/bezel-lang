@@ -190,7 +190,8 @@ Prog prog(const std::string& recvDecl, const std::string& call) {
     return Prog{src, 6};
 }
 
-// The owning family (stdlib §4.2): the receiver is an `OwningArray<Box>`
+// The owning family (stdlib §4.2; `OwningArray<T>`, §4.5): the receiver is an
+// `OwningArray<Box>`
 // viewed through one of the owning collection interfaces. The element is a
 // class, so the owning collection disposes it at scope end.
 Prog owningProg(const std::string& recvDecl, const std::string& call) {
@@ -211,7 +212,7 @@ Prog owningProg(const std::string& recvDecl, const std::string& call) {
 }  // namespace
 
 // ===========================================================================
-// stdlib §4.1 — the BORROWING collection interfaces. The `Count` PROPERTY is
+// stdlib §4.1 — the BORROWING collection interfaces. The Count PROPERTY is
 // inherited from `IReadOnlyCollection<out T>` (stdlib §4.1), so the CALL
 // spelling has no candidate.
 // ===========================================================================

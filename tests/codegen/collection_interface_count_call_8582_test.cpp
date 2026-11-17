@@ -42,8 +42,9 @@
 // property-call refusal, which fires BEFORE codegen is reached. The
 // committed member on these three heads is the INHERITED `Count` PROPERTY
 // (stdlib §4.1: "pure readonly property Count: int" on
-// `IReadOnlyCollection<out T>`), stdlib §1's "Block-by-name" row commits the
-// lookup to instance members BY NAME — "inherited ones included" — and a
+// `IReadOnlyCollection<out T>`); the
+// stdlib §1 "Block-by-name" row commits the lookup to instance members BY
+// NAME — "inherited ones included" — and a
 // property of a non-function type is not callable (§27.1, §27.7): the call
 // has no candidate. Codegen's #853 fence remains as the backstop for the
 // shapes sema does not type, but the message the user sees is the sema one,
