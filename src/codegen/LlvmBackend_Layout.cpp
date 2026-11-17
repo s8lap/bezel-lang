@@ -4297,6 +4297,54 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             rt = const_cast<sema::TypeRef*>(sub);
         }
     }
+    // fix #8593 (§12.7 "A nullable target tests as its underlying type" /
+    // §17.4 "`as` on value types", v0.357): the TARGET's nullability does
+    // not change WHAT the test looks for. §12.7: "`x is T?` has the answer
+    // of `x is T` and narrows as it does … and `x as T?` is `x as T`" — so a
+    // nullable target is tested and unboxed as its UNDERLYING type.
+    //
+    // `rtBase` is that underlying type: the target with its nullability
+    // stripped. It is the ONE place the stripping happens, so the descriptor
+    // lookup and the unbox gate below cannot disagree about it.
+    //
+    // WHY IT MATTERS. A NULLABLE VALUE-BUILTIN target (`Guid?`, `DateTime?`,
+    // `TimeSpan?`, `DateOnly?`, `TimeOnly?`) is the one target shape whose
+    // BOXABILITY the nullability changed: `valueBuiltinBoxName` deliberately
+    // EXCLUDES a nullable source ("a `DateTime?` → Object box is a separate
+    // shape"), so `isBoxableValueType(Guid?)` was FALSE and
+    // `boxDescriptorFor(Guid?)` resolved NO descriptor (the value-builtin's
+    // descriptor is keyed by the NON-nullable name, and a builtin class sym is
+    // not in `descArray_`). The two consequences were both SILENT wrong
+    // answers (issue #8593):
+    //   * `as` — the unbox arm was gated on `isBoxableValueType(rt)`, so
+    //     `g as Guid?` fell through to the REFERENCE-target arm and produced
+    //     a POINTER where the `Guid?` slot wanted the tagged
+    //     `{i8 hasValue; Guid}` carrier. The store into the local then failed
+    //     and `lowerLocalDecl` degraded the local to a zero-initialized
+    //     value (its #2434 "failed to lower" warning), so `x <> null` read
+    //     `False` where §17.4 requires `True`.
+    //   * `is` — with no descriptor the test hit the #2775 "dropped" bail:
+    //     the test produced nothing, and the enclosing statement degraded the
+    //     same way (the #3079 "failed to lower" warning, no answer at all).
+    //
+    // The box itself is unaffected: a `Guid?` boxed into an `Object` carries
+    // the UNDERLYING type's descriptor (the §8.6 nullable-value-type box
+    // vtable), so resolving the target to the underlying type's descriptor
+    // is exactly the tag the box carries.
+    sema::TypeRef rtBase = *rt;
+    rtBase.nullable = false;
+    // The ONE boxability decision for this target, on its UNDERLYING type
+    // (§12.7, above). `isBoxableValueType(rt)` already answers the same for
+    // every target except the NULLABLE VALUE-BUILTIN family, whose
+    // `valueBuiltinBoxName` entry the nullability removes — so the extra
+    // disjunct is scoped to that family and changes no other target's
+    // lowering. Both `as` arms below read this one definition, so the
+    // reference-target fallback and the unbox arm cannot disagree about
+    // whether the target is a boxable value type.
+    const bool targetIsBoxableValue =
+        isBoxableValueType(rt) ||
+        (rt->nullable && valueBuiltinName(rt) != nullptr &&
+         isBoxableValueType(&rtBase));
 
     // fix #2775 (§8.6/§12.7/§19.3, v0.240): SILENCE AMPLIFIER. Every
     // `return nullptr` below is not "an error we recover from" — lowerIf turns
@@ -4441,7 +4489,7 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                 obj, llvm::ConstantPointerNull::get(ptrTy()), "is.str.nonnull");
         if (te.op == "is") return holds;
         if (te.op == "is not") return builder_.CreateXor(holds, builder_.getInt1(true));
-        if (!instance && isBoxableValueType(rt) &&
+        if (!instance && targetIsBoxableValue &&
             rt->kind != sema::TypeRef::Kind::Unit) {
             sema::TypeRef tmp = *rt;
             tmp.nullable = true;
@@ -4576,6 +4624,17 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // setupBoxDescriptors — this is what makes `o is Rect` / `o is int`
     // recognize a boxed value (findings 06/08/12/13).
     llvm::GlobalVariable* targetDesc = boxDescriptorFor(rt);
+    // fix #8593 (§12.7, v0.357): a NULLABLE target tests as its underlying
+    // type, so a nullable target with no descriptor of its own resolves the
+    // UNDERLYING type's — the descriptor the box actually carries (§8.6's
+    // nullable-value-type box vtable). This is a FALLBACK, not a rewrite:
+    // `boxDescriptorFor(rt)` still wins whenever the nullable target has a
+    // descriptor of its own (a nullable primitive keeps its `primBoxDesc_`
+    // entry, a nullable record keeps its `descArray_` entry), so every other
+    // target's descriptor — and therefore every other type test — is
+    // unchanged.
+    if (!targetDesc && rt->nullable)
+        targetDesc = boxDescriptorFor(&rtBase);
     if (!targetDesc) {
         // Reference types declared inline still resolve via descArray_.
         if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration) {
@@ -5255,7 +5314,20 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         // change makes the boxing and type-TEST directions correct and leaves
         // the unbox untouched, rather than inventing a `()?` representation.
         // Filed separately; it is the unit twin of #2911's `x as [N]T`.
-        if (isBoxableValueType(rt) && rt->kind != sema::TypeRef::Kind::Unit) {
+        //
+        // fix #8593 (§12.7 "A nullable target tests as its underlying type" /
+        // §17.4 "`as` on value types", v0.357): the boxability of the TARGET
+        // is decided on its UNDERLYING type (`targetIsBoxableValue`, above) —
+        // §12.7: "`x as T?` is `x as T`". The only target shape whose
+        // boxability the nullability changed is the NULLABLE VALUE-BUILTIN
+        // (`Guid?`, `DateTime?`, …): `valueBuiltinBoxName` excludes a nullable
+        // source, so `isBoxableValueType(Guid?)` was FALSE and `g as Guid?`
+        // fell through to the REFERENCE-target arm below — a pointer where
+        // the `Guid?` slot wants the tagged `{i8 hasValue; Guid}` carrier,
+        // which degraded the destination local to a zero-initialized value
+        // (#2434's warning) and made `x <> null` read `False`.
+        if (targetIsBoxableValue &&
+            rt->kind != sema::TypeRef::Kind::Unit) {
             // §17.4: the result of `as` is ALWAYS nullable, so the target may be
             // written either bare (`o as int`) or already-nullable (`o as int?`).
             // The box stores the BARE value bytes, and the result struct built
@@ -5265,8 +5337,10 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             // (`int?`/`Rec?`) made `valTy` the {i8, T} struct, so the load read a
             // {i8,T} and the wrap below inserted that {i8,T} into the T slot of
             // another {i8,T} → malformed insertvalue (issue #1154).
-            sema::TypeRef rtBase = *rt;
-            rtBase.nullable = false;
+            //
+            // `rtBase` is the function-scope copy (the target with its
+            // nullability stripped, #8593 above) — the same underlying type
+            // the boxability decision was made on.
             llvm::Type* valTy = lowerTypeRef(&rtBase);
             auto* loadBB = llvm::BasicBlock::Create(llvm_, "unbox.load",
                                                     currentFn_);
