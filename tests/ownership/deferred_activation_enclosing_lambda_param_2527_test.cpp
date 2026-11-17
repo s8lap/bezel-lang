@@ -24,8 +24,9 @@
 // equivalent METHOD-level shape (which IS observable) and verify the fix does
 // not regress the deferred-activation capture-set check on either axis:
 // (a) the FIX keeps the existing rejection of a method-level `owned` param
-//     captured by a forwarded lambda (the `owned_param_capture_rejected` row
-//     in the sibling 1818 suite), so no over-admit; and
+//     captured by a forwarded lambda (`method_level_owned_param_capture_still_rejected`
+//     below, which absorbed the 1818 suite's `owned_param_capture_rejected`), so no
+//     over-admit; and
 // (b) the FIX keeps every ACCEPT in the sibling 1818 suite green, so no
 //     over-reject — particularly the §28.3 ruling that a PLAIN (borrow)
 //     parameter forwarded into a deferred-activation frame is admitted

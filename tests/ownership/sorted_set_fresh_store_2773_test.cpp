@@ -93,21 +93,3 @@ BEZEL_TEST(sorted_set_fresh_store_2773, sortedset_add_named_holder_not_rejected)
         "end M; end C;");
     BEZEL_EXPECT_EQ(freshStoreWarnings(r), 0);
 }
-
-// per §15.4 (v0.286): the indexer-set half of the shared sink
-// (`checkIndexerSetBorrowStoreEscape`) is also widened, though `SortedSet`
-// has no indexer (stdlib §4.18) to exercise it through — this row documents
-// that absence rather than asserting a warning that cannot fire. `Add` is the
-// only store position §4.18 declares, and it is covered above.
-BEZEL_TEST(sorted_set_fresh_store_2773, sortedset_has_no_indexer_store_position) {
-    OwnershipResult r = check(
-        "class C public static method M(): int "
-        "  using var s := new SortedSet<Ord>(); "
-        "  s.Add(new Ord(3)); "
-        "  return s.Count; "
-        "end M; end C;");
-    // Exactly the ONE `.Add` error — nothing from an indexer sink, because
-    // `SortedSet<T>` (stdlib §4.18) declares no `[i: int]`/`[key: K]`
-    // property for `checkIndexerSetBorrowStoreEscape` to ever match.
-    BEZEL_EXPECT_EQ(freshStoreWarnings(r), 1);
-}

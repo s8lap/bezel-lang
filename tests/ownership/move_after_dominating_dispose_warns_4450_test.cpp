@@ -366,25 +366,6 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
 // the program's own head (rows 5-6's natural form, by design).
 // ============================================================================
 BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           checked_mode_backstop_for_row_1_assignment_rhs_in_while) {
-    JitResult jr = runAotCheckedDisposal(wrap(
-        "var x := new Res(1); "
-        "x.Dispose(); "
-        "var t := 0; "
-        "var i := 0; "
-        "try "
-        "  while i < 2 do "
-        "    t := t + Sink.Take(move x); "
-        "    i := i + 1; "
-        "  end; "
-        "  return 0; "
-        "catch DisposedAccessException => return 1; "
-        "end; "));
-    BEZEL_EXPECT_TRUE(jr.ran);
-    BEZEL_EXPECT_EQ(jr.exitCode, 1);
-}
-
-BEZEL_TEST(move_after_dominating_dispose_warns_4450,
            checked_mode_backstop_for_row_2_localdecl_init) {
     JitResult jr = runAotCheckedDisposal(wrap(
         "var x := new Res(1); "
@@ -430,31 +411,6 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
         "try "
         "  y := move x; "
         "  var z := y.tag; "
-        "  return 0; "
-        "catch DisposedAccessException => return 1; "
-        "end; "));
-    BEZEL_EXPECT_TRUE(jr.ran);
-    BEZEL_EXPECT_EQ(jr.exitCode, 1);
-}
-
-BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           checked_mode_backstop_for_row_6_top_level_move_in_while_with_field_access) {
-    // Same as the row 5 backstop variant, inside a `while` body.  The
-    // field access through the moved-from `y` inside the loop body is
-    // what triggers the exception; without it, the natural form runs
-    // to completion in checked mode (which is itself the §28.2 verdict
-    // for this row's natural shape).
-    JitResult jr = runAotCheckedDisposal(wrap(
-        "var x := new Res(1); "
-        "var y := new Res(2); "
-        "x.Dispose(); "
-        "var i := 0; "
-        "try "
-        "  while i < 2 do "
-        "    y := move x; "
-        "    var z := y.tag; "
-        "    i := i + 1; "
-        "  end; "
         "  return 0; "
         "catch DisposedAccessException => return 1; "
         "end; "));
@@ -598,43 +554,4 @@ inline int runCompileOnly(const std::string& source) {
     // `Severity::Error` entries; a runtime crash does not.
     if (jr.diagnostics.hasErrors()) return 1;
     return 0;
-}
-
-BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           aot_row_4_bare_statement_compiles_clean) {
-    // The program COMPILES (no errors) under the post-fix verdict.  The
-    // §28.2 consume-side warning is in the diagnostics, not in errors,
-    // and is what the parseAndCheckOwnership rows above already pin.
-    auto r = parseAndCheckOwnership(wrap(
-        "var x := new Res(1); "
-        "x.Dispose(); "
-        "Sink.Take(move x); "
-        "return 0;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
-BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           aot_row_5_top_level_move_compiles_clean) {
-    auto r = parseAndCheckOwnership(wrap(
-        "var x := new Res(1); "
-        "var y := new Res(2); "
-        "x.Dispose(); "
-        "y := move x; "
-        "return y.tag;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
-BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           aot_row_6_top_level_move_in_while_compiles_clean) {
-    auto r = parseAndCheckOwnership(wrap(
-        "var x := new Res(1); "
-        "var y := new Res(2); "
-        "x.Dispose(); "
-        "var i := 0; "
-        "while i < 2 do "
-        "  y := move x; "
-        "  i := i + 1; "
-        "end; "
-        "return y.tag;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

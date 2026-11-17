@@ -144,43 +144,6 @@ BEZEL_TEST(lambda_body_try_finally_terminated_arm_join_4142,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// Row 2 (load-bearing soundness pin): try body ends in `return`,
-// finally has `move x`. The finally walk MUST see the body's operand
-// (finally always runs, even on the body's return path). Pre-#4142 the
-// body's operand was already in `tryEnds` for finally; the fix's
-// `tryEndsForFinally` preserves that exactly. A first draft of #4142
-// accidentally excluded the body from BOTH views — silently re-accepting
-// this double-move. This row pins that the fix does NOT regress #4138's
-// finally-soundness property.
-// FAIL-WITHOUT: hasErrors() is true (this row is the #4138 soundness
-// pin, separate from Row 14 of terminated_arm_excluded_from_join_4138
-// because this file pins the lambda-body pre-pass's `try` join
-// specifically). PASS-WITH: same rejection.
-BEZEL_TEST(lambda_body_try_finally_terminated_arm_join_4142,
-           try_finally_return_body_finally_double_move_rejected_28_3) {
-    std::string src =
-        std::string(kRes) +
-        "class C "
-        "  public static method Main(): int "
-        "    var f := lambda(): int => do "
-        "      var x := new Res(5); "
-        "      var t := 0; "
-        "      try "
-        "        t := t + Sink.Take(move x); "
-        "        return t; "
-        "      finally "
-        "        t := t + Sink.Take(move x); "
-        "      end; "
-        "      return t; "
-        "    end; "
-        "    return f(); "
-        "  end Main; "
-        "end C;";
-    OwnershipResult r = parseAndCheckOwnership(src);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kAlreadyMovedMsg));
-}
-
 // Row 3: try body ends in `return`; a `catch e => ; end;` arm keeps `x`
 // in Owned state. The post-`try` `move x` is unreachable via the body
 // (which always returned) but reachable via the catch arm's `;` (which

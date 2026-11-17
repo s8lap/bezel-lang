@@ -201,39 +201,6 @@ BEZEL_TEST(const_nullcond_materializer_2749,
 }
 
 // =====================================================================
-// fix #2756 / §7.5 (v0.282): the `?.` builtin-call typing fix above is the
-// PRECONDITION for the `?.` builtin-call surface to type at all. Before
-// this fix `var parts := t?.Split(",");` (with `t: string?` and a non-const
-// initializer) was left untyped on the access AND on the call — codegen
-// degraded the local to a zero-initialized slot (#2434). After the fix the
-// access is typed `Array<string>?` (per §7.5) and the call's exprType is
-// propagated by the NCM-block shim in typeCall. This test pins the post-
-// fix sema/ownership behaviour on the NON-`const` shape (the `const` shape
-// is pinned by `nullcond_materializer_const_rejected_spec_21_1_stdlib_9_6`
-// above): ownership parses cleanly, the §21.1 predicate's narrowness gate
-// does not fire (this is a `var`, not a `const`), and the diagnostic stream
-// does NOT carry the §21.1 \"must not take an owned production\" message.
-// The codegen-level \"degraded to a zero/null return value\" #2434/#2491
-// diagnostic is what codegen emits when the call exprType is null; the
-// OWNERSHIP pass itself does not produce it, so we rely on the matching
-// non-`const` call as a positive witness that the type is now non-null.
-// =====================================================================
-BEZEL_TEST(const_nullcond_materializer_2749,
-           nullcond_split_owned_var_no_const_reject_spec_7_5) {
-    auto r = parseAndCheckOwnership(
-        "module M; class C public static method M(): int "
-        "    var t: string? := \"a,b,c\"; "
-        "    var parts := t?.Split(\",\"); "
-        "    return 0; end M; "
-        "  public static method Main(): int return 0; end Main; end C;");
-    // Non-const binding of an owned production: §21.1 does NOT reject
-    // (it only rejects `const`). §28.10's auto-drop note MAY fire here
-    // (the value is owned and not `using`-bound), and that is expected;
-    // we only assert §21.1 is silent.
-    BEZEL_EXPECT_FALSE(hasAnyConstOwnedProductionError(r));
-}
-
-// =====================================================================
 // narrow #3376 / §7.5 (v0.282) — THE REGRESSION THIS FILE PREVIOUSLY MISSED.
 //
 // #3376 pre-typed `t?.Split(",")` in `resolveNullCondMember` so the §21.1

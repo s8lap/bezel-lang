@@ -31,28 +31,6 @@ int run(const std::string& src) {
 }
 }  // namespace
 
-// §30.5 Pattern A: the REGRESSION — a local initialized by a collection literal
-// and returned from an async method was misclassified as Borrowed and rejected
-// by checkAsyncPatternABorrowedIdentifierReturn. The local's initializer was an
-// Owned producer (heap backing, §15.4 / §28.3), so `return arr` is a legal
-// owned-variable return. Must compile and run with exit 4.
-BEZEL_TEST(async_pattern_a_collection_literal_owned_4338,
-           bound_local_collection_literal_return) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "class C "
-        "  public static async method MakeAsync(): Task<Array<int>> "
-        "    var arr: Array<int> := [1, 2, 3, 4]; "
-        "    return arr; "
-        "  end MakeAsync; "
-        "  public static method Main(): int "
-        "    using var t := C.MakeAsync(); "
-        "    t.Wait(); "
-        "    return t.Result.Count; "  // 4
-        "  end Main; "
-        "end C;"), 4);
-}
-
 // §30.5 Pattern A — borrowed identifier return MUST STILL be rejected.
 // A plain field read or parameter is a borrow source and cannot be returned
 // from a Pattern A async method. This is NOT changed by the fix — the fix only

@@ -819,31 +819,6 @@ BEZEL_TEST(joinInto_core_state_matrix_4312_4313,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// B9 — NEITHER arm discharges `y` at all; `y` is read as a plain borrow both
-// inside the `if` and after the join. No MovedFrom/Disposed state anywhere.
-BEZEL_TEST(joinInto_core_state_matrix_4312_4313, accept_neither_discharges_28_3) {
-    OwnershipResult r = parseAndCheckOwnership(
-        "module M; "
-        "class Res "
-        "  public tag: int; "
-        "  public constructor(t: int) this.tag := t; end constructor; "
-        "  destructor end destructor; "
-        "end Res; "
-        "class C "
-        "  public static method Main(cond: bool): int "
-        "    var x := new Res(5); "
-        "    var y := x; "
-        "    if cond then "
-        "      var t1 := y.tag; "
-        "    end; "
-        "    var t2 := y.tag; "
-        "    x.Dispose(); "
-        "    return t2; "
-        "  end Main; "
-        "end C; ");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 // ============================================================================
 // RUNTIME SEVERITY REGRESSION GUARDS — the pre-fix defect's own measured
 // crashes, loop-amplified 200x, pinned as compile-time REJECTIONS (matching

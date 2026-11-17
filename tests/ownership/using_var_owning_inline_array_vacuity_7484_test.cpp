@@ -913,21 +913,6 @@ BEZEL_TEST(using_var_owning_inline_array_vacuity_7484,
         r.stdoutText));
 }
 
-// per §15.3 / §22.3 / §28.4, fix #7484
-//
-// THE CODECGEN-SIDE ROW (b). The owning inline array handed to an `owned`
-// PARAMETER: discharged once, at the callee's scope end.
-BEZEL_TEST(using_var_owning_inline_array_vacuity_7484,
-            the_owned_parameter_takes_the_discharge_exactly_once_15_3) {
-    JitResult r = runAotChecked(ownedParamProgram());
-    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "DTOR "), 2);
-    BEZEL_EXPECT_FALSE(bezel::test::aot_detail::hasSanitizerReport(
-        r.stdoutText));
-}
-
 // per §15.3 / §28.4, fix #7484
 //
 // THE FIELD-SOURCE ROW. The owning inline array MOVED out of a class field

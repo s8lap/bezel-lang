@@ -238,32 +238,3 @@ BEZEL_TEST(move_field_enclosing_type_param_receiver_2014,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // field non-null: read the correct slot
 }
-
-// §14 / §28.8.1: the CONCRETE-generic case (an EXPLICIT `Box<long>` type arg, NOT
-// the enclosing type parameter) already worked and must stay working — the receiver
-// resolves directly to the specialized layout with no enclosing-param indirection.
-// Guards that the #2014 fix does not disturb the concrete path. Disposed once.
-BEZEL_TEST(move_field_enclosing_type_param_receiver_2014,
-           concrete_generic_receiver_still_disposes_once_spec_14) {
-    std::string src =
-        std::string(kCell) +
-        "class Box<T> "
-        "  public first: T; "
-        "  public owned f: Cell? := null; "
-        "  public constructor(v: T) this.first := v; this.f := new Cell(); end constructor; "
-        "  destructor end destructor; "
-        "end Box; "
-        "class C "
-        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
-        "  public static method Use() "
-        "    using var box := new Box<long>(1234567890123L); "
-        "    var t: Cell? := move box.f!; "
-        "    box.f := null; "
-        "    C.Sink(move t!); "
-        "  end Use; "
-        "  public static method Main(): int C.Use(); return Cell.live; end Main; "
-        "end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-}

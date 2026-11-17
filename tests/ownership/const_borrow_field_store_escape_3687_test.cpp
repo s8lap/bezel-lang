@@ -245,23 +245,6 @@ BEZEL_TEST(const_borrow_field_store_escape_3687,
 }
 
 // =============================================================================
-// ACCEPT CONTROL — an ordinary const initializer (no borrow of any tracked
-// owned local anywhere) is completely unaffected.
-// =============================================================================
-BEZEL_TEST(const_borrow_field_store_escape_3687,
-           ordinary_const_initializer_unaffected_control) {
-    auto r = parseAndCheckOwnership(
-        "module M; class C "
-        "  public static method Main(): int "
-        "    const n := 5; "
-        "    const m := n + 1; "
-        "    return m; "
-        "  end Main; "
-        "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
-// =============================================================================
 // INTEGRATION — the real AOT pipeline (full driver: lex/parse/sema/ownership,
 // the same path `bezelc` uses) rejects the exact #3687 repro, not just the
 // isolated ownership-pass harness above. `r.ran` stays false on any

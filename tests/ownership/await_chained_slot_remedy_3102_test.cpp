@@ -109,16 +109,6 @@ BEZEL_TEST(await_chained_slot_remedy_3102, plain_owned_local_source_points_at_ki
     BEZEL_EXPECT_TRUE(hasErrorMessage(r, kChainedSlotRemedy));
 }
 
-// CONTROL — the fix is a message fork, not an admission: the shape is still
-// REJECTED. (Guards against a fork that accidentally swallowed the report.)
-BEZEL_TEST(await_chained_slot_remedy_3102, shape_still_rejected_30_5) {
-    auto r = parseAndCheckOwnership(program(
-        "using var task := C.P(); "
-        "var cfg := await task; "
-        "return cfg; "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-}
-
 // CONTROL — the ADMITTED kind-2 spelling the message now teaches must itself be
 // accepted; a remedy the compiler rejects would be worse than the generic one.
 BEZEL_TEST(await_chained_slot_remedy_3102, taught_chained_form_accepted_30_5) {

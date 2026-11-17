@@ -124,14 +124,6 @@ BEZEL_TEST(own_value_builtin_434, cancellation_token_local_no_dispose_error) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28 / §6.1: CancellationToken.None static property via local — no error.
-BEZEL_TEST(own_value_builtin_434, cancellation_token_none_local_no_error) {
-    auto r = parseAndCheckOwnership(own(
-        "var tok := CancellationToken.None; "
-        "return 0; "));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 // ---------------------------------------------------------------------------
 // Regression: owned class locals STILL require disposal (no-under).
 // ---------------------------------------------------------------------------

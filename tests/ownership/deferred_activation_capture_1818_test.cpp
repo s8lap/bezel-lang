@@ -148,19 +148,6 @@ BEZEL_TEST(deferred_activation_capture_1818, direct_return_owned_local_rejected)
     BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
 }
 
-// An `owned` PARAMETER is a live owned obligation the method disposes at exit
-// (§28.3 auto-drop). A lambda capturing it, whose frame escapes (returned),
-// would dangle after that disposal — rejected. (The owned param also draws the
-// ordinary must-use auto-drop WARNING, but the capture-set error is the
-// load-bearing diagnostic pinned here.) // per §28.3, §28.14
-BEZEL_TEST(deferred_activation_capture_1818, owned_param_capture_rejected) {
-    auto r = parseAndCheckOwnership(wrap(
-        "var q := Doubled(nums, lambda(x) => s.Apply(x)); "
-        "return q;",
-        "method M(nums: Array<int>, owned s: Scaler): IEnumerable<int>"));
-    BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
-}
-
 // ===========================================================================
 // ADMIT — the reduction's exemptions and the non-escaping positions. Each must
 // compile clean (guards the over-rejection risk the T2 reduction targets).
@@ -719,7 +706,8 @@ BEZEL_TEST(deferred_activation_capture_1818, async_awaited_in_scope_accepted) {
 // expression body cannot declare a `using var`, so the escaping-capture shape it
 // admits is a captured `owned` PARAMETER — a live owned obligation the method
 // disposes at scope exit (§28.3 auto-drop) — the direct `=>` analog of the
-// block-body `owned_param_capture_rejected` test. Before this parity fix
+// block-body `owned_param_capture_rejected` case (now pinned by
+// deferred_activation_enclosing_lambda_param_2527.method_level_owned_param_capture_still_rejected). Before this parity fix
 // `runExprBodyOwningReturnCheck` never seeded `methodParamSet_`, so
 // deferredActivationCaptureSources classified EVERY parameter capture as
 // lambda-internal and the owned-param capture was silently admitted on the `=>`
@@ -757,7 +745,8 @@ std::string exprWrap(const std::string& exprBody, const std::string& sig) {
 
 }  // namespace
 
-// ★ Primary T8 regression: the expr-body analog of `owned_param_capture_rejected`.
+// ★ Primary T8 regression: the expr-body analog of `owned_param_capture_rejected`
+// (the block-body case, pinned in deferred_activation_enclosing_lambda_param_2527_test.cpp).
 // The lambda `(x) => s.Apply(x)` captures the `owned` parameter `s` — a live owned
 // obligation the method disposes at scope exit — and the `=>` body returns the
 // `Doubled` frame carrying it, so the frame escapes `s`'s scope. Rejected with the
