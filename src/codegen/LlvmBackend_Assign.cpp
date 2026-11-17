@@ -6727,10 +6727,16 @@ bool Emitter::propertyGetterIsProvenLend(sema::PropertySymbol* ps,
     // `T` -> `T`: one type under every substitution, so no conversion and no
     // §29.2 mint. On a non-generic owner the two types are the same.
     const sema::TypeRef* declTy = readTy;
-    if (const auto* pdecl = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
+    // SEAM-ACCESSOR: both-sources read — a LOCAL property's declared type is
+    // its PropertyDecl's; an IMPORTED one has no decl and takes the loader's
+    // `importedMemberType` side table (§2.8.2, v0.357).
+    if (const auto* pdecl = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
         if (pdecl->type)
             if (const sema::TypeRef* dt = ctx_.resolvedType(*pdecl->type))
                 declTy = dt;
+    } else if (const sema::TypeRef* it = ctx_.importedMemberType(ps)) {
+        declTy = it;
+    }
 
     std::function<bool(const ast::Expr*, unsigned)> lendExpr =
         [&](const ast::Expr* e, unsigned d) -> bool {
