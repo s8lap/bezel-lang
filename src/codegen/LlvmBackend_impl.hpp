@@ -22096,13 +22096,41 @@ private:
     // candidates.
     std::unordered_set<const void*> closureLocalCandidates_;
     // fix #4422 (§27.5, v0.298): closure-typed locals that were reassigned
-    // via lowerClosureLocalReassign. For these locals, the scope-end release
-    // is suppressed (ClosureEscapeWalker marks any reassigned local as escaped),
-    // so the slot's final value is never released unless the call site emits
-    // a release. Tracked so the LocalSymbol arm in emitClosureCall can emit
-    // emitClosureRelease only for reassigned locals, avoiding a double-release
-    // for non-reassigned locals (whose scope-end release is already correct).
+    // via lowerClosureLocalReassign. Read by the LocalSymbol arm in
+    // emitClosureCall, whose call-site release is — since fix #8480 — only
+    // the FALLBACK for a reassigned local that has no scope-end release
+    // armed (see `closureEscapingScopeEndRelease_` below).
     std::unordered_set<const void*> closureLocalReassigned_;
+    // fix #8480 / fix #8479 (§28.9, v0.357): closure-typed locals of the
+    // analyzed body whose slot owns one reference at every point AND whose
+    // value can leave the frame — a `return` of the local, a field or
+    // collection store, a bind into a non-owning local:
+    //   - a local the body ASSIGNS TO (the bind's reference, then each
+    //     `lowerClosureLocalReassign` store's);
+    //   - an owned alias (`closureAliasOwned_`), assigned to or not;
+    //   - a local an owned alias that is not itself confined was bound from.
+    // That reference is released at SCOPE END like any other owned local's —
+    // but the local is not "non-escaping", so it must stay out of
+    // `closureReleaseEligible_` (which `collectCellFreeEligible` reads as
+    // "the closure does not outlive the scope" and frees its capture cells
+    // on). Four consumers:
+    //   - `lowerLocalDecl` registers the scope-end `bz_closure_release`
+    //     (no capture-cell free);
+    //   - `returnedClosureLocalOwnsPlusOne` answers FALSE, so `return f;`
+    //     mints the caller's reference;
+    //   - `lowerReturn` keeps the local's scope-end release on the return
+    //     edge instead of erasing it (the mint above pairs with it);
+    //   - `emitClosureCall` reads it as "scope-end release armed" and emits
+    //     no call-site release.
+    // For these locals this replaces the #4422 / #4434 call-site release
+    // (`emitClosureCall` released the slot's reference after the first
+    // LEXICAL call of a reassigned local, which freed a function value the
+    // slot still named whenever the slot was used again: a call site inside
+    // a loop, a second use, a `return` after the call). Keyed by the
+    // declaration node; the verdict is rewritten each time
+    // `collectClosureReleaseEligible` walks the declaring body, and a nested
+    // lambda's own re-scan leaves the enclosing body's entries alone.
+    std::unordered_set<const void*> closureEscapingScopeEndRelease_;
     // fix #4434 (§27.5 / §28.9, v0.298): closure-typed locals whose slot is
     // captured by a downstream lambda (the slot lives in `cellVars_` — a heap
     // cell, not a bare ptr). The envdtor's release is the sole owner of the
@@ -22115,9 +22143,11 @@ private:
     //       AND SKIP the scope-end `boxedCellFree` registration in
     //       consumeLastLambdaCapturedCells (the envdtor is the only owner;
     //       scope-end would double-free alongside it).
-    //   (c) reassigned AND plain (not captured-cell): existing #4422
-    //       call-site discipline — first call emits release, multi-call
-    //       arms scope-end release and skips call-site (the lane-34 gate).
+    //   (c) reassigned AND plain (not captured-cell): the slot's reference
+    //       is released at scope end (fix #8480; see
+    //       `closureEscapingScopeEndRelease_` above). The #4422 call-site
+    //       release remains only for a reassigned local with NO scope-end
+    //       release armed.
     // `closureLocalCapturedCellReassigned_` is the subset of this set whose
     // decl was ALSO observed reassigned by the walker — that pair is the
     // condition consumeLastLambdaCapturedCells consults to skip its cell-
@@ -22165,23 +22195,24 @@ private:
     // still emitted) but NOT in `closureBorrowRetainEligible_`, so its +1
     // simply leaks — the safe direction.
     std::unordered_set<const void*> closureBorrowRetainEligible_;
-    // fix #8440 (§27.5 / §28.9, v0.357): every closure local that is bound
-    // from a BORROWED read of another function value (`var cmp := g;` — a
-    // local, a parameter, a field, an array element) AND is assigned to
-    // somewhere in its body, a nested lambda body included. Its slot is
-    // overwritten later, and every overwrite path
-    // (`lowerClosureLocalReassign`, `lowerCapturedClosureLocalReassign`, the
-    // call-site release in `emitClosureCall`) releases the DISPLACED value as
-    // a reference the slot owns. A borrow-bound slot owned nothing, so that
-    // release dropped the SOURCE's reference and freed a function value the
-    // source still names (a heap-use-after-free on its next call).
-    // `lowerLocalDecl` therefore takes the slot its OWN reference at the
-    // bind (`bz_closure_retain`), and `collectClosureReleaseEligible` then
-    // classifies the local exactly like a producer-initialized one.
+    // fix #8440 / fix #8479 (§27.5 / §28.9, v0.357): every closure local
+    // that is bound from a BORROWED read of another function value
+    // (`var cmp := g;` — a local, a parameter, a field, an array element).
+    // Such a local is a second name for the function value, and everything
+    // that can end the value's life through another name — an overwrite of
+    // the SOURCE (`lowerClosureLocalReassign`, a field store), an overwrite
+    // of the alias itself, the env destructor of a lambda that captured the
+    // alias — releases a reference as one its holder owns. A borrow-bound
+    // slot owned nothing, so those releases freed a function value another
+    // name still called (heap-use-after-free). `lowerLocalDecl` therefore
+    // takes the slot its OWN reference at the bind (`bz_closure_retain`),
+    // and `collectClosureReleaseEligible` then classifies the local exactly
+    // like a producer-initialized one. (#8440 admitted only the aliases the
+    // body assigns to; #8479 admits every one.)
     //
     // Keyed by the declaration node and INSERT-ONLY: membership is a fact
-    // about the AST (the node's initializer shape and whether the body
-    // assigns to it), not about the function being lowered, so a nested
+    // about the AST (the node's initializer shape), not about the function
+    // being lowered, so a nested
     // lambda's own `collectClosureReleaseEligible` re-scan must not erase
     // the enclosing body's entries (`closureBorrowAll_` above is cleared by
     // that re-scan and is not restored).

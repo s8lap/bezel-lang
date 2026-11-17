@@ -20301,16 +20301,19 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // closureReleaseEligible_ to fire. Add it here, after lowerExpr returns,
     // but ONLY if the escape walk did NOT exclude this local (a reassignment
     // marks it escaped — lowerClosureLocalReassign's own release already handles
-    // the displaced value, and the scope-end release must NOT fire or it
-    // double-frees alongside the fix #4422 call-site release).
+    // the displaced value; whether the FINAL value is released at scope end is
+    // collectClosureReleaseEligible's verdict, fix #8480).
     if (dynamic_cast<const ast::LambdaExpr*>(init) &&
         closureReleaseEligible_.count(static_cast<const void*>(declNode)))
         closureReleaseEligible_.insert(static_cast<const void*>(declNode));
-    // fix #8440 (§27.5 / §28.9, v0.357): a closure local bound from a borrowed
-    // read of another function value (`var cmp := g;`) that the body later
-    // assigns to takes its OWN reference here, so the overwrite's release of
-    // the displaced value (`lowerClosureLocalReassign` and its siblings)
-    // spends this reference and not the source's. `closureAliasOwned_` is the
+    // fix #8440 / fix #8479 (§27.5 / §28.9, v0.357): a closure local bound
+    // from a borrowed read of another function value (`var cmp := g;`) takes
+    // its OWN reference here. §28.9: "the type's lifetime is managed by the
+    // runtime without user involvement" — the alias is a second name for the
+    // value, so an overwrite of the SOURCE (#8479), an overwrite of the alias
+    // (#8440) and the env destructor of a lambda that captured the alias
+    // (#8478) each release a reference their own holder owns, never the
+    // other name's. `closureAliasOwned_` is the
     // classification `collectClosureReleaseEligible` made; the same call put
     // the local on the producer walk, which is what releases this reference.
     // Deliberately NOT gated on `currentFn_ == closureReleaseEligibleFn_`:
@@ -20419,6 +20422,27 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         // arm consumes the vector; the non-closure arm must clear it too so the
         // next lowerLocalDecl in this scope does not reprocess stale cells.
         lastLambdaCapturedCells_.clear();
+        // fix #8480 / fix #8479 (§28.9, v0.357): a closure local whose slot
+        // owns its reference and whose value can also leave the frame
+        // (`closureEscapingScopeEndRelease_`, see its declaration). The slot
+        // owns one reference to whatever it holds — the bind's, then each
+        // `lowerClosureLocalReassign` store's — and that reference is
+        // released here, at scope end, on the normal and the unwind exit
+        // alike. For an assigned-to local it used to be released right
+        // after the local's first lexical call (the #4422 call-site
+        // release), which freed a function value the slot went on naming;
+        // for an alias there was no reference to release. No capture-cell
+        // free is registered: the closure may outlive this scope, so its
+        // cells stay with its env destructor. `bz_closure_release` is
+        // null-safe (a no-init `var f: T;` slot that no path assigned).
+        if (slot && currentFn_ == closureReleaseEligibleFn_ &&
+            closureEscapingScopeEndRelease_.count(
+                static_cast<const void*>(declNode)) &&
+            !disposeStack_.empty()) {
+            Disposal d{slot, nullptr};
+            d.closureRelease = true;
+            disposeStack_.back().push_back(d);
+        }
     }
     // fix #2714 (§27.5 / §28.9, v0.286): the producer-side fix for closure-
     // value calls — `var got := pick();` where `pick` is a lambda-typed local
@@ -36327,6 +36351,15 @@ bool Emitter::returnedClosureLocalOwnsPlusOne(const ast::Expr* e) const {
     // scan found WITHIN the analyzed body, so membership proves `declNode`
     // belongs to THIS body rather than an enclosing one.
     if (!closureLocalCandidates_.count(declNode)) return false;
+    // fix #8480 (§28.9, v0.357): an assigned-to local whose scope-end release
+    // is armed although its value leaves the frame
+    // (`closureEscapingScopeEndRelease_`). The slot's reference is released
+    // at scope end on EVERY exit, the returning one included (`lowerReturn`
+    // keeps that release on the return edge), so the return must MINT the
+    // caller's reference: answer "does not own". Asked before the producer
+    // arm below, whose "the slot's +1 is transferred" answer is only right
+    // for a slot nothing else releases.
+    if (closureEscapingScopeEndRelease_.count(declNode)) return false;
     // A producer-initialized closure local: the lambda / method-ref +1 was
     // transferred into the slot (closureReleaseEligible_ or not — the slot
     // always holds the producer's +1).
@@ -36364,19 +36397,23 @@ bool Emitter::returnedClosureLocalOwnsPlusOne(const ast::Expr* e) const {
     // retain's twin (a UAF once the envdtor reads through the now-dangling
     // cell). Mirrors the producer arm directly above.
     if (closureBorrowRetainEligible_.count(declNode)) return true;
-    // fix #8440 (§27.5 / §28.9, v0.357): an assigned-to alias
-    // (`closureAliasOwned_`) is DELIBERATELY not answered here, although its
-    // slot holds a +1 after the declaration. A reassigned local that is
-    // called exactly once has its slot's reference released at that call
-    // (the call-site discipline in emitClosureCall); if it is returned
-    // afterwards it no longer owns what it returns. Answering "owns +1"
-    // would skip the return-site mint there, and on the path where the alias
-    // still names its source the caller would be handed a reference the
-    // source's own scope-end release then drops. Declining keeps the mint.
-    // The cost is the alias's own reference when it is returned WITHOUT
-    // having been called (MEASURED: 64 B per call, the amount the pre-fix
-    // compiler leaks for the same program; tracked as #8483, which waits
-    // on the call-site release itself, #8480).
+    // fix #8479 (§27.5 / §28.9, v0.357): an alias that took its own
+    // reference at the bind (`closureAliasOwned_`) owns exactly one, like a
+    // producer-initialized local. An alias collectClosureReleaseEligible
+    // classified was answered above (`closureEscapingScopeEndRelease_`: the
+    // return mints and the scope-end release stays; `closureReleaseEligible_`:
+    // the return transfers and the release is erased on the return edge).
+    // What reaches this line is an alias whose slot a lambda CAPTURED: its
+    // reference lives in the capture cell, the frame releases nothing, and
+    // for a captured local that is returned by name the capturing env's
+    // destructor does not release the cell's contents either
+    // (`capturedLocalReturnedByName`, fix #4198) — the `return` is that
+    // protocol's silent TRANSFER, exactly as for the producer-initialized
+    // twin above. Minting instead leaked the bind's reference on every call
+    // (MEASURED: `var cmp := g; var h := lambda() => cmp(3, 1); … return
+    // cmp;`, 64 B per call before this fix — the mint sat on top of a
+    // reference nothing released).
+    if (closureAliasOwned_.count(declNode)) return true;
     return false;
 }
 
@@ -36502,17 +36539,12 @@ bool Emitter::lowerClosureFieldStore(const ast::Expr& target,
 // a field — that is lowerClosureFieldStore; NOT an array element / ref-out
 // param / static field), matching lowerStringLocalReassign's own scope.
 //
-// The reassigned slot keeps owning its final value; ClosureEscapeWalker's
-// AssignmentStmt arm marks ANY reassignment of the target as an escape
-// ("Reassigning the local itself → escape (overwrite handling is out of
-// this increment)" — this fix is that increment's overwrite handling), so a
-// reassigned local is never in closureReleaseEligible_ and its FINAL value
-// is NOT auto-released at scope end — it simply leaks if never returned or
-// otherwise consumed, the same safe-direction trade-off
-// lowerStringLocalReassign's own doc comment describes for strings (never a
-// UAF, never a double-free — only ever a leak, and only for the one final
-// value, not every displaced intermediate one, which this function now
-// reclaims).
+// The reassigned slot keeps owning its final value. That reference is
+// released at SCOPE END (fix #8480, §28.9, v0.357 — see
+// collectClosureReleaseEligible's post-walk verdict and
+// `closureEscapingScopeEndRelease_`), unless the slot is a captured cell
+// (the env destructor owns it). A reassigned local that verdict does not
+// cover still gets the #4422 call-site release (`emitClosureCall`).
 bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
                                         llvm::Value* slotAddr, llvm::Type* elemTy,
                                         llvm::Value* newVal,
@@ -36570,9 +36602,12 @@ bool Emitter::lowerClosureLocalReassign(const ast::Expr& target,
         emitClosureRetain(newVal);
     builder_.CreateStore(newVal, slotAddr);
     emitClosureRelease(oldVal);
-    // fix #4422: track this local as reassigned so the LocalSymbol arm in
-    // emitClosureCall knows to emit emitClosureRelease after the call
-    // (reassigned locals are excluded from scope-end release).
+    // fix #4422 (§27.5, v0.298): record the reassignment for
+    // `emitClosureCall`'s call-site release. fix #8480 (§28.9, v0.357): the
+    // slot owns its FINAL value's reference until scope end, and that is
+    // where collectClosureReleaseEligible now releases it for every plain
+    // reassigned local it classifies; the call-site release reads this set
+    // only for a local with no scope-end release armed.
     if (auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(target)))
         if (loc->decl)
             closureLocalReassigned_.insert(static_cast<const void*>(loc->decl));
@@ -38452,7 +38487,7 @@ struct ClosureEscapeWalker {
     // end fires once at function exit. NOT an escape through a captured
     // lambda's body or a `return f` transfer — those still leak the +1
     // safely (the prior behavior). See the doc comment above
-    // closureLocalReassigned_ for the post-walk override.
+    // closureEscapingScopeEndRelease_ (LlvmBackend_impl.hpp) for the override.
     bool escapedDueToReassign = false;
     // FINDING [1] / §28.9 / §28.3: true while walking inside a lambda body. A
     // captured closure local read inside a nested lambda is held by that
@@ -38546,6 +38581,28 @@ struct ClosureEscapeWalker {
     // Set when the ReturnStmt stmt() arm visits a value that IS the target
     // ident.
     bool isReturned_ = false;
+    // fix #8480 (§28.9, v0.357): for a target the body ASSIGNS TO
+    // (`assignedSomewhere`, pre-seeded by collectClosureReleaseEligible from
+    // its ClosureLocalAssignScan), the walk never short-circuits, and it
+    // records whether a value of the target LEAVES THE FRAME through a
+    // non-reassign, non-return escape (a field or collection store, a bind
+    // into a non-owning local, a kept argument), and on which side of the
+    // first assignment the walk meets: `escapeBeforeReassign_` (the INITIAL
+    // value) or `escapeAfterReassign_`. Either one — or a `return` of the
+    // bare target, which `isReturned_` carries — gives the local the
+    // `closureEscapingScopeEndRelease_` verdict instead of
+    // `closureReleaseEligible_`; the side matters only to the #4473
+    // assign-into arm, which must keep the reach it had when the walk
+    // stopped at an escape of the initial value.
+    bool assignedSomewhere = false;
+    // fix #8479 (§28.9, v0.357): the walk does not short-circuit for a target
+    // that took its own reference at the bind either (an owned alias): its
+    // verdict needs to know whether a lambda captures it anywhere in the
+    // body (`isCapturedCellSlot_`), not just whether it escapes.
+    bool walkWholeBody = false;
+    bool reassignSeen_ = false;
+    bool escapeBeforeReassign_ = false;
+    bool escapeAfterReassign_ = false;
     // fix #4473 (§27.5 / §28.9, v0.301): true when target is the RHS of an
     // AssignmentStmt whose LHS is a same-scope closure-typed local/parameter
     // (a `lambdaRef := y` shape where `y` is the walked target and
@@ -39013,11 +39070,16 @@ struct ClosureEscapeWalker {
         // `escaped = true`). Non-reassign escape sources still short-circuit
         // (a captured lambda read or a return transfer makes any further
         // walking irrelevant for the post-walk override's classification).
-        if (escaped && !escapedDueToReassign) return;
+        if (escaped && !escapedDueToReassign && !walkWholeBody) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
             // FINDING [1]: inside a lambda body, a captured-local read always
             // escapes — the env outlives the scope (safe-read does not apply).
-            if (isTargetIdent(id) && (!safeRead || inLambda)) escaped = true;
+            if (isTargetIdent(id) && (!safeRead || inLambda)) {
+                escaped = true;
+                // fix #8480: see escapeBeforeReassign_'s comment.
+                if (reassignSeen_) escapeAfterReassign_ = true;
+                else escapeBeforeReassign_ = true;
+            }
             // fix #4434 (§27.5 / §28.9, v0.298): a target reference observed
             // while `inLambda` is true proves the slot is captured by a
             // downstream lambda, so it lives in a heap cell (cellVars_) and the
@@ -39372,7 +39434,7 @@ struct ClosureEscapeWalker {
         // non-reassign escape sources (a captured lambda read, a return
         // transfer, a field store, etc.) while letting the walker cross
         // reassign-only escape sources.
-        if (escaped && !escapedDueToReassign) return;
+        if (escaped && !escapedDueToReassign && !walkWholeBody) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
             // fix #8440 (§27.5 / §28.9, v0.357): EXCEPT a bind into a local
             // that takes its own reference (ownedAliasDecls). The new local
@@ -39400,6 +39462,15 @@ struct ClosureEscapeWalker {
             return;
         }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            // fix #8479 (§21.1 / §28.9, v0.357): the `const` spelling of an
+            // owned alias (`const cmp := g;`) takes its own reference at the
+            // bind exactly as the `var` spelling does (`lowerLocalDecl` lowers
+            // both), so it is the same safe read of target.
+            if (!inLambda && ownedAliasDecls &&
+                ownedAliasDecls->count(static_cast<const void*>(lc))) {
+                expr(lc->value.get(), /*safeRead=*/true);
+                return;
+            }
             expr(lc->value.get(), /*safeRead=*/false); return;
         }
         if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
@@ -39418,8 +39489,20 @@ struct ClosureEscapeWalker {
             // NOT a return transfer of target: the cell's lifetime is the
             // call return, and the existing call-site release handles it. So
             // only the bare-ident case marks isReturned_.
-            if (r->value && isTargetIdent(r->value.get()))
+            if (r->value && isTargetIdent(r->value.get())) {
                 isReturned_ = true;
+                // fix #8480 (§28.9, v0.357): for an assigned-to target the
+                // return is recorded as a return ONLY — not as a frame escape
+                // before/after the assignment (see escapeBeforeReassign_) —
+                // because the verdict for a returned assigned-to local does
+                // not depend on where the return sits: the return mints and
+                // the scope-end release stays. Inside a lambda body the read
+                // is a capture and takes the ordinary path below.
+                if (assignedSomewhere && !inLambda) {
+                    escaped = true;
+                    return;
+                }
+            }
             // fix #6176 (§7.7, v0.338): `return nn ?? e;` where nothing mints
             // the caller's reference is the same transfer as `return nn;` —
             // see `coalesceReturnTransfers`. (The BinaryExpr arm of expr()
@@ -39459,6 +39542,7 @@ struct ClosureEscapeWalker {
                 // walker MUST continue so it counts callees).
                 escaped = true;
                 escapedDueToReassign = true;
+                reassignSeen_ = true;  // fix #8480
                 // fix #4434 (§27.5 / §28.9, v0.298): a reassignment target
                 // observed inside a lambda body proves the slot is captured
                 // (a lambda cannot reassign a local it does not capture). The
@@ -39534,8 +39618,15 @@ struct ClosureEscapeWalker {
             // produces — the retain-and-store pair is only emitted for
             // closure-typed LHS, and a non-target RHS would not strand
             // target's +1.
+            // fix #8480 (§28.9, v0.357): not when the target's INITIAL
+            // value already left the frame through another site — the walk
+            // used to stop there and never reach this statement, and it
+            // only continues now because the target is assigned to
+            // somewhere (see `assignedSomewhere`). Keeps this arm's reach
+            // exactly what it was.
             if (isClosureTypedLocalAssign(*as->target) &&
-                containsTargetAnywhere(as->value.get())) {
+                containsTargetAnywhere(as->value.get()) &&
+                !(escapeBeforeReassign_ && !reassignSeen_)) {
                 escapedDueToAssignIntoClosureLocal_ = true;
             }
             expr(as->target.get(), /*safeRead=*/false);
@@ -39546,6 +39637,7 @@ struct ClosureEscapeWalker {
             if (isTargetIdent(inc->target.get())) {
                 // fix #2107-follow-up: same as AssignmentStmt above.
                 escapedDueToReassign = true;
+                reassignSeen_ = true;  // fix #8480
                 // fix #4434: same captured-cell reasoning as the
                 // AssignmentStmt arm above.
                 if (inLambda) isCapturedCellSlot_ = true;
@@ -40031,12 +40123,24 @@ void Emitter::collectClosureReleaseEligible(
     // yields a borrowed pointer, one returning a fresh lambda a +1), so
     // neither answer is right for both — tracked as #8481.
     //
-    // WHICH locals: only those the body assigns to. A never-assigned alias
-    // has no overwrite to release through, so its slot is never treated as
-    // an owner by the three paths above and it is left on the borrow arm.
-    // (Two other ways such an alias can outlive its value — it is captured
-    // by a lambda, or its SOURCE is overwritten — are not this defect's
-    // paths and are tracked as #8478 and #8479.)
+    // WHICH locals: every one (fix #8479, §28.9, v0.357). #8440 admitted
+    // only the aliases the body assigns to, on the argument that a
+    // never-assigned alias has no overwrite to release through. Two other
+    // paths end the aliased value's life while the alias still names it:
+    //   - its SOURCE is overwritten (`g := …;`, `h.F := …;`): the overwrite
+    //     releases the displaced value as the source's own reference, and
+    //     the alias calls a freed cell (#8479; MEASURED on the parent commit,
+    //     the issue's two repros: heap-use-after-free in `main`, 0 lines);
+    //   - the alias is captured by a lambda (#8478): the first capture moves
+    //     the slot's value into the capture cell and the capturing closure's
+    //     env destructor releases the cell's contents — the source's
+    //     reference, when the slot owned none (MEASURED: heap-use-after-free
+    //     in `lam$1`, 1 line).
+    // Both are the same missing reference, so the alias takes it at the bind
+    // whether or not it is assigned to. The same change arms the SOURCE's
+    // own scope-end release, which an unowned alias used to block (the
+    // walker read `var cmp := g;` as an escape of `g`): the 64 B the
+    // issue's control leaked.
     std::unordered_set<const void*> assignedLocals;
     {
         ClosureLocalAssignScan as{ctx_, assignedLocals};
@@ -40110,9 +40214,8 @@ void Emitter::collectClosureReleaseEligible(
                 if (!lt) lt = ctx_.exprType(*v.init);
                 if (lt && !lt->nullable &&
                     lt->kind == sema::TypeRef::Kind::Function &&
-                    assignedLocals.count(static_cast<const void*>(s)) &&
                     isBorrowedClosureRead(v.init)) {
-                    // fix #8440: an assigned-to alias owns its reference
+                    // fix #8440 / fix #8479: an alias owns its reference
                     // from the bind (see the header comment above) and is
                     // walked as a producer-initialized local.
                     closureAliasOwned_.insert(static_cast<const void*>(s));
@@ -40230,6 +40333,9 @@ void Emitter::collectClosureReleaseEligible(
     };
     for (auto& s : body) scan(s.get());
 
+    // fix #8479: the candidates a `return` names bare (see the alias-source
+    // pass after this loop).
+    std::unordered_set<const void*> returnedByName;
     for (const ast::Node* ld : candidates) {
         ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         w.coalesceReturnTransfers = coalesceReturnTransfers;  // #6176
@@ -40249,9 +40355,22 @@ void Emitter::collectClosureReleaseEligible(
         // locals (arming scope-end release to keep the cell alive across
         // calls). Only break when a NON-reassign escape source fires (lambda
         // capture, return transfer, field store, etc.).
+        //
+        // fix #8480 (§28.9, v0.357): a target the body assigns to ANYWHERE
+        // is walked to the end regardless of what comes first — the verdict
+        // below needs the whole body (is it captured, is it returned, did a
+        // value leave the frame before or after an assignment), and it must
+        // not depend on whether the assignment happens to precede the first
+        // escape in source order.
+        w.assignedSomewhere =
+            assignedLocals.count(static_cast<const void*>(ld)) != 0;
+        const bool ownsFromBind =
+            closureAliasOwned_.count(static_cast<const void*>(ld)) != 0;
+        w.walkWholeBody = w.assignedSomewhere || ownsFromBind;
         for (auto& s : body) {
             w.stmt(s.get());
-            if (w.escaped && !w.escapedDueToReassign) break;
+            if (w.escaped && !w.escapedDueToReassign && !w.walkWholeBody)
+                break;
         }
         // fix #4434 (§27.5 / §28.9, v0.298): captured-cell
         // classification has moved to `collectCapturedCellClosureLocals`
@@ -40343,15 +40462,117 @@ void Emitter::collectClosureReleaseEligible(
         // parallels the existing reassign arm: a captured-cell RHS
         // would be released by the envdtor of the lambda that captured
         // it, and arming scope-end release here would double-free.
-        if (w.escaped && !w.isCapturedCellSlot_ &&
-            ((w.escapedDueToReassign && !w.isReturned_ &&
-              (w.calleeCallCount > 1 || w.calleeCallCount == 0 ||
-               w.uncountableCalleeSeen)) ||
-             w.escapedDueToAssignIntoClosureLocal_)) {
-            w.escaped = false;
+        //
+        // fix #8480 (§28.9, v0.357): path (c) no longer depends on the call
+        // count, and the call-site release it deferred to no longer reaches
+        // a local classified here (`emitClosureCall` reads both verdict sets
+        // as "scope-end release armed").
+        //
+        // §28.9 puts a function value's lifetime with the runtime ("the
+        // type's lifetime is managed by the runtime without user
+        // involvement"), so a value must stay alive for as long as the slot
+        // names it. The single-call arm released the slot's reference right
+        // after the local's one LEXICAL call (`emitClosureCall`), on the
+        // premise that the call was the slot's last use. A lexical count
+        // says nothing about that. MEASURED on the parent commit, the
+        // issue's repros under `--sanitize=address`: the call site is inside
+        // a loop the declaration is outside of (heap-use-after-free in
+        // `main`, 1 line of 101; with a second closure local assigned back,
+        // the runtime's own over-release guard, exit 134); the local is
+        // returned after its call (heap-use-after-free in `main`, 1 line);
+        // the local is passed on after its call. The slot of an assigned-to
+        // local owns one reference to whatever it holds at every point, so
+        // that reference is now released where every other owned local's
+        // is: at scope end.
+        //
+        //   - reassigned, plain, no value leaves the frame: armed
+        //     (`closureReleaseEligible_`), for any number of calls.
+        //   - reassigned, plain, and a value leaves the frame (a `return`
+        //     of the local, a field or collection store, a bind into a
+        //     non-owning local — before or after an assignment): armed too,
+        //     but through `closureEscapingScopeEndRelease_` — the closure
+        //     can outlive the scope, so it must not be read as non-escaping
+        //     by collectCellFreeEligible (which frees the capture cells of
+        //     a `closureReleaseEligible_` local's lambda at scope end; with
+        //     the #4425 arm that was a heap-use-after-free in the stored
+        //     closure's body, MEASURED on the parent commit for a
+        //     reassigned never-called capturing local stored into a field),
+        //     and a `return` of it mints instead of transferring (see
+        //     `returnedClosureLocalOwnsPlusOne`), so the paths that do NOT
+        //     return it release it as well. Before this fix every such
+        //     local's reference was released too — after its single call,
+        //     or at scope end by the #4425 arm — except a returned one's.
+        //   - #4473's `escapedDueToAssignIntoClosureLocal_` arm is unchanged
+        //     and still wins.
+        //
+        // fix #8479 (§28.9, v0.357): an owned alias (`ownsFromBind`) gets
+        // the same verdict whether or not it is assigned to. Its slot's
+        // reference is its OWN at every point — taken at the bind, re-taken
+        // by each assignment — and no site that lets the value leave the
+        // frame spends it (a field store retains, a return mints, a
+        // collection store borrows; the one site that takes a slot's
+        // reference over is a lambda capture, excluded here by
+        // `isCapturedCellSlot_`). So it is released at scope end whatever
+        // else happens to the value — exactly as the unowned alias's
+        // "nothing to release" was right whatever happened.
+        const void* ldKey = static_cast<const void*>(ld);
+        closureEscapingScopeEndRelease_.erase(ldKey);
+        if (w.escaped && !w.isCapturedCellSlot_) {
+            if (w.escapedDueToAssignIntoClosureLocal_) {
+                w.escaped = false;
+            } else if (w.escapedDueToReassign || ownsFromBind) {
+                const bool leavesFrame = w.isReturned_ ||
+                                         w.escapeBeforeReassign_ ||
+                                         w.escapeAfterReassign_;
+                if (w.escapedDueToReassign && !leavesFrame)
+                    w.escaped = false;
+                else
+                    closureEscapingScopeEndRelease_.insert(ldKey);
+            }
         }
         if (!w.escaped)
-            closureReleaseEligible_.insert(static_cast<const void*>(ld));
+            closureReleaseEligible_.insert(ldKey);
+        if (w.isReturned_) returnedByName.insert(ldKey);
+    }
+    // fix #8479 (§27.5 / §28.9, v0.357): a local that an owned alias was
+    // bound from is confined to its scope only if that ALIAS is. The bind is
+    // a safe read of the source (the alias took its own reference, so the
+    // source's scope-end release stays balanced), but the alias keeps the
+    // closure alive, and an alias that is returned, stored, captured by a
+    // lambda, or assigned onward lets the closure outlive the source's
+    // scope (a `return` of the bare alias leaves the alias itself in
+    // `closureReleaseEligible_` — it transfers its reference — so that case
+    // is read from `returnedByName`). `closureReleaseEligible_` is read by
+    // collectCellFreeEligible as
+    // "this local's lambda dies with the scope", which frees the lambda's
+    // capture cells there: MEASURED with the alias returned,
+    // `var g := lambda(x, y) => x - y + k; var cmp := g; return cmp;` freed
+    // `k`'s cell at the method's end and the caller's call read it
+    // (heap-use-after-free in the lambda body). So such a source moves to
+    // `closureEscapingScopeEndRelease_`: its release stays armed, its
+    // capture cells are no longer freed with the scope. A chain
+    // (`a := g; b := a; return b;`) needs the fixpoint.
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const ast::Node* alias : candidates) {
+            const void* aliasKey = static_cast<const void*>(alias);
+            if (!closureAliasOwned_.count(aliasKey) ||
+                (closureReleaseEligible_.count(aliasKey) &&
+                 !returnedByName.count(aliasKey)))
+                continue;
+            LocalDeclInitView av = localDeclInitView(alias);
+            if (!av.init) continue;
+            for (const ast::Node* src : candidates) {
+                const void* srcKey = static_cast<const void*>(src);
+                if (src == alias || !closureReleaseEligible_.count(srcKey))
+                    continue;
+                ClosureEscapeWalker sw{ctx_, srcKey};
+                if (!sw.containsTargetAnywhere(av.init)) continue;
+                closureReleaseEligible_.erase(srcKey);
+                closureEscapingScopeEndRelease_.insert(srcKey);
+                changed = true;
+            }
+        }
     }
     // fix #2714 (§27.5 / §28.9, v0.286): same conservative escape walk for the
     // BORROW side. A non-escaping borrow local releases its retained +1 at

@@ -29,13 +29,13 @@
 // parameter, a field, a built-in collection element, or an if-expression over
 // those) AND that is assigned to anywhere in its body takes its own +1 at the
 // declaration (`closureAliasOwned_`), and is then tracked exactly like a
-// producer-initialized local. No release site changed. An alias that is never
-// assigned to is untouched (the `control_alias_never_reassigned` row); what is
-// deliberately NOT fixed here is filed: such an alias captured by a lambda
-// (#8478) or outliving an overwrite of its source (#8479), the call-site
-// release when the call repeats or a return follows (#8480), function values
-// read through property / indexer getters (#8481), and the returned-alias
-// leak (#8483).
+// producer-initialized local. No release site changed. What fix #8440 left
+// out was filed, and fix #8479 / #8478 / #8480 closed most of it: an alias
+// that is never assigned to now takes its own reference too (captured by a
+// lambda — #8478; outliving an overwrite of its source — #8479), a reassigned
+// local's reference is released at scope end instead of after its one lexical
+// call (#8480), and the returned-alias leak (#8483) went with it. Function
+// values read through property / indexer getters (#8481) remain.
 //
 // Every program loops 100 times (a one-shot repro is a vacuous oracle for a
 // refcount defect) and runs under generated-code AddressSanitizer AND
@@ -79,6 +79,11 @@
 // prints 101, 134 or 201. Every "leak" in the right-hand column predates the
 // fix; the row that carries it says what leaks, and runs with LeakSanitizer
 // off. The three `control_` rows pass before and after.)
+//
+// SINCE fix #8479 / #8480 (the table above is fix #8440's own measurement):
+// `alias_of_alias`, `control_alias_never_reassigned` (leak 64 B) and
+// `control_returned_reassigned_alias_is_live` (leak 6400 B) are CLEAN, and
+// those three rows now run under LeakSanitizer like the rest.
 
 #include <string>
 
@@ -363,17 +368,15 @@ end C;
 
 // Alias form: an alias of an alias (`a := g; b := a; b := lambda`); all three
 // names are called after the reassignment.
-// LSan off for this row only: `a` is an alias that is never reassigned, so —
-// like the control row below — it keeps `g` from being released at scope end
-// (64 B, once; LeakSanitizer reports it in about 6 runs of 10). Unchanged by
-// the fix (tracked as #8479), and independent of the reassigned alias `b` this
-// row is about.
+// Under LeakSanitizer since fix #8479: `a`, an alias that is never reassigned,
+// used to keep `g` from being released at scope end (64 B, once); it now owns
+// its own reference and both are released.
 BEZEL_TEST(closure_local_alias_reassign_uaf_8440,
            alias_of_alias_spec_28_9) {
     std::string e;
     for (int i = 0; i < 100; ++i) { line(e, i % 2 == 0 ? 12 : 10); }
     e += "DONE\n";
-    BEZEL_EXPECT_EQ(runLenientOut(R"BZL(
+    BEZEL_EXPECT_EQ(runCheckedOut(R"BZL(
 module M;
 public class C
   public static method Main(): int
@@ -813,17 +816,17 @@ end C;
 
 // CONTROL (passes before and after): the reassigned alias is RETURNED from the
 // method and the caller calls it twice.
-// LSan off for this row only: returning the alias mints a second reference (the
-// alias is deliberately not a `returnedClosureLocalOwnsPlusOne` owner — see that
-// function), so one cell leaks per call (6400 B) — the same amount the pre-fix
-// compiler leaks (tracked as #8483; the transfer is unsafe until #8480).
-// What the row pins is that the returned value is LIVE.
+// Under LeakSanitizer since fix #8480: the return minted the caller's reference
+// on top of the alias's own, which nothing released (one cell per call,
+// 6400 B — #8483). The alias's reference is now released at scope end on every
+// path, the returning one included. The row pins that the returned value is
+// LIVE and that nothing leaks.
 BEZEL_TEST(closure_local_alias_reassign_uaf_8440,
            control_returned_reassigned_alias_is_live_spec_28_9) {
     std::string e;
     for (int i = 0; i < 100; ++i) { line(e, i % 2 == 0 ? -2 : 2); }
     e += "DONE\n";
-    BEZEL_EXPECT_EQ(runLenientOut(R"BZL(
+    BEZEL_EXPECT_EQ(runCheckedOut(R"BZL(
 module M;
 public class C
   public static method Pick(c: bool): (int, int) -> int
@@ -874,16 +877,16 @@ end C;
 )BZL"), e);
 }
 
-// CONTROL: an alias that is never reassigned is NOT in scope of the fix.
-// LSan off for this row only: an alias that is never reassigned keeps its source
-// from being released at scope end (64 B, once) — unchanged by the fix, measured
-// identical before and after (tracked as #8479).
+// CONTROL: an alias that is never reassigned was not in scope of fix #8440.
+// Under LeakSanitizer since fix #8479: such an alias used to keep its source
+// from being released at scope end (64 B, once); it now owns a reference of its
+// own, and both are released.
 BEZEL_TEST(closure_local_alias_reassign_uaf_8440,
            control_alias_never_reassigned_spec_28_9) {
     std::string e;
     for (int i = 0; i < 100; ++i) { line(e, 2); }
     e += "DONE\n";
-    BEZEL_EXPECT_EQ(runLenientOut(R"BZL(
+    BEZEL_EXPECT_EQ(runCheckedOut(R"BZL(
 module M;
 public class C
   public static method Main(): int

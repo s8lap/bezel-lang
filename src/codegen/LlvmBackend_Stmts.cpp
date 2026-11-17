@@ -4741,6 +4741,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // (and disposed) the freed object — a heap-use-after-free. Peel only
         // postfix `!` layers (never `as`, whose result is a borrow, §17.4).
         llvm::AllocaInst* retSlot = nullptr;
+        // fix #8480 (§28.9, v0.357): set when the returned local is an
+        // assigned-to closure local whose scope-end release stays armed
+        // across the return (`closureEscapingScopeEndRelease_`): the return
+        // site MINTED the caller's reference (`returnedClosureLocalOwnsPlusOne`
+        // answered false), so the slot's own reference is still released on
+        // this exit like on every other — its `closureRelease` entry is kept
+        // below instead of erased.
+        bool retKeepsClosureRelease = false;
         const ast::Expr* retCore = rs->value.get();
         while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(retCore)) {
             if (!pb->operand) break;
@@ -4752,6 +4760,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
                     auto lit = locals_.find(loc->decl);
                     if (lit != locals_.end()) retSlot = lit->second;
+                    retKeepsClosureRelease =
+                        loc->decl &&
+                        closureEscapingScopeEndRelease_.count(
+                            static_cast<const void*>(loc->decl)) != 0;
                 }
             }
             // fix #7537 (§15.3 *Return* + *Parameter passing*, §28.1 clause 1,
@@ -4813,7 +4825,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             for (auto& scope : disposeStack_) {
                 scope.erase(
                     std::remove_if(scope.begin(), scope.end(),
-                        [retSlot](const auto& e) {
+                        [retSlot, retKeepsClosureRelease](const auto& e) {
                             // #1418 / §27.5 / §28.9: if the returned local is a
                             // lambda-CAPTURED value local, its slot is the shared
                             // capture-cell holder. Returning it yields a COPY of the
@@ -4828,9 +4840,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             // local yields a COPY of the cell's contents, not
                             // the frame's counted reference to the cell, which
                             // still has to be dropped here.
+                            // fix #8480: see retKeepsClosureRelease.
                             return e.slot == retSlot &&
                                    !e.boxedCellFree &&
-                                   !e.boxedCellFreeDeferred && !e.cellRelease;
+                                   !e.boxedCellFreeDeferred && !e.cellRelease &&
+                                   !(retKeepsClosureRelease &&
+                                     e.closureRelease);
                         }),
                     scope.end());
             }
