@@ -30,11 +30,27 @@
 // are checked at instantiation"); the fix's narrow issuance respects that
 // pin (one of the rows below makes this explicit).
 //
+// fix #8639 (§5.1, §3.6 rule 2, §14.2, §7.10, v0.357) WIDENS that scope: a
+// constrained parameter is rejected on the same §5.1 ground as an
+// unconstrained one. §5.1's reference-conversion list names a type parameter
+// only as the SOURCE of a conversion, so a concrete type never converts to a
+// type parameter under ANY constraint; a constraint ADMITS substitutions
+// (§14.2's table), it does not create a conversion, and §3.6 rule 2's "a
+// generic body type-checks under the weakest assumption its constraints
+// establish" then requires the initializer to be assignable to EVERY
+// admitted substitution. §7.10's "checked at instantiation" is the COPY
+// DEMAND (§7.10: "That check is not the `value` constraint's"), not a
+// conversion check. The `where T: value` row below FLIPS from acceptance to
+// rejection (named in the commit body); MEASURED on the pre-fix compiler, the
+// accepted program miscompiled — `Holder<Point>` stored the int 99 into the
+// record's first word and printed `99` / `0`.
+//
 // Cite: spec §5.1 (implicit conversions, constant narrowing), §14.2
-// (constraints — unconstrained type-parameter-typed storage has no
-// primitive guarantee; constrained storage defers to instantiation),
-// v0.307. Related: #4768 (reverse direction), #3944 (the same generic
-// body-field default at the codegen side, with different failure surface).
+// (constraints — a constraint admits substitutions; it creates no
+// conversion), §3.6 rule 2 (the weakest assumption), §17.11 (the default
+// operator), v0.307 / v0.357. Related: #4768 (reverse direction), #3944
+// (the same generic body-field default at the codegen side, with different
+// failure surface), #8639 (the widening of this arm's scope).
 
 #include "support/aot_support.hpp"  // runAot
 #include "support/codegen_support.hpp"
@@ -73,6 +89,25 @@ constexpr const char* kFieldArmWording =
 constexpr const char* kGeneralArmWording =
     "does not implicitly convert to the type parameter";
 
+// fix #8639's constrained tail: the reason the constraint does not supply
+// the conversion. The FIELD arm's own lead ("a primitive literal cannot
+// initialize a generic field whose type parameter may resolve to a class,
+// record, or non-int primitive") describes the UNCONSTRAINED case only --
+// under `where T: class` the parameter resolves to no record and no
+// primitive -- so the constrained wording carries its own reason clause.
+constexpr const char* kConstrainedTail =
+    "lists no conversion from a concrete type to a type parameter";
+
+// fix #8639's constrained FIELD lead: the constrained wording's own lead is
+// "`T` is a type parameter, and §5.1 lists no conversion from a concrete
+// type to a type parameter" — the UNCONSTRAINED lead's second half ("a
+// primitive literal cannot initialize a generic field whose type parameter
+// may resolve to a class, record, or non-int primitive") does NOT describe
+// the constrained case, so the constrained row pins this lead instead.
+constexpr const char* kFieldConstrainedLead =
+    "is a type parameter, and §5.1 lists no conversion from a concrete type "
+    "to a type parameter";
+
 // Match against the visitMember FIELD-INIT arms' diagnostic (OLD wording).
 // Field / property initializers go through this arm FIRST, so even after
 // the #4916 split these sites still emit the OLD wording — the field arm
@@ -101,6 +136,25 @@ bool rejectedByGeneralRule(const std::string& program) {
         if (d.severity != bezel::Severity::Error) continue;
         if (d.message.find(kGeneralArmWording) != std::string::npos)
             return true;
+    }
+    return false;
+}
+
+// fix #8639: the CONSTRAINED field arm's wording — the field-initializer
+// arm's own lead ("initializer for field `…` has a type that is not
+// implicitly convertible to the target type") plus the constrained reason
+// clause. A row that pinned only the reason clause would also match the
+// GENERAL arm, so the field lead is pinned too.
+bool rejectedByConstrainedFieldRule(const std::string& program) {
+    auto r = runAot(program);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("initializer for field") == std::string::npos)
+            continue;
+        if (d.message.find(kFieldConstrainedLead) == std::string::npos) continue;
+        if (d.message.find(kConstrainedTail) == std::string::npos) continue;
+        return true;
     }
     return false;
 }
@@ -188,18 +242,29 @@ end Program;
 )BZ"));
 }
 
-// Constraint DOES relax the rule: `where T: value` admits primitive
-// substitutions (alongside records / enums / choices / inline arrays),
-// and §14.2's instantiation-time check (§14.2: "operations that copy T …
-// are checked at instantiation") handles a primitive-literal initializer
-// into T-typed storage as a deferred-to-instantiation conversion.
-// THIS IS THE PINNED ACCEPTANCE SHAPE — the same shape
-// `generic_ref_out_exact_unification_1686__…` exercises — and the fix's
-// narrow issuance MUST NOT reject it. Sanity control: this rows RUNS,
-// prints `99`, and exercises the FieldDecl + checkAssignable paths.
+// BEHAVIOUR FLIP (fix #8639, §5.1 / §3.6 rule 2 / §14.2, v0.357): this row
+// used to PIN the acceptance. That reading does not survive the spec: §5.1's
+// reference-conversion list names a type parameter only as the SOURCE of a
+// conversion, so a concrete type never converts to a type parameter under any
+// constraint; a constraint ADMITS substitutions, it does not create a
+// conversion; and §3.6 rule 2's "a generic body type-checks under the
+// weakest assumption its constraints establish" requires the initializer to
+// be assignable to EVERY admitted substitution (`where T: value` admits a
+// RECORD too, which `99` is not). §7.10's "checked at instantiation" is the
+// COPY DEMAND, not a conversion check.
+//
+// MEASURED on the pre-fix compiler: the accepted program MISCOMPILED. At
+// `Holder<Point>` the body is not re-checked at the instantiation, so the
+// int 99 was stored into the record's first word -- the program printed `99`
+// and `0` where a `Point` was expected.
+//
+// The row now pins the REJECTION, with the #8639 wording. The sibling
+// #5469 arm (a concrete CLASS/RECORD source into a type parameter) was never
+// constraint-gated and already rejected that shape under every constraint
+// kind; this row now matches it.
 BEZEL_TEST(field_init_type_param_4810,
-           constrained_type_param_field_primitive_deferred_spec_14_2) {
-    auto r = runAot(R"BZ(
+           constrained_type_param_field_primitive_rejected_spec_5_1) {
+    BEZEL_EXPECT_TRUE(rejectedByConstrainedFieldRule(R"BZ(
 module Conf;
 public class Holder<U> where U: value
   public dv: U := 99;
@@ -209,9 +274,7 @@ public class Holder<U> where U: value
     return 0;
   end Main;
 end Holder;
-)BZ");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("99\n"));
+)BZ"));
 }
 
 // ═════════ Accept controls ═════════════════════════════════════════════════

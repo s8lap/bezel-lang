@@ -10964,7 +10964,7 @@ void ExprTC::checkAssignable(
     // the OLD acceptance; that test is updated by this commit to use
     // `default(T)`, the legal §17.11 spelling.
     //
-    // Scope, deliberately narrow — same as #4768's arm: only names in
+    // Scope — same as #4768's arm: only names in
     // `currentScopeGenericParamNames()` (the enclosing type's, method's and
     // extension target's own parameters), with a primitive non-Object source
     // (the surface from which an integer literal `99` arrives: every primitive
@@ -10975,6 +10975,45 @@ void ExprTC::checkAssignable(
     // (every type, including a type parameter, converts to `Object`). A
     // callee's unsubstituted free parameter (freeTypeParamNames) is again an
     // inference gap, not a conversion, and is left alone.
+    //
+    // fix #8639 (§5.1, §3.6 rule 2, §14.2, v0.357): the target's CONSTRAINTS
+    // are NOT part of this arm's scope any more. §5.1's conversion list is
+    // closed and it names a type parameter only as the SOURCE of a reference
+    // conversion ("a type parameter to an interface or class its constraints
+    // guarantee conformance to") — there is no row whose source is a concrete
+    // type and whose target is a type parameter, under any constraint:
+    //   * constant narrowing needs "any integer type whose range contains its
+    //     value" (§5.1), and a type parameter is not an integer type;
+    //   * the numeric table widens to a CONCRETE integer type;
+    //   * the nullable lift composes conversions that exist.
+    // A constraint ADMITS substitutions (§14.2's table: `notnull` admits "non-
+    // nullable types only (value or reference)", `value` admits "records,
+    // enums, choices, primitives, inline arrays …, the unit type"); it does
+    // not create a conversion, and §3.6 rule 2's "a generic body type-checks
+    // under the weakest assumption its constraints establish" therefore
+    // requires the initializer to be assignable to EVERY admitted
+    // substitution — `int` is not one of them under `notnull` (a `string` is
+    // admitted too), nor under `class` (no primitive is a class), nor under
+    // `value` (a record is admitted too), nor under an interface or a class
+    // bound (a conforming class is admitted too).
+    //
+    // The old gate (`!isCurrentScopeTypeParamConstrained`) read a
+    // CONSTRAINED parameter as "deferred to instantiation", citing §7.10's
+    // "operations that copy T … are checked at instantiation". That sentence
+    // is the COPY DEMAND (§7.10's own next paragraph: "That check is not the
+    // `value` constraint's: it is a requirement of the body's use of any type
+    // parameter whose constraints admit a move-only substitution"), and
+    // `dv: U := 99` is not an operation that copies a T — it copies an `int`
+    // INTO a T slot. MEASURED: the deferral has no mechanism — the body is
+    // not re-checked at the instantiation, so `class Holder<U> where U: value`
+    // with `public dv: U := 99` compiled clean and MISCOMPILED at
+    // `Holder<Point>` (the int 99 was stored into the record's first word; the
+    // program printed `99` and `0`), while the same body at `F<string>` under
+    // `where T: notnull` produced malformed IR ("Function return type does
+    // not match operand type of return inst!"). The sibling arm below
+    // (#5469 — a concrete CLASS/RECORD source into a type parameter) was
+    // NEVER constraint-gated and already rejects that shape under every
+    // constraint kind; this arm now matches it.
     {
         std::string_view toTpHead =
             (to->kind == TypeRef::Kind::Named && !to->declaration &&
@@ -10997,19 +11036,7 @@ void ExprTC::checkAssignable(
                                    freeTypeParamNames->count(toTpHead);
         if (!toTpHead.empty() && fromConcretePrimitive &&
             !toIsCalleeFreeParam &&
-            currentScopeGenericParamNames().count(toTpHead) &&
-            // fix #4810 scope (§14.2): only UNCONSTRAINED type-parameter
-            // targets (§5.1's narrow wording — primitive widening and
-            // constant narrowing both fail under the weakest "no constraint
-            // names a primitive" assumption). A CONSTRAINED parameter like
-            // `where T: value` admits primitive substitutions, so a
-            // primitive-literal initializer into T-typed storage is checked
-            // at instantiation per §14.2's "operations that copy T …
-            // are checked at instantiation" — that path is the
-            // `generic_ref_out_exact_unification_1686__…` lit test's
-            // pinned behaviour and the fix's narrow issuance must NOT
-            // collide with it.
-            !isCurrentScopeTypeParamConstrained(toTpHead)) {
+            currentScopeGenericParamNames().count(toTpHead)) {
             // fix #4916 (§3.6 rule 2, §5.1, §14.2, v0.307): the GENERAL
             // `checkAssignable` arm must NOT use the FIELD wording
             // ("a primitive literal cannot initialize a generic field") —
@@ -11025,15 +11052,41 @@ void ExprTC::checkAssignable(
             // the visitMember FieldDecl/PropertyDecl arms at lines
             // ~15079 and ~15474 — those are the sites the OLD wording
             // actually describes.
+            //
+            // fix #8639 (§5.1, §14.2, v0.357): a CONSTRAINED target gets
+            // its own tail. The old tail's remedy — `default(T)` — is a
+            // compile error under `where T: class` and under any type-bound
+            // constraint (§17.11: "the constraint guarantees T is
+            // non-nullable, and the null value `default(T)` would produce
+            // does not fit T's contract"), so recommending it there would
+            // point at a second error. The constrained tail names the reason
+            // the constraint does not help (it ADMITS substitutions; it does
+            // not create a conversion) and gives the two legal spellings.
+            const bool toIsConstrained =
+                isCurrentScopeTypeParamConstrained(toTpHead);
             reportNotConvertible(
                 std::string("a value of primitive type `") +
                 spellPrimitiveName(from->primitive) +
                 "` does not implicitly convert to the type parameter `" +
                 std::string(toTpHead) +
-                "` (§3.6 rule 2, §5.1, §14.2) — for a literal "
-                "initializer use a `default(" + std::string(toTpHead) +
-                ")` expression, or constrain `" + std::string(toTpHead) +
-                "` to an interface that exposes the value you need");
+                "` (§3.6 rule 2, §5.1, §14.2) — " +
+                (toIsConstrained
+                     ? std::string("§5.1 lists no conversion from a concrete "
+                                   "type to a type parameter, and the "
+                                   "constraint on `") +
+                           std::string(toTpHead) +
+                           "` does not make `" +
+                           spellPrimitiveName(from->primitive) +
+                           "` one of the types it admits; use a `default(" +
+                           std::string(toTpHead) +
+                           ")` expression where the constraint admits a zero "
+                           "value (§17.11), or take the value from a "
+                           "parameter of that type"
+                     : std::string("for a literal initializer use a `default(") +
+                           std::string(toTpHead) +
+                           ")` expression, or constrain `" +
+                           std::string(toTpHead) +
+                           "` to an interface that exposes the value you need"));
             return;
         }
     }
@@ -26054,32 +26107,57 @@ void ExprTC::visitMember(const ast::Member& m) {
                             // is a qualifier, not a rename.
                             !fty->isAliasQualifiedBuiltin() &&
                             currentScopeGenericParamNames().count(
-                                fty->headName()) &&
-                            // fix #4810 scope: only UNCONSTRAINED type-
-                            // parameter targets — see the matching clause at
-                            // the #4810 `checkAssignable` arm for the spec
-                            // derivation.
-                            !isCurrentScopeTypeParamConstrained(
                                 fty->headName())) {
                             std::string_view toTpHead = fty->headName();
+                            // fix #8639 (§5.1, §14.2, v0.357): a CONSTRAINED
+                            // type-parameter target is rejected on the same
+                            // §5.1 ground as an unconstrained one — the
+                            // constraint ADMITS substitutions, it does not
+                            // create a conversion (see the #4810
+                            // `checkAssignable` arm's #8639 note for the
+                            // derivation and the measurement). The unconstrained
+                            // wording is unchanged; the constrained one names
+                            // the reason the constraint does not help and
+                            // gives the legal spellings.
+                            const bool toIsConstrained =
+                                isCurrentScopeTypeParamConstrained(toTpHead);
                             ctx_.diagnostics().report(
                                 Severity::Error,
                                 fd->initializer->span.begin,
                                 std::string("initializer for field `") +
                                     std::string(fd->name) +
                                     "` has a type that is not implicitly "
-                                    "convertible to the target type (§5.1): `"
-                                    + std::string(toTpHead) +
-                                    "` is a type parameter, and a primitive "
-                                    "literal cannot initialize a generic "
-                                    "field whose type parameter may resolve "
-                                    "to a class, record, or non-int primitive "
-                                    "(§5.1, §14.2) — use a `default(" +
+                                    "convertible to the target type (§5.1): `" +
                                     std::string(toTpHead) +
-                                    ")` expression, or constrain `" +
-                                    std::string(toTpHead) +
-                                    "` to an interface that exposes the value "
-                                    "you need");
+                                    (toIsConstrained
+                                         ? std::string(
+                                               "` is a type parameter, and "
+                                               "§5.1 lists no conversion from "
+                                               "a concrete type to a type "
+                                               "parameter — the constraint on "
+                                               "`") +
+                                               std::string(toTpHead) +
+                                               "` does not make the primitive "
+                                               "one of the types it admits "
+                                               "(§5.1, §14.2); use a `default(" +
+                                               std::string(toTpHead) +
+                                               ")` expression where the "
+                                               "constraint admits a zero value "
+                                               "(§17.11), or take the value from "
+                                               "a parameter of that type"
+                                         : std::string(
+                                               "` is a type parameter, and a "
+                                               "primitive literal cannot "
+                                               "initialize a generic field "
+                                               "whose type parameter may "
+                                               "resolve to a class, record, or "
+                                               "non-int primitive (§5.1, §14.2) "
+                                               "— use a `default(") +
+                                               std::string(toTpHead) +
+                                               ")` expression, or constrain `" +
+                                               std::string(toTpHead) +
+                                               "` to an interface that exposes "
+                                               "the value you need"));
                         }
                     }
                     // The §5.1 / §22.8 / §23.1 assignability check that
@@ -26467,32 +26545,51 @@ void ExprTC::visitMember(const ast::Member& m) {
                             // rename. Mirrors the field clause above.
                             !pty->isAliasQualifiedBuiltin() &&
                             currentScopeGenericParamNames().count(
-                                pty->headName()) &&
-                            // fix #4810 scope: only UNCONSTRAINED type-
-                            // parameter targets — see the matching clause at
-                            // the #4810 `checkAssignable` arm for the spec
-                            // derivation.
-                            !isCurrentScopeTypeParamConstrained(
                                 pty->headName())) {
                             std::string_view toTpHead = pty->headName();
+                            // fix #8639 (§5.1, §14.2, v0.357): the
+                            // auto-property twin of the FieldDecl arm's
+                            // #8639 change — a CONSTRAINED type-parameter
+                            // target is rejected on the same §5.1 ground.
+                            const bool toIsConstrained =
+                                isCurrentScopeTypeParamConstrained(toTpHead);
                             ctx_.diagnostics().report(
                                 Severity::Error,
                                 pd->autoInitializer->span.begin,
                                 std::string("initializer for property `") +
                                     std::string(pd->name) +
                                     "` has a type that is not implicitly "
-                                    "convertible to the target type (§5.1): `"
-                                    + std::string(toTpHead) +
-                                    "` is a type parameter, and a primitive "
-                                    "literal cannot initialize a generic "
-                                    "field whose type parameter may resolve "
-                                    "to a class, record, or non-int primitive "
-                                    "(§5.1, §14.2) — use a `default(" +
+                                    "convertible to the target type (§5.1): `" +
                                     std::string(toTpHead) +
-                                    ")` expression, or constrain `" +
-                                    std::string(toTpHead) +
-                                    "` to an interface that exposes the value "
-                                    "you need");
+                                    (toIsConstrained
+                                         ? std::string(
+                                               "` is a type parameter, and "
+                                               "§5.1 lists no conversion from "
+                                               "a concrete type to a type "
+                                               "parameter — the constraint on "
+                                               "`") +
+                                               std::string(toTpHead) +
+                                               "` does not make the primitive "
+                                               "one of the types it admits "
+                                               "(§5.1, §14.2); use a `default(" +
+                                               std::string(toTpHead) +
+                                               ")` expression where the "
+                                               "constraint admits a zero value "
+                                               "(§17.11), or take the value from "
+                                               "a parameter of that type"
+                                         : std::string(
+                                               "` is a type parameter, and a "
+                                               "primitive literal cannot "
+                                               "initialize a generic field "
+                                               "whose type parameter may "
+                                               "resolve to a class, record, or "
+                                               "non-int primitive (§5.1, §14.2) "
+                                               "— use a `default(") +
+                                               std::string(toTpHead) +
+                                               ")` expression, or constrain `" +
+                                               std::string(toTpHead) +
+                                               "` to an interface that exposes "
+                                               "the value you need"));
                         }
                     }
                     // The assignability half still defers on

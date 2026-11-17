@@ -125,39 +125,66 @@ BEZEL_TEST(generic_record_body_field_default_nullable_3944,
 // `ast::PropertyDecl` in buildRecordValue's dispatch) and the same
 // generic+nullable-default hazard.
 //
-// REWORK 2026-09-25 (cycle-25 main binding): this row was rewritten to
-// use `where T: new()` (§14.2 — `new()` admits `T = int?` because
-// `int?`'s `default` is `null`) plus a primitive-literal initializer
-// `F: T := 7`. The `where T: new()` qualifier pulls the row OUT of the
-// #4810 sema arm's narrowed scope: #4810 only rejects primitive-literal
-// init at UNCONSTRAINED type-parameter targets (§5.1 / §14.2; this row's
-// T IS constrained to `new()`, so the literal initializer's §5.1
-// conversion is checked at instantiation per §14.2's deferred-pin — the
-// `generic_ref_out_exact_unification_1686__…` lit test's pinned behaviour
-// and what the #4810 accept-control `constrained_type_param_field_…`
-// row at `Holder<U> where U: value` exercises).
+// REWORK 2026-11-12 (fix #8639, §5.1 / §3.6 rule 2 / §14.2): this row's
+// program was `record Box<T>(Y: int) where T: new()  public F: T := 7;`
+// — a primitive-literal initializer into a BARE type-parameter field, with
+// the `where T: new()` constraint chosen (in the 2026-09-25 rework) to
+// pull the row OUT of the #4810 sema arm's scope, which then covered only
+// UNCONSTRAINED type-parameter targets. fix #8639 closes that hole: a
+// concrete primitive does not implicitly convert to a type parameter under
+// ANY constraint kind (§5.1's conversion list names a type parameter only
+// as the SOURCE of a reference conversion; a constraint ADMITS
+// substitutions, it does not create a conversion — §14.2; §3.6 rule 2
+// requires the body to type-check under the weakest assumption its
+// constraints establish), so `public F: T := 7` is now ill-formed under
+// `where T: new()` too, and the row's program no longer compiles.
 //
-// Why this row DOES pin #3944 while the `default(T)` rows above do NOT:
-// the codegen-path #3944 bug was triggered by the primitive-literal
-// default value (the only shape that exposes the bare-vs-resolved type
-// discrepancy in `buildRecordValue`'s default-init loop — `default(T)`
-// gives a null tagged value on BOTH pre-#3944 and post-#3944 codegen,
-// which is the symmetric case the wrap handles identically on both
-// sides). `F: T := 7` at `Box<int?>` reads back `f = present(7)` — the
-// wrap is required. Pre-#3944 (bare `recordMemberType`): the wrap is
-// skipped because `isNullableValueTy(T)` returns false on bare T, so the
-// raw i32 7 lands directly over the `{i8, int}` slot: hasValue becomes 7
-// (truthy) and the value byte stays 0, so `b.F ?? -1` reads 0. Pre-#3944
-// the row returns 0 (corrupted). Post-#3944 (`recordMemberTypeResolved`):
-// `isNullableValueTy(int?)` returns true, the {hasValue=1, value=7}
-// struct is constructed and stored, so `b.F ?? -1` reads 7. Post-#3944
-// the row returns 7 (correct). Measured on the lane's redo of FAIL-WITHOUT
-// / PASS-WITH at this exact subtree, this cycle.
+// The row's PROGRAM is rewritten to the nearest legal shape that keeps the
+// codegen path it was written for:
+//
+//   record Box<T>(Y: int) where T: new()
+//     public F: int? := 7;
+//   end Box;
+//
+// — the same generic record, the same `new()`-constrained parameter
+// instantiated at `int?`, the same PLAIN body field (`ast::FieldDecl`, not
+// the auto-property path), the same primitive-literal initializer, the same
+// nullable-value field, and the same observable: the field reads back
+// `present(7)`, so `b.F ?? -1` is 7.
+//
+// COVERAGE CHANGE (stated plainly): the bare-vs-resolved aspect of the
+// #3944 pin is UNREPRESENTABLE now. The #3944 bug was the default-init
+// loop reading the BARE (unsubstituted) field type: for a field declared
+// `F: T` in a record instantiated at `Box<int?>`, `isNullableValueTy(T)`
+// on the bare type is false while `isNullableValueTy(int?)` on the
+// RESOLVED type is true, so the {i8 hasValue; T value} wrap was skipped
+// and the raw payload landed over the tagged slot. That shape needs BOTH a
+// bare type-parameter field type AND a non-null payload. The only legal
+// default for a bare type-parameter field is `default(T)` (§17.11), and
+// `default(T)` at a nullable substitution is `null` — the symmetric case
+// the wrap handles identically on both sides (the same loss the
+// auto-property row above already documents). fix #8639 therefore makes the
+// one shape that could expose the discrepancy ill-formed, and what remains
+// below is a REGRESSION GUARD for the default-init LOOP's wrap/widen logic
+// on the plain-field path (a regression that drops the wrap for a
+// nullable value field now reads back 0 instead of 7), not a strict
+// FAIL-WITHOUT pin for the specific bare-vs-resolved defect.
+//
+// (The original 2026-09-25 measurement, for the record: pre-#3944 this
+// program returned 0 — the raw i32 7 over the `{i8, int}` slot, hasValue
+// byte 7 (truthy), value byte 0 — and post-#3944 it returned 7.)
+//
+// The bare-type-parameter PLAIN-field successor (`public F: T := default(T)`
+// at `Box<int?>` — the §17.11-legal spelling, which keeps the record's
+// substitution in the plain-field path) is green with AND without this fix,
+// so it is NOT added here as a new gtest row (a base-green row belongs in
+// the conformance corpus); it is handed to the harvest lane in the lane's
+// probe dir under `corpus-candidates/` (case `c8639_0012`).
 BEZEL_TEST(generic_record_body_field_default_nullable_3944,
            plain_field_default_also_fixed) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; record Box<T>(Y: int) where T: new() "
-        "  public F: T := 7; "
+        "  public F: int? := 7; "
         "end Box; "
         "class C public static method Main(): int "
         "  var b := new Box<int?>(0); "

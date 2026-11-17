@@ -130,18 +130,34 @@ BEZEL_TEST(generic_arg_inference_785, inline_out_var_inferred_typearg_1164) {
 // must still participate in inference — here T is inferable ONLY from the out
 // argument `s: int`, so skipping the inline forms must not have broadened to
 // skip plain `out`.
+//
+// fix #8639 (§5.1, §3.6 rule 2, §14.2, v0.357): the body's write into the
+// `out` parameter is re-spelled `o := default(T)` (the §17.11-legal default
+// for a `value`-constrained type parameter) and the EXPECTED VALUE follows it
+// (the caller's `s` now receives `default(int)` = 0, so `r + s` is 3, not 10).
+// `s` starts at 9, not 0, so the row still proves the `out` write LANDED: had
+// it not, `r + s` would be 12.
+// The body used to write the primitive literal `o := 7` — a concrete-primitive
+// -into-a-type-parameter assignment: §5.1's conversion list names a type
+// parameter only as the SOURCE of a conversion, and under `where T: value`
+// (which admits records too) the literal has no conversion to `T`, so the body
+// does not type-check under the weakest assumption its constraints establish
+// (§3.6 rule 2). The change is confined to the body's write and the value it
+// writes: the guard's subject — the INFERENCE of `T` from the single
+// pre-declared `out` argument — is untouched (the call still compiles, and
+// `s` is still typed `int` from the out parameter).
 BEZEL_TEST(generic_arg_inference_785, predeclared_out_arg_still_infers_1164) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
         "static class U "
         "  public static method H<T>(out o: T): int where T: value "
-        "    o := 7; return 3; "
+        "    o := default(T); return 3; "
         "  end H; "
         "  public static method Main(): int "
-        "    var s: int := 0; "
-        "    var r := U.H(out s); return r + s; "  // 10
+        "    var s: int := 9; "
+        "    var r := U.H(out s); return r + s; "  // 3 (r = 3, s overwritten from 9 to default(int) = 0)
         "  end Main; "
-        "end U;"), 10);
+        "end U;"), 3);
 }
 
 
