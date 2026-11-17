@@ -13,7 +13,6 @@
 # (mirrors scripts/localdecl_only_walkers.grandfather, ported
 # from #3590 as the family-wide mechanism).
 
-1    tests/codegen/async_auto_drop_sync_dispose_1663_test.cpp
 1    tests/codegen/async_iter_early_abandonment_dispose_1525_test.cpp
 1    tests/codegen/async_iterator_lambda_param_capture_cell_3567_test.cpp
 1    tests/codegen/box_value_type_generic_record_2203_test.cpp
