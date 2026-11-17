@@ -20190,6 +20190,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     if (v && v->getType()->isPointerTy() &&
         currentFn_ == objectStringReleaseEligibleFn_ &&
         objectStringBorrowAll_.count(static_cast<const void*>(declNode)) &&
+        !objectStringLateLocals_.count(static_cast<const void*>(declNode)) &&
         !disposeStack_.empty()) {
         // Retain: the Object slot now owns an independent +1.
         emitStringRetain(v);
@@ -20205,6 +20206,31 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             // Initializer is a string-typed identifier — the slot is a string.
             builder_.CreateStore(builder_.getInt1(true), state);
         }
+        if (objectStringReleaseEligible_.count(
+                static_cast<const void*>(declNode))) {
+            Disposal d{slot, nullptr};
+            d.objectStringRelease = true;
+            d.objectStringReleaseState = state;
+            disposeStack_.back().push_back(d);
+        }
+    }
+    // fix #8598 (§28.9 / §8.6, v0.357): a LATE string-aliased slot — an
+    // `Object`/interface-typed local whose own initializer is not a string (a
+    // class instance, `null`, or none) and that a later `o := <string>`
+    // makes hold a string (collectObjectStringReleaseEligible). It takes NO
+    // reference at bind (what it holds now is not a string), so its state bit
+    // starts FALSE; the reassignment site retains the string, releases a
+    // displaced one, and sets the bit, so the scope-end release below drops
+    // exactly the reference the slot holds last. Without it the reassignment's
+    // retain had no release at all: a non-escaping, read-only alias leaked one
+    // string per call where the pre-fix build was clean (review
+    // r42-rev-m37-8598, probes d01 / d02 / d04 / c16 / d05 / d07). An escaping
+    // alias registers no release and keeps its reference (the bounded leak).
+    if (slot && currentFn_ == objectStringReleaseEligibleFn_ &&
+        objectStringLateLocals_.count(static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        llvm::AllocaInst* state = entryAlloca(llvm::Type::getInt1Ty(llvm_));
+        builder_.CreateStore(builder_.getInt1(false), state);
         if (objectStringReleaseEligible_.count(
                 static_cast<const void*>(declNode))) {
             Disposal d{slot, nullptr};
@@ -31921,6 +31947,16 @@ struct StringEscapeWalker {
     // null, such a formal is a conservative ESCAPE (leak, never UAF).
     const std::function<bool(const sema::Symbol*, size_t)>*
         objectFormalNonEscaping = nullptr;
+    // fix #8598 (§28.9, v0.357): the `o := s;` reassignments whose site
+    // RETAINS `s` into the `Object`/interface-typed slot `o`
+    // (`Emitter::objectStringReassignRetain_`, filled by
+    // collectObjectStringReleaseEligible). The reassignment arm reads the
+    // source as a SAFE READ only for a member of this set: the set is the
+    // very predicate the retain is emitted on, so the walk's verdict and the
+    // retain are one fact. Null ⇒ every such reassignment stays the
+    // conservative escape (leak, never UAF).
+    const std::unordered_set<const ast::AssignmentStmt*>*
+        objectStringReassignRetain = nullptr;
     // fix #2641 / §22.4: the `out var x` ARGUMENT occurrence that INTRODUCES the
     // tracked recipient. For an inline out-var the "decl node" IS an
     // `ast::IdentifierExpr` in an argument list (ExprTypecheck_Exprs.cpp sets
@@ -35311,61 +35347,42 @@ struct StringEscapeWalker {
                 }
                 // fix #8598 (§28.9, v0.357): the OBJECT-ALIAS twin of the
                 // #2806 arm above. `o := s;` where `o` is an `Object`-typed
-                // local is a BORROW of `s`, not an ESCAPE: the reassignment
-                // site now RETAINS the string into the slot (the slot owes a
-                // reference whatever names the string — §28.9), so `s` keeps
-                // its own `+1` and its own scope-end release, and the slot's
-                // own `+1` is released with the slot.
+                // local is a BORROW of `s`, not an ESCAPE, WHEN the
+                // reassignment site retains `s` into the slot: then `s`
+                // keeps its own `+1` and its own scope-end release, and the
+                // slot's own `+1` is released with the slot (or, for an
+                // alias that escapes, kept — the bounded leak, never the
+                // dangling read).
                 //
-                // WITHOUT this arm the source was tainted: the walker's
-                // general `:=` handling reads the RHS with safeRead=false, so
-                // `s`'s scope-end release was suppressed while the slot's
-                // release (the state bit says "the slot holds a string") ran
-                // in its place — the two balanced by accident, and a fix that
-                // added the slot's own retain turned that accident into a
-                // leak. Reading the source as a safe read is the sound
-                // verdict now that the slot really does hold its own
-                // reference.
-                //
-                // The retain really happens wherever this arm fires: the
-                // VALUE's own static type is the test (a non-nullable
-                // `string` is what `isObjectStringSource` admits), and the
-                // TARGET's own static type is the other half (an
-                // `Object`/interface-typed local is the slot that takes the
-                // reference). The value's static type also keeps this arm
-                // from firing in the OBJECT-alias walk, where the tracked
-                // local is an `Object` and a reassignment into a slot of an
-                // `Object`-typed value retains NOTHING — reading the source
-                // as safe there would free the string under the alias.
+                // The arm fires ONLY for a member of
+                // `objectStringReassignRetain` — the set the reassignment
+                // site in lowerStmt emits its `bz_string_retain` on. It used
+                // to fire for ANY non-nullable `string` value while the
+                // retain was gated on `isObjectStringSource`, which rejects
+                // a source whose declaration is not a `var` / `const` local
+                // (an `out var` recipient, a pattern binding): `s` then kept
+                // its scope-end release while the slot took NO reference,
+                // and a store of the alias dangled (measured
+                // heap-use-after-free, review r42-rev-m37-8598 probe e01).
+                // One set for both halves keeps them in lockstep. A
+                // reassignment outside the set falls through to the
+                // conservative escape below (the source's release is
+                // suppressed: a leak, never a dangling read).
                 //
                 // Gated on `stringReleaseMode` (the string-release walk
                 // family only — the dict-materializer, grouping and
-                // borrowing-Array walks share this walker but emit no
-                // assignment-side retain, so for them the copy genuinely
-                // aliases a single reference) and on `!inLambda` (a
-                // captured-from outer-local read always escapes — the env
-                // outlives the scope), the same `inLambda` clause the #1997 /
-                // #2764 / #2806 / #8214 relaxations use.
+                // borrowing-Array walks share this walker but leave the set
+                // null) and on `!inLambda` (a captured-from outer-local read
+                // always escapes — the env outlives the scope), the same
+                // `inLambda` clause the #1997 / #2764 / #2806 / #8214
+                // relaxations use.
                 if (stringReleaseMode && !inLambda &&
+                    objectStringReassignRetain &&
+                    objectStringReassignRetain->count(as) &&
                     isTargetIdent(as->value.get())) {
-                    const sema::TypeRef* vTy = ctx.exprType(*as->value.get());
-                    const bool valueIsString =
-                        vTy && !vTy->nullable &&
-                        vTy->kind == sema::TypeRef::Kind::Primitive &&
-                        vTy->primitive == sema::PrimitiveType::String;
-                    auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
-                        as->target.get());
-                    if (valueIsString && tid) {
-                        auto* tls = dynamic_cast<sema::LocalSymbol*>(
-                            ctx.exprSymbol(*tid));
-                        if (tls && tls->decl &&
-                            isObjectOrInterfaceTypeRef(
-                                ctx.exprType(*as->target))) {
-                            expr(as->target.get(), /*safeRead=*/false);
-                            expr(as->value.get(), /*safeRead=*/true);
-                            return;
-                        }
-                    }
+                    expr(as->target.get(), /*safeRead=*/false);
+                    expr(as->value.get(), /*safeRead=*/true);
+                    return;
                 }
                 // fix #8214 / §28.9 / §4.6 / §8.6 (v0.355): the
                 // OBJECT-STRING STORAGE FIELD twin of the property-set
@@ -40829,6 +40846,7 @@ void Emitter::collectStringReleaseEligible(
         // and the source's release stays armed. Must run AFTER
         // collectObjectStringReleaseEligible (which populates the set).
         w.objectStringBorrowAliases = &objectStringBorrowAll_;
+        w.objectStringReassignRetain = &objectStringReassignRetain_;  // fix #8598
         // fix #8214 / §28.9 / §4.6 / §8.6 (v0.355): the OBJECT-STRING
         // STORAGE FIELDS — a store into such a field retains the value
         // into the field (the field takes its OWN +1), so the source's
@@ -40874,6 +40892,7 @@ void Emitter::collectStringReleaseEligible(
         // the producer loop above (a copy of an `Object` alias of a
         // string is a borrow too).
         w.objectStringBorrowAliases = &objectStringBorrowAll_;
+        w.objectStringReassignRetain = &objectStringReassignRetain_;  // fix #8598
         // fix #8214 / §28.9 / §4.6 / §8.6 (v0.355): the OBJECT-STRING
         // STORAGE FIELDS — a store into such a field retains the value
         // into the field (the field takes its OWN +1), so the source's
@@ -40910,6 +40929,7 @@ bool Emitter::stringParamReleaseEligible(
     w.scrutineeBorrowMode = true;
     w.borrowRetainedAliases = &stringBorrowAll_;
     w.objectStringBorrowAliases = &objectStringBorrowAll_;
+    w.objectStringReassignRetain = &objectStringReassignRetain_;  // fix #8598
     for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
     return !w.escaped;
 }
@@ -40953,6 +40973,7 @@ bool Emitter::outVarStringReleaseEligible(const ast::IdentifierExpr* id) {
     w.scrutineeBorrowMode = true;    // fix #2481
     w.borrowRetainedAliases = &stringBorrowAll_;          // fix #2764
     w.objectStringBorrowAliases = &objectStringBorrowAll_;  // fix #2900
+    w.objectStringReassignRetain = &objectStringReassignRetain_;  // fix #8598
     w.outVarIntroSite = static_cast<const void*>(id);
     // fix #8307 (§28.9, v0.357): see collectStringReleaseEligible.
     const std::function<bool(const sema::Symbol*, size_t)>
@@ -47169,6 +47190,8 @@ void Emitter::collectObjectStringReleaseEligible(
     objectStringBorrowAll_.clear();
     objectStringReleaseEligible_.clear();
     objectStringReassignedLocals_.clear();
+    objectStringReassignRetain_.clear();   // fix #8598
+    objectStringLateLocals_.clear();       // fix #8598
     // Candidate scan: an Object/interface-typed `var` local (non-using, with
     // an initializer) whose initializer is a bare string-typed IdentifierExpr
     // referring to a string local. The identifier must be a LocalSymbol with a
@@ -47203,6 +47226,8 @@ void Emitter::collectObjectStringReleaseEligible(
     // LocalDecl-only cast they could only be reached for a LocalDecl (for which
     // the block recursion below is a no-op anyway), which is no longer true.
     std::vector<const ast::Node*> candidates;
+    // fix #8598: the LATE candidates not yet reassigned from a string.
+    std::unordered_set<const ast::LocalDecl*> pendingLate;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         [&] {
@@ -47345,6 +47370,22 @@ void Emitter::collectObjectStringReleaseEligible(
             candidates.push_back(s);
             objectStringBorrowAll_.insert(static_cast<const void*>(s));
         }();
+        // fix #8598 (§28.9 / §8.6, v0.357): an `Object`/interface-typed `var`
+        // local the scan above did NOT admit — its own initializer is not a
+        // string (a class instance, `null`, no initializer at all) — is a
+        // LATE candidate: it becomes a string-aliased slot at its first
+        // `o := <string>` below, whose site retains the string into it. The
+        // slot takes no reference at bind; its state bit starts false.
+        if (auto* lateLd = dynamic_cast<const ast::LocalDecl*>(s)) {
+            LocalDeclInitView lv = localDeclInitView(s);
+            const sema::TypeRef* lt =
+                lv.type ? ctx_.resolvedType(*lv.type)
+                        : (lv.init ? ctx_.exprType(*lv.init) : nullptr);
+            if (!lv.isUsing &&
+                !objectStringBorrowAll_.count(static_cast<const void*>(s)) &&
+                isObjectOrInterfaceTarget(lt))
+                pendingLate.insert(lateLd);
+        }
         // Reassigned-target scan: identical shape to the box collector's —
         // every plain `:=` (and compound `:=`) into one of the candidate
         // locals is recorded so the reassignment site can release the old
@@ -47362,9 +47403,25 @@ void Emitter::collectObjectStringReleaseEligible(
                     // reaching codegen — #3591.
                     if (auto* tld = dynamic_cast<const ast::LocalDecl*>(
                             tsym->decl)) {
+                        // fix #8598 (§28.9, v0.357): the reassignment that
+                        // makes a LATE candidate hold a string admits it.
+                        const bool strSrc =
+                            as->op == ":=" &&
+                            isObjectStringSource(as->value.get()) == 1;
+                        if (strSrc && pendingLate.erase(tld)) {
+                            candidates.push_back(tld);
+                            objectStringBorrowAll_.insert(
+                                static_cast<const void*>(tld));
+                            objectStringLateLocals_.insert(
+                                static_cast<const void*>(tld));
+                        }
                         if (objectStringBorrowAll_.count(
-                                static_cast<const void*>(tld)))
+                                static_cast<const void*>(tld))) {
                             objectStringReassignedLocals_.insert(tld);
+                            // fix #8598: the site retains the string into the
+                            // slot — the one set the escape walk reads too.
+                            if (strSrc) objectStringReassignRetain_.insert(as);
+                        }
                     }
                 }
             }
@@ -47415,6 +47472,7 @@ void Emitter::collectObjectStringReleaseEligible(
         w.scrutineeBorrowMode = true;
         w.borrowRetainedAliases = &stringBorrowAll_;
         w.objectStringBorrowAliases = &objectStringBorrowAll_;
+        w.objectStringReassignRetain = &objectStringReassignRetain_;  // fix #8598
         w.objectFormalNonEscaping = &objectFormalNonEscaping;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)

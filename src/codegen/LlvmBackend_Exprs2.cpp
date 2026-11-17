@@ -2000,6 +2000,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     auto savedObjectStringBorrowAll = objectStringBorrowAll_;
     auto savedObjectStringReleaseEligible = objectStringReleaseEligible_;
     auto savedObjectStringReassignedLocals = objectStringReassignedLocals_;
+    auto savedObjectStringReassignRetain = objectStringReassignRetain_;  // #8598
+    auto savedObjectStringLateLocals = objectStringLateLocals_;          // #8598
     llvm::Function* savedObjectStringReleaseEligibleFn =
         objectStringReleaseEligibleFn_;
     // fix #2641: the analyzed-body pointer travels with the eligibility sets
@@ -4532,6 +4534,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         std::move(savedObjectStringReleaseEligible);
     objectStringReassignedLocals_ =
         std::move(savedObjectStringReassignedLocals);
+    objectStringReassignRetain_ =
+        std::move(savedObjectStringReassignRetain);   // fix #8598
+    objectStringLateLocals_ = std::move(savedObjectStringLateLocals);  // #8598
     objectStringReleaseEligibleFn_ = savedObjectStringReleaseEligibleFn;
     stringReleaseAnalyzedBody_ = savedStringReleaseBody;   // fix #2641
     stringReleaseAnalyzedExpr_ = savedStringReleaseAnalyzedExpr;  // fix #4044

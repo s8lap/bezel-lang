@@ -68,6 +68,9 @@ const char* kLengthTotal = "690\n";
 //     lambda, so the slot's own scope-end release is armed and the lambda's
 //     retain balances it.
 const char* kDecls =
+    "public class Cell "
+    "  public V: int := 0; "
+    "end Cell; "
     "public class Holder "
     "  public O: Object := \"\"; "
     "  public method KeepLam(x: string) "
@@ -86,6 +89,16 @@ const char* kDecls =
     "return o.ToString().Length; end; "
     "    return f(); "
     "  end ReadLam; "
+    // fix-forward (review r42-rev-m37-8598, probe d07): inside the lambda body
+    // a LATE slot — its own initializer is a borrowed class instance — is
+    // REASSIGNED from the captured string and only read.
+    "  public owned C: Cell := new Cell(); "
+    "  public method Peek(o: Object): int => o.ToString().Length; "
+    "  public method ClassInitReassignLam(x: string): int "
+    "    var f := lambda(): int => do var o: Object := this.C; o := x; "
+    "return this.Peek(o); end; "
+    "    return f(); "
+    "  end ClassInitReassignLam; "
     "end Holder; "
     "public class Make "
     "  public static method Str(n: int): string => \"s\" + n.ToString(); "
@@ -189,4 +202,22 @@ BEZEL_TEST(object_string_lambda_capture_retain_8599,
 BEZEL_TEST(object_string_lambda_capture_retain_8599,
            control_lambda_body_captured_param_object_alias_read_only_spec_28_9) {
     expectCleanRun(readProgram(), kLengthTotal);
+}
+
+// ===========================================================================
+// BOUNDARY CONTROL (base-green, kept: an rc leak check over a loop, which a
+// corpus case cannot express). Review r42-rev-m37-8598, probe d07.
+// ===========================================================================
+
+// Inside a lambda body, an `Object` local whose own initializer is a borrowed
+// class instance is reassigned from the captured string and only read. Goes
+// RED under the wrong fix `retain at the reassignment into a slot whose
+// initializer is not a string, with no release armed for it`. That was the
+// first cut of #8598: MEASURED LEAK 7290 B / 400 allocs. The late slot's
+// state-bit-gated scope-end release balances it.
+BEZEL_TEST(object_string_lambda_capture_retain_8599,
+           fixfwd_lambda_body_class_init_reassign_read_only_no_leak_spec_28_9) {
+    expectCleanRun(program("      do var x := Make.Str(i); "
+                           "total := total + h.ClassInitReassignLam(x); end; "),
+                   kLengthTotal);
 }

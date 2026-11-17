@@ -22377,6 +22377,22 @@ private:
     // box-vs-class dispatch. Populated by `collectObjectStringReleaseEligible`
     // (a statement walk, identical in shape to the box one).
     std::unordered_set<const ast::LocalDecl*> objectStringReassignedLocals_;
+    // fix #8598 (§28.9, v0.357): the `o := <string>` REASSIGNMENTS whose
+    // site retains the string into the `Object`/interface-typed slot `o` —
+    // `o` is a candidate of THIS body (`objectStringBorrowAll_`) and the
+    // source is one `isObjectStringSource` admits. ONE set answers the
+    // question for BOTH halves of the fact: the reassignment site in
+    // lowerStmt retains exactly here, and the StringEscapeWalker reads the
+    // source as a safe read exactly here (so the source keeps its own
+    // scope-end release). Keyed on the AssignmentStmt node.
+    std::unordered_set<const ast::AssignmentStmt*> objectStringReassignRetain_;
+    // fix #8598 (§28.9, v0.357): the subset of `objectStringBorrowAll_` whose
+    // OWN initializer is not a string (a class instance, `null`, no
+    // initializer at all) and that a later `o := <string>` makes hold a
+    // string. Such a slot takes no reference at bind; its state bit starts
+    // FALSE and the reassignment site sets it, so its scope-end release
+    // drops the reference the reassignment took.
+    std::unordered_set<const void*> objectStringLateLocals_;
     // Pin token: the function `collectObjectStringReleaseEligible` analyzed
     // (mirrors `stringReleaseEligibleFn_` / `boxReleaseEligibleFn_`).
     llvm::Function* objectStringReleaseEligibleFn_ = nullptr;

@@ -2385,24 +2385,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // `isObjectStringSource` (declared below) runs; reusing it
                     // is the only way the bit update and the bind site can
                     // stay in lockstep.
-                    //
-                    // fix #8598 (§28.9, v0.357): the target's slot kind.
-                    // An `Object`/interface-typed LOCAL is a slot that holds a
-                    // reference as its bare pointer (§8.6: a reference type
-                    // is not boxed), so a string stored into it is a string
-                    // the slot must hold a reference to (§28.9 leaves the
-                    // string's lifetime to the runtime).
-                    bool ostrTarget = false;
-                    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
-                            as->target.get())) {
-                        auto* tsym = dynamic_cast<sema::LocalSymbol*>(
-                            ctx_.exprSymbol(*tid));
-                        if (tsym && tsym->decl) {
-                            const sema::TypeRef* tTy = ctx_.exprType(*as->target);
-                            ostrTarget = isObjectOrInterfaceTarget(tTy);
-                        }
-                    }
-                    int newOstrKind = (ostrState || ostrTarget)
+                    int newOstrKind = ostrState
                         ? isObjectStringSource(as->value.get())
                         : -1;
                     // fix #8598 (§28.9, v0.357): the slot takes its OWN
@@ -2416,6 +2399,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // the next store) freed the string under the slot — the
                     // measured heap-use-after-free of #8598.
                     //
+                    // The retain fires exactly for the members of
+                    // `objectStringReassignRetain_` (collectObjectStringRelease-
+                    // Eligible): the target is an `Object`/interface-typed
+                    // local this body's collector admitted, and the source is
+                    // one `isObjectStringSource` accepts. The escape walk
+                    // reads the source as a safe read for exactly the same
+                    // set, so a source whose release stays armed is always
+                    // one the slot holds its own reference to. A body the
+                    // collector did not analyze (an `async` body, a
+                    // constructor) has no member here: the reassignment stays
+                    // the raw store it was, and the walk keeps the source
+                    // conservative.
+                    //
                     // The reference is dropped again only where the slot's own
                     // scope-end release is armed (the escape walk proved the
                     // alias never escapes); an escaping alias keeps its
@@ -2427,9 +2423,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // never dips the count to zero on the way (retain-before-
                     // release, the order `lowerStringLocalReassign` uses for
                     // the `string`-typed twin).
-                    if (ostrTarget && newOstrKind == 1 && rhs &&
-                        rhs->getType()->isPointerTy())
-                        emitStringRetain(rhs);
+                    const bool ostrRetained =
+                        objectStringReassignRetain_.count(as) && rhs &&
+                        rhs->getType()->isPointerTy();
+                    if (ostrRetained) emitStringRetain(rhs);
+                    // The bit says "the slot holds a reference of its own to
+                    // a string": a string source the site did NOT retain
+                    // leaves it false, so the scope end never releases a
+                    // reference the slot does not hold.
+                    if (newOstrKind == 1 && !ostrRetained) newOstrKind = 0;
                     if (ostrState && newOstrKind >= 0) {
                         llvm::Value* oldIsStr = builder_.CreateLoad(
                             llvm::Type::getInt1Ty(llvm_), ostrState,
