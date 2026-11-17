@@ -11903,6 +11903,38 @@ bool Emitter::returnSourceIsCalleeOwnedCollection(const ast::Expr* src) const {
                 return true;
             if (dynamic_cast<const ast::CallExpr*>(ld->initializer.get()))
                 return true;
+            // fix #6406 (§28.3.4 *Producers*, §29.2, §28.9, v0.357): a
+            // collection LITERAL targeting a reference type is `Owned` (the
+            // producers table), so it is the third fresh-owned producer form
+            // — `var a: Array<int> := [1, 2, 3]; return a;` mints the same +1
+            // backing `new Array<int>(...)` does. It was missing from this
+            // list, so
+            // the return took the BORROWING wrap and, because §28.3 suppresses
+            // the local's own reclaim on `return a`, NOBODY freed the backing:
+            // MEASURED `Direct leak of 96 byte(s)` + `Indirect leak of 64
+            // byte(s)` per call (28800 B + 19200 B over 300 calls,
+            // `bz_array_alloc`). The `new` spelling of the same program was
+            // already clean.
+            if (dynamic_cast<const ast::CollectionLiteralExpr*>(
+                    ld->initializer.get())) {
+                // EXCEPT a NESTED array-backed element (`Array<Array<int>>`
+                // viewed as `IEnumerable<IEnumerable<int>>`): that arm of
+                // `wrapAsIEnumerableForTarget` frees the source at once for a
+                // callee-owned source and hands back a wrapper over the freed
+                // backing — a use-after-free, MEASURED on the `new`-initialised
+                // twin on the base tree (so it is not this fix's) and filed as
+                // #8722. Keeping the literal spelling Borrowed here
+                // leaves it at its base behaviour (a leak) instead of
+                // promoting it to that UAF.
+                const sema::TypeRef* lt = ctx_.exprType(*id);
+                const sema::TypeRef* el =
+                    (lt && !lt->genericArgs.empty()) ? lt->genericArgs[0]
+                                                     : nullptr;
+                if (el && el->kind == sema::TypeRef::Kind::Named &&
+                    common::isArrayEnumeratorWrapSourceName(el->headName()))
+                    return false;
+                return true;
+            }
             return false;
         }
         // A ParameterSymbol, FieldSymbol, PropertySymbol, or a synthetic
