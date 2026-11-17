@@ -25587,6 +25587,51 @@ private:
         const std::unordered_map<std::string_view, const sema::TypeRef*>&
             argSemaTy);
 
+    // narrow #8386 (§9.7, §28.9, §28.3.1 K1.6, v0.357): the positional
+    // arguments of a RETURNED record construction whose string the return's
+    // own disposals are about to free — `var f := line.Split(',');
+    // return new E(f[0], n);`. `buildRecordValue`'s positional store takes one
+    // reference on each as it stores it, so the returned copy holds its own.
+    // Filled by `collectReturnedRecordStringArgsToRetain` (called by the
+    // `return` lowering before the value is lowered) and emptied right after
+    // the value is lowered. See the definition in LlvmBackend_Exprs2.cpp.
+    std::unordered_set<const ast::Expr*> returnedRecordStringArgsToRetain_;
+    void collectReturnedRecordStringArgsToRetain(const ast::Expr* e,
+                                                 bool directArgsOnly = false,
+                                                 unsigned depth = 0);
+    bool isStringReadOfLocalCollectionDisposedAtReturn(
+        const ast::Expr* e) const;
+    // The two-statement spelling of the same return, `var e := new E(f[0], n);
+    // … return e;`. The declaration cannot know it will be returned, so the
+    // string is HELD for the local's scope instead (one hidden slot per
+    // covered argument, released at scope end like a string local), and a
+    // `return e;` that still carries the held string in that field takes the
+    // returned copy's own reference from the holder
+    // (`retainReturnedRecordLocalStrings`). `fn` pins an entry to the function
+    // it was emitted in: a generic body is emitted once per specialisation.
+    struct RecordLocalStringHolder {
+        llvm::AllocaInst* slot = nullptr;   // the held string
+        llvm::Type* recTy = nullptr;        // the record's struct type
+        unsigned fieldIdx = 0;              // its field in that struct
+    };
+    struct RecordLocalStringHolders {
+        llvm::Function* fn = nullptr;
+        std::vector<RecordLocalStringHolder> holders;
+    };
+    std::unordered_map<const ast::Node*, RecordLocalStringHolders>
+        recordLocalStringHolders_;
+    // Set only while the declaration's own construction is being lowered:
+    // where `buildRecordValue` reports the holders, and the argument list
+    // (the declaration's `new E(...)`, never a nested one) they belong to.
+    std::vector<RecordLocalStringHolder>* recordLocalStringHolderSink_ = nullptr;
+    const std::vector<ast::CallArgument>* recordLocalStringHolderArgs_ = nullptr;
+    void lowerLocalDeclHoldingRecordStrings(const ast::Node* declNode,
+                                            const ast::Expr* init,
+                                            const ast::Type* typeNode,
+                                            bool isUsing);
+    void retainReturnedRecordLocalStrings(const ast::Expr* src,
+                                          llvm::Value* v);
+
     // CG-console: emit a Console.Write/Console.WriteLine call as an
     // intrinsic. Uses libc write(1, data, len) for Write and additionally
     // write(1, "\n", 1) for WriteLine. This provides observable stdout.

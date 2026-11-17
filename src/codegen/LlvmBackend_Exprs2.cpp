@@ -13078,6 +13078,190 @@ llvm::Value* Emitter::lowerEnumCast(const ast::CallExpr& call) {
 }
 
 
+// narrow #8386 (§9.7, §28.9, §28.3.1 K1.6, v0.357): the RETURN face of "an
+// indexer-read string passed into a record constructor is freed with its
+// source collection".
+//
+// THE RULE. §9.7: "Reference-typed fields whose declared types are
+// runtime-managed (`string`, `Type`, function types) do not make the record
+// borrow-bearing because runtime-managed values have unbounded lifetime by
+// construction"; §28.3.1 K1.6: "Values of runtime-managed type (`string`,
+// `Type`, boxed value types, function values) and of ordinary value type carry
+// no classification and no obligation". A record's `string` component is
+// therefore the string for as long as the record value is reachable — the
+// collection it was read from dying is not the program's concern.
+//
+// THE DEFECT. `buildRecordValue`'s positional store is a bare store: a record
+// built from a BORROWED read (`f[0]`) embeds a pointer whose only reference is
+// the collection's. A by-value return is a bit copy that touches no refcount,
+// and the return's scope-end disposals run after the value is lowered, so
+//     var f := line.Split(',');
+//     return new E(f[0], f[1].Length);
+// freed `f`, and with it `f[0]`, and handed the caller a record whose `Name`
+// dangles (heap-use-after-free on the first read; an `Array<E>` that stores
+// the result retains freed memory). `1cae10ffd` cured the store into an
+// `Array<E>`, where the ARRAY became the holder; here the holder is the
+// returned value itself.
+//
+// THE MECHANISM, the one #8627 (`retainCoOwnedArrayCopyOutForReturn`) uses for
+// `return arr[i]`: the reference is taken before the return's disposals run.
+// The `return` lowering names, before it lowers the value, every argument the
+// rule covers (this walk); `buildRecordValue` retains each as it stores it —
+// directly after the read, so nothing can free the string in between.
+//
+// SCOPE, deliberately narrow (recorded interpretation):
+//   * only a string read by INDEXER from a LOCAL collection THIS return
+//     disposes (`isStringReadOfLocalCollectionDisposedAtReturn`). A parameter,
+//     a field, `this._names`, and a local ALIAS of either carry no pending
+//     disposal: they outlive the call and keep the pre-fix borrow, so no
+//     getter gains a reference nobody releases;
+//   * the string is read through its owner (a collection of strings holds a
+//     reference per element), so it is alive at the retain — the walk never
+//     names a string it cannot vouch for (#8592: retaining a dead string
+//     writes freed memory);
+//   * the construction must BE the returned value: the walk descends only
+//     through a nested positional construction (`new Outer(new E(f[0]), 2)`)
+//     and the arms of a conditional expression. An argument of a CALL is not
+//     the returned value and is left alone;
+//   * a state-machine body (async / iterator) is excluded, as for #8627.
+// No caller releases a by-value result's strings (#8267 tracks that
+// caller-side release; the `+1`-producer twin `return new E(f[0] + "x", n)`
+// already leaks the same way), so the cost is one retained string per such
+// call, in exchange for a live component.
+bool Emitter::isStringReadOfLocalCollectionDisposedAtReturn(
+        const ast::Expr* e) const {
+    auto* ix = dynamic_cast<const ast::IndexExpr*>(e);
+    if (!ix || !ix->target || ix->indices.size() != 1) return false;
+    // A non-nullable `string` element only: a `string?` element read already
+    // takes its own reference (MEASURED: `return new EN(f[0], n)` over an
+    // `Array<string?>` is no use-after-free on the pre-fix compiler).
+    const sema::TypeRef* et = ctx_.exprType(*e);
+    if (!et || et->nullable || et->kind != sema::TypeRef::Kind::Primitive ||
+        et->primitive != sema::PrimitiveType::String)
+        return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ix->target.get());
+    if (!id) return false;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!ls) return false;
+    auto it = locals_.find(ls->decl);
+    if (it == locals_.end() || !it->second) return false;
+    // The local's OWN pending collection disposal: present exactly when this
+    // function frees the collection (and its element references) on the way
+    // out. A borrow alias (`var ns := this._names`) has none.
+    for (const auto& scope : disposeStack_)
+        for (const Disposal& d : scope)
+            if (d.slot == it->second && (d.collection || d.dict))
+                return true;
+    return false;
+}
+
+void Emitter::collectReturnedRecordStringArgsToRetain(const ast::Expr* e,
+                                                      bool directArgsOnly,
+                                                      unsigned depth) {
+    if (!e || depth > 8) return;
+    if (smStateStruct_ || !currentFn_ || disposeStack_.empty()) return;
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        if (directArgsOnly) return;
+        collectReturnedRecordStringArgsToRetain(ce->thenValue.get(), false,
+                                                depth + 1);
+        collectReturnedRecordStringArgsToRetain(ce->elseValue.get(), false,
+                                                depth + 1);
+        return;
+    }
+    auto* ne = dynamic_cast<const ast::NewExpr*>(e);
+    if (!ne || !ne->type) return;
+    const sema::TypeRef* nty = ctx_.exprType(*e);
+    if (!nty || nty->kind != sema::TypeRef::Kind::Named || !nty->declaration ||
+        nty->declaration->kind != ast::TypeDeclKind::Record)
+        return;
+    for (const ast::CallArgument& a : ne->args) {
+        if (!a.value) continue;
+        if (isStringReadOfLocalCollectionDisposedAtReturn(a.value.get()))
+            returnedRecordStringArgsToRetain_.insert(a.value.get());
+        else if (!directArgsOnly &&
+                 dynamic_cast<const ast::NewExpr*>(a.value.get()))
+            collectReturnedRecordStringArgsToRetain(a.value.get(), false,
+                                                    depth + 1);
+    }
+}
+
+// narrow #8386, the two-statement spelling: `var e := new E(f[0], n); …
+// return e;`. See `recordLocalStringHolders_` (LlvmBackend_impl.hpp).
+//
+// The declaration HOLDS each covered string for the local's scope: the
+// reference `buildRecordValue` takes at the store is parked in a hidden slot
+// and released at scope end, exactly like a string local. On every path that
+// does not return the record this is a balanced retain/release inside the
+// source collection's own lifetime (the collection is declared before the
+// record, so it outlives the record's scope): nothing observable changes and
+// nothing leaks. Only the declaration's OWN construction is covered — a
+// nested one keeps the pre-fix store.
+void Emitter::lowerLocalDeclHoldingRecordStrings(const ast::Node* declNode,
+                                                 const ast::Expr* init,
+                                                 const ast::Type* typeNode,
+                                                 bool isUsing) {
+    // A nested declaration (a lambda body inside the initializer) must not
+    // see, or clobber, the enclosing one's state.
+    auto savedArgs = std::move(returnedRecordStringArgsToRetain_);
+    auto* savedSink = recordLocalStringHolderSink_;
+    auto* savedHolderArgs = recordLocalStringHolderArgs_;
+    returnedRecordStringArgsToRetain_.clear();
+    recordLocalStringHolderSink_ = nullptr;
+    recordLocalStringHolderArgs_ = nullptr;
+    recordLocalStringHolders_.erase(declNode);
+    std::vector<RecordLocalStringHolder> holders;
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(init); ne && !isUsing) {
+        collectReturnedRecordStringArgsToRetain(init, /*directArgsOnly=*/true);
+        if (!returnedRecordStringArgsToRetain_.empty()) {
+            recordLocalStringHolderSink_ = &holders;
+            recordLocalStringHolderArgs_ = &ne->args;
+        }
+    }
+    lowerLocalDecl(declNode, init, typeNode);
+    if (!holders.empty())
+        recordLocalStringHolders_[declNode] =
+            RecordLocalStringHolders{currentFn_, std::move(holders)};
+    returnedRecordStringArgsToRetain_ = std::move(savedArgs);
+    recordLocalStringHolderSink_ = savedSink;
+    recordLocalStringHolderArgs_ = savedHolderArgs;
+}
+
+// `return e;` of a record local whose declaration holds strings (above): for
+// each holder whose string the returned value STILL carries in that field,
+// the returned copy takes its own reference, before the return's disposals
+// release the holder and free the collection. The string is alive here — the
+// holder owns a reference on it — whatever happened to the collection since
+// the declaration. A local that was reassigned in between no longer carries
+// the held pointer, and nothing is taken for it (`bz_string_retain` of null
+// is a no-op).
+void Emitter::retainReturnedRecordLocalStrings(const ast::Expr* src,
+                                               llvm::Value* v) {
+    if (!src || !v || recordLocalStringHolders_.empty()) return;
+    if (smStateStruct_ || !currentFn_ || !builder_.GetInsertBlock()) return;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(src);
+    if (!id) return;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!ls) return;
+    auto it = recordLocalStringHolders_.find(ls->decl);
+    if (it == recordLocalStringHolders_.end() || it->second.fn != currentFn_)
+        return;
+    auto* st = llvm::dyn_cast<llvm::StructType>(v->getType());
+    if (!st) return;
+    for (const RecordLocalStringHolder& h : it->second.holders) {
+        if (!h.slot || h.recTy != st || h.fieldIdx >= st->getNumElements() ||
+            !st->getElementType(h.fieldIdx)->isPointerTy())
+            continue;
+        llvm::Value* held =
+            builder_.CreateLoad(ptrTy(), h.slot, "rec.ret.held");
+        llvm::Value* cur =
+            builder_.CreateExtractValue(v, h.fieldIdx, "rec.ret.cur");
+        llvm::Value* same = builder_.CreateICmpEQ(held, cur, "rec.ret.same");
+        emitStringRetain(builder_.CreateSelect(
+            same, held, llvm::ConstantPointerNull::get(ptrTy()),
+            "rec.ret.take"));
+    }
+}
+
 llvm::Value* Emitter::buildRecordValue(
         const sema::TypeSymbol* t,
         const std::vector<ast::CallArgument>& args,
@@ -13761,6 +13945,21 @@ llvm::Value* Emitter::buildRecordValue(
                 llvm::Value* v = lowerExpr(*fieldArg[i]->value);
                 genericSubst_ = std::move(recSubst);
                 genericSubstSemaTy_ = std::move(recSemaTy);
+                // narrow #8386 (§9.7, §28.9, v0.357): a string the `return`
+                // lowering named — read by indexer from a local collection the
+                // return is about to dispose — is retained here, directly
+                // after the read, so the returned record holds its own
+                // reference (see collectReturnedRecordStringArgsToRetain).
+                // Empty outside a `return`'s value, so every other
+                // construction stores exactly as before.
+                llvm::Value* retainedStr = nullptr;
+                if (v && v->getType()->isPointerTy() &&
+                    !returnedRecordStringArgsToRetain_.empty() &&
+                    returnedRecordStringArgsToRetain_.erase(
+                        fieldArg[i]->value.get()) != 0) {
+                    emitStringRetain(v);
+                    retainedStr = v;
+                }
                 // §9.1 / §14.1 (#769): resolve the field's type through the
                 // active record generic substitution — see the nullable-value
                 // wrap below, which is the reason this is resolved and not read
@@ -13831,6 +14030,23 @@ llvm::Value* Emitter::buildRecordValue(
                     v, fieldLlvmTy, isUnsignedTargetExpr(*fieldArg[i]->value));
                 builder_.CreateStore(
                     v, builder_.CreateStructGEP(st, slot, idxIt->second));
+                // narrow #8386: the declaration form parks the reference taken
+                // above in a hidden slot released at the local's scope end
+                // (see lowerLocalDeclHoldingRecordStrings). Without a holder
+                // sink — the `return new E(...)` form — the reference is the
+                // returned value's and nothing more is done.
+                if (retainedStr && recordLocalStringHolderSink_ &&
+                    recordLocalStringHolderArgs_ == &args &&
+                    !disposeStack_.empty()) {
+                    llvm::AllocaInst* hslot = entryAllocaNullPtr();
+                    builder_.CreateStore(retainedStr, hslot);
+                    Disposal hd{hslot, nullptr};
+                    hd.stringRelease = true;
+                    hd.nullSlotAfterRelease = true;
+                    disposeStack_.back().push_back(hd);
+                    recordLocalStringHolderSink_->push_back(
+                        RecordLocalStringHolder{hslot, st, idxIt->second});
+                }
             }
             return builder_.CreateLoad(st, slot);
         }

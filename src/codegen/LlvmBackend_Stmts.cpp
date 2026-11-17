@@ -370,7 +370,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             auto* savedScopeBoundInit = deferredRecvScopeBoundInit_;
             deferredRecvScopeBoundInit_ =
                 ld->isUsing ? ld->initializer.get() : nullptr;
-            lowerLocalDecl(ld, ld->initializer.get(), ld->type.get());
+            // narrow #8386 (§9.7, §28.9, v0.357): a record local built from
+            // a string read out of a local collection holds that string for
+            // its scope, so a later `return e;` can hand the copy its own
+            // reference (see lowerLocalDeclHoldingRecordStrings).
+            lowerLocalDeclHoldingRecordStrings(ld, ld->initializer.get(),
+                                               ld->type.get(), ld->isUsing);
             deferredRecvScopeBoundInit_ = savedScopeBoundInit;
         }
         // #823 / §27.5: a local declared INSIDE a loop body is re-initialised
@@ -606,7 +611,9 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         return false;
     }
     if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
-        lowerLocalDecl(lc, lc->value.get(), lc->type.get());
+        // narrow #8386: as for the `var` arm above.
+        lowerLocalDeclHoldingRecordStrings(lc, lc->value.get(), lc->type.get(),
+                                           /*isUsing=*/false);
         // #823 / §27.5: same loop-body fresh-capture handling as LocalDecl.
         if (!loopStack_.empty()) {
             auto lit = locals_.find(lc);
@@ -3413,7 +3420,39 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     v = lowerReturnCollectionLiteral(cl, rrt);
                 }
             }
-            if (!v) v = lowerExpr(*rs->value);
+            // narrow #8386 (§9.7, §28.9, v0.357): `return new E(f[0], n);`
+            // where `f` is a local collection this return disposes — the
+            // record's positional store retains the strings named here, so
+            // the returned copy outlives `f` (see
+            // collectReturnedRecordStringArgsToRetain). Only when the method
+            // returns the record BY VALUE: an `Object` / interface return
+            // boxes the value, and the box holds its own references.
+            if (!v) {
+                bool returnsRecordByValue = false;
+                if (const ast::Type* rn = returnReprTypeNode()) {
+                    const sema::TypeRef* retTy = ctx_.resolvedType(*rn);
+                    returnsRecordByValue =
+                        retTy && retTy->kind == sema::TypeRef::Kind::Named &&
+                        retTy->declaration &&
+                        retTy->declaration->kind == ast::TypeDeclKind::Record;
+                }
+                // Saved, not just cleared: a `return` inside a lambda in a
+                // declaration's initializer must not disturb that
+                // declaration's own set.
+                auto savedArgs = std::move(returnedRecordStringArgsToRetain_);
+                auto* savedSink = recordLocalStringHolderSink_;
+                returnedRecordStringArgsToRetain_.clear();
+                recordLocalStringHolderSink_ = nullptr;
+                if (returnsRecordByValue)
+                    collectReturnedRecordStringArgsToRetain(rs->value.get());
+                v = lowerExpr(*rs->value);
+                returnedRecordStringArgsToRetain_ = std::move(savedArgs);
+                recordLocalStringHolderSink_ = savedSink;
+                // The two-statement spelling: `var e := new E(f[0], n); …
+                // return e;` (see retainReturnedRecordLocalStrings).
+                if (v && returnsRecordByValue)
+                    retainReturnedRecordLocalStrings(rs->value.get(), v);
+            }
             // fix #6557 follow-up (§28.11, §28.9, v0.357): `return arr[i];`
             // out of a co-owning array that dies at this return gives the
             // returned copy its own references on the strings it embeds,
