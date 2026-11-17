@@ -53,11 +53,14 @@
 // live in System.Serialization (§2.15) and are NOT auto-imported; the tests
 // include "import System.Serialization;".
 
+#include <iostream>
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
@@ -593,4 +596,599 @@ BEZEL_TEST(codegen_serialization_class_collection_8391,
         "  end; "
         "  return (if caught then 42 else 1); "
         "end Main; end C;"), 42);
+}
+
+// ===========================================================================
+// THE EXCEPTION PATH OF AN ADMITTED COLLECTION COMPONENT (#8391 review F6,
+// and the F1 rows the first review asked for).
+//
+// §9.8 v0.357: "A **missing** required component (one neither present nor
+// `serialized optional`), a **duplicate** field name, a type mismatch, or a
+// name not matching any enum constant raises `SerializationException`
+// unconditionally" — so a truncated payload raises. §28.3 v0.357: "**Owned**
+// — the holder is responsible for disposing the referenced object exactly
+// once": what the reader has built when it raises is disposed once — not
+// leaked (F1), and not disposed twice (F6).
+//
+// F6. The element reader of an `OwningArray<Class>` component is ONE emitted
+// copy of the element class's synthesized `Deserialize`, run once per element
+// in the collection reader's loop. Before the #8574 fix its component slots
+// were reset once per function, so element k+1 began with element k's
+// pointers still in them — pointers element k's object already owned. A cut
+// inside element 2 or 3 then made the unwind sweep release element 1's or 2's
+// string again (`refcount over-release (string)`), or free its owned
+// `Array<string>` twice (AddressSanitizer double-free). A SINGLE `Deserialize`
+// call is enough; the rows marked "one call per frame" read in a helper
+// method so that nothing but the element loop can carry a pointer over.
+//
+// Every row here runs under `runAotChecked` (AddressSanitizer over the
+// generated module, LeakSanitizer at exit), drives each failing read at least
+// 200 times, and asserts `didNotCrash` and `assertNoLeak`.
+// ===========================================================================
+
+namespace {
+
+// Every diagnostic the harness produced, concatenated — the sanitizer report
+// the AOT harness embeds in the diagnostic message when ASan / LSan fires.
+std::string diagnosticText(const JitResult& r) {
+    std::string out;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        out += d.message;
+        out += '\n';
+    }
+    return out;
+}
+
+// The program ran to completion: it compiled, the sanitizer leg really ran
+// (a toolchain SKIP fails the row instead of passing it silently), it exited
+// normally with the program's own exit code and the exact expected output,
+// and neither AddressSanitizer nor the runtime's §28.9 over-release check
+// fired. `runAotChecked` reports an abort and any sanitizer report as
+// `ran == false`.
+void didNotCrash(const JitResult& r, const std::string& out) {
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
+    BEZEL_EXPECT_EQ(r.stdoutText, out);
+    const std::string text = diagnosticText(r);
+    BEZEL_EXPECT_TRUE(text.find("ERROR: AddressSanitizer") ==
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(text.find("refcount over-release") == std::string::npos);
+}
+
+// LeakSanitizer counted nothing: 0 leaked allocations, 0 leaked bytes. LSan
+// prints a SUMMARY line only when it finds a leak, so "no summary" is 0.
+void assertNoLeak(const JitResult& r) {
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    const std::string text = diagnosticText(r);
+    unsigned long long leakedBytes = 0, leakedAllocs = 0;
+    const bool sawSummary =
+        bezel::test::aot_detail::parseLeakSummary(text, leakedBytes, leakedAllocs);
+    const unsigned long long leakedAllocations = sawSummary ? leakedAllocs : 0ull;
+    const unsigned long long leakedByteCount = sawSummary ? leakedBytes : 0ull;
+    if (sawSummary)
+        std::cout << "    [ LEAK COUNT ] " << leakedAllocations
+                  << " allocation(s) / " << leakedByteCount
+                  << " byte(s) leaked (expected 0 / 0)\n";
+    BEZEL_EXPECT_EQ(leakedAllocations, 0ull);
+    BEZEL_EXPECT_EQ(leakedByteCount, 0ull);
+    BEZEL_EXPECT_TRUE(text.find("ERROR: LeakSanitizer") == std::string::npos);
+}
+
+void expectClean(const JitResult& r, const std::string& out) {
+    didNotCrash(r, out);
+    assertNoLeak(r);
+}
+
+// A shape is the type declarations and the statements that bind `src`, the
+// `P` to serialize.
+struct Shape {
+    const char* decls;
+    const char* build;
+};
+
+const char* kHead = "module M; import System.Serialization;\n";
+
+// Three `Leaf(name: string, v: int)` elements — review F6's first shape
+// (the reviewer's sw4 sweep: cuts 48..65 of this payload failed).
+const Shape kOwningLeaves = {
+    R"BZL(class Leaf(name: string, v: int): ISerializable, IDeserializable
+  public Name: string := name;
+  public property V: int => v;
+end Leaf;
+class P(id: int, owned items: OwningArray<Leaf>): ISerializable, IDeserializable
+  public owned Items: OwningArray<Leaf> := items;
+  public property Id: int => id;
+end P;)BZL",
+    R"BZL(using var src := new P(3, new OwningArray<Leaf>());
+    src.Items.Add(new Leaf("a" + "a", 1)); src.Items.Add(new Leaf("b" + "b", 2)); src.Items.Add(new Leaf("c" + "c", 3));)BZL"};
+
+// Three `Node(label: string, owned subs: Array<string>)` elements — review
+// F6's second shape (the reviewer's t3_owningnode_bin sweep: 83 cuts failed).
+const Shape kOwningNodes = {
+    R"BZL(class Node(label: string, owned subs: Array<string>): ISerializable, IDeserializable
+  public Label: string := label;
+  public owned Subs: Array<string> := subs;
+end Node;
+class P(id: int, owned tags: OwningArray<Node>): ISerializable, IDeserializable
+  public owned Tags: OwningArray<Node> := tags;
+  public property Id: int => id;
+end P;)BZL",
+    R"BZL(using var src := new P(3, new OwningArray<Node>());
+    var bi := 0;
+    while bi < 3 do
+      var subs := new Array<string>(); subs.Add("s" + bi.ToString()); subs.Add("t" + bi.ToString());
+      src.Tags.Add(new Node("n" + bi.ToString(), move subs));
+      bi := bi + 1;
+    end;)BZL"};
+
+const Shape kArrayOfString = {
+    R"BZL(class P(id: int, owned tags: Array<string>, s: string): ISerializable, IDeserializable
+  public owned Tags: Array<string> := tags;
+  public property Id: int => id;
+  public S: string := s;
+end P;)BZL",
+    R"BZL(using var src := new P(7, new Array<string>(), "ta" + "il");
+    src.Tags.Add("a" + "a"); src.Tags.Add("b" + "b");)BZL"};
+
+const Shape kNullableArray = {
+    R"BZL(class P(id: int, owned tags: Array<string>?, s: string): ISerializable, IDeserializable
+  public owned Tags: Array<string>? := tags;
+  public property Id: int => id;
+  public S: string := s;
+end P;)BZL",
+    R"BZL(using var src := new P(7, new Array<string>(), "ta" + "il");
+    src.Tags!.Add("a" + "a");)BZL"};
+
+// ONE CALL PER FRAME, every prefix: `One` holds the only `P.Deserialize(d)`
+// and is entered afresh for each read, so the only loop the emitted reader
+// runs in is the collection component's own element loop. 200 rounds of
+// cut = 0, 1, .. n; a strict prefix raises, the whole payload round-trips.
+std::string oneCallPerFrameEveryPrefix(const Shape& sh) {
+    return std::string(kHead) + sh.decls + R"BZL(
+class C
+  static method One(bytes: OwningBuffer<byte>, cut: int): int
+    using var d := new BinaryDeserializer(bytes.AsReadOnlySpan(0, cut));
+    try
+      using var x := P.Deserialize(d);
+      return 1;
+    catch SerializationException => return 0;
+    end;
+  end One;
+  public static method Main(): int
+    )BZL" + sh.build + R"BZL(
+    using var s := new BinarySerializer();
+    src.Serialize(s);
+    using var bytes := s.ToBytes();
+    var n := bytes.Length;
+    var caught := 0;
+    var ok := 0;
+    var round := 0;
+    while round < 200 do
+      var cut := 0;
+      while cut <= n do
+        if One(bytes, cut) = 1 then ok := ok + 1; else caught := caught + 1; end;
+        cut := cut + 1;
+      end;
+      round := round + 1;
+    end;
+    Console.WriteLine(ok);
+    Console.WriteLine(caught = 200 * n);
+    return 42;
+  end Main;
+end C;
+)BZL";
+}
+
+// THE CALL LOOP, every prefix: the read sits in `Main`'s own loop (the form
+// the reviewer's sweep used), so the emitted reader also runs once per call.
+std::string callLoopEveryPrefix(const Shape& sh) {
+    return std::string(kHead) + sh.decls + R"BZL(
+class C
+  public static method Main(): int
+    )BZL" + sh.build + R"BZL(
+    using var s := new BinarySerializer();
+    src.Serialize(s);
+    using var bytes := s.ToBytes();
+    var n := bytes.Length;
+    var caught := 0;
+    var ok := 0;
+    var round := 0;
+    while round < 200 do
+      var cut := 0;
+      while cut <= n do
+        using var d := new BinaryDeserializer(bytes.AsReadOnlySpan(0, cut));
+        try
+          using var x := P.Deserialize(d);
+          ok := ok + 1;
+        catch SerializationException => caught := caught + 1;
+        end;
+        cut := cut + 1;
+      end;
+      round := round + 1;
+    end;
+    Console.WriteLine(ok);
+    Console.WriteLine(caught = 200 * n);
+    return 42;
+  end Main;
+end C;
+)BZL";
+}
+
+// THE CALL LOOP, every ordered pair (a, b) of cuts 0..n through one textual
+// `P.Deserialize(d)`: success -> failure, failure -> success and failure ->
+// failure, the failure at every offset on both sides. Each cut is driven
+// 2 * (n + 1) * rounds times on each side; every row picks `rounds` so that
+// is at least 200. The program checks both counts and prints two booleans.
+std::string callLoopEveryPair(const Shape& sh, const char* format, int rounds) {
+    const std::string r = std::to_string(rounds);
+    return std::string(kHead) + sh.decls + R"BZL(
+class C
+  public static method Main(): int
+    )BZL" + sh.build + R"BZL(
+    using var s := new )BZL" + format + R"BZL(Serializer();
+    src.Serialize(s);
+    using var bytes := s.ToBytes();
+    var n := bytes.Length;
+    var caught := 0;
+    var ok := 0;
+    var round := 0;
+    while round < )BZL" + r + R"BZL( do
+      var a := 0;
+      while a <= n do
+        var b := 0;
+        while b <= n do
+          var k := 0;
+          while k < 2 do
+            var cut := a;
+            if k = 1 then cut := b; end;
+            using var d := new )BZL" + format + R"BZL(Deserializer(bytes.AsReadOnlySpan(0, cut));
+            try
+              using var x := P.Deserialize(d);
+              ok := ok + 1;
+            catch SerializationException => caught := caught + 1;
+            end;
+            k := k + 1;
+          end;
+          b := b + 1;
+        end;
+        a := a + 1;
+      end;
+      round := round + 1;
+    end;
+    var wantOk := )BZL" + r + R"BZL( * 2 * (n + 1);
+    var wantCaught := )BZL" + r + R"BZL( * 2 * (n + 1) * (n + 1) - wantOk;
+    Console.WriteLine(ok = wantOk);
+    Console.WriteLine(caught = wantCaught);
+    return 42;
+  end Main;
+end C;
+)BZL";
+}
+
+// The review's loop form (probe L1 / L2), 200 calls: even calls read the
+// whole payload, odd calls read 1 byte and raise before any component.
+// `%T%` is the element type; `%ADD%` fills the array.
+std::string wholeThenOneByte(const char* elemType, const char* add) {
+    std::string p = std::string(kHead) + R"BZL(
+class Bag(id: int, owned tags: Array<%T%>): ISerializable, IDeserializable
+  public owned Tags: Array<%T%> := tags;
+  public property Id: int => id;
+end Bag;
+class C
+  public static method Main(): int
+    using var good := new Bag(7, new Array<%T%>());
+    %ADD%
+    using var s := new BinarySerializer();
+    good.Serialize(s);
+    using var bytes := s.ToBytes();
+    var caught := 0;
+    var ok := 0;
+    var i := 0;
+    while i < 200 do
+      var n := bytes.Length;
+      if i mod 2 = 1 then n := 1; end;
+      using var d := new BinaryDeserializer(bytes.AsReadOnlySpan(0, n));
+      try
+        using var b2 := Bag.Deserialize(d);
+        ok := ok + 1;
+      catch SerializationException => caught := caught + 1;
+      end;
+      i := i + 1;
+    end;
+    Console.WriteLine(ok);
+    Console.WriteLine(caught);
+    return 42;
+  end Main;
+end C;
+)BZL";
+    auto replaceAll = [&p](const std::string& from, const std::string& to) {
+        for (std::size_t at = p.find(from); at != std::string::npos;
+             at = p.find(from, at + to.size()))
+            p.replace(at, from.size(), to);
+    };
+    replaceAll("%T%", elemType);
+    replaceAll("%ADD%", add);
+    return p;
+}
+
+// An `OwningArray<Meta>` whose FIRST element carries its `serialized
+// optional` component and whose other two omit it, read by one call per
+// frame, 200 times. §9.8 v0.357: "On read, a missing field yields
+// `default(T)`" — two nulls per read. `%T%` is the component type, `%V%` the
+// first element's value.
+std::string optionalInElements(const char* type, const char* value) {
+    std::string p = std::string(kHead) + R"BZL(
+class Meta : ISerializable, IDeserializable
+  public property Code: int;
+  public property Note: %T%? serialized optional;
+  public constructor(code: int, note: %T%?)
+    Code := code; Note := note;
+  end constructor;
+end Meta;
+class Bag(id: int, owned items: OwningArray<Meta>): ISerializable, IDeserializable
+  public owned Items: OwningArray<Meta> := items;
+  public property Id: int => id;
+end Bag;
+class C
+  public static method One(): int
+    using var b := new Bag(3, new OwningArray<Meta>());
+    b.Items.Add(new Meta(1, %V%)); b.Items.Add(new Meta(2, null)); b.Items.Add(new Meta(3, null));
+    using var s := new BinarySerializer();
+    b.Serialize(s);
+    using var bytes := s.ToBytes();
+    using var d := new BinaryDeserializer(bytes.AsReadOnlySpan());
+    using var b2 := Bag.Deserialize(d);
+    var nulls := 0;
+    var k := 0;
+    while k < b2.Items.Count do
+      if b2.Items[k].Note = null then nulls := nulls + 1; end;
+      k := k + 1;
+    end;
+    return nulls;
+  end One;
+  public static method Main(): int
+    var i := 0;
+    var nulls := 0;
+    while i < 200 do
+      nulls := nulls + One();
+      i := i + 1;
+    end;
+    Console.WriteLine(nulls);
+    return 42;
+  end Main;
+end C;
+)BZL";
+    auto replaceAll = [&p](const std::string& from, const std::string& to) {
+        for (std::size_t at = p.find(from); at != std::string::npos;
+             at = p.find(from, at + to.size()))
+            p.replace(at, from.size(), to);
+    };
+    replaceAll("%T%", type);
+    replaceAll("%V%", value);
+    return p;
+}
+
+}  // namespace
+
+// --- F6: one call per frame --------------------------------------------------
+
+// `OwningArray<Leaf(name: string, v: int)>`, three elements, binary, every
+// prefix (the reviewer's sw4 cuts 48..65 among them), one call per frame.
+// Pre-fix: `bezel: fatal: refcount over-release (string)`.
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           owning_array_of_string_class_one_call_every_prefix_200_rounds_spec_9_8_v0357) {
+    expectClean(runAotChecked(oneCallPerFrameEveryPrefix(kOwningLeaves)),
+                "200\nTrue\n");
+}
+
+// `OwningArray<Node(label: string, owned subs: Array<string>)>`, three
+// elements, binary, every prefix, one call per frame. Pre-fix:
+// AddressSanitizer attempting double-free (the previous element's
+// `Array<string>`).
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           owning_array_of_array_owning_class_one_call_every_prefix_200_rounds_spec_9_8_v0357) {
+    expectClean(runAotChecked(oneCallPerFrameEveryPrefix(kOwningNodes)),
+                "200\nTrue\n");
+}
+
+// --- F6 in the reviewer's own form: the read in a loop -----------------------
+
+// The reviewer's t3_owningnode_bin sweep as one program: every prefix, 200
+// rounds, the read in `Main`'s loop.
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           owning_array_of_array_owning_class_call_loop_every_prefix_200_rounds_spec_9_8_v0357) {
+    expectClean(runAotChecked(callLoopEveryPrefix(kOwningNodes)),
+                "200\nTrue\n");
+}
+
+// The same shape in JSON, every ordered pair of cuts.
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           owning_array_of_array_owning_class_every_ordered_pair_of_cuts_json_spec_9_8_v0357) {
+    expectClean(runAotChecked(callLoopEveryPair(kOwningNodes, "Json", 1)),
+                "True\nTrue\n");
+}
+
+// `OwningArray<Leaf>` in binary, every ordered pair of cuts.
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           owning_array_of_string_class_every_ordered_pair_of_cuts_binary_spec_9_8_v0357) {
+    expectClean(runAotChecked(callLoopEveryPair(kOwningLeaves, "Binary", 1)),
+                "True\nTrue\n");
+}
+
+// --- The review's loop form: the collection slot itself ----------------------
+
+// Probe L1: `Array<int>`, the whole payload then one byte, 200 calls.
+// Pre-fix: AddressSanitizer attempting double-free (the previous call's
+// array, still in the component slot).
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           array_of_int_whole_then_one_byte_200_calls_spec_9_8_v0357) {
+    expectClean(runAotChecked(wholeThenOneByte(
+                    "int", "good.Tags.Add(1); good.Tags.Add(2);")),
+                "100\n100\n");
+}
+
+// Probe L2: the same with `Array<string>`.
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           array_of_string_whole_then_one_byte_200_calls_spec_9_8_v0357) {
+    expectClean(runAotChecked(wholeThenOneByte(
+                    "string",
+                    "good.Tags.Add(\"al\" + \"pha\"); good.Tags.Add(\"be\" + \"ta\");")),
+                "100\n100\n");
+}
+
+// `Array<string>` followed by a string, every ordered pair of cuts — binary
+// and JSON.
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           array_of_string_every_ordered_pair_of_cuts_binary_spec_9_8_v0357) {
+    expectClean(runAotChecked(callLoopEveryPair(kArrayOfString, "Binary", 2)),
+                "True\nTrue\n");
+}
+
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           array_of_string_every_ordered_pair_of_cuts_json_spec_9_8_v0357) {
+    expectClean(runAotChecked(callLoopEveryPair(kArrayOfString, "Json", 3)),
+                "True\nTrue\n");
+}
+
+// A NULLABLE collection component, every ordered pair of cuts.
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           nullable_array_of_string_every_ordered_pair_of_cuts_binary_spec_9_8_v0357) {
+    expectClean(runAotChecked(callLoopEveryPair(kNullableArray, "Binary", 2)),
+                "True\nTrue\n");
+}
+
+// --- `serialized optional` inside an element ---------------------------------
+
+// `int?`: a WRONG-OUTPUT row. Pre-fix the two elements that omit `Note` read
+// back the first element's 77, so the program printed 0 — with no sanitizer
+// report at all.
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           optional_int_omitted_in_later_elements_reads_null_spec_9_8_v0357) {
+    expectClean(runAotChecked(optionalInElements("int", "77")), "400\n");
+}
+
+// `string?`: pre-fix the two later elements aliased the first element's
+// string without a reference of their own — `refcount over-release (string)`
+// on a read that SUCCEEDS.
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           optional_string_omitted_in_later_elements_reads_null_spec_9_8_v0357) {
+    expectClean(runAotChecked(optionalInElements("string", "\"a\" + \"a\"")),
+                "400\n");
+}
+
+// --- F1: the exception rows the first review asked for (probes a6, g1, a7) ---
+//
+// They pin #8391's own unwind cleanup of the half-built collection, 200
+// times over and under the leak oracle. As single reads all three were
+// already clean at the #8391 commit; g1 and a7 below still are, and are the
+// controls of this group. a6, driven here as 200 rounds over ONE call site,
+// also runs into #8574's stale slots and is red without that fix.
+
+// Probe a6: `Array<string>` of three, every cut 1..39, 200 rounds — 39 raises
+// per round.
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           array_of_string_cuts_1_to_39_200_rounds_no_leak_spec_9_8_v0357) {
+    expectClean(runAotChecked(std::string(kHead) + R"BZL(
+class Bag(id: int, owned tags: Array<string>): ISerializable, IDeserializable
+  public owned Tags: Array<string> := tags;
+  public property Id: int => id;
+end Bag;
+class C
+  public static method Main(): int
+    var caught := 0;
+    var round := 0;
+    while round < 200 do
+      var cut := 1;
+      while cut < 40 do
+        using var b := new Bag(7, new Array<string>());
+        b.Tags.Add("alpha"); b.Tags.Add("beta"); b.Tags.Add("gamma");
+        using var s := new BinarySerializer();
+        b.Serialize(s);
+        using var bytes := s.ToBytes();
+        if cut < bytes.Length then
+          using var d := new BinaryDeserializer(bytes.AsReadOnlySpan(0, cut));
+          try
+            using var b2 := Bag.Deserialize(d);
+          catch SerializationException => caught := caught + 1;
+          end;
+        end;
+        cut := cut + 1;
+      end;
+      round := round + 1;
+    end;
+    Console.WriteLine(caught);
+    return 42;
+  end Main;
+end C;
+)BZL"),
+                "7800\n");
+}
+
+// Probe g1: `Array<int>` of three, cut 2 bytes short of the end — the count
+// is read and the last element is missing. 200 calls.
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           array_of_int_last_element_missing_200_calls_no_leak_spec_9_8_v0357) {
+    expectClean(runAotChecked(std::string(kHead) + R"BZL(
+class Bag(id: int, owned tags: Array<int>): ISerializable, IDeserializable
+  public owned Tags: Array<int> := tags;
+  public property Id: int => id;
+end Bag;
+class C
+  public static method Main(): int
+    using var b := new Bag(7, new Array<int>());
+    b.Tags.Add(1); b.Tags.Add(2); b.Tags.Add(3);
+    using var s := new BinarySerializer();
+    b.Serialize(s);
+    using var bytes := s.ToBytes();
+    var caught := 0;
+    var i := 0;
+    while i < 200 do
+      using var d := new BinaryDeserializer(bytes.AsReadOnlySpan(0, bytes.Length - 2));
+      try
+        using var b2 := Bag.Deserialize(d);
+      catch SerializationException => caught := caught + 1;
+      end;
+      i := i + 1;
+    end;
+    Console.WriteLine(caught);
+    return 42;
+  end Main;
+end C;
+)BZL"),
+                "200\n");
+}
+
+// Probe a7: a hand-built payload whose array count is 2^31-1 with no
+// elements behind it. 200 calls.
+BEZEL_TEST(codegen_serialization_class_collection_8391,
+           array_count_without_elements_200_calls_no_leak_spec_9_8_v0357) {
+    expectClean(runAotChecked(std::string(kHead) + R"BZL(
+class Bag(id: int, owned tags: Array<string>): ISerializable, IDeserializable
+  public owned Tags: Array<string> := tags;
+  public property Id: int => id;
+end Bag;
+class C
+  public static method Main(): int
+    using var s := new BinarySerializer();
+    s.BeginObject(2);
+    s.WriteFieldName("id"); s.WriteInt(7);
+    s.WriteFieldName("Tags"); s.BeginArray(2147483647);
+    using var bytes := s.ToBytes();
+    var caught := 0;
+    var i := 0;
+    while i < 200 do
+      using var d := new BinaryDeserializer(bytes.AsReadOnlySpan());
+      try
+        using var b2 := Bag.Deserialize(d);
+      catch SerializationException => caught := caught + 1;
+      end;
+      i := i + 1;
+    end;
+    Console.WriteLine(caught);
+    return 42;
+  end Main;
+end C;
+)BZL"),
+                "200\n");
 }
