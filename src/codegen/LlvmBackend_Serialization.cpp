@@ -934,6 +934,34 @@ void Emitter::emitEnumSerialize(const TypeSymbol* ts,
 }
 
 // ---------------------------------------------------------------------------
+// deserializerNameSlotNote — fix #8574 / §9.8 / §28.3 / §28.9 (v0.357)
+//
+// Every synthesized deserializer below (record, choice, polymorphic class,
+// class) keeps the field-name string it is currently dispatching on — and the
+// choice / polymorphic ones their `$case` / `$type` discriminator string — in
+// a cleanup slot registered as a `stringRelease` disposal in the ENCLOSING
+// scope, so a throw from a nested read releases it (#550, #1635).
+//
+// The deserializer body is emitted INLINE, so one emitted copy — and its one
+// slot — can run many times in a single frame: a Deserialize call inside a
+// loop, or the element reader of a collection component (#8391). The plain
+// `stringRelease` arm releases the slot's string and leaves the pointer in
+// the slot. A run that raised while a name was live therefore left a
+// RELEASED pointer behind, and the next sweep of that scope that came before
+// the slot was overwritten released it a second time: the next run raising
+// before it has read a field name (a payload truncated inside its header), or
+// the scope's own normal exit on a path that does not run the deserializer at
+// all. Measured: a class of two `int` components, read from a payload cut
+// inside a value and then from one cut at byte 1, in one loop, aborts with
+// `refcount over-release (string)` — it has no string component to blame.
+//
+// §28.3's exception-path discharge releases each value exactly once, so these
+// registrations set `Disposal::nullSlotAfterRelease`: the sweep stores null
+// after it releases, and a later sweep reads null. (The normal match / skip
+// paths already release explicitly and null the slot themselves.)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // Emitter::emitRecordDeserialize  §9.8
 //
 // Emits the synthesized `Deserialize(d: IDeserializer): T` body.
@@ -1071,6 +1099,7 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     if (!disposeStack_.empty()) {
         Disposal nd{namePtrSlot, nullptr};
         nd.stringRelease = true;
+        nd.nullSlotAfterRelease = true;   // fix #8574: see deserializerNameSlotNote
         disposeStack_.back().push_back(nd);
     }
 
@@ -2370,6 +2399,7 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
     if (!disposeStack_.empty()) {
         Disposal nd{discSlot, nullptr};
         nd.stringRelease = true;
+        nd.nullSlotAfterRelease = true;   // fix #8574: see deserializerNameSlotNote
         disposeStack_.back().push_back(nd);
     }
 
@@ -2385,6 +2415,7 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
     if (!disposeStack_.empty()) {
         Disposal nd{namePtrSlot, nullptr};
         nd.stringRelease = true;
+        nd.nullSlotAfterRelease = true;   // fix #8574: see deserializerNameSlotNote
         disposeStack_.back().push_back(nd);
     }
 
@@ -2886,6 +2917,7 @@ llvm::Value* Emitter::emitPolyClassDeserialize(const TypeSymbol* baseTs,
     if (!disposeStack_.empty()) {
         Disposal nd{discSlot, nullptr};
         nd.stringRelease = true;
+        nd.nullSlotAfterRelease = true;   // fix #8574: see deserializerNameSlotNote
         disposeStack_.back().push_back(nd);
     }
 
@@ -3509,6 +3541,30 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     // Allocate local slots for each non-skip component.
     // fix #669: null-init stores must be in the entry block, not the current
     // insert point (which may be liveBB of an outer nullable deserialization).
+    //
+    // fix #8574 / #8391 (F6) / §9.8 / §28.3 / §28.9 (v0.357): the entry-block
+    // store runs once per FUNCTION, but this code is emitted INLINE and can
+    // run many times in one frame — once per iteration when the Deserialize
+    // call sits in a loop (#8574), and once per ELEMENT when it is the
+    // element reader of a collection component (#8391's `OwningArray<Leaf>`
+    // loop). A run that completes MOVES each slot's value into the
+    // constructed object and leaves the pointer behind in the slot; the next
+    // run then starts with the PREVIOUS run's pointers, and
+    //   * a throw before it overwrites a slot makes the component scope's
+    //     unwind sweep (registered below) release a value the earlier object
+    //     owns — the measured `refcount over-release (string)` abort,
+    //     heap-use-after-free (owned class) and double-free (collection);
+    //   * a `serialized optional` component the wire omits is constructed
+    //     from the previous run's value instead of `default(T)` (§9.8: "a
+    //     missing field yields `default(T)`").
+    // §28.3 discharges each owned value exactly once, so the slots are
+    // ALSO reset here, at the current insertion point, at the start of
+    // every run — the per-invocation shape the seen-flags below (#2399),
+    // emitRecordDeserialize's slots and emitChoiceDeserialize's payload
+    // slots already have. No slot can hold a live owned value at this point:
+    // the previous run either completed (every value moved into its object)
+    // or unwound (every value released by the sweep). The entry-block store
+    // stays, so a path that never reaches this code still reads null.
     std::vector<llvm::AllocaInst*> slots(comps.size(), nullptr);
     for (unsigned i = 0; i < comps.size(); ++i) {
         if (comps[i].isSkip || !comps[i].ty) continue;
@@ -3520,6 +3576,7 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
             llvm::IRBuilder<> eb_b(&eb, std::next(slot->getIterator()));
             eb_b.CreateStore(llvm::Constant::getNullValue(lt), slot);
         }
+        builder_.CreateStore(llvm::Constant::getNullValue(lt), slot);
         slots[i] = slot;
     }
 
@@ -3623,6 +3680,7 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     if (!disposeStack_.empty()) {
         Disposal nd{namePtrSlot, nullptr};
         nd.stringRelease = true;
+        nd.nullSlotAfterRelease = true;   // fix #8574: see deserializerNameSlotNote
         disposeStack_.back().push_back(nd);
     }
 
