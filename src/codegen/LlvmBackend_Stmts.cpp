@@ -3369,6 +3369,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // inline.
         detectAsyncPatternAKind(rs->value.get());
         llvm::Value* v = nullptr;
+        // fix-forward #8479 (§28.9 / §27.5, v0.357): set when the armed-local
+        // mint below (right after `v` is evaluated) already gave the caller
+        // its reference, so the venue-keyed closure mint arms further down
+        // do not mint a second one.
+        bool armedClosureLocalReturnMinted = false;
         if (rs->value) {
             if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
                     rs->value.get())) {
@@ -3459,6 +3464,53 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // before the disposals below free the array (see
             // retainCoOwnedArrayCopyOutForReturn).
             if (v) retainCoOwnedArrayCopyOutForReturn(rs->value.get(), v);
+            // fix-forward #8479 (§28.9 / §27.5, v0.357): `return f;` (or
+            // `return f!;`; postfix `!` neither moves nor copies, §17.8) of a
+            // closure local whose scope-end release STAYS ARMED across the
+            // return (`closureEscapingScopeEndRelease_`: an assigned-to local,
+            // an owned alias, the source of an alias that leaves the frame).
+            // §28.9: "the type's lifetime is managed by the runtime without
+            // user involvement". The slot's reference is released on this
+            // exit like on every other, so the value handed to the caller
+            // needs a reference of its own, taken BEFORE that release runs,
+            // at every return venue.
+            //
+            // The venue-keyed mint arms below do not give that: they mint
+            // only where the declared result is a function type (a method's,
+            // a block lambda's), the async arm mints AFTER `emitAllDisposals`
+            // and not at all on the finally-routed edge, and a result typed
+            // `Object` / `Object?` never mints. MEASURED on the parent commit
+            // (`--sanitize=address`, 200 iterations), each a program that only
+            // leaked on r30-c1: `var a := g; return a;` from an `async`
+            // method, from an `async` block lambda, and from a method
+            // returning `Object` / `Object?`: heap-use-after-free (the
+            // scope-end `bz_closure_release` ran before any retain).
+            //
+            // So the mint for such a local is taken HERE, once, before any
+            // disposal or finally routing, whatever the venue;
+            // `armedClosureLocalReturnMinted` keeps the arms below from
+            // minting again. `bz_closure_retain` is null-safe (a nullable
+            // local that holds null).
+            if (v && v->getType()->isPointerTy() && !diverged_ &&
+                currentFn_ == closureReleaseEligibleFn_ &&
+                !builder_.GetInsertBlock()->getTerminator()) {
+                const ast::Expr* core = rs->value.get();
+                while (auto* pb =
+                           dynamic_cast<const ast::PostfixBangExpr*>(core)) {
+                    if (!pb->operand) break;
+                    core = pb->operand.get();
+                }
+                auto* id = dynamic_cast<const ast::IdentifierExpr*>(core);
+                auto* loc = id ? dynamic_cast<sema::LocalSymbol*>(
+                                     ctx_.exprSymbol(*id))
+                               : nullptr;
+                if (loc && loc->decl &&
+                    closureEscapingScopeEndRelease_.count(
+                        static_cast<const void*>(loc->decl))) {
+                    emitClosureRetain(v);
+                    armedClosureLocalReturnMinted = true;
+                }
+            }
             // fix #6452 (§28.3 *Returning a deferred-activation frame* / §29.2 /
             // §29.1 / §28.6; stdlib §4.5 / §4.13, v0.338): the RETURN face of
             // the builtin `recv.Drain()` view. #4750 / #4772 gave the
@@ -4143,6 +4195,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     !arrivesFromCallee &&
                     !isPlusOneClosureProducer(rs->value.get()) &&
                     !isUserMethodClosureReturnCall(rs->value.get()) &&
+                    !armedClosureLocalReturnMinted &&  // fix-forward #8479
                     !returnedClosureLocalOwnsPlusOne(rs->value.get()))
                     emitClosureRetain(v);
             }
@@ -4512,6 +4565,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             !isPlusOneClosureProducer(rs->value.get()) &&
             !isUserMethodClosureReturnCall(rs->value.get()) &&
             !isLambdaClosureReturnCall(rs->value.get()) &&
+            !armedClosureLocalReturnMinted &&  // fix-forward #8479
             !returnedClosureLocalOwnsPlusOne(rs->value.get()))
             emitClosureRetain(v);
         // ⚠ fix #2703 (v0.240) — THIS ARM DELIBERATELY KEEPS `currentReturnType
@@ -4599,6 +4653,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 !isPlusOneClosureProducer(rs->value.get()) &&
                 !isUserMethodClosureReturnCall(rs->value.get()) &&
                 !isLambdaClosureReturnCall(rs->value.get()) &&
+                !armedClosureLocalReturnMinted &&  // fix-forward #8479
                 !returnedClosureLocalOwnsPlusOne(rs->value.get()) &&
                 !isCoalescedClosureTransfer(rs->value.get()))
                 emitClosureRetain(v);
