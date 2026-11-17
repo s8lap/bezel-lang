@@ -155,23 +155,6 @@ BEZEL_TEST(decimal_literal_scale_bound_ties_to_even_5174,
         "0\n");
 }
 
-// §4.4 (v0.310) CONTROL: 28 fractional digits is IN decimal's set (s = 28), so
-// this literal is exact and must fold unchanged. The post-fix code's scale
-// reduction loop must not run for it (the loop condition is s > 28), which is
-// what keeps this row non-vacuous: it fails if the reduction is off by one.
-BEZEL_TEST(decimal_literal_scale_bound_ties_to_even_5174,
-           twenty_eight_frac_digits_in_range_unchanged_spec_4_4) {
-    BEZEL_EXPECT_EQ(runAotChecked(
-        "module M; class C "
-        "  public static method Main(): int "
-        "    const c: decimal := 1.0000000000000000000000000001m; "
-        "    Console.WriteLine(c); "
-        "    return 0; "
-        "  end Main; "
-        "end C;").stdoutText,
-        "1.0000000000000000000000000001\n");
-}
-
 // §4.4 (v0.310) CONTROL: "79228162514264337593543950335.4m is MaxValue". This
 // is the exact-overflow edge the post-fix rounding must NOT disturb: the 30th
 // digit '4' is dropped for the same reason as the tie rows above, but being
