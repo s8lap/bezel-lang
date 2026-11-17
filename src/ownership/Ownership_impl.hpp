@@ -931,9 +931,19 @@ public:
     // `classChainHasOwningInlineArrayField` companion walk this method used
     // to consult (#2654) is removed — see `localIsTrivialDisposeNewBinding`'s
     // header comment for the rationale and the #2666 walk-through.
-    bool localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld,
-                                         const sema::LocalSymbol* ls,
-                                         bool reassigned);
+    bool localIsTrivialDisposeNewBinding(
+        const ast::LocalDecl& ld, const sema::LocalSymbol* ls,
+        const std::unordered_set<const sema::Symbol*>& reassigned);
+    // fix #4418 (§28.9, §28.3.4, v0.357): the producer walk behind it -- the
+    // produced type of `new`/call, peeled through `!`, every arm of a join
+    // (`??`, if-expression, expression-`case`) trivial, and a `move x`
+    // re-keyed on x's own producer. Unrecognised forms answer false.
+    bool producedValueIsTrivialDispose(
+        const ast::Expr& e, const sema::TypeRef* target,
+        const std::unordered_set<const sema::Symbol*>& reassigned, int depth);
+    bool movedSourceIsTrivialDispose(
+        const ast::Expr& operand,
+        const std::unordered_set<const sema::Symbol*>& reassigned, int depth);
 
     // narrow #4743: the TYPE-classification half of `localIsTrivialDisposeNewBinding`,
     // factored out so the owned-PARAMETER must-use gate reads the same

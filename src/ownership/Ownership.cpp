@@ -1582,7 +1582,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // twin's arm is unchanged).
                         // per §28.9, §28.3.3, §15.4, v0.357, #7980
                         if (!localIsTrivialDisposeNewBinding(
-                                *ld, ls, reassignedLocals.count(sym) != 0) &&
+                                *ld, ls, reassignedLocals) &&
                             // §29.11 (v0.334): a bound lazy query whose
                             // enumeration right is spent at a statically
                             // visible consumption point is silent — the
@@ -1761,7 +1761,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // trivial-dispose". WARNING ONLY — the scope-end
                         // free armed just above still runs. // per §28.9
                         if (localIsTrivialDisposeNewBinding(
-                                *ld, ls, reassignedLocals.count(sym) != 0))
+                                *ld, ls, reassignedLocals))
                             continue;
                             ctx_.diagnostics().report(
                             Severity::Warning,
@@ -2063,7 +2063,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 // a later store's, which its initializer's type says nothing
                 // about (`var o: Object := new Res(1); o := 42;`).
                 if (reassignedLocals.count(sym) == 0 &&
-                    localIsTrivialDisposeNewBinding(*ld, ls, false))
+                    localIsTrivialDisposeNewBinding(*ld, ls, reassignedLocals))
                     continue;
                 ctx_.diagnostics().report(
                     Severity::Warning, ld->span.begin,
@@ -10301,52 +10301,158 @@ bool MethodOwnership::rhsIsVacuousBorrowPin(const ast::Expr& e) const {
 // `owned` parameter) is not an `ast::LocalDecl` at all, so it cannot reach
 // this arm.  // per §28.9, §28.3, v0.268, #2654 + #2666 + #2667
 bool MethodOwnership::localIsTrivialDisposeNewBinding(
-        const ast::LocalDecl& ld, const sema::LocalSymbol* ls, bool reassigned) {
+        const ast::LocalDecl& ld, const sema::LocalSymbol* ls,
+        const std::unordered_set<const sema::Symbol*>& reassigned) {
     if (ld.isUsing) return false;                      // "…or `using var`"
     if (!ld.initializer) return false;
     // fix #4418 (§28.9, v0.357): the exemption's classification key is "read
     // from the PRODUCED type where the drop site's value has a statically-known
     // producer (a `new` expression, an `owned`-returning call), and from the
-    // DECLARED type otherwise". So the `new` form (the only form this
-    // predicate used to admit) is now one of three arms:
-    //   * a `new` expression or a CALL -- the produced type is the
-    //     expression's own type (for a call, the callee's declared `owned T`
-    //     return after substitution). Never the local's declared type: the
-    //     two differ exactly where it matters, e.g. `var b: Base := new
-    //     Derived();` with a trivial `Base` and a destructor-bearing
-    //     `Derived` allocates a NON-trivial instance carrying a real §28.3
-    //     obligation, and keying on the declared `Base` would suppress a
-    //     warning that is genuinely due -- the dangerous direction.
-    //   * any other initializer (a `move` transfer, an `if`/`??` join, an
-    //     index/slice read) -- no statically-known producer, so the local's
-    //     declared (or inferred) type decides.
-    // An interface-typed key is never trivial-dispose
-    // (`typeIsProvablyTrivialDisposeClass` rejects every non-`Class`
-    // declaration), so an `owned IThing`-returning call keeps its warning.
-    // A CollectionLiteralExpr has no recorded exprType (§15.4 context-typing),
-    // so it falls to the declared-type arm, which is the literal's target.
-    // Falls back to the written `new T` type node when the expression type is
-    // unavailable (error recovery).  // per §28.9, v0.357, #2654, #4418
-    const sema::TypeRef* t = nullptr;
+    // DECLARED type otherwise", and "Where a producer is present, its produced
+    // type decides in both directions whatever the declared type is". An owned
+    // plain-`var` local's initializer is always one of §28.3.4's producers, so
+    // the classification walks that producer (`producedValueIsTrivialDispose`)
+    // and NEVER falls back to the local's declared or inferred type: `var b:
+    // Base := new Derived();` with a trivial `Base` and a destructor-bearing
+    // `Derived` allocates a NON-trivial instance carrying a real §28.3
+    // obligation, and keying on `Base` would suppress a warning that is
+    // genuinely due -- the dangerous direction. The same holds for a wrapped
+    // producer (`MkDN()!`, `(if c then new Derived() else new Base())`, `MkDN()
+    // ?? new Derived()`), whose inferred type is the trivial join `Base`.
+    // per §28.9, §28.3.4, v0.357, #2654, #4418
     if (const auto* ne = dynamic_cast<const ast::NewExpr*>(ld.initializer.get())) {
-        t = ctx_.exprType(*ne);
+        // The bare `new` form: unchanged from #2654 (it does not consult
+        // `reassigned`; that pre-existing gap is #8705).
+        const sema::TypeRef* t = ctx_.exprType(*ne);
         if (!t && ne->type) t = ctx_.resolvedType(*ne->type);
-    } else {
-        // The CALL and declared-type arms key on the INITIALIZER's value, so
-        // they hold only while the local still holds it: a reassigned local
-        // (`var x: Base? := null; x := new Derived();`) or a null-initialized
-        // one that becomes owned through reassignment drops a value this
-        // initializer says nothing about. Those keep the warning -- a retained
-        // (noisy) lint, never a hidden obligation.
-        if (reassigned || ld.becomesOwnedViaReassign) return false;
-        if (dynamic_cast<const ast::NullLiteralExpr*>(ld.initializer.get()))
-            return false;
-        if (dynamic_cast<const ast::CallExpr*>(ld.initializer.get()))
-            t = ctx_.exprType(*ld.initializer);
-        else if (ls)
-            t = ls->declType;
+        return typeIsProvablyTrivialDisposeClass(t);
     }
-    return typeIsProvablyTrivialDisposeClass(t);
+    // Every other arm keys on the INITIALIZER's value, so it holds only while
+    // the local still holds it: a reassigned local (`var x: Base? := null; x :=
+    // new Derived();`) or a null-initialized one that becomes owned through
+    // reassignment drops a value this initializer says nothing about. Those
+    // keep the warning -- a retained (noisy) lint, never a hidden obligation.
+    if (reassigned.count(ls) != 0 || ld.becomesOwnedViaReassign) return false;
+    if (dynamic_cast<const ast::NullLiteralExpr*>(ld.initializer.get()))
+        return false;
+    const sema::TypeRef* target = ls ? ls->declType : nullptr;
+    // The v0.180 binding-position marker `var y := owned x;` stores the bare
+    // `x`: the same transfer as `var y := move x;`.
+    if (ld.initializerHasOwnedMarker)
+        return movedSourceIsTrivialDispose(*ld.initializer, reassigned, 0);
+    return producedValueIsTrivialDispose(*ld.initializer, target, reassigned, 0);
+}
+
+// fix #4418 (§28.9, §28.3.4, v0.357): is the value `e` produces -- an owned
+// local's initializer, or one arm of it -- provably trivial-dispose? Walks
+// §28.3.4's producers table rather than reading the local's declared type:
+//   * `new T(...)`, any call, and a range slice: the expression's own
+//     (produced) type;
+//   * a collection literal: its target type (§15.4 context-typing -- the
+//     literal records no type of its own, and the target is the type it
+//     constructs);
+//   * `x!`: "a fresh producer's `!` is owned" -- the producer underneath;
+//   * `a ?? b`, `(if c then v1 else v2)`, an expression-`case`: "the meet of
+//     the arms' ownership states" -- exempt only when EVERY arm is itself a
+//     trivial-dispose production (one destructor-bearing arm is a real
+//     obligation on the path that selects it);
+//   * `move x` (bare, or as a marked arm): the moved binding's own key --
+//     its initializer's producer, re-walked, or a parameter's declared type.
+// A `null` or `throw` arm of a join produces no value to dispose, so it does
+// not block the exemption (the caller has already refused a bare `null`
+// initializer). Anything else (a binding atom, a block-bodied arm, an
+// unrecognised form) answers false: the warning is kept. That direction is
+// the predicate's standing posture -- a retained (noisy) lint, never a hidden
+// obligation. `depth` bounds the walk.
+bool MethodOwnership::producedValueIsTrivialDispose(
+        const ast::Expr& e, const sema::TypeRef* target,
+        const std::unordered_set<const sema::Symbol*>& reassigned, int depth) {
+    if (depth > 8) return false;
+    if (const auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        const sema::TypeRef* t = ctx_.exprType(*ne);
+        if (!t && ne->type) t = ctx_.resolvedType(*ne->type);
+        return typeIsProvablyTrivialDisposeClass(t);
+    }
+    if (dynamic_cast<const ast::CallExpr*>(&e))
+        return typeIsProvablyTrivialDisposeClass(ctx_.exprType(e));
+    // §28.3.4 row "Range slice `arr[r]`": Owned -- a fresh `Array<T>`, its
+    // produced type the expression's own. (A plain indexer read is a borrow,
+    // so it never initializes an owned local.)
+    if (dynamic_cast<const ast::IndexExpr*>(&e))
+        return typeIsProvablyTrivialDisposeClass(ctx_.exprType(e));
+    if (dynamic_cast<const ast::CollectionLiteralExpr*>(&e))
+        return typeIsProvablyTrivialDisposeClass(target);
+    if (const auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e))
+        return pb->operand &&
+               producedValueIsTrivialDispose(*pb->operand, target, reassigned,
+                                             depth + 1);
+    if (const auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->op != "??" || !be->left || !be->right) return false;
+        return producedValueIsTrivialDispose(*be->left, target, reassigned,
+                                             depth + 1) &&
+               producedValueIsTrivialDispose(*be->right, target, reassigned,
+                                             depth + 1);
+    }
+    if (const auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (!ce->thenValue || !ce->elseValue) return false;
+        return producedValueIsTrivialDispose(*ce->thenValue, target, reassigned,
+                                             depth + 1) &&
+               producedValueIsTrivialDispose(*ce->elseValue, target, reassigned,
+                                             depth + 1);
+    }
+    if (const auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (cx->arms.empty()) return false;
+        for (const auto& arm : cx->arms) {
+            if (arm.bodyKind != ast::CaseArmBodyKind::Expression ||
+                !arm.exprBody)
+                return false;
+            if (!producedValueIsTrivialDispose(*arm.exprBody, target,
+                                               reassigned, depth + 1))
+                return false;
+        }
+        return true;
+    }
+    if (const auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (ue->op != "move" || ue->replacement || !ue->operand) return false;
+        return movedSourceIsTrivialDispose(*ue->operand, reassigned, depth + 1);
+    }
+    if (dynamic_cast<const ast::MarkedTransferExpr*>(&e))
+        return movedSourceIsTrivialDispose(e, reassigned, depth + 1);
+    if (dynamic_cast<const ast::NullLiteralExpr*>(&e) ||
+        dynamic_cast<const ast::ThrowExpr*>(&e))
+        return depth > 0;
+    return false;
+}
+
+// The `move x` arm of `producedValueIsTrivialDispose`: `x` names the binding
+// whose obligation transfers, so the transferred value's key is x's own -- a
+// plain-`var` local's initializer producer (re-walked, while x was never
+// reassigned), or an `owned` parameter's declared type (a parameter has no
+// producer: §28.9's declared-type arm). Any other operand (a field, a slot,
+// an unresolved name) keeps the warning. per §28.9, §28.3.4, v0.357, #4418
+bool MethodOwnership::movedSourceIsTrivialDispose(
+        const ast::Expr& operand,
+        const std::unordered_set<const sema::Symbol*>& reassigned, int depth) {
+    if (depth > 8) return false;
+    if (!dynamic_cast<const ast::IdentifierExpr*>(&operand) &&
+        !dynamic_cast<const ast::MarkedTransferExpr*>(&operand))
+        return false;
+    const sema::Symbol* s = ctx_.exprSymbol(operand);
+    if (!s) return false;
+    if (const auto* ps = dynamic_cast<const sema::ParameterSymbol*>(s))
+        return ps->modifier == "owned" && ownedParamIsTrivialDispose(*ps);
+    const auto* src = dynamic_cast<const sema::LocalSymbol*>(s);
+    if (!src || src->isUsing) return false;
+    const auto* sd = dynamic_cast<const ast::LocalDecl*>(src->decl);
+    if (!sd || sd->isUsing || !sd->initializer) return false;
+    if (reassigned.count(src) != 0 || sd->becomesOwnedViaReassign) return false;
+    if (dynamic_cast<const ast::NullLiteralExpr*>(sd->initializer.get()))
+        return false;
+    if (sd->initializerHasOwnedMarker)
+        return movedSourceIsTrivialDispose(*sd->initializer, reassigned,
+                                           depth + 1);
+    return producedValueIsTrivialDispose(*sd->initializer, src->declType,
+                                         reassigned, depth + 1);
 }
 
 // The TYPE half of the §28.9 exemption, shared by the owned-LOCAL `new`

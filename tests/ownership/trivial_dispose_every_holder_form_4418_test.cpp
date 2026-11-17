@@ -52,6 +52,17 @@ const char* kTrivial =
     "  public method X(): int => _x; "
     "end K; ";
 
+// A trivial-dispose `Base` with a destructor-bearing `Derived` (NOT trivial).
+const char* kBaseDerived =
+    "class Base "
+    "  public constructor() end constructor; "
+    "  public method X(): int => 1; "
+    "end Base; "
+    "class Derived: Base "
+    "  public constructor() base(); end constructor; "
+    "  destructor end destructor; "
+    "end Derived; ";
+
 // The destructor-bearing twin: NOT trivial-dispose.
 const char* kNonTrivial =
     "class D "
@@ -77,6 +88,7 @@ BEZEL_TEST(trivial_dispose_every_holder_form_4418,
         "    var f := Mk(); return f.Count; "
         "  end Main; "
         "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasMustUseWarning(r, "f"));
 }
 
@@ -94,25 +106,30 @@ BEZEL_TEST(trivial_dispose_every_holder_form_4418,
         "    var k := Mk(); return k.X(); "
         "  end Main; "
         "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasMustUseWarning(r, "k"));
 }
 
-// §28.9 v0.357, the produced-type arm: a trivial-dispose DECLARED `Base` over
-// a call returning a destructor-bearing `owned D` is not exempt (value-keyed,
-// K1.6). Control for the call arm.
+// §28.9 v0.357, the produced-type arm (control 1 of 2): a trivial-dispose
+// DECLARED `Base` over a call returning a destructor-bearing `owned Derived`
+// is not exempt -- "Where a producer is present, its produced type decides in
+// both directions whatever the declared type is". Green on r30-c1 too; it is
+// RED under the plausible wrong fix that keys the call arm on the local's
+// declared type (`t = ls->declType` for a CallExpr initializer).
 BEZEL_TEST(trivial_dispose_every_holder_form_4418,
            call_bound_local_nontrivial_producer_keeps_warning_spec_28_9) {
     auto r = parseAndCheckOwnership(
-        std::string("module M; ") + kNonTrivial +
+        std::string("module M; ") + kBaseDerived +
         "class C "
-        "  private static method Mk(): owned D "
-        "    return new D(1); "
-        "  end Mk; "
+        "  private static method MkD(): owned Derived "
+        "    return new Derived(); "
+        "  end MkD; "
         "  public static method Main(): int "
-        "    var d := Mk(); return d.X(); "
+        "    var b: Base := MkD(); return b.X(); "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(hasMustUseWarning(r, "d"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMustUseWarning(r, "b"));
 }
 
 // §28.9 v0.357 / §29.2: an owning iteration variable of trivial-dispose
@@ -131,6 +148,7 @@ BEZEL_TEST(trivial_dispose_every_holder_form_4418,
         "    return 0; "
         "  end Main; "
         "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasMustUseWarning(r, "k"));
 }
 
@@ -145,6 +163,7 @@ BEZEL_TEST(trivial_dispose_every_holder_form_4418,
         "    yield return 1; "
         "  end Gen; "
         "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasMustUseWarning(r, "k"));
 }
 
@@ -158,12 +177,15 @@ BEZEL_TEST(trivial_dispose_every_holder_form_4418,
         "    return 1; "
         "  end Run; "
         "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasMustUseWarning(r, "k"));
 }
 
-// Control for the frame-parameter arms: a destructor-bearing `owned`
+// Control 2 of 2, for the frame-parameter arms: a destructor-bearing `owned`
 // parameter of an iterator keeps its warning (the exemption is value-keyed,
-// not a blanket drop of the frame lint).
+// not a blanket drop of the frame lint). Green on r30-c1 too; it is RED under
+// the plausible wrong fix that silences the iterator frame's must-use warning
+// unconditionally instead of through `ownedParamIsTrivialDispose`.
 BEZEL_TEST(trivial_dispose_every_holder_form_4418,
            iterator_owned_param_of_nontrivial_type_keeps_warning_spec_29_8) {
     auto r = parseAndCheckOwnership(
@@ -194,6 +216,107 @@ BEZEL_TEST(trivial_dispose_every_holder_form_4418,
         "    throw new Exception(\"x\"); "
         "  end Run; "
         "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasMustUseWarning(r, "v"));
     BEZEL_EXPECT_FALSE(hasMustUseWarning(r, "w"));
+}
+
+// ---------------------------------------------------------------------------
+// fix-forward #4418 (review r42-rev-p7-4418, REJECT 1): a WRAPPED producer.
+// §28.3.4's producers table classifies every owned initializer, and §28.9
+// keys the exemption on the produced type "where the drop site's value has a
+// statically-known producer": "Where a producer is present, its produced type
+// decides in both directions whatever the declared type is: `var b: Base :=
+// new Derived();` above is not exempt". The rejected first cut recognised only
+// a BARE `new` / call initializer and keyed every other form on the local's
+// declared (or inferred) type, so each row below -- a destructor-bearing
+// `Derived` production under a trivial `Base` -- lost its warning. Each row is
+// RED on a869c719d (the rejected first cut) and green on r30-c1 and here.
+// ---------------------------------------------------------------------------
+
+namespace {
+std::string baseDerivedProg(const std::string& members) {
+    return std::string("module M; ") + kBaseDerived + "class C " + members +
+           "end C;";
+}
+}  // namespace
+
+// §28.3.4 row `x!`: "a fresh producer's `!` is owned" -- the producer is the
+// call, whose produced type is the destructor-bearing `Derived`.
+BEZEL_TEST(trivial_dispose_every_holder_form_4418,
+           bang_over_call_producing_derived_under_trivial_base_keeps_warning_spec_28_9) {
+    auto r = parseAndCheckOwnership(baseDerivedProg(
+        "  private static method MkDN(): owned Derived? => new Derived(); "
+        "  public static method Main(): int "
+        "    var b: Base := MkDN()!; return b.X(); "
+        "  end Main; "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMustUseWarning(r, "b"));
+}
+
+// §28.3.4 row `(if c then v1 else v2)`: the meet of the arms -- one arm is a
+// destructor-bearing production, so the declared `Base` does not exempt it.
+BEZEL_TEST(trivial_dispose_every_holder_form_4418,
+           if_join_with_derived_arm_under_declared_trivial_base_keeps_warning_spec_28_9) {
+    auto r = parseAndCheckOwnership(baseDerivedProg(
+        "  public static method Main(c: bool): int "
+        "    var b: Base := (if c then new Derived() else new Base()); "
+        "    return b.X(); "
+        "  end Main; "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMustUseWarning(r, "b"));
+}
+
+// The same join with NO annotation: the INFERRED join type is the trivial
+// `Base`, and it still does not decide over the `new Derived()` arm.
+BEZEL_TEST(trivial_dispose_every_holder_form_4418,
+           if_join_with_derived_arm_inferred_trivial_base_keeps_warning_spec_28_9) {
+    auto r = parseAndCheckOwnership(baseDerivedProg(
+        "  public static method Main(c: bool): int "
+        "    var b := (if c then new Derived() else new Base()); "
+        "    return b.X(); "
+        "  end Main; "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMustUseWarning(r, "b"));
+}
+
+// §28.3.4 row `a ?? b`: the meet of both operands' productions.
+BEZEL_TEST(trivial_dispose_every_holder_form_4418,
+           coalesce_of_derived_productions_under_trivial_base_keeps_warning_spec_28_9) {
+    auto r = parseAndCheckOwnership(baseDerivedProg(
+        "  private static method MkDN(): owned Derived? => new Derived(); "
+        "  public static method Main(): int "
+        "    var b: Base := MkDN() ?? new Derived(); return b.X(); "
+        "  end Main; "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMustUseWarning(r, "b"));
+}
+
+// §28.3.4 row expression-`case`: "the meet ranges over every arm's result
+// expression" -- one destructor-bearing arm keeps the warning.
+BEZEL_TEST(trivial_dispose_every_holder_form_4418,
+           case_join_with_derived_arm_under_trivial_base_keeps_warning_spec_28_9) {
+    auto r = parseAndCheckOwnership(baseDerivedProg(
+        "  public static method Main(n: int): int "
+        "    var b: Base := (case n of 0 => new Base(), _ => new Derived()); "
+        "    return b.X(); "
+        "  end Main; "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMustUseWarning(r, "b"));
+}
+
+// `move d` over `d := new Derived()`: the transferred value's key is d's own
+// producer (the `new Derived()`), not the receiving binding's declared `Base`.
+// (The reviewer recorded the declared-vs-value-keyed reading of a `move`
+// initializer as a spec tension on #4418 for the docs session; this keeps the
+// r30-c1 behaviour, and 3709's `var y := move v` over `new StringBuilder()`
+// stays silent because v's producer is trivial.)
+BEZEL_TEST(trivial_dispose_every_holder_form_4418,
+           move_of_derived_local_into_trivial_base_keeps_warning_spec_28_9) {
+    auto r = parseAndCheckOwnership(baseDerivedProg(
+        "  public static method Main(): int "
+        "    var d := new Derived(); var b: Base := move d; return b.X(); "
+        "  end Main; "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMustUseWarning(r, "b"));
 }
