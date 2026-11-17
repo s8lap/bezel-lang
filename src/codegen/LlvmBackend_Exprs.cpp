@@ -2291,9 +2291,31 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (re->step) {
             llvm::Value* s = lowerExpr(*re->step);
             if (!s) return nullptr;
+            // fix #8685 (§16.3, §5.1, §16.4, §16.5, v0.357): `Step` is a
+            // SIGNED 64-bit integer — §16.3, verbatim: "`Step` is a signed
+            // 64-bit integer, to support descending iteration over both
+            // signed and unsigned `T`" — and the step EXPRESSION converts to
+            // it under §5.1's table, so an UNSIGNED source widens
+            // VALUE-PRESERVINGLY (zero-extended) and a signed one
+            // sign-extends. The step was ALWAYS sign-extended here, so a
+            // `uint` step of 3000000000 became the NEGATIVE i64 -1294967296:
+            // the range's direction is the step's SIGN (§16.4), so the range
+            // iterated DESCENDING and the `IEnumerable<T>` face drained EMPTY
+            // — while the counted loop (§16.5) answered 0 and 3000000000,
+            // because the counted-loop lowering ALREADY zero-extended an
+            // unsigned step. The two faces of ONE range disagreed.
+            //
+            // The signedness is the SOURCE EXPRESSION's own, read with
+            // `isUnsignedTargetExpr` — the house predicate the counted-loop
+            // lowering (LlvmBackend_Stmts.cpp) and the `Step(by)` method
+            // (LlvmBackend_Calls2.cpp) already use, so the three sites
+            // cannot disagree. It is NOT inferred from the bit width: `int`
+            // and `uint` are both 32 bits, `long` and `ulong` both 64.
             stepV = s->getType() == i64()
                         ? s
-                        : builder_.CreateSExt(s, i64(), "range.step");
+                        : (isUnsignedTargetExpr(*re->step)
+                               ? builder_.CreateZExtOrTrunc(s, i64(), "range.step")
+                               : builder_.CreateSExtOrTrunc(s, i64(), "range.step"));
             // §16.4 (v0.242, #3052), verbatim: "A step of zero is rejected
             // **at construction**: … evaluating a range expression whose
             // computed step is zero raises `OverflowException` at the
