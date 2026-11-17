@@ -12387,6 +12387,58 @@ static bool isStdlibComparableValueBuiltin(const TypeSymbol* d) {
            d->name == "Guid";
 }
 
+// fix #8590 (spec §14.2 *Interface conformance* rule 2 and *Worked example:
+// `where T: IComparable<int>`*, v0.357): is this declaration-less Named ref in
+// a bound's INSTANTIATION position the CONSTRAINT'S OWN type parameter?
+//
+// `!bArg->declaration` alone is true for TWO different shapes: a
+// bare-parameter marker (`where T: IComparable<T>` — the constraint's own
+// parameter) and a BUILT-IN type name spelled in the bound (`where T:
+// IComparable<DateTime>`). Reading the second as the first replaced the
+// bound's argument with the CANDIDATE, and the instantiation check then
+// compared the candidate with ITSELF — so a record conforming to
+// `IComparable<Rec>` was admitted against the bound `IComparable<DateTime>`
+// (the type confusion fix #4863 closed). §14.2 rule 2 admits a record only by
+// listing THAT instantiation in its inheritance clause, so `Rec` does not
+// conform to `IComparable<DateTime>`.
+//
+// The resolver's own answer comes first (#8213): a spelling that bound to a
+// type parameter IS the constraint's own parameter, even when its NAME is a
+// built-in's (`class Box<DateTime>`); a spelling the resolver resolved to a
+// concrete type is that type, whatever its name. A ref the resolver never
+// resolved (module metadata, a later pass's synthesised ref) falls back to the
+// name test — `isOpenParamLeaf`: a built-in type name is concrete, any other
+// declaration-less name is a marker.
+static bool isBoundParamMarker(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named || t->declaration) return false;
+    if (t->typeParam == TypeRef::TypeParamBinding::Param) return true;
+    if (t->typeParam == TypeRef::TypeParamBinding::NotParam) return false;
+    return isOpenParamLeaf(t);
+}
+
+// fix #8590 (spec §14.2 *Interface conformance* rule 2, v0.357): do the bound's
+// instantiation argument and the CANDIDATE's own instantiation of the same
+// interface name the SAME type?
+//
+// `Resolver::typeRefEqual` compares a Named ref's DECLARATION first, so two
+// DECLARATION-LESS refs (both nullptr) are equal whatever their names — the
+// blind spot #6315 documents ("the declaration compare below equates any two
+// of them (`Array<U>` with `Array<V>`)"). A bound that spells a BUILT-IN type
+// names the INSTANTIATION it spells, so the spelled names must agree — at the
+// head and at every nested argument.
+static bool sameBoundInstantiationArg(const TypeRef* a, const TypeRef* b) {
+    if (!a || !b) return false;
+    if (a->kind != b->kind || a->nullable != b->nullable) return false;
+    if (a->kind != TypeRef::Kind::Named) return typeRefEqual(a, b);
+    if (a->declaration != b->declaration) return false;
+    if (!a->declaration && namedLeafName(a) != namedLeafName(b)) return false;
+    if (a->genericArgs.size() != b->genericArgs.size()) return false;
+    for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
+        if (!sameBoundInstantiationArg(a->genericArgs[i], b->genericArgs[i]))
+            return false;
+    return true;
+}
+
 bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
                            SemaContext* ctx) {
     if (!arg || !bound) return false;
@@ -12502,8 +12554,15 @@ bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
                 // §14.2 substitution (single-entry): a bare-parameter marker
                 // in the bound names the constraint's own type parameter;
                 // under substitution it equals the candidate.
-                if (bArg && bArg->kind == TypeRef::Kind::Named &&
-                    !bArg->declaration) {
+                //
+                // fix #8590 (§14.2 *Interface conformance* rule 2, v0.357):
+                // the marker test must not read a BUILT-IN type name spelled
+                // in the bound (`where T: IComparable<DateTime>`) as the
+                // constraint's own parameter — see `isBoundParamMarker` above.
+                // The bound's argument is then the INSTANTIATION it names, and
+                // it is compared with the candidate's own instantiation
+                // (`sameBoundInstantiationArg` above), not replaced by it.
+                if (isBoundParamMarker(bArg)) {
                     bArg = arg;
                     // fix #5086 (§14.2, v0.307): when bArg is replaced with
                     // the full candidate arg (e.g. Pair<string>), the nested
@@ -12597,7 +12656,8 @@ bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
                             break;
                         }
                     }
-                } else if (!typeRefEqual(bArg, tRef->genericArgs[j])) {
+                } else if (!sameBoundInstantiationArg(bArg,
+                                                      tRef->genericArgs[j])) {
                     allMatch = false;
                     break;
                 }
