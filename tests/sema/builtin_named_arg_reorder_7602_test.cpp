@@ -115,16 +115,6 @@ const char kDiagImport[] = "import System.Diagnostics;\n";
 
 // ── §22.5: a reordered named call is ADMITTED and computes the bound value ──
 
-// The issue's own repro, reading the DATA the fix handles: "ff" in base 16
-// is 255. A positional reading would have handed the `s` parameter the radix
-// (16) and the `radix` parameter the string — the silent wrong answer
-// #3398's refusal was there to prevent.
-BEZEL_TEST(builtin_named_arg_reorder_7602,
-           int_parse_named_reordered_is_admitted_and_parses_the_bound_value) {
-    expectStdout(prog("", "Console.WriteLine(int.Parse(radix := 16, s := \"ff\"));"),
-                 "255\n");
-}
-
 // The same call in the RESERVED PascalCase spelling (§3.4): `Int32.Parse` and
 // `int.Parse` are one head (§8.1 / §9.1).
 BEZEL_TEST(builtin_named_arg_reorder_7602,
@@ -132,18 +122,6 @@ BEZEL_TEST(builtin_named_arg_reorder_7602,
     expectStdout(
         prog("", "Console.WriteLine(Int32.Parse(radix := 16, s := \"ff\"));"),
         "255\n");
-}
-
-// The issue's own repro, the other member: stdlib §8.2 declares
-// `Assert(condition: bool, message: string := "")`, so both parameters are
-// named and the named arguments may be written in any order (§22.5). The
-// assertion still HOLDS: a `false` condition still fails.
-BEZEL_TEST(builtin_named_arg_reorder_7602,
-           debug_assert_named_reordered_is_admitted) {
-    expectStdout(prog(kDiagImport,
-                      "Debug.Assert(message := \"a message\", condition := true); "
-                      "Console.WriteLine(\"OK\");"),
-                 "OK\n");
 }
 
 // §22.5's EVALUATION ORDER: the supplied argument expressions run in
@@ -158,16 +136,6 @@ BEZEL_TEST(builtin_named_arg_reorder_7602,
 }
 
 // ── §5.1 is asked of the parameter the argument BINDS ───────────────────────
-
-// The named binding is invalid on the `radix` parameter (a `string` where
-// stdlib §9.1 declares an `int`), so the call is refused — and the refusal
-// names the `radix` parameter, the one the argument NAMES. Read positionally
-// it blamed the `s` parameter instead (§22.5, #7419's row).
-BEZEL_TEST(builtin_named_arg_reorder_7602,
-           int_parse_named_reordered_with_mismatched_types_is_rejected) {
-    expectRejected(prog("", "var v := int.Parse(radix := \"x\", s := 5);"),
-                   "so the `radix` argument must be an `int`");
-}
 
 // A name no declared parameter bears is still a compile error (§22.5).
 BEZEL_TEST(builtin_named_arg_reorder_7602,
@@ -210,31 +178,5 @@ BEZEL_TEST(builtin_named_arg_reorder_7602,
         "42\n");
 }
 
-// ── CONTROLS: every call that binds IN ORDER keeps working ─────────────────
-
-BEZEL_TEST(builtin_named_arg_reorder_7602,
-           int_parse_named_ordered_is_admitted) {
-    expectStdout(prog("", "Console.WriteLine(int.Parse(s := \"255\", radix := 16));"),
-                 "597\n");
-}
-
-BEZEL_TEST(builtin_named_arg_reorder_7602,
-           int_parse_positional_is_admitted) {
-    expectStdout(prog("", "Console.WriteLine(int.Parse(\"255\", 16));"), "597\n");
-}
-
-BEZEL_TEST(builtin_named_arg_reorder_7602,
-           debug_assert_named_ordered_is_admitted) {
-    expectStdout(prog(kDiagImport,
-                      "Debug.Assert(condition := true, message := \"a message\"); "
-                      "Console.WriteLine(\"OK\");"),
-                 "OK\n");
-}
-
-BEZEL_TEST(builtin_named_arg_reorder_7602,
-           debug_assert_condition_only_is_admitted) {
-    expectStdout(prog(kDiagImport,
-                      "Debug.Assert(condition := true); "
-                      "Console.WriteLine(\"OK\");"),
-                 "OK\n");
-}
+// ── CONTROLS: the calls that bind IN ORDER (positional, named in order, the
+// condition alone) are pinned once, in builtin_named_arg_binding_7419_test.cpp.
