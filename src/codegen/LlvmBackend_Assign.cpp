@@ -19054,6 +19054,13 @@ struct ParamEscapeWalker {
                        std::unordered_set<const sema::Symbol*>&)>
         lambdaCaptures;
     bool escaped = false;
+    // fix #6149 (§14.1, v0.357): the callee's OWN type parameters, bound to
+    // the types ONE call site supplies (read by `isValueKindExpr`). Null for
+    // the cached, instantiation-independent walk, which reads a type
+    // parameter as no value kind at all — the answer that holds for every
+    // binding.
+    const std::unordered_map<std::string_view, const sema::TypeRef*>*
+        typeParamSubst = nullptr;
 
     bool isTarget(const ast::Expr* e) {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -19113,6 +19120,17 @@ struct ParamEscapeWalker {
         // may outlive the call (same guard as `isUnboxedRead`).
         if (!e || lambdaDepth != 0 || isTarget(e)) return false;
         const sema::TypeRef* t = ctx.exprType(*e);
+        // fix #6149 (§8.6 / §14.1, v0.357): inside a walk made for ONE
+        // instantiation of a generic callee, a receiver typed by the callee's
+        // own type parameter is read as the type that call binds it to — the
+        // monomorphized body the call runs is that type's (§14.1), so `x: T`
+        // bound to a value record dispatches the record's value-semantics
+        // `Equals` exactly as a receiver declared with the record type does.
+        if (t && typeParamSubst && t->kind == sema::TypeRef::Kind::Named &&
+            t->isResolvedTypeParam() && !t->nullable) {
+            auto it = typeParamSubst->find(t->headName());
+            if (it != typeParamSubst->end() && it->second) t = it->second;
+        }
         if (!t || t->nullable) return false;
         using K = sema::TypeRef::Kind;
         using P = sema::PrimitiveType;
@@ -19697,13 +19715,22 @@ struct ParamEscapeWalker {
 // body in this module ⇒ false (leak — the safe direction per #2823/#2874).
 // Locally-compiled MethodDecl / ConstructorDecl: walk the body with
 // ParamEscapeWalker; the result is cached per callee Decl.
-bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
-                                       size_t paramIdx) {
+bool Emitter::isCalleeParamNonEscaping(
+        const ast::Member* callee, size_t paramIdx,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>*
+            typeParamSubst) {
     if (!callee) return false;
+    // fix #6149 (§14.1, v0.357): a walk for ONE instantiation of a generic
+    // callee (`typeParamSubst` non-empty) answers for that call site only, so
+    // it neither reads nor writes the per-callee cache, whose entries hold
+    // the instantiation-independent answer.
+    const bool instantiated = typeParamSubst && !typeParamSubst->empty();
     // Check the cache first.
-    auto it = calleeParamNonEscape_.find(callee);
-    if (it != calleeParamNonEscape_.end())
-        return it->second.count(paramIdx) != 0;
+    if (!instantiated) {
+        auto it = calleeParamNonEscape_.find(callee);
+        if (it != calleeParamNonEscape_.end())
+            return it->second.count(paramIdx) != 0;
+    }
 
     // Build the cache entry by walking every parameter (the walker is O(N) per
     // call, so amortising it across all Object/interface params of one callee
@@ -19755,7 +19782,8 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
     auto unboxes = [this](const sema::TypeRef* t) -> bool {
         return t && (isBoxableValueType(t) || isNullableValueTy(t));
     };
-    calleeParamNonEscape_[callee];  // seed: every parameter escapes (#8011)
+    if (!instantiated)
+        calleeParamNonEscape_[callee];  // seed: every parameter escapes (#8011)
     auto walkParams = [&](const std::vector<ast::Param>& params,
                           const std::vector<std::unique_ptr<ast::Stmt>>* body,
                           const ast::Expr* exprBody) {
@@ -19764,6 +19792,7 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
             const sema::TypeRef* pt = ctx_.resolvedType(*params[i].type);
             if (!pt || !isObjectOrInterfaceTarget(pt)) continue;
             ParamEscapeWalker w{ctx_, params[i].type.get(), captures};
+            w.typeParamSubst = instantiated ? typeParamSubst : nullptr;
             w.argNonEscaping = argNonEscaping;
             w.unboxes = unboxes;
             if (body) {
@@ -19803,7 +19832,8 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
             if (mod == "sealed") sealedMod = true;
         }
         if (stateMachine || (dispatched && !sealedMod)) {
-            calleeParamNonEscape_[callee] = std::move(nonEscape);
+            if (!instantiated)
+                calleeParamNonEscape_[callee] = std::move(nonEscape);
             return false;
         }
         if (md->bodyKind == ast::MethodBodyKind::Expression) {
@@ -19819,7 +19849,7 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
         return false;
     }
     bool result = nonEscape.count(paramIdx) != 0;
-    calleeParamNonEscape_[callee] = std::move(nonEscape);
+    if (!instantiated) calleeParamNonEscape_[callee] = std::move(nonEscape);
     return result;
 }
 
@@ -20271,7 +20301,7 @@ bool Emitter::isCalleeRecordParamNonEscaping(const ast::Member* callee,
 }
 
 
-// fix #5855 (§8.6 / §9.7 / §28.3, v0.357): the callee-side facts
+// fix #5855 / #6149 (§8.6 / §9.7 / §28.3, v0.357): the callee-side facts
 // shared by the two call-argument relaxations below — the resolved
 // MethodSymbol of a plain call to a LOCALLY compiled user method that is not
 // an operator, an extension or an interface member, with every argument
@@ -20353,6 +20383,60 @@ bool Emitter::recordLocalStrictlyCallBounded(
         if (w.escaped) return false;
     }
     return true;
+}
+
+
+// fix #6149 (§8.6 / §14.1 / §28.3 / §28.9, v0.357): is the argument at `i`
+// a box handed to an `Object`/interface parameter that the callee provably
+// does not let outlive the call (the #2952 summary)? For a GENERIC callee the
+// walk is made for THIS call's instantiation: the callee's own type
+// parameters are bound from the call's explicit type-argument list, or else
+// from each argument whose formal is a bare type parameter. A parameter left
+// unbound (or bound to a type parameter of the caller) stays unbound, and the
+// walk reads it as no value kind at all — the answer for every binding.
+bool Emitter::boxArgToUserCallNonEscaping(
+        const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+        std::size_t i) {
+    const sema::MethodSymbol* ms = plainLocalUserCallee(callee, args, i);
+    if (!ms) return false;
+    auto* decl = dynamic_cast<const ast::Member*>(ms->decl);
+    if (ms->genericParams.empty()) return isCalleeParamNonEscaping(decl, i);
+    std::unordered_map<std::string_view, const sema::TypeRef*> subst;
+    auto bindable = [](const sema::TypeRef* t) {
+        return t && !(t->kind == sema::TypeRef::Kind::Named &&
+                      t->isResolvedTypeParam());
+    };
+    const std::vector<std::unique_ptr<ast::Type>>* tas = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+        tas = &ma->typeArgs;
+    else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(callee))
+        tas = &id->typeArgs;
+    if (tas && !tas->empty()) {
+        if (tas->size() == ms->genericParams.size()) {
+            for (std::size_t k = 0; k < tas->size(); ++k) {
+                const sema::TypeRef* t =
+                    (*tas)[k] ? ctx_.resolvedType(*(*tas)[k]) : nullptr;
+                if (ms->genericParams[k] && bindable(t))
+                    subst[ms->genericParams[k]->name] = t;
+            }
+        }
+    } else {
+        for (std::size_t j = 0; j < args.size() && j < ms->params.size(); ++j) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[j]);
+            const sema::TypeRef* ft =
+                ps && ps->declType ? ctx_.resolvedType(*ps->declType) : nullptr;
+            if (!ft || ft->nullable || ft->kind != sema::TypeRef::Kind::Named ||
+                !ft->isResolvedTypeParam() || !args[j].value)
+                continue;
+            for (const sema::Symbol* gp : ms->genericParams) {
+                if (!gp || gp->name != ft->headName()) continue;
+                const sema::TypeRef* at = ctx_.exprType(*args[j].value);
+                if (bindable(at) && !subst.count(gp->name))
+                    subst[gp->name] = at;
+            }
+        }
+    }
+    return isCalleeParamNonEscaping(decl, i, &subst);
 }
 
 

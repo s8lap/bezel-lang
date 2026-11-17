@@ -13531,7 +13531,14 @@ private:
     // is never assigned to a static/instance field, passed to another call,
     // returned, captured, or stored — the same conservative shape BoxEscapeWalker
     // uses for the local-binding case. Imported callees ⇒ false.
-    bool isCalleeParamNonEscaping(const ast::Member* callee, size_t paramIdx);
+    //
+    // fix #6149 (§14.1, v0.357): `typeParamSubst`, when non-empty, binds the
+    // callee's OWN type parameters to the types one call site supplies, and
+    // the walk then answers for that instantiation only (uncached).
+    bool isCalleeParamNonEscaping(
+        const ast::Member* callee, size_t paramIdx,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>*
+            typeParamSubst = nullptr);
     // fix #5855 (§9.7 / §28.3 / §28.9, v0.357): may the by-value RECORD
     // parameter at `paramIdx` of `callee` outlive the call? (See
     // RecordParamEscapeWalker, LlvmBackend_Assign.cpp.) Cached per callee in
@@ -13544,7 +13551,7 @@ private:
     // / `GetHashCode()` on a non-nullable, non-generic record value, with a
     // same-typed plain argument — neither operand is kept or boxed.
     bool isSynthesizedRecordValueMemberCall(const ast::CallExpr& c);
-    // fix #5855 (v0.357): the resolved MethodSymbol of a plain call to
+    // fix #5855 / #6149 (v0.357): the resolved MethodSymbol of a plain call to
     // a locally compiled user method (no operator, extension or interface
     // member; every argument plain; a plain parameter at `i`), else null.
     const sema::MethodSymbol* plainLocalUserCallee(
@@ -13553,6 +13560,12 @@ private:
     // fix #5855 (§9.7 / §28.3, v0.357): a by-value record argument the callee
     // provably does not let outlive the call.
     bool recordArgToUserCallNonEscaping(
+        const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+        std::size_t i);
+    // fix #6149 (§8.6 / §14.1 / §28.3, v0.357): a box argument the callee
+    // provably does not let outlive the call, for a generic callee answered
+    // for this call's instantiation.
+    bool boxArgToUserCallNonEscaping(
         const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
         std::size_t i);
     // fix #5855 (v0.357): a record argument boxed into a non-generic callee's

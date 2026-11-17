@@ -46250,6 +46250,16 @@ struct BoxEscapeWalker {
     // Left empty in phase 1, like `isKnownBoxReceiver`.
     std::function<bool(const sema::MethodSymbol*, const ast::Expr*)>
         isSynthesizedEqualsCallee;
+    // fix #6149 (§8.6 / §28.3 / §28.9, v0.357): "is the argument at this
+    // position of this call a CALL-BOUNDED BORROW of the box?" — the
+    // Emitter's `boxArgToUserCallNonEscaping`, true only for a resolved,
+    // locally compiled, non-dispatched user method whose parameter at that
+    // position provably does not outlive the call (the #2952 summary, the
+    // same fact that arms the post-call release of a box the CALL mints).
+    // Empty for every other reuse of this walker.
+    std::function<bool(const ast::Expr*, const std::vector<ast::CallArgument>&,
+                       std::size_t)>
+        userCallArgNonEscaping;
     // fix #6057 (§27.6 / §28.9, v0.338): "does this method reference take
     // its own reference on its receiver's box?" — the Emitter's
     // `methodRefRetainsBoxReceiver`. Left empty in phase 1.
@@ -46496,7 +46506,9 @@ struct BoxEscapeWalker {
                         (isConsoleNonRetainingArg(callee, i, &ctx) ||
                          isSequenceEqualSpanNonRetainingArg(callee, i, ctx) ||
                          isNarrowedRead(args[i].value.get()) ||
-                         isKnownBoxEqualsArg(callee, args)) &&
+                         isKnownBoxEqualsArg(callee, args) ||
+                         (userCallArgNonEscaping &&           // fix #6149
+                          userCallArgNonEscaping(callee, args, i))) &&
                         !inLambda;
             expr(args[i].value.get(), safe);
         }
@@ -47257,6 +47269,14 @@ void Emitter::collectBoxReleaseEligible(
     // 200 allocation(s)` with the cap in place — exactly the documented
     // bound, not a soundness failure.
     std::unordered_map<const void*, bool> boxAliasBorrowTargets;
+    // fix #6149 (§8.6 / §28.3 / §28.9, v0.357): both passes read the SAME
+    // call-argument relaxation, so pass 2 stays a superset of pass 1 (the
+    // invariant `boxAliasBorrowTargets` relies on).
+    const auto boxUserArg =
+        [this](const ast::Expr* callee,
+               const std::vector<ast::CallArgument>& args, std::size_t i) {
+            return boxArgToUserCallNonEscaping(callee, args, i);
+        };
     const std::size_t aliasRounds =
         std::min<std::size_t>(candidates.size(), 8u);
     for (std::size_t round = 0; round < aliasRounds; ++round) {
@@ -47281,6 +47301,7 @@ void Emitter::collectBoxReleaseEligible(
                     return rt && rt->kind == sema::TypeRef::Kind::Named &&
                            isSynthesizedIEquatableEquals(ms, rt->declaration);
                 };
+            w.userCallArgNonEscaping = boxUserArg;   // fix #6149
             // Round 0 reads an EMPTY map, which disables the relaxation
             // everywhere and reproduces the pre-#6309 verdicts exactly; later
             // rounds read the previous round's.
@@ -47319,6 +47340,7 @@ void Emitter::collectBoxReleaseEligible(
                        isSynthesizedIEquatableEquals(ms, rt->declaration);
             };
         w.boxAliasBorrowTargets = &boxAliasBorrowTargets;   // fix #6309
+        w.userCallArgNonEscaping = boxUserArg;               // fix #6149
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         bool hasManagedBox =
             isPlusOneBoxProducer(ld) || w.sawBoxAssignment;
