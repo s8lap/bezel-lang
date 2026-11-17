@@ -129,7 +129,11 @@ extern "C" void* bz_exc_causechain_link(void* causeTypeName, void* causeMessage,
 // call-propagated exception has no static type at all), so the descriptor
 // channel is not available there; the virtual default is the §8.5 class
 // default — the type's qualified name — for every built-in exception and every
-// user subclass that does not override `ToString`.
+// user subclass that does not override `ToString`. A user override is CALLED
+// here, and its rendering becomes the `TypeName` — a known §31.2 deviation
+// ("its type name") shared with the CauseChain snapshot, because r30-c1 has no
+// runtime type-name source other than this slot (the type descriptor carries
+// no name, and `GetType()` is refused); tracked by #8634 for both chains.
 //
 // THE APPEND IS BEST-EFFORT (§31.2's explicit exception to §17.7's fatal
 // allocation rule): "the recording is diagnostic machinery, and a failed
@@ -215,9 +219,16 @@ extern "C" void bz_exc_superseded_append(void* superseding, void* superseded) {
     }
     void* message = nullptr;
     memcpy(&message, (uint8_t*)superseded + BZ_EXC_MSG_OFFSET, sizeof(void*));
+    // The `ToString` result is the CALLER's: a `string` return is an owned
+    // result (+1), so the snapshot ADOPTS it rather than retaining it a second
+    // time. Retaining it leaked one reference per supersession whenever the
+    // result was a fresh string — a user override such as `"X-" + Message`
+    // (review r42-rev-m13-3261 F2: 400 allocations over 200 loops). A
+    // type-name literal (the §8.5 default, every built-in thunk) carries the
+    // sentinel refcount, so adopting it is the no-op it always was. `Message`
+    // is a borrowed field read, so it IS retained.
     void* tn = typeName ? typeName : empty;
     void* mg = message ? message : empty;
-    bz_string_retain(tn);
     bz_string_retain(mg);
     elems[w].typeName   = tn;
     elems[w].message    = mg;

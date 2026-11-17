@@ -362,3 +362,61 @@ BEZEL_TEST(codegen_exc_superseded_chain_3261,
            no_constructor_accepts_superseded_chain_spec_31_4) {
     BEZEL_EXPECT_TRUE(rejectsWith(kNoConstructorAcceptsChain, "constructor"));
 }
+
+// =====================================================================
+// fix-forward of #3261 (review r42-rev-m13-3261, findings F2 and F4).
+// =====================================================================
+
+namespace {
+
+// F2. §31.2: the record is "a copy of value data" — the snapshot of a user
+// exception class that OVERRIDES `ToString`. The snapshot's `TypeName` is read
+// through the virtual `ToString` (vtable slot 3, the CauseChain channel; the
+// value is #8634's defect and is deliberately NOT pinned here). The override
+// returns a FRESH string, and the append retained that owned (+1) result a
+// second time: LeakSanitizer reported 9000 bytes in 400 allocations over the
+// 200 iterations. The row pins the count and the superseded `Message`, and
+// `runAotChecked` fails it on the leak.
+const char* kToStringOverrideLoop =
+    "module M; "
+    "public class ExA: Exception "
+    "  public constructor(message: string) base(message); "
+    "  end constructor; "
+    "  public override method ToString(): string "
+    "    return \"CUSTOM-\" + Message; "
+    "  end ToString; "
+    "end ExA; "
+    "public class ExB: Exception "
+    "  public constructor(message: string) base(message); "
+    "  end constructor; "
+    "end ExB; "
+    "public class Program "
+    "  public static method Main() "
+    "    for var i in 0..<200 do "
+    "      try "
+    "        try "
+    "          throw new ExA(\"first\"); "
+    "        finally "
+    "          throw new ExB(\"second\"); "
+    "        end try; "
+    "      catch "
+    "        var ex: Exception => do "
+    "          if i = 199 then "
+    "            Console.WriteLine(ex.SupersededChain.Count); "
+    "            Console.WriteLine(ex.SupersededChain[0].Message); "
+    "          end if; "
+    "        end end; "
+    "    end for; "
+    "  end Main; "
+    "end Program; ";
+
+}  // namespace
+
+BEZEL_TEST(codegen_exc_superseded_chain_3261,
+           tostring_override_snapshot_is_leak_free_spec_31_2) {
+    JitResult r = runAotChecked(kToStringOverrideLoop);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(out(r), std::string("1\nfirst"));
+}
