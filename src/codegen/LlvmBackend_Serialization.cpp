@@ -15,6 +15,7 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
 #include "ast/Node.hpp"
+#include "sema/CollectionShape.hpp"  // serializationSequenceCollectionElement — §9.8 (#8391)
 #include "sema/EnumValues.hpp"  // fix #3140: enumConstantWireNames — §9.8
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
@@ -672,6 +673,69 @@ void Emitter::emitSerializeField(llvm::Value* val,
         auto* endFn = declareC("bz_binser_end_array", voidTy, {ptrTy()});
         builder_.CreateCall(endFn, {serPtr});
         return;
+    }
+
+    // §9.8 (v0.357, issue #8391): a standard sequence collection component —
+    // `Array<T>` (stdlib §4.4) or `OwningArray<T>` (stdlib §4.5) — is encoded
+    // exactly as §9.8's admissible-component row says it is: "a standard
+    // sequence collection (`Array<T>`, `OwningArray<T>`, `LinkedList<T>`, etc.,
+    // and inline arrays `[N]T`) whose element type is admissible as a
+    // serialized component (encoded with `BeginArray`/`EndArray`)".
+    //
+    // So: BeginArray(count), each element through a recursive
+    // emitSerializeField, EndArray — the same three steps the inline-array arm
+    // above takes, except that the count is a RUNTIME value here (the
+    // collection's own Count) and the element loop is a real loop rather than
+    // an unrolled one.
+    //
+    // `val` is the collection's `bz_array_t*` — both heads share that
+    // representation (§4.4/§4.5) and the same index order (index 0 first), so
+    // one arm serves both. The element size is the collection's own
+    // `collectionElemSize`, the same value `bz_array_alloc` sized the backing
+    // with, so `bz_array_get` reads each element back with the right stride.
+    if (fieldTy->kind == K::Named) {
+        const sema::TypeRef* seqElem =
+            sema::serializationSequenceCollectionElement(fieldTy);
+        if (seqElem) {
+            llvm::Type* elemLlvmTy = lowerTypeRef(seqElem);
+            if (!elemLlvmTy) return;
+            llvm::Type* i64Ty = i64();
+            llvm::Value* esz = builder_.getInt64(collectionElemSize(fieldTy));
+            auto* lenFn = declareC("bz_array_len", i64Ty, {ptrTy()});
+            llvm::Value* count = builder_.CreateCall(lenFn, {val}, "ser.arr.n");
+            auto* beginFn = declareC("bz_binser_begin_array", voidTy,
+                                     {ptrTy(), i32()});
+            builder_.CreateCall(beginFn,
+                {serPtr, builder_.CreateTrunc(count, i32(), "ser.arr.n32")});
+            // The element loop. The index lives in an entry-block alloca so the
+            // back edge does not need a phi (the same shape the inline-array
+            // literal paths use).
+            llvm::AllocaInst* idxSlot = entryAlloca(i64Ty);
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            llvm::AllocaInst* elemSlot = entryAlloca(elemLlvmTy);
+            auto* getFn = declareC("bz_array_get", voidTy,
+                                   {ptrTy(), i64(), ptrTy(), i64()});
+            auto* hdrBB  = llvm::BasicBlock::Create(llvm_, "ser.arr.hdr",  currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ser.arr.body", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "ser.arr.end",  currentFn_);
+            builder_.CreateBr(hdrBB);
+            builder_.SetInsertPoint(hdrBB);
+            llvm::Value* i = builder_.CreateLoad(i64Ty, idxSlot, "ser.arr.i");
+            llvm::Value* more = builder_.CreateICmpSLT(i, count, "ser.arr.more");
+            builder_.CreateCondBr(more, bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            builder_.CreateCall(getFn, {val, i, elemSlot, esz});
+            llvm::Value* elem =
+                builder_.CreateLoad(elemLlvmTy, elemSlot, "ser.arr.e");
+            emitSerializeField(elem, seqElem, serPtr);
+            builder_.CreateStore(
+                builder_.CreateAdd(i, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(hdrBB);
+            builder_.SetInsertPoint(endBB);
+            auto* endFn = declareC("bz_binser_end_array", voidTy, {ptrTy()});
+            builder_.CreateCall(endFn, {serPtr});
+            return;
+        }
     }
 
     if (fieldTy->kind == K::Named && fieldTy->declaration) {
@@ -1836,6 +1900,178 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
             return builder_.CreateLoad(arrLlvmTy, slot, "deser.inlinearr");
         }
         return nullptr;
+    }
+
+    // §9.8 (v0.357, issue #8391): the read half of the sequence-collection
+    // component — the mirror of emitSerializeField's arm above.
+    //
+    // BeginArray()/EndArray() bracket the read (consuming the wire's own count
+    // prefix / '['..']' delimiters per stdlib §2.15). The LOOP is driven by
+    // the wire's count in the binary format and by HasMoreElements() in JSON,
+    // because "On the read side `JsonDeserializer.BeginArray()` returns `-1`,
+    // so consumers use `HasMoreElements()`" (stdlib §2.15).
+    //
+    // The reconstructed collection is a FRESH `bz_array_t*` that the enclosing
+    // class OWNS (the component is an `owned` field), so the class's disposal
+    // cascade frees it — exactly as it frees any other owned collection field.
+    // The elements are the values the reader produced: a `string` element is a
+    // fresh +1 reference (bz_binder_read_string) which the borrowing array
+    // co-owns (stdlib §4.4 / §28.11 row 2), so that +1 is TRANSFERRED to the
+    // slot — no extra retain here, or the array's release would drop one
+    // reference short of the reader's.
+    if (fieldTy->kind == K::Named) {
+        const sema::TypeRef* seqElem =
+            sema::serializationSequenceCollectionElement(fieldTy);
+        if (seqElem) {
+            llvm::Type* elemLlvmTy = lowerTypeRef(seqElem);
+            if (!elemLlvmTy) return nullptr;
+            llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
+            llvm::Type* i64Ty = i64();
+            llvm::Value* esz = builder_.getInt64(collectionElemSize(fieldTy));
+            auto* beginFn = declareC("bz_binder_begin_array", i32(), {ptrTy()});
+            llvm::Value* count =
+                builder_.CreateCall(beginFn, {derPtr}, "deser.arr.n");
+            // The capacity: the wire's count when it is known (binary), a
+            // small default when it is not (JSON).
+            llvm::Value* isCounted = builder_.CreateICmpSGE(
+                count, builder_.getInt32(0), "deser.arr.counted");
+            llvm::Value* cap = builder_.CreateSelect(
+                isCounted, builder_.CreateZExt(count, i64Ty),
+                builder_.getInt64(8), "deser.arr.cap");
+            auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+            llvm::Value* arr =
+                builder_.CreateCall(allocFn, {esz, cap}, "deser.arr");
+            // §28.11 / stdlib §4.5: an OWNING collection stamps its element
+            // disposer at construction (it owns its elements); the borrowing
+            // `Array<T>` (stdlib §4.4) does not.
+            stampOwningElemDisposer(arr, seqElem,
+                                     fieldTy->headName() == "OwningArray");
+            // fix #8391 (F1) / §28.3 / §28.9 / §28.11: the fresh array is
+            // owned by NOBODY until the enclosing class takes it into the
+            // constructed object — and a truncated wire makes the element
+            // read below raise SerializationException. The half-built array
+            // (and the elements already added to it) must therefore be
+            // DISCHARGED on that edge: §28.3's exception-path discharge
+            // ("the compiler treats every owned local and owned parameter as
+            // if it were wrapped in an implicit try/finally … Exceptions
+            // therefore do not produce leaks"), the same rule the pinned
+            // no-leak-on-truncation standard states for the other §9.8
+            // deserialize arms (tests/codegen/serialization_tier2_classes_
+            // test.cpp: "truncated binary input must raise
+            // SerializationException and leave no heap leak or double-free").
+            //
+            // The slot + the collection's OWN per-element disposer
+            // (buildCollectionTempDisposal — the same selection the
+            // scope-end / owned-field disposal uses, so a string element is
+            // released by the string-release thunk and an owning class
+            // element by the class disposer, each exactly once) is what the
+            // cleanup block frees.
+            llvm::AllocaInst* arrSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(arr, arrSlot);
+            Disposal arrDisp = buildCollectionTempDisposal(arrSlot, fieldTy);
+            llvm::Value* arrDispArg =
+                arrDisp.collectionElemDisposer
+                    ? llvm::cast<llvm::Value>(arrDisp.collectionElemDisposer)
+                    : llvm::ConstantPointerNull::get(ptrTy());
+            // The unwind cleanup is installed ONLY across the element loop and
+            // restored when the arm returns (the array's ownership then passes
+            // to the caller's component slot), so the cleanup block's only
+            // predecessors are the throw edges emitted INSIDE the loop — the
+            // exactly-once property `closureArgUnwindCleanup` /
+            // `stringPinArgUnwindCleanup` (LlvmBackend_Disposal.cpp) record
+            // for the same shape.
+            //
+            // `unwindScopeDepth_` is deliberately NOT narrowed: the enclosing
+            // disposal scopes (e.g. the class deserializer's already-populated
+            // component scope, #2378) must still be swept by the pending
+            // check that fires inside the loop, exactly as they are for a
+            // throw from any other nested read.
+            llvm::BasicBlock* savedUnwind = unwindTarget_;
+            {
+                auto* savedInsert = builder_.GetInsertBlock();
+                llvm::BasicBlock* enclosing = unwindBB();
+                auto* cleanup = llvm::BasicBlock::Create(
+                    llvm_, "deser.arr.cleanup", currentFn_);
+                builder_.SetInsertPoint(cleanup);
+                llvm::Value* cur = builder_.CreateLoad(
+                    ptrTy(), arrSlot, "deser.arr.cur");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    cur, llvm::ConstantPointerNull::get(ptrTy()),
+                    "deser.arr.null");
+                auto* frBB = llvm::BasicBlock::Create(
+                    llvm_, "deser.arr.free", currentFn_);
+                auto* contBB = llvm::BasicBlock::Create(
+                    llvm_, "deser.arr.freed", currentFn_);
+                builder_.CreateCondBr(isNull, contBB, frBB);
+                builder_.SetInsertPoint(frBB);
+                auto* freeFn = declareC("bz_array_free", voidTy,
+                                        {ptrTy(), ptrTy()});
+                builder_.CreateCall(freeFn, {cur, arrDispArg});
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+                builder_.CreateBr(enclosing);
+                builder_.SetInsertPoint(savedInsert);
+                unwindTarget_ = cleanup;
+            }
+            // fix #6776 (§8.2): the per-instantiation type tag, read back by
+            // `o is Array<T>` and the through-`Object` ToString.
+            if (typeRefIsRuntimeConcrete(fieldTy))
+                stampBuiltinTypeDesc(arr, fieldTy);
+            // The element loop.
+            llvm::AllocaInst* idxSlot = entryAlloca(i64Ty);
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            llvm::AllocaInst* elemSlot = entryAlloca(elemLlvmTy);
+            auto* hasMoreFn = declareC("bz_binder_has_more_elements", i8(),
+                                       {ptrTy()});
+            auto* addFn = declareC("bz_array_add", voidTy,
+                                   {ptrTy(), ptrTy(), i64()});
+            auto* hdrBB  = llvm::BasicBlock::Create(llvm_, "deser.arr.hdr",  currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "deser.arr.body", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "deser.arr.end",  currentFn_);
+            builder_.CreateBr(hdrBB);
+            builder_.SetInsertPoint(hdrBB);
+            llvm::Value* i = builder_.CreateLoad(i64Ty, idxSlot, "deser.arr.i");
+            llvm::Value* hasMore =
+                builder_.CreateCall(hasMoreFn, {derPtr}, "deser.arr.hm");
+            llvm::Value* iLt = builder_.CreateICmpSLT(
+                i, builder_.CreateZExt(count, i64Ty), "deser.arr.lt");
+            llvm::Value* cond = builder_.CreateSelect(
+                isCounted, iLt,
+                builder_.CreateICmpNE(hasMore, builder_.getInt8(0),
+                                      "deser.arr.hmb"),
+                "deser.arr.cond");
+            builder_.CreateCondBr(cond, bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* elem = emitDeserializeField(seqElem, derPtr);
+            if (elem) {
+                builder_.CreateStore(elem, elemSlot);
+                builder_.CreateCall(addFn, {arr, elemSlot, esz});
+                builder_.CreateStore(
+                    builder_.CreateAdd(i, builder_.getInt64(1)), idxSlot);
+                builder_.CreateBr(hdrBB);
+            } else {
+                // The element type is admissible (§9.8), so the reader always
+                // produces one; this guard is a LOUD backstop against an
+                // infinite loop should a future element shape be admitted
+                // without a reader (the same discipline emitSerializeField's
+                // fallback follows).
+                builder_.CreateBr(endBB);
+            }
+            builder_.SetInsertPoint(endBB);
+            auto* endFn = declareC("bz_binder_end_array", voidTy, {ptrTy()});
+            builder_.CreateCall(endFn, {derPtr});
+            // The array is COMPLETE: its ownership passes to the caller (the
+            // class component slot, which the class's own owned-field
+            // cascade discharges on the normal path). Null the slot so the
+            // cleanup block above can never double-free it, and restore the
+            // unwind target so a LATER throw takes the enclosing edge — the
+            // class deserializer's own component scope then discharges this
+            // array (see emitClassDeserialize's registration below).
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), arrSlot);
+            unwindTarget_ = savedUnwind;
+            return arr;
+        }
     }
 
     if (fieldTy->kind == K::Named && fieldTy->declaration) {
@@ -3502,6 +3738,39 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
             // on unwind (LlvmBackend_Disposal.cpp's emitDisposals).
             Disposal cd{slots[i], cty->declaration};
             cd.unwindOnly = true;
+            disposeStack_.back().push_back(cd);
+        } else if (sema::serializationSequenceCollectionElement(cty)) {
+            // fix #8391 (F1) / §9.8 / §28.3 / §28.9 / §28.11: an `owned`
+            // sequence-collection component (Array<T> / OwningArray<T>, the
+            // §9.8 class-component row). The reader produced a FRESH
+            // bz_array_t* which the class OWNS: on the NORMAL path the
+            // class's own owned-field cascade discharges it (the
+            // `ownedCollectionFieldType` row every other owned collection
+            // field uses). But on a LATER component's throw the object does
+            // not exist yet, so that cascade cannot run — this scope can
+            // (§28.3's exception-path discharge, the same rule the
+            // owned-class and string component arms above follow).
+            //
+            // The per-element disposer is the collection's OWN
+            // (buildCollectionTempDisposal — the same selection the
+            // owned-field disposal makes), so a string element is released
+            // by the string-release thunk and an owning class element by
+            // the class disposer, each exactly once and by the same rule as
+            // on the normal path.
+            //
+            // `releaseOnUnwindOnly` and NOT `unwindOnly`: the unwind-only
+            // arm of emitDisposals dispatches a VTABLE dispose, and a
+            // bz_array_t has no Bezel vtable at word 0 — that would be a
+            // wild jump, not a leak (the same reason
+            // registerFreshOwnedVtablelessBuiltinReceiverTempK8 records).
+            // `releaseOnUnwindOnly` is honoured by the COLLECTION arm
+            // itself: skipped on the normal edge, fired on the exception
+            // edge — which is the only edge that reaches this scope (the
+            // normal path pops it without disposal).
+            Disposal cd = buildCollectionTempDisposal(slots[i], cty);
+            cd.unwindOnly = false;
+            cd.dynamicDispose = false;
+            cd.releaseOnUnwindOnly = true;
             disposeStack_.back().push_back(cd);
         } else if (cty->kind == sema::TypeRef::Kind::Primitive &&
                    cty->primitive == sema::PrimitiveType::String) {

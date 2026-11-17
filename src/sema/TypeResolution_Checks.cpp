@@ -4,6 +4,7 @@
 #include "common/OwnershipFacts.hpp"  // classifyChoiceType — §35.7 hashable choice edge (#2087)
 
 #include "sema/ConstFold.hpp"
+#include "sema/CollectionShape.hpp"  // serializationSequenceCollectionElement — §9.8 (#8391)
 #include "sema/EnumValues.hpp"  // enumHasZeroConstant — §17.11 default(E) (#3044)
 #include "sema/FieldSymbolAccessors.hpp"  // fieldDeclTypeOf — §28.9/§15.1.1 (#3650)
 #include "sema/GenericParams.hpp"  // detail::astGenericParams — §14.6 in-scope name set (#3271)
@@ -16887,6 +16888,60 @@ static bool typeRiskingUnreleasedStringInInlineArray(const TypeRef* tr) {
     return false;
 }
 
+// §9.8 (v0.357, issue #8391): can the synthesized `Deserialize` produce a
+// component of this COLLECTION type holding an element of this ELEMENT type
+// WITHOUT leaving that element unowned?
+//
+// §9.8's class clause admits "owned collections of eligible elements", and
+// §28.11's element-slot table says who owns a slot:
+//   - the BORROWING family (`Array<T>`, stdlib §4.4) CO-OWNS a runtime-managed
+//     element (`string`) with the slot (retain on insert, release on free) and
+//     COPIES a VALUE element (primitive / enum / record / choice); a
+//     CLASS-typed element is BORROWED ("elements untouched") — so a synthesized
+//     `Deserialize` that CONSTRUCTS one (a fresh class instance, or a fresh
+//     nested collection) leaves it with no owner and it leaks.
+//   - the OWNING family (`OwningArray<T>`, stdlib §4.5) OWNS a class-typed
+//     element (it disposes each at free) and — per §28.11 — admits no
+//     value-typed or runtime-managed element at all.
+//
+// So a BORROWING collection admits a value element or a `string`, and an OWNING
+// collection admits a class element. Two shapes the compiler cannot own today
+// are excluded here (and reported in issue #8510): a NULLABLE `string` element
+// (the collection's element slot does not co-own a nullable string — the
+// `isStringTypeRefNonNull` gate that pairs the insert's retain with the free's
+// release excludes the nullable form on BOTH sides, so the fresh string the
+// reader produces has no owner) and a class-typed element in a BORROWING
+// collection.
+static bool serializationCollectionElementIsReconstructible(
+        std::string_view collHead, const TypeRef* elemTy) {
+    if (!elemTy) return false;
+    bool elemIsClassLike = false;
+    bool elemIsString = false;
+    if (elemTy->kind == TypeRef::Kind::Primitive) {
+        elemIsString = (elemTy->primitive == PrimitiveType::String);
+    } else if (elemTy->kind == TypeRef::Kind::Named) {
+        if (!elemTy->declaration) {
+            // A builtin with no user TypeDecl: `Shared<T>`/`Weak<T>` (a
+            // ref-counted handle), another builtin COLLECTION (a class type in
+            // §3.1's sense), or a builtin VALUE type (`Span<T>`, `Range<T>`,
+            // …). The last group is not a class type, but the element-slot
+            // table of §28.11 does not name it either, so it is treated
+            // CONSERVATIVELY as class-like — the borrowing family then does
+            // not admit it (the safe direction: a shape the compiler cannot
+            // prove it owns is not admitted).
+            elemIsClassLike = true;
+        } else {
+            const auto k = elemTy->declaration->kind;
+            elemIsClassLike = (k == ast::TypeDeclKind::Class ||
+                               k == ast::TypeDeclKind::Interface);
+        }
+    }
+    // A nullable `string` element: excluded (see the comment above).
+    if (elemIsString && elemTy->nullable) return false;
+    if (collHead == "OwningArray") return elemIsClassLike;
+    return !elemIsClassLike;
+}
+
 static bool isSerializationEligibleType(
         const TypeRef* tr,
         std::unordered_set<const TypeSymbol*>& visited,
@@ -17004,6 +17059,41 @@ static bool isSerializationEligibleType(
             // back-edge — only a class can.
             if (forRecordComponent) return false;
             return isSerializationEligibleType(tr->genericArgs[0], visited, ctx,
+                                                forRecordComponent);
+        }
+        // §9.8 (v0.357, issue #8391): a standard sequence collection is an
+        // admissible component type when its element type is — "a standard
+        // sequence collection (`Array<T>`, `OwningArray<T>`, `LinkedList<T>`,
+        // etc., and inline arrays `[N]T`) whose element type is admissible as a
+        // serialized component (encoded with `BeginArray`/`EndArray`)". The
+        // heap collections are CLASS types (§3.1), so of the admissible rows
+        // they "are admissible in **class** components only" — a record (and a
+        // choice payload, which is record-admissible) may not hold one:
+        // "The same holds for `Shared<T>`, `Weak<T>`, interface-typed, **and
+        // standard heap-collection** components (the heap collections are class
+        // types, §3.1)".
+        //
+        // The class half is what this branch admits: `checkClassSerialization
+        // EligibilityLate` asks the predicate with `forRecordComponent` FALSE,
+        // and the element type is checked with the SAME flag, so a class
+        // component may hold a class-typed element (a "synthesized class",
+        // §9.8's admissible row) while a record's may not.
+        //
+        // The element type must itself be admissible; that recursion is what
+        // makes `Array<string>` admissible and `Array<SomeUnserializableClass>`
+        // not.
+        if (const TypeRef* elemTy =
+                serializationSequenceCollectionElement(tr)) {
+            if (forRecordComponent) return false;
+            // §9.8 (v0.357, issue #8391): the element must be one the
+            // synthesized `Deserialize` can produce WITH an owner the
+            // collection can take (§28.11's element-slot table) — see
+            // `serializationCollectionElementIsReconstructible` above.
+            if (!serializationCollectionElementIsReconstructible(
+                    tr->headName(), elemTy)) {
+                return false;
+            }
+            return isSerializationEligibleType(elemTy, visited, ctx,
                                                 forRecordComponent);
         }
     }
@@ -18415,6 +18505,50 @@ void Resolver::checkClassSerializationEligibilityLate() {
                     // Valid back-edge under graph/cyclic.
                     return 1;
                 }
+                // §9.8 (v0.357, issue #8391): a collection component must be an
+                // OWNED field. §9.8's class clause admits "owned collections of
+                // eligible elements" — the collection itself is an owning edge
+                // of the class, and the class frees it.
+                //
+                // The synthesized `Deserialize` CONSTRUCTS the collection fresh
+                // (there is no identity to resolve a collection against — the
+                // tag→object table of §9.8's *Synthesized `Deserialize`* holds
+                // only the objects written with an identity tag, and a
+                // collection is written inline). A NON-owned collection field
+                // would therefore hold a fresh collection that no owner frees:
+                // §9.7's leak-prevention rule has no owner to bind it to.
+                // MEASURED on the pre-rule build: a class with a non-owned
+                // `Array<string>` component round-tripped and leaked 330 bytes
+                // in 6 allocations per round-trip under ASan/LSan.
+                //
+                // A class-typed (non-collection) field is NOT affected: it is a
+                // back-edge, handled by the arm above (§9.8's "a plain
+                // borrowing field [is a] back-reference", admitted under
+                // `serialized graph`/`cyclic`).
+                //
+                // fix #8391 (F1-review F2, v0.357): the rule is scoped to
+                // `needsDeserHere` — the class SYNTHESIZES a `Deserialize`.
+                // The rationale above is entirely about the compiler
+                // CONSTRUCTING the collection: a class that declares only
+                // `ISerializable` (write-only) synthesizes NO `Deserialize`,
+                // so no fresh collection is ever bound to the field and the
+                // "no owner to free it" argument does not apply — the
+                // borrow is the class's own business, exactly as for any
+                // other borrowed field. The same holds for a class that
+                // hand-writes its own `Deserialize` (the hand-written code
+                // decides what it binds). MEASURED on the pre-fix tip: a
+                // write-only class with a borrowed `Array<string>` field was
+                // rejected with this very diagnostic.
+                if (needsDeserHere && !isOwned &&
+                    sema::serializationSequenceCollectionElement(tr)) {
+                    reportIneligible(fieldName,
+                        "is a collection-typed field that is not `owned` — §9.8's "
+                        "class clause admits \"owned collections of eligible "
+                        "elements\", and the synthesized `Deserialize` constructs "
+                        "the collection fresh, so a borrowing collection field "
+                        "would have no owner to free it");
+                    return 2;
+                }
                 if (!isSerializationEligibleType(tr, visited, ctx_)) {
                     reportIneligible(fieldName,
                         "has a type that is not serialization-eligible");
@@ -18486,6 +18620,34 @@ void Resolver::checkClassSerializationEligibilityLate() {
                 if (!pd->type) continue;
                 const TypeRef* tr = ctx_.resolvedType(*pd->type);
                 if (!tr) continue;
+                // §9.8 (v0.357, issue #8391): the same owned-collection rule
+                // the field arm above applies. An auto-property's backing field
+                // is NEVER `owned` — Appendix A.4's `PropertyDecl` production
+                // carries no `owned`/`scoped` slot (only `FieldDecl` does), and
+                // §23.1's auto-property storage is a plain field — so a
+                // collection-typed auto-property cannot be an "owned collection
+                // of eligible elements", and the synthesized `Deserialize`
+                // would bind a fresh collection to a slot with no owner.
+                // The remedy is an explicit `owned` field.
+                //
+                // fix #8391 (F1-review F2, v0.357): scoped to `needsDeserHere`
+                // for the same reason as the field arm above — the rule is
+                // about the SYNTHESIZED `Deserialize` constructing the
+                // collection fresh, and a write-only class (or one that
+                // hand-writes its own `Deserialize`) has no such
+                // construction.
+                if (needsDeserHere &&
+                    sema::serializationSequenceCollectionElement(tr)) {
+                    reportIneligible(m->name,
+                        "is a collection-typed auto-property — §9.8's class "
+                        "clause admits \"owned collections of eligible elements\", "
+                        "and an auto-property's backing field is never `owned` "
+                        "(Appendix A.4's `PropertyDecl` has no `owned` slot), so "
+                        "the synthesized `Deserialize` would bind a fresh "
+                        "collection to a slot with no owner; declare an "
+                        "explicit `owned` field instead");
+                    break;
+                }
                 if (!isSerializationEligibleType(tr, visited, ctx_)) {
                     reportIneligible(m->name,
                         "has a type that is not serialization-eligible");
@@ -18525,7 +18687,26 @@ void Resolver::checkClassSerializationEligibilityLate() {
             }
 
             // §9.8 v0.136 constructor-selection check (applies when synthesis of
-            // Deserialize is needed — i.e. !hwD2).
+            // Deserialize is needed — i.e. `needsDeserHere`, the class declares
+            // `IDeserializable` and hand-writes no `Deserialize`).
+            //
+            // fix #8391 (v0.357): the condition was `!hwD2` — "no hand-written
+            // Deserialize" — which ALSO fired for a class that declares ONLY
+            // `ISerializable`. §9.8's *Constructor selection* paragraph is
+            // scoped to the SYNTHESIZED `Deserialize` ("Where a synthesized
+            // `Deserialize` constructs by constructor call, it uses the unique
+            // constructor whose parameter list binds exactly the components to
+            // be bound"), and a write-only class synthesizes NO `Deserialize` —
+            // so the check has nothing to decide for it. MEASURED on the
+            // pre-fix base: a class declaring only `ISerializable` was
+            // rejected with "declares `IDeserializable` … no constructor has
+            // parameter names matching the serialized component set {Name,
+            // Tags} — candidates: (none)" — naming an interface the class does
+            // not declare, and rejecting even a class with NO components at
+            // all. The class late pass already computes the right condition
+            // (`needsDeserHere = wantsID && !hwD2`, used by the base-storage
+            // check above); this arm now reads the same one.
+            //
             // Rule: there must be exactly one non-static constructor whose
             // parameter names match exactly the set of serialized component
             // declared identifiers (bijection, order-insensitive, case-
@@ -18542,7 +18723,7 @@ void Resolver::checkClassSerializationEligibilityLate() {
             // the base class itself.  Therefore the constructor-matching check
             // does not apply to the declaring base.  Skip it.
             if (!sccPolyCases.empty()) { /* skip ctor check for poly base */ }
-            else if (!hwD2) {
+            else if (needsDeserHere) {
                 // Helper: fold to lowercase (ASCII).
                 auto toLower = [](std::string_view sv) {
                     std::string r(sv);
