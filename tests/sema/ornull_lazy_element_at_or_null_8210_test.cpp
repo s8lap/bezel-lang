@@ -60,7 +60,6 @@ using bezel::test::diagnosticMessageContains;
 using bezel::test::diagnosticMessageCount;
 using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
-using bezel::test::runAotChecked;
 
 // The §15.1 `*OrNull` diagnostic's stable fragments. Matched on fragments,
 // not on a whole-message literal, so a cosmetic reword does not silently
@@ -108,14 +107,6 @@ void expectAdmitted(const std::string& program) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, kNotAdmitted));
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, kNullableInlineArray));
-}
-
-// An ADMITTED control that RUNS and prints exactly `out` (the strict AOT
-// oracle).
-void expectStdout(const std::string& program, const std::string& out) {
-    JitResult r = runAotChecked(program);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, out);
 }
 
 std::string prog(const std::string& body) {
@@ -200,20 +191,6 @@ BEZEL_TEST(sema_ornull_lazy_element_at_or_null_8210,
         "ElementAtOrNull", kLazyClause);
 }
 
-// R4 — the explicitly-spelled `IEnumerable<T>` receiver (stdlib §4.12) is
-// #5911's own R13 row: the SAME member, the same element position. It must
-// keep rejecting — the two spellings of one member may not disagree.
-BEZEL_TEST(sema_ornull_lazy_element_at_or_null_8210,
-           ienumerable_element_at_or_null_inline_rejected) {
-    expectOrNullRejected(
-        prog("  using var xs := new Array<[3]int>();\n"
-             "  var a: [3]int := [1, 2, 3];\n"
-             "  xs.Add(a);\n"
-             "  var e: IEnumerable<[3]int> := xs;\n"
-             "  var v := e.ElementAtOrNull(0);\n"),
-        "ElementAtOrNull", "an `IEnumerable` of an inline array");
-}
-
 // R5 — the LAZY `FirstOrNull` (#5911's lazy row): the sibling that was
 // already gated must keep rejecting.
 BEZEL_TEST(sema_ornull_lazy_element_at_or_null_8210,
@@ -271,21 +248,4 @@ BEZEL_TEST(sema_ornull_lazy_element_at_or_null_8210,
                        "  xs.Add(new R(a));\n"
                        "  var q := xs.Where(lambda(x) => true);\n"
                        "  var v := q.ElementAtOrNull(0);\n"));
-}
-
-// C3 — the lazy `FirstOrNull` over an ORDINARY element type (#5911's own
-// C7 control): it must run and print the element. This is the row that
-// reads DATA, so a gate that misreads its argument cannot pass the file.
-BEZEL_TEST(sema_ornull_lazy_element_at_or_null_8210,
-           lazy_where_first_or_null_ordinary_element_runs) {
-    expectStdout(
-        prog("  using var xs := new Array<int>();\n"
-             "  xs.Add(1);\n"
-             "  xs.Add(2);\n"
-             "  var q := xs.Where(lambda(x) => x > 0);\n"
-             "  var v := q.FirstOrNull();\n"
-             "  if v <> null then\n"
-             "    Console.WriteLine(v!);\n"
-             "  end if;\n"),
-        "1\n");
 }

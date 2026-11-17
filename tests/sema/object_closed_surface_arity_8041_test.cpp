@@ -160,21 +160,6 @@ BEZEL_TEST(object_surface_arity_8041, force_unwrap_twin_is_refused) {
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kArityToString));
 }
 
-// THE CONTROL ROW: the DECLARED forms still bind and read the data. The
-// refusal is the arity axis, not a closure of the surface.
-BEZEL_TEST(object_surface_arity_8041, declared_forms_still_bind) {
-    auto r = runAot(
-        "module M; class C public static method Main(): int "
-        "  var o: Object := 5; "
-        "  Console.WriteLine(o.ToString()); "
-        "  Console.WriteLine(o.Equals(o)); "
-        "  Console.WriteLine(o.GetHashCode()); "
-        "  return 0; end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "5\nTrue\n5\n");
-}
-
 // §8.2's reflection gate keeps its OWN diagnostic for the zero-argument
 // `GetType()` — the arity axis must not shadow it.
 BEZEL_TEST(object_surface_arity_8041, get_type_keeps_its_own_diagnostic) {

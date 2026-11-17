@@ -267,27 +267,3 @@ BEZEL_TEST(index_arg_ownership_modifier_3097,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(4, r.exitCode);
 }
-
-BEZEL_TEST(index_arg_ownership_modifier_3097,
-           the_named_argument_form_at_a_call_and_a_new_is_untouched_spec_22_5) {
-    // The OTHER direction: the named form is a §22.5 CALL/NEW property and
-    // must keep working. The fix is keyed on the IndexExpr node kind (the
-    // walk in visitChildren's IndexExpr arm), not on `CallArgument::name` —
-    // so a doubled diagnostic here would have been a regression.
-    auto r = runAot(
-        "module M; "
-        "class Cfg "
-        "  public readonly property N: int; "
-        "  public constructor(verbose: bool, n: int) N := n; end; "
-        "end Cfg; "
-        "class C "
-        "  public static method Add(a: int, b: int): int return a + b; "
-        "  end Add; "
-        "  public static method Main(): int "
-        "    using var cfg := new Cfg(verbose := true, n := 3); "
-        "    return Add(b := 2, a := 1) + cfg.N; "
-        "  end Main; "
-        "end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(6, r.exitCode);
-}

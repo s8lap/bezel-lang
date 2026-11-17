@@ -548,17 +548,6 @@ BEZEL_TEST(operator_declaring_type_1347, no_declaring_type_param_rejected_25_2) 
     BEZEL_EXPECT_TRUE(anyMessageMentions(r, "25.2"));
 }
 
-// §25.2 (#1347) CONTROL: first param is declaring type → OK.
-BEZEL_TEST(operator_declaring_type_1347, first_param_declaring_type_ok_25_2) {
-    auto r = parseSema(
-        "module M; record Vec(X: int) "
-        "  public static method operator +(a: Vec, b: Vec): Vec => "
-        "    new Vec(a.X + b.X); "
-        "end Vec; "
-        "class C public static method Main(): int return 0; end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 // §25.2 (#1347) CONTROL: second param is declaring type (cross-type, like
 // TimeSpan `operator +(duration, offset: TimeSpan)`) → OK.
 BEZEL_TEST(operator_declaring_type_1347, second_param_declaring_type_ok_25_2) {

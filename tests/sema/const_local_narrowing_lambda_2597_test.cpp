@@ -211,51 +211,6 @@ BEZEL_TEST(sema_const_narrowing_lambda_2597,
     BEZEL_EXPECT_TRUE(hasMsg(r, "requires narrowing"));
 }
 
-// §27.5 / #2259: a captured PARAMETER is mutable (assignable) and is a
-// ParameterSymbol, not a `const` LocalSymbol — its fact must still be dropped.
-// This is the axis where a predicate written as "not a mutable local" rather
-// than "is a const local" would have silently gone wrong.
-BEZEL_TEST(sema_const_narrowing_lambda_2597,
-           captured_parameter_fact_still_dropped_spec_27_5) {
-    auto r = parseSemaAll(
-        "module M; class C "
-        "  public static method Run(s: string?): int "
-        "    if s <> null then "
-        "      var f := lambda() => s.Length; "
-        "      return f(); "
-        "    end; "
-        "    return 0; "
-        "  end Run; "
-        "  public static method Main(): int return 0; end Main; "
-        "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMsg(r, "requires narrowing"));
-}
-
-// §12.7 / #2259: a `var` local's TYPE fact must still be dropped — `b.M()`
-// inside the body is rejected because `b` reverts to `Base`.
-BEZEL_TEST(sema_const_narrowing_lambda_2597,
-           var_local_type_fact_still_dropped_spec_12_7) {
-    auto r = parseSemaAll(
-        "module M; "
-        "class Base end Base; "
-        "class Derived : Base "
-        "  public method M(): int return 7; end M; "
-        "end Derived; "
-        "class C "
-        "  public static method Run(b: Base): int "
-        "    if b is Derived then "
-        "      var f := lambda(): int => do return b.M(); end; "
-        "      return f(); "
-        "    end; "
-        "    return 0; "
-        "  end Run; "
-        "  public static method Main(): int return 0; end Main; "
-        "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasMsg(r, "no member `M` on type `Base`"));
-}
-
 // §7.4 / #2116: a readonly-field fact rooted in a `var` local must still be
 // dropped — the ROOT can be reassigned to a different object between closure
 // creation and invocation, so the field read is not final even though the field

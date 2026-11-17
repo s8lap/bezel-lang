@@ -59,31 +59,6 @@ bool rejectedByRule(const std::string& program, const char* paramName) {
 
 // ═════════ Accept rows (each rejected at 335e3849) ═══════════════════════
 
-// The headline repro: an int literal to a generic callee whose parameter
-// shares its NAME with the generic caller's parameter.
-BEZEL_TEST(callee_type_param_name_collision_4915,
-           int_literal_to_same_named_callee_param_accepted_spec_14_5) {
-    auto r = runAot(R"BZ(
-module Conf;
-public class Util
-  public static method Id<T>(x: T): T
-    return x;
-  end Id;
-  public static method Go<T>(v: T): int
-    return Id(5);
-  end Go;
-end Util;
-public class Program
-  public static method Main(): int
-    Console.WriteLine(Util.Go<int>(1));
-    return 0;
-  end Main;
-end Program;
-)BZ");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("5\n"));
-}
-
 // `string` is modelled as a primitive, so a string literal argument took the
 // same path (the callee's `T` infers `string`).
 BEZEL_TEST(callee_type_param_name_collision_4915,

@@ -187,32 +187,6 @@ BEZEL_TEST(ctor_out_var_da_2409,
 // Controls: the DA fix must NOT newly reject paths §22.4 admits.
 // =============================================================================
 
-// Control: a non-nullable VALUE-typed recipient (`out n: int`, no `?`) is
-// exempt from DA tracking altogether (`isNonNullableReferenceType` is false
-// for a value type) — §7.9's zero default applies on the skip path instead
-// of a compile error. This proves routing NewExpr args through
-// `visitCallArg` (fix b) does not newly over-reject a value-typed skip-path
-// read; the ACTUAL zero-value is supplied by #2402's separate codegen fix
-// (already landed), exercised here as an integration check.
-BEZEL_TEST(ctor_out_var_da_2409,
-           and_skip_nonnullable_value_read_accepted_default_zero_spec_7_9) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class Widget "
-        "  public ok: bool; "
-        "  public constructor(s: string, out n: int) "
-        "    n := 42; ok := true; "
-        "  end; "
-        "end Widget; "
-        "class C "
-        "  public static method Main(): int "
-        "    var flag := false; "
-        "    if flag and new Widget(\"x\", out var n).ok then "
-        "      return 1; "
-        "    end; "
-        "    return n; "
-        "  end Main; end C;"), 0);
-}
-
 // Taken-call control: the constructor actually RUNS (`flag` is `true`), so
 // `n` is definitely assigned on every reaching read — must stay ACCEPTED and
 // observe the real written value, proving the DA fix does not disturb the

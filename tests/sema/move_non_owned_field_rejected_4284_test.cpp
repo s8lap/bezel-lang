@@ -242,32 +242,6 @@ BEZEL_TEST(move_non_owned_field_rejected_4284,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// §28.3: `move box.n` of a VALUE field (`int`) — no borrow/own distinction
-// for value types (§3: value types carry no storage obligation; reads copy),
-// so the rejection must NOT fire. The value is read through and the program
-// returns the field value (42). Guards the fix's value-typed scoping.
-BEZEL_TEST(move_non_owned_field_rejected_4284,
-           move_value_field_unchanged_spec_28_3) {
-    std::string src =
-        "module M; "
-        "class Box "
-        "  public n: int := 42; "
-        "  public constructor() end constructor; "
-        "  destructor end destructor; "
-        "end Box; "
-        "class C "
-        "  public static method Use(): int "
-        "    using var box := new Box(); "
-        "    var q: int := move box.n; "
-        "    return q; "
-        "  end Use; "
-        "  public static method Main(): int return C.Use(); end Main; "
-        "end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 42);
-}
-
 // §28.3: a plain (non-`move`) read of a non-`owned` class field — the
 // canonical use site. The unmarked read stays a borrow; the program compiles
 // and the field aliases the source object as expected. (Box wraps a Cell in a

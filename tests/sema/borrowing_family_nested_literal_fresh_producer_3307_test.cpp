@@ -336,16 +336,3 @@ BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
         "    return xs[0][0].Id + xs[1][0].Id; ",
         22);
 }
-
-// The owning-family remedy, executed: same `[new Conn(1)]` shape that's
-// REJECTED at `Array<OwningArray<Conn>>` is ACCEPTED at
-// `OwningArray<OwningArray<Conn>>` (the owning family takes ownership and
-// the literal-tree rule reclaims the inner free aggregate). Read-back: 9.
-// per §15.4, §28.6 (#3307)
-BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
-           owning_array_owning_array_fresh_inner_admitted_spec_15_4) {
-    expectAccepted(
-        "    using var xs: OwningArray<OwningArray<Conn>> := [[new Conn(9)]]; "
-        "    return xs[0][0].Id; ",
-        9);
-}

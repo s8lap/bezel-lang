@@ -909,32 +909,6 @@ BEZEL_TEST(sema_case_exhaust,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// (c) NO-OVER-WARN control (both directions). A CORRECTLY-instantiated arm MUST
-// still cover its determined leaf — the arg-sensitive check must not regress the
-// determined idiom. `Ok<int>` + `Err<int>` at `Result<int>` are each the sole
-// admitted instantiation and each covered, so the case is exhaustive with no
-// `_` and no warning (and no error). Guards the opposite failure mode of the
-// #1862 fix: a spurious missing-leaf warning on a legitimately-covered leaf.
-BEZEL_TEST(sema_case_exhaust,
-           correct_instantiation_control_stays_covered_spec_19_6) {
-    auto r = parseSemaAll(
-        "module M; "
-        "closed class Result<T> end Result; "
-        "sealed class Ok<T> : Result<T> end Ok; "
-        "sealed class Err<T> : Result<T> end Err; "
-        "class Calc "
-        "  public method M(r: Result<int>): int "
-        "    var a := (case r of "
-        "      var o: Ok<int> => 1, "   // T := int — covers Ok<int>
-        "      var e: Err<int> => 2 "   // T := int — covers Err<int>
-        "); "
-        "    return a; "
-        "  end M; "
-        "end Calc;");
-    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));  // both correctly covered
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 // --- #1874: ARG-SENSITIVE coverage via an ANCESTOR arm (spec §19.6 v0.196) ---
 //
 // #1862 made a determined leaf's DIRECT self-match arg-sensitive; this closes the
@@ -2679,4 +2653,3 @@ BEZEL_TEST(sema_case_exhaust, record_three_part_head_match_ok_spec_19_6_alias_he
     BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
-

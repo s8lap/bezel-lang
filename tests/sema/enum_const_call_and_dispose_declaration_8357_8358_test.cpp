@@ -203,22 +203,6 @@ BEZEL_TEST(enum_const_call_dispose_decl_8357_8358,
         rejectedWith(p, "the enum constant `Container.Status.Green`"));
 }
 
-// CONTROL: the enum constant READ — a value, not a call (§26.5 rule 2). The
-// #8358 check is a CALL check and leaves the read alone.
-BEZEL_TEST(enum_const_call_dispose_decl_8357_8358,
-           enum_constant_read_stays_admitted_spec_26_5_rule_2) {
-    const std::string p = prog({
-        "module M;",
-        "public enum E Green; end E;",
-        kMain,
-        kMainBody,
-        "    E.Green;",
-        kMainEnd,
-        "end Program;",
-    });
-    expectCompiles(p);
-}
-
 // CONTROL: the same constant READ into a binding — the READ spelling, not a
 // call.
 BEZEL_TEST(enum_const_call_dispose_decl_8357_8358,

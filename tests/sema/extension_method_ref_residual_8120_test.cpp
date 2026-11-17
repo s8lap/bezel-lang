@@ -218,14 +218,3 @@ BEZEL_TEST(sema_extension_method_ref_residual_8120,
     BEZEL_EXPECT_TRUE(hasError(r, kStackDoubled));
     BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
 }
-
-// The sibling member the receiver DOES declare still answers: `Array<T>`
-// declares `Count` (stdlib §4.4), and the Count-vs-Length convention is why
-// the diagnostic points at the documented surface. `Count` is a PROPERTY
-// (`public pure readonly property Count: int`), so it is read, not called:
-// `a.Count()` is refused by #7543 (§26.5 rule 1).
-BEZEL_TEST(sema_extension_method_ref_residual_8120,
-           array_count_still_answers) {
-    // per stdlib §4.4 (v0.355)
-    expectStdout("", "Console.WriteLine(a.Count);", "3\n");
-}

@@ -315,14 +315,6 @@ BEZEL_TEST(convert_radix_residual_7286_mirror,
 // The CONTROLS — green on BOTH arms (the conforming spellings are unchanged).
 // ===========================================================================
 
-// stdlib §9.1: the lower-case digits.
-BEZEL_TEST(convert_radix_residual_7286_mirror,
-           int_literal_radix_renders_the_radix_form_9_1) {
-    BEZEL_EXPECT_EQ(runAotOut(prog(
-                        "    Console.WriteLine(Convert.ToString(255, 16));")),
-                    "ff");
-}
-
 // The `uint` literal radix (stdlib §5.1's constant narrowing, across
 // signedness).
 BEZEL_TEST(convert_radix_residual_7286_mirror,
@@ -353,14 +345,6 @@ BEZEL_TEST(convert_radix_residual_7286_mirror,
            int_literal_radix_10_renders_the_decimal_form_9_1) {
     BEZEL_EXPECT_EQ(runAotOut(prog(
                         "    Console.WriteLine(Convert.ToString(255, 10));")),
-                    "255");
-}
-
-// The one-argument form (stdlib §2.3) is untouched.
-BEZEL_TEST(convert_radix_residual_7286_mirror,
-           one_argument_form_is_unchanged_2_3) {
-    BEZEL_EXPECT_EQ(runAotOut(prog(
-                        "    Console.WriteLine(Convert.ToString(255));")),
                     "255");
 }
 

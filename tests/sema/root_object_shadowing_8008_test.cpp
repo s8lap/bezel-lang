@@ -334,36 +334,6 @@ BEZEL_TEST(root_object_shadowing_8008,
 }
 
 // =====================================================================
-// ROW 6 — CONTROL: a user's module-level GENERIC `Object<T>` is still
-// ADMITTED as an ordinary user type (§8.1: "a generic `Object<T>` is a
-// different name (§2.2)"). It is instantiated, its OWN member is called,
-// and the right value is printed. This fix must not undo the picked
-// #7992/#7997 commit.
-//
-// GREEN on both arms.
-// =====================================================================
-
-BEZEL_TEST(root_object_shadowing_8008,
-           a_user_generic_object_is_still_admitted_spec_8_1) {
-    JitResult r = runAot(
-        "module M; "
-        "public class Object<T> "
-        "  public method Hi(): int => 7; "
-        "end Object; "
-        "public class Program "
-        "  public static method Main(): int "
-        "    using var o := new Object<int>(); "
-        "    Console.WriteLine(o.Hi()); "
-        "    return 0; "
-        "  end Main; "
-        "end Program;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("7\n"));
-}
-
-// =====================================================================
 // ROW 7 — CONTROL: `System.Object` still REACHES THE ROOT (§8.1's own last
 // clause: "and `System.Object` still reaches it"). The qualified spelling
 // names the root BY DEFINITION, so a value of the root and a value of

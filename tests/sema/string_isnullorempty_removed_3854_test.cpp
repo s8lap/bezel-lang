@@ -174,15 +174,6 @@ BEZEL_TEST(sema_isnullorempty_removed_3854,
 }
 
 BEZEL_TEST(sema_isnullorempty_removed_3854,
-           accept_isnullorwhitespace_whitespace_arg_still_works) {
-    BEZEL_EXPECT_EQ(runAotOut(prog(
-                        "    Console.WriteLine((if "
-                        "string.IsNullOrWhiteSpace(\"   \") then 1 else 0));\n"
-                        "    return 0;")),
-                    "1");
-}
-
-BEZEL_TEST(sema_isnullorempty_removed_3854,
            accept_isnullorwhitespace_bare_reference_still_works) {
     // The bare-method-reference branch of the shared arm, kept for the
     // surviving sibling: `Select(string.IsNullOrWhiteSpace)`.

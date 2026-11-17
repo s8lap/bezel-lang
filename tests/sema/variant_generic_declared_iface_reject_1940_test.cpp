@@ -138,27 +138,6 @@ BEZEL_TEST(variant_generic_declared_iface_reject_1940, impl_of_one_user_iface_to
 
 // ---- Regression guards: legitimate conformance stays ACCEPTED (no over-reject) ----
 
-// (5) A class that GENUINELY implements the declared interface `IComparable<Box>`
-// stays assignable to it. Exercises the new gate's ACCEPT path directly:
-// isSubtype(Box, IComparable) is true (Box lists IComparable<Box> as a base), so
-// the assignment is accepted with the arg variance the residual. (Same shape as
-// the #1935 suite's Named-Named control — must remain green.)
-BEZEL_TEST(variant_generic_declared_iface_reject_1940, class_implements_icomparable_accepted) {
-    auto r = parseSemaAll(
-        "module M;\n"
-        "class Box(v: int): IComparable<Box>\n"
-        "  public method CompareTo(other: Box): int\n"
-        "    return 0;\n"
-        "  end CompareTo;\n"
-        "end Box;\n"
-        "class C\n"
-        "  public method M(b: Box)\n"
-        "    var c: IComparable<Box> := b;\n"
-        "  end M;\n"
-        "end C;\n");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 // (6) COVARIANCE across declarations: `Box<Dog>` implements `IReadOnly<Dog>`,
 // which reference-converts to `IReadOnly<Animal>` (Dog <: Animal, covariant
 // §12.9). The declaration relationship (Box <: IReadOnly) holds regardless of

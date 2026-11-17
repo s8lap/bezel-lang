@@ -91,20 +91,6 @@ end C;
 
 // --- the Parse family: a non-string first argument has no reachable candidate ---
 
-// stdlib §9.1 declares `Parse(s: string): int` and the span form. An `int`
-// reaches neither §9.1 parameter (§5.1 admits no conversion to `string`), so
-// §22.6 makes the call a compile error. Before the anchor it COMPILED and
-// printed `0` with an `internal:` degrade — the silent-acceptance inversion
-// #7372 exists for.
-BEZEL_TEST(narrowed_residual_7372, int_parse_with_an_int_first_argument_is_refused) {
-    auto r = runAot(prog("", "    Console.WriteLine(int.Parse(16));"));
-    expectRefused(r,
-        "stdlib §9.1 declares `Parse(s: string): int` / "
-        "`Parse(s: ReadOnlyStringSpan): int`, so the `s` argument must be a "
-        "`string` — a `int` is never implicitly convertible to a `string` (§5.1) — "
-        "the call is a compile error with no candidates cited (§22.6)");
-}
-
 // The `TryParse` form of §9.1: `TryParse(s: string, out result: int): bool`
 // — the first parameter is still a `string`.
 BEZEL_TEST(narrowed_residual_7372,

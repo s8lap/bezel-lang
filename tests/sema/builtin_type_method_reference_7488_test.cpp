@@ -285,14 +285,3 @@ BEZEL_TEST(sema_builtin_type_method_reference_7488,
                    "    Console.WriteLine(f(a));",
                    kNoStaticLength);
 }
-
-// The sibling member the receiver DOES declare still answers: `Array<T>`
-// declares `Count` (stdlib §4.4), and the Count-vs-Length convention is
-// why the diagnostic points at it.
-BEZEL_TEST(sema_builtin_type_method_reference_7488,
-           array_count_still_answers) {
-    // per stdlib §4.4 (v0.355)
-    expectStdout("",
-                 "Console.WriteLine(a.Count);",
-                 "3\n");
-}

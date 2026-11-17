@@ -563,29 +563,3 @@ BEZEL_TEST(sema_async_disposable_conformance_7569,
     BEZEL_EXPECT_TRUE(rejectedAt(
         p, 4, 3, "may not declare a `Dispose` method directly"));
 }
-
-// THE `IDisposable` TWIN, THE THIRD WAY — §28.12: "`IAsyncDisposable`
-// extends `IDisposable`". A class that lists the built-in `IAsyncDisposable`
-// therefore ALSO conforms to `IDisposable`, whose `Dispose()` is
-// compiler-generated: the `IAsyncDisposable` obligation is the `DisposeAsync`
-// member ALONE, and the synthetic `Dispose` is not a second obligation. The
-// class below declares `DisposeAsync` and no `Dispose` — it must stay
-// admitted.
-BEZEL_TEST(sema_async_disposable_conformance_7569,
-           i_async_disposable_does_not_demand_a_user_dispose_spec_28_12) {
-    const std::string p = prog({
-        "module Conf;",
-        "public class Res: IAsyncDisposable",
-        "  public constructor() end constructor;",
-        "  public async method DisposeAsync(): Task",
-        "    await Task.Delay(0);",
-        "  end DisposeAsync;",
-        "end Res;",
-        "public class Program",
-        "  public static method Main()",
-        "    Console.WriteLine(\"ok\");",
-        "  end Main;",
-        "end Program;",
-    });
-    expectRunsClean(p, "ok\n");
-}

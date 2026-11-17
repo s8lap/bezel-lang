@@ -79,19 +79,6 @@ void expectRejected(const std::string& stmt, const std::string& needle) {
     BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
 }
 
-// A control row: the program must compile, run, and print exactly `out`.
-void expectStdout(const std::string& body, const std::string& out) {
-    auto r = runAot("module M;\n"
-                    "class C\n"
-                    "  public static method Main(): int\n"
-                    "    " + body + "\n"
-                    "    return 0;\n"
-                    "  end Main;\n"
-                    "end C;\n");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, out);
-}
-
 // The dedicated diagnostic for a search value that reaches no declared
 // overload (the wording #6562 established and #6635 generalised).
 const char kSearchValue[] =
@@ -183,18 +170,3 @@ BEZEL_TEST(sema_string_object_search_value_6826,
 }
 
 // ── CONTROLS: the declared forms still work, with their values pinned ──────
-
-BEZEL_TEST(sema_string_object_search_value_6826, contains_string_control) {
-    expectStdout("var s := \"abc\"; Console.WriteLine(s.Contains(\"b\"));",
-                 "True\n");
-}
-
-BEZEL_TEST(sema_string_object_search_value_6826, contains_char_control) {
-    expectStdout("var s := \"abc\"; Console.WriteLine(s.Contains('b'));",
-                 "True\n");
-}
-
-BEZEL_TEST(sema_string_object_search_value_6826, replace_string_control) {
-    expectStdout("var s := \"abc\"; Console.WriteLine(s.Replace(\"a\", \"x\"));",
-                 "xbc\n");
-}

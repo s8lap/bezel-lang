@@ -321,21 +321,6 @@ BEZEL_TEST(convert_tostring_ambiguity_7266,
                     "4000000000");
 }
 
-// The one-argument forms: `int` and `long` are exact matches.
-BEZEL_TEST(convert_tostring_ambiguity_7266,
-           convert_tostring_one_arg_int_value_renders_2_3) {
-    BEZEL_EXPECT_EQ(runAotOut(prog(
-                        "    Console.WriteLine(Convert.ToString(255));")),
-                    "255");
-}
-
-BEZEL_TEST(convert_tostring_ambiguity_7266,
-           convert_tostring_one_arg_long_value_renders_2_3) {
-    BEZEL_EXPECT_EQ(runAotOut(prog(
-                        "    Console.WriteLine(Convert.ToString(255L));")),
-                    "255");
-}
-
 // A `uint` VALUE: §5.1 never converts `uint` to `int` ("Between signed
 // and unsigned types of the same or narrower width ... [is] never
 // implicit"), so the `int` form is INAPPLICABLE and exactly one

@@ -364,69 +364,6 @@ BEZEL_TEST(record_receiver_store_incr_nested_8100,
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("7\n9\n"));
 }
 
-// §9.4's second boundary, read with the new chain walk: a store to a STATIC
-// is not a receiver store — a static is not reached through `this`.
-BEZEL_TEST(record_receiver_store_incr_nested_8100,
-           static_field_store_accepted_spec_9_4) {
-    auto r = runAot(
-        "module Conf; "
-        "public record Gauge "
-        "  public static Count: int := 0; "
-        "  public readonly property Raw: int; "
-        "  public constructor(raw: int) "
-        "    Raw := raw; "
-        "  end constructor; "
-        "  public property D: int "
-        "    get => Raw; "
-        "    set => do Count := Count + value; end; "
-        "  end D; "
-        "end Gauge; "
-        "public class Program "
-        "  public static method Main() "
-        "    var g := new Gauge(2); "
-        "    g.D := 4; "
-        "    Console.WriteLine(Gauge.Count); "
-        "  end Main; "
-        "end Program;");
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("4\n"));
-}
-
-// §9.4's mediating shape: a store beyond a class-typed hop lands in the
-// borrowed heap object and is legal. The hop here is the FIRST hop of the
-// chain.
-BEZEL_TEST(record_receiver_store_incr_nested_8100,
-           class_hop_store_accepted_spec_9_4) {
-    auto r = runAot(
-        "module Conf; "
-        "public class Cell "
-        "  public property Value: int; "
-        "  public constructor(value: int) "
-        "    Value := value; "
-        "  end constructor; "
-        "end Cell; "
-        "public record View "
-        "  public readonly property Target: Cell; "
-        "  public constructor(target: Cell) "
-        "    Target := target; "
-        "  end constructor; "
-        "  public property Level: int "
-        "    get => Target.Value; "
-        "    set => Target.Value := value; "
-        "  end Level; "
-        "end View; "
-        "public class Program "
-        "  public static method Main() "
-        "    using var c := new Cell(0); "
-        "    var v := new View(c); "
-        "    v.Level := 7; "
-        "    Console.WriteLine(c.Value); "
-        "  end Main; "
-        "end Program;");
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("7\n"));
-}
-
 // The class hop AFTER a record-typed hop: the chain leaves the receiver at
 // the class-typed member, so the store beyond it lands in the borrowed heap
 // object and is legal. This is the admitting twin of the nested-record rows

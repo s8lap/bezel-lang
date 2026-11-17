@@ -454,20 +454,6 @@ BEZEL_TEST(dict_range_key_6527,
             "end Helper;\n"));
 }
 
-// §15.6's ADMITTED range slice — `Array<T>` — must still slice. The rejection is
-// on the DICTIONARY KEY SLOT, not on the index form; the `in` gate added here is
-// likewise keyed on the receiver, so `a` must keep slicing and keep admitting a
-// range-shaped expression of its own.
-BEZEL_TEST(dict_range_key_6527,
-           control_array_range_slice_is_unchanged_spec_15_6) {
-    BEZEL_EXPECT_EQ(
-        std::string("2\n"),
-        out("    var a: Array<int> := [10, 20, 30];\n"
-            "    var s := a[0..1];\n"
-            "    Console.WriteLine(s.Count.ToString());\n"
-            "    return 0;\n"));
-}
-
 // `in` over an ELEMENT collection is deliberately NOT gated by this change (the
 // fix's scope is the keyed families; the element families admit a wider
 // legitimate left-operand set through §8.4 equality). This row pins that

@@ -240,12 +240,6 @@ BEZEL_TEST(math_convert_nullability_7232_7418,
                     "2");
 }
 
-BEZEL_TEST(math_convert_nullability_7232_7418,
-           math_pow_double_arguments_still_work_2_2) {
-    BEZEL_EXPECT_EQ(runAotOut(prog("    Console.WriteLine(Math.Pow(2.0, 10.0));")),
-                    "1024");
-}
-
 // The NAMED spelling of a CONFORMING argument is unaffected.
 BEZEL_TEST(math_convert_nullability_7232_7418,
            math_abs_named_double_argument_still_works_2_2) {

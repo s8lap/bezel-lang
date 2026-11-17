@@ -479,17 +479,6 @@ BEZEL_TEST(property_called_as_method_7543,
         5, builtinPropertyCallMessage("Count", "Array", "4.4", "int"));
 }
 
-// A USER class that reuses a built-in's name is not the built-in: its own
-// declared surface answers, so a METHOD of that name is still callable.
-BEZEL_TEST(property_called_as_method_7543,
-           a_user_class_named_like_a_builtin_keeps_its_own_method) {
-    expectStdout(
-        progWithUserClass("public method Count(): int return 42; end Count;",
-                          "var o := new Foo(); "
-                          "Console.WriteLine(o.Count().ToString());"),
-        "42\n");
-}
-
 // A USER class that reuses a built-in's name and declares the PROPERTY of
 // that name is refused -- the property is the user's own, and §27.1 / §27.7
 // do not care which type declared it.

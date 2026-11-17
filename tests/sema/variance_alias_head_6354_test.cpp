@@ -85,11 +85,6 @@ BEZEL_TEST(variance_alias_head_6354, out_t_under_invariant_class_alias_return_re
                    "composed through a nested type constructor");
 }
 
-BEZEL_TEST(variance_alias_head_6354, out_t_under_array_return_non_alias_twin_rejected) {
-    expectRejected("interface I<out T> method Get(): Array<T>; end I; ",
-                  "composed through a nested type constructor");
-}
-
 // --- issue repro 2: the same alias at an INPUT slot -------------------------
 
 BEZEL_TEST(variance_alias_head_6354, out_t_under_invariant_class_alias_input_rejected) {

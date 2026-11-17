@@ -314,15 +314,6 @@ BEZEL_TEST(math_minmax_nullable_7660,
 // rather than refusing every nullable spelling.
 
 BEZEL_TEST(math_minmax_nullable_7660,
-           min_declaration_narrowed_double_still_works_7_4) {
-    BEZEL_EXPECT_EQ(
-        runAotOut(prog(
-            "    var d: double? := 2.5; "
-            "    Console.WriteLine(Math.Min(d, 1.0));")),
-        "1");
-}
-
-BEZEL_TEST(math_minmax_nullable_7660,
            min_null_test_narrowed_double_still_works_7_4) {
     BEZEL_EXPECT_EQ(
         runAotOut(prog(

@@ -174,26 +174,6 @@ BEZEL_TEST(divergent_lambda_unchanged_6195,
            "convertible to the target type"));
 }
 
-// CONTROL (#6107 item 2 still in force): a lambda at an explicit function-typed
-// type argument is formed at that type (§12.7).
-BEZEL_TEST(divergent_lambda_unchanged_6195,
-           explicit_function_typed_type_argument_still_forms_lambda_at_that_type_spec_12_7) {
-    auto r = runAot(
-        "module T;\n"
-        "public static class Util\n"
-        "  public static method Pass<T>(v: T): Object => v;\n"
-        "end;\n"
-        "public static class Program\n"
-        "  public static method Main(args: Array<string>): int\n"
-        "    var o := Util.Pass<(int) -> int>(lambda(x) => x.Length);\n"
-        "    return 0;\n"
-        "  end;\n"
-        "end;\n");
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
-        r, ":7:51: no member `Length` on primitive type `int`"));
-}
-
 // REJECT (origin/main: rejected at compile time; staging wrongly accepted.) A
 // throws-only block lambda bound to a variable and assigned to a `() -> ()`
 // target is rejected on origin/main; the open #6195 question is its

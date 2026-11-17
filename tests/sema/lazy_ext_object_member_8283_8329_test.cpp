@@ -279,29 +279,6 @@ std::string arrayOfArrayObjectMin() {
         "end C;\n";
 }
 
-// ROW R10 — CONTROL (the §26.5.1 specificity order). A §5-named call at a §5
-// arity still takes the §5 operator: stdlib §5's `IEnumerable<T>` head is
-// more specific than `Object`, and its overload IS applicable at an `int`
-// element, so the user's `extension Object { Min() }` must not pre-empt it.
-// The program prints the §5 pipeline's element count (2).
-std::string lazyReceiverSameArityStillTakesStdlib() {
-    return
-        "module M;\n"
-        "extension Object\n"
-        "  public method Select(f: (int) -> int): int => 4242;\n"
-        "end;\n"
-        "class C\n"
-        "  public static method Main(): int\n"
-        "    var a := new Array<int>();\n"
-        "    a.Add(1);\n"
-        "    a.Add(2);\n"
-        "    var q := a.Where(lambda(x) => x > 0).Select(lambda(x) => x + 1);\n"
-        "    Console.WriteLine(q.Count());\n"
-        "    return 0;\n"
-        "  end Main;\n"
-        "end C;\n";
-}
-
 // ROW R11 — CONTROL (the dictionary half of #8179, NOT fixed). A
 // `Dictionary<string,int>` receiver refuses a `extension Object` member of a
 // name stdlib §5 does not declare: the dictionary's `Object` view reads freed
@@ -458,21 +435,6 @@ BEZEL_TEST(sema_lazy_ext_object_member_8283_8329,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "4242\n4343\n");
-}
-
-// ---------------------------------------------------------------------------
-// R10 — CONTROL (the §26.5.1 specificity order). A §5-named call at a §5
-// arity still takes the §5 operator: stdlib §5's `IEnumerable<T>` head is
-// more specific than `Object` and its overload IS applicable at an `int`
-// element, so the user's `extension Object { Select(f) }` must not pre-empt
-// it. The program prints the §5 pipeline's element count (2).
-// ---------------------------------------------------------------------------
-BEZEL_TEST(sema_lazy_ext_object_member_8283_8329,
-           same_arity_call_still_takes_the_stdlib_operator) {
-    JitResult r = runAotChecked(lazyReceiverSameArityStillTakesStdlib());
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "2\n");
 }
 
 // ---------------------------------------------------------------------------

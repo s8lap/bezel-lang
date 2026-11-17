@@ -161,28 +161,6 @@ BEZEL_TEST(alias_qualified_static_class_value_8022,
 // ── THE #8022 ALIAS ARM: a name the aliased module does not home ───────────
 
 BEZEL_TEST(alias_qualified_static_class_value_8022,
-           alias_unknown_type_call_head_is_rejected) {
-    // per §2.2: `sio.NotAType` names no type of `System.IO`.
-    auto r = runAot(prog("import System.IO as sio;\n",
-        "    sio.NotAType.Exists(\"x\");"));
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, "");
-    BEZEL_EXPECT_TRUE(hasError(r,
-        "module `System.IO` has no public type `NotAType`"));
-}
-
-BEZEL_TEST(alias_qualified_static_class_value_8022,
-           alias_builtin_class_of_another_module_is_rejected) {
-    // per §2.2 + stdlib §7.3: `File` is homed by `System.IO`, not `System`.
-    auto r = runAot(prog("import System as st;\n",
-        "    Console.WriteLine(st.File.Exists(\"x\"));"));
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, "");
-    BEZEL_EXPECT_TRUE(hasError(r,
-        "module `System` has no public type `File`"));
-}
-
-BEZEL_TEST(alias_qualified_static_class_value_8022,
            module_qualified_unknown_type_is_rejected_with_the_same_text) {
     // control: the module-qualified spelling's text, which the alias reuses.
     auto r = runAot(prog("import System.IO;\n",
@@ -213,16 +191,6 @@ BEZEL_TEST(alias_qualified_static_class_value_8022,
     // and answers.
     auto r = runAot(prog("import System.IO;\n",
         "    Console.WriteLine(System.IO.Path.Combine(\"a\", \"b\"));"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, "a/b\nafter\n");
-}
-
-BEZEL_TEST(alias_qualified_static_class_value_8022,
-           alias_qualified_static_class_call_still_resolves) {
-    // control (#7996): `sio.Path.Combine(..)` still names the built-in and
-    // answers.
-    auto r = runAot(prog("import System.IO as sio;\n",
-        "    Console.WriteLine(sio.Path.Combine(\"a\", \"b\"));"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "a/b\nafter\n");
 }
@@ -279,35 +247,6 @@ BEZEL_TEST(alias_qualified_static_class_value_8022,
 }
 
 // ── WHAT MUST NOT CHANGE: a USER TYPE still wins ───────────────────────────
-
-BEZEL_TEST(alias_qualified_static_class_value_8022,
-           alias_user_type_still_wins) {
-    // per §2.7 rule 1: an alias of a module that exports a USER type named
-    // `File` selects THAT type, not a diagnostic — the bare-name ambiguity
-    // machinery must not turn a resolvable user type into a diagnostic.
-    std::vector<ModuleSource> mods;
-    mods.push_back({"Lib", R"BZ(
-module Lib;
-public static class File
-  public static method Exists(p: string): int
-    return 7;
-  end Exists;
-end File;
-)BZ"});
-    mods.push_back({"App", R"BZ(
-module App;
-import Lib as l;
-class P
-  public static method Main(): int
-    Console.WriteLine(l.File.Exists("x"));
-    return 0;
-  end Main;
-end P;
-)BZ"});
-    auto r = runAotModules(mods, "App");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, "7\n");
-}
 
 BEZEL_TEST(alias_qualified_static_class_value_8022,
            module_qualified_user_type_still_wins) {

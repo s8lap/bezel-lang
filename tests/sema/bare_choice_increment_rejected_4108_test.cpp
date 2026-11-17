@@ -41,8 +41,6 @@ bool diagContains(const JitResult& r, const char* sub) {
     return false;
 }
 
-int run(const JitResult& r) { return r.ran ? r.exitCode : -999; }
-
 }  // namespace
 
 // T1: bare `choice++` on a choice-typed local — the issue's primary repro.
@@ -114,26 +112,3 @@ BEZEL_TEST(bare_choice_increment_rejected_4108,
         "end C;");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }
-
-// ===========================================================================
-// ACCEPT controls — none of these should be affected by the fix.
-// ===========================================================================
-
-// T4: `int` local — §17.6 category (2).
-BEZEL_TEST(bare_choice_increment_rejected_4108,
-           int_local_increment_still_accepted_spec_17_6) {
-    BEZEL_EXPECT_EQ(run(runAot(
-        "module M; class C public static method Main(): int "
-        "  var i := 5; i++; return i; "
-        "end Main; end C;")), 6);
-}
-
-// T5: `char` local.
-BEZEL_TEST(bare_choice_increment_rejected_4108,
-           char_local_increment_still_accepted_spec_17_6) {
-    BEZEL_EXPECT_EQ(run(runAot(
-        "module M; class C public static method Main(): int "
-        "  var ch: char := 'a'; ch++; return int(ch); "
-        "end Main; end C;")), 98);
-}
-

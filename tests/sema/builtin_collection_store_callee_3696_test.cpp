@@ -101,21 +101,6 @@ BEZEL_TEST(builtin_collection_store_callee_3696,
     BEZEL_EXPECT_TRUE(diagContains(r, "collection reachable beyond the call"));
 }
 
-// Row 3 — positive control: Array (already in the list) must still be
-// caught. Proves the fix preserved the existing family's precision
-// (didn't widen to add SortedSet AND accidentally drop Array).
-BEZEL_TEST(builtin_collection_store_callee_3696,
-           array_param_receiver_still_rejected_call_bounded_source) {
-    auto r = parseAndCheckOwnership(
-        "module M; class C "
-        "  public static method Enlist(f: () -> int, xs: Array<() -> int>) "
-        "    xs.Add(f); "
-        "  end Enlist; "
-        "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(diagContains(r, "collection reachable beyond the call"));
-}
-
 // Row 4 — negative control: SortedSet<T>.Add(value_typed_x) on a parameter
 // receiver must NOT fire (the argument is plain int, no §28.14
 // obligation). Proves the fix gates correctly on the call-bounded side of

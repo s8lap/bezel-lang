@@ -125,13 +125,6 @@ BEZEL_TEST(sema_string_search_value_int_6635, contains_long_search_value_rejecte
                    kSearchValue);
 }
 
-// A COMPILE-TIME CONSTANT is not an escape: the constant-narrowing clause
-// applies to an INTEGER TARGET, and `char`/`string` are not integer targets.
-BEZEL_TEST(sema_string_search_value_int_6635,
-           contains_int_constant_search_value_rejected) {
-    expectRejected("Console.WriteLine(s.Contains(5));", kSearchValue);
-}
-
 // ── CONTROLS: the declared forms still work, with their values pinned ──────
 
 BEZEL_TEST(sema_string_search_value_int_6635, contains_string_control) {

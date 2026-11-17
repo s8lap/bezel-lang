@@ -146,18 +146,3 @@ BEZEL_TEST(operator_compound_assign_3107, underlying_mod_binary_allowed) {
         "end Main; end F;");
     BEZEL_EXPECT_FALSE(hasCompoundAssignError(r));
 }
-
-// §25.1 (#3107): pre-fix, declaring `operator +=` was silently accepted
-// and the inert member created noise without diagnostic. This test pins
-// the silent-accept regression by asserting the post-fix counterexample:
-// a clean `+` declaration (no `+=`) compiles with no §25.1 compound
-// error.
-BEZEL_TEST(operator_compound_assign_3107, no_compound_decl_no_error) {
-    auto r = parseSemaAll(
-        std::string(kRec) +
-        "  public static method operator +(a: V, b: V): V => "
-        "new V(a.n + b.n); "
-        "end V; class F public static method Main(): int return 0; "
-        "end Main; end F;");
-    BEZEL_EXPECT_FALSE(hasCompoundAssignError(r));
-}

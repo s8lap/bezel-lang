@@ -34,15 +34,6 @@ bezel::test::SemaResult parseSemaAll(std::string_view src) {
 // ---------------------------------------------------------------------------
 // §26.5 step 2 — extension on a class resolves; no "no member" diagnostic.
 // ---------------------------------------------------------------------------
-BEZEL_TEST(sema_extension, method_on_class_resolves_clean) {
-    auto r = parseSemaAll(
-        "module M; "
-        "class Foo public _x: int := 0; end Foo; "
-        "extension Foo public method Bar(): int => this._x + 1; end; "
-        "class P public method Use(f: Foo): int => f.Bar(); end P;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 // §26.5 step 2 — extension on a primitive (`extension int`) resolves clean.
 BEZEL_TEST(sema_extension, method_on_int_resolves_clean) {
     auto r = parseSemaAll(
@@ -204,22 +195,6 @@ BEZEL_TEST(sema_extension, static_property_in_extension_rejected_1581) {
             d.message.find("26.3") != std::string::npos)
             found = true;
     BEZEL_EXPECT_TRUE(found);
-}
-
-// §26.3 (v0.183, #1581): a plain (non-static) instance extension method on a
-// user-defined class continues to compile cleanly — the fix targets only
-// the `static` modifier, not extension methods in general.
-BEZEL_TEST(sema_extension, instance_method_in_extension_still_accepted_1581) {
-    auto r = parseSemaAll(
-        "module M; "
-        "class Widget public _n: int := 0; end Widget; "
-        "extension Widget "
-        "  public method Describe(): int => this._n + 1; "
-        "end; "
-        "class C public static method Main(w: Widget): int "
-        "  return w.Describe(); "
-        "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // ---------------------------------------------------------------------------

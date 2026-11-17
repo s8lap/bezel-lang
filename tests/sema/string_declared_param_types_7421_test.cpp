@@ -242,30 +242,9 @@ BEZEL_TEST(sema_string_declared_param_types_7421, compareto_bool_control) {
                  "-1\n");
 }
 
-// The char-or-string overload sets keep both of their declared forms.
-BEZEL_TEST(sema_string_declared_param_types_7421, contains_string_control) {
-    expectStdout("var s := \"abc\"; Console.WriteLine(s.Contains(\"b\"));",
-                 "True\n");
-}
-
-BEZEL_TEST(sema_string_declared_param_types_7421, contains_char_control) {
-    expectStdout("var s := \"abc\"; Console.WriteLine(s.Contains('b'));",
-                 "True\n");
-}
-
-BEZEL_TEST(sema_string_declared_param_types_7421, indexof_string_control) {
-    expectStdout("var s := \"abc\"; Console.WriteLine(s.IndexOf(\"b\"));",
-                 "1\n");
-}
-
 BEZEL_TEST(sema_string_declared_param_types_7421, indexof_char_control) {
     expectStdout("var s := \"abc\"; Console.WriteLine(s.IndexOf('b'));",
                  "1\n");
-}
-
-BEZEL_TEST(sema_string_declared_param_types_7421, lastindexof_string_control) {
-    expectStdout("var s := \"abcabc\"; Console.WriteLine(s.LastIndexOf(\"b\"));",
-                 "4\n");
 }
 
 // `Split(separator: string)`.

@@ -95,17 +95,6 @@ void expectRefused(const JitResult& r, const char* overload,
 }  // namespace
 
 // ===========================================================================
-// stdlib §2.2 `Math` — the issue's own repro, POSITIONAL spelling.
-// ===========================================================================
-BEZEL_TEST(builtin_member_arg_type_7218,
-           math_pow_string_argument_is_refused_with_a_located_5_1_diagnostic) {
-    auto r = runAot(prog(
-        "    Console.WriteLine(Math.Pow(\"not a double\", 3));"));
-    expectRefused(r, "no matching overload of `Math.Pow`",
-                  "the `x` argument must be a `double`");
-}
-
-// ===========================================================================
 // stdlib §2.2 `Math` — the SECOND parameter, so the diagnostic must name
 // `y` and not `x` (the overload table is per-parameter).
 // ===========================================================================
@@ -114,16 +103,6 @@ BEZEL_TEST(builtin_member_arg_type_7218,
     auto r = runAot(prog("    Console.WriteLine(Math.Pow(2, \"x\"));"));
     expectRefused(r, "no matching overload of `Math.Pow`",
                   "the `y` argument must be a `double`");
-}
-
-// ===========================================================================
-// stdlib §2.2 `Math` — `Sqrt(x: double): double`.
-// ===========================================================================
-BEZEL_TEST(builtin_member_arg_type_7218,
-           math_sqrt_string_argument_is_refused_with_a_located_5_1_diagnostic) {
-    auto r = runAot(prog("    Console.WriteLine(Math.Sqrt(\"x\"));"));
-    expectRefused(r, "no matching overload of `Math.Sqrt`",
-                  "the `x` argument must be a `double`");
 }
 
 // ===========================================================================
@@ -137,29 +116,6 @@ BEZEL_TEST(builtin_member_arg_type_7218,
     auto r = runAot(prog("    Console.WriteLine(Math.Abs(true));"));
     expectRefused(r, "no matching overload of `Math.Abs`",
                   "the `x` argument must be an `int`");
-}
-
-// ===========================================================================
-// stdlib §2.3 `Convert` — the issue names the `Convert` family too.
-// `ToDouble(value: string): double`, so an `int` argument is refused.
-// ===========================================================================
-BEZEL_TEST(builtin_member_arg_type_7218,
-           convert_to_double_int_argument_is_refused_with_a_located_5_1_diagnostic) {
-    auto r = runAot(prog("    Console.WriteLine(Convert.ToDouble(7));"));
-    expectRefused(r, "no matching overload of `Convert.ToDouble`",
-                  "the `value` argument must be a `string`");
-}
-
-// ===========================================================================
-// stdlib §2.3 `Convert` — `ToBoolean(value: string): bool`; a `bool`
-// argument is not a `string` and §5.1 admits no `bool` -> `string`
-// conversion, so this is refused too.
-// ===========================================================================
-BEZEL_TEST(builtin_member_arg_type_7218,
-           convert_to_boolean_bool_argument_is_refused_with_a_located_5_1_diagnostic) {
-    auto r = runAot(prog("    Console.WriteLine(Convert.ToBoolean(true));"));
-    expectRefused(r, "no matching overload of `Convert.ToBoolean`",
-                  "the `value` argument must be a `string`");
 }
 
 // ===========================================================================

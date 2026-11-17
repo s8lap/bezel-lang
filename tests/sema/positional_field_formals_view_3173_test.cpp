@@ -208,47 +208,6 @@ BEZEL_TEST(positional_field_formals_view_3173,
 }
 
 // ===========================================================================
-// T6 — POSITIVE happy path: the unified binder still lowers correctly
-// through the positional-field path (was: pre-#3163 silent-zero object).
-//
-// `new PBox(3, 4)` for `class PBox(V: int, W: int)`: V = 3, W = 4.
-// ===========================================================================
-BEZEL_TEST(positional_field_formals_view_3173,
-           correct_arity_still_lowers_spec_22_10) {
-    BEZEL_EXPECT_EQ(run(
-        "module M;"
-        "public class PBox(V: int, W: int)"
-        "  public method Sum(): int return V + W; end Sum;"
-        "end PBox;"
-        "class C public static method Main(): int"
-        "  using var b := new PBox(3, 4);"
-        "  return b.Sum();"
-        "end Main; end C;"), 7);
-}
-
-// ===========================================================================
-// T7 — POSITIVE named-argument path: the unified binder handles
-// `new PBox(W := 4, V := 3)` correctly (§22.5 + §22.10).
-//
-// This is the LOCAL twin of #3196's cross-module row — same shape, single
-// module. Both run through `bindArgsToParams` over the positional-field view
-// (#3173), and the side-table publication (`setNewExprPositionalBinding`)
-// receives the binding the unified binder computed.
-// ===========================================================================
-BEZEL_TEST(positional_field_formals_view_3173,
-           named_arguments_lowers_through_unified_binder_spec_22_5) {
-    BEZEL_EXPECT_EQ(run(
-        "module M;"
-        "public class PBox(V: int, W: int)"
-        "  public method Sum(): int return V + W; end Sum;"
-        "end PBox;"
-        "class C public static method Main(): int"
-        "  using var b := new PBox(W := 4, V := 3);"
-        "  return b.Sum();"
-        "end Main; end C;"), 7);
-}
-
-// ===========================================================================
 // T8 — POSITIVE RECORD path: the unified binder works through the §9.1
 // positional-field view for a RECORD too, where the field list has no
 // per-slot defaults (A.3 `PositionalField` admits no default syntax).

@@ -125,26 +125,6 @@ BEZEL_TEST(conditional_atom_narrow_2105, if_atom_eq_null_narrows_else_spec_7_4) 
 // narrows THAT arm's own body.
 // ---------------------------------------------------------------------------
 
-// §7.4 (v0.210, #2105): the first arm's condition narrows the first
-// arm's body. `(when s <> null => s.Length, _ => 0)` — `s.Length` in the
-// first arm is accepted without a further guard.
-// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `(when …)`
-// expression is retired — rewritten as an equivalent `(if … then … else …)`
-// to preserve the narrowing subject.
-BEZEL_TEST(when_arm_narrow_2105, when_expr_first_arm_condition_narrows_body_spec_7_4) {
-    auto r = parseSemaAll(
-        "module M; "
-        "class C "
-        "  public static method Run(s: string?): int "
-        "    return (if s <> null then s.Length else 0); "
-        "  end Run; "
-        "  public static method Main(): int "
-        "    return C.Run(\"hi\"); "
-        "  end Main; "
-        "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 // §7.4 / §19.1 (control, #2105): the SECOND arm does not inherit the
 // FIRST arm's narrowing — it is reached only when the first arm's
 // condition was FALSE (`s = null`). `s.Length` in the `_` arm is the

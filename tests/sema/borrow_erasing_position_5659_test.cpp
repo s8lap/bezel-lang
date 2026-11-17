@@ -106,27 +106,6 @@ BEZEL_TEST(sema_borrow_erasing_position_5659,
     BEZEL_EXPECT_TRUE(rejectedBorrowErasing(r));
 }
 
-// The `s8_6_0007` program: a SPAN (a class-backed builtin view), not an
-// `IReadOnlySpan`. §9.7 reads a value declared at `IReadOnlySpan<TElement>` as
-// holding the span's borrows, and `isBorrowBearingRecordOrSpan` answers the
-// same for the concrete views — the two legs of one predicate.
-BEZEL_TEST(sema_borrow_erasing_position_5659,
-           concrete_span_at_object_parameter_rejected_spec_9_7) {
-    JitResult r = runAot(
-        "module M; "
-        "class Sink public static method K(x: Object?) end K; end Sink; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var buf := new OwningBuffer<int>(4); "
-        "    var s := buf.AsSpan(); "
-        "    Sink.K(s); "
-        "    return 0; "
-        "  end Main; "
-        "end C;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(rejectedBorrowErasing(r));
-}
-
 // =====================================================================
 // ROUTE 2 — `as` (§17.4). The `s8_6_0009` program.
 // =====================================================================

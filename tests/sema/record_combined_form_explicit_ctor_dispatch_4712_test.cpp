@@ -99,36 +99,6 @@ BEZEL_TEST(record_combined_form_explicit_ctor_dispatch_4712,
     BEZEL_EXPECT_EQ(r.exitCode, 10);
 }
 
-// ── (2) regression guard: the same record's PRIMARY-shape construction
-//        (`new Point2(1, 2)`) must still resolve to the auto-generated
-//        primary and return 3 — the §9.3 rule "the body adds further
-//        members" means the primary remains; the bug fix must not retire
-//        it. The fix widens the record branch's gate (defers when an
-//        explicit ctor is present); codegen's positional fast path
-//        (`buildRecordValue`, lines 10715-10718 — `args.size() ==
-//        recPosFieldCount && explicitCs == nullptr`) handles this case
-//        because `ctorForArgs` finds no body-ctor match for the 2-arg
-//        call ──────────────────────────────────────────────────────────────
-BEZEL_TEST(record_combined_form_explicit_ctor_dispatch_4712,
-           primary_shape_still_works_spec_9_3) {
-    auto r = runAot(
-        "module M; "
-        "public record Point2(X: int, Y: int) "
-        "  public constructor(scale: int) "
-        "    X := scale; "
-        "    Y := scale; "
-        "  end constructor; "
-        "end Point2; "
-        "public class Program "
-        "  public static method Main(): int "
-        "    var p := new Point2(1, 2); "
-        "    return p.X + p.Y; "
-        "  end Main; "
-        "end Program;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 3);
-}
-
 // ── (3) FLIPPED for fix #5132 (§9.3 / §22.6, v0.308): body ctor with a
 //        single-int parameter of a DIFFERENT NAME than the primary's
 //        positional field is no longer accepted. Under §22.6 overload

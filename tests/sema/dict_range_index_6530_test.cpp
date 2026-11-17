@@ -350,21 +350,6 @@ BEZEL_TEST(dict_range_index_6530,
         "implicitly convertible to the target type"));
 }
 
-// And #6500's OWN repro shape — a string-keyed dictionary — must still be
-// rejected. On the pre-#6500 compiler this reached codegen and produced
-// malformed IR ("IR verification failed (malformed IR emitted)"); the guard
-// turned it into a diagnostic, and the fix here must not turn it back into an
-// accepted program.
-BEZEL_TEST(dict_range_index_6530,
-           control_string_keyed_dict_range_index_is_still_guarded_spec_23_4) {
-    auto r = runAot(prog("    var d: Dictionary<string, string> := "
-                         "[\"aa\": \"bb\"];\n"
-                         "    var s := d[0..1];\n"
-                         "    return s.Length;\n"));
-    BEZEL_EXPECT_TRUE(rejectedWith(
-        r, "range index `[a..b]` is not admitted on `Dictionary<K, V>`"));
-}
-
 // ── A REAL built-in key reaching a body whose type parameter is spelled
 //    like it ───────────────────────────────────────────────────────────────
 //

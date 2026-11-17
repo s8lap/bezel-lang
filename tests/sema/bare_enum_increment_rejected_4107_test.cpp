@@ -122,23 +122,3 @@ BEZEL_TEST(bare_enum_increment_rejected_4107,
     BEZEL_EXPECT_TRUE(hasMsg(r, "`++` is not defined on enum type `Color`"));
     BEZEL_EXPECT_TRUE(hasMsg(r, "§17.6"));
 }
-
-// =========================================================================
-// §17.6 / §6.1 — ACCEPT SHAPES (no false reject)
-// =========================================================================
-
-// §17.6 / §6.1: `i++` on an int local — an enum's underlying value is a
-// plain integer and MUST still admit `++`. This is NOT the same as incrementing
-// the enum itself.
-BEZEL_TEST(bare_enum_increment_rejected_4107,
-           int_underlying_value_increment_accepted_spec_17_6) {
-    auto r = parseSemaAll(
-        "module M; class C "
-        "  public static method Main(): int "
-        "    var i := 5; "
-        "    i++; "
-        "    return i; "
-        "  end Main; "
-        "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}

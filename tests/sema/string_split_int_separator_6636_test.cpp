@@ -93,14 +93,6 @@ BEZEL_TEST(sema_string_split_int_separator_6636, split_int_separator_rejected) {
     expectRejected("Console.WriteLine(s.Split(5).Count);", kSeparator);
 }
 
-// A COMPILE-TIME CONSTANT is not an escape: §5.1's constant-narrowing
-// clause applies to an INTEGER TARGET, and `char`/`string` are not integer
-// targets.
-BEZEL_TEST(sema_string_split_int_separator_6636,
-           split_int_constant_separator_rejected) {
-    expectRejected("Console.WriteLine(s.Split(5).Count);", kSeparator);
-}
-
 // §5.1's table has no `long` -> `char` row either.
 BEZEL_TEST(sema_string_split_int_separator_6636, split_long_separator_rejected) {
     expectRejected("var n: long := 5; Console.WriteLine(s.Split(n).Count);",
