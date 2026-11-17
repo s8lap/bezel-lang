@@ -434,29 +434,13 @@ BEZEL_TEST(async_own_patternA, await_value_typed_task_any_position_clean) {
 // This FLIPS the pre-D2 KEEP-REJECT — verified leak-clean under ASan/LSan on the
 // normal, throw, and cancellation edges (async_own_task_across_suspend_1868
 // codegen suite). Since fix #1772 a plain owned CLASS local across a suspend is
-// auto-dropped as well (plain_owned_class_never_used_across_suspend_auto_dropped_1772
-// below). // per §28.3, §30.5, §28.12 (v0.190)
+// auto-dropped as well (async_own_suspend.suspend_local_dropped_on_normal_path_auto_dropped_1772,
+// which pins this program with these assertions). // per §28.3, §30.5, §28.12 (v0.190)
 BEZEL_TEST(async_own_patternA, plain_owned_task_never_awaited_across_suspend_admitted_1868) {
     auto r = parseAndCheckOwnership(wrap(
         "var t := p.MakeShared(); "
         "await p.MakeUnit(); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
-// fix #1772 (FLIPPED from `plain_owned_class_never_used_across_suspend_still_rejected_1868`,
-// which asserted the hard reject): a plain owned CLASS local held live across a
-// suspend point is auto-dropped at scope end like the task-family local of the
-// row above. Its disposal is the same normal/unwind scope path an admitted
-// `using var` suspend-local takes, so it covers the same edges; the #1772
-// ruling (2026-07-24) settles that the task-only admission was not a §30.5
-// carve-out. `T` is trivial-dispose (§28.9): no warning either.
-// // per §28.3.10, §28.9, §30.5 (v0.357)
-BEZEL_TEST(async_own_patternA, plain_owned_class_never_used_across_suspend_auto_dropped_1772) {
-    auto r = parseAndCheckOwnership(wrap(
-        "var x := new T(); "
-        "await p.MakeUnit(); "));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(hasAutoDropWarning(r, "x"));
 }
 
 // SB01-D2 (#1868): a plain owned `OwningTask<T>` (Pattern B) local never awaited
