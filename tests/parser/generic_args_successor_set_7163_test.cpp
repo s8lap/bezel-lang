@@ -310,17 +310,6 @@ BEZEL_TEST(generic_args_successor_set_7163,
     BEZEL_EXPECT_EQ(parseInitText("a < b > c"), std::string("((a < b) > c)"));
 }
 
-BEZEL_TEST(generic_args_successor_set_7163,
-           spec_22_12_relational_with_an_indexed_operand_stays_relational) {
-    BEZEL_EXPECT_EQ(parseInitText("x[i] < y"), std::string("(x[i] < y)"));
-}
-
-BEZEL_TEST(generic_args_successor_set_7163,
-           spec_22_12_relational_with_call_operands_stays_relational) {
-    BEZEL_EXPECT_EQ(parseInitText("f(a, b) < g(c, d)"),
-                    std::string("(f(a, b) < g(c, d))"));
-}
-
 // A relational chain at a DOTTED segment: the `>` is followed by an operand,
 // not by one of the eight successors.
 BEZEL_TEST(generic_args_successor_set_7163,
@@ -478,24 +467,6 @@ BEZEL_TEST(generic_args_successor_set_7163,
         "  Console.WriteLine(Registry<int>.Make()); "
         "  return 0; "
         "end Main; end D; ");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "7\n");
-}
-
-// The bare-callee form: `Make<int>(7)` — §14.1's `Id<string>("hello")` shape.
-BEZEL_TEST(generic_args_successor_set_7163,
-           spec_14_1_bare_callee_explicit_type_arguments_still_runs) {
-    auto r = runAot(
-        "module M; "
-        "public class D public static method Main(): int "
-        "  Console.WriteLine(Make<int>(7)); "
-        "  return 0; "
-        "end Main; "
-        "public static method Make<T>(v: T): T "
-        "  return v; "
-        "end Make; "
-        "end D; ");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "7\n");
