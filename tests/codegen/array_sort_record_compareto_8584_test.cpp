@@ -9,8 +9,8 @@
 //     and states of the parameterless natural-order form: "for a concrete
 //     element type the natural-order comparer is that type's own `CompareTo`
 //     (for example `int.CompareTo`)".
-//   * stdlib §2.8 gives that member its meaning: "`a.CompareTo(b)` returns a
-//     negative number if `a < b`, zero if equal, a positive number if
+//   * that member's meaning is given by stdlib §2.8 (`IComparable<T>`):
+//     "`a.CompareTo(b)` returns a negative number if `a < b`, zero if equal, a positive number if
 //     `a > b`" — and the code-generation reference §5 calls the parameterless
 //     form the "natural order" of the element type, i.e. the order ITS OWN
 //     `CompareTo` defines (a type whose `CompareTo` orders descending is

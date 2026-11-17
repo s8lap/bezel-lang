@@ -9116,9 +9116,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         //     public method Sorted(): owned Array<T> where T: IComparable<T>;
         // and states of the parameterless natural-order form: "for a concrete
         // element type the natural-order comparer is that type's own `CompareTo`
-        // (for example `int.CompareTo`)". stdlib §2.8 gives that member's
-        // meaning: "`a.CompareTo(b)` returns a negative number if `a < b`, zero
-        // if equal, a positive number if `a > b`". spec §14.2 *Interface
+        // (for example `int.CompareTo`)". The meaning of that member is given
+        // by stdlib §2.8 (`IComparable<T>`): "`a.CompareTo(b)` returns a
+        // negative number if `a < b`, zero if equal, a positive number if
+        // `a > b`". spec §14.2 *Interface
         // conformance* rule 2 is what admits the record at all: "T is a record
         // that lists I (or any interface extending I) in its inheritance clause
         // and declares matching members" — so a
