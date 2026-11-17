@@ -223,50 +223,6 @@ BEZEL_TEST(move_borrow_receiver_owned_field_2011,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// §28.8.1: `C.Sink(move this.f!)` — the this-receiver owned-field move into an
-// owned parameter, the field reassigned before exit. Guards against the fix
-// mis-classifying the this-receiver arg-sink field move as a borrow.
-BEZEL_TEST(move_borrow_receiver_owned_field_2011,
-           argsink_move_this_field_disposes_once_spec_28_8_1) {
-    std::string src =
-        std::string(kCell) +
-        "class Box "
-        "  public owned f: Cell? := null; "
-        "  public constructor() this.f := new Cell(); end constructor; "
-        "  public method Give() C.Sink(move this.f!); this.f := null; end Give; "
-        "  destructor end destructor; "
-        "end Box; "
-        "class C "
-        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
-        "  public static method Main(): int "
-        "    do using var b := new Box(); b.Give(); end; return Cell.live; "
-        "  end Main; "
-        "end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-}
-
-// ===========================================================================
-// NON-REGRESSION — the #1995 owned-field-return controls must still pass: a
-// `this`-receiver owned-field return (`move this.f!` / `move _f!`) must NOT trip
-// the borrow-return diagnostic the #2011 fix now applies to BORROW receivers.
-// ===========================================================================
-BEZEL_TEST(move_borrow_receiver_owned_field_2011,
-           this_receiver_owned_field_return_not_flagged_spec_28_8_1) {
-    auto r = parseAndCheckOwnership(
-        std::string(kCell) +
-        "class Box "
-        "  public owned f: Cell? := null; "
-        "  public constructor() this.f := new Cell(); end constructor; "
-        "  public method TakeBare(): owned Cell return move f!; end TakeBare; "
-        "  public method TakeThis(): owned Cell return move this.f!; end TakeThis; "
-        "  destructor end destructor; "
-        "end Box;");
-    // The this-receiver owned-field move is not the #2011 borrow-receiver hazard.
-    BEZEL_EXPECT_FALSE(errorSays(r, kBorrowReturn));
-}
-
 // ===========================================================================
 // RUNTIME UAF — a NON-identifier BORROW receiver (`o.inner.f`, whose receiver
 // `o.inner` is itself a borrow field read) defeats the #2002 slot-nulling

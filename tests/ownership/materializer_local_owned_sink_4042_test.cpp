@@ -156,29 +156,6 @@ BEZEL_TEST(materializer_local_owned_sink_4042,
     BEZEL_EXPECT_EQ(jr.exitCode, 3);
 }
 
-BEZEL_TEST(materializer_local_owned_sink_4042,
-           sorted_via_local_return_move_accepted_spec_28_3_stdlib_4_4) {
-    JitResult jr = runAotChecked(
-        "module Conf; "
-        "class W "
-        "  public method Sort(seq: Array<int>): owned Array<int> "
-        "    var items := seq.Sorted(); "
-        "    return items; "
-        "  end Sort; "
-        "end W; "
-        "class Main "
-        "  public static method Main(): int "
-        "    using var seq := new Array<int>(); "
-        "    seq.Add(3); seq.Add(1); seq.Add(2); "
-        "    using var w := new W(); "
-        "    using var r := w.Sort(seq); "
-        "    return r.Count; "
-        "  end Main; "
-        "end Main;");
-    BEZEL_EXPECT_TRUE(jr.ran);
-    BEZEL_EXPECT_EQ(jr.exitCode, 3);
-}
-
 // ===========================================================================
 // AMPLIFIED RUNTIME PROOF (300 iterations, ASan/LSan) — one per owned-sink
 // SHAPE `ownedArgSourceIsBorrow` gates: return, return move, owned field

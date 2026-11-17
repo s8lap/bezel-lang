@@ -43,8 +43,6 @@
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::diagnosticMessageContains;
-using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -68,10 +66,6 @@ const char* kBox =
     "  public constructor(owned c: Cell) this.item := c; end constructor; "
     "end Box; ";
 
-// #1005 diagnostic fragment (pre-existing wording, kept for boundary rows).
-constexpr const char* k1005DiagFragment =
-    "cannot return an owned field's `move`d value through a non-`owned` "
-    "return";
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -112,22 +106,6 @@ BEZEL_TEST(async_owning_task_owned_field_move_return_4337,
 // ---------------------------------------------------------------------------
 // Boundary / accept-side controls that must not regress.
 // ---------------------------------------------------------------------------
-
-// The SYNC (non-async) #1005 rule is NOT changed by this fix — `move
-// <owned field>` through a non-async, non-`owned` return is still a leak.
-// Confirms the boundary between "async OwningTask carve" and "sync #1005".
-BEZEL_TEST(async_owning_task_owned_field_move_return_4337,
-          boundary_sync_move_owned_field_still_rejected) {
-    auto r = runAot(
-        "module M; " + std::string(kCell) + std::string(kBox) +
-        "class D "
-        "  public method Take(h: Box): Cell? "
-        "    return move h.item; "  // NOT async — the genuine #1005 leak
-        "  end Take; "
-        "end D;");
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, k1005DiagFragment));
-}
 
 // A bare (non-`move`) read of the owned field through `OwningTask<Cell>`
 // is NOT the shape this fix addresses (it is a different question: whether

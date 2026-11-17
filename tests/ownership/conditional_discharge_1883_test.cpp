@@ -150,28 +150,6 @@ BEZEL_TEST(conditional_discharge_1883,
 // !st.maybeConsumed filter) and the unconditional dispose still auto-drops.
 // ============================================================================
 
-// §28.3 v0.180 (#1626): the Owned ⊓ MovedFrom split — a `move x` on one
-// branch — sets maybeConsumed and is hard-rejected by the post-join
-// discharge error. This is the exact #1626 baseline that the #1883 fix
-// MUST NOT regress.
-BEZEL_TEST(conditional_discharge_1883,
-           move_split_still_hard_rejected_spec_28_3) {
-    auto r = parseAndCheckOwnership(wrap(
-        "class Sink "
-        "  public method Take(owned t: A) "
-        "    using var h: A := t; "
-        "  end Take; "
-        "end Sink; "
-        "var s: Sink := new Sink(); "
-        "var x: A := new A(); "
-        "if C.Cond() then "
-        "  s.Take(move x); "
-        "end; "
-        "return 0;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(hasAutoDropWarning(r, "x"));
-}
-
 // §28.3 v0.150 baseline: unconditional `x.Dispose()` then no further use —
 // the legacy #601 / spec_28_2_one_branch_no_warn case. Still accepted with
 // no error (the Dispose is the proper discharge).

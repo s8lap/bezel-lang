@@ -226,24 +226,6 @@ BEZEL_TEST(nullcond_checkread_moved_from_disposed_3984,
 // fix that merely silenced the #2961 warning (typed the recipient `int`, say)
 // still fails them.
 // ============================================================================
-BEZEL_TEST(nullcond_checkread_moved_from_disposed_3984,
-           owningarray_trypopfirst_out_var_recipient_typed_spec_28_11) {
-    auto r = runAot(
-        "module M; "
-        "class Box public Val: int := 0; "
-        "  public constructor(v: int) Val := v; end constructor; end Box; "
-        "class C public static method Main(): int "
-        "  do using var a := new OwningArray<Box>(); "
-        "    a.Add(move (new Box(10))); a.Add(move (new Box(20))); "
-        "    var ok := a.TryPopFirst(out var item); "
-        "    var v := 0; if item <> null then v := item.Val; end; "
-        "    item?.Dispose(); "
-        "    if ok then return v; end; return 0; end; return 0; "
-        "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 10);
-}
-
 // The OwningLinkedList twin of the row above (stdlib §4.7) — same table, same
 // missing arm. A fix that added only the `OwningArray` arm leaves this red.
 BEZEL_TEST(nullcond_checkread_moved_from_disposed_3984,

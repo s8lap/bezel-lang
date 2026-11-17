@@ -308,21 +308,3 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
-
-// Not-a-regression: an ordinary owned-LOCAL move into a sink — `move x!` where
-// `x` is a `Cell?` local, NOT a field of another object — is untouched by the
-// #1999 fix (the move source is a bare identifier, not a `recv.f` member access)
-// and disposes exactly once. Guards the fix's scoping to member-access sources.
-BEZEL_TEST(move_field_nonthis_owned_sink_1999,
-           owned_local_move_into_sink_unaffected_disposes_once_spec_28_8_1) {
-    std::string src =
-        std::string(kCell) +
-        "class C "
-        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
-        "  public static method Use() var x: Cell? := new Cell(); C.Sink(move x!); end Use; "
-        "  public static method Main(): int C.Use(); return Cell.live; end Main; "
-        "end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-}

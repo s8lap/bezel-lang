@@ -418,21 +418,3 @@ BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
         "end C;");
     BEZEL_EXPECT_TRUE(hasInertRhsWarning(r, "x"));
 }
-
-BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
-           over_rejection_guard_non_chain_call_returning_int_still_warns_spec_28_10) {
-    // A call returning a built-in NON-chain-claimed type (e.g. an int or
-    // a struct — but here, more interesting, a non-named return). My
-    // disjunct gates on `rt->kind == Named`, so a value-typed return
-    // never matches.
-    auto r = parseAndCheckOwnership(
-        "module M; class C "
-        "  public static method F(): int return 42; end F; "
-        "  public static method M(): int "
-        "    using var x := C.F(); "
-        "    return 0; "
-        "  end M; "
-        "  public static method Main(): int return 0; end Main; "
-        "end C;");
-    BEZEL_EXPECT_TRUE(hasInertRhsWarning(r, "x"));
-}

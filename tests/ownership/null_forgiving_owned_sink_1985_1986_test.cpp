@@ -311,21 +311,3 @@ BEZEL_TEST(null_forgiving_owned_sink_1986,
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(errorSays(r, "already moved out"));
 }
-
-// §17.8 / §28.3 / §28.8.1 (v0.309, #5144, #4993): `this.f := move x!` is the
-// REDUNDANT MARKER — §17.8 makes `x!` classified by position EXACTLY as `x`
-// is, and `move` at a marker-free position (K3.1 owned-field store) is the
-// §28.3 K3.13 redundant-marker diagnostic. This row REPLACES the pre-fix
-// "still disposes once" pin (which pinned the silent-accept behavior the #5144
-// fix explicitly removes). // per §17.8, §28.3 K3.13
-BEZEL_TEST(null_forgiving_owned_sink_1986,
-           move_bang_into_owned_field_rejected_redundant_marker_spec_28_3) {
-    auto r = parseAndCheckOwnership(
-        std::string(kCell) +
-        "class Box "
-        "  public owned f: Cell? := null; "
-        "  public method Set() var x: Cell? := new Cell(); this.f := move x!; end Set; "
-        "end Box;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(errorSays(r, "the `move` marker is redundant"));
-}

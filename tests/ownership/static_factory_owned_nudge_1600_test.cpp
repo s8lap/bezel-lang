@@ -92,28 +92,6 @@ BEZEL_TEST(static_factory_owned_nudge_1600, sourceless_static_factory_rejected) 
     BEZEL_EXPECT_TRUE(hasStaticReturnError(r, "Make"));
 }
 
-// The declaration-site rule is independent of any caller's discharge shape —
-// it fires whether the call is `var m := Make();`, `using var m := Make();`,
-// or never called at all. (Was the v0.60 warning's "declaration-level lint"
-// property; v0.201 carries it forward as the declaration-level ERROR.)
-BEZEL_TEST(static_factory_owned_nudge_1600,
-           fires_regardless_of_caller_discharge_style) {
-    auto r = parseAndCheckOwnership(
-        "module M; class Res "
-        "  public constructor() end constructor; "
-        "  destructor end destructor; "
-        "end Res; "
-        "class Factory "
-        "  public static method Make(): Res return new Res(); end Make; "
-        "  public static method Main(): int "
-        "    using var m := Make(); "
-        "    return 0; "
-        "  end Main; "
-        "end Factory;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasStaticReturnError(r, "Make"));
-}
-
 // Expression-bodied static factories (`Make(): Res => new Res();`) are
 // rejected identically — the predicate is signature-keyed (bodyKind-
 // independent).

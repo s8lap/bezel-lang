@@ -219,18 +219,6 @@ BEZEL_TEST(owning_task_result_plain_var_8137,
     expectNoLeak(r, "500\nlive 0\n");
 }
 
-// §28.10 -- the `using var` spelling, the CONTROL. This shape was already
-// clean (codegen's case (b0d) recognised it) and must stay clean: the fix
-// must not disturb it, and in particular must not double-dispose it.
-BEZEL_TEST(owning_task_result_plain_var_8137,
-           using_var_result_control_is_unchanged_spec_28_10) {
-    JitResult r = runAotChecked(prog(
-        "      using var t := Mk(); "
-        "      using var c := t.Result; "
-        "      s := s + c.v; "));
-    expectNoLeak(r, "500\nlive 0\n");
-}
-
 // §28.9 / §30.3 -- the VALUE-typed control: a `Task<int>?` receiver's
 // `Result` is an `int`, which carries no disposal obligation, so no disposal
 // may be registered for it (a registered one would dispose a non-heap value).

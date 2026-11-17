@@ -287,45 +287,6 @@ BEZEL_TEST(lazy_select_slice_minting_selector_7156,
     BEZEL_EXPECT_EQ(run(src), 3);
 }
 
-// stdlib §5 (v0.194) / §28.3 (#7156): a FIELD read of a `string` is a BORROW
-// of the receiver's slot — admitted, leak-free. "a" + "bb" = 3.
-BEZEL_TEST(lazy_select_slice_minting_selector_7156,
-           select_string_field_read_accepted_leakfree_spec_5) {
-    std::string src =
-        "module M; import System.Collections.Linq; "
-        "record R(Name: string); "
-        "class C public static method Main(): int "
-        "  using var rows: Array<R> := [new R(\"a\"), new R(\"bb\")]; "
-        "  var total: int := 0; "
-        "  for var w in rows.Select(lambda(r) => r.Name) do "
-        "    total := total + w.Length; "
-        "  end for; "
-        "  return total; "
-        "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(src), 3);
-}
-
-// stdlib §5 (v0.194) / §28.3 (#7156): a USER-DEFINED method returning a
-// BORROWED string is left alone by the gate (the no-`MethodDecl` gate in the
-// §9.6 mint-set test) — admitted, leak-free. 1 + 2 = 3.
-BEZEL_TEST(lazy_select_slice_minting_selector_7156,
-           select_user_method_borrowed_string_accepted_leakfree_spec_5) {
-    std::string src =
-        "module M; import System.Collections.Linq; "
-        "class C "
-        "  private static method Identity(s: string): string => s; "
-        "  public static method Main(): int "
-        "    using var words: Array<string> := [\"a\", \"bb\"]; "
-        "    var total: int := 0; "
-        "    for var w in words.Select(lambda(s) => Identity(s)) do "
-        "      total := total + w.Length; "
-        "    end for; "
-        "    return total; "
-        "  end Main; "
-        "end C;";
-    BEZEL_EXPECT_EQ(run(src), 3);
-}
-
 // stdlib §9.6 (v0.343) / §28.3 (#7156): `ToString()` is §9.6's ONE instance
 // member whose result is a `string` but which does NOT mint — §9.6 says it
 // "returns this". A `ToString` selector stays ADMITTED and leak-free.

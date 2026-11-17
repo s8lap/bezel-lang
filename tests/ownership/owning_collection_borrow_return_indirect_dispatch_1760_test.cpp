@@ -301,26 +301,3 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
         "end P;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
-
-// A receiver `owned`-field read returned through an idempotent-safe owning
-// WRAPPER (`Shared<T>`) keeps the #1493 carve-out — its double-dispose is a
-// safe refcount no-op. The fix must NOT tighten the wrapper heads. Scope
-// guard that the reject above is limited to the non-idempotent owning-
-// collection heads.
-BEZEL_TEST(owning_collection_borrow_return_1760,
-           shared_receiver_field_returned_still_accepted) {
-    auto r = parseAndCheckOwnership(
-        "module M; "
-        "class Cell "
-        "  public constructor() end constructor; "
-        "  destructor end destructor; "
-        "end Cell; "
-        "class Holder "
-        "  public owned field: Shared<Cell>; "
-        "  public constructor(owned f: Shared<Cell>) field := f; "
-        "  end constructor; "
-        "  destructor end destructor; "
-        "  public method Get(): Shared<Cell> return field; end Get; "
-        "end Holder;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}

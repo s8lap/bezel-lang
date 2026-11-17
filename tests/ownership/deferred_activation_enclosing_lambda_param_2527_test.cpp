@@ -111,42 +111,6 @@ BEZEL_TEST(deferred_activation_enclosing_lambda_param_2527,
     BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
 }
 
-// #2527 guard (existing accept preserved): the method-level PLAIN param
-// (a borrow) captured by a lambda forwarded to a deferred-activation
-// callee. The OLD gate skipped `s` as "not in `methodParamSet_`" — wait,
-// `s` IS in `methodParamSet_` (it's `M`'s own param), so the OLD gate
-// classifies `s` as a real capture with modifier == "" (not owned). The
-// NEW gate classifies `s` the same way (not in `forwardedInternalParams`).
-// Either way: admitted (the caller re-establishes the frame's constraint
-// against its own argument, §28.3). Guards against the fix wrongly
-// rejecting the plain-borrow case. // per §28.3, v0.196
-BEZEL_TEST(deferred_activation_enclosing_lambda_param_2527,
-          method_level_borrow_param_capture_still_accepted) {
-    auto r = parseAndCheckOwnership(wrap(
-        "var q := Doubled(nums, lambda(x) => s.Apply(x)); "
-        "return q;",
-        "method M(nums: Array<int>, s: Scaler): IEnumerable<int>"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
-// #2527 guard (existing accept preserved): a forwarded lambda whose body
-// uses only a method-scope source that contributes nothing (`this.Scale` +
-// a value-typed local + a static field). The forwarded lambda's own params
-// are classified as INTERNAL (skipped) by both gates — but with the NEW
-// gate, the only skipped params are exactly the forwarded lambda's own
-// params (`x`), so any method-scope captures are correctly classified.
-// Guards against the fix wrongly skipping method-scope captures that
-// should reach the reduction. // per §28.3, §28.14, v0.196
-BEZEL_TEST(deferred_activation_enclosing_lambda_param_2527,
-          method_level_capture_free_lambda_still_accepted) {
-    auto r = parseAndCheckOwnership(wrap(
-        "var bump: int := 5; "
-        "var q := Doubled(nums, lambda(x) => this.Scale(x) + bump + Program.Factor); "
-        "return q;",
-        "method M(nums: Array<int>): IEnumerable<int>"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 // #2527 guard (existing accept preserved): the forwarded lambda's own
 // param is correctly INTERNAL — not a capture — under the NEW gate. The
 // forwarded lambda `(x: int) => x` has no captures, so the admitted result

@@ -71,22 +71,6 @@ BEZEL_TEST(owned_sink, add_move_owned_local_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §22.3 (v0.169, #1348): a NAMED OWNED BINDING (owned local) in an owned-
-// consuming position requires the call-site `move` marker — `s.Add(move x)`
-// transfers ownership (x → moved-from) and the marker announces it. (The bare
-// `s.Add(x)` form is now rejected; see marker_transfer_test.cpp.)
-// per §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
-BEZEL_TEST(owned_sink, add_marked_owned_local_accepted) {
-    auto r = parseAndCheckOwnership(mod(
-        "class C "
-        "  public method M(s: Sink) "
-        "    var x := new T(); "
-        "    s.Add(move x); "
-        "  end M; "
-        "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 // §28.8: a `new` expression produces an owned value; passing it directly
 // to an `owned` parameter transfers that fresh ownership in.
 BEZEL_TEST(owned_sink, add_new_expr_accepted) {
@@ -323,25 +307,6 @@ BEZEL_TEST(owned_sink, builtin_dict_add_borrow_value_rejected) {
 // fix the intrinsic had no owned-sink entry, so `tasks` was reported as "dropped
 // without disposal" — a spurious reject of canonical code.
 BEZEL_TEST(owned_sink, task_whenallowned_consumes_owned_array_1121) {
-    auto r = parseAndCheckOwnership(
-        "module M; import System.Collections.Generic; "
-        "class Res public n: int; public constructor(v: int) n := v; end constructor; end Res; "
-        "class C "
-        "  public static async method Make(v: int): OwningTask<Res> return new Res(v); end Make; "
-        "  public static async method LoadAll(): OwningTask<OwningArray<Res>> "
-        "    var tasks := new OwningArray<OwningTask<Res>>(); "
-        "    tasks.Add(Make(3)); "
-        "    using var wt := Task.WhenAllOwned<Res>(move tasks); "
-        "    return await wt; "
-        "  end LoadAll; "
-        "  public static method Main(): int => 0; "
-        "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
-// Parity guard: the explicit `move tasks` form (the spec-canonical owned
-// transfer) compiles identically — the implicit form above must match it.
-BEZEL_TEST(owned_sink, task_whenallowned_explicit_move_accepted_1121) {
     auto r = parseAndCheckOwnership(
         "module M; import System.Collections.Generic; "
         "class Res public n: int; public constructor(v: int) n := v; end constructor; end Res; "

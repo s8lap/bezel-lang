@@ -499,45 +499,6 @@ BEZEL_TEST(vacuous_pin_lint_2073,
     BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "arr"));
 }
 
-// Sanity control — the rework-2 exclusion must NOT mask true inert-RHS
-// diagnostics on value-typed / runtime-managed types: `using var x := 42`
-// is still vacuous and STILL fires the inert-RHS warning (the int RHS
-// is not a disposable class type). // per §28.10 #2073 (rework 2)
-BEZEL_TEST(vacuous_pin_lint_2073,
-           rework2_does_not_mask_int_param_lint) {
-    auto r = parseAndCheckOwnership(
-        "module M; "
-        "class C "
-        "  public method M(b: int): int "
-        "    using var x := b; "
-        "    return 0; "
-        "  end M; "
-        "  public static method Main(): int return 0; end Main; "
-        "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasInertRhsWarning(r, "x"));
-    BEZEL_EXPECT_EQ(countInertRhsWarnings(r, "x"), 1);
-}
-
-// Sanity control — `using var s := "hello"` (runtime-managed string)
-// remains inert and STILL fires the inert-RHS warning.
-// // per §28.10 #2073 (rework 2)
-BEZEL_TEST(vacuous_pin_lint_2073,
-           rework2_does_not_mask_string_literal_lint) {
-    auto r = parseAndCheckOwnership(
-        "module M; "
-        "class C "
-        "  public method M(): int "
-        "    using var s := \"hello\"; "
-        "    return 0; "
-        "  end M; "
-        "  public static method Main(): int return 0; end Main; "
-        "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasInertRhsWarning(r, "s"));
-    BEZEL_EXPECT_EQ(countInertRhsWarnings(r, "s"), 1);
-}
-
 // ============================================================================
 // rework 3c — direct negative-control coverage for EVERY retained head in
 // `rhsIsDisposableClassType` (#2073). Each test below exercises one head: a

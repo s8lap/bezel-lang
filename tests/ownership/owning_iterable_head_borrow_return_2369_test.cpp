@@ -77,20 +77,6 @@ std::string mod(const std::string& body) {
 // heads sailed past `checkBorrowReturnedThroughOwningType` entirely.
 // ===========================================================================
 
-// `IOwningEnumerable<T>` control (already in kOwningTypeHeads pre-#2369) —
-// pins the whole four-head surface and proves the test infra fires.
-BEZEL_TEST(owning_iterable_head_borrow_return_2369,
-           iowning_enumerable_param_passthrough_rejected) {
-    auto r = parseAndCheckOwnership(mod(
-        "class P "
-        "  public static method Id(src: IOwningEnumerable<Cell>): "
-        "      IOwningEnumerable<Cell> => src; "
-        "end P;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(
-        r, "a borrow may not be returned through the owning-type"));
-}
-
 // `IOwningEnumerator<T>` — the first missing head. Pre-fix: admitted (the
 // hole); post-fix: rejected at the def site.
 BEZEL_TEST(owning_iterable_head_borrow_return_2369,

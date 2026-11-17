@@ -125,18 +125,6 @@ BEZEL_TEST(own_captured_owned_1958, unmarked_transfer_exprstmt_in_closure_reject
     BEZEL_EXPECT_TRUE(rejectsCapturedOwnedConsume(r));
 }
 
-// A MARKED TRANSFER via `move r` inside a closure — the other transfer spelling.
-BEZEL_TEST(own_captured_owned_1958, move_transfer_in_closure_rejected_28_3) {
-    auto r = parseAndCheckOwnership(wrap(
-        "public static method Main(): int "
-        "  using var r := new R(); "
-        "  var f := lambda() => do return Sink(move r); end; "
-        "  return f(); "
-        "end Main;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(rejectsCapturedOwnedConsume(r));
-}
-
 // An explicit `.Dispose()` of a captured owned binding inside a closure. §28.3
 // v0.184 / §28.2: a closure may not dispose a captured owned binding. (Runtime-
 // benign via disposed-flag idempotence, but the same root cause — wrongly

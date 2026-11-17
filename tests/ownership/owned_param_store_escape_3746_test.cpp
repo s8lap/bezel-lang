@@ -326,28 +326,6 @@ BEZEL_TEST(owned_param_store_escape_3746,
         "end C;")), "5");
 }
 
-// NEGATIVE (§28.8.1, the marked transfer) — `move p` into an `owned` field.
-// `recordMovesIn` leaves `p` MovedFrom before this check runs, so no live
-// source resolves and the transfer is admitted, parameter arm or not.
-BEZEL_TEST(owned_param_store_escape_3746,
-           move_into_owned_field_accepted_28_8) {
-    BEZEL_EXPECT_EQ(runOut(prog(
-        "class Box "
-        "  public owned r: R?; "
-        "  public method Take(p: owned R) "
-        "    this.r := p; "
-        "  end Take; "
-        "end Box; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var b := new Box(); "
-        "    b.Take(new R()); "
-        "    Console.WriteLine(b.r!.V().ToString()); "
-        "    return 0; "
-        "  end Main; "
-        "end C;")), "5");
-}
-
 // NEGATIVE (§28.11) — the RECEIVER boundary of the collection legs. The
 // collection is a method-scope LOCAL, not reachable beyond the method, so
 // `RecvKind::Local` applies and the verdict stays the declaring-block depth

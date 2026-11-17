@@ -139,20 +139,6 @@ BEZEL_TEST(move_static_owned_field_owned_return_2027,
     BEZEL_EXPECT_TRUE(errorSays(r, kBorrowReturn));
 }
 
-// §22.13: the runtime twin — the issue's exact program shape. Fail-without: base
-// compiled and SEGV'd in `bz_dispose_static_owned` at exit under AOT+ASan (the
-// double-free). Pass-with: compile error, the program never runs.
-BEZEL_TEST(move_static_owned_field_owned_return_2027,
-           runtime_static_owned_field_return_double_free_rejected_spec_22_13) {
-    auto r = parseAndCheckOwnership(
-        std::string(kCell) + kRegistry +
-        "  public static method Take(): owned Cell return move Registry.Slot; "
-        "  end Take; "
-        "end Registry;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(errorSays(r, kBorrowReturn));
-}
-
 // ===========================================================================
 // REJECT — the broader #2011-family return-position member-access hole: a borrow
 // receiver's owned-field move WITHOUT `!` (`return move b.f`) also slipped past

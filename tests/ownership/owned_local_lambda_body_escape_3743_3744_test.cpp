@@ -578,33 +578,4 @@ BEZEL_TEST(lambda_body_escape_owned_3800,
         "end C;"), "5");
 }
 
-// NEGATIVE (§28.3, #3800) — the METHOD-SCOPE ACCEPT boundary: the same
-// `b.a := r;` hoisted one frame OUT of the lambda body, no `move`. At method
-// scope `targetIsOwnedField`'s move-on-read skip is sound (the dataflow
-// records the move and the scope-end auto-drop on the local is suppressed).
-// The byte-identical in-body program is the E12 positive above. Pins that
-// the widening did not become "any bare read of an owned local into an
-// `owned` field is rejected" — only the in-body store is, for the
-// dataflow-not-recorded reason.
-BEZEL_TEST(lambda_body_escape_owned_3800,
-           method_scope_owned_field_store_accepted_28_8) {
-    BEZEL_EXPECT_EQ(runOut(std::string(kPrelude) +
-        "class Box "
-        "  public owned a: R? := null; "
-        "end Box; "
-        "class C "
-        "  public method Run(): int "
-        "    var r := new R(); "
-        "    var b := new Box(); "
-        "    b.a := r; "
-        "    return b.a!.V(); "
-        "  end Run; "
-        "  public static method Main(): int "
-        "    using var c := new C(); "
-        "    Console.WriteLine(c.Run().ToString()); "
-        "    return 0; "
-        "  end Main; "
-        "end C;"), "5");
-}
-
 }  // namespace

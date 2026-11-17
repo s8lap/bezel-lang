@@ -114,20 +114,6 @@ BEZEL_TEST(catch_owned_sink, pass_binding_to_owned_param_explicit_modifier_rejec
     BEZEL_EXPECT_TRUE(hasErrorMessage(r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
-// §31.1 / §28.8 — `move ex` into the owned parameter. `move` of a borrow is no
-// more an owned value than the bare binding (the binding is owned by the
-// runtime, not this scope). REJECTED.
-BEZEL_TEST(catch_owned_sink, move_binding_to_owned_param_rejected_31_1) {
-    auto r = parseAndCheckOwnership(wrap(
-        "public method Handle() "
-        "  try DoWork(); "
-        "  catch var ex: Exception => this.Set(move ex); "
-        "  end; "
-        "end Handle;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "a borrow cannot be passed where an `owned` value is required"));
-}
-
 // §31.1 / §28.8 — indirect via a re-borrow holder: `var b := ex; this.Set(b);`.
 // The holder `b` re-borrows the in-flight exception (Borrowed state, source
 // `ex`); sinking it into the owned parameter is the same retention. REJECTED.

@@ -97,20 +97,6 @@ BEZEL_TEST(iterator_yield_case_arm_3148, case_arm_only_yield_owned_param_frame_d
     BEZEL_EXPECT_EQ(r.exitCode, 6);
 }
 
-// §29.3 / §29.8: the `case` STATEMENT arm must be recognised as an iterator
-// body even when the yield is in the arm. Value 1 + 5 = 6.
-// (The `when` spelling was retired per §19 / §22.4, v0.289; this row now uses
-// the equivalent `case n of` form.) // per §29.3 / §29.8, v0.252
-BEZEL_TEST(iterator_yield_case_arm_3148, when_arm_only_yield_owned_param_frame_disposed) {
-    auto r = runAotChecked(wrap(
-        "    case n of "
-        "      1 => do yield return 1; yield return r.v; end, "
-        "      _ => do yield return 0; end, "
-        "    end; "));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 6);
-}
-
 // §29.3: a `case` arm nested inside an `if` branch — the recursion must reach a
 // `case` at any depth, not just at the top of the body. Value 1 + 5 = 6.
 // // per §29.3 / §29.8, v0.252

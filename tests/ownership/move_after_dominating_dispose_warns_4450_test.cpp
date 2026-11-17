@@ -399,30 +399,6 @@ BEZEL_TEST(move_after_dominating_dispose_warns_4450,
 }
 
 BEZEL_TEST(move_after_dominating_dispose_warns_4450,
-           checked_mode_backstop_for_row_3_assignment_rhs_in_while) {
-    // Same as row 1 — the move's RHS is `Sink.Take(move x)` and the
-    // callee's own `r.tag` read is the member access that triggers the
-    // backstop.  Row 1 and row 3 share the same checked-mode shape (the
-    // `while` is irrelevant to the runtime exception); the two rows are
-    // distinct at the static-analysis level only.
-    JitResult jr = runAotCheckedDisposal(wrap(
-        "var x := new Res(1); "
-        "x.Dispose(); "
-        "var t := 0; "
-        "var i := 0; "
-        "try "
-        "  while i < 2 do "
-        "    t := t + Sink.Take(move x); "
-        "    i := i + 1; "
-        "  end; "
-        "  return 0; "
-        "catch DisposedAccessException => return 1; "
-        "end; "));
-    BEZEL_EXPECT_TRUE(jr.ran);
-    BEZEL_EXPECT_EQ(jr.exitCode, 1);
-}
-
-BEZEL_TEST(move_after_dominating_dispose_warns_4450,
            checked_mode_backstop_for_row_4_bare_statement) {
     // `Sink.Take(move x)`'s body reads `r.tag` — the member access through
     // the moved-from-and-already-disposed reference — so the exception

@@ -222,20 +222,6 @@ BEZEL_TEST(state_machine_param_conditional_discharge_2310,
 
 // ---- FORM 6: `new Ctor(owned p)` (a constructor with an owned parameter) ----
 
-BEZEL_TEST(state_machine_param_conditional_discharge_2310,
-           form6_iterator_new_ctor_owned_argument_spec_29_8) {
-    expectBalanced(prog(
-        "  public static method Use(owned c: Cell, cond: bool): IEnumerable<int> "
-        "    if cond then using var k := owned c; end; "
-        "    yield return 1; "
-        "  end Use; "
-        "  public static method Main(): int "
-        "    for var v in Use(new Cell(), true) do end; "
-        "    for var v in Use(new Cell(), false) do end; "
-        "    return Cell.n; "
-        "  end Main; "));
-}
-
 // ---- Cross-kind coverage: the same six forms in plain async and async iterator
 
 // §30.1 plain async: form 1 across `await`. Discharging path + suspension

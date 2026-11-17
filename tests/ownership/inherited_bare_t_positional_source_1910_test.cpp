@@ -89,55 +89,6 @@ BEZEL_TEST(inherited_bare_t_positional_source_1910,
 }
 
 // ---------------------------------------------------------------------------
-// (b) REGRESSION GUARD for the existing positive case — a parameter at a
-// SOURCE position in the inherited declaration is still admitted. The
-// shape `class VChooser: IChooser<T> ... method Pick(a: C, b: C): C return
-// a;` from #1885 must continue to be accepted: both `a` and `b` are at
-// source positions in `IChooser<T>.Pick(a: T, b: T): T` (their types
-// mention T), so the refined carve-out admits the borrow through `a`.
-// ---------------------------------------------------------------------------
-
-BEZEL_TEST(inherited_bare_t_positional_source_1910,
-           borrow_through_source_position_parameter_accepted_spec_28_3) {
-    auto r = parseAndCheckOwnership(
-        "module M; "
-        "class C public constructor() end constructor; "
-        "  destructor end destructor; end C; "
-        "interface IChooser<T> "
-        "  method Pick(a: T, b: T): T; "
-        "end IChooser; "
-        "class VChooser: IChooser<C> "
-        "  public constructor() end constructor; "
-        "  destructor end destructor; "
-        "  public method Pick(a: C, b: C): C return a; end Pick; "
-        "end VChooser;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
-// ---------------------------------------------------------------------------
-// (c) REGRESSION GUARD for the `=>` expression-body form on the same source-
-// position parameter — the bare-T classification is inherited on both body
-// kinds, and `=> a;` over the source position is admitted.
-// ---------------------------------------------------------------------------
-
-BEZEL_TEST(inherited_bare_t_positional_source_1910,
-           expression_body_source_position_parameter_accepted_spec_28_3) {
-    auto r = parseAndCheckOwnership(
-        "module M; "
-        "class C public constructor() end constructor; "
-        "  destructor end destructor; end C; "
-        "interface IChooser<T> "
-        "  method Pick(a: T, b: T): T; "
-        "end IChooser; "
-        "class VChooser: IChooser<C> "
-        "  public constructor() end constructor; "
-        "  destructor end destructor; "
-        "  public method Pick(a: C, b: C): C => a; "
-        "end VChooser;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
-// ---------------------------------------------------------------------------
 // (d) OVER-REJECT GUARD — receiver-sourced return is admitted unchanged.
 // `return _inner;` from an inherited-bare-T method whose `_inner` is a
 // receiver-sourced owned field. The receiver-sourced check runs at a

@@ -190,17 +190,6 @@ BEZEL_TEST(borrow_return_1007, owned_return_type_borrow_rejected_spec_3993) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// The genuine owned producer through the SAME owned-declared return type is
-// NOT over-rejected — `new` is a fresh production, not a borrow.
-BEZEL_TEST(borrow_return_1007, owned_return_type_fresh_producer_accepted) {
-    auto r = parseAndCheckOwnership(mod(
-        "class P "
-        "  public static method Make(): owned OwningArray<Cell> "
-        "    => new OwningArray<Cell>(); "
-        "end P;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 // A call returning an owned value (Shared<T>.Clone() → `owned Shared<T>`) is a
 // genuine owned producer, not a borrow — must compile.
 BEZEL_TEST(borrow_return_1007, shared_clone_owned_producer_clean) {

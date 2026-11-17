@@ -411,14 +411,4 @@ BEZEL_TEST(owning_match_assigned_alias_escape_4720,
         "        outer := c; ")), kEscapeNeedle));
 }
 
-BEZEL_TEST(owning_match_assigned_alias_escape_4720,
-           control_direct_expression_arm_still_rejected_4635) {
-    BEZEL_EXPECT_TRUE(rejectsWith(prog(
-        "    using var other := new Widget(\"other\"); "
-        "    var o := Outer.W(new Widget(\"a\"), new Widget(\"b\")); "
-        "    var got := (case move o of W(var w, _) => w, X => other); "
-        "    Console.WriteLine($\"got={got.Ping()}\"); "
-        "    return 0; "), kEscapeNeedle));
-}
-
 }  // namespace

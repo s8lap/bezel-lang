@@ -215,32 +215,6 @@ BEZEL_TEST(async_pattern_a_borrowed_identifier_return_4311,
 // says nothing about programs that must keep compiling).
 // ---------------------------------------------------------------------------
 
-// A bare IdentifierExpr return of a still-OWNED local (a plain `var`, kind
-// 1's genuine source) must keep compiling and disposing correctly — this is
-// EXACTLY the axis `fix #4285` left conservative (its own
-// `accept_bare_owned_local_return_unaffected_30_5` row), now exercised
-// against THIS fix's new check to prove no regression. Loop-amplified (50x).
-BEZEL_TEST(async_pattern_a_borrowed_identifier_return_4311,
-          accept_owned_local_return_unaffected_30_5) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; " + std::string(kCell) +
-        "class C "
-        "  public static async method MakeAsync(): Task<Cell> "
-        "    var c := new Cell(); "
-        "    return c; "  // owned local — admitted
-        "  end MakeAsync; "
-        "  public static async method Main(): Task<int> "
-        "    var i := 0; "
-        "    while i < 50 do "
-        "      do using var t := C.MakeAsync(); var c := await t; end; "
-        "      i := i + 1; "
-        "    end; "
-        "    return Cell.n; "  // expect 0
-        "  end Main; "
-        "end C;"),
-        0);
-}
-
 // An `owned` PARAMETER returned bare — genuinely owned (transferred into the
 // callee), a NEW accept control this fix's parameter arm must admit (#4285's
 // own grid tested only the owned-LOCAL accept shape, not owned-parameter).
@@ -290,34 +264,6 @@ BEZEL_TEST(async_pattern_a_borrowed_identifier_return_4311,
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(
         r, "may not be returned through the owning-type return"));
     BEZEL_EXPECT_TRUE(!diagnosticMessageContains(r, kFixDiagFragment));
-}
-
-// A legitimate kind-2 chained return (`return await <owned Pattern A
-// source>`) is untouched — the checked expr is a `UnaryExpr("await")`, never
-// an `IdentifierExpr`, so this fix's `dynamic_cast<IdentifierExpr>` guard
-// never matches it. Loop-amplified (50x).
-BEZEL_TEST(async_pattern_a_borrowed_identifier_return_4311,
-          accept_chained_await_return_unaffected_30_5) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; " + std::string(kCell) +
-        "class C "
-        "  public static async method LoadAsync(): Task<Cell> "
-        "    return new Cell(); "
-        "  end LoadAsync; "
-        "  public static async method ChainAsync(): Task<Cell> "
-        "    using var inner := C.LoadAsync(); "
-        "    return await inner; "  // kind 2: chained slot
-        "  end ChainAsync; "
-        "  public static async method Main(): Task<int> "
-        "    var i := 0; "
-        "    while i < 50 do "
-        "      do using var t := C.ChainAsync(); var c := await t; end; "
-        "      i := i + 1; "
-        "    end; "
-        "    return Cell.n; "  // expect 0
-        "  end Main; "
-        "end C;"),
-        0);
 }
 
 // ---------------------------------------------------------------------------

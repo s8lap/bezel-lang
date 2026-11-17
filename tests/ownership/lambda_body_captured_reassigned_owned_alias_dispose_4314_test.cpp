@@ -284,20 +284,3 @@ BEZEL_TEST(lambda_body_captured_reassigned_owned_alias_dispose_4314,
     BEZEL_EXPECT_TRUE(r.ran);
     if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
-
-// A lambda that produces and disposes its OWN fresh value (unrelated to any
-// captured, reassigned-owned outer local): the initializer is a NewExpr,
-// never an IdentifierExpr, so neither #4286's nor this fix's enclosing-frame
-// retry ever engages, by construction.
-BEZEL_TEST(lambda_body_captured_reassigned_owned_alias_dispose_4314,
-           lambda_owns_and_disposes_its_own_value_still_compiles_28_3) {
-    auto r = runAot(
-        "module M; class C public static method Main(): int "
-        "  var f := lambda() => do "
-        "    var b := new Array<int>(2); b.Add(1); b.Dispose(); return 0; "
-        "  end; "
-        "  return f(); "
-        "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 0);
-}

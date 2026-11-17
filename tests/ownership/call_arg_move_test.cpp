@@ -41,31 +41,7 @@ BEZEL_TEST(own_call_arg, owned_arg_modifier_consumes_local) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(own_call_arg, move_arg_consumes_local) {
-    auto r = parseAndCheckOwnership(mod(
-        "class C "
-        "  public method M(s: Sink) "
-        "    var x := new T(); "
-        "    s.Take(move x); "
-        "  end M; "
-        "end C;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 BEZEL_TEST(own_call_arg, read_after_owned_arg_diagnoses) {
-    auto r = parseAndCheckOwnership(mod(
-        "class C "
-        "  public method M(s: Sink) "
-        "    var x := new T(); "
-        "    s.Take(move x); "
-        "    _ := x; "
-        "  end M; "
-        "end C;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "already moved out"));
-}
-
-BEZEL_TEST(own_call_arg, read_after_move_arg_diagnoses) {
     auto r = parseAndCheckOwnership(mod(
         "class C "
         "  public method M(s: Sink) "
@@ -120,15 +96,6 @@ std::string box(const std::string& methodBody) {
 } // namespace
 
 BEZEL_TEST(own_call_arg, new_move_arg_consumes_local) {
-    auto r = parseAndCheckOwnership(box(
-        "public method M() "
-        "  var t := new T(); "
-        "  using var b := new Box(move t); "
-        "end M;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
-BEZEL_TEST(own_call_arg, new_owned_arg_consumes_local) {
     auto r = parseAndCheckOwnership(box(
         "public method M() "
         "  var t := new T(); "

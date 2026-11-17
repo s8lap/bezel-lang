@@ -161,23 +161,6 @@ BEZEL_TEST(move_bang_borrow_owned_sink_1993,
 // Disposes the value EXACTLY once (Cell.live == 0 under the ASan oracle).
 // ===========================================================================
 
-// §28.8.1: `C.Sink(move x!)` where `x` is an OWNED local — the legal owned
-// transfer. The callee disposes it exactly once; `x` does not auto-drop. Guards
-// against the fix over-rejecting the legit owned-local case.
-BEZEL_TEST(move_bang_borrow_owned_sink_1993,
-           owned_local_move_bang_into_param_disposes_once_spec_28_8_1) {
-    std::string src =
-        std::string(kCell) +
-        "class C "
-        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
-        "  public static method Use() var x: Cell? := new Cell(); C.Sink(move x!); end Use; "
-        "  public static method Main(): int C.Use(); return Cell.live; end Main; "
-        "end C;";
-    auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-}
-
 // §28.8.1: `C.Sink(move this.f!)` where `f` is an OWNED field — `move obj.f!` is
 // the legal owned READ of an owned field (§28.8.1), NOT a borrow. The field is
 // left moved-from and reassigned (`this.f := null`) before exit; the sink

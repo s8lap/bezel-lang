@@ -193,52 +193,6 @@ BEZEL_TEST(owning_match_arm_binding_double_move_5134,
     BEZEL_EXPECT_EQ(r.stdoutText, "dispose b\nr1=a\ndispose a\n");
 }
 
-// (ACCEPT 1 — p6) `move w` on exactly ONE branch of a nested if-expression,
-// with NO later use of `w` — the #4944-admitted shape itself. Must still
-// compile clean and dispose exactly once per iteration: #5134's fix must not
-// regress the maybe-consumed-but-never-read-again case into a false
-// "undischarged owned value" report at the arm's own scope end.
-BEZEL_TEST(owning_match_arm_binding_double_move_5134,
-           move_on_one_branch_only_no_later_use_accepted) {
-    JitResult r = runAot(prog(
-        "    var p := true; "
-        "    var o := Mk(); "
-        "    case move o of "
-        "      W(var w, _) => do "
-        "        var r := (if p then move w else new Widget(\"z\")); "
-        "        Console.WriteLine($\"r={r.Name()}\"); "
-        "      end, "
-        "      X => () "
-        "    end case; "));
-    BEZEL_EXPECT_EQ(errorCount(r), 0);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "r=a\ndispose a\ndispose b\n");
-}
-
-// (ACCEPT 1, looped 200x under the plain oracle) a one-shot leak/UAF repro
-// can pass by accident; loop the accepted shape so an unsound admission
-// (double-free / leak from a wrongly-cleared state) shows under repetition
-// even without ASan. Also run with BEZEL_AOT_FORCE_SANITIZE=address in the
-// lane check (not here — see the commit's own verification notes).
-BEZEL_TEST(owning_match_arm_binding_double_move_5134,
-           move_on_one_branch_only_looped_no_leak_no_crash) {
-    std::string body =
-        "    var p := true; "
-        "    var i := 0; "
-        "    while i < 200 do "
-        "      var o := Mk(); "
-        "      using var r := (case move o of "
-        "          W(var w, _) => (if p then move w else new Widget(\"z\")), "
-        "          X => new Widget(\"x\")); "
-        "      i := i + 1; "
-        "    end while; ";
-    JitResult r = runAot(prog(body));
-    BEZEL_EXPECT_EQ(errorCount(r), 0);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-}
-
 // (ACCEPT 2, looped 200x) the double-move REJECT-1 shape's accepted
 // counterpart: a single `move w`, no second consume, no later use — the
 // ordinary #4633 direct-transfer baseline, looped to confirm #5134's

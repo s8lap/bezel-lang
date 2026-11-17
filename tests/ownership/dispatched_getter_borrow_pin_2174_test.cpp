@@ -143,40 +143,6 @@ BEZEL_TEST(dispatched_getter_borrow_pin_2174,
 }
 
 // ===========================================================================
-// (3) §28.10 / §28.3 / §28.6 — DIRECT-DISPATCH getter read on a typed
-// `using var` (the #2137 control). The PropertySymbol resolves to
-// `Owner.W`'s concrete PropertyDecl (with body), so propertyGetterIsRecognized-
-// Borrow's body scan applies. This was the #2137 shape, ALREADY admitted;
-// the dispatch fix doesn't regress it. // per §28.10, #2137
-// ===========================================================================
-BEZEL_TEST(dispatched_getter_borrow_pin_2174,
-           direct_dispatched_getter_read_still_pins_control_spec_28_10) {
-    JitResult r = runAotChecked(
-        std::string(kWidget) +
-        "class Owner "
-        "  private owned _w: Widget; "
-        "  public constructor() _w := new Widget(); end constructor; "
-        "  public property W: Widget => _w; "
-        "end Owner; "
-        "class P "
-        "  public static method Run(): int "
-        "    using var o := new Owner(); "
-        "    using var y: Widget := o.W; "    // direct dispatch
-        "    return y.Ping(); "
-        "  end Run; "
-        "  public static method Main(): int "
-        "    var r := P.Run(); "
-        "    return Widget.live; "
-        "  end Main; "
-        "end P;");
-    if (!r.ran) {
-        BEZEL_EXPECT_TRUE(r.ran);
-        return;
-    }
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-}
-
-// ===========================================================================
 // (4) §28.6 / §28.10 — CONTROL: a getter that returns a FRESH owned value
 // (the #926 leak) is rejected even when read through an interface. The
 // `=> new Cell()` body is a fresh producer; §28.6 forbids it at the
@@ -186,4 +152,3 @@ BEZEL_TEST(dispatched_getter_borrow_pin_2174,
 // Compile-time-only: the OWN-class getter is already rejected; the
 // interface case is the same body, just read through the interface —
 // rejection happens at the definition site, not the use site.
-

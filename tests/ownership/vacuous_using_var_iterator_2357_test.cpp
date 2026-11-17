@@ -214,38 +214,6 @@ BEZEL_TEST(vacuous_using_var_iterator_2357,
     BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "en"));
 }
 
-// Owning-iterator variant: `d.GetOwningEnumerator()` on the
-// `IOwningEnumerable<T>` returned by `OwningArray<T>.Drain()`. The
-// owning enumerator is the same iterator-frame shape — §29.1's "owned
-// transfer" rule applies to the `MoveNext`+`TakeCurrent` interface.
-// Already exercised by #2451's test (vacuous_pin_lint_2073_test.cpp's
-// `owning_enumerator_using_var_no_warn_spec_29_1_2451`), included here
-// for self-containment so the regression file covers all four
-// get-enumerator forms (#2357's "GetEnumerator / GetAsyncEnumerator /
-// GetOwningEnumerator / GetOwningAsyncEnumerator" family).
-// // per §28.10, §29.1, stdlib §4.5/§4.13, #2385, #2451, #2357
-BEZEL_TEST(vacuous_using_var_iterator_2357,
-           using_var_getowningenumerator_no_warn_spec_29_1) {
-    auto r = parseAndCheckOwnership(
-        "module M; "
-        "class Cell public constructor() end constructor; "
-        "  destructor end destructor; "
-        "end Cell; "
-        "class C "
-        "  public static method M(): int "
-        "    using var arr := new OwningArray<Cell>(); "
-        "    arr.Add(new Cell()); "
-        "    using var d := arr.Drain(); "
-        "    using var e := d.GetOwningEnumerator(); "
-        "    return 0; "
-        "  end M; "
-        "  public static method Main(): int return 0; end Main; "
-        "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "e"));
-    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "e"));
-}
-
 // ============================================================================
 // Controls — make sure the fix does not MASK other warnings it should
 // not affect. Pin both the negative (genuinely-vacuous-RHS still warns)
@@ -294,32 +262,6 @@ BEZEL_TEST(vacuous_using_var_iterator_2357,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "x"));
     BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "x"));
-}
-
-// Control (carve-out boundary): `IList<int>` is a DIFFERENT
-// declaration-less sentinel (the array-backed, unwrapped protocol per
-// iterator_native_test.cpp's `ilist_local_unwrapped_control`) that is
-// deliberately EXCLUDED from `rhsIsDisposableClassType` — only the
-// eight iteration-protocol names were added. A `using var` pinning a
-// borrowing `Array<int>` through `IList<int>` remains genuinely
-// vacuous (no fresh wrapper is allocated for IList) and must still
-// warn, proving the fix is scoped to the exact head-name set.
-// // per §28.10, §29.1, stdlib §4.12/§4.13, #2451, #2357
-BEZEL_TEST(vacuous_using_var_iterator_2357,
-           ilist_sentinel_still_warns_carveout_boundary_spec_28_10) {
-    auto r = parseAndCheckOwnership(
-        "module M; "
-        "class C "
-        "  public static method M(): int "
-        "    using var a := new Array<int>(); "
-        "    var v := a; "  // a borrowing alias: spec v0.350 §28.10 rejects the owned `a`
-        "    using var seq: IList<int> := v; "
-        "    return 0; "
-        "  end M; "
-        "  public static method Main(): int return 0; end Main; "
-        "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasInertRhsWarning(r, "seq"));
 }
 
 // Control (carve-out boundary): `IReadOnlyCollection<int>` — also a

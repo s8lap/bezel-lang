@@ -535,24 +535,6 @@ BEZEL_TEST(own_escape, return_reference_field_on_plain_var_diagnosed) {
         r, "§28.3 borrow-lifetime rule"));
 }
 
-// §28.3 (#1960): this row was written as a POSITIVE control against
-// over-rejection, asserting that a bare-identifier return of a plain `var`
-// owned local is a move-out. `fe95b173` reversed that, and the spec is on the
-// fix's side — see return_bare_local_rejected_row4_28_3 above for the two
-// citations. The row is KEPT rather than deleted because its axis is still
-// worth pinning: it is the same repro as that row, so if a future change ever
-// re-admits the shape, both fail together and the disagreement is visible.
-BEZEL_TEST(own_escape, return_bare_plain_var_rejected_row4_1960) {
-    auto r = parseAndCheckOwnership(wrap(
-        "public method Take(): Connection "
-        "  var c := new Connection(); "
-        "  return c; "
-        "end Take;"));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
-        r, "may return only a receiver-sourced borrow"));
-}
-
 // ===========================================================================
 // §9.7 / §4.14 / §4.15 (issue #1959): returning a builtin span VIEW
 // (Span / ReadOnlySpan / ArraySpan / ReadOnlyArraySpan) that views a scope-

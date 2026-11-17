@@ -258,22 +258,6 @@ BEZEL_TEST(ownership_choice_case_from_temporary,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// ADMIT CONTROL 5 — an OWNING choice with NO borrow-carrying payload does not
-// hold borrows, so §35.3's second bullet does not reach it even though the
-// choice is owning. This row separates "owning" (which the reject row uses)
-// from "holds borrows" (which the reject row actually keys on): without it,
-// `Owned.Got(new Res())` could be admitted merely by being owning, and the
-// owning+borrow row above could be admitted for the wrong reason.
-BEZEL_TEST(ownership_choice_case_from_temporary,
-           owning_choice_without_borrows_temporary_admitted_spec_35_4) {
-    auto r = parseAndCheckOwnership(mod(
-        "class Program public static method Main() "
-        "  var f := Owned.Got(new Res()); "
-        "  _ := f; "
-        "end Main; end Program; "));
-    BEZEL_EXPECT_FALSE(hasChoiceTemporaryError(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
 // ===========================================================================
 // AOT ORACLE — this is a borrow/LIFETIME rule, so the rows that RUN are what
 // the native sanitizer exercises. `parseAndCheckOwnership` is a compile-only

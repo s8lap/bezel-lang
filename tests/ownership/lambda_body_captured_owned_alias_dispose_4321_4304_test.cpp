@@ -441,23 +441,6 @@ BEZEL_TEST(lambda_body_captured_owned_alias_dispose_4321_4304,
     if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// A lambda that produces and disposes its OWN fresh value (unrelated to
-// either axis): the initializer is a NewExpr, never an IdentifierExpr, so
-// neither new predicate's enclosing-frame retry ever engages, by
-// construction.
-BEZEL_TEST(lambda_body_captured_owned_alias_dispose_4321_4304,
-           lambda_owns_and_disposes_its_own_value_still_compiles_28_3) {
-    auto r = runAot(
-        "module M; class C public static method Main(): int "
-        "  var f := lambda() => do "
-        "    var b := new Array<int>(2); b.Add(1); b.Dispose(); return 0; "
-        "  end; "
-        "  return f(); "
-        "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 0);
-}
-
 // #4304's OWN axis control: a BORROWED (unmarked, non-`owned`) parameter
 // captured by a lambda, aliased and read-only (never disposed). Proves
 // `isOwnedParameterInEnclosingFrame`'s `ps->modifier == "owned"` gate

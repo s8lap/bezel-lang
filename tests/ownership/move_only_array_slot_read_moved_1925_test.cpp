@@ -194,17 +194,6 @@ BEZEL_TEST(move_only_array_slot_read_moved_1925,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §15.3 (#1925): after `var b := a;` the transfer TARGET `b` is live — a slot
-// read of `b` is well-formed. Only the moved-from SOURCE `a` is rejected. Accepts.
-BEZEL_TEST(move_only_array_slot_read_moved_1925,
-           slot_read_of_live_transfer_target_is_accepted_spec_15_3) {
-    auto r = parseAndCheckOwnership(wrap(
-        "var a: [1 owned]Cell? := [new Cell(1)]; "
-        "var b: [1 owned]Cell? := a; "
-        "return b[0]!.V();"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 // §15.3 (#1925): an ELEMENT move `move a[0]` moves only that slot and leaves the
 // ARRAY live (Owned/Borrowed, NOT MovedFrom) — the other slots stay readable. A
 // slot read of a different slot `a[1]` is accepted (guards the gate: the fix

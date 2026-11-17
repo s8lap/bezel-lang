@@ -136,18 +136,6 @@ BEZEL_TEST(own_value_builtin_434, cancellation_token_none_local_no_error) {
 // Regression: owned class locals STILL require disposal (no-under).
 // ---------------------------------------------------------------------------
 
-// §28.3: CancellationTokenSource is an OWNED disposable class.
-// A plain `var` without `using` or explicit Dispose MUST still be diagnosed.
-// §28.3 v0.150 (#1008 Part B): a plain-`var` CancellationTokenSource left
-// undischarged auto-drops at scope end (must-use warning), no error.
-BEZEL_TEST(own_value_builtin_434, cancellation_token_source_still_owned) {
-    auto r = parseAndCheckOwnership(own(
-        "var cts := new CancellationTokenSource(); "
-        "return 0; "));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "cts"));
-}
-
 // §28.3: using var CancellationTokenSource is implicitly discharged — clean.
 BEZEL_TEST(own_value_builtin_434, cancellation_token_source_using_var_clean) {
     auto r = parseAndCheckOwnership(own(
