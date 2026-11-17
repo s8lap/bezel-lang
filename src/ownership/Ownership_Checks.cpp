@@ -4998,7 +4998,13 @@ bool MethodOwnership::isBorrowableOwnedSinkType(const sema::TypeRef* rt) {
 // aliases into its identifier root. A *value-typed* return (the spec's
 // "value-typed returns") is a copy and can never outlive its source, so
 // it is never a borrow escape and is reported here as may-borrow = false.
-bool MethodOwnership::isCompletionSourceTaskRead(const ast::Expr& e) const {
+bool MethodOwnership::isCompletionSourceTaskRead(const ast::Expr& e0) const {
+    // fix #8671 (§30.11, §28.3, v0.357): look through the postfix `!` (and
+    // `!!`), which is a view of the same borrow, as the user-class `h.It!`.
+    const ast::Expr* top = &e0;
+    while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(top))
+        top = pb->operand.get();
+    const ast::Expr& e = *top;
     const ast::Expr* target = nullptr;
     std::string_view member;
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
