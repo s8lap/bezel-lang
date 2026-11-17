@@ -7410,8 +7410,9 @@ llvm::Value* Emitter::emitTypeParamPatternTest(const sema::TypeRef* ct,
 void Emitter::emitThrowBuiltin(const char* name) {
     auto vit = builtinVtable_.find(name);
     if (vit == builtinVtable_.end()) return;
-    // §31.4: kExcObjSize object; slot0=vtable, message/causechain/paramname
-    // slots left null by calloc (a guard-thrown exception carries none).
+    // §31.4: kExcObjSize object; slot0=vtable, message/causechain/paramname/
+    // supersededchain slots left null by calloc (a guard-thrown exception
+    // carries none).
     llvm::Value* obj = builder_.CreateCall(
         callocFn(), {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});
     builder_.CreateStore(vit->second, obj);
@@ -12307,7 +12308,7 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
     // exception.  By pre-seeding propagateBB_ we intercept every uncaught-
     // exception exit and:
     //   1. Load bz_exc (the original exception that escaped the ctor).
-    //   2. Allocate a TypeInitializationException (kExcObjSize / 40 bytes —
+    //   2. Allocate a TypeInitializationException (kExcObjSize / 48 bytes —
     //      the uniform built-in exception block, §31.4; #1033 requires the
     //      full size so the disposer's ParamName@32 read stays in bounds):
     //        [offset  0] vtable ptr    — identifies the type at runtime
@@ -13218,7 +13219,7 @@ void Emitter::emitEnsureInitFns() {
         // rethrown; the triggering access and every subsequent access see the same
         // cached TypeInitializationException instance"). #5872: the cached TIE is
         // the block built by emitStaticConstructorBody's self-wrap, already a
-        // uniform kExcObjSize (40) allocation carrying the TIE vtable and its
+        // uniform kExcObjSize (48) allocation carrying the TIE vtable and its
         // inner at offset 16, and marked runtime-owned above so no handler
         // reclaims it — so it is safe to raise the same pointer on every later
         // access.

@@ -1707,10 +1707,11 @@ llvm::Function* Emitter::emitImportedIndexerGetterInheritedWrapper(
     // Determine the offset of the FIRST instance-storage field under the
     // substitution. For our case (`class GBase<T> { _v: T }`) the offset
     // is `disposedFlagIndex + 1` = 2 (after vtable ptr and disposed flag).
-    // For an exception-derived class the offset is `5 + 1` = 6 (the extra
-    // 4 slots are the built-in exception base: Message, Inner, CauseChain,
-    // ParamName). We use `instanceStorageTypes` under the substitution
-    // and the struct's `disposedFlagIndex` to derive the exact slot index.
+    // For an exception-derived class the offset is `6 + 1` = 7 (the extra
+    // 5 slots are the built-in exception base: Message, Inner, CauseChain,
+    // ParamName, SupersededChain). We use `instanceStorageTypes` under the
+    // substitution and the struct's `disposedFlagIndex` to derive the exact
+    // slot index.
     auto savedSubst = genericSubst_;
     auto savedSemaTy = genericSubstSemaTy_;
     genericSubst_ = subst;

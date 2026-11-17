@@ -3375,6 +3375,23 @@ void Emitter::emitPendingCheck(std::size_t unwindDisposeHi) {
 // handling's hold is released and nothing is disposed
 // (bz_exc_leave_handling).
 void Emitter::emitEndExcHandling(llvm::Value* exc, llvm::Value* leaving) {
+    // fix #3261 (§31.2 / §31.4, v0.357): RECORD BEFORE DROP. Every caller
+    // that passes `leaving` is a supersession point — the leave block of a
+    // catch arm, a `when` guard or an exception-entered `finally`
+    // (emitExcLeaveBlock), the §28.4 destructor-body supersede, the multi-value
+    // cleanup pass and the `await using` unwind fault edge — so `leaving`
+    // supersedes `exc` here, and §31.2 requires the runtime to append `exc`'s
+    // snapshot to the SUPERSEDING exception's `SupersededChain` "before the
+    // superseded exception is disposed (or, for the two owner-owned instances
+    // above, before it is dropped from the in-flight slot)" — i.e. before the
+    // verdict below, on every branch of it. The runtime records nothing for a
+    // null `leaving` and for `leaving == exc` (a bare `throw;`, or the same
+    // bound task awaited again: "Self-supersession records nothing").
+    if (leaving)
+        builder_.CreateCall(
+            declareC("bz_exc_superseded_append", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy(), ptrTy()}),
+            {leaving, exc});
     llvm::Value* verdict =
         leaving ? builder_.CreateCall(
                       declareC("bz_exc_leave_handling",

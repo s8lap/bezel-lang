@@ -1944,6 +1944,52 @@ void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
         }
     }
 
+    // fix #3261 (§17.7 / §31.4, v0.357): the built-in exception types'
+    // CONSTRUCTOR SURFACE is closed — §17.7: "the constructor surface is
+    // exactly what that document declares — `new T(...)` resolves only against
+    // a declared constructor, never against a compiler-supplied fallback."
+    // §31.4 declares, for every built-in exception type, only the ONE- and
+    // TWO-argument forms — `(message: string)` and either `(message: string,
+    // cause: Exception)` (the form of a type that declares no constructor of
+    // its own) or `(message: string, paramName: string)`
+    // (`ArgumentException`, `ArgumentOutOfRangeException`), with
+    // `TimeoutException` spelling the second `inner: Exception` — and
+    // `Exception` itself adds the parameterless form. NO built-in exception
+    // type declares a constructor of THREE or more parameters.
+    //
+    // WHY THIS LANE FIXES IT (and it is this lane's, not a drive-by). §31.4
+    // says of the member this lane implements: "No constructor populates or
+    // accepts `SupersededChain`". Before #3261 the surface was UNCHECKED, so
+    // `new Exception("m", cause, cause.SupersededChain)` — the very spelling
+    // that clause forbids — was ADMITTED, and so was every other
+    // three-argument built-in exception construction. The rule corpus case
+    // `s31_4_0007` ("no Exception constructor accepts a SupersededChain
+    // argument", banked `pass`) was rejected on the base only because
+    // `cause.SupersededChain` was ITSELF an error ("no member
+    // `SupersededChain`"); #3261 makes that member exist, and without this
+    // arm the case COMPILES — a §31.4 violation and a corpus REGRESSION.
+    //
+    // The arm rejects three or more arguments only. The one- and
+    // two-argument forms are untouched: the parameterless form is declared for
+    // `Exception` itself, and whether every derived built-in declares it is a
+    // separate question this lane does not answer.
+    if (common::isBuiltinExceptionName(n) && ne.args.size() >= 3) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            "`new " + n + "(...)` with " + std::to_string(ne.args.size()) +
+            " arguments matches no constructor the standard library declares "
+            "for `" + n + "`: no built-in exception type declares a "
+            "constructor of three or more parameters \xE2\x80\x94 \xC2\xA7"
+            "31.4 declares only the one- and two-argument forms "
+            "(`(message: string)` and either `(message: string, cause: "
+            "Exception)` or `(message: string, paramName: string)`), and "
+            "`Exception` itself adds the parameterless one (\xC2\xA7""17.7 "
+            "closed constructor surface)");
+        // fix #3425: the arity is already wrong, so binding names against a
+        // declared list would only cascade. One diagnostic per `new`.
+        return;
+    }
+
     // fix #7502 (spec §22.5 "Every parameter that declares no default must be
     // bound" and §17.7, v0.350; stdlib §2.5): the §2.5 date/time constructors
     // are DECLARED with exact arities — `DateOnly(year, month, day)`,
@@ -4739,6 +4785,13 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                               /*nullable=*/true));
                     break;
                 case BuiltinExcMember::CauseChain:
+                    ctx_.setExprType(&e, excCauseChainTypeRef());
+                    break;
+                case BuiltinExcMember::SupersededChain:
+                    // fix #3261 (§31.4, v0.357): `SupersededChain:
+                    // Array<ExceptionInfo>` — the same synthetic TypeRef
+                    // CauseChain gets, so `.Count` and `chain[i].Message`
+                    // resolve identically either way.
                     ctx_.setExprType(&e, excCauseChainTypeRef());
                     break;
                 default:

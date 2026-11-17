@@ -2676,16 +2676,17 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
         std::vector<llvm::Type*> specFieldTys;
         specFieldTys.push_back(ptrTy());            // [0] vtable pointer
         // #595 / §31.4: a class that directly inherits a built-in exception
-        // mirrors the FULL 40-byte built-in header (Message@8, Inner@16,
-        // CauseChain@24, ParamName@32) — see classStruct. The disposed flag
-        // moves to [5] in that case.
+        // mirrors the FULL 48-byte built-in header (Message@8, Inner@16,
+        // CauseChain@24, ParamName@32, SupersededChain@40) — see classStruct.
+        // The disposed flag moves to [6] in that case.
         if (hasBuiltinExceptionBase(t)) {
             specFieldTys.push_back(ptrTy());        // [1] inherited Message
             specFieldTys.push_back(ptrTy());        // [2] InnerException
             specFieldTys.push_back(ptrTy());        // [3] CauseChain
             specFieldTys.push_back(ptrTy());        // [4] ParamName
+            specFieldTys.push_back(ptrTy());        // [5] SupersededChain
         }
-        specFieldTys.push_back(disposedFlagTy());   // [1 or 5] disposed run-once flag
+        specFieldTys.push_back(disposedFlagTy());   // [1 or 6] disposed run-once flag
         // fix #2897 (§14.1 / §12 / §22.8, v0.240): resolve each slot under the
         // substitution of the class that DECLARES it. The flat name-keyed map
         // cannot hold two bindings of one spelling at once, so a base that reuses
@@ -2829,20 +2830,27 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
     // exception object layout so the base-Exception member reads/writes hit the
     // same byte offsets regardless of whether `e` is typed as the user class or
     // as the built-in base. Built-in exceptions are a uniform kExcObjSize
-    // (40-byte) block: [0]=vtable, [8]=Message, [16]=InnerException(TIE),
-    // [24]=CauseChain, [32]=ParamName. Mirror all four data slots BEFORE the
-    // disposed flag, giving: [vtable(0), message(1), inner(2), causechain(3),
-    // paramname(4), disposed(5), own_fields…]. disposedFlagIndex() returns 5
+    // (48-byte) block: [0]=vtable, [8]=Message, [16]=InnerException(TIE),
+    // [24]=CauseChain, [32]=ParamName, [40]=SupersededChain. Mirror all five
+    // data slots BEFORE the disposed flag, giving:
+    // [vtable(0), message(1), inner(2), causechain(3), paramname(4),
+    //  superseded(5), disposed(6), own_fields…]. disposedFlagIndex() returns 6
     // for such classes so the disposer and disposal checks GEP the right slot.
     // (Before v0.163 only the message slot was mirrored; `base(msg, cause)`
     // then wrote CauseChain@24 into the disposed flag / past the block, and
     // `e.CauseChain` on a user instance read out of bounds — the exception-
     // surface merge-gate heap-overflow finding.)
+    //
+    // fix #3261 (§31.2 / §31.4, v0.357): the SupersededChain slot is mirrored
+    // too, at the same byte offset (40) the built-in block uses, so a supersession
+    // record written through a built-in-typed receiver is readable through a
+    // user-typed one and vice versa. The disposed flag moves from [5] to [6].
     if (hasBuiltinExceptionBase(t)) {
         fieldTys.push_back(ptrTy());          // [1] inherited Message @8
         fieldTys.push_back(ptrTy());          // [2] InnerException @16 (unused)
         fieldTys.push_back(ptrTy());          // [3] CauseChain @24
         fieldTys.push_back(ptrTy());          // [4] ParamName @32
+        fieldTys.push_back(ptrTy());          // [5] SupersededChain @40
     }
     // §28.2 / §28.6: the per-object i8 "disposed" run-once flag.  It sits at a
     // fixed index in every class (1 normally, 2 for builtin-exception-derived
@@ -2872,14 +2880,17 @@ llvm::Type* Emitter::disposedFlagTy() { return llvm::Type::getInt8Ty(llvm_); }
 // shared generated Dispose accesses it correctly.
 //
 // For user classes that directly inherit a built-in exception type (§12 /
-// §31.4): slot 5 — slots 1..4 are occupied by the inherited Message /
-// InnerException / CauseChain / ParamName pointers that mirror the built-in
-// exception's uniform 40-byte layout (byte offsets 8/16/24/32). Keeping the
-// full header ensures every base-Exception member read/write hits the same
-// byte offset whether the object is typed as the user class or as the
-// built-in Exception base type.
+// §31.4): slot 6 — slots 1..5 are occupied by the inherited Message /
+// InnerException / CauseChain / ParamName / SupersededChain pointers that
+// mirror the built-in exception's uniform 48-byte layout (byte offsets
+// 8/16/24/32/40). Keeping the full header ensures every base-Exception member
+// read/write hits the same byte offset whether the object is typed as the user
+// class or as the built-in Exception base type.
+//
+// fix #3261 (§31.2 / §31.4, v0.357): the SupersededChain slot was added, so
+// the flag moves from slot 5 to slot 6.
 unsigned Emitter::disposedFlagIndex(const sema::TypeSymbol* t) {
-    if (t && hasBuiltinExceptionBase(t)) return 5u;
+    if (t && hasBuiltinExceptionBase(t)) return 6u;
     return 1u;
 }
 

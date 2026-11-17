@@ -7256,7 +7256,8 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             auto vit = builtinVtable_.find(n);
             if (vit != builtinVtable_.end()) {
                 // §31.4: kExcObjSize block — vtable@0, Message@8, CauseChain@24,
-                // ParamName@32 (calloc zeroes the unused slots).
+                // ParamName@32, SupersededChain@40 (calloc zeroes the unused
+                // slots).
                 llvm::Value* obj = builder_.CreateCall(
                     callocFn(),
                     {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});

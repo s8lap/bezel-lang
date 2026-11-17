@@ -39559,6 +39559,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         case BuiltinExcMember::CauseChain:
                             ctx_.setExprType(&ma, excCauseChainTypeRef());
                             return;
+                        case BuiltinExcMember::SupersededChain:
+                            // fix #3261 (§31.4, v0.357): `SupersededChain:
+                            // Array<ExceptionInfo>` — the same type
+                            // CauseChain gets.
+                            ctx_.setExprType(&ma, excCauseChainTypeRef());
+                            return;
                         case BuiltinExcMember::None:
                             break;
                     }
@@ -40782,6 +40788,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                 case BuiltinExcMember::CauseChain:
                                     ctx_.setExprType(&ma, excCauseChainTypeRef());
                                     return;
+                                case BuiltinExcMember::SupersededChain:
+                                    // fix #3261 (§31.4, v0.357): the class
+                                    // bound supplies the whole §31.4 surface,
+                                    // SupersededChain included.
+                                    ctx_.setExprType(&ma, excCauseChainTypeRef());
+                                    return;
                                 case BuiltinExcMember::None:
                                     break;
                             }
@@ -41260,6 +41272,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
             if (ma.member == "CauseChain" && isExcType(rtt)) {
+                ctx_.setExprType(&ma, excCauseChainTypeRef());
+                return;
+            }
+            // fix #3261 (§31.4, v0.357): `SupersededChain: Array<ExceptionInfo>`
+            // on a built-in exception receiver — the same type CauseChain gets.
+            if (ma.member == "SupersededChain" && isExcType(rtt)) {
                 ctx_.setExprType(&ma, excCauseChainTypeRef());
                 return;
             }
@@ -45265,12 +45283,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                                rn == "ArgumentNullException" ||
                                                rn == "ArgumentOutOfRangeException"
                                            ? "Message, StackTrace, CauseChain, "
-                                             "ParamName"
+                                             "SupersededChain, ParamName"
                                            : (rn == "DomainFaultedException"
                                                   ? "Message, StackTrace, "
-                                                    "CauseChain, FaultStackTrace"
+                                                    "CauseChain, "
+                                                    "SupersededChain, "
+                                                    "FaultStackTrace"
                                                   : "Message, StackTrace, "
-                                                    "CauseChain"));
+                                                    "CauseChain, "
+                                                    "SupersededChain"));
                             ctx_.diagnostics().report(
                                 Severity::Error, loc,
                                 std::string("no member `") +
@@ -47179,6 +47200,13 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     isBuiltinExInheritedMember = true;
                     ctx_.setExprType(&ma, excCauseChainTypeRef());
                     break;
+                case BuiltinExcMember::SupersededChain:
+                    // fix #3261 (§31.4, v0.357): `readonly property
+                    // SupersededChain: Array<ExceptionInfo>` ("empty when
+                    // nothing superseded") — the same synthetic TypeRef.
+                    isBuiltinExInheritedMember = true;
+                    ctx_.setExprType(&ma, excCauseChainTypeRef());
+                    break;
                 case BuiltinExcMember::None:
                     break;
             }
@@ -48077,6 +48105,15 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             case BuiltinExcMember::CauseChain:
                 // §31.4 `CauseChain: Array<ExceptionInfo>`.
                 // Nullable per §7.5 (`?.`).
+                {
+                    TypeRef* arr = excCauseChainTypeRef();
+                    arr->nullable = true;
+                    ctx_.setExprType(&nm, arr);
+                }
+                return;
+            case BuiltinExcMember::SupersededChain:
+                // fix #3261 (§31.4, v0.357): `SupersededChain:
+                // Array<ExceptionInfo>`. Nullable per §7.5 (`?.`).
                 {
                     TypeRef* arr = excCauseChainTypeRef();
                     arr->nullable = true;

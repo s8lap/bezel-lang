@@ -5797,7 +5797,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // null-pointer-as-null representation FINDING [3] uses for a
         // reference-typed storage member.
         if (nm->member == "Message" || nm->member == "StackTrace" ||
-            nm->member == "CauseChain" || nm->member == "ParamName" ||
+            nm->member == "CauseChain" || nm->member == "SupersededChain" ||
+            nm->member == "ParamName" ||
             nm->member == "FaultStackTrace") {
             const sema::TypeRef* ncRtt = ctx_.exprType(*nm->target);
             bool ncExcReceiver = false;
@@ -5839,6 +5840,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 } else {
                     int64_t ncOff = nm->member == "Message"    ? kExcMsgOffset
                                   : nm->member == "CauseChain" ? kExcCauseOffset
+                                  : nm->member == "SupersededChain"
+                                        ? kExcSupersededOffset
                                   : /*ParamName*/              kExcParamOffset;
                     llvm::Value* ncSlot = builder_.CreateGEP(
                         i8Ty, excObj, builder_.getInt64(ncOff));
@@ -9910,7 +9913,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (ma->target && emittingGenericTemplateBody_ &&
             ctx_.exprSymbol(*ma) == nullptr &&
             (ma->member == "Message" || ma->member == "StackTrace" ||
-             ma->member == "ParamName" || ma->member == "CauseChain") &&
+             ma->member == "ParamName" || ma->member == "CauseChain" ||
+             ma->member == "SupersededChain") &&
             isBareTypeParamRef(
                 resolveTypeParamRef(ctx_.exprType(*ma->target)))) {
             if (ma->member == "Message" || ma->member == "StackTrace")
@@ -10105,6 +10109,21 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 llvm::Value* ccSlot = builder_.CreateGEP(
                     i8Ty, excObj, builder_.getInt64(kExcCauseOffset));
                 return builder_.CreateLoad(ptrTy(), ccSlot, "exc.causechain");
+            }
+            // fix #3261 (§31.2 / §31.4, v0.357): `SupersededChain:
+            // Array<ExceptionInfo>` — the runtime-populated record of every
+            // exception this one SUPERSEDED (earliest first). The slot is at
+            // byte 40; null reads as the empty chain (bz_array_len(null) == 0),
+            // which is §31.4's "it starts empty and shares the empty-array
+            // representation, so an exception that supersedes nothing
+            // allocates nothing".
+            if (ma->member == "SupersededChain" &&
+                isInheritedExcSurfaceAccess(ma)) {
+                llvm::Value* excObj = lowerExpr(*ma->target);
+                if (!excObj) return nullptr;
+                llvm::Value* scSlot = builder_.CreateGEP(
+                    i8Ty, excObj, builder_.getInt64(kExcSupersededOffset));
+                return builder_.CreateLoad(ptrTy(), scSlot, "exc.superseded");
             }
             if (ma->member == "ParamName" && isInheritedExcSurfaceAccess(ma)) {
                 llvm::Value* excObj = lowerExpr(*ma->target);
@@ -11514,7 +11533,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
             const bool bareExcSurface =
                 id2->name == "Message" || id2->name == "StackTrace" ||
-                id2->name == "CauseChain" || id2->name == "ParamName" ||
+                id2->name == "CauseChain" || id2->name == "SupersededChain" ||
+                id2->name == "ParamName" ||
                 // fix #8399 (stdlib §6.8, v0.357): the DFE's own member —
                 // the copied stack-trace text of the original exception. It
                 // reaches here through the same sema arm as the four §31.4
@@ -11535,6 +11555,15 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         i8Ty, currentThis_,
                         builder_.getInt64(kExcCauseOffset), "cc.slot");
                     return builder_.CreateLoad(ptrTy(), ccSlot, "cc.val");
+                }
+                if (id2->name == "SupersededChain") {
+                    // fix #3261 (§31.2 / §31.4, v0.357): `SupersededChain:
+                    // Array<ExceptionInfo>` @40 — null reads as the empty
+                    // chain, exactly as CauseChain's does.
+                    llvm::Value* scSlot = builder_.CreateGEP(
+                        i8Ty, currentThis_,
+                        builder_.getInt64(kExcSupersededOffset), "sc.slot");
+                    return builder_.CreateLoad(ptrTy(), scSlot, "sc.val");
                 }
                 if (id2->name == "ParamName") {
                     // §31.4 `ParamName: string?` @32 — null when not supplied,

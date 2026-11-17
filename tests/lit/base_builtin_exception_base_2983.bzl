@@ -62,11 +62,15 @@ end C;
 // severity word, so anchor on the `:line:col:` shape plus the message text.
 
 // The reject names the ACTUAL base, and the surface it ACTUALLY has —
-// Message/StackTrace/CauseChain, with ParamName correctly absent because §31.4
-// declares that one on ArgumentException.
+// Message/StackTrace/CauseChain/SupersededChain, with ParamName correctly
+// absent because §31.4 declares that one on ArgumentException.
+// fix #3261 (§31.4, v0.357): the surface list gained `SupersededChain` — the
+// member §31.4 declares on `Exception` and #3261 implemented. The list is
+// built by ASKING the resolver member by member, so it names exactly the
+// members the resolver accepts.
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: `base.Nope` does not name a base-class member
 // CHECK-SAME: `ExB`'s class base is the built-in `Exception` (§31.4)
-// CHECK-SAME: whose surface is Message, StackTrace, CauseChain and the universal
+// CHECK-SAME: whose surface is Message, StackTrace, CauseChain, SupersededChain and the universal
 // CHECK-SAME: (§12.3)
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: `base.ParamName` does not name a base-class member

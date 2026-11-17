@@ -11999,15 +11999,28 @@ private:
     //   [24] CauseChain   — bz_array_t* of ExceptionInfo (null → empty), the
     //        #811 snapshot built by the (message, cause) constructor.
     //   [32] ParamName    — bz_string* (ArgumentException; null when absent).
+    //   [40] SupersededChain — bz_array_t* of ExceptionInfo (null → empty),
+    //        the §31.2 record-before-drop chain: every exception this one
+    //        SUPERSEDED, earliest first (§31.4). Runtime-populated exactly as
+    //        StackTrace is — no constructor populates or accepts it.
     // The block is a uniform kExcObjSize bytes for every built-in exception so
     // the base-Exception getters (CauseChain at 24) read a valid slot on any of
     // them; calloc zeroes the unused slots. Growing (never moving) the block
     // keeps every existing read (Message@8, InnerException@16) intact.
-    static constexpr int64_t kExcObjSize        = 40;
+    //
+    // fix #3261 (§31.2 / §31.4, v0.357): the SupersededChain slot is ADDED at
+    // 40, so the block grows 40 → 48 bytes. Growing (never moving) keeps every
+    // existing offset intact — the same discipline the InnerException slot's
+    // addition used. A user class deriving from a built-in exception mirrors
+    // the SAME header (classStruct / LlvmBackend_Layout.cpp), so its
+    // SupersededChain lands at byte 40 too and its disposed flag moves from
+    // slot 5 to slot 6.
+    static constexpr int64_t kExcObjSize        = 48;
     static constexpr int64_t kExcMsgOffset      = 8;
     static constexpr int64_t kExcInnerOffset    = 16;
     static constexpr int64_t kExcCauseOffset    = 24;
     static constexpr int64_t kExcParamOffset    = 32;
+    static constexpr int64_t kExcSupersededOffset = 40;
 
     // §31.4 / #811: build the CauseChain snapshot for `new Exception(msg, cause)`
     // from the (already-lowered) borrowed `cause` object. Reads the cause's type
@@ -12065,8 +12078,9 @@ private:
     //     — the original path, left byte-for-byte unconditional so this change
     //     cannot alter it;
     //   * a receiver typed as a USER SUBCLASS of one — `classStruct` mirrors
-    //     the full 40-byte header into such a class (Message@8, Inner@16,
-    //     CauseChain@24, ParamName@32; `disposedFlagIndex` returns 5), so the
+    //     the full 48-byte header into such a class (Message@8, Inner@16,
+    //     CauseChain@24, ParamName@32, SupersededChain@40;
+    //     `disposedFlagIndex` returns 6), so the
     //     very same GEPs are correct. Measured on 0dac23f through a base-typed
     //     receiver over a subclass instance: `pn=pp`, `cc=1`, `cc0=root`;
     //   * `this` / `base` inside such a class, where sema deliberately gives

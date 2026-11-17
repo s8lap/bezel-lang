@@ -1238,6 +1238,12 @@ BuiltinExcMember builtinExceptionSurfaceMemberOf(std::string_view builtinBase,
             if (member == "Message")    return found(BuiltinExcMember::Message);
             if (member == "StackTrace") return found(BuiltinExcMember::StackTrace);
             if (member == "CauseChain") return found(BuiltinExcMember::CauseChain);
+            // fix #3261 (§31.4, v0.357): `public readonly property
+            // SupersededChain: Array<ExceptionInfo>;  // empty when nothing
+            // superseded`. Declared on `Exception` itself (not on a derived
+            // type), so it is answered at the same level as CauseChain.
+            if (member == "SupersededChain")
+                return found(BuiltinExcMember::SupersededChain);
         }
         cur = common::builtinExceptionParentOf(cur);
     }
@@ -1255,7 +1261,8 @@ std::string builtinExceptionSurfaceList(std::string_view builtinBase) {
     // reject is the #2983 defect over again (a message whose factual claim is
     // false), so the two must share one source of truth.
     static constexpr std::string_view kNames[] = {"Message", "StackTrace",
-                                                  "CauseChain", "ParamName",
+                                                  "CauseChain", "SupersededChain",
+                                                  "ParamName",
                                                   "FaultStackTrace"};
     std::string out;
     for (std::string_view n : kNames) {

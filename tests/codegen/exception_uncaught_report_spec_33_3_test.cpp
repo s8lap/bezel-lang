@@ -122,3 +122,27 @@ BEZEL_TEST(codegen_uncaught_report, caught_exception_no_report_spec_33_3) {
     BEZEL_EXPECT_EQ(o.exitCode, 0);
     BEZEL_EXPECT_TRUE(!contains(o.stderrText, "handled"));
 }
+
+// fix #3261 / #8464 (§33.3 / §31.2 / §31.4, v0.357): the report's content
+// list is "the exception's type, message, stack trace, `CauseChain`, and
+// `SupersededChain`". The SupersededChain arm is live now that the chain is
+// runtime-populated at each supersession (§31.2's record-before-drop rule):
+// a `finally` that throws supersedes the in-flight exception, and the
+// uncaught report must show WHAT WAS SUPERSEDED — the original failure stays
+// readable in the report.
+BEZEL_TEST(codegen_uncaught_report, superseded_chain_on_stderr_spec_33_3) {
+    auto o = compileAndRunCapturingStderr(
+        "module M; class C public static method Main(): int "
+        "  try "
+        "    throw new Exception(\"first failure\"); "
+        "  finally "
+        "    throw new InvalidOperationException(\"cleanup failure\"); "
+        "  end try; "
+        "end Main; end C;");
+    BEZEL_EXPECT_EQ(o.exitCode, 70);
+    // the superseding exception: its type and message
+    BEZEL_EXPECT_TRUE(contains(o.stderrText, "InvalidOperationException"));
+    BEZEL_EXPECT_TRUE(contains(o.stderrText, "cleanup failure"));
+    // and the superseded one, which the report must not lose
+    BEZEL_EXPECT_TRUE(contains(o.stderrText, "first failure"));
+}

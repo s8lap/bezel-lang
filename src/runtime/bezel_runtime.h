@@ -2514,6 +2514,24 @@ void bz_exc_tables_init(void** excVtableTable, void** excDescTable);
 // reclaim site's order.
 void bz_exc_reclaim_causechain_registered(void* obj);
 
+// fix #3261 (§31.2 / §31.4, v0.357): the record-before-drop append. Appends to
+// the SUPERSEDING exception's `SupersededChain` the snapshot of the SUPERSEDED
+// exception: first every entry of the superseded exception's own
+// `SupersededChain`, then (last) the superseded exception's own
+// `ExceptionInfo` — type name, `Message`, `StackTrace` — so the chain reads
+// earliest-superseded first.
+//
+// Called by the codegen at each supersession point (§31.2) BEFORE the
+// superseded exception is disposed. Both arguments are exception objects
+// (built-in or a user subclass of one — the same §31.4 header). A no-op for a
+// null argument and for SELF-supersession (§31.2: "Self-supersession records
+// nothing").
+//
+// The append is BEST-EFFORT by §31.2's explicit exception to §17.7's fatal
+// allocation rule: a failed allocation silently drops the entry and the
+// supersession proceeds exactly as without the record.
+void bz_exc_superseded_append(void* superseding, void* superseded);
+
 // OwningBuffer<byte> helpers used by BinarySerializer/BinaryDeserializer.
 // bz_owned_buffer_alloc: allocate an OwningBuffer<byte> with the given bytes,
 // returning the opaque handle (an owned bz_array_t* wrapper). Caller owns it.

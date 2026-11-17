@@ -759,6 +759,12 @@ enum class BuiltinExcMember {
     Message,     // Exception.Message      : string
     StackTrace,  // Exception.StackTrace   : string
     CauseChain,  // Exception.CauseChain   : Array<ExceptionInfo>
+    // fix #3261 (§31.2 / §31.4, v0.357): Exception.SupersededChain —
+    // Array<ExceptionInfo>, the runtime-populated record of every exception
+    // this one SUPERSEDED (earliest first). §31.4: "the chain is
+    // runtime-populated exactly as StackTrace is, so no constructor's purity
+    // classification changes"; §31.2 owns the record-before-drop rule.
+    SupersededChain,  // Exception.SupersededChain : Array<ExceptionInfo>
     ParamName,   // ArgumentException.ParamName : string?
 };
 

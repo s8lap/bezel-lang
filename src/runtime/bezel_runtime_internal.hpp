@@ -191,7 +191,12 @@ private:
 }
 
 // ---- shared object-layout constants ----
-static const int64_t BZ_EXC_OBJ_SIZE = 40;
+// fix #3261 (§31.2 / §31.4, v0.357): the §31.4 exception header grows a
+// `SupersededChain` slot at byte 40, so the uniform built-in exception block
+// grows 40 → 48 bytes. This MUST match `kExcObjSize` in
+// src/codegen/LlvmBackend_impl.hpp — the two are the same layout, stated
+// once per side of the compiler/runtime boundary.
+static const int64_t BZ_EXC_OBJ_SIZE = 48;
 static const int64_t BZ_CLOSURE_ENV_OFFSET = 8;
 
 // §27.7.1 (v0.180, #1544): byte offset of the function-value KIND tag inside

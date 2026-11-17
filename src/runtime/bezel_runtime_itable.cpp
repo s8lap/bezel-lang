@@ -39,9 +39,10 @@ extern "C" void** bz_itable_lookup_inst(void** itmap, void* inst_td,
 // §31.4 (v0.162/v0.163) built-in exception object layout — byte offsets that
 // must match the codegen constants in LlvmBackend_impl.hpp (kExc*Offset):
 //   [0] vtable  [8] Message  [16] InnerException(TIE)  [24] CauseChain
-//   [32] ParamName
+//   [32] ParamName  [40] SupersededChain
 static const int64_t BZ_EXC_MSG_OFFSET   = 8;
 static const int64_t BZ_EXC_CAUSE_OFFSET = 24;
+static const int64_t BZ_EXC_SUPERSEDED_OFFSET = 40;
 
 // §31.4 ExceptionInfo record — the {TypeName, Message, StackTrace} value type
 // codegen lowers to three consecutive bz_string* (a 24-byte {ptr,ptr,ptr}
@@ -103,6 +104,142 @@ extern "C" void* bz_exc_causechain_link(void* causeTypeName, void* causeMessage,
     return arr;
 }
 
+// fix #3261 (§31.2 / §31.4, v0.357): the SUPERSEDEDCHAIN record-before-drop
+// append.
+//
+// §31.2: "At the instant of supersession … and before the superseded exception
+// is disposed … the runtime appends to the SUPERSEDING exception's
+// `SupersededChain`: first, in order, every entry of the superseded exception's
+// own `SupersededChain`, and then, last, an `ExceptionInfo` snapshot of the
+// superseded exception itself — its type name, `Message`, and `StackTrace`."
+// §31.4: "`SupersededChain` carries an `ExceptionInfo` snapshot of every
+// exception this exception SUPERSEDED … chronologically, earliest-superseded
+// first."
+//
+// THE ORDER. The appended block is `superseded.ownChain ++ [snapshot(superseded)]`,
+// and the result is `superseding.ownChain ++ appended`. Because the SUPERSEDED
+// exception's own chain is carried over first, a chain of supersessions reads
+// earliest-first at every depth: E3 supersedes E2 supersedes E1 gives
+// E3 = [snap(E1), snap(E2)].
+//
+// THE TYPE NAME. Read through the exception's virtual `ToString` (vtable slot
+// 3) — the SAME channel the `(message, cause)` snapshot uses
+// (`bz_exc_causechain_link`'s `causeTypeName`, fed by `emitExcCauseSnapshot`).
+// The supersession site does not know the superseded exception's STATIC type (a
+// call-propagated exception has no static type at all), so the descriptor
+// channel is not available there; the virtual default is the §8.5 class
+// default — the type's qualified name — for every built-in exception and every
+// user subclass that does not override `ToString`.
+//
+// THE APPEND IS BEST-EFFORT (§31.2's explicit exception to §17.7's fatal
+// allocation rule): "the recording is diagnostic machinery, and a failed
+// diagnostic allocation must not convert a diagnosable supersession into a
+// process abort — so growing the carrier array or copying the strings, where it
+// cannot be satisfied, silently drops the entry and the supersession proceeds
+// exactly as without this rule". Hence this helper allocates with `calloc`
+// directly (NOT `bz_array_alloc_count_n`, which TERMINATES on failure) and
+// returns silently when the allocation cannot be satisfied.
+//
+// SELF-SUPERSESSION (§31.2) records nothing: "where the superseding and the
+// superseded exception are the SAME INSTANCE … no entry is appended and the
+// chain is unchanged".
+extern "C" void bz_exc_superseded_append(void* superseding, void* superseded) {
+    if (!superseding || !superseded) return;
+    // §31.2 "Self-supersession records nothing".
+    if (superseding == superseded) return;
+    // The superseded exception's own chain (its earlier losses) — carried over
+    // FIRST, then the superseded exception's own snapshot.
+    void* ownChain = nullptr;
+    memcpy(&ownChain, (uint8_t*)superseded + BZ_EXC_SUPERSEDED_OFFSET,
+           sizeof(void*));
+    int64_t ownCount = ownChain ? ((bz_array_t*)ownChain)->count : 0;
+    // The superseding exception's chain so far — the new entries go AFTER it.
+    void* curChain = nullptr;
+    memcpy(&curChain, (uint8_t*)superseding + BZ_EXC_SUPERSEDED_OFFSET,
+           sizeof(void*));
+    int64_t curCount = curChain ? ((bz_array_t*)curChain)->count : 0;
+    int64_t total = curCount + ownCount + 1;
+    // Best-effort allocation (§31.2): a failure drops the entry, silently.
+    auto* arr = (bz_array_t*)calloc(1, sizeof(bz_array_t));
+    if (!arr) return;
+    arr->vtable = (void*)bz_array_vtable;   // §8.2: runtime type identity
+    arr->kind   = BZ_RUNTIME_KIND_ARRAY;
+    arr->data   = calloc((size_t)total, sizeof(bz_excinfo_t));
+    if (!arr->data) { free(arr); return; }
+    arr->capacity = total;
+    arr->count    = total;
+    auto* elems = (bz_excinfo_t*)arr->data;
+    void* empty = bz_rt_empty_string();
+    int64_t w = 0;
+    // 1. the superseding exception's own entries (unchanged, in order);
+    if (curChain) {
+        auto* src = (bz_excinfo_t*)((bz_array_t*)curChain)->data;
+        for (int64_t i = 0; i < curCount; i++) {
+            void* st = src[i].stackTrace ? src[i].stackTrace : empty;
+            bz_string_retain(src[i].typeName);
+            bz_string_retain(src[i].message);
+            bz_string_retain(st);
+            elems[w].typeName   = src[i].typeName;
+            elems[w].message    = src[i].message;
+            elems[w].stackTrace = st;
+            w++;
+        }
+    }
+    // 2. the superseded exception's OWN SupersededChain entries (§31.2:
+    //    "first, in order, every entry of the superseded exception's own
+    //    SupersededChain");
+    if (ownChain) {
+        auto* src = (bz_excinfo_t*)((bz_array_t*)ownChain)->data;
+        for (int64_t i = 0; i < ownCount; i++) {
+            void* st = src[i].stackTrace ? src[i].stackTrace : empty;
+            bz_string_retain(src[i].typeName);
+            bz_string_retain(src[i].message);
+            bz_string_retain(st);
+            elems[w].typeName   = src[i].typeName;
+            elems[w].message    = src[i].message;
+            elems[w].stackTrace = st;
+            w++;
+        }
+    }
+    // 3. and LAST, the snapshot of the superseded exception itself.
+    void* typeName = nullptr;
+    void* vtable = nullptr;
+    memcpy(&vtable, superseded, sizeof(void*));
+    if (vtable) {
+        void* toStrFnP = nullptr;
+        memcpy(&toStrFnP, (uint8_t*)vtable + 3 * sizeof(void*), sizeof(void*));
+        if (toStrFnP) {
+            typedef void* (*bz_tostr_fn)(void*);
+            typeName = ((bz_tostr_fn)toStrFnP)(superseded);
+        }
+    }
+    void* message = nullptr;
+    memcpy(&message, (uint8_t*)superseded + BZ_EXC_MSG_OFFSET, sizeof(void*));
+    void* tn = typeName ? typeName : empty;
+    void* mg = message ? message : empty;
+    bz_string_retain(tn);
+    bz_string_retain(mg);
+    elems[w].typeName   = tn;
+    elems[w].message    = mg;
+    elems[w].stackTrace = empty;   // §31.4 stub — "" pre-debug-info
+    // Install the new chain, then release the old one. The old array's strings
+    // were retained by the copy above, so releasing them here leaves exactly
+    // one reference per string in the NEW array.
+    memcpy((uint8_t*)superseding + BZ_EXC_SUPERSEDED_OFFSET, &arr,
+           sizeof(void*));
+    if (curChain) {
+        auto* old = (bz_array_t*)curChain;
+        auto* oldElems = (bz_excinfo_t*)old->data;
+        for (int64_t i = 0; i < old->count; i++) {
+            bz_string_release(oldElems[i].typeName);
+            bz_string_release(oldElems[i].message);
+            bz_string_release(oldElems[i].stackTrace);
+        }
+        free(old->data);
+        free(old);
+    }
+}
+
 // §31.4/#811/#1389: reclaim a CauseChain snapshot at the exception object's
 // TERMINAL reclaim (immediately before the object's own block is freed) —
 // called from the codegen `emitDisposeAndReclaim` reclaim site
@@ -123,8 +260,9 @@ extern "C" void* bz_exc_causechain_link(void* causeTypeName, void* causeMessage,
 // built-in-exception vtable table bz_unhandled_exception gates on: a directly
 // constructed built-in exception's vtable is one of these. A USER subclass of
 // a built-in exception (§31.4) carries the SAME §31.4 header (its layout
-// mirrors Message@8/InnerException@16/CauseChain@24/ParamName@32 via
-// hasBuiltinExceptionBase in classStruct), but its vtable is vt$<C>, which is
+// mirrors Message@8/InnerException@16/CauseChain@24/ParamName@32/
+// SupersededChain@40 via hasBuiltinExceptionBase in classStruct), but its
+// vtable is vt$<C>, which is
 // NOT in excVtableTable — so the vtable-identity gate alone skipped it and its
 // CauseChain leaked (issue #2989/#2979). The compiler already records that
 // header-bearing fact in the type's descriptor chain: vtable[0] is td$<C>, a
@@ -173,6 +311,27 @@ extern "C" void bz_exc_reclaim_causechain(void* obj, void** excVtableTable,
         }
     }
     if (!builtinExc) return;
+    // fix #3261 (§31.2 / §31.4, v0.357): the SupersededChain slot @40 is
+    // reclaimed HERE too, by the same discipline and at the same site: it is a
+    // heap array of retained strings owned by the exception object, and this
+    // site runs exactly once per object, strictly after every live
+    // borrow/read has concluded.
+    void* supChain;
+    memcpy(&supChain, (uint8_t*)obj + BZ_EXC_SUPERSEDED_OFFSET, sizeof(void*));
+    if (supChain) {
+        auto* sarr = (bz_array_t*)supChain;
+        auto* selems = (bz_excinfo_t*)sarr->data;
+        for (int64_t i = 0; i < sarr->count; i++) {
+            bz_string_release(selems[i].typeName);
+            bz_string_release(selems[i].message);
+            bz_string_release(selems[i].stackTrace);
+        }
+        free(sarr->data);
+        free(sarr);
+        void* null_sup = nullptr;
+        memcpy((uint8_t*)obj + BZ_EXC_SUPERSEDED_OFFSET, &null_sup,
+               sizeof(void*));
+    }
     void* chain;
     memcpy(&chain, (uint8_t*)obj + BZ_EXC_CAUSE_OFFSET, sizeof(void*));
     if (!chain) return;
@@ -307,6 +466,34 @@ extern "C" void bz_unhandled_exception(void* exc, void** excVtableTable) {
             auto* elems = (bz_excinfo_t*)arr->data;
             for (int64_t i = 0; i < arr->count; i++) {
                 fputs("Caused by: ", f);
+                bz_rt_fput_bzstring(elems[i].typeName, f);
+                if (bz_rt_strlen(elems[i].message) > 0) {
+                    fputs(": ", f);
+                    bz_rt_fput_bzstring(elems[i].message, f);
+                }
+                fputc('\n', f);
+            }
+        }
+    }
+    // fix #3261 / #8464 (§33.3 / §31.2 / §31.4, v0.357): the report's content
+    // list is "the exception's type, message, stack trace, `CauseChain`, and
+    // `SupersededChain`" — so the SupersededChain is printed too, BESIDE the
+    // causes rather than merged with them (the two chains are independent, and
+    // their orderings mean different things). The chain is runtime-populated
+    // at each supersession (§31.2's record-before-drop rule), so this arm is
+    // live: an exception that superseded another reports what it superseded,
+    // earliest-superseded first. Before #3261 the slot did not exist and the
+    // chain was always empty, so the report's omission was vacuous; it is not
+    // vacuous now.
+    if (builtinExc) {
+        void* chain;
+        memcpy(&chain, (uint8_t*)exc + BZ_EXC_SUPERSEDED_OFFSET,
+               sizeof(void*));
+        if (chain) {
+            auto* arr = (bz_array_t*)chain;
+            auto* elems = (bz_excinfo_t*)arr->data;
+            for (int64_t i = 0; i < arr->count; i++) {
+                fputs("Superseded: ", f);
                 bz_rt_fput_bzstring(elems[i].typeName, f);
                 if (bz_rt_strlen(elems[i].message) > 0) {
                     fputs(": ", f);
