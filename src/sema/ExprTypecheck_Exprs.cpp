@@ -14338,6 +14338,72 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         const ast::ExternDecl* calleeXd2 = nullptr;
         if (auto* xs2 = dynamic_cast<sema::ExternDeclSymbol*>(calleeSym2))
             calleeXd2 = xs2->externDecl;
+        // narrow #8394 (§14.5 *Inputs and phases* / §22.6, v0.357):
+        // "Inference runs after arity filtering and named-argument binding
+        // (§22.5) fix the argument-to-parameter correspondence". The callee
+        // symbol recorded before resolution is one member of the overload
+        // set, not necessarily the one the call binds, so an OVERLOADED name
+        // (`Seq.M<T, K>(xs, key: (T) -> K)` beside a non-generic
+        // `M(a: int, b: int, c: int, d: int)`) kept the pre-#8394 path: an
+        // un-annotated lambda was typed against an untyped parameter, a
+        // `v.Name + "!"` key was rejected and a `v.Age` key bound `K` to
+        // nothing, so `M` returned the FIRST element. When exactly ONE
+        // same-name candidate survives the §22.5 binding (and, under an
+        // explicit list, the §14.5 list-length filter) and it is a generic
+        // method, it is the only candidate the call
+        // can resolve to, so phase 2 types the lambda against it. Several
+        // survivors keep the old path: §22.6 types the lambda per candidate,
+        // which this single pre-resolution visit cannot do.
+        // The swap happens BEFORE the decl read below, so the survivor's
+        // `MethodDecl` is read once, at the one existing site (a survivor
+        // with no local decl leaves `calleeMd2` null, and phase 2 then keeps
+        // its old path exactly as for any imported callee).
+        bool calleeArityUnique2 = false;
+        if (auto* cms2 = dynamic_cast<sema::MethodSymbol*>(calleeSym2);
+            cms2 && !cms2->extensionDecl && cms2->parent &&
+            !isSoleNamedCandidate(cms2)) {
+            const std::vector<std::unique_ptr<ast::Type>>* listArgs2 = nullptr;
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    ce->callee.get()))
+                listArgs2 = &ma->typeArgs;
+            else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                         ce->callee.get()))
+                listArgs2 = &id->typeArgs;
+            else if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                         ce->callee.get()))
+                listArgs2 = &ncm->typeArgs;
+            sema::MethodSymbol* survivor2 = nullptr;
+            int survivors2 = 0;
+            std::vector<const TypeSymbol*> work2{cms2->parent}, seen2;
+            while (!work2.empty()) {
+                const TypeSymbol* t = work2.back();
+                work2.pop_back();
+                if (!t || std::find(seen2.begin(), seen2.end(), t) !=
+                              seen2.end())
+                    continue;
+                seen2.push_back(t);
+                for (Symbol* m : t->members) {
+                    auto* o = dynamic_cast<sema::MethodSymbol*>(m);
+                    if (!o || o->name != cms2->name) continue;
+                    if (listArgs2 && !listArgs2->empty() &&
+                        o->genericParams.size() != listArgs2->size())
+                        continue;
+                    if (!bindArgsToParams(sema::FormalsView::of(*o), ce->args,
+                                          ce->span.begin, std::string{},
+                                          /*emit=*/false)
+                             .ok)
+                        continue;
+                    ++survivors2;
+                    survivor2 = o;
+                }
+                for (auto* b : t->baseTypes) work2.push_back(b);
+            }
+            if (survivors2 == 1 && survivor2 &&
+                !survivor2->genericParams.empty()) {
+                calleeSym2 = survivor2;
+                calleeArityUnique2 = true;
+            }
+        }
         if (auto* ms2 = dynamic_cast<sema::MethodSymbol*>(calleeSym2)) {
             calleeMs2 = ms2;
             calleeMd2 = dynamic_cast<const ast::MethodDecl*>(ms2->decl);
@@ -14620,19 +14686,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // Deliberately narrow — each exclusion keeps the pre-#8394 path,
         // which is no worse than before:
         //   * an explicit type-argument list on any callee spelling: no
-        //     inference runs (§14.5 *Explicit lists are all-or-nothing*), and
-        //     the #5117 fix-forward's bare-`T` bail stays exactly as it is;
+        //     inference runs (§14.5 *Explicit lists are all-or-nothing*); a
+        //     full member-access list is substituted in `formalFnParamType2`
+        //     instead, and a NULLABLE listed bare `T` keeps the #5117
+        //     fix-forward's bail there;
         //   * a callee with no AST decl (imported) or an extension method
         //     (the receiver is not a positional `ce->args` entry), a named
         //     argument written away from its own formal's position (codegen
         //     pairs arguments with formals by position), or an overloaded
         //     name (the formal is one candidate's, not resolution's pick —
-        //     #6161's hazard);
+        //     #6161's hazard) unless exactly one candidate survives the
+        //     §22.5 binding (`calleeArityUnique2` above);
         //   * a binding that is still open (mentions a type parameter in
-        //     scope, the callee's own, or is an Error type), or a bare-`T`
-        //     parameter position whose binding is NULLABLE — the `int?` shape
-        //     the #5117 fix-forward measured (`y.ToString()` on a threaded
-        //     `int?` trips the §7.4 narrowing gate), left on its old path;
+        //     scope, the callee's own, or is an Error type);
         //   * a call site at which codegen's monomorphization would leave one
         //     of the callee's type parameters UNBOUND (`codegenBinds2` below).
         const bool phase2Eligible2 = [&]() -> bool {
@@ -14649,7 +14715,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     ce->callee.get());
                 ncm && !ncm->typeArgs.empty())
                 return false;
-            if (!isSoleNamedCandidate(calleeMs2)) return false;
+            if (!calleeArityUnique2 && !isSoleNamedCandidate(calleeMs2))
+                return false;
             // A named argument is fine only where it already sits at its
             // own formal's position (textual index == formal index).
             for (std::size_t i = 0; i < ce->args.size(); ++i) {
@@ -14787,6 +14854,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             const bool phase1Done = deferredLam2[pos];
             std::unordered_map<std::string_view, TypeRef*> inferred;
             std::unordered_set<std::string_view> codegenBound;
+            bool narrowedNullableArg = false;
             for (std::size_t i = 0; i < ce->args.size() &&
                                     i < calleeMd2->params.size(); ++i) {
                 if (i == pos) continue;
@@ -14807,6 +14875,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     continue;
                 unifyArgSubst(calleeMd2->params[i].type.get(), at,
                               calleeOwnGenericNames, inferred);
+                // A §7.4-narrowed nullable read is of its NON-nullable type
+                // at the call (§22.6 *The argument's static type*), but
+                // `exprType` still reports the declared `int?`; a binding read
+                // off it is not the one the spec makes (see the bare-`T`
+                // check below).
+                if (at->nullable && isNarrowedNonNullRead(ea.value.get()))
+                    narrowedNullableArg = true;
                 // Codegen skips a `null` literal argument outright (#885).
                 if (!dynamic_cast<const ast::NullLiteralExpr*>(ea.value.get()))
                     codegenBinds2(
@@ -14856,10 +14931,21 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             if (!substPt || substPt->kind != TypeRef::Kind::Function ||
                 substPt->funcParams.size() != pt->funcParams.size())
                 return nullptr;
+            // A bare-`T` position bound to a NULLABLE type takes it too
+            // (narrow #8394): phase 1 binds `X` "to the argument's static type
+            // at that position, nullable or not", so `Select(ns, lambda(v) =>
+            // v ?? -1)` over `ns: Array<int?>` types `v` as `int?`. Left
+            // untyped, `v` was lowered at the placeholder and the call printed
+            // three garbage ints instead of `3 -1 8`. (The #5117 fix-forward's
+            // bail for a nullable binding stays on the EXPLICIT-list path in
+            // `formalFnParamType2`.) Not when a narrowed nullable read took
+            // part in the binding: there the spec's `T` is the non-nullable
+            // type and the old path is kept.
             for (std::size_t i = 0; i < substPt->funcParams.size(); ++i) {
                 const TypeRef* st = substPt->funcParams[i].type;
                 if (!st || mentionsOwnGeneric(st)) return nullptr;
-                if (isBareOwnGenericRef(pt->funcParams[i].type) && st->nullable)
+                if (isBareOwnGenericRef(pt->funcParams[i].type) &&
+                    st->nullable && narrowedNullableArg)
                     return nullptr;
             }
             return substPt;
@@ -14872,8 +14958,31 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 pt->kind == TypeRef::Kind::Function) {
                 if (TypeRef* inferredPt = inferredFnParamType2(pos, pt))
                     return inferredPt;
-                for (const auto& fp : pt->funcParams)
-                    if (isBareOwnGenericRef(fp.type)) return nullptr;
+                // narrow #8394 (§14.5 *Explicit lists are all-or-nothing*,
+                // v0.357): "When a full explicit list is supplied, no
+                // inference runs" — the list IS the binding, so a bare-`T`
+                // parameter position takes the listed type
+                // (`Seq.M<Box, string>(xs, lambda(v) => v.Name + "!")` typed
+                // `v` as nothing and rejected the `+`). A NULLABLE listed type
+                // keeps the #5117 fix-forward's bail below (the
+                // `Util.Map<int?>(v, lambda(y) => y.ToString())` shape), and a
+                // partial `methodSubst` is not a full list.
+                bool fullList2 = !methodSubst.empty();
+                for (const std::string_view nm : calleeOwnGenericNames) {
+                    auto it = methodSubst.find(nm);
+                    if (it == methodSubst.end() || !it->second ||
+                        it->second->kind == TypeRef::Kind::Error)
+                        fullList2 = false;
+                }
+                for (const auto& fp : pt->funcParams) {
+                    if (!isBareOwnGenericRef(fp.type)) continue;
+                    if (!fullList2) return nullptr;
+                    const TypeRef* bound =
+                        methodSubst.find(fp.type->headName())->second;
+                    if (bound->nullable ||
+                        refOutParamTypeMentionsTypeParam(bound, scopeTpNames2))
+                        return nullptr;
+                }
                 // fix #5117: apply methodSubst BEFORE mentionsOwnGeneric check.
                 // This substitutes U → int in Array<U>, so Array<int> no longer
                 // contains the method's own generic U, and we don't bail.
