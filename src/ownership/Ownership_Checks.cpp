@@ -5851,6 +5851,78 @@ void MethodOwnership::reportCapturedOwnedConsume(std::string_view name,
                "restructure so the closure only borrows it.");
 }
 
+// fix #7891 (§28.3 *Captured owned bindings*, §15.3, §35.4, v0.357).
+//
+// §28.3: "Inside a closure, a captured owned binding — an owned local or
+// `owned` parameter of the enclosing body — is uniformly in borrow state:
+// reads borrow (the producers rows above), and assignment to it, a marked
+// transfer from it, an explicit `Dispose()` or discard of it, and every other
+// owned-consuming use of it are compile errors — a closure cannot consume,
+// reassign, or dispose a captured owned binding", and names the move-only
+// case as "the same principle". §28.9: "Capturing a *move-only* local ...
+// follows the same rule: the closure captures a borrow whose source is the
+// local's enclosing scope ... a move-only capture cannot be a copy (copying
+// is forbidden) and cannot be a move (the local is still in scope under its
+// name". For a move-only value the owned-consuming use needs no marker: §15.3 makes the plain binding,
+// assignment, by-value argument and `return` of an owning-classified choice a
+// MOVE ("copies are forbidden, so the plain binding can only move"), and
+// §17.8 classifies `x!` exactly as the bare `x`. The walk above recognised
+// only the MARKED and class-shaped consumes (`owned r`, `move r`,
+// `r.Dispose()`, `_ := r`, `r := …`), so `var y := o;`, `var y := o!;`,
+// `Take(o)`, `using var y := o;` and `lambda(): C => o` over a captured
+// owning-choice `o` were accepted, and the closure's taker and the enclosing
+// scope's active-case pass both disposed the one payload.
+//
+// `e` is the expression AT an owned-consuming position inside a closure body
+// (the callers pick the positions). It is reported when it names — directly,
+// through `!`, through an if-expression branch or a `??` operand (§20
+// *Ownership*: "a branch naming such a binding classifies by the position the
+// whole expression occupies") — an owning-choice binding of the ENCLOSING
+// body: a tracked local (in `states_`, which holds no closure-body local), or
+// a parameter that is not a parameter of any closure the scan is inside. A
+// field read, an index, a call result and a fresh construction are not a
+// bare binding and are left to their own rules.
+void MethodOwnership::reportMoveOnlyChoiceMoveInClosure(const ast::Expr& e) {
+    const ast::Expr* core = &e;
+    while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core)) {
+        if (!pb->operand) return;
+        core = pb->operand.get();
+    }
+    if (const auto* c = dynamic_cast<const ast::ConditionalExpr*>(core)) {
+        if (c->thenValue) reportMoveOnlyChoiceMoveInClosure(*c->thenValue);
+        if (c->elseValue) reportMoveOnlyChoiceMoveInClosure(*c->elseValue);
+        return;
+    }
+    if (const auto* b = dynamic_cast<const ast::BinaryExpr*>(core)) {
+        if (b->op != "??") return;
+        if (b->left) reportMoveOnlyChoiceMoveInClosure(*b->left);
+        if (b->right) reportMoveOnlyChoiceMoveInClosure(*b->right);
+        return;
+    }
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(core);
+    if (!id) return;
+    if (id->name == "this" || id->name == "base") return;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    if (!sym) return;
+    if (states_.find(sym) == states_.end()) {
+        // Not a tracked enclosing local. A by-value-move PARAMETER of the
+        // enclosing body is not in `states_` until something moves it
+        // (`noteOwningChoiceWholeMoveRead` seeds it at the move site), so it
+        // is admitted here by exclusion: a parameter that no closure on the
+        // scan stack declares is the enclosing body's own.
+        if (!dynamic_cast<sema::ParameterSymbol*>(sym)) return;
+        for (const ast::LambdaExpr* lam : closureScanStack_) {
+            const std::vector<sema::Symbol*>* lps = ctx_.lambdaParams(lam);
+            if (!lps) continue;
+            for (sema::Symbol* lp : *lps)
+                if (lp == sym) return;  // the closure's own parameter
+        }
+    }
+    auto verdict = common::classifyChoiceType(ctx_.exprType(*id), ctx_);
+    if (!verdict || *verdict != common::ChoiceClassification::Owning) return;
+    reportCapturedOwnedConsume(id->name, id->span.begin, "transfer");
+}
+
 bool MethodOwnership::calleeArgIsOwnedSink(
         const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
         std::size_t argIdx) {
@@ -5935,6 +6007,7 @@ void MethodOwnership::reportMovedFromCapturesIn(const ast::LambdaExpr& lam,
                                                 const BranchPath& lamPath) {
     std::vector<const ast::IdentifierExpr*> ids;
     collectLambdaIdentifiers(lam, ids);
+    appendDeepMoveOnlyChoiceCaptures(lam, ids);  // fix #7891, §28.9
     for (const ast::IdentifierExpr* id : ids) {
         if (!id) continue;
         if (id->name == "this" || id->name == "base") continue;
@@ -6124,10 +6197,17 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
         // capture check runs from `checkCapturedOwnedConsumeInStmt` after the
         // walk, not here. Order-independent by construction.
         stmtPendingLambdas_.emplace_back(lam, stmtBranchPath_);
-        if (lam->exprBody)
+        closureScanStack_.push_back(lam);
+        if (lam->exprBody) {
+            // fix #7891: an expression body IS the closure's `return`
+            // (§15.3 *Return*: "returning a move-only value transfers it to
+            // the caller") — `lambda(): C => o` moves the captured `o` out.
+            reportMoveOnlyChoiceMoveInClosure(*lam->exprBody);
             scanCapturedOwnedConsumeExpr(*lam->exprBody, /*insideLambda=*/true);
+        }
         for (const auto& st : lam->stmts)
             if (st) scanCapturedOwnedConsumeStmt(*st, /*insideLambda=*/true);
+        closureScanStack_.pop_back();
         return;
     }
     if (const auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
@@ -6160,6 +6240,16 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
                     calleeArgIsOwnedSink(call->callee.get(), call->args, pos);
                 if (insideLambda) {
                     reportArgConsumeCapturedOwned(a, ownedSink);
+                    // fix #7891 (§15.3 *Parameter passing*): a move-only
+                    // argument is a by-value MOVE whatever the formal's
+                    // marker; `moveOnlyArgIsConsumed` carves `ref` / `out`
+                    // and §25.2's `Equals`, as at the top level.
+                    // Skipped when the arm above already reported this very
+                    // argument (an `owned` formal over an Owned binding).
+                    if (a.value && moveOnlyArgIsConsumed(call->callee.get(), a) &&
+                        !(isCapturedOwnedBinding(*a.value) &&
+                          argConsumesBareBinding(a, ownedSink)))
+                        reportMoveOnlyChoiceMoveInClosure(*a.value);
                 } else if (stmtHasLambda_ && a.value &&
                            argConsumesBareBinding(a, ownedSink)) {
                     // fix #3755 (review follow-up): an owned-sink argument of
@@ -6241,6 +6331,10 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
                     calleeArgIsOwnedSink(nc->callee.get(), nc->args, pos);
                 if (insideLambda) {
                     reportArgConsumeCapturedOwned(a, ownedSink);
+                    if (a.value && moveOnlyArgIsConsumed(nc->callee.get(), a) &&
+                        !(isCapturedOwnedBinding(*a.value) &&
+                          argConsumesBareBinding(a, ownedSink)))
+                        reportMoveOnlyChoiceMoveInClosure(*a.value);  // #7891
                 } else if (stmtHasLambda_ && a.value &&
                            argConsumesBareBinding(a, ownedSink)) {
                     recordStatementConsumedBinding(*a.value);  // fix #3755
@@ -6291,6 +6385,12 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
                     ctorParams.valid() && boundPos < ctorParams.size() &&
                     ctorParams.modifier(boundPos) == "owned";
                 reportArgConsumeCapturedOwned(a, ownedSink);
+                // fix #7891 (§15.3 *Parameter passing*): the constructor
+                // twin of the call arm's move-only argument check.
+                if (a.value && moveOnlyArgIsConsumed(nullptr, a) &&
+                    !(isCapturedOwnedBinding(*a.value) &&
+                      argConsumesBareBinding(a, ownedSink)))
+                    reportMoveOnlyChoiceMoveInClosure(*a.value);
                 ++pos;
             }
         }
@@ -6466,6 +6566,10 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
 void MethodOwnership::scanCapturedOwnedConsumeStmt(const ast::Stmt& s,
                                                    bool insideLambda) {
     if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        // fix #7891 (§15.3 *Local-to-local assignment*): `var y := o;` /
+        // `using var y := o;` over a captured owning-choice `o` MOVES it.
+        if (insideLambda && ld->initializer)
+            reportMoveOnlyChoiceMoveInClosure(*ld->initializer);
         if (ld->initializer)
             scanCapturedOwnedConsumeExpr(*ld->initializer, insideLambda);
         return;
@@ -6491,6 +6595,10 @@ void MethodOwnership::scanCapturedOwnedConsumeStmt(const ast::Stmt& s,
                 dynamic_cast<const ast::IdentifierExpr*>(as->target.get());
             reportCapturedOwnedConsume(tid->name, tid->span.begin, "assign to");
         }
+        // fix #7891 (§15.3): `y := o;` / `h.F := o;` moves a captured
+        // owning-choice `o` out of the enclosing scope.
+        if (insideLambda && as->value)
+            reportMoveOnlyChoiceMoveInClosure(*as->value);
         if (as->target) scanCapturedOwnedConsumeExpr(*as->target, insideLambda);
         if (as->value) scanCapturedOwnedConsumeExpr(*as->value, insideLambda);
         return;
@@ -6510,6 +6618,9 @@ void MethodOwnership::scanCapturedOwnedConsumeStmt(const ast::Stmt& s,
         return;
     }
     if (const auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        // fix #7891 (§15.3 *Return*): `return o;` inside the closure body.
+        if (insideLambda && rs->value)
+            reportMoveOnlyChoiceMoveInClosure(*rs->value);
         if (rs->value) scanCapturedOwnedConsumeExpr(*rs->value, insideLambda);
         return;
     }
@@ -6809,6 +6920,7 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
     for (const ast::LambdaExpr* lam : lambdas) {
         std::vector<const ast::IdentifierExpr*> ids;
         collectLambdaIdentifiers(*lam, ids);
+        appendDeepMoveOnlyChoiceCaptures(*lam, ids);  // fix #7891, §28.9
         for (const ast::IdentifierExpr* id : ids) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
             if (!sym) continue;
@@ -7085,7 +7197,19 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // scope-bound discharge obligation — a value-typed or
             // runtime-managed (string/function) local is never Owned, so
             // capturing one is not constrained and is not diagnosed here.
-            if (st->state != OwnershipState::Owned) continue;
+            //
+            // fix #7891 (§28.9, v0.357): the MOVE-ONLY capture is the one
+            // value-typed exception — "Capturing a *move-only* local ...
+            // follows the same rule: the closure captures a borrow whose
+            // source is the local's enclosing scope, and may not outlive it".
+            // An owning-choice local is `Borrowed` in the dataflow when a
+            // plain `var` and is no class reference, so both gates below
+            // skipped it and the returned closure read the payload the
+            // scope-end active-case pass had already disposed.
+            const bool moveOnlyCapture =
+                it != states_.end() && isLiveMoveOnlyChoiceLocal(sym);
+            if (st->state != OwnershipState::Owned && !moveOnlyCapture)
+                continue;
             // Belt-and-braces: confirm the captured local's declared type is
             // a class/interface reference (the only thing a §28.3 borrow can
             // alias). An Owned non-reference would be surprising, but the
@@ -7101,7 +7225,8 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
             // Null declType → unknown; isBorrowableType is conservative
             // (true), but we additionally already gated on Owned, so this
             // only admits genuine owned-reference captures.
-            if (declTy && !isBorrowableType(declTy)) continue;
+            if (declTy && !isBorrowableType(declTy) && !moveOnlyCapture)
+                continue;
             report(
                 Severity::Error, id->span.begin,
                 std::string("returned closure captures `") +
@@ -8151,6 +8276,41 @@ bool MethodOwnership::isEscapeBoundLocal(sema::Symbol* sym) const {
     // local is disposed at scope end; the caught exception is disposed by the
     // runtime when the arm completes. A borrow of either may not escape.
     return isOwnedTrackedLocal(sym) || isCatchBorrow(sym);
+}
+
+// fix #7891 (§28.9, v0.357): see the header declarations.
+bool MethodOwnership::isMoveOnlyChoiceLocalSymbol(sema::Symbol* sym) const {
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    // LOCALDECL-ONLY: a `const` local never holds a move-only value -- §21.1
+    // rejects that declaration (its enforcement gap is #2745), so there is no
+    // owning-choice `const` cell for a closure to capture or consume.
+    if (!ls || !dynamic_cast<const ast::LocalDecl*>(ls->decl)) return false;
+    auto verdict = common::classifyChoiceType(ls->declType, ctx_);
+    return verdict && *verdict == common::ChoiceClassification::Owning;
+}
+
+bool MethodOwnership::isLiveMoveOnlyChoiceLocal(sema::Symbol* sym) const {
+    if (!isMoveOnlyChoiceLocalSymbol(sym)) return false;
+    auto it = states_.find(sym);
+    if (it == states_.end()) return false;
+    return it->second.state == OwnershipState::Owned ||
+           it->second.state == OwnershipState::Borrowed;
+}
+
+void MethodOwnership::appendDeepMoveOnlyChoiceCaptures(
+        const ast::LambdaExpr& lam,
+        std::vector<const ast::IdentifierExpr*>& ids) const {
+    std::vector<const ast::IdentifierExpr*> deep;
+    const bool saved = deepCaptureWalk_;
+    deepCaptureWalk_ = true;
+    collectLambdaIdentifiers(lam, deep);
+    deepCaptureWalk_ = saved;
+    for (const ast::IdentifierExpr* id : deep) {
+        if (!id) continue;
+        if (std::find(ids.begin(), ids.end(), id) != ids.end()) continue;
+        if (isMoveOnlyChoiceLocalSymbol(ctx_.exprSymbol(*id)))
+            ids.push_back(id);
+    }
 }
 
 // fix #8165 (§28.3 *Producers*, §28.3.8, §28.3.9, stdlib §9.6, v0.355): see
@@ -9359,6 +9519,7 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
     if (const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&rhs)) {
         std::vector<const ast::IdentifierExpr*> ids;
         collectLambdaIdentifiers(*lam, ids);
+        appendDeepMoveOnlyChoiceCaptures(*lam, ids);  // fix #7891, §28.9
         for (const ast::IdentifierExpr* id : ids) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
             // fix #8165 (§28.3 *Producers*, §28.3.8, §28.9, stdlib §9.6,
@@ -9377,6 +9538,12 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             if (isEscapeBoundLocal(sym) ||
                 isFreshOwnedArrayMaterializerLocal(sym))
                 return sym;
+            // fix #7891 (§28.9, v0.357): a captured MOVE-ONLY local. "the
+            // closure captures a borrow whose source is the local's enclosing
+            // scope, and may not outlive it" — so the holder borrows it like
+            // an owned class local, and the consume-site freeze and the
+            // store/return escape checks that read the holder's source apply.
+            if (isLiveMoveOnlyChoiceLocal(sym)) return sym;
             // fix #6296 (§28.3 *Provenance* clause 1, v0.338): a captured
             // FUNCTION value "carries its own set, transitively" — resolve the
             // fixpoint's answer for it. This is the leg the issue's repro was
@@ -17509,6 +17676,7 @@ void MethodOwnership::collectCaptureSourcesInto(sema::Symbol* holder,
     if (const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&value)) {
         std::vector<const ast::IdentifierExpr*> ids;
         collectLambdaIdentifiers(*lam, ids);
+        appendDeepMoveOnlyChoiceCaptures(*lam, ids);  // fix #7891, §28.9
         for (const ast::IdentifierExpr* id : ids) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
             if (!sym) continue;

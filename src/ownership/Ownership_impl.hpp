@@ -2905,6 +2905,16 @@ private:
     bool isCapturedOwnedBinding(const ast::Expr& e);
     void reportCapturedOwnedConsume(std::string_view name, SourceLocation loc,
                                     const char* verb);
+    // fix #7891 (§28.3 *Captured owned bindings*, §15.3, §35.4, v0.357): the
+    // MOVE-ONLY half of the in-closure consume rule. For an owning-classified
+    // choice the UNMARKED read at an owned-consuming position is itself the
+    // transfer (§15.3), so `e` — the expression at such a position inside a
+    // closure body — is reported when it names (through `!`, an if-expression
+    // branch or a `??` operand) an owning-choice binding of the ENCLOSING
+    // body. `closureScanStack_` is the chain of lambda literals the scan is
+    // inside, consulted to tell a closure's own parameter from a captured one.
+    void reportMoveOnlyChoiceMoveInClosure(const ast::Expr& e);
+    std::vector<const ast::LambdaExpr*> closureScanStack_;
 
     // fix #3755 (§28.3 *Captured owned bindings* / §27.5 / §28.8.1, v0.286):
     // the READ half of the §28.3 captured-owned-binding rule, the sibling of
@@ -4424,6 +4434,34 @@ private:
     // borrow (store-to-field, out/ref param, multi-hop alias, closure
     // capture). // per §28.3, §31.1
     bool isEscapeBoundLocal(sema::Symbol* sym) const;
+
+    // fix #7891 (§28.9, §15.3, §35.4, v0.357): is `sym` a LIVE local of an
+    // owning-classified choice type — the move-only local §28.9's capture
+    // rule speaks of ("Capturing a *move-only* local ... the closure captures
+    // a borrow whose source is the local's enclosing scope, and may not
+    // outlive it")? Such a local is tracked `Borrowed` when a plain `var`
+    // (its obligation is codegen's scope-end active-case pass, not a
+    // dataflow `Owned`), so `isOwnedTrackedLocal` misses it. Consulted ONLY
+    // by the closure-capture legs (the holder's source and the returned
+    // closure), never by the general escape predicate above: a bare read of
+    // such a local at an owned-consuming position is a MOVE, not an escaping
+    // borrow.
+    bool isLiveMoveOnlyChoiceLocal(sema::Symbol* sym) const;
+    // The type half of the above (no dataflow state consulted), for the
+    // capture pre-pass that runs before `states_` is populated.
+    bool isMoveOnlyChoiceLocalSymbol(sema::Symbol* sym) const;
+    // fix #7891 (§28.9, v0.357): appends to `ids` every identifier a DEEP
+    // walk of `lam` (the #6630 `deepCaptureWalk_` arms: `case`, `$"…"`,
+    // `with`, collection literals, ranges, `bind`) reaches that the plain
+    // walk missed AND that names a move-only choice local. The one read an
+    // owning choice supports without a move is `case o of …`, which the
+    // plain walk does not descend into (#6653), so without this the capture
+    // legs never saw the canonical move-only capture at all. Restricted to
+    // that symbol kind so every other consumer's behaviour — #6653's wider
+    // gap included — is exactly what it was.
+    void appendDeepMoveOnlyChoiceCaptures(
+        const ast::LambdaExpr& lam,
+        std::vector<const ast::IdentifierExpr*>& ids) const;
 
     // fix #8165 (§28.3 *Producers*, §28.3.8, §28.3.9, stdlib §9.6, v0.355): is
     // `e` a FRESH OWNED builtin `Array<T>` PRODUCTION — the stdlib's

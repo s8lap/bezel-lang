@@ -9174,15 +9174,31 @@ void Emitter::markOwningChoiceMovedFromCore(const ast::LocalDecl* targetLd,
     // live a compile error, so the shape should not reach here; declining is
     // the conservative answer if it ever does (the pre-fix double free, never
     // a fresh corruption).
-    if (slot->getAllocatedType() != want) return;
+    //
+    // fix #7891 (§27.5 / §15.3, v0.357): the capture-boxed local IS reachable
+    // — the consume-site freeze forbids the move only while the closure's
+    // borrow is live, so `var f := lambda ...; _ := f(); var y := o;` after
+    // the closure's last use is the ordinary §15.3 move. Its value lives in the
+    // heap cell, so the zero-store goes THROUGH the cell (`boxedStorage`,
+    // the same address the scope-end active-case pass now walks); declining
+    // would leave that pass disposing the payload the taker already owns.
+    // Anything else whose storage is not the exact choice layout is still
+    // declined.
+    llvm::Value* addr = slot;
+    if (slot->getAllocatedType() != want) {
+        auto cit = cellVars_.find(slot);
+        if (cit == cellVars_.end() || cit->second != want) return;
+        llvm::Type* cellElemTy = nullptr;
+        addr = boxedStorage(slot, cellElemTy);
+    }
     llvm::Value* zero = llvm::Constant::getNullValue(want);
     if (guard) {
         // The guarded form (an if-expression branch, above): the slot keeps
         // its value on the path where the other branch was selected.
-        llvm::Value* cur = builder_.CreateLoad(want, slot, "ocmv.cur");
+        llvm::Value* cur = builder_.CreateLoad(want, addr, "ocmv.cur");
         zero = builder_.CreateSelect(guard, zero, cur, "ocmv.next");
     }
-    builder_.CreateStore(zero, slot);
+    builder_.CreateStore(zero, addr);
 }
 
 
@@ -12891,10 +12907,30 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // admits a `C` one, and reading the wrapper's leading bytes as the
             // tag is what made the nullable spelling leak (or, for a different
             // case order, dispatch through the wrong payload slot).
+            // fix #7891 (§27.5 / §28.3 *Captured owned bindings*, §35.4,
+            // v0.357): a CAPTURED owning-choice local. §28.3: "Inside a
+            // closure, a captured owned binding ... is uniformly in borrow
+            // state: reads borrow" — the capture is legal, and §28.9 has
+            // the move-only capture be "a borrow whose source is the local's
+            // enclosing scope", so that scope still disposes it. `boxLocalSlot`
+            // moved the choice value into the capture's heap cell and rebound this entry's
+            // `slot` to the pointer-sized cell HOLDER, so walking the holder
+            // as the choice struct read past it (MEASURED at r30-c1
+            // 46219d9ba: AddressSanitizer stack-buffer-overflow, READ of size
+            // 24 over the 8-byte holder, for a pure `case o of` read in the
+            // closure). `boxedStorage` is the single authority for "where
+            // does this local's value live" — the cell when boxed (with the
+            // recorded holder-read fall-back for a path that never reached
+            // the capture site), the alloca itself otherwise — and it is what
+            // every other reads-through-cell disposal in this function uses,
+            // which is also what makes `consumeLastLambdaCapturedCells` defer
+            // the cell's own free until after this walk.
+            llvm::Type* ocElemTy = nullptr;
+            llvm::Value* ocAddr = boxedStorage(it->slot, ocElemTy);
             if (it->owningChoiceRef)
-                emitOwningChoiceLocationDisposal(it->slot, it->owningChoiceRef);
+                emitOwningChoiceLocationDisposal(ocAddr, it->owningChoiceRef);
             else
-                emitOwningChoiceActiveCaseDisposal(it->slot, it->owningChoiceTy,
+                emitOwningChoiceActiveCaseDisposal(ocAddr, it->owningChoiceTy,
                                                    it->owningChoiceRef);
             continue;
         }
