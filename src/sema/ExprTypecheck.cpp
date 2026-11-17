@@ -8186,8 +8186,36 @@ void ExprTC::checkAssignable(
                     // `T := int?` substitution the carrier IS the value (#4899).
                     // Nor a boxing target (`Object`, an interface): the box
                     // site reads the carrier at the read's declared `T?`.
+                    //
+                    // fix #8607 (§7.4 / §22.6 / §14 / §8.6, v0.357): the
+                    // `from->declaration` test missed the VALUE-BUILTIN
+                    // family, because a value-builtin spelled as an
+                    // ANNOTATION (`var n: Guid?`) resolves to a
+                    // DECLARATION-LESS Named ref — the resolver keeps
+                    // `declaration = nullptr` for the value-builtins (see
+                    // `isValueBuiltinByName`'s own note: "DateTime/TimeSpan/
+                    // DateOnly/TimeOnly/Guid/CancellationToken keep
+                    // declaration=null so that lowerNew()'s `!rt->declaration`
+                    // gate fires"). So the read was NOT published, codegen
+                    // did not extract the payload, and the `{i8 hasValue;
+                    // Guid}` carrier was handed to a `Guid` PARAMETER
+                    // un-stripped: a generic `Bx<Guid>(n)` (T = Guid) boxed
+                    // the carrier, so the box's payload began with the
+                    // carrier's `hasValue` tag byte and `ToString` printed
+                    // `01000000-0000-…` for a `Guid.Empty` — a silent wrong
+                    // value.
+                    //
+                    // `isValueBuiltinByName` is the ONE authority for that
+                    // family (the #1463 consolidation), so this names no
+                    // hand-list. A generic TYPE PARAMETER is still excluded:
+                    // its name is not a value-builtin's, and the #4899
+                    // substitution case is untouched. Codegen re-checks the
+                    // shape before extracting anything, so a name that
+                    // collides with a user's type parameter is inert.
                     if ((from->kind == TypeRef::Kind::Primitive ||
-                         from->declaration) &&
+                         from->declaration ||
+                         (from->kind == TypeRef::Kind::Named &&
+                          isValueBuiltinByName(from->headName()))) &&
                         !isBoxingTargetType(to))
                         ctx_.markNarrowedValueRead(id);
                     if (from->kind == TypeRef::Kind::Primitive) {
