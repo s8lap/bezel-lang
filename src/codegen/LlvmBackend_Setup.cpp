@@ -42082,6 +42082,10 @@ void Emitter::collectCtorRecordBorrowEligible(
         if (ts->kind != ast::TypeDeclKind::Record || ctx_.isImported(ts) ||
             !ts->genericParams.empty() || !recordIsPositional(ts))
             continue;
+        // SEAM-ACCESSOR: local-only by construction -- the `ctx_.isImported(ts)`
+        // guard just above `continue`s for an imported record, whose
+        // `Symbol::decl` is never assigned (#3152), so this read sees only
+        // locally compiled records (fix #5855, v0.357).
         auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
         if (!td || td->positionalFields.size() != ne->args.size()) continue;
         bool declaredCtor = false;
