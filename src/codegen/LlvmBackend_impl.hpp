@@ -15250,7 +15250,17 @@ private:
     // temporary has no slot to null). See the definition for the measured
     // double-free population and why this is a property of the release rather
     // than a per-arm habit.
-    void nullExplicitlyDisposedBuiltinSlot(const ast::Expr& recvExpr);
+    //
+    // fix #8600 (spec §28.2 / §28.3, v0.357): `forceEvenInCheckedMode` — the
+    // CHECKED-mode elision above is sound ONLY for a release that QUARANTINES
+    // its block (a class instance, an array, a dictionary, a closure, a Shared
+    // handle): there the disposed flag stays readable, so the scope-exit
+    // auto-drop's reload of the same pointer is a harmless no-op. The TASK
+    // family's release is a PLAIN FREE (bz_task_free -> `delete task`), so the
+    // reload is a use-after-free; the Task arm passes `true` and the slot is
+    // nulled in both modes. See the definition for the measurement.
+    void nullExplicitlyDisposedBuiltinSlot(const ast::Expr& recvExpr,
+                                           bool forceEvenInCheckedMode = false);
 
     // #1833 (b) / #1467 / §22.4 / §28.3: for a `discardOwnedOutSlots_` range
     // `[base, end)` recorded by buildOrderedArgs on the constructor call path,

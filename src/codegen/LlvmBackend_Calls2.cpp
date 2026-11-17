@@ -8707,6 +8707,12 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
     // (a borrow's slot must NOT be nulled there — its real
     // owner reclaims through it).
     bool builtinReleasedHere = true;
+    // fix #8600 (spec §28.2 / §28.3, v0.357): the Task family's release FREES
+    // the task struct instead of quarantining it, so its slot must be nulled
+    // even in CHECKED mode (where every other built-in's slot is left in place
+    // so the disposed-flag backstop stays readable). Set by the Task arm below;
+    // consumed by the chain's single exit.
+    bool forceSlotNullEvenInCheckedMode = false;
     // §3: collection types use bz_array_free / bz_dict_free.
     auto* recvTy = ctx_.exprType(target);
     // issues #343 / D8: a Set is dict-backed (records,
@@ -9117,7 +9123,37 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
         // vtable-less-builtin arm (which has no Task release) and the chain's
         // exit still nulls the slot, so a second `Dispose()` reloads null and
         // skips — one reclaim, no double free.
-        emitTaskDisposal(recvTy, recv);
+        //
+        // fix #8600 (spec §28.2 / §28.3, v0.357): the chain's exit nulls the
+        // slot in BOTH modes for this receiver — the task release FREES the
+        // task struct (`delete task`), it does not quarantine it, so a slot
+        // that still held the pointer after the explicit Dispose would be read
+        // by the §28.3 scope-end discharge (and by a repeated Dispose) — a
+        // use-after-free whose `bz_task_is_error` locks the DESTROYED mutex
+        // (issue #8600: an infinite `__lll_lock_wait` spin, MEASURED). The
+        // NULL GUARD below is the other half: with the slot nulled, the second
+        // `Dispose()` of the same binding reloads NULL, and the task protocol
+        // must SKIP it rather than call `bz_task_is_error(NULL)`. Every other
+        // arm of this chain has that guard; the Task arm did not, which is why
+        // a repeated `t.Dispose()` SEGFAULTED on a null receiver even in
+        // unchecked mode. §28.2: "Dispose() on any class instance is
+        // idempotent: the first call performs the disposal; subsequent calls
+        // are no-ops."
+        forceSlotNullEvenInCheckedMode = true;
+        {
+            auto* nnBB = llvm::BasicBlock::Create(llvm_, "taskdisp.nn",
+                                                   currentFn_);
+            auto* ctBB = llvm::BasicBlock::Create(llvm_, "taskdisp.cont",
+                                                   currentFn_);
+            builder_.CreateCondBr(
+                builder_.CreateICmpNE(
+                    recv, llvm::ConstantPointerNull::get(ptrTy())),
+                nnBB, ctBB);
+            builder_.SetInsertPoint(nnBB);
+            emitTaskDisposal(recvTy, recv);
+            builder_.CreateBr(ctBB);
+            builder_.SetInsertPoint(ctBB);
+        }
     } else if (common::isVtableLessBuiltinClassName(
                    builtinTypeName(recvTy))) {
         // fix #2921 (spec §28.2 / §28.9 / §8.1, stdlib §1 /
@@ -9540,7 +9576,7 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
     // family — and §28.3's scope-exit / unwind auto-drop
     // reloads null and discharges nothing.
     if (builtinReleasedHere)
-        nullExplicitlyDisposedBuiltinSlot(target);
+        nullExplicitlyDisposedBuiltinSlot(target, forceSlotNullEvenInCheckedMode);
     return true;
 }
 

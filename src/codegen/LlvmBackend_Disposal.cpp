@@ -4795,13 +4795,74 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
 //     `a[i].Dispose()` subscript through `lvalueAddr`, which would re-evaluate
 //     the index expression and re-emit its §15.1 bounds check.
 // // per §28.2 / §28.3
-void Emitter::nullExplicitlyDisposedBuiltinSlot(const ast::Expr& recvExpr) {
-    if (checkedDisposal_) return;
-    if (!dynamic_cast<const ast::IdentifierExpr*>(&recvExpr) &&
-        !dynamic_cast<const ast::MemberAccessExpr*>(&recvExpr))
+void Emitter::nullExplicitlyDisposedBuiltinSlot(const ast::Expr& recvExpr,
+                                                bool forceEvenInCheckedMode) {
+    // fix #2967 (spec §28.2 / §28.3, v0.240): the checked-mode elision. The
+    // reason for it is that a CHECKED-mode release QUARANTINES its block
+    // (emitReclaimBlock keeps the header so the per-instance disposed flag
+    // stays readable — §28.2's "defer reclaiming a disposed instance's memory
+    // in checked mode (quarantine, delayed free) so that the flag remains
+    // readable after disposal"), so the §28.3 scope-exit / unwind auto-drop's
+    // reload of the same pointer re-runs an IDEMPOTENT release on a block that
+    // is still there. Nulling it there would turn the backstop's
+    // DisposedAccessException into a null-deref (§28.2's checked mode wants a
+    // DETERMINISTIC fault, not a crash).
+    //
+    // fix #8600 (spec §28.2 / §28.3, v0.357): that reasoning does NOT hold for
+    // a release that FREES its block. The TASK family is one: its disposal
+    // protocol is `bz_task_fire_and_forget[_checked]` -> `bz_task_free` ->
+    // `bz_task_destroy` -> `delete task` — the task struct (and the
+    // std::mutex inside it) is GONE the moment the explicit `t.Dispose()` runs,
+    // in BOTH modes. Leaving the pointer in the slot in checked mode therefore
+    // makes every later touch of that binding a use-after-free: the §28.3
+    // scope-end discharge calls `bz_task_is_error(t)` on the freed struct,
+    // which locks the DESTROYED mutex — MEASURED (issue #8600, gdb on the hung
+    // process): `__lll_lock_wait <- pthread_mutex_lock <- bz_task_is_error <-
+    // bz$async$M.Program$Main$Resume <- domain_drain <- BzScheduler::run_worker`,
+    // an infinite spin (the freed chunk's first bytes are glibc's tcache `next`
+    // pointer, so the destroyed mutex's `__lock` word is non-zero). The same
+    // use-after-free is what a REPEATED `t.Dispose()` took (the second call
+    // reloaded the still-set slot).
+    //
+    // §28.3's "explicitly-disposed" post-state is the rule this implements: the
+    // explicit call OWNS the discharge ("Scope-end machinery skips its
+    // disposal"), and the slot-null is the hand-off — the same hand-off the
+    // unchecked mode already makes. Nothing is lost in checked mode: a later
+    // READ of the binding is a compile error (§28.3 "Use after a dominating
+    // explicit disposal", and the conditional-discharge join), so there is no
+    // post-dispose use whose DisposedAccessException backstop the null would
+    // have destroyed.
+    if (checkedDisposal_ && !forceEvenInCheckedMode) return;
+    // fix #8600 (spec §28.2 / §28.3, v0.357): the `!` (null-forgiving)
+    // spelling of the receiver — `t!.Dispose()`. §17.12's `!` neither
+    // produces nor transfers: it null-checks and yields the OPERAND's value,
+    // so the slot to null is the OPERAND's — the same unwrap
+    // `explicitDisposeOwnedReceiverSlot` does. Without it the Task family's
+    // `t!.Dispose()` left the pointer in the slot, and the §28.3 scope-end
+    // discharge re-read the FREED task struct — the same hang as
+    // `t.Dispose()`, and in BOTH modes (MEASURED: `var t: Task<int>? :=
+    // Task.FromResult(1); t!.Dispose();` -> rc=124 in checked AND unchecked
+    // mode).
+    //
+    // The unwrap is applied ONLY for the family that needs it — the Task
+    // family, the one whose release FREES its block (it is the sole setter of
+    // `forceEvenInCheckedMode`). The other built-ins' `!`-spelled disposals
+    // keep their current slot handling: for them the release QUARANTINES, so
+    // the scope-end discharge's reload re-runs an idempotent release on a
+    // block that is still there, and nulling the slot there would change the
+    // `!` spelling's observable behaviour for no gain.
+    const ast::Expr* target = &recvExpr;
+    if (forceEvenInCheckedMode) {
+        while (auto* bang = dynamic_cast<const ast::PostfixBangExpr*>(target)) {
+            if (!bang->operand) break;
+            target = bang->operand.get();
+        }
+    }
+    if (!dynamic_cast<const ast::IdentifierExpr*>(target) &&
+        !dynamic_cast<const ast::MemberAccessExpr*>(target))
         return;
     llvm::Type* slotTy = nullptr;
-    if (llvm::Value* slot = lvalueAddr(recvExpr, slotTy))
+    if (llvm::Value* slot = lvalueAddr(*target, slotTy))
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), slot);
 }
 
