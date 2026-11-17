@@ -9050,12 +9050,19 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 llvm::Value* obj = lowerExpr(*ma->target);
                 if (obj) {
                     // §28.2 v0.135 / issue #627: checked-disposal guard for
-                    // array-backed collection Count/Length property access.
-                    // Skip for Set<T> (dict-backed); they use bz_dict_count.
-                    if (checkedDisposal_ && !dictBacked) {
+                    // a collection's Count/Length property access.
+                    // narrow #7076 (§28.2, v0.357): a dict-backed Set<T> is
+                    // guarded too, on the header it actually has — the
+                    // bz_dict_t flag, never the array one. It used to be
+                    // skipped, so a `.Count` on a disposed set read a released
+                    // table (freed memory, or — once the scope-end release
+                    // quarantines — a reset empty table answering 0) instead
+                    // of raising DisposedAccessException.
+                    if (checkedDisposal_) {
                         llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
-                        auto* isFn = declareC("bz_array_is_disposed", i8Ty,
-                                              {ptrTy()});
+                        auto* isFn = declareC(dictBacked ? "bz_dict_is_disposed"
+                                                         : "bz_array_is_disposed",
+                                              i8Ty, {ptrTy()});
                         llvm::Value* flag =
                             builder_.CreateCall(isFn, {obj}, "cd.arrdis");
                         llvm::Value* disposed = builder_.CreateICmpNE(

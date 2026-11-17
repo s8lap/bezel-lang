@@ -11655,7 +11655,26 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             llvm::Value* disp = it->dictValueDisposer
                 ? llvm::cast<llvm::Value>(it->dictValueDisposer)
                 : llvm::ConstantPointerNull::get(ptrTy());
-            auto* fn = declareC("bz_dict_free",
+            // narrow #7076 (§28.2 / §28.3, v0.357): in CHECKED disposal mode
+            // the scope-end release of a hash-backed dictionary or set must
+            // not reclaim the header, for the reason the collection arm above
+            // gives (#7045): §28.3's store-rule residual lets a call store a
+            // borrow of a plain argument in a field, the temporary is disposed
+            // at its boundary, and a later access through the stored borrow
+            // must raise DisposedAccessException (§28.2: "any instance member
+            // access on a logically-disposed instance") — which the
+            // method-entry guard can only do if the header it reads
+            // (bz_dict_is_disposed) is still there. So the checked release
+            // quarantines (the §28.2 latitude to "defer reclaiming a disposed
+            // instance's memory in checked mode"): bz_dict_mark_disposed runs
+            // the same value cascade and frees the same buckets, sets the
+            // flag, and keeps the header. The escape mark keeps the retained
+            // header reachable, as the explicit `.Dispose()` arm does
+            // (emitExplicitDisposeChain). Unchecked mode keeps the immediate
+            // free. The null-store below stays unconditional.
+            emitCdMarkEscaped(tbl);
+            auto* fn = declareC(checkedDisposal_ ? "bz_dict_mark_disposed"
+                                                 : "bz_dict_free",
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {tbl, disp});
