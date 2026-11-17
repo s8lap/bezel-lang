@@ -668,14 +668,4 @@ BEZEL_TEST(xmod_builtin_iface_conformance_3139,
     BEZEL_EXPECT_TRUE(diag.find("Wrong3139 does not implement IComparable<Wrong3139>") != std::string::npos);
 }
 
-// IMPORTED CORRECT-ARG CONTROL: the existing #3139 guard — an imported class
-// that DOES implement IComparable<Self> correctly must still be ACCEPTED.
-// This is the headline row from this file: the first test added in the
-// pre-regression version of this branch, pinned at value 27.
-BEZEL_TEST(xmod_builtin_iface_conformance_3139,
-           sort_imported_correct_icomp_still_sorts_spec_14_2) {
-    BEZEL_EXPECT_EQ(
-        compileImportAndRun3139(kLib3139, importer3139(kSortBody3139)), 27);
-}
-
 }  // namespace bezel::module

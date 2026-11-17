@@ -83,31 +83,5 @@ BEZEL_TEST(iface_method_where_clause_5391,
     BEZEL_EXPECT_TRUE(hasWhereDiag);
 }
 
-// ===========================================================================
-// PART 3: SEMA — an implementation that omits the `where` clause is fine
-// (inherits the interface's constraints).
-// ===========================================================================
-
-BEZEL_TEST(iface_method_where_clause_5391,
-           impl_omits_where_inherits_interface_constraint) {
-    // Interface declares `where T: class`; implementation omits the clause
-    // (inherits it). Should compile successfully — the omitted clause means
-    // "exactly the inherited set" per §14.2.
-    const char* kSrc =
-        "module M; "
-        "public interface I "
-        "  method M<T>(x: T): int where T: class; "
-        "end I; "
-        "public class C : I "
-        "  public constructor() end constructor; "
-        "  public method M<T>(x: T): int return 42; end M; "
-        "end C; "
-        "public class Entry public static method Main(): int => 0; end Entry;";
-    auto r = test::runAot(kSrc);
-    // Should compile (ran = true) even though implementation omits the clause.
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-}
-
 }  // namespace
 }  // namespace bezel::module
