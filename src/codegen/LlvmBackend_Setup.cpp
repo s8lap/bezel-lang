@@ -47389,6 +47389,9 @@ void Emitter::collectObjectStringReleaseEligible(
         // LATE candidate: it becomes a string-aliased slot at its first
         // `o := <string>` below, whose site retains the string into it. The
         // slot takes no reference at bind; its state bit starts false.
+        // LOCALDECL-ONLY: a late slot is admitted only by a later `o := <string>`
+        // reassignment (the `tld` arm below); a §21.1 `const` can never be
+        // reassigned (compile error), so it cannot become a late candidate.
         if (auto* lateLd = dynamic_cast<const ast::LocalDecl*>(s)) {
             LocalDeclInitView lv = localDeclInitView(s);
             const sema::TypeRef* lt =
