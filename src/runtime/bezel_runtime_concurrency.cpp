@@ -1179,6 +1179,26 @@ bool bz_task_is_spent(void* tp) {
     return task->is_spent;
 }
 
+// §31.2 (v0.357) "The chain is per raise, not per instance: when an owner
+// re-raises one of those instances into the in-flight slot, its
+// SupersededChain is cleared first". Called by codegen at every await /
+// `.Result` re-raise of a task-owned fault `exc`, before it enters the
+// in-flight slot. The FIRST re-raise carries the async body's own raise to
+// its first awaiter, so the chain that raise recorded is kept; each LATER
+// re-raise of the same fault clears it, so a multi-awaited task's fault
+// reports only the supersessions of the raise being reported (1, 1, 1 — never
+// 1, 2, 3).
+void bz_task_fault_reraise_clear(void* tp, void* exc) {
+    auto* task = (bz_task_t*)tp;
+    bool later = false;
+    {
+        std::lock_guard<std::mutex> lk(task->mtx);
+        later = task->fault_reraised;
+        task->fault_reraised = true;
+    }
+    if (later) bz_exc_superseded_clear(exc);
+}
+
 // §30.5 / #1332 (v0.162): transfer ownership of `source` into `outer`'s chained
 // slot. Called when `return await <Pattern A source>` completes the outer async
 // method — the source task must outlive the outer task so the borrowed result

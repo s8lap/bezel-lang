@@ -1043,6 +1043,11 @@ bool  bz_task_is_error(void* task);
 void  bz_task_mark_spent(void* task);
 // bz_task_is_spent: returns true after the first await consumed the OwningTask.
 bool  bz_task_is_spent(void* task);
+// §31.2 (v0.357) "The chain is per raise, not per instance": at an await /
+// `.Result` re-raise of the task-owned fault `exc`, clear its SupersededChain
+// unless this is the task's FIRST re-raise (which reports the async body's
+// own raise and keeps what it recorded).
+void  bz_task_fault_reraise_clear(void* task, void* exc);
 
 // §30.5 / #1332 (v0.162): Pattern A chained slot.
 // Transfer ownership of `source` (a Pattern A Task<T:class> result producer) into
@@ -2531,6 +2536,14 @@ void bz_exc_reclaim_causechain_registered(void* obj);
 // allocation rule: a failed allocation silently drops the entry and the
 // supersession proceeds exactly as without the record.
 void bz_exc_superseded_append(void* superseding, void* superseded);
+
+// §31.2 (v0.357) "The chain is per raise, not per instance": an OWNER's
+// re-raise of a task-owned fault (`await t`, `t.Result`) or of the cached
+// `TypeInitializationException` clears the instance's `SupersededChain` first,
+// so it records only the supersessions of the raise being reported. Releases
+// the chain's strings, frees the array and nulls the slot (the empty chain).
+// A no-op for a null argument or an empty chain.
+void bz_exc_superseded_clear(void* exc);
 
 // OwningBuffer<byte> helpers used by BinarySerializer/BinaryDeserializer.
 // bz_owned_buffer_alloc: allocate an OwningBuffer<byte> with the given bytes,

@@ -5461,6 +5461,16 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
         auto* errObjFn = declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
         llvm::Value* excObj =
             builder_.CreateCall(errObjFn, {awaitedTask}, "await.errobj");
+        // §31.2 (v0.357) "The chain is per raise, not per instance": this is
+        // the OWNER's re-raise of a task-owned fault into the in-flight slot,
+        // so a LATER re-raise clears its `SupersededChain` first — a
+        // multi-awaited task's fault records only the supersessions of the
+        // raise being reported. The task's first re-raise keeps the chain its
+        // async body recorded (bz_task_fault_reraise_clear).
+        builder_.CreateCall(
+            declareC("bz_task_fault_reraise_clear",
+                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}),
+            {awaitedTask, excObj});
         builder_.CreateStore(excObj, emitExcSlot());
         // §30.4 / §30.9 (#854): for a BOUND task (freeTaskAfter == false — the task
         // outlives this await and may be awaited AGAIN, §30.4), the re-raised

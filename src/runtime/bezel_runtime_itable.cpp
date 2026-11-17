@@ -251,6 +251,36 @@ extern "C" void bz_exc_superseded_append(void* superseding, void* superseded) {
     }
 }
 
+// §31.2 (v0.357): "The chain is per raise, not per instance: when an owner
+// re-raises one of those instances into the in-flight slot, its
+// `SupersededChain` is cleared first, so it records only the supersessions of
+// the raise being reported." Called BEFORE the instance enters the in-flight
+// slot, so a supersession of this raise appends onto an empty chain: directly
+// by the codegen at the cached-TIE re-raise sites, and through
+// bz_task_fault_reraise_clear at a task's LATER `await` / `.Result` re-raise
+// of its fault (the first one keeps the async body's own record; #8640).
+// Not called for a bare `throw;` (§31.2: "is not such a raise ... and
+// preserves the chain"). The cleared state is the empty-array representation
+// the slot starts in (null).
+extern "C" void bz_exc_superseded_clear(void* exc) {
+    if (!exc) return;
+    void* chain = nullptr;
+    memcpy(&chain, (uint8_t*)exc + BZ_EXC_SUPERSEDED_OFFSET, sizeof(void*));
+    if (!chain) return;
+    void* null_chain = nullptr;
+    memcpy((uint8_t*)exc + BZ_EXC_SUPERSEDED_OFFSET, &null_chain,
+           sizeof(void*));
+    auto* arr = (bz_array_t*)chain;
+    auto* elems = (bz_excinfo_t*)arr->data;
+    for (int64_t i = 0; i < arr->count; i++) {
+        bz_string_release(elems[i].typeName);
+        bz_string_release(elems[i].message);
+        bz_string_release(elems[i].stackTrace);
+    }
+    free(arr->data);
+    free(arr);
+}
+
 // §31.4/#811/#1389: reclaim a CauseChain snapshot at the exception object's
 // TERMINAL reclaim (immediately before the object's own block is freed) —
 // called from the codegen `emitDisposeAndReclaim` reclaim site

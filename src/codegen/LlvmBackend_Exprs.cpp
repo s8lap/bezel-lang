@@ -8480,6 +8480,16 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         builder_.CreateBr(noMarkBB);
                         builder_.SetInsertPoint(noMarkBB);
                     }
+                    // §31.2 (v0.357) "The chain is per raise, not per
+                    // instance": a later re-raise of the task-owned fault
+                    // clears its `SupersededChain` first (the `await` fault
+                    // edge does the same). Before the anonymous producer's
+                    // task free below, which this call must not outlive.
+                    builder_.CreateCall(
+                        declareC("bz_task_fault_reraise_clear",
+                                 llvm::Type::getVoidTy(llvm_),
+                                 {ptrTy(), ptrTy()}),
+                        {task, excObj});
                     // §30.5 (#1127): anonymous producer (`C.Method().Result`)
                     // has no binder that will dispose the task struct; reclaim
                     // it here on the fault path before re-throwing. (excObj is

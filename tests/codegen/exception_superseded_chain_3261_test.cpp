@@ -410,6 +410,184 @@ const char* kToStringOverrideLoop =
     "  end Main; "
     "end Program; ";
 
+// F4. §31.2: "when a `finally` entered during exception propagation itself
+// completes by throwing (directly, or via a call that propagates), the new
+// exception replaces the one being handled". Awaiting a faulted task re-raises
+// its fault (§30.9), so an `await` of a faulted task inside such a `finally`
+// — or inside a catch arm — supersedes the in-flight / caught `ExB`: the
+// re-raised fault's `SupersededChain` records `ExB` and `ExB` is disposed.
+// At the reviewed tip 0823dd306 the chain was empty (count 0) and `ExB`
+// leaked (48 bytes). On this base the await's unwind edge reaches the region's
+// leave block (#7940), whose emitEndExcHandling now records the supersession.
+const char* kFinallyAwaitsFaultedTask =
+    "module M; "
+    "public class ExA: Exception "
+    "  public constructor(message: string) base(message); "
+    "  end constructor; "
+    "end ExA; "
+    "public class ExB: Exception "
+    "  public constructor(message: string) base(message); "
+    "  end constructor; "
+    "end ExB; "
+    "public class Program "
+    "  public static async method Fail(): Task<int> "
+    "    throw new ExA(\"task-fault\"); "
+    "  end Fail; "
+    "  public static async method Main(): Task<int> "
+    "    var t := Program.Fail(); "
+    "    try "
+    "      try "
+    "        throw new ExB(\"loss\"); "
+    "      finally "
+    "        await t; "
+    "      end try; "
+    "    catch "
+    "      var e: Exception => do "
+    "        Console.WriteLine(e.Message); "
+    "        Console.WriteLine(e.SupersededChain.Count); "
+    "        Console.WriteLine(e.SupersededChain[0].Message); "
+    "      end end; "
+    "    return 0; "
+    "  end Main; "
+    "end Program; ";
+
+const char* kCatchArmAwaitsFaultedTask =
+    "module M; "
+    "public class ExA: Exception "
+    "  public constructor(message: string) base(message); "
+    "  end constructor; "
+    "end ExA; "
+    "public class ExB: Exception "
+    "  public constructor(message: string) base(message); "
+    "  end constructor; "
+    "end ExB; "
+    "public class Program "
+    "  public static async method Fail(): Task<int> "
+    "    throw new ExA(\"task-fault\"); "
+    "  end Fail; "
+    "  public static async method Main(): Task<int> "
+    "    var t := Program.Fail(); "
+    "    try "
+    "      try "
+    "        throw new ExB(\"loss\"); "
+    "      catch "
+    "        var b: ExB => do await t; end end; "
+    "    catch "
+    "      var e: Exception => do "
+    "        Console.WriteLine(e.Message); "
+    "        Console.WriteLine(e.SupersededChain.Count); "
+    "        Console.WriteLine(e.SupersededChain[0].Message); "
+    "      end end; "
+    "    return 0; "
+    "  end Main; "
+    "end Program; ";
+
+// F4. §31.2: "The chain is per raise, not per instance: when an owner
+// re-raises one of those instances into the in-flight slot, its
+// `SupersededChain` is cleared first, so it records only the supersessions of
+// the raise being reported." The SAME task-owned fault is re-raised three
+// times (§30.4: a `Task` may be awaited again), each raise superseding one
+// `ExB`; each raise reports exactly one entry. Without the clear the chain
+// accumulates across raises (1, 2, 3).
+const char* kMultiAwaitPerRaise =
+    "module M; "
+    "public class ExA: Exception "
+    "  public constructor(message: string) base(message); "
+    "  end constructor; "
+    "end ExA; "
+    "public class ExB: Exception "
+    "  public constructor(message: string) base(message); "
+    "  end constructor; "
+    "end ExB; "
+    "public class Program "
+    "  public static async method Fail(): Task<int> "
+    "    throw new ExA(\"task-fault\"); "
+    "  end Fail; "
+    "  public static async method Main(): Task<int> "
+    "    var t := Program.Fail(); "
+    "    for var i in 0..<3 do "
+    "      try "
+    "        try "
+    "          throw new ExB(\"loss\" + i.ToString()); "
+    "        finally "
+    "          await t; "
+    "        end try; "
+    "      catch "
+    "        var e: ExA => do "
+    "          Console.WriteLine(e.SupersededChain.Count); "
+    "          Console.WriteLine(e.SupersededChain[0].Message); "
+    "        end end; "
+    "    end for; "
+    "    return 0; "
+    "  end Main; "
+    "end Program; ";
+
+// The same clause on §30.3's other re-raise, the faulted `Result` read.
+const char* kResultReadPerRaise =
+    "module M; "
+    "public class ExA: Exception "
+    "  public constructor(message: string) base(message); "
+    "  end constructor; "
+    "end ExA; "
+    "public class ExB: Exception "
+    "  public constructor(message: string) base(message); "
+    "  end constructor; "
+    "end ExB; "
+    "public class Program "
+    "  public static async method Fail(): Task<int> "
+    "    throw new ExA(\"task-fault\"); "
+    "  end Fail; "
+    "  public static method Main() "
+    "    var t := Program.Fail(); "
+    "    for var i in 0..<3 do "
+    "      try "
+    "        try "
+    "          throw new ExB(\"loss\" + i.ToString()); "
+    "        finally "
+    "          var r := t.Result; "
+    "        end try; "
+    "      catch "
+    "        var e: ExA => do "
+    "          Console.WriteLine(e.SupersededChain.Count); "
+    "          Console.WriteLine(e.SupersededChain[0].Message); "
+    "        end end; "
+    "    end for; "
+    "  end Main; "
+    "end Program; ";
+
+// The same clause on the other owner-owned instance, the cached
+// `TypeInitializationException` (§22.7: every later access re-raises the SAME
+// cached instance).
+const char* kCachedTiePerRaise =
+    "module M; "
+    "public class ExB: Exception "
+    "  public constructor(message: string) base(message); "
+    "  end constructor; "
+    "end ExB; "
+    "public class Cfg "
+    "  public static readonly Value: int := Cfg.Load(); "
+    "  private static method Load(): int "
+    "    throw new InvalidOperationException(\"init failed\"); "
+    "  end Load; "
+    "end Cfg; "
+    "public class Program "
+    "  public static method Main() "
+    "    for var i in 0..<3 do "
+    "      try "
+    "        try "
+    "          throw new ExB(\"loss\" + i.ToString()); "
+    "        finally "
+    "          Console.WriteLine(Cfg.Value); "
+    "        end try; "
+    "      catch "
+    "        var e: TypeInitializationException => do "
+    "          Console.WriteLine(e.SupersededChain.Count); "
+    "          Console.WriteLine(e.SupersededChain[0].Message); "
+    "        end end; "
+    "    end for; "
+    "  end Main; "
+    "end Program; ";
+
 }  // namespace
 
 BEZEL_TEST(codegen_exc_superseded_chain_3261,
@@ -419,4 +597,49 @@ BEZEL_TEST(codegen_exc_superseded_chain_3261,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(out(r), std::string("1\nfirst"));
+}
+
+BEZEL_TEST(codegen_exc_superseded_chain_3261,
+           finally_await_faulted_task_supersedes_spec_31_2_30_9) {
+    JitResult r = runAotChecked(kFinallyAwaitsFaultedTask);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(out(r), std::string("task-fault\n1\nloss"));
+}
+
+BEZEL_TEST(codegen_exc_superseded_chain_3261,
+           catch_arm_await_faulted_task_supersedes_spec_31_2_30_9) {
+    JitResult r = runAotChecked(kCatchArmAwaitsFaultedTask);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(out(r), std::string("task-fault\n1\nloss"));
+}
+
+BEZEL_TEST(codegen_exc_superseded_chain_3261,
+           multi_await_chain_is_per_raise_spec_31_2_30_4) {
+    JitResult r = runAotChecked(kMultiAwaitPerRaise);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(out(r), std::string("1\nloss0\n1\nloss1\n1\nloss2"));
+}
+
+BEZEL_TEST(codegen_exc_superseded_chain_3261,
+           result_read_chain_is_per_raise_spec_31_2_30_3) {
+    JitResult r = runAotChecked(kResultReadPerRaise);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(out(r), std::string("1\nloss0\n1\nloss1\n1\nloss2"));
+}
+
+BEZEL_TEST(codegen_exc_superseded_chain_3261,
+           cached_tie_chain_is_per_raise_spec_31_2_22_7) {
+    JitResult r = runAotChecked(kCachedTiePerRaise);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(out(r), std::string("1\nloss0\n1\nloss1\n1\nloss2"));
 }

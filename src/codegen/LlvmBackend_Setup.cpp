@@ -2353,7 +2353,17 @@ llvm::Function* Emitter::genericInstEnsureInitFn(
     // (bz_static_init_wait returned 3) — both leave excGV already populated
     // (by whichever domain's failB ran first), so both raise the SAME instance.
     builder_.SetInsertPoint(reraiseB);
-    builder_.CreateStore(builder_.CreateLoad(ptrTy(), excGV), emitExcSlot());
+    {
+        // §31.2 (v0.357) "The chain is per raise, not per instance": the
+        // owner's re-raise of the cached TIE clears its `SupersededChain`
+        // first, so it records only the supersessions of this raise.
+        llvm::Value* cachedTie = builder_.CreateLoad(ptrTy(), excGV);
+        builder_.CreateCall(
+            declareC("bz_exc_superseded_clear", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy()}),
+            {cachedTie});
+        builder_.CreateStore(cachedTie, emitExcSlot());
+    }
     builder_.CreateBr(retB);
 
     builder_.SetInsertPoint(retB);
@@ -13224,7 +13234,18 @@ void Emitter::emitEnsureInitFns() {
         // reclaims it — so it is safe to raise the same pointer on every later
         // access.
         builder_.SetInsertPoint(failedB);
-        builder_.CreateStore(builder_.CreateLoad(ptrTy(), excGV), emitExcSlot());
+        {
+            // §31.2 (v0.357) "The chain is per raise, not per instance": the
+            // owner's re-raise of the cached TIE clears its
+            // `SupersededChain` first (the generic-instantiation twin above
+            // does the same).
+            llvm::Value* cachedTie = builder_.CreateLoad(ptrTy(), excGV);
+            builder_.CreateCall(
+                declareC("bz_exc_superseded_clear",
+                         llvm::Type::getVoidTy(llvm_), {ptrTy()}),
+                {cachedTie});
+            builder_.CreateStore(cachedTie, emitExcSlot());
+        }
         builder_.CreateBr(retB);
 
         builder_.SetInsertPoint(retB);

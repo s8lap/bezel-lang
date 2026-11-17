@@ -628,6 +628,13 @@ struct bz_task_t {
     // teardown (bz_task_destroy) — or hands it on with the instance when a
     // runtime combinator takes the fault out of it (bz_task_take_fault).
     bool fault_hold = false;
+    // §31.2 (v0.357) "The chain is per raise, not per instance": set by the
+    // FIRST await / `.Result` re-raise of this task's fault
+    // (bz_task_fault_reraise_clear). That first re-raise reports the async
+    // body's own raise across the task boundary, so it keeps the chain the
+    // body recorded; every later re-raise clears the fault's SupersededChain
+    // first. The first-awaiter reading is spec question #8640.
+    bool fault_reraised = false;
     char* error_msg = nullptr;
     // §30.9: the ORIGINAL exception object that faulted this task (a Bezel heap
     // object with a leading vtable word). Preserved across the task boundary so
