@@ -38603,6 +38603,26 @@ struct ClosureEscapeWalker {
     bool reassignSeen_ = false;
     bool escapeBeforeReassign_ = false;
     bool escapeAfterReassign_ = false;
+    // fix-forward #8479 (§28.9, v0.357): set when the walk meets `target` at
+    // an escape site that is NOT known to take a reference of its own. The
+    // two escape sites that are known to take one are a `return` of the bare
+    // target (the return mints the caller's reference, or transfers the
+    // slot's) and a store of the bare target into an instance field of a
+    // class (`lowerClosureFieldStore` retains; `storeTargetTakesReference`
+    // below). A lambda capture is not an escape of this kind either (the
+    // capture cell holds the slot's reference). Every other escape — a
+    // collection `Add` / `Insert` / indexer store, a collection literal, a
+    // `scoped` or otherwise retained argument, a static / record field
+    // store, a bind into a local that takes no reference — may KEEP the
+    // pointer while owning nothing (`Array<F>.Add` takes no reference:
+    // #5216, #5866), so the only thing keeping the stored function value
+    // alive afterwards is a reference some local still holds.
+    // collectClosureReleaseEligible reads this for an owned alias: binding a
+    // source into such an alias is an escape of the SOURCE.
+    bool keptWithoutReference_ = false;
+    // True while the walk is inside one of the two reference-taking escape
+    // sites named above.
+    bool inReferenceTakingSite_ = false;
     // fix #4473 (§27.5 / §28.9, v0.301): true when target is the RHS of an
     // AssignmentStmt whose LHS is a same-scope closure-typed local/parameter
     // (a `lambdaRef := y` shape where `y` is the walked target and
@@ -38636,6 +38656,28 @@ struct ClosureEscapeWalker {
     // value for the new local, so two references exist from then on and each
     // local releases its own. See the LocalDecl arm of stmt().
     const std::unordered_set<const void*>* ownedAliasDecls = nullptr;
+
+    // fix-forward #8479 (§28.9, v0.357): true when a store into `t` is one
+    // `Emitter::lowerClosureFieldStore` handles, i.e. `t` is what
+    // `Emitter::isClosureFieldLvalue` accepts — a function-typed INSTANCE
+    // field or auto-property of a CLASS. That store retains a borrowed
+    // right-hand side, so the stored pointer has a reference of its own. A
+    // local, a `ref`/`out` parameter, an array or dictionary element, a
+    // static field and a record field are all plain stores and answer false.
+    // Fails closed: anything not positively recognised is "takes none".
+    bool storeTargetTakesReference(const ast::Expr& t) const {
+        const sema::TypeRef* rt = ctx.exprType(t);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Function) return false;
+        sema::Symbol* sym = ctx.exprSymbol(t);
+        auto* ms = dynamic_cast<sema::MemberSymbol*>(sym);
+        if (!ms || !ms->parent ||
+            ms->parent->kind != ast::TypeDeclKind::Class)
+            return false;
+        for (auto mod : ms->modifiers)
+            if (mod == "static") return false;
+        if (dynamic_cast<sema::FieldSymbol*>(sym)) return true;
+        return sema::isAutoPropertyStorageSymbol(sym, ctx);
+    }
 
     bool isTargetIdent(const ast::Expr* e) const {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -39079,6 +39121,9 @@ struct ClosureEscapeWalker {
                 // fix #8480: see escapeBeforeReassign_'s comment.
                 if (reassignSeen_) escapeAfterReassign_ = true;
                 else escapeBeforeReassign_ = true;
+                // fix-forward #8479: see keptWithoutReference_'s comment.
+                if (!inLambda && !inReferenceTakingSite_)
+                    keptWithoutReference_ = true;
             }
             // fix #4434 (§27.5 / §28.9, v0.298): a target reference observed
             // while `inLambda` is true proves the slot is captured by a
@@ -39515,7 +39560,19 @@ struct ClosureEscapeWalker {
                 escaped = true;
                 return;
             }
-            expr(r->value.get(), /*safeRead=*/false); return;
+            // fix-forward #8479 (§28.9, v0.357): a `return` of the BARE
+            // target hands the caller a reference of its own (minted or
+            // transferred, `returnedClosureLocalOwnsPlusOne`); see
+            // keptWithoutReference_. A returned expression that merely
+            // contains the target is not recognised and stays "kept".
+            {
+                const bool savedSite = inReferenceTakingSite_;
+                if (r->value && isTargetIdent(r->value.get()))
+                    inReferenceTakingSite_ = true;
+                expr(r->value.get(), /*safeRead=*/false);
+                inReferenceTakingSite_ = savedSite;
+            }
+            return;
         }
         if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
             // A discarded expression (e.g. `f(args);` — the call callee is a
@@ -39630,7 +39687,20 @@ struct ClosureEscapeWalker {
                 escapedDueToAssignIntoClosureLocal_ = true;
             }
             expr(as->target.get(), /*safeRead=*/false);
-            expr(as->value.get(), /*safeRead=*/false);
+            // fix-forward #8479 (§28.9, v0.357): `obj.F := target;` into an
+            // instance field of a class retains the stored value
+            // (storeTargetTakesReference); see keptWithoutReference_. Any
+            // other store of the target — `xs[i] := target;`, a static or
+            // record field, a compound operator — takes no reference.
+            {
+                const bool savedSite = inReferenceTakingSite_;
+                if (as->op == ":=" && as->target && as->value &&
+                    isTargetIdent(as->value.get()) &&
+                    storeTargetTakesReference(*as->target))
+                    inReferenceTakingSite_ = true;
+                expr(as->value.get(), /*safeRead=*/false);
+                inReferenceTakingSite_ = savedSite;
+            }
             return;
         }
         if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
@@ -40333,6 +40403,73 @@ void Emitter::collectClosureReleaseEligible(
     };
     for (auto& s : body) scan(s.get());
 
+    // fix-forward #8479 (§28.9, v0.357): which of this body's owned aliases
+    // may a SOURCE be bound into without the bind counting as an escape of
+    // the source.
+    //
+    // An owned alias retains at its bind and releases at its scope end, so
+    // by itself it is balanced, and that is what lets the source keep its
+    // own verdict (fix #8440's "safe read"). It stops being enough the
+    // moment the alias hands the value to a site that keeps the pointer and
+    // takes NO reference — `fs.Add(a)`, `fs.Insert(0, a)`, `fs[0] := a`,
+    // `d[k] := a`, a collection literal, a kept argument (`Array<F>` stores
+    // borrow a function value: #5216, #5866). The stored pointer then has
+    // nothing behind it except the references the locals hold: the alias's
+    // is gone at the alias's scope end, so the SOURCE's is the only one
+    // left, and releasing it frees a function value the collection still
+    // reaches. MEASURED (ASan, 200 iterations) on the first #8479 fix: five
+    // programs that merely leaked before it (`var g := lambda …; var a := g;
+    // fs.Add(a);` with `fs` outliving the block or the call) became
+    // heap-use-after-free.
+    //
+    // So for such an alias the bind is what it was before #8479: an ESCAPE
+    // of the source. A never-reassigned source then keeps "escaped, not
+    // released" (its reference is the one the collection lives on — a leak,
+    // the safe direction, and exactly the verdict of the alias-free
+    // `fs.Add(g)`); the alias itself still retains and releases, so it adds
+    // nothing and removes nothing. The alias's `keptWithoutReference_` is
+    // the test, and it spreads up an alias chain (`var a := g; var b := a;
+    // fs.Add(b);` — `a` is where `b`'s kept value came from).
+    //
+    // Both reference-taking escapes stay out of this: a `return` of the
+    // alias and a store into a class instance field leave the value with a
+    // reference of its own, so the source may still be released (the
+    // alias-source pass after the main loop handles its cell).
+    std::unordered_set<const void*> sourceSafeAliases;
+    {
+        std::unordered_set<const void*> keptAliases;
+        for (const ast::Node* ld : candidates) {
+            const void* key = static_cast<const void*>(ld);
+            if (!closureAliasOwned_.count(key)) continue;
+            sourceSafeAliases.insert(key);
+            ClosureEscapeWalker aw{ctx_, key};
+            aw.coalesceReturnTransfers = coalesceReturnTransfers;  // #6176
+            aw.ownedAliasDecls = &closureAliasOwned_;
+            aw.scrutineeBorrowMode = true;
+            aw.assignedSomewhere = assignedLocals.count(key) != 0;
+            aw.walkWholeBody = true;
+            for (auto& s : body) aw.stmt(s.get());
+            if (aw.keptWithoutReference_) keptAliases.insert(key);
+        }
+        for (bool changed = !keptAliases.empty(); changed;) {
+            changed = false;
+            for (const ast::Node* ld : candidates) {
+                const void* key = static_cast<const void*>(ld);
+                if (!keptAliases.count(key)) continue;
+                LocalDeclInitView kv = localDeclInitView(ld);
+                if (!kv.init) continue;
+                for (const void* other : sourceSafeAliases) {
+                    if (other == key || keptAliases.count(other)) continue;
+                    ClosureEscapeWalker cw{ctx_, other};
+                    if (!cw.containsTargetAnywhere(kv.init)) continue;
+                    keptAliases.insert(other);
+                    changed = true;
+                }
+            }
+        }
+        for (const void* key : keptAliases) sourceSafeAliases.erase(key);
+    }
+
     // fix #8479: the candidates a `return` names bare (see the alias-source
     // pass after this loop).
     std::unordered_set<const void*> returnedByName;
@@ -40341,7 +40478,9 @@ void Emitter::collectClosureReleaseEligible(
         w.coalesceReturnTransfers = coalesceReturnTransfers;  // #6176
         // fix #8440: a bind into an alias that takes its own reference does
         // not spend this candidate's reference (see ownedAliasDecls).
-        w.ownedAliasDecls = &closureAliasOwned_;
+        // fix-forward #8479: unless that alias hands the value on to a site
+        // that keeps it without a reference (sourceSafeAliases, above).
+        w.ownedAliasDecls = &sourceSafeAliases;
         // fix #2481 (consumer 3/3): OPT-IN the case-scrutinee relaxation —
         // see the scrutineeBorrowMode flag comment (struct ClosureEscapeWalker,
         // above) for the full soundness argument. A closure-typed producer
@@ -40510,11 +40649,19 @@ void Emitter::collectClosureReleaseEligible(
         // reference is its OWN at every point — taken at the bind, re-taken
         // by each assignment — and no site that lets the value leave the
         // frame spends it (a field store retains, a return mints, a
-        // collection store borrows; the one site that takes a slot's
+        // collection store takes nothing; the one site that takes a slot's
         // reference over is a lambda capture, excluded here by
-        // `isCapturedCellSlot_`). So it is released at scope end whatever
-        // else happens to the value — exactly as the unowned alias's
-        // "nothing to release" was right whatever happened.
+        // `isCapturedCellSlot_`). So the ALIAS's reference is released at
+        // scope end whatever else happens to the value: that release only
+        // undoes the alias's own retain.
+        //
+        // fix-forward #8479: what that does NOT settle is the SOURCE. A
+        // collection store keeps the pointer and takes no reference, so
+        // once the alias's reference is gone the stored value lives on the
+        // source's alone — which is why the bind into an alias that reaches
+        // such a store is an escape of the source again (`sourceSafeAliases`,
+        // above this loop), and the source keeps the verdict it had before
+        // the alias owned anything.
         const void* ldKey = static_cast<const void*>(ld);
         closureEscapingScopeEndRelease_.erase(ldKey);
         if (w.escaped && !w.isCapturedCellSlot_) {
