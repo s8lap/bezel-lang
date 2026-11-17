@@ -18974,6 +18974,61 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // methods. FileStream has no user TypeDecl, so nothing else
                     // types these calls.
                     if (colName == "FileStream") {
+                        // fix #1394 (stdlib §7.1, v0.357): the ONE-argument
+                        // forms are the span overloads
+                        // `Read(buffer: Span<byte>): int` and
+                        // `Write(buffer: ReadOnlySpan<byte>)`. Codegen lowers
+                        // the span's (source, start, length) straight into
+                        // the byte-window runtime entries, so the argument
+                        // must be a BYTE span of the right family or the call
+                        // would reinterpret another element type's storage as
+                        // bytes (a `Span<int>`) or write through a read-only
+                        // view (a `ReadOnlySpan<byte>` at `Read`). A writable
+                        // `Span<byte>`/`ArraySpan<byte>` is admitted at
+                        // `Write` too: it converts to its read-only twin
+                        // (stdlib §4.14/§4.15). An argument whose static type
+                        // is unknown or not a builtin span is left to the
+                        // backstop (no verdict on what this check cannot see).
+                        if ((m == "Read" || m == "Write") &&
+                            ce.args.size() == 1 && ce.args[0].value &&
+                            !ce.args[0].isDiscard) {
+                            const TypeRef* at = ctx_.exprType(*ce.args[0].value);
+                            if (at && at->kind == TypeRef::Kind::Named &&
+                                !at->declaration) {
+                                const auto hn = at->headName();
+                                const bool spanHead =
+                                    hn == "Span" || hn == "ArraySpan" ||
+                                    hn == "ReadOnlySpan" ||
+                                    hn == "ReadOnlyArraySpan";
+                                const bool writable =
+                                    hn == "Span" || hn == "ArraySpan";
+                                const bool byteEl =
+                                    at->genericArgs.size() == 1 &&
+                                    at->genericArgs[0] &&
+                                    at->genericArgs[0]->kind ==
+                                        TypeRef::Kind::Primitive &&
+                                    at->genericArgs[0]->primitive == P::Byte;
+                                if (spanHead && (!byteEl ||
+                                        (m == "Read" && !writable))) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error,
+                                        ce.args[0].value->span.begin,
+                                        std::string("`FileStream.") +
+                                        std::string(m) + "` takes " +
+                                        (m == "Read"
+                                            ? "a writable `Span<byte>` "
+                                              "(or `ArraySpan<byte>`)"
+                                            : "a `ReadOnlySpan<byte>` "
+                                              "(or `ReadOnlyArraySpan<byte>`)") +
+                                        " as its one-argument span form, not " +
+                                        (byteEl ? "the read-only `" : "a non-`byte` `") +
+                                        std::string(hn) +
+                                        "` (stdlib \xC2\xA7""7.1, v0.357; "
+                                        "fix #1394)");
+                                    return;
+                                }
+                            }
+                        }
                         // §7.1: Read(buffer, offset, count) → int (bytes read).
                         if (m == "Read")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));

@@ -16545,7 +16545,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                 "documents for it: either `" + ftMember +
                                 "` is not on that surface (a misspelling), or "
                                 "it is documented but not implemented by this "
-                                "compiler (#2457)" +
+                                "compiler (" +
+                                // fix #1394 (stdlib §7.1/§7.2, v0.357): the
+                                // `Stream`/`FileStream` surface has its own
+                                // live tracker — #1394 names the forms still
+                                // unimplemented there (the async
+                                // `ReadAsync`/`WriteAsync`/`ReadAllAsync`
+                                // members and a `Stream`-typed receiver) —
+                                // so the closed #2457 is not cited for it.
+                                std::string((ftRecv == "FileStream" ||
+                                             ftRecv == "Stream")
+                                                ? "#1394" : "#2457") +
+                                ")" +
                                 builtinMemberChainNote(ftMember, ftApplied));
                             return nullptr;
                         }

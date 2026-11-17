@@ -21904,6 +21904,41 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         "IndexOutOfRangeException");
                     return nullptr;
                 }
+                // per stdlib §7.1 (#1394, v0.357): the span overloads
+                // `Read(buffer: Span<byte>): int` and
+                // `Write(buffer: ReadOnlySpan<byte>)`. "The span carries its
+                // own range" (slice first, §1 Window parameters): a span
+                // value lowers to the shared `%bz.arrayspan { ptr source,
+                // i32 start, i32 length }` struct (spanSource / spanStart /
+                // spanLength), whose `source` is the backing `bz_array_t*`
+                // of the 3-argument form's `buffer` — so the span forms are
+                // exactly the windowed runtime entries with the span's own
+                // (start, length) as (offset, count); there is no second
+                // window to guard. The argument is gated on its STATIC type
+                // (`isSpanLikeTypeName`, fix #3891/#3889: a struct-shaped
+                // non-span such as a `Range<int>` must never have its bytes
+                // reinterpreted as a span), so any other one-argument
+                // spelling still reaches the #2457 backstop.
+                if ((mname == "Read" || mname == "Write") &&
+                    call.args.size() == 1 && call.args[0].value &&
+                    isSpanLikeTypeName(ctx_.exprType(*call.args[0].value))) {
+                    llvm::Value* sp = lowerExpr(*call.args[0].value);
+                    if (!sp || !sp->getType()->isStructTy()) return nullptr;
+                    llvm::Value* src = spanSource(sp);
+                    llvm::Value* off = spanStart(sp);
+                    llvm::Value* cnt = spanLength(sp);
+                    if (mname == "Read") {
+                        auto* fn = declareC("bz_filestream_read", i64(),
+                                            {ptrTy(), ptrTy(), i32(), i32()});
+                        llvm::Value* n = builder_.CreateCall(
+                            fn, {fs, src, off, cnt}, "fs.read.span");
+                        return builder_.CreateTrunc(n, i32(), "fs.read.span.n");
+                    }
+                    auto* fn = declareC("bz_filestream_write", i32(),
+                                        {ptrTy(), ptrTy(), i32(), i32()});
+                    builder_.CreateCall(fn, {fs, src, off, cnt}, "fs.write.span");
+                    return nullptr;
+                }
                 if (mname == "Flush" && call.args.empty()) {
                     auto* fn = declareC("bz_filestream_flush",
                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
