@@ -3510,13 +3510,30 @@ void ExprTC::resolveMemberAccessWithRule1(const ast::MemberAccessExpr& ma) {
         // them: the arity-0 call is the HOLE (it MATCHES the property's own
         // arity, so every "takes no arguments" arm skipped it), and the
         // arity>0 call was never the hole.
+        //
+        // fix #8633 (stdlib §1 "Block-by-name", §4.1 / §4.2, spec §26.5 rule 1,
+        // §27.1, §27.7, v0.357): the gate is the table's `refusesCall`, NOT
+        // its `readModelled`. The two are different questions: `refusesCall`
+        // asks whether the CALL spelling of this PROPERTY must be refused
+        // (it must, on every head — a property of a non-function type is not
+        // callable), and `readModelled` asks whether the property READ is a
+        // modelled spelling on this receiver (and so whether the refusal may
+        // offer `.X` as the remedy). Before this fix the two were the same
+        // flag, which left the six collection INTERFACE heads' inherited
+        // `Count` PROPERTY unrefused: `c.Count()` on an `IList<int>` was
+        // typed `int` and answered the element count, where the same call on
+        // the concrete `Array<int>` is refused. stdlib §1's "Block-by-name"
+        // row commits the lookup to instance members BY NAME — "inherited
+        // ones included" — so the `Count` PROPERTY `IList<T>` inherits from
+        // `IReadOnlyCollection<T>` (stdlib §4.1) blocks the §5 `Count()`
+        // operator exactly as `Array<T>`'s own `Count` does.
         TypeRef* recvTy = currentCallArity_ == 0 ? ctx_.exprType(*ma.target)
                                                   : nullptr;
         const std::string_view recvHead = builtinPropertyReceiverHead(recvTy);
         if (!recvHead.empty()) {
             const common::BuiltinPropertyDecl* d =
                 common::builtinDeclaredProperty(recvHead, ma.member);
-            if (d && d->readModelled) {
+            if (d && d->refusesCall) {
                 auto loc = ma.span.begin;
                 if (loc.line == 0) loc = ma.target->span.begin;
                 ctx_.diagnostics().report(
@@ -3525,7 +3542,8 @@ void ExprTC::resolveMemberAccessWithRule1(const ast::MemberAccessExpr& ma) {
                         ma.member, recvHead,
                         std::string("stdlib \xC2\xA7") + std::string(d->section) +
                             ": `" + std::string(d->member) + ": " +
-                            std::string(d->type) + "`"));
+                            std::string(d->type) + "`",
+                        d->readModelled));
                 return;
             }
         }
@@ -7563,6 +7581,58 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     "takes no arguments (stdlib §3.1), but this call supplies " +
                     std::to_string(currentCallArity_) + ". " +
                     extensionNameBlockedNote(nullCondRecvTy, nm->member));
+        }
+        // fix #8633 (stdlib §1 "Block-by-name", §4.1 / §4.2, spec §7.5,
+        // §26.5 rule 1, §27.1, §27.7, v0.357): the `?.` twin of the `.`
+        // spelling's refusal of a built-in PROPERTY called as a method.
+        //
+        // §7.5 (v0.357): "`x?.M` returns null if `x` is null; otherwise it
+        // performs the access." — the `?.` spelling performs the SAME access
+        // the `.` spelling does, so the two spellings of ONE member may not
+        // disagree (the rule #8582 and #8583 record, and #7670's refusal of
+        // the `?.` `Count(pred)` already applies it: the `?.` spelling
+        // commits to the instance member BY NAME, "inherited ones included").
+        //
+        // So `c?.Count()` on a collection INTERFACE head names the inherited
+        // `Count` PROPERTY (stdlib §4.1: `IReadOnlyCollection<out T>` declares
+        // "pure readonly property Count: int"), and a property of a non-function
+        // type is not callable (§27.1, §27.7): the call has no candidate.
+        // Before this fix the `?.` spelling was typed `int?` and answered the
+        // element count — the SAME hole the `.` spelling had, and (on
+        // `IOwningList<T>`) a SILENT one: MEASURED on this base, `c?.Count()`
+        // over an `IOwningList<Box>?` degraded to a zero-initialised value
+        // behind the internal #2434 warning and printed -1.
+        //
+        // The table's `refusesNullCondCall` flag scopes this to the rows whose
+        // `?.` spelling must be refused: the six collection INTERFACE heads.
+        // It is FALSE for the CONCRETE heads, and that is a PIN, not an
+        // omission: the conformance corpus's §7.5 rule cases s7_5_0009 /
+        // s7_5_0010 / s7_5_0012 / s7_5_0013 are `expect: run` cases over
+        // `a?.Count()` on an `Array<int>?`, and #6529 (CLOSED) is the issue
+        // that made the spelling work. The `.` spelling of that shape is
+        // refused (the #7543 rule); the corpus's §7.5 VEHICLE is what differs,
+        // and fix #8633 leaves the corpus alone and reports the difference.
+        if (nullCondIsCall && currentCallArity_ == 0 && nm->target &&
+            ctx_.diagnostics().errorCount() == errorsBeforeNullCond) {
+            const std::string_view nullCondHead =
+                builtinPropertyReceiverHead(nullCondRecvTy);
+            if (!nullCondHead.empty()) {
+                const common::BuiltinPropertyDecl* d =
+                    common::builtinDeclaredProperty(nullCondHead, nm->member);
+                if (d && d->refusesNullCondCall) {
+                    auto loc = nm->span.begin;
+                    if (loc.line == 0) loc = nm->target->span.begin;
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        common::propertyCalledAsMethodMessage(
+                            nm->member, nullCondHead,
+                            std::string("stdlib \xC2\xA7") +
+                                std::string(d->section) + ": `" +
+                                std::string(d->member) + ": " +
+                                std::string(d->type) + "`",
+                            d->readModelled));
+                }
+            }
         }
     }
     // Slice 3f: NewExpr is typed as its constructed type. `default`

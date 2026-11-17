@@ -54,9 +54,12 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 using bezel::test::runAotOut;
 
@@ -81,6 +84,15 @@ std::string listProgram(const std::string& ext, const std::string& body) {
            "  var c: IList<int> := a; " + body +
            "  return 0; "
            " end Main; end Program;";
+}
+
+// A rejection row: the program must be REJECTED at compile time with the
+// named diagnostic, at a real source location, and it must not have run.
+bool rejectedWith(const std::string& program, const char* needle) {
+    auto r = runAot(program);
+    if (r.ran) return false;
+    if (!failedAtCompileTimeWithRealLocation(r)) return false;
+    return diagnosticMessageContains(r, needle);
 }
 
 }  // namespace
@@ -164,12 +176,21 @@ BEZEL_TEST(extension_receiver_symbol_6159, sb_length_declared_member_wins) {
 // `IReadOnlyCollection<T>`, and an inherited member commits rule 1 too (the
 // stdlib's "Block-by-name" convention: "extension resolution commits to
 // instance members by name, inherited ones included") — the built-in answers.
-BEZEL_TEST(extension_receiver_symbol_6159, ilist_count_inherited_member_wins) {
-    // per §26.5 rule 1 (v0.345); stdlib §4.1
-    BEZEL_EXPECT_EQ(runAotOut(listProgram(
-        "extension IList<int> public method Count(): int => 77; end;",
-        "var i: int := c.Count(); Console.WriteLine(i);")),
-        "3");
+//
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1,
+// §27.7, v0.357): this row's expectation is FLIPPED. The committed member is
+// the inherited `Count` PROPERTY, and a property of a non-function type is
+// not callable, so the CALL spelling has no candidate — the #7543 refusal the
+// concrete `Array<T>` head already gets. The extension's 77 is unreachable
+// either way; the built-in's answer is unreachable too.
+BEZEL_TEST(extension_receiver_symbol_6159,
+           ilist_count_inherited_member_call_is_refused_property_call_8633) {
+    // per stdlib §4.1 + §26.5 rule 1 + §27.1 + §27.7 (v0.357)
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        listProgram(
+            "extension IList<int> public method Count(): int => 77; end;",
+            "var i: int := c.Count(); Console.WriteLine(i);"),
+        "`Count` is a property of `IList`, not a method"));
 }
 
 // per §26.5 rule 1 (v0.345) + stdlib §4.4: `Array<T>` DECLARES `Count`, so
@@ -198,10 +219,13 @@ BEZEL_TEST(extension_receiver_symbol_6159, array_count_declared_member_wins) {
 //
 // fix #7543 (§26.5 rule 1, §27.1, §27.7, v0.355): the two PROPERTY reads
 // (`a.Count`, `sb.Length`) are the spellings stdlib §4.4 / §3.1 declare; the
-// CALL spelling of each is now refused. The `IList<T>` receiver's zero-arg
-// `c.Count()` is the collection-INTERFACE shape, which stays admitted (#7446's
-// ruling — the built-in answers it, and the property READ on a declaration-less
-// interface head is not modelled in the local-initialiser position).
+// CALL spelling of each is now refused.
+//
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1,
+// §27.7, v0.357): the `IList<T>` receiver's zero-arg `c.Count()` is refused
+// too — the collection-INTERFACE head inherits the `Count` PROPERTY, so the
+// call has no candidate. That call leaves this row (it is pinned by its own
+// rejection row below), so the two remaining PROPERTY reads are the control.
 BEZEL_TEST(extension_receiver_symbol_6159, no_extension_builtin_still_answers) {
     // per stdlib §3.1 / §4.1 / §4.4
     BEZEL_EXPECT_EQ(runAotOut(
@@ -211,11 +235,29 @@ BEZEL_TEST(extension_receiver_symbol_6159, no_extension_builtin_still_answers) {
         "  var c: IList<int> := a; "
         "  var sb := new StringBuilder(); sb.Append(\"abc\"); "
         "  Console.WriteLine(a.Count); "
-        "  Console.WriteLine(c.Count()); "
         "  Console.WriteLine(sb.Length); "
         "  return 0; "
         "end Main; end Program;"),
-        "3\n3\n3");
+        "3\n3");
+}
+
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1,
+// §27.7, v0.357): the `IList<T>` receiver's zero-arg `c.Count()` — the
+// collection-INTERFACE shape, with NO extension in the program at all — is
+// refused with the #7543 diagnostic, exactly as `a.Count()` on the concrete
+// `Array<T>` head is.
+BEZEL_TEST(extension_receiver_symbol_6159,
+           no_extension_ilist_count_call_is_refused_property_call_8633) {
+    // per stdlib §4.1 + §26.5 rule 1 + §27.1 + §27.7 (v0.357)
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        "module R; "
+        "class Program public static method Main(): int "
+        "  var a: Array<int> := [1,2,3]; "
+        "  var c: IList<int> := a; "
+        "  Console.WriteLine(c.Count()); "
+        "  return 0; "
+        "end Main; end Program;",
+        "`Count` is a property of `IList`, not a method"));
 }
 
 // An extension whose name no built-in arm claims is untouched by the fix.

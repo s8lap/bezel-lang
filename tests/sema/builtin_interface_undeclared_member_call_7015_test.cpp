@@ -247,11 +247,22 @@ BEZEL_TEST(builtin_interface_undeclared_member_call_7015,
 
 // CONTROL 7 — the stdlib §5 `Count()` operator (a METHOD, distinct from the
 // `Count` property of the counted heads).
+//
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1,
+// §27.7, v0.357): this row's expectation is FLIPPED. `IList<T>` INHERITS the
+// `Count` PROPERTY from `IReadOnlyCollection<T>` (stdlib §4.1: "pure readonly
+// property Count: int"), and stdlib §1's "Block-by-name" row commits the
+// lookup to instance members BY NAME — "inherited ones included" — so
+// `il.Count()` names that PROPERTY, not the §5 `IEnumerable<T>` extension
+// operator. A property of a non-function type is not callable (§27.1,
+// §27.7), so the call has no candidate: the #7543 refusal the concrete
+// `Array<T>` head already gets.
 BEZEL_TEST(builtin_interface_undeclared_member_call_7015,
-           ilist_linq_count_call_still_works_spec_5) {
-    expectStdout(mainWith("var il: IList<int> := a; ",
-                          "Console.WriteLine(il.Count()); "),
-                 "3\n");
+           ilist_linq_count_call_is_refused_property_call_8633) {
+    expectRejected(
+        mainWith("var il: IList<int> := a; ",
+                 "Console.WriteLine(il.Count()); "),
+        "`Count` is a property of `IList`, not a method");
 }
 
 // CONTROL 8 — the same operator on the enumeration interface (stdlib §4.12).

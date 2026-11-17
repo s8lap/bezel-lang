@@ -32,6 +32,19 @@
 // defect. After the fix they agree: the call is the built-in's `int`, the
 // `int` spelling is admitted, and the `string` spelling is refused by §5.1.
 //
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §7.5, §26.5 rule 1,
+// §27.1, §27.7, v0.357): the CALL spelling of the inherited `Count`
+// PROPERTY is refused outright — "`Count` is a property of `IList`, not a
+// method (stdlib §4.1: `Count: int`), so this call has no candidate: the
+// lookup commits to the instance member (§26.5 rule 1), and only a
+// function-typed property can be called (§27.1, §27.7) — read it without
+// parentheses, `.Count`". That is the #7543 refusal the concrete `Array<T>`
+// head already gets; the extension's 77 is unreachable either way. §7.5 says
+// the `?.` spelling performs the SAME access, so the `?.` spelling is
+// refused with the SAME diagnostic. The PROPERTY READ `c.Count` / `c?.Count`
+// — the spelling stdlib §4.1 declares — still answers, and that is pinned
+// by the CONTROL rows.
+//
 // THE ROWS. The value rows assert the program's exact STDOUT (the oracle is
 // the RENDERED VALUE). The rejection row asserts the SPECIFIC diagnostic at
 // a real source location. The CONTROL rows are load-bearing: where §26.5
@@ -102,12 +115,25 @@ void expectStdout(const std::string& ext, const std::string& body,
     BEZEL_EXPECT_EQ(r.stdoutText, out);
 }
 
-// A value row over the NULLABLE receiver (the `?.` spelling).
-void expectStdoutNullable(const std::string& ext, const std::string& body,
-                          const std::string& out) {
+// A rejection row over the NULLABLE receiver (the `?.` spelling).
+void expectRejectedNullable(const std::string& ext, const std::string& body,
+                             const std::string& needle) {
     auto r = runAot(progNullable(ext, body));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, out);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasError(r, needle));
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+}
+
+// A rejection row that must carry EVERY named diagnostic (fix #8633: the
+// property-call refusal, and the §5.1 refusal that follows it as the second
+// report — the same two-report cascade the concrete `Array<T>` head has).
+void expectRejectedWithAll(const std::string& ext, const std::string& body,
+                           const std::vector<std::string>& needles) {
+    auto r = runAot(prog(ext, body));
+    BEZEL_EXPECT_FALSE(r.ran);
+    for (const auto& needle : needles)
+        BEZEL_EXPECT_TRUE(hasError(r, needle));
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
 }
 
 // §5.1's refusal of an int-typed initializer for a `string`-typed local.
@@ -115,53 +141,83 @@ const char kNotConvertible[] =
     "the initializer for `s` has a type that is not implicitly convertible "
     "to the target type (§5.1)";
 
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1,
+// §27.7, v0.357): the CALL spelling of the inherited `Count` PROPERTY is
+// refused — "`Count` is a property of `IList`, not a method (stdlib §4.1:
+// `Count: int`), so this call has no candidate: the lookup commits to the
+// instance member (§26.5 rule 1), and only a function-typed property can be
+// called (§27.1, §27.7) — read it without parentheses, `.Count`". The same
+// refusal the concrete `Array<T>` head gets (#7543).
+const char kCountIsAProperty[] =
+    "`Count` is a property of `IList`, not a method (stdlib \xC2\xA7""4.1: "
+    "`Count: int`)";
+
 }  // namespace
 
 // ── the DEFECT: the extension typed a member the receiver INHERITS ────────
 
 // The `string` spelling. Before the fix it COMPILED — the built-in's `int`
 // was stored in a `string`-typed local — which is the soundness defect.
+//
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1,
+// §27.7, v0.357): the CALL itself is refused now, with the #7543 diagnostic
+// the concrete `Array<T>` head already gets — the committed member is the
+// inherited `Count` PROPERTY, and a property of a non-function type is not
+// callable. The `string` target's own §5.1 refusal follows it as the SECOND
+// report (the same two-report cascade the `Array<int>` head has — MEASURED),
+// so both diagnostics are pinned here.
 BEZEL_TEST(sema_collection_interface_inherited_member_7446,
-           ilist_count_string_target_rejected) {
-    // per §26.5 rule 1 (v0.345) + stdlib §4.1 + §5.1
-    expectRejected("extension IList<int>\n"
-                   "  public method Count(): string => \"USER\";\n"
-                   "end;\n",
-                   "var s: string := c.Count();\n"
-                   "    Console.WriteLine(s);",
-                   kNotConvertible);
+           ilist_count_string_target_rejected_property_call_8633) {
+    // per stdlib §4.1 + §26.5 rule 1 + §27.1 + §27.7 (v0.357); §5.1
+    expectRejectedWithAll("extension IList<int>\n"
+                           "  public method Count(): string => \"USER\";\n"
+                           "end;\n",
+                           "var s: string := c.Count();\n"
+                           "    Console.WriteLine(s);",
+                           {kCountIsAProperty, kNotConvertible});
 }
 
 // The `int` spelling, with an extension whose OWN return type is `bool`.
 // Before the fix the extension typed the call `bool`, so the `int` spelling
 // was REFUSED by §5.1 while the `string` spelling was admitted — the two
 // spellings disagreed. After the fix the call is the built-in's `int`.
+//
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1,
+// §27.7, v0.357): the CALL has no candidate at all now, so the §5.1 refusal
+// of the `int` target is GONE — the call is refused by the property-call
+// diagnostic alone, exactly as on the concrete `Array<T>` head.
 BEZEL_TEST(sema_collection_interface_inherited_member_7446,
-           ilist_count_bool_extension_int_target_prints_the_builtin_count) {
-    // per §26.5 rule 1 (v0.345) + stdlib §4.1 + §4.4
-    expectStdout("extension IList<int>\n"
-                 "  public method Count(): bool => true;\n"
-                 "end;\n",
-                 "var i: int := c.Count();\n"
-                 "    Console.WriteLine(i);",
-                 "3\n");
+           ilist_count_bool_extension_int_target_is_refused_property_call_8633) {
+    // per stdlib §4.1 + §26.5 rule 1 + §27.1 + §27.7 (v0.357)
+    expectRejected("extension IList<int>\n"
+                   "  public method Count(): bool => true;\n"
+                   "end;\n",
+                   "var i: int := c.Count();\n"
+                   "    Console.WriteLine(i);",
+                   kCountIsAProperty);
 }
 
 // ── CONTROLS ──────────────────────────────────────────────────────────────
 
 // §26.5 rule 1 (v0.345) + stdlib §4.1: `IList<T>` INHERITS `Count`, so the
-// extension is UNREACHABLE and the built-in answers with the element count
-// — not the extension's 77. This is the value the L1 lane's #6159 fix
-// already pinned at the CODEGEN end; it is pinned here at the SEMA end too.
+// extension is UNREACHABLE — the built-in would answer with the element count,
+// not the extension's 77.
+//
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1,
+// §27.7, v0.357): the CALL spelling is refused altogether now (the committed
+// member is the inherited `Count` PROPERTY, and a property of a non-function
+// type is not callable), so the extension stays unreachable — and so does the
+// built-in's answer. This is the #7543 refusal the concrete `Array<T>` head
+// already gets.
 BEZEL_TEST(sema_collection_interface_inherited_member_7446,
-           ilist_count_extension_is_unreachable) {
-    // per §26.5 rule 1 (v0.345) + stdlib §4.1
-    expectStdout("extension IList<int>\n"
-                 "  public method Count(): int => 77;\n"
-                 "end;\n",
-                 "var i: int := c.Count();\n"
-                 "    Console.WriteLine(i);",
-                 "3\n");
+           ilist_count_extension_is_refused_property_call_8633) {
+    // per stdlib §4.1 + §26.5 rule 1 + §27.1 + §27.7 (v0.357)
+    expectRejected("extension IList<int>\n"
+                   "  public method Count(): int => 77;\n"
+                   "end;\n",
+                   "var i: int := c.Count();\n"
+                   "    Console.WriteLine(i);",
+                   kCountIsAProperty);
 }
 
 // §26.5 rule 2 (v0.345) + stdlib §4.1: `IList<T>` declares NO `Length`, so
@@ -192,43 +248,68 @@ BEZEL_TEST(sema_collection_interface_inherited_member_7446,
                  "77\n");
 }
 
-// With NO extension at all the built-in answers, exactly as before the fix.
+// With NO extension at all the built-in used to answer, exactly as before the
+// fix.
+//
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1,
+// §27.7, v0.357): the CALL is refused with the #7543 diagnostic — the
+// inherited `Count` PROPERTY is committed by name, and a property of a
+// non-function type is not callable. The PROPERTY READ `c.Count` is the
+// spelling stdlib §4.1 declares, and it still answers; that control is a
+// CORPUS candidate (it is green with and without the fix), not a gtest row —
+// see `corpus-candidates/cc04_ilist_count_property_read_legal.bzl` and
+// `cc05_ilist_nullcond_count_read_legal.bzl` in the lane's probe dir.
 BEZEL_TEST(sema_collection_interface_inherited_member_7446,
-           no_extension_builtin_still_answers) {
-    // per stdlib §4.1 / §4.4
-    expectStdout("",
-                 "var i: int := c.Count();\n"
-                 "    Console.WriteLine(i);",
-                 "3\n");
+           no_extension_builtin_call_is_refused_property_call_8633) {
+    // per stdlib §4.1 + §26.5 rule 1 + §27.1 + §27.7 (v0.357)
+    expectRejected("",
+                   "var i: int := c.Count();\n"
+                   "    Console.WriteLine(i);",
+                   kCountIsAProperty);
 }
 
 // ── the `?.` twin ──────────────────────────────────────────────────────────
 
 // The null-conditional spelling of the same shape. §26.5 rule 1 commits
-// instance resolution by NAME on this receiver too, so the built-in answers
-// (the element count) and the user's extension is unreachable. Before the
-// fix the `?.` path consulted the extension and dispatched it, so the
-// program printed the extension's 77.
+// instance resolution by NAME on this receiver too, so the built-in used to
+// answer (the element count) and the user's extension was unreachable.
+//
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §7.5, §26.5 rule 1,
+// §27.1, §27.7, v0.357): §7.5 says the `?.` spelling performs the SAME
+// access the `.` spelling does, so the two spellings of ONE member may not
+// disagree — and the `.` spelling is refused. The `?.` spelling is refused
+// with the SAME diagnostic.
 BEZEL_TEST(sema_collection_interface_inherited_member_7446,
-           ilist_null_cond_count_answers_the_builtin) {
-    // per §26.5 rule 1 (v0.345) + stdlib §4.1 + §7.5
-    expectStdoutNullable("extension IList<int>\n"
-                         "  public method Count(): int => 77;\n"
-                         "end;\n",
-                         "var i: int? := c?.Count();\n"
-                         "    Console.WriteLine(i ?? -1);",
-                         "3\n");
+           ilist_null_cond_count_is_refused_property_call_8633) {
+    // per stdlib §4.1 + §7.5 + §26.5 rule 1 + §27.1 + §27.7 (v0.357)
+    expectRejectedNullable("extension IList<int>\n"
+                            "  public method Count(): int => 77;\n"
+                            "end;\n",
+                            "var i: int? := c?.Count();\n"
+                            "    Console.WriteLine(i ?? -1);",
+                            kCountIsAProperty);
 }
 
-// The same `?.` spelling with NO extension: the built-in answers and the
-// result is the element count. Before the fix the `?.` path found no member
-// at all — the read was left untyped, the local degraded to a zero value
-// (#2434) and the program printed -1.
+// The same `?.` spelling with NO extension: the built-in used to answer and
+// the result was the element count. Before that fix the `?.` path found no
+// member at all — the read was left untyped, the local degraded to a zero
+// value (#2434) and the program printed -1.
+//
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §7.5, §26.5 rule 1,
+// §27.1, §27.7, v0.357): the `?.` CALL is refused with the SAME diagnostic
+// the `.` spelling gets.
 BEZEL_TEST(sema_collection_interface_inherited_member_7446,
-           ilist_null_cond_count_without_extension_answers_the_builtin) {
-    // per §26.5 rule 1 (v0.345) + stdlib §4.1 + §7.5
-    expectStdoutNullable("",
-                         "var i: int? := c?.Count();\n"
-                         "    Console.WriteLine(i ?? -1);",
-                         "3\n");
+           ilist_null_cond_count_without_extension_is_refused_property_call_8633) {
+    // per stdlib §4.1 + §7.5 + §26.5 rule 1 + §27.1 + §27.7 (v0.357)
+    expectRejectedNullable("",
+                            "var i: int? := c?.Count();\n"
+                            "    Console.WriteLine(i ?? -1);",
+                            kCountIsAProperty);
 }
+
+// CONTROL: the `?.` PROPERTY READ `c?.Count` is the spelling stdlib §4.1
+// declares, and it still answers with the element count (3). fix #8633
+// refuses the CALL spelling only. (A CORPUS candidate, not a gtest row — it
+// is green with and without the fix. See
+// `corpus-candidates/cc05_ilist_nullcond_count_read_legal.bzl` in the lane's
+// probe dir.)

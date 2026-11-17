@@ -2991,22 +2991,43 @@ const std::vector<BuiltinPropertyDecl>& builtinPropertyDecls() {
         {"JsonOptions", "MaxDepth", "int", "2.15", false, true},
         {"ScopeGuard", "IsDismissed", "bool", "2.21", false, true},
         {"StringBuilder", "Length", "int", "3.1", false, true},
-        {"StringBuilder", "Capacity", "int", "3.1", false, false},
+        {"StringBuilder", "Capacity", "int", "3.1", false, false, false, false},
         {"Encoding", "Name", "string", "3.2", false, true},
         {"Encoding", "UTF8", "Encoding", "3.2", true, true},
         {"Encoding", "UTF16", "Encoding", "3.2", true, true},
         {"Encoding", "UTF32", "Encoding", "3.2", true, true},
         {"Encoding", "ASCII", "Encoding", "3.2", true, true},
-        {"IReadOnlyCollection", "Count", "int", "4.1", false, false},
-        {"IReadOnlyList", "Count", "int", "4.1", false, false},
-        {"ICollection", "Count", "int", "4.1", false, false},
-        {"ICollection", "IsReadOnly", "bool", "4.1", false, false},
-        {"IList", "Count", "int", "4.1", false, false},
-        {"IList", "IsReadOnly", "bool", "4.1", false, false},
-        {"IOwningCollection", "Count", "int", "4.2", false, false},
-        {"IOwningCollection", "IsReadOnly", "bool", "4.2", false, false},
-        {"IOwningList", "Count", "int", "4.2", false, false},
-        {"IOwningList", "IsReadOnly", "bool", "4.2", false, false},
+        // fix #8633 (stdlib §1 "Block-by-name", §4.1 / §4.2, spec §26.5 rule 1,
+        // §27.1, §27.7, v0.357): the six collection INTERFACE heads inherit the
+        // `Count` PROPERTY from `IReadOnlyCollection<out T>` (stdlib §4.1: "pure
+        // readonly property Count: int"), which `ICollection<T>` /
+        // `IReadOnlyList<T>` / `IList<T>` extend and which the §4.2 owning pair
+        // extends in turn. stdlib §1's "Block-by-name" row commits the lookup to
+        // instance members BY NAME — "inherited ones included" — so on these six
+        // heads `c.Count()` names THAT member, and a property of a non-function
+        // type is not callable (§27.1, §27.7): the CALL spelling is refused.
+        //
+        // The three ARRAY-BACKED heads (`IList`, `IReadOnlyList`,
+        // `IOwningList`) MODEL the property READ (MEASURED: `c.Count` prints 3
+        // over an `IList<int>`, `var n := c.Count;` prints 3, `c.Count` prints 2
+        // over an `IOwningList<Box>`), so the refusal's remedy (`.Count`
+        // instead of `.Count()`) works and is offered. The three POLYMORPHIC
+        // heads (`ICollection`, `IReadOnlyCollection`, `IOwningCollection`) do
+        // NOT: their READ is refused by codegen's #853 fence (the concrete
+        // backing is erased at the interface), so no remedy is offered there.
+        {"IReadOnlyCollection", "Count", "int", "4.1", false, false, true, true},
+        {"IReadOnlyList", "Count", "int", "4.1", false, true, true, true},
+        {"ICollection", "Count", "int", "4.1", false, false, true, true},
+        // `IsReadOnly` is a PROPERTY too (stdlib §4.1), but its CALL spelling
+        // is already refused by the #2457 backstop and is NOT this lane's
+        // scope — the table does not add a second report on the same access.
+        {"ICollection", "IsReadOnly", "bool", "4.1", false, true, false, false},
+        {"IList", "Count", "int", "4.1", false, true, true, true},
+        {"IList", "IsReadOnly", "bool", "4.1", false, true, false, false},
+        {"IOwningCollection", "Count", "int", "4.2", false, false, true, true},
+        {"IOwningCollection", "IsReadOnly", "bool", "4.2", false, true, false, false},
+        {"IOwningList", "Count", "int", "4.2", false, true, true, true},
+        {"IOwningList", "IsReadOnly", "bool", "4.2", false, true, false, false},
         {"Array", "Count", "int", "4.4", false, true},
         {"Array", "Capacity", "int", "4.4", false, true},
         {"OwningArray", "Count", "int", "4.5", false, true},
@@ -3131,15 +3152,26 @@ const BuiltinPropertyDecl* builtinDeclaredProperty(std::string_view head,
 
 std::string propertyCalledAsMethodMessage(std::string_view member,
                                           std::string_view owner,
-                                          const std::string& declNote) {
-    return "`" + std::string(member) + "` is a property of `" +
-           std::string(owner) + "`, not a method (" + declNote +
-           "), so this call has no candidate: the lookup commits to the "
-           "instance member (\xC2\xA7""26.5 rule 1), and only a "
-           "function-typed property can be called (\xC2\xA7""27.1, "
-           "\xC2\xA7""27.7) \xE2\x80\x94"" read it without parentheses, `." +
-           std::string(member) + "`";
-}  // per §26.5 rule 1 / §27.1 / §27.7, fix #7543 + #7984
+                                          const std::string& declNote,
+                                          bool withRemedy) {
+    std::string msg = "`" + std::string(member) + "` is a property of `" +
+                      std::string(owner) + "`, not a method (" + declNote +
+                      "), so this call has no candidate: the lookup commits to the "
+                      "instance member (\xC2\xA7""26.5 rule 1), and only a "
+                      "function-typed property can be called (\xC2\xA7""27.1, "
+                      "\xC2\xA7""27.7)";
+    // fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1,
+    // §27.7, v0.357): the REMEDY (".Count" instead of ".Count()") is offered
+    // only where the property READ is a modelled spelling on this receiver —
+    // the three POLYMORPHIC collection interfaces' `Count` READ is refused by
+    // codegen's #853 fence, so pointing at `.Count` there would send the
+    // reader to a spelling that is itself refused.
+    if (withRemedy) {
+        msg += " \xE2\x80\x94"" read it without parentheses, `." +
+               std::string(member) + "`";
+    }
+    return msg;
+}  // per §26.5 rule 1 / §27.1 / §27.7, fix #7543 + #7984 + #8633
 
 // fix #5044 (§2.3 Row 10, stdlib §4, v0.307): the §2.3 always-available
 // bare-name Row 10 collection/iterator heads. The single authority for

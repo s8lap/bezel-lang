@@ -1318,25 +1318,63 @@ struct BuiltinPropertyDecl {
     // the CALL spelling leaves a working remedy (`.Count` instead of
     // `.Count()`). False for two cases:
     //
-    //  * the six collection INTERFACE heads of stdlib §4.1 / §4.2
-    //    (`IReadOnlyCollection`, `IReadOnlyList`, `ICollection`, `IList`,
-    //    `IOwningCollection`, `IOwningList`) — the compiler does not model a
-    //    property read on a declaration-less interface head in the
-    //    local-initialiser position (MEASURED, `var n := c.Count;` on an
-    //    `IList<int>` compiles with the internal #3079 "failed to lower"
-    //    warning and prints NOTHING), and the zero-arg property call on such a
-    //    receiver is pinned ACCEPTED by #7446's and #7597's own tests ("on an
-    //    `IList<int>` receiver the built-in must answer"). The read is
-    //    #7090's family (a property reference over a builtin collection
-    //    interface head), which this lane does not own. The CONCRETE heads
-    //    that implement the same interfaces are NOT in this exemption: their
-    //    property read is modelled, so refusing their call spelling leaves
-    //    the remedy `.Count`.
+    //  * the three POLYMORPHIC collection INTERFACE heads of stdlib §4.1 /
+    //    §4.2 (`ICollection`, `IReadOnlyCollection`, `IOwningCollection`) —
+    //    the READ of `Count` through them is refused by codegen's #853 fence
+    //    (the concrete backing is erased at the interface: array / linked-list
+    //    / hash-table, so no single runtime dispatch is sound). MEASURED on
+    //    this base: `Console.WriteLine(c.Count)` over an `ICollection<int>`
+    //    is refused with "`.Count` through a polymorphic collection
+    //    interface ... is not yet supported in codegen". So the refusal's
+    //    remedy (`.Count`) does NOT work there and the message must not
+    //    offer it.
     //  * `StringBuilder.Capacity` (stdlib §3.1) — the READ is already refused
     //    as a declared-but-unimplemented member (#7661's open question), so
     //    refusing the call would only take away the one spelling the
     //    compiler still admits.
+    //
+    // fix #8633 (stdlib §1 "Block-by-name", §4.1 / §4.2, spec §26.5 rule 1,
+    // §27.1, §27.7, v0.357): the OTHER three collection INTERFACE heads
+    // (`IReadOnlyList`, `IList`, `IOwningList`) are NOT in this exemption —
+    // they are array-backed, so their `Count` READ is a modelled spelling.
+    // MEASURED on this base: `Console.WriteLine(c.Count)` over an
+    // `IList<int>` prints 3, `var n := c.Count;` over an `IList<int>` prints
+    // 3, `Console.WriteLine(c.Count)` over an `IOwningList<Box>` prints 2,
+    // and `c?.Count` over an `IList<int>?` prints 3. The exemption this flag
+    // used to carry for them (the note above claimed the read "prints
+    // NOTHING" in the local-initialiser position) no longer holds — it was
+    // true when #7090's family owned the read and is stale now.
     bool readModelled = true;
+    // The CALL spelling of this property is REFUSED (§26.5 rule 1 + §27.1:
+    // the committed member is a PROPERTY, so the call has no candidate).
+    // True for every row but the two whose CALL spelling the house already
+    // refuses with its OWN message:
+    //
+    //  * `StringBuilder.Capacity` (stdlib §3.1) — #7661's arm refuses the
+    //    call with "declared (stdlib §3.1) but is not yet implemented by this
+    //    compiler", and it fires FIRST, so the table must not add a second
+    //    report on the same access.
+    //  * the six collection INTERFACE heads' `IsReadOnly` (stdlib §4.1 /
+    //    §4.2) — the call is refused today by the #2457 backstop ("produced
+    //    no value"), which names the member but not the property. Fix #8633
+    //    owns the `Count` PROPERTY only; the `IsReadOnly` call spelling is a
+    //    separate defect (filed alongside it).
+    bool refusesCall = true;
+    // The `?.` CALL spelling is refused too (§7.5: the `?.` spelling performs
+    // the SAME access the `.` spelling does, so the two spellings of ONE
+    // member may not disagree — the rule #8582 and #8583 record).
+    //
+    // False for the CONCRETE heads, and that is a PIN, not an omission: the
+    // conformance corpus — the spec's own executable rules — requires the
+    // `?.` CALL spelling of a built-in property to RUN. §7.5's rule cases
+    // `s7_5_0009`, `s7_5_0010`, `s7_5_0012` and `s7_5_0013` are `expect: run`
+    // cases over `a?.Count()` on an `Array<int>?` ("With a non-null receiver
+    // the access is the call `Count()`, which yields the element count, 2"),
+    // and #6529 (CLOSED) is the issue that made the spelling work. So
+    // `a?.Count()` is LEGAL on an `Array<int>?` while `a.Count()` is refused
+    // — the corpus vehicle, not the compiler, decides that difference, and
+    // fix #8633 leaves it alone and reports it.
+    bool refusesNullCondCall = false;
 };
 
 // The declared PROPERTY `member` of the built-in head `head`, or nullptr when
@@ -1348,8 +1386,14 @@ const BuiltinPropertyDecl* builtinDeclaredProperty(std::string_view head,
 // "a property was called as a method". `declNote` names the declaration —
 // "stdlib §4.4: `Count: int`" for a built-in, "§23" for a user-declared
 // property — and `owner` names the type that declares it.
+//
+// `withRemedy` adds the "read it without parentheses, `.X`" clause; it is
+// false only where the property READ is NOT a modelled spelling on that
+// receiver (fix #8633: the three polymorphic collection interfaces' `Count`
+// READ is refused by codegen's #853 fence).
 std::string propertyCalledAsMethodMessage(std::string_view member,
                                           std::string_view owner,
-                                          const std::string& declNote);
+                                          const std::string& declNote,
+                                          bool withRemedy = true);
 
 }  // namespace bezel::common

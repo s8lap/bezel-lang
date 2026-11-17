@@ -5,8 +5,13 @@
 // `IList<T>` / `IReadOnlyList<T>` / `ICollection<T>` / `IReadOnlyCollection<T>`
 // receiver, exactly as on `Array<T>` (#3342): "the call is a compile error
 // citing the instance member(s)". Before the fix `l.Count(pred)` compiled and
-// ran. The zero-arg `l.Count()`, the property read `l.Count`, and receivers
-// with no instance `Count` (`IEnumerable<T>`, the composed
+// ran.
+//
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1,
+// §27.7, v0.357): the ZERO-ARGUMENT call is refused too, with the #7543
+// diagnostic — the committed member is the arity-0 `Count` PROPERTY, and a
+// property of a non-function type is not callable. The property read `l.Count`
+// and receivers with no instance `Count` (`IEnumerable<T>`, the composed
 // `l.Where(pred).Count()`) stay accepted.
 
 #include "sema/ExprTypecheck.hpp"
@@ -32,6 +37,22 @@ bool hasBlockError(const bezel::test::SemaResult& r) {
             d.message.find("instance member") != std::string::npos &&
             d.message.find("26.5") != std::string::npos &&
             d.message.find("rule 1") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1,
+// §27.7, v0.357): the ZERO-ARGUMENT call `c.Count()` names the inherited
+// `Count` PROPERTY, and a property of a non-function type is not callable —
+// the #7543 refusal the concrete `Array<T>` head already gets.
+bool hasPropertyCallError(const bezel::test::SemaResult& r,
+                           const std::string& head) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("`Count` is a property of `" + head + "`") !=
+                std::string::npos &&
+            d.message.find("not a method") != std::string::npos &&
+            d.message.find("stdlib \xC2\xA7""4.1") != std::string::npos)
             return true;
     }
     return false;
@@ -68,11 +89,22 @@ BEZEL_TEST(sema_interface_count_pred_blocked_7597,
     auto r = onRecv("IReadOnlyCollection<int>", COUNT_PRED);
     BEZEL_EXPECT_TRUE(hasBlockError(r));
 }
-// Controls: still accepted.
-BEZEL_TEST(sema_interface_count_pred_blocked_7597, zero_arg_call_accepted) {
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1,
+// §27.7, v0.357): the ZERO-ARGUMENT call is refused too, with the #7543
+// diagnostic. `IList<T>` INHERITS `Count` from `IReadOnlyCollection<T>`
+// (stdlib §4.1: "pure readonly property Count: int"), and stdlib §1's
+// "Block-by-name" row commits the lookup to instance members BY NAME —
+// "inherited ones included" — so `c.Count()` names that PROPERTY. A property
+// of a non-function type is not callable (§27.1, §27.7), so the call has no
+// candidate: exactly the refusal the concrete `Array<T>` head gets. Before
+// #8633 this call was ACCEPTED and answered the element count.
+BEZEL_TEST(sema_interface_count_pred_blocked_7597,
+           zero_arg_call_rejected_property_call_8633) {
     auto r = onRecv("IList<int>", "c.Count()");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasPropertyCallError(r, "IList"));
 }
+// Control: the PROPERTY READ is the spelling stdlib §4.1 declares, and it
+// stays admitted.
 BEZEL_TEST(sema_interface_count_pred_blocked_7597, property_read_accepted) {
     auto r = onRecv("IList<int>", "c.Count");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

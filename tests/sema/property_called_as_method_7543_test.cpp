@@ -521,24 +521,23 @@ BEZEL_TEST(property_called_as_method_7543,
 // The BOUNDARY of the rule -- the two surfaces it does NOT reach.
 // ===========================================================================
 
-// The eight collection INTERFACE heads of stdlib §4.1 / §4.2 are OUT of the
-// refusal. #7446's own ruling is that on an `IList<T>` receiver the built-in
-// answers the zero-arg property call -- `IList<T>` INHERITS `Count` from
-// `IReadOnlyCollection<T>`, so the user's extension is unreachable and the
-// built-in's count is the answer -- and the property READ on a
-// declaration-less interface head is not modelled in the
-// local-initialiser position (MEASURED: `var n := c.Count;` on an
-// `IList<int>` compiles with the internal #3079 "failed to lower" warning and
-// prints NOTHING -- #7090's family). Refusing the call there would take away
-// the only working spelling for the count on an interface-typed receiver, so
-// the zero-arg call stays admitted. The arity>0 call (`c.Count(pred)`) is
-// already refused, by #7597's own arm.
+// fix #8633 (stdlib §1 "Block-by-name", §4.1, spec §26.5 rule 1, §27.1, §27.7,
+// v0.357): this row's expectation is FLIPPED (it was
+// `interface_head_zero_arg_property_call_stays_admitted_7446`, which pinned the
+// zero-arg call ADMITTED). `IList<T>` INHERITS the `Count` PROPERTY from
+// `IReadOnlyCollection<T>` (stdlib §4.1), and stdlib §1's "Block-by-name" row
+// commits the lookup to instance members BY NAME, "inherited ones included",
+// so `c.Count()` names that PROPERTY and has no candidate -- the refusal the
+// concrete `Array<T>` head gets. The remedy it names, `c.Count`, is a working
+// spelling on the array-backed `IList` head (MEASURED: it prints 3, so the old
+// "not modelled in the local-initialiser position" premise is stale). The
+// arity>0 call (`c.Count(pred)`) was already refused, by #7597's own arm.
 BEZEL_TEST(property_called_as_method_7543,
-           interface_head_zero_arg_property_call_stays_admitted_7446) {
-    expectStdout(
+           interface_head_zero_arg_property_call_is_rejected_8633) {
+    expectRejectedWith(
         prog("var a: Array<int> := [1,2,3]; var c: IList<int> := a; "
              "var n := c.Count(); Console.WriteLine(n.ToString());"),
-        "3\n");
+        4, builtinPropertyCallMessage("Count", "IList", "4.1", "int"));
 }
 
 // `StringBuilder.Capacity` (stdlib §3.1) is a DECLARED-BUT-UNIMPLEMENTED

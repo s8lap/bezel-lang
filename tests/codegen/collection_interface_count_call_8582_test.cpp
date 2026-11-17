@@ -37,6 +37,18 @@
 // interfaces, and the `?.` spelling lowers through the `.` spelling's own
 // dispatch (§7.5), so the two spellings fail with the SAME diagnostic.
 //
+// fix #8633 (stdlib §1 "Block-by-name", §4.1 / §4.2, spec §26.5 rule 1,
+// §27.1, §27.7, v0.357): the diagnostic these rows pin is now the SEMA
+// property-call refusal, which fires BEFORE codegen is reached. The
+// committed member on these three heads is the INHERITED `Count` PROPERTY
+// (stdlib §4.1: "pure readonly property Count: int" on
+// `IReadOnlyCollection<out T>`), stdlib §1's "Block-by-name" row commits the
+// lookup to instance members BY NAME — "inherited ones included" — and a
+// property of a non-function type is not callable (§27.1, §27.7): the call
+// has no candidate. Codegen's #853 fence remains as the backstop for the
+// shapes sema does not type, but the message the user sees is the sema one,
+// and it names the head and its declaration.
+//
 // Every row below is load-bearing: each one is RED on the base commit (the
 // access was dropped: the program compiled with the #2434 warning, printed
 // nothing or a zero, and exited 0) and GREEN with the fix.
@@ -52,16 +64,39 @@ using bezel::test::runAot;
 
 namespace {
 
-// The refusal's wording — the CALL spelling names the operator (`Count()`),
-// so this needle is distinct from the PROPERTY read's "`.Count` through a
-// polymorphic collection interface" and cannot be satisfied by it.
-const char* kCountCallFence =
-    "`Count()` through a polymorphic collection interface";
+// fix #8633 (stdlib §1 "Block-by-name", §4.1 / §4.2, spec §26.5 rule 1,
+// §27.1, §27.7, v0.357): the refusal these rows pin is now the SEMA
+// property-call diagnostic, NOT codegen's #853 fence.
+//
+// The committed member on these three heads is the INHERITED `Count`
+// PROPERTY — stdlib §4.1 declares "pure readonly property Count: int" on
+// `IReadOnlyCollection<out T>`, and `ICollection<T>` / `IOwningCollection<T>`
+// extend it. stdlib §1's "Block-by-name" row commits the lookup to instance
+// members BY NAME — "inherited ones included" — so `c.Count()` names THAT
+// member, and a property of a non-function type is not callable (§27.1,
+// §27.7): the call has no candidate.
+//
+// The diagnostic therefore names the head and its declaration, and CANNOT be
+// satisfied by the old fence's wording ("`Count()` through a polymorphic
+// collection interface") — the needle below is built per head so a row cannot
+// pass on the WRONG head's diagnostic. Codegen's #853 fence stays as the
+// backstop for the shapes sema does not type, but the message the user sees
+// is this one.
+//
+// NOTE: the three polymorphic heads do NOT get the remedy clause ("read it
+// without parentheses, `.Count`") — their property READ is itself refused by
+// the #853 fence (the concrete backing is erased at the interface), so
+// pointing the reader at `.Count` would send them to a refused spelling.
+std::string propertyCallFence(const std::string& head,
+                              const std::string& section) {
+    return "`Count` is a property of `" + head + "`, not a method (stdlib \xC2\xA7" +
+           section + ": `Count: int`), so this call has no candidate";
+}
 
 // A program that is REJECTED at compile time with the given diagnostic, and
 // that ran nothing. (runAot synthesizes an Error diagnostic for a runtime
 // crash too, so this checks the TEXT as well as the absence of a run.)
-bool rejectedWith(const std::string& program, const char* needle) {
+bool rejectedWith(const std::string& program, const std::string& needle) {
     JitResult r = runAot(program);
     if (r.ran || !r.stdoutText.empty()) return false;
     for (const auto& d : r.diagnostics.diagnostics())
@@ -110,7 +145,7 @@ BEZEL_TEST(collection_interface_count_call_8582,
              "  var c: ICollection<int> := a; "
              "  var n := c.Count(); "
              "  Console.WriteLine(n); "),
-        kCountCallFence));
+        propertyCallFence("ICollection", "4.1")));
 }
 
 // stdlib §5 / §4.1: the read-only polymorphic head is refused the same way.
@@ -121,7 +156,7 @@ BEZEL_TEST(collection_interface_count_call_8582,
              "  var rc: IReadOnlyCollection<int> := a; "
              "  var n := rc.Count(); "
              "  Console.WriteLine(n); "),
-        kCountCallFence));
+        propertyCallFence("IReadOnlyCollection", "4.1")));
 }
 
 // stdlib §5 / §4.2: the owning polymorphic head is refused the same way.
@@ -131,7 +166,7 @@ BEZEL_TEST(collection_interface_count_call_8582,
         owningProg("  var oc: IOwningCollection<Box> := a; "
                    "  var n := oc.Count(); "
                    "  Console.WriteLine(n); "),
-        kCountCallFence));
+        propertyCallFence("IOwningCollection", "4.2")));
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +180,7 @@ BEZEL_TEST(collection_interface_count_call_8582,
         prog("  var a: Array<int> := [7, 8, 9]; "
              "  var c: ICollection<int> := a; "
              "  Console.WriteLine(c.Count()); "),
-        kCountCallFence));
+        propertyCallFence("ICollection", "4.1")));
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +196,7 @@ BEZEL_TEST(collection_interface_count_call_8582,
              "  var c: ICollection<int>? := a; "
              "  var n := c?.Count(); "
              "  Console.WriteLine(n ?? -1); "),
-        kCountCallFence));
+        propertyCallFence("ICollection", "4.1")));
 }
 
 BEZEL_TEST(collection_interface_count_call_8582,
@@ -171,7 +206,7 @@ BEZEL_TEST(collection_interface_count_call_8582,
              "  var rc: IReadOnlyCollection<int>? := a; "
              "  var n := rc?.Count(); "
              "  Console.WriteLine(n ?? -1); "),
-        kCountCallFence));
+        propertyCallFence("IReadOnlyCollection", "4.1")));
 }
 
 BEZEL_TEST(collection_interface_count_call_8582,
@@ -180,5 +215,5 @@ BEZEL_TEST(collection_interface_count_call_8582,
         owningProg("  var oc: IOwningCollection<Box>? := a; "
                    "  var n := oc?.Count(); "
                    "  Console.WriteLine(n ?? -1); "),
-        kCountCallFence));
+        propertyCallFence("IOwningCollection", "4.2")));
 }

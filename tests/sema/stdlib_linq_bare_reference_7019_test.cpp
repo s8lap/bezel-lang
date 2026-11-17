@@ -182,14 +182,20 @@ BEZEL_TEST(stdlib_linq_bare_reference_7019,
                  "True\n");
 }
 
-// CONTROL 3 — the §5 `Count()` OPERATOR spelled as a call is legitimate on
-// every head, including the ones that declare the property (§5 names the
-// method; §4.1 names the property).
+// CONTROL 3 — FLIPPED by fix #8633 (stdlib §1 "Block-by-name", §4.1, spec
+// §26.5 rule 1, §27.1, §27.7, v0.357). It pinned the §5 `Count()` OPERATOR
+// spelled as a call as legitimate "on every head, including the ones that
+// declare the property". stdlib §1 says the opposite: an instance member,
+// "inherited ones included", blocks the same-named §5 operator by name, so on
+// an `IList<T>` (which inherits the `Count` property from
+// `IReadOnlyCollection<T>`) `il.Count()` names the PROPERTY and has no
+// candidate. The operator stays reachable on heads with no `Count` member
+// (`IEnumerable<T>`, `IGrouping`) and composed (`il.Where(p).Count()`).
 BEZEL_TEST(stdlib_linq_bare_reference_7019,
-           ilist_linq_count_call_still_works_spec_5) {
-    expectStdout(mainWith("var il: IList<int> := a; ",
-                          "Console.WriteLine(il.Count()); "),
-                 "3\n");
+           ilist_count_call_is_refused_property_call_8633) {
+    expectRejected(mainWith("var il: IList<int> := a; ",
+                            "Console.WriteLine(il.Count()); "),
+                   "`Count` is a property of `IList`, not a method");
 }
 
 // CONTROL 4 — an ordinary §5 operator call.
