@@ -306,3 +306,74 @@ BEZEL_TEST(for_in_getter_proven_lend_hops_6447,
                     "get => do var t := Inner; return t; end;"),
         "s=1200");
 }
+
+// ===========================================================================
+// fix-forward #6447 (review r42-rev-f20-6438, finding F1) — THE GENERIC
+// OWNER. The property is declared `T` on `Holder<T>` and read through
+// `Holder<SelfA>`, so the READ's type is the substituted `SelfA` while every
+// type inside the getter's body is the unsubstituted `T`. Judging the
+// getter's return edge `T` against the read's `SelfA` read "may mint" and
+// refused the lend; the loop then reclaimed the holder's own `_f`. MEASURED
+// on the reviewed tip (2e6744605 / a8705d794), `bezelc --sanitize=address`:
+//
+//   ERROR: AddressSanitizer: heap-use-after-free … in bz$Holder$DisposeCore$spec0
+//
+// where the parent (a44c7bec8) ran it clean, `s=1200`.
+// ===========================================================================
+namespace {
+
+const char* kGenericHolder =
+    "public class Holder<T> "
+    "  private owned _f: T; "
+    "  public constructor(owned f: T) _f := f; end constructor; "
+    "  public property Seq: T get => do var t := _f; return t; end; end Seq; "
+    "end Holder; ";
+
+}  // namespace
+
+// The review's own probe (g1_T_selfa_block_for.bzl, = q1). RED on the
+// reviewed tip, green on the parent and with this fix.
+BEZEL_TEST(for_in_getter_proven_lend_hops_6447,
+           generic_holder_block_getter_launders_t_loop_must_not_reclaim_spec_28_9) {
+    std::string src = std::string("module TM; ") + kSelfA + kGenericHolder +
+        "public class TMImpl "
+        "  public static method Main(): int "
+        "    var s := 0; "
+        "    for var i in 0..<200 do "
+        "      var h := new Holder<SelfA>(new SelfA(3)); "
+        "      for var x in h.Seq do s := s + x; end; "
+        "    end for; "
+        "    Console.WriteLine($\"s={s}\"); "
+        "    return 0; "
+        "  end Main; "
+        "end TMImpl; ";
+    expectCleanSum(src, "s=1200");
+}
+
+// The same generic getter reached through a HOP from a non-generic outer
+// getter. The hop's return edge is judged inside `Holder<T>`'s body, so it
+// needs the declared-type target as well; the one-hop floor does not follow
+// a property hop at all. RED on the parent and on the reviewed tip.
+BEZEL_TEST(for_in_getter_proven_lend_hops_6447,
+           generic_holder_getter_through_outer_property_hop_must_not_reclaim_spec_28_9) {
+    std::string src = std::string("module TM; ") + kSelfA + kGenericHolder +
+        "public class Wrap "
+        "  private owned _h: Holder<SelfA>; "
+        "  public constructor() _h := new Holder<SelfA>(new SelfA(3)); "
+        "  end constructor; "
+        "  public property Seq: SelfA get => do var t := _h.Seq; return t; end; "
+        "  end Seq; "
+        "end Wrap; "
+        "public class TMImpl "
+        "  public static method Main(): int "
+        "    var s := 0; "
+        "    for var i in 0..<200 do "
+        "      var w := new Wrap(); "
+        "      for var x in w.Seq do s := s + x; end; "
+        "    end for; "
+        "    Console.WriteLine($\"s={s}\"); "
+        "    return 0; "
+        "  end Main; "
+        "end TMImpl; ";
+    expectCleanSum(src, "s=1200");
+}

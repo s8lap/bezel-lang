@@ -8692,16 +8692,31 @@ private:
     // property reached from inside another getter, whose edges are judged
     // from the types alone.
     //
-    // FALSE IS ALWAYS THE SAFE ANSWER, in the sense that it changes nothing:
-    // every caller feeds the verdict into `fieldLend && !minted` →
-    // `sourceIsNamedLocal`, whose FALSE branch keeps the loop-end reclamation
-    // the consumer registered before this rule existed. A wrong `true` can
-    // only cost a leak, never a use-after-free. It declines where §29.2's
-    // mint is never published and cannot be ruled out from the types — see
-    // the face guard at the definition.
+    // FALSE IS THE SAFE ANSWER ONLY BECAUSE OF THE FLOOR. Every caller feeds
+    // the verdict into `lend && !minted` → `sourceIsNamedLocal`, whose FALSE
+    // branch keeps the loop-end reclamation. That reclamation is the parent's
+    // behaviour only where the parent's own predicate also said "not a
+    // lend"; where it said "lend", a FALSE here would withdraw a lend and
+    // free storage the holder still owns. So `propertyReadIsLend` asks
+    // `blockGetterReturnsFieldLend` first and this rule only on top of it
+    // (fix-forward #6447, review r42-rev-f20-6438 F1). A wrong `true` costs a
+    // leak. It declines where §29.2's mint is never published and cannot be
+    // ruled out from the types — see the face guard at the definition — and
+    // on a `virtual` property unless every override declared in this
+    // compilation is itself a proven lend.
     bool propertyGetterIsProvenLend(sema::PropertySymbol* ps,
                                     const sema::TypeRef* readTy,
                                     bool hop, unsigned depth);
+
+    // fix #6447 (§28.2, §28.9, §29.2, v0.338): the ONE-HOP predicate — does
+    // EVERY top-level `return` of this property's BLOCK-form getter denote a
+    // FIELD read, possibly through locals bound only to field reads, on a face
+    // that published the getter's mint channel? fix-forward #6447 (v0.357):
+    // kept as the FLOOR under `propertyGetterIsProvenLend`, asked first by
+    // `propertyReadIsLend`, so the wider rule can only add lend verdicts and
+    // never withdraws one this predicate proved (a withdrawn lend re-registers
+    // the loop's reclamation of storage the holder still owns).
+    bool blockGetterReturnsFieldLend(sema::Symbol* sym);
 
     // fix #6447 (§28.2, §28.9, §29.2, v0.357): the consumer's whole verdict
     // on a property READ used as an iteration source — does the value in
