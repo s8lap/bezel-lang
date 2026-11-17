@@ -579,12 +579,25 @@ bool ExprTC::defaultIllFormed(const TypeRef* t,
 // thread (#829) finds nothing; this is the same shape as the `Zip` / `Aggregate`
 // seeding. Empty for any other call.
 std::vector<TypeRef*> ExprTC::sortComparerLambdaParamTypes(const ast::CallExpr& ce) {
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
-    if (!ma || ce.args.size() != 1) return {};
-    const bool isSort = ma->member == "Sort";
-    const bool isSorted = ma->member == "Sorted";
+    // fix #8455 (§7.5, v0.357): the `?.` spelling takes the same formal as the
+    // `.` spelling -- on a non-null receiver `x?.M(..)` behaves exactly as
+    // `x.M(..)` -- so `m?.Sort(lambda(x, y) => ..)` seeds its parameters too.
+    // The receiver's nullability does not matter here: only its element type.
+    const ast::Expr* rcvNode = nullptr;
+    std::string_view member;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+        rcvNode = ma->target.get();
+        member = ma->member;
+    } else if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                   ce.callee.get())) {
+        rcvNode = ncm->target.get();
+        member = ncm->member;
+    }
+    if (!rcvNode || ce.args.size() != 1) return {};
+    const bool isSort = member == "Sort";
+    const bool isSorted = member == "Sorted";
     if (!isSort && !isSorted) return {};
-    TypeRef* recvTy = ctx_.exprType(*ma->target);
+    TypeRef* recvTy = ctx_.exprType(*rcvNode);
     if (!recvTy || recvTy->kind != TypeRef::Kind::Named || recvTy->declaration ||
         recvTy->genericArgs.size() != 1 || !recvTy->genericArgs[0])
         return {};

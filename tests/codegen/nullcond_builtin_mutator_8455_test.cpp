@@ -163,3 +163,33 @@ BEZEL_TEST(nullcond_builtin_mutator_8455, nullcond_mutates_the_same_array) {
             "    Console.WriteLine(); ")),
         std::string("3 2 1 "));
 }
+
+// #8455 (residual after abc69adf6 / 5bfbe3d4f): the issue's own shape with an
+// UNANNOTATED comparer lambda. sema seeded the `(T, T) -> int` formal's
+// parameters only for the `.` callee (`sortComparerLambdaParamTypes`), so on
+// the `?.` callee `x` / `y` stayed untyped and the whole call lowered to
+// nothing (`b c a`). stdlib §4.4 `Sort(comparer: (T, T) -> int)`; spec §7.5
+// (v0.357): on a non-null receiver `?.` behaves exactly as `.`.
+BEZEL_TEST(nullcond_builtin_mutator_8455, sort_with_unannotated_comparer) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog(
+            std::string(kArrW) +
+            "    n?.Sort(lambda(x, y) => x.K.CompareTo(y.K)); " +
+            kPrintKeys)),
+        std::string("a b c "));
+}
+
+// The same through `Sorted(comparer)` (stdlib §4.4: a fresh sorted copy), the
+// other member `sortComparerLambdaParamTypes` serves: the unannotated
+// comparer must type through `?.` and the source stays unsorted.
+BEZEL_TEST(nullcond_builtin_mutator_8455, sorted_with_unannotated_comparer) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog(
+            std::string(kArrW) +
+            "    var s := n?.Sorted(lambda(x, y) => x.K.CompareTo(y.K)); "
+            "    if s <> null then "
+            "      for var e in s do Console.Write($\"{e.K} \"); end; "
+            "    end; "
+            "    Console.WriteLine(); ")),
+        std::string("a b c "));
+}
