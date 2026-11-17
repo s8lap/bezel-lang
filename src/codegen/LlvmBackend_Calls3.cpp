@@ -7957,12 +7957,22 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             // Dispose() — release this sender handle (may close the channel).
             // Null the receiver slot after the call so any subsequent
             // using-var scope-exit reload sees null and skips (§28.2).
+            //
+            // narrow #6314 (§28.2 / §28.3, v0.357): in CHECKED disposal mode
+            // too. `bz_channel_sender_release` deletes the handle — a sender
+            // has no disposed flag and no quarantine — so the checked-mode
+            // exemption the collection arms need (their guard reads the flag
+            // through the slot) kept a dangling pointer here, and the handle
+            // was then released again by the dispatcher's own `ChannelSender`
+            // arm (this arm returns no value, so the call falls through to it)
+            // and a third time by §28.3's scope-end auto-drop. With the slot
+            // nulled both later releases reload null, which the runtime skips.
             if (mname == "Dispose" && call.args.empty()) {
                 auto* fn = declareC("bz_channel_sender_release",
                                     llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy()});
                 builder_.CreateCall(fn, {tx, getCCEVtable()});
-                if (!checkedDisposal_ && ma) {
+                if (ma) {
                     llvm::Type* slotTy = nullptr;
                     if (llvm::Value* slot = lvalueAddr(*ma->target, slotTy))
                         builder_.CreateStore(
