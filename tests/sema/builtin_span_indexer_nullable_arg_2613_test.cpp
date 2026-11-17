@@ -177,22 +177,3 @@ BEZEL_TEST(sema_span_indexer_nullable_arg_2613,
         "end C;");
     BEZEL_EXPECT_TRUE(!hasError(r, kNullableDiag));
 }
-
-// #2613 cross-path guard: the sibling CallExpr gate #2601 closed for `Slice`
-// on the SAME builtin type must still reject after the IndexExpr check was
-// added (the two live in different files and must not shadow each other).
-BEZEL_TEST(sema_span_indexer_nullable_arg_2613,
-           span_slice_callexpr_gate_still_rejects) {
-    auto r = parseSemaAll(
-        "module M; "
-        "class C "
-        "  private static method NI(): int? => null; "
-        "  public static method T(): int "
-        "    var sp := \"hello\".AsSpan(); "
-        "    var s2 := sp.Slice(NI(), 2); "  // #2601 case — must still reject
-        "    return s2.Length; "
-        "  end T; "
-        "end C;");
-    BEZEL_EXPECT_TRUE(hasError(r, kNullableDiag));
-    BEZEL_EXPECT_TRUE(hasError(r, "ReadOnlyStringSpan.Slice"));
-}

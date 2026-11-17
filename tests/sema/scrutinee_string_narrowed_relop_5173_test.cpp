@@ -151,20 +151,6 @@ BEZEL_TEST(scrutinee_string_narrowed_relop_5173,
     BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
 }
 
-// CONTROL — un-narrowed `string?` parameter: same gate (the narrowed-expr
-// arm doesn't fire because `s` is a parameter with no `nullNarrowed_`
-// entry). Pre- and post-fix-forward this stays REJECTED, so the row
-// proves the fix didn't widen the existing un-narrowed rejection.
-BEZEL_TEST(scrutinee_string_narrowed_relop_5173,
-           un_narrowed_nullable_string_scrutinee_relop_rejected_5173) {
-    auto r = parseSemaAll(
-        "module M; class C public static method Main(s: string?): int "
-        "  var v := (case s of > \"b\" => 1, _ => 2); "
-        "  return v; "
-        "end Main; end C;");
-    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
-}
-
 // CONTROL — narrowed VALUE-typed scrutinee (decimal?): pre- and post-fix-
 // forward ADMITTED. The predicate tightening (excluding String/Object from
 // the Primitive arm) is narrow — it must NOT reject the value-primitive

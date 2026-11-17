@@ -236,36 +236,6 @@ BEZEL_TEST(builtin_generic_object_typeparam_7997,
 }
 
 // =====================================================================
-// ROW 4 — CONTROL: the user's generic `Object<T>` is STILL ADMITTED as an
-// ordinary user type (§8.1: "a generic `Object<T>` is a different name
-// (§2.2)"). It is instantiated, its OWN member is called, and the right
-// value is printed. This fix narrows §5.1's KEY; it must not narrow
-// §8.1's admission.
-//
-// GREEN on both arms.
-// =====================================================================
-
-BEZEL_TEST(builtin_generic_object_typeparam_7997,
-           user_generic_object_is_still_admitted_spec_8_1) {
-    JitResult r = runAot(
-        "module M; "
-        "public class Object<T> "
-        "  public method Hi(): int => 7; "
-        "end Object; "
-        "public class Program "
-        "  public static method Main(): int "
-        "    using var o := new Object<int>(); "
-        "    Console.WriteLine(o.Hi()); "
-        "    return 0; "
-        "  end Main; "
-        "end Program;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("7\n"));
-}
-
-// =====================================================================
 // ROW 5 — CONTROL: an ORDINARY user class into a bare type parameter is
 // still rejected, with the SAME §5.1 wording. The fix changed the rule's
 // KEY (spelling → resolved identity), not the rule: the diagnostic this

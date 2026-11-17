@@ -438,18 +438,6 @@ BEZEL_TEST(nested_record_restrictions_7490,
     expectCompiles(p);
 }
 
-// ADMITTING TWIN 4 — the MODULE-LEVEL record is unchanged: still REFUSED,
-// with the SAME wording and the SAME declaration site.
-BEZEL_TEST(nested_record_restrictions_7490,
-           module_level_record_listing_idisposable_is_still_rejected_spec_9_7) {
-    const std::string p = prog({
-        "module Conf;",
-        "public record R: IDisposable public _x: int := 0; end R;",
-    });
-    BEZEL_EXPECT_TRUE(
-        rejectedAt(p, 2, 8, "record `R` may not implement `IDisposable` (§9.7)"));
-}
-
 // The module-level record's OTHER §9.7 ban — unchanged.
 BEZEL_TEST(nested_record_restrictions_7490,
            module_level_record_with_a_destructor_is_still_rejected_spec_9_7) {

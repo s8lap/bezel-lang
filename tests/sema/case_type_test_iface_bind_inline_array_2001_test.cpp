@@ -95,23 +95,6 @@ BEZEL_TEST(case_type_test_iface_bind_inline_array_2001,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// ---- Precision boundary unchanged: a still-erased kind stays REJECTED ----------
-
-// A FUNCTION-typed argument (#1939) is NOT runtime-reified — the descriptor key
-// collapses `Kind::Function` to "F" at any depth — so `is C<(int)->int>` degrades
-// and a `C<(string)->string>` sibling would mis-bind. The uniqueness rejection
-// must STAND (the #2001 admission is scoped to folded inline arrays, NOT functions).
-BEZEL_TEST(case_type_test_iface_bind_inline_array_2001,
-           function_arg_still_erased_rejected) {
-    auto r = parseSemaAll(wrap(
-        "interface IMarker<T>\nend IMarker;\n"
-        "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
-        "  public method M(m: IMarker<int>): int\n"
-        "    var n := (case m of\n"
-        "      var x: C<(int) -> int> => 1,\n"
-        "      _ => 0\n"
-        "    );\n"
-        "    return n;\n"
-        "  end M;\n"));
-    BEZEL_EXPECT_TRUE(hasErasedAmbiguousError(r));
-}
+// The precision boundary (a still-erased function argument stays REJECTED) is pinned,
+// with a stronger oracle, by case_type_test_iface_bind_ambiguous_1927.
+// implemented_twice_function_arg_erased_rejected.

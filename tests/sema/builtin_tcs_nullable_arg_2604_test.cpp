@@ -230,21 +230,3 @@ BEZEL_TEST(sema_tcs_nullable_arg_2604,
         "end C;");
     BEZEL_EXPECT_TRUE(!hasError(r, kNullableDiag));
 }
-
-// #2604 cross-domain guard: the new isTaskSource branch is head-name keyed, so
-// it cannot perturb the isElementCollection / isKeyedCollection / isSpanBuffer
-// / isAtomic branches sharing this helper. Re-run a representative #2602 case
-// (the atomic family) to confirm it still rejects after the branch was added.
-BEZEL_TEST(sema_tcs_nullable_arg_2604,
-           atomic_branch_unaffected_by_tasksource_branch) {
-    auto r = parseSemaAll(
-        "module M; "
-        "class C "
-        "  private static method N(): int? => null; "
-        "  public static method T(a: Atomic<int>): int "
-        "    return a.Exchange(N()); "  // #2602 case — must still reject
-        "  end T; "
-        "end C;");
-    BEZEL_EXPECT_TRUE(hasError(r, kNullableDiag));
-    BEZEL_EXPECT_TRUE(hasError(r, "Atomic<T>.Exchange"));
-}

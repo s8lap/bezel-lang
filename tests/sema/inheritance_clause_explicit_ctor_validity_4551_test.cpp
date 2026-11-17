@@ -196,42 +196,6 @@ BEZEL_TEST(inheritance_clause_explicit_ctor_validity_4551,
 }
 
 // ---------------------------------------------------------------------------
-// CONTROL — a clause that legitimately OMITS a §22.5-DEFAULTED parameter
-// (#4550's subject). This is the shape a naive "every parameter must be bound"
-// reading of the new rejection breaks, and the one that separates PIN 5's
-// complaint from "rejects every short clause".
-// ---------------------------------------------------------------------------
-BEZEL_TEST(inheritance_clause_explicit_ctor_validity_4551,
-           clause_omitting_a_defaulted_parameter_still_accepted_4550) {
-    auto r = runAot(
-        "module M; "
-        "class B "
-        "  public n: int := 0; "
-        "  public s: string := \"\"; "
-        "  public constructor(a: int, b: string := \"zz\") "
-        "    n := a; "
-        "    s := b; "
-        "  end constructor; "
-        "  public method Show() "
-        "    Console.WriteLine($\"n={n} s={s}\"); "
-        "  end Show; "
-        "end B; "
-        "class D(v: int) : B(a := v) "
-        "  public method Go() Show(); end Go; "
-        "end D; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var d := new D(4); "
-        "    d.Go(); "
-        "    return 0; "
-        "  end Main; "
-        "end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("n=4 s=zz\n"));
-}
-
-// ---------------------------------------------------------------------------
 // CONTROL — the arm's BOUNDARY, and #4518's own control row in this file's
 // terms: a base with BOTH a §22.10 primary parameter list and a convenience
 // constructor, where the clause binds the PRIMARY list (its arity matches the

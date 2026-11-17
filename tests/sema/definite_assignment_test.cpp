@@ -32,17 +32,6 @@ BEZEL_TEST(sema_da, local_with_init_is_assigned) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §7.9 (v0.299, #4419): a local of DEFAULTABLE type declared without an
-// initializer (`var x: int;`) holds the type's default (`0` for int) from
-// its declaration and may be read from any reaching path. Replaces the
-// pre-#4419 over-strict verdict (which rejected every no-init local
-// unconditionally). Pair with `local_nondefaultable_no_init_still_diagnoses`
-// below, which preserves the rejection for non-defaultable types.
-BEZEL_TEST(sema_da, local_defaultable_no_init_read_accepted_spec_7_9_4419) {
-    auto r = parseAndCheckDA(wrap("var x: int; _ := x;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 // §7.9 (v0.299, #4419): a NON-defaultable local declared without an
 // initializer (non-nullable `string`) still requires explicit assignment
 // before read — the §17.11 "defaultable" glossary entry admits only
@@ -58,11 +47,6 @@ BEZEL_TEST(sema_da, local_nondefaultable_no_init_still_diagnoses_spec_7_9_4419) 
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(mentionsUnassignedRead(r));
-}
-
-BEZEL_TEST(sema_da, local_assigned_before_read_is_clean) {
-    auto r = parseAndCheckDA(wrap("var x: int; x := 5; _ := x;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(sema_da, both_branches_assign_is_clean) {

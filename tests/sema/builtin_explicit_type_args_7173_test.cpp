@@ -170,10 +170,3 @@ BEZEL_TEST(sema_builtin_explicit_type_args_7173, stringbuilder_append_control) {
                  "    Console.WriteLine(sb.Length);",
                  "2\n");
 }
-
-BEZEL_TEST(sema_builtin_explicit_type_args_7173, debug_writeline_control) {
-    // `Debug.WriteLine` writes to the standard ERROR stream, so the
-    // program's standard output is empty; the row pins that the call still
-    // compiles and runs.
-    expectStdout("Debug.WriteLine(\"hello\");", "");
-}

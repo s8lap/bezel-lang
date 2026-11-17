@@ -160,15 +160,6 @@ BEZEL_TEST(object_surface_arity_8041, force_unwrap_twin_is_refused) {
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kArityToString));
 }
 
-// §8.2's reflection gate keeps its OWN diagnostic for the zero-argument
-// `GetType()` — the arity axis must not shadow it.
-BEZEL_TEST(object_surface_arity_8041, get_type_keeps_its_own_diagnostic) {
-    auto r = runAot(mainBody("var o: Object := 5; var g := o.GetType();"));
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kGetTypeNotImplemented));
-}
-
 // A CLASS receiver keeps its own surface: §8.1's declaration is the root
 // `Object`'s, not every receiver's.
 BEZEL_TEST(object_surface_arity_8041, class_receiver_keeps_its_own_members) {

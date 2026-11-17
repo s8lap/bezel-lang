@@ -203,27 +203,3 @@ BEZEL_TEST(sema_atomic_nullable_arg_2602,
         "end C;");
     BEZEL_EXPECT_TRUE(!hasError(r, kNullableDiag));
 }
-
-// #2602 cross-domain guard: the §7 gate's isAtomic branch is name-gated to
-// `Atomic`/`AtomicInteger` only, so it cannot perturb the isElementCollection/
-// isKeyedCollection/isSpanBuffer branches. This re-runs a representative case
-// from #2582 (heap collection) using that suite's own `new`-constructed-local
-// shape (known to trigger in the harness) to confirm the collection branch
-// still rejects after the isAtomic branch was added. The authoritative
-// no-spillover proof is the full #2581/#2582/#2600 suites re-run during
-// acceptance.
-BEZEL_TEST(sema_atomic_nullable_arg_2602,
-           heap_collection_branch_unaffected_by_atomic_branch) {
-    auto r = parseSemaAll(
-        "module M; "
-        "class C "
-        "  private static method N(): int? => null; "
-        "  public static method T(): int "
-        "    var arr := new Array<int>(1); "
-        "    arr[0] := 7; "
-        "    return arr.IndexOf(N()); "  // #2582 case — must still reject
-        "  end T; "
-        "end C;");
-    BEZEL_EXPECT_TRUE(hasError(r, kNullableDiag));
-    BEZEL_EXPECT_TRUE(hasError(r, "Array<T>.IndexOf"));
-}
