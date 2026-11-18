@@ -3996,6 +3996,13 @@ private:
     // argument for a function-typed parameter.  lowerLambda reads this to
     // infer the LLVM types for unannotated lambda parameters.
     const sema::TypeRef* expectedFunctionType_ = nullptr;
+    // fix #8794 (§27.3, v0.359): the assignment `f := lambda() => k;` supplies
+    // the target's function type to THAT lambda literal only (lowerLambda swaps
+    // it into expectedFunctionType_ when `&lam == assignRhsLambda_`), so a
+    // lambda in the assignment TARGET (`d[(lambda() => 1)()] := ...`) never
+    // sees the right-hand side's slot.
+    const ast::LambdaExpr* assignRhsLambda_ = nullptr;
+    const sema::TypeRef* assignRhsLambdaFnTy_ = nullptr;
     // lambdaParamTypeHint_: maps ParameterSymbol* → sema TypeRef* for lambda
     // params whose type is inferred from expectedFunctionType_ (no declType AST
     // node).  Used in identifier lookup to supply the missing sema type so that

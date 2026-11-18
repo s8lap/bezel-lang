@@ -21,11 +21,27 @@
 #include "support/aot_support.hpp"   // runAot, runAotChecked
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
 std::string runOut(const std::string& src) {
     auto r = runAotChecked(src);
+    if (!r.ran) {
+        std::string s = "DID NOT RUN:";
+        for (const auto& d : r.diagnostics.diagnostics())
+            if (d.severity == bezel::Severity::Error) s += " | " + d.message;
+        return s;
+    }
+    return r.stdoutText + "exit=" + std::to_string(r.exitCode);
+}
+
+// runAot (not runAotChecked) for the two Dictionary<int, () -> double> rows
+// below: a Dictionary holding closure values leaks 64 B at exit on the base
+// tree as well (measured identical on 80439bb9d and 6e995439e), an unrelated
+// residue that LSan would report; the rows pin the printed values.
+std::string runOutNoSan(const std::string& src) {
+    auto r = runAot(src);
     if (!r.ran) {
         std::string s = "DID NOT RUN:";
         for (const auto& d : r.diagnostics.diagnostics())
@@ -90,4 +106,40 @@ BEZEL_TEST(codegen_expr_lambda_narrowed_capture_8794, reassigned_lambda) {
         "    f := lambda() => k;\n"
         "    Console.WriteLine(f());\n")),
         std::string("5\nexit=0"));
+}
+
+// Fix-forward (rev-s56 REJECT of 6e995439e): the assignment target's function
+// type is the slot of the RIGHT-HAND-SIDE lambda only (§27.3, v0.359: a
+// lambda's expected type comes from the position it stands in). A lambda in
+// the assignment TARGET is a different position: `(lambda() => 1)()` as the
+// dictionary key must stay an `int`-returning closure. With the slot armed
+// for the whole statement the key lambda took the `() -> double` return and
+// the key was stored as garbage (-140509184 on 6e995439e).
+BEZEL_TEST(codegen_expr_lambda_narrowed_capture_8794, iife_in_assignment_target_keeps_its_own_type) {
+    BEZEL_EXPECT_EQ(runOutNoSan(prog("",
+        "    const k: double? := 2.5;\n"
+        "    var d := new Dictionary<int, () -> double>();\n"
+        "    d[(lambda() => 1)()] := lambda() => k;\n"
+        "    for var key in d.Keys do\n"
+        "      Console.WriteLine(key);\n"
+        "    end for;\n"
+        "    var e := new Dictionary<int, () -> double>();\n"
+        "    e[(lambda() => 1)()] := lambda() => 2.5;\n"
+        "    for var key in e.Keys do\n"
+        "      Console.WriteLine(key);\n"
+        "    end for;\n")),
+        std::string("1\n1\nexit=0"));
+}
+
+// The same shape read back: the narrowed-read RHS is stored under key 1 (not
+// a second garbage key) and still returns the payload.
+BEZEL_TEST(codegen_expr_lambda_narrowed_capture_8794, iife_in_assignment_target_overwrites_key) {
+    BEZEL_EXPECT_EQ(runOutNoSan(prog("",
+        "    const k: double? := 2.5;\n"
+        "    var d := new Dictionary<int, () -> double>();\n"
+        "    d[1] := lambda() => 0.0;\n"
+        "    d[(lambda() => 1)()] := lambda() => k;\n"
+        "    Console.WriteLine(d.Count);\n"
+        "    Console.WriteLine(d[1]());\n")),
+        std::string("1\n2.5\nexit=0"));
 }

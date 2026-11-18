@@ -670,12 +670,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // the target, as a typed-local initializer does (lowerLocalDecl): the
         // body's own exprType is the declared carrier `T?`, so without the
         // target the closure returns the carrier to a caller reading `int`.
-        // Gated to exactly that shape: no other assigned lambda sees a target.
-        struct ExpectedFnRestore {
-            const sema::TypeRef*& slot;
-            const sema::TypeRef* saved;
-            ~ExpectedFnRestore() { slot = saved; }
-        } expectedFnRestore{expectedFunctionType_, expectedFunctionType_};
+        // Gated to exactly that shape: no other assigned lambda sees a target,
+        // and the slot is keyed on the right-hand-side LambdaExpr node (consumed
+        // by lowerLambda), so a lambda inside the assignment TARGET
+        // (`d[(lambda() => 1)()] := lambda() => k;`) does not take it.
+        struct AssignRhsLambdaRestore {
+            const ast::LambdaExpr*& lam;
+            const sema::TypeRef*& fnTy;
+            const ast::LambdaExpr* savedLam;
+            const sema::TypeRef* savedFnTy;
+            ~AssignRhsLambdaRestore() { lam = savedLam; fnTy = savedFnTy; }
+        } assignRhsLambdaRestore{assignRhsLambda_, assignRhsLambdaFnTy_,
+                                 assignRhsLambda_, assignRhsLambdaFnTy_};
         if (as->target && as->value && as->op == ":=")
             if (auto* lamRhs =
                     dynamic_cast<const ast::LambdaExpr*>(as->value.get()))
@@ -683,8 +689,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     ctx_.isNarrowedValueRead(*lamRhs->exprBody))
                     if (const sema::TypeRef* tt = ctx_.exprType(*as->target))
                         if (tt->kind == sema::TypeRef::Kind::Function &&
-                            tt->funcReturn && !tt->funcReturn->nullable)
-                            expectedFunctionType_ = tt;
+                            tt->funcReturn && !tt->funcReturn->nullable) {
+                            assignRhsLambda_ = lamRhs;
+                            assignRhsLambdaFnTy_ = tt;
+                        }
         if (as->target && as->value) {
             // per §24: `event += handler` / `event -= handler` (inside the
             // declaring class) desugar to Add/Remove — not a real compound

@@ -1307,6 +1307,15 @@ llvm::GlobalVariable* Emitter::getFreedSlotGlobal() {
 
 
 llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
+    // fix #8794 (§27.3, v0.359): the assignment arm's target function type
+    // reaches only the right-hand-side lambda literal it was computed for.
+    struct AssignRhsSlot {
+        const sema::TypeRef*& slot;
+        const sema::TypeRef* saved;
+        ~AssignRhsSlot() { slot = saved; }
+    } assignRhsSlot{expectedFunctionType_, expectedFunctionType_};
+    if (assignRhsLambda_ == &lam && assignRhsLambdaFnTy_)
+        expectedFunctionType_ = assignRhsLambdaFnTy_;
     const std::vector<sema::Symbol*>* paramSyms = ctx_.lambdaParams(&lam);
     // fix #4813 (§14.1 / §14.5, v0.307): snapshot the hint map BEFORE this
     // lambda's own parameter hints are set below, so the restore on exit drops
