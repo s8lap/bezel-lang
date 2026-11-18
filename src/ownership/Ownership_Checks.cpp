@@ -24978,24 +24978,35 @@ static bool captureParamIsValueConstrained(
 // // per §28.3 v0.326, §28.1 v0.326, §14.2
 bool MethodOwnership::typeParamAdmitsClassOrInterface(
     std::string_view head) const {
+    if (!typeParamIsDeclaredHere(head)) return false;
+    if (typeParamIsValueConstrained(head))
+        return false;  // §14.2 `where T: value` — outside the rule entirely
+    return true;
+}
+
+// fix #8785: see the declaration. Positional recognition — the head must name
+// one of THIS body's own generic parameters, method-level or enclosing-type-
+// level. `extensionEnclosingParams` is already folded into `enclosingParams` by
+// computeBareReturnContext's caller (Ownership.cpp), so the two vectors below
+// are the complete name set. // per §28.1 v0.326, §14.2
+bool MethodOwnership::typeParamIsDeclaredHere(std::string_view head) const {
     if (!genericCtx_) return false;
-    // Positional recognition — the head must name one of THIS body's own generic
-    // parameters, method-level or enclosing-type-level. `extensionEnclosingParams`
-    // is already folded into `enclosingParams` by computeBareReturnContext's
-    // caller (Ownership.cpp), so the two vectors below are the complete name set.
     auto inParams = [&](const std::vector<ast::GenericParam>* ps) -> bool {
         if (!ps) return false;
         for (const ast::GenericParam& g : *ps)
             if (g.name == head) return true;
         return false;
     };
-    if (!inParams(genericCtx_->methodParams) &&
-        !inParams(genericCtx_->enclosingParams))
-        return false;
-    if (captureParamIsValueConstrained(head, genericCtx_->methodConstraints) ||
-        captureParamIsValueConstrained(head, genericCtx_->enclosingConstraints))
-        return false;  // §14.2 `where T: value` — outside the rule entirely
-    return true;
+    return inParams(genericCtx_->methodParams) ||
+           inParams(genericCtx_->enclosingParams);
+}
+
+bool MethodOwnership::typeParamIsValueConstrained(std::string_view head) const {
+    if (!typeParamIsDeclaredHere(head)) return false;
+    return captureParamIsValueConstrained(head,
+                                          genericCtx_->methodConstraints) ||
+           captureParamIsValueConstrained(head,
+                                          genericCtx_->enclosingConstraints);
 }
 
 // fix #5661 (§28.3 *Argument contributions* clause 4, v0.326): see the
@@ -29612,63 +29623,114 @@ MethodOwnership::ScopedBound MethodOwnership::scopedBoundingLocal(
 // fix #8785 (§28.3 closure bullet *Provenance* clause 1, v0.359): does this
 // CAPTURED binding contribute a source to the closure's source set?
 //
-// The clause, verbatim: "a captured local or parameter of a value type that
-// holds borrows ([§3.6]) the sources of the borrows it carries, ...; a
-// captured value that carries no borrow — a value type that holds none, a
-// null-source value, a `string` — contributes nothing, and lives in its heap
-// capture cell".
+// The clause, verbatim: "a captured borrowed local or parameter that binding's
+// source; a captured owned local its enclosing scope ...; a captured `ref` or
+// `out` parameter, whatever its type, the declaring body's scope as well; a
+// captured local or parameter of a value type that holds borrows ([§3.6]) the
+// sources of the borrows it carries ...; a captured value that carries no
+// borrow — a value type that holds none, a null-source value, a `string` —
+// contributes nothing, and lives in its heap capture cell".
 //
-// So a capture of a VALUE type that holds NO borrows contributes NOTHING: the
-// closure's source set stays empty, and §28.3's set-erasing rule is binary
-// on that set ("At every set-erasing position a function value with a
-// non-empty source set is rejected, and a capture-free one is admitted",
-// v0.359) — the capture-free closure is ADMITTED there.
+// "Contributes nothing" is therefore the EXCEPTION, reached only for a capture
+// POSITIVELY identified as a value type that holds no borrow
+// (`captureTypeHoldsNoBorrow`); every other capture is COUNTED. The default is
+// the count, never the exemption: a declaration-less stdlib class
+// (`StringBuilder`, `Array<T>`, `Dictionary<K,V>`, `Random`, …), a span, an
+// unknown head or an unresolved type contributes its binding's source. The
+// first #8785 cut defaulted the other way at a declaration-less head and so
+// newly admitted every stdlib-class and span capture at a set-erasing position.
 //
-// Every other capture is COUNTED, exactly as before this change:
-//   * a class- or interface-typed capture — a borrow, carrying its binding's
-//     source (clause 1);
-//   * a value type that HOLDS borrows (a borrow-bearing record, choice or
-//     inline array) — the sources of the borrows it carries (clause 1);
-//   * a function-typed capture — its own set, transitively (clause 1);
-//   * an owned local or an `owned` parameter — its enclosing scope;
-//   * a `ref`/`out` parameter — the declaring body's scope, whatever its type;
-//   * a `string` capture — §28.3's clause 1 says a `string` contributes
-//     nothing either, but that is a SIBLING shape of the same predicate and
-//     is filed separately; #8785's shape is the VALUE-TYPE capture, so a
-//     `string` capture stays counted here;
-//   * a capture whose type is unknown — conservatively counted.
+// An OWNED binding is counted whatever its type ("a captured owned local its
+// enclosing scope"): an `owned` parameter, a local the file's owned-obligation
+// predicate flags, or a local the flow state currently tracks as Owned.
+//
+// SCOPE: a `string` capture is §28.3's third "contributes nothing" form, but it
+// is the sibling shape #8806 and stays counted here; so does a null-source
+// value, whose recognition is a per-VALUE fact the capture's declared type
+// cannot show.
 //
 // A capture of `this`/`base` resolves to no symbol, so it is not counted here
 // at all (unchanged).
-bool MethodOwnership::captureContributesSource(
-    const sema::Symbol* sym) const {
+bool MethodOwnership::captureContributesSource(const sema::Symbol* sym) {
     if (!sym) return false;
+    // "a captured owned local its enclosing scope": any owned binding, whatever
+    // its type.
+    if (symbolIsOwnedObligation(sym)) return true;
+    if (isOwnedTrackedLocal(const_cast<sema::Symbol*>(sym))) return true;
     const sema::TypeRef* t = nullptr;
     if (auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym)) {
-        // §28.3 *Captured owned bindings*: a captured owned local contributes
-        // its enclosing scope.
-        if (symbolIsOwnedObligation(sym)) return true;
         t = ls->declType;
     } else if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym)) {
-        if (symbolIsOwnedObligation(sym)) return true;
-        // §28.3 *Provenance* clause 1: "a captured `ref` or `out` parameter,
-        // whatever its type, the declaring body's scope as well".
-        if (ps->modifier == "ref" || ps->modifier == "out" ||
-            ps->modifier == "out owned")
-            return true;
+        // "a captured `ref` or `out` parameter, whatever its type, the
+        // declaring body's scope as well" — and any non-plain modifier is
+        // counted (only a plain by-value parameter can be a value copy).
+        if (!ps->modifier.empty()) return true;
         t = ps->resolvedDeclType;
         if (!t && ps->declType) t = ctx_.resolvedType(*ps->declType);
     } else {
-        // Not a local and not a parameter: unchanged (conservative).
+        // Not a local and not a parameter: conservative.
         return true;
     }
-    if (!t) return true;  // an unresolved type: conservative
+    std::unordered_set<const sema::TypeRef*> seen;
+    return !captureTypeHoldsNoBorrow(t, seen, /*env=*/nullptr,
+                                     /*topLevel=*/true);
+}
+
+// fix #8785 (§28.3 *Provenance* clause 1, v0.359; §3.6; §9.7; §35.4): is `t`
+// POSITIVELY a value type that holds no borrow? A CLOSED, positive test —
+// `false` (the capture is counted) for every type it cannot positively place:
+//
+//   * a primitive VALUE type (`bool`, `char`, the numeric types), nullable or
+//     not, and `()`: yes. `Object` (a class, §9.7): no. `string`: yes as a
+//     COMPONENT of a record, choice or inline array (§9.7 — runtime-managed);
+//     a captured `string` binding is #8806's shape and stays counted;
+//   * a function type: no (clause 1 — "its own set, transitively");
+//   * a class or interface, or a declaration-less builtin class head
+//     (`isBorrowableOwnedSinkType`: `StringBuilder`, `Random`, the plain and
+//     owning collections, the builtin exceptions): no;
+//   * a span view or a borrow-bearing record or inline array
+//     (`isBorrowBearingRecordOrSpan`) or a choice that holds borrows
+//     (`isBorrowBearingChoice`): no;
+//   * a declaration-less type parameter: yes only at the capture's own
+//     declared type and only when it is one of the analysed body's parameters
+//     constrained `where T: value` (§14.2; §28.1 clause 5); anything else is
+//     read under §28.1's class-or-interface assumption;
+//   * a declaration-less builtin head: yes only for the closed value set
+//     `trustIsDeclarationlessValueBuiltin` names, minus `CancellationToken`
+//     (a borrow-bearing record, §9.7: "a span's and a `CancellationToken`'s
+//     alike"), `ReadOnlyStringSpan`, `String` and `Type` (reference-backed);
+//   * a value builtin with a symbol, an enum: yes (`CancellationToken` and the
+//     spans excepted, as above);
+//   * a record, a choice or an inline array: yes only when EVERY component —
+//     each storage field, each case payload, the element — is itself
+//     positively no-borrow, read through the instantiation's substitution
+//     (`seedRecordSubstEnv`). An `owned` payload or an `owned` inline array
+//     holds an owned reference: no. The structural walk is what reaches a
+//     declaration-less class component (`record R(B: StringBuilder)`), which
+//     §9.7's own field walk does not see;
+//   * an unresolved or erroneous type: no.
+// `seen` is the PATH guard of the record/choice walk (a type already on the
+// path answers "no": conservative, and terminating).
+// // per §28.3, §3.6, §9.7, §35.4, §14.2
+bool MethodOwnership::captureTypeHoldsNoBorrow(
+    const sema::TypeRef* t, std::unordered_set<const sema::TypeRef*>& seen,
+    const common::RecordSubstEnv* env, bool topLevel) {
+    if (!t) return false;
+    // A component's bare type parameter, read through the instantiation.
+    if (env) {
+        const common::RecordSubstEnv::Entry sub =
+            common::resolveRecordFieldSubst(t, env);
+        if (sub.ty && sub.ty != t)
+            return captureTypeHoldsNoBorrow(sub.ty, seen, sub.env, topLevel);
+    }
+    // The declaration-less class heads, the builtin exceptions and every
+    // class/interface reference.
+    if (isBorrowableOwnedSinkType(t)) return false;
+    // The span views and the borrow-bearing records, inline arrays, choices.
+    if (isBorrowBearingRecordOrSpan(t) || isBorrowBearingChoice(t))
+        return false;
     switch (t->kind) {
         case sema::TypeRef::Kind::Primitive:
-            // §3.1: the primitive VALUE types (`bool`, `char`, the numeric
-            // types) hold no borrows — §28.3 *Provenance* clause 1: such a
-            // capture "contributes nothing". `string` is a reference type
-            // (§3.1) and `Object` holds a class reference: both stay counted.
             switch (t->primitive) {
                 case sema::PrimitiveType::Bool:
                 case sema::PrimitiveType::Char:
@@ -29683,44 +29745,92 @@ bool MethodOwnership::captureContributesSource(
                 case sema::PrimitiveType::Float:
                 case sema::PrimitiveType::Double:
                 case sema::PrimitiveType::Decimal:
-                    return false;
-                default:
                     return true;
+                case sema::PrimitiveType::String:
+                    // A `string` COMPONENT is runtime-managed and makes no
+                    // value type hold a borrow (§9.7: "string / function /
+                    // boxed ... fields do not"), so `record R(S: string)`
+                    // holds none. A captured `string` binding itself is the
+                    // sibling shape #8806 and stays counted here.
+                    return !topLevel;
+                default:
+                    return false;  // `Object` — a class (§9.7)
             }
-        case sema::TypeRef::Kind::Function:
-            // A captured function value contributes its own set, transitively
-            // (§28.3 *Provenance* clause 1).
-            return true;
         case sema::TypeRef::Kind::Unit:
-            return false;
+            return true;
         case sema::TypeRef::Kind::InlineArray:
-            // §3.6: an inline array holds borrows iff its element type does
-            // (§9.7: "a borrow-bearing inline array (one whose element type is
-            // a reference type or a borrow-bearing record ...)").
-            return isBorrowBearingRecordOrSpan(t);
-        case sema::TypeRef::Kind::Named: {
-            if (!t->declaration) {
-                // A bare type parameter (or an unresolvable builtin head):
-                // §28.1 clauses 3/5 read a type parameter admitting a
-                // class-or-interface substitution as borrow-bearing.
-                return captureTypeIsBorrowBearing(t);
-            }
-            const ast::TypeDeclKind k = t->declaration->kind;
-            if (k == ast::TypeDeclKind::Class ||
-                k == ast::TypeDeclKind::Interface)
-                return true;  // a borrow
-            // A value builtin is a scalar/struct: it holds no borrows (§2.5).
-            if (t->declaration->isValueBuiltin) return false;
-            // A record, a choice or an enum: §3.6's holds-borrows property.
-            if (k == ast::TypeDeclKind::Choice) return isBorrowBearingChoice(t);
-            if (k == ast::TypeDeclKind::Record)
-                return isBorrowBearingRecord(t) || isBorrowBearingRecordOrSpan(t);
-            return false;  // an enum holds no borrows
-        }
-        case sema::TypeRef::Kind::Error:
+            if (!t->arrayElement || t->arrayOwned) return false;
+            return captureTypeHoldsNoBorrow(t->arrayElement, seen, env,
+                                            /*topLevel=*/false);
+        case sema::TypeRef::Kind::Named:
             break;
+        default:
+            return false;  // Function, Error
     }
-    return true;  // conservative
+    // `CancellationToken` holds a borrow of its source (§9.7, §30.8), and the
+    // string-backed span and the reference-backed `String`/`Type` spellings
+    // are not value types that hold none here.
+    const std::string_view head =
+        t->declaration ? std::string_view(t->declaration->name) : t->headName();
+    if (head == "CancellationToken" || head == "ReadOnlyStringSpan" ||
+        head == "String" || head == "Type")
+        return false;
+    if (!t->declaration) {
+        // A type parameter is asked first: one may be spelled like a value
+        // builtin (`class Box<Guid>`).
+        if (t->isResolvedTypeParam() ||
+            (t->astNode && t->astNode->name &&
+             t->astNode->name->parts.size() == 1 &&
+             typeParamIsDeclaredHere(t->astNode->name->parts.front()))) {
+            if (!topLevel) return false;
+            return t->astNode && t->astNode->name &&
+                   t->astNode->name->parts.size() == 1 &&
+                   typeParamIsValueConstrained(
+                       t->astNode->name->parts.front());
+        }
+        if (head.empty()) return false;
+        return trustIsDeclarationlessValueBuiltin(head);
+    }
+    const sema::TypeSymbol* ts = t->declaration;
+    // A synthetic value builtin (`DateTime`, `TimeSpan`, `Guid`, `Range`, …)
+    // is keyed `Class` by `builtinClassSym`, so it is asked first.
+    if (ts->isValueBuiltin) return true;
+    if (ts->kind == ast::TypeDeclKind::Class ||
+        ts->kind == ast::TypeDeclKind::Interface)
+        return false;
+    if (ts->kind == ast::TypeDeclKind::Enum) return true;
+    if (ts->kind != ast::TypeDeclKind::Record &&
+        ts->kind != ast::TypeDeclKind::Choice)
+        return false;
+    if (!seen.insert(t).second) return false;  // PATH guard
+    common::RecordSubstEnv myEnv;
+    common::seedRecordSubstEnv(*ts, *t, env, myEnv);
+    const common::RecordSubstEnv* compEnv = myEnv.map.empty() ? nullptr : &myEnv;
+    bool noBorrow = true;
+    if (ts->kind == ast::TypeDeclKind::Record) {
+        noBorrow = !sema::anyRecordStorageField(
+            ts, ctx_, [&](const sema::Symbol*, const sema::TypeRef* ft) {
+                return !captureTypeHoldsNoBorrow(ft, seen, compEnv,
+                                                 /*topLevel=*/false);
+            });
+    } else {
+        for (const sema::ChoiceCaseSymbol* ccs : sema::choiceCasesOf(ts)) {
+            if (!ccs || !ccs->caseDecl) { noBorrow = false; break; }
+            for (const auto& pf : ccs->caseDecl->payload) {
+                const sema::TypeRef* pt =
+                    pf.type ? ctx_.resolvedType(*pf.type) : nullptr;
+                if (pf.modifier == "owned" ||
+                    !captureTypeHoldsNoBorrow(pt, seen, compEnv,
+                                              /*topLevel=*/false)) {
+                    noBorrow = false;
+                    break;
+                }
+            }
+            if (!noBorrow) break;
+        }
+    }
+    seen.erase(t);
+    return noBorrow;
 }
 
 // §28.3 closure bullet *Set-erasing positions* (v0.330): a function value

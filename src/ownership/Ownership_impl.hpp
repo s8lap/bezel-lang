@@ -6761,6 +6761,12 @@ private:
     // null-declaration Named shape is not mistaken for a type parameter.
     // // per §28.1 v0.326, §28.3 v0.326, §14.2
     bool typeParamAdmitsClassOrInterface(std::string_view head) const;
+    // fix #8785: the two halves of the question above, asked separately —
+    // does `head` name one of the analysed body's own generic parameters, and
+    // is that parameter `where T: value`-constrained (§14.2)?
+    // // per §28.1 v0.326, §14.2
+    bool typeParamIsDeclaredHere(std::string_view head) const;
+    bool typeParamIsValueConstrained(std::string_view head) const;
 
     // fix #3746 (§28.3 *Captured owned bindings*, v0.286): the ONE both-kinds
     // form of the question above — "is this symbol a binding whose owned value
@@ -7267,11 +7273,21 @@ private:
     // parameter.  Determines whether `arg` is a function value with captures.
     bool exprIsFunctionValueWithNonEmptyCaptureSet(const ast::Expr& arg);
     // fix #8785 (§28.3 closure bullet *Provenance* clause 1, v0.359): does this
-    // CAPTURED binding contribute a source to the closure's source set?  A
-    // capture of a value type that holds NO borrows contributes nothing, so
-    // the closure stays capture-free and is admitted at a §28.3 set-erasing
-    // position; every other capture is counted.
-    bool captureContributesSource(const sema::Symbol* sym) const;
+    // CAPTURED binding contribute a source to the closure's source set?  Only
+    // a capture POSITIVELY identified as a value type that holds no borrow
+    // (`captureTypeHoldsNoBorrow`) contributes nothing, so the closure stays
+    // capture-free and is admitted at a §28.3 set-erasing position; every
+    // other capture — an owned binding of any type, a `ref`/`out` parameter,
+    // a declaration-less stdlib class, a span, an unknown type — is counted.
+    bool captureContributesSource(const sema::Symbol* sym);
+    // fix #8785: the closed, positive "a value type that holds none" test of
+    // §28.3 clause 1 (§3.6, §9.7, §35.4). `topLevel` is true at the capture's
+    // own declared type, where a `where T: value` type parameter of the
+    // analysed body qualifies; `seen` is the record/choice walk's path guard
+    // and `env` its instantiation substitution. // per §28.3, §3.6, §9.7
+    bool captureTypeHoldsNoBorrow(
+        const sema::TypeRef* t, std::unordered_set<const sema::TypeRef*>& seen,
+        const common::RecordSubstEnv* env, bool topLevel);
     void scopedCollectCaptures(const ast::LambdaExpr& lam,
                                std::vector<const ast::IdentifierExpr*>& out);
     void scopedCaptureWalkStmt(const ast::Stmt& s,
