@@ -3181,6 +3181,12 @@ private:
         // back to for a runtime-managed value it cannot prove non-escaping).
         // Fires on BOTH the normal and unwind exit, mirroring `grouping`.
         bool dictEntryKeyRelease = false;
+        // fix #8592 (§28.9 / §28.11, v0.357): `slot` is a co-own HOLDER (see
+        // bindCoOwnedArrayCopyOut): a null-initialized pointer slot naming the
+        // references a copied-out element's binding took, given back with
+        // `bz_coown_holder_drop`. Fires on both exits; the drop nulls the
+        // slot, so it is idempotent.
+        bool coOwnHolder = false;
         // fix #8232 (stdlib §5 / §4.8, v0.355): the local's slot holds the
         // NULLABLE form of the synthetic `DictionaryEntry<K, V>` -- §5's
         // `ElementAtOrNull(index: int): T?` forms its `T?` at a dictionary's
@@ -5598,9 +5604,18 @@ private:
     // #422: store rc := 1 into a freshly malloc'd bz_string header (field 3).
     // Every heap producer in codegen calls this so the value carries the
     // producer's reference (§4.6 runtime-managed lifetime).
+    //
+    // fix #8592 (§28.9 / §28.11, v0.357): and reports the new string to the
+    // runtime (`bz_string_born`), which keeps the set of FREED string
+    // addresses a co-owning array consults before it takes a reference; the
+    // allocator may have handed back an address in that set. One relaxed
+    // load when no co-owner exists.
     void initStringRc(llvm::Value* strObj) {
         builder_.CreateStore(llvm::ConstantInt::get(i64(), 1),
                              builder_.CreateStructGEP(stringType(), strObj, 3));
+        builder_.CreateCall(declareC("bz_string_born",
+                                     llvm::Type::getVoidTy(llvm_), {ptrTy()}),
+                            {strObj});
     }
 
     // #422: emit a call to bz_string_retain(s) — increments rc (no-op on a
@@ -17446,6 +17461,15 @@ private:
     // `retainCoOwnedArrayCopyOutForReturn` (LlvmBackend_Assign.cpp).
     void retainCoOwnedArrayCopyOutForReturn(const ast::Expr* src,
                                             llvm::Value* v);
+    // fix #8592 (§28.9 / §28.11 *The element slot policy*, v0.357): a
+    // co-owner takes a reference on every string it is handed unless the
+    // string is proven dead (see "A REFERENCE IS TAKEN UNLESS THE STRING IS
+    // PROVEN DEAD" in bezel_runtime_collections.cpp). The compiler's half
+    // (LlvmBackend_Assign.cpp): the leaf walk the runtime needs to find a
+    // record element's strings, and the module constructor that turns the
+    // runtime's tracking of freed string addresses on before `main`.
+    llvm::Function* coOwnLeafVisitThunk(const sema::TypeRef* et);
+    void emitStringDeathTrackingCtor();
 
     // fix #4135 (§27.5 / §28.9, stdlib §4.9, v0.295): is `rt` a
     // DrainedEntry<K,V> type from lowerDictDrainFor (the for-loop-variable

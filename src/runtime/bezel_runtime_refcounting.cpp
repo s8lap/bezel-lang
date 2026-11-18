@@ -156,6 +156,10 @@ extern "C" void bz_string_release(void* s) {
     // second free() below (see bz_refcount_overrelease_fail's comment).
     if (new_count < 0)
         bz_refcount_overrelease_fail("string");
+    // fix #8592: the string is dead from here on; say so BEFORE the memory
+    // goes back to the allocator (see "TOMBSTONES" below).
+    if (__atomic_load_n(&bz_string_deaths_tracked, __ATOMIC_RELAXED))
+        bz_string_note_dead(s);
     // Last reference gone: free the data buffer, then the header. Read the data
     // pointer at offset 0 (the layout's first field). free(NULL) is safe (the
     // empty-string case may carry a null data pointer).
@@ -163,6 +167,156 @@ extern "C" void bz_string_release(void* s) {
     memcpy(&data, (uint8_t*)s, sizeof(void*));
     free(data);
     free(s);
+}
+
+// ---------------------------------------------------------------------------
+// fix #8592 (§28.9 / §28.11 *The element slot policy*, v0.357): TOMBSTONES.
+//
+// A record VALUE is a byte copy and holds no reference on the strings it
+// embeds (§28.11's value row), so a record value can outlive them: it then
+// carries the address of a string that has been freed. A CO-OWNER (an
+// `Array<E>` whose slots co-own their embedded strings, and the binding of an
+// element copied out of one — see "A REFERENCE IS TAKEN UNLESS THE STRING IS
+// PROVEN DEAD" in bezel_runtime_collections.cpp) must take a reference on
+// every LIVE string it is handed, and must not touch a dead one. Nothing in
+// the pointer says which it is, and nothing the compiler can see does either
+// (a class field, an async or iterator local, a value returned by a method:
+// each can carry a live string or a dead one).
+//
+// So the runtime keeps the one fact that decides it: the set of addresses at
+// which a string header was FREED and at which no string has been allocated
+// since. An address in the set is PROOF that the string is dead. An address
+// not in the set is treated as alive — the conservative default: a co-owner
+// that is not sure takes the reference.
+//
+//   * `bz_string_release` adds the address when the last reference goes;
+//   * every producer of a heap string removes the address it has just been
+//     given (`bz_string_born`: the runtime's `bz_string_init_rc` and its few
+//     hand-written twins, and generated code's `initStringRc`), so a tombstone
+//     never outlives the allocator's reuse of that address by a string. Reuse
+//     by anything that is not a string leaves the tombstone in place, which is
+//     still the truth about a string pointer with that value.
+//
+// TRACKING IS OFF until a program that has a co-owner asks for it: the
+// compiler emits a module constructor calling `bz_string_track_deaths` in
+// every module that creates one (so tracking starts before `main`), and the
+// runtime's own co-owner entry points call it as well (a host that does not
+// run module constructors). A string freed while tracking was off is simply
+// not known dead, and gets the default. With tracking off the whole mechanism
+// is one relaxed load per string allocation and per final release.
+//
+// The table is an open-addressed set (static storage first, the heap only
+// when it outgrows it), guarded by one mutex. Keys are stored COMPLEMENTED:
+// the table must never look, to a leak checker, like a reference to a block.
+// Its size is bounded by the number of distinct addresses at which the
+// allocator has ever placed a string header.
+int bz_string_deaths_tracked = 0;
+static std::mutex& bz_tomb_mutex() {
+    alignas(std::mutex) static unsigned char buf[sizeof(std::mutex)];
+    static std::mutex* m = new (buf) std::mutex();   // never destroyed: atexit
+    return *m;                                       // disposal still frees strings
+}
+enum { BZ_TOMB_TAB0 = 1024 };                        // a power of two
+static uintptr_t bz_tomb_tab0[BZ_TOMB_TAB0];         // 0: an empty slot
+static uintptr_t* bz_tomb_tab = bz_tomb_tab0;
+static size_t bz_tomb_cap = BZ_TOMB_TAB0;            // always a power of two
+static size_t bz_tomb_len = 0;
+static inline uintptr_t bz_tomb_key(const void* p) { return ~(uintptr_t)p; }
+static inline size_t bz_tomb_home(uintptr_t k, size_t cap) {
+    uint64_t h = (uint64_t)k * 0x9E3779B97F4A7C15ull;
+    return (size_t)(h >> 32) & (cap - 1);
+}
+// The slot holding `p`, or SIZE_MAX. Linear probing; an empty slot ends a run.
+static size_t bz_tomb_find(const void* p) {
+    const uintptr_t k = bz_tomb_key(p);
+    const size_t mask = bz_tomb_cap - 1;
+    for (size_t i = bz_tomb_home(k, bz_tomb_cap);; i = (i + 1) & mask) {
+        if (bz_tomb_tab[i] == k) return i;
+        if (!bz_tomb_tab[i]) return SIZE_MAX;
+    }
+}
+// Add `p`, which must not be present. The table is kept at most half full, so
+// every probe run ends.
+static void bz_tomb_insert(const void* p) {
+    if ((bz_tomb_len + 1) * 2 > bz_tomb_cap) {
+        const size_t ncap = bz_tomb_cap * 2;
+        auto* nt = (uintptr_t*)calloc(ncap, sizeof(uintptr_t));
+        if (!nt) bz_alloc_fail("string tombstones");
+        for (size_t i = 0; i < bz_tomb_cap; i++) {
+            if (!bz_tomb_tab[i]) continue;
+            size_t j = bz_tomb_home(bz_tomb_tab[i], ncap);
+            while (nt[j]) j = (j + 1) & (ncap - 1);
+            nt[j] = bz_tomb_tab[i];
+        }
+        if (bz_tomb_tab != bz_tomb_tab0) free(bz_tomb_tab);
+        bz_tomb_tab = nt;
+        bz_tomb_cap = ncap;
+    }
+    const size_t mask = bz_tomb_cap - 1;
+    size_t i = bz_tomb_home(bz_tomb_key(p), bz_tomb_cap);
+    while (bz_tomb_tab[i]) i = (i + 1) & mask;
+    bz_tomb_tab[i] = bz_tomb_key(p);
+    bz_tomb_len++;
+}
+// Remove the entry in slot `hole`, closing the gap (backward shift) so no
+// probe run is broken: a later entry moves into the hole unless its home lies
+// after the hole.
+static void bz_tomb_erase(size_t hole) {
+    const size_t mask = bz_tomb_cap - 1;
+    for (size_t j = (hole + 1) & mask; bz_tomb_tab[j]; j = (j + 1) & mask) {
+        const size_t home = bz_tomb_home(bz_tomb_tab[j], bz_tomb_cap);
+        if (((j - home) & mask) >= ((j - hole) & mask)) {
+            bz_tomb_tab[hole] = bz_tomb_tab[j];
+            hole = j;
+        }
+    }
+    bz_tomb_tab[hole] = 0;
+    bz_tomb_len--;
+}
+
+extern "C" void bz_string_track_deaths(void) {
+    __atomic_store_n(&bz_string_deaths_tracked, 1, __ATOMIC_RELEASE);
+}
+
+// The final release of `s`, about to free it (tracking is on).
+void bz_string_note_dead(void* s) {
+    std::lock_guard<std::mutex> lk(bz_tomb_mutex());
+    if (bz_tomb_find(s) == SIZE_MAX) bz_tomb_insert(s);
+}
+
+// A heap string header has just been allocated at `s`: whatever died at this
+// address before is no longer what a pointer with this value denotes.
+extern "C" void bz_string_born(void* s) {
+    if (!s || !__atomic_load_n(&bz_string_deaths_tracked, __ATOMIC_RELAXED))
+        return;
+    std::lock_guard<std::mutex> lk(bz_tomb_mutex());
+    if (!bz_tomb_len) return;
+    const size_t i = bz_tomb_find(s);
+    if (i != SIZE_MAX) bz_tomb_erase(i);
+}
+
+// A co-owner's take: one reference on `s` UNLESS `s` is proven dead. Returns
+// whether the caller now holds a reference it must give back with
+// `bz_string_release` (true for null and for a literal, where the give-back is
+// a no-op). The tombstone test reads the pointer VALUE only — a dead string's
+// memory is never touched. The lookup and the increment happen under the
+// mutex the final release takes before it frees, so the string cannot be
+// freed between them; a count that has already reached zero on another thread
+// (its tombstone is about to be written) is not revived.
+bool bz_string_retain_unless_dead(void* s) {
+    if (!s) return true;
+    bz_string_track_deaths();
+    int64_t* rcp = (int64_t*)((uint8_t*)s + BZ_STRING_RC_OFFSET);
+    std::lock_guard<std::mutex> lk(bz_tomb_mutex());
+    if (bz_tomb_len && bz_tomb_find(s) != SIZE_MAX) return false;
+    int64_t rc = __atomic_load_n(rcp, __ATOMIC_ACQUIRE);
+    if (rc == BZ_STRING_RC_SENTINEL) return true;   // static/literal
+    while (rc > 0) {
+        if (__atomic_compare_exchange_n(rcp, &rc, rc + 1, /*weak=*/false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------

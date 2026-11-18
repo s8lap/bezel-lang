@@ -10967,6 +10967,16 @@ llvm::Value* emitTextReaderReadToEnd(llvm::IRBuilder<>& builder,
     // #422: the producer's reference, rc := 1.
     builder.CreateStore(builder.getInt64(1),
                         builder.CreateStructGEP(stringTy, strObj, 3));
+    // fix #8592 (§28.9 / §28.11, v0.357): and the report of the new string
+    // every producer makes (see Emitter::initStringRc).
+    llvm::Function* bornFn = module->getFunction("bz_string_born");
+    if (!bornFn) {
+        auto* ft3 = llvm::FunctionType::get(llvm::Type::getVoidTy(llvmCtx),
+                                            {ptrT}, false);
+        bornFn = llvm::Function::Create(
+            ft3, llvm::GlobalValue::ExternalLinkage, "bz_string_born", module);
+    }
+    builder.CreateCall(bornFn, {strObj});
     return strObj;
 }
 

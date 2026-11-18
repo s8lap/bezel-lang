@@ -447,6 +447,7 @@ static void* bz_make_temporal_string(char* out, int pos) {
     sh->len   = (int64_t)pos;
     sh->width = 1;
     sh->rc    = 1;  // producer's reference (§4.6)
+    bz_string_born(sh);  // fix #8592: a string now lives here
     return sh;
 }
 
@@ -797,6 +798,7 @@ void* bz_make_string(const char* buf, int64_t len) {
     data[len] = '\0';
     bz_string_hdr* sh = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
     sh->data = data; sh->len = len; sh->width = 1; sh->rc = 1;
+    bz_string_born(sh);  // fix #8592: a string now lives here
     return sh;
 }
 
@@ -1057,6 +1059,7 @@ void* bz_timeonly_to_string(int32_t ms_from_midnight) {
     sh->len   = 8;
     sh->width = 1;
     sh->rc    = 1;
+    bz_string_born(sh);  // fix #8592: a string now lives here
     return sh;
 }
 

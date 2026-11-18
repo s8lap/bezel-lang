@@ -8,6 +8,7 @@
 // setjmp to catch this, and after std::sort returns, checks the flag and
 // throws InvalidOperationException so the Bezel landing pad catches it.
 #include <csetjmp>
+#include <new>
 thread_local void*  bz_sort_in_progress_arr = nullptr;  // null = no sort in progress
 thread_local bool   bz_sort_mutation_attempted = false;  // true = mutation during sort
 thread_local std::jmp_buf* bz_sort_jmp_buf = nullptr;   // non-null = jump target
@@ -179,23 +180,198 @@ static inline bool bz_array_str_key_slot(const bz_array_t* arr, int64_t esz) {
 // string at struct field 0 (a `DictionaryEntry<string, V>` Key). The #8386
 // stamp generalizes it to an element whose embedded strings sit anywhere in
 // the value — a user record with one or more `string` components, nested
-// records, a choice payload — by carrying two per-element-type thunks the
-// compiler generated from the record's own layout (`emb_retain` /
-// `emb_release`, each applied to the ADDRESS of one element). Every take and
-// every give-back in this file goes through these two helpers, so the two
+// records, a choice payload — by carrying a per-element-type walk the
+// compiler generated from the record's own layout (`emb_visit`, applied to
+// the ADDRESS of one element; see `bz_coown_collect`). Every take and every
+// give-back in this file goes through the two slot helpers below, so the two
 // stamps share one discipline and cannot drift.
 //
-// `emb_release` NULLS the string fields it releases (it is the same field walk
-// a record local's scope-end release uses), so it must only ever be applied to
-// bytes that are about to be discarded — a removed slot, a cleared slot, a
-// displaced element's private copy — never to a live slot.
-static inline void bz_array_take_slot_refs(const bz_array_t* arr, const void* slot) {
-    if (arr->emb_retain) arr->emb_retain((void*)slot);
-    else bz_string_retain(*(void* const*)slot);
+// fix #8592 (§28.9 / §28.11 *The element slot policy*, v0.357): A REFERENCE IS
+// TAKEN UNLESS THE STRING IS PROVEN DEAD.
+//
+// THE DEFECT. The takes above were unconditional: every `Add` / `Insert` /
+// indexer store into a stamped array retained every string the incoming
+// element embeds. But an element VALUE is a byte copy, and a byte copy holds
+// no reference of its own (§28.11's value row) — so a value can reach the
+// store (a local copied from another local, a method's return value, a class
+// field, an async or iterator local, a for-in variable copied to an outer
+// local, a record built from a source that has since died) carrying a pointer
+// whose string was already freed, typically because this very array had been
+// its last owner and gave the reference back at an overwrite, a `RemoveAt` or
+// a `Clear`. Retaining through it is a write into freed memory: `bezel:
+// fatal: refcount over-release (string)`, or a SEGV under ASan (#8592's nine
+// programs, each of which ran clean before the three co-ownership fixes
+// because the store was then a byte copy that never touched the string).
+//
+// THE RULE. §28.11's copy slot "copies the value in", and a string held
+// through the copy keeps §28.9's unbounded lifetime through every later
+// mutation or disposal of the source — so a co-owner takes its reference on
+// EVERY string it cannot prove dead. It skips exactly one kind: a string whose
+// address the runtime has recorded as freed and not reallocated since (the
+// TOMBSTONES of bezel_runtime_refcounting.cpp). §28.9 gives a string an
+// unbounded lifetime for its HOLDERS; it does not make a stale copy of a
+// pointer a holder, and no reference can be taken on a string that no longer
+// exists. Such a string is stored exactly as it was before the stamp existed:
+// byte-copied, untouched, and recorded as NOT OWNED so the give-back walk does
+// not release a reference this array never took.
+//
+// The direction of the default is the point (the first cut of this fix took a
+// reference only on a string something vouched for, and thereby stored LIVE
+// strings unowned whenever nothing did: a for-in variable, a dictionary
+// value, a record parameter's component — a use-after-free as soon as the
+// source was cleared). A live string is never in the tombstone set, so no
+// program that was sound under the unconditional takes can lose a reference.
+//
+// If a dead string's address has been reused by a new string, the stale
+// pointer is indistinguishable from the new one; taking a reference then
+// retains the new, live string and the matching give-back releases it, which
+// is balanced and memory-safe (the stale slot was already unreadable).
+static inline bool bz_coown_hold(void* p) {
+    return bz_string_retain_unless_dead(p);
 }
-static inline void bz_array_drop_slot_refs(const bz_array_t* arr, void* slot) {
-    if (arr->emb_release) arr->emb_release(slot);
-    else bz_string_release(*(void**)slot);
+// Give back one reference a co-owner took with `bz_coown_hold`.
+static inline void bz_coown_unhold(void* p) {
+    bz_string_release(p);
+}
+
+// One mutex for the holder-block pool below (holders are bound and dropped on
+// whatever thread runs the binding's scope).
+static std::mutex& bz_coown_mutex() {
+    alignas(std::mutex) static unsigned char buf[sizeof(std::mutex)];
+    static std::mutex* m = new (buf) std::mutex();   // never destroyed: atexit
+    return *m;                        // disposal still gives references back
+}
+
+// A holder's LIST of the strings it holds a reference on: a chain of
+// fixed-size blocks drawn from a recycled pool (the first batch is static
+// storage; a batch is never returned to the allocator, and every batch stays
+// reachable from `bz_coown_batches`).
+struct bz_coown_block {
+    bz_coown_block* next;
+    size_t n;
+    void* leaf[6];
+};
+enum { BZ_COOWN_BATCH = 16 };
+struct bz_coown_batch {
+    bz_coown_batch* next;
+    bz_coown_block blocks[BZ_COOWN_BATCH];
+};
+static bz_coown_batch bz_coown_batch0;
+static bz_coown_batch* bz_coown_batches = nullptr;
+static bz_coown_block* bz_coown_pool = nullptr;
+// Append `p` to the list at `*head`.
+static void bz_coown_list_push(bz_coown_block** head, void* p) {
+    std::lock_guard<std::mutex> lk(bz_coown_mutex());
+    bz_coown_block* b = *head;
+    if (!b || b->n == sizeof(b->leaf) / sizeof(b->leaf[0])) {
+        if (!bz_coown_pool) {
+            bz_coown_batch* batch = &bz_coown_batch0;
+            if (bz_coown_batches) {
+                batch = (bz_coown_batch*)calloc(1, sizeof(bz_coown_batch));
+                if (!batch) bz_alloc_fail("co-owner holder list");
+            }
+            batch->next = bz_coown_batches;
+            bz_coown_batches = batch;
+            for (int i = 0; i < BZ_COOWN_BATCH; i++) {
+                batch->blocks[i].next = bz_coown_pool;
+                bz_coown_pool = &batch->blocks[i];
+            }
+        }
+        bz_coown_block* fresh = bz_coown_pool;
+        bz_coown_pool = fresh->next;
+        fresh->next = b;
+        fresh->n = 0;
+        *head = b = fresh;
+    }
+    b->leaf[b->n++] = p;
+}
+// Give back every reference in the list `b` and recycle its blocks.
+static void bz_coown_list_giveback(bz_coown_block* b) {
+    while (b) {
+        for (size_t i = 0; i < b->n; i++) bz_coown_unhold(b->leaf[i]);
+        bz_coown_block* next = b->next;
+        std::lock_guard<std::mutex> lk(bz_coown_mutex());
+        for (size_t i = 0; i < b->n; i++) b->leaf[i] = nullptr;
+        b->n = 0;
+        b->next = bz_coown_pool;
+        bz_coown_pool = b;
+        b = next;
+    }
+}
+
+// The embedded strings ("leaves") of one element. The Key stamp has exactly
+// one, at field 0. The #8386 stamp carries a compiler-generated walk of the
+// record's own layout (`emb_visit`, applied to the ADDRESS of an element) that
+// reports every embedded string pointer to `bz_coown_leaf`, which appends it
+// to the collector the current thread has installed.
+struct bz_coown_leaves {
+    void* inl[8];
+    std::vector<void*> more;
+    size_t n = 0;
+    void push(void* p) { if (n < 8) inl[n] = p; else more.push_back(p); n++; }
+    void* at(size_t i) const { return i < 8 ? inl[i] : more[i - 8]; }
+};
+static thread_local bz_coown_leaves* bz_coown_leaf_sink = nullptr;
+extern "C" void bz_coown_leaf(void* p) {
+    if (p && bz_coown_leaf_sink) bz_coown_leaf_sink->push(p);
+}
+static void bz_coown_collect(void (*visit)(void*), const void* elem,
+                             bz_coown_leaves& out) {
+    if (!visit) {
+        void* key = *(void* const*)elem;
+        if (key) out.push(key);
+        return;
+    }
+    bz_coown_leaves* saved = bz_coown_leaf_sink;
+    bz_coown_leaf_sink = &out;
+    visit((void*)elem);
+    bz_coown_leaf_sink = saved;
+}
+
+// The strings this array stores WITHOUT owning a reference on them (see THE
+// RULE above): a multiset of pointer values, created on the first such store.
+// It is keyed by pointer, not by slot, so a sort, a reverse or a shift needs
+// no bookkeeping, and the invariant is a count: for every string pointer `p`,
+//   references this array holds on p  =  slots carrying p  -  unowned(p).
+typedef std::unordered_map<const void*, int64_t> bz_coown_unowned_t;
+static void bz_array_note_unowned(bz_array_t* arr, void* p) {
+    if (!arr->coown_unowned) arr->coown_unowned = new bz_coown_unowned_t();
+    (*(bz_coown_unowned_t*)arr->coown_unowned)[p]++;
+}
+static bool bz_array_consume_unowned(bz_array_t* arr, void* p) {
+    auto* u = (bz_coown_unowned_t*)arr->coown_unowned;
+    if (!u) return false;
+    auto it = u->find(p);
+    if (it == u->end()) return false;
+    if (--it->second <= 0) u->erase(it);
+    return true;
+}
+static void bz_array_forget_unowned(bz_array_t* arr) {
+    delete (bz_coown_unowned_t*)arr->coown_unowned;
+    arr->coown_unowned = nullptr;
+}
+// Take / give back the references of the strings in `leaves` for `arr`.
+static void bz_array_take_leaves(bz_array_t* arr, const bz_coown_leaves& leaves) {
+    for (size_t i = 0; i < leaves.n; i++) {
+        void* p = leaves.at(i);
+        if (!bz_coown_hold(p)) bz_array_note_unowned(arr, p);
+    }
+}
+static void bz_array_drop_leaves(bz_array_t* arr, const bz_coown_leaves& leaves) {
+    for (size_t i = 0; i < leaves.n; i++) {
+        void* p = leaves.at(i);
+        if (!bz_array_consume_unowned(arr, p)) bz_coown_unhold(p);
+    }
+}
+static inline void bz_array_take_slot_refs(bz_array_t* arr, const void* slot) {
+    bz_coown_leaves leaves;
+    bz_coown_collect(arr->emb_visit, slot, leaves);
+    bz_array_take_leaves(arr, leaves);
+}
+static inline void bz_array_drop_slot_refs(bz_array_t* arr, const void* slot) {
+    bz_coown_leaves leaves;
+    bz_coown_collect(arr->emb_visit, slot, leaves);
+    bz_array_drop_leaves(arr, leaves);
 }
 
 static void bz_array_take_str_dict_key(void* arrp, int64_t idx, int64_t esz) {
@@ -259,12 +435,9 @@ static void bz_array_drop_str_dict_key(void* arrp, int64_t idx, int64_t esz) {
 // there, not the value it just wrote — the same "read the old pointer before
 // the store" rule `bz_array_set_disposing` has always used for an owning
 // element's disposal (issue #388 / stdlib §4.5).
-static inline void bz_take_str_dict_key_ptr(void* key) {
-    bz_string_retain(key);
-}
-static inline void bz_drop_str_dict_key_ptr(void* key) {
-    bz_string_release(key);
-}
+//
+// fix #8592: both stamps now share ONE replace, `bz_array_replace_coown_slot`
+// below, which keeps exactly this ordering.
 
 // Give back every slot the array currently holds. Shared by the two clears and
 // by the two frees, so all four discharge exactly the slots they empty.
@@ -287,32 +460,29 @@ static void bz_array_drop_all_str_dict_keys(void* arrp, bool keep_stamp = false)
         char* slot = (char*)bz_array_ptr_at(arr, i, esz);
         bz_array_drop_slot_refs(arr, slot);
     }
+    // fix #8592: every slot has been given back, so no unowned mention can
+    // still be outstanding; the (now empty) record goes with the slots.
+    bz_array_forget_unowned(arr);
     if (!keep_stamp) {
         arr->str_key_esz = 0;
-        arr->emb_retain = nullptr;   // fix #8386: the thunks go with the stamp
-        arr->emb_release = nullptr;
+        arr->emb_visit = nullptr;    // fix #8386: the walk goes with the stamp
     }
 }
 
-// fix #8386: the REPLACE half for a thunk-stamped array, shared by the two
-// indexer stores. Same ordering as the Key stamp's replace, for the same
-// reason (see the take-then-release note above): the incoming element's
-// references are taken BEFORE the displaced element's are given back, so a
-// self-store nets to nothing instead of freeing a string the slot still
-// holds. The displaced element is copied out WHOLE first — its strings can be
-// at any offset, and `emb_release` nulls what it releases, which must not
-// happen to the bytes just stored.
-static void bz_array_replace_emb_slot(bz_array_t* arr, int64_t idx,
-                                      const void* elem, int64_t esz) {
+// The REPLACE half of an indexer store into a stamped array, shared by the two
+// indexer stores and by both stamps (fix #8386 / fix #8592). Ordering as the
+// take-then-release note above requires: the incoming element's references
+// are taken BEFORE the displaced element's are given back, so a self-store
+// nets to nothing instead of freeing a string the slot still holds. The
+// displaced element's strings are read BEFORE the copy overwrites them.
+static void bz_array_replace_coown_slot(bz_array_t* arr, int64_t idx,
+                                        const void* elem, int64_t esz) {
     char* slot = (char*)arr->data + idx * esz;
-    char small[256];
-    char* displaced = (size_t)esz <= sizeof small ? small : (char*)malloc((size_t)esz);
-    if (!displaced) bz_alloc_fail("Array<T> displaced element");
-    memcpy(displaced, slot, (size_t)esz);
-    arr->emb_retain((void*)elem);
+    bz_coown_leaves displaced;
+    bz_coown_collect(arr->emb_visit, slot, displaced);
+    bz_array_take_slot_refs(arr, elem);
     memcpy(slot, elem, (size_t)esz);
-    arr->emb_release(displaced);
-    if (displaced != small) free(displaced);
+    bz_array_drop_leaves(arr, displaced);
 }
 
 void* bz_array_alloc(int64_t elem_size, int64_t initial_cap) {
@@ -416,7 +586,7 @@ void bz_array_set(void* arrp, int64_t idx, const void* elem, int64_t elem_size) 
     // back the Key it co-owned and takes the one it now co-owns.
     //
     // fix #6560 follow-up: TAKE FIRST, THEN RELEASE (see
-    // `bz_drop_str_dict_key_ptr` for the measurement and the rule). The
+    // the take-then-release note above for the measurement and the rule). The
     // displaced Key is read out of the slot before the memcpy — exactly as
     // `bz_array_set_disposing` does for an owning array's element (issue #388
     // / stdlib §4.5) — so a store whose source is the slot it overwrites, or a
@@ -429,17 +599,8 @@ void bz_array_set(void* arrp, int64_t idx, const void* elem, int64_t elem_size) 
         // an index outside [0, count), is not a slot this array co-owns, so no
         // Key is taken or given back — only the bytes move.
         if (bz_array_str_key_slot(arr, elem_size) && idx >= 0 && idx < arr->count) {
-            if (arr->emb_retain) {  // fix #8386: a thunk-stamped record array
-                bz_array_replace_emb_slot(arr, idx, elem, elem_size);
-                return;
-            }
-            void* displaced = *(void**)bz_array_ptr_at(arr, idx, elem_size);
-            // The incoming Key comes from `elem`, NOT from the slot: after the
-            // memcpy the slot holds it, but reading it there would retain the
-            // displaced value a second time when the two alias.
-            bz_take_str_dict_key_ptr(*(void**)elem);
-            memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
-            bz_drop_str_dict_key_ptr(displaced);
+            // fix #8386 / fix #8592: one replace for both stamps.
+            bz_array_replace_coown_slot(arr, idx, elem, elem_size);
             return;
         }
     }
@@ -471,14 +632,8 @@ void bz_array_set_disposing(void* arrp, int64_t idx, const void* elem,
     // the `((void**)arr->data)[idx]` disposer read above is a stride-8 reach.
     if (arr->str_key_esz > 0 &&
         bz_array_str_key_slot(arr, elem_size) && idx >= 0 && idx < arr->count) {
-        if (arr->emb_retain) {  // fix #8386: a thunk-stamped record array
-            bz_array_replace_emb_slot(arr, idx, elem, elem_size);
-            return;
-        }
-        void* displaced = *(void**)bz_array_ptr_at(arr, idx, elem_size);
-        bz_take_str_dict_key_ptr(*(void**)elem);
-        memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
-        bz_drop_str_dict_key_ptr(displaced);
+        // fix #8386 / fix #8592: one replace for both stamps.
+        bz_array_replace_coown_slot(arr, idx, elem, elem_size);
         return;
     }
     memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
@@ -788,6 +943,19 @@ static void bz_array_release_str_dict_keys(bz_array_t* arr) {
 // later `Add` / `Insert` / indexer store takes the reference as it stores. An
 // array that reaches the runtime any other way leaves `str_key_esz` zero and
 // is byte-for-byte unaffected.
+//
+// fix #8592: the initial walk is a take like any other (see THE RULE above),
+// and a stamp is what makes this process one that has a co-owner: the tracking
+// of string deaths is turned on here if the module constructor has not
+// already done it.
+static void bz_array_coown_stamp_slots(bz_array_t* arr, int64_t esz) {
+    bz_string_track_deaths();
+    if (!arr->data) return;
+    for (int64_t i = 0; i < arr->count; ++i) {
+        char* slot = (char*)bz_array_ptr_at(arr, i, esz);
+        if (slot) bz_array_take_slot_refs(arr, slot);
+    }
+}
 extern "C" void bz_array_own_str_dict_keys(void* arrp, int64_t esz) {
     if (!arrp || esz <= 0) return;
     auto* arr = (bz_array_t*)arrp;
@@ -796,13 +964,9 @@ extern "C" void bz_array_own_str_dict_keys(void* arrp, int64_t esz) {
     // stamp is what makes the first `Add` take. Returning early here (the
     // pre-#6557 shape) left a zero-length `new Array<...>(0, fill)` unstamped
     // for life. A disposed array is the one header that must stay unstamped.
-    if (arr->disposed) return;
-    if (arr->data) {
-        for (int64_t i = 0; i < arr->count; ++i) {
-            char* slot = (char*)bz_array_ptr_at(arr, i, esz);
-            if (slot) bz_string_retain(*(void**)slot);
-        }
-    }
+    if (arr->disposed || arr->str_key_esz > 0) return;
+    arr->emb_visit = nullptr;
+    bz_array_coown_stamp_slots(arr, esz);
     arr->str_key_esz = esz;
 }
 
@@ -838,21 +1002,19 @@ extern "C" void bz_array_own_str_dict_keys(void* arrp, int64_t esz) {
 // string's lifetime becomes max(its source's, its slot's) — never shorter than
 // before, never unbounded. No program that was clean before the stamp can
 // leak or over-release because of it.
-extern "C" void bz_array_own_embedded_strings(void* arrp, int64_t esz,
-                                              void (*retain)(void*),
-                                              void (*release)(void*)) {
-    if (!arrp || esz <= 0 || !retain || !release) return;
+//
+// fix #8592: ONE entry point for the compiler's stamp, for both element
+// shapes. `visit` is the element's leaf walk (see `bz_coown_collect`), or NULL
+// for the Key stamp ("the string at field 0"). The strings already in the
+// slots (a `(size, fill)` fill value) are taken under THE RULE above.
+extern "C" void bz_array_coown_stamp(void* arrp, int64_t esz,
+                                     void (*visit)(void*)) {
+    if (!arrp || esz <= 0) return;
     auto* arr = (bz_array_t*)arrp;
     if (arr->disposed || arr->str_key_esz > 0) return;  // never re-stamp
-    if (arr->data) {
-        for (int64_t i = 0; i < arr->count; ++i) {
-            char* slot = (char*)bz_array_ptr_at(arr, i, esz);
-            if (slot) retain(slot);
-        }
-    }
+    arr->emb_visit = visit;
+    bz_array_coown_stamp_slots(arr, esz);
     arr->str_key_esz = esz;
-    arr->emb_retain = retain;
-    arr->emb_release = release;
 }
 
 // fix #6566 (§28.11 *The element slot policy*, §28.9, v0.357): the COPY-OUT
@@ -869,21 +1031,62 @@ extern "C" void bz_array_own_embedded_strings(void* arrp, int64_t esz,
 // ran, and `rows[1] := t;` then took a reference on freed memory (#6566's
 // swap; `RemoveAt(0)` + `Add(t)` and `Clear()` + `Add(t)` are the same shape).
 //
-// THE MECHANISM. `copy` is the address of a private byte copy of an element
-// the caller has JUST read out of `arrp` (nothing ran in between, so the slot
-// still holds the same bytes and the array still holds its references — which
-// is what makes taking another one safe). When `arrp` is a co-owner of its
-// slots' strings, one reference per embedded string is taken on behalf of the
-// copy; the caller releases them when the copy's binding ends. When `arrp` is
-// NOT a co-owner (an unstamped array: the strings' liveness is whatever the
-// producer left, and may already be gone) the copy is ZEROED instead, so the
-// caller's unconditional scope-end release is a no-op — no reference is ever
-// taken through a pointer this array does not vouch for.
+// THE MECHANISM (as of fix #8592). The binding owns a HOLDER — `*slot`, null
+// or the list of strings it holds a reference on. `value` is the address of a
+// private byte copy of an element the caller has JUST read out of `arrp`
+// (nothing ran in between, so the slot still holds the same bytes). When
+// `arrp` is a co-owner of its slots' strings, the holder takes one reference
+// on each embedded string under THE RULE above — every one that is not proven
+// dead; a slot can carry a dead string (one that was stored unowned), and the
+// copy of it is then not held either. When `arrp` is NOT a co-owner (an
+// unstamped array: nothing here was ever taken on the strings' behalf) the
+// holder takes nothing. Whatever the slot held before (a re-bind) is given
+// back AFTER the new references are taken, so a value whose strings only the
+// old holder kept alive stays held. (Until fix #8592 the holder was a shadow
+// copy of the element, released field by field; a per-string decision needs a
+// list.)
+extern "C" void bz_array_coown_bind(void** slot, void* arrp, const void* value,
+                                    int64_t esz) {
+    if (!slot) return;
+    bz_coown_block* held = nullptr;
+    auto* arr = (bz_array_t*)arrp;
+    if (value && arr && !arr->disposed && bz_array_str_key_slot(arr, esz)) {
+        bz_coown_leaves leaves;
+        bz_coown_collect(arr->emb_visit, value, leaves);
+        for (size_t i = 0; i < leaves.n; i++) {
+            void* p = leaves.at(i);
+            if (p && bz_coown_hold(p)) bz_coown_list_push(&held, p);
+        }
+    }
+    auto* old = (bz_coown_block*)*slot;
+    *slot = held;
+    bz_coown_list_giveback(old);
+}
+// Give back what `bz_array_coown_bind` took (the binding's scope end) and
+// empty the slot, so a second call releases nothing.
+extern "C" void bz_coown_holder_drop(void** slot) {
+    if (!slot) return;
+    auto* old = (bz_coown_block*)*slot;
+    if (!old) return;
+    *slot = nullptr;
+    bz_coown_list_giveback(old);
+}
+
+// fix #8627 (§28.11, §28.9, v0.357): the copy-out of a `return rows[i];` whose
+// receiver dies with the returning function. `copy` is the address of a
+// scratch byte copy of the element just read out of `arrp`; when `arrp`
+// co-owns its slots' strings, one reference per embedded string is taken on
+// behalf of the value being returned — under THE RULE above, so a dead string
+// a slot carries unowned is left alone (fix #8592). Nothing gives these
+// references back: the returned value is a byte copy with no holder of its
+// own (#8627's recorded interpretation).
 extern "C" void bz_array_coown_copy_out(void* arrp, void* copy, int64_t esz) {
     if (!copy || esz <= 0) return;
     auto* arr = (bz_array_t*)arrp;
     if (arr && !arr->disposed && bz_array_str_key_slot(arr, esz)) {
-        bz_array_take_slot_refs(arr, copy);
+        bz_coown_leaves leaves;
+        bz_coown_collect(arr->emb_visit, copy, leaves);
+        for (size_t i = 0; i < leaves.n; i++) (void)bz_coown_hold(leaves.at(i));
         return;
     }
     memset(copy, 0, (size_t)esz);

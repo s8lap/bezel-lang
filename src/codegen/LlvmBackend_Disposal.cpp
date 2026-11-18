@@ -10704,6 +10704,14 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // above/below). The local was proven non-escaping, so nothing else
         // holds the string: bz_string_release frees it exactly once (no UAF,
         // no double-free). bz_string_release is null-/sentinel-safe.
+        // fix #8592 (§28.9 / §28.11, v0.357): a co-own holder gives back the
+        // references its binding took (bindCoOwnedArrayCopyOut).
+        if (it->coOwnHolder) {
+            auto* dropFn = declareC("bz_coown_holder_drop",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(dropFn, {it->slot});
+            continue;
+        }
         if (it->dictEntryKeyRelease) {
             if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
                     it->slot->getAllocatedType())) {

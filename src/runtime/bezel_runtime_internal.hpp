@@ -367,12 +367,24 @@ static const int64_t BZ_STRING_RC_OFFSET = 24;
 // string starts at 1 and could never reach this by retaining (2^63 retains).
 static const int64_t BZ_STRING_RC_SENTINEL = 0x7FFFFFFFFFFFFFFFLL;
 
+// fix #8592 (§28.9 / §28.11, v0.357): the string TOMBSTONES (see
+// bezel_runtime_refcounting.cpp). `bz_string_deaths_tracked` is nonzero once a
+// co-owner exists; `bz_string_note_dead` is the final release's report;
+// `bz_string_retain_unless_dead` is a co-owner's take. `bz_string_born` (in
+// bezel_runtime.h: generated code calls it too) is every producer's report.
+extern int bz_string_deaths_tracked;
+void bz_string_note_dead(void* s);
+bool bz_string_retain_unless_dead(void* s);
+
 // Initialize the rc field of a freshly heap-allocated bz_string header to 1.
 // The header was calloc'd (rc reads 0); the producer holds the first reference.
 static inline void bz_string_init_rc(void* s) {
     if (!s) return;
     int64_t one = 1;
     memcpy((uint8_t*)s + BZ_STRING_RC_OFFSET, &one, sizeof(int64_t));
+    // fix #8592: a string now lives at this address.
+    if (__atomic_load_n(&bz_string_deaths_tracked, __ATOMIC_RELAXED))
+        bz_string_born(s);
 }
 
 // ---- shared runtime types (used across >1 domain TU) ----
@@ -496,18 +508,26 @@ struct bz_array_t {
     // bz_array_len / bz_array_ptr_at / bz_array_get).
     int64_t str_key_esz;
     // fix #8386 (§28.9 / §28.3.1 K1.6, v0.357): the GENERAL form of the stamp
-    // above. When both are non-null, the references this array co-owns per
-    // slot are not "the string at field 0" but "every string the element
-    // carries", and these two compiler-generated thunks are the walk: each is
-    // applied to the ADDRESS of one element (stride `str_key_esz`) and
-    // retains / releases every embedded string of a record element (nested
-    // records and choice payloads included). Set only by
-    // `bz_array_own_embedded_strings`, together with `str_key_esz`, and
-    // cleared with it. NULL (the calloc default) with `str_key_esz > 0` is
-    // exactly the #6550 Key stamp. APPENDED last: {…, str_key_esz@72,
-    // emb_retain@80, emb_release@88} (96 B).
-    void (*emb_retain)(void*);
-    void (*emb_release)(void*);
+    // above. When non-null, the references this array co-owns per slot are
+    // not "the string at field 0" but "every string the element carries", and
+    // this compiler-generated walk finds them: applied to the ADDRESS of one
+    // element (stride `str_key_esz`), it reports every embedded string
+    // pointer of a record element (nested records and choice payloads
+    // included) to `bz_coown_leaf`. Set only by `bz_array_coown_stamp`,
+    // together with `str_key_esz`, and cleared with it. NULL (the calloc
+    // default) with `str_key_esz > 0` is exactly the #6550 Key stamp.
+    // (Until fix #8592 this was a retain/release thunk pair; the runtime now
+    // decides per string whether a reference is taken, so it needs the
+    // pointers, not a fixed action.)
+    void (*emb_visit)(void*);
+    // fix #8592 (§28.9 / §28.11, v0.357): the strings this array stores but
+    // holds NO reference on — a `std::unordered_map<const void*, int64_t>`
+    // multiset of pointer values, allocated on the first store of a string
+    // that is proven dead (see "A REFERENCE IS TAKEN UNLESS THE STRING IS
+    // PROVEN DEAD" in bezel_runtime_collections.cpp). NULL: every slot's
+    // strings are owned. APPENDED last: {…, str_key_esz@72, emb_visit@80,
+    // coown_unowned@88} (96 B, as before this fix).
+    void* coown_unowned;
 };
 typedef struct { char* data; int64_t len; uint8_t width; int64_t rc; } bz_string_hdr;
 struct bz_string_struct {

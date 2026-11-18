@@ -8339,6 +8339,15 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // The two thunks and the stamp live in
                 // `stampArrayStringCoOwner` (LlvmBackend_Layout.cpp), shared
                 // with the §9.8 deserialize arm (fix #8391).
+                //
+                // fix #8592 (§28.9 / §28.11, v0.357): the record stamp carries
+                // ONE walk — `coOwnLeafVisitThunk`, which reports each
+                // embedded string to the runtime — in place of the retain /
+                // release thunk pair, because the runtime now decides per
+                // string whether a reference is taken (every string not
+                // proven dead; see bezel_runtime_collections.cpp). A module
+                // that creates a co-owner also turns the runtime's tracking
+                // of freed string addresses on, before `main`.
                 auto stampStrDictKeyCoOwner = [&](llvm::Value* arr) {
                     stampArrayStringCoOwner(arr, rt, elemSize);
                 };

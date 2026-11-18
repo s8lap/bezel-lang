@@ -597,37 +597,42 @@ void Emitter::noteArrayElemRead(const ast::Expr& ix, llvm::Value* recv,
 // `Array<DictionaryEntry<string, int>>`). Reading `t.Name` after the first
 // store was a use-after-free for the same reason (#6566's own table).
 //
-// THE MECHANISM. The binding gets a SHADOW — a second copy of the element in
-// its own entry-block slot — and `bz_array_coown_copy_out(recv, shadow, esz)`
-// takes one reference per embedded string into it when `recv` is, at run
-// time, a co-owner of its slots (the stamp), and zeroes it when it is not.
-// The shadow's strings are released at the end of the local's scope by the
-// record-local release walk (`recordStringFields`) or the entry Key release
-// (`dictEntryKeyRelease`), both of which are null-safe and null what they
-// release, on the normal and the unwind exit alike. The reference is held in
-// the shadow rather than in the local's own slot so that nothing the program
-// does to the local (a field store into `t`, a reassignment from another
-// producer) can change which strings the scope-end release gives back.
+// THE MECHANISM (as of fix #8592). The binding gets a HOLDER — a pointer slot
+// in the entry block — and `bz_array_coown_bind(holder, recv, &value, esz)`
+// takes one reference into it per embedded string when `recv` is, at run
+// time, a co-owner of its slots (the stamp), and takes nothing when it is
+// not. The holder gives them back at the end of the local's scope
+// (`bz_coown_holder_drop`, null-safe and idempotent), on the normal and the
+// unwind exit alike. The references are held beside the local rather than in
+// its own slot so that nothing the program does to the local (a field store
+// into `t`, a reassignment from another producer) can change which strings
+// the scope-end drop gives back.
 //
-// WHY THE RUN-TIME STAMP IS THE GATE. Taking a reference is only safe on a
-// string known to be alive. A stamped array vouches for every string in its
-// slots; an unstamped one (a `ToArray()` copy of a record array, a
-// literal-built array — #8484) vouches for nothing, and its elements may
-// carry pointers that died with their producer. Retaining through those would
-// turn a program that never reads the strings into a use-after-free, so for
-// an unstamped receiver this is a no-op by construction.
+// fix #8592 (§28.9 / §28.11, v0.357): the holder is a LIST of strings, not
+// the shadow copy of the element it was (released field by field), because
+// what is taken is decided per string: a slot of a co-owning array can carry
+// a string that was already dead when it was stored (the array then holds no
+// reference on it — see "A REFERENCE IS TAKEN UNLESS THE STRING IS PROVEN
+// DEAD" in bezel_runtime_collections.cpp), and the copy of such a slot must
+// not take one either. The unconditional take aborted there.
+//
+// WHY THE RUN-TIME STAMP IS THE GATE. A stamped array holds a reference on
+// the strings in its slots; an unstamped one (a `ToArray()` copy of a record
+// array, a literal-built array — #8484) holds nothing, and nothing was ever
+// taken on its elements' behalf. For an unstamped receiver this is a no-op by
+// construction.
 //
 // PAIRED. One take at the bind, one release at scope end (or at the next
 // re-bind of the same local, below), so a string's lifetime becomes
 // max(what it was, the binding's) — never shorter, never unbounded.
 //
-// A REASSIGNMENT `t := rows[i]` of a local that already has a shadow re-binds
-// it: the previous references are released and the new element's taken. A
-// reassignment from any other producer leaves the shadow alone (it keeps the
-// old strings alive to scope end, which is the safe direction).
+// A REASSIGNMENT `t := rows[i]` of a local that already has a holder re-binds
+// it: the new element's references are taken, then the previous ones given
+// back. A reassignment from any other producer leaves the holder alone (it
+// keeps the old strings alive to scope end, which is the safe direction).
 //
 // NOT COVERED, deliberately: a state-machine body (async / iterator — the
-// shadow is not a frame field, so it would not survive a suspend), and a copy
+// holder is not a frame field, so it would not survive a suspend), and a copy
 // that does not come straight from an indexer-get (a for-in variable copied to
 // an outer local, a value returned by a method). Those keep the pre-fix
 // behaviour and stay tracked by #6566.
@@ -658,7 +663,7 @@ void Emitter::bindCoOwnedArrayCopyOut(const ast::Node* declNode,
     llvm::Type* ety = lowerTypeRef(et);
     auto* est = llvm::dyn_cast_or_null<llvm::StructType>(ety);
     if (!est || v->getType() != ety) return;
-    // The shadow is `esz` bytes to the runtime (the stride the array was
+    // The copy is `esz` bytes to the runtime (the stride the array was
     // stamped with); it must be exactly the element's own allocation size.
     if (esz != static_cast<int64_t>(
                    module_->getDataLayout().getTypeAllocSize(ety)))
@@ -668,47 +673,117 @@ void Emitter::bindCoOwnedArrayCopyOut(const ast::Node* declNode,
                     !est->getElementType(0)->isPointerTy()))
         return;
 
-    llvm::AllocaInst* shadow = nullptr;
+    llvm::AllocaInst* holder = nullptr;
     auto it = coOwnedCopyOutShadow_.find(static_cast<const void*>(declNode));
     if (it != coOwnedCopyOutShadow_.end() && it->second &&
         it->second->getFunction() == currentFn_ &&
-        it->second->getAllocatedType() == ety)
-        shadow = it->second;
+        it->second->getAllocatedType() == ptrTy())
+        holder = it->second;
     if (isDecl) {
-        // Zeroed in the entry block: a disposal pass can be reached on a path
-        // that never ran the bind below (#2733), and must release nothing.
+        // Null in the entry block: a disposal pass can be reached on a path
+        // that never ran the bind below (#2733), and must give nothing back.
         llvm::BasicBlock& entry = currentFn_->getEntryBlock();
         llvm::IRBuilder<> tmp(&entry, entry.begin());
-        shadow = tmp.CreateAlloca(ety, nullptr, "coown.copy");
-        tmp.CreateStore(llvm::Constant::getNullValue(ety), shadow);
-        coOwnedCopyOutShadow_[static_cast<const void*>(declNode)] = shadow;
-        if (isEntry) {
-            Disposal d{shadow, nullptr};
-            d.dictEntryKeyRelease = true;
-            disposeStack_.back().push_back(d);
-        } else {
-            Disposal d{shadow, et->declaration};
-            d.recordStringFields = true;
-            d.clsRef = et;
-            disposeStack_.back().push_back(d);
-        }
-    } else {
-        if (!shadow) return;  // not a local this fix bound: leave it alone
-        // Re-bind: give back what the previous copy-out took.
-        if (isEntry) {
-            llvm::Value* keyAddr =
-                builder_.CreateStructGEP(est, shadow, 0, "coown.key.addr");
-            emitStringRelease(
-                builder_.CreateLoad(ptrTy(), keyAddr, "coown.key.old"));
-        } else {
-            emitRecordStringFieldReleases(shadow, et);
-        }
+        holder = tmp.CreateAlloca(ptrTy(), nullptr, "coown.holder");
+        tmp.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), holder);
+        coOwnedCopyOutShadow_[static_cast<const void*>(declNode)] = holder;
+        Disposal d{holder, nullptr};
+        d.coOwnHolder = true;
+        disposeStack_.back().push_back(d);
+    } else if (!holder) {
+        return;  // not a local this fix bound: leave it alone
     }
-    builder_.CreateStore(v, shadow);
-    auto* fn = declareC("bz_array_coown_copy_out",
-                        llvm::Type::getVoidTy(llvm_),
-                        {ptrTy(), ptrTy(), i64()});
-    builder_.CreateCall(fn, {recv, shadow, builder_.getInt64(esz)});
+    // The runtime walks a private copy of the element with the array's own
+    // leaf walk; a re-bind takes the new references before it gives the
+    // previous ones back.
+    llvm::BasicBlock& entry = currentFn_->getEntryBlock();
+    llvm::IRBuilder<> tmp(&entry, entry.begin());
+    llvm::AllocaInst* copy = tmp.CreateAlloca(ety, nullptr, "coown.copy");
+    builder_.CreateStore(v, copy);
+    auto* fn = declareC("bz_array_coown_bind", llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), ptrTy(), i64()});
+    builder_.CreateCall(fn, {holder, recv, copy, builder_.getInt64(esz)});
+    emitStringDeathTrackingCtor();
+}
+
+// fix #8592 (§28.9 / §28.11, v0.357): the LEAF WALK of a record element type
+// — `void walk(elemAddr)`, reporting every string the element embeds to the
+// runtime's `bz_coown_leaf`. A co-owning array decides per string whether it
+// takes a reference (every string not proven dead), so the runtime needs the
+// pointers, not a fixed retain / release action. The walk is the record's own
+// string-field retain walk (`emitRecordStringFieldRetains_impl`: direct
+// components, nested records, a choice payload, an inline array), emitted
+// into a thunk with every `bz_string_retain(p)` it produced redirected to
+// `bz_coown_leaf(p)` — so the set of strings the runtime sees is by
+// construction the set a record local's own retain / release walks touch.
+// Null for a `DictionaryEntry<string, V>` (its one leaf is the Key at field
+// 0, which the runtime reads directly). One per concrete element type per
+// module, found again by name.
+llvm::Function* Emitter::coOwnLeafVisitThunk(const sema::TypeRef* et) {
+    if (!et || isDictEntryStringKeyTypeRef(et)) return nullptr;
+    if (!isRecordWithStringFieldsTypeRef(et) || !typeRefIsRuntimeConcrete(et))
+        return nullptr;
+    std::string name = std::string("bz$coownVisit$") + mangleTypeRefForSymbol(et);
+    if (llvm::Function* have = module_->getFunction(name)) return have;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      name, module_.get());
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    // The walker emits through builder_/currentFn_ — point both at the thunk,
+    // then restore (the boxedRecordValueFreer pattern).
+    llvm::Function* savedFn = currentFn_;
+    auto* savedBB = builder_.GetInsertBlock();
+    auto savedIP = savedBB ? builder_.GetInsertPoint()
+                           : decltype(savedBB->begin()){};
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entry);
+    emitRecordStringFieldRetains_impl(&*fn->args().begin(), et);
+    if (!builder_.GetInsertBlock()->getTerminator()) builder_.CreateRetVoid();
+    currentFn_ = savedFn;
+    if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
+    auto* leafFn = declareC("bz_coown_leaf", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy()});
+    if (llvm::Function* retainFn = module_->getFunction("bz_string_retain")) {
+        for (llvm::BasicBlock& bb : *fn)
+            for (llvm::Instruction& inst : bb)
+                if (auto* ci = llvm::dyn_cast<llvm::CallInst>(&inst))
+                    if (ci->getCalledFunction() == retainFn)
+                        ci->setCalledFunction(leafFn);
+    }
+    return fn;
+}
+
+// fix #8592 (§28.9 / §28.11, v0.357): this module creates a CO-OWNER, so the
+// runtime must know, from before `main`, which string addresses have been
+// freed (the tombstones of bezel_runtime_refcounting.cpp — a co-owner takes a
+// reference on every string not PROVEN dead, and a string that died before
+// tracking began cannot be proven dead). Emits, once per module, a module
+// constructor that calls `bz_string_track_deaths()`. Built without the
+// IRBuilder, so it is safe to call from any lowering position.
+void Emitter::emitStringDeathTrackingCtor() {
+    static const char* const kName = "bz$trackStringDeaths";
+    if (module_->getFunction(kName)) return;
+    auto* voidTy = llvm::Type::getVoidTy(llvm_);
+    auto* fnTy = llvm::FunctionType::get(voidTy, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      kName, module_.get());
+    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    llvm::CallInst::Create(declareC("bz_string_track_deaths", voidTy, {}), {},
+                           "", bb);
+    llvm::ReturnInst::Create(llvm_, bb);
+    // `llvm.global_ctors` is an appending array of { priority, fn, data };
+    // this is the only entry this backend ever adds.
+    auto* i32Ty = llvm::Type::getInt32Ty(llvm_);
+    auto* entTy = llvm::StructType::get(i32Ty, ptrTy(), ptrTy());
+    llvm::Constant* ent = llvm::ConstantStruct::get(
+        entTy, {llvm::ConstantInt::get(i32Ty, 65535), fn,
+                llvm::ConstantPointerNull::get(ptrTy())});
+    auto* arrTy = llvm::ArrayType::get(entTy, 1);
+    new llvm::GlobalVariable(*module_, arrTy, /*isConstant=*/false,
+                             llvm::GlobalValue::AppendingLinkage,
+                             llvm::ConstantArray::get(arrTy, {ent}),
+                             "llvm.global_ctors");
 }
 
 // fix #6557 follow-up (§28.11 *The element slot policy*, §28.9, v0.357): the

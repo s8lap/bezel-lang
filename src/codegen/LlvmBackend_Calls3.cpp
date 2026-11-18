@@ -3958,6 +3958,9 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Value* arr =
             builder_.CreateCall(toArr, {lazy, builder_.getInt64(esz)},
                                 "linq.toarr");
+        // fix #8592 (§28.9 / §28.11, v0.357): the snapshot is a co-owner of
+        // its Keys, so this module asks for string deaths to be tracked.
+        if (entryWithStringKey) emitStringDeathTrackingCtor();
         // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: a materialized Array<string>
         // co-owns a +1 per element so it can be released symmetrically. Keyed on
         // the produced element type being in the RuntimeManaged row AND specifically

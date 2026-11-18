@@ -220,13 +220,28 @@ void bz_array_retain_strings(void* arr);
 // released without ever having been retained.  The stamp is calloc-zeroed, so an
 // unstamped array is byte-for-byte unaffected by the discharge.
 void bz_array_own_str_dict_keys(void* arr, int64_t elem_size);
-// fix #8386 (§28.9, v0.357): stamp `arr` as the co-owner of every string its
-// record elements embed; `retain` / `release` are applied to an element address.
-void bz_array_own_embedded_strings(void* arr, int64_t elem_size,
-                                   void (*retain)(void*), void (*release)(void*));
-// fix #6566 (§28.11, v0.357): `copy` is a private byte copy of an element just
-// read out of `arr`. Takes one reference per embedded string for the copy when
-// `arr` co-owns its slots' strings; zeroes `copy` otherwise.
+// fix #8386 / fix #8592 (§28.9, §28.11, v0.357): stamp `arr` as the co-owner
+// of every string its elements embed. `visit` is applied to an element address
+// and reports each embedded string pointer to `bz_coown_leaf`; NULL means "the
+// string at field 0" (the Key stamp). A co-owner takes a reference on every
+// string it stores unless the string is proven dead (see
+// bezel_runtime_collections.cpp).
+void bz_array_coown_stamp(void* arr, int64_t elem_size, void (*visit)(void*));
+// fix #8592: the leaf sink of a `visit` walk (called only by generated walks).
+void bz_coown_leaf(void* str);
+// fix #6566 / fix #8592 (§28.11, v0.357): `*slot` (null-initialized) is the
+// HOLDER of a binding that has just received, at `value`, a private byte copy
+// of an element read out of `arr`. When `arr` co-owns its slots' strings the
+// holder takes one reference on each embedded string not proven dead, after
+// which it gives back what it held before. `bz_coown_holder_drop` gives
+// everything back and nulls `*slot`.
+void bz_array_coown_bind(void** slot, void* arr, const void* value,
+                         int64_t elem_size);
+void bz_coown_holder_drop(void** slot);
+// fix #8627 (§28.11, v0.357): `copy` is a scratch byte copy of an element just
+// read out of `arr` and about to be returned. Takes one reference per embedded
+// string not proven dead when `arr` co-owns its slots' strings (never given
+// back); zeroes `copy` otherwise.
 void bz_array_coown_copy_out(void* arr, void* copy, int64_t elem_size);
 
 // Return a pointer directly into the array's internal buffer at element `idx`.
@@ -1534,6 +1549,13 @@ void bz_shared_event_source_free(void* src);
 // no-op. Non-atomic for now; becomes atomic when async lands.
 void bz_string_retain(void* s);
 void bz_string_release(void* s);
+// fix #8592 (§28.9 / §28.11, v0.357): the string tombstones (see
+// bezel_runtime_refcounting.cpp). `bz_string_track_deaths` turns the tracking
+// of freed string addresses on (idempotent; emitted as a module constructor by
+// every module that creates a co-owning array). `bz_string_born` is called by
+// every producer of a heap string header, right after it sets rc := 1.
+void bz_string_track_deaths(void);
+void bz_string_born(void* s);
 
 // §8.6 / §12.7 (#417): runtime discriminator for `o is string` / `o as string`
 // / `o.ToString()` where o: Object holds a string. A string stored in an Object

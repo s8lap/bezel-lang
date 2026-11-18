@@ -5672,21 +5672,30 @@ llvm::Function* Emitter::stampArrayStringCoOwner(llvm::Value* arr,
                                llvm::Type::getVoidTy(llvm_),
                                {ptrTy(), i64()});
         builder_.CreateCall(ownFn, {arr, builder_.getInt64(elemSize)});
+        emitStringDeathTrackingCtor();  // fix #8592: see below
         return nullptr;
     }
     // fix #8386: a record element with string components. Gated on a CONCRETE
     // element type: inside an unspecialized generic body the element layout is
     // not known here, and the array is left exactly as it was.
-    if (!isRecordWithStringFieldsTypeRef(et) || !typeRefIsRuntimeConcrete(et))
-        return nullptr;
-    llvm::Function* retainFn = arrayEmbeddedStringThunk(et, true);
-    llvm::Function* releaseFn = arrayEmbeddedStringThunk(et, false);
-    auto* ownFn = declareC("bz_array_own_embedded_strings",
+    //
+    // fix #8592 (§28.9 / §28.11, v0.357): the stamp carries ONE walk —
+    // `coOwnLeafVisitThunk` (which applies the gate above), reporting each
+    // embedded string to the runtime — in place of the retain / release thunk
+    // pair: the runtime now decides per string whether a reference is taken
+    // (every string not proven dead; see bezel_runtime_collections.cpp). A
+    // module that creates a co-owner also turns the runtime's record of freed
+    // string addresses on, before `main`. The RELEASE thunk is still what this
+    // returns: the §9.8 reader holds a real +1 on each string it built, and
+    // gives exactly that back.
+    llvm::Function* visitFn = coOwnLeafVisitThunk(et);
+    if (!visitFn) return nullptr;
+    auto* ownFn = declareC("bz_array_coown_stamp",
                            llvm::Type::getVoidTy(llvm_),
-                           {ptrTy(), i64(), ptrTy(), ptrTy()});
-    builder_.CreateCall(
-        ownFn, {arr, builder_.getInt64(elemSize), retainFn, releaseFn});
-    return releaseFn;
+                           {ptrTy(), i64(), ptrTy()});
+    builder_.CreateCall(ownFn, {arr, builder_.getInt64(elemSize), visitFn});
+    emitStringDeathTrackingCtor();
+    return arrayEmbeddedStringThunk(et, false);
 }
 
 

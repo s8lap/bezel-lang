@@ -1219,6 +1219,7 @@ extern "C" void* bz_decimal_to_string(const bz_decimal_t* a) {
     hdr->len   = len;
     hdr->width = 1;
     hdr->rc    = 1;  // producer's reference
+    bz_string_born(hdr);  // fix #8592: a string now lives here
     return hdr;
 }
 
@@ -1399,6 +1400,7 @@ void* bz_guid_to_string(const bz_guid_t* g) {
     s->len   = 36;
     s->width = 1;
     s->rc    = BZ_GUID_STRING_RC_INIT;  // producer's reference (§4.6)
+    bz_string_born(s);  // fix #8592: a string now lives here
     return s;
 }
 
