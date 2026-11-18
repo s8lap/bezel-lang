@@ -39847,6 +39847,26 @@ struct ClosureEscapeWalker {
             expr(bx->body.get(), safeRead);
             return;
         }
+        // fix #8750 (§18.5 / §28.9, v0.359): an interpolation hole `$"{…}"`
+        // holds an ordinary expression, and this dispatch had no arm for the
+        // string that carries it: the parts fell through to the leaf end
+        // below, so a `target` named inside a hole was neither a read nor an
+        // escape. `var s := $"{C.KeepR(new RB(g), fs)}";` stores `g`'s
+        // closure in the caller's array from inside the hole, and `g` kept
+        // its scope-end release - a heap-use-after-free at the stored
+        // closure's next call. Each hole is walked in an escaping position
+        // (safeRead=false), as an argument of an unknown call would be; a
+        // call OF `target` inside a hole is still decided by the CallExpr arm
+        // above and stays a call. The one hole that is a plain read is the
+        // bare name itself, `$"{target}"`: the hole only renders the value
+        // (a function value renders as its type), and nothing keeps it. A
+        // literal part has no expression.
+        if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : isx->parts)
+                expr(part.expr.get(),
+                     /*safeRead=*/isTargetIdent(part.expr.get()));
+            return;
+        }
         // Leaf literals contain no identifiers — nothing to do. An unrecognized
         // composite the grammar can produce is one of the cases above.
     }
