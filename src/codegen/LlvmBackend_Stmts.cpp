@@ -10416,6 +10416,13 @@ bool Emitter::lowerStringFor(const ast::ForStmt& fs) {
     // Loop variable slot — the body sees `c` as the current char (i32).
     auto* varSlot = entryAlloca(i32());
     locals_[&fs] = varSlot;
+    // §29.3 / §30.7 (#747 R42): a body that suspends (`yield` / `await`)
+    // resumes on a fresh stack, so the loop's implicit slots live in the
+    // state machine's spill area — the registration every sibling for-loop
+    // makes (see the declaration). It is also what runs the suspend-dominance
+    // fixup for a sync iterator, which carries the string pointer and its
+    // length across the `yield`.
+    registerForLoopSpillSlots(fs, {idxSlot, varSlot});
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "sfor.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sfor.body", currentFn_);
