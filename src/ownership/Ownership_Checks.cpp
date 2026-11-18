@@ -160,6 +160,12 @@ const ast::Expr* lookThroughForceUnwrap(const ast::Expr* e) {
     return e;
 }
 
+// fix #7124 (§22.3, v0.359): defined below; the function-value callee's type,
+// whose parameter slots carry the modifiers a call-site `move` is checked
+// against.
+static const sema::TypeRef* functionValueCalleeType(
+    const ast::Expr* callee, const sema::SemaContext& ctx);  // defined below
+
 // fix #8160 (stdlib §6.10, v0.355; #5657): the OPERAND of an `as` cast — the
 // one spelling of a language spec §5.1 reference conversion that WIDENS the
 // expression's own static type on the page (`new TaskScope() as Object` has
@@ -2165,6 +2171,22 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
                            "ownership — remove `move` (§22.3, v0.314)");
                 }
             }
+            // fix #7124 (§22.3 *Parameter modifiers*, v0.359): the same rule
+            // through a FUNCTION VALUE — `var r := f(move d);` over
+            // `f: (D) -> int`. No formals resolve for a function value; the
+            // bound slot's modifier is read from the callee's function type.
+            // See the twin in `handleDischarge`.
+            else if (un->op == "move" && !formals.valid()) {
+                const sema::TypeRef* fnTy =
+                    functionValueCalleeType(callee, ctx_);
+                if (fnTy && pos < fnTy->funcParams.size() &&
+                    fnTy->funcParams[pos].modifier != "owned") {
+                    report(Severity::Error, un->span.begin,
+                           "the `move` call-site marker is only valid on an argument "
+                           "to an `owned` parameter; this parameter does not take "
+                           "ownership — remove `move` (§22.3, v0.314)");
+                }
+            }
         }
         recordMovesIn(*a.value);
         ++pos;
@@ -2652,6 +2674,11 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         // that classification alone cannot see it).
         const CalleeFormals discFormals =
             calleeOrChainFormals(call->callee.get(), call->args);
+        // fix #7124 (§22.3, v0.359): a call through a FUNCTION VALUE has no
+        // `discFormals`; its slots live on the callee's function type.
+        const sema::TypeRef* fnValueTy =
+            discFormals.valid() ? nullptr
+                                : functionValueCalleeType(call->callee.get(), ctx_);
         std::size_t pos = 0;
         for (const auto& a : call->args) {
             if (!a.value) { ++pos; continue; }
@@ -2935,6 +2962,28 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                    "does not take ownership — remove `move` (§22.3, "
                                    "v0.314)");
                         }
+                    } else if (!ownedSink && fnValueTy &&
+                               pos < fnValueTy->funcParams.size() &&
+                               fnValueTy->funcParams[pos].modifier != "owned") {
+                        // fix #7124 (§22.3 *Parameter modifiers*, v0.359): the
+                        // SAME rule through a FUNCTION VALUE. §22.3's marker is
+                        // a property of the argument POSITION, not of the
+                        // spelling of the call: "writing it on a borrow, a
+                        // fresh producer, or a non-`owned` parameter position
+                        // is likewise an error". A function value has no
+                        // formals to resolve (`discFormals` is invalid); its
+                        // parameter slots — modifiers included — are part of
+                        // its TYPE (§27.1), so the bound slot is read from the
+                        // callee's function type. Without this `f(move d)`
+                        // over `(D) -> ()` compiled and leaked `d`, while the
+                        // direct `s.Accept(move d)` was rejected. The fix is a
+                        // REJECTION: the function-value spelling is not taught
+                        // to honour `move` at a non-`owned` slot.
+                        report(Severity::Error, un->span.begin,
+                               "the `move` call-site marker is only valid on an "
+                               "argument to an `owned` parameter; this parameter "
+                               "does not take ownership — remove `move` (§22.3, "
+                               "v0.314)");
                     }
                 }
             }

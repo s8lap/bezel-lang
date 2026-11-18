@@ -1707,7 +1707,7 @@ s22_3_0052	pass
 s22_3_0053	pass	
 s22_3_0054	pass	
 s22_3_0055	fail	#7086
-s22_3_0056	fail	#7124: §22.3's move call-site marker is not enforced at a function-value invoke
+s22_3_0056	pass	
 s22_3_0057	pass	
 s22_3_0058	pass	
 s22_3_0059	pass	
