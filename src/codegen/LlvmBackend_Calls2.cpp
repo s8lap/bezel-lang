@@ -20036,6 +20036,105 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
                     if (formalIsFunction && isMethodOwnTypeParam &&
                         !calleeBodyUsesFormalOnlyByInvocation(*mdCb, p.name))
                         continue;
+                    // fix #8900 (§28.3 *Set-erasing positions* / §28.9 / §28.14,
+                    // v0.359): the CLASS-OWN twin of the method-own arm above —
+                    // a formal declared at the ENCLOSING TYPE's own type
+                    // parameter (`Keep<T>.Put(a: T)`).
+                    //
+                    // WHY THE #5116 NARROWING NO LONGER HOLDS HERE. The
+                    // narrowing above was correct WHEN IT WAS WRITTEN: the
+                    // arm's soundness rested on a callee-body walk, and at
+                    // v0.307 there was none. Since #5216 (v0.313) the walk
+                    // EXISTS (`calleeBodyUsesFormalOnlyByInvocation` /
+                    // `…OrInspection`), and the method-own arm above uses it as
+                    // its whole guard. The class-own case is therefore
+                    // decidable, and this arm arms the release only when the
+                    // walk passes.
+                    //
+                    // WHAT THE WALK BUYS. §28.3's *Set-erasing positions* bullet
+                    // (v0.359) names this very call: "a field (instance or
+                    // static; not a `scoped` field, …), parameter, return slot,
+                    // `ref` or `out` location, record component, choice payload
+                    // or inline-array slot whose declared, pre-substitution type
+                    // (the element type, for an inline array) is a bare type
+                    // parameter, at an instantiation substituting a function type
+                    // or `Object`, nullable or not, for it — `k.Put(f)` at
+                    // `k: Keep<Object>` over `Put(a: T)`" — and rules "At every
+                    // set-erasing position a function value with a non-empty
+                    // source set is rejected, and a capture-free one is
+                    // admitted". The position is ANNOUNCEMENT-ERASING (§28.3's
+                    // sink rule: such a position "announces no source set"), so
+                    // the callee holds no reference past the call and the CALLER
+                    // keeps the obligation. §28.14's call-bounded default says
+                    // the same for the function-typed substitution ("A
+                    // function-typed parameter declared *without* `scoped` is
+                    // **call-bounded**"), and §28.9 makes the function value
+                    // itself runtime-managed (the heap-allocated closure
+                    // object), so the caller's temporary must release it when
+                    // the call returns.
+                    //
+                    // WHY THE WALK IS STILL THE WHOLE PROOF. A capture-free
+                    // function value IS admitted at a set-erasing position, so
+                    // the callee body may STORE the formal — and a store into a
+                    // `T?` field takes NO retain (codegen does not recognise a
+                    // type-parameter field as a closure storage member), so a
+                    // release at the call's end would free a cell the field
+                    // still points at: the #1921/#2248 / #5216 UAF shape.
+                    // `calleeBodyUsesFormalOnlyByInvocationOrInspection` is the
+                    // fail-closed walk that rules it out: it admits only an
+                    // invocation of the formal and the two inspections that
+                    // read nothing out of it (a `null` comparison and a type
+                    // test) and fails on every other use — a store, a forward, a
+                    // return, a capture, a shadowing binding. It is the walk
+                    // the method-own arm's stricter sibling and #8843's
+                    // `Object`-formal arm already use, and the class-own
+                    // formal's EFFECTIVE type at this call site is exactly one
+                    // of their two shapes: the argument is a function value, so
+                    // the substitution can be nothing else.
+                    //
+                    // NOTE THE DIFFERENCE FROM #8854's SIBLING ARM. That fix
+                    // discharged the BOUND-LOCAL spelling (the caller's
+                    // SCOPE-END release, `closureArgBindsMethodOwnTypeParamBorrow`
+                    // in LlvmBackend_Setup.cpp); this arm discharges the
+                    // LITERAL spelling (the call-site temporary release, here).
+                    // A literal has no local to release at, so the two arms
+                    // never overlap: `isPlusOneClosureProducer` below is true
+                    // only for a fresh producer (a lambda literal or a method
+                    // reference), never for a local bound to one — so no
+                    // argument is released twice.
+                    bool isClassOwnTypeParam = false;
+                    if (!isMethodOwnTypeParam && ms->parent)
+                        for (const sema::Symbol* gp : ms->parent->genericParams)
+                            if (gp && gp->name == formalHead) {
+                                isClassOwnTypeParam = true;
+                                break;
+                            }
+                    if (isClassOwnTypeParam && argExprs[ai]) {
+                        // The argument's sema type at this call site is the
+                        // type the class's type argument substitutes for the
+                        // formal: the lambda's own function type when the
+                        // substitution is a function type, and `Object` when
+                        // the substitution is `Object` (§28.3's bullet names
+                        // both). A lambda literal cannot type-check against
+                        // any other substitution (a class type is not a
+                        // function value), so the two arms below are the whole
+                        // domain.
+                        if (auto* argTy = ctx_.exprType(*argExprs[ai])) {
+                            // §28.3's bullet names the substitution "a function
+                            // type or `Object`, nullable or not", so
+                            // nullability is NOT a gate here.
+                            if (argTy->kind == sema::TypeRef::Kind::Function)
+                                formalIsFunction = true;
+                            else if (argTy->kind == sema::TypeRef::Kind::Primitive &&
+                                     argTy->primitive ==
+                                         sema::PrimitiveType::Object)
+                                formalIsFunction = true;
+                        }
+                    }
+                    if (formalIsFunction && isClassOwnTypeParam &&
+                        !calleeBodyUsesFormalOnlyByInvocationOrInspection(
+                            *mdCb, p.name))
+                        continue;
                 }
                 // fix #8843 (§28.9 / §8.1 / §27.5, v0.359): an `Object` formal
                 // whose callee only null-/type-tests it. Not function-typed,
