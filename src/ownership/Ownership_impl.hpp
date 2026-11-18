@@ -5144,6 +5144,24 @@ private:
     // ENCLOSING lambda, written in a nested lambda; true when it reported.
     bool reportEnclosingLambdaOwnedThrow(const ast::Expr& op);
 
+    // fix #8895 (§31.1, v0.359): the innermost ENCLOSING lambda whose own
+    // source range declares `sym` (null when none does -- the symbol then
+    // belongs to the method body, whose bindings live in `states_`).
+    const ast::LambdaExpr* lambdaOwnerOfDeclaringLambda(sema::Symbol* sym);
+
+    // fix #8895 (§31.1, v0.359): a COMPOSITE throw operand of a closure body
+    // (a conditional expression's arm-meet). Every arm that names a
+    // lambda-body local holding a borrow is installed as a borrow and the
+    // METHOD arm's own predicate decides the shape.
+    void checkLambdaBodyCompositeThrowOperandNotBorrowed(
+        const ast::Expr& operand);
+
+    // fix #8895 (§31.1, v0.359): the arms of a composite throw operand that
+    // name a lambda-body local holding a BORROW at the throw.
+    void collectLambdaBodyBorrowArms(const ast::Expr& e,
+                                      std::uint32_t atOffset,
+                                      std::vector<sema::LocalSymbol*>& out);
+
     // §31.1 / §28.3.7 (axiom A5, v0.350; issue #7412, owner ruling "reading
     // 1"): the `throw` operand is consumed as an owned value passed to the
     // runtime's exception machinery -- a move OUT of the binding's scope -- and

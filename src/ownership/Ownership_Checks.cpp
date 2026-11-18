@@ -13802,7 +13802,17 @@ void MethodOwnership::checkLambdaBodyThrowOperandNotBorrowed(
             op = lookThroughForceUnwrap(un->operand.get());
     }
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(op);
-    if (!id) return;
+    if (!id) {
+        // fix #8895 (§31.1 *The throw operand*, v0.359): a COMPOSITE operand
+        // — a conditional expression's arm-meet (`throw (if c then b else
+        // b2)`). The method arm's own classifier (`ownedArgSourceIsBorrow`)
+        // recurses into a conditional's arms, so the method body rejects the
+        // shape; the closure body never asked, because this arm only ever
+        // classified a BARE IDENTIFIER. The composite arm asks the same
+        // question of the same arms. // per §31.1, v0.359, #8895
+        checkLambdaBodyCompositeThrowOperandNotBorrowed(operand);
+        return;
+    }
     if (id->name == "this" || id->name == "base") return;
     sema::Symbol* sym = ctx_.exprSymbol(*id);
     if (!sym) return;
@@ -13818,29 +13828,8 @@ void MethodOwnership::checkLambdaBodyThrowOperandNotBorrowed(
     // ENCLOSING lambda (the CAPTURED case, #8859). The span test is the one
     // `collectHeldBorrowsOfClosureCaptures` already uses to tell a closure's
     // own binding from a captured one: a binding declared inside a lambda's
-    // own source range is that closure's own. `closureScanStack_` holds the
-    // chain of lambda literals the scan is inside, OUTERMOST first, so the
-    // search walks it from the back and the innermost enclosing lambda that
-    // DECLARES the local is the binding's owner.
-    std::uint32_t declOff = sym->declLoc.offset;
-    bool declKnown = sym->declLoc.line != 0;
-    if (!declKnown && sym->decl) {
-        declOff = sym->decl->span.begin.offset;
-        declKnown = sym->decl->span.begin.line != 0;
-    }
-    if (!declKnown) return;
-    const ast::LambdaExpr* owner = nullptr;
-    for (auto it = closureScanStack_.rbegin(); it != closureScanStack_.rend();
-         ++it) {
-        const ast::LambdaExpr* cand = *it;
-        if (!cand) continue;
-        const std::uint32_t candLo = cand->span.begin.offset;
-        const std::uint32_t candHi = cand->span.end.offset;
-        if (declOff >= candLo && declOff < candHi) {
-            owner = cand;
-            break;
-        }
-    }
+    // own source range is that closure's own.
+    const ast::LambdaExpr* owner = lambdaOwnerOfDeclaringLambda(sym);
     // No enclosing lambda declares it: the local belongs to the METHOD body,
     // which is #8781's case (a captured borrowed binding) — that one is asked
     // `checkThrowOperandNotBorrowed` in the ENCLOSING frame, where the binding
@@ -13862,6 +13851,154 @@ void MethodOwnership::checkLambdaBodyThrowOperandNotBorrowed(
     checkThrowOperandNotBorrowed(operand);
     if (hadSaved) states_[ls] = savedEntry;
     else states_.erase(ls);
+}
+
+// fix #8895 (§31.1 *The throw operand*, v0.359): the OWNER of a local — the
+// innermost ENCLOSING lambda whose own source range declares it.
+//
+// The span test is the one `collectHeldBorrowsOfClosureCaptures` already uses
+// to tell a closure's own binding from a captured one: a binding declared
+// inside a lambda's own source range is that closure's own.
+// `closureScanStack_` holds the chain of lambda literals the scan is inside,
+// OUTERMOST first, so the search walks it from the back and the innermost
+// enclosing lambda that DECLARES the local is the binding's owner.
+//
+// Returns null when no enclosing lambda declares the symbol — then the symbol
+// belongs to the METHOD body, whose bindings are tracked in `states_` (the
+// #8781 case). // per §31.1, v0.359, #8802, #8859, #8895
+const ast::LambdaExpr* MethodOwnership::lambdaOwnerOfDeclaringLambda(
+    sema::Symbol* sym) {
+    if (!sym) return nullptr;
+    std::uint32_t declOff = sym->declLoc.offset;
+    bool declKnown = sym->declLoc.line != 0;
+    if (!declKnown && sym->decl) {
+        declOff = sym->decl->span.begin.offset;
+        declKnown = sym->decl->span.begin.line != 0;
+    }
+    if (!declKnown) return nullptr;
+    for (auto it = closureScanStack_.rbegin(); it != closureScanStack_.rend();
+         ++it) {
+        const ast::LambdaExpr* cand = *it;
+        if (!cand) continue;
+        const std::uint32_t candLo = cand->span.begin.offset;
+        const std::uint32_t candHi = cand->span.end.offset;
+        if (declOff >= candLo && declOff < candHi) return cand;
+    }
+    return nullptr;
+}
+
+// fix #8895 (§31.1 *The throw operand*, v0.359): a COMPOSITE operand of a
+// closure's `throw` — a conditional expression's arm-meet,
+// `throw (if c then b else b2)`.
+//
+// §31.1 "The throw operand": "The operand is consumed as an owned value under
+// the ownership rules below, so a *borrowed* class reference is not a valid
+// operand." The rule names NO scope. The METHOD body rejects the shape
+// through `checkThrowOperandNotBorrowed` — its classifier
+// (`ownedArgSourceIsBorrow`) recurses into a conditional's arms and answers
+// "borrow" iff EITHER arm is a borrow (fix #4008) — and draws its own
+// diagnostic. The closure body never asked: `checkLambdaBodyThrowOperandNotBorrowed`
+// classifies a BARE IDENTIFIER only, so a conditional's arms were never asked
+// the borrow question, and the program compiled (rc=0) and core-dumped at run
+// time (MEASURED on r30-c1 @ af51cca67: rc=139, the borrow's owner and the
+// runtime both disposed the instance).
+//
+// The arms are resolved EXACTLY as the bare-identifier arm resolves its
+// operand: the arm's local is resolved against `closureScanStack_` (its owner
+// lambda — the throwing lambda's own body or an ENCLOSING lambda's, the
+// CAPTURED case of #8859), and its value at the throw must be a BORROW on
+// every path (`lambdaBodyLocalHoldsBorrow`). Each such arm is installed as a
+// borrow in `states_` for the duration of ONE call to the method arm's own
+// predicate, and the verdict is then the METHOD arm's: its classifier
+// decides the shape's rule (the OR over the arms) and its diagnostic text is
+// the one the reader already knows. The `states_` entries are removed on the
+// way out, so the enclosing frame's `states_` is exactly as it was.
+//
+// The `??` spelling is NOT handled here: its meet is computed by
+// `producerState` (scope-independent), so the `??` operand is already asked
+// the borrow question in a closure body (MEASURED: `throw d ?? b` in a lambda
+// is rejected today). The `case` spelling is not handled either — the method
+// arm's own classifier has no `CaseExpr` arm (fix #4008 deferred it), so a
+// `case` operand is admitted in the METHOD body too and must stay admitted
+// here. // per §31.1, v0.359, #8895
+void MethodOwnership::checkLambdaBodyCompositeThrowOperandNotBorrowed(
+    const ast::Expr& operand) {
+    std::vector<sema::LocalSymbol*> borrowArms;
+    collectLambdaBodyBorrowArms(operand, operand.span.begin.offset,
+                                borrowArms);
+    if (borrowArms.empty()) return;
+    // Install each borrowing arm's BORROW state for the duration of the one
+    // call below — the same temporary entry the bare-identifier arm installs
+    // (`ownedArgSourceIsBorrow` reads `states_` and has no side effects of its
+    // own, so the temporary entries are the only state the call touches).
+    std::vector<sema::LocalSymbol*> wasTracked;
+    std::vector<LocalOwnership> savedEntries;
+    for (sema::LocalSymbol* ls : borrowArms) {
+        auto saved = states_.find(ls);
+        if (saved != states_.end()) {
+            wasTracked.push_back(ls);
+            savedEntries.push_back(saved->second);
+        }
+        LocalOwnership borrowState;
+        borrowState.state = OwnershipState::Borrowed;
+        states_[ls] = borrowState;
+    }
+    checkThrowOperandNotBorrowed(operand);
+    for (sema::LocalSymbol* ls : borrowArms) {
+        bool tracked = false;
+        for (sema::LocalSymbol* t : wasTracked)
+            if (t == ls) tracked = true;
+        if (!tracked) states_.erase(ls);
+    }
+    for (std::size_t i = 0; i < wasTracked.size(); ++i)
+        states_[wasTracked[i]] = savedEntries[i];
+}
+
+// fix #8895 (§31.1, v0.359): the ARMS of a composite throw operand that name a
+// LAMBDA-BODY local holding a BORROW at the throw.
+//
+// The walk is deliberately narrow: a conditional expression's `thenValue` and
+// `elseValue` (an `if/elif/.../else` chain right-nests in `elseValue`, so the
+// recursion reaches every arm of an arbitrary chain), the `!` and `move`
+// peels (both classify the UNDERLYING place), and the bare identifier itself.
+// Anything else (a `??` meet, a `case` arm, a call, a field read) is left to
+// the method arm's own classifier, which decides those shapes by rules this
+// walk does not duplicate. // per §31.1, v0.359, #8895
+void MethodOwnership::collectLambdaBodyBorrowArms(
+    const ast::Expr& e, std::uint32_t atOffset,
+    std::vector<sema::LocalSymbol*>& out) {
+    const ast::Expr* core = lookThroughForceUnwrap(&e);
+    if (!core) return;
+    if (const auto* un = dynamic_cast<const ast::UnaryExpr*>(core)) {
+        if (un->op == "move" && un->operand) {
+            core = lookThroughForceUnwrap(un->operand.get());
+            if (!core) return;
+        }
+    }
+    if (const auto* ce = dynamic_cast<const ast::ConditionalExpr*>(core)) {
+        if (ce->thenValue)
+            collectLambdaBodyBorrowArms(*ce->thenValue, atOffset, out);
+        if (ce->elseValue)
+            collectLambdaBodyBorrowArms(*ce->elseValue, atOffset, out);
+        return;
+    }
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(core);
+    if (!id) return;
+    if (id->name == "this" || id->name == "base") return;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    if (!sym) return;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls) return;
+    if (isCatchBorrow(sym)) return;
+    // The arm's local must be declared by a lambda that ENCLOSES the throwing
+    // one; a METHOD-body local is tracked in `states_` already (the #8781
+    // case) and is classified by the method arm's own predicate.
+    const ast::LambdaExpr* owner = lambdaOwnerOfDeclaringLambda(sym);
+    if (!owner) return;
+    if (!lambdaBodyLocalHoldsBorrow(ls, *owner, atOffset)) return;
+    for (sema::LocalSymbol* seen : out)
+        if (seen == ls) return;
+    out.push_back(ls);
 }
 
 // fix #8802 (§31.1, v0.359): the local's ownership state at a source offset.
