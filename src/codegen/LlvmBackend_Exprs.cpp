@@ -13682,6 +13682,8 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     auto* fn = declareC("bz_str_contains", i32(), {ptrTy(), ptrTy()});
                     llvm::Value* res = builder_.CreateCall(fn, {haystack, needle},
                                                            "sin.r");
+                    // fix #8648: the substring test only read the needle.
+                    releaseBorrowedStringQuery(bin.left.get(), needle);
                     return builder_.CreateTrunc(res, i1(), "sin");
                 }
                 if (lTy && lTy->kind == sema::TypeRef::Kind::Primitive &&
@@ -13767,7 +13769,12 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     }
                     auto* fn = declareC("bz_dict_contains_gen", i1(),
                                         {ptrTy(), ptrTy()});
-                    return builder_.CreateCall(fn, {set, ep}, "set.in");
+                    llvm::Value* setIn =
+                        builder_.CreateCall(fn, {set, ep}, "set.in");
+                    // fix #8648: `x in set` IS `set.Contains(x)` (§17.5), and
+                    // the lookup kept nothing of a `string` query.
+                    releaseBorrowedStringQuery(bin.left.get(), elem);
+                    return setIn;
                 }
             }
         }
@@ -13850,6 +13857,10 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 llvm::Value* elem = lowerExpr(*bin.left);
                 llvm::Value* coll = lowerExpr(*bin.right);
                 if (!elem || !coll) return nullptr;
+                // fix #8648: `x in c` IS `c.Contains(x)` (§17.5) — the scan
+                // only reads a `string` query, so a +1 one is released when
+                // the scan is over (both loops below).
+                llvm::Value* const ownedStrQuery = elem;
                 // fix #4619 (§8.6/§25.2/§8.4/§17.5, v0.307): §8.6-box a
                 // bare-value-typed LHS into the Object/interface element
                 // slot ONCE, before either scan — see `boxMembershipQuery`
@@ -13919,6 +13930,7 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     auto* phi = builder_.CreatePHI(i1(), 2, "llin.result");
                     phi->addIncoming(builder_.getTrue(),  foundBB);
                     phi->addIncoming(builder_.getFalse(), condBB);
+                    releaseBorrowedStringQuery(bin.left.get(), ownedStrQuery);
                     return phi;
                 }
 
@@ -13961,6 +13973,7 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 auto* phi = builder_.CreatePHI(i1(), 2, "coll.in");
                 phi->addIncoming(builder_.getTrue(),  foundBB);
                 phi->addIncoming(builder_.getFalse(), condBB);
+                releaseBorrowedStringQuery(bin.left.get(), ownedStrQuery);
                 return phi;
             }
         }
@@ -13995,13 +14008,18 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
 
                 llvm::Value* target = lowerExpr(*bin.left);
                 if (!target) return nullptr;
+                // fix #8648: as for the array-backed scan above.
+                llvm::Value* const ownedStrQuery = target;
                 // fix #4619 (§8.6/§25.2/§8.4/§17.5, v0.307): §8.6-box a
                 // bare-value-typed LHS into the Object/interface element
                 // slot ONCE, before the scan — see `boxMembershipQuery`
                 // (LlvmBackend_Layout.cpp).
                 target = boxMembershipQuery(target, elemRef, bin.left.get());
 
-                if (N == 0) return builder_.getFalse();
+                if (N == 0) {
+                    releaseBorrowedStringQuery(bin.left.get(), ownedStrQuery);
+                    return builder_.getFalse();
+                }
 
                 bool elemIsClass = elemRef &&
                     elemRef->kind == sema::TypeRef::Kind::Named &&
@@ -14047,6 +14065,7 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 auto* phi = builder_.CreatePHI(i1(), 2, "iin.result");
                 phi->addIncoming(builder_.getTrue(),  foundBB);
                 phi->addIncoming(builder_.getFalse(), condBB);
+                releaseBorrowedStringQuery(bin.left.get(), ownedStrQuery);
                 return phi;
             }
         }

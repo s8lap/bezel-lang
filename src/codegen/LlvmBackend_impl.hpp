@@ -5623,6 +5623,24 @@ private:
         builder_.CreateCall(fn, {s});
     }
 
+    // fix #8648 (§17.5, §28.9, v0.357): a membership / search query over a
+    // collection — `c.Contains(x)`, `x in c`, `c.IndexOf(x)`,
+    // `c.LastIndexOf(x)`, `c.Remove(x)`, the separator of `string.Join` —
+    // BORROWS `x`: the collection compares against it (or copies its bytes)
+    // and keeps nothing. When `x` is a +1 string producer the query is its
+    // only holder, so the query releases it once it has finished reading it.
+    // `q` is the value `lowerExpr(*query)` returned, taken BEFORE any §8.6
+    // box (`boxMembershipQuery` leaves a string as it is: in an `Object`
+    // slot a string is its own reference, §5.1); nothing is emitted for a
+    // borrowed `x` (a local, a field, a literal). The element type is not
+    // consulted — the question is whose reference the QUERY is, and a
+    // `string` asked of an `Array<Object>` is as much the query's own.
+    void releaseBorrowedStringQuery(const ast::Expr* query, llvm::Value* q) {
+        if (!query || !q || !q->getType()->isPointerTy()) return;
+        if (emittingDisposerBody_) return;
+        if (isPlusOneStringProducer(query)) emitStringRelease(q);
+    }
+
     // fix #5244 / #5262 (§4.6 / §28.9, v0.313): is `pty` a `string` or
     // `string?` FORMAL — i.e. a by-value string parameter a #5262 pin
     // applies to?

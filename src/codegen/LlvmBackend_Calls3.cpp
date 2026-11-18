@@ -5683,6 +5683,9 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
         // query into the Object/interface element slot ONCE, before the walk —
         // see `boxMembershipQuery` (LlvmBackend_Layout.cpp).
+        // fix #8648 (§17.5, §28.9, v0.357): a +1 string query is borrowed by
+        // the scan and released after it (`releaseBorrowedStringQuery`).
+        llvm::Value* const ownedStrQuery = v;
         v = boxMembershipQuery(v, elemRef, call.args[0].value.get());
         // Spill the search target to a stable alloca slot.
         llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
@@ -5729,6 +5732,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         builder_.CreateBr(condBB);
         // Return the matching node pointer (null if not found) — LinkedListNode<T>?.
         builder_.SetInsertPoint(endBB);
+        releaseBorrowedStringQuery(call.args[0].value.get(), ownedStrQuery);
         return builder_.CreateLoad(ptrTy(), foundNodeSlot, "llf.result");
     }
     // --- Count (no-arg call form, e.g. l.Count()) → int ---
@@ -5800,6 +5804,9 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
         // query into the Object/interface element slot ONCE, before the walk —
         // see `boxMembershipQuery` (LlvmBackend_Layout.cpp).
+        // fix #8648 (§17.5, §28.9, v0.357): a +1 string query is borrowed by
+        // the scan and released after it (`releaseBorrowedStringQuery`).
+        llvm::Value* const ownedStrQuery = v;
         v = boxMembershipQuery(v, elemRef, call.args[0].value.get());
         // Spill the search target to a stable alloca slot.
         llvm::AllocaInst* tgtSlot = entryAlloca(v->getType());
@@ -5846,6 +5853,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         builder_.CreateBr(condBB);
         // After loop: check if a match was found (foundNodeSlot != null).
         builder_.SetInsertPoint(endBB);
+        releaseBorrowedStringQuery(call.args[0].value.get(), ownedStrQuery);
         llvm::Value* foundNode = builder_.CreateLoad(ptrTy(), foundNodeSlot,
                                                      "llr.fnd");
         llvm::Value* found = builder_.CreateICmpNE(foundNode, nullP, "llr.found");
@@ -5906,6 +5914,9 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
         // query into the Object/interface element slot ONCE, before the walk —
         // see `boxMembershipQuery` (LlvmBackend_Layout.cpp).
+        // fix #8648 (§17.5, §28.9, v0.357): a +1 string query is borrowed by
+        // the scan and released after it (`releaseBorrowedStringQuery`).
+        llvm::Value* const ownedStrQuery = v;
         v = boxMembershipQuery(v, elemRef, call.args[0].value.get());
         // Spill the search target to a stable alloca slot (same pattern as the
         // `in` operator LinkedList path in LlvmBackend_Exprs.cpp #2764).
@@ -5946,6 +5957,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         auto* phi = builder_.CreatePHI(i1(), 2, "llc.result");
         phi->addIncoming(builder_.getTrue(),  foundBB);
         phi->addIncoming(builder_.getFalse(), condBB);
+        releaseBorrowedStringQuery(call.args[0].value.get(), ownedStrQuery);
         // fix #6388 (§28.3 *Unbound owned temporaries*, §28.9, stdlib §4.6/§4.7,
         // v0.338): the walk above is a BORROWING use of the receiver — it reads
         // elements and compares them, handing back a bool that retains no
@@ -6535,6 +6547,9 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
         // query into the Object/interface element slot ONCE, before the scan —
         // see `boxMembershipQuery` (LlvmBackend_Layout.cpp).
+        // fix #8648 (§17.5, §28.9, v0.357): a +1 string query is borrowed by
+        // the scan and released after it (`releaseBorrowedStringQuery`).
+        llvm::Value* const ownedStrQuery = v;
         v = boxMembershipQuery(v, spanElemRef, call.args[0].value.get());
         int64_t esz = spanElemSize();
         llvm::Type* ety = spanElemTy();
@@ -6577,6 +6592,7 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         auto* phi = builder_.CreatePHI(i32(), 2, "iof.r");
         phi->addIncoming(idx32, foundBB);  // found: return current local index
         phi->addIncoming(builder_.getInt32(-1), condBB);  // not found: -1
+        releaseBorrowedStringQuery(call.args[0].value.get(), ownedStrQuery);
         return phi;
     }
 
@@ -6594,6 +6610,9 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
         // query into the Object/interface element slot ONCE, before the scan —
         // see `boxMembershipQuery` (LlvmBackend_Layout.cpp).
+        // fix #8648 (§17.5, §28.9, v0.357): a +1 string query is borrowed by
+        // the scan and released after it (`releaseBorrowedStringQuery`).
+        llvm::Value* const ownedStrQuery = v;
         v = boxMembershipQuery(v, spanElemRef, call.args[0].value.get());
         int64_t esz = spanElemSize();
         llvm::Type* ety = spanElemTy();
@@ -6635,6 +6654,7 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         auto* phi = builder_.CreatePHI(i1(), 2, "cnt.r");
         phi->addIncoming(builder_.getTrue(),  foundBB);
         phi->addIncoming(builder_.getFalse(), condBB);
+        releaseBorrowedStringQuery(call.args[0].value.get(), ownedStrQuery);
         return phi;
     }
 
@@ -9768,10 +9788,16 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
         // fix #4619 (§8.6/§25.2/§8.4, v0.307): §8.6-box a bare-value-typed
         // query into the Object/interface element slot ONCE, before the scan —
         // see `boxMembershipQuery` (LlvmBackend_Layout.cpp).
+        // fix #8648 (§17.5, §28.9, v0.357): a +1 string query is borrowed by
+        // the scan and released after it (`releaseBorrowedStringQuery`).
+        llvm::Value* const ownedStrQuery = target;
         target = boxMembershipQuery(target, elemRef, call.args[0].value.get());
 
         // Empty array always returns false.
-        if (N == 0) return builder_.getFalse();
+        if (N == 0) {
+            releaseBorrowedStringQuery(call.args[0].value.get(), ownedStrQuery);
+            return builder_.getFalse();
+        }
 
         bool elemIsClass = elemRef &&
             elemRef->kind == sema::TypeRef::Kind::Named &&
@@ -9816,6 +9842,7 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
         auto* phi = builder_.CreatePHI(i1(), 2, "iac.result");
         phi->addIncoming(builder_.getTrue(),  foundBB);
         phi->addIncoming(builder_.getFalse(), condBB);
+        releaseBorrowedStringQuery(call.args[0].value.get(), ownedStrQuery);
         return phi;
     }
 

@@ -4909,11 +4909,41 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     // the set takes an INDEPENDENT +1. A +1 producer is transferred
                     // (its single reference becomes the set's — no retain); a borrow
                     // / literal / identifier is retained. retain is null/sentinel-safe.
-                    if (isStrSet && !isPlusOneStringProducer(call.args[0].value.get()))
+                    const bool ownedStrItem =
+                        isStrSet && !emittingDisposerBody_ &&
+                        isPlusOneStringProducer(call.args[0].value.get());
+                    if (isStrSet && !ownedStrItem)
                         emitStringRetain(item);
                     auto* fn = declareC("bz_dict_set_gen",
                         llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
-                    builder_.CreateCall(fn, {recv, elemPtr(item, call.args[0].value.get()), sentinel});
+                    if (ownedStrItem) {
+                        // fix #8648 (§4.10, §28.9, v0.357): the set takes a
+                        // +1 item's reference only when it INSERTS. An item
+                        // already present (§4.10 dedup by content) is not
+                        // stored, so its one reference is released here.
+                        llvm::Value* ep =
+                            elemPtr(item, call.args[0].value.get());
+                        auto* containsFn = declareC("bz_dict_contains_gen",
+                                                    i1(), {ptrTy(), ptrTy()});
+                        llvm::Value* already = builder_.CreateCall(
+                            containsFn, {recv, ep}, "set.add.has");
+                        auto* insBB = llvm::BasicBlock::Create(
+                            llvm_, "set.add.ins", currentFn_);
+                        auto* dupBB = llvm::BasicBlock::Create(
+                            llvm_, "set.add.dup", currentFn_);
+                        auto* doneBB = llvm::BasicBlock::Create(
+                            llvm_, "set.add.done", currentFn_);
+                        builder_.CreateCondBr(already, dupBB, insBB);
+                        builder_.SetInsertPoint(insBB);
+                        builder_.CreateCall(fn, {recv, ep, sentinel});
+                        builder_.CreateBr(doneBB);
+                        builder_.SetInsertPoint(dupBB);
+                        emitStringRelease(item);
+                        builder_.CreateBr(doneBB);
+                        builder_.SetInsertPoint(doneBB);
+                    } else {
+                        builder_.CreateCall(fn, {recv, elemPtr(item, call.args[0].value.get()), sentinel});
+                    }
                     // fix #6394: the insert is the last read of `recv`; reclaim
                     // the unbound receiver here (§28.3's end-of-full-expression
                     // boundary, which for this arm is its own return).
@@ -4938,7 +4968,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto* afterBB  = llvm::BasicBlock::Create(
                         llvm_, "ta.after", currentFn_);
                     llvm::Value* notPresent = builder_.CreateNot(already, "ta.new");
-                    builder_.CreateCondBr(notPresent, insertBB, afterBB);
+                    if (isStrSet && !emittingDisposerBody_ &&
+                        isPlusOneStringProducer(call.args[0].value.get())) {
+                        // fix #8648 (§4.10, §28.9, v0.357): a +1 item that is
+                        // NOT inserted keeps its one reference — release it.
+                        auto* dupBB = llvm::BasicBlock::Create(
+                            llvm_, "ta.dup", currentFn_);
+                        builder_.CreateCondBr(notPresent, insertBB, dupBB);
+                        builder_.SetInsertPoint(dupBB);
+                        emitStringRelease(item);
+                        builder_.CreateBr(afterBB);
+                    } else {
+                        builder_.CreateCondBr(notPresent, insertBB, afterBB);
+                    }
                     builder_.SetInsertPoint(insertBB);
                     // #429 / §28.9: retain on insert (same rule as Add — the set
                     // co-owns the +1 only if TryAdd actually inserts, so emit the
@@ -4967,6 +5009,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                         {ptrTy(), ptrTy()});
                     llvm::Value* has =
                         builder_.CreateCall(fn, {recv, elemPtr(item, call.args[0].value.get())}, "set.has");
+                    // fix #8648: the lookup hashed and compared the query's
+                    // bytes and kept nothing, so a +1 query is released here.
+                    releaseBorrowedStringQuery(call.args[0].value.get(), item);
                     // fix #6394: the membership query is a PURE BORROW of the
                     // argument (`item`), never of the receiver, so the bool this
                     // arm returns aliases nothing and the reclaim is safe here.
@@ -4987,6 +5032,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                           i1(), {ptrTy(), ptrTy()});
                     llvm::Value* removed =
                         builder_.CreateCall(rmFn, {recv, elemPtr(item, call.args[0].value.get())}, "set.rm");
+                    // fix #8648: the removal released the STORED element; the
+                    // query was only compared against, so a +1 query is
+                    // released here.
+                    releaseBorrowedStringQuery(call.args[0].value.get(), item);
                     // fix #6394: reclaim AFTER the unlink, so the removal has
                     // already resolved the one element's ownership and the
                     // receiver's own release pass cannot discharge it twice —
@@ -10075,6 +10124,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // boxed pointer `emitRemoveElementEquality`'s Object arm requires
             // and the value tail reads the element's BOX HEADER instead. See
             // `boxMembershipQuery` (LlvmBackend_Layout.cpp) for the warrant.
+            // fix #8648 (§17.5, §28.9, v0.357): the query as lowered, ahead
+            // of any §8.6 box — what `releaseBorrowedStringQuery` releases.
+            llvm::Value* const ownedStrQuery = target;
             target = boxMembershipQuery(target, arrElemRef,
                                         call.args[0].value.get());
             llvm::Type* elemTy = getElemTy();
@@ -10141,6 +10193,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             phiIdx->addIncoming(result64, foundBB);
             phiIdx->addIncoming(builder_.getInt64(-1), condBB);
             llvm::Value* iofv = builder_.CreateTrunc(phiIdx, i32(), "iof.i32");
+            // fix #8648: the search only read the query.
+            releaseBorrowedStringQuery(call.args[0].value.get(), ownedStrQuery);
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return iofv;
@@ -11366,6 +11420,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // boxed pointer `emitRemoveElementEquality`'s Object arm requires
             // and the value tail reads the element's BOX HEADER instead. See
             // `boxMembershipQuery` (LlvmBackend_Layout.cpp) for the warrant.
+            // fix #8648 (§17.5, §28.9, v0.357): the query as lowered, ahead
+            // of any §8.6 box — what `releaseBorrowedStringQuery` releases.
+            llvm::Value* const ownedStrQuery = target;
             target = boxMembershipQuery(target, arrElemRef,
                                         call.args[0].value.get());
             llvm::Type* elemTy = getElemTy();
@@ -11419,6 +11476,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phi = builder_.CreatePHI(i1(), 2, "rmi.r");
             phi->addIncoming(builder_.getTrue(), foundBB);
             phi->addIncoming(builder_.getFalse(), condBB);
+            // fix #8648: the removal gave back the STORED element; the query
+            // was only compared against.
+            releaseBorrowedStringQuery(call.args[0].value.get(), ownedStrQuery);
             return phi;
         }
         if ((m == "Pop" || m == "Dequeue") && call.args.empty()) {
@@ -11958,6 +12018,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // boxed pointer `emitRemoveElementEquality`'s Object arm requires
             // and the value tail reads the element's BOX HEADER instead. See
             // `boxMembershipQuery` (LlvmBackend_Layout.cpp) for the warrant.
+            // fix #8648 (§17.5, §28.9, v0.357): the query as lowered, ahead
+            // of any §8.6 box — what `releaseBorrowedStringQuery` releases.
+            llvm::Value* const ownedStrQuery = target;
             target = boxMembershipQuery(target, arrElemRef,
                                         call.args[0].value.get());
             llvm::Type* elemTy = getElemTy();
@@ -11993,6 +12056,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phiCon = builder_.CreatePHI(i1(), 2, "con.r");
             phiCon->addIncoming(builder_.getTrue(), foundBB);
             phiCon->addIncoming(builder_.getFalse(), condBB);
+            // fix #8648: "a PURE BORROW" (above) of a +1 string is still the
+            // only reference to it — the scan is over, release it.
+            releaseBorrowedStringQuery(call.args[0].value.get(), ownedStrQuery);
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return phiCon;
@@ -18011,6 +18077,9 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // as before.
         auto* joinFn = declareC("bz_str_join", ptrTy(), {ptrTy(), ptrTy()});
         llvm::Value* strObj = builder_.CreateCall(joinFn, {sep, arr}, "join.str");
+        // fix #8648: "the separator [is] only READ" (above) — a +1 separator
+        // is released now that its bytes are in the joined string.
+        releaseBorrowedStringQuery(call.args[sepArgIdx].value.get(), sep);
         // per stdlib §9.6 (#1182): reclaim the materialized snapshot AFTER the
         // joined string is fully built. NULL element disposer: the join borrowed
         // the element strings (copied their bytes) — frees only the snapshot's
