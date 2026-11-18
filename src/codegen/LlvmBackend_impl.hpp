@@ -4387,9 +4387,21 @@ private:
     // fix #5315 (§14.1 / §23, v0.313): the NAMED-property block getters of
     // `ensurePropertyBlockGetter`, per (decl, accessor tag, owner
     // instantiation) — the last two vectors are `propertyThunkSubstKey`'s.
+    //
+    // fix #8763 (fix-forward 2, §28.9 / §7.5, v0.359): the LAST element is
+    // the READER-REFERENCE VARIANT — "does this getter mint the +1 closure
+    // reference its reader owns?". It is part of the KEY because the two
+    // variants are DIFFERENT FUNCTIONS with different ownership contracts:
+    // the ordinary read (`obj.P`) hands the reader a reference the reader
+    // discharges, while the `?.` read (`obj?.P`) lifts the result to §7.5's
+    // always-nullable type, whose protocol has no owner for a closure
+    // reference — so that spelling reads a BORROW (§28.9: "a getter never
+    // transfers a reclamation obligation to its reader") and its getter must
+    // not mint. One getter function cannot serve both, so the variant is
+    // part of the memo key and the two functions are emitted separately.
     using PropBlockGetterKey =
         std::tuple<const ast::PropertyDecl*, unsigned,
-                   std::vector<llvm::Type*>, std::vector<std::string>>;
+                   std::vector<llvm::Type*>, std::vector<std::string>, bool>;
     std::map<PropBlockGetterKey, llvm::Function*> propBlockGetterInstFns_;
 
     // #815 / §9.1: standalone getter functions for a positional record field
@@ -8929,6 +8941,21 @@ private:
     // computedGetterOf above.
     const ast::PropertyAccessor* blockGetterOf(sema::Symbol* sym);
 
+    // fix #8763 (fix-forward 2, §28.9, v0.359): the property's AST
+    // declaration, or null when the symbol has none (an IMPORTED property's
+    // `decl` is null unless the loader re-parsed a body for it — #3671).
+    //
+    // ONE accessor for the AST side of a property, so the class-3 read
+    // (`dynamic_cast<const ast::PropertyDecl*>(ps->decl)`) is paid ONCE in
+    // this TU and every user of the fact — `blockGetterOf` below and
+    // `blockGetterMintsClosureRef` (LlvmBackend_Setup.cpp, the #8763 shared
+    // predicate) — goes through it. The alternative was a SECOND class-3
+    // read in the predicate's own TU, which the imported-symbol ratchet
+    // (`scripts/check_imported_symbol_reads.py`) counts per file: the read
+    // would have pushed `LlvmBackend_Setup.cpp` over its baselined count and
+    // needed a fresh `// SEAM-DEBT` marker to justify the rise (#3152).
+    const ast::PropertyDecl* propertyDeclOf(const sema::Symbol* sym) const;
+
     // fix #6447 (§28.2, §28.9, §29.2, v0.357): does this property's getter
     // hand back storage some holder already keeps alive — is EVERY value it
     // can return a PROVEN LEND (a field read, a local every one of whose
@@ -9000,9 +9027,25 @@ private:
     // `currentAccessorPropSym_`), and it has NO default: every call site must
     // say what it knows, so a site that has the symbol in scope cannot
     // silently stop publishing the mint #6397 closed the leak with.
+    //
+    // fix #8763 (fix-forward 2, §28.9 / §7.5, v0.359): `mintReaderRef` says
+    // whether this getter hands its reader the +1 closure reference the
+    // reader owns. `true` is the ORDINARY read (`obj.P`): the reader's
+    // binding / store / argument / return owns the reference and discharges
+    // it, and the direct call and the discarded read give it back. `false` is
+    // the `?.` read (`obj?.P`): §7.5 lifts the result to an always-nullable
+    // type, and a nullable function value has no owner for a closure
+    // reference, so that spelling reads a BORROW and its getter must not
+    // mint — §28.9: "a getter never transfers a reclamation obligation to
+    // its reader". It is a PARAMETER (and part of the memo key) because the
+    // getter is emitted out of line and MEMOISED per (decl, tag,
+    // instantiation): one function cannot serve two ownership contracts.
+    // It has NO default, for the reason `ps`/`psKey` have none: every call
+    // site must say which contract it is asking for.
     llvm::Function* ensurePropertyBlockGetter(
         const ast::PropertyDecl* pd, const ast::PropertyAccessor* acc,
-        const sema::PropertySymbol* ps, const sema::PropertySymbol* psKey);
+        const sema::PropertySymbol* ps, const sema::PropertySymbol* psKey,
+        bool mintReaderRef);
 
     // #481 / §12.1 / §12.5 / §23: emit (or retrieve cached) a uniform-signature
     // accessor FUNCTION for a virtual property, so it can be installed in a

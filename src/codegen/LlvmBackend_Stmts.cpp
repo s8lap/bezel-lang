@@ -13435,7 +13435,8 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                 // Try block getter (get => do...end).
                 else if (const ast::PropertyAccessor* acc = blockGetterOf(currentPropSym)) {
                     llvm::Function* getterFn = ensurePropertyBlockGetter(
-                        pd, acc, /*ps=*/nullptr, /*psKey=*/currentPropSym);
+                        pd, acc, /*ps=*/nullptr, /*psKey=*/currentPropSym,
+                        /*mintReaderRef=*/true);
                     if (getterFn) {
                         auto* fnTy = getterFn->getFunctionType();
                         curVal = builder_.CreateCall(fnTy, getterFn, {enumObj2});

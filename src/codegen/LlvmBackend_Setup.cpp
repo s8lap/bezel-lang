@@ -37614,7 +37614,18 @@ bool Emitter::blockGetterMintsClosureRef(
     if (!ps || ps->isIndexer) return false;
     if (propGetSlot_.count(ps) || ifacePropertyGetIndex_.count(ps))
         return false;
-    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    // fix #8763 (fix-forward 2, §28.9, v0.359): the AST side of the property
+    // comes from the SHARED accessor `propertyDeclOf`
+    // (LlvmBackend_Assign.cpp), which is where this TU's own class-3 read
+    // (`dynamic_cast<const ast::PropertyDecl*>(ps->decl)`) lives — so the
+    // imported-symbol ratchet (`scripts/check_imported_symbol_reads.py`,
+    // umbrella #3152) does not count a SECOND one here. That ratchet
+    // baselines the count PER FILE, and the #8763 pair's own copy of this
+    // predicate pushed `LlvmBackend_Setup.cpp` one read over its baselined
+    // count (16 → 17) with no `// SEAM-DEBT` marker to justify the rise;
+    // going through the shared accessor keeps the count at 16 and adds no
+    // debt.
+    const ast::PropertyDecl* pd = propertyDeclOf(ps);
     if (!pd || !pd->type) return false;
     const sema::TypeRef* pty = ctx_.resolvedType(*pd->type);
     if (!pty || pty->kind != sema::TypeRef::Kind::Function || pty->nullable)

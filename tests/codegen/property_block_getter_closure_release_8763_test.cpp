@@ -26,13 +26,27 @@
 // leak check); the getter is read in a loop so the leak cannot hide in
 // sanitizer noise.
 //
-// The last two rows are the FIX-FORWARD's: #8763 taught the reader side of
+// Rows 4 and 5 are the FIX-FORWARD's: #8763 taught the reader side of
 // the block getter's protocol only to the read sites that TAKE ownership (a
 // binding local, a store, an argument, a return). A read that is INVOKED
 // directly (`h.P()`) takes no ownership — the call consumes the closure and
 // drops it — so the reference the getter handed over had no owner and leaked.
 // They are RED on #8763's commit (621997773) and green with the fix; the
 // three rows above them are red on the base the fix was written against.
+//
+// Rows 6 and 7 are the FIX-FORWARD 2's (the pair 621997773 + cf92fa30a
+// was REJECTED for two NEW leaks on shapes the r30-c1 tip is clean on):
+//   * a NULLABLE function-typed getter (`(() -> int)?`) — the getter minted
+//     the reader's reference for EVERY function-kind type, while the reader
+//     predicate excludes a nullable one, so nothing ever discharged it;
+//   * a `?.` read of a getter — §7.5 lifts the result to an always-nullable
+//     type, and a nullable function value has no owner for a closure
+//     reference, so that spelling reads a BORROW (§28.9: "a getter never
+//     transfers a reclamation obligation to its reader") and its getter must
+//     not mint.
+// Both rows are RED on the pair and on the r30-c1 tip (a function-typed
+// getter's body was not analysed there, so the getter's own closure local
+// leaked as well) and green with this fix.
 //
 // per §27.5, §28.9, §23.3, §23.4 (v0.359)
 
@@ -228,4 +242,112 @@ BEZEL_TEST(property_block_getter_closure_release_8763,
         "  end; "
         "end Program;"),
         "3599");
+}
+
+// fix #8763 (fix-forward 2) — the NULLABLE function-typed block getter.
+//
+// #8763's getter side mints the reader's +1 closure reference for EVERY
+// getter whose declared type is a function type, while the reader side
+// (`blockGetterMintsClosureRef`) admits a NON-NULLABLE one only. A nullable
+// property (`(() -> int)?`) therefore got a reference no read site ever
+// discharged: one closure per read, unbounded.
+//
+// MEASURED on the #8763 pair (621997773 + cf92fa30a) with `bezelc
+// --sanitize=address` on this program (200 reads):
+//   "SUMMARY: AddressSanitizer: 14328 byte(s) leaked in 398 allocation(s)"
+// — one closure per read, on a shape the r30-c1 tip is CLEAN on.
+//
+// §28.9 (v0.359): "a getter never transfers a reclamation obligation to its
+// reader" — so a getter whose reader cannot discharge a reference must not
+// mint one. The getter's mint is now gated on the SAME shared predicate the
+// reader side asks, so the two halves cannot disagree.
+//
+// The row's getter body ALSO holds a closure local it does not return, so
+// the row is red on the r30-c1 tip for that reason too (a function-typed
+// getter's body was not analysed there — #6766's per-body analysis skipped
+// it) and green only when BOTH halves hold: the body is analysed AND the
+// getter does not mint a reference the nullable reader cannot discharge.
+BEZEL_TEST(property_block_getter_closure_release_8763,
+           nullable_block_getter_reference_not_leaked_200x_spec_28_9) {
+    BEZEL_EXPECT_EQ(stdoutChecked(
+        "module M; "
+        "public class H "
+        "  private f: () -> int; "
+        "  public constructor() f := lambda(): int => 5; end; "
+        "  public method Reset() f := lambda(): int => 6; end; "
+        "  public property NP: (() -> int)? "
+        "    get => do var spare := lambda(): int => 7; return f; end; "
+        "  end; "
+        "end H; "
+        "public static class Program "
+        "  public static method Main(args: Array<string>): int "
+        "    var i := 0; "
+        "    var tot := 0; "
+        "    using var h := new H(); "
+        "    while i < 200 do "
+        "      var x := h.NP; "
+        "      if x <> null then tot := tot + x!(); end; "
+        "      h.Reset(); "
+        "      i := i + 1; "
+        "    end; "
+        "    Console.Write(tot); "
+        "    return 0; "
+        "  end; "
+        "end Program;"),
+        "1199");
+}
+
+// fix #8763 (fix-forward 2) — the `?.` READ of a block getter.
+//
+// §7.5 (v0.359): "`x?.M` returns null if `x` is null; otherwise it performs
+// the access. The result type is always nullable." The result of a `?.` read
+// of a function-typed property is therefore a NULLABLE function value, and a
+// nullable function value has no owner for a closure reference — the read
+// sites that consume it (a binding local, a `??`, a discard, a call through
+// the lifted value) have their own nullable protocol and none of them
+// discharges the reference the getter handed over. So the `?.` spelling
+// reads a BORROW (§28.9: "a getter never transfers a reclamation obligation
+// to its reader") and its getter must not mint.
+//
+// MEASURED on the #8763 pair (621997773 + cf92fa30a) with `bezelc
+// --sanitize=address` on this program (200 reads):
+//   "SUMMARY: AddressSanitizer: 14328 byte(s) leaked in 398 allocation(s)"
+// — one closure per read, on a shape the r30-c1 tip is CLEAN on.
+//
+// The row's getter body ALSO holds a closure local it does not return, so
+// the row is red on the r30-c1 tip for that reason too (a function-typed
+// getter's body was not analysed there) and green only when the body is
+// analysed AND the `?.` read does not mint a reference nobody can discharge.
+//
+// The printed total is the program's own: 5 from the constructor's closure,
+// then 6 per read after the first reset.
+BEZEL_TEST(property_block_getter_closure_release_8763,
+           safe_nav_block_getter_reference_not_leaked_200x_spec_28_9) {
+    BEZEL_EXPECT_EQ(stdoutChecked(
+        "module M; "
+        "public class H "
+        "  private f: () -> int; "
+        "  public constructor() f := lambda(): int => 5; end; "
+        "  public method Reset() f := lambda(): int => 6; end; "
+        "  public property P: () -> int "
+        "    get => do var spare := lambda(): int => 7; return f; end; "
+        "  end; "
+        "end H; "
+        "public static class Program "
+        "  public static method Main(args: Array<string>): int "
+        "    var i := 0; "
+        "    var tot := 0; "
+        "    using var h := new H(); "
+        "    var hn: H? := h; "
+        "    while i < 200 do "
+        "      var y := hn?.P; "
+        "      if y <> null then tot := tot + y!(); end; "
+        "      h.Reset(); "
+        "      i := i + 1; "
+        "    end; "
+        "    Console.Write(tot); "
+        "    return 0; "
+        "  end; "
+        "end Program;"),
+        "1199");
 }

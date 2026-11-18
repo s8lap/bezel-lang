@@ -6468,10 +6468,55 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         // §23.3 block-form getter: call the standalone getter
                         // function (ncPd is non-null — blockGetterOf returns
                         // null for an imported property with no PropertyDecl).
+                        //
+                        // fix #8763 (fix-forward 2, §7.5 / §28.9, v0.359):
+                        // `mintReaderRef = false` — the `?.` spelling reads a
+                        // BORROW, so its getter must not mint the reader's
+                        // +1 closure reference.
+                        //
+                        // WHY. §7.5: "`x?.M` returns null if `x` is null;
+                        // otherwise it performs the access. The result type is
+                        // always nullable." The result of a `?.` read is
+                        // therefore a NULLABLE function value, and a nullable
+                        // function value has NO owner for a closure
+                        // reference: the read sites that consume it (a
+                        // binding local, a `??`, a discard, a call through
+                        // the lifted value) have their own nullable protocol,
+                        // and none of them discharges the reference.
+                        //
+                        // MEASURED on the #8763 pair (621997773 +
+                        // cf92fa30a) with `bezelc --sanitize=address` on the
+                        // `?.`-of-a-field-returning-getter probe (200 reads of
+                        // `hn?.P`): "SUMMARY: AddressSanitizer: 14328
+                        // byte(s) leaked in 398 allocation(s)" — one closure
+                        // per read, unbounded, on a shape the r30-c1 tip is
+                        // CLEAN on. The `.` spelling of the same read
+                        // (`h.P`) is not affected: its reader owns the
+                        // reference and discharges it.
+                        //
+                        // §28.9 (v0.359): "a getter never transfers a
+                        // reclamation obligation to its reader" — so a read
+                        // whose reader cannot discharge a reference must not
+                        // be handed one. The getter is emitted out of line
+                        // and MEMOISED per (decl, tag, instantiation), so the
+                        // borrow variant is a SEPARATE function
+                        // (`bz$prop$P$get$lend`), keyed by the variant in
+                        // `PropBlockGetterKey`; the two contracts cannot share
+                        // one body.
+                        //
+                        // The getter's per-body closure-local analysis still
+                        // runs in this variant (the body is analysed like any
+                        // other body): only the reader's reference is not
+                        // minted. A getter that returns a LOCAL closure
+                        // transfers that local's own +1 out of the frame, so
+                        // the value the reader gets stays alive; that is the
+                        // pre-#8763 behaviour for this spelling, and it is
+                        // what the tip does.
                         llvm::Function* ncGetterFn =
                             ensurePropertyBlockGetter(
                                 ncPd, ncBlockAcc, /*ps=*/nullptr,
-                                /*psKey=*/ncPropSym);
+                                /*psKey=*/ncPropSym,
+                                /*mintReaderRef=*/false);
                         ncRaw = builder_.CreateCall(
                             ncGetterFn->getFunctionType(), ncGetterFn, {obj});
                         emitPendingCheck();  // §31.1/§31.2: throw propagation
@@ -11031,7 +11076,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // of one generic declaration otherwise share a single cached getter
             // and the second reads the first one's answer. `ps2` is null for a
             // non-generic owner, where the empty key is already correct.
-            llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc, ps2, ps2);
+            llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc, ps2, ps2,
+                                                                /*mintReaderRef=*/true);
             if (substInstalled) {
                 genericSubst_ = std::move(savedSubst);
                 genericSubstSemaTy_ = std::move(savedSema);
@@ -11711,7 +11757,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // worse user-visible outcome than a wrong value, and the same
             // omission is one field-layout drift away from a silent miscompile
             // whenever the two return types happen to agree.
-            llvm::Function* fn = ensurePropertyBlockGetter(pd, acc, ps, ps);
+            llvm::Function* fn = ensurePropertyBlockGetter(pd, acc, ps, ps,
+                                                          /*mintReaderRef=*/true);
             llvm::Value* res =
                 builder_.CreateCall(fn->getFunctionType(), fn, {currentThis_});
             // §31.1/§31.2 (FINDING [4]): see the qualified block-getter read
@@ -12770,7 +12817,8 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
                     if (ipd) {
                         llvm::Function* getterFn =
                             ensurePropertyBlockGetter(
-                                ipd, acc, /*ps=*/nullptr, /*psKey=*/impl);
+                                ipd, acc, /*ps=*/nullptr, /*psKey=*/impl,
+                                /*mintReaderRef=*/true);
                         llvm::Value* res = builder_.CreateCall(
                             getterFn->getFunctionType(), getterFn, {obj});
                         emitPendingCheck();

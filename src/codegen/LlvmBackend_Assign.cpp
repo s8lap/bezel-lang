@@ -6435,10 +6435,17 @@ llvm::Value* Emitter::callComputedGetterFn(sema::PropertySymbol* ps,
 }
 
 
+const ast::PropertyDecl* Emitter::propertyDeclOf(const sema::Symbol* sym) const {
+    const auto* ps = dynamic_cast<const sema::PropertySymbol*>(sym);
+    if (!ps) return nullptr;
+    return dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+}
+
+
 const ast::PropertyAccessor* Emitter::blockGetterOf(sema::Symbol* sym) {
     auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
     if (!ps || ps->isIndexer) return nullptr;
-    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    const ast::PropertyDecl* pd = propertyDeclOf(sym);
     if (!pd || pd->isIndexer) return nullptr;
     if (pd->bodyKind == ast::PropertyBodyKind::Block) {
         for (const auto& acc : pd->accessors) {
@@ -7346,7 +7353,8 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
                                           const ast::PropertyDecl* pd,
                                           const ast::PropertyAccessor* acc,
                                           const sema::PropertySymbol* ps,
-                                          const sema::PropertySymbol* psKey) {
+                                          const sema::PropertySymbol* psKey,
+                                          bool mintReaderRef) {
     // fix #2928: the memo key carries the accessor specialization tag; tag 0 is
     // the shared/erased template every ordinary caller wants.
     //
@@ -7358,7 +7366,16 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
     // later one (`Holder<int>`'s `bw` served `Holder<string>`, whose `_w` sits
     // at a different offset). A caller that passes no symbol (the inline read
     // sites) keeps the empty key, i.e. today's behaviour.
-    PropBlockGetterKey bgKey{pd, accessorSpecTagNow(), {}, {}};
+    //
+    // fix #8763 (fix-forward 2, §28.9 / §7.5, v0.359): ...and the
+    // READER-REFERENCE VARIANT (the last element). The two variants are
+    // DIFFERENT ownership contracts and therefore DIFFERENT functions: the
+    // ordinary read's getter hands the reader a +1 the reader discharges, and
+    // the `?.` read's getter hands the reader a BORROW (§28.9: "a getter
+    // never transfers a reclamation obligation to its reader"), because
+    // §7.5's always-nullable result has no owner for a closure reference.
+    // One memo entry cannot serve both, so the variant is part of the key.
+    PropBlockGetterKey bgKey{pd, accessorSpecTagNow(), {}, {}, mintReaderRef};
     if (ps) propertyThunkSubstKey(ps, std::get<2>(bgKey), std::get<3>(bgKey));
     auto it = propBlockGetterInstFns_.find(bgKey);
     if (it != propBlockGetterInstFns_.end()) return it->second;
@@ -7367,9 +7384,17 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
     if (!retTy) retTy = i32();
 
     auto* fnTy = llvm::FunctionType::get(retTy, {ptrTy()}, false);
+    // fix #8763 (fix-forward 2, §28.9 / §7.5, v0.359): the BORROW variant
+    // gets its own name, so an IR dump shows WHICH contract the getter was
+    // emitted under (`bz$prop$P$get` mints the reader's reference;
+    // `bz$prop$P$get$lend` does not). Without the suffix the two functions
+    // would collide on one symbol name and LLVM would rename the second
+    // implicitly (`…$get.1`), which reads like an accident.
     auto* fn = llvm::Function::Create(
         fnTy, llvm::GlobalValue::InternalLinkage,
-        "bz$prop$" + std::string(pd->name) + "$get", *module_);
+        mintReaderRef ? ("bz$prop$" + std::string(pd->name) + "$get")
+                      : ("bz$prop$" + std::string(pd->name) + "$get$lend"),
+        *module_);
     propBlockGetterInstFns_[bgKey] = fn;
     // no capture attribute added (Captures API varies by LLVM version)
 
@@ -7589,9 +7614,36 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
     // accessor's own declared type — the same node `accessorReturnTypeNode_`
     // already publishes for the REPRESENTATION arms — so the representation
     // behaviour of the body is unchanged.
+    //
+    // fix #8763 (fix-forward 2, §28.9 / §7.5, v0.359): ...and only for a
+    // getter whose READER owns the reference it hands over. The gate is now
+    // the SHARED predicate `blockGetterMintsClosureRef` — the SAME question
+    // the reader side asks — so the two halves of the protocol cannot
+    // disagree about which reads mint:
+    //
+    //   * a NULLABLE function-typed property (`(() -> int)?`) is excluded by
+    //     that predicate, and it must be excluded HERE too: the reader's
+    //     value is a nullable function value, and the nullable protocol
+    //     (§7.5) has no owner for a closure reference, so nothing would ever
+    //     discharge the reference this getter minted. MEASURED on the
+    //     #8763 pair (621997773 + cf92fa30a) with `bezelc
+    //     --sanitize=address` on the nullable-getter probe (200 reads of
+    //     `h.NP`): "SUMMARY: AddressSanitizer: 14328 byte(s) leaked in 398
+    //     allocation(s)" — one closure per read, unbounded, on a shape the
+    //     r30-c1 tip is CLEAN on.
+    //   * the `?.` spelling (`h?.P`) is excluded by the VARIANT parameter
+    //     (`mintReaderRef == false`), for the same reason: §7.5's
+    //     always-nullable result has no owner for the reference either.
+    //
+    // §28.9 (v0.359): "a getter never transfers a reclamation obligation to
+    // its reader" — the getter's reference is the IMPLEMENTATION's to
+    // balance, and it may only be minted where the reader's protocol can
+    // discharge it.
     const ast::Type* savedGetterReturnTypeNode = currentReturnTypeNode_;
     const bool publishGetterReturnType =
-        getterRetTy && getterRetTy->kind == sema::TypeRef::Kind::Function;
+        mintReaderRef && getterRetTy &&
+        getterRetTy->kind == sema::TypeRef::Kind::Function &&
+        blockGetterMintsClosureRef(ps ? ps : psKey);
     if (publishGetterReturnType) currentReturnTypeNode_ = pd->type.get();
     if (analyzeGetterClosures) {
         getterClosureScope.emplace(*this);
@@ -8523,7 +8575,15 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     // signature (`lowerType(pd->type)`) and body (field GEPs against one
     // `class.Holder$specN`) are lowered under the live §14.1 substitution, so a
     // memo per `pd` froze the first instantiation's getter for every later one.
-    PropBlockGetterKey bgKey{pd, accessorSpecTagNow(), {}, {}};
+    //
+    // fix #8763 (fix-forward 2, §28.9, v0.359): the READER-REFERENCE VARIANT
+    // is the last key element. An INDEXER getter never mints a reader
+    // reference (this emitter does not publish the body's declared return
+    // type, so `emitReturn`'s closure-return mint never fires for it), so the
+    // indexer face takes the BORROW variant. The indexer's `pd` is a different
+    // declaration from any ordinary property's, so the two faces can never
+    // collide on one memo entry.
+    PropBlockGetterKey bgKey{pd, accessorSpecTagNow(), {}, {}, false};
     if (ps) propertyThunkSubstKey(ps, std::get<2>(bgKey), std::get<3>(bgKey));
     auto it = propBlockGetterInstFns_.find(bgKey);
     if (it != propBlockGetterInstFns_.end()) return it->second;
@@ -16544,7 +16604,8 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
         if (pd) {
             if (const ast::PropertyAccessor* acc = blockGetterOf(currentPropSym)) {
                 currentFn = ensurePropertyBlockGetter(
-                    pd, acc, /*ps=*/nullptr, /*psKey=*/currentPropSym);
+                    pd, acc, /*ps=*/nullptr, /*psKey=*/currentPropSym,
+                    /*mintReaderRef=*/true);
             } else if (const ast::Expr* ge = computedGetterOf(currentPropSym)) {
                 llvm::Type* propRetTy = pd->type ? lowerType(pd->type.get()) : elemTy;
                 if (!propRetTy) propRetTy = elemTy;
