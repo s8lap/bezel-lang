@@ -13518,12 +13518,30 @@ void MethodOwnership::checkThrowOperandNotBorrowed(const ast::Expr& operand) {
 //
 // This closes exactly that gap, and nothing wider:
 //
-//   * The operand must be a bare read of a local DECLARED IN THIS LAMBDA
-//     BODY. A CAPTURED binding is #7920's (owned) and #8781's (borrowed)
-//     case, and a lambda PARAMETER is #8781's case: those are asked
+//   * The operand must be a bare read of a local DECLARED IN THE BODY OF A
+//     LAMBDA THAT ENCLOSES THE THROWING ONE — the throwing lambda's own body,
+//     or the body of any ENCLOSING lambda (the CAPTURED case, #8859). A
+//     CAPTURED binding of the METHOD body is #7920's (owned) and #8781's
+//     (borrowed) case, and a lambda PARAMETER is #8781's case: those are asked
 //     `checkThrowOperandNotBorrowed` in the ENCLOSING frame, where the
 //     binding IS tracked in `states_`. A lambda-body local is tracked in NO
 //     frame, so that check cannot see it — it is the one shape it misses.
+//
+// fix #8859 (§31.1 *The throw operand*, v0.359): the ENCLOSING-lambda half.
+// The rule above closed the ONE-LEVEL case only: the local had to be declared
+// inside the THROWING lambda's own source range, so a local of an ENCLOSING
+// lambda — captured by the throwing lambda — was never asked the borrow
+// question and the program compiled (rc=0) and core-dumped at run time
+// (MEASURED: rc=139, 50/50 runs). #8781 cannot cover it either: the captured
+// borrowed binding of a METHOD body is classified through the METHOD frame's
+// `states_`, and an OUTER-LAMBDA local has no entry in any frame. The arm now
+// resolves the local against EVERY enclosing lambda on `closureScanStack_`
+// (the chain of lambda literals the closure scan is inside, outermost first)
+// and asks the borrow question against the innermost one that DECLARES it —
+// the binding's owner. The classification itself is unchanged: the local's
+// value at the throw must be a BORROW (the same `producerState` rule, the same
+// one-sided flow-insensitivity), so an enclosing lambda's OWNED local, a fresh
+// `throw new`, a `move`d owned value and a bare re-raise stay admitted.
 //
 //   * The local's value at the throw must be a BORROW. The local's ownership
 //     state is its BINDING's §28.3 producers-table classification — the SAME
@@ -13552,12 +13570,10 @@ void MethodOwnership::checkThrowOperandNotBorrowed(const ast::Expr& operand) {
 // `throw b!` is covered: §17.8 classifies `x!` by its position exactly as the
 // bare read `x`. `throw move b` is covered: §28.8.1 reads the underlying
 // PLACE, so a borrow place under `move` is still a borrow. // per §31.1,
-// v0.359, #8802
+// v0.359, #8802, #8859
 void MethodOwnership::checkLambdaBodyThrowOperandNotBorrowed(
     const ast::Expr& operand) {
     if (closureScanStack_.empty()) return;
-    const ast::LambdaExpr* lam = closureScanStack_.back();
-    if (!lam) return;
     // Peel the `!` (§17.8) and the `move` (§28.8.1): both classify the
     // UNDERLYING place, so `throw b!` and `throw move b` are the same
     // question as `throw b`.
@@ -13579,12 +13595,15 @@ void MethodOwnership::checkLambdaBodyThrowOperandNotBorrowed(
     auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
     if (!ls) return;
     if (isCatchBorrow(sym)) return;
-    // The local must be declared IN THIS LAMBDA BODY. The span test is the
-    // one `collectHeldBorrowsOfClosureCaptures` already uses to tell a
-    // closure's own binding from a captured one: a binding declared inside
-    // the lambda's own source range is the closure's own.
-    const std::uint32_t lamLo = lam->span.begin.offset;
-    const std::uint32_t lamHi = lam->span.end.offset;
+    // The local must be declared IN THE BODY OF A LAMBDA THAT ENCLOSES THE
+    // THROWING ONE — the throwing lambda's own body, or the body of any
+    // ENCLOSING lambda (the CAPTURED case, #8859). The span test is the one
+    // `collectHeldBorrowsOfClosureCaptures` already uses to tell a closure's
+    // own binding from a captured one: a binding declared inside a lambda's
+    // own source range is that closure's own. `closureScanStack_` holds the
+    // chain of lambda literals the scan is inside, OUTERMOST first, so the
+    // search walks it from the back and the innermost enclosing lambda that
+    // DECLARES the local is the binding's owner.
     std::uint32_t declOff = sym->declLoc.offset;
     bool declKnown = sym->declLoc.line != 0;
     if (!declKnown && sym->decl) {
@@ -13592,9 +13611,25 @@ void MethodOwnership::checkLambdaBodyThrowOperandNotBorrowed(
         declKnown = sym->decl->span.begin.line != 0;
     }
     if (!declKnown) return;
-    if (declOff < lamLo || declOff >= lamHi) return;
+    const ast::LambdaExpr* owner = nullptr;
+    for (auto it = closureScanStack_.rbegin(); it != closureScanStack_.rend();
+         ++it) {
+        const ast::LambdaExpr* cand = *it;
+        if (!cand) continue;
+        const std::uint32_t candLo = cand->span.begin.offset;
+        const std::uint32_t candHi = cand->span.end.offset;
+        if (declOff >= candLo && declOff < candHi) {
+            owner = cand;
+            break;
+        }
+    }
+    // No enclosing lambda declares it: the local belongs to the METHOD body,
+    // which is #8781's case (a captured borrowed binding) — that one is asked
+    // `checkThrowOperandNotBorrowed` in the ENCLOSING frame, where the binding
+    // IS tracked in `states_`.
+    if (!owner) return;
     // The local's value at the throw must be a borrow on every path.
-    if (!lambdaBodyLocalHoldsBorrow(ls, *lam, operand.span.begin.offset))
+    if (!lambdaBodyLocalHoldsBorrow(ls, *owner, operand.span.begin.offset))
         return;
     // Hand the verdict to the METHOD arm's own predicate, with the local's
     // borrow state installed for the duration of that one call. The entry is
@@ -13630,7 +13665,16 @@ void MethodOwnership::checkLambdaBodyThrowOperandNotBorrowed(
 // grammar (StmtWalker.hpp, fix #3656) — over the lambda's own top-level
 // statements. That walker does not cross into a nested lambda (a nested
 // lambda's body is walked with ITS own bindings), so a nested lambda's local
-// is never mistaken for this lambda's. // per §31.1, §28.3, v0.359
+// is never mistaken for this lambda's.
+//
+// fix #8859 (§31.1, v0.359): the lambda handed in is the OWNER of the local —
+// the innermost ENCLOSING lambda that declares it, which for the captured
+// case is NOT the lambda the throw is written in. The `atOffset` is then the
+// throw's own offset, which lies INSIDE a nested lambda of the owner, so an
+// owner binding that follows the nested lambda literal in source order is
+// not part of the history — the same one-sided, source-order rule, in the same
+// conservative direction (an unseen owned binding can only make the check
+// report a borrow it should not). // per §31.1, §28.3, v0.359, #8802, #8859
 bool MethodOwnership::lambdaBodyLocalHoldsBorrow(sema::LocalSymbol* ls,
                                                   const ast::LambdaExpr& lam,
                                                   std::uint32_t atOffset) {
