@@ -16,6 +16,7 @@
 #include "common/OwnershipFacts.hpp"   // #1414 stage 4: shared ownership-facts core
 #include "common/PatternAResultCollection.hpp"  // fix #4338: isPatternAResultCollectionHead
 #include "flow/CFG.hpp"
+#include "ownership/ExprWalker.hpp"  // fix #8767: walkStmtDeep — the getter escape screen
 #include "ownership/FieldWriteUse.hpp"  // fix #7976: the §28.7 dominated-use check
 #include "ownership/OwnershipState.hpp"
 #include "ownership/StmtWalker.hpp"  // fix #3565: forEachNestedStmt — the
@@ -20092,24 +20093,47 @@ void MethodOwnership::checkReturnGetEnumeratorFromScopeBoundReceiver(
 // getter's owned locals; that free is sound only when no borrow of such a
 // local outlives the getter body. §28.3 forbids every such escape ("A borrow
 // cannot outlive its source"), and the method pass enforces it through
-// `report()` — which the getter mode records (`getterSuppressedError_`). Two
-// escapes the method pass itself ACCEPTS (pre-existing holes, #8836 and
-// #8837) never reach `report()`: a returned `(if c then t else null)` over an
-// owned local, and a returned lambda capturing an alias `b := t`. MEASURED on
-// the rejected first attempt (0ddb37e6d), both are a heap-use-after-free in a
-// getter (r42-rev-m74 b31, b33) where the base merely leaked.
+// `report()` — which the getter mode records (`getterSuppressedError_`).
+// Several escapes the method pass itself ACCEPTS never reach `report()`, and
+// on a getter they turned the pre-fix bounded leak into a use-after-free:
+//   * a returned `(if c then t else null)` and a returned lambda over an
+//     alias `b := t` (#8836, #8837; r42-rev-m74 b31, b33);
+//   * a record whose FUNCTION-typed component captures the local, stored
+//     into a field, returned through a local, or nested in another record
+//     (#8852; r42-rev-s67 s02, s21, s23) — SEGV in the closure;
+//   * a store made inside a LAMBDA body (s22, the #8837 alias family);
+//   * the local, or a borrow of it, handed to a plain (non-`scoped`)
+//     parameter that the callee stores (s05, s06, s14, s17, s20; r42-s77
+//     n02). §28.3 field-store clause 3 (v0.359) ADMITS that store at the
+//     call ("an unbound owned temporary or a borrow of a scope-bound local,
+//     passed to a plain parameter that the callee stores … is admitted at
+//     the call"), and its backstop is the checked build's
+//     `DisposedAccessException`; in the default (unchecked) build the store
+//     dangles once the local is freed (#4602).
 //
-// So the getter mode treats as a possible escape every `return` and every
-// store into a location that is not one of the body's own locals whose value
-// is of a type that can carry a borrow — anything but a non-`Object`
-// primitive (`string` included: §28.1, runtime-managed), `()`, an enum, or a
-// record that is not borrow-bearing (§9.7) — unless the value is `null` or a
-// `new` whose arguments carry no borrow. The screen is deliberately
-// over-approximate: a false positive costs only the pre-fix bounded leak
-// (the free is withdrawn), a false negative is a use-after-free.
+// So the getter mode treats as a possible escape, anywhere in the body —
+// lambda bodies, `case` arms and binding atoms included (`walkStmtDeep`):
+//   (1) a `return`, `yield return` or `throw` value,
+//   (2) a store into anything but one of the body's own locals, and
+//   (3) a call, `new` or index argument bound to a formal that is not
+//       `scoped` (a `move` argument transfers the value and is exempt),
+// whose value is of a type that can carry a borrow — anything but a
+// non-`Object` primitive (`string` included: §28.1, runtime-managed), `()`,
+// an enum, or a record (or inline array) whose every component, transitively,
+// is one of those — unless the value is `null` or a `new` whose arguments
+// carry no borrow. A FUNCTION-typed component CAN carry a borrow (§28.3's
+// closure bullet: a closure whose source set holds the local), so this
+// classifier is deliberately NOT `common::isBorrowBearingRecordOrSpan`, whose
+// §9.7 field walk answers the record-layout question (a `Function` field is
+// borrow-free there) rather than this escape question. The screen is
+// over-approximate on purpose: a false positive costs only the pre-fix
+// bounded leak (the free is withdrawn), a false negative is a
+// use-after-free.
 bool MethodOwnership::getterBorrowMayEscape(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
-    auto typeCannotCarryBorrow = [&](const sema::TypeRef* t) -> bool {
+    std::unordered_set<const sema::TypeSymbol*> recordsOnPath;
+    std::function<bool(const sema::TypeRef*)> typeCannotCarryBorrow =
+        [&](const sema::TypeRef* t) -> bool {
         if (!t) return false;
         switch (t->kind) {
             case sema::TypeRef::Kind::Primitive:
@@ -20117,50 +20141,100 @@ bool MethodOwnership::getterBorrowMayEscape(
                        t->primitive != sema::PrimitiveType::None;
             case sema::TypeRef::Kind::Unit:
                 return true;
-            case sema::TypeRef::Kind::Named:
-                if (!t->declaration) return false;  // bare type parameter
-                if (t->declaration->kind == ast::TypeDeclKind::Enum)
-                    return true;
-                if (t->declaration->kind == ast::TypeDeclKind::Record)
-                    return !common::isBorrowBearingRecordOrSpan(t, ctx_);
-                return false;
+            case sema::TypeRef::Kind::InlineArray:
+                return typeCannotCarryBorrow(t->arrayElement);
+            case sema::TypeRef::Kind::Named: {
+                const sema::TypeSymbol* ts = t->declaration;
+                if (!ts) return false;  // bare type parameter, builtin head
+                if (ts->kind == ast::TypeDeclKind::Enum) return true;
+                if (ts->kind != ast::TypeDeclKind::Record) return false;
+                // A generic record's components may be its type
+                // parameters, which this walk does not substitute: such a
+                // component reads as a bare type parameter (above) and
+                // classifies the record as borrow-carrying.
+                if (!recordsOnPath.insert(ts).second) return false;
+                const bool carrying = sema::anyRecordStorageField(
+                    ts, ctx_,
+                    [&](const sema::Symbol*, const sema::TypeRef* ft) {
+                        return !typeCannotCarryBorrow(ft);
+                    });
+                recordsOnPath.erase(ts);
+                return !carrying;
+            }
             default:
-                return false;
+                return false;  // Function, Error
         }
     };
-    auto valueCannotCarryBorrow = [&](const ast::Expr& e) -> bool {
+    std::function<bool(const ast::Expr&)> valueCannotCarryBorrow =
+        [&](const ast::Expr& e) -> bool {
         if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) return true;
         if (typeCannotCarryBorrow(ctx_.exprType(e))) return true;
         if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
             for (const auto& a : ne->args)
-                if (!a.value || !typeCannotCarryBorrow(ctx_.exprType(*a.value)))
+                if (!a.value || !valueCannotCarryBorrow(*a.value))
                     return false;
             return true;
         }
         return false;
     };
+    auto isMove = [](const ast::Expr& e) {
+        auto* un = dynamic_cast<const ast::UnaryExpr*>(&e);
+        return un && un->op == "move";
+    };
     bool escapes = false;
+    auto argsEscape = [&](const ast::Expr* callee, const ast::NewExpr* ne,
+                          const std::vector<ast::CallArgument>& args) {
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            const auto& a = args[i];
+            if (!a.value || isMove(*a.value)) continue;
+            if (valueCannotCarryBorrow(*a.value)) continue;
+            // A `scoped` formal is call-bounded (§28.14): the callee cannot
+            // retain the argument past the call.
+            if ((callee || ne) && scopedFormalAt(callee, ne, &args, i))
+                continue;
+            escapes = true;
+            return;
+        }
+    };
+    auto onExpr = [&](const ast::Expr& e) {
+        if (escapes) return;
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e))
+            argsEscape(ce->callee.get(), nullptr, ce->args);
+        else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e))
+            argsEscape(nc->callee.get(), nullptr, nc->args);
+        else if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e))
+            argsEscape(nullptr, ne, ne->args);
+        else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
+            argsEscape(nullptr, nullptr, ix->indices);
+    };
+    auto valueLeaves = [&](const std::unique_ptr<ast::Expr>& v) {
+        if (v && !valueCannotCarryBorrow(*v)) escapes = true;
+    };
+    auto onStmt = [&](const ast::Stmt& st) {
+        if (escapes) return;
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&st)) {
+            valueLeaves(rs->value);
+        } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&st)) {
+            valueLeaves(ys->value);
+        } else if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&st)) {
+            valueLeaves(ts->value);
+        } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&st)) {
+            if (!as->target || !as->value) return;
+            // A store into one of the body's own locals (a lambda's
+            // included) stays inside the body: the stored value is screened
+            // again wherever it leaves the local, by the rules above. The
+            // nested-scope escape of such a store (b28) is the method pass's
+            // §28.3 rejection, recorded through `report()`.
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+                if (dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)))
+                    return;
+            valueLeaves(as->value);
+        }
+    };
     for (const auto& top : body) {
         if (!top || escapes) continue;
-        forEachNestedStmt(*top, [&](const ast::Stmt& st) {
-            if (escapes) return;
-            if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&st)) {
-                if (rs->value && !valueCannotCarryBorrow(*rs->value))
-                    escapes = true;
-                return;
-            }
-            if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&st)) {
-                if (!as->target || !as->value) return;
-                // A store into one of the body's own locals stays inside the
-                // body; the nested-scope escape of such a store (b28) is the
-                // method pass's §28.3 rejection, recorded through `report()`.
-                if (auto* id =
-                        dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
-                    if (dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)))
-                        return;
-                if (!valueCannotCarryBorrow(*as->value)) escapes = true;
-            }
-        });
+        walkStmtDeep(*top, onExpr, onStmt);
     }
     return escapes;
 }
@@ -20622,6 +20696,10 @@ static void runGetterBody(const ast::PropertyDecl& pd,
     for (const auto& top : acc.stmts) {
         if (!top) continue;
         forEachNestedStmt(*top, [&](const ast::Stmt& st) {
+            // LOCALDECL-ONLY: the snapshot covers the FREE-direction flags
+            // the run may arm, and a §21.1 `const` local carries none — it
+            // never owns (the `const` owned-production rejections), so it has
+            // no scope-end free to arm or withdraw.
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&st)) {
                 keep(ld->autoDropAtScopeEnd);
                 keep(ld->becomesOwnedViaReassign);
@@ -20652,8 +20730,11 @@ static void runGetterBody(const ast::PropertyDecl& pd,
     // free this run armed is sound only if no borrow of the freed local
     // outlives the getter body. When the method pass WOULD have rejected the
     // body (a suppressed §28.3 error — r42-rev-m74's b04, b09, b28, b30, b34)
-    // or a borrow-carrying value leaves it (`getterBorrowMayEscape` — b31,
-    // b33, the method-pass holes #8836 / #8837), that is not established, so
+    // or a borrow-carrying value may leave it (`getterBorrowMayEscape` — a
+    // return, a non-local store or a non-`scoped` argument, lambda bodies
+    // included: b31, b33, the method-pass holes #8836 / #8837 / #8852, and
+    // the trust stores of §28.3 field-store clause 3), that is not
+    // established, so
     // every free the run armed is WITHDRAWN: the pre-fix bounded leak, which
     // is the safe direction, instead of a use-after-free. No rejection is
     // added — that is the spec-shaped change #8767's comment leaves open.

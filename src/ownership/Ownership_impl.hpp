@@ -602,11 +602,14 @@ public:
     // `getterSuppressedError_`'s comment.
     bool getterSuppressedError() const { return getterSuppressedError_; }
     // fix #8767 fix-forward (§28.3, §28.3.10, v0.359): may a borrow of one of
-    // the getter body's own locals leave the body through a `return` or a
-    // store into a non-local location? The cases the method pass ACCEPTS and
+    // the getter body's own locals leave the body through a `return`, a
+    // store into a non-local location, or an argument bound to a non-`scoped`
+    // formal — lambda bodies included? The cases the method pass ACCEPTS and
     // still dangles (#8836's `return (if c then t else null)`, #8837's
-    // returned lambda over an alias `b := t`) never reach `report()`, so the
-    // getter mode screens them structurally. Defined in Ownership.cpp.
+    // returned lambda over an alias `b := t`, #8852's record with a
+    // function-typed component, §28.3 clause 3's trust store) never reach
+    // `report()`, so the getter mode screens them structurally. Defined in
+    // Ownership.cpp.
     bool getterBorrowMayEscape(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // fix #8767 fix-forward: withdraw the symbol-level §28.3.10 scope-end
