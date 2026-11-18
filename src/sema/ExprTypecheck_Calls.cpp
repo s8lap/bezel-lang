@@ -453,20 +453,45 @@ static bool isOpenTypeParamRef(const TypeRef* t) {
            t->genericArgs.empty() && t->isResolvedTypeParam();
 }
 
-// fix #8741 (§14.2 *Type-parameter bounds*, v0.359): `where S: U`, where U's
-// substitution is an OPAQUE TYPE PARAMETER IN SCOPE and so has no declaration
-// to walk. "A substitution S for `T` satisfies `where T: U` exactly when S is
-// non-nullable and is a *subtype of* the substitution for `U`": a primitive or
-// a declared argument is a subtype of it only by the parameter's own
-// constraints, which name no concrete type, so neither is. An argument that is
-// itself a type parameter or an unresolved type stays undecided (false): the
-// conservative direction.
+// fix #8742 / #8741 (§14.2 *Type-parameter bounds*, v0.359): `where S: U`,
+// where U's substitution has NO declaration to walk -- a primitive, or an
+// opaque type parameter in scope. "A substitution S for `T` satisfies
+// `where T: U` exactly when S is non-nullable and is a *subtype of* the
+// substitution for `U`". Decided only where the answer is certain:
+//  * U := a primitive: a primitive argument is a subtype only of the SAME
+//    primitive (there is no widening subtyping: `int` is not a subtype of
+//    `long`: "at `U := long` it admits `long` alone"), and a declared type
+//    (class, record, enum) is a subtype of no primitive; a NULLABLE U admits
+//    no type; `U := Object` admits `Object` and every class type, so a
+//    primitive other than `Object` is refused and a declared type is left
+//    undecided;
+//  * U := an opaque type parameter in scope: a primitive or a declared
+//    argument is a subtype of it only by the parameter's own constraints,
+//    which name no concrete type, so neither is.
+// An argument that is itself a type parameter, an unresolved type, or `Object`
+// stays undecided (false): the conservative direction.
 static bool bareBoundSubstitutionRejects(const TypeRef* arg,
                                          const TypeRef* u) {
     if (!arg || !u) return false;
     const bool argPrim = arg->kind == TypeRef::Kind::Primitive;
     const bool argDeclared =
         arg->kind == TypeRef::Kind::Named && arg->declaration;
+    if (u->kind == TypeRef::Kind::Primitive) {
+        if (u->primitive == PrimitiveType::None) return false;
+        // "at a nullable substitution for `U` it admits no type".
+        if (u->nullable) return argPrim || argDeclared;
+        // "At `U := Object` the bound admits `Object` and every class type,
+        // and nothing else: `string` ... [is] not [a class]"; a value type
+        // reaches `Object` only by boxing, which the three relations exclude.
+        if (u->primitive == PrimitiveType::Object)
+            return argPrim && arg->primitive != PrimitiveType::Object &&
+                   arg->primitive != PrimitiveType::None;
+        if (argPrim)
+            return arg->primitive != PrimitiveType::Object &&
+                   arg->primitive != PrimitiveType::None &&
+                   arg->primitive != u->primitive;
+        return argDeclared;
+    }
     if (isOpenTypeParamRef(u)) return argPrim || argDeclared;
     return false;
 }
@@ -10392,7 +10417,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     uSubst = ui->second;
                                 } else if (boundSubst &&
                                            (boundSubst->declaration ||
-                                            boundOpenArg)) {
+                                            boundOpenArg ||
+                                            (boundSubst != bound &&
+                                             boundSubst->kind ==
+                                                 TypeRef::Kind::Primitive))) {
                                     // the ENCLOSING CLASS's own parameter,
                                     // substituted with the receiver's class
                                     // argument (#8663: §14.2's
@@ -10415,17 +10443,30 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                                    argDecl,
                                                    uSubst->declaration)) {
                                         report(uName);
+                                    } else if (uSubst->declaration &&
+                                               argRef->kind ==
+                                                   TypeRef::Kind::Primitive &&
+                                               !uSubst->declaration
+                                                    ->isSynthesizedBuiltinInterface) {
+                                        // fix #8742 (§14.2 *Type-parameter
+                                        // bounds*, v0.359): a PRIMITIVE has
+                                        // no declaration to walk and is a
+                                        // subtype of no declared type, bar
+                                        // the compiler-known builtin
+                                        // interfaces it conforms to by the
+                                        // stdlib's own declaration (left to
+                                        // the defer below).
+                                        report(uName);
                                     } else if (!uSubst->declaration &&
                                                bareBoundSubstitutionRejects(
                                                    argRef, uSubst)) {
-                                        // fix #8741 (§14.2 *Type-parameter
-                                        // bounds*, v0.359): the bound's
-                                        // substitution is an opaque type
-                                        // parameter in scope: it has no
-                                        // declaration to walk, and S is a
-                                        // subtype of it only as
-                                        // `bareBoundSubstitutionRejects`
-                                        // decides.
+                                        // fix #8742 / #8741 (§14.2 *Type-
+                                        // parameter bounds*, v0.359): the
+                                        // bound's substitution is a PRIMITIVE
+                                        // or an opaque type parameter in
+                                        // scope: it has no declaration to
+                                        // walk, but S is a subtype of it only
+                                        // as the rule below decides.
                                         report(uName);
                                     }
                                     // else: U's or T's substitution is not
