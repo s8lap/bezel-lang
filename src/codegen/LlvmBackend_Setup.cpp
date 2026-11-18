@@ -25992,25 +25992,176 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
     // no further plumbing of the resolved type is needed here.
     const sema::TypeRef* rt =
         ps->declType ? ctx_.resolvedType(*ps->declType) : ps->resolvedDeclType;
-    // fix #TBD (§15.3 / §35.4, v0.315): an `owned` parameter of an
-    // owning-classified choice type.  §15.3: parameter passing for a move-only
-    // type is by value-move; the callee's scope-end auto-dispose must cover
-    // the incoming value on every exit path.  Before this fix,
-    // registerUnwindOwnedParam had no branch for owning choice parameters —
-    // the slot fell through all checks and was silently skipped,
-    // causing a direct leak.  Classify the resolved parameter type and register
-    // the active-case disposal entry if it is Owning.
-    if (ps->modifier == "owned" &&
-        rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+    // fix #7722 (§15.3 *Parameter passing*, §28.1 clause 1, §35.4, v0.359): a
+    // MOVE-ONLY (owning-classified choice) PARAMETER is a LIVE owning binding
+    // in the callee, and the callee owns the value.
+    //
+    // §15.3 *Parameter passing*: "a parameter declared `(x: V)` for an ordinary
+    // V is by value (copy); for a move-only V, it is by value-move (transfer
+    // ownership). The caller's argument expression is in moved-from state after
+    // the call." ⇒ the CALLER's binding is moved-from and disposes nothing;
+    // the CALLEE holds the value and owes the scope-end discharge (§28.3.10:
+    // "for an `owned` parameter, at the end of the method").
+    //
+    // §28.1 CLAUSE 1 — THE `owned` MODIFIER IS IRRELEVANT HERE. "Move-only
+    // value types (§15.3): the modifier is admitted-but-redundant — the
+    // type's own move semantics already transfer the obligation." §15.3 says
+    // it in full: "A parameter declared `(owned x: V)` is identical to plain
+    // `(x: V)` for a move-only V; the modifier is admitted for documentation
+    // but is redundant." ⇒ the branch below must NOT be
+    // gated on `ps->modifier == "owned"`. Before #7722 it WAS, and the PLAIN
+    // spelling — the one §15.3's own example writes, and the one the issue's
+    // repro uses — fell through every check and was silently skipped: the
+    // callee's scope-end pass disposed NOTHING and the value leaked.
+    // MEASURED on the base (r30-c1 227d95a17): `Call(f: (OChoice) -> int,
+    // o: OChoice)` called with `OChoice.Text(new Res())` leaks
+    // "1600 byte(s) in 100 allocation(s)" over 100 iterations, and the
+    // destructor counter prints 0 (none of the 100 `Res` is disposed).
+    // The `owned o: OChoice` spelling of the same shape does NOT leak (100
+    // dispositions) — the differential control that pins the defect on the
+    // MODIFIER rather than on the shape.
+    //
+    // §35.4: "Disposal is defined by the active case" — the owning choice's
+    // active case's `owned` payloads are disposed in place; that is the
+    // `d.owningChoice` entry (the same mechanism the `owned` spelling used).
+    //
+    // `releaseOnUnwindOnly` — NOT THE GATE THE ISSUE'S REPRO NEEDS. The
+    // owning-choice arm of `emitDisposals` fires on BOTH the normal and the
+    // unwind exit; it consults `unwindOnly`, not `releaseOnUnwindOnly`, so the
+    // flag does not decide the normal-exit discharge. The gate that DID
+    // decide it was `ps->modifier == "owned"` — the one removed above. The
+    // sibling move-only arm below (fix #8376, the owning INLINE ARRAY)
+    // documents the trap for ITS arm: "the owning-choice arm's
+    // `d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;` must NOT be copied",
+    // because `autoDropAtScopeEnd` is set only for an `owned` parameter.
+    //
+    // WHY THE ADMISSION IS EXACTLY ONCE (the moved-out half). §15.3's
+    // *Parameter passing* also says the CALLER's argument is moved-from, so a
+    // callee that moves the parameter ON — into a local, into another
+    // callee, or out through a `return` — hands the value to the receiver.
+    // Every one of those transfer sites already ZERO-STOREs the source slot
+    // (`markOwningChoiceMovedFromCore`: the local target, the call argument
+    // [#5436], the parameter source [#7415], the return [#7890]), and
+    // `emitOwningChoiceActiveCaseDisposal` NULL-GUARDS every owned payload
+    // pointer it reads — so the scope-end pass over a moved-from slot disposes
+    // nothing, and the receiver's own disposal is the sole one. Exactly once,
+    // on either edge.
+    if (rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
         rt->declaration->kind == ast::TypeDeclKind::Choice) {
         const sema::TypeRef* instRt = resolveTypeParamRef(rt);
         auto verdict = common::classifyChoiceType(instRt, ctx_);
         if (verdict && *verdict == common::ChoiceClassification::Owning) {
+            // fix #7722: the PLAIN spelling is admitted, but ONLY where the
+            // CALL SITE is guaranteed to mark the caller's source moved-from
+            // BEFORE the call. The two disposals can never meet only if the
+            // caller has already given the value up when the callee disposes
+            // it; where the call site cannot know that, the callee must not
+            // dispose the value either, and the caller's own scope-end
+            // discharge remains the sole one.
+            //
+            // THE CALLEE-SIDE MIRROR OF THE CALL SITE'S `calleeEntryMayThrow`
+            // GATE (`markMoveOnlyChoiceArgsMovedFrom`'s predicate in
+            // LlvmBackend_Calls2.cpp). The call site declines to mark when the
+            // callee's ENTRY may raise before its root scope opens — and then
+            // the callee does not dispose the parameter — so the callee must
+            // NOT dispose it either, or the caller's scope-end discharge and
+            // the callee's own meet.
+            //
+            // The mirror is deliberately CONSERVATIVE: it skips the
+            // registration in every case the call site might skip, and in a
+            // few more. A skip leaves the base's behaviour (the caller's
+            // scope-end discharge is the sole one) — a LEAK, the defect this
+            // fix addresses — and NEVER a double free. The direction that
+            // matters is therefore "skip when in doubt": a callee-side check
+            // that is too narrow would let the callee dispose a value the
+            // caller also disposes, which is memory corruption.
+            //
+            // MEASURED on the base (r30-c1 227d95a17) and on this tip over
+            // the spelling x shape matrix (probe/matrix/): the shapes the
+            // mirror skips — a dynamically dispatched member, a member of a
+            // class that implements an interface, an imported callee, a
+            // `requires` clause, an expression body, an async method — keep
+            // the base's verdict on both arms, and the shapes it admits (a
+            // static, block-bodied, non-imported member with no `requires`
+            // clause) go from LEAK to clean.
+            if (ps->modifier != "owned") {
+                bool calleeDisposes = false;
+                if (sema::MethodSymbol* cms = currentMethod_) {
+                    bool ok = true;
+                    // (1) A DYNAMICALLY REACHABLE member. The call site
+                    //     dispatches through a vtable or an itable slot, so it
+                    //     cannot know which body runs and does not mark the
+                    //     caller's source at the call site. A virtual or
+                    //     `override` member has a vtable slot; an instance
+                    //     member of a class that implements an interface has
+                    //     an itable slot.
+                    if (vtableSlot_.count(cms) != 0) ok = false;
+                    if (ok && !isStaticMethod(cms) && cms->parent) {
+                        for (const sema::TypeSymbol* t = cms->parent; t;
+                             t = baseClassOf(t)) {
+                            for (const sema::TypeSymbol* b : t->baseTypes)
+                                if (b &&
+                                    b->kind == ast::TypeDeclKind::Interface)
+                                    ok = false;
+                            if (!ok) break;
+                        }
+                    }
+                    // (2) An IMPORTED callee's prologue was compiled by its
+                    //     own module and is not readable here (#7617).
+                    if (ctx_.isImported(cms)) ok = false;
+                    // (3) A `requires` clause (own or inherited) is evaluated
+                    //     in the ENTRY prologue, ahead of the root scope: on
+                    //     that raise the callee disposes nothing.
+                    if (!cms->inheritedRequiresClauses.empty()) ok = false;
+                    const auto* cmd =
+                        dynamic_cast<const ast::MethodDecl*>(cms->decl);
+                    if (!cmd) {
+                        ok = false;
+                    } else {
+                        for (const auto& c : cmd->contractClauses)
+                            if (c.kind == ast::ContractClause::Kind::Requires)
+                                ok = false;
+                        // (4) An EXPRESSION body opens no root scope, so it
+                        //     never enrolls a parameter disposal at all
+                        //     (#7707).
+                        if (cmd->bodyKind != ast::MethodBodyKind::Block)
+                            ok = false;
+                    }
+                    // (5) An ASYNC method's static initializer runs in its
+                    //     task entry, not at the call site's point.
+                    if (isAsyncMethod(cms)) ok = false;
+                    // (6) The checked-disposal receiver guard and the
+                    //     checked-contracts entry invariant are emitted ahead
+                    //     of the body, on an instance member.
+                    if (ok && !isStaticMethod(cms)) {
+                        if (checkedDisposal_) ok = false;
+                        if (checkedContracts_ && cms->parent &&
+                            cms->parent->kind == ast::TypeDeclKind::Class &&
+                            hasClassInvariant(cms->parent))
+                            ok = false;
+                    }
+                    calleeDisposes = ok;
+                }
+                // Not admitted: the caller's scope-end discharge is the sole
+                // one (the base's behaviour) — a leak, never a double free.
+                if (!calleeDisposes) return;
+            }
             Disposal d{slot, nullptr};
             d.owningChoice = true;
             d.owningChoiceTy = instRt->declaration;
             d.owningChoiceRef = instRt;
-            d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;
+            // The owning-choice arm of `emitDisposals` fires on BOTH the
+            // normal and the unwind exit (§28.3.10's auto-drop on the
+            // normal-exit edge, §28.3's exception-path discharge on the
+            // unwinding one); it consults `unwindOnly`, not
+            // `releaseOnUnwindOnly`. The flag carries the `owned` spelling's
+            // verdict so the two spellings register IDENTICALLY (§15.3
+            // *Parameter passing*: "A parameter declared `(owned x: V)` is
+            // identical to plain `(x: V)` for a move-only V"; §28.1 clause 1:
+            // "the modifier is admitted-but-redundant — the type's own move
+            // semantics already transfer the obligation").
+            d.releaseOnUnwindOnly =
+                (ps->modifier == "owned") ? !ps->autoDropAtScopeEnd : false;
             disposeStack_.front().push_back(d);
             return;
         }

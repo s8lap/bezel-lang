@@ -24749,7 +24749,8 @@ private:
     void markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call,
                                          bool atCallSite = false,
                                          sema::MethodSymbol* callee = nullptr,
-                                         bool baseQualified = false);
+                                         bool baseQualified = false,
+                                         bool admitPlainMoveOnly = false);
 
     // Does `emitMethodCall(ms, …, baseQualified, …)` reach its runtime target
     // through a vtable or itable slot (so the function that runs is whichever

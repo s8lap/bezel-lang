@@ -9702,7 +9702,8 @@ static bool importedMemberTypeAdmitsClosureDispatch(
 void Emitter::markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call,
                                               bool atCallSite,
                                               sema::MethodSymbol* callee,
-                                              bool baseQualified) {
+                                              bool baseQualified,
+                                              bool admitPlainMoveOnly) {
     if (!call.callee) return;
     // fix #6182 (§35.3 + §15.3 *Parameter passing*, v0.338): a CASE
     // CONSTRUCTION is a parameter passing too. §35.3: "a move-only value
@@ -9937,7 +9938,97 @@ void Emitter::markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call,
         if (ps->modifier == "ref" || ps->modifier == "out" ||
             ps->modifier == "out owned" || ps->modifier == "scoped")
             continue;
-        if (atCallSite && ps->modifier != "owned") continue;
+        // fix #7722 (§15.3 *Parameter passing*, §28.1 clause 1, v0.359): the
+        // PLAIN spelling of a MOVE-ONLY formal is the SAME by-value-move
+        // (transfer ownership) formal as the `owned` spelling, so the
+        // at-call-site form must admit it too — see the admission below.
+        //
+        // `plainMoveOnlyFormal` — this argument position is a PLAIN MOVE-ONLY
+        // formal, i.e. a by-value-move (transfer ownership) parameter written
+        // without the redundant `owned` marker (§15.3 *Parameter passing*;
+        // §28.1 clause 1). The
+        // callee owns the value it receives (fix #7722's callee-side arm), so
+        // the caller's source must be marked moved-from on EVERY path shape,
+        // and the two shape-specific skips below (the if-expression argument
+        // and the entry-throws guard) do not apply to it.
+        bool plainMoveOnlyFormal = false;
+        if (atCallSite && ps->modifier != "owned") {
+            // fix #7722: the PLAIN spelling of a MOVE-ONLY formal is the SAME
+            // by-value-move (transfer ownership) formal as the `owned` spelling,
+            // so at a call site that must mark the caller's source
+            // moved-from BEFORE the dispatch, the plain spelling needs the
+            // same admission.
+            //
+            // §15.3 *Parameter passing*: "A parameter declared `(owned x: V)` is
+            // identical to plain `(x: V)` for a move-only V; the modifier is
+            // admitted for documentation but is redundant." §28.1 clause 1
+            // ("Move-only value types"): "the modifier is admitted-but-
+            // redundant — the type's own move semantics already transfer the
+            // obligation." §15.3 again: "for a move-only V, it is by
+            // value-move (transfer ownership). The caller's argument
+            // expression is in moved-from state after the call." ⇒ the
+            // caller's source is moved-from at a plain move-only formal
+            // exactly as it is at an `owned` one, and this mark (the
+            // zero-store that leaves the caller's source moved-from) must
+            // cover the plain spelling too.
+            //
+            // BEFORE #7722 the plain spelling was skipped here, and the two
+            // consequences were MEASURED (on r30-c1 227d95a17 + the #7722
+            // callee-side fix):
+            //   * the `?.` path — whose ONLY mark is this at-call-site form
+            //     (it has no post-dispatch sweep: the `?.` call is lowered
+            //     from `lowerNullCondCall`, not from `lowerCall`) — left the
+            //     caller's source populated while the callee disposed the
+            //     value it had received: "heap-use-after-free ... READ of
+            //     size 8", freed by the callee (`bz$M.Holder$Take`), read by
+            //     the caller;
+            //   * a callee whose BODY throws left the caller's source
+            //     populated too — the post-dispatch sweep
+            //     (`markMoveOnlyChoiceArgsMovedFrom` with `atCallSite ==
+            //     false`, run in `lowerCall` AFTER the dispatch) runs only on
+            //     the normal-return edge, so the caller's scope-end disposal
+            //     and the callee's unwind disposal both fired: the same
+            //     use-after-free.
+            //
+            // The at-call-site form is emitted BEFORE the call ("the caller's
+            // owning-choice argument slots are zeroed HERE, at the 'call
+            // about to run' point, so the store dominates the callee's throw
+            // edge"), so admitting the plain spelling here makes the callee's
+            // own disposal the only one on both the normal and the unwind
+            // edge.
+            //
+            // `admitPlainMoveOnly` is the CALL SITE's vote: it is set only by
+            // the two at-call-site forms that must mark before the dispatch
+            // (the ordinary call path's, and the `?.` path's). Every other
+            // form — the post-dispatch sweep above all — keeps the base
+            // behaviour, where the plain spelling is marked by the general
+            // path below on the normal-return edge.
+            //
+            // THE GATE IS THE FORMAL'S OWN DECLARED TYPE, exactly as the
+            // #7538 gate below is: the callee's `registerUnwindOwnedParam`
+            // enrolls only a formal DECLARED with an owning-classified
+            // choice, so a formal that is not one (a bare type parameter `T`
+            // substituted to `OChoice`, a value-like choice, a class) is NOT a
+            // transfer formal here either.
+            if (!admitPlainMoveOnly) continue;
+            const sema::TypeRef* declared = ps->resolvedDeclType;
+            if (!declared && ps->declType)
+                declared = ctx_.resolvedType(*ps->declType);
+            bool moveOnlyFormal = false;
+            if (declared && declared->kind == sema::TypeRef::Kind::Named &&
+                declared->declaration &&
+                declared->declaration->kind == ast::TypeDeclKind::Choice) {
+                const sema::TypeRef* inst = resolveTypeParamRef(declared);
+                if (inst && inst->kind == sema::TypeRef::Kind::Named &&
+                    inst->declaration) {
+                    auto v = common::classifyChoiceType(inst, ctx_);
+                    moveOnlyFormal =
+                        v && *v == common::ChoiceClassification::Owning;
+                }
+            }
+            if (!moveOnlyFormal) continue;
+            plainMoveOnlyFormal = true;
+        }
         const sema::TypeRef* pt = ps->resolvedDeclType;
         if (!pt && ps->declType) pt = ctx_.resolvedType(*ps->declType);
         if (!pt) continue;
@@ -9975,8 +10066,31 @@ void Emitter::markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call,
         // leaks through such a callee), so marking would turn today's
         // caller-side disposal of `Take((if c then w else E))` into that
         // leak. It follows #6168's callee half.
-        if (dynamic_cast<const ast::ConditionalExpr*>(a.value.get())) continue;
-        if (atCallSite && calleeEntryMayThrow()) return;
+        //
+        // fix #7722: that reasoning was about a callee that does NOT dispose
+        // the parameter. With the callee-side arm (the callee now disposes
+        // the value it received), the caller's source must be marked
+        // moved-from on this shape too — otherwise the caller's scope-end
+        // disposal and the callee's own disposal both fire on the selected
+        // branch's value: a double free. The mark's ConditionalExpr arm
+        // (§20 *Ownership*: the selected branch moves) is the guarded
+        // zero-store, so the untaken branch keeps its value.
+        if (!plainMoveOnlyFormal &&
+            dynamic_cast<const ast::ConditionalExpr*>(a.value.get()))
+            continue;
+        // The entry-throws guard keeps the caller's value when the callee
+        // might not dispose it (an entry that raises before the callee's root
+        // scope opens: an arrow body, a dynamic dispatch, an imported callee, a
+        // `requires` clause, a raising static initializer). That premise still
+        // holds for the PLAIN move-only spelling, so the guard is NOT
+        // bypassed for it: marking the caller's source moved-from at such a
+        // callee would leave the value owned by NOBODY (the callee's root
+        // scope never opened, so it never enrolled the disposal), which is a
+        // leak. The guard's own residual — a callee that does open its root
+        // scope and then throws in its body — is the #7538 family's, and the
+        // block-body callee this lane's rows use is not that case.
+        if (atCallSite && calleeEntryMayThrow())
+            return;
         if (hoistStaticInit) {
             emitEnsureStaticInit(ms->parent);
             hoistStaticInit = false;  // once, ahead of the first zero-store
@@ -19062,9 +19176,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // edge (see `markMoveOnlyChoiceArgsMovedFrom`). Handed the `ms` the call
     // below is handed (the §11.8 redirect above may have replaced the AST's),
     // and `baseQualified`, so it decides on the function the call emits.
+    //
+    // fix #7722 (§15.3 *Parameter passing*, §28.1 clause 1, v0.359): this is
+    // the ordinary path's PRE-call mark for the PLAIN spelling of a move-only
+    // formal. The post-dispatch sweep below (in `lowerCall`, AFTER the
+    // dispatch) marks the plain spelling on the NORMAL-return edge only, so
+    // without this pre-call mark a callee whose BODY throws leaves the
+    // caller's source populated: the caller's scope-end disposal and the
+    // callee's unwind disposal both fire (a heap-use-after-free).
     if (!diverged_)
         markMoveOnlyChoiceArgsMovedFrom(call, /*atCallSite=*/true, ms,
-                                        baseQualified);
+                                        baseQualified,
+                                        /*admitPlainMoveOnly=*/true);
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs,
                                          call.span.begin, thisReceiver,
                                          argBoxCallIdx);
@@ -27758,9 +27881,27 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     // argument at all and registers nothing, exactly as §7.5 requires.
     CallClosureArgRelease clRel =
         prepareCallClosureArgRelease(ms, args, argExprs, call);
+    // fix #7722 (§15.3 *Parameter passing*, §28.1 clause 1, v0.359): the `?.`
+    // twin of the ordinary path's PLAIN move-only mark. This path has NO
+    // post-dispatch sweep (the ordinary path's runs in `lowerCall`, AFTER the
+    // dispatch — and the `?.` call is lowered from `lowerNullCondCall`, not
+    // from `lowerCall`), so before #7722 the `?.` spelling never marked the
+    // caller's source at a PLAIN move-only formal: the caller kept the value
+    // and disposed it at its own scope end, while the callee disposed the
+    // value it had received — "heap-use-after-free ... READ of size 8", freed
+    // by the callee and read by the caller (MEASURED on r30-c1 227d95a17 +
+    // the #7722 callee-side arm, on `h?.Take(b)`).
+    //
+    // The admission adds the PLAIN spelling to the at-call-site form; the
+    // `owned` spelling keeps the form's own entry-throws guard (the #7538
+    // family's residual is not this lane's to move), and the `owned` spelling's
+    // own mark above is unchanged. An owning-choice result is no longer
+    // excluded here: #8920 wraps that result on this path, so the mark applies
+    // to it as to any other `?.` call.
     if (!diverged_)
         markMoveOnlyChoiceArgsMovedFrom(call, /*atCallSite=*/true, ms,
-                                        /*baseQualified=*/false);
+                                        /*baseQualified=*/false,
+                                        /*admitPlainMoveOnly=*/true);
     llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false, &argExprs,
                                     call.span.begin, /*thisReceiver=*/false,
                                     argBoxCallIdx);
