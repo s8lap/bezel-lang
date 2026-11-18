@@ -19779,6 +19779,13 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
                         !calleeBodyUsesFormalOnlyByInvocation(*mdCb, p.name))
                         continue;
                 }
+                // fix #8843 (§28.9 / §8.1 / §27.5, v0.359): an `Object` formal
+                // whose callee only null-/type-tests it. Not function-typed,
+                // so the checks above skipped it and the literal's +1 leaked
+                // (64 B per call). The predicate carries the whole proof.
+                if (!formalIsFunction &&
+                    isObjectFormalInspectOnlyArgPosition(call, pi))
+                    formalIsFunction = true;
                 if (!formalIsFunction) continue;
                 if (argExprs[ai] && isPlusOneClosureProducer(argExprs[ai]))
                     rel.callBounded.push_back(args[ai]);

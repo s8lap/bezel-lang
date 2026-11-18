@@ -36478,6 +36478,49 @@ bool Emitter::isCallBoundedClosureArgPosition(const ast::CallExpr& call,
 }
 
 
+// fix #8843 (§28.9 / §8.1 / §27.5, v0.359): see the declaration in
+// LlvmBackend_impl.hpp. A lambda LITERAL passed straight to an `Object` formal
+// is a +1 temporary nobody drops: the formal is not function-typed, so neither
+// #1073's call-bounded arm nor the capture-cell pre-scan admitted it (64 B per
+// call, measured 12800 B / 200 iterations). The soundness argument is the
+// closure-LOCAL arm (c) of closureArgBindsMethodOwnTypeParamBorrow (#8743),
+// not a new one: an `Object` formal has no sema call-bounded backstop (§28.14
+// covers function-typed formals), so the callee-body walk is the whole proof
+// and it fails closed on every use but a null test / type test of the formal.
+// The literal is released at the call's end, so a callee that returned a lazy
+// frame (declared return other than none / primitive) is declined as well.
+bool Emitter::isObjectFormalInspectOnlyArgPosition(const ast::CallExpr& call,
+                                                   std::size_t ai) const {
+    if (!call.callee) return false;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+    if (!ms || ms->isOperator || ctx_.isImported(ms)) return false;
+    // SEAM-ACCESSOR: the imported case is declined on the line above; this AST
+    // read is reached only for a locally compiled callee (as the sibling).
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md) return false;
+    if (isAsyncMethod(ms)) return false;
+    if (md->bodyKind == ast::MethodBodyKind::Block && containsYield(md->stmts))
+        return false;
+    if (!md->genericParams.empty() || (ms->parent && !ms->parent->genericParams.empty()))
+        return false;
+    if (md->returnType) {
+        const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
+        if (!rt || rt->kind != sema::TypeRef::Kind::Primitive) return false;
+    }
+    if (call.args.size() != md->params.size() || ai >= md->params.size())
+        return false;
+    for (const auto& a : call.args)
+        if (!a.name.empty() || !a.modifier.empty() || a.isDiscard) return false;
+    const ast::Param& p = md->params[ai];
+    if (!p.modifier.empty() || !p.type) return false;
+    const sema::TypeRef* ft = ctx_.resolvedType(*p.type);
+    if (!ft || ft->kind != sema::TypeRef::Kind::Primitive ||
+        ft->primitive != sema::PrimitiveType::Object)
+        return false;
+    return calleeBodyUsesFormalOnlyByInvocationOrInspection(*md, p.name);
+}
+
+
 // #429 (closure RETURN category) / §28.9 / §28.3: see the declaration in
 // LlvmBackend_impl.hpp. A returned IDENTIFIER names a closure-typed LOCAL
 // that owns a +1 in its slot when EITHER its initializer is a +1 closure

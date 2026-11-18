@@ -22209,6 +22209,18 @@ private:
     // this into arming.
     bool isCallBoundedClosureArgPosition(const ast::CallExpr& call,
                                          std::size_t ai) const;
+    // fix #8843 (§28.9 / §8.1 / §27.5, v0.359): the `Object`-formal sibling of
+    // isCallBoundedClosureArgPosition. True when argument `ai` of `call` is
+    // bound to a plain `Object` / `Object?` formal of a locally compiled,
+    // non-virtual, non-async, non-iterator user method with no declared return
+    // or a primitive one, whose body only null-tests / type-tests the formal
+    // (calleeBodyUsesFormalOnlyByInvocationOrInspection). A closure literal
+    // there is held by nobody once the call returns (§8.1: the callee receives
+    // the very cell), so the caller's +1 is the one to drop. Same fail-closed
+    // shape as closureArgBindsMethodOwnTypeParamBorrow's arm (c), which proves
+    // it for a closure LOCAL.
+    bool isObjectFormalInspectOnlyArgPosition(const ast::CallExpr& call,
+                                              std::size_t ai) const;
     // #429 (closure RETURN category) / §28.9 / §28.3: true when the returned
     // expression is an identifier naming a closure-typed local whose slot
     // already owns a +1 — either initialized by a +1 closure producer (lambda /
