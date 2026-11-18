@@ -37927,6 +37927,75 @@ bool Emitter::isUserMethodClosureReturnCall(const ast::Expr* init) const {
 bool Emitter::isLambdaClosureReturnCall(const ast::Expr* init) const {
     auto* call = dynamic_cast<const ast::CallExpr*>(init);
     if (!call || !call->callee) return false;
+    // fix #8870 / #8893 (§27.5 / §28.9, v0.359): the IMMEDIATELY-INVOKED
+    // lambda twin — the callee is a LAMBDA LITERAL invoked at its own
+    // construction site (`(lambda(): () -> int => lambda() => 3)()`), not a
+    // name that denotes a lambda. The callee is still a lambda, and the body
+    // that runs is the SAME body the named twin runs, so it mints the SAME
+    // single +1 for a function-typed result — the caller owns that one
+    // reference and must release it (§28.9, v0.359: "the type's lifetime is
+    // managed by the runtime without user involvement" — runtime management
+    // governs "the heap-allocated closure object that backs" a function-typed
+    // value; §27.3, v0.359: a lambda's return-type ascription may be a
+    // function type, so the lambda's result may itself be a closure).
+    //
+    // MEASURED on this fix's base (r30-c1 @ e1bbf3711), `bezelc
+    // --sanitize=address`:
+    //   var f: () -> int := (lambda(): () -> int => lambda() => 3)();
+    //     -> "SUMMARY: AddressSanitizer: 64 byte(s) leaked in 1
+    //        allocation(s)."  (the closure cell the IIFE's body minted)
+    //   var g: () -> () -> int := lambda(): () -> int => lambda() => 3;
+    //   var f: () -> int := g();        <- the NAMED twin: CLEAN.
+    //
+    // WHY THE NAMED TWIN WAS CLEAN AND THE IIFE WAS NOT. Both spellings run
+    // the same lambda body, so both mint one +1. The named twin's call
+    // (`g()`) has an IdentifierExpr callee naming a lambda-typed local, which
+    // this predicate admitted; the IIFE's call has a LambdaExpr callee, which
+    // it declined — so `collectClosureReleaseEligible`'s producer walk never
+    // made the local a candidate, no scope-end `bz_closure_release` was
+    // armed, and the +1 was never dropped. The defect is a MISSING
+    // RECOGNIZER, not a missing mint; the mint was always there.
+    //
+    // SOUNDNESS. The result type is derived exactly the way `lowerLambda`
+    // derives the closure entry's return type (LlvmBackend_Exprs2.cpp): the
+    // §27.3 ascription when present, else the expression body's own sema
+    // type, else the lambda type's funcReturn. That is the SAME type the
+    // body's own mint gate reads (`retSemaTy->kind == Function`), so the
+    // predicate and the mint agree by construction: when the result is a
+    // function type the body either TRANSFERS a producer's +1 (a lambda /
+    // method-ref body), MINT one by retain (a field / parameter / call body),
+    // or TRANSFERS a closure local's +1
+    // (`returnedClosureLocalOwnsPlusOne`) — in every case the IIFE's result
+    // carries exactly one reference the caller owns. A non-function result
+    // (an `int`, a `string`, a `Task<…>`) is declined, exactly as the named
+    // twin's `rt->funcReturn->kind == Function` gate declines it: releasing
+    // a non-closure would free a value the callee still references (the UAF
+    // `isPlusOneClosureProducer`'s own comment declines the blanket
+    // "every closure-valued call is a +1 producer" for).
+    //
+    // A NULLABLE function result is declined, line for line with the named
+    // twin's gate: `bz_closure_release` is null-safe, but a nullable result
+    // is not the uniform +1 the gate above establishes.
+    if (auto* iifeLam =
+            dynamic_cast<const ast::LambdaExpr*>(call->callee.get())) {
+        const sema::TypeRef* lamTy = ctx_.exprType(*iifeLam);
+        if (!lamTy || lamTy->kind != sema::TypeRef::Kind::Function)
+            return false;
+        const sema::TypeRef* ret = nullptr;
+        if (iifeLam->retType || iifeLam->isAsync) {
+            // An §27.3 ascription (or an async lambda's Task<T> wrapper) is
+            // the lambda type's own funcReturn.
+            ret = lamTy->funcReturn;
+        } else if (iifeLam->exprBody) {
+            // An un-ascribed expression body: the body's own sema type, the
+            // same value `lowerLambda` puts in `retSemaTy`.
+            ret = ctx_.exprType(*iifeLam->exprBody);
+        } else {
+            ret = lamTy->funcReturn;
+        }
+        return ret && !ret->nullable &&
+               ret->kind == sema::TypeRef::Kind::Function;
+    }
     // A bare reference to a lambda-typed LOCAL or PARAMETER — an
     // IdentifierExpr naming a LocalSymbol or ParameterSymbol. A method-ref
     // (MemberAccessExpr `T.M` / `obj.M`) is handled by

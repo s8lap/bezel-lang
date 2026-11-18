@@ -22496,6 +22496,16 @@ private:
     // (a LocalSymbol / ParameterSymbol holding a known +1 cell) is the
     // statically-known case the decline was protecting AGAINST this fix
     // misfiring on.
+    // fix #8870 / #8893 (§27.5 / §28.9, v0.359): the IMMEDIATELY-INVOKED
+    // lambda twin — the callee is a lambda LITERAL invoked at its own
+    // construction site (`(lambda(): () -> int => lambda() => 3)()`). Same
+    // body as the named twin, same single +1 for a function-typed result, so
+    // the same release obligation; the result type is derived exactly as
+    // `lowerLambda` derives the closure entry's return type, so the
+    // predicate and the body's mint agree by construction. The IIFE's
+    // RESULT is the value released here — a conditional-callee IIFE
+    // (`(if c then lambda.. else lambda..)()`, #8892) leaks its CALLEE
+    // instead and is a different defect.
     bool isLambdaClosureReturnCall(const ast::Expr* init) const;
     // fix #3927 (§27.5 / §28.9, v0.295): awaited sibling of the two predicates
     // above. `var g := await f();` is the Task<closure>-consumer shape (#3788 /
