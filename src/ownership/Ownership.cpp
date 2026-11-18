@@ -16421,6 +16421,93 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // fix #8813 (§28.8.1 / §28.3 K3.1 / §28.3 K7.4, v0.359): the
+        // OWNED-FIELD STORE consume — the lambda-body twin of the method-level
+        // `handleAssignment` arm `targetIsOwnedField` → `handleOwnedFieldAssignment`.
+        //
+        // §28.8.1: "The replacement `e` is an owned value for the location's
+        // declared type: a fresh producer, a `move` result, a named owned
+        // binding — the position is marker-free, as every store into an owned
+        // location is (K3.1: the binding is left moved-from, and the freeze
+        // applies)". So a bare read of an owned LOCAL stored into an `owned`
+        // field is a MOVE-OUT of that local (K3.1's consume-table row for
+        // "store into an `owned` field"): the binding is left moved-from, and
+        // the field's owner disposes the value from then on.
+        //
+        // WHAT WAS WRONG. The ownership pass's dataflow never enters a lambda
+        // body ("ownership's statement walks never enter a lambda body"), so
+        // the method-level `handleOwnedFieldAssignment` never ran for a store
+        // written inside a lambda body: the local stayed Owned, the §28.3
+        // affine auto-drop kept flagging it for the scope-end disposal, and
+        // the lambda frame's scope-end free ran ALONGSIDE the field's own
+        // disposal. MEASURED (issue #8813, `--sanitize=address`): "attempting
+        // double-free", the first free the lambda frame's scope-end
+        // `bz_array_free` (in the inlined lambda scope end), the second
+        // `C.DisposeCore` — the field's owner disposing the same array. The
+        // byte-identical METHOD-body twin is clean 5/5.
+        //
+        // WHY IT IS HERE. `handleOwnedFieldAssignment` is the ONE authority
+        // for the rule — its BORROW half already reaches a lambda body
+        // through #8797's channel in `scanLambdaBodyBorrowStores`, which calls
+        // the same function with the same predicate; only the REACH of its
+        // LEGAL (owned) half was missing. `borrowAlreadyFlagged=true` keeps
+        // the borrow case silent here: that diagnostic belongs to the #8797
+        // channel, which words it with the §28.3 lifetime rule.
+        //
+        // SCOPE. Only the lambda body's OWN frame. A CAPTURED binding is
+        // uniformly in BORROW state inside the closure (§28.3 *Captured owned
+        // bindings*: "a captured owned binding … is uniformly in borrow
+        // state") and is the #8797 channel's business, not this consume;
+        // `lambdaCapturedSyms_` names exactly the captured symbols.
+        if (as->target && as->value && targetIsOwnedField(*as->target)) {
+            // §17.8: `x!` classifies exactly as `x` at a marker-free position,
+            // so peel a single `!` to the underlying identifier — the same peel
+            // `handleOwnedFieldAssignment` performs on the RHS.
+            const auto* srcId = dynamic_cast<const ast::IdentifierExpr*>(
+                lookThroughForceUnwrap(as->value.get()));
+            if (srcId) {
+                sema::Symbol* srcSym = ctx_.exprSymbol(*srcId);
+                if (srcSym && !lambdaCapturedSyms_.count(srcSym)) {
+                    // The scope-end disposal must STAY registered: the
+                    // transfer happens on the stored path only, so §28.3's
+                    // scope-end disposal has to be PER-PATH (K7.4: "a
+                    // transferred value is left in moved-from state so the
+                    // scope-end disposal skips it"). The codegen twin
+                    // (`nullTransferredOwnedLocalSlot` at the owned-field
+                    // store) vacates the source slot on the stored path, and
+                    // the null-guarded scope-end disposal then frees the
+                    // value on the not-stored path — exactly once either way.
+                    //
+                    // Pre-set the flag HERE (the affine auto-drop sweep runs
+                    // LATER in `run()` and would SKIP this local, because the
+                    // consume below records it as discharged — `markMovedByName`
+                    // inserts it into the persistent `everDischarged_` set).
+                    // The flag is also what `seedLambdaBodyOwnedLocals`'s
+                    // `localIsOwnedObligation` reads, so the §28.3 *Captured
+                    // owned bindings* rejection of a SAME-FRAME owned local
+                    // stored into a field (#3800's twin, pinned by
+                    // `tests/lit/ownership/lambda_body_escape_3800__same_frame_
+                    // owned_field_store_in_lambda_body_rejected.bzl`) keeps
+                    // firing. A `using var` is excluded: it is scope-bound
+                    // (§28.3 axiom A5) and the consume below rejects it with
+                    // the method twin's own "cannot move out of `using var`"
+                    // error, so its disposal registration is not this fix's
+                    // business. // per §28.3 K7.4, §28.9, §17.8, v0.359
+                    if (auto* sls =
+                            dynamic_cast<sema::LocalSymbol*>(srcSym)) {
+                        if (auto* sld =
+                                dynamic_cast<const ast::LocalDecl*>(
+                                    sls->decl)) {
+                            if (!sld->isUsing)
+                                const_cast<ast::LocalDecl*>(sld)
+                                    ->autoDropAtScopeEnd = true;
+                        }
+                    }
+                    handleOwnedFieldAssignment(
+                        *as, /*borrowAlreadyFlagged=*/true);
+                }
+            }
+        }
         if (as->target) {
             std::vector<const ast::LambdaExpr*> nestedLambdas;
             collectBodyLambdasExpr(*as->target, nestedLambdas);

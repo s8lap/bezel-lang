@@ -12103,7 +12103,64 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         callBoundedFormal = true;
                 }
             }
-            llvm::Value* v = lowerExpr(*a.value);
+            // fix #8813 (§15.4 / §28.3 *Unbound owned temporaries*, v0.359): a
+            // COLLECTION-LITERAL argument to a function VALUE.
+            //
+            // §15.4: a collection literal has no standalone type — it is
+            // CONTEXT-TYPED by the position it is written in. `lowerExpr`
+            // returns null for a `CollectionLiteralExpr` (it names no target
+            // type of its own), so the literal has to be MATERIALIZED against
+            // the formal's resolved type, exactly as the method-call path
+            // (`buildOrderedArgs`, LlvmBackend_Assign.cpp) and the
+            // imported-callee path (LlvmBackend_Calls2.cpp's own
+            // `materializeCollectionLiteralForArg` arm) do.
+            //
+            // WITHOUT this arm the whole call was abandoned: the null `v` fell
+            // through the unit-rescue and the `if (!v) return nullptr;` guard,
+            // so `f([1, 2, 3])` — a call through a function-typed local — never
+            // ran its callee at all. MEASURED (issue #8813): the callee's
+            // store into an `owned` field never reached the field, and the
+            // program's value was lost — "Unhandled exception:
+            // System.NullReferenceException" (exit 70) for the
+            // `Console.WriteLine(h.saved!.Count)` twin, and a zero result with
+            // "internal: return-value expression failed to lower to a value
+            // … #2491" for the `return f([1, 2, 3]);` twin. The
+            // byte-identical METHOD-call twin (`C.Take([1, 2, 3])`) works.
+            //
+            // The disposal of the materialized temporary follows the formal's
+            // mode, exactly as the method-call path does: an `owned` formal
+            // takes ownership (the callee disposes it), a borrow formal
+            // borrows it, so the caller disposes the temp once at scope exit.
+            llvm::Value* v = nullptr;
+            if (auto* argLit =
+                        dynamic_cast<const ast::CollectionLiteralExpr*>(
+                            a.value.get());
+                argLit && pi < rt->funcParams.size() &&
+                    rt->funcParams[pi].type) {
+                const sema::TypeRef* formalTy =
+                    resolveTypeParamRef(rt->funcParams[pi].type);
+                v = materializeCollectionLiteralForArg(argLit, formalTy);
+                if (v) {
+                    // Spill the collection pointer to a slot (the disposal
+                    // entry frees through the alloca, mirroring a `using var`
+                    // local's slot).
+                    llvm::AllocaInst* litSlot = entryAlloca(v->getType());
+                    builder_.CreateStore(v, litSlot);
+                    // fix #5292 / §28.3 *Unbound owned temporaries* rule 1,
+                    // §30.1 (v0.313): the borrow-parameter literal temporary
+                    // is disposed at scope end, possibly after a LATER
+                    // argument's suspension, so its disposal slot must live in
+                    // the async frame.
+                    const std::string_view formalMod =
+                        rt->funcParams[pi].modifier;
+                    if (smStateStruct_ && formalMod != "owned")
+                        asyncHandlerSpillSlots_.push_back(litSlot);
+                    if (formalMod != "owned" && !disposeStack_.empty())
+                        disposeStack_.back().push_back(
+                            buildCollectionTempDisposal(litSlot, formalTy));
+                }
+            }
+            if (!v) v = lowerExpr(*a.value);
             // fix #5347: emit the borrowed-string pin BEFORE the unit rescue
             // and boxing.  The retain must be on the value `lowerExpr` returned —
             // `boxForTarget` may replace `v` with a boxed copy; the retain is

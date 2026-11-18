@@ -2719,6 +2719,68 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             nullTransferredOwnedLocalSlot(as->value.get());
                     }
                 }
+                // fix #8813 (§28.8.1 / §28.3 K3.1 / K7.4, v0.359): the same
+                // vacate for a bare owned LOCAL source — the lambda-body twin
+                // of the `owned`-parameter arm above.
+                //
+                // §28.8.1: a store into an owned location is a MARKER-FREE
+                // position, and "K3.1: the binding is left moved-from, and the
+                // freeze applies" — so `this.saved := ys;` over an owned local
+                // `ys` MOVES the value into the field: the field's owner
+                // disposes it from then on, and the local's own scope-end
+                // disposal must not.
+                //
+                // The ownership pass's dataflow never enters a lambda body, so
+                // the method-level `handleOwnedFieldAssignment` never marked
+                // such a local moved-from: the §28.3 affine auto-drop kept
+                // flagging it (`autoDropAtScopeEnd`), the lambda frame's
+                // scope-end free ran, and the field's disposal freed the same
+                // value again — MEASURED (issue #8813, `--sanitize=address`):
+                // "attempting double-free", the first free the lambda scope
+                // end's `bz_array_free`, the second `C.DisposeCore`. The
+                // byte-identical METHOD-body twin is clean: there the local is
+                // marked moved-from, so the scope-end disposal is never
+                // registered at all.
+                //
+                // Vacating the slot here makes the lambda path match the
+                // method twin's OUTCOME, and — because the disposal is
+                // null-guarded — keeps it PER-PATH (§28.3 K7.4: "scope-end
+                // disposal is per-path"): the stored path skips the disposal
+                // (the field owns the value) and the not-stored path still
+                // disposes it, exactly once. This is the same mechanism (and
+                // the same helper) the `owned`-parameter arm above uses.
+                //
+                // GATED on `autoDropAtScopeEnd` — the flag the ownership pass
+                // sets on a plain `var` owned local whose scope-end disposal
+                // is registered (codegen's `registerUsingDisposal` arm). A
+                // method-body local stored into an owned field does NOT carry
+                // it (the method-level dataflow marked it moved-from, so the
+                // affine auto-drop never flagged it and no scope-end disposal
+                // is registered there) — so this arm reaches the LAMBDA path
+                // only, and the method path is untouched. §17.8: `x!`
+                // classifies exactly as `x` at a marker-free position, so peel
+                // a single `!` to the underlying identifier.
+                if (as->value && !as->valueHasOwnedMarker &&
+                    isOwnedFieldStoreTarget(*as->target)) {
+                    const ast::Expr* srcExpr = as->value.get();
+                    if (auto* pb =
+                            dynamic_cast<const ast::PostfixBangExpr*>(srcExpr))
+                        srcExpr = pb->operand.get();
+                    if (auto* vid =
+                            dynamic_cast<const ast::IdentifierExpr*>(srcExpr)) {
+                        if (auto* vls =
+                                dynamic_cast<sema::LocalSymbol*>(
+                                    ctx_.exprSymbol(*vid))) {
+                            if (auto* vld =
+                                    dynamic_cast<const ast::LocalDecl*>(
+                                        vls->decl)) {
+                                if (!vld->isUsing &&
+                                    vld->autoDropAtScopeEnd)
+                                    nullTransferredOwnedLocalSlot(srcExpr);
+                            }
+                        }
+                    }
+                }
                 // fix #4646 (§22.16, v0.307): the §22.16 AUTO-PROPERTY setter
                 // NORMAL-EXIT boundary. This is the end of the whole `:=` store
                 // sequence, so the instance is observed in the state the store
