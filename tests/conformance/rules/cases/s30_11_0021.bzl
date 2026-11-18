@@ -8,6 +8,7 @@
 //! stdout: 8
 //! issue: 8671
 module Conf;
+import System.Threading;
 
 public class Program
   public static method Get(): int

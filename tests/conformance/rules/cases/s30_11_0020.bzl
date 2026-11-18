@@ -8,6 +8,7 @@
 //! stdout: 7
 //! issue: 8671
 module Conf;
+import System.Threading;
 
 public class Program
   public static async method Get(): Task<int>
