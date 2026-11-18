@@ -21665,9 +21665,23 @@ private:
     // function does not attempt, so the flag must stay false there; arming
     // it unconditionally would double-free a value the ruling says the
     // consumer now owns.
+    // fix #7558 (§27.5 / §28.9, v0.359): `lambdaCaptureBorrow` lets the
+    // Array-literal candidates loop (and the safe-view-alias walk it feeds)
+    // treat a SAFE READ of the tracked local inside a lambda body as a borrow
+    // when `captureCellFreeNonEscaping` holds for it. Passed true ONLY by the
+    // call sites that run collectCellFreeEligible FIRST (the method and
+    // constructor bodies in LlvmBackend_Setup.cpp), because that predicate
+    // reads `cellFreeEligible_`; every other site leaves it false and keeps
+    // the conservative "a capture is an escape" verdict.
     void collectBorrowingArrayFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
-        bool yieldIsBorrowIterYield = false);
+        bool yieldIsBorrowIterYield = false,
+        bool lambdaCaptureBorrow = false);
+    // fix #7558: true iff `decl` (a captured local's declaration node) is a
+    // member of `cellFreeEligible_` for the function being emitted — every
+    // lambda capturing it is non-escaping — and no `TaskScope.Spawn` capture
+    // makes its cell unwind-unsafe (`unwindUnsafeCellFree_`).
+    bool captureCellFreeNonEscaping(const void* decl) const;
     // fix #2802 / §21.1 / §28.9 / §15.4: a tiny POD view over a local
     // declaration's initialization, holding exactly the fields every
     // eligibility recognizer (isFreshGroupingTerminalLocal,
@@ -21873,7 +21887,8 @@ private:
     void collectSafeViewAliases(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         const ast::Node* arrLd,
-        std::unordered_set<const void*>& out);
+        std::unordered_set<const void*>& out,
+        bool lambdaCaptureBorrow = false);
     // #1003: true if the local described by `view` binds a plain `var` whose
     // resolved type is a borrowing bz_array_t-backed collection (`Array`/`Stack`/
     // `Queue`, NOT an `Owned*` family, NOT dict-backed Dictionary/Set/

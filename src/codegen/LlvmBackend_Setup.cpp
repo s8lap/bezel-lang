@@ -11801,7 +11801,8 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         collectRecordCallResultReleaseEligible(*ci.stmts);  // fix #1747
         collectInlineArrayStringCallResultReleaseEligible(*ci.stmts);  // fix #4296
         collectValueLikeChoiceCallResultReleaseEligible(*ci.stmts);  // fix #2428
-        collectBorrowingArrayFreeEligible(*ci.stmts);  // #1003
+        // fix #7558: the borrowing-array walk now runs AFTER
+        // collectCellFreeEligible (see below) — it consults `cellFreeEligible_`.
         // fix #4434 (§27.5 / §28.9, v0.298): walk closure-typed locals to
         // classify captured-cell status BEFORE the recursive
         // `collectClosureReleaseEligible(lam.stmts)` calls inside lowerLambda
@@ -11818,6 +11819,13 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         collectDefinitelyEscapingLambdas(*ci.stmts);  // #694
         // Must run AFTER collectClosureReleaseEligible (uses the result).
         collectCellFreeEligible(*ci.stmts);
+        // fix #7558 (§27.5 / §28.9, v0.359): moved here from before
+        // collectCapturedCellClosureLocals (#1003). Nothing between the two
+        // positions reads `borrowingArrayFreeEligible_`; the walk needs
+        // `cellFreeEligible_` so a borrowed Array local captured only by
+        // non-escaping lambdas is still reclaimed at scope end.
+        collectBorrowingArrayFreeEligible(*ci.stmts, /*yieldIsBorrowIterYield=*/false,
+                                          /*lambdaCaptureBorrow=*/true);  // #1003
     }
 
     // fix #633 / §33.4: Main(args: Array<string>) has C ABI signature
@@ -13770,7 +13778,8 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     // function — same staleness discipline every method-body call applies.
     borrowingArrayFreeEligible_.clear();
     borrowingArrayFreeEligibleFn_ = fn;
-    collectBorrowingArrayFreeEligible(cd->body);
+    collectBorrowingArrayFreeEligible(cd->body, /*yieldIsBorrowIterYield=*/false,
+                                      /*lambdaCaptureBorrow=*/true);  // fix #7558
 
     // §22.16 (v0.203, #2053): a constructor's `requires` clauses evaluate
     // AFTER argument binding completes and BEFORE any of the member's own
@@ -31971,6 +31980,22 @@ struct StringEscapeWalker {
     // their own unrelated relaxations — this one is scoped narrowly to the
     // single new YieldStmt arm below and defaults false everywhere else.
     bool yieldIsBorrowIterYield = false;
+    // fix #7558 (§27.5 / §28.9, v0.359): OPT-IN, borrowingArrayMode-ADJACENT
+    // relaxation of the FINDING [1] rule above. A SAFE-READ of the tracked
+    // local inside a lambda body (a method receiver, a `?.` receiver, a
+    // comparison operand: `a.Count`, `c?.Count`, `c.Sum()`) is not an escape
+    // when `captureNonEscaping(target)` holds, i.e. when
+    // collectCellFreeEligible proved every lambda capturing the target is
+    // non-escaping (`cellFreeEligible_`): each such closure is released
+    // before the owner scope ends, so the env's alias of the borrowed backing
+    // never outlives the scope-end `bz_array_free`. The capture cell is then
+    // freed AFTER that disposal (consumeLastLambdaCapturedCells'
+    // `hasOwnerDisposal` -> `boxedCellFreeDeferred`, the #1017 second pass).
+    // An UNSAFE read (`return a`, `var b := a`, an escaping call argument)
+    // still escapes: only the `inLambda` OVERRIDE is lifted, not the
+    // safe-read test. Null / false for every other walk, leaving them
+    // bit-identical.
+    const std::function<bool(const void*)>* captureNonEscaping = nullptr;
     // #1997 / §4.6 / §28.9 / §28.3 (v0.197): OPT-IN gate for the plain-`:=`
     // reassignment relaxation below (treat a reassignment of the tracked local as
     // NOT an escape, so the local stays scope-end-release eligible). Sound ONLY for
@@ -34298,7 +34323,13 @@ struct StringEscapeWalker {
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
             // FINDING [1]: inside a lambda body, a captured-local read always
             // escapes — the env outlives the scope (safe-read does not apply).
-            if (isTargetIdent(id) && (!safeRead || inLambda)) escaped = true;
+            // fix #7558: unless the capture is proven non-escaping and the
+            // read is a safe read (see `captureNonEscaping`).
+            if (isTargetIdent(id) &&
+                (!safeRead ||
+                 (inLambda &&
+                  !(captureNonEscaping && (*captureNonEscaping)(target)))))
+                escaped = true;
             return;
         }
         // Concat / comparison: both operands are non-consuming reads.
@@ -47041,9 +47072,18 @@ void Emitter::freeUnboundOwnedOwningCollectionTemp(llvm::Value* v,
 // position read (`a.Length`, `a[i]`, `for var x in a`, a method/property receiver)
 // stays eligible — for those, the local is provably the sole owner of the backing,
 // so freeing it once at scope end is free of UAF and of double-free.
+bool Emitter::captureCellFreeNonEscaping(const void* decl) const {
+    // fix #7558: `cellFreeEligibleFn_` names the function whose pre-scan
+    // populated the set; a verdict recorded for another body is no verdict.
+    if (!currentFn_ || currentFn_ != cellFreeEligibleFn_) return false;
+    return cellFreeEligible_.count(decl) != 0 &&
+           unwindUnsafeCellFree_.count(decl) == 0;
+}
+
 void Emitter::collectBorrowingArrayFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
-        bool yieldIsBorrowIterYield) {
+        bool yieldIsBorrowIterYield,
+        bool lambdaCaptureBorrow) {
     borrowingArrayFreeEligible_.clear();
     // fix #4308 sibling: OWNING-array twin (see member declaration comment).
     groupByToArrayFreeEligible_.clear();
@@ -47057,6 +47097,11 @@ void Emitter::collectBorrowingArrayFreeEligible(
     literalTreeAggregateEligible_.clear();  // #2660
     dictFlatValueFreeSafe_.clear();  // fix #5106 follow-up
     // fix issue 2802 / §21.1: the eligibility sets are keyed on the AST node pointer (const void*), and the consumers (escape walker's `target`, collectSafeViewAliases, lowerLocalDecl's `dictLiteralFreeEligible_` lookup, ...) all compare via `const void*` — so widening the candidate vector type from `const ast::LocalDecl*` to `const ast::Node*` admits §21.1 `const` locals (LocalConstDecl, a different Stmt subtype) without changing any downstream pointer-identity comparison. The pre-issue-2802 type was the local reason the dict-literal form below elided a `const` binding: collectBorrowingArrayFreeEligible's scan lambda only matched LocalDecl, so a `const d: Dictionary<K,V> := [k:v, ...]` (the issue's measured repro: 832 KB / 10000 allocs leaked per 2000 iters) was never added to dictLiteralCandidates, the escape-walk never ran for it, and dictLiteralFreeEligible_ never received it — the literal's table was allocated by materializeHeapDictLiteral but never reclaimed, exactly the issue's defect. Admitting const locals here is the fix for issue 2802.
+    // fix #7558: the walker's non-escaping-capture predicate (see the walker
+    // field `captureNonEscaping`); only the Array-literal `candidates` loop and
+    // its safe-view alias walk are handed it.
+    const std::function<bool(const void*)> captureNonEscaping =
+        [this](const void* d) { return captureCellFreeNonEscaping(d); };
     std::vector<const ast::Node*> candidates;
     std::vector<const ast::Node*> dictCandidates;  // #1028
     std::vector<const ast::Node*> groupingCandidates;  // #1930
@@ -47301,9 +47346,11 @@ void Emitter::collectBorrowingArrayFreeEligible(
         // only the wrapper struct). Then run the escape walk in borrowingArrayMode
         // so a for-in over the array and a binding into a safe view are borrows.
         std::unordered_set<const void*> safeViews;
-        collectSafeViewAliases(body, ld, safeViews);
+        collectSafeViewAliases(body, ld, safeViews, lambdaCaptureBorrow);
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         w.borrowingArrayMode = true;
+        // fix #7558: see the walker field's comment.
+        if (lambdaCaptureBorrow) w.captureNonEscaping = &captureNonEscaping;
         // fix #3706: only THIS loop (the Array-literal `candidates` family)
         // gets the relaxation — see the walker field's own comment and this
         // function's new parameter doc (LlvmBackend_impl.hpp) for why the
@@ -48213,7 +48260,13 @@ bool Emitter::dictFlatValueFreeSafe(
 void Emitter::collectSafeViewAliases(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         const ast::Node* arrLd,
-        std::unordered_set<const void*>& out) {
+        std::unordered_set<const void*>& out,
+        bool lambdaCaptureBorrow) {
+    // fix #7558: the per-view escape walk below may also lift the lambda-
+    // capture override for the VIEW local (`var c: Array<int>? := a;` captured
+    // by a non-escaping lambda), under the same predicate as the array's own.
+    const std::function<bool(const void*)> captureNonEscaping =
+        [this](const void* d) { return captureCellFreeNonEscaping(d); };
     // fix #3427 hole 3 (§21.1 / §28.9 / §28.11, v0.286): `views` was
     // `const ast::LocalDecl*` and the scan below matched only
     // `dynamic_cast<const ast::LocalDecl*>(s)`, so a §21.1 runtime `const`
@@ -48378,6 +48431,7 @@ void Emitter::collectSafeViewAliases(
     for (const ast::Node* v : views) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(v)};
         w.borrowingArrayMode = true;
+        if (lambdaCaptureBorrow) w.captureNonEscaping = &captureNonEscaping;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped) out.insert(static_cast<const void*>(v));
     }
