@@ -29390,7 +29390,15 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
         if (call->callee) {
             sema::Symbol* sym = ctx_.exprSymbol(*call->callee);
-            if (dynamic_cast<sema::LocalSymbol*>(sym) ||
+            // fix #8846 (§28.9 / §27.5, v0.359): an IMMEDIATELY-INVOKED lambda
+            // `(lambda() => t + "q")()` calls the same lambda body the named
+            // twin does, which mints +1 for its string result, so the IIFE
+            // call is a +1 producer exactly like a call through a local.
+            const bool iifeCallee =
+                dynamic_cast<const ast::LambdaExpr*>(call->callee.get()) !=
+                nullptr;
+            if (iifeCallee ||
+                dynamic_cast<sema::LocalSymbol*>(sym) ||
                 dynamic_cast<sema::ParameterSymbol*>(sym)) {
                 // The result type of the call is the funcReturn of the callee.
                 // If that result is string (nullable OR non-nullable, fix #2196),
