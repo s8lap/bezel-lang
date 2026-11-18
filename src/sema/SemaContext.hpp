@@ -1680,6 +1680,52 @@ inline bool isValueBuiltinByName(std::string_view n) {
     return false;
 }
 
+// fix #8591 (spec §14.2 "Type-parameter bounds" table, stdlib §2.5/§2.6,
+// v0.357): is `t` a STDLIB VALUE BUILTIN — one of the compiler-intrinsic
+// value types the standard library declares as a `public record`?
+//
+// §14.2's `class` row admits "Non-nullable reference types only — classes
+// (including `Array<T>`, `OwningArray<T>`, and other heap collection types),
+// interfaces, `string`, function types", and its `value` row admits
+// "Non-nullable value types — records, enums, choices (§35), primitives,
+// inline arrays (all forms), the unit type". The stdlib value builtins —
+// DateTime, TimeSpan, DateOnly and TimeOnly (stdlib §2.5), Guid (§2.6),
+// CancellationToken (§6.1), Range (§9.8), IntPtr/UIntPtr (§10.0) and the
+// span views (§4.14/§4.15) — are RECORDS, so they are VALUE types: a
+// `where T: class` bound REFUSES them.
+//
+// The compiler-intrinsic symbol the compiler mints for those names
+// (`builtinClassSym` above) carries `kind = ast::TypeDeclKind::Class` — a
+// deliberate simplification ("They carry kind==Class so that the sema and
+// codegen paths that inspect class-typed member accesses continue to work
+// unchanged") — so a classifier that reads the KIND alone reads a value
+// builtin as a reference type. The discriminator is the flag
+// `builtinClassSym` sets on that same symbol: `isValueBuiltin`.
+//
+// The three shapes a built-in reaches a program in (the §2.6 `Guid` note in
+// sema/BuiltinValueTypes.hpp):
+//   (a) the synthetic `builtinClassSym(name)` symbol — `declaration` set and
+//       `isValueBuiltin` true;
+//   (b) the DECLARATION-LESS Named ref (#1463, above) — `declaration` null;
+//   (c) a metadata spelling (`importedName`).
+//
+// A USER type of the same name is NOT the built-in: `isUserDeclaredTypeSym`
+// (sema/Symbol.hpp) is the house discriminator for that (#5272).
+inline bool isStdlibValueBuiltinType(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return false;
+    if (t->declaration) {
+        if (isUserDeclaredTypeSym(t->declaration)) return false;  // a user type
+        return t->declaration->isValueBuiltin;
+    }
+    // The DECLARATION-LESS shape: the NAME decides. The LAST path part is
+    // the head (`System.Guid` names the same built-in as `Guid`).
+    if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
+        return isValueBuiltinByName(t->astNode->name->parts.back());
+    if (!t->astNode && !t->importedName.empty())
+        return isValueBuiltinByName(t->importedName);
+    return false;
+}
+
 // fix #7028 (stdlib §3.2, v0.355): is this TypeRef the stdlib §3.2
 // `Encoding` — the BUILT-IN, and not a user class of that name (§11.3
 // reserves no names)?

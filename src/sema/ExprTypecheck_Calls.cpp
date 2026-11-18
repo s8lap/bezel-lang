@@ -10181,8 +10181,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     bound->declaration->name));
                         } else if (item.kind == "class") {
                             // §14.2: non-nullable reference type only.
+                            //
+                            // fix #8591 (§14.2 "Type-parameter bounds" table,
+                            // stdlib §2.5/§2.6, v0.357): a STDLIB VALUE BUILTIN
+                            // is a VALUE type — the standard library declares
+                            // it as a `public record` — so the `class` bound
+                            // refuses it. The compiler-intrinsic symbol the
+                            // compiler mints for those names carries
+                            // `kind = Class` (`SemaContext::builtinClassSym`),
+                            // so `refKindOf` — the mirror of
+                            // `Resolver::categorize` — reads it as a reference
+                            // type; `isStdlibValueBuiltinType`
+                            // (SemaContext.hpp) is the shared discriminator
+                            // both bound sites consult.
                             int r = refKindOf(argRef);
-                            if (argRef->nullable || r == 0) report("class");
+                            if (argRef->nullable || r == 0 ||
+                                isStdlibValueBuiltinType(argRef))
+                                report("class");
                         } else if (item.kind == "value") {
                             // §14.2: non-nullable value type only.
                             int r = refKindOf(argRef);

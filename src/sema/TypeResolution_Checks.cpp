@@ -13748,6 +13748,16 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
     if (item.kind == "class") {
         // §14.2: non-nullable reference types only.
         if (arg->nullable) { report("class"); return; }
+        // fix #8591 (§14.2 "Type-parameter bounds" table, stdlib §2.5/§2.6,
+        // v0.357): a STDLIB VALUE BUILTIN is a VALUE type — the standard
+        // library declares it as a `public record` (stdlib §2.5/§2.6) — so
+        // the `class` bound refuses it. The compiler-intrinsic symbol the
+        // compiler mints for those names carries `kind = Class` (a
+        // deliberate simplification, `SemaContext::builtinClassSym`), so the
+        // KIND-based classification below reads it as a reference type; the
+        // discriminator is `isStdlibValueBuiltinType` (SemaContext.hpp),
+        // which consults the value-builtin flag the same symbol carries.
+        if (isStdlibValueBuiltinType(arg)) { report("class"); return; }
         TypeCategory c = categorize(arg);
         if (c == TypeCategory::Value) report("class");
         // Unknown → defer (no diagnostic).
