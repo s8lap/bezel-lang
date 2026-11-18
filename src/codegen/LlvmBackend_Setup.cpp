@@ -31995,7 +31995,81 @@ struct StringEscapeWalker {
     // still escapes: only the `inLambda` OVERRIDE is lifted, not the
     // safe-read test. Null / false for every other walk, leaving them
     // bit-identical.
+    //
+    // fix-forward #7558 (§28.3 / §28.9, v0.359): the lift covers ONLY a read
+    // whose value cannot carry the tracked local's storage out of the lambda
+    // — a read in `lambdaValueReads` (see `noteLambdaValueReads`). §28.9:
+    // runtime management of the closure "relaxes nothing about the values
+    // the closure captures: a captured borrowed class reference is subject
+    // to §28.3's borrow-escape rules"; a receiver read whose RESULT is itself
+    // a borrow of the local (`a.GetEnumerator()`, `a.AsReadOnlySpan()`, a
+    // lazy `a.Where(..)` query, a method reference `a.IndexOf`) can be the
+    // lambda's result and outlive the scope-end `bz_array_free` through
+    // `f()` (heap-use-after-free, review r42-rev-s55 p27/p42/p43/p44), so it
+    // keeps the conservative escape verdict.
     const std::function<bool(const void*)>* captureNonEscaping = nullptr;
+    // fix-forward #7558: the tracked-local IdentifierExpr nodes, inside a
+    // lambda body, that root a derivation chain (receiver / `?.` receiver /
+    // index target / `!` / conditional arm / binary operand) containing a
+    // step whose type is a value-copy primitive — `a.Count`, `a.IndexOf(x)`,
+    // `a[i]` of an `Array<int>`, `a[0].V`, `a == b` — or that are the
+    // iterable of a `for` whose element type is one. Past such a step the
+    // value is a copy that cannot alias the local's backing, so whatever
+    // the rest of the lambda does with it cannot outlive that backing.
+    std::unordered_set<const ast::IdentifierExpr*> lambdaValueReads;
+    // fix-forward #7558: nesting depth of `async lambda` bodies. An async
+    // lambda's body runs after the call that starts it may have returned
+    // (its task is the call's result, §30.6), so a read there is never
+    // lifted, however value-typed.
+    int asyncLambdaDepth = 0;
+    bool lambdaReadLiftArmed() const {
+        return inLambda && asyncLambdaDepth == 0 && captureNonEscaping &&
+               (*captureNonEscaping)(target);
+    }
+    // A value-copy result: a non-`Object` primitive (`bool`, `char`, the
+    // numeric types, `string`, nullable or not). `string` is runtime-managed
+    // (§28.9) and a read of one takes its own reference. Function types (a
+    // method reference captures its receiver), `Object` (may box/alias the
+    // receiver), and every Named type (an enumerator, a span, a view, a
+    // record that may hold a borrow) are NOT value copies here.
+    bool isValueCopyType(const sema::TypeRef* t) const {
+        return t && t->kind == sema::TypeRef::Kind::Primitive &&
+               t->primitive != sema::PrimitiveType::None &&
+               t->primitive != sema::PrimitiveType::Object;
+    }
+    void noteLambdaValueReads(const ast::Expr* e, bool sawValue) {
+        if (!e) return;
+        if (!sawValue && isValueCopyType(ctx.exprType(*e))) sawValue = true;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            if (sawValue && isTargetIdent(id)) lambdaValueReads.insert(id);
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e))
+            return noteLambdaValueReads(m->target.get(), sawValue);
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e))
+            return noteLambdaValueReads(m->target.get(), sawValue);
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e))
+            return noteLambdaValueReads(c->callee.get(), sawValue);
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e))
+            return noteLambdaValueReads(c->callee.get(), sawValue);
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e))
+            return noteLambdaValueReads(ix->target.get(), sawValue);
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e))
+            return noteLambdaValueReads(p->operand.get(), sawValue);
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            noteLambdaValueReads(c->thenValue.get(), sawValue);
+            noteLambdaValueReads(c->elseValue.get(), sawValue);
+            return;
+        }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            noteLambdaValueReads(b->left.get(), sawValue);
+            noteLambdaValueReads(b->right.get(), sawValue);
+            return;
+        }
+        // Any other node (an argument list, `as`, a lambda, `new`, ...) is not
+        // a derivation step of the receiver: its operands start new chains,
+        // which expr() examines when it reaches them.
+    }
     // #1997 / §4.6 / §28.9 / §28.3 (v0.197): OPT-IN gate for the plain-`:=`
     // reassignment relaxation below (treat a reassignment of the tracked local as
     // NOT an escape, so the local stays scope-end-release eligible). Sound ONLY for
@@ -34320,15 +34394,19 @@ struct StringEscapeWalker {
         if (!e || escaped) return;
         // fix #6170: a retained choice-construction argument is a read.
         if (retainedCtorArgs && retainedCtorArgs->count(e)) safeRead = true;
+        // fix-forward #7558: record, top-down, the lambda reads whose chain
+        // reaches a value copy (see `lambdaValueReads`).
+        if (lambdaReadLiftArmed()) noteLambdaValueReads(e, /*sawValue=*/false);
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
             // FINDING [1]: inside a lambda body, a captured-local read always
             // escapes — the env outlives the scope (safe-read does not apply).
-            // fix #7558: unless the capture is proven non-escaping and the
-            // read is a safe read (see `captureNonEscaping`).
+            // fix #7558: unless the capture is proven non-escaping, the read
+            // is a safe read (see `captureNonEscaping`), and its value is a
+            // copy (fix-forward: see `lambdaValueReads`).
             if (isTargetIdent(id) &&
                 (!safeRead ||
-                 (inLambda &&
-                  !(captureNonEscaping && (*captureNonEscaping)(target)))))
+                 (inLambda && !(lambdaReadLiftArmed() &&
+                                lambdaValueReads.count(id) != 0))))
                 escaped = true;
             return;
         }
@@ -34792,8 +34870,10 @@ struct StringEscapeWalker {
             // release that would free a value the env still aliases (UAF).
             bool savedInLambda = inLambda;
             inLambda = true;
+            if (lam->isAsync) ++asyncLambdaDepth;  // fix-forward #7558
             if (lam->exprBody) expr(lam->exprBody.get(), /*safeRead=*/false);
             for (auto& s : lam->stmts) stmt(s.get());
+            if (lam->isAsync) --asyncLambdaDepth;
             inLambda = savedInLambda;
             return;
         }
@@ -36023,9 +36103,23 @@ struct StringEscapeWalker {
             // `x` is"), so the borrow-read verdict looks through the `!`.
             // `expr()` forwards the position through a PostfixBangExpr.
             if (borrowingArrayMode &&
-                isTargetIdent(peelForInSourceBang(fs->iterable.get())))
+                isTargetIdent(peelForInSourceBang(fs->iterable.get()))) {
+                // fix-forward #7558 (§28.3 / §28.9, v0.359): inside a
+                // non-escaping lambda, iterating the local over a value-copy
+                // element type is a value read (see `lambdaValueReads`): the
+                // per-loop enumerator dies with the loop, inside the body, and
+                // each element is a copy.
+                if (lambdaReadLiftArmed() && !fs->isAwait) {
+                    const auto* src = dynamic_cast<const ast::IdentifierExpr*>(
+                        peelForInSourceBang(fs->iterable.get()));
+                    const sema::TypeRef* it = ctx.exprType(*fs->iterable);
+                    if (src && it && it->kind == sema::TypeRef::Kind::Named &&
+                        it->genericArgs.size() == 1 &&
+                        isValueCopyType(it->genericArgs[0]))
+                        lambdaValueReads.insert(src);
+                }
                 expr(fs->iterable.get(), /*safeRead=*/true);
-            else
+            } else
                 expr(fs->iterable.get(), /*safeRead=*/false);
             expr(fs->withExpr.get(), /*safeRead=*/false);
             for (auto& b : fs->body) stmt(b.get());
