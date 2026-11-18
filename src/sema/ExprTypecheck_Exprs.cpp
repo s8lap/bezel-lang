@@ -17632,6 +17632,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 default: break;
             }
         }
+        // fix #6643 (§27.3, v0.359): the error count BEFORE the expression
+        // body's visit, so the §27.3 admission check below can tell "the body
+        // has no type because it is a unit-returning call" (no error was
+        // reported) from "the body has no type because it did not type-check"
+        // (an error was already reported at the body — the check then stays
+        // silent rather than piling a second diagnostic on the same
+        // position).
+        std::size_t lamBodyErrsBefore = ctx_.diagnostics().errorCount();
         if (lam->exprBody) {
             // per §15.4 (#1825): when a lambda's expression body is a collection
             // literal AND the lambda has a determinable target return type from
@@ -17693,6 +17701,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             if (hasAscription)
                 applyDeclaredResultCaseReading(
                     const_cast<ast::LambdaExpr*>(lam)->exprBody);
+            // fix #6643 (§27.3, v0.359): the error count BEFORE the body
+            // visit, so the §27.3 admission check below can tell "the body has
+            // no type because it is a unit-returning call" (no error was
+            // reported) from "the body has no type because it did not
+            // type-check" (an error was already reported at the body — the
+            // check then stays silent rather than piling a second diagnostic
+            // on the same position).
+            lamBodyErrsBefore = ctx_.diagnostics().errorCount();
             visitExpr(*lam->exprBody);
             // fix #4323 (§5.1/§11.2, v0.298): the SEVENTH site fix #4310
             // missed — an expression-bodied lambda's collection-literal body
@@ -17956,6 +17972,102 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 retVal->span.begin,
                                 "lambda body's returned value", retVal);
             });
+        }
+        // fix #6643 (§27.3 *Which block-bodied lambdas return a value* /
+        // *Return-type inference without a target* / *Admission at a
+        // target-typed non-call position*, v0.359): the §27.3 classification
+        // is checked against the TARGET TYPE for an EXPRESSION body too, not
+        // only for a block body. §27.3:
+        //
+        //   "Expression-bodied lambdas need no inference rule: the body
+        //    expression's type is the return type, and a body of type `()`
+        //    makes a procedure lambda."
+        //
+        //   "A target type, when present, is checked against this
+        //    classification — a procedure-bodied lambda does not convert to a
+        //    value-returning function type, nor the reverse."
+        //
+        // #6161's check fires only for a BLOCK body — it lives inside the
+        // block-body branch of the return-type inference below, so an
+        // expression body, whose classification is exactly the one §27.3
+        // states for it, was never judged. MEASURED on b279e8daf:
+        // `var g: () -> int := lambda() => Console.WriteLine("y");` compiled,
+        // and the `() -> int` callee read a value the unit-typed body never
+        // produced.
+        //
+        // TWO shapes are rejected here:
+        //
+        //  (a) the body's recorded type is the UNIT type — the body is a
+        //      procedure body by §27.3's own sentence. The §5.1 conversion
+        //      check above does NOT catch it: `checkAssignable` has no arm
+        //      for a `Kind::Unit` source and falls through to its final
+        //      "Mixed / generic-parameter / null-literal cases: skip"
+        //      catch-all (ExprTypecheck.cpp).
+        //
+        //  (b) the body is a CALL whose own callee carries no type — the
+        //      unit-returning BUILT-IN member calls sema deliberately leaves
+        //      untyped (`Console.WriteLine` / `Console.Write` /
+        //      `Array<T>.Add` — "Write / WriteLine → unit (leave untyped)",
+        //      ExprTypecheck_Calls.cpp's built-in static accept-list), so
+        //      neither the call nor the body of the issue's own repro has a
+        //      type: the lambda's inferred return type is null, and the
+        //      callee read whatever the slot happened to hold.
+        //
+        // The (b) test is deliberately narrow — the CALLEE must itself be
+        // untyped. A call whose callee HAS a type but whose RESULT has none
+        // is a different defect (e.g. §27.4's inference of a function-typed
+        // parameter slot, which sema does not reach today) and is NOT this
+        // issue's: rejecting it here would reject programs that are not
+        // procedure lambdas.
+        //
+        // The target slot must be a VALUE slot for the rule to bite: a
+        // `() -> ()` target admits a procedure lambda (§27.3's discarded-
+        // result regime), and a bare type-parameter slot is not judged here
+        // (the same exclusion the check above states). An ASCRIBED lambda is
+        // not judged here either: its ascription is its written return type
+        // and the ascription's own §5.1 check governs it (the branch above).
+        //
+        // A `throw` body is not judged either — §17.12: "Both forms have the
+        // bottom type — assignable to any expected type — because control
+        // transfers to the matching handler before any value is produced."
+        // The bottom type reaches any expected type, so a throw-bodied
+        // lambda IS admitted at a value slot (sema leaves the `throw`
+        // expression itself untyped, which is a WEAKER implementation of
+        // §17.12, not a licence to reject the body).
+        //
+        // And an untyped body whose OWN visit already reported an error is
+        // not judged: the body did not type-check, and the diagnostic that
+        // says so is the one the programmer has to fix. The check then stays
+        // silent instead of piling a second message on the same position.
+        const bool lamBodyIsThrow =
+            lam->exprBody &&
+            dynamic_cast<const ast::ThrowExpr*>(lam->exprBody.get()) != nullptr;
+        if (!hasAscription && !lam->isAsync && lamTargetRet &&
+            !lamTargetAmbiguous && lam->exprBody && !lam->isBlockBody &&
+            !lamBodyIsThrow &&
+            (lamTargetRet->kind == TypeRef::Kind::Primitive ||
+             (lamTargetRet->kind == TypeRef::Kind::Named &&
+              lamTargetRet->declaration))) {
+            const TypeRef* bodyTy = ctx_.exprType(*lam->exprBody);
+            bool unitBody = bodyTy && bodyTy->kind == TypeRef::Kind::Unit;
+            if (!bodyTy && ctx_.diagnostics().errorCount() == lamBodyErrsBefore) {
+                // (b): a call whose CALLEE carries no type — a unit-returning
+                // built-in member call.
+                if (const auto* ce = dynamic_cast<const ast::CallExpr*>(
+                        lam->exprBody.get())) {
+                    if (ce->callee) {
+                        const TypeRef* calleeTy = ctx_.exprType(*ce->callee);
+                        unitBody = !calleeTy;
+                    }
+                }
+            }
+            if (unitBody) {
+                ctx_.diagnostics().report(
+                    Severity::Error, lam->exprBody->span.begin,
+                    "a procedure-bodied lambda (a body of type `()`) does not "
+                    "convert to a function type whose return type is a value "
+                    "(\xC2\xa7""27.3)");
+            }
         }
         // §27.3/§21.7 (v0.217): a value-ascribed BLOCK body must return a
         // value on every path — the same totality rule as a method with a
