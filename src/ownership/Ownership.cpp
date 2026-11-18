@@ -14836,7 +14836,75 @@ void MethodOwnership::seedLambdaBodyOwnedLocals(
 void MethodOwnership::scanLambdaBodyBorrowStores(const ast::Stmt& s) {
     forEachNestedStmt(s, [this](const ast::Stmt& cur) {
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&cur)) {
-            checkBorrowStoreEscape(*as, EscapeScope::LambdaBody);
+            bool flagged386 =
+                checkBorrowStoreEscape(*as, EscapeScope::LambdaBody);
+            // fix #8797 (§28.3 / §28.5 / §28.8, v0.359): the OWNED-FIELD
+            // sibling of the #3565 channel above — the one ownership rule
+            // the method-level `handleAssignment` applies that the lambda-body
+            // pre-pass did NOT.
+            //
+            // WHAT WAS WRONG. §28.5 / §28.8: an `owned` field is an owned
+            // storage location and may only receive an OWNED value; a BORROW
+            // RHS is the double-dispose hazard (the field's owner disposes the
+            // value when the object is disposed, and the borrow's real owner
+            // disposes it too). The method-level spelling is rejected by
+            // `handleAssignment`'s `targetIsOwnedField` arm →
+            // `handleOwnedFieldAssignment` ("a borrow cannot be stored into an
+            // `owned` field"), but that arm is reached only from
+            // `visitStmt`, which the dataflow drives for METHOD-body
+            // statements — "ownership's statement walks never enter a lambda
+            // body (it lives inside a `LambdaExpr`, an expression)"
+            // (`checkLambdaBodyEscapes`'s header). So the byte-identical
+            // lambda-body spelling was ACCEPTED:
+            //
+            //   class C
+            //     private owned saved: Array<int>;
+            //     public method Go(): int
+            //       var xs: Array<int> := [1, 2, 3];
+            //       var f := lambda(l: Array<int>): int =>
+            //         do this.saved := l; return l.Count; end;
+            //       var n := f(xs);            // the borrow of `xs` is stored
+            //       return n;                  // into the owned field
+            //     end Go;
+            //   end C;
+            //
+            // `l` is a plain parameter — a BORROW (§28.3.4: "Parameter `p`
+            // (no modifier) | Borrowed (source: caller)") — so the store
+            // gives the field a reference the CALLER still owns. Measured on
+            // r30-c1 @ b80788db5: the program compiled (rc=0) and the owned
+            // field's dispose freed the caller's array. That is benign only
+            // while the caller's own scope-end free does not run; issue
+            // #8320's fix (a call through a FUNCTION VALUE leaves the
+            // caller's owned collection local owned, so its scope-end free
+            // DOES run) turns it into a hard double free — measured:
+            // "ERROR: AddressSanitizer: attempting double-free on
+            // 0x7b9cec3e00e0", the first free the caller's scope-end
+            // `bz_array_free`, the second the field's `DisposeCore`.
+            //
+            // WHY IT IS HERE. The rule is not new and the diagnostic is not
+            // new: `handleOwnedFieldAssignment` is the ONE authority for it
+            // and is called here with the SAME predicate
+            // (`ownedArgSourceIsBorrow`) and the SAME diagnostic text the
+            // method-level path uses, so the two callee kinds cannot drift
+            // apart. Only the REACH is new: the lambda body.
+            //
+            // The borrow case of `handleOwnedFieldAssignment` REPORTS and
+            // returns — it records no ownership transfer — so calling it from
+            // the lambda-body pre-pass touches no dataflow state. The
+            // `ownedArgSourceIsBorrow` guard in front of it keeps the legal
+            // path out: a legal owned RHS would otherwise reach the transfer
+            // bookkeeping, which belongs to the method-level dataflow and not
+            // to this syntactic pre-pass. `flagged386` suppresses a duplicate
+            // when the #3565 channel above already reported this store.
+            // // per §28.3, §28.5, §28.8, v0.359
+            if (!flagged386 && as->value && as->target &&
+                ownedArgSourceIsBorrow(*as->value) &&
+                (targetIsOwnedField(*as->target) ||
+                 targetIsOwningInlineArraySlot(*as->target)))
+                handleOwnedFieldAssignment(
+                    *as, /*borrowAlreadyFlagged=*/false,
+                    /*intoOwningArraySlot=*/
+                        targetIsOwningInlineArraySlot(*as->target));
             // §28.11 indexer-set sink — see fix #3799 above. The check is a
             // no-op on a non-IndexExpr target (it bails in its first guard),
             // so running it on every AssignmentStmt alongside the #3565 call
