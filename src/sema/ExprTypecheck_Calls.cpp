@@ -49561,6 +49561,96 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         ctx_.setExprType(&nm, llElem);
         return;
     }
+    // fix #8770 (§7.5 / §7.7, stdlib §4.6 / §4.7, v0.359): `l?.FirstNode` /
+    // `l?.LastNode` on a `LinkedList<T>` / `OwningLinkedList<T>` receiver.
+    // stdlib §4.6 declares `public pure readonly property FirstNode:
+    // LinkedListNode<T>?` and `LastNode: LinkedListNode<T>?` (§4.7 the same
+    // pair on `OwningLinkedList<T>`), and the `.` form types them in
+    // resolveMemberAccess's LinkedList node-property block (`makeNodeTy`); the
+    // `?.` node had no twin, so it was left UNTYPED -- no diagnostic, and
+    // codegen lowered the access to NOTHING behind the #2434 (the local's
+    // initializer did not lower to a value) and #3079 (the enclosing
+    // `Console.WriteLine` emitted nothing at all) warnings.
+    //
+    // §7.5: "`x?.M` returns null if `x` is null; otherwise it performs the
+    // access. The result type is always nullable" -- and the member's own type
+    // is ALREADY nullable, so the result is the member's type, `LinkedListNode<T>?`
+    // (§7.5's chain rule: "A segment whose own declared type is nullable needs
+    // its own `?.` before the next suffix", which is why the issue's repro
+    // spells `l?.FirstNode?.Value`). A call spelling (`l?.FirstNode()`) is
+    // left to the paths below.
+    if (!member && recvTyForDiag && currentCallArity_ <= 0 &&
+        &nm != calleeOfCallCtx_ &&
+        (nm.member == "FirstNode" || nm.member == "LastNode") &&
+        recvTyForDiag->kind == TypeRef::Kind::Named &&
+        !recvTyForDiag->declaration &&
+        ((recvTyForDiag->astNode && recvTyForDiag->astNode->name &&
+          !recvTyForDiag->astNode->name->parts.empty()) ||
+         (!recvTyForDiag->astNode && !recvTyForDiag->importedName.empty())) &&
+        (recvTyForDiag->headName() == "LinkedList" ||
+         recvTyForDiag->headName() == "OwningLinkedList") &&
+        !recvTyForDiag->genericArgs.empty() && recvTyForDiag->genericArgs[0]) {
+        TypeRef* llNode = ctx_.makeTypeRef();
+        llNode->kind = TypeRef::Kind::Named;
+        llNode->nullable = true;
+        auto* llNodeAnn = new ast::Type();
+        llNodeAnn->kind = ast::TypeKind::Named;
+        auto* llNodeName = new ast::QualifiedName();
+        llNodeName->parts.push_back("LinkedListNode");
+        llNodeAnn->name.reset(llNodeName);
+        llNode->astNode = llNodeAnn;
+        llNode->genericArgs.push_back(recvTyForDiag->genericArgs[0]);
+        ctx_.setExprType(&nm, llNode);
+        return;
+    }
+    // fix #8770 (§7.5 / §7.7, stdlib §4.6, v0.359): `n?.Value` / `n?.Next` /
+    // `n?.Previous` on a `LinkedListNode<T>` receiver -- the SECOND segment of
+    // the `l?.FirstNode?.Value` chain the issue's repro spells. stdlib §4.6
+    // declares on `LinkedListNode<T>`: `public readonly property Value: T`,
+    // `Next: LinkedListNode<T>?` and `Previous: LinkedListNode<T>?`; the `.`
+    // form types them in resolveMemberAccess's node-accessor block, and the
+    // `?.` node had no twin -- so `n?.Value` was left UNTYPED and lowered to
+    // NOTHING (#3079: the enclosing `Console.WriteLine` emitted nothing at
+    // all). MEASURED on the base: the same gap is reachable through the `.`
+    // form alone (`var n := l.FirstNode; n?.Value` printed nothing), and the
+    // §7.4 diagnostic on the `.` spelling of the same member NAMES `n?.Value`
+    // as the remedy -- a spelling that lowered to nothing.
+    //
+    // §7.5: "The result type is always nullable", so `Value`'s `T` is lifted
+    // to `T?` and the node members' own `LinkedListNode<T>?` flattens to
+    // itself. A call spelling (`n?.Value()`) is left to the paths below.
+    if (!member && recvTyForDiag && currentCallArity_ <= 0 &&
+        &nm != calleeOfCallCtx_ &&
+        (nm.member == "Value" || nm.member == "Next" ||
+         nm.member == "Previous") &&
+        recvTyForDiag->kind == TypeRef::Kind::Named &&
+        !recvTyForDiag->declaration &&
+        recvTyForDiag->astNode && recvTyForDiag->astNode->name &&
+        !recvTyForDiag->astNode->name->parts.empty() &&
+        recvTyForDiag->headName() == "LinkedListNode" &&
+        !recvTyForDiag->genericArgs.empty() && recvTyForDiag->genericArgs[0]) {
+        TypeRef* ndElem = recvTyForDiag->genericArgs[0];
+        if (nm.member == "Value") {
+            TypeRef* ndVal = ctx_.makeTypeRef(*ndElem);
+            ndVal->nullable = true;
+            ctx_.setExprType(&nm, ndVal);
+            return;
+        }
+        // `Next` / `Previous`: `LinkedListNode<T>?` (stdlib §4.6), built the
+        // way resolveMemberAccess's node-accessor block builds it.
+        TypeRef* ndNode = ctx_.makeTypeRef();
+        ndNode->kind = TypeRef::Kind::Named;
+        ndNode->nullable = true;
+        auto* ndAnn = new ast::Type();
+        ndAnn->kind = ast::TypeKind::Named;
+        auto* ndName = new ast::QualifiedName();
+        ndName->parts.push_back("LinkedListNode");
+        ndAnn->name.reset(ndName);
+        ndNode->astNode = ndAnn;
+        ndNode->genericArgs.push_back(ndElem);
+        ctx_.setExprType(&nm, ndNode);
+        return;
+    }
     // fix #6512 (stdlib §5 / §7.5, v0.338): `?.` on an `IGrouping<TKey, T>`
     // receiver. IGrouping TypeRefs are synthetic (no declaration), so
     // `memberTargetType` above returns null, `lookupMember` finds nothing, and

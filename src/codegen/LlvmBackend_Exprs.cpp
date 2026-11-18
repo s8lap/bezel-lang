@@ -6065,8 +6065,15 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // present `T?`.
         // fix #8759 (stdlib §4.17, v0.359): SortedDictionary `?.FirstKey` /
         // `?.LastKey` take the SortedSet path (bare `K`, lifted to `K?`).
+        // fix #8770 (stdlib §4.6 / §4.7, v0.359): `l?.FirstNode` /
+        // `l?.LastNode` take the list path: the `.` form's own read is the
+        // `bz_llist_first_node` / `bz_llist_last_node` call, whose result is
+        // the NODE POINTER (already null when the list is empty), so the
+        // §7.5 result is that pointer as is -- a `LinkedListNode<T>?` is a
+        // nullable REFERENCE, not a nullable value, so no carrier is built.
         if ((nm->member == "First" || nm->member == "Last" ||
-             nm->member == "FirstKey" || nm->member == "LastKey") &&
+             nm->member == "FirstKey" || nm->member == "LastKey" ||
+             nm->member == "FirstNode" || nm->member == "LastNode") &&
             ctx_.exprSymbol(e) == nullptr) {
             const sema::TypeRef* ncLlRcvTy = ctx_.exprType(*nm->target);
             const sema::TypeRef* ncLlResTy = ctx_.exprType(e);
@@ -6134,6 +6141,98 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     ncLlEntryBB);
                 ncLlPhi->addIncoming(ncLlInner, ncLlAccessEnd);
                 return ncLlPhi;
+            }
+        }
+        // fix #8770 (§7.5 / §7.7, stdlib §4.6, v0.359): `n?.Value` /
+        // `n?.Next` / `n?.Previous` on a `LinkedListNode<T>` receiver -- the
+        // SECOND segment of the `l?.FirstNode?.Value` chain the issue's repro
+        // spells. stdlib §4.6 declares on `LinkedListNode<T>`: `public readonly
+        // property Value: T`, `Next: LinkedListNode<T>?` and `Previous:
+        // LinkedListNode<T>?`; the `.` form reads them through
+        // `bz_llist_node_value_ptr` / `bz_llist_node_next` /
+        // `bz_llist_node_prev` (the MemberAccessExpr arm below), and a
+        // NullCondMemberExpr is a DISTINCT AST node, so that arm never ran and
+        // the access lowered to NOTHING (#3079 -- the enclosing
+        // `Console.WriteLine` emitted nothing at all). MEASURED on the base:
+        // the same gap is reachable through the `.` form alone (`var n :=
+        // l.FirstNode; n?.Value` printed nothing), and the §7.4 diagnostic on
+        // the `.` spelling of the same member NAMES `n?.Value` as the remedy --
+        // a spelling that lowered to nothing.
+        //
+        // Lower the receiver ONCE (§7.5: "The receiver is evaluated first"); a
+        // null receiver yields null, otherwise the `.` form's own read runs on
+        // the node pointer. §7.5's result is always nullable: a VALUE member
+        // (`Value: T`) is lifted to the tagged `{i8 hasValue; T}` carrier; a
+        // REFERENCE member (a node borrow) stays a possibly-null pointer.
+        if ((nm->member == "Value" || nm->member == "Next" ||
+             nm->member == "Previous") &&
+            ctx_.exprSymbol(e) == nullptr) {
+            const sema::TypeRef* ncNdRcvTy = ctx_.exprType(*nm->target);
+            const sema::TypeRef* ncNdResTy = ctx_.exprType(e);
+            const bool ncNdIsNode =
+                ncNdRcvTy && ncNdRcvTy->kind == sema::TypeRef::Kind::Named &&
+                !ncNdRcvTy->declaration && ncNdRcvTy->astNode &&
+                ncNdRcvTy->astNode->name &&
+                !ncNdRcvTy->astNode->name->parts.empty() &&
+                ncNdRcvTy->headName() == "LinkedListNode";
+            if (ncNdIsNode && ncNdResTy && ncNdResTy->nullable &&
+                !ncNdRcvTy->genericArgs.empty() && ncNdRcvTy->genericArgs[0]) {
+                const sema::TypeRef* ncNdElemTy = ncNdRcvTy->genericArgs[0];
+                llvm::Type* ncNdElemLlvmTy = lowerTypeRef(ncNdElemTy);
+                if (!ncNdElemLlvmTy) return nullptr;
+                // The §7.5 result's representation, decided BEFORE any block
+                // is opened so an unrecognised shape returns with the CFG
+                // untouched (the #3079 backstop then reports it loudly).
+                const bool ncNdResIsValue = isNullableValueTy(ncNdResTy);
+                llvm::Type* ncNdResLlvm = nullptr;
+                llvm::Constant* ncNdResNull = nullptr;
+                if (ncNdResIsValue) {
+                    ncNdResLlvm = nullableValueStructTy(ncNdResTy);
+                    ncNdResNull = nullableValueNull(ncNdResTy);
+                } else {
+                    ncNdResLlvm = ptrTy();
+                    ncNdResNull = llvm::ConstantPointerNull::get(ptrTy());
+                }
+                llvm::Value* ncNdRcv = lowerExpr(*nm->target);
+                if (!ncNdRcv || !ncNdRcv->getType()->isPointerTy())
+                    return nullptr;
+                auto* ncNdEntryBB = builder_.GetInsertBlock();
+                auto* ncNdAccessBB = llvm::BasicBlock::Create(
+                    llvm_, "ncnd.access", currentFn_);
+                auto* ncNdEndBB = llvm::BasicBlock::Create(
+                    llvm_, "ncnd.end", currentFn_);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpEQ(
+                        ncNdRcv, llvm::ConstantPointerNull::get(ptrTy())),
+                    ncNdEndBB, ncNdAccessBB);
+                builder_.SetInsertPoint(ncNdAccessBB);
+                llvm::Value* ncNdVal = nullptr;
+                if (nm->member == "Value") {
+                    auto* valF = declareC("bz_llist_node_value_ptr",
+                                          ptrTy(), {ptrTy()});
+                    llvm::Value* ncNdVPtr =
+                        builder_.CreateCall(valF, {ncNdRcv}, "ncnd.vptr");
+                    ncNdVal = builder_.CreateLoad(ncNdElemLlvmTy, ncNdVPtr,
+                                                  "ncnd.val");
+                    // A NULLABLE VALUE element type (`int?`) stores the whole
+                    // carrier in the node's value slot, so the load IS the
+                    // §7.5 result; a bare value type is lifted into one here.
+                    if (ncNdResIsValue && !isNullableValueTy(ncNdElemTy))
+                        ncNdVal = wrapNullableValue(ncNdResTy, ncNdVal);
+                } else if (nm->member == "Next") {
+                    auto* f = declareC("bz_llist_node_next", ptrTy(), {ptrTy()});
+                    ncNdVal = builder_.CreateCall(f, {ncNdRcv}, "ncnd.next");
+                } else {
+                    auto* f = declareC("bz_llist_node_prev", ptrTy(), {ptrTy()});
+                    ncNdVal = builder_.CreateCall(f, {ncNdRcv}, "ncnd.prev");
+                }
+                auto* ncNdAccessEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(ncNdEndBB);
+                builder_.SetInsertPoint(ncNdEndBB);
+                auto* ncNdPhi = builder_.CreatePHI(ncNdResLlvm, 2, "ncnd.res");
+                ncNdPhi->addIncoming(ncNdResNull, ncNdEntryBB);
+                ncNdPhi->addIncoming(ncNdVal, ncNdAccessEnd);
+                return ncNdPhi;
             }
         }
         // fix #6024 (§7.5, v0.338): `c?.Count` / `c?.Length` on a built-in
