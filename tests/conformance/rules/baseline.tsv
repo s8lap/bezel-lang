@@ -294,9 +294,9 @@ s5_3_0003	pass
 s5_3_0004	pass	
 s5_3_0005	fail	divergence
 s5_3_0006	fail	divergence
-s5_4_0001	fail	divergence
+s5_4_0001	pass	
 s5_4_0002	pass	
-s5_4_0003	fail	divergence
+s5_4_0003	pass	
 s5_4_0004	pass	
 s5_4_0005	pass	
 s5_4_0006	pass	
@@ -625,7 +625,7 @@ s8_4_0007	pass
 s8_4_0008	pass	
 s8_5_0001	pass	
 s8_5_0002	pass	
-s8_5_0003	fail	divergence
+s8_5_0003	pass	
 s8_5_0014	pass	
 s8_5_0015	pass	
 s8_5_0016	pass	
@@ -777,9 +777,9 @@ s10_2_0031	pass
 s10_3_0001	pass	
 s10_3_0002	pass	
 s10_4_0001	pass	
-s10_4_0002	fail	divergence
-s10_4_0003	fail	divergence
-s10_4_0004	fail	divergence
+s10_4_0002	pass	
+s10_4_0003	pass	
+s10_4_0004	pass	
 s10_4_0005	pass	
 s10_4_0006	pass	
 s10_4_0031	pass	
@@ -2681,7 +2681,7 @@ s28_10_0011	pass
 s28_10_0012	pass	
 s28_10_0013	pass	
 s28_10_0014	pass	
-s28_10_0015	fail	#5582
+s28_10_0015	pass	
 s28_10_0016	fail	#7092
 s28_10_0017	pass	
 s28_10_0041	pass	
@@ -2774,7 +2774,7 @@ s28_14_0005	pass
 s28_14_0006	pass	
 s28_14_0007	pass	
 s28_14_0008	pass	
-s28_14_0009	fail	divergence
+s28_14_0009	pass	
 s28_14_0010	pass	
 s28_14_0011	pass	
 s28_14_0012	pass	
@@ -2994,7 +2994,7 @@ s30_10_0012	pass
 s30_10_0013	pass	
 s30_11_0001	pass	
 s30_11_0002	pass	
-s30_11_0003	fail	divergence
+s30_11_0003	pass	
 s30_11_0004	pass	
 s30_11_0005	pass	
 s30_11_0006	pass	
@@ -3054,7 +3054,7 @@ s31_2_0008	pass
 s31_2_0009	pass	
 s31_2_0010	pass	
 s31_2_0011	pass	
-s31_2_0012	fail	divergence
+s31_2_0012	pass	
 s31_2_0013	pass	
 s31_2_1_0001	pass	
 s31_2_1_0002	pass	
@@ -3084,7 +3084,7 @@ s31_4_0004	pass
 s31_4_0005	pass	
 s31_4_0006	pass	
 s31_4_0007	pass	
-s31_4_0008	fail	divergence
+s31_4_0008	pass	
 s31_5_0001	pass	
 s31_5_0002	pass	
 s32_1_0001	pass	
@@ -3864,7 +3864,7 @@ l8_1_0003	pass
 l8_2_0001	pass	
 l9_1_0001	pass	
 l9_1_0002	pass	
-l9_1_0003	fail	divergence
+l9_1_0003	pass	
 l9_1_0004	pass	
 l9_1_0005	pass	
 l9_1_0006	pass	#7268
@@ -3884,7 +3884,7 @@ l9_2_0001	pass
 l9_2_0002	pass	
 l9_3_0001	pass	
 l9_3_0002	pass	
-l9_3_0003	fail	divergence
+l9_3_0003	pass	
 l9_4_0001	pass	
 l9_4_0002	pass	
 l9_5_0001	pass	
@@ -3938,7 +3938,7 @@ l9_8_0009	pass
 l9_8_0010	pass	
 l9_8_0011	pass	
 l9_9_0001	pass	
-l9_9_0002	fail	divergence
+l9_9_0002	pass	
 l10_0_0001	pass	
 l10_1_0001	pass	
 l10_1_0002	fail	divergence
