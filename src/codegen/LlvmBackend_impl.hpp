@@ -2701,6 +2701,12 @@ private:
         // once per exit (no double-free of the cell). `slot` holds the closure
         // pointer; the class/collection/dict fields are unused.
         bool closureRelease = false;
+        // fix #8824 (§28.9 / §31.1, v0.359): a `closureRelease` entry that is
+        // SKIPPED on the isUnwind path. Set for a reassigned closure local
+        // whose value may be one a store kept without a reference when an
+        // exception leaves the scope (closureReassignedKeptAtUnwind_); the
+        // slot's reference is then the one keeping that value alive.
+        bool closureReleaseSkipOnUnwind = false;
         // #422 / §8.6 / §28.9: a `var` Object/interface local holding a BOXED
         // VALUE that PROVABLY does not escape its scope (a non-escape walk found
         // every use is a non-consuming read — `is`/`as`/`= null`/`<> null`) and
@@ -22348,6 +22354,13 @@ private:
     // is armed. Rewritten like closureKeptCaptureLocals_.
     std::unordered_set<const void*> closureReassignKeepsOld_;
     std::unordered_set<const void*> closureReassignedKeptAtExit_;
+    // fix #8824 (§28.9 / §31.1, v0.359): declarations whose value may be kept
+    // at a point an exception can leave the method from (a call that throws
+    // between `fs.Add(b);` and `b := g;`), but whose final value at the
+    // normal scope end is not. The scope-end release stays armed and is
+    // marked `closureReleaseSkipOnUnwind`, so it fires on the normal exits
+    // only. Rewritten like closureReassignedKeptAtExit_.
+    std::unordered_set<const void*> closureReassignedKeptAtUnwind_;
     // fix #8743 (§28.9 / §30.5, v0.359): `Object` locals `b` of an async
     // `Task<Object>` body bound by `var b: Object := f as Object;`, where `f`
     // is a closure local this frame holds the one reference of (a lambda

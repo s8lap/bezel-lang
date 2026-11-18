@@ -10668,6 +10668,8 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // values are borrows (§28.9), so the env's CONTENTS are not freed — no
         // double-dispose of a capture. bz_closure_release is null-safe.
         if (it->closureRelease) {
+            // fix #8824: see Disposal::closureReleaseSkipOnUnwind.
+            if (isUnwind && it->closureReleaseSkipOnUnwind) continue;
             llvm::Value* c = builder_.CreateLoad(ptrTy(), it->slot, "cl.rel");
             emitClosureRelease(c);
             continue;

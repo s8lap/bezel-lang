@@ -20541,6 +20541,10 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         consumeLastLambdaCapturedCells();
         Disposal d{slot, nullptr};
         d.closureRelease = true;
+        // fix #8824 (§28.9 / §31.1, v0.359): see
+        // closureReassignedKeptAtUnwind_.
+        d.closureReleaseSkipOnUnwind = closureReassignedKeptAtUnwind_.count(
+                                           static_cast<const void*>(declNode)) != 0;
         disposeStack_.back().push_back(d);
     } else {
         // #2182 / §28.3: a non-closure-local lowerLocalDecl that does not reach
@@ -20569,6 +20573,9 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             !disposeStack_.empty()) {
             Disposal d{slot, nullptr};
             d.closureRelease = true;
+            // fix #8824: see closureReassignedKeptAtUnwind_.
+            d.closureReleaseSkipOnUnwind = closureReassignedKeptAtUnwind_.count(
+                                               static_cast<const void*>(declNode)) != 0;
             disposeStack_.back().push_back(d);
         }
     }
@@ -41961,6 +41968,7 @@ void Emitter::collectClosureReleaseEligible(
             const void* key = static_cast<const void*>(c);
             closureKeptCaptureLocals_.erase(key);
             closureReassignedKeptAtExit_.erase(key);
+            closureReassignedKeptAtUnwind_.erase(key);
             ClosureEscapeWalker kw{ctx_, key};
             kw.coalesceReturnTransfers = coalesceReturnTransfers;
             kw.ownedAliasDecls = &closureAliasOwned_;
@@ -42023,8 +42031,17 @@ void Emitter::collectClosureReleaseEligible(
         // where the analysis cannot see, or one assigned other than by a
         // plain `:=` that `lowerClosureLocalReassign` lowers keeps the
         // flow-insensitive verdict. A `try` body's every point reaches its
-        // catch arms and finally clause; an exception that leaves the method
-        // is not modelled, as nowhere else in this pass.
+        // catch arms and finally clause.
+        //   * fix #8824 (§28.9 / §31.1, v0.359): an exception raised by a
+        //     CALL that leaves the method runs `b`'s scope-end release on the
+        //     unwind path too. `fs.Add(b); Boom(); b := g;` released the
+        //     kept initial value there when `Boom()` threw. MEASURED (200x,
+        //     `--sanitize=address`) on r30-c1 432dfa61c: heap-use-after-free
+        //     on the caller's first call through `fs[0]` after a throw. Every
+        //     statement boundary may be such an exit, so the states there are
+        //     joined into `unwindSt`; if one can reach it kept, the scope-end
+        //     release is skipped on the unwind path only
+        //     (closureReassignedKeptAtUnwind_).
         using DefSet = std::set<const void*>;
         struct FlowState {
             DefSet reach, keptSince;
@@ -42050,6 +42067,8 @@ void Emitter::collectClosureReleaseEligible(
             DefSet usedDefs;
             std::set<const ast::AssignmentStmt*> keepOld;
             bool keptAtExit = false;
+            // fix #8824: see unwindSt.
+            bool keptAtUnwind = false;
         };
         auto nodeKey = [](const ast::Node* n) {
             return static_cast<const void*>(n);
@@ -42067,6 +42086,9 @@ void Emitter::collectClosureReleaseEligible(
             for (auto& s : body)
                 if (nodeKey(s.get()) == b) declAtTop = true;
             FlowState exitSt;
+            // fix #8824: the states at every statement boundary, any of which
+            // a call that throws may leave the method from.
+            FlowState unwindSt;
             struct LoopFrame {
                 FlowState brk, cont;
             };
@@ -42147,9 +42169,11 @@ void Emitter::collectClosureReleaseEligible(
                                 FlowState& st) {
                 for (auto& s : v) {
                     for (FlowState* acc : tryAccs) joinInto(*acc, st);
+                    joinInto(unwindSt, st);
                     flow(s.get(), st);
                 }
                 for (FlowState* acc : tryAccs) joinInto(*acc, st);
+                joinInto(unwindSt, st);
             };
             auto loopFixpoint = [&](const std::vector<std::unique_ptr<ast::Stmt>>& v,
                                     FlowState& st, bool headerKeeps,
@@ -42355,6 +42379,8 @@ void Emitter::collectClosureReleaseEligible(
                 if (!visited.count(r)) out.complete = false;
             out.keptAtExit =
                 declAtTop ? hasOwn(exitSt.keptSince) : everKeptOwn;
+            out.keptAtUnwind =
+                declAtTop ? hasOwn(unwindSt.keptSince) : everKeptOwn;
             return out;
         };
         std::unordered_map<const void*, DefFlow> defFlows;
@@ -42408,6 +42434,9 @@ void Emitter::collectClosureReleaseEligible(
             for (const ast::AssignmentStmt* as : f.keepOld)
                 closureReassignKeepsOld_.insert(
                     static_cast<const void*>(as->target.get()));
+            // fix #8824: the release stays armed for the normal exits.
+            if (!f.keptAtExit && f.keptAtUnwind)
+                closureReassignedKeptAtUnwind_.insert(key);
             if (!f.keptAtExit) continue;
             changedAny |= closureReleaseEligible_.erase(key) != 0;
             changedAny |= closureEscapingScopeEndRelease_.erase(key) != 0;
