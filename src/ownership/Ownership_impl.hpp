@@ -5144,6 +5144,11 @@ private:
     // ENCLOSING lambda, written in a nested lambda; true when it reported.
     bool reportEnclosingLambdaOwnedThrow(const ast::Expr& op);
 
+    // fix #8926 (§28.3, §31.1, v0.359): the lambda that DECLARES a
+    // parameter (null when none of the enclosing lambdas does -- the
+    // parameter then belongs to the method body, #7920's own arm).
+    const ast::LambdaExpr* lambdaOwnerOfParameter(sema::ParameterSymbol* ps);
+
     // fix #8895 (§31.1, v0.359): the innermost ENCLOSING lambda whose own
     // source range declares `sym` (null when none does -- the symbol then
     // belongs to the method body, whose bindings live in `states_`).

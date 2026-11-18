@@ -6257,38 +6257,46 @@ void MethodOwnership::reportCapturedThrowOperand(const ast::Expr& operand) {
 // is CAPTURED iff its owner is not the throwing (innermost) lambda, and it is
 // OWNED iff every binding of it that precedes the throw is an owned
 // production (the same one-sided source-order rule, so an ambiguous history
-// is never rejected). Returns true when it reported. // per §28.3, §31.1, v0.359
+// is never rejected).
+//
+// fix #8926 (§28.3 *Captured owned bindings*, §31.1, v0.359): the OWNED
+// PARAMETER of an ENCLOSING lambda. §28.3 names it beside the owned local —
+// "a captured owned binding — an owned local or `owned` parameter of the
+// enclosing body" — and a parameter has no BINDING STATEMENT, so the
+// `lambdaBodyLocalHoldsBorrow` history the local case reads cannot find it;
+// and a lambda's `ParameterSymbol` carries no declaration location (sema
+// records only its name and modifier), so the owner cannot be resolved by
+// declaration offset either. The owner is therefore resolved through
+// `ctx_.lambdaParams` — the route `reportMoveOnlyChoiceMoveInClosure` already
+// uses — and the binding is OWNED iff the parameter's own modifier says so
+// (`owned` / `out owned`), which is the same classification
+// `ownedArgSourceIsBorrow` reads for a parameter.
+//
+// The throwing lambda's OWN `owned` parameter is admitted (the closure owns
+// it and the throw consumes it, exactly as a method's `owned` parameter is),
+// and a NON-`owned` parameter is a borrow — that is the §31.1 operand rule,
+// which `checkThrowOperandNotBorrowed` reports on its own. Returns true when
+// it reported. // per §28.3, §31.1, v0.359
 bool MethodOwnership::reportEnclosingLambdaOwnedThrow(const ast::Expr& op) {
     if (closureScanStack_.size() < 2) return false;
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&op);
     if (!id || id->name == "this" || id->name == "base") return false;
     sema::Symbol* sym = ctx_.exprSymbol(*id);
-    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
-    if (!ls || isCatchBorrow(sym)) return false;
-    std::uint32_t declOff = sym->declLoc.offset;
-    bool declKnown = sym->declLoc.line != 0;
-    if (!declKnown && sym->decl) {
-        declOff = sym->decl->span.begin.offset;
-        declKnown = sym->decl->span.begin.line != 0;
-    }
-    if (!declKnown) return false;
+    if (!sym || isCatchBorrow(sym)) return false;
     const ast::LambdaExpr* owner = nullptr;
-    for (auto it = closureScanStack_.rbegin(); it != closureScanStack_.rend();
-         ++it) {
-        const ast::LambdaExpr* cand = *it;
-        if (!cand) continue;
-        if (declOff >= cand->span.begin.offset &&
-            declOff < cand->span.end.offset) {
-            owner = cand;
-            break;
-        }
+    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+        owner = lambdaOwnerOfParameter(ps);
+        if (!owner || owner == closureScanStack_.back()) return false;
+        if (ps->modifier != "owned" && ps->modifier != "out owned") return false;
+    } else {
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+        if (!ls) return false;
+        owner = lambdaOwnerOfDeclaringLambda(sym);
+        if (!owner || owner == closureScanStack_.back()) return false;
+        if (!lambdaBodyLocalHoldsBorrow(ls, *owner, id->span.begin.offset,
+                                        OwnershipState::Owned))
+            return false;
     }
-    // Not declared by any enclosing lambda (method body: #7920's own arm), or
-    // declared by the throwing lambda itself (its own local: admitted).
-    if (!owner || owner == closureScanStack_.back()) return false;
-    if (!lambdaBodyLocalHoldsBorrow(ls, *owner, id->span.begin.offset,
-                                    OwnershipState::Owned))
-        return false;
     reportOnce(Severity::Error, id->span.begin,
                std::string("cannot throw captured owned binding `") +
                    std::string(id->name) +
@@ -6301,6 +6309,33 @@ bool MethodOwnership::reportEnclosingLambdaOwnedThrow(const ast::Expr& op) {
                    "and transfer the value in from outside, or restructure so "
                    "the closure only borrows it.");
     return true;
+}
+
+// fix #8926 (§28.3 *Captured owned bindings*, §31.1, v0.359): the lambda that
+// DECLARES a parameter.
+//
+// A lambda's `ParameterSymbol` carries no declaration location (sema records
+// only its name and modifier — src/sema/ExprTypecheck_Exprs.cpp), so the
+// owner cannot be resolved by source range the way a local's owner is. The
+// parameters a lambda declares are read from `ctx_.lambdaParams`, the same
+// route `reportMoveOnlyChoiceMoveInClosure` uses. `closureScanStack_` holds
+// the chain of lambda literals the scan is inside, so at most one of them
+// declares the parameter. Returns null when none does — the parameter then
+// belongs to the METHOD body, which is #7920's own arm. // per §28.3, §31.1,
+// v0.359, #8926
+const ast::LambdaExpr* MethodOwnership::lambdaOwnerOfParameter(
+    sema::ParameterSymbol* ps) {
+    if (!ps) return nullptr;
+    for (auto it = closureScanStack_.rbegin(); it != closureScanStack_.rend();
+         ++it) {
+        const ast::LambdaExpr* cand = *it;
+        if (!cand) continue;
+        const std::vector<sema::Symbol*>* lps = ctx_.lambdaParams(cand);
+        if (!lps) continue;
+        for (sema::Symbol* lp : *lps)
+            if (lp == ps) return cand;
+    }
+    return nullptr;
 }
 
 void MethodOwnership::reportCapturedOwnedConsume(std::string_view name,
