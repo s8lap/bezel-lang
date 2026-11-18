@@ -16576,7 +16576,31 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
     // already ran them, §22.8 step 1).
     if (!isThis)
         emitOwnFieldInit(cs->parent, obj, classStruct(cs->parent));
-    bool bodyTerminated = lowerScopedBlock(cd->body, startIdx);
+    // fix #8765 (§27.5 / §28.9, v0.359): the ctor's PARAMETERS are declared in
+    // the CTOR BODY's own scope — the scope `lowerScopedBlock` opens below —
+    // and are invisible outside it: the caller's frame never names them. So
+    // the depth #3403's guard reads for a captured parameter (the scope the
+    // parameter is visible in) is this scope's depth, not the caller's
+    // function-body ROOT scope the guard hard-coded. Read it off the emitter's
+    // own facts — `lowerScopedBlock` pushes exactly one scope — for the ctor
+    // body's duration only, and restore it on return so a nested inlined
+    // constructor body (one constructor body constructing another) reads its
+    // own depth while it is lowered, and the caller's own body reads the
+    // root scope again afterwards.
+    //
+    // Without this the capture cell of a constructor parameter captured by a
+    // lambda in an INLINED constructor body was never reclaimed: one 4 B
+    // cell per construction (MEASURED: 800 B in 200 allocations over 200
+    // constructions). The same body in a COMPILED constructor — whose body
+    // scope IS the function-body root scope — is clean, and so is the same
+    // body capturing a LOCAL, which the #969 `declScopeDepth_` rule already
+    // handles by the local's own recorded depth.
+    bool bodyTerminated = false;
+    {
+        CapturedParamScopeDepth ctorParamScopeDepth(
+            this, disposeStack_.size() + 1);
+        bodyTerminated = lowerScopedBlock(cd->body, startIdx);
+    }
     // fix #1239 / §14/§31: if the inlined constructor body diverged — e.g.
     // because it ends with an unconditional `throw` — the current basic block
     // already has a terminator (the `br` to ctor.inline.cleanup).  The
@@ -21688,7 +21712,39 @@ void Emitter::consumeLastLambdaCapturedCells() {
         // clean on a build with this conjunct deleted. That is the deliberate
         // trade, the same one #969 made for locals, and the correct direction of
         // danger: the alternative reading is the SIGSEGV above.
-        if (ce.isParam && disposeStack_.size() > 1) continue;
+        //
+        // fix #8765 (§27.5 / §28.9, v0.359): the depth above is the depth of
+        // the scope the PARAMETER is declared in, and for an INLINED
+        // constructor body that is NOT the function-body ROOT scope.
+        // `inlineCtorBody` lowers a generic class constructor, a record
+        // constructor and a `this(...)` chain target into the CALLER's frame,
+        // where the ctor body opens its OWN scope; the ctor's parameters are
+        // declared in THAT scope and are invisible outside it (the caller's
+        // frame never names them). So the capture site's depth is >= 2 even
+        // when the call site sits at the caller's root, and the hard-coded
+        // "1" declined the capture-cell free for EVERY parameter captured by
+        // an inlined constructor body: the 4 B cell leaked once per
+        // construction (MEASURED: 800 B in 200 allocations over 200
+        // constructions of a generic class whose constructor body forms a
+        // lambda capturing a constructor parameter; the same body in a
+        // COMPILED constructor is clean, and so is the same body capturing a
+        // LOCAL).
+        //
+        // The guard's MEANING is unchanged — skip the free only when the
+        // capture site is DEEPER than the scope the parameter is declared in,
+        // the #3403 hazard, where the parameter is read after the capture
+        // site's scope exits and the cell must outlive it — but the depth it
+        // compares against is now the depth of the scope the parameter is
+        // actually visible in (`capturedParamDeclScopeDepth_`, set by
+        // `inlineCtorBody` for the ctor body's duration and 1 — the
+        // function-body ROOT scope — everywhere else). A capture at the ctor
+        // body's own top level is at the parameter's own depth, so the free
+        // is admitted; a capture in a NESTED block of the ctor body is
+        // deeper, so the free is still declined and the #3403 hazard keeps
+        // its SIGSEGV-avoiding behaviour.
+        if (ce.isParam &&
+            disposeStack_.size() > capturedParamDeclScopeDepth_)
+            continue;
         auto dd = declScopeDepth_.find(ce.key);
         if (dd != declScopeDepth_.end() && dd->second < disposeStack_.size()) {
             // fix #4261: before deferring, check whether an OUTER scope has

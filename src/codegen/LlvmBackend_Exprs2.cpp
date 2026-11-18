@@ -14612,7 +14612,31 @@ llvm::Value* Emitter::buildRecordValue(
                 bodyStartIdx = 1;
             }
         }
-        lowerScopedBlock(cd->body, bodyStartIdx);
+        // fix #8765 (§27.5 / §28.9, v0.359): the record constructor's
+        // PARAMETERS are declared in the CONSTRUCTOR BODY's own scope — the
+        // scope `lowerScopedBlock` opens below — and are invisible outside
+        // it: the caller's frame never names them. So the depth #3403's
+        // guard reads for a captured parameter (the scope the parameter is
+        // visible in) is this scope's depth, not the caller's function-body
+        // ROOT scope the guard hard-coded. Read it off the emitter's own
+        // facts — `lowerScopedBlock` pushes exactly one scope — for the
+        // constructor body's duration ONLY (the guard restores it on scope
+        // exit, so a capture formed in the CALLER's body afterwards reads
+        // the caller's own depth again).
+        //
+        // The record constructor's inline path is the RECORD twin of
+        // `inlineCtorBody` (LlvmBackend_Setup.cpp) and had the same 4 B
+        // capture cell leaked once per construction (MEASURED: 800 B in 200
+        // allocations over 200 constructions of a record whose constructor
+        // body forms a lambda capturing a constructor parameter). The
+        // issue's own note that "the record form is clean" does not hold
+        // for a RECORD with an explicit constructor and a parameter-capturing
+        // lambda — measured on the base tree.
+        {
+            CapturedParamScopeDepth recCtorParamScopeDepth(
+                this, disposeStack_.size() + 1);
+            lowerScopedBlock(cd->body, bodyStartIdx);
+        }
         if (analyzeRecordCtorClosures) {
             closureLocalCapturedCell_ =
                 std::move(savedRecCtorClosureCapturedCell);

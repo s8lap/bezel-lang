@@ -2051,6 +2051,51 @@ private:
     // LastCellEntry::isParam (fix #3403) carries the same fact without needing a
     // registration at every one of paramSlots_'s ~20 population sites.
     std::unordered_map<const void*, std::size_t> declScopeDepth_;
+    // fix #8765 (§27.5 / §28.9, v0.359): the scope depth in which the
+    // PARAMETERS of the body being lowered are declared — the scope
+    // #3403's guard reads to decide whether a captured parameter's cell may
+    // be freed at the capture site's scope end (it may NOT when the parameter
+    // is read after that scope exits, the #3403 hazard).
+    //
+    // The value is the FUNCTION-BODY ROOT scope (depth 1) everywhere except
+    // inside an INLINED constructor body: `inlineCtorBody` lowers a generic
+    // class constructor, a record constructor or a `this(...)` chain target
+    // into the CALLER's frame, where it opens its OWN scope, and ITS
+    // parameters are declared in THAT scope (and are invisible outside it).
+    // #3403's guard hard-coded "depth 1 IS the function-body ROOT scope",
+    // which does not hold for an inlined constructor body, so it declined the
+    // capture-cell free for EVERY parameter captured there and the 4 B cell
+    // leaked once per construction (MEASURED: 800 B in 200 allocations over
+    // 200 constructions of a generic class whose constructor body forms a
+    // lambda capturing a constructor parameter; the same body in a compiled
+    // constructor is clean).
+    //
+    // `inlineCtorBody` sets it to the ctor body's own scope depth for the
+    // ctor body's duration only and restores it on return, so a nested
+    // inlined constructor body (one constructor body constructing another)
+    // reads its own depth while it is lowered.
+    std::size_t capturedParamDeclScopeDepth_ = 1;
+    // fix #8765 (§27.5 / §28.9, v0.359): RAII for
+    // `capturedParamDeclScopeDepth_`. An INLINED constructor body declares
+    // ITS parameters in the scope it opens for its own body, so the depth is
+    // set for that body's duration ONLY and restored on scope exit — a
+    // capture formed in the CALLER's body after the inlined constructor
+    // returns must read the caller's own depth again, not the constructor
+    // body's.
+    struct CapturedParamScopeDepth {
+        Emitter* self;
+        std::size_t saved;
+        CapturedParamScopeDepth(Emitter* e, std::size_t depth)
+            : self(e), saved(e->capturedParamDeclScopeDepth_) {
+            e->capturedParamDeclScopeDepth_ = depth;
+        }
+        ~CapturedParamScopeDepth() {
+            self->capturedParamDeclScopeDepth_ = saved;
+        }
+        CapturedParamScopeDepth(const CapturedParamScopeDepth&) = delete;
+        CapturedParamScopeDepth& operator=(const CapturedParamScopeDepth&) =
+            delete;
+    };
     // fix #4523 (§27.5 / §28.9, v0.306): the FUNCTION each `declScopeDepth_`
     // entry is a depth INTO. `declScopeDepth_` is module-wide and never cleared,
     // while `disposeStack_` is cleared per body (lowerLambda, every async resume
