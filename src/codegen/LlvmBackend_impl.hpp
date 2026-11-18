@@ -15383,9 +15383,12 @@ private:
     //   * `syncIter` — a SYNC/ASYNC ITERATOR callee, whose frame retains
     //     its own +1 on the cell (#1864);
     //   * `callBounded` — a PLAIN (call-bounded) parameter (#1073);
-    //   * `scoped` — a `scoped` parameter whose callee body provably
-    //     never references it, so the callee provably did not store it
-    //     (#3195).
+    //   * `scoped` — a `scoped` parameter (#3195; widened by #8817 to EVERY
+    //     `scoped` formal, not only the passive ones): the callee receives
+    //     the callback as a BORROW and takes its own reference only by
+    //     storing it into a `scoped` field of the bounding object (which
+    //     retains), so the caller's producer reference is the caller's to
+    //     drop after the call.
     struct CallClosureArgRelease {
         std::vector<llvm::Value*> syncIter;
         std::vector<llvm::Value*> callBounded;

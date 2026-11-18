@@ -19792,27 +19792,38 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
             }
         }
     }
-    // fix #3195 / §28.14 (the SCOPED PASSIVE case) / §28.9 / §27.5: a `scoped`
-    // function-typed parameter MAY store the callback (§28.14), but only if the
-    // callee body actually references the parameter — a `Subscribe(scoped h: () -> ())`
-    // whose body is `=> new Sub()` never reads `h`, so the +1 closure producer
-    // passed in is caller-owned through-and-through and the cell (40 bytes) +
-    // its env block (8 bytes) leak per call (LSan, on the issue's exact repro).
+    // fix #3195 / §28.14 (the SCOPED case) / §28.9 / §27.5, WIDENED by
+    // fix #8817 (§28.14 / §28.9, v0.359): a `+1` closure producer (a lambda
+    // literal, or a method reference) passed to a `scoped` function-typed
+    // parameter of a user-authored callee is the CALLER's reference, and the
+    // caller drops it once the call returns. #3195 armed that release only
+    // for the SCOPED PASSIVE case — a callee whose body never references the
+    // parameter, where no `scoped` field write can have occurred and the
+    // producer's +1 was caller-owned through-and-through (the cell + its env
+    // block leaked per call on the issue's exact repro).
+    //
+    // #8817 widened it to EVERY `scoped` formal, because the passivity test
+    // was not the right discriminator: the callee's own `scoped`-field store
+    // takes an INDEPENDENT +1 on the cell (retained at store, released by the
+    // owner's disposal — `isClosureStorageMember` / `lowerClosureFieldStore`),
+    // so a callee that DOES reference the parameter holds a reference of its
+    // own and the caller's reference is still the caller's to drop. Under the
+    // old bail the producer's +1 was dropped by nobody whenever the callee
+    // referenced the parameter — the closure stored into the `scoped` field
+    // was never freed, 64 B per store (issue #8817). The widened arm is the
+    // same discipline the STRING argument-pass release already follows for
+    // every formal (§28.9): "the callee receives the string as a BORROW …
+    // if the callee stores the param into a string field the field-store path
+    // inside the callee already retains it independently (rc→2), so our
+    // release here (rc→1) is safe".
     //
     // WHY THE CALLER MAY DROP IT HERE. §28.14 ("The callee may store the
-    // callback") makes storage a MAY, not a MUST; when the callee body
-    // provably does NOT reference the parameter, no `scoped` field write can
-    // have occurred — `MethodOwnership::scopedFormalAt` rejects every sink
-    // other than a direct non-owned `scoped` field of the bounding object, and
-    // such a write would require the parameter's identifier in the body. We
-    // confirm by walking the callee's body for any `IdentifierExpr` whose name
-    // matches `p.name`; a hit proves a real reference (a call-invocation
-    // `h()` reads through the cell's function pointer without +1, so it does
-    // NOT transfer ownership — but we conservatively bail on ANY hit because a
-    // a body that invokes `h` may also store it elsewhere via forwarding, and
-    // the leak is the safe direction (a UAF is not). So we arm only when the
-    // body has zero references to the parameter — the common `=> new R()`
-    // ignore-handler shape, where storage is provably absent.
+    // callback") makes storage a MAY, not a MUST, and §28.14's own admission
+    // rules enumerate the callee's three permitted uses of the parameter —
+    // invoke it, store it into a `scoped` field of the bounding object, or
+    // forward it to a `scoped` parameter of a call on `this` — so no other
+    // path can keep the caller's reference alive by itself. See the per-arm
+    // comment below for the per-use discharge.
     //
     // Same exclusions as the call-bounded arm above: not async, not sync iter,
     // declared return not a frame, and the substituted result type not a frame
@@ -19892,21 +19903,63 @@ Emitter::CallClosureArgRelease Emitter::prepareCallClosureArgRelease(
                 // where the inline spelling `scoped f: (int) -> string` was
                 // already clean. Fail-closed direction unchanged.
                 if (!p.type || !resolvedFormalIsFunction(*p.type, ctx_)) continue;
-                // Body-references check: bail at any hit (the conservative
-                // direction — leak, not UAF).
-                std::vector<const ast::IdentifierExpr*> bodyRefs;
-                if (mdSc->bodyKind == ast::MethodBodyKind::Expression &&
-                    mdSc->exprBody) {
-                    collectClosureArgBodyIdentifiers(*mdSc->exprBody, bodyRefs);
-                } else if (mdSc->bodyKind == ast::MethodBodyKind::Block) {
-                    for (const auto& st : mdSc->stmts)
-                        if (st) collectClosureArgBodyIdentifiers(*st, bodyRefs);
-                }
-                bool referenced = false;
-                for (const ast::IdentifierExpr* id : bodyRefs) {
-                    if (id->name == p.name) { referenced = true; break; }
-                }
-                if (referenced) continue;
+                // fix #8817 (§28.14 / §28.9, v0.359): the body-references bail
+                // that used to sit here is GONE. A `scoped` formal is received
+                // as a BORROW of the caller's value (§28.3's producers table:
+                // a by-value function-typed parameter is an unmodified borrow;
+                // §28.1 makes `owned` inadmissible on a function type). What
+                // the callee MAY do with it (§28.14) is exactly three things,
+                // and sema enforces the list (the diagnostic at
+                // `src/ownership/Ownership_Checks.cpp`'s scoped-formal arm
+                // names them): invoke it, store it into a `scoped` field of the
+                // bounding object, or forward it to a `scoped` parameter of a
+                // call on `this`. It may NOT be bound to a local, returned, or
+                // stored anywhere else — so there is no path on which the
+                // callee keeps the caller's reference alive by itself.
+                //
+                //   * INVOKED — the callee reads the cell's function pointer
+                //     and takes no reference; the caller's +1 is the only one,
+                //     and the caller's release after the call reclaims it.
+                //   * STORED into a `scoped` field of the bounding object —
+                //     that store is `lowerClosureFieldStore`
+                //     (`src/codegen/LlvmBackend_Setup.cpp`), which RETAINS the
+                //     new value for the field ("a class closure field holds
+                //     an INDEPENDENT +1 on a closure cell, retained at store
+                //     and released on the owner's disposal" —
+                //     `isClosureStorageMember`). The field therefore owns a
+                //     reference of its own, and the caller's release after the
+                //     call cannot strand it: the field's reference is dropped
+                //     exactly once, by the store's release-old (overwrite) or
+                //     by the owner's disposer (holder gone) — §28.14's
+                //     "storage-bounded" bound, realised.
+                //   * FORWARDED to another `scoped` parameter — the forwarded
+                //     callee invokes or stores, i.e. the same two cases, and
+                //     the forwarded argument is not a `+1` producer (it is an
+                //     identifier), so no release is armed for it here.
+                //
+                // So the caller's producer reference is the CALLER's to drop
+                // on EVERY `scoped` formal, exactly as it already was for a
+                // PLAIN (call-bounded) formal (`rel.callBounded`) and as it is
+                // for a `string` producer at ANY formal (#429's ARGUMENT-PASS
+                // category, `src/codegen/LlvmBackend_Calls2.cpp`'s string
+                // release: "the callee receives the string as a BORROW … if
+                // the callee stores the param into a string field the
+                // field-store path inside the callee already retains it
+                // independently (rc→2), so our release here (rc→1) is safe").
+                // The closure path was the one that diverged from that
+                // discipline, and the divergence is issue #8817's leak: a
+                // closure stored into a `scoped` field was never freed (the
+                // producer's +1 was dropped by nobody), 64 B per store.
+                //
+                // The old bail was the conservative direction (leak, not
+                // UAF) and it was WRONG to be conservative here, because the
+                // store it was afraid of DOES take its own reference. The
+                // remaining soundness requirement is the one §28.14's own
+                // admission rules give for free: a `scoped` formal may not be
+                // bound to a local (semantic rejection, §28.14), so the
+                // "rebind a local initialized from the formal" hazard — the
+                // one shape in which a callee could drop a reference it never
+                // owned — is not expressible for a `scoped` formal.
                 const std::size_t ai = off + pi;
                 if (argExprs[ai] && isPlusOneClosureProducer(argExprs[ai]))
                     rel.scoped.push_back(args[ai]);
@@ -20718,11 +20771,14 @@ bool Emitter::deriveDescendantGenericSubst(
 
 
 // fix #3195 / §28.14: walk an arbitrary AST node collecting every bare
-// `IdentifierExpr` it contains. Used by the `scoped`-passive release arm in
-// emitMethodCall to test whether a `scoped` function-typed parameter is
-// referenced ANYWHERE in the callee body — a hit proves the parameter is used
-// (and so the release is conservatively bailed on). The walk matches the
-// `Ownership_Checks.cpp::collectIdentifiersIn` shape one-for-one — same AST
+// `IdentifierExpr` it contains. Used by the sync-iterator release arm in
+// emitMethodCall to test whether a function-typed formal is referenced ANYWHERE
+// in the callee body — a hit proves the parameter is used (and so the release
+// is conservatively bailed on). (The `scoped` release arm used it for the same
+// question until fix #8817 widened that arm to the referencing case, which the
+// §28.14 admission rules make sound — a `scoped` formal may not be bound to a
+// local, so no callee can drop a reference it never owned.) The walk matches
+// the `Ownership_Checks.cpp::collectIdentifiersIn` shape one-for-one — same AST
 // coverage, same descent, so the two walkers cannot disagree on what counts
 // as a reference.
 void Emitter::collectClosureArgBodyIdentifiers(

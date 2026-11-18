@@ -39,15 +39,30 @@
 // UAF).
 //
 // FAIL-WITHOUT / PASS-WITH. Cases A, B, D, E leak on base (40B closure cell
-// each call). Case C is the control row from the issue body — plain `var p :=
-// new Pub(); return 0;` — which is clean both before and after the fix.
-// Cases F, G, H pin the over-arm guards: the callee body that DOES reference
-// `h` (F), a sync iterator that retains (G), and a deferred-activation callee
-// (H) all retain the closure past the call and the release must NOT arm — a
-// wrongly-armed release would surface as the ASan use-after-free the helper
-// still catches. The same exclusions the #1073 / #2305 arm applies carry over
-// to the scoped arm unchanged (not async, not sync iter, declared return not
-// a frame, substituted result not a frame / lazy-query / function value).
+// each call). Case C is the control row from the issue body's plain `var p :=
+// new Pub(); return 0;` shape — clean both before and after the fix.
+// Cases G and H pin the over-arm guards: a sync iterator that retains (G) and
+// a deferred-activation callee (H) both retain the closure past the call, and
+// the release must NOT arm there — a wrongly-armed release would surface as
+// the ASan use-after-free the helper still catches. The same exclusions the
+// #1073 / #2305 arm applies carry over to the scoped arm unchanged (not async,
+// not sync iter, declared return not a frame, substituted result not a frame /
+// lazy-query / function value).
+//
+// CASE F, WIDENED BY fix #8817 (§28.14 / §28.9, v0.359). Case F is a callee
+// whose body DOES reference `h` (it invokes it) — the shape the #3195 arm
+// bailed on. #8817 widened the `scoped` arm to that shape too, because the
+// callee's own `scoped`-field store takes an INDEPENDENT +1 on the closure
+// cell (retained at store, released on the owner's disposal), so the
+// caller's producer reference is the caller's to drop after the call in EVERY
+// case; and a callee that only INVOKES the callback takes no reference at
+// all, so the caller's release reclaims the cell it owns. Case F therefore no
+// longer "must NOT arm": it now runs with the release armed, and it still
+// runs clean (the callee used the callback during the call, and the cell is
+// reclaimed once the call returns). The row's assertion is unchanged — it
+// still pins that a callee which references the callback neither leaks nor
+// trips the ASan use-after-free check — and the two rows that still must not
+// arm are G and H, whose callees retain the closure past the call.
 
 #include <string>
 
@@ -248,13 +263,16 @@ BEZEL_TEST(codegen_3195_scoped_passive, method_reference_scoped_param_released_s
 }
 
 // ===========================================================================
-// F — OVER-ARM CONTROL #1: a callee body that DOES reference the `scoped`
-// parameter MUST keep the closure alive (the callee is permitted to forward
-// or invoke it without taking a +1, but the conservative body-references gate
-// bails at any hit). A wrongly-armed release would UAF; the lenient helper
-// still catches that with ASan. This row runs clean both before and after
-// the fix (the body does no storage, so the call-bounded release path was
-// already correct; the new scoped arm must simply NOT also fire here).
+// F — a callee body that DOES reference the `scoped` parameter (it invokes
+// it). WIDENED by fix #8817 (§28.14 / §28.9, v0.359): the #3195 arm bailed at
+// any body reference, on the theory that a referencing callee might store the
+// callback without taking a reference. It does take one — a `scoped`-field
+// store retains an INDEPENDENT +1 on the closure cell — and a callee that
+// only INVOKES the callback takes none, so the caller's producer reference
+// is the caller's to drop after the call in every case. The release therefore
+// arms here, and the row still runs clean: the callee used the callback
+// during the call and the cell is reclaimed once the call returns. The
+// lenient helper still catches a wrongly-armed release with ASan.
 // ===========================================================================
 BEZEL_TEST(codegen_3195_scoped_passive, over_arm_control_body_references_h_spec_28_14) {
     auto r = runAotCheckedLenient(
