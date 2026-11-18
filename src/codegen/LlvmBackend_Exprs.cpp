@@ -6049,6 +6049,86 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 return igKeyPhi;
             }
         }
+        // fix #8749 (§7.5 / §7.7, stdlib §4.6 / §4.18, v0.359): `l?.First` /
+        // `l?.Last` on a nullable `LinkedList<T>` / `OwningLinkedList<T>` /
+        // `SortedSet<T>` receiver. The `.` form is the §4.6 `T?` getter (the
+        // MemberAccessExpr arm's `bz_llist_first_node` read) or the §4.18 `T`
+        // getter (the `bz_dict_min/max_key` read); a `?.` access is a DISTINCT
+        // AST node, so those arms never ran and the access lowered to NOTHING
+        // (#2434, #3079): `Console.WriteLine(m?.First ?? -1)` printed no line
+        // at all. §7.5: the `?.` result is the nullable of the member type
+        // (`T?` over a `T?` flattens). The receiver is lowered ONCE; a null
+        // receiver yields null, otherwise the `.` form's own lowering runs on
+        // a synthetic `.` node over a pinned placeholder carrying the
+        // already-lowered receiver (the `?.Count` pattern below). The
+        // SortedSet getter returns the bare `T`, which this arm lifts to the
+        // present `T?`.
+        if ((nm->member == "First" || nm->member == "Last") &&
+            ctx_.exprSymbol(e) == nullptr) {
+            const sema::TypeRef* ncLlRcvTy = ctx_.exprType(*nm->target);
+            const sema::TypeRef* ncLlResTy = ctx_.exprType(e);
+            const bool ncLlIsList =
+                ncLlRcvTy && isLinkedListTypeName(ncLlRcvTy);
+            const bool ncLlIsSorted =
+                ncLlRcvTy && ncLlRcvTy->kind == sema::TypeRef::Kind::Named &&
+                !ncLlRcvTy->declaration && ncLlRcvTy->headName() == "SortedSet";
+            if (ncLlResTy && ncLlResTy->nullable &&
+                (ncLlIsList || ncLlIsSorted)) {
+                llvm::Value* ncLlRcv = lowerExpr(*nm->target);
+                if (!ncLlRcv || !ncLlRcv->getType()->isPointerTy())
+                    return nullptr;
+                auto* ncLlEntryBB = builder_.GetInsertBlock();
+                auto* ncLlAccessBB = llvm::BasicBlock::Create(
+                    llvm_, "ncll.access", currentFn_);
+                auto* ncLlEndBB = llvm::BasicBlock::Create(
+                    llvm_, "ncll.end", currentFn_);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpEQ(
+                        ncLlRcv, llvm::ConstantPointerNull::get(ptrTy())),
+                    ncLlEndBB, ncLlAccessBB);
+                builder_.SetInsertPoint(ncLlAccessBB);
+                auto ncLlPlaceholder = std::make_unique<ast::IdentifierExpr>();
+                ncLlPlaceholder->name = "<nullcond-receiver>";
+                ctx_.setExprType(ncLlPlaceholder.get(),
+                                 const_cast<sema::TypeRef*>(ncLlRcvTy));
+                exprValueOverride_[ncLlPlaceholder.get()] = ncLlRcv;
+                auto ncLlDotted = std::make_unique<ast::MemberAccessExpr>();
+                ncLlDotted->span = e.span;
+                ncLlDotted->member = nm->member;
+                ncLlDotted->target = std::move(ncLlPlaceholder);
+                const ast::Expr* ncLlKey = ncLlDotted->target.get();
+                // The `.` form's own type: the list's `T?`; the sorted set's
+                // bare `T`.
+                sema::TypeRef* ncLlDotTy = ctx_.makeTypeRef(*ncLlResTy);
+                if (ncLlIsSorted) ncLlDotTy->nullable = false;
+                ctx_.setExprType(ncLlDotted.get(), ncLlDotTy);
+                llvm::Value* ncLlInner = lowerExpr(*ncLlDotted);
+                exprValueOverride_.erase(ncLlKey);
+                nullCondCountSynth_.push_back(std::move(ncLlDotted));
+                const bool ncLlRefRes = !isNullableValueTy(ncLlResTy);
+                if (!ncLlInner ||
+                    (ncLlRefRes && !ncLlInner->getType()->isPointerTy())) {
+                    // Unrecognised shape: close the CFG, keep the old result.
+                    builder_.CreateBr(ncLlEndBB);
+                    builder_.SetInsertPoint(ncLlEndBB);
+                    return nullptr;
+                }
+                if (ncLlIsSorted && !ncLlRefRes)
+                    ncLlInner = wrapNullableValue(ncLlResTy, ncLlInner);
+                auto* ncLlAccessEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(ncLlEndBB);
+                builder_.SetInsertPoint(ncLlEndBB);
+                auto* ncLlPhi = builder_.CreatePHI(ncLlInner->getType(), 2);
+                ncLlPhi->addIncoming(
+                    ncLlRefRes
+                        ? static_cast<llvm::Value*>(
+                              llvm::ConstantPointerNull::get(ptrTy()))
+                        : static_cast<llvm::Value*>(nullableValueNull(ncLlResTy)),
+                    ncLlEntryBB);
+                ncLlPhi->addIncoming(ncLlInner, ncLlAccessEnd);
+                return ncLlPhi;
+            }
+        }
         // fix #6024 (§7.5, v0.338): `c?.Count` / `c?.Length` on a built-in
         // collection head, typed `int?` by resolveNullCondMember. The receiver
         // is lowered ONCE; a null receiver yields null, otherwise the `.` form's

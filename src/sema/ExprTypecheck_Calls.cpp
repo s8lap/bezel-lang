@@ -49043,6 +49043,34 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             }
         }
     }
+    // fix #8749 (§7.5 / §7.7, stdlib §4.6 / §4.18, v0.359): `l?.First` /
+    // `l?.Last` on a `LinkedList<T>` / `OwningLinkedList<T>` / `SortedSet<T>`
+    // receiver. The lists declare `public pure readonly property First: T?`
+    // (stdlib §4.6 / §4.7), the sorted set `First: T` (§4.18), and the `.`
+    // form types them in resolveMemberAccess's node-property block
+    // (`makeNullableElemTy`); the `?.` node was left UNTYPED -- no diagnostic,
+    // and codegen lowered the access to nothing behind the #2434 / #3079
+    // warnings, so `Console.WriteLine(m?.First ?? -1)` printed no line at all.
+    // §7.5: "The result type is always nullable", and `T?` over a `T?` member
+    // flattens, so the result is the member's own nullable element type. A
+    // call spelling (`l?.First()`) is left to the paths below.
+    if (!member && recvTyForDiag && currentCallArity_ <= 0 &&
+        &nm != calleeOfCallCtx_ &&
+        (nm.member == "First" || nm.member == "Last") &&
+        recvTyForDiag->kind == TypeRef::Kind::Named &&
+        !recvTyForDiag->declaration &&
+        ((recvTyForDiag->astNode && recvTyForDiag->astNode->name &&
+          !recvTyForDiag->astNode->name->parts.empty()) ||
+         (!recvTyForDiag->astNode && !recvTyForDiag->importedName.empty())) &&
+        (recvTyForDiag->headName() == "LinkedList" ||
+         recvTyForDiag->headName() == "OwningLinkedList" ||
+         recvTyForDiag->headName() == "SortedSet") &&
+        !recvTyForDiag->genericArgs.empty() && recvTyForDiag->genericArgs[0]) {
+        TypeRef* llElem = ctx_.makeTypeRef(*recvTyForDiag->genericArgs[0]);
+        llElem->nullable = true;
+        ctx_.setExprType(&nm, llElem);
+        return;
+    }
     // fix #6512 (stdlib §5 / §7.5, v0.338): `?.` on an `IGrouping<TKey, T>`
     // receiver. IGrouping TypeRefs are synthetic (no declaration), so
     // `memberTargetType` above returns null, `lookupMember` finds nothing, and
