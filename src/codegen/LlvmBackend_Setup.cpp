@@ -32016,6 +32016,20 @@ struct StringEscapeWalker {
     // iterable of a `for` whose element type is one. Past such a step the
     // value is a copy that cannot alias the local's backing, so whatever
     // the rest of the lambda does with it cannot outlive that backing.
+    //
+    // second fix-forward #7558 (review r42-rev-s66): a `string` step is NOT
+    // a copy. A read of a string element (`a[1]`, `a.First()`, `x` of a
+    // `for` over an `Array<string>`) yields the string the array still owns,
+    // and a later step may borrow it: `a[1].AsSpan()` is a span over the
+    // element's storage, which the scope-end array free releases (SEGV in
+    // `bz_str_slice_cp` through `return f();`, r02/r06/r07/r07b/r10b/r15/r16;
+    // a span keeping no source alive is #8191). Even a string the lambda
+    // RETURNS is the same runtime-managed string (§4.6, §28.9), shared by
+    // reference rather than copied, so a span the caller takes over it
+    // outlives the array once the caller's own reference drops. A string
+    // step counts as a copy only as the result of a string concatenation
+    // `+` over non-nullable, non-`Object` operands, which always builds a
+    // fresh string (emitStringConcat).
     std::unordered_set<const ast::IdentifierExpr*> lambdaValueReads;
     // fix-forward #7558: nesting depth of `async lambda` bodies. An async
     // lambda's body runs after the call that starts it may have returned
@@ -32026,20 +32040,27 @@ struct StringEscapeWalker {
         return inLambda && asyncLambdaDepth == 0 && captureNonEscaping &&
                (*captureNonEscaping)(target);
     }
-    // A value-copy result: a non-`Object` primitive (`bool`, `char`, the
-    // numeric types, `string`, nullable or not). `string` is runtime-managed
-    // (§28.9) and a read of one takes its own reference. Function types (a
+    // A value-copy result: a primitive other than `Object` and `string`
+    // (`bool`, `char`, the numeric types, nullable or not). Function types (a
     // method reference captures its receiver), `Object` (may box/alias the
-    // receiver), and every Named type (an enumerator, a span, a view, a
-    // record that may hold a borrow) are NOT value copies here.
+    // receiver), `string` (an element read is the array's own string, see
+    // `lambdaValueReads`), and every Named type (an enumerator, a span, a
+    // view, a record that may hold a borrow) are NOT value copies here.
     bool isValueCopyType(const sema::TypeRef* t) const {
         return t && t->kind == sema::TypeRef::Kind::Primitive &&
                t->primitive != sema::PrimitiveType::None &&
-               t->primitive != sema::PrimitiveType::Object;
+               t->primitive != sema::PrimitiveType::Object &&
+               t->primitive != sema::PrimitiveType::String;
+    }
+    // second fix-forward #7558: a non-nullable `string` (the concat test).
+    static bool isPlainStringType(const sema::TypeRef* t) {
+        return t && t->kind == sema::TypeRef::Kind::Primitive &&
+               t->primitive == sema::PrimitiveType::String && !t->nullable;
     }
     void noteLambdaValueReads(const ast::Expr* e, bool sawValue) {
         if (!e) return;
-        if (!sawValue && isValueCopyType(ctx.exprType(*e))) sawValue = true;
+        const sema::TypeRef* et = ctx.exprType(*e);
+        if (!sawValue && isValueCopyType(et)) sawValue = true;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
             if (sawValue && isTargetIdent(id)) lambdaValueReads.insert(id);
             return;
@@ -32062,6 +32083,21 @@ struct StringEscapeWalker {
             return;
         }
         if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            // second fix-forward #7558: a string `+` over non-nullable
+            // operands concatenates into a FRESH string (emitStringConcat
+            // mallocs the result), so its operands are copied, not aliased.
+            if (!sawValue && b->op == "+" && isPlainStringType(et) && b->left &&
+                b->right) {
+                const sema::TypeRef* lt = ctx.exprType(*b->left);
+                const sema::TypeRef* rt = ctx.exprType(*b->right);
+                if (lt && rt && lt->kind == sema::TypeRef::Kind::Primitive &&
+                    rt->kind == sema::TypeRef::Kind::Primitive &&
+                    !lt->nullable && !rt->nullable &&
+                    lt->primitive != sema::PrimitiveType::Object &&
+                    rt->primitive != sema::PrimitiveType::Object &&
+                    (isPlainStringType(lt) || isPlainStringType(rt)))
+                    sawValue = true;
+            }
             noteLambdaValueReads(b->left.get(), sawValue);
             noteLambdaValueReads(b->right.get(), sawValue);
             return;
