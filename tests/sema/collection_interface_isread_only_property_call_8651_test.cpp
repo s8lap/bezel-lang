@@ -10,8 +10,8 @@
 //   end ICollection;
 //
 // so `ICollection<T>` DECLARES it; `IList<T>` (stdlib §4.1) extends
-// `ICollection<T>` and inherits it, and stdlib §4.2 declares the same member
-// on `IOwningCollection<T>`, which `IOwningList<T>` extends. FOUR heads carry
+// `ICollection<T>` and inherits it, and `IOwningCollection<T>` (stdlib §4.2)
+// declares the same member, which `IOwningList<T>` extends. FOUR heads carry
 // the member — `ICollection`, `IList`, `IOwningCollection`, `IOwningList`.
 // (`IReadOnlyCollection<T>` / `IReadOnlyList<T>` declare no `IsReadOnly`;
 // the six heads of #8633 are the `Count` heads.)
@@ -181,8 +181,8 @@ Prog prog(const std::string& recvDecl, const std::string& call) {
     return Prog{src, 6};
 }
 
-// The owning family (stdlib §4.2): the receiver is an `OwningArray<Box>`
-// viewed through one of the owning collection interfaces. The element is a
+// The owning family: the receiver is an `OwningArray<Box>` viewed through
+// one of the owning collection interfaces (`IOwningCollection<T>`, stdlib §4.2). The element is a
 // class, so the owning collection disposes it at scope end.
 Prog owningProg(const std::string& recvDecl, const std::string& call) {
     std::string src = "module M; import System; import System.Linq;\n";  // 1

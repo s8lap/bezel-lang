@@ -3021,9 +3021,9 @@ const std::vector<BuiltinPropertyDecl>& builtinPropertyDecls() {
         // fix #8651 (stdlib §4.1 / §4.2, spec §26.5 rule 1, §27.1, §27.7,
         // §7.5, v0.357): `IsReadOnly` is a PROPERTY of these FOUR heads —
         // stdlib §4.1 declares it on `ICollection<T>` ("readonly property
-        // IsReadOnly: bool;"), which `IList<T>` extends, and stdlib §4.2
-        // declares it on `IOwningCollection<T>`, which `IOwningList<T>`
-        // extends. (`IReadOnlyCollection<T>` / `IReadOnlyList<T>` declare no
+        // IsReadOnly: bool;"), which `IList<T>` extends, and
+        // `IOwningCollection<T>` (stdlib §4.2) declares it, which
+        // `IOwningList<T>` extends. (`IReadOnlyCollection<T>` / `IReadOnlyList<T>` declare no
         // `IsReadOnly` — the six heads of #8633 are the `Count` heads.)
         //
         // A property of a NON-function type is not callable (§27.1, §27.7),
