@@ -2023,6 +2023,138 @@ void reportCollectionLiteralDictFormBadTarget(DiagnosticEngine& diags,
         "change the target type to a dictionary (§15.4)");
 }
 
+// fix #8450 (§15.4, v0.357; stdlib §5): the receiver heads stdlib §5's
+// `extension IEnumerable<T>` block reaches — the built-in heap collections
+// (stdlib §4.4-§4.11, §4.17-§4.19) and the built-in collection interfaces
+// the §5 operators are actually lowered on (stdlib §4.1's `IEnumerable<T>` /
+// `IList<T>` / `IReadOnlyList<T>`).
+//
+// `ICollection<T>` / `IReadOnlyCollection<T>` are deliberately NOT here:
+// fix #7544's own note records that the §5 operators are NOT lowered on them
+// ("their runtime representation is erased (codegen rejects §5 operators on
+// them loudly, #853)"), so a call there is already a LOUD rejection and
+// refusing it here would replace that diagnostic with a different one.
+static bool isLinqEnumerableReceiverHead(std::string_view head) {
+    return head == "Array" || head == "OwningArray" ||
+           head == "Set" || head == "OwningSet" ||
+           head == "Stack" || head == "OwningStack" ||
+           head == "Queue" || head == "OwningQueue" ||
+           head == "LinkedList" || head == "OwningLinkedList" ||
+           head == "SortedSet" || head == "SortedDictionary" ||
+           head == "Dictionary" || head == "OwningDictionary" ||
+           head == "FrozenArray" ||
+           head == "IEnumerable" || head == "IList" || head == "IReadOnlyList";
+}
+
+// fix #8450 (§15.4, v0.357; stdlib §5): the stdlib §5 `extension
+// `IEnumerable<T>` operators whose `other` parameter is DECLARED as an
+// INTERFACE —
+//     public method Concat(other: IEnumerable<T>): IEnumerable<T>;
+//     public method Zip<U, R>(other: IEnumerable<U>, combine: (T, U) -> R): IEnumerable<R>;
+//     public method Union(other: IEnumerable<T>): IEnumerable<T>;
+//     public method Intersect(other: IEnumerable<T>): IEnumerable<T>;
+//     public method Except(other: IEnumerable<T>): IEnumerable<T>;
+// (stdlib §5, `System.Collections.Linq`) — carry NO MethodSymbol, so §22.5's
+// parameter-driven target typing (`checkArgsAgainstParams`) never runs for
+// them: a collection literal at the `other` position is left with NO target
+// type at all.
+//
+// §15.4 (v0.357): "A collection literal has no standalone type. It is
+// well-typed only in a context that provides the target type", and the CLOSED
+// list of "target types that admit collection literals" names NO interface —
+// so a literal at an `IEnumerable<T>` parameter has no determinable target
+// type and is a compile error. Before this the call was ACCEPTED and codegen's
+// #2434 degraded the query local to a zero-initialized value.
+//
+// The refusal reuses the #1174 diagnostic (`reportCollectionLiteralInterfaceTarget`)
+// — the same one the `string.Trim` / `string.Join` arms and the #8390
+// `File.WriteAllLines` arm report — so one rule reads the same at every
+// position.
+//
+// SCOPE — the `other` argument of the five operators, and nothing else:
+//   * `Zip`'s SECOND argument is the `combine` LAMBDA — a function-typed
+//     parameter (`combine: (T, U) -> R`), not an `IEnumerable<T>` one — so it
+//     is out of scope here (§15.4's target list names no function type
+//     either).
+//   * The receiver must be a SEQUENCE the §5 block reaches: the lazy sentinel
+//     a chained §5 call mints, a built-in heap collection, or a built-in
+//     collection interface. A receiver outside that set is a different call
+//     surface — the user's own declared member — where §15.4's target check
+//     already runs through `checkArgsAgainstParams`.
+static void reportLinqEnumerableLiteralArg(SemaContext& ctx,
+                                           const ast::CallExpr& ce) {
+    auto* bma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!bma || !bma->target) return;
+    const std::string_view m = bma->member;
+    // The `other` argument is the FIRST argument of every one of the five
+    // (stdlib §5's declared signatures, quoted above). The ARITY is the
+    // signature's: one argument for Concat/Union/Intersect/Except, two for
+    // the `Zip<U,R>(other, combine)` form.
+    if (m == "Zip") {
+        if (ce.args.size() != 2) return;
+    } else if (m == "Concat" || m == "Union" || m == "Intersect" ||
+               m == "Except") {
+        if (ce.args.size() != 1) return;
+    } else {
+        return;
+    }
+    // A USER-declared member of the same name — an extension block's method
+    // (`resolveExtensionMember` publishes the MethodSymbol on the callee) or
+    // an instance method — binds the call to ITS OWN declared parameter type,
+    // which may well be a legal §15.4 target (`Array<T>`). §26.5 picks that
+    // member, not stdlib §5's operator, so the interface-parameter refusal
+    // must not fire on it.
+    if (dynamic_cast<MethodSymbol*>(ctx.exprSymbol(*ce.callee))) return;
+    const ast::CallArgument& other = ce.args[0];
+    if (!other.value) return;
+    auto* lit =
+        dynamic_cast<const ast::CollectionLiteralExpr*>(other.value.get());
+    if (!lit) return;
+    // THE RECEIVER. Two shapes reach a §5 operator:
+    //   (a) the LAZY SENTINEL — the Named / no-declaration / no-astNode /
+    //       genericArgs shape the §5 typing mints (`makeLazyEnumerable`),
+    //       i.e. the receiver of a CHAINED §5 call (`a.Where(..).Concat(..)`);
+    //   (b) a built-in heap collection or a built-in collection interface.
+    // The `importedName.empty()` clause is LOAD-BEARING — the same one
+    // `Emitter::isLazyEnumerableType` and `isLazyEnumerableExprType` carry:
+    // a builtin interface RECONSTRUCTED FROM MODULE METADATA has the same
+    // shape but names itself in `importedName`, and that receiver is the
+    // #995 vtable object, not a lazy query.
+    const TypeRef* recvTy = ctx.exprType(*bma->target);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named) return;
+    const bool lazySentinel = !recvTy->declaration && !recvTy->astNode &&
+                              !recvTy->genericArgs.empty() &&
+                              recvTy->importedName.empty();
+    if (!lazySentinel) {
+        // A USER's own type (a class or an interface) is not §5's surface:
+        // the built-in generic interfaces carry NO TypeSymbol (§2.5 / #495),
+        // so `declaration` is null for the built-ins and set for the user's.
+        if (recvTy->declaration) return;
+        const std::string_view head =
+            recvTy->aliasResolvedHead.empty()
+                ? recvTy->headName()
+                : std::string_view(recvTy->aliasResolvedHead);
+        if (!isLinqEnumerableReceiverHead(head)) return;
+    }
+    // THE ELEMENT TYPE. The receiver's element type T is the `other`
+    // parameter's type argument for Concat/Union/Intersect/Except
+    // (`IEnumerable<T>`). For `Zip` the parameter is `IEnumerable<U>` — U is
+    // the OTHER sequence's element type, which for a literal is the type of
+    // the literal's own elements (the literal has no type of its own,
+    // §15.4) — so read it off the literal's first element, falling back to
+    // the receiver's T when the literal is empty or its element is untyped.
+    const TypeRef* elem =
+        recvTy->genericArgs.empty() ? nullptr : recvTy->genericArgs[0];
+    if (m == "Zip" && !lit->elements.empty() && lit->elements[0]) {
+        if (const TypeRef* le = ctx.exprType(*lit->elements[0]))
+            if (le->kind != TypeRef::Kind::Error) elem = le;
+    }
+    std::string iface = "IEnumerable";
+    if (elem) iface += "<" + collectionLiteralTargetSpelling(elem) + ">";
+    reportCollectionLiteralInterfaceTarget(ctx.diagnostics(),
+                                           other.value->span.begin, iface);
+}
+
 // fix #5882 (§15.4 / §3.6 clause (c), v0.338; the #6237 limitation): see the
 // declaration in ExprTypecheck_impl.hpp.
 bool reportHashKeyInlineArrayLiteral(DiagnosticEngine& diags,
@@ -8498,6 +8630,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             }
         }
     }
+    // fix #8450 (§15.4, v0.357; stdlib §5): the same refusal for the stdlib
+    // §5 `extension IEnumerable<T>` operators whose `other` parameter is
+    // DECLARED `IEnumerable<T>` (or `IEnumerable<U>` for `Zip`):
+    // `Concat(other: IEnumerable<T>)`, `Union`/`Intersect`/`Except(other:
+    // IEnumerable<T>)` and `Zip<U,R>(other: IEnumerable<U>, combine: (T,U)->R)`.
+    // They carry no MethodSymbol, so §22.5's parameter-driven target typing
+    // never runs for them and a collection literal at the `other` position has
+    // NO target type. §15.4's target list names no interface, so the literal
+    // is ill-formed there; before this it was accepted and the query local
+    // degraded to a zero value (#2434). A typed binding (`var xs: Array<int>
+    // := [...]`) is unaffected.
+    reportLinqEnumerableLiteralArg(ctx_, ce);
     // §5.2: an explicit conversion `int(x)` — the callee is a primitive
     // type name with no symbol. The call's type is that primitive type.
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get())) {
