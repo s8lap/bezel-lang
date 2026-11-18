@@ -1618,6 +1618,27 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     frt = resolveBareTParamConcreteHoleTy(frt, ev);  // #5024
                     sema::TypeRef frtNvBuf4934;
                     frt = resolveBareTParamNullableHoleTy(frt, ev, frtNvBuf4934);
+                    // fix #8646 (§18.5, §28.9, v0.357): a `string` hole with
+                    // a format spec over a +1 producer. `emitWithFormatSpec`
+                    // builds the padded text as a NEW string and reads the
+                    // hole's own string as a borrow; `appendPart` then
+                    // releases the padded copy (`pv != srcEv`) and nothing
+                    // gave the source back. MEASURED on this fix's parent,
+                    // 200 evaluations: `$"{h.Mint(),12}"` (a user method)
+                    // leaked one string per evaluation. Called
+                    // only where the rendered text is a different value from
+                    // the hole's (else `appendPart` has released it), and
+                    // only for a `string` hole: any other hole's source is
+                    // not the string the classification speaks of. A null
+                    // (the `string?` hole's null path) releases as a no-op.
+                    auto releaseFormattedHoleSource = [&] {
+                        if (frt &&
+                            frt->kind == sema::TypeRef::Kind::Primitive &&
+                            frt->primitive == sema::PrimitiveType::String &&
+                            ev->getType()->isPointerTy() &&
+                            isPlusOneStringProducer(part.expr.get()))
+                            emitStringRelease(ev);
+                    };
                     // §18.5 / §7: a nullable VALUE part WITH a format spec —
                     // branch on hasValue (absent → "null"; present → apply the
                     // spec to the UNWRAPPED payload). emitWithFormatSpec expects
@@ -1705,12 +1726,14 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         phi2->addIncoming(liveStr, liveEnd);
                         phi2->addIncoming(nStr2, nullEnd2);
                         appendPart(phi2, ev, part.expr.get());
+                        if (liveStr != ev) releaseFormattedHoleSource();
                         closePartScope();
                         continue;
                     }
                     pv = emitWithFormatSpec(ev, part.formatSpec, frt);
                     if (pv) {
                         appendPart(pv, ev, part.expr.get());
+                        if (pv != ev) releaseFormattedHoleSource();
                         closePartScope();
                         continue;
                     }

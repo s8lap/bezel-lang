@@ -128,3 +128,39 @@ BEZEL_TEST(codegen_str_consumer_release, string_producer_discard_is_released_642
         "end Main; end C;");
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
 }
+
+// #8646 (§18.5 / §28.9): an interpolation hole with an alignment pads a COPY
+// of the hole's text; the hole's own +1 string must be released, on the
+// `string` and the `string?` hole alike. 200x.
+BEZEL_TEST(codegen_str_consumer_release, string_producer_formatted_hole_is_released_8646_spec_18_5) {
+    auto r = runAotChecked(
+        "module M; "
+        "class H "
+        "  private _n: int; "
+        "  public constructor(n: int) _n := n; end constructor; "
+        "  public method Mint(): string return \"KM\" + _n.ToString(); end Mint; "
+        "  public method Long(): string return \"long-producer-string-no-\" + _n.ToString(); end Long; "
+        "  public method MintQ(): string? return \"KQ\" + _n.ToString(); end MintQ; "
+        "  public property P: string get => \"KP\" + _n.ToString(); end P; "
+        "end H; "
+        "class Z "
+        "  public static method Id(s: string): string return s; end Id; "
+        "  public static method TakeO(o: Object): int return 1; end TakeO; "
+        "  public static method Len(s: string): int return s.Length; end Len; "
+        "end Z; "
+        "class C public static method Main(): int "
+        "  var i := 0; var tot := 0; "
+        "  var s := \"local\" + 1.ToString(); "
+        "  var h := new H(7); "
+        "  while i < 200 do "
+        "    i := i + 1; "
+        "    var a := $\"{h.Mint(),12}\"; "
+        "    var b := $\"{h.Long(),-30}|\"; "
+        "    var c := $\"{h.MintQ(),30}\"; "
+        "    if a.Length = 12 and b.Length = 31 and c.Length = 30 then tot := tot + 1; end; "
+        "  end while; "
+        "  if tot = 200 * 1 then return 1; end; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 1);
+}
