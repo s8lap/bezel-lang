@@ -7388,6 +7388,40 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
                     return;
                 }
             }
+            // fix #8837 (§28.3 *Provenance* clause 1 + the sink rule, K3.13,
+            // v0.359): a captured BORROWED local — `var b := t;` is a borrow
+            // (K3.13) — contributes "that binding's source", so `return
+            // lambda() => b.v;` carries `t` and is rejected exactly as the
+            // direct `return lambda() => t.v;` is (the Owned leg below). `b`
+            // is Borrowed in `states_`, so that leg skipped it and the
+            // returned closure read `t` after its scope-end disposal. A
+            // borrow-bearing record / span / choice carrier is left to the
+            // §9.7 leg below, which already rejects it with its own wording.
+            const sema::TypeRef* aliasTy = nullptr;
+            if (auto* als = dynamic_cast<sema::LocalSymbol*>(sym))
+                aliasTy = als->declType;
+            const bool aliasIsCarrier =
+                aliasTy && (isBorrowBearingRecordOrSpan(aliasTy) ||
+                            isBorrowBearingChoice(aliasTy));
+            if (sema::Symbol* root = aliasIsCarrier
+                                         ? nullptr
+                                         : capturedAliasEscapeBoundSource(sym)) {
+                report(
+                    Severity::Error, id->span.begin,
+                    std::string("returned closure captures `") +
+                    std::string(sym->name) + "`, a borrow of `" +
+                    std::string(root->name) +
+                    "` whose source is disposed at scope end — a captured "
+                    "borrowed local contributes its own source to the "
+                    "closure's source set (§28.3 closure bullet, provenance "
+                    "clause 1; `var b := t;` is a borrow, K3.13), so the "
+                    "returned closure would outlive `" +
+                    std::string(root->name) +
+                    "` (use-after-dispose); keep the owned location in a "
+                    "longer-lived scope, or copy the data the closure needs "
+                    "out of it)");
+                return;  // one diagnostic per return is enough
+            }
             // §31.1 (issue #392): a returned/escaping closure capturing a
             // catch-bound exception variable. The caught exception is a borrow
             // whose lifetime is the catch arm body; capturing it does not
@@ -10347,6 +10381,13 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             // the other, so `states_[g].source` stayed empty and the §28.3
             // outlive rejection never fired.
             if (sema::Symbol* carried = captureSourceOf(sym)) return carried;
+            // fix #8837 (§28.3 *Provenance* clause 1, K3.13, v0.359): a
+            // captured BORROWED local contributes its source — `var b := t;
+            // var f := lambda() => b.v;` carries `t` exactly as
+            // `lambda() => t.v` does, so the holder's later escape (a return,
+            // an outer-local store) is judged against `t`.
+            if (sema::Symbol* root = capturedAliasEscapeBoundSource(sym))
+                return root;
             // §9.7 (#2144): a captured local of borrow-bearing record /
             // builtin-span type re-borrows every source the record carries
             // (recordBorrowLocalSource_, the #1726/#1966 provenance). The
@@ -18701,9 +18742,26 @@ sema::Symbol* MethodOwnership::captureSourceOf(const sema::Symbol* sym) {
     // escape-bound obligation at this point (already disposed / moved out, or a
     // parameter, which outlives the call) is not a live borrow to diagnose —
     // the same guard the direct capture paths apply.
-    for (sema::Symbol* s : captureSourcesOf(sym))
+    for (sema::Symbol* s : captureSourcesOf(sym)) {
         if (isEscapeBoundLocal(s)) return s;
+        // fix #8837 (§28.3 *Provenance* clause 1, v0.359): a captured leaf
+        // that is itself a borrow (`var b := t;`) contributes its source.
+        if (sema::Symbol* root = capturedAliasEscapeBoundSource(s)) return root;
+    }
     return nullptr;
+}
+
+sema::Symbol* MethodOwnership::capturedAliasEscapeBoundSource(
+    const sema::Symbol* sym) const {
+    if (!sym || !dynamic_cast<const sema::LocalSymbol*>(sym)) return nullptr;
+    auto it = states_.find(const_cast<sema::Symbol*>(sym));
+    if (it == states_.end() || !it->second.source || !it->second.source->sym)
+        return nullptr;
+    // Only a BORROWED holder: an owned local's own capture is the Owned leg's,
+    // and a moved-from / disposed holder carries no live borrow.
+    if (it->second.state != OwnershipState::Borrowed) return nullptr;
+    sema::Symbol* src = it->second.source->sym;
+    return isEscapeBoundLocal(src) ? src : nullptr;
 }
 
 

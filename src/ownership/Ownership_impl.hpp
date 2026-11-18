@@ -1416,6 +1416,15 @@ private:
     // convenience for the capture walks, which report one borrow at a time.
     // per §28.3, v0.338
     sema::Symbol* captureSourceOf(const sema::Symbol* sym);
+    // fix #8837 (§28.3 *Provenance* clause 1, K3.13, v0.359): the live
+    // escape-bound source a captured BORROWED local contributes. `var b := t;`
+    // is a borrow (K3.13), and clause 1 counts "a captured borrowed local or
+    // parameter [as] that binding's source", so a lambda capturing `b` carries
+    // `t` exactly as one capturing `t` does. Null unless `sym` is a local
+    // whose current tracked borrow source (`states_[sym].source`, the root of
+    // the alias chain — Shape 1 of borrowSourceForExpr records the root) is
+    // still a live escape-bound obligation here. // per §28.3, v0.359
+    sema::Symbol* capturedAliasEscapeBoundSource(const sema::Symbol* sym) const;
     // issue #4225 (§28.3/§28.7/§30.14 v0.180): the sibling window table for a
     // PLAIN identifier alias holder (`var y := x;` / `y := x;` where the
     // source is a class/interface-typed local, tracked via
