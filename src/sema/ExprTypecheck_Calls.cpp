@@ -10003,6 +10003,50 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         md, sb.first, sb.second, argNameOf(sb.second),
                         ce.span.begin);
                 }
+                // fix #8663 (spec §14.1 *Instantiation and its site* /
+                // §14.2 *Constraints*, v0.357): a method's `where` clause
+                // belongs to the DECLARING TYPE's member set, so a bound
+                // that names the ENCLOSING CLASS's type parameter is read
+                // at the call under the RECEIVER's class instantiation.
+                //
+                // §14.1: "Wherever a rule of this specification fires *at
+                // the instantiation site* — §3.6 rule 2's per-instantiation
+                // property evaluation, this section's constraint checks
+                // (§14.2), ... — it fires at every such site."
+                // §14.2: "A constraint whose bound is another type parameter
+                // — of the same declaration, or of the enclosing type — is
+                // grammatical and has subtype semantics: a substitution S
+                // for `T` satisfies `where T: U` exactly when S is
+                // non-nullable and is a *subtype of* the substitution for
+                // `U`".
+                //
+                // BEFORE THE FIX the bound was read with the class's own
+                // parameter UNSUBSTITUTED (a bare marker), and the
+                // conformance walk (`argSatisfiesTypeBound`) reads such a
+                // marker as "the constraint's own parameter" (§14.2's
+                // single-entry substitution {the constraint's param -> the
+                // candidate}) — so `d.Z<Num2>(...)` on a `D<Num>` receiver
+                // was compared against `IBox<Num2>` and ADMITTED, and the
+                // body then read a `Num2` as a `Num`.
+                //
+                // The receiver's class arguments are read through the SAME
+                // helper the member's RETURN type is substituted with
+                // (`substituteMemberType`), so a direct receiver, an
+                // INHERITED member reached through a derived receiver, and
+                // a `this`/`base` receiver all read the class's arguments
+                // the same way. A receiver that fixes no class argument (a
+                // non-generic class, a bare type parameter, an unresolved
+                // receiver) leaves the bound UNCHANGED — the conservative
+                // direction, and the pre-fix behaviour.
+                TypeSymbol* classParent = ms ? ms->parent : nullptr;
+                const ast::Expr* classRecv = nullptr;
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        ce.callee.get()))
+                    classRecv = ma->target.get();
+                else if (auto* ncm =
+                             dynamic_cast<const ast::NullCondMemberExpr*>(
+                                 ce.callee.get()))
+                    classRecv = ncm->target.get();
                 for (const auto& gc : methodGenericConstraints) {
                     auto ai = subst.find(gc.typeParam);
                     if (ai == subst.end() || !ai->second) continue;
@@ -10034,6 +10078,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // `ctx_.resolvedType(*item.typeArg)` the
                             // pre-fix code computed inline.
                             TypeRef* bound = item.bound;
+                            // fix #8663 (§14.1 / §14.2, v0.357): read the
+                            // bound under the RECEIVER's class
+                            // instantiation, so a bound naming the
+                            // enclosing class's type parameter is compared
+                            // against the class's ARGUMENT (`IBox<Y>` at a
+                            // `D<Num>` receiver is `IBox<Num>`). The
+                            // UNSUBSTITUTED bound stays in `bound`: it is
+                            // what says whether the bound is a bare type
+                            // PARAMETER (the type-parameter-bound arm
+                            // below) at all.
+                            TypeRef* boundSubst = bound;
+                            if (bound && classParent &&
+                                !classParent->genericParams.empty())
+                                boundSubst = substituteMemberType(
+                                    bound, classRecv, classParent);
                             // #1867 / §14.2 clause 5 + §28.2/§9.7: a
                             // PRIMITIVE argument against `IDisposable`/
                             // `IAsyncDisposable` — which only classes
@@ -10069,21 +10128,37 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 continue;
                             }
                             // §14.2 type-parameter bound (`where T: U`):
-                            // the bound is another type parameter of this
-                            // method, so it carries no declaration of its
-                            // own. Its concrete bound is U's substitution
-                            // (looked up in `subst`); T's substitution
-                            // must be non-nullable and assignable to it —
-                            // identical, a subclass, or an interface
-                            // conformance — else the instantiation is
-                            // rejected (closes the soundness hole where
-                            // an unrelated type was silently accepted).
+                            // the bound is another type parameter — of this
+                            // method (a sibling parameter) or, since #8663,
+                            // of the ENCLOSING CLASS — so it carries no
+                            // declaration of its own. Its concrete bound is
+                            // that parameter's substitution: the METHOD's
+                            // own (looked up in `subst`), or the CLASS's
+                            // (the receiver's class instantiation, read
+                            // through the substituted bound). T's
+                            // substitution must be non-nullable and
+                            // assignable to it — identical, a subclass, or
+                            // an interface conformance — else the
+                            // instantiation is rejected (closes the
+                            // soundness hole where an unrelated type was
+                            // silently accepted).
                             if ((!bound || !bound->declaration) &&
                                 !item.boundParamName.empty()) {
                                 auto ui = subst.find(
                                     item.boundParamName);
+                                TypeRef* uSubst = nullptr;
                                 if (ui != subst.end() && ui->second) {
-                                    TypeRef* uSubst = ui->second;
+                                    uSubst = ui->second;
+                                } else if (boundSubst &&
+                                           boundSubst->declaration) {
+                                    // the ENCLOSING CLASS's own parameter,
+                                    // substituted with the receiver's class
+                                    // argument (#8663: §14.2's
+                                    // type-parameter-bounds paragraph names
+                                    // "the enclosing type" explicitly).
+                                    uSubst = boundSubst;
+                                }
+                                if (uSubst) {
                                     std::string uName =
                                         uSubst->declaration
                                             ? std::string(
@@ -10167,7 +10242,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // concrete primitive.
                                 if (primitiveConformsToBuiltinInstanceIface(
                                         argRef->primitive, bn,
-                                        bound->genericArgs) ==
+                                        boundSubst->genericArgs) ==
                                     PrimBuiltinIfaceConformance::Rejects)
                                     report(std::string(bn));
                                 continue;
@@ -10176,7 +10251,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // the nested-generic substitution branch inside
                             // argSatisfiesTypeBound can build a SubstArgs
                             // instead of dereferencing a null SemaContext*.
-                            if (!argSatisfiesTypeBound(argRef, bound, &ctx_))
+                            //
+                            // fix #8663 (§14.1 / §14.2, v0.357): the bound is
+                            // read under the RECEIVER's class instantiation
+                            // (`boundSubst`), so a bound naming the
+                            // enclosing class's type parameter is compared
+                            // against the class's ARGUMENT.
+                            if (!argSatisfiesTypeBound(argRef, boundSubst,
+                                                      &ctx_))
                                 report(std::string(
                                     bound->declaration->name));
                         } else if (item.kind == "class") {
