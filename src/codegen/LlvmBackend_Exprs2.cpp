@@ -2690,10 +2690,50 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // double-free when !declsCapturedByEscaping_ holds. For escaping
         // lambdas, boxedCellFree is already suppressed (capturedByEscaping has
         // the key), so the definitelyEscapingLambdas_ guard is harmless there.
+        //
+        // fix #8835 (§27.5 / §28.9, v0.359): the `declsCapturedByEscaping_`
+        // suppressor is MODULE-WIDE, and an ENCLOSING frame's scan puts an
+        // entry in it for every symbol an ESCAPING lambda's body mentions —
+        // INCLUDING that escaping lambda's OWN locals, which it does not
+        // capture at all (they are allocated in ITS frame, per activation of
+        // it). `collectCellFreeEligible` clears `cellFreeEligible_` for a
+        // nested lambda's re-scan but never `declsCapturedByEscaping_`
+        // (`CaptureReclaimSetScope` saves/restores it across a nested
+        // emission, it does not clear it), so the entry survives into the
+        // nested frame's own re-scan and suppresses the scope-end free of a
+        // cell THAT frame allocated: the scope-end route declines on the
+        // stale entry, and the #4509 refcount route declines too because
+        // `cellFreeEligible_` (the nested frame's own, correct
+        // classification) holds the key — neither route arms, and the cell
+        // leaks. MEASURED (issue #8835): 1600 B / 400 cells for
+        // `return lambda() => do var k := 3; var h := lambda() => k;
+        // return h(); end` at 200 activations (the `string` twin: 3200 B /
+        // 400), while the same shape in a METHOD frame is clean.
+        //
+        // THE FIX: the accumulated set answers "does an ESCAPING lambda
+        // capture this local?" for a local of an ANCESTOR frame — for a local
+        // declared in THIS frame, THIS frame's own classification answers it,
+        // and it is already a conjunct of this very condition: only a lambda
+        // lexically inside this frame can capture a local this frame
+        // declares (lexical scoping), and this frame's scan classified every
+        // one of them, so `cellFreeEligible_.count(decl)` already proves that
+        // no escaping lambda in this frame captures it. The #4210 double-free
+        // protection is therefore preserved by that conjunct alone, and the
+        // accumulated-set suppressor is applied only to a local this frame
+        // does NOT declare — where it remains exactly as strict as before.
+        bool declCapturedByEscaping = false;
+        {
+            std::size_t declOwnerScopeIdx = 0;
+            const bool declDeclaredInThisFrame = declScopeDisposeIndex(
+                static_cast<const void*>(decl), declOwnerScopeIdx);
+            declCapturedByEscaping =
+                !declDeclaredInThisFrame &&
+                declsCapturedByEscaping_.count(static_cast<const void*>(decl));
+        }
         if (!alreadyBoxed && !isForVar &&
             currentFn_ == cellFreeEligibleFn_ &&
             !definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
-            !declsCapturedByEscaping_.count(static_cast<const void*>(decl)) &&
+            !declCapturedByEscaping &&
             cellFreeEligible_.count(static_cast<const void*>(decl))) {
             // #782: if the captured local is a move-only OWNING inline-array
             // ([N owned]T? / [N owned]T), record N so lowerLocalDecl registers an
