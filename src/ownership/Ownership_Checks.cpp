@@ -8989,7 +8989,16 @@ bool MethodOwnership::isPlainBorrowParam(sema::Symbol* sym) {
     if (!methodParamSet_.count(sym)) return false;
     const sema::TypeRef* declTy =
         ps->declType ? ctx_.resolvedType(*ps->declType) : ps->resolvedDeclType;
-    return isBorrowableType(declTy);
+    // fix #8918 (§28.3.4 / §28.3.8, v0.359): a plain parameter of a
+    // declaration-less BUILT-IN CLASS (`OwningArray<T>`, `Array<T>`,
+    // `Dictionary<K, V>`, `StringBuilder`, ... -- the heap class references of
+    // `isBorrowBearingBuiltinClassHead`) is a borrow whose source is the
+    // caller exactly as a user-class parameter is ("Parameter `p` (no
+    // modifier) | Borrowed (source: caller)"). `isBorrowableType` reads
+    // `declaration->kind` and so misses them (see the header on
+    // `isBorrowableOwnedSinkType`); a value builtin (`isValueBuiltin`),
+    // `string` and every other primitive stay non-borrowable. // per §28.3.4
+    return isBorrowableOwnedSinkType(declTy);
 }
 
 // fix #8849 (§28.3 *Provenance* clause 1, v0.359): the PLAIN (borrowing)
