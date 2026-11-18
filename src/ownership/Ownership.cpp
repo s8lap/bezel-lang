@@ -11836,20 +11836,7 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             if (st.state == OwnershipState::Owned && !as.valueHasOwnedMarker) {
                 if (selfRead && !moveOnlyTarget)
                     report(Severity::Error, as.target->span.begin,
-                           std::string("cannot self-assign `") +
-                               std::string(id->name) +
-                               "`: the right-hand side is an unmarked read of "
-                               "`" + std::string(id->name) +
-                               "`, which is a BORROW, and `" +
-                               std::string(id->name) +
-                               "` is in the OWNED state — §28.3's state match "
-                               "requires an owned-state LHS to receive an "
-                               "owned value (a fresh producer, or a named owned "
-                               "binding under the explicit transfer marker `x "
-                               ":= move y`). A self-assignment is no exception: "
-                               "it is not a §28.7 drop-and-replace discharge. "
-                               "Delete the statement, or spell the transfer "
-                               "explicitly with `move`");
+                           selfAssignOwnedLocalMessage(std::string(id->name)));
                 // fix #8328 (§28.3 *State match on reassignment*, v0.355): the
                 // self-assignment IS a state-match violation (a BORROW into an
                 // OWNED-state LHS), so the store is rejected and never
@@ -15993,6 +15980,44 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                                    "both reachable");
                         if (!suppressDiag_) st.state = OwnershipState::Poisoned;
                         break;
+                    }
+                    // fix #7109 (§28.3 *State match on reassignment*, v0.359):
+                    // the SELF-ASSIGNMENT `t := t;` into an OWNED-STATE local,
+                    // in the LAMBDA-BODY spelling. §28.3: "A self-assignment is
+                    // no exception: for an owned-state class-typed local `t`,
+                    // `t := t;` stores the unmarked read `t`, a borrow, into an
+                    // owned-state LHS and is rejected at the assignment by this
+                    // rule". The rule names no scope; the method-body arm
+                    // (`handleAssignment`) rejects it, and this arm — a
+                    // deliberately NARROW mirror that never reaches that arm —
+                    // did not, so `lambda() => do var u := new Cell(1); u :=
+                    // u; … end` compiled. Same predicate as the method arm: an
+                    // Owned-state LHS, an unmarked RHS that is the SAME binding
+                    // (symbol identity, a `!` peeled), and not a move-only
+                    // VALUE type (§15.3's whole-value no-op). A rejected store
+                    // never happens (#8328), so the state transition is
+                    // skipped. // per §28.3, §15.3, v0.359
+                    if (as->value && !as->valueHasOwnedMarker &&
+                        st.state == OwnershipState::Owned) {
+                        const auto* srid = dynamic_cast<const ast::IdentifierExpr*>(
+                            lookThroughForceUnwrap(as->value.get()));
+                        // A `using var` is non-reassignable (§28.10), so its
+                        // own diagnostic already rejects the store.
+                        const auto* sls =
+                            dynamic_cast<const sema::LocalSymbol*>(sym);
+                        const auto* sld =
+                            sls ? dynamic_cast<const ast::LocalDecl*>(sls->decl)
+                                : nullptr;
+                        const char* moKind = nullptr;
+                        if (srid && refersTo(sym, *srid) &&
+                            !(sld && sld->isUsing) &&
+                            !common::isMoveOnlyValueType(ctx_.exprType(*tid), ctx_,
+                                                         moKind)) {
+                            report(Severity::Error, as->target->span.begin,
+                                   selfAssignOwnedLocalMessage(
+                                       std::string(tid->name)));
+                            break;
+                        }
                     }
                     // fix #7963 (§28.3.3 first half / §28.3 *State match on
                     // reassignment*, v0.355): the ENUMERATOR family's §28.3.3
@@ -20605,6 +20630,10 @@ static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
                     mo.scanGetterReturns(
                         acc.stmts,
                         pd->type ? ctx.resolvedType(*pd->type) : nullptr);
+                    // fix #7109 (§28.3 *State match on reassignment*, v0.359):
+                    // the self-assignment rule in a getter body, which never
+                    // reaches `handleAssignment`.
+                    mo.scanGetterSelfAssignments(acc.stmts);
                 }
                 // fix #5621 (§28.3, v0.326): for block-bodied getters, scan
                 // return statements and check that any returned function value

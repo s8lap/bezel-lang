@@ -166,6 +166,22 @@ const ast::Expr* lookThroughForceUnwrap(const ast::Expr* e) {
 static const sema::TypeRef* functionValueCalleeType(
     const ast::Expr* callee, const sema::SemaContext& ctx);  // defined below
 
+// fix #7109 (§28.3 *State match on reassignment*, v0.359): the single text of
+// the self-assignment rejection. Declared in Ownership_impl.hpp.
+std::string selfAssignOwnedLocalMessage(const std::string& name) {
+    return std::string("cannot self-assign `") + name +
+           "`: the right-hand side is an unmarked read of `" + name +
+           "`, which is a BORROW, and `" + name +
+           "` is in the OWNED state — §28.3's state match "
+           "requires an owned-state LHS to receive an "
+           "owned value (a fresh producer, or a named owned "
+           "binding under the explicit transfer marker `x "
+           ":= move y`). A self-assignment is no exception: "
+           "it is not a §28.7 drop-and-replace discharge. "
+           "Delete the statement, or spell the transfer "
+           "explicitly with `move`";
+}
+
 // fix #8160 (stdlib §6.10, v0.355; #5657): the OPERAND of an `as` cast — the
 // one spelling of a language spec §5.1 reference conversion that WIDENS the
 // expression's own static type on the page (`new TaskScope() as Object` has
@@ -21908,6 +21924,83 @@ void MethodOwnership::checkAutoPropertyInitializer(
                "would leak; store the value in an explicit `owned` field whose "
                "containing object disposes it (§28.5), or expose a factory method "
                "returning `owned T` (§28.6)");
+}
+
+// fix #7109 (§28.3 *State match on reassignment*, v0.359): `t := t;` into an
+// owned-state class-typed local, in a GETTER body. A getter accessor never
+// reaches `handleAssignment` (its body gets only the narrow checks of
+// `checkMember`), so the rule — "A self-assignment is no exception: for an
+// owned-state class-typed local `t`, `t := t;` stores the unmarked read `t`, a
+// borrow, into an owned-state LHS and is rejected at the assignment by this
+// rule" — had no reader there.
+//
+// The getter walk carries no dataflow, so "owned-state" is decided
+// STRUCTURALLY and CONSERVATIVELY (it can under-reject, never over-reject): the
+// local is a `var` declared by this very body whose initializer is a fresh
+// owned producer (`producerState == Owned`, the same single home
+// `scanGetterReturns` uses), and EVERY store to it in the body is a
+// self-assignment — so no other store can have moved the local out of the
+// owned state before the self-assignment is reached. The same exclusions as
+// the method-body arm hold: a move-only VALUE type keeps §15.3's whole-value
+// no-op, and a marked RHS (`t := move t`) is the sanctioned transfer. The walk
+// uses `forEachNestedStmt`, which never crosses into a lambda body (that body
+// has its own arm). // per §28.3, §15.3, §28.7, v0.359
+void MethodOwnership::scanGetterSelfAssignments(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    std::vector<const ast::AssignmentStmt*> selfStores;
+    std::vector<const ast::Node*> otherlyStored;
+    auto selfSym = [&](const ast::AssignmentStmt* as) -> const sema::Symbol* {
+        if (!as || !as->target || !as->value || as->op != ":=" ||
+            as->valueHasOwnedMarker)
+            return nullptr;
+        const auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as->target.get());
+        const auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+            lookThroughForceUnwrap(as->value.get()));
+        if (!tid || !rid) return nullptr;
+        const sema::Symbol* ts = ctx_.exprSymbol(*tid);
+        return ts && ts == ctx_.exprSymbol(*rid) ? ts : nullptr;
+    };
+    auto noteOther = [&](const ast::Expr* target) {
+        if (!target) return;
+        if (auto* ls = dynamic_cast<const sema::LocalSymbol*>(
+                ctx_.exprSymbol(*target)))
+            if (ls->decl &&
+                std::find(otherlyStored.begin(), otherlyStored.end(), ls->decl) ==
+                    otherlyStored.end())
+                otherlyStored.push_back(ls->decl);
+    };
+    for (const auto& s : stmts) {
+        if (!s) continue;
+        forEachNestedStmt(*s, [&](const ast::Stmt& inner) {
+            if (const auto* as = dynamic_cast<const ast::AssignmentStmt*>(&inner)) {
+                if (selfSym(as)) selfStores.push_back(as);
+                else noteOther(as->target.get());
+            } else if (const auto* is =
+                           dynamic_cast<const ast::IncrementStmt*>(&inner)) {
+                noteOther(is->target.get());
+            }
+        });
+    }
+    for (const ast::AssignmentStmt* as : selfStores) {
+        const auto* tid = static_cast<const ast::IdentifierExpr*>(as->target.get());
+        const auto* ls =
+            dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*tid));
+        if (!ls) continue;
+        // LOCALDECL-ONLY: `selfStores` holds assignment TARGETS, and a §21.1
+        // `const` local can never be an assignment target (rejected as "cannot
+        // assign to const local"), so a `LocalConstDecl` cannot reach here.
+        const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+        if (!ld || !ld->initializer || ld->isUsing) continue;
+        if (std::find(otherlyStored.begin(), otherlyStored.end(), ls->decl) !=
+            otherlyStored.end())
+            continue;
+        if (producerState(*ld->initializer) != OwnershipState::Owned) continue;
+        const char* moKind = nullptr;
+        if (common::isMoveOnlyValueType(ctx_.exprType(*tid), ctx_, moKind))
+            continue;
+        report(Severity::Error, as->target->span.begin,
+               selfAssignOwnedLocalMessage(std::string(tid->name)));
+    }
 }
 
 void MethodOwnership::scanGetterReturnsStmt(const ast::Stmt* s,

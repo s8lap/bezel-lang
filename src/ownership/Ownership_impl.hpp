@@ -379,6 +379,13 @@ enum class OwnedSourceKinds {
 // Ownership_Checks.cpp; shared by both Ownership.cpp and Ownership_Checks.cpp.
 const ast::Expr* lookThroughForceUnwrap(const ast::Expr* e);
 
+// fix #7109 (§28.3 *State match on reassignment*, v0.359): the ONE diagnostic
+// text for a self-assignment `t := t;` into an owned-state class-typed local,
+// shared by the method-body arm (`handleAssignment`), the lambda-body arm and
+// the getter-body scan so every body kind answers with the same words.
+// Defined in Ownership_Checks.cpp.
+std::string selfAssignOwnedLocalMessage(const std::string& name);
+
 // §28.8.1 (#867): the per-block dataflow lattice for the field-restoration
 // check. A `move` of an owned field leaves the field moved-from; the field
 // must be RESTORED (reassigned a value, incl. `null` for a nullable owned
@@ -582,6 +589,11 @@ public:
         const sema::TypeRef* getterReturnType);
     void scanGetterReturnsStmt(const ast::Stmt* s,
                                const sema::TypeRef* getterReturnType);
+    // fix #7109 (§28.3 *State match on reassignment*, v0.359): a getter body
+    // never reaches `handleAssignment`, so its owned-state locals' §28.3
+    // self-assignment `t := t;` is rejected by this narrow structural scan.
+    void scanGetterSelfAssignments(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
 
     // #1484 / #2168 / §23.1 / §28.6: declaration initializers that store a
     // freshly-produced owned value (producerState == Owned) into NON-`owned`
