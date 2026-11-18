@@ -28425,7 +28425,53 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             if (!lc->type || written)
                 constInitRoots_[lc->value.get()] = written;
         }
+        // fix #6696 (§27.3 *Admission at a target-typed non-call position*,
+        // §5.1, v0.359): a `const` local's declared type is a TARGET-TYPED
+        // position exactly as a `var` local's is — §27.3: "A lambda literal at
+        // a position that supplies a function-typed target other than a call
+        // argument — the initializer of a declared function-typed local or
+        // field … — is admitted under the argument-position rule of §14.5
+        // phase 2 and §22.6 (*Lambda-literal arguments*)". The `var` twin
+        // threads that target (`pendingLambdaTargetReturn_`,
+        // ExprTypecheck.cpp's LocalDecl arm) so the §27.3 check can judge the
+        // lambda's body against the target's return slot; the `const` arm
+        // visited the initializer with NO target thread, so `lamTargetRet`
+        // was null and the check never ran. MEASURED: `const f: () -> int :=
+        // lambda() => k;` with `var k: int?` was ACCEPTED (the callee read
+        // the null payload) while the `var f:` spelling was correctly
+        // rejected — the same program, two verdicts.
+        // The §30.6 task-family hint, the §27.3 target return slot, the
+        // §28.8 `owned` marker and the §27.4 parameter types are threaded
+        // exactly as the `var` arm does, and restored after the visit.
+        TypeRef* savedLamRetC = pendingLambdaReturnType_;
+        std::vector<TypeRef*> savedLamParamsC = pendingLambdaParamTypes_;
+        TypeRef* savedLamTargetRetC = pendingLambdaTargetReturn_;
+        bool savedLamTargetRetOwnedC = pendingLambdaTargetReturnOwned_;
+        if (lc->type && lc->value &&
+            dynamic_cast<const ast::LambdaExpr*>(lc->value.get())) {
+            if (auto* dt = ctx_.resolvedType(*lc->type)) {
+                if (dt->kind == TypeRef::Kind::Function && dt->funcReturn &&
+                    isTaskFamilyRef(dt->funcReturn) &&
+                    !dt->funcReturn->genericArgs.empty())
+                    pendingLambdaReturnType_ =
+                        dt->funcReturn->genericArgs.front();
+                if (dt->kind == TypeRef::Kind::Function)
+                    pendingLambdaTargetReturn_ = dt->funcReturn;
+                if (dt->kind == TypeRef::Kind::Function)
+                    pendingLambdaTargetReturnOwned_ = dt->funcReturnOwned;
+                if (dt->kind == TypeRef::Kind::Function &&
+                    !dt->funcParams.empty()) {
+                    pendingLambdaParamTypes_.clear();
+                    for (const auto& fp : dt->funcParams)
+                        pendingLambdaParamTypes_.push_back(fp.type);
+                }
+            }
+        }
         if (lc->value) visitExpr(*lc->value);
+        pendingLambdaReturnType_ = savedLamRetC;
+        pendingLambdaParamTypes_ = savedLamParamsC;
+        pendingLambdaTargetReturn_ = savedLamTargetRetC;
+        pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwnedC;
         // fix #3700 (§21.1 / §6.3 / §28.3, v0.287): a runtime const of a
         // sub-int nullable width (e.g. `const cb: byte? := 3`) used to store
         // the payload as `i32 3` into the `{i8 hasValue; i8 value}` slot —
