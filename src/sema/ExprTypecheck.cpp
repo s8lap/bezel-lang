@@ -16958,7 +16958,29 @@ void ExprTC::checkObjectClosedSurfaceCall(const ast::CallExpr& ce) {
     // against the compiler's CANONICAL root-`Object` TypeRef, which
     // `isRootObjectValueReceiver` excludes — that spelling keeps working,
     // and it is the admitting twin of the refusal below.
-    if (!isRootObjectValueReceiver(ctx_.exprType(*target), ctx_)) return;
+    // fix #7270 (§8.1 / §22.12, v0.359): a FUNCTION value reaches `Object`
+    // through §8.1's base chain ("function types reaching `Object`
+    // similarly via their reference-type heap representation"), so it has
+    // `ReferenceEquals` — but `ReferenceEquals` is `static`, and §22.12's
+    // "a static member must be accessed through the type name, not an
+    // instance" applies to the inherited static as to any other, exactly as
+    // it does for a root-`Object`-typed receiver below (#8043). Without
+    // this, `f.ReferenceEquals(f, f)` compiled, lowered to nothing (#3079)
+    // and leaked.
+    const TypeRef* targetTy = ctx_.exprType(*target);
+    if (isObjectStaticSurfaceMember(member) && targetTy &&
+        targetTy->kind == TypeRef::Kind::Function) {
+        ctx_.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            "cannot call the static member `" + std::string(member) +
+                "` through a function value: `" + std::string(member) +
+                "` is a static member of the root `Object` (\xC2\xA7""8.1) and "
+                "must be accessed through the type name, not an instance "
+                "(\xC2\xA7""22.12) — write `Object." +
+                std::string(member) + "(a, b)`");
+        return;
+    }
+    if (!isRootObjectValueReceiver(targetTy, ctx_)) return;
     if (isObjectStaticSurfaceMember(member)) {
         // fix #8043 (§8.1 / §22.12, v0.350).
         ctx_.diagnostics().report(

@@ -286,3 +286,27 @@ BEZEL_TEST(object_surface_arity_8043, static_spelling_still_works) {
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "True\nFalse\n");
 }
+
+// ---------------------------------------------------------------------------
+// #7270 — the same rule for a FUNCTION value (§8.1 v0.359, §22.12).
+//
+// §8.1: function types reach `Object` "via their reference-type heap
+// representation", so a function value HAS `ReferenceEquals` — as the one
+// `static` member of §8.1's block, reached through the type name (§22.12:
+// "a static member must be accessed through the type name, not an
+// instance"). MEASURED on base b279e8daf: `c.ReferenceEquals(c, c)` compiled
+// with only the #3079 "failed to lower" warning, printed nothing, leaked 64 B.
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(object_surface_arity_7270, function_value_instance_spelling_of_the_static_member_is_refused) {
+    auto r = runAot(
+        "module M; class C public static method Main(): int "
+        "  var c := lambda(): int => 42; "
+        "  Console.WriteLine(c.ReferenceEquals(c, c)); "
+        "  return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "cannot call the static member `ReferenceEquals` through a "
+           "function value"));
+}
