@@ -4894,7 +4894,20 @@ private:
         const std::vector<const ast::Expr*>& argExprs =
             std::vector<const ast::Expr*>(),
         const std::vector<bool>& isGeneric = std::vector<bool>(),
-        const std::vector<bool>& inferenceFailed = std::vector<bool>());
+        const std::vector<bool>& inferenceFailed = std::vector<bool>(),
+        bool gradeLambdaArgs = false);
+    // fix #6642 (§22.6 *Lambda-literal arguments* / *Parameter count at a
+    // function-typed position*, v0.359): the grade of a lambda-literal
+    // argument `lam` at a candidate's formal `slot`, for `resolveOverload`'s
+    // grid when the caller passes `gradeLambdaArgs` (the constructor
+    // overload path). `Unknown` is any cell the rule's inputs do not decide
+    // here (an unannotated or destructured lambda parameter, an `async`
+    // lambda, a non-function or generic slot, a return type the grid cannot
+    // judge): one on a candidate that is otherwise applicable leaves the
+    // whole call `Undecidable`, exactly as before the column was graded.
+    enum class LambdaCellGrade { Unknown, NotApplicable, Convert, Exact };
+    LambdaCellGrade gradeLambdaLiteralCell(const ast::LambdaExpr& lam,
+                                           const TypeRef* slot);
 
     // §22.6 method-overload resolution. Given the initially-resolved
     // MethodSymbol for a call and the call site, returns the MethodSymbol

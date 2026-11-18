@@ -2864,10 +2864,21 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     const std::string& calleeDesc, const std::string& extraNote,
     const std::vector<const ast::Expr*>& argExprs,
     const std::vector<bool>& isGeneric,
-    const std::vector<bool>& inferenceFailed) {
+    const std::vector<bool>& inferenceFailed, bool gradeLambdaArgs) {
     OverloadResult res;
     const std::size_t nCand = paramTypes.size();
     const std::size_t nArg = argTypes.size();
+    // fix #6642 (§22.6 *Lambda-literal arguments*, v0.359): with
+    // `gradeLambdaArgs`, a lambda-literal argument's column is graded by
+    // `gradeLambdaLiteralCell` instead of by its recorded function type,
+    // which `judgeable` below does not admit. The column is then ranked like
+    // every other one (better-or-equal everywhere, strictly better somewhere;
+    // the co-equal rule; ambiguity). Only the constructor overload paths pass
+    // it: the method path keeps its own `Undecidable` arm for these calls.
+    std::vector<const ast::LambdaExpr*> lambdaCol(nArg, nullptr);
+    if (gradeLambdaArgs)
+        for (std::size_t i = 0; i < nArg && i < argExprs.size(); ++i)
+            lambdaCol[i] = dynamic_cast<const ast::LambdaExpr*>(argExprs[i]);
 
     // Undecidable guard: §22.6 ranking is reliable only for the type pairs
     // checkAssignable judges — primitive↔primitive and non-generic
@@ -2894,8 +2905,8 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
                 return false;  // Error, InlineArray, Function
         }
     };
-    for (const TypeRef* a : argTypes)
-        if (!judgeable(a)) {
+    for (std::size_t i = 0; i < nArg; ++i)
+        if (!lambdaCol[i] && !judgeable(argTypes[i])) {
             // fix #NNNN (§22.6, v0.298): all candidates are inapplicable when
             // the argument types themselves can't be judged.
             res.applicable.assign(nCand, false);
@@ -2956,9 +2967,31 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     // boxing conversions to generic interfaces) or returns NotApplicable (for
     // truly unrankable type pairs), which is the same outcome the guard gave
     // them — just reached through the normal classification path.
+    // fix #6642: candidate c has a lambda cell this grid cannot judge.
+    std::vector<bool> lambdaUnknown(nCand, false);
     for (std::size_t c = 0; c < nCand; ++c) {
         grid[c].resize(nArg);
         for (std::size_t i = 0; i < nArg; ++i) {
+            if (lambdaCol[i]) {
+                ArgMatch m = ArgMatch::Exact;
+                switch (gradeLambdaLiteralCell(*lambdaCol[i],
+                                               paramTypes[c][i])) {
+                    case LambdaCellGrade::Unknown:
+                        lambdaUnknown[c] = true;
+                        break;
+                    case LambdaCellGrade::NotApplicable:
+                        m = ArgMatch::NotApplicable;
+                        break;
+                    case LambdaCellGrade::Convert:
+                        m = ArgMatch::Convert;
+                        break;
+                    case LambdaCellGrade::Exact:
+                        break;
+                }
+                grid[c][i] = m;
+                if (m == ArgMatch::NotApplicable) res.applicable[c] = false;
+                continue;
+            }
             // fix #2985 (§22.6 + §5.1 v0.240 *Constant narrowing*): delegate
             // to narrowIntConstantToTarget first so an in-range compile-time
             // int constant (literal, local / member const, enum constant of
@@ -3139,6 +3172,16 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
             if (m == ArgMatch::NotApplicable) res.applicable[c] = false;
         }
     }
+
+    // fix #6642: a candidate some other cell already rules out is
+    // inapplicable whatever its lambda cell would be; an otherwise-applicable
+    // one with an ungraded lambda cell leaves the ranking undecided, as it was
+    // before the column was graded.
+    for (std::size_t c = 0; c < nCand; ++c)
+        if (res.applicable[c] && lambdaUnknown[c]) {
+            res.outcome = OverloadOutcome::Undecidable;
+            return res;
+        }
 
     std::vector<std::size_t> appl;
     for (std::size_t c = 0; c < nCand; ++c)
@@ -4176,6 +4219,144 @@ static bool lambdaBodyIsBareNull(const ast::Expr* arg, const TypeRef* lamTy) {
     const TypeRef* r = lamTy->funcReturn;
     return r->kind == TypeRef::Kind::Primitive &&
            r->primitive == PrimitiveType::Object && r->nullable;
+}
+
+// fix #6642 (§22.6 *Lambda-literal arguments* / *Parameter count at a
+// function-typed position*, v0.359). One cell of `resolveOverload`'s grid for
+// a lambda-literal argument. The rule, quoted:
+//
+//   * "a candidate whose function-typed slot has a different number of
+//     parameter slots from the argument's (... a lambda's parameter count) is
+//     inapplicable at that position";
+//   * "applicability and ranking at that argument position are decided by its
+//     inferred return type ... the candidate is applicable at the position
+//     when the lambda's inferred return type equals the candidate's return
+//     slot, implicitly converts to it (§5.1) ... The candidate is exact at the
+//     position when the inferred return type equals the return slot ..., and
+//     converting otherwise";
+//   * "for a procedure slot (`-> ()`) ... an expression-bodied lambda whose
+//     body is not of type `()` is applicable ... and ranks converting there,
+//     while a unit-typed body or a `: ()` ascription is exact and a
+//     block-bodied lambda that returns a value is inapplicable".
+//
+// Graded only from facts that do not depend on which candidate the lambda was
+// typed against: the lambda is typed ONCE, against one member's formal (the
+// `new` path threads `formalCtorOutParamType`), so an unannotated parameter's
+// type, and the return type that follows from it, are that member's and not
+// necessarily this candidate's — such a lambda is `Unknown` unless the type it
+// took is this candidate's own slot type. So are an
+// `async` lambda (§30.6 decides it), a diverging block body (the open #6161
+// question), a bare-`null` or collection-literal body (no inferred return
+// type, §14.5 phase 2), an integer return value at an integer slot it does
+// not widen to (§5.1 constant narrowing may still admit it), and any slot or
+// return type the grid's type-pair grading does not judge.
+ExprTC::LambdaCellGrade ExprTC::gradeLambdaLiteralCell(
+    const ast::LambdaExpr& lam, const TypeRef* slot) {
+    using G = LambdaCellGrade;
+    if (!slot || slot->kind != TypeRef::Kind::Function || lam.isAsync)
+        return G::Unknown;
+    if (lam.params.size() != slot->funcParams.size()) return G::NotApplicable;
+    const TypeRef* lt = ctx_.exprType(lam);
+    if (!lt || lt->kind != TypeRef::Kind::Function || !lt->funcReturn ||
+        lt->funcParams.size() != lam.params.size() || !slot->funcReturn)
+        return G::Unknown;
+    // The same type pairs `resolveOverload`'s `judgeable` admits.
+    auto judgeable = [](const TypeRef* t) {
+        if (!t) return false;
+        if (t->kind == TypeRef::Kind::Primitive ||
+            t->kind == TypeRef::Kind::Unit)
+            return true;
+        return t->kind == TypeRef::Kind::Named && t->declaration &&
+               t->genericArgs.empty();
+    };
+    // Parameter slots. An unannotated parameter took the type of the formal
+    // the lambda was typed against (§27.4); where that is THIS candidate's
+    // slot type the recorded lambda is the one this candidate would type, and
+    // otherwise it is not judged. A written parameter type is judged by
+    // §27.1.1 (as the §27.4 admission rule applies it): only identity outside
+    // a class / interface / `string` slot, so two different primitives are
+    // certainly inapplicable; anything else is not judged.
+    for (std::size_t k = 0; k < lam.params.size(); ++k) {
+        const ast::Param& p = lam.params[k];
+        if (p.destructure) return G::Unknown;
+        const TypeRef* lp = lt->funcParams[k].type;
+        const TypeRef* sp = slot->funcParams[k].type;
+        if (!lp || !sp || !judgeable(lp) || !judgeable(sp)) return G::Unknown;
+        if (sameTypeBySpelling(lp, sp) && lp->nullable == sp->nullable)
+            continue;
+        if (!p.type) return G::Unknown;
+        if (lp->kind == TypeRef::Kind::Primitive &&
+            sp->kind == TypeRef::Kind::Primitive &&
+            lp->primitive != PrimitiveType::Object &&
+            sp->primitive != PrimitiveType::Object &&
+            lp->primitive != PrimitiveType::String &&
+            sp->primitive != PrimitiveType::String)
+            return G::NotApplicable;
+        return G::Unknown;
+    }
+    const TypeRef* r = lt->funcReturn;
+    const TypeRef* sr = slot->funcReturn;
+    bool hasValueReturn = false;
+    bool intLiteralReturn = false;
+    if (lam.isBlockBody)
+        forEachLambdaReturnValue(lam, [&](const ast::Expr* v) {
+            if (!v) return;
+            hasValueReturn = true;
+            const ast::Expr* e = v;
+            if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e);
+                u && u->op == "-")
+                e = u->operand.get();
+            if (dynamic_cast<const ast::IntLiteralExpr*>(e))
+                intLiteralReturn = true;
+        });
+    if (lam.exprBody) {
+        const ast::Expr* e = lam.exprBody.get();
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e); u && u->op == "-")
+            e = u->operand.get();
+        if (dynamic_cast<const ast::IntLiteralExpr*>(e)) intLiteralReturn = true;
+    }
+    if (lambdaBodyIsBareNull(&lam, lt)) return G::Unknown;
+    // A block body with no value-carrying `return` whose recorded return is
+    // not `()` diverges (the `int` placeholder): not judged (#6161).
+    if (lam.isBlockBody && !hasValueReturn && r->kind != TypeRef::Kind::Unit)
+        return G::Unknown;
+    if (lam.retType) {
+        // An ascription is the written return type (§27.3); judged as a
+        // value's return type (§27.1.1), so only identity is certain.
+        if (sameTypeBySpelling(r, sr) && r->nullable == sr->nullable)
+            return G::Exact;
+        if (r->kind == TypeRef::Kind::Primitive &&
+            sr->kind == TypeRef::Kind::Primitive)
+            return G::NotApplicable;
+        return G::Unknown;
+    }
+    if (sr->kind == TypeRef::Kind::Unit) {
+        if (r->kind == TypeRef::Kind::Unit) return G::Exact;
+        // A block body that returns a value is inapplicable at `-> ()`; an
+        // expression body's result is discarded there, converting.
+        return lam.isBlockBody ? G::NotApplicable : G::Convert;
+    }
+    if (r->kind == TypeRef::Kind::Unit) {
+        // A procedure lambda (or a unit-typed expression body) yields no
+        // value for a concrete value slot (`procedureLambdaInapplicableAt`'s
+        // concrete-slot predicate).
+        return judgeable(sr) ? G::NotApplicable : G::Unknown;
+    }
+    if (!judgeable(r) || !judgeable(sr)) return G::Unknown;
+    // A literal-typed return value reads at `int` by §4.2; a recorded type
+    // other than `int` for it came from a widening hint, not the body.
+    if (intLiteralReturn &&
+        !(r->kind == TypeRef::Kind::Primitive &&
+          r->primitive == PrimitiveType::Int))
+        return G::Unknown;
+    switch (classifyArg(r, sr)) {
+        case ArgMatch::Exact: return G::Exact;
+        case ArgMatch::Convert: return G::Convert;
+        case ArgMatch::NotApplicable: break;
+    }
+    if (isIntegerParamForOverload(r) && isIntegerParamForOverload(sr))
+        return G::Unknown;
+    return G::NotApplicable;
 }
 
 // fix #8626 (§14.5 phase 1 + phase 2 + phase 3, v0.357): the phase-3
@@ -33761,7 +33942,13 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                 }
             }
             if (ldecls.empty()) {
+                const std::size_t errsBefore =
+                    ctx_.diagnostics().errorCount();
                 checkDeferredLambdasAgainst(0);
+                // fix #6642: a §27.3 error just reported is the call's
+                // diagnostic; ranking the lambda column would add a second,
+                // §22.6 "no overload is applicable" error for the same lambda.
+                if (ctx_.diagnostics().errorCount() != errsBefore) return;
             } else if (ldecls.size() != decls.size()) {
                 decls.swap(ldecls);
                 declSyms.swap(ldeclSyms);
@@ -33913,7 +34100,13 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                             for (const auto& a : ne.args)
                                 es.push_back(a.value.get());
                             return es;
-                        }());
+                        }(),
+                        /*isGeneric=*/std::vector<bool>(),
+                        /*inferenceFailed=*/std::vector<bool>(),
+                        // fix #6642 (§22.6 *Lambda-literal arguments*,
+                        // v0.359): a lambda-literal argument is a ranked
+                        // column, not an `Undecidable` one.
+                        /*gradeLambdaArgs=*/true);
         // fix #4780 (§22.6 stage 7, v0.307): resolveOverload returns
         // Ambiguous when it finds multiple applicable candidates with
         // identical conversions. The caller must not fall through silently.
@@ -33925,6 +34118,24 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             newRes.winnerIndex < declSyms.size()) {
             checkDeferredLambdasAgainst(newRes.winnerIndex);
             ctx_.setResolvedNewCtor(&ne.args, declSyms[newRes.winnerIndex]);
+            // fix #6642 (§22.6 stage 3, v0.359): a lambda cell is graded from
+            // the lambda's parameter count, written parameter types and
+            // inferred return type only, and the lambda arm suspended its own
+            // §27.3 target checks because the formal it was typed against
+            // belonged to one member of the set (#6161). Judge the arguments
+            // against the CHOSEN constructor's signature, as the
+            // single-candidate arm does. A call with no lambda argument keeps
+            // the grid's verdict alone (every cell already exact or a §5.1
+            // conversion).
+            bool anyLambdaArg = false;
+            for (const auto& a : ne.args)
+                if (dynamic_cast<const ast::LambdaExpr*>(a.value.get()))
+                    anyLambdaArg = true;
+            if (anyLambdaArg)
+                checkArgsAgainstParams(
+                    decls[newRes.winnerIndex]->params, ne.args, ne.span.begin,
+                    std::string("`new ") + std::string(t->name) + "`", &ne,
+                    t);
         }
         return;
     }
