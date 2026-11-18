@@ -597,6 +597,23 @@ public:
     // for what it suppresses and what it keeps. Set by `runGetterBody` before
     // the getter body's `run`.
     void setGetterScopeOnly() { getterScopeOnly_ = true; }
+    // fix #8767 fix-forward (§28.3, §28.3.10, v0.359): did the getter-mode
+    // run suppress a rejection the method-body pass would have raised? See
+    // `getterSuppressedError_`'s comment.
+    bool getterSuppressedError() const { return getterSuppressedError_; }
+    // fix #8767 fix-forward (§28.3, §28.3.10, v0.359): may a borrow of one of
+    // the getter body's own locals leave the body through a `return` or a
+    // store into a non-local location? The cases the method pass ACCEPTS and
+    // still dangles (#8836's `return (if c then t else null)`, #8837's
+    // returned lambda over an alias `b := t`) never reach `report()`, so the
+    // getter mode screens them structurally. Defined in Ownership.cpp.
+    bool getterBorrowMayEscape(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // fix #8767 fix-forward: withdraw the symbol-level §28.3.10 scope-end
+    // free (`LocalSymbol::autoDropAtScopeEnd`, the inline `out owned var` and
+    // pre-declared out-recipient spellings) this run armed. Defined in
+    // Ownership.cpp.
+    void withdrawGetterSymbolAutoDrops();
     // fix #5252: does an owned borrow SOURCE (already classified owned by
     // `ownedLocalBorrowSource`) name a parameter rather than a local? True for
     // a ParameterSymbol and for the `set(owned)` accessor's `value`; selects
@@ -1710,8 +1727,12 @@ private:
     // this mode SUPPRESSES (the §21.1 `const`-local rejections and the §28.3
     // hard "would be dropped here without disposal" error were routed
     // through `report()` for exactly this reason). A suppressed rejection
-    // leaves the pre-fix behaviour (a bounded leak) in place — the safe
-    // direction — and the auto-drop FLAGS the sweep sets are unaffected.
+    // does NOT by itself leave the pre-fix behaviour in place: the free this
+    // mode arms is new, and the §28.3 rejections it suppresses are what make
+    // that free sound. So a suppressed ERROR is recorded
+    // (`getterSuppressedError_`), and `runGetterBody` withdraws every
+    // scope-end free the run armed when one was — the pre-fix bounded leak,
+    // the safe direction.
     //
     // The mode ALSO narrows the scope-end DISPOSAL itself: it arms the
     // §28.3.10 scope-end free only where the local's scope-end value is
@@ -1723,9 +1744,26 @@ private:
     // the measurement.
     bool getterScopeOnly_ = false;
 
+    // fix #8767 fix-forward (§28.3, §28.3.10, v0.359): the getter mode
+    // SUPPRESSES a rejection, but it must not FORGET one. The §28.3
+    // borrow-lifetime ("would outlive its source"), closure-sink ("captures
+    // ... whose source is disposed at scope end"), borrowed-field-store and
+    // consume-site-freeze rejections are what make the §28.3.10 scope-end
+    // free SOUND in a method body: a program that reaches the free without
+    // one of them firing has no borrow of the freed local left alive. A
+    // getter body in which one of them WOULD fire has such a borrow, so its
+    // scope-end frees are withdrawn (`runGetterBody`) — the pre-fix bounded
+    // leak, the safe direction. Recorded only on the final, unsuppressed pass
+    // (`suppressDiag_` marks a fixpoint iteration, whose reports are not
+    // verdicts).
+    bool getterSuppressedError_ = false;
+
     void report(Severity sev, SourceLocation loc, std::string msg) {
         if (suppressDiag_) return;
-        if (getterScopeOnly_) return;
+        if (getterScopeOnly_) {
+            if (sev == Severity::Error) getterSuppressedError_ = true;
+            return;
+        }
         ctx_.diagnostics().report(sev, loc, std::move(msg));
     }
 

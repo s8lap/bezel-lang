@@ -20087,6 +20087,99 @@ void MethodOwnership::checkReturnGetEnumeratorFromScopeBoundReceiver(
     return;
 }
 
+// fix #8767 fix-forward (§28.3, §28.3.10, v0.359): the getter-mode structural
+// escape screen. `runGetterBody` arms the §28.3.10 scope-end free on a
+// getter's owned locals; that free is sound only when no borrow of such a
+// local outlives the getter body. §28.3 forbids every such escape ("A borrow
+// cannot outlive its source"), and the method pass enforces it through
+// `report()` — which the getter mode records (`getterSuppressedError_`). Two
+// escapes the method pass itself ACCEPTS (pre-existing holes, #8836 and
+// #8837) never reach `report()`: a returned `(if c then t else null)` over an
+// owned local, and a returned lambda capturing an alias `b := t`. MEASURED on
+// the rejected first attempt (0ddb37e6d), both are a heap-use-after-free in a
+// getter (r42-rev-m74 b31, b33) where the base merely leaked.
+//
+// So the getter mode treats as a possible escape every `return` and every
+// store into a location that is not one of the body's own locals whose value
+// is of a type that can carry a borrow — anything but a non-`Object`
+// primitive (`string` included: §28.1, runtime-managed), `()`, an enum, or a
+// record that is not borrow-bearing (§9.7) — unless the value is `null` or a
+// `new` whose arguments carry no borrow. The screen is deliberately
+// over-approximate: a false positive costs only the pre-fix bounded leak
+// (the free is withdrawn), a false negative is a use-after-free.
+bool MethodOwnership::getterBorrowMayEscape(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    auto typeCannotCarryBorrow = [&](const sema::TypeRef* t) -> bool {
+        if (!t) return false;
+        switch (t->kind) {
+            case sema::TypeRef::Kind::Primitive:
+                return t->primitive != sema::PrimitiveType::Object &&
+                       t->primitive != sema::PrimitiveType::None;
+            case sema::TypeRef::Kind::Unit:
+                return true;
+            case sema::TypeRef::Kind::Named:
+                if (!t->declaration) return false;  // bare type parameter
+                if (t->declaration->kind == ast::TypeDeclKind::Enum)
+                    return true;
+                if (t->declaration->kind == ast::TypeDeclKind::Record)
+                    return !common::isBorrowBearingRecordOrSpan(t, ctx_);
+                return false;
+            default:
+                return false;
+        }
+    };
+    auto valueCannotCarryBorrow = [&](const ast::Expr& e) -> bool {
+        if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) return true;
+        if (typeCannotCarryBorrow(ctx_.exprType(e))) return true;
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+            for (const auto& a : ne->args)
+                if (!a.value || !typeCannotCarryBorrow(ctx_.exprType(*a.value)))
+                    return false;
+            return true;
+        }
+        return false;
+    };
+    bool escapes = false;
+    for (const auto& top : body) {
+        if (!top || escapes) continue;
+        forEachNestedStmt(*top, [&](const ast::Stmt& st) {
+            if (escapes) return;
+            if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&st)) {
+                if (rs->value && !valueCannotCarryBorrow(*rs->value))
+                    escapes = true;
+                return;
+            }
+            if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&st)) {
+                if (!as->target || !as->value) return;
+                // A store into one of the body's own locals stays inside the
+                // body; the nested-scope escape of such a store (b28) is the
+                // method pass's §28.3 rejection, recorded through `report()`.
+                if (auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+                    if (dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)))
+                        return;
+                if (!valueCannotCarryBorrow(*as->value)) escapes = true;
+            }
+        });
+    }
+    return escapes;
+}
+
+// fix #8767 fix-forward (§28.3.10, v0.359): the symbol-level half of the
+// withdrawal `runGetterBody` performs for an escaping getter. The LocalDecl
+// flags are restored there from a pre-run snapshot; the symbol-level flag has
+// no LocalDecl to snapshot (an inline `out owned var` local) or is armed on
+// the symbol (a pre-declared out-recipient), and every symbol here is a local
+// of THIS getter body, which nothing but this run's sweep flags.
+void MethodOwnership::withdrawGetterSymbolAutoDrops() {
+    for (sema::Symbol* sym : everOwnedPlainLocals_)
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+            ls->autoDropAtScopeEnd = false;
+    for (sema::Symbol* sym : preDeclaredOutOwnedRecipients_)
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+            ls->autoDropAtScopeEnd = false;
+}
+
 namespace {
 
 // Top-level walker — visits every method/ctor body in the source.
@@ -20515,6 +20608,39 @@ static void runGetterBody(const ast::PropertyDecl& pd,
     bool isStatic = false;
     for (std::string_view mod : pd.modifiers)
         if (mod == "static") isStatic = true;
+    // fix #8767 fix-forward (§28.3, §28.3.10, v0.359): snapshot every
+    // statement-level disposal flag the run may arm in this body, so an
+    // escaping getter's frees can be withdrawn after it (below). Only the
+    // FREE-direction flags are snapshotted; the flags that make codegen
+    // dispose LESS (`usingVarSourceIsBorrow`, `initializerCallIsBorrow`,
+    // `lhsMovedFromAtStore`) keep the run's verdict.
+    std::vector<std::pair<bool*, bool>> armed;
+    auto keep = [&armed](const bool& f) {
+        bool* p = const_cast<bool*>(&f);
+        armed.emplace_back(p, *p);
+    };
+    for (const auto& top : acc.stmts) {
+        if (!top) continue;
+        forEachNestedStmt(*top, [&](const ast::Stmt& st) {
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&st)) {
+                keep(ld->autoDropAtScopeEnd);
+                keep(ld->becomesOwnedViaReassign);
+                keep(ld->dischargedByDiscard);
+            } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&st)) {
+                keep(es->disposeOwnedValue);
+            } else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&st)) {
+                keep(ds->disposeOwnedValue);
+                keep(ds->disposeInlineOwnedArray);
+                keep(ds->disposeOwnedCollectionValue);
+                keep(ds->disposeOwnedBuilderValue);
+            } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(&st)) {
+                keep(fs->ownedIterVarAutoDropAtBodyEnd);
+            } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&st)) {
+                keep(cs->disposeOwnedScrutinee);
+            }
+        });
+    }
+    const std::size_t diagMark = ctx.diagnostics().diagnostics().size();
     MethodOwnership mo(ctx);
     mo.setGetterScopeOnly();
     mo.run(acc.stmts, &params, /*isAsync=*/false, /*isDestructor=*/false,
@@ -20522,6 +20648,31 @@ static void runGetterBody(const ast::PropertyDecl& pd,
            /*genericCtx=*/nullptr,
            /*isGenericBody=*/enclosingType &&
                !enclosingType->genericParams.empty());
+    // §28.3 (v0.359): "A borrow cannot outlive its source." The scope-end
+    // free this run armed is sound only if no borrow of the freed local
+    // outlives the getter body. When the method pass WOULD have rejected the
+    // body (a suppressed §28.3 error — r42-rev-m74's b04, b09, b28, b30, b34)
+    // or a borrow-carrying value leaves it (`getterBorrowMayEscape` — b31,
+    // b33, the method-pass holes #8836 / #8837), that is not established, so
+    // every free the run armed is WITHDRAWN: the pre-fix bounded leak, which
+    // is the safe direction, instead of a use-after-free. No rejection is
+    // added — that is the spec-shaped change #8767's comment leaves open.
+    if (!mo.getterSuppressedError() && !mo.getterBorrowMayEscape(acc.stmts))
+        return;
+    for (auto& [flag, before] : armed) *flag = before;
+    mo.withdrawGetterSymbolAutoDrops();
+    // The §28.3.10 must-use lint the run reported directly announces an
+    // implicit drop at the scope end; with the drop withdrawn, so is its
+    // announcement. Every WARNING the getter run reported is that lint (the
+    // run's other reports are suppressed), so the warnings are dropped and
+    // any error or note is kept.
+    std::vector<Diagnostic> kept;
+    const auto& all = ctx.diagnostics().diagnostics();
+    for (std::size_t i = diagMark; i < all.size(); ++i)
+        if (all[i].severity != Severity::Warning) kept.push_back(all[i]);
+    ctx.diagnostics().rollbackTo(diagMark);
+    for (auto& d : kept)
+        ctx.diagnostics().report(d.severity, d.location, std::move(d.message));
 }
 
 // fix #4011 / §7.9: forward-declared so checkMember's NestedTypeMember arm
