@@ -40284,10 +40284,21 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     // plain `f: F?` formal is rejected). The non-nullable requirement was
     // this arm's own narrowing, not a premise of its argument, and the
     // inspection walk keeps the independent fail-closed guard.
+    // fix #8933 (§28.14 / §28.9, v0.359): the walk also admits a use of the
+    // formal as an ARGUMENT to another call-bounded parameter — §28.14's
+    // "the callee may be invoked, bound to locals, and passed on as an
+    // argument to another call-bounded parameter". A callee that only
+    // FORWARDS its formal holds nothing past its own call, so the caller's
+    // closure local may still be released at the caller's scope end (the
+    // issue's repro leaked one closure cell + its env per call). The
+    // forwarding proof is recursive and fails closed — see
+    // calleeBodyUsesFormalOnlyByInvocationInspectionOrForwarding's
+    // declaration in LlvmBackend_impl.hpp.
     if (resolvedFormalIsFunction(*p.type, ctx)) {
         const sema::TypeRef* at0 = ctx.exprType(*a.value);
         if (at0 && at0->kind == sema::TypeRef::Kind::Function &&
-            calleeBodyUsesFormalOnlyByInvocationOrInspection(*md, p.name))
+            calleeBodyUsesFormalOnlyByInvocationInspectionOrForwarding(
+                ctx, *md, p.name))
             return true;
         return false;
     }

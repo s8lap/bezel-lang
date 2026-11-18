@@ -957,6 +957,32 @@ bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
 bool calleeBodyUsesFormalOnlyByInvocationOrInspection(
         const ast::MethodDecl& md, std::string_view name);
 
+// fix #8933 (§28.14 / §28.9, v0.359): the same fail-closed walk, PLUS
+// §28.14's "passed on as an argument to another call-bounded parameter" —
+// a callee that HANDS ITS OWN call-bounded formal on to another call-bounded
+// parameter holds nothing past its own call, so the caller's closure local
+// may still be released at ITS scope end.
+//
+// The proof is RECURSIVE and needs the sema context (the forwarded callee's
+// signature and, for a method target, its body):
+//   * a forwarded ARGUMENT is admitted only at a PLAIN function-typed
+//     parameter of a callee that holds nothing past ITS call — for a method
+//     target, this very walk over the target's body; for a function-value
+//     target, the SIGNATURE (a function value has no body to walk, and
+//     §28.14's call-bounded default is a property of the PARAMETER, whose
+//     obligations the compiler verifies for every user-authored body);
+//   * a `scoped` / `owned` / `ref` / `out` parameter, an imported / virtual /
+//     async callee, a deferred-activation return (a Task-family or iterable
+//     head — §28.14 *Call-bounded × deferred activation*) and a call-graph
+//     cycle all DECLINE, which leaves the argument an escape — a leak, never
+//     an early release.
+//
+// Used by ClosureEscapeWalker's method-callee argument relief
+// (closureArgBindsMethodOwnTypeParamBorrow arm (b), LlvmBackend_Setup.cpp).
+bool calleeBodyUsesFormalOnlyByInvocationInspectionOrForwarding(
+        const sema::SemaContext& ctx, const ast::MethodDecl& md,
+        std::string_view name);
+
 // fix #5611 (§28.14 / §28.9 / §8.6, v0.334): true when a PLAIN (no-modifier)
 // parameter's DECLARED type is a function type, however it is SPELLED.
 //

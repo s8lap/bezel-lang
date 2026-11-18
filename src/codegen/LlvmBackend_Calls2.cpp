@@ -21327,6 +21327,50 @@ void Emitter::collectClosureArgBodyIdentifiers(
 }
 
 
+// fix #8933 (§28.14 / §28.9, v0.359): the FORWARDING admission — a use of a
+// call-bounded formal AS AN ARGUMENT to another call ("passed on as an
+// argument to another call-bounded parameter", §28.14 v0.359) — is admitted
+// only when the forwarded position is ITSELF call-bounded and its own callee
+// obeys the same obligation.
+//
+// The proof, step by step (every clause fails closed → a leak, never an
+// early release):
+//
+//   * the forwarded ARGUMENT is a bare reference to the formal, at a plain
+//     positional argument (no `scoped` / `owned` / `ref` / `out` marker, no
+//     name, no discard);
+//   * the forwarded CALLEE is either
+//       - a locally compiled, non-imported, non-virtual METHOD whose
+//         parameter at that position is a PLAIN function-typed formal whose
+//         own body keeps nothing past ITS call (the SAME walk, recursively),
+//         and whose declared return announces no deferred-activation frame
+//         (§28.14 *Call-bounded × deferred activation*), or
+//       - a FUNCTION VALUE whose type is a function type with a PLAIN
+//         function-typed parameter at that position and a return slot that
+//         announces no deferred-activation frame. A function value offers no
+//         body to walk, so the proof there is the SIGNATURE — §28.14's
+//         call-bounded default is a property of the PARAMETER, and the
+//         compiler verifies the callee's obligations for every user-authored
+//         body (a method's own formals and a LAMBDA's own formals alike).
+//   * the chain depth is bounded, so a cycle in the call graph cannot
+//     recurse forever.
+//
+// The METHOD branch is the one #8872's function-value arm cannot cover:
+// #8872 admits a call THROUGH a function value; this admits a call to a
+// METHOD whose body hands its own call-bounded formal on to another
+// call-bounded parameter.
+//
+// Declared before the walk below (which calls it) and defined after it (the
+// recursion runs the walk again).
+static bool forwardedArgPositionIsCallBounded(
+        const sema::SemaContext& ctx, const ast::CallExpr& c, std::size_t i,
+        int depth);
+// fix #8933: the walk driver, with the forwarding chain depth (the public
+// entry point below starts it at 0).
+static bool bodyWalkAllowsForwarding(const sema::SemaContext& ctx,
+                                     const ast::MethodDecl& md,
+                                     std::string_view name, int depth);
+
 namespace {
 // fix #5216 / narrow #5129 (§28.9 / §28.14, v0.313): the fail-closed walk
 // behind calleeBodyUsesFormalOnlyByInvocation (declared and documented in
@@ -21357,6 +21401,20 @@ struct FormalInvocationOnlyWalk {
     // invocation or an inspection there is a capture, which the closure's env
     // holds past the call.
     int lambdaDepth = 0;
+    // fix #8933 (§28.14 / §28.9, v0.359): the sema context of the module
+    // being lowered — needed ONLY by the FORWARDING admission below, which
+    // resolves the forwarded call's callee and its signature. Null when the
+    // caller supplied none; then no forwarding is admitted (fail closed).
+    const sema::SemaContext* ctx = nullptr;
+    // fix #8933: admit a use of the formal AS AN ARGUMENT to another call
+    // (§28.14's "passed on as an argument to another call-bounded parameter")
+    // when the forwarded position is itself call-bounded. Off by default: the
+    // strict walk (calleeBodyUsesFormalOnlyByInvocation) and the inspection
+    // walk keep their verdicts.
+    bool allowForwarding = false;
+    // fix #8933: the depth of the forwarding chain already walked (a cycle
+    // in the call graph must not recurse forever; the limit fails closed).
+    int forwardDepth = 0;
     bool isNullTestOfName(const ast::BinaryExpr& be) const {
         if (be.op != "=" && be.op != "<>") return false;
         auto isNull = [](const ast::Expr* e) {
@@ -21375,6 +21433,26 @@ struct FormalInvocationOnlyWalk {
     }
     void args(const std::vector<ast::CallArgument>& v) {
         for (const auto& a : v) { if (!ok) return; expr(a.value.get()); }
+    }
+    // fix #8933 (§28.14 / §28.9, v0.359): the ARGUMENTS of a CALL. A use of
+    // the formal here is a §28.14 FORWARD — "the callee may ... be passed on
+    // as an argument to another call-bounded parameter" — so it is admitted
+    // when the forwarded position is itself call-bounded (and, for a method
+    // target, when that method's own body keeps nothing past ITS call: the
+    // SAME proof, recursively). Every other use of the formal in an argument
+    // position still fails the walk closed.
+    void callArgs(const ast::CallExpr& c) {
+        for (std::size_t i = 0; i < c.args.size(); ++i) {
+            if (!ok) return;
+            const ast::CallArgument& a = c.args[i];
+            if (!a.value) continue;
+            if (allowForwarding && ctx && lambdaDepth == 0 &&
+                isName(a.value.get()) &&
+                forwardedArgPositionIsCallBounded(*ctx, c, i, forwardDepth))
+                continue;  // #8933: the formal is forwarded to a
+                           // call-bounded position
+            expr(a.value.get());
+        }
     }
     void stmt(const ast::Stmt* s) {
         if (!ok || !s) return;
@@ -21468,7 +21546,10 @@ struct FormalInvocationOnlyWalk {
             // fix #8482: inside a lambda body the invocation is a capture.
             if (!isName(c->callee.get()) || lambdaDepth > 0)
                 expr(c->callee.get());
-            args(c->args);
+            // fix #8933: a call's arguments may carry the formal FORWARDED to
+            // another call-bounded parameter (§28.14) — callArgs admits that
+            // shape, every other argument use still fails the walk closed.
+            callArgs(*c);
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
@@ -21626,6 +21707,175 @@ bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
 bool calleeBodyUsesFormalOnlyByInvocationOrInspection(
         const ast::MethodDecl& md, std::string_view name) {
     return calleeBodyUsesFormalOnly(md, name, /*allowInspection=*/true);
+}
+
+
+// fix #8933 (§28.14 / §28.9, v0.359): the FORWARDING admission — the same
+// fail-closed walk, plus §28.14's "the callee may be invoked, bound to
+// locals, and PASSED ON AS AN ARGUMENT TO ANOTHER CALL-BOUNDED PARAMETER".
+//
+// WHY. A call-bounded formal that a callee HANDS ON to another call-bounded
+// parameter is the one use the walk above rejected: `g` as an ARGUMENT is
+// neither an invocation nor an inspection of the formal, so the walk failed,
+// the escape walker's method-callee relief declined, and the CALLER's closure
+// local was never released (one closure cell + its env per call — the
+// issue's repro: 15200 byte(s) in 600 allocation(s) over 200 iterations).
+//
+// THE PROOF IS RECURSIVE, and it fails closed at every step (see the
+// declaration comment above for the clause-by-clause list):
+//   * the forwarded position must be a PLAIN function-typed parameter of a
+//     callee that holds nothing past ITS call — for a method target, that is
+//     this very walk, run over the target's body; for a function-value
+//     target, it is the SIGNATURE (a function value has no body to walk, and
+//     §28.14's call-bounded default is a property of the PARAMETER, whose
+//     obligations the compiler verifies for every user-authored body);
+//   * a `scoped` / `owned` / `ref` / `out` parameter, an imported or virtual
+//     or async callee, a deferred-activation return (a Task-family or
+//     iterable head — §28.14 *Call-bounded × deferred activation*) and a
+//     call-graph cycle all DECLINE, which leaves the argument an escape — a
+//     leak, never an early release.
+bool calleeBodyUsesFormalOnlyByInvocationInspectionOrForwarding(
+        const sema::SemaContext& ctx, const ast::MethodDecl& md,
+        std::string_view name) {
+    return bodyWalkAllowsForwarding(ctx, md, name, /*depth=*/0);
+}
+
+// fix #8933: the walk driver with the forwarding chain depth.
+static bool bodyWalkAllowsForwarding(const sema::SemaContext& ctx,
+                                     const ast::MethodDecl& md,
+                                     std::string_view name, int depth) {
+    if (name.empty()) return false;
+    for (auto mod : md.modifiers)
+        if (mod == "virtual" || mod == "abstract" || mod == "override")
+            return false;
+    FormalInvocationOnlyWalk w{name};
+    w.allowInspection = true;
+    // fix #8933: the forwarding admission, with the sema context the proof
+    // needs to resolve the forwarded callee.
+    w.allowForwarding = true;
+    w.ctx = &ctx;
+    w.forwardDepth = depth;
+    if (md.bodyKind == ast::MethodBodyKind::Expression) {
+        if (!md.exprBody) return false;
+        w.expr(md.exprBody.get());
+    } else if (md.bodyKind == ast::MethodBodyKind::Block) {
+        w.stmts(md.stmts);
+    } else {
+        return false;
+    }
+    return w.ok;
+}
+
+// fix #8933 (§28.14 / §28.9, v0.359): is argument `i` of `c` at a position
+// that is ITSELF call-bounded — i.e. may the formal be forwarded there?
+//
+// The METHOD branch: a locally compiled, non-imported, non-virtual method
+// whose parameter at `i` is a PLAIN function-typed formal whose own body
+// keeps nothing past ITS call (the same walk, recursively).
+//
+// The FUNCTION-VALUE branch: a function value has no body to walk, so the
+// proof is the SIGNATURE — §28.14 (v0.359) states the call-bounded default
+// as a property of the PARAMETER ("A function-typed parameter declared
+// *without* `scoped` is call-bounded: the callee receives the callback for
+// the duration of the call only ... These obligations are compiler-verified
+// for user-authored callees"), and the compiler verifies them for every
+// user-authored body — a method's own formals and a LAMBDA's own formals
+// alike. The one §28.14 shape allowed to retain the callback past the call
+// is *Call-bounded × deferred activation*, which the RETURN slot announces,
+// so a Task-family or iterable head declines.
+//
+// Every clause fails closed: an unrecognised shape returns false, which
+// leaves the argument an escape — a leak, never an early release.
+static bool forwardedArgPositionIsCallBounded(
+        const sema::SemaContext& ctx, const ast::CallExpr& c, std::size_t i,
+        int depth) {
+    // A cycle in the call graph must not recurse forever; the limit fails
+    // closed (a leak, never an early release).
+    if (depth > 8) return false;
+    if (i >= c.args.size() || !c.args[i].value) return false;
+    // The forwarded ARGUMENT itself: a plain positional argument. A
+    // `scoped` / `owned` / `ref` / `out` marker changes what the position
+    // means, and a named or discarded argument does not pin an index.
+    const ast::CallArgument& a = c.args[i];
+    if (!a.modifier.empty() || !a.name.empty() || a.isDiscard) return false;
+    if (!c.callee) return false;
+    // The METHOD branch.
+    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+            ctx.exprSymbol(*c.callee))) {
+        if (ms->isOperator || ctx.isImported(ms)) return false;
+        // SEAM-ACCESSOR: the imported case is declined on the line above; this
+        // AST read is reached only for a locally compiled callee.
+        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (!md) return false;
+        // A virtual / abstract / override callee may be overridden at runtime
+        // with a body that stores the callback; an `async` callee (or one
+        // whose body yields) mints a deferred-activation frame that may hold
+        // it past the call (§28.14 *Call-bounded × deferred activation*).
+        // The YIELD case needs no separate test: the recursive walk below
+        // fails closed on a `yield` statement (a frame residence), so an
+        // iterator callee is declined there.
+        for (auto mod : md->modifiers)
+            if (mod == "async" || mod == "virtual" || mod == "abstract" ||
+                mod == "override")
+                return false;
+        // POSITIONAL, exact arity — the only shape in which the syntactic
+        // index is the PARAMETER index.
+        if (c.args.size() != md->params.size() || i >= md->params.size())
+            return false;
+        for (const auto& arg : c.args)
+            if (!arg.name.empty() || !arg.modifier.empty() || arg.isDiscard)
+                return false;
+        const ast::Param& p = md->params[i];
+        // No modifier: `scoped` is storage-bounded (the callee MAY store the
+        // callback), `owned` transfers it in, `ref`/`out` alias it.
+        if (!p.modifier.empty() || !p.type) return false;
+        // The formal must be FUNCTION-TYPED — the §28.14 call-bounded default
+        // is stated for a function-typed parameter. A bare type parameter
+        // resolves to Kind::Named and can never arm this.
+        if (!resolvedFormalIsFunction(*p.type, ctx)) return false;
+        // The RETURN slot must not carry the callback out of the call, and
+        // must not announce a deferred-activation frame.
+        if (md->returnType) {
+            const sema::TypeRef* drt = ctx.resolvedType(*md->returnType);
+            if (!drt) return false;
+            if (drt->kind == sema::TypeRef::Kind::Function) return false;
+            if (drt->isResolvedTypeParam()) return false;
+            if (drt->kind == sema::TypeRef::Kind::Named) {
+                const std::string_view head = drt->headName();
+                if (common::isTaskFamilyHead(head) ||
+                    common::isIterableInterfaceHead(head))
+                    return false;
+            }
+        }
+        // RECURSE: the target's own body must keep nothing past ITS call.
+        return bodyWalkAllowsForwarding(ctx, *md, p.name, depth + 1);
+    }
+    // The FUNCTION-VALUE branch.
+    const sema::TypeRef* ft = ctx.exprType(*c.callee);
+    if (!ft || ft->kind != sema::TypeRef::Kind::Function || ft->nullable)
+        return false;
+    if (c.args.size() != ft->funcParams.size() || i >= ft->funcParams.size())
+        return false;
+    for (const auto& arg : c.args)
+        if (!arg.name.empty() || !arg.modifier.empty() || arg.isDiscard)
+            return false;
+    const auto& fp = ft->funcParams[i];
+    if (!fp.modifier.empty()) return false;
+    if (!fp.type || fp.type->kind != sema::TypeRef::Kind::Function)
+        return false;
+    if (fp.type->isResolvedTypeParam()) return false;
+    const sema::TypeRef* rt = ft->funcReturn;
+    if (rt) {
+        if (rt->kind == sema::TypeRef::Kind::Function) return false;
+        if (rt->isResolvedTypeParam()) return false;
+        if (rt->kind == sema::TypeRef::Kind::Named) {
+            const std::string_view head = rt->headName();
+            if (common::isTaskFamilyHead(head) ||
+                common::isIterableInterfaceHead(head))
+                return false;
+        }
+    }
+    return true;
 }
 
 
