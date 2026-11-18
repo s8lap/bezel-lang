@@ -2943,6 +2943,8 @@ private:
     bool isCapturedOwnedBinding(const ast::Expr& e);
     void reportCapturedOwnedConsume(std::string_view name, SourceLocation loc,
                                     const char* verb);
+    // fix #7920 (§28.3, §31.1, v0.359): `throw c` over a captured owned `c`.
+    void reportCapturedThrowOperand(const ast::Expr& operand);
     // fix #7891 (§28.3 *Captured owned bindings*, §15.3, §35.4, v0.357): the
     // MOVE-ONLY half of the in-closure consume rule. For an owning-classified
     // choice the UNMARKED read at an owned-consuming position is itself the

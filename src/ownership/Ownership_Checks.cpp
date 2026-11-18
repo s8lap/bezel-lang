@@ -6107,6 +6107,24 @@ bool MethodOwnership::isCapturedOwnedBinding(const ast::Expr& e) {
     return it->second.state == OwnershipState::Owned;
 }
 
+// fix #7920 (§28.3 *Captured owned bindings*, §31.1 *The throw operand*,
+// v0.359). §31.1: "The operand is consumed as an owned value under the
+// ownership rules", and `throw x` "is a source-visible kill — the keyword
+// itself is the announcement". §28.3: inside a closure a captured owned
+// binding is in borrow state and "every other owned-consuming use of it" is a
+// compile error. So `throw c` over a captured owned `c` is a closure-side
+// consume (the thrown instance is disposed by the runtime after the catch arm
+// while the enclosing scope still holds the disposal obligation: a double
+// dispose) and is rejected here; `isCapturedOwnedBinding` limits it to an
+// enclosing-body binding still in the Owned state, so a closure's own local
+// and a borrow are untouched. A `!` is peeled (§17.8 classifies `c!` as `c`).
+void MethodOwnership::reportCapturedThrowOperand(const ast::Expr& operand) {
+    const ast::Expr* op = lookThroughForceUnwrap(&operand);
+    if (!op || !isCapturedOwnedBinding(*op)) return;
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(op);
+    reportCapturedOwnedConsume(id->name, id->span.begin, "throw");
+}
+
 void MethodOwnership::reportCapturedOwnedConsume(std::string_view name,
                                                  SourceLocation loc,
                                                  const char* verb) {
@@ -6800,6 +6818,11 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
         return;
     }
     if (const auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        // fix #7920 (§28.3 *Captured owned bindings*, §31.1 *The throw
+        // operand*, v0.359): the expression-bodied / expression-position
+        // spelling of the throw-consume, see the ThrowStmt arm.
+        if (insideLambda && th->operand)
+            reportCapturedThrowOperand(*th->operand);
         if (th->operand) scanCapturedOwnedConsumeExpr(*th->operand, insideLambda);
         return;
     }
@@ -6914,6 +6937,9 @@ void MethodOwnership::scanCapturedOwnedConsumeStmt(const ast::Stmt& s,
         return;
     }
     if (const auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        // fix #7920 (§28.3 *Captured owned bindings*, §31.1 *The throw
+        // operand*, v0.359): `throw c;` over a captured owned `c`.
+        if (insideLambda && th->value) reportCapturedThrowOperand(*th->value);
         if (th->value) scanCapturedOwnedConsumeExpr(*th->value, insideLambda);
         return;
     }
