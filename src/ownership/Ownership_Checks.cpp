@@ -7129,6 +7129,16 @@ void MethodOwnership::scanCapturedOwnedConsumeStmt(const ast::Stmt& s,
         // is the local one (see the function's own header).
         if (insideLambda && th->value)
             checkLambdaBodyThrowOperandNotBorrowed(*th->value);
+        // fix #8901 (§28.3 K3.13 marker economy / K3.8 throw operand,
+        // §31.1, v0.359): `throw move c;` is rejected as a REDUNDANT MARKER
+        // — the `throw` keyword already announces the ownership transfer.
+        // The method body has always rejected it (the `ThrowStmt` arm of the
+        // method's statement walk), but that walk never enters a lambda body,
+        // so the closure body admitted it. The predicate is the method's own
+        // (`reportRedundantMoveOnThrowOperand`), so the two bodies draw the
+        // same diagnostic at the same place.
+        if (insideLambda && th->value)
+            reportRedundantMoveOnThrowOperand(*th->value);
         if (th->value) scanCapturedOwnedConsumeExpr(*th->value, insideLambda);
         return;
     }
@@ -13717,6 +13727,59 @@ void MethodOwnership::checkThrowOperandNotBorrowed(const ast::Expr& operand) {
         "(\xc2\xa7""31.2.4); to propagate a caught exception's information, chain "
         "a fresh instance through its snapshot constructor \xe2\x80\x94 "
         "`throw new Exception(ex.Message, ex)` (\xc2\xa7""31.4)");
+}
+
+// §28.3 K3.13 (marker economy) / K3.8 (throw operand): `throw move e;` is
+// rejected as redundant — the `throw` keyword already announces the ownership
+// transfer (consume table K3.8 row, Spelling column = "none").
+//
+// The rule is SHARED by the METHOD body and the CLOSURE body: the marker
+// economy is a property of the `throw` keyword, not of the scope the throw is
+// written in. §31.1 (v0.359): "`throw x` is a source-visible kill — the
+// keyword itself is the announcement (K3.13), so the transfer marker is not
+// written here — `throw move x` is rejected at the marker-free position
+// (§28.3) — the same no-marker rule as an `owned` return".
+//
+// fix #8901 (§28.3, §31.1, v0.359): the METHOD body rejected the spelling
+// (the `ThrowStmt` arm of the method's statement walk), but the walk never
+// enters a lambda body — so the same statement inside a closure was ADMITTED
+// (MEASURED on r30-c1 @ af51cca67: bezelc rc=0, the program ran and printed
+// "caught"). The closure scan now asks the same question, through this one
+// predicate, so the two bodies cannot drift apart.
+//
+// Bounded to LOCAL or PARAMETER sources; `throw move _f;` of a field is NOT
+// redundant — the field's K9.2 restoration tracking still needs the marker.
+//
+// fix #5144 / §17.8 (v0.309): `throw move x!` is also a redundant marker —
+// `throw x!` already announces the consume, the `move` adds nothing. The `!`
+// is peeled (one layer, identical to the AssignmentStmt / ReturnStmt
+// redundant-marker fix) so the `throw move x!` form is rejected the same way
+// `throw move x;` already is. // per §28.3, §31.1, v0.359, #5144, #8901
+void MethodOwnership::reportRedundantMoveOnThrowOperand(const ast::Expr& value) {
+    const auto* ue = dynamic_cast<const ast::UnaryExpr*>(&value);
+    if (!ue) return;
+    if (ue->op != "move" || !ue->operand) return;
+    const ast::Expr* moveOperand = lookThroughForceUnwrap(ue->operand.get());
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(moveOperand);
+    if (!id) return;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    bool sourceIsLocalOrParam =
+        sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
+                dynamic_cast<sema::ParameterSymbol*>(sym));
+    if (!sourceIsLocalOrParam) return;
+    // `reportOnce`, not `report`: the closure scan can reach the same operand
+    // from more than one analysis (the #8860 precedent for the throw-operand
+    // family), and the method body's own arm reaches it too. The fold keeps
+    // the diagnostic single at its place.
+    reportOnce(
+        Severity::Error, ue->span.begin,
+        std::string("the `move` marker is redundant on a "
+                    "`throw` operand — the `throw` "
+                    "keyword already announces the "
+                    "ownership transfer; write `throw ") +
+            std::string(id->name) +
+            "` without `move` (§28.3 K3.13 marker "
+            "economy; K3.8 throw)");
 }
 
 // fix #8802 (§31.1 *The throw operand*, v0.359): the LAMBDA-BODY LOCAL half.

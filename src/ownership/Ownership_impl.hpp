@@ -5162,6 +5162,13 @@ private:
                                       std::uint32_t atOffset,
                                       std::vector<sema::LocalSymbol*>& out);
 
+    // fix #8901 (§28.3 K3.13 marker economy / K3.8 throw operand, §31.1,
+    // v0.359): `throw move x;` of a LOCAL or PARAMETER source is a redundant
+    // marker -- the `throw` keyword already announces the ownership transfer.
+    // SHARED by the method body (its `ThrowStmt` arm) and the closure body
+    // (the closure scan), so the two cannot drift apart.
+    void reportRedundantMoveOnThrowOperand(const ast::Expr& value);
+
     // §31.1 / §28.3.7 (axiom A5, v0.350; issue #7412, owner ruling "reading
     // 1"): the `throw` operand is consumed as an owned value passed to the
     // runtime's exception machinery -- a move OUT of the binding's scope -- and

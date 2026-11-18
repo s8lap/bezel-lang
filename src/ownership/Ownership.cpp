@@ -5739,41 +5739,10 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         // §28.3 K3.13 (marker economy) / K3.8 (throw operand): `throw move e;`
         // is rejected as redundant — the `throw` keyword already announces the
         // ownership transfer (consume table K3.8 row, Spelling column = "none").
-        // Bounded to LOCAL or PARAMETER sources; `throw move _f;` of a field
-        // is NOT redundant — the field's K9.2 restoration tracking still
-        // needs the marker.
-        if (th->value) {
-            if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(th->value.get())) {
-                // fix #5144 / §17.8 (v0.309): `throw move x!` is also a
-                // redundant marker — `throw x!` already announces the consume,
-                // the `move` adds nothing. Peel the `!` (one layer, identical to
-                // the AssignmentStmt / ReturnStmt redundant-marker fix above) so
-                // the `throw move x!` form is rejected the same way `throw
-                // move x;` already is.
-                const ast::Expr* moveOperand =
-                    lookThroughForceUnwrap(ue->operand.get());
-                if (ue->op == "move" &&
-                    dynamic_cast<const ast::IdentifierExpr*>(moveOperand)) {
-                    auto* id = static_cast<const ast::IdentifierExpr*>(
-                        moveOperand);
-                    auto* sym = ctx_.exprSymbol(*id);
-                    bool sourceIsLocalOrParam =
-                        sym && (dynamic_cast<sema::LocalSymbol*>(sym) ||
-                                dynamic_cast<sema::ParameterSymbol*>(sym));
-                    if (sourceIsLocalOrParam) {
-                        report(
-                            Severity::Error, ue->span.begin,
-                            std::string("the `move` marker is redundant on a "
-                                        "`throw` operand — the `throw` "
-                                        "keyword already announces the "
-                                        "ownership transfer; write `throw ") +
-                                std::string(id->name) +
-                                "` without `move` (§28.3 K3.13 marker "
-                                "economy; K3.8 throw)");
-                    }
-                }
-            }
-        }
+        // The predicate is SHARED with the closure body (fix #8901), which
+        // reaches it through the closure scan: the marker economy is a
+        // property of the `throw` keyword, not of the scope.
+        if (th->value) reportRedundantMoveOnThrowOperand(*th->value);
         // §31.1 (issue #430): check for a catch borrow escaping via a
         // NON-OWNED constructor argument of the thrown object. This is the
         // `throw new Wrap(ex)` pattern where Wrap's ctor stores ex in a
